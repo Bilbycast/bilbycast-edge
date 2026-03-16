@@ -1,0 +1,345 @@
+use std::collections::HashSet;
+use std::net::SocketAddr;
+
+use anyhow::{bail, Result};
+
+use super::models::*;
+
+/// Validates the entire application configuration.
+///
+/// Performs the following checks:
+/// 1. **Duplicate flow IDs**: ensures no two flows share the same `id` value.
+/// 2. **Per-flow validation**: delegates to [`validate_flow`] for each flow, which
+///    checks ID/name non-emptiness, input validity, duplicate output IDs, and
+///    individual output validity.
+///
+/// # Errors
+///
+/// Returns an error describing the first validation failure encountered.
+pub fn validate_config(config: &AppConfig) -> Result<()> {
+    let mut flow_ids = HashSet::new();
+    for flow in &config.flows {
+        if !flow_ids.insert(&flow.id) {
+            bail!("Duplicate flow ID: {}", flow.id);
+        }
+        validate_flow(flow)?;
+    }
+    Ok(())
+}
+
+/// Validates a single flow configuration.
+///
+/// Performs the following checks in order:
+/// 1. **Non-empty ID**: the flow `id` must not be an empty string.
+/// 2. **Non-empty name**: the flow `name` must not be an empty string.
+/// 3. **Input validation**: delegates to `validate_input` to check the input
+///    source configuration (bind addresses, SRT mode requirements, FEC params, etc.).
+/// 4. **Duplicate output IDs**: ensures no two outputs within this flow share the
+///    same `id` value.
+/// 5. **Per-output validation**: delegates to `validate_output` for each output.
+///
+/// # Errors
+///
+/// Returns an error describing the first validation failure encountered.
+pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
+    if flow.id.is_empty() {
+        bail!("Flow ID cannot be empty");
+    }
+    if flow.name.is_empty() {
+        bail!("Flow name cannot be empty");
+    }
+
+    validate_input(&flow.input)?;
+
+    let mut output_ids = HashSet::new();
+    for output in &flow.outputs {
+        let oid = output.id();
+        if !output_ids.insert(oid.to_string()) {
+            bail!("Duplicate output ID '{}' in flow '{}'", oid, flow.id);
+        }
+        validate_output(output)?;
+    }
+
+    Ok(())
+}
+
+/// Validates the input source configuration for a flow.
+///
+/// For **RTP** inputs: validates the `bind_addr` as a socket address, the optional
+/// `interface_addr` as an IP address, and any FEC decode parameters.
+///
+/// For **SRT** inputs: validates the `local_addr` as a socket address, checks SRT
+/// mode-specific requirements (e.g., `remote_addr` required for caller/rendezvous),
+/// validates passphrase length and AES key length, and validates the optional
+/// redundancy (leg 2) configuration.
+fn validate_input(input: &InputConfig) -> Result<()> {
+    match input {
+        InputConfig::Rtp(rtp) => {
+            validate_socket_addr(&rtp.bind_addr, "RTP input bind_addr")?;
+            if let Some(ref iface) = rtp.interface_addr {
+                validate_ip_addr(iface, "RTP input interface_addr")?;
+            }
+            if let Some(ref fec) = rtp.fec_decode {
+                validate_fec(fec)?;
+            }
+        }
+        InputConfig::Srt(srt) => {
+            validate_socket_addr(&srt.local_addr, "SRT input local_addr")?;
+            validate_srt_common(
+                &srt.mode,
+                &srt.remote_addr,
+                srt.passphrase.as_deref(),
+                srt.aes_key_len,
+                "SRT input",
+            )?;
+            if let Some(ref red) = srt.redundancy {
+                validate_srt_redundancy(red, "SRT input")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates a single output configuration.
+///
+/// For **RTP** outputs: checks that the output ID is non-empty, validates `dest_addr`
+/// as a socket address, validates the optional `bind_addr`, and checks any FEC encode
+/// parameters.
+///
+/// For **SRT** outputs: checks that the output ID is non-empty, validates `local_addr`
+/// as a socket address, checks SRT mode-specific requirements (caller/rendezvous need
+/// `remote_addr`), validates passphrase and AES key length, and validates the optional
+/// redundancy configuration.
+///
+/// # Errors
+///
+/// Returns an error describing the first validation failure encountered.
+pub fn validate_output(output: &OutputConfig) -> Result<()> {
+    match output {
+        OutputConfig::Rtp(rtp) => {
+            if rtp.id.is_empty() {
+                bail!("RTP output ID cannot be empty");
+            }
+            validate_socket_addr(&rtp.dest_addr, "RTP output dest_addr")?;
+            if let Some(ref bind) = rtp.bind_addr {
+                validate_socket_addr(bind, "RTP output bind_addr")?;
+            }
+            if let Some(ref fec) = rtp.fec_encode {
+                validate_fec(fec)?;
+            }
+        }
+        OutputConfig::Srt(srt) => {
+            if srt.id.is_empty() {
+                bail!("SRT output ID cannot be empty");
+            }
+            validate_socket_addr(&srt.local_addr, "SRT output local_addr")?;
+            validate_srt_common(
+                &srt.mode,
+                &srt.remote_addr,
+                srt.passphrase.as_deref(),
+                srt.aes_key_len,
+                "SRT output",
+            )?;
+            if let Some(ref red) = srt.redundancy {
+                validate_srt_redundancy(red, "SRT output")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_srt_common(
+    mode: &SrtMode,
+    remote_addr: &Option<String>,
+    passphrase: Option<&str>,
+    aes_key_len: Option<usize>,
+    context: &str,
+) -> Result<()> {
+    match mode {
+        SrtMode::Caller | SrtMode::Rendezvous => {
+            let addr = remote_addr
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("{context}: remote_addr is required for caller/rendezvous mode"))?;
+            validate_socket_addr(addr, &format!("{context} remote_addr"))?;
+        }
+        SrtMode::Listener => {}
+    }
+
+    if let Some(pass) = passphrase {
+        if pass.len() < 10 || pass.len() > 79 {
+            bail!("{context}: passphrase must be 10-79 characters, got {}", pass.len());
+        }
+    }
+
+    if let Some(key_len) = aes_key_len {
+        if key_len != 16 && key_len != 24 && key_len != 32 {
+            bail!("{context}: aes_key_len must be 16, 24, or 32, got {key_len}");
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_srt_redundancy(red: &SrtRedundancyConfig, context: &str) -> Result<()> {
+    validate_socket_addr(&red.local_addr, &format!("{context} redundancy local_addr"))?;
+    validate_srt_common(
+        &red.mode,
+        &red.remote_addr,
+        red.passphrase.as_deref(),
+        red.aes_key_len,
+        &format!("{context} redundancy"),
+    )
+}
+
+/// Validates SMPTE 2022-1 FEC parameters.
+///
+/// Checks that `columns` (L parameter) is in the range 1..=20 and `rows` (D parameter)
+/// is in the range 4..=20.
+fn validate_fec(fec: &FecConfig) -> Result<()> {
+    if fec.columns < 1 || fec.columns > 20 {
+        bail!("FEC columns must be 1-20, got {}", fec.columns);
+    }
+    if fec.rows < 4 || fec.rows > 20 {
+        bail!("FEC rows must be 4-20, got {}", fec.rows);
+    }
+    Ok(())
+}
+
+/// Validates that `addr` is a parseable `ip:port` socket address.
+///
+/// Uses [`std::net::SocketAddr`] parsing, which accepts both IPv4 and IPv6 formats.
+/// The `context` parameter is included in the error message to identify which config
+/// field failed validation.
+fn validate_socket_addr(addr: &str, context: &str) -> Result<()> {
+    addr.parse::<SocketAddr>()
+        .map_err(|e| anyhow::anyhow!("{context}: invalid socket address '{addr}': {e}"))?;
+    Ok(())
+}
+
+/// Validates that `addr` is a parseable IP address (without port).
+///
+/// Uses [`std::net::IpAddr`] parsing, which accepts both IPv4 and IPv6 formats.
+/// The `context` parameter is included in the error message to identify which config
+/// field failed validation.
+fn validate_ip_addr(addr: &str, context: &str) -> Result<()> {
+    addr.parse::<std::net::IpAddr>()
+        .map_err(|e| anyhow::anyhow!("{context}: invalid IP address '{addr}': {e}"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_valid_rtp_flow() {
+        let flow = FlowConfig {
+            id: "f1".to_string(),
+            name: "Flow 1".to_string(),
+            enabled: true,
+            input: InputConfig::Rtp(RtpInputConfig {
+                bind_addr: "0.0.0.0:5000".to_string(),
+                interface_addr: None,
+                fec_decode: None,
+            }),
+            outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
+                id: "out-1".to_string(),
+                name: "Out 1".to_string(),
+                dest_addr: "127.0.0.1:5004".to_string(),
+                bind_addr: None,
+                interface_addr: None,
+                fec_encode: None,
+            })],
+        };
+        assert!(validate_flow(&flow).is_ok());
+    }
+
+    #[test]
+    fn test_invalid_bind_addr() {
+        let flow = FlowConfig {
+            id: "f1".to_string(),
+            name: "Flow 1".to_string(),
+            enabled: true,
+            input: InputConfig::Rtp(RtpInputConfig {
+                bind_addr: "not-an-address".to_string(),
+                interface_addr: None,
+                fec_decode: None,
+            }),
+            outputs: vec![],
+        };
+        assert!(validate_flow(&flow).is_err());
+    }
+
+    #[test]
+    fn test_srt_caller_missing_remote() {
+        let flow = FlowConfig {
+            id: "f1".to_string(),
+            name: "Flow 1".to_string(),
+            enabled: true,
+            input: InputConfig::Srt(SrtInputConfig {
+                mode: SrtMode::Caller,
+                local_addr: "0.0.0.0:9000".to_string(),
+                remote_addr: None,
+                latency_ms: 120,
+                passphrase: None,
+                aes_key_len: None,
+                redundancy: None,
+            }),
+            outputs: vec![],
+        };
+        assert!(validate_flow(&flow).is_err());
+    }
+
+    #[test]
+    fn test_duplicate_flow_ids() {
+        let config = AppConfig {
+            version: 1,
+            server: ServerConfig::default(),
+            flows: vec![
+                FlowConfig {
+                    id: "same-id".to_string(),
+                    name: "Flow 1".to_string(),
+                    enabled: true,
+                    input: InputConfig::Rtp(RtpInputConfig {
+                        bind_addr: "0.0.0.0:5000".to_string(),
+                        interface_addr: None,
+                        fec_decode: None,
+                    }),
+                    outputs: vec![],
+                },
+                FlowConfig {
+                    id: "same-id".to_string(),
+                    name: "Flow 2".to_string(),
+                    enabled: true,
+                    input: InputConfig::Rtp(RtpInputConfig {
+                        bind_addr: "0.0.0.0:5001".to_string(),
+                        interface_addr: None,
+                        fec_decode: None,
+                    }),
+                    outputs: vec![],
+                },
+            ],
+        };
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_passphrase_length() {
+        let flow = FlowConfig {
+            id: "f1".to_string(),
+            name: "Flow 1".to_string(),
+            enabled: true,
+            input: InputConfig::Srt(SrtInputConfig {
+                mode: SrtMode::Listener,
+                local_addr: "0.0.0.0:9000".to_string(),
+                remote_addr: None,
+                latency_ms: 120,
+                passphrase: Some("short".to_string()),
+                aes_key_len: None,
+                redundancy: None,
+            }),
+            outputs: vec![],
+        };
+        assert!(validate_flow(&flow).is_err());
+    }
+}
