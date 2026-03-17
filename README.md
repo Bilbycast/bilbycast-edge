@@ -1,4 +1,4 @@
-# srtedge
+# bilbycast-edge
 
 A high-performance RTP/SMPTE 2022-2 over SRT transport bridge with SMPTE 2022-7 hitless redundancy and SMPTE 2022-1 Forward Error Correction.
 
@@ -20,7 +20,7 @@ A high-performance RTP/SMPTE 2022-2 over SRT transport bridge with SMPTE 2022-7 
 
 ```
                         +-------------------------------------------------+
-                        |                   srtedge                        |
+                        |                   bilbycast-edge                        |
                         |                                                  |
   RTP/UDP ------+       |   +-----------+    broadcast     +-----------+   |     +-----> RTP/UDP
   (unicast/     |       |   |   Input   |    channel       |  Output   |   |     |      (unicast/
@@ -49,13 +49,13 @@ A high-performance RTP/SMPTE 2022-2 over SRT transport bridge with SMPTE 2022-7 
 |-----------|---------|
 | **Rust 1.85+** | Edition 2024 support |
 
-SRT transport is implemented in pure Rust via the `srt-native` crate -- no C compiler, CMake, or system libraries are required.
+SRT transport is implemented in pure Rust via the `bilbycast-srt` crate -- no C compiler, CMake, or system libraries are required.
 
 ## Build and Run
 
 ```bash
 # Clone and build
-cd srtedge
+cd bilbycast-edge
 cargo build --release
 
 # Run tests
@@ -66,13 +66,13 @@ cargo doc --no-deps --open
 
 # Copy the example config and run
 cp srt-to-rtp.json config.json
-./target/release/srtedge -c config.json
+./target/release/bilbycast-edge -c config.json
 ```
 
 ## CLI Usage
 
 ```
-srtedge [OPTIONS]
+bilbycast-edge [OPTIONS]
 
 Options:
   -c, --config <PATH>       Path to configuration file [default: ./config.json]
@@ -109,7 +109,7 @@ The configuration is stored as JSON in the file specified by `--config` (default
 
 ### Monitor Config (`MonitorConfig`) -- optional
 
-When present, srtedge starts a second HTTP server serving a self-contained HTML dashboard for browser-based status monitoring. Omit this section entirely to disable the dashboard.
+When present, bilbycast-edge starts a second HTTP server serving a self-contained HTML dashboard for browser-based status monitoring. Omit this section entirely to disable the dashboard.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -508,10 +508,10 @@ All metrics are exported at `GET /metrics` in Prometheus text exposition format 
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `srtedge_info{version="..."}` | gauge | Application version info |
-| `srtedge_uptime_seconds` | gauge | Application uptime in seconds |
-| `srtedge_flows_total` | gauge | Total configured flows |
-| `srtedge_flows_active` | gauge | Currently running flows |
+| `bilbycast_edge_info{version="..."}` | gauge | Application version info |
+| `bilbycast_edge_uptime_seconds` | gauge | Application uptime in seconds |
+| `bilbycast_edge_flows_total` | gauge | Total configured flows |
+| `bilbycast_edge_flows_active` | gauge | Currently running flows |
 
 ### Per-Flow Input Metrics
 
@@ -519,12 +519,12 @@ Labels: `flow_id`
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `srtedge_flow_input_packets_total` | counter | Total RTP packets received |
-| `srtedge_flow_input_bytes_total` | counter | Total bytes received |
-| `srtedge_flow_input_bitrate_bps` | gauge | Current input bitrate (bits/sec) |
-| `srtedge_flow_input_packets_lost` | counter | Packets lost (sequence gaps) |
-| `srtedge_flow_input_fec_recovered_total` | counter | Packets recovered via FEC |
-| `srtedge_flow_input_redundancy_switches_total` | counter | SMPTE 2022-7 leg switches |
+| `bilbycast_edge_flow_input_packets_total` | counter | Total RTP packets received |
+| `bilbycast_edge_flow_input_bytes_total` | counter | Total bytes received |
+| `bilbycast_edge_flow_input_bitrate_bps` | gauge | Current input bitrate (bits/sec) |
+| `bilbycast_edge_flow_input_packets_lost` | counter | Packets lost (sequence gaps) |
+| `bilbycast_edge_flow_input_fec_recovered_total` | counter | Packets recovered via FEC |
+| `bilbycast_edge_flow_input_redundancy_switches_total` | counter | SMPTE 2022-7 leg switches |
 
 ### Per-Output Metrics
 
@@ -532,11 +532,11 @@ Labels: `flow_id`, `output_id`
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `srtedge_flow_output_packets_total` | counter | Total packets sent |
-| `srtedge_flow_output_bytes_total` | counter | Total bytes sent |
-| `srtedge_flow_output_bitrate_bps` | gauge | Current output bitrate (bits/sec) |
-| `srtedge_flow_output_packets_dropped` | counter | Packets dropped (broadcast lag) |
-| `srtedge_flow_output_fec_sent_total` | counter | FEC packets generated and sent |
+| `bilbycast_edge_flow_output_packets_total` | counter | Total packets sent |
+| `bilbycast_edge_flow_output_bytes_total` | counter | Total bytes sent |
+| `bilbycast_edge_flow_output_bitrate_bps` | gauge | Current output bitrate (bits/sec) |
+| `bilbycast_edge_flow_output_packets_dropped` | counter | Packets dropped (broadcast lag) |
+| `bilbycast_edge_flow_output_fec_sent_total` | counter | FEC packets generated and sent |
 
 ### SRT Connection Metrics
 
@@ -544,8 +544,8 @@ Labels: `flow_id`, `leg` (and optionally `output_id`)
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `srtedge_srt_rtt_ms` | gauge | SRT round-trip time in milliseconds |
-| `srtedge_srt_loss_total` | counter | SRT total packet loss |
+| `bilbycast_edge_srt_rtt_ms` | gauge | SRT round-trip time in milliseconds |
+| `bilbycast_edge_srt_loss_total` | counter | SRT total packet loss |
 
 Leg values: `input`, `input_leg2`, `leg1`, `leg2`
 
@@ -585,7 +585,7 @@ Verifies basic RTP input and output without SRT.
 **Steps:**
 
 ```bash
-# Terminal 1: Start srtedge
+# Terminal 1: Start bilbycast-edge
 cargo run -- -c config.json
 
 # Terminal 2: Send test RTP stream
@@ -605,7 +605,7 @@ curl -s http://localhost:8080/api/v1/stats | python3 -m json.tool
 **Steps:**
 
 ```bash
-# Terminal 1: Start srtedge
+# Terminal 1: Start bilbycast-edge
 cargo run -- -c config.json
 
 # Terminal 2: Send test RTP stream
@@ -650,7 +650,7 @@ ffplay udp://127.0.0.1:6000
 **Steps:**
 
 ```bash
-# Terminal 1: Start srtedge
+# Terminal 1: Start bilbycast-edge
 cargo run -- -c config.json
 
 # Terminal 2: Send via SRT (generate MPEG-TS, send over SRT)
@@ -782,7 +782,7 @@ curl -s -X POST http://localhost:8080/api/v1/config/reload | python3 -m json.too
 **Steps:**
 
 ```bash
-# Terminal 1: Start srtedge
+# Terminal 1: Start bilbycast-edge
 cargo run -- -c config.json
 
 # Terminal 2: Send to leg 1
@@ -809,7 +809,7 @@ watch -n1 'curl -s http://localhost:8080/api/v1/stats/redundant-input \
 **Steps:**
 
 ```bash
-# Start srtedge with FEC-enabled config
+# Start bilbycast-edge with FEC-enabled config
 cargo run -- -c config.json
 
 # Send stream and check fec_packets_sent in output stats
@@ -832,7 +832,7 @@ Add a `"monitor"` section to your config:
 ```
 
 ```bash
-# Start srtedge with monitor enabled
+# Start bilbycast-edge with monitor enabled
 cargo run -- -c config.json
 
 # Open the dashboard in your browser
@@ -863,13 +863,13 @@ curl -s http://localhost:8080/health | python3 -m json.tool
 ## Project Structure
 
 ```
-srtedge/
+bilbycast-edge/
 ├── Cargo.toml                     # Workspace root
 ├── README.md                      # This file
-├── srt-native/                    # Pure Rust SRT protocol implementation
+├── bilbycast-srt/                    # Pure Rust SRT protocol implementation
 │   ├── srt-protocol/              # Protocol state machines, buffers, crypto
 │   └── srt-transport/             # Async I/O layer (tokio): SrtSocket, SrtListener
-└── srtedge/                       # Main application crate
+└── bilbycast-edge/                       # Main application crate
     ├── Cargo.toml
     └── src/
         ├── main.rs                # CLI, server startup, stats publisher

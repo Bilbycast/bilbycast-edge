@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "server": {
+    "listen_addr": "0.0.0.0",
+    "listen_port": 8080
+  },
+  "monitor": {
+    "listen_addr": "0.0.0.0",
+    "listen_port": 9090
+  },
+  "flows": [
+    {
+      "id": "flow-hitless",
+      "name": "2022-7 Hitless: Dual SRT In -> RTP Out",
+      "enabled": true,
+      "input": {
+        "type": "srt",
+        "mode": "listener",
+        "local_addr": "0.0.0.0:9001",
+        "latency_ms": 200,
+        "redundancy": {
+          "mode": "listener",
+          "local_addr": "0.0.0.0:9002",
+          "latency_ms": 200
+        }
+      },
+      "outputs": [
+        {
+          "type": "rtp",
+          "id": "rtp-out",
+          "name": "Merged RTP Output",
+          "dest_addr": "127.0.0.1:5005"
+        }
+      ]
+    }
+  ]
+}

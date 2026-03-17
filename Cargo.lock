@@ -194,6 +194,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bilbycast-edge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bytes",
+ "chrono",
+ "clap",
+ "dashmap",
+ "rand 0.10.0",
+ "serde",
+ "serde_json",
+ "socket2",
+ "srt-protocol",
+ "srt-transport",
+ "strum",
+ "strum_macros",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1222,33 +1249,6 @@ dependencies = [
  "socket2",
  "srt-protocol",
  "tokio",
-]
-
-[[package]]
-name = "srtedge"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "bytes",
- "chrono",
- "clap",
- "dashmap",
- "rand 0.10.0",
- "serde",
- "serde_json",
- "socket2",
- "srt-protocol",
- "srt-transport",
- "strum",
- "strum_macros",
- "tempfile",
- "tokio",
- "tokio-util",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

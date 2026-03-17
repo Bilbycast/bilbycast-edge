@@ -1,0 +1,638 @@
+pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BilbyCast Edge Monitor</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,monospace;background:#0d1117;color:#c9d1d9;min-height:100vh}
+a{color:#58a6ff;text-decoration:none}
+header{background:#161b22;border-bottom:1px solid #30363d;padding:12px 24px;display:flex;align-items:center;justify-content:space-between}
+header h1{font-size:18px;font-weight:600;color:#f0f6fc}
+header .meta{font-size:13px;color:#8b949e}
+.system-bar{display:flex;gap:24px;padding:16px 24px;background:#161b22;border-bottom:1px solid #30363d;flex-wrap:wrap}
+.stat-box{display:flex;flex-direction:column;gap:2px}
+.stat-box .label{font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:0.5px}
+.stat-box .value{font-size:20px;font-weight:600;color:#f0f6fc}
+.container{padding:24px;display:grid;grid-template-columns:repeat(auto-fill,minmax(480px,1fr));gap:16px}
+.flow-card{background:#161b22;border:1px solid #30363d;border-radius:8px;overflow:hidden}
+.flow-header{padding:12px 16px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #21262d}
+.flow-name{font-size:15px;font-weight:600;color:#f0f6fc}
+.badge{padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600;text-transform:uppercase}
+.badge-running{background:#0d419d;color:#58a6ff}
+.badge-idle{background:#272c33;color:#8b949e}
+.badge-starting{background:#4d2d00;color:#d29922}
+.badge-error{background:#5c1a1a;color:#f85149}
+.badge-stopped{background:#272c33;color:#8b949e}
+.flow-viz{padding:12px 16px;border-bottom:1px solid #21262d}
+.flow-viz canvas{display:block;width:100%}
+.section{padding:12px 16px}
+.section-title{font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}
+.stat{display:flex;flex-direction:column}
+.stat .k{font-size:11px;color:#8b949e}
+.stat .v{font-size:14px;color:#c9d1d9;font-weight:500}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;color:#8b949e;font-weight:500;padding:4px 8px;font-size:11px;text-transform:uppercase}
+td{padding:4px 8px;color:#c9d1d9;border-top:1px solid #21262d}
+.srt-details{margin-top:8px;padding:8px 12px;background:#0d1117;border-radius:4px;font-size:12px}
+.srt-details .row{display:flex;gap:16px;flex-wrap:wrap}
+.srt-details .item{color:#8b949e}
+.srt-details .item span{color:#c9d1d9;font-weight:500}
+.no-flows{text-align:center;padding:48px 24px;color:#8b949e;font-size:15px}
+.error-banner{background:#5c1a1a;color:#f85149;padding:8px 24px;font-size:13px;text-align:center;display:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>BilbyCast Edge Monitor</h1>
+  <div class="meta" id="version"></div>
+</header>
+<div class="error-banner" id="error-banner">Connection lost - retrying...</div>
+<div class="system-bar" id="system-bar"></div>
+<div class="container" id="flows"></div>
+<script>
+const REFRESH_MS = 1500;
+let errorCount = 0;
+
+// ── Flow visualization state ──
+const vizStates = new Map();
+
+const C_GREEN = '#3fb950';
+const C_AMBER = '#d29922';
+const C_RED = '#f85149';
+const C_BLUE = '#58a6ff';
+const C_GRAY = '#8b949e';
+const C_TEXT = '#c9d1d9';
+const C_TEXT_DIM = '#8b949e';
+const C_BG = '#0d1117';
+const C_NODE_BG = '#161b22';
+
+function healthColor(state, dropped, srtStats) {
+  if (!state) return C_GRAY;
+  const s = String(state).toLowerCase();
+  if (s.includes('error') || s === 'broken') return C_RED;
+  if (s === 'connecting' || s === 'starting') return C_BLUE;
+  if (s === 'idle' || s === 'stopped') return C_GRAY;
+  if ((dropped && dropped > 0) || (srtStats && srtStats.pkt_loss_total > 0)) return C_AMBER;
+  return C_GREEN;
+}
+
+function inputHealthColor(inp) {
+  if (!inp || !inp.state) return C_GRAY;
+  const s = String(inp.state).toLowerCase();
+  if (s.includes('error') || s === 'broken') return C_RED;
+  if (s === 'connecting' || s === 'starting') return C_BLUE;
+  if (s === 'idle' || s === 'stopped' || s === 'waiting') return C_GRAY;
+  if (inp.packets_lost > 0) return C_AMBER;
+  return C_GREEN;
+}
+
+function computeLayout(w, h, numOutputs, dualInput) {
+  const nodeW = Math.min(w * 0.18, 110);
+  const nodeH = 36;
+  const hubX = w * 0.38;
+  const hubY = h / 2;
+  const inX = w * 0.08;
+  const outX = w - w * 0.08 - nodeW;
+  const outputs = [];
+  // Dual input legs for 2022-7 redundancy
+  let inputs = [];
+  if (dualInput) {
+    const gap = nodeH + 12;
+    inputs = [
+      { x: inX, y: hubY - gap / 2 },
+      { x: inX, y: hubY + gap / 2 }
+    ];
+  } else {
+    inputs = [{ x: inX, y: hubY }];
+  }
+  const inY = dualInput ? hubY : hubY;
+  if (numOutputs > 0) {
+    const totalH = numOutputs * (nodeH + 12) - 12;
+    const startY = (h - totalH) / 2 + nodeH / 2;
+    for (let i = 0; i < numOutputs; i++) {
+      outputs.push({ x: outX, y: startY + i * (nodeH + 12) });
+    }
+  }
+  return { inX, inY, hubX, hubY, nodeW, nodeH, outputs, inputs };
+}
+
+function drawRoundedRect(ctx, x, y, w, h, r, fillColor, strokeColor) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+  if (fillColor) { ctx.fillStyle = fillColor; ctx.fill(); }
+  if (strokeColor) { ctx.strokeStyle = strokeColor; ctx.lineWidth = 1.5; ctx.stroke(); }
+}
+
+function drawNode(ctx, x, y, w, h, label, sublabel, color) {
+  const r = 6;
+  // Fill with dark translucent version of color
+  const rgb = hexToRgb(color);
+  drawRoundedRect(ctx, x, y - h/2, w, h, r, 'rgba('+rgb.r+','+rgb.g+','+rgb.b+',0.12)', color);
+  // Status dot
+  ctx.beginPath();
+  ctx.arc(x + 10, y, 3.5, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+  // Label
+  ctx.fillStyle = C_TEXT;
+  ctx.font = '600 12px -apple-system,BlinkMacSystemFont,monospace';
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  ctx.fillText(label, x + 20, sublabel ? y - 6 : y);
+  if (sublabel) {
+    ctx.fillStyle = C_TEXT_DIM;
+    ctx.font = '10px -apple-system,BlinkMacSystemFont,monospace';
+    ctx.fillText(sublabel, x + 20, y + 8);
+  }
+}
+
+function drawHub(ctx, x, y, color) {
+  ctx.beginPath();
+  ctx.arc(x, y, 5, 0, Math.PI * 2);
+  const rgb = hexToRgb(color);
+  ctx.fillStyle = 'rgba('+rgb.r+','+rgb.g+','+rgb.b+',0.3)';
+  ctx.fill();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+}
+
+function drawConnection(ctx, x1, y1, x2, y2, color) {
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  // Bezier curve for smooth routing
+  const cpx = x1 + (x2 - x1) * 0.5;
+  ctx.bezierCurveTo(cpx, y1, cpx, y2, x2, y2);
+  const rgb = hexToRgb(color);
+  ctx.strokeStyle = 'rgba('+rgb.r+','+rgb.g+','+rgb.b+',0.35)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+}
+
+function bezierPoint(x1, y1, x2, y2, t) {
+  const cpx = x1 + (x2 - x1) * 0.5;
+  const u = 1 - t;
+  const x = u*u*u*x1 + 3*u*u*t*cpx + 3*u*t*t*cpx + t*t*t*x2;
+  const y = u*u*u*y1 + 3*u*u*t*y1 + 3*u*t*t*y2 + t*t*t*y2;
+  return { x, y };
+}
+
+function drawParticle(ctx, x, y, color) {
+  const rgb = hexToRgb(color);
+  // Glow
+  ctx.beginPath();
+  ctx.arc(x, y, 6, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba('+rgb.r+','+rgb.g+','+rgb.b+',0.15)';
+  ctx.fill();
+  // Core
+  ctx.beginPath();
+  ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+}
+
+function drawBitrateLabel(ctx, x, y, bps) {
+  const text = fmt_bitrate(bps);
+  ctx.fillStyle = C_TEXT_DIM;
+  ctx.font = '10px -apple-system,BlinkMacSystemFont,monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+  ctx.fillText(text, x, y - 4);
+}
+
+function hexToRgb(hex) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return { r, g, b };
+}
+
+function updateVizData(flowId, flowData) {
+  let vs = vizStates.get(flowId);
+  if (!vs) {
+    vs = { canvas: null, ctx: null, particles: new Map(), data: null, lastResize: 0 };
+    vizStates.set(flowId, vs);
+  }
+  vs.data = flowData;
+  // Ensure particle arrays match outputs
+  const outs = flowData.outputs || [];
+  // Input-to-hub particles
+  if (!vs.particles.has('_input')) {
+    vs.particles.set('_input', []);
+  }
+  for (const o of outs) {
+    const key = o.output_id || o.output_name;
+    if (!vs.particles.has(key)) {
+      vs.particles.set(key, []);
+    }
+  }
+  // Remove particles for removed outputs
+  for (const key of vs.particles.keys()) {
+    if (key === '_input') continue;
+    if (!outs.find(o => (o.output_id || o.output_name) === key)) {
+      vs.particles.delete(key);
+    }
+  }
+}
+
+function initVizCanvas(flowId) {
+  const vs = vizStates.get(flowId);
+  if (!vs) return;
+  const container = document.getElementById('viz-' + flowId);
+  if (!container) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = container.clientWidth;
+  const numOuts = (vs.data && vs.data.outputs) ? vs.data.outputs.length : 1;
+  const inp = vs.data ? vs.data.input : null;
+  const dualInput = inp && (inp.srt_leg2_stats || inp.redundancy_switches);
+  const minNodes = Math.max(numOuts, dualInput ? 2 : 1);
+  const h = Math.max(100, Math.min(minNodes * 50 + 40, 350));
+  let canvas = container.querySelector('canvas');
+  if (!canvas) {
+    canvas = document.createElement('canvas');
+    container.appendChild(canvas);
+  }
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  vs.canvas = canvas;
+  vs.ctx = ctx;
+  vs.w = w;
+  vs.h = h;
+}
+
+// Approximate bezier arc length by sampling points
+function bezierLength(x1, y1, x2, y2, steps) {
+  steps = steps || 16;
+  let len = 0;
+  let prev = bezierPoint(x1, y1, x2, y2, 0);
+  for (let i = 1; i <= steps; i++) {
+    const cur = bezierPoint(x1, y1, x2, y2, i / steps);
+    const dx = cur.x - prev.x, dy = cur.y - prev.y;
+    len += Math.sqrt(dx * dx + dy * dy);
+    prev = cur;
+  }
+  return len;
+}
+
+function updateParticles(particles, bps, dt, linePixelLen) {
+  const bpsMb = (bps || 0) / 1e6;
+  // Only animate when there is actual bitrate
+  const hasActivity = bpsMb > 0;
+  // 1-6 particles scaling with bitrate (1 at low rates, up to 6 at 100+ Mbps)
+  const targetCount = hasActivity ? Math.max(1, Math.min(Math.ceil(bpsMb / 20) + 1, 6)) : 0;
+  // Target pixel speed: 40-120 px/sec regardless of line length
+  const pxPerSec = hasActivity ? 40 + Math.min(bpsMb / 100, 1.0) * 80 : 0;
+  // Convert to t-units/sec using line length
+  const safeLen = Math.max(linePixelLen || 200, 50);
+  const speed = pxPerSec / safeLen;
+  // Add/remove particles to match target
+  while (particles.length < targetCount) {
+    particles.push({ t: Math.random() });
+  }
+  while (particles.length > targetCount) {
+    particles.pop();
+  }
+  // Advance
+  for (const p of particles) {
+    p.t += speed * dt;
+    if (p.t > 1) p.t -= 1;
+  }
+}
+
+let lastFrameTime = 0;
+
+function animateAll(timestamp) {
+  const dt = lastFrameTime ? (timestamp - lastFrameTime) / 1000 : 0.016;
+  lastFrameTime = timestamp;
+
+  for (const [flowId, vs] of vizStates) {
+    if (!vs.canvas || !vs.ctx || !vs.data) continue;
+    if (!vs.canvas.isConnected) continue;
+
+    const ctx = vs.ctx;
+    const w = vs.w;
+    const h = vs.h;
+    const inp = vs.data.input || {};
+    const outs = vs.data.outputs || [];
+    const dualInput = !!(inp.srt_leg2_stats || inp.redundancy_switches);
+    const layout = computeLayout(w, h, outs.length, dualInput);
+
+    ctx.clearRect(0, 0, w, h);
+
+    const inpColor = inputHealthColor(inp);
+    const inpLabel = (inp.input_type || 'INPUT').toUpperCase();
+
+    if (dualInput) {
+      // Draw two input leg nodes
+      const leg1Color = inp.srt_stats ? healthColor(inp.srt_stats.state, 0, inp.srt_stats) : inpColor;
+      const leg2Color = inp.srt_leg2_stats ? healthColor(inp.srt_leg2_stats.state, 0, inp.srt_leg2_stats) : C_GRAY;
+      const il1 = layout.inputs[0];
+      const il2 = layout.inputs[1];
+      drawNode(ctx, il1.x, il1.y, layout.nodeW, layout.nodeH, inpLabel, 'Leg 1', leg1Color);
+      drawNode(ctx, il2.x, il2.y, layout.nodeW, layout.nodeH, inpLabel, 'Leg 2', leg2Color);
+
+      if (outs.length === 0) { requestAnimationFrame(animateAll); return; }
+
+      // Draw hub
+      drawHub(ctx, layout.hubX, layout.hubY, inpColor);
+
+      // Draw leg1-to-hub and leg2-to-hub lines
+      const inRight = il1.x + layout.nodeW;
+      drawConnection(ctx, inRight, il1.y, layout.hubX, layout.hubY, leg1Color);
+      drawConnection(ctx, inRight, il2.y, layout.hubX, layout.hubY, leg2Color);
+
+      // Leg 1 particles
+      const l1Parts = vs.particles.get('_input') || [];
+      const l1Len = bezierLength(inRight, il1.y, layout.hubX, layout.hubY);
+      updateParticles(l1Parts, inp.bitrate_bps, dt, l1Len);
+      for (const p of l1Parts) {
+        const pt = bezierPoint(inRight, il1.y, layout.hubX, layout.hubY, p.t);
+        drawParticle(ctx, pt.x, pt.y, leg1Color);
+      }
+
+      // Leg 2 particles
+      if (!vs.particles.has('_input2')) vs.particles.set('_input2', []);
+      const l2Parts = vs.particles.get('_input2');
+      const l2Len = bezierLength(inRight, il2.y, layout.hubX, layout.hubY);
+      updateParticles(l2Parts, inp.bitrate_bps, dt, l2Len);
+      for (const p of l2Parts) {
+        const pt = bezierPoint(inRight, il2.y, layout.hubX, layout.hubY, p.t);
+        drawParticle(ctx, pt.x, pt.y, leg2Color);
+      }
+
+      // Bitrate label between legs (centered)
+      const midY = (il1.y + il2.y) / 2;
+      const inMid = bezierPoint(inRight, midY, layout.hubX, layout.hubY, 0.45);
+      drawBitrateLabel(ctx, inMid.x, inMid.y, inp.bitrate_bps);
+    } else {
+      // Single input node
+      drawNode(ctx, layout.inputs[0].x, layout.inputs[0].y, layout.nodeW, layout.nodeH, inpLabel, inp.state || '', inpColor);
+
+      if (outs.length === 0) { requestAnimationFrame(animateAll); return; }
+
+      // Draw hub
+      drawHub(ctx, layout.hubX, layout.hubY, inpColor);
+
+      // Draw input-to-hub line
+      const inRight = layout.inputs[0].x + layout.nodeW;
+      drawConnection(ctx, inRight, layout.inputs[0].y, layout.hubX, layout.hubY, inpColor);
+
+      // Input particles
+      const inpParts = vs.particles.get('_input') || [];
+      const inpLineLen = bezierLength(inRight, layout.inputs[0].y, layout.hubX, layout.hubY);
+      updateParticles(inpParts, inp.bitrate_bps, dt, inpLineLen);
+      for (const p of inpParts) {
+        const pt = bezierPoint(inRight, layout.inputs[0].y, layout.hubX, layout.hubY, p.t);
+        drawParticle(ctx, pt.x, pt.y, inpColor);
+      }
+
+      // Bitrate label on input line
+      const inMid = bezierPoint(inRight, layout.inputs[0].y, layout.hubX, layout.hubY, 0.5);
+      drawBitrateLabel(ctx, inMid.x, inMid.y, inp.bitrate_bps);
+    }
+
+    // Draw each output
+    for (let i = 0; i < outs.length; i++) {
+      const o = outs[i];
+      const ol = layout.outputs[i];
+      const oColor = healthColor(o.state, o.packets_dropped, o.srt_stats);
+      const oLabel = (o.output_name || o.output_id || 'OUT').substring(0, 14);
+      const oSub = (o.output_type || '').toUpperCase();
+
+      // Hub-to-output line
+      drawConnection(ctx, layout.hubX, layout.hubY, ol.x, ol.y, oColor);
+
+      // Output particles
+      const key = o.output_id || o.output_name;
+      const parts = vs.particles.get(key) || [];
+      const oLineLen = bezierLength(layout.hubX, layout.hubY, ol.x, ol.y);
+      updateParticles(parts, o.bitrate_bps, dt, oLineLen);
+      for (const p of parts) {
+        const pt = bezierPoint(layout.hubX, layout.hubY, ol.x, ol.y, p.t);
+        drawParticle(ctx, pt.x, pt.y, oColor);
+      }
+
+      // Bitrate label
+      const oMid = bezierPoint(layout.hubX, layout.hubY, ol.x, ol.y, 0.5);
+      drawBitrateLabel(ctx, oMid.x, oMid.y, o.bitrate_bps);
+
+      // Output node
+      drawNode(ctx, ol.x, ol.y, layout.nodeW, layout.nodeH, oLabel, oSub, oColor);
+    }
+  }
+
+  requestAnimationFrame(animateAll);
+}
+
+requestAnimationFrame(animateAll);
+
+// ── Formatters ──
+
+function fmt_uptime(s) {
+  if (!s && s !== 0) return '-';
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (d > 0) return d + 'd ' + h + 'h ' + m + 'm';
+  if (h > 0) return h + 'h ' + m + 'm ' + sec + 's';
+  return m + 'm ' + sec + 's';
+}
+
+function fmt_bitrate(bps) {
+  if (!bps) return '0 bps';
+  if (bps >= 1e9) return (bps / 1e9).toFixed(2) + ' Gbps';
+  if (bps >= 1e6) return (bps / 1e6).toFixed(2) + ' Mbps';
+  if (bps >= 1e3) return (bps / 1e3).toFixed(1) + ' Kbps';
+  return bps + ' bps';
+}
+
+function fmt_bytes(b) {
+  if (!b) return '0 B';
+  if (b >= 1e12) return (b / 1e12).toFixed(2) + ' TB';
+  if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB';
+  if (b >= 1e6) return (b / 1e6).toFixed(1) + ' MB';
+  if (b >= 1e3) return (b / 1e3).toFixed(1) + ' KB';
+  return b + ' B';
+}
+
+function fmt_num(n) {
+  if (n === undefined || n === null) return '0';
+  return n.toLocaleString();
+}
+
+function badge_class(state) {
+  if (!state) return 'badge-idle';
+  const s = typeof state === 'string' ? state.toLowerCase() : '';
+  if (s === 'running') return 'badge-running';
+  if (s === 'starting') return 'badge-starting';
+  if (s === 'stopped') return 'badge-stopped';
+  if (s === 'idle') return 'badge-idle';
+  return 'badge-error';
+}
+
+function state_label(state) {
+  if (!state) return 'Idle';
+  if (typeof state === 'object' && state.Error) return 'Error: ' + state.Error;
+  return state;
+}
+
+function render_srt(srt, label) {
+  if (!srt) return '';
+  return '<div class="srt-details"><div class="row">' +
+    '<div class="item">' + label + ': <span>' + srt.state + '</span></div>' +
+    '<div class="item">RTT: <span>' + (srt.rtt_ms || 0).toFixed(1) + ' ms</span></div>' +
+    '<div class="item">Loss: <span>' + fmt_num(srt.pkt_loss_total) + '</span></div>' +
+    '<div class="item">Retransmit: <span>' + fmt_num(srt.pkt_retransmit_total) + '</span></div>' +
+    '</div></div>';
+}
+
+function render(data) {
+  const sys = data.system;
+  document.getElementById('version').textContent = 'v' + sys.version;
+
+  document.getElementById('system-bar').innerHTML =
+    '<div class="stat-box"><div class="label">Uptime</div><div class="value">' + fmt_uptime(sys.uptime_secs) + '</div></div>' +
+    '<div class="stat-box"><div class="label">Active Flows</div><div class="value">' + sys.active_flows + ' / ' + sys.total_flows + '</div></div>' +
+    '<div class="stat-box"><div class="label">Version</div><div class="value">' + sys.version + '</div></div>';
+
+  const flows = data.flows || [];
+  const container = document.getElementById('flows');
+
+  if (flows.length === 0) {
+    container.innerHTML = '<div class="no-flows">No flows configured</div>';
+    vizStates.clear();
+    return;
+  }
+
+  // Update viz data for all flows before rebuilding HTML
+  const activeIds = new Set();
+  for (const f of flows) {
+    const fid = f.flow_id;
+    activeIds.add(fid);
+    updateVizData(fid, f);
+  }
+  // Remove stale viz states
+  for (const key of vizStates.keys()) {
+    if (!activeIds.has(key)) vizStates.delete(key);
+  }
+
+  let html = '';
+  for (const f of flows) {
+    const st = state_label(f.state);
+    const bc = badge_class(f.state);
+    const inp = f.input || {};
+    const outs = f.outputs || [];
+
+    html += '<div class="flow-card">';
+    html += '<div class="flow-header"><span class="flow-name">' + esc(f.flow_name || f.flow_id) + '</span>';
+    html += '<span class="badge ' + bc + '">' + esc(st) + '</span></div>';
+
+    // Flow visualization canvas
+    html += '<div class="flow-viz" id="viz-' + esc(f.flow_id) + '"></div>';
+
+    // Input section
+    html += '<div class="section"><div class="section-title">Input (' + esc(inp.input_type || 'unknown') + ')</div>';
+    html += '<div class="stats-grid">';
+    html += '<div class="stat"><div class="k">State</div><div class="v">' + esc(inp.state || '-') + '</div></div>';
+    html += '<div class="stat"><div class="k">Packets</div><div class="v">' + fmt_num(inp.packets_received) + '</div></div>';
+    html += '<div class="stat"><div class="k">Bytes</div><div class="v">' + fmt_bytes(inp.bytes_received) + '</div></div>';
+    html += '<div class="stat"><div class="k">Bitrate</div><div class="v">' + fmt_bitrate(inp.bitrate_bps) + '</div></div>';
+    html += '<div class="stat"><div class="k">Lost</div><div class="v">' + fmt_num(inp.packets_lost) + '</div></div>';
+    if (inp.packets_recovered_fec) {
+      html += '<div class="stat"><div class="k">FEC Recovered</div><div class="v">' + fmt_num(inp.packets_recovered_fec) + '</div></div>';
+    }
+    if (inp.redundancy_switches) {
+      html += '<div class="stat"><div class="k">Redundancy Switches</div><div class="v">' + fmt_num(inp.redundancy_switches) + '</div></div>';
+    }
+    html += '</div>';
+    html += render_srt(inp.srt_stats, 'SRT Leg1');
+    html += render_srt(inp.srt_leg2_stats, 'SRT Leg2');
+    html += '</div>';
+
+    // Outputs section
+    if (outs.length > 0) {
+      html += '<div class="section"><div class="section-title">Outputs</div>';
+      html += '<table><tr><th>Name</th><th>Type</th><th>State</th><th>Packets</th><th>Bytes</th><th>Bitrate</th><th>Dropped</th></tr>';
+      for (const o of outs) {
+        html += '<tr>';
+        html += '<td>' + esc(o.output_name || o.output_id) + '</td>';
+        html += '<td>' + esc(o.output_type || '-') + '</td>';
+        html += '<td>' + esc(o.state || '-') + '</td>';
+        html += '<td>' + fmt_num(o.packets_sent) + '</td>';
+        html += '<td>' + fmt_bytes(o.bytes_sent) + '</td>';
+        html += '<td>' + fmt_bitrate(o.bitrate_bps) + '</td>';
+        html += '<td>' + fmt_num(o.packets_dropped) + '</td>';
+        html += '</tr>';
+      }
+      html += '</table>';
+      for (const o of outs) {
+        html += render_srt(o.srt_stats, esc(o.output_name || o.output_id) + ' Leg1');
+        html += render_srt(o.srt_leg2_stats, esc(o.output_name || o.output_id) + ' Leg2');
+      }
+      html += '</div>';
+    }
+
+    html += '</div>';
+  }
+  container.innerHTML = html;
+
+  // Initialize canvases after DOM is updated
+  for (const f of flows) {
+    initVizCanvas(f.flow_id);
+  }
+}
+
+function esc(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// Handle window resize — reinitialize canvases
+let resizeTimer = null;
+window.addEventListener('resize', function() {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(function() {
+    for (const [flowId] of vizStates) {
+      initVizCanvas(flowId);
+    }
+  }, 150);
+});
+
+async function poll() {
+  try {
+    const res = await fetch('/api/stats');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    render(data);
+    errorCount = 0;
+    document.getElementById('error-banner').style.display = 'none';
+  } catch (e) {
+    errorCount++;
+    if (errorCount > 2) {
+      document.getElementById('error-banner').style.display = 'block';
+    }
+  }
+}
+
+poll();
+setInterval(poll, REFRESH_MS);
+</script>
+</body>
+</html>"##;

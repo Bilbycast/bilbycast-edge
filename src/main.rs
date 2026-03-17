@@ -1,4 +1,4 @@
-//! srtedge binary entry point.
+//! bilbycast-edge binary entry point.
 //!
 //! Parses CLI arguments, loads and validates the JSON config,
 //! starts all enabled flows, launches the axum API server, and
@@ -32,7 +32,7 @@ use stats::collector::StatsCollector;
 use api::server::{AppState, build_router};
 
 #[derive(Parser, Debug)]
-#[command(name = "srtedge")]
+#[command(name = "bilbycast-edge")]
 #[command(about = "RTP/SMPTE 2022-2 over SRT transport bridge with 2022-7 hitless redundancy")]
 #[command(version)]
 struct Cli {
@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
     util::time::init_epoch();
 
     tracing::info!(
-        "srtedge v{} starting",
+        "bilbycast-edge v{} starting",
         env!("CARGO_PKG_VERSION")
     );
 
@@ -181,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
     // Graceful shutdown: stop all flows
     flow_manager.stop_all().await;
 
-    tracing::info!("srtedge shutting down");
+    tracing::info!("bilbycast-edge shutting down");
     Ok(())
 }
 

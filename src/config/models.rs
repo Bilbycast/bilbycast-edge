@@ -45,7 +45,7 @@ impl Default for ServerConfig {
 
 /// Optional web monitoring dashboard configuration.
 ///
-/// When present, srtedge starts a second HTTP server on the specified address
+/// When present, bilbycast-edge starts a second HTTP server on the specified address
 /// serving a self-contained HTML dashboard for browser-based status monitoring.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitorConfig {

@@ -1,5 +1,5 @@
 [package]
-name = "srtedge"
+name = "bilbycast-edge"
 version = "0.1.0"
 edition = "2024"
 description = "RTP/SMPTE 2022-2 over SRT transport bridge with 2022-7 hitless redundancy"
@@ -50,8 +50,8 @@ anyhow = "1.0.102"
 uuid = { version = "1.22.0", features = ["v4", "serde"] }
 
 # SRT native (pure Rust)
-srt-transport = { path = "../srt-native/srt-transport" }
-srt-protocol = { path = "../srt-native/srt-protocol" }
+srt-transport = { path = "../bilbycast-srt/srt-transport" }
+srt-protocol = { path = "../bilbycast-srt/srt-protocol" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

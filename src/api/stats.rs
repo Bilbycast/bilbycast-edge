@@ -99,7 +99,7 @@ pub async fn flow_stats(
 ///
 /// Returns a [`HealthResponse`] JSON object with the following fields:
 /// - `status`: always `"ok"` if the server is responsive.
-/// - `version`: the SRTEdge application version (from `CARGO_PKG_VERSION`).
+/// - `version`: the BilbyCast Edge application version (from `CARGO_PKG_VERSION`).
 /// - `uptime_secs`: seconds since the application started.
 /// - `active_flows`: number of flows currently running in the engine.
 /// - `total_flows`: total number of flows defined in the configuration.
@@ -126,29 +126,29 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 /// Metrics are organized into the following categories:
 ///
 /// **Application-level gauges:**
-/// - `srtedge_info` -- application version label
-/// - `srtedge_uptime_seconds` -- time since startup in seconds
-/// - `srtedge_flows_total` -- total number of configured flows
-/// - `srtedge_flows_active` -- number of currently running flows
+/// - `bilbycast_edge_info` -- application version label
+/// - `bilbycast_edge_uptime_seconds` -- time since startup in seconds
+/// - `bilbycast_edge_flows_total` -- total number of configured flows
+/// - `bilbycast_edge_flows_active` -- number of currently running flows
 ///
 /// **Per-flow input counters/gauges** (labeled by `flow_id`):
-/// - `srtedge_flow_input_packets_total` -- total RTP packets received
-/// - `srtedge_flow_input_bytes_total` -- total bytes received
-/// - `srtedge_flow_input_bitrate_bps` -- current input bitrate (bits/sec)
-/// - `srtedge_flow_input_packets_lost` -- total packets lost (sequence gaps)
-/// - `srtedge_flow_input_fec_recovered_total` -- packets recovered via FEC
-/// - `srtedge_flow_input_redundancy_switches_total` -- SMPTE 2022-7 leg switches
+/// - `bilbycast_edge_flow_input_packets_total` -- total RTP packets received
+/// - `bilbycast_edge_flow_input_bytes_total` -- total bytes received
+/// - `bilbycast_edge_flow_input_bitrate_bps` -- current input bitrate (bits/sec)
+/// - `bilbycast_edge_flow_input_packets_lost` -- total packets lost (sequence gaps)
+/// - `bilbycast_edge_flow_input_fec_recovered_total` -- packets recovered via FEC
+/// - `bilbycast_edge_flow_input_redundancy_switches_total` -- SMPTE 2022-7 leg switches
 ///
 /// **Per-output counters/gauges** (labeled by `flow_id` + `output_id`):
-/// - `srtedge_flow_output_packets_total` -- total packets sent
-/// - `srtedge_flow_output_bytes_total` -- total bytes sent
-/// - `srtedge_flow_output_bitrate_bps` -- current output bitrate (bits/sec)
-/// - `srtedge_flow_output_packets_dropped` -- packets dropped due to lag
-/// - `srtedge_flow_output_fec_sent_total` -- FEC packets sent
+/// - `bilbycast_edge_flow_output_packets_total` -- total packets sent
+/// - `bilbycast_edge_flow_output_bytes_total` -- total bytes sent
+/// - `bilbycast_edge_flow_output_bitrate_bps` -- current output bitrate (bits/sec)
+/// - `bilbycast_edge_flow_output_packets_dropped` -- packets dropped due to lag
+/// - `bilbycast_edge_flow_output_fec_sent_total` -- FEC packets sent
 ///
 /// **SRT-specific gauges** (labeled by `flow_id`, optionally `output_id` and `leg`):
-/// - `srtedge_srt_rtt_ms` -- SRT round-trip time in milliseconds
-/// - `srtedge_srt_loss_total` -- SRT total packet loss counter
+/// - `bilbycast_edge_srt_rtt_ms` -- SRT round-trip time in milliseconds
+/// - `bilbycast_edge_srt_loss_total` -- SRT total packet loss counter
 ///
 /// Only metrics for currently running flows are emitted; idle flows are excluded.
 pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
@@ -159,185 +159,185 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
     let mut output = String::new();
 
     // App info
-    output.push_str("# HELP srtedge_info Application info\n");
-    output.push_str("# TYPE srtedge_info gauge\n");
+    output.push_str("# HELP bilbycast_edge_info Application info\n");
+    output.push_str("# TYPE bilbycast_edge_info gauge\n");
     output.push_str(&format!(
-        "srtedge_info{{version=\"{}\"}} 1\n",
+        "bilbycast_edge_info{{version=\"{}\"}} 1\n",
         env!("CARGO_PKG_VERSION")
     ));
 
-    output.push_str("# HELP srtedge_uptime_seconds Application uptime\n");
-    output.push_str("# TYPE srtedge_uptime_seconds gauge\n");
-    output.push_str(&format!("srtedge_uptime_seconds {uptime}\n"));
+    output.push_str("# HELP bilbycast_edge_uptime_seconds Application uptime\n");
+    output.push_str("# TYPE bilbycast_edge_uptime_seconds gauge\n");
+    output.push_str(&format!("bilbycast_edge_uptime_seconds {uptime}\n"));
 
-    output.push_str("# HELP srtedge_flows_total Total configured flows\n");
-    output.push_str("# TYPE srtedge_flows_total gauge\n");
-    output.push_str(&format!("srtedge_flows_total {}\n", config.flows.len()));
+    output.push_str("# HELP bilbycast_edge_flows_total Total configured flows\n");
+    output.push_str("# TYPE bilbycast_edge_flows_total gauge\n");
+    output.push_str(&format!("bilbycast_edge_flows_total {}\n", config.flows.len()));
 
-    output.push_str("# HELP srtedge_flows_active Currently running flows\n");
-    output.push_str("# TYPE srtedge_flows_active gauge\n");
+    output.push_str("# HELP bilbycast_edge_flows_active Currently running flows\n");
+    output.push_str("# TYPE bilbycast_edge_flows_active gauge\n");
     output.push_str(&format!(
-        "srtedge_flows_active {}\n",
+        "bilbycast_edge_flows_active {}\n",
         state.flow_manager.active_flow_count()
     ));
 
     // Per-flow input metrics
     if !flow_snapshots.is_empty() {
-        output.push_str("\n# HELP srtedge_flow_input_packets_total Total RTP packets received\n");
-        output.push_str("# TYPE srtedge_flow_input_packets_total counter\n");
+        output.push_str("\n# HELP bilbycast_edge_flow_input_packets_total Total RTP packets received\n");
+        output.push_str("# TYPE bilbycast_edge_flow_input_packets_total counter\n");
         for fs in &flow_snapshots {
             output.push_str(&format!(
-                "srtedge_flow_input_packets_total{{flow_id=\"{}\"}} {}\n",
+                "bilbycast_edge_flow_input_packets_total{{flow_id=\"{}\"}} {}\n",
                 fs.flow_id, fs.input.packets_received
             ));
         }
 
-        output.push_str("\n# HELP srtedge_flow_input_bytes_total Total bytes received\n");
-        output.push_str("# TYPE srtedge_flow_input_bytes_total counter\n");
+        output.push_str("\n# HELP bilbycast_edge_flow_input_bytes_total Total bytes received\n");
+        output.push_str("# TYPE bilbycast_edge_flow_input_bytes_total counter\n");
         for fs in &flow_snapshots {
             output.push_str(&format!(
-                "srtedge_flow_input_bytes_total{{flow_id=\"{}\"}} {}\n",
+                "bilbycast_edge_flow_input_bytes_total{{flow_id=\"{}\"}} {}\n",
                 fs.flow_id, fs.input.bytes_received
             ));
         }
 
-        output.push_str("\n# HELP srtedge_flow_input_bitrate_bps Input bitrate in bits per second\n");
-        output.push_str("# TYPE srtedge_flow_input_bitrate_bps gauge\n");
+        output.push_str("\n# HELP bilbycast_edge_flow_input_bitrate_bps Input bitrate in bits per second\n");
+        output.push_str("# TYPE bilbycast_edge_flow_input_bitrate_bps gauge\n");
         for fs in &flow_snapshots {
             output.push_str(&format!(
-                "srtedge_flow_input_bitrate_bps{{flow_id=\"{}\"}} {}\n",
+                "bilbycast_edge_flow_input_bitrate_bps{{flow_id=\"{}\"}} {}\n",
                 fs.flow_id, fs.input.bitrate_bps
             ));
         }
 
-        output.push_str("\n# HELP srtedge_flow_input_packets_lost Total packets lost (sequence gaps)\n");
-        output.push_str("# TYPE srtedge_flow_input_packets_lost counter\n");
+        output.push_str("\n# HELP bilbycast_edge_flow_input_packets_lost Total packets lost (sequence gaps)\n");
+        output.push_str("# TYPE bilbycast_edge_flow_input_packets_lost counter\n");
         for fs in &flow_snapshots {
             output.push_str(&format!(
-                "srtedge_flow_input_packets_lost{{flow_id=\"{}\"}} {}\n",
+                "bilbycast_edge_flow_input_packets_lost{{flow_id=\"{}\"}} {}\n",
                 fs.flow_id, fs.input.packets_lost
             ));
         }
 
-        output.push_str("\n# HELP srtedge_flow_input_fec_recovered_total Packets recovered via FEC\n");
-        output.push_str("# TYPE srtedge_flow_input_fec_recovered_total counter\n");
+        output.push_str("\n# HELP bilbycast_edge_flow_input_fec_recovered_total Packets recovered via FEC\n");
+        output.push_str("# TYPE bilbycast_edge_flow_input_fec_recovered_total counter\n");
         for fs in &flow_snapshots {
             output.push_str(&format!(
-                "srtedge_flow_input_fec_recovered_total{{flow_id=\"{}\"}} {}\n",
+                "bilbycast_edge_flow_input_fec_recovered_total{{flow_id=\"{}\"}} {}\n",
                 fs.flow_id, fs.input.packets_recovered_fec
             ));
         }
 
-        output.push_str("\n# HELP srtedge_flow_input_redundancy_switches_total Redundancy leg switches\n");
-        output.push_str("# TYPE srtedge_flow_input_redundancy_switches_total counter\n");
+        output.push_str("\n# HELP bilbycast_edge_flow_input_redundancy_switches_total Redundancy leg switches\n");
+        output.push_str("# TYPE bilbycast_edge_flow_input_redundancy_switches_total counter\n");
         for fs in &flow_snapshots {
             output.push_str(&format!(
-                "srtedge_flow_input_redundancy_switches_total{{flow_id=\"{}\"}} {}\n",
+                "bilbycast_edge_flow_input_redundancy_switches_total{{flow_id=\"{}\"}} {}\n",
                 fs.flow_id, fs.input.redundancy_switches
             ));
         }
 
         // Per-output metrics
-        output.push_str("\n# HELP srtedge_flow_output_packets_total Total packets sent per output\n");
-        output.push_str("# TYPE srtedge_flow_output_packets_total counter\n");
+        output.push_str("\n# HELP bilbycast_edge_flow_output_packets_total Total packets sent per output\n");
+        output.push_str("# TYPE bilbycast_edge_flow_output_packets_total counter\n");
         for fs in &flow_snapshots {
             for os in &fs.outputs {
                 output.push_str(&format!(
-                    "srtedge_flow_output_packets_total{{flow_id=\"{}\",output_id=\"{}\"}} {}\n",
+                    "bilbycast_edge_flow_output_packets_total{{flow_id=\"{}\",output_id=\"{}\"}} {}\n",
                     fs.flow_id, os.output_id, os.packets_sent
                 ));
             }
         }
 
-        output.push_str("\n# HELP srtedge_flow_output_bytes_total Total bytes sent per output\n");
-        output.push_str("# TYPE srtedge_flow_output_bytes_total counter\n");
+        output.push_str("\n# HELP bilbycast_edge_flow_output_bytes_total Total bytes sent per output\n");
+        output.push_str("# TYPE bilbycast_edge_flow_output_bytes_total counter\n");
         for fs in &flow_snapshots {
             for os in &fs.outputs {
                 output.push_str(&format!(
-                    "srtedge_flow_output_bytes_total{{flow_id=\"{}\",output_id=\"{}\"}} {}\n",
+                    "bilbycast_edge_flow_output_bytes_total{{flow_id=\"{}\",output_id=\"{}\"}} {}\n",
                     fs.flow_id, os.output_id, os.bytes_sent
                 ));
             }
         }
 
-        output.push_str("\n# HELP srtedge_flow_output_bitrate_bps Output bitrate in bits per second\n");
-        output.push_str("# TYPE srtedge_flow_output_bitrate_bps gauge\n");
+        output.push_str("\n# HELP bilbycast_edge_flow_output_bitrate_bps Output bitrate in bits per second\n");
+        output.push_str("# TYPE bilbycast_edge_flow_output_bitrate_bps gauge\n");
         for fs in &flow_snapshots {
             for os in &fs.outputs {
                 output.push_str(&format!(
-                    "srtedge_flow_output_bitrate_bps{{flow_id=\"{}\",output_id=\"{}\"}} {}\n",
+                    "bilbycast_edge_flow_output_bitrate_bps{{flow_id=\"{}\",output_id=\"{}\"}} {}\n",
                     fs.flow_id, os.output_id, os.bitrate_bps
                 ));
             }
         }
 
-        output.push_str("\n# HELP srtedge_flow_output_packets_dropped Packets dropped due to lag\n");
-        output.push_str("# TYPE srtedge_flow_output_packets_dropped counter\n");
+        output.push_str("\n# HELP bilbycast_edge_flow_output_packets_dropped Packets dropped due to lag\n");
+        output.push_str("# TYPE bilbycast_edge_flow_output_packets_dropped counter\n");
         for fs in &flow_snapshots {
             for os in &fs.outputs {
                 output.push_str(&format!(
-                    "srtedge_flow_output_packets_dropped{{flow_id=\"{}\",output_id=\"{}\"}} {}\n",
+                    "bilbycast_edge_flow_output_packets_dropped{{flow_id=\"{}\",output_id=\"{}\"}} {}\n",
                     fs.flow_id, os.output_id, os.packets_dropped
                 ));
             }
         }
 
-        output.push_str("\n# HELP srtedge_flow_output_fec_sent_total FEC packets sent per output\n");
-        output.push_str("# TYPE srtedge_flow_output_fec_sent_total counter\n");
+        output.push_str("\n# HELP bilbycast_edge_flow_output_fec_sent_total FEC packets sent per output\n");
+        output.push_str("# TYPE bilbycast_edge_flow_output_fec_sent_total counter\n");
         for fs in &flow_snapshots {
             for os in &fs.outputs {
                 output.push_str(&format!(
-                    "srtedge_flow_output_fec_sent_total{{flow_id=\"{}\",output_id=\"{}\"}} {}\n",
+                    "bilbycast_edge_flow_output_fec_sent_total{{flow_id=\"{}\",output_id=\"{}\"}} {}\n",
                     fs.flow_id, os.output_id, os.fec_packets_sent
                 ));
             }
         }
 
         // SRT-specific metrics (when available)
-        output.push_str("\n# HELP srtedge_srt_rtt_ms SRT round-trip time in milliseconds\n");
-        output.push_str("# TYPE srtedge_srt_rtt_ms gauge\n");
+        output.push_str("\n# HELP bilbycast_edge_srt_rtt_ms SRT round-trip time in milliseconds\n");
+        output.push_str("# TYPE bilbycast_edge_srt_rtt_ms gauge\n");
         for fs in &flow_snapshots {
             if let Some(ref srt) = fs.input.srt_stats {
                 output.push_str(&format!(
-                    "srtedge_srt_rtt_ms{{flow_id=\"{}\",leg=\"input\"}} {:.1}\n",
+                    "bilbycast_edge_srt_rtt_ms{{flow_id=\"{}\",leg=\"input\"}} {:.1}\n",
                     fs.flow_id, srt.rtt_ms
                 ));
             }
             if let Some(ref srt) = fs.input.srt_leg2_stats {
                 output.push_str(&format!(
-                    "srtedge_srt_rtt_ms{{flow_id=\"{}\",leg=\"input_leg2\"}} {:.1}\n",
+                    "bilbycast_edge_srt_rtt_ms{{flow_id=\"{}\",leg=\"input_leg2\"}} {:.1}\n",
                     fs.flow_id, srt.rtt_ms
                 ));
             }
             for os in &fs.outputs {
                 if let Some(ref srt) = os.srt_stats {
                     output.push_str(&format!(
-                        "srtedge_srt_rtt_ms{{flow_id=\"{}\",output_id=\"{}\",leg=\"leg1\"}} {:.1}\n",
+                        "bilbycast_edge_srt_rtt_ms{{flow_id=\"{}\",output_id=\"{}\",leg=\"leg1\"}} {:.1}\n",
                         fs.flow_id, os.output_id, srt.rtt_ms
                     ));
                 }
                 if let Some(ref srt) = os.srt_leg2_stats {
                     output.push_str(&format!(
-                        "srtedge_srt_rtt_ms{{flow_id=\"{}\",output_id=\"{}\",leg=\"leg2\"}} {:.1}\n",
+                        "bilbycast_edge_srt_rtt_ms{{flow_id=\"{}\",output_id=\"{}\",leg=\"leg2\"}} {:.1}\n",
                         fs.flow_id, os.output_id, srt.rtt_ms
                     ));
                 }
             }
         }
 
-        output.push_str("\n# HELP srtedge_srt_loss_total SRT total packet loss\n");
-        output.push_str("# TYPE srtedge_srt_loss_total counter\n");
+        output.push_str("\n# HELP bilbycast_edge_srt_loss_total SRT total packet loss\n");
+        output.push_str("# TYPE bilbycast_edge_srt_loss_total counter\n");
         for fs in &flow_snapshots {
             if let Some(ref srt) = fs.input.srt_stats {
                 output.push_str(&format!(
-                    "srtedge_srt_loss_total{{flow_id=\"{}\",leg=\"input\"}} {}\n",
+                    "bilbycast_edge_srt_loss_total{{flow_id=\"{}\",leg=\"input\"}} {}\n",
                     fs.flow_id, srt.pkt_loss_total
                 ));
             }
             for os in &fs.outputs {
                 if let Some(ref srt) = os.srt_stats {
                     output.push_str(&format!(
-                        "srtedge_srt_loss_total{{flow_id=\"{}\",output_id=\"{}\",leg=\"leg1\"}} {}\n",
+                        "bilbycast_edge_srt_loss_total{{flow_id=\"{}\",output_id=\"{}\",leg=\"leg1\"}} {}\n",
                         fs.flow_id, os.output_id, srt.pkt_loss_total
                     ));
                 }

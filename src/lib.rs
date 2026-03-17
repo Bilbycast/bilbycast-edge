@@ -1,4 +1,4 @@
-//! # srtedge
+//! # bilbycast-edge
 //!
 //! A high-performance RTP/SMPTE 2022-2 over SRT transport bridge with
 //! SMPTE 2022-7 hitless redundancy and SMPTE 2022-1 Forward Error Correction.

@@ -114,7 +114,7 @@ pub async fn connect_srt(
             Ok(Arc::new(sock))
         }
         SrtMode::Rendezvous => {
-            bail!("Rendezvous mode is not yet supported with srt-native");
+            bail!("Rendezvous mode is not yet supported with bilbycast-srt");
         }
     }
 }

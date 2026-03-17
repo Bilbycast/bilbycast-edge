@@ -52,7 +52,7 @@ mod tests {
 
     #[test]
     fn test_load_nonexistent_returns_default() {
-        let path = Path::new("/tmp/nonexistent_srtedge_config_test.json");
+        let path = Path::new("/tmp/nonexistent_bilbycast_edge_config_test.json");
         let config = load_config(path).unwrap();
         assert!(config.flows.is_empty());
         assert_eq!(config.version, 1);
