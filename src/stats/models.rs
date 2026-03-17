@@ -15,6 +15,9 @@ pub struct FlowStats {
     pub outputs: Vec<OutputStats>,
     /// Wall-clock seconds since the flow was started.
     pub uptime_secs: u64,
+    /// TR-101290 transport stream analysis (present when flow is running).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tr101290: Option<Tr101290Stats>,
 }
 
 /// Lifecycle state of a media flow.
@@ -88,6 +91,51 @@ pub struct OutputStats {
     /// SRT-level statistics for the redundancy (second) output leg (if SMPTE 2022-7).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub srt_leg2_stats: Option<SrtLegStats>,
+}
+
+/// TR-101290 transport stream analysis statistics for a single flow.
+///
+/// Contains error counts for Priority 1 (critical) and Priority 2 (important)
+/// checks as defined by ETSI TR 101 290. Summary flags `priority1_ok` and
+/// `priority2_ok` indicate whether any errors have been detected since the
+/// flow started.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct Tr101290Stats {
+    /// Total MPEG-TS packets inspected by the analyzer.
+    pub ts_packets_analyzed: u64,
+    /// Number of PAT sections received.
+    pub pat_count: u64,
+    /// Number of PMT sections received.
+    pub pmt_count: u64,
+
+    // ── Priority 1 (critical) ──
+
+    /// Number of times sync was lost (≥5 consecutive missing 0x47 sync bytes).
+    pub sync_loss_count: u64,
+    /// Individual TS packets where the sync byte was not 0x47.
+    pub sync_byte_errors: u64,
+    /// Continuity counter discontinuities (CC not incrementing by 1 mod 16).
+    pub cc_errors: u64,
+    /// PAT (PID 0x0000) not received within the required 500 ms interval.
+    pub pat_errors: u64,
+    /// A PMT referenced by the PAT was not received within 500 ms.
+    pub pmt_errors: u64,
+
+    // ── Priority 2 (important) ──
+
+    /// TS packets with the Transport Error Indicator bit set.
+    pub tei_errors: u64,
+    /// PCR jumps exceeding 100 ms or going backwards.
+    pub pcr_discontinuity_errors: u64,
+    /// PCR jitter relative to wall clock exceeding 500 ns.
+    pub pcr_accuracy_errors: u64,
+
+    // ── Summary ──
+
+    /// `true` when all Priority 1 error counters are zero.
+    pub priority1_ok: bool,
+    /// `true` when all Priority 2 error counters are zero.
+    pub priority2_ok: bool,
 }
 
 /// SRT connection-level statistics for a single SRT socket/leg.

@@ -93,6 +93,8 @@ fn validate_input(input: &InputConfig) -> Result<()> {
             if let Some(ref fec) = rtp.fec_decode {
                 validate_fec(fec)?;
             }
+            // Validate address family consistency
+            validate_rtp_input_addr_family(rtp)?;
         }
         InputConfig::Srt(srt) => {
             validate_socket_addr(&srt.local_addr, "SRT input local_addr")?;
@@ -135,9 +137,14 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
             if let Some(ref bind) = rtp.bind_addr {
                 validate_socket_addr(bind, "RTP output bind_addr")?;
             }
+            if let Some(ref iface) = rtp.interface_addr {
+                validate_ip_addr(iface, "RTP output interface_addr")?;
+            }
             if let Some(ref fec) = rtp.fec_encode {
                 validate_fec(fec)?;
             }
+            // Validate address family consistency
+            validate_rtp_output_addr_family(rtp)?;
         }
         OutputConfig::Srt(srt) => {
             if srt.id.is_empty() {
@@ -200,6 +207,48 @@ fn validate_srt_redundancy(red: &SrtRedundancyConfig, context: &str) -> Result<(
         red.aes_key_len,
         &format!("{context} redundancy"),
     )
+}
+
+/// Validates that the RTP input bind address and interface address use the same address family.
+fn validate_rtp_input_addr_family(rtp: &RtpInputConfig) -> Result<()> {
+    if let Some(ref iface) = rtp.interface_addr {
+        let bind: SocketAddr = rtp.bind_addr.parse()?;
+        let iface_ip: std::net::IpAddr = iface.parse()?;
+        if bind.is_ipv4() != iface_ip.is_ipv4() {
+            bail!(
+                "RTP input: bind_addr '{}' and interface_addr '{}' must use the same address family (both IPv4 or both IPv6)",
+                rtp.bind_addr, iface
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Validates that the RTP output dest, bind, and interface addresses use consistent address families.
+fn validate_rtp_output_addr_family(rtp: &RtpOutputConfig) -> Result<()> {
+    let dest: SocketAddr = rtp.dest_addr.parse()?;
+
+    if let Some(ref bind) = rtp.bind_addr {
+        let bind_addr: SocketAddr = bind.parse()?;
+        if dest.is_ipv4() != bind_addr.is_ipv4() {
+            bail!(
+                "RTP output '{}': dest_addr '{}' and bind_addr '{}' must use the same address family",
+                rtp.id, rtp.dest_addr, bind
+            );
+        }
+    }
+
+    if let Some(ref iface) = rtp.interface_addr {
+        let iface_ip: std::net::IpAddr = iface.parse()?;
+        if dest.is_ipv4() != iface_ip.is_ipv4() {
+            bail!(
+                "RTP output '{}': dest_addr '{}' and interface_addr '{}' must use the same address family",
+                rtp.id, rtp.dest_addr, iface
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Validates SMPTE 2022-1 FEC parameters.
@@ -351,6 +400,164 @@ mod tests {
                 redundancy: None,
             }),
             outputs: vec![],
+        };
+        assert!(validate_flow(&flow).is_err());
+    }
+
+    // --- IPv6 address validation tests ---
+
+    #[test]
+    fn test_valid_ipv6_unicast_rtp_flow() {
+        let flow = FlowConfig {
+            id: "f1".to_string(),
+            name: "IPv6 Unicast".to_string(),
+            enabled: true,
+            input: InputConfig::Rtp(RtpInputConfig {
+                bind_addr: "[::]:5000".to_string(),
+                interface_addr: None,
+                fec_decode: None,
+            }),
+            outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
+                id: "out-1".to_string(),
+                name: "Out 1".to_string(),
+                dest_addr: "[::1]:5004".to_string(),
+                bind_addr: None,
+                interface_addr: None,
+                fec_encode: None,
+            })],
+        };
+        assert!(validate_flow(&flow).is_ok());
+    }
+
+    #[test]
+    fn test_valid_ipv4_multicast_rtp_flow() {
+        let flow = FlowConfig {
+            id: "f1".to_string(),
+            name: "IPv4 Multicast".to_string(),
+            enabled: true,
+            input: InputConfig::Rtp(RtpInputConfig {
+                bind_addr: "239.1.1.1:5000".to_string(),
+                interface_addr: Some("192.168.1.100".to_string()),
+                fec_decode: None,
+            }),
+            outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
+                id: "out-1".to_string(),
+                name: "Multicast Out".to_string(),
+                dest_addr: "239.1.2.1:5004".to_string(),
+                bind_addr: None,
+                interface_addr: Some("192.168.1.100".to_string()),
+                fec_encode: None,
+            })],
+        };
+        assert!(validate_flow(&flow).is_ok());
+    }
+
+    #[test]
+    fn test_valid_ipv6_multicast_rtp_flow() {
+        let flow = FlowConfig {
+            id: "f1".to_string(),
+            name: "IPv6 Multicast".to_string(),
+            enabled: true,
+            input: InputConfig::Rtp(RtpInputConfig {
+                bind_addr: "[ff7e::1]:5000".to_string(),
+                interface_addr: Some("::1".to_string()),
+                fec_decode: None,
+            }),
+            outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
+                id: "out-1".to_string(),
+                name: "IPv6 Mcast Out".to_string(),
+                dest_addr: "[ff7e::2]:5004".to_string(),
+                bind_addr: None,
+                interface_addr: Some("::1".to_string()),
+                fec_encode: None,
+            })],
+        };
+        assert!(validate_flow(&flow).is_ok());
+    }
+
+    // --- Address family mismatch tests ---
+
+    #[test]
+    fn test_rtp_input_mismatched_addr_family() {
+        let flow = FlowConfig {
+            id: "f1".to_string(),
+            name: "Mismatched".to_string(),
+            enabled: true,
+            input: InputConfig::Rtp(RtpInputConfig {
+                bind_addr: "239.1.1.1:5000".to_string(),         // IPv4
+                interface_addr: Some("::1".to_string()),          // IPv6 - mismatch!
+                fec_decode: None,
+            }),
+            outputs: vec![],
+        };
+        assert!(validate_flow(&flow).is_err());
+    }
+
+    #[test]
+    fn test_rtp_output_mismatched_dest_bind_family() {
+        let flow = FlowConfig {
+            id: "f1".to_string(),
+            name: "Mismatched".to_string(),
+            enabled: true,
+            input: InputConfig::Rtp(RtpInputConfig {
+                bind_addr: "[::]:5000".to_string(),
+                interface_addr: None,
+                fec_decode: None,
+            }),
+            outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
+                id: "out-1".to_string(),
+                name: "Bad".to_string(),
+                dest_addr: "[::1]:5004".to_string(),            // IPv6
+                bind_addr: Some("0.0.0.0:0".to_string()),      // IPv4 - mismatch!
+                interface_addr: None,
+                fec_encode: None,
+            })],
+        };
+        assert!(validate_flow(&flow).is_err());
+    }
+
+    #[test]
+    fn test_rtp_output_mismatched_dest_iface_family() {
+        let flow = FlowConfig {
+            id: "f1".to_string(),
+            name: "Mismatched".to_string(),
+            enabled: true,
+            input: InputConfig::Rtp(RtpInputConfig {
+                bind_addr: "0.0.0.0:5000".to_string(),
+                interface_addr: None,
+                fec_decode: None,
+            }),
+            outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
+                id: "out-1".to_string(),
+                name: "Bad".to_string(),
+                dest_addr: "239.1.1.1:5004".to_string(),       // IPv4
+                bind_addr: None,
+                interface_addr: Some("::1".to_string()),        // IPv6 - mismatch!
+                fec_encode: None,
+            })],
+        };
+        assert!(validate_flow(&flow).is_err());
+    }
+
+    #[test]
+    fn test_rtp_output_invalid_interface_addr() {
+        let flow = FlowConfig {
+            id: "f1".to_string(),
+            name: "Bad iface".to_string(),
+            enabled: true,
+            input: InputConfig::Rtp(RtpInputConfig {
+                bind_addr: "0.0.0.0:5000".to_string(),
+                interface_addr: None,
+                fec_decode: None,
+            }),
+            outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
+                id: "out-1".to_string(),
+                name: "Bad".to_string(),
+                dest_addr: "239.1.1.1:5004".to_string(),
+                bind_addr: None,
+                interface_addr: Some("not-an-ip".to_string()),
+                fec_encode: None,
+            })],
         };
         assert!(validate_flow(&flow).is_err());
     }

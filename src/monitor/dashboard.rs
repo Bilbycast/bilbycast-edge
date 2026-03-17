@@ -566,6 +566,33 @@ function render(data) {
     html += render_srt(inp.srt_leg2_stats, 'SRT Leg2');
     html += '</div>';
 
+    // TR-101290 section
+    if (f.tr101290) {
+      const tr = f.tr101290;
+      const p1ok = tr.priority1_ok;
+      const p2ok = tr.priority2_ok;
+      const p1c = p1ok ? C_GREEN : C_RED;
+      const p2c = p2ok ? C_GREEN : C_AMBER;
+      const ec = function(v) { return v > 0 ? 'color:' + C_RED : ''; };
+
+      html += '<div class="section"><div class="section-title">TR-101290 Analysis</div>';
+      html += '<div class="stats-grid">';
+      html += '<div class="stat"><div class="k">TS Packets</div><div class="v">' + fmt_num(tr.ts_packets_analyzed) + '</div></div>';
+      html += '<div class="stat"><div class="k">Priority 1</div><div class="v" style="color:' + p1c + '">' + (p1ok ? 'OK' : 'ERRORS') + '</div></div>';
+      html += '<div class="stat"><div class="k">Priority 2</div><div class="v" style="color:' + p2c + '">' + (p2ok ? 'OK' : 'ERRORS') + '</div></div>';
+      html += '<div class="stat"><div class="k">Sync Errors</div><div class="v" style="' + ec(tr.sync_byte_errors) + '">' + fmt_num(tr.sync_byte_errors) + '</div></div>';
+      html += '<div class="stat"><div class="k">Sync Loss</div><div class="v" style="' + ec(tr.sync_loss_count) + '">' + fmt_num(tr.sync_loss_count) + '</div></div>';
+      html += '<div class="stat"><div class="k">CC Errors</div><div class="v" style="' + ec(tr.cc_errors) + '">' + fmt_num(tr.cc_errors) + '</div></div>';
+      html += '<div class="stat"><div class="k">PAT Errors</div><div class="v" style="' + ec(tr.pat_errors) + '">' + fmt_num(tr.pat_errors) + '</div></div>';
+      html += '<div class="stat"><div class="k">PMT Errors</div><div class="v" style="' + ec(tr.pmt_errors) + '">' + fmt_num(tr.pmt_errors) + '</div></div>';
+      html += '<div class="stat"><div class="k">TEI Errors</div><div class="v" style="' + ec(tr.tei_errors) + '">' + fmt_num(tr.tei_errors) + '</div></div>';
+      html += '<div class="stat"><div class="k">PCR Discont.</div><div class="v" style="' + ec(tr.pcr_discontinuity_errors) + '">' + fmt_num(tr.pcr_discontinuity_errors) + '</div></div>';
+      html += '<div class="stat"><div class="k">PCR Accuracy</div><div class="v" style="' + ec(tr.pcr_accuracy_errors) + '">' + fmt_num(tr.pcr_accuracy_errors) + '</div></div>';
+      html += '<div class="stat"><div class="k">PATs</div><div class="v">' + fmt_num(tr.pat_count) + '</div></div>';
+      html += '<div class="stat"><div class="k">PMTs</div><div class="v">' + fmt_num(tr.pmt_count) + '</div></div>';
+      html += '</div></div>';
+    }
+
     // Outputs section
     if (outs.length > 0) {
       html += '<div class="section"><div class="section-title">Outputs</div>';

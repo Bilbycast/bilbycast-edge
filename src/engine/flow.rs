@@ -15,6 +15,8 @@ use super::input_srt::spawn_srt_input;
 use super::output_rtp::spawn_rtp_output;
 use super::output_srt::spawn_srt_output;
 use super::packet::{BROADCAST_CHANNEL_CAPACITY, RtpPacket};
+use super::tr101290::spawn_tr101290_analyzer;
+use crate::stats::collector::Tr101290Accumulator;
 
 /// Runtime state for a single media flow (one input, N outputs).
 ///
@@ -56,6 +58,8 @@ pub struct FlowRuntime {
     /// Per-flow stats accumulator shared with the input task and all
     /// output tasks. Metrics are updated via atomic operations.
     pub stats: Arc<FlowStatsAccumulator>,
+    /// TR-101290 analyzer task handle.
+    pub analyzer_handle: JoinHandle<()>,
 }
 
 /// Runtime state for a single output within a flow.
@@ -141,6 +145,15 @@ impl FlowRuntime {
             }
         };
 
+        // Start TR-101290 analyzer (independent broadcast subscriber)
+        let tr101290_acc = Arc::new(Tr101290Accumulator::new());
+        flow_stats.tr101290.set(tr101290_acc.clone()).ok();
+        let analyzer_handle = spawn_tr101290_analyzer(
+            &broadcast_tx,
+            tr101290_acc,
+            cancel_token.child_token(),
+        );
+
         // Start output tasks
         let mut output_handles = HashMap::new();
         for output_config in &config.outputs {
@@ -168,6 +181,7 @@ impl FlowRuntime {
             output_handles: RwLock::new(output_handles),
             cancel_token,
             stats: flow_stats,
+            analyzer_handle,
         })
     }
 

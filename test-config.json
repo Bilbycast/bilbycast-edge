@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "server": {
+    "listen_addr": "0.0.0.0",
+    "listen_port": 8080
+  },
+  "monitor": {
+    "listen_addr": "0.0.0.0",
+    "listen_port": 9090
+  },
+  "flows": [
+    {
+      "id": "srt-fanout",
+      "name": "SRT Input → SRT + RTP Outputs",
+      "enabled": true,
+      "input": {
+        "type": "srt",
+        "mode": "listener",
+        "local_addr": "0.0.0.0:9000",
+        "latency_ms": 120
+      },
+      "outputs": [
+        {
+          "type": "srt",
+          "id": "srt-out",
+          "name": "SRT Output",
+          "mode": "listener",
+          "local_addr": "0.0.0.0:9001",
+          "latency_ms": 120
+        },
+        {
+          "type": "rtp",
+          "id": "rtp-out",
+          "name": "RTP Output",
+          "dest_addr": "127.0.0.1:5004"
+        }
+      ]
+    }
+  ]
+}

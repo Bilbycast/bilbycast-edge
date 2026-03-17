@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -60,6 +61,130 @@ impl OutputStatsAccumulator {
     }
 }
 
+// ── TR-101290 Accumulator ──────────────────────────────────────────────────
+
+/// Internal per-PID PCR tracking state.
+pub struct PcrState {
+    /// Last PCR value in 27 MHz ticks.
+    pub last_pcr_value: u64,
+    /// Wall-clock time when the last PCR was received.
+    pub last_pcr_wall_time: Instant,
+}
+
+/// Internal mutable state for stateful TR-101290 checks.
+///
+/// Only accessed by the single analyzer task (writes) and the 1/sec
+/// snapshot path (brief read lock). Contention is negligible.
+pub struct Tr101290State {
+    /// Per-PID last continuity counter value.
+    pub cc_tracker: HashMap<u16, u8>,
+    /// Last time PID 0x0000 (PAT) was seen.
+    pub last_pat_time: Option<Instant>,
+    /// Whether we have ever received a PAT (to avoid false alarms on startup).
+    pub pat_seen: bool,
+    /// PMT PIDs discovered from PAT, mapped to their last-seen time.
+    pub pmt_pids: HashMap<u16, Option<Instant>>,
+    /// Per-PID PCR tracking for discontinuity and accuracy checks.
+    pub pcr_tracker: HashMap<u16, PcrState>,
+    /// Whether the stream is currently in sync.
+    pub in_sync: bool,
+    /// Consecutive TS packets with correct sync byte.
+    pub sync_consecutive_good: u32,
+    /// Consecutive TS packets with incorrect sync byte.
+    pub sync_consecutive_bad: u32,
+}
+
+impl Default for Tr101290State {
+    fn default() -> Self {
+        Self {
+            cc_tracker: HashMap::new(),
+            last_pat_time: None,
+            pat_seen: false,
+            pmt_pids: HashMap::new(),
+            pcr_tracker: HashMap::new(),
+            in_sync: true,
+            sync_consecutive_good: 0,
+            sync_consecutive_bad: 0,
+        }
+    }
+}
+
+/// Lock-free TR-101290 statistics accumulator.
+///
+/// Atomic counters are incremented by the analyzer task with `Relaxed`
+/// ordering. The `state` mutex holds per-PID tracking data and is only
+/// contended between the analyzer task and the rare 1/sec snapshot.
+pub struct Tr101290Accumulator {
+    // Informational
+    pub ts_packets_analyzed: AtomicU64,
+    pub pat_count: AtomicU64,
+    pub pmt_count: AtomicU64,
+    // Priority 1
+    pub sync_loss_count: AtomicU64,
+    pub sync_byte_errors: AtomicU64,
+    pub cc_errors: AtomicU64,
+    pub pat_errors: AtomicU64,
+    pub pmt_errors: AtomicU64,
+    // Priority 2
+    pub tei_errors: AtomicU64,
+    pub pcr_discontinuity_errors: AtomicU64,
+    pub pcr_accuracy_errors: AtomicU64,
+    // Internal state
+    pub state: Mutex<Tr101290State>,
+}
+
+impl Tr101290Accumulator {
+    pub fn new() -> Self {
+        Self {
+            ts_packets_analyzed: AtomicU64::new(0),
+            pat_count: AtomicU64::new(0),
+            pmt_count: AtomicU64::new(0),
+            sync_loss_count: AtomicU64::new(0),
+            sync_byte_errors: AtomicU64::new(0),
+            cc_errors: AtomicU64::new(0),
+            pat_errors: AtomicU64::new(0),
+            pmt_errors: AtomicU64::new(0),
+            tei_errors: AtomicU64::new(0),
+            pcr_discontinuity_errors: AtomicU64::new(0),
+            pcr_accuracy_errors: AtomicU64::new(0),
+            state: Mutex::new(Tr101290State::default()),
+        }
+    }
+
+    /// Take a point-in-time snapshot of all TR-101290 counters.
+    pub fn snapshot(&self) -> Tr101290Stats {
+        let sync_loss = self.sync_loss_count.load(Ordering::Relaxed);
+        let sync_byte = self.sync_byte_errors.load(Ordering::Relaxed);
+        let cc = self.cc_errors.load(Ordering::Relaxed);
+        let pat = self.pat_errors.load(Ordering::Relaxed);
+        let pmt = self.pmt_errors.load(Ordering::Relaxed);
+        let tei = self.tei_errors.load(Ordering::Relaxed);
+        let pcr_disc = self.pcr_discontinuity_errors.load(Ordering::Relaxed);
+        let pcr_acc = self.pcr_accuracy_errors.load(Ordering::Relaxed);
+
+        let priority1_ok = sync_loss == 0 && sync_byte == 0 && cc == 0 && pat == 0 && pmt == 0;
+        let priority2_ok = tei == 0 && pcr_disc == 0 && pcr_acc == 0;
+
+        Tr101290Stats {
+            ts_packets_analyzed: self.ts_packets_analyzed.load(Ordering::Relaxed),
+            pat_count: self.pat_count.load(Ordering::Relaxed),
+            pmt_count: self.pmt_count.load(Ordering::Relaxed),
+            sync_loss_count: sync_loss,
+            sync_byte_errors: sync_byte,
+            cc_errors: cc,
+            pat_errors: pat,
+            pmt_errors: pmt,
+            tei_errors: tei,
+            pcr_discontinuity_errors: pcr_disc,
+            pcr_accuracy_errors: pcr_acc,
+            priority1_ok,
+            priority2_ok,
+        }
+    }
+}
+
+// ── Per-flow Accumulator ───────────────────────────────────────────────────
+
 /// Per-flow atomic counters for a single media flow (one input, N outputs).
 ///
 /// Holds input-side counters (`input_packets`, `input_bytes`, `input_loss`,
@@ -81,6 +206,8 @@ pub struct FlowStatsAccumulator {
     // Per-output stats
     pub output_stats: DashMap<String, Arc<OutputStatsAccumulator>>,
     input_throughput: Mutex<ThroughputEstimator>,
+    /// TR-101290 analyzer stats, set once when the flow starts.
+    pub tr101290: OnceLock<Arc<Tr101290Accumulator>>,
 }
 
 impl FlowStatsAccumulator {
@@ -100,6 +227,7 @@ impl FlowStatsAccumulator {
             redundancy_switches: AtomicU64::new(0),
             output_stats: DashMap::new(),
             input_throughput: Mutex::new(ThroughputEstimator::new()),
+            tr101290: OnceLock::new(),
         }
     }
 
@@ -129,6 +257,8 @@ impl FlowStatsAccumulator {
         let input_bytes = self.input_bytes.load(Ordering::Relaxed);
         let input_bitrate = self.input_throughput.lock().unwrap().sample(input_bytes);
 
+        let tr101290 = self.tr101290.get().map(|acc| acc.snapshot());
+
         FlowStats {
             flow_id: self.flow_id.clone(),
             flow_name: self.flow_name.clone(),
@@ -147,6 +277,7 @@ impl FlowStatsAccumulator {
             },
             outputs,
             uptime_secs: self.started_at.elapsed().as_secs(),
+            tr101290,
         }
     }
 }

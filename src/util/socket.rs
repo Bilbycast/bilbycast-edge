@@ -61,10 +61,9 @@ async fn bind_multicast_input(
         .context("Failed to convert socket2 socket to tokio UdpSocket")?;
 
     // Join multicast group
-    let iface = parse_interface_v4(interface_addr)?;
-
     match mcast_addr.ip() {
         IpAddr::V4(group) => {
+            let iface = parse_interface_v4(interface_addr)?;
             tokio_socket
                 .join_multicast_v4(group, iface)
                 .with_context(|| {
@@ -76,11 +75,12 @@ async fn bind_multicast_input(
             );
         }
         IpAddr::V6(group) => {
+            let iface_index = parse_interface_v6_index(interface_addr)?;
             tokio_socket
-                .join_multicast_v6(&group, 0)
-                .with_context(|| format!("Failed to join multicast group {group}"))?;
+                .join_multicast_v6(&group, iface_index)
+                .with_context(|| format!("Failed to join multicast group {group} on interface index {iface_index}"))?;
             tracing::info!(
-                "UDP input: joined multicast group {group}, port {}",
+                "UDP input: joined multicast group {group} on interface index {iface_index}, port {}",
                 mcast_addr.port()
             );
         }
@@ -128,15 +128,23 @@ pub async fn create_udp_output(
         .bind(&SockAddr::from(bind_to))
         .with_context(|| format!("Failed to bind output socket to {bind_to}"))?;
 
-    // If destination is multicast, set the outgoing interface
+    // If destination is multicast, set the outgoing interface and TTL/hop limit
     if dest.ip().is_multicast() {
-        if let IpAddr::V4(_) = dest.ip() {
-            let iface = parse_interface_v4(interface_addr)?;
-            socket
-                .set_multicast_if_v4(&iface)
-                .context("Failed to set multicast interface")?;
-            // TTL for multicast
-            socket.set_multicast_ttl_v4(16)?;
+        match dest.ip() {
+            IpAddr::V4(_) => {
+                let iface = parse_interface_v4(interface_addr)?;
+                socket
+                    .set_multicast_if_v4(&iface)
+                    .context("Failed to set multicast interface")?;
+                socket.set_multicast_ttl_v4(16)?;
+            }
+            IpAddr::V6(_) => {
+                let iface_index = parse_interface_v6_index(interface_addr)?;
+                socket
+                    .set_multicast_if_v6(iface_index)
+                    .context("Failed to set IPv6 multicast interface")?;
+                socket.set_multicast_hops_v6(16)?;
+            }
         }
     }
 
@@ -156,5 +164,36 @@ fn parse_interface_v4(interface_addr: Option<&str>) -> Result<Ipv4Addr> {
             .parse::<Ipv4Addr>()
             .with_context(|| format!("Invalid interface address: {addr}")),
         None => Ok(Ipv4Addr::UNSPECIFIED),
+    }
+}
+
+/// Parse an interface specification for IPv6 multicast.
+/// Accepts either a numeric interface index (e.g. "2") or an interface name (e.g. "eth0").
+/// Returns 0 (any interface) if no interface is specified.
+///
+/// Note: IPv6 multicast APIs use interface indexes rather than IP addresses.
+/// Use `ip -6 addr` or `ifconfig` to find the appropriate interface index or name.
+fn parse_interface_v6_index(interface_addr: Option<&str>) -> Result<u32> {
+    match interface_addr {
+        None => Ok(0),
+        Some(addr) => {
+            // First try parsing as a numeric interface index
+            if let Ok(index) = addr.parse::<u32>() {
+                return Ok(index);
+            }
+            // Try resolving as an interface name (e.g. "eth0", "en0")
+            let c_name = std::ffi::CString::new(addr)
+                .with_context(|| format!("Invalid interface name: {addr}"))?;
+            // SAFETY: if_nametoindex is a standard POSIX function that takes a null-terminated
+            // C string and returns 0 on failure or the interface index on success.
+            let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+            if index == 0 {
+                anyhow::bail!(
+                    "Invalid interface for IPv6 multicast: '{addr}'. \
+                     Expected a numeric interface index (e.g. \"2\") or interface name (e.g. \"eth0\")."
+                );
+            }
+            Ok(index)
+        }
     }
 }

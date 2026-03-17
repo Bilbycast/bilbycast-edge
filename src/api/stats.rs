@@ -325,6 +325,95 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
             }
         }
 
+        // TR-101290 metrics
+        output.push_str("\n# HELP bilbycast_edge_tr101290_ts_packets_total TS packets analyzed\n");
+        output.push_str("# TYPE bilbycast_edge_tr101290_ts_packets_total counter\n");
+        for fs in &flow_snapshots {
+            if let Some(ref tr) = fs.tr101290 {
+                output.push_str(&format!(
+                    "bilbycast_edge_tr101290_ts_packets_total{{flow_id=\"{}\"}} {}\n",
+                    fs.flow_id, tr.ts_packets_analyzed
+                ));
+            }
+        }
+
+        output.push_str("\n# HELP bilbycast_edge_tr101290_sync_byte_errors_total Sync byte errors\n");
+        output.push_str("# TYPE bilbycast_edge_tr101290_sync_byte_errors_total counter\n");
+        for fs in &flow_snapshots {
+            if let Some(ref tr) = fs.tr101290 {
+                output.push_str(&format!(
+                    "bilbycast_edge_tr101290_sync_byte_errors_total{{flow_id=\"{}\"}} {}\n",
+                    fs.flow_id, tr.sync_byte_errors
+                ));
+            }
+        }
+
+        output.push_str("\n# HELP bilbycast_edge_tr101290_cc_errors_total Continuity counter errors\n");
+        output.push_str("# TYPE bilbycast_edge_tr101290_cc_errors_total counter\n");
+        for fs in &flow_snapshots {
+            if let Some(ref tr) = fs.tr101290 {
+                output.push_str(&format!(
+                    "bilbycast_edge_tr101290_cc_errors_total{{flow_id=\"{}\"}} {}\n",
+                    fs.flow_id, tr.cc_errors
+                ));
+            }
+        }
+
+        output.push_str("\n# HELP bilbycast_edge_tr101290_pat_errors_total PAT timeout errors\n");
+        output.push_str("# TYPE bilbycast_edge_tr101290_pat_errors_total counter\n");
+        for fs in &flow_snapshots {
+            if let Some(ref tr) = fs.tr101290 {
+                output.push_str(&format!(
+                    "bilbycast_edge_tr101290_pat_errors_total{{flow_id=\"{}\"}} {}\n",
+                    fs.flow_id, tr.pat_errors
+                ));
+            }
+        }
+
+        output.push_str("\n# HELP bilbycast_edge_tr101290_pmt_errors_total PMT timeout errors\n");
+        output.push_str("# TYPE bilbycast_edge_tr101290_pmt_errors_total counter\n");
+        for fs in &flow_snapshots {
+            if let Some(ref tr) = fs.tr101290 {
+                output.push_str(&format!(
+                    "bilbycast_edge_tr101290_pmt_errors_total{{flow_id=\"{}\"}} {}\n",
+                    fs.flow_id, tr.pmt_errors
+                ));
+            }
+        }
+
+        output.push_str("\n# HELP bilbycast_edge_tr101290_tei_errors_total Transport error indicator errors\n");
+        output.push_str("# TYPE bilbycast_edge_tr101290_tei_errors_total counter\n");
+        for fs in &flow_snapshots {
+            if let Some(ref tr) = fs.tr101290 {
+                output.push_str(&format!(
+                    "bilbycast_edge_tr101290_tei_errors_total{{flow_id=\"{}\"}} {}\n",
+                    fs.flow_id, tr.tei_errors
+                ));
+            }
+        }
+
+        output.push_str("\n# HELP bilbycast_edge_tr101290_pcr_discontinuity_errors_total PCR discontinuity errors\n");
+        output.push_str("# TYPE bilbycast_edge_tr101290_pcr_discontinuity_errors_total counter\n");
+        for fs in &flow_snapshots {
+            if let Some(ref tr) = fs.tr101290 {
+                output.push_str(&format!(
+                    "bilbycast_edge_tr101290_pcr_discontinuity_errors_total{{flow_id=\"{}\"}} {}\n",
+                    fs.flow_id, tr.pcr_discontinuity_errors
+                ));
+            }
+        }
+
+        output.push_str("\n# HELP bilbycast_edge_tr101290_pcr_accuracy_errors_total PCR accuracy errors\n");
+        output.push_str("# TYPE bilbycast_edge_tr101290_pcr_accuracy_errors_total counter\n");
+        for fs in &flow_snapshots {
+            if let Some(ref tr) = fs.tr101290 {
+                output.push_str(&format!(
+                    "bilbycast_edge_tr101290_pcr_accuracy_errors_total{{flow_id=\"{}\"}} {}\n",
+                    fs.flow_id, tr.pcr_accuracy_errors
+                ));
+            }
+        }
+
         output.push_str("\n# HELP bilbycast_edge_srt_loss_total SRT total packet loss\n");
         output.push_str("# TYPE bilbycast_edge_srt_loss_total counter\n");
         for fs in &flow_snapshots {
