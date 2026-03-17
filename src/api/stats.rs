@@ -22,13 +22,11 @@ use super::server::AppState;
 /// # Errors
 ///
 /// This handler is infallible under normal operation.
-pub async fn all_stats(
-    State(state): State<AppState>,
-) -> Result<Json<ApiResponse<AllStatsResponse>>, ApiError> {
+/// Gathers all stats from state. Used by both the API and the monitor dashboard.
+pub async fn gather_all_stats(state: &AppState) -> AllStatsResponse {
     let config = state.config.read().await;
     let uptime = state.start_time.elapsed().as_secs();
 
-    // Get real stats from running flows, with fallback for non-running flows
     let mut flow_stats = state.flow_manager.stats().all_snapshots();
 
     // Include configured-but-not-running flows as idle
@@ -42,7 +40,7 @@ pub async fn all_stats(
         }
     }
 
-    let response = AllStatsResponse {
+    AllStatsResponse {
         system: SystemStats {
             uptime_secs: uptime,
             total_flows: config.flows.len(),
@@ -50,9 +48,13 @@ pub async fn all_stats(
             version: env!("CARGO_PKG_VERSION").to_string(),
         },
         flows: flow_stats,
-    };
+    }
+}
 
-    Ok(Json(ApiResponse::ok(response)))
+pub async fn all_stats(
+    State(state): State<AppState>,
+) -> Result<Json<ApiResponse<AllStatsResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(gather_all_stats(&state).await)))
 }
 
 /// `GET /api/v1/stats/{flow_id}` -- Retrieve statistics for a single flow.

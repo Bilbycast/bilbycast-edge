@@ -7,6 +7,9 @@ pub struct AppConfig {
     pub version: u32,
     /// API server configuration
     pub server: ServerConfig,
+    /// Optional web monitoring dashboard
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<MonitorConfig>,
     /// List of all configured flows
     #[serde(default)]
     pub flows: Vec<FlowConfig>,
@@ -17,6 +20,7 @@ impl Default for AppConfig {
         Self {
             version: 1,
             server: ServerConfig::default(),
+            monitor: None,
             flows: Vec::new(),
         }
     }
@@ -37,6 +41,18 @@ impl Default for ServerConfig {
             listen_port: 8080,
         }
     }
+}
+
+/// Optional web monitoring dashboard configuration.
+///
+/// When present, srtedge starts a second HTTP server on the specified address
+/// serving a self-contained HTML dashboard for browser-based status monitoring.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorConfig {
+    /// Dashboard listen address, e.g. "0.0.0.0"
+    pub listen_addr: String,
+    /// Dashboard listen port, e.g. 9090
+    pub listen_port: u16,
 }
 
 /// A Flow is the unit of configuration: one input fanning out to N outputs.
@@ -262,6 +278,7 @@ mod tests {
         let config = AppConfig {
             version: 1,
             server: ServerConfig::default(),
+            monitor: None,
             flows: vec![FlowConfig {
                 id: "test-flow".to_string(),
                 name: "Test Flow".to_string(),

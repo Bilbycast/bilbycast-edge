@@ -1,10 +1,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use dashmap::DashMap;
 
 use super::models::*;
+use super::throughput::ThroughputEstimator;
 
 /// Per-output atomic counters for a single output leg.
 ///
@@ -20,6 +21,7 @@ pub struct OutputStatsAccumulator {
     pub bytes_sent: AtomicU64,
     pub packets_dropped: AtomicU64,
     pub fec_packets_sent: AtomicU64,
+    throughput: Mutex<ThroughputEstimator>,
 }
 
 impl OutputStatsAccumulator {
@@ -33,20 +35,23 @@ impl OutputStatsAccumulator {
             bytes_sent: AtomicU64::new(0),
             packets_dropped: AtomicU64::new(0),
             fec_packets_sent: AtomicU64::new(0),
+            throughput: Mutex::new(ThroughputEstimator::new()),
         }
     }
 
     /// Take a point-in-time snapshot of all atomic counters and return an
     /// [`OutputStats`] value suitable for JSON serialisation.
     pub fn snapshot(&self) -> OutputStats {
+        let bytes = self.bytes_sent.load(Ordering::Relaxed);
+        let bitrate_bps = self.throughput.lock().unwrap().sample(bytes);
         OutputStats {
             output_id: self.output_id.clone(),
             output_name: self.output_name.clone(),
             output_type: self.output_type.clone(),
             state: "active".to_string(),
             packets_sent: self.packets_sent.load(Ordering::Relaxed),
-            bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
-            bitrate_bps: 0, // TODO: calculate from throughput estimator
+            bytes_sent: bytes,
+            bitrate_bps,
             packets_dropped: self.packets_dropped.load(Ordering::Relaxed),
             fec_packets_sent: self.fec_packets_sent.load(Ordering::Relaxed),
             srt_stats: None,
@@ -75,6 +80,7 @@ pub struct FlowStatsAccumulator {
     pub redundancy_switches: AtomicU64,
     // Per-output stats
     pub output_stats: DashMap<String, Arc<OutputStatsAccumulator>>,
+    input_throughput: Mutex<ThroughputEstimator>,
 }
 
 impl FlowStatsAccumulator {
@@ -93,6 +99,7 @@ impl FlowStatsAccumulator {
             fec_recovered: AtomicU64::new(0),
             redundancy_switches: AtomicU64::new(0),
             output_stats: DashMap::new(),
+            input_throughput: Mutex::new(ThroughputEstimator::new()),
         }
     }
 
@@ -119,6 +126,9 @@ impl FlowStatsAccumulator {
             .map(|entry| entry.value().snapshot())
             .collect();
 
+        let input_bytes = self.input_bytes.load(Ordering::Relaxed);
+        let input_bitrate = self.input_throughput.lock().unwrap().sample(input_bytes);
+
         FlowStats {
             flow_id: self.flow_id.clone(),
             flow_name: self.flow_name.clone(),
@@ -127,8 +137,8 @@ impl FlowStatsAccumulator {
                 input_type: self.input_type.clone(),
                 state: "receiving".to_string(),
                 packets_received: self.input_packets.load(Ordering::Relaxed),
-                bytes_received: self.input_bytes.load(Ordering::Relaxed),
-                bitrate_bps: 0, // TODO
+                bytes_received: input_bytes,
+                bitrate_bps: input_bitrate,
                 packets_lost: self.input_loss.load(Ordering::Relaxed),
                 packets_recovered_fec: self.fec_recovered.load(Ordering::Relaxed),
                 srt_stats: None,

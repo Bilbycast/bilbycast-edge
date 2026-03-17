@@ -13,11 +13,13 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, broadcast};
+use tokio_util::sync::CancellationToken;
 
 mod api;
 mod config;
 mod engine;
 mod fec;
+mod monitor;
 mod redundancy;
 mod srt;
 mod stats;
@@ -45,6 +47,10 @@ struct Cli {
     /// Override API listen address (overrides config file)
     #[arg(short = 'b', long)]
     bind: Option<String>,
+
+    /// Override monitor dashboard port (overrides config file)
+    #[arg(long)]
+    monitor_port: Option<u16>,
 
     /// Log level (trace, debug, info, warn, error)
     #[arg(short, long, default_value = "info")]
@@ -88,6 +94,11 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref bind) = cli.bind {
         app_config.server.listen_addr = bind.clone();
     }
+    if let Some(mp) = cli.monitor_port {
+        if let Some(ref mut mon) = app_config.monitor {
+            mon.listen_port = mp;
+        }
+    }
 
     let listen_addr = format!(
         "{}:{}",
@@ -118,10 +129,27 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Build router and start server
-    let router = build_router(state);
+    let router = build_router(state.clone());
 
     let listener = TcpListener::bind(&listen_addr).await?;
     tracing::info!("API server listening on {listen_addr}");
+
+    // Shared shutdown token for coordinated graceful shutdown
+    let shutdown_token = CancellationToken::new();
+
+    // Optionally start the monitor dashboard server
+    let _monitor_handle = if let Some(ref monitor_config) = app_config.monitor {
+        Some(
+            monitor::server::start_monitor_server(
+                state.clone(),
+                monitor_config,
+                shutdown_token.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
 
     // Spawn background stats WebSocket publisher (1/sec)
     {
@@ -132,8 +160,22 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Spawn shutdown signal handler
+    {
+        let token = shutdown_token.clone();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to install CTRL+C signal handler");
+            tracing::info!("Received shutdown signal");
+            token.cancel();
+        });
+    }
+
     axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_token.cancelled().await;
+        })
         .await?;
 
     // Graceful shutdown: stop all flows
@@ -195,13 +237,3 @@ async fn stats_publisher_loop(
     }
 }
 
-/// Waits for a CTRL+C signal, then returns to trigger graceful shutdown.
-///
-/// Used with `axum::serve(...).with_graceful_shutdown(shutdown_signal())` to
-/// stop the server and all running flows cleanly.
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to install CTRL+C signal handler");
-    tracing::info!("Received shutdown signal");
-}

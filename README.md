@@ -12,6 +12,7 @@ A high-performance RTP/SMPTE 2022-2 over SRT transport bridge with SMPTE 2022-7 
 - **REST API** -- full CRUD for flows, hot-add/remove outputs, start/stop/restart, config management
 - **WebSocket Stats** -- real-time JSON stats pushed to subscribers every second with computed bitrates
 - **Prometheus Metrics** -- `/metrics` endpoint with per-flow input/output counters, bitrates, FEC, SRT stats
+- **Web Monitor Dashboard** -- optional browser-based status page on a separate port with auto-refreshing flow stats
 - **Persistent Config** -- JSON config file auto-loaded on startup, mutations persisted immediately
 - **Graceful Shutdown** -- CTRL+C triggers coordinated shutdown of all flows and SRT connections
 
@@ -35,6 +36,8 @@ A high-performance RTP/SMPTE 2022-2 over SRT transport bridge with SMPTE 2022-7 
                         +-------------------------------------------------+
                         |   REST API   |   WebSocket   |   Prometheus     |
                         |   :8080      |   /ws/stats   |   /metrics       |
+                        +-------------------------------------------------+
+                        |   Web Monitor Dashboard (optional, :9090)       |
                         +-------------------------------------------------+
 ```
 
@@ -75,6 +78,7 @@ Options:
   -c, --config <PATH>       Path to configuration file [default: ./config.json]
   -p, --port <PORT>         Override API listen port (overrides config file)
   -b, --bind <ADDR>         Override API listen address (overrides config file)
+      --monitor-port <PORT>  Override monitor dashboard port (overrides config file)
   -l, --log-level <LEVEL>   Log level: trace, debug, info, warn, error [default: info]
   -h, --help                Print help
   -V, --version             Print version
@@ -93,6 +97,7 @@ The configuration is stored as JSON in the file specified by `--config` (default
 |-------|------|---------|-------------|
 | `version` | `u32` | `1` | Schema version for forward compatibility |
 | `server` | `ServerConfig` | see below | API server settings |
+| `monitor` | `MonitorConfig?` | `null` | Optional web monitoring dashboard (omit to disable) |
 | `flows` | `FlowConfig[]` | `[]` | List of flow definitions |
 
 ### Server Config (`ServerConfig`)
@@ -101,6 +106,15 @@ The configuration is stored as JSON in the file specified by `--config` (default
 |-------|------|---------|-------------|
 | `listen_addr` | `string` | `"0.0.0.0"` | API listen address |
 | `listen_port` | `u16` | `8080` | API listen port |
+
+### Monitor Config (`MonitorConfig`) -- optional
+
+When present, srtedge starts a second HTTP server serving a self-contained HTML dashboard for browser-based status monitoring. Omit this section entirely to disable the dashboard.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `listen_addr` | `string` | required | Dashboard listen address, e.g. `"0.0.0.0"` |
+| `listen_port` | `u16` | required | Dashboard listen port, e.g. `9090` |
 
 ### Flow Config (`FlowConfig`)
 
@@ -202,12 +216,13 @@ SMPTE 2022-1 Forward Error Correction parameters.
 
 ### 1. Simple RTP to SRT Bridge
 
-Receives an RTP multicast stream and bridges it over SRT:
+Receives an RTP multicast stream and bridges it over SRT (with optional web monitor on port 9090):
 
 ```json
 {
   "version": 1,
   "server": { "listen_addr": "0.0.0.0", "listen_port": 8080 },
+  "monitor": { "listen_addr": "0.0.0.0", "listen_port": 9090 },
   "flows": [
     {
       "id": "rtp-to-srt",
@@ -425,6 +440,17 @@ Error responses:
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/v1/ws/stats` | WebSocket upgrade for real-time stats (JSON array of `FlowStats` every 1 second) |
+
+### Web Monitor Dashboard (optional)
+
+When `monitor` is configured, a self-contained HTML dashboard is served on the specified port:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/` | HTML dashboard with auto-refreshing flow stats (1.5s interval) |
+| `GET` | `/api/stats` | JSON stats endpoint used by the dashboard |
+
+Open `http://<monitor_addr>:<monitor_port>` in any browser to view system and per-flow status.
 
 ### Stats JSON Structure
 
@@ -792,7 +818,32 @@ curl -s http://localhost:8080/api/v1/stats | python3 -m json.tool
 
 **Expected:** `fec_packets_sent` increments as FEC packets are generated. For a 10x10 matrix, expect 10 column FEC + 10 row FEC = 20 FEC packets per 100 media packets.
 
-### Test 12: Health Check
+### Test 12: Web Monitor Dashboard
+
+Add a `"monitor"` section to your config:
+
+```json
+{
+  "version": 1,
+  "server": { "listen_addr": "0.0.0.0", "listen_port": 8080 },
+  "monitor": { "listen_addr": "0.0.0.0", "listen_port": 9090 },
+  "flows": [...]
+}
+```
+
+```bash
+# Start srtedge with monitor enabled
+cargo run -- -c config.json
+
+# Open the dashboard in your browser
+open http://localhost:9090
+```
+
+**Expected:** A dark-themed dashboard showing system uptime, active flows, and per-flow cards with input/output stats that auto-refresh every 1.5 seconds.
+
+You can also override the monitor port via CLI: `--monitor-port 9090`
+
+### Test 13: Health Check
 
 ```bash
 curl -s http://localhost:8080/health | python3 -m json.tool
@@ -834,6 +885,9 @@ srtedge/
         │   ├── models.rs          # Config structs (AppConfig, FlowConfig, etc.)
         │   ├── persistence.rs     # JSON load/save with atomic writes
         │   └── validation.rs      # Config validation rules
+        ├── monitor/               # Web monitoring dashboard
+        │   ├── server.rs          # Monitor HTTP server (separate port)
+        │   └── dashboard.rs       # Embedded HTML/CSS/JS dashboard
         ├── engine/                # Flow engine
         │   ├── manager.rs         # FlowManager: lifecycle orchestration
         │   ├── flow.rs            # FlowRuntime: input + outputs + broadcast

@@ -64,6 +64,7 @@ mod tests {
         let config = AppConfig {
             version: 1,
             server: ServerConfig::default(),
+            monitor: None,
             flows: vec![FlowConfig {
                 id: "test".to_string(),
                 name: "Test".to_string(),

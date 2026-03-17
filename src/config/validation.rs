@@ -17,6 +17,17 @@ use super::models::*;
 ///
 /// Returns an error describing the first validation failure encountered.
 pub fn validate_config(config: &AppConfig) -> Result<()> {
+    // Validate monitor config if present
+    if let Some(ref monitor) = config.monitor {
+        let monitor_addr = format!("{}:{}", monitor.listen_addr, monitor.listen_port);
+        validate_socket_addr(&monitor_addr, "monitor listen address")?;
+        if monitor.listen_addr == config.server.listen_addr
+            && monitor.listen_port == config.server.listen_port
+        {
+            bail!("Monitor listen address must differ from the API server address");
+        }
+    }
+
     let mut flow_ids = HashSet::new();
     for flow in &config.flows {
         if !flow_ids.insert(&flow.id) {
@@ -295,6 +306,7 @@ mod tests {
         let config = AppConfig {
             version: 1,
             server: ServerConfig::default(),
+            monitor: None,
             flows: vec![
                 FlowConfig {
                     id: "same-id".to_string(),
