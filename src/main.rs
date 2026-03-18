@@ -19,6 +19,7 @@ mod api;
 mod config;
 mod engine;
 mod fec;
+mod manager;
 mod monitor;
 mod redundancy;
 mod srt;
@@ -175,6 +176,20 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             stats_publisher_loop(ws_tx, stats_fm).await;
         });
+    }
+
+    // Optionally start manager client
+    if let Some(ref mgr_config) = app_config.manager {
+        if mgr_config.enabled {
+            tracing::info!("Manager client enabled, connecting to {}", mgr_config.url);
+            manager::client::start_manager_client(
+                mgr_config.clone(),
+                flow_manager.clone(),
+                ws_stats_tx.clone(),
+                state.config.clone(),
+                cli.config.clone(),
+            );
+        }
     }
 
     // Spawn shutdown signal handler

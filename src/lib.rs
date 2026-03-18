@@ -24,6 +24,7 @@ pub mod api;
 pub mod config;
 pub mod engine;
 pub mod fec;
+pub mod manager;
 pub mod redundancy;
 pub mod srt;
 pub mod stats;

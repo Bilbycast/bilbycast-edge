@@ -10,6 +10,9 @@ pub struct AppConfig {
     /// Optional web monitoring dashboard
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monitor: Option<MonitorConfig>,
+    /// Optional manager connection for centralized monitoring
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager: Option<crate::manager::ManagerConfig>,
     /// List of all configured flows
     #[serde(default)]
     pub flows: Vec<FlowConfig>,
@@ -21,6 +24,7 @@ impl Default for AppConfig {
             version: 1,
             server: ServerConfig::default(),
             monitor: None,
+            manager: None,
             flows: Vec::new(),
         }
     }
