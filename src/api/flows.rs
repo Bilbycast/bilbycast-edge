@@ -5,6 +5,7 @@ use crate::config::models::{AppConfig, FlowConfig, OutputConfig};
 use crate::config::persistence::save_config;
 use crate::config::validation::{validate_config, validate_flow, validate_output};
 
+use super::auth::RequireAdmin;
 use super::errors::ApiError;
 use super::models::{ApiResponse, FlowListResponse, FlowSummary};
 use super::server::AppState;
@@ -65,6 +66,7 @@ pub async fn get_flow(
 /// persisted to config and a warning is logged. The flow can be started later via the
 /// start endpoint.
 pub async fn create_flow(
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Json(flow): Json<FlowConfig>,
 ) -> Result<Json<ApiResponse<FlowConfig>>, ApiError> {
@@ -109,6 +111,7 @@ pub async fn create_flow(
 /// Note: if the engine fails to restart the flow after update, the config is still
 /// persisted and a warning is logged.
 pub async fn update_flow(
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(flow_id): Path<String>,
     Json(mut flow): Json<FlowConfig>,
@@ -152,6 +155,7 @@ pub async fn update_flow(
 /// - [`ApiError::NotFound`] (404) if no flow with the given `flow_id` exists in the config.
 /// - [`ApiError::Internal`] (500) if persisting the updated config to disk fails.
 pub async fn delete_flow(
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(flow_id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
@@ -187,6 +191,7 @@ pub async fn delete_flow(
 /// - [`ApiError::NotFound`] (404) if no flow with the given `flow_id` exists in the config.
 /// - [`ApiError::Internal`] (500) if the engine fails to start the flow.
 pub async fn start_flow(
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(flow_id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
@@ -226,6 +231,7 @@ pub async fn start_flow(
 /// - [`ApiError::Conflict`] (409) if the flow is not currently running.
 /// - [`ApiError::Internal`] (500) if the engine fails to stop the flow.
 pub async fn stop_flow(
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(flow_id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
@@ -264,6 +270,7 @@ pub async fn stop_flow(
 /// - [`ApiError::NotFound`] (404) if no flow with the given `flow_id` exists in the config.
 /// - [`ApiError::Internal`] (500) if the engine fails to create the new flow instance.
 pub async fn restart_flow(
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(flow_id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
@@ -309,6 +316,7 @@ pub async fn restart_flow(
 /// Note: if hot-adding the output to a running flow fails, the output is still persisted
 /// to config and a warning is logged.
 pub async fn add_output(
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(flow_id): Path<String>,
     Json(output): Json<OutputConfig>,
@@ -355,6 +363,7 @@ pub async fn add_output(
 /// - [`ApiError::NotFound`] (404) if the flow or the output within it does not exist.
 /// - [`ApiError::Internal`] (500) if persisting the config to disk fails.
 pub async fn remove_output(
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path((flow_id, output_id)): Path<(String, String)>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
@@ -418,6 +427,7 @@ pub async fn get_config(
 /// - [`ApiError::Internal`] (500) if persisting the config to disk fails, or if
 ///   individual flows fail to start (logged as errors but does not fail the request).
 pub async fn replace_config(
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Json(new_config): Json<AppConfig>,
 ) -> Result<Json<ApiResponse<AppConfig>>, ApiError> {
@@ -458,6 +468,7 @@ pub async fn replace_config(
 /// Note: individual flow start failures are logged as errors but do not cause the
 /// reload request itself to fail.
 pub async fn reload_config(
+    _admin: RequireAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<AppConfig>>, ApiError> {
     let new_config = crate::config::persistence::load_config(&state.config_path)

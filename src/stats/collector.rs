@@ -104,6 +104,11 @@ pub struct Tr101290State {
     pub iat_max_us: f64,
     pub iat_sum_us: f64,
     pub iat_count: u64,
+    // ── VSF TR-07 detection ──
+    /// Whether JPEG XS (stream type 0x61) has been detected in any PMT.
+    pub jpeg_xs_detected: bool,
+    /// PID of the JPEG XS elementary stream, if detected.
+    pub jpeg_xs_pid: Option<u16>,
 }
 
 impl Default for Tr101290State {
@@ -124,6 +129,8 @@ impl Default for Tr101290State {
             iat_max_us: 0.0,
             iat_sum_us: 0.0,
             iat_count: 0,
+            jpeg_xs_detected: false,
+            jpeg_xs_pid: None,
         }
     }
 }
@@ -184,6 +191,12 @@ impl Tr101290Accumulator {
         let priority1_ok = sync_loss == 0 && sync_byte == 0 && cc == 0 && pat == 0 && pmt == 0;
         let priority2_ok = tei == 0 && pcr_disc == 0 && pcr_acc == 0;
 
+        // Read TR-07 state from the state mutex
+        let (jpeg_xs_detected, jpeg_xs_pid) = {
+            let state = self.state.lock().unwrap();
+            (state.jpeg_xs_detected, state.jpeg_xs_pid)
+        };
+
         Tr101290Stats {
             ts_packets_analyzed: self.ts_packets_analyzed.load(Ordering::Relaxed),
             pat_count: self.pat_count.load(Ordering::Relaxed),
@@ -198,6 +211,8 @@ impl Tr101290Accumulator {
             pcr_accuracy_errors: pcr_acc,
             priority1_ok,
             priority2_ok,
+            tr07_compliant: jpeg_xs_detected,
+            jpeg_xs_pid,
         }
     }
 }

@@ -595,6 +595,12 @@ function render(data) {
       html += '<div class="stat"><div class="k">PCR Accuracy</div><div class="v" style="' + ec(tr.pcr_accuracy_errors) + '">' + fmt_num(tr.pcr_accuracy_errors) + '</div></div>';
       html += '<div class="stat"><div class="k">PATs</div><div class="v">' + fmt_num(tr.pat_count) + '</div></div>';
       html += '<div class="stat"><div class="k">PMTs</div><div class="v">' + fmt_num(tr.pmt_count) + '</div></div>';
+      // VSF TR-07 compliance indicator
+      if (tr.tr07_compliant) {
+        html += '<div class="stat"><div class="k">VSF TR-07</div><div class="v" style="color:' + C_GREEN + '">COMPLIANT (JPEG XS PID 0x' + (tr.jpeg_xs_pid ? tr.jpeg_xs_pid.toString(16).toUpperCase().padStart(4, '0') : '?') + ')</div></div>';
+      } else {
+        html += '<div class="stat"><div class="k">VSF TR-07</div><div class="v" style="color:' + C_GRAY + '">No JPEG XS</div></div>';
+      }
       html += '</div></div>';
     }
 

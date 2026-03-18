@@ -221,6 +221,7 @@ async fn rtp_input_loop(
                                 sequence_number: seq,
                                 rtp_timestamp: ts,
                                 recv_time_us: now_us(),
+                                is_raw_ts: false,
                             };
                             let _ = broadcast_tx.send(packet);
                         }

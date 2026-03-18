@@ -2,7 +2,7 @@
 name = "bilbycast-edge"
 version = "0.1.0"
 edition = "2024"
-description = "RTP/SMPTE 2022-2 over SRT transport bridge with 2022-7 hitless redundancy"
+description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 
 [dependencies]
 # Async runtime
@@ -47,12 +47,47 @@ rand = "0.10.0"
 # Error handling
 anyhow = "1.0.102"
 
+# Auth (JWT / HMAC-SHA256)
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+serde_urlencoded = "0.7"
+
 # UUID for flow IDs
 uuid = { version = "1.22.0", features = ["v4", "serde"] }
 
 # SRT native (pure Rust)
 srt-transport = { path = "../bilbycast-srt/srt-transport" }
 srt-protocol = { path = "../bilbycast-srt/srt-protocol" }
+
+[features]
+default = []
+# Enable TLS (HTTPS on API + RTMPS) support via rustls/tokio-rustls/axum-server.
+tls = ["dep:tokio-rustls", "dep:axum-server", "dep:rustls", "dep:rustls-pemfile"]
+# Enable WebRTC/WHIP output via webrtc-rs (large dependency tree).
+# webrtc = ["dep:webrtc"]
+
+[dependencies.tokio-rustls]
+version = "0.26"
+optional = true
+
+[dependencies.axum-server]
+version = "0.7"
+features = ["tls-rustls"]
+optional = true
+
+[dependencies.rustls]
+version = "0.23"
+optional = true
+
+[dependencies.rustls-pemfile]
+version = "2"
+optional = true
+
+# Uncomment to enable WebRTC/WHIP output:
+# [dependencies.webrtc]
+# version = "0.11"
+# optional = true
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -12,8 +12,11 @@ use crate::stats::collector::{FlowStatsAccumulator, OutputStatsAccumulator};
 
 use super::input_rtp::spawn_rtp_input;
 use super::input_srt::spawn_srt_input;
+use super::output_hls::spawn_hls_output;
+use super::output_rtmp::spawn_rtmp_output;
 use super::output_rtp::spawn_rtp_output;
 use super::output_srt::spawn_srt_output;
+use super::output_webrtc::spawn_webrtc_output;
 use super::packet::{BROADCAST_CHANNEL_CAPACITY, RtpPacket};
 use super::tr101290::spawn_tr101290_analyzer;
 use crate::stats::collector::Tr101290Accumulator;
@@ -233,6 +236,69 @@ impl FlowRuntime {
 
                 let handle = spawn_srt_output(
                     srt_config.clone(),
+                    broadcast_tx,
+                    output_stats.clone(),
+                    output_cancel.clone(),
+                );
+
+                Ok(OutputRuntime {
+                    config: output_config.clone(),
+                    handle,
+                    cancel_token: output_cancel,
+                    stats: output_stats,
+                })
+            }
+            OutputConfig::Rtmp(rtmp_config) => {
+                let output_stats = flow_stats.register_output(
+                    rtmp_config.id.clone(),
+                    rtmp_config.name.clone(),
+                    "rtmp".to_string(),
+                );
+
+                let handle = spawn_rtmp_output(
+                    rtmp_config.clone(),
+                    broadcast_tx,
+                    output_stats.clone(),
+                    output_cancel.clone(),
+                );
+
+                Ok(OutputRuntime {
+                    config: output_config.clone(),
+                    handle,
+                    cancel_token: output_cancel,
+                    stats: output_stats,
+                })
+            }
+            OutputConfig::Hls(hls_config) => {
+                let output_stats = flow_stats.register_output(
+                    hls_config.id.clone(),
+                    hls_config.name.clone(),
+                    "hls".to_string(),
+                );
+
+                let handle = spawn_hls_output(
+                    hls_config.clone(),
+                    broadcast_tx,
+                    output_stats.clone(),
+                    output_cancel.clone(),
+                );
+
+                Ok(OutputRuntime {
+                    config: output_config.clone(),
+                    handle,
+                    cancel_token: output_cancel,
+                    stats: output_stats,
+                })
+            }
+            OutputConfig::Webrtc(webrtc_config) => {
+                let output_stats = flow_stats.register_output(
+                    webrtc_config.id.clone(),
+                    webrtc_config.name.clone(),
+                    "webrtc".to_string(),
+                );
+
+                let handle = spawn_webrtc_output(
+                    webrtc_config.clone(),
                     broadcast_tx,
                     output_stats.clone(),
                     output_cancel.clone(),

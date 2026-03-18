@@ -7,6 +7,7 @@
 //! All REST endpoints are prefixed with `/api/v1/` except `/health` and `/metrics`.
 //! CORS is permissive (all origins). HTTP request tracing is enabled via tower-http.
 
+pub mod auth;
 pub mod errors;
 pub mod flows;
 pub mod models;

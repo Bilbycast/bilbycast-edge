@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use bytes::Bytes;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -14,10 +15,67 @@ use crate::util::time::now_us;
 
 use super::packet::RtpPacket;
 
-/// Spawn a task that receives RTP packets from an SRT connection and
-/// publishes them to a broadcast channel for fan-out to outputs.
-/// If the config has redundancy enabled, two SRT legs are connected
-/// and packets are merged using SMPTE 2022-7 hitless merge.
+// ── Constants ──────────────────────────────────────────────────────────────
+
+/// TS sync byte — used to detect raw TS data (first byte = 0x47).
+const TS_SYNC_BYTE: u8 = 0x47;
+
+/// TS packet size.
+const TS_PACKET_SIZE: usize = 188;
+
+// ── SRT Payload Format Detection ───────────────────────────────────────────
+
+/// Detected payload format inside SRT datagrams.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SrtPayloadFormat {
+    /// Not yet detected — waiting for first packet.
+    Unknown,
+    /// RTP/TS per SMPTE ST 2022-2: RTP header (12+ bytes) + TS packets.
+    RtpTs,
+    /// Raw MPEG-2 TS: one or more 188-byte packets with no RTP header.
+    /// This is what OBS, Haivision, srt-live-transmit, and vMix send.
+    RawTs,
+}
+
+/// Detect the payload format of an SRT datagram.
+///
+/// Checks whether the first bytes look like an RTP header (version 2) or
+/// a raw TS sync byte (0x47). If the data starts with 0x47 and its length
+/// is a multiple of 188, it's almost certainly raw TS.
+fn detect_format(data: &[u8]) -> SrtPayloadFormat {
+    if data.len() < 12 {
+        return SrtPayloadFormat::Unknown;
+    }
+
+    // Check for RTP version 2 header
+    if is_likely_rtp(data) {
+        return SrtPayloadFormat::RtpTs;
+    }
+
+    // Check for raw TS: starts with sync byte and length is multiple of 188
+    if data[0] == TS_SYNC_BYTE && data.len() >= TS_PACKET_SIZE {
+        return SrtPayloadFormat::RawTs;
+    }
+
+    SrtPayloadFormat::Unknown
+}
+
+// ── Public Entry Point ─────────────────────────────────────────────────────
+
+/// Spawn a task that receives packets from an SRT connection and publishes
+/// them to a broadcast channel for fan-out to outputs.
+///
+/// Supports both RTP-wrapped TS (SMPTE ST 2022-2) and raw TS over SRT.
+/// Format is auto-detected from the first received packet:
+/// - **RTP/TS**: packets are parsed for RTP seq/timestamp, forwarded with
+///   `is_raw_ts = false`.
+/// - **Raw TS**: a synthetic incrementing sequence number is generated,
+///   forwarded with `is_raw_ts = true` so outputs know not to strip an
+///   RTP header.
+///
+/// If the config has redundancy enabled, two SRT legs are connected and
+/// packets are merged using SMPTE 2022-7 hitless protection switching.
+/// For raw TS, 2022-7 merge uses a synthetic sequence counter per leg.
 pub fn spawn_srt_input(
     config: SrtInputConfig,
     broadcast_tx: broadcast::Sender<RtpPacket>,
@@ -40,17 +98,6 @@ pub fn spawn_srt_input(
 // Single-leg SRT input (no redundancy)
 // ---------------------------------------------------------------------------
 
-/// Core receive loop for a single-leg SRT input (no redundancy).
-///
-/// Establishes an SRT connection (caller or listener, per config), then
-/// receives packets asynchronously using `socket.recv().await`. Each
-/// received packet is parsed for RTP headers, sequence gaps are tracked
-/// for loss stats, and packets are published to the broadcast channel
-/// for fan-out to outputs.
-///
-/// If the SRT connection drops (recv returns an error), the outer loop
-/// closes the socket and attempts to reconnect after a 1-second delay.
-/// Reconnection continues until the cancellation token fires.
 async fn srt_input_loop(
     config: SrtInputConfig,
     broadcast_tx: broadcast::Sender<RtpPacket>,
@@ -59,7 +106,6 @@ async fn srt_input_loop(
 ) -> anyhow::Result<()> {
     // Outer reconnection loop
     loop {
-        // Connect with retry (respects cancellation)
         let socket = match connect_srt_input(&config, &cancel).await {
             Ok(s) => s,
             Err(e) => {
@@ -78,9 +124,13 @@ async fn srt_input_loop(
             config.local_addr,
         );
 
+        let mut format = SrtPayloadFormat::Unknown;
         let mut last_seq: Option<u16> = None;
+        let mut raw_ts_seq_counter: u16 = 0;
+        // Synthetic RTP timestamp counter for raw TS (increments by TS packet count * 188)
+        let mut raw_ts_timestamp: u32 = 0;
 
-        // Inner packet processing loop — runs until disconnect or cancel
+        // Inner packet processing loop
         let connection_lost = loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
@@ -91,14 +141,45 @@ async fn srt_input_loop(
                 result = socket.recv() => {
                     match result {
                         Ok(data) => {
-                            if !is_likely_rtp(&data) {
-                                continue;
+                            // Auto-detect format on first packet
+                            if format == SrtPayloadFormat::Unknown {
+                                format = detect_format(&data);
+                                match format {
+                                    SrtPayloadFormat::RtpTs => {
+                                        tracing::info!("SRT input: detected RTP/TS format (SMPTE ST 2022-2)");
+                                    }
+                                    SrtPayloadFormat::RawTs => {
+                                        tracing::info!("SRT input: detected raw TS format (OBS/Haivision/srt-live-transmit compatible)");
+                                    }
+                                    SrtPayloadFormat::Unknown => {
+                                        tracing::warn!("SRT input: unrecognized payload format, treating as raw data");
+                                        format = SrtPayloadFormat::RawTs;
+                                    }
+                                }
                             }
 
-                            let seq = parse_rtp_sequence_number(&data).unwrap_or(0);
-                            let ts = parse_rtp_timestamp(&data).unwrap_or(0);
+                            let (seq, ts, is_raw) = match format {
+                                SrtPayloadFormat::RtpTs => {
+                                    if !is_likely_rtp(&data) {
+                                        continue;
+                                    }
+                                    let seq = parse_rtp_sequence_number(&data).unwrap_or(0);
+                                    let ts = parse_rtp_timestamp(&data).unwrap_or(0);
+                                    (seq, ts, false)
+                                }
+                                SrtPayloadFormat::RawTs | SrtPayloadFormat::Unknown => {
+                                    // Generate synthetic sequence number and timestamp
+                                    let seq = raw_ts_seq_counter;
+                                    raw_ts_seq_counter = raw_ts_seq_counter.wrapping_add(1);
+                                    // Approximate timestamp: assume 90kHz clock, ~7 TS packets per
+                                    // datagram at ~1316 bytes
+                                    let ts_pkts = (data.len() / TS_PACKET_SIZE) as u32;
+                                    raw_ts_timestamp = raw_ts_timestamp.wrapping_add(ts_pkts * 188 * 8);
+                                    (seq, raw_ts_timestamp, true)
+                                }
+                            };
 
-                            // Detect sequence gaps for loss counting
+                            // Detect sequence gaps for loss counting (works for both formats)
                             if let Some(prev) = last_seq {
                                 let expected = prev.wrapping_add(1);
                                 if seq != expected {
@@ -119,13 +200,12 @@ async fn srt_input_loop(
                                 sequence_number: seq,
                                 rtp_timestamp: ts,
                                 recv_time_us: now_us(),
+                                is_raw_ts: is_raw,
                             };
 
-                            // Send to broadcast channel for fan-out
                             let _ = broadcast_tx.send(packet);
                         }
                         Err(_) => {
-                            // Connection lost
                             tracing::warn!("SRT input connection lost, will reconnect");
                             break true;
                         }
@@ -134,14 +214,12 @@ async fn srt_input_loop(
             }
         };
 
-        // Close old socket before reconnecting
         let _ = socket.close().await;
 
         if !connection_lost {
             break;
         }
 
-        // Brief delay before reconnect attempt
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("SRT input stopping during reconnect delay");
@@ -157,29 +235,16 @@ async fn srt_input_loop(
 }
 
 // ---------------------------------------------------------------------------
-// Dual-leg SRT input with SMPTE 2022-7 hitless merge
+// Dual-leg SRT input with SMPTE 2022-7 hitless protection switching
 // ---------------------------------------------------------------------------
 
-/// Core receive loop for dual-leg SRT input with SMPTE 2022-7 hitless merge.
+/// Dual-leg SRT input with SMPTE 2022-7 hitless merge.
 ///
-/// Connects two independent SRT legs (leg 1 from the main config, leg 2 from
-/// the redundancy config). Both legs are received asynchronously using
-/// `tokio::select!` over `socket.recv().await`.
-///
-/// Each received packet is passed through [`HitlessMerger::try_merge`], which
-/// implements SMPTE 2022-7 sequence-based deduplication:
-///
-/// - If the packet's sequence number advances the merged output stream, it is
-///   forwarded to the broadcast channel and the producing leg is noted.
-/// - If the packet is a duplicate (already forwarded via the other leg) or
-///   out-of-order, it is silently dropped.
-///
-/// A **redundancy switch** occurs when the merger starts forwarding packets
-/// from a different leg than it was previously using. This happens when the
-/// previously active leg is lagging or has lost packets. Each switch is
-/// counted in `stats.redundancy_switches` for monitoring.
-///
-/// If both legs are lost, the loop terminates.
+/// For **RTP/TS** streams: merge uses the RTP sequence number (standard 2022-7).
+/// For **raw TS** streams: merge uses a synthetic per-leg sequence counter.
+/// Both legs must use the same format — if one leg sends RTP and the other
+/// sends raw TS, the raw TS leg is accepted but merge may not deduplicate
+/// perfectly (documented limitation).
 async fn srt_input_redundant_loop(
     config: SrtInputConfig,
     broadcast_tx: broadcast::Sender<RtpPacket>,
@@ -191,7 +256,7 @@ async fn srt_input_redundant_loop(
         .as_ref()
         .expect("redundancy config must be present");
 
-    // Outer reconnection loop — restarts both legs on total connection loss
+    // Outer reconnection loop
     loop {
         // --- Connect leg 1 ---
         let socket_leg1 = match connect_srt_input(&config, &cancel).await {
@@ -209,7 +274,7 @@ async fn srt_input_redundant_loop(
             config.local_addr
         );
 
-        // --- Connect leg 2 (best-effort — fall back to single-leg if it fails) ---
+        // --- Connect leg 2 (best-effort) ---
         let socket_leg2 = match connect_srt_redundancy_leg(redundancy, &cancel).await {
             Ok(s) => Some(s),
             Err(e) => {
@@ -233,14 +298,15 @@ async fn srt_input_redundant_loop(
         let mut prev_active_leg = ActiveLeg::None;
         let mut leg1_alive = true;
         let mut leg2_alive = socket_leg2.is_some();
+        let mut format = SrtPayloadFormat::Unknown;
+        let mut raw_ts_seq_leg1: u16 = 0;
+        let mut raw_ts_seq_leg2: u16 = 0;
+        let mut raw_ts_timestamp: u32 = 0;
 
-        // Use a dummy socket reference for leg2 when not connected. The `if leg2_alive`
-        // guard on the select branch ensures we never actually recv from it.
         let dummy_leg2;
         let socket_leg2_ref = match &socket_leg2 {
             Some(s) => s,
             None => {
-                // We need a reference that lives long enough but is never used
                 dummy_leg2 = socket_leg1.clone();
                 &dummy_leg2
             }
@@ -259,9 +325,16 @@ async fn srt_input_redundant_loop(
                 result = socket_leg1.recv(), if leg1_alive => {
                     match result {
                         Ok(data) => {
+                            if format == SrtPayloadFormat::Unknown {
+                                format = detect_format(&data);
+                                log_detected_format(format);
+                            }
                             process_redundant_packet(
                                 data,
                                 ActiveLeg::Leg1,
+                                format,
+                                &mut raw_ts_seq_leg1,
+                                &mut raw_ts_timestamp,
                                 &mut merger,
                                 &mut prev_active_leg,
                                 &stats,
@@ -281,9 +354,16 @@ async fn srt_input_redundant_loop(
                 result = socket_leg2_ref.recv(), if leg2_alive => {
                     match result {
                         Ok(data) => {
+                            if format == SrtPayloadFormat::Unknown {
+                                format = detect_format(&data);
+                                log_detected_format(format);
+                            }
                             process_redundant_packet(
                                 data,
                                 ActiveLeg::Leg2,
+                                format,
+                                &mut raw_ts_seq_leg2,
+                                &mut raw_ts_timestamp,
                                 &mut merger,
                                 &mut prev_active_leg,
                                 &stats,
@@ -303,13 +383,12 @@ async fn srt_input_redundant_loop(
             }
         }
 
-        // Cleanup before reconnect
+        // Cleanup
         let _ = socket_leg1.close().await;
         if let Some(ref s) = socket_leg2 {
             let _ = s.close().await;
         }
 
-        // Brief delay before reconnect attempt
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("SRT input (redundant) stopping during reconnect delay");
@@ -322,26 +401,59 @@ async fn srt_input_redundant_loop(
     }
 }
 
+fn log_detected_format(format: SrtPayloadFormat) {
+    match format {
+        SrtPayloadFormat::RtpTs => {
+            tracing::info!("SRT input: detected RTP/TS format (SMPTE ST 2022-2)");
+        }
+        SrtPayloadFormat::RawTs => {
+            tracing::info!("SRT input: detected raw TS format (OBS/Haivision compatible)");
+        }
+        SrtPayloadFormat::Unknown => {
+            tracing::warn!("SRT input: unrecognized format, treating as raw data");
+        }
+    }
+}
+
 /// Process a single packet from a redundancy leg through the hitless merger.
 ///
-/// Checks if the packet is valid RTP, attempts merge, tracks redundancy
-/// switches, updates stats, and broadcasts if the packet advances the stream.
+/// Handles both RTP/TS and raw TS formats. For RTP/TS, the RTP sequence
+/// number is used for 2022-7 merge. For raw TS, a per-leg synthetic
+/// sequence counter is used.
 fn process_redundant_packet(
-    data: bytes::Bytes,
+    data: Bytes,
     leg: ActiveLeg,
+    format: SrtPayloadFormat,
+    raw_ts_seq: &mut u16,
+    raw_ts_timestamp: &mut u32,
     merger: &mut HitlessMerger,
     prev_active_leg: &mut ActiveLeg,
     stats: &Arc<FlowStatsAccumulator>,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
 ) {
-    if !is_likely_rtp(&data) {
-        return;
-    }
+    let (seq, ts, is_raw) = match format {
+        SrtPayloadFormat::RtpTs => {
+            if !is_likely_rtp(&data) {
+                return;
+            }
+            let seq = parse_rtp_sequence_number(&data).unwrap_or(0);
+            let ts = parse_rtp_timestamp(&data).unwrap_or(0);
+            (seq, ts, false)
+        }
+        SrtPayloadFormat::RawTs | SrtPayloadFormat::Unknown => {
+            let seq = *raw_ts_seq;
+            *raw_ts_seq = raw_ts_seq.wrapping_add(1);
+            let ts_pkts = (data.len() / TS_PACKET_SIZE) as u32;
+            *raw_ts_timestamp = raw_ts_timestamp.wrapping_add(ts_pkts * 188 * 8);
+            (seq, *raw_ts_timestamp, true)
+        }
+    };
 
-    let seq = parse_rtp_sequence_number(&data).unwrap_or(0);
-    let ts = parse_rtp_timestamp(&data).unwrap_or(0);
-
-    // Try merge — only forward if this packet advances the sequence
+    // For RTP/TS, 2022-7 merge uses the real RTP sequence number.
+    // For raw TS with redundancy, we still attempt merge using the synthetic
+    // sequence — this provides basic protection switching (if one leg drops,
+    // the other takes over) but cannot deduplicate identical packets since
+    // each leg generates independent synthetic sequences.
     if let Some(chosen_leg) = merger.try_merge(seq, leg) {
         // Track redundancy switches
         if *prev_active_leg != ActiveLeg::None && chosen_leg != *prev_active_leg {
@@ -357,7 +469,6 @@ fn process_redundant_packet(
         }
         *prev_active_leg = chosen_leg;
 
-        // Update stats
         stats.input_packets.fetch_add(1, Ordering::Relaxed);
         stats
             .input_bytes
@@ -368,9 +479,9 @@ fn process_redundant_packet(
             sequence_number: seq,
             rtp_timestamp: ts,
             recv_time_us: now_us(),
+            is_raw_ts: is_raw,
         };
 
         let _ = broadcast_tx.send(packet);
     }
-    // else: duplicate or out-of-order — silently dropped
 }

@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "server": {
+    "listen_addr": "0.0.0.0",
+    "listen_port": 8080
+  },
+  "monitor": {
+    "listen_addr": "0.0.0.0",
+    "listen_port": 9090
+  },
+  "flows": [
+    {
+      "id": "srt-to-twitch",
+      "name": "SRT Input to Twitch RTMP",
+      "enabled": true,
+      "input": {
+        "type": "srt",
+        "mode": "listener",
+        "local_addr": "0.0.0.0:9000",
+        "latency_ms": 200
+      },
+      "outputs": [
+        {
+          "type": "rtmp",
+          "id": "twitch-out",
+          "name": "Twitch Live",
+          "dest_url": "rtmp://live.twitch.tv/app",
+          "stream_key": "live_YOUR_STREAM_KEY_HERE",
+          "reconnect_delay_secs": 5
+        }
+      ]
+    }
+  ]
+}

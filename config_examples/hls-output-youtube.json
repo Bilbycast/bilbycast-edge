@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "server": {
+    "listen_addr": "0.0.0.0",
+    "listen_port": 8080
+  },
+  "monitor": {
+    "listen_addr": "0.0.0.0",
+    "listen_port": 9090
+  },
+  "flows": [
+    {
+      "id": "rtp-to-youtube-hls",
+      "name": "RTP Input to YouTube HLS",
+      "enabled": true,
+      "input": {
+        "type": "rtp",
+        "bind_addr": "0.0.0.0:5000"
+      },
+      "outputs": [
+        {
+          "type": "hls",
+          "id": "youtube-hls",
+          "name": "YouTube HLS Ingest",
+          "ingest_url": "https://a.upload.youtube.com/http_upload_hls?cid=YOUR_CHANNEL_ID&copy=0&file=",
+          "segment_duration_secs": 2.0,
+          "max_segments": 5,
+          "auth_token": "YOUR_AUTH_TOKEN"
+        }
+      ]
+    }
+  ]
+}

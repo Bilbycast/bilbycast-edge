@@ -32,6 +32,22 @@ pub struct ServerConfig {
     pub listen_addr: String,
     /// API listen port, default 8080
     pub listen_port: u16,
+    /// Optional TLS configuration for HTTPS on the API server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsConfig>,
+    /// Optional OAuth 2.0 authentication configuration.
+    /// When absent or `enabled: false`, all endpoints are unauthenticated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<crate::api::auth::AuthConfig>,
+}
+
+/// TLS configuration for HTTPS serving.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// Path to PEM-encoded TLS certificate file.
+    pub cert_path: String,
+    /// Path to PEM-encoded TLS private key file.
+    pub key_path: String,
 }
 
 impl Default for ServerConfig {
@@ -39,6 +55,8 @@ impl Default for ServerConfig {
         Self {
             listen_addr: "0.0.0.0".to_string(),
             listen_port: 8080,
+            tls: None,
+            auth: None,
         }
     }
 }
@@ -97,6 +115,10 @@ pub struct RtpInputConfig {
     /// Optional: decode incoming SMPTE 2022-1 FEC before forwarding
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fec_decode: Option<FecConfig>,
+    /// Enable VSF TR-07 mode: validates JPEG XS stream presence in PMT.
+    /// When true, the dashboard and API report TR-07 compliance status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tr07_mode: Option<bool>,
     /// Source IP allow-list (RP 2129 C5). Only packets from these IPs are accepted.
     /// When absent, all sources are allowed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -148,34 +170,48 @@ pub enum OutputConfig {
     /// Send RTP over SRT
     #[serde(rename = "srt")]
     Srt(SrtOutputConfig),
+    /// Publish to RTMP/RTMPS server (e.g. Twitch, YouTube)
+    #[serde(rename = "rtmp")]
+    Rtmp(RtmpOutputConfig),
+    /// Send TS segments via HLS ingest (e.g. YouTube HLS)
+    #[serde(rename = "hls")]
+    Hls(HlsOutputConfig),
+    /// Send via WebRTC/WHIP
+    #[serde(rename = "webrtc")]
+    Webrtc(WebrtcOutputConfig),
 }
 
 impl OutputConfig {
-    /// Returns the unique identifier of this output, regardless of its concrete type
-    /// (RTP or SRT). The ID is unique within the scope of a single flow.
+    /// Returns the unique identifier of this output, regardless of its concrete type.
     pub fn id(&self) -> &str {
         match self {
             OutputConfig::Rtp(c) => &c.id,
             OutputConfig::Srt(c) => &c.id,
+            OutputConfig::Rtmp(c) => &c.id,
+            OutputConfig::Hls(c) => &c.id,
+            OutputConfig::Webrtc(c) => &c.id,
         }
     }
 
-    /// Returns the human-readable display name of this output, regardless of its
-    /// concrete type (RTP or SRT).
+    /// Returns the human-readable display name of this output.
     pub fn name(&self) -> &str {
         match self {
             OutputConfig::Rtp(c) => &c.name,
             OutputConfig::Srt(c) => &c.name,
+            OutputConfig::Rtmp(c) => &c.name,
+            OutputConfig::Hls(c) => &c.name,
+            OutputConfig::Webrtc(c) => &c.name,
         }
     }
 
-    /// Returns the transport type name of this output as a static string: `"rtp"` or `"srt"`.
-    /// Useful for display, logging, and serialization where the variant tag is needed
-    /// without pattern-matching the full enum.
+    /// Returns the transport type name of this output as a static string.
     pub fn type_name(&self) -> &'static str {
         match self {
             OutputConfig::Rtp(_) => "rtp",
             OutputConfig::Srt(_) => "srt",
+            OutputConfig::Rtmp(_) => "rtmp",
+            OutputConfig::Hls(_) => "hls",
+            OutputConfig::Webrtc(_) => "webrtc",
         }
     }
 }
@@ -280,6 +316,100 @@ pub struct SrtRedundancyConfig {
     pub aes_key_len: Option<usize>,
 }
 
+/// RTMP/RTMPS output configuration for publishing to streaming platforms.
+///
+/// Demuxes H.264/AAC from the MPEG-2 TS stream, muxes into FLV, and publishes
+/// via the RTMP protocol. Supports RTMPS (RTMP over TLS) via `rustls`.
+///
+/// # Limitations
+/// - Output only (publish). RTMP input is not supported.
+/// - Only H.264 video and AAC audio are supported (no HEVC/VP9).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RtmpOutputConfig {
+    /// Unique output ID within this flow.
+    pub id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// RTMP destination URL, e.g. "rtmp://live.twitch.tv/app" or "rtmps://a.rtmps.youtube.com/live2"
+    pub dest_url: String,
+    /// Stream key for authentication.
+    pub stream_key: String,
+    /// Reconnect delay in seconds after connection failure (default: 5).
+    #[serde(default = "default_reconnect_delay")]
+    pub reconnect_delay_secs: u64,
+    /// Maximum reconnection attempts. None = unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_reconnect_attempts: Option<u32>,
+}
+
+fn default_reconnect_delay() -> u64 {
+    5
+}
+
+/// HLS ingest output configuration for YouTube HLS or similar endpoints.
+///
+/// Segments the MPEG-2 TS data into time-bounded chunks and uploads them
+/// via HTTP PUT/POST along with a rolling M3U8 playlist. Supports HEVC/HDR
+/// content that RTMP cannot carry.
+///
+/// # Limitations
+/// - Output only. Segment-based transport inherently adds 1-4s latency.
+/// - The ingest endpoint must support HTTP PUT or POST for segment upload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HlsOutputConfig {
+    /// Unique output ID within this flow.
+    pub id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// HLS ingest URL (base URL for segment and playlist uploads).
+    pub ingest_url: String,
+    /// Target segment duration in seconds (default: 2.0, range: 0.5-10.0).
+    #[serde(default = "default_segment_duration")]
+    pub segment_duration_secs: f64,
+    /// Optional authentication token (sent as Authorization: Bearer header).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    /// Maximum number of segments in the rolling playlist (default: 5).
+    #[serde(default = "default_max_segments")]
+    pub max_segments: usize,
+}
+
+fn default_segment_duration() -> f64 {
+    2.0
+}
+
+fn default_max_segments() -> usize {
+    5
+}
+
+/// WebRTC/WHIP output configuration.
+///
+/// Extracts H.264 NALUs from the MPEG-2 TS stream, repacketizes them
+/// as RFC 6184 RTP, and sends via a WebRTC PeerConnection established
+/// through WHIP (WebRTC-HTTP Ingestion Protocol) signaling.
+///
+/// # Limitations
+/// - Audio: only Opus passthrough is supported. AAC→Opus transcoding
+///   requires C libraries and is NOT available in the pure-Rust build.
+/// - If the source TS carries AAC audio, set `video_only: true` or
+///   the audio track will be silent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebrtcOutputConfig {
+    /// Unique output ID within this flow.
+    pub id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// WHIP endpoint URL for WebRTC signaling.
+    pub whip_url: String,
+    /// Optional Bearer token for WHIP authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<String>,
+    /// When true, only video is sent (audio track omitted).
+    /// Use when source audio is AAC and cannot be transcoded to Opus.
+    #[serde(default)]
+    pub video_only: bool,
+}
+
 /// SMPTE 2022-1 FEC parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FecConfig {
@@ -310,6 +440,7 @@ mod tests {
                     allowed_sources: None,
                     allowed_payload_types: None,
                     max_bitrate_mbps: None,
+                    tr07_mode: None,
                 }),
                 outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                     id: "out-1".to_string(),

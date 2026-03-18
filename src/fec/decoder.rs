@@ -94,6 +94,7 @@ impl FecDecoder {
             sequence_number: seq,
             rtp_timestamp: ts,
             recv_time_us: now_us(),
+            is_raw_ts: false,
         });
 
         // Check if matrix cycle is complete — reset for next
@@ -186,6 +187,7 @@ impl FecDecoder {
             sequence_number: recovered_seq,
             rtp_timestamp: 0,
             recv_time_us: now_us(),
+            is_raw_ts: false,
         })
     }
 }

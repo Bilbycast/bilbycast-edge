@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "server": {
+    "listen_addr": "0.0.0.0",
+    "listen_port": 8080,
+    "auth": {
+      "enabled": true,
+      "jwt_secret": "this-is-a-very-secret-key-at-least-32-chars-long!",
+      "token_lifetime_secs": 3600,
+      "clients": [
+        {
+          "client_id": "admin",
+          "client_secret": "admin-password-123",
+          "role": "admin"
+        },
+        {
+          "client_id": "grafana",
+          "client_secret": "grafana-readonly-key",
+          "role": "monitor"
+        }
+      ],
+      "public_metrics": true
+    }
+  },
+  "monitor": {
+    "listen_addr": "0.0.0.0",
+    "listen_port": 9090
+  },
+  "flows": [
+    {
+      "id": "test",
+      "name": "Test",
+      "enabled": false,
+      "input": {
+        "type": "rtp",
+        "bind_addr": "0.0.0.0:5000"
+      },
+      "outputs": []
+    }
+  ]
+}

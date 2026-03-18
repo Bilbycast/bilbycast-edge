@@ -28,6 +28,42 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
         }
     }
 
+    // Validate TLS config if present
+    if let Some(ref tls) = config.server.tls {
+        if tls.cert_path.is_empty() {
+            bail!("TLS cert_path cannot be empty");
+        }
+        if tls.key_path.is_empty() {
+            bail!("TLS key_path cannot be empty");
+        }
+    }
+
+    // Validate auth config if present
+    if let Some(ref auth) = config.server.auth {
+        if auth.enabled {
+            if auth.jwt_secret.len() < 32 {
+                bail!("Auth jwt_secret must be at least 32 characters for security");
+            }
+            if auth.clients.is_empty() {
+                bail!("Auth is enabled but no clients are configured");
+            }
+            for client in &auth.clients {
+                if client.client_id.is_empty() {
+                    bail!("Auth client_id cannot be empty");
+                }
+                if client.client_secret.is_empty() {
+                    bail!("Auth client_secret cannot be empty");
+                }
+                if client.role != "admin" && client.role != "monitor" {
+                    bail!(
+                        "Auth client '{}': role must be 'admin' or 'monitor', got '{}'",
+                        client.client_id, client.role
+                    );
+                }
+            }
+        }
+    }
+
     let mut flow_ids = HashSet::new();
     for flow in &config.flows {
         if !flow_ids.insert(&flow.id) {
@@ -186,6 +222,45 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
                 validate_srt_redundancy(red, "SRT output")?;
             }
         }
+        OutputConfig::Rtmp(rtmp) => {
+            if rtmp.id.is_empty() {
+                bail!("RTMP output ID cannot be empty");
+            }
+            if !rtmp.dest_url.starts_with("rtmp://") && !rtmp.dest_url.starts_with("rtmps://") {
+                bail!("RTMP output '{}': dest_url must start with rtmp:// or rtmps://", rtmp.id);
+            }
+            if rtmp.stream_key.is_empty() {
+                bail!("RTMP output '{}': stream_key cannot be empty", rtmp.id);
+            }
+            if rtmp.reconnect_delay_secs == 0 {
+                bail!("RTMP output '{}': reconnect_delay_secs must be > 0", rtmp.id);
+            }
+        }
+        OutputConfig::Hls(hls) => {
+            if hls.id.is_empty() {
+                bail!("HLS output ID cannot be empty");
+            }
+            if !hls.ingest_url.starts_with("http://") && !hls.ingest_url.starts_with("https://") {
+                bail!("HLS output '{}': ingest_url must start with http:// or https://", hls.id);
+            }
+            if hls.segment_duration_secs < 0.5 || hls.segment_duration_secs > 10.0 {
+                bail!(
+                    "HLS output '{}': segment_duration_secs must be 0.5-10.0, got {}",
+                    hls.id, hls.segment_duration_secs
+                );
+            }
+            if hls.max_segments == 0 || hls.max_segments > 30 {
+                bail!("HLS output '{}': max_segments must be 1-30, got {}", hls.id, hls.max_segments);
+            }
+        }
+        OutputConfig::Webrtc(webrtc) => {
+            if webrtc.id.is_empty() {
+                bail!("WebRTC output ID cannot be empty");
+            }
+            if !webrtc.whip_url.starts_with("http://") && !webrtc.whip_url.starts_with("https://") {
+                bail!("WebRTC output '{}': whip_url must start with http:// or https://", webrtc.id);
+            }
+        }
     }
     Ok(())
 }
@@ -328,6 +403,7 @@ mod tests {
                 allowed_sources: None,
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
+                tr07_mode: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -355,6 +431,7 @@ mod tests {
                 allowed_sources: None,
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
+                tr07_mode: None,
             }),
             outputs: vec![],
         };
@@ -399,6 +476,7 @@ mod tests {
                         allowed_sources: None,
                         allowed_payload_types: None,
                         max_bitrate_mbps: None,
+                        tr07_mode: None,
                     }),
                     outputs: vec![],
                 },
@@ -413,6 +491,7 @@ mod tests {
                         allowed_sources: None,
                         allowed_payload_types: None,
                         max_bitrate_mbps: None,
+                        tr07_mode: None,
                     }),
                     outputs: vec![],
                 },
@@ -456,6 +535,7 @@ mod tests {
                 allowed_sources: None,
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
+                tr07_mode: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -483,6 +563,7 @@ mod tests {
                 allowed_sources: None,
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
+                tr07_mode: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -510,6 +591,7 @@ mod tests {
                 allowed_sources: None,
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
+                tr07_mode: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -539,6 +621,7 @@ mod tests {
                 allowed_sources: None,
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
+                tr07_mode: None,
             }),
             outputs: vec![],
         };
@@ -558,6 +641,7 @@ mod tests {
                 allowed_sources: None,
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
+                tr07_mode: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -585,6 +669,7 @@ mod tests {
                 allowed_sources: None,
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
+                tr07_mode: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -612,6 +697,7 @@ mod tests {
                 allowed_sources: None,
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
+                tr07_mode: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),

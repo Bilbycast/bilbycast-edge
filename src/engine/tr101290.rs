@@ -208,27 +208,34 @@ async fn tr101290_analyzer_loop(
     }
 }
 
-/// Process a single RTP packet: strip the RTP header and iterate over
-/// the contained 188-byte MPEG-TS packets.
+/// Process a single packet: strip the RTP header (if present) and iterate
+/// over the contained 188-byte MPEG-TS packets.
+///
+/// Handles both RTP-wrapped TS (strip RTP header first) and raw TS
+/// (process bytes directly).
 fn process_rtp_packet(packet: &RtpPacket, stats: &Tr101290Accumulator) {
     let data = &packet.data;
-    if data.len() < RTP_HEADER_MIN_SIZE {
-        return;
-    }
 
-    // Determine actual RTP header length (12 + 4*CC count + optional extension)
-    let cc_count = (data[0] & 0x0F) as usize;
-    let has_extension = (data[0] & 0x10) != 0;
-    let mut rtp_header_len = RTP_HEADER_MIN_SIZE + cc_count * 4;
+    // Determine payload start based on packet format
+    let payload = if packet.is_raw_ts {
+        // Raw TS: entire data is TS packets, no RTP header to strip
+        &data[..]
+    } else {
+        // RTP/TS: strip RTP header to get to TS payload
+        if data.len() < RTP_HEADER_MIN_SIZE {
+            return;
+        }
+        let cc_count = (data[0] & 0x0F) as usize;
+        let has_extension = (data[0] & 0x10) != 0;
+        let mut rtp_header_len = RTP_HEADER_MIN_SIZE + cc_count * 4;
 
-    if has_extension && data.len() > rtp_header_len + 4 {
-        // Extension header: 2-byte profile + 2-byte length (in 32-bit words)
-        let ext_len =
-            ((data[rtp_header_len + 2] as usize) << 8 | data[rtp_header_len + 3] as usize) * 4;
-        rtp_header_len += 4 + ext_len;
-    }
-
-    let payload = &data[rtp_header_len..];
+        if has_extension && data.len() > rtp_header_len + 4 {
+            let ext_len =
+                ((data[rtp_header_len + 2] as usize) << 8 | data[rtp_header_len + 3] as usize) * 4;
+            rtp_header_len += 4 + ext_len;
+        }
+        &data[rtp_header_len..]
+    };
     let now = Instant::now();
 
     let mut state = stats.state.lock().unwrap();
@@ -352,6 +359,8 @@ fn process_ts_packet(
         state.pmt_pids.insert(pid, Some(now));
         if ts_pusi(pkt) {
             stats.pmt_count.fetch_add(1, Ordering::Relaxed);
+            // VSF TR-07 detection: scan PMT for JPEG XS stream type (0x61)
+            detect_jpeg_xs_in_pmt(pkt, state);
         }
     }
 
@@ -402,6 +411,67 @@ fn process_ts_packet(
                 last_pcr_wall_time: now,
             },
         );
+    }
+}
+
+/// VSF TR-07 detection: scan a PMT section for JPEG XS stream type (0x61).
+///
+/// Per VSF TR-07:2022, JPEG XS video is carried in MPEG-2 TS with stream_type
+/// 0x61. This function parses the PMT elementary stream loop to detect this
+/// stream type, setting `state.jpeg_xs_detected` and `state.jpeg_xs_pid`.
+fn detect_jpeg_xs_in_pmt(pkt: &[u8], state: &mut crate::stats::collector::Tr101290State) {
+    if !ts_pusi(pkt) {
+        return;
+    }
+
+    let mut offset = 4;
+    if ts_has_adaptation(pkt) {
+        let af_len = pkt[4] as usize;
+        offset = 5 + af_len;
+    }
+    if offset >= TS_PACKET_SIZE {
+        return;
+    }
+
+    // pointer_field
+    let pointer = pkt[offset] as usize;
+    offset += 1 + pointer;
+
+    // PMT header: table_id(1) + flags+length(2) + program_number(2) +
+    // version(1) + section_number(1) + last_section(1) + pcr_pid(2) +
+    // program_info_length(2) = 12 bytes
+    if offset + 12 > TS_PACKET_SIZE {
+        return;
+    }
+    let table_id = pkt[offset];
+    if table_id != 0x02 {
+        return;
+    }
+    let section_length =
+        (((pkt[offset + 1] & 0x0F) as usize) << 8) | (pkt[offset + 2] as usize);
+    let program_info_length =
+        (((pkt[offset + 10] & 0x0F) as usize) << 8) | (pkt[offset + 11] as usize);
+
+    let data_start = offset + 12 + program_info_length;
+    let data_end = (offset + 3 + section_length).min(TS_PACKET_SIZE).saturating_sub(4);
+
+    let mut pos = data_start;
+    while pos + 5 <= data_end {
+        let stream_type = pkt[pos];
+        let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
+        let es_info_length =
+            (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
+
+        // JPEG XS stream type per ISO/IEC 13818-1 and VSF TR-07
+        if stream_type == 0x61 {
+            if !state.jpeg_xs_detected {
+                tracing::info!("VSF TR-07: JPEG XS stream detected on PID 0x{:04X}", es_pid);
+            }
+            state.jpeg_xs_detected = true;
+            state.jpeg_xs_pid = Some(es_pid);
+        }
+
+        pos += 5 + es_info_length;
     }
 }
 

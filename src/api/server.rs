@@ -2,8 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::middleware;
 use axum::Router;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use tokio::sync::{RwLock, broadcast};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -11,110 +12,103 @@ use tower_http::trace::TraceLayer;
 use crate::config::models::AppConfig;
 use crate::engine::manager::FlowManager;
 
+use super::auth::{self, AuthState};
 use super::{flows, stats, ws};
 
 /// Shared application state accessible from all Axum handlers via [`axum::extract::State`].
-///
-/// This struct is cheaply cloneable (all fields are either `Arc`-wrapped or `Copy`)
-/// and is injected into every request handler by the Axum router.
 #[derive(Clone)]
 pub struct AppState {
-    /// The current in-memory application configuration, protected by an async read-write lock.
-    /// Handlers acquire a read lock for queries and a write lock for mutations (create, update,
-    /// delete, config replace, config reload).
+    /// The current in-memory application configuration.
     pub config: Arc<RwLock<AppConfig>>,
-    /// Filesystem path to the persisted `config.json` file. Used by mutation handlers to
-    /// write configuration changes back to disk after modifying the in-memory config.
+    /// Filesystem path to the persisted `config.json` file.
     pub config_path: PathBuf,
-    /// Handle to the flow engine manager that controls the lifecycle of all SRT/RTP flows.
-    /// Provides methods to create, start, stop, and destroy flows, as well as to query
-    /// runtime statistics.
+    /// Handle to the flow engine manager.
     pub flow_manager: Arc<FlowManager>,
-    /// Monotonic timestamp recorded at application startup. Used to compute uptime for
-    /// the health endpoint and statistics responses.
+    /// Monotonic timestamp recorded at application startup.
     pub start_time: Instant,
-    /// Broadcast channel sender for pushing real-time statistics to WebSocket clients.
-    /// The stats publisher task sends JSON-serialized [`super::models::WsStatsMessage`]
-    /// payloads through this channel, and each connected WebSocket client subscribes
-    /// via [`broadcast::Sender::subscribe`].
+    /// Broadcast channel sender for WebSocket stats.
     pub ws_stats_tx: broadcast::Sender<String>,
+    /// Optional auth state (None = auth disabled).
+    pub auth_state: Option<Arc<AuthState>>,
 }
 
-/// Constructs the main Axum [`Router`] with all API routes and middleware.
+/// Constructs the main Axum [`Router`] with all API routes, auth middleware, and layers.
 ///
-/// # Routes
+/// When auth is enabled, the router is split into:
+/// - **Public routes**: `/health`, `/oauth/token`, and optionally `/metrics` — no auth required
+/// - **Read-only routes**: GET endpoints — require valid JWT (any role)
+/// - **Admin routes**: POST/PUT/DELETE mutation endpoints — require `admin` role
 ///
-/// **Flow CRUD**
-/// - `GET    /api/v1/flows`                        -- list all configured flows
-/// - `POST   /api/v1/flows`                        -- create a new flow
-/// - `GET    /api/v1/flows/{flow_id}`              -- get a single flow by ID
-/// - `PUT    /api/v1/flows/{flow_id}`              -- update (replace) a flow
-/// - `DELETE /api/v1/flows/{flow_id}`              -- delete a flow
-///
-/// **Flow actions**
-/// - `POST   /api/v1/flows/{flow_id}/start`        -- start a stopped flow
-/// - `POST   /api/v1/flows/{flow_id}/stop`         -- stop a running flow
-/// - `POST   /api/v1/flows/{flow_id}/restart`      -- restart (stop + start) a flow
-///
-/// **Output management**
-/// - `POST   /api/v1/flows/{flow_id}/outputs`              -- add an output to a flow
-/// - `DELETE /api/v1/flows/{flow_id}/outputs/{output_id}`   -- remove an output from a flow
-///
-/// **Statistics**
-/// - `GET    /api/v1/stats`              -- aggregated system + per-flow statistics
-/// - `GET    /api/v1/stats/{flow_id}`    -- statistics for a single flow
-///
-/// **Configuration**
-/// - `GET    /api/v1/config`         -- retrieve the full running configuration
-/// - `PUT    /api/v1/config`         -- replace the entire configuration
-/// - `POST   /api/v1/config/reload`  -- reload configuration from disk
-///
-/// **Health & Metrics**
-/// - `GET    /health`    -- lightweight health check
-/// - `GET    /metrics`   -- Prometheus-compatible metrics endpoint
-///
-/// **WebSocket**
-/// - `GET    /api/v1/ws/stats`  -- WebSocket upgrade for real-time stats streaming
-///
-/// # Middleware
-///
-/// The router includes [`TraceLayer`] for HTTP request/response logging and
-/// [`CorsLayer::permissive`] for unrestricted cross-origin requests during development.
+/// When auth is disabled (no `auth` config or `enabled: false`), all routes are open.
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
-        // Flow CRUD
-        .route("/api/v1/flows", get(flows::list_flows).post(flows::create_flow))
+    let auth_state = state.auth_state.clone();
+
+    // --- Public routes (never require auth) ---
+    let public_routes = Router::new()
+        .route("/health", get(stats::health))
+        .route("/oauth/token", post(auth::oauth_token_handler));
+
+    // --- Optionally public metrics ---
+    let metrics_public = auth_state
+        .as_ref()
+        .map(|a| a.config.public_metrics)
+        .unwrap_or(true);
+
+    let public_routes = if metrics_public {
+        public_routes.route("/metrics", get(stats::prometheus_metrics))
+    } else {
+        public_routes
+    };
+
+    // --- Protected routes (require valid JWT when auth enabled) ---
+    // Read-only routes: any authenticated role (admin or monitor)
+    let read_routes = Router::new()
+        .route("/api/v1/flows", get(flows::list_flows))
+        .route("/api/v1/flows/{flow_id}", get(flows::get_flow))
+        .route("/api/v1/stats", get(stats::all_stats))
+        .route("/api/v1/stats/{flow_id}", get(stats::flow_stats))
+        .route("/api/v1/config", get(flows::get_config))
+        .route("/api/v1/ws/stats", get(ws::ws_stats_handler));
+
+    // Add metrics under auth if not public
+    let read_routes = if !metrics_public {
+        read_routes.route("/metrics", get(stats::prometheus_metrics))
+    } else {
+        read_routes
+    };
+
+    // Write routes: require admin role (enforced by RequireAdmin extractor in handlers,
+    // middleware just validates the JWT is present and not expired)
+    let write_routes = Router::new()
+        .route("/api/v1/flows", post(flows::create_flow))
         .route(
             "/api/v1/flows/{flow_id}",
-            get(flows::get_flow)
-                .put(flows::update_flow)
-                .delete(flows::delete_flow),
+            put(flows::update_flow).delete(flows::delete_flow),
         )
-        // Flow actions
         .route("/api/v1/flows/{flow_id}/start", post(flows::start_flow))
         .route("/api/v1/flows/{flow_id}/stop", post(flows::stop_flow))
         .route("/api/v1/flows/{flow_id}/restart", post(flows::restart_flow))
-        // Output management
         .route("/api/v1/flows/{flow_id}/outputs", post(flows::add_output))
         .route(
             "/api/v1/flows/{flow_id}/outputs/{output_id}",
             delete(flows::remove_output),
         )
-        // Stats
-        .route("/api/v1/stats", get(stats::all_stats))
-        .route("/api/v1/stats/{flow_id}", get(stats::flow_stats))
-        // Config
-        .route(
-            "/api/v1/config",
-            get(flows::get_config).put(flows::replace_config),
-        )
-        .route("/api/v1/config/reload", post(flows::reload_config))
-        // Health & Metrics
-        .route("/health", get(stats::health))
-        .route("/metrics", get(stats::prometheus_metrics))
-        // WebSocket
-        .route("/api/v1/ws/stats", get(ws::ws_stats_handler))
-        // Middleware
+        .route("/api/v1/config", put(flows::replace_config))
+        .route("/api/v1/config/reload", post(flows::reload_config));
+
+    // Combine protected routes with auth middleware
+    let protected_routes = Router::new()
+        .merge(read_routes)
+        .merge(write_routes)
+        .route_layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            auth::auth_middleware,
+        ));
+
+    // Merge everything
+    Router::new()
+        .merge(public_routes)
+        .merge(protected_routes)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)

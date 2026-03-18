@@ -171,6 +171,14 @@ pub struct Tr101290Stats {
     pub priority1_ok: bool,
     /// `true` when all Priority 2 error counters are zero.
     pub priority2_ok: bool,
+
+    // ── VSF TR-07 (JPEG XS over MPEG-2 TS per SMPTE ST 2022-2) ──
+
+    /// Whether the stream is TR-07 compliant (JPEG XS detected in PMT).
+    pub tr07_compliant: bool,
+    /// PID of the JPEG XS elementary stream, if detected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jpeg_xs_pid: Option<u16>,
 }
 
 /// SRT connection-level statistics for a single SRT socket/leg.

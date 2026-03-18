@@ -1,0 +1,108 @@
+{
+  "version": 1,
+  "server": {
+    "listen_addr": "0.0.0.0",
+    "listen_port": 8080
+  },
+  "monitor": {
+    "listen_addr": "0.0.0.0",
+    "listen_port": 9090
+  },
+  "flows": [
+    {
+      "id": "flow-a-srt-to-rtmp",
+      "name": "Test A: SRT Raw-TS to RTMP",
+      "enabled": true,
+      "input": {
+        "type": "srt",
+        "mode": "listener",
+        "local_addr": "0.0.0.0:9000",
+        "latency_ms": 200
+      },
+      "outputs": [
+        {
+          "type": "rtmp",
+          "id": "rtmp-to-ffmpeg",
+          "name": "RTMP to ffmpeg server",
+          "dest_url": "rtmp://127.0.0.1:1935/live",
+          "stream_key": "test",
+          "reconnect_delay_secs": 2
+        },
+        {
+          "type": "rtp",
+          "id": "rtp-monitor",
+          "name": "RTP monitor tap",
+          "dest_addr": "127.0.0.1:5004",
+          "dscp": 46
+        }
+      ]
+    },
+    {
+      "id": "flow-b-srt-redundant",
+      "name": "Test B: SRT 2022-7 Redundant Input",
+      "enabled": true,
+      "input": {
+        "type": "srt",
+        "mode": "listener",
+        "local_addr": "0.0.0.0:9010",
+        "latency_ms": 200,
+        "redundancy": {
+          "mode": "listener",
+          "local_addr": "0.0.0.0:9011",
+          "latency_ms": 200
+        }
+      },
+      "outputs": [
+        {
+          "type": "rtp",
+          "id": "rtp-from-redundant",
+          "name": "RTP from 2022-7 merge",
+          "dest_addr": "127.0.0.1:5006",
+          "dscp": 46
+        },
+        {
+          "type": "srt",
+          "id": "srt-from-redundant",
+          "name": "SRT output from 2022-7",
+          "mode": "listener",
+          "local_addr": "0.0.0.0:9012",
+          "latency_ms": 200
+        }
+      ]
+    },
+    {
+      "id": "flow-c-rtp-fanout",
+      "name": "Test C: RTP to SRT+RTMP+WebRTC",
+      "enabled": true,
+      "input": {
+        "type": "rtp",
+        "bind_addr": "0.0.0.0:6000"
+      },
+      "outputs": [
+        {
+          "type": "srt",
+          "id": "srt-out-c",
+          "name": "SRT output",
+          "mode": "listener",
+          "local_addr": "0.0.0.0:9020",
+          "latency_ms": 200
+        },
+        {
+          "type": "rtmp",
+          "id": "rtmp-out-c",
+          "name": "RTMP output",
+          "dest_url": "rtmp://127.0.0.1:1936/live",
+          "stream_key": "stream2",
+          "reconnect_delay_secs": 2
+        },
+        {
+          "type": "webrtc",
+          "id": "webrtc-out-c",
+          "name": "WebRTC WHIP (stub)",
+          "whip_url": "https://whip.example.com/ingest",
+          "video_only": true
+        }
+      ]
+    }
+  ]
+}

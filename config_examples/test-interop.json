@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "server": {
+    "listen_addr": "0.0.0.0",
+    "listen_port": 8080
+  },
+  "monitor": {
+    "listen_addr": "0.0.0.0",
+    "listen_port": 9090
+  },
+  "flows": [
+    {
+      "id": "test-srt-fanout",
+      "name": "SRT to RTP+SRT+RTMP Fan-out",
+      "enabled": true,
+      "input": {
+        "type": "srt",
+        "mode": "listener",
+        "local_addr": "0.0.0.0:9000",
+        "latency_ms": 200
+      },
+      "outputs": [
+        {
+          "type": "rtp",
+          "id": "rtp-out",
+          "name": "RTP UDP Output",
+          "dest_addr": "127.0.0.1:5004",
+          "dscp": 46
+        },
+        {
+          "type": "srt",
+          "id": "srt-out",
+          "name": "SRT Listener Output",
+          "mode": "listener",
+          "local_addr": "0.0.0.0:9001",
+          "latency_ms": 200
+        },
+        {
+          "type": "rtmp",
+          "id": "rtmp-out",
+          "name": "RTMP to Local Server",
+          "dest_url": "rtmp://127.0.0.1:1935/live",
+          "stream_key": "test",
+          "reconnect_delay_secs": 3
+        }
+      ]
+    },
+    {
+      "id": "test-rtp-input",
+      "name": "RTP Input to SRT Output",
+      "enabled": true,
+      "input": {
+        "type": "rtp",
+        "bind_addr": "0.0.0.0:6000"
+      },
+      "outputs": [
+        {
+          "type": "srt",
+          "id": "srt-out2",
+          "name": "SRT Caller Output",
+          "mode": "listener",
+          "local_addr": "0.0.0.0:9002",
+          "latency_ms": 200
+        }
+      ]
+    }
+  ]
+}

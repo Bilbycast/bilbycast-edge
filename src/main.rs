@@ -110,12 +110,31 @@ async fn main() -> anyhow::Result<()> {
     let global_stats = Arc::new(StatsCollector::new());
     let flow_manager = Arc::new(FlowManager::new(global_stats.clone()));
 
+    // Build auth state from config (None if auth not configured or disabled)
+    let auth_state = app_config
+        .server
+        .auth
+        .as_ref()
+        .filter(|a| a.enabled)
+        .map(|auth_config| {
+            tracing::info!(
+                "API authentication enabled: {} client(s) configured",
+                auth_config.clients.len()
+            );
+            Arc::new(api::auth::AuthState::new(auth_config.clone()))
+        });
+
+    if auth_state.is_none() {
+        tracing::warn!("API authentication is DISABLED — all endpoints are open");
+    }
+
     let state = AppState {
         config: Arc::new(RwLock::new(app_config.clone())),
         config_path: cli.config.clone(),
         flow_manager: flow_manager.clone(),
         start_time: Instant::now(),
         ws_stats_tx: ws_stats_tx.clone(),
+        auth_state,
     };
 
     // Start all enabled flows from config
@@ -130,8 +149,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Build router and start server
     let router = build_router(state.clone());
-
-    let listener = TcpListener::bind(&listen_addr).await?;
     tracing::info!("API server listening on {listen_addr}");
 
     // Shared shutdown token for coordinated graceful shutdown
@@ -172,11 +189,50 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            shutdown_token.cancelled().await;
-        })
-        .await?;
+    // Start API server (with or without TLS)
+    #[cfg(feature = "tls")]
+    {
+        if let Some(ref tls_config) = app_config.server.tls {
+            use axum_server::tls_rustls::RustlsConfig;
+            let rustls_config = RustlsConfig::from_pem_file(&tls_config.cert_path, &tls_config.key_path)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to load TLS cert/key: {e}"))?;
+            tracing::info!("API server TLS enabled (cert={}, key={})", tls_config.cert_path, tls_config.key_path);
+
+            let addr: std::net::SocketAddr = listen_addr.parse()?;
+            let handle = axum_server::Handle::new();
+            let shutdown_handle = handle.clone();
+            tokio::spawn(async move {
+                shutdown_token.cancelled().await;
+                shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+            });
+
+            axum_server::bind_rustls(addr, rustls_config)
+                .handle(handle)
+                .serve(router.into_make_service())
+                .await?;
+        } else {
+            let listener = TcpListener::bind(&listen_addr).await?;
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    shutdown_token.cancelled().await;
+                })
+                .await?;
+        }
+    }
+
+    #[cfg(not(feature = "tls"))]
+    {
+        if app_config.server.tls.is_some() {
+            tracing::warn!("TLS is configured but the 'tls' feature is not enabled. Build with --features tls to enable HTTPS.");
+        }
+        let listener = TcpListener::bind(&listen_addr).await?;
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                shutdown_token.cancelled().await;
+            })
+            .await?;
+    }
 
     // Graceful shutdown: stop all flows
     flow_manager.stop_all().await;
