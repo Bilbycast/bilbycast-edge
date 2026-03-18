@@ -182,12 +182,20 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref mgr_config) = app_config.manager {
         if mgr_config.enabled {
             tracing::info!("Manager client enabled, connecting to {}", mgr_config.url);
+            let local_ip = resolve_local_ip();
+            let api_port = app_config.server.listen_port;
+            let mgr_api_addr = format!("{}:{}", local_ip, api_port);
+            let mgr_monitor_addr = app_config.monitor.as_ref().map(|m| {
+                format!("{}:{}", local_ip, m.listen_port)
+            });
             manager::client::start_manager_client(
                 mgr_config.clone(),
                 flow_manager.clone(),
                 ws_stats_tx.clone(),
                 state.config.clone(),
                 cli.config.clone(),
+                mgr_api_addr,
+                mgr_monitor_addr,
             );
         }
     }
@@ -306,5 +314,24 @@ async fn stats_publisher_loop(
             }
         }
     }
+}
+
+/// Resolve the machine's actual LAN IP address by connecting a UDP socket
+/// to an external address (no actual traffic is sent). Falls back to 127.0.0.1.
+fn resolve_local_ip() -> String {
+    // UDP connect trick — works on Mac and Linux without extra crates.
+    // Connecting a UDP socket to a public IP sets the OS routing table
+    // source address without sending any packets.
+    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if sock.connect("8.8.8.8:80").is_ok() {
+            if let Ok(addr) = sock.local_addr() {
+                let ip = addr.ip().to_string();
+                if ip != "0.0.0.0" {
+                    return ip;
+                }
+            }
+        }
+    }
+    "127.0.0.1".to_string()
 }
 

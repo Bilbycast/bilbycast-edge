@@ -21,6 +21,11 @@
 # Environment & secrets
 .env
 .env.*
+*.pem
+*.key
+*.crt
+certs/
+*-credentials.json
 
 # Logs
 *.log
