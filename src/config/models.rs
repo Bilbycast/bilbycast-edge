@@ -149,6 +149,10 @@ pub struct SrtInputConfig {
     /// SRT latency in milliseconds
     #[serde(default = "default_latency")]
     pub latency_ms: u64,
+    /// Peer idle timeout in seconds. Connection is dropped if no data
+    /// is received for this duration. Default: 30s (suitable for broadcast).
+    #[serde(default = "default_peer_idle_timeout")]
+    pub peer_idle_timeout_secs: u64,
     /// Optional AES encryption passphrase (10-79 chars)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub passphrase: Option<String>,
@@ -162,6 +166,10 @@ pub struct SrtInputConfig {
 
 fn default_latency() -> u64 {
     120
+}
+
+fn default_peer_idle_timeout() -> u64 {
+    30
 }
 
 /// Output destination configuration
@@ -263,6 +271,10 @@ pub struct SrtOutputConfig {
     /// SRT latency in ms
     #[serde(default = "default_latency")]
     pub latency_ms: u64,
+    /// Peer idle timeout in seconds. Connection is dropped if no data
+    /// is received for this duration. Default: 30s (suitable for broadcast).
+    #[serde(default = "default_peer_idle_timeout")]
+    pub peer_idle_timeout_secs: u64,
     /// Optional AES encryption passphrase
     #[serde(skip_serializing_if = "Option::is_none")]
     pub passphrase: Option<String>,
@@ -312,6 +324,9 @@ pub struct SrtRedundancyConfig {
     /// SRT latency for leg 2
     #[serde(default = "default_latency")]
     pub latency_ms: u64,
+    /// Peer idle timeout in seconds for leg 2. Default: 30s.
+    #[serde(default = "default_peer_idle_timeout")]
+    pub peer_idle_timeout_secs: u64,
     /// Optional AES passphrase for leg 2
     #[serde(skip_serializing_if = "Option::is_none")]
     pub passphrase: Option<String>,

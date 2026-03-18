@@ -12,18 +12,21 @@ use crate::config::models::{SrtInputConfig, SrtMode, SrtOutputConfig, SrtRedunda
 
 /// Build an [`SrtSocketBuilder`] from common SRT configuration parameters.
 ///
-/// Applies sensible defaults for peer idle timeout (5 s) and live mode.
+/// `peer_idle_timeout_secs` controls how long to wait with no data before
+/// considering the connection dead. Default is 30s (suitable for broadcast).
 /// If a passphrase is provided, AES encryption is enabled with the given
 /// key length (defaulting to 16 bytes / AES-128).
 fn build_socket_builder(
     latency_ms: u64,
+    peer_idle_timeout_secs: u64,
     passphrase: Option<&str>,
     aes_key_len: Option<usize>,
 ) -> SrtSocketBuilder {
+    let timeout = if peer_idle_timeout_secs == 0 { 30 } else { peer_idle_timeout_secs };
     let mut builder = SrtSocket::builder()
         .latency(Duration::from_millis(latency_ms))
         .live_mode()
-        .peer_idle_timeout(Duration::from_secs(5));
+        .peer_idle_timeout(Duration::from_secs(timeout));
 
     if let Some(pass) = passphrase {
         let key_size = match aes_key_len.unwrap_or(16) {
@@ -51,6 +54,7 @@ pub async fn connect_srt(
     local_addr: &str,
     remote_addr: Option<&str>,
     latency_ms: u64,
+    peer_idle_timeout_secs: u64,
     passphrase: Option<&str>,
     aes_key_len: Option<usize>,
 ) -> Result<Arc<SrtSocket>> {
@@ -67,7 +71,7 @@ pub async fn connect_srt(
 
             tracing::info!("SRT caller connecting {} -> {}", local_addr, remote);
 
-            let builder = build_socket_builder(latency_ms, passphrase, aes_key_len);
+            let builder = build_socket_builder(latency_ms, peer_idle_timeout_secs, passphrase, aes_key_len);
             let sock = builder
                 .bind(local_sa)
                 .connect(remote_sa)
@@ -84,9 +88,11 @@ pub async fn connect_srt(
 
             tracing::info!("SRT listener waiting on {}", local_addr);
 
+            let timeout = if peer_idle_timeout_secs == 0 { 30 } else { peer_idle_timeout_secs };
             let mut listener_builder = SrtListener::builder()
                 .latency(Duration::from_millis(latency_ms))
-                .live_mode();
+                .live_mode()
+                .peer_idle_timeout(Duration::from_secs(timeout));
 
             if let Some(pass) = passphrase {
                 let key_size = match aes_key_len.unwrap_or(16) {
@@ -133,6 +139,7 @@ pub async fn connect_srt_with_retry(
     local_addr: &str,
     remote_addr: Option<&str>,
     latency_ms: u64,
+    peer_idle_timeout_secs: u64,
     passphrase: Option<&str>,
     aes_key_len: Option<usize>,
     cancel: &CancellationToken,
@@ -141,7 +148,7 @@ pub async fn connect_srt_with_retry(
     let max_delay = Duration::from_secs(30);
 
     loop {
-        match connect_srt(mode, local_addr, remote_addr, latency_ms, passphrase, aes_key_len).await
+        match connect_srt(mode, local_addr, remote_addr, latency_ms, peer_idle_timeout_secs, passphrase, aes_key_len).await
         {
             Ok(sock) => return Ok(sock),
             Err(e) => {
@@ -179,6 +186,7 @@ pub async fn connect_srt_input(
         &config.local_addr,
         config.remote_addr.as_deref(),
         config.latency_ms,
+        config.peer_idle_timeout_secs,
         config.passphrase.as_deref(),
         config.aes_key_len,
         cancel,
@@ -197,6 +205,7 @@ pub async fn connect_srt_output(
         &config.local_addr,
         config.remote_addr.as_deref(),
         config.latency_ms,
+        config.peer_idle_timeout_secs,
         config.passphrase.as_deref(),
         config.aes_key_len,
         cancel,
@@ -215,6 +224,7 @@ pub async fn connect_srt_redundancy_leg(
         &redundancy.local_addr,
         redundancy.remote_addr.as_deref(),
         redundancy.latency_ms,
+        redundancy.peer_idle_timeout_secs,
         redundancy.passphrase.as_deref(),
         redundancy.aes_key_len,
         cancel,
