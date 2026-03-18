@@ -92,6 +92,18 @@ pub struct Tr101290State {
     pub sync_consecutive_good: u32,
     /// Consecutive TS packets with incorrect sync byte.
     pub sync_consecutive_bad: u32,
+    // ── IAT / PDV tracking (RP 2129 U2, M2, M3) ──
+    /// Last RTP packet receive time in microseconds.
+    pub last_recv_time_us: Option<u64>,
+    /// Last RTP timestamp for jitter calculation.
+    pub last_rtp_timestamp: Option<u32>,
+    /// RFC 3550 jitter estimator (in timestamp units, scaled to microseconds).
+    pub jitter_us: f64,
+    /// IAT running stats for the current window.
+    pub iat_min_us: f64,
+    pub iat_max_us: f64,
+    pub iat_sum_us: f64,
+    pub iat_count: u64,
 }
 
 impl Default for Tr101290State {
@@ -105,6 +117,13 @@ impl Default for Tr101290State {
             in_sync: true,
             sync_consecutive_good: 0,
             sync_consecutive_bad: 0,
+            last_recv_time_us: None,
+            last_rtp_timestamp: None,
+            jitter_us: 0.0,
+            iat_min_us: f64::MAX,
+            iat_max_us: 0.0,
+            iat_sum_us: 0.0,
+            iat_count: 0,
         }
     }
 }
@@ -201,6 +220,7 @@ pub struct FlowStatsAccumulator {
     pub input_packets: AtomicU64,
     pub input_bytes: AtomicU64,
     pub input_loss: AtomicU64,
+    pub input_filtered: AtomicU64,
     pub fec_recovered: AtomicU64,
     pub redundancy_switches: AtomicU64,
     // Per-output stats
@@ -223,6 +243,7 @@ impl FlowStatsAccumulator {
             input_packets: AtomicU64::new(0),
             input_bytes: AtomicU64::new(0),
             input_loss: AtomicU64::new(0),
+            input_filtered: AtomicU64::new(0),
             fec_recovered: AtomicU64::new(0),
             redundancy_switches: AtomicU64::new(0),
             output_stats: DashMap::new(),
@@ -257,7 +278,29 @@ impl FlowStatsAccumulator {
         let input_bytes = self.input_bytes.load(Ordering::Relaxed);
         let input_bitrate = self.input_throughput.lock().unwrap().sample(input_bytes);
 
-        let tr101290 = self.tr101290.get().map(|acc| acc.snapshot());
+        let tr101290_snap = self.tr101290.get().map(|acc| acc.snapshot());
+
+        // Extract IAT/PDV from the TR-101290 analyzer state
+        let (iat, pdv_jitter_us) = self.tr101290.get()
+            .map(|acc| {
+                let state = acc.state.lock().unwrap();
+                let iat = if state.iat_count > 0 {
+                    Some(IatStats {
+                        min_us: if state.iat_min_us == f64::MAX { 0.0 } else { state.iat_min_us },
+                        max_us: state.iat_max_us,
+                        avg_us: state.iat_sum_us / state.iat_count as f64,
+                    })
+                } else {
+                    None
+                };
+                let pdv = if state.jitter_us > 0.0 { Some(state.jitter_us) } else { None };
+                (iat, pdv)
+            })
+            .unwrap_or((None, None));
+
+        // Derive flow health (RP 2129 M6)
+        let packets_lost = self.input_loss.load(Ordering::Relaxed);
+        let health = derive_flow_health(input_bitrate, packets_lost, &tr101290_snap);
 
         FlowStats {
             flow_id: self.flow_id.clone(),
@@ -269,7 +312,8 @@ impl FlowStatsAccumulator {
                 packets_received: self.input_packets.load(Ordering::Relaxed),
                 bytes_received: input_bytes,
                 bitrate_bps: input_bitrate,
-                packets_lost: self.input_loss.load(Ordering::Relaxed),
+                packets_lost,
+                packets_filtered: self.input_filtered.load(Ordering::Relaxed),
                 packets_recovered_fec: self.fec_recovered.load(Ordering::Relaxed),
                 srt_stats: None,
                 srt_leg2_stats: None,
@@ -277,9 +321,53 @@ impl FlowStatsAccumulator {
             },
             outputs,
             uptime_secs: self.started_at.elapsed().as_secs(),
-            tr101290,
+            tr101290: tr101290_snap,
+            health,
+            iat,
+            pdv_jitter_us,
         }
     }
+}
+
+/// Derive flow health from available metrics (RP 2129 M6).
+/// Called during the 1/sec snapshot — zero hot-path impact.
+fn derive_flow_health(
+    bitrate_bps: u64,
+    packets_lost: u64,
+    tr101290: &Option<Tr101290Stats>,
+) -> FlowHealth {
+    if let Some(tr) = tr101290 {
+        // Critical: sync loss or sustained errors
+        if tr.sync_loss_count > 0 {
+            return FlowHealth::Critical;
+        }
+        // Error: P1 errors (CC, PAT, PMT)
+        if !tr.priority1_ok {
+            return FlowHealth::Error;
+        }
+    }
+
+    // Critical: no data flowing
+    if bitrate_bps == 0 {
+        return FlowHealth::Critical;
+    }
+
+    // Error: significant packet loss
+    if packets_lost > 100 {
+        return FlowHealth::Error;
+    }
+
+    // Warning: P2 errors or minor loss
+    if let Some(tr) = tr101290 {
+        if !tr.priority2_ok {
+            return FlowHealth::Warning;
+        }
+    }
+    if packets_lost > 0 {
+        return FlowHealth::Warning;
+    }
+
+    FlowHealth::Healthy
 }
 
 /// Global statistics registry that holds all flow stats accumulators.

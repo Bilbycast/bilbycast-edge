@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -31,12 +33,61 @@ pub fn spawn_rtp_input(
     })
 }
 
+/// Simple token-bucket rate limiter.
+///
+/// Tokens are replenished based on elapsed time. Each byte consumed costs
+/// one token. If insufficient tokens are available, the packet is rejected.
+/// All operations are integer arithmetic — no system calls or allocations.
+struct TokenBucket {
+    tokens: f64,
+    max_tokens: f64,
+    rate_bytes_per_us: f64,
+    last_refill_us: u64,
+}
+
+impl TokenBucket {
+    fn new(max_bitrate_mbps: f64) -> Self {
+        let rate_bytes_per_sec = max_bitrate_mbps * 1_000_000.0 / 8.0;
+        let rate_bytes_per_us = rate_bytes_per_sec / 1_000_000.0;
+        // Allow burst of up to 10ms worth of data
+        let max_tokens = rate_bytes_per_sec * 0.01;
+        Self {
+            tokens: max_tokens,
+            max_tokens,
+            rate_bytes_per_us,
+            last_refill_us: now_us(),
+        }
+    }
+
+    /// Returns true if the packet is allowed, false if rate-limited.
+    fn try_consume(&mut self, bytes: usize) -> bool {
+        let now = now_us();
+        let elapsed = now.saturating_sub(self.last_refill_us);
+        self.last_refill_us = now;
+
+        // Replenish tokens
+        self.tokens += elapsed as f64 * self.rate_bytes_per_us;
+        if self.tokens > self.max_tokens {
+            self.tokens = self.max_tokens;
+        }
+
+        let cost = bytes as f64;
+        if self.tokens >= cost {
+            self.tokens -= cost;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Core receive loop for RTP input.
 ///
 /// Binds a UDP socket to `config.bind_addr` (with optional multicast join via
 /// `config.interface_addr`), then enters a select loop that:
 ///
 /// - Reads datagrams from the socket.
+/// - Applies ingress filters (source IP, payload type, rate limit) per RP 2129.
 /// - Filters non-RTP packets (e.g., stray RTCP).
 /// - Tracks sequence numbers and counts gaps as packet loss.
 /// - Optionally passes packets through a [`FecDecoder`] pipeline that can
@@ -54,14 +105,31 @@ async fn rtp_input_loop(
 
     tracing::info!("RTP input started on {}", config.bind_addr);
 
+    // ── Ingress filters (RP 2129) — built once, checked per-packet ──
+
+    // C5: Source IP allow-list (pre-parsed into HashSet for O(1) lookup)
+    let source_filter: Option<HashSet<IpAddr>> = config.allowed_sources.as_ref().map(|sources| {
+        let set: HashSet<IpAddr> = sources
+            .iter()
+            .filter_map(|s| s.parse::<IpAddr>().ok())
+            .collect();
+        tracing::info!("Source IP filter enabled: {} allowed addresses", set.len());
+        set
+    });
+
+    // U4: RTP payload type allow-list
+    let pt_filter: Option<Vec<u8>> = config.allowed_payload_types.clone();
+    if let Some(ref pts) = pt_filter {
+        tracing::info!("Payload type filter enabled: {:?}", pts);
+    }
+
+    // C7: Per-flow ingress rate limiter
+    let mut rate_limiter: Option<TokenBucket> = config.max_bitrate_mbps.map(|rate| {
+        tracing::info!("Rate limit enabled: {rate} Mbps");
+        TokenBucket::new(rate)
+    });
+
     // Optional FEC decoder.
-    //
-    // The FEC decoder needs to report how many packets it has recovered,
-    // but it lives behind a `&mut` reference inside the select loop where
-    // we also need `&stats`. To avoid borrow conflicts, we use a shared
-    // `Arc<AtomicU64>` counter: the decoder increments it internally on
-    // each recovery, and we periodically copy its value into the stats
-    // accumulator with a simple `load` + `store` (no lock required).
     let fec_recovered_counter = Arc::new(AtomicU64::new(0));
     let mut fec_decoder = config.fec_decode.as_ref().map(|fec_config| {
         tracing::info!(
@@ -87,22 +155,42 @@ async fn rtp_input_loop(
             }
             result = socket.recv_from(&mut buf) => {
                 match result {
-                    Ok((len, _src)) => {
+                    Ok((len, src)) => {
                         let data = &buf[..len];
+
+                        // ── C5: Source IP filter ──
+                        if let Some(ref allowed) = source_filter {
+                            if !allowed.contains(&src.ip()) {
+                                stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                        }
 
                         if !is_likely_rtp(data) {
                             continue;
+                        }
+
+                        // ── U4: Payload type filter ──
+                        if let Some(ref pts) = pt_filter {
+                            let pt = data[1] & 0x7F;
+                            if !pts.contains(&pt) {
+                                stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                        }
+
+                        // ── C7: Rate limit ──
+                        if let Some(ref mut limiter) = rate_limiter {
+                            if !limiter.try_consume(len) {
+                                stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
                         }
 
                         let seq = parse_rtp_sequence_number(data).unwrap_or(0);
                         let ts = parse_rtp_timestamp(data).unwrap_or(0);
 
                         // Detect sequence gaps for loss counting.
-                        // RTP sequence numbers are 16-bit and wrap around, so
-                        // we use wrapping arithmetic. Gaps larger than 1000 are
-                        // likely caused by a source restart or massive reorder
-                        // rather than actual loss, so we ignore them to avoid
-                        // wildly inflating the loss counter.
                         if let Some(prev) = last_seq {
                             let expected = prev.wrapping_add(1);
                             if seq != expected {
@@ -121,29 +209,13 @@ async fn rtp_input_loop(
                         let bytes_data = Bytes::copy_from_slice(data);
 
                         if let Some(ref mut decoder) = fec_decoder {
-                            // FEC decode pipeline:
-                            //
-                            // `process_media` accepts every incoming packet (both
-                            // media and FEC). Internally it distinguishes them by
-                            // payload type:
-                            //   - Media packets are stored in a column/row matrix
-                            //     and returned immediately for forwarding.
-                            //   - FEC packets are consumed by the XOR recovery
-                            //     engine. If a gap can be filled, the recovered
-                            //     media packet(s) are also returned in the vec.
-                            //
-                            // The returned vec therefore contains the original
-                            // media packet plus any packets recovered by FEC.
                             let packets = decoder.process_media(seq, ts, &bytes_data);
                             for pkt in packets {
                                 let _ = broadcast_tx.send(pkt);
                             }
-                            // Sync the FEC recovered counter back to the stats
-                            // accumulator (atomic load + store, no lock needed).
                             let recovered = fec_recovered_counter.load(Ordering::Relaxed);
                             stats.fec_recovered.store(recovered, Ordering::Relaxed);
                         } else {
-                            // No FEC — forward the raw media packet directly.
                             let packet = RtpPacket {
                                 data: bytes_data,
                                 sequence_number: seq,

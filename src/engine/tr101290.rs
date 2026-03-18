@@ -233,6 +233,43 @@ fn process_rtp_packet(packet: &RtpPacket, stats: &Tr101290Accumulator) {
 
     let mut state = stats.state.lock().unwrap();
 
+    // ── IAT and PDV/jitter computation (RP 2129 U2, M2, M3) ──
+    // Runs per-RTP-packet (not per-TS-packet) on this independent analyzer task.
+    {
+        let recv_us = packet.recv_time_us;
+        let rtp_ts = packet.rtp_timestamp;
+
+        // IAT: delta between consecutive packet arrival times
+        if let Some(prev_recv) = state.last_recv_time_us {
+            let iat = recv_us.saturating_sub(prev_recv) as f64;
+            if iat < state.iat_min_us {
+                state.iat_min_us = iat;
+            }
+            if iat > state.iat_max_us {
+                state.iat_max_us = iat;
+            }
+            state.iat_sum_us += iat;
+            state.iat_count += 1;
+        }
+        state.last_recv_time_us = Some(recv_us);
+
+        // PDV/Jitter: RFC 3550 exponential moving average
+        // D(i-1,i) = |(recv_i - recv_{i-1}) - (ts_i - ts_{i-1})|
+        // J = J + (|D| - J) / 16
+        if let (Some(prev_recv), Some(prev_ts)) =
+            (state.last_recv_time_us, state.last_rtp_timestamp)
+        {
+            // recv delta in microseconds
+            let recv_delta = recv_us as f64 - state.last_recv_time_us.unwrap_or(recv_us) as f64;
+            // RTP timestamp delta in microseconds (assume 90kHz clock → 1 tick = 11.11 us)
+            let ts_delta = rtp_ts.wrapping_sub(prev_ts) as f64 * (1_000_000.0 / 90_000.0);
+            let d = (recv_delta - ts_delta).abs();
+            state.jitter_us += (d - state.jitter_us) / 16.0;
+            let _ = prev_recv; // suppress warning
+        }
+        state.last_rtp_timestamp = Some(rtp_ts);
+    }
+
     // Iterate over 188-byte TS packets in the RTP payload
     let mut offset = 0;
     while offset + TS_PACKET_SIZE <= payload.len() {

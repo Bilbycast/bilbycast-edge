@@ -52,7 +52,7 @@ async fn rtp_output_loop(
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let (socket, dest) =
-        create_udp_output(&config.dest_addr, config.bind_addr.as_deref(), config.interface_addr.as_deref()).await?;
+        create_udp_output(&config.dest_addr, config.bind_addr.as_deref(), config.interface_addr.as_deref(), config.dscp).await?;
 
     tracing::info!(
         "RTP output '{}' started -> {}",

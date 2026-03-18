@@ -95,6 +95,7 @@ pub async fn create_udp_output(
     dest_addr: &str,
     bind_addr: Option<&str>,
     interface_addr: Option<&str>,
+    dscp: u8,
 ) -> Result<(UdpSocket, SocketAddr)> {
     let dest: SocketAddr = dest_addr
         .parse()
@@ -127,6 +128,25 @@ pub async fn create_udp_output(
     socket
         .bind(&SockAddr::from(bind_to))
         .with_context(|| format!("Failed to bind output socket to {bind_to}"))?;
+
+    // Set DSCP/QoS marking (RP 2129 C10). The TOS/Traffic Class byte is DSCP << 2.
+    // This is a per-socket kernel option — all packets inherit it automatically.
+    if dscp > 0 {
+        let tos = (dscp as u32) << 2;
+        match domain {
+            d if d == Domain::IPV4 => {
+                socket
+                    .set_tos_v4(tos)
+                    .with_context(|| format!("Failed to set DSCP {dscp} (TOS {tos})"))?;
+            }
+            _ => {
+                socket
+                    .set_tclass_v6(tos)
+                    .with_context(|| format!("Failed to set DSCP {dscp} (Traffic Class {tos})"))?;
+            }
+        }
+        tracing::info!("UDP output: DSCP set to {dscp} (TOS/TCLASS byte {tos:#04x})");
+    }
 
     // If destination is multicast, set the outgoing interface and TTL/hop limit
     if dest.ip().is_multicast() {

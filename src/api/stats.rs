@@ -237,6 +237,38 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
             ));
         }
 
+        // RP 2129 metrics
+        output.push_str("\n# HELP bilbycast_edge_flow_input_packets_filtered Packets dropped by ingress filters\n");
+        output.push_str("# TYPE bilbycast_edge_flow_input_packets_filtered counter\n");
+        for fs in &flow_snapshots {
+            output.push_str(&format!(
+                "bilbycast_edge_flow_input_packets_filtered{{flow_id=\"{}\"}} {}\n",
+                fs.flow_id, fs.input.packets_filtered
+            ));
+        }
+
+        output.push_str("\n# HELP bilbycast_edge_flow_pdv_jitter_us Packet delivery variation (jitter) in microseconds\n");
+        output.push_str("# TYPE bilbycast_edge_flow_pdv_jitter_us gauge\n");
+        for fs in &flow_snapshots {
+            if let Some(jitter) = fs.pdv_jitter_us {
+                output.push_str(&format!(
+                    "bilbycast_edge_flow_pdv_jitter_us{{flow_id=\"{}\"}} {:.1}\n",
+                    fs.flow_id, jitter
+                ));
+            }
+        }
+
+        output.push_str("\n# HELP bilbycast_edge_flow_iat_avg_us Average inter-arrival time in microseconds\n");
+        output.push_str("# TYPE bilbycast_edge_flow_iat_avg_us gauge\n");
+        for fs in &flow_snapshots {
+            if let Some(ref iat) = fs.iat {
+                output.push_str(&format!(
+                    "bilbycast_edge_flow_iat_avg_us{{flow_id=\"{}\"}} {:.1}\n",
+                    fs.flow_id, iat.avg_us
+                ));
+            }
+        }
+
         // Per-output metrics
         output.push_str("\n# HELP bilbycast_edge_flow_output_packets_total Total packets sent per output\n");
         output.push_str("# TYPE bilbycast_edge_flow_output_packets_total counter\n");

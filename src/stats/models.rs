@@ -18,6 +18,39 @@ pub struct FlowStats {
     /// TR-101290 transport stream analysis (present when flow is running).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tr101290: Option<Tr101290Stats>,
+    /// Overall flow health derived from all metrics (RP 2129 M6).
+    pub health: FlowHealth,
+    /// RTP inter-arrival time metrics in microseconds (RP 2129 U2/M2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iat: Option<IatStats>,
+    /// Packet delivery variation / jitter in microseconds (RP 2129 U2/M3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pdv_jitter_us: Option<f64>,
+}
+
+/// Inter-arrival time statistics (microseconds).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct IatStats {
+    /// Minimum IAT observed in the last reporting window.
+    pub min_us: f64,
+    /// Maximum IAT observed in the last reporting window.
+    pub max_us: f64,
+    /// Average IAT observed in the last reporting window.
+    pub avg_us: f64,
+}
+
+/// Flow health/alarm state derived from monitoring metrics (RP 2129 M6).
+#[derive(Debug, Clone, Serialize, Default, PartialEq)]
+pub enum FlowHealth {
+    /// No errors, bitrate > 0, stream healthy.
+    #[default]
+    Healthy,
+    /// Minor issues: PCR accuracy errors or low-level CC errors.
+    Warning,
+    /// Significant issues: sync loss, PAT/PMT timeout, or high packet loss.
+    Error,
+    /// Sustained failures: input disconnected or zero bitrate for extended period.
+    Critical,
 }
 
 /// Lifecycle state of a media flow.
@@ -52,6 +85,8 @@ pub struct InputStats {
     pub bitrate_bps: u64,
     /// Number of RTP packets detected as lost (sequence gaps).
     pub packets_lost: u64,
+    /// Packets dropped by ingress filters (source IP, payload type, rate limit).
+    pub packets_filtered: u64,
     /// Number of lost packets successfully recovered via SMPTE 2022-1 FEC.
     pub packets_recovered_fec: u64,
     /// SRT-level statistics for the primary input leg (if SRT transport).

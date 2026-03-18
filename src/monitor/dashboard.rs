@@ -542,7 +542,12 @@ function render(data) {
 
     html += '<div class="flow-card">';
     html += '<div class="flow-header"><span class="flow-name">' + esc(f.flow_name || f.flow_id) + '</span>';
-    html += '<span class="badge ' + bc + '">' + esc(st) + '</span></div>';
+    html += '<span style="display:flex;gap:6px;align-items:center">';
+    // Health badge (RP 2129 M6)
+    var hc = {'Healthy':C_GREEN,'Warning':C_AMBER,'Error':C_RED,'Critical':C_RED}[f.health] || C_GRAY;
+    html += '<span class="badge" style="background:rgba(' + hexToRgb(hc).r + ',' + hexToRgb(hc).g + ',' + hexToRgb(hc).b + ',0.15);color:' + hc + '">' + esc(f.health || 'Unknown') + '</span>';
+    html += '<span class="badge ' + bc + '">' + esc(st) + '</span>';
+    html += '</span></div>';
 
     // Flow visualization canvas
     html += '<div class="flow-viz" id="viz-' + esc(f.flow_id) + '"></div>';
@@ -590,6 +595,34 @@ function render(data) {
       html += '<div class="stat"><div class="k">PCR Accuracy</div><div class="v" style="' + ec(tr.pcr_accuracy_errors) + '">' + fmt_num(tr.pcr_accuracy_errors) + '</div></div>';
       html += '<div class="stat"><div class="k">PATs</div><div class="v">' + fmt_num(tr.pat_count) + '</div></div>';
       html += '<div class="stat"><div class="k">PMTs</div><div class="v">' + fmt_num(tr.pmt_count) + '</div></div>';
+      html += '</div></div>';
+    }
+
+    // SMPTE Trust Boundary Metrics section
+    {
+      html += '<div class="section"><div class="section-title">SMPTE Trust Boundary Metrics</div>';
+      html += '<div class="stats-grid">';
+      // IAT
+      if (f.iat) {
+        html += '<div class="stat"><div class="k">IAT Avg</div><div class="v">' + f.iat.avg_us.toFixed(0) + ' \u00B5s</div></div>';
+        html += '<div class="stat"><div class="k">IAT Min</div><div class="v">' + f.iat.min_us.toFixed(0) + ' \u00B5s</div></div>';
+        html += '<div class="stat"><div class="k">IAT Max</div><div class="v">' + f.iat.max_us.toFixed(0) + ' \u00B5s</div></div>';
+      } else {
+        html += '<div class="stat"><div class="k">IAT</div><div class="v" style="color:' + C_GRAY + '">waiting</div></div>';
+      }
+      // PDV / Jitter
+      if (f.pdv_jitter_us) {
+        html += '<div class="stat"><div class="k">Jitter (PDV)</div><div class="v">' + f.pdv_jitter_us.toFixed(1) + ' \u00B5s</div></div>';
+      } else {
+        html += '<div class="stat"><div class="k">Jitter (PDV)</div><div class="v" style="color:' + C_GRAY + '">waiting</div></div>';
+      }
+      // Packets filtered
+      html += '<div class="stat"><div class="k">Pkts Filtered</div><div class="v">' + fmt_num(inp.packets_filtered) + '</div></div>';
+      // Packet rate (packets/sec derived from bitrate and avg packet size)
+      var pps = inp.packets_received && f.uptime_secs ? Math.round(inp.packets_received / f.uptime_secs) : 0;
+      html += '<div class="stat"><div class="k">Packet Rate</div><div class="v">' + fmt_num(pps) + ' pkt/s</div></div>';
+      // Seq gaps (same as lost but shown here for RP 2129 context)
+      html += '<div class="stat"><div class="k">Seq Gaps</div><div class="v">' + fmt_num(inp.packets_lost) + '</div></div>';
       html += '</div></div>';
     }
 

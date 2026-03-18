@@ -97,6 +97,18 @@ pub struct RtpInputConfig {
     /// Optional: decode incoming SMPTE 2022-1 FEC before forwarding
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fec_decode: Option<FecConfig>,
+    /// Source IP allow-list (RP 2129 C5). Only packets from these IPs are accepted.
+    /// When absent, all sources are allowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_sources: Option<Vec<String>>,
+    /// RTP payload type allow-list (RP 2129 U4). Only packets with these PTs are accepted.
+    /// When absent, all payload types are allowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_payload_types: Option<Vec<u8>>,
+    /// Maximum ingress bitrate in Mbps (RP 2129 C7). Excess packets are dropped.
+    /// When absent, no rate limiting is applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bitrate_mbps: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +197,14 @@ pub struct RtpOutputConfig {
     /// Optional: encode SMPTE 2022-1 FEC on output
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fec_encode: Option<FecConfig>,
+    /// DSCP value for QoS marking on egress (RP 2129 C10), range 0-63.
+    /// Default: 46 (Expedited Forwarding per RFC 4594).
+    #[serde(default = "default_dscp")]
+    pub dscp: u8,
+}
+
+fn default_dscp() -> u8 {
+    46 // Expedited Forwarding per RFC 4594
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,6 +307,9 @@ mod tests {
                     bind_addr: "0.0.0.0:5000".to_string(),
                     interface_addr: None,
                     fec_decode: None,
+                    allowed_sources: None,
+                    allowed_payload_types: None,
+                    max_bitrate_mbps: None,
                 }),
                 outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                     id: "out-1".to_string(),
@@ -295,6 +318,7 @@ mod tests {
                     bind_addr: None,
                     interface_addr: None,
                     fec_encode: None,
+                    dscp: default_dscp(),
                 })],
             }],
         };

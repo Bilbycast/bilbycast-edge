@@ -95,6 +95,26 @@ fn validate_input(input: &InputConfig) -> Result<()> {
             }
             // Validate address family consistency
             validate_rtp_input_addr_family(rtp)?;
+            // Validate source IP allow-list
+            if let Some(ref sources) = rtp.allowed_sources {
+                for src in sources {
+                    validate_ip_addr(src, "RTP input allowed_sources")?;
+                }
+            }
+            // Validate payload type allow-list
+            if let Some(ref pts) = rtp.allowed_payload_types {
+                for &pt in pts {
+                    if pt > 127 {
+                        bail!("RTP input allowed_payload_types: PT must be 0-127, got {pt}");
+                    }
+                }
+            }
+            // Validate rate limit
+            if let Some(rate) = rtp.max_bitrate_mbps {
+                if rate <= 0.0 {
+                    bail!("RTP input max_bitrate_mbps must be positive, got {rate}");
+                }
+            }
         }
         InputConfig::Srt(srt) => {
             validate_socket_addr(&srt.local_addr, "SRT input local_addr")?;
@@ -145,6 +165,10 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
             }
             // Validate address family consistency
             validate_rtp_output_addr_family(rtp)?;
+            // Validate DSCP value
+            if rtp.dscp > 63 {
+                bail!("RTP output '{}': DSCP must be 0-63, got {}", rtp.id, rtp.dscp);
+            }
         }
         OutputConfig::Srt(srt) => {
             if srt.id.is_empty() {
@@ -301,6 +325,9 @@ mod tests {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,
                 fec_decode: None,
+                allowed_sources: None,
+                allowed_payload_types: None,
+                max_bitrate_mbps: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -309,6 +336,7 @@ mod tests {
                 bind_addr: None,
                 interface_addr: None,
                 fec_encode: None,
+                dscp: 46,
             })],
         };
         assert!(validate_flow(&flow).is_ok());
@@ -324,6 +352,9 @@ mod tests {
                 bind_addr: "not-an-address".to_string(),
                 interface_addr: None,
                 fec_decode: None,
+                allowed_sources: None,
+                allowed_payload_types: None,
+                max_bitrate_mbps: None,
             }),
             outputs: vec![],
         };
@@ -365,6 +396,9 @@ mod tests {
                         bind_addr: "0.0.0.0:5000".to_string(),
                         interface_addr: None,
                         fec_decode: None,
+                        allowed_sources: None,
+                        allowed_payload_types: None,
+                        max_bitrate_mbps: None,
                     }),
                     outputs: vec![],
                 },
@@ -376,6 +410,9 @@ mod tests {
                         bind_addr: "0.0.0.0:5001".to_string(),
                         interface_addr: None,
                         fec_decode: None,
+                        allowed_sources: None,
+                        allowed_payload_types: None,
+                        max_bitrate_mbps: None,
                     }),
                     outputs: vec![],
                 },
@@ -416,6 +453,9 @@ mod tests {
                 bind_addr: "[::]:5000".to_string(),
                 interface_addr: None,
                 fec_decode: None,
+                allowed_sources: None,
+                allowed_payload_types: None,
+                max_bitrate_mbps: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -424,6 +464,7 @@ mod tests {
                 bind_addr: None,
                 interface_addr: None,
                 fec_encode: None,
+                dscp: 46,
             })],
         };
         assert!(validate_flow(&flow).is_ok());
@@ -439,6 +480,9 @@ mod tests {
                 bind_addr: "239.1.1.1:5000".to_string(),
                 interface_addr: Some("192.168.1.100".to_string()),
                 fec_decode: None,
+                allowed_sources: None,
+                allowed_payload_types: None,
+                max_bitrate_mbps: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -447,6 +491,7 @@ mod tests {
                 bind_addr: None,
                 interface_addr: Some("192.168.1.100".to_string()),
                 fec_encode: None,
+                dscp: 46,
             })],
         };
         assert!(validate_flow(&flow).is_ok());
@@ -462,6 +507,9 @@ mod tests {
                 bind_addr: "[ff7e::1]:5000".to_string(),
                 interface_addr: Some("::1".to_string()),
                 fec_decode: None,
+                allowed_sources: None,
+                allowed_payload_types: None,
+                max_bitrate_mbps: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -470,6 +518,7 @@ mod tests {
                 bind_addr: None,
                 interface_addr: Some("::1".to_string()),
                 fec_encode: None,
+                dscp: 46,
             })],
         };
         assert!(validate_flow(&flow).is_ok());
@@ -487,6 +536,9 @@ mod tests {
                 bind_addr: "239.1.1.1:5000".to_string(),         // IPv4
                 interface_addr: Some("::1".to_string()),          // IPv6 - mismatch!
                 fec_decode: None,
+                allowed_sources: None,
+                allowed_payload_types: None,
+                max_bitrate_mbps: None,
             }),
             outputs: vec![],
         };
@@ -503,6 +555,9 @@ mod tests {
                 bind_addr: "[::]:5000".to_string(),
                 interface_addr: None,
                 fec_decode: None,
+                allowed_sources: None,
+                allowed_payload_types: None,
+                max_bitrate_mbps: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -511,6 +566,7 @@ mod tests {
                 bind_addr: Some("0.0.0.0:0".to_string()),      // IPv4 - mismatch!
                 interface_addr: None,
                 fec_encode: None,
+                dscp: 46,
             })],
         };
         assert!(validate_flow(&flow).is_err());
@@ -526,6 +582,9 @@ mod tests {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,
                 fec_decode: None,
+                allowed_sources: None,
+                allowed_payload_types: None,
+                max_bitrate_mbps: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -534,6 +593,7 @@ mod tests {
                 bind_addr: None,
                 interface_addr: Some("::1".to_string()),        // IPv6 - mismatch!
                 fec_encode: None,
+                dscp: 46,
             })],
         };
         assert!(validate_flow(&flow).is_err());
@@ -549,6 +609,9 @@ mod tests {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,
                 fec_decode: None,
+                allowed_sources: None,
+                allowed_payload_types: None,
+                max_bitrate_mbps: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -557,6 +620,7 @@ mod tests {
                 bind_addr: None,
                 interface_addr: Some("not-an-ip".to_string()),
                 fec_encode: None,
+                dscp: 46,
             })],
         };
         assert!(validate_flow(&flow).is_err());
