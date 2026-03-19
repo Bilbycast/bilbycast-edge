@@ -73,10 +73,25 @@ pub enum FlowState {
 /// Statistics for a flow's input leg.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct InputStats {
-    /// Transport protocol type, e.g. `"srt"`, `"udp"`.
+    /// Transport protocol type, e.g. `"srt"`, `"udp"`, `"rtmp"`.
     pub input_type: String,
     /// Human-readable connection state, e.g. `"receiving"`, `"connecting"`.
     pub state: String,
+    /// SRT mode: "caller", "listener", or "rendezvous" (for topology display).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Local bind address from config (for topology display).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_addr: Option<String>,
+    /// Remote address from config — SRT caller/rendezvous destination (for topology display).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_addr: Option<String>,
+    /// RTMP listen address (for topology display).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listen_addr: Option<String>,
+    /// RTP bind address (for topology display).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind_addr: Option<String>,
     /// Total RTP packets received on this input.
     pub packets_received: u64,
     /// Total bytes received (RTP payload + header).
@@ -106,10 +121,28 @@ pub struct OutputStats {
     pub output_id: String,
     /// Human-readable display name for the output.
     pub output_name: String,
-    /// Transport protocol type, e.g. `"srt"`, `"udp"`.
+    /// Transport protocol type, e.g. `"srt"`, `"udp"`, `"rtmp"`.
     pub output_type: String,
     /// Human-readable connection state, e.g. `"active"`, `"connecting"`.
     pub state: String,
+    /// SRT mode (for topology display).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Remote address — SRT caller destination or RTP dest_addr (for topology display).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_addr: Option<String>,
+    /// Destination address — RTP dest_addr (for topology display).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dest_addr: Option<String>,
+    /// RTMP destination URL (for topology display).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dest_url: Option<String>,
+    /// HLS ingest URL (for topology display).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingest_url: Option<String>,
+    /// WHIP URL for WebRTC (for topology display).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub whip_url: Option<String>,
     /// Total RTP packets successfully sent on this output.
     pub packets_sent: u64,
     /// Total bytes sent (RTP payload + header).

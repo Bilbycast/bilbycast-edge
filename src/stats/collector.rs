@@ -50,6 +50,12 @@ impl OutputStatsAccumulator {
             output_name: self.output_name.clone(),
             output_type: self.output_type.clone(),
             state: "active".to_string(),
+            mode: None,
+            remote_addr: None,
+            dest_addr: None,
+            dest_url: None,
+            ingest_url: None,
+            whip_url: None,
             packets_sent: self.packets_sent.load(Ordering::Relaxed),
             bytes_sent: bytes,
             bitrate_bps,
@@ -243,6 +249,31 @@ pub struct FlowStatsAccumulator {
     input_throughput: Mutex<ThroughputEstimator>,
     /// TR-101290 analyzer stats, set once when the flow starts.
     pub tr101290: OnceLock<Arc<Tr101290Accumulator>>,
+    /// Input config metadata for topology display (set once at flow start).
+    pub input_config_meta: OnceLock<InputConfigMeta>,
+    /// Per-output config metadata for topology display (set once per output).
+    pub output_config_meta: DashMap<String, OutputConfigMeta>,
+}
+
+/// Lightweight input config metadata for topology display.
+#[derive(Debug, Clone)]
+pub struct InputConfigMeta {
+    pub mode: Option<String>,
+    pub local_addr: Option<String>,
+    pub remote_addr: Option<String>,
+    pub listen_addr: Option<String>,
+    pub bind_addr: Option<String>,
+}
+
+/// Lightweight output config metadata for topology display.
+#[derive(Debug, Clone)]
+pub struct OutputConfigMeta {
+    pub mode: Option<String>,
+    pub remote_addr: Option<String>,
+    pub dest_addr: Option<String>,
+    pub dest_url: Option<String>,
+    pub ingest_url: Option<String>,
+    pub whip_url: Option<String>,
 }
 
 impl FlowStatsAccumulator {
@@ -264,6 +295,8 @@ impl FlowStatsAccumulator {
             output_stats: DashMap::new(),
             input_throughput: Mutex::new(ThroughputEstimator::new()),
             tr101290: OnceLock::new(),
+            input_config_meta: OnceLock::new(),
+            output_config_meta: DashMap::new(),
         }
     }
 
@@ -287,7 +320,19 @@ impl FlowStatsAccumulator {
         let outputs: Vec<OutputStats> = self
             .output_stats
             .iter()
-            .map(|entry| entry.value().snapshot())
+            .map(|entry| {
+                let mut snap = entry.value().snapshot();
+                // Inject config metadata for topology display
+                if let Some(meta) = self.output_config_meta.get(entry.key()) {
+                    snap.mode = meta.mode.clone();
+                    snap.remote_addr = meta.remote_addr.clone();
+                    snap.dest_addr = meta.dest_addr.clone();
+                    snap.dest_url = meta.dest_url.clone();
+                    snap.ingest_url = meta.ingest_url.clone();
+                    snap.whip_url = meta.whip_url.clone();
+                }
+                snap
+            })
             .collect();
 
         let input_bytes = self.input_bytes.load(Ordering::Relaxed);
@@ -321,18 +366,26 @@ impl FlowStatsAccumulator {
             flow_id: self.flow_id.clone(),
             flow_name: self.flow_name.clone(),
             state: FlowState::Running,
-            input: InputStats {
-                input_type: self.input_type.clone(),
-                state: "receiving".to_string(),
-                packets_received: self.input_packets.load(Ordering::Relaxed),
-                bytes_received: input_bytes,
-                bitrate_bps: input_bitrate,
-                packets_lost,
-                packets_filtered: self.input_filtered.load(Ordering::Relaxed),
-                packets_recovered_fec: self.fec_recovered.load(Ordering::Relaxed),
-                srt_stats: None,
-                srt_leg2_stats: None,
-                redundancy_switches: self.redundancy_switches.load(Ordering::Relaxed),
+            input: {
+                let meta = self.input_config_meta.get();
+                InputStats {
+                    input_type: self.input_type.clone(),
+                    state: "receiving".to_string(),
+                    mode: meta.and_then(|m| m.mode.clone()),
+                    local_addr: meta.and_then(|m| m.local_addr.clone()),
+                    remote_addr: meta.and_then(|m| m.remote_addr.clone()),
+                    listen_addr: meta.and_then(|m| m.listen_addr.clone()),
+                    bind_addr: meta.and_then(|m| m.bind_addr.clone()),
+                    packets_received: self.input_packets.load(Ordering::Relaxed),
+                    bytes_received: input_bytes,
+                    bitrate_bps: input_bitrate,
+                    packets_lost,
+                    packets_filtered: self.input_filtered.load(Ordering::Relaxed),
+                    packets_recovered_fec: self.fec_recovered.load(Ordering::Relaxed),
+                    srt_stats: None,
+                    srt_leg2_stats: None,
+                    redundancy_switches: self.redundancy_switches.load(Ordering::Relaxed),
+                }
             },
             outputs,
             uptime_secs: self.started_at.elapsed().as_secs(),

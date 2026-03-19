@@ -130,6 +130,56 @@ impl FlowRuntime {
             input_type.to_string(),
         );
 
+        // Populate input config metadata for topology display
+        use crate::stats::collector::{InputConfigMeta, OutputConfigMeta};
+        let input_meta = match &config.input {
+            InputConfig::Rtp(c) => InputConfigMeta {
+                mode: None, local_addr: None, remote_addr: None,
+                listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
+            },
+            InputConfig::Srt(c) => InputConfigMeta {
+                mode: Some(format!("{:?}", c.mode).to_lowercase()),
+                local_addr: Some(c.local_addr.clone()),
+                remote_addr: c.remote_addr.clone(),
+                listen_addr: None, bind_addr: None,
+            },
+            InputConfig::Rtmp(c) => InputConfigMeta {
+                mode: None, local_addr: None, remote_addr: None,
+                listen_addr: Some(c.listen_addr.clone()), bind_addr: None,
+            },
+        };
+        let _ = flow_stats.input_config_meta.set(input_meta);
+
+        // Populate output config metadata
+        for oc in &config.outputs {
+            let meta = match oc {
+                OutputConfig::Srt(c) => OutputConfigMeta {
+                    mode: Some(format!("{:?}", c.mode).to_lowercase()),
+                    remote_addr: c.remote_addr.clone(),
+                    dest_addr: None, dest_url: None, ingest_url: None, whip_url: None,
+                },
+                OutputConfig::Rtp(c) => OutputConfigMeta {
+                    mode: None, remote_addr: None,
+                    dest_addr: Some(c.dest_addr.clone()),
+                    dest_url: None, ingest_url: None, whip_url: None,
+                },
+                OutputConfig::Rtmp(c) => OutputConfigMeta {
+                    mode: None, remote_addr: None, dest_addr: None,
+                    dest_url: Some(c.dest_url.clone()),
+                    ingest_url: None, whip_url: None,
+                },
+                OutputConfig::Hls(c) => OutputConfigMeta {
+                    mode: None, remote_addr: None, dest_addr: None, dest_url: None,
+                    ingest_url: Some(c.ingest_url.clone()), whip_url: None,
+                },
+                OutputConfig::Webrtc(c) => OutputConfigMeta {
+                    mode: None, remote_addr: None, dest_addr: None, dest_url: None,
+                    ingest_url: None, whip_url: Some(c.whip_url.clone()),
+                },
+            };
+            flow_stats.output_config_meta.insert(oc.id().to_string(), meta);
+        }
+
         // Start input task
         let input_handle = match &config.input {
             InputConfig::Rtp(rtp_config) => {
