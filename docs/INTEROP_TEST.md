@@ -1,101 +1,100 @@
 # bilbycast-edge Interoperability Test Procedure
 
-## Overview
+## Quick Start
 
-This test validates SRT and RTP flows across multiple bilbycast-edge nodes, native C++ SRT tools (srt-live-transmit), ffmpeg, and VLC. It tests:
+Paste this to Claude to set up the test:
 
-- SRT caller/listener between edge nodes (Rust-to-Rust)
-- SRT interop with C++ srt-live-transmit
-- SRT ingest from remote source
-- SRT ingest from local ffmpeg
-- RTP forwarding between edge nodes
-- RTP playback to VLC
-- Manager monitoring of all nodes
+> Set up the bilbycast interop test as described in `bilbycast-edge/docs/INTEROP_TEST.md`.
+> Use `AO_VIDEO.mp4` from the dev_claude folder. The remote SRT source at 192.168.50.186:9000
+> may or may not be running — Edge-3 should keep retrying until it comes up. Start the
+> bilbycast-manager to monitor all nodes.
 
-## Test Topology
+## Topology
 
 ```
-[Remote SRT 192.168.50.186:9000]          [ffmpeg AO_VIDEO.mp4]
-         │ SRT caller                          │ srt-live-transmit
-         ▼                                     ▼ SRT caller
-┌──────────────────────┐            ┌──────────────────────┐
-│  mac_edge-1 (:8080)  │            │  mac_edge-4 (:8083)  │
-│  SRT input (caller)  │            │  SRT input (listener │
-│                      │            │           on :9002)  │
-│  Out 1: RTP → VLC-1  │            │  Out 1: SRT caller   │
-│         (:5004)      │            │    → srt-live-transmit│
-│  Out 2: SRT listener │            │         (:9003)      │
-│         (:9001)      │            │  Out 2: RTP → VLC-4  │
-│  Out 3: RTP → edge-3 │            │         (:5008)      │
-│         (:5006)      │            └──────────────────────┘
-└───┬─────────┬────────┘
-    │SRT      │RTP
-    ▼         ▼
-┌────────────┐ ┌─────────────┐
-│mac_edge-2  │ │ mac_edge-3  │
-│(:8081)     │ │ (:8082)     │
-│SRT caller  │ │ RTP input   │
-│from :9001  │ │ on :5006    │
-│            │ │             │
-│Out: RTP    │ │Out: RTP     │
-│→ VLC-2    │ │→ VLC-3     │
-│(:5005)    │ │(:5007)     │
-└────────────┘ └─────────────┘
+Source A: ffmpeg -c copy /tmp/ao_video_long.ts → srt-live-transmit → SRT :9000
+Source B: Remote SRT at 192.168.50.186:9000 (may be offline, edge retries)
 
-VLC-1 (rtp://@:5004) — Remote feed via Edge-1
-VLC-2 (rtp://@:5005) — Remote feed via Edge-1 SRT → Edge-2
-VLC-3 (rtp://@:5007) — Remote feed via Edge-1 RTP → Edge-3
-VLC-4 (rtp://@:5008) — Local AO_VIDEO via Edge-4
+[Source A] ──SRT caller──► [Edge-1 :9000 listener]
+                              ├──SRT caller :9100──► [srt-live-transmit] ──UDP :7771──► [ffplay PLAYER-1]
+                              └──SRT listener :9001──► [Edge-2 caller] (Rust-to-Rust)
+
+[Source B] ──SRT caller──► [Edge-3 :9002 caller → 192.168.50.186:9000]
+                              └──SRT listener :9003──► [Edge-4 caller]
+                                                         ├──SRT caller :9101──► [srt-live-transmit] ──UDP :7772──► [ffplay PLAYER-2]
+                                                         └──UDP TS :5008──► (available for VLC/ffplay)
+
+bilbycast-manager on :8443 monitors all 4 nodes
 ```
+
+## What This Tests
+
+| # | Test | Transport |
+|---|------|-----------|
+| 1 | C++ srt-live-transmit → Rust SRT listener input | C++ caller → Rust listener |
+| 2 | Rust SRT caller output → C++ srt-live-transmit | Rust caller → C++ listener |
+| 3 | Rust SRT listener output → Rust SRT caller input | Rust-to-Rust (Edge-1→Edge-2) |
+| 4 | Rust SRT listener output → Rust SRT caller input | Rust-to-Rust (Edge-3→Edge-4) |
+| 5 | Fan-out: 1 input → 2 SRT outputs | Edge-1: caller + listener |
+| 6 | Fan-out: 1 input → SRT + UDP outputs | Edge-4: SRT caller + UDP |
+| 7 | 2-hop SRT chain with video playback | Edge-3 → Edge-4 → ffplay |
+| 8 | SRT auto-reconnect on source unavailable | Edge-3 retries 192.168.50.186 |
+| 9 | Manager monitoring all nodes | WebSocket dashboard |
+| 10 | C++ interop (no SEQUENCE DISCREPANCY) | ISN=0 fix verified |
+
+## Ports Used
+
+| Port | Service |
+|------|---------|
+| 8443 | bilbycast-manager web UI + API |
+| 8080-8083 | Edge 1-4 API servers |
+| 8090-8093 | Edge 1-4 monitor dashboards |
+| 9000 | Edge-1 SRT listener input |
+| 9001 | Edge-1 SRT listener output (for Edge-2) |
+| 9002 | Edge-3 SRT caller input (→ 192.168.50.186:9000) |
+| 9003 | Edge-3 SRT listener output (for Edge-4) |
+| 9100 | srt-live-transmit receiver for Edge-1 output |
+| 9101 | srt-live-transmit receiver for Edge-4 output |
+| 5008 | Edge-4 UDP TS output |
+| 7771 | UDP relay: srt-live-transmit → ffplay PLAYER-1 |
+| 7772 | UDP relay: srt-live-transmit → ffplay PLAYER-2 |
 
 ## Prerequisites
 
 - macOS with bilbycast-edge and bilbycast-manager built
 - `srt-live-transmit` installed (`brew install srt`)
-- `ffmpeg` installed
-- VLC installed at `/Applications/VLC.app`
-- Test video: `AO_VIDEO.mp4` in the dev_claude directory
-- Optional: Remote SRT source at 192.168.50.186:9000
+- `ffmpeg` and `ffplay` installed (`brew install ffmpeg`)
+- Test video: `/Users/rezarahimi/Development/dev_claude/AO_VIDEO.mp4`
 
-## Ports Used
+## Prepare Long Test File
 
-| Port  | Service                          |
-|-------|----------------------------------|
-| 8443  | bilbycast-manager web UI + API   |
-| 8080  | mac_edge-1 API                   |
-| 8081  | mac_edge-2 API                   |
-| 8082  | mac_edge-3 API                   |
-| 8083  | mac_edge-4 API                   |
-| 8090-8093 | Edge monitor dashboards      |
-| 9000  | Remote SRT source (external)     |
-| 9001  | Edge-1 SRT listener output       |
-| 9002  | Edge-4 SRT listener input        |
-| 9003  | Native SRT receiver (srt-live-transmit) |
-| 5004  | VLC-1 RTP (from edge-1)          |
-| 5005  | VLC-2 RTP (from edge-2)          |
-| 5006  | Edge-3 RTP input (from edge-1)   |
-| 5007  | VLC-3 RTP (from edge-3)          |
-| 5008  | VLC-4 RTP (from edge-4)          |
+The 43-second AO_VIDEO.mp4 must be pre-concatenated into a long .ts file.
+Do NOT use `-stream_loop` or `-c:v libx264` re-encoding — both cause
+timestamp issues that degrade playback over time.
+
+```bash
+# Create 14-minute test file (one-time)
+CONCAT=/tmp/concat_list.txt
+rm -f $CONCAT
+for i in $(seq 1 20); do
+  echo "file '/Users/rezarahimi/Development/dev_claude/AO_VIDEO.mp4'" >> $CONCAT
+done
+ffmpeg -y -f concat -safe 0 -i $CONCAT -c copy -f mpegts /tmp/ao_video_long.ts
+```
 
 ## Step-by-Step Setup
 
-### Step 1: Clean up and start manager
+### Step 1: Start manager
 
 ```bash
-# Kill old processes
-pkill -f "bilbycast" ; pkill -f "srt-live" ; pkill -f "ffmpeg" ; pkill -f VLC
-
-# Start manager (fresh DB)
-cd bilbycast-manager
-rm -f bilbycast-manager.db*
-echo -e "admin\nAdmin\nadmin@test.com\nAdmin123!\nAdmin123!" | \
-  ./target/debug/bilbycast-manager setup --config config/default.toml
+cd /Users/rezarahimi/Development/dev_claude/bilbycast-manager
+# If fresh DB needed:
+# rm -f bilbycast-manager.db*
+# echo -e "admin\nAdmin\nadmin@test.com\nAdmin123!\nAdmin123!" | ./target/debug/bilbycast-manager setup --config config/default.toml
 ./target/debug/bilbycast-manager serve --config config/default.toml &
-sleep 2
 ```
 
-### Step 2: Register nodes
-
+Register 4 nodes via API if fresh DB:
 ```bash
 TOKEN=$(curl -s http://localhost:8443/api/v1/auth/login -X POST \
   -H "Content-Type: application/json" \
@@ -109,192 +108,169 @@ for NAME in mac_edge-1 mac_edge-2 mac_edge-3 mac_edge-4; do
 done
 ```
 
-Save the registration tokens and put them in the config files below.
+Put the registration tokens into the edge config files below.
 
-### Step 3: Create config files
+### Step 2: Create edge configs
 
-Create `/tmp/mac-edge-1.json`:
+**Edge-1** (`/tmp/edge-1.json`): SRT listener in :9000, SRT caller out :9100, SRT listener out :9001
 ```json
 {
   "version": 1,
   "server": { "listen_addr": "0.0.0.0", "listen_port": 8080 },
   "monitor": { "listen_addr": "0.0.0.0", "listen_port": 8090 },
-  "manager": {
-    "enabled": true,
-    "url": "ws://127.0.0.1:8443/ws/node",
-    "registration_token": "<TOKEN_FROM_STEP_2>"
-  },
+  "manager": { "enabled": true, "url": "ws://127.0.0.1:8443/ws/node",
+    "registration_token": "<TOKEN>" },
   "flows": [{
-    "id": "remote-ingest",
-    "name": "Remote SRT Ingest + Fanout",
-    "enabled": true,
-    "input": {
-      "type": "srt", "mode": "caller",
-      "local_addr": "0.0.0.0:0", "remote_addr": "192.168.50.186:9000",
-      "latency_ms": 200, "peer_idle_timeout_secs": 60
-    },
+    "id": "ingest-1", "name": "Ingest 1", "enabled": true,
+    "input": { "type": "srt", "mode": "listener", "local_addr": "0.0.0.0:9000",
+      "latency_ms": 200, "peer_idle_timeout_secs": 60 },
     "outputs": [
-      { "type": "rtp", "id": "vlc1", "name": "RTP to VLC-1", "dest_addr": "127.0.0.1:5004" },
-      { "type": "srt", "id": "srt-to-edge2", "name": "SRT Listener for Edge-2",
-        "mode": "listener", "local_addr": "0.0.0.0:9001", "latency_ms": 200, "peer_idle_timeout_secs": 60 },
-      { "type": "rtp", "id": "rtp-to-edge3", "name": "RTP to Edge-3", "dest_addr": "127.0.0.1:5006" }
+      { "type": "srt", "id": "srt-caller-out", "name": "SRT to ffplay-1",
+        "mode": "caller", "local_addr": "0.0.0.0:0", "remote_addr": "127.0.0.1:9100",
+        "latency_ms": 200, "peer_idle_timeout_secs": 60 },
+      { "type": "srt", "id": "srt-listener-out", "name": "SRT Listener for Edge-2",
+        "mode": "listener", "local_addr": "0.0.0.0:9001",
+        "latency_ms": 200, "peer_idle_timeout_secs": 60 }
     ]
   }]
 }
 ```
 
-Create `/tmp/mac-edge-2.json`:
+**Edge-2** (`/tmp/edge-2.json`): SRT caller in from Edge-1 :9001
 ```json
 {
   "version": 1,
   "server": { "listen_addr": "0.0.0.0", "listen_port": 8081 },
   "monitor": { "listen_addr": "0.0.0.0", "listen_port": 8091 },
-  "manager": {
-    "enabled": true,
-    "url": "ws://127.0.0.1:8443/ws/node",
-    "registration_token": "<TOKEN_FROM_STEP_2>"
-  },
+  "manager": { "enabled": true, "url": "ws://127.0.0.1:8443/ws/node",
+    "registration_token": "<TOKEN>" },
   "flows": [{
-    "id": "srt-from-edge1",
-    "name": "SRT from Edge-1",
-    "enabled": true,
-    "input": {
-      "type": "srt", "mode": "caller",
-      "local_addr": "0.0.0.0:0", "remote_addr": "127.0.0.1:9001",
-      "latency_ms": 200, "peer_idle_timeout_secs": 60
-    },
-    "outputs": [
-      { "type": "rtp", "id": "vlc2", "name": "RTP to VLC-2", "dest_addr": "127.0.0.1:5005" }
-    ]
+    "id": "chain-from-1", "name": "SRT Chain from Edge-1", "enabled": true,
+    "input": { "type": "srt", "mode": "caller", "local_addr": "0.0.0.0:0",
+      "remote_addr": "127.0.0.1:9001", "latency_ms": 200, "peer_idle_timeout_secs": 60 },
+    "outputs": []
   }]
 }
 ```
 
-Create `/tmp/mac-edge-3.json`:
+**Edge-3** (`/tmp/edge-3.json`): SRT caller to remote 192.168.50.186:9000, SRT listener out :9003
 ```json
 {
   "version": 1,
   "server": { "listen_addr": "0.0.0.0", "listen_port": 8082 },
   "monitor": { "listen_addr": "0.0.0.0", "listen_port": 8092 },
-  "manager": {
-    "enabled": true,
-    "url": "ws://127.0.0.1:8443/ws/node",
-    "registration_token": "<TOKEN_FROM_STEP_2>"
-  },
+  "manager": { "enabled": true, "url": "ws://127.0.0.1:8443/ws/node",
+    "registration_token": "<TOKEN>" },
   "flows": [{
-    "id": "rtp-from-edge1",
-    "name": "RTP from Edge-1",
-    "enabled": true,
-    "input": { "type": "rtp", "bind_addr": "0.0.0.0:5006" },
+    "id": "remote-ingest", "name": "Remote SRT Ingest", "enabled": true,
+    "input": { "type": "srt", "mode": "caller", "local_addr": "0.0.0.0:0",
+      "remote_addr": "192.168.50.186:9000", "latency_ms": 200, "peer_idle_timeout_secs": 60 },
     "outputs": [
-      { "type": "rtp", "id": "vlc3", "name": "RTP to VLC-3", "dest_addr": "127.0.0.1:5007" }
+      { "type": "srt", "id": "srt-listener-out", "name": "SRT Listener for Edge-4",
+        "mode": "listener", "local_addr": "0.0.0.0:9003",
+        "latency_ms": 200, "peer_idle_timeout_secs": 60 }
     ]
   }]
 }
 ```
 
-Create `/tmp/mac-edge-4.json`:
+**Edge-4** (`/tmp/edge-4.json`): SRT caller from Edge-3 :9003, SRT caller out :9101, UDP out :5008
 ```json
 {
   "version": 1,
   "server": { "listen_addr": "0.0.0.0", "listen_port": 8083 },
   "monitor": { "listen_addr": "0.0.0.0", "listen_port": 8093 },
-  "manager": {
-    "enabled": true,
-    "url": "ws://127.0.0.1:8443/ws/node",
-    "registration_token": "<TOKEN_FROM_STEP_2>"
-  },
+  "manager": { "enabled": true, "url": "ws://127.0.0.1:8443/ws/node",
+    "registration_token": "<TOKEN>" },
   "flows": [{
-    "id": "local-ingest",
-    "name": "Local AO_VIDEO Ingest",
-    "enabled": true,
-    "input": {
-      "type": "srt", "mode": "listener",
-      "local_addr": "0.0.0.0:9002", "latency_ms": 200, "peer_idle_timeout_secs": 60
-    },
+    "id": "chain-from-3", "name": "SRT Chain from Edge-3", "enabled": true,
+    "input": { "type": "srt", "mode": "caller", "local_addr": "0.0.0.0:0",
+      "remote_addr": "127.0.0.1:9003", "latency_ms": 200, "peer_idle_timeout_secs": 60 },
     "outputs": [
-      { "type": "srt", "id": "srt-to-native", "name": "SRT to Native Receiver",
-        "mode": "caller", "local_addr": "0.0.0.0:0", "remote_addr": "127.0.0.1:9003",
+      { "type": "srt", "id": "srt-caller-out", "name": "SRT to ffplay-2",
+        "mode": "caller", "local_addr": "0.0.0.0:0", "remote_addr": "127.0.0.1:9101",
         "latency_ms": 200, "peer_idle_timeout_secs": 60 },
-      { "type": "rtp", "id": "vlc4", "name": "RTP to VLC-4", "dest_addr": "127.0.0.1:5008" }
+      { "type": "rtp", "id": "udp-out", "name": "UDP TS out", "dest_addr": "127.0.0.1:5008" }
     ]
   }]
 }
 ```
 
-### Step 4: Start native SRT receiver and edge nodes
+### Step 3: Start everything (order matters)
 
 ```bash
-cd bilbycast-edge
+cd /Users/rezarahimi/Development/dev_claude/bilbycast-edge
 
-# Native SRT receiver (receives from edge-4)
-srt-live-transmit "srt://:9003?mode=listener&latency=200" "udp://127.0.0.1:7000" &
+# Receivers first (SRT listeners for edge caller outputs)
+srt-live-transmit "srt://:9100?mode=listener&latency=200" "udp://127.0.0.1:7771" 2>/dev/null &
+srt-live-transmit "srt://:9101?mode=listener&latency=200" "udp://127.0.0.1:7772" 2>/dev/null &
+sleep 1
 
-# Start edges (order matters: listeners before callers)
-./target/debug/bilbycast-edge --config /tmp/mac-edge-4.json &
-sleep 2
-./target/debug/bilbycast-edge --config /tmp/mac-edge-1.json &
-sleep 2
-./target/debug/bilbycast-edge --config /tmp/mac-edge-3.json &
-sleep 2
-./target/debug/bilbycast-edge --config /tmp/mac-edge-2.json &
+# Listener edges first, then caller edges
+./target/debug/bilbycast-edge --config /tmp/edge-1.json 2>/dev/null &
+./target/debug/bilbycast-edge --config /tmp/edge-3.json 2>/dev/null &
 sleep 3
+./target/debug/bilbycast-edge --config /tmp/edge-2.json 2>/dev/null &
+./target/debug/bilbycast-edge --config /tmp/edge-4.json 2>/dev/null &
+sleep 3
+
+# Source for Edge-1 (copy mode, pre-concatenated long file)
+ffmpeg -re -i /tmp/ao_video_long.ts -c copy -f mpegts pipe:1 2>/dev/null | \
+  srt-live-transmit "file://con" "srt://127.0.0.1:9000?mode=caller&latency=200" 2>/dev/null &
+sleep 3
+
+# Players
+ffplay -probesize 5000000 -analyzeduration 5000000 \
+  -f mpegts "udp://127.0.0.1:7771?localport=7771&overrun_nonfatal=1&fifo_size=50000000" \
+  -window_title "PLAYER-1: Edge-1 SRT caller out" -x 640 -y 360 2>/dev/null &
+
+ffplay -probesize 5000000 -analyzeduration 5000000 \
+  -f mpegts "udp://127.0.0.1:7772?localport=7772&overrun_nonfatal=1&fifo_size=50000000" \
+  -window_title "PLAYER-2: Edge-3→Edge-4 chain" -x 640 -y 360 2>/dev/null &
 ```
 
-### Step 5: Start ffmpeg source and VLC players
+### Step 4: Verify
 
 ```bash
-# Local video source → edge-4 via SRT
-ffmpeg -re -stream_loop -1 -i AO_VIDEO.mp4 \
-  -c copy -f mpegts pipe:1 2>/dev/null | \
-  srt-live-transmit "file://con" "srt://127.0.0.1:9002?mode=caller&latency=200" &
-
-# VLC players
-/Applications/VLC.app/Contents/MacOS/VLC "rtp://@:5004" --network-caching=500 &
-/Applications/VLC.app/Contents/MacOS/VLC "rtp://@:5005" --network-caching=500 &
-/Applications/VLC.app/Contents/MacOS/VLC "rtp://@:5007" --network-caching=500 &
-/Applications/VLC.app/Contents/MacOS/VLC "rtp://@:5008" --network-caching=500 &
-```
-
-### Step 6: Verify
-
-```bash
-# Check all edge stats
+# Check all edges
 for PORT in 8080 8081 8082 8083; do
-  echo "=== Edge on :${PORT} ==="
-  curl -s "http://localhost:${PORT}/api/v1/stats" | python3 -m json.tool
+  E=$((PORT - 8079))
+  echo "--- Edge-$E ---"
+  curl -s "http://localhost:$PORT/api/v1/stats" | python3 -m json.tool
 done
 
-# Check manager dashboard
+# Manager dashboard
 open http://localhost:8443
 # Login: admin / Admin123!
 ```
 
-## Expected Results
-
-| Flow Path | Transport | Expected Bitrate | VLC Window |
-|-----------|-----------|-----------------|------------|
-| Remote → Edge-1 → VLC-1 | SRT in, RTP out | ~3-10 Mbps | VLC-1 (:5004) |
-| Remote → Edge-1 → Edge-2 → VLC-2 | SRT→SRT→RTP | ~3-10 Mbps | VLC-2 (:5005) |
-| Remote → Edge-1 → Edge-3 → VLC-3 | SRT→RTP→RTP | ~3-10 Mbps | VLC-3 (:5007) |
-| AO_VIDEO → Edge-4 → VLC-4 | SRT in, RTP out | ~7-9 Mbps | VLC-4 (:5008) |
-| AO_VIDEO → Edge-4 → Native SRT | SRT in, SRT out | ~7-9 Mbps | (srt-live-transmit) |
-
-## What This Tests
-
-1. **SRT caller input** — Edge-1 connects to remote SRT, Edge-4 receives from ffmpeg
-2. **SRT listener input** — Edge-4 accepts connection from srt-live-transmit
-3. **SRT listener output** — Edge-1 serves data to Edge-2 (Rust-to-Rust)
-4. **SRT caller output** — Edge-4 sends to native srt-live-transmit (Rust-to-C++)
-5. **RTP output** — All edges output to VLC via RTP/UDP
-6. **RTP input** — Edge-3 receives RTP from Edge-1
-7. **Fan-out** — Edge-1 has 3 simultaneous outputs from 1 input
-8. **Manager monitoring** — All 4 nodes visible in dashboard with live stats
-9. **Auto-reconnect** — Edge-1 retries remote SRT with exponential backoff
-10. **Interop** — Rust SRT ↔ C++ libsrt (srt-live-transmit, ffmpeg)
-
-## Teardown
+### Step 5: Teardown
 
 ```bash
-pkill -f "bilbycast" ; pkill -f "srt-live" ; pkill -f "ffmpeg" ; pkill -f VLC
+pkill -f "bilbycast" ; pkill -f "srt-live" ; pkill -f "ffmpeg" ; pkill -f "ffplay"
 ```
+
+## Expected Results
+
+| Path | Bitrate | Loss |
+|------|---------|------|
+| Source A → Edge-1 | ~8-9 Mbps | 0 |
+| Edge-1 → srt-live-transmit → PLAYER-1 | ~8-9 Mbps | 0 |
+| Edge-1 → Edge-2 (Rust-to-Rust SRT) | ~8-9 Mbps | 0 |
+| Remote → Edge-3 (when available) | ~3-10 Mbps | 0 |
+| Edge-3 → Edge-4 (Rust-to-Rust SRT) | ~3-10 Mbps | 0 |
+| Edge-4 → srt-live-transmit → PLAYER-2 | ~3-10 Mbps | 0 |
+| Edge-4 → UDP :5008 | ~3-10 Mbps | 0 |
+
+Edge-3 will show "SRT connection attempt N failed, retrying" until
+192.168.50.186:9000 comes online. Once it does, data flows automatically.
+Edge-4 and PLAYER-2 will start showing video at that point.
+
+## Important Notes
+
+- **Do NOT re-encode** (`-c:v libx264`): causes timestamp jitter that degrades playback
+- **Do NOT use `-stream_loop`**: causes timestamp discontinuities at loop points
+- **Pre-concat** the video into a long .ts file instead (see Prepare section)
+- **Start order matters**: receivers → listener edges → caller edges → sources → players
+- **SRT listener accepts one connection**: if a source dies, restart both the edge and the source
+- **VLC needs MPEG-TS over UDP**, not RTP (no SDP). Use `ffplay` for RTP streams.
