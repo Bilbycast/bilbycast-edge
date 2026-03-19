@@ -165,6 +165,12 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                 validate_srt_redundancy(red, "SRT input")?;
             }
         }
+        InputConfig::Rtmp(rtmp) => {
+            validate_socket_addr(&rtmp.listen_addr, "RTMP input listen_addr")?;
+            if rtmp.app.is_empty() {
+                bail!("RTMP input app name must not be empty");
+            }
+        }
     }
     Ok(())
 }

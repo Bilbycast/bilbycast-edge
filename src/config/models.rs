@@ -97,7 +97,7 @@ fn default_true() -> bool {
     true
 }
 
-/// Input source configuration -- either RTP/UDP or SRT
+/// Input source configuration -- RTP/UDP, SRT, or RTMP
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum InputConfig {
@@ -107,6 +107,9 @@ pub enum InputConfig {
     /// Receive RTP over SRT
     #[serde(rename = "srt")]
     Srt(SrtInputConfig),
+    /// Receive H.264/AAC via RTMP (accept publish from OBS, ffmpeg, etc.)
+    #[serde(rename = "rtmp")]
+    Rtmp(RtmpInputConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +165,48 @@ pub struct SrtInputConfig {
     /// Optional: enable 2022-7 redundancy on input (merge from two SRT legs)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<SrtRedundancyConfig>,
+}
+
+/// RTMP input configuration — runs an RTMP server that accepts publish connections.
+///
+/// OBS, ffmpeg, or any RTMP encoder can push to `rtmp://<edge_ip>:<port>/<app>/<stream_key>`.
+/// The received H.264 video and AAC audio are remuxed into MPEG-TS and pushed
+/// through the broadcast channel like any other input.
+///
+/// # Example config
+///
+/// ```json
+/// {
+///   "type": "rtmp",
+///   "listen_addr": "0.0.0.0:1935",
+///   "app": "live",
+///   "stream_key": "my_stream"
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RtmpInputConfig {
+    /// RTMP listen address, e.g. "0.0.0.0:1935"
+    pub listen_addr: String,
+    /// RTMP application name. The publisher must use this in the URL path.
+    /// e.g. "live" → publisher connects to `rtmp://host:port/live/stream_key`
+    #[serde(default = "default_rtmp_app")]
+    pub app: String,
+    /// Optional stream key for authentication. If set, only publishers using
+    /// this exact stream key are accepted. If absent, any stream key is allowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_key: Option<String>,
+    /// Maximum number of simultaneous publishers allowed (default: 1).
+    /// For broadcast use, typically only one publisher is active at a time.
+    #[serde(default = "default_max_publishers")]
+    pub max_publishers: u32,
+}
+
+fn default_rtmp_app() -> String {
+    "live".to_string()
+}
+
+fn default_max_publishers() -> u32 {
+    1
 }
 
 fn default_latency() -> u64 {

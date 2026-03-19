@@ -5,7 +5,7 @@
 //! owns the input task, output tasks, a broadcast channel connecting them,
 //! and a cancellation token hierarchy for graceful shutdown.
 //!
-//! Input tasks ([`input_rtp`], [`input_srt`]) receive packets and publish
+//! Input tasks ([`input_rtp`], [`input_srt`], [`input_rtmp`]) receive packets and publish
 //! [`packet::RtpPacket`] structs to the broadcast channel. Output tasks
 //! ([`output_rtp`], [`output_srt`]) subscribe independently and forward
 //! packets to their destinations.
@@ -17,6 +17,7 @@
 //! - **Redundancy duplicate** on SRT output (SMPTE 2022-7 dual-leg send)
 
 pub mod flow;
+pub mod input_rtmp;
 pub mod input_rtp;
 pub mod input_srt;
 pub mod manager;

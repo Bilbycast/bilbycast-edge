@@ -185,6 +185,38 @@ The input is discriminated by the `"type"` field.
 | `allowed_payload_types`  | `u8[]?`      | `null`  | RTP payload type allowlist (RP 2129 U4)          |
 | `max_bitrate_mbps`       | `f64?`       | `null`  | Maximum ingress bitrate in Mbps (RP 2129 C7)     |
 
+### RTMP Input (`"type": "rtmp"`)
+
+Accepts incoming RTMP publish connections from OBS, ffmpeg, Wirecast, or any RTMP encoder. The received H.264 video and AAC audio are remuxed into MPEG-TS and pushed through the flow pipeline.
+
+| Field            | Type      | Default  | Description                                     |
+|------------------|-----------|----------|-------------------------------------------------|
+| `type`           | `"rtmp"`  | --       | Input type discriminator                        |
+| `listen_addr`    | `string`  | --       | RTMP listen address, e.g. `"0.0.0.0:1935"`     |
+| `app`            | `string`  | `"live"` | RTMP application name (URL path component)      |
+| `stream_key`     | `string?` | `null`   | Stream key for authentication (null = accept any)|
+| `max_publishers` | `u32`     | `1`      | Max simultaneous publishers                     |
+
+**Example:**
+
+```json
+{
+  "type": "rtmp",
+  "listen_addr": "0.0.0.0:1935",
+  "app": "live",
+  "stream_key": "my_secret_key"
+}
+```
+
+**Publishing from ffmpeg:**
+```bash
+ffmpeg -re -i input.mp4 -c:v libx264 -c:a aac -f flv rtmp://edge:1935/live/my_secret_key
+```
+
+**Publishing from OBS:**
+- Server: `rtmp://edge:1935/live`
+- Stream Key: `my_secret_key`
+
 ---
 
 ## Output Types

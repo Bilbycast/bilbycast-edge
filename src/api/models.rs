@@ -65,6 +65,7 @@ impl From<&FlowConfig> for FlowSummary {
         let input_type = match &flow.input {
             crate::config::models::InputConfig::Rtp(_) => "rtp",
             crate::config::models::InputConfig::Srt(_) => "srt",
+            crate::config::models::InputConfig::Rtmp(_) => "rtmp",
         };
         Self {
             id: flow.id.clone(),

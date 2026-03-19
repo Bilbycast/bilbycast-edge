@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::models::*;
 use crate::stats::collector::{FlowStatsAccumulator, OutputStatsAccumulator};
 
+use super::input_rtmp::spawn_rtmp_input;
 use super::input_rtp::spawn_rtp_input;
 use super::input_srt::spawn_srt_input;
 use super::output_hls::spawn_hls_output;
@@ -119,6 +120,7 @@ impl FlowRuntime {
         let input_type = match &config.input {
             InputConfig::Rtp(_) => "rtp",
             InputConfig::Srt(_) => "srt",
+            InputConfig::Rtmp(_) => "rtmp",
         };
 
         // Register flow stats
@@ -141,6 +143,14 @@ impl FlowRuntime {
             InputConfig::Srt(srt_config) => {
                 spawn_srt_input(
                     srt_config.clone(),
+                    broadcast_tx.clone(),
+                    flow_stats.clone(),
+                    cancel_token.child_token(),
+                )
+            }
+            InputConfig::Rtmp(rtmp_config) => {
+                spawn_rtmp_input(
+                    rtmp_config.clone(),
                     broadcast_tx.clone(),
                     flow_stats.clone(),
                     cancel_token.child_token(),
