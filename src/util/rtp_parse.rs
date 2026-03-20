@@ -18,30 +18,6 @@ pub fn parse_rtp_timestamp(data: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes([data[4], data[5], data[6], data[7]]))
 }
 
-/// Parse the RTP SSRC from a raw packet.
-pub fn parse_rtp_ssrc(data: &[u8]) -> Option<u32> {
-    if data.len() < RTP_HEADER_MIN_SIZE {
-        return None;
-    }
-    Some(u32::from_be_bytes([data[8], data[9], data[10], data[11]]))
-}
-
-/// Parse the RTP payload type from a raw packet.
-pub fn parse_rtp_payload_type(data: &[u8]) -> Option<u8> {
-    if data.len() < RTP_HEADER_MIN_SIZE {
-        return None;
-    }
-    Some(data[1] & 0x7F)
-}
-
-/// Parse the RTP version from a raw packet. Should be 2.
-pub fn parse_rtp_version(data: &[u8]) -> Option<u8> {
-    if data.is_empty() {
-        return None;
-    }
-    Some((data[0] >> 6) & 0x03)
-}
-
 /// Quick validation: checks if a packet looks like a valid RTP packet.
 pub fn is_likely_rtp(data: &[u8]) -> bool {
     if data.len() < RTP_HEADER_MIN_SIZE {
@@ -82,18 +58,6 @@ mod tests {
     fn test_parse_timestamp() {
         let pkt = make_rtp_packet(0, 0xDEADBEEF, 0, 33);
         assert_eq!(parse_rtp_timestamp(&pkt), Some(0xDEADBEEF));
-    }
-
-    #[test]
-    fn test_parse_ssrc() {
-        let pkt = make_rtp_packet(0, 0, 0x12345678, 33);
-        assert_eq!(parse_rtp_ssrc(&pkt), Some(0x12345678));
-    }
-
-    #[test]
-    fn test_parse_payload_type() {
-        let pkt = make_rtp_packet(0, 0, 0, 33);
-        assert_eq!(parse_rtp_payload_type(&pkt), Some(33));
     }
 
     #[test]

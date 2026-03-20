@@ -50,6 +50,8 @@ pub struct FlowRuntime {
     /// subscribes to this sender to receive a copy of each packet.
     pub broadcast_tx: broadcast::Sender<RtpPacket>,
     /// Tokio task handle for the input (RTP or SRT receiver).
+    /// Stored to keep the JoinHandle alive; shutdown uses CancellationToken.
+    #[allow(dead_code)]
     pub input_handle: JoinHandle<()>,
     /// Output task handles, keyed by output_id. Protected by an async
     /// `RwLock` to allow concurrent reads (stats queries) and exclusive
@@ -63,6 +65,8 @@ pub struct FlowRuntime {
     /// output tasks. Metrics are updated via atomic operations.
     pub stats: Arc<FlowStatsAccumulator>,
     /// TR-101290 analyzer task handle.
+    /// Stored to keep the JoinHandle alive; shutdown uses CancellationToken.
+    #[allow(dead_code)]
     pub analyzer_handle: JoinHandle<()>,
 }
 
@@ -77,13 +81,16 @@ pub struct FlowRuntime {
 /// - **Stats accumulator** (`stats`): per-output metrics (packets sent,
 ///   bytes sent, drops, FEC packets sent).
 pub struct OutputRuntime {
-    pub config: OutputConfig,
     /// Tokio task handle for this output's send loop.
+    /// Stored to keep the JoinHandle alive; shutdown uses CancellationToken.
+    #[allow(dead_code)]
     pub handle: JoinHandle<()>,
     /// Child cancellation token. Dropping or cancelling this stops only
     /// this output, leaving the rest of the flow running.
     pub cancel_token: CancellationToken,
-    /// Per-output stats accumulator shared with the output task.
+    /// Per-output stats accumulator. The Arc is shared with the output task;
+    /// dropping this field would decrement the refcount while the task still writes to it.
+    #[allow(dead_code)]
     pub stats: Arc<OutputStatsAccumulator>,
 }
 
@@ -156,24 +163,25 @@ impl FlowRuntime {
                 OutputConfig::Srt(c) => OutputConfigMeta {
                     mode: Some(format!("{:?}", c.mode).to_lowercase()),
                     remote_addr: c.remote_addr.clone(),
+                    local_addr: Some(c.local_addr.clone()),
                     dest_addr: None, dest_url: None, ingest_url: None, whip_url: None,
                 },
                 OutputConfig::Rtp(c) => OutputConfigMeta {
-                    mode: None, remote_addr: None,
+                    mode: None, remote_addr: None, local_addr: None,
                     dest_addr: Some(c.dest_addr.clone()),
                     dest_url: None, ingest_url: None, whip_url: None,
                 },
                 OutputConfig::Rtmp(c) => OutputConfigMeta {
-                    mode: None, remote_addr: None, dest_addr: None,
+                    mode: None, remote_addr: None, local_addr: None, dest_addr: None,
                     dest_url: Some(c.dest_url.clone()),
                     ingest_url: None, whip_url: None,
                 },
                 OutputConfig::Hls(c) => OutputConfigMeta {
-                    mode: None, remote_addr: None, dest_addr: None, dest_url: None,
+                    mode: None, remote_addr: None, local_addr: None, dest_addr: None, dest_url: None,
                     ingest_url: Some(c.ingest_url.clone()), whip_url: None,
                 },
                 OutputConfig::Webrtc(c) => OutputConfigMeta {
-                    mode: None, remote_addr: None, dest_addr: None, dest_url: None,
+                    mode: None, remote_addr: None, local_addr: None, dest_addr: None, dest_url: None,
                     ingest_url: None, whip_url: Some(c.whip_url.clone()),
                 },
             };
@@ -281,7 +289,6 @@ impl FlowRuntime {
                 );
 
                 Ok(OutputRuntime {
-                    config: output_config.clone(),
                     handle,
                     cancel_token: output_cancel,
                     stats: output_stats,
@@ -302,7 +309,6 @@ impl FlowRuntime {
                 );
 
                 Ok(OutputRuntime {
-                    config: output_config.clone(),
                     handle,
                     cancel_token: output_cancel,
                     stats: output_stats,
@@ -323,7 +329,6 @@ impl FlowRuntime {
                 );
 
                 Ok(OutputRuntime {
-                    config: output_config.clone(),
                     handle,
                     cancel_token: output_cancel,
                     stats: output_stats,
@@ -344,7 +349,6 @@ impl FlowRuntime {
                 );
 
                 Ok(OutputRuntime {
-                    config: output_config.clone(),
                     handle,
                     cancel_token: output_cancel,
                     stats: output_stats,
@@ -365,7 +369,6 @@ impl FlowRuntime {
                 );
 
                 Ok(OutputRuntime {
-                    config: output_config.clone(),
                     handle,
                     cancel_token: output_cancel,
                     stats: output_stats,

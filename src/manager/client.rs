@@ -16,6 +16,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::models::{AppConfig, FlowConfig};
 use crate::engine::manager::FlowManager;
+use crate::tunnel::TunnelConfig;
+use crate::tunnel::manager::TunnelManager;
 
 use super::ManagerConfig;
 
@@ -23,6 +25,7 @@ use super::ManagerConfig;
 pub fn start_manager_client(
     config: ManagerConfig,
     flow_manager: Arc<FlowManager>,
+    tunnel_manager: Arc<TunnelManager>,
     ws_stats_rx: broadcast::Sender<String>,
     app_config: Arc<RwLock<AppConfig>>,
     config_path: PathBuf,
@@ -30,13 +33,14 @@ pub fn start_manager_client(
     monitor_addr: Option<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        manager_client_loop(config, flow_manager, ws_stats_rx, app_config, config_path, api_addr, monitor_addr).await;
+        manager_client_loop(config, flow_manager, tunnel_manager, ws_stats_rx, app_config, config_path, api_addr, monitor_addr).await;
     })
 }
 
 async fn manager_client_loop(
     mut config: ManagerConfig,
     flow_manager: Arc<FlowManager>,
+    tunnel_manager: Arc<TunnelManager>,
     ws_stats_tx: broadcast::Sender<String>,
     app_config: Arc<RwLock<AppConfig>>,
     config_path: PathBuf,
@@ -52,6 +56,7 @@ async fn manager_client_loop(
         match try_connect(
             &config,
             &flow_manager,
+            &tunnel_manager,
             &ws_stats_tx,
             &app_config,
             &config_path,
@@ -101,6 +106,7 @@ enum ConnectResult {
 async fn try_connect(
     config: &ManagerConfig,
     flow_manager: &Arc<FlowManager>,
+    tunnel_manager: &Arc<TunnelManager>,
     ws_stats_tx: &broadcast::Sender<String>,
     app_config: &Arc<RwLock<AppConfig>>,
     config_path: &PathBuf,
@@ -194,11 +200,19 @@ async fn try_connect(
             stats_result = stats_rx.recv() => {
                 match stats_result {
                     Ok(stats_json) => {
+                        // Collect tunnel stats alongside flow stats
+                        let tunnel_statuses: Vec<serde_json::Value> = tunnel_manager
+                            .list_tunnels()
+                            .into_iter()
+                            .map(|ts| serde_json::to_value(ts).unwrap_or_default())
+                            .collect();
+
                         let envelope = serde_json::json!({
                             "type": "stats",
                             "timestamp": chrono::Utc::now().to_rfc3339(),
                             "payload": {
                                 "flows": serde_json::from_str::<serde_json::Value>(&stats_json).unwrap_or_default(),
+                                "tunnels": tunnel_statuses,
                                 "uptime_secs": 0,
                                 "active_flows": flow_manager.active_flow_count(),
                                 "total_flows": flow_manager.active_flow_count()
@@ -220,7 +234,7 @@ async fn try_connect(
             msg = ws_read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_manager_message(&text, flow_manager, &mut ws_write).await;
+                        handle_manager_message(&text, flow_manager, tunnel_manager, &mut ws_write).await;
                     }
                     Some(Ok(Message::Ping(data))) => {
                         let _ = ws_write.send(Message::Pong(data)).await;
@@ -333,6 +347,7 @@ async fn persist_credentials(
 async fn handle_manager_message<S>(
     text: &str,
     flow_manager: &Arc<FlowManager>,
+    tunnel_manager: &Arc<TunnelManager>,
     ws_write: &mut futures_util::stream::SplitSink<S, Message>,
 ) where
     S: futures_util::Sink<Message> + Unpin,
@@ -365,7 +380,7 @@ async fn handle_manager_message<S>(
             let action = &payload["action"];
             let action_type = action["type"].as_str().unwrap_or("");
 
-            let result = execute_command(action_type, action, flow_manager).await;
+            let result = execute_command(action_type, action, flow_manager, tunnel_manager).await;
 
             let ack = serde_json::json!({
                 "type": "command_ack",
@@ -394,6 +409,7 @@ async fn execute_command(
     action_type: &str,
     action: &serde_json::Value,
     flow_manager: &Arc<FlowManager>,
+    tunnel_manager: &Arc<TunnelManager>,
 ) -> Result<(), String> {
     match action_type {
         "create_flow" => {
@@ -443,6 +459,23 @@ async fn execute_command(
             tracing::info!("Manager command: remove output '{output_id}' from flow '{flow_id}'");
             flow_manager
                 .remove_output(flow_id, output_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "create_tunnel" => {
+            let tunnel: TunnelConfig = serde_json::from_value(action["tunnel"].clone())
+                .map_err(|e| format!("Invalid tunnel config: {e}"))?;
+            tracing::info!("Manager command: create tunnel '{}'", tunnel.id);
+            tunnel_manager
+                .create_tunnel(tunnel)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "delete_tunnel" => {
+            let tunnel_id = action["tunnel_id"].as_str().ok_or("Missing tunnel_id")?;
+            tracing::info!("Manager command: delete tunnel '{tunnel_id}'");
+            tunnel_manager
+                .destroy_tunnel(tunnel_id)
                 .await
                 .map_err(|e| e.to_string())
         }

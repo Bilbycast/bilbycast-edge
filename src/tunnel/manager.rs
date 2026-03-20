@@ -1,0 +1,487 @@
+//! Tunnel lifecycle manager.
+//!
+//! Manages the creation, teardown, and status tracking of IP tunnels.
+//! Each tunnel runs as a set of tokio tasks coordinated by a CancellationToken.
+
+use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use dashmap::DashMap;
+use serde::Serialize;
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+use super::config::{TunnelConfig, TunnelDirection, TunnelMode, TunnelProtocol};
+use super::relay_client::{self, RelayTunnelParams, RelayTunnelState};
+use super::tcp_forwarder::{self, TcpForwarderStats};
+use super::udp_forwarder::{self, UdpForwarderStats};
+
+/// Runtime state for an active tunnel.
+struct TunnelRuntime {
+    config: TunnelConfig,
+    cancel: CancellationToken,
+    state_rx: watch::Receiver<RelayTunnelState>,
+    udp_stats: Option<Arc<UdpForwarderStats>>,
+    tcp_stats: Option<Arc<TcpForwarderStats>>,
+}
+
+/// Serializable tunnel status for API responses.
+#[derive(Debug, Clone, Serialize)]
+pub struct TunnelStatus {
+    pub id: String,
+    pub name: String,
+    pub protocol: String,
+    pub mode: String,
+    pub direction: String,
+    pub local_addr: String,
+    pub state: String,
+    pub stats: TunnelStatsSnapshot,
+}
+
+/// Serializable tunnel stats for API responses.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TunnelStatsSnapshot {
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub send_errors: u64,
+    pub connections_total: u64,
+    pub connections_active: u64,
+}
+
+/// Manages all active tunnels on this edge node.
+pub struct TunnelManager {
+    tunnels: DashMap<String, TunnelRuntime>,
+}
+
+impl TunnelManager {
+    pub fn new() -> Self {
+        Self {
+            tunnels: DashMap::new(),
+        }
+    }
+
+    /// Create and start a tunnel from the given configuration.
+    pub async fn create_tunnel(&self, config: TunnelConfig) -> anyhow::Result<()> {
+        if self.tunnels.contains_key(&config.id) {
+            anyhow::bail!("Tunnel '{}' already exists", config.id);
+        }
+
+        let tunnel_id = Uuid::parse_str(&config.id)
+            .unwrap_or_else(|_| Uuid::new_v5(&Uuid::NAMESPACE_OID, config.id.as_bytes()));
+
+        let cancel = CancellationToken::new();
+        let (state_tx, state_rx) = watch::channel(RelayTunnelState::Connecting);
+
+        // Create shared stats objects that are used by both the runtime and the forwarder tasks
+        let udp_stats = if config.protocol == TunnelProtocol::Udp {
+            Some(Arc::new(UdpForwarderStats::default()))
+        } else {
+            None
+        };
+        let tcp_stats = if config.protocol == TunnelProtocol::Tcp {
+            Some(Arc::new(TcpForwarderStats::default()))
+        } else {
+            None
+        };
+
+        match config.mode {
+            TunnelMode::Relay => {
+                self.start_relay_tunnel(
+                    &config, tunnel_id, cancel.clone(), state_tx,
+                    udp_stats.clone(), tcp_stats.clone(),
+                ).await?;
+            }
+            TunnelMode::Direct => {
+                self.start_direct_tunnel(
+                    &config, tunnel_id, cancel.clone(), state_tx,
+                    udp_stats.clone(), tcp_stats.clone(),
+                ).await?;
+            }
+        }
+
+        self.tunnels.insert(
+            config.id.clone(),
+            TunnelRuntime {
+                config,
+                cancel,
+                state_rx,
+                udp_stats,
+                tcp_stats,
+            },
+        );
+
+        Ok(())
+    }
+
+    async fn start_relay_tunnel(
+        &self,
+        config: &TunnelConfig,
+        tunnel_id: Uuid,
+        cancel: CancellationToken,
+        state_tx: watch::Sender<RelayTunnelState>,
+        udp_stats: Option<Arc<UdpForwarderStats>>,
+        tcp_stats: Option<Arc<TcpForwarderStats>>,
+    ) -> anyhow::Result<()> {
+        let relay_addr: SocketAddr = config
+            .relay_addr
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("relay_addr required for relay mode"))?
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid relay_addr: {e}"))?;
+
+        let edge_id = config
+            .relay_edge_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("relay_edge_id required for relay mode"))?;
+
+        let relay_secret = config
+            .relay_secret
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("relay_secret required for relay mode"))?;
+
+        let local_addr: SocketAddr = config
+            .local_addr
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid local_addr: {e}"))?;
+
+        let params = RelayTunnelParams {
+            tunnel_id,
+            relay_addr,
+            edge_id,
+            relay_secret,
+            direction: config.direction,
+            protocol: config.protocol,
+        };
+
+        let direction = config.direction;
+        let protocol = config.protocol;
+        let config_id = config.id.clone();
+
+        // Spawn the tunnel lifecycle task
+        tokio::spawn(async move {
+            let result = run_relay_tunnel(
+                params,
+                direction,
+                protocol,
+                local_addr,
+                state_tx,
+                cancel.clone(),
+                udp_stats,
+                tcp_stats,
+            )
+            .await;
+
+            if let Err(e) = result {
+                if !cancel.is_cancelled() {
+                    tracing::error!(tunnel_id = %config_id, "Relay tunnel failed: {e}");
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    async fn start_direct_tunnel(
+        &self,
+        config: &TunnelConfig,
+        tunnel_id: Uuid,
+        cancel: CancellationToken,
+        state_tx: watch::Sender<RelayTunnelState>,
+        udp_stats: Option<Arc<UdpForwarderStats>>,
+        tcp_stats: Option<Arc<TcpForwarderStats>>,
+    ) -> anyhow::Result<()> {
+        let local_addr: SocketAddr = config
+            .local_addr
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid local_addr: {e}"))?;
+
+        let tunnel_psk = config.tunnel_psk.clone()
+            .ok_or_else(|| anyhow::anyhow!("tunnel_psk required for direct mode"))?;
+
+        let direction = config.direction;
+        let protocol = config.protocol;
+        let config_clone = config.clone();
+
+        tokio::spawn(async move {
+            let result = run_direct_tunnel(
+                config_clone,
+                tunnel_id,
+                direction,
+                protocol,
+                local_addr,
+                tunnel_psk,
+                state_tx,
+                cancel.clone(),
+                udp_stats,
+                tcp_stats,
+            )
+            .await;
+
+            if let Err(e) = result {
+                if !cancel.is_cancelled() {
+                    tracing::error!(tunnel_id = %tunnel_id, "Direct tunnel failed: {e}");
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Destroy (stop) a tunnel by ID.
+    pub async fn destroy_tunnel(&self, id: &str) -> anyhow::Result<()> {
+        let (_, runtime) = self
+            .tunnels
+            .remove(id)
+            .ok_or_else(|| anyhow::anyhow!("Tunnel '{id}' not found"))?;
+
+        runtime.cancel.cancel();
+        tracing::info!(tunnel_id = %id, "Tunnel destroyed");
+        Ok(())
+    }
+
+    /// Get the status of a specific tunnel.
+    pub fn tunnel_status(&self, id: &str) -> Option<TunnelStatus> {
+        self.tunnels.get(id).map(|entry| build_status(&entry))
+    }
+
+    /// List all active tunnels.
+    pub fn list_tunnels(&self) -> Vec<TunnelStatus> {
+        self.tunnels
+            .iter()
+            .map(|entry| build_status(&entry))
+            .collect()
+    }
+
+    /// Stop all tunnels (called during graceful shutdown).
+    pub async fn stop_all(&self) {
+        for entry in self.tunnels.iter() {
+            entry.cancel.cancel();
+        }
+        self.tunnels.clear();
+        tracing::info!("All tunnels stopped");
+    }
+}
+
+fn build_status(runtime: &TunnelRuntime) -> TunnelStatus {
+    let state = *runtime.state_rx.borrow();
+
+    let mut stats = TunnelStatsSnapshot::default();
+    if let Some(ref udp) = runtime.udp_stats {
+        stats.packets_sent = udp.packets_sent.load(Ordering::Relaxed);
+        stats.packets_received = udp.packets_received.load(Ordering::Relaxed);
+        stats.bytes_sent = udp.bytes_sent.load(Ordering::Relaxed);
+        stats.bytes_received = udp.bytes_received.load(Ordering::Relaxed);
+        stats.send_errors = udp.send_errors.load(Ordering::Relaxed);
+    }
+    if let Some(ref tcp) = runtime.tcp_stats {
+        stats.bytes_sent = tcp.bytes_sent.load(Ordering::Relaxed);
+        stats.bytes_received = tcp.bytes_received.load(Ordering::Relaxed);
+        stats.connections_total = tcp.connections_total.load(Ordering::Relaxed);
+        stats.connections_active = tcp.connections_active.load(Ordering::Relaxed);
+    }
+
+    TunnelStatus {
+        id: runtime.config.id.clone(),
+        name: runtime.config.name.clone(),
+        protocol: runtime.config.protocol.to_string(),
+        mode: runtime.config.mode.to_string(),
+        direction: runtime.config.direction.to_string(),
+        local_addr: runtime.config.local_addr.clone(),
+        state: state.to_string(),
+        stats,
+    }
+}
+
+/// Main lifecycle for a relay-mode tunnel.
+async fn run_relay_tunnel(
+    params: RelayTunnelParams,
+    direction: TunnelDirection,
+    protocol: TunnelProtocol,
+    local_addr: SocketAddr,
+    state_tx: watch::Sender<RelayTunnelState>,
+    cancel: CancellationToken,
+    udp_stats: Option<Arc<UdpForwarderStats>>,
+    tcp_stats: Option<Arc<TcpForwarderStats>>,
+) -> anyhow::Result<()> {
+    let tunnel_id = params.tunnel_id;
+
+    // Connect with retry (handles backoff)
+    let conn = relay_client::connect_with_retry(&params, &state_tx, cancel.clone()).await?;
+
+    tracing::info!(
+        tunnel_id = %tunnel_id,
+        direction = %direction,
+        protocol = %protocol,
+        "Relay tunnel connected, starting forwarder"
+    );
+
+    // Run the appropriate forwarder using the shared stats
+    run_forwarder(tunnel_id, protocol, direction, local_addr, conn, cancel, udp_stats, tcp_stats).await
+}
+
+/// Main lifecycle for a direct-mode tunnel.
+async fn run_direct_tunnel(
+    config: TunnelConfig,
+    tunnel_id: Uuid,
+    direction: TunnelDirection,
+    protocol: TunnelProtocol,
+    local_addr: SocketAddr,
+    tunnel_psk: String,
+    state_tx: watch::Sender<RelayTunnelState>,
+    cancel: CancellationToken,
+    udp_stats: Option<Arc<UdpForwarderStats>>,
+    tcp_stats: Option<Arc<TcpForwarderStats>>,
+) -> anyhow::Result<()> {
+    use super::protocol::{ALPN_DIRECT, PeerMessage};
+    use super::{auth, quic};
+
+    let conn = match direction {
+        // Ingress in direct mode = this edge is the QUIC server (has public IP)
+        TunnelDirection::Ingress => {
+            let listen_addr: SocketAddr = config
+                .direct_listen_addr
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("direct_listen_addr required for direct ingress"))?
+                .parse()?;
+
+            state_tx.send_replace(RelayTunnelState::Connecting);
+
+            let endpoint = quic::make_server_endpoint(
+                listen_addr,
+                ALPN_DIRECT,
+                config.tls_cert_pem.as_deref(),
+                config.tls_key_pem.as_deref(),
+            )?;
+
+            tracing::info!(
+                tunnel_id = %tunnel_id,
+                listen_addr = %listen_addr,
+                "Direct tunnel: listening for peer"
+            );
+
+            state_tx.send_replace(RelayTunnelState::Waiting);
+
+            // Accept incoming connection
+            let incoming = tokio::select! {
+                result = endpoint.accept() => {
+                    result.ok_or_else(|| anyhow::anyhow!("Endpoint closed"))?
+                }
+                _ = cancel.cancelled() => anyhow::bail!("cancelled"),
+            };
+            let conn = incoming.await?;
+
+            // Authenticate: accept control stream, verify peer auth
+            state_tx.send_replace(RelayTunnelState::Authenticating);
+            let (mut send, mut recv) = conn.accept_bi().await?;
+            let msg: PeerMessage = super::protocol::read_message(&mut recv).await?;
+
+            match msg {
+                PeerMessage::PeerAuth { tunnel_id: tid, token } if tid == tunnel_id => {
+                    if auth::verify_token(&token, &tunnel_psk).is_some() {
+                        super::protocol::write_message(
+                            &mut send,
+                            &PeerMessage::PeerAuthOk { tunnel_id },
+                        )
+                        .await?;
+                        tracing::info!(tunnel_id = %tunnel_id, "Direct peer authenticated");
+                    } else {
+                        super::protocol::write_message(
+                            &mut send,
+                            &PeerMessage::PeerAuthError {
+                                reason: "Invalid token".into(),
+                            },
+                        )
+                        .await?;
+                        anyhow::bail!("Direct peer auth failed: invalid token");
+                    }
+                }
+                other => {
+                    anyhow::bail!("Unexpected peer message during auth: {other:?}");
+                }
+            }
+
+            conn
+        }
+
+        // Egress in direct mode = this edge connects to the public peer
+        TunnelDirection::Egress => {
+            let peer_addr: SocketAddr = config
+                .peer_addr
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("peer_addr required for direct egress"))?
+                .parse()?;
+
+            state_tx.send_replace(RelayTunnelState::Connecting);
+
+            let endpoint = quic::make_client_endpoint(ALPN_DIRECT)?;
+            let conn = quic::connect(&endpoint, peer_addr, "bilbycast-edge").await?;
+
+            // Authenticate: open control stream, send auth
+            state_tx.send_replace(RelayTunnelState::Authenticating);
+            let (mut send, mut recv) = conn.open_bi().await?;
+            let token = auth::generate_token(&tunnel_id.to_string(), &tunnel_psk);
+            super::protocol::write_message(
+                &mut send,
+                &PeerMessage::PeerAuth { tunnel_id, token },
+            )
+            .await?;
+
+            let response: PeerMessage = super::protocol::read_message(&mut recv).await?;
+            match response {
+                PeerMessage::PeerAuthOk { .. } => {
+                    tracing::info!(tunnel_id = %tunnel_id, "Direct peer auth OK");
+                }
+                PeerMessage::PeerAuthError { reason } => {
+                    anyhow::bail!("Direct peer auth failed: {reason}");
+                }
+                other => {
+                    anyhow::bail!("Unexpected peer response: {other:?}");
+                }
+            }
+
+            conn
+        }
+    };
+
+    state_tx.send_replace(RelayTunnelState::Ready);
+
+    // Run the appropriate forwarder using the shared stats
+    run_forwarder(tunnel_id, protocol, direction, local_addr, conn, cancel, udp_stats, tcp_stats).await
+}
+
+/// Run the appropriate forwarder for the given protocol and direction.
+/// Shared between relay and direct tunnel modes.
+async fn run_forwarder(
+    tunnel_id: Uuid,
+    protocol: TunnelProtocol,
+    direction: TunnelDirection,
+    local_addr: SocketAddr,
+    conn: quinn::Connection,
+    cancel: CancellationToken,
+    udp_stats: Option<Arc<UdpForwarderStats>>,
+    tcp_stats: Option<Arc<TcpForwarderStats>>,
+) -> anyhow::Result<()> {
+    match (protocol, direction) {
+        (TunnelProtocol::Udp, TunnelDirection::Egress) => {
+            let stats = udp_stats.unwrap_or_else(|| Arc::new(UdpForwarderStats::default()));
+            udp_forwarder::run_egress(tunnel_id, local_addr, conn, stats, cancel).await?;
+        }
+        (TunnelProtocol::Udp, TunnelDirection::Ingress) => {
+            let stats = udp_stats.unwrap_or_else(|| Arc::new(UdpForwarderStats::default()));
+            udp_forwarder::run_ingress(tunnel_id, local_addr, conn, stats, cancel).await?;
+        }
+        (TunnelProtocol::Tcp, TunnelDirection::Egress) => {
+            let stats = tcp_stats.unwrap_or_else(|| Arc::new(TcpForwarderStats::default()));
+            tcp_forwarder::run_egress(tunnel_id, local_addr, conn, stats, cancel).await?;
+        }
+        (TunnelProtocol::Tcp, TunnelDirection::Ingress) => {
+            let stats = tcp_stats.unwrap_or_else(|| Arc::new(TcpForwarderStats::default()));
+            tcp_forwarder::run_ingress(tunnel_id, local_addr, conn, stats, cancel).await?;
+        }
+    }
+    Ok(())
+}

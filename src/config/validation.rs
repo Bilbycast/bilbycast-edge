@@ -455,6 +455,7 @@ mod tests {
                 local_addr: "0.0.0.0:9000".to_string(),
                 remote_addr: None,
                 latency_ms: 120,
+                peer_idle_timeout_secs: 30,
                 passphrase: None,
                 aes_key_len: None,
                 redundancy: None,
@@ -470,6 +471,8 @@ mod tests {
             version: 1,
             server: ServerConfig::default(),
             monitor: None,
+            manager: None,
+            tunnels: Vec::new(),
             flows: vec![
                 FlowConfig {
                     id: "same-id".to_string(),
@@ -517,6 +520,7 @@ mod tests {
                 local_addr: "0.0.0.0:9000".to_string(),
                 remote_addr: None,
                 latency_ms: 120,
+                peer_idle_timeout_secs: 30,
                 passphrase: Some("short".to_string()),
                 aes_key_len: None,
                 redundancy: None,

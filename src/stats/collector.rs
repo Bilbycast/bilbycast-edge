@@ -56,6 +56,7 @@ impl OutputStatsAccumulator {
             dest_url: None,
             ingest_url: None,
             whip_url: None,
+            local_addr: None,
             packets_sent: self.packets_sent.load(Ordering::Relaxed),
             bytes_sent: bytes,
             bitrate_bps,
@@ -274,6 +275,7 @@ pub struct OutputConfigMeta {
     pub dest_url: Option<String>,
     pub ingest_url: Option<String>,
     pub whip_url: Option<String>,
+    pub local_addr: Option<String>,
 }
 
 impl FlowStatsAccumulator {
@@ -330,6 +332,7 @@ impl FlowStatsAccumulator {
                     snap.dest_url = meta.dest_url.clone();
                     snap.ingest_url = meta.ingest_url.clone();
                     snap.whip_url = meta.whip_url.clone();
+                    snap.local_addr = meta.local_addr.clone();
                 }
                 snap
             })
@@ -446,16 +449,13 @@ fn derive_flow_health(
 /// [`Self::flow_snapshot`] without blocking the data plane.
 pub struct StatsCollector {
     pub flow_stats: DashMap<String, Arc<FlowStatsAccumulator>>,
-    pub start_time: Instant,
 }
 
 impl StatsCollector {
-    /// Create an empty stats collector. Records `Instant::now()` as the
-    /// global start time (used for system-level uptime reporting).
+    /// Create an empty stats collector.
     pub fn new() -> Self {
         Self {
             flow_stats: DashMap::new(),
-            start_time: Instant::now(),
         }
     }
 

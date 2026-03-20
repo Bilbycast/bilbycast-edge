@@ -11,9 +11,10 @@ use tower_http::trace::TraceLayer;
 
 use crate::config::models::AppConfig;
 use crate::engine::manager::FlowManager;
+use crate::tunnel::manager::TunnelManager;
 
 use super::auth::{self, AuthState};
-use super::{flows, stats, ws};
+use super::{flows, stats, tunnels, ws};
 
 /// Shared application state accessible from all Axum handlers via [`axum::extract::State`].
 #[derive(Clone)]
@@ -24,6 +25,8 @@ pub struct AppState {
     pub config_path: PathBuf,
     /// Handle to the flow engine manager.
     pub flow_manager: Arc<FlowManager>,
+    /// Handle to the IP tunnel manager.
+    pub tunnel_manager: Arc<TunnelManager>,
     /// Monotonic timestamp recorded at application startup.
     pub start_time: Instant,
     /// Broadcast channel sender for WebSocket stats.
@@ -68,7 +71,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/stats", get(stats::all_stats))
         .route("/api/v1/stats/{flow_id}", get(stats::flow_stats))
         .route("/api/v1/config", get(flows::get_config))
-        .route("/api/v1/ws/stats", get(ws::ws_stats_handler));
+        .route("/api/v1/ws/stats", get(ws::ws_stats_handler))
+        .route("/api/v1/tunnels", get(tunnels::list_tunnels))
+        .route("/api/v1/tunnels/{id}", get(tunnels::get_tunnel));
 
     // Add metrics under auth if not public
     let read_routes = if !metrics_public {
@@ -94,7 +99,9 @@ pub fn build_router(state: AppState) -> Router {
             delete(flows::remove_output),
         )
         .route("/api/v1/config", put(flows::replace_config))
-        .route("/api/v1/config/reload", post(flows::reload_config));
+        .route("/api/v1/config/reload", post(flows::reload_config))
+        .route("/api/v1/tunnels", post(tunnels::create_tunnel))
+        .route("/api/v1/tunnels/{id}", delete(tunnels::delete_tunnel));
 
     // Combine protected routes with auth middleware
     let protected_routes = Router::new()

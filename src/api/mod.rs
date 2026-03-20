@@ -13,4 +13,5 @@ pub mod flows;
 pub mod models;
 pub mod server;
 pub mod stats;
+pub mod tunnels;
 pub mod ws;

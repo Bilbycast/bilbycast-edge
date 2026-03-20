@@ -24,12 +24,14 @@ mod monitor;
 mod redundancy;
 mod srt;
 mod stats;
+mod tunnel;
 mod util;
 
 use config::persistence::load_config;
 use config::validation::validate_config;
 use engine::manager::FlowManager;
 use stats::collector::StatsCollector;
+use tunnel::manager::TunnelManager;
 use api::server::{AppState, build_router};
 
 #[derive(Parser, Debug)]
@@ -71,11 +73,16 @@ async fn main() -> anyhow::Result<()> {
         .with_target(true)
         .init();
 
+    // Install rustls crypto provider (required by rustls 0.23+ for QUIC tunnels)
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls CryptoProvider");
+
     // Initialize monotonic clock
     util::time::init_epoch();
 
     tracing::info!(
-        "bilbycast-edge v{} starting",
+        "bilbycast-edge v{} starting (tunnel support enabled)",
         env!("CARGO_PKG_VERSION")
     );
 
@@ -110,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
     let (ws_stats_tx, _) = broadcast::channel::<String>(64);
     let global_stats = Arc::new(StatsCollector::new());
     let flow_manager = Arc::new(FlowManager::new(global_stats.clone()));
+    let tunnel_manager = Arc::new(TunnelManager::new());
 
     // Build auth state from config (None if auth not configured or disabled)
     let auth_state = app_config
@@ -133,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
         config: Arc::new(RwLock::new(app_config.clone())),
         config_path: cli.config.clone(),
         flow_manager: flow_manager.clone(),
+        tunnel_manager: tunnel_manager.clone(),
         start_time: Instant::now(),
         ws_stats_tx: ws_stats_tx.clone(),
         auth_state,
@@ -144,6 +153,16 @@ async fn main() -> anyhow::Result<()> {
             match flow_manager.create_flow(flow.clone()).await {
                 Ok(()) => tracing::info!("Auto-started flow '{}'", flow.id),
                 Err(e) => tracing::error!("Failed to auto-start flow '{}': {e}", flow.id),
+            }
+        }
+    }
+
+    // Start all enabled tunnels from config
+    for tunnel_cfg in &app_config.tunnels {
+        if tunnel_cfg.enabled {
+            match tunnel_manager.create_tunnel(tunnel_cfg.clone()).await {
+                Ok(()) => tracing::info!("Auto-started tunnel '{}'", tunnel_cfg.id),
+                Err(e) => tracing::error!("Failed to auto-start tunnel '{}': {e}", tunnel_cfg.id),
             }
         }
     }
@@ -191,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
             manager::client::start_manager_client(
                 mgr_config.clone(),
                 flow_manager.clone(),
+                tunnel_manager.clone(),
                 ws_stats_tx.clone(),
                 state.config.clone(),
                 cli.config.clone(),
@@ -257,8 +277,9 @@ async fn main() -> anyhow::Result<()> {
             .await?;
     }
 
-    // Graceful shutdown: stop all flows
+    // Graceful shutdown: stop all flows and tunnels
     flow_manager.stop_all().await;
+    tunnel_manager.stop_all().await;
 
     tracing::info!("bilbycast-edge shutting down");
     Ok(())

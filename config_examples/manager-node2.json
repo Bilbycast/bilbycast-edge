@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "server": {
+    "listen_addr": "0.0.0.0",
+    "listen_port": 8082
+  },
+  "manager": {
+    "enabled": true,
+    "url": "ws://127.0.0.1:8443/ws/node",
+    "node_id": "d6027b8e-b9e6-4c8e-bd3f-3b2d1b29b9cc",
+    "node_secret": "17dbe3bd-36f2-461b-9ec9-d9acfd83903c"
+  },
+  "flows": []
+}

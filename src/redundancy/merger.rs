@@ -4,7 +4,6 @@
 //! The merger accepts packets from either leg and forwards only those with sequence numbers
 //! strictly advancing beyond the last consumed sequence. Duplicate packets (same seq from
 //! both legs) are dropped.
-
 /// Identifies which SRT leg a packet arrived on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveLeg {
@@ -78,15 +77,6 @@ impl HitlessMerger {
         }
     }
 
-    /// Returns the currently active leg.
-    pub fn active_leg(&self) -> ActiveLeg {
-        self.active_leg
-    }
-
-    /// Returns the last consumed sequence number.
-    pub fn last_consumed_seq(&self) -> u16 {
-        self.last_consumed_seq
-    }
 }
 
 #[cfg(test)]
@@ -98,7 +88,6 @@ mod tests {
         let mut merger = HitlessMerger::new();
         let result = merger.try_merge(0, ActiveLeg::Leg1);
         assert_eq!(result, Some(ActiveLeg::Leg1));
-        assert_eq!(merger.last_consumed_seq(), 0);
     }
 
     #[test]
@@ -135,7 +124,6 @@ mod tests {
         assert_eq!(merger.try_merge(100, ActiveLeg::Leg1), Some(ActiveLeg::Leg1));
         // Gap: 100 -> 105 (diff=5, valid forward gap)
         assert_eq!(merger.try_merge(105, ActiveLeg::Leg2), Some(ActiveLeg::Leg2));
-        assert_eq!(merger.last_consumed_seq(), 105);
     }
 
     #[test]
@@ -147,7 +135,6 @@ mod tests {
         // Wraparound to 0
         assert_eq!(merger.try_merge(0, ActiveLeg::Leg2), Some(ActiveLeg::Leg2));
         assert_eq!(merger.try_merge(1, ActiveLeg::Leg1), Some(ActiveLeg::Leg1));
-        assert_eq!(merger.last_consumed_seq(), 1);
     }
 
     #[test]
@@ -183,6 +170,5 @@ mod tests {
         // Leg1 stops, leg2 continues
         assert_eq!(merger.try_merge(102, ActiveLeg::Leg2), Some(ActiveLeg::Leg2));
         assert_eq!(merger.try_merge(103, ActiveLeg::Leg2), Some(ActiveLeg::Leg2));
-        assert_eq!(merger.active_leg(), ActiveLeg::Leg2);
     }
 }

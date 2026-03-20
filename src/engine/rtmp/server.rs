@@ -10,7 +10,6 @@
 //! - OBS Studio
 //! - ffmpeg (`-f flv rtmp://host:port/app/key`)
 //! - Wirecast, vMix, etc.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -38,9 +37,7 @@ pub enum RtmpMediaMessage {
         timestamp_ms: u32,
     },
     /// Metadata message (onMetaData).
-    Metadata {
-        data: Bytes,
-    },
+    Metadata,
     /// Publisher disconnected.
     Disconnected,
 }
@@ -335,9 +332,7 @@ async fn receive_media_loop<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 }).await;
             }
             msg_type::DATA_AMF0 => {
-                let _ = media_tx.send(RtmpMediaMessage::Metadata {
-                    data: Bytes::from(msg.payload),
-                }).await;
+                let _ = media_tx.send(RtmpMediaMessage::Metadata).await;
             }
             msg_type::SET_CHUNK_SIZE => {
                 if msg.payload.len() >= 4 {

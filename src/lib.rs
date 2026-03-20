@@ -28,4 +28,5 @@ pub mod manager;
 pub mod redundancy;
 pub mod srt;
 pub mod stats;
+pub mod tunnel;
 pub mod util;

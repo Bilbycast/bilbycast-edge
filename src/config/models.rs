@@ -16,6 +16,9 @@ pub struct AppConfig {
     /// List of all configured flows
     #[serde(default)]
     pub flows: Vec<FlowConfig>,
+    /// Optional IP tunnels (relay or direct QUIC tunnels between edge nodes)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tunnels: Vec<crate::tunnel::TunnelConfig>,
 }
 
 impl Default for AppConfig {
@@ -26,6 +29,7 @@ impl Default for AppConfig {
             monitor: None,
             manager: None,
             flows: Vec::new(),
+            tunnels: Vec::new(),
         }
     }
 }
@@ -250,27 +254,6 @@ impl OutputConfig {
         }
     }
 
-    /// Returns the human-readable display name of this output.
-    pub fn name(&self) -> &str {
-        match self {
-            OutputConfig::Rtp(c) => &c.name,
-            OutputConfig::Srt(c) => &c.name,
-            OutputConfig::Rtmp(c) => &c.name,
-            OutputConfig::Hls(c) => &c.name,
-            OutputConfig::Webrtc(c) => &c.name,
-        }
-    }
-
-    /// Returns the transport type name of this output as a static string.
-    pub fn type_name(&self) -> &'static str {
-        match self {
-            OutputConfig::Rtp(_) => "rtp",
-            OutputConfig::Srt(_) => "srt",
-            OutputConfig::Rtmp(_) => "rtmp",
-            OutputConfig::Hls(_) => "hls",
-            OutputConfig::Webrtc(_) => "webrtc",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -493,6 +476,8 @@ mod tests {
             version: 1,
             server: ServerConfig::default(),
             monitor: None,
+            manager: None,
+            tunnels: Vec::new(),
             flows: vec![FlowConfig {
                 id: "test-flow".to_string(),
                 name: "Test Flow".to_string(),

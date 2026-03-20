@@ -216,7 +216,7 @@ async fn process_media(
                             _ => {}
                         }
                     }
-                    Some(RtmpMediaMessage::Metadata { .. }) => {
+                    Some(RtmpMediaMessage::Metadata) => {
                         // Could extract resolution, bitrate, etc. from onMetaData
                         tracing::debug!("RTMP: received metadata");
                     }

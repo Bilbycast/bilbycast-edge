@@ -54,25 +54,36 @@ pub struct FlowSummary {
     pub name: String,
     /// Whether the flow is marked as enabled in the configuration.
     pub enabled: bool,
-    /// The type of the flow's input source: `"rtp"` or `"srt"`.
+    /// The type of the flow's input source: `"rtp"`, `"srt"`, or `"rtmp"`.
     pub input_type: String,
     /// Number of outputs configured for this flow.
     pub output_count: usize,
+    /// Whether SMPTE 2022-7 redundancy is configured on the input.
+    pub input_redundancy: bool,
+    /// Whether any output has SMPTE 2022-7 redundancy configured.
+    pub output_redundancy: bool,
 }
 
 impl From<&FlowConfig> for FlowSummary {
     fn from(flow: &FlowConfig) -> Self {
-        let input_type = match &flow.input {
-            crate::config::models::InputConfig::Rtp(_) => "rtp",
-            crate::config::models::InputConfig::Srt(_) => "srt",
-            crate::config::models::InputConfig::Rtmp(_) => "rtmp",
+        use crate::config::models::{InputConfig, OutputConfig};
+
+        let (input_type, input_redundancy) = match &flow.input {
+            InputConfig::Rtp(_) => ("rtp", false),
+            InputConfig::Srt(srt) => ("srt", srt.redundancy.is_some()),
+            InputConfig::Rtmp(_) => ("rtmp", false),
         };
+        let output_redundancy = flow.outputs.iter().any(|o| {
+            matches!(o, OutputConfig::Srt(srt) if srt.redundancy.is_some())
+        });
         Self {
             id: flow.id.clone(),
             name: flow.name.clone(),
             enabled: flow.enabled,
             input_type: input_type.to_string(),
             output_count: flow.outputs.len(),
+            input_redundancy,
+            output_redundancy,
         }
     }
 }
@@ -118,16 +129,4 @@ pub struct HealthResponse {
     pub active_flows: usize,
     /// Total number of flows defined in the configuration.
     pub total_flows: usize,
-}
-
-/// JSON message pushed to WebSocket clients on the `/api/v1/ws/stats` channel.
-///
-/// The stats publisher task periodically constructs this message and broadcasts it
-/// through [`super::server::AppState::ws_stats_tx`].
-#[derive(Serialize)]
-pub struct WsStatsMessage {
-    /// ISO 8601 timestamp indicating when the snapshot was taken.
-    pub timestamp: String,
-    /// Per-flow statistics snapshot for all running flows at the time of broadcast.
-    pub flows: Vec<FlowStats>,
 }

@@ -151,37 +151,6 @@ fn build_fec_header(
     hdr
 }
 
-/// Parse our FEC header to extract key fields.
-pub fn parse_fec_header(data: &[u8]) -> Option<FecHeaderInfo> {
-    if data.len() < 10 {
-        return None;
-    }
-
-    let sn_base = u16::from_be_bytes([data[0], data[1]]);
-    let is_column = (data[8] & 0x40) != 0;
-    let index = data[8] & 0x07;
-    let offset = data[9];
-
-    Some(FecHeaderInfo {
-        sn_base,
-        is_column,
-        index,
-        offset,
-    })
-}
-
-/// Parsed FEC header information extracted from a 10-byte SMPTE 2022-1 FEC header.
-pub struct FecHeaderInfo {
-    /// Base RTP sequence number of the first protected media packet.
-    pub sn_base: u16,
-    /// `true` for column FEC (D bit set), `false` for row FEC.
-    pub is_column: bool,
-    /// Column or row index that this FEC packet protects (0..L-1 or 0..D-1).
-    pub index: u8,
-    /// Stride between protected packets: L for column FEC, 1 for row FEC.
-    pub offset: u8,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,13 +204,4 @@ mod tests {
         assert!(fec.is_empty()); // first packet of new cycle, no FEC yet
     }
 
-    #[test]
-    fn test_fec_header_roundtrip() {
-        let hdr = build_fec_header(1234, 5, 10, true);
-        let info = parse_fec_header(&hdr).unwrap();
-        assert_eq!(info.sn_base, 1234);
-        assert_eq!(info.index, 5);
-        assert_eq!(info.offset, 10);
-        assert!(info.is_column);
-    }
 }

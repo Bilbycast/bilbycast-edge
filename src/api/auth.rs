@@ -232,21 +232,15 @@ pub async fn auth_middleware(
 ///
 /// Extracts [`Claims`] from request extensions (inserted by [`auth_middleware`])
 /// and returns 403 if the role is not `"admin"`.
-pub struct RequireAdmin(pub Claims);
+pub struct RequireAdmin;
 
 impl<S: Send + Sync> FromRequestParts<S> for RequireAdmin {
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         // If no Claims in extensions, auth middleware didn't run (auth disabled) — allow through
-        let Some(claims) = parts.extensions.get::<Claims>().cloned() else {
-            return Ok(RequireAdmin(Claims {
-                sub: "anonymous".to_string(),
-                role: "admin".to_string(),
-                iat: 0,
-                exp: 0,
-                iss: "none".to_string(),
-            }));
+        let Some(claims) = parts.extensions.get::<Claims>() else {
+            return Ok(RequireAdmin);
         };
 
         if claims.role != "admin" {
@@ -256,7 +250,7 @@ impl<S: Send + Sync> FromRequestParts<S> for RequireAdmin {
             ));
         }
 
-        Ok(RequireAdmin(claims))
+        Ok(RequireAdmin)
     }
 }
 

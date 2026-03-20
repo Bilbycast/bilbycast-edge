@@ -25,7 +25,6 @@
 //! - CSID 3: AMF command messages (connect, createStream, publish)
 //! - CSID 4: audio data
 //! - CSID 5: video data (some servers also accept 6)
-
 use anyhow::{Context, Result, bail};
 use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -45,10 +44,6 @@ pub const DESIRED_CHUNK_SIZE: u32 = 4096;
 pub mod msg_type {
     /// Set Chunk Size (protocol control, chunk stream 2).
     pub const SET_CHUNK_SIZE: u8 = 1;
-    /// Abort Message.
-    pub const ABORT: u8 = 2;
-    /// Acknowledgement.
-    pub const ACKNOWLEDGEMENT: u8 = 3;
     /// Window Acknowledgement Size.
     pub const WINDOW_ACK_SIZE: u8 = 5;
     /// Set Peer Bandwidth.
@@ -84,12 +79,6 @@ impl ChunkWriter {
             chunk_size: DEFAULT_CHUNK_SIZE,
             buf: BytesMut::with_capacity(8192),
         }
-    }
-
-    /// Update the outbound chunk size. Must also send a Set Chunk Size message
-    /// to the peer (done in [`write_set_chunk_size`]).
-    pub fn set_chunk_size(&mut self, size: u32) {
-        self.chunk_size = size;
     }
 
     /// Serialise an RTMP message into chunks and write them to `stream`.
@@ -236,7 +225,6 @@ impl Default for ChunkStreamState {
 pub struct RtmpMessage {
     pub msg_type: u8,
     pub timestamp: u32,
-    pub stream_id: u32,
     pub payload: Vec<u8>,
 }
 
@@ -357,7 +345,6 @@ impl ChunkReader {
                 let msg = RtmpMessage {
                     msg_type: state.msg_type,
                     timestamp: state.timestamp,
-                    stream_id: state.stream_id,
                     payload: state.payload.clone(),
                 };
                 state.payload.clear();

@@ -59,15 +59,8 @@ pub enum FlowState {
     /// Configured but not yet running (initial/default state).
     #[default]
     Idle,
-    /// Initialising connections and resources; not yet forwarding packets.
-    Starting,
     /// Actively receiving and forwarding media packets.
     Running,
-    /// The flow encountered an unrecoverable error. The `String` contains a
-    /// human-readable description of what went wrong.
-    Error(String),
-    /// The flow was explicitly stopped by the operator.
-    Stopped,
 }
 
 /// Statistics for a flow's input leg.
@@ -143,6 +136,9 @@ pub struct OutputStats {
     /// WHIP URL for WebRTC (for topology display).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub whip_url: Option<String>,
+    /// Local address — SRT listener bind address (for topology display).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_addr: Option<String>,
     /// Total RTP packets successfully sent on this output.
     pub packets_sent: u64,
     /// Total bytes sent (RTP payload + header).

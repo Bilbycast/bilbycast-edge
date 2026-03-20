@@ -1,0 +1,257 @@
+//! Relay client — manages the QUIC connection to a bilbycast-relay server.
+//!
+//! Handles authentication, tunnel binding, keepalive, and reconnection.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use quinn::Connection;
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+use super::auth;
+use super::config::{TunnelDirection, TunnelProtocol};
+use super::protocol::{
+    self, EdgeMessage, RelayDirection, RelayMessage, RelayProtocol, ALPN_RELAY,
+};
+use super::quic;
+
+/// State of the relay tunnel connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayTunnelState {
+    Connecting,
+    Authenticating,
+    Waiting,
+    Ready,
+    Down,
+}
+
+impl std::fmt::Display for RelayTunnelState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connecting => write!(f, "connecting"),
+            Self::Authenticating => write!(f, "authenticating"),
+            Self::Waiting => write!(f, "waiting"),
+            Self::Ready => write!(f, "ready"),
+            Self::Down => write!(f, "down"),
+        }
+    }
+}
+
+/// Parameters for establishing a relay tunnel.
+pub struct RelayTunnelParams {
+    pub tunnel_id: Uuid,
+    pub relay_addr: SocketAddr,
+    pub edge_id: String,
+    pub relay_secret: String,
+    pub direction: TunnelDirection,
+    pub protocol: TunnelProtocol,
+}
+
+/// Establish a QUIC connection to the relay, authenticate, and bind the tunnel.
+///
+/// Returns the QUIC connection and a state watch receiver.
+/// The connection is ready for data forwarding once state becomes `Ready`.
+pub async fn connect_and_bind(
+    params: &RelayTunnelParams,
+    state_tx: &watch::Sender<RelayTunnelState>,
+    cancel: CancellationToken,
+) -> Result<Connection> {
+    // Connect to relay
+    state_tx.send_replace(RelayTunnelState::Connecting);
+    let endpoint = quic::make_client_endpoint(ALPN_RELAY)?;
+
+    let conn = tokio::select! {
+        result = quic::connect(&endpoint, params.relay_addr, "relay") => result?,
+        _ = cancel.cancelled() => anyhow::bail!("cancelled during connect"),
+    };
+
+    tracing::info!(
+        tunnel_id = %params.tunnel_id,
+        relay = %params.relay_addr,
+        "Connected to relay"
+    );
+
+    // Open control stream (bidirectional stream 0)
+    let (mut send, mut recv) = conn.open_bi().await?;
+
+    // Authenticate
+    state_tx.send_replace(RelayTunnelState::Authenticating);
+    let token = auth::generate_token(&params.edge_id, &params.relay_secret);
+    protocol::write_message(&mut send, &EdgeMessage::Auth { token }).await?;
+
+    let response: RelayMessage = protocol::read_message(&mut recv).await?;
+    match response {
+        RelayMessage::AuthOk { edge_id } => {
+            tracing::info!(tunnel_id = %params.tunnel_id, edge_id = %edge_id, "Relay auth OK");
+        }
+        RelayMessage::AuthError { reason } => {
+            anyhow::bail!("Relay auth failed: {reason}");
+        }
+        other => {
+            anyhow::bail!("Unexpected relay response during auth: {other:?}");
+        }
+    }
+
+    // Bind tunnel
+    let relay_direction = match params.direction {
+        TunnelDirection::Ingress => RelayDirection::Ingress,
+        TunnelDirection::Egress => RelayDirection::Egress,
+    };
+    let relay_protocol = match params.protocol {
+        TunnelProtocol::Tcp => RelayProtocol::Tcp,
+        TunnelProtocol::Udp => RelayProtocol::Udp,
+    };
+
+    protocol::write_message(
+        &mut send,
+        &EdgeMessage::TunnelBind {
+            tunnel_id: params.tunnel_id,
+            direction: relay_direction,
+            protocol: relay_protocol,
+        },
+    )
+    .await?;
+
+    // Wait for tunnel to become ready.
+    // TunnelReady may arrive either on the control bidi stream (if we are the
+    // second edge to bind) or via a uni-stream notification (if we are the
+    // first edge to bind and the peer binds later).
+    loop {
+        tokio::select! {
+            result = protocol::read_message::<RelayMessage>(&mut recv) => {
+                let msg = result?;
+                match msg {
+                    RelayMessage::TunnelReady { tunnel_id } if tunnel_id == params.tunnel_id => {
+                        state_tx.send_replace(RelayTunnelState::Ready);
+                        tracing::info!(
+                            tunnel_id = %params.tunnel_id,
+                            direction = %params.direction,
+                            "Tunnel ready"
+                        );
+                        break;
+                    }
+                    RelayMessage::TunnelWaiting { tunnel_id } if tunnel_id == params.tunnel_id => {
+                        state_tx.send_replace(RelayTunnelState::Waiting);
+                        tracing::info!(
+                            tunnel_id = %params.tunnel_id,
+                            "Waiting for peer to bind"
+                        );
+                    }
+                    RelayMessage::Pong => {}
+                    other => {
+                        tracing::debug!(
+                            tunnel_id = %params.tunnel_id,
+                            "Relay message while waiting: {other:?}"
+                        );
+                    }
+                }
+            }
+            // Accept uni-stream notifications from relay (used when we were
+            // the first edge to bind and the peer joins later)
+            result = conn.accept_uni() => {
+                if let Ok(mut uni_recv) = result {
+                    if let Ok(msg) = protocol::read_message::<RelayMessage>(&mut uni_recv).await {
+                        if let RelayMessage::TunnelReady { tunnel_id } = msg {
+                            if tunnel_id == params.tunnel_id {
+                                state_tx.send_replace(RelayTunnelState::Ready);
+                                tracing::info!(
+                                    tunnel_id = %params.tunnel_id,
+                                    direction = %params.direction,
+                                    "Tunnel ready (via notification)"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            _ = cancel.cancelled() => anyhow::bail!("cancelled waiting for tunnel ready"),
+        }
+    }
+
+    // Spawn keepalive task on the control stream
+    let cancel_keepalive = cancel.clone();
+    let keepalive_send = Arc::new(tokio::sync::Mutex::new(send));
+    let ka_send = keepalive_send.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let mut s = ka_send.lock().await;
+                    if protocol::write_message(&mut *s, &EdgeMessage::Ping).await.is_err() {
+                        break;
+                    }
+                }
+                _ = cancel_keepalive.cancelled() => break,
+            }
+        }
+    });
+
+    // Spawn control stream reader (handles pong, tunnel_down)
+    let state_tx_clone = state_tx.clone();
+    let tunnel_id = params.tunnel_id;
+    let cancel_reader = cancel.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                result = protocol::read_message::<RelayMessage>(&mut recv) => {
+                    match result {
+                        Ok(RelayMessage::Pong) => {}
+                        Ok(RelayMessage::TunnelDown { tunnel_id: tid, reason }) if tid == tunnel_id => {
+                            tracing::warn!(tunnel_id = %tid, reason = %reason, "Tunnel down");
+                            state_tx_clone.send_replace(RelayTunnelState::Down);
+                            break;
+                        }
+                        Ok(msg) => {
+                            tracing::debug!("Relay control message: {msg:?}");
+                        }
+                        Err(e) => {
+                            tracing::warn!("Relay control stream error: {e}");
+                            state_tx_clone.send_replace(RelayTunnelState::Down);
+                            break;
+                        }
+                    }
+                }
+                _ = cancel_reader.cancelled() => break,
+            }
+        }
+    });
+
+    Ok(conn)
+}
+
+/// Connect to relay with exponential backoff retry.
+pub async fn connect_with_retry(
+    params: &RelayTunnelParams,
+    state_tx: &watch::Sender<RelayTunnelState>,
+    cancel: CancellationToken,
+) -> Result<Connection> {
+    let mut backoff = Duration::from_secs(1);
+    let max_backoff = Duration::from_secs(60);
+
+    loop {
+        match connect_and_bind(params, state_tx, cancel.clone()).await {
+            Ok(conn) => return Ok(conn),
+            Err(e) => {
+                if cancel.is_cancelled() {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    tunnel_id = %params.tunnel_id,
+                    "Relay connection failed: {e}, retrying in {:?}",
+                    backoff
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {},
+                    _ = cancel.cancelled() => anyhow::bail!("cancelled during retry backoff"),
+                }
+                backoff = (backoff * 2).min(max_backoff);
+            }
+        }
+    }
+}

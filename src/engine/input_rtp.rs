@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use tokio::sync::broadcast;
@@ -130,7 +130,6 @@ async fn rtp_input_loop(
     });
 
     // Optional FEC decoder.
-    let fec_recovered_counter = Arc::new(AtomicU64::new(0));
     let mut fec_decoder = config.fec_decode.as_ref().map(|fec_config| {
         tracing::info!(
             "FEC decode enabled: L={} D={}",
@@ -140,7 +139,6 @@ async fn rtp_input_loop(
         FecDecoder::new(
             fec_config.columns,
             fec_config.rows,
-            fec_recovered_counter.clone(),
         )
     });
 
@@ -213,8 +211,6 @@ async fn rtp_input_loop(
                             for pkt in packets {
                                 let _ = broadcast_tx.send(pkt);
                             }
-                            let recovered = fec_recovered_counter.load(Ordering::Relaxed);
-                            stats.fec_recovered.store(recovered, Ordering::Relaxed);
                         } else {
                             let packet = RtpPacket {
                                 data: bytes_data,

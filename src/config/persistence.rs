@@ -65,6 +65,8 @@ mod tests {
             version: 1,
             server: ServerConfig::default(),
             monitor: None,
+            manager: None,
+            tunnels: Vec::new(),
             flows: vec![FlowConfig {
                 id: "test".to_string(),
                 name: "Test".to_string(),

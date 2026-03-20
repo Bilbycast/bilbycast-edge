@@ -17,13 +17,11 @@
 //! - PID 0x1000: PMT (Program Map Table)
 //! - PID 0x0100: Video PES (H.264)
 //! - PID 0x0101: Audio PES (AAC)
-
 use bytes::{BufMut, BytesMut, Bytes};
 
 // TS constants
 const TS_PACKET_SIZE: usize = 188;
 const TS_SYNC_BYTE: u8 = 0x47;
-const PAT_PID: u16 = 0x0000;
 const PMT_PID: u16 = 0x1000;
 const VIDEO_PID: u16 = 0x0100;
 const AUDIO_PID: u16 = 0x0101;
@@ -255,7 +253,7 @@ impl TsMuxer {
 
         // Calculate section length
         let streams_len = 5 + if self.has_audio { 5 } else { 0 }; // 5 bytes per stream entry
-        let section_length = 9 + streams_len as u16; // fixed(9) + program_info_length(0) + streams + CRC(4) ... actually:
+        let _section_length = 9 + streams_len as u16; // fixed(9) + program_info_length(0) + streams + CRC(4) ... actually:
         // section_length includes: program_number(2) + reserved/version(1) + section_number(1) + last_section(1)
         // + reserved/PCR_PID(2) + reserved/program_info_length(2) + streams + CRC32(4)
         let section_length = 9 + streams_len as u16 + 4; // +4 for CRC
