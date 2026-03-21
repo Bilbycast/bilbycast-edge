@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use bytes::BytesMut;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -11,6 +12,19 @@ use crate::stats::collector::OutputStatsAccumulator;
 use crate::util::socket::create_udp_output;
 
 use super::packet::RtpPacket;
+
+/// TS sync byte.
+const TS_SYNC_BYTE: u8 = 0x47;
+
+/// TS packet size.
+const TS_PACKET_SIZE: usize = 188;
+
+/// Number of TS packets per UDP datagram for raw TS output.
+/// 7 × 188 = 1316 bytes — the standard for MPEG-TS over UDP.
+const TS_PACKETS_PER_DATAGRAM: usize = 7;
+
+/// Minimum consecutive sync bytes needed to confirm TS alignment.
+const TS_SYNC_CONFIRM_COUNT: usize = 3;
 
 /// Spawn a task that subscribes to the broadcast channel and sends
 /// RTP packets out over a UDP socket. If FEC encode is configured,
@@ -80,6 +94,16 @@ async fn rtp_output_loop(
         )
     });
 
+    // Buffer for re-aligning raw TS data into 188-byte aligned datagrams.
+    // SRT may deliver data in chunks that don't align to TS packet boundaries
+    // (e.g., 1456-byte byte-stream chunks). This buffer accumulates incoming
+    // data, finds the TS sync byte (0x47) boundary, and sends properly aligned
+    // chunks (7 × 188 = 1316 bytes) — the standard for MPEG-TS over UDP.
+    let mut ts_realign_buf = BytesMut::new();
+    let ts_datagram_size = TS_PACKETS_PER_DATAGRAM * TS_PACKET_SIZE;
+    let mut is_raw_ts_stream = false;
+    let mut ts_sync_found = false;
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -89,14 +113,90 @@ async fn rtp_output_loop(
             result = rx.recv() => {
                 match result {
                     Ok(packet) => {
-                        // Send the media packet
-                        match socket.send_to(&packet.data, dest).await {
-                            Ok(sent) => {
-                                stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                        if packet.is_raw_ts {
+                            // Raw TS: buffer and re-align to 188-byte boundaries.
+                            // SRT interop may deliver data in non-aligned chunks.
+                            if !is_raw_ts_stream {
+                                is_raw_ts_stream = true;
+                                tracing::info!(
+                                    "RTP output '{}': raw TS detected, enabling TS re-alignment ({} TS pkts/datagram)",
+                                    config.id,
+                                    TS_PACKETS_PER_DATAGRAM
+                                );
                             }
-                            Err(e) => {
-                                tracing::warn!("RTP output '{}' send error: {e}", config.id);
+
+                            ts_realign_buf.extend_from_slice(&packet.data);
+
+                            // Find TS sync boundary on first data: scan for 0x47
+                            // at 188-byte intervals to confirm alignment.
+                            if !ts_sync_found {
+                                let min_bytes = TS_SYNC_CONFIRM_COUNT * TS_PACKET_SIZE;
+                                if ts_realign_buf.len() >= min_bytes {
+                                    let mut found_offset = None;
+                                    for offset in 0..TS_PACKET_SIZE {
+                                        let all_sync = (0..TS_SYNC_CONFIRM_COUNT).all(|i| {
+                                            let pos = offset + i * TS_PACKET_SIZE;
+                                            pos < ts_realign_buf.len()
+                                                && ts_realign_buf[pos] == TS_SYNC_BYTE
+                                        });
+                                        if all_sync {
+                                            found_offset = Some(offset);
+                                            break;
+                                        }
+                                    }
+
+                                    if let Some(offset) = found_offset {
+                                        if offset > 0 {
+                                            tracing::info!(
+                                                "RTP output '{}': TS sync found at offset {}, discarding {} leading bytes",
+                                                config.id,
+                                                offset,
+                                                offset
+                                            );
+                                            let _ = ts_realign_buf.split_to(offset);
+                                        } else {
+                                            tracing::info!(
+                                                "RTP output '{}': TS sync found at offset 0 (already aligned)",
+                                                config.id
+                                            );
+                                        }
+                                        ts_sync_found = true;
+                                    } else {
+                                        tracing::warn!(
+                                            "RTP output '{}': no TS sync found in {} bytes, discarding",
+                                            config.id,
+                                            ts_realign_buf.len()
+                                        );
+                                        ts_realign_buf.clear();
+                                    }
+                                }
+                            }
+
+                            // Send complete TS-aligned datagrams
+                            if ts_sync_found {
+                                while ts_realign_buf.len() >= ts_datagram_size {
+                                    let datagram = ts_realign_buf.split_to(ts_datagram_size);
+                                    match socket.send_to(&datagram, dest).await {
+                                        Ok(sent) => {
+                                            stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                            stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("RTP output '{}' send error: {e}", config.id);
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // RTP-wrapped data: send as-is (already properly framed)
+                            match socket.send_to(&packet.data, dest).await {
+                                Ok(sent) => {
+                                    stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                    stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("RTP output '{}' send error: {e}", config.id);
+                                }
                             }
                         }
 

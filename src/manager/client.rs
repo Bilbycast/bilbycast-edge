@@ -194,6 +194,11 @@ async fn try_connect(
     }
 
     let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
+    // Periodic stats timer ensures tunnel-only nodes (no flows) still send
+    // stats to the manager. Without this, nodes with 0 flows never fire
+    // stats_rx and the manager never receives tunnel stats.
+    let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
+    stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -223,11 +228,39 @@ async fn try_connect(
                                 break;
                             }
                         }
+                        // Reset the periodic timer since we just sent stats
+                        stats_interval.reset();
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::debug!("Manager client lagged {n} stats messages");
                     }
                     Err(_) => break,
+                }
+            }
+
+            // Periodic stats for tunnel-only nodes (no flows to trigger stats_rx)
+            _ = stats_interval.tick() => {
+                let tunnel_statuses: Vec<serde_json::Value> = tunnel_manager
+                    .list_tunnels()
+                    .into_iter()
+                    .map(|ts| serde_json::to_value(ts).unwrap_or_default())
+                    .collect();
+
+                let envelope = serde_json::json!({
+                    "type": "stats",
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "payload": {
+                        "flows": [],
+                        "tunnels": tunnel_statuses,
+                        "uptime_secs": 0,
+                        "active_flows": flow_manager.active_flow_count(),
+                        "total_flows": flow_manager.active_flow_count()
+                    }
+                });
+                if let Ok(json) = serde_json::to_string(&envelope) {
+                    if ws_write.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
                 }
             }
 
