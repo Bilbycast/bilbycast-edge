@@ -93,7 +93,7 @@ All data flows through a single type: `RtpPacket { data: Bytes, sequence_number:
 | `config/` | `models.rs`, `validation.rs`, `persistence.rs` | JSON config, enum-tagged types, atomic save |
 | `stats/` | `collector.rs`, `models.rs`, `throughput.rs` | Lock-free stats registry, bitrate estimation |
 | `tunnel/` | `manager.rs`, `relay_client.rs`, `udp_forwarder.rs`, `tcp_forwarder.rs` | QUIC-based IP tunnels (relay/direct) |
-| `manager/` | `client.rs`, `config.rs` | WebSocket client to bilbycast-manager |
+| `manager/` | `client.rs`, `config.rs` | WebSocket client to bilbycast-manager. Sends stats (1s) and health (15s). Handles commands: get_config (returns full AppConfig), create/delete/start/stop flow, add/remove output, create/delete tunnel |
 | `monitor/` | `server.rs`, `dashboard.rs` | Embedded HTML/JS dashboard on separate port |
 | `srt/` | `connection.rs` | SRT stats polling and socket config |
 | `util/` | `rtp_parse.rs`, `socket.rs`, `time.rs` | RTP header parsing, UDP/multicast, monotonic clock |

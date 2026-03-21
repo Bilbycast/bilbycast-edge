@@ -267,7 +267,7 @@ async fn try_connect(
             msg = ws_read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_manager_message(&text, flow_manager, tunnel_manager, &mut ws_write).await;
+                        handle_manager_message(&text, flow_manager, tunnel_manager, app_config, &mut ws_write).await;
                     }
                     Some(Ok(Message::Ping(data))) => {
                         let _ = ws_write.send(Message::Pong(data)).await;
@@ -381,6 +381,7 @@ async fn handle_manager_message<S>(
     text: &str,
     flow_manager: &Arc<FlowManager>,
     tunnel_manager: &Arc<TunnelManager>,
+    app_config: &Arc<RwLock<AppConfig>>,
     ws_write: &mut futures_util::stream::SplitSink<S, Message>,
 ) where
     S: futures_util::Sink<Message> + Unpin,
@@ -412,6 +413,22 @@ async fn handle_manager_message<S>(
             let command_id = payload["command_id"].as_str().unwrap_or("unknown");
             let action = &payload["action"];
             let action_type = action["type"].as_str().unwrap_or("");
+
+            // Handle get_config specially — it sends a config_response, not a command_ack
+            if action_type == "get_config" {
+                tracing::info!("Manager command: get_config");
+                let cfg = app_config.read().await;
+                let config_json = serde_json::to_value(&*cfg).unwrap_or_default();
+                let response = serde_json::json!({
+                    "type": "config_response",
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "payload": config_json
+                });
+                if let Ok(json) = serde_json::to_string(&response) {
+                    let _ = ws_write.send(Message::Text(json.into())).await;
+                }
+                return;
+            }
 
             let result = execute_command(action_type, action, flow_manager, tunnel_manager).await;
 
