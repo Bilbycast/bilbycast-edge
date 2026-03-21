@@ -89,7 +89,7 @@ All data flows through a single type: `RtpPacket { data: Bytes, sequence_number:
 | `engine/` | `tr101290.rs` | Transport stream quality analysis (sync, CC, PAT/PMT, PCR) |
 | `fec/` | `encoder.rs`, `decoder.rs`, `matrix.rs` | SMPTE 2022-1 FEC (XOR column×row) |
 | `redundancy/` | `merger.rs` | SMPTE 2022-7 hitless merge (seq dedup from dual SRT legs) |
-| `api/` | `server.rs`, `auth.rs`, `flows.rs`, `stats.rs`, `tunnels.rs`, `ws.rs` | Axum REST API, OAuth2/JWT, WebSocket stats |
+| `api/` | `server.rs`, `auth.rs`, `flows.rs`, `stats.rs`, `tunnels.rs`, `ws.rs`, `nmos.rs`, `nmos_is05.rs` | Axum REST API, OAuth2/JWT, WebSocket stats, NMOS IS-04 Node API, NMOS IS-05 Connection Management |
 | `config/` | `models.rs`, `validation.rs`, `persistence.rs` | JSON config, enum-tagged types, atomic save |
 | `stats/` | `collector.rs`, `models.rs`, `throughput.rs` | Lock-free stats registry, bitrate estimation |
 | `tunnel/` | `manager.rs`, `relay_client.rs`, `udp_forwarder.rs`, `tcp_forwarder.rs` | QUIC-based IP tunnels (relay/direct) |
@@ -117,12 +117,16 @@ Four security layers, from outermost to innermost:
 
 SRT uses AES-128/192/256 encryption + passphrase auth. Tunnels use QUIC/TLS 1.3 + HMAC-SHA256 tokens.
 
+**Manager connection**: The WebSocket client to bilbycast-manager enforces `wss://` (TLS). Plaintext `ws://` URLs are rejected at connection time. Set `accept_self_signed_cert: true` in the `manager` config section to accept self-signed certificates (dev/testing only).
+
 ### API Structure (`src/api/server.rs`)
 
 - Public: `/health`, `/oauth/token`, `/metrics`
 - Read-only (JWT or auth-disabled): `GET /api/v1/*`
 - Admin (requires `admin` role): `POST/PUT/DELETE /api/v1/*`
 - WebSocket: `/api/v1/ws/stats` (1/sec stats broadcast)
+- NMOS IS-04 (public, no auth): `/x-nmos/node/v1.3/` — Node, Device, Source, Flow, Sender, Receiver resources
+- NMOS IS-05 (public, no auth): `/x-nmos/connection/v1.1/` — Staged/active transport parameter management for senders and receivers
 
 ## Adding New Input/Output Types
 

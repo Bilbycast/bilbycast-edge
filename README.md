@@ -2,6 +2,8 @@
 
 Media transport edge node supporting SRT, RTP/UDP, RTMP, HLS, and WebRTC protocols. Each node runs one or more flows, where a flow consists of a single input fanning out to multiple outputs, with support for SMPTE 2022-1 FEC and SMPTE 2022-7 hitless redundancy.
 
+Supports NMOS IS-04 (Discovery & Registration) and IS-05 (Connection Management) for integration with broadcast control systems. Exposes Prometheus metrics for monitoring.
+
 ## Supported Protocols
 
 | Protocol | Input | Output | Notes                                          |

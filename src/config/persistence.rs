@@ -63,6 +63,7 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let config = AppConfig {
             version: 1,
+            node_id: None,
             server: ServerConfig::default(),
             monitor: None,
             manager: None,

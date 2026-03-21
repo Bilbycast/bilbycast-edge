@@ -21,6 +21,47 @@ use crate::tunnel::manager::TunnelManager;
 
 use super::ManagerConfig;
 
+/// Certificate verifier that accepts any certificate (for self-signed cert support).
+#[derive(Debug)]
+struct InsecureCertVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for InsecureCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// Start the manager client background task.
 pub fn start_manager_client(
     config: ManagerConfig,
@@ -113,12 +154,34 @@ async fn try_connect(
     api_addr: &str,
     monitor_addr: Option<&str>,
 ) -> Result<ConnectResult, String> {
-    // Connect to the bare WebSocket URL (no credentials in query params)
-    let connect_url = &config.url;
+    // Enforce TLS — only wss:// connections are allowed
+    if !config.url.starts_with("wss://") {
+        return Err(
+            "Manager URL must use wss:// (TLS). Plaintext ws:// connections are not allowed."
+                .into(),
+        );
+    }
 
-    let (ws_stream, _response) = tokio_tungstenite::connect_async(connect_url)
+    let (ws_stream, _response) = if config.accept_self_signed_cert {
+        // Build a rustls ClientConfig that accepts any certificate
+        let tls_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(InsecureCertVerifier))
+            .with_no_client_auth();
+        let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config));
+        tokio_tungstenite::connect_async_tls_with_config(
+            &config.url,
+            None,
+            false,
+            Some(connector),
+        )
         .await
-        .map_err(|e| format!("WebSocket connect failed: {e}"))?;
+        .map_err(|e| format!("WebSocket connect failed: {e}"))?
+    } else {
+        tokio_tungstenite::connect_async(&config.url)
+            .await
+            .map_err(|e| format!("WebSocket connect failed: {e}"))?
+    };
 
     tracing::info!("WebSocket connected, sending auth...");
 

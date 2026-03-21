@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use serde::Serialize;
+use std::sync::Mutex;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -17,6 +18,7 @@ use super::config::{TunnelConfig, TunnelDirection, TunnelMode, TunnelProtocol};
 use super::relay_client::{self, RelayTunnelParams, RelayTunnelState};
 use super::tcp_forwarder::{self, TcpForwarderStats};
 use super::udp_forwarder::{self, UdpForwarderStats};
+use crate::stats::throughput::ThroughputEstimator;
 
 /// Runtime state for an active tunnel.
 struct TunnelRuntime {
@@ -25,6 +27,8 @@ struct TunnelRuntime {
     state_rx: watch::Receiver<RelayTunnelState>,
     udp_stats: Option<Arc<UdpForwarderStats>>,
     tcp_stats: Option<Arc<TcpForwarderStats>>,
+    throughput_in: Mutex<ThroughputEstimator>,
+    throughput_out: Mutex<ThroughputEstimator>,
 }
 
 /// Serializable tunnel status for API responses.
@@ -47,6 +51,8 @@ pub struct TunnelStatsSnapshot {
     pub packets_received: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    pub bitrate_in_bps: u64,
+    pub bitrate_out_bps: u64,
     pub send_errors: u64,
     pub connections_total: u64,
     pub connections_active: u64,
@@ -111,6 +117,8 @@ impl TunnelManager {
                 state_rx,
                 udp_stats,
                 tcp_stats,
+                throughput_in: Mutex::new(ThroughputEstimator::new()),
+                throughput_out: Mutex::new(ThroughputEstimator::new()),
             },
         );
 
@@ -282,6 +290,14 @@ fn build_status(runtime: &TunnelRuntime) -> TunnelStatus {
         stats.bytes_received = tcp.bytes_received.load(Ordering::Relaxed);
         stats.connections_total = tcp.connections_total.load(Ordering::Relaxed);
         stats.connections_active = tcp.connections_active.load(Ordering::Relaxed);
+    }
+
+    // Sample throughput estimators to compute bitrate
+    if let Ok(mut est) = runtime.throughput_in.lock() {
+        stats.bitrate_in_bps = est.sample(stats.bytes_received);
+    }
+    if let Ok(mut est) = runtime.throughput_out.lock() {
+        stats.bitrate_out_bps = est.sample(stats.bytes_sent);
     }
 
     TunnelStatus {

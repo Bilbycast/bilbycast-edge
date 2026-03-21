@@ -14,7 +14,8 @@ use crate::engine::manager::FlowManager;
 use crate::tunnel::manager::TunnelManager;
 
 use super::auth::{self, AuthState};
-use super::{flows, stats, tunnels, ws};
+use super::nmos_is05::Is05State;
+use super::{flows, nmos, nmos_is05, stats, tunnels, ws};
 
 /// Shared application state accessible from all Axum handlers via [`axum::extract::State`].
 #[derive(Clone)]
@@ -33,6 +34,8 @@ pub struct AppState {
     pub ws_stats_tx: broadcast::Sender<String>,
     /// Optional auth state (None = auth disabled).
     pub auth_state: Option<Arc<AuthState>>,
+    /// NMOS IS-05 staged transport parameters.
+    pub is05_state: Arc<Is05State>,
 }
 
 /// Constructs the main Axum [`Router`] with all API routes, auth middleware, and layers.
@@ -112,10 +115,16 @@ pub fn build_router(state: AppState) -> Router {
             auth::auth_middleware,
         ));
 
+    // NMOS IS-04 and IS-05 routes (public, no auth — for NMOS controller compatibility)
+    let nmos_routes = Router::new()
+        .nest("/x-nmos/node/v1.3", nmos::nmos_node_router())
+        .nest("/x-nmos/connection/v1.1", nmos_is05::nmos_connection_router());
+
     // Merge everything
     Router::new()
         .merge(public_routes)
         .merge(protected_routes)
+        .merge(nmos_routes)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)

@@ -89,6 +89,14 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration
     let mut app_config = load_config(&cli.config)?;
 
+    // Ensure persistent node UUID exists (used for NMOS IS-04)
+    if app_config.node_id.is_none() {
+        let node_id = uuid::Uuid::new_v4().to_string();
+        tracing::info!("Generated new node_id: {node_id}");
+        app_config.node_id = Some(node_id);
+        config::persistence::save_config(&cli.config, &app_config)?;
+    }
+
     // Validate config
     if let Err(e) = validate_config(&app_config) {
         tracing::error!("Invalid configuration: {e}");
@@ -145,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
         start_time: Instant::now(),
         ws_stats_tx: ws_stats_tx.clone(),
         auth_state,
+        is05_state: Arc::new(api::nmos_is05::Is05State::new()),
     };
 
     // Start all enabled flows from config

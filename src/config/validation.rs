@@ -469,6 +469,7 @@ mod tests {
     fn test_duplicate_flow_ids() {
         let config = AppConfig {
             version: 1,
+            node_id: None,
             server: ServerConfig::default(),
             monitor: None,
             manager: None,

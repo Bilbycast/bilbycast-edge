@@ -9,6 +9,7 @@ bilbycast-edge is configured via a JSON file (default: `./config.json`). Changes
 ```json
 {
   "version": 1,
+  "node_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "server": {
     "listen_addr": "0.0.0.0",
     "listen_port": 8080,
@@ -20,6 +21,12 @@ bilbycast-edge is configured via a JSON file (default: `./config.json`). Changes
   "flows": []
 }
 ```
+
+## Node Identity
+
+| Field     | Type      | Default | Description |
+|-----------|-----------|---------|-------------|
+| `node_id` | `string?` | Auto-generated | Persistent UUID v4 identifying this edge node. Auto-generated on first startup and saved to config. Used as the NMOS IS-04 Node ID. All NMOS resource UUIDs are derived from this value (UUID v5), so they remain stable across restarts. |
 
 ---
 
@@ -109,7 +116,8 @@ Optional connection to a bilbycast-manager instance for centralized monitoring a
 | Field                | Type      | Default | Description                                     |
 |----------------------|-----------|---------|-------------------------------------------------|
 | `enabled`            | `bool`    | `false` | Enable the manager connection                   |
-| `url`                | `string`  | --      | Manager WebSocket URL, e.g. `"wss://manager-host:8443/ws/node"` |
+| `url`                | `string`  | --      | Manager WebSocket URL, e.g. `"wss://manager-host:8443/ws/node"` (must use `wss://`) |
+| `accept_self_signed_cert` | `bool` | `false` | Accept self-signed TLS certificates from the manager. **Dev/testing only** — disables cert validation. |
 | `registration_token` | `string?` | `null`  | One-time registration token (first connection only) |
 | `node_id`            | `string?` | `null`  | Assigned node ID (set automatically after registration) |
 | `node_secret`        | `string?` | `null`  | Assigned node secret (set automatically after registration) |

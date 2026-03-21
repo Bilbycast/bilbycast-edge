@@ -1127,3 +1127,27 @@ All API errors return a JSON body with `"success": false` and an `"error"` messa
 | PUT | `/api/v1/config` | Yes | admin | Replace entire config |
 | POST | `/api/v1/config/reload` | Yes | admin | Reload config from disk |
 | GET | `/api/v1/ws/stats` | Yes | any | WebSocket stats stream |
+| GET | `/x-nmos/node/v1.3/` | No | - | NMOS IS-04: Node API root |
+| GET | `/x-nmos/node/v1.3/self` | No | - | NMOS IS-04: Node resource |
+| GET | `/x-nmos/node/v1.3/devices/` | No | - | NMOS IS-04: List devices |
+| GET | `/x-nmos/node/v1.3/devices/{id}` | No | - | NMOS IS-04: Get device |
+| GET | `/x-nmos/node/v1.3/sources/` | No | - | NMOS IS-04: List sources |
+| GET | `/x-nmos/node/v1.3/sources/{id}` | No | - | NMOS IS-04: Get source |
+| GET | `/x-nmos/node/v1.3/flows/` | No | - | NMOS IS-04: List flows |
+| GET | `/x-nmos/node/v1.3/flows/{id}` | No | - | NMOS IS-04: Get flow |
+| GET | `/x-nmos/node/v1.3/senders/` | No | - | NMOS IS-04: List senders |
+| GET | `/x-nmos/node/v1.3/senders/{id}` | No | - | NMOS IS-04: Get sender |
+| GET | `/x-nmos/node/v1.3/receivers/` | No | - | NMOS IS-04: List receivers |
+| GET | `/x-nmos/node/v1.3/receivers/{id}` | No | - | NMOS IS-04: Get receiver |
+| GET | `/x-nmos/connection/v1.1/single/senders/` | No | - | NMOS IS-05: List senders |
+| GET | `/x-nmos/connection/v1.1/single/senders/{id}/staged` | No | - | NMOS IS-05: Get staged params |
+| PATCH | `/x-nmos/connection/v1.1/single/senders/{id}/staged` | No | - | NMOS IS-05: Update staged + activate |
+| GET | `/x-nmos/connection/v1.1/single/senders/{id}/active` | No | - | NMOS IS-05: Get active params |
+| GET | `/x-nmos/connection/v1.1/single/senders/{id}/transporttype` | No | - | NMOS IS-05: Get transport type |
+| GET | `/x-nmos/connection/v1.1/single/senders/{id}/constraints` | No | - | NMOS IS-05: Get constraints |
+| GET | `/x-nmos/connection/v1.1/single/receivers/` | No | - | NMOS IS-05: List receivers |
+| GET | `/x-nmos/connection/v1.1/single/receivers/{id}/staged` | No | - | NMOS IS-05: Get staged params |
+| PATCH | `/x-nmos/connection/v1.1/single/receivers/{id}/staged` | No | - | NMOS IS-05: Update staged + activate |
+| GET | `/x-nmos/connection/v1.1/single/receivers/{id}/active` | No | - | NMOS IS-05: Get active params |
+| GET | `/x-nmos/connection/v1.1/single/receivers/{id}/transporttype` | No | - | NMOS IS-05: Get transport type |
+| GET | `/x-nmos/connection/v1.1/single/receivers/{id}/constraints` | No | - | NMOS IS-05: Get constraints |

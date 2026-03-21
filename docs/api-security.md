@@ -674,7 +674,7 @@ A future release may support delegating authentication to an external identity p
 
 ### NMOS IS-10 (Authorization)
 
-The AMWA NMOS IS-10 specification defines an authorization framework for broadcast media networks. A future release may implement IS-10 compatibility, allowing bilbycast-edge to participate in NMOS-managed environments where authorization tokens are issued by a central NMOS Authorization Server and validated using JWKs (JSON Web Key Sets).
+bilbycast-edge implements NMOS IS-04 (Node API v1.3) and IS-05 (Connection Management v1.1). These endpoints are currently unauthenticated for compatibility with NMOS controllers. The AMWA NMOS IS-10 specification defines an authorization framework for broadcast media networks. A future release may implement IS-10 compatibility, allowing bilbycast-edge to secure the NMOS endpoints using authorization tokens issued by a central NMOS Authorization Server and validated using JWKs (JSON Web Key Sets).
 
 ### API key authentication
 

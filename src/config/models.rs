@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 pub struct AppConfig {
     /// Schema version for forward compatibility
     pub version: u32,
+    /// Persistent node UUID (auto-generated on first run, used for NMOS IS-04)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
     /// API server configuration
     pub server: ServerConfig,
     /// Optional web monitoring dashboard
@@ -25,6 +28,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             version: 1,
+            node_id: None,
             server: ServerConfig::default(),
             monitor: None,
             manager: None,
@@ -474,6 +478,7 @@ mod tests {
     fn test_roundtrip_config() {
         let config = AppConfig {
             version: 1,
+            node_id: None,
             server: ServerConfig::default(),
             monitor: None,
             manager: None,

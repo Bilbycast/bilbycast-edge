@@ -11,6 +11,8 @@ pub mod auth;
 pub mod errors;
 pub mod flows;
 pub mod models;
+pub mod nmos;
+pub mod nmos_is05;
 pub mod server;
 pub mod stats;
 pub mod tunnels;
