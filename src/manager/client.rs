@@ -14,7 +14,8 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{broadcast, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::config::models::{AppConfig, FlowConfig};
+use crate::config::models::{AppConfig, FlowConfig, OutputConfig};
+use crate::config::persistence::save_config;
 use crate::engine::manager::FlowManager;
 use crate::tunnel::TunnelConfig;
 use crate::tunnel::manager::TunnelManager;
@@ -330,7 +331,7 @@ async fn try_connect(
             msg = ws_read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_manager_message(&text, flow_manager, tunnel_manager, app_config, &mut ws_write).await;
+                        handle_manager_message(&text, flow_manager, tunnel_manager, app_config, config_path, &mut ws_write).await;
                     }
                     Some(Ok(Message::Ping(data))) => {
                         let _ = ws_write.send(Message::Pong(data)).await;
@@ -445,6 +446,7 @@ async fn handle_manager_message<S>(
     flow_manager: &Arc<FlowManager>,
     tunnel_manager: &Arc<TunnelManager>,
     app_config: &Arc<RwLock<AppConfig>>,
+    config_path: &PathBuf,
     ws_write: &mut futures_util::stream::SplitSink<S, Message>,
 ) where
     S: futures_util::Sink<Message> + Unpin,
@@ -493,7 +495,15 @@ async fn handle_manager_message<S>(
                 return;
             }
 
-            let result = execute_command(action_type, action, flow_manager, tunnel_manager).await;
+            let result = execute_command(
+                action_type,
+                action,
+                flow_manager,
+                tunnel_manager,
+                app_config,
+                config_path,
+            )
+            .await;
 
             let ack = serde_json::json!({
                 "type": "command_ack",
@@ -523,6 +533,8 @@ async fn execute_command(
     action: &serde_json::Value,
     flow_manager: &Arc<FlowManager>,
     tunnel_manager: &Arc<TunnelManager>,
+    app_config: &Arc<RwLock<AppConfig>>,
+    config_path: &PathBuf,
 ) -> Result<(), String> {
     match action_type {
         "create_flow" => {
@@ -530,9 +542,38 @@ async fn execute_command(
                 .map_err(|e| format!("Invalid flow config: {e}"))?;
             tracing::info!("Manager command: create flow '{}'", flow.id);
             flow_manager
-                .create_flow(flow)
+                .create_flow(flow.clone())
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            // Persist to config
+            let mut cfg = app_config.write().await;
+            cfg.flows.push(flow);
+            persist_config(&cfg, config_path);
+            Ok(())
+        }
+        "update_flow" => {
+            let flow: FlowConfig = serde_json::from_value(action["flow"].clone())
+                .map_err(|e| format!("Invalid flow config: {e}"))?;
+            let flow_id = action["flow_id"]
+                .as_str()
+                .unwrap_or(&flow.id);
+            tracing::info!("Manager command: update flow '{flow_id}'");
+            // Stop old flow (ignore error if not running)
+            let _ = flow_manager.destroy_flow(flow_id).await;
+            // Start new flow
+            flow_manager
+                .create_flow(flow.clone())
+                .await
+                .map_err(|e| e.to_string())?;
+            // Update config
+            let mut cfg = app_config.write().await;
+            if let Some(pos) = cfg.flows.iter().position(|f| f.id == flow_id) {
+                cfg.flows[pos] = flow;
+            } else {
+                cfg.flows.push(flow);
+            }
+            persist_config(&cfg, config_path);
+            Ok(())
         }
         "delete_flow" => {
             let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?;
@@ -540,7 +581,12 @@ async fn execute_command(
             flow_manager
                 .destroy_flow(flow_id)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            // Remove from config
+            let mut cfg = app_config.write().await;
+            cfg.flows.retain(|f| f.id != flow_id);
+            persist_config(&cfg, config_path);
+            Ok(())
         }
         "stop_flow" => {
             let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?;
@@ -548,23 +594,60 @@ async fn execute_command(
             flow_manager
                 .stop_flow(flow_id)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            // Mark disabled in config
+            let mut cfg = app_config.write().await;
+            if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
+                flow.enabled = false;
+            }
+            persist_config(&cfg, config_path);
+            Ok(())
         }
         "start_flow" | "restart_flow" => {
             let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?;
             tracing::info!("Manager command: {action_type} flow '{flow_id}'");
+            // If restarting, stop first (ignore error if not running)
+            if action_type == "restart_flow" {
+                let _ = flow_manager.destroy_flow(flow_id).await;
+            }
+            // Find flow config and start it
+            let flow_config = {
+                let cfg = app_config.read().await;
+                cfg.flows
+                    .iter()
+                    .find(|f| f.id == flow_id)
+                    .cloned()
+                    .ok_or_else(|| format!("Flow '{flow_id}' not found in config"))?
+            };
+            flow_manager
+                .create_flow(flow_config)
+                .await
+                .map_err(|e| e.to_string())?;
+            // Mark enabled in config
+            let mut cfg = app_config.write().await;
+            if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
+                flow.enabled = true;
+            }
+            persist_config(&cfg, config_path);
             Ok(())
         }
         "add_output" => {
             let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?;
-            let output: crate::config::models::OutputConfig =
+            let output: OutputConfig =
                 serde_json::from_value(action["output"].clone())
                     .map_err(|e| format!("Invalid output config: {e}"))?;
             tracing::info!("Manager command: add output to flow '{flow_id}'");
             flow_manager
-                .add_output(flow_id, output)
+                .add_output(flow_id, output.clone())
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            // Add to config
+            let mut cfg = app_config.write().await;
+            if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
+                flow.outputs.push(output);
+            }
+            persist_config(&cfg, config_path);
+            Ok(())
         }
         "remove_output" => {
             let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?;
@@ -573,16 +656,28 @@ async fn execute_command(
             flow_manager
                 .remove_output(flow_id, output_id)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            // Remove from config
+            let mut cfg = app_config.write().await;
+            if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
+                flow.outputs.retain(|o| o.id() != output_id);
+            }
+            persist_config(&cfg, config_path);
+            Ok(())
         }
         "create_tunnel" => {
             let tunnel: TunnelConfig = serde_json::from_value(action["tunnel"].clone())
                 .map_err(|e| format!("Invalid tunnel config: {e}"))?;
             tracing::info!("Manager command: create tunnel '{}'", tunnel.id);
             tunnel_manager
-                .create_tunnel(tunnel)
+                .create_tunnel(tunnel.clone())
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            // Add to config
+            let mut cfg = app_config.write().await;
+            cfg.tunnels.push(tunnel);
+            persist_config(&cfg, config_path);
+            Ok(())
         }
         "delete_tunnel" => {
             let tunnel_id = action["tunnel_id"].as_str().ok_or("Missing tunnel_id")?;
@@ -590,8 +685,20 @@ async fn execute_command(
             tunnel_manager
                 .destroy_tunnel(tunnel_id)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            // Remove from config
+            let mut cfg = app_config.write().await;
+            cfg.tunnels.retain(|t| t.id != tunnel_id);
+            persist_config(&cfg, config_path);
+            Ok(())
         }
         _ => Err(format!("Unknown command: {action_type}")),
+    }
+}
+
+/// Persist config to disk (fire-and-forget, logs on error).
+fn persist_config(config: &AppConfig, config_path: &PathBuf) {
+    if let Err(e) = save_config(config_path.as_path(), config) {
+        tracing::warn!("Failed to persist config after manager command: {e}");
     }
 }
