@@ -31,6 +31,9 @@ pub async fn create_tunnel(
     State(state): State<AppState>,
     Json(config): Json<TunnelConfig>,
 ) -> impl IntoResponse {
+    if let Err(e) = crate::config::validation::validate_tunnel(&config) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e.to_string() }))).into_response();
+    }
     match state.tunnel_manager.create_tunnel(config).await {
         Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({ "status": "created" }))).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),

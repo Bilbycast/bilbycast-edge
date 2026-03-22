@@ -16,6 +16,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::models::{AppConfig, FlowConfig, OutputConfig};
 use crate::config::persistence::save_config;
+use crate::config::validation::{validate_config, validate_flow, validate_output, validate_tunnel};
 use crate::engine::manager::FlowManager;
 use crate::tunnel::TunnelConfig;
 use crate::tunnel::manager::TunnelManager;
@@ -540,6 +541,14 @@ async fn execute_command(
         "create_flow" => {
             let flow: FlowConfig = serde_json::from_value(action["flow"].clone())
                 .map_err(|e| format!("Invalid flow config: {e}"))?;
+            validate_flow(&flow).map_err(|e| format!("Invalid flow config: {e}"))?;
+            // Check for duplicate flow ID
+            {
+                let cfg = app_config.read().await;
+                if cfg.flows.iter().any(|f| f.id == flow.id) {
+                    return Err(format!("Duplicate flow ID '{}'", flow.id));
+                }
+            }
             tracing::info!("Manager command: create flow '{}'", flow.id);
             flow_manager
                 .create_flow(flow.clone())
@@ -554,6 +563,7 @@ async fn execute_command(
         "update_flow" => {
             let flow: FlowConfig = serde_json::from_value(action["flow"].clone())
                 .map_err(|e| format!("Invalid flow config: {e}"))?;
+            validate_flow(&flow).map_err(|e| format!("Invalid flow config: {e}"))?;
             let flow_id = action["flow_id"]
                 .as_str()
                 .unwrap_or(&flow.id);
@@ -636,6 +646,7 @@ async fn execute_command(
             let output: OutputConfig =
                 serde_json::from_value(action["output"].clone())
                     .map_err(|e| format!("Invalid output config: {e}"))?;
+            validate_output(&output).map_err(|e| format!("Invalid output config: {e}"))?;
             tracing::info!("Manager command: add output to flow '{flow_id}'");
             flow_manager
                 .add_output(flow_id, output.clone())
@@ -668,6 +679,7 @@ async fn execute_command(
         "create_tunnel" => {
             let tunnel: TunnelConfig = serde_json::from_value(action["tunnel"].clone())
                 .map_err(|e| format!("Invalid tunnel config: {e}"))?;
+            validate_tunnel(&tunnel).map_err(|e| format!("Invalid tunnel config: {e}"))?;
             tracing::info!("Manager command: create tunnel '{}'", tunnel.id);
             tunnel_manager
                 .create_tunnel(tunnel.clone())
@@ -690,6 +702,45 @@ async fn execute_command(
             let mut cfg = app_config.write().await;
             cfg.tunnels.retain(|t| t.id != tunnel_id);
             persist_config(&cfg, config_path);
+            Ok(())
+        }
+        "update_config" => {
+            let new_config: AppConfig = serde_json::from_value(action["config"].clone())
+                .map_err(|e| format!("Invalid config: {e}"))?;
+            validate_config(&new_config).map_err(|e| format!("Invalid config: {e}"))?;
+            tracing::info!("Manager command: update_config");
+
+            // Stop all existing flows
+            flow_manager.stop_all().await;
+            // Stop all existing tunnels
+            tunnel_manager.stop_all().await;
+
+            // Apply new config
+            {
+                let mut cfg = app_config.write().await;
+                cfg.flows = new_config.flows.clone();
+                cfg.tunnels = new_config.tunnels.clone();
+                cfg.server = new_config.server.clone();
+                cfg.monitor = new_config.monitor.clone();
+                persist_config(&cfg, config_path);
+            }
+
+            // Start enabled flows from new config
+            for flow in &new_config.flows {
+                if flow.enabled {
+                    if let Err(e) = flow_manager.create_flow(flow.clone()).await {
+                        tracing::warn!("Failed to start flow '{}' after config update: {e}", flow.id);
+                    }
+                }
+            }
+
+            // Start tunnels from new config
+            for tunnel in &new_config.tunnels {
+                if let Err(e) = tunnel_manager.create_tunnel(tunnel.clone()).await {
+                    tracing::warn!("Failed to start tunnel '{}' after config update: {e}", tunnel.id);
+                }
+            }
+
             Ok(())
         }
         _ => Err(format!("Unknown command: {action_type}")),

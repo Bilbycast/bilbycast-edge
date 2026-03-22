@@ -92,8 +92,14 @@ pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
     if flow.id.is_empty() {
         bail!("Flow ID cannot be empty");
     }
+    if flow.id.len() > 64 {
+        bail!("Flow ID must be at most 64 characters");
+    }
     if flow.name.is_empty() {
         bail!("Flow name cannot be empty");
+    }
+    if flow.name.len() > 256 {
+        bail!("Flow name must be at most 256 characters");
     }
 
     validate_input(&flow.input)?;
@@ -150,6 +156,9 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                 if rate <= 0.0 {
                     bail!("RTP input max_bitrate_mbps must be positive, got {rate}");
                 }
+                if rate > 10_000.0 {
+                    bail!("RTP input max_bitrate_mbps must be at most 10000 (10 Gbps), got {rate}");
+                }
             }
         }
         InputConfig::Srt(srt) => {
@@ -170,7 +179,35 @@ fn validate_input(input: &InputConfig) -> Result<()> {
             if rtmp.app.is_empty() {
                 bail!("RTMP input app name must not be empty");
             }
+            if rtmp.app.len() > 64 {
+                bail!("RTMP input app name must be at most 64 characters");
+            }
+            if let Some(ref key) = rtmp.stream_key {
+                if key.len() > 256 {
+                    bail!("RTMP input stream_key must be at most 256 characters");
+                }
+            }
         }
+    }
+    Ok(())
+}
+
+fn validate_id(id: &str, context: &str) -> Result<()> {
+    if id.is_empty() {
+        bail!("{context} ID cannot be empty");
+    }
+    if id.len() > 64 {
+        bail!("{context} ID must be at most 64 characters");
+    }
+    Ok(())
+}
+
+fn validate_name(name: &str, context: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("{context} name cannot be empty");
+    }
+    if name.len() > 256 {
+        bail!("{context} name must be at most 256 characters");
     }
     Ok(())
 }
@@ -192,9 +229,8 @@ fn validate_input(input: &InputConfig) -> Result<()> {
 pub fn validate_output(output: &OutputConfig) -> Result<()> {
     match output {
         OutputConfig::Rtp(rtp) => {
-            if rtp.id.is_empty() {
-                bail!("RTP output ID cannot be empty");
-            }
+            validate_id(&rtp.id, "RTP output")?;
+            validate_name(&rtp.name, "RTP output")?;
             validate_socket_addr(&rtp.dest_addr, "RTP output dest_addr")?;
             if let Some(ref bind) = rtp.bind_addr {
                 validate_socket_addr(bind, "RTP output bind_addr")?;
@@ -213,9 +249,8 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
             }
         }
         OutputConfig::Srt(srt) => {
-            if srt.id.is_empty() {
-                bail!("SRT output ID cannot be empty");
-            }
+            validate_id(&srt.id, "SRT output")?;
+            validate_name(&srt.name, "SRT output")?;
             validate_socket_addr(&srt.local_addr, "SRT output local_addr")?;
             validate_srt_common(
                 &srt.mode,
@@ -229,25 +264,37 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
             }
         }
         OutputConfig::Rtmp(rtmp) => {
-            if rtmp.id.is_empty() {
-                bail!("RTMP output ID cannot be empty");
-            }
+            validate_id(&rtmp.id, "RTMP output")?;
+            validate_name(&rtmp.name, "RTMP output")?;
             if !rtmp.dest_url.starts_with("rtmp://") && !rtmp.dest_url.starts_with("rtmps://") {
                 bail!("RTMP output '{}': dest_url must start with rtmp:// or rtmps://", rtmp.id);
             }
+            if rtmp.dest_url.len() > 2048 {
+                bail!("RTMP output '{}': dest_url must be at most 2048 characters", rtmp.id);
+            }
             if rtmp.stream_key.is_empty() {
                 bail!("RTMP output '{}': stream_key cannot be empty", rtmp.id);
+            }
+            if rtmp.stream_key.len() > 256 {
+                bail!("RTMP output '{}': stream_key must be at most 256 characters", rtmp.id);
             }
             if rtmp.reconnect_delay_secs == 0 {
                 bail!("RTMP output '{}': reconnect_delay_secs must be > 0", rtmp.id);
             }
         }
         OutputConfig::Hls(hls) => {
-            if hls.id.is_empty() {
-                bail!("HLS output ID cannot be empty");
-            }
+            validate_id(&hls.id, "HLS output")?;
+            validate_name(&hls.name, "HLS output")?;
             if !hls.ingest_url.starts_with("http://") && !hls.ingest_url.starts_with("https://") {
                 bail!("HLS output '{}': ingest_url must start with http:// or https://", hls.id);
+            }
+            if hls.ingest_url.len() > 2048 {
+                bail!("HLS output '{}': ingest_url must be at most 2048 characters", hls.id);
+            }
+            if let Some(ref token) = hls.auth_token {
+                if token.len() > 4096 {
+                    bail!("HLS output '{}': auth_token must be at most 4096 characters", hls.id);
+                }
             }
             if hls.segment_duration_secs < 0.5 || hls.segment_duration_secs > 10.0 {
                 bail!(
@@ -260,11 +307,18 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
             }
         }
         OutputConfig::Webrtc(webrtc) => {
-            if webrtc.id.is_empty() {
-                bail!("WebRTC output ID cannot be empty");
-            }
+            validate_id(&webrtc.id, "WebRTC output")?;
+            validate_name(&webrtc.name, "WebRTC output")?;
             if !webrtc.whip_url.starts_with("http://") && !webrtc.whip_url.starts_with("https://") {
                 bail!("WebRTC output '{}': whip_url must start with http:// or https://", webrtc.id);
+            }
+            if webrtc.whip_url.len() > 2048 {
+                bail!("WebRTC output '{}': whip_url must be at most 2048 characters", webrtc.id);
+            }
+            if let Some(ref token) = webrtc.bearer_token {
+                if token.len() > 4096 {
+                    bail!("WebRTC output '{}': bearer_token must be at most 4096 characters", webrtc.id);
+                }
             }
         }
     }
@@ -389,6 +443,67 @@ fn validate_socket_addr(addr: &str, context: &str) -> Result<()> {
 fn validate_ip_addr(addr: &str, context: &str) -> Result<()> {
     addr.parse::<std::net::IpAddr>()
         .map_err(|e| anyhow::anyhow!("{context}: invalid IP address '{addr}': {e}"))?;
+    Ok(())
+}
+
+/// Validates a tunnel configuration.
+pub fn validate_tunnel(tunnel: &crate::tunnel::TunnelConfig) -> Result<()> {
+    validate_id(&tunnel.id, "Tunnel")?;
+    validate_name(&tunnel.name, "Tunnel")?;
+
+    // Validate local address
+    validate_socket_addr(&tunnel.local_addr, "Tunnel local_addr")?;
+
+    // Mode-specific validation
+    match tunnel.mode {
+        crate::tunnel::config::TunnelMode::Relay => {
+            let relay_addr = tunnel.relay_addr.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Tunnel '{}': relay_addr is required for relay mode", tunnel.id))?;
+            if relay_addr.is_empty() || relay_addr.len() > 256 {
+                bail!("Tunnel '{}': relay_addr must be 1-256 characters", tunnel.id);
+            }
+        }
+        crate::tunnel::config::TunnelMode::Direct => {
+            match tunnel.direction {
+                crate::tunnel::config::TunnelDirection::Egress => {
+                    if tunnel.peer_addr.is_none() {
+                        bail!("Tunnel '{}': peer_addr is required for direct egress", tunnel.id);
+                    }
+                }
+                crate::tunnel::config::TunnelDirection::Ingress => {
+                    if tunnel.direct_listen_addr.is_none() {
+                        bail!("Tunnel '{}': direct_listen_addr is required for direct ingress", tunnel.id);
+                    }
+                }
+            }
+        }
+    }
+
+    // Validate optional string field lengths
+    if let Some(ref s) = tunnel.relay_edge_id {
+        if s.len() > 256 {
+            bail!("Tunnel '{}': relay_edge_id must be at most 256 characters", tunnel.id);
+        }
+    }
+    if let Some(ref s) = tunnel.relay_secret {
+        if s.len() > 256 {
+            bail!("Tunnel '{}': relay_secret must be at most 256 characters", tunnel.id);
+        }
+    }
+    if let Some(ref s) = tunnel.tunnel_psk {
+        if s.len() > 256 {
+            bail!("Tunnel '{}': tunnel_psk must be at most 256 characters", tunnel.id);
+        }
+    }
+    if let Some(ref addr) = tunnel.peer_addr {
+        if addr.len() > 256 {
+            bail!("Tunnel '{}': peer_addr must be at most 256 characters", tunnel.id);
+        }
+    }
+    if let Some(ref addr) = tunnel.direct_listen_addr {
+        validate_socket_addr(addr, &format!("Tunnel '{}' direct_listen_addr", tunnel.id))?;
+    }
+
     Ok(())
 }
 

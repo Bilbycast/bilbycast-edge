@@ -117,6 +117,15 @@ Four security layers, from outermost to innermost:
 
 SRT uses AES-128/192/256 encryption + passphrase auth. Tunnels use QUIC/TLS 1.3 + HMAC-SHA256 tokens.
 
+**Input validation** (`src/config/validation.rs`): All configs are validated at load time and when received via manager WebSocket commands. Validation includes:
+- String length limits: IDs max 64 chars, names max 256 chars, URLs max 2048 chars, tokens max 4096 chars
+- Socket address parsing, address family consistency, DSCP 0-63, FEC params bounded
+- SRT passphrase 10-79 chars, AES key length 16/24/32, mode-specific field requirements
+- RTP bitrate limit max 10 Gbps, HLS segments 0.5-10s, RTMP URL scheme validation
+- Tunnel config: mode-specific required fields, address validation, PSK length limits
+- **Manager commands are validated before execution** — `create_flow`, `update_flow`, `add_output`, `update_config`, and `create_tunnel` all call their respective validation functions after deserialization
+- Duplicate flow ID detection on create
+
 **Manager connection**: The WebSocket client to bilbycast-manager enforces `wss://` (TLS). Plaintext `ws://` URLs are rejected at connection time. Set `accept_self_signed_cert: true` in the `manager` config section to accept self-signed certificates (dev/testing only).
 
 ### API Structure (`src/api/server.rs`)
@@ -152,7 +161,7 @@ pub fn spawn_xxx_output(
 
 ## Configuration
 
-Full reference in `docs/CONFIGURATION.md`. Config is JSON with enum-tagged input/output types (e.g., `"type": "srt"`, `"mode": "caller"`). Validation runs at load time, not per-packet.
+Full reference in `docs/CONFIGURATION.md`. Config is JSON with enum-tagged input/output types (e.g., `"type": "srt"`, `"mode": "caller"`). Validation runs at load time and on every manager command — not per-packet. When adding new config fields, always add validation in `src/config/validation.rs`.
 
 ## Key Design Constraints
 
