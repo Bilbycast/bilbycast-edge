@@ -18,6 +18,7 @@
 
 pub mod flow;
 pub mod input_rtmp;
+pub mod media_analysis;
 pub mod input_rtp;
 pub mod input_srt;
 pub mod manager;
@@ -29,3 +30,4 @@ pub mod output_webrtc;
 pub mod packet;
 pub mod rtmp;
 pub mod tr101290;
+pub mod ts_parse;

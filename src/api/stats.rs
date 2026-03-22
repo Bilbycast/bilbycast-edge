@@ -446,6 +446,58 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
             }
         }
 
+        // Media analysis metrics
+        for fs in &flow_snapshots {
+            if let Some(ref ma) = fs.media_analysis {
+                for v in &ma.video_streams {
+                    output.push_str(&format!(
+                        "bilbycast_edge_media_video_info{{flow_id=\"{}\",pid=\"0x{:04X}\",codec=\"{}\",resolution=\"{}\",profile=\"{}\",level=\"{}\"}} 1\n",
+                        fs.flow_id,
+                        v.pid,
+                        v.codec,
+                        v.resolution.as_deref().unwrap_or("unknown"),
+                        v.profile.as_deref().unwrap_or("unknown"),
+                        v.level.as_deref().unwrap_or("unknown"),
+                    ));
+                    if let Some(fps) = v.frame_rate {
+                        output.push_str(&format!(
+                            "bilbycast_edge_media_video_framerate{{flow_id=\"{}\",pid=\"0x{:04X}\"}} {:.2}\n",
+                            fs.flow_id, v.pid, fps
+                        ));
+                    }
+                    if v.bitrate_bps > 0 {
+                        output.push_str(&format!(
+                            "bilbycast_edge_media_pid_bitrate_bps{{flow_id=\"{}\",pid=\"0x{:04X}\",type=\"video\"}} {}\n",
+                            fs.flow_id, v.pid, v.bitrate_bps
+                        ));
+                    }
+                }
+                for a in &ma.audio_streams {
+                    output.push_str(&format!(
+                        "bilbycast_edge_media_audio_info{{flow_id=\"{}\",pid=\"0x{:04X}\",codec=\"{}\",sample_rate=\"{}\",channels=\"{}\"{}}} 1\n",
+                        fs.flow_id,
+                        a.pid,
+                        a.codec,
+                        a.sample_rate_hz.map(|r| r.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                        a.channels.map(|c| c.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                        a.language.as_ref().map(|l| format!(",language=\"{}\"", l)).unwrap_or_default(),
+                    ));
+                    if a.bitrate_bps > 0 {
+                        output.push_str(&format!(
+                            "bilbycast_edge_media_pid_bitrate_bps{{flow_id=\"{}\",pid=\"0x{:04X}\",type=\"audio\"}} {}\n",
+                            fs.flow_id, a.pid, a.bitrate_bps
+                        ));
+                    }
+                }
+                if ma.total_bitrate_bps > 0 {
+                    output.push_str(&format!(
+                        "bilbycast_edge_media_total_bitrate_bps{{flow_id=\"{}\"}} {}\n",
+                        fs.flow_id, ma.total_bitrate_bps
+                    ));
+                }
+            }
+        }
+
         output.push_str("\n# HELP bilbycast_edge_srt_loss_total SRT total packet loss\n");
         output.push_str("# TYPE bilbycast_edge_srt_loss_total counter\n");
         for fs in &flow_snapshots {

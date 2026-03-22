@@ -72,6 +72,7 @@ mod tests {
                 id: "test".to_string(),
                 name: "Test".to_string(),
                 enabled: true,
+                media_analysis: true,
                 input: InputConfig::Rtp(RtpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
                     interface_addr: None,

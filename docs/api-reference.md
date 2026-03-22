@@ -711,6 +711,37 @@ Retrieve aggregated system-wide and per-flow statistics. Running flows include l
           "tr07_compliant": false,
           "jpeg_xs_pid": null
         },
+        "media_analysis": {
+          "protocol": "srt",
+          "payload_format": "raw_ts",
+          "fec": null,
+          "redundancy": null,
+          "program_count": 1,
+          "video_streams": [
+            {
+              "pid": 256,
+              "codec": "H.264/AVC",
+              "stream_type": 27,
+              "resolution": "1920x1080",
+              "frame_rate": 29.97,
+              "profile": "High",
+              "level": "4.0",
+              "bitrate_bps": 5000000
+            }
+          ],
+          "audio_streams": [
+            {
+              "pid": 257,
+              "codec": "AAC-LC",
+              "stream_type": 15,
+              "sample_rate_hz": 48000,
+              "channels": 2,
+              "language": "eng",
+              "bitrate_bps": 128000
+            }
+          ],
+          "total_bitrate_bps": 5200000
+        },
         "iat": {
           "min_us": 120.5,
           "max_us": 180.3,
@@ -744,6 +775,7 @@ Retrieve aggregated system-wide and per-flow statistics. Running flows include l
 | `input` | object | Input leg statistics (see below) |
 | `outputs` | array | Per-output statistics (see below) |
 | `tr101290` | object/null | TR-101290 analysis (present when running) |
+| `media_analysis` | object/null | Media content analysis — codec, resolution, frame rate, audio format, per-PID bitrate (present when running and `media_analysis` config is `true`) |
 | `iat` | object/null | Inter-arrival time stats in microseconds |
 | `pdv_jitter_us` | float/null | Packet delivery variation (jitter) in microseconds |
 
@@ -987,6 +1019,16 @@ Prometheus-compatible metrics endpoint. Returns metrics in the Prometheus text e
 | `bilbycast_edge_tr101290_tei_errors_total` | counter | Transport error indicator errors |
 | `bilbycast_edge_tr101290_pcr_discontinuity_errors_total` | counter | PCR discontinuity errors |
 | `bilbycast_edge_tr101290_pcr_accuracy_errors_total` | counter | PCR accuracy errors |
+
+**Media analysis metrics** (labeled by `flow_id` and `pid`):
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `bilbycast_edge_media_video_info` | info | Video stream info (labels: `codec`, `resolution`, `profile`, `level`) |
+| `bilbycast_edge_media_video_framerate` | gauge | Video frame rate in fps |
+| `bilbycast_edge_media_audio_info` | info | Audio stream info (labels: `codec`, `sample_rate`, `channels`, `language`) |
+| `bilbycast_edge_media_pid_bitrate_bps` | gauge | Per-PID bitrate in bits/sec (label: `type` = `video` or `audio`) |
+| `bilbycast_edge_media_total_bitrate_bps` | gauge | Total TS bitrate in bits/sec |
 
 Only metrics for currently running flows are emitted.
 

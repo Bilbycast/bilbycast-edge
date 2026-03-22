@@ -17,14 +17,9 @@ use tokio_util::sync::CancellationToken;
 use crate::stats::collector::{PcrState, Tr101290Accumulator};
 
 use super::packet::RtpPacket;
+use super::ts_parse::*;
 
 // ── Constants ──────────────────────────────────────────────────────────────
-
-const TS_PACKET_SIZE: usize = 188;
-const TS_SYNC_BYTE: u8 = 0x47;
-const RTP_HEADER_MIN_SIZE: usize = 12;
-const PAT_PID: u16 = 0x0000;
-const NULL_PID: u16 = 0x1FFF;
 
 /// Number of consecutive bad sync bytes before declaring sync loss.
 const SYNC_LOSS_THRESHOLD: u32 = 5;
@@ -38,122 +33,6 @@ const PCR_JITTER_THRESHOLD_NS: u64 = 500;
 
 /// PAT / PMT must appear at least every 500 ms per TR-101290.
 const PAT_PMT_TIMEOUT: Duration = Duration::from_millis(500);
-
-// ── TS Packet Parsing (inline, zero-allocation) ───────────────────────────
-
-#[inline(always)]
-fn ts_pid(pkt: &[u8]) -> u16 {
-    ((pkt[1] as u16 & 0x1F) << 8) | pkt[2] as u16
-}
-
-#[inline(always)]
-fn ts_tei(pkt: &[u8]) -> bool {
-    (pkt[1] & 0x80) != 0
-}
-
-#[inline(always)]
-fn ts_pusi(pkt: &[u8]) -> bool {
-    (pkt[1] & 0x40) != 0
-}
-
-#[inline(always)]
-fn ts_cc(pkt: &[u8]) -> u8 {
-    pkt[3] & 0x0F
-}
-
-#[inline(always)]
-fn ts_adaptation_field_control(pkt: &[u8]) -> u8 {
-    (pkt[3] >> 4) & 0x03
-}
-
-#[inline(always)]
-fn ts_has_payload(pkt: &[u8]) -> bool {
-    ts_adaptation_field_control(pkt) & 0x01 != 0
-}
-
-#[inline(always)]
-fn ts_has_adaptation(pkt: &[u8]) -> bool {
-    ts_adaptation_field_control(pkt) & 0x02 != 0
-}
-
-/// Extract the 42-bit PCR base and 9-bit extension from the adaptation field,
-/// returning the full PCR value in 27 MHz ticks.
-fn extract_pcr(pkt: &[u8]) -> Option<u64> {
-    if !ts_has_adaptation(pkt) {
-        return None;
-    }
-    let af_len = pkt[4] as usize;
-    if af_len < 7 {
-        return None; // Need flags byte + 6 PCR bytes
-    }
-    let flags = pkt[5];
-    if flags & 0x10 == 0 {
-        return None; // PCR flag not set
-    }
-    // PCR bytes start at offset 6 in the TS packet
-    let base = ((pkt[6] as u64) << 25)
-        | ((pkt[7] as u64) << 17)
-        | ((pkt[8] as u64) << 9)
-        | ((pkt[9] as u64) << 1)
-        | ((pkt[10] as u64) >> 7);
-    let ext = (((pkt[10] & 0x01) as u64) << 8) | (pkt[11] as u64);
-    Some(base * 300 + ext)
-}
-
-/// Parse a single-packet PAT to extract PMT PIDs.
-///
-/// Returns a list of PMT PIDs found in the PAT section. Skips the NIT
-/// reference (program_number 0). Only processes PATs that start in this
-/// packet (PUSI set).
-fn parse_pat_pmt_pids(pkt: &[u8]) -> Vec<u16> {
-    let mut pids = Vec::new();
-
-    if !ts_pusi(pkt) {
-        return pids;
-    }
-
-    // Find payload start offset
-    let mut offset = 4;
-    if ts_has_adaptation(pkt) {
-        let af_len = pkt[4] as usize;
-        offset = 5 + af_len;
-    }
-    if offset >= TS_PACKET_SIZE {
-        return pids;
-    }
-
-    // pointer_field: number of bytes before section start
-    let pointer = pkt[offset] as usize;
-    offset += 1 + pointer;
-
-    // PAT section header: table_id(1) + flags+length(2) + ts_id(2) +
-    // version/cni(1) + section_number(1) + last_section(1) = 8 bytes
-    if offset + 8 > TS_PACKET_SIZE {
-        return pids;
-    }
-    let table_id = pkt[offset];
-    if table_id != 0x00 {
-        return pids; // Not a PAT
-    }
-    let section_length =
-        (((pkt[offset + 1] & 0x0F) as usize) << 8) | (pkt[offset + 2] as usize);
-    let data_start = offset + 8;
-    // section_length includes 4-byte CRC at end
-    let data_end = (offset + 3 + section_length).min(TS_PACKET_SIZE).saturating_sub(4);
-
-    let mut pos = data_start;
-    while pos + 4 <= data_end {
-        let program_number = ((pkt[pos] as u16) << 8) | pkt[pos + 1] as u16;
-        let pid = ((pkt[pos + 2] as u16 & 0x1F) << 8) | pkt[pos + 3] as u16;
-        if program_number != 0 {
-            // program_number 0 is NIT PID, skip it
-            pids.push(pid);
-        }
-        pos += 4;
-    }
-
-    pids
-}
 
 // ── Analyzer Task ──────────────────────────────────────────────────────────
 
@@ -214,28 +93,10 @@ async fn tr101290_analyzer_loop(
 /// Handles both RTP-wrapped TS (strip RTP header first) and raw TS
 /// (process bytes directly).
 fn process_rtp_packet(packet: &RtpPacket, stats: &Tr101290Accumulator) {
-    let data = &packet.data;
-
-    // Determine payload start based on packet format
-    let payload = if packet.is_raw_ts {
-        // Raw TS: entire data is TS packets, no RTP header to strip
-        &data[..]
-    } else {
-        // RTP/TS: strip RTP header to get to TS payload
-        if data.len() < RTP_HEADER_MIN_SIZE {
-            return;
-        }
-        let cc_count = (data[0] & 0x0F) as usize;
-        let has_extension = (data[0] & 0x10) != 0;
-        let mut rtp_header_len = RTP_HEADER_MIN_SIZE + cc_count * 4;
-
-        if has_extension && data.len() > rtp_header_len + 4 {
-            let ext_len =
-                ((data[rtp_header_len + 2] as usize) << 8 | data[rtp_header_len + 3] as usize) * 4;
-            rtp_header_len += 4 + ext_len;
-        }
-        &data[rtp_header_len..]
-    };
+    let payload = strip_rtp_header(packet);
+    if payload.is_empty() {
+        return;
+    }
     let now = Instant::now();
 
     let mut state = stats.state.lock().unwrap();

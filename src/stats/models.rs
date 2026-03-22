@@ -26,6 +26,9 @@ pub struct FlowStats {
     /// Packet delivery variation / jitter in microseconds (RP 2129 U2/M3).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pdv_jitter_us: Option<f64>,
+    /// Media content analysis (codec, resolution, frame rate, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_analysis: Option<MediaAnalysisStats>,
 }
 
 /// Inter-arrival time statistics (microseconds).
@@ -227,4 +230,100 @@ pub struct SrtLegStats {
     pub pkt_retransmit_total: i32,
     /// Milliseconds since the SRT socket was connected (socket uptime).
     pub uptime_ms: i64,
+}
+
+// ── Media Analysis ────────────────────────────────────────────────────────
+
+/// Media content analysis statistics for a single flow.
+///
+/// Reports detected codecs, resolution, frame rate, audio format, and
+/// transport-level features (FEC, redundancy) derived from MPEG-TS PSI
+/// tables and elementary stream headers.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct MediaAnalysisStats {
+    /// Transport protocol: "rtp", "srt", "rtmp".
+    pub protocol: String,
+    /// Payload format: "rtp_ts" or "raw_ts".
+    pub payload_format: String,
+    /// FEC information (if configured).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fec: Option<FecInfo>,
+    /// Redundancy information (if configured).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<RedundancyInfo>,
+    /// Number of MPEG-TS programs detected in PAT.
+    pub program_count: u16,
+    /// Detected video elementary streams.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub video_streams: Vec<VideoStreamInfo>,
+    /// Detected audio elementary streams.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub audio_streams: Vec<AudioStreamInfo>,
+    /// Aggregate TS bitrate in bits per second.
+    pub total_bitrate_bps: u64,
+}
+
+/// FEC configuration information.
+#[derive(Debug, Clone, Serialize)]
+pub struct FecInfo {
+    /// FEC standard, e.g. "SMPTE 2022-1".
+    pub standard: String,
+    /// Column count (L parameter).
+    pub columns: u8,
+    /// Row count (D parameter).
+    pub rows: u8,
+}
+
+/// Redundancy configuration information.
+#[derive(Debug, Clone, Serialize)]
+pub struct RedundancyInfo {
+    /// Redundancy standard, e.g. "SMPTE 2022-7".
+    pub standard: String,
+}
+
+/// Detected video elementary stream information.
+#[derive(Debug, Clone, Serialize)]
+pub struct VideoStreamInfo {
+    /// MPEG-TS PID of this video elementary stream.
+    pub pid: u16,
+    /// Human-readable codec name, e.g. "H.264/AVC", "H.265/HEVC", "JPEG XS".
+    pub codec: String,
+    /// MPEG-TS stream_type value from PMT.
+    pub stream_type: u8,
+    /// Detected resolution, e.g. "1920x1080".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    /// Detected frame rate in frames per second.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_rate: Option<f64>,
+    /// Codec profile, e.g. "High", "Main".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Codec level, e.g. "4.0", "5.1".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    /// Estimated bitrate for this PID in bits per second.
+    pub bitrate_bps: u64,
+}
+
+/// Detected audio elementary stream information.
+#[derive(Debug, Clone, Serialize)]
+pub struct AudioStreamInfo {
+    /// MPEG-TS PID of this audio elementary stream.
+    pub pid: u16,
+    /// Human-readable codec name, e.g. "AAC-LC", "AC-3", "E-AC-3".
+    pub codec: String,
+    /// MPEG-TS stream_type value from PMT.
+    pub stream_type: u8,
+    /// Sample rate in Hz, e.g. 48000.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_rate_hz: Option<u32>,
+    /// Number of audio channels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u8>,
+    /// ISO 639 language code, e.g. "eng", "fra".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Estimated bitrate for this PID in bits per second.
+    pub bitrate_bps: u64,
 }

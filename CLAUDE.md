@@ -68,6 +68,7 @@ FlowManager (DashMap)
         │                      └─► Output-N
         │
         ├─ TR-101290 Analyzer (independent subscriber)
+        ├─ Media Analyzer (independent subscriber, toggleable per-flow)
         ├─ CancellationToken (hierarchical: parent → children)
         └─ StatsAccumulator (AtomicU64 counters, lock-free)
 ```
@@ -87,6 +88,8 @@ All data flows through a single type: `RtpPacket { data: Bytes, sequence_number:
 | `engine/` | `output_rtp.rs`, `output_srt.rs`, `output_rtmp.rs`, `output_hls.rs`, `output_webrtc.rs` | Protocol-specific output tasks |
 | `engine/rtmp/` | `server.rs`, `amf0.rs`, `chunk.rs`, `ts_mux.rs` | RTMP protocol internals, FLV→MPEG-TS |
 | `engine/` | `tr101290.rs` | Transport stream quality analysis (sync, CC, PAT/PMT, PCR) |
+| `engine/` | `media_analysis.rs` | Media content detection (codec, resolution, frame rate, audio format, per-PID bitrate) |
+| `engine/` | `ts_parse.rs` | Shared MPEG-TS packet parsing helpers (used by tr101290 and media_analysis) |
 | `fec/` | `encoder.rs`, `decoder.rs`, `matrix.rs` | SMPTE 2022-1 FEC (XOR column×row) |
 | `redundancy/` | `merger.rs` | SMPTE 2022-7 hitless merge (seq dedup from dual SRT legs) |
 | `api/` | `server.rs`, `auth.rs`, `flows.rs`, `stats.rs`, `tunnels.rs`, `ws.rs`, `nmos.rs`, `nmos_is05.rs` | Axum REST API, OAuth2/JWT, WebSocket stats, NMOS IS-04 Node API, NMOS IS-05 Connection Management |

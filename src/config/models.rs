@@ -95,6 +95,10 @@ pub struct FlowConfig {
     /// Whether this flow should be active on startup
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Enable media content analysis (codec, resolution, frame rate detection).
+    /// Default: true. Set to false to save CPU on resource-constrained devices.
+    #[serde(default = "default_true")]
+    pub media_analysis: bool,
     /// The single input source for this flow
     pub input: InputConfig,
     /// One or more output destinations (fan-out)
@@ -487,6 +491,7 @@ mod tests {
                 id: "test-flow".to_string(),
                 name: "Test Flow".to_string(),
                 enabled: true,
+                media_analysis: true,
                 input: InputConfig::Rtp(RtpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
                     interface_addr: None,

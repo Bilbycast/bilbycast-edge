@@ -19,8 +19,9 @@ use super::output_rtp::spawn_rtp_output;
 use super::output_srt::spawn_srt_output;
 use super::output_webrtc::spawn_webrtc_output;
 use super::packet::{BROADCAST_CHANNEL_CAPACITY, RtpPacket};
+use super::media_analysis::spawn_media_analyzer;
 use super::tr101290::spawn_tr101290_analyzer;
-use crate::stats::collector::Tr101290Accumulator;
+use crate::stats::collector::{MediaAnalysisAccumulator, Tr101290Accumulator};
 
 /// Runtime state for a single media flow (one input, N outputs).
 ///
@@ -68,6 +69,10 @@ pub struct FlowRuntime {
     /// Stored to keep the JoinHandle alive; shutdown uses CancellationToken.
     #[allow(dead_code)]
     pub analyzer_handle: JoinHandle<()>,
+    /// Media analysis task handle (if enabled in config).
+    /// Stored to keep the JoinHandle alive; shutdown uses CancellationToken.
+    #[allow(dead_code)]
+    pub media_analysis_handle: Option<JoinHandle<()>>,
 }
 
 /// Runtime state for a single output within a flow.
@@ -225,6 +230,49 @@ impl FlowRuntime {
             cancel_token.child_token(),
         );
 
+        // Start media analysis (if enabled)
+        let media_analysis_handle = if config.media_analysis {
+            let (protocol, payload_format, fec_enabled, fec_type, redundancy_enabled, redundancy_type) =
+                match &config.input {
+                    InputConfig::Rtp(rtp) => {
+                        let (fec_en, fec_ty) = if let Some(fec) = &rtp.fec_decode {
+                            (true, Some(format!("SMPTE 2022-1 (L={}, D={})", fec.columns, fec.rows)))
+                        } else {
+                            (false, None)
+                        };
+                        ("rtp".to_string(), "rtp_ts".to_string(), fec_en, fec_ty, false, None)
+                    }
+                    InputConfig::Srt(srt) => {
+                        let (red_en, red_ty) = if srt.redundancy.is_some() {
+                            (true, Some("SMPTE 2022-7".to_string()))
+                        } else {
+                            (false, None)
+                        };
+                        ("srt".to_string(), "unknown".to_string(), false, None, red_en, red_ty)
+                    }
+                    InputConfig::Rtmp(_) => {
+                        ("rtmp".to_string(), "raw_ts".to_string(), false, None, false, None)
+                    }
+                };
+            let media_acc = Arc::new(MediaAnalysisAccumulator::new(
+                protocol,
+                payload_format,
+                fec_enabled,
+                fec_type,
+                redundancy_enabled,
+                redundancy_type,
+            ));
+            flow_stats.media_analysis.set(media_acc.clone()).ok();
+            Some(spawn_media_analyzer(
+                &config,
+                &broadcast_tx,
+                media_acc,
+                cancel_token.child_token(),
+            ))
+        } else {
+            None
+        };
+
         // Start output tasks
         let mut output_handles = HashMap::new();
         for output_config in &config.outputs {
@@ -253,6 +301,7 @@ impl FlowRuntime {
             cancel_token,
             stats: flow_stats,
             analyzer_handle,
+            media_analysis_handle,
         })
     }
 

@@ -155,11 +155,12 @@ An array of flow definitions. Each flow has one input and one or more outputs.
 
 | Field     | Type             | Default | Description                              |
 |-----------|------------------|---------|------------------------------------------|
-| `id`      | `string`         | --      | Unique flow identifier                   |
-| `name`    | `string`         | --      | Human-readable name                      |
-| `enabled` | `bool`           | `true`  | Auto-start when the application starts   |
-| `input`   | `InputConfig`    | --      | Single input source                      |
-| `outputs` | `OutputConfig[]` | --      | One or more output destinations          |
+| `id`              | `string`         | --      | Unique flow identifier                   |
+| `name`            | `string`         | --      | Human-readable name                      |
+| `enabled`         | `bool`           | `true`  | Auto-start when the application starts   |
+| `media_analysis`  | `bool`           | `true`  | Enable media content analysis (codec, resolution, frame rate detection). Set to `false` to save CPU on resource-constrained devices. |
+| `input`           | `InputConfig`    | --      | Single input source                      |
+| `outputs`         | `OutputConfig[]` | --      | One or more output destinations          |
 
 ---
 

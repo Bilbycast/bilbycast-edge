@@ -44,6 +44,7 @@
                             │  │  │   │  CancellationToken (parent)    │   │  │  │
                             │  │  │   │  StatsAccumulator (AtomicU64)  │   │  │  │
                             │  │  │   │  TR-101290 Analyzer            │   │  │  │
+                            │  │  │   │  Media Analyzer (toggleable)   │   │  │  │
                             │  │  │   └─────────────────────────────────┘   │  │  │
                             │  │  │                                          │  │  │
                             │  │  └──────────────────────────────────────────┘  │  │
@@ -120,6 +121,10 @@
   │  │  TR-101290   │◀── subscribe() ── (independent quality analyzer)         │
   │  │  Analyzer    │                                                          │
   │  └──────────────┘                                                          │
+  │  ┌──────────────┐                                                          │
+  │  │  Media       │◀── subscribe() ── (codec/resolution/fps detection)       │
+  │  │  Analyzer    │    toggleable per-flow via media_analysis config          │
+  │  └──────────────┘                                                          │
   └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -133,6 +138,7 @@
   │     ├─▶ Flow-1 cancel_token.cancel()
   │     │     ├─▶ input_task (child token) ──▶ exits select! loop
   │     │     ├─▶ tr101290_task (child)    ──▶ exits select! loop
+  │     │     ├─▶ media_analysis (child)  ──▶ exits select! loop (if enabled)
   │     │     ├─▶ output-A (child token)   ──▶ exits select! loop
   │     │     └─▶ output-B (child token)   ──▶ exits select! loop
   │     │

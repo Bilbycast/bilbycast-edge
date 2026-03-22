@@ -224,6 +224,165 @@ impl Tr101290Accumulator {
     }
 }
 
+// ── Media Analysis Accumulator ────────────────────────────────────────────
+
+/// Internal state for media content analysis.
+pub struct MediaAnalysisState {
+    // Transport (set once from config)
+    pub protocol: String,
+    pub payload_format: String,
+    pub fec_enabled: bool,
+    pub fec_type: Option<String>,
+    pub redundancy_enabled: bool,
+    pub redundancy_type: Option<String>,
+    // Parsed from stream
+    pub program_count: u16,
+    pub video_streams: Vec<VideoStreamState>,
+    pub audio_streams: Vec<AudioStreamState>,
+    pub last_pmt_version: Option<u8>,
+    pub detected: bool,
+    // Per-PID byte counters for bitrate estimation
+    pub pid_bytes: HashMap<u16, u64>,
+    pub last_bitrate_calc: Instant,
+    pub pid_bitrates: HashMap<u16, u64>,
+    pub total_bitrate_bps: u64,
+}
+
+/// Internal state for a detected video stream.
+pub struct VideoStreamState {
+    pub pid: u16,
+    pub codec: String,
+    pub stream_type: u8,
+    pub width: Option<u16>,
+    pub height: Option<u16>,
+    pub frame_rate: Option<f64>,
+    pub profile: Option<String>,
+    pub level: Option<String>,
+    pub sps_detected: bool,
+}
+
+/// Internal state for a detected audio stream.
+pub struct AudioStreamState {
+    pub pid: u16,
+    pub codec: String,
+    pub stream_type: u8,
+    pub sample_rate_hz: Option<u32>,
+    pub channels: Option<u8>,
+    pub language: Option<String>,
+    pub header_detected: bool,
+}
+
+/// Media analysis accumulator. The single analyzer task writes to `state`;
+/// the 1/sec snapshot path reads it briefly.
+pub struct MediaAnalysisAccumulator {
+    pub state: Mutex<MediaAnalysisState>,
+}
+
+impl MediaAnalysisAccumulator {
+    pub fn new(
+        protocol: String,
+        payload_format: String,
+        fec_enabled: bool,
+        fec_type: Option<String>,
+        redundancy_enabled: bool,
+        redundancy_type: Option<String>,
+    ) -> Self {
+        Self {
+            state: Mutex::new(MediaAnalysisState {
+                protocol,
+                payload_format,
+                fec_enabled,
+                fec_type,
+                redundancy_enabled,
+                redundancy_type,
+                program_count: 0,
+                video_streams: Vec::new(),
+                audio_streams: Vec::new(),
+                last_pmt_version: None,
+                detected: false,
+                pid_bytes: HashMap::new(),
+                last_bitrate_calc: Instant::now(),
+                pid_bitrates: HashMap::new(),
+                total_bitrate_bps: 0,
+            }),
+        }
+    }
+
+    /// Take a point-in-time snapshot for JSON serialisation.
+    pub fn snapshot(&self) -> MediaAnalysisStats {
+        let state = self.state.lock().unwrap();
+        MediaAnalysisStats {
+            protocol: state.protocol.clone(),
+            payload_format: state.payload_format.clone(),
+            fec: if state.fec_enabled {
+                // Parse fec_type string for L/D params
+                Some(FecInfo {
+                    standard: "SMPTE 2022-1".to_string(),
+                    columns: 0, // filled from config string
+                    rows: 0,
+                })
+            } else {
+                None
+            }.or_else(|| {
+                // Try to parse from fec_type
+                state.fec_type.as_ref().map(|ft| {
+                    // Format: "SMPTE 2022-1 (L=5, D=5)"
+                    let mut cols = 0u8;
+                    let mut rows = 0u8;
+                    if let Some(l_start) = ft.find("L=") {
+                        if let Some(end) = ft[l_start + 2..].find(|c: char| !c.is_ascii_digit()) {
+                            cols = ft[l_start + 2..l_start + 2 + end].parse().unwrap_or(0);
+                        }
+                    }
+                    if let Some(d_start) = ft.find("D=") {
+                        if let Some(end) = ft[d_start + 2..].find(|c: char| !c.is_ascii_digit()) {
+                            rows = ft[d_start + 2..d_start + 2 + end].parse().unwrap_or(0);
+                        }
+                    }
+                    FecInfo { standard: "SMPTE 2022-1".to_string(), columns: cols, rows }
+                })
+            }),
+            redundancy: if state.redundancy_enabled {
+                Some(RedundancyInfo {
+                    standard: state.redundancy_type.clone().unwrap_or_else(|| "SMPTE 2022-7".to_string()),
+                })
+            } else {
+                None
+            },
+            program_count: state.program_count,
+            video_streams: state.video_streams.iter().map(|v| {
+                let bitrate = state.pid_bitrates.get(&v.pid).copied().unwrap_or(0);
+                VideoStreamInfo {
+                    pid: v.pid,
+                    codec: v.codec.clone(),
+                    stream_type: v.stream_type,
+                    resolution: match (v.width, v.height) {
+                        (Some(w), Some(h)) => Some(format!("{}x{}", w, h)),
+                        _ => None,
+                    },
+                    frame_rate: v.frame_rate,
+                    profile: v.profile.clone(),
+                    level: v.level.clone(),
+                    bitrate_bps: bitrate,
+                }
+            }).collect(),
+            audio_streams: state.audio_streams.iter().map(|a| {
+                let bitrate = state.pid_bitrates.get(&a.pid).copied().unwrap_or(0);
+                AudioStreamInfo {
+                    pid: a.pid,
+                    codec: a.codec.clone(),
+                    stream_type: a.stream_type,
+                    sample_rate_hz: a.sample_rate_hz,
+                    channels: a.channels,
+                    language: a.language.clone(),
+                    bitrate_bps: bitrate,
+                }
+            }).collect(),
+            total_bitrate_bps: state.total_bitrate_bps,
+        }
+    }
+}
+
 // ── Per-flow Accumulator ───────────────────────────────────────────────────
 
 /// Per-flow atomic counters for a single media flow (one input, N outputs).
@@ -250,6 +409,8 @@ pub struct FlowStatsAccumulator {
     input_throughput: Mutex<ThroughputEstimator>,
     /// TR-101290 analyzer stats, set once when the flow starts.
     pub tr101290: OnceLock<Arc<Tr101290Accumulator>>,
+    /// Media analysis stats, set once when the flow starts (if enabled).
+    pub media_analysis: OnceLock<Arc<MediaAnalysisAccumulator>>,
     /// Input config metadata for topology display (set once at flow start).
     pub input_config_meta: OnceLock<InputConfigMeta>,
     /// Per-output config metadata for topology display (set once per output).
@@ -297,6 +458,7 @@ impl FlowStatsAccumulator {
             output_stats: DashMap::new(),
             input_throughput: Mutex::new(ThroughputEstimator::new()),
             tr101290: OnceLock::new(),
+            media_analysis: OnceLock::new(),
             input_config_meta: OnceLock::new(),
             output_config_meta: DashMap::new(),
         }
@@ -361,6 +523,8 @@ impl FlowStatsAccumulator {
             })
             .unwrap_or((None, None));
 
+        let media_analysis = self.media_analysis.get().map(|acc| acc.snapshot());
+
         // Derive flow health (RP 2129 M6)
         let packets_lost = self.input_loss.load(Ordering::Relaxed);
         let health = derive_flow_health(input_bitrate, packets_lost, &tr101290_snap);
@@ -396,6 +560,7 @@ impl FlowStatsAccumulator {
             health,
             iat,
             pdv_jitter_us,
+            media_analysis,
         }
     }
 }

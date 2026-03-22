@@ -604,6 +604,56 @@ function render(data) {
       html += '</div></div>';
     }
 
+    // Media Analysis section
+    if (f.media_analysis) {
+      const ma = f.media_analysis;
+      html += '<div class="section"><div class="section-title">Media Analysis</div>';
+      html += '<div class="stats-grid">';
+      html += '<div class="stat"><div class="k">Protocol</div><div class="v">' + esc(ma.protocol || '-').toUpperCase() + '</div></div>';
+      html += '<div class="stat"><div class="k">Payload</div><div class="v">' + esc(ma.payload_format || '-') + '</div></div>';
+      if (ma.fec) {
+        html += '<div class="stat"><div class="k">FEC</div><div class="v" style="color:' + C_GREEN + '">' + esc(ma.fec.standard) + ' (L=' + ma.fec.columns + ', D=' + ma.fec.rows + ')</div></div>';
+      }
+      if (ma.redundancy) {
+        html += '<div class="stat"><div class="k">Redundancy</div><div class="v" style="color:' + C_GREEN + '">' + esc(ma.redundancy.standard) + '</div></div>';
+      }
+      html += '<div class="stat"><div class="k">Programs</div><div class="v">' + (ma.program_count || 0) + '</div></div>';
+      html += '<div class="stat"><div class="k">TS Bitrate</div><div class="v">' + fmt_bitrate(ma.total_bitrate_bps) + '</div></div>';
+      html += '</div>';
+      if (ma.video_streams && ma.video_streams.length > 0) {
+        html += '<div style="margin-top:8px"><div style="font-size:11px;font-weight:600;color:#8b949e;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px">Video Streams</div>';
+        html += '<table><tr><th>PID</th><th>Codec</th><th>Resolution</th><th>Frame Rate</th><th>Profile</th><th>Level</th><th>Bitrate</th></tr>';
+        for (const vs of ma.video_streams) {
+          html += '<tr>';
+          html += '<td>0x' + vs.pid.toString(16).toUpperCase().padStart(4, '0') + '</td>';
+          html += '<td>' + esc(vs.codec) + '</td>';
+          html += '<td>' + esc(vs.resolution || 'detecting...') + '</td>';
+          html += '<td>' + (vs.frame_rate ? vs.frame_rate.toFixed(2) + ' fps' : 'detecting...') + '</td>';
+          html += '<td>' + esc(vs.profile || '-') + '</td>';
+          html += '<td>' + esc(vs.level || '-') + '</td>';
+          html += '<td>' + fmt_bitrate(vs.bitrate_bps) + '</td>';
+          html += '</tr>';
+        }
+        html += '</table></div>';
+      }
+      if (ma.audio_streams && ma.audio_streams.length > 0) {
+        html += '<div style="margin-top:8px"><div style="font-size:11px;font-weight:600;color:#8b949e;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px">Audio Streams</div>';
+        html += '<table><tr><th>PID</th><th>Codec</th><th>Sample Rate</th><th>Channels</th><th>Language</th><th>Bitrate</th></tr>';
+        for (const as1 of ma.audio_streams) {
+          html += '<tr>';
+          html += '<td>0x' + as1.pid.toString(16).toUpperCase().padStart(4, '0') + '</td>';
+          html += '<td>' + esc(as1.codec) + '</td>';
+          html += '<td>' + (as1.sample_rate_hz ? as1.sample_rate_hz + ' Hz' : 'detecting...') + '</td>';
+          html += '<td>' + (as1.channels != null ? as1.channels + ' ch' : '-') + '</td>';
+          html += '<td>' + esc(as1.language || '-') + '</td>';
+          html += '<td>' + fmt_bitrate(as1.bitrate_bps) + '</td>';
+          html += '</tr>';
+        }
+        html += '</table></div>';
+      }
+      html += '</div>';
+    }
+
     // SMPTE Trust Boundary Metrics section
     {
       html += '<div class="section"><div class="section-title">SMPTE Trust Boundary Metrics</div>';
