@@ -231,3 +231,110 @@ pub async fn connect_srt_redundancy_leg(
     )
     .await
 }
+
+// ---------------------------------------------------------------------------
+// Persistent SRT listener helpers
+// ---------------------------------------------------------------------------
+// These functions support the "bind once, accept many" pattern for listener-
+// mode outputs and inputs. Instead of closing the listener after the first
+// accepted connection (which prevents reconnection), the listener is kept
+// alive and `accept_srt_connection` is called each time a new peer connects.
+
+/// Bind an SRT listener without accepting any connection.
+///
+/// Returns the listener which can be used with [`accept_srt_connection`]
+/// to accept connections repeatedly.
+pub async fn bind_srt_listener(
+    local_addr: &str,
+    latency_ms: u64,
+    peer_idle_timeout_secs: u64,
+    passphrase: Option<&str>,
+    aes_key_len: Option<usize>,
+) -> Result<SrtListener> {
+    let local_sa: SocketAddr = local_addr
+        .parse()
+        .context(format!("Invalid local address: {local_addr}"))?;
+
+    let timeout = if peer_idle_timeout_secs == 0 { 30 } else { peer_idle_timeout_secs };
+    let mut listener_builder = SrtListener::builder()
+        .latency(Duration::from_millis(latency_ms))
+        .live_mode()
+        .peer_idle_timeout(Duration::from_secs(timeout));
+
+    if let Some(pass) = passphrase {
+        let key_size = match aes_key_len.unwrap_or(16) {
+            24 => KeySize::AES192,
+            32 => KeySize::AES256,
+            _ => KeySize::AES128,
+        };
+        listener_builder = listener_builder.encryption(pass, key_size);
+    }
+
+    let listener = listener_builder
+        .bind(local_sa)
+        .await
+        .context(format!("SRT listener bind on {local_addr} failed"))?;
+
+    tracing::info!("SRT listener bound on {}", local_addr);
+    Ok(listener)
+}
+
+/// Accept a single incoming SRT connection on an existing listener.
+///
+/// Blocks until a caller connects or the cancellation token fires.
+pub async fn accept_srt_connection(
+    listener: &mut SrtListener,
+    cancel: &CancellationToken,
+) -> Result<Arc<SrtSocket>> {
+    let local_addr = listener.local_addr();
+    tracing::info!("SRT listener waiting for connection on {}", local_addr);
+
+    tokio::select! {
+        _ = cancel.cancelled() => {
+            bail!("SRT accept cancelled");
+        }
+        result = listener.accept() => {
+            let sock = result.context(format!(
+                "SRT listener accept on {} failed", local_addr
+            ))?;
+            tracing::info!("SRT listener accepted connection on {}", local_addr);
+            Ok(Arc::new(sock))
+        }
+    }
+}
+
+/// Bind an SRT listener for an output using [`SrtOutputConfig`] parameters.
+pub async fn bind_srt_listener_for_output(config: &SrtOutputConfig) -> Result<SrtListener> {
+    bind_srt_listener(
+        &config.local_addr,
+        config.latency_ms,
+        config.peer_idle_timeout_secs,
+        config.passphrase.as_deref(),
+        config.aes_key_len,
+    )
+    .await
+}
+
+/// Bind an SRT listener for an input using [`SrtInputConfig`] parameters.
+pub async fn bind_srt_listener_for_input(config: &SrtInputConfig) -> Result<SrtListener> {
+    bind_srt_listener(
+        &config.local_addr,
+        config.latency_ms,
+        config.peer_idle_timeout_secs,
+        config.passphrase.as_deref(),
+        config.aes_key_len,
+    )
+    .await
+}
+
+/// Bind an SRT listener for a redundancy leg using [`SrtRedundancyConfig`] parameters.
+pub async fn bind_srt_listener_for_redundancy(config: &SrtRedundancyConfig) -> Result<SrtListener> {
+    bind_srt_listener(
+        &config.local_addr,
+        config.latency_ms,
+        config.peer_idle_timeout_secs,
+        config.passphrase.as_deref(),
+        config.aes_key_len,
+    )
+    .await
+}

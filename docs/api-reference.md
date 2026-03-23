@@ -25,6 +25,7 @@ All error responses use the same envelope without `data`:
 ## Table of Contents
 
 - [Health](#health)
+- [Setup Wizard](#setup-wizard)
 - [Authentication](#authentication)
 - [Flows](#flows)
 - [Flow Actions](#flow-actions)
@@ -67,6 +68,78 @@ Lightweight health check suitable for load balancers, orchestrators, and monitor
 
 ```bash
 curl http://localhost:8080/health
+```
+
+---
+
+## Setup Wizard
+
+Browser-based initial provisioning for edge nodes deployed on COTS hardware. All setup endpoints are public (no authentication required). Access is controlled by the `setup_enabled` config flag (default: `true`).
+
+### GET /setup
+
+Serves the setup wizard HTML page. Returns the wizard form when `setup_enabled` is true, or a "Setup Disabled" page when false.
+
+### GET /setup/status
+
+Returns the current setup-relevant configuration as JSON for pre-filling the form.
+
+**Response:**
+
+```json
+{
+  "listen_addr": "0.0.0.0",
+  "listen_port": 8080,
+  "manager_url": null,
+  "accept_self_signed_cert": false,
+  "registration_token": null,
+  "device_name": null,
+  "setup_enabled": true
+}
+```
+
+### POST /setup
+
+Validates and saves setup configuration. Returns 403 if `setup_enabled` is false.
+
+**Request body:**
+
+```json
+{
+  "listen_addr": "0.0.0.0",
+  "listen_port": 8080,
+  "manager_url": "wss://manager.example.com:8443/ws/node",
+  "accept_self_signed_cert": false,
+  "registration_token": "token-from-manager",
+  "device_name": "Studio-A Encoder"
+}
+```
+
+| Field | Type | Required | Constraints |
+|-------|------|----------|-------------|
+| `listen_addr` | `string` | No | API server bind address |
+| `listen_port` | `u16` | No | 1-65535 |
+| `manager_url` | `string` | Yes | Must start with `wss://`, max 2048 chars |
+| `accept_self_signed_cert` | `bool` | No | Default: false |
+| `registration_token` | `string` | No | Max 4096 chars |
+| `device_name` | `string` | No | Max 256 chars |
+
+**Success response (200):**
+
+```json
+{
+  "success": true,
+  "message": "Configuration saved. Restart the bilbycast-edge service to apply the new settings."
+}
+```
+
+**Error response (400/403):**
+
+```json
+{
+  "success": false,
+  "error": "Manager URL must start with wss:// (TLS required)"
+}
 ```
 
 ---
@@ -783,7 +856,7 @@ Retrieve aggregated system-wide and per-flow statistics. Running flows include l
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `input_type` | string | `"udp"` or `"srt"` |
+| `input_type` | string | `"rtp"`, `"srt"`, `"rtmp"`, `"rtsp"`, `"webrtc"`, or `"whep"` |
 | `state` | string | Connection state (e.g., `"receiving"`, `"connecting"`) |
 | `packets_received` | integer | Total RTP packets received |
 | `bytes_received` | integer | Total bytes received |
@@ -1163,6 +1236,10 @@ All API errors return a JSON body with `"success": false` and an `"error"` messa
 | POST | `/api/v1/flows/{flow_id}/restart` | Yes | admin | Restart flow |
 | POST | `/api/v1/flows/{flow_id}/outputs` | Yes | admin | Add output |
 | DELETE | `/api/v1/flows/{flow_id}/outputs/{output_id}` | Yes | admin | Remove output |
+| POST | `/api/v1/flows/{flow_id}/whip` | Yes | admin | WHIP: Accept WebRTC publisher (SDP offer → answer) |
+| DELETE | `/api/v1/flows/{flow_id}/whip/{session_id}` | Yes | admin | WHIP: Disconnect publisher |
+| POST | `/api/v1/flows/{flow_id}/whep` | Yes | admin | WHEP: Accept WebRTC viewer (SDP offer → answer) |
+| DELETE | `/api/v1/flows/{flow_id}/whep/{session_id}` | Yes | admin | WHEP: Disconnect viewer |
 | GET | `/api/v1/stats` | Yes | any | All statistics |
 | GET | `/api/v1/stats/{flow_id}` | Yes | any | Single flow stats |
 | GET | `/api/v1/config` | Yes | any | Get running config |

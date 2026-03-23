@@ -26,8 +26,10 @@ const PMT_PID: u16 = 0x1000;
 const VIDEO_PID: u16 = 0x0100;
 const AUDIO_PID: u16 = 0x0101;
 
-/// H.264 stream type in PMT.
+/// H.264 stream type in PMT (ISO 14496-10).
 const STREAM_TYPE_H264: u8 = 0x1B;
+/// H.265/HEVC stream type in PMT (ITU-T H.265).
+pub const STREAM_TYPE_H265: u8 = 0x24;
 /// AAC stream type in PMT (ISO 13818-7).
 const STREAM_TYPE_AAC: u8 = 0x0F;
 
@@ -38,10 +40,17 @@ pub struct TsMuxer {
     cc_pmt: u8,
     cc_video: u8,
     cc_audio: u8,
-    /// Whether we've sent the initial PAT/PMT.
+    /// Whether the stream includes video (affects PMT content).
+    has_video: bool,
+    /// Whether the stream includes audio (affects PMT content).
     has_audio: bool,
-    /// PAT/PMT interval counter (send every N video frames).
+    /// Video stream type for PMT (H.264=0x1B, H.265=0x24).
+    video_stream_type: u8,
+    /// Frame counter for periodic PAT/PMT emission.
+    /// Counts across both video and audio frames.
     pat_pmt_counter: u32,
+    /// Whether PAT/PMT have been emitted at least once.
+    pat_pmt_sent: bool,
 }
 
 impl TsMuxer {
@@ -51,9 +60,17 @@ impl TsMuxer {
             cc_pmt: 0,
             cc_video: 0,
             cc_audio: 0,
+            has_video: true,
             has_audio: false,
+            video_stream_type: STREAM_TYPE_H264,
             pat_pmt_counter: 0,
+            pat_pmt_sent: false,
         }
+    }
+
+    /// Set whether the stream has video (affects PMT).
+    pub fn set_has_video(&mut self, has: bool) {
+        self.has_video = has;
     }
 
     /// Set whether the stream has audio (affects PMT).
@@ -61,20 +78,44 @@ impl TsMuxer {
         self.has_audio = has;
     }
 
+    /// Set the video stream type for PMT (default: H.264 = 0x1B).
+    /// Use `0x24` for H.265/HEVC.
+    pub fn set_video_stream_type(&mut self, stream_type: u8) {
+        self.video_stream_type = stream_type;
+    }
+
+    /// Emit PAT and PMT packets if needed.
+    ///
+    /// PAT/PMT are emitted:
+    /// - On the very first frame (audio or video) to ensure players can
+    ///   discover the program structure immediately.
+    /// - Before every video keyframe (IDR) for fast channel-change.
+    /// - Every 40 frames (~1.3s at 30fps, well within the TR-101290
+    ///   500ms requirement for typical frame rates).
+    ///
+    /// This is called from both `mux_video()` and `mux_audio()` so that
+    /// audio-only streams (e.g., RTSP cameras sending H.265 video that
+    /// we don't yet decode) still get valid program tables.
+    fn maybe_emit_pat_pmt(&mut self, force: bool) -> Vec<Bytes> {
+        self.pat_pmt_counter += 1;
+        if force || !self.pat_pmt_sent || self.pat_pmt_counter >= 40 {
+            self.pat_pmt_counter = 0;
+            self.pat_pmt_sent = true;
+            vec![
+                Bytes::from(self.build_pat()),
+                Bytes::from(self.build_pmt()),
+            ]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Mux a video access unit (H.264 NALUs in Annex B format) into TS packets.
     ///
     /// `dts_90khz` and `pts_90khz` are in 90kHz clock units.
     /// `is_keyframe` indicates if this is an IDR frame (prepend PAT/PMT + PCR).
     pub fn mux_video(&mut self, annex_b_data: &[u8], pts_90khz: u64, dts_90khz: u64, is_keyframe: bool) -> Vec<Bytes> {
-        let mut packets = Vec::new();
-
-        // Send PAT/PMT before keyframes or every 40 frames (~1.3s at 30fps)
-        self.pat_pmt_counter += 1;
-        if is_keyframe || self.pat_pmt_counter >= 40 {
-            self.pat_pmt_counter = 0;
-            packets.push(Bytes::from(self.build_pat()));
-            packets.push(Bytes::from(self.build_pmt()));
-        }
+        let mut packets = self.maybe_emit_pat_pmt(is_keyframe);
 
         // Build PES packet
         let pes = build_pes_packet(0xE0, annex_b_data, pts_90khz, Some(dts_90khz));
@@ -90,10 +131,14 @@ impl TsMuxer {
     ///
     /// Wraps the frame in an ADTS header before PES encapsulation.
     pub fn mux_audio(&mut self, raw_aac: &[u8], pts_90khz: u64, sample_rate_idx: u8, channels: u8) -> Vec<Bytes> {
+        let mut packets = self.maybe_emit_pat_pmt(false);
+
         // Wrap in ADTS header
         let adts_frame = build_adts_frame(raw_aac, sample_rate_idx, channels);
         let pes = build_pes_packet(0xC0, &adts_frame, pts_90khz, None);
-        self.packetize(AUDIO_PID, &pes, true, false, None)
+        packets.extend(self.packetize(AUDIO_PID, &pes, true, false, None));
+
+        packets
     }
 
     /// Split a PES payload into 188-byte TS packets.
@@ -251,9 +296,8 @@ impl TsMuxer {
         let pmt_start = 5;
         pkt[pmt_start] = 0x02; // table_id = 2 (PMT)
 
-        // Calculate section length
-        let streams_len = 5 + if self.has_audio { 5 } else { 0 }; // 5 bytes per stream entry
-        let _section_length = 9 + streams_len as u16; // fixed(9) + program_info_length(0) + streams + CRC(4) ... actually:
+        // Calculate section length: 5 bytes per stream entry
+        let streams_len = (if self.has_video { 5 } else { 0 }) + (if self.has_audio { 5 } else { 0 });
         // section_length includes: program_number(2) + reserved/version(1) + section_number(1) + last_section(1)
         // + reserved/PCR_PID(2) + reserved/program_info_length(2) + streams + CRC32(4)
         let section_length = 9 + streams_len as u16 + 4; // +4 for CRC
@@ -265,20 +309,24 @@ impl TsMuxer {
         pkt[pmt_start + 5] = 0xC1; // reserved, version=0, current_next=1
         pkt[pmt_start + 6] = 0x00; // section_number
         pkt[pmt_start + 7] = 0x00; // last_section_number
-        pkt[pmt_start + 8] = 0xE0 | ((VIDEO_PID >> 8) as u8 & 0x1F); // PCR PID = video PID
-        pkt[pmt_start + 9] = VIDEO_PID as u8;
+        // PCR PID: use video PID if video is present, otherwise audio PID
+        let pcr_pid = if self.has_video { VIDEO_PID } else { AUDIO_PID };
+        pkt[pmt_start + 8] = 0xE0 | ((pcr_pid >> 8) as u8 & 0x1F);
+        pkt[pmt_start + 9] = pcr_pid as u8;
         pkt[pmt_start + 10] = 0xF0; // reserved + program_info_length high
         pkt[pmt_start + 11] = 0x00; // program_info_length low = 0
 
         let mut pos = pmt_start + 12;
 
-        // Video stream entry: H.264
-        pkt[pos] = STREAM_TYPE_H264;
-        pkt[pos + 1] = 0xE0 | ((VIDEO_PID >> 8) as u8 & 0x1F);
-        pkt[pos + 2] = VIDEO_PID as u8;
-        pkt[pos + 3] = 0xF0; // reserved + ES_info_length high
-        pkt[pos + 4] = 0x00; // ES_info_length low = 0
-        pos += 5;
+        // Video stream entry (H.264 or H.265)
+        if self.has_video {
+            pkt[pos] = self.video_stream_type;
+            pkt[pos + 1] = 0xE0 | ((VIDEO_PID >> 8) as u8 & 0x1F);
+            pkt[pos + 2] = VIDEO_PID as u8;
+            pkt[pos + 3] = 0xF0; // reserved + ES_info_length high
+            pkt[pos + 4] = 0x00; // ES_info_length low = 0
+            pos += 5;
+        }
 
         // Audio stream entry: AAC
         if self.has_audio {

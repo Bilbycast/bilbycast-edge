@@ -30,7 +30,7 @@ bilbycast-edge implements a self-contained API security layer with the following
 2. **JWT (HS256)** -- Tokens are signed using HMAC-SHA256 with a shared secret configured in the config file. No external identity provider is required.
 3. **Role-Based Access Control** -- Two roles (`admin` and `monitor`) control access to API endpoints. Read-only endpoints accept any role; mutation endpoints require `admin`.
 4. **TLS/HTTPS** -- Optional TLS termination using PEM-encoded certificates, powered by `rustls` (pure Rust, no OpenSSL dependency).
-5. **Public endpoints** -- `/health` and `/oauth/token` are always accessible without authentication. `/metrics` is public by default but can be placed behind auth.
+5. **Public endpoints** -- `/health`, `/oauth/token`, and `/setup` are always accessible without authentication. `/metrics` is public by default but can be placed behind auth. The `/setup` wizard is gated by the `setup_enabled` config flag (default: true) and is intended for initial provisioning of unconfigured nodes.
 
 When the `auth` configuration block is absent or has `enabled: false`, all endpoints are open with no authentication. This is suitable for development but should never be used in production.
 
@@ -166,6 +166,9 @@ bilbycast-edge supports two roles:
 |----------|--------|-------|---------|-------------------|
 | `/health` | GET | Yes | Yes | Yes |
 | `/oauth/token` | POST | Yes | Yes | Yes |
+| `/setup` | GET | Yes | Yes | Yes (if setup_enabled) |
+| `/setup` | POST | Yes | Yes | Yes (if setup_enabled) |
+| `/setup/status` | GET | Yes | Yes | Yes (if setup_enabled) |
 | `/metrics` | GET | Yes | Yes | Yes (if public_metrics) |
 | `/api/v1/flows` | GET | Yes | Yes | Yes |
 | `/api/v1/flows/{id}` | GET | Yes | Yes | Yes |
@@ -183,6 +186,12 @@ bilbycast-edge supports two roles:
 | `/api/v1/config` | PUT | Yes | **No (403)** | Yes |
 | `/api/v1/config/reload` | POST | Yes | **No (403)** | Yes |
 | `/api/v1/ws/stats` | GET | Yes | Yes | Yes |
+| `/api/v1/flows/{id}/whip` | POST | Yes | **No (403)** | Yes |
+| `/api/v1/flows/{id}/whip/{sid}` | DELETE | Yes | **No (403)** | Yes |
+| `/api/v1/flows/{id}/whep` | POST | Yes | **No (403)** | Yes |
+| `/api/v1/flows/{id}/whep/{sid}` | DELETE | Yes | **No (403)** | Yes |
+
+**Note:** WHIP/WHEP endpoints additionally validate per-flow Bearer tokens configured in the flow's WebRTC input/output config. This is separate from the API auth — even with API auth disabled, the per-flow bearer_token protects WebRTC signaling.
 
 **How RBAC works internally:**
 

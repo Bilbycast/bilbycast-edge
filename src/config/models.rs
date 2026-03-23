@@ -13,6 +13,13 @@ pub struct AppConfig {
     /// Optional web monitoring dashboard
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monitor: Option<MonitorConfig>,
+    /// Optional human-readable device name/label (set during initial setup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    /// Whether the /setup wizard page is enabled. Default: true.
+    /// Set to false to disable the setup wizard after provisioning.
+    #[serde(default = "default_true")]
+    pub setup_enabled: bool,
     /// Optional manager connection for centralized monitoring
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager: Option<crate::manager::ManagerConfig>,
@@ -29,6 +36,8 @@ impl Default for AppConfig {
         Self {
             version: 1,
             node_id: None,
+            device_name: None,
+            setup_enabled: true,
             server: ServerConfig::default(),
             monitor: None,
             manager: None,
@@ -109,19 +118,31 @@ fn default_true() -> bool {
     true
 }
 
-/// Input source configuration -- RTP/UDP, SRT, or RTMP
+/// Input source configuration — RTP, UDP, SRT, RTMP, RTSP, or WebRTC
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum InputConfig {
-    /// Receive RTP over UDP (unicast or multicast)
+    /// Receive RTP over UDP (unicast or multicast) with optional FEC and ingress filters
     #[serde(rename = "rtp")]
     Rtp(RtpInputConfig),
+    /// Receive raw UDP datagrams (MPEG-TS or other payloads, no RTP header required)
+    #[serde(rename = "udp")]
+    Udp(UdpInputConfig),
     /// Receive RTP over SRT
     #[serde(rename = "srt")]
     Srt(SrtInputConfig),
     /// Receive H.264/AAC via RTMP (accept publish from OBS, ffmpeg, etc.)
     #[serde(rename = "rtmp")]
     Rtmp(RtmpInputConfig),
+    /// Receive H.264/H.265 + AAC via RTSP (pull from IP cameras, media servers)
+    #[serde(rename = "rtsp")]
+    Rtsp(RtspInputConfig),
+    /// Receive H.264/Opus via WebRTC WHIP (accept publish from OBS, browser, etc.)
+    #[serde(rename = "webrtc")]
+    Webrtc(WebrtcInputConfig),
+    /// Receive H.264/Opus via WebRTC WHEP client (pull from external WHEP server)
+    #[serde(rename = "whep")]
+    Whep(WhepInputConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +171,20 @@ pub struct RtpInputConfig {
     /// When absent, no rate limiting is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bitrate_mbps: Option<f64>,
+}
+
+/// Raw UDP input — receives datagrams without requiring RTP headers.
+///
+/// Suitable for receiving raw MPEG-TS over UDP (e.g., from OBS, srt-live-transmit,
+/// ffmpeg with `udp://` output). All datagrams are accepted and forwarded with
+/// synthetic sequence numbers and `is_raw_ts: true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpInputConfig {
+    /// Local address to bind, e.g. "0.0.0.0:5000" or "239.1.1.1:5000" for multicast
+    pub bind_addr: String,
+    /// Network interface IP for multicast join (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +256,90 @@ fn default_max_publishers() -> u32 {
     1
 }
 
+/// RTSP transport mode for receiving RTP packets.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub enum RtspTransport {
+    /// RTP over TCP interleaved in the RTSP connection (most reliable, works through firewalls).
+    #[default]
+    #[serde(rename = "tcp")]
+    Tcp,
+    /// RTP over UDP (lower latency, may not work through NAT/firewalls).
+    #[serde(rename = "udp")]
+    Udp,
+}
+
+/// RTSP input configuration — pulls media from an RTSP source (IP cameras, media servers).
+///
+/// Uses the `retina` pure-Rust RTSP client to handle DESCRIBE/SETUP/PLAY signaling
+/// and receive H.264 video (+ optional AAC audio) via RTP. The received media is
+/// muxed into MPEG-TS and published to the flow's broadcast channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RtspInputConfig {
+    /// RTSP source URL, e.g. "rtsp://camera.local:554/stream1"
+    pub rtsp_url: String,
+    /// Username for RTSP authentication (Digest or Basic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Password for RTSP authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// RTP transport mode: "tcp" (interleaved, default) or "udp".
+    #[serde(default)]
+    pub transport: RtspTransport,
+    /// Connection timeout in seconds (default: 10).
+    #[serde(default = "default_rtsp_timeout")]
+    pub timeout_secs: u64,
+    /// Reconnect delay in seconds after connection loss (default: 5).
+    #[serde(default = "default_rtsp_reconnect")]
+    pub reconnect_delay_secs: u64,
+}
+
+fn default_rtsp_timeout() -> u64 {
+    10
+}
+
+fn default_rtsp_reconnect() -> u64 {
+    5
+}
+
+/// WebRTC/WHIP input configuration — runs a WHIP server endpoint accepting
+/// WebRTC contributions from publishers (OBS, browsers, etc.).
+///
+/// The WHIP endpoint is auto-generated at `/api/v1/flows/{flow_id}/whip`.
+/// Publishers POST an SDP offer and receive an SDP answer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebrtcInputConfig {
+    /// Optional Bearer token required from WHIP publishers for authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<String>,
+    /// When true, only video is received (audio tracks from publisher ignored).
+    #[serde(default)]
+    pub video_only: bool,
+    /// Public IP to advertise in ICE candidates (for NAT traversal).
+    /// If not set, auto-detects from the bound socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_ip: Option<String>,
+    /// STUN server URL for ICE candidate gathering (optional, ICE-lite doesn't need it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stun_server: Option<String>,
+}
+
+/// WebRTC/WHEP input configuration — pulls media from an external WHEP server.
+///
+/// The edge acts as a WHEP client: it POSTs an SDP offer to the WHEP endpoint
+/// and establishes a receive-only WebRTC session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhepInputConfig {
+    /// WHEP endpoint URL to pull media from.
+    pub whep_url: String,
+    /// Optional Bearer token for WHEP authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<String>,
+    /// When true, only video is received (audio tracks ignored).
+    #[serde(default)]
+    pub video_only: bool,
+}
+
 fn default_latency() -> u64 {
     120
 }
@@ -233,9 +352,12 @@ fn default_peer_idle_timeout() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum OutputConfig {
-    /// Send RTP over UDP
+    /// Send RTP-wrapped packets over UDP (with RTP headers, optional FEC)
     #[serde(rename = "rtp")]
     Rtp(RtpOutputConfig),
+    /// Send raw MPEG-TS over UDP (no RTP headers, 7×188-byte datagrams)
+    #[serde(rename = "udp")]
+    Udp(UdpOutputConfig),
     /// Send RTP over SRT
     #[serde(rename = "srt")]
     Srt(SrtOutputConfig),
@@ -255,6 +377,7 @@ impl OutputConfig {
     pub fn id(&self) -> &str {
         match self {
             OutputConfig::Rtp(c) => &c.id,
+            OutputConfig::Udp(c) => &c.id,
             OutputConfig::Srt(c) => &c.id,
             OutputConfig::Rtmp(c) => &c.id,
             OutputConfig::Hls(c) => &c.id,
@@ -289,6 +412,32 @@ pub struct RtpOutputConfig {
 
 fn default_dscp() -> u8 {
     46 // Expedited Forwarding per RFC 4594
+}
+
+/// Raw UDP output — sends MPEG-TS datagrams without RTP headers.
+///
+/// Sends TS-aligned datagrams (7 × 188 = 1316 bytes each). If the input
+/// is RTP-wrapped, the RTP header is stripped before sending. Suitable for
+/// feeding ffplay, VLC, multicast distribution, or any receiver expecting
+/// raw MPEG-TS over UDP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpOutputConfig {
+    /// Unique output ID within this flow
+    pub id: String,
+    /// Human-readable name
+    pub name: String,
+    /// Destination address, e.g. "192.168.1.100:5004" or "239.1.2.1:5004"
+    pub dest_addr: String,
+    /// Source bind address (optional, defaults to "0.0.0.0:0")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind_addr: Option<String>,
+    /// Network interface IP for multicast send (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface_addr: Option<String>,
+    /// DSCP value for QoS marking on egress, range 0-63.
+    /// Default: 46 (Expedited Forwarding per RFC 4594).
+    #[serde(default = "default_dscp")]
+    pub dscp: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,7 +476,7 @@ pub struct SrtOutputConfig {
 /// The mode affects which address fields are required in the configuration:
 /// - `Caller` and `Rendezvous` require a `remote_addr`.
 /// - `Listener` only needs a `local_addr` to bind on.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SrtMode {
     /// Active mode: the SRT endpoint initiates the connection to a remote listener.
     /// Requires `remote_addr` to be specified. This is the most common mode for
@@ -437,30 +586,57 @@ fn default_max_segments() -> usize {
     5
 }
 
-/// WebRTC/WHIP output configuration.
+/// WebRTC output mode.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub enum WebrtcOutputMode {
+    /// Push media to an external WHIP endpoint (edge acts as WHIP client).
+    #[default]
+    #[serde(rename = "whip_client")]
+    WhipClient,
+    /// Serve media to browser viewers via WHEP (edge acts as WHEP server).
+    #[serde(rename = "whep_server")]
+    WhepServer,
+}
+
+/// WebRTC output configuration.
 ///
-/// Extracts H.264 NALUs from the MPEG-2 TS stream, repacketizes them
-/// as RFC 6184 RTP, and sends via a WebRTC PeerConnection established
-/// through WHIP (WebRTC-HTTP Ingestion Protocol) signaling.
+/// Supports two modes:
+/// - **WHIP client** (`mode: "whip_client"`): Pushes media to an external
+///   WHIP endpoint (e.g., CDN, cloud encoder). Requires `whip_url`.
+/// - **WHEP server** (`mode: "whep_server"`): Serves media to browser
+///   viewers. The WHEP endpoint is auto-generated at
+///   `/api/v1/flows/{flow_id}/whep`.
 ///
-/// # Limitations
-/// - Audio: only Opus passthrough is supported. AAC→Opus transcoding
-///   requires C libraries and is NOT available in the pure-Rust build.
-/// - If the source TS carries AAC audio, set `video_only: true` or
-///   the audio track will be silent.
+/// Extracts H.264 NALUs from the MPEG-2 TS stream and repacketizes as
+/// RFC 6184 RTP. Opus audio is passed through when available.
+///
+/// # Audio limitations
+/// - Only Opus passthrough is supported. AAC→Opus transcoding requires
+///   C libraries and is NOT available in the pure-Rust build.
+/// - If the source TS carries AAC audio, the audio track will be
+///   automatically omitted for WebRTC outputs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebrtcOutputConfig {
     /// Unique output ID within this flow.
     pub id: String,
     /// Human-readable name.
     pub name: String,
-    /// WHIP endpoint URL for WebRTC signaling.
-    pub whip_url: String,
-    /// Optional Bearer token for WHIP authentication.
+    /// Output mode: `"whip_client"` or `"whep_server"`. Default: `"whip_client"`.
+    #[serde(default)]
+    pub mode: WebrtcOutputMode,
+    /// WHIP endpoint URL (required for `whip_client` mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whip_url: Option<String>,
+    /// Optional Bearer token for WHIP/WHEP authentication.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearer_token: Option<String>,
+    /// Maximum concurrent viewers (WHEP server mode only, default: 10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_viewers: Option<u32>,
+    /// Public IP to advertise in ICE candidates (for NAT traversal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_ip: Option<String>,
     /// When true, only video is sent (audio track omitted).
-    /// Use when source audio is AAC and cannot be transcoded to Opus.
     #[serde(default)]
     pub video_only: bool,
 }
@@ -483,6 +659,8 @@ mod tests {
         let config = AppConfig {
             version: 1,
             node_id: None,
+            device_name: None,
+            setup_enabled: true,
             server: ServerConfig::default(),
             monitor: None,
             manager: None,

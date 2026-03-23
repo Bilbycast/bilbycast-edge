@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-bilbycast-edge is a Rust media transport gateway for professional broadcast workflows. It bridges multiple protocols (SRT, RTP/UDP, RTMP, HLS, WebRTC) with SMPTE 2022-1 FEC and SMPTE 2022-7 hitless redundancy. Designed for low-latency, uninterrupted media flow with broadcast-grade QoS.
+bilbycast-edge is a Rust media transport gateway for professional broadcast workflows. It bridges multiple protocols (SRT, RTP, UDP, RTMP, RTSP, HLS, WebRTC WHIP/WHEP) with SMPTE 2022-1 FEC and SMPTE 2022-7 hitless redundancy. WebRTC support includes all four WHIP/WHEP modes (input and output, client and server) via the pure-Rust `str0m` WebRTC stack, interoperable with OBS, browsers, and standard WHIP/WHEP implementations. Designed for low-latency, uninterrupted media flow with broadcast-grade QoS.
 
 ## Build Commands
 
@@ -15,6 +15,8 @@ cargo build --release          # Optimized release build
 cargo test                     # Run all tests
 cargo test <test_name>         # Run a single test
 cargo build --features tls     # Enable HTTPS/RTMPS support
+cargo build --features webrtc  # Enable WebRTC WHIP/WHEP support
+cargo build --features tls,webrtc  # Enable both
 ```
 
 ## Running
@@ -37,7 +39,7 @@ These must be present for the project to compile.
 ## Feature Flags
 
 - `tls` — HTTPS and RTMPS support (tokio-rustls + axum-server)
-- `webrtc` — WebRTC/WHIP output (currently commented out in Cargo.toml)
+- `webrtc` — WebRTC WHIP/WHEP input and output via str0m (pure Rust, sans-I/O)
 
 ## Architecture Overview
 
@@ -84,12 +86,16 @@ All data flows through a single type: `RtpPacket { data: Bytes, sequence_number:
 | Module | Key Files | Purpose |
 |--------|-----------|---------|
 | `engine/` | `manager.rs`, `flow.rs`, `packet.rs` | Flow lifecycle, FlowRuntime bring-up/teardown |
-| `engine/` | `input_rtp.rs`, `input_srt.rs`, `input_rtmp.rs` | Protocol-specific input tasks |
-| `engine/` | `output_rtp.rs`, `output_srt.rs`, `output_rtmp.rs`, `output_hls.rs`, `output_webrtc.rs` | Protocol-specific output tasks |
-| `engine/rtmp/` | `server.rs`, `amf0.rs`, `chunk.rs`, `ts_mux.rs` | RTMP protocol internals, FLV→MPEG-TS |
+| `engine/` | `input_rtp.rs`, `input_udp.rs`, `input_srt.rs`, `input_rtmp.rs` | Protocol-specific input tasks |
+| `engine/` | `output_rtp.rs`, `output_udp.rs`, `output_srt.rs`, `output_rtmp.rs`, `output_hls.rs`, `output_webrtc.rs` | Protocol-specific output tasks |
+| `engine/rtmp/` | `server.rs`, `amf0.rs`, `chunk.rs`, `ts_mux.rs` | RTMP protocol internals, FLV→MPEG-TS. `ts_mux.rs` is the shared TS muxer (PAT/PMT/PES) used by RTMP, RTSP, and WebRTC inputs |
 | `engine/` | `tr101290.rs` | Transport stream quality analysis (sync, CC, PAT/PMT, PCR) |
 | `engine/` | `media_analysis.rs` | Media content detection (codec, resolution, frame rate, audio format, per-PID bitrate) |
 | `engine/` | `ts_parse.rs` | Shared MPEG-TS packet parsing helpers (used by tr101290 and media_analysis) |
+| `engine/` | `input_rtsp.rs` | RTSP input: pull H.264/H.265 + AAC from IP cameras and media servers via retina crate |
+| `engine/` | `input_webrtc.rs` | WebRTC input: WHIP server (receive contributions) and WHEP client (pull from server) |
+| `engine/webrtc/` | `session.rs`, `ts_demux.rs`, `rtp_h264.rs`, `rtp_h264_depack.rs`, `signaling.rs` | WebRTC core: str0m session wrapper, TS demuxer, RFC 6184 H.264 packetizer/depacketizer, WHIP/WHEP HTTP signaling |
+| `api/` | `webrtc.rs` | WHIP/WHEP HTTP endpoint handlers and session registry |
 | `fec/` | `encoder.rs`, `decoder.rs`, `matrix.rs` | SMPTE 2022-1 FEC (XOR column×row) |
 | `redundancy/` | `merger.rs` | SMPTE 2022-7 hitless merge (seq dedup from dual SRT legs) |
 | `api/` | `server.rs`, `auth.rs`, `flows.rs`, `stats.rs`, `tunnels.rs`, `ws.rs`, `nmos.rs`, `nmos_is05.rs` | Axum REST API, OAuth2/JWT, WebSocket stats, NMOS IS-04 Node API, NMOS IS-05 Connection Management |
@@ -98,6 +104,7 @@ All data flows through a single type: `RtpPacket { data: Bytes, sequence_number:
 | `tunnel/` | `manager.rs`, `relay_client.rs`, `udp_forwarder.rs`, `tcp_forwarder.rs` | QUIC-based IP tunnels (relay/direct) |
 | `manager/` | `client.rs`, `config.rs` | WebSocket client to bilbycast-manager. Sends stats (1s) and health (15s). Handles commands: get_config (returns full AppConfig), create/delete/start/stop flow, add/remove output, create/delete tunnel |
 | `monitor/` | `server.rs`, `dashboard.rs` | Embedded HTML/JS dashboard on separate port |
+| `setup/` | `handlers.rs`, `wizard.rs` | Browser-based setup wizard for initial provisioning (inline HTML, gated by `setup_enabled` config flag) |
 | `srt/` | `connection.rs` | SRT stats polling and socket config |
 | `util/` | `rtp_parse.rs`, `socket.rs`, `time.rs` | RTP header parsing, UDP/multicast, monotonic clock |
 
@@ -133,7 +140,7 @@ SRT uses AES-128/192/256 encryption + passphrase auth. Tunnels use QUIC/TLS 1.3 
 
 ### API Structure (`src/api/server.rs`)
 
-- Public: `/health`, `/oauth/token`, `/metrics`
+- Public: `/health`, `/oauth/token`, `/metrics`, `/setup` (gated by `setup_enabled`)
 - Read-only (JWT or auth-disabled): `GET /api/v1/*`
 - Admin (requires `admin` role): `POST/PUT/DELETE /api/v1/*`
 - WebSocket: `/api/v1/ws/stats` (1/sec stats broadcast)

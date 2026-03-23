@@ -23,7 +23,7 @@ with its current status and a brief description of the implementation.
 | C1 | Trusted / Untrusted interface zones | missing | The system does not model interface trust zones. Flows are configured per-endpoint; zone separation must be enforced by network topology. |
 | C2 | Deny-all on untrusted ingress | missing | No OS-level firewall integration. Operators should pair bilbycast-edge with host firewall rules (iptables / nftables / pf). |
 | C3 | Deny-all on trusted egress | missing | Same as C2. |
-| C4 | UDP-only traffic | **met** | All transports are UDP-based: raw RTP/UDP and SRT (which runs over UDP). No TCP listeners are exposed on the media path. |
+| C4 | UDP-only traffic | **met** | All transports are UDP-based: raw RTP/UDP, SRT (over UDP), and WebRTC (ICE/DTLS/SRTP over UDP). RTMP and RTSP use TCP but are not part of the RP 2129 trusted boundary. |
 | C5 | L3/L4 source IP filtering | **met** | `allowed_sources` on `RtpInputConfig` accepts a list of IP addresses. Packets from unlisted sources are dropped before entering the broadcast channel. The allow-list is pre-parsed into a `HashSet<IpAddr>` for O(1) per-packet lookup. Dropped packets are counted in the `packets_filtered` stat. |
 | C6 | Per-flow NAT (address rewriting) | missing | The system forwards packets byte-for-byte; no SNAT/DNAT capability. |
 | C7 | Per-flow ingress rate limiting | **met** | `max_bitrate_mbps` on `RtpInputConfig` enables a token-bucket rate limiter. Excess packets are dropped before the broadcast channel. The token bucket uses integer arithmetic with a 10 ms burst allowance. Dropped packets are counted in `packets_filtered`. |
@@ -33,7 +33,7 @@ with its current status and a brief description of the implementation.
 
 ---
 
-## Use Case 1: UDP/RTP Flows
+## Use Case 1: RTP and UDP Flows
 
 | ID | Requirement | Status | Implementation |
 |----|-------------|--------|----------------|

@@ -70,8 +70,12 @@ impl From<&FlowConfig> for FlowSummary {
 
         let (input_type, input_redundancy) = match &flow.input {
             InputConfig::Rtp(_) => ("rtp", false),
+            InputConfig::Udp(_) => ("udp", false),
             InputConfig::Srt(srt) => ("srt", srt.redundancy.is_some()),
             InputConfig::Rtmp(_) => ("rtmp", false),
+            InputConfig::Rtsp(_) => ("rtsp", false),
+            InputConfig::Webrtc(_) => ("webrtc", false),
+            InputConfig::Whep(_) => ("whep", false),
         };
         let output_redundancy = flow.outputs.iter().any(|o| {
             matches!(o, OutputConfig::Srt(srt) if srt.redundancy.is_some())

@@ -2,12 +2,16 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
+use srt_transport::SrtSocket;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::models::SrtOutputConfig;
-use crate::srt::connection::{connect_srt_output, connect_srt_redundancy_leg};
+use crate::config::models::{SrtMode, SrtOutputConfig};
+use crate::srt::connection::{
+    accept_srt_connection, bind_srt_listener_for_output, bind_srt_listener_for_redundancy,
+    connect_srt_output, connect_srt_redundancy_leg,
+};
 use crate::stats::collector::OutputStatsAccumulator;
 
 use super::packet::RtpPacket;
@@ -41,32 +45,85 @@ pub fn spawn_srt_output(
 
 /// Core send loop for a single-leg SRT output (no redundancy).
 ///
-/// Connects to the SRT peer (caller or listener per config), then bridges
-/// the async broadcast receiver to the SRT socket via a bounded mpsc channel
-/// and a dedicated Tokio send task:
-///
-///   `[async task: broadcast recv] --mpsc try_send--> [tokio task: async SRT send]`
-///
-/// **Backpressure / drop behavior**: the mpsc channel has a capacity of 256.
-/// The main task uses `try_send` (non-blocking) to enqueue packets. If the
-/// SRT send task cannot keep up (e.g., the SRT congestion control is
-/// throttling), the channel fills up and `try_send` returns `Full`. In that
-/// case the packet is dropped and `stats.packets_dropped` is incremented.
-/// This design ensures the broadcast receiver is never blocked by a slow
-/// SRT destination.
-///
-/// If the send task encounters a send error (connection lost), it exits,
-/// closing the mpsc channel. The main task detects this via
-/// `TrySendError::Closed` and enters the reconnection path.
+/// Dispatches to listener-specific or caller-specific loops based on the
+/// SRT mode. Listener mode binds once and re-accepts on disconnect; caller
+/// mode reconnects with exponential back-off.
 async fn srt_output_loop(
     config: &SrtOutputConfig,
     rx: &mut broadcast::Receiver<RtpPacket>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    // Outer reconnection loop
+    match config.mode {
+        SrtMode::Listener => srt_output_listener_loop(config, rx, stats, cancel).await,
+        _ => srt_output_caller_loop(config, rx, stats, cancel).await,
+    }
+}
+
+/// Listener-mode output: binds the listener once and re-accepts new callers
+/// on disconnect, avoiding the port-rebind problem.
+async fn srt_output_listener_loop(
+    config: &SrtOutputConfig,
+    rx: &mut broadcast::Receiver<RtpPacket>,
+    stats: Arc<OutputStatsAccumulator>,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let mut listener = bind_srt_listener_for_output(config).await?;
+
     loop {
-        // Connect with retry (respects cancellation)
+        let socket = match accept_srt_connection(&mut listener, &cancel).await {
+            Ok(s) => s,
+            Err(_) if cancel.is_cancelled() => {
+                tracing::info!(
+                    "SRT output '{}' stopping (cancelled during accept)",
+                    config.id
+                );
+                let _ = listener.close().await;
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::error!("SRT output '{}' accept failed: {e}", config.id);
+                let _ = listener.close().await;
+                return Err(e);
+            }
+        };
+
+        tracing::info!(
+            "SRT output '{}' connected: mode=listener local={}",
+            config.id,
+            config.local_addr,
+        );
+
+        let disconnected = srt_output_forward_loop(config, rx, &stats, &cancel, &socket).await?;
+        let _ = socket.close().await;
+
+        if !disconnected {
+            let _ = listener.close().await;
+            return Ok(());
+        }
+
+        // Brief delay before re-accepting
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!("SRT output '{}' stopping during reconnect delay", config.id);
+                let _ = listener.close().await;
+                return Ok(());
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+        }
+
+        tracing::info!("SRT output '{}' waiting for caller to reconnect...", config.id);
+    }
+}
+
+/// Caller-mode output: reconnects with exponential back-off on disconnect.
+async fn srt_output_caller_loop(
+    config: &SrtOutputConfig,
+    rx: &mut broadcast::Receiver<RtpPacket>,
+    stats: Arc<OutputStatsAccumulator>,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    loop {
         let socket = match connect_srt_output(config, &cancel).await {
             Ok(s) => s,
             Err(e) => {
@@ -89,91 +146,10 @@ async fn srt_output_loop(
             config.local_addr,
         );
 
-        // Bridge the broadcast receiver to the async SRT send via a bounded
-        // mpsc channel and a dedicated Tokio task. The mpsc channel (capacity
-        // 256) acts as a small buffer. The main task uses `try_send` so it
-        // never blocks.
-        let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<Bytes>(256);
-        let send_socket = socket.clone();
-        let send_stats = stats.clone();
-        let output_id = config.id.clone();
-        let send_handle = tokio::spawn(async move {
-            while let Some(data) = send_rx.recv().await {
-                match send_socket.send(&data).await {
-                    Ok(sent) => {
-                        send_stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                        send_stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        tracing::warn!("SRT output '{}' send error: {e}", output_id);
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Inner packet forwarding loop — runs until disconnect or cancel
-        let connection_lost = loop {
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    tracing::info!("SRT output '{}' stopping (cancelled)", config.id);
-                    drop(send_tx); // close channel, send task will exit
-                    let _ = send_handle.await;
-                    let _ = socket.close().await;
-                    return Ok(());
-                }
-                result = rx.recv() => {
-                    match result {
-                        Ok(packet) => {
-                            // Use try_send (non-blocking) to avoid stalling the async
-                            // task. If the mpsc channel is full, SRT's send task
-                            // cannot keep up with the input rate and we must drop
-                            // the packet rather than block — blocking here would
-                            // back-pressure the broadcast channel and affect all
-                            // other outputs sharing the same input.
-                            match send_tx.try_send(packet.data) {
-                                Ok(()) => {}
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                    stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                                }
-                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                    // Send task died (connection lost)
-                                    tracing::warn!(
-                                        "SRT output '{}' connection lost, will reconnect",
-                                        config.id
-                                    );
-                                    break true;
-                                }
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            stats.packets_dropped.fetch_add(n, Ordering::Relaxed);
-                            tracing::warn!(
-                                "SRT output '{}' lagged, dropped {n} packets",
-                                config.id
-                            );
-                        }
-                        Err(broadcast::error::RecvError::Closed) => {
-                            tracing::info!(
-                                "SRT output '{}' broadcast channel closed",
-                                config.id
-                            );
-                            drop(send_tx);
-                            let _ = send_handle.await;
-                            let _ = socket.close().await;
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-        };
-
-        // Close old socket before reconnecting
-        drop(send_tx);
-        let _ = send_handle.await;
+        let disconnected = srt_output_forward_loop(config, rx, &stats, &cancel, &socket).await?;
         let _ = socket.close().await;
 
-        if !connection_lost {
+        if !disconnected {
             break;
         }
 
@@ -192,6 +168,89 @@ async fn srt_output_loop(
     Ok(())
 }
 
+/// Inner packet forwarding loop shared by listener and caller output modes.
+///
+/// Bridges the broadcast receiver to the SRT socket via a bounded mpsc channel
+/// and a dedicated Tokio send task. Returns `Ok(true)` if the connection was
+/// lost (caller should reconnect), `Ok(false)` if the broadcast channel closed
+/// (flow is shutting down).
+async fn srt_output_forward_loop(
+    config: &SrtOutputConfig,
+    rx: &mut broadcast::Receiver<RtpPacket>,
+    stats: &Arc<OutputStatsAccumulator>,
+    cancel: &CancellationToken,
+    socket: &Arc<SrtSocket>,
+) -> anyhow::Result<bool> {
+    let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<Bytes>(256);
+    let send_socket = socket.clone();
+    let send_stats = stats.clone();
+    let output_id = config.id.clone();
+    let send_handle = tokio::spawn(async move {
+        while let Some(data) = send_rx.recv().await {
+            match send_socket.send(&data).await {
+                Ok(sent) => {
+                    send_stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                    send_stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::warn!("SRT output '{}' send error: {e}", output_id);
+                    break;
+                }
+            }
+        }
+    });
+
+    let connection_lost = loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!("SRT output '{}' stopping (cancelled)", config.id);
+                drop(send_tx);
+                let _ = send_handle.await;
+                return Ok(false);
+            }
+            result = rx.recv() => {
+                match result {
+                    Ok(packet) => {
+                        match send_tx.try_send(packet.data) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                tracing::warn!(
+                                    "SRT output '{}' connection lost, will reconnect",
+                                    config.id
+                                );
+                                break true;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        stats.packets_dropped.fetch_add(n, Ordering::Relaxed);
+                        tracing::warn!(
+                            "SRT output '{}' lagged, dropped {n} packets",
+                            config.id
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        tracing::info!(
+                            "SRT output '{}' broadcast channel closed",
+                            config.id
+                        );
+                        drop(send_tx);
+                        let _ = send_handle.await;
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    };
+
+    drop(send_tx);
+    let _ = send_handle.await;
+    Ok(connection_lost)
+}
+
 // ---------------------------------------------------------------------------
 // Dual-leg SRT output with SMPTE 2022-7 duplication
 // ---------------------------------------------------------------------------
@@ -202,12 +261,8 @@ async fn srt_output_loop(
 /// the redundancy config). Each leg gets its own dedicated Tokio send task
 /// and mpsc channel, following the same pattern as the single-leg output.
 ///
-/// An [`SrtDuplicator`] wraps both mpsc senders and provides a single
-/// `send()` method that duplicates every packet to both legs using
-/// `try_send`. Each leg operates independently: if one leg's channel is full
-/// (backpressure), the packet is dropped for that leg only; the other leg
-/// still receives it. If one leg's send task dies (connection lost), the
-/// duplicator continues sending to the surviving leg.
+/// Listener-mode legs bind once and re-accept on disconnect; caller-mode legs
+/// reconnect with exponential back-off.
 ///
 /// Stats counting: only leg 1 increments `packets_sent` and `bytes_sent` to
 /// avoid double-counting, since both legs carry identical data.
@@ -222,16 +277,36 @@ async fn srt_output_redundant_loop(
         .as_ref()
         .expect("redundancy config must be present");
 
+    // Bind persistent listeners for any legs in listener mode
+    let mut listener_leg1 = if config.mode == SrtMode::Listener {
+        Some(bind_srt_listener_for_output(config).await?)
+    } else {
+        None
+    };
+    let mut listener_leg2 = if redundancy.mode == SrtMode::Listener {
+        Some(bind_srt_listener_for_redundancy(redundancy).await?)
+    } else {
+        None
+    };
+
     // Outer reconnection loop — restarts both legs on total connection loss
     loop {
-        // Connect leg 1
-        let socket_leg1 = match connect_srt_output(config, &cancel).await {
-            Ok(s) => s,
-            Err(e) => {
-                if cancel.is_cancelled() {
-                    return Ok(());
+        // Connect/accept leg 1
+        let socket_leg1 = if let Some(ref mut listener) = listener_leg1 {
+            match accept_srt_connection(listener, &cancel).await {
+                Ok(s) => s,
+                Err(_) if cancel.is_cancelled() => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        } else {
+            match connect_srt_output(config, &cancel).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if cancel.is_cancelled() {
+                        return Ok(());
+                    }
+                    return Err(e);
                 }
-                return Err(e);
             }
         };
         tracing::info!(
@@ -241,19 +316,36 @@ async fn srt_output_redundant_loop(
             config.local_addr
         );
 
-        // Connect leg 2 (best-effort — fall back to single-leg if it fails)
-        let socket_leg2 = match connect_srt_redundancy_leg(redundancy, &cancel).await {
-            Ok(s) => Some(s),
-            Err(e) => {
-                if cancel.is_cancelled() {
+        // Connect/accept leg 2 (best-effort — fall back to single-leg if it fails)
+        let socket_leg2 = if let Some(ref mut listener) = listener_leg2 {
+            match accept_srt_connection(listener, &cancel).await {
+                Ok(s) => Some(s),
+                Err(_) if cancel.is_cancelled() => {
                     let _ = socket_leg1.close().await;
                     return Ok(());
                 }
-                tracing::warn!(
-                    "SRT output '{}' leg2 connection failed: {e}, running single-leg",
-                    config.id
-                );
-                None
+                Err(e) => {
+                    tracing::warn!(
+                        "SRT output '{}' leg2 accept failed: {e}, running single-leg",
+                        config.id
+                    );
+                    None
+                }
+            }
+        } else {
+            match connect_srt_redundancy_leg(redundancy, &cancel).await {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    if cancel.is_cancelled() {
+                        let _ = socket_leg1.close().await;
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        "SRT output '{}' leg2 connection failed: {e}, running single-leg",
+                        config.id
+                    );
+                    None
+                }
             }
         };
         if socket_leg2.is_some() {
@@ -323,6 +415,8 @@ async fn srt_output_redundant_loop(
                     if let Some(ref s) = socket_leg2 {
                         let _ = s.close().await;
                     }
+                    if let Some(ref l) = listener_leg1 { let _ = l.close().await; }
+                    if let Some(ref l) = listener_leg2 { let _ = l.close().await; }
                     return Ok(());
                 }
                 result = rx.recv() => {
@@ -378,7 +472,7 @@ async fn srt_output_redundant_loop(
             }
         }
 
-        // Cleanup before reconnect
+        // Cleanup sockets before reconnect (listeners stay open)
         drop(send_tx_leg1);
         drop(send_tx_leg2_opt);
         let _ = send_handle1.await;
@@ -388,6 +482,8 @@ async fn srt_output_redundant_loop(
         }
 
         if broadcast_closed {
+            if let Some(ref l) = listener_leg1 { let _ = l.close().await; }
+            if let Some(ref l) = listener_leg2 { let _ = l.close().await; }
             return Ok(());
         }
 
@@ -395,6 +491,8 @@ async fn srt_output_redundant_loop(
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("SRT output '{}' (redundant) stopping during reconnect delay", config.id);
+                if let Some(ref l) = listener_leg1 { let _ = l.close().await; }
+                if let Some(ref l) = listener_leg2 { let _ = l.close().await; }
                 return Ok(());
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}

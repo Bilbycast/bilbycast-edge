@@ -18,9 +18,14 @@
 
 pub mod flow;
 pub mod input_rtmp;
+pub mod input_rtsp;
+#[cfg(feature = "webrtc")]
+pub mod input_webrtc;
 pub mod media_analysis;
 pub mod input_rtp;
 pub mod input_srt;
+pub mod input_udp;
+pub mod output_udp;
 pub mod manager;
 pub mod output_hls;
 pub mod output_rtmp;
@@ -31,3 +36,5 @@ pub mod packet;
 pub mod rtmp;
 pub mod tr101290;
 pub mod ts_parse;
+#[cfg(feature = "webrtc")]
+pub mod webrtc;

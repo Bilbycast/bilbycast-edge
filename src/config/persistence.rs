@@ -64,6 +64,8 @@ mod tests {
         let config = AppConfig {
             version: 1,
             node_id: None,
+            device_name: None,
+            setup_enabled: true,
             server: ServerConfig::default(),
             monitor: None,
             manager: None,

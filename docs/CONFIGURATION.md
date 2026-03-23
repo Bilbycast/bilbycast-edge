@@ -10,6 +10,8 @@ bilbycast-edge is configured via a JSON file (default: `./config.json`). Changes
 {
   "version": 1,
   "node_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "device_name": "Studio-A Encoder",
+  "setup_enabled": true,
   "server": {
     "listen_addr": "0.0.0.0",
     "listen_port": 8080,
@@ -22,11 +24,13 @@ bilbycast-edge is configured via a JSON file (default: `./config.json`). Changes
 }
 ```
 
-## Node Identity
+## Node Identity & Setup
 
 | Field     | Type      | Default | Description |
 |-----------|-----------|---------|-------------|
 | `node_id` | `string?` | Auto-generated | Persistent UUID v4 identifying this edge node. Auto-generated on first startup and saved to config. Used as the NMOS IS-04 Node ID. All NMOS resource UUIDs are derived from this value (UUID v5), so they remain stable across restarts. |
+| `device_name` | `string?` | `null` | Optional human-readable label for this edge node (e.g. "Studio-A Encoder"). Max 256 characters. |
+| `setup_enabled` | `bool` | `true` | When true, the browser-based setup wizard is accessible at `/setup`. Set to false to disable it after provisioning. |
 
 ---
 
@@ -183,6 +187,8 @@ The input is discriminated by the `"type"` field.
 
 ### RTP Input (`"type": "rtp"`)
 
+Receives RTP-wrapped MPEG-TS packets (SMPTE ST 2022-2). Requires valid RTP v2 headers — non-RTP packets are silently dropped. Use the UDP input type for raw TS without RTP headers.
+
 | Field                    | Type         | Default | Description                                     |
 |--------------------------|--------------|---------|-------------------------------------------------|
 | `type`                   | `"rtp"`      | --      | Input type discriminator                        |
@@ -193,6 +199,16 @@ The input is discriminated by the `"type"` field.
 | `allowed_sources`        | `string[]?`  | `null`  | Source IP allowlist (RP 2129 C5)                 |
 | `allowed_payload_types`  | `u8[]?`      | `null`  | RTP payload type allowlist (RP 2129 U4)          |
 | `max_bitrate_mbps`       | `f64?`       | `null`  | Maximum ingress bitrate in Mbps (RP 2129 C7)     |
+
+### UDP Input (`"type": "udp"`)
+
+Receives raw UDP datagrams without requiring RTP headers. Suitable for raw MPEG-TS over UDP from OBS, ffmpeg (`-f mpegts udp://`), srt-live-transmit, VLC, or any source that sends plain TS.
+
+| Field            | Type       | Default | Description                                     |
+|------------------|------------|---------|-------------------------------------------------|
+| `type`           | `"udp"`    | --      | Input type discriminator                        |
+| `bind_addr`      | `string`   | --      | Local bind address, e.g. `"0.0.0.0:5000"` or `"239.1.1.1:5000"` for multicast |
+| `interface_addr`  | `string?` | `null`  | Network interface IP for multicast join          |
 
 ### RTMP Input (`"type": "rtmp"`)
 
@@ -226,6 +242,56 @@ ffmpeg -re -i input.mp4 -c:v libx264 -c:a aac -f flv rtmp://edge:1935/live/my_se
 - Server: `rtmp://edge:1935/live`
 - Stream Key: `my_secret_key`
 
+### RTSP Input (`"type": "rtsp"`)
+
+Pulls H.264 or H.265/HEVC video and AAC audio from RTSP sources (IP cameras, media servers). Uses the `retina` pure-Rust RTSP client. Produces MPEG-TS with proper PAT/PMT program tables. Audio-only streams are supported.
+
+| Field                 | Type     | Default  | Description                                     |
+|-----------------------|----------|----------|-------------------------------------------------|
+| `type`                | `"rtsp"` | --       | Input type discriminator                        |
+| `rtsp_url`            | `string` | --       | RTSP source URL, e.g. `"rtsp://camera:554/stream1"` |
+| `username`            | `string?`| `null`   | Username for RTSP authentication                 |
+| `password`            | `string?`| `null`   | Password for RTSP authentication                 |
+| `transport`           | `string` | `"tcp"`  | `"tcp"` (interleaved, default) or `"udp"`        |
+| `timeout_secs`        | `u64`    | `10`     | Connection timeout in seconds                    |
+| `reconnect_delay_secs`| `u64`    | `5`      | Delay between reconnection attempts              |
+
+### WebRTC/WHIP Input (`"type": "webrtc"`)
+
+Accepts incoming WebRTC contributions from publishers (OBS, browsers) via the WHIP protocol (RFC 9725). The WHIP endpoint is auto-generated at `/api/v1/flows/{flow_id}/whip`. Requires the `webrtc` cargo feature.
+
+| Field          | Type      | Default | Description                                     |
+|----------------|-----------|---------|-------------------------------------------------|
+| `type`         | `"webrtc"`| --      | Input type discriminator                        |
+| `bearer_token` | `string?` | `null`  | Bearer token required from WHIP publishers       |
+| `video_only`   | `bool`    | `false` | Ignore audio tracks from publisher               |
+| `public_ip`    | `string?` | `null`  | Public IP for ICE candidates (NAT traversal)     |
+| `stun_server`  | `string?` | `null`  | STUN server URL (optional, ICE-lite doesn't need it) |
+
+**Example:**
+```json
+{
+  "type": "webrtc",
+  "bearer_token": "my-secret-token"
+}
+```
+
+**Publishing from OBS:**
+1. Settings → Stream → Service: WHIP
+2. Server: `http://edge:8080/api/v1/flows/my-flow/whip`
+3. Bearer Token: `my-secret-token`
+
+### WHEP Input (`"type": "whep"`)
+
+Pulls media from an external WHEP server. The edge acts as a WHEP client. Requires the `webrtc` cargo feature.
+
+| Field          | Type      | Default | Description                                     |
+|----------------|-----------|---------|-------------------------------------------------|
+| `type`         | `"whep"`  | --      | Input type discriminator                        |
+| `whep_url`     | `string`  | --      | WHEP endpoint URL to pull media from             |
+| `bearer_token` | `string?` | `null`  | Bearer token for WHEP authentication             |
+| `video_only`   | `bool`    | `false` | Receive only video (ignore audio)                |
+
 ---
 
 ## Output Types
@@ -249,6 +315,8 @@ Outputs are discriminated by the `"type"` field. All output types share `id` and
 
 ### RTP Output (`"type": "rtp"`)
 
+Sends RTP-wrapped MPEG-TS packets with RTP headers. Supports SMPTE 2022-1 FEC encoding.
+
 | Field            | Type         | Default | Description                                     |
 |------------------|--------------|---------|-------------------------------------------------|
 | `type`           | `"rtp"`      | --      | Output type discriminator                       |
@@ -259,6 +327,20 @@ Outputs are discriminated by the `"type"` field. All output types share `id` and
 | `interface_addr` | `string?`    | `null`  | Network interface IP for multicast send          |
 | `fec_encode`     | `FecConfig?` | `null`  | SMPTE 2022-1 FEC encode parameters              |
 | `dscp`           | `u8`         | `46`    | DSCP value for QoS marking (0-63, default: 46 = Expedited Forwarding) |
+
+### UDP Output (`"type": "udp"`)
+
+Sends raw MPEG-TS over UDP without RTP headers. Datagrams are TS-aligned (7×188 = 1316 bytes). If the input is RTP-wrapped, RTP headers are stripped automatically. Compatible with ffplay, VLC, and standard IP/TS multicast receivers.
+
+| Field            | Type       | Default | Description                                     |
+|------------------|-----------|---------|-------------------------------------------------|
+| `type`           | `"udp"`    | --      | Output type discriminator                       |
+| `id`             | `string`   | --      | Unique output ID within this flow               |
+| `name`           | `string`   | --      | Human-readable name                             |
+| `dest_addr`      | `string`   | --      | Destination address, e.g. `"192.168.1.100:5004"` |
+| `bind_addr`      | `string?`  | `null`  | Source bind address (default: `"0.0.0.0:0"`)    |
+| `interface_addr`  | `string?` | `null`  | Network interface IP for multicast send          |
+| `dscp`           | `u8`       | `46`    | DSCP value for QoS marking (0-63, default: 46 = Expedited Forwarding) |
 
 ### RTMP Output (`"type": "rtmp"`)
 
@@ -290,16 +372,19 @@ Segment-based HTTP ingest. Supports HEVC/HDR content.
 
 ### WebRTC Output (`"type": "webrtc"`)
 
-WHIP signaling for WebRTC PeerConnection. Video only supports H.264; audio supports Opus passthrough only.
+WebRTC output supporting two modes: WHIP client (push to external endpoint) and WHEP server (serve viewers). Requires the `webrtc` cargo feature. Video: H.264 only; audio: Opus passthrough only (AAC sources fall back to video-only automatically).
 
-| Field          | Type      | Default | Description                                     |
-|----------------|-----------|---------|-------------------------------------------------|
-| `type`         | `"webrtc"`| --      | Output type discriminator                       |
-| `id`           | `string`  | --      | Unique output ID within this flow               |
-| `name`         | `string`  | --      | Human-readable name                             |
-| `whip_url`     | `string`  | --      | WHIP endpoint URL for signaling                  |
-| `bearer_token` | `string?` | `null`  | Bearer token for WHIP authentication             |
-| `video_only`   | `bool`    | `false` | Send only video (use when audio is AAC)          |
+| Field          | Type      | Default        | Description                                     |
+|----------------|-----------|----------------|-------------------------------------------------|
+| `type`         | `"webrtc"`| --             | Output type discriminator                       |
+| `id`           | `string`  | --             | Unique output ID within this flow               |
+| `name`         | `string`  | --             | Human-readable name                             |
+| `mode`         | `string`  | `"whip_client"`| `"whip_client"` (push to WHIP endpoint) or `"whep_server"` (serve viewers) |
+| `whip_url`     | `string?` | `null`         | WHIP endpoint URL (required for `whip_client` mode) |
+| `bearer_token` | `string?` | `null`         | Bearer token for authentication                  |
+| `max_viewers`  | `u32?`    | `10`           | Max concurrent viewers (WHEP server mode only, 1-100) |
+| `public_ip`    | `string?` | `null`         | Public IP for ICE candidates (NAT traversal)     |
+| `video_only`   | `bool`    | `false`        | Send only video (audio omitted)                  |
 
 ---
 

@@ -17,6 +17,10 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
 - [Input Types](#input-types)
   - [RTP Input](#rtp-input)
   - [SRT Input](#srt-input)
+  - [RTMP Input](#rtmp-input)
+  - [RTSP Input](#rtsp-input)
+  - [WebRTC/WHIP Input](#webrtcwhip-input)
+  - [WHEP Input](#whep-input)
 - [Output Types](#output-types)
   - [RTP Output](#rtp-output)
   - [SRT Output](#srt-output)
@@ -45,6 +49,8 @@ The configuration is loaded and validated at startup. Changes made through the A
 ```json
 {
   "version": 1,
+  "device_name": "Studio-A Encoder",
+  "setup_enabled": true,
   "server": {
     "listen_addr": "0.0.0.0",
     "listen_port": 8080,
@@ -139,8 +145,11 @@ The configuration is loaded and validated at startup. Changes made through the A
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `version` | integer | Yes | - | Schema version. Currently must be `1`. |
+| `device_name` | string | No | `null` | Optional human-readable label for this edge node (e.g. "Studio-A Encoder"). Max 256 characters. |
+| `setup_enabled` | boolean | No | `true` | When true, the browser-based setup wizard is accessible at `/setup`. Set to false to disable after provisioning. |
 | `server` | object | Yes | - | API server configuration. |
 | `monitor` | object | No | `null` | Web monitoring dashboard configuration. |
+| `manager` | object | No | `null` | Manager WebSocket connection configuration. |
 | `flows` | array | No | `[]` | List of flow configurations. |
 
 ---
@@ -272,18 +281,18 @@ Each flow defines one input source fanning out to one or more output destination
 | `id` | string | Yes | - | Unique identifier. Cannot be empty. Must be unique across all flows. |
 | `name` | string | Yes | - | Human-readable display name. Cannot be empty. |
 | `enabled` | boolean | No | `true` | Whether to auto-start this flow on startup or creation. |
-| `input` | object | Yes | - | Input source configuration (RTP or SRT). |
+| `input` | object | Yes | - | Input source configuration (RTP, UDP, SRT, RTMP, RTSP, WebRTC, or WHEP). |
 | `outputs` | array | Yes | - | Output destination configurations. Can be empty. Output IDs must be unique within the flow. |
 
 ---
 
 ## Input Types
 
-The `input` object uses a `type` discriminator field to determine which input variant is used.
+The `input` object uses a `type` discriminator field to determine which input variant is used: `rtp`, `udp`, `srt`, `rtmp`, `rtsp`, `webrtc`, or `whep`.
 
 ### RTP Input
 
-Receives RTP/UDP packets (SMPTE ST 2022-2). Supports unicast, multicast, IPv4, and IPv6.
+Receives RTP-wrapped MPEG-TS packets (SMPTE ST 2022-2). Requires valid RTP v2 headers. Supports unicast, multicast, IPv4, and IPv6. For raw TS without RTP headers, use the UDP input type.
 
 ```json
 {
@@ -317,6 +326,28 @@ Receives RTP/UDP packets (SMPTE ST 2022-2). Supports unicast, multicast, IPv4, a
 - `interface_addr` must be a valid IP address (no port) in the same address family as `bind_addr`.
 - `allowed_payload_types` values must be 0-127.
 - `max_bitrate_mbps` must be positive.
+
+### UDP Input
+
+Receives raw UDP datagrams without requiring RTP headers. Suitable for raw MPEG-TS over UDP from OBS, ffmpeg (`-f mpegts udp://`), srt-live-transmit, VLC, or any source that sends plain TS.
+
+```json
+{
+  "type": "udp",
+  "bind_addr": "0.0.0.0:5000",
+  "interface_addr": "192.168.1.100"
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `type` | string | Yes | - | Must be `"udp"`. |
+| `bind_addr` | string | Yes | - | Local socket address to bind (`ip:port`). For multicast, use the group address. |
+| `interface_addr` | string | No | `null` | Network interface IP for multicast group join. Must be the same address family as `bind_addr`. |
+
+**Validation rules:**
+- `bind_addr` must be a valid `ip:port` socket address.
+- `interface_addr` must be a valid IP address in the same address family as `bind_addr`.
 
 ### SRT Input
 
@@ -358,6 +389,83 @@ Receives RTP encapsulated in SRT. Supports caller, listener, and rendezvous mode
 - `passphrase` must be 10-79 characters.
 - `aes_key_len` must be 16, 24, or 32.
 
+### RTMP Input
+
+Accepts incoming RTMP publish connections from OBS, ffmpeg, Wirecast, etc.
+
+```json
+{
+  "type": "rtmp",
+  "listen_addr": "0.0.0.0:1935",
+  "app": "live",
+  "stream_key": "my_secret_key"
+}
+```
+
+### RTSP Input
+
+Pulls H.264 or H.265/HEVC video and AAC audio from RTSP sources (IP cameras, media servers). Uses the `retina` pure-Rust RTSP client with automatic reconnection. Produces MPEG-TS with proper PAT/PMT program tables. Audio-only streams are supported (PAT/PMT are emitted even without video).
+
+```json
+{
+  "type": "rtsp",
+  "rtsp_url": "rtsp://camera.local:554/stream1",
+  "username": "admin",
+  "password": "secret",
+  "transport": "tcp"
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `type` | string | Yes | - | Must be `"rtsp"`. |
+| `rtsp_url` | string | Yes | - | RTSP source URL. Must start with `rtsp://` or `rtsps://`. |
+| `username` | string | No | `null` | RTSP authentication username (Digest or Basic). |
+| `password` | string | No | `null` | RTSP authentication password. |
+| `transport` | string | No | `"tcp"` | `"tcp"` (interleaved, reliable) or `"udp"` (lower latency). |
+| `timeout_secs` | integer | No | `10` | Connection timeout in seconds. |
+| `reconnect_delay_secs` | integer | No | `5` | Delay between reconnection attempts on failure. |
+
+### WebRTC/WHIP Input
+
+Accepts WebRTC contributions from publishers (OBS, browsers) via the WHIP protocol (RFC 9725). Requires the `webrtc` cargo feature.
+
+```json
+{
+  "type": "webrtc",
+  "bearer_token": "my-auth-token"
+}
+```
+
+Publishers POST an SDP offer to `/api/v1/flows/{flow_id}/whip` and receive an SDP answer. The Bearer token (if configured) must be included in the `Authorization` header.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `type` | string | Yes | - | Must be `"webrtc"`. |
+| `bearer_token` | string | No | `null` | Required from WHIP publishers for authentication. |
+| `video_only` | boolean | No | `false` | Ignore audio tracks from publisher. |
+| `public_ip` | string | No | `null` | Public IP to advertise in ICE candidates (for NAT traversal). |
+| `stun_server` | string | No | `null` | STUN server URL for ICE candidate gathering. |
+
+### WHEP Input
+
+Pulls media from an external WHEP server. The edge acts as a WHEP client. Requires the `webrtc` cargo feature.
+
+```json
+{
+  "type": "whep",
+  "whep_url": "https://server.example.com/whep/stream",
+  "bearer_token": "optional-token"
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `type` | string | Yes | - | Must be `"whep"`. |
+| `whep_url` | string | Yes | - | WHEP endpoint URL to pull from. |
+| `bearer_token` | string | No | `null` | Bearer token for WHEP authentication. |
+| `video_only` | boolean | No | `false` | Receive only video (ignore audio). |
+
 ---
 
 ## Output Types
@@ -366,7 +474,7 @@ Each output has a `type` discriminator. All outputs share `id` and `name` fields
 
 ### RTP Output
 
-Sends RTP/UDP packets to a unicast or multicast destination.
+Sends RTP-wrapped MPEG-TS packets to a unicast or multicast destination. Supports SMPTE 2022-1 FEC encoding.
 
 ```json
 {
@@ -398,6 +506,35 @@ Sends RTP/UDP packets to a unicast or multicast destination.
 **Validation rules:**
 - `id` cannot be empty.
 - `dest_addr`, `bind_addr`, and `interface_addr` must all use the same address family.
+- `dscp` must be 0-63.
+
+### UDP Output
+
+Sends raw MPEG-TS over UDP without RTP headers. Datagrams are TS-aligned (7×188 = 1316 bytes). If the input is RTP-wrapped, RTP headers are automatically stripped. Compatible with ffplay, VLC, and standard IP/TS multicast receivers.
+
+```json
+{
+  "type": "udp",
+  "id": "udp-out-1",
+  "name": "Local Playout (raw TS)",
+  "dest_addr": "192.168.1.50:5004",
+  "dscp": 46
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `type` | string | Yes | - | Must be `"udp"`. |
+| `id` | string | Yes | - | Unique output ID within the flow. |
+| `name` | string | Yes | - | Human-readable display name. |
+| `dest_addr` | string | Yes | - | Destination socket address (`ip:port`). For multicast, use the group address. |
+| `bind_addr` | string | No | `"0.0.0.0:0"` | Source bind address. Must be same address family as `dest_addr`. |
+| `interface_addr` | string | No | `null` | Network interface IP for multicast send. |
+| `dscp` | integer | No | `46` | DSCP value for QoS marking. Range 0-63. |
+
+**Validation rules:**
+- `id` cannot be empty.
+- `dest_addr` must be a valid socket address.
 - `dscp` must be 0-63.
 
 ### SRT Output
@@ -500,32 +637,49 @@ Segments MPEG-2 TS data and uploads via HTTP for HLS ingest (e.g., YouTube HLS).
 
 ### WebRTC Output
 
-Sends via WebRTC using WHIP (WebRTC-HTTP Ingestion Protocol) signaling. Extracts H.264 NALUs from the TS stream and repacketizes as RFC 6184 RTP.
+Supports two modes: WHIP client (push to external endpoint) and WHEP server (serve viewers). Requires the `webrtc` cargo feature.
+
+**WHIP Client mode** — push to an external WHIP endpoint:
 
 ```json
 {
   "type": "webrtc",
-  "id": "webrtc-out",
-  "name": "WebRTC Output",
+  "id": "whip-push",
+  "name": "Push to CDN",
+  "mode": "whip_client",
   "whip_url": "https://whip.example.com/ingest/stream1",
-  "bearer_token": "my-auth-token",
-  "video_only": true
+  "bearer_token": "my-auth-token"
 }
 ```
+
+**WHEP Server mode** — serve browser viewers:
+
+```json
+{
+  "type": "webrtc",
+  "id": "whep-serve",
+  "name": "Browser Viewers",
+  "mode": "whep_server",
+  "max_viewers": 20,
+  "bearer_token": "viewer-auth-token"
+}
+```
+
+Viewers POST an SDP offer to `/api/v1/flows/{flow_id}/whep` and receive an SDP answer.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `type` | string | Yes | - | Must be `"webrtc"`. |
-| `id` | string | Yes | - | Unique output ID. Cannot be empty. |
+| `id` | string | Yes | - | Unique output ID. |
 | `name` | string | Yes | - | Human-readable display name. |
-| `whip_url` | string | Yes | - | WHIP signaling endpoint URL. Must start with `http://` or `https://`. |
-| `bearer_token` | string | No | `null` | Bearer token for WHIP endpoint authentication. |
-| `video_only` | boolean | No | `false` | When `true`, only video is sent (audio track omitted). Set to `true` when the source carries AAC audio, since AAC-to-Opus transcoding is not available in the pure-Rust build. |
+| `mode` | string | No | `"whip_client"` | `"whip_client"` (push to endpoint) or `"whep_server"` (serve viewers). |
+| `whip_url` | string | WHIP only | - | WHIP endpoint URL. Required for `whip_client` mode. |
+| `bearer_token` | string | No | `null` | Bearer token for authentication. |
+| `max_viewers` | integer | No | `10` | Max concurrent viewers (WHEP server mode only, 1-100). |
+| `public_ip` | string | No | `null` | Public IP for ICE candidates (NAT traversal). |
+| `video_only` | boolean | No | `false` | Only send video (audio omitted). AAC sources automatically fall back to video-only. |
 
-**Limitations:**
-- Requires the `webrtc` Cargo feature.
-- Audio: Only Opus passthrough. AAC-to-Opus transcoding requires C libraries not available in the pure-Rust build.
-- Requires a WHIP-compatible endpoint.
+**Audio:** Opus passthrough only. Opus flows natively on WebRTC paths. AAC sources fall back to video-only automatically (no C-library transcoding available).
 
 ---
 

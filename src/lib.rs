@@ -26,6 +26,7 @@ pub mod engine;
 pub mod fec;
 pub mod manager;
 pub mod redundancy;
+pub mod setup;
 pub mod srt;
 pub mod stats;
 pub mod tunnel;

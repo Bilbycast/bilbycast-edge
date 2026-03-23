@@ -36,6 +36,11 @@ pub struct AppState {
     pub auth_state: Option<Arc<AuthState>>,
     /// NMOS IS-05 staged transport parameters.
     pub is05_state: Arc<Is05State>,
+    /// WebRTC session registry for WHIP/WHEP endpoints (None when webrtc feature disabled).
+    #[cfg(feature = "webrtc")]
+    pub webrtc_sessions: Option<Arc<crate::api::webrtc::registry::WebrtcSessionRegistry>>,
+    #[cfg(not(feature = "webrtc"))]
+    pub webrtc_sessions: Option<()>,
 }
 
 /// Constructs the main Axum [`Router`] with all API routes, auth middleware, and layers.
@@ -59,6 +64,11 @@ pub fn build_router(state: AppState) -> Router {
         .as_ref()
         .map(|a| a.config.public_metrics)
         .unwrap_or(true);
+
+    // Setup wizard routes (public, no auth — for initial provisioning)
+    let public_routes = public_routes
+        .route("/setup", get(crate::setup::handlers::setup_page).post(crate::setup::handlers::apply_setup))
+        .route("/setup/status", get(crate::setup::handlers::setup_status));
 
     let public_routes = if metrics_public {
         public_routes.route("/metrics", get(stats::prometheus_metrics))
@@ -105,6 +115,17 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/config/reload", post(flows::reload_config))
         .route("/api/v1/tunnels", post(tunnels::create_tunnel))
         .route("/api/v1/tunnels/{id}", delete(tunnels::delete_tunnel));
+
+    // WHIP/WHEP routes (feature-gated)
+    #[cfg(feature = "webrtc")]
+    let write_routes = {
+        use crate::api::webrtc::handlers;
+        write_routes
+            .route("/api/v1/flows/{flow_id}/whip", post(handlers::whip_offer))
+            .route("/api/v1/flows/{flow_id}/whip/{session_id}", delete(handlers::whip_delete))
+            .route("/api/v1/flows/{flow_id}/whep", post(handlers::whep_offer))
+            .route("/api/v1/flows/{flow_id}/whep/{session_id}", delete(handlers::whep_delete))
+    };
 
     // Combine protected routes with auth middleware
     let protected_routes = Router::new()

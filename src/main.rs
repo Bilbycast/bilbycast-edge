@@ -22,6 +22,7 @@ mod fec;
 mod manager;
 mod monitor;
 mod redundancy;
+mod setup;
 mod srt;
 mod stats;
 mod tunnel;
@@ -154,6 +155,10 @@ async fn main() -> anyhow::Result<()> {
         ws_stats_tx: ws_stats_tx.clone(),
         auth_state,
         is05_state: Arc::new(api::nmos_is05::Is05State::new()),
+        #[cfg(feature = "webrtc")]
+        webrtc_sessions: Some(Arc::new(api::webrtc::registry::WebrtcSessionRegistry::new())),
+        #[cfg(not(feature = "webrtc"))]
+        webrtc_sessions: None,
     };
 
     // Start all enabled flows from config

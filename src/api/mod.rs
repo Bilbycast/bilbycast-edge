@@ -16,4 +16,6 @@ pub mod nmos_is05;
 pub mod server;
 pub mod stats;
 pub mod tunnels;
+#[cfg(feature = "webrtc")]
+pub mod webrtc;
 pub mod ws;

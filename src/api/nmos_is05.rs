@@ -429,6 +429,13 @@ fn active_sender_params(
             interface_ip: c.interface_addr.clone(),
             ..Default::default()
         },
+        OutputConfig::Udp(c) => TransportParamSet {
+            destination_ip: Some(c.dest_addr.split(':').next().unwrap_or("").to_string()),
+            destination_port: c.dest_addr.split(':').nth(1).and_then(|p| p.parse().ok()),
+            source_ip: c.bind_addr.as_deref().map(|a| a.split(':').next().unwrap_or("").to_string()),
+            interface_ip: c.interface_addr.clone(),
+            ..Default::default()
+        },
         OutputConfig::Srt(c) => TransportParamSet {
             destination_ip: c.remote_addr.as_deref().map(|a| a.split(':').next().unwrap_or("").to_string()),
             destination_port: c.remote_addr.as_deref().and_then(|a| a.split(':').nth(1).and_then(|p| p.parse().ok())),
@@ -457,6 +464,11 @@ fn active_receiver_params(
             source_port: c.bind_addr.split(':').nth(1).and_then(|p| p.parse().ok()),
             ..Default::default()
         },
+        InputConfig::Udp(c) => TransportParamSet {
+            interface_ip: c.interface_addr.clone(),
+            source_port: c.bind_addr.split(':').nth(1).and_then(|p| p.parse().ok()),
+            ..Default::default()
+        },
         InputConfig::Srt(c) => TransportParamSet {
             source_ip: Some(c.local_addr.split(':').next().unwrap_or("").to_string()),
             source_port: c.local_addr.split(':').nth(1).and_then(|p| p.parse().ok()),
@@ -466,6 +478,12 @@ fn active_receiver_params(
         },
         InputConfig::Rtmp(c) => TransportParamSet {
             source_port: c.listen_addr.split(':').nth(1).and_then(|p| p.parse().ok()),
+            ..Default::default()
+        },
+        InputConfig::Rtsp(_) => TransportParamSet {
+            ..Default::default()
+        },
+        InputConfig::Webrtc(_) | InputConfig::Whep(_) => TransportParamSet {
             ..Default::default()
         },
     };

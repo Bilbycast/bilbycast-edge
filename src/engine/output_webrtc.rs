@@ -1,3 +1,8 @@
+//! WebRTC output tasks: WHIP client (push to server) and WHEP server (serve viewers).
+//!
+//! Both modes extract H.264 NALUs from MPEG-TS broadcast channel packets,
+//! packetize per RFC 6184, and send via str0m WebRTC sessions.
+
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -10,111 +15,59 @@ use crate::stats::collector::OutputStatsAccumulator;
 
 use super::packet::RtpPacket;
 
-/// Spawn a WebRTC/WHIP output task.
-///
-/// **This is a stub implementation.** The full WebRTC output requires the
-/// `webrtc` crate (webrtc-rs) which is a heavy dependency not yet included
-/// in Cargo.toml. This stub allows the configuration to be accepted and
-/// the project to compile without that dependency.
-///
-/// The stub subscribes to the broadcast channel and silently consumes
-/// packets (so the broadcast channel does not report lag for this output),
-/// but does not transmit any data.
-///
-/// # Full implementation roadmap
-///
-/// A complete WebRTC output would perform these steps:
-///
-/// ## 1. WHIP Signaling (WebRTC-HTTP Ingestion Protocol, RFC draft)
-///
-/// - Construct an SDP offer describing a sendonly H.264 video track
-///   (and optionally an Opus audio track).
-/// - HTTP POST the SDP offer to `config.whip_url` with
-///   `Content-Type: application/sdp`.
-/// - If `config.bearer_token` is set, include an `Authorization: Bearer`
-///   header for authentication.
-/// - Parse the 201 Created response body as the SDP answer.
-/// - Extract ICE candidates and DTLS fingerprint from the answer.
-///
-/// ## 2. ICE + DTLS + SRTP establishment
-///
-/// - Use the `webrtc::ice` agent to perform ICE connectivity checks
-///   (STUN binding requests) using candidates from the SDP exchange.
-/// - Once ICE succeeds, perform a DTLS handshake over the selected
-///   candidate pair to derive SRTP keys.
-/// - Open an SRTP session for encrypted media transport.
-///
-/// ## 3. H.264 NALU extraction from MPEG-2 TS
-///
-/// - Demux the incoming TS stream (from the broadcast channel's RTP
-///   packets with headers stripped) using `TsDemuxer` to extract PES
-///   packets carrying H.264 Annex B byte streams.
-/// - Parse the Annex B stream to identify individual NAL Units (NALUs),
-///   splitting on 0x00000001 start codes.
-/// - Identify NALU types: SPS (type 7), PPS (type 8), IDR (type 5),
-///   non-IDR slices (type 1), SEI (type 6), etc.
-/// - Cache the most recent SPS/PPS for periodic re-sending (needed for
-///   late joiners and after packet loss).
-///
-/// ## 4. RFC 6184 RTP packetization (H.264 over RTP)
-///
-/// - Small NALUs (< MTU, typically 1200 bytes for WebRTC) are sent as
-///   Single NAL Unit packets: RTP header + NALU directly.
-/// - Large NALUs are fragmented using FU-A (Fragmentation Unit type A):
-///   each fragment has an FU indicator byte and FU header byte before
-///   the NALU fragment data.
-/// - Set the RTP marker bit on the last packet of each access unit
-///   (frame boundary).
-/// - Use payload type 96 (dynamic) and clock rate 90000 Hz.
-/// - Increment the RTP sequence number per packet, RTP timestamp per
-///   frame (using 90 kHz clock derived from PTS).
-///
-/// ## 5. Audio handling
-///
-/// - **Opus passthrough only**: if the source TS carries Opus audio
-///   (PID with stream type 0x06 and Opus descriptor), the Opus frames
-///   can be forwarded directly in RTP packets (RFC 7587, clock 48000).
-/// - **AAC is NOT supported**: transcoding AAC to Opus requires a C
-///   library (e.g. libopus + FFmpeg). If the source carries AAC audio,
-///   the user should set `video_only: true` in the config or the audio
-///   track will be silent.
-///
-/// ## 6. Congestion control and stats
-///
-/// - Implement TWCC (Transport-Wide Congestion Control) or GCC
-///   (Google Congestion Control) feedback to adapt video bitrate.
-/// - Report `packets_sent`, `bytes_sent` to the stats accumulator.
-/// - On ICE failure or DTLS timeout, log an error and attempt
-///   re-signaling after a backoff delay.
+/// Spawn a WebRTC output task (WHIP client or WHEP server depending on config mode).
 pub fn spawn_webrtc_output(
     config: WebrtcOutputConfig,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     output_stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
-    let mut rx = broadcast_tx.subscribe();
+    let rx = broadcast_tx.subscribe();
 
-    tokio::spawn(async move {
-        tracing::warn!(
-            "WebRTC output '{}' is a stub: the `webrtc` cargo feature/dependency is not enabled. \
-             Packets will be consumed but not transmitted. \
-             WHIP endpoint: {}",
-            config.id,
-            config.whip_url,
-        );
+    #[cfg(feature = "webrtc")]
+    {
+        use crate::config::models::WebrtcOutputMode;
+        match config.mode {
+            WebrtcOutputMode::WhipClient => {
+                tokio::spawn(async move {
+                    whip_client_loop(config, rx, output_stats, cancel).await;
+                })
+            }
+            WebrtcOutputMode::WhepServer => {
+                // WHEP server mode: the actual session creation is driven by
+                // API POST requests. This task just keeps the output alive
+                // and tracks stats. Individual viewer sessions are spawned
+                // by the session registry.
+                tokio::spawn(async move {
+                    tracing::info!(
+                        "WebRTC/WHEP server output '{}' started, waiting for viewers at /api/v1/flows/.../whep",
+                        config.id,
+                    );
+                    webrtc_stub_loop(&config, rx, output_stats, cancel).await;
+                })
+            }
+        }
+    }
 
-        webrtc_stub_loop(&config, &mut rx, output_stats, cancel).await;
-    })
+    #[cfg(not(feature = "webrtc"))]
+    {
+        tokio::spawn(async move {
+            tracing::warn!(
+                "WebRTC output '{}' is a stub: the `webrtc` cargo feature is not enabled. \
+                 Packets will be consumed but not transmitted.",
+                config.id,
+            );
+            webrtc_stub_loop(&config, rx, output_stats, cancel).await;
+        })
+    }
 }
 
-/// Stub receive loop that consumes packets without transmitting.
-///
-/// This prevents the broadcast channel from reporting lag for this output
-/// while the real WebRTC implementation is not yet available. The loop
-/// exits when the cancellation token fires or the broadcast channel closes.
+/// Stub receive loop — consumes packets without transmitting.
+/// Used when webrtc feature is disabled, or for WHEP server mode
+/// (where actual sending happens in per-viewer session tasks).
 async fn webrtc_stub_loop(
     config: &WebrtcOutputConfig,
-    rx: &mut broadcast::Receiver<RtpPacket>,
+    mut rx: broadcast::Receiver<RtpPacket>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
 ) {
@@ -127,16 +80,10 @@ async fn webrtc_stub_loop(
             result = rx.recv() => {
                 match result {
                     Ok(_packet) => {
-                        // Stub: consume and discard. A real implementation would
-                        // demux TS, extract H.264 NALUs, repacketize per RFC 6184,
-                        // and send via the SRTP session established through WHIP.
+                        // Consume silently
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         stats.packets_dropped.fetch_add(n, Ordering::Relaxed);
-                        tracing::warn!(
-                            "WebRTC output '{}' lagged, dropped {n} packets",
-                            config.id,
-                        );
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         tracing::info!("WebRTC output '{}' broadcast channel closed", config.id);
@@ -146,4 +93,192 @@ async fn webrtc_stub_loop(
             }
         }
     }
+}
+
+/// WHIP client output loop — pushes media to an external WHIP endpoint.
+#[cfg(feature = "webrtc")]
+async fn whip_client_loop(
+    config: WebrtcOutputConfig,
+    mut rx: broadcast::Receiver<RtpPacket>,
+    stats: Arc<OutputStatsAccumulator>,
+    cancel: CancellationToken,
+) {
+    use std::time::Instant;
+    use super::ts_parse::strip_rtp_header;
+    use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
+    use super::webrtc::ts_demux::TsDemuxer;
+    use super::webrtc::rtp_h264::H264Packetizer;
+    use str0m::media::MediaTime;
+
+    let whip_url = match &config.whip_url {
+        Some(url) => url.clone(),
+        None => {
+            tracing::error!("WebRTC output '{}': no whip_url configured", config.id);
+            return;
+        }
+    };
+
+    let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+    let public_ip = config.public_ip.as_ref().and_then(|ip| ip.parse().ok());
+    let session_config = SessionConfig { bind_addr, public_ip };
+    let mut backoff_secs = 1u64;
+
+    'outer: loop {
+        // Create session
+        let mut session = match WebrtcSession::new(&session_config).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("WHIP client '{}': session error: {}", config.id, e);
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                }
+                backoff_secs = (backoff_secs * 2).min(30);
+                continue;
+            }
+        };
+
+        // Create SDP offer (sendonly video + optional audio)
+        let (offer_sdp, pending) = match session.create_offer(true, !config.video_only, true) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::error!("WHIP client '{}': SDP offer error: {}", config.id, e);
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                }
+                backoff_secs = (backoff_secs * 2).min(30);
+                continue;
+            }
+        };
+
+        // POST to WHIP endpoint
+        let (answer_sdp, _resource_url) = match super::webrtc::signaling::whip_post(
+            &whip_url,
+            &offer_sdp,
+            config.bearer_token.as_deref(),
+        ).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("WHIP signaling '{}' failed: {}", config.id, e);
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                }
+                backoff_secs = (backoff_secs * 2).min(30);
+                continue;
+            }
+        };
+
+        if let Err(e) = session.apply_answer(&answer_sdp, pending) {
+            tracing::error!("WHIP client '{}': SDP answer error: {}", config.id, e);
+            continue;
+        }
+
+        backoff_secs = 1;
+        tracing::info!("WHIP client '{}' connected to {}", config.id, whip_url);
+
+        // Wait for ICE+DTLS to complete
+        let child_cancel = cancel.child_token();
+        let mut connected = false;
+
+        // Wait for connected event before sending media
+        loop {
+            let event = session.poll_event(&child_cancel).await;
+            match event {
+                SessionEvent::Connected => {
+                    connected = true;
+                    tracing::info!("WHIP client '{}' session established", config.id);
+                    break;
+                }
+                SessionEvent::Disconnected => {
+                    tracing::warn!("WHIP client '{}' disconnected during setup", config.id);
+                    continue 'outer;
+                }
+                _ => continue,
+            }
+        }
+
+        if !connected {
+            continue;
+        }
+
+        // Get the video PT
+        let video_mid = match session.video_mid {
+            Some(mid) => mid,
+            None => {
+                tracing::error!("WHIP client '{}': no video MID", config.id);
+                continue;
+            }
+        };
+        let video_pt = match session.get_pt(video_mid) {
+            Some(pt) => pt,
+            None => {
+                tracing::error!("WHIP client '{}': no video PT negotiated", config.id);
+                continue;
+            }
+        };
+
+        // Send loop: demux TS → packetize H.264 → send via str0m
+        let mut demuxer = TsDemuxer::new();
+        let mut rtp_seq: u16 = 0;
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break 'outer,
+
+                result = rx.recv() => {
+                    match result {
+                        Ok(packet) => {
+                            let payload = strip_rtp_header(&packet);
+                            if payload.is_empty() { continue; }
+
+                            let frames = demuxer.demux(payload);
+                            for frame in frames {
+                                match frame {
+                                    super::webrtc::ts_demux::DemuxedFrame::H264 { nalus, pts, .. } => {
+                                        let nalu_count = nalus.len();
+                                        for (i, nalu) in nalus.iter().enumerate() {
+                                            let is_last = i == nalu_count - 1;
+                                            let rtp_payloads = H264Packetizer::packetize(nalu, is_last);
+                                            for rtp_payload in &rtp_payloads {
+                                                let media_time = MediaTime::new(pts, str0m::media::Frequency::NINETY_KHZ);
+                                                if let Err(e) = session.write_media(
+                                                    video_mid,
+                                                    video_pt,
+                                                    Instant::now(),
+                                                    media_time,
+                                                    &rtp_payload.data,
+                                                ) {
+                                                    tracing::debug!("WHIP write error: {}", e);
+                                                }
+                                                stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                                stats.bytes_sent.fetch_add(rtp_payload.data.len() as u64, Ordering::Relaxed);
+                                                rtp_seq = rtp_seq.wrapping_add(1);
+                                            }
+                                        }
+                                    }
+                                    super::webrtc::ts_demux::DemuxedFrame::Opus { .. } => {
+                                        // TODO: Send Opus via audio MID
+                                    }
+                                }
+                            }
+
+                            // Drive str0m (send any queued output)
+                            // poll_event would block, so just drain transmits
+                            while let Ok(str0m::Output::Transmit(t)) = session.rtc_poll_output() {
+                                let _ = session.send_udp(&t).await;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            stats.packets_dropped.fetch_add(n, Ordering::Relaxed);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break 'outer,
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::info!("WebRTC output '{}' stopped", config.id);
 }

@@ -6,7 +6,7 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
 
 ## Input Protocols
 
-### RTP/UDP (SMPTE ST 2022-2)
+### RTP (SMPTE ST 2022-2)
 - **Direction:** Input
 - **Transport:** UDP unicast or multicast, IPv4 and IPv6
 - **Payload:** MPEG-2 Transport Stream in RTP per SMPTE ST 2022-2
@@ -18,6 +18,15 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
   - Per-flow ingress rate limiting (RP 2129 C7)
   - DSCP/QoS marking on egress (RP 2129 C10)
   - VSF TR-07 mode: auto-detects JPEG XS streams
+
+### UDP (Raw MPEG-TS)
+- **Direction:** Input
+- **Transport:** UDP unicast or multicast, IPv4 and IPv6
+- **Payload:** Raw MPEG-TS datagrams (no RTP headers required)
+- **Features:**
+  - Accepts any UDP datagram (no RTP v2 header filtering)
+  - IGMP/MLD multicast group join with interface selection
+  - Compatible with OBS, ffmpeg `udp://` output, srt-live-transmit, VLC
 
 ### SRT (Secure Reliable Transport)
 - **Direction:** Input
@@ -31,13 +40,24 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
 
 ## Output Protocols
 
-### RTP/UDP (SMPTE ST 2022-2)
+### RTP (SMPTE ST 2022-2)
 - **Direction:** Output
 - **Transport:** UDP unicast or multicast
+- **Payload:** RTP-wrapped MPEG-TS packets with RTP headers
 - **Features:**
   - SMPTE 2022-1 FEC encode
   - DSCP/QoS marking (default: 46 Expedited Forwarding)
   - Multicast with interface selection
+
+### UDP (Raw MPEG-TS)
+- **Direction:** Output
+- **Transport:** UDP unicast or multicast
+- **Payload:** Raw MPEG-TS datagrams (7×188 = 1316 bytes, no RTP headers)
+- **Features:**
+  - Strips RTP headers when input is RTP-wrapped
+  - TS sync detection and packet alignment
+  - DSCP/QoS marking
+  - Compatible with ffplay, VLC, multicast distribution
 
 ### SRT (Secure Reliable Transport)
 - **Direction:** Output
@@ -77,18 +97,35 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
   - Output only. Segment-based transport inherently adds 1-4 seconds of latency.
   - Uses a minimal built-in HTTP client (not a full HTTP/2 client).
 
-### WebRTC/WHIP
-- **Direction:** Output only
-- **Transport:** UDP (ICE/DTLS/SRTP)
-- **Status:** Stub implementation. Full support requires the `webrtc` cargo feature.
-- **Planned features:**
-  - WHIP (WebRTC-HTTP Ingestion Protocol) signaling
-  - H.264 NALU extraction and RFC 6184 repacketization
-  - ICE/DTLS/SRTP via the `webrtc-rs` pure Rust stack
+### RTSP
+- **Direction:** Input only
+- **Transport:** TCP (interleaved) or UDP
+- **Client library:** `retina` (pure Rust)
+- **Features:**
+  - Pull H.264 or H.265/HEVC video and AAC audio from IP cameras and media servers
+  - Digest and Basic authentication support
+  - TCP interleaved (default, works through firewalls) or UDP transport
+  - Automatic reconnection with configurable delay
+  - Received media is muxed into MPEG-TS with proper PAT/PMT program tables
+  - Audio-only streams supported (PAT/PMT emitted even without video)
 - **Limitations:**
-  - Audio: Only Opus passthrough. AAC-to-Opus transcoding requires C libraries (`libopus`, `libfdk-aac`) which are not available in the pure Rust build.
-  - Feature-gated: adds significant compile time (~5 minutes for clean build).
-  - Requires a WHIP-compatible endpoint.
+  - Input only (no RTSP server mode)
+  - AAC audio is passed through as ADTS in MPEG-TS
+
+### WebRTC (WHIP/WHEP)
+- **Direction:** Input and Output
+- **Transport:** UDP (ICE-lite/DTLS/SRTP) via `str0m` pure-Rust WebRTC stack
+- **Status:** Fully implemented. Requires the `webrtc` cargo feature.
+- **Four modes:**
+  - **WHIP input** (server): Accept contributions from OBS, browsers — endpoint at `/api/v1/flows/{id}/whip`
+  - **WHIP output** (client): Push media to external WHIP endpoints (CDN, cloud)
+  - **WHEP output** (server): Serve browser viewers — endpoint at `/api/v1/flows/{id}/whep`
+  - **WHEP input** (client): Pull media from external WHEP servers
+- **Video:** H.264 only (RFC 6184 RTP packetization/depacketization)
+- **Audio:** Opus passthrough. Opus flows natively on WebRTC paths and gets muxed into MPEG-TS for SRT/RTP/UDP outputs. AAC sources going to WebRTC output automatically fall back to video-only (no C-library transcoding).
+- **Interoperability:** Compatible with OBS, browsers, Cloudflare, LiveKit, and other standard WHIP/WHEP implementations.
+- **Security:** Bearer token authentication on WHIP/WHEP endpoints, DTLS/SRTP encryption, ICE-lite for server modes.
+- **NAT traversal:** Configurable `public_ip` and optional `stun_server` for ICE candidate advertisement.
 
 ## Monitoring and Analysis
 
@@ -115,7 +152,7 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
 | Feature | Description | Default |
 |---------|-------------|---------|
 | `tls` | Enable RTMPS (RTMP over TLS) via `rustls`/`tokio-rustls` | No |
-| `webrtc` | Enable WebRTC/WHIP output via `webrtc-rs` | No |
+| `webrtc` | Enable WebRTC WHIP/WHEP input and output via `str0m` | No |
 
 Build with all features:
 ```bash

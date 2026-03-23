@@ -1,6 +1,6 @@
 # bilbycast-edge
 
-Media transport edge node supporting SRT, RTP/UDP, RTMP, HLS, and WebRTC protocols. Each node runs one or more flows, where a flow consists of a single input fanning out to multiple outputs, with support for SMPTE 2022-1 FEC and SMPTE 2022-7 hitless redundancy.
+Media transport edge node supporting SRT, RTP, UDP, RTMP, HLS, and WebRTC protocols. Each node runs one or more flows, where a flow consists of a single input fanning out to multiple outputs, with support for SMPTE 2022-1 FEC and SMPTE 2022-7 hitless redundancy.
 
 Supports NMOS IS-04 (Discovery & Registration) and IS-05 (Connection Management) for integration with broadcast control systems. Exposes Prometheus metrics for monitoring.
 
@@ -9,10 +9,12 @@ Supports NMOS IS-04 (Discovery & Registration) and IS-05 (Connection Management)
 | Protocol | Input | Output | Notes                                          |
 |----------|-------|--------|-------------------------------------------------|
 | SRT      | Yes   | Yes    | Caller, listener, rendezvous modes; AES encryption; 2022-7 redundancy |
-| RTP/UDP  | Yes   | Yes    | Unicast and multicast; SMPTE 2022-1 FEC; DSCP QoS marking |
-| RTMP     | No    | Yes    | H.264/AAC only; supports RTMPS (TLS)           |
+| RTP      | Yes   | Yes    | RTP-wrapped over UDP; unicast and multicast; SMPTE 2022-1 FEC; DSCP QoS |
+| UDP      | Yes   | Yes    | Raw MPEG-TS over UDP; unicast and multicast; DSCP QoS marking |
+| RTMP     | Yes   | Yes    | H.264/AAC; accepts publish from OBS/ffmpeg; supports RTMPS (TLS) |
+| RTSP     | Yes   | No     | Pull H.264/H.265 from IP cameras/media servers; TCP/UDP transport; auto-reconnect |
 | HLS      | No    | Yes    | Segment-based ingest; supports HEVC/HDR         |
-| WebRTC   | No    | Yes    | WHIP signaling; H.264 video; Opus audio passthrough |
+| WebRTC   | Yes   | Yes    | WHIP/WHEP; H.264 video + Opus audio; requires `webrtc` feature |
 
 ## Quick Start
 
@@ -140,6 +142,22 @@ Supports NMOS IS-04 (Discovery & Registration) and IS-05 (Connection Management)
 5. **The node appears** in the manager dashboard and can be configured and monitored remotely. Commands from the manager (create flow, delete flow, add/remove output) are executed automatically.
 
 6. **Credentials are saved automatically** to the config file after registration. On subsequent starts, the node reconnects using `node_id` and `node_secret` (the `registration_token` field is cleared). The connection uses exponential backoff (1s to 60s) for automatic reconnection.
+
+### Option 4: Browser-based setup (field deployment)
+
+For COTS hardware deployed at venues where SSH access is impractical:
+
+1. Follow build steps from Option 1. Start the node with a minimal or empty config.
+
+2. **Open the setup wizard** in a browser at `http://<edge-ip>:8080/setup`.
+
+3. **Fill in the form**: device name, API listen address/port, manager URL, registration token, and whether to accept self-signed certificates.
+
+4. **Save** -- the configuration is written to disk.
+
+5. **Restart the service** to apply the new settings (e.g., `systemctl restart bilbycast-edge`).
+
+The setup wizard is enabled by default (`setup_enabled: true` in config). Set it to `false` after provisioning to disable access. The wizard requires no authentication -- it is intended for initial setup of unconfigured nodes.
 
 ## CLI Options
 

@@ -64,6 +64,33 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
         }
     }
 
+    // Validate device name if present
+    if let Some(ref name) = config.device_name {
+        if name.len() > 256 {
+            bail!("Device name must be at most 256 characters");
+        }
+    }
+
+    // Validate manager config if present
+    if let Some(ref mgr) = config.manager {
+        if mgr.enabled {
+            if mgr.url.is_empty() {
+                bail!("Manager URL cannot be empty when manager is enabled");
+            }
+            if !mgr.url.starts_with("wss://") {
+                bail!("Manager URL must start with wss:// (TLS required)");
+            }
+            if mgr.url.len() > 2048 {
+                bail!("Manager URL must be at most 2048 characters");
+            }
+            if let Some(ref token) = mgr.registration_token {
+                if token.len() > 4096 {
+                    bail!("Manager registration token must be at most 4096 characters");
+                }
+            }
+        }
+    }
+
     let mut flow_ids = HashSet::new();
     for flow in &config.flows {
         if !flow_ids.insert(&flow.id) {
@@ -161,6 +188,23 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                 }
             }
         }
+        InputConfig::Udp(udp) => {
+            validate_socket_addr(&udp.bind_addr, "UDP input bind_addr")?;
+            if let Some(ref iface) = udp.interface_addr {
+                validate_ip_addr(iface, "UDP input interface_addr")?;
+                // Validate address family consistency
+                let bind_sa: SocketAddr = udp.bind_addr.parse().unwrap();
+                let iface_ip: std::net::IpAddr = iface.parse().map_err(|_| {
+                    anyhow::anyhow!("UDP input interface_addr: invalid IP address '{iface}'")
+                })?;
+                if bind_sa.ip().is_ipv4() != iface_ip.is_ipv4() {
+                    bail!(
+                        "UDP input: bind_addr '{}' and interface_addr '{}' must use the same address family",
+                        udp.bind_addr, iface
+                    );
+                }
+            }
+        }
         InputConfig::Srt(srt) => {
             validate_socket_addr(&srt.local_addr, "SRT input local_addr")?;
             validate_srt_common(
@@ -185,6 +229,54 @@ fn validate_input(input: &InputConfig) -> Result<()> {
             if let Some(ref key) = rtmp.stream_key {
                 if key.len() > 256 {
                     bail!("RTMP input stream_key must be at most 256 characters");
+                }
+            }
+        }
+        InputConfig::Rtsp(rtsp) => {
+            if !rtsp.rtsp_url.starts_with("rtsp://") && !rtsp.rtsp_url.starts_with("rtsps://") {
+                bail!("RTSP input: rtsp_url must start with rtsp:// or rtsps://");
+            }
+            if rtsp.rtsp_url.len() > 2048 {
+                bail!("RTSP input: rtsp_url must be at most 2048 characters");
+            }
+            if let Some(ref user) = rtsp.username {
+                if user.len() > 256 {
+                    bail!("RTSP input: username must be at most 256 characters");
+                }
+            }
+            if let Some(ref pass) = rtsp.password {
+                if pass.len() > 256 {
+                    bail!("RTSP input: password must be at most 256 characters");
+                }
+            }
+        }
+        InputConfig::Webrtc(webrtc) => {
+            if let Some(ref token) = webrtc.bearer_token {
+                if token.len() > 4096 {
+                    bail!("WebRTC input: bearer_token must be at most 4096 characters");
+                }
+            }
+            if let Some(ref ip) = webrtc.public_ip {
+                if ip.parse::<std::net::IpAddr>().is_err() {
+                    bail!("WebRTC input: invalid public_ip '{}'", ip);
+                }
+            }
+            if let Some(ref stun) = webrtc.stun_server {
+                if stun.len() > 2048 {
+                    bail!("WebRTC input: stun_server must be at most 2048 characters");
+                }
+            }
+        }
+        InputConfig::Whep(whep) => {
+            if !whep.whep_url.starts_with("http://") && !whep.whep_url.starts_with("https://") {
+                bail!("WHEP input: whep_url must start with http:// or https://");
+            }
+            if whep.whep_url.len() > 2048 {
+                bail!("WHEP input: whep_url must be at most 2048 characters");
+            }
+            if let Some(ref token) = whep.bearer_token {
+                if token.len() > 4096 {
+                    bail!("WHEP input: bearer_token must be at most 4096 characters");
                 }
             }
         }
@@ -248,6 +340,20 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
                 bail!("RTP output '{}': DSCP must be 0-63, got {}", rtp.id, rtp.dscp);
             }
         }
+        OutputConfig::Udp(udp) => {
+            validate_id(&udp.id, "UDP output")?;
+            validate_name(&udp.name, "UDP output")?;
+            validate_socket_addr(&udp.dest_addr, "UDP output dest_addr")?;
+            if let Some(ref bind) = udp.bind_addr {
+                validate_socket_addr(bind, "UDP output bind_addr")?;
+            }
+            if let Some(ref iface) = udp.interface_addr {
+                validate_ip_addr(iface, "UDP output interface_addr")?;
+            }
+            if udp.dscp > 63 {
+                bail!("UDP output '{}': DSCP must be 0-63, got {}", udp.id, udp.dscp);
+            }
+        }
         OutputConfig::Srt(srt) => {
             validate_id(&srt.id, "SRT output")?;
             validate_name(&srt.name, "SRT output")?;
@@ -309,15 +415,34 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
         OutputConfig::Webrtc(webrtc) => {
             validate_id(&webrtc.id, "WebRTC output")?;
             validate_name(&webrtc.name, "WebRTC output")?;
-            if !webrtc.whip_url.starts_with("http://") && !webrtc.whip_url.starts_with("https://") {
-                bail!("WebRTC output '{}': whip_url must start with http:// or https://", webrtc.id);
-            }
-            if webrtc.whip_url.len() > 2048 {
-                bail!("WebRTC output '{}': whip_url must be at most 2048 characters", webrtc.id);
+            match webrtc.mode {
+                crate::config::models::WebrtcOutputMode::WhipClient => {
+                    let url = webrtc.whip_url.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("WebRTC output '{}': whip_url is required for whip_client mode", webrtc.id)
+                    })?;
+                    if !url.starts_with("http://") && !url.starts_with("https://") {
+                        bail!("WebRTC output '{}': whip_url must start with http:// or https://", webrtc.id);
+                    }
+                    if url.len() > 2048 {
+                        bail!("WebRTC output '{}': whip_url must be at most 2048 characters", webrtc.id);
+                    }
+                }
+                crate::config::models::WebrtcOutputMode::WhepServer => {
+                    if let Some(max) = webrtc.max_viewers {
+                        if max == 0 || max > 100 {
+                            bail!("WebRTC output '{}': max_viewers must be 1-100, got {}", webrtc.id, max);
+                        }
+                    }
+                }
             }
             if let Some(ref token) = webrtc.bearer_token {
                 if token.len() > 4096 {
                     bail!("WebRTC output '{}': bearer_token must be at most 4096 characters", webrtc.id);
+                }
+            }
+            if let Some(ref ip) = webrtc.public_ip {
+                if ip.parse::<std::net::IpAddr>().is_err() {
+                    bail!("WebRTC output '{}': invalid public_ip '{}'", webrtc.id, ip);
                 }
             }
         }
@@ -588,6 +713,8 @@ mod tests {
         let config = AppConfig {
             version: 1,
             node_id: None,
+            device_name: None,
+            setup_enabled: true,
             server: ServerConfig::default(),
             monitor: None,
             manager: None,

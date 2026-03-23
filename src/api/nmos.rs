@@ -105,14 +105,18 @@ fn nmos_version() -> String {
 fn input_transport(input: &InputConfig) -> &'static str {
     match input {
         InputConfig::Rtp(_) => "urn:x-nmos:transport:rtp",
+        InputConfig::Udp(_) => "urn:x-nmos:transport:rtp",
         InputConfig::Srt(_) => "urn:x-nmos:transport:rtp",
         InputConfig::Rtmp(_) => "urn:x-nmos:transport:rtp",
+        InputConfig::Rtsp(_) => "urn:x-nmos:transport:rtp",
+        InputConfig::Webrtc(_) | InputConfig::Whep(_) => "urn:x-nmos:transport:websocket",
     }
 }
 
 fn output_transport(output: &OutputConfig) -> &'static str {
     match output {
         OutputConfig::Rtp(_) => "urn:x-nmos:transport:rtp",
+        OutputConfig::Udp(_) => "urn:x-nmos:transport:rtp",
         OutputConfig::Srt(_) => "urn:x-nmos:transport:rtp",
         OutputConfig::Rtmp(_) => "urn:x-nmos:transport:rtp",
         OutputConfig::Hls(_) => "urn:x-nmos:transport:rtp",
@@ -123,14 +127,19 @@ fn output_transport(output: &OutputConfig) -> &'static str {
 fn input_type_str(input: &InputConfig) -> &'static str {
     match input {
         InputConfig::Rtp(_) => "rtp",
+        InputConfig::Udp(_) => "udp",
         InputConfig::Srt(_) => "srt",
         InputConfig::Rtmp(_) => "rtmp",
+        InputConfig::Rtsp(_) => "rtsp",
+        InputConfig::Webrtc(_) => "webrtc",
+        InputConfig::Whep(_) => "whep",
     }
 }
 
 fn output_id(output: &OutputConfig) -> &str {
     match output {
         OutputConfig::Rtp(c) => &c.id,
+        OutputConfig::Udp(c) => &c.id,
         OutputConfig::Srt(c) => &c.id,
         OutputConfig::Rtmp(c) => &c.id,
         OutputConfig::Hls(c) => &c.id,
@@ -141,6 +150,7 @@ fn output_id(output: &OutputConfig) -> &str {
 fn output_name(output: &OutputConfig) -> &str {
     match output {
         OutputConfig::Rtp(c) => &c.name,
+        OutputConfig::Udp(c) => &c.name,
         OutputConfig::Srt(c) => &c.name,
         OutputConfig::Rtmp(c) => &c.name,
         OutputConfig::Hls(c) => &c.name,

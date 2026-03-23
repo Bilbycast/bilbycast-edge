@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-edge"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 
@@ -76,8 +76,8 @@ rcgen = "0.14.7"
 default = []
 # Enable TLS (HTTPS on API + RTMPS) support via rustls/tokio-rustls/axum-server.
 tls = ["dep:tokio-rustls", "dep:axum-server"]
-# Enable WebRTC/WHIP output via webrtc-rs (large dependency tree).
-# webrtc = ["dep:webrtc"]
+# Enable WebRTC WHIP/WHEP input and output via str0m (pure Rust, sans-I/O).
+webrtc = ["dep:str0m", "dep:reqwest"]
 
 [dependencies.tokio-rustls]
 version = "0.26.4"
@@ -88,10 +88,18 @@ version = "0.8.0"
 features = ["tls-rustls"]
 optional = true
 
-# Uncomment to enable WebRTC/WHIP output:
-# [dependencies.webrtc]
-# version = "0.11"
-# optional = true
+[dependencies.str0m]
+version = "0.17.0"
+optional = true
+
+[dependencies.reqwest]
+version = "0.13.2"
+default-features = false
+features = ["rustls"]
+optional = true
+
+[dependencies.retina]
+version = "0.4.19"
 
 [dev-dependencies]
 tempfile = "3.27.0"

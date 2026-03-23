@@ -63,6 +63,10 @@ fn populate_transport_info(config: &FlowConfig, state: &mut MediaAnalysisState) 
                 ));
             }
         }
+        InputConfig::Udp(_) => {
+            state.protocol = "udp".to_string();
+            state.payload_format = "raw_ts".to_string();
+        }
         InputConfig::Srt(srt) => {
             state.protocol = "srt".to_string();
             // SRT can carry either RTP-wrapped or raw TS; we'll detect from data
@@ -75,6 +79,18 @@ fn populate_transport_info(config: &FlowConfig, state: &mut MediaAnalysisState) 
         InputConfig::Rtmp(_) => {
             state.protocol = "rtmp".to_string();
             state.payload_format = "raw_ts".to_string();
+        }
+        InputConfig::Rtsp(_) => {
+            state.protocol = "rtsp".to_string();
+            state.payload_format = "raw_ts".to_string();
+        }
+        InputConfig::Webrtc(_) => {
+            state.protocol = "webrtc".to_string();
+            state.payload_format = "rtp_h264".to_string();
+        }
+        InputConfig::Whep(_) => {
+            state.protocol = "whep".to_string();
+            state.payload_format = "rtp_h264".to_string();
         }
     }
 }
