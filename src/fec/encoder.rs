@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
 //! SMPTE 2022-1 FEC Encoder -- generates column and row FEC packets.
 //!
 //! Accumulates media packets in an L x D matrix. After each complete column

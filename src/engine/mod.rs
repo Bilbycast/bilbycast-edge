@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
 //! Flow engine: lifecycle management for input and output tasks.
 //!
 //! The [`manager::FlowManager`] orchestrates creating, starting, stopping, and

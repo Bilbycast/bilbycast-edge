@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
 //! MPEG-TS demuxer for WebRTC output.
 //!
 //! Extracts H.264 NAL units and Opus audio frames from an MPEG-TS stream

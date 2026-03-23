@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
 //! RTSP input — pulls H.264/AAC from RTSP sources (IP cameras, media servers).
 //!
 //! Uses the `retina` pure-Rust RTSP client for signaling and RTP reception.

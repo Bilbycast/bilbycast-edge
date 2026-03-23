@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
 //! Shared utilities: RTP parsing, UDP socket setup, and monotonic time.
 //!
 //! - [`rtp_parse`] -- Zero-copy extraction of RTP header fields: sequence number,

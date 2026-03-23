@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
 //! SMPTE 2022-1 FEC Decoder -- recovers lost RTP packets using FEC data.
 //!
 //! The decoder maintains an L x D FEC matrix. Media packets are placed into

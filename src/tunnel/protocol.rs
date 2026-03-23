@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
 //! Wire protocol for QUIC tunnel control and data streams.
 //!
 //! This must match the protocol defined in `bilbycast-relay/src/protocol.rs`.

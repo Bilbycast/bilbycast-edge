@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
 //! SMPTE 2022-7 hitless redundancy: merge (RX).
 //!
 //! - [`merger::HitlessMerger`] -- De-duplicates RTP packets arriving from two

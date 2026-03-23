@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
 //! RFC 6184 H.264 RTP depacketizer.
 //!
 //! Reassembles H.264 NAL units from incoming RTP packets. Handles:

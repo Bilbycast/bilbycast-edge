@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
 //! SMPTE 2022-1 Forward Error Correction (FEC) encoder and decoder.
 //!
 //! Provides column and row XOR parity across an L x D matrix of RTP packets.

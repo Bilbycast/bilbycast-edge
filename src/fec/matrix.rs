@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
 //! SMPTE 2022-1 FEC Matrix -- L x D grid for XOR parity computation.
 //!
 //! Layout: L columns x D rows. Media packets are placed column-major:

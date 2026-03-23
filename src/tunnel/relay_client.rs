@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
 //! Relay client — manages the QUIC connection to a bilbycast-relay server.
 //!
 //! Handles authentication, tunnel binding, keepalive, and reconnection.

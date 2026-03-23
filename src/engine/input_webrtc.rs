@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
 //! WebRTC input tasks: WHIP server (receive contributions) and WHEP client (pull from server).
 //!
 //! Both modes receive H.264 video (and optionally Opus audio) via WebRTC,

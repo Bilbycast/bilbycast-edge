@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
+// Copyright (c) 2026 Reza Rahimi. All rights reserved.
+// SPDX-License-Identifier: Elastic-2.0
+
 //! RTMP output task — publishes demuxed H.264/AAC to an RTMP server.
 //!
 //! Subscribes to the flow's broadcast channel, demuxes MPEG-TS into
