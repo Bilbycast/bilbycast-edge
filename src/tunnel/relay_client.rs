@@ -3,7 +3,9 @@
 
 //! Relay client — manages the QUIC connection to a bilbycast-relay server.
 //!
-//! Handles authentication, tunnel binding, keepalive, and reconnection.
+//! The relay is stateless — no authentication needed. The edge connects and
+//! immediately binds tunnels by UUID. All tunnel data is encrypted end-to-end
+//! between edge nodes; the relay only sees ciphertext.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,7 +17,6 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::auth;
 use super::config::{TunnelDirection, TunnelProtocol};
 use super::protocol::{
     self, EdgeMessage, RelayDirection, RelayMessage, RelayProtocol, ALPN_RELAY,
@@ -26,7 +27,6 @@ use super::quic;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayTunnelState {
     Connecting,
-    Authenticating,
     Waiting,
     Ready,
     Down,
@@ -36,7 +36,6 @@ impl std::fmt::Display for RelayTunnelState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Connecting => write!(f, "connecting"),
-            Self::Authenticating => write!(f, "authenticating"),
             Self::Waiting => write!(f, "waiting"),
             Self::Ready => write!(f, "ready"),
             Self::Down => write!(f, "down"),
@@ -48,16 +47,16 @@ impl std::fmt::Display for RelayTunnelState {
 pub struct RelayTunnelParams {
     pub tunnel_id: Uuid,
     pub relay_addr: SocketAddr,
-    pub edge_id: String,
-    pub relay_secret: String,
     pub direction: TunnelDirection,
     pub protocol: TunnelProtocol,
 }
 
-/// Establish a QUIC connection to the relay, authenticate, and bind the tunnel.
+/// Establish a QUIC connection to the relay and bind the tunnel.
 ///
-/// Returns the QUIC connection and a state watch receiver.
-/// The connection is ready for data forwarding once state becomes `Ready`.
+/// No authentication step — the relay is stateless. The edge connects and
+/// immediately sends a TunnelBind message.
+///
+/// Returns the QUIC connection ready for data forwarding once state becomes `Ready`.
 pub async fn connect_and_bind(
     params: &RelayTunnelParams,
     state_tx: &watch::Sender<RelayTunnelState>,
@@ -81,25 +80,7 @@ pub async fn connect_and_bind(
     // Open control stream (bidirectional stream 0)
     let (mut send, mut recv) = conn.open_bi().await?;
 
-    // Authenticate
-    state_tx.send_replace(RelayTunnelState::Authenticating);
-    let token = auth::generate_token(&params.edge_id, &params.relay_secret);
-    protocol::write_message(&mut send, &EdgeMessage::Auth { token }).await?;
-
-    let response: RelayMessage = protocol::read_message(&mut recv).await?;
-    match response {
-        RelayMessage::AuthOk { edge_id } => {
-            tracing::info!(tunnel_id = %params.tunnel_id, edge_id = %edge_id, "Relay auth OK");
-        }
-        RelayMessage::AuthError { reason } => {
-            anyhow::bail!("Relay auth failed: {reason}");
-        }
-        other => {
-            anyhow::bail!("Unexpected relay response during auth: {other:?}");
-        }
-    }
-
-    // Bind tunnel
+    // Bind tunnel immediately (no auth step)
     let relay_direction = match params.direction {
         TunnelDirection::Ingress => RelayDirection::Ingress,
         TunnelDirection::Egress => RelayDirection::Egress,

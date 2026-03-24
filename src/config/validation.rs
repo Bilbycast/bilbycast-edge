@@ -607,17 +607,25 @@ pub fn validate_tunnel(tunnel: &crate::tunnel::TunnelConfig) -> Result<()> {
         }
     }
 
+    // Validate tunnel encryption key
+    if let Some(ref key) = tunnel.tunnel_encryption_key {
+        if key.len() != 64 {
+            bail!(
+                "Tunnel '{}': tunnel_encryption_key must be exactly 64 hex characters (32 bytes), got {} chars",
+                tunnel.id, key.len()
+            );
+        }
+        if !key.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!("Tunnel '{}': tunnel_encryption_key must contain only hex characters", tunnel.id);
+        }
+    } else if tunnel.mode == crate::tunnel::config::TunnelMode::Relay {
+        bail!(
+            "Tunnel '{}': tunnel_encryption_key is required for relay mode (end-to-end encryption)",
+            tunnel.id
+        );
+    }
+
     // Validate optional string field lengths
-    if let Some(ref s) = tunnel.relay_edge_id {
-        if s.len() > 256 {
-            bail!("Tunnel '{}': relay_edge_id must be at most 256 characters", tunnel.id);
-        }
-    }
-    if let Some(ref s) = tunnel.relay_secret {
-        if s.len() > 256 {
-            bail!("Tunnel '{}': relay_secret must be at most 256 characters", tunnel.id);
-        }
-    }
     if let Some(ref s) = tunnel.tunnel_psk {
         if s.len() > 256 {
             bail!("Tunnel '{}': tunnel_psk must be at most 256 characters", tunnel.id);

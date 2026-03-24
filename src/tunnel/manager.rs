@@ -144,16 +144,6 @@ impl TunnelManager {
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid relay_addr: {e}"))?;
 
-        let edge_id = config
-            .relay_edge_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("relay_edge_id required for relay mode"))?;
-
-        let relay_secret = config
-            .relay_secret
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("relay_secret required for relay mode"))?;
-
         let local_addr: SocketAddr = config
             .local_addr
             .parse()
@@ -162,10 +152,18 @@ impl TunnelManager {
         let params = RelayTunnelParams {
             tunnel_id,
             relay_addr,
-            edge_id,
-            relay_secret,
             direction: config.direction,
             protocol: config.protocol,
+        };
+
+        // Create cipher from encryption key
+        let cipher = if let Some(ref key) = config.tunnel_encryption_key {
+            Some(Arc::new(
+                super::crypto::TunnelCipher::new(key)
+                    .map_err(|e| anyhow::anyhow!("Failed to create tunnel cipher: {e}"))?,
+            ))
+        } else {
+            None
         };
 
         let direction = config.direction;
@@ -183,6 +181,7 @@ impl TunnelManager {
                 cancel.clone(),
                 udp_stats,
                 tcp_stats,
+                cipher,
             )
             .await;
 
@@ -325,6 +324,7 @@ async fn run_relay_tunnel(
     cancel: CancellationToken,
     udp_stats: Option<Arc<UdpForwarderStats>>,
     tcp_stats: Option<Arc<TcpForwarderStats>>,
+    cipher: Option<Arc<super::crypto::TunnelCipher>>,
 ) -> anyhow::Result<()> {
     let tunnel_id = params.tunnel_id;
 
@@ -335,11 +335,12 @@ async fn run_relay_tunnel(
         tunnel_id = %tunnel_id,
         direction = %direction,
         protocol = %protocol,
+        encrypted = cipher.is_some(),
         "Relay tunnel connected, starting forwarder"
     );
 
     // Run the appropriate forwarder using the shared stats
-    run_forwarder(tunnel_id, protocol, direction, local_addr, conn, cancel, udp_stats, tcp_stats).await
+    run_forwarder(tunnel_id, protocol, direction, local_addr, conn, cancel, udp_stats, tcp_stats, cipher).await
 }
 
 /// Main lifecycle for a direct-mode tunnel.
@@ -394,7 +395,7 @@ async fn run_direct_tunnel(
             let conn = incoming.await?;
 
             // Authenticate: accept control stream, verify peer auth
-            state_tx.send_replace(RelayTunnelState::Authenticating);
+            state_tx.send_replace(RelayTunnelState::Connecting);
             let (mut send, mut recv) = conn.accept_bi().await?;
             let msg: PeerMessage = super::protocol::read_message(&mut recv).await?;
 
@@ -440,7 +441,7 @@ async fn run_direct_tunnel(
             let conn = quic::connect(&endpoint, peer_addr, "bilbycast-edge").await?;
 
             // Authenticate: open control stream, send auth
-            state_tx.send_replace(RelayTunnelState::Authenticating);
+            state_tx.send_replace(RelayTunnelState::Connecting);
             let (mut send, mut recv) = conn.open_bi().await?;
             let token = auth::generate_token(&tunnel_id.to_string(), &tunnel_psk);
             super::protocol::write_message(
@@ -468,8 +469,18 @@ async fn run_direct_tunnel(
 
     state_tx.send_replace(RelayTunnelState::Ready);
 
+    // Create cipher for direct mode (defense-in-depth, optional)
+    let cipher = if let Some(ref key) = config.tunnel_encryption_key {
+        Some(Arc::new(
+            super::crypto::TunnelCipher::new(key)
+                .map_err(|e| anyhow::anyhow!("Failed to create tunnel cipher: {e}"))?,
+        ))
+    } else {
+        None
+    };
+
     // Run the appropriate forwarder using the shared stats
-    run_forwarder(tunnel_id, protocol, direction, local_addr, conn, cancel, udp_stats, tcp_stats).await
+    run_forwarder(tunnel_id, protocol, direction, local_addr, conn, cancel, udp_stats, tcp_stats, cipher).await
 }
 
 /// Run the appropriate forwarder for the given protocol and direction.
@@ -483,23 +494,24 @@ async fn run_forwarder(
     cancel: CancellationToken,
     udp_stats: Option<Arc<UdpForwarderStats>>,
     tcp_stats: Option<Arc<TcpForwarderStats>>,
+    cipher: Option<Arc<super::crypto::TunnelCipher>>,
 ) -> anyhow::Result<()> {
     match (protocol, direction) {
         (TunnelProtocol::Udp, TunnelDirection::Egress) => {
             let stats = udp_stats.unwrap_or_else(|| Arc::new(UdpForwarderStats::default()));
-            udp_forwarder::run_egress(tunnel_id, local_addr, conn, stats, cancel).await?;
+            udp_forwarder::run_egress(tunnel_id, local_addr, conn, stats, cancel, cipher).await?;
         }
         (TunnelProtocol::Udp, TunnelDirection::Ingress) => {
             let stats = udp_stats.unwrap_or_else(|| Arc::new(UdpForwarderStats::default()));
-            udp_forwarder::run_ingress(tunnel_id, local_addr, conn, stats, cancel).await?;
+            udp_forwarder::run_ingress(tunnel_id, local_addr, conn, stats, cancel, cipher).await?;
         }
         (TunnelProtocol::Tcp, TunnelDirection::Egress) => {
             let stats = tcp_stats.unwrap_or_else(|| Arc::new(TcpForwarderStats::default()));
-            tcp_forwarder::run_egress(tunnel_id, local_addr, conn, stats, cancel).await?;
+            tcp_forwarder::run_egress(tunnel_id, local_addr, conn, stats, cancel, cipher).await?;
         }
         (TunnelProtocol::Tcp, TunnelDirection::Ingress) => {
             let stats = tcp_stats.unwrap_or_else(|| Arc::new(TcpForwarderStats::default()));
-            tcp_forwarder::run_ingress(tunnel_id, local_addr, conn, stats, cancel).await?;
+            tcp_forwarder::run_ingress(tunnel_id, local_addr, conn, stats, cancel, cipher).await?;
         }
     }
     Ok(())

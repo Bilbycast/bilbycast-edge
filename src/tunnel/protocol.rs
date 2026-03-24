@@ -22,10 +22,6 @@ pub const ALPN_DIRECT: &[u8] = b"bilbycast-direct";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum EdgeMessage {
-    /// Authenticate with a relay token.
-    #[serde(rename = "auth")]
-    Auth { token: String },
-
     /// Bind a tunnel endpoint on this edge.
     #[serde(rename = "tunnel_bind")]
     TunnelBind {
@@ -47,14 +43,6 @@ pub enum EdgeMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum RelayMessage {
-    /// Authentication succeeded.
-    #[serde(rename = "auth_ok")]
-    AuthOk { edge_id: String },
-
-    /// Authentication failed.
-    #[serde(rename = "auth_error")]
-    AuthError { reason: String },
-
     /// Tunnel is ready (both sides have bound).
     #[serde(rename = "tunnel_ready")]
     TunnelReady { tunnel_id: Uuid },

@@ -70,6 +70,8 @@ srt-protocol = { path = "../bilbycast-srt/srt-protocol" }
 quinn = "0.11.9"
 # rustls and rustls-pemfile are always needed (tunnel subsystem uses QUIC/TLS)
 rustls = { version = "0.23.37", features = ["ring"] }
+# AEAD encryption for end-to-end tunnel encryption (ChaCha20-Poly1305)
+ring = "0.17"
 rustls-pemfile = "2.2.0"
 rcgen = "0.14.7"
 

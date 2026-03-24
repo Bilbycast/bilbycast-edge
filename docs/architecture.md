@@ -196,9 +196,12 @@
   Tunnel Security:
   ┌────────────────────────────────────────┐
   │  QUIC + TLS 1.3 (quinn/rustls)        │
-  │  HMAC-SHA256 auth tokens              │
+  │  E2E: ChaCha20-Poly1305 (AEAD)       │
+  │  32-byte shared key per tunnel        │
+  │  Manager generates + distributes keys │
+  │  Relay is stateless (no auth/ACL)     │
+  │  28 bytes overhead (12 nonce+16 tag)  │
   │  Per-tunnel PSK (direct mode)         │
-  │  Shared secret (relay mode)           │
   └────────────────────────────────────────┘
 
   SRT Security:

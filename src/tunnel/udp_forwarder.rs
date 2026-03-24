@@ -6,8 +6,8 @@
 //! Forwards UDP datagrams between a local UDP socket and a QUIC connection
 //! (relay or direct peer) using QUIC datagrams (unreliable, unordered).
 //!
-//! This is ideal for SRT traffic — SRT has its own retransmission and
-//! congestion control, so the unreliable QUIC datagram transport is perfect.
+//! When a `TunnelCipher` is provided, all payloads are encrypted end-to-end
+//! before being sent through the relay. The relay sees only ciphertext.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,6 +20,7 @@ use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::crypto::TunnelCipher;
 use super::protocol;
 
 /// Statistics for a UDP tunnel forwarder.
@@ -43,11 +44,13 @@ pub async fn run_egress(
     conn: Connection,
     stats: Arc<UdpForwarderStats>,
     cancel: CancellationToken,
+    cipher: Option<Arc<TunnelCipher>>,
 ) -> Result<()> {
     let socket = UdpSocket::bind(local_addr).await?;
     tracing::info!(
         tunnel_id = %tunnel_id,
         local_addr = %local_addr,
+        encrypted = cipher.is_some(),
         "UDP egress forwarder started"
     );
 
@@ -60,7 +63,7 @@ pub async fn run_egress(
 
     loop {
         tokio::select! {
-            // Local → QUIC: receive from local UDP socket, send as QUIC datagram
+            // Local → QUIC: receive from local UDP socket, encrypt, send as QUIC datagram
             result = socket.recv_from(&mut buf) => {
                 let (len, from_addr) = result?;
                 // Remember sender for return traffic
@@ -68,7 +71,19 @@ pub async fn run_egress(
                     let mut pa = peer_addr.lock().await;
                     *pa = Some(from_addr);
                 }
-                let datagram = protocol::encode_udp_datagram(&tunnel_id, &buf[..len]);
+                let payload = if let Some(ref c) = cipher {
+                    match c.encrypt(&buf[..len]) {
+                        Ok(encrypted) => encrypted,
+                        Err(e) => {
+                            tracing::debug!(tunnel_id = %tunnel_id, "Encryption error: {e}");
+                            stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    }
+                } else {
+                    buf[..len].to_vec()
+                };
+                let datagram = protocol::encode_udp_datagram(&tunnel_id, &payload);
                 match conn.send_datagram(Bytes::from(datagram)) {
                     Ok(()) => {
                         stats.packets_sent.fetch_add(1, Ordering::Relaxed);
@@ -81,13 +96,24 @@ pub async fn run_egress(
                 }
             }
 
-            // QUIC → Local: receive QUIC datagram, forward to last-seen local sender
+            // QUIC → Local: receive QUIC datagram, decrypt, forward to last-seen local sender
             result = conn.read_datagram() => {
                 let datagram = result?;
-                if let Some((_tid, payload)) = protocol::decode_udp_datagram(&datagram) {
+                if let Some((_tid, encrypted_payload)) = protocol::decode_udp_datagram(&datagram) {
+                    let payload = if let Some(ref c) = cipher {
+                        match c.decrypt(encrypted_payload) {
+                            Ok(decrypted) => decrypted,
+                            Err(e) => {
+                                tracing::debug!(tunnel_id = %tunnel_id, "Decryption error: {e}");
+                                continue;
+                            }
+                        }
+                    } else {
+                        encrypted_payload.to_vec()
+                    };
                     let pa = peer_addr.lock().await;
                     if let Some(addr) = *pa {
-                        let _ = socket.send_to(payload, addr).await;
+                        let _ = socket.send_to(&payload, addr).await;
                         stats.packets_received.fetch_add(1, Ordering::Relaxed);
                         stats.bytes_received.fetch_add(payload.len() as u64, Ordering::Relaxed);
                     }
@@ -106,7 +132,7 @@ pub async fn run_egress(
 
 /// Run the UDP forwarder for an **ingress** tunnel.
 ///
-/// Ingress: receive QUIC datagrams from relay/peer, extract the payload,
+/// Ingress: receive QUIC datagrams from relay/peer, decrypt the payload,
 /// and forward to `forward_addr`. Also listen for return UDP traffic and
 /// send it back through the QUIC connection.
 pub async fn run_ingress(
@@ -115,6 +141,7 @@ pub async fn run_ingress(
     conn: Connection,
     stats: Arc<UdpForwarderStats>,
     cancel: CancellationToken,
+    cipher: Option<Arc<TunnelCipher>>,
 ) -> Result<()> {
     // Bind an ephemeral port for sending to the forward address
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -122,6 +149,7 @@ pub async fn run_ingress(
         tunnel_id = %tunnel_id,
         forward_addr = %forward_addr,
         local_port = %socket.local_addr()?,
+        encrypted = cipher.is_some(),
         "UDP ingress forwarder started"
     );
 
@@ -130,20 +158,43 @@ pub async fn run_ingress(
 
     loop {
         tokio::select! {
-            // QUIC → Local: receive datagram from relay, forward to local app
+            // QUIC → Local: receive datagram from relay, decrypt, forward to local app
             result = conn.read_datagram() => {
                 let datagram = result?;
-                if let Some((_tid, payload)) = protocol::decode_udp_datagram(&datagram) {
-                    let _ = socket.send_to(payload, forward_addr).await;
+                if let Some((_tid, encrypted_payload)) = protocol::decode_udp_datagram(&datagram) {
+                    let payload = if let Some(ref c) = cipher {
+                        match c.decrypt(encrypted_payload) {
+                            Ok(decrypted) => decrypted,
+                            Err(e) => {
+                                tracing::debug!(tunnel_id = %tunnel_id, "Decryption error: {e}");
+                                continue;
+                            }
+                        }
+                    } else {
+                        encrypted_payload.to_vec()
+                    };
+                    let _ = socket.send_to(&payload, forward_addr).await;
                     stats.packets_received.fetch_add(1, Ordering::Relaxed);
                     stats.bytes_received.fetch_add(payload.len() as u64, Ordering::Relaxed);
                 }
             }
 
-            // Local → QUIC: receive return traffic from local app, send back through tunnel
+            // Local → QUIC: receive return traffic from local app, encrypt, send back
             result = socket.recv_from(&mut buf) => {
                 let (len, _from_addr) = result?;
-                let datagram = protocol::encode_udp_datagram(&tunnel_id, &buf[..len]);
+                let payload = if let Some(ref c) = cipher {
+                    match c.encrypt(&buf[..len]) {
+                        Ok(encrypted) => encrypted,
+                        Err(e) => {
+                            tracing::debug!(tunnel_id = %tunnel_id, "Encryption error: {e}");
+                            stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    }
+                } else {
+                    buf[..len].to_vec()
+                };
+                let datagram = protocol::encode_udp_datagram(&tunnel_id, &payload);
                 match conn.send_datagram(Bytes::from(datagram)) {
                     Ok(()) => {
                         stats.packets_sent.fetch_add(1, Ordering::Relaxed);

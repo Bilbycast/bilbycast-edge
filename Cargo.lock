@@ -306,7 +306,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bilbycast-edge"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -324,6 +324,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "retina",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "serde",

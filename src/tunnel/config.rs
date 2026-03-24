@@ -36,14 +36,13 @@ pub struct TunnelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_addr: Option<String>,
 
-    /// This edge's identity for relay authentication.
-    /// The relay verifies `HMAC-SHA256(edge_id, shared_secret)`.
+    // ── End-to-end encryption ──
+    /// Symmetric encryption key for end-to-end tunnel encryption (hex-encoded, 64 chars = 32 bytes).
+    /// Both edges must have the same key. Distributed by the manager.
+    /// Required for relay mode (relay sees only ciphertext).
+    /// Optional for direct mode (QUIC already encrypts, this adds defense-in-depth).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub relay_edge_id: Option<String>,
-
-    /// Shared secret for relay HMAC-SHA256 authentication.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub relay_secret: Option<String>,
+    pub tunnel_encryption_key: Option<String>,
 
     // ── Direct mode fields ──
     /// Remote peer QUIC address for direct mode, e.g. `"203.0.113.50:4433"`.

@@ -29,6 +29,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod crypto;
 pub mod manager;
 pub mod protocol;
 pub mod quic;
