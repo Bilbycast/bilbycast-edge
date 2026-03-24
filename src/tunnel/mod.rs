@@ -1,9 +1,6 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
-
 //! IP Tunnel subsystem for bilbycast-edge.
 //!
 //! Provides QUIC-based tunneling between edge nodes, either through a relay

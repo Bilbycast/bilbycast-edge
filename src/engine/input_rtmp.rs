@@ -1,9 +1,6 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
-
 //! RTMP input — accepts incoming publish connections and remuxes to MPEG-TS.
 //!
 //! This module runs an RTMP server that accepts one publisher at a time (OBS,

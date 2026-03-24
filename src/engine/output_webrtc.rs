@@ -1,9 +1,6 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
-
 //! WebRTC output tasks: WHIP client (push to server) and WHEP server (serve viewers).
 //!
 //! Both modes extract H.264 NALUs from MPEG-TS broadcast channel packets,
@@ -266,6 +263,9 @@ async fn whip_client_loop(
                                     }
                                     super::webrtc::ts_demux::DemuxedFrame::Opus { .. } => {
                                         // TODO: Send Opus via audio MID
+                                    }
+                                    super::webrtc::ts_demux::DemuxedFrame::Aac { .. } => {
+                                        // AAC not supported in WebRTC — skip
                                     }
                                 }
                             }

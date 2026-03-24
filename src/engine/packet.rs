@@ -1,9 +1,6 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
-
 use bytes::Bytes;
 
 /// Maximum RTP packet size for SMPTE 2022-2 (7 x 188 byte TS packets + 12 byte RTP header)

@@ -306,7 +306,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bilbycast-edge"
-version = "0.3.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2557,7 +2557,7 @@ dependencies = [
 
 [[package]]
 name = "srt-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2574,7 +2574,7 @@ dependencies = [
 
 [[package]]
 name = "srt-transport"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bitflags",
  "bytes",

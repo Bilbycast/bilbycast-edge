@@ -1,9 +1,6 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
-
 /// Minimum RTP header size (no CSRC, no extensions)
 pub const RTP_HEADER_MIN_SIZE: usize = 12;
 

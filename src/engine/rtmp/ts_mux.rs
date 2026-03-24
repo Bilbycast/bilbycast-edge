@@ -1,9 +1,6 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
-
 //! MPEG-TS muxer for H.264 video and AAC audio.
 //!
 //! Takes raw H.264 NALUs and AAC frames (extracted from RTMP FLV tags)

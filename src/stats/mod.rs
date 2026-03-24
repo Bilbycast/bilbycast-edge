@@ -1,9 +1,6 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
-
 //! Statistics collection using lock-free atomic counters.
 //!
 //! - [`collector::StatsCollector`] -- Global registry of per-flow accumulators,

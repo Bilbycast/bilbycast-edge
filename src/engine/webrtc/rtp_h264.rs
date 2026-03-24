@@ -1,9 +1,6 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
-
 //! RFC 6184 H.264 RTP packetizer.
 //!
 //! Converts H.264 NAL units into RTP packets suitable for WebRTC transport.

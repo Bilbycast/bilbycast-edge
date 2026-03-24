@@ -1,9 +1,6 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
-
 //! NMOS IS-04 Node API (v1.3).
 //!
 //! Exposes the edge node as an NMOS Node with Device, Source, Flow, Sender,

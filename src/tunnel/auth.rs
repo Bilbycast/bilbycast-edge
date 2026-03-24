@@ -1,9 +1,6 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
-
 //! HMAC-SHA256 token generation for tunnel authentication.
 //!
 //! Matches the auth scheme in `bilbycast-relay/src/auth.rs`.

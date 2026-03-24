@@ -1,9 +1,6 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
-
 //! Flow engine: lifecycle management for input and output tasks.
 //!
 //! The [`manager::FlowManager`] orchestrates creating, starting, stopping, and
@@ -41,6 +38,7 @@ pub mod output_webrtc;
 pub mod packet;
 pub mod rtmp;
 pub mod tr101290;
+pub mod ts_demux;
 pub mod ts_parse;
 #[cfg(feature = "webrtc")]
 pub mod webrtc;

@@ -1,9 +1,6 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
-
 //! AMF0 (Action Message Format version 0) encoder and decoder.
 //!
 //! AMF0 is used in RTMP command messages (`msg_type 20`) to encode method names,

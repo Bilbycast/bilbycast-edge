@@ -1,9 +1,6 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
-
 //! REST API, WebSocket, and Prometheus metrics server.
 //!
 //! Built on [axum](https://docs.rs/axum). Provides CRUD operations for flow
