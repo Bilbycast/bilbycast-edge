@@ -190,6 +190,25 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                     bail!("RTP input max_bitrate_mbps must be at most 10000 (10 Gbps), got {rate}");
                 }
             }
+            // Validate 2022-7 redundancy (leg 2)
+            if let Some(ref red) = rtp.redundancy {
+                validate_socket_addr(&red.bind_addr, "RTP input redundancy bind_addr")?;
+                if let Some(ref iface) = red.interface_addr {
+                    validate_ip_addr(iface, "RTP input redundancy interface_addr")?;
+                }
+                // Validate leg 2 address family consistency
+                let leg1: SocketAddr = rtp.bind_addr.parse()?;
+                let leg2: SocketAddr = red.bind_addr.parse()?;
+                if leg1.is_ipv4() != leg2.is_ipv4() {
+                    bail!("RTP input redundancy: leg 1 ({}) and leg 2 ({}) must use the same address family", rtp.bind_addr, red.bind_addr);
+                }
+                if let Some(ref iface) = red.interface_addr {
+                    let iface_ip: std::net::IpAddr = iface.parse()?;
+                    if leg2.is_ipv4() != iface_ip.is_ipv4() {
+                        bail!("RTP input redundancy: bind_addr and interface_addr must use the same address family");
+                    }
+                }
+            }
         }
         InputConfig::Udp(udp) => {
             validate_socket_addr(&udp.bind_addr, "UDP input bind_addr")?;
@@ -341,6 +360,27 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
             // Validate DSCP value
             if rtp.dscp > 63 {
                 bail!("RTP output '{}': DSCP must be 0-63, got {}", rtp.id, rtp.dscp);
+            }
+            // Validate 2022-7 redundancy (leg 2)
+            if let Some(ref red) = rtp.redundancy {
+                validate_socket_addr(&red.dest_addr, "RTP output redundancy dest_addr")?;
+                if let Some(ref bind) = red.bind_addr {
+                    validate_socket_addr(bind, "RTP output redundancy bind_addr")?;
+                }
+                if let Some(ref iface) = red.interface_addr {
+                    validate_ip_addr(iface, "RTP output redundancy interface_addr")?;
+                }
+                if let Some(dscp) = red.dscp {
+                    if dscp > 63 {
+                        bail!("RTP output '{}' redundancy: DSCP must be 0-63, got {}", rtp.id, dscp);
+                    }
+                }
+                // Validate address family consistency between legs
+                let leg1: SocketAddr = rtp.dest_addr.parse()?;
+                let leg2: SocketAddr = red.dest_addr.parse()?;
+                if leg1.is_ipv4() != leg2.is_ipv4() {
+                    bail!("RTP output '{}' redundancy: leg 1 ({}) and leg 2 ({}) must use the same address family", rtp.id, rtp.dest_addr, red.dest_addr);
+                }
             }
         }
         OutputConfig::Udp(udp) => {
@@ -577,6 +617,13 @@ fn validate_ip_addr(addr: &str, context: &str) -> Result<()> {
 /// Validates a tunnel configuration.
 pub fn validate_tunnel(tunnel: &crate::tunnel::TunnelConfig) -> Result<()> {
     validate_id(&tunnel.id, "Tunnel")?;
+    // Tunnel IDs must be valid UUIDs to prevent predictable v5 derivation
+    if uuid::Uuid::parse_str(&tunnel.id).is_err() {
+        bail!(
+            "Tunnel '{}': id must be a valid UUID (e.g., '550e8400-e29b-41d4-a716-446655440000')",
+            tunnel.id
+        );
+    }
     validate_name(&tunnel.name, "Tunnel")?;
 
     // Validate local address
@@ -625,6 +672,19 @@ pub fn validate_tunnel(tunnel: &crate::tunnel::TunnelConfig) -> Result<()> {
         );
     }
 
+    // Validate tunnel bind secret (relay authentication)
+    if let Some(ref key) = tunnel.tunnel_bind_secret {
+        if key.len() != 64 {
+            bail!(
+                "Tunnel '{}': tunnel_bind_secret must be exactly 64 hex characters (32 bytes), got {} chars",
+                tunnel.id, key.len()
+            );
+        }
+        if !key.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!("Tunnel '{}': tunnel_bind_secret must contain only hex characters", tunnel.id);
+        }
+    }
+
     // Validate optional string field lengths
     if let Some(ref s) = tunnel.tunnel_psk {
         if s.len() > 256 {
@@ -662,6 +722,7 @@ mod tests {
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
                 tr07_mode: None,
+                redundancy: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -671,6 +732,7 @@ mod tests {
                 interface_addr: None,
                 fec_encode: None,
                 dscp: 46,
+                redundancy: None,
             })],
         };
         assert!(validate_flow(&flow).is_ok());
@@ -691,6 +753,7 @@ mod tests {
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
                 tr07_mode: None,
+                redundancy: None,
             }),
             outputs: vec![],
         };
@@ -744,6 +807,7 @@ mod tests {
                         allowed_payload_types: None,
                         max_bitrate_mbps: None,
                         tr07_mode: None,
+                        redundancy: None,
                     }),
                     outputs: vec![],
                 },
@@ -760,6 +824,7 @@ mod tests {
                         allowed_payload_types: None,
                         max_bitrate_mbps: None,
                         tr07_mode: None,
+                        redundancy: None,
                     }),
                     outputs: vec![],
                 },
@@ -807,6 +872,7 @@ mod tests {
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
                 tr07_mode: None,
+                redundancy: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -816,6 +882,7 @@ mod tests {
                 interface_addr: None,
                 fec_encode: None,
                 dscp: 46,
+                redundancy: None,
             })],
         };
         assert!(validate_flow(&flow).is_ok());
@@ -836,6 +903,7 @@ mod tests {
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
                 tr07_mode: None,
+                redundancy: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -845,6 +913,7 @@ mod tests {
                 interface_addr: Some("192.168.1.100".to_string()),
                 fec_encode: None,
                 dscp: 46,
+                redundancy: None,
             })],
         };
         assert!(validate_flow(&flow).is_ok());
@@ -865,6 +934,7 @@ mod tests {
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
                 tr07_mode: None,
+                redundancy: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -874,6 +944,7 @@ mod tests {
                 interface_addr: Some("::1".to_string()),
                 fec_encode: None,
                 dscp: 46,
+                redundancy: None,
             })],
         };
         assert!(validate_flow(&flow).is_ok());
@@ -896,6 +967,7 @@ mod tests {
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
                 tr07_mode: None,
+                redundancy: None,
             }),
             outputs: vec![],
         };
@@ -917,6 +989,7 @@ mod tests {
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
                 tr07_mode: None,
+                redundancy: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -926,6 +999,7 @@ mod tests {
                 interface_addr: None,
                 fec_encode: None,
                 dscp: 46,
+                redundancy: None,
             })],
         };
         assert!(validate_flow(&flow).is_err());
@@ -946,6 +1020,7 @@ mod tests {
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
                 tr07_mode: None,
+                redundancy: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -955,6 +1030,7 @@ mod tests {
                 interface_addr: Some("::1".to_string()),        // IPv6 - mismatch!
                 fec_encode: None,
                 dscp: 46,
+                redundancy: None,
             })],
         };
         assert!(validate_flow(&flow).is_err());
@@ -975,6 +1051,7 @@ mod tests {
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
                 tr07_mode: None,
+                redundancy: None,
             }),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
@@ -984,6 +1061,7 @@ mod tests {
                 interface_addr: Some("not-an-ip".to_string()),
                 fec_encode: None,
                 dscp: 46,
+                redundancy: None,
             })],
         };
         assert!(validate_flow(&flow).is_err());

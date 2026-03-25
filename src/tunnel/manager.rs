@@ -64,13 +64,21 @@ pub struct TunnelStatsSnapshot {
 /// Manages all active tunnels on this edge node.
 pub struct TunnelManager {
     tunnels: DashMap<String, TunnelRuntime>,
+    /// Manager node_id, used to identify this edge to relay nodes.
+    manager_node_id: Mutex<Option<String>>,
 }
 
 impl TunnelManager {
     pub fn new() -> Self {
         Self {
             tunnels: DashMap::new(),
+            manager_node_id: Mutex::new(None),
         }
+    }
+
+    /// Set the manager node_id (called after manager registration/auth).
+    pub fn set_manager_node_id(&self, id: String) {
+        *self.manager_node_id.lock().unwrap() = Some(id);
     }
 
     /// Create and start a tunnel from the given configuration.
@@ -80,7 +88,7 @@ impl TunnelManager {
         }
 
         let tunnel_id = Uuid::parse_str(&config.id)
-            .unwrap_or_else(|_| Uuid::new_v5(&Uuid::NAMESPACE_OID, config.id.as_bytes()));
+            .map_err(|e| anyhow::anyhow!("Tunnel '{}': id is not a valid UUID: {e}", config.id))?;
 
         let cancel = CancellationToken::new();
         let (state_tx, state_rx) = watch::channel(RelayTunnelState::Connecting);
@@ -149,11 +157,14 @@ impl TunnelManager {
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid local_addr: {e}"))?;
 
+        let edge_id = self.manager_node_id.lock().unwrap().clone();
         let params = RelayTunnelParams {
             tunnel_id,
             relay_addr,
             direction: config.direction,
             protocol: config.protocol,
+            edge_id,
+            tunnel_bind_secret: config.tunnel_bind_secret.clone(),
         };
 
         // Create cipher from encryption key

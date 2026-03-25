@@ -49,6 +49,10 @@ pub struct RelayTunnelParams {
     pub relay_addr: SocketAddr,
     pub direction: TunnelDirection,
     pub protocol: TunnelProtocol,
+    /// Optional manager node_id to identify this edge to the relay.
+    pub edge_id: Option<String>,
+    /// Optional bind secret for relay tunnel authentication.
+    pub tunnel_bind_secret: Option<String>,
 }
 
 /// Establish a QUIC connection to the relay and bind the tunnel.
@@ -80,7 +84,12 @@ pub async fn connect_and_bind(
     // Open control stream (bidirectional stream 0)
     let (mut send, mut recv) = conn.open_bi().await?;
 
-    // Bind tunnel immediately (no auth step)
+    // Identify this edge to the relay (enables topology visualization in the manager)
+    if let Some(ref id) = params.edge_id {
+        protocol::write_message(&mut send, &EdgeMessage::Identify { edge_id: id.clone() }).await?;
+    }
+
+    // Bind tunnel (with optional bind token for relay authentication)
     let relay_direction = match params.direction {
         TunnelDirection::Ingress => RelayDirection::Ingress,
         TunnelDirection::Egress => RelayDirection::Egress,
@@ -90,12 +99,22 @@ pub async fn connect_and_bind(
         TunnelProtocol::Udp => RelayProtocol::Udp,
     };
 
+    // Compute bind token if bind secret is available
+    let bind_token = params.tunnel_bind_secret.as_deref().map(|secret| {
+        let direction_str = match params.direction {
+            TunnelDirection::Ingress => "ingress",
+            TunnelDirection::Egress => "egress",
+        };
+        super::auth::compute_bind_token(&params.tunnel_id.to_string(), direction_str, secret)
+    });
+
     protocol::write_message(
         &mut send,
         &EdgeMessage::TunnelBind {
             tunnel_id: params.tunnel_id,
             direction: relay_direction,
             protocol: relay_protocol,
+            bind_token,
         },
     )
     .await?;

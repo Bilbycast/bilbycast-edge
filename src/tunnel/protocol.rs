@@ -28,11 +28,19 @@ pub enum EdgeMessage {
         tunnel_id: Uuid,
         direction: RelayDirection,
         protocol: RelayProtocol,
+        /// HMAC-SHA256 bind token for relay authentication (optional, for backwards compat).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bind_token: Option<String>,
     },
 
     /// Unbind a tunnel.
     #[serde(rename = "tunnel_unbind")]
     TunnelUnbind { tunnel_id: Uuid },
+
+    /// Identify this edge with a stable ID (e.g., manager node_id).
+    /// Should be sent before any TunnelBind. Optional — relay falls back to connection_id.
+    #[serde(rename = "identify")]
+    Identify { edge_id: String },
 
     /// Keepalive ping.
     #[serde(rename = "ping")]

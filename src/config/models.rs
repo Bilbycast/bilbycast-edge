@@ -174,6 +174,9 @@ pub struct RtpInputConfig {
     /// When absent, no rate limiting is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bitrate_mbps: Option<f64>,
+    /// Optional: enable SMPTE 2022-7 redundancy (merge from two UDP legs)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<RtpRedundancyConfig>,
 }
 
 /// Raw UDP input — receives datagrams without requiring RTP headers.
@@ -411,6 +414,9 @@ pub struct RtpOutputConfig {
     /// Default: 46 (Expedited Forwarding per RFC 4594).
     #[serde(default = "default_dscp")]
     pub dscp: u8,
+    /// Optional: enable SMPTE 2022-7 redundancy (duplicate to two UDP legs)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<RtpOutputRedundancyConfig>,
 }
 
 fn default_dscp() -> u8 {
@@ -521,6 +527,34 @@ pub struct SrtRedundancyConfig {
     /// AES key length for leg 2
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aes_key_len: Option<usize>,
+}
+
+/// SMPTE 2022-7 redundancy config for an RTP input (leg 2).
+/// The primary bind_addr in the parent RtpInputConfig is leg 1; this defines leg 2.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RtpRedundancyConfig {
+    /// Bind address for leg 2, e.g. "239.1.1.2:5000" or "0.0.0.0:5002"
+    pub bind_addr: String,
+    /// Network interface IP for multicast join on leg 2 (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface_addr: Option<String>,
+}
+
+/// SMPTE 2022-7 redundancy config for an RTP output (leg 2).
+/// The primary dest_addr in the parent RtpOutputConfig is leg 1; this defines leg 2.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RtpOutputRedundancyConfig {
+    /// Destination address for leg 2, e.g. "239.1.2.1:5004"
+    pub dest_addr: String,
+    /// Source bind address for leg 2 (optional, defaults to "0.0.0.0:0")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind_addr: Option<String>,
+    /// Network interface IP for multicast send on leg 2 (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface_addr: Option<String>,
+    /// DSCP value for leg 2 (optional, defaults to parent's dscp)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dscp: Option<u8>,
 }
 
 /// RTMP/RTMPS output configuration for publishing to streaming platforms.
@@ -681,6 +715,7 @@ mod tests {
                     allowed_payload_types: None,
                     max_bitrate_mbps: None,
                     tr07_mode: None,
+                    redundancy: None,
                 }),
                 outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                     id: "out-1".to_string(),
@@ -690,6 +725,7 @@ mod tests {
                     interface_addr: None,
                     fec_encode: None,
                     dscp: default_dscp(),
+                    redundancy: None,
                 })],
             }],
         };

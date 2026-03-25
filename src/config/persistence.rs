@@ -86,6 +86,7 @@ mod tests {
                     allowed_payload_types: None,
                     max_bitrate_mbps: None,
                     tr07_mode: None,
+                    redundancy: None,
                 }),
                 outputs: vec![],
             }],

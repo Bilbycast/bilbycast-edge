@@ -40,6 +40,15 @@ pub fn verify_token(token: &str, secret: &str) -> Option<String> {
     }
 }
 
+/// Compute a bind token for relay tunnel authentication.
+///
+/// The token is `HMAC-SHA256(tunnel_id:direction, bind_secret)` hex-encoded.
+/// Direction should be "ingress" or "egress".
+pub fn compute_bind_token(tunnel_id: &str, direction: &str, bind_secret: &str) -> String {
+    let identity = format!("{tunnel_id}:{direction}");
+    compute_hmac(&identity, bind_secret)
+}
+
 fn compute_hmac(identity: &str, secret: &str) -> String {
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC key can be any length");

@@ -187,18 +187,19 @@ The input is discriminated by the `"type"` field.
 
 ### RTP Input (`"type": "rtp"`)
 
-Receives RTP-wrapped MPEG-TS packets (SMPTE ST 2022-2). Requires valid RTP v2 headers — non-RTP packets are silently dropped. Use the UDP input type for raw TS without RTP headers.
+Receives RTP-wrapped MPEG-TS packets (SMPTE ST 2022-2), VSF TR-07, or generic RTP streams. Requires valid RTP v2 headers — non-RTP packets are silently dropped. Supports SMPTE 2022-7 hitless redundancy (dual-leg merge) and SMPTE 2022-1 FEC recovery. Use the UDP input type for raw TS without RTP headers.
 
-| Field                    | Type         | Default | Description                                     |
-|--------------------------|--------------|---------|-------------------------------------------------|
-| `type`                   | `"rtp"`      | --      | Input type discriminator                        |
-| `bind_addr`              | `string`     | --      | Local bind address, e.g. `"0.0.0.0:5000"` or `"239.1.1.1:5000"` for multicast |
-| `interface_addr`         | `string?`    | `null`  | Network interface IP for multicast join          |
-| `fec_decode`             | `FecConfig?` | `null`  | SMPTE 2022-1 FEC decode parameters              |
-| `tr07_mode`              | `bool?`      | `null`  | Enable VSF TR-07 (JPEG XS) compliance reporting |
-| `allowed_sources`        | `string[]?`  | `null`  | Source IP allowlist (RP 2129 C5)                 |
-| `allowed_payload_types`  | `u8[]?`      | `null`  | RTP payload type allowlist (RP 2129 U4)          |
-| `max_bitrate_mbps`       | `f64?`       | `null`  | Maximum ingress bitrate in Mbps (RP 2129 C7)     |
+| Field                    | Type                    | Default | Description                                     |
+|--------------------------|-------------------------|---------|-------------------------------------------------|
+| `type`                   | `"rtp"`                 | --      | Input type discriminator                        |
+| `bind_addr`              | `string`                | --      | Local bind address (leg 1), e.g. `"0.0.0.0:5000"` or `"239.1.1.1:5000"` for multicast |
+| `interface_addr`         | `string?`               | `null`  | Network interface IP for multicast join          |
+| `fec_decode`             | `FecConfig?`            | `null`  | SMPTE 2022-1 FEC decode parameters (applied per-leg before merge) |
+| `tr07_mode`              | `bool?`                 | `null`  | Enable VSF TR-07 (JPEG XS) compliance reporting |
+| `allowed_sources`        | `string[]?`             | `null`  | Source IP allowlist (RP 2129 C5)                 |
+| `allowed_payload_types`  | `u8[]?`                 | `null`  | RTP payload type allowlist (RP 2129 U4)          |
+| `max_bitrate_mbps`       | `f64?`                  | `null`  | Maximum ingress bitrate in Mbps (RP 2129 C7)     |
+| `redundancy`             | `RtpRedundancyConfig?`  | `null`  | SMPTE 2022-7 second leg configuration           |
 
 ### UDP Input (`"type": "udp"`)
 
@@ -315,18 +316,19 @@ Outputs are discriminated by the `"type"` field. All output types share `id` and
 
 ### RTP Output (`"type": "rtp"`)
 
-Sends RTP-wrapped MPEG-TS packets with RTP headers. Supports SMPTE 2022-1 FEC encoding.
+Sends RTP-wrapped MPEG-TS packets with RTP headers. Supports SMPTE 2022-1 FEC encoding and SMPTE 2022-7 hitless redundancy (dual-leg duplication).
 
-| Field            | Type         | Default | Description                                     |
-|------------------|--------------|---------|-------------------------------------------------|
-| `type`           | `"rtp"`      | --      | Output type discriminator                       |
-| `id`             | `string`     | --      | Unique output ID within this flow               |
-| `name`           | `string`     | --      | Human-readable name                             |
-| `dest_addr`      | `string`     | --      | Destination address, e.g. `"192.168.1.100:5004"` |
-| `bind_addr`      | `string?`    | `null`  | Source bind address (default: `"0.0.0.0:0"`)    |
-| `interface_addr` | `string?`    | `null`  | Network interface IP for multicast send          |
-| `fec_encode`     | `FecConfig?` | `null`  | SMPTE 2022-1 FEC encode parameters              |
-| `dscp`           | `u8`         | `46`    | DSCP value for QoS marking (0-63, default: 46 = Expedited Forwarding) |
+| Field            | Type                          | Default | Description                                     |
+|------------------|-------------------------------|---------|-------------------------------------------------|
+| `type`           | `"rtp"`                       | --      | Output type discriminator                       |
+| `id`             | `string`                      | --      | Unique output ID within this flow               |
+| `name`           | `string`                      | --      | Human-readable name                             |
+| `dest_addr`      | `string`                      | --      | Destination address (leg 1), e.g. `"192.168.1.100:5004"` |
+| `bind_addr`      | `string?`                     | `null`  | Source bind address (default: `"0.0.0.0:0"`)    |
+| `interface_addr` | `string?`                     | `null`  | Network interface IP for multicast send          |
+| `fec_encode`     | `FecConfig?`                  | `null`  | SMPTE 2022-1 FEC encode parameters (sent to both legs) |
+| `dscp`           | `u8`                          | `46`    | DSCP value for QoS marking (0-63, default: 46 = Expedited Forwarding) |
+| `redundancy`     | `RtpOutputRedundancyConfig?`  | `null`  | SMPTE 2022-7 second leg configuration           |
 
 ### UDP Output (`"type": "udp"`)
 
@@ -413,6 +415,26 @@ Defines the second SRT leg for SMPTE 2022-7 hitless redundancy. The primary SRT 
 | `passphrase`  | `string?` | `null`  | AES passphrase for leg 2                 |
 | `aes_key_len` | `usize?`  | `null`  | AES key length for leg 2                 |
 
+### RTP Redundancy Config (`RtpRedundancyConfig`)
+
+Defines the second RTP leg for SMPTE 2022-7 hitless redundancy on input. The primary `bind_addr` in the parent RTP input defines leg 1; this defines leg 2. Ingress filters, FEC decode, and rate limiting from the parent apply to both legs.
+
+| Field            | Type       | Default | Description                              |
+|------------------|-----------|---------|------------------------------------------|
+| `bind_addr`      | `string`  | --      | Bind address for leg 2                   |
+| `interface_addr` | `string?` | `null`  | Network interface IP for multicast join   |
+
+### RTP Output Redundancy Config (`RtpOutputRedundancyConfig`)
+
+Defines the second RTP leg for SMPTE 2022-7 hitless redundancy on output. The primary `dest_addr` in the parent RTP output defines leg 1; this defines leg 2. FEC encoding from the parent applies to both legs.
+
+| Field            | Type       | Default       | Description                              |
+|------------------|-----------|---------------|------------------------------------------|
+| `dest_addr`      | `string`  | --            | Destination address for leg 2            |
+| `bind_addr`      | `string?` | `null`        | Source bind address for leg 2            |
+| `interface_addr` | `string?` | `null`        | Network interface IP for multicast send   |
+| `dscp`           | `u8?`     | parent's dscp | DSCP value for leg 2 (defaults to parent) |
+
 ### FEC Config (`FecConfig`)
 
 SMPTE 2022-1 Forward Error Correction parameters.
@@ -485,6 +507,46 @@ SMPTE 2022-1 Forward Error Correction parameters.
           "id": "rtp-fec",
           "name": "RTP with FEC",
           "dest_addr": "192.168.1.50:5004",
+          "fec_encode": { "columns": 10, "rows": 10 }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### RTP with 2022-7 Redundancy (Dual Multicast)
+
+```json
+{
+  "version": 1,
+  "server": { "listen_addr": "0.0.0.0", "listen_port": 8080 },
+  "flows": [
+    {
+      "id": "redundant-rtp",
+      "name": "RTP 2022-7 Multicast to Multicast",
+      "enabled": true,
+      "input": {
+        "type": "rtp",
+        "bind_addr": "239.1.1.1:5000",
+        "interface_addr": "192.168.1.10",
+        "redundancy": {
+          "bind_addr": "239.1.1.2:5000",
+          "interface_addr": "192.168.1.10"
+        },
+        "fec_decode": { "columns": 10, "rows": 10 }
+      },
+      "outputs": [
+        {
+          "type": "rtp",
+          "id": "rtp-out",
+          "name": "Redundant RTP Output",
+          "dest_addr": "239.2.1.1:5004",
+          "interface_addr": "192.168.1.10",
+          "redundancy": {
+            "dest_addr": "239.2.1.2:5004",
+            "interface_addr": "192.168.1.10"
+          },
           "fec_encode": { "columns": 10, "rows": 10 }
         }
       ]

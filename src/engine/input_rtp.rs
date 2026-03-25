@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::models::RtpInputConfig;
 use crate::fec::decoder::FecDecoder;
+use crate::redundancy::merger::{ActiveLeg, HitlessMerger};
 use crate::stats::collector::FlowStatsAccumulator;
 use crate::util::rtp_parse::{is_likely_rtp, parse_rtp_sequence_number, parse_rtp_timestamp};
 use crate::util::socket::bind_udp_input;
@@ -23,6 +24,7 @@ use super::packet::{MAX_RTP_PACKET_SIZE, RtpPacket};
 /// Spawn a task that receives RTP packets from a UDP socket and
 /// publishes them to a broadcast channel for fan-out to outputs.
 /// If FEC decode is configured, lost packets may be recovered.
+/// If redundancy is configured, two UDP legs are merged using SMPTE 2022-7.
 pub fn spawn_rtp_input(
     config: RtpInputConfig,
     broadcast_tx: broadcast::Sender<RtpPacket>,
@@ -30,7 +32,12 @@ pub fn spawn_rtp_input(
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = rtp_input_loop(config, broadcast_tx, stats, cancel).await {
+        let result = if config.redundancy.is_some() {
+            rtp_input_redundant_loop(config, broadcast_tx, stats, cancel).await
+        } else {
+            rtp_input_loop(config, broadcast_tx, stats, cancel).await
+        };
+        if let Err(e) = result {
             tracing::error!("RTP input task exited with error: {e}");
         }
     })
@@ -139,10 +146,7 @@ async fn rtp_input_loop(
             fec_config.columns,
             fec_config.rows
         );
-        FecDecoder::new(
-            fec_config.columns,
-            fec_config.rows,
-        )
+        FecDecoder::new(fec_config.columns, fec_config.rows)
     });
 
     let mut buf = vec![0u8; MAX_RTP_PACKET_SIZE + 100]; // extra headroom
@@ -234,4 +238,198 @@ async fn rtp_input_loop(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// SMPTE 2022-7 dual-leg RTP input
+// ---------------------------------------------------------------------------
+
+/// Dual-leg RTP input with SMPTE 2022-7 hitless merge.
+///
+/// Binds two UDP sockets (leg 1 and leg 2), applies the same ingress filters
+/// to both, optionally runs per-leg FEC decoding, then merges de-duplicated
+/// packets via [`HitlessMerger`] before publishing to the broadcast channel.
+///
+/// This supports all RTP-based formats: RTP/MPEG-TS (SMPTE 2022-2),
+/// VSF TR-07, and generic RTP streams. The merge uses the native RTP
+/// sequence number present in every packet header.
+async fn rtp_input_redundant_loop(
+    config: RtpInputConfig,
+    broadcast_tx: broadcast::Sender<RtpPacket>,
+    stats: Arc<FlowStatsAccumulator>,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let redundancy = config
+        .redundancy
+        .as_ref()
+        .expect("redundancy config must be present");
+
+    let socket1 = bind_udp_input(&config.bind_addr, config.interface_addr.as_deref()).await?;
+    let socket2 = bind_udp_input(&redundancy.bind_addr, redundancy.interface_addr.as_deref()).await?;
+
+    tracing::info!(
+        "RTP input started with 2022-7 redundancy: leg1={} leg2={}",
+        config.bind_addr,
+        redundancy.bind_addr
+    );
+
+    // ── Shared ingress filters (applied to both legs) ──
+
+    let source_filter: Option<HashSet<IpAddr>> = config.allowed_sources.as_ref().map(|sources| {
+        let set: HashSet<IpAddr> = sources
+            .iter()
+            .filter_map(|s| s.parse::<IpAddr>().ok())
+            .collect();
+        tracing::info!("Source IP filter enabled: {} allowed addresses", set.len());
+        set
+    });
+
+    let pt_filter: Option<Vec<u8>> = config.allowed_payload_types.clone();
+    if let Some(ref pts) = pt_filter {
+        tracing::info!("Payload type filter enabled: {:?}", pts);
+    }
+
+    // Rate limiter is shared across both legs (combined rate)
+    let mut rate_limiter: Option<TokenBucket> = config.max_bitrate_mbps.map(|rate| {
+        tracing::info!("Rate limit enabled: {rate} Mbps (combined across both legs)");
+        TokenBucket::new(rate)
+    });
+
+    // Per-leg FEC decoders (each leg has independent FEC repair data)
+    let mut fec_decoder_leg1 = config.fec_decode.as_ref().map(|fec_config| {
+        tracing::info!(
+            "FEC decode enabled (leg 1): L={} D={}",
+            fec_config.columns,
+            fec_config.rows
+        );
+        FecDecoder::new(fec_config.columns, fec_config.rows)
+    });
+    let mut fec_decoder_leg2 = config.fec_decode.as_ref().map(|fec_config| {
+        tracing::info!(
+            "FEC decode enabled (leg 2): L={} D={}",
+            fec_config.columns,
+            fec_config.rows
+        );
+        FecDecoder::new(fec_config.columns, fec_config.rows)
+    });
+
+    let mut merger = HitlessMerger::new();
+    let mut prev_active_leg = ActiveLeg::None;
+    let mut buf1 = vec![0u8; MAX_RTP_PACKET_SIZE + 100];
+    let mut buf2 = vec![0u8; MAX_RTP_PACKET_SIZE + 100];
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!("RTP input (2022-7) stopping (cancelled)");
+                break;
+            }
+            result = socket1.recv_from(&mut buf1) => {
+                if let Ok((len, src)) = result {
+                    process_redundant_rtp_packet(
+                        &buf1[..len], src.ip(), ActiveLeg::Leg1,
+                        &source_filter, &pt_filter, &mut rate_limiter,
+                        &mut fec_decoder_leg1, &mut merger, &mut prev_active_leg,
+                        &broadcast_tx, &stats,
+                    );
+                }
+            }
+            result = socket2.recv_from(&mut buf2) => {
+                if let Ok((len, src)) = result {
+                    process_redundant_rtp_packet(
+                        &buf2[..len], src.ip(), ActiveLeg::Leg2,
+                        &source_filter, &pt_filter, &mut rate_limiter,
+                        &mut fec_decoder_leg2, &mut merger, &mut prev_active_leg,
+                        &broadcast_tx, &stats,
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Process a single packet from one leg of a 2022-7 redundant RTP input.
+/// Applies ingress filters, optional FEC decode, and merger deduplication.
+#[allow(clippy::too_many_arguments)]
+fn process_redundant_rtp_packet(
+    data: &[u8],
+    src_ip: IpAddr,
+    leg: ActiveLeg,
+    source_filter: &Option<HashSet<IpAddr>>,
+    pt_filter: &Option<Vec<u8>>,
+    rate_limiter: &mut Option<TokenBucket>,
+    fec_decoder: &mut Option<FecDecoder>,
+    merger: &mut HitlessMerger,
+    prev_active_leg: &mut ActiveLeg,
+    broadcast_tx: &broadcast::Sender<RtpPacket>,
+    stats: &FlowStatsAccumulator,
+) {
+    // C5: Source IP filter
+    if let Some(allowed) = source_filter {
+        if !allowed.contains(&src_ip) {
+            stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+
+    if !is_likely_rtp(data) {
+        return;
+    }
+
+    // U4: Payload type filter
+    if let Some(pts) = pt_filter {
+        let pt = data[1] & 0x7F;
+        if !pts.contains(&pt) {
+            stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+
+    // C7: Rate limit
+    if let Some(limiter) = rate_limiter {
+        if !limiter.try_consume(data.len()) {
+            stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+
+    let seq = parse_rtp_sequence_number(data).unwrap_or(0);
+    let ts = parse_rtp_timestamp(data).unwrap_or(0);
+    let bytes_data = Bytes::copy_from_slice(data);
+
+    // FEC decode (per-leg), then merge each resulting packet
+    if let Some(decoder) = fec_decoder {
+        let packets = decoder.process_media(seq, ts, &bytes_data);
+        for pkt in packets {
+            if let Some(chosen_leg) = merger.try_merge(pkt.sequence_number, leg) {
+                if *prev_active_leg != ActiveLeg::None && chosen_leg != *prev_active_leg {
+                    stats.redundancy_switches.fetch_add(1, Ordering::Relaxed);
+                }
+                *prev_active_leg = chosen_leg;
+                stats.input_packets.fetch_add(1, Ordering::Relaxed);
+                stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
+                let _ = broadcast_tx.send(pkt);
+            }
+        }
+    } else {
+        // No FEC — merge the raw packet directly
+        if let Some(chosen_leg) = merger.try_merge(seq, leg) {
+            if *prev_active_leg != ActiveLeg::None && chosen_leg != *prev_active_leg {
+                stats.redundancy_switches.fetch_add(1, Ordering::Relaxed);
+            }
+            *prev_active_leg = chosen_leg;
+            stats.input_packets.fetch_add(1, Ordering::Relaxed);
+            stats.input_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+            let packet = RtpPacket {
+                data: bytes_data,
+                sequence_number: seq,
+                rtp_timestamp: ts,
+                recv_time_us: now_us(),
+                is_raw_ts: false,
+            };
+            let _ = broadcast_tx.send(packet);
+        }
+    }
 }

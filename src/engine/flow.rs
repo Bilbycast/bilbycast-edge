@@ -329,7 +329,12 @@ impl FlowRuntime {
                         } else {
                             (false, None)
                         };
-                        ("rtp".to_string(), "rtp_ts".to_string(), fec_en, fec_ty, false, None)
+                        let (red_en, red_ty) = if rtp.redundancy.is_some() {
+                            (true, Some("SMPTE 2022-7".to_string()))
+                        } else {
+                            (false, None)
+                        };
+                        ("rtp".to_string(), "rtp_ts".to_string(), fec_en, fec_ty, red_en, red_ty)
                     }
                     InputConfig::Udp(_) => {
                         ("udp".to_string(), "raw_ts".to_string(), false, None, false, None)

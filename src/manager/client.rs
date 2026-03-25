@@ -93,6 +93,12 @@ async fn manager_client_loop(
     api_addr: String,
     monitor_addr: Option<String>,
 ) {
+    // If we already have a node_id from config, set it on the tunnel manager
+    // so relay tunnels can identify this edge before the first manager connection.
+    if let Some(ref node_id) = config.node_id {
+        tunnel_manager.set_manager_node_id(node_id.clone());
+    }
+
     let mut backoff_secs = 1u64;
     let max_backoff = 60u64;
 
@@ -125,6 +131,7 @@ async fn manager_client_loop(
                 config.registration_token = None;
                 config.node_id = Some(node_id.clone());
                 config.node_secret = Some(node_secret.clone());
+                tunnel_manager.set_manager_node_id(node_id.clone());
                 backoff_secs = 1;
 
                 // Persist to config file

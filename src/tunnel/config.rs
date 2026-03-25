@@ -44,6 +44,12 @@ pub struct TunnelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel_encryption_key: Option<String>,
 
+    /// Shared secret for relay tunnel bind authentication (hex-encoded, 64 chars = 32 bytes).
+    /// Used to compute HMAC-SHA256 bind tokens that prove this edge is authorized to bind
+    /// a specific tunnel on the relay. Distributed by the manager alongside the encryption key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_bind_secret: Option<String>,
+
     // ── Direct mode fields ──
     /// Remote peer QUIC address for direct mode, e.g. `"203.0.113.50:4433"`.
     /// Required when `mode` is `direct` and `direction` is `egress` (connecting side).

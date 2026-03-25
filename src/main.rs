@@ -131,6 +131,13 @@ async fn main() -> anyhow::Result<()> {
     let flow_manager = Arc::new(FlowManager::new(global_stats.clone()));
     let tunnel_manager = Arc::new(TunnelManager::new());
 
+    // Set the manager node_id on the tunnel manager so relay tunnels can identify this edge
+    if let Some(ref mgr) = app_config.manager {
+        if let Some(ref node_id) = mgr.node_id {
+            tunnel_manager.set_manager_node_id(node_id.clone());
+        }
+    }
+
     // Build auth state from config (None if auth not configured or disabled)
     let auth_state = app_config
         .server
