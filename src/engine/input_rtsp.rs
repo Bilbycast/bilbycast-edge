@@ -176,9 +176,17 @@ async fn run_rtsp_session(
                 // FrameFormat::SIMPLE gives Annex B — TsMuxer expects this
                 let ts_chunks = ts_muxer.mux_video(&data, pts_90khz, pts_90khz, is_keyframe);
 
-                for ts_data in ts_chunks {
+                // Bundle all TS packets from this frame into a single RtpPacket
+                // to reduce broadcast channel pressure (individual 188-byte packets
+                // cause media analyzer lag and missed PAT/PMT detection)
+                if !ts_chunks.is_empty() {
+                    let total_len: usize = ts_chunks.iter().map(|c| c.len()).sum();
+                    let mut combined = bytes::BytesMut::with_capacity(total_len);
+                    for chunk in &ts_chunks {
+                        combined.extend_from_slice(chunk);
+                    }
                     let pkt = RtpPacket {
-                        data: ts_data,
+                        data: combined.freeze(),
                         sequence_number: seq_num,
                         rtp_timestamp: pts_90khz as u32,
                         recv_time_us: crate::util::time::now_us(),
@@ -200,9 +208,14 @@ async fn run_rtsp_session(
                 // Default: 48kHz (idx=3), stereo (2ch)
                 let ts_chunks = ts_muxer.mux_audio(data, pts_90khz, 3, 2);
 
-                for ts_data in ts_chunks {
+                if !ts_chunks.is_empty() {
+                    let total_len: usize = ts_chunks.iter().map(|c| c.len()).sum();
+                    let mut combined = bytes::BytesMut::with_capacity(total_len);
+                    for chunk in &ts_chunks {
+                        combined.extend_from_slice(chunk);
+                    }
                     let pkt = RtpPacket {
-                        data: ts_data,
+                        data: combined.freeze(),
                         sequence_number: seq_num,
                         rtp_timestamp: pts_90khz as u32,
                         recv_time_us: crate::util::time::now_us(),

@@ -88,14 +88,14 @@ All data flows through a single type: `RtpPacket { data: Bytes, sequence_number:
 | `engine/` | `manager.rs`, `flow.rs`, `packet.rs` | Flow lifecycle, FlowRuntime bring-up/teardown |
 | `engine/` | `input_rtp.rs`, `input_udp.rs`, `input_srt.rs`, `input_rtmp.rs` | Protocol-specific input tasks |
 | `engine/` | `output_rtp.rs`, `output_udp.rs`, `output_srt.rs`, `output_rtmp.rs`, `output_hls.rs`, `output_webrtc.rs` | Protocol-specific output tasks |
-| `engine/rtmp/` | `server.rs`, `amf0.rs`, `chunk.rs`, `ts_mux.rs` | RTMP protocol internals, FLV→MPEG-TS. `ts_mux.rs` is the shared TS muxer (PAT/PMT/PES) used by RTMP, RTSP, and WebRTC inputs |
+| `engine/rtmp/` | `server.rs`, `amf0.rs`, `chunk.rs`, `ts_mux.rs` | RTMP protocol internals, FLV→MPEG-TS. `ts_mux.rs` is the shared TS muxer (PAT/PMT/PES) used by RTMP, RTSP, and WebRTC inputs. PAT/PMT `section_length` must include the 4-byte CRC32 per MPEG-TS spec. Inputs using TsMuxer must bundle TS packets per-frame (not per-188-byte packet) to avoid broadcast channel pressure |
 | `engine/` | `tr101290.rs` | Transport stream quality analysis (sync, CC, PAT/PMT, PCR) |
 | `engine/` | `media_analysis.rs` | Media content detection (codec, resolution, frame rate, audio format, per-PID bitrate) |
 | `engine/` | `ts_parse.rs` | Shared MPEG-TS packet parsing helpers (used by tr101290 and media_analysis) |
 | `engine/` | `input_rtsp.rs` | RTSP input: pull H.264/H.265 + AAC from IP cameras and media servers via retina crate |
 | `engine/` | `input_webrtc.rs` | WebRTC input: WHIP server (receive contributions) and WHEP client (pull from server) |
 | `engine/webrtc/` | `session.rs`, `ts_demux.rs`, `rtp_h264.rs`, `rtp_h264_depack.rs`, `signaling.rs` | WebRTC core: str0m session wrapper, TS demuxer, RFC 6184 H.264 packetizer/depacketizer, WHIP/WHEP HTTP signaling |
-| `api/` | `webrtc.rs` | WHIP/WHEP HTTP endpoint handlers and session registry |
+| `api/` | `webrtc.rs` | WHIP/WHEP HTTP endpoint handlers and session registry. **Important:** When a WebRTC/WHIP flow is created, its `whip_session_tx` (stored in `FlowRuntime`) must be registered with `WebrtcSessionRegistry` via `register_whip_input()` — this wiring happens in `main.rs`, `api/flows.rs`, and `manager/client.rs` after every `create_flow` call |
 | `fec/` | `encoder.rs`, `decoder.rs`, `matrix.rs` | SMPTE 2022-1 FEC (XOR column×row) |
 | `redundancy/` | `merger.rs` | SMPTE 2022-7 hitless merge (seq dedup from dual RTP or SRT legs) |
 | `api/` | `server.rs`, `auth.rs`, `flows.rs`, `stats.rs`, `tunnels.rs`, `ws.rs`, `nmos.rs`, `nmos_is05.rs` | Axum REST API, OAuth2/JWT, WebSocket stats, NMOS IS-04 Node API, NMOS IS-05 Connection Management |

@@ -78,6 +78,10 @@ pub struct FlowRuntime {
     /// Stored to keep the JoinHandle alive; shutdown uses CancellationToken.
     #[allow(dead_code)]
     pub media_analysis_handle: Option<JoinHandle<()>>,
+    /// WHIP input session channel sender (only set for WebRTC/WHIP input flows).
+    /// Must be registered with the WebrtcSessionRegistry after flow creation.
+    #[cfg(feature = "webrtc")]
+    pub whip_session_tx: Option<(tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>, Option<String>)>,
 }
 
 /// Runtime state for a single output within a flow.
@@ -226,6 +230,8 @@ impl FlowRuntime {
         }
 
         // Start input task
+        #[cfg(feature = "webrtc")]
+        let mut whip_session_info: Option<(tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>, Option<String>)> = None;
         let input_handle = match &config.input {
             InputConfig::Rtp(rtp_config) => {
                 spawn_rtp_input(
@@ -271,9 +277,8 @@ impl FlowRuntime {
             InputConfig::Webrtc(webrtc_config) => {
                 // Create channel for WHIP API handler → input task communication
                 let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
-                // Register with session registry (will be set up by main.rs)
-                // The actual registration happens after AppState is constructed
-                // For now, spawn the input task with the receiver
+                // Store session_tx and bearer_token for registration with WebrtcSessionRegistry
+                whip_session_info = Some((session_tx, webrtc_config.bearer_token.clone()));
                 super::input_webrtc::spawn_whip_input(
                     webrtc_config.clone(),
                     config.id.clone(),
@@ -408,6 +413,8 @@ impl FlowRuntime {
             stats: flow_stats,
             analyzer_handle,
             media_analysis_handle,
+            #[cfg(feature = "webrtc")]
+            whip_session_tx: whip_session_info,
         })
     }
 

@@ -71,8 +71,19 @@ impl WebrtcSession {
             .set_ice_lite(true)
             .build(Instant::now());
 
-        // Add host candidate
-        let candidate_ip = config.public_ip.unwrap_or(local_addr.ip());
+        // Add host candidate — resolve 0.0.0.0 to a real local IP
+        let candidate_ip = config.public_ip.unwrap_or_else(|| {
+            let ip = local_addr.ip();
+            if ip.is_unspecified() {
+                // Discover a real local IP by connecting a throwaway UDP socket
+                std::net::UdpSocket::bind("0.0.0.0:0")
+                    .and_then(|s| { s.connect("8.8.8.8:80")?; s.local_addr() })
+                    .map(|a| a.ip())
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+            } else {
+                ip
+            }
+        });
         let candidate_addr = SocketAddr::new(candidate_ip, local_addr.port());
         rtc.add_local_candidate(
             Candidate::host(candidate_addr, Protocol::Udp)

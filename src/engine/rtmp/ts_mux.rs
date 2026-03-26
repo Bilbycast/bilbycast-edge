@@ -255,7 +255,7 @@ impl TsMuxer {
         let pat_start = 5;
         pkt[pat_start] = 0x00; // table_id = 0 (PAT)
         // section_syntax_indicator=1, reserved, section_length
-        let section_length: u16 = 9; // 5 fixed + 4 program
+        let section_length: u16 = 13; // 5 fixed + 4 program + 4 CRC
         pkt[pat_start + 1] = 0xB0 | ((section_length >> 8) as u8 & 0x0F);
         pkt[pat_start + 2] = section_length as u8;
         pkt[pat_start + 3] = 0x00; // transport_stream_id high

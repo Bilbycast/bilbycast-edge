@@ -1,6 +1,45 @@
 # Configuration Reference
 
-bilbycast-edge is configured via a JSON file (default: `./config.json`). Changes made through the REST API are persisted to this file immediately.
+bilbycast-edge is configured via a JSON file (default: `./config.json`). All changes — whether from the REST API, manager commands, or the setup wizard — are persisted to this file immediately and survive reboots.
+
+---
+
+## Config Persistence
+
+The edge node's config file is the **source of truth** for its configuration. The manager does not store node configs in its database — it only sends commands, and the edge is responsible for persisting its own state.
+
+### When config is saved to disk
+
+Config is written to disk immediately after any of these events:
+
+- **First startup** — auto-generated `node_id` is saved
+- **Manager registration** — `node_id` and `node_secret` credentials are saved after successful registration
+- **REST API flow operations** — creating, updating, or deleting flows via the local API
+- **Manager `update_config` command** — when a user updates the config through the manager UI
+- **Setup wizard** — initial provisioning via the browser-based setup at `/setup`
+
+### Atomic writes
+
+Config saves use an atomic two-phase write: the JSON is first written to a temporary file (`.json.tmp`), then renamed to the actual config path. This prevents partial or corrupted config files if the node crashes or loses power mid-write.
+
+### Manager UpdateConfig behavior
+
+When the manager sends an `update_config` command:
+
+1. The manager sends the **full config** (not a diff)
+2. The edge **validates** the new config before applying it
+3. All running flows and tunnels are **stopped**
+4. The in-memory config is updated and **saved to disk**
+5. Enabled flows and tunnels are **restarted** from the new config
+6. A `command_ack` is sent back to the manager
+
+**Fields replaced** by UpdateConfig: `flows`, `tunnels`, `server`, `monitor`
+
+**Fields preserved** (not overwritten): `version`, `node_id`, `device_name`, `setup_enabled`, `manager` (connection credentials)
+
+### Reboot behavior
+
+On startup, the edge loads its config from the JSON file on disk. Since all changes are persisted immediately, the node will always start with the latest config — including any changes made remotely through the manager.
 
 ---
 

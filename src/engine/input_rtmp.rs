@@ -148,10 +148,16 @@ async fn process_media(
 
                                 let ts_packets = muxer.mux_video(&annex_b, pts_90khz, dts_90khz, is_keyframe);
 
-                                for pkt_data in ts_packets {
+                                // Bundle all TS packets from this frame into one RtpPacket
+                                if !ts_packets.is_empty() {
+                                    let total_len: usize = ts_packets.iter().map(|c| c.len()).sum();
+                                    let mut combined = bytes::BytesMut::with_capacity(total_len);
+                                    for chunk in &ts_packets {
+                                        combined.extend_from_slice(chunk);
+                                    }
                                     let recv_time = std::time::Instant::now().elapsed().as_micros() as u64;
                                     let packet = RtpPacket {
-                                        data: pkt_data,
+                                        data: combined.freeze(),
                                         sequence_number: seq_num,
                                         rtp_timestamp: dts_90khz as u32,
                                         recv_time_us: recv_time,
@@ -159,7 +165,7 @@ async fn process_media(
                                     };
                                     seq_num = seq_num.wrapping_add(1);
                                     stats.input_packets.fetch_add(1, Ordering::Relaxed);
-                                    stats.input_bytes.fetch_add(188, Ordering::Relaxed);
+                                    stats.input_bytes.fetch_add(total_len as u64, Ordering::Relaxed);
                                     let _ = broadcast_tx.send(packet);
                                 }
                             }
@@ -201,10 +207,15 @@ async fn process_media(
 
                                 let ts_packets = muxer.mux_audio(raw_aac, pts_90khz, audio_sample_rate_idx, audio_channels);
 
-                                for pkt_data in ts_packets {
+                                if !ts_packets.is_empty() {
+                                    let total_len: usize = ts_packets.iter().map(|c| c.len()).sum();
+                                    let mut combined = bytes::BytesMut::with_capacity(total_len);
+                                    for chunk in &ts_packets {
+                                        combined.extend_from_slice(chunk);
+                                    }
                                     let recv_time = std::time::Instant::now().elapsed().as_micros() as u64;
                                     let packet = RtpPacket {
-                                        data: pkt_data,
+                                        data: combined.freeze(),
                                         sequence_number: seq_num,
                                         rtp_timestamp: pts_90khz as u32,
                                         recv_time_us: recv_time,
@@ -212,7 +223,7 @@ async fn process_media(
                                     };
                                     seq_num = seq_num.wrapping_add(1);
                                     stats.input_packets.fetch_add(1, Ordering::Relaxed);
-                                    stats.input_bytes.fetch_add(188, Ordering::Relaxed);
+                                    stats.input_bytes.fetch_add(total_len as u64, Ordering::Relaxed);
                                     let _ = broadcast_tx.send(packet);
                                 }
                             }

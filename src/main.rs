@@ -175,7 +175,17 @@ async fn main() -> anyhow::Result<()> {
     for flow in &app_config.flows {
         if flow.enabled {
             match flow_manager.create_flow(flow.clone()).await {
-                Ok(()) => tracing::info!("Auto-started flow '{}'", flow.id),
+                Ok(runtime) => {
+                    tracing::info!("Auto-started flow '{}'", flow.id);
+                    // Register WHIP input channel with session registry if this is a WebRTC flow
+                    #[cfg(feature = "webrtc")]
+                    if let Some((tx, bearer_token)) = &runtime.whip_session_tx {
+                        if let Some(ref registry) = state.webrtc_sessions {
+                            registry.register_whip_input(&flow.id, tx.clone(), bearer_token.clone());
+                            tracing::info!("Registered WHIP input for flow '{}'", flow.id);
+                        }
+                    }
+                }
                 Err(e) => tracing::error!("Failed to auto-start flow '{}': {e}", flow.id),
             }
         }
@@ -240,6 +250,10 @@ async fn main() -> anyhow::Result<()> {
                 cli.config.clone(),
                 mgr_api_addr,
                 mgr_monitor_addr,
+                #[cfg(feature = "webrtc")]
+                { state.webrtc_sessions.clone() },
+                #[cfg(not(feature = "webrtc"))]
+                (),
             );
         }
     }

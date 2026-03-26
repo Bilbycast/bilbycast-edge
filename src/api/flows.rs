@@ -13,6 +13,17 @@ use super::errors::ApiError;
 use super::models::{ApiResponse, FlowListResponse, FlowSummary};
 use super::server::AppState;
 
+/// Register a WHIP input channel with the WebRTC session registry (if applicable).
+#[cfg(feature = "webrtc")]
+fn register_whip_if_needed(state: &AppState, runtime: &crate::engine::flow::FlowRuntime) {
+    if let Some((tx, bearer_token)) = &runtime.whip_session_tx {
+        if let Some(ref registry) = state.webrtc_sessions {
+            registry.register_whip_input(&runtime.config.id, tx.clone(), bearer_token.clone());
+            tracing::info!("Registered WHIP input for flow '{}'", runtime.config.id);
+        }
+    }
+}
+
 /// `GET /api/v1/flows` -- List all configured flows.
 ///
 /// Returns a [`FlowListResponse`] containing a summary of every flow in the current
@@ -89,8 +100,12 @@ pub async fn create_flow(
 
     // Start the flow in the engine if enabled
     if flow.enabled {
-        if let Err(e) = state.flow_manager.create_flow(flow.clone()).await {
-            tracing::warn!("Flow '{}' persisted but failed to start: {e}", flow.id);
+        match state.flow_manager.create_flow(flow.clone()).await {
+            Ok(runtime) => {
+                #[cfg(feature = "webrtc")]
+                register_whip_if_needed(&state, &runtime);
+            }
+            Err(e) => tracing::warn!("Flow '{}' persisted but failed to start: {e}", flow.id),
         }
     }
 
@@ -139,8 +154,12 @@ pub async fn update_flow(
     save_config(&state.config_path, &config).map_err(|e| ApiError::Internal(e.to_string()))?;
 
     if flow.enabled {
-        if let Err(e) = state.flow_manager.create_flow(flow.clone()).await {
-            tracing::warn!("Flow '{}' updated but failed to restart: {e}", flow_id);
+        match state.flow_manager.create_flow(flow.clone()).await {
+            Ok(runtime) => {
+                #[cfg(feature = "webrtc")]
+                register_whip_if_needed(&state, &runtime);
+            }
+            Err(e) => tracing::warn!("Flow '{}' updated but failed to restart: {e}", flow_id),
         }
     }
 
@@ -212,11 +231,15 @@ pub async fn start_flow(
 
     drop(config); // release read lock before async engine call
 
-    state
+    let runtime = state
         .flow_manager
         .create_flow(flow)
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to start flow '{flow_id}': {e}")))?;
+
+    #[cfg(feature = "webrtc")]
+    register_whip_if_needed(&state, &runtime);
+    let _ = runtime; // suppress unused warning when webrtc feature is off
 
     tracing::info!("Started flow '{}'", flow_id);
     Ok(Json(ApiResponse::ok(())))
@@ -292,11 +315,15 @@ pub async fn restart_flow(
     }
 
     // Start
-    state
+    let runtime = state
         .flow_manager
         .create_flow(flow)
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to restart flow '{flow_id}': {e}")))?;
+
+    #[cfg(feature = "webrtc")]
+    register_whip_if_needed(&state, &runtime);
+    let _ = runtime;
 
     tracing::info!("Restarted flow '{}'", flow_id);
     Ok(Json(ApiResponse::ok(())))
@@ -446,8 +473,12 @@ pub async fn replace_config(
     // Start all enabled flows from new config
     for flow in &config.flows {
         if flow.enabled {
-            if let Err(e) = state.flow_manager.create_flow(flow.clone()).await {
-                tracing::error!("Failed to start flow '{}' after config replace: {e}", flow.id);
+            match state.flow_manager.create_flow(flow.clone()).await {
+                Ok(runtime) => {
+                    #[cfg(feature = "webrtc")]
+                    register_whip_if_needed(&state, &runtime);
+                }
+                Err(e) => tracing::error!("Failed to start flow '{}' after config replace: {e}", flow.id),
             }
         }
     }
@@ -488,8 +519,12 @@ pub async fn reload_config(
     // Start all enabled flows from reloaded config
     for flow in &config.flows {
         if flow.enabled {
-            if let Err(e) = state.flow_manager.create_flow(flow.clone()).await {
-                tracing::error!("Failed to start flow '{}' after config reload: {e}", flow.id);
+            match state.flow_manager.create_flow(flow.clone()).await {
+                Ok(runtime) => {
+                    #[cfg(feature = "webrtc")]
+                    register_whip_if_needed(&state, &runtime);
+                }
+                Err(e) => tracing::error!("Failed to start flow '{}' after config reload: {e}", flow.id),
             }
         }
     }

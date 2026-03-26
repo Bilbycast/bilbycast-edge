@@ -75,14 +75,15 @@ impl FlowManager {
     /// Returns an error if a flow with the same `config.id` is already running
     /// or if the underlying input/output tasks fail to initialize (e.g., socket
     /// bind failure, SRT connection error).
-    pub async fn create_flow(&self, config: FlowConfig) -> Result<()> {
+    pub async fn create_flow(&self, config: FlowConfig) -> Result<Arc<FlowRuntime>> {
         if self.flows.contains_key(&config.id) {
             bail!("Flow '{}' is already running", config.id);
         }
 
         let runtime = FlowRuntime::start(config.clone(), &self.stats).await?;
-        self.flows.insert(config.id.clone(), Arc::new(runtime));
-        Ok(())
+        let runtime = Arc::new(runtime);
+        self.flows.insert(config.id.clone(), runtime.clone());
+        Ok(runtime)
     }
 
     /// Stop and remove a running flow by its ID.
