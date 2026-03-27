@@ -122,7 +122,7 @@ fn default_true() -> bool {
 }
 
 /// Input source configuration — RTP, UDP, SRT, RTMP, RTSP, or WebRTC
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum InputConfig {
     /// Receive RTP over UDP (unicast or multicast) with optional FEC and ingress filters
@@ -148,7 +148,7 @@ pub enum InputConfig {
     Whep(WhepInputConfig),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RtpInputConfig {
     /// Local address to bind, e.g. "0.0.0.0:5000" or "239.1.1.1:5000" for multicast
     pub bind_addr: String,
@@ -184,7 +184,7 @@ pub struct RtpInputConfig {
 /// Suitable for receiving raw MPEG-TS over UDP (e.g., from OBS, srt-live-transmit,
 /// ffmpeg with `udp://` output). All datagrams are accepted and forwarded with
 /// synthetic sequence numbers and `is_raw_ts: true`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UdpInputConfig {
     /// Local address to bind, e.g. "0.0.0.0:5000" or "239.1.1.1:5000" for multicast
     pub bind_addr: String,
@@ -193,7 +193,7 @@ pub struct UdpInputConfig {
     pub interface_addr: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SrtInputConfig {
     /// SRT connection mode
     pub mode: SrtMode,
@@ -236,7 +236,7 @@ pub struct SrtInputConfig {
 ///   "stream_key": "my_stream"
 /// }
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RtmpInputConfig {
     /// RTMP listen address, e.g. "0.0.0.0:1935"
     pub listen_addr: String,
@@ -263,7 +263,7 @@ fn default_max_publishers() -> u32 {
 }
 
 /// RTSP transport mode for receiving RTP packets.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum RtspTransport {
     /// RTP over TCP interleaved in the RTSP connection (most reliable, works through firewalls).
     #[default]
@@ -279,7 +279,7 @@ pub enum RtspTransport {
 /// Uses the `retina` pure-Rust RTSP client to handle DESCRIBE/SETUP/PLAY signaling
 /// and receive H.264 video (+ optional AAC audio) via RTP. The received media is
 /// muxed into MPEG-TS and published to the flow's broadcast channel.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RtspInputConfig {
     /// RTSP source URL, e.g. "rtsp://camera.local:554/stream1"
     pub rtsp_url: String,
@@ -313,7 +313,7 @@ fn default_rtsp_reconnect() -> u64 {
 ///
 /// The WHIP endpoint is auto-generated at `/api/v1/flows/{flow_id}/whip`.
 /// Publishers POST an SDP offer and receive an SDP answer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WebrtcInputConfig {
     /// Optional Bearer token required from WHIP publishers for authentication.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -334,7 +334,7 @@ pub struct WebrtcInputConfig {
 ///
 /// The edge acts as a WHEP client: it POSTs an SDP offer to the WHEP endpoint
 /// and establishes a receive-only WebRTC session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WhepInputConfig {
     /// WHEP endpoint URL to pull media from.
     pub whep_url: String,
@@ -355,7 +355,7 @@ fn default_peer_idle_timeout() -> u64 {
 }
 
 /// Output destination configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum OutputConfig {
     /// Send RTP-wrapped packets over UDP (with RTP headers, optional FEC)
@@ -393,7 +393,7 @@ impl OutputConfig {
 
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RtpOutputConfig {
     /// Unique output ID within this flow
     pub id: String,
@@ -429,7 +429,7 @@ fn default_dscp() -> u8 {
 /// is RTP-wrapped, the RTP header is stripped before sending. Suitable for
 /// feeding ffplay, VLC, multicast distribution, or any receiver expecting
 /// raw MPEG-TS over UDP.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UdpOutputConfig {
     /// Unique output ID within this flow
     pub id: String,
@@ -449,7 +449,7 @@ pub struct UdpOutputConfig {
     pub dscp: u8,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SrtOutputConfig {
     /// Unique output ID within this flow
     pub id: String,
@@ -506,7 +506,7 @@ pub enum SrtMode {
 
 /// SMPTE 2022-7 redundancy config for an SRT leg.
 /// The primary SRT config in the parent is leg 1; this struct defines leg 2.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SrtRedundancyConfig {
     /// SRT mode for the second leg
     pub mode: SrtMode,
@@ -531,7 +531,7 @@ pub struct SrtRedundancyConfig {
 
 /// SMPTE 2022-7 redundancy config for an RTP input (leg 2).
 /// The primary bind_addr in the parent RtpInputConfig is leg 1; this defines leg 2.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RtpRedundancyConfig {
     /// Bind address for leg 2, e.g. "239.1.1.2:5000" or "0.0.0.0:5002"
     pub bind_addr: String,
@@ -542,7 +542,7 @@ pub struct RtpRedundancyConfig {
 
 /// SMPTE 2022-7 redundancy config for an RTP output (leg 2).
 /// The primary dest_addr in the parent RtpOutputConfig is leg 1; this defines leg 2.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RtpOutputRedundancyConfig {
     /// Destination address for leg 2, e.g. "239.1.2.1:5004"
     pub dest_addr: String,
@@ -565,7 +565,7 @@ pub struct RtpOutputRedundancyConfig {
 /// # Limitations
 /// - Output only (publish). RTMP input is not supported.
 /// - Only H.264 video and AAC audio are supported (no HEVC/VP9).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RtmpOutputConfig {
     /// Unique output ID within this flow.
     pub id: String,
@@ -596,7 +596,7 @@ fn default_reconnect_delay() -> u64 {
 /// # Limitations
 /// - Output only. Segment-based transport inherently adds 1-4s latency.
 /// - The ingest endpoint must support HTTP PUT or POST for segment upload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HlsOutputConfig {
     /// Unique output ID within this flow.
     pub id: String,
@@ -624,7 +624,7 @@ fn default_max_segments() -> usize {
 }
 
 /// WebRTC output mode.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum WebrtcOutputMode {
     /// Push media to an external WHIP endpoint (edge acts as WHIP client).
     #[default]
@@ -652,7 +652,7 @@ pub enum WebrtcOutputMode {
 ///   C libraries and is NOT available in the pure-Rust build.
 /// - If the source TS carries AAC audio, the audio track will be
 ///   automatically omitted for WebRTC outputs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WebrtcOutputConfig {
     /// Unique output ID within this flow.
     pub id: String,
@@ -679,7 +679,7 @@ pub struct WebrtcOutputConfig {
 }
 
 /// SMPTE 2022-1 FEC parameters
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FecConfig {
     /// Number of columns (L parameter), typically 5-20
     pub columns: u8,

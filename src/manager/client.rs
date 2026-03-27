@@ -9,6 +9,7 @@
 //! Authentication is done via an "auth" message sent as the first WebSocket frame
 //! after connecting (not via query parameters, to avoid leaking secrets in URLs/logs).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -601,28 +602,77 @@ async fn execute_command(
             Ok(())
         }
         "update_flow" => {
-            let flow: FlowConfig = serde_json::from_value(action["flow"].clone())
+            let new_flow: FlowConfig = serde_json::from_value(action["flow"].clone())
                 .map_err(|e| format!("Invalid flow config: {e}"))?;
-            validate_flow(&flow).map_err(|e| format!("Invalid flow config: {e}"))?;
+            validate_flow(&new_flow).map_err(|e| format!("Invalid flow config: {e}"))?;
             let flow_id = action["flow_id"]
                 .as_str()
-                .unwrap_or(&flow.id);
-            tracing::info!("Manager command: update flow '{flow_id}'");
-            // Stop old flow (ignore error if not running)
-            let _ = flow_manager.destroy_flow(flow_id).await;
-            // Start new flow
-            let runtime = flow_manager
-                .create_flow(flow.clone())
-                .await
-                .map_err(|e| e.to_string())?;
-            #[cfg(feature = "webrtc")]
-            register_whip_if_needed(webrtc_sessions, &runtime);
+                .unwrap_or(&new_flow.id);
+            tracing::info!("Manager command: update flow '{flow_id}' (diff-based)");
+
+            // Get old flow config for comparison
+            let old_flow = {
+                let cfg = app_config.read().await;
+                cfg.flows.iter().find(|f| f.id == flow_id).cloned()
+            };
+
+            let was_running = flow_manager.is_running(flow_id);
+
+            if let Some(old_flow) = old_flow {
+                if was_running && new_flow.enabled {
+                    // Flow exists and should keep running — diff it
+                    let input_changed = old_flow.input != new_flow.input;
+                    let meta_changed = old_flow.name != new_flow.name
+                        || old_flow.media_analysis != new_flow.media_analysis;
+
+                    if input_changed || meta_changed {
+                        // Input or metadata changed — must restart entire flow
+                        tracing::info!("Update flow '{flow_id}': restarting (input changed={input_changed}, meta changed={meta_changed})");
+                        let _ = flow_manager.destroy_flow(flow_id).await;
+                        let runtime = flow_manager
+                            .create_flow(new_flow.clone())
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        #[cfg(feature = "webrtc")]
+                        register_whip_if_needed(webrtc_sessions, &runtime);
+                    } else {
+                        // Only outputs changed — diff surgically
+                        tracing::info!("Update flow '{flow_id}': input unchanged, diffing outputs ({} old → {} new)",
+                            old_flow.outputs.len(), new_flow.outputs.len());
+                        diff_outputs(flow_manager, flow_id, &old_flow.outputs, &new_flow.outputs).await;
+                    }
+                } else if was_running && !new_flow.enabled {
+                    // Disable
+                    tracing::info!("Update flow '{flow_id}': disabling");
+                    let _ = flow_manager.destroy_flow(flow_id).await;
+                } else if !was_running && new_flow.enabled {
+                    // Enable / start
+                    tracing::info!("Update flow '{flow_id}': starting");
+                    let runtime = flow_manager
+                        .create_flow(new_flow.clone())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    #[cfg(feature = "webrtc")]
+                    register_whip_if_needed(webrtc_sessions, &runtime);
+                }
+            } else {
+                // No old flow — create new
+                tracing::info!("Update flow '{flow_id}': creating (no previous config)");
+                let _ = flow_manager.destroy_flow(flow_id).await; // in case running without config
+                let runtime = flow_manager
+                    .create_flow(new_flow.clone())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                #[cfg(feature = "webrtc")]
+                register_whip_if_needed(webrtc_sessions, &runtime);
+            }
+
             // Update config
             let mut cfg = app_config.write().await;
             if let Some(pos) = cfg.flows.iter().position(|f| f.id == flow_id) {
-                cfg.flows[pos] = flow;
+                cfg.flows[pos] = new_flow;
             } else {
-                cfg.flows.push(flow);
+                cfg.flows.push(new_flow);
             }
             persist_config(&cfg, config_path);
             Ok(())
@@ -752,14 +802,130 @@ async fn execute_command(
             let new_config: AppConfig = serde_json::from_value(action["config"].clone())
                 .map_err(|e| format!("Invalid config: {e}"))?;
             validate_config(&new_config).map_err(|e| format!("Invalid config: {e}"))?;
-            tracing::info!("Manager command: update_config");
+            tracing::info!("Manager command: update_config (diff-based)");
 
-            // Stop all existing flows
-            flow_manager.stop_all().await;
-            // Stop all existing tunnels
-            tunnel_manager.stop_all().await;
+            let old_config = app_config.read().await.clone();
+            tracing::info!("Config diff: old={} flows/{} tunnels, new={} flows/{} tunnels",
+                old_config.flows.len(), old_config.tunnels.len(),
+                new_config.flows.len(), new_config.tunnels.len());
 
-            // Apply new config
+            // --- Diff flows ---
+            let old_flow_map: HashMap<&str, &FlowConfig> =
+                old_config.flows.iter().map(|f| (f.id.as_str(), f)).collect();
+            let new_flow_map: HashMap<&str, &FlowConfig> =
+                new_config.flows.iter().map(|f| (f.id.as_str(), f)).collect();
+
+            // Removed flows: in old but not in new
+            for &id in old_flow_map.keys() {
+                if !new_flow_map.contains_key(id) {
+                    tracing::info!("Config diff: removing flow '{id}'");
+                    let _ = flow_manager.destroy_flow(id).await;
+                }
+            }
+
+            // Added or changed flows
+            for (&id, &new_flow) in &new_flow_map {
+                let was_running = flow_manager.is_running(id);
+                match old_flow_map.get(id) {
+                    None => {
+                        // Brand-new flow
+                        if new_flow.enabled {
+                            tracing::info!("Config diff: creating new flow '{id}'");
+                            match flow_manager.create_flow(new_flow.clone()).await {
+                                Ok(runtime) => {
+                                    #[cfg(feature = "webrtc")]
+                                    register_whip_if_needed(webrtc_sessions, &runtime);
+                                }
+                                Err(e) => tracing::warn!("Failed to start new flow '{id}': {e}"),
+                            }
+                        }
+                    }
+                    Some(&old_flow) => {
+                        // Flow exists in both old and new config
+                        let should_run = new_flow.enabled;
+
+                        if was_running && !should_run {
+                            // Was running, now disabled → stop
+                            tracing::info!("Config diff: disabling flow '{id}'");
+                            let _ = flow_manager.destroy_flow(id).await;
+                        } else if !was_running && should_run {
+                            // Was stopped, now enabled → start
+                            tracing::info!("Config diff: enabling flow '{id}'");
+                            match flow_manager.create_flow(new_flow.clone()).await {
+                                Ok(runtime) => {
+                                    #[cfg(feature = "webrtc")]
+                                    register_whip_if_needed(webrtc_sessions, &runtime);
+                                }
+                                Err(e) => tracing::warn!("Failed to start flow '{id}': {e}"),
+                            }
+                        } else if was_running && should_run {
+                            // Both running — check what changed
+                            let input_changed = old_flow.input != new_flow.input;
+                            let meta_changed = old_flow.name != new_flow.name
+                                || old_flow.media_analysis != new_flow.media_analysis;
+
+                            if input_changed || meta_changed {
+                                // Input or flow metadata changed → must restart entire flow
+                                tracing::info!("Config diff: restarting flow '{id}' (input changed={input_changed}, meta changed={meta_changed})");
+                                let _ = flow_manager.destroy_flow(id).await;
+                                match flow_manager.create_flow(new_flow.clone()).await {
+                                    Ok(runtime) => {
+                                        #[cfg(feature = "webrtc")]
+                                        register_whip_if_needed(webrtc_sessions, &runtime);
+                                    }
+                                    Err(e) => tracing::warn!("Failed to restart flow '{id}': {e}"),
+                                }
+                            } else {
+                                // Input unchanged — diff outputs surgically
+                                tracing::info!("Config diff: flow '{id}' unchanged, diffing outputs ({} old → {} new)",
+                                    old_flow.outputs.len(), new_flow.outputs.len());
+                                diff_outputs(flow_manager, id, &old_flow.outputs, &new_flow.outputs).await;
+                            }
+                        }
+                        // else: !was_running && !should_run → no-op
+                    }
+                }
+            }
+
+            // --- Diff tunnels ---
+            let old_tunnel_map: HashMap<&str, &TunnelConfig> =
+                old_config.tunnels.iter().map(|t| (t.id.as_str(), t)).collect();
+            let new_tunnel_map: HashMap<&str, &TunnelConfig> =
+                new_config.tunnels.iter().map(|t| (t.id.as_str(), t)).collect();
+
+            // Removed tunnels
+            for &id in old_tunnel_map.keys() {
+                if !new_tunnel_map.contains_key(id) {
+                    tracing::info!("Config diff: removing tunnel '{id}'");
+                    let _ = tunnel_manager.destroy_tunnel(id).await;
+                }
+            }
+
+            // Added or changed tunnels
+            for (&id, &new_tunnel) in &new_tunnel_map {
+                match old_tunnel_map.get(id) {
+                    None => {
+                        tracing::info!("Config diff: creating new tunnel '{id}'");
+                        if let Err(e) = tunnel_manager.create_tunnel(new_tunnel.clone()).await {
+                            tracing::warn!("Failed to start new tunnel '{id}': {e}");
+                        }
+                    }
+                    Some(&old_tunnel) => {
+                        if old_tunnel != new_tunnel {
+                            tracing::warn!("Config diff: RESTARTING tunnel '{id}' — old: {:?}, new: {:?}",
+                                serde_json::to_value(old_tunnel).ok(), serde_json::to_value(new_tunnel).ok());
+                            let _ = tunnel_manager.destroy_tunnel(id).await;
+                            if let Err(e) = tunnel_manager.create_tunnel(new_tunnel.clone()).await {
+                                tracing::warn!("Failed to restart tunnel '{id}': {e}");
+                            }
+                        } else {
+                            tracing::info!("Config diff: tunnel '{id}' unchanged");
+                        }
+                    }
+                }
+            }
+
+            // Apply new config and persist
             {
                 let mut cfg = app_config.write().await;
                 cfg.flows = new_config.flows.clone();
@@ -769,29 +935,64 @@ async fn execute_command(
                 persist_config(&cfg, config_path);
             }
 
-            // Start enabled flows from new config
-            for flow in &new_config.flows {
-                if flow.enabled {
-                    match flow_manager.create_flow(flow.clone()).await {
-                        Ok(runtime) => {
-                            #[cfg(feature = "webrtc")]
-                            register_whip_if_needed(webrtc_sessions, &runtime);
-                        }
-                        Err(e) => tracing::warn!("Failed to start flow '{}' after config update: {e}", flow.id),
-                    }
-                }
-            }
-
-            // Start tunnels from new config
-            for tunnel in &new_config.tunnels {
-                if let Err(e) = tunnel_manager.create_tunnel(tunnel.clone()).await {
-                    tracing::warn!("Failed to start tunnel '{}' after config update: {e}", tunnel.id);
-                }
-            }
-
             Ok(())
         }
         _ => Err(format!("Unknown command: {action_type}")),
+    }
+}
+
+/// Diff outputs between old and new config, applying surgical hot-add/remove.
+///
+/// Only outputs that actually changed are touched; unchanged outputs keep running
+/// without interruption.
+async fn diff_outputs(
+    flow_manager: &FlowManager,
+    flow_id: &str,
+    old_outputs: &[OutputConfig],
+    new_outputs: &[OutputConfig],
+) {
+    let old_map: HashMap<&str, &OutputConfig> =
+        old_outputs.iter().map(|o| (o.id(), o)).collect();
+    let new_map: HashMap<&str, &OutputConfig> =
+        new_outputs.iter().map(|o| (o.id(), o)).collect();
+
+    // Remove outputs that are no longer present
+    for &id in old_map.keys() {
+        if !new_map.contains_key(id) {
+            tracing::info!("Config diff: removing output '{id}' from flow '{flow_id}'");
+            if let Err(e) = flow_manager.remove_output(flow_id, id).await {
+                tracing::warn!("Failed to remove output '{id}' from flow '{flow_id}': {e}");
+            }
+        }
+    }
+
+    // Add new outputs or replace changed ones
+    for (&id, &new_output) in &new_map {
+        match old_map.get(id) {
+            None => {
+                // Brand-new output
+                tracing::info!("Config diff: adding output '{id}' to flow '{flow_id}'");
+                if let Err(e) = flow_manager.add_output(flow_id, new_output.clone()).await {
+                    tracing::warn!("Failed to add output '{id}' to flow '{flow_id}': {e}");
+                }
+            }
+            Some(&old_output) => {
+                // Output exists in both — check if config changed
+                if old_output != new_output {
+                    tracing::warn!("Config diff: REPLACING output '{id}' in flow '{flow_id}' — configs differ!");
+                    tracing::warn!("  old: {:?}", serde_json::to_value(old_output).ok());
+                    tracing::warn!("  new: {:?}", serde_json::to_value(new_output).ok());
+                    if let Err(e) = flow_manager.remove_output(flow_id, id).await {
+                        tracing::warn!("Failed to remove output '{id}' for replacement: {e}");
+                    }
+                    if let Err(e) = flow_manager.add_output(flow_id, new_output.clone()).await {
+                        tracing::warn!("Failed to re-add output '{id}' after replacement: {e}");
+                    }
+                } else {
+                    tracing::info!("Config diff: output '{id}' unchanged, keeping alive");
+                }
+            }
+        }
     }
 }
 

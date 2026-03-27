@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::models::{SrtMode, SrtOutputConfig};
 use crate::srt::connection::{
     accept_srt_connection, bind_srt_listener_for_output, bind_srt_listener_for_redundancy,
-    connect_srt_output, connect_srt_redundancy_leg,
+    connect_srt_output, connect_srt_redundancy_leg, spawn_srt_stats_poller,
 };
 use crate::stats::collector::OutputStatsAccumulator;
 
@@ -97,7 +97,11 @@ async fn srt_output_listener_loop(
             config.local_addr,
         );
 
+        let poller_cancel = cancel.child_token();
+        spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
+
         let disconnected = srt_output_forward_loop(config, rx, &stats, &cancel, &socket).await?;
+        poller_cancel.cancel();
         let _ = socket.close().await;
 
         if !disconnected {
@@ -149,7 +153,11 @@ async fn srt_output_caller_loop(
             config.local_addr,
         );
 
+        let poller_cancel = cancel.child_token();
+        spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
+
         let disconnected = srt_output_forward_loop(config, rx, &stats, &cancel, &socket).await?;
+        poller_cancel.cancel();
         let _ = socket.close().await;
 
         if !disconnected {

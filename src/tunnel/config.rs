@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Configuration for a single IP tunnel.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TunnelConfig {
     /// Unique tunnel identifier (UUID).
     pub id: String,

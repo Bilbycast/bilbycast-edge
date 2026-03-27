@@ -12,6 +12,7 @@ use srt_protocol::config::KeySize;
 use srt_transport::{SrtListener, SrtSocket, SrtSocketBuilder};
 
 use crate::config::models::{SrtInputConfig, SrtMode, SrtOutputConfig, SrtRedundancyConfig};
+use crate::stats::models::SrtLegStats;
 
 /// Build an [`SrtSocketBuilder`] from common SRT configuration parameters.
 ///
@@ -340,4 +341,46 @@ pub async fn bind_srt_listener_for_redundancy(config: &SrtRedundancyConfig) -> R
         config.aes_key_len,
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// SRT stats conversion
+// ---------------------------------------------------------------------------
+
+/// Convert [`srt_protocol::stats::SrtStats`] into the edge API [`SrtLegStats`].
+pub fn convert_srt_stats(stats: &srt_protocol::stats::SrtStats) -> SrtLegStats {
+    SrtLegStats {
+        state: "connected".to_string(),
+        rtt_ms: stats.ms_rtt,
+        send_rate_mbps: stats.mbps_send_rate,
+        recv_rate_mbps: stats.mbps_recv_rate,
+        pkt_loss_total: (stats.pkt_snd_loss_total as i64) + (stats.pkt_rcv_loss_total as i64),
+        pkt_retransmit_total: stats.pkt_retrans_total,
+        pkt_recv_drop_total: stats.pkt_rcv_drop_total,
+        pkt_send_drop_total: stats.pkt_snd_drop_total,
+        uptime_ms: stats.ms_timestamp,
+    }
+}
+
+/// Spawn a background task that polls SRT socket stats every second and
+/// writes the result into the provided cache. Runs until the cancellation
+/// token fires.
+pub fn spawn_srt_stats_poller(
+    socket: Arc<SrtSocket>,
+    cache: Arc<std::sync::Mutex<Option<SrtLegStats>>>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    let stats = socket.stats().await;
+                    let leg_stats = convert_srt_stats(&stats);
+                    *cache.lock().unwrap() = Some(leg_stats);
+                }
+            }
+        }
+    });
 }

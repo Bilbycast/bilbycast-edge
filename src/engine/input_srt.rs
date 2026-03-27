@@ -13,7 +13,7 @@ use crate::config::models::{SrtInputConfig, SrtMode};
 use crate::redundancy::merger::{ActiveLeg, HitlessMerger};
 use crate::srt::connection::{
     accept_srt_connection, bind_srt_listener_for_input, bind_srt_listener_for_redundancy,
-    connect_srt_input, connect_srt_redundancy_leg,
+    connect_srt_input, connect_srt_redundancy_leg, spawn_srt_stats_poller,
 };
 use crate::stats::collector::FlowStatsAccumulator;
 use crate::util::rtp_parse::{is_likely_rtp, parse_rtp_sequence_number, parse_rtp_timestamp};
@@ -150,10 +150,14 @@ async fn srt_input_listener_loop(
             config.local_addr,
         );
 
+        let poller_cancel = cancel.child_token();
+        spawn_srt_stats_poller(socket.clone(), stats.input_srt_stats_cache.clone(), poller_cancel.clone());
+
         let disconnected = srt_input_recv_loop(
             &socket, &broadcast_tx, &stats, &cancel,
             &mut format, &mut last_seq, &mut raw_ts_seq_counter, &mut raw_ts_timestamp,
         ).await?;
+        poller_cancel.cancel();
         let _ = socket.close().await;
 
         if !disconnected {
@@ -205,10 +209,14 @@ async fn srt_input_caller_loop(
             config.local_addr,
         );
 
+        let poller_cancel = cancel.child_token();
+        spawn_srt_stats_poller(socket.clone(), stats.input_srt_stats_cache.clone(), poller_cancel.clone());
+
         let disconnected = srt_input_recv_loop(
             &socket, &broadcast_tx, &stats, &cancel,
             &mut format, &mut last_seq, &mut raw_ts_seq_counter, &mut raw_ts_timestamp,
         ).await?;
+        poller_cancel.cancel();
         let _ = socket.close().await;
 
         if !disconnected {

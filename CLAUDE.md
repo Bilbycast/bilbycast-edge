@@ -102,7 +102,7 @@ All data flows through a single type: `RtpPacket { data: Bytes, sequence_number:
 | `config/` | `models.rs`, `validation.rs`, `persistence.rs` | JSON config, enum-tagged types, atomic save |
 | `stats/` | `collector.rs`, `models.rs`, `throughput.rs` | Lock-free stats registry, bitrate estimation |
 | `tunnel/` | `manager.rs`, `relay_client.rs`, `udp_forwarder.rs`, `tcp_forwarder.rs`, `crypto.rs`, `auth.rs` | QUIC-based IP tunnels (relay/direct), end-to-end encryption, HMAC-SHA256 bind authentication |
-| `manager/` | `client.rs`, `config.rs` | WebSocket client to bilbycast-manager. Sends stats (1s) and health (15s). Handles commands: get_config (returns full AppConfig), create/delete/start/stop flow, add/remove output, create/delete tunnel |
+| `manager/` | `client.rs`, `config.rs` | WebSocket client to bilbycast-manager. Sends stats (1s) and health (15s). Handles commands: get_config, create/delete/start/stop flow, update_flow (diff-based), update_config (diff-based), add/remove output, create/delete tunnel. **Config updates use diff logic** — `update_flow` and `update_config` compare old vs new using `PartialEq` and only restart flows when input/metadata changes; output-only changes are applied surgically via hot-add/remove without disrupting other outputs or SRT connections |
 | `monitor/` | `server.rs`, `dashboard.rs` | Embedded HTML/JS dashboard on separate port |
 | `setup/` | `handlers.rs`, `wizard.rs` | Browser-based setup wizard for initial provisioning (inline HTML, gated by `setup_enabled` config flag) |
 | `srt/` | `connection.rs` | SRT stats polling and socket config |

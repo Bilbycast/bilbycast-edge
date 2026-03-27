@@ -231,6 +231,10 @@ pub struct SrtLegStats {
     pub pkt_loss_total: i64,
     /// Total packets retransmitted by the SRT ARQ mechanism.
     pub pkt_retransmit_total: i32,
+    /// Total packets dropped at receiver (too late for TSBPD delivery).
+    pub pkt_recv_drop_total: i32,
+    /// Total packets dropped at sender (too late to send).
+    pub pkt_send_drop_total: i32,
     /// Milliseconds since the SRT socket was connected (socket uptime).
     pub uptime_ms: i64,
 }

@@ -22,16 +22,27 @@ Config is written to disk immediately after any of these events:
 
 Config saves use an atomic two-phase write: the JSON is first written to a temporary file (`.json.tmp`), then renamed to the actual config path. This prevents partial or corrupted config files if the node crashes or loses power mid-write.
 
-### Manager UpdateConfig behavior
+### Manager config update behavior
 
-When the manager sends an `update_config` command:
+Both `update_config` (full config replacement) and `update_flow` (single flow update) use **diff-based** logic to minimize disruption to running flows. Only changed components are restarted; unchanged flows, outputs, and tunnels continue running uninterrupted.
 
-1. The manager sends the **full config** (not a diff)
+When the manager sends an `update_config` or `update_flow` command:
+
+1. The manager sends the full config (not a diff) — the edge computes the diff internally
 2. The edge **validates** the new config before applying it
-3. All running flows and tunnels are **stopped**
-4. The in-memory config is updated and **saved to disk**
-5. Enabled flows and tunnels are **restarted** from the new config
-6. A `command_ack` is sent back to the manager
+3. **Flows** are compared by ID between old and new config:
+   - Removed flows → destroyed
+   - Added flows → created
+   - Unchanged flows → **not touched** (input and all outputs keep running)
+   - Changed flows: if only outputs changed, outputs are surgically hot-added/removed; if the input or metadata changed, the flow is fully restarted
+4. **Tunnels** are compared similarly — only changed tunnels are restarted
+5. **Outputs** within a flow are diffed by ID:
+   - Removed outputs → hot-removed (other outputs unaffected)
+   - Added outputs → hot-added (subscribes to existing broadcast channel)
+   - Changed outputs (different config) → removed and re-added
+   - Unchanged outputs → **not touched** (SRT/RTP connections survive)
+6. The in-memory config is updated and **saved to disk**
+7. A `command_ack` is sent back to the manager
 
 **Fields replaced** by UpdateConfig: `flows`, `tunnels`, `server`, `monitor`
 

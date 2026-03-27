@@ -26,6 +26,10 @@ pub struct OutputStatsAccumulator {
     pub packets_dropped: AtomicU64,
     pub fec_packets_sent: AtomicU64,
     throughput: Mutex<ThroughputEstimator>,
+    /// Cached SRT stats for primary leg, updated by the SRT output polling task.
+    pub srt_stats_cache: Arc<Mutex<Option<SrtLegStats>>>,
+    /// Cached SRT stats for redundancy leg, updated by the SRT output polling task.
+    pub srt_leg2_stats_cache: Arc<Mutex<Option<SrtLegStats>>>,
 }
 
 impl OutputStatsAccumulator {
@@ -40,6 +44,8 @@ impl OutputStatsAccumulator {
             packets_dropped: AtomicU64::new(0),
             fec_packets_sent: AtomicU64::new(0),
             throughput: Mutex::new(ThroughputEstimator::new()),
+            srt_stats_cache: Arc::new(Mutex::new(None)),
+            srt_leg2_stats_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -65,8 +71,8 @@ impl OutputStatsAccumulator {
             bitrate_bps,
             packets_dropped: self.packets_dropped.load(Ordering::Relaxed),
             fec_packets_sent: self.fec_packets_sent.load(Ordering::Relaxed),
-            srt_stats: None,
-            srt_leg2_stats: None,
+            srt_stats: self.srt_stats_cache.lock().unwrap().clone(),
+            srt_leg2_stats: self.srt_leg2_stats_cache.lock().unwrap().clone(),
         }
     }
 }
@@ -418,6 +424,10 @@ pub struct FlowStatsAccumulator {
     pub input_config_meta: OnceLock<InputConfigMeta>,
     /// Per-output config metadata for topology display (set once per output).
     pub output_config_meta: DashMap<String, OutputConfigMeta>,
+    /// Cached SRT stats for primary input leg, updated by the SRT input polling task.
+    pub input_srt_stats_cache: Arc<Mutex<Option<SrtLegStats>>>,
+    /// Cached SRT stats for redundancy input leg, updated by the SRT input polling task.
+    pub input_srt_leg2_stats_cache: Arc<Mutex<Option<SrtLegStats>>>,
 }
 
 /// Lightweight input config metadata for topology display.
@@ -464,6 +474,8 @@ impl FlowStatsAccumulator {
             media_analysis: OnceLock::new(),
             input_config_meta: OnceLock::new(),
             output_config_meta: DashMap::new(),
+            input_srt_stats_cache: Arc::new(Mutex::new(None)),
+            input_srt_leg2_stats_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -552,8 +564,8 @@ impl FlowStatsAccumulator {
                     packets_lost,
                     packets_filtered: self.input_filtered.load(Ordering::Relaxed),
                     packets_recovered_fec: self.fec_recovered.load(Ordering::Relaxed),
-                    srt_stats: None,
-                    srt_leg2_stats: None,
+                    srt_stats: self.input_srt_stats_cache.lock().unwrap().clone(),
+                    srt_leg2_stats: self.input_srt_leg2_stats_cache.lock().unwrap().clone(),
                     redundancy_switches: self.redundancy_switches.load(Ordering::Relaxed),
                 }
             },
