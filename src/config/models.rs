@@ -290,6 +290,19 @@ pub struct SrtInputConfig {
     /// Maximum payload size per SRT packet (default: 1316 for MPEG-TS 7×188).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_size: Option<u32>,
+    /// Maximum Segment Size in bytes (default: 1500). Controls the maximum UDP
+    /// packet size including SRT header. Adjust for non-standard MTU paths
+    /// (e.g., lower for VPNs/tunnels, higher for jumbo frames up to 9000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mss: Option<u32>,
+    /// Enable too-late packet drop (default: true in live mode). When enabled,
+    /// packets that arrive after their TSBPD delivery deadline are dropped.
+    /// Disable for recording/archival use cases where completeness matters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tlpkt_drop: Option<bool>,
+    /// IP Time To Live (default: 64). Range: 1-255.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_ttl: Option<i32>,
     /// Optional: enable 2022-7 redundancy on input (merge from two SRT legs)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<SrtRedundancyConfig>,
@@ -618,6 +631,15 @@ pub struct SrtOutputConfig {
     /// Maximum payload size per SRT packet (default: 1316).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_size: Option<u32>,
+    /// Maximum Segment Size in bytes (default: 1500).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mss: Option<u32>,
+    /// Enable too-late packet drop (default: true in live mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tlpkt_drop: Option<bool>,
+    /// IP Time To Live (default: 64). Range: 1-255.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_ttl: Option<i32>,
     /// Optional: enable 2022-7 redundancy on output (duplicate to two SRT legs)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<SrtRedundancyConfig>,
@@ -733,6 +755,15 @@ pub struct SrtRedundancyConfig {
     /// Maximum payload size for leg 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_size: Option<u32>,
+    /// Maximum Segment Size for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mss: Option<u32>,
+    /// Enable too-late packet drop for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tlpkt_drop: Option<bool>,
+    /// IP Time To Live for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_ttl: Option<i32>,
 }
 
 /// SMPTE 2022-7 redundancy config for an RTP input (leg 2).

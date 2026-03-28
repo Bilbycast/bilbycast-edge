@@ -260,6 +260,20 @@ pub struct SrtLegStats {
     pub byte_retrans_total: u64,
     /// Total bytes dropped at receiver.
     pub byte_recv_drop_total: u64,
+    /// Total bytes lost (receiver side).
+    pub byte_recv_loss_total: u64,
+    /// Total bytes dropped at sender (too late to send).
+    pub byte_send_drop_total: u64,
+    /// Total undecrypted bytes (encryption mismatch).
+    pub byte_recv_undecrypt_total: u64,
+    /// Total unique data packets sent (excluding retransmissions).
+    pub pkt_sent_unique_total: i64,
+    /// Total unique data packets received (excluding retransmissions).
+    pub pkt_recv_unique_total: i64,
+    /// Total unique bytes sent (excluding retransmissions).
+    pub byte_sent_unique_total: u64,
+    /// Total unique bytes received (excluding retransmissions).
+    pub byte_recv_unique_total: u64,
 
     // ── ACK/NAK counters ──
 
@@ -292,6 +306,22 @@ pub struct SrtLegStats {
     pub ms_send_tsbpd_delay: i32,
     /// Negotiated receiver TSBPD delay in milliseconds.
     pub ms_recv_tsbpd_delay: i32,
+
+    // ── Buffer occupancy ──
+
+    /// Unacknowledged packets in sender buffer.
+    pub pkt_send_buf: i32,
+    /// Unacknowledged bytes in sender buffer.
+    pub byte_send_buf: i32,
+    /// Undelivered packets in receiver buffer.
+    pub pkt_recv_buf: i32,
+    /// Undelivered bytes in receiver buffer.
+    pub byte_recv_buf: i32,
+
+    // ── Pacing ──
+
+    /// Packet sending period in microseconds (congestion control pacing).
+    pub us_pkt_send_period: f64,
 
     // ── Reorder / belated ──
 

@@ -237,6 +237,7 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                 srt.send_buffer_size, srt.recv_buffer_size, srt.ip_tos,
                 srt.retransmit_algo.as_deref(), srt.send_drop_delay, srt.loss_max_ttl,
                 srt.km_refresh_rate, srt.km_pre_announce, srt.payload_size,
+                srt.mss, srt.ip_ttl,
                 "SRT input",
             )?;
             if let Some(ref red) = srt.redundancy {
@@ -412,6 +413,7 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
                 srt.send_buffer_size, srt.recv_buffer_size, srt.ip_tos,
                 srt.retransmit_algo.as_deref(), srt.send_drop_delay, srt.loss_max_ttl,
                 srt.km_refresh_rate, srt.km_pre_announce, srt.payload_size,
+                srt.mss, srt.ip_ttl,
                 "SRT output",
             )?;
             if let Some(ref red) = srt.redundancy {
@@ -521,6 +523,8 @@ fn validate_srt_common(
     km_refresh_rate: Option<u32>,
     km_pre_announce: Option<u32>,
     payload_size: Option<u32>,
+    mss: Option<u32>,
+    ip_ttl: Option<i32>,
     context: &str,
 ) -> Result<()> {
     match mode {
@@ -659,6 +663,18 @@ fn validate_srt_common(
         }
     }
 
+    if let Some(s) = mss {
+        if s < 76 || s > 9000 {
+            bail!("{context}: mss must be 76-9000, got {s}");
+        }
+    }
+
+    if let Some(t) = ip_ttl {
+        if !(1..=255).contains(&t) {
+            bail!("{context}: ip_ttl must be 1-255, got {t}");
+        }
+    }
+
     Ok(())
 }
 
@@ -672,6 +688,7 @@ fn validate_srt_redundancy(red: &SrtRedundancyConfig, context: &str) -> Result<(
         red.send_buffer_size, red.recv_buffer_size, red.ip_tos,
         red.retransmit_algo.as_deref(), red.send_drop_delay, red.loss_max_ttl,
         red.km_refresh_rate, red.km_pre_announce, red.payload_size,
+        red.mss, red.ip_ttl,
         &format!("{context} redundancy"),
     )
 }
@@ -926,7 +943,7 @@ mod tests {
                 flight_flag_size: None, send_buffer_size: None, recv_buffer_size: None,
                 ip_tos: None, retransmit_algo: None, send_drop_delay: None,
                 loss_max_ttl: None, km_refresh_rate: None, km_pre_announce: None,
-                payload_size: None,
+                payload_size: None, mss: None, tlpkt_drop: None, ip_ttl: None,
                 redundancy: None,
             }),
             outputs: vec![],
@@ -1011,7 +1028,7 @@ mod tests {
                 flight_flag_size: None, send_buffer_size: None, recv_buffer_size: None,
                 ip_tos: None, retransmit_algo: None, send_drop_delay: None,
                 loss_max_ttl: None, km_refresh_rate: None, km_pre_announce: None,
-                payload_size: None,
+                payload_size: None, mss: None, tlpkt_drop: None, ip_ttl: None,
                 redundancy: None,
             }),
             outputs: vec![],

@@ -48,6 +48,9 @@ pub struct SrtConnectionParams<'a> {
     pub km_refresh_rate: Option<u32>,
     pub km_pre_announce: Option<u32>,
     pub payload_size: Option<u32>,
+    pub mss: Option<u32>,
+    pub tlpkt_drop: Option<bool>,
+    pub ip_ttl: Option<i32>,
 }
 
 impl<'a> From<&'a SrtInputConfig> for SrtConnectionParams<'a> {
@@ -81,6 +84,9 @@ impl<'a> From<&'a SrtInputConfig> for SrtConnectionParams<'a> {
             km_refresh_rate: c.km_refresh_rate,
             km_pre_announce: c.km_pre_announce,
             payload_size: c.payload_size,
+            mss: c.mss,
+            tlpkt_drop: c.tlpkt_drop,
+            ip_ttl: c.ip_ttl,
         }
     }
 }
@@ -116,6 +122,9 @@ impl<'a> From<&'a SrtOutputConfig> for SrtConnectionParams<'a> {
             km_refresh_rate: c.km_refresh_rate,
             km_pre_announce: c.km_pre_announce,
             payload_size: c.payload_size,
+            mss: c.mss,
+            tlpkt_drop: c.tlpkt_drop,
+            ip_ttl: c.ip_ttl,
         }
     }
 }
@@ -151,6 +160,9 @@ impl<'a> From<&'a SrtRedundancyConfig> for SrtConnectionParams<'a> {
             km_refresh_rate: c.km_refresh_rate,
             km_pre_announce: c.km_pre_announce,
             payload_size: c.payload_size,
+            mss: c.mss,
+            tlpkt_drop: c.tlpkt_drop,
+            ip_ttl: c.ip_ttl,
         }
     }
 }
@@ -179,6 +191,9 @@ fn apply_advanced_options(mut builder: SrtSocketBuilder, p: &SrtConnectionParams
     if let Some(r) = p.km_refresh_rate { builder = builder.km_refresh_rate(r); }
     if let Some(r) = p.km_pre_announce { builder = builder.km_pre_announce(r); }
     if let Some(s) = p.payload_size { builder = builder.payload_size(s); }
+    if let Some(s) = p.mss { builder = builder.mss(s); }
+    if let Some(t) = p.tlpkt_drop { builder = builder.tlpkt_drop(t); }
+    if let Some(t) = p.ip_ttl { builder = builder.ip_ttl(t); }
     builder
 }
 
@@ -250,6 +265,9 @@ fn apply_advanced_options_listener(
     if let Some(r) = p.km_refresh_rate { lb = lb.km_refresh_rate(r); }
     if let Some(r) = p.km_pre_announce { lb = lb.km_pre_announce(r); }
     if let Some(s) = p.payload_size { lb = lb.payload_size(s); }
+    if let Some(s) = p.mss { lb = lb.mss(s); }
+    if let Some(t) = p.tlpkt_drop { lb = lb.tlpkt_drop(t); }
+    if let Some(t) = p.ip_ttl { lb = lb.ip_ttl(t); }
     lb
 }
 
@@ -563,6 +581,13 @@ pub fn convert_srt_stats(stats: &srt_protocol::stats::SrtStats) -> SrtLegStats {
         byte_recv_total: stats.byte_recv_total,
         byte_retrans_total: stats.byte_retrans_total,
         byte_recv_drop_total: stats.byte_rcv_drop_total,
+        byte_recv_loss_total: stats.byte_rcv_loss_total,
+        byte_send_drop_total: stats.byte_snd_drop_total,
+        byte_recv_undecrypt_total: stats.byte_rcv_undecrypt_total,
+        pkt_sent_unique_total: stats.pkt_sent_unique_total,
+        pkt_recv_unique_total: stats.pkt_recv_unique_total,
+        byte_sent_unique_total: stats.byte_sent_unique_total,
+        byte_recv_unique_total: stats.byte_recv_unique_total,
 
         // ACK/NAK
         pkt_sent_ack_total: stats.pkt_sent_ack_total,
@@ -580,6 +605,15 @@ pub fn convert_srt_stats(stats: &srt_protocol::stats::SrtStats) -> SrtLegStats {
         ms_recv_buf: stats.ms_rcv_buf,
         ms_send_tsbpd_delay: stats.ms_snd_tsbpd_delay,
         ms_recv_tsbpd_delay: stats.ms_rcv_tsbpd_delay,
+
+        // Buffer occupancy
+        pkt_send_buf: stats.pkt_snd_buf,
+        byte_send_buf: stats.byte_snd_buf,
+        pkt_recv_buf: stats.pkt_rcv_buf,
+        byte_recv_buf: stats.byte_rcv_buf,
+
+        // Pacing
+        us_pkt_send_period: stats.us_pkt_snd_period,
 
         // Reorder / belated
         pkt_reorder_distance: stats.pkt_reorder_distance,
