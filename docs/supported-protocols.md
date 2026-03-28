@@ -33,8 +33,11 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
 - **Transport:** UDP with ARQ retransmission
 - **Modes:** Caller, Listener, Rendezvous
 - **Features:**
-  - AES-128/192/256 encryption
-  - Configurable latency buffer
+  - AES-128/192/256 encryption (AES-CTR default, AES-GCM authenticated encryption selectable via `crypto_mode`)
+  - Stream ID access control (`stream_id`, max 512 chars per SRT spec; supports `#!::r=name,m=mode,u=user` structured format)
+  - FEC (Forward Error Correction) via `packet_filter` — XOR-based row/column parity, staircase layout, ARQ integration modes (`always`/`onreq`/`never`), wire-compatible with libsrt v1.5.5
+  - Configurable latency buffer (symmetric or asymmetric receiver/sender latency)
+  - Retransmission bandwidth capping (Token Bucket shaper via `max_rexmit_bw`)
   - SMPTE 2022-7 hitless redundancy merge (dual-leg input)
   - Automatic reconnection
 
@@ -63,7 +66,11 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
 - **Direction:** Output
 - **Modes:** Caller, Listener, Rendezvous
 - **Features:**
-  - AES encryption
+  - AES encryption (AES-CTR or AES-GCM via `crypto_mode`)
+  - Stream ID access control (`stream_id`, max 512 chars; callers send during handshake, listeners filter)
+  - FEC (Forward Error Correction) via `packet_filter` — same capabilities as SRT input
+  - Asymmetric latency support (independent receiver/sender latency)
+  - Retransmission bandwidth capping (Token Bucket shaper)
   - SMPTE 2022-7 hitless redundancy duplication (dual-leg output)
   - Non-blocking mpsc bridge prevents TCP backpressure from affecting other outputs
   - Automatic reconnection

@@ -101,9 +101,9 @@ pub async fn create_flow(
     // Start the flow in the engine if enabled
     if flow.enabled {
         match state.flow_manager.create_flow(flow.clone()).await {
-            Ok(runtime) => {
+            Ok(_runtime) => {
                 #[cfg(feature = "webrtc")]
-                register_whip_if_needed(&state, &runtime);
+                register_whip_if_needed(&state, &_runtime);
             }
             Err(e) => tracing::warn!("Flow '{}' persisted but failed to start: {e}", flow.id),
         }
@@ -155,9 +155,9 @@ pub async fn update_flow(
 
     if flow.enabled {
         match state.flow_manager.create_flow(flow.clone()).await {
-            Ok(runtime) => {
+            Ok(_runtime) => {
                 #[cfg(feature = "webrtc")]
-                register_whip_if_needed(&state, &runtime);
+                register_whip_if_needed(&state, &_runtime);
             }
             Err(e) => tracing::warn!("Flow '{}' updated but failed to restart: {e}", flow_id),
         }
@@ -474,9 +474,9 @@ pub async fn replace_config(
     for flow in &config.flows {
         if flow.enabled {
             match state.flow_manager.create_flow(flow.clone()).await {
-                Ok(runtime) => {
+                Ok(_runtime) => {
                     #[cfg(feature = "webrtc")]
-                    register_whip_if_needed(&state, &runtime);
+                    register_whip_if_needed(&state, &_runtime);
                 }
                 Err(e) => tracing::error!("Failed to start flow '{}' after config replace: {e}", flow.id),
             }
@@ -520,9 +520,9 @@ pub async fn reload_config(
     for flow in &config.flows {
         if flow.enabled {
             match state.flow_manager.create_flow(flow.clone()).await {
-                Ok(runtime) => {
+                Ok(_runtime) => {
                     #[cfg(feature = "webrtc")]
-                    register_whip_if_needed(&state, &runtime);
+                    register_whip_if_needed(&state, &_runtime);
                 }
                 Err(e) => tracing::error!("Failed to start flow '{}' after config reload: {e}", flow.id),
             }

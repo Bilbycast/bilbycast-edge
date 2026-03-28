@@ -29,13 +29,8 @@ pub enum DemuxedFrame {
         /// Whether this is a keyframe (contains IDR NALU).
         is_keyframe: bool,
     },
-    /// Opus audio frame.
-    Opus {
-        /// Raw Opus frame data.
-        data: Vec<u8>,
-        /// Presentation timestamp in 90 kHz clock ticks.
-        pts: u64,
-    },
+    /// Opus audio frame (not yet supported for output — placeholder variant).
+    Opus,
     /// AAC audio frame (raw, ADTS header stripped).
     Aac {
         /// Raw AAC frame data (without ADTS header).
@@ -357,10 +352,7 @@ impl TsDemuxer {
                 }]
             }
             STREAM_TYPE_PRIVATE if Some(pid) == self.audio_pid => {
-                vec![DemuxedFrame::Opus {
-                    data: es_data.to_vec(),
-                    pts: pts.unwrap_or(0),
-                }]
+                vec![DemuxedFrame::Opus]
             }
             STREAM_TYPE_AAC_ADTS if Some(pid) == self.audio_pid => {
                 // A single PES may contain multiple ADTS frames concatenated.

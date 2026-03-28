@@ -25,8 +25,9 @@ const NONCE_LEN: usize = 12;
 /// AEAD tag size (128 bits).
 const TAG_LEN: usize = 16;
 
-/// Total overhead per encrypted message.
-pub const ENCRYPTION_OVERHEAD: usize = NONCE_LEN + TAG_LEN;
+/// Total overhead per encrypted message (used in tests).
+#[cfg(test)]
+const ENCRYPTION_OVERHEAD: usize = NONCE_LEN + TAG_LEN;
 
 /// Symmetric cipher for end-to-end tunnel encryption.
 ///

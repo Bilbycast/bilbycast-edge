@@ -8,32 +8,197 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use tokio_util::sync::CancellationToken;
 
-use srt_protocol::config::KeySize;
+use srt_protocol::config::{CryptoModeConfig, KeySize, RetransmitAlgo};
 use srt_transport::{SrtListener, SrtSocket, SrtSocketBuilder};
 
 use crate::config::models::{SrtInputConfig, SrtMode, SrtOutputConfig, SrtRedundancyConfig};
 use crate::stats::models::SrtLegStats;
 
-/// Build an [`SrtSocketBuilder`] from common SRT configuration parameters.
+/// Common SRT connection parameters extracted from any SRT config type.
 ///
-/// `peer_idle_timeout_secs` controls how long to wait with no data before
-/// considering the connection dead. Default is 30s (suitable for broadcast).
-/// If a passphrase is provided, AES encryption is enabled with the given
-/// key length (defaulting to 16 bytes / AES-128).
-fn build_socket_builder(
-    latency_ms: u64,
-    peer_idle_timeout_secs: u64,
-    passphrase: Option<&str>,
-    aes_key_len: Option<usize>,
-) -> SrtSocketBuilder {
-    let timeout = if peer_idle_timeout_secs == 0 { 30 } else { peer_idle_timeout_secs };
+/// This struct avoids passing 20+ positional parameters through the connection
+/// pipeline. Use `From<&SrtInputConfig>`, `From<&SrtOutputConfig>`, or
+/// `From<&SrtRedundancyConfig>` to construct.
+pub struct SrtConnectionParams<'a> {
+    pub mode: &'a SrtMode,
+    pub local_addr: &'a str,
+    pub remote_addr: Option<&'a str>,
+    pub latency_ms: u64,
+    pub recv_latency_ms: Option<u64>,
+    pub peer_latency_ms: Option<u64>,
+    pub peer_idle_timeout_secs: u64,
+    pub passphrase: Option<&'a str>,
+    pub aes_key_len: Option<usize>,
+    pub crypto_mode: Option<&'a str>,
+    pub max_rexmit_bw: Option<i64>,
+    pub stream_id: Option<&'a str>,
+    pub packet_filter: Option<&'a str>,
+    pub max_bw: Option<i64>,
+    pub input_bw: Option<i64>,
+    pub overhead_bw: Option<i32>,
+    pub enforced_encryption: Option<bool>,
+    pub connect_timeout_secs: Option<u64>,
+    pub flight_flag_size: Option<u32>,
+    pub send_buffer_size: Option<u32>,
+    pub recv_buffer_size: Option<u32>,
+    pub ip_tos: Option<i32>,
+    pub retransmit_algo: Option<&'a str>,
+    pub send_drop_delay: Option<i32>,
+    pub loss_max_ttl: Option<i32>,
+    pub km_refresh_rate: Option<u32>,
+    pub km_pre_announce: Option<u32>,
+    pub payload_size: Option<u32>,
+}
+
+impl<'a> From<&'a SrtInputConfig> for SrtConnectionParams<'a> {
+    fn from(c: &'a SrtInputConfig) -> Self {
+        Self {
+            mode: &c.mode,
+            local_addr: &c.local_addr,
+            remote_addr: c.remote_addr.as_deref(),
+            latency_ms: c.latency_ms,
+            recv_latency_ms: c.recv_latency_ms,
+            peer_latency_ms: c.peer_latency_ms,
+            peer_idle_timeout_secs: c.peer_idle_timeout_secs,
+            passphrase: c.passphrase.as_deref(),
+            aes_key_len: c.aes_key_len,
+            crypto_mode: c.crypto_mode.as_deref(),
+            max_rexmit_bw: c.max_rexmit_bw,
+            stream_id: c.stream_id.as_deref(),
+            packet_filter: c.packet_filter.as_deref(),
+            max_bw: c.max_bw,
+            input_bw: c.input_bw,
+            overhead_bw: c.overhead_bw,
+            enforced_encryption: c.enforced_encryption,
+            connect_timeout_secs: c.connect_timeout_secs,
+            flight_flag_size: c.flight_flag_size,
+            send_buffer_size: c.send_buffer_size,
+            recv_buffer_size: c.recv_buffer_size,
+            ip_tos: c.ip_tos,
+            retransmit_algo: c.retransmit_algo.as_deref(),
+            send_drop_delay: c.send_drop_delay,
+            loss_max_ttl: c.loss_max_ttl,
+            km_refresh_rate: c.km_refresh_rate,
+            km_pre_announce: c.km_pre_announce,
+            payload_size: c.payload_size,
+        }
+    }
+}
+
+impl<'a> From<&'a SrtOutputConfig> for SrtConnectionParams<'a> {
+    fn from(c: &'a SrtOutputConfig) -> Self {
+        Self {
+            mode: &c.mode,
+            local_addr: &c.local_addr,
+            remote_addr: c.remote_addr.as_deref(),
+            latency_ms: c.latency_ms,
+            recv_latency_ms: c.recv_latency_ms,
+            peer_latency_ms: c.peer_latency_ms,
+            peer_idle_timeout_secs: c.peer_idle_timeout_secs,
+            passphrase: c.passphrase.as_deref(),
+            aes_key_len: c.aes_key_len,
+            crypto_mode: c.crypto_mode.as_deref(),
+            max_rexmit_bw: c.max_rexmit_bw,
+            stream_id: c.stream_id.as_deref(),
+            packet_filter: c.packet_filter.as_deref(),
+            max_bw: c.max_bw,
+            input_bw: c.input_bw,
+            overhead_bw: c.overhead_bw,
+            enforced_encryption: c.enforced_encryption,
+            connect_timeout_secs: c.connect_timeout_secs,
+            flight_flag_size: c.flight_flag_size,
+            send_buffer_size: c.send_buffer_size,
+            recv_buffer_size: c.recv_buffer_size,
+            ip_tos: c.ip_tos,
+            retransmit_algo: c.retransmit_algo.as_deref(),
+            send_drop_delay: c.send_drop_delay,
+            loss_max_ttl: c.loss_max_ttl,
+            km_refresh_rate: c.km_refresh_rate,
+            km_pre_announce: c.km_pre_announce,
+            payload_size: c.payload_size,
+        }
+    }
+}
+
+impl<'a> From<&'a SrtRedundancyConfig> for SrtConnectionParams<'a> {
+    fn from(c: &'a SrtRedundancyConfig) -> Self {
+        Self {
+            mode: &c.mode,
+            local_addr: &c.local_addr,
+            remote_addr: c.remote_addr.as_deref(),
+            latency_ms: c.latency_ms,
+            recv_latency_ms: c.recv_latency_ms,
+            peer_latency_ms: c.peer_latency_ms,
+            peer_idle_timeout_secs: c.peer_idle_timeout_secs,
+            passphrase: c.passphrase.as_deref(),
+            aes_key_len: c.aes_key_len,
+            crypto_mode: c.crypto_mode.as_deref(),
+            max_rexmit_bw: c.max_rexmit_bw,
+            stream_id: c.stream_id.as_deref(),
+            packet_filter: c.packet_filter.as_deref(),
+            max_bw: c.max_bw,
+            input_bw: c.input_bw,
+            overhead_bw: c.overhead_bw,
+            enforced_encryption: c.enforced_encryption,
+            connect_timeout_secs: c.connect_timeout_secs,
+            flight_flag_size: c.flight_flag_size,
+            send_buffer_size: c.send_buffer_size,
+            recv_buffer_size: c.recv_buffer_size,
+            ip_tos: c.ip_tos,
+            retransmit_algo: c.retransmit_algo.as_deref(),
+            send_drop_delay: c.send_drop_delay,
+            loss_max_ttl: c.loss_max_ttl,
+            km_refresh_rate: c.km_refresh_rate,
+            km_pre_announce: c.km_pre_announce,
+            payload_size: c.payload_size,
+        }
+    }
+}
+
+fn parse_retransmit_algo(s: Option<&str>) -> RetransmitAlgo {
+    match s {
+        Some("reduced") => RetransmitAlgo::Reduced,
+        _ => RetransmitAlgo::Default,
+    }
+}
+
+/// Apply the common SRT advanced options to a socket builder.
+fn apply_advanced_options(mut builder: SrtSocketBuilder, p: &SrtConnectionParams) -> SrtSocketBuilder {
+    if let Some(bw) = p.max_bw { builder = builder.max_bw(bw); }
+    if let Some(bw) = p.input_bw { builder = builder.input_bw(bw); }
+    if let Some(pct) = p.overhead_bw { builder = builder.overhead_bw(pct); }
+    if let Some(e) = p.enforced_encryption { builder = builder.enforced_encryption(e); }
+    if let Some(t) = p.connect_timeout_secs { builder = builder.connect_timeout(Duration::from_secs(t)); }
+    if let Some(s) = p.flight_flag_size { builder = builder.flight_flag_size(s); }
+    if let Some(s) = p.send_buffer_size { builder = builder.send_buffer_size(s * 1316); }
+    if let Some(s) = p.recv_buffer_size { builder = builder.recv_buffer_size(s * 1316); }
+    if let Some(t) = p.ip_tos { builder = builder.ip_tos(t); }
+    if p.retransmit_algo.is_some() { builder = builder.retransmit_algo(parse_retransmit_algo(p.retransmit_algo)); }
+    if let Some(d) = p.send_drop_delay { builder = builder.send_drop_delay(d); }
+    if let Some(t) = p.loss_max_ttl { builder = builder.loss_max_ttl(t); }
+    if let Some(r) = p.km_refresh_rate { builder = builder.km_refresh_rate(r); }
+    if let Some(r) = p.km_pre_announce { builder = builder.km_pre_announce(r); }
+    if let Some(s) = p.payload_size { builder = builder.payload_size(s); }
+    builder
+}
+
+/// Build an [`SrtSocketBuilder`] from [`SrtConnectionParams`].
+fn build_socket_builder(p: &SrtConnectionParams) -> SrtSocketBuilder {
+    let timeout = if p.peer_idle_timeout_secs == 0 { 30 } else { p.peer_idle_timeout_secs };
     let mut builder = SrtSocket::builder()
-        .latency(Duration::from_millis(latency_ms))
+        .latency(Duration::from_millis(p.latency_ms))
         .live_mode()
         .peer_idle_timeout(Duration::from_secs(timeout));
 
-    if let Some(pass) = passphrase {
-        let key_size = match aes_key_len.unwrap_or(16) {
+    if let Some(recv) = p.recv_latency_ms {
+        builder = builder.receiver_latency(Duration::from_millis(recv));
+    }
+    if let Some(peer) = p.peer_latency_ms {
+        builder = builder.sender_latency(Duration::from_millis(peer));
+    }
+
+    if let Some(pass) = p.passphrase {
+        let key_size = match p.aes_key_len.unwrap_or(16) {
             24 => KeySize::AES192,
             32 => KeySize::AES256,
             _ => KeySize::AES128,
@@ -41,41 +206,111 @@ fn build_socket_builder(
         builder = builder.encryption(pass, key_size);
     }
 
+    if p.crypto_mode == Some("aes-gcm") {
+        builder = builder.crypto_mode(CryptoModeConfig::AesGcm);
+    }
+
+    if let Some(bw) = p.max_rexmit_bw {
+        builder = builder.max_rexmit_bw(bw);
+    }
+
+    if let Some(sid) = p.stream_id {
+        if !sid.is_empty() {
+            builder = builder.stream_id(sid.to_string());
+        }
+    }
+
+    if let Some(pf) = p.packet_filter {
+        if !pf.is_empty() {
+            builder = builder.packet_filter(pf.to_string());
+        }
+    }
+
+    builder = apply_advanced_options(builder, p);
     builder
 }
 
+/// Apply common SRT advanced options to a listener builder.
+fn apply_advanced_options_listener(
+    mut lb: srt_transport::SrtListenerBuilder,
+    p: &SrtConnectionParams,
+) -> srt_transport::SrtListenerBuilder {
+    if let Some(bw) = p.max_bw { lb = lb.max_bw(bw); }
+    if let Some(bw) = p.input_bw { lb = lb.input_bw(bw); }
+    if let Some(pct) = p.overhead_bw { lb = lb.overhead_bw(pct); }
+    if let Some(e) = p.enforced_encryption { lb = lb.enforced_encryption(e); }
+    if let Some(t) = p.connect_timeout_secs { lb = lb.connect_timeout(Duration::from_secs(t)); }
+    if let Some(s) = p.flight_flag_size { lb = lb.flight_flag_size(s); }
+    if let Some(s) = p.send_buffer_size { lb = lb.send_buffer_size(s * 1316); }
+    if let Some(s) = p.recv_buffer_size { lb = lb.recv_buffer_size(s * 1316); }
+    if let Some(t) = p.ip_tos { lb = lb.ip_tos(t); }
+    if p.retransmit_algo.is_some() { lb = lb.retransmit_algo(parse_retransmit_algo(p.retransmit_algo)); }
+    if let Some(d) = p.send_drop_delay { lb = lb.send_drop_delay(d); }
+    if let Some(t) = p.loss_max_ttl { lb = lb.loss_max_ttl(t); }
+    if let Some(r) = p.km_refresh_rate { lb = lb.km_refresh_rate(r); }
+    if let Some(r) = p.km_pre_announce { lb = lb.km_pre_announce(r); }
+    if let Some(s) = p.payload_size { lb = lb.payload_size(s); }
+    lb
+}
+
+/// Build a listener from [`SrtConnectionParams`].
+fn build_listener_builder(p: &SrtConnectionParams) -> srt_transport::SrtListenerBuilder {
+    let timeout = if p.peer_idle_timeout_secs == 0 { 30 } else { p.peer_idle_timeout_secs };
+    let mut lb = SrtListener::builder()
+        .latency(Duration::from_millis(p.latency_ms))
+        .live_mode()
+        .peer_idle_timeout(Duration::from_secs(timeout));
+
+    if let Some(recv) = p.recv_latency_ms {
+        lb = lb.receiver_latency(Duration::from_millis(recv));
+    }
+    if let Some(peer) = p.peer_latency_ms {
+        lb = lb.sender_latency(Duration::from_millis(peer));
+    }
+
+    if let Some(pass) = p.passphrase {
+        let key_size = match p.aes_key_len.unwrap_or(16) {
+            24 => KeySize::AES192,
+            32 => KeySize::AES256,
+            _ => KeySize::AES128,
+        };
+        lb = lb.encryption(pass, key_size);
+    }
+
+    if p.crypto_mode == Some("aes-gcm") {
+        lb = lb.crypto_mode(CryptoModeConfig::AesGcm);
+    }
+
+    if let Some(bw) = p.max_rexmit_bw {
+        lb = lb.max_rexmit_bw(bw);
+    }
+
+    if let Some(pf) = p.packet_filter {
+        if !pf.is_empty() {
+            lb = lb.packet_filter(pf.to_string());
+        }
+    }
+
+    lb = apply_advanced_options_listener(lb, p);
+    lb
+}
+
 /// Connect an SRT socket based on mode (caller / listener).
-///
-/// Builds a socket with the supplied parameters and connects in the
-/// requested mode. Returns the connected socket wrapped in an `Arc`.
-///
-/// # Errors
-///
-/// Returns an error if `remote_addr` is `None` for caller mode
-/// or if the underlying SRT connection fails.
-pub async fn connect_srt(
-    mode: &SrtMode,
-    local_addr: &str,
-    remote_addr: Option<&str>,
-    latency_ms: u64,
-    peer_idle_timeout_secs: u64,
-    passphrase: Option<&str>,
-    aes_key_len: Option<usize>,
-) -> Result<Arc<SrtSocket>> {
-    match mode {
+pub async fn connect_srt(p: &SrtConnectionParams<'_>) -> Result<Arc<SrtSocket>> {
+    match p.mode {
         SrtMode::Caller => {
-            let remote = remote_addr
+            let remote = p.remote_addr
                 .ok_or_else(|| anyhow::anyhow!("Caller mode requires remote_addr"))?;
             let remote_sa: SocketAddr = remote
                 .parse()
                 .context(format!("Invalid remote address: {remote}"))?;
-            let local_sa: SocketAddr = local_addr
+            let local_sa: SocketAddr = p.local_addr
                 .parse()
-                .context(format!("Invalid local address: {local_addr}"))?;
+                .context(format!("Invalid local address: {}", p.local_addr))?;
 
-            tracing::info!("SRT caller connecting {} -> {}", local_addr, remote);
+            tracing::info!("SRT caller connecting {} -> {}", p.local_addr, remote);
 
-            let builder = build_socket_builder(latency_ms, peer_idle_timeout_secs, passphrase, aes_key_len);
+            let builder = build_socket_builder(p);
             let sock = builder
                 .bind(local_sa)
                 .connect(remote_sa)
@@ -86,45 +321,69 @@ pub async fn connect_srt(
             Ok(Arc::new(sock))
         }
         SrtMode::Listener => {
-            let local_sa: SocketAddr = local_addr
+            let local_sa: SocketAddr = p.local_addr
                 .parse()
-                .context(format!("Invalid local address: {local_addr}"))?;
+                .context(format!("Invalid local address: {}", p.local_addr))?;
 
-            tracing::info!("SRT listener waiting on {}", local_addr);
+            tracing::info!("SRT listener waiting on {}", p.local_addr);
 
-            let timeout = if peer_idle_timeout_secs == 0 { 30 } else { peer_idle_timeout_secs };
-            let mut listener_builder = SrtListener::builder()
-                .latency(Duration::from_millis(latency_ms))
-                .live_mode()
-                .peer_idle_timeout(Duration::from_secs(timeout));
+            let mut listener_builder = build_listener_builder(p);
 
-            if let Some(pass) = passphrase {
-                let key_size = match aes_key_len.unwrap_or(16) {
-                    24 => KeySize::AES192,
-                    32 => KeySize::AES256,
-                    _ => KeySize::AES128,
-                };
-                listener_builder = listener_builder.encryption(pass, key_size);
+            // Add access control for stream_id filtering on listener
+            if let Some(expected_sid) = p.stream_id {
+                if !expected_sid.is_empty() {
+                    let expected = expected_sid.to_string();
+                    listener_builder = listener_builder.access_control_fn(move |info| {
+                        if info.stream_id == expected {
+                            Ok(())
+                        } else {
+                            tracing::warn!(
+                                "SRT listener: rejecting connection from {} — stream_id {:?} does not match expected {:?}",
+                                info.peer_addr, info.stream_id, expected
+                            );
+                            Err(srt_protocol::error::RejectReason::Peer)
+                        }
+                    });
+                }
             }
 
             let mut listener = listener_builder
                 .bind(local_sa)
                 .await
-                .context(format!("SRT listener bind on {local_addr} failed"))?;
+                .context(format!("SRT listener bind on {} failed", p.local_addr))?;
 
             let sock = listener
                 .accept()
                 .await
-                .context(format!("SRT listener accept on {local_addr} failed"))?;
+                .context(format!("SRT listener accept on {} failed", p.local_addr))?;
 
             // Close the listener after accepting one connection
             let _ = listener.close().await;
 
-            tracing::info!("SRT listener accepted connection on {}", local_addr);
+            tracing::info!("SRT listener accepted connection on {}", p.local_addr);
             Ok(Arc::new(sock))
         }
         SrtMode::Rendezvous => {
-            bail!("Rendezvous mode is not yet supported with bilbycast-srt");
+            let remote = p.remote_addr
+                .ok_or_else(|| anyhow::anyhow!("Rendezvous mode requires remote_addr"))?;
+            let remote_sa: SocketAddr = remote
+                .parse()
+                .context(format!("Invalid remote address: {remote}"))?;
+            let local_sa: SocketAddr = p.local_addr
+                .parse()
+                .context(format!("Invalid local address: {}", p.local_addr))?;
+
+            tracing::info!("SRT rendezvous connecting {} <-> {}", p.local_addr, remote);
+
+            let builder = build_socket_builder(p);
+            let sock = builder
+                .rendezvous(true)
+                .connect_rendezvous(local_sa, remote_sa)
+                .await
+                .context(format!("SRT rendezvous connect {} <-> {remote} failed", p.local_addr))?;
+
+            tracing::info!("SRT rendezvous connected {} <-> {}", p.local_addr, remote);
+            Ok(Arc::new(sock))
         }
     }
 }
@@ -132,28 +391,16 @@ pub async fn connect_srt(
 /// Connect with retry logic and exponential back-off.
 ///
 /// Retries indefinitely until the connection succeeds or the
-/// `CancellationToken` is triggered. The back-off starts at 1 s and
-/// doubles each attempt up to a maximum of 30 s.
-///
-/// # Errors
-///
-/// Returns an error only if the retry loop is cancelled.
+/// `CancellationToken` is triggered.
 pub async fn connect_srt_with_retry(
-    mode: &SrtMode,
-    local_addr: &str,
-    remote_addr: Option<&str>,
-    latency_ms: u64,
-    peer_idle_timeout_secs: u64,
-    passphrase: Option<&str>,
-    aes_key_len: Option<usize>,
+    p: &SrtConnectionParams<'_>,
     cancel: &CancellationToken,
 ) -> Result<Arc<SrtSocket>> {
     let mut attempt = 0u32;
     let max_delay = Duration::from_secs(30);
 
     loop {
-        match connect_srt(mode, local_addr, remote_addr, latency_ms, peer_idle_timeout_secs, passphrase, aes_key_len).await
-        {
+        match connect_srt(p).await {
             Ok(sock) => return Ok(sock),
             Err(e) => {
                 attempt += 1;
@@ -185,17 +432,8 @@ pub async fn connect_srt_input(
     config: &SrtInputConfig,
     cancel: &CancellationToken,
 ) -> Result<Arc<SrtSocket>> {
-    connect_srt_with_retry(
-        &config.mode,
-        &config.local_addr,
-        config.remote_addr.as_deref(),
-        config.latency_ms,
-        config.peer_idle_timeout_secs,
-        config.passphrase.as_deref(),
-        config.aes_key_len,
-        cancel,
-    )
-    .await
+    let p = SrtConnectionParams::from(config);
+    connect_srt_with_retry(&p, cancel).await
 }
 
 /// Convenience wrapper: connect an SRT socket for an output using the
@@ -204,17 +442,8 @@ pub async fn connect_srt_output(
     config: &SrtOutputConfig,
     cancel: &CancellationToken,
 ) -> Result<Arc<SrtSocket>> {
-    connect_srt_with_retry(
-        &config.mode,
-        &config.local_addr,
-        config.remote_addr.as_deref(),
-        config.latency_ms,
-        config.peer_idle_timeout_secs,
-        config.passphrase.as_deref(),
-        config.aes_key_len,
-        cancel,
-    )
-    .await
+    let p = SrtConnectionParams::from(config);
+    connect_srt_with_retry(&p, cancel).await
 }
 
 /// Convenience wrapper: connect the SMPTE 2022-7 redundancy leg (leg 2)
@@ -223,69 +452,50 @@ pub async fn connect_srt_redundancy_leg(
     redundancy: &SrtRedundancyConfig,
     cancel: &CancellationToken,
 ) -> Result<Arc<SrtSocket>> {
-    connect_srt_with_retry(
-        &redundancy.mode,
-        &redundancy.local_addr,
-        redundancy.remote_addr.as_deref(),
-        redundancy.latency_ms,
-        redundancy.peer_idle_timeout_secs,
-        redundancy.passphrase.as_deref(),
-        redundancy.aes_key_len,
-        cancel,
-    )
-    .await
+    let p = SrtConnectionParams::from(redundancy);
+    connect_srt_with_retry(&p, cancel).await
 }
 
 // ---------------------------------------------------------------------------
 // Persistent SRT listener helpers
 // ---------------------------------------------------------------------------
-// These functions support the "bind once, accept many" pattern for listener-
-// mode outputs and inputs. Instead of closing the listener after the first
-// accepted connection (which prevents reconnection), the listener is kept
-// alive and `accept_srt_connection` is called each time a new peer connects.
 
 /// Bind an SRT listener without accepting any connection.
-///
-/// Returns the listener which can be used with [`accept_srt_connection`]
-/// to accept connections repeatedly.
-pub async fn bind_srt_listener(
-    local_addr: &str,
-    latency_ms: u64,
-    peer_idle_timeout_secs: u64,
-    passphrase: Option<&str>,
-    aes_key_len: Option<usize>,
-) -> Result<SrtListener> {
-    let local_sa: SocketAddr = local_addr
+pub async fn bind_srt_listener(p: &SrtConnectionParams<'_>) -> Result<SrtListener> {
+    let local_sa: SocketAddr = p.local_addr
         .parse()
-        .context(format!("Invalid local address: {local_addr}"))?;
+        .context(format!("Invalid local address: {}", p.local_addr))?;
 
-    let timeout = if peer_idle_timeout_secs == 0 { 30 } else { peer_idle_timeout_secs };
-    let mut listener_builder = SrtListener::builder()
-        .latency(Duration::from_millis(latency_ms))
-        .live_mode()
-        .peer_idle_timeout(Duration::from_secs(timeout));
+    let mut listener_builder = build_listener_builder(p);
 
-    if let Some(pass) = passphrase {
-        let key_size = match aes_key_len.unwrap_or(16) {
-            24 => KeySize::AES192,
-            32 => KeySize::AES256,
-            _ => KeySize::AES128,
-        };
-        listener_builder = listener_builder.encryption(pass, key_size);
+    // Add access control for stream_id filtering on listener
+    if let Some(expected_sid) = p.stream_id {
+        if !expected_sid.is_empty() {
+            let expected = expected_sid.to_string();
+            listener_builder = listener_builder.access_control_fn(move |info| {
+                if info.stream_id == expected {
+                    Ok(())
+                } else {
+                    tracing::warn!(
+                        "SRT listener: rejecting connection from {} — stream_id {:?} does not match expected {:?}",
+                        info.peer_addr, info.stream_id, expected
+                    );
+                    Err(srt_protocol::error::RejectReason::Peer)
+                }
+            });
+        }
     }
 
     let listener = listener_builder
         .bind(local_sa)
         .await
-        .context(format!("SRT listener bind on {local_addr} failed"))?;
+        .context(format!("SRT listener bind on {} failed", p.local_addr))?;
 
-    tracing::info!("SRT listener bound on {}", local_addr);
+    tracing::info!("SRT listener bound on {}", p.local_addr);
     Ok(listener)
 }
 
 /// Accept a single incoming SRT connection on an existing listener.
-///
-/// Blocks until a caller connects or the cancellation token fires.
 pub async fn accept_srt_connection(
     listener: &mut SrtListener,
     cancel: &CancellationToken,
@@ -309,38 +519,20 @@ pub async fn accept_srt_connection(
 
 /// Bind an SRT listener for an output using [`SrtOutputConfig`] parameters.
 pub async fn bind_srt_listener_for_output(config: &SrtOutputConfig) -> Result<SrtListener> {
-    bind_srt_listener(
-        &config.local_addr,
-        config.latency_ms,
-        config.peer_idle_timeout_secs,
-        config.passphrase.as_deref(),
-        config.aes_key_len,
-    )
-    .await
+    let p = SrtConnectionParams::from(config);
+    bind_srt_listener(&p).await
 }
 
 /// Bind an SRT listener for an input using [`SrtInputConfig`] parameters.
 pub async fn bind_srt_listener_for_input(config: &SrtInputConfig) -> Result<SrtListener> {
-    bind_srt_listener(
-        &config.local_addr,
-        config.latency_ms,
-        config.peer_idle_timeout_secs,
-        config.passphrase.as_deref(),
-        config.aes_key_len,
-    )
-    .await
+    let p = SrtConnectionParams::from(config);
+    bind_srt_listener(&p).await
 }
 
 /// Bind an SRT listener for a redundancy leg using [`SrtRedundancyConfig`] parameters.
 pub async fn bind_srt_listener_for_redundancy(config: &SrtRedundancyConfig) -> Result<SrtListener> {
-    bind_srt_listener(
-        &config.local_addr,
-        config.latency_ms,
-        config.peer_idle_timeout_secs,
-        config.passphrase.as_deref(),
-        config.aes_key_len,
-    )
-    .await
+    let p = SrtConnectionParams::from(config);
+    bind_srt_listener(&p).await
 }
 
 // ---------------------------------------------------------------------------
@@ -354,10 +546,56 @@ pub fn convert_srt_stats(stats: &srt_protocol::stats::SrtStats) -> SrtLegStats {
         rtt_ms: stats.ms_rtt,
         send_rate_mbps: stats.mbps_send_rate,
         recv_rate_mbps: stats.mbps_recv_rate,
+        bandwidth_mbps: stats.mbps_bandwidth,
+        max_bw_mbps: stats.mbps_max_bw,
+
+        // Cumulative counters
+        pkt_sent_total: stats.pkt_sent_total,
+        pkt_recv_total: stats.pkt_recv_total,
         pkt_loss_total: (stats.pkt_snd_loss_total as i64) + (stats.pkt_rcv_loss_total as i64),
+        pkt_send_loss_total: stats.pkt_snd_loss_total,
+        pkt_recv_loss_total: stats.pkt_rcv_loss_total,
         pkt_retransmit_total: stats.pkt_retrans_total,
         pkt_recv_drop_total: stats.pkt_rcv_drop_total,
         pkt_send_drop_total: stats.pkt_snd_drop_total,
+        pkt_recv_undecrypt_total: stats.pkt_rcv_undecrypt_total,
+        byte_sent_total: stats.byte_sent_total,
+        byte_recv_total: stats.byte_recv_total,
+        byte_retrans_total: stats.byte_retrans_total,
+        byte_recv_drop_total: stats.byte_rcv_drop_total,
+
+        // ACK/NAK
+        pkt_sent_ack_total: stats.pkt_sent_ack_total,
+        pkt_recv_ack_total: stats.pkt_recv_ack_total,
+        pkt_sent_nak_total: stats.pkt_sent_nak_total,
+        pkt_recv_nak_total: stats.pkt_recv_nak_total,
+
+        // Flow control / buffer state
+        pkt_flow_window: stats.pkt_flow_window,
+        pkt_congestion_window: stats.pkt_congestion_window,
+        pkt_flight_size: stats.pkt_flight_size,
+        byte_avail_send_buf: stats.byte_avail_snd_buf,
+        byte_avail_recv_buf: stats.byte_avail_rcv_buf,
+        ms_send_buf: stats.ms_snd_buf,
+        ms_recv_buf: stats.ms_rcv_buf,
+        ms_send_tsbpd_delay: stats.ms_snd_tsbpd_delay,
+        ms_recv_tsbpd_delay: stats.ms_rcv_tsbpd_delay,
+
+        // Reorder / belated
+        pkt_reorder_distance: stats.pkt_reorder_distance,
+        pkt_reorder_tolerance: stats.pkt_reorder_tolerance,
+        pkt_recv_belated: stats.pkt_rcv_belated,
+        pkt_recv_avg_belated_time: stats.pkt_rcv_avg_belated_time,
+
+        // FEC stats
+        pkt_send_filter_extra_total: stats.pkt_snd_filter_extra_total,
+        pkt_recv_filter_extra_total: stats.pkt_rcv_filter_extra_total,
+        pkt_recv_filter_supply_total: stats.pkt_rcv_filter_supply_total,
+        pkt_recv_filter_loss_total: stats.pkt_rcv_filter_loss_total,
+        pkt_send_filter_extra: stats.pkt_snd_filter_extra,
+        pkt_recv_filter_supply: stats.pkt_rcv_filter_supply,
+        pkt_recv_filter_loss: stats.pkt_rcv_filter_loss,
+
         uptime_ms: stats.ms_timestamp,
     }
 }

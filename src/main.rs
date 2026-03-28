@@ -167,19 +167,17 @@ async fn main() -> anyhow::Result<()> {
         is05_state: Arc::new(api::nmos_is05::Is05State::new()),
         #[cfg(feature = "webrtc")]
         webrtc_sessions: Some(Arc::new(api::webrtc::registry::WebrtcSessionRegistry::new())),
-        #[cfg(not(feature = "webrtc"))]
-        webrtc_sessions: None,
     };
 
     // Start all enabled flows from config
     for flow in &app_config.flows {
         if flow.enabled {
             match flow_manager.create_flow(flow.clone()).await {
-                Ok(runtime) => {
+                Ok(_runtime) => {
                     tracing::info!("Auto-started flow '{}'", flow.id);
                     // Register WHIP input channel with session registry if this is a WebRTC flow
                     #[cfg(feature = "webrtc")]
-                    if let Some((tx, bearer_token)) = &runtime.whip_session_tx {
+                    if let Some((tx, bearer_token)) = &_runtime.whip_session_tx {
                         if let Some(ref registry) = state.webrtc_sessions {
                             registry.register_whip_input(&flow.id, tx.clone(), bearer_token.clone());
                             tracing::info!("Registered WHIP input for flow '{}'", flow.id);

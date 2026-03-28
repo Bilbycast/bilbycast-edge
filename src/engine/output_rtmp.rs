@@ -212,7 +212,7 @@ async fn publish_loop(
                     stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                     stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
                 }
-                DemuxedFrame::Opus { .. } => {
+                DemuxedFrame::Opus => {
                     // RTMP doesn't support Opus — skip
                 }
             }

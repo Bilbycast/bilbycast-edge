@@ -227,14 +227,100 @@ pub struct SrtLegStats {
     pub send_rate_mbps: f64,
     /// Estimated receive rate in megabits per second.
     pub recv_rate_mbps: f64,
+    /// Estimated link bandwidth in megabits per second.
+    pub bandwidth_mbps: f64,
+    /// Maximum configured bandwidth in megabits per second.
+    pub max_bw_mbps: f64,
+
+    // ── Cumulative counters ──
+
+    /// Total packets sent (including retransmissions).
+    pub pkt_sent_total: i64,
+    /// Total packets received.
+    pub pkt_recv_total: i64,
     /// Total packets lost (send + receive directions combined).
     pub pkt_loss_total: i64,
+    /// Total send-side lost packets.
+    pub pkt_send_loss_total: i32,
+    /// Total receive-side lost packets.
+    pub pkt_recv_loss_total: i32,
     /// Total packets retransmitted by the SRT ARQ mechanism.
     pub pkt_retransmit_total: i32,
     /// Total packets dropped at receiver (too late for TSBPD delivery).
     pub pkt_recv_drop_total: i32,
     /// Total packets dropped at sender (too late to send).
     pub pkt_send_drop_total: i32,
+    /// Total undecryptable packets (encryption mismatch).
+    pub pkt_recv_undecrypt_total: i32,
+    /// Total bytes sent.
+    pub byte_sent_total: u64,
+    /// Total bytes received.
+    pub byte_recv_total: u64,
+    /// Total bytes retransmitted.
+    pub byte_retrans_total: u64,
+    /// Total bytes dropped at receiver.
+    pub byte_recv_drop_total: u64,
+
+    // ── ACK/NAK counters ──
+
+    /// Total ACK packets sent.
+    pub pkt_sent_ack_total: i32,
+    /// Total ACK packets received.
+    pub pkt_recv_ack_total: i32,
+    /// Total NAK packets sent.
+    pub pkt_sent_nak_total: i32,
+    /// Total NAK packets received.
+    pub pkt_recv_nak_total: i32,
+
+    // ── Flow control / buffer state ──
+
+    /// Flow window size in packets.
+    pub pkt_flow_window: i32,
+    /// Congestion window size in packets.
+    pub pkt_congestion_window: i32,
+    /// Packets currently in flight.
+    pub pkt_flight_size: i32,
+    /// Available send buffer in bytes.
+    pub byte_avail_send_buf: i32,
+    /// Available receive buffer in bytes.
+    pub byte_avail_recv_buf: i32,
+    /// Send buffer latency in milliseconds.
+    pub ms_send_buf: i32,
+    /// Receive buffer latency in milliseconds.
+    pub ms_recv_buf: i32,
+    /// Negotiated sender TSBPD delay in milliseconds.
+    pub ms_send_tsbpd_delay: i32,
+    /// Negotiated receiver TSBPD delay in milliseconds.
+    pub ms_recv_tsbpd_delay: i32,
+
+    // ── Reorder / belated ──
+
+    /// Packet reorder distance.
+    pub pkt_reorder_distance: i32,
+    /// Packet reorder tolerance.
+    pub pkt_reorder_tolerance: i32,
+    /// Packets received but too late for TSBPD delivery (ARQ failed to recover in time).
+    pub pkt_recv_belated: i64,
+    /// Average lateness of belated packets in milliseconds.
+    pub pkt_recv_avg_belated_time: f64,
+
+    // ── FEC (packet filter) statistics ──
+
+    /// FEC packets sent (overhead, total).
+    pub pkt_send_filter_extra_total: i32,
+    /// FEC packets received (total).
+    pub pkt_recv_filter_extra_total: i32,
+    /// Packets recovered by FEC (total).
+    pub pkt_recv_filter_supply_total: i32,
+    /// Unrecoverable FEC losses (total).
+    pub pkt_recv_filter_loss_total: i32,
+    /// FEC packets sent (overhead, interval).
+    pub pkt_send_filter_extra: i32,
+    /// Packets recovered by FEC (interval).
+    pub pkt_recv_filter_supply: i32,
+    /// Unrecoverable FEC losses (interval).
+    pub pkt_recv_filter_loss: i32,
+
     /// Milliseconds since the SRT socket was connected (socket uptime).
     pub uptime_ms: i64,
 }

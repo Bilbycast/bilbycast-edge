@@ -261,7 +261,7 @@ async fn whip_client_loop(
                                             }
                                         }
                                     }
-                                    super::webrtc::ts_demux::DemuxedFrame::Opus { .. } => {
+                                    super::webrtc::ts_demux::DemuxedFrame::Opus => {
                                         // TODO: Send Opus via audio MID
                                     }
                                     super::webrtc::ts_demux::DemuxedFrame::Aac { .. } => {

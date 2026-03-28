@@ -8,7 +8,7 @@ Supports NMOS IS-04 (Discovery & Registration) and IS-05 (Connection Management)
 
 | Protocol | Input | Output | Notes                                          |
 |----------|-------|--------|-------------------------------------------------|
-| SRT      | Yes   | Yes    | Caller, listener, rendezvous modes; AES encryption; 2022-7 redundancy |
+| SRT      | Yes   | Yes    | Caller, listener, rendezvous modes; AES encryption; Stream ID access control; 2022-7 redundancy |
 | RTP      | Yes   | Yes    | RTP-wrapped over UDP; unicast and multicast; SMPTE 2022-1 FEC; DSCP QoS |
 | UDP      | Yes   | Yes    | Raw MPEG-TS over UDP; unicast and multicast; DSCP QoS marking |
 | RTMP     | Yes   | Yes    | H.264/AAC; accepts publish from OBS/ffmpeg; supports RTMPS (TLS) |

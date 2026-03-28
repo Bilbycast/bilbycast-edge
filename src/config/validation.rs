@@ -230,10 +230,13 @@ fn validate_input(input: &InputConfig) -> Result<()> {
         InputConfig::Srt(srt) => {
             validate_socket_addr(&srt.local_addr, "SRT input local_addr")?;
             validate_srt_common(
-                &srt.mode,
-                &srt.remote_addr,
-                srt.passphrase.as_deref(),
-                srt.aes_key_len,
+                &srt.mode, &srt.remote_addr,
+                srt.passphrase.as_deref(), srt.aes_key_len, srt.crypto_mode.as_deref(),
+                srt.max_rexmit_bw, srt.stream_id.as_deref(), srt.packet_filter.as_deref(),
+                srt.max_bw, srt.overhead_bw, srt.flight_flag_size,
+                srt.send_buffer_size, srt.recv_buffer_size, srt.ip_tos,
+                srt.retransmit_algo.as_deref(), srt.send_drop_delay, srt.loss_max_ttl,
+                srt.km_refresh_rate, srt.km_pre_announce, srt.payload_size,
                 "SRT input",
             )?;
             if let Some(ref red) = srt.redundancy {
@@ -402,10 +405,13 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
             validate_name(&srt.name, "SRT output")?;
             validate_socket_addr(&srt.local_addr, "SRT output local_addr")?;
             validate_srt_common(
-                &srt.mode,
-                &srt.remote_addr,
-                srt.passphrase.as_deref(),
-                srt.aes_key_len,
+                &srt.mode, &srt.remote_addr,
+                srt.passphrase.as_deref(), srt.aes_key_len, srt.crypto_mode.as_deref(),
+                srt.max_rexmit_bw, srt.stream_id.as_deref(), srt.packet_filter.as_deref(),
+                srt.max_bw, srt.overhead_bw, srt.flight_flag_size,
+                srt.send_buffer_size, srt.recv_buffer_size, srt.ip_tos,
+                srt.retransmit_algo.as_deref(), srt.send_drop_delay, srt.loss_max_ttl,
+                srt.km_refresh_rate, srt.km_pre_announce, srt.payload_size,
                 "SRT output",
             )?;
             if let Some(ref red) = srt.redundancy {
@@ -493,11 +499,28 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_srt_common(
     mode: &SrtMode,
     remote_addr: &Option<String>,
     passphrase: Option<&str>,
     aes_key_len: Option<usize>,
+    crypto_mode: Option<&str>,
+    max_rexmit_bw: Option<i64>,
+    stream_id: Option<&str>,
+    packet_filter: Option<&str>,
+    max_bw: Option<i64>,
+    overhead_bw: Option<i32>,
+    flight_flag_size: Option<u32>,
+    send_buffer_size: Option<u32>,
+    recv_buffer_size: Option<u32>,
+    ip_tos: Option<i32>,
+    retransmit_algo: Option<&str>,
+    send_drop_delay: Option<i32>,
+    loss_max_ttl: Option<i32>,
+    km_refresh_rate: Option<u32>,
+    km_pre_announce: Option<u32>,
+    payload_size: Option<u32>,
     context: &str,
 ) -> Result<()> {
     match mode {
@@ -522,16 +545,133 @@ fn validate_srt_common(
         }
     }
 
+    if let Some(cm) = crypto_mode {
+        if cm != "aes-ctr" && cm != "aes-gcm" {
+            bail!("{context}: crypto_mode must be \"aes-ctr\" or \"aes-gcm\", got \"{cm}\"");
+        }
+        if cm == "aes-gcm" {
+            if let Some(24) = aes_key_len {
+                bail!("{context}: AES-GCM does not support AES-192 (aes_key_len 24); use 16 or 32");
+            }
+        }
+    }
+
+    if let Some(bw) = max_rexmit_bw {
+        if bw < -1 {
+            bail!("{context}: max_rexmit_bw must be -1 (unlimited), 0 (disable), or > 0 (bytes/sec), got {bw}");
+        }
+    }
+
+    if let Some(sid) = stream_id {
+        if sid.len() > 512 {
+            bail!("{context}: stream_id must be at most 512 characters (per SRT spec), got {}", sid.len());
+        }
+    }
+
+    if let Some(pf) = packet_filter {
+        if pf.len() > 512 {
+            bail!("{context}: packet_filter must be at most 512 characters, got {}", pf.len());
+        }
+        match srt_protocol::fec::FecConfig::parse(pf) {
+            Ok(fec_cfg) => {
+                if fec_cfg.cols == 0 || fec_cfg.cols > 256 {
+                    bail!("{context}: FEC cols must be 1-256, got {}", fec_cfg.cols);
+                }
+                if fec_cfg.rows == 0 || fec_cfg.rows > 256 {
+                    bail!("{context}: FEC rows must be 1-256, got {}", fec_cfg.rows);
+                }
+            }
+            Err(e) => {
+                bail!("{context}: invalid packet_filter: {e}");
+            }
+        }
+    }
+
+    if let Some(bw) = max_bw {
+        if bw < 0 {
+            bail!("{context}: max_bw must be >= 0 (0 = unlimited), got {bw}");
+        }
+    }
+
+    if let Some(pct) = overhead_bw {
+        if pct < 5 || pct > 100 {
+            bail!("{context}: overhead_bw must be 5-100 (percentage), got {pct}");
+        }
+    }
+
+    if let Some(ffs) = flight_flag_size {
+        if ffs < 32 {
+            bail!("{context}: flight_flag_size must be >= 32 packets, got {ffs}");
+        }
+    }
+
+    if let Some(s) = send_buffer_size {
+        if s < 32 {
+            bail!("{context}: send_buffer_size must be >= 32 packets, got {s}");
+        }
+    }
+
+    if let Some(s) = recv_buffer_size {
+        if s < 32 {
+            bail!("{context}: recv_buffer_size must be >= 32 packets, got {s}");
+        }
+    }
+
+    if let Some(t) = ip_tos {
+        if !(0..=255).contains(&t) {
+            bail!("{context}: ip_tos must be 0-255, got {t}");
+        }
+    }
+
+    if let Some(algo) = retransmit_algo {
+        if algo != "default" && algo != "reduced" {
+            bail!("{context}: retransmit_algo must be \"default\" or \"reduced\", got \"{algo}\"");
+        }
+    }
+
+    if let Some(d) = send_drop_delay {
+        if d < -1 {
+            bail!("{context}: send_drop_delay must be >= -1, got {d}");
+        }
+    }
+
+    if let Some(t) = loss_max_ttl {
+        if t < 0 {
+            bail!("{context}: loss_max_ttl must be >= 0, got {t}");
+        }
+    }
+
+    if let Some(r) = km_refresh_rate {
+        if r == 0 {
+            bail!("{context}: km_refresh_rate must be > 0");
+        }
+    }
+
+    if let Some(r) = km_pre_announce {
+        if r == 0 {
+            bail!("{context}: km_pre_announce must be > 0");
+        }
+    }
+
+    if let Some(s) = payload_size {
+        if s < 188 || s > 1456 {
+            bail!("{context}: payload_size must be 188-1456, got {s}");
+        }
+    }
+
     Ok(())
 }
 
 fn validate_srt_redundancy(red: &SrtRedundancyConfig, context: &str) -> Result<()> {
     validate_socket_addr(&red.local_addr, &format!("{context} redundancy local_addr"))?;
     validate_srt_common(
-        &red.mode,
-        &red.remote_addr,
-        red.passphrase.as_deref(),
-        red.aes_key_len,
+        &red.mode, &red.remote_addr,
+        red.passphrase.as_deref(), red.aes_key_len, red.crypto_mode.as_deref(),
+        red.max_rexmit_bw, red.stream_id.as_deref(), red.packet_filter.as_deref(),
+        red.max_bw, red.overhead_bw, red.flight_flag_size,
+        red.send_buffer_size, red.recv_buffer_size, red.ip_tos,
+        red.retransmit_algo.as_deref(), red.send_drop_delay, red.loss_max_ttl,
+        red.km_refresh_rate, red.km_pre_announce, red.payload_size,
         &format!("{context} redundancy"),
     )
 }
@@ -773,8 +913,20 @@ mod tests {
                 remote_addr: None,
                 latency_ms: 120,
                 peer_idle_timeout_secs: 30,
+                recv_latency_ms: None,
+                peer_latency_ms: None,
                 passphrase: None,
                 aes_key_len: None,
+                crypto_mode: None,
+                max_rexmit_bw: None,
+                stream_id: None,
+                packet_filter: None,
+                max_bw: None, input_bw: None, overhead_bw: None,
+                enforced_encryption: None, connect_timeout_secs: None,
+                flight_flag_size: None, send_buffer_size: None, recv_buffer_size: None,
+                ip_tos: None, retransmit_algo: None, send_drop_delay: None,
+                loss_max_ttl: None, km_refresh_rate: None, km_pre_announce: None,
+                payload_size: None,
                 redundancy: None,
             }),
             outputs: vec![],
@@ -846,8 +998,20 @@ mod tests {
                 remote_addr: None,
                 latency_ms: 120,
                 peer_idle_timeout_secs: 30,
+                recv_latency_ms: None,
+                peer_latency_ms: None,
                 passphrase: Some("short".to_string()),
                 aes_key_len: None,
+                crypto_mode: None,
+                max_rexmit_bw: None,
+                stream_id: None,
+                packet_filter: None,
+                max_bw: None, input_bw: None, overhead_bw: None,
+                enforced_encryption: None, connect_timeout_secs: None,
+                flight_flag_size: None, send_buffer_size: None, recv_buffer_size: None,
+                ip_tos: None, retransmit_algo: None, send_drop_delay: None,
+                loss_max_ttl: None, km_refresh_rate: None, km_pre_announce: None,
+                payload_size: None,
                 redundancy: None,
             }),
             outputs: vec![],

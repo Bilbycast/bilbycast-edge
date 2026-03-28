@@ -202,9 +202,18 @@ pub struct SrtInputConfig {
     /// Remote address (required for caller and rendezvous modes)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_addr: Option<String>,
-    /// SRT latency in milliseconds
+    /// SRT latency in milliseconds (sets both receiver and peer/sender latency).
+    /// Use recv_latency_ms / peer_latency_ms to override independently.
     #[serde(default = "default_latency")]
     pub latency_ms: u64,
+    /// Receiver-side latency override in milliseconds. When set, overrides latency_ms
+    /// for the receiver side only (how long the receiver buffers before delivering).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recv_latency_ms: Option<u64>,
+    /// Peer/sender-side latency override in milliseconds. When set, overrides latency_ms
+    /// for the sender side only (minimum latency the sender requests from the receiver).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_latency_ms: Option<u64>,
     /// Peer idle timeout in seconds. Connection is dropped if no data
     /// is received for this duration. Default: 30s (suitable for broadcast).
     #[serde(default = "default_peer_idle_timeout")]
@@ -215,6 +224,72 @@ pub struct SrtInputConfig {
     /// AES key length: 16, 24, or 32 (default 16)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aes_key_len: Option<usize>,
+    /// Encryption cipher mode: "aes-ctr" (default) or "aes-gcm" (authenticated encryption).
+    /// AES-GCM requires libsrt >= 1.5.2 on the peer and only supports AES-128/256 keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crypto_mode: Option<String>,
+    /// Maximum retransmission bandwidth in bytes/sec (Token Bucket shaper).
+    /// -1 = unlimited (default), 0 = disable retransmissions, >0 = cap in bytes/sec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rexmit_bw: Option<i64>,
+    /// SRT Stream ID for access control (max 512 chars, per SRT spec).
+    /// For callers: sent to the listener during handshake for stream identification.
+    /// For listeners: if set, only connections with a matching stream_id are accepted.
+    /// Supports both plain strings and the structured `#!::key=value,...` format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<String>,
+    /// SRT packet filter for FEC (Forward Error Correction).
+    /// Format: "fec,cols:10,rows:5,layout:staircase,arq:onreq"
+    /// Negotiated with peer during handshake. Both sides must agree on parameters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_filter: Option<String>,
+    /// Maximum bandwidth in bytes/sec (0 = unlimited). Limits total send rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bw: Option<i64>,
+    /// Estimated input bandwidth in bytes/sec. Helps congestion control estimate
+    /// the rate. 0 = auto-detect from data rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_bw: Option<i64>,
+    /// Overhead bandwidth as percentage (5-100) over the input rate for congestion
+    /// control. Default: 25%.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overhead_bw: Option<i32>,
+    /// Enforce encryption: reject connections from unencrypted peers. Default: true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enforced_encryption: Option<bool>,
+    /// Connection timeout in seconds. Default: 3s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+    /// Flow control window size in packets (default: 25600).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flight_flag_size: Option<u32>,
+    /// Send buffer size in packets (default: 8192).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_buffer_size: Option<u32>,
+    /// Receive buffer size in packets (default: 8192).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recv_buffer_size: Option<u32>,
+    /// IP Type of Service / DSCP value (0-255). Default: 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_tos: Option<i32>,
+    /// Retransmission algorithm: "default" or "reduced" (v1.5.5 efficient algo).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retransmit_algo: Option<String>,
+    /// Extra delay in ms before sender drops a packet (-1 = off). Default: -1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_drop_delay: Option<i32>,
+    /// Maximum reorder tolerance in packets (0 = adaptive). Default: 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_max_ttl: Option<i32>,
+    /// Key material refresh rate in packets. Default: ~16M.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub km_refresh_rate: Option<u32>,
+    /// Key material pre-announce in packets before refresh. Default: 4096.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub km_pre_announce: Option<u32>,
+    /// Maximum payload size per SRT packet (default: 1316 for MPEG-TS 7×188).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_size: Option<u32>,
     /// Optional: enable 2022-7 redundancy on input (merge from two SRT legs)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<SrtRedundancyConfig>,
@@ -462,9 +537,15 @@ pub struct SrtOutputConfig {
     /// Remote address (required for caller and rendezvous)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_addr: Option<String>,
-    /// SRT latency in ms
+    /// SRT latency in ms (sets both receiver and peer/sender latency).
     #[serde(default = "default_latency")]
     pub latency_ms: u64,
+    /// Receiver-side latency override in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recv_latency_ms: Option<u64>,
+    /// Peer/sender-side latency override in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_latency_ms: Option<u64>,
     /// Peer idle timeout in seconds. Connection is dropped if no data
     /// is received for this duration. Default: 30s (suitable for broadcast).
     #[serde(default = "default_peer_idle_timeout")]
@@ -475,6 +556,68 @@ pub struct SrtOutputConfig {
     /// AES key length: 16, 24, or 32
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aes_key_len: Option<usize>,
+    /// Encryption cipher mode: "aes-ctr" (default) or "aes-gcm" (authenticated encryption).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crypto_mode: Option<String>,
+    /// Maximum retransmission bandwidth in bytes/sec (Token Bucket shaper).
+    /// -1 = unlimited (default), 0 = disable retransmissions, >0 = cap in bytes/sec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rexmit_bw: Option<i64>,
+    /// SRT Stream ID for access control (max 512 chars, per SRT spec).
+    /// For callers: sent to the listener during handshake for stream identification.
+    /// For listeners: if set, only connections with a matching stream_id are accepted.
+    /// Supports both plain strings and the structured `#!::key=value,...` format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<String>,
+    /// SRT packet filter for FEC (Forward Error Correction).
+    /// Format: "fec,cols:10,rows:5,layout:staircase,arq:onreq"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_filter: Option<String>,
+    /// Maximum bandwidth in bytes/sec (0 = unlimited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bw: Option<i64>,
+    /// Estimated input bandwidth in bytes/sec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_bw: Option<i64>,
+    /// Overhead bandwidth as percentage (5-100). Default: 25%.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overhead_bw: Option<i32>,
+    /// Enforce encryption: reject unencrypted peers. Default: true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enforced_encryption: Option<bool>,
+    /// Connection timeout in seconds. Default: 3s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+    /// Flow control window size in packets (default: 25600).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flight_flag_size: Option<u32>,
+    /// Send buffer size in packets (default: 8192).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_buffer_size: Option<u32>,
+    /// Receive buffer size in packets (default: 8192).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recv_buffer_size: Option<u32>,
+    /// IP Type of Service / DSCP value (0-255). Default: 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_tos: Option<i32>,
+    /// Retransmission algorithm: "default" or "reduced".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retransmit_algo: Option<String>,
+    /// Extra delay in ms before sender drops a packet (-1 = off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_drop_delay: Option<i32>,
+    /// Maximum reorder tolerance in packets (0 = adaptive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_max_ttl: Option<i32>,
+    /// Key material refresh rate in packets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub km_refresh_rate: Option<u32>,
+    /// Key material pre-announce in packets before refresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub km_pre_announce: Option<u32>,
+    /// Maximum payload size per SRT packet (default: 1316).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_size: Option<u32>,
     /// Optional: enable 2022-7 redundancy on output (duplicate to two SRT legs)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<SrtRedundancyConfig>,
@@ -518,6 +661,12 @@ pub struct SrtRedundancyConfig {
     /// SRT latency for leg 2
     #[serde(default = "default_latency")]
     pub latency_ms: u64,
+    /// Receiver-side latency override for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recv_latency_ms: Option<u64>,
+    /// Peer/sender-side latency override for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_latency_ms: Option<u64>,
     /// Peer idle timeout in seconds for leg 2. Default: 30s.
     #[serde(default = "default_peer_idle_timeout")]
     pub peer_idle_timeout_secs: u64,
@@ -527,6 +676,63 @@ pub struct SrtRedundancyConfig {
     /// AES key length for leg 2
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aes_key_len: Option<usize>,
+    /// Encryption cipher mode for leg 2: "aes-ctr" (default) or "aes-gcm".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crypto_mode: Option<String>,
+    /// Maximum retransmission bandwidth in bytes/sec for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rexmit_bw: Option<i64>,
+    /// SRT Stream ID for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<String>,
+    /// SRT packet filter for FEC on leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_filter: Option<String>,
+    /// Maximum bandwidth in bytes/sec for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bw: Option<i64>,
+    /// Estimated input bandwidth in bytes/sec for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_bw: Option<i64>,
+    /// Overhead bandwidth as percentage for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overhead_bw: Option<i32>,
+    /// Enforce encryption for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enforced_encryption: Option<bool>,
+    /// Connection timeout in seconds for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+    /// Flow control window size for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flight_flag_size: Option<u32>,
+    /// Send buffer size in packets for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_buffer_size: Option<u32>,
+    /// Receive buffer size in packets for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recv_buffer_size: Option<u32>,
+    /// IP TOS / DSCP for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_tos: Option<i32>,
+    /// Retransmission algorithm for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retransmit_algo: Option<String>,
+    /// Extra delay before sender drop for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_drop_delay: Option<i32>,
+    /// Maximum reorder tolerance for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_max_ttl: Option<i32>,
+    /// Key material refresh rate for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub km_refresh_rate: Option<u32>,
+    /// Key material pre-announce for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub km_pre_announce: Option<u32>,
+    /// Maximum payload size for leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_size: Option<u32>,
 }
 
 /// SMPTE 2022-7 redundancy config for an RTP input (leg 2).

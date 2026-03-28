@@ -28,13 +28,13 @@ pub fn spawn_srt_output(
     output_stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
-    let mut rx = broadcast_tx.subscribe();
+    let broadcast_tx = broadcast_tx.clone();
 
     tokio::spawn(async move {
         let result = if config.redundancy.is_some() {
-            srt_output_redundant_loop(&config, &mut rx, output_stats, cancel).await
+            srt_output_redundant_loop(&config, &broadcast_tx, output_stats, cancel).await
         } else {
-            srt_output_loop(&config, &mut rx, output_stats, cancel).await
+            srt_output_loop(&config, &broadcast_tx, output_stats, cancel).await
         };
         if let Err(e) = result {
             tracing::error!("SRT output '{}' exited with error: {e}", config.id);
@@ -53,13 +53,13 @@ pub fn spawn_srt_output(
 /// mode reconnects with exponential back-off.
 async fn srt_output_loop(
     config: &SrtOutputConfig,
-    rx: &mut broadcast::Receiver<RtpPacket>,
+    broadcast_tx: &broadcast::Sender<RtpPacket>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     match config.mode {
-        SrtMode::Listener => srt_output_listener_loop(config, rx, stats, cancel).await,
-        _ => srt_output_caller_loop(config, rx, stats, cancel).await,
+        SrtMode::Listener => srt_output_listener_loop(config, broadcast_tx, stats, cancel).await,
+        _ => srt_output_caller_loop(config, broadcast_tx, stats, cancel).await,
     }
 }
 
@@ -67,7 +67,7 @@ async fn srt_output_loop(
 /// on disconnect, avoiding the port-rebind problem.
 async fn srt_output_listener_loop(
     config: &SrtOutputConfig,
-    rx: &mut broadcast::Receiver<RtpPacket>,
+    broadcast_tx: &broadcast::Sender<RtpPacket>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
@@ -97,10 +97,67 @@ async fn srt_output_listener_loop(
             config.local_addr,
         );
 
+        // Validate the connection is alive before committing to it.
+        // Under high delay/loss, the listener may accept a stale connection
+        // where the caller's handshake timed out and retried with a new socket ID.
+        // Send a few packets and check for ACK responses within 5 seconds.
+        let is_alive = {
+            let mut test_rx = broadcast_tx.subscribe();
+            let mut sent = 0u32;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            let alive = loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break false,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        // Check if we received any ACKs
+                        let srt_stats = socket.stats().await;
+                        if srt_stats.pkt_recv_ack_total > 0 {
+                            break true;
+                        }
+                        tracing::warn!(
+                            "SRT output '{}' no ACK received after 3s, connection likely stale",
+                            config.id
+                        );
+                        break false;
+                    }
+                    result = test_rx.recv() => {
+                        if let Ok(packet) = result {
+                            if socket.send(&packet.data).await.is_err() {
+                                break false;
+                            }
+                            sent += 1;
+                            // After sending some packets, check for ACKs periodically
+                            if sent % 100 == 0 {
+                                let srt_stats = socket.stats().await;
+                                if srt_stats.pkt_recv_ack_total > 0 {
+                                    break true;
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            alive
+        };
+
+        if !is_alive {
+            tracing::info!(
+                "SRT output '{}' stale connection detected, re-accepting...",
+                config.id
+            );
+            let _ = socket.close().await;
+            continue;
+        }
+
+        // Subscribe AFTER the peer connects so no stale packets accumulate
+        // during the accept() wait. The receiver is dropped and re-created
+        // on each reconnect cycle.
+        let mut rx = broadcast_tx.subscribe();
+
         let poller_cancel = cancel.child_token();
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
 
-        let disconnected = srt_output_forward_loop(config, rx, &stats, &cancel, &socket).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &socket).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -126,7 +183,7 @@ async fn srt_output_listener_loop(
 /// Caller-mode output: reconnects with exponential back-off on disconnect.
 async fn srt_output_caller_loop(
     config: &SrtOutputConfig,
-    rx: &mut broadcast::Receiver<RtpPacket>,
+    broadcast_tx: &broadcast::Sender<RtpPacket>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
@@ -153,10 +210,13 @@ async fn srt_output_caller_loop(
             config.local_addr,
         );
 
+        // Subscribe AFTER the peer connects so no stale packets accumulate
+        let mut rx = broadcast_tx.subscribe();
+
         let poller_cancel = cancel.child_token();
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
 
-        let disconnected = srt_output_forward_loop(config, rx, &stats, &cancel, &socket).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &socket).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -279,7 +339,7 @@ async fn srt_output_forward_loop(
 /// avoid double-counting, since both legs carry identical data.
 async fn srt_output_redundant_loop(
     config: &SrtOutputConfig,
-    rx: &mut broadcast::Receiver<RtpPacket>,
+    broadcast_tx: &broadcast::Sender<RtpPacket>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
@@ -367,6 +427,9 @@ async fn srt_output_redundant_loop(
                 redundancy.local_addr
             );
         }
+
+        // Subscribe AFTER both legs connect so no stale packets accumulate
+        let mut rx = broadcast_tx.subscribe();
 
         // Spawn async send tasks — one per leg.
         let (send_tx_leg1, mut send_rx_leg1) = tokio::sync::mpsc::channel::<Bytes>(256);

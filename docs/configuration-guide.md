@@ -362,12 +362,14 @@ Receives RTP encapsulated in SRT. Supports caller, listener, and rendezvous mode
   "latency_ms": 500,
   "passphrase": "my-encryption-key",
   "aes_key_len": 32,
+  "crypto_mode": "aes-gcm",
   "redundancy": {
     "mode": "listener",
     "local_addr": "0.0.0.0:9001",
     "latency_ms": 500,
     "passphrase": "my-encryption-key",
-    "aes_key_len": 32
+    "aes_key_len": 32,
+    "crypto_mode": "aes-gcm"
   }
 }
 ```
@@ -381,6 +383,7 @@ Receives RTP encapsulated in SRT. Supports caller, listener, and rendezvous mode
 | `latency_ms` | integer | No | `120` | SRT receive latency buffer in milliseconds. Higher values provide more resilience to network jitter at the cost of increased delay. |
 | `passphrase` | string | No | `null` | AES encryption passphrase. Must be 10-79 characters. When `null`, encryption is disabled. |
 | `aes_key_len` | integer | No | `16` | AES key length in bytes: `16` (AES-128), `24` (AES-192), or `32` (AES-256). Only meaningful if `passphrase` is set. |
+| `crypto_mode` | string | No | `null` | Cipher mode: `"aes-ctr"` (default) or `"aes-gcm"` (authenticated encryption). AES-GCM requires libsrt >= 1.5.2 on the peer and only supports AES-128/256 (not AES-192). |
 | `redundancy` | object | No | `null` | SMPTE 2022-7 redundancy configuration for a second SRT leg. See [SRT Redundancy](#smpte-2022-7-srt-redundancy). |
 
 **Validation rules:**
@@ -388,6 +391,7 @@ Receives RTP encapsulated in SRT. Supports caller, listener, and rendezvous mode
 - `remote_addr` is required for `caller` and `rendezvous` modes and must be a valid socket address.
 - `passphrase` must be 10-79 characters.
 - `aes_key_len` must be 16, 24, or 32.
+- `crypto_mode` must be `"aes-ctr"` or `"aes-gcm"`. AES-GCM with `aes_key_len` 24 is rejected.
 
 ### RTMP Input
 
@@ -574,6 +578,7 @@ Sends RTP encapsulated in SRT.
 | `latency_ms` | integer | No | `120` | SRT send latency in milliseconds. |
 | `passphrase` | string | No | `null` | AES encryption passphrase (10-79 characters). |
 | `aes_key_len` | integer | No | `16` | AES key length: 16, 24, or 32. |
+| `crypto_mode` | string | No | `null` | Cipher mode: `"aes-ctr"` (default) or `"aes-gcm"`. |
 | `redundancy` | object | No | `null` | SMPTE 2022-7 redundancy for a second SRT output leg. |
 
 ### RTMP Output
@@ -737,6 +742,7 @@ For output: packets are duplicated and sent on both legs simultaneously.
 | `latency_ms` | integer | No | `120` | SRT latency for leg 2. |
 | `passphrase` | string | No | `null` | AES encryption passphrase for leg 2 (10-79 characters). |
 | `aes_key_len` | integer | No | `16` | AES key length for leg 2 (16, 24, or 32). |
+| `crypto_mode` | string | No | `null` | Cipher mode for leg 2: `"aes-ctr"` or `"aes-gcm"`. |
 
 Legs can use different SRT modes, different ports, different latency values, and even different encryption settings (though using the same settings is recommended for simplicity).
 

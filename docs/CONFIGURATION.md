@@ -226,14 +226,21 @@ The input is discriminated by the `"type"` field.
 
 | Field         | Type                    | Default | Description                                     |
 |---------------|-------------------------|---------|-------------------------------------------------|
-| `type`        | `"srt"`                 | --      | Input type discriminator                        |
-| `mode`        | `SrtMode`               | --      | `"caller"`, `"listener"`, or `"rendezvous"`     |
-| `local_addr`  | `string`                | --      | Local bind address, e.g. `"0.0.0.0:9000"`      |
-| `remote_addr` | `string?`               | `null`  | Remote address (required for caller/rendezvous) |
-| `latency_ms`  | `u64`                   | `120`   | SRT latency in milliseconds                     |
-| `passphrase`  | `string?`               | `null`  | AES encryption passphrase (10-79 characters)    |
-| `aes_key_len` | `usize?`                | `null`  | AES key length: 16, 24, or 32                   |
-| `redundancy`  | `SrtRedundancyConfig?`  | `null`  | SMPTE 2022-7 second leg configuration           |
+| `type`             | `"srt"`                 | --      | Input type discriminator                        |
+| `mode`             | `SrtMode`               | --      | `"caller"`, `"listener"`, or `"rendezvous"`     |
+| `local_addr`       | `string`                | --      | Local bind address, e.g. `"0.0.0.0:9000"`      |
+| `remote_addr`      | `string?`               | `null`  | Remote address (required for caller/rendezvous) |
+| `latency_ms`       | `u64`                   | `120`   | SRT latency in milliseconds (sets both receiver and peer/sender latency) |
+| `recv_latency_ms`  | `u64?`                  | `null`  | Receiver-side latency override in ms. When set, overrides `latency_ms` for the receiver buffer only. |
+| `peer_latency_ms`  | `u64?`                  | `null`  | Peer/sender-side latency override in ms. When set, overrides `latency_ms` for the sender's minimum latency request. |
+| `peer_idle_timeout_secs` | `u64`              | `30`    | Connection dropped if no data received for this many seconds |
+| `passphrase`       | `string?`               | `null`  | AES encryption passphrase (10-79 characters)    |
+| `aes_key_len`      | `usize?`                | `null`  | AES key length: 16, 24, or 32                   |
+| `crypto_mode`      | `string?`               | `null`  | Cipher mode: `"aes-ctr"` (default) or `"aes-gcm"` (authenticated encryption). AES-GCM requires libsrt >= 1.5.2 on the peer and only supports AES-128/256 (not AES-192). |
+| `max_rexmit_bw`    | `i64?`                  | `null`  | Maximum retransmission bandwidth in bytes/sec. `-1` = unlimited, `0` = disable retransmissions, `> 0` = cap in bytes/sec. Uses Token Bucket shaper. |
+| `stream_id`        | `string?`               | `null`  | SRT Stream ID for access control (max 512 chars). **Caller:** sent to the listener during handshake for stream identification/routing. **Listener:** if set, only callers with a matching stream_id are accepted (others are rejected). Supports plain strings or the structured `#!::r=name,m=publish,u=user` format per the SRT Access Control spec. |
+| `packet_filter`    | `string?`               | `null`  | SRT FEC (Forward Error Correction) config string. Format: `"fec,cols:10,rows:5,layout:staircase,arq:onreq"`. **cols:** row group size (1-256). **rows:** column group size (1 = row-only, >1 = 2D FEC, 1-256). **layout:** `"even"` or `"staircase"` (default, spreads FEC packets evenly). **arq:** `"always"` (ARQ+FEC parallel), `"onreq"` (FEC first, then ARQ, default), `"never"` (FEC only). Negotiated with peer during handshake — both sides must agree on parameters. |
+| `redundancy`       | `SrtRedundancyConfig?`  | `null`  | SMPTE 2022-7 second leg configuration           |
 
 ### RTP Input (`"type": "rtp"`)
 
@@ -353,16 +360,23 @@ Outputs are discriminated by the `"type"` field. All output types share `id` and
 
 | Field         | Type                    | Default | Description                                     |
 |---------------|-------------------------|---------|-------------------------------------------------|
-| `type`        | `"srt"`                 | --      | Output type discriminator                       |
-| `id`          | `string`                | --      | Unique output ID within this flow               |
-| `name`        | `string`                | --      | Human-readable name                             |
-| `mode`        | `SrtMode`               | --      | `"caller"`, `"listener"`, or `"rendezvous"`     |
-| `local_addr`  | `string`                | --      | Local bind address                              |
-| `remote_addr` | `string?`               | `null`  | Remote address (required for caller/rendezvous) |
-| `latency_ms`  | `u64`                   | `120`   | SRT latency in milliseconds                     |
-| `passphrase`  | `string?`               | `null`  | AES encryption passphrase (10-79 characters)    |
-| `aes_key_len` | `usize?`                | `null`  | AES key length: 16, 24, or 32                   |
-| `redundancy`  | `SrtRedundancyConfig?`  | `null`  | SMPTE 2022-7 second leg configuration           |
+| `type`             | `"srt"`                 | --      | Output type discriminator                       |
+| `id`               | `string`                | --      | Unique output ID within this flow               |
+| `name`             | `string`                | --      | Human-readable name                             |
+| `mode`             | `SrtMode`               | --      | `"caller"`, `"listener"`, or `"rendezvous"`     |
+| `local_addr`       | `string`                | --      | Local bind address                              |
+| `remote_addr`      | `string?`               | `null`  | Remote address (required for caller/rendezvous) |
+| `latency_ms`       | `u64`                   | `120`   | SRT latency in milliseconds (sets both receiver and peer/sender latency) |
+| `recv_latency_ms`  | `u64?`                  | `null`  | Receiver-side latency override in ms            |
+| `peer_latency_ms`  | `u64?`                  | `null`  | Peer/sender-side latency override in ms         |
+| `peer_idle_timeout_secs` | `u64`              | `30`    | Connection dropped if no data received for this many seconds |
+| `passphrase`       | `string?`               | `null`  | AES encryption passphrase (10-79 characters)    |
+| `aes_key_len`      | `usize?`                | `null`  | AES key length: 16, 24, or 32                   |
+| `crypto_mode`      | `string?`               | `null`  | Cipher mode: `"aes-ctr"` (default) or `"aes-gcm"` (authenticated encryption) |
+| `max_rexmit_bw`    | `i64?`                  | `null`  | Maximum retransmission bandwidth in bytes/sec (`-1` = unlimited, `0` = disable, `> 0` = cap) |
+| `stream_id`        | `string?`               | `null`  | SRT Stream ID for access control (max 512 chars). Caller: sent during handshake. Listener: if set, only matching callers accepted. |
+| `packet_filter`    | `string?`               | `null`  | SRT FEC config string (see SRT Input for format details). |
+| `redundancy`       | `SrtRedundancyConfig?`  | `null`  | SMPTE 2022-7 second leg configuration           |
 
 ### RTP Output (`"type": "rtp"`)
 
@@ -456,14 +470,20 @@ WebRTC output supporting two modes: WHIP client (push to external endpoint) and 
 
 Defines the second SRT leg for SMPTE 2022-7 hitless redundancy. The primary SRT settings in the parent define leg 1; this defines leg 2.
 
-| Field         | Type      | Default | Description                              |
-|---------------|-----------|---------|------------------------------------------|
-| `mode`        | `SrtMode` | --      | SRT mode for leg 2                       |
-| `local_addr`  | `string`  | --      | Bind address for leg 2                   |
-| `remote_addr` | `string?` | `null`  | Remote address for leg 2                 |
-| `latency_ms`  | `u64`     | `120`   | SRT latency for leg 2                    |
-| `passphrase`  | `string?` | `null`  | AES passphrase for leg 2                 |
-| `aes_key_len` | `usize?`  | `null`  | AES key length for leg 2                 |
+| Field              | Type      | Default | Description                              |
+|--------------------|-----------|---------|------------------------------------------|
+| `mode`             | `SrtMode` | --      | SRT mode for leg 2                       |
+| `local_addr`       | `string`  | --      | Bind address for leg 2                   |
+| `remote_addr`      | `string?` | `null`  | Remote address for leg 2                 |
+| `latency_ms`       | `u64`     | `120`   | SRT latency for leg 2                    |
+| `recv_latency_ms`  | `u64?`    | `null`  | Receiver-side latency override for leg 2 |
+| `peer_latency_ms`  | `u64?`    | `null`  | Peer/sender-side latency override for leg 2 |
+| `peer_idle_timeout_secs` | `u64` | `30`  | Peer idle timeout for leg 2              |
+| `passphrase`       | `string?` | `null`  | AES passphrase for leg 2                 |
+| `aes_key_len`      | `usize?`  | `null`  | AES key length for leg 2                 |
+| `crypto_mode`      | `string?` | `null`  | Cipher mode for leg 2: `"aes-ctr"` or `"aes-gcm"` |
+| `max_rexmit_bw`    | `i64?`    | `null`  | Max retransmission bandwidth for leg 2   |
+| `stream_id`        | `string?` | `null`  | SRT Stream ID for leg 2                 |
 
 ### RTP Redundancy Config (`RtpRedundancyConfig`)
 
@@ -528,6 +548,43 @@ SMPTE 2022-1 Forward Error Correction parameters.
   ]
 }
 ```
+
+### SRT with FEC (Forward Error Correction)
+
+```json
+{
+  "version": 1,
+  "server": { "listen_addr": "0.0.0.0", "listen_port": 8080 },
+  "flows": [
+    {
+      "id": "srt-fec-flow",
+      "name": "SRT with FEC protection",
+      "enabled": true,
+      "input": {
+        "type": "srt",
+        "mode": "listener",
+        "local_addr": "0.0.0.0:9000",
+        "latency_ms": 200,
+        "packet_filter": "fec,cols:10,rows:5,layout:staircase,arq:onreq"
+      },
+      "outputs": [
+        {
+          "type": "srt",
+          "id": "srt-fec-out",
+          "name": "SRT FEC Output",
+          "mode": "caller",
+          "local_addr": "0.0.0.0:0",
+          "remote_addr": "192.168.1.100:9001",
+          "latency_ms": 200,
+          "packet_filter": "fec,cols:10,rows:5,layout:staircase,arq:onreq"
+        }
+      ]
+    }
+  ]
+}
+```
+
+> **Note:** SRT FEC is different from SMPTE 2022-1 FEC used with RTP. SRT FEC operates at the SRT protocol level and is negotiated during the SRT handshake. The `packet_filter` config must match between caller and listener. Row-only FEC (`rows:1`) adds ~10% bandwidth overhead; 2D FEC (e.g., `rows:5`) adds ~30% but can recover from burst losses across both dimensions.
 
 ### SRT with 2022-7 Redundancy and FEC Output
 
@@ -673,7 +730,8 @@ SMPTE 2022-1 Forward Error Correction parameters.
         "mode": "listener",
         "local_addr": "0.0.0.0:9000",
         "latency_ms": 200,
-        "passphrase": "my-srt-encryption-key"
+        "passphrase": "my-srt-encryption-key",
+        "crypto_mode": "aes-gcm"
       },
       "outputs": [
         {

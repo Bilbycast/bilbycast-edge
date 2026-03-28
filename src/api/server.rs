@@ -42,8 +42,6 @@ pub struct AppState {
     /// WebRTC session registry for WHIP/WHEP endpoints (None when webrtc feature disabled).
     #[cfg(feature = "webrtc")]
     pub webrtc_sessions: Option<Arc<crate::api::webrtc::registry::WebrtcSessionRegistry>>,
-    #[cfg(not(feature = "webrtc"))]
-    pub webrtc_sessions: Option<()>,
 }
 
 /// Constructs the main Axum [`Router`] with all API routes, auth middleware, and layers.

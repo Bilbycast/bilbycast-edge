@@ -26,6 +26,7 @@ use crate::tunnel::TunnelConfig;
 use crate::tunnel::manager::TunnelManager;
 
 use super::ManagerConfig;
+#[cfg(feature = "webrtc")]
 use crate::engine::flow::FlowRuntime;
 
 #[cfg(feature = "webrtc")]
@@ -574,7 +575,7 @@ async fn execute_command(
     tunnel_manager: &Arc<TunnelManager>,
     app_config: &Arc<RwLock<AppConfig>>,
     config_path: &PathBuf,
-    webrtc_sessions: &WebrtcRegistry,
+    _webrtc_sessions: &WebrtcRegistry,
 ) -> Result<(), String> {
     match action_type {
         "create_flow" => {
@@ -589,12 +590,12 @@ async fn execute_command(
                 }
             }
             tracing::info!("Manager command: create flow '{}'", flow.id);
-            let runtime = flow_manager
+            let _runtime = flow_manager
                 .create_flow(flow.clone())
                 .await
                 .map_err(|e| e.to_string())?;
             #[cfg(feature = "webrtc")]
-            register_whip_if_needed(webrtc_sessions, &runtime);
+            register_whip_if_needed(_webrtc_sessions, &_runtime);
             // Persist to config
             let mut cfg = app_config.write().await;
             cfg.flows.push(flow);
@@ -629,12 +630,12 @@ async fn execute_command(
                         // Input or metadata changed — must restart entire flow
                         tracing::info!("Update flow '{flow_id}': restarting (input changed={input_changed}, meta changed={meta_changed})");
                         let _ = flow_manager.destroy_flow(flow_id).await;
-                        let runtime = flow_manager
+                        let _runtime = flow_manager
                             .create_flow(new_flow.clone())
                             .await
                             .map_err(|e| e.to_string())?;
                         #[cfg(feature = "webrtc")]
-                        register_whip_if_needed(webrtc_sessions, &runtime);
+                        register_whip_if_needed(_webrtc_sessions, &_runtime);
                     } else {
                         // Only outputs changed — diff surgically
                         tracing::info!("Update flow '{flow_id}': input unchanged, diffing outputs ({} old → {} new)",
@@ -648,23 +649,23 @@ async fn execute_command(
                 } else if !was_running && new_flow.enabled {
                     // Enable / start
                     tracing::info!("Update flow '{flow_id}': starting");
-                    let runtime = flow_manager
+                    let _runtime = flow_manager
                         .create_flow(new_flow.clone())
                         .await
                         .map_err(|e| e.to_string())?;
                     #[cfg(feature = "webrtc")]
-                    register_whip_if_needed(webrtc_sessions, &runtime);
+                    register_whip_if_needed(_webrtc_sessions, &_runtime);
                 }
             } else {
                 // No old flow — create new
                 tracing::info!("Update flow '{flow_id}': creating (no previous config)");
                 let _ = flow_manager.destroy_flow(flow_id).await; // in case running without config
-                let runtime = flow_manager
+                let _runtime = flow_manager
                     .create_flow(new_flow.clone())
                     .await
                     .map_err(|e| e.to_string())?;
                 #[cfg(feature = "webrtc")]
-                register_whip_if_needed(webrtc_sessions, &runtime);
+                register_whip_if_needed(_webrtc_sessions, &_runtime);
             }
 
             // Update config
@@ -721,12 +722,12 @@ async fn execute_command(
                     .cloned()
                     .ok_or_else(|| format!("Flow '{flow_id}' not found in config"))?
             };
-            let runtime = flow_manager
+            let _runtime = flow_manager
                 .create_flow(flow_config)
                 .await
                 .map_err(|e| e.to_string())?;
             #[cfg(feature = "webrtc")]
-            register_whip_if_needed(webrtc_sessions, &runtime);
+            register_whip_if_needed(_webrtc_sessions, &_runtime);
             // Mark enabled in config
             let mut cfg = app_config.write().await;
             if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
@@ -832,9 +833,9 @@ async fn execute_command(
                         if new_flow.enabled {
                             tracing::info!("Config diff: creating new flow '{id}'");
                             match flow_manager.create_flow(new_flow.clone()).await {
-                                Ok(runtime) => {
+                                Ok(_runtime) => {
                                     #[cfg(feature = "webrtc")]
-                                    register_whip_if_needed(webrtc_sessions, &runtime);
+                                    register_whip_if_needed(_webrtc_sessions, &_runtime);
                                 }
                                 Err(e) => tracing::warn!("Failed to start new flow '{id}': {e}"),
                             }
@@ -852,9 +853,9 @@ async fn execute_command(
                             // Was stopped, now enabled → start
                             tracing::info!("Config diff: enabling flow '{id}'");
                             match flow_manager.create_flow(new_flow.clone()).await {
-                                Ok(runtime) => {
+                                Ok(_runtime) => {
                                     #[cfg(feature = "webrtc")]
-                                    register_whip_if_needed(webrtc_sessions, &runtime);
+                                    register_whip_if_needed(_webrtc_sessions, &_runtime);
                                 }
                                 Err(e) => tracing::warn!("Failed to start flow '{id}': {e}"),
                             }
@@ -869,9 +870,9 @@ async fn execute_command(
                                 tracing::info!("Config diff: restarting flow '{id}' (input changed={input_changed}, meta changed={meta_changed})");
                                 let _ = flow_manager.destroy_flow(id).await;
                                 match flow_manager.create_flow(new_flow.clone()).await {
-                                    Ok(runtime) => {
+                                    Ok(_runtime) => {
                                         #[cfg(feature = "webrtc")]
-                                        register_whip_if_needed(webrtc_sessions, &runtime);
+                                        register_whip_if_needed(_webrtc_sessions, &_runtime);
                                     }
                                     Err(e) => tracing::warn!("Failed to restart flow '{id}': {e}"),
                                 }
