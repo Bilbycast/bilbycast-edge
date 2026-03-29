@@ -19,7 +19,8 @@ use tokio::sync::{broadcast, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::models::{AppConfig, FlowConfig, OutputConfig};
-use crate::config::persistence::save_config;
+use crate::config::persistence::save_config_split;
+use crate::config::secrets::SecretsConfig;
 use crate::config::validation::{validate_config, validate_flow, validate_output, validate_tunnel};
 use crate::engine::manager::FlowManager;
 use crate::tunnel::TunnelConfig;
@@ -97,6 +98,7 @@ pub fn start_manager_client(
     ws_stats_rx: broadcast::Sender<String>,
     app_config: Arc<RwLock<AppConfig>>,
     config_path: PathBuf,
+    secrets_path: PathBuf,
     api_addr: String,
     monitor_addr: Option<String>,
     webrtc_sessions: WebrtcRegistry,
@@ -104,7 +106,7 @@ pub fn start_manager_client(
     tokio::spawn(async move {
         manager_client_loop(
             config, flow_manager, tunnel_manager, ws_stats_rx, app_config, config_path,
-            api_addr, monitor_addr, webrtc_sessions,
+            secrets_path, api_addr, monitor_addr, webrtc_sessions,
         ).await;
     })
 }
@@ -116,6 +118,7 @@ async fn manager_client_loop(
     ws_stats_tx: broadcast::Sender<String>,
     app_config: Arc<RwLock<AppConfig>>,
     config_path: PathBuf,
+    secrets_path: PathBuf,
     api_addr: String,
     monitor_addr: Option<String>,
     webrtc_sessions: WebrtcRegistry,
@@ -139,6 +142,7 @@ async fn manager_client_loop(
             &ws_stats_tx,
             &app_config,
             &config_path,
+            &secrets_path,
             &api_addr,
             monitor_addr.as_deref(),
             &webrtc_sessions,
@@ -162,8 +166,8 @@ async fn manager_client_loop(
                 tunnel_manager.set_manager_node_id(node_id.clone());
                 backoff_secs = 1;
 
-                // Persist to config file
-                persist_credentials(&app_config, &config_path, &node_id, &node_secret).await;
+                // Persist to config + secrets files
+                persist_credentials(&app_config, &config_path, &secrets_path, &node_id, &node_secret).await;
             }
             Err(e) => {
                 tracing::warn!("Manager connection failed: {e}");
@@ -191,6 +195,7 @@ async fn try_connect(
     ws_stats_tx: &broadcast::Sender<String>,
     app_config: &Arc<RwLock<AppConfig>>,
     config_path: &PathBuf,
+    secrets_path: &PathBuf,
     api_addr: &str,
     monitor_addr: Option<&str>,
     webrtc_sessions: &WebrtcRegistry,
@@ -266,7 +271,7 @@ async fn try_connect(
 
                     if !node_id.is_empty() && !node_secret.is_empty() {
                         // Persist immediately
-                        persist_credentials(app_config, config_path, &node_id, &node_secret)
+                        persist_credentials(app_config, config_path, secrets_path, &node_id, &node_secret)
                             .await;
                         registered_creds = Some((node_id, node_secret));
                     }
@@ -373,7 +378,7 @@ async fn try_connect(
                     Some(Ok(Message::Text(text))) => {
                         handle_manager_message(
                             &text, flow_manager, tunnel_manager, app_config, config_path,
-                            &webrtc_sessions, &mut ws_write,
+                            secrets_path, &webrtc_sessions, &mut ws_write,
                         ).await;
                     }
                     Some(Ok(Message::Ping(data))) => {
@@ -414,20 +419,27 @@ async fn try_connect(
 
 /// Build the auth message sent as the first WebSocket frame.
 /// Contains either registration_token OR node_id + node_secret.
+/// WebSocket protocol version. Sent in auth payload so the manager can detect mismatches.
+const WS_PROTOCOL_VERSION: u32 = 1;
+
 fn build_auth_message(config: &ManagerConfig) -> serde_json::Value {
     if let (Some(node_id), Some(node_secret)) = (&config.node_id, &config.node_secret) {
         serde_json::json!({
             "type": "auth",
             "payload": {
                 "node_id": node_id,
-                "node_secret": node_secret
+                "node_secret": node_secret,
+                "software_version": env!("CARGO_PKG_VERSION"),
+                "protocol_version": WS_PROTOCOL_VERSION
             }
         })
     } else if let Some(token) = &config.registration_token {
         serde_json::json!({
             "type": "auth",
             "payload": {
-                "registration_token": token
+                "registration_token": token,
+                "software_version": env!("CARGO_PKG_VERSION"),
+                "protocol_version": WS_PROTOCOL_VERSION
             }
         })
     } else {
@@ -458,10 +470,11 @@ fn build_health_payload(flow_manager: &FlowManager, api_addr: &str, monitor_addr
     })
 }
 
-/// Persist manager credentials to the config file.
+/// Persist manager credentials to config + secrets files.
 async fn persist_credentials(
     app_config: &Arc<RwLock<AppConfig>>,
     config_path: &PathBuf,
+    secrets_path: &PathBuf,
     node_id: &str,
     node_secret: &str,
 ) {
@@ -471,15 +484,10 @@ async fn persist_credentials(
         mgr.node_id = Some(node_id.to_string());
         mgr.node_secret = Some(node_secret.to_string());
     }
-    if let Ok(json) = serde_json::to_string_pretty(&*cfg) {
-        if let Err(e) = std::fs::write(config_path, &json) {
-            tracing::warn!("Failed to persist manager credentials: {e}");
-        } else {
-            tracing::info!(
-                "Manager credentials saved to {}",
-                config_path.display()
-            );
-        }
+    if let Err(e) = save_config_split(config_path, secrets_path, &cfg) {
+        tracing::warn!("Failed to persist manager credentials: {e}");
+    } else {
+        tracing::info!("Manager credentials saved (node_secret → {})", secrets_path.display());
     }
 }
 
@@ -490,6 +498,7 @@ async fn handle_manager_message<S>(
     tunnel_manager: &Arc<TunnelManager>,
     app_config: &Arc<RwLock<AppConfig>>,
     config_path: &PathBuf,
+    secrets_path: &PathBuf,
     webrtc_sessions: &WebrtcRegistry,
     ws_write: &mut futures_util::stream::SplitSink<S, Message>,
 ) where
@@ -527,7 +536,10 @@ async fn handle_manager_message<S>(
             if action_type == "get_config" {
                 tracing::info!("Manager command: get_config");
                 let cfg = app_config.read().await;
-                let config_json = serde_json::to_value(&*cfg).unwrap_or_default();
+                // Strip secrets before sending — secrets never leave the node
+                let mut safe_cfg = (*cfg).clone();
+                safe_cfg.strip_secrets();
+                let config_json = serde_json::to_value(&safe_cfg).unwrap_or_default();
                 let response = serde_json::json!({
                     "type": "config_response",
                     "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -541,7 +553,7 @@ async fn handle_manager_message<S>(
 
             let result = execute_command(
                 action_type, action, flow_manager, tunnel_manager,
-                app_config, config_path, webrtc_sessions,
+                app_config, config_path, secrets_path, webrtc_sessions,
             )
             .await;
 
@@ -575,6 +587,7 @@ async fn execute_command(
     tunnel_manager: &Arc<TunnelManager>,
     app_config: &Arc<RwLock<AppConfig>>,
     config_path: &PathBuf,
+    secrets_path: &PathBuf,
     _webrtc_sessions: &WebrtcRegistry,
 ) -> Result<(), String> {
     match action_type {
@@ -599,7 +612,7 @@ async fn execute_command(
             // Persist to config
             let mut cfg = app_config.write().await;
             cfg.flows.push(flow);
-            persist_config(&cfg, config_path);
+            persist_config(&cfg, config_path, secrets_path);
             Ok(())
         }
         "update_flow" => {
@@ -675,7 +688,7 @@ async fn execute_command(
             } else {
                 cfg.flows.push(new_flow);
             }
-            persist_config(&cfg, config_path);
+            persist_config(&cfg, config_path, secrets_path);
             Ok(())
         }
         "delete_flow" => {
@@ -688,7 +701,7 @@ async fn execute_command(
             // Remove from config
             let mut cfg = app_config.write().await;
             cfg.flows.retain(|f| f.id != flow_id);
-            persist_config(&cfg, config_path);
+            persist_config(&cfg, config_path, secrets_path);
             Ok(())
         }
         "stop_flow" => {
@@ -703,7 +716,7 @@ async fn execute_command(
             if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
                 flow.enabled = false;
             }
-            persist_config(&cfg, config_path);
+            persist_config(&cfg, config_path, secrets_path);
             Ok(())
         }
         "start_flow" | "restart_flow" => {
@@ -733,7 +746,7 @@ async fn execute_command(
             if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
                 flow.enabled = true;
             }
-            persist_config(&cfg, config_path);
+            persist_config(&cfg, config_path, secrets_path);
             Ok(())
         }
         "add_output" => {
@@ -752,7 +765,7 @@ async fn execute_command(
             if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
                 flow.outputs.push(output);
             }
-            persist_config(&cfg, config_path);
+            persist_config(&cfg, config_path, secrets_path);
             Ok(())
         }
         "remove_output" => {
@@ -768,7 +781,7 @@ async fn execute_command(
             if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
                 flow.outputs.retain(|o| o.id() != output_id);
             }
-            persist_config(&cfg, config_path);
+            persist_config(&cfg, config_path, secrets_path);
             Ok(())
         }
         "create_tunnel" => {
@@ -780,10 +793,14 @@ async fn execute_command(
                 .create_tunnel(tunnel.clone())
                 .await
                 .map_err(|e| e.to_string())?;
-            // Add to config
+            // Upsert in config: replace existing entry or append new
             let mut cfg = app_config.write().await;
-            cfg.tunnels.push(tunnel);
-            persist_config(&cfg, config_path);
+            if let Some(existing) = cfg.tunnels.iter_mut().find(|t| t.id == tunnel.id) {
+                *existing = tunnel;
+            } else {
+                cfg.tunnels.push(tunnel);
+            }
+            persist_config(&cfg, config_path, secrets_path);
             Ok(())
         }
         "delete_tunnel" => {
@@ -796,16 +813,23 @@ async fn execute_command(
             // Remove from config
             let mut cfg = app_config.write().await;
             cfg.tunnels.retain(|t| t.id != tunnel_id);
-            persist_config(&cfg, config_path);
+            persist_config(&cfg, config_path, secrets_path);
             Ok(())
         }
         "update_config" => {
-            let new_config: AppConfig = serde_json::from_value(action["config"].clone())
+            let mut new_config: AppConfig = serde_json::from_value(action["config"].clone())
                 .map_err(|e| format!("Invalid config: {e}"))?;
+
+            // The manager doesn't have secrets (GetConfig strips them), so
+            // merge the node's existing secrets into the incoming config before
+            // validation and application.
+            let old_config = app_config.read().await.clone();
+            let existing_secrets = SecretsConfig::extract_from(&old_config);
+            existing_secrets.merge_into(&mut new_config);
+
             validate_config(&new_config).map_err(|e| format!("Invalid config: {e}"))?;
             tracing::info!("Manager command: update_config (diff-based)");
 
-            let old_config = app_config.read().await.clone();
             tracing::info!("Config diff: old={} flows/{} tunnels, new={} flows/{} tunnels",
                 old_config.flows.len(), old_config.tunnels.len(),
                 new_config.flows.len(), new_config.tunnels.len());
@@ -933,7 +957,7 @@ async fn execute_command(
                 cfg.tunnels = new_config.tunnels.clone();
                 cfg.server = new_config.server.clone();
                 cfg.monitor = new_config.monitor.clone();
-                persist_config(&cfg, config_path);
+                persist_config(&cfg, config_path, secrets_path);
             }
 
             Ok(())
@@ -998,8 +1022,8 @@ async fn diff_outputs(
 }
 
 /// Persist config to disk (fire-and-forget, logs on error).
-fn persist_config(config: &AppConfig, config_path: &PathBuf) {
-    if let Err(e) = save_config(config_path.as_path(), config) {
+fn persist_config(config: &AppConfig, config_path: &PathBuf, secrets_path: &PathBuf) {
+    if let Err(e) = save_config_split(config_path.as_path(), secrets_path.as_path(), config) {
         tracing::warn!("Failed to persist config after manager command: {e}");
     }
 }

@@ -82,7 +82,7 @@ Serves the setup wizard HTML page. Returns the wizard form when `setup_enabled` 
 
 ### GET /setup/status
 
-Returns the current setup-relevant configuration as JSON for pre-filling the form.
+Returns the current setup-relevant configuration as JSON for pre-filling the form. The `registration_token` is always `null` in responses — secrets are never exposed via this endpoint.
 
 **Response:**
 
@@ -938,7 +938,7 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/stats/main-f
 
 ### GET /api/v1/config
 
-Retrieve the full running application configuration. Returns the current in-memory state, which may differ from the on-disk file if external edits were made without reloading.
+Retrieve the running application configuration with secrets stripped. Returns the operational config (addresses, ports, flow definitions, tunnel routing) but never includes sensitive fields such as `node_secret`, SRT passphrases, RTMP stream keys, tunnel encryption keys, JWT secrets, or client credentials.
 
 **Auth:** Requires valid JWT (any role).
 
@@ -972,17 +972,17 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/config
 
 ### PUT /api/v1/config
 
-Replace the entire application configuration atomically. Stops all running flows, replaces the in-memory config, persists to disk, and starts all flows with `enabled: true`.
+Replace the entire application configuration atomically. Stops all running flows, replaces the in-memory config, persists to disk (operational fields to `config.json`, secrets to `secrets.json`), and starts all flows with `enabled: true`.
 
 **Auth:** Requires `admin` role.
 
 **Request body:**
 
-A complete `AppConfig` JSON object (see [Configuration Guide](configuration-guide.md)).
+A complete `AppConfig` JSON object (see [Configuration Guide](configuration-guide.md)). May include secrets (e.g., SRT passphrases, auth config) — they will be stored in `secrets.json`.
 
 **Response (200):**
 
-Returns the new configuration.
+Returns the new configuration with secrets stripped.
 
 **Error responses:**
 
@@ -1004,7 +1004,7 @@ curl -X PUT http://localhost:8080/api/v1/config \
 
 ### POST /api/v1/config/reload
 
-Reload configuration from the config file on disk. Stops all running flows, reads and validates the file, replaces the in-memory config, and starts all enabled flows. Useful after manual edits to the config file.
+Reload configuration from disk (`config.json` + `secrets.json`). Stops all running flows, reads and validates both files, merges secrets into the config, replaces the in-memory state, and starts all enabled flows. Useful after manual edits to the config files.
 
 **Auth:** Requires `admin` role.
 
@@ -1012,7 +1012,7 @@ Reload configuration from the config file on disk. Stops all running flows, read
 
 **Response (200):**
 
-Returns the reloaded configuration.
+Returns the reloaded configuration with secrets stripped.
 
 **Error responses:**
 

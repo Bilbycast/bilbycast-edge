@@ -99,10 +99,10 @@ All data flows through a single type: `RtpPacket { data: Bytes, sequence_number:
 | `fec/` | `encoder.rs`, `decoder.rs`, `matrix.rs` | SMPTE 2022-1 FEC (XOR column×row) |
 | `redundancy/` | `merger.rs` | SMPTE 2022-7 hitless merge (seq dedup from dual RTP or SRT legs) |
 | `api/` | `server.rs`, `auth.rs`, `flows.rs`, `stats.rs`, `tunnels.rs`, `ws.rs`, `nmos.rs`, `nmos_is05.rs` | Axum REST API, OAuth2/JWT, WebSocket stats, NMOS IS-04 Node API, NMOS IS-05 Connection Management |
-| `config/` | `models.rs`, `validation.rs`, `persistence.rs` | JSON config, enum-tagged types, atomic save |
+| `config/` | `models.rs`, `validation.rs`, `persistence.rs`, `secrets.rs` | JSON config, enum-tagged types, atomic save, secrets split (`config.json` + `secrets.json`) |
 | `stats/` | `collector.rs`, `models.rs`, `throughput.rs` | Lock-free stats registry, bitrate estimation |
-| `tunnel/` | `manager.rs`, `relay_client.rs`, `udp_forwarder.rs`, `tcp_forwarder.rs`, `crypto.rs`, `auth.rs` | QUIC-based IP tunnels (relay/direct), end-to-end encryption, HMAC-SHA256 bind authentication |
-| `manager/` | `client.rs`, `config.rs` | WebSocket client to bilbycast-manager. Sends stats (1s) and health (15s). Handles commands: get_config, create/delete/start/stop flow, update_flow (diff-based), update_config (diff-based), add/remove output, create/delete tunnel. **Config updates use diff logic** — `update_flow` and `update_config` compare old vs new using `PartialEq` and only restart flows when input/metadata changes; output-only changes are applied surgically via hot-add/remove without disrupting other outputs or SRT connections |
+| `tunnel/` | `manager.rs`, `relay_client.rs`, `udp_forwarder.rs`, `tcp_forwarder.rs`, `crypto.rs`, `auth.rs` | QUIC-based IP tunnels (relay/direct), end-to-end encryption, HMAC-SHA256 bind authentication. `protocol.rs` defines `TUNNEL_PROTOCOL_VERSION`, `ParsedMessage<T>` + `read_message_resilient()` for graceful handling of unknown message types, and `Hello`/`HelloAck` handshake for version detection |
+| `manager/` | `client.rs`, `config.rs` | WebSocket client to bilbycast-manager. Sends stats (1s) and health (15s). Auth payload includes `protocol_version` and `software_version` for compatibility detection. Handles commands: get_config, create/delete/start/stop flow, update_flow (diff-based), update_config (diff-based), add/remove output, create/delete tunnel. **GetConfig strips secrets** — `strip_secrets()` removes all sensitive fields before serializing the response, so the manager never receives `node_secret`, tunnel keys, SRT passphrases, etc. **UpdateConfig merges secrets** — incoming config from manager (which lacks secrets) is merged with existing local secrets before applying. **Config updates use diff logic** — `update_flow` and `update_config` compare old vs new using `PartialEq` and only restart flows when input/metadata changes; output-only changes are applied surgically via hot-add/remove without disrupting other outputs or SRT connections |
 | `monitor/` | `server.rs`, `dashboard.rs` | Embedded HTML/JS dashboard on separate port |
 | `setup/` | `handlers.rs`, `wizard.rs` | Browser-based setup wizard for initial provisioning (inline HTML, gated by `setup_enabled` config flag) |
 | `srt/` | `connection.rs` | SRT socket config via `SrtConnectionParams` struct, stats polling (45+ fields including FEC, ACK/NAK, flow control, buffer state), `convert_srt_stats()` |
@@ -172,6 +172,29 @@ pub fn spawn_xxx_output(
 ## Configuration
 
 Full reference in `docs/CONFIGURATION.md`. Config is JSON with enum-tagged input/output types (e.g., `"type": "srt"`, `"mode": "caller"`). Validation runs at load time and on every manager command — not per-packet. When adding new config fields, always add validation in `src/config/validation.rs`.
+
+### Config/Secrets Split
+
+Configuration is persisted across two files:
+
+- **`config.json`** — Operational config (addresses, ports, protocols, flow definitions without secrets). Safe to send to the manager, inspect, and version-control.
+- **`secrets.json`** — All secrets (node credentials, tunnel encryption keys, SRT passphrases, RTMP stream keys, auth config, TLS paths). Never leaves the node. Written with `0600` permissions on Unix.
+
+At runtime, both files merge into a single `AppConfig` in memory — all existing code works unchanged. The split is purely a persistence and serialization boundary.
+
+**Secrets inventory** (fields stored in `secrets.json`):
+- Node-level: `manager.node_secret`, `manager.registration_token`, `server.tls`, `server.auth` (jwt_secret, client credentials)
+- Per-tunnel (keyed by ID): `tunnel_encryption_key`, `tunnel_bind_secret`, `tunnel_psk`, `tls_cert_pem`, `tls_key_pem`
+- Per-flow input: SRT `passphrase`, RTMP `stream_key`, RTSP `username`/`password`, WebRTC `bearer_token`
+- Per-flow output (keyed by ID): SRT `passphrase`, RTMP `stream_key`, HLS `auth_token`, WebRTC `bearer_token`
+
+**Key implementation files:**
+- `src/config/secrets.rs` — `SecretsConfig` struct, `extract_from()`, `merge_into()`, `has_secrets()`, and `AppConfig::strip_secrets()`
+- `src/config/persistence.rs` — `load_config_split()` (with auto-migration from legacy single-file), `save_config_split()`, `save_secrets()`
+
+**Migration**: On first startup after upgrade, if `config.json` contains secrets and `secrets.json` does not exist, the system automatically splits them. Users don't need to take any action.
+
+**When adding new secret fields**: Add the field to the appropriate secrets struct (`InputSecrets`, `OutputSecrets`, `TunnelSecrets`), update `extract_from`/`merge_into`/`strip_secrets`, and update `has_secrets` for migration detection.
 
 ## Key Design Constraints
 

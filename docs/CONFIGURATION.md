@@ -1,26 +1,34 @@
 # Configuration Reference
 
-bilbycast-edge is configured via a JSON file (default: `./config.json`). All changes — whether from the REST API, manager commands, or the setup wizard — are persisted to this file immediately and survive reboots.
+bilbycast-edge is configured via two JSON files:
+
+- **`config.json`** (default: `./config.json`) — Operational configuration: server addresses, flow definitions, tunnel routing, monitor settings. This file is safe to inspect, back up, and version-control. When the manager requests the node's config (`GetConfig`), only this file's content is returned — secrets are never included.
+- **`secrets.json`** (auto-derived: same directory as `config.json`) — All sensitive credentials: manager auth secrets, tunnel encryption keys, SRT passphrases, RTMP stream keys, API auth config (JWT secret, client secrets), TLS cert/key paths. This file is written with `0600` permissions (owner-only) on Unix and **never leaves the node**.
+
+At runtime, both files are merged into a single `AppConfig` in memory. The split is purely a persistence and serialization boundary — existing code that reads config works unchanged.
+
+**Migration from single file**: If you upgrade from a version that used a single `config.json` containing secrets, the node automatically detects this on first startup, extracts secrets into `secrets.json`, and rewrites `config.json` without secrets. No manual action is required.
 
 ---
 
 ## Config Persistence
 
-The edge node's config file is the **source of truth** for its configuration. The manager does not store node configs in its database — it only sends commands, and the edge is responsible for persisting its own state.
+The edge node's config files are the **source of truth** for its configuration. The manager does not store node configs in its database — it only sends commands, and the edge is responsible for persisting its own state.
 
 ### When config is saved to disk
 
-Config is written to disk immediately after any of these events:
+Both `config.json` and `secrets.json` are written to disk immediately after any of these events:
 
-- **First startup** — auto-generated `node_id` is saved
-- **Manager registration** — `node_id` and `node_secret` credentials are saved after successful registration
-- **REST API flow operations** — creating, updating, or deleting flows via the local API
-- **Manager `update_config` command** — when a user updates the config through the manager UI
-- **Setup wizard** — initial provisioning via the browser-based setup at `/setup`
+- **First startup** — auto-generated `node_id` is saved to `config.json`
+- **Manager registration** — `node_id` saved to `config.json`, `node_secret` saved to `secrets.json` (registration token cleared)
+- **REST API flow operations** — creating, updating, or deleting flows via the local API (flow secrets like SRT passphrases go to `secrets.json`)
+- **Manager `update_config` command** — operational fields update `config.json`, existing secrets are preserved in `secrets.json`
+- **Manager `create_tunnel` command** — tunnel routing goes to `config.json`, tunnel encryption keys go to `secrets.json`
+- **Setup wizard** — operational settings go to `config.json`, registration token goes to `secrets.json`
 
 ### Atomic writes
 
-Config saves use an atomic two-phase write: the JSON is first written to a temporary file (`.json.tmp`), then renamed to the actual config path. This prevents partial or corrupted config files if the node crashes or loses power mid-write.
+Config saves use an atomic two-phase write: the JSON is first written to a temporary file (`.json.tmp`), then renamed to the actual config path. This prevents partial or corrupted config files if the node crashes or loses power mid-write. Both `config.json` and `secrets.json` use this approach.
 
 ### Manager config update behavior
 
@@ -28,8 +36,8 @@ Both `update_config` (full config replacement) and `update_flow` (single flow up
 
 When the manager sends an `update_config` or `update_flow` command:
 
-1. The manager sends the full config (not a diff) — the edge computes the diff internally
-2. The edge **validates** the new config before applying it
+1. The manager sends the full operational config (not a diff, and without secrets — since `GetConfig` strips them) — the edge computes the diff internally
+2. The edge **merges existing secrets** from its local `secrets.json` into the incoming config, then **validates** the merged config before applying it
 3. **Flows** are compared by ID between old and new config:
    - Removed flows → destroyed
    - Added flows → created
@@ -41,7 +49,7 @@ When the manager sends an `update_config` or `update_flow` command:
    - Added outputs → hot-added (subscribes to existing broadcast channel)
    - Changed outputs (different config) → removed and re-added
    - Unchanged outputs → **not touched** (SRT/RTP connections survive)
-6. The in-memory config is updated and **saved to disk**
+6. The in-memory config is updated and **saved to disk** (operational fields to `config.json`, secrets to `secrets.json`)
 7. A `command_ack` is sent back to the manager
 
 **Fields replaced** by UpdateConfig: `flows`, `tunnels`, `server`, `monitor`
@@ -50,7 +58,7 @@ When the manager sends an `update_config` or `update_flow` command:
 
 ### Reboot behavior
 
-On startup, the edge loads its config from the JSON file on disk. Since all changes are persisted immediately, the node will always start with the latest config — including any changes made remotely through the manager.
+On startup, the edge loads its config from both `config.json` and `secrets.json`, merging them into a single in-memory `AppConfig`. Since all changes are persisted immediately, the node will always start with the latest config — including any changes made remotely through the manager.
 
 ---
 
@@ -97,6 +105,8 @@ API server configuration.
 
 ### TLS Configuration
 
+> **Note:** The `tls` section is stored in `secrets.json`, not `config.json`, since it contains paths to sensitive key material.
+
 Enables HTTPS on the API server. Requires building with `--features tls`.
 
 | Field       | Type     | Description                          |
@@ -118,6 +128,8 @@ Enables HTTPS on the API server. Requires building with `--features tls`.
 ```
 
 ### Authentication Configuration
+
+> **Note:** The `auth` section is stored in `secrets.json`, not `config.json`, since it contains the JWT signing secret and client credentials.
 
 OAuth 2.0 client credentials authentication with JWT (HMAC-SHA256). When absent or `enabled: false`, all API endpoints are unauthenticated.
 
@@ -172,32 +184,48 @@ Optional connection to a bilbycast-manager instance for centralized monitoring a
 | `enabled`            | `bool`    | `false` | Enable the manager connection                   |
 | `url`                | `string`  | --      | Manager WebSocket URL, e.g. `"wss://manager-host:8443/ws/node"` (must use `wss://`) |
 | `accept_self_signed_cert` | `bool` | `false` | Accept self-signed TLS certificates from the manager. **Dev/testing only** — disables cert validation. |
-| `registration_token` | `string?` | `null`  | One-time registration token (first connection only) |
+| `registration_token` | `string?` | `null`  | One-time registration token (first connection only). **Stored in `secrets.json`.** |
 | `node_id`            | `string?` | `null`  | Assigned node ID (set automatically after registration) |
-| `node_secret`        | `string?` | `null`  | Assigned node secret (set automatically after registration) |
+| `node_secret`        | `string?` | `null`  | Assigned node secret (set automatically after registration). **Stored in `secrets.json`.** |
 
-On first connection, provide `registration_token`. After successful registration, the manager returns `node_id` and `node_secret`, which are written back to the config file automatically. The `registration_token` is cleared. Subsequent connections use `node_id` and `node_secret`.
+On first connection, provide `registration_token`. After successful registration, the manager returns `node_id` and `node_secret`. The `node_id` is saved to `config.json`, while `node_secret` is saved to `secrets.json`. The `registration_token` is cleared from both files. Subsequent connections use `node_id` and `node_secret`.
 
+**config.json** (before registration):
 ```json
 {
   "manager": {
     "enabled": true,
-    "url": "wss://manager.example.com:8443/ws/node",
-    "registration_token": "abc123-one-time-token"
+    "url": "wss://manager.example.com:8443/ws/node"
   }
 }
 ```
 
-After registration, the file is updated to:
+**secrets.json** (before registration, created by setup wizard):
+```json
+{
+  "version": 1,
+  "manager_registration_token": "abc123-one-time-token"
+}
+```
 
+After registration, the files are updated to:
+
+**config.json**:
 ```json
 {
   "manager": {
     "enabled": true,
     "url": "wss://manager.example.com:8443/ws/node",
-    "node_id": "assigned-uuid",
-    "node_secret": "assigned-secret"
+    "node_id": "assigned-uuid"
   }
+}
+```
+
+**secrets.json**:
+```json
+{
+  "version": 1,
+  "manager_node_secret": "assigned-secret"
 }
 ```
 

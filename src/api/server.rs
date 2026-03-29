@@ -27,6 +27,8 @@ pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
     /// Filesystem path to the persisted `config.json` file.
     pub config_path: PathBuf,
+    /// Filesystem path to the persisted `secrets.json` file.
+    pub secrets_path: PathBuf,
     /// Handle to the flow engine manager.
     pub flow_manager: Arc<FlowManager>,
     /// Handle to the IP tunnel manager.

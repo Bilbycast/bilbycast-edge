@@ -19,7 +19,8 @@ use uuid::Uuid;
 
 use super::config::{TunnelDirection, TunnelProtocol};
 use super::protocol::{
-    self, EdgeMessage, RelayDirection, RelayMessage, RelayProtocol, ALPN_RELAY,
+    self, EdgeMessage, ParsedMessage, RelayDirection, RelayMessage, RelayProtocol, ALPN_RELAY,
+    TUNNEL_PROTOCOL_VERSION,
 };
 use super::quic;
 
@@ -84,6 +85,16 @@ pub async fn connect_and_bind(
     // Open control stream (bidirectional stream 0)
     let (mut send, mut recv) = conn.open_bi().await?;
 
+    // Send protocol version handshake (new relays respond with HelloAck; old relays ignore it)
+    protocol::write_message(
+        &mut send,
+        &EdgeMessage::Hello {
+            protocol_version: TUNNEL_PROTOCOL_VERSION,
+            software_version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+    )
+    .await?;
+
     // Identify this edge to the relay (enables topology visualization in the manager)
     if let Some(ref id) = params.edge_id {
         protocol::write_message(&mut send, &EdgeMessage::Identify { edge_id: id.clone() }).await?;
@@ -125,8 +136,17 @@ pub async fn connect_and_bind(
     // first edge to bind and the peer binds later).
     loop {
         tokio::select! {
-            result = protocol::read_message::<RelayMessage>(&mut recv) => {
-                let msg = result?;
+            result = protocol::read_message_resilient::<RelayMessage>(&mut recv) => {
+                let msg = match result? {
+                    ParsedMessage::Known(msg) => msg,
+                    ParsedMessage::Unknown { msg_type } => {
+                        tracing::debug!(
+                            tunnel_id = %params.tunnel_id,
+                            "Unknown relay message type '{msg_type}' while waiting, ignoring"
+                        );
+                        continue;
+                    }
+                };
                 match msg {
                     RelayMessage::TunnelReady { tunnel_id } if tunnel_id == params.tunnel_id => {
                         state_tx.send_replace(RelayTunnelState::Ready);
@@ -144,6 +164,17 @@ pub async fn connect_and_bind(
                             "Waiting for peer to bind"
                         );
                     }
+                    RelayMessage::HelloAck { protocol_version, software_version } => {
+                        tracing::info!(
+                            tunnel_id = %params.tunnel_id,
+                            "Relay hello_ack: protocol v{protocol_version}, software {software_version}"
+                        );
+                        if protocol_version != TUNNEL_PROTOCOL_VERSION {
+                            tracing::warn!(
+                                "Tunnel protocol version mismatch: edge={TUNNEL_PROTOCOL_VERSION}, relay={protocol_version}"
+                            );
+                        }
+                    }
                     RelayMessage::Pong => {}
                     other => {
                         tracing::debug!(
@@ -157,7 +188,7 @@ pub async fn connect_and_bind(
             // the first edge to bind and the peer joins later)
             result = conn.accept_uni() => {
                 if let Ok(mut uni_recv) = result {
-                    if let Ok(msg) = protocol::read_message::<RelayMessage>(&mut uni_recv).await {
+                    if let Ok(ParsedMessage::Known(msg)) = protocol::read_message_resilient::<RelayMessage>(&mut uni_recv).await {
                         if let RelayMessage::TunnelReady { tunnel_id } = msg {
                             if tunnel_id == params.tunnel_id {
                                 state_tx.send_replace(RelayTunnelState::Ready);
@@ -202,16 +233,19 @@ pub async fn connect_and_bind(
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                result = protocol::read_message::<RelayMessage>(&mut recv) => {
+                result = protocol::read_message_resilient::<RelayMessage>(&mut recv) => {
                     match result {
-                        Ok(RelayMessage::Pong) => {}
-                        Ok(RelayMessage::TunnelDown { tunnel_id: tid, reason }) if tid == tunnel_id => {
+                        Ok(ParsedMessage::Known(RelayMessage::Pong | RelayMessage::HelloAck { .. })) => {}
+                        Ok(ParsedMessage::Known(RelayMessage::TunnelDown { tunnel_id: tid, reason })) if tid == tunnel_id => {
                             tracing::warn!(tunnel_id = %tid, reason = %reason, "Tunnel down");
                             state_tx_clone.send_replace(RelayTunnelState::Down);
                             break;
                         }
-                        Ok(msg) => {
+                        Ok(ParsedMessage::Known(msg)) => {
                             tracing::debug!("Relay control message: {msg:?}");
+                        }
+                        Ok(ParsedMessage::Unknown { msg_type }) => {
+                            tracing::debug!("Unknown relay message type '{msg_type}', ignoring");
                         }
                         Err(e) => {
                             tracing::warn!("Relay control stream error: {e}");

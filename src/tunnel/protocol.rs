@@ -8,6 +8,11 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+// ── Protocol version ──
+
+/// Current tunnel protocol version. Bump when adding new message types or changing semantics.
+pub const TUNNEL_PROTOCOL_VERSION: u32 = 1;
+
 // ── ALPN protocol identifiers ──
 
 /// ALPN protocol for edge-to-relay connections.
@@ -45,6 +50,14 @@ pub enum EdgeMessage {
     /// Keepalive ping.
     #[serde(rename = "ping")]
     Ping,
+
+    /// Protocol version handshake (sent as the first message on the control stream).
+    /// Old relays (with resilient deserialization) will ignore this; new relays respond with HelloAck.
+    #[serde(rename = "hello")]
+    Hello {
+        protocol_version: u32,
+        software_version: String,
+    },
 }
 
 /// Messages sent from relay to edge on the control stream.
@@ -66,6 +79,15 @@ pub enum RelayMessage {
     /// Keepalive pong.
     #[serde(rename = "pong")]
     Pong,
+
+    /// Protocol version handshake response.
+    /// Sent in reply to an edge's Hello message. Contains the relay's protocol version
+    /// so the edge can detect mismatches and log warnings.
+    #[serde(rename = "hello_ack")]
+    HelloAck {
+        protocol_version: u32,
+        software_version: String,
+    },
 }
 
 // ── Direct mode messages ──
@@ -138,6 +160,16 @@ pub const MAX_MESSAGE_SIZE: usize = 1_048_576;
 /// UDP datagram prefix length (16-byte UUID).
 pub const UDP_DATAGRAM_PREFIX_LEN: usize = 16;
 
+/// Result of resilient message parsing: either a known typed message or an
+/// unknown type that was gracefully skipped (instead of tearing down the connection).
+#[derive(Debug, Clone)]
+pub enum ParsedMessage<T> {
+    /// Successfully deserialized into the expected type.
+    Known(T),
+    /// The message had an unrecognized "type" tag. The connection stays alive.
+    Unknown { msg_type: String },
+}
+
 /// Read a length-prefixed JSON message from a QUIC stream.
 pub async fn read_message<T: serde::de::DeserializeOwned>(
     recv: &mut quinn::RecvStream,
@@ -151,6 +183,36 @@ pub async fn read_message<T: serde::de::DeserializeOwned>(
     let mut buf = vec![0u8; len];
     recv.read_exact(&mut buf).await?;
     Ok(serde_json::from_slice(&buf)?)
+}
+
+/// Read a length-prefixed JSON message, gracefully handling unknown "type" variants.
+///
+/// If the message has a "type" tag that doesn't match any known variant of `T`,
+/// returns `ParsedMessage::Unknown` instead of an error. This prevents unknown
+/// message types (e.g., from a newer protocol version) from tearing down the
+/// entire QUIC connection.
+pub async fn read_message_resilient<T: serde::de::DeserializeOwned>(
+    recv: &mut quinn::RecvStream,
+) -> anyhow::Result<ParsedMessage<T>> {
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_MESSAGE_SIZE {
+        anyhow::bail!("message too large: {len} bytes");
+    }
+    let mut buf = vec![0u8; len];
+    recv.read_exact(&mut buf).await?;
+
+    match serde_json::from_slice::<T>(&buf) {
+        Ok(msg) => Ok(ParsedMessage::Known(msg)),
+        Err(_) => {
+            let msg_type = serde_json::from_slice::<serde_json::Value>(&buf)
+                .ok()
+                .and_then(|v| v.get("type")?.as_str().map(String::from))
+                .unwrap_or_else(|| "unknown".into());
+            Ok(ParsedMessage::Unknown { msg_type })
+        }
+    }
 }
 
 /// Write a length-prefixed JSON message to a QUIC stream.

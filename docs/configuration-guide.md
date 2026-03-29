@@ -38,9 +38,14 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
 
 ## Configuration File Basics
 
-bilbycast-edge reads its configuration from a JSON file specified by the `--config` CLI argument (default: `./config.json`). If the file does not exist at startup, an empty default configuration is used.
+bilbycast-edge reads its configuration from two JSON files:
 
-The configuration is loaded and validated at startup. Changes made through the API (creating flows, updating config) are automatically persisted back to the same file using atomic writes (write to temp file, then rename).
+- **`config.json`** — Operational configuration (specified by `--config`, default: `./config.json`). Contains server settings, flow definitions, tunnel routing — everything except secrets.
+- **`secrets.json`** — Sensitive credentials (auto-derived: same directory as `config.json`). Contains manager auth secrets, tunnel encryption keys, SRT passphrases, RTMP stream keys, API auth config, TLS cert/key paths. Written with `0600` permissions on Unix.
+
+If neither file exists at startup, an empty default configuration is used. Both files are loaded and merged into a single in-memory config, then validated at startup. Changes made through the API or manager commands are automatically persisted — operational fields to `config.json`, secrets to `secrets.json` — using atomic writes (write to temp file, then rename).
+
+**Migration**: If upgrading from a version that used a single `config.json` with secrets, the node automatically splits them on first startup.
 
 ---
 
@@ -804,18 +809,19 @@ RUST_LOG=bilbycast_edge=debug,tower_http=info bilbycast-edge --config config.jso
 
 ## Config Persistence Behavior
 
-bilbycast-edge automatically persists configuration changes to disk when flows are modified through the API:
+bilbycast-edge automatically persists configuration changes to disk when flows are modified through the API. Operational fields go to `config.json`, secrets (passphrases, tokens, keys) go to `secrets.json`:
 
-- **Create flow** (`POST /api/v1/flows`) -- Appends the new flow and saves.
+- **Create flow** (`POST /api/v1/flows`) -- Appends the new flow and saves (secrets like SRT passphrase go to `secrets.json`).
 - **Update flow** (`PUT /api/v1/flows/{id}`) -- Replaces the flow in-place and saves.
-- **Delete flow** (`DELETE /api/v1/flows/{id}`) -- Removes the flow and saves.
+- **Delete flow** (`DELETE /api/v1/flows/{id}`) -- Removes the flow and saves (orphaned secrets cleaned up automatically).
 - **Add output** (`POST /api/v1/flows/{id}/outputs`) -- Appends the output and saves.
 - **Remove output** (`DELETE /api/v1/flows/{id}/outputs/{oid}`) -- Removes the output and saves.
 - **Replace config** (`PUT /api/v1/config`) -- Replaces the entire config and saves.
+- **Get config** (`GET /api/v1/config`) -- Returns the config with all secrets stripped. Secrets are never exposed via API responses.
 
 ### Atomic writes
 
-All config saves use an atomic write strategy: the configuration is written to a temporary file (`config.json.tmp`), then atomically renamed to the target path. This prevents corruption if the process is interrupted during a write.
+All config saves use an atomic write strategy: both `config.json` and `secrets.json` are written to temporary files (`.json.tmp`), then atomically renamed to the target paths. This prevents corruption if the process is interrupted during a write. `secrets.json` is written with `0600` permissions (owner-only) on Unix.
 
 ### Default config
 
@@ -834,7 +840,7 @@ If the config file does not exist when bilbycast-edge starts, an empty default c
 
 ### Reloading from disk
 
-Use `POST /api/v1/config/reload` to re-read the config file from disk. This is useful after manual edits or after deploying a new config file via external tooling (e.g., Ansible, Chef).
+Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json` from disk. This is useful after manual edits or after deploying new config files via external tooling (e.g., Ansible, Chef).
 
 ---
 

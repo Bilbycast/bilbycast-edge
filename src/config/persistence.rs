@@ -6,6 +6,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use super::models::AppConfig;
+use super::secrets::{SecretsConfig, has_secrets};
 
 /// Load configuration from a JSON file.
 /// Returns default config if the file doesn't exist.
@@ -44,6 +45,101 @@ pub fn save_config(path: &Path, config: &AppConfig) -> Result<()> {
         .with_context(|| format!("Failed to rename temp config to: {}", path.display()))?;
 
     tracing::debug!("Config saved to {}", path.display());
+    Ok(())
+}
+
+/// Load configuration from split files (`config.json` + `secrets.json`).
+///
+/// - If `secrets.json` doesn't exist but `config.json` contains secrets,
+///   performs automatic migration: extracts secrets to `secrets.json` and
+///   rewrites `config.json` without secrets.
+/// - If neither file exists, returns defaults (first-time setup).
+/// - If both exist, loads and merges normally.
+pub fn load_config_split(config_path: &Path, secrets_path: &Path) -> Result<AppConfig> {
+    let mut config = load_config(config_path)?;
+
+    if secrets_path.exists() {
+        // Normal path: load secrets and merge into config
+        let secrets = load_secrets(secrets_path)?;
+        secrets.merge_into(&mut config);
+    } else if config_path.exists() && has_secrets(&config) {
+        // Migration: config.json has secrets but no secrets.json yet
+        tracing::info!(
+            "Migrating secrets from {} to {}",
+            config_path.display(),
+            secrets_path.display()
+        );
+        let secrets = SecretsConfig::extract_from(&config);
+        save_secrets(secrets_path, &secrets)?;
+
+        // Rewrite config.json without secrets
+        let mut stripped = config.clone();
+        stripped.strip_secrets();
+        save_config(config_path, &stripped)?;
+
+        tracing::info!("Migration complete: secrets moved to {}", secrets_path.display());
+    }
+    // else: first-time setup with no files — config is defaults, no secrets to merge
+
+    Ok(config)
+}
+
+/// Save configuration to split files (`config.json` + `secrets.json`).
+///
+/// Extracts secrets from the in-memory `AppConfig`, writes the stripped
+/// operational config to `config.json` and secrets to `secrets.json`.
+pub fn save_config_split(
+    config_path: &Path,
+    secrets_path: &Path,
+    config: &AppConfig,
+) -> Result<()> {
+    let secrets = SecretsConfig::extract_from(config);
+
+    // Write stripped config to config.json
+    let mut stripped = config.clone();
+    stripped.strip_secrets();
+    save_config(config_path, &stripped)?;
+
+    // Write secrets to secrets.json (only if there are any)
+    if !secrets.is_empty() {
+        save_secrets(secrets_path, &secrets)?;
+    }
+
+    Ok(())
+}
+
+/// Load secrets from a JSON file.
+fn load_secrets(path: &Path) -> Result<SecretsConfig> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read secrets file: {}", path.display()))?;
+
+    let secrets: SecretsConfig = serde_json::from_str(&contents)
+        .with_context(|| format!("Failed to parse secrets file: {}", path.display()))?;
+
+    tracing::debug!("Loaded secrets from {}", path.display());
+    Ok(secrets)
+}
+
+/// Save secrets to a JSON file with restrictive permissions.
+pub fn save_secrets(path: &Path, secrets: &SecretsConfig) -> Result<()> {
+    let contents =
+        serde_json::to_string_pretty(secrets).context("Failed to serialize secrets")?;
+
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, &contents)
+        .with_context(|| format!("Failed to write temp secrets file: {}", tmp_path.display()))?;
+
+    std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("Failed to rename temp secrets to: {}", path.display()))?;
+
+    // Set restrictive file permissions on Unix (owner read/write only)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    tracing::debug!("Secrets saved to {}", path.display());
     Ok(())
 }
 

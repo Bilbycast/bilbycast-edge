@@ -70,35 +70,46 @@ Supports NMOS IS-04 (Discovery & Registration) and IS-05 (Connection Management)
 
 1. Follow build steps from Option 1.
 
-2. **Create a config file** with the `auth` section under `server`:
+2. **Create a config file** (`config.json`) with server settings, and a **secrets file** (`secrets.json`) with auth credentials:
+
+   **config.json**:
    ```json
    {
      "version": 1,
      "server": {
        "listen_addr": "0.0.0.0",
-       "listen_port": 8080,
-       "auth": {
-         "enabled": true,
-         "jwt_secret": "your-secret-key-at-least-32-characters",
-         "token_lifetime_secs": 3600,
-         "clients": [
-           {
-             "client_id": "prometheus",
-             "client_secret": "a-strong-random-secret",
-             "role": "monitor"
-           },
-           {
-             "client_id": "admin-tool",
-             "client_secret": "another-strong-secret",
-             "role": "admin"
-           }
-         ],
-         "public_metrics": true
-       }
+       "listen_port": 8080
      },
      "flows": []
    }
    ```
+
+   **secrets.json** (set `chmod 600 secrets.json`):
+   ```json
+   {
+     "version": 1,
+     "server_auth": {
+       "enabled": true,
+       "jwt_secret": "your-secret-key-at-least-32-characters",
+       "token_lifetime_secs": 3600,
+       "clients": [
+         {
+           "client_id": "prometheus",
+           "client_secret": "a-strong-random-secret",
+           "role": "monitor"
+         },
+         {
+           "client_id": "admin-tool",
+           "client_secret": "another-strong-secret",
+           "role": "admin"
+         }
+       ],
+       "public_metrics": true
+     }
+   }
+   ```
+
+   > **Tip**: You can also place the `auth` section inside `config.json` under `server` for convenience — it will be automatically migrated to `secrets.json` on first startup.
 
 3. **Start the node**.
 
@@ -124,24 +135,35 @@ Supports NMOS IS-04 (Discovery & Registration) and IS-05 (Connection Management)
 2. **Get a registration token** from the manager (Dashboard -- register a new node, or use the manager API to create a node entry).
 
 3. **Create a config file** with the `manager` section:
+
+   **config.json**:
    ```json
    {
      "version": 1,
      "server": { "listen_addr": "0.0.0.0", "listen_port": 8080 },
      "manager": {
        "enabled": true,
-       "url": "wss://manager-host:8443/ws/node",
-       "registration_token": "<token-from-manager>"
+       "url": "wss://manager-host:8443/ws/node"
      },
      "flows": []
    }
    ```
 
+   **secrets.json** (optional — or use the setup wizard instead):
+   ```json
+   {
+     "version": 1,
+     "manager_registration_token": "<token-from-manager>"
+   }
+   ```
+
+   > **Tip**: You can also place the `registration_token` inside `config.json` under `manager` — it will be automatically migrated to `secrets.json` on first startup.
+
 4. **Start the node** -- it connects to the manager, authenticates with the registration token, and receives a permanent `node_id` and `node_secret`.
 
 5. **The node appears** in the manager dashboard and can be configured and monitored remotely. Commands from the manager (create flow, delete flow, add/remove output) are executed automatically.
 
-6. **Credentials are saved automatically** to the config file after registration. On subsequent starts, the node reconnects using `node_id` and `node_secret` (the `registration_token` field is cleared). The connection uses exponential backoff (1s to 60s) for automatic reconnection.
+6. **Credentials are saved automatically** after registration: `node_id` goes to `config.json`, `node_secret` goes to `secrets.json` (with `0600` permissions). The `registration_token` is cleared. On subsequent starts, the node reconnects using the saved credentials. The connection uses exponential backoff (1s to 60s) for automatic reconnection.
 
 ### Option 4: Browser-based setup (field deployment)
 

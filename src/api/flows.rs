@@ -5,7 +5,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 
 use crate::config::models::{AppConfig, FlowConfig, OutputConfig};
-use crate::config::persistence::save_config;
+use crate::config::persistence::save_config_split;
 use crate::config::validation::{validate_config, validate_flow, validate_output};
 
 use super::auth::RequireAdmin;
@@ -96,7 +96,7 @@ pub async fn create_flow(
     }
 
     config.flows.push(flow.clone());
-    save_config(&state.config_path, &config).map_err(|e| ApiError::Internal(e.to_string()))?;
+    save_config_split(&state.config_path, &state.secrets_path, &config).map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Start the flow in the engine if enabled
     if flow.enabled {
@@ -151,7 +151,7 @@ pub async fn update_flow(
     }
 
     config.flows[idx] = flow.clone();
-    save_config(&state.config_path, &config).map_err(|e| ApiError::Internal(e.to_string()))?;
+    save_config_split(&state.config_path, &state.secrets_path, &config).map_err(|e| ApiError::Internal(e.to_string()))?;
 
     if flow.enabled {
         match state.flow_manager.create_flow(flow.clone()).await {
@@ -195,7 +195,7 @@ pub async fn delete_flow(
         .ok_or_else(|| ApiError::NotFound(format!("Flow '{flow_id}' not found")))?;
 
     config.flows.remove(idx);
-    save_config(&state.config_path, &config).map_err(|e| ApiError::Internal(e.to_string()))?;
+    save_config_split(&state.config_path, &state.secrets_path, &config).map_err(|e| ApiError::Internal(e.to_string()))?;
 
     tracing::info!("Deleted flow '{}'", flow_id);
     Ok(Json(ApiResponse::ok(())))
@@ -369,7 +369,7 @@ pub async fn add_output(
     }
 
     flow.outputs.push(output.clone());
-    save_config(&state.config_path, &config).map_err(|e| ApiError::Internal(e.to_string()))?;
+    save_config_split(&state.config_path, &state.secrets_path, &config).map_err(|e| ApiError::Internal(e.to_string()))?;
     drop(config);
 
     // Hot-add output to running flow
@@ -421,7 +421,7 @@ pub async fn remove_output(
         })?;
 
     flow.outputs.remove(idx);
-    save_config(&state.config_path, &config).map_err(|e| ApiError::Internal(e.to_string()))?;
+    save_config_split(&state.config_path, &state.secrets_path, &config).map_err(|e| ApiError::Internal(e.to_string()))?;
 
     tracing::info!("Removed output '{}' from flow '{}'", output_id, flow_id);
     Ok(Json(ApiResponse::ok(())))
@@ -440,7 +440,10 @@ pub async fn get_config(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<AppConfig>>, ApiError> {
     let config = state.config.read().await;
-    Ok(Json(ApiResponse::ok(config.clone())))
+    // Strip secrets before returning — secrets never leave the node via API
+    let mut safe_config = config.clone();
+    safe_config.strip_secrets();
+    Ok(Json(ApiResponse::ok(safe_config)))
 }
 
 /// `PUT /api/v1/config` -- Replace the entire application configuration.
@@ -468,7 +471,7 @@ pub async fn replace_config(
 
     let mut config = state.config.write().await;
     *config = new_config.clone();
-    save_config(&state.config_path, &config).map_err(|e| ApiError::Internal(e.to_string()))?;
+    save_config_split(&state.config_path, &state.secrets_path, &config).map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Start all enabled flows from new config
     for flow in &config.flows {
@@ -484,7 +487,10 @@ pub async fn replace_config(
     }
 
     tracing::info!("Replaced entire config with {} flow(s)", config.flows.len());
-    Ok(Json(ApiResponse::ok(new_config)))
+    // Strip secrets from the response
+    let mut safe_config = new_config;
+    safe_config.strip_secrets();
+    Ok(Json(ApiResponse::ok(safe_config)))
 }
 
 /// `POST /api/v1/config/reload` -- Reload configuration from disk.
@@ -505,7 +511,7 @@ pub async fn reload_config(
     _admin: RequireAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<AppConfig>>, ApiError> {
-    let new_config = crate::config::persistence::load_config(&state.config_path)
+    let new_config = crate::config::persistence::load_config_split(&state.config_path, &state.secrets_path)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     validate_config(&new_config).map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -533,5 +539,8 @@ pub async fn reload_config(
         "Reloaded config from disk with {} flow(s)",
         config.flows.len()
     );
-    Ok(Json(ApiResponse::ok(new_config)))
+    // Strip secrets from the response
+    let mut safe_config = new_config;
+    safe_config.strip_secrets();
+    Ok(Json(ApiResponse::ok(safe_config)))
 }

@@ -31,7 +31,7 @@ mod stats;
 mod tunnel;
 mod util;
 
-use config::persistence::load_config;
+use config::persistence::{load_config_split, save_config_split};
 use config::validation::validate_config;
 use engine::manager::FlowManager;
 use stats::collector::StatsCollector;
@@ -90,15 +90,18 @@ async fn main() -> anyhow::Result<()> {
         env!("CARGO_PKG_VERSION")
     );
 
-    // Load configuration
-    let mut app_config = load_config(&cli.config)?;
+    // Derive secrets file path (same directory as config, named "secrets.json")
+    let secrets_path = cli.config.with_file_name("secrets.json");
+
+    // Load configuration (split: config.json + secrets.json, with auto-migration)
+    let mut app_config = load_config_split(&cli.config, &secrets_path)?;
 
     // Ensure persistent node UUID exists (used for NMOS IS-04)
     if app_config.node_id.is_none() {
         let node_id = uuid::Uuid::new_v4().to_string();
         tracing::info!("Generated new node_id: {node_id}");
         app_config.node_id = Some(node_id);
-        config::persistence::save_config(&cli.config, &app_config)?;
+        save_config_split(&cli.config, &secrets_path, &app_config)?;
     }
 
     // Validate config
@@ -159,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         config: Arc::new(RwLock::new(app_config.clone())),
         config_path: cli.config.clone(),
+        secrets_path: secrets_path.clone(),
         flow_manager: flow_manager.clone(),
         tunnel_manager: tunnel_manager.clone(),
         start_time: Instant::now(),
@@ -246,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
                 ws_stats_tx.clone(),
                 state.config.clone(),
                 cli.config.clone(),
+                secrets_path.clone(),
                 mgr_api_addr,
                 mgr_monitor_addr,
                 #[cfg(feature = "webrtc")]

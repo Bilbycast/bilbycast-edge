@@ -13,4 +13,5 @@
 
 pub mod models;
 pub mod persistence;
+pub mod secrets;
 pub mod validation;

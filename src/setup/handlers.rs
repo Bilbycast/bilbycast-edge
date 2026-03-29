@@ -8,7 +8,7 @@ use axum::response::{Html, IntoResponse};
 use serde::{Deserialize, Serialize};
 
 use crate::api::server::AppState;
-use crate::config::persistence::save_config;
+use crate::config::persistence::save_config_split;
 use crate::config::validation::validate_config;
 use crate::manager::ManagerConfig;
 
@@ -59,20 +59,20 @@ pub async fn setup_page(State(state): State<AppState>) -> impl IntoResponse {
 /// GET /setup/status — returns current setup-relevant config as JSON.
 pub async fn setup_status(State(state): State<AppState>) -> Json<SetupStatus> {
     let config = state.config.read().await;
-    let (manager_url, accept_self_signed, reg_token) = match &config.manager {
+    let (manager_url, accept_self_signed) = match &config.manager {
         Some(m) => (
             Some(m.url.clone()),
             m.accept_self_signed_cert,
-            m.registration_token.clone(),
         ),
-        None => (None, false, None),
+        None => (None, false),
     };
     Json(SetupStatus {
         listen_addr: config.server.listen_addr.clone(),
         listen_port: config.server.listen_port,
         manager_url,
         accept_self_signed_cert: accept_self_signed,
-        registration_token: reg_token,
+        // Never expose the registration token — it's a secret
+        registration_token: None,
         device_name: config.device_name.clone(),
         setup_enabled: config.setup_enabled,
     })
@@ -217,7 +217,7 @@ pub async fn apply_setup(
     }
 
     // Save to disk
-    if let Err(e) = save_config(&state.config_path, &config) {
+    if let Err(e) = save_config_split(&state.config_path, &state.secrets_path, &config) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(SetupResponse {

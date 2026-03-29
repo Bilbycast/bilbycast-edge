@@ -18,8 +18,8 @@
                             │  │                                                 │  │
                             │  │  ┌──────────┐  ┌────────────┐  ┌────────────┐  │  │
                             │  │  │ REST API │  │  Auth/JWT  │  │  Config    │  │  │
-                            │  │  │ (axum)   │──│  (OAuth2)  │  │ (JSON/    │  │  │
-                            │  │  │          │  │  RBAC      │  │  validate) │  │  │
+                            │  │  │ (axum)   │──│  (OAuth2)  │  │ (JSON +   │  │  │
+                            │  │  │          │  │  RBAC      │  │  secrets)  │  │  │
                             │  │  └────┬─────┘  └────────────┘  └─────┬──────┘  │  │
                             │  │       │                              │         │  │
                             │  └───────┼──────────────────────────────┼─────────┘  │
@@ -249,10 +249,11 @@ Current pattern requires changes in these locations:
 |------|------|--------|
 | 1 | `src/config/models.rs` | Add variant to `InputConfig` or `OutputConfig` enum |
 | 2 | `src/config/validation.rs` | Add validation rules for the new variant |
-| 3 | `src/engine/input_xxx.rs` or `output_xxx.rs` | Create the new task module |
-| 4 | `src/engine/mod.rs` | Declare `pub mod` |
-| 5 | `src/engine/flow.rs` | Add `match` arm in `start()` or `start_output()` |
-| 6 | `src/engine/flow.rs` | Add config metadata extraction |
+| 3 | `src/config/secrets.rs` | Add secret fields to `InputSecrets`/`OutputSecrets`, update `extract_from`/`merge_into`/`strip_secrets`/`has_secrets` |
+| 4 | `src/engine/input_xxx.rs` or `output_xxx.rs` | Create the new task module |
+| 5 | `src/engine/mod.rs` | Declare `pub mod` |
+| 6 | `src/engine/flow.rs` | Add `match` arm in `start()` or `start_output()` |
+| 7 | `src/engine/flow.rs` | Add config metadata extraction |
 
 The spawn function signature convention:
 ```rust

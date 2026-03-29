@@ -80,6 +80,15 @@ pub async fn run_egress(
                 });
             }
 
+            reason = conn.closed() => {
+                tracing::warn!(
+                    tunnel_id = %tunnel_id,
+                    reason = %reason,
+                    "QUIC connection closed, stopping TCP egress forwarder"
+                );
+                anyhow::bail!("QUIC connection closed: {reason}");
+            }
+
             _ = cancel.cancelled() => {
                 tracing::info!(tunnel_id = %tunnel_id, "TCP egress forwarder stopping");
                 break;

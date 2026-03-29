@@ -267,7 +267,7 @@ curl -k https://localhost:8443/health
 
 ## Auth Configuration Reference
 
-The `auth` block is an optional sub-object of `server`:
+The `auth` block is an optional sub-object of `server`. It is stored in `secrets.json` (not `config.json`) since it contains the JWT signing secret and client credentials. When first setting up auth, you can place it in `config.json` for convenience — it will be automatically migrated to `secrets.json` on first startup.
 
 ```json
 {
@@ -665,10 +665,12 @@ Note: Query parameter authentication is less secure than headers because tokens 
 
 ### Config file security
 
-- The config file contains client secrets and the JWT secret in plaintext.
-- Set file permissions to owner-only: `chmod 600 config.json`
-- Config changes via the API (PUT /api/v1/config) are persisted to disk atomically (write to temp file, then rename).
-- The auth section is not modifiable via the API -- it can only be changed by editing the config file and restarting.
+- Secrets (JWT secret, client credentials, tunnel encryption keys, SRT passphrases, etc.) are stored in a separate `secrets.json` file, not in `config.json`.
+- `secrets.json` is automatically written with `0600` permissions (owner read/write only) on Unix.
+- `config.json` contains only operational configuration (addresses, ports, flow definitions) and is safe to inspect, back up, or version-control.
+- When the manager requests the node's config (`GetConfig`), secrets are stripped before sending — the manager never receives sensitive fields.
+- Config changes via the API (PUT /api/v1/config) are persisted atomically: operational fields to `config.json`, secrets to `secrets.json` (write to temp file, then rename).
+- The auth section is not modifiable via the API -- it can only be changed by editing `secrets.json` and restarting.
 
 ---
 

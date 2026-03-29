@@ -9,6 +9,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use dashmap::DashMap;
 use serde::Serialize;
@@ -63,7 +64,7 @@ pub struct TunnelStatsSnapshot {
 
 /// Manages all active tunnels on this edge node.
 pub struct TunnelManager {
-    tunnels: DashMap<String, TunnelRuntime>,
+    tunnels: Arc<DashMap<String, TunnelRuntime>>,
     /// Manager node_id, used to identify this edge to relay nodes.
     manager_node_id: Mutex<Option<String>>,
 }
@@ -71,7 +72,7 @@ pub struct TunnelManager {
 impl TunnelManager {
     pub fn new() -> Self {
         Self {
-            tunnels: DashMap::new(),
+            tunnels: Arc::new(DashMap::new()),
             manager_node_id: Mutex::new(None),
         }
     }
@@ -82,9 +83,19 @@ impl TunnelManager {
     }
 
     /// Create and start a tunnel from the given configuration.
+    ///
+    /// Upsert semantics: if a tunnel with the same ID already exists and its
+    /// config is identical, this is a no-op.  If the config differs the old
+    /// tunnel is destroyed first and a new one is created.
     pub async fn create_tunnel(&self, config: TunnelConfig) -> anyhow::Result<()> {
-        if self.tunnels.contains_key(&config.id) {
-            anyhow::bail!("Tunnel '{}' already exists", config.id);
+        if let Some(existing) = self.tunnels.get(&config.id) {
+            if existing.config == config {
+                tracing::info!(tunnel_id = %config.id, "Tunnel already exists with identical config, skipping");
+                return Ok(());
+            }
+            drop(existing);
+            tracing::info!(tunnel_id = %config.id, "Tunnel exists with different config, replacing");
+            self.destroy_tunnel(&config.id).await?;
         }
 
         let tunnel_id = Uuid::parse_str(&config.id)
@@ -180,6 +191,7 @@ impl TunnelManager {
         let direction = config.direction;
         let protocol = config.protocol;
         let config_id = config.id.clone();
+        let tunnels = self.tunnels.clone();
 
         // Spawn the tunnel lifecycle task
         tokio::spawn(async move {
@@ -199,6 +211,8 @@ impl TunnelManager {
             if let Err(e) = result {
                 if !cancel.is_cancelled() {
                     tracing::error!(tunnel_id = %config_id, "Relay tunnel failed: {e}");
+                    // Remove from DashMap so manager re-push can re-create it
+                    tunnels.remove(&config_id);
                 }
             }
         });
@@ -226,6 +240,8 @@ impl TunnelManager {
         let direction = config.direction;
         let protocol = config.protocol;
         let config_clone = config.clone();
+        let config_id = config.id.clone();
+        let tunnels = self.tunnels.clone();
 
         tokio::spawn(async move {
             let result = run_direct_tunnel(
@@ -245,6 +261,8 @@ impl TunnelManager {
             if let Err(e) = result {
                 if !cancel.is_cancelled() {
                     tracing::error!(tunnel_id = %tunnel_id, "Direct tunnel failed: {e}");
+                    // Remove from DashMap so manager re-push can re-create it
+                    tunnels.remove(&config_id);
                 }
             }
         });
@@ -326,6 +344,9 @@ fn build_status(runtime: &TunnelRuntime) -> TunnelStatus {
 }
 
 /// Main lifecycle for a relay-mode tunnel.
+///
+/// Wraps the connect+forward cycle in a reconnection loop so the tunnel
+/// automatically recovers when the relay restarts or the QUIC connection drops.
 async fn run_relay_tunnel(
     params: RelayTunnelParams,
     direction: TunnelDirection,
@@ -338,20 +359,55 @@ async fn run_relay_tunnel(
     cipher: Option<Arc<super::crypto::TunnelCipher>>,
 ) -> anyhow::Result<()> {
     let tunnel_id = params.tunnel_id;
+    let max_backoff = Duration::from_secs(60);
+    let mut reconnect_backoff = Duration::from_secs(1);
 
-    // Connect with retry (handles backoff)
-    let conn = relay_client::connect_with_retry(&params, &state_tx, cancel.clone()).await?;
+    loop {
+        // Connect with retry (handles its own internal backoff for initial connect)
+        let conn = relay_client::connect_with_retry(&params, &state_tx, cancel.clone()).await?;
 
-    tracing::info!(
-        tunnel_id = %tunnel_id,
-        direction = %direction,
-        protocol = %protocol,
-        encrypted = cipher.is_some(),
-        "Relay tunnel connected, starting forwarder"
-    );
+        tracing::info!(
+            tunnel_id = %tunnel_id,
+            direction = %direction,
+            protocol = %protocol,
+            encrypted = cipher.is_some(),
+            "Relay tunnel connected, starting forwarder"
+        );
 
-    // Run the appropriate forwarder using the shared stats
-    run_forwarder(tunnel_id, protocol, direction, local_addr, conn, cancel, udp_stats, tcp_stats, cipher).await
+        // Reset backoff after successful connection
+        reconnect_backoff = Duration::from_secs(1);
+
+        // Run the forwarder — blocks until the QUIC connection drops
+        let result = run_forwarder(
+            tunnel_id, protocol, direction, local_addr, conn, cancel.clone(),
+            udp_stats.clone(), tcp_stats.clone(), cipher.clone(),
+        ).await;
+
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
+        // Connection lost — log and prepare to reconnect
+        match result {
+            Err(ref e) => tracing::warn!(
+                tunnel_id = %tunnel_id,
+                "Relay tunnel connection lost: {e}, reconnecting in {reconnect_backoff:?}"
+            ),
+            Ok(()) => tracing::warn!(
+                tunnel_id = %tunnel_id,
+                "Relay tunnel forwarder exited, reconnecting in {reconnect_backoff:?}"
+            ),
+        }
+
+        state_tx.send_replace(RelayTunnelState::Connecting);
+
+        tokio::select! {
+            _ = tokio::time::sleep(reconnect_backoff) => {}
+            _ = cancel.cancelled() => return Ok(()),
+        }
+
+        reconnect_backoff = (reconnect_backoff * 2).min(max_backoff);
+    }
 }
 
 /// Main lifecycle for a direct-mode tunnel.
