@@ -14,7 +14,7 @@ Supports NMOS IS-04 (Discovery & Registration) and IS-05 (Connection Management)
 | RTMP     | Yes   | Yes    | H.264/AAC; accepts publish from OBS/ffmpeg; supports RTMPS (TLS) |
 | RTSP     | Yes   | No     | Pull H.264/H.265 from IP cameras/media servers; TCP/UDP transport; auto-reconnect |
 | HLS      | No    | Yes    | Segment-based ingest; supports HEVC/HDR         |
-| WebRTC   | Yes   | Yes    | WHIP/WHEP; H.264 video + Opus audio; requires `webrtc` feature |
+| WebRTC   | Yes   | Yes    | WHIP/WHEP; H.264 video + Opus audio (enabled by default) |
 
 ## Quick Start
 

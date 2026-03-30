@@ -49,6 +49,31 @@ fn register_whip_if_needed(
     }
 }
 
+/// Register a WHEP output channel with the WebRTC session registry (if applicable).
+#[cfg(feature = "webrtc")]
+fn register_whep_if_needed(
+    webrtc_sessions: &WebrtcRegistry,
+    runtime: &FlowRuntime,
+) {
+    if let Some((tx, bearer_token)) = &runtime.whep_session_tx {
+        if let Some(registry) = webrtc_sessions {
+            registry.register_whep_output(&runtime.config.id, tx.clone(), bearer_token.clone());
+            tracing::info!("Registered WHEP output for flow '{}'", runtime.config.id);
+        }
+    }
+}
+
+/// Compute SHA-256 fingerprint of a DER-encoded certificate.
+/// Returns colon-separated hex string, e.g. "ab:cd:ef:01:23:...".
+fn compute_cert_fingerprint(cert_der: &[u8]) -> String {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(cert_der);
+    hash.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 /// Certificate verifier that accepts any certificate (for self-signed cert support).
 #[derive(Debug)]
 struct InsecureCertVerifier;
@@ -87,6 +112,80 @@ impl rustls::client::danger::ServerCertVerifier for InsecureCertVerifier {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+/// Certificate verifier with fingerprint pinning.
+///
+/// Performs standard TLS certificate validation (CA chain, hostname, etc.),
+/// then additionally checks that the server certificate's SHA-256 fingerprint
+/// matches the configured pin. Protects against compromised CAs.
+#[derive(Debug)]
+struct PinnedCertVerifier {
+    /// The expected SHA-256 fingerprint (colon-separated hex).
+    expected_fingerprint: String,
+    /// The standard webpki-based verifier for CA chain validation.
+    inner: Arc<rustls::client::WebPkiServerVerifier>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // First, perform standard CA chain validation
+        self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
+
+        // Then check the fingerprint pin
+        let actual = compute_cert_fingerprint(end_entity.as_ref());
+        if actual != self.expected_fingerprint {
+            tracing::error!(
+                "Certificate fingerprint mismatch! Expected: {}, got: {}. \
+                 This could indicate a man-in-the-middle attack or a legitimate \
+                 certificate rotation. Update cert_fingerprint in the manager config \
+                 if the certificate was intentionally changed.",
+                self.expected_fingerprint,
+                actual
+            );
+            return Err(rustls::Error::General(format!(
+                "Certificate fingerprint mismatch: expected {}, got {}",
+                self.expected_fingerprint, actual
+            )));
+        }
+
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
     }
 }
 
@@ -209,12 +308,54 @@ async fn try_connect(
     }
 
     let (ws_stream, _response) = if config.accept_self_signed_cert {
+        // SECURITY: Require explicit env var to allow insecure connections.
+        // This prevents accidental use in production when left in config files.
+        if std::env::var("BILBYCAST_ALLOW_INSECURE").as_deref() != Ok("1") {
+            return Err(
+                "accept_self_signed_cert is enabled but BILBYCAST_ALLOW_INSECURE=1 is not set. \
+                 This is a security safeguard — self-signed cert mode disables ALL certificate \
+                 validation, making the connection vulnerable to MITM attacks. Set \
+                 BILBYCAST_ALLOW_INSECURE=1 to confirm this is intentional (dev/testing only)."
+                    .into(),
+            );
+        }
+        tracing::warn!(
+            "SECURITY WARNING: accept_self_signed_cert is enabled — ALL TLS certificate \
+             validation is disabled. This makes the connection vulnerable to man-in-the-middle \
+             attacks. Do NOT use this in production."
+        );
         // Build a rustls ClientConfig that accepts any certificate
         let tls_config = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(std::sync::Arc::new(InsecureCertVerifier))
             .with_no_client_auth();
         let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config));
+        tokio_tungstenite::connect_async_tls_with_config(
+            &config.url,
+            None,
+            false,
+            Some(connector),
+        )
+        .await
+        .map_err(|e| format!("WebSocket connect failed: {e}"))?
+    } else if let Some(ref fingerprint) = config.cert_fingerprint {
+        // Certificate pinning: validate CA chain AND check fingerprint
+        tracing::info!("Certificate pinning enabled (fingerprint: {}...)", &fingerprint[..fingerprint.len().min(11)]);
+        let root_store = rustls::RootCertStore::from_iter(
+            webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+        );
+        let inner = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+            .build()
+            .map_err(|e| format!("Failed to build certificate verifier: {e}"))?;
+        let verifier = PinnedCertVerifier {
+            expected_fingerprint: fingerprint.clone(),
+            inner,
+        };
+        let tls_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_no_client_auth();
+        let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
         tokio_tungstenite::connect_async_tls_with_config(
             &config.url,
             None,
@@ -230,6 +371,15 @@ async fn try_connect(
     };
 
     tracing::info!("WebSocket connected, sending auth...");
+
+    // TOFU hint: if no cert pinning is configured, suggest it
+    if config.cert_fingerprint.is_none() && !config.accept_self_signed_cert {
+        tracing::info!(
+            "Tip: Set \"cert_fingerprint\" in the manager config to enable certificate \
+             pinning (protects against compromised CAs). Use the manager's TLS certificate \
+             SHA-256 fingerprint (colon-separated hex)."
+        );
+    }
 
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
@@ -609,6 +759,8 @@ async fn execute_command(
                 .map_err(|e| e.to_string())?;
             #[cfg(feature = "webrtc")]
             register_whip_if_needed(_webrtc_sessions, &_runtime);
+            #[cfg(feature = "webrtc")]
+            register_whep_if_needed(_webrtc_sessions, &_runtime);
             // Persist to config
             let mut cfg = app_config.write().await;
             cfg.flows.push(flow);
@@ -649,6 +801,8 @@ async fn execute_command(
                             .map_err(|e| e.to_string())?;
                         #[cfg(feature = "webrtc")]
                         register_whip_if_needed(_webrtc_sessions, &_runtime);
+                        #[cfg(feature = "webrtc")]
+                        register_whep_if_needed(_webrtc_sessions, &_runtime);
                     } else {
                         // Only outputs changed — diff surgically
                         tracing::info!("Update flow '{flow_id}': input unchanged, diffing outputs ({} old → {} new)",
@@ -668,6 +822,8 @@ async fn execute_command(
                         .map_err(|e| e.to_string())?;
                     #[cfg(feature = "webrtc")]
                     register_whip_if_needed(_webrtc_sessions, &_runtime);
+                    #[cfg(feature = "webrtc")]
+                    register_whep_if_needed(_webrtc_sessions, &_runtime);
                 }
             } else {
                 // No old flow — create new
@@ -679,6 +835,8 @@ async fn execute_command(
                     .map_err(|e| e.to_string())?;
                 #[cfg(feature = "webrtc")]
                 register_whip_if_needed(_webrtc_sessions, &_runtime);
+                #[cfg(feature = "webrtc")]
+                register_whep_if_needed(_webrtc_sessions, &_runtime);
             }
 
             // Update config
@@ -741,6 +899,8 @@ async fn execute_command(
                 .map_err(|e| e.to_string())?;
             #[cfg(feature = "webrtc")]
             register_whip_if_needed(_webrtc_sessions, &_runtime);
+            #[cfg(feature = "webrtc")]
+            register_whep_if_needed(_webrtc_sessions, &_runtime);
             // Mark enabled in config
             let mut cfg = app_config.write().await;
             if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
@@ -860,6 +1020,8 @@ async fn execute_command(
                                 Ok(_runtime) => {
                                     #[cfg(feature = "webrtc")]
                                     register_whip_if_needed(_webrtc_sessions, &_runtime);
+                                    #[cfg(feature = "webrtc")]
+                                    register_whep_if_needed(_webrtc_sessions, &_runtime);
                                 }
                                 Err(e) => tracing::warn!("Failed to start new flow '{id}': {e}"),
                             }
@@ -880,6 +1042,8 @@ async fn execute_command(
                                 Ok(_runtime) => {
                                     #[cfg(feature = "webrtc")]
                                     register_whip_if_needed(_webrtc_sessions, &_runtime);
+                                    #[cfg(feature = "webrtc")]
+                                    register_whep_if_needed(_webrtc_sessions, &_runtime);
                                 }
                                 Err(e) => tracing::warn!("Failed to start flow '{id}': {e}"),
                             }
@@ -897,6 +1061,8 @@ async fn execute_command(
                                     Ok(_runtime) => {
                                         #[cfg(feature = "webrtc")]
                                         register_whip_if_needed(_webrtc_sessions, &_runtime);
+                                        #[cfg(feature = "webrtc")]
+                                        register_whep_if_needed(_webrtc_sessions, &_runtime);
                                     }
                                     Err(e) => tracing::warn!("Failed to restart flow '{id}': {e}"),
                                 }
@@ -960,6 +1126,30 @@ async fn execute_command(
                 persist_config(&cfg, config_path, secrets_path);
             }
 
+            Ok(())
+        }
+        "rotate_secret" => {
+            let new_secret = action["new_secret"]
+                .as_str()
+                .ok_or("Missing new_secret in rotate_secret command")?;
+            if new_secret.is_empty() {
+                return Err("Empty new_secret in rotate_secret command".into());
+            }
+
+            tracing::info!("Manager command: rotate_secret — updating node authentication secret");
+
+            // Update in-memory config and persist to disk
+            {
+                let mut cfg = app_config.write().await;
+                if let Some(ref mut mgr) = cfg.manager {
+                    mgr.node_secret = Some(new_secret.to_string());
+                } else {
+                    return Err("No manager config present to update secret".into());
+                }
+                persist_config(&cfg, config_path, secrets_path);
+            }
+
+            tracing::info!("Node secret rotated and persisted to secrets.json");
             Ok(())
         }
         _ => Err(format!("Unknown command: {action_type}")),

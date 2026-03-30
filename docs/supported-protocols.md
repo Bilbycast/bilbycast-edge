@@ -88,7 +88,7 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
 - **Limitations:**
   - Output only. RTMP input (ingest from OBS etc.) is not implemented.
   - Only H.264 video and AAC audio. HEVC/VP9 not supported via RTMP.
-  - RTMPS (TLS) requires building with the `tls` cargo feature.
+  - RTMPS (TLS) uses the `tls` feature (enabled by default).
 
 ### HLS Ingest
 - **Direction:** Output only
@@ -122,7 +122,7 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
 ### WebRTC (WHIP/WHEP)
 - **Direction:** Input and Output
 - **Transport:** UDP (ICE-lite/DTLS/SRTP) via `str0m` pure-Rust WebRTC stack
-- **Status:** Fully implemented. Requires the `webrtc` cargo feature.
+- **Status:** Fully implemented. The `webrtc` feature is enabled by default.
 - **Four modes:**
   - **WHIP input** (server): Accept contributions from OBS, browsers — endpoint at `/api/v1/flows/{id}/whip`
   - **WHIP output** (client): Push media to external WHIP endpoints (CDN, cloud)
@@ -158,13 +158,10 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
 
 | Feature | Description | Default |
 |---------|-------------|---------|
-| `tls` | Enable RTMPS (RTMP over TLS) via `rustls`/`tokio-rustls` | No |
-| `webrtc` | Enable WebRTC WHIP/WHEP input and output via `str0m` | No |
+| `tls` | Enable RTMPS (RTMP over TLS) via `rustls`/`tokio-rustls` | **Yes** |
+| `webrtc` | Enable WebRTC WHIP/WHEP input and output via `str0m` | **Yes** |
 
-Build with all features:
-```bash
-cargo build --release --features tls,webrtc
-```
+All features are enabled by default. A plain `cargo build --release` includes everything.
 
 ## Configuration Examples
 

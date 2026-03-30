@@ -82,6 +82,10 @@ pub struct FlowRuntime {
     /// Must be registered with the WebrtcSessionRegistry after flow creation.
     #[cfg(feature = "webrtc")]
     pub whip_session_tx: Option<(tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>, Option<String>)>,
+    /// WHEP output session channel sender (only set for flows with a WHEP server output).
+    /// Must be registered with the WebrtcSessionRegistry after flow creation.
+    #[cfg(feature = "webrtc")]
+    pub whep_session_tx: Option<(tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>, Option<String>)>,
 }
 
 /// Runtime state for a single output within a flow.
@@ -385,13 +389,32 @@ impl FlowRuntime {
         };
 
         // Start output tasks
+        #[cfg(feature = "webrtc")]
+        let mut whep_session_info: Option<(tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>, Option<String>)> = None;
         let mut output_handles = HashMap::new();
         for output_config in &config.outputs {
+            // For WHEP server outputs, create the session channel so the HTTP
+            // handler can forward SDP offers to the output task.
+            #[cfg(feature = "webrtc")]
+            let whep_rx = if let OutputConfig::Webrtc(wc) = output_config {
+                if wc.mode == crate::config::models::WebrtcOutputMode::WhepServer {
+                    let (tx, rx) = tokio::sync::mpsc::channel(4);
+                    whep_session_info = Some((tx, wc.bearer_token.clone()));
+                    Some(rx)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let output_rt = Self::start_output(
                 output_config,
                 &broadcast_tx,
                 &flow_stats,
                 &cancel_token,
+                #[cfg(feature = "webrtc")]
+                whep_rx,
             ).await?;
             output_handles.insert(output_config.id().to_string(), output_rt);
         }
@@ -415,6 +438,8 @@ impl FlowRuntime {
             media_analysis_handle,
             #[cfg(feature = "webrtc")]
             whip_session_tx: whip_session_info,
+            #[cfg(feature = "webrtc")]
+            whep_session_tx: whep_session_info,
         })
     }
 
@@ -432,6 +457,8 @@ impl FlowRuntime {
         broadcast_tx: &broadcast::Sender<RtpPacket>,
         flow_stats: &Arc<FlowStatsAccumulator>,
         parent_cancel: &CancellationToken,
+        #[cfg(feature = "webrtc")]
+        whep_session_rx: Option<tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>>,
     ) -> Result<OutputRuntime> {
         let output_cancel = parent_cancel.child_token();
 
@@ -548,6 +575,8 @@ impl FlowRuntime {
                     broadcast_tx,
                     output_stats.clone(),
                     output_cancel.clone(),
+                    #[cfg(feature = "webrtc")]
+                    whep_session_rx,
                 );
 
                 Ok(OutputRuntime {
@@ -574,11 +603,18 @@ impl FlowRuntime {
     ) -> Result<()> {
         let output_id = output_config.id().to_string();
 
+        // Note: WHEP server outputs hot-added at runtime won't accept viewers
+        // until the flow is restarted (the session channel cannot be registered
+        // with WebrtcSessionRegistry through this path). WHEP outputs defined
+        // at flow creation time work correctly.
+
         let output_rt = Self::start_output(
             &output_config,
             &self.broadcast_tx,
             flow_stats,
             &self.cancel_token,
+            #[cfg(feature = "webrtc")]
+            None,
         ).await?;
 
         let mut handles = self.output_handles.write().await;

@@ -187,6 +187,14 @@ async fn main() -> anyhow::Result<()> {
                             tracing::info!("Registered WHIP input for flow '{}'", flow.id);
                         }
                     }
+                    // Register WHEP output channel with session registry
+                    #[cfg(feature = "webrtc")]
+                    if let Some((tx, bearer_token)) = &_runtime.whep_session_tx {
+                        if let Some(ref registry) = state.webrtc_sessions {
+                            registry.register_whep_output(&flow.id, tx.clone(), bearer_token.clone());
+                            tracing::info!("Registered WHEP output for flow '{}'", flow.id);
+                        }
+                    }
                 }
                 Err(e) => tracing::error!("Failed to auto-start flow '{}': {e}", flow.id),
             }

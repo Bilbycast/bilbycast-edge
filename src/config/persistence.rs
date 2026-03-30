@@ -5,6 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use super::crypto;
 use super::models::AppConfig;
 use super::secrets::{SecretsConfig, has_secrets};
 
@@ -55,12 +56,21 @@ pub fn save_config(path: &Path, config: &AppConfig) -> Result<()> {
 ///   rewrites `config.json` without secrets.
 /// - If neither file exists, returns defaults (first-time setup).
 /// - If both exist, loads and merges normally.
+///
+/// Secrets are encrypted at rest using a machine-specific key derived from
+/// `/etc/machine-id` (Linux) or a generated `.secrets_key` file (fallback).
+/// Existing unencrypted secrets.json files are auto-migrated to encrypted form.
 pub fn load_config_split(config_path: &Path, secrets_path: &Path) -> Result<AppConfig> {
     let mut config = load_config(config_path)?;
 
+    // Resolve the machine seed for secrets encryption/decryption
+    let secrets_dir = secrets_path.parent().unwrap_or(Path::new("."));
+    let machine_seed = crypto::get_machine_seed(secrets_dir)
+        .context("Failed to obtain machine seed for secrets encryption")?;
+
     if secrets_path.exists() {
         // Normal path: load secrets and merge into config
-        let secrets = load_secrets(secrets_path)?;
+        let secrets = load_secrets(secrets_path, &machine_seed)?;
         secrets.merge_into(&mut config);
     } else if config_path.exists() && has_secrets(&config) {
         // Migration: config.json has secrets but no secrets.json yet
@@ -70,14 +80,14 @@ pub fn load_config_split(config_path: &Path, secrets_path: &Path) -> Result<AppC
             secrets_path.display()
         );
         let secrets = SecretsConfig::extract_from(&config);
-        save_secrets(secrets_path, &secrets)?;
+        save_secrets(secrets_path, &secrets, &machine_seed)?;
 
         // Rewrite config.json without secrets
         let mut stripped = config.clone();
         stripped.strip_secrets();
         save_config(config_path, &stripped)?;
 
-        tracing::info!("Migration complete: secrets moved to {}", secrets_path.display());
+        tracing::info!("Migration complete: secrets moved to {} (encrypted)", secrets_path.display());
     }
     // else: first-time setup with no files — config is defaults, no secrets to merge
 
@@ -87,7 +97,7 @@ pub fn load_config_split(config_path: &Path, secrets_path: &Path) -> Result<AppC
 /// Save configuration to split files (`config.json` + `secrets.json`).
 ///
 /// Extracts secrets from the in-memory `AppConfig`, writes the stripped
-/// operational config to `config.json` and secrets to `secrets.json`.
+/// operational config to `config.json` and encrypted secrets to `secrets.json`.
 pub fn save_config_split(
     config_path: &Path,
     secrets_path: &Path,
@@ -100,33 +110,54 @@ pub fn save_config_split(
     stripped.strip_secrets();
     save_config(config_path, &stripped)?;
 
-    // Write secrets to secrets.json (only if there are any)
+    // Write encrypted secrets to secrets.json (only if there are any)
     if !secrets.is_empty() {
-        save_secrets(secrets_path, &secrets)?;
+        let secrets_dir = secrets_path.parent().unwrap_or(Path::new("."));
+        let machine_seed = crypto::get_machine_seed(secrets_dir)
+            .context("Failed to obtain machine seed for secrets encryption")?;
+        save_secrets(secrets_path, &secrets, &machine_seed)?;
     }
 
     Ok(())
 }
 
-/// Load secrets from a JSON file.
-fn load_secrets(path: &Path) -> Result<SecretsConfig> {
-    let contents = std::fs::read_to_string(path)
+/// Load secrets from a JSON file, decrypting if encrypted.
+///
+/// Supports both encrypted (`v1:...`) and legacy unencrypted formats.
+/// Legacy files are automatically re-encrypted on the next save.
+fn load_secrets(path: &Path, machine_seed: &str) -> Result<SecretsConfig> {
+    let raw = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read secrets file: {}", path.display()))?;
 
-    let secrets: SecretsConfig = serde_json::from_str(&contents)
+    let json_str = if crypto::is_encrypted(&raw) {
+        crypto::decrypt_secrets(&raw, machine_seed)
+            .with_context(|| format!("Failed to decrypt secrets file: {}", path.display()))?
+    } else {
+        tracing::info!(
+            "Found unencrypted secrets.json — will be encrypted on next save"
+        );
+        raw
+    };
+
+    let secrets: SecretsConfig = serde_json::from_str(&json_str)
         .with_context(|| format!("Failed to parse secrets file: {}", path.display()))?;
 
-    tracing::debug!("Loaded secrets from {}", path.display());
+    tracing::debug!("Loaded secrets from {} (encrypted at rest)", path.display());
     Ok(secrets)
 }
 
-/// Save secrets to a JSON file with restrictive permissions.
-pub fn save_secrets(path: &Path, secrets: &SecretsConfig) -> Result<()> {
-    let contents =
+/// Save secrets to an encrypted JSON file with restrictive permissions.
+///
+/// The file is encrypted using AES-256-GCM with a machine-specific key.
+pub fn save_secrets(path: &Path, secrets: &SecretsConfig, machine_seed: &str) -> Result<()> {
+    let json =
         serde_json::to_string_pretty(secrets).context("Failed to serialize secrets")?;
 
+    let encrypted =
+        crypto::encrypt_secrets(&json, machine_seed).context("Failed to encrypt secrets")?;
+
     let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, &contents)
+    std::fs::write(&tmp_path, &encrypted)
         .with_context(|| format!("Failed to write temp secrets file: {}", tmp_path.display()))?;
 
     std::fs::rename(&tmp_path, path)
@@ -139,7 +170,7 @@ pub fn save_secrets(path: &Path, secrets: &SecretsConfig) -> Result<()> {
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
 
-    tracing::debug!("Secrets saved to {}", path.display());
+    tracing::debug!("Secrets saved to {} (encrypted)", path.display());
     Ok(())
 }
 

@@ -32,6 +32,7 @@ All error responses use the same envelope without `data`:
 - [Outputs](#outputs)
 - [Statistics](#statistics)
 - [Configuration](#configuration)
+- [Tunnels](#tunnels)
 - [Prometheus Metrics](#prometheus-metrics)
 - [WebSocket](#websocket)
 - [Error Codes](#error-codes)
@@ -1113,6 +1114,126 @@ curl http://localhost:8080/metrics
 
 ---
 
+## Tunnels
+
+### GET /api/v1/tunnels
+
+List all active IP tunnels.
+
+**Auth:** Requires valid JWT (any role) when auth is enabled.
+
+**Response (200 OK):**
+
+```json
+{
+  "tunnels": [
+    {
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "name": "Stadium to Studio",
+      "protocol": "udp",
+      "mode": "relay",
+      "direction": "egress",
+      "state": "Connected",
+      "local_addr": "0.0.0.0:9000",
+      "relay_addr": "relay.example.com:4433"
+    }
+  ]
+}
+```
+
+### GET /api/v1/tunnels/{id}
+
+Get status of a specific tunnel.
+
+**Auth:** Requires valid JWT (any role) when auth is enabled.
+
+**Response (200 OK):**
+
+```json
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "name": "Stadium to Studio",
+  "protocol": "udp",
+  "mode": "relay",
+  "direction": "egress",
+  "state": "Connected",
+  "local_addr": "0.0.0.0:9000",
+  "relay_addr": "relay.example.com:4433"
+}
+```
+
+**Response (404 Not Found):**
+
+```json
+{
+  "error": "Tunnel not found"
+}
+```
+
+### POST /api/v1/tunnels
+
+Create a new IP tunnel. The tunnel configuration is validated before creation.
+
+**Auth:** Requires valid JWT with `admin` role when auth is enabled.
+
+**Request body:** A `TunnelConfig` JSON object. See [Tunnel Configuration](configuration-guide.md#tunnel-configuration) for all fields.
+
+**Example — relay mode UDP tunnel:**
+
+```json
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "name": "Stadium to Studio",
+  "enabled": true,
+  "protocol": "udp",
+  "mode": "relay",
+  "direction": "egress",
+  "local_addr": "0.0.0.0:9000",
+  "relay_addr": "relay.example.com:4433",
+  "tunnel_encryption_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+}
+```
+
+**Response (201 Created):**
+
+```json
+{
+  "status": "created"
+}
+```
+
+**Response (400 Bad Request):**
+
+```json
+{
+  "error": "tunnel_encryption_key is required for relay mode"
+}
+```
+
+### DELETE /api/v1/tunnels/{id}
+
+Destroy a tunnel and clean up its connections.
+
+**Auth:** Requires valid JWT with `admin` role when auth is enabled.
+
+**Response (200 OK):**
+
+```json
+{
+  "status": "deleted"
+}
+```
+
+**Response (404 Not Found):**
+
+```json
+{
+  "error": "Tunnel not found"
+}
+```
+
+---
+
 ## WebSocket
 
 ### GET /api/v1/ws/stats
@@ -1240,6 +1361,10 @@ All API errors return a JSON body with `"success": false` and an `"error"` messa
 | DELETE | `/api/v1/flows/{flow_id}/whip/{session_id}` | Yes | admin | WHIP: Disconnect publisher |
 | POST | `/api/v1/flows/{flow_id}/whep` | Yes | admin | WHEP: Accept WebRTC viewer (SDP offer → answer) |
 | DELETE | `/api/v1/flows/{flow_id}/whep/{session_id}` | Yes | admin | WHEP: Disconnect viewer |
+| GET | `/api/v1/tunnels` | Yes | any | List all tunnels |
+| GET | `/api/v1/tunnels/{id}` | Yes | any | Get tunnel status |
+| POST | `/api/v1/tunnels` | Yes | admin | Create tunnel |
+| DELETE | `/api/v1/tunnels/{id}` | Yes | admin | Delete tunnel |
 | GET | `/api/v1/stats` | Yes | any | All statistics |
 | GET | `/api/v1/stats/{flow_id}` | Yes | any | Single flow stats |
 | GET | `/api/v1/config` | Yes | any | Get running config |

@@ -10,13 +10,10 @@ bilbycast-edge is a Rust media transport gateway for professional broadcast work
 
 ```bash
 cargo check                    # Quick type/borrow check
-cargo build                    # Debug build
-cargo build --release          # Optimized release build
+cargo build                    # Debug build (all features: TLS + WebRTC)
+cargo build --release          # Optimized release build (all features)
 cargo test                     # Run all tests
 cargo test <test_name>         # Run a single test
-cargo build --features tls     # Enable HTTPS/RTMPS support
-cargo build --features webrtc  # Enable WebRTC WHIP/WHEP support
-cargo build --features tls,webrtc  # Enable both
 ```
 
 ## Running
@@ -38,8 +35,10 @@ These must be present for the project to compile.
 
 ## Feature Flags
 
-- `tls` — HTTPS and RTMPS support (tokio-rustls + axum-server)
-- `webrtc` — WebRTC WHIP/WHEP input and output via str0m (pure Rust, sans-I/O)
+Both features are enabled by default. A plain `cargo build` includes everything.
+
+- `tls` — HTTPS and RTMPS support (tokio-rustls + axum-server) — **default on**
+- `webrtc` — WebRTC WHIP/WHEP input and output via str0m (pure Rust, sans-I/O) — **default on**
 
 ## Architecture Overview
 
@@ -136,7 +135,7 @@ SRT uses AES-128/192/256 encryption + passphrase auth with selectable cipher mod
 - **Manager commands are validated before execution** — `create_flow`, `update_flow`, `add_output`, `update_config`, and `create_tunnel` all call their respective validation functions after deserialization
 - Duplicate flow ID detection on create
 
-**Manager connection**: The WebSocket client to bilbycast-manager enforces `wss://` (TLS). Plaintext `ws://` URLs are rejected at connection time. Set `accept_self_signed_cert: true` in the `manager` config section to accept self-signed certificates (dev/testing only).
+**Manager connection**: The WebSocket client to bilbycast-manager enforces `wss://` (TLS). Plaintext `ws://` URLs are rejected at connection time. Self-signed cert mode (`accept_self_signed_cert: true`) requires `BILBYCAST_ALLOW_INSECURE=1` env var as a safety guard. Optional certificate pinning (`cert_fingerprint`) validates the server's SHA-256 certificate fingerprint against a configured value, protecting against compromised CAs. Secret rotation (`rotate_secret` command) allows the manager to replace the node's authentication secret over the active WebSocket connection.
 
 ### API Structure (`src/api/server.rs`)
 
@@ -178,7 +177,7 @@ Full reference in `docs/CONFIGURATION.md`. Config is JSON with enum-tagged input
 Configuration is persisted across two files:
 
 - **`config.json`** — Operational config (addresses, ports, protocols, flow definitions without secrets). Safe to send to the manager, inspect, and version-control.
-- **`secrets.json`** — All secrets (node credentials, tunnel encryption keys, SRT passphrases, RTMP stream keys, auth config, TLS paths). Never leaves the node. Written with `0600` permissions on Unix.
+- **`secrets.json`** — All secrets (node credentials, tunnel encryption keys, SRT passphrases, RTMP stream keys, auth config, TLS paths). Never leaves the node. **Encrypted at rest** using AES-256-GCM with a machine-specific key derived from `/etc/machine-id` (Linux) or a generated `.secrets_key` file (fallback for macOS/containers). Written with `0600` permissions on Unix. Existing unencrypted files are auto-migrated on first load.
 
 At runtime, both files merge into a single `AppConfig` in memory — all existing code works unchanged. The split is purely a persistence and serialization boundary.
 
@@ -190,6 +189,7 @@ At runtime, both files merge into a single `AppConfig` in memory — all existin
 
 **Key implementation files:**
 - `src/config/secrets.rs` — `SecretsConfig` struct, `extract_from()`, `merge_into()`, `has_secrets()`, and `AppConfig::strip_secrets()`
+- `src/config/crypto.rs` — AES-256-GCM encryption/decryption for `secrets.json`, machine seed derivation (`/etc/machine-id` or `.secrets_key` fallback), HKDF-SHA256 key derivation
 - `src/config/persistence.rs` — `load_config_split()` (with auto-migration from legacy single-file), `save_config_split()`, `save_secrets()`
 
 **Migration**: On first startup after upgrade, if `config.json` contains secrets and `secrets.json` does not exist, the system automatically splits them. Users don't need to take any action.

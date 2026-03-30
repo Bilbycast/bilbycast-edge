@@ -78,7 +78,8 @@ On startup, the edge loads its config from both `config.json` and `secrets.json`
   },
   "monitor": null,
   "manager": null,
-  "flows": []
+  "flows": [],
+  "tunnels": []
 }
 ```
 
@@ -107,7 +108,7 @@ API server configuration.
 
 > **Note:** The `tls` section is stored in `secrets.json`, not `config.json`, since it contains paths to sensitive key material.
 
-Enables HTTPS on the API server. Requires building with `--features tls`.
+Enables HTTPS on the API server. The `tls` feature is enabled by default.
 
 | Field       | Type     | Description                          |
 |-------------|----------|--------------------------------------|
@@ -183,7 +184,8 @@ Optional connection to a bilbycast-manager instance for centralized monitoring a
 |----------------------|-----------|---------|-------------------------------------------------|
 | `enabled`            | `bool`    | `false` | Enable the manager connection                   |
 | `url`                | `string`  | --      | Manager WebSocket URL, e.g. `"wss://manager-host:8443/ws/node"` (must use `wss://`) |
-| `accept_self_signed_cert` | `bool` | `false` | Accept self-signed TLS certificates from the manager. **Dev/testing only** — disables cert validation. |
+| `accept_self_signed_cert` | `bool` | `false` | Accept self-signed TLS certificates from the manager. **Dev/testing only** — disables cert validation. Requires `BILBYCAST_ALLOW_INSECURE=1` env var as a safety guard. |
+| `cert_fingerprint`   | `string?` | `null`  | SHA-256 fingerprint of the manager's TLS certificate for certificate pinning. Format: hex-encoded with colons, e.g. `"ab:cd:ef:01:23:..."`. When set, connections to servers with a different certificate are rejected, even if CA-signed. Protects against compromised CAs and targeted MITM attacks. The server's fingerprint is logged on first connection for easy pinning. |
 | `registration_token` | `string?` | `null`  | One-time registration token (first connection only). **Stored in `secrets.json`.** |
 | `node_id`            | `string?` | `null`  | Assigned node ID (set automatically after registration) |
 | `node_secret`        | `string?` | `null`  | Assigned node secret (set automatically after registration). **Stored in `secrets.json`.** |
@@ -228,6 +230,113 @@ After registration, the files are updated to:
   "manager_node_secret": "assigned-secret"
 }
 ```
+
+---
+
+## Tunnels Section
+
+An array of IP tunnel definitions. Tunnels create encrypted point-to-point links between edge nodes, either through a bilbycast-relay server (for NAT traversal) or directly via QUIC (when one edge has a public IP).
+
+| Field                  | Type      | Default | Description |
+|------------------------|-----------|---------|-------------|
+| `id`                   | `string`  | --      | Unique tunnel identifier. Must be a valid UUID. |
+| `name`                 | `string`  | --      | Human-readable tunnel name |
+| `enabled`              | `bool`    | `true`  | Whether this tunnel is active |
+| `protocol`             | `string`  | --      | Transport protocol: `"tcp"` (reliable, ordered — QUIC streams) or `"udp"` (unreliable — QUIC datagrams, best for SRT/media) |
+| `mode`                 | `string`  | --      | Connectivity mode: `"relay"` (both edges behind NAT, traffic via relay) or `"direct"` (direct QUIC between edges) |
+| `direction`            | `string`  | --      | This edge's role: `"ingress"` (receives tunnel traffic, forwards to `local_addr`) or `"egress"` (listens on `local_addr`, sends into tunnel) |
+| `local_addr`           | `string`  | --      | Local address. For **egress**: listen address for local traffic to tunnel (e.g. `"0.0.0.0:9000"`). For **ingress**: forward address for received tunnel traffic (e.g. `"127.0.0.1:9000"`). |
+| `relay_addr`           | `string?` | `null`  | Relay server QUIC address, e.g. `"relay.example.com:4433"`. **Required for relay mode.** |
+| `tunnel_encryption_key`| `string?` | `null`  | End-to-end encryption key (hex-encoded, exactly 64 chars = 32 bytes). Both edges must have the same key (distributed by manager). **Required for relay mode** (relay sees only ciphertext). Optional for direct mode (defense-in-depth). **Stored in `secrets.json`.** |
+| `tunnel_bind_secret`   | `string?` | `null`  | Shared secret for relay bind authentication (hex-encoded, exactly 64 chars = 32 bytes). Used to compute HMAC-SHA256 bind tokens. **Stored in `secrets.json`.** |
+| `peer_addr`            | `string?` | `null`  | Remote peer QUIC address, e.g. `"203.0.113.50:4433"`. **Required for direct mode, egress direction.** |
+| `direct_listen_addr`   | `string?` | `null`  | QUIC listen address, e.g. `"0.0.0.0:4433"`. **Required for direct mode, ingress direction.** |
+| `tunnel_psk`           | `string?` | `null`  | Pre-shared key for direct mode HMAC-SHA256 authentication (hex-encoded, 64 chars). Both edges must share the same PSK. **Stored in `secrets.json`.** |
+| `tls_cert_pem`         | `string?` | `null`  | TLS certificate PEM for direct mode listener. Auto-generated if absent. **Stored in `secrets.json`.** |
+| `tls_key_pem`          | `string?` | `null`  | TLS key PEM for direct mode listener. Auto-generated if absent. **Stored in `secrets.json`.** |
+
+### Relay Mode Example
+
+Both edges behind NAT, traffic forwarded through a bilbycast-relay server. End-to-end encrypted — the relay cannot read payloads.
+
+**Edge A (egress — captures local SRT traffic and tunnels it):**
+```json
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "name": "Stadium to Studio Tunnel",
+  "enabled": true,
+  "protocol": "udp",
+  "mode": "relay",
+  "direction": "egress",
+  "local_addr": "0.0.0.0:9000",
+  "relay_addr": "relay.example.com:4433",
+  "tunnel_encryption_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "tunnel_bind_secret": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+}
+```
+
+**Edge B (ingress — receives tunnel traffic and forwards to local address):**
+```json
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "name": "Stadium to Studio Tunnel",
+  "enabled": true,
+  "protocol": "udp",
+  "mode": "relay",
+  "direction": "ingress",
+  "local_addr": "127.0.0.1:9000",
+  "relay_addr": "relay.example.com:4433",
+  "tunnel_encryption_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "tunnel_bind_secret": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+}
+```
+
+Both edges must use the same `id`, `tunnel_encryption_key`, and `tunnel_bind_secret`. The manager distributes these automatically when creating tunnels.
+
+### Direct Mode Example
+
+One edge has a public IP. Direct QUIC connection — no relay needed.
+
+**Edge A (ingress — listens for QUIC connection):**
+```json
+{
+  "id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+  "name": "Direct Link",
+  "enabled": true,
+  "protocol": "tcp",
+  "mode": "direct",
+  "direction": "ingress",
+  "local_addr": "127.0.0.1:9000",
+  "direct_listen_addr": "0.0.0.0:4433",
+  "tunnel_psk": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+}
+```
+
+**Edge B (egress — connects to Edge A's public address):**
+```json
+{
+  "id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+  "name": "Direct Link",
+  "enabled": true,
+  "protocol": "tcp",
+  "mode": "direct",
+  "direction": "egress",
+  "local_addr": "0.0.0.0:9000",
+  "peer_addr": "203.0.113.50:4433",
+  "tunnel_psk": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+}
+```
+
+### Validation Rules
+
+- `id` must be a valid UUID
+- `relay_addr` required when `mode` is `relay`
+- `tunnel_encryption_key` required when `mode` is `relay`, must be exactly 64 hex chars (32 bytes)
+- `tunnel_bind_secret` must be exactly 64 hex chars if present
+- `peer_addr` required when `mode` is `direct` and `direction` is `egress`
+- `direct_listen_addr` required when `mode` is `direct` and `direction` is `ingress`
+- `tunnel_psk` must be exactly 64 hex chars if present
+- All address fields must be valid socket addresses
 
 ---
 
@@ -344,7 +453,7 @@ Pulls H.264 or H.265/HEVC video and AAC audio from RTSP sources (IP cameras, med
 
 ### WebRTC/WHIP Input (`"type": "webrtc"`)
 
-Accepts incoming WebRTC contributions from publishers (OBS, browsers) via the WHIP protocol (RFC 9725). The WHIP endpoint is auto-generated at `/api/v1/flows/{flow_id}/whip`. Requires the `webrtc` cargo feature.
+Accepts incoming WebRTC contributions from publishers (OBS, browsers) via the WHIP protocol (RFC 9725). The WHIP endpoint is auto-generated at `/api/v1/flows/{flow_id}/whip`. The `webrtc` feature is enabled by default.
 
 | Field          | Type      | Default | Description                                     |
 |----------------|-----------|---------|-------------------------------------------------|
@@ -369,7 +478,7 @@ Accepts incoming WebRTC contributions from publishers (OBS, browsers) via the WH
 
 ### WHEP Input (`"type": "whep"`)
 
-Pulls media from an external WHEP server. The edge acts as a WHEP client. Requires the `webrtc` cargo feature.
+Pulls media from an external WHEP server. The edge acts as a WHEP client. The `webrtc` feature is enabled by default.
 
 | Field          | Type      | Default | Description                                     |
 |----------------|-----------|---------|-------------------------------------------------|
@@ -466,7 +575,7 @@ Segment-based HTTP ingest. Supports HEVC/HDR content.
 
 ### WebRTC Output (`"type": "webrtc"`)
 
-WebRTC output supporting two modes: WHIP client (push to external endpoint) and WHEP server (serve viewers). Requires the `webrtc` cargo feature. Video: H.264 only; audio: Opus passthrough only (AAC sources fall back to video-only automatically).
+WebRTC output supporting two modes: WHIP client (push to external endpoint) and WHEP server (serve viewers). The `webrtc` feature is enabled by default. Video: H.264 only; audio: Opus passthrough only (AAC sources fall back to video-only automatically).
 
 | Field          | Type      | Default        | Description                                     |
 |----------------|-----------|----------------|-------------------------------------------------|
@@ -772,6 +881,55 @@ SMPTE 2022-1 Forward Error Correction parameters.
           "latency_ms": 200
         }
       ]
+    }
+  ]
+}
+```
+
+### Manager-Connected Node with Relay Tunnel
+
+```json
+{
+  "version": 1,
+  "server": { "listen_addr": "0.0.0.0", "listen_port": 8080 },
+  "manager": {
+    "enabled": true,
+    "url": "wss://manager.example.com:8443/ws/node",
+    "cert_fingerprint": "ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89"
+  },
+  "flows": [
+    {
+      "id": "tunnel-feed",
+      "name": "Feed via Tunnel",
+      "enabled": true,
+      "input": {
+        "type": "srt",
+        "mode": "listener",
+        "local_addr": "0.0.0.0:9000",
+        "latency_ms": 200
+      },
+      "outputs": [
+        {
+          "type": "udp",
+          "id": "tunnel-out",
+          "name": "To Tunnel Egress",
+          "dest_addr": "127.0.0.1:9100"
+        }
+      ]
+    }
+  ],
+  "tunnels": [
+    {
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "name": "Stadium to Studio",
+      "enabled": true,
+      "protocol": "udp",
+      "mode": "relay",
+      "direction": "egress",
+      "local_addr": "0.0.0.0:9100",
+      "relay_addr": "relay.example.com:4433",
+      "tunnel_encryption_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "tunnel_bind_secret": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
     }
   ]
 }

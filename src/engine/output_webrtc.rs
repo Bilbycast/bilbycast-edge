@@ -19,11 +19,18 @@ use crate::stats::collector::OutputStatsAccumulator;
 use super::packet::RtpPacket;
 
 /// Spawn a WebRTC output task (WHIP client or WHEP server depending on config mode).
+///
+/// For WHEP server mode, `session_rx` must be provided — it receives SDP offers
+/// from the HTTP handler (via `WebrtcSessionRegistry`) and spawns per-viewer
+/// send tasks. The corresponding sender is stored in `FlowRuntime::whep_session_tx`
+/// and registered with the session registry after flow creation.
 pub fn spawn_webrtc_output(
     config: WebrtcOutputConfig,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     output_stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
+    #[cfg(feature = "webrtc")]
+    session_rx: Option<tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>>,
 ) -> JoinHandle<()> {
     let rx = broadcast_tx.subscribe();
 
@@ -37,16 +44,21 @@ pub fn spawn_webrtc_output(
                 })
             }
             WebrtcOutputMode::WhepServer => {
-                // WHEP server mode: the actual session creation is driven by
-                // API POST requests. This task just keeps the output alive
-                // and tracks stats. Individual viewer sessions are spawned
-                // by the session registry.
+                let broadcast_tx_clone = broadcast_tx.clone();
                 tokio::spawn(async move {
                     tracing::info!(
                         "WebRTC/WHEP server output '{}' started, waiting for viewers at /api/v1/flows/.../whep",
                         config.id,
                     );
-                    webrtc_stub_loop(&config, rx, output_stats, cancel).await;
+                    if let Some(session_rx) = session_rx {
+                        whep_server_loop(config, broadcast_tx_clone, rx, output_stats, cancel, session_rx).await;
+                    } else {
+                        tracing::warn!(
+                            "WHEP server output '{}' has no session channel — viewers cannot connect",
+                            config.id,
+                        );
+                        webrtc_stub_loop(&config, rx, output_stats, cancel).await;
+                    }
                 })
             }
         }
@@ -96,6 +108,209 @@ async fn webrtc_stub_loop(
             }
         }
     }
+}
+
+/// WHEP server loop — listens for viewer session requests from the HTTP handler
+/// and spawns per-viewer send tasks that subscribe to the broadcast channel.
+#[cfg(feature = "webrtc")]
+async fn whep_server_loop(
+    config: WebrtcOutputConfig,
+    broadcast_tx: broadcast::Sender<RtpPacket>,
+    mut rx: broadcast::Receiver<RtpPacket>,
+    stats: Arc<OutputStatsAccumulator>,
+    cancel: CancellationToken,
+    mut session_rx: tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>,
+) {
+    use super::webrtc::session::{SessionConfig, WebrtcSession};
+
+    let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+    let public_ip = config.public_ip.as_ref().and_then(|ip| ip.parse().ok());
+    let session_config = SessionConfig { bind_addr, public_ip };
+
+    loop {
+        // Wait for a viewer to connect via WHEP
+        let msg = tokio::select! {
+            _ = cancel.cancelled() => break,
+            msg = session_rx.recv() => match msg {
+                Some(m) => m,
+                None => break, // Channel closed
+            },
+            // Keep consuming broadcast packets while waiting so we don't lag
+            result = rx.recv() => {
+                match result {
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        stats.packets_dropped.fetch_add(n, Ordering::Relaxed);
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        };
+
+        tracing::info!("WHEP viewer connecting to output '{}'", config.id);
+
+        // Create WebRTC session for this viewer
+        let mut session = match WebrtcSession::new(&session_config).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("WHEP output '{}': failed to create session: {}", config.id, e);
+                let _ = msg.reply.send(Err(e));
+                continue;
+            }
+        };
+
+        // Accept the viewer's SDP offer (recvonly from viewer's perspective)
+        let answer = match session.accept_offer(&msg.offer_sdp) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!("WHEP output '{}': failed to accept SDP offer: {}", config.id, e);
+                let _ = msg.reply.send(Err(e));
+                continue;
+            }
+        };
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let _ = msg.reply.send(Ok((answer, session_id.clone())));
+
+        // Spawn a per-viewer send task
+        let viewer_rx = broadcast_tx.subscribe();
+        let viewer_cancel = cancel.child_token();
+        let viewer_stats = stats.clone();
+        let output_id = config.id.clone();
+        let video_only = config.video_only;
+
+        tokio::spawn(async move {
+            whep_viewer_loop(
+                &output_id,
+                &session_id,
+                session,
+                viewer_rx,
+                viewer_stats,
+                viewer_cancel,
+                video_only,
+            ).await;
+        });
+    }
+
+    tracing::info!("WHEP server output '{}' stopped", config.id);
+}
+
+/// Per-viewer send loop: demux TS → packetize H.264 → send via WebRTC to one viewer.
+#[cfg(feature = "webrtc")]
+async fn whep_viewer_loop(
+    output_id: &str,
+    session_id: &str,
+    mut session: super::webrtc::session::WebrtcSession,
+    mut rx: broadcast::Receiver<RtpPacket>,
+    stats: Arc<OutputStatsAccumulator>,
+    cancel: CancellationToken,
+    video_only: bool,
+) {
+    use super::ts_parse::strip_rtp_header;
+    use super::webrtc::ts_demux::TsDemuxer;
+    use super::webrtc::rtp_h264::H264Packetizer;
+    use super::webrtc::session::SessionEvent;
+    use str0m::media::MediaTime;
+    use std::time::Instant;
+
+    // Wait for ICE+DTLS to complete
+    loop {
+        let event = session.poll_event(&cancel).await;
+        match event {
+            SessionEvent::Connected => {
+                tracing::info!("WHEP viewer '{}' connected on output '{}'", session_id, output_id);
+                break;
+            }
+            SessionEvent::Disconnected => {
+                tracing::info!("WHEP viewer '{}' disconnected during setup", session_id);
+                return;
+            }
+            _ => continue,
+        }
+    }
+
+    // Get the video MID and PT
+    let video_mid = match session.video_mid {
+        Some(mid) => mid,
+        None => {
+            tracing::error!("WHEP viewer '{}': no video MID negotiated", session_id);
+            return;
+        }
+    };
+    let video_pt = match session.get_pt(video_mid) {
+        Some(pt) => pt,
+        None => {
+            tracing::error!("WHEP viewer '{}': no video PT negotiated", session_id);
+            return;
+        }
+    };
+
+    let _ = video_only; // TODO: handle audio MID when audio support is added
+
+    // Send loop: demux TS → packetize H.264 → send via str0m
+    let mut demuxer = TsDemuxer::new();
+    let mut rtp_seq: u16 = 0;
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+
+            result = rx.recv() => {
+                match result {
+                    Ok(packet) => {
+                        let payload = strip_rtp_header(&packet);
+                        if payload.is_empty() { continue; }
+
+                        let frames = demuxer.demux(payload);
+                        for frame in frames {
+                            match frame {
+                                super::webrtc::ts_demux::DemuxedFrame::H264 { nalus, pts, .. } => {
+                                    let nalu_count = nalus.len();
+                                    for (i, nalu) in nalus.iter().enumerate() {
+                                        let is_last = i == nalu_count - 1;
+                                        let rtp_payloads = H264Packetizer::packetize(nalu, is_last);
+                                        for rtp_payload in &rtp_payloads {
+                                            let media_time = MediaTime::new(pts, str0m::media::Frequency::NINETY_KHZ);
+                                            if let Err(e) = session.write_media(
+                                                video_mid,
+                                                video_pt,
+                                                Instant::now(),
+                                                media_time,
+                                                &rtp_payload.data,
+                                            ) {
+                                                tracing::debug!("WHEP viewer '{}' write error: {}", session_id, e);
+                                            }
+                                            stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                            stats.bytes_sent.fetch_add(rtp_payload.data.len() as u64, Ordering::Relaxed);
+                                            rtp_seq = rtp_seq.wrapping_add(1);
+                                        }
+                                    }
+                                }
+                                super::webrtc::ts_demux::DemuxedFrame::Opus => {
+                                    // TODO: Send Opus via audio MID
+                                }
+                                super::webrtc::ts_demux::DemuxedFrame::Aac { .. } => {
+                                    // AAC not supported in WebRTC — skip
+                                }
+                            }
+                        }
+
+                        // Drive str0m (send any queued output)
+                        while let Ok(str0m::Output::Transmit(t)) = session.rtc_poll_output() {
+                            let _ = session.send_udp(&t).await;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        stats.packets_dropped.fetch_add(n, Ordering::Relaxed);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+
+    tracing::info!("WHEP viewer '{}' disconnected from output '{}'", session_id, output_id);
 }
 
 /// WHIP client output loop — pushes media to an external WHIP endpoint.

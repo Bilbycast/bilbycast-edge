@@ -13,6 +13,8 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
 - [TLS Configuration](#tls-configuration)
 - [Auth Configuration](#auth-configuration)
 - [Monitor Configuration](#monitor-configuration)
+- [Manager Configuration](#manager-configuration)
+- [Tunnel Configuration](#tunnel-configuration)
 - [Flow Configuration](#flow-configuration)
 - [Input Types](#input-types)
   - [RTP Input](#rtp-input)
@@ -150,12 +152,14 @@ If neither file exists at startup, an empty default configuration is used. Both 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `version` | integer | Yes | - | Schema version. Currently must be `1`. |
+| `node_id` | string | No | Auto-generated | Persistent UUID v4 identifying this edge node. Auto-generated on first startup and saved to config. Used as the NMOS IS-04 Node ID. |
 | `device_name` | string | No | `null` | Optional human-readable label for this edge node (e.g. "Studio-A Encoder"). Max 256 characters. |
 | `setup_enabled` | boolean | No | `true` | When true, the browser-based setup wizard is accessible at `/setup`. Set to false to disable after provisioning. |
 | `server` | object | Yes | - | API server configuration. |
 | `monitor` | object | No | `null` | Web monitoring dashboard configuration. |
-| `manager` | object | No | `null` | Manager WebSocket connection configuration. |
-| `flows` | array | No | `[]` | List of flow configurations. |
+| `manager` | object | No | `null` | Manager WebSocket connection configuration. See [Manager Configuration](#manager-configuration). |
+| `flows` | array | No | `[]` | List of flow configurations. See [Flow Configuration](#flow-configuration). |
+| `tunnels` | array | No | `[]` | List of IP tunnel configurations. See [Tunnel Configuration](#tunnel-configuration). |
 
 ---
 
@@ -178,14 +182,14 @@ The `server` object controls the API server listener.
 |-------|------|----------|---------|-------------|
 | `listen_addr` | string | Yes | `"0.0.0.0"` | IP address to bind the API server to. Use `"0.0.0.0"` for all interfaces or a specific IP. |
 | `listen_port` | integer | Yes | `8080` | TCP port for the API server. |
-| `tls` | object | No | `null` | TLS configuration for HTTPS. Requires the `tls` Cargo feature. |
+| `tls` | object | No | `null` | TLS configuration for HTTPS (`tls` feature enabled by default). |
 | `auth` | object | No | `null` | OAuth 2.0 / JWT authentication configuration. When absent or `enabled: false`, all endpoints are open. |
 
 ---
 
 ## TLS Configuration
 
-Optional sub-object of `server`. Requires building with `--features tls`.
+Optional sub-object of `server`. The `tls` feature is enabled by default.
 
 ```json
 {
@@ -264,6 +268,129 @@ Optional top-level object. When present, bilbycast-edge starts a second HTTP ser
 | `listen_port` | integer | Yes | TCP port for the dashboard. Must differ from `server.listen_port` if the same `listen_addr` is used. |
 
 **Validation:** The monitor address must differ from the API server address (same IP + same port is rejected).
+
+---
+
+## Manager Configuration
+
+Optional connection to a bilbycast-manager instance for centralized monitoring and remote control. All communication uses an outbound WebSocket connection from the edge to the manager — no inbound connections are required, making this work behind NAT and firewalls.
+
+```json
+{
+  "manager": {
+    "enabled": true,
+    "url": "wss://manager-host:8443/ws/node",
+    "accept_self_signed_cert": false,
+    "cert_fingerprint": "ab:cd:ef:01:23:45:67:89:..."
+  }
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `enabled` | boolean | No | `false` | Enable the manager connection. |
+| `url` | string | Yes (if enabled) | - | Manager WebSocket URL. Must use `wss://` (TLS required). Example: `"wss://manager-host:8443/ws/node"`. Max 2048 characters. |
+| `accept_self_signed_cert` | boolean | No | `false` | Accept self-signed TLS certificates from the manager. **Dev/testing only** — disables all TLS validation. Requires `BILBYCAST_ALLOW_INSECURE=1` environment variable as a safety guard. |
+| `cert_fingerprint` | string | No | `null` | SHA-256 fingerprint of the manager's TLS certificate for certificate pinning. Format: hex with colons, e.g. `"ab:cd:ef:01:23:..."`. When set, connections to servers presenting a different certificate are rejected, even if the certificate is CA-signed. Protects against compromised CAs. The server's fingerprint is logged on first connection. |
+| `registration_token` | string | No | `null` | One-time registration token from the manager. Used on first connection only. After successful registration, the token is cleared and replaced by `node_id` + `node_secret`. **Stored in `secrets.json`.** |
+| `node_id` | string | No | `null` | Persistent node ID assigned by the manager during registration. Saved automatically. |
+| `node_secret` | string | No | `null` | Persistent node secret assigned by the manager during registration. **Stored in `secrets.json`** (encrypted at rest). |
+
+### Registration Flow
+
+1. Create a node in the manager UI — you receive a one-time registration token.
+2. Provide the token via the setup wizard (`http://<edge-ip>:8080/setup`) or in `secrets.json`.
+3. Start the edge. It connects to the manager, sends the token, and receives `node_id` + `node_secret`.
+4. Credentials are saved automatically: `node_id` to `config.json`, `node_secret` to `secrets.json`.
+5. The registration token is cleared. Future connections use `node_id` + `node_secret`.
+6. If the connection drops, the edge auto-reconnects with exponential backoff (1s to 60s).
+
+### Validation Rules
+
+- `url` must start with `wss://` (plaintext `ws://` is rejected).
+- `url` max 2048 characters.
+- `registration_token` max 4096 characters.
+- `accept_self_signed_cert: true` is rejected unless `BILBYCAST_ALLOW_INSECURE=1` is set.
+
+---
+
+## Tunnel Configuration
+
+IP tunnels create encrypted point-to-point links between edge nodes, either through a bilbycast-relay server (for NAT traversal) or directly via QUIC (when one edge has a public IP).
+
+### Relay Mode
+
+Both edges connect outbound to a bilbycast-relay server. The relay pairs them by tunnel UUID and forwards traffic. End-to-end encryption ensures the relay cannot read payloads.
+
+```json
+{
+  "tunnels": [
+    {
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "name": "Stadium to Studio",
+      "protocol": "udp",
+      "mode": "relay",
+      "direction": "egress",
+      "local_addr": "0.0.0.0:9000",
+      "relay_addr": "relay.example.com:4433",
+      "tunnel_encryption_key": "0123456789abcdef...",
+      "tunnel_bind_secret": "fedcba9876543210..."
+    }
+  ]
+}
+```
+
+### Direct Mode
+
+One edge has a public IP. Direct QUIC connection between edges — no relay needed.
+
+```json
+{
+  "tunnels": [
+    {
+      "id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+      "name": "Direct Link",
+      "protocol": "tcp",
+      "mode": "direct",
+      "direction": "ingress",
+      "local_addr": "127.0.0.1:9000",
+      "direct_listen_addr": "0.0.0.0:4433",
+      "tunnel_psk": "abcdef0123456789..."
+    }
+  ]
+}
+```
+
+### Tunnel Fields
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `id` | string | Yes | - | Unique tunnel identifier. Must be a valid UUID. Both edges in a tunnel pair must use the same ID. |
+| `name` | string | Yes | - | Human-readable name. |
+| `enabled` | boolean | No | `true` | Whether the tunnel is active. |
+| `protocol` | string | Yes | - | `"tcp"` (reliable, ordered — QUIC streams) or `"udp"` (unreliable — QUIC datagrams, best for SRT and media). |
+| `mode` | string | Yes | - | `"relay"` (via relay server) or `"direct"` (QUIC peer-to-peer). |
+| `direction` | string | Yes | - | `"ingress"` (receives tunnel traffic, forwards to `local_addr`) or `"egress"` (listens on `local_addr`, sends into tunnel). |
+| `local_addr` | string | Yes | - | For **egress**: listen address for local traffic to tunnel (e.g. `"0.0.0.0:9000"`). For **ingress**: forward destination for received traffic (e.g. `"127.0.0.1:9000"`). |
+| `relay_addr` | string | Relay mode | `null` | Relay server QUIC address (e.g. `"relay.example.com:4433"`). Required for relay mode. |
+| `tunnel_encryption_key` | string | Relay mode | `null` | End-to-end ChaCha20-Poly1305 encryption key. Hex-encoded, exactly 64 chars (32 bytes). Required for relay mode. Both edges must share the same key. **Stored in `secrets.json`.** |
+| `tunnel_bind_secret` | string | No | `null` | HMAC-SHA256 bind authentication secret. Hex-encoded, exactly 64 chars. Proves authorization to bind on the relay. **Stored in `secrets.json`.** |
+| `peer_addr` | string | Direct egress | `null` | Remote peer QUIC address (e.g. `"203.0.113.50:4433"`). Required for direct mode, egress direction. |
+| `direct_listen_addr` | string | Direct ingress | `null` | QUIC listen address (e.g. `"0.0.0.0:4433"`). Required for direct mode, ingress direction. |
+| `tunnel_psk` | string | No | `null` | Pre-shared key for direct mode authentication. Hex-encoded, 64 chars. Both edges must share the same PSK. **Stored in `secrets.json`.** |
+| `tls_cert_pem` | string | No | Auto-generated | TLS certificate PEM for direct mode listener. Auto-generated if absent. **Stored in `secrets.json`.** |
+| `tls_key_pem` | string | No | Auto-generated | TLS private key PEM for direct mode listener. **Stored in `secrets.json`.** |
+
+### Tunnel Validation Rules
+
+- `id` must be a valid UUID.
+- `relay_addr` required when `mode` is `"relay"`.
+- `tunnel_encryption_key` required for relay mode; must be exactly 64 hex characters.
+- `tunnel_bind_secret` must be exactly 64 hex characters if present.
+- `peer_addr` required for direct mode egress.
+- `direct_listen_addr` required for direct mode ingress.
+- `tunnel_psk` must be exactly 64 hex characters if present.
+- All address fields must be valid socket addresses.
 
 ---
 
@@ -437,7 +564,7 @@ Pulls H.264 or H.265/HEVC video and AAC audio from RTSP sources (IP cameras, med
 
 ### WebRTC/WHIP Input
 
-Accepts WebRTC contributions from publishers (OBS, browsers) via the WHIP protocol (RFC 9725). Requires the `webrtc` cargo feature.
+Accepts WebRTC contributions from publishers (OBS, browsers) via the WHIP protocol (RFC 9725). The `webrtc` feature is enabled by default.
 
 ```json
 {
@@ -458,7 +585,7 @@ Publishers POST an SDP offer to `/api/v1/flows/{flow_id}/whip` and receive an SD
 
 ### WHEP Input
 
-Pulls media from an external WHEP server. The edge acts as a WHEP client. Requires the `webrtc` cargo feature.
+Pulls media from an external WHEP server. The edge acts as a WHEP client. The `webrtc` feature is enabled by default.
 
 ```json
 {
@@ -607,7 +734,7 @@ Publishes to an RTMP/RTMPS server (e.g., Twitch, YouTube Live, Facebook Live). D
 | `type` | string | Yes | - | Must be `"rtmp"`. |
 | `id` | string | Yes | - | Unique output ID. Cannot be empty. |
 | `name` | string | Yes | - | Human-readable display name. |
-| `dest_url` | string | Yes | - | RTMP server URL. Must start with `rtmp://` or `rtmps://`. RTMPS requires the `tls` Cargo feature. |
+| `dest_url` | string | Yes | - | RTMP server URL. Must start with `rtmp://` or `rtmps://`. RTMPS requires the `tls` feature (enabled by default). |
 | `stream_key` | string | Yes | - | Stream key for authentication with the RTMP server. Cannot be empty. |
 | `reconnect_delay_secs` | integer | No | `5` | Seconds to wait before reconnecting after a failure. Must be > 0. |
 | `max_reconnect_attempts` | integer | No | `null` (unlimited) | Maximum reconnection attempts. When `null`, reconnects indefinitely. |
@@ -647,7 +774,7 @@ Segments MPEG-2 TS data and uploads via HTTP for HLS ingest (e.g., YouTube HLS).
 
 ### WebRTC Output
 
-Supports two modes: WHIP client (push to external endpoint) and WHEP server (serve viewers). Requires the `webrtc` cargo feature.
+Supports two modes: WHIP client (push to external endpoint) and WHEP server (serve viewers). The `webrtc` feature is enabled by default.
 
 **WHIP Client mode** — push to an external WHIP endpoint:
 

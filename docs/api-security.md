@@ -203,10 +203,10 @@ bilbycast-edge supports two roles:
 
 ## TLS/HTTPS Setup
 
-TLS support requires building bilbycast-edge with the `tls` Cargo feature:
+TLS support is included in the default build (the `tls` feature is enabled by default):
 
 ```bash
-cargo build --release --features tls
+cargo build --release
 ```
 
 ### Generating self-signed certificates (development)
@@ -405,8 +405,8 @@ curl http://localhost:8080/api/v1/flows
 ### Step 6: (Optional) Add TLS
 
 ```bash
-# Build with TLS support
-cargo build --release --features tls
+# Build (TLS is included by default)
+cargo build --release
 
 # Generate certs
 openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes \
@@ -649,7 +649,7 @@ Note: Query parameter authentication is less secure than headers because tokens 
 - Use CA-signed certificates in production (Let's Encrypt is free and automated).
 - Set up certificate auto-renewal (e.g., certbot with a cron job).
 - Use port 8443 (or 443 with appropriate permissions) for HTTPS.
-- The `tls` feature uses `rustls`, which supports TLS 1.2 and 1.3 only (no legacy TLS 1.0/1.1).
+- TLS uses `rustls` (enabled by default), which supports TLS 1.2 and 1.3 only (no legacy TLS 1.0/1.1).
 
 ### Token lifetime
 

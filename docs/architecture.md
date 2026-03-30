@@ -166,7 +166,7 @@
   │
   ▼
   ┌────────────────────────────────────────┐
-  │  Layer 1: TLS (optional, feature=tls)  │
+  │  Layer 1: TLS (default on)              │
   │  rustls + ring crypto                  │
   └────────────┬───────────────────────────┘
                ▼

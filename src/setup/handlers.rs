@@ -196,6 +196,7 @@ pub async fn apply_setup(
         enabled: true,
         url: manager_url,
         accept_self_signed_cert: payload.accept_self_signed_cert.unwrap_or(false),
+        cert_fingerprint: config.manager.as_ref().and_then(|m| m.cert_fingerprint.clone()),
         registration_token,
         node_id: config.manager.as_ref().and_then(|m| m.node_id.clone()),
         node_secret: config.manager.as_ref().and_then(|m| m.node_secret.clone()),

@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-edge"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 license = "Elastic-2.0"
@@ -54,11 +54,15 @@ sha2 = "0.10.9"
 base64 = "0.22.1"
 serde_urlencoded = "0.7.1"
 
+# Secrets encryption at rest (AES-256-GCM for secrets.json)
+aes-gcm = "0.10"
+
 # UUID for flow IDs
 uuid = { version = "1.22.0", features = ["v4", "v5", "serde"] }
 
 # WebSocket client for manager connection
 tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
+webpki-roots = "0.26"
 futures-util = "0.3.32"
 url = "2.5.8"
 
@@ -76,7 +80,7 @@ rustls-pemfile = "2.2.0"
 rcgen = "0.14.7"
 
 [features]
-default = []
+default = ["tls", "webrtc"]
 # Enable TLS (HTTPS on API + RTMPS) support via rustls/tokio-rustls/axum-server.
 tls = ["dep:tokio-rustls", "dep:axum-server"]
 # Enable WebRTC WHIP/WHEP input and output via str0m (pure Rust, sans-I/O).

@@ -306,8 +306,9 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bilbycast-edge"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "axum",
  "axum-server",
@@ -347,6 +348,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

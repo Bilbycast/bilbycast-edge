@@ -24,6 +24,17 @@ fn register_whip_if_needed(state: &AppState, runtime: &crate::engine::flow::Flow
     }
 }
 
+/// Register a WHEP output channel with the WebRTC session registry (if applicable).
+#[cfg(feature = "webrtc")]
+fn register_whep_if_needed(state: &AppState, runtime: &crate::engine::flow::FlowRuntime) {
+    if let Some((tx, bearer_token)) = &runtime.whep_session_tx {
+        if let Some(ref registry) = state.webrtc_sessions {
+            registry.register_whep_output(&runtime.config.id, tx.clone(), bearer_token.clone());
+            tracing::info!("Registered WHEP output for flow '{}'", runtime.config.id);
+        }
+    }
+}
+
 /// `GET /api/v1/flows` -- List all configured flows.
 ///
 /// Returns a [`FlowListResponse`] containing a summary of every flow in the current
@@ -104,6 +115,7 @@ pub async fn create_flow(
             Ok(_runtime) => {
                 #[cfg(feature = "webrtc")]
                 register_whip_if_needed(&state, &_runtime);
+                register_whep_if_needed(&state, &_runtime);
             }
             Err(e) => tracing::warn!("Flow '{}' persisted but failed to start: {e}", flow.id),
         }
@@ -158,6 +170,7 @@ pub async fn update_flow(
             Ok(_runtime) => {
                 #[cfg(feature = "webrtc")]
                 register_whip_if_needed(&state, &_runtime);
+                register_whep_if_needed(&state, &_runtime);
             }
             Err(e) => tracing::warn!("Flow '{}' updated but failed to restart: {e}", flow_id),
         }
@@ -239,6 +252,7 @@ pub async fn start_flow(
 
     #[cfg(feature = "webrtc")]
     register_whip_if_needed(&state, &runtime);
+    register_whep_if_needed(&state, &runtime);
     let _ = runtime; // suppress unused warning when webrtc feature is off
 
     tracing::info!("Started flow '{}'", flow_id);
@@ -323,6 +337,7 @@ pub async fn restart_flow(
 
     #[cfg(feature = "webrtc")]
     register_whip_if_needed(&state, &runtime);
+    register_whep_if_needed(&state, &runtime);
     let _ = runtime;
 
     tracing::info!("Restarted flow '{}'", flow_id);
@@ -480,6 +495,8 @@ pub async fn replace_config(
                 Ok(_runtime) => {
                     #[cfg(feature = "webrtc")]
                     register_whip_if_needed(&state, &_runtime);
+                    #[cfg(feature = "webrtc")]
+                    register_whep_if_needed(&state, &_runtime);
                 }
                 Err(e) => tracing::error!("Failed to start flow '{}' after config replace: {e}", flow.id),
             }
@@ -529,6 +546,8 @@ pub async fn reload_config(
                 Ok(_runtime) => {
                     #[cfg(feature = "webrtc")]
                     register_whip_if_needed(&state, &_runtime);
+                    #[cfg(feature = "webrtc")]
+                    register_whep_if_needed(&state, &_runtime);
                 }
                 Err(e) => tracing::error!("Failed to start flow '{}' after config reload: {e}", flow.id),
             }

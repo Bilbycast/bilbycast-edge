@@ -11,6 +11,7 @@
 //! - [`persistence`] -- Load/save config as JSON with atomic file writes
 //! - [`validation`] -- Validates config fields (addresses, SRT modes, FEC params, etc.)
 
+pub mod crypto;
 pub mod models;
 pub mod persistence;
 pub mod secrets;
