@@ -2,8 +2,8 @@
 
 bilbycast-edge is configured via two JSON files:
 
-- **`config.json`** (default: `./config.json`) — Operational configuration: server addresses, flow definitions, tunnel routing, monitor settings. This file is safe to inspect, back up, and version-control. When the manager requests the node's config (`GetConfig`), only this file's content is returned — secrets are never included.
-- **`secrets.json`** (auto-derived: same directory as `config.json`) — All sensitive credentials: manager auth secrets, tunnel encryption keys, SRT passphrases, RTMP stream keys, API auth config (JWT secret, client secrets), TLS cert/key paths. This file is written with `0600` permissions (owner-only) on Unix and **never leaves the node**.
+- **`config.json`** (default: `./config.json`) — Operational configuration: server addresses, flow definitions (including user-configured parameters like SRT passphrases, RTSP credentials, RTMP keys, bearer tokens), tunnel routing, monitor settings. When the manager requests the node's config (`GetConfig`), this file's content is returned with infrastructure secrets stripped.
+- **`secrets.json`** (auto-derived: same directory as `config.json`) — Infrastructure credentials only: manager auth secrets, tunnel encryption keys, API auth config (JWT secret, client secrets), TLS cert/key paths. This file is written with `0600` permissions (owner-only) on Unix and **never leaves the node**. Flow-level user parameters (SRT passphrases, RTSP credentials, RTMP stream keys, WebRTC bearer tokens, HLS auth tokens) stay in `config.json` so they are visible in the manager UI and survive round-trip config updates.
 
 At runtime, both files are merged into a single `AppConfig` in memory. The split is purely a persistence and serialization boundary — existing code that reads config works unchanged.
 
@@ -21,7 +21,7 @@ Both `config.json` and `secrets.json` are written to disk immediately after any 
 
 - **First startup** — auto-generated `node_id` is saved to `config.json`
 - **Manager registration** — `node_id` saved to `config.json`, `node_secret` saved to `secrets.json` (registration token cleared)
-- **REST API flow operations** — creating, updating, or deleting flows via the local API (flow secrets like SRT passphrases go to `secrets.json`)
+- **REST API flow operations** — creating, updating, or deleting flows via the local API (flow parameters including SRT passphrases, RTSP credentials, RTMP keys stay in `config.json`)
 - **Manager `update_config` command** — operational fields update `config.json`, existing secrets are preserved in `secrets.json`
 - **Manager `create_tunnel` command** — tunnel routing goes to `config.json`, tunnel encryption keys go to `secrets.json`
 - **Setup wizard** — operational settings go to `config.json`, registration token goes to `secrets.json`

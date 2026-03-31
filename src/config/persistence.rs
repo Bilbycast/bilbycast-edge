@@ -71,7 +71,21 @@ pub fn load_config_split(config_path: &Path, secrets_path: &Path) -> Result<AppC
     if secrets_path.exists() {
         // Normal path: load secrets and merge into config
         let secrets = load_secrets(secrets_path, &machine_seed)?;
+
+        // Check if secrets.json has legacy flow secrets that need migration
+        let has_legacy_flows = !secrets.flows.is_empty();
+
         secrets.merge_into(&mut config);
+
+        if has_legacy_flows {
+            // Re-save both files: flow params now go into config.json,
+            // and secrets.json will no longer contain flow entries.
+            tracing::info!(
+                "Migrating flow secrets from secrets.json back to config.json"
+            );
+            save_config_split(config_path, secrets_path, &config)?;
+            tracing::info!("Flow secrets migration complete");
+        }
     } else if config_path.exists() && has_secrets(&config) {
         // Migration: config.json has secrets but no secrets.json yet
         tracing::info!(

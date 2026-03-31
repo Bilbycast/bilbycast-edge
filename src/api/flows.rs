@@ -455,9 +455,9 @@ pub async fn get_config(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<AppConfig>>, ApiError> {
     let config = state.config.read().await;
-    // Strip secrets before returning — secrets never leave the node via API
+    // Mask secrets for API display — shows that secrets are configured without exposing them
     let mut safe_config = config.clone();
-    safe_config.strip_secrets();
+    safe_config.mask_secrets();
     Ok(Json(ApiResponse::ok(safe_config)))
 }
 
@@ -504,9 +504,9 @@ pub async fn replace_config(
     }
 
     tracing::info!("Replaced entire config with {} flow(s)", config.flows.len());
-    // Strip secrets from the response
+    // Mask secrets for API display
     let mut safe_config = new_config;
-    safe_config.strip_secrets();
+    safe_config.mask_secrets();
     Ok(Json(ApiResponse::ok(safe_config)))
 }
 
@@ -558,8 +558,8 @@ pub async fn reload_config(
         "Reloaded config from disk with {} flow(s)",
         config.flows.len()
     );
-    // Strip secrets from the response
+    // Mask secrets for API display
     let mut safe_config = new_config;
-    safe_config.strip_secrets();
+    safe_config.mask_secrets();
     Ok(Json(ApiResponse::ok(safe_config)))
 }

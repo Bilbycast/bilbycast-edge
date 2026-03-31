@@ -236,8 +236,9 @@ async fn main() -> anyhow::Result<()> {
     {
         let ws_tx = ws_stats_tx.clone();
         let stats_fm = flow_manager.clone();
+        let stats_config = state.config.clone();
         tokio::spawn(async move {
-            stats_publisher_loop(ws_tx, stats_fm).await;
+            stats_publisher_loop(ws_tx, stats_fm, stats_config).await;
         });
     }
 
@@ -347,7 +348,9 @@ async fn main() -> anyhow::Result<()> {
 async fn stats_publisher_loop(
     ws_tx: broadcast::Sender<String>,
     flow_manager: Arc<FlowManager>,
+    app_config: Arc<RwLock<config::models::AppConfig>>,
 ) {
+    use stats::models::FlowStats;
     use stats::throughput::ThroughputEstimator;
 
     let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -377,11 +380,24 @@ async fn stats_publisher_loop(
             }
         }
 
-        // Broadcast to all WebSocket subscribers (ignore if no subscribers)
-        if !snapshots.is_empty() {
-            if let Ok(json) = serde_json::to_string(&snapshots) {
-                let _ = ws_tx.send(json);
+        // Include configured-but-not-running flows as idle so they remain
+        // visible in the manager UI when stopped (instead of disappearing)
+        {
+            let config = app_config.read().await;
+            for flow_cfg in &config.flows {
+                if !snapshots.iter().any(|s| s.flow_id == flow_cfg.id) {
+                    snapshots.push(FlowStats {
+                        flow_id: flow_cfg.id.clone(),
+                        flow_name: flow_cfg.name.clone(),
+                        ..Default::default()
+                    });
+                }
             }
+        }
+
+        // Broadcast to all WebSocket subscribers (ignore if no subscribers)
+        if let Ok(json) = serde_json::to_string(&snapshots) {
+            let _ = ws_tx.send(json);
         }
     }
 }

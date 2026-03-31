@@ -42,10 +42,10 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
 
 bilbycast-edge reads its configuration from two JSON files:
 
-- **`config.json`** — Operational configuration (specified by `--config`, default: `./config.json`). Contains server settings, flow definitions, tunnel routing — everything except secrets.
-- **`secrets.json`** — Sensitive credentials (auto-derived: same directory as `config.json`). Contains manager auth secrets, tunnel encryption keys, SRT passphrases, RTMP stream keys, API auth config, TLS cert/key paths. Written with `0600` permissions on Unix.
+- **`config.json`** — Operational configuration (specified by `--config`, default: `./config.json`). Contains server settings, flow definitions (including user-configured parameters like SRT passphrases, RTSP credentials, RTMP stream keys, bearer tokens, HLS auth tokens), and tunnel routing.
+- **`secrets.json`** — Infrastructure credentials (auto-derived: same directory as `config.json`). Contains manager auth secrets, tunnel encryption keys, API auth config (JWT secret, client credentials), TLS cert/key paths. Written with `0600` permissions on Unix.
 
-If neither file exists at startup, an empty default configuration is used. Both files are loaded and merged into a single in-memory config, then validated at startup. Changes made through the API or manager commands are automatically persisted — operational fields to `config.json`, secrets to `secrets.json` — using atomic writes (write to temp file, then rename).
+If neither file exists at startup, an empty default configuration is used. Both files are loaded and merged into a single in-memory config, then validated at startup. Changes made through the API or manager commands are automatically persisted — flow configs and operational fields to `config.json`, infrastructure secrets to `secrets.json` — using atomic writes (write to temp file, then rename).
 
 **Migration**: If upgrading from a version that used a single `config.json` with secrets, the node automatically splits them on first startup.
 
@@ -936,15 +936,15 @@ RUST_LOG=bilbycast_edge=debug,tower_http=info bilbycast-edge --config config.jso
 
 ## Config Persistence Behavior
 
-bilbycast-edge automatically persists configuration changes to disk when flows are modified through the API. Operational fields go to `config.json`, secrets (passphrases, tokens, keys) go to `secrets.json`:
+bilbycast-edge automatically persists configuration changes to disk when flows are modified through the API. Flow configs (including user parameters like SRT passphrases, RTSP credentials, RTMP keys) go to `config.json`, infrastructure secrets go to `secrets.json`:
 
-- **Create flow** (`POST /api/v1/flows`) -- Appends the new flow and saves (secrets like SRT passphrase go to `secrets.json`).
+- **Create flow** (`POST /api/v1/flows`) -- Appends the new flow and saves (flow parameters stay in `config.json`).
 - **Update flow** (`PUT /api/v1/flows/{id}`) -- Replaces the flow in-place and saves.
-- **Delete flow** (`DELETE /api/v1/flows/{id}`) -- Removes the flow and saves (orphaned secrets cleaned up automatically).
+- **Delete flow** (`DELETE /api/v1/flows/{id}`) -- Removes the flow and saves.
 - **Add output** (`POST /api/v1/flows/{id}/outputs`) -- Appends the output and saves.
 - **Remove output** (`DELETE /api/v1/flows/{id}/outputs/{oid}`) -- Removes the output and saves.
 - **Replace config** (`PUT /api/v1/config`) -- Replaces the entire config and saves.
-- **Get config** (`GET /api/v1/config`) -- Returns the config with all secrets stripped. Secrets are never exposed via API responses.
+- **Get config** (`GET /api/v1/config`) -- Returns the config with infrastructure secrets stripped. Flow parameters (passphrases, credentials, keys) are included in the response.
 
 ### Atomic writes
 

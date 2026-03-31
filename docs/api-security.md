@@ -665,11 +665,12 @@ Note: Query parameter authentication is less secure than headers because tokens 
 
 ### Config file security
 
-- Secrets (JWT secret, client credentials, tunnel encryption keys, SRT passphrases, etc.) are stored in a separate `secrets.json` file, not in `config.json`.
+- Infrastructure secrets (JWT secret, client credentials, tunnel encryption keys, TLS config) are stored in a separate `secrets.json` file, not in `config.json`.
+- Flow-level user parameters (SRT passphrases, RTSP credentials, RTMP stream keys, bearer tokens, HLS auth tokens) stay in `config.json` so they are visible in the manager UI.
 - `secrets.json` is automatically written with `0600` permissions (owner read/write only) on Unix.
-- `config.json` contains only operational configuration (addresses, ports, flow definitions) and is safe to inspect, back up, or version-control.
-- When the manager requests the node's config (`GetConfig`), secrets are stripped before sending — the manager never receives sensitive fields.
-- Config changes via the API (PUT /api/v1/config) are persisted atomically: operational fields to `config.json`, secrets to `secrets.json` (write to temp file, then rename).
+- `config.json` contains operational configuration plus flow parameters. It is safe to inspect and back up (but note it contains user-configured credentials for protocols like SRT and RTSP).
+- When the manager requests the node's config (`GetConfig`), infrastructure secrets are stripped before sending — the manager never receives `node_secret`, tunnel keys, or TLS/auth config. Flow parameters are included for UI visibility.
+- Config changes via the API (PUT /api/v1/config) are persisted atomically: flow configs and operational fields to `config.json`, infrastructure secrets to `secrets.json` (write to temp file, then rename).
 - The auth section is not modifiable via the API -- it can only be changed by editing `secrets.json` and restarting.
 
 ---

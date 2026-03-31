@@ -471,15 +471,18 @@ async fn try_connect(
                             .map(|ts| serde_json::to_value(ts).unwrap_or_default())
                             .collect();
 
+                        let flows_value = serde_json::from_str::<serde_json::Value>(&stats_json).unwrap_or_default();
+                        let total_flows = flows_value.as_array().map_or(0, |a| a.len());
+
                         let envelope = serde_json::json!({
                             "type": "stats",
                             "timestamp": chrono::Utc::now().to_rfc3339(),
                             "payload": {
-                                "flows": serde_json::from_str::<serde_json::Value>(&stats_json).unwrap_or_default(),
+                                "flows": flows_value,
                                 "tunnels": tunnel_statuses,
                                 "uptime_secs": 0,
                                 "active_flows": flow_manager.active_flow_count(),
-                                "total_flows": flow_manager.active_flow_count()
+                                "total_flows": total_flows
                             }
                         });
                         if let Ok(json) = serde_json::to_string(&envelope) {
@@ -686,7 +689,8 @@ async fn handle_manager_message<S>(
             if action_type == "get_config" {
                 tracing::info!("Manager command: get_config");
                 let cfg = app_config.read().await;
-                // Strip secrets before sending — secrets never leave the node
+                // Strip infrastructure secrets (node credentials, TLS, tunnel keys)
+                // before sending — flow parameters are preserved for UI visibility
                 let mut safe_cfg = (*cfg).clone();
                 safe_cfg.strip_secrets();
                 let config_json = serde_json::to_value(&safe_cfg).unwrap_or_default();
@@ -980,9 +984,9 @@ async fn execute_command(
             let mut new_config: AppConfig = serde_json::from_value(action["config"].clone())
                 .map_err(|e| format!("Invalid config: {e}"))?;
 
-            // The manager doesn't have secrets (GetConfig strips them), so
-            // merge the node's existing secrets into the incoming config before
-            // validation and application.
+            // The manager doesn't have infrastructure secrets (GetConfig strips
+            // node credentials, TLS, and tunnel keys), so merge the node's
+            // existing secrets into the incoming config before validation.
             let old_config = app_config.read().await.clone();
             let existing_secrets = SecretsConfig::extract_from(&old_config);
             existing_secrets.merge_into(&mut new_config);

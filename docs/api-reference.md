@@ -939,7 +939,7 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/stats/main-f
 
 ### GET /api/v1/config
 
-Retrieve the running application configuration with secrets stripped. Returns the operational config (addresses, ports, flow definitions, tunnel routing) but never includes sensitive fields such as `node_secret`, SRT passphrases, RTMP stream keys, tunnel encryption keys, JWT secrets, or client credentials.
+Retrieve the running application configuration with infrastructure secrets stripped. Returns the operational config including flow definitions with all user-configured parameters (SRT passphrases, RTSP credentials, RTMP stream keys, bearer tokens). Infrastructure secrets (`node_secret`, tunnel encryption keys, JWT secrets, client credentials, TLS config) are never included.
 
 **Auth:** Requires valid JWT (any role).
 
@@ -973,17 +973,17 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/config
 
 ### PUT /api/v1/config
 
-Replace the entire application configuration atomically. Stops all running flows, replaces the in-memory config, persists to disk (operational fields to `config.json`, secrets to `secrets.json`), and starts all flows with `enabled: true`.
+Replace the entire application configuration atomically. Stops all running flows, replaces the in-memory config, persists to disk (flow configs including user parameters to `config.json`, infrastructure secrets to `secrets.json`), and starts all flows with `enabled: true`.
 
 **Auth:** Requires `admin` role.
 
 **Request body:**
 
-A complete `AppConfig` JSON object (see [Configuration Guide](configuration-guide.md)). May include secrets (e.g., SRT passphrases, auth config) — they will be stored in `secrets.json`.
+A complete `AppConfig` JSON object (see [Configuration Guide](configuration-guide.md)). Flow parameters (SRT passphrases, RTSP credentials, RTMP keys, etc.) are stored in `config.json`. Infrastructure secrets (auth config, TLS) are stored in `secrets.json`.
 
 **Response (200):**
 
-Returns the new configuration with secrets stripped.
+Returns the new configuration with infrastructure secrets stripped (flow parameters preserved).
 
 **Error responses:**
 

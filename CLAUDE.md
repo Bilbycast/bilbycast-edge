@@ -184,8 +184,10 @@ At runtime, both files merge into a single `AppConfig` in memory — all existin
 **Secrets inventory** (fields stored in `secrets.json`):
 - Node-level: `manager.node_secret`, `manager.registration_token`, `server.tls`, `server.auth` (jwt_secret, client credentials)
 - Per-tunnel (keyed by ID): `tunnel_encryption_key`, `tunnel_bind_secret`, `tunnel_psk`, `tls_cert_pem`, `tls_key_pem`
-- Per-flow input: SRT `passphrase`, RTMP `stream_key`, RTSP `username`/`password`, WebRTC `bearer_token`
-- Per-flow output (keyed by ID): SRT `passphrase`, RTMP `stream_key`, HLS `auth_token`, WebRTC `bearer_token`
+
+**Flow parameters in `config.json`** (NOT in secrets.json):
+- SRT `passphrase`, RTMP `stream_key`, RTSP `username`/`password`, WebRTC `bearer_token`, HLS `auth_token`
+- These stay in config.json so they are visible in the manager UI and survive round-trip config updates
 
 **Key implementation files:**
 - `src/config/secrets.rs` — `SecretsConfig` struct, `extract_from()`, `merge_into()`, `has_secrets()`, and `AppConfig::strip_secrets()`
@@ -194,7 +196,7 @@ At runtime, both files merge into a single `AppConfig` in memory — all existin
 
 **Migration**: On first startup after upgrade, if `config.json` contains secrets and `secrets.json` does not exist, the system automatically splits them. Users don't need to take any action.
 
-**When adding new secret fields**: Add the field to the appropriate secrets struct (`InputSecrets`, `OutputSecrets`, `TunnelSecrets`), update `extract_from`/`merge_into`/`strip_secrets`, and update `has_secrets` for migration detection.
+**When adding new infrastructure secret fields**: Add the field to the appropriate secrets struct (`TunnelSecrets` or `SecretsConfig`), update `extract_from`/`merge_into`/`strip_secrets`, and update `has_secrets` for migration detection. Flow-level user parameters (passphrases, credentials, keys) should stay in `config.json`, not `secrets.json`.
 
 ## Key Design Constraints
 

@@ -1,12 +1,17 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Secrets configuration — stored in `secrets.json`, never sent to the manager.
+//! Infrastructure secrets — stored in `secrets.json`, never sent to the manager.
 //!
 //! This module defines the `SecretsConfig` struct and related types that hold
-//! sensitive credentials (keys, tokens, passphrases). At runtime, secrets are
-//! merged into the unified `AppConfig` in memory. On disk, they live in a
-//! separate file with restrictive permissions.
+//! infrastructure credentials (node auth, tunnel keys, TLS/auth config). At
+//! runtime, secrets are merged into the unified `AppConfig` in memory. On disk,
+//! they live in a separate file with restrictive permissions.
+//!
+//! Flow-level user parameters (SRT passphrases, RTSP credentials, RTMP stream
+//! keys, bearer tokens, HLS auth tokens) stay in `config.json` — they are not
+//! treated as secrets. This ensures they are visible in the manager UI and
+//! survive round-trip config updates.
 
 use std::collections::HashMap;
 
@@ -18,6 +23,11 @@ use crate::config::models::{
 };
 
 /// Root secrets configuration, persisted to `secrets.json`.
+///
+/// Only infrastructure secrets live here: node credentials, server TLS/auth,
+/// and tunnel encryption keys. Flow-level user parameters (SRT passphrases,
+/// RTSP credentials, RTMP keys, bearer tokens) stay in `config.json` so they
+/// are visible in the manager UI and survive round-trip config updates.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecretsConfig {
     /// Schema version for forward compatibility.
@@ -44,7 +54,9 @@ pub struct SecretsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tunnels: HashMap<String, TunnelSecrets>,
 
-    // -- Per-flow secrets, keyed by flow ID --
+    // -- Legacy per-flow secrets (v1 migration only) --
+    // Flow secrets were moved back to config.json in v2. This field exists
+    // solely to deserialize old secrets.json files during migration.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub flows: HashMap<String, FlowSecrets>,
 }
@@ -132,32 +144,8 @@ impl TunnelSecrets {
     }
 }
 
-impl InputSecrets {
-    fn is_empty(&self) -> bool {
-        self.passphrase.is_none()
-            && self.redundancy_passphrase.is_none()
-            && self.stream_key.is_none()
-            && self.username.is_none()
-            && self.password.is_none()
-            && self.bearer_token.is_none()
-    }
-}
-
-impl OutputSecrets {
-    fn is_empty(&self) -> bool {
-        self.passphrase.is_none()
-            && self.redundancy_passphrase.is_none()
-            && self.stream_key.is_none()
-            && self.auth_token.is_none()
-            && self.bearer_token.is_none()
-    }
-}
-
-impl FlowSecrets {
-    fn is_empty(&self) -> bool {
-        self.input.as_ref().map_or(true, |i| i.is_empty()) && self.outputs.is_empty()
-    }
-}
+// InputSecrets, OutputSecrets, FlowSecrets structs are retained for
+// deserializing legacy secrets.json files during migration. No methods needed.
 
 impl SecretsConfig {
     /// Returns true if there are any secrets stored.
@@ -170,7 +158,11 @@ impl SecretsConfig {
             && self.flows.is_empty()
     }
 
-    /// Extract all secret fields from an `AppConfig` into a `SecretsConfig`.
+    /// Extract infrastructure secret fields from an `AppConfig` into a `SecretsConfig`.
+    ///
+    /// Flow-level parameters (SRT passphrases, RTSP credentials, RTMP keys, bearer
+    /// tokens) are intentionally kept in `config.json` so they are visible in the
+    /// manager UI and survive round-trip config updates.
     pub fn extract_from(config: &AppConfig) -> Self {
         let mut secrets = SecretsConfig {
             version: 1,
@@ -203,18 +195,17 @@ impl SecretsConfig {
             }
         }
 
-        // Flow secrets
-        for flow in &config.flows {
-            let fs = Self::extract_flow_secrets(flow);
-            if !fs.is_empty() {
-                secrets.flows.insert(flow.id.clone(), fs);
-            }
-        }
+        // Flow secrets are NOT extracted — they stay in config.json
 
         secrets
     }
 
     /// Merge secrets back into an `AppConfig`.
+    ///
+    /// Merges infrastructure secrets (node credentials, TLS, tunnel keys).
+    /// Also handles legacy migration: if `secrets.json` has flow secrets from
+    /// the old format (v1), those are merged back into config so they are
+    /// preserved during the transition.
     pub fn merge_into(&self, config: &mut AppConfig) {
         // Manager secrets
         if let Some(ref mut mgr) = config.manager {
@@ -257,85 +248,23 @@ impl SecretsConfig {
             }
         }
 
-        // Flow secrets
-        for flow in &mut config.flows {
-            if let Some(fs) = self.flows.get(&flow.id) {
-                Self::merge_flow_secrets(fs, flow);
+        // Legacy flow secrets migration: if old secrets.json had flow secrets,
+        // merge them back into config so they are not lost during upgrade.
+        if !self.flows.is_empty() {
+            tracing::info!(
+                "Migrating {} flow secret(s) from secrets.json back to config.json",
+                self.flows.len()
+            );
+            for flow in &mut config.flows {
+                if let Some(fs) = self.flows.get(&flow.id) {
+                    Self::merge_flow_secrets(fs, flow);
+                }
             }
         }
     }
 
-    fn extract_flow_secrets(flow: &FlowConfig) -> FlowSecrets {
-        let input = Self::extract_input_secrets(&flow.input);
-        let mut outputs = HashMap::new();
-        for output in &flow.outputs {
-            let os = Self::extract_output_secrets(output);
-            if !os.is_empty() {
-                outputs.insert(output.id().to_string(), os);
-            }
-        }
-        FlowSecrets {
-            input: if input.is_empty() { None } else { Some(input) },
-            outputs,
-        }
-    }
-
-    fn extract_input_secrets(input: &InputConfig) -> InputSecrets {
-        match input {
-            InputConfig::Srt(srt) => InputSecrets {
-                passphrase: srt.passphrase.clone(),
-                redundancy_passphrase: srt
-                    .redundancy
-                    .as_ref()
-                    .and_then(|r| r.passphrase.clone()),
-                ..Default::default()
-            },
-            InputConfig::Rtmp(rtmp) => InputSecrets {
-                stream_key: rtmp.stream_key.clone(),
-                ..Default::default()
-            },
-            InputConfig::Rtsp(rtsp) => InputSecrets {
-                username: rtsp.username.clone(),
-                password: rtsp.password.clone(),
-                ..Default::default()
-            },
-            InputConfig::Webrtc(webrtc) => InputSecrets {
-                bearer_token: webrtc.bearer_token.clone(),
-                ..Default::default()
-            },
-            InputConfig::Whep(whep) => InputSecrets {
-                bearer_token: whep.bearer_token.clone(),
-                ..Default::default()
-            },
-            InputConfig::Rtp(_) | InputConfig::Udp(_) => InputSecrets::default(),
-        }
-    }
-
-    fn extract_output_secrets(output: &OutputConfig) -> OutputSecrets {
-        match output {
-            OutputConfig::Srt(srt) => OutputSecrets {
-                passphrase: srt.passphrase.clone(),
-                redundancy_passphrase: srt
-                    .redundancy
-                    .as_ref()
-                    .and_then(|r| r.passphrase.clone()),
-                ..Default::default()
-            },
-            OutputConfig::Rtmp(rtmp) => OutputSecrets {
-                stream_key: Some(rtmp.stream_key.clone()),
-                ..Default::default()
-            },
-            OutputConfig::Hls(hls) => OutputSecrets {
-                auth_token: hls.auth_token.clone(),
-                ..Default::default()
-            },
-            OutputConfig::Webrtc(webrtc) => OutputSecrets {
-                bearer_token: webrtc.bearer_token.clone(),
-                ..Default::default()
-            },
-            OutputConfig::Rtp(_) | OutputConfig::Udp(_) => OutputSecrets::default(),
-        }
-    }
+    // Legacy merge functions — used only during migration from old secrets.json
+    // format that stored flow secrets separately.
 
     fn merge_flow_secrets(fs: &FlowSecrets, flow: &mut FlowConfig) {
         if let Some(ref is) = fs.input {
@@ -426,10 +355,12 @@ impl SecretsConfig {
 }
 
 impl AppConfig {
-    /// Remove all secret fields from this config, making it safe to send over the wire.
+    /// Remove infrastructure secret fields from this config, making it safe to send
+    /// to the manager.
     ///
-    /// After calling this, the config contains only operational data (addresses, ports,
-    /// protocols, tuning parameters) with all secrets set to `None` or removed.
+    /// After calling this, node credentials, server TLS/auth, and tunnel encryption
+    /// keys are removed. Flow-level user parameters (SRT passphrases, RTSP credentials,
+    /// RTMP keys, bearer tokens) are preserved so they remain visible in the manager UI.
     pub fn strip_secrets(&mut self) {
         // Manager secrets
         if let Some(ref mut mgr) = self.manager {
@@ -450,65 +381,48 @@ impl AppConfig {
             tunnel.tls_key_pem = None;
         }
 
-        // Flow secrets
-        for flow in &mut self.flows {
-            Self::strip_input_secrets(&mut flow.input);
-            for output in &mut flow.outputs {
-                Self::strip_output_secrets(output);
-            }
-        }
-    }
-
-    fn strip_input_secrets(input: &mut InputConfig) {
-        match input {
-            InputConfig::Srt(srt) => {
-                srt.passphrase = None;
-                if let Some(ref mut red) = srt.redundancy {
-                    red.passphrase = None;
-                }
-            }
-            InputConfig::Rtmp(rtmp) => {
-                rtmp.stream_key = None;
-            }
-            InputConfig::Rtsp(rtsp) => {
-                rtsp.username = None;
-                rtsp.password = None;
-            }
-            InputConfig::Webrtc(webrtc) => {
-                webrtc.bearer_token = None;
-            }
-            InputConfig::Whep(whep) => {
-                whep.bearer_token = None;
-            }
-            InputConfig::Rtp(_) | InputConfig::Udp(_) => {}
-        }
-    }
-
-    fn strip_output_secrets(output: &mut OutputConfig) {
-        match output {
-            OutputConfig::Srt(srt) => {
-                srt.passphrase = None;
-                if let Some(ref mut red) = srt.redundancy {
-                    red.passphrase = None;
-                }
-            }
-            OutputConfig::Rtmp(rtmp) => {
-                // RTMP stream_key is required (non-Option), set to empty
-                rtmp.stream_key = String::new();
-            }
-            OutputConfig::Hls(hls) => {
-                hls.auth_token = None;
-            }
-            OutputConfig::Webrtc(webrtc) => {
-                webrtc.bearer_token = None;
-            }
-            OutputConfig::Rtp(_) | OutputConfig::Udp(_) => {}
-        }
+        // Flow parameters are NOT stripped — they are user-configured values
+        // that need to be visible in the manager UI and survive round-trip updates.
     }
 }
 
-/// Returns true if the given `AppConfig` contains any secrets that should be
-/// split out into `secrets.json`. Used for migration detection.
+impl AppConfig {
+    /// Strip infrastructure secrets for local API display.
+    ///
+    /// Internal secrets (manager credentials, server TLS/auth, tunnel keys)
+    /// are set to `None` — they are never relevant to the user's API view.
+    /// Flow-level parameters are preserved in full — users need to see their
+    /// configured passphrases, credentials, and keys.
+    pub fn mask_secrets(&mut self) {
+        // Manager secrets — internal, always hide
+        if let Some(ref mut mgr) = self.manager {
+            mgr.node_secret = None;
+            mgr.registration_token = None;
+        }
+
+        // Server TLS and auth — internal
+        self.server.tls = None;
+        self.server.auth = None;
+
+        // Tunnel secrets — internal
+        for tunnel in &mut self.tunnels {
+            tunnel.tunnel_encryption_key = None;
+            tunnel.tunnel_bind_secret = None;
+            tunnel.tunnel_psk = None;
+            tunnel.tls_cert_pem = None;
+            tunnel.tls_key_pem = None;
+        }
+
+        // Flow parameters are NOT masked — users need to see their configured
+        // passphrases, credentials, and keys in full.
+    }
+}
+
+/// Returns true if the given `AppConfig` contains any infrastructure secrets
+/// that should be split out into `secrets.json`. Used for migration detection.
+///
+/// Flow-level parameters (passphrases, credentials, keys) are NOT considered
+/// secrets for this purpose — they stay in `config.json`.
 pub fn has_secrets(config: &AppConfig) -> bool {
     // Manager secrets
     if let Some(ref mgr) = config.manager {
@@ -534,53 +448,8 @@ pub fn has_secrets(config: &AppConfig) -> bool {
         }
     }
 
-    // Flow secrets
-    for flow in &config.flows {
-        if has_input_secrets(&flow.input) {
-            return true;
-        }
-        for output in &flow.outputs {
-            if has_output_secrets(output) {
-                return true;
-            }
-        }
-    }
-
+    // Flow parameters are NOT secrets — they stay in config.json
     false
-}
-
-fn has_input_secrets(input: &InputConfig) -> bool {
-    match input {
-        InputConfig::Srt(srt) => {
-            srt.passphrase.is_some()
-                || srt
-                    .redundancy
-                    .as_ref()
-                    .map_or(false, |r| r.passphrase.is_some())
-        }
-        InputConfig::Rtmp(rtmp) => rtmp.stream_key.is_some(),
-        InputConfig::Rtsp(rtsp) => rtsp.username.is_some() || rtsp.password.is_some(),
-        InputConfig::Webrtc(webrtc) => webrtc.bearer_token.is_some(),
-        InputConfig::Whep(whep) => whep.bearer_token.is_some(),
-        InputConfig::Rtp(_) | InputConfig::Udp(_) => false,
-    }
-}
-
-fn has_output_secrets(output: &OutputConfig) -> bool {
-    match output {
-        OutputConfig::Srt(srt) => {
-            srt.passphrase.is_some()
-                || srt
-                    .redundancy
-                    .as_ref()
-                    .map_or(false, |r| r.passphrase.is_some())
-        }
-        // RTMP stream_key is always present (required field) — always a secret
-        OutputConfig::Rtmp(_) => true,
-        OutputConfig::Hls(hls) => hls.auth_token.is_some(),
-        OutputConfig::Webrtc(webrtc) => webrtc.bearer_token.is_some(),
-        OutputConfig::Rtp(_) | OutputConfig::Udp(_) => false,
-    }
 }
 
 #[cfg(test)]
@@ -668,7 +537,7 @@ mod tests {
             }],
         };
 
-        // Extract secrets
+        // Extract secrets — only infrastructure secrets, not flow params
         let secrets = SecretsConfig::extract_from(&config);
         assert_eq!(secrets.manager_node_secret, Some("secret-123".to_string()));
         assert_eq!(
@@ -680,17 +549,10 @@ mod tests {
             secrets.tunnels["tunnel-1"].tunnel_encryption_key,
             Some("a".repeat(64))
         );
-        assert!(secrets.flows.contains_key("srt-flow"));
-        assert_eq!(
-            secrets.flows["srt-flow"]
-                .input
-                .as_ref()
-                .unwrap()
-                .passphrase,
-            Some("my-secret-pass".to_string())
-        );
+        // Flow secrets should NOT be extracted
+        assert!(secrets.flows.is_empty());
 
-        // Strip secrets from config
+        // Strip secrets from config — flow params should be preserved
         let mut stripped = config.clone();
         stripped.strip_secrets();
         assert!(stripped.manager.as_ref().unwrap().node_secret.is_none());
@@ -702,8 +564,11 @@ mod tests {
             .is_none());
         assert!(stripped.tunnels[0].tunnel_encryption_key.is_none());
         assert!(stripped.tunnels[0].tunnel_bind_secret.is_none());
+        // SRT passphrase should still be present after strip_secrets
         match &stripped.flows[0].input {
-            InputConfig::Srt(srt) => assert!(srt.passphrase.is_none()),
+            InputConfig::Srt(srt) => {
+                assert_eq!(srt.passphrase, Some("my-secret-pass".to_string()));
+            }
             _ => panic!("Expected SRT input"),
         }
 
@@ -717,12 +582,6 @@ mod tests {
             stripped.tunnels[0].tunnel_encryption_key,
             Some("a".repeat(64))
         );
-        match &stripped.flows[0].input {
-            InputConfig::Srt(srt) => {
-                assert_eq!(srt.passphrase, Some("my-secret-pass".to_string()));
-            }
-            _ => panic!("Expected SRT input"),
-        }
     }
 
     #[test]
@@ -747,7 +606,65 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_secrets_rtmp_output() {
+    fn test_has_secrets_ignores_flow_params() {
+        // Flow parameters (SRT passphrase, RTMP key, etc.) are NOT secrets
+        let config = AppConfig {
+            version: 1,
+            node_id: None,
+            device_name: None,
+            setup_enabled: true,
+            server: ServerConfig::default(),
+            monitor: None,
+            manager: None,
+            tunnels: vec![],
+            flows: vec![FlowConfig {
+                id: "srt-flow".to_string(),
+                name: "SRT Flow".to_string(),
+                enabled: true,
+                media_analysis: true,
+                input: InputConfig::Srt(SrtInputConfig {
+                    mode: SrtMode::Listener,
+                    local_addr: "0.0.0.0:9000".to_string(),
+                    remote_addr: None,
+                    latency_ms: 120,
+                    recv_latency_ms: None,
+                    peer_latency_ms: None,
+                    peer_idle_timeout_secs: 30,
+                    passphrase: Some("my-secret-pass".to_string()),
+                    aes_key_len: None,
+                    crypto_mode: None,
+                    max_rexmit_bw: None,
+                    stream_id: None,
+                    packet_filter: None,
+                    max_bw: None,
+                    input_bw: None,
+                    overhead_bw: None,
+                    enforced_encryption: None,
+                    connect_timeout_secs: None,
+                    flight_flag_size: None,
+                    send_buffer_size: None,
+                    recv_buffer_size: None,
+                    ip_tos: None,
+                    retransmit_algo: None,
+                    send_drop_delay: None,
+                    loss_max_ttl: None,
+                    km_refresh_rate: None,
+                    km_pre_announce: None,
+                    payload_size: None,
+                    mss: None,
+                    tlpkt_drop: None,
+                    ip_ttl: None,
+                    redundancy: None,
+                }),
+                outputs: vec![],
+            }],
+        };
+        // Config with only flow params should NOT be considered as having secrets
+        assert!(!has_secrets(&config));
+    }
+
+    #[test]
+    fn test_strip_secrets_preserves_flow_params() {
         let mut config = AppConfig {
             version: 1,
             node_id: None,
@@ -783,25 +700,89 @@ mod tests {
             }],
         };
 
-        // Extract secrets (should capture stream_key)
-        let secrets = SecretsConfig::extract_from(&config);
-        assert_eq!(
-            secrets.flows["rtmp-flow"].outputs["rtmp-out"].stream_key,
-            Some("my-stream-key".to_string())
-        );
-
-        // Strip secrets (stream_key should become empty)
+        // strip_secrets should preserve flow params
         config.strip_secrets();
-        match &config.flows[0].outputs[0] {
-            OutputConfig::Rtmp(rtmp) => assert!(rtmp.stream_key.is_empty()),
-            _ => panic!("Expected RTMP output"),
-        }
-
-        // Merge secrets back
-        secrets.merge_into(&mut config);
         match &config.flows[0].outputs[0] {
             OutputConfig::Rtmp(rtmp) => assert_eq!(rtmp.stream_key, "my-stream-key"),
             _ => panic!("Expected RTMP output"),
+        }
+    }
+
+    #[test]
+    fn test_legacy_flow_secrets_migration() {
+        // Simulate old secrets.json with flow secrets
+        let mut legacy_secrets = SecretsConfig::default();
+        legacy_secrets.flows.insert(
+            "srt-flow".to_string(),
+            FlowSecrets {
+                input: Some(InputSecrets {
+                    passphrase: Some("legacy-pass".to_string()),
+                    ..Default::default()
+                }),
+                outputs: HashMap::new(),
+            },
+        );
+
+        // Config without the passphrase (as it was stripped in old format)
+        let mut config = AppConfig {
+            version: 1,
+            node_id: None,
+            device_name: None,
+            setup_enabled: true,
+            server: ServerConfig::default(),
+            monitor: None,
+            manager: None,
+            tunnels: vec![],
+            flows: vec![FlowConfig {
+                id: "srt-flow".to_string(),
+                name: "SRT Flow".to_string(),
+                enabled: true,
+                media_analysis: true,
+                input: InputConfig::Srt(SrtInputConfig {
+                    mode: SrtMode::Listener,
+                    local_addr: "0.0.0.0:9000".to_string(),
+                    remote_addr: None,
+                    latency_ms: 120,
+                    recv_latency_ms: None,
+                    peer_latency_ms: None,
+                    peer_idle_timeout_secs: 30,
+                    passphrase: None,
+                    aes_key_len: None,
+                    crypto_mode: None,
+                    max_rexmit_bw: None,
+                    stream_id: None,
+                    packet_filter: None,
+                    max_bw: None,
+                    input_bw: None,
+                    overhead_bw: None,
+                    enforced_encryption: None,
+                    connect_timeout_secs: None,
+                    flight_flag_size: None,
+                    send_buffer_size: None,
+                    recv_buffer_size: None,
+                    ip_tos: None,
+                    retransmit_algo: None,
+                    send_drop_delay: None,
+                    loss_max_ttl: None,
+                    km_refresh_rate: None,
+                    km_pre_announce: None,
+                    payload_size: None,
+                    mss: None,
+                    tlpkt_drop: None,
+                    ip_ttl: None,
+                    redundancy: None,
+                }),
+                outputs: vec![],
+            }],
+        };
+
+        // Legacy merge should restore flow secrets from old secrets.json
+        legacy_secrets.merge_into(&mut config);
+        match &config.flows[0].input {
+            InputConfig::Srt(srt) => {
+                assert_eq!(srt.passphrase, Some("legacy-pass".to_string()));
+            }
+            _ => panic!("Expected SRT input"),
         }
     }
 }
