@@ -165,34 +165,41 @@ impl FlowRuntime {
             InputConfig::Rtp(c) => InputConfigMeta {
                 mode: None, local_addr: None, remote_addr: None,
                 listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
+                rtsp_url: None, whep_url: None,
             },
             InputConfig::Udp(c) => InputConfigMeta {
                 mode: None, local_addr: None, remote_addr: None,
                 listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
+                rtsp_url: None, whep_url: None,
             },
             InputConfig::Srt(c) => InputConfigMeta {
                 mode: Some(format!("{:?}", c.mode).to_lowercase()),
                 local_addr: Some(c.local_addr.clone()),
                 remote_addr: c.remote_addr.clone(),
                 listen_addr: None, bind_addr: None,
+                rtsp_url: None, whep_url: None,
             },
             InputConfig::Rtmp(c) => InputConfigMeta {
                 mode: None, local_addr: None, remote_addr: None,
                 listen_addr: Some(c.listen_addr.clone()), bind_addr: None,
+                rtsp_url: None, whep_url: None,
             },
             InputConfig::Rtsp(c) => InputConfigMeta {
                 mode: Some(format!("{:?}", c.transport).to_lowercase()),
-                local_addr: None, remote_addr: Some(c.rtsp_url.clone()),
+                local_addr: None, remote_addr: None,
                 listen_addr: None, bind_addr: None,
+                rtsp_url: Some(c.rtsp_url.clone()), whep_url: None,
             },
             InputConfig::Webrtc(_) => InputConfigMeta {
                 mode: Some("whip_server".to_string()), local_addr: None, remote_addr: None,
                 listen_addr: None, bind_addr: None,
+                rtsp_url: None, whep_url: None,
             },
             InputConfig::Whep(c) => InputConfigMeta {
                 mode: Some("whep_client".to_string()), local_addr: None,
-                remote_addr: Some(c.whep_url.clone()),
+                remote_addr: None,
                 listen_addr: None, bind_addr: None,
+                rtsp_url: None, whep_url: Some(c.whep_url.clone()),
             },
         };
         let _ = flow_stats.input_config_meta.set(input_meta);
@@ -634,10 +641,19 @@ impl FlowRuntime {
     ///
     /// Returns an error if no output with the given ID exists in this flow.
     pub async fn remove_output(&self, output_id: &str) -> Result<()> {
-        let mut handles = self.output_handles.write().await;
-        if let Some(output_rt) = handles.remove(output_id) {
+        let output_rt = {
+            let mut handles = self.output_handles.write().await;
+            handles.remove(output_id)
+        };
+        if let Some(output_rt) = output_rt {
             output_rt.cancel_token.cancel();
-            // Clean up stats for this output
+            // Wait for the output task to finish cleanup (close SRT listener/socket,
+            // release UDP port) before returning. This ensures the port is free for
+            // reuse when a new output is created on the same address.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                output_rt.handle,
+            ).await;
             self.stats.unregister_output(output_id);
             tracing::info!("Removed output '{}' from flow '{}'", output_id, self.config.id);
             Ok(())
@@ -655,5 +671,14 @@ impl FlowRuntime {
     pub async fn stop(&self) {
         tracing::info!("Stopping flow '{}' ({})", self.config.id, self.config.name);
         self.cancel_token.cancel();
+        // Await all output task handles so sockets (especially SRT listeners)
+        // are fully closed and ports released before the flow is considered stopped.
+        let output_handles: Vec<_> = {
+            let mut handles = self.output_handles.write().await;
+            handles.drain().map(|(_, rt)| rt.handle).collect()
+        };
+        for handle in output_handles {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        }
     }
 }

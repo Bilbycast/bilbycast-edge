@@ -2562,7 +2562,7 @@ dependencies = [
 
 [[package]]
 name = "srt-protocol"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2579,7 +2579,7 @@ dependencies = [
 
 [[package]]
 name = "srt-transport"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bitflags",
  "bytes",

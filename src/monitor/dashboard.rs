@@ -502,7 +502,8 @@ function render_srt(srt, label) {
     '<div class="item">' + label + ': <span>' + srt.state + '</span></div>' +
     '<div class="item">RTT: <span>' + (srt.rtt_ms || 0).toFixed(1) + ' ms</span></div>' +
     '<div class="item">Loss: <span>' + fmt_num(srt.pkt_loss_total) + '</span></div>' +
-    '<div class="item">Retransmit: <span>' + fmt_num(srt.pkt_retransmit_total) + '</span></div>' +
+    '<div class="item">Retransmit (snd): <span>' + fmt_num(srt.pkt_retransmit_total) + '</span></div>' +
+    '<div class="item">Retransmit (rcv): <span>' + fmt_num(srt.pkt_recv_retransmit_total) + '</span></div>' +
     '</div></div>';
 }
 

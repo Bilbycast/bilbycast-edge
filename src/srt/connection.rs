@@ -574,6 +574,7 @@ pub fn convert_srt_stats(stats: &srt_protocol::stats::SrtStats) -> SrtLegStats {
         pkt_send_loss_total: stats.pkt_snd_loss_total,
         pkt_recv_loss_total: stats.pkt_rcv_loss_total,
         pkt_retransmit_total: stats.pkt_retrans_total,
+        pkt_recv_retransmit_total: stats.pkt_rcv_retrans_total,
         pkt_recv_drop_total: stats.pkt_rcv_drop_total,
         pkt_send_drop_total: stats.pkt_snd_drop_total,
         pkt_recv_undecrypt_total: stats.pkt_rcv_undecrypt_total,

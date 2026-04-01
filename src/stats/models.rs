@@ -91,6 +91,12 @@ pub struct InputStats {
     /// RTP bind address (for topology display).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bind_addr: Option<String>,
+    /// RTSP source URL (for topology display).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtsp_url: Option<String>,
+    /// WHEP source URL (for topology display).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub whep_url: Option<String>,
     /// Total RTP packets received on this input.
     pub packets_received: u64,
     /// Total bytes received (RTP payload + header).
@@ -244,8 +250,10 @@ pub struct SrtLegStats {
     pub pkt_send_loss_total: i32,
     /// Total receive-side lost packets.
     pub pkt_recv_loss_total: i32,
-    /// Total packets retransmitted by the SRT ARQ mechanism.
+    /// Total packets retransmitted by the SRT ARQ mechanism (sender side).
     pub pkt_retransmit_total: i32,
+    /// Total retransmitted packets received (receiver side ARQ metric).
+    pub pkt_recv_retransmit_total: i32,
     /// Total packets dropped at receiver (too late for TSBPD delivery).
     pub pkt_recv_drop_total: i32,
     /// Total packets dropped at sender (too late to send).

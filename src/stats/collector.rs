@@ -438,6 +438,8 @@ pub struct InputConfigMeta {
     pub remote_addr: Option<String>,
     pub listen_addr: Option<String>,
     pub bind_addr: Option<String>,
+    pub rtsp_url: Option<String>,
+    pub whep_url: Option<String>,
 }
 
 /// Lightweight output config metadata for topology display.
@@ -558,6 +560,8 @@ impl FlowStatsAccumulator {
                     remote_addr: meta.and_then(|m| m.remote_addr.clone()),
                     listen_addr: meta.and_then(|m| m.listen_addr.clone()),
                     bind_addr: meta.and_then(|m| m.bind_addr.clone()),
+                    rtsp_url: meta.and_then(|m| m.rtsp_url.clone()),
+                    whep_url: meta.and_then(|m| m.whep_url.clone()),
                     packets_received: self.input_packets.load(Ordering::Relaxed),
                     bytes_received: input_bytes,
                     bitrate_bps: input_bitrate,
