@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::WebrtcOutputConfig;
+use crate::manager::events::{EventSender, EventSeverity};
 use crate::stats::collector::OutputStatsAccumulator;
 
 use super::packet::RtpPacket;
@@ -31,6 +32,8 @@ pub fn spawn_webrtc_output(
     cancel: CancellationToken,
     #[cfg(feature = "webrtc")]
     session_rx: Option<tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>>,
+    event_sender: EventSender,
+    flow_id: String,
 ) -> JoinHandle<()> {
     let rx = broadcast_tx.subscribe();
 
@@ -40,7 +43,7 @@ pub fn spawn_webrtc_output(
         match config.mode {
             WebrtcOutputMode::WhipClient => {
                 tokio::spawn(async move {
-                    whip_client_loop(config, rx, output_stats, cancel).await;
+                    whip_client_loop(config, rx, output_stats, cancel, &event_sender, &flow_id).await;
                 })
             }
             WebrtcOutputMode::WhepServer => {
@@ -51,7 +54,7 @@ pub fn spawn_webrtc_output(
                         config.id,
                     );
                     if let Some(session_rx) = session_rx {
-                        whep_server_loop(config, broadcast_tx_clone, rx, output_stats, cancel, session_rx).await;
+                        whep_server_loop(config, broadcast_tx_clone, rx, output_stats, cancel, session_rx, &event_sender, &flow_id).await;
                     } else {
                         tracing::warn!(
                             "WHEP server output '{}' has no session channel — viewers cannot connect",
@@ -66,6 +69,7 @@ pub fn spawn_webrtc_output(
 
     #[cfg(not(feature = "webrtc"))]
     {
+        let _ = (event_sender, flow_id); // Suppress unused warnings
         tokio::spawn(async move {
             tracing::warn!(
                 "WebRTC output '{}' is a stub: the `webrtc` cargo feature is not enabled. \
@@ -120,6 +124,8 @@ async fn whep_server_loop(
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
     mut session_rx: tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>,
+    events: &EventSender,
+    flow_id: &str,
 ) {
     use super::webrtc::session::{SessionConfig, WebrtcSession};
 
@@ -155,6 +161,7 @@ async fn whep_server_loop(
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("WHEP output '{}': failed to create session: {}", config.id, e);
+                events.emit_flow(EventSeverity::Warning, "webrtc", format!("WebRTC session creation failed: {e}"), flow_id);
                 let _ = msg.reply.send(Err(e));
                 continue;
             }
@@ -179,6 +186,8 @@ async fn whep_server_loop(
         let viewer_stats = stats.clone();
         let output_id = config.id.clone();
         let video_only = config.video_only;
+        let viewer_events = events.clone();
+        let viewer_flow_id = flow_id.to_string();
 
         tokio::spawn(async move {
             whep_viewer_loop(
@@ -189,6 +198,8 @@ async fn whep_server_loop(
                 viewer_stats,
                 viewer_cancel,
                 video_only,
+                &viewer_events,
+                &viewer_flow_id,
             ).await;
         });
     }
@@ -206,6 +217,8 @@ async fn whep_viewer_loop(
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
     video_only: bool,
+    events: &EventSender,
+    flow_id: &str,
 ) {
     use super::ts_parse::strip_rtp_header;
     use super::webrtc::ts_demux::TsDemuxer;
@@ -220,10 +233,12 @@ async fn whep_viewer_loop(
         match event {
             SessionEvent::Connected => {
                 tracing::info!("WHEP viewer '{}' connected on output '{}'", session_id, output_id);
+                events.emit_flow(EventSeverity::Info, "webrtc", "WHEP viewer connected", flow_id);
                 break;
             }
             SessionEvent::Disconnected => {
                 tracing::info!("WHEP viewer '{}' disconnected during setup", session_id);
+                events.emit_flow(EventSeverity::Info, "webrtc", "WHEP viewer disconnected", flow_id);
                 return;
             }
             _ => continue,
@@ -311,6 +326,7 @@ async fn whep_viewer_loop(
     }
 
     tracing::info!("WHEP viewer '{}' disconnected from output '{}'", session_id, output_id);
+    events.emit_flow(EventSeverity::Info, "webrtc", "WHEP viewer disconnected", flow_id);
 }
 
 /// WHIP client output loop — pushes media to an external WHIP endpoint.
@@ -320,6 +336,8 @@ async fn whip_client_loop(
     mut rx: broadcast::Receiver<RtpPacket>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
+    events: &EventSender,
+    flow_id: &str,
 ) {
     use std::time::Instant;
     use super::ts_parse::strip_rtp_header;
@@ -347,6 +365,7 @@ async fn whip_client_loop(
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("WHIP client '{}': session error: {}", config.id, e);
+                events.emit_flow(EventSeverity::Warning, "webrtc", format!("WebRTC session creation failed: {e}"), flow_id);
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}

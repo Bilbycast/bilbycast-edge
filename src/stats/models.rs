@@ -32,6 +32,9 @@ pub struct FlowStats {
     /// Media content analysis (codec, resolution, frame rate, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_analysis: Option<MediaAnalysisStats>,
+    /// Thumbnail generation statistics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<ThumbnailStats>,
 }
 
 /// Inter-arrival time statistics (microseconds).
@@ -196,15 +199,38 @@ pub struct Tr101290Stats {
     pub pat_errors: u64,
     /// A PMT referenced by the PAT was not received within 500 ms.
     pub pmt_errors: u64,
+    /// Elementary stream PIDs referenced in PMT but not seen within 500 ms.
+    pub pid_errors: u64,
 
     // ── Priority 2 (important) ──
 
     /// TS packets with the Transport Error Indicator bit set.
     pub tei_errors: u64,
+    /// CRC-32 verification failures on PAT/PMT sections.
+    pub crc_errors: u64,
     /// PCR jumps exceeding 100 ms or going backwards.
     pub pcr_discontinuity_errors: u64,
     /// PCR jitter relative to wall clock exceeding 500 ns.
     pub pcr_accuracy_errors: u64,
+
+    // ── Windowed counters (reset each snapshot, "errors since last report") ──
+
+    /// CC errors in the last reporting window.
+    pub window_cc_errors: u64,
+    /// PAT timeout errors in the last reporting window.
+    pub window_pat_errors: u64,
+    /// PMT timeout errors in the last reporting window.
+    pub window_pmt_errors: u64,
+    /// PID errors in the last reporting window.
+    pub window_pid_errors: u64,
+    /// TEI errors in the last reporting window.
+    pub window_tei_errors: u64,
+    /// CRC errors in the last reporting window.
+    pub window_crc_errors: u64,
+    /// PCR discontinuity errors in the last reporting window.
+    pub window_pcr_discontinuity_errors: u64,
+    /// PCR accuracy errors in the last reporting window.
+    pub window_pcr_accuracy_errors: u64,
 
     // ── Summary ──
 
@@ -457,4 +483,24 @@ pub struct AudioStreamInfo {
     pub language: Option<String>,
     /// Estimated bitrate for this PID in bits per second.
     pub bitrate_bps: u64,
+}
+
+// ── Thumbnail Generation ─────────────────────────────────────────────────
+
+/// Thumbnail generation statistics for a single flow.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ThumbnailStats {
+    /// Whether thumbnail generation is active for this flow.
+    pub enabled: bool,
+    /// Total thumbnails successfully captured since flow start.
+    pub total_captured: u64,
+    /// Total capture errors (ffmpeg failures, timeouts) since flow start.
+    pub capture_errors: u64,
+    /// Whether a thumbnail is currently available.
+    pub has_thumbnail: bool,
+    /// Active thumbnail alarm: `"black"` if the frame is all-dark,
+    /// `"frozen"` if the same frame has been captured for 3+ consecutive
+    /// intervals (30 s+). Absent when no alarm is active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alarm: Option<String>,
 }

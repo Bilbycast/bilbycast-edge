@@ -52,6 +52,21 @@ pub fn ts_has_adaptation(pkt: &[u8]) -> bool {
     ts_adaptation_field_control(pkt) & 0x02 != 0
 }
 
+/// Check the discontinuity_indicator flag in the adaptation field.
+/// When set, a PCR discontinuity is expected and should not be flagged as an error.
+#[inline(always)]
+pub fn ts_discontinuity_indicator(pkt: &[u8]) -> bool {
+    if !ts_has_adaptation(pkt) {
+        return false;
+    }
+    let af_len = pkt[4] as usize;
+    if af_len == 0 {
+        return false;
+    }
+    // Bit 7 of the adaptation field flags byte
+    (pkt[5] & 0x80) != 0
+}
+
 /// Extract the 42-bit PCR base and 9-bit extension from the adaptation field,
 /// returning the full PCR value in 27 MHz ticks.
 pub fn extract_pcr(pkt: &[u8]) -> Option<u64> {
@@ -131,6 +146,58 @@ pub fn parse_pat_pmt_pids(pkt: &[u8]) -> Vec<u16> {
     }
 
     pids
+}
+
+// ── MPEG-2 CRC-32 ───────────────────────────────────────────────────────
+
+/// MPEG-2 CRC-32 lookup table (polynomial 0x04C11DB7, no bit reversal).
+/// Used to verify PAT, PMT, and other PSI section integrity per ISO/IEC 13818-1.
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0u32;
+    while i < 256 {
+        let mut crc = i << 24;
+        let mut j = 0;
+        while j < 8 {
+            if crc & 0x80000000 != 0 {
+                crc = (crc << 1) ^ 0x04C11DB7;
+            } else {
+                crc <<= 1;
+            }
+            j += 1;
+        }
+        table[i as usize] = crc;
+        i += 1;
+    }
+    table
+};
+
+/// Compute the MPEG-2 CRC-32 over a byte slice.
+/// A valid PSI section (including its trailing CRC-32 bytes) produces 0x00000000.
+pub fn mpeg2_crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFFFFFF;
+    for &byte in data {
+        let idx = ((crc >> 24) ^ byte as u32) as usize;
+        crc = (crc << 8) ^ CRC32_TABLE[idx];
+    }
+    crc
+}
+
+/// Verify the CRC-32 of a PSI section starting at `section_start` in a TS packet.
+/// `section_start` points to the table_id byte. Returns `true` if the CRC is valid.
+/// Returns `false` if the section is truncated or the CRC does not match.
+pub fn verify_psi_crc(pkt: &[u8], section_start: usize) -> bool {
+    if section_start + 3 > TS_PACKET_SIZE {
+        return false;
+    }
+    let section_length =
+        (((pkt[section_start + 1] & 0x0F) as usize) << 8) | (pkt[section_start + 2] as usize);
+    let section_end = section_start + 3 + section_length;
+    if section_end > TS_PACKET_SIZE {
+        return false; // Section spans multiple packets — cannot verify in single-packet mode
+    }
+    // CRC-32 covers table_id through the CRC itself; result should be 0
+    mpeg2_crc32(&pkt[section_start..section_end]) == 0
 }
 
 // ── RTP Header Stripping ─────────────────────────────────────────────────

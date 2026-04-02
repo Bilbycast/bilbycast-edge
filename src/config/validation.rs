@@ -871,6 +871,7 @@ mod tests {
             name: "Flow 1".to_string(),
             enabled: true,
             media_analysis: true,
+            thumbnail: true,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,
@@ -902,6 +903,7 @@ mod tests {
             name: "Flow 1".to_string(),
             enabled: true,
             media_analysis: true,
+            thumbnail: true,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "not-an-address".to_string(),
                 interface_addr: None,
@@ -924,6 +926,7 @@ mod tests {
             name: "Flow 1".to_string(),
             enabled: true,
             media_analysis: true,
+            thumbnail: true,
             input: InputConfig::Srt(SrtInputConfig {
                 mode: SrtMode::Caller,
                 local_addr: "0.0.0.0:9000".to_string(),
@@ -968,6 +971,7 @@ mod tests {
                     name: "Flow 1".to_string(),
                     enabled: true,
                     media_analysis: true,
+            thumbnail: true,
                     input: InputConfig::Rtp(RtpInputConfig {
                         bind_addr: "0.0.0.0:5000".to_string(),
                         interface_addr: None,
@@ -985,6 +989,7 @@ mod tests {
                     name: "Flow 2".to_string(),
                     enabled: true,
                     media_analysis: true,
+            thumbnail: true,
                     input: InputConfig::Rtp(RtpInputConfig {
                         bind_addr: "0.0.0.0:5001".to_string(),
                         interface_addr: None,
@@ -1009,6 +1014,7 @@ mod tests {
             name: "Flow 1".to_string(),
             enabled: true,
             media_analysis: true,
+            thumbnail: true,
             input: InputConfig::Srt(SrtInputConfig {
                 mode: SrtMode::Listener,
                 local_addr: "0.0.0.0:9000".to_string(),
@@ -1045,6 +1051,7 @@ mod tests {
             name: "IPv6 Unicast".to_string(),
             enabled: true,
             media_analysis: true,
+            thumbnail: true,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "[::]:5000".to_string(),
                 interface_addr: None,
@@ -1076,6 +1083,7 @@ mod tests {
             name: "IPv4 Multicast".to_string(),
             enabled: true,
             media_analysis: true,
+            thumbnail: true,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "239.1.1.1:5000".to_string(),
                 interface_addr: Some("192.168.1.100".to_string()),
@@ -1107,6 +1115,7 @@ mod tests {
             name: "IPv6 Multicast".to_string(),
             enabled: true,
             media_analysis: true,
+            thumbnail: true,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "[ff7e::1]:5000".to_string(),
                 interface_addr: Some("::1".to_string()),
@@ -1140,6 +1149,7 @@ mod tests {
             name: "Mismatched".to_string(),
             enabled: true,
             media_analysis: true,
+            thumbnail: true,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "239.1.1.1:5000".to_string(),         // IPv4
                 interface_addr: Some("::1".to_string()),          // IPv6 - mismatch!
@@ -1162,6 +1172,7 @@ mod tests {
             name: "Mismatched".to_string(),
             enabled: true,
             media_analysis: true,
+            thumbnail: true,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "[::]:5000".to_string(),
                 interface_addr: None,
@@ -1193,6 +1204,7 @@ mod tests {
             name: "Mismatched".to_string(),
             enabled: true,
             media_analysis: true,
+            thumbnail: true,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,
@@ -1224,6 +1236,7 @@ mod tests {
             name: "Bad iface".to_string(),
             enabled: true,
             media_analysis: true,
+            thumbnail: true,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,

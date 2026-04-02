@@ -128,11 +128,20 @@ async fn main() -> anyhow::Result<()> {
         app_config.server.listen_addr, app_config.server.listen_port
     );
 
+    // Detect ffmpeg availability (for optional thumbnail generation)
+    let ffmpeg_available = engine::thumbnail::check_ffmpeg_available();
+    if ffmpeg_available {
+        tracing::info!("ffmpeg detected — flow thumbnail generation available");
+    } else {
+        tracing::info!("ffmpeg not found — flow thumbnail generation disabled");
+    }
+
     // Create shared state
     let (ws_stats_tx, _) = broadcast::channel::<String>(64);
+    let (event_sender, event_rx) = manager::event_channel();
     let global_stats = Arc::new(StatsCollector::new());
-    let flow_manager = Arc::new(FlowManager::new(global_stats.clone()));
-    let tunnel_manager = Arc::new(TunnelManager::new());
+    let flow_manager = Arc::new(FlowManager::new(global_stats.clone(), ffmpeg_available, event_sender.clone()));
+    let tunnel_manager = Arc::new(TunnelManager::new(event_sender.clone()));
 
     // Set the manager node_id on the tunnel manager so relay tunnels can identify this edge
     if let Some(ref mgr) = app_config.manager {
@@ -266,6 +275,7 @@ async fn main() -> anyhow::Result<()> {
                 { state.webrtc_sessions.clone() },
                 #[cfg(not(feature = "webrtc"))]
                 (),
+                event_rx,
             );
         }
     }

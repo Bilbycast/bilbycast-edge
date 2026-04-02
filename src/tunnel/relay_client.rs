@@ -23,6 +23,7 @@ use super::protocol::{
     TUNNEL_PROTOCOL_VERSION,
 };
 use super::quic;
+use crate::manager::events::{EventSender, EventSeverity};
 
 /// State of the relay tunnel connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +67,7 @@ pub async fn connect_and_bind(
     params: &RelayTunnelParams,
     state_tx: &watch::Sender<RelayTunnelState>,
     cancel: CancellationToken,
+    event_sender: EventSender,
 ) -> Result<Connection> {
     // Connect to relay
     state_tx.send_replace(RelayTunnelState::Connecting);
@@ -155,6 +157,12 @@ pub async fn connect_and_bind(
                             direction = %params.direction,
                             "Tunnel ready"
                         );
+                        event_sender.emit_flow(
+                            EventSeverity::Info,
+                            "tunnel",
+                            "Tunnel connected to relay",
+                            &params.tunnel_id.to_string(),
+                        );
                         break;
                     }
                     RelayMessage::TunnelWaiting { tunnel_id } if tunnel_id == params.tunnel_id => {
@@ -197,6 +205,12 @@ pub async fn connect_and_bind(
                                     direction = %params.direction,
                                     "Tunnel ready (via notification)"
                                 );
+                                event_sender.emit_flow(
+                                    EventSeverity::Info,
+                                    "tunnel",
+                                    "Tunnel connected to relay",
+                                    &params.tunnel_id.to_string(),
+                                );
                                 break;
                             }
                         }
@@ -229,7 +243,9 @@ pub async fn connect_and_bind(
     // Spawn control stream reader (handles pong, tunnel_down)
     let state_tx_clone = state_tx.clone();
     let tunnel_id = params.tunnel_id;
+    let tunnel_id_str = params.tunnel_id.to_string();
     let cancel_reader = cancel.clone();
+    let reader_event_sender = event_sender.clone();
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -238,6 +254,12 @@ pub async fn connect_and_bind(
                         Ok(ParsedMessage::Known(RelayMessage::Pong | RelayMessage::HelloAck { .. })) => {}
                         Ok(ParsedMessage::Known(RelayMessage::TunnelDown { tunnel_id: tid, reason })) if tid == tunnel_id => {
                             tracing::warn!(tunnel_id = %tid, reason = %reason, "Tunnel down");
+                            reader_event_sender.emit_flow(
+                                EventSeverity::Warning,
+                                "tunnel",
+                                format!("Tunnel peer disconnected: {reason}"),
+                                &tunnel_id_str,
+                            );
                             state_tx_clone.send_replace(RelayTunnelState::Down);
                             break;
                         }
@@ -249,6 +271,12 @@ pub async fn connect_and_bind(
                         }
                         Err(e) => {
                             tracing::warn!("Relay control stream error: {e}");
+                            reader_event_sender.emit_flow(
+                                EventSeverity::Warning,
+                                "tunnel",
+                                format!("Tunnel disconnected from relay: {e}"),
+                                &tunnel_id_str,
+                            );
                             state_tx_clone.send_replace(RelayTunnelState::Down);
                             break;
                         }
@@ -267,16 +295,34 @@ pub async fn connect_with_retry(
     params: &RelayTunnelParams,
     state_tx: &watch::Sender<RelayTunnelState>,
     cancel: CancellationToken,
+    event_sender: EventSender,
 ) -> Result<Connection> {
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(60);
 
     loop {
-        match connect_and_bind(params, state_tx, cancel.clone()).await {
+        match connect_and_bind(params, state_tx, cancel.clone(), event_sender.clone()).await {
             Ok(conn) => return Ok(conn),
             Err(e) => {
                 if cancel.is_cancelled() {
                     return Err(e);
+                }
+                let err_msg = e.to_string();
+                // Detect bind rejection
+                if err_msg.contains("bind_rejected") || err_msg.contains("BindRejected") {
+                    event_sender.emit_flow(
+                        EventSeverity::Critical,
+                        "tunnel",
+                        format!("Tunnel bind rejected by relay: {e}"),
+                        &params.tunnel_id.to_string(),
+                    );
+                } else {
+                    event_sender.emit_flow(
+                        EventSeverity::Warning,
+                        "tunnel",
+                        format!("Tunnel connection to relay failed: {e}"),
+                        &params.tunnel_id.to_string(),
+                    );
                 }
                 tracing::warn!(
                     tunnel_id = %params.tunnel_id,

@@ -111,6 +111,10 @@ pub struct FlowConfig {
     /// Default: true. Set to false to save CPU on resource-constrained devices.
     #[serde(default = "default_true")]
     pub media_analysis: bool,
+    /// Enable thumbnail generation for visual flow preview (requires ffmpeg on the device).
+    /// Default: true. Thumbnails are only produced when ffmpeg is detected at startup.
+    #[serde(default = "default_true")]
+    pub thumbnail: bool,
     /// The single input source for this flow
     pub input: InputConfig,
     /// One or more output destinations (fan-out)
@@ -944,6 +948,7 @@ mod tests {
                 name: "Test Flow".to_string(),
                 enabled: true,
                 media_analysis: true,
+                thumbnail: true,
                 input: InputConfig::Rtp(RtpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
                     interface_addr: None,

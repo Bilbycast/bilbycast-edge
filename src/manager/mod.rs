@@ -11,5 +11,7 @@
 
 pub mod client;
 pub mod config;
+pub mod events;
 
 pub use config::ManagerConfig;
+pub use events::{EventSender, EventSeverity, event_channel};

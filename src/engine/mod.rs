@@ -37,6 +37,7 @@ pub mod output_srt;
 pub mod output_webrtc;
 pub mod packet;
 pub mod rtmp;
+pub mod thumbnail;
 pub mod tr101290;
 pub mod ts_demux;
 pub mod ts_parse;

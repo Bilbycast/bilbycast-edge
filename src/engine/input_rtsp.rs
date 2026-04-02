@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::{RtspInputConfig, RtspTransport};
+use crate::manager::events::{EventSender, EventSeverity};
 use crate::stats::collector::FlowStatsAccumulator;
 
 use super::packet::RtpPacket;
@@ -31,10 +32,12 @@ pub fn spawn_rtsp_input(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
+    event_sender: EventSender,
+    flow_id: String,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         tracing::info!("RTSP input started, connecting to {}", config.rtsp_url);
-        rtsp_input_loop(config, broadcast_tx, stats, cancel).await;
+        rtsp_input_loop(config, broadcast_tx, stats, cancel, event_sender, flow_id).await;
     })
 }
 
@@ -43,11 +46,17 @@ async fn rtsp_input_loop(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
+    event_sender: EventSender,
+    flow_id: String,
 ) {
     let reconnect_delay = std::time::Duration::from_secs(config.reconnect_delay_secs);
+    // Track whether we need to emit a disconnect event. Set to true when
+    // connected, cleared after emitting the disconnect event. This prevents
+    // spamming the same warning on every reconnection attempt.
+    let mut disconnect_event_pending = false;
 
     loop {
-        match run_rtsp_session(&config, &broadcast_tx, &stats, &cancel).await {
+        match run_rtsp_session(&config, &broadcast_tx, &stats, &cancel, &event_sender, &flow_id, &mut disconnect_event_pending).await {
             Ok(()) => {
                 tracing::info!("RTSP input stopped (cancelled)");
                 break;
@@ -58,6 +67,16 @@ async fn rtsp_input_loop(
                     e,
                     config.reconnect_delay_secs
                 );
+                // Emit disconnect event once per connection cycle (not on every retry)
+                if disconnect_event_pending {
+                    event_sender.emit_flow(
+                        EventSeverity::Warning,
+                        "rtsp",
+                        format!("RTSP input disconnected: {e}. Reconnecting in {}s", config.reconnect_delay_secs),
+                        &flow_id,
+                    );
+                    disconnect_event_pending = false;
+                }
                 tokio::select! {
                     _ = cancel.cancelled() => {
                         tracing::info!("RTSP input stopped during reconnect wait");
@@ -75,6 +94,9 @@ async fn run_rtsp_session(
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     stats: &Arc<FlowStatsAccumulator>,
     cancel: &CancellationToken,
+    event_sender: &EventSender,
+    flow_id: &str,
+    disconnect_event_pending: &mut bool,
 ) -> anyhow::Result<()> {
     use retina::client::{PlayOptions, SessionGroup, SetupOptions};
     use retina::codec::{CodecItem, FrameFormat};
@@ -145,6 +167,13 @@ async fn run_rtsp_session(
         .demuxed()?;
 
     tracing::info!("RTSP: connected and playing from {}", config.rtsp_url);
+    event_sender.emit_flow(
+        EventSeverity::Info,
+        "rtsp",
+        format!("RTSP connected to {}", config.rtsp_url),
+        flow_id,
+    );
+    *disconnect_event_pending = true;
 
     let mut ts_muxer = TsMuxer::new();
     ts_muxer.set_has_video(has_video);

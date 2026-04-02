@@ -482,6 +482,7 @@ mod tests {
                 name: "SRT Flow".to_string(),
                 enabled: true,
                 media_analysis: true,
+                thumbnail: true,
                 input: InputConfig::Srt(SrtInputConfig {
                     mode: SrtMode::Listener,
                     local_addr: "0.0.0.0:9000".to_string(),
@@ -622,6 +623,7 @@ mod tests {
                 name: "SRT Flow".to_string(),
                 enabled: true,
                 media_analysis: true,
+                thumbnail: true,
                 input: InputConfig::Srt(SrtInputConfig {
                     mode: SrtMode::Listener,
                     local_addr: "0.0.0.0:9000".to_string(),
@@ -679,6 +681,7 @@ mod tests {
                 name: "RTMP Flow".to_string(),
                 enabled: true,
                 media_analysis: true,
+                thumbnail: true,
                 input: InputConfig::Rtp(RtpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
                     interface_addr: None,
@@ -738,6 +741,7 @@ mod tests {
                 name: "SRT Flow".to_string(),
                 enabled: true,
                 media_analysis: true,
+                thumbnail: true,
                 input: InputConfig::Srt(SrtInputConfig {
                     mode: SrtMode::Listener,
                     local_addr: "0.0.0.0:9000".to_string(),

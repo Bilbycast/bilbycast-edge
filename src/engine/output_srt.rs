@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::{SrtMode, SrtOutputConfig};
+use crate::manager::events::{EventSender, EventSeverity};
 use crate::srt::connection::{
     accept_srt_connection, bind_srt_listener_for_output, bind_srt_listener_for_redundancy,
     connect_srt_output, connect_srt_redundancy_leg, spawn_srt_stats_poller,
@@ -27,14 +28,16 @@ pub fn spawn_srt_output(
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     output_stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
+    event_sender: EventSender,
+    flow_id: String,
 ) -> JoinHandle<()> {
     let broadcast_tx = broadcast_tx.clone();
 
     tokio::spawn(async move {
         let result = if config.redundancy.is_some() {
-            srt_output_redundant_loop(&config, &broadcast_tx, output_stats, cancel).await
+            srt_output_redundant_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id).await
         } else {
-            srt_output_loop(&config, &broadcast_tx, output_stats, cancel).await
+            srt_output_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id).await
         };
         if let Err(e) = result {
             tracing::error!("SRT output '{}' exited with error: {e}", config.id);
@@ -56,10 +59,12 @@ async fn srt_output_loop(
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
+    events: &EventSender,
+    flow_id: &str,
 ) -> anyhow::Result<()> {
     match config.mode {
-        SrtMode::Listener => srt_output_listener_loop(config, broadcast_tx, stats, cancel).await,
-        _ => srt_output_caller_loop(config, broadcast_tx, stats, cancel).await,
+        SrtMode::Listener => srt_output_listener_loop(config, broadcast_tx, stats, cancel, events, flow_id).await,
+        _ => srt_output_caller_loop(config, broadcast_tx, stats, cancel, events, flow_id).await,
     }
 }
 
@@ -70,6 +75,8 @@ async fn srt_output_listener_loop(
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
+    events: &EventSender,
+    flow_id: &str,
 ) -> anyhow::Result<()> {
     let mut listener = bind_srt_listener_for_output(config).await?;
 
@@ -96,6 +103,7 @@ async fn srt_output_listener_loop(
             config.id,
             config.local_addr,
         );
+        events.emit_flow(EventSeverity::Info, "srt", format!("SRT output '{}' connected", config.id), flow_id);
 
         // Validate the connection is alive before committing to it.
         // Under high delay/loss, the listener may accept a stale connection
@@ -145,6 +153,7 @@ async fn srt_output_listener_loop(
                 "SRT output '{}' stale connection detected, re-accepting...",
                 config.id
             );
+            events.emit_flow(EventSeverity::Warning, "srt", format!("SRT output '{}' stale connection detected", config.id), flow_id);
             let _ = socket.close().await;
             continue;
         }
@@ -176,6 +185,7 @@ async fn srt_output_listener_loop(
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
         }
 
+        events.emit_flow(EventSeverity::Warning, "srt", format!("SRT output '{}' disconnected", config.id), flow_id);
         tracing::info!("SRT output '{}' waiting for caller to reconnect...", config.id);
     }
 }
@@ -186,6 +196,8 @@ async fn srt_output_caller_loop(
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
+    events: &EventSender,
+    flow_id: &str,
 ) -> anyhow::Result<()> {
     loop {
         let socket = match connect_srt_output(config, &cancel).await {
@@ -199,6 +211,7 @@ async fn srt_output_caller_loop(
                     return Ok(());
                 }
                 tracing::error!("SRT output '{}' connection failed: {e}", config.id);
+                events.emit_flow(EventSeverity::Critical, "srt", format!("SRT output '{}' connection failed: {e}", config.id), flow_id);
                 return Err(e);
             }
         };
@@ -209,6 +222,7 @@ async fn srt_output_caller_loop(
             config.mode,
             config.local_addr,
         );
+        events.emit_flow(EventSeverity::Info, "srt", format!("SRT output '{}' connected", config.id), flow_id);
 
         // Subscribe AFTER the peer connects so no stale packets accumulate
         let mut rx = broadcast_tx.subscribe();
@@ -233,6 +247,7 @@ async fn srt_output_caller_loop(
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
         }
 
+        events.emit_flow(EventSeverity::Warning, "srt", format!("SRT output '{}' disconnected", config.id), flow_id);
         tracing::info!("SRT output '{}' attempting reconnection...", config.id);
     }
 
@@ -342,6 +357,8 @@ async fn srt_output_redundant_loop(
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
+    events: &EventSender,
+    flow_id: &str,
 ) -> anyhow::Result<()> {
     let redundancy = config
         .redundancy
@@ -386,6 +403,7 @@ async fn srt_output_redundant_loop(
             config.mode,
             config.local_addr
         );
+        events.emit_flow(EventSeverity::Info, "srt", format!("SRT output '{}' connected", config.id), flow_id);
 
         // Connect/accept leg 2 (best-effort — fall back to single-leg if it fails)
         let socket_leg2 = if let Some(ref mut listener) = listener_leg2 {
@@ -572,6 +590,7 @@ async fn srt_output_redundant_loop(
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
         }
 
+        events.emit_flow(EventSeverity::Warning, "srt", format!("SRT output '{}' disconnected", config.id), flow_id);
         tracing::info!("SRT output '{}' (redundant) attempting reconnection...", config.id);
     }
 }

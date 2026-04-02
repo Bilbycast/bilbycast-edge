@@ -22,6 +22,7 @@ use super::config::{TunnelConfig, TunnelDirection, TunnelMode, TunnelProtocol};
 use super::relay_client::{self, RelayTunnelParams, RelayTunnelState};
 use super::tcp_forwarder::{self, TcpForwarderStats};
 use super::udp_forwarder::{self, UdpForwarderStats};
+use crate::manager::events::{EventSender, EventSeverity};
 use crate::stats::throughput::ThroughputEstimator;
 
 /// Runtime state for an active tunnel.
@@ -67,14 +68,22 @@ pub struct TunnelManager {
     tunnels: Arc<DashMap<String, TunnelRuntime>>,
     /// Manager node_id, used to identify this edge to relay nodes.
     manager_node_id: Mutex<Option<String>>,
+    /// Event sender for forwarding operational events to the manager.
+    event_sender: EventSender,
 }
 
 impl TunnelManager {
-    pub fn new() -> Self {
+    pub fn new(event_sender: EventSender) -> Self {
         Self {
             tunnels: Arc::new(DashMap::new()),
             manager_node_id: Mutex::new(None),
+            event_sender,
         }
+    }
+
+    /// Get a reference to the event sender.
+    pub fn event_sender(&self) -> &EventSender {
+        &self.event_sender
     }
 
     /// Set the manager node_id (called after manager registration/auth).
@@ -131,6 +140,8 @@ impl TunnelManager {
             }
         }
 
+        let tunnel_name = config.name.clone();
+        let tunnel_id_str = config.id.clone();
         self.tunnels.insert(
             config.id.clone(),
             TunnelRuntime {
@@ -142,6 +153,13 @@ impl TunnelManager {
                 throughput_in: Mutex::new(ThroughputEstimator::new()),
                 throughput_out: Mutex::new(ThroughputEstimator::new()),
             },
+        );
+
+        self.event_sender.emit_flow(
+            EventSeverity::Info,
+            "tunnel",
+            format!("Tunnel '{}' started", tunnel_name),
+            &tunnel_id_str,
         );
 
         Ok(())
@@ -191,7 +209,9 @@ impl TunnelManager {
         let direction = config.direction;
         let protocol = config.protocol;
         let config_id = config.id.clone();
+        let config_name = config.name.clone();
         let tunnels = self.tunnels.clone();
+        let event_sender = self.event_sender.clone();
 
         // Spawn the tunnel lifecycle task
         tokio::spawn(async move {
@@ -205,12 +225,19 @@ impl TunnelManager {
                 udp_stats,
                 tcp_stats,
                 cipher,
+                event_sender.clone(),
             )
             .await;
 
             if let Err(e) = result {
                 if !cancel.is_cancelled() {
                     tracing::error!(tunnel_id = %config_id, "Relay tunnel failed: {e}");
+                    event_sender.emit_flow(
+                        EventSeverity::Critical,
+                        "tunnel",
+                        format!("Tunnel '{}' failed: {e}", config_name),
+                        &config_id,
+                    );
                     // Remove from DashMap so manager re-push can re-create it
                     tunnels.remove(&config_id);
                 }
@@ -241,7 +268,9 @@ impl TunnelManager {
         let protocol = config.protocol;
         let config_clone = config.clone();
         let config_id = config.id.clone();
+        let config_name = config.name.clone();
         let tunnels = self.tunnels.clone();
+        let event_sender = self.event_sender.clone();
 
         tokio::spawn(async move {
             let result = run_direct_tunnel(
@@ -261,6 +290,12 @@ impl TunnelManager {
             if let Err(e) = result {
                 if !cancel.is_cancelled() {
                     tracing::error!(tunnel_id = %tunnel_id, "Direct tunnel failed: {e}");
+                    event_sender.emit_flow(
+                        EventSeverity::Critical,
+                        "tunnel",
+                        format!("Tunnel '{}' failed: {e}", config_name),
+                        &config_id,
+                    );
                     // Remove from DashMap so manager re-push can re-create it
                     tunnels.remove(&config_id);
                 }
@@ -277,8 +312,17 @@ impl TunnelManager {
             .remove(id)
             .ok_or_else(|| anyhow::anyhow!("Tunnel '{id}' not found"))?;
 
+        let tunnel_name = runtime.config.name.clone();
         runtime.cancel.cancel();
         tracing::info!(tunnel_id = %id, "Tunnel destroyed");
+
+        self.event_sender.emit_flow(
+            EventSeverity::Info,
+            "tunnel",
+            format!("Tunnel '{}' stopped", tunnel_name),
+            id,
+        );
+
         Ok(())
     }
 
@@ -357,14 +401,16 @@ async fn run_relay_tunnel(
     udp_stats: Option<Arc<UdpForwarderStats>>,
     tcp_stats: Option<Arc<TcpForwarderStats>>,
     cipher: Option<Arc<super::crypto::TunnelCipher>>,
+    event_sender: EventSender,
 ) -> anyhow::Result<()> {
     let tunnel_id = params.tunnel_id;
+    let tunnel_id_str = tunnel_id.to_string();
     let max_backoff = Duration::from_secs(60);
     let mut reconnect_backoff = Duration::from_secs(1);
 
     loop {
         // Connect with retry (handles its own internal backoff for initial connect)
-        let conn = relay_client::connect_with_retry(&params, &state_tx, cancel.clone()).await?;
+        let conn = relay_client::connect_with_retry(&params, &state_tx, cancel.clone(), event_sender.clone()).await?;
 
         tracing::info!(
             tunnel_id = %tunnel_id,
@@ -389,14 +435,30 @@ async fn run_relay_tunnel(
 
         // Connection lost — log and prepare to reconnect
         match result {
-            Err(ref e) => tracing::warn!(
-                tunnel_id = %tunnel_id,
-                "Relay tunnel connection lost: {e}, reconnecting in {reconnect_backoff:?}"
-            ),
-            Ok(()) => tracing::warn!(
-                tunnel_id = %tunnel_id,
-                "Relay tunnel forwarder exited, reconnecting in {reconnect_backoff:?}"
-            ),
+            Err(ref e) => {
+                tracing::warn!(
+                    tunnel_id = %tunnel_id,
+                    "Relay tunnel connection lost: {e}, reconnecting in {reconnect_backoff:?}"
+                );
+                event_sender.emit_flow(
+                    EventSeverity::Warning,
+                    "tunnel",
+                    format!("Tunnel disconnected from relay: {e}"),
+                    &tunnel_id_str,
+                );
+            }
+            Ok(()) => {
+                tracing::warn!(
+                    tunnel_id = %tunnel_id,
+                    "Relay tunnel forwarder exited, reconnecting in {reconnect_backoff:?}"
+                );
+                event_sender.emit_flow(
+                    EventSeverity::Warning,
+                    "tunnel",
+                    "Tunnel disconnected from relay",
+                    &tunnel_id_str,
+                );
+            }
         }
 
         state_tx.send_replace(RelayTunnelState::Connecting);

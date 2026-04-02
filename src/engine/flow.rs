@@ -11,7 +11,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::*;
-use crate::stats::collector::{FlowStatsAccumulator, OutputStatsAccumulator};
+use crate::manager::events::EventSender;
+use crate::stats::collector::{FlowStatsAccumulator, OutputConfigMeta, OutputStatsAccumulator};
 
 use super::input_rtmp::spawn_rtmp_input;
 use super::input_rtp::spawn_rtp_input;
@@ -25,8 +26,9 @@ use super::output_udp::spawn_udp_output;
 use super::output_webrtc::spawn_webrtc_output;
 use super::packet::{BROADCAST_CHANNEL_CAPACITY, RtpPacket};
 use super::media_analysis::spawn_media_analyzer;
+use super::thumbnail::spawn_thumbnail_generator;
 use super::tr101290::spawn_tr101290_analyzer;
-use crate::stats::collector::{MediaAnalysisAccumulator, Tr101290Accumulator};
+use crate::stats::collector::{MediaAnalysisAccumulator, ThumbnailAccumulator, Tr101290Accumulator};
 
 /// Runtime state for a single media flow (one input, N outputs).
 ///
@@ -78,6 +80,10 @@ pub struct FlowRuntime {
     /// Stored to keep the JoinHandle alive; shutdown uses CancellationToken.
     #[allow(dead_code)]
     pub media_analysis_handle: Option<JoinHandle<()>>,
+    /// Thumbnail generation task handle (if enabled and ffmpeg available).
+    /// Stored to keep the JoinHandle alive; shutdown uses CancellationToken.
+    #[allow(dead_code)]
+    pub thumbnail_handle: Option<JoinHandle<()>>,
     /// WHIP input session channel sender (only set for WebRTC/WHIP input flows).
     /// Must be registered with the WebrtcSessionRegistry after flow creation.
     #[cfg(feature = "webrtc")]
@@ -86,6 +92,9 @@ pub struct FlowRuntime {
     /// Must be registered with the WebrtcSessionRegistry after flow creation.
     #[cfg(feature = "webrtc")]
     pub whep_session_tx: Option<(tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>, Option<String>)>,
+    /// Event sender for emitting operational events to the manager.
+    /// Stored so that hot-added outputs can also emit events.
+    pub event_sender: EventSender,
 }
 
 /// Runtime state for a single output within a flow.
@@ -131,7 +140,7 @@ impl FlowRuntime {
     /// Returns an error if any output task fails to start (e.g., socket
     /// bind failure). The input task is spawned first and errors there are
     /// reported asynchronously via the task's log output.
-    pub async fn start(config: FlowConfig, global_stats: &crate::stats::collector::StatsCollector) -> Result<Self> {
+    pub async fn start(config: FlowConfig, global_stats: &crate::stats::collector::StatsCollector, ffmpeg_available: bool, event_sender: EventSender) -> Result<Self> {
         let cancel_token = CancellationToken::new();
         // The broadcast channel is bounded to BROADCAST_CHANNEL_CAPACITY slots.
         // When a slow output (receiver) cannot keep up, it will *not* block the
@@ -160,7 +169,7 @@ impl FlowRuntime {
         );
 
         // Populate input config metadata for topology display
-        use crate::stats::collector::{InputConfigMeta, OutputConfigMeta};
+        use crate::stats::collector::InputConfigMeta;
         let input_meta = match &config.input {
             InputConfig::Rtp(c) => InputConfigMeta {
                 mode: None, local_addr: None, remote_addr: None,
@@ -206,38 +215,10 @@ impl FlowRuntime {
 
         // Populate output config metadata
         for oc in &config.outputs {
-            let meta = match oc {
-                OutputConfig::Srt(c) => OutputConfigMeta {
-                    mode: Some(format!("{:?}", c.mode).to_lowercase()),
-                    remote_addr: c.remote_addr.clone(),
-                    local_addr: Some(c.local_addr.clone()),
-                    dest_addr: None, dest_url: None, ingest_url: None, whip_url: None,
-                },
-                OutputConfig::Rtp(c) => OutputConfigMeta {
-                    mode: None, remote_addr: None, local_addr: None,
-                    dest_addr: Some(c.dest_addr.clone()),
-                    dest_url: None, ingest_url: None, whip_url: None,
-                },
-                OutputConfig::Udp(c) => OutputConfigMeta {
-                    mode: None, remote_addr: None, local_addr: None,
-                    dest_addr: Some(c.dest_addr.clone()),
-                    dest_url: None, ingest_url: None, whip_url: None,
-                },
-                OutputConfig::Rtmp(c) => OutputConfigMeta {
-                    mode: None, remote_addr: None, local_addr: None, dest_addr: None,
-                    dest_url: Some(c.dest_url.clone()),
-                    ingest_url: None, whip_url: None,
-                },
-                OutputConfig::Hls(c) => OutputConfigMeta {
-                    mode: None, remote_addr: None, local_addr: None, dest_addr: None, dest_url: None,
-                    ingest_url: Some(c.ingest_url.clone()), whip_url: None,
-                },
-                OutputConfig::Webrtc(c) => OutputConfigMeta {
-                    mode: None, remote_addr: None, local_addr: None, dest_addr: None, dest_url: None,
-                    ingest_url: None, whip_url: c.whip_url.clone(),
-                },
-            };
-            flow_stats.output_config_meta.insert(oc.id().to_string(), meta);
+            flow_stats.output_config_meta.insert(
+                oc.id().to_string(),
+                build_output_config_meta(oc),
+            );
         }
 
         // Start input task
@@ -266,6 +247,8 @@ impl FlowRuntime {
                     broadcast_tx.clone(),
                     flow_stats.clone(),
                     cancel_token.child_token(),
+                    event_sender.clone(),
+                    config.id.clone(),
                 )
             }
             InputConfig::Rtmp(rtmp_config) => {
@@ -274,6 +257,8 @@ impl FlowRuntime {
                     broadcast_tx.clone(),
                     flow_stats.clone(),
                     cancel_token.child_token(),
+                    event_sender.clone(),
+                    config.id.clone(),
                 )
             }
             InputConfig::Rtsp(rtsp_config) => {
@@ -282,6 +267,8 @@ impl FlowRuntime {
                     broadcast_tx.clone(),
                     flow_stats.clone(),
                     cancel_token.child_token(),
+                    event_sender.clone(),
+                    config.id.clone(),
                 )
             }
             #[cfg(feature = "webrtc")]
@@ -297,6 +284,7 @@ impl FlowRuntime {
                     flow_stats.clone(),
                     cancel_token.child_token(),
                     session_rx,
+                    event_sender.clone(),
                 )
             }
             #[cfg(not(feature = "webrtc"))]
@@ -314,6 +302,8 @@ impl FlowRuntime {
                     broadcast_tx.clone(),
                     flow_stats.clone(),
                     cancel_token.child_token(),
+                    event_sender.clone(),
+                    config.id.clone(),
                 )
             }
             #[cfg(not(feature = "webrtc"))]
@@ -395,6 +385,19 @@ impl FlowRuntime {
             None
         };
 
+        // Start thumbnail generator (if enabled and ffmpeg available)
+        let thumbnail_handle = if config.thumbnail && ffmpeg_available {
+            let thumb_acc = Arc::new(ThumbnailAccumulator::new());
+            flow_stats.thumbnail.set(thumb_acc.clone()).ok();
+            Some(spawn_thumbnail_generator(
+                &broadcast_tx,
+                thumb_acc,
+                cancel_token.child_token(),
+            ))
+        } else {
+            None
+        };
+
         // Start output tasks
         #[cfg(feature = "webrtc")]
         let mut whep_session_info: Option<(tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>, Option<String>)> = None;
@@ -420,6 +423,8 @@ impl FlowRuntime {
                 &broadcast_tx,
                 &flow_stats,
                 &cancel_token,
+                &event_sender,
+                &config.id,
                 #[cfg(feature = "webrtc")]
                 whep_rx,
             ).await?;
@@ -443,10 +448,12 @@ impl FlowRuntime {
             stats: flow_stats,
             analyzer_handle,
             media_analysis_handle,
+            thumbnail_handle,
             #[cfg(feature = "webrtc")]
             whip_session_tx: whip_session_info,
             #[cfg(feature = "webrtc")]
             whep_session_tx: whep_session_info,
+            event_sender,
         })
     }
 
@@ -464,6 +471,8 @@ impl FlowRuntime {
         broadcast_tx: &broadcast::Sender<RtpPacket>,
         flow_stats: &Arc<FlowStatsAccumulator>,
         parent_cancel: &CancellationToken,
+        event_sender: &EventSender,
+        flow_id: &str,
         #[cfg(feature = "webrtc")]
         whep_session_rx: Option<tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>>,
     ) -> Result<OutputRuntime> {
@@ -522,6 +531,8 @@ impl FlowRuntime {
                     broadcast_tx,
                     output_stats.clone(),
                     output_cancel.clone(),
+                    event_sender.clone(),
+                    flow_id.to_string(),
                 );
 
                 Ok(OutputRuntime {
@@ -562,6 +573,8 @@ impl FlowRuntime {
                     broadcast_tx,
                     output_stats.clone(),
                     output_cancel.clone(),
+                    event_sender.clone(),
+                    flow_id.to_string(),
                 );
 
                 Ok(OutputRuntime {
@@ -584,6 +597,8 @@ impl FlowRuntime {
                     output_cancel.clone(),
                     #[cfg(feature = "webrtc")]
                     whep_session_rx,
+                    event_sender.clone(),
+                    flow_id.to_string(),
                 );
 
                 Ok(OutputRuntime {
@@ -620,9 +635,17 @@ impl FlowRuntime {
             &self.broadcast_tx,
             flow_stats,
             &self.cancel_token,
+            &self.event_sender,
+            &self.config.id,
             #[cfg(feature = "webrtc")]
             None,
         ).await?;
+
+        // Update output config metadata so stats snapshots reflect the new address/port
+        flow_stats.output_config_meta.insert(
+            output_id.clone(),
+            build_output_config_meta(&output_config),
+        );
 
         let mut handles = self.output_handles.write().await;
         handles.insert(output_id.clone(), output_rt);
@@ -680,5 +703,43 @@ impl FlowRuntime {
         for handle in output_handles {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         }
+    }
+}
+
+/// Build topology-display metadata from an output config.
+///
+/// Used both at initial flow creation and when hot-adding outputs so that
+/// stats snapshots always reflect the current output address/port.
+fn build_output_config_meta(config: &OutputConfig) -> OutputConfigMeta {
+    match config {
+        OutputConfig::Srt(c) => OutputConfigMeta {
+            mode: Some(format!("{:?}", c.mode).to_lowercase()),
+            remote_addr: c.remote_addr.clone(),
+            local_addr: Some(c.local_addr.clone()),
+            dest_addr: None, dest_url: None, ingest_url: None, whip_url: None,
+        },
+        OutputConfig::Rtp(c) => OutputConfigMeta {
+            mode: None, remote_addr: None, local_addr: None,
+            dest_addr: Some(c.dest_addr.clone()),
+            dest_url: None, ingest_url: None, whip_url: None,
+        },
+        OutputConfig::Udp(c) => OutputConfigMeta {
+            mode: None, remote_addr: None, local_addr: None,
+            dest_addr: Some(c.dest_addr.clone()),
+            dest_url: None, ingest_url: None, whip_url: None,
+        },
+        OutputConfig::Rtmp(c) => OutputConfigMeta {
+            mode: None, remote_addr: None, local_addr: None, dest_addr: None,
+            dest_url: Some(c.dest_url.clone()),
+            ingest_url: None, whip_url: None,
+        },
+        OutputConfig::Hls(c) => OutputConfigMeta {
+            mode: None, remote_addr: None, local_addr: None, dest_addr: None, dest_url: None,
+            ingest_url: Some(c.ingest_url.clone()), whip_url: None,
+        },
+        OutputConfig::Webrtc(c) => OutputConfigMeta {
+            mode: None, remote_addr: None, local_addr: None, dest_addr: None, dest_url: None,
+            ingest_url: None, whip_url: c.whip_url.clone(),
+        },
     }
 }

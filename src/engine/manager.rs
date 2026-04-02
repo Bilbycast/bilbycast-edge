@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 use dashmap::DashMap;
 
 use crate::config::models::{FlowConfig, OutputConfig};
+use crate::manager::events::{EventSender, EventSeverity};
 use crate::stats::collector::StatsCollector;
 
 use super::flow::FlowRuntime;
@@ -35,6 +36,11 @@ pub struct FlowManager {
     /// Global stats collector shared across all flows; each flow registers
     /// itself here on creation and unregisters on destruction.
     stats: Arc<StatsCollector>,
+    /// Whether ffmpeg is available on this device (detected at startup).
+    /// Used to gate optional thumbnail generation per flow.
+    ffmpeg_available: bool,
+    /// Event sender for forwarding operational events to the manager.
+    event_sender: EventSender,
 }
 
 impl FlowManager {
@@ -43,11 +49,23 @@ impl FlowManager {
     /// The provided [`StatsCollector`] is shared with every flow that is
     /// subsequently created, allowing the stats subsystem to aggregate
     /// metrics across all flows.
-    pub fn new(stats: Arc<StatsCollector>) -> Self {
+    pub fn new(stats: Arc<StatsCollector>, ffmpeg_available: bool, event_sender: EventSender) -> Self {
         Self {
             flows: DashMap::new(),
             stats,
+            ffmpeg_available,
+            event_sender,
         }
+    }
+
+    /// Get a clone of the event sender for passing to sub-components.
+    pub fn event_sender(&self) -> &EventSender {
+        &self.event_sender
+    }
+
+    /// Whether ffmpeg is available on this device.
+    pub fn ffmpeg_available(&self) -> bool {
+        self.ffmpeg_available
     }
 
     /// Return the number of flows that are currently active (running).
@@ -80,10 +98,29 @@ impl FlowManager {
             bail!("Flow '{}' is already running", config.id);
         }
 
-        let runtime = FlowRuntime::start(config.clone(), &self.stats).await?;
-        let runtime = Arc::new(runtime);
-        self.flows.insert(config.id.clone(), runtime.clone());
-        Ok(runtime)
+        let flow_id = config.id.clone();
+        match FlowRuntime::start(config.clone(), &self.stats, self.ffmpeg_available, self.event_sender.clone()).await {
+            Ok(runtime) => {
+                let runtime = Arc::new(runtime);
+                self.flows.insert(flow_id.clone(), runtime.clone());
+                self.event_sender.emit_flow(
+                    EventSeverity::Info,
+                    "flow",
+                    format!("Flow '{}' started", flow_id),
+                    &flow_id,
+                );
+                Ok(runtime)
+            }
+            Err(e) => {
+                self.event_sender.emit_flow(
+                    EventSeverity::Critical,
+                    "flow",
+                    format!("Flow '{}' failed to start: {e}", flow_id),
+                    &flow_id,
+                );
+                Err(e)
+            }
+        }
     }
 
     /// Stop and remove a running flow by its ID.
@@ -99,6 +136,12 @@ impl FlowManager {
         if let Some((_, runtime)) = self.flows.remove(flow_id) {
             runtime.stop().await;
             self.stats.unregister_flow(flow_id);
+            self.event_sender.emit_flow(
+                EventSeverity::Info,
+                "flow",
+                format!("Flow '{flow_id}' stopped"),
+                flow_id,
+            );
             Ok(())
         } else {
             bail!("Flow '{}' is not running", flow_id);
@@ -126,11 +169,31 @@ impl FlowManager {
     /// Returns an error if the flow is not running or if the output fails to
     /// start (e.g., socket bind failure).
     pub async fn add_output(&self, flow_id: &str, output: OutputConfig) -> Result<()> {
+        let output_id = output.id().to_string();
         let runtime = self
             .flows
             .get(flow_id)
             .ok_or_else(|| anyhow::anyhow!("Flow '{}' is not running", flow_id))?;
-        runtime.add_output(output, &runtime.stats).await
+        match runtime.add_output(output, &runtime.stats).await {
+            Ok(()) => {
+                self.event_sender.emit_flow(
+                    EventSeverity::Info,
+                    "flow",
+                    format!("Output '{output_id}' added to flow '{flow_id}'"),
+                    flow_id,
+                );
+                Ok(())
+            }
+            Err(e) => {
+                self.event_sender.emit_flow(
+                    EventSeverity::Warning,
+                    "flow",
+                    format!("Output '{output_id}' failed to start on flow '{flow_id}': {e}"),
+                    flow_id,
+                );
+                Err(e)
+            }
+        }
     }
 
     /// Remove a single output from a running flow without affecting other outputs.
@@ -146,7 +209,14 @@ impl FlowManager {
             .flows
             .get(flow_id)
             .ok_or_else(|| anyhow::anyhow!("Flow '{}' is not running", flow_id))?;
-        runtime.remove_output(output_id).await
+        runtime.remove_output(output_id).await?;
+        self.event_sender.emit_flow(
+            EventSeverity::Info,
+            "flow",
+            format!("Output '{output_id}' removed from flow '{flow_id}'"),
+            flow_id,
+        );
+        Ok(())
     }
 
     /// Gracefully stop all running flows, typically called during application shutdown.

@@ -110,9 +110,13 @@ fn process_rtp_packet(packet: &RtpPacket, stats: &Tr101290Accumulator) {
         let recv_us = packet.recv_time_us;
         let rtp_ts = packet.rtp_timestamp;
 
+        // Read previous values BEFORE updating state
+        let prev_recv = state.last_recv_time_us;
+        let prev_ts = state.last_rtp_timestamp;
+
         // IAT: delta between consecutive packet arrival times
-        if let Some(prev_recv) = state.last_recv_time_us {
-            let iat = recv_us.saturating_sub(prev_recv) as f64;
+        if let Some(prev_recv_us) = prev_recv {
+            let iat = recv_us.saturating_sub(prev_recv_us) as f64;
             if iat < state.iat_min_us {
                 state.iat_min_us = iat;
             }
@@ -122,22 +126,21 @@ fn process_rtp_packet(packet: &RtpPacket, stats: &Tr101290Accumulator) {
             state.iat_sum_us += iat;
             state.iat_count += 1;
         }
-        state.last_recv_time_us = Some(recv_us);
 
         // PDV/Jitter: RFC 3550 exponential moving average
         // D(i-1,i) = |(recv_i - recv_{i-1}) - (ts_i - ts_{i-1})|
         // J = J + (|D| - J) / 16
-        if let (Some(prev_recv), Some(prev_ts)) =
-            (state.last_recv_time_us, state.last_rtp_timestamp)
-        {
+        if let (Some(prev_recv_us), Some(prev_rtp_ts)) = (prev_recv, prev_ts) {
             // recv delta in microseconds
-            let recv_delta = recv_us as f64 - state.last_recv_time_us.unwrap_or(recv_us) as f64;
+            let recv_delta = recv_us as f64 - prev_recv_us as f64;
             // RTP timestamp delta in microseconds (assume 90kHz clock → 1 tick = 11.11 us)
-            let ts_delta = rtp_ts.wrapping_sub(prev_ts) as f64 * (1_000_000.0 / 90_000.0);
+            let ts_delta = rtp_ts.wrapping_sub(prev_rtp_ts) as f64 * (1_000_000.0 / 90_000.0);
             let d = (recv_delta - ts_delta).abs();
             state.jitter_us += (d - state.jitter_us) / 16.0;
-            let _ = prev_recv; // suppress warning
         }
+
+        // Update state AFTER reading previous values
+        state.last_recv_time_us = Some(recv_us);
         state.last_rtp_timestamp = Some(rtp_ts);
     }
 
@@ -182,6 +185,7 @@ fn process_ts_packet(
     // ── 2. Transport Error Indicator ──
     if ts_tei(pkt) {
         stats.tei_errors.fetch_add(1, Ordering::Relaxed);
+        stats.window_tei_errors.fetch_add(1, Ordering::Relaxed);
     }
 
     let pid = ts_pid(pkt);
@@ -195,6 +199,7 @@ fn process_ts_packet(
             // Allow duplicate (same CC) per spec, but flag other mismatches
             if cc != expected && cc != prev_cc {
                 stats.cc_errors.fetch_add(1, Ordering::Relaxed);
+                stats.window_cc_errors.fetch_add(1, Ordering::Relaxed);
             }
         }
         state.cc_tracker.insert(pid, cc);
@@ -207,6 +212,15 @@ fn process_ts_packet(
 
         if ts_pusi(pkt) {
             stats.pat_count.fetch_add(1, Ordering::Relaxed);
+
+            // CRC-32 verification (Priority 2)
+            if let Some(section_start) = psi_section_start(pkt) {
+                if !verify_psi_crc(pkt, section_start) {
+                    stats.crc_errors.fetch_add(1, Ordering::Relaxed);
+                    stats.window_crc_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
             let pmt_pids = parse_pat_pmt_pids(pkt);
             // Update known PMT PIDs — add new ones, keep existing timestamps
             for &pmt_pid in &pmt_pids {
@@ -223,47 +237,79 @@ fn process_ts_packet(
         state.pmt_pids.insert(pid, Some(now));
         if ts_pusi(pkt) {
             stats.pmt_count.fetch_add(1, Ordering::Relaxed);
+
+            // CRC-32 verification (Priority 2)
+            if let Some(section_start) = psi_section_start(pkt) {
+                if !verify_psi_crc(pkt, section_start) {
+                    stats.crc_errors.fetch_add(1, Ordering::Relaxed);
+                    stats.window_crc_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            // Extract ES PIDs from PMT for PID error tracking (Priority 1)
+            extract_es_pids_from_pmt(pkt, state);
             // VSF TR-07 detection: scan PMT for JPEG XS stream type (0x61)
             detect_jpeg_xs_in_pmt(pkt, state);
         }
     }
 
+    // ── 5b. Track ES PID presence for PID error check (Priority 1) ──
+    if state.es_pids.contains_key(&pid) {
+        state.es_pids.insert(pid, Some(now));
+    }
+
     // ── 6. PCR checks ──
     if let Some(pcr_value) = extract_pcr(pkt) {
-        if let Some(prev) = state.pcr_tracker.get(&pid) {
-            // PCR discontinuity: jump > 100ms or backwards
-            let pcr_delta = if pcr_value >= prev.last_pcr_value {
-                pcr_value - prev.last_pcr_value
-            } else {
-                // PCR went backwards
-                stats
-                    .pcr_discontinuity_errors
-                    .fetch_add(1, Ordering::Relaxed);
-                0 // Skip accuracy check for backwards PCR
-            };
+        // When discontinuity_indicator is set, the PCR jump is expected
+        // (e.g., stream switch) — skip discontinuity and accuracy checks
+        // but still update the tracker for subsequent packets.
+        let discontinuity_expected = ts_discontinuity_indicator(pkt);
 
-            if pcr_delta > 0 {
-                if pcr_delta > PCR_DISCONTINUITY_THRESHOLD {
+        if let Some(prev) = state.pcr_tracker.get(&pid) {
+            if !discontinuity_expected {
+                // PCR discontinuity: jump > 100ms or backwards
+                let pcr_delta = if pcr_value >= prev.last_pcr_value {
+                    pcr_value - prev.last_pcr_value
+                } else {
+                    // PCR went backwards
                     stats
                         .pcr_discontinuity_errors
                         .fetch_add(1, Ordering::Relaxed);
-                }
-
-                // PCR accuracy: compare PCR delta to wall-clock delta
-                let wall_delta = now.duration_since(prev.last_pcr_wall_time);
-                let wall_delta_27mhz =
-                    wall_delta.as_secs() * 27_000_000 + wall_delta.subsec_nanos() as u64 * 27 / 1000;
-                let jitter_27mhz = if pcr_delta > wall_delta_27mhz {
-                    pcr_delta - wall_delta_27mhz
-                } else {
-                    wall_delta_27mhz - pcr_delta
-                };
-                // Convert jitter from 27MHz ticks to nanoseconds: ticks * 1000 / 27
-                let jitter_ns = jitter_27mhz * 1000 / 27;
-                if jitter_ns > PCR_JITTER_THRESHOLD_NS {
                     stats
-                        .pcr_accuracy_errors
+                        .window_pcr_discontinuity_errors
                         .fetch_add(1, Ordering::Relaxed);
+                    0 // Skip accuracy check for backwards PCR
+                };
+
+                if pcr_delta > 0 {
+                    if pcr_delta > PCR_DISCONTINUITY_THRESHOLD {
+                        stats
+                            .pcr_discontinuity_errors
+                            .fetch_add(1, Ordering::Relaxed);
+                        stats
+                            .window_pcr_discontinuity_errors
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    // PCR accuracy: compare PCR delta to wall-clock delta
+                    let wall_delta = now.duration_since(prev.last_pcr_wall_time);
+                    let wall_delta_27mhz =
+                        wall_delta.as_secs() * 27_000_000 + wall_delta.subsec_nanos() as u64 * 27 / 1000;
+                    let jitter_27mhz = if pcr_delta > wall_delta_27mhz {
+                        pcr_delta - wall_delta_27mhz
+                    } else {
+                        wall_delta_27mhz - pcr_delta
+                    };
+                    // Convert jitter from 27MHz ticks to nanoseconds: ticks * 1000 / 27
+                    let jitter_ns = jitter_27mhz * 1000 / 27;
+                    if jitter_ns > PCR_JITTER_THRESHOLD_NS {
+                        stats
+                            .pcr_accuracy_errors
+                            .fetch_add(1, Ordering::Relaxed);
+                        stats
+                            .window_pcr_accuracy_errors
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -276,6 +322,77 @@ fn process_ts_packet(
             },
         );
     }
+}
+
+/// Get the section start offset within a TS packet containing a PSI section
+/// with PUSI set. Returns the offset of the table_id byte.
+fn psi_section_start(pkt: &[u8]) -> Option<usize> {
+    if !ts_pusi(pkt) {
+        return None;
+    }
+    let mut offset = 4;
+    if ts_has_adaptation(pkt) {
+        let af_len = pkt[4] as usize;
+        offset = 5 + af_len;
+    }
+    if offset >= TS_PACKET_SIZE {
+        return None;
+    }
+    let pointer = pkt[offset] as usize;
+    let section_start = offset + 1 + pointer;
+    if section_start >= TS_PACKET_SIZE {
+        return None;
+    }
+    Some(section_start)
+}
+
+/// Extract elementary stream PIDs from a PMT section and register them
+/// for PID error tracking (TR-101290 Priority 1).
+fn extract_es_pids_from_pmt(pkt: &[u8], state: &mut crate::stats::collector::Tr101290State) {
+    if !ts_pusi(pkt) {
+        return;
+    }
+
+    let mut offset = 4;
+    if ts_has_adaptation(pkt) {
+        let af_len = pkt[4] as usize;
+        offset = 5 + af_len;
+    }
+    if offset >= TS_PACKET_SIZE {
+        return;
+    }
+
+    let pointer = pkt[offset] as usize;
+    offset += 1 + pointer;
+
+    if offset + 12 > TS_PACKET_SIZE {
+        return;
+    }
+    let table_id = pkt[offset];
+    if table_id != 0x02 {
+        return;
+    }
+    let section_length =
+        (((pkt[offset + 1] & 0x0F) as usize) << 8) | (pkt[offset + 2] as usize);
+    let program_info_length =
+        (((pkt[offset + 10] & 0x0F) as usize) << 8) | (pkt[offset + 11] as usize);
+
+    let data_start = offset + 12 + program_info_length;
+    let data_end = (offset + 3 + section_length).min(TS_PACKET_SIZE).saturating_sub(4);
+
+    let mut new_es_pids = std::collections::HashSet::new();
+    let mut pos = data_start;
+    while pos + 5 <= data_end {
+        let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
+        let es_info_length =
+            (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
+        new_es_pids.insert(es_pid);
+        // Register ES PID if not already tracked
+        state.es_pids.entry(es_pid).or_insert(None);
+        pos += 5 + es_info_length;
+    }
+    // Remove ES PIDs no longer referenced by this PMT
+    state.es_pids.retain(|pid, _| new_es_pids.contains(pid));
 }
 
 /// VSF TR-07 detection: scan a PMT section for JPEG XS stream type (0x61).
@@ -355,6 +472,7 @@ fn check_pat_pmt_timeouts(stats: &Tr101290Accumulator) {
     if let Some(last) = state.last_pat_time {
         if now.duration_since(last) > PAT_PMT_TIMEOUT {
             stats.pat_errors.fetch_add(1, Ordering::Relaxed);
+            stats.window_pat_errors.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -363,11 +481,29 @@ fn check_pat_pmt_timeouts(stats: &Tr101290Accumulator) {
         match last_time {
             Some(t) if now.duration_since(*t) > PAT_PMT_TIMEOUT => {
                 stats.pmt_errors.fetch_add(1, Ordering::Relaxed);
+                stats.window_pmt_errors.fetch_add(1, Ordering::Relaxed);
             }
             None => {
                 // PMT PID discovered in PAT but never seen yet — count as error
                 // only if we've been running long enough (PAT was already seen)
                 stats.pmt_errors.fetch_add(1, Ordering::Relaxed);
+                stats.window_pmt_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    // PID error check (Priority 1): ES PIDs referenced in PMT must appear
+    for (_, last_time) in &state.es_pids {
+        match last_time {
+            Some(t) if now.duration_since(*t) > PAT_PMT_TIMEOUT => {
+                stats.pid_errors.fetch_add(1, Ordering::Relaxed);
+                stats.window_pid_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {
+                // ES PID discovered in PMT but never seen yet
+                stats.pid_errors.fetch_add(1, Ordering::Relaxed);
+                stats.window_pid_errors.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
         }
@@ -544,16 +680,68 @@ mod tests {
         assert!(snap.priority1_ok);
         assert!(snap.priority2_ok);
 
-        // CC error → priority 1 not OK
+        // CC error → priority 1 not OK (must increment both cumulative and windowed)
         stats.cc_errors.fetch_add(1, Ordering::Relaxed);
+        stats.window_cc_errors.fetch_add(1, Ordering::Relaxed);
         let snap = stats.snapshot();
-        assert!(!snap.priority1_ok);
+        assert!(!snap.priority1_ok, "P1 should fail with CC error in window");
         assert!(snap.priority2_ok);
 
-        // TEI error → priority 2 not OK
+        // After snapshot, windowed CC was reset. Add TEI + CC again for combined test.
+        stats.cc_errors.fetch_add(1, Ordering::Relaxed);
+        stats.window_cc_errors.fetch_add(1, Ordering::Relaxed);
         stats.tei_errors.fetch_add(1, Ordering::Relaxed);
+        stats.window_tei_errors.fetch_add(1, Ordering::Relaxed);
         let snap = stats.snapshot();
-        assert!(!snap.priority1_ok);
-        assert!(!snap.priority2_ok);
+        assert!(!snap.priority1_ok, "P1 should fail with CC error in window");
+        assert!(!snap.priority2_ok, "P2 should fail with TEI error in window");
+
+        // After snapshot, windowed counters are reset → priorities should be OK again
+        let snap = stats.snapshot();
+        assert!(snap.priority1_ok, "P1 should be OK after window reset");
+        assert!(snap.priority2_ok, "P2 should be OK after window reset");
+        // But cumulative counters remain
+        assert_eq!(snap.cc_errors, 2);
+        assert_eq!(snap.tei_errors, 1);
+    }
+
+    #[test]
+    fn test_mpeg2_crc32_known_value() {
+        // MPEG-2 CRC-32 of an empty payload with initial 0xFFFFFFFF should produce a known value
+        assert_eq!(mpeg2_crc32(&[]), 0xFFFFFFFF);
+        // A valid PAT/PMT section (including its CRC) should produce 0
+        // Test with a minimal PAT: table_id=0, section_length includes CRC
+        // We verify the algorithm works by checking round-trip
+        let data = [0x00, 0x01, 0x02, 0x03];
+        let crc = mpeg2_crc32(&data);
+        assert_ne!(crc, 0); // Non-trivial data should not produce 0
+        // Append CRC bytes (big-endian) and verify the result is 0
+        let mut with_crc = data.to_vec();
+        with_crc.push((crc >> 24) as u8);
+        with_crc.push((crc >> 16) as u8);
+        with_crc.push((crc >> 8) as u8);
+        with_crc.push(crc as u8);
+        assert_eq!(mpeg2_crc32(&with_crc), 0, "CRC should be 0 when CRC bytes are appended");
+    }
+
+    #[test]
+    fn test_discontinuity_indicator() {
+        // Packet with adaptation field and discontinuity_indicator set
+        let mut pkt = vec![0u8; TS_PACKET_SIZE];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = 0x01; // PID high byte
+        pkt[2] = 0x00; // PID low byte
+        pkt[3] = 0x30; // adaptation_field_control = 0x11 (AF + payload)
+        pkt[4] = 0x07; // adaptation field length
+        pkt[5] = 0x80; // discontinuity_indicator = 1
+        assert!(ts_discontinuity_indicator(&pkt));
+
+        // Same packet without discontinuity flag
+        pkt[5] = 0x00;
+        assert!(!ts_discontinuity_indicator(&pkt));
+
+        // Packet without adaptation field
+        pkt[3] = 0x10; // payload only
+        assert!(!ts_discontinuity_indicator(&pkt));
     }
 }

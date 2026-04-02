@@ -219,6 +219,7 @@ mod tests {
                 name: "Test".to_string(),
                 enabled: true,
                 media_analysis: true,
+                thumbnail: true,
                 input: InputConfig::Rtp(RtpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
                     interface_addr: None,

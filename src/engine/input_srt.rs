@@ -10,6 +10,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::{SrtInputConfig, SrtMode};
+use crate::manager::events::{EventSender, EventSeverity};
 use crate::redundancy::merger::{ActiveLeg, HitlessMerger};
 use crate::srt::connection::{
     accept_srt_connection, bind_srt_listener_for_input, bind_srt_listener_for_redundancy,
@@ -87,15 +88,18 @@ pub fn spawn_srt_input(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
+    event_sender: EventSender,
+    flow_id: String,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let result = if config.redundancy.is_some() {
-            srt_input_redundant_loop(config, broadcast_tx, stats, cancel).await
+            srt_input_redundant_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id).await
         } else {
-            srt_input_loop(config, broadcast_tx, stats, cancel).await
+            srt_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id).await
         };
         if let Err(e) = result {
             tracing::error!("SRT input task exited with error: {e}");
+            event_sender.emit_flow(EventSeverity::Critical, "flow", format!("Flow input lost: {e}"), &flow_id);
         }
     })
 }
@@ -109,10 +113,12 @@ async fn srt_input_loop(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
+    events: &EventSender,
+    flow_id: &str,
 ) -> anyhow::Result<()> {
     match config.mode {
-        SrtMode::Listener => srt_input_listener_loop(config, broadcast_tx, stats, cancel).await,
-        _ => srt_input_caller_loop(config, broadcast_tx, stats, cancel).await,
+        SrtMode::Listener => srt_input_listener_loop(config, broadcast_tx, stats, cancel, events, flow_id).await,
+        _ => srt_input_caller_loop(config, broadcast_tx, stats, cancel, events, flow_id).await,
     }
 }
 
@@ -123,6 +129,8 @@ async fn srt_input_listener_loop(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
+    events: &EventSender,
+    flow_id: &str,
 ) -> anyhow::Result<()> {
     let mut listener = bind_srt_listener_for_input(&config).await?;
     let mut format = SrtPayloadFormat::Unknown;
@@ -140,6 +148,7 @@ async fn srt_input_listener_loop(
             }
             Err(e) => {
                 tracing::error!("SRT input accept failed: {e}");
+                events.emit_flow(EventSeverity::Critical, "srt", format!("SRT input connection failed: {e}"), flow_id);
                 let _ = listener.close().await;
                 return Err(e);
             }
@@ -149,6 +158,7 @@ async fn srt_input_listener_loop(
             "SRT input connected: mode=listener local={}",
             config.local_addr,
         );
+        events.emit_flow(EventSeverity::Info, "srt", "SRT input connected (mode=listener)", flow_id);
 
         let poller_cancel = cancel.child_token();
         spawn_srt_stats_poller(socket.clone(), stats.input_srt_stats_cache.clone(), poller_cancel.clone());
@@ -164,6 +174,8 @@ async fn srt_input_listener_loop(
             let _ = listener.close().await;
             return Ok(());
         }
+
+        events.emit_flow(EventSeverity::Warning, "srt", "SRT input disconnected, reconnecting", flow_id);
 
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -184,6 +196,8 @@ async fn srt_input_caller_loop(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
+    events: &EventSender,
+    flow_id: &str,
 ) -> anyhow::Result<()> {
     let mut format = SrtPayloadFormat::Unknown;
     let mut last_seq: Option<u16> = None;
@@ -199,6 +213,7 @@ async fn srt_input_caller_loop(
                     return Ok(());
                 }
                 tracing::error!("SRT input connection failed: {e}");
+                events.emit_flow(EventSeverity::Critical, "srt", format!("SRT input connection failed: {e}"), flow_id);
                 return Err(e);
             }
         };
@@ -208,6 +223,7 @@ async fn srt_input_caller_loop(
             config.mode,
             config.local_addr,
         );
+        events.emit_flow(EventSeverity::Info, "srt", format!("SRT input connected (mode={:?})", config.mode), flow_id);
 
         let poller_cancel = cancel.child_token();
         spawn_srt_stats_poller(socket.clone(), stats.input_srt_stats_cache.clone(), poller_cancel.clone());
@@ -222,6 +238,8 @@ async fn srt_input_caller_loop(
         if !disconnected {
             break;
         }
+
+        events.emit_flow(EventSeverity::Warning, "srt", "SRT input disconnected, reconnecting", flow_id);
 
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -349,6 +367,8 @@ async fn srt_input_redundant_loop(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
+    events: &EventSender,
+    flow_id: &str,
 ) -> anyhow::Result<()> {
     let redundancy = config
         .redundancy
@@ -404,6 +424,7 @@ async fn srt_input_redundant_loop(
             config.mode,
             config.local_addr
         );
+        events.emit_flow(EventSeverity::Info, "srt", "SRT input connected (mode=listener, redundant leg 1)", flow_id);
 
         // --- Connect/accept leg 2 (best-effort) ---
         let socket_leg2 = if let Some(ref mut listener) = listener_leg2 {
@@ -494,9 +515,11 @@ async fn srt_input_redundant_loop(
                         }
                         Err(_) => {
                             tracing::warn!("SRT input leg1 connection lost");
+                            events.emit_flow(EventSeverity::Warning, "redundancy", "Redundant leg 1 lost", flow_id);
                             leg1_alive = false;
                             if !leg2_alive {
                                 tracing::warn!("SRT input (redundant) both legs lost, will reconnect");
+                                events.emit_flow(EventSeverity::Critical, "redundancy", "Both redundant legs lost", flow_id);
                                 break;
                             }
                         }
@@ -523,9 +546,11 @@ async fn srt_input_redundant_loop(
                         }
                         Err(_) => {
                             tracing::warn!("SRT input leg2 connection lost");
+                            events.emit_flow(EventSeverity::Warning, "redundancy", "Redundant leg 2 lost", flow_id);
                             leg2_alive = false;
                             if !leg1_alive {
                                 tracing::warn!("SRT input (redundant) both legs lost, will reconnect");
+                                events.emit_flow(EventSeverity::Critical, "redundancy", "Both redundant legs lost", flow_id);
                                 break;
                             }
                         }

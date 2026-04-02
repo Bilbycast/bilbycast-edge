@@ -416,6 +416,17 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
             }
         }
 
+        output.push_str("\n# HELP bilbycast_edge_tr101290_pid_errors_total PID errors (ES PIDs missing)\n");
+        output.push_str("# TYPE bilbycast_edge_tr101290_pid_errors_total counter\n");
+        for fs in &flow_snapshots {
+            if let Some(ref tr) = fs.tr101290 {
+                output.push_str(&format!(
+                    "bilbycast_edge_tr101290_pid_errors_total{{flow_id=\"{}\"}} {}\n",
+                    fs.flow_id, tr.pid_errors
+                ));
+            }
+        }
+
         output.push_str("\n# HELP bilbycast_edge_tr101290_tei_errors_total Transport error indicator errors\n");
         output.push_str("# TYPE bilbycast_edge_tr101290_tei_errors_total counter\n");
         for fs in &flow_snapshots {
@@ -423,6 +434,17 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
                 output.push_str(&format!(
                     "bilbycast_edge_tr101290_tei_errors_total{{flow_id=\"{}\"}} {}\n",
                     fs.flow_id, tr.tei_errors
+                ));
+            }
+        }
+
+        output.push_str("\n# HELP bilbycast_edge_tr101290_crc_errors_total CRC-32 errors on PAT/PMT sections\n");
+        output.push_str("# TYPE bilbycast_edge_tr101290_crc_errors_total counter\n");
+        for fs in &flow_snapshots {
+            if let Some(ref tr) = fs.tr101290 {
+                output.push_str(&format!(
+                    "bilbycast_edge_tr101290_crc_errors_total{{flow_id=\"{}\"}} {}\n",
+                    fs.flow_id, tr.crc_errors
                 ));
             }
         }

@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::HlsOutputConfig;
+use crate::manager::events::{EventSender, EventSeverity};
 use crate::stats::collector::OutputStatsAccumulator;
 
 use super::packet::RtpPacket;
@@ -35,12 +36,20 @@ pub fn spawn_hls_output(
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     output_stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
+    event_sender: EventSender,
+    flow_id: String,
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
 
     tokio::spawn(async move {
-        if let Err(e) = hls_output_loop(&config, &mut rx, output_stats, cancel).await {
+        if let Err(e) = hls_output_loop(&config, &mut rx, output_stats, cancel, &event_sender, &flow_id).await {
             tracing::error!("HLS output '{}' exited with error: {e}", config.id);
+            event_sender.emit_flow(
+                EventSeverity::Critical,
+                "hls",
+                format!("HLS output '{}' error: {e}", config.id),
+                &flow_id,
+            );
         }
     })
 }
@@ -56,6 +65,8 @@ async fn hls_output_loop(
     rx: &mut broadcast::Receiver<RtpPacket>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
+    event_sender: &EventSender,
+    flow_id: &str,
 ) -> anyhow::Result<()> {
     tracing::info!(
         "HLS output '{}' started -> {} (segment={}s, max_segments={})",
@@ -133,6 +144,12 @@ async fn hls_output_loop(
                                         "HLS output '{}': failed to upload segment_{}.ts: {e}",
                                         config.id,
                                         seq,
+                                    );
+                                    event_sender.emit_flow(
+                                        EventSeverity::Warning,
+                                        "hls",
+                                        format!("HLS output '{}': segment upload failed: {e}", config.id),
+                                        flow_id,
                                     );
                                 }
                             }

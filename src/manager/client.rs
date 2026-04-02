@@ -15,8 +15,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_tungstenite::tungstenite::Message;
+
+use super::events::{self, Event, EventSender, EventSeverity, build_event_envelope};
 
 use crate::config::models::{AppConfig, FlowConfig, OutputConfig};
 use crate::config::persistence::save_config_split;
@@ -201,11 +203,12 @@ pub fn start_manager_client(
     api_addr: String,
     monitor_addr: Option<String>,
     webrtc_sessions: WebrtcRegistry,
+    event_rx: mpsc::UnboundedReceiver<Event>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         manager_client_loop(
             config, flow_manager, tunnel_manager, ws_stats_rx, app_config, config_path,
-            secrets_path, api_addr, monitor_addr, webrtc_sessions,
+            secrets_path, api_addr, monitor_addr, webrtc_sessions, event_rx,
         ).await;
     })
 }
@@ -221,6 +224,7 @@ async fn manager_client_loop(
     api_addr: String,
     monitor_addr: Option<String>,
     webrtc_sessions: WebrtcRegistry,
+    mut event_rx: mpsc::UnboundedReceiver<Event>,
 ) {
     // If we already have a node_id from config, set it on the tunnel manager
     // so relay tunnels can identify this edge before the first manager connection.
@@ -245,6 +249,7 @@ async fn manager_client_loop(
             &api_addr,
             monitor_addr.as_deref(),
             &webrtc_sessions,
+            &mut event_rx,
         )
         .await
         {
@@ -270,6 +275,11 @@ async fn manager_client_loop(
             }
             Err(e) => {
                 tracing::warn!("Manager connection failed: {e}");
+                tunnel_manager.event_sender().emit(
+                    EventSeverity::Warning,
+                    "manager",
+                    "Manager connection lost, reconnecting",
+                );
             }
         }
 
@@ -298,6 +308,7 @@ async fn try_connect(
     api_addr: &str,
     monitor_addr: Option<&str>,
     webrtc_sessions: &WebrtcRegistry,
+    event_rx: &mut mpsc::UnboundedReceiver<Event>,
 ) -> Result<ConnectResult, String> {
     // Enforce TLS — only wss:// connections are allowed
     if !config.url.starts_with("wss://") {
@@ -406,6 +417,11 @@ async fn try_connect(
             match response["type"].as_str().unwrap_or("") {
                 "auth_ok" => {
                     tracing::info!("Authenticated with manager");
+                    tunnel_manager.event_sender().emit(
+                        EventSeverity::Info,
+                        "manager",
+                        "Connected to manager",
+                    );
                 }
                 "register_ack" => {
                     let payload = &response["payload"];
@@ -418,6 +434,11 @@ async fn try_connect(
                         .unwrap_or("")
                         .to_string();
                     tracing::info!("Registered with manager: node_id={node_id}");
+                    tunnel_manager.event_sender().emit(
+                        EventSeverity::Info,
+                        "manager",
+                        "Connected to manager",
+                    );
 
                     if !node_id.is_empty() && !node_secret.is_empty() {
                         // Persist immediately
@@ -430,6 +451,11 @@ async fn try_connect(
                     let msg = response["message"]
                         .as_str()
                         .unwrap_or("Unknown auth error");
+                    tunnel_manager.event_sender().emit(
+                        EventSeverity::Critical,
+                        "manager",
+                        format!("Manager authentication failed: {msg}"),
+                    );
                     return Err(format!("Auth rejected: {msg}"));
                 }
                 other => {
@@ -458,6 +484,12 @@ async fn try_connect(
     // stats_rx and the manager never receives tunnel stats.
     let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
     stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Thumbnail polling: check for new thumbnails every 10 seconds
+    let mut thumbnail_interval = tokio::time::interval(Duration::from_secs(10));
+    thumbnail_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Track last-sent generation per flow to avoid re-sending unchanged thumbnails
+    let mut thumbnail_generations: HashMap<String, u64> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -552,6 +584,55 @@ async fn try_connect(
                     "payload": build_health_payload(flow_manager, api_addr, monitor_addr)
                 });
                 if let Ok(json) = serde_json::to_string(&pong) {
+                    if ws_write.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+
+            // Send new thumbnails to manager
+            _ = thumbnail_interval.tick() => {
+                use base64::Engine;
+                let stats = flow_manager.stats();
+                for entry in stats.flow_stats.iter() {
+                    let flow_id = entry.key().clone();
+                    let acc = entry.value();
+                    if let Some(thumb_acc) = acc.thumbnail.get() {
+                        let thumb_gen = thumb_acc.generation.load(std::sync::atomic::Ordering::Relaxed);
+                        let prev = thumbnail_generations.get(&flow_id).copied().unwrap_or(0);
+                        if thumb_gen > prev {
+                            // Clone JPEG data out of the mutex before any .await
+                            let jpeg_clone = thumb_acc.latest_jpeg.lock().unwrap()
+                                .as_ref()
+                                .map(|(jpeg, _)| jpeg.clone());
+                            if let Some(jpeg) = jpeg_clone {
+                                let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
+                                let envelope = serde_json::json!({
+                                    "type": "thumbnail",
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                    "payload": {
+                                        "flow_id": flow_id,
+                                        "data": b64,
+                                        "width": 320,
+                                        "height": 180
+                                    }
+                                });
+                                if let Ok(json) = serde_json::to_string(&envelope) {
+                                    if ws_write.send(Message::Text(json.into())).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                thumbnail_generations.insert(flow_id, thumb_gen);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Forward queued events to the manager
+            Some(event) = event_rx.recv() => {
+                let envelope = build_event_envelope(&event);
+                if let Ok(json) = serde_json::to_string(&envelope) {
                     if ws_write.send(Message::Text(json.into())).await.is_err() {
                         break;
                     }
@@ -1127,8 +1208,21 @@ async fn execute_command(
                 cfg.tunnels = new_config.tunnels.clone();
                 cfg.server = new_config.server.clone();
                 cfg.monitor = new_config.monitor.clone();
-                persist_config(&cfg, config_path, secrets_path);
+                if let Err(e) = save_config_split(config_path.as_path(), secrets_path.as_path(), &cfg) {
+                    tracing::warn!("Failed to persist config after manager command: {e}");
+                    tunnel_manager.event_sender().emit(
+                        EventSeverity::Warning,
+                        "config",
+                        format!("Failed to persist configuration: {e}"),
+                    );
+                }
             }
+
+            tunnel_manager.event_sender().emit(
+                EventSeverity::Info,
+                "config",
+                "Configuration updated",
+            );
 
             Ok(())
         }

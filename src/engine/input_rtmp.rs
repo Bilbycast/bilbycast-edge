@@ -33,6 +33,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::RtmpInputConfig;
+use crate::manager::events::{EventSender, EventSeverity};
 use crate::stats::collector::FlowStatsAccumulator;
 
 use super::packet::RtpPacket;
@@ -48,6 +49,8 @@ pub fn spawn_rtmp_input(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
+    event_sender: EventSender,
+    flow_id: String,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         tracing::info!("RTMP input starting on {} (app='{}')", config.listen_addr, config.app);
@@ -64,14 +67,22 @@ pub fn spawn_rtmp_input(
         // Spawn the RTMP server
         let cancel_server = cancel.clone();
         let is_pub = is_publishing.clone();
+        let server_event_sender = event_sender.clone();
+        let server_flow_id = flow_id.clone();
         tokio::spawn(async move {
             if let Err(e) = run_rtmp_server(server_config, media_tx, is_pub, cancel_server).await {
                 tracing::error!("RTMP server error: {e:#}");
+                server_event_sender.emit_flow(
+                    EventSeverity::Critical,
+                    "rtmp",
+                    format!("RTMP server error: {e}"),
+                    &server_flow_id,
+                );
             }
         });
 
         // Process media messages from the RTMP server
-        process_media(media_rx, broadcast_tx, stats, cancel).await;
+        process_media(media_rx, broadcast_tx, stats, cancel, event_sender, flow_id).await;
     })
 }
 
@@ -81,6 +92,8 @@ async fn process_media(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
+    event_sender: EventSender,
+    flow_id: String,
 ) {
     let mut muxer = TsMuxer::new();
     let mut seq_num: u16 = 0;
@@ -120,6 +133,12 @@ async fn process_media(
                                     pps = Some(p);
                                     muxer.set_has_audio(true); // Assume audio until proven otherwise
                                     tracing::info!("RTMP: received AVC sequence header (SPS+PPS)");
+                                    event_sender.emit_flow(
+                                        EventSeverity::Info,
+                                        "rtmp",
+                                        "RTMP publisher connected",
+                                        &flow_id,
+                                    );
                                 }
                             }
                             1 => {
@@ -236,6 +255,12 @@ async fn process_media(
                     }
                     Some(RtmpMediaMessage::Disconnected) => {
                         tracing::info!("RTMP publisher disconnected, waiting for reconnection");
+                        event_sender.emit_flow(
+                            EventSeverity::Warning,
+                            "rtmp",
+                            "RTMP publisher disconnected",
+                            &flow_id,
+                        );
                         has_sent_sps_pps = false;
                     }
                     None => {

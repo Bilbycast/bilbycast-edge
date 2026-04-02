@@ -100,6 +100,9 @@ pub struct Tr101290State {
     pub pat_seen: bool,
     /// PMT PIDs discovered from PAT, mapped to their last-seen time.
     pub pmt_pids: HashMap<u16, Option<Instant>>,
+    /// Elementary stream PIDs discovered from PMT, mapped to their last-seen time.
+    /// Used for PID error detection (P1): ES PIDs that stop appearing.
+    pub es_pids: HashMap<u16, Option<Instant>>,
     /// Per-PID PCR tracking for discontinuity and accuracy checks.
     pub pcr_tracker: HashMap<u16, PcrState>,
     /// Whether the stream is currently in sync.
@@ -134,6 +137,7 @@ impl Default for Tr101290State {
             last_pat_time: None,
             pat_seen: false,
             pmt_pids: HashMap::new(),
+            es_pids: HashMap::new(),
             pcr_tracker: HashMap::new(),
             in_sync: true,
             sync_consecutive_good: 0,
@@ -157,6 +161,7 @@ impl Default for Tr101290State {
 /// ordering. The `state` mutex holds per-PID tracking data and is only
 /// contended between the analyzer task and the rare 1/sec snapshot.
 pub struct Tr101290Accumulator {
+    // ── Cumulative counters (monotonically increasing, lifetime of the flow) ──
     // Informational
     pub ts_packets_analyzed: AtomicU64,
     pub pat_count: AtomicU64,
@@ -167,10 +172,23 @@ pub struct Tr101290Accumulator {
     pub cc_errors: AtomicU64,
     pub pat_errors: AtomicU64,
     pub pmt_errors: AtomicU64,
+    pub pid_errors: AtomicU64,
     // Priority 2
     pub tei_errors: AtomicU64,
+    pub crc_errors: AtomicU64,
     pub pcr_discontinuity_errors: AtomicU64,
     pub pcr_accuracy_errors: AtomicU64,
+
+    // ── Windowed counters (reset each snapshot, "errors since last report") ──
+    pub window_cc_errors: AtomicU64,
+    pub window_pat_errors: AtomicU64,
+    pub window_pmt_errors: AtomicU64,
+    pub window_pid_errors: AtomicU64,
+    pub window_tei_errors: AtomicU64,
+    pub window_crc_errors: AtomicU64,
+    pub window_pcr_discontinuity_errors: AtomicU64,
+    pub window_pcr_accuracy_errors: AtomicU64,
+
     // Internal state
     pub state: Mutex<Tr101290State>,
 }
@@ -186,26 +204,57 @@ impl Tr101290Accumulator {
             cc_errors: AtomicU64::new(0),
             pat_errors: AtomicU64::new(0),
             pmt_errors: AtomicU64::new(0),
+            pid_errors: AtomicU64::new(0),
             tei_errors: AtomicU64::new(0),
+            crc_errors: AtomicU64::new(0),
             pcr_discontinuity_errors: AtomicU64::new(0),
             pcr_accuracy_errors: AtomicU64::new(0),
+            window_cc_errors: AtomicU64::new(0),
+            window_pat_errors: AtomicU64::new(0),
+            window_pmt_errors: AtomicU64::new(0),
+            window_pid_errors: AtomicU64::new(0),
+            window_tei_errors: AtomicU64::new(0),
+            window_crc_errors: AtomicU64::new(0),
+            window_pcr_discontinuity_errors: AtomicU64::new(0),
+            window_pcr_accuracy_errors: AtomicU64::new(0),
             state: Mutex::new(Tr101290State::default()),
         }
     }
 
     /// Take a point-in-time snapshot of all TR-101290 counters.
+    ///
+    /// Cumulative counters are always-increasing totals. Windowed counters are
+    /// atomically swapped to zero on each snapshot, providing "errors since last
+    /// report" for operational dashboards. `priority1_ok` / `priority2_ok` are
+    /// derived from the **windowed** counters so they reflect current stream
+    /// health, not historical errors.
     pub fn snapshot(&self) -> Tr101290Stats {
+        // Cumulative totals
         let sync_loss = self.sync_loss_count.load(Ordering::Relaxed);
         let sync_byte = self.sync_byte_errors.load(Ordering::Relaxed);
         let cc = self.cc_errors.load(Ordering::Relaxed);
         let pat = self.pat_errors.load(Ordering::Relaxed);
         let pmt = self.pmt_errors.load(Ordering::Relaxed);
+        let pid = self.pid_errors.load(Ordering::Relaxed);
         let tei = self.tei_errors.load(Ordering::Relaxed);
+        let crc = self.crc_errors.load(Ordering::Relaxed);
         let pcr_disc = self.pcr_discontinuity_errors.load(Ordering::Relaxed);
         let pcr_acc = self.pcr_accuracy_errors.load(Ordering::Relaxed);
 
-        let priority1_ok = sync_loss == 0 && sync_byte == 0 && cc == 0 && pat == 0 && pmt == 0;
-        let priority2_ok = tei == 0 && pcr_disc == 0 && pcr_acc == 0;
+        // Windowed counters — swap to zero atomically
+        let w_cc = self.window_cc_errors.swap(0, Ordering::Relaxed);
+        let w_pat = self.window_pat_errors.swap(0, Ordering::Relaxed);
+        let w_pmt = self.window_pmt_errors.swap(0, Ordering::Relaxed);
+        let w_pid = self.window_pid_errors.swap(0, Ordering::Relaxed);
+        let w_tei = self.window_tei_errors.swap(0, Ordering::Relaxed);
+        let w_crc = self.window_crc_errors.swap(0, Ordering::Relaxed);
+        let w_pcr_disc = self.window_pcr_discontinuity_errors.swap(0, Ordering::Relaxed);
+        let w_pcr_acc = self.window_pcr_accuracy_errors.swap(0, Ordering::Relaxed);
+
+        // Priority flags based on windowed counters (current health, not historical)
+        let in_sync = { self.state.lock().unwrap().in_sync };
+        let priority1_ok = in_sync && w_cc == 0 && w_pat == 0 && w_pmt == 0 && w_pid == 0;
+        let priority2_ok = w_tei == 0 && w_crc == 0 && w_pcr_disc == 0 && w_pcr_acc == 0;
 
         // Read TR-07 state from the state mutex
         let (jpeg_xs_detected, jpeg_xs_pid) = {
@@ -222,9 +271,19 @@ impl Tr101290Accumulator {
             cc_errors: cc,
             pat_errors: pat,
             pmt_errors: pmt,
+            pid_errors: pid,
             tei_errors: tei,
+            crc_errors: crc,
             pcr_discontinuity_errors: pcr_disc,
             pcr_accuracy_errors: pcr_acc,
+            window_cc_errors: w_cc,
+            window_pat_errors: w_pat,
+            window_pmt_errors: w_pmt,
+            window_pid_errors: w_pid,
+            window_tei_errors: w_tei,
+            window_crc_errors: w_crc,
+            window_pcr_discontinuity_errors: w_pcr_disc,
+            window_pcr_accuracy_errors: w_pcr_acc,
             priority1_ok,
             priority2_ok,
             tr07_compliant: jpeg_xs_detected,
@@ -392,6 +451,92 @@ impl MediaAnalysisAccumulator {
     }
 }
 
+// ── Thumbnail Accumulator ─────────────────────────────────────────────────
+
+/// Number of consecutive identical thumbnail captures before raising a
+/// "frozen" alarm. At 10 s per capture this corresponds to ~30 s.
+const FREEZE_THRESHOLD: u64 = 3;
+
+/// Thumbnail generation accumulator. The thumbnail task writes the latest
+/// JPEG bytes; the 1/sec snapshot path reads the counters.
+pub struct ThumbnailAccumulator {
+    /// Latest captured JPEG thumbnail data and capture timestamp.
+    pub latest_jpeg: Mutex<Option<(bytes::Bytes, Instant)>>,
+    /// Monotonically increasing generation counter. Incremented each time a
+    /// new thumbnail is captured, so consumers can detect changes.
+    pub generation: AtomicU64,
+    /// Total thumbnails successfully captured.
+    pub total_captured: AtomicU64,
+    /// Total capture errors (ffmpeg failures, timeouts).
+    pub capture_errors: AtomicU64,
+    /// Hash of the previously captured JPEG for freeze-frame comparison.
+    prev_jpeg_hash: Mutex<Option<u64>>,
+    /// How many consecutive captures produced an identical JPEG hash.
+    freeze_count: AtomicU64,
+    /// Current thumbnail alarm: `"black"`, `"frozen"`, or `None`.
+    alarm: Mutex<Option<String>>,
+}
+
+impl ThumbnailAccumulator {
+    pub fn new() -> Self {
+        Self {
+            latest_jpeg: Mutex::new(None),
+            generation: AtomicU64::new(0),
+            total_captured: AtomicU64::new(0),
+            capture_errors: AtomicU64::new(0),
+            prev_jpeg_hash: Mutex::new(None),
+            freeze_count: AtomicU64::new(0),
+            alarm: Mutex::new(None),
+        }
+    }
+
+    /// Store a newly captured thumbnail.
+    pub fn store(&self, jpeg_data: bytes::Bytes) {
+        *self.latest_jpeg.lock().unwrap() = Some((jpeg_data, Instant::now()));
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.total_captured.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a capture error.
+    pub fn record_error(&self) {
+        self.capture_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Check whether the current JPEG hash matches the previous one and
+    /// update the freeze counter accordingly. Returns `true` when the
+    /// frame has been identical for [`FREEZE_THRESHOLD`] consecutive
+    /// captures.
+    pub fn check_freeze(&self, jpeg_hash: u64) -> bool {
+        let mut prev = self.prev_jpeg_hash.lock().unwrap();
+        if *prev == Some(jpeg_hash) {
+            let count = self.freeze_count.fetch_add(1, Ordering::Relaxed) + 1;
+            count >= FREEZE_THRESHOLD
+        } else {
+            *prev = Some(jpeg_hash);
+            self.freeze_count.store(1, Ordering::Relaxed);
+            false
+        }
+    }
+
+    /// Set or clear the current thumbnail alarm.
+    pub fn set_alarm(&self, value: Option<String>) {
+        *self.alarm.lock().unwrap() = value;
+    }
+
+    /// Take a point-in-time snapshot for JSON serialisation.
+    pub fn snapshot(&self) -> ThumbnailStats {
+        let has_thumbnail = self.latest_jpeg.lock().unwrap().is_some();
+        let alarm = self.alarm.lock().unwrap().clone();
+        ThumbnailStats {
+            enabled: true,
+            total_captured: self.total_captured.load(Ordering::Relaxed),
+            capture_errors: self.capture_errors.load(Ordering::Relaxed),
+            has_thumbnail,
+            alarm,
+        }
+    }
+}
+
 // ── Per-flow Accumulator ───────────────────────────────────────────────────
 
 /// Per-flow atomic counters for a single media flow (one input, N outputs).
@@ -420,6 +565,8 @@ pub struct FlowStatsAccumulator {
     pub tr101290: OnceLock<Arc<Tr101290Accumulator>>,
     /// Media analysis stats, set once when the flow starts (if enabled).
     pub media_analysis: OnceLock<Arc<MediaAnalysisAccumulator>>,
+    /// Thumbnail generation stats, set once when the flow starts (if enabled and ffmpeg available).
+    pub thumbnail: OnceLock<Arc<ThumbnailAccumulator>>,
     /// Input config metadata for topology display (set once at flow start).
     pub input_config_meta: OnceLock<InputConfigMeta>,
     /// Per-output config metadata for topology display (set once per output).
@@ -474,6 +621,7 @@ impl FlowStatsAccumulator {
             input_throughput: Mutex::new(ThroughputEstimator::new()),
             tr101290: OnceLock::new(),
             media_analysis: OnceLock::new(),
+            thumbnail: OnceLock::new(),
             input_config_meta: OnceLock::new(),
             output_config_meta: DashMap::new(),
             input_srt_stats_cache: Arc::new(Mutex::new(None)),
@@ -490,9 +638,10 @@ impl FlowStatsAccumulator {
         acc
     }
 
-    /// Remove an output's accumulator from this flow.
+    /// Remove an output's accumulator and config metadata from this flow.
     pub fn unregister_output(&self, output_id: &str) {
         self.output_stats.remove(output_id);
+        self.output_config_meta.remove(output_id);
     }
 
     /// Take a point-in-time snapshot of all input counters and every registered
@@ -541,6 +690,7 @@ impl FlowStatsAccumulator {
             .unwrap_or((None, None));
 
         let media_analysis = self.media_analysis.get().map(|acc| acc.snapshot());
+        let thumbnail = self.thumbnail.get().map(|acc| acc.snapshot());
 
         // Derive flow health (RP 2129 M6)
         let packets_lost = self.input_loss.load(Ordering::Relaxed);
@@ -580,6 +730,7 @@ impl FlowStatsAccumulator {
             iat,
             pdv_jitter_us,
             media_analysis,
+            thumbnail,
         }
     }
 }

@@ -594,7 +594,9 @@ function render(data) {
       html += '<div class="stat"><div class="k">CC Errors</div><div class="v" style="' + ec(tr.cc_errors) + '">' + fmt_num(tr.cc_errors) + '</div></div>';
       html += '<div class="stat"><div class="k">PAT Errors</div><div class="v" style="' + ec(tr.pat_errors) + '">' + fmt_num(tr.pat_errors) + '</div></div>';
       html += '<div class="stat"><div class="k">PMT Errors</div><div class="v" style="' + ec(tr.pmt_errors) + '">' + fmt_num(tr.pmt_errors) + '</div></div>';
+      html += '<div class="stat"><div class="k">PID Errors</div><div class="v" style="' + ec(tr.pid_errors) + '">' + fmt_num(tr.pid_errors) + '</div></div>';
       html += '<div class="stat"><div class="k">TEI Errors</div><div class="v" style="' + ec(tr.tei_errors) + '">' + fmt_num(tr.tei_errors) + '</div></div>';
+      html += '<div class="stat"><div class="k">CRC Errors</div><div class="v" style="' + ec(tr.crc_errors) + '">' + fmt_num(tr.crc_errors) + '</div></div>';
       html += '<div class="stat"><div class="k">PCR Discont.</div><div class="v" style="' + ec(tr.pcr_discontinuity_errors) + '">' + fmt_num(tr.pcr_discontinuity_errors) + '</div></div>';
       html += '<div class="stat"><div class="k">PCR Accuracy</div><div class="v" style="' + ec(tr.pcr_accuracy_errors) + '">' + fmt_num(tr.pcr_accuracy_errors) + '</div></div>';
       html += '<div class="stat"><div class="k">PATs</div><div class="v">' + fmt_num(tr.pat_count) + '</div></div>';
