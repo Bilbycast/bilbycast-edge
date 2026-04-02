@@ -3,7 +3,7 @@ name = "bilbycast-edge"
 version = "0.7.0"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
-license = "Elastic-2.0"
+license = "MPL-2.0"
 
 [dependencies]
 # Async runtime
