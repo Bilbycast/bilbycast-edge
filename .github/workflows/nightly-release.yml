@@ -55,7 +55,7 @@ jobs:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             artifact_suffix: x86_64-linux
-          - runner: ubuntu-24.04-arm64
+          - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             artifact_suffix: aarch64-linux
     runs-on: ${{ matrix.runner }}
