@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 //! RFC 6184 H.264 RTP depacketizer.
 //!
@@ -7,7 +7,11 @@
 //! - Single NAL Unit packets (type 1-23)
 //! - FU-A fragmentation packets (type 28)
 //! - STAP-A aggregation packets (type 24)
+//!
+//! Currently unused: str0m handles RTP depacketization internally.
+//! Retained for future direct RTP H.264 input without str0m.
 
+#[allow(dead_code)]
 /// Reassembled NAL unit with timing information.
 pub struct DepacketizedNalu {
     /// Complete NALU data (including the NALU header byte).
@@ -18,6 +22,7 @@ pub struct DepacketizedNalu {
     pub marker: bool,
 }
 
+#[allow(dead_code)]
 /// H.264 RTP depacketizer per RFC 6184.
 ///
 /// Call `depacketize()` for each incoming RTP payload. Returns zero or
@@ -30,6 +35,7 @@ pub struct H264Depacketizer {
     fu_a_active: bool,
 }
 
+#[allow(dead_code)]
 impl H264Depacketizer {
     pub fn new() -> Self {
         Self {

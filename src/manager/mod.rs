@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 //! Manager client module.
 //!
@@ -14,4 +14,4 @@ pub mod config;
 pub mod events;
 
 pub use config::ManagerConfig;
-pub use events::{EventSender, EventSeverity, event_channel};
+pub use events::event_channel;

@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 //! WHIP/WHEP HTTP signaling client.
 //!
@@ -74,6 +74,8 @@ pub async fn whep_post(
 /// Delete a WHIP/WHEP session resource.
 ///
 /// Per RFC 9725, sending DELETE to the resource URL tears down the session.
+/// Retained: spec-correct session teardown per RFC 9725, to be wired into session lifecycle.
+#[allow(dead_code)]
 pub async fn delete_session(resource_url: &str, bearer_token: Option<&str>) -> Result<()> {
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)

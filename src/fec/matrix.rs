@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 //! SMPTE 2022-1 FEC Matrix -- L x D grid for XOR parity computation.
 //!

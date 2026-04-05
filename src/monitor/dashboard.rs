@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <html lang="en">
@@ -45,6 +45,21 @@ td{padding:4px 8px;color:#c9d1d9;border-top:1px solid #21262d}
 .srt-details .item span{color:#c9d1d9;font-weight:500}
 .no-flows{text-align:center;padding:48px 24px;color:#8b949e;font-size:15px}
 .error-banner{background:#5c1a1a;color:#f85149;padding:8px 24px;font-size:13px;text-align:center;display:none}
+.thumb-wrap{position:relative;width:160px;height:90px;flex-shrink:0;background:#0d1117;border-radius:4px;overflow:hidden}
+.thumb-wrap img{width:100%;height:100%;object-fit:cover;display:block}
+.thumb-wrap img.hidden{display:none}
+.thumb-overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;pointer-events:none}
+.thumb-overlay[data-alarm="no-signal"]{background:rgba(100,116,139,0.75);color:#e2e8f0}
+.thumb-overlay[data-alarm="frozen"]{background:rgba(59,130,246,0.55);color:#fff}
+.thumb-overlay[data-alarm="black"]{background:rgba(0,0,0,0.70);color:#94a3b8}
+.thumb-overlay[data-alarm="stopped"]{background:rgba(100,116,139,0.80);color:#cbd5e1}
+.tunnel-section{padding:0 24px 16px;display:none}
+.tunnel-section.visible{display:block}
+.tunnel-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}
+.tunnel-card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px}
+.tunnel-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.tunnel-name{font-size:14px;font-weight:600;color:#f0f6fc}
+.tunnel-mode{font-size:11px;color:#8b949e;text-transform:uppercase}
 </style>
 </head>
 <body>
@@ -54,6 +69,10 @@ td{padding:4px 8px;color:#c9d1d9;border-top:1px solid #21262d}
 </header>
 <div class="error-banner" id="error-banner">Connection lost - retrying...</div>
 <div class="system-bar" id="system-bar"></div>
+<div class="tunnel-section" id="tunnel-section">
+  <div style="font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px;padding:0">IP Tunnels</div>
+  <div class="tunnel-grid" id="tunnel-grid"></div>
+</div>
 <div class="container" id="flows"></div>
 <script>
 const REFRESH_MS = 1500;
@@ -511,10 +530,13 @@ function render(data) {
   const sys = data.system;
   document.getElementById('version').textContent = 'v' + sys.version;
 
-  document.getElementById('system-bar').innerHTML =
-    '<div class="stat-box"><div class="label">Uptime</div><div class="value">' + fmt_uptime(sys.uptime_secs) + '</div></div>' +
-    '<div class="stat-box"><div class="label">Active Flows</div><div class="value">' + sys.active_flows + ' / ' + sys.total_flows + '</div></div>' +
-    '<div class="stat-box"><div class="label">Version</div><div class="value">' + sys.version + '</div></div>';
+  var sysHtml = '<div class="stat-box"><div class="label">Uptime</div><div class="value">' + fmt_uptime(sys.uptime_secs) + '</div></div>' +
+    '<div class="stat-box"><div class="label">Active Flows</div><div class="value">' + sys.active_flows + ' / ' + sys.total_flows + '</div></div>';
+  if (lastTunnelCount > 0) {
+    sysHtml += '<div class="stat-box"><div class="label">Tunnels</div><div class="value">' + lastTunnelCount + '</div></div>';
+  }
+  sysHtml += '<div class="stat-box"><div class="label">Version</div><div class="value">' + sys.version + '</div></div>';
+  document.getElementById('system-bar').innerHTML = sysHtml;
 
   const flows = data.flows || [];
   const container = document.getElementById('flows');
@@ -545,13 +567,29 @@ function render(data) {
     const outs = f.outputs || [];
 
     html += '<div class="flow-card">';
-    html += '<div class="flow-header"><span class="flow-name">' + esc(f.flow_name || f.flow_id) + '</span>';
+    html += '<div class="flow-header" style="gap:12px">';
+    // Thumbnail preview
+    var thumbInfo = f.thumbnail || {};
+    if (thumbInfo.has_thumbnail || thumbInfo.enabled) {
+      var thumbUrl = '/api/thumbnail/' + encodeURIComponent(f.flow_id);
+      var thumbAlarm = thumbInfo.alarm || (st === 'Stopped' || st === 'Idle' ? 'stopped' : (!thumbInfo.has_thumbnail ? 'no-signal' : ''));
+      html += '<div class="thumb-wrap">';
+      html += '<img data-thumb-flow="' + esc(f.flow_id) + '" src="' + thumbUrl + '?t=' + Date.now() + '" onerror="this.classList.add(\'hidden\')" onload="this.classList.remove(\'hidden\')">';
+      if (thumbAlarm) {
+        html += '<div class="thumb-overlay" data-alarm="' + esc(thumbAlarm) + '">' + esc(thumbAlarm.replace('-', ' ')) + '</div>';
+      }
+      html += '</div>';
+    }
+    html += '<div style="flex:1;min-width:0">';
+    html += '<div style="display:flex;align-items:center;justify-content:space-between">';
+    html += '<span class="flow-name">' + esc(f.flow_name || f.flow_id) + '</span>';
     html += '<span style="display:flex;gap:6px;align-items:center">';
     // Health badge (RP 2129 M6)
     var hc = {'Healthy':C_GREEN,'Warning':C_AMBER,'Error':C_RED,'Critical':C_RED}[f.health] || C_GRAY;
     html += '<span class="badge" style="background:rgba(' + hexToRgb(hc).r + ',' + hexToRgb(hc).g + ',' + hexToRgb(hc).b + ',0.15);color:' + hc + '">' + esc(f.health || 'Unknown') + '</span>';
     html += '<span class="badge ' + bc + '">' + esc(st) + '</span>';
     html += '</span></div>';
+    html += '</div></div>';
 
     // Flow visualization canvas
     html += '<div class="flow-viz" id="viz-' + esc(f.flow_id) + '"></div>';
@@ -691,16 +729,20 @@ function render(data) {
     // Outputs section
     if (outs.length > 0) {
       html += '<div class="section"><div class="section-title">Outputs</div>';
-      html += '<table><tr><th>Name</th><th>Type</th><th>State</th><th>Packets</th><th>Bytes</th><th>Bitrate</th><th>Dropped</th></tr>';
+      html += '<table><tr><th>Name</th><th>Type</th><th>State</th><th>Packets</th><th>Bytes</th><th>Bitrate</th><th>Dropped</th><th>FEC Sent</th></tr>';
       for (const o of outs) {
         html += '<tr>';
-        html += '<td>' + esc(o.output_name || o.output_id) + '</td>';
+        var oName = esc(o.output_name || o.output_id);
+        if (o.srt_leg2_stats) oName += ' <span style="color:#58a6ff;font-size:10px;font-weight:600">[2022-7]</span>';
+        if (o.output_type === 'webrtc') oName += ' <span style="color:#a78bfa;font-size:10px;font-weight:600">[WebRTC]</span>';
+        html += '<td>' + oName + '</td>';
         html += '<td>' + esc(o.output_type || '-') + '</td>';
         html += '<td>' + esc(o.state || '-') + '</td>';
         html += '<td>' + fmt_num(o.packets_sent) + '</td>';
         html += '<td>' + fmt_bytes(o.bytes_sent) + '</td>';
         html += '<td>' + fmt_bitrate(o.bitrate_bps) + '</td>';
         html += '<td>' + fmt_num(o.packets_dropped) + '</td>';
+        html += '<td>' + fmt_num(o.fec_packets_sent) + '</td>';
         html += '</tr>';
       }
       html += '</table>';
@@ -726,6 +768,57 @@ function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+function tunnelStateColor(state) {
+  if (!state) return C_GRAY;
+  var s = state.toLowerCase();
+  if (s === 'connected' || s === 'active') return C_GREEN;
+  if (s === 'connecting' || s === 'binding') return C_BLUE;
+  if (s.includes('error')) return C_RED;
+  return C_GRAY;
+}
+
+var lastTunnelCount = 0;
+
+function renderTunnels(tunnels) {
+  var section = document.getElementById('tunnel-section');
+  lastTunnelCount = tunnels.length;
+  if (!tunnels || tunnels.length === 0) {
+    section.classList.remove('visible');
+    return;
+  }
+  section.classList.add('visible');
+  var html = '';
+  for (var i = 0; i < tunnels.length; i++) {
+    var t = tunnels[i];
+    var sc = tunnelStateColor(t.state);
+    var rgb = hexToRgb(sc);
+    html += '<div class="tunnel-card">';
+    html += '<div class="tunnel-header">';
+    html += '<span class="tunnel-name">' + esc(t.name || t.id) + '</span>';
+    html += '<span style="display:flex;gap:6px;align-items:center">';
+    html += '<span class="badge" style="background:rgba(' + rgb.r + ',' + rgb.g + ',' + rgb.b + ',0.15);color:' + sc + '">' + esc(t.state || 'unknown') + '</span>';
+    html += '<span class="tunnel-mode">' + esc(t.mode) + ' / ' + esc(t.direction) + '</span>';
+    html += '</span></div>';
+    html += '<div class="stats-grid">';
+    html += '<div class="stat"><div class="k">Protocol</div><div class="v">' + esc(t.protocol || '-').toUpperCase() + '</div></div>';
+    html += '<div class="stat"><div class="k">Local Addr</div><div class="v">' + esc(t.local_addr || '-') + '</div></div>';
+    if (t.stats) {
+      html += '<div class="stat"><div class="k">In Bitrate</div><div class="v">' + fmt_bitrate(t.stats.bitrate_in_bps) + '</div></div>';
+      html += '<div class="stat"><div class="k">Out Bitrate</div><div class="v">' + fmt_bitrate(t.stats.bitrate_out_bps) + '</div></div>';
+      html += '<div class="stat"><div class="k">Pkts Sent</div><div class="v">' + fmt_num(t.stats.packets_sent) + '</div></div>';
+      html += '<div class="stat"><div class="k">Pkts Recv</div><div class="v">' + fmt_num(t.stats.packets_received) + '</div></div>';
+      html += '<div class="stat"><div class="k">Bytes Sent</div><div class="v">' + fmt_bytes(t.stats.bytes_sent) + '</div></div>';
+      html += '<div class="stat"><div class="k">Bytes Recv</div><div class="v">' + fmt_bytes(t.stats.bytes_received) + '</div></div>';
+      if (t.stats.send_errors > 0) {
+        html += '<div class="stat"><div class="k">Send Errors</div><div class="v" style="color:' + C_RED + '">' + fmt_num(t.stats.send_errors) + '</div></div>';
+      }
+      html += '<div class="stat"><div class="k">Connections</div><div class="v">' + t.stats.connections_active + ' / ' + t.stats.connections_total + '</div></div>';
+    }
+    html += '</div></div>';
+  }
+  document.getElementById('tunnel-grid').innerHTML = html;
+}
+
 // Handle window resize — reinitialize canvases
 let resizeTimer = null;
 window.addEventListener('resize', function() {
@@ -737,12 +830,20 @@ window.addEventListener('resize', function() {
   }, 150);
 });
 
-async function poll() {
+// ── Tunnel polling (slower interval, not in WebSocket stream) ──
+async function pollTunnels() {
+  try {
+    const res = await fetch('/api/tunnels');
+    if (res.ok) renderTunnels(await res.json());
+  } catch (e) { /* ignore */ }
+}
+
+// ── Stats: HTTP polling fallback ──
+async function pollStats() {
   try {
     const res = await fetch('/api/stats');
     if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
-    render(data);
+    render(await res.json());
     errorCount = 0;
     document.getElementById('error-banner').style.display = 'none';
   } catch (e) {
@@ -753,8 +854,68 @@ async function poll() {
   }
 }
 
-poll();
-setInterval(poll, REFRESH_MS);
+// ── WebSocket with HTTP fallback ──
+let ws = null;
+let wsRetries = 0;
+let httpInterval = null;
+
+function startWebSocket() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/api/ws');
+
+  ws.onopen = function() {
+    wsRetries = 0;
+    // Stop HTTP polling when WS is active
+    if (httpInterval) { clearInterval(httpInterval); httpInterval = null; }
+    document.getElementById('error-banner').style.display = 'none';
+    errorCount = 0;
+  };
+
+  ws.onmessage = function(event) {
+    try {
+      const data = JSON.parse(event.data);
+      render(data);
+      document.getElementById('error-banner').style.display = 'none';
+      errorCount = 0;
+    } catch (e) { /* ignore parse errors */ }
+  };
+
+  ws.onclose = function() {
+    ws = null;
+    wsRetries++;
+    if (wsRetries > 5) {
+      // Give up on WebSocket, fall back to HTTP polling
+      if (!httpInterval) {
+        httpInterval = setInterval(pollStats, REFRESH_MS);
+      }
+    } else {
+      // Retry WebSocket with backoff
+      setTimeout(startWebSocket, Math.min(1000 * wsRetries, 5000));
+    }
+  };
+
+  ws.onerror = function() {
+    // onclose will fire after onerror
+  };
+}
+
+// Initial load via HTTP (get data immediately)
+pollStats();
+pollTunnels();
+
+// Start WebSocket for real-time stats
+startWebSocket();
+
+// Tunnel polling at a slower interval (not in WS stream)
+setInterval(pollTunnels, 5000);
+
+// Refresh thumbnails every 12 seconds (independent of stats)
+setInterval(function() {
+  document.querySelectorAll('img[data-thumb-flow]').forEach(function(img) {
+    var src = img.getAttribute('src').split('?')[0];
+    img.setAttribute('src', src + '?t=' + Date.now());
+  });
+}, 12000);
 </script>
 </body>
 </html>"##;

@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,7 +58,8 @@ pub struct FlowRuntime {
     /// subscribes to this sender to receive a copy of each packet.
     pub broadcast_tx: broadcast::Sender<RtpPacket>,
     /// Tokio task handle for the input (RTP or SRT receiver).
-    /// Stored to keep the JoinHandle alive; shutdown uses CancellationToken.
+    /// Held for ownership — dropping a JoinHandle detaches the task.
+    /// Shutdown is driven by CancellationToken, not by aborting the handle.
     #[allow(dead_code)]
     pub input_handle: JoinHandle<()>,
     /// Output task handles, keyed by output_id. Protected by an async
@@ -73,15 +74,18 @@ pub struct FlowRuntime {
     /// output tasks. Metrics are updated via atomic operations.
     pub stats: Arc<FlowStatsAccumulator>,
     /// TR-101290 analyzer task handle.
-    /// Stored to keep the JoinHandle alive; shutdown uses CancellationToken.
+    /// Held for ownership — dropping a JoinHandle detaches the task.
+    /// Shutdown is driven by CancellationToken, not by aborting the handle.
     #[allow(dead_code)]
     pub analyzer_handle: JoinHandle<()>,
     /// Media analysis task handle (if enabled in config).
-    /// Stored to keep the JoinHandle alive; shutdown uses CancellationToken.
+    /// Held for ownership — dropping a JoinHandle detaches the task.
+    /// Shutdown is driven by CancellationToken, not by aborting the handle.
     #[allow(dead_code)]
     pub media_analysis_handle: Option<JoinHandle<()>>,
     /// Thumbnail generation task handle (if enabled and ffmpeg available).
-    /// Stored to keep the JoinHandle alive; shutdown uses CancellationToken.
+    /// Held for ownership — dropping a JoinHandle detaches the task.
+    /// Shutdown is driven by CancellationToken, not by aborting the handle.
     #[allow(dead_code)]
     pub thumbnail_handle: Option<JoinHandle<()>>,
     /// WHIP input session channel sender (only set for WebRTC/WHIP input flows).
@@ -109,14 +113,14 @@ pub struct FlowRuntime {
 ///   bytes sent, drops, FEC packets sent).
 pub struct OutputRuntime {
     /// Tokio task handle for this output's send loop.
-    /// Stored to keep the JoinHandle alive; shutdown uses CancellationToken.
-    #[allow(dead_code)]
+    /// Awaited during remove_output() and stop() for graceful shutdown.
     pub handle: JoinHandle<()>,
     /// Child cancellation token. Dropping or cancelling this stops only
     /// this output, leaving the rest of the flow running.
     pub cancel_token: CancellationToken,
-    /// Per-output stats accumulator. The Arc is shared with the output task;
-    /// dropping this field would decrement the refcount while the task still writes to it.
+    /// Per-output stats accumulator. Held for Arc refcount — the output task
+    /// holds a clone and writes to it; dropping this would decrement the
+    /// refcount while the task is still running.
     #[allow(dead_code)]
     pub stats: Arc<OutputStatsAccumulator>,
 }

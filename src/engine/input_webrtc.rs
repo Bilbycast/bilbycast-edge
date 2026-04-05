@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 //! WebRTC input tasks: WHIP server (receive contributions) and WHEP client (pull from server).
 //!
@@ -10,11 +10,7 @@
 use std::sync::Arc;
 #[cfg(feature = "webrtc")]
 use std::sync::atomic::Ordering;
-#[cfg(feature = "webrtc")]
-use std::time::Instant;
 
-#[cfg(feature = "webrtc")]
-use bytes::Bytes;
 #[cfg(feature = "webrtc")]
 use tokio::sync::broadcast;
 #[cfg(feature = "webrtc")]

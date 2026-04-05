@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 //! RFC 6184 H.264 RTP packetizer.
 //!
@@ -19,6 +19,8 @@ pub struct RtpPayload {
     pub data: Vec<u8>,
     /// Whether this is the last packet of the current access unit (frame).
     /// Set the RTP marker bit on this packet.
+    /// Retained: part of RFC 6184 spec, needed for frame-boundary-aware output.
+    #[allow(dead_code)]
     pub marker: bool,
 }
 

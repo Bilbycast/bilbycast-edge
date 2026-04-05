@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 //! OAuth 2.0 Client Credentials + JWT (HS256) + RBAC authentication for bilbycast-edge.
 //!

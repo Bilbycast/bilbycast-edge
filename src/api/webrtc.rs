@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 //! WHIP/WHEP HTTP endpoint handlers for WebRTC signaling.
 //!
@@ -15,12 +15,10 @@
 
 #[cfg(feature = "webrtc")]
 pub mod handlers {
-    use std::sync::Arc;
-
     use axum::body::Body;
     use axum::extract::{Path, State};
     use axum::http::{HeaderMap, StatusCode, header};
-    use axum::response::{IntoResponse, Response};
+    use axum::response::Response;
 
     use crate::api::server::AppState;
 
@@ -164,8 +162,6 @@ pub mod handlers {
 
 #[cfg(feature = "webrtc")]
 pub mod registry {
-    use std::sync::Arc;
-
     use anyhow::Result;
     use dashmap::DashMap;
     use tokio::sync::mpsc;
@@ -235,6 +231,8 @@ pub mod registry {
         }
 
         /// Unregister channels for a flow (called on flow stop).
+        /// Retained for flow lifecycle cleanup when session management is wired up.
+        #[allow(dead_code)]
         pub fn unregister_flow(&self, flow_id: &str) {
             self.whip_input_channels.remove(flow_id);
             self.whep_output_channels.remove(flow_id);
@@ -314,6 +312,8 @@ pub mod registry {
         }
 
         /// Count active sessions for a flow.
+        /// Retained for future monitoring/diagnostics use.
+        #[allow(dead_code)]
         pub fn session_count(&self, flow_id: &str) -> usize {
             let prefix = format!("{}/", flow_id);
             self.sessions.iter().filter(|e| e.key().starts_with(&prefix)).count()

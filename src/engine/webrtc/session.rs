@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 //! WebRTC session wrapper around str0m.
 //!
@@ -19,6 +19,10 @@ use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
 /// Events produced by the WebRTC session for the caller to handle.
+///
+/// Some fields are retained for future use (audio support, timing, diagnostics)
+/// even though they are not yet consumed by callers.
+#[allow(dead_code)]
 pub enum SessionEvent {
     /// Received depayloaded media data on a track.
     MediaData {
@@ -146,6 +150,8 @@ impl WebrtcSession {
     }
 
     /// Get the local socket address.
+    /// Retained for diagnostics and future ICE candidate reporting.
+    #[allow(dead_code)]
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
@@ -173,6 +179,8 @@ impl WebrtcSession {
     }
 
     /// Check if the session is still alive.
+    /// Retained for future session health monitoring.
+    #[allow(dead_code)]
     pub fn is_alive(&self) -> bool {
         self.rtc.is_alive()
     }

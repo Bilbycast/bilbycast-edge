@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 //! Tunnel lifecycle manager.
 //!
@@ -405,8 +405,7 @@ async fn run_relay_tunnel(
 ) -> anyhow::Result<()> {
     let tunnel_id = params.tunnel_id;
     let tunnel_id_str = tunnel_id.to_string();
-    let max_backoff = Duration::from_secs(60);
-    let mut reconnect_backoff = Duration::from_secs(1);
+    let reconnect_delay = Duration::from_secs(1);
 
     loop {
         // Connect with retry (handles its own internal backoff for initial connect)
@@ -419,9 +418,6 @@ async fn run_relay_tunnel(
             encrypted = cipher.is_some(),
             "Relay tunnel connected, starting forwarder"
         );
-
-        // Reset backoff after successful connection
-        reconnect_backoff = Duration::from_secs(1);
 
         // Run the forwarder — blocks until the QUIC connection drops
         let result = run_forwarder(
@@ -438,7 +434,7 @@ async fn run_relay_tunnel(
             Err(ref e) => {
                 tracing::warn!(
                     tunnel_id = %tunnel_id,
-                    "Relay tunnel connection lost: {e}, reconnecting in {reconnect_backoff:?}"
+                    "Relay tunnel connection lost: {e}, reconnecting in {reconnect_delay:?}"
                 );
                 event_sender.emit_flow(
                     EventSeverity::Warning,
@@ -450,7 +446,7 @@ async fn run_relay_tunnel(
             Ok(()) => {
                 tracing::warn!(
                     tunnel_id = %tunnel_id,
-                    "Relay tunnel forwarder exited, reconnecting in {reconnect_backoff:?}"
+                    "Relay tunnel forwarder exited, reconnecting in {reconnect_delay:?}"
                 );
                 event_sender.emit_flow(
                     EventSeverity::Warning,
@@ -464,11 +460,9 @@ async fn run_relay_tunnel(
         state_tx.send_replace(RelayTunnelState::Connecting);
 
         tokio::select! {
-            _ = tokio::time::sleep(reconnect_backoff) => {}
+            _ = tokio::time::sleep(reconnect_delay) => {}
             _ = cancel.cancelled() => return Ok(()),
         }
-
-        reconnect_backoff = (reconnect_backoff * 2).min(max_backoff);
     }
 }
 

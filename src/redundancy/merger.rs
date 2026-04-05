@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 //! SMPTE 2022-7 Hitless Merge -- de-duplicates RTP packets arriving from two SRT legs.
 //!

@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 //! Manager WebSocket client.
 //!
@@ -18,7 +18,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 
-use super::events::{self, Event, EventSender, EventSeverity, build_event_envelope};
+use super::events::{Event, EventSeverity, build_event_envelope};
 
 use crate::config::models::{AppConfig, FlowConfig, OutputConfig};
 use crate::config::persistence::save_config_split;

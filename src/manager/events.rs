@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 //! Event sender for forwarding operational events to the manager.
 //!
@@ -86,6 +86,8 @@ impl EventSender {
     }
 
     /// Convenience: send a flow-scoped event with structured details.
+    /// Retained for future use when events need structured detail payloads.
+    #[allow(dead_code)]
     pub fn emit_flow_with_details(
         &self,
         severity: EventSeverity,

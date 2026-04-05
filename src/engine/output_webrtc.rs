@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 //! WebRTC output tasks: WHIP client (push to server) and WHEP server (serve viewers).
 //!
@@ -417,14 +417,12 @@ async fn whip_client_loop(
 
         // Wait for ICE+DTLS to complete
         let child_cancel = cancel.child_token();
-        let mut connected = false;
 
         // Wait for connected event before sending media
         loop {
             let event = session.poll_event(&child_cancel).await;
             match event {
                 SessionEvent::Connected => {
-                    connected = true;
                     tracing::info!("WHIP client '{}' session established", config.id);
                     break;
                 }
@@ -434,10 +432,6 @@ async fn whip_client_loop(
                 }
                 _ => continue,
             }
-        }
-
-        if !connected {
-            continue;
         }
 
         // Get the video PT

@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 //! Secrets encryption at rest for `secrets.json`.
 //!
@@ -124,10 +124,10 @@ pub fn encrypt_secrets(plaintext: &str, seed: &str) -> Result<String> {
 
     let mut nonce_bytes = [0u8; 12];
     rand::rng().fill(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::<aes_gcm::aead::consts::U12>::from(nonce_bytes);
 
     let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_bytes())
+        .encrypt(&nonce, plaintext.as_bytes())
         .map_err(|e| anyhow::anyhow!("Encryption failed: {e}"))?;
 
     // Concatenate nonce + ciphertext and base64-encode
@@ -166,9 +166,11 @@ pub fn decrypt_secrets(data: &str, seed: &str) -> Result<String> {
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|e| anyhow::anyhow!("Invalid encryption key: {e}"))?;
 
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce_array: [u8; 12] = nonce_bytes.try_into()
+        .map_err(|_| anyhow::anyhow!("Invalid nonce length"))?;
+    let nonce = Nonce::<aes_gcm::aead::consts::U12>::from(nonce_array);
     let plaintext = cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|_| anyhow::anyhow!(
             "Failed to decrypt secrets.json — the machine identity may have changed, \
              or the file was copied from another machine. If this is expected, delete \

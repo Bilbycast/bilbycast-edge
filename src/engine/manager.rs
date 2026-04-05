@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 use std::sync::Arc;
 
@@ -59,11 +59,15 @@ impl FlowManager {
     }
 
     /// Get a clone of the event sender for passing to sub-components.
+    /// Retained for use by future sub-components that need to emit events.
+    #[allow(dead_code)]
     pub fn event_sender(&self) -> &EventSender {
         &self.event_sender
     }
 
     /// Whether ffmpeg is available on this device.
+    /// Retained as public accessor for thumbnail feature gating.
+    #[allow(dead_code)]
     pub fn ffmpeg_available(&self) -> bool {
         self.ffmpeg_available
     }
