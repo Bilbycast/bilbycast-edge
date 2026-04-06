@@ -224,7 +224,11 @@ async fn run_rtsp_session(
                     seq_num = seq_num.wrapping_add(1);
                     stats.input_packets.fetch_add(1, Ordering::Relaxed);
                     stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
-                    let _ = broadcast_tx.send(pkt);
+                    if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
+                        let _ = broadcast_tx.send(pkt);
+                    } else {
+                        stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             CodecItem::AudioFrame(frame) => {
@@ -253,7 +257,11 @@ async fn run_rtsp_session(
                     seq_num = seq_num.wrapping_add(1);
                     stats.input_packets.fetch_add(1, Ordering::Relaxed);
                     stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
-                    let _ = broadcast_tx.send(pkt);
+                    if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
+                        let _ = broadcast_tx.send(pkt);
+                    } else {
+                        stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             _ => {} // SenderReport, MessageFrame, etc.

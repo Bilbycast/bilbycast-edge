@@ -19,6 +19,7 @@
 //! - **Redundancy merge** on SRT input (SMPTE 2022-7 de-duplication)
 //! - **Redundancy duplicate** on SRT output (SMPTE 2022-7 dual-leg send)
 
+pub mod bandwidth_monitor;
 pub mod flow;
 pub mod input_rtmp;
 pub mod input_rtsp;

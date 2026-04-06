@@ -35,6 +35,15 @@ pub struct FlowStats {
     /// Thumbnail generation statistics.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbnail: Option<ThumbnailStats>,
+    /// Whether the flow's input bitrate currently exceeds the configured bandwidth limit.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub bandwidth_exceeded: bool,
+    /// Whether the flow is currently blocked (packets dropped) due to bandwidth limit enforcement.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub bandwidth_blocked: bool,
+    /// Configured bandwidth limit in Mbps (for dashboard display). Absent if no limit configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bandwidth_limit_mbps: Option<f64>,
 }
 
 /// Inter-arrival time statistics (microseconds).

@@ -115,10 +115,49 @@ pub struct FlowConfig {
     /// Default: true. Thumbnails are only produced when ffmpeg is detected at startup.
     #[serde(default = "default_true")]
     pub thumbnail: bool,
+    /// Optional bandwidth limit for trust boundary enforcement (RP 2129).
+    /// When configured, the node monitors the flow's input bitrate and takes
+    /// the specified action if it exceeds the limit for the grace period.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bandwidth_limit: Option<BandwidthLimitConfig>,
     /// The single input source for this flow
     pub input: InputConfig,
     /// One or more output destinations (fan-out)
     pub outputs: Vec<OutputConfig>,
+}
+
+/// Bandwidth limit configuration for per-flow trust boundary enforcement.
+///
+/// Monitors the flow's input bitrate and triggers an action if it exceeds
+/// the configured maximum for the duration of the grace period. This avoids
+/// false positives from transient spikes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BandwidthLimitConfig {
+    /// Expected maximum bitrate in megabits per second.
+    pub max_bitrate_mbps: f64,
+    /// Action to take when the limit is exceeded.
+    pub action: BandwidthLimitAction,
+    /// Seconds the bitrate must continuously exceed the limit before
+    /// triggering the action. Default: 5 seconds.
+    #[serde(default = "default_grace_period")]
+    pub grace_period_secs: u32,
+}
+
+/// Action to take when a flow's bandwidth limit is exceeded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BandwidthLimitAction {
+    /// Raise a warning event and flag the flow on the dashboard.
+    /// The flow continues operating normally.
+    Alarm,
+    /// Gate the flow: drop all incoming packets until the bandwidth
+    /// returns to within the configured limit. The flow stays alive
+    /// and automatically resumes when bandwidth normalizes.
+    Block,
+}
+
+fn default_grace_period() -> u32 {
+    5
 }
 
 fn default_true() -> bool {
@@ -949,6 +988,7 @@ mod tests {
                 enabled: true,
                 media_analysis: true,
                 thumbnail: true,
+                bandwidth_limit: None,
                 input: InputConfig::Rtp(RtpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
                     interface_addr: None,

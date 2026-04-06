@@ -75,6 +75,12 @@ async fn udp_input_loop(
                         stats.input_packets.fetch_add(1, Ordering::Relaxed);
                         stats.input_bytes.fetch_add(len as u64, Ordering::Relaxed);
 
+                        // Bandwidth limit enforcement: drop packet if flow is blocked
+                        if stats.bandwidth_blocked.load(Ordering::Relaxed) {
+                            stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+
                         let packet = RtpPacket {
                             data: Bytes::copy_from_slice(data),
                             sequence_number: seq,

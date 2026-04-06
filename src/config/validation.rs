@@ -132,6 +132,34 @@ pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
         bail!("Flow name must be at most 256 characters");
     }
 
+    // Validate bandwidth limit if configured
+    if let Some(ref bw) = flow.bandwidth_limit {
+        if bw.max_bitrate_mbps <= 0.0 {
+            bail!(
+                "Flow '{}': bandwidth_limit max_bitrate_mbps must be positive, got {}",
+                flow.id, bw.max_bitrate_mbps
+            );
+        }
+        if bw.max_bitrate_mbps > 10_000.0 {
+            bail!(
+                "Flow '{}': bandwidth_limit max_bitrate_mbps must be at most 10000 (10 Gbps), got {}",
+                flow.id, bw.max_bitrate_mbps
+            );
+        }
+        if bw.grace_period_secs < 1 {
+            bail!(
+                "Flow '{}': bandwidth_limit grace_period_secs must be at least 1, got {}",
+                flow.id, bw.grace_period_secs
+            );
+        }
+        if bw.grace_period_secs > 60 {
+            bail!(
+                "Flow '{}': bandwidth_limit grace_period_secs must be at most 60, got {}",
+                flow.id, bw.grace_period_secs
+            );
+        }
+    }
+
     validate_input(&flow.input)?;
 
     let mut output_ids = HashSet::new();
@@ -872,6 +900,7 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            bandwidth_limit: None,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,
@@ -904,6 +933,7 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            bandwidth_limit: None,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "not-an-address".to_string(),
                 interface_addr: None,
@@ -927,6 +957,7 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            bandwidth_limit: None,
             input: InputConfig::Srt(SrtInputConfig {
                 mode: SrtMode::Caller,
                 local_addr: "0.0.0.0:9000".to_string(),
@@ -972,6 +1003,7 @@ mod tests {
                     enabled: true,
                     media_analysis: true,
             thumbnail: true,
+                    bandwidth_limit: None,
                     input: InputConfig::Rtp(RtpInputConfig {
                         bind_addr: "0.0.0.0:5000".to_string(),
                         interface_addr: None,
@@ -990,6 +1022,7 @@ mod tests {
                     enabled: true,
                     media_analysis: true,
             thumbnail: true,
+                    bandwidth_limit: None,
                     input: InputConfig::Rtp(RtpInputConfig {
                         bind_addr: "0.0.0.0:5001".to_string(),
                         interface_addr: None,
@@ -1015,6 +1048,7 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            bandwidth_limit: None,
             input: InputConfig::Srt(SrtInputConfig {
                 mode: SrtMode::Listener,
                 local_addr: "0.0.0.0:9000".to_string(),
@@ -1052,6 +1086,7 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            bandwidth_limit: None,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "[::]:5000".to_string(),
                 interface_addr: None,
@@ -1084,6 +1119,7 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            bandwidth_limit: None,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "239.1.1.1:5000".to_string(),
                 interface_addr: Some("192.168.1.100".to_string()),
@@ -1116,6 +1152,7 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            bandwidth_limit: None,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "[ff7e::1]:5000".to_string(),
                 interface_addr: Some("::1".to_string()),
@@ -1150,6 +1187,7 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            bandwidth_limit: None,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "239.1.1.1:5000".to_string(),         // IPv4
                 interface_addr: Some("::1".to_string()),          // IPv6 - mismatch!
@@ -1173,6 +1211,7 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            bandwidth_limit: None,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "[::]:5000".to_string(),
                 interface_addr: None,
@@ -1205,6 +1244,7 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            bandwidth_limit: None,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,
@@ -1237,6 +1277,7 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            bandwidth_limit: None,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,

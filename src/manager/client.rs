@@ -874,7 +874,9 @@ async fn execute_command(
                     // Flow exists and should keep running — diff it
                     let input_changed = old_flow.input != new_flow.input;
                     let meta_changed = old_flow.name != new_flow.name
-                        || old_flow.media_analysis != new_flow.media_analysis;
+                        || old_flow.media_analysis != new_flow.media_analysis
+                        || old_flow.thumbnail != new_flow.thumbnail
+                        || old_flow.bandwidth_limit != new_flow.bandwidth_limit;
 
                     if input_changed || meta_changed {
                         // Input or metadata changed — must restart entire flow
@@ -1136,7 +1138,9 @@ async fn execute_command(
                             // Both running — check what changed
                             let input_changed = old_flow.input != new_flow.input;
                             let meta_changed = old_flow.name != new_flow.name
-                                || old_flow.media_analysis != new_flow.media_analysis;
+                                || old_flow.media_analysis != new_flow.media_analysis
+                                || old_flow.thumbnail != new_flow.thumbnail
+                                || old_flow.bandwidth_limit != new_flow.bandwidth_limit;
 
                             if input_changed || meta_changed {
                                 // Input or flow metadata changed → must restart entire flow

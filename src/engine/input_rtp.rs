@@ -207,9 +207,15 @@ async fn rtp_input_loop(
                         }
                         last_seq = Some(seq);
 
-                        // Update stats
+                        // Update stats (always counted so bandwidth monitor sees real traffic)
                         stats.input_packets.fetch_add(1, Ordering::Relaxed);
                         stats.input_bytes.fetch_add(len as u64, Ordering::Relaxed);
+
+                        // Bandwidth limit enforcement: drop packet if flow is blocked
+                        if stats.bandwidth_blocked.load(Ordering::Relaxed) {
+                            stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
 
                         let bytes_data = Bytes::copy_from_slice(data);
 
@@ -410,7 +416,12 @@ fn process_redundant_rtp_packet(
                 *prev_active_leg = chosen_leg;
                 stats.input_packets.fetch_add(1, Ordering::Relaxed);
                 stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
-                let _ = broadcast_tx.send(pkt);
+                // Bandwidth limit enforcement
+                if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
+                    let _ = broadcast_tx.send(pkt);
+                } else {
+                    stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     } else {
@@ -422,14 +433,19 @@ fn process_redundant_rtp_packet(
             *prev_active_leg = chosen_leg;
             stats.input_packets.fetch_add(1, Ordering::Relaxed);
             stats.input_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
-            let packet = RtpPacket {
-                data: bytes_data,
-                sequence_number: seq,
-                rtp_timestamp: ts,
-                recv_time_us: now_us(),
-                is_raw_ts: false,
-            };
-            let _ = broadcast_tx.send(packet);
+            // Bandwidth limit enforcement
+            if stats.bandwidth_blocked.load(Ordering::Relaxed) {
+                stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+            } else {
+                let packet = RtpPacket {
+                    data: bytes_data,
+                    sequence_number: seq,
+                    rtp_timestamp: ts,
+                    recv_time_us: now_us(),
+                    is_raw_ts: false,
+                };
+                let _ = broadcast_tx.send(packet);
+            }
         }
     }
 }

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -560,7 +560,7 @@ pub struct FlowStatsAccumulator {
     pub redundancy_switches: AtomicU64,
     // Per-output stats
     pub output_stats: DashMap<String, Arc<OutputStatsAccumulator>>,
-    input_throughput: Mutex<ThroughputEstimator>,
+    pub input_throughput: Mutex<ThroughputEstimator>,
     /// TR-101290 analyzer stats, set once when the flow starts.
     pub tr101290: OnceLock<Arc<Tr101290Accumulator>>,
     /// Media analysis stats, set once when the flow starts (if enabled).
@@ -575,6 +575,13 @@ pub struct FlowStatsAccumulator {
     pub input_srt_stats_cache: Arc<Mutex<Option<SrtLegStats>>>,
     /// Cached SRT stats for redundancy input leg, updated by the SRT input polling task.
     pub input_srt_leg2_stats_cache: Arc<Mutex<Option<SrtLegStats>>>,
+    /// Set to `true` by the bandwidth monitor when the input bitrate exceeds the configured limit.
+    pub bandwidth_exceeded: AtomicBool,
+    /// Set to `true` by the bandwidth monitor to gate the flow (block action).
+    /// Input tasks check this flag and drop packets while it is set.
+    pub bandwidth_blocked: AtomicBool,
+    /// Configured bandwidth limit in Mbps (set once at flow start, for dashboard display).
+    pub bandwidth_limit_mbps: OnceLock<f64>,
 }
 
 /// Lightweight input config metadata for topology display.
@@ -626,6 +633,9 @@ impl FlowStatsAccumulator {
             output_config_meta: DashMap::new(),
             input_srt_stats_cache: Arc::new(Mutex::new(None)),
             input_srt_leg2_stats_cache: Arc::new(Mutex::new(None)),
+            bandwidth_exceeded: AtomicBool::new(false),
+            bandwidth_blocked: AtomicBool::new(false),
+            bandwidth_limit_mbps: OnceLock::new(),
         }
     }
 
@@ -694,7 +704,9 @@ impl FlowStatsAccumulator {
 
         // Derive flow health (RP 2129 M6)
         let packets_lost = self.input_loss.load(Ordering::Relaxed);
-        let health = derive_flow_health(input_bitrate, packets_lost, &tr101290_snap);
+        let bw_exceeded = self.bandwidth_exceeded.load(Ordering::Relaxed);
+        let bw_blocked = self.bandwidth_blocked.load(Ordering::Relaxed);
+        let health = derive_flow_health(input_bitrate, packets_lost, &tr101290_snap, bw_exceeded, bw_blocked);
 
         FlowStats {
             flow_id: self.flow_id.clone(),
@@ -731,6 +743,9 @@ impl FlowStatsAccumulator {
             pdv_jitter_us,
             media_analysis,
             thumbnail,
+            bandwidth_exceeded: bw_exceeded,
+            bandwidth_blocked: bw_blocked,
+            bandwidth_limit_mbps: self.bandwidth_limit_mbps.get().copied(),
         }
     }
 }
@@ -741,6 +756,8 @@ fn derive_flow_health(
     bitrate_bps: u64,
     packets_lost: u64,
     tr101290: &Option<Tr101290Stats>,
+    bandwidth_exceeded: bool,
+    bandwidth_blocked: bool,
 ) -> FlowHealth {
     if let Some(tr) = tr101290 {
         // Critical: sync loss or sustained errors
@@ -754,13 +771,23 @@ fn derive_flow_health(
     }
 
     // Critical: no data flowing
-    if bitrate_bps == 0 {
+    if bitrate_bps == 0 && !bandwidth_blocked {
         return FlowHealth::Critical;
+    }
+
+    // Error: flow is actively blocked by bandwidth enforcement
+    if bandwidth_blocked {
+        return FlowHealth::Error;
     }
 
     // Error: significant packet loss
     if packets_lost > 100 {
         return FlowHealth::Error;
+    }
+
+    // Warning: bandwidth exceeded (alarm mode)
+    if bandwidth_exceeded {
+        return FlowHealth::Warning;
     }
 
     // Warning: P2 errors or minor loss

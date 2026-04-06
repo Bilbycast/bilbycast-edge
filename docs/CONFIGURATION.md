@@ -350,8 +350,39 @@ An array of flow definitions. Each flow has one input and one or more outputs.
 | `name`            | `string`         | --      | Human-readable name                      |
 | `enabled`         | `bool`           | `true`  | Auto-start when the application starts   |
 | `media_analysis`  | `bool`           | `true`  | Enable media content analysis (codec, resolution, frame rate detection). Set to `false` to save CPU on resource-constrained devices. |
+| `thumbnail`       | `bool`           | `true`  | Enable thumbnail generation for visual flow preview (requires ffmpeg on the device). |
+| `bandwidth_limit` | `BandwidthLimitConfig?` | `null` | Per-flow bandwidth monitoring for trust boundary enforcement (RP 2129). See below. |
 | `input`           | `InputConfig`    | --      | Single input source                      |
 | `outputs`         | `OutputConfig[]` | --      | One or more output destinations          |
+
+### Bandwidth Limit (`bandwidth_limit`)
+
+Optional per-flow bandwidth monitoring for SMPTE RP 2129 trust boundary enforcement. Monitors the flow's input bitrate and takes action if it exceeds the configured limit for the grace period.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_bitrate_mbps` | `f64` | -- | Expected maximum bitrate in megabits per second (0 < value ≤ 10000) |
+| `action` | `string` | -- | Action when exceeded: `"alarm"` (raise warning event, flag on dashboard) or `"block"` (drop all packets until bandwidth normalizes) |
+| `grace_period_secs` | `u32` | `5` | Seconds the bitrate must continuously exceed the limit before triggering (1-60). Prevents false positives from transient spikes. |
+
+**Example:**
+```json
+{
+  "id": "studio-feed",
+  "name": "Studio Feed",
+  "bandwidth_limit": {
+    "max_bitrate_mbps": 25.0,
+    "action": "alarm",
+    "grace_period_secs": 5
+  },
+  "input": { "type": "srt", "mode": "listener", "local_addr": "0.0.0.0:9000" },
+  "outputs": [...]
+}
+```
+
+**Alarm action:** Emits a `warning` event and flags the flow on the dashboard. The flow continues operating normally. When bitrate returns to normal, an `info` recovery event is emitted.
+
+**Block action:** Gates the flow — all incoming packets are dropped while the bitrate exceeds the limit. The flow stays alive and automatically resumes when bandwidth normalizes. A probe-and-check mechanism periodically samples real traffic to detect recovery. Blocked packets are counted in `packets_filtered`.
 
 ---
 

@@ -101,12 +101,14 @@ function healthColor(state, dropped, srtStats) {
   return C_GREEN;
 }
 
-function inputHealthColor(inp) {
+function inputHealthColor(inp, flowData) {
   if (!inp || !inp.state) return C_GRAY;
   const s = String(inp.state).toLowerCase();
   if (s.includes('error') || s === 'broken') return C_RED;
   if (s === 'connecting' || s === 'starting') return C_BLUE;
   if (s === 'idle' || s === 'stopped' || s === 'waiting') return C_GRAY;
+  if (flowData && flowData.bandwidth_blocked) return C_RED;
+  if (flowData && flowData.bandwidth_exceeded) return C_AMBER;
   if (inp.packets_lost > 0) return C_AMBER;
   return C_GREEN;
 }
@@ -225,13 +227,17 @@ function drawParticle(ctx, x, y, color) {
   ctx.fill();
 }
 
-function drawBitrateLabel(ctx, x, y, bps) {
+function drawBitrateLabel(ctx, x, y, bps, limitMbps, exceeded) {
   const text = fmt_bitrate(bps);
-  ctx.fillStyle = C_TEXT_DIM;
+  var label = text;
+  if (limitMbps) {
+    label = text + ' / ' + limitMbps.toFixed(1) + ' Mbps';
+  }
+  ctx.fillStyle = exceeded ? C_AMBER : C_TEXT_DIM;
   ctx.font = '10px -apple-system,BlinkMacSystemFont,monospace';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'bottom';
-  ctx.fillText(text, x, y - 4);
+  ctx.fillText(label, x, y - 4);
 }
 
 function hexToRgb(hex) {
@@ -357,7 +363,7 @@ function animateAll(timestamp) {
 
     ctx.clearRect(0, 0, w, h);
 
-    const inpColor = inputHealthColor(inp);
+    const inpColor = inputHealthColor(inp, vs.data);
     const inpLabel = (inp.input_type || 'INPUT').toUpperCase();
 
     if (dualInput) {
@@ -401,7 +407,7 @@ function animateAll(timestamp) {
       // Bitrate label between legs (centered)
       const midY = (il1.y + il2.y) / 2;
       const inMid = bezierPoint(inRight, midY, layout.hubX, layout.hubY, 0.45);
-      drawBitrateLabel(ctx, inMid.x, inMid.y, inp.bitrate_bps);
+      drawBitrateLabel(ctx, inMid.x, inMid.y, inp.bitrate_bps, vs.data.bandwidth_limit_mbps, vs.data.bandwidth_exceeded || vs.data.bandwidth_blocked);
     } else {
       // Single input node
       drawNode(ctx, layout.inputs[0].x, layout.inputs[0].y, layout.nodeW, layout.nodeH, inpLabel, inp.state || '', inpColor);
@@ -426,7 +432,7 @@ function animateAll(timestamp) {
 
       // Bitrate label on input line
       const inMid = bezierPoint(inRight, layout.inputs[0].y, layout.hubX, layout.hubY, 0.5);
-      drawBitrateLabel(ctx, inMid.x, inMid.y, inp.bitrate_bps);
+      drawBitrateLabel(ctx, inMid.x, inMid.y, inp.bitrate_bps, vs.data.bandwidth_limit_mbps, vs.data.bandwidth_exceeded || vs.data.bandwidth_blocked);
     }
 
     // Draw each output
@@ -587,6 +593,16 @@ function render(data) {
     // Health badge (RP 2129 M6)
     var hc = {'Healthy':C_GREEN,'Warning':C_AMBER,'Error':C_RED,'Critical':C_RED}[f.health] || C_GRAY;
     html += '<span class="badge" style="background:rgba(' + hexToRgb(hc).r + ',' + hexToRgb(hc).g + ',' + hexToRgb(hc).b + ',0.15);color:' + hc + '">' + esc(f.health || 'Unknown') + '</span>';
+    // Bandwidth limit badge
+    if (f.bandwidth_limit_mbps) {
+      if (f.bandwidth_blocked) {
+        html += '<span class="badge" style="background:rgba(248,81,73,0.15);color:#f85149">BLOCKED: BW ' + fmt_bitrate(f.input.bitrate_bps) + ' / ' + f.bandwidth_limit_mbps.toFixed(1) + ' Mbps</span>';
+      } else if (f.bandwidth_exceeded) {
+        html += '<span class="badge" style="background:rgba(210,153,34,0.15);color:#d29922">BW EXCEEDED: ' + fmt_bitrate(f.input.bitrate_bps) + ' / ' + f.bandwidth_limit_mbps.toFixed(1) + ' Mbps</span>';
+      } else {
+        html += '<span class="badge" style="background:rgba(139,148,158,0.08);color:#8b949e">Limit: ' + f.bandwidth_limit_mbps.toFixed(1) + ' Mbps</span>';
+      }
+    }
     html += '<span class="badge ' + bc + '">' + esc(st) + '</span>';
     html += '</span></div>';
     html += '</div></div>';

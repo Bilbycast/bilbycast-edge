@@ -145,7 +145,11 @@ async fn whip_input_loop(
                             seq_num = seq_num.wrapping_add(1);
                             stats.input_packets.fetch_add(1, Ordering::Relaxed);
                             stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
-                            let _ = broadcast_tx.send(pkt);
+                            if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
+                                let _ = broadcast_tx.send(pkt);
+                            } else {
+                                stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                     // TODO: Handle Opus audio — mux into TS with stream_type 0x06
@@ -288,7 +292,11 @@ async fn whep_input_loop(
                             seq_num = seq_num.wrapping_add(1);
                             stats.input_packets.fetch_add(1, Ordering::Relaxed);
                             stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
-                            let _ = broadcast_tx.send(pkt);
+                            if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
+                                let _ = broadcast_tx.send(pkt);
+                            } else {
+                                stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                 }

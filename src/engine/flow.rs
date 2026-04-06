@@ -25,6 +25,7 @@ use super::output_srt::spawn_srt_output;
 use super::output_udp::spawn_udp_output;
 use super::output_webrtc::spawn_webrtc_output;
 use super::packet::{BROADCAST_CHANNEL_CAPACITY, RtpPacket};
+use super::bandwidth_monitor::spawn_bandwidth_monitor;
 use super::media_analysis::spawn_media_analyzer;
 use super::thumbnail::spawn_thumbnail_generator;
 use super::tr101290::spawn_tr101290_analyzer;
@@ -88,6 +89,10 @@ pub struct FlowRuntime {
     /// Shutdown is driven by CancellationToken, not by aborting the handle.
     #[allow(dead_code)]
     pub thumbnail_handle: Option<JoinHandle<()>>,
+    /// Bandwidth monitor task handle (if bandwidth_limit is configured).
+    /// Held for ownership — shutdown is driven by CancellationToken.
+    #[allow(dead_code)]
+    pub bandwidth_monitor_handle: Option<JoinHandle<()>>,
     /// WHIP input session channel sender (only set for WebRTC/WHIP input flows).
     /// Must be registered with the WebrtcSessionRegistry after flow creation.
     #[cfg(feature = "webrtc")]
@@ -402,6 +407,20 @@ impl FlowRuntime {
             None
         };
 
+        // Start bandwidth monitor (if configured)
+        let bandwidth_monitor_handle = if let Some(ref bw_limit) = config.bandwidth_limit {
+            flow_stats.bandwidth_limit_mbps.set(bw_limit.max_bitrate_mbps).ok();
+            Some(spawn_bandwidth_monitor(
+                config.id.clone(),
+                bw_limit.clone(),
+                flow_stats.clone(),
+                event_sender.clone(),
+                cancel_token.child_token(),
+            ))
+        } else {
+            None
+        };
+
         // Start output tasks
         #[cfg(feature = "webrtc")]
         let mut whep_session_info: Option<(tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>, Option<String>)> = None;
@@ -453,6 +472,7 @@ impl FlowRuntime {
             analyzer_handle,
             media_analysis_handle,
             thumbnail_handle,
+            bandwidth_monitor_handle,
             #[cfg(feature = "webrtc")]
             whip_session_tx: whip_session_info,
             #[cfg(feature = "webrtc")]

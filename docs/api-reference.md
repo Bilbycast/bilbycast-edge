@@ -852,6 +852,9 @@ Retrieve aggregated system-wide and per-flow statistics. Running flows include l
 | `media_analysis` | object/null | Media content analysis — codec, resolution, frame rate, audio format, per-PID bitrate (present when running and `media_analysis` config is `true`) |
 | `iat` | object/null | Inter-arrival time stats in microseconds |
 | `pdv_jitter_us` | float/null | Packet delivery variation (jitter) in microseconds |
+| `bandwidth_exceeded` | boolean | `true` if the flow's input bitrate currently exceeds the configured `bandwidth_limit`. Omitted when `false`. |
+| `bandwidth_blocked` | boolean | `true` if the flow is currently gated (packets dropped) due to bandwidth limit enforcement. Omitted when `false`. |
+| `bandwidth_limit_mbps` | float/null | Configured bandwidth limit in Mbps (for display). Absent if no limit configured. |
 
 **Input stats fields:**
 

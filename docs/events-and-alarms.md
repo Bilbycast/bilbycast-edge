@@ -68,6 +68,19 @@ Events are queued in an unbounded in-memory channel. When the edge is not connec
 
 ---
 
+### Bandwidth (`bandwidth`)
+
+| Severity | Message | Trigger | Details |
+|----------|---------|---------|---------|
+| warning | Flow '{id}' bandwidth exceeded limit ({current} Mbps > {limit} Mbps) | Input bitrate exceeds configured `bandwidth_limit.max_bitrate_mbps` for the grace period (alarm action) | `{ current_mbps, limit_mbps, action: "alarm" }` |
+| critical | Flow '{id}' blocked: bandwidth exceeded limit ({current} Mbps > {limit} Mbps) | Input bitrate exceeds configured limit for the grace period (block action) — packets dropped until bandwidth normalizes | `{ current_mbps, limit_mbps, action: "block" }` |
+| info | Flow '{id}' bandwidth returned to normal, unblocked | Bitrate returned within limits after being blocked — flow resumes | `{ current_mbps, limit_mbps }` |
+| info | Flow '{id}' bandwidth returned to normal ({current} Mbps <= {limit} Mbps) | Bitrate returned within limits after alarm | `{ current_mbps, limit_mbps }` |
+
+**Source**: `src/engine/bandwidth_monitor.rs`
+
+---
+
 ### SRT (`srt`)
 
 #### SRT Input
@@ -217,6 +230,7 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | Category | Count | Description |
 |----------|-------|-------------|
 | `flow` | 7 | Flow lifecycle (start/stop/fail, output add/remove) |
+| `bandwidth` | 4 | Per-flow bandwidth monitoring (alarm, block, recovery) |
 | `srt` | 9 | SRT input and output connection state |
 | `redundancy` | 3 | SMPTE 2022-7 dual-leg status |
 | `rtmp` | 3 | RTMP publisher connections |
@@ -226,12 +240,12 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `tunnel` | 8 | Tunnel connection state |
 | `manager` | 3 | Manager WebSocket connection |
 | `config` | 2 | Configuration changes |
-| **Total** | **47** | |
+| **Total** | **51** | |
 
 ### By Severity
 
 | Severity | Count | Description |
 |----------|-------|-------------|
-| critical | 10 | Service-impacting: flow/tunnel failures, auth rejection, both legs lost |
-| warning | 17 | Degradation: disconnects, stale connections, upload failures, reconnects |
-| info | 20 | State changes: connections established, flows started, config updated |
+| critical | 11 | Service-impacting: flow/tunnel failures, auth rejection, both legs lost, bandwidth block |
+| warning | 18 | Degradation: disconnects, stale connections, upload failures, reconnects, bandwidth exceeded |
+| info | 22 | State changes: connections established, flows started, config updated, bandwidth recovery |

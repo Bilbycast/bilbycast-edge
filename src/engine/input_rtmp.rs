@@ -185,7 +185,11 @@ async fn process_media(
                                     seq_num = seq_num.wrapping_add(1);
                                     stats.input_packets.fetch_add(1, Ordering::Relaxed);
                                     stats.input_bytes.fetch_add(total_len as u64, Ordering::Relaxed);
-                                    let _ = broadcast_tx.send(packet);
+                                    if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
+                                        let _ = broadcast_tx.send(packet);
+                                    } else {
+                                        stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+                                    }
                                 }
                             }
                             _ => {}
@@ -243,7 +247,11 @@ async fn process_media(
                                     seq_num = seq_num.wrapping_add(1);
                                     stats.input_packets.fetch_add(1, Ordering::Relaxed);
                                     stats.input_bytes.fetch_add(total_len as u64, Ordering::Relaxed);
-                                    let _ = broadcast_tx.send(packet);
+                                    if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
+                                        let _ = broadcast_tx.send(packet);
+                                    } else {
+                                        stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+                                    }
                                 }
                             }
                             _ => {}

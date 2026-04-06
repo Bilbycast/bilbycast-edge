@@ -483,6 +483,7 @@ mod tests {
                 enabled: true,
                 media_analysis: true,
                 thumbnail: true,
+                bandwidth_limit: None,
                 input: InputConfig::Srt(SrtInputConfig {
                     mode: SrtMode::Listener,
                     local_addr: "0.0.0.0:9000".to_string(),
@@ -624,6 +625,7 @@ mod tests {
                 enabled: true,
                 media_analysis: true,
                 thumbnail: true,
+                bandwidth_limit: None,
                 input: InputConfig::Srt(SrtInputConfig {
                     mode: SrtMode::Listener,
                     local_addr: "0.0.0.0:9000".to_string(),
@@ -682,6 +684,7 @@ mod tests {
                 enabled: true,
                 media_analysis: true,
                 thumbnail: true,
+                bandwidth_limit: None,
                 input: InputConfig::Rtp(RtpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
                     interface_addr: None,
@@ -742,6 +745,7 @@ mod tests {
                 enabled: true,
                 media_analysis: true,
                 thumbnail: true,
+                bandwidth_limit: None,
                 input: InputConfig::Srt(SrtInputConfig {
                     mode: SrtMode::Listener,
                     local_addr: "0.0.0.0:9000".to_string(),

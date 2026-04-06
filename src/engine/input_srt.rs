@@ -328,6 +328,12 @@ async fn srt_input_recv_loop(
                         stats.input_packets.fetch_add(1, Ordering::Relaxed);
                         stats.input_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
 
+                        // Bandwidth limit enforcement: drop packet if flow is blocked
+                        if stats.bandwidth_blocked.load(Ordering::Relaxed) {
+                            stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+
                         let packet = RtpPacket {
                             data,
                             sequence_number: seq,
@@ -651,6 +657,12 @@ fn process_redundant_packet(
         stats
             .input_bytes
             .fetch_add(data.len() as u64, Ordering::Relaxed);
+
+        // Bandwidth limit enforcement: drop packet if flow is blocked
+        if stats.bandwidth_blocked.load(Ordering::Relaxed) {
+            stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
 
         let packet = RtpPacket {
             data,

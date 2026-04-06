@@ -413,8 +413,37 @@ Each flow defines one input source fanning out to one or more output destination
 | `id` | string | Yes | - | Unique identifier. Cannot be empty. Must be unique across all flows. |
 | `name` | string | Yes | - | Human-readable display name. Cannot be empty. |
 | `enabled` | boolean | No | `true` | Whether to auto-start this flow on startup or creation. |
+| `media_analysis` | boolean | No | `true` | Enable media content analysis (codec, resolution, frame rate detection). |
+| `thumbnail` | boolean | No | `true` | Enable thumbnail generation (requires ffmpeg). |
+| `bandwidth_limit` | object | No | `null` | Per-flow bandwidth monitoring (RP 2129). See [Bandwidth Limit](#bandwidth-limit). |
 | `input` | object | Yes | - | Input source configuration (RTP, UDP, SRT, RTMP, RTSP, WebRTC, or WHEP). |
 | `outputs` | array | Yes | - | Output destination configurations. Can be empty. Output IDs must be unique within the flow. |
+
+### Bandwidth Limit
+
+Optional per-flow bandwidth monitoring for SMPTE RP 2129 trust boundary enforcement. Monitors the flow's input bitrate and takes action when it exceeds the configured limit for the grace period. Works with all input types (RTP, UDP, SRT, RTMP, RTSP, WebRTC).
+
+```json
+{
+  "bandwidth_limit": {
+    "max_bitrate_mbps": 25.0,
+    "action": "alarm",
+    "grace_period_secs": 5
+  }
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `max_bitrate_mbps` | float | Yes | - | Expected maximum bitrate in Mbps. Must be positive and at most 10000 (10 Gbps). |
+| `action` | string | Yes | - | `"alarm"`: raise warning event + flag on dashboard. `"block"`: drop all packets until bandwidth normalizes. |
+| `grace_period_secs` | integer | No | `5` | Seconds the bitrate must continuously exceed the limit before triggering (1-60). |
+
+**Alarm action:** Emits a warning event and flags the flow on the dashboard. The flow continues operating. An info event is emitted when bitrate returns to normal.
+
+**Block action:** Gates the flow — drops all incoming packets while bandwidth exceeds the limit. The flow stays alive and automatically resumes when bandwidth normalizes via a probe-and-check mechanism. Blocked packets are counted in `packets_filtered`.
+
+> **Note:** This is distinct from `max_bitrate_mbps` on RTP input, which is a hard token-bucket rate limiter that drops excess packets immediately. `bandwidth_limit` monitors aggregate flow bitrate over time with a grace period and configurable response actions.
 
 ---
 
