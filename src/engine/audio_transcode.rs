@@ -1212,6 +1212,178 @@ impl TranscodeStage {
         self.stats.record_latency(lat.max(latency.min(lat)));
         emitted
     }
+
+    /// Process pre-decoded planar f32 PCM samples instead of an RTP-wrapped
+    /// PCM packet.
+    ///
+    /// This is the entry point used by the AAC-decode bridge in
+    /// [`crate::engine::audio_decode`]: the AAC decoder produces planar
+    /// `Vec<Vec<f32>>` from each ADTS frame, and that is fed directly here,
+    /// skipping the RTP header parse and `decode_pcm_be` stage that the
+    /// regular [`process`](Self::process) method runs first.
+    ///
+    /// `planar` must have exactly `self.input.channels` rows and equal-length
+    /// columns. `recv_time_us` is the upstream packet receive timestamp,
+    /// used solely for latency stats.
+    ///
+    /// Output is the same as [`process`](Self::process): zero or more
+    /// fully-formed RTP-PCM frames at the configured target rate / depth /
+    /// channel count, ready to send to the wire.
+    pub fn process_planar(&mut self, planar: &[Vec<f32>], recv_time_us: u64) -> Vec<Bytes> {
+        self.stats.inc_input();
+
+        if planar.len() != self.input.channels as usize {
+            self.stats.inc_dropped();
+            return Vec::new();
+        }
+        let n_frames = planar.first().map(|c| c.len()).unwrap_or(0);
+        if n_frames == 0 {
+            return Vec::new();
+        }
+        if planar.iter().any(|c| c.len() != n_frames) {
+            self.stats.inc_dropped();
+            return Vec::new();
+        }
+
+        // Mirror the existing process() pipeline starting at "apply channel
+        // matrix". We copy planar into in_scratch so the rest of the code
+        // path is byte-identical.
+        for (dst, src) in self.in_scratch.iter_mut().zip(planar.iter()) {
+            dst.clear();
+            dst.extend_from_slice(src);
+        }
+
+        // Apply the live channel matrix.
+        let matrix = self.current_matrix();
+        if matrix.out_channels() != self.cfg.out_channels as usize {
+            if let Err(_) = apply_channel_matrix(
+                &self.in_scratch,
+                &self.cfg.channel_matrix,
+                &mut self.routed_scratch,
+            ) {
+                self.stats.inc_dropped();
+                return Vec::new();
+            }
+        } else if let Err(_) =
+            apply_channel_matrix(&self.in_scratch, &matrix, &mut self.routed_scratch)
+        {
+            self.stats.inc_dropped();
+            return Vec::new();
+        }
+
+        // Resample (rebuilt lazily, identical to process()).
+        if self.input.sample_rate == self.cfg.out_sample_rate {
+            for (ch_idx, ch) in self.routed_scratch.iter().enumerate() {
+                if ch_idx < self.out_accum.len() {
+                    self.out_accum[ch_idx].extend_from_slice(ch);
+                }
+            }
+        } else {
+            if self.resampler.is_none() || self.resampler_chunk_in != n_frames {
+                let ratio =
+                    self.cfg.out_sample_rate as f64 / self.input.sample_rate as f64;
+                let params = sinc_params_for(self.cfg.src_quality);
+                match Async::<f32>::new_sinc(
+                    ratio,
+                    2.0,
+                    &params,
+                    n_frames,
+                    self.cfg.out_channels as usize,
+                    FixedAsync::Input,
+                ) {
+                    Ok(r) => {
+                        let max_out = r.output_frames_max();
+                        self.resample_out_scratch = (0..self.cfg.out_channels as usize)
+                            .map(|_| vec![0.0f32; max_out])
+                            .collect();
+                        self.resampler = Some(r);
+                        self.resampler_chunk_in = n_frames;
+                    }
+                    Err(_) => {
+                        self.stats.inc_dropped();
+                        return Vec::new();
+                    }
+                }
+            }
+            let r = self.resampler.as_mut().unwrap();
+            let channels = self.cfg.out_channels as usize;
+            let in_frames = n_frames;
+            let out_frames_max =
+                self.resample_out_scratch.first().map(|v| v.len()).unwrap_or(0);
+            let in_adapter = match SequentialSliceOfVecs::new(
+                self.routed_scratch.as_slice(),
+                channels,
+                in_frames,
+            ) {
+                Ok(a) => a,
+                Err(_) => {
+                    self.stats.inc_dropped();
+                    return Vec::new();
+                }
+            };
+            let mut out_adapter = match SequentialSliceOfVecs::new_mut(
+                self.resample_out_scratch.as_mut_slice(),
+                channels,
+                out_frames_max,
+            ) {
+                Ok(a) => a,
+                Err(_) => {
+                    self.stats.inc_dropped();
+                    return Vec::new();
+                }
+            };
+            let written = match r.process_into_buffer(&in_adapter, &mut out_adapter, None) {
+                Ok((_in_used, out_written)) => out_written,
+                Err(_) => {
+                    self.stats.inc_dropped();
+                    return Vec::new();
+                }
+            };
+            for (ch_idx, ch) in self.resample_out_scratch.iter().enumerate() {
+                if ch_idx < self.out_accum.len() {
+                    self.out_accum[ch_idx].extend_from_slice(&ch[..written]);
+                }
+            }
+        }
+
+        // Drain accumulated samples into output packets, identical to process().
+        let mut emitted = Vec::new();
+        while self
+            .out_accum
+            .iter()
+            .all(|c| c.len() >= self.out_samples_per_packet)
+        {
+            let mut block: Vec<Vec<f32>> = self
+                .out_accum
+                .iter_mut()
+                .map(|c| c.drain(..self.out_samples_per_packet).collect())
+                .collect();
+
+            self.encode_buf.clear();
+            encode_pcm_be(
+                &block,
+                self.cfg.out_bit_depth,
+                self.cfg.dither,
+                &mut self.encode_buf,
+                &mut self.rng,
+            );
+
+            let mut packets: Vec<Bytes> = Vec::with_capacity(1);
+            let _leftover = self
+                .packetizer
+                .packetize(&self.encode_buf[..], &mut packets);
+            for p in packets {
+                emitted.push(p);
+            }
+
+            let _ = block.drain(..);
+        }
+
+        self.stats.inc_output(emitted.len() as u64);
+        let lat = current_micros().saturating_sub(recv_time_us);
+        self.stats.record_latency(lat);
+        emitted
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

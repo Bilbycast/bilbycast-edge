@@ -306,12 +306,24 @@ fn forward_audio_packet(
 /// [`RtpPacket`] to the configured Red destination, plus the optional Blue
 /// destination, with the configured DSCP.
 ///
-/// When `config.transcode` is `Some` AND `input_format` is `Some`, an in-line
-/// [`crate::engine::audio_transcode::TranscodeStage`] runs between the broadcast
-/// receiver and the send call: each input packet is decoded, optionally
-/// resampled / rerouted / re-quantized, and re-emitted as zero or more output
-/// RTP packets at the target format. When either is absent, the loop falls
-/// back to the byte-identical passthrough path (existing behavior).
+/// Three modes:
+///
+/// 1. **PCM passthrough** (default for ST 2110 → ST 2110): no transcode,
+///    no decode. Each `RtpPacket` is sent unchanged.
+/// 2. **PCM transcode** (`config.transcode` is `Some` AND `input_format` is
+///    `Some`): an in-line [`crate::engine::audio_transcode::TranscodeStage`]
+///    runs between the broadcast receiver and the send call: each input
+///    packet is decoded, optionally resampled / rerouted / re-quantized, and
+///    re-emitted as zero or more output RTP packets at the target format.
+/// 3. **Compressed-audio bridge** (`compressed_audio_input` is `true`): the
+///    upstream input is a TS-bearing source (RTMP, RTSP, SRT/UDP/RTP TS).
+///    The loop runs an in-line [`crate::engine::ts_demux::TsDemuxer`] +
+///    [`crate::engine::audio_decode::AacDecoder`], decodes AAC-LC frames to
+///    planar f32 PCM, and feeds them to a lazily-built `TranscodeStage`
+///    (built once the first AAC frame reveals the actual sample rate /
+///    channel count via `cached_aac_config`). When `config.transcode` is
+///    not set, the stage is auto-configured to target the output's own
+///    `sample_rate` / `bit_depth` / `channels`.
 pub async fn run_st2110_audio_output(
     config: St2110AudioOutputConfig,
     is_aes3: bool,
@@ -320,6 +332,7 @@ pub async fn run_st2110_audio_output(
     cancel: CancellationToken,
     input_format: Option<crate::engine::audio_transcode::InputFormat>,
     flow_id: &str,
+    compressed_audio_input: bool,
 ) -> Result<()> {
     let label = if is_aes3 { "ST2110-31" } else { "ST2110-30" };
     let (red_sock, red_dest) = create_udp_output(
@@ -345,74 +358,56 @@ pub async fn run_st2110_audio_output(
     // activations propagate without restarting the flow; if no IS-08 state
     // has been registered (test contexts) it falls back to a static source.
     let mut transcode = match (config.transcode.as_ref(), input_format) {
-        (Some(tj), Some(input)) => {
-            match crate::engine::audio_transcode::resolve_transcode(tj, input) {
-                Ok(cfg) => {
-                    let is08_input_id = format!("st2110_30:{}", flow_id);
-                    let is08_output_id = format!("st2110_30:{}:{}", flow_id, config.id);
-                    let matrix_source =
-                        crate::engine::audio_transcode::MatrixSource::is08_tracked(
-                            is08_output_id,
-                            is08_input_id,
-                            input.channels,
-                            cfg.out_channels,
-                            cfg.channel_matrix.clone(),
-                        );
-                    let stats_arc = std::sync::Arc::new(
-                        crate::engine::audio_transcode::TranscodeStats::new(),
-                    );
-                    // Publish the transcoder stats handle so the per-output
-                    // stats snapshot can read transcode_latency_us /
-                    // transcode_input_packets / transcode_dropped.
-                    stats.set_transcode_stats(stats_arc.clone());
-                    let ssrc = config.ssrc.unwrap_or_else(rand::random);
-                    let stage = crate::engine::audio_transcode::TranscodeStage::new(
-                        input,
-                        cfg,
-                        matrix_source,
-                        stats_arc,
-                        ssrc,
-                        rand::random::<u16>(),
-                        rand::random::<u32>(),
-                    );
-                    tracing::info!(
-                        "{label} output '{}' transcode enabled: {}Hz/{}bit/{}ch -> {}Hz/{}bit/{}ch",
-                        config.id,
-                        input.sample_rate,
-                        input.bit_depth.as_u8(),
-                        input.channels,
-                        config.transcode.as_ref().unwrap().sample_rate.unwrap_or(input.sample_rate),
-                        config.transcode.as_ref().unwrap().bit_depth.unwrap_or(input.bit_depth.as_u8()),
-                        config.transcode.as_ref().unwrap().channels.unwrap_or(input.channels),
-                    );
-                    Some(stage)
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "{label} output '{}' transcode resolve failed: {e}; falling back to passthrough",
-                        config.id
-                    );
-                    None
-                }
-            }
-        }
+        (Some(tj), Some(input)) => build_audio_transcode_stage(
+            tj.clone(),
+            input,
+            &config,
+            &stats,
+            flow_id,
+            label,
+        ),
         (Some(_), None) => {
-            tracing::warn!(
-                "{label} output '{}' has transcode config but upstream input is not audio; \
-                 falling back to passthrough",
-                config.id
-            );
-            None
+            if compressed_audio_input {
+                // Defer: input format is unknown until the first decoded AAC
+                // frame. The transcode block will be applied lazily by the
+                // compressed-audio path below.
+                None
+            } else {
+                tracing::warn!(
+                    "{label} output '{}' has transcode config but upstream input is not audio; \
+                     falling back to passthrough",
+                    config.id
+                );
+                None
+            }
         }
         _ => None,
     };
 
+    // Compressed-audio bridge state. Built only when the upstream input may
+    // carry MPEG-TS / AAC. The decoder + transcode stage are both built
+    // lazily — we have to wait for the first ADTS frame to reveal the AAC
+    // sample rate and channel count.
+    let mut ts_demuxer: Option<crate::engine::ts_demux::TsDemuxer> =
+        if compressed_audio_input {
+            Some(crate::engine::ts_demux::TsDemuxer::new(None))
+        } else {
+            None
+        };
+    let mut aac_decoder: Option<crate::engine::audio_decode::AacDecoder> = None;
+    let mut compressed_transcode: Option<crate::engine::audio_transcode::TranscodeStage> = None;
+    // Logged-once flag to prevent log spam when AAC config / decode errors
+    // repeat on every frame.
+    let mut logged_decoder_init_failure = false;
+    let mut logged_decode_error_kind: Option<String> = None;
+
     tracing::info!(
-        "{label} output '{}' started -> red={} blue={:?} transcode={}",
+        "{label} output '{}' started -> red={} blue={:?} transcode={} compressed_input={}",
         config.id,
         red_dest,
         blue.as_ref().map(|(_, d)| *d),
-        transcode.is_some()
+        transcode.is_some(),
+        compressed_audio_input,
     );
 
     loop {
@@ -424,9 +419,24 @@ pub async fn run_st2110_audio_output(
             res = rx.recv() => {
                 match res {
                     Ok(packet) => {
-                        // Build the list of output buffers to send: either the
-                        // raw packet (passthrough) or the transcoder's output.
-                        let outputs: Vec<Bytes> = if let Some(stage) = transcode.as_mut() {
+                        // Build the list of output buffers to send. Three modes:
+                        //   (a) Compressed-audio bridge (TS→AAC→PCM)
+                        //   (b) PCM transcode
+                        //   (c) Byte-identical passthrough
+                        let outputs: Vec<Bytes> = if let Some(demuxer) = ts_demuxer.as_mut() {
+                            run_compressed_audio_step(
+                                &packet,
+                                demuxer,
+                                &mut aac_decoder,
+                                &mut compressed_transcode,
+                                &config,
+                                &stats,
+                                flow_id,
+                                label,
+                                &mut logged_decoder_init_failure,
+                                &mut logged_decode_error_kind,
+                            )
+                        } else if let Some(stage) = transcode.as_mut() {
                             stage.process(&packet)
                         } else {
                             vec![packet.data.clone()]
@@ -762,6 +772,224 @@ pub async fn run_st2110_anc_output(
     }
 }
 
+/// One step of the compressed-audio bridge. Called from the audio output
+/// recv loop when `compressed_audio_input` is true.
+///
+/// Demuxes any TS packets in the broadcast `RtpPacket`, decodes ADTS AAC
+/// frames into planar f32 PCM, lazily builds the [`TranscodeStage`] from
+/// the AAC config the first time it's known, and runs each decoded frame
+/// through `process_planar`. Returns the resulting RTP-PCM frames ready
+/// for the wire.
+///
+/// All errors are logged once (per kind) to avoid spamming the log when
+/// a malformed input loops on the same frame.
+#[allow(clippy::too_many_arguments)]
+fn run_compressed_audio_step(
+    packet: &RtpPacket,
+    demuxer: &mut crate::engine::ts_demux::TsDemuxer,
+    decoder: &mut Option<crate::engine::audio_decode::AacDecoder>,
+    transcode: &mut Option<crate::engine::audio_transcode::TranscodeStage>,
+    config: &St2110AudioOutputConfig,
+    stats: &Arc<OutputStatsAccumulator>,
+    flow_id: &str,
+    label: &str,
+    logged_init_failure: &mut bool,
+    logged_decode_error: &mut Option<String>,
+) -> Vec<Bytes> {
+    use crate::engine::audio_decode::AacDecoder;
+    use crate::engine::ts_demux::DemuxedFrame;
+    use crate::engine::ts_parse::strip_rtp_header;
+
+    let ts_payload = strip_rtp_header(packet);
+    if ts_payload.is_empty() {
+        return Vec::new();
+    }
+    let frames = demuxer.demux(ts_payload);
+    if frames.is_empty() {
+        return Vec::new();
+    }
+
+    let mut emitted: Vec<Bytes> = Vec::new();
+    for frame in frames {
+        let DemuxedFrame::Aac { data, pts: _ } = frame else {
+            // H.264 / Opus / other elementary streams: ignored. Audio
+            // outputs are AAC-only in Phase A.
+            continue;
+        };
+
+        // Lazy decoder + transcode-stage construction. Both are built only
+        // once we have the AAC config (sample_rate_index + channel_config),
+        // which lands in `cached_aac_config()` after the demuxer parses
+        // the first ADTS header. The data we just received IS the first
+        // ADTS frame's body, so the cache is populated by now.
+        if decoder.is_none() {
+            let Some((profile, sri, cc)) = demuxer.cached_aac_config() else {
+                // Should never happen — we just got an Aac frame from the
+                // demuxer, which means it parsed an ADTS header for us.
+                // Log defensively and skip.
+                if !*logged_init_failure {
+                    tracing::warn!(
+                        "{label} output '{}' received AAC frame but demuxer has no cached config",
+                        config.id
+                    );
+                    *logged_init_failure = true;
+                }
+                continue;
+            };
+            match AacDecoder::from_adts_config(profile, sri, cc) {
+                Ok(d) => {
+                    let sample_rate = d.sample_rate();
+                    let channels = d.channels();
+                    tracing::info!(
+                        "{label} output '{}' AAC-LC decoder ready: {sample_rate} Hz, {channels} ch",
+                        config.id
+                    );
+
+                    // Discovered input format. Bit depth is nominal — the
+                    // f32 path bypasses decode_pcm_be entirely. We pick L24
+                    // because it round-trips f32 with the highest fidelity
+                    // and matches the most common ST 2110-30 deployment.
+                    let input = crate::engine::audio_transcode::InputFormat {
+                        sample_rate,
+                        bit_depth: crate::engine::audio_transcode::BitDepth::L24,
+                        channels,
+                    };
+
+                    // Build a TranscodeJson: use the configured one if
+                    // present, otherwise synthesize one that targets the
+                    // output's own format. This is what makes "AAC →
+                    // ST 2110-30 with no transcode block" work out of the
+                    // box: we auto-bridge to the output's nominal format.
+                    let tj = config.transcode.clone().unwrap_or_else(|| {
+                        crate::engine::audio_transcode::TranscodeJson {
+                            sample_rate: Some(config.sample_rate),
+                            bit_depth: Some(config.bit_depth),
+                            channels: Some(config.channels),
+                            ..Default::default()
+                        }
+                    });
+
+                    *decoder = Some(d);
+                    *transcode = build_audio_transcode_stage(
+                        tj,
+                        input,
+                        config,
+                        stats,
+                        flow_id,
+                        label,
+                    );
+                    if transcode.is_none() {
+                        if !*logged_init_failure {
+                            tracing::error!(
+                                "{label} output '{}' compressed-audio transcode stage build failed",
+                                config.id
+                            );
+                            *logged_init_failure = true;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if !*logged_init_failure {
+                        tracing::error!(
+                            "{label} output '{}' AAC decoder init failed: {e}; AAC frames will be dropped",
+                            config.id
+                        );
+                        *logged_init_failure = true;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        let (Some(dec), Some(stage)) = (decoder.as_mut(), transcode.as_mut()) else {
+            continue;
+        };
+
+        match dec.decode_frame(&data) {
+            Ok(planar) => {
+                let pkts = stage.process_planar(&planar, packet.recv_time_us);
+                emitted.extend(pkts);
+            }
+            Err(e) => {
+                let kind = format!("{e}");
+                if logged_decode_error.as_deref() != Some(kind.as_str()) {
+                    tracing::warn!(
+                        "{label} output '{}' AAC decode error: {e}",
+                        config.id
+                    );
+                    *logged_decode_error = Some(kind);
+                }
+            }
+        }
+    }
+
+    emitted
+}
+
+/// Build a [`crate::engine::audio_transcode::TranscodeStage`] for an audio
+/// output, given a known input format.
+///
+/// Shared between two call sites:
+///
+/// 1. The eager construction at the top of [`run_st2110_audio_output`] when
+///    the input is PCM and `config.transcode` is set.
+/// 2. The lazy construction in the compressed-audio bridge below, fired
+///    once the AAC decoder reveals the actual sample rate / channel count
+///    from the first ADTS frame.
+fn build_audio_transcode_stage(
+    tj: crate::engine::audio_transcode::TranscodeJson,
+    input: crate::engine::audio_transcode::InputFormat,
+    config: &St2110AudioOutputConfig,
+    stats: &Arc<OutputStatsAccumulator>,
+    flow_id: &str,
+    label: &str,
+) -> Option<crate::engine::audio_transcode::TranscodeStage> {
+    match crate::engine::audio_transcode::resolve_transcode(&tj, input) {
+        Ok(cfg) => {
+            let is08_input_id = format!("st2110_30:{}", flow_id);
+            let is08_output_id = format!("st2110_30:{}:{}", flow_id, config.id);
+            let matrix_source = crate::engine::audio_transcode::MatrixSource::is08_tracked(
+                is08_output_id,
+                is08_input_id,
+                input.channels,
+                cfg.out_channels,
+                cfg.channel_matrix.clone(),
+            );
+            let stats_arc =
+                std::sync::Arc::new(crate::engine::audio_transcode::TranscodeStats::new());
+            stats.set_transcode_stats(stats_arc.clone());
+            let ssrc = config.ssrc.unwrap_or_else(rand::random);
+            let stage = crate::engine::audio_transcode::TranscodeStage::new(
+                input,
+                cfg,
+                matrix_source,
+                stats_arc,
+                ssrc,
+                rand::random::<u16>(),
+                rand::random::<u32>(),
+            );
+            tracing::info!(
+                "{label} output '{}' transcode enabled: {}Hz/{}bit/{}ch -> {}Hz/{}bit/{}ch",
+                config.id,
+                input.sample_rate,
+                input.bit_depth.as_u8(),
+                input.channels,
+                tj.sample_rate.unwrap_or(input.sample_rate),
+                tj.bit_depth.unwrap_or(input.bit_depth.as_u8()),
+                tj.channels.unwrap_or(input.channels),
+            );
+            Some(stage)
+        }
+        Err(e) => {
+            tracing::error!(
+                "{label} output '{}' transcode resolve failed: {e}; falling back to passthrough",
+                config.id
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -855,7 +1083,7 @@ mod tests {
             let mut rx = tx.subscribe();
             let stats = out_stats.clone();
             async move {
-                let _ = run_st2110_audio_output(output_config, false, &mut rx, stats, out_cancel, None, "test-flow").await;
+                let _ = run_st2110_audio_output(output_config, false, &mut rx, stats, out_cancel, None, "test-flow", false).await;
             }
         });
 
@@ -977,6 +1205,7 @@ mod tests {
                     out_cancel,
                     input_format,
                     "tx-flow",
+                    false,
                 )
                 .await;
             }

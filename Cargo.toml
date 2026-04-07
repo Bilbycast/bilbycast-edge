@@ -51,6 +51,13 @@ rand = "0.10.0"
 # pipeline). No C deps.
 rubato = "2.0.0"
 
+# Pure-Rust audio codec decoder (used by `engine::audio_decode` to convert
+# AAC-LC contribution audio from RTMP/RTSP/SRT-TS/UDP-TS sources into PCM
+# so it can land into the existing PCM-only audio outputs (ST 2110-30/-31,
+# rtp_audio, SMPTE 302M). MPL-2.0, 100% Rust, no C deps. Minimal feature
+# set: AAC codec only, no format demuxers (we already demux TS in-house).
+symphonia = { version = "0.5.5", features = ["aac"], default-features = false }
+
 # Error handling
 anyhow = "1.0.102"
 

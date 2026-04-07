@@ -52,6 +52,13 @@ pub mod webrtc;
 /// `rtp_audio`, and SMPTE 302M-over-SRT/UDP/RTP outputs.
 pub mod audio_transcode;
 
+/// In-process AAC-LC decoder. Bridges compressed contribution audio (AAC in
+/// MPEG-TS via RTMP/RTSP/SRT/UDP inputs) into the PCM pipeline so it can land
+/// into the existing PCM-only outputs (ST 2110-30/-31, `rtp_audio`,
+/// SMPTE 302M). Pure Rust via `symphonia-codec-aac`. AAC-LC mono/stereo only;
+/// HE-AAC and multichannel AAC are rejected with a clear error.
+pub mod audio_decode;
+
 /// SMPTE 302M-2007 LPCM audio packetizer / depacketizer. Bit-packs 48 kHz
 /// 16/20/24-bit audio into private MPEG-TS PES payloads tagged with the
 /// `BSSD` registration descriptor. Pairs with [`audio_transcode`] (which

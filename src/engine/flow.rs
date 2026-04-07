@@ -535,6 +535,13 @@ impl FlowRuntime {
         // non-audio inputs (video, MPEG-TS, etc.) — passthrough is selected.
         let input_audio_format =
             crate::engine::audio_transcode::InputFormat::from_input_config(&config.input);
+        // Resolve once whether the upstream input is a TS-bearing source that
+        // could carry compressed audio (AAC). When true, audio output spawn
+        // modules will run an in-line TsDemuxer + AacDecoder ahead of the
+        // transcode chain so AAC contribution audio can land into PCM
+        // outputs (ST 2110-30/-31, rtp_audio, SMPTE 302M).
+        let compressed_audio_input =
+            crate::engine::audio_decode::input_can_carry_ts_audio(&config.input);
         for output_config in &config.outputs {
             // For WHEP server outputs, create the session channel so the HTTP
             // handler can forward SDP offers to the output task.
@@ -559,6 +566,7 @@ impl FlowRuntime {
                 &event_sender,
                 &config.id,
                 input_audio_format,
+                compressed_audio_input,
                 #[cfg(feature = "webrtc")]
                 whep_rx,
             ).await?;
@@ -609,6 +617,7 @@ impl FlowRuntime {
         event_sender: &EventSender,
         flow_id: &str,
         input_audio_format: Option<crate::engine::audio_transcode::InputFormat>,
+        compressed_audio_input: bool,
         #[cfg(feature = "webrtc")]
         whep_session_rx: Option<tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>>,
     ) -> Result<OutputRuntime> {
@@ -758,6 +767,7 @@ impl FlowRuntime {
                     output_cancel.clone(),
                     input_audio_format,
                     flow_id,
+                    compressed_audio_input,
                 );
                 Ok(OutputRuntime {
                     handle,
@@ -778,6 +788,7 @@ impl FlowRuntime {
                     output_cancel.clone(),
                     input_audio_format,
                     flow_id,
+                    compressed_audio_input,
                 );
                 Ok(OutputRuntime {
                     handle,
@@ -816,6 +827,7 @@ impl FlowRuntime {
                     output_cancel.clone(),
                     input_audio_format,
                     flow_id,
+                    compressed_audio_input,
                 );
                 Ok(OutputRuntime {
                     handle,
@@ -848,6 +860,8 @@ impl FlowRuntime {
 
         let input_audio_format =
             crate::engine::audio_transcode::InputFormat::from_input_config(&self.config.input);
+        let compressed_audio_input =
+            crate::engine::audio_decode::input_can_carry_ts_audio(&self.config.input);
         let output_rt = Self::start_output(
             &output_config,
             &self.broadcast_tx,
@@ -856,6 +870,7 @@ impl FlowRuntime {
             &self.event_sender,
             &self.config.id,
             input_audio_format,
+            compressed_audio_input,
             #[cfg(feature = "webrtc")]
             None,
         ).await?;

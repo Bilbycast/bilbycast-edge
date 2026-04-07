@@ -711,6 +711,67 @@ impl S302mOutputPipeline {
         }
     }
 
+    /// Feed pre-decoded planar f32 PCM through the pipeline. Mirrors
+    /// [`process`](Self::process) but skips the upstream RTP-PCM decode
+    /// stage — used by the compressed-audio bridge in
+    /// [`crate::engine::output_rtp_audio`] when the upstream input is AAC
+    /// in MPEG-TS and has already been decoded by
+    /// [`crate::engine::audio_decode::AacDecoder`].
+    ///
+    /// `recv_time_us` is the upstream packet receive timestamp; passed
+    /// through to the transcode stage solely for latency stats.
+    ///
+    /// After this call, drain ready 1316-byte datagrams via
+    /// [`take_ready_datagrams`](Self::take_ready_datagrams).
+    pub fn process_planar(&mut self, planar: &[Vec<f32>], recv_time_us: u64) {
+        let rtp_packets = self.transcode.process_planar(planar, recv_time_us);
+        let bps_wire = match self.out_bit_depth {
+            16 => 2usize,
+            20 => 3usize,
+            24 => 3usize,
+            _ => return,
+        };
+        let frame_size = self.out_channels as usize * bps_wire;
+        let bit_depth_enum = match self.out_bit_depth {
+            16 => BitDepth::L16,
+            20 => BitDepth::L20,
+            24 => BitDepth::L24,
+            _ => return,
+        };
+        for rtp in rtp_packets {
+            if rtp.len() < 12 {
+                continue;
+            }
+            let payload = &rtp[12..];
+            if payload.len() % frame_size != 0 {
+                continue;
+            }
+            let n_frames = payload.len() / frame_size;
+            let mut planar_out: Vec<Vec<f32>> =
+                (0..self.out_channels).map(|_| Vec::with_capacity(n_frames)).collect();
+            if crate::engine::audio_transcode::decode_pcm_be(
+                payload,
+                bit_depth_enum,
+                self.out_channels,
+                &mut planar_out,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            let pes = match self.packetizer.packetize_f32(&planar_out) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let ts_packets = self.ts_mux.mux_private_audio(&pes, self.pts_90khz);
+            for ts_pkt in ts_packets {
+                self.pending_ts.extend_from_slice(&ts_pkt);
+            }
+            let pts_advance = (n_frames as u64 * 90_000) / 48_000;
+            self.pts_90khz = self.pts_90khz.wrapping_add(pts_advance);
+        }
+    }
+
     /// Drain ready 1316-byte SRT datagrams. Returns whatever is currently
     /// buffered, leaving any partial datagram for the next call.
     pub fn take_ready_datagrams(&mut self) -> Vec<bytes::Bytes> {

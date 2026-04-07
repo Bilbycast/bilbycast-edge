@@ -23,6 +23,7 @@ pub fn spawn_st2110_30_output(
     cancel: CancellationToken,
     input_format: Option<InputFormat>,
     flow_id: &str,
+    compressed_audio_input: bool,
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
     let id = config.id.clone();
@@ -36,6 +37,7 @@ pub fn spawn_st2110_30_output(
             cancel,
             input_format,
             &flow_id,
+            compressed_audio_input,
         )
         .await
         {
