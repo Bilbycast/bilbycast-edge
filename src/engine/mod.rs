@@ -59,6 +59,13 @@ pub mod audio_transcode;
 /// HE-AAC and multichannel AAC are rejected with a clear error.
 pub mod audio_decode;
 
+/// ffmpeg-sidecar audio encoder. Wraps a long-running ffmpeg subprocess as a
+/// PCM → compressed-audio encoder for the RTMP, HLS, and WebRTC outputs.
+/// Pure Rust binary — ffmpeg is invoked at runtime via subprocess, never
+/// linked. Outputs that don't request `audio_encode` keep working unchanged.
+/// Supports AAC-LC, HE-AAC v1/v2, Opus, MP2, AC-3.
+pub mod audio_encode;
+
 /// SMPTE 302M-2007 LPCM audio packetizer / depacketizer. Bit-packs 48 kHz
 /// 16/20/24-bit audio into private MPEG-TS PES payloads tagged with the
 /// `BSSD` registration descriptor. Pairs with [`audio_transcode`] (which
