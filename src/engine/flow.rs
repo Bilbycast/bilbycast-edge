@@ -749,6 +749,7 @@ impl FlowRuntime {
                     whep_session_rx,
                     event_sender.clone(),
                     flow_id.to_string(),
+                    compressed_audio_input,
                 );
 
                 Ok(OutputRuntime {

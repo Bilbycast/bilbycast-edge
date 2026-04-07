@@ -17,7 +17,33 @@ use crate::config::models::WebrtcOutputConfig;
 use crate::manager::events::{EventSender, EventSeverity};
 use crate::stats::collector::OutputStatsAccumulator;
 
+#[cfg(feature = "webrtc")]
+use super::audio_decode::{AacDecoder, sample_rate_from_index};
+#[cfg(feature = "webrtc")]
+use super::audio_encode::{AudioCodec, AudioEncoder, AudioEncoderError, EncoderParams};
 use super::packet::RtpPacket;
+
+/// Per-output encoder state for the WebRTC audio_encode bridge. Mirrors the
+/// pattern in [`super::output_rtmp`] but tailored to Opus output: there is
+/// no Transparent same-codec fast path because the source is always AAC and
+/// WebRTC always emits Opus.
+#[cfg(feature = "webrtc")]
+enum WebrtcEncoderState {
+    /// audio_encode unset, or video_only=true. Drop audio frames silently
+    /// (preserves the existing pre-Phase B behavior).
+    Disabled,
+    /// audio_encode set; encoder will be built on first AAC frame.
+    Lazy,
+    /// Decoder + encoder running; each AAC frame goes through decode → encode
+    /// → write_media to the WebRTC audio MID.
+    Active {
+        decoder: AacDecoder,
+        encoder: AudioEncoder,
+    },
+    /// Decoder or encoder construction failed once. Drop audio for the
+    /// rest of the session's lifetime.
+    Failed,
+}
 
 /// Spawn a WebRTC output task (WHIP client or WHEP server depending on config mode).
 ///
@@ -34,6 +60,7 @@ pub fn spawn_webrtc_output(
     session_rx: Option<tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>>,
     event_sender: EventSender,
     flow_id: String,
+    compressed_audio_input: bool,
 ) -> JoinHandle<()> {
     let rx = broadcast_tx.subscribe();
 
@@ -43,7 +70,7 @@ pub fn spawn_webrtc_output(
         match config.mode {
             WebrtcOutputMode::WhipClient => {
                 tokio::spawn(async move {
-                    whip_client_loop(config, rx, output_stats, cancel, &event_sender, &flow_id).await;
+                    whip_client_loop(config, rx, output_stats, cancel, &event_sender, &flow_id, compressed_audio_input).await;
                 })
             }
             WebrtcOutputMode::WhepServer => {
@@ -54,7 +81,7 @@ pub fn spawn_webrtc_output(
                         config.id,
                     );
                     if let Some(session_rx) = session_rx {
-                        whep_server_loop(config, broadcast_tx_clone, rx, output_stats, cancel, session_rx, &event_sender, &flow_id).await;
+                        whep_server_loop(config, broadcast_tx_clone, rx, output_stats, cancel, session_rx, &event_sender, &flow_id, compressed_audio_input).await;
                     } else {
                         tracing::warn!(
                             "WHEP server output '{}' has no session channel — viewers cannot connect",
@@ -69,7 +96,7 @@ pub fn spawn_webrtc_output(
 
     #[cfg(not(feature = "webrtc"))]
     {
-        let _ = (event_sender, flow_id); // Suppress unused warnings
+        let _ = (event_sender, flow_id, compressed_audio_input); // Suppress unused warnings
         tokio::spawn(async move {
             tracing::warn!(
                 "WebRTC output '{}' is a stub: the `webrtc` cargo feature is not enabled. \
@@ -126,6 +153,7 @@ async fn whep_server_loop(
     mut session_rx: tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>,
     events: &EventSender,
     flow_id: &str,
+    compressed_audio_input: bool,
 ) {
     use super::webrtc::session::{SessionConfig, WebrtcSession};
 
@@ -189,6 +217,8 @@ async fn whep_server_loop(
         let viewer_program = config.program_number;
         let viewer_events = events.clone();
         let viewer_flow_id = flow_id.to_string();
+        let viewer_audio_encode = config.audio_encode.clone();
+        let viewer_compressed = compressed_audio_input;
 
         tokio::spawn(async move {
             whep_viewer_loop(
@@ -202,6 +232,8 @@ async fn whep_server_loop(
                 viewer_program,
                 &viewer_events,
                 &viewer_flow_id,
+                viewer_audio_encode,
+                viewer_compressed,
             ).await;
         });
     }
@@ -222,6 +254,8 @@ async fn whep_viewer_loop(
     program_number: Option<u16>,
     events: &EventSender,
     flow_id: &str,
+    audio_encode: Option<crate::config::models::AudioEncodeConfig>,
+    compressed_audio_input: bool,
 ) {
     use super::ts_parse::strip_rtp_header;
     use super::webrtc::ts_demux::TsDemuxer;
@@ -264,7 +298,24 @@ async fn whep_viewer_loop(
         }
     };
 
-    let _ = video_only; // TODO: handle audio MID when audio support is added
+    // Extract the audio MID + payload type if SDP negotiated audio.
+    // video_only=true skips this entirely (no audio MID was negotiated).
+    let (audio_mid, audio_pt) = if !video_only {
+        let mid = session.audio_mid;
+        let pt = mid.and_then(|m| session.get_pt(m));
+        (mid, pt)
+    } else {
+        (None, None)
+    };
+
+    // Build encoder state lazily on first AAC frame. The Lazy state only
+    // makes sense when audio_encode is set AND audio MID was negotiated.
+    let mut encoder_state: WebrtcEncoderState =
+        if audio_encode.is_some() && audio_mid.is_some() && audio_pt.is_some() {
+            WebrtcEncoderState::Lazy
+        } else {
+            WebrtcEncoderState::Disabled
+        };
 
     // Send loop: demux TS → packetize H.264 → send via str0m
     let mut demuxer = TsDemuxer::new(program_number);
@@ -306,10 +357,53 @@ async fn whep_viewer_loop(
                                     }
                                 }
                                 super::webrtc::ts_demux::DemuxedFrame::Opus => {
-                                    // TODO: Send Opus via audio MID
+                                    // TODO: handle native Opus passthrough
+                                    // (rare — would require an OBS source
+                                    // already publishing Opus-in-TS).
                                 }
-                                super::webrtc::ts_demux::DemuxedFrame::Aac { .. } => {
-                                    // AAC not supported in WebRTC — skip
+                                super::webrtc::ts_demux::DemuxedFrame::Aac { data, pts } => {
+                                    if matches!(encoder_state, WebrtcEncoderState::Lazy) {
+                                        encoder_state = build_webrtc_encoder_state(
+                                            audio_encode.as_ref(),
+                                            &demuxer,
+                                            compressed_audio_input,
+                                            &cancel,
+                                            &stats,
+                                            flow_id,
+                                            output_id,
+                                        );
+                                    }
+                                    if let (
+                                        WebrtcEncoderState::Active { decoder, encoder },
+                                        Some(audio_mid),
+                                        Some(audio_pt),
+                                    ) = (&mut encoder_state, audio_mid, audio_pt)
+                                    {
+                                        if let Ok(planar) = decoder.decode_frame(&data) {
+                                            encoder.submit_planar(&planar, pts);
+                                        }
+                                        for frame in encoder.drain() {
+                                            // Convert 90k PTS → 48k for Opus
+                                            let media_time = MediaTime::new(
+                                                frame.pts * 48_000 / 90_000,
+                                                str0m::media::Frequency::FORTY_EIGHT_KHZ,
+                                            );
+                                            if let Err(e) = session.write_media(
+                                                audio_mid,
+                                                audio_pt,
+                                                Instant::now(),
+                                                media_time,
+                                                &frame.data,
+                                            ) {
+                                                tracing::debug!(
+                                                    "WHEP viewer '{}' audio write error: {}",
+                                                    session_id, e
+                                                );
+                                            }
+                                            stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                            stats.bytes_sent.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -341,6 +435,7 @@ async fn whip_client_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    compressed_audio_input: bool,
 ) {
     use std::time::Instant;
     use super::ts_parse::strip_rtp_header;
@@ -453,6 +548,23 @@ async fn whip_client_loop(
             }
         };
 
+        // Optional audio MID + PT (only present when video_only=false).
+        let (audio_mid, audio_pt) = if !config.video_only {
+            let mid = session.audio_mid;
+            let pt = mid.and_then(|m| session.get_pt(m));
+            (mid, pt)
+        } else {
+            (None, None)
+        };
+
+        let audio_encode = config.audio_encode.clone();
+        let mut encoder_state: WebrtcEncoderState =
+            if audio_encode.is_some() && audio_mid.is_some() && audio_pt.is_some() {
+                WebrtcEncoderState::Lazy
+            } else {
+                WebrtcEncoderState::Disabled
+            };
+
         // Send loop: demux TS → packetize H.264 → send via str0m
         let mut demuxer = TsDemuxer::new(config.program_number);
         let mut rtp_seq: u16 = 0;
@@ -493,10 +605,49 @@ async fn whip_client_loop(
                                         }
                                     }
                                     super::webrtc::ts_demux::DemuxedFrame::Opus => {
-                                        // TODO: Send Opus via audio MID
+                                        // Native Opus passthrough not yet implemented
                                     }
-                                    super::webrtc::ts_demux::DemuxedFrame::Aac { .. } => {
-                                        // AAC not supported in WebRTC — skip
+                                    super::webrtc::ts_demux::DemuxedFrame::Aac { data, pts } => {
+                                        if matches!(encoder_state, WebrtcEncoderState::Lazy) {
+                                            encoder_state = build_webrtc_encoder_state(
+                                                audio_encode.as_ref(),
+                                                &demuxer,
+                                                compressed_audio_input,
+                                                &cancel,
+                                                &stats,
+                                                flow_id,
+                                                &config.id,
+                                            );
+                                        }
+                                        if let (
+                                            WebrtcEncoderState::Active { decoder, encoder },
+                                            Some(audio_mid),
+                                            Some(audio_pt),
+                                        ) = (&mut encoder_state, audio_mid, audio_pt)
+                                        {
+                                            if let Ok(planar) = decoder.decode_frame(&data) {
+                                                encoder.submit_planar(&planar, pts);
+                                            }
+                                            for frame in encoder.drain() {
+                                                let media_time = MediaTime::new(
+                                                    frame.pts * 48_000 / 90_000,
+                                                    str0m::media::Frequency::FORTY_EIGHT_KHZ,
+                                                );
+                                                if let Err(e) = session.write_media(
+                                                    audio_mid,
+                                                    audio_pt,
+                                                    Instant::now(),
+                                                    media_time,
+                                                    &frame.data,
+                                                ) {
+                                                    tracing::debug!(
+                                                        "WHIP audio write error: {}", e
+                                                    );
+                                                }
+                                                stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                                stats.bytes_sent.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -518,4 +669,130 @@ async fn whip_client_loop(
     }
 
     tracing::info!("WebRTC output '{}' stopped", config.id);
+}
+
+/// Lazy build of the WebRTC encoder state on the first AAC frame. Mirrors
+/// `super::output_rtmp::build_encoder_state` but specialised for the
+/// AAC → Opus path. Returns Failed (with a clear log) if the input is
+/// non-AAC-LC, ffmpeg is missing, or anything in the decode/encode chain
+/// rejects the source.
+#[cfg(feature = "webrtc")]
+fn build_webrtc_encoder_state(
+    audio_encode: Option<&crate::config::models::AudioEncodeConfig>,
+    demuxer: &super::ts_demux::TsDemuxer,
+    compressed_audio_input: bool,
+    cancel: &CancellationToken,
+    stats: &Arc<OutputStatsAccumulator>,
+    flow_id: &str,
+    output_id: &str,
+) -> WebrtcEncoderState {
+    let Some(enc_cfg) = audio_encode else {
+        return WebrtcEncoderState::Disabled;
+    };
+
+    if !compressed_audio_input {
+        tracing::error!(
+            "WebRTC output '{}': audio_encode is set but the flow input cannot carry TS audio (PCM-only source); audio will be dropped",
+            output_id
+        );
+        return WebrtcEncoderState::Failed;
+    }
+
+    let Some((profile, sr_idx, ch_cfg)) = demuxer.cached_aac_config() else {
+        return WebrtcEncoderState::Lazy;
+    };
+
+    if profile != 1 {
+        tracing::error!(
+            "WebRTC output '{}': audio_encode requires AAC-LC input (ADTS profile=1, AOT=2), got profile={profile} (AOT={}); audio will be dropped",
+            output_id,
+            profile + 1
+        );
+        return WebrtcEncoderState::Failed;
+    }
+
+    let Some(input_sr) = sample_rate_from_index(sr_idx) else {
+        tracing::error!(
+            "WebRTC output '{}': audio_encode rejected unsupported AAC sample_rate_index={sr_idx}",
+            output_id
+        );
+        return WebrtcEncoderState::Failed;
+    };
+    if ch_cfg == 0 || ch_cfg > 2 {
+        tracing::error!(
+            "WebRTC output '{}': audio_encode rejected unsupported AAC channel_config={ch_cfg}",
+            output_id
+        );
+        return WebrtcEncoderState::Failed;
+    }
+
+    // Validation guarantees codec=opus for WebRTC; no need to handle others.
+    let Some(codec) = AudioCodec::parse(&enc_cfg.codec) else {
+        tracing::error!(
+            "WebRTC output '{}': audio_encode unknown codec '{}'",
+            output_id, enc_cfg.codec
+        );
+        return WebrtcEncoderState::Failed;
+    };
+    if codec != AudioCodec::Opus {
+        tracing::error!(
+            "WebRTC output '{}': audio_encode codec must be 'opus', got '{}'",
+            output_id, enc_cfg.codec
+        );
+        return WebrtcEncoderState::Failed;
+    }
+
+    let target_ch = enc_cfg.channels.unwrap_or(ch_cfg);
+    let target_br = enc_cfg.bitrate_kbps.unwrap_or_else(|| codec.default_bitrate_kbps());
+
+    let params = EncoderParams {
+        codec,
+        sample_rate: input_sr,
+        channels: ch_cfg,
+        target_bitrate_kbps: target_br,
+        // Opus is always 48 kHz on the wire regardless of operator input.
+        target_sample_rate: 48_000,
+        target_channels: target_ch,
+    };
+
+    let decoder = match AacDecoder::from_adts_config(profile, sr_idx, ch_cfg) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(
+                "WebRTC output '{}': audio_encode AacDecoder build failed: {e}",
+                output_id
+            );
+            return WebrtcEncoderState::Failed;
+        }
+    };
+
+    let encoder = match AudioEncoder::spawn(
+        params,
+        cancel.child_token(),
+        flow_id.to_string(),
+        output_id.to_string(),
+        stats.clone(),
+    ) {
+        Ok(e) => e,
+        Err(AudioEncoderError::FfmpegNotFound) => {
+            tracing::error!(
+                "WebRTC output '{}': audio_encode requires ffmpeg in PATH but it is not installed; audio will be dropped",
+                output_id
+            );
+            return WebrtcEncoderState::Failed;
+        }
+        Err(e) => {
+            tracing::error!(
+                "WebRTC output '{}': audio_encode spawn failed: {e}",
+                output_id
+            );
+            return WebrtcEncoderState::Failed;
+        }
+    };
+
+    tracing::info!(
+        "WebRTC output '{}': audio_encode active (Opus, source {} Hz {} ch -> 48000 Hz {} ch, {} kbps)",
+        output_id, input_sr, ch_cfg, target_ch, target_br,
+    );
+    WebrtcEncoderState::Active { decoder, encoder }
 }
