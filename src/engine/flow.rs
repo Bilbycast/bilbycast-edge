@@ -701,6 +701,8 @@ impl FlowRuntime {
                     broadcast_tx,
                     output_stats.clone(),
                     output_cancel.clone(),
+                    compressed_audio_input,
+                    flow_id.to_string(),
                 );
 
                 Ok(OutputRuntime {
