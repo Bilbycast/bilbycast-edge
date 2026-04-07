@@ -371,6 +371,7 @@ async fn whep_viewer_loop(
                                             &stats,
                                             flow_id,
                                             output_id,
+                                            events,
                                         );
                                     }
                                     if let (
@@ -617,6 +618,7 @@ async fn whip_client_loop(
                                                 &stats,
                                                 flow_id,
                                                 &config.id,
+                                                events,
                                             );
                                         }
                                         if let (
@@ -685,15 +687,23 @@ fn build_webrtc_encoder_state(
     stats: &Arc<OutputStatsAccumulator>,
     flow_id: &str,
     output_id: &str,
+    events: &EventSender,
 ) -> WebrtcEncoderState {
     let Some(enc_cfg) = audio_encode else {
         return WebrtcEncoderState::Disabled;
     };
 
     if !compressed_audio_input {
-        tracing::error!(
+        let msg = format!(
             "WebRTC output '{}': audio_encode is set but the flow input cannot carry TS audio (PCM-only source); audio will be dropped",
             output_id
+        );
+        tracing::error!("{msg}");
+        events.emit_flow(
+            EventSeverity::Critical,
+            crate::manager::events::category::AUDIO_ENCODE,
+            msg,
+            flow_id,
         );
         return WebrtcEncoderState::Failed;
     }
@@ -703,10 +713,17 @@ fn build_webrtc_encoder_state(
     };
 
     if profile != 1 {
-        tracing::error!(
+        let msg = format!(
             "WebRTC output '{}': audio_encode requires AAC-LC input (ADTS profile=1, AOT=2), got profile={profile} (AOT={}); audio will be dropped",
             output_id,
             profile + 1
+        );
+        tracing::error!("{msg}");
+        events.emit_flow(
+            EventSeverity::Critical,
+            crate::manager::events::category::AUDIO_ENCODE,
+            msg,
+            flow_id,
         );
         return WebrtcEncoderState::Failed;
     }
@@ -772,19 +789,34 @@ fn build_webrtc_encoder_state(
         flow_id.to_string(),
         output_id.to_string(),
         stats.clone(),
+        Some(events.clone()),
     ) {
         Ok(e) => e,
         Err(AudioEncoderError::FfmpegNotFound) => {
-            tracing::error!(
+            let msg = format!(
                 "WebRTC output '{}': audio_encode requires ffmpeg in PATH but it is not installed; audio will be dropped",
                 output_id
+            );
+            tracing::error!("{msg}");
+            events.emit_flow(
+                EventSeverity::Critical,
+                crate::manager::events::category::AUDIO_ENCODE,
+                msg,
+                flow_id,
             );
             return WebrtcEncoderState::Failed;
         }
         Err(e) => {
-            tracing::error!(
+            let msg = format!(
                 "WebRTC output '{}': audio_encode spawn failed: {e}",
                 output_id
+            );
+            tracing::error!("{msg}");
+            events.emit_flow(
+                EventSeverity::Critical,
+                crate::manager::events::category::AUDIO_ENCODE,
+                msg,
+                flow_id,
             );
             return WebrtcEncoderState::Failed;
         }

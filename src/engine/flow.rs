@@ -703,6 +703,7 @@ impl FlowRuntime {
                     output_cancel.clone(),
                     compressed_audio_input,
                     flow_id.to_string(),
+                    event_sender.clone(),
                 );
 
                 Ok(OutputRuntime {

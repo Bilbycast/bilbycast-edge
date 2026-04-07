@@ -145,6 +145,10 @@ pub mod category {
     pub const NMOS: &str = "nmos";
     /// SCTE-104 ad-marker decoding events surfaced from ANC (-40) flows.
     pub const SCTE104: &str = "scte104";
+    /// ffmpeg-sidecar audio encoder lifecycle (started / failed / restarted).
+    /// Emitted by the per-output encoder bridges in `engine::audio_encode`
+    /// and the build helpers in output_rtmp / output_hls / output_webrtc.
+    pub const AUDIO_ENCODE: &str = "audio_encode";
 }
 
 /// Create an event sender/receiver pair.

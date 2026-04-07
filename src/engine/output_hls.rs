@@ -99,12 +99,33 @@ async fn hls_output_loop(
                         config.id
                     );
                     tracing::error!("{msg}");
-                    event_sender.emit_flow(EventSeverity::Critical, "hls", msg, flow_id);
+                    event_sender.emit_flow(
+                        EventSeverity::Critical,
+                        crate::manager::events::category::AUDIO_ENCODE,
+                        msg,
+                        flow_id,
+                    );
                     return Ok(());
                 }
                 tracing::info!(
                     "HLS output '{}': audio_encode active codec={} bitrate={:?}k sr={:?} ch={:?}",
                     config.id, enc.codec, enc.bitrate_kbps, enc.sample_rate, enc.channels
+                );
+                event_sender.emit_flow_with_details(
+                    EventSeverity::Info,
+                    crate::manager::events::category::AUDIO_ENCODE,
+                    format!(
+                        "HLS output '{}': audio encoder started (codec={})",
+                        config.id, enc.codec
+                    ),
+                    flow_id,
+                    serde_json::json!({
+                        "output_id": config.id,
+                        "codec": enc.codec,
+                        "bitrate_kbps": enc.bitrate_kbps,
+                        "sample_rate": enc.sample_rate,
+                        "channels": enc.channels,
+                    }),
                 );
                 Some(args)
             }
@@ -114,7 +135,12 @@ async fn hls_output_loop(
                     config.id
                 );
                 tracing::error!("{msg}");
-                event_sender.emit_flow(EventSeverity::Critical, "hls", msg, flow_id);
+                event_sender.emit_flow(
+                    EventSeverity::Critical,
+                    crate::manager::events::category::AUDIO_ENCODE,
+                    msg,
+                    flow_id,
+                );
                 return Ok(());
             }
         },
@@ -206,7 +232,7 @@ async fn hls_output_loop(
                                         );
                                         event_sender.emit_flow(
                                             EventSeverity::Warning,
-                                            "hls",
+                                            crate::manager::events::category::AUDIO_ENCODE,
                                             format!("HLS output '{}': segment {} remux failed: {e}", config.id, segment_seq),
                                             flow_id,
                                         );

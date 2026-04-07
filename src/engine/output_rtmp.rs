@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::RtmpOutputConfig;
+use crate::manager::events::{EventSender, EventSeverity};
 use crate::stats::collector::OutputStatsAccumulator;
 
 use super::audio_decode::{AacDecoder, sample_rate_from_index};
@@ -61,6 +62,7 @@ pub fn spawn_rtmp_output(
     cancel: CancellationToken,
     compressed_audio_input: bool,
     flow_id: String,
+    event_sender: EventSender,
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
 
@@ -115,7 +117,7 @@ pub fn spawn_rtmp_output(
             // Run the publish loop
             let err = publish_loop(
                 &config, &mut client, &mut rx, &output_stats, &cancel,
-                compressed_audio_input, &flow_id,
+                compressed_audio_input, &flow_id, &event_sender,
             ).await;
 
             let _ = client.close().await;
@@ -145,6 +147,7 @@ async fn publish_loop(
     cancel: &CancellationToken,
     compressed_audio_input: bool,
     flow_id: &str,
+    event_sender: &EventSender,
 ) -> anyhow::Result<()> {
     let mut demuxer = TsDemuxer::new(config.program_number);
     let mut sent_video_header = false;
@@ -243,6 +246,7 @@ async fn publish_loop(
                             cancel,
                             stats,
                             flow_id,
+                            event_sender,
                         );
                     }
 
@@ -461,15 +465,23 @@ fn build_encoder_state(
     cancel: &CancellationToken,
     stats: &Arc<OutputStatsAccumulator>,
     flow_id: &str,
+    event_sender: &EventSender,
 ) -> EncoderState {
     let Some(enc_cfg) = config.audio_encode.as_ref() else {
         return EncoderState::Disabled;
     };
 
     if !compressed_audio_input {
-        tracing::error!(
+        let msg = format!(
             "RTMP output '{}': audio_encode is set but the flow input cannot carry TS audio (PCM-only source); audio will be dropped",
             config.id
+        );
+        tracing::error!("{msg}");
+        event_sender.emit_flow(
+            EventSeverity::Critical,
+            crate::manager::events::category::AUDIO_ENCODE,
+            msg,
+            flow_id,
         );
         return EncoderState::Failed;
     }
@@ -483,10 +495,17 @@ fn build_encoder_state(
     };
 
     if profile != 1 {
-        tracing::error!(
+        let msg = format!(
             "RTMP output '{}': audio_encode requires AAC-LC input (ADTS profile=1, AOT=2), got profile={profile} (AOT={}); audio will be dropped",
             config.id,
             profile + 1
+        );
+        tracing::error!("{msg}");
+        event_sender.emit_flow(
+            EventSeverity::Critical,
+            crate::manager::events::category::AUDIO_ENCODE,
+            msg,
+            flow_id,
         );
         return EncoderState::Failed;
     }
@@ -558,19 +577,34 @@ fn build_encoder_state(
         flow_id.to_string(),
         config.id.clone(),
         stats.clone(),
+        Some(event_sender.clone()),
     ) {
         Ok(e) => e,
         Err(AudioEncoderError::FfmpegNotFound) => {
-            tracing::error!(
+            let msg = format!(
                 "RTMP output '{}': audio_encode requires ffmpeg in PATH but it is not installed; audio will be dropped",
                 config.id
+            );
+            tracing::error!("{msg}");
+            event_sender.emit_flow(
+                EventSeverity::Critical,
+                crate::manager::events::category::AUDIO_ENCODE,
+                msg,
+                flow_id,
             );
             return EncoderState::Failed;
         }
         Err(e) => {
-            tracing::error!(
+            let msg = format!(
                 "RTMP output '{}': audio_encode encoder spawn failed: {e}",
                 config.id
+            );
+            tracing::error!("{msg}");
+            event_sender.emit_flow(
+                EventSeverity::Critical,
+                crate::manager::events::category::AUDIO_ENCODE,
+                msg,
+                flow_id,
             );
             return EncoderState::Failed;
         }

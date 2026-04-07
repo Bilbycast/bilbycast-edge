@@ -64,6 +64,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::manager::events::{EventSender, EventSeverity};
 use crate::stats::collector::OutputStatsAccumulator;
 
 // ── Public types ────────────────────────────────────────────────────────────
@@ -285,6 +286,7 @@ impl AudioEncoder {
         flow_id: String,
         output_id: String,
         stats: Arc<OutputStatsAccumulator>,
+        events: Option<EventSender>,
     ) -> Result<Self, AudioEncoderError> {
         // Reject obviously bad PCM formats early so we don't spawn ffmpeg
         // for an unfixable input.
@@ -316,6 +318,7 @@ impl AudioEncoder {
             flow_id,
             output_id,
             stats,
+            events,
         ));
 
         Ok(Self {
@@ -970,6 +973,7 @@ async fn supervisor_loop(
     flow_id: String,
     output_id: String,
     stats: Arc<OutputStatsAccumulator>,
+    events: Option<EventSender>,
 ) {
     tracing::info!(
         "audio_encode supervisor started: flow={} output={} codec={} sr={}/{} ch={}/{} br={}k",
@@ -979,6 +983,25 @@ async fn supervisor_loop(
         params.channels, params.target_channels,
         params.target_bitrate_kbps,
     );
+
+    if let Some(ref ev) = events {
+        ev.emit_flow_with_details(
+            EventSeverity::Info,
+            crate::manager::events::category::AUDIO_ENCODE,
+            format!(
+                "audio encoder started: output '{}' codec={} {} kbps",
+                output_id, params.codec.as_str(), params.target_bitrate_kbps
+            ),
+            &flow_id,
+            serde_json::json!({
+                "output_id": output_id,
+                "codec": params.codec.as_str(),
+                "bitrate_kbps": params.target_bitrate_kbps,
+                "sample_rate": params.target_sample_rate,
+                "channels": params.target_channels,
+            }),
+        );
+    }
 
     let mut restart_count: u32 = 0;
     let mut window_start = std::time::Instant::now();
@@ -1164,7 +1187,34 @@ async fn supervisor_loop(
                 "audio_encode '{}': giving up after {} restarts in {} seconds",
                 output_id, MAX_RESTARTS, RESTART_WINDOW.as_secs()
             );
+            if let Some(ref ev) = events {
+                ev.emit_flow(
+                    EventSeverity::Critical,
+                    crate::manager::events::category::AUDIO_ENCODE,
+                    format!(
+                        "audio encoder failed: output '{}' exhausted {} restarts in {} s",
+                        output_id, MAX_RESTARTS, RESTART_WINDOW.as_secs()
+                    ),
+                    &flow_id,
+                );
+            }
             break;
+        }
+        if let Some(ref ev) = events {
+            ev.emit_flow_with_details(
+                EventSeverity::Warning,
+                crate::manager::events::category::AUDIO_ENCODE,
+                format!(
+                    "audio encoder restarted: output '{}' restart {}/{}",
+                    output_id, restart_count, MAX_RESTARTS
+                ),
+                &flow_id,
+                serde_json::json!({
+                    "output_id": output_id,
+                    "restart_count": restart_count,
+                    "max_restarts": MAX_RESTARTS,
+                }),
+            );
         }
         let backoff = compute_backoff(restart_count);
         tokio::select! {
@@ -1604,7 +1654,7 @@ mod tests {
             "rtmp".into(),
         ));
         let err = AudioEncoder::spawn(
-            params, cancel, "test-flow".into(), "test-output".into(), stats,
+            params, cancel, "test-flow".into(), "test-output".into(), stats, None,
         ).unwrap_err();
         match err {
             AudioEncoderError::InvalidPcmFormat { .. } => {}
