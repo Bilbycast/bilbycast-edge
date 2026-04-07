@@ -15,6 +15,7 @@ use crate::stats::collector::OutputStatsAccumulator;
 use crate::util::socket::create_udp_output;
 
 use super::packet::RtpPacket;
+use super::ts_program_filter::TsProgramFilter;
 
 /// TS sync byte.
 const TS_SYNC_BYTE: u8 = 0x47;
@@ -113,6 +114,16 @@ async fn rtp_output_loop(
     let mut is_raw_ts_stream = false;
     let mut ts_sync_found = false;
 
+    // Optional MPTS → SPTS program filter.
+    let mut program_filter = config.program_number.map(|n| {
+        tracing::info!(
+            "RTP output '{}': program filter enabled, target program_number = {}",
+            config.id, n
+        );
+        TsProgramFilter::new(n)
+    });
+    let mut filter_scratch: Vec<u8> = Vec::new();
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -122,6 +133,27 @@ async fn rtp_output_loop(
             result = rx.recv() => {
                 match result {
                     Ok(packet) => {
+                        // Apply program filter (if enabled). For RTP-wrapped
+                        // packets the filter strips the RTP header, filters
+                        // the TS payload, then re-wraps with the original
+                        // RTP header. For raw TS the filtered bytes feed the
+                        // re-alignment buffer below. If the filter eats the
+                        // entire packet (no target-program TS in this datagram)
+                        // we skip both the send AND the FEC update.
+                        let packet = if let Some(ref mut filter) = program_filter {
+                            match filter.filter_packet(&packet, &mut filter_scratch) {
+                                Some(filtered) => RtpPacket {
+                                    data: filtered,
+                                    sequence_number: packet.sequence_number,
+                                    rtp_timestamp: packet.rtp_timestamp,
+                                    recv_time_us: packet.recv_time_us,
+                                    is_raw_ts: packet.is_raw_ts,
+                                },
+                                None => continue,
+                            }
+                        } else {
+                            packet
+                        };
                         if packet.is_raw_ts {
                             // Raw TS: buffer and re-align to 188-byte boundaries.
                             // SRT interop may deliver data in non-aligned chunks.
@@ -338,6 +370,16 @@ async fn rtp_output_redundant_loop(
     let mut is_raw_ts_stream = false;
     let mut ts_sync_found = false;
 
+    // Optional MPTS → SPTS program filter (shared by both legs).
+    let mut program_filter = config.program_number.map(|n| {
+        tracing::info!(
+            "RTP output '{}' (2022-7): program filter enabled, target program_number = {}",
+            config.id, n
+        );
+        TsProgramFilter::new(n)
+    });
+    let mut filter_scratch: Vec<u8> = Vec::new();
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -347,6 +389,23 @@ async fn rtp_output_redundant_loop(
             result = rx.recv() => {
                 match result {
                     Ok(packet) => {
+                        // Apply program filter (if enabled). Same semantics as
+                        // the single-leg path: skip the entire packet if the
+                        // filter eats it (no target-program TS in this datagram).
+                        let packet = if let Some(ref mut filter) = program_filter {
+                            match filter.filter_packet(&packet, &mut filter_scratch) {
+                                Some(filtered) => RtpPacket {
+                                    data: filtered,
+                                    sequence_number: packet.sequence_number,
+                                    rtp_timestamp: packet.rtp_timestamp,
+                                    recv_time_us: packet.recv_time_us,
+                                    is_raw_ts: packet.is_raw_ts,
+                                },
+                                None => continue,
+                            }
+                        } else {
+                            packet
+                        };
                         if packet.is_raw_ts {
                             // Raw TS: buffer and re-align, send to both legs
                             if !is_raw_ts_stream {

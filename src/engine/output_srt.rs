@@ -18,7 +18,10 @@ use crate::srt::connection::{
 };
 use crate::stats::collector::OutputStatsAccumulator;
 
+use super::audio_302m::S302mOutputPipeline;
+use super::audio_transcode::InputFormat;
 use super::packet::RtpPacket;
+use super::ts_program_filter::TsProgramFilter;
 
 /// Spawn a task that subscribes to the broadcast channel and sends
 /// RTP packets over an SRT connection. If redundancy is configured,
@@ -30,6 +33,7 @@ pub fn spawn_srt_output(
     cancel: CancellationToken,
     event_sender: EventSender,
     flow_id: String,
+    input_format: Option<InputFormat>,
 ) -> JoinHandle<()> {
     let broadcast_tx = broadcast_tx.clone();
 
@@ -37,7 +41,7 @@ pub fn spawn_srt_output(
         let result = if config.redundancy.is_some() {
             srt_output_redundant_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id).await
         } else {
-            srt_output_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id).await
+            srt_output_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, input_format).await
         };
         if let Err(e) = result {
             tracing::error!("SRT output '{}' exited with error: {e}", config.id);
@@ -61,10 +65,11 @@ async fn srt_output_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    input_format: Option<InputFormat>,
 ) -> anyhow::Result<()> {
     match config.mode {
-        SrtMode::Listener => srt_output_listener_loop(config, broadcast_tx, stats, cancel, events, flow_id).await,
-        _ => srt_output_caller_loop(config, broadcast_tx, stats, cancel, events, flow_id).await,
+        SrtMode::Listener => srt_output_listener_loop(config, broadcast_tx, stats, cancel, events, flow_id, input_format).await,
+        _ => srt_output_caller_loop(config, broadcast_tx, stats, cancel, events, flow_id, input_format).await,
     }
 }
 
@@ -77,8 +82,16 @@ async fn srt_output_listener_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    input_format: Option<InputFormat>,
 ) -> anyhow::Result<()> {
     let mut listener = bind_srt_listener_for_output(config).await?;
+    let mut program_filter = config.program_number.map(|n| {
+        tracing::info!(
+            "SRT output '{}' (listener): program filter enabled, target program_number = {}",
+            config.id, n
+        );
+        TsProgramFilter::new(n)
+    });
 
     loop {
         let socket = match accept_srt_connection(&mut listener, &cancel).await {
@@ -166,7 +179,7 @@ async fn srt_output_listener_loop(
         let poller_cancel = cancel.child_token();
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
 
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &socket).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &socket, &mut program_filter, input_format).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -191,6 +204,7 @@ async fn srt_output_listener_loop(
 }
 
 /// Caller-mode output: reconnects with exponential back-off on disconnect.
+#[allow(clippy::too_many_arguments)]
 async fn srt_output_caller_loop(
     config: &SrtOutputConfig,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
@@ -198,7 +212,15 @@ async fn srt_output_caller_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    input_format: Option<InputFormat>,
 ) -> anyhow::Result<()> {
+    let mut program_filter = config.program_number.map(|n| {
+        tracing::info!(
+            "SRT output '{}' (caller): program filter enabled, target program_number = {}",
+            config.id, n
+        );
+        TsProgramFilter::new(n)
+    });
     loop {
         let socket = match connect_srt_output(config, &cancel).await {
             Ok(s) => s,
@@ -230,7 +252,7 @@ async fn srt_output_caller_loop(
         let poller_cancel = cancel.child_token();
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
 
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &socket).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &socket, &mut program_filter, input_format).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -260,12 +282,18 @@ async fn srt_output_caller_loop(
 /// and a dedicated Tokio send task. Returns `Ok(true)` if the connection was
 /// lost (caller should reconnect), `Ok(false)` if the broadcast channel closed
 /// (flow is shutting down).
+///
+/// `program_filter` is owned by the caller so its PAT/PMT state survives
+/// reconnects.
+#[allow(clippy::too_many_arguments)]
 async fn srt_output_forward_loop(
     config: &SrtOutputConfig,
     rx: &mut broadcast::Receiver<RtpPacket>,
     stats: &Arc<OutputStatsAccumulator>,
     cancel: &CancellationToken,
     socket: &Arc<SrtSocket>,
+    program_filter: &mut Option<TsProgramFilter>,
+    input_format: Option<InputFormat>,
 ) -> anyhow::Result<bool> {
     let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<Bytes>(256);
     let send_socket = socket.clone();
@@ -286,6 +314,60 @@ async fn srt_output_forward_loop(
         }
     });
 
+    // Build the optional SMPTE 302M output pipeline. Active when:
+    //   - `transport_mode == "audio_302m"`
+    //   - upstream input is an audio essence (`input_format` is Some)
+    //
+    // When active, the program filter is bypassed (the brief explicitly
+    // rejects `program_number` for the 302M audio mode) and incoming RTP
+    // audio packets are routed through Transcode → 302M → TsMuxer →
+    // 1316-byte SRT datagrams.
+    let mut audio_302m: Option<S302mOutputPipeline> = None;
+    if matches!(config.transport_mode.as_deref(), Some("audio_302m")) {
+        match input_format {
+            Some(input) => {
+                // Default to L24 / preserve channel count (rounded up to even)
+                // / 4 ms packet time. Hardcoded for chunk 6; chunks 9 will let
+                // the operator override via UI.
+                let out_channels = match input.channels {
+                    1 => 2,
+                    n if n % 2 == 0 && n <= 8 => n,
+                    n if n > 8 => 8,
+                    _ => input.channels + 1,
+                };
+                match S302mOutputPipeline::new(input, out_channels, 24, 4_000) {
+                    Ok(p) => {
+                        tracing::info!(
+                            "SRT output '{}' transport_mode=audio_302m: \
+                             {}Hz/{}bit/{}ch -> 48000/24/{} 302M-in-MPEG-TS",
+                            config.id,
+                            input.sample_rate,
+                            input.bit_depth.as_u8(),
+                            input.channels,
+                            out_channels,
+                        );
+                        audio_302m = Some(p);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "SRT output '{}' could not build 302M pipeline: {e}; \
+                             falling back to passthrough TS",
+                            config.id
+                        );
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    "SRT output '{}' transport_mode=audio_302m but upstream input \
+                     is not audio; falling back to passthrough TS",
+                    config.id
+                );
+            }
+        }
+    }
+
+    let mut filter_scratch: Vec<u8> = Vec::new();
     let connection_lost = loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -297,7 +379,39 @@ async fn srt_output_forward_loop(
             result = rx.recv() => {
                 match result {
                     Ok(packet) => {
-                        match send_tx.try_send(packet.data) {
+                        // 302M path takes precedence over the TS program filter
+                        // (the modes are mutually exclusive — see validator).
+                        if let Some(pipeline) = audio_302m.as_mut() {
+                            pipeline.process(&packet);
+                            for datagram in pipeline.take_ready_datagrams() {
+                                match send_tx.try_send(datagram) {
+                                    Ok(()) => {}
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                        tracing::warn!(
+                                            "SRT output '{}' connection lost (302M), will reconnect",
+                                            config.id
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        // Apply program filter if configured. Skip the packet
+                        // entirely when the filter eats it (no target-program
+                        // bytes in this datagram).
+                        let payload = if let Some(filter) = program_filter.as_mut() {
+                            match filter.filter_packet(&packet, &mut filter_scratch) {
+                                Some(b) => b,
+                                None => continue,
+                            }
+                        } else {
+                            packet.data
+                        };
+                        match send_tx.try_send(payload) {
                             Ok(()) => {}
                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                 stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
@@ -376,6 +490,16 @@ async fn srt_output_redundant_loop(
     } else {
         None
     };
+
+    // Optional MPTS → SPTS program filter (shared across both legs and across reconnects).
+    let mut program_filter = config.program_number.map(|n| {
+        tracing::info!(
+            "SRT output '{}' (2022-7): program filter enabled, target program_number = {}",
+            config.id, n
+        );
+        TsProgramFilter::new(n)
+    });
+    let mut filter_scratch: Vec<u8> = Vec::new();
 
     // Outer reconnection loop — restarts both legs on total connection loss
     loop {
@@ -514,7 +638,17 @@ async fn srt_output_redundant_loop(
                 result = rx.recv() => {
                     match result {
                         Ok(packet) => {
-                            let leg1_ok = match send_tx_leg1.try_send(packet.data.clone()) {
+                            // Apply program filter if configured. Skip both legs
+                            // when the filter eats the entire packet.
+                            let payload = if let Some(ref mut filter) = program_filter {
+                                match filter.filter_packet(&packet, &mut filter_scratch) {
+                                    Some(b) => b,
+                                    None => continue,
+                                }
+                            } else {
+                                packet.data
+                            };
+                            let leg1_ok = match send_tx_leg1.try_send(payload.clone()) {
                                 Ok(()) => true,
                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                     stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
@@ -524,7 +658,7 @@ async fn srt_output_redundant_loop(
                             };
 
                             let leg2_ok = if let Some(ref tx2) = send_tx_leg2_opt {
-                                match tx2.try_send(packet.data) {
+                                match tx2.try_send(payload) {
                                     Ok(()) => true,
                                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                         stats.packets_dropped.fetch_add(1, Ordering::Relaxed);

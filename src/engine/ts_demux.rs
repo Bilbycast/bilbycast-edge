@@ -52,13 +52,18 @@ struct PesAssembler {
 
 /// MPEG-TS demuxer that extracts elementary stream frames.
 pub struct TsDemuxer {
-    /// PMT PIDs discovered from PAT.
-    pmt_pids: HashMap<u16, ()>,
-    /// Video PID (H.264 or H.265) discovered from PMT.
+    /// Optional MPEG-TS program_number selector. If `None`, the demuxer
+    /// locks onto the program with the lowest program_number found in the
+    /// PAT (deterministic default for MPTS inputs). If `Some(N)`, only the
+    /// PMT for program N is honoured; other programs are ignored.
+    target_program: Option<u16>,
+    /// PMT PID we're locked onto (set after the first PAT is parsed).
+    selected_pmt_pid: Option<u16>,
+    /// Video PID (H.264 or H.265) discovered from the selected PMT.
     video_pid: Option<u16>,
     /// Video stream type.
     video_stream_type: u8,
-    /// Audio PID (Opus) discovered from PMT.
+    /// Audio PID discovered from the selected PMT.
     audio_pid: Option<u16>,
     /// Per-PID PES reassembly.
     pes_assemblers: HashMap<u16, PesAssembler>,
@@ -71,9 +76,18 @@ pub struct TsDemuxer {
 }
 
 impl TsDemuxer {
-    pub fn new() -> Self {
+    /// Create a new demuxer.
+    ///
+    /// `target_program` selects the MPEG-TS program to extract elementary
+    /// streams from:
+    /// - `None` — lock onto the lowest program_number in the PAT (deterministic
+    ///   default; behaves identically for single-program TS).
+    /// - `Some(N)` — extract only program N. If N is not present in the PAT,
+    ///   no frames are produced until N appears.
+    pub fn new(target_program: Option<u16>) -> Self {
         Self {
-            pmt_pids: HashMap::new(),
+            target_program,
+            selected_pmt_pid: None,
             video_pid: None,
             video_stream_type: 0,
             audio_pid: None,
@@ -121,18 +135,43 @@ impl TsDemuxer {
     fn process_ts_packet(&mut self, pkt: &[u8]) -> Vec<DemuxedFrame> {
         let pid = ts_pid(pkt);
 
-        // PAT
+        // PAT — pick the program we want to lock onto.
         if pid == PAT_PID && ts_pusi(pkt) {
-            let pids = parse_pat_pmt_pids(pkt);
-            self.pmt_pids.clear();
-            for p in pids {
-                self.pmt_pids.insert(p, ());
+            let mut programs = parse_pat_programs(pkt);
+            if programs.is_empty() {
+                return Vec::new();
+            }
+            // Sort by program_number ascending so the default (lowest) is
+            // deterministic across runs.
+            programs.sort_by_key(|(num, _)| *num);
+            let new_pmt_pid = match self.target_program {
+                Some(target) => programs
+                    .iter()
+                    .find(|(num, _)| *num == target)
+                    .map(|(_, pid)| *pid),
+                None => programs.first().map(|(_, pid)| *pid),
+            };
+            if new_pmt_pid != self.selected_pmt_pid {
+                if let Some(new_pid) = new_pmt_pid {
+                    tracing::info!(
+                        "TS demux: locked onto program{} (PMT PID 0x{:04X})",
+                        self.target_program
+                            .map(|n| format!(" {}", n))
+                            .unwrap_or_default(),
+                        new_pid
+                    );
+                }
+                // Reset ES state when the locked PMT PID changes.
+                self.selected_pmt_pid = new_pmt_pid;
+                self.video_pid = None;
+                self.audio_pid = None;
+                self.pes_assemblers.clear();
             }
             return Vec::new();
         }
 
-        // PMT
-        if self.pmt_pids.contains_key(&pid) && ts_pusi(pkt) {
+        // PMT — only honour the PMT for our locked program.
+        if Some(pid) == self.selected_pmt_pid && ts_pusi(pkt) {
             self.parse_pmt(pkt);
             return Vec::new();
         }
@@ -508,7 +547,7 @@ mod tests {
 
     #[test]
     fn test_annex_b_nalu_extraction() {
-        let mut demux = TsDemuxer::new();
+        let mut demux = TsDemuxer::new(None);
 
         // Annex B stream with two NALUs: SPS and PPS
         let data = [
@@ -530,7 +569,7 @@ mod tests {
 
     #[test]
     fn test_three_byte_start_code() {
-        let mut demux = TsDemuxer::new();
+        let mut demux = TsDemuxer::new(None);
 
         let data = [
             0x00, 0x00, 0x01, // 3-byte start code

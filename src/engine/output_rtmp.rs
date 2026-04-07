@@ -111,7 +111,7 @@ async fn publish_loop(
     stats: &Arc<OutputStatsAccumulator>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
-    let mut demuxer = TsDemuxer::new();
+    let mut demuxer = TsDemuxer::new(config.program_number);
     let mut sent_video_header = false;
     let mut sent_audio_header = false;
     let mut base_pts: Option<u64> = None;

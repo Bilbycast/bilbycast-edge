@@ -86,8 +86,6 @@ impl EventSender {
     }
 
     /// Convenience: send a flow-scoped event with structured details.
-    /// Retained for future use when events need structured detail payloads.
-    #[allow(dead_code)]
     pub fn emit_flow_with_details(
         &self,
         severity: EventSeverity,
@@ -96,14 +94,57 @@ impl EventSender {
         flow_id: &str,
         details: serde_json::Value,
     ) {
+        self.emit_with_details(severity, category, message, Some(flow_id), details);
+    }
+
+    /// Send an event with structured details and an optional flow scope.
+    /// Used by ST 2110 producers (PTP, network leg, SCTE-104) where the
+    /// flow_id may or may not be known at emission time.
+    pub fn emit_with_details(
+        &self,
+        severity: EventSeverity,
+        category: &str,
+        message: impl Into<String>,
+        flow_id: Option<&str>,
+        details: serde_json::Value,
+    ) {
         self.send(Event {
             severity,
             category: category.to_string(),
             message: message.into(),
             details: Some(details),
-            flow_id: Some(flow_id.to_string()),
+            flow_id: flow_id.map(|s| s.to_string()),
         });
     }
+}
+
+/// Event category strings used by the edge.
+///
+/// The manager's `events` table stores `category` as a free-form string, so
+/// adding new categories does not require a database migration. These
+/// constants exist so producers (and the unit tests) cannot diverge on
+/// spelling, and so the new ST 2110 categories are documented in code
+/// alongside the existing ones.
+#[allow(dead_code)]
+pub mod category {
+    pub const SRT: &str = "srt";
+    pub const RTMP: &str = "rtmp";
+    pub const RTSP: &str = "rtsp";
+    pub const HLS: &str = "hls";
+    pub const TUNNEL: &str = "tunnel";
+    pub const FLOW: &str = "flow";
+    pub const BANDWIDTH: &str = "bandwidth";
+    pub const WEBRTC: &str = "webrtc";
+    // ── ST 2110 / NMOS event categories ──
+    /// PTP lock state changes (acquired, lost, holdover, reporter unavailable).
+    pub const PTP: &str = "ptp";
+    /// SMPTE 2022-7 Red/Blue leg state (single-leg, dual-leg, leg switch).
+    pub const NETWORK_LEG: &str = "network_leg";
+    /// NMOS IS-04/IS-05/IS-08/BCP-004 lifecycle (registration, activation,
+    /// channel-map updates).
+    pub const NMOS: &str = "nmos";
+    /// SCTE-104 ad-marker decoding events surfaced from ANC (-40) flows.
+    pub const SCTE104: &str = "scte104";
 }
 
 /// Create an event sender/receiver pair.

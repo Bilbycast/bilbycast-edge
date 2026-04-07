@@ -186,6 +186,7 @@ async fn whep_server_loop(
         let viewer_stats = stats.clone();
         let output_id = config.id.clone();
         let video_only = config.video_only;
+        let viewer_program = config.program_number;
         let viewer_events = events.clone();
         let viewer_flow_id = flow_id.to_string();
 
@@ -198,6 +199,7 @@ async fn whep_server_loop(
                 viewer_stats,
                 viewer_cancel,
                 video_only,
+                viewer_program,
                 &viewer_events,
                 &viewer_flow_id,
             ).await;
@@ -217,6 +219,7 @@ async fn whep_viewer_loop(
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
     video_only: bool,
+    program_number: Option<u16>,
     events: &EventSender,
     flow_id: &str,
 ) {
@@ -264,7 +267,7 @@ async fn whep_viewer_loop(
     let _ = video_only; // TODO: handle audio MID when audio support is added
 
     // Send loop: demux TS → packetize H.264 → send via str0m
-    let mut demuxer = TsDemuxer::new();
+    let mut demuxer = TsDemuxer::new(program_number);
     let mut rtp_seq: u16 = 0;
 
     loop {
@@ -451,7 +454,7 @@ async fn whip_client_loop(
         };
 
         // Send loop: demux TS → packetize H.264 → send via str0m
-        let mut demuxer = TsDemuxer::new();
+        let mut demuxer = TsDemuxer::new(config.program_number);
         let mut rtp_seq: u16 = 0;
 
         loop {

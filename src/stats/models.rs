@@ -44,6 +44,86 @@ pub struct FlowStats {
     /// Configured bandwidth limit in Mbps (for dashboard display). Absent if no limit configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bandwidth_limit_mbps: Option<f64>,
+    /// PTP clock state for this flow. Populated by ST 2110 flows whose
+    /// `clock_domain` is set; absent for non-ST-2110 flows. Backward-compatible
+    /// addition — old manager builds ignore unknown fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ptp_state: Option<PtpStateStats>,
+    /// Per-leg counters for SMPTE 2022-7 Red/Blue dual-network operation.
+    /// Present only when the flow's input has `redundancy` set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_legs: Option<NetworkLegsStats>,
+    /// Per-essence breakdown when this flow is part of a multi-essence
+    /// ST 2110 flow group. Reserved for the flow-group runtime in step 5/6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub essence_flows: Option<Vec<EssenceFlowStats>>,
+}
+
+/// PTP state snapshot reported up to the manager.
+///
+/// Mirrors `engine::st2110::ptp::PtpState` but uses `Option` for fields that
+/// are not yet known so the JSON shape stays stable when ptp4l is unreachable
+/// (the common case at startup).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PtpStateStats {
+    /// `"locked"`, `"holdover"`, `"unlocked"`, or `"unavailable"`.
+    pub lock_state: String,
+    /// PTP domain (0..=127) the reporter is monitoring.
+    pub domain: Option<u8>,
+    /// Grandmaster identity as a hex string ("xx:xx:xx:xx:xx:xx:xx:xx").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grandmaster_id: Option<String>,
+    /// Offset from master in nanoseconds (negative = local clock is behind).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset_ns: Option<i64>,
+    /// Mean path delay in nanoseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mean_path_delay_ns: Option<i64>,
+    /// Steps removed from the grandmaster (0 if directly connected).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steps_removed: Option<u16>,
+    /// Unix epoch milliseconds of the most recent successful update from
+    /// `ptp4l`. `None` when no update has happened yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_update_ms: Option<u64>,
+}
+
+/// Per-leg counters for a SMPTE 2022-7 dual-network input.
+///
+/// Sourced from `engine::st2110::redblue::RedBlueStats::snapshot()`. Both
+/// legs are exposed even when one is currently silent so operators can see
+/// the imbalance.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct NetworkLegsStats {
+    pub red: LegCounters,
+    pub blue: LegCounters,
+    /// Total times the merger flipped the active leg.
+    pub leg_switches: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct LegCounters {
+    pub packets_received: u64,
+    pub bytes_received: u64,
+    pub packets_forwarded: u64,
+    pub packets_duplicate: u64,
+}
+
+/// Per-essence stats for a single member of a flow group.
+///
+/// Used by the manager UI to render multi-essence ST 2110 flow groups.
+/// Today only the flow_id and essence_type are surfaced — packet/byte counts
+/// continue to live on the per-flow snapshot. The struct is reserved here so
+/// that future additions can land without bumping the WS protocol version.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct EssenceFlowStats {
+    pub flow_id: String,
+    /// `"st2110_30"`, `"st2110_31"`, `"st2110_40"`, future `"st2110_22"`,
+    /// `"st2110_20"`.
+    pub essence_type: String,
+    /// Optional human-readable label (channel order, ANC stream description).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// Inter-arrival time statistics (microseconds).
@@ -163,6 +243,13 @@ pub struct OutputStats {
     /// Local address — SRT listener bind address (for topology display).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_addr: Option<String>,
+    /// Configured MPTS program filter for this output (mirrors `program_number`
+    /// in the output config). `null` means passthrough for TS-native outputs
+    /// (UDP/RTP/SRT/HLS) or "auto, lowest program_number in PAT" for re-muxing
+    /// outputs (RTMP/WebRTC). Surfaced so the manager status view can show at
+    /// a glance which MPTS program each output is locked to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
     /// Total RTP packets successfully sent on this output.
     pub packets_sent: u64,
     /// Total bytes sent (RTP payload + header).
@@ -179,6 +266,33 @@ pub struct OutputStats {
     /// SRT-level statistics for the redundancy (second) output leg (if SMPTE 2022-7).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub srt_leg2_stats: Option<SrtLegStats>,
+    /// Per-output PCM transcode stage statistics. Present only when the
+    /// output runs an `engine::audio_transcode::TranscodeStage` (i.e., the
+    /// output config has a `transcode` block AND the upstream input is an
+    /// audio essence). Absent otherwise (passthrough outputs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcode_stats: Option<TranscodeStatsSnapshot>,
+}
+
+/// Per-output transcoder snapshot. Mirrors `engine::audio_transcode::TranscodeStats`
+/// at point-in-time, suitable for the manager UI and Prometheus surfacing.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct TranscodeStatsSnapshot {
+    /// Input RTP packets seen by the transcoder.
+    pub input_packets: u64,
+    /// Output RTP packets emitted (may differ from input due to packet-time
+    /// or sample-rate differences between input and output).
+    pub output_packets: u64,
+    /// Packets dropped inside the transcoder (decode error, resampler
+    /// failure, malformed RTP). Distinct from the broadcast-channel lag
+    /// drops counted in `packets_dropped`.
+    pub dropped: u64,
+    /// Times the transcoder reset its internal state due to an upstream
+    /// format change.
+    pub format_resets: u64,
+    /// Most recent end-to-end transcode latency, in microseconds. Measured
+    /// from the input packet's `recv_time_us` to emission time.
+    pub last_latency_us: u64,
 }
 
 /// TR-101290 transport stream analysis statistics for a single flow.
@@ -419,13 +533,35 @@ pub struct MediaAnalysisStats {
     pub redundancy: Option<RedundancyInfo>,
     /// Number of MPEG-TS programs detected in PAT.
     pub program_count: u16,
-    /// Detected video elementary streams.
+    /// Per-program elementary stream breakdown (one entry per PMT).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub programs: Vec<ProgramInfo>,
+    /// Detected video elementary streams (flat union across all programs,
+    /// kept for backwards compatibility with older manager UIs).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub video_streams: Vec<VideoStreamInfo>,
-    /// Detected audio elementary streams.
+    /// Detected audio elementary streams (flat union across all programs,
+    /// kept for backwards compatibility with older manager UIs).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub audio_streams: Vec<AudioStreamInfo>,
     /// Aggregate TS bitrate in bits per second.
+    pub total_bitrate_bps: u64,
+}
+
+/// Detected MPEG-TS program (one PMT) and its elementary streams.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProgramInfo {
+    /// MPEG-TS program_number from the PAT.
+    pub program_number: u16,
+    /// PID of this program's PMT.
+    pub pmt_pid: u16,
+    /// Video elementary streams belonging to this program.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub video_streams: Vec<VideoStreamInfo>,
+    /// Audio elementary streams belonging to this program.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub audio_streams: Vec<AudioStreamInfo>,
+    /// Sum of bitrates of all elementary streams in this program (bits/sec).
     pub total_bitrate_bps: u64,
 }
 

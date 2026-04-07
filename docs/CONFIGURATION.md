@@ -351,6 +351,7 @@ An array of flow definitions. Each flow has one input and one or more outputs.
 | `enabled`         | `bool`           | `true`  | Auto-start when the application starts   |
 | `media_analysis`  | `bool`           | `true`  | Enable media content analysis (codec, resolution, frame rate detection). Set to `false` to save CPU on resource-constrained devices. |
 | `thumbnail`       | `bool`           | `true`  | Enable thumbnail generation for visual flow preview (requires ffmpeg on the device). |
+| `thumbnail_program_number` | `u16?`   | `null`  | When the input is an MPTS, render the thumbnail from this MPEG-TS program only. `null` lets ffmpeg pick the first program it finds. Must be `> 0` if set. See the **[MPTS → SPTS filtering](#mpts--spts-filtering)** section. |
 | `bandwidth_limit` | `BandwidthLimitConfig?` | `null` | Per-flow bandwidth monitoring for trust boundary enforcement (RP 2129). See below. |
 | `input`           | `InputConfig`    | --      | Single input source                      |
 | `outputs`         | `OutputConfig[]` | --      | One or more output destinations          |
@@ -545,6 +546,8 @@ Outputs are discriminated by the `"type"` field. All output types share `id` and
 | `stream_id`        | `string?`               | `null`  | SRT Stream ID for access control (max 512 chars). Caller: sent during handshake. Listener: if set, only matching callers accepted. |
 | `packet_filter`    | `string?`               | `null`  | SRT FEC config string (see SRT Input for format details). |
 | `redundancy`       | `SrtRedundancyConfig?`  | `null`  | SMPTE 2022-7 second leg configuration           |
+| `program_number`   | `u16?`                  | `null`  | MPTS → SPTS program filter. `null` = passthrough (full MPTS); `Some(N)` = send only program N as a rewritten single-program TS. Must be `> 0`. See the **[MPTS → SPTS filtering](#mpts--spts-filtering)** section. |
+| `transport_mode`   | `string?`               | `null`  | `"ts"` (default) sends raw MPEG-TS as the existing path does. `"audio_302m"` runs the per-output transcode + SMPTE 302M packetizer + TsMuxer pipeline and ships 7×188-byte LPCM-in-MPEG-TS chunks over SRT. Mutually exclusive with `packet_filter`, `program_number`, and `redundancy`. The upstream input must be an audio essence (`st2110_30`, `st2110_31`, or `rtp_audio`). See [`audio-gateway.md`](audio-gateway.md). |
 
 ### RTP Output (`"type": "rtp"`)
 
@@ -561,6 +564,7 @@ Sends RTP-wrapped MPEG-TS packets with RTP headers. Supports SMPTE 2022-1 FEC en
 | `fec_encode`     | `FecConfig?`                  | `null`  | SMPTE 2022-1 FEC encode parameters (sent to both legs) |
 | `dscp`           | `u8`                          | `46`    | DSCP value for QoS marking (0-63, default: 46 = Expedited Forwarding) |
 | `redundancy`     | `RtpOutputRedundancyConfig?`  | `null`  | SMPTE 2022-7 second leg configuration           |
+| `program_number` | `u16?`                        | `null`  | MPTS → SPTS program filter. `null` = passthrough (full MPTS); `Some(N)` = send only program N as a rewritten single-program TS. Applied before FEC and 2022-7 redundancy, so receivers see the filtered SPTS. Must be `> 0`. |
 
 ### UDP Output (`"type": "udp"`)
 
@@ -575,6 +579,8 @@ Sends raw MPEG-TS over UDP without RTP headers. Datagrams are TS-aligned (7×188
 | `bind_addr`      | `string?`  | `null`  | Source bind address (default: `"0.0.0.0:0"`)    |
 | `interface_addr`  | `string?` | `null`  | Network interface IP for multicast send          |
 | `dscp`           | `u8`       | `46`    | DSCP value for QoS marking (0-63, default: 46 = Expedited Forwarding) |
+| `program_number` | `u16?`     | `null`  | MPTS → SPTS program filter. `null` = passthrough (full MPTS); `Some(N)` = send only program N as a rewritten single-program TS. Must be `> 0`. |
+| `transport_mode` | `string?`  | `null`  | `"ts"` (default) sends raw MPEG-TS as the existing path does. `"audio_302m"` runs the per-output transcode + SMPTE 302M packetizer pipeline and emits 7×188-byte LPCM-in-MPEG-TS chunks as plain UDP datagrams (useful for legacy hardware decoders that consume raw MPEG-TS over UDP). Mutually exclusive with `program_number`. See [`audio-gateway.md`](audio-gateway.md). |
 
 ### RTMP Output (`"type": "rtmp"`)
 
@@ -589,6 +595,7 @@ H.264/AAC only. Supports RTMPS (TLS) via `rtmps://` URLs.
 | `stream_key`               | `string`| --      | Stream key for authentication                   |
 | `reconnect_delay_secs`     | `u64`   | `5`     | Delay between reconnection attempts             |
 | `max_reconnect_attempts`   | `u32?`  | `null`  | Maximum reconnect attempts (null = unlimited)   |
+| `program_number`           | `u16?`  | `null`  | MPTS program selector. `null` = lock onto the lowest program_number in the PAT (deterministic default for MPTS inputs); `Some(N)` = extract elementary streams from program N only. RTMP is single-program by spec, so this only changes *which* program is published. Must be `> 0`. |
 
 ### HLS Output (`"type": "hls"`)
 
@@ -603,6 +610,7 @@ Segment-based HTTP ingest. Supports HEVC/HDR content.
 | `segment_duration_secs`| `f64`     | `2.0`   | Target segment duration (range: 0.5-10.0)        |
 | `auth_token`           | `string?` | `null`  | Bearer token for Authorization header            |
 | `max_segments`         | `usize`   | `5`     | Maximum segments in rolling playlist             |
+| `program_number`       | `u16?`    | `null`  | MPTS → SPTS program filter. `null` = each segment carries the full MPTS; `Some(N)` = each segment carries only program N as a rewritten single-program TS. Must be `> 0`. |
 
 ### WebRTC Output (`"type": "webrtc"`)
 
@@ -619,6 +627,163 @@ WebRTC output supporting two modes: WHIP client (push to external endpoint) and 
 | `max_viewers`  | `u32?`    | `10`           | Max concurrent viewers (WHEP server mode only, 1-100) |
 | `public_ip`    | `string?` | `null`         | Public IP for ICE candidates (NAT traversal)     |
 | `video_only`   | `bool`    | `false`        | Send only video (audio omitted)                  |
+| `program_number` | `u16?`  | `null`         | MPTS program selector. `null` = lock onto the lowest program_number in the PAT (deterministic default); `Some(N)` = extract elementary streams from program N only. WebRTC is single-program by spec, so this only changes *which* program is sent. Must be `> 0`. |
+
+### SMPTE ST 2110-30 / -31 Audio Output (`"type": "st2110_30"` / `"st2110_31"`)
+
+RFC 3551 PCM audio over RTP/UDP, multicast or unicast. ST 2110-30 carries
+big-endian L16 or L24 PCM samples; ST 2110-31 carries 24-bit AES3 sub-frames
+(transparent to Dolby E and AES3 user/channel-status bits). Both share the
+same struct shape — only the depacketizer label differs. Best-effort PTP
+slave operation via the external `ptp4l` daemon's management Unix socket.
+
+| Field            | Type                | Default | Description                                     |
+|------------------|---------------------|---------|-------------------------------------------------|
+| `type`           | `"st2110_30"` / `"st2110_31"` | -- | Output type discriminator                       |
+| `id`             | `string`            | --      | Unique output ID within this flow               |
+| `name`           | `string`            | --      | Human-readable name                             |
+| `dest_addr`      | `string`            | --      | Primary (Red) destination address               |
+| `bind_addr`      | `string?`           | `null`  | Source bind address (default `"0.0.0.0:0"`)     |
+| `interface_addr` | `string?`           | `null`  | Multicast NIC IP for the primary leg            |
+| `redundancy`     | `RedBlueBindConfig?`| `null`  | Optional SMPTE 2022-7 second leg (Blue network) |
+| `sample_rate`    | `u32`               | `48000` | `48000` or `96000` Hz (wire format)             |
+| `bit_depth`      | `u8`                | `24`    | `16` or `24` (-30); always `24` for -31         |
+| `channels`       | `u8`                | `2`     | `1`, `2`, `4`, `8`, or `16`                     |
+| `packet_time_us` | `u32`               | `1000`  | `125`, `250`, `333`, `500`, `1000`, `4000` µs   |
+| `payload_type`   | `u8`                | `97`    | RTP dynamic payload type, 96..=127              |
+| `clock_domain`   | `u8?`               | `null`  | PTP clock domain, 0..=127. Inherits from the parent flow when omitted. |
+| `dscp`           | `u8`                | `46`    | DSCP value for QoS marking (0-63, default 46 / EF) |
+| `ssrc`           | `u32?`              | `null`  | Optional fixed RTP SSRC; random when omitted    |
+| `transcode`      | `TranscodeJson?`    | `null`  | Optional per-output PCM transcode block (sample rate, bit depth, channel routing). When omitted, byte-identical passthrough runs. See [`audio-gateway.md`](audio-gateway.md) for the full feature set, channel-routing presets, IS-08 hot reload, and stats. |
+
+#### `transcode` block fields
+
+| Field | Allowed values | Default | Description |
+|---|---|---|---|
+| `sample_rate` | 32000, 44100, 48000, 88200, 96000 | input rate | Output sample rate; `rubato` SRC if different from input |
+| `bit_depth` | 16, 20, 24 | input depth | TPDF dither on down-conversion by default |
+| `channels` | 1..=16 | input count | Must agree with `channel_map` length when set |
+| `channel_map` | `[[in_ch, ...], ...]` per output channel | identity / auto-promote | Manual unity-gain matrix; mutually exclusive with `channel_map_preset` |
+| `channel_map_preset` | named preset (see [`audio-gateway.md`](audio-gateway.md#channel-routing-presets)) | none | `mono_to_stereo`, `stereo_to_mono_3db`, `stereo_to_mono_6db`, `5_1_to_stereo_bs775`, `7_1_to_stereo_bs775`, `4ch_to_stereo_lt_rt` |
+| `packet_time_us` | 125, 250, 333, 500, 1000, 4000 | 1000 | Output RTP packet time |
+| `payload_type` | 96..=127 | 97 | Output RTP dynamic payload type |
+| `src_quality` | `"high"`, `"fast"` | `"high"` | High = `rubato::SincFixedIn` (broadcast quality). Fast = `rubato::FastFixedIn` (lower latency, talkback). |
+| `dither` | `"tpdf"`, `"none"` | `"tpdf"` | TPDF dither on bit-depth down-conversion |
+
+### SMPTE ST 2110-40 ANC Output (`"type": "st2110_40"`)
+
+RFC 8331 ancillary data: SCTE-104 ad markers, SMPTE 12M timecode,
+CEA-608/708 captions, AFD, CDP. Same shape as the audio output minus
+the audio essence fields and minus `transcode`.
+
+| Field            | Type                | Default | Description                                     |
+|------------------|---------------------|---------|-------------------------------------------------|
+| `type`           | `"st2110_40"`       | --      | Output type discriminator                       |
+| `id`             | `string`            | --      | Unique output ID within this flow               |
+| `name`           | `string`            | --      | Human-readable name                             |
+| `dest_addr`      | `string`            | --      | Primary destination address                     |
+| `bind_addr`      | `string?`           | `null`  | Source bind address                             |
+| `interface_addr` | `string?`           | `null`  | Multicast NIC IP                                |
+| `redundancy`     | `RedBlueBindConfig?`| `null`  | Optional SMPTE 2022-7 second leg                |
+| `payload_type`   | `u8`                | `100`   | RTP dynamic payload type, 96..=127              |
+| `clock_domain`   | `u8?`               | `null`  | PTP clock domain, 0..=127                       |
+| `dscp`           | `u8`                | `46`    | DSCP value for QoS marking                      |
+| `ssrc`           | `u32?`              | `null`  | Optional fixed RTP SSRC                         |
+
+### Generic `rtp_audio` Output (`"type": "rtp_audio"`)
+
+Wire-identical to ST 2110-30 (RFC 3551 RTP + big-endian L16/L24 PCM)
+but with relaxed validation: sample rates 32 / 44.1 / 48 / 88.2 / 96
+kHz, no PTP requirement, no NMOS `clock_domain` advertising. Use this
+for radio contribution feeds over the public internet, talkback between
+studios that don't share a PTP fabric, and ffmpeg / OBS / GStreamer
+interop where ST 2110-30's PTP assumption is overkill.
+
+| Field            | Type                | Default | Description                                     |
+|------------------|---------------------|---------|-------------------------------------------------|
+| `type`           | `"rtp_audio"`       | --      | Output type discriminator                       |
+| `id`             | `string`            | --      | Unique output ID within this flow               |
+| `name`           | `string`            | --      | Human-readable name                             |
+| `dest_addr`      | `string`            | --      | Primary destination address                     |
+| `bind_addr`      | `string?`           | `null`  | Source bind address                             |
+| `interface_addr` | `string?`           | `null`  | Multicast NIC IP                                |
+| `redundancy`     | `RedBlueBindConfig?`| `null`  | Optional SMPTE 2022-7 second leg                |
+| `sample_rate`    | `u32`               | --      | `32000`, `44100`, `48000`, `88200`, `96000` Hz  |
+| `bit_depth`      | `u8`                | --      | `16` or `24`                                    |
+| `channels`       | `u8`                | --      | `1`..=`16`                                      |
+| `packet_time_us` | `u32`               | `1000`  | `125`, `250`, `333`, `500`, `1000`, `4000`, `20000` µs |
+| `payload_type`   | `u8`                | `97`    | RTP dynamic payload type, 96..=127              |
+| `dscp`           | `u8`                | `46`    | DSCP value for QoS marking                      |
+| `ssrc`           | `u32?`              | `null`  | Optional fixed RTP SSRC                         |
+| `transcode`      | `TranscodeJson?`    | `null`  | Same `transcode` block as ST 2110-30 outputs    |
+| `transport_mode` | `string?`           | `null`  | `"rtp"` (default) sends RFC 3551 PCM/RTP. `"audio_302m"` wraps the PCM as SMPTE 302M LPCM in MPEG-TS and ships it inside RFC 2250 RTP/MP2T (payload type 33), useful for hardware decoders that expect MPEG-TS over RTP. |
+
+`rtp_audio` also exists as an **input type** with the same field set
+minus `dest_addr`/`dscp`/`ssrc`/`transport_mode`/`transcode`. The input
+variant additionally accepts `allowed_sources` (RP 2129 C5 source IP
+allow-list).
+
+> **Audio gateway deep dive.** For worked configuration examples
+> covering radio contribution, monitoring downmix, talkback, and
+> third-party SRT decoder interop — including the four runnable
+> ffmpeg / srt-live-transmit interop test scripts — see the dedicated
+> [Audio Gateway Guide](audio-gateway.md).
+
+---
+
+## MPTS → SPTS filtering
+
+All outputs — and the thumbnail generator — accept an optional `program_number` selector for down-selecting an MPTS (Multi-Program Transport Stream) input to a single program. There are two behaviours depending on whether the output natively carries a full MPTS:
+
+**TS-native outputs** (`udp`, `rtp`, `srt`, `hls`):
+
+- `program_number = null` (default) → **pass the full MPTS through unchanged**. This is the current behaviour for every existing config.
+- `program_number = N` → the edge rewrites the PAT to a single-program form and drops every TS packet that doesn't belong to program N's PMT, ES, or PCR PIDs. The receiver sees a valid SPTS. FEC (2022-1) and hitless redundancy (2022-7) operate on the filtered bytes, so the protection applies to the SPTS the receiver will decode.
+
+**Re-muxing outputs** (`rtmp`, `webrtc`):
+
+These outputs extract elementary streams from the TS, so they can only carry one program by spec.
+
+- `program_number = null` (default) → **lock onto the lowest `program_number` in the PAT**. This is deterministic across restarts and across sibling outputs of the same flow. For single-program inputs it has no visible effect.
+- `program_number = N` → extract elementary streams from program N's PMT only.
+
+**Thumbnail generator** (`thumbnail_program_number` on `FlowConfig`):
+
+- `null` (default) → ffmpeg picks the first program it finds in the buffered TS.
+- `Some(N)` → the buffered TS is pre-filtered so ffmpeg sees only program N. Useful when you want the manager UI preview to show a specific program.
+
+**Validation:** `program_number = 0` is rejected at config load and on manager commands — program_number 0 is reserved for the NIT in the MPEG-TS specification and never identifies a real program.
+
+**Disappearing programs:** If the selected program is not present in the PAT (either because it never existed or because a PAT version bump dropped it), the output emits nothing (TS-native) or produces no frames (re-muxing) until the program reappears. The filter automatically recovers on the next PAT that re-advertises the target.
+
+**Per-output scope:** `program_number` is set on each output independently. You can run a single MPTS flow with one UDP output forwarding the full MPTS to an archive, a second UDP output filtering to program 1 for a viewer, and an RTMP output publishing program 2 — all three sharing the same broadcast channel inside the edge.
+
+**Example — 2-program MPTS fanning out to three different destinations:**
+
+```json
+{
+  "id": "mpts-flow",
+  "name": "Dual-program feed",
+  "input": { "type": "udp", "bind_addr": "0.0.0.0:5020" },
+  "outputs": [
+    {
+      "type": "udp", "id": "archive", "name": "Archive full MPTS",
+      "dest_addr": "10.0.0.5:6000"
+    },
+    {
+      "type": "udp", "id": "prog1-viewer", "name": "Program 1 → ffplay",
+      "dest_addr": "127.0.0.1:6001",
+      "program_number": 1
+    },
+    {
+      "type": "rtmp", "id": "prog2-rtmp", "name": "Program 2 → CDN",
+      "dest_url": "rtmp://live.example.com/app",
+      "stream_key": "my-key",
+      "program_number": 2
+    }
+  ]
+}
+```
 
 ---
 

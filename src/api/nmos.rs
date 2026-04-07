@@ -113,6 +113,10 @@ fn input_transport(input: &InputConfig) -> &'static str {
         InputConfig::Rtmp(_) => "urn:x-nmos:transport:rtp",
         InputConfig::Rtsp(_) => "urn:x-nmos:transport:rtp",
         InputConfig::Webrtc(_) | InputConfig::Whep(_) => "urn:x-nmos:transport:websocket",
+        InputConfig::St2110_30(_) | InputConfig::St2110_31(_) | InputConfig::St2110_40(_) => {
+            "urn:x-nmos:transport:rtp"
+        }
+        InputConfig::RtpAudio(_) => "urn:x-nmos:transport:rtp",
     }
 }
 
@@ -124,6 +128,105 @@ fn output_transport(output: &OutputConfig) -> &'static str {
         OutputConfig::Rtmp(_) => "urn:x-nmos:transport:rtp",
         OutputConfig::Hls(_) => "urn:x-nmos:transport:rtp",
         OutputConfig::Webrtc(_) => "urn:x-nmos:transport:websocket",
+        OutputConfig::St2110_30(_) | OutputConfig::St2110_31(_) | OutputConfig::St2110_40(_) => {
+            "urn:x-nmos:transport:rtp"
+        }
+        OutputConfig::RtpAudio(_) => "urn:x-nmos:transport:rtp",
+    }
+}
+
+/// NMOS format URN for an input. ST 2110-30/-31 → `urn:x-nmos:format:audio`,
+/// ST 2110-40 → `urn:x-nmos:format:data`, everything else → `mux` (unchanged
+/// from the historical single-format behaviour). Used by `list_sources`,
+/// `list_flows`, `list_receivers`, and the IS-04 single-resource handlers
+/// so each ST 2110 essence flow exposes the correct NMOS format.
+fn input_format(input: &InputConfig) -> &'static str {
+    match input {
+        InputConfig::St2110_30(_) | InputConfig::St2110_31(_) => "urn:x-nmos:format:audio",
+        InputConfig::St2110_40(_) => "urn:x-nmos:format:data",
+        _ => "urn:x-nmos:format:mux",
+    }
+}
+
+/// NMOS format URN for an output. Mirrors [`input_format`] for ST 2110.
+/// Currently unused at the IS-04 sender level (NMOS senders inherit format
+/// from the linked flow), but exposed for the SDP-viewer modal that picks
+/// the per-output essence.
+#[allow(dead_code)]
+fn output_format(output: &OutputConfig) -> &'static str {
+    match output {
+        OutputConfig::St2110_30(_) | OutputConfig::St2110_31(_) => "urn:x-nmos:format:audio",
+        OutputConfig::St2110_40(_) => "urn:x-nmos:format:data",
+        _ => "urn:x-nmos:format:mux",
+    }
+}
+
+/// BCP-004 receiver capabilities for ST 2110-30/-31 audio inputs.
+///
+/// Returns a `caps` JSON object with a `media_types` list and a
+/// `constraint_sets` list keyed by `urn:x-nmos:cap:format:*` URNs. Older NMOS
+/// controllers that only understand `media_types` ignore the constraint set;
+/// BCP-004-aware controllers (e.g. Sony NMOS Commissioning Tool) use it to
+/// reject incompatible senders before activation.
+fn audio_receiver_caps(c: &crate::config::models::St2110AudioInputConfig) -> serde_json::Value {
+    serde_json::json!({
+        "media_types": ["audio/L16", "audio/L24"],
+        "constraint_sets": [{
+            "urn:x-nmos:cap:format:media_type": {
+                "enum": ["audio/L16", "audio/L24"]
+            },
+            "urn:x-nmos:cap:format:sample_rate": {
+                "enum": [{"numerator": c.sample_rate}]
+            },
+            "urn:x-nmos:cap:format:channel_count": {
+                "enum": [c.channels as u64]
+            },
+            "urn:x-nmos:cap:format:sample_depth": {
+                "enum": [c.bit_depth as u64]
+            }
+        }]
+    })
+}
+
+/// BCP-004 receiver capabilities for ST 2110-40 ancillary data inputs.
+fn anc_receiver_caps() -> serde_json::Value {
+    serde_json::json!({
+        "media_types": ["video/smpte291"],
+        "constraint_sets": [{
+            "urn:x-nmos:cap:format:media_type": {
+                "enum": ["video/smpte291"]
+            }
+        }]
+    })
+}
+
+/// Receiver caps for an arbitrary input. ST 2110 inputs return BCP-004
+/// constraint sets; non-ST-2110 inputs continue to advertise the historical
+/// `video/MP2T` shape so existing NMOS controllers don't break.
+fn receiver_caps(input: &InputConfig) -> serde_json::Value {
+    match input {
+        InputConfig::St2110_30(c) | InputConfig::St2110_31(c) => audio_receiver_caps(c),
+        InputConfig::St2110_40(_) => anc_receiver_caps(),
+        _ => serde_json::json!({"media_types": ["video/MP2T"]}),
+    }
+}
+
+/// Source-side `caps` for ST 2110 audio. Empty for non-ST-2110.
+fn source_caps(input: &InputConfig) -> serde_json::Value {
+    match input {
+        InputConfig::St2110_30(c) | InputConfig::St2110_31(c) => serde_json::json!({
+            "media_types": ["audio/L16", "audio/L24"],
+            "constraint_sets": [{
+                "urn:x-nmos:cap:format:sample_rate": {
+                    "enum": [{"numerator": c.sample_rate}]
+                },
+                "urn:x-nmos:cap:format:channel_count": {
+                    "enum": [c.channels as u64]
+                }
+            }]
+        }),
+        InputConfig::St2110_40(_) => serde_json::json!({"media_types": ["video/smpte291"]}),
+        _ => serde_json::json!({}),
     }
 }
 
@@ -136,6 +239,10 @@ fn input_type_str(input: &InputConfig) -> &'static str {
         InputConfig::Rtsp(_) => "rtsp",
         InputConfig::Webrtc(_) => "webrtc",
         InputConfig::Whep(_) => "whep",
+        InputConfig::St2110_30(_) => "st2110_30",
+        InputConfig::St2110_31(_) => "st2110_31",
+        InputConfig::St2110_40(_) => "st2110_40",
+        InputConfig::RtpAudio(_) => "rtp_audio",
     }
 }
 
@@ -147,6 +254,10 @@ fn output_id(output: &OutputConfig) -> &str {
         OutputConfig::Rtmp(c) => &c.id,
         OutputConfig::Hls(c) => &c.id,
         OutputConfig::Webrtc(c) => &c.id,
+        OutputConfig::St2110_30(c) => &c.id,
+        OutputConfig::St2110_31(c) => &c.id,
+        OutputConfig::St2110_40(c) => &c.id,
+        OutputConfig::RtpAudio(c) => &c.id,
     }
 }
 
@@ -158,6 +269,10 @@ fn output_name(output: &OutputConfig) -> &str {
         OutputConfig::Rtmp(c) => &c.name,
         OutputConfig::Hls(c) => &c.name,
         OutputConfig::Webrtc(c) => &c.name,
+        OutputConfig::St2110_30(c) => &c.name,
+        OutputConfig::St2110_31(c) => &c.name,
+        OutputConfig::St2110_40(c) => &c.name,
+        OutputConfig::RtpAudio(c) => &c.name,
     }
 }
 
@@ -276,6 +391,27 @@ async fn node_self(State(state): State<AppState>) -> Json<NmosNode> {
         config.server.listen_addr, config.server.listen_port
     );
 
+    // Advertise PTP clock(s) when any flow declares a `clock_domain`. The
+    // manager UI gates the ST 2110 PTP card on the presence of this list,
+    // and external NMOS controllers use it to validate IS-04 sources whose
+    // `clock_name` references one of the entries below.
+    let mut clocks: Vec<serde_json::Value> = Vec::new();
+    let mut seen_domains: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    for flow in &config.flows {
+        if let Some(d) = flow.clock_domain {
+            if seen_domains.insert(d) {
+                clocks.push(serde_json::json!({
+                    "name": "clk0",
+                    "ref_type": "ptp",
+                    "traceable": true,
+                    "version": "IEEE1588-2008",
+                    "gmid": "00-00-00-00-00-00-00-00",
+                    "locked": false
+                }));
+            }
+        }
+    }
+
     Json(NmosNode {
         id: nid.to_string(),
         version,
@@ -294,7 +430,7 @@ async fn node_self(State(state): State<AppState>) -> Json<NmosNode> {
             }]
         }),
         services: vec![],
-        clocks: vec![],
+        clocks,
         interfaces: vec![],
     })
 }
@@ -359,11 +495,14 @@ async fn list_sources(State(state): State<AppState>) -> Json<Vec<NmosSource>> {
             label: f.name.clone(),
             description: format!("{} input ({})", f.name, input_type_str(&f.input)),
             tags: serde_json::json!({}),
-            format: "urn:x-nmos:format:mux".into(),
-            caps: serde_json::json!({}),
+            format: input_format(&f.input).into(),
+            caps: source_caps(&f.input),
             device_id: did.to_string(),
             parents: vec![],
-            clock_name: serde_json::Value::Null,
+            clock_name: f
+                .clock_domain
+                .map(|_| serde_json::Value::String("clk0".into()))
+                .unwrap_or(serde_json::Value::Null),
         })
         .collect();
     Json(sources)
@@ -385,11 +524,14 @@ async fn get_source(
                 label: f.name.clone(),
                 description: format!("{} input ({})", f.name, input_type_str(&f.input)),
                 tags: serde_json::json!({}),
-                format: "urn:x-nmos:format:mux".into(),
-                caps: serde_json::json!({}),
+                format: input_format(&f.input).into(),
+                caps: source_caps(&f.input),
                 device_id: did.to_string(),
                 parents: vec![],
-                clock_name: serde_json::Value::Null,
+                clock_name: f
+                    .clock_domain
+                    .map(|_| serde_json::Value::String("clk0".into()))
+                    .unwrap_or(serde_json::Value::Null),
             }));
         }
     }
@@ -409,7 +551,7 @@ async fn list_flows(State(state): State<AppState>) -> Json<Vec<NmosFlow>> {
             label: f.name.clone(),
             description: format!("Flow: {}", f.name),
             tags: serde_json::json!({}),
-            format: "urn:x-nmos:format:mux".into(),
+            format: input_format(&f.input).into(),
             source_id: source_uuid(&nid, &f.id).to_string(),
             device_id: did.to_string(),
             parents: vec![],
@@ -434,7 +576,7 @@ async fn get_flow(
                 label: f.name.clone(),
                 description: format!("Flow: {}", f.name),
                 tags: serde_json::json!({}),
-                format: "urn:x-nmos:format:mux".into(),
+                format: input_format(&f.input).into(),
                 source_id: source_uuid(&nid, &f.id).to_string(),
                 device_id: did.to_string(),
                 parents: vec![],
@@ -518,8 +660,8 @@ async fn list_receivers(State(state): State<AppState>) -> Json<Vec<NmosReceiver>
             label: f.name.clone(),
             description: format!("{} receiver ({})", f.name, input_type_str(&f.input)),
             tags: serde_json::json!({}),
-            format: "urn:x-nmos:format:mux".into(),
-            caps: serde_json::json!({"media_types": ["video/MP2T"]}),
+            format: input_format(&f.input).into(),
+            caps: receiver_caps(&f.input),
             device_id: did.to_string(),
             transport: input_transport(&f.input).into(),
             interface_bindings: vec![],
@@ -549,8 +691,8 @@ async fn get_receiver(
                     input_type_str(&f.input)
                 ),
                 tags: serde_json::json!({}),
-                format: "urn:x-nmos:format:mux".into(),
-                caps: serde_json::json!({"media_types": ["video/MP2T"]}),
+                format: input_format(&f.input).into(),
+                caps: receiver_caps(&f.input),
                 device_id: did.to_string(),
                 transport: input_transport(&f.input).into(),
                 interface_bindings: vec![],

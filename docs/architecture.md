@@ -241,6 +241,65 @@
                     (engine, tunnel)
 ```
 
+## Audio gateway pipeline (`engine::audio_transcode`, `engine::audio_302m`)
+
+Two engine modules implement Bilbycast's audio gateway feature set,
+inserted between the broadcast channel and the per-output send loop:
+
+```
+broadcast::channel<RtpPacket> (per flow)
+        │
+        │  per-output subscribe
+        ▼
+┌─────────────────────────────────────────────────────────┐
+│ engine::audio_transcode::TranscodeStage (per output)    │
+│   PcmDepacketizer → decode_pcm_be (BE PCM → planar f32) │
+│     → apply_channel_matrix (IS-08 watch::Receiver       │
+│       sampled per packet, single atomic load)           │
+│     → rubato SRC (SincFixedIn or FastFixedIn)           │
+│     → encode_pcm_be (planar f32 → BE PCM with TPDF)     │
+│     → PcmPacketizer (RTP framing at target packet time) │
+│   stats: TranscodeStats { input_packets, output_packets │
+│          dropped, format_resets, last_latency_us }      │
+└────────┬────────────────────────────────────────────────┘
+         │
+         ▼
+  ┌─────────────────────────┐
+  │ output backend          │
+  │  • st2110_30 / -31 RTP  │  → byte-identical RTP send (Red + Blue)
+  │  • rtp_audio RTP        │
+  │  • engine::audio_302m   │  → S302mPacketizer (302M bit packing)
+  │       S302mOutputPipe   │     → TsMuxer (BSSD reg descriptor in PMT)
+  │                         │       → 7×188 byte chunk bundling
+  │                         │         → SRT / UDP / RTP-MP2T (PT 33)
+  └─────────────────────────┘
+```
+
+Key invariants:
+
+- **Lock-free hot path.** No `Mutex` is taken on per-packet processing
+  inside `TranscodeStage` or `S302mOutputPipeline`. All counters are
+  `AtomicU64`. The IS-08 `watch::Receiver::has_changed()` check is a
+  single atomic load; the per-output channel matrix is cached and only
+  recomputed when an IS-08 activation arrives (typically operator
+  action, never per packet).
+- **No back-pressure on the input task.** When the transcoder can't
+  keep up, it drops packets via `TranscodeStats::dropped` rather than
+  signaling backpressure to upstream. Same rule as every other output
+  in the codebase.
+- **Passthrough is free.** When a flow's outputs don't set a `transcode`
+  block, no `TranscodeStage` is constructed and the existing
+  byte-identical passthrough path runs unchanged. The stage is purely
+  opt-in per output.
+- **SMPTE 302M bit packing matches ffmpeg.** `S302mPacketizer` and
+  `S302mDepacketizer` follow ffmpeg's `libavcodec/s302menc.c` /
+  `s302mdec.c` byte-for-byte; round trips are sample-exact at 16-bit
+  and within ±1 LSB at 24-bit (verified by 11 unit tests in
+  `engine::audio_302m::tests`).
+
+For the operator-facing description, configuration syntax, presets,
+and worked use cases, see the [Audio Gateway Guide](audio-gateway.md).
+
 ## Adding New Input/Output Types
 
 Current pattern requires changes in these locations:
@@ -264,6 +323,40 @@ pub fn spawn_xxx_output(
     cancel: CancellationToken,
 ) -> JoinHandle<()>
 ```
+
+## MPTS → SPTS program filtering
+
+When an input carries an MPTS (Multi-Program Transport Stream) and an output wants only a single program, a per-output **program filter** runs between the broadcast receiver and the output's send path. Two implementations share the heavy lifting:
+
+```
+  MPTS input ──▶ broadcast channel ──▶ subscribe()
+                                            │
+                                            ▼
+                                  ┌──────────────────┐
+                                  │ program_filter   │    (only when program_number is set)
+                                  │ ───────────────  │
+                                  │ TS-native output │    TsProgramFilter: rewrites PAT,
+                                  │ (UDP/RTP/SRT/HLS)│    drops non-target PMT/ES/PCR PIDs,
+                                  │                  │    preserves RTP header on wrapped
+                                  │                  │    packets. Output becomes SPTS.
+                                  │                  │
+                                  │ Re-muxing output │    TsDemuxer(target_program):
+                                  │ (RTMP/WebRTC)    │    picks video/audio PIDs from the
+                                  │                  │    selected program's PMT only.
+                                  │                  │    Default = lowest program_number.
+                                  └──────────────────┘
+                                            │
+                                            ▼
+                                  protocol-specific send
+```
+
+- **TS-native path** (`engine/ts_program_filter.rs`): `TsProgramFilter` consumes raw 188-byte TS packets and emits only those belonging to the selected program. It reads the PAT to find the target's PMT PID, parses that PMT to derive the allowed-PID set (PMT + each ES PID + PCR PID), generates a fresh single-program PAT (using the existing `mpeg2_crc32` for the CRC32 trailer), and drops everything else. State persists across calls so PAT version bumps and programs coming/going mid-stream are handled.
+- **Re-muxing path** (`engine/ts_demux.rs`): `TsDemuxer::new(target_program: Option<u16>)` honours the same selector. When `None`, it reads the PAT, sorts programs by `program_number`, and locks onto the lowest — a deterministic default that replaces the previous "first PMT seen" race. When `Some(N)`, non-target PMTs are ignored entirely.
+- **Thumbnail generator** (`engine/thumbnail.rs`): accepts an optional `thumbnail_program_number` on `FlowConfig`. When set, the buffered TS goes through `TsProgramFilter` before being piped to ffmpeg so the manager UI preview matches the chosen program.
+
+FEC (2022-1) and hitless redundancy (2022-7) run **after** the filter, so the receiver's recovery layer protects the filtered SPTS bytes — not the original MPTS.
+
+`program_number` is per-output, so one flow can fan an MPTS out to multiple outputs, each locked onto a different program, alongside a sibling output that still passes the full MPTS unchanged.
 
 ## Backpressure & QoS
 

@@ -19,6 +19,7 @@ use uuid::Uuid;
 use super::nmos;
 use super::server::AppState;
 use crate::config::models::{InputConfig, OutputConfig};
+use crate::manager::events::{EventSeverity, category};
 
 /// In-memory staged transport parameters for IS-05.
 pub struct Is05State {
@@ -174,12 +175,13 @@ async fn patch_sender_staged(
 ) -> Result<Json<TransportParams>, StatusCode> {
     let uuid = Uuid::parse_str(&id).map_err(|_| StatusCode::NOT_FOUND)?;
 
-    // Verify this sender exists
-    {
+    // Verify this sender exists; capture flow_id for event scoping.
+    let sender_flow_id = {
         let config = state.config.read().await;
         let nid = nmos::node_uuid_from_config(&config);
-        let _ = find_sender(&config, &nid, &uuid)?;
-    }
+        let (fid, _) = find_sender(&config, &nid, &uuid)?;
+        fid
+    };
 
     // Check for immediate activation
     let should_activate = patch
@@ -203,6 +205,19 @@ async fn patch_sender_staged(
         // TODO: Apply transport parameter changes to the running flow
         // This would involve reverse-looking up the flow_id/output_id and calling
         // flow_manager.remove_output() + flow_manager.add_output() with new params
+        if let Some(ref tx) = state.event_sender {
+            tx.emit_flow_with_details(
+                EventSeverity::Info,
+                category::NMOS,
+                format!("IS-05 sender {uuid} activated"),
+                &sender_flow_id,
+                serde_json::json!({
+                    "subsystem": "is-05",
+                    "action": "sender_activated",
+                    "sender_id": uuid.to_string(),
+                }),
+            );
+        }
         return Ok(Json(result));
     }
 
@@ -300,12 +315,13 @@ async fn patch_receiver_staged(
 ) -> Result<Json<TransportParams>, StatusCode> {
     let uuid = Uuid::parse_str(&id).map_err(|_| StatusCode::NOT_FOUND)?;
 
-    // Verify this receiver exists
-    {
+    // Verify this receiver exists; capture flow_id for event scoping.
+    let receiver_flow_id = {
         let config = state.config.read().await;
         let nid = nmos::node_uuid_from_config(&config);
-        let _ = find_receiver(&config, &nid, &uuid)?;
-    }
+        let f = find_receiver(&config, &nid, &uuid)?;
+        f.id.clone()
+    };
 
     let should_activate = patch
         .activation
@@ -327,6 +343,19 @@ async fn patch_receiver_staged(
         // TODO: Apply transport parameter changes to the running flow
         // This would involve reverse-looking up the flow_id and calling
         // flow_manager.destroy_flow() + flow_manager.create_flow() with updated InputConfig
+        if let Some(ref tx) = state.event_sender {
+            tx.emit_flow_with_details(
+                EventSeverity::Info,
+                category::NMOS,
+                format!("IS-05 receiver {uuid} activated"),
+                &receiver_flow_id,
+                serde_json::json!({
+                    "subsystem": "is-05",
+                    "action": "receiver_activated",
+                    "receiver_id": uuid.to_string(),
+                }),
+            );
+        }
         return Ok(Json(result));
     }
 
@@ -487,6 +516,22 @@ fn active_receiver_params(
             ..Default::default()
         },
         InputConfig::Webrtc(_) | InputConfig::Whep(_) => TransportParamSet {
+            ..Default::default()
+        },
+        // SMPTE ST 2110 — Phase 1 reports primary leg bind only.
+        InputConfig::St2110_30(c) | InputConfig::St2110_31(c) => TransportParamSet {
+            interface_ip: c.interface_addr.clone(),
+            source_port: c.bind_addr.split(':').nth(1).and_then(|p| p.parse().ok()),
+            ..Default::default()
+        },
+        InputConfig::St2110_40(c) => TransportParamSet {
+            interface_ip: c.interface_addr.clone(),
+            source_port: c.bind_addr.split(':').nth(1).and_then(|p| p.parse().ok()),
+            ..Default::default()
+        },
+        InputConfig::RtpAudio(c) => TransportParamSet {
+            interface_ip: c.interface_addr.clone(),
+            source_port: c.bind_addr.split(':').nth(1).and_then(|p| p.parse().ok()),
             ..Default::default()
         },
     };

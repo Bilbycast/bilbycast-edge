@@ -14,11 +14,13 @@ use tower_http::trace::TraceLayer;
 
 use crate::config::models::AppConfig;
 use crate::engine::manager::FlowManager;
+use crate::manager::events::EventSender;
 use crate::tunnel::manager::TunnelManager;
 
 use super::auth::{self, AuthState};
 use super::nmos_is05::Is05State;
-use super::{flows, nmos, nmos_is05, stats, tunnels, ws};
+use super::nmos_is08::Is08State;
+use super::{flows, nmos, nmos_is05, nmos_is08, stats, tunnels, ws};
 
 /// Shared application state accessible from all Axum handlers via [`axum::extract::State`].
 #[derive(Clone)]
@@ -41,9 +43,17 @@ pub struct AppState {
     pub auth_state: Option<Arc<AuthState>>,
     /// NMOS IS-05 staged transport parameters.
     pub is05_state: Arc<Is05State>,
+    /// NMOS IS-08 audio channel mapping state. Active map is persisted next
+    /// to `config.json`; staged map is in-memory only.
+    pub is08_state: Arc<Is08State>,
     /// WebRTC session registry for WHIP/WHEP endpoints (None when webrtc feature disabled).
     #[cfg(feature = "webrtc")]
     pub webrtc_sessions: Option<Arc<crate::api::webrtc::registry::WebrtcSessionRegistry>>,
+    /// Manager event sender. Used by NMOS IS-05/IS-08 handlers to surface
+    /// `nmos` lifecycle events (sender/receiver activations, channel-map
+    /// stage/activate). `None` is tolerated so unit tests that build a
+    /// minimal AppState don't need to plumb the channel.
+    pub event_sender: Option<EventSender>,
 }
 
 /// Constructs the main Axum [`Router`] with all API routes, auth middleware, and layers.
@@ -139,10 +149,11 @@ pub fn build_router(state: AppState) -> Router {
             auth::auth_middleware,
         ));
 
-    // NMOS IS-04 and IS-05 routes (public, no auth — for NMOS controller compatibility)
+    // NMOS IS-04, IS-05, and IS-08 routes (public, no auth — for NMOS controller compatibility)
     let nmos_routes = Router::new()
         .nest("/x-nmos/node/v1.3", nmos::nmos_node_router())
-        .nest("/x-nmos/connection/v1.1", nmos_is05::nmos_connection_router());
+        .nest("/x-nmos/connection/v1.1", nmos_is05::nmos_connection_router())
+        .nest("/x-nmos/channelmapping/v1.0", nmos_is08::nmos_is08_router());
 
     // Merge everything
     Router::new()

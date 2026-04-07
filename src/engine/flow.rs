@@ -168,6 +168,10 @@ impl FlowRuntime {
             InputConfig::Rtsp(_) => "rtsp",
             InputConfig::Webrtc(_) => "webrtc",
             InputConfig::Whep(_) => "whep",
+            InputConfig::St2110_30(_) => "st2110_30",
+            InputConfig::St2110_31(_) => "st2110_31",
+            InputConfig::St2110_40(_) => "st2110_40",
+            InputConfig::RtpAudio(_) => "rtp_audio",
         };
 
         // Register flow stats
@@ -218,6 +222,21 @@ impl FlowRuntime {
                 remote_addr: None,
                 listen_addr: None, bind_addr: None,
                 rtsp_url: None, whep_url: Some(c.whep_url.clone()),
+            },
+            InputConfig::St2110_30(c) | InputConfig::St2110_31(c) => InputConfigMeta {
+                mode: None, local_addr: None, remote_addr: None,
+                listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
+                rtsp_url: None, whep_url: None,
+            },
+            InputConfig::St2110_40(c) => InputConfigMeta {
+                mode: None, local_addr: None, remote_addr: None,
+                listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
+                rtsp_url: None, whep_url: None,
+            },
+            InputConfig::RtpAudio(c) => InputConfigMeta {
+                mode: None, local_addr: None, remote_addr: None,
+                listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
+                rtsp_url: None, whep_url: None,
             },
         };
         let _ = flow_stats.input_config_meta.set(input_meta);
@@ -323,6 +342,55 @@ impl FlowRuntime {
                     cancel.cancelled().await;
                 })
             }
+            // The PTP clock_domain may be set on the flow itself or on the
+            // per-essence input config. The cloned local inherits the
+            // flow-level value when the essence does not override it; the
+            // stored InputConfig is untouched so update_flow's diff stays
+            // accurate.
+            InputConfig::St2110_30(c) => {
+                let mut c = c.clone();
+                c.clock_domain = c.clock_domain.or(config.clock_domain);
+                super::input_st2110_30::spawn_st2110_30_input(
+                    c,
+                    broadcast_tx.clone(),
+                    flow_stats.clone(),
+                    cancel_token.child_token(),
+                    event_sender.clone(),
+                    config.id.clone(),
+                )
+            }
+            InputConfig::St2110_31(c) => {
+                let mut c = c.clone();
+                c.clock_domain = c.clock_domain.or(config.clock_domain);
+                super::input_st2110_31::spawn_st2110_31_input(
+                    c,
+                    broadcast_tx.clone(),
+                    flow_stats.clone(),
+                    cancel_token.child_token(),
+                    event_sender.clone(),
+                    config.id.clone(),
+                )
+            }
+            InputConfig::St2110_40(c) => {
+                let mut c = c.clone();
+                c.clock_domain = c.clock_domain.or(config.clock_domain);
+                super::input_st2110_40::spawn_st2110_40_input(
+                    c,
+                    broadcast_tx.clone(),
+                    flow_stats.clone(),
+                    cancel_token.child_token(),
+                    event_sender.clone(),
+                    config.id.clone(),
+                )
+            }
+            InputConfig::RtpAudio(c) => super::input_rtp_audio::spawn_rtp_audio_input(
+                c.clone(),
+                broadcast_tx.clone(),
+                flow_stats.clone(),
+                cancel_token.child_token(),
+                Some(event_sender.clone()),
+                Some(config.id.clone()),
+            ),
         };
 
         // Start TR-101290 analyzer (independent broadcast subscriber)
@@ -374,6 +442,42 @@ impl FlowRuntime {
                     InputConfig::Whep(_) => {
                         ("whep".to_string(), "rtp_h264".to_string(), false, None, false, None)
                     }
+                    InputConfig::St2110_30(c) => {
+                        let (red_en, red_ty) = if c.redundancy.is_some() {
+                            (true, Some("SMPTE 2022-7".to_string()))
+                        } else {
+                            (false, None)
+                        };
+                        ("st2110_30".to_string(), "pcm_l24".to_string(), false, None, red_en, red_ty)
+                    }
+                    InputConfig::St2110_31(c) => {
+                        let (red_en, red_ty) = if c.redundancy.is_some() {
+                            (true, Some("SMPTE 2022-7".to_string()))
+                        } else {
+                            (false, None)
+                        };
+                        ("st2110_31".to_string(), "aes3".to_string(), false, None, red_en, red_ty)
+                    }
+                    InputConfig::St2110_40(c) => {
+                        let (red_en, red_ty) = if c.redundancy.is_some() {
+                            (true, Some("SMPTE 2022-7".to_string()))
+                        } else {
+                            (false, None)
+                        };
+                        ("st2110_40".to_string(), "anc".to_string(), false, None, red_en, red_ty)
+                    }
+                    InputConfig::RtpAudio(c) => {
+                        let (red_en, red_ty) = if c.redundancy.is_some() {
+                            (true, Some("SMPTE 2022-7".to_string()))
+                        } else {
+                            (false, None)
+                        };
+                        let payload_fmt = match c.bit_depth {
+                            16 => "pcm_l16".to_string(),
+                            _ => "pcm_l24".to_string(),
+                        };
+                        ("rtp_audio".to_string(), payload_fmt, false, None, red_en, red_ty)
+                    }
                 };
             let media_acc = Arc::new(MediaAnalysisAccumulator::new(
                 protocol,
@@ -402,6 +506,7 @@ impl FlowRuntime {
                 &broadcast_tx,
                 thumb_acc,
                 cancel_token.child_token(),
+                config.thumbnail_program_number,
             ))
         } else {
             None
@@ -425,6 +530,11 @@ impl FlowRuntime {
         #[cfg(feature = "webrtc")]
         let mut whep_session_info: Option<(tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>, Option<String>)> = None;
         let mut output_handles = HashMap::new();
+        // Resolve the upstream input audio format once so audio output spawn
+        // modules can construct an optional TranscodeStage. Returns None for
+        // non-audio inputs (video, MPEG-TS, etc.) — passthrough is selected.
+        let input_audio_format =
+            crate::engine::audio_transcode::InputFormat::from_input_config(&config.input);
         for output_config in &config.outputs {
             // For WHEP server outputs, create the session channel so the HTTP
             // handler can forward SDP offers to the output task.
@@ -448,6 +558,7 @@ impl FlowRuntime {
                 &cancel_token,
                 &event_sender,
                 &config.id,
+                input_audio_format,
                 #[cfg(feature = "webrtc")]
                 whep_rx,
             ).await?;
@@ -497,6 +608,7 @@ impl FlowRuntime {
         parent_cancel: &CancellationToken,
         event_sender: &EventSender,
         flow_id: &str,
+        input_audio_format: Option<crate::engine::audio_transcode::InputFormat>,
         #[cfg(feature = "webrtc")]
         whep_session_rx: Option<tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>>,
     ) -> Result<OutputRuntime> {
@@ -535,6 +647,7 @@ impl FlowRuntime {
                     broadcast_tx,
                     output_stats.clone(),
                     output_cancel.clone(),
+                    input_audio_format,
                 );
 
                 Ok(OutputRuntime {
@@ -557,6 +670,7 @@ impl FlowRuntime {
                     output_cancel.clone(),
                     event_sender.clone(),
                     flow_id.to_string(),
+                    input_audio_format,
                 );
 
                 Ok(OutputRuntime {
@@ -631,6 +745,84 @@ impl FlowRuntime {
                     stats: output_stats,
                 })
             }
+            OutputConfig::St2110_30(c) => {
+                let output_stats = flow_stats.register_output(
+                    c.id.clone(),
+                    c.name.clone(),
+                    "st2110_30".to_string(),
+                );
+                let handle = super::output_st2110_30::spawn_st2110_30_output(
+                    c.clone(),
+                    broadcast_tx,
+                    output_stats.clone(),
+                    output_cancel.clone(),
+                    input_audio_format,
+                    flow_id,
+                );
+                Ok(OutputRuntime {
+                    handle,
+                    cancel_token: output_cancel,
+                    stats: output_stats,
+                })
+            }
+            OutputConfig::St2110_31(c) => {
+                let output_stats = flow_stats.register_output(
+                    c.id.clone(),
+                    c.name.clone(),
+                    "st2110_31".to_string(),
+                );
+                let handle = super::output_st2110_31::spawn_st2110_31_output(
+                    c.clone(),
+                    broadcast_tx,
+                    output_stats.clone(),
+                    output_cancel.clone(),
+                    input_audio_format,
+                    flow_id,
+                );
+                Ok(OutputRuntime {
+                    handle,
+                    cancel_token: output_cancel,
+                    stats: output_stats,
+                })
+            }
+            OutputConfig::St2110_40(c) => {
+                let output_stats = flow_stats.register_output(
+                    c.id.clone(),
+                    c.name.clone(),
+                    "st2110_40".to_string(),
+                );
+                let handle = super::output_st2110_40::spawn_st2110_40_output(
+                    c.clone(),
+                    broadcast_tx,
+                    output_stats.clone(),
+                    output_cancel.clone(),
+                );
+                Ok(OutputRuntime {
+                    handle,
+                    cancel_token: output_cancel,
+                    stats: output_stats,
+                })
+            }
+            OutputConfig::RtpAudio(c) => {
+                let output_stats = flow_stats.register_output(
+                    c.id.clone(),
+                    c.name.clone(),
+                    "rtp_audio".to_string(),
+                );
+                let handle = super::output_rtp_audio::spawn_rtp_audio_output(
+                    c.clone(),
+                    broadcast_tx,
+                    output_stats.clone(),
+                    output_cancel.clone(),
+                    input_audio_format,
+                    flow_id,
+                );
+                Ok(OutputRuntime {
+                    handle,
+                    cancel_token: output_cancel,
+                    stats: output_stats,
+                })
+            }
         }
     }
 
@@ -654,6 +846,8 @@ impl FlowRuntime {
         // with WebrtcSessionRegistry through this path). WHEP outputs defined
         // at flow creation time work correctly.
 
+        let input_audio_format =
+            crate::engine::audio_transcode::InputFormat::from_input_config(&self.config.input);
         let output_rt = Self::start_output(
             &output_config,
             &self.broadcast_tx,
@@ -661,6 +855,7 @@ impl FlowRuntime {
             &self.cancel_token,
             &self.event_sender,
             &self.config.id,
+            input_audio_format,
             #[cfg(feature = "webrtc")]
             None,
         ).await?;
@@ -741,29 +936,53 @@ fn build_output_config_meta(config: &OutputConfig) -> OutputConfigMeta {
             remote_addr: c.remote_addr.clone(),
             local_addr: Some(c.local_addr.clone()),
             dest_addr: None, dest_url: None, ingest_url: None, whip_url: None,
+            program_number: c.program_number,
         },
         OutputConfig::Rtp(c) => OutputConfigMeta {
             mode: None, remote_addr: None, local_addr: None,
             dest_addr: Some(c.dest_addr.clone()),
             dest_url: None, ingest_url: None, whip_url: None,
+            program_number: c.program_number,
         },
         OutputConfig::Udp(c) => OutputConfigMeta {
             mode: None, remote_addr: None, local_addr: None,
             dest_addr: Some(c.dest_addr.clone()),
             dest_url: None, ingest_url: None, whip_url: None,
+            program_number: c.program_number,
         },
         OutputConfig::Rtmp(c) => OutputConfigMeta {
             mode: None, remote_addr: None, local_addr: None, dest_addr: None,
             dest_url: Some(c.dest_url.clone()),
             ingest_url: None, whip_url: None,
+            program_number: c.program_number,
         },
         OutputConfig::Hls(c) => OutputConfigMeta {
             mode: None, remote_addr: None, local_addr: None, dest_addr: None, dest_url: None,
             ingest_url: Some(c.ingest_url.clone()), whip_url: None,
+            program_number: c.program_number,
         },
         OutputConfig::Webrtc(c) => OutputConfigMeta {
             mode: None, remote_addr: None, local_addr: None, dest_addr: None, dest_url: None,
             ingest_url: None, whip_url: c.whip_url.clone(),
+            program_number: c.program_number,
+        },
+        OutputConfig::St2110_30(c) | OutputConfig::St2110_31(c) => OutputConfigMeta {
+            mode: None, remote_addr: None, local_addr: None,
+            dest_addr: Some(c.dest_addr.clone()),
+            dest_url: None, ingest_url: None, whip_url: None,
+            program_number: None,
+        },
+        OutputConfig::St2110_40(c) => OutputConfigMeta {
+            mode: None, remote_addr: None, local_addr: None,
+            dest_addr: Some(c.dest_addr.clone()),
+            dest_url: None, ingest_url: None, whip_url: None,
+            program_number: None,
+        },
+        OutputConfig::RtpAudio(c) => OutputConfigMeta {
+            mode: None, remote_addr: None, local_addr: None,
+            dest_addr: Some(c.dest_addr.clone()),
+            dest_url: None, ingest_url: None, whip_url: None,
+            program_number: None,
         },
     }
 }

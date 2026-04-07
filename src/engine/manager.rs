@@ -223,6 +223,133 @@ impl FlowManager {
         Ok(())
     }
 
+    /// Atomically start every member flow of a flow group.
+    ///
+    /// Spawns each member's `FlowRuntime::start` in parallel via
+    /// [`futures_util::future::join_all`]. If **any** member fails to start,
+    /// every member that did successfully start is rolled back via
+    /// `flow.stop()` and an `Err` is returned. This gives operators an
+    /// all-or-nothing guarantee for groups that share a PTP domain or that
+    /// must activate as a unit (audio + ANC, dual-feed talkback, etc.).
+    ///
+    /// **Note on barrier semantics:** "atomic" here means the *futures*
+    /// complete in the same scheduler tick — i.e., the members start within
+    /// roughly one tokio task wakeup of each other (typically << 1 ms on a
+    /// quiet runtime). This is sufficient for IS-05 immediate activation; a
+    /// stricter time-aligned start (using a `tokio::sync::Barrier` to gate
+    /// the input task spawn until all members are bound) is a follow-up.
+    pub async fn start_flow_group(
+        &self,
+        group_id: &str,
+        members: Vec<FlowConfig>,
+    ) -> Result<()> {
+        if members.is_empty() {
+            bail!("Flow group '{}' has no members to start", group_id);
+        }
+        // Avoid double-starting members that are already running.
+        let already_running: Vec<&FlowConfig> = members
+            .iter()
+            .filter(|f| self.flows.contains_key(&f.id))
+            .collect();
+        if !already_running.is_empty() {
+            bail!(
+                "Cannot start flow group '{}': member flow(s) already running: {}",
+                group_id,
+                already_running
+                    .iter()
+                    .map(|f| f.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
+        // Spawn all member starts in parallel.
+        let starts = futures_util::future::join_all(
+            members
+                .iter()
+                .cloned()
+                .map(|cfg| async move { (cfg.id.clone(), self.create_flow(cfg).await) }),
+        )
+        .await;
+
+        // Check for any failures.
+        let mut started_ids: Vec<String> = Vec::new();
+        let mut first_error: Option<(String, anyhow::Error)> = None;
+        for (id, res) in starts {
+            match res {
+                Ok(_) => started_ids.push(id),
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some((id, e));
+                    }
+                }
+            }
+        }
+
+        if let Some((failed_id, err)) = first_error {
+            // Roll back: stop every member that DID start.
+            tracing::error!(
+                "Flow group '{}' start failed at member '{failed_id}': {err}; rolling back {} started members",
+                group_id,
+                started_ids.len()
+            );
+            for id in &started_ids {
+                let _ = self.destroy_flow(id).await;
+            }
+            self.event_sender.emit(
+                EventSeverity::Critical,
+                "flow_group",
+                format!("Flow group '{group_id}' start rolled back: member '{failed_id}' failed: {err}"),
+            );
+            bail!(
+                "Flow group '{group_id}' start failed at member '{failed_id}': {err} (rolled back)"
+            );
+        }
+
+        self.event_sender.emit(
+            EventSeverity::Info,
+            "flow_group",
+            format!(
+                "Flow group '{group_id}' started ({} members)",
+                started_ids.len()
+            ),
+        );
+        Ok(())
+    }
+
+    /// Stop every member flow of a flow group in parallel. Best-effort:
+    /// individual member stop failures are logged but do not abort the
+    /// remaining stops. The group is considered stopped once all member
+    /// runtimes have exited.
+    pub async fn stop_flow_group(&self, group_id: &str, member_ids: &[String]) -> Result<()> {
+        if member_ids.is_empty() {
+            return Ok(());
+        }
+        let stops = futures_util::future::join_all(
+            member_ids
+                .iter()
+                .map(|id| async move { (id.clone(), self.destroy_flow(id).await) }),
+        )
+        .await;
+        let mut failures: Vec<String> = Vec::new();
+        for (id, res) in stops {
+            if let Err(e) = res {
+                tracing::warn!("Flow group '{group_id}' stop_flow_group: member '{id}' stop error: {e}");
+                failures.push(id);
+            }
+        }
+        self.event_sender.emit(
+            EventSeverity::Info,
+            "flow_group",
+            format!(
+                "Flow group '{group_id}' stopped ({} members; {} failures)",
+                member_ids.len() - failures.len(),
+                failures.len()
+            ),
+        );
+        Ok(())
+    }
+
     /// Gracefully stop all running flows, typically called during application shutdown.
     ///
     /// Iterates over every active flow, cancels its token, and removes it from

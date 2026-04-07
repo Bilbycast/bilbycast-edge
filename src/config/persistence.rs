@@ -214,13 +214,17 @@ mod tests {
             monitor: None,
             manager: None,
             tunnels: Vec::new(),
+            flow_groups: Vec::new(),
             flows: vec![FlowConfig {
                 id: "test".to_string(),
                 name: "Test".to_string(),
                 enabled: true,
                 media_analysis: true,
                 thumbnail: true,
+                thumbnail_program_number: None,
                 bandwidth_limit: None,
+                flow_group_id: None,
+                clock_domain: None,
                 input: InputConfig::Rtp(RtpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
                     interface_addr: None,

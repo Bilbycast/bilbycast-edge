@@ -79,9 +79,17 @@ impl From<&FlowConfig> for FlowSummary {
             InputConfig::Rtsp(_) => ("rtsp", false),
             InputConfig::Webrtc(_) => ("webrtc", false),
             InputConfig::Whep(_) => ("whep", false),
+            InputConfig::St2110_30(c) => ("st2110_30", c.redundancy.is_some()),
+            InputConfig::St2110_31(c) => ("st2110_31", c.redundancy.is_some()),
+            InputConfig::St2110_40(c) => ("st2110_40", c.redundancy.is_some()),
+            InputConfig::RtpAudio(c) => ("rtp_audio", c.redundancy.is_some()),
         };
-        let output_redundancy = flow.outputs.iter().any(|o| {
-            matches!(o, OutputConfig::Srt(srt) if srt.redundancy.is_some())
+        let output_redundancy = flow.outputs.iter().any(|o| match o {
+            OutputConfig::Srt(srt) => srt.redundancy.is_some(),
+            OutputConfig::St2110_30(c) | OutputConfig::St2110_31(c) => c.redundancy.is_some(),
+            OutputConfig::St2110_40(c) => c.redundancy.is_some(),
+            OutputConfig::RtpAudio(c) => c.redundancy.is_some(),
+            _ => false,
         });
         Self {
             id: flow.id.clone(),

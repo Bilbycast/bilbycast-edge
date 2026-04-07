@@ -16,6 +16,7 @@ use crate::manager::events::{EventSender, EventSeverity};
 use crate::stats::collector::OutputStatsAccumulator;
 
 use super::packet::RtpPacket;
+use super::ts_program_filter::TsProgramFilter;
 
 /// Minimum RTP header size (no CSRC or extensions).
 const RTP_HEADER_MIN: usize = 12;
@@ -82,6 +83,19 @@ async fn hls_output_loop(
     let mut segment_start_us: Option<u64> = None;
     let mut segment_seq: u64 = 0;
 
+    // Optional MPTS → SPTS program filter. When set, every TS chunk is
+    // filtered before it joins the segment buffer, so the resulting `.ts`
+    // segments carry only the selected program. PAT/PMT state survives
+    // across packets so version bumps are handled.
+    let mut program_filter = config.program_number.map(|n| {
+        tracing::info!(
+            "HLS output '{}': program filter enabled, target program_number = {}",
+            config.id, n
+        );
+        TsProgramFilter::new(n)
+    });
+    let mut filter_scratch: Vec<u8> = Vec::new();
+
     // Rolling playlist: (sequence_number, duration_secs)
     let mut playlist_entries: VecDeque<(u64, f64)> = VecDeque::new();
 
@@ -95,7 +109,9 @@ async fn hls_output_loop(
                 match result {
                     Ok(packet) => {
                         // Strip RTP header to get raw TS payload.
-                        let payload = if packet.data.len() > RTP_HEADER_MIN {
+                        let payload = if packet.is_raw_ts {
+                            &packet.data[..]
+                        } else if packet.data.len() > RTP_HEADER_MIN {
                             &packet.data[RTP_HEADER_MIN..]
                         } else {
                             // Packet too small to contain TS data, skip.
@@ -106,7 +122,19 @@ async fn hls_output_loop(
                         let start = segment_start_us.get_or_insert(packet.recv_time_us);
                         let elapsed_us = packet.recv_time_us.saturating_sub(*start);
 
-                        segment_buf.extend_from_slice(payload);
+                        // Apply program filter if configured: feed only the
+                        // selected program's TS bytes into the segment buffer.
+                        // Skip the packet entirely when the filter eats it.
+                        if let Some(ref mut filter) = program_filter {
+                            filter_scratch.clear();
+                            filter.filter_into(payload, &mut filter_scratch);
+                            if filter_scratch.is_empty() {
+                                continue;
+                            }
+                            segment_buf.extend_from_slice(&filter_scratch);
+                        } else {
+                            segment_buf.extend_from_slice(payload);
+                        }
 
                         // Check if we should cut a segment.
                         if elapsed_us >= segment_duration_us && !segment_buf.is_empty() {

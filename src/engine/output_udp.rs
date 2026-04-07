@@ -13,7 +13,10 @@ use crate::config::models::UdpOutputConfig;
 use crate::stats::collector::OutputStatsAccumulator;
 use crate::util::socket::create_udp_output;
 
+use super::audio_302m::S302mOutputPipeline;
+use super::audio_transcode::InputFormat;
 use super::packet::RtpPacket;
+use super::ts_program_filter::TsProgramFilter;
 
 /// TS sync byte.
 const TS_SYNC_BYTE: u8 = 0x47;
@@ -42,14 +45,116 @@ pub fn spawn_udp_output(
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     output_stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
+    input_format: Option<InputFormat>,
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
 
     tokio::spawn(async move {
-        if let Err(e) = udp_output_loop(&config, &mut rx, output_stats, cancel).await {
+        if matches!(config.transport_mode.as_deref(), Some("audio_302m")) {
+            if let Err(e) =
+                udp_output_loop_302m(&config, &mut rx, output_stats, cancel, input_format).await
+            {
+                tracing::error!(
+                    "UDP output '{}' (audio_302m) exited with error: {e}",
+                    config.id
+                );
+            }
+        } else if let Err(e) = udp_output_loop(&config, &mut rx, output_stats, cancel).await {
             tracing::error!("UDP output '{}' exited with error: {e}", config.id);
         }
     })
+}
+
+/// 302M output loop: builds a [`S302mOutputPipeline`] and ships its
+/// 1316-byte (7×188) MPEG-TS datagrams over plain UDP. No RTP wrapper —
+/// hardware decoders that expect raw MPEG-TS over UDP can consume this
+/// directly.
+async fn udp_output_loop_302m(
+    config: &UdpOutputConfig,
+    rx: &mut broadcast::Receiver<RtpPacket>,
+    stats: Arc<OutputStatsAccumulator>,
+    cancel: CancellationToken,
+    input_format: Option<InputFormat>,
+) -> anyhow::Result<()> {
+    let (socket, dest) = create_udp_output(
+        &config.dest_addr,
+        config.bind_addr.as_deref(),
+        config.interface_addr.as_deref(),
+        config.dscp,
+    )
+    .await?;
+
+    let input = match input_format {
+        Some(i) => i,
+        None => {
+            tracing::warn!(
+                "UDP output '{}' transport_mode=audio_302m but upstream input is not audio; \
+                 falling back to passthrough TS",
+                config.id
+            );
+            return udp_output_loop(config, rx, stats, cancel).await;
+        }
+    };
+
+    let out_channels = match input.channels {
+        1 => 2,
+        n if n % 2 == 0 && n <= 8 => n,
+        n if n > 8 => 8,
+        _ => input.channels + 1,
+    };
+    let mut pipeline = match S302mOutputPipeline::new(input, out_channels, 24, 4_000) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(
+                "UDP output '{}' could not build 302M pipeline: {e}",
+                config.id
+            );
+            return Ok(());
+        }
+    };
+
+    tracing::info!(
+        "UDP output '{}' (audio_302m) -> {} ({}Hz/{}bit/{}ch input)",
+        config.id,
+        dest,
+        input.sample_rate,
+        input.bit_depth.as_u8(),
+        input.channels,
+    );
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!("UDP output '{}' (audio_302m) stopping (cancelled)", config.id);
+                return Ok(());
+            }
+            result = rx.recv() => {
+                match result {
+                    Ok(packet) => {
+                        pipeline.process(&packet);
+                        for datagram in pipeline.take_ready_datagrams() {
+                            match socket.send_to(&datagram, dest).await {
+                                Ok(sent) => {
+                                    stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                    stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("UDP output '{}' (302M) send error: {e}", config.id);
+                                }
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        stats.packets_dropped.fetch_add(n, Ordering::Relaxed);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        tracing::info!("UDP output '{}' (302M) broadcast closed", config.id);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn udp_output_loop(
@@ -62,6 +167,16 @@ async fn udp_output_loop(
         create_udp_output(&config.dest_addr, config.bind_addr.as_deref(), config.interface_addr.as_deref(), config.dscp).await?;
 
     tracing::info!("UDP output '{}' started -> {}", config.id, dest);
+
+    // Optional MPTS → SPTS program filter.
+    let mut program_filter = config.program_number.map(|n| {
+        tracing::info!(
+            "UDP output '{}': program filter enabled, target program_number = {}",
+            config.id, n
+        );
+        TsProgramFilter::new(n)
+    });
+    let mut filter_scratch: Vec<u8> = Vec::new();
 
     // Buffer for re-aligning TS data into 188-byte aligned datagrams.
     let mut ts_buf = BytesMut::new();
@@ -86,7 +201,19 @@ async fn udp_output_loop(
                             continue;
                         };
 
-                        ts_buf.extend_from_slice(ts_data);
+                        // Apply program filter (MPTS → SPTS) if configured.
+                        // The filter consumes raw TS bytes and emits raw TS
+                        // bytes belonging to the selected program only.
+                        if let Some(ref mut filter) = program_filter {
+                            filter_scratch.clear();
+                            filter.filter_into(ts_data, &mut filter_scratch);
+                            if filter_scratch.is_empty() {
+                                continue;
+                            }
+                            ts_buf.extend_from_slice(&filter_scratch);
+                        } else {
+                            ts_buf.extend_from_slice(ts_data);
+                        }
 
                         // Find TS sync boundary on first data
                         if !ts_sync_found {

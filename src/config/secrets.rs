@@ -315,6 +315,11 @@ impl SecretsConfig {
                 }
             }
             InputConfig::Rtp(_) | InputConfig::Udp(_) => {}
+            // SMPTE ST 2110 inputs carry no per-input secrets in Phase 1.
+            InputConfig::St2110_30(_)
+            | InputConfig::St2110_31(_)
+            | InputConfig::St2110_40(_)
+            | InputConfig::RtpAudio(_) => {}
         }
     }
 
@@ -350,6 +355,11 @@ impl SecretsConfig {
                 }
             }
             OutputConfig::Rtp(_) | OutputConfig::Udp(_) => {}
+            // SMPTE ST 2110 outputs carry no per-output secrets in Phase 1.
+            OutputConfig::St2110_30(_)
+            | OutputConfig::St2110_31(_)
+            | OutputConfig::St2110_40(_)
+            | OutputConfig::RtpAudio(_) => {}
         }
     }
 }
@@ -483,7 +493,10 @@ mod tests {
                 enabled: true,
                 media_analysis: true,
                 thumbnail: true,
+                thumbnail_program_number: None,
                 bandwidth_limit: None,
+                flow_group_id: None,
+                clock_domain: None,
                 input: InputConfig::Srt(SrtInputConfig {
                     mode: SrtMode::Listener,
                     local_addr: "0.0.0.0:9000".to_string(),
@@ -517,6 +530,7 @@ mod tests {
                     tlpkt_drop: None,
                     ip_ttl: None,
                     redundancy: None,
+                    transport_mode: None,
                 }),
                 outputs: vec![],
             }],
@@ -537,6 +551,7 @@ mod tests {
                 tls_cert_pem: None,
                 tls_key_pem: None,
             }],
+            flow_groups: vec![],
         };
 
         // Extract secrets — only infrastructure secrets, not flow params
@@ -619,13 +634,17 @@ mod tests {
             monitor: None,
             manager: None,
             tunnels: vec![],
+            flow_groups: vec![],
             flows: vec![FlowConfig {
                 id: "srt-flow".to_string(),
                 name: "SRT Flow".to_string(),
                 enabled: true,
                 media_analysis: true,
                 thumbnail: true,
+                thumbnail_program_number: None,
                 bandwidth_limit: None,
+                flow_group_id: None,
+                clock_domain: None,
                 input: InputConfig::Srt(SrtInputConfig {
                     mode: SrtMode::Listener,
                     local_addr: "0.0.0.0:9000".to_string(),
@@ -659,6 +678,7 @@ mod tests {
                     tlpkt_drop: None,
                     ip_ttl: None,
                     redundancy: None,
+                    transport_mode: None,
                 }),
                 outputs: vec![],
             }],
@@ -678,13 +698,17 @@ mod tests {
             monitor: None,
             manager: None,
             tunnels: vec![],
+            flow_groups: vec![],
             flows: vec![FlowConfig {
                 id: "rtmp-flow".to_string(),
                 name: "RTMP Flow".to_string(),
                 enabled: true,
                 media_analysis: true,
                 thumbnail: true,
+                thumbnail_program_number: None,
                 bandwidth_limit: None,
+                flow_group_id: None,
+                clock_domain: None,
                 input: InputConfig::Rtp(RtpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
                     interface_addr: None,
@@ -702,6 +726,7 @@ mod tests {
                     stream_key: "my-stream-key".to_string(),
                     reconnect_delay_secs: 5,
                     max_reconnect_attempts: None,
+                    program_number: None,
                 })],
             }],
         };
@@ -739,13 +764,17 @@ mod tests {
             monitor: None,
             manager: None,
             tunnels: vec![],
+            flow_groups: vec![],
             flows: vec![FlowConfig {
                 id: "srt-flow".to_string(),
                 name: "SRT Flow".to_string(),
                 enabled: true,
                 media_analysis: true,
                 thumbnail: true,
+                thumbnail_program_number: None,
                 bandwidth_limit: None,
+                flow_group_id: None,
+                clock_domain: None,
                 input: InputConfig::Srt(SrtInputConfig {
                     mode: SrtMode::Listener,
                     local_addr: "0.0.0.0:9000".to_string(),
@@ -779,6 +808,7 @@ mod tests {
                     tlpkt_drop: None,
                     ip_ttl: None,
                     redundancy: None,
+                    transport_mode: None,
                 }),
                 outputs: vec![],
             }],

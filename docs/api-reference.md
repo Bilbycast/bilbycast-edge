@@ -370,6 +370,8 @@ Create a new flow. The flow is validated, persisted to the config file, and (if 
 }
 ```
 
+> **MPTS inputs:** every output type accepts an optional `program_number` field to down-select an MPTS input to a single program. `null` (default) passes the full MPTS through on TS-native outputs (UDP/RTP/SRT/HLS) or locks onto the lowest `program_number` in the PAT on re-muxing outputs (RTMP/WebRTC). See [configuration-guide.md — MPTS → SPTS filtering](configuration-guide.md#mpts--spts-filtering) for the full behaviour matrix. `FlowConfig` also accepts an optional `thumbnail_program_number` field that filters the buffered TS before piping it to ffmpeg for the manager UI preview.
+
 **Response (200):**
 
 Returns the created flow configuration in the standard envelope.
@@ -791,6 +793,36 @@ Retrieve aggregated system-wide and per-flow statistics. Running flows include l
           "fec": null,
           "redundancy": null,
           "program_count": 1,
+          "programs": [
+            {
+              "program_number": 1,
+              "pmt_pid": 4096,
+              "video_streams": [
+                {
+                  "pid": 256,
+                  "codec": "H.264/AVC",
+                  "stream_type": 27,
+                  "resolution": "1920x1080",
+                  "frame_rate": 29.97,
+                  "profile": "High",
+                  "level": "4.0",
+                  "bitrate_bps": 5000000
+                }
+              ],
+              "audio_streams": [
+                {
+                  "pid": 257,
+                  "codec": "AAC-LC",
+                  "stream_type": 15,
+                  "sample_rate_hz": 48000,
+                  "channels": 2,
+                  "language": "eng",
+                  "bitrate_bps": 128000
+                }
+              ],
+              "total_bitrate_bps": 5128000
+            }
+          ],
           "video_streams": [
             {
               "pid": 256,
@@ -849,7 +881,7 @@ Retrieve aggregated system-wide and per-flow statistics. Running flows include l
 | `input` | object | Input leg statistics (see below) |
 | `outputs` | array | Per-output statistics (see below) |
 | `tr101290` | object/null | TR-101290 analysis (present when running) |
-| `media_analysis` | object/null | Media content analysis — codec, resolution, frame rate, audio format, per-PID bitrate (present when running and `media_analysis` config is `true`) |
+| `media_analysis` | object/null | Media content analysis — codec, resolution, frame rate, audio format, per-PID bitrate (present when running and `media_analysis` config is `true`). The `programs[]` array (new) contains one entry per MPEG-TS program with its own `video_streams`/`audio_streams` — use it for MPTS introspection. The top-level `video_streams`/`audio_streams` are kept for backward compatibility and contain the flat union across all programs. |
 | `iat` | object/null | Inter-arrival time stats in microseconds |
 | `pdv_jitter_us` | float/null | Packet delivery variation (jitter) in microseconds |
 | `bandwidth_exceeded` | boolean | `true` if the flow's input bitrate currently exceeds the configured `bandwidth_limit`. Omitted when `false`. |

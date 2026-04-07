@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::events::{Event, EventSeverity, build_event_envelope};
 
-use crate::config::models::{AppConfig, FlowConfig, OutputConfig};
+use crate::config::models::{AppConfig, FlowConfig, FlowGroupConfig, OutputConfig};
 use crate::config::persistence::save_config_split;
 use crate::config::secrets::SecretsConfig;
 use crate::config::validation::{validate_config, validate_flow, validate_output, validate_tunnel};
@@ -700,8 +700,36 @@ fn build_health_payload(flow_manager: &FlowManager, api_addr: &str, monitor_addr
         "active_flows": flow_manager.active_flow_count(),
         "total_flows": flow_manager.active_flow_count(),
         "api_addr": api_addr,
-        "monitor_addr": monitor_addr
+        "monitor_addr": monitor_addr,
+        // SMPTE ST 2110 (Phase 1) capability advertisement. The manager UI
+        // gates ST 2110 controls per-node on the presence of these strings;
+        // older edges that don't include this field are treated as
+        // "no ST 2110 support" by the manager (the field is `Option` with
+        // `serde(default)` on the manager side).
+        "capabilities": st2110_capabilities()
     })
+}
+
+/// Return the list of ST 2110 capability strings advertised by this build.
+/// Always includes the four base capabilities — Phase 1 ships them all in
+/// the default build. The `ptp-internal` feature is reflected as an
+/// additional `"ptp-internal"` string for completeness.
+fn st2110_capabilities() -> Vec<&'static str> {
+    let mut caps = vec![
+        "st2110-30",
+        "st2110-31",
+        "st2110-40",
+        "ptp",
+        "is-04",
+        "is-05",
+        "is-08",
+        "bcp-004",
+        "redundancy-2022-7",
+    ];
+    if cfg!(feature = "ptp-internal") {
+        caps.push("ptp-internal");
+    }
+    caps
 }
 
 /// Persist manager credentials to config + secrets files.
@@ -1212,6 +1240,7 @@ async fn execute_command(
                 cfg.tunnels = new_config.tunnels.clone();
                 cfg.server = new_config.server.clone();
                 cfg.monitor = new_config.monitor.clone();
+                cfg.flow_groups = new_config.flow_groups.clone();
                 if let Err(e) = save_config_split(config_path.as_path(), secrets_path.as_path(), &cfg) {
                     tracing::warn!("Failed to persist config after manager command: {e}");
                     tunnel_manager.event_sender().emit(
@@ -1228,6 +1257,295 @@ async fn execute_command(
                 "Configuration updated",
             );
 
+            Ok(())
+        }
+        // ── SMPTE ST 2110 (Phase 1) read commands ──
+        //
+        // These are thin wrappers around state already exposed via the
+        // IS-04/IS-05/IS-08 REST endpoints. The manager UI's "Refresh" buttons
+        // can hit either the REST endpoints directly or these WS commands.
+        // For now we ack them; full result-payload wiring is a separate task.
+        "get_nmos_state"
+        | "get_ptp_state"
+        | "get_sdp_document"
+        | "get_audio_channel_map"
+        | "set_audio_channel_map" => {
+            tracing::info!(
+                "Manager command: {action_type} (Phase 1 stub — acked, NMOS state served via REST)"
+            );
+            Ok(())
+        }
+        // ── SMPTE ST 2110 flow group mutation commands ──
+        //
+        // Mutate `cfg.flow_groups`, validate the resulting config, and persist
+        // via save_config_split. Pattern mirrors the `update_config` arm above.
+        "start_flow_group" => {
+            // Start every member flow of a flow group atomically. The group
+            // must already be persisted in `cfg.flow_groups`. The members are
+            // looked up by id from `cfg.flows`. If any member is missing or
+            // any FlowRuntime::start fails, every started member is rolled
+            // back and an Err is returned to the manager.
+            let group_id = action["flow_group_id"]
+                .as_str()
+                .ok_or("Missing flow_group_id in start_flow_group command")?
+                .to_string();
+            let cfg = app_config.read().await;
+            let group = cfg
+                .flow_groups
+                .iter()
+                .find(|g| g.id == group_id)
+                .ok_or_else(|| format!("Flow group '{group_id}' not found"))?;
+            let members: Vec<crate::config::models::FlowConfig> = group
+                .flows
+                .iter()
+                .filter_map(|fid| cfg.flows.iter().find(|f| f.id == *fid).cloned())
+                .collect();
+            if members.len() != group.flows.len() {
+                let missing: Vec<String> = group
+                    .flows
+                    .iter()
+                    .filter(|fid| !cfg.flows.iter().any(|f| f.id == **fid))
+                    .cloned()
+                    .collect();
+                return Err(format!(
+                    "Flow group '{group_id}' references missing flow(s): {}",
+                    missing.join(", ")
+                )
+                .into());
+            }
+            drop(cfg);
+            flow_manager
+                .start_flow_group(&group_id, members)
+                .await
+                .map_err(|e| format!("start_flow_group failed: {e}"))?;
+            Ok(())
+        }
+        "stop_flow_group" => {
+            let group_id = action["flow_group_id"]
+                .as_str()
+                .ok_or("Missing flow_group_id in stop_flow_group command")?
+                .to_string();
+            let cfg = app_config.read().await;
+            let member_ids: Vec<String> = cfg
+                .flow_groups
+                .iter()
+                .find(|g| g.id == group_id)
+                .map(|g| g.flows.clone())
+                .ok_or_else(|| format!("Flow group '{group_id}' not found"))?;
+            drop(cfg);
+            flow_manager
+                .stop_flow_group(&group_id, &member_ids)
+                .await
+                .map_err(|e| format!("stop_flow_group failed: {e}"))?;
+            Ok(())
+        }
+        "add_flow_group" => {
+            let group: FlowGroupConfig = serde_json::from_value(action["flow_group"].clone())
+                .map_err(|e| format!("Invalid flow_group payload: {e}"))?;
+
+            let mut cfg = app_config.write().await;
+            if cfg.flow_groups.iter().any(|g| g.id == group.id) {
+                return Err(format!("Flow group '{}' already exists", group.id).into());
+            }
+            cfg.flow_groups.push(group.clone());
+            if let Err(e) = validate_config(&cfg) {
+                // Roll back the push so an invalid group never lingers in memory.
+                cfg.flow_groups.retain(|g| g.id != group.id);
+                return Err(format!("Invalid flow group: {e}").into());
+            }
+            if let Err(e) = save_config_split(config_path.as_path(), secrets_path.as_path(), &cfg) {
+                tracing::warn!("Failed to persist config after add_flow_group: {e}");
+                tunnel_manager.event_sender().emit(
+                    EventSeverity::Warning,
+                    "config",
+                    format!("Failed to persist flow group '{}': {e}", group.id),
+                );
+            } else {
+                tunnel_manager.event_sender().emit(
+                    EventSeverity::Info,
+                    "config",
+                    format!("Flow group '{}' added", group.id),
+                );
+            }
+            Ok(())
+        }
+        "update_flow_group" => {
+            let new_group: FlowGroupConfig =
+                serde_json::from_value(action["flow_group"].clone())
+                    .map_err(|e| format!("Invalid flow_group payload: {e}"))?;
+            let target_id = action["flow_group_id"]
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| new_group.id.clone());
+
+            let mut cfg = app_config.write().await;
+            let idx = cfg
+                .flow_groups
+                .iter()
+                .position(|g| g.id == target_id)
+                .ok_or_else(|| format!("Flow group '{target_id}' not found"))?;
+            let old = std::mem::replace(&mut cfg.flow_groups[idx], new_group.clone());
+            if let Err(e) = validate_config(&cfg) {
+                cfg.flow_groups[idx] = old;
+                return Err(format!("Invalid flow group update: {e}").into());
+            }
+            if let Err(e) = save_config_split(config_path.as_path(), secrets_path.as_path(), &cfg) {
+                tracing::warn!("Failed to persist config after update_flow_group: {e}");
+                tunnel_manager.event_sender().emit(
+                    EventSeverity::Warning,
+                    "config",
+                    format!("Failed to persist flow group '{target_id}': {e}"),
+                );
+            } else {
+                tunnel_manager.event_sender().emit(
+                    EventSeverity::Info,
+                    "config",
+                    format!("Flow group '{target_id}' updated"),
+                );
+            }
+            Ok(())
+        }
+        "remove_flow_group" => {
+            let target_id = action["flow_group_id"]
+                .as_str()
+                .ok_or("Missing flow_group_id in remove_flow_group command")?
+                .to_string();
+
+            let mut cfg = app_config.write().await;
+            // Reject removal if any flow still references this group, otherwise
+            // the persisted config would fail validate_config on next load.
+            let referencing: Vec<String> = cfg
+                .flows
+                .iter()
+                .filter(|f| f.flow_group_id.as_deref() == Some(target_id.as_str()))
+                .map(|f| f.id.clone())
+                .collect();
+            if !referencing.is_empty() {
+                return Err(format!(
+                    "Flow group '{target_id}' is still referenced by flow(s): {}",
+                    referencing.join(", ")
+                )
+                .into());
+            }
+            let before = cfg.flow_groups.len();
+            cfg.flow_groups.retain(|g| g.id != target_id);
+            if cfg.flow_groups.len() == before {
+                return Err(format!("Flow group '{target_id}' not found").into());
+            }
+            if let Err(e) = save_config_split(config_path.as_path(), secrets_path.as_path(), &cfg) {
+                tracing::warn!("Failed to persist config after remove_flow_group: {e}");
+                tunnel_manager.event_sender().emit(
+                    EventSeverity::Warning,
+                    "config",
+                    format!("Failed to persist removal of flow group '{target_id}': {e}"),
+                );
+            } else {
+                tunnel_manager.event_sender().emit(
+                    EventSeverity::Info,
+                    "config",
+                    format!("Flow group '{target_id}' removed"),
+                );
+            }
+            Ok(())
+        }
+        "add_essence_flow" => {
+            let group_id = action["flow_group_id"]
+                .as_str()
+                .ok_or("Missing flow_group_id in add_essence_flow command")?
+                .to_string();
+            let flow_id = action["flow_id"]
+                .as_str()
+                .ok_or("Missing flow_id in add_essence_flow command")?
+                .to_string();
+
+            let mut cfg = app_config.write().await;
+            if !cfg.flows.iter().any(|f| f.id == flow_id) {
+                return Err(format!("Flow '{flow_id}' does not exist on this node").into());
+            }
+            let group = cfg
+                .flow_groups
+                .iter_mut()
+                .find(|g| g.id == group_id)
+                .ok_or_else(|| format!("Flow group '{group_id}' not found"))?;
+            if !group.flows.iter().any(|f| f == &flow_id) {
+                group.flows.push(flow_id.clone());
+            }
+            if let Err(e) = validate_config(&cfg) {
+                // Roll back: remove the flow_id we just added.
+                if let Some(g) = cfg.flow_groups.iter_mut().find(|g| g.id == group_id) {
+                    g.flows.retain(|f| f != &flow_id);
+                }
+                return Err(format!("Invalid essence flow add: {e}").into());
+            }
+            if let Err(e) = save_config_split(config_path.as_path(), secrets_path.as_path(), &cfg) {
+                tracing::warn!("Failed to persist config after add_essence_flow: {e}");
+                tunnel_manager.event_sender().emit(
+                    EventSeverity::Warning,
+                    "config",
+                    format!("Failed to persist add_essence_flow '{flow_id}' → '{group_id}': {e}"),
+                );
+            } else {
+                tunnel_manager.event_sender().emit(
+                    EventSeverity::Info,
+                    "config",
+                    format!("Flow '{flow_id}' added to group '{group_id}'"),
+                );
+            }
+            Ok(())
+        }
+        "remove_essence_flow" => {
+            // Note: removing an essence flow from a group does NOT clear the
+            // flow's `flow_group_id` field — that's a separate `update_flow`
+            // operation. The bidirectional cross-check in validate_config will
+            // reject this command if any flow still has flow_group_id pointing
+            // at this group as its membership; the manager must clear the
+            // flow's flow_group_id first (or the caller must use remove_flow_group).
+            let group_id = action["flow_group_id"]
+                .as_str()
+                .ok_or("Missing flow_group_id in remove_essence_flow command")?
+                .to_string();
+            let flow_id = action["flow_id"]
+                .as_str()
+                .ok_or("Missing flow_id in remove_essence_flow command")?
+                .to_string();
+
+            let mut cfg = app_config.write().await;
+            let group = cfg
+                .flow_groups
+                .iter_mut()
+                .find(|g| g.id == group_id)
+                .ok_or_else(|| format!("Flow group '{group_id}' not found"))?;
+            let before = group.flows.len();
+            group.flows.retain(|f| f != &flow_id);
+            if group.flows.len() == before {
+                return Err(format!(
+                    "Flow '{flow_id}' is not a member of group '{group_id}'"
+                )
+                .into());
+            }
+            if let Err(e) = validate_config(&cfg) {
+                // Roll back: re-add the flow_id we just removed.
+                if let Some(g) = cfg.flow_groups.iter_mut().find(|g| g.id == group_id) {
+                    g.flows.push(flow_id.clone());
+                }
+                return Err(format!("Invalid essence flow remove: {e}").into());
+            }
+            if let Err(e) = save_config_split(config_path.as_path(), secrets_path.as_path(), &cfg) {
+                tracing::warn!("Failed to persist config after remove_essence_flow: {e}");
+                tunnel_manager.event_sender().emit(
+                    EventSeverity::Warning,
+                    "config",
+                    format!(
+                        "Failed to persist remove_essence_flow '{flow_id}' from '{group_id}': {e}"
+                    ),
+                );
+            } else {
+                tunnel_manager.event_sender().emit(
+                    EventSeverity::Info,
+                    "config",
+                    format!("Flow '{flow_id}' removed from group '{group_id}'"),
+                );
+            }
             Ok(())
         }
         "rotate_secret" => {

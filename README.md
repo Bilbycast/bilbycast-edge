@@ -2,19 +2,25 @@
 
 Media transport edge node supporting SRT, RTP, UDP, RTMP, HLS, and WebRTC protocols. Each node runs one or more flows, where a flow consists of a single input fanning out to multiple outputs, with support for SMPTE 2022-1 FEC and SMPTE 2022-7 hitless redundancy.
 
+Full MPTS (multi-program transport stream) support end-to-end on UDP/RTP/SRT/HLS with optional per-output `program_number` down-selection for extracting a single program as a rewritten SPTS. RTMP/WebRTC outputs and the thumbnail generator lock onto a chosen program deterministically.
+
 Supports NMOS IS-04 (Discovery & Registration) and IS-05 (Connection Management) for integration with broadcast control systems. Exposes Prometheus metrics for monitoring.
 
 ## Supported Protocols
 
 | Protocol | Input | Output | Notes                                          |
 |----------|-------|--------|-------------------------------------------------|
-| SRT      | Yes   | Yes    | Caller, listener, rendezvous modes; AES encryption; Stream ID access control; 2022-7 redundancy |
+| SRT      | Yes   | Yes    | Caller, listener, rendezvous modes; AES encryption; Stream ID access control; 2022-7 redundancy. **`transport_mode: "audio_302m"`** for SMPTE 302M LPCM-in-MPEG-TS over SRT (output side; input demux deferred) |
 | RTP      | Yes   | Yes    | RTP-wrapped over UDP; unicast and multicast; SMPTE 2022-1 FEC; DSCP QoS |
-| UDP      | Yes   | Yes    | Raw MPEG-TS over UDP; unicast and multicast; DSCP QoS marking |
+| UDP      | Yes   | Yes    | Raw MPEG-TS over UDP; unicast and multicast; DSCP QoS marking. **`transport_mode: "audio_302m"`** for SMPTE 302M LPCM-in-MPEG-TS over UDP |
 | RTMP     | Yes   | Yes    | H.264/AAC; accepts publish from OBS/ffmpeg; supports RTMPS (TLS) |
 | RTSP     | Yes   | No     | Pull H.264/H.265 from IP cameras/media servers; TCP/UDP transport; auto-reconnect |
 | HLS      | No    | Yes    | Segment-based ingest; supports HEVC/HDR         |
 | WebRTC   | Yes   | Yes    | WHIP/WHEP; H.264 video + Opus audio (enabled by default) |
+| **SMPTE ST 2110-30** | Yes | Yes | RFC 3551 PCM audio (L16/L24); 2022-7 dual-network; PTP slave via external `ptp4l`. Optional per-output `transcode` block (sample-rate / bit-depth / channel routing) |
+| **SMPTE ST 2110-31** | Yes | Yes | AES3 transparent audio (24-bit), preserves Dolby E and AES3 sub-frame bits |
+| **SMPTE ST 2110-40** | Yes | Yes | RFC 8331 ancillary data (SCTE-104, SMPTE 12M timecode, CEA-608/708 captions) |
+| **`rtp_audio`** | Yes | Yes | Generic RFC 3551 PCM-over-RTP — wire-identical to ST 2110-30 but **no PTP requirement**, sample rates 32 / 44.1 / 48 / 88.2 / 96 kHz. For radio contribution, talkback, ffmpeg / OBS interop. Same `transcode` block as ST 2110-30. Output supports `transport_mode: "audio_302m"` (RTP/MP2T encapsulation per RFC 2250) |
 
 ## Quick Start
 
@@ -198,7 +204,16 @@ Options:
 
 ## Documentation
 
-- [Configuration Reference](docs/CONFIGURATION.md) -- full config file documentation with all fields and examples
+- [Configuration Reference](docs/CONFIGURATION.md) — full config file documentation with all fields and examples
+- [Configuration Guide](docs/configuration-guide.md) — annotated examples for every input and output type
+- [Supported Protocols](docs/supported-protocols.md) — protocol matrix with feature lists
+- **[Audio Gateway Guide](docs/audio-gateway.md)** — bridging PCM audio between studios, transcoding, talkback, radio contribution, and SMPTE 302M LPCM-in-MPEG-TS over SRT/UDP/RTP. Read this if you're using Bilbycast for any audio that isn't strict byte-identical ST 2110-30 passthrough.
+- [SMPTE ST 2110](docs/st2110.md) — ST 2110-30/-31/-40 architecture, validation rules, PTP integration
+- [NMOS](docs/nmos.md) — IS-04 / IS-05 / IS-08 / BCP-004 surface, mDNS-SD registration, channel mapping
+- [Events and Alarms](docs/events-and-alarms.md) — operational event reference
+- [API Reference](docs/api-reference.md) — REST and WebSocket API
+- [API Security](docs/api-security.md) — TLS, JWT, RBAC, ingress filters
+- [Architecture](docs/architecture.md) — internal structure of the edge process
 
 ## License
 

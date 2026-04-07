@@ -178,8 +178,15 @@ async fn main() -> anyhow::Result<()> {
         ws_stats_tx: ws_stats_tx.clone(),
         auth_state,
         is05_state: Arc::new(api::nmos_is05::Is05State::new()),
+        is08_state: api::nmos_is08::Is08State::load_or_default(
+            cli.config
+                .parent()
+                .map(|p| p.join("nmos_channel_map.json"))
+                .unwrap_or_else(|| std::path::PathBuf::from("nmos_channel_map.json")),
+        ),
         #[cfg(feature = "webrtc")]
         webrtc_sessions: Some(Arc::new(api::webrtc::registry::WebrtcSessionRegistry::new())),
+        event_sender: Some(event_sender.clone()),
     };
 
     // Start all enabled flows from config
@@ -223,6 +230,26 @@ async fn main() -> anyhow::Result<()> {
     // Build router and start server
     let router = build_router(state.clone());
     tracing::info!("API server listening on {listen_addr}");
+
+    // Best-effort NMOS mDNS-SD registration. Kept alive for the lifetime of
+    // the process; dropped on shutdown to unregister cleanly. Failures are
+    // logged inside the helper and never block flow startup.
+    let _nmos_mdns = {
+        let node_id = app_config
+            .node_id
+            .clone()
+            .unwrap_or_else(|| "00000000-0000-0000-0000-000000000000".into());
+        let hostname = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("HOST"))
+            .unwrap_or_else(|_| "bilbycast-edge".into());
+        let https = app_config.server.tls.is_some();
+        api::nmos_mdns::spawn_nmos_node_advertisement(
+            &node_id,
+            &hostname,
+            app_config.server.listen_port,
+            https,
+        )
+    };
 
     // Shared shutdown token for coordinated graceful shutdown
     let shutdown_token = CancellationToken::new();

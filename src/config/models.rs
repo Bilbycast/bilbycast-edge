@@ -32,6 +32,13 @@ pub struct AppConfig {
     /// Optional IP tunnels (relay or direct QUIC tunnels between edge nodes)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tunnels: Vec<crate::tunnel::TunnelConfig>,
+    /// Optional SMPTE ST 2110 flow groups (essence bundles).
+    ///
+    /// A flow group bundles multiple essence flows (audio, ancillary, future video)
+    /// that share PTP timing and NMOS activation. Each member references a top-level
+    /// `FlowConfig` by ID. Existing single-flow configs do not need to use flow groups.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flow_groups: Vec<FlowGroupConfig>,
 }
 
 impl Default for AppConfig {
@@ -46,6 +53,7 @@ impl Default for AppConfig {
             manager: None,
             flows: Vec::new(),
             tunnels: Vec::new(),
+            flow_groups: Vec::new(),
         }
     }
 }
@@ -115,11 +123,25 @@ pub struct FlowConfig {
     /// Default: true. Thumbnails are only produced when ffmpeg is detected at startup.
     #[serde(default = "default_true")]
     pub thumbnail: bool,
+    /// MPEG-TS program_number whose video to render in the thumbnail when
+    /// the input is an MPTS. `None` = let ffmpeg pick (typically the first
+    /// program). Must be > 0 if set; program_number 0 is reserved for the NIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_program_number: Option<u16>,
     /// Optional bandwidth limit for trust boundary enforcement (RP 2129).
     /// When configured, the node monitors the flow's input bitrate and takes
     /// the specified action if it exceeds the limit for the grace period.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bandwidth_limit: Option<BandwidthLimitConfig>,
+    /// Optional SMPTE ST 2110 flow group membership. When set, this flow is an
+    /// essence flow within the named group and shares its clock domain. Default: None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_group_id: Option<String>,
+    /// Optional PTP clock domain (IEEE 1588) for this flow. 0..=127. Used by
+    /// SMPTE ST 2110 inputs/outputs and the PTP state reporter to scope sync
+    /// monitoring. Inherits from `flow_group` if set there. Default: None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_domain: Option<u8>,
     /// The single input source for this flow
     pub input: InputConfig,
     /// One or more output destinations (fan-out)
@@ -189,6 +211,24 @@ pub enum InputConfig {
     /// Receive H.264/Opus via WebRTC WHEP client (pull from external WHEP server)
     #[serde(rename = "whep")]
     Whep(WhepInputConfig),
+    /// Receive SMPTE ST 2110-30 uncompressed PCM audio over RTP (L16/L24).
+    #[serde(rename = "st2110_30")]
+    St2110_30(St2110AudioInputConfig),
+    /// Receive SMPTE ST 2110-31 AES3 transparent audio over RTP (preserves Dolby E,
+    /// AES3 user/channel-status/validity bits). Wire format identical to -30 except
+    /// the payload is AES3 sub-frames rather than linear PCM samples.
+    #[serde(rename = "st2110_31")]
+    St2110_31(St2110AudioInputConfig),
+    /// Receive SMPTE ST 2110-40 ancillary data (RFC 8331) — SCTE-104 ad markers,
+    /// SMPTE 12M timecode, CEA-608/708 captions, and other ANC essence.
+    #[serde(rename = "st2110_40")]
+    St2110_40(St2110AncillaryInputConfig),
+    /// Receive RFC 3551 PCM audio over RTP/UDP without ST 2110 constraints.
+    /// No PTP requirement, no RFC 7273 timing reference, no clock_domain
+    /// advertising in NMOS. Useful for radio contribution feeds, talkback,
+    /// and any general PCM-over-RTP source where ST 2110 is overkill.
+    #[serde(rename = "rtp_audio")]
+    RtpAudio(RtpAudioInputConfig),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -349,6 +389,16 @@ pub struct SrtInputConfig {
     /// Optional: enable 2022-7 redundancy on input (merge from two SRT legs)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<SrtRedundancyConfig>,
+    /// Transport mode for the SRT input stream. `"ts"` (default) auto-detects
+    /// RTP/TS or raw TS as the existing path does. `"audio_302m"` forces a
+    /// SMPTE 302M LPCM-in-MPEG-TS demux: the input task locates the BSSD
+    /// audio elementary stream in the PMT, reassembles its private PES
+    /// packets, depacketizes the LPCM samples, and republishes them as RTP
+    /// audio packets onto the broadcast channel. Implementation arrives in
+    /// a follow-up — until then `audio_302m` is accepted by the validator
+    /// but the runtime falls back to standard auto-detect with a warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_mode: Option<String>,
 }
 
 /// RTMP input configuration — runs an RTMP server that accepts publish connections.
@@ -507,6 +557,21 @@ pub enum OutputConfig {
     /// Send via WebRTC/WHIP
     #[serde(rename = "webrtc")]
     Webrtc(WebrtcOutputConfig),
+    /// Send SMPTE ST 2110-30 uncompressed PCM audio over RTP (L16/L24).
+    #[serde(rename = "st2110_30")]
+    St2110_30(St2110AudioOutputConfig),
+    /// Send SMPTE ST 2110-31 AES3 transparent audio over RTP.
+    #[serde(rename = "st2110_31")]
+    St2110_31(St2110AudioOutputConfig),
+    /// Send SMPTE ST 2110-40 ancillary data over RTP.
+    #[serde(rename = "st2110_40")]
+    St2110_40(St2110AncillaryOutputConfig),
+    /// Send PCM audio via RFC 3551 RTP/UDP without ST 2110 constraints
+    /// (no PTP, no RFC 7273 timing, no NMOS clock_domain advertising).
+    /// Supports the same `transcode` block as ST 2110-30 outputs and
+    /// optionally MPEG-TS / SMPTE 302M wrapping via `transport_mode`.
+    #[serde(rename = "rtp_audio")]
+    RtpAudio(RtpAudioOutputConfig),
 }
 
 impl OutputConfig {
@@ -519,6 +584,10 @@ impl OutputConfig {
             OutputConfig::Rtmp(c) => &c.id,
             OutputConfig::Hls(c) => &c.id,
             OutputConfig::Webrtc(c) => &c.id,
+            OutputConfig::St2110_30(c) => &c.id,
+            OutputConfig::St2110_31(c) => &c.id,
+            OutputConfig::St2110_40(c) => &c.id,
+            OutputConfig::RtpAudio(c) => &c.id,
         }
     }
 
@@ -548,6 +617,11 @@ pub struct RtpOutputConfig {
     /// Optional: enable SMPTE 2022-7 redundancy (duplicate to two UDP legs)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<RtpOutputRedundancyConfig>,
+    /// If set, filter the (possibly MPTS) input stream down to this single
+    /// MPEG-TS program before sending. Default: passthrough (full MPTS).
+    /// Must be > 0; program_number 0 is reserved for the NIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
 }
 
 fn default_dscp() -> u8 {
@@ -578,6 +652,19 @@ pub struct UdpOutputConfig {
     /// Default: 46 (Expedited Forwarding per RFC 4594).
     #[serde(default = "default_dscp")]
     pub dscp: u8,
+    /// If set, filter the (possibly MPTS) input stream down to this single
+    /// MPEG-TS program before sending. Default: passthrough (full MPTS).
+    /// Must be > 0; program_number 0 is reserved for the NIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
+    /// Transport mode for this UDP output. `"ts"` (default) sends raw
+    /// MPEG-TS as the existing path does. `"audio_302m"` runs the per-output
+    /// transcode + 302M-in-MPEG-TS pipeline and sends the resulting
+    /// 7×188-byte TS chunks as plain UDP datagrams — useful for legacy
+    /// hardware decoders that expect raw MPEG-TS over UDP carrying SMPTE
+    /// 302M LPCM audio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -686,6 +773,20 @@ pub struct SrtOutputConfig {
     /// Optional: enable 2022-7 redundancy on output (duplicate to two SRT legs)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<SrtRedundancyConfig>,
+    /// If set, filter the (possibly MPTS) input stream down to this single
+    /// MPEG-TS program before sending. Default: passthrough (full MPTS).
+    /// Must be > 0; program_number 0 is reserved for the NIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
+    /// Transport mode for this SRT output. `"ts"` (default) sends whatever
+    /// the upstream broadcast channel produces (RTP-wrapped or raw TS).
+    /// `"audio_302m"` runs the per-output transcode + 302M packetizer
+    /// + TS muxer pipeline and ships 7×188-byte SMPTE 302M-in-MPEG-TS
+    /// datagrams over SRT. Interoperable with `ffmpeg -c:a s302m`,
+    /// `srt-live-transmit`, and broadcast hardware decoders that expect
+    /// 302M LPCM in MPEG-TS over SRT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_mode: Option<String>,
 }
 
 /// SRT connection mode, determining which side initiates the handshake.
@@ -861,6 +962,13 @@ pub struct RtmpOutputConfig {
     /// Maximum reconnection attempts. None = unlimited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_reconnect_attempts: Option<u32>,
+    /// MPEG-TS program_number to extract elementary streams from when the
+    /// input is an MPTS. `None` = lock onto the lowest program_number found
+    /// in the PAT (deterministic default). RTMP is single-program by spec,
+    /// so this only changes which program is published — it does not
+    /// preserve MPTS structure. Must be > 0 if set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
 }
 
 fn default_reconnect_delay() -> u64 {
@@ -893,6 +1001,12 @@ pub struct HlsOutputConfig {
     /// Maximum number of segments in the rolling playlist (default: 5).
     #[serde(default = "default_max_segments")]
     pub max_segments: usize,
+    /// If set, filter the (possibly MPTS) input stream down to this single
+    /// MPEG-TS program before segmenting. Default: passthrough (full MPTS
+    /// in each `.ts` segment). Must be > 0; program_number 0 is reserved
+    /// for the NIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
 }
 
 fn default_segment_duration() -> f64 {
@@ -956,6 +1070,12 @@ pub struct WebrtcOutputConfig {
     /// When true, only video is sent (audio track omitted).
     #[serde(default)]
     pub video_only: bool,
+    /// MPEG-TS program_number to extract elementary streams from when the
+    /// input is an MPTS. `None` = lock onto the lowest program_number found
+    /// in the PAT (deterministic default). WebRTC is single-program by spec,
+    /// so this only changes which program is sent. Must be > 0 if set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
 }
 
 /// SMPTE 2022-1 FEC parameters
@@ -965,6 +1085,311 @@ pub struct FecConfig {
     pub columns: u8,
     /// Number of rows (D parameter), typically 5-20
     pub rows: u8,
+}
+
+// ─────────────────────────── SMPTE ST 2110 ───────────────────────────
+//
+// Phase 1 ST 2110 support: -30 (PCM audio), -31 (AES3 transparent), -40
+// (ancillary data). All three are RTP-over-UDP and reuse the existing
+// `RtpPacket` abstraction. Inputs and outputs may bind to two physically
+// disjoint networks (Red/Blue) for SMPTE 2022-7 hitless redundancy.
+//
+// The actual packetizers/depacketizers and I/O tasks live under
+// `src/engine/st2110/`. The runtime spawn entry points are stubbed in
+// step 1 and implemented in step 4 of the Phase 1 plan.
+
+/// Second-leg bind for SMPTE 2022-7 dual-network (Red/Blue) operation.
+///
+/// The primary bind/dest in the parent input/output config is leg 1 (typically
+/// the "Red" network); this struct defines leg 2 ("Blue"). Both legs receive
+/// or transmit the same RTP stream; on input, the existing `HitlessMerger`
+/// dedupes by RTP sequence number.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RedBlueBindConfig {
+    /// Second-leg socket address. For an input this is the bind address;
+    /// for an output it is the destination address.
+    pub addr: String,
+    /// Network interface IP for multicast on leg 2 (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_addr: Option<String>,
+}
+
+/// SMPTE ST 2110-30 / -31 audio input configuration.
+///
+/// Both -30 (linear PCM L16/L24) and -31 (AES3 transparent) share this struct.
+/// The variant in `InputConfig` (`St2110_30` vs `St2110_31`) selects the payload
+/// format at runtime. AES3 always uses 24-bit sub-frames.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct St2110AudioInputConfig {
+    /// Primary (Red) bind address, e.g. "239.10.10.1:5004" or "0.0.0.0:5004".
+    pub bind_addr: String,
+    /// Network interface IP for multicast join on the primary leg (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_addr: Option<String>,
+    /// Optional SMPTE 2022-7 second leg (Blue network).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<RedBlueBindConfig>,
+    /// Sample rate in Hz. ST 2110-30 PM profile: 48000. AM profile: 96000. Default: 48000.
+    #[serde(default = "default_st2110_sample_rate")]
+    pub sample_rate: u32,
+    /// Bit depth per sample. -30 supports 16 or 24 (L16/L24). -31 is always 24
+    /// (AES3 sub-frames). Default: 24.
+    #[serde(default = "default_st2110_bit_depth")]
+    pub bit_depth: u8,
+    /// Channel count: 1, 2, 4, 8, or 16. Default: 2.
+    #[serde(default = "default_st2110_channels")]
+    pub channels: u8,
+    /// RTP packet time in microseconds. Common values: 125, 250, 333, 500,
+    /// 1000, 4000. Default: 1000 (1ms, ST 2110-30 PM profile).
+    #[serde(default = "default_st2110_packet_time_us")]
+    pub packet_time_us: u32,
+    /// Dynamic RTP payload type (96..=127). Default: 97.
+    #[serde(default = "default_st2110_audio_pt")]
+    pub payload_type: u8,
+    /// PTP clock domain (IEEE 1588), 0..=127. Inherits from the parent flow
+    /// or flow group when omitted. Used by the PTP state reporter to scope
+    /// sync monitoring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_domain: Option<u8>,
+    /// Source IP allow-list (RP 2129 C5). When absent, all sources accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_sources: Option<Vec<String>>,
+    /// Maximum ingress bitrate in Mbps (RP 2129 C7). Excess packets dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bitrate_mbps: Option<f64>,
+}
+
+/// SMPTE ST 2110-30 / -31 audio output configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct St2110AudioOutputConfig {
+    /// Unique output ID within this flow.
+    pub id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Primary (Red) destination address.
+    pub dest_addr: String,
+    /// Source bind address (optional, defaults to "0.0.0.0:0").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_addr: Option<String>,
+    /// Network interface IP for multicast send on the primary leg (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_addr: Option<String>,
+    /// Optional SMPTE 2022-7 second leg (Blue network).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<RedBlueBindConfig>,
+    /// Sample rate in Hz (48000 default, 96000 allowed).
+    #[serde(default = "default_st2110_sample_rate")]
+    pub sample_rate: u32,
+    /// Bit depth per sample (16 or 24 for -30; 24 for -31).
+    #[serde(default = "default_st2110_bit_depth")]
+    pub bit_depth: u8,
+    /// Channel count (1, 2, 4, 8, 16).
+    #[serde(default = "default_st2110_channels")]
+    pub channels: u8,
+    /// RTP packet time in microseconds.
+    #[serde(default = "default_st2110_packet_time_us")]
+    pub packet_time_us: u32,
+    /// Dynamic RTP payload type (96..=127).
+    #[serde(default = "default_st2110_audio_pt")]
+    pub payload_type: u8,
+    /// PTP clock domain (0..=127).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_domain: Option<u8>,
+    /// DSCP value for QoS marking (0-63). Default: 46 (EF per RFC 4594).
+    #[serde(default = "default_dscp")]
+    pub dscp: u8,
+    /// Optional fixed RTP SSRC. When omitted, a random SSRC is generated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssrc: Option<u32>,
+    /// Optional per-output PCM transcode block. When set, the spawn module
+    /// inserts a [`crate::engine::audio_transcode::TranscodeStage`] between
+    /// the broadcast subscriber and the RTP send loop, allowing the output
+    /// to differ from the input in sample rate, bit depth, channel layout,
+    /// packet time, and payload type. When unset, byte-identical passthrough
+    /// is used (default behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+}
+
+/// Generic RFC 3551 PCM-over-RTP audio input — no ST 2110 baggage.
+///
+/// Identical wire format to ST 2110-30 but with relaxed constraints:
+///
+/// - Sample rate: any of 32000, 44100, 48000, 88200, 96000 Hz
+/// - Bit depth: 16 or 24 (L16/L24)
+/// - Channels: 1..=16
+/// - Packet time: any reasonable value (default 1000 µs)
+/// - No PTP requirement, no RFC 7273 timing reference
+/// - No NMOS `clock_domain` advertising
+///
+/// Use this when bridging audio over the public internet, between studios
+/// without a shared PTP fabric, or to interoperate with hardware/software
+/// that produces RFC 3551 RTP audio (ffmpeg, OBS, GStreamer, etc.).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RtpAudioInputConfig {
+    /// Local UDP bind address (e.g. "0.0.0.0:5004" or "239.10.10.1:5004").
+    pub bind_addr: String,
+    /// Multicast NIC IP for joining (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_addr: Option<String>,
+    /// Optional SMPTE 2022-7 second leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<RedBlueBindConfig>,
+    /// Sample rate in Hz. One of 32000, 44100, 48000, 88200, 96000.
+    pub sample_rate: u32,
+    /// PCM bit depth: 16 or 24.
+    pub bit_depth: u8,
+    /// Channel count: 1..=16.
+    pub channels: u8,
+    /// RTP packet time in microseconds. Default: 1000 (1 ms).
+    #[serde(default = "default_st2110_packet_time_us")]
+    pub packet_time_us: u32,
+    /// Dynamic RTP payload type (96..=127).
+    #[serde(default = "default_st2110_audio_pt")]
+    pub payload_type: u8,
+    /// Source IP allow-list (RP 2129 C5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_sources: Option<Vec<String>>,
+}
+
+/// Generic RFC 3551 PCM-over-RTP audio output. See [`RtpAudioInputConfig`]
+/// for the rationale. Supports the same `transcode` block as ST 2110-30
+/// outputs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RtpAudioOutputConfig {
+    pub id: String,
+    pub name: String,
+    pub dest_addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<RedBlueBindConfig>,
+    pub sample_rate: u32,
+    pub bit_depth: u8,
+    pub channels: u8,
+    #[serde(default = "default_st2110_packet_time_us")]
+    pub packet_time_us: u32,
+    #[serde(default = "default_st2110_audio_pt")]
+    pub payload_type: u8,
+    #[serde(default = "default_dscp")]
+    pub dscp: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssrc: Option<u32>,
+    /// Optional per-output PCM transcode block (see St2110AudioOutputConfig.transcode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Transport mode: `"rtp"` (default) sends RFC 3551 PCM over UDP,
+    /// `"audio_302m"` wraps the PCM as SMPTE 302M LPCM in MPEG-TS and sends
+    /// the TS via RTP/MP2T (RFC 2250). The 302M mode is implemented in
+    /// Chunks 5–7.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_mode: Option<String>,
+}
+
+/// SMPTE ST 2110-40 ancillary data input configuration.
+///
+/// Carries SCTE-104 ad markers, SMPTE 12M timecode, CEA-608/708 captions, and
+/// other ancillary data per RFC 8331.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct St2110AncillaryInputConfig {
+    /// Primary (Red) bind address.
+    pub bind_addr: String,
+    /// Network interface IP for multicast join on the primary leg (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_addr: Option<String>,
+    /// Optional SMPTE 2022-7 second leg (Blue network).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<RedBlueBindConfig>,
+    /// Dynamic RTP payload type (96..=127). Default: 100.
+    #[serde(default = "default_st2110_anc_pt")]
+    pub payload_type: u8,
+    /// PTP clock domain (0..=127).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_domain: Option<u8>,
+    /// Source IP allow-list (RP 2129 C5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_sources: Option<Vec<String>>,
+}
+
+/// SMPTE ST 2110-40 ancillary data output configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct St2110AncillaryOutputConfig {
+    /// Unique output ID within this flow.
+    pub id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Primary (Red) destination address.
+    pub dest_addr: String,
+    /// Source bind address (optional, defaults to "0.0.0.0:0").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_addr: Option<String>,
+    /// Network interface IP for multicast send on the primary leg (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_addr: Option<String>,
+    /// Optional SMPTE 2022-7 second leg (Blue network).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<RedBlueBindConfig>,
+    /// Dynamic RTP payload type (96..=127).
+    #[serde(default = "default_st2110_anc_pt")]
+    pub payload_type: u8,
+    /// PTP clock domain (0..=127).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_domain: Option<u8>,
+    /// DSCP value for QoS marking (0-63). Default: 46.
+    #[serde(default = "default_dscp")]
+    pub dscp: u8,
+    /// Optional fixed RTP SSRC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssrc: Option<u32>,
+}
+
+/// SMPTE ST 2110 flow group ("essence bundle") configuration.
+///
+/// A flow group bundles multiple essence flows that share PTP timing and NMOS
+/// activation. Member flows are referenced by their `FlowConfig.id`. The group's
+/// `clock_domain` is the default for all members; an individual flow may override
+/// it. Existing single-flow configs do not need to use flow groups.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FlowGroupConfig {
+    /// Unique identifier for this flow group (max 64 chars).
+    pub id: String,
+    /// Human-readable name (max 256 chars).
+    pub name: String,
+    /// PTP clock domain (IEEE 1588), 0..=127, shared by all member flows
+    /// unless they override it individually.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_domain: Option<u8>,
+    /// Member flow IDs. Each must reference a top-level `FlowConfig.id`.
+    /// Accepts `flow_ids` as an alias on input so the manager wire format
+    /// (which uses `flow_ids`) round-trips through the same struct.
+    #[serde(default, alias = "flow_ids")]
+    pub flows: Vec<String>,
+}
+
+fn default_st2110_sample_rate() -> u32 {
+    48_000
+}
+
+fn default_st2110_bit_depth() -> u8 {
+    24
+}
+
+fn default_st2110_channels() -> u8 {
+    2
+}
+
+fn default_st2110_packet_time_us() -> u32 {
+    1_000
+}
+
+fn default_st2110_audio_pt() -> u8 {
+    97
+}
+
+fn default_st2110_anc_pt() -> u8 {
+    100
 }
 
 #[cfg(test)]
@@ -982,13 +1407,17 @@ mod tests {
             monitor: None,
             manager: None,
             tunnels: Vec::new(),
+            flow_groups: Vec::new(),
             flows: vec![FlowConfig {
                 id: "test-flow".to_string(),
                 name: "Test Flow".to_string(),
                 enabled: true,
                 media_analysis: true,
                 thumbnail: true,
+                thumbnail_program_number: None,
                 bandwidth_limit: None,
+                flow_group_id: None,
+                clock_domain: None,
                 input: InputConfig::Rtp(RtpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
                     interface_addr: None,
@@ -1008,6 +1437,7 @@ mod tests {
                     fec_encode: None,
                     dscp: default_dscp(),
                     redundancy: None,
+                    program_number: None,
                 })],
             }],
         };

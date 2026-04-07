@@ -93,16 +93,15 @@ pub fn extract_pcr(pkt: &[u8]) -> Option<u64> {
 
 // ── PAT Parsing ──────────────────────────────────────────────────────────
 
-/// Parse a single-packet PAT to extract PMT PIDs.
+/// Parse a single-packet PAT to extract `(program_number, pmt_pid)` pairs.
 ///
-/// Returns a list of PMT PIDs found in the PAT section. Skips the NIT
-/// reference (program_number 0). Only processes PATs that start in this
-/// packet (PUSI set).
-pub fn parse_pat_pmt_pids(pkt: &[u8]) -> Vec<u16> {
-    let mut pids = Vec::new();
+/// Skips the NIT reference (program_number 0). Only processes PATs that
+/// start in this packet (PUSI set).
+pub fn parse_pat_programs(pkt: &[u8]) -> Vec<(u16, u16)> {
+    let mut programs = Vec::new();
 
     if !ts_pusi(pkt) {
-        return pids;
+        return programs;
     }
 
     // Find payload start offset
@@ -112,7 +111,7 @@ pub fn parse_pat_pmt_pids(pkt: &[u8]) -> Vec<u16> {
         offset = 5 + af_len;
     }
     if offset >= TS_PACKET_SIZE {
-        return pids;
+        return programs;
     }
 
     // pointer_field: number of bytes before section start
@@ -122,11 +121,11 @@ pub fn parse_pat_pmt_pids(pkt: &[u8]) -> Vec<u16> {
     // PAT section header: table_id(1) + flags+length(2) + ts_id(2) +
     // version/cni(1) + section_number(1) + last_section(1) = 8 bytes
     if offset + 8 > TS_PACKET_SIZE {
-        return pids;
+        return programs;
     }
     let table_id = pkt[offset];
     if table_id != 0x00 {
-        return pids; // Not a PAT
+        return programs; // Not a PAT
     }
     let section_length =
         (((pkt[offset + 1] & 0x0F) as usize) << 8) | (pkt[offset + 2] as usize);
@@ -140,12 +139,20 @@ pub fn parse_pat_pmt_pids(pkt: &[u8]) -> Vec<u16> {
         let pid = ((pkt[pos + 2] as u16 & 0x1F) << 8) | pkt[pos + 3] as u16;
         if program_number != 0 {
             // program_number 0 is NIT PID, skip it
-            pids.push(pid);
+            programs.push((program_number, pid));
         }
         pos += 4;
     }
 
-    pids
+    programs
+}
+
+/// Parse a single-packet PAT to extract PMT PIDs only (drops program_number).
+///
+/// Thin wrapper around [`parse_pat_programs`] for callers that don't need
+/// the program identity.
+pub fn parse_pat_pmt_pids(pkt: &[u8]) -> Vec<u16> {
+    parse_pat_programs(pkt).into_iter().map(|(_, pid)| pid).collect()
 }
 
 // ── MPEG-2 CRC-32 ───────────────────────────────────────────────────────
@@ -243,4 +250,83 @@ pub fn ts_payload_offset(pkt: &[u8]) -> usize {
         offset = 5 + af_len;
     }
     offset
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a synthetic PAT TS packet carrying the given (program_number, pmt_pid)
+    /// entries plus an optional NIT entry (program_number 0).
+    fn build_pat_packet(programs: &[(u16, u16)], with_nit: bool) -> [u8; TS_PACKET_SIZE] {
+        let mut pkt = [0xFFu8; TS_PACKET_SIZE];
+        // TS header: sync(0x47), PUSI=1 PID=0x0000, no adaptation, PUSI continuity 0
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = 0x40; // PUSI=1, PID high = 0
+        pkt[2] = 0x00; // PID low = 0 (PAT_PID)
+        pkt[3] = 0x10; // adaptation_field_control=01 (payload only), CC=0
+        // pointer_field
+        pkt[4] = 0x00;
+        // PAT section starts at offset 5
+        let entries_count = programs.len() + if with_nit { 1 } else { 0 };
+        // section_length covers from after section_length field through CRC
+        // Header after table_id+length: ts_id(2) + version/cni(1) + section_number(1) +
+        // last_section(1) = 5 bytes; entries: 4 bytes each; CRC: 4 bytes
+        let section_length = 5 + 4 * entries_count + 4;
+        pkt[5] = 0x00; // table_id = PAT
+        pkt[6] = 0xB0 | (((section_length >> 8) as u8) & 0x0F); // section_syntax_indicator=1, '0', reserved, length high
+        pkt[7] = (section_length & 0xFF) as u8;
+        pkt[8] = 0x00; // transport_stream_id high
+        pkt[9] = 0x01; // transport_stream_id low
+        pkt[10] = 0xC1; // reserved + version=0 + current_next=1
+        pkt[11] = 0x00; // section_number
+        pkt[12] = 0x00; // last_section_number
+        let mut pos = 13;
+        if with_nit {
+            pkt[pos] = 0x00;
+            pkt[pos + 1] = 0x00; // program_number=0 (NIT)
+            pkt[pos + 2] = 0xE0;
+            pkt[pos + 3] = 0x10; // NIT PID=0x0010
+            pos += 4;
+        }
+        for (program_number, pmt_pid) in programs {
+            pkt[pos] = (program_number >> 8) as u8;
+            pkt[pos + 1] = (program_number & 0xFF) as u8;
+            pkt[pos + 2] = 0xE0 | (((pmt_pid >> 8) as u8) & 0x1F);
+            pkt[pos + 3] = (pmt_pid & 0xFF) as u8;
+            pos += 4;
+        }
+        // CRC bytes (4) — value isn't checked by parse_pat_programs, leave as default
+        pkt
+    }
+
+    #[test]
+    fn parse_pat_programs_extracts_single_program() {
+        let pkt = build_pat_packet(&[(1, 0x1000)], true);
+        let programs = parse_pat_programs(&pkt);
+        assert_eq!(programs, vec![(1, 0x1000)]);
+    }
+
+    #[test]
+    fn parse_pat_programs_extracts_multiple_programs_for_mpts() {
+        let pkt = build_pat_packet(&[(1, 0x1000), (2, 0x1100), (3, 0x1200)], true);
+        let programs = parse_pat_programs(&pkt);
+        assert_eq!(programs, vec![(1, 0x1000), (2, 0x1100), (3, 0x1200)]);
+    }
+
+    #[test]
+    fn parse_pat_programs_skips_nit_program_zero() {
+        let pkt = build_pat_packet(&[(7, 0x1F00)], true);
+        let programs = parse_pat_programs(&pkt);
+        // NIT (program_number 0) must be filtered out
+        assert_eq!(programs.len(), 1);
+        assert_eq!(programs[0], (7, 0x1F00));
+    }
+
+    #[test]
+    fn parse_pat_pmt_pids_returns_pids_only() {
+        let pkt = build_pat_packet(&[(1, 0x1000), (2, 0x1100)], false);
+        let pids = parse_pat_pmt_pids(&pkt);
+        assert_eq!(pids, vec![0x1000, 0x1100]);
+    }
 }

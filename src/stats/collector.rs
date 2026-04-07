@@ -30,6 +30,10 @@ pub struct OutputStatsAccumulator {
     pub srt_stats_cache: Arc<Mutex<Option<SrtLegStats>>>,
     /// Cached SRT stats for redundancy leg, updated by the SRT output polling task.
     pub srt_leg2_stats_cache: Arc<Mutex<Option<SrtLegStats>>>,
+    /// Optional handle to a per-output PCM transcoder's stats counters.
+    /// Set once at output startup by `run_st2110_audio_output` (and any other
+    /// output that runs a TranscodeStage). Reading is a single atomic load.
+    transcode_stats: OnceLock<Arc<crate::engine::audio_transcode::TranscodeStats>>,
 }
 
 impl OutputStatsAccumulator {
@@ -46,7 +50,17 @@ impl OutputStatsAccumulator {
             throughput: Mutex::new(ThroughputEstimator::new()),
             srt_stats_cache: Arc::new(Mutex::new(None)),
             srt_leg2_stats_cache: Arc::new(Mutex::new(None)),
+            transcode_stats: OnceLock::new(),
         }
+    }
+
+    /// Register the per-output transcoder stats handle. Called once at
+    /// output startup. Subsequent calls are no-ops (first wins).
+    pub fn set_transcode_stats(
+        &self,
+        stats: Arc<crate::engine::audio_transcode::TranscodeStats>,
+    ) {
+        let _ = self.transcode_stats.set(stats);
     }
 
     /// Take a point-in-time snapshot of all atomic counters and return an
@@ -54,6 +68,15 @@ impl OutputStatsAccumulator {
     pub fn snapshot(&self) -> OutputStats {
         let bytes = self.bytes_sent.load(Ordering::Relaxed);
         let bitrate_bps = self.throughput.lock().unwrap().sample(bytes);
+        let transcode_stats = self.transcode_stats.get().map(|t| {
+            crate::stats::models::TranscodeStatsSnapshot {
+                input_packets: t.input_packets.load(Ordering::Relaxed),
+                output_packets: t.output_packets.load(Ordering::Relaxed),
+                dropped: t.dropped.load(Ordering::Relaxed),
+                format_resets: t.format_resets.load(Ordering::Relaxed),
+                last_latency_us: t.last_latency_us.load(Ordering::Relaxed),
+            }
+        });
         OutputStats {
             output_id: self.output_id.clone(),
             output_name: self.output_name.clone(),
@@ -66,6 +89,7 @@ impl OutputStatsAccumulator {
             ingest_url: None,
             whip_url: None,
             local_addr: None,
+            program_number: None,
             packets_sent: self.packets_sent.load(Ordering::Relaxed),
             bytes_sent: bytes,
             bitrate_bps,
@@ -73,6 +97,7 @@ impl OutputStatsAccumulator {
             fec_packets_sent: self.fec_packets_sent.load(Ordering::Relaxed),
             srt_stats: self.srt_stats_cache.lock().unwrap().clone(),
             srt_leg2_stats: self.srt_leg2_stats_cache.lock().unwrap().clone(),
+            transcode_stats,
         }
     }
 }
@@ -303,17 +328,22 @@ pub struct MediaAnalysisState {
     pub fec_type: Option<String>,
     pub redundancy_enabled: bool,
     pub redundancy_type: Option<String>,
-    // Parsed from stream
-    pub program_count: u16,
-    pub video_streams: Vec<VideoStreamState>,
-    pub audio_streams: Vec<AudioStreamState>,
-    pub last_pmt_version: Option<u8>,
-    pub detected: bool,
+    // Parsed from stream — one entry per MPEG-TS program (PMT) found in the PAT.
+    pub programs: Vec<ProgramState>,
     // Per-PID byte counters for bitrate estimation
     pub pid_bytes: HashMap<u16, u64>,
     pub last_bitrate_calc: Instant,
     pub pid_bitrates: HashMap<u16, u64>,
     pub total_bitrate_bps: u64,
+}
+
+/// Internal state for one MPEG-TS program (one PMT).
+pub struct ProgramState {
+    pub program_number: u16,
+    pub pmt_pid: u16,
+    pub last_pmt_version: Option<u8>,
+    pub video_streams: Vec<VideoStreamState>,
+    pub audio_streams: Vec<AudioStreamState>,
 }
 
 /// Internal state for a detected video stream.
@@ -363,11 +393,7 @@ impl MediaAnalysisAccumulator {
                 fec_type,
                 redundancy_enabled,
                 redundancy_type,
-                program_count: 0,
-                video_streams: Vec::new(),
-                audio_streams: Vec::new(),
-                last_pmt_version: None,
-                detected: false,
+                programs: Vec::new(),
                 pid_bytes: HashMap::new(),
                 last_bitrate_calc: Instant::now(),
                 pid_bitrates: HashMap::new(),
@@ -417,8 +443,48 @@ impl MediaAnalysisAccumulator {
             } else {
                 None
             },
-            program_count: state.program_count,
-            video_streams: state.video_streams.iter().map(|v| {
+            program_count: state.programs.len() as u16,
+            programs: state.programs.iter().map(|p| {
+                let video_streams: Vec<VideoStreamInfo> = p.video_streams.iter().map(|v| {
+                    let bitrate = state.pid_bitrates.get(&v.pid).copied().unwrap_or(0);
+                    VideoStreamInfo {
+                        pid: v.pid,
+                        codec: v.codec.clone(),
+                        stream_type: v.stream_type,
+                        resolution: match (v.width, v.height) {
+                            (Some(w), Some(h)) => Some(format!("{}x{}", w, h)),
+                            _ => None,
+                        },
+                        frame_rate: v.frame_rate,
+                        profile: v.profile.clone(),
+                        level: v.level.clone(),
+                        bitrate_bps: bitrate,
+                    }
+                }).collect();
+                let audio_streams: Vec<AudioStreamInfo> = p.audio_streams.iter().map(|a| {
+                    let bitrate = state.pid_bitrates.get(&a.pid).copied().unwrap_or(0);
+                    AudioStreamInfo {
+                        pid: a.pid,
+                        codec: a.codec.clone(),
+                        stream_type: a.stream_type,
+                        sample_rate_hz: a.sample_rate_hz,
+                        channels: a.channels,
+                        language: a.language.clone(),
+                        bitrate_bps: bitrate,
+                    }
+                }).collect();
+                let total_bitrate_bps: u64 = video_streams.iter().map(|v| v.bitrate_bps).sum::<u64>()
+                    + audio_streams.iter().map(|a| a.bitrate_bps).sum::<u64>();
+                ProgramInfo {
+                    program_number: p.program_number,
+                    pmt_pid: p.pmt_pid,
+                    video_streams,
+                    audio_streams,
+                    total_bitrate_bps,
+                }
+            }).collect(),
+            // Backward-compat flat union of all programs' streams.
+            video_streams: state.programs.iter().flat_map(|p| p.video_streams.iter()).map(|v| {
                 let bitrate = state.pid_bitrates.get(&v.pid).copied().unwrap_or(0);
                 VideoStreamInfo {
                     pid: v.pid,
@@ -434,7 +500,7 @@ impl MediaAnalysisAccumulator {
                     bitrate_bps: bitrate,
                 }
             }).collect(),
-            audio_streams: state.audio_streams.iter().map(|a| {
+            audio_streams: state.programs.iter().flat_map(|p| p.audio_streams.iter()).map(|a| {
                 let bitrate = state.pid_bitrates.get(&a.pid).copied().unwrap_or(0);
                 AudioStreamInfo {
                     pid: a.pid,
@@ -582,6 +648,16 @@ pub struct FlowStatsAccumulator {
     pub bandwidth_blocked: AtomicBool,
     /// Configured bandwidth limit in Mbps (set once at flow start, for dashboard display).
     pub bandwidth_limit_mbps: OnceLock<f64>,
+    /// PTP state handle for ST 2110 flows whose `clock_domain` is set.
+    /// Populated by the input spawn helpers in `engine/st2110_io.rs`. The
+    /// snapshot path reads it via `PtpStateHandle::snapshot()` and converts
+    /// the result into the wire-shaped `PtpStateStats`.
+    pub ptp_state: OnceLock<crate::engine::st2110::ptp::PtpStateHandle>,
+    /// Per-leg packet/byte counters for SMPTE 2022-7 dual-network inputs.
+    /// Populated by the input spawn helpers after the Red/Blue UDP sockets
+    /// have been bound. Absent for non-ST-2110 flows and for ST 2110 flows
+    /// without a `redundancy` config (Red-only).
+    pub red_blue_stats: OnceLock<Arc<crate::engine::st2110::redblue::RedBlueStats>>,
 }
 
 /// Lightweight input config metadata for topology display.
@@ -606,6 +682,9 @@ pub struct OutputConfigMeta {
     pub ingest_url: Option<String>,
     pub whip_url: Option<String>,
     pub local_addr: Option<String>,
+    /// Configured MPTS `program_number` filter, mirrored into `OutputStats` for
+    /// the manager status view.
+    pub program_number: Option<u16>,
 }
 
 impl FlowStatsAccumulator {
@@ -636,6 +715,8 @@ impl FlowStatsAccumulator {
             bandwidth_exceeded: AtomicBool::new(false),
             bandwidth_blocked: AtomicBool::new(false),
             bandwidth_limit_mbps: OnceLock::new(),
+            ptp_state: OnceLock::new(),
+            red_blue_stats: OnceLock::new(),
         }
     }
 
@@ -671,6 +752,7 @@ impl FlowStatsAccumulator {
                     snap.ingest_url = meta.ingest_url.clone();
                     snap.whip_url = meta.whip_url.clone();
                     snap.local_addr = meta.local_addr.clone();
+                    snap.program_number = meta.program_number;
                 }
                 snap
             })
@@ -746,7 +828,63 @@ impl FlowStatsAccumulator {
             bandwidth_exceeded: bw_exceeded,
             bandwidth_blocked: bw_blocked,
             bandwidth_limit_mbps: self.bandwidth_limit_mbps.get().copied(),
+            // ST 2110 / NMOS optional fields. Populated for ST 2110 flows
+            // whose input spawn helpers have stored a PtpStateHandle and/or a
+            // RedBlueStats Arc on this accumulator. Non-ST-2110 flows leave
+            // these as `None` so the JSON shape stays unchanged.
+            ptp_state: self.ptp_state.get().map(ptp_state_to_stats),
+            network_legs: self
+                .red_blue_stats
+                .get()
+                .map(|s| red_blue_to_stats(&s.snapshot())),
+            essence_flows: None,
         }
+    }
+}
+
+/// Convert a live `engine::st2110::ptp::PtpState` into the wire-shaped
+/// `PtpStateStats` carried by `FlowStats`. Pure mapping — no I/O, no locks.
+fn ptp_state_to_stats(handle: &crate::engine::st2110::ptp::PtpStateHandle) -> PtpStateStats {
+    use crate::engine::st2110::ptp::PtpLockState;
+    let s = handle.snapshot();
+    let lock_state = match s.lock_state {
+        PtpLockState::Locked => "locked",
+        PtpLockState::Holdover => "holdover",
+        PtpLockState::Acquiring => "acquiring",
+        PtpLockState::Master => "master",
+        PtpLockState::Unknown => "unknown",
+        PtpLockState::Unavailable => "unavailable",
+    }
+    .to_string();
+    PtpStateStats {
+        lock_state,
+        domain: Some(s.domain),
+        grandmaster_id: s.grandmaster_id.map(|gm| gm.to_string()),
+        offset_ns: s.offset_ns,
+        mean_path_delay_ns: s.mean_path_delay_ns,
+        steps_removed: s.steps_removed,
+        last_update_ms: s.last_update_unix_ms.map(|v| v as u64),
+    }
+}
+
+/// Convert a `RedBlueStatsSnapshot` into the wire-shaped `NetworkLegsStats`.
+fn red_blue_to_stats(
+    snap: &crate::engine::st2110::redblue::RedBlueStatsSnapshot,
+) -> NetworkLegsStats {
+    NetworkLegsStats {
+        red: LegCounters {
+            packets_received: snap.red.packets_received,
+            bytes_received: snap.red.bytes_received,
+            packets_forwarded: snap.red.packets_forwarded,
+            packets_duplicate: snap.red.packets_duplicate,
+        },
+        blue: LegCounters {
+            packets_received: snap.blue.packets_received,
+            bytes_received: snap.blue.bytes_received,
+            packets_forwarded: snap.blue.packets_forwarded,
+            packets_duplicate: snap.blue.packets_duplicate,
+        },
+        leg_switches: snap.leg_switches,
     }
 }
 

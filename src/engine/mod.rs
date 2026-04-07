@@ -42,5 +42,53 @@ pub mod thumbnail;
 pub mod tr101290;
 pub mod ts_demux;
 pub mod ts_parse;
+pub mod ts_program_filter;
 #[cfg(feature = "webrtc")]
 pub mod webrtc;
+
+/// Per-output PCM audio transcoding stage (sample rate, bit depth, channel
+/// routing, packet time, payload type). Pure Rust via `rubato`. Fed by ST 2110
+/// audio inputs and the new `rtp_audio` input; consumed by ST 2110-30/-31,
+/// `rtp_audio`, and SMPTE 302M-over-SRT/UDP/RTP outputs.
+pub mod audio_transcode;
+
+/// SMPTE 302M-2007 LPCM audio packetizer / depacketizer. Bit-packs 48 kHz
+/// 16/20/24-bit audio into private MPEG-TS PES payloads tagged with the
+/// `BSSD` registration descriptor. Pairs with [`audio_transcode`] (which
+/// resamples non-48 kHz inputs and promotes to even channel counts) and
+/// the TS muxer (which wraps the PES payload in `stream_type = 0x06`).
+pub mod audio_302m;
+
+/// SMPTE ST 2110 essence-flow support (audio, ancillary, future video).
+///
+/// Phase 1 lands the foundation in three pure-Rust submodules:
+/// - [`st2110::ptp`]: PTP state reporter (reads `ptp4l`'s management Unix
+///   socket; reports `Unavailable` when no daemon is running)
+/// - [`st2110::hwts`]: hardware timestamp helpers (`SO_TIMESTAMPING` enable
+///   and cmsghdr parsing on Linux; no-op on other platforms)
+/// - [`st2110::redblue`]: SMPTE 2022-7 dual-network ("Red"/"Blue") bind
+///   helpers and recv loop, reusing `redundancy::merger::HitlessMerger`
+///
+/// Packetizers and runtime input/output tasks land in Phase 1 step 4.
+pub mod st2110;
+
+/// Shared input/output runtime helpers for ST 2110 essence flows. The thin
+/// `input_st2110_*` / `output_st2110_*` modules below delegate to the helpers
+/// in this module so the recv/send/RedBluePair plumbing lives in one place.
+pub mod st2110_io;
+
+pub mod input_st2110_30;
+pub mod input_st2110_31;
+pub mod input_st2110_40;
+pub mod output_st2110_30;
+pub mod output_st2110_31;
+pub mod output_st2110_40;
+
+/// Generic RFC 3551 PCM-over-RTP audio input. Wire-identical to ST 2110-30
+/// but with no PTP / RFC 7273 / NMOS clock_domain. Drives the same shared
+/// runtime as the ST 2110 audio modules.
+pub mod input_rtp_audio;
+/// Generic RFC 3551 PCM-over-RTP audio output (companion to `input_rtp_audio`).
+/// Supports the same `transcode` block as ST 2110-30 outputs and a future
+/// `transport_mode: "audio_302m"` for SMPTE 302M-in-MPEG-TS over RTP.
+pub mod output_rtp_audio;

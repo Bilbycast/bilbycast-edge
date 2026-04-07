@@ -94,13 +94,40 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
         }
     }
 
-    let mut flow_ids = HashSet::new();
+    let mut flow_ids: HashSet<String> = HashSet::new();
     for flow in &config.flows {
-        if !flow_ids.insert(&flow.id) {
+        if !flow_ids.insert(flow.id.clone()) {
             bail!("Duplicate flow ID: {}", flow.id);
         }
         validate_flow(flow)?;
     }
+
+    // Validate ST 2110 flow groups (essence bundles).
+    // Each group must have a unique ID and only reference defined flows; each
+    // member flow's `flow_group_id` (if set) must point at this group.
+    let mut seen_groups: HashSet<String> = HashSet::new();
+    for group in &config.flow_groups {
+        validate_flow_group(group, &flow_ids, &mut seen_groups)?;
+    }
+    // Cross-check: any flow with `flow_group_id` set must reference an existing
+    // group, and the group must list it as a member (no orphan back-references).
+    for flow in &config.flows {
+        if let Some(ref gid) = flow.flow_group_id {
+            let group = config.flow_groups.iter().find(|g| g.id == *gid).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Flow '{}' references flow_group_id '{}' which is not defined",
+                    flow.id, gid
+                )
+            })?;
+            if !group.flows.iter().any(|f| f == &flow.id) {
+                bail!(
+                    "Flow '{}' references flow_group_id '{}' but is not a member of that group",
+                    flow.id, gid
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -131,6 +158,23 @@ pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
     if flow.name.len() > 256 {
         bail!("Flow name must be at most 256 characters");
     }
+
+    // Validate thumbnail program selector
+    validate_program_number(
+        flow.thumbnail_program_number,
+        &format!("Flow '{}' thumbnail", flow.id),
+    )?;
+
+    // Validate optional flow group membership and clock domain
+    if let Some(ref gid) = flow.flow_group_id {
+        if gid.is_empty() {
+            bail!("Flow '{}': flow_group_id must not be an empty string", flow.id);
+        }
+        if gid.len() > 64 {
+            bail!("Flow '{}': flow_group_id must be at most 64 characters", flow.id);
+        }
+    }
+    validate_clock_domain(flow.clock_domain, &format!("Flow '{}'", flow.id))?;
 
     // Validate bandwidth limit if configured
     if let Some(ref bw) = flow.bandwidth_limit {
@@ -271,6 +315,14 @@ fn validate_input(input: &InputConfig) -> Result<()> {
             if let Some(ref red) = srt.redundancy {
                 validate_srt_redundancy(red, "SRT input")?;
             }
+            if let Some(ref tm) = srt.transport_mode {
+                if !matches!(tm.as_str(), "ts" | "audio_302m") {
+                    bail!(
+                        "SRT input: transport_mode must be 'ts' or 'audio_302m', got '{}'",
+                        tm
+                    );
+                }
+            }
         }
         InputConfig::Rtmp(rtmp) => {
             validate_socket_addr(&rtmp.listen_addr, "RTMP input listen_addr")?;
@@ -334,6 +386,428 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                 }
             }
         }
+        InputConfig::St2110_30(c) => validate_st2110_audio_input(c, St2110Profile::Pcm)?,
+        InputConfig::St2110_31(c) => validate_st2110_audio_input(c, St2110Profile::Aes3)?,
+        InputConfig::St2110_40(c) => validate_st2110_ancillary_input(c)?,
+        InputConfig::RtpAudio(c) => validate_rtp_audio_input(c)?,
+    }
+    Ok(())
+}
+
+/// SMPTE ST 2110 audio profile selector — controls per-format validation
+/// rules (e.g., -31 only permits 24-bit AES3 sub-frames).
+#[derive(Debug, Clone, Copy)]
+enum St2110Profile {
+    /// ST 2110-30 — linear PCM, 16 or 24 bit
+    Pcm,
+    /// ST 2110-31 — AES3 transparent, always 24 bit
+    Aes3,
+}
+
+impl St2110Profile {
+    fn label(self) -> &'static str {
+        match self {
+            St2110Profile::Pcm => "ST 2110-30",
+            St2110Profile::Aes3 => "ST 2110-31",
+        }
+    }
+}
+
+fn validate_st2110_audio_input(c: &St2110AudioInputConfig, profile: St2110Profile) -> Result<()> {
+    let label = profile.label();
+    validate_socket_addr(&c.bind_addr, &format!("{label} input bind_addr"))?;
+    if let Some(ref iface) = c.interface_addr {
+        validate_ip_addr(iface, &format!("{label} input interface_addr"))?;
+    }
+    validate_st2110_audio_params(profile, c.sample_rate, c.bit_depth, c.channels, c.packet_time_us, &format!("{label} input"))?;
+    validate_rtp_payload_type(c.payload_type, &format!("{label} input"))?;
+    validate_clock_domain(c.clock_domain, &format!("{label} input"))?;
+    if let Some(ref sources) = c.allowed_sources {
+        for s in sources {
+            validate_ip_addr(s, &format!("{label} input allowed_sources"))?;
+        }
+    }
+    if let Some(rate) = c.max_bitrate_mbps {
+        if rate <= 0.0 {
+            bail!("{label} input max_bitrate_mbps must be positive, got {rate}");
+        }
+        if rate > 10_000.0 {
+            bail!("{label} input max_bitrate_mbps must be at most 10000 (10 Gbps), got {rate}");
+        }
+    }
+    if let Some(ref red) = c.redundancy {
+        validate_red_blue_bind(red, &c.bind_addr, &format!("{label} input redundancy"))?;
+    }
+    Ok(())
+}
+
+fn validate_st2110_audio_output(c: &St2110AudioOutputConfig, profile: St2110Profile) -> Result<()> {
+    let label = profile.label();
+    validate_id(&c.id, &format!("{label} output"))?;
+    validate_name(&c.name, &format!("{label} output"))?;
+    validate_socket_addr(&c.dest_addr, &format!("{label} output dest_addr"))?;
+    if let Some(ref bind) = c.bind_addr {
+        validate_socket_addr(bind, &format!("{label} output bind_addr"))?;
+    }
+    if let Some(ref iface) = c.interface_addr {
+        validate_ip_addr(iface, &format!("{label} output interface_addr"))?;
+    }
+    validate_st2110_audio_params(profile, c.sample_rate, c.bit_depth, c.channels, c.packet_time_us, &format!("{label} output '{}'", c.id))?;
+    validate_rtp_payload_type(c.payload_type, &format!("{label} output '{}'", c.id))?;
+    validate_clock_domain(c.clock_domain, &format!("{label} output '{}'", c.id))?;
+    if c.dscp > 63 {
+        bail!("{label} output '{}': DSCP must be 0-63, got {}", c.id, c.dscp);
+    }
+    if let Some(ref red) = c.redundancy {
+        validate_red_blue_bind(red, &c.dest_addr, &format!("{label} output '{}' redundancy", c.id))?;
+    }
+    if let Some(ref tj) = c.transcode {
+        // Resolve against the OUTPUT's declared input format. The flow-level
+        // wiring (Chunk 2) will instead resolve against the upstream input
+        // config; for now we validate using the output's own audio params as
+        // the input format placeholder so the JSON is at least internally
+        // consistent. Range/structural validation runs the same way.
+        validate_transcode_block(
+            tj,
+            c.sample_rate,
+            c.bit_depth,
+            c.channels,
+            &format!("{label} output '{}' transcode", c.id),
+        )?;
+    }
+    Ok(())
+}
+
+/// Validate a JSON `transcode` block. Range checks for every field plus the
+/// preset/matrix consistency rules. Used by audio output validators.
+pub(crate) fn validate_transcode_block(
+    tj: &crate::engine::audio_transcode::TranscodeJson,
+    in_sample_rate: u32,
+    in_bit_depth: u8,
+    in_channels: u8,
+    context: &str,
+) -> Result<()> {
+    if let Some(sr) = tj.sample_rate {
+        if !matches!(sr, 32_000 | 44_100 | 48_000 | 88_200 | 96_000) {
+            bail!(
+                "{context}.sample_rate must be one of 32000, 44100, 48000, 88200, 96000, got {sr}"
+            );
+        }
+    }
+    if let Some(bd) = tj.bit_depth {
+        if !matches!(bd, 16 | 20 | 24) {
+            bail!("{context}.bit_depth must be 16, 20, or 24, got {bd}");
+        }
+    }
+    if let Some(ch) = tj.channels {
+        if ch == 0 || ch > 16 {
+            bail!("{context}.channels must be 1..=16, got {ch}");
+        }
+    }
+    if let Some(pt) = tj.packet_time_us {
+        if !matches!(pt, 125 | 250 | 333 | 500 | 1_000 | 4_000) {
+            bail!(
+                "{context}.packet_time_us must be one of 125, 250, 333, 500, 1000, 4000, got {pt}"
+            );
+        }
+    }
+    if let Some(pt) = tj.payload_type {
+        if !(96..=127).contains(&pt) {
+            bail!("{context}.payload_type must be in dynamic range 96-127, got {pt}");
+        }
+    }
+    if tj.channel_map.is_some() && tj.channel_map_preset.is_some() {
+        bail!(
+            "{context}: channel_map and channel_map_preset are mutually exclusive"
+        );
+    }
+    // Structural cross-checks via the resolver — this catches matrix-shape /
+    // out-of-bounds / unknown-preset errors with one consistent code path.
+    let in_bd = match in_bit_depth {
+        16 => crate::engine::audio_transcode::BitDepth::L16,
+        20 => crate::engine::audio_transcode::BitDepth::L20,
+        24 => crate::engine::audio_transcode::BitDepth::L24,
+        other => bail!("{context}: input bit_depth {other} not supported"),
+    };
+    crate::engine::audio_transcode::resolve_transcode(
+        tj,
+        crate::engine::audio_transcode::InputFormat {
+            sample_rate: in_sample_rate,
+            bit_depth: in_bd,
+            channels: in_channels,
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("{context}: {e}"))?;
+    Ok(())
+}
+
+fn validate_st2110_ancillary_input(c: &St2110AncillaryInputConfig) -> Result<()> {
+    validate_socket_addr(&c.bind_addr, "ST 2110-40 input bind_addr")?;
+    if let Some(ref iface) = c.interface_addr {
+        validate_ip_addr(iface, "ST 2110-40 input interface_addr")?;
+    }
+    validate_rtp_payload_type(c.payload_type, "ST 2110-40 input")?;
+    validate_clock_domain(c.clock_domain, "ST 2110-40 input")?;
+    if let Some(ref sources) = c.allowed_sources {
+        for s in sources {
+            validate_ip_addr(s, "ST 2110-40 input allowed_sources")?;
+        }
+    }
+    if let Some(ref red) = c.redundancy {
+        validate_red_blue_bind(red, &c.bind_addr, "ST 2110-40 input redundancy")?;
+    }
+    Ok(())
+}
+
+fn validate_st2110_ancillary_output(c: &St2110AncillaryOutputConfig) -> Result<()> {
+    validate_id(&c.id, "ST 2110-40 output")?;
+    validate_name(&c.name, "ST 2110-40 output")?;
+    validate_socket_addr(&c.dest_addr, "ST 2110-40 output dest_addr")?;
+    if let Some(ref bind) = c.bind_addr {
+        validate_socket_addr(bind, "ST 2110-40 output bind_addr")?;
+    }
+    if let Some(ref iface) = c.interface_addr {
+        validate_ip_addr(iface, "ST 2110-40 output interface_addr")?;
+    }
+    validate_rtp_payload_type(c.payload_type, &format!("ST 2110-40 output '{}'", c.id))?;
+    validate_clock_domain(c.clock_domain, &format!("ST 2110-40 output '{}'", c.id))?;
+    if c.dscp > 63 {
+        bail!("ST 2110-40 output '{}': DSCP must be 0-63, got {}", c.id, c.dscp);
+    }
+    if let Some(ref red) = c.redundancy {
+        validate_red_blue_bind(red, &c.dest_addr, &format!("ST 2110-40 output '{}' redundancy", c.id))?;
+    }
+    Ok(())
+}
+
+/// Validate a generic `rtp_audio` input. Same shape as ST 2110-30 but with
+/// a relaxed sample rate set (32k / 44.1k / 48k / 88.2k / 96k) and no
+/// PTP / clock_domain requirement.
+fn validate_rtp_audio_input(c: &RtpAudioInputConfig) -> Result<()> {
+    validate_socket_addr(&c.bind_addr, "rtp_audio input bind_addr")?;
+    if let Some(ref iface) = c.interface_addr {
+        validate_ip_addr(iface, "rtp_audio input interface_addr")?;
+    }
+    validate_rtp_audio_params(
+        c.sample_rate,
+        c.bit_depth,
+        c.channels,
+        c.packet_time_us,
+        "rtp_audio input",
+    )?;
+    validate_rtp_payload_type(c.payload_type, "rtp_audio input")?;
+    if let Some(ref sources) = c.allowed_sources {
+        for s in sources {
+            validate_ip_addr(s, "rtp_audio input allowed_sources")?;
+        }
+    }
+    if let Some(ref red) = c.redundancy {
+        validate_red_blue_bind(red, &c.bind_addr, "rtp_audio input redundancy")?;
+    }
+    Ok(())
+}
+
+fn validate_rtp_audio_output(c: &RtpAudioOutputConfig) -> Result<()> {
+    validate_id(&c.id, "rtp_audio output")?;
+    validate_name(&c.name, "rtp_audio output")?;
+    validate_socket_addr(&c.dest_addr, &format!("rtp_audio output '{}' dest_addr", c.id))?;
+    if let Some(ref bind) = c.bind_addr {
+        validate_socket_addr(bind, &format!("rtp_audio output '{}' bind_addr", c.id))?;
+    }
+    if let Some(ref iface) = c.interface_addr {
+        validate_ip_addr(iface, &format!("rtp_audio output '{}' interface_addr", c.id))?;
+    }
+    validate_rtp_audio_params(
+        c.sample_rate,
+        c.bit_depth,
+        c.channels,
+        c.packet_time_us,
+        &format!("rtp_audio output '{}'", c.id),
+    )?;
+    validate_rtp_payload_type(c.payload_type, &format!("rtp_audio output '{}'", c.id))?;
+    if c.dscp > 63 {
+        bail!("rtp_audio output '{}': DSCP must be 0-63, got {}", c.id, c.dscp);
+    }
+    if let Some(ref red) = c.redundancy {
+        validate_red_blue_bind(red, &c.dest_addr, &format!("rtp_audio output '{}' redundancy", c.id))?;
+    }
+    if let Some(ref tj) = c.transcode {
+        validate_transcode_block(
+            tj,
+            c.sample_rate,
+            c.bit_depth,
+            c.channels,
+            &format!("rtp_audio output '{}' transcode", c.id),
+        )?;
+    }
+    if let Some(ref tm) = c.transport_mode {
+        if !matches!(tm.as_str(), "rtp" | "audio_302m") {
+            bail!(
+                "rtp_audio output '{}': transport_mode must be 'rtp' or 'audio_302m', got '{}'",
+                c.id,
+                tm
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Relaxed audio parameter validator for `rtp_audio`. Permits the wider sample
+/// rate set used by RFC 3551 (32 k, 44.1 k, 48 k, 88.2 k, 96 k) and the same
+/// channel/packet-time/bit-depth set as ST 2110-30.
+fn validate_rtp_audio_params(
+    sample_rate: u32,
+    bit_depth: u8,
+    channels: u8,
+    packet_time_us: u32,
+    context: &str,
+) -> Result<()> {
+    if !matches!(sample_rate, 32_000 | 44_100 | 48_000 | 88_200 | 96_000) {
+        bail!(
+            "{context}: sample_rate must be one of 32000, 44100, 48000, 88200, 96000, got {sample_rate}"
+        );
+    }
+    if bit_depth != 16 && bit_depth != 24 {
+        bail!("{context}: bit_depth must be 16 or 24, got {bit_depth}");
+    }
+    if channels == 0 || channels > 16 {
+        bail!("{context}: channels must be 1..=16, got {channels}");
+    }
+    if !matches!(packet_time_us, 125 | 250 | 333 | 500 | 1_000 | 4_000 | 20_000) {
+        bail!(
+            "{context}: packet_time_us must be one of 125, 250, 333, 500, 1000, 4000, 20000, got {packet_time_us}"
+        );
+    }
+    Ok(())
+}
+
+/// Validates the second-leg bind for SMPTE 2022-7 (Red/Blue) operation.
+///
+/// Ensures the leg-2 address is a valid socket address, the optional interface
+/// is a valid IP, the address family matches the primary leg, and (when both
+/// are unicast) the IP differs from the primary so the two legs do not collapse
+/// onto the same NIC by accident.
+fn validate_red_blue_bind(red: &RedBlueBindConfig, primary_addr: &str, context: &str) -> Result<()> {
+    validate_socket_addr(&red.addr, &format!("{context} addr"))?;
+    if let Some(ref iface) = red.interface_addr {
+        validate_ip_addr(iface, &format!("{context} interface_addr"))?;
+    }
+    let leg1: SocketAddr = primary_addr.parse()
+        .map_err(|e| anyhow::anyhow!("{context}: primary addr '{primary_addr}' is not parseable: {e}"))?;
+    let leg2: SocketAddr = red.addr.parse()
+        .map_err(|e| anyhow::anyhow!("{context}: leg 2 addr '{}' is not parseable: {e}", red.addr))?;
+    if leg1.is_ipv4() != leg2.is_ipv4() {
+        bail!(
+            "{context}: leg 1 ({primary_addr}) and leg 2 ({}) must use the same address family",
+            red.addr
+        );
+    }
+    if let Some(ref iface) = red.interface_addr {
+        let iface_ip: std::net::IpAddr = iface.parse()
+            .map_err(|_| anyhow::anyhow!("{context} interface_addr: invalid IP '{iface}'"))?;
+        if leg2.is_ipv4() != iface_ip.is_ipv4() {
+            bail!("{context}: leg 2 addr and interface_addr must use the same address family");
+        }
+    }
+    // Both legs unicast and bound to the same IP defeats the purpose of 2022-7.
+    let leg1_ip = leg1.ip();
+    let leg2_ip = leg2.ip();
+    if !leg1_ip.is_unspecified() && !leg2_ip.is_unspecified() && !leg1_ip.is_multicast()
+        && !leg2_ip.is_multicast() && leg1_ip == leg2_ip
+    {
+        bail!(
+            "{context}: leg 1 and leg 2 must use distinct IPs for SMPTE 2022-7 \
+             (got {leg1_ip} for both)"
+        );
+    }
+    Ok(())
+}
+
+fn validate_st2110_audio_params(
+    profile: St2110Profile,
+    sample_rate: u32,
+    bit_depth: u8,
+    channels: u8,
+    packet_time_us: u32,
+    context: &str,
+) -> Result<()> {
+    // ST 2110-30 supports 48 and 96 kHz; ST 2110-31 only 48 kHz in practice but
+    // the wire format permits 96 kHz so accept both.
+    if sample_rate != 48_000 && sample_rate != 96_000 {
+        bail!("{context}: sample_rate must be 48000 or 96000, got {sample_rate}");
+    }
+    match profile {
+        St2110Profile::Pcm => {
+            if bit_depth != 16 && bit_depth != 24 {
+                bail!("{context}: ST 2110-30 bit_depth must be 16 or 24, got {bit_depth}");
+            }
+        }
+        St2110Profile::Aes3 => {
+            if bit_depth != 24 {
+                bail!("{context}: ST 2110-31 bit_depth must be 24 (AES3 sub-frame), got {bit_depth}");
+            }
+        }
+    }
+    if !matches!(channels, 1 | 2 | 4 | 8 | 16) {
+        bail!("{context}: channels must be 1, 2, 4, 8, or 16, got {channels}");
+    }
+    // ST 2110-30 PM (Standard) and AM (high frame) profile packet times.
+    if !matches!(packet_time_us, 125 | 250 | 333 | 500 | 1_000 | 4_000) {
+        bail!(
+            "{context}: packet_time_us must be 125, 250, 333, 500, 1000, or 4000, got {packet_time_us}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_rtp_payload_type(pt: u8, context: &str) -> Result<()> {
+    if !(96..=127).contains(&pt) {
+        bail!("{context}: payload_type must be in dynamic range 96-127, got {pt}");
+    }
+    Ok(())
+}
+
+fn validate_clock_domain(domain: Option<u8>, context: &str) -> Result<()> {
+    if let Some(d) = domain {
+        if d > 127 {
+            bail!("{context}: clock_domain must be 0-127 (IEEE 1588), got {d}");
+        }
+    }
+    Ok(())
+}
+
+/// Validates a single SMPTE ST 2110 flow group definition.
+///
+/// Checks ID/name length, clock domain, that there is at least one member, and
+/// that every member references a real flow ID.
+fn validate_flow_group(
+    g: &FlowGroupConfig,
+    flow_ids: &HashSet<String>,
+    seen_groups: &mut HashSet<String>,
+) -> Result<()> {
+    validate_id(&g.id, "Flow group")?;
+    validate_name(&g.name, "Flow group")?;
+    validate_clock_domain(g.clock_domain, &format!("Flow group '{}'", g.id))?;
+    if !seen_groups.insert(g.id.clone()) {
+        bail!("Duplicate flow group ID: {}", g.id);
+    }
+    if g.flows.is_empty() {
+        bail!("Flow group '{}' must reference at least one flow", g.id);
+    }
+    let mut seen_members = HashSet::new();
+    for fid in &g.flows {
+        if fid.len() > 64 {
+            bail!("Flow group '{}': member flow ID '{}' is too long (max 64)", g.id, fid);
+        }
+        if !seen_members.insert(fid.clone()) {
+            bail!("Flow group '{}': duplicate member flow ID '{}'", g.id, fid);
+        }
+        if !flow_ids.contains(fid) {
+            bail!(
+                "Flow group '{}': member flow ID '{}' does not reference a defined flow",
+                g.id, fid
+            );
+        }
     }
     Ok(())
 }
@@ -358,6 +832,17 @@ fn validate_name(name: &str, context: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate an optional MPEG-TS program_number selector. program_number 0 is
+/// reserved for the NIT and never identifies a real program.
+fn validate_program_number(prog: Option<u16>, context: &str) -> Result<()> {
+    if let Some(n) = prog {
+        if n == 0 {
+            bail!("{context}: program_number must be > 0 (0 is reserved for the NIT)");
+        }
+    }
+    Ok(())
+}
+
 /// Validates a single output configuration.
 ///
 /// For **RTP** outputs: checks that the output ID is non-empty, validates `dest_addr`
@@ -377,6 +862,7 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
         OutputConfig::Rtp(rtp) => {
             validate_id(&rtp.id, "RTP output")?;
             validate_name(&rtp.name, "RTP output")?;
+            validate_program_number(rtp.program_number, &format!("RTP output '{}'", rtp.id))?;
             validate_socket_addr(&rtp.dest_addr, "RTP output dest_addr")?;
             if let Some(ref bind) = rtp.bind_addr {
                 validate_socket_addr(bind, "RTP output bind_addr")?;
@@ -418,6 +904,7 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
         OutputConfig::Udp(udp) => {
             validate_id(&udp.id, "UDP output")?;
             validate_name(&udp.name, "UDP output")?;
+            validate_program_number(udp.program_number, &format!("UDP output '{}'", udp.id))?;
             validate_socket_addr(&udp.dest_addr, "UDP output dest_addr")?;
             if let Some(ref bind) = udp.bind_addr {
                 validate_socket_addr(bind, "UDP output bind_addr")?;
@@ -428,10 +915,26 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
             if udp.dscp > 63 {
                 bail!("UDP output '{}': DSCP must be 0-63, got {}", udp.id, udp.dscp);
             }
+            if let Some(ref tm) = udp.transport_mode {
+                if !matches!(tm.as_str(), "ts" | "audio_302m") {
+                    bail!(
+                        "UDP output '{}': transport_mode must be 'ts' or 'audio_302m', got '{}'",
+                        udp.id,
+                        tm
+                    );
+                }
+                if tm == "audio_302m" && udp.program_number.is_some() {
+                    bail!(
+                        "UDP output '{}': transport_mode 'audio_302m' is incompatible with program_number",
+                        udp.id
+                    );
+                }
+            }
         }
         OutputConfig::Srt(srt) => {
             validate_id(&srt.id, "SRT output")?;
             validate_name(&srt.name, "SRT output")?;
+            validate_program_number(srt.program_number, &format!("SRT output '{}'", srt.id))?;
             validate_socket_addr(&srt.local_addr, "SRT output local_addr")?;
             validate_srt_common(
                 &srt.mode, &srt.remote_addr,
@@ -447,10 +950,40 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
             if let Some(ref red) = srt.redundancy {
                 validate_srt_redundancy(red, "SRT output")?;
             }
+            if let Some(ref tm) = srt.transport_mode {
+                if !matches!(tm.as_str(), "ts" | "audio_302m") {
+                    bail!(
+                        "SRT output '{}': transport_mode must be 'ts' or 'audio_302m', got '{}'",
+                        srt.id,
+                        tm
+                    );
+                }
+                if tm == "audio_302m" {
+                    if srt.packet_filter.is_some() {
+                        bail!(
+                            "SRT output '{}': transport_mode 'audio_302m' is incompatible with packet_filter (FEC)",
+                            srt.id
+                        );
+                    }
+                    if srt.program_number.is_some() {
+                        bail!(
+                            "SRT output '{}': transport_mode 'audio_302m' is incompatible with program_number",
+                            srt.id
+                        );
+                    }
+                    if srt.redundancy.is_some() {
+                        bail!(
+                            "SRT output '{}': transport_mode 'audio_302m' is incompatible with SMPTE 2022-7 redundancy",
+                            srt.id
+                        );
+                    }
+                }
+            }
         }
         OutputConfig::Rtmp(rtmp) => {
             validate_id(&rtmp.id, "RTMP output")?;
             validate_name(&rtmp.name, "RTMP output")?;
+            validate_program_number(rtmp.program_number, &format!("RTMP output '{}'", rtmp.id))?;
             if !rtmp.dest_url.starts_with("rtmp://") && !rtmp.dest_url.starts_with("rtmps://") {
                 bail!("RTMP output '{}': dest_url must start with rtmp:// or rtmps://", rtmp.id);
             }
@@ -470,6 +1003,7 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
         OutputConfig::Hls(hls) => {
             validate_id(&hls.id, "HLS output")?;
             validate_name(&hls.name, "HLS output")?;
+            validate_program_number(hls.program_number, &format!("HLS output '{}'", hls.id))?;
             if !hls.ingest_url.starts_with("http://") && !hls.ingest_url.starts_with("https://") {
                 bail!("HLS output '{}': ingest_url must start with http:// or https://", hls.id);
             }
@@ -494,6 +1028,7 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
         OutputConfig::Webrtc(webrtc) => {
             validate_id(&webrtc.id, "WebRTC output")?;
             validate_name(&webrtc.name, "WebRTC output")?;
+            validate_program_number(webrtc.program_number, &format!("WebRTC output '{}'", webrtc.id))?;
             match webrtc.mode {
                 crate::config::models::WebrtcOutputMode::WhipClient => {
                     let url = webrtc.whip_url.as_ref().ok_or_else(|| {
@@ -525,6 +1060,10 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
                 }
             }
         }
+        OutputConfig::St2110_30(c) => validate_st2110_audio_output(c, St2110Profile::Pcm)?,
+        OutputConfig::St2110_31(c) => validate_st2110_audio_output(c, St2110Profile::Aes3)?,
+        OutputConfig::St2110_40(c) => validate_st2110_ancillary_output(c)?,
+        OutputConfig::RtpAudio(c) => validate_rtp_audio_output(c)?,
     }
     Ok(())
 }
@@ -900,7 +1439,10 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            thumbnail_program_number: None,
             bandwidth_limit: None,
+            flow_group_id: None,
+            clock_domain: None,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,
@@ -920,6 +1462,7 @@ mod tests {
                 fec_encode: None,
                 dscp: 46,
                 redundancy: None,
+                program_number: None,
             })],
         };
         assert!(validate_flow(&flow).is_ok());
@@ -933,7 +1476,10 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            thumbnail_program_number: None,
             bandwidth_limit: None,
+            flow_group_id: None,
+            clock_domain: None,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "not-an-address".to_string(),
                 interface_addr: None,
@@ -957,7 +1503,10 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            thumbnail_program_number: None,
             bandwidth_limit: None,
+            flow_group_id: None,
+            clock_domain: None,
             input: InputConfig::Srt(SrtInputConfig {
                 mode: SrtMode::Caller,
                 local_addr: "0.0.0.0:9000".to_string(),
@@ -979,6 +1528,7 @@ mod tests {
                 loss_max_ttl: None, km_refresh_rate: None, km_pre_announce: None,
                 payload_size: None, mss: None, tlpkt_drop: None, ip_ttl: None,
                 redundancy: None,
+                transport_mode: None,
             }),
             outputs: vec![],
         };
@@ -996,6 +1546,7 @@ mod tests {
             monitor: None,
             manager: None,
             tunnels: Vec::new(),
+            flow_groups: Vec::new(),
             flows: vec![
                 FlowConfig {
                     id: "same-id".to_string(),
@@ -1003,7 +1554,10 @@ mod tests {
                     enabled: true,
                     media_analysis: true,
             thumbnail: true,
+            thumbnail_program_number: None,
                     bandwidth_limit: None,
+                    flow_group_id: None,
+                    clock_domain: None,
                     input: InputConfig::Rtp(RtpInputConfig {
                         bind_addr: "0.0.0.0:5000".to_string(),
                         interface_addr: None,
@@ -1022,7 +1576,10 @@ mod tests {
                     enabled: true,
                     media_analysis: true,
             thumbnail: true,
+            thumbnail_program_number: None,
                     bandwidth_limit: None,
+                    flow_group_id: None,
+                    clock_domain: None,
                     input: InputConfig::Rtp(RtpInputConfig {
                         bind_addr: "0.0.0.0:5001".to_string(),
                         interface_addr: None,
@@ -1048,7 +1605,10 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            thumbnail_program_number: None,
             bandwidth_limit: None,
+            flow_group_id: None,
+            clock_domain: None,
             input: InputConfig::Srt(SrtInputConfig {
                 mode: SrtMode::Listener,
                 local_addr: "0.0.0.0:9000".to_string(),
@@ -1070,6 +1630,7 @@ mod tests {
                 loss_max_ttl: None, km_refresh_rate: None, km_pre_announce: None,
                 payload_size: None, mss: None, tlpkt_drop: None, ip_ttl: None,
                 redundancy: None,
+                transport_mode: None,
             }),
             outputs: vec![],
         };
@@ -1086,7 +1647,10 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            thumbnail_program_number: None,
             bandwidth_limit: None,
+            flow_group_id: None,
+            clock_domain: None,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "[::]:5000".to_string(),
                 interface_addr: None,
@@ -1106,6 +1670,7 @@ mod tests {
                 fec_encode: None,
                 dscp: 46,
                 redundancy: None,
+                program_number: None,
             })],
         };
         assert!(validate_flow(&flow).is_ok());
@@ -1119,7 +1684,10 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            thumbnail_program_number: None,
             bandwidth_limit: None,
+            flow_group_id: None,
+            clock_domain: None,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "239.1.1.1:5000".to_string(),
                 interface_addr: Some("192.168.1.100".to_string()),
@@ -1139,6 +1707,7 @@ mod tests {
                 fec_encode: None,
                 dscp: 46,
                 redundancy: None,
+                program_number: None,
             })],
         };
         assert!(validate_flow(&flow).is_ok());
@@ -1152,7 +1721,10 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            thumbnail_program_number: None,
             bandwidth_limit: None,
+            flow_group_id: None,
+            clock_domain: None,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "[ff7e::1]:5000".to_string(),
                 interface_addr: Some("::1".to_string()),
@@ -1172,6 +1744,7 @@ mod tests {
                 fec_encode: None,
                 dscp: 46,
                 redundancy: None,
+                program_number: None,
             })],
         };
         assert!(validate_flow(&flow).is_ok());
@@ -1187,7 +1760,10 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            thumbnail_program_number: None,
             bandwidth_limit: None,
+            flow_group_id: None,
+            clock_domain: None,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "239.1.1.1:5000".to_string(),         // IPv4
                 interface_addr: Some("::1".to_string()),          // IPv6 - mismatch!
@@ -1211,7 +1787,10 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            thumbnail_program_number: None,
             bandwidth_limit: None,
+            flow_group_id: None,
+            clock_domain: None,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "[::]:5000".to_string(),
                 interface_addr: None,
@@ -1231,6 +1810,7 @@ mod tests {
                 fec_encode: None,
                 dscp: 46,
                 redundancy: None,
+                program_number: None,
             })],
         };
         assert!(validate_flow(&flow).is_err());
@@ -1244,7 +1824,10 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            thumbnail_program_number: None,
             bandwidth_limit: None,
+            flow_group_id: None,
+            clock_domain: None,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,
@@ -1264,6 +1847,7 @@ mod tests {
                 fec_encode: None,
                 dscp: 46,
                 redundancy: None,
+                program_number: None,
             })],
         };
         assert!(validate_flow(&flow).is_err());
@@ -1277,7 +1861,10 @@ mod tests {
             enabled: true,
             media_analysis: true,
             thumbnail: true,
+            thumbnail_program_number: None,
             bandwidth_limit: None,
+            flow_group_id: None,
+            clock_domain: None,
             input: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,
@@ -1297,8 +1884,334 @@ mod tests {
                 fec_encode: None,
                 dscp: 46,
                 redundancy: None,
+                program_number: None,
             })],
         };
         assert!(validate_flow(&flow).is_err());
+    }
+
+    // ─────────────── SMPTE ST 2110 validation tests ───────────────
+
+    fn st2110_30_input(addr: &str) -> St2110AudioInputConfig {
+        St2110AudioInputConfig {
+            bind_addr: addr.to_string(),
+            interface_addr: None,
+            redundancy: None,
+            sample_rate: 48_000,
+            bit_depth: 24,
+            channels: 2,
+            packet_time_us: 1_000,
+            payload_type: 97,
+            clock_domain: Some(0),
+            allowed_sources: None,
+            max_bitrate_mbps: None,
+        }
+    }
+
+    fn st2110_30_output(id: &str, dest: &str) -> St2110AudioOutputConfig {
+        St2110AudioOutputConfig {
+            id: id.to_string(),
+            name: "Audio out".to_string(),
+            dest_addr: dest.to_string(),
+            bind_addr: None,
+            interface_addr: None,
+            redundancy: None,
+            sample_rate: 48_000,
+            bit_depth: 24,
+            channels: 2,
+            packet_time_us: 1_000,
+            payload_type: 97,
+            clock_domain: Some(0),
+            dscp: 46,
+            ssrc: None,
+            transcode: None,
+        }
+    }
+
+    #[test]
+    fn test_st2110_30_valid_audio_input() {
+        let cfg = st2110_30_input("239.10.10.1:5004");
+        validate_st2110_audio_input(&cfg, St2110Profile::Pcm).expect("valid -30 input");
+    }
+
+    #[test]
+    fn test_st2110_30_invalid_sample_rate() {
+        let mut cfg = st2110_30_input("239.10.10.1:5004");
+        cfg.sample_rate = 44_100;
+        assert!(validate_st2110_audio_input(&cfg, St2110Profile::Pcm).is_err());
+    }
+
+    #[test]
+    fn test_st2110_30_invalid_bit_depth() {
+        let mut cfg = st2110_30_input("239.10.10.1:5004");
+        cfg.bit_depth = 32;
+        assert!(validate_st2110_audio_input(&cfg, St2110Profile::Pcm).is_err());
+    }
+
+    #[test]
+    fn test_st2110_31_requires_24_bit() {
+        let mut cfg = st2110_30_input("239.10.10.1:5004");
+        cfg.bit_depth = 16; // valid for -30 but rejected for -31
+        assert!(validate_st2110_audio_input(&cfg, St2110Profile::Aes3).is_err());
+    }
+
+    #[test]
+    fn test_st2110_invalid_channel_count() {
+        let mut cfg = st2110_30_input("239.10.10.1:5004");
+        cfg.channels = 3;
+        assert!(validate_st2110_audio_input(&cfg, St2110Profile::Pcm).is_err());
+    }
+
+    #[test]
+    fn test_st2110_invalid_packet_time() {
+        let mut cfg = st2110_30_input("239.10.10.1:5004");
+        cfg.packet_time_us = 750;
+        assert!(validate_st2110_audio_input(&cfg, St2110Profile::Pcm).is_err());
+    }
+
+    #[test]
+    fn test_st2110_payload_type_out_of_range() {
+        let mut cfg = st2110_30_input("239.10.10.1:5004");
+        cfg.payload_type = 50;
+        assert!(validate_st2110_audio_input(&cfg, St2110Profile::Pcm).is_err());
+    }
+
+    #[test]
+    fn test_st2110_clock_domain_out_of_range() {
+        let mut cfg = st2110_30_input("239.10.10.1:5004");
+        cfg.clock_domain = Some(200);
+        assert!(validate_st2110_audio_input(&cfg, St2110Profile::Pcm).is_err());
+    }
+
+    #[test]
+    fn test_st2110_red_blue_legs_collision_rejected() {
+        let mut cfg = st2110_30_input("10.0.0.5:5004");
+        cfg.redundancy = Some(RedBlueBindConfig {
+            addr: "10.0.0.5:5006".to_string(),
+            interface_addr: None,
+        });
+        assert!(validate_st2110_audio_input(&cfg, St2110Profile::Pcm).is_err());
+    }
+
+    #[test]
+    fn test_st2110_red_blue_address_family_mismatch_rejected() {
+        let mut cfg = st2110_30_input("10.0.0.5:5004");
+        cfg.redundancy = Some(RedBlueBindConfig {
+            addr: "[::1]:5006".to_string(),
+            interface_addr: None,
+        });
+        assert!(validate_st2110_audio_input(&cfg, St2110Profile::Pcm).is_err());
+    }
+
+    #[test]
+    fn test_st2110_red_blue_distinct_unicast_ok() {
+        let mut cfg = st2110_30_input("10.0.0.5:5004");
+        cfg.redundancy = Some(RedBlueBindConfig {
+            addr: "10.0.1.5:5006".to_string(),
+            interface_addr: None,
+        });
+        validate_st2110_audio_input(&cfg, St2110Profile::Pcm).expect("distinct legs");
+    }
+
+    #[test]
+    fn test_st2110_30_output_valid() {
+        let out = st2110_30_output("audio-1", "239.10.10.1:5004");
+        validate_st2110_audio_output(&out, St2110Profile::Pcm).expect("valid -30 output");
+    }
+
+    #[test]
+    fn test_st2110_30_output_dscp_out_of_range() {
+        let mut out = st2110_30_output("audio-1", "239.10.10.1:5004");
+        out.dscp = 64;
+        assert!(validate_st2110_audio_output(&out, St2110Profile::Pcm).is_err());
+    }
+
+    #[test]
+    fn test_st2110_40_input_valid() {
+        let anc = St2110AncillaryInputConfig {
+            bind_addr: "239.10.10.10:5006".to_string(),
+            interface_addr: None,
+            redundancy: None,
+            payload_type: 100,
+            clock_domain: Some(0),
+            allowed_sources: None,
+        };
+        validate_st2110_ancillary_input(&anc).expect("valid -40 input");
+    }
+
+    #[test]
+    fn test_st2110_40_input_payload_type_out_of_range() {
+        let anc = St2110AncillaryInputConfig {
+            bind_addr: "239.10.10.10:5006".to_string(),
+            interface_addr: None,
+            redundancy: None,
+            payload_type: 50,
+            clock_domain: Some(0),
+            allowed_sources: None,
+        };
+        assert!(validate_st2110_ancillary_input(&anc).is_err());
+    }
+
+    #[test]
+    fn test_flow_with_st2110_input_validates() {
+        let flow = FlowConfig {
+            id: "audio-flow".to_string(),
+            name: "Audio".to_string(),
+            enabled: true,
+            media_analysis: false,
+            thumbnail: false,
+            thumbnail_program_number: None,
+            bandwidth_limit: None,
+            flow_group_id: Some("group-1".to_string()),
+            clock_domain: Some(0),
+            input: InputConfig::St2110_30(st2110_30_input("239.10.10.1:5004")),
+            outputs: vec![OutputConfig::St2110_30(st2110_30_output(
+                "out-1",
+                "239.10.10.2:5004",
+            ))],
+        };
+        validate_flow(&flow).expect("valid ST 2110 flow");
+    }
+
+    #[test]
+    fn test_flow_group_member_must_exist() {
+        let mut config = AppConfig::default();
+        config.flow_groups.push(FlowGroupConfig {
+            id: "group-1".to_string(),
+            name: "Group 1".to_string(),
+            clock_domain: Some(0),
+            flows: vec!["does-not-exist".to_string()],
+        });
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_flow_group_back_reference_must_match() {
+        // Flow declares membership in group-1 but is not listed as a member.
+        let mut config = AppConfig::default();
+        config.flows.push(FlowConfig {
+            id: "audio-flow".to_string(),
+            name: "Audio".to_string(),
+            enabled: true,
+            media_analysis: false,
+            thumbnail: false,
+            thumbnail_program_number: None,
+            bandwidth_limit: None,
+            flow_group_id: Some("group-1".to_string()),
+            clock_domain: Some(0),
+            input: InputConfig::St2110_30(st2110_30_input("239.10.10.1:5004")),
+            outputs: vec![],
+        });
+        config.flow_groups.push(FlowGroupConfig {
+            id: "group-1".to_string(),
+            name: "Group 1".to_string(),
+            clock_domain: Some(0),
+            flows: vec!["something-else".to_string()],
+        });
+        config.flows.push(FlowConfig {
+            id: "something-else".to_string(),
+            name: "Other".to_string(),
+            enabled: true,
+            media_analysis: false,
+            thumbnail: false,
+            thumbnail_program_number: None,
+            bandwidth_limit: None,
+            flow_group_id: None,
+            clock_domain: None,
+            input: InputConfig::St2110_30(st2110_30_input("239.10.10.2:5004")),
+            outputs: vec![],
+        });
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_flow_group_round_trip_ok() {
+        let mut config = AppConfig::default();
+        config.flows.push(FlowConfig {
+            id: "audio-flow".to_string(),
+            name: "Audio".to_string(),
+            enabled: true,
+            media_analysis: false,
+            thumbnail: false,
+            thumbnail_program_number: None,
+            bandwidth_limit: None,
+            flow_group_id: Some("group-1".to_string()),
+            clock_domain: Some(0),
+            input: InputConfig::St2110_30(st2110_30_input("239.10.10.1:5004")),
+            outputs: vec![],
+        });
+        config.flow_groups.push(FlowGroupConfig {
+            id: "group-1".to_string(),
+            name: "Group 1".to_string(),
+            clock_domain: Some(0),
+            flows: vec!["audio-flow".to_string()],
+        });
+        validate_config(&config).expect("valid flow-group config");
+    }
+
+    /// The manager wire format uses `flow_ids` for the membership list
+    /// (matching the manager's REST/DB column name `essences` historically).
+    /// The edge accepts both `flow_ids` and `flows` as input via a serde
+    /// alias on `FlowGroupConfig.flows` so the WS commands `add_flow_group` /
+    /// `update_flow_group` deserialize correctly. Persisted output always
+    /// uses the canonical `flows` field.
+    #[test]
+    fn test_flow_group_accepts_flow_ids_alias() {
+        let json = serde_json::json!({
+            "id": "main-bundle",
+            "name": "Main bundle",
+            "clock_domain": 0,
+            "flow_ids": ["audio-flow", "anc-flow"]
+        });
+        let group: FlowGroupConfig = serde_json::from_value(json).expect("flow_ids alias accepted");
+        assert_eq!(group.id, "main-bundle");
+        assert_eq!(group.flows, vec!["audio-flow".to_string(), "anc-flow".to_string()]);
+        // And the canonical field name still works.
+        let json2 = serde_json::json!({
+            "id": "alt",
+            "name": "Alt",
+            "flows": ["x"]
+        });
+        let group2: FlowGroupConfig = serde_json::from_value(json2).expect("flows accepted");
+        assert_eq!(group2.flows, vec!["x".to_string()]);
+    }
+
+    /// Existing testbed configs (SRT/RTP/RTMP/etc) must continue to deserialize
+    /// and validate unchanged after the ST 2110 additions. This is the
+    /// regression guard called out in the Phase 1 plan, step 1.
+    #[test]
+    fn test_existing_testbed_configs_still_load() {
+        use std::fs;
+        let testbed_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("testbed")
+            .join("configs");
+        if !testbed_dir.exists() {
+            // Tolerate running outside the monorepo (CI / standalone clones).
+            return;
+        }
+        let mut checked = 0usize;
+        for entry in fs::read_dir(&testbed_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            // Edge configs only — skip the relay config which has a different shape.
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name == "relay.json" {
+                continue;
+            }
+            let raw = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            // Deserialize must succeed unchanged with the new optional fields.
+            let cfg: AppConfig = serde_json::from_str(&raw)
+                .unwrap_or_else(|e| panic!("deserialize {}: {e}", path.display()));
+            // Loading must validate cleanly — the new ST 2110 additions should
+            // not introduce false positives on pre-existing configs.
+            validate_config(&cfg)
+                .unwrap_or_else(|e| panic!("validate {}: {e}", path.display()));
+            checked += 1;
+        }
+        assert!(checked > 0, "no testbed configs were checked");
     }
 }

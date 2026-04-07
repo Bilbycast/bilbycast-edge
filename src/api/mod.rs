@@ -16,6 +16,8 @@ pub mod flows;
 pub mod models;
 pub mod nmos;
 pub mod nmos_is05;
+pub mod nmos_is08;
+pub mod nmos_mdns;
 pub mod server;
 pub mod stats;
 pub mod tunnels;

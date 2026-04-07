@@ -13,7 +13,6 @@
 //! elementary stream headers (H.264 SPS, H.265 SPS, AAC ADTS). All
 //! parsing is pure Rust with zero external C dependencies.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::models::*;
 use crate::stats::collector::{
-    AudioStreamState, MediaAnalysisAccumulator, MediaAnalysisState, VideoStreamState,
+    AudioStreamState, MediaAnalysisAccumulator, MediaAnalysisState, ProgramState, VideoStreamState,
 };
 
 use super::packet::RtpPacket;
@@ -95,6 +94,26 @@ fn populate_transport_info(config: &FlowConfig, state: &mut MediaAnalysisState) 
             state.protocol = "whep".to_string();
             state.payload_format = "rtp_h264".to_string();
         }
+        InputConfig::St2110_30(_) => {
+            state.protocol = "st2110_30".to_string();
+            state.payload_format = "pcm_l24".to_string();
+        }
+        InputConfig::St2110_31(_) => {
+            state.protocol = "st2110_31".to_string();
+            state.payload_format = "aes3".to_string();
+        }
+        InputConfig::St2110_40(_) => {
+            state.protocol = "st2110_40".to_string();
+            state.payload_format = "anc".to_string();
+        }
+        InputConfig::RtpAudio(c) => {
+            state.protocol = "rtp_audio".to_string();
+            state.payload_format = if c.bit_depth == 16 {
+                "pcm_l16".to_string()
+            } else {
+                "pcm_l24".to_string()
+            };
+        }
     }
 }
 
@@ -111,7 +130,6 @@ async fn media_analyzer_loop(
     bitrate_interval.tick().await; // consume first immediate tick
 
     // Local parsing state (not shared — only accessed by this task)
-    let mut pmt_pids: HashMap<u16, ()> = HashMap::new();
     let mut payload_format_detected = false;
 
     loop {
@@ -131,7 +149,6 @@ async fn media_analyzer_loop(
                         process_packet(
                             &packet,
                             &stats,
-                            &mut pmt_pids,
                             &mut payload_format_detected,
                         );
                     }
@@ -176,7 +193,6 @@ fn calculate_bitrates(stats: &MediaAnalysisAccumulator) {
 fn process_packet(
     packet: &RtpPacket,
     stats: &MediaAnalysisAccumulator,
-    pmt_pids: &mut HashMap<u16, ()>,
     payload_format_detected: &mut bool,
 ) {
     let payload = strip_rtp_header(packet);
@@ -201,16 +217,12 @@ fn process_packet(
     let mut offset = 0;
     while offset + TS_PACKET_SIZE <= payload.len() {
         let ts_pkt = &payload[offset..offset + TS_PACKET_SIZE];
-        process_ts_packet(ts_pkt, &mut state, pmt_pids);
+        process_ts_packet(ts_pkt, &mut state);
         offset += TS_PACKET_SIZE;
     }
 }
 
-fn process_ts_packet(
-    pkt: &[u8],
-    state: &mut MediaAnalysisState,
-    pmt_pids: &mut HashMap<u16, ()>,
-) {
+fn process_ts_packet(pkt: &[u8], state: &mut MediaAnalysisState) {
     if pkt[0] != TS_SYNC_BYTE {
         return;
     }
@@ -220,31 +232,63 @@ fn process_ts_packet(
     // Count bytes per PID for bitrate estimation
     *state.pid_bytes.entry(pid).or_insert(0) += TS_PACKET_SIZE as u64;
 
-    // PAT handling
+    // PAT handling — reconcile programs list with the PAT contents.
     if pid == PAT_PID && ts_pusi(pkt) {
-        let found_pids = parse_pat_pmt_pids(pkt);
-        state.program_count = found_pids.len() as u16;
-        pmt_pids.clear();
-        for p in found_pids {
-            pmt_pids.insert(p, ());
+        let found = parse_pat_programs(pkt);
+        // Drop programs no longer in the PAT
+        state
+            .programs
+            .retain(|p| found.iter().any(|(pn, _)| *pn == p.program_number));
+        // Update PMT PIDs and append new programs (preserve detection state across PAT bumps)
+        for (program_number, pmt_pid) in &found {
+            if let Some(existing) = state
+                .programs
+                .iter_mut()
+                .find(|p| p.program_number == *program_number)
+            {
+                if existing.pmt_pid != *pmt_pid {
+                    existing.pmt_pid = *pmt_pid;
+                    // PMT PID changed — force a re-parse next PMT seen
+                    existing.last_pmt_version = None;
+                }
+            } else {
+                state.programs.push(ProgramState {
+                    program_number: *program_number,
+                    pmt_pid: *pmt_pid,
+                    last_pmt_version: None,
+                    video_streams: Vec::new(),
+                    audio_streams: Vec::new(),
+                });
+            }
+        }
+        // Sort by program_number for stable UI ordering
+        state.programs.sort_by_key(|p| p.program_number);
+    }
+
+    // PMT handling — find the program owning this PID and update its streams.
+    if ts_pusi(pkt) {
+        if let Some(program_idx) = state.programs.iter().position(|p| p.pmt_pid == pid) {
+            parse_pmt_streams(pkt, &mut state.programs[program_idx]);
         }
     }
 
-    // PMT handling
-    if pmt_pids.contains_key(&pid) && ts_pusi(pkt) {
-        parse_pmt_streams(pkt, state);
-    }
-
     // PES header detection for codec detail extraction
-    if ts_pusi(pkt) && ts_has_payload(pkt) && pid != PAT_PID && !pmt_pids.contains_key(&pid) {
+    if ts_pusi(pkt) && ts_has_payload(pkt) && pid != PAT_PID {
+        let is_pmt_pid = state.programs.iter().any(|p| p.pmt_pid == pid);
+        if is_pmt_pid {
+            return;
+        }
+
         // Check if this PID is a known video stream that needs SPS detection
         let needs_video_parse = state
-            .video_streams
+            .programs
             .iter()
+            .flat_map(|p| p.video_streams.iter())
             .any(|v| v.pid == pid && !v.sps_detected);
         let needs_audio_parse = state
-            .audio_streams
+            .programs
             .iter()
+            .flat_map(|p| p.audio_streams.iter())
             .any(|a| a.pid == pid && !a.header_detected);
 
         if needs_video_parse {
@@ -258,8 +302,8 @@ fn process_ts_packet(
 
 // ── PMT Stream Extraction ────────────────────────────────────────────────
 
-/// Parse a PMT section to extract all elementary stream entries.
-fn parse_pmt_streams(pkt: &[u8], state: &mut MediaAnalysisState) {
+/// Parse a PMT section to extract all elementary stream entries for one program.
+fn parse_pmt_streams(pkt: &[u8], program: &mut ProgramState) {
     let mut offset = 4;
     if ts_has_adaptation(pkt) {
         let af_len = pkt[4] as usize;
@@ -285,10 +329,10 @@ fn parse_pmt_streams(pkt: &[u8], state: &mut MediaAnalysisState) {
 
     // Check PMT version — skip re-parsing if unchanged
     let version = (pkt[offset + 5] >> 1) & 0x1F;
-    if state.last_pmt_version == Some(version) {
+    if program.last_pmt_version == Some(version) {
         return;
     }
-    state.last_pmt_version = Some(version);
+    program.last_pmt_version = Some(version);
 
     let program_info_length =
         (((pkt[offset + 10] & 0x0F) as usize) << 8) | (pkt[offset + 11] as usize);
@@ -299,8 +343,8 @@ fn parse_pmt_streams(pkt: &[u8], state: &mut MediaAnalysisState) {
         .saturating_sub(4);
 
     // Clear existing streams and re-populate
-    state.video_streams.clear();
-    state.audio_streams.clear();
+    program.video_streams.clear();
+    program.audio_streams.clear();
 
     let mut pos = data_start;
     while pos + 5 <= data_end {
@@ -317,7 +361,7 @@ fn parse_pmt_streams(pkt: &[u8], state: &mut MediaAnalysisState) {
         match stream_type {
             // Video stream types
             0x1B => {
-                state.video_streams.push(VideoStreamState {
+                program.video_streams.push(VideoStreamState {
                     pid: es_pid,
                     codec: "H.264/AVC".to_string(),
                     stream_type,
@@ -330,7 +374,7 @@ fn parse_pmt_streams(pkt: &[u8], state: &mut MediaAnalysisState) {
                 });
             }
             0x24 => {
-                state.video_streams.push(VideoStreamState {
+                program.video_streams.push(VideoStreamState {
                     pid: es_pid,
                     codec: "H.265/HEVC".to_string(),
                     stream_type,
@@ -343,7 +387,7 @@ fn parse_pmt_streams(pkt: &[u8], state: &mut MediaAnalysisState) {
                 });
             }
             0x61 => {
-                state.video_streams.push(VideoStreamState {
+                program.video_streams.push(VideoStreamState {
                     pid: es_pid,
                     codec: "JPEG XS".to_string(),
                     stream_type,
@@ -356,7 +400,7 @@ fn parse_pmt_streams(pkt: &[u8], state: &mut MediaAnalysisState) {
                 });
             }
             0x01 | 0x02 => {
-                state.video_streams.push(VideoStreamState {
+                program.video_streams.push(VideoStreamState {
                     pid: es_pid,
                     codec: if stream_type == 0x01 {
                         "MPEG-1 Video".to_string()
@@ -374,7 +418,7 @@ fn parse_pmt_streams(pkt: &[u8], state: &mut MediaAnalysisState) {
             }
             // Audio stream types
             0x03 | 0x04 => {
-                state.audio_streams.push(AudioStreamState {
+                program.audio_streams.push(AudioStreamState {
                     pid: es_pid,
                     codec: "MPEG Audio".to_string(),
                     stream_type,
@@ -385,7 +429,7 @@ fn parse_pmt_streams(pkt: &[u8], state: &mut MediaAnalysisState) {
                 });
             }
             0x0F => {
-                state.audio_streams.push(AudioStreamState {
+                program.audio_streams.push(AudioStreamState {
                     pid: es_pid,
                     codec: "AAC".to_string(),
                     stream_type,
@@ -396,7 +440,7 @@ fn parse_pmt_streams(pkt: &[u8], state: &mut MediaAnalysisState) {
                 });
             }
             0x11 => {
-                state.audio_streams.push(AudioStreamState {
+                program.audio_streams.push(AudioStreamState {
                     pid: es_pid,
                     codec: "AAC-LATM".to_string(),
                     stream_type,
@@ -407,7 +451,7 @@ fn parse_pmt_streams(pkt: &[u8], state: &mut MediaAnalysisState) {
                 });
             }
             0x81 => {
-                state.audio_streams.push(AudioStreamState {
+                program.audio_streams.push(AudioStreamState {
                     pid: es_pid,
                     codec: "AC-3".to_string(),
                     stream_type,
@@ -418,7 +462,7 @@ fn parse_pmt_streams(pkt: &[u8], state: &mut MediaAnalysisState) {
                 });
             }
             0x87 => {
-                state.audio_streams.push(AudioStreamState {
+                program.audio_streams.push(AudioStreamState {
                     pid: es_pid,
                     codec: "E-AC-3".to_string(),
                     stream_type,
@@ -432,7 +476,7 @@ fn parse_pmt_streams(pkt: &[u8], state: &mut MediaAnalysisState) {
                 // Private data — check descriptors for AC-3/E-AC-3
                 let codec = detect_private_stream_codec(&pkt[desc_start..desc_end]);
                 if let Some(codec_name) = codec {
-                    state.audio_streams.push(AudioStreamState {
+                    program.audio_streams.push(AudioStreamState {
                         pid: es_pid,
                         codec: codec_name,
                         stream_type,
@@ -449,36 +493,32 @@ fn parse_pmt_streams(pkt: &[u8], state: &mut MediaAnalysisState) {
         pos += 5 + es_info_length;
     }
 
-    if !state.detected {
-        state.detected = true;
-        let video_count = state.video_streams.len();
-        let audio_count = state.audio_streams.len();
+    tracing::info!(
+        "Media analysis: program {} (PMT 0x{:04X}): {} video stream(s), {} audio stream(s)",
+        program.program_number,
+        program.pmt_pid,
+        program.video_streams.len(),
+        program.audio_streams.len(),
+    );
+    for v in &program.video_streams {
         tracing::info!(
-            "Media analysis: detected {} program(s), {} video stream(s), {} audio stream(s)",
-            state.program_count,
-            video_count,
-            audio_count,
+            "  Video PID 0x{:04X}: {} (stream_type=0x{:02X})",
+            v.pid,
+            v.codec,
+            v.stream_type,
         );
-        for v in &state.video_streams {
-            tracing::info!(
-                "  Video PID 0x{:04X}: {} (stream_type=0x{:02X})",
-                v.pid,
-                v.codec,
-                v.stream_type,
-            );
-        }
-        for a in &state.audio_streams {
-            tracing::info!(
-                "  Audio PID 0x{:04X}: {} (stream_type=0x{:02X}){}",
-                a.pid,
-                a.codec,
-                a.stream_type,
-                a.language
-                    .as_ref()
-                    .map(|l| format!(" [{}]", l))
-                    .unwrap_or_default(),
-            );
-        }
+    }
+    for a in &program.audio_streams {
+        tracing::info!(
+            "  Audio PID 0x{:04X}: {} (stream_type=0x{:02X}){}",
+            a.pid,
+            a.codec,
+            a.stream_type,
+            a.language
+                .as_ref()
+                .map(|l| format!(" [{}]", l))
+                .unwrap_or_default(),
+        );
     }
 }
 
@@ -564,10 +604,15 @@ fn try_parse_video_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
     }
     let es_data = &payload[es_start..];
 
-    // Determine codec from stream state
-    let stream = state.video_streams.iter().find(|v| v.pid == pid);
-    let stream_type = match stream {
-        Some(v) => v.stream_type,
+    // Determine codec from stream state (search across all programs)
+    let stream_type = state
+        .programs
+        .iter()
+        .flat_map(|p| p.video_streams.iter())
+        .find(|v| v.pid == pid)
+        .map(|v| v.stream_type);
+    let stream_type = match stream_type {
+        Some(t) => t,
         None => return,
     };
 
@@ -587,7 +632,11 @@ fn try_parse_video_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
                     sps_info.profile,
                     sps_info.level,
                 );
-                if let Some(v) = state.video_streams.iter_mut().find(|v| v.pid == pid) {
+                if let Some(v) = state
+                    .programs
+                    .iter_mut()
+                    .find_map(|p| p.video_streams.iter_mut().find(|v| v.pid == pid))
+                {
                     v.width = Some(sps_info.width);
                     v.height = Some(sps_info.height);
                     v.frame_rate = sps_info.frame_rate;
@@ -612,7 +661,11 @@ fn try_parse_video_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
                     sps_info.profile,
                     sps_info.level,
                 );
-                if let Some(v) = state.video_streams.iter_mut().find(|v| v.pid == pid) {
+                if let Some(v) = state
+                    .programs
+                    .iter_mut()
+                    .find_map(|p| p.video_streams.iter_mut().find(|v| v.pid == pid))
+                {
                     v.width = Some(sps_info.width);
                     v.height = Some(sps_info.height);
                     v.frame_rate = sps_info.frame_rate;
@@ -650,7 +703,11 @@ fn try_parse_audio_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
     // Try ADTS header detection (AAC)
     if es_data.len() >= 7 && es_data[0] == 0xFF && (es_data[1] & 0xF0) == 0xF0 {
         if let Some(adts) = parse_adts_header(es_data) {
-            if let Some(a) = state.audio_streams.iter_mut().find(|a| a.pid == pid) {
+            if let Some(a) = state
+                .programs
+                .iter_mut()
+                .find_map(|p| p.audio_streams.iter_mut().find(|a| a.pid == pid))
+            {
                 a.sample_rate_hz = Some(adts.sample_rate);
                 a.channels = Some(adts.channels);
                 a.codec = adts.profile_name;

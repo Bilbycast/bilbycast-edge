@@ -49,6 +49,14 @@ pub struct TsMuxer {
     has_audio: bool,
     /// Video stream type for PMT (H.264=0x1B, H.265=0x24).
     video_stream_type: u8,
+    /// Audio stream type for PMT (default: AAC = 0x0F). Override to 0x06
+    /// for SMPTE 302M private PES, or other ISO/IEC 13818-1 stream_type
+    /// values.
+    audio_stream_type: u8,
+    /// Optional 4-byte registration descriptor format_identifier for the
+    /// audio elementary stream. Set to `Some(*b"BSSD")` for SMPTE 302M
+    /// LPCM. When `None`, no registration descriptor is written.
+    audio_registration: Option<[u8; 4]>,
     /// Frame counter for periodic PAT/PMT emission.
     /// Counts across both video and audio frames.
     pat_pmt_counter: u32,
@@ -66,6 +74,8 @@ impl TsMuxer {
             has_video: true,
             has_audio: false,
             video_stream_type: STREAM_TYPE_H264,
+            audio_stream_type: STREAM_TYPE_AAC,
+            audio_registration: None,
             pat_pmt_counter: 0,
             pat_pmt_sent: false,
         }
@@ -85,6 +95,19 @@ impl TsMuxer {
     /// Use `0x24` for H.265/HEVC.
     pub fn set_video_stream_type(&mut self, stream_type: u8) {
         self.video_stream_type = stream_type;
+    }
+
+    /// Set the audio elementary stream type and optional registration
+    /// descriptor format_identifier. For SMPTE 302M:
+    ///
+    /// ```ignore
+    /// muxer.set_audio_stream(0x06, Some(*b"BSSD"));
+    /// ```
+    ///
+    /// Default is AAC (`0x0F`, no registration descriptor).
+    pub fn set_audio_stream(&mut self, stream_type: u8, registration: Option<[u8; 4]>) {
+        self.audio_stream_type = stream_type;
+        self.audio_registration = registration;
     }
 
     /// Emit PAT and PMT packets if needed.
@@ -299,11 +322,14 @@ impl TsMuxer {
         let pmt_start = 5;
         pkt[pmt_start] = 0x02; // table_id = 2 (PMT)
 
-        // Calculate section length: 5 bytes per stream entry
-        let streams_len = (if self.has_video { 5 } else { 0 }) + (if self.has_audio { 5 } else { 0 });
-        // section_length includes: program_number(2) + reserved/version(1) + section_number(1) + last_section(1)
-        // + reserved/PCR_PID(2) + reserved/program_info_length(2) + streams + CRC32(4)
-        let section_length = 9 + streams_len as u16 + 4; // +4 for CRC
+        // Per-ES descriptor sizes (registration descriptor is 6 bytes:
+        // tag(1) + len(1) + format_identifier(4)).
+        let audio_desc_len = if self.audio_registration.is_some() { 6 } else { 0 };
+        // 5 bytes per stream entry header + per-stream descriptor bytes.
+        let streams_len = (if self.has_video { 5 } else { 0 })
+            + (if self.has_audio { 5 + audio_desc_len } else { 0 });
+        // section_length covers everything from program_number through CRC.
+        let section_length = 9 + streams_len as u16 + 4;
 
         pkt[pmt_start + 1] = 0xB0 | ((section_length >> 8) as u8 & 0x0F);
         pkt[pmt_start + 2] = section_length as u8;
@@ -331,14 +357,25 @@ impl TsMuxer {
             pos += 5;
         }
 
-        // Audio stream entry: AAC
+        // Audio stream entry. The stream type is configurable (default AAC,
+        // 0x06 for SMPTE 302M private PES). When `audio_registration` is set,
+        // a 6-byte registration descriptor is written into ES_info.
         if self.has_audio {
-            pkt[pos] = STREAM_TYPE_AAC;
+            pkt[pos] = self.audio_stream_type;
             pkt[pos + 1] = 0xE0 | ((AUDIO_PID >> 8) as u8 & 0x1F);
             pkt[pos + 2] = AUDIO_PID as u8;
-            pkt[pos + 3] = 0xF0;
-            pkt[pos + 4] = 0x00;
+            pkt[pos + 3] = 0xF0 | ((audio_desc_len >> 8) as u8 & 0x0F);
+            pkt[pos + 4] = audio_desc_len as u8;
             pos += 5;
+            if let Some(reg) = self.audio_registration {
+                pkt[pos] = 0x05; // descriptor_tag = registration_descriptor
+                pkt[pos + 1] = 0x04; // descriptor_length
+                pkt[pos + 2] = reg[0];
+                pkt[pos + 3] = reg[1];
+                pkt[pos + 4] = reg[2];
+                pkt[pos + 5] = reg[3];
+                pos += 6;
+            }
         }
 
         // CRC32
@@ -352,6 +389,26 @@ impl TsMuxer {
         }
 
         pkt
+    }
+
+    /// Mux a private-PES audio payload (e.g., SMPTE 302M LPCM) into TS
+    /// packets on the audio PID. Uses PES `stream_id = 0xBD`
+    /// (private_stream_1). The caller supplies a complete PES payload — for
+    /// 302M, that's a `S302mPacketizer::packetize_f32(...)` result.
+    ///
+    /// `pts_90khz` is the presentation timestamp in 90 kHz ticks. PCR is
+    /// emitted on the audio PID (since this path is normally audio-only —
+    /// `has_video` should be `false`).
+    pub fn mux_private_audio(
+        &mut self,
+        pes_payload: &[u8],
+        pts_90khz: u64,
+    ) -> Vec<Bytes> {
+        let mut packets = self.maybe_emit_pat_pmt(false);
+        let pes = build_pes_packet(0xBD, pes_payload, pts_90khz, None);
+        // Audio-only TS: PCR rides the audio PID.
+        packets.extend(self.packetize(AUDIO_PID, &pes, true, !self.has_video, Some(pts_90khz)));
+        packets
     }
 }
 
@@ -491,5 +548,59 @@ mod tests {
         assert_eq!(adts.len(), 9); // 7 header + 2 data
         assert_eq!(adts[0], 0xFF);
         assert_eq!(adts[1] & 0xF0, 0xF0);
+    }
+
+    #[test]
+    fn test_pmt_with_smpte_302m_registration_descriptor() {
+        let mut muxer = TsMuxer::new();
+        muxer.set_has_video(false);
+        muxer.set_has_audio(true);
+        muxer.set_audio_stream(0x06, Some(*b"BSSD"));
+        let pmt = muxer.build_pmt();
+        assert_eq!(pmt.len(), TS_PACKET_SIZE);
+        assert_eq!(pmt[0], TS_SYNC_BYTE);
+        // PMT section starts at byte 5 (sync + 3 + pointer field)
+        // table_id at pmt_start = byte 5
+        assert_eq!(pmt[5], 0x02);
+        // Walk to the audio ES entry. With no video, the entry sits right
+        // after the 12-byte fixed PMT prologue at pmt_start + 12 = 17.
+        let es_start = 5 + 12;
+        assert_eq!(pmt[es_start], 0x06, "stream_type should be 0x06 (private PES)");
+        let es_info_len = ((pmt[es_start + 3] & 0x0F) as usize) << 8 | pmt[es_start + 4] as usize;
+        assert_eq!(es_info_len, 6, "ES_info_length should be 6 (registration descriptor)");
+        // Registration descriptor: tag 0x05, length 0x04, "BSSD"
+        assert_eq!(pmt[es_start + 5], 0x05);
+        assert_eq!(pmt[es_start + 6], 0x04);
+        assert_eq!(&pmt[es_start + 7..es_start + 11], b"BSSD");
+    }
+
+    #[test]
+    fn test_pmt_default_audio_aac_no_registration() {
+        let mut muxer = TsMuxer::new();
+        muxer.set_has_video(false);
+        muxer.set_has_audio(true);
+        // Don't override audio_stream — should default to AAC, no registration descriptor.
+        let pmt = muxer.build_pmt();
+        let es_start = 5 + 12;
+        assert_eq!(pmt[es_start], 0x0F);
+        let es_info_len = ((pmt[es_start + 3] & 0x0F) as usize) << 8 | pmt[es_start + 4] as usize;
+        assert_eq!(es_info_len, 0);
+    }
+
+    #[test]
+    fn test_mux_private_audio_emits_at_least_one_ts_packet() {
+        let mut muxer = TsMuxer::new();
+        muxer.set_has_video(false);
+        muxer.set_has_audio(true);
+        muxer.set_audio_stream(0x06, Some(*b"BSSD"));
+        // 64 bytes of dummy 302M-style PES payload.
+        let payload = vec![0u8; 64];
+        let ts = muxer.mux_private_audio(&payload, 90_000);
+        assert!(!ts.is_empty());
+        // First two should be PAT and PMT, then one or more 188-byte TS packets.
+        for pkt in &ts {
+            assert_eq!(pkt.len(), TS_PACKET_SIZE);
+            assert_eq!(pkt[0], TS_SYNC_BYTE);
+        }
     }
 }

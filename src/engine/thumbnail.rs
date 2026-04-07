@@ -42,6 +42,7 @@ use crate::stats::collector::ThumbnailAccumulator;
 
 use super::packet::RtpPacket;
 use super::ts_parse::strip_rtp_header;
+use super::ts_program_filter::TsProgramFilter;
 
 /// How often to generate a thumbnail (seconds).
 const THUMBNAIL_INTERVAL: Duration = Duration::from_secs(10);
@@ -71,13 +72,19 @@ const BLACK_DETECT_TIMEOUT: Duration = Duration::from_secs(3);
 // ── Public API ───────────────────────────────────────────────────────────
 
 /// Spawn the thumbnail generator as an independent broadcast subscriber.
+///
+/// `program_number` selects which MPEG-TS program to render when the input
+/// is an MPTS. `None` keeps the current behaviour (raw TS to ffmpeg, which
+/// picks the first program); `Some(N)` runs the buffered TS through a
+/// `TsProgramFilter` so ffmpeg only sees the elementary streams of program N.
 pub fn spawn_thumbnail_generator(
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     stats: Arc<ThumbnailAccumulator>,
     cancel: CancellationToken,
+    program_number: Option<u16>,
 ) -> JoinHandle<()> {
     let rx = broadcast_tx.subscribe();
-    tokio::spawn(thumbnail_loop(rx, stats, cancel))
+    tokio::spawn(thumbnail_loop(rx, stats, cancel, program_number))
 }
 
 /// Check whether ffmpeg is available on this system.
@@ -97,8 +104,13 @@ async fn thumbnail_loop(
     mut rx: broadcast::Receiver<RtpPacket>,
     stats: Arc<ThumbnailAccumulator>,
     cancel: CancellationToken,
+    program_number: Option<u16>,
 ) {
-    tracing::info!("Thumbnail generator started");
+    if let Some(n) = program_number {
+        tracing::info!("Thumbnail generator started (program filter target = {})", n);
+    } else {
+        tracing::info!("Thumbnail generator started");
+    }
 
     let mut interval = tokio::time::interval(THUMBNAIL_INTERVAL);
     interval.tick().await; // consume first immediate tick
@@ -106,6 +118,8 @@ async fn thumbnail_loop(
     // Ring buffer of recent TS packet data
     let mut ts_buffer: VecDeque<Bytes> = VecDeque::new();
     let mut buffer_bytes: usize = 0;
+    let mut program_filter = program_number.map(TsProgramFilter::new);
+    let mut filter_scratch: Vec<u8> = Vec::new();
 
     loop {
         tokio::select! {
@@ -116,8 +130,22 @@ async fn thumbnail_loop(
 
             _ = interval.tick() => {
                 if buffer_bytes > 0 {
-                    // Collect buffered TS data and generate thumbnail
-                    let ts_data = collect_buffer(&ts_buffer);
+                    // Collect buffered TS data and generate thumbnail.
+                    // When a program filter is set, run the buffer through
+                    // it first so ffmpeg only sees the selected program.
+                    let raw_ts = collect_buffer(&ts_buffer);
+                    let ts_data: Bytes = if let Some(ref mut filter) = program_filter {
+                        filter_scratch.clear();
+                        filter.filter_into(&raw_ts, &mut filter_scratch);
+                        if filter_scratch.is_empty() {
+                            // Selected program isn't in this buffer window —
+                            // wait for the next tick.
+                            continue;
+                        }
+                        Bytes::copy_from_slice(&filter_scratch)
+                    } else {
+                        raw_ts
+                    };
                     match generate_thumbnail(&ts_data).await {
                         Ok(jpeg) => {
                             tracing::debug!(

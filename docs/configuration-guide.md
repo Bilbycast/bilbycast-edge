@@ -29,6 +29,14 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
   - [RTMP Output](#rtmp-output)
   - [HLS Output](#hls-output)
   - [WebRTC Output](#webrtc-output)
+- **SMPTE ST 2110 audio + ANC** — see the dedicated section near the
+  end of this guide and the deep-dive in
+  [`audio-gateway.md`](audio-gateway.md). Covers ST 2110-30/-31 audio,
+  ST 2110-40 ANC, the per-output `transcode` block (sample rate / bit
+  depth / channel routing), the `rtp_audio` no-PTP variant, and SMPTE
+  302M LPCM-in-MPEG-TS over SRT / UDP / RTP-MP2T (`transport_mode:
+  "audio_302m"`).
+- [MPTS → SPTS filtering](#mpts--spts-filtering)
 - [SMPTE 2022-1 FEC Configuration](#smpte-2022-1-fec-configuration)
 - [SMPTE 2022-7 SRT Redundancy](#smpte-2022-7-srt-redundancy)
 - [SRT Connection Modes](#srt-connection-modes)
@@ -415,6 +423,7 @@ Each flow defines one input source fanning out to one or more output destination
 | `enabled` | boolean | No | `true` | Whether to auto-start this flow on startup or creation. |
 | `media_analysis` | boolean | No | `true` | Enable media content analysis (codec, resolution, frame rate detection). |
 | `thumbnail` | boolean | No | `true` | Enable thumbnail generation (requires ffmpeg). |
+| `thumbnail_program_number` | integer | No | `null` | When the input is an MPTS, render the thumbnail from this MPEG-TS program only. `null` lets ffmpeg pick the first program it finds. Must be `> 0` if set. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 | `bandwidth_limit` | object | No | `null` | Per-flow bandwidth monitoring (RP 2129). See [Bandwidth Limit](#bandwidth-limit). |
 | `input` | object | Yes | - | Input source configuration (RTP, UDP, SRT, RTMP, RTSP, WebRTC, or WHEP). |
 | `outputs` | array | Yes | - | Output destination configurations. Can be empty. Output IDs must be unique within the flow. |
@@ -667,11 +676,13 @@ Sends RTP-wrapped MPEG-TS packets to a unicast or multicast destination. Support
 | `interface_addr` | string | No | `null` | Network interface IP for multicast send. Must be same address family as `dest_addr`. |
 | `fec_encode` | object | No | `null` | SMPTE 2022-1 FEC encode parameters. See [FEC Configuration](#smpte-2022-1-fec-configuration). |
 | `dscp` | integer | No | `46` | DSCP value for QoS marking (RP 2129 C10). Range 0-63. Default 46 = Expedited Forwarding (RFC 4594). |
+| `program_number` | integer | No | `null` | MPTS → SPTS program filter. `null` = full MPTS passthrough; `Some(N)` = forward only program N as a rewritten single-program TS. Applied before FEC, so the receiver's FEC protects the filtered SPTS. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 
 **Validation rules:**
 - `id` cannot be empty.
 - `dest_addr`, `bind_addr`, and `interface_addr` must all use the same address family.
 - `dscp` must be 0-63.
+- `program_number` must be `> 0` if set (program_number 0 is reserved for the NIT).
 
 ### UDP Output
 
@@ -696,11 +707,13 @@ Sends raw MPEG-TS over UDP without RTP headers. Datagrams are TS-aligned (7×188
 | `bind_addr` | string | No | `"0.0.0.0:0"` | Source bind address. Must be same address family as `dest_addr`. |
 | `interface_addr` | string | No | `null` | Network interface IP for multicast send. |
 | `dscp` | integer | No | `46` | DSCP value for QoS marking. Range 0-63. |
+| `program_number` | integer | No | `null` | MPTS → SPTS program filter. `null` = full MPTS passthrough; `Some(N)` = forward only program N as a rewritten single-program TS. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 
 **Validation rules:**
 - `id` cannot be empty.
 - `dest_addr` must be a valid socket address.
 - `dscp` must be 0-63.
+- `program_number` must be `> 0` if set.
 
 ### SRT Output
 
@@ -741,6 +754,7 @@ Sends RTP encapsulated in SRT.
 | `aes_key_len` | integer | No | `16` | AES key length: 16, 24, or 32. |
 | `crypto_mode` | string | No | `null` | Cipher mode: `"aes-ctr"` (default) or `"aes-gcm"`. |
 | `redundancy` | object | No | `null` | SMPTE 2022-7 redundancy for a second SRT output leg. |
+| `program_number` | integer | No | `null` | MPTS → SPTS program filter. `null` = full MPTS passthrough; `Some(N)` = forward only program N as a rewritten single-program TS. Applied once and mirrored to both legs when 2022-7 is enabled. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 
 ### RTMP Output
 
@@ -767,6 +781,7 @@ Publishes to an RTMP/RTMPS server (e.g., Twitch, YouTube Live, Facebook Live). D
 | `stream_key` | string | Yes | - | Stream key for authentication with the RTMP server. Cannot be empty. |
 | `reconnect_delay_secs` | integer | No | `5` | Seconds to wait before reconnecting after a failure. Must be > 0. |
 | `max_reconnect_attempts` | integer | No | `null` (unlimited) | Maximum reconnection attempts. When `null`, reconnects indefinitely. |
+| `program_number` | integer | No | `null` | MPTS program selector. `null` = lock onto the lowest program_number in the PAT (deterministic default); `Some(N)` = extract elementary streams from program N only. RTMP is single-program by spec, so this only changes *which* program is published. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 
 **Limitations:**
 - Output only. RTMP input is not supported.
@@ -797,6 +812,7 @@ Segments MPEG-2 TS data and uploads via HTTP for HLS ingest (e.g., YouTube HLS).
 | `segment_duration_secs` | float | No | `2.0` | Target segment duration in seconds. Range: 0.5-10.0. |
 | `auth_token` | string | No | `null` | Bearer token sent with each HTTP upload request. |
 | `max_segments` | integer | No | `5` | Maximum segments in the rolling playlist. Range: 1-30. |
+| `program_number` | integer | No | `null` | MPTS → SPTS program filter. `null` = each segment carries the full MPTS; `Some(N)` = each segment carries only program N as a rewritten single-program TS. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 
 **Limitations:**
 - Output only. Segment-based transport inherently adds 1-4 seconds of latency.
@@ -844,8 +860,60 @@ Viewers POST an SDP offer to `/api/v1/flows/{flow_id}/whep` and receive an SDP a
 | `max_viewers` | integer | No | `10` | Max concurrent viewers (WHEP server mode only, 1-100). |
 | `public_ip` | string | No | `null` | Public IP for ICE candidates (NAT traversal). |
 | `video_only` | boolean | No | `false` | Only send video (audio omitted). AAC sources automatically fall back to video-only. |
+| `program_number` | integer | No | `null` | MPTS program selector. `null` = lock onto the lowest program_number in the PAT (deterministic default); `Some(N)` = extract elementary streams from program N only. WebRTC is single-program by spec, so this only changes *which* program is sent. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 
 **Audio:** Opus passthrough only. Opus flows natively on WebRTC paths. AAC sources fall back to video-only automatically (no C-library transcoding available).
+
+---
+
+## MPTS → SPTS filtering
+
+All outputs — and the thumbnail generator — accept an optional `program_number` selector for down-selecting an MPTS (Multi-Program Transport Stream) input to a single program. Whether the filter rewrites TS bytes or just picks which elementary streams to extract depends on the output type.
+
+### Behaviour matrix
+
+| Output | `program_number = null` (default) | `program_number = N` |
+|--------|-----------------------------------|----------------------|
+| **UDP / RTP / SRT / HLS** (TS-native) | full MPTS passthrough (current behaviour) | PAT rewritten to a single-program form; only program N's PMT, ES, and PCR PIDs survive. FEC (2022-1) and hitless redundancy (2022-7) operate on the filtered bytes. |
+| **RTMP / WebRTC** (re-muxing) | lock onto the lowest `program_number` in the PAT (deterministic — replaces the old "first PMT seen" race) | extract elementary streams from program N's PMT only |
+| **Thumbnail generator** (`thumbnail_program_number` on `FlowConfig`) | ffmpeg picks the first program it finds | TS is pre-filtered so ffmpeg only sees program N |
+
+### Rules
+
+- **`program_number` is per-output.** One flow can run three outputs in parallel — one forwarding full MPTS to an archive, one filtered to program 1, and another to program 2 — all sharing the same broadcast channel.
+- **`program_number = 0` is rejected** at config load and on manager commands. Program number 0 is reserved for the NIT in the MPEG-TS specification and never identifies a real program.
+- **Disappearing programs** (selected program not in the PAT, or a PAT version bump removes it): the output emits nothing until the program reappears. The filter automatically recovers on the next PAT that re-advertises the target.
+- **SPTS inputs** are unaffected — there's only one program, so `program_number = 1` (or whatever it is) filters to the same stream that was already there.
+
+### Example — 2-program MPTS fanning out to three destinations
+
+```json
+{
+  "id": "mpts-flow",
+  "name": "Dual-program feed",
+  "thumbnail_program_number": 1,
+  "input": { "type": "udp", "bind_addr": "0.0.0.0:5020" },
+  "outputs": [
+    {
+      "type": "udp", "id": "archive", "name": "Archive full MPTS",
+      "dest_addr": "10.0.0.5:6000"
+    },
+    {
+      "type": "udp", "id": "prog1-viewer", "name": "Program 1 → ffplay",
+      "dest_addr": "127.0.0.1:6001",
+      "program_number": 1
+    },
+    {
+      "type": "rtmp", "id": "prog2-rtmp", "name": "Program 2 → CDN",
+      "dest_url": "rtmp://live.example.com/app",
+      "stream_key": "my-key",
+      "program_number": 2
+    }
+  ]
+}
+```
+
+The archive receives the full MPTS. The `prog1-viewer` UDP output sends only program 1 as a rewritten SPTS (PAT lists one entry, program 1's PMT + ES PIDs). The RTMP output publishes program 2's elementary streams. The manager UI thumbnail shows a frame from program 1.
 
 ---
 
@@ -1295,3 +1363,287 @@ Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json
   ]
 }
 ```
+
+## SMPTE ST 2110 (Phase 1)
+
+bilbycast-edge supports the broadcast-audio and broadcast-data subset of
+SMPTE ST 2110: **ST 2110-30** (linear PCM L16/L24), **ST 2110-31** (AES3
+transparent for Dolby E and similar), and **ST 2110-40** (RFC 8331
+ancillary data including SCTE-104, SMPTE 12M timecode, CEA-608/708
+captions). Video essences (ST 2110-22 JPEG XS, ST 2110-20 uncompressed)
+are reserved for Phase 2 and Phase 3.
+
+PTP integration is best-effort and reads from an external `ptp4l`
+daemon's management Unix socket — no PTP daemon ships in the edge. SMPTE
+2022-7 Red/Blue dual-network operation is opt-in via the `redundancy`
+block on each ST 2110 input/output. The full architecture and NIC list
+live in [`docs/st2110.md`](st2110.md); the NMOS surface area
+(IS-04/IS-05/IS-08, BCP-004, mDNS-SD) is documented in
+[`docs/nmos.md`](nmos.md).
+
+### Flow-level fields
+
+| Field | Type | Required | Purpose |
+|-------|------|----------|---------|
+| `clock_domain` | u8 | No | IEEE 1588 PTP domain (0–127). Setting this on a flow makes the edge spawn a `PtpStateReporter` and surface lock state through `FlowStats.ptp_state`. |
+| `flow_group_id` | string | No | Logical bundle id; multiple essence flows on a single edge can share a group so the manager treats them as one unit. |
+
+Both fields are optional and backward-compatible — existing configs
+deserialize unchanged.
+
+### ST 2110-30 / -31 audio input
+
+```json
+{
+  "id": "studio-a-stereo",
+  "name": "Studio A — stereo",
+  "enabled": true,
+  "clock_domain": 0,
+  "input": {
+    "type": "st2110_30",
+    "bind_addr": "239.0.0.10:5000",
+    "interface_addr": "10.0.0.5",
+    "sample_rate": 48000,
+    "bit_depth": 24,
+    "channels": 2,
+    "packet_time_us": 1000,
+    "payload_type": 97,
+    "redundancy": {
+      "addr": "239.1.0.10:5000",
+      "interface_addr": "10.1.0.5"
+    }
+  },
+  "outputs": []
+}
+```
+
+`type: "st2110_31"` uses an identical struct — only the depacketizer
+label changes. AES3 transparency preserves user bits, channel status,
+validity, and parity.
+
+### ST 2110-30 / -31 audio output
+
+```json
+{
+  "type": "st2110_30",
+  "id": "monitor-out",
+  "name": "Loopback to monitor",
+  "dest_addr": "239.2.0.10:5000",
+  "interface_addr": "10.0.0.5",
+  "dscp": 46,
+  "sample_rate": 48000,
+  "bit_depth": 24,
+  "channels": 2,
+  "packet_time_us": 1000,
+  "payload_type": 97,
+  "redundancy": {
+    "addr": "239.3.0.10:5000",
+    "interface_addr": "10.1.0.5"
+  }
+}
+```
+
+#### Optional `transcode` block
+
+Every audio output (`st2110_30`, `st2110_31`, `rtp_audio`) accepts an
+optional `transcode` field for per-output sample-rate / bit-depth /
+channel-routing conversion. The transcoder runs lock-free between the
+broadcast subscriber and the RTP send loop, and is invisible when
+omitted (the existing byte-identical passthrough path runs unchanged).
+
+```json
+{
+  "type": "st2110_30",
+  "id": "monitoring-stereo",
+  "name": "Surround → stereo monitor",
+  "dest_addr": "239.2.0.10:5000",
+  "sample_rate": 48000,
+  "bit_depth": 24,
+  "channels": 2,
+  "packet_time_us": 1000,
+  "payload_type": 97,
+  "transcode": {
+    "channels": 2,
+    "channel_map_preset": "5_1_to_stereo_bs775"
+  }
+}
+```
+
+The full feature set, all six channel-routing presets, IS-08 hot
+reload, validation rules, and worked use cases (monitoring downmix,
+WAN contribution, talkback, third-party SRT decoder interop) live in
+**[`audio-gateway.md`](audio-gateway.md)** — read that for the deep
+dive.
+
+### `rtp_audio` input/output (no PTP, generic PCM/RTP)
+
+`rtp_audio` is wire-identical to ST 2110-30 but with no PTP requirement,
+no NMOS `clock_domain` advertising, and a relaxed sample-rate set
+(32 / 44.1 / 48 / 88.2 / 96 kHz). Use it for radio contribution feeds
+over the public internet, talkback between studios that don't share a
+PTP fabric, and ffmpeg / OBS / GStreamer interop.
+
+```json
+{
+  "id": "perth-receive",
+  "name": "Sydney → Perth contribution receiver",
+  "input": {
+    "type": "rtp_audio",
+    "bind_addr": "0.0.0.0:5004",
+    "sample_rate": 48000,
+    "bit_depth": 24,
+    "channels": 2,
+    "packet_time_us": 4000,
+    "payload_type": 97
+  },
+  "outputs": [
+    {
+      "type": "st2110_30",
+      "id": "perth-monitor",
+      "name": "Perth monitor multicast",
+      "dest_addr": "239.20.0.10:5004",
+      "sample_rate": 44100,
+      "bit_depth": 16,
+      "channels": 2,
+      "packet_time_us": 1000,
+      "payload_type": 97,
+      "transcode": {
+        "sample_rate": 44100,
+        "bit_depth": 16,
+        "channels": 2
+      }
+    }
+  ]
+}
+```
+
+`rtp_audio` outputs share the `transcode` block exactly with ST 2110-30
+outputs and additionally support `transport_mode: "audio_302m"` to
+emit SMPTE 302M LPCM in MPEG-TS wrapped as RFC 2250 RTP/MP2T
+(payload type 33).
+
+### SMPTE 302M LPCM in MPEG-TS over SRT / UDP / RTP-MP2T
+
+SRT, UDP, and `rtp_audio` outputs accept an optional
+`transport_mode: "audio_302m"` field. When set (and the upstream input
+is an audio essence), Bilbycast runs the per-output transcode + 302M
+packetizer + TsMuxer pipeline and emits 7×188-byte MPEG-TS chunks
+over the chosen transport. This is the standard broadcast contribution
+format for lossless audio, interoperable with `ffmpeg -c:a s302m`,
+`srt-live-transmit`, and broadcast hardware decoders that consume
+SMPTE 302M LPCM in MPEG-TS.
+
+Example: send a stereo AES67 feed to a third-party SRT decoder as 302M:
+
+```json
+{
+  "type": "srt",
+  "id": "playout-feed",
+  "name": "Studio → playout decoder",
+  "mode": "caller",
+  "local_addr": "0.0.0.0:0",
+  "remote_addr": "playout-decoder.example.com:9000",
+  "latency_ms": 200,
+  "transport_mode": "audio_302m"
+}
+```
+
+The `audio_302m` mode is mutually exclusive with `packet_filter` (FEC),
+`program_number`, and SMPTE 2022-7 redundancy on SRT — the validator
+rejects all three combinations at config load time. See
+[`audio-gateway.md`](audio-gateway.md) for the full pipeline,
+constraint rationale, and the four runnable interop test scripts in
+`testbed/audio-tests/302m-interop/`.
+
+### ST 2110-40 ancillary input/output
+
+```json
+{
+  "id": "anc-flow",
+  "name": "ANC (timecode + SCTE-104)",
+  "enabled": true,
+  "clock_domain": 0,
+  "input": {
+    "type": "st2110_40",
+    "bind_addr": "239.0.0.20:5000",
+    "interface_addr": "10.0.0.5",
+    "payload_type": 100
+  },
+  "outputs": [
+    {
+      "type": "st2110_40",
+      "id": "anc-out",
+      "name": "ANC loopback",
+      "dest_addr": "239.2.0.20:5000",
+      "dscp": 46,
+      "payload_type": 100
+    }
+  ]
+}
+```
+
+### Validation limits
+
+| Field | Allowed values |
+|-------|----------------|
+| `sample_rate` (ST 2110-30/-31 wire) | `48000`, `96000` |
+| `bit_depth` (ST 2110-30 wire) | `16`, `24` |
+| `bit_depth` (ST 2110-31 wire, AES3) | `24` |
+| `channels` | `1`, `2`, `4`, `8`, `16` |
+| `packet_time_us` | `125`, `250`, `333`, `500`, `1000`, `4000` |
+| `payload_type` | `96`–`127` |
+| `clock_domain` | `0`–`127` |
+| `dscp` | `0`–`63` (default `46` / EF) |
+| `rtp_audio.sample_rate` | `32000`, `44100`, `48000`, `88200`, `96000` |
+| `rtp_audio.bit_depth` | `16`, `24` |
+| `transcode.sample_rate` | `32000`, `44100`, `48000`, `88200`, `96000` |
+| `transcode.bit_depth` | `16`, `20`, `24` |
+| `transcode.channels` | `1`..=`16` |
+| SRT/UDP/`rtp_audio` `transport_mode` | `"ts"` (default — UDP/SRT), `"rtp"` (default — `rtp_audio`), `"audio_302m"` |
+
+When `transport_mode == "audio_302m"`:
+
+- SRT output rejects `packet_filter`, `program_number`, and `redundancy`
+- UDP output rejects `program_number`
+- The upstream input must be an audio essence (`st2110_30`, `st2110_31`,
+  or `rtp_audio`); other input types fall back to passthrough TS with a
+  warning
+
+Combining `allowed_sources` with `redundancy` is rejected by validation
+because the merger path doesn't expose per-packet `src` and we won't
+silently bypass the source filter on the dual-leg path.
+
+### Flow groups (essence bundles)
+
+A flow group binds multiple per-essence flows into a single logical unit
+sharing a PTP `clock_domain`. The schema lives at the top level of the
+config:
+
+```json
+{
+  "version": 1,
+  "server": { "...": "..." },
+  "flow_groups": [
+    {
+      "id": "studio-a-program",
+      "name": "Studio A program",
+      "clock_domain": 0,
+      "flow_ids": ["studio-a-stereo", "anc-flow"]
+    }
+  ],
+  "flows": [ "..." ]
+}
+```
+
+Each flow named in `flow_ids` must exist elsewhere in the same config.
+The manager UI renders flow groups as visual containers in the topology
+view (deferred — see `docs/st2110.md`).
+
+### WAN bridge (ST 2110 → SRT)
+
+A flow with a ST 2110-30/-31/-40 input and an SRT output passes RTP
+packets through the broadcast channel unchanged, so the WAN bridge mode
+is just a normal flow definition — no special configuration needed.
+Receivers on the far side rebuild the multicast group from the RTP
+stream.
+

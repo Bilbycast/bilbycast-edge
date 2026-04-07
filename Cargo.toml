@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-edge"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 license = "MPL-2.0"
@@ -29,7 +29,7 @@ clap = { version = "4.6.0", features = ["derive"] }
 chrono = "0.4.44"
 
 # Concurrency
-dashmap = "6.1.0"
+dashmap = "7.0.0-rc2"
 
 # Byte buffers
 bytes = "1.11.1"
@@ -44,6 +44,12 @@ libc = "0.2.184"
 
 # Random
 rand = "0.10.0"
+
+# Pure-Rust audio sample rate conversion (used by the per-output PCM
+# transcode stage in `engine::audio_transcode` to bridge mismatched
+# ST 2110-30 / -31 / rtp_audio formats and feed the SMPTE 302M-over-SRT
+# pipeline). No C deps.
+rubato = "2.0.0"
 
 # Error handling
 anyhow = "1.0.102"
@@ -85,6 +91,15 @@ default = ["tls", "webrtc"]
 tls = ["dep:tokio-rustls", "dep:axum-server"]
 # Enable WebRTC WHIP/WHEP input and output via str0m (pure Rust, sans-I/O).
 webrtc = ["dep:str0m", "dep:reqwest"]
+# (SMPTE ST 2110 — Phase 1) Optional in-process PTP slave clock via the
+# pure-Rust `statime` crate. The default deployment runs `ptp4l` (linuxptp)
+# externally and bilbycast reads its management socket; this feature exists
+# for simpler deployments that prefer a single-process model. The flag is
+# wired through the build matrix in step 2; the actual `statime` integration
+# (and dependency declaration) lands in a follow-up step. Until then the
+# feature is a no-op marker — `cargo build --features ptp-internal` succeeds
+# and the reporter still falls back to ptp4l.
+ptp-internal = []
 
 [dependencies.tokio-rustls]
 version = "0.26.4"
@@ -107,6 +122,12 @@ optional = true
 
 [dependencies.retina]
 version = "0.4.19"
+
+# Pure-Rust mDNS-SD service registration for NMOS IS-04 discovery
+# (`_nmos-node._tcp`). Best-effort: registration is gated at runtime so
+# environments without multicast on the chosen interface degrade cleanly.
+[dependencies.mdns-sd]
+version = "0.19.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
