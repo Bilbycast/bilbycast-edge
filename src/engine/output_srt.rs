@@ -34,14 +34,17 @@ pub fn spawn_srt_output(
     event_sender: EventSender,
     flow_id: String,
     input_format: Option<InputFormat>,
+    compressed_audio_input: bool,
 ) -> JoinHandle<()> {
     let broadcast_tx = broadcast_tx.clone();
 
     tokio::spawn(async move {
         let result = if config.redundancy.is_some() {
+            // Redundant SRT output does not support 302M mode, so the
+            // compressed-audio bridge is not applicable here.
             srt_output_redundant_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id).await
         } else {
-            srt_output_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, input_format).await
+            srt_output_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, input_format, compressed_audio_input).await
         };
         if let Err(e) = result {
             tracing::error!("SRT output '{}' exited with error: {e}", config.id);
@@ -58,6 +61,7 @@ pub fn spawn_srt_output(
 /// Dispatches to listener-specific or caller-specific loops based on the
 /// SRT mode. Listener mode binds once and re-accepts on disconnect; caller
 /// mode reconnects with exponential back-off.
+#[allow(clippy::too_many_arguments)]
 async fn srt_output_loop(
     config: &SrtOutputConfig,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
@@ -66,15 +70,17 @@ async fn srt_output_loop(
     events: &EventSender,
     flow_id: &str,
     input_format: Option<InputFormat>,
+    compressed_audio_input: bool,
 ) -> anyhow::Result<()> {
     match config.mode {
-        SrtMode::Listener => srt_output_listener_loop(config, broadcast_tx, stats, cancel, events, flow_id, input_format).await,
-        _ => srt_output_caller_loop(config, broadcast_tx, stats, cancel, events, flow_id, input_format).await,
+        SrtMode::Listener => srt_output_listener_loop(config, broadcast_tx, stats, cancel, events, flow_id, input_format, compressed_audio_input).await,
+        _ => srt_output_caller_loop(config, broadcast_tx, stats, cancel, events, flow_id, input_format, compressed_audio_input).await,
     }
 }
 
 /// Listener-mode output: binds the listener once and re-accepts new callers
 /// on disconnect, avoiding the port-rebind problem.
+#[allow(clippy::too_many_arguments)]
 async fn srt_output_listener_loop(
     config: &SrtOutputConfig,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
@@ -83,6 +89,7 @@ async fn srt_output_listener_loop(
     events: &EventSender,
     flow_id: &str,
     input_format: Option<InputFormat>,
+    compressed_audio_input: bool,
 ) -> anyhow::Result<()> {
     let mut listener = bind_srt_listener_for_output(config).await?;
     let mut program_filter = config.program_number.map(|n| {
@@ -179,7 +186,7 @@ async fn srt_output_listener_loop(
         let poller_cancel = cancel.child_token();
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
 
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &socket, &mut program_filter, input_format).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &socket, &mut program_filter, input_format, compressed_audio_input).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -213,6 +220,7 @@ async fn srt_output_caller_loop(
     events: &EventSender,
     flow_id: &str,
     input_format: Option<InputFormat>,
+    compressed_audio_input: bool,
 ) -> anyhow::Result<()> {
     let mut program_filter = config.program_number.map(|n| {
         tracing::info!(
@@ -252,7 +260,7 @@ async fn srt_output_caller_loop(
         let poller_cancel = cancel.child_token();
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
 
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &socket, &mut program_filter, input_format).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &socket, &mut program_filter, input_format, compressed_audio_input).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -294,6 +302,7 @@ async fn srt_output_forward_loop(
     socket: &Arc<SrtSocket>,
     program_filter: &mut Option<TsProgramFilter>,
     input_format: Option<InputFormat>,
+    compressed_audio_input: bool,
 ) -> anyhow::Result<bool> {
     let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<Bytes>(256);
     let send_socket = socket.clone();
@@ -316,14 +325,20 @@ async fn srt_output_forward_loop(
 
     // Build the optional SMPTE 302M output pipeline. Active when:
     //   - `transport_mode == "audio_302m"`
-    //   - upstream input is an audio essence (`input_format` is Some)
+    //   - upstream input is an audio essence (`input_format` is Some) OR
+    //     the input is a TS-bearing source carrying AAC
+    //     (`compressed_audio_input == true`).
     //
     // When active, the program filter is bypassed (the brief explicitly
     // rejects `program_number` for the 302M audio mode) and incoming RTP
     // audio packets are routed through Transcode → 302M → TsMuxer →
-    // 1316-byte SRT datagrams.
+    // 1316-byte SRT datagrams. For the compressed-audio-input case, an
+    // in-line TsDemuxer + AacDecoder runs ahead of the pipeline, which
+    // is itself built lazily on the first decoded AAC frame (once the
+    // sample rate / channel count is known).
+    let is_302m_mode = matches!(config.transport_mode.as_deref(), Some("audio_302m"));
     let mut audio_302m: Option<S302mOutputPipeline> = None;
-    if matches!(config.transport_mode.as_deref(), Some("audio_302m")) {
+    if is_302m_mode && !compressed_audio_input {
         match input_format {
             Some(input) => {
                 // Default to L24 / preserve channel count (rounded up to even)
@@ -367,6 +382,22 @@ async fn srt_output_forward_loop(
         }
     }
 
+    // Compressed-audio bridge state. Only initialised when the 302M mode
+    // is selected AND the upstream input is a TS-bearing source. All three
+    // pieces are built lazily: the demuxer is created eagerly so it can
+    // start parsing the PAT/PMT/ADTS headers; the decoder and pipeline
+    // wait for the first AAC frame so they can pick up the sample rate
+    // and channel count from `cached_aac_config()`.
+    let mut ts_demuxer_302m: Option<crate::engine::ts_demux::TsDemuxer> =
+        if is_302m_mode && compressed_audio_input {
+            Some(crate::engine::ts_demux::TsDemuxer::new(None))
+        } else {
+            None
+        };
+    let mut aac_decoder_302m: Option<crate::engine::audio_decode::AacDecoder> = None;
+    let mut logged_302m_init_failure = false;
+    let mut logged_302m_decode_error: Option<String> = None;
+
     let mut filter_scratch: Vec<u8> = Vec::new();
     let connection_lost = loop {
         tokio::select! {
@@ -379,6 +410,41 @@ async fn srt_output_forward_loop(
             result = rx.recv() => {
                 match result {
                     Ok(packet) => {
+                        // Compressed-audio bridge for the 302M mode takes
+                        // precedence over both the PCM 302M path and the
+                        // TS program filter. Drives a TsDemuxer + lazy
+                        // AacDecoder + lazy S302mOutputPipeline and then
+                        // drains the pipeline's ready datagrams into the
+                        // same send queue as the PCM path.
+                        if let Some(demuxer) = ts_demuxer_302m.as_mut() {
+                            srt_run_compressed_302m_step(
+                                &packet,
+                                demuxer,
+                                &mut aac_decoder_302m,
+                                &mut audio_302m,
+                                config,
+                                &mut logged_302m_init_failure,
+                                &mut logged_302m_decode_error,
+                            );
+                            if let Some(pipeline) = audio_302m.as_mut() {
+                                for datagram in pipeline.take_ready_datagrams() {
+                                    match send_tx.try_send(datagram) {
+                                        Ok(()) => {}
+                                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                            stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                            tracing::warn!(
+                                                "SRT output '{}' connection lost (302M compressed), will reconnect",
+                                                config.id
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         // 302M path takes precedence over the TS program filter
                         // (the modes are mutually exclusive — see validator).
                         if let Some(pipeline) = audio_302m.as_mut() {
@@ -726,5 +792,120 @@ async fn srt_output_redundant_loop(
 
         events.emit_flow(EventSeverity::Warning, "srt", format!("SRT output '{}' disconnected", config.id), flow_id);
         tracing::info!("SRT output '{}' (redundant) attempting reconnection...", config.id);
+    }
+}
+
+/// One step of the compressed-audio bridge for the SRT output's 302M mode.
+///
+/// Demuxes any TS packets in `packet`, decodes ADTS AAC frames into planar
+/// f32 PCM, and feeds them through `S302mOutputPipeline::process_planar`.
+/// The AAC decoder and the pipeline are both built lazily on the first
+/// successfully-parsed AAC frame, once the sample rate and channel count
+/// are known.
+///
+/// Mirrors `run_compressed_302m_step` in `output_rtp_audio.rs` — same
+/// lifecycle, same lazy-init logic, same once-per-kind log deduplication.
+fn srt_run_compressed_302m_step(
+    packet: &RtpPacket,
+    demuxer: &mut crate::engine::ts_demux::TsDemuxer,
+    decoder: &mut Option<crate::engine::audio_decode::AacDecoder>,
+    pipeline: &mut Option<S302mOutputPipeline>,
+    config: &SrtOutputConfig,
+    logged_init_failure: &mut bool,
+    logged_decode_error: &mut Option<String>,
+) {
+    use crate::engine::audio_decode::AacDecoder;
+    use crate::engine::ts_demux::DemuxedFrame;
+    use crate::engine::ts_parse::strip_rtp_header;
+
+    let ts_payload = strip_rtp_header(packet);
+    if ts_payload.is_empty() {
+        return;
+    }
+    let frames = demuxer.demux(ts_payload);
+    if frames.is_empty() {
+        return;
+    }
+
+    for frame in frames {
+        let DemuxedFrame::Aac { data, pts: _ } = frame else {
+            continue;
+        };
+
+        if decoder.is_none() {
+            let Some((profile, sri, cc)) = demuxer.cached_aac_config() else {
+                if !*logged_init_failure {
+                    tracing::warn!(
+                        "SRT output '{}' (302M) AAC frame without cached config",
+                        config.id
+                    );
+                    *logged_init_failure = true;
+                }
+                continue;
+            };
+            match AacDecoder::from_adts_config(profile, sri, cc) {
+                Ok(d) => {
+                    let sample_rate = d.sample_rate();
+                    let channels = d.channels();
+                    let input = InputFormat {
+                        sample_rate,
+                        bit_depth: crate::engine::audio_transcode::BitDepth::L24,
+                        channels,
+                    };
+                    let out_channels = if channels == 1 { 2 } else { channels };
+                    match S302mOutputPipeline::new(input, out_channels, 24, 4_000) {
+                        Ok(p) => {
+                            tracing::info!(
+                                "SRT output '{}' (302M) compressed bridge ready: \
+                                 AAC-LC {sample_rate} Hz, {channels} ch -> 48000 Hz {out_channels} ch L24 302M",
+                                config.id
+                            );
+                            *decoder = Some(d);
+                            *pipeline = Some(p);
+                        }
+                        Err(e) => {
+                            if !*logged_init_failure {
+                                tracing::error!(
+                                    "SRT output '{}' (302M) S302mOutputPipeline build failed: {e}",
+                                    config.id
+                                );
+                                *logged_init_failure = true;
+                            }
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if !*logged_init_failure {
+                        tracing::error!(
+                            "SRT output '{}' (302M) AAC decoder init failed: {e}",
+                            config.id
+                        );
+                        *logged_init_failure = true;
+                    }
+                    return;
+                }
+            }
+        }
+
+        let (Some(dec), Some(p)) = (decoder.as_mut(), pipeline.as_mut()) else {
+            continue;
+        };
+
+        match dec.decode_frame(&data) {
+            Ok(planar) => {
+                p.process_planar(&planar, packet.recv_time_us);
+            }
+            Err(e) => {
+                let kind = format!("{e}");
+                if logged_decode_error.as_deref() != Some(kind.as_str()) {
+                    tracing::warn!(
+                        "SRT output '{}' (302M) AAC decode error: {e}",
+                        config.id
+                    );
+                    *logged_decode_error = Some(kind);
+                }
+            }
+        }
     }
 }

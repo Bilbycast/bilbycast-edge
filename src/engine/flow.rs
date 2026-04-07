@@ -680,6 +680,7 @@ impl FlowRuntime {
                     event_sender.clone(),
                     flow_id.to_string(),
                     input_audio_format,
+                    compressed_audio_input,
                 );
 
                 Ok(OutputRuntime {
