@@ -843,6 +843,50 @@ fn validate_program_number(prog: Option<u16>, context: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate an `audio_encode` block. Each output type passes its allowed
+/// codec set so we can reject invalid combinations (e.g. Opus on RTMP)
+/// at config load time rather than at output start time.
+fn validate_audio_encode(
+    enc: &crate::config::models::AudioEncodeConfig,
+    allowed_codecs: &[&str],
+    context: &str,
+) -> Result<()> {
+    if !allowed_codecs.contains(&enc.codec.as_str()) {
+        bail!(
+            "{context}: audio_encode.codec '{}' is not allowed for this output; allowed: {:?}",
+            enc.codec,
+            allowed_codecs
+        );
+    }
+    if let Some(br) = enc.bitrate_kbps {
+        if !(16..=512).contains(&br) {
+            bail!(
+                "{context}: audio_encode.bitrate_kbps must be 16..=512, got {}",
+                br
+            );
+        }
+    }
+    if let Some(sr) = enc.sample_rate {
+        const ALLOWED_SR: &[u32] = &[8_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000];
+        if !ALLOWED_SR.contains(&sr) {
+            bail!(
+                "{context}: audio_encode.sample_rate must be one of {:?}, got {}",
+                ALLOWED_SR,
+                sr
+            );
+        }
+    }
+    if let Some(ch) = enc.channels {
+        if ch == 0 || ch > 2 {
+            bail!(
+                "{context}: audio_encode.channels must be 1 or 2, got {}",
+                ch
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Validates a single output configuration.
 ///
 /// For **RTP** outputs: checks that the output ID is non-empty, validates `dest_addr`
@@ -999,6 +1043,13 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
             if rtmp.reconnect_delay_secs == 0 {
                 bail!("RTMP output '{}': reconnect_delay_secs must be > 0", rtmp.id);
             }
+            if let Some(ref enc) = rtmp.audio_encode {
+                validate_audio_encode(
+                    enc,
+                    &["aac_lc", "he_aac_v1", "he_aac_v2"],
+                    &format!("RTMP output '{}'", rtmp.id),
+                )?;
+            }
         }
         OutputConfig::Hls(hls) => {
             validate_id(&hls.id, "HLS output")?;
@@ -1023,6 +1074,13 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
             }
             if hls.max_segments == 0 || hls.max_segments > 30 {
                 bail!("HLS output '{}': max_segments must be 1-30, got {}", hls.id, hls.max_segments);
+            }
+            if let Some(ref enc) = hls.audio_encode {
+                validate_audio_encode(
+                    enc,
+                    &["aac_lc", "he_aac_v1", "he_aac_v2", "mp2", "ac3"],
+                    &format!("HLS output '{}'", hls.id),
+                )?;
             }
         }
         OutputConfig::Webrtc(webrtc) => {
@@ -1058,6 +1116,19 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
                 if ip.parse::<std::net::IpAddr>().is_err() {
                     bail!("WebRTC output '{}': invalid public_ip '{}'", webrtc.id, ip);
                 }
+            }
+            if let Some(ref enc) = webrtc.audio_encode {
+                if webrtc.video_only {
+                    bail!(
+                        "WebRTC output '{}': audio_encode requires video_only=false (audio MID must be negotiated in SDP)",
+                        webrtc.id
+                    );
+                }
+                validate_audio_encode(
+                    enc,
+                    &["opus"],
+                    &format!("WebRTC output '{}'", webrtc.id),
+                )?;
             }
         }
         OutputConfig::St2110_30(c) => validate_st2110_audio_output(c, St2110Profile::Pcm)?,
@@ -2213,5 +2284,168 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "no testbed configs were checked");
+    }
+
+    // ── audio_encode validation tests ─────────────────────────────────
+
+    fn make_audio_encode(codec: &str) -> crate::config::models::AudioEncodeConfig {
+        crate::config::models::AudioEncodeConfig {
+            codec: codec.to_string(),
+            bitrate_kbps: None,
+            sample_rate: None,
+            channels: None,
+        }
+    }
+
+    #[test]
+    fn validate_audio_encode_accepts_aac_lc_for_rtmp() {
+        let enc = make_audio_encode("aac_lc");
+        assert!(validate_audio_encode(&enc, &["aac_lc", "he_aac_v1", "he_aac_v2"], "test").is_ok());
+    }
+
+    #[test]
+    fn validate_audio_encode_rejects_opus_on_rtmp() {
+        let enc = make_audio_encode("opus");
+        let err = validate_audio_encode(&enc, &["aac_lc", "he_aac_v1", "he_aac_v2"], "RTMP test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not allowed"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_audio_encode_rejects_aac_on_webrtc() {
+        let enc = make_audio_encode("aac_lc");
+        let err = validate_audio_encode(&enc, &["opus"], "WebRTC test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not allowed"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_audio_encode_rejects_unknown_codec() {
+        let enc = make_audio_encode("flac");
+        assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_err());
+    }
+
+    #[test]
+    fn validate_audio_encode_bitrate_bounds() {
+        let mut enc = make_audio_encode("aac_lc");
+        enc.bitrate_kbps = Some(8); // too low
+        assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_err());
+        enc.bitrate_kbps = Some(1024); // too high
+        assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_err());
+        enc.bitrate_kbps = Some(128); // just right
+        assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_ok());
+        enc.bitrate_kbps = Some(16); // edge low
+        assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_ok());
+        enc.bitrate_kbps = Some(512); // edge high
+        assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_ok());
+    }
+
+    #[test]
+    fn validate_audio_encode_sample_rate_whitelist() {
+        let mut enc = make_audio_encode("aac_lc");
+        for sr in [8_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000] {
+            enc.sample_rate = Some(sr);
+            assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_ok(), "{sr}");
+        }
+        enc.sample_rate = Some(96_000);
+        assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_err());
+        enc.sample_rate = Some(11_025);
+        assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_err());
+    }
+
+    #[test]
+    fn validate_audio_encode_channels_1_or_2() {
+        let mut enc = make_audio_encode("aac_lc");
+        enc.channels = Some(1);
+        assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_ok());
+        enc.channels = Some(2);
+        assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_ok());
+        enc.channels = Some(0);
+        assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_err());
+        enc.channels = Some(6);
+        assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_err());
+    }
+
+    #[test]
+    fn validate_output_rtmp_with_audio_encode() {
+        use crate::config::models::{AudioEncodeConfig, OutputConfig, RtmpOutputConfig};
+        let make = |codec: &str| OutputConfig::Rtmp(RtmpOutputConfig {
+            id: "rtmp1".into(),
+            name: "rtmp 1".into(),
+            dest_url: "rtmp://example.com/app".into(),
+            stream_key: "abc".into(),
+            reconnect_delay_secs: 5,
+            max_reconnect_attempts: None,
+            program_number: None,
+            audio_encode: Some(AudioEncodeConfig {
+                codec: codec.into(),
+                bitrate_kbps: None,
+                sample_rate: None,
+                channels: None,
+            }),
+        });
+        assert!(validate_output(&make("aac_lc")).is_ok());
+        assert!(validate_output(&make("he_aac_v1")).is_ok());
+        // Opus must fail on RTMP.
+        assert!(validate_output(&make("opus")).is_err());
+        // MP2 must fail on RTMP (only HLS gets MP2/AC3).
+        assert!(validate_output(&make("mp2")).is_err());
+    }
+
+    #[test]
+    fn validate_output_hls_audio_encode_includes_mp2_ac3() {
+        use crate::config::models::{AudioEncodeConfig, HlsOutputConfig, OutputConfig};
+        let make = |codec: &str| OutputConfig::Hls(HlsOutputConfig {
+            id: "hls1".into(),
+            name: "hls 1".into(),
+            ingest_url: "https://example.com/hls".into(),
+            segment_duration_secs: 2.0,
+            auth_token: None,
+            max_segments: 5,
+            program_number: None,
+            audio_encode: Some(AudioEncodeConfig {
+                codec: codec.into(),
+                bitrate_kbps: None,
+                sample_rate: None,
+                channels: None,
+            }),
+        });
+        assert!(validate_output(&make("aac_lc")).is_ok());
+        assert!(validate_output(&make("mp2")).is_ok());
+        assert!(validate_output(&make("ac3")).is_ok());
+        assert!(validate_output(&make("opus")).is_err());
+    }
+
+    #[test]
+    fn validate_output_webrtc_audio_encode_only_opus() {
+        use crate::config::models::{
+            AudioEncodeConfig, OutputConfig, WebrtcOutputConfig, WebrtcOutputMode,
+        };
+        let make = |codec: &str, video_only: bool| OutputConfig::Webrtc(WebrtcOutputConfig {
+            id: "wrtc1".into(),
+            name: "wrtc 1".into(),
+            mode: WebrtcOutputMode::WhepServer,
+            whip_url: None,
+            bearer_token: None,
+            max_viewers: Some(10),
+            public_ip: None,
+            video_only,
+            program_number: None,
+            audio_encode: Some(AudioEncodeConfig {
+                codec: codec.into(),
+                bitrate_kbps: None,
+                sample_rate: None,
+                channels: None,
+            }),
+        });
+        // Opus + audio MID negotiated → OK.
+        assert!(validate_output(&make("opus", false)).is_ok());
+        // Opus + video_only=true → must reject (no audio MID).
+        let err = validate_output(&make("opus", true)).unwrap_err().to_string();
+        assert!(err.contains("video_only=false"), "got: {err}");
+        // AAC on WebRTC → must reject.
+        assert!(validate_output(&make("aac_lc", false)).is_err());
     }
 }

@@ -969,6 +969,15 @@ pub struct RtmpOutputConfig {
     /// preserve MPTS structure. Must be > 0 if set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_number: Option<u16>,
+    /// Optional audio encode block. When set, this output will decode the
+    /// input audio (must be AAC-LC), re-encode it via the ffmpeg sidecar
+    /// encoder, and emit the result as the audio elementary stream of the
+    /// FLV publish. RTMP-FLV only supports AAC, so the codec field must
+    /// be one of `aac_lc`, `he_aac_v1`, `he_aac_v2`. Requires ffmpeg in
+    /// PATH at runtime — outputs without `audio_encode` set keep working
+    /// without ffmpeg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
 }
 
 fn default_reconnect_delay() -> u64 {
@@ -1007,6 +1016,15 @@ pub struct HlsOutputConfig {
     /// for the NIT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_number: Option<u16>,
+    /// Optional audio encode block. When set, this output stops being a
+    /// pure TS-passthrough segmenter: it demuxes video + audio, re-encodes
+    /// audio via the ffmpeg sidecar encoder, and re-muxes a fresh TS for
+    /// the segment buffer. HLS-TS supports `aac_lc`, `he_aac_v1`,
+    /// `he_aac_v2`, `mp2`, and `ac3`. Requires ffmpeg in PATH at runtime.
+    /// The same-codec fast path (codec=aac_lc with no overrides on an
+    /// AAC-LC source) skips the re-mux and falls back to passthrough.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
 }
 
 fn default_segment_duration() -> f64 {
@@ -1076,6 +1094,45 @@ pub struct WebrtcOutputConfig {
     /// so this only changes which program is sent. Must be > 0 if set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_number: Option<u16>,
+    /// Optional audio encode block. When set, the output decodes the
+    /// AAC-LC audio from the input TS, encodes it via the ffmpeg sidecar
+    /// encoder, and writes the resulting Opus packets to the WebRTC
+    /// audio MID. WebRTC realistically only supports `opus` here.
+    /// Requires `video_only=false` (an audio MID must be negotiated in
+    /// SDP) and ffmpeg in PATH at runtime. This is the only path that
+    /// gets audio onto a WebRTC output today; without `audio_encode`
+    /// the output is video-only by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
+}
+
+/// Audio encoder configuration block. Used by RTMP, HLS, and WebRTC
+/// outputs (as `audio_encode`) to enable PCM → compressed-audio re-encoding
+/// via the ffmpeg sidecar encoder (see `engine::audio_encode`).
+///
+/// The valid codec set depends on the output container — see the
+/// per-output documentation. Validation in `config::validation` enforces
+/// the matrix at config load time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioEncodeConfig {
+    /// Codec name. One of:
+    /// `aac_lc`, `he_aac_v1`, `he_aac_v2`, `opus`, `mp2`, `ac3`.
+    pub codec: String,
+    /// Optional bitrate in kbps. Defaults to a per-codec value when
+    /// unset (AAC-LC=128, HE-AAC-v1=64, HE-AAC-v2=32, Opus=96,
+    /// MP2=192, AC-3=192). Range: 16..=512 kbps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate_kbps: Option<u32>,
+    /// Optional output sample rate in Hz. Defaults to the input audio
+    /// sample rate. Allowed values: 8000, 16000, 22050, 24000, 32000,
+    /// 44100, 48000. (Opus is always carried at 48 kHz on the wire
+    /// regardless of this field.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<u32>,
+    /// Optional output channel count (1 or 2). Defaults to the input
+    /// audio channel count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u8>,
 }
 
 /// SMPTE 2022-1 FEC parameters

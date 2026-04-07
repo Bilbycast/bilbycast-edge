@@ -727,6 +727,7 @@ mod tests {
                     reconnect_delay_secs: 5,
                     max_reconnect_attempts: None,
                     program_number: None,
+                    audio_encode: None,
                 })],
             }],
         };
