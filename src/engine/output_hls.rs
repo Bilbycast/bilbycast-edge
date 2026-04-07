@@ -2,21 +2,29 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use std::collections::VecDeque;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::models::HlsOutputConfig;
+use crate::config::models::{AudioEncodeConfig, HlsOutputConfig};
 use crate::manager::events::{EventSender, EventSeverity};
 use crate::stats::collector::OutputStatsAccumulator;
 
+use super::audio_encode::{AudioCodec, check_ffmpeg_available};
 use super::packet::RtpPacket;
 use super::ts_program_filter::TsProgramFilter;
+
+/// Maximum time we'll wait for ffmpeg to re-mux a single segment.
+/// Segments are typically 2-6 seconds, so 30 s is a generous safety bound.
+const HLS_REMUX_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Minimum RTP header size (no CSRC or extensions).
 const RTP_HEADER_MIN: usize = 12;
@@ -78,6 +86,40 @@ async fn hls_output_loop(
     );
 
     let segment_duration_us = (config.segment_duration_secs * 1_000_000.0) as u64;
+
+    // Resolve audio_encode at startup. When set, ffmpeg must be present in
+    // PATH or the output refuses to start (the operator asked for re-encode
+    // and we can't deliver). When unset, behaviour is unchanged.
+    let remux_args: Option<Vec<String>> = match &config.audio_encode {
+        Some(enc) => match build_remux_args(enc) {
+            Ok(args) => {
+                if !check_ffmpeg_available() {
+                    let msg = format!(
+                        "HLS output '{}': audio_encode requires ffmpeg in PATH but it is not installed; refusing to start output",
+                        config.id
+                    );
+                    tracing::error!("{msg}");
+                    event_sender.emit_flow(EventSeverity::Critical, "hls", msg, flow_id);
+                    return Ok(());
+                }
+                tracing::info!(
+                    "HLS output '{}': audio_encode active codec={} bitrate={:?}k sr={:?} ch={:?}",
+                    config.id, enc.codec, enc.bitrate_kbps, enc.sample_rate, enc.channels
+                );
+                Some(args)
+            }
+            Err(e) => {
+                let msg = format!(
+                    "HLS output '{}': audio_encode rejected: {e}",
+                    config.id
+                );
+                tracing::error!("{msg}");
+                event_sender.emit_flow(EventSeverity::Critical, "hls", msg, flow_id);
+                return Ok(());
+            }
+        },
+        None => None,
+    };
 
     let mut segment_buf: Vec<u8> = Vec::with_capacity(2 * 1024 * 1024); // 2 MB initial
     let mut segment_start_us: Option<u64> = None;
@@ -143,10 +185,41 @@ async fn hls_output_loop(
                             segment_seq += 1;
 
                             // Upload the segment (non-blocking: log and continue on failure).
-                            let segment_data = std::mem::replace(
+                            let raw_segment = std::mem::replace(
                                 &mut segment_buf,
                                 Vec::with_capacity(2 * 1024 * 1024),
                             );
+
+                            // Run the segment through ffmpeg if audio_encode
+                            // is configured. ffmpeg copies the video stream
+                            // and re-encodes the audio per the configured
+                            // codec/bitrate, then re-muxes a fresh TS.
+                            // On ffmpeg failure we skip this segment with a
+                            // warning — the next segment may succeed.
+                            let segment_data = if let Some(ref args) = remux_args {
+                                match remux_segment_via_ffmpeg(&raw_segment, args).await {
+                                    Ok(data) => data,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "HLS output '{}': segment {} ffmpeg remux failed: {e}; skipping",
+                                            config.id, segment_seq
+                                        );
+                                        event_sender.emit_flow(
+                                            EventSeverity::Warning,
+                                            "hls",
+                                            format!("HLS output '{}': segment {} remux failed: {e}", config.id, segment_seq),
+                                            flow_id,
+                                        );
+                                        // Reset for the next segment but
+                                        // don't bump segment_seq (we'll
+                                        // re-use it next iteration).
+                                        segment_start_us = None;
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                raw_segment
+                            };
                             let segment_bytes = segment_data.len() as u64;
 
                             let segment_url = format!(
@@ -349,4 +422,204 @@ async fn http_put(
     }
 
     Ok(())
+}
+
+// ── audio_encode: per-segment ffmpeg remux ─────────────────────────────────
+
+/// Build the ffmpeg argv for the HLS audio re-encode case. The encoder
+/// reads MPEG-TS bytes on stdin, copies all video streams as-is, re-encodes
+/// the audio per the configured codec/bitrate/SR/channels, and writes a
+/// fresh MPEG-TS file to stdout. ffmpeg-as-remuxer rather than wiring the
+/// engine::audio_encode::AudioEncoder PCM pipeline avoids re-implementing a
+/// TS muxer for MP2/AC-3 (the existing engine/rtmp/ts_mux.rs only knows
+/// AAC). Per-segment fork is acceptable because HLS segments are 2-6 s
+/// long and ffmpeg startup is small relative to that.
+fn build_remux_args(enc: &AudioEncodeConfig) -> Result<Vec<String>, String> {
+    let codec = AudioCodec::parse(&enc.codec)
+        .ok_or_else(|| format!("unknown codec '{}'", enc.codec))?;
+
+    let mut args: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-nostats".into(),
+        "-loglevel".into(),
+        "warning".into(),
+        // Read MPEG-TS bytes from stdin.
+        "-f".into(),
+        "mpegts".into(),
+        "-i".into(),
+        "pipe:0".into(),
+        // Copy video streams unchanged.
+        "-c:v".into(),
+        "copy".into(),
+    ];
+
+    let bitrate = format!("{}k",
+        enc.bitrate_kbps.unwrap_or_else(|| codec.default_bitrate_kbps()));
+
+    match codec {
+        AudioCodec::AacLc => {
+            args.extend([
+                "-c:a".into(), "aac".into(),
+                "-profile:a".into(), "aac_low".into(),
+                "-b:a".into(), bitrate,
+            ]);
+        }
+        AudioCodec::HeAacV1 => {
+            args.extend([
+                "-c:a".into(), "aac".into(),
+                "-profile:a".into(), "aac_he".into(),
+                "-b:a".into(), bitrate,
+            ]);
+        }
+        AudioCodec::HeAacV2 => {
+            args.extend([
+                "-c:a".into(), "aac".into(),
+                "-profile:a".into(), "aac_he_v2".into(),
+                "-b:a".into(), bitrate,
+            ]);
+        }
+        AudioCodec::Mp2 => {
+            args.extend([
+                "-c:a".into(), "mp2".into(),
+                "-b:a".into(), bitrate,
+            ]);
+        }
+        AudioCodec::Ac3 => {
+            args.extend([
+                "-c:a".into(), "ac3".into(),
+                "-b:a".into(), bitrate,
+            ]);
+        }
+        AudioCodec::Opus => {
+            // Validation should have rejected this — Opus on HLS-TS is
+            // out of scope for v1.
+            return Err("Opus is not supported on HLS in this build".into());
+        }
+    }
+
+    if let Some(sr) = enc.sample_rate {
+        args.extend(["-ar".into(), sr.to_string()]);
+    }
+    if let Some(ch) = enc.channels {
+        args.extend(["-ac".into(), ch.to_string()]);
+    }
+
+    args.extend([
+        // Output: MPEG-TS to stdout.
+        "-f".into(),
+        "mpegts".into(),
+        "pipe:1".into(),
+    ]);
+
+    Ok(args)
+}
+
+/// Run ffmpeg as a one-shot remuxer over a single HLS segment. Pipes
+/// `segment` to stdin and reads the re-muxed TS from stdout. Times out
+/// after [`HLS_REMUX_TIMEOUT`] to catch a hung ffmpeg.
+async fn remux_segment_via_ffmpeg(
+    segment: &[u8],
+    args: &[String],
+) -> Result<Vec<u8>, String> {
+    let mut child = tokio::process::Command::new("ffmpeg")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("failed to spawn ffmpeg: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let bytes = Bytes::copy_from_slice(segment);
+        tokio::spawn(async move {
+            let _ = stdin.write_all(&bytes).await;
+            let _ = stdin.shutdown().await;
+        });
+    }
+
+    let output = tokio::time::timeout(HLS_REMUX_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| "ffmpeg remux timed out".to_string())?
+        .map_err(|e| format!("ffmpeg wait failed: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "ffmpeg exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+
+    if output.stdout.is_empty() {
+        return Err("ffmpeg produced no output".to_string());
+    }
+
+    Ok(output.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_enc(codec: &str) -> AudioEncodeConfig {
+        AudioEncodeConfig {
+            codec: codec.into(),
+            bitrate_kbps: None,
+            sample_rate: None,
+            channels: None,
+        }
+    }
+
+    #[test]
+    fn build_remux_args_aac_lc_minimal() {
+        let args = build_remux_args(&make_enc("aac_lc")).unwrap();
+        let joined = args.join(" ");
+        assert!(joined.contains("-i pipe:0"));
+        assert!(joined.contains("-c:v copy"));
+        assert!(joined.contains("-c:a aac"));
+        assert!(joined.contains("-profile:a aac_low"));
+        assert!(joined.contains("-b:a 128k"));
+        assert!(joined.contains("-f mpegts"));
+        assert!(joined.ends_with("pipe:1"));
+    }
+
+    #[test]
+    fn build_remux_args_he_aac_profiles() {
+        let args1 = build_remux_args(&make_enc("he_aac_v1")).unwrap();
+        assert!(args1.join(" ").contains("-profile:a aac_he"));
+        let args2 = build_remux_args(&make_enc("he_aac_v2")).unwrap();
+        assert!(args2.join(" ").contains("-profile:a aac_he_v2"));
+    }
+
+    #[test]
+    fn build_remux_args_mp2_and_ac3() {
+        let args = build_remux_args(&make_enc("mp2")).unwrap();
+        let j = args.join(" ");
+        assert!(j.contains("-c:a mp2"));
+        assert!(j.contains("-b:a 192k"));
+        let args = build_remux_args(&make_enc("ac3")).unwrap();
+        let j = args.join(" ");
+        assert!(j.contains("-c:a ac3"));
+        assert!(j.contains("-b:a 192k"));
+    }
+
+    #[test]
+    fn build_remux_args_opus_rejected() {
+        assert!(build_remux_args(&make_enc("opus")).is_err());
+    }
+
+    #[test]
+    fn build_remux_args_overrides_propagate() {
+        let mut enc = make_enc("aac_lc");
+        enc.bitrate_kbps = Some(96);
+        enc.sample_rate = Some(44_100);
+        enc.channels = Some(1);
+        let args = build_remux_args(&enc).unwrap();
+        let j = args.join(" ");
+        assert!(j.contains("-b:a 96k"));
+        assert!(j.contains("-ar 44100"));
+        assert!(j.contains("-ac 1"));
+    }
 }
