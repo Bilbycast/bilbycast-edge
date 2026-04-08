@@ -701,21 +701,27 @@ fn build_health_payload(flow_manager: &FlowManager, api_addr: &str, monitor_addr
         "total_flows": flow_manager.active_flow_count(),
         "api_addr": api_addr,
         "monitor_addr": monitor_addr,
-        // SMPTE ST 2110 (Phase 1) capability advertisement. The manager UI
-        // gates ST 2110 controls per-node on the presence of these strings;
-        // older edges that don't include this field are treated as
-        // "no ST 2110 support" by the manager (the field is `Option` with
-        // `serde(default)` on the manager side).
-        "capabilities": st2110_capabilities()
+        // Capability advertisement. The manager UI gates feature controls
+        // per-node on the presence of these strings (e.g. ST 2110 form
+        // sections, Phase B audio_encode block). Older edges that don't
+        // include this field are treated as "no advertised features" by
+        // the manager — the field is `Option` with `serde(default)` on
+        // the manager side.
+        "capabilities": edge_capabilities()
     })
 }
 
-/// Return the list of ST 2110 capability strings advertised by this build.
-/// Always includes the four base capabilities — Phase 1 ships them all in
-/// the default build. The `ptp-internal` feature is reflected as an
-/// additional `"ptp-internal"` string for completeness.
-fn st2110_capabilities() -> Vec<&'static str> {
+/// Return the list of capability strings advertised by this build.
+///
+/// Always includes the ST 2110 Phase 1 capabilities (the default build
+/// ships them all) and the Phase B `audio-encode` capability (the
+/// ffmpeg-sidecar audio encoder is unconditionally compiled into every
+/// build — ffmpeg itself is a runtime dependency, gated lazily on the
+/// per-output `audio_encode` block). The `ptp-internal` feature is
+/// reflected as an additional `"ptp-internal"` string for completeness.
+fn edge_capabilities() -> Vec<&'static str> {
     let mut caps = vec![
+        // SMPTE ST 2110 Phase 1
         "st2110-30",
         "st2110-31",
         "st2110-40",
@@ -725,6 +731,9 @@ fn st2110_capabilities() -> Vec<&'static str> {
         "is-08",
         "bcp-004",
         "redundancy-2022-7",
+        // Phase B compressed-audio bridge: ffmpeg-sidecar audio encoder
+        // on RTMP / HLS / WebRTC outputs.
+        "audio-encode",
     ];
     if cfg!(feature = "ptp-internal") {
         caps.push("ptp-internal");
