@@ -231,6 +231,32 @@ pub enum InputConfig {
     RtpAudio(RtpAudioInputConfig),
 }
 
+impl InputConfig {
+    /// Returns true when this input produces MPEG-TS bytes (with or without
+    /// an RTP wrapper) on the broadcast channel.
+    ///
+    /// Used by the flow runtime to gate MPEG-TS-only consumers like the
+    /// TR-101290 analyzer. Audio-only and ANC inputs (ST 2110-30/-31/-40,
+    /// `rtp_audio`) carry uncompressed PCM or RFC 8331 ancillary data and
+    /// must not be subjected to TR-101290 sync-byte / CC checks — running
+    /// the analyzer on them log-spams "sync lost" warnings forever.
+    pub fn is_ts_carrier(&self) -> bool {
+        match self {
+            InputConfig::Rtp(_)
+            | InputConfig::Udp(_)
+            | InputConfig::Srt(_)
+            | InputConfig::Rtmp(_)
+            | InputConfig::Rtsp(_)
+            | InputConfig::Webrtc(_)
+            | InputConfig::Whep(_) => true,
+            InputConfig::St2110_30(_)
+            | InputConfig::St2110_31(_)
+            | InputConfig::St2110_40(_)
+            | InputConfig::RtpAudio(_) => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RtpInputConfig {
     /// Local address to bind, e.g. "0.0.0.0:5000" or "239.1.1.1:5000" for multicast
@@ -1452,6 +1478,45 @@ fn default_st2110_anc_pt() -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for Bug C (2026-04-09): the TR-101290 analyzer must only
+    /// run on inputs that actually carry MPEG-TS bytes. Audio-only inputs
+    /// (ST 2110-30/-31, `rtp_audio`) and ANC inputs (ST 2110-40) carry PCM
+    /// or RFC 8331 ancillary data on the broadcast channel, and feeding
+    /// those into TR-101290 produces a stream of "sync lost" warnings
+    /// every second forever. This test pins down which inputs are TS
+    /// carriers so anyone adding a new input variant is forced to make a
+    /// conscious classification.
+    #[test]
+    fn input_config_is_ts_carrier_classification() {
+        // Build the variants from JSON to avoid coupling the regression
+        // test to every field on every input struct.
+        let parse = |json: &str| -> InputConfig {
+            serde_json::from_str(json).expect("test JSON must parse")
+        };
+
+        // Non-TS — analyzer must NOT spawn for these.
+        assert!(!parse(
+            r#"{"type":"st2110_30","bind_addr":"127.0.0.1:5000","sample_rate":48000,"channels":2,"bit_depth":24,"packet_duration_us":1000}"#
+        ).is_ts_carrier());
+        assert!(!parse(
+            r#"{"type":"st2110_31","bind_addr":"127.0.0.1:5000","sample_rate":48000,"channels":2,"bit_depth":24,"packet_duration_us":1000}"#
+        ).is_ts_carrier());
+        assert!(!parse(
+            r#"{"type":"st2110_40","bind_addr":"127.0.0.1:5000"}"#
+        ).is_ts_carrier());
+        assert!(!parse(
+            r#"{"type":"rtp_audio","bind_addr":"127.0.0.1:5000","sample_rate":48000,"channels":2,"bit_depth":24}"#
+        ).is_ts_carrier());
+
+        // TS-carrying — analyzer must spawn for these.
+        assert!(parse(
+            r#"{"type":"udp","bind_addr":"127.0.0.1:5000"}"#
+        ).is_ts_carrier());
+        assert!(parse(
+            r#"{"type":"rtp","bind_addr":"127.0.0.1:5000"}"#
+        ).is_ts_carrier());
+    }
 
     #[test]
     fn test_roundtrip_config() {

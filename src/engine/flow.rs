@@ -393,14 +393,29 @@ impl FlowRuntime {
             ),
         };
 
-        // Start TR-101290 analyzer (independent broadcast subscriber)
+        // Start TR-101290 analyzer (independent broadcast subscriber).
+        //
+        // Only spawn the analyzer for inputs that actually carry MPEG-TS.
+        // Audio-only and ANC inputs (ST 2110-30/-31/-40, `rtp_audio`) carry
+        // PCM samples or RFC 8331 ancillary data on the broadcast channel,
+        // not TS packets — running TR-101290 on them produces an endless
+        // stream of "sync lost" warnings within seconds and pollutes the
+        // operator log for no diagnostic value. The accumulator is still
+        // created so `flow_stats.tr101290` has a stable shape regardless
+        // of input type; for non-TS flows it just stays at zero.
         let tr101290_acc = Arc::new(Tr101290Accumulator::new());
         flow_stats.tr101290.set(tr101290_acc.clone()).ok();
-        let analyzer_handle = spawn_tr101290_analyzer(
-            &broadcast_tx,
-            tr101290_acc,
-            cancel_token.child_token(),
-        );
+        let analyzer_handle = if config.input.is_ts_carrier() {
+            spawn_tr101290_analyzer(
+                &broadcast_tx,
+                tr101290_acc,
+                cancel_token.child_token(),
+            )
+        } else {
+            // Spawn an immediately-completing no-op task so the
+            // `analyzer_handle: JoinHandle<()>` field always has a value.
+            tokio::spawn(async {})
+        };
 
         // Start media analysis (if enabled)
         let media_analysis_handle = if config.media_analysis {
