@@ -206,16 +206,40 @@ pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
 
     validate_input(&flow.input)?;
 
+    // If the flow's input is itself an uncompressed audio source we can pass
+    // its (sample_rate, bit_depth, channels) shape down to per-output
+    // transcode validation so that channel-map presets and matrix rules are
+    // checked against the *actual* upstream channel count, not the output's
+    // own placeholder. For non-audio inputs (RTMP/RTSP/UDP/SRT carrying TS,
+    // etc.) the audio_decode bridge runs at runtime and the upstream shape
+    // isn't statically known here — None falls back to the output's own
+    // declared shape, matching the legacy placeholder behaviour.
+    let upstream_audio = upstream_audio_shape(&flow.input);
+
     let mut output_ids = HashSet::new();
     for output in &flow.outputs {
         let oid = output.id();
         if !output_ids.insert(oid.to_string()) {
             bail!("Duplicate output ID '{}' in flow '{}'", oid, flow.id);
         }
-        validate_output(output)?;
+        validate_output_with_input(output, upstream_audio)?;
     }
 
     Ok(())
+}
+
+/// If `input` is itself an uncompressed audio source, return its
+/// `(sample_rate, bit_depth, channels)` shape so per-output transcode
+/// validation can check matrices against the real upstream channel count
+/// instead of the output's own placeholder.
+fn upstream_audio_shape(input: &InputConfig) -> Option<(u32, u8, u8)> {
+    match input {
+        InputConfig::St2110_30(c) | InputConfig::St2110_31(c) => {
+            Some((c.sample_rate, c.bit_depth, c.channels))
+        }
+        InputConfig::RtpAudio(c) => Some((c.sample_rate, c.bit_depth, c.channels)),
+        _ => None,
+    }
 }
 
 /// Validates the input source configuration for a flow.
@@ -441,7 +465,11 @@ fn validate_st2110_audio_input(c: &St2110AudioInputConfig, profile: St2110Profil
     Ok(())
 }
 
-fn validate_st2110_audio_output(c: &St2110AudioOutputConfig, profile: St2110Profile) -> Result<()> {
+fn validate_st2110_audio_output(
+    c: &St2110AudioOutputConfig,
+    profile: St2110Profile,
+    upstream_audio: Option<(u32, u8, u8)>,
+) -> Result<()> {
     let label = profile.label();
     validate_id(&c.id, &format!("{label} output"))?;
     validate_name(&c.name, &format!("{label} output"))?;
@@ -462,16 +490,18 @@ fn validate_st2110_audio_output(c: &St2110AudioOutputConfig, profile: St2110Prof
         validate_red_blue_bind(red, &c.dest_addr, &format!("{label} output '{}' redundancy", c.id))?;
     }
     if let Some(ref tj) = c.transcode {
-        // Resolve against the OUTPUT's declared input format. The flow-level
-        // wiring (Chunk 2) will instead resolve against the upstream input
-        // config; for now we validate using the output's own audio params as
-        // the input format placeholder so the JSON is at least internally
-        // consistent. Range/structural validation runs the same way.
+        // Use the parent flow's upstream audio shape when available so
+        // channel-map presets are resolved against the *real* upstream
+        // channel count. Falls back to the output's own declared shape
+        // when the upstream is non-audio (e.g. RTMP/RTSP feeding the
+        // audio_decode bridge — runtime resolves the actual format then).
+        let (in_sr, in_bd, in_ch) = upstream_audio
+            .unwrap_or((c.sample_rate, c.bit_depth, c.channels));
         validate_transcode_block(
             tj,
-            c.sample_rate,
-            c.bit_depth,
-            c.channels,
+            in_sr,
+            in_bd,
+            in_ch,
             &format!("{label} output '{}' transcode", c.id),
         )?;
     }
@@ -607,7 +637,10 @@ fn validate_rtp_audio_input(c: &RtpAudioInputConfig) -> Result<()> {
     Ok(())
 }
 
-fn validate_rtp_audio_output(c: &RtpAudioOutputConfig) -> Result<()> {
+fn validate_rtp_audio_output(
+    c: &RtpAudioOutputConfig,
+    upstream_audio: Option<(u32, u8, u8)>,
+) -> Result<()> {
     validate_id(&c.id, "rtp_audio output")?;
     validate_name(&c.name, "rtp_audio output")?;
     validate_socket_addr(&c.dest_addr, &format!("rtp_audio output '{}' dest_addr", c.id))?;
@@ -632,11 +665,15 @@ fn validate_rtp_audio_output(c: &RtpAudioOutputConfig) -> Result<()> {
         validate_red_blue_bind(red, &c.dest_addr, &format!("rtp_audio output '{}' redundancy", c.id))?;
     }
     if let Some(ref tj) = c.transcode {
+        // See st2110_audio_output: prefer the parent flow's upstream shape
+        // when known so channel-map presets resolve against the real input.
+        let (in_sr, in_bd, in_ch) = upstream_audio
+            .unwrap_or((c.sample_rate, c.bit_depth, c.channels));
         validate_transcode_block(
             tj,
-            c.sample_rate,
-            c.bit_depth,
-            c.channels,
+            in_sr,
+            in_bd,
+            in_ch,
             &format!("rtp_audio output '{}' transcode", c.id),
         )?;
     }
@@ -902,6 +939,18 @@ fn validate_audio_encode(
 ///
 /// Returns an error describing the first validation failure encountered.
 pub fn validate_output(output: &OutputConfig) -> Result<()> {
+    validate_output_with_input(output, None)
+}
+
+/// Like [`validate_output`] but additionally takes the parent flow's
+/// upstream audio shape (sample_rate, bit_depth, channels) when the input is
+/// itself an uncompressed audio source. Used by `validate_flow` so transcode
+/// channel-map presets are checked against the actual upstream channel count
+/// rather than the output's own declared channels.
+pub fn validate_output_with_input(
+    output: &OutputConfig,
+    upstream_audio: Option<(u32, u8, u8)>,
+) -> Result<()> {
     match output {
         OutputConfig::Rtp(rtp) => {
             validate_id(&rtp.id, "RTP output")?;
@@ -1131,10 +1180,14 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
                 )?;
             }
         }
-        OutputConfig::St2110_30(c) => validate_st2110_audio_output(c, St2110Profile::Pcm)?,
-        OutputConfig::St2110_31(c) => validate_st2110_audio_output(c, St2110Profile::Aes3)?,
+        OutputConfig::St2110_30(c) => {
+            validate_st2110_audio_output(c, St2110Profile::Pcm, upstream_audio)?
+        }
+        OutputConfig::St2110_31(c) => {
+            validate_st2110_audio_output(c, St2110Profile::Aes3, upstream_audio)?
+        }
         OutputConfig::St2110_40(c) => validate_st2110_ancillary_output(c)?,
-        OutputConfig::RtpAudio(c) => validate_rtp_audio_output(c)?,
+        OutputConfig::RtpAudio(c) => validate_rtp_audio_output(c, upstream_audio)?,
     }
     Ok(())
 }
@@ -2087,14 +2140,14 @@ mod tests {
     #[test]
     fn test_st2110_30_output_valid() {
         let out = st2110_30_output("audio-1", "239.10.10.1:5004");
-        validate_st2110_audio_output(&out, St2110Profile::Pcm).expect("valid -30 output");
+        validate_st2110_audio_output(&out, St2110Profile::Pcm, None).expect("valid -30 output");
     }
 
     #[test]
     fn test_st2110_30_output_dscp_out_of_range() {
         let mut out = st2110_30_output("audio-1", "239.10.10.1:5004");
         out.dscp = 64;
-        assert!(validate_st2110_audio_output(&out, St2110Profile::Pcm).is_err());
+        assert!(validate_st2110_audio_output(&out, St2110Profile::Pcm, None).is_err());
     }
 
     #[test]

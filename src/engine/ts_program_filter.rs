@@ -514,6 +514,90 @@ mod tests {
         assert_eq!(programs, vec![(2, 0x1500)]);
     }
 
+    /// Reproducer for the production bug: feed the real MPTS file into the
+    /// filter in 1316-byte (7 × 188) chunks the way `output_udp.rs` delivers
+    /// each broadcast packet, and verify both programs still emit data.
+    #[test]
+    fn filter_real_mpts_chunked_program_2_emits_data() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testbed/quality/refs/ref_mpts_60s.ts"
+        );
+        let Ok(data) = std::fs::read(path) else {
+            eprintln!("skipping, fixture missing at {path}");
+            return;
+        };
+        const CHUNK: usize = 7 * TS_PACKET_SIZE; // 1316, matches UDP datagram
+
+        for target in [1u16, 2u16] {
+            let mut filter = TsProgramFilter::new(target);
+            let mut total = Vec::new();
+            for chunk in data.chunks(CHUNK) {
+                let mut out = Vec::new();
+                filter.filter_into(chunk, &mut out);
+                total.extend_from_slice(&out);
+            }
+            assert!(
+                !total.is_empty(),
+                "chunked filter for program {target} produced 0 bytes from {} byte MPTS",
+                data.len()
+            );
+        }
+    }
+
+    /// Real-fixture test: load the testbed reference MPTS file (2 programs)
+    /// and run the filter targeting program 2. Reproduces the bug where the
+    /// filter produces zero output for any program > 1 against real
+    /// ffmpeg-emitted MPTS data.
+    #[test]
+    fn filter_real_mpts_program_2_emits_data() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testbed/quality/refs/ref_mpts_60s.ts"
+        );
+        let Ok(data) = std::fs::read(path) else {
+            // Fixture missing — skip rather than fail in environments without
+            // the testbed checkout.
+            eprintln!("skipping real-MPTS test, fixture not found at {path}");
+            return;
+        };
+        // Verify the source PAT contains both programs first.
+        // First PAT packet is at offset 188 in this file (after a leading
+        // null packet) but a robust scan finds it.
+        let mut pat_programs = None;
+        for chunk in data.chunks_exact(TS_PACKET_SIZE).take(20) {
+            if chunk[0] == TS_SYNC_BYTE && ts_pid(chunk) == PAT_PID && ts_pusi(chunk) {
+                pat_programs = Some(parse_pat_programs(chunk));
+                break;
+            }
+        }
+        let programs = pat_programs.expect("no PAT in first 20 packets of fixture");
+        assert!(
+            programs.iter().any(|(n, _)| *n == 1),
+            "fixture PAT missing program 1: {programs:?}"
+        );
+        assert!(
+            programs.iter().any(|(n, _)| *n == 2),
+            "fixture PAT missing program 2: {programs:?}"
+        );
+
+        // Run the filter on the entire file targeting program 2.
+        let mut filter = TsProgramFilter::new(2);
+        let mut out = Vec::new();
+        filter.filter_into(&data, &mut out);
+        assert!(
+            !out.is_empty(),
+            "filter for program 2 produced 0 bytes from a {}-byte real MPTS file containing program 2",
+            data.len()
+        );
+
+        // Sanity: filter for program 1 also produces data.
+        let mut filter1 = TsProgramFilter::new(1);
+        let mut out1 = Vec::new();
+        filter1.filter_into(&data, &mut out1);
+        assert!(!out1.is_empty(), "filter for program 1 also produced 0 bytes");
+    }
+
     #[test]
     fn filter_handles_pat_version_bump_dropping_target() {
         let mut filter = TsProgramFilter::new(2);

@@ -154,6 +154,11 @@ pub enum AudioEncoderError {
     EncoderCrashed { exit_status: String, stderr_tail: String },
     /// Internal channel was closed unexpectedly.
     ChannelClosed,
+    /// HE-AAC v1/v2 was requested but the local ffmpeg doesn't have the
+    /// `libfdk_aac` encoder built in. The native `aac` encoder hard-rejects
+    /// the `aac_he` and `aac_he_v2` profiles, so we refuse to spawn rather
+    /// than producing zero output / cryptic ffmpeg `-22` errors.
+    HeAacRequiresLibfdk,
 }
 
 impl std::fmt::Display for AudioEncoderError {
@@ -171,6 +176,14 @@ impl std::fmt::Display for AudioEncoderError {
                 "audio encoder crashed (exit: {exit_status}): {stderr_tail}"
             ),
             Self::ChannelClosed => write!(f, "audio encoder channel closed"),
+            Self::HeAacRequiresLibfdk => write!(
+                f,
+                "he_aac_v1/he_aac_v2 require an ffmpeg build with libfdk_aac \
+                 (the native ffmpeg `aac` encoder does not support the aac_he / \
+                 aac_he_v2 profiles). Install ffmpeg with `--enable-libfdk-aac` \
+                 (e.g. via the homebrew-ffmpeg/ffmpeg tap on macOS) and restart \
+                 the edge node, or switch this output to `aac_lc`."
+            ),
         }
     }
 }
@@ -242,6 +255,43 @@ pub fn check_ffmpeg_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Returns true if the local ffmpeg has the `libfdk_aac` encoder built in.
+///
+/// HE-AAC v1 / v2 encoding is only reliably supported by `libfdk_aac` —
+/// ffmpeg's native `aac` encoder hard-rejects the `aac_he` and `aac_he_v2`
+/// profiles with "Profile not supported!", and `aac_at` (Apple AudioToolbox)
+/// silently downgrades to LC. We surface this at output startup so HE-AAC
+/// configs fail loudly with a clear message instead of producing zero
+/// segments / cryptic ffmpeg `-22` errors downstream.
+///
+/// Cached on first call; subsequent calls return the cached result so we
+/// don't fork ffmpeg per output.
+pub fn check_libfdk_aac_available() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let out = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-encoders"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output();
+        match out {
+            Ok(o) => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                stdout.lines().any(|line| {
+                    // ffmpeg lists encoders as "<flags> <name> ..."; look
+                    // for the libfdk_aac entry specifically.
+                    let trimmed = line.trim_start();
+                    let mut parts = trimmed.split_whitespace();
+                    parts.next(); // skip flag column
+                    parts.next() == Some("libfdk_aac")
+                })
+            }
+            Err(_) => false,
+        }
+    })
+}
+
 /// A spawned audio encoder, owning the bounded PCM input channel and the
 /// supervisor task that manages the ffmpeg subprocess. Drop the encoder
 /// (or cancel its `CancellationToken`) to tear down the subprocess.
@@ -303,6 +353,15 @@ impl AudioEncoder {
 
         if !check_ffmpeg_available() {
             return Err(AudioEncoderError::FfmpegNotFound);
+        }
+
+        // HE-AAC needs libfdk_aac specifically — fail loudly if missing
+        // instead of producing zero output and cryptic ffmpeg `-22` errors
+        // per segment downstream.
+        if matches!(params.codec, AudioCodec::HeAacV1 | AudioCodec::HeAacV2)
+            && !check_libfdk_aac_available()
+        {
+            return Err(AudioEncoderError::HeAacRequiresLibfdk);
         }
 
         let (pcm_tx, pcm_rx) = mpsc::channel::<PcmChunk>(PCM_CHANNEL_DEPTH);
@@ -456,8 +515,11 @@ fn build_ffmpeg_args(params: &EncoderParams) -> Vec<String> {
             ]);
         }
         AudioCodec::HeAacV1 => {
+            // HE-AAC v1: requires libfdk_aac. The spawn() path checks
+            // this and refuses to start if libfdk_aac is missing, so
+            // by the time we build args we know it's available.
             args.extend([
-                "-c:a".into(), "aac".into(),
+                "-c:a".into(), "libfdk_aac".into(),
                 "-profile:a".into(), "aac_he".into(),
                 "-b:a".into(), bitrate,
                 "-ar".into(), target_sr,
@@ -466,8 +528,9 @@ fn build_ffmpeg_args(params: &EncoderParams) -> Vec<String> {
             ]);
         }
         AudioCodec::HeAacV2 => {
+            // HE-AAC v2 (PS): requires libfdk_aac. Same gating as v1.
             args.extend([
-                "-c:a".into(), "aac".into(),
+                "-c:a".into(), "libfdk_aac".into(),
                 "-profile:a".into(), "aac_he_v2".into(),
                 "-b:a".into(), bitrate,
                 "-ar".into(), target_sr,
@@ -1468,7 +1531,9 @@ mod tests {
     }
 
     #[test]
-    fn ffmpeg_args_he_aac_v1_v2_profiles() {
+    fn ffmpeg_args_he_aac_v1_v2_use_libfdk() {
+        // HE-AAC v1/v2 must request the libfdk_aac encoder, not the
+        // native `aac` encoder which hard-rejects the aac_he profile.
         for (codec, profile) in [
             (AudioCodec::HeAacV1, "aac_he"),
             (AudioCodec::HeAacV2, "aac_he_v2"),
@@ -1483,6 +1548,7 @@ mod tests {
             };
             let args = build_ffmpeg_args(&params);
             let joined = args.join(" ");
+            assert!(joined.contains("-c:a libfdk_aac"), "args = {joined}");
             assert!(joined.contains(&format!("-profile:a {profile}")));
             assert!(joined.contains("-f adts"));
         }

@@ -106,7 +106,15 @@ impl WebrtcSession {
 
     /// Accept an SDP offer (server mode) and return the SDP answer string.
     pub fn accept_offer(&mut self, offer_sdp: &str) -> Result<String> {
-        let offer = SdpOffer::from_sdp_string(offer_sdp)
+        // str0m 0.18's SDP parser hard-codes the session name field to a
+        // single dash (`s=-`) and rejects every other session name. ffmpeg
+        // and a number of other production WHIP publishers send a real
+        // session name (e.g. `s=FFmpegPublishSession`), which is RFC 4566
+        // legal but trips str0m. We normalise the offer here before parsing
+        // so the rest of the pipeline doesn't have to know about the quirk.
+        let normalised = normalise_sdp_offer_for_str0m(offer_sdp);
+
+        let offer = SdpOffer::from_sdp_string(&normalised)
             .map_err(|e| anyhow::anyhow!("SDP parse error: {}", e))?;
 
         let answer = self.rtc.sdp_api().accept_offer(offer)
@@ -226,11 +234,25 @@ impl WebrtcSession {
                             match result {
                                 Ok((len, source)) => {
                                     let now = Instant::now();
+                                    // str0m's DatagramRecv try_into rejects
+                                    // datagrams that aren't STUN/DTLS/RTP/RTCP.
+                                    // Hostile or stray packets must NOT crash
+                                    // the WebRTC session task — drop them and
+                                    // keep going.
+                                    let contents = match (&self.buf[..len]).try_into() {
+                                        Ok(c) => c,
+                                        Err(e) => {
+                                            tracing::debug!(
+                                                "WebRTC: dropped {len}-byte datagram from {source}: {e}"
+                                            );
+                                            continue;
+                                        }
+                                    };
                                     let receive = str0m::net::Receive {
                                         proto: Protocol::Udp,
                                         source,
                                         destination: self.local_addr,
-                                        contents: (&self.buf[..len]).try_into().unwrap(),
+                                        contents,
                                     };
                                     let _ = self.rtc.handle_input(Input::Receive(now, receive));
                                     continue;
@@ -292,5 +314,86 @@ impl WebrtcSession {
             }
             _ => None,
         }
+    }
+}
+
+/// Normalise an incoming SDP offer so str0m's overly strict parser will
+/// accept it.
+///
+/// As of str0m 0.18 the parser hard-codes the session name to a single
+/// dash (`s=-`) — see `str0m/src/sdp/parser.rs` line 46:
+/// `typed_line('s', token('-'))`. RFC 4566 §5.3 lets the session name be
+/// any UTF-8 text and merely *recommends* `-` when there is no real name,
+/// so production WHIP publishers (notably ffmpeg, which uses
+/// `s=FFmpegPublishSession`) trip the parser with a cryptic
+/// `Parse error at PointerOffset(...)`. We rewrite the line in-place to
+/// `s=-` before handing the offer to str0m. The session name is purely
+/// descriptive — it has no effect on ICE, DTLS, or media negotiation —
+/// so the rewrite is safe.
+///
+/// Other str0m quirks may be added here in future. Keep the rewrites
+/// minimal and well-commented so the workaround can be retired when the
+/// upstream parser is fixed.
+fn normalise_sdp_offer_for_str0m(offer: &str) -> String {
+    let mut out = String::with_capacity(offer.len());
+    let mut session_name_rewritten = false;
+    for raw_line in offer.split_inclusive('\n') {
+        let line_no_eol = raw_line.trim_end_matches(['\r', '\n']);
+        if !session_name_rewritten && line_no_eol.starts_with("s=") && line_no_eol != "s=-" {
+            // Preserve whatever line ending the original used so we don't
+            // accidentally convert CRLF→LF or vice versa.
+            let eol = &raw_line[line_no_eol.len()..];
+            out.push_str("s=-");
+            out.push_str(eol);
+            session_name_rewritten = true;
+        } else {
+            out.push_str(raw_line);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalise_replaces_real_session_name_with_dash() {
+        let offer = "v=0\r\n\
+                     o=- 123 2 IN IP4 127.0.0.1\r\n\
+                     s=FFmpegPublishSession\r\n\
+                     t=0 0\r\n";
+        let out = normalise_sdp_offer_for_str0m(offer);
+        assert!(out.contains("\r\ns=-\r\n"));
+        assert!(!out.contains("FFmpegPublishSession"));
+    }
+
+    #[test]
+    fn normalise_leaves_dash_session_name_alone() {
+        let offer = "v=0\r\ns=-\r\nt=0 0\r\n";
+        assert_eq!(normalise_sdp_offer_for_str0m(offer), offer);
+    }
+
+    #[test]
+    fn normalise_only_rewrites_first_session_name() {
+        // Per RFC 4566 there is exactly one s= line per SDP, but a media
+        // description in some pathological inputs might contain a literal
+        // `s=` substring. Make sure we don't accidentally touch m=/a= lines
+        // that happen to start with `s` later in the document.
+        let offer = "v=0\r\n\
+                     s=Foo\r\n\
+                     t=0 0\r\n\
+                     m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+                     a=sendonly\r\n";
+        let out = normalise_sdp_offer_for_str0m(offer);
+        assert!(out.contains("\r\ns=-\r\n"));
+        assert!(out.contains("a=sendonly"));
+    }
+
+    #[test]
+    fn normalise_preserves_lf_only_line_endings() {
+        let offer = "v=0\ns=Whatever\nt=0 0\n";
+        let out = normalise_sdp_offer_for_str0m(offer);
+        assert_eq!(out, "v=0\ns=-\nt=0 0\n");
     }
 }

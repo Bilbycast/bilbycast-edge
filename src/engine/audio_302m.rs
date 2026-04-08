@@ -617,16 +617,28 @@ impl S302mOutputPipeline {
                 input.channels, out_channels
             ));
         };
+        // Only enable TPDF dither when the bit-depth conversion will
+        // actually need it: i.e. the source format on the wire is wider
+        // than the target. Bit-perfect (input == output) and bit-promote
+        // (e.g. 16-bit in → 24-bit out) cases must NOT add dither — they
+        // would inject ±1 LSB noise into a stream that should be byte
+        // identical to the source.
+        let out_bd = BitDepth::from_u8(out_bit_depth)
+            .ok_or_else(|| format!("invalid bit depth {out_bit_depth}"))?;
+        let dither = if input.bit_depth.as_u8() > out_bd.as_u8() {
+            crate::engine::audio_transcode::Dither::Tpdf
+        } else {
+            crate::engine::audio_transcode::Dither::None
+        };
         let cfg = TranscodeConfig {
             out_sample_rate: 48_000,
-            out_bit_depth: BitDepth::from_u8(out_bit_depth)
-                .ok_or_else(|| format!("invalid bit depth {out_bit_depth}"))?,
+            out_bit_depth: out_bd,
             out_channels,
             channel_matrix,
             out_packet_time_us,
             out_payload_type: 97,
             src_quality: SrcQuality::High,
-            dither: crate::engine::audio_transcode::Dither::Tpdf,
+            dither,
         };
         let stats = Arc::new(TranscodeStats::new());
         let matrix = MatrixSource::static_(cfg.channel_matrix.clone());

@@ -30,6 +30,52 @@ const TS_PACKETS_PER_DATAGRAM: usize = 7;
 /// Minimum consecutive sync bytes needed to confirm TS alignment.
 const TS_SYNC_CONFIRM_COUNT: usize = 3;
 
+/// RTP header size (no CSRC, no extension).
+const RTP_HEADER_SIZE: usize = 12;
+
+/// RFC 2250 payload type for MPEG-TS over RTP (PT=33, MP2T).
+const RTP_PT_MP2T: u8 = 33;
+
+/// State carried across packets when wrapping raw TS data into RTP.
+/// One per output. SSRC is randomised at construction; sequence number and
+/// timestamp advance monotonically per emitted RTP datagram.
+struct RtpWrapState {
+    seq: u16,
+    ssrc: u32,
+}
+
+impl RtpWrapState {
+    fn new() -> Self {
+        Self {
+            seq: rand::random::<u16>(),
+            ssrc: rand::random::<u32>(),
+        }
+    }
+
+    /// Build a 12-byte RFC 2250 RTP header for an MPEG-TS payload (PT=33).
+    /// `rtp_ts` is the 32-bit RTP timestamp at the 90 kHz MPEG clock; pass
+    /// the value derived from the upstream `RtpPacket::rtp_timestamp` so the
+    /// wire timing reflects the source media clock rather than wall time.
+    /// Sequence number advances by 1 per call.
+    fn build_header(&mut self, rtp_ts: u32) -> [u8; RTP_HEADER_SIZE] {
+        let mut hdr = [0u8; RTP_HEADER_SIZE];
+        hdr[0] = 0x80; // V=2, P=0, X=0, CC=0
+        hdr[1] = RTP_PT_MP2T; // M=0, PT=33
+        hdr[2] = (self.seq >> 8) as u8;
+        hdr[3] = (self.seq & 0xFF) as u8;
+        hdr[4] = (rtp_ts >> 24) as u8;
+        hdr[5] = (rtp_ts >> 16) as u8;
+        hdr[6] = (rtp_ts >> 8) as u8;
+        hdr[7] = rtp_ts as u8;
+        hdr[8] = (self.ssrc >> 24) as u8;
+        hdr[9] = (self.ssrc >> 16) as u8;
+        hdr[10] = (self.ssrc >> 8) as u8;
+        hdr[11] = self.ssrc as u8;
+        self.seq = self.seq.wrapping_add(1);
+        hdr
+    }
+}
+
 /// Spawn a task that subscribes to the broadcast channel and sends
 /// RTP packets out over a UDP socket. If FEC encode is configured,
 /// FEC packets are also generated and sent. If redundancy is configured,
@@ -124,6 +170,15 @@ async fn rtp_output_loop(
     });
     let mut filter_scratch: Vec<u8> = Vec::new();
 
+    // RTP wrap state for raw-TS payloads. Random SSRC + monotonic seq so this
+    // output emits RFC 2250-compliant RTP/MPEG-TS even when its upstream
+    // input was raw TS (UDP, RTMP, RTSP, etc.). The 90 kHz timestamp is
+    // carried from the inbound packet so the wire reflects the source media
+    // clock.
+    let mut rtp_wrap = RtpWrapState::new();
+    // Reusable scratch buffer for [12-byte RTP header || 1316-byte TS] datagrams.
+    let mut rtp_send_buf = Vec::with_capacity(RTP_HEADER_SIZE + TS_PACKETS_PER_DATAGRAM * TS_PACKET_SIZE);
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -213,11 +268,18 @@ async fn rtp_output_loop(
                                 }
                             }
 
-                            // Send complete TS-aligned datagrams
+                            // Send complete TS-aligned datagrams. Each
+                            // 1316-byte TS chunk is wrapped in a fresh 12-byte
+                            // RFC 2250 RTP header (PT=33 MP2T) before send so
+                            // downstream RTP receivers see proper framing.
                             if ts_sync_found {
                                 while ts_realign_buf.len() >= ts_datagram_size {
                                     let datagram = ts_realign_buf.split_to(ts_datagram_size);
-                                    match socket.send_to(&datagram, dest).await {
+                                    let header = rtp_wrap.build_header(packet.rtp_timestamp);
+                                    rtp_send_buf.clear();
+                                    rtp_send_buf.extend_from_slice(&header);
+                                    rtp_send_buf.extend_from_slice(&datagram);
+                                    match socket.send_to(&rtp_send_buf, dest).await {
                                         Ok(sent) => {
                                             stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                                             stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
@@ -380,6 +442,12 @@ async fn rtp_output_redundant_loop(
     });
     let mut filter_scratch: Vec<u8> = Vec::new();
 
+    // RTP wrap state shared by both legs — both legs MUST emit identical
+    // sequence numbers and SSRC so the receiver-side hitless merger can
+    // dedupe by sequence number per SMPTE 2022-7.
+    let mut rtp_wrap = RtpWrapState::new();
+    let mut rtp_send_buf = Vec::with_capacity(RTP_HEADER_SIZE + TS_PACKETS_PER_DATAGRAM * TS_PACKET_SIZE);
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -449,12 +517,18 @@ async fn rtp_output_redundant_loop(
                             if ts_sync_found {
                                 while ts_realign_buf.len() >= ts_datagram_size {
                                     let datagram = ts_realign_buf.split_to(ts_datagram_size);
-                                    // Send to both legs
-                                    if let Ok(sent) = socket1.send_to(&datagram, dest1).await {
+                                    // Build the RTP-wrapped datagram once,
+                                    // send identical bytes to both legs so the
+                                    // receiver-side merger sees matching seq.
+                                    let header = rtp_wrap.build_header(packet.rtp_timestamp);
+                                    rtp_send_buf.clear();
+                                    rtp_send_buf.extend_from_slice(&header);
+                                    rtp_send_buf.extend_from_slice(&datagram);
+                                    if let Ok(sent) = socket1.send_to(&rtp_send_buf, dest1).await {
                                         stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                                         stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
                                     }
-                                    let _ = socket2.send_to(&datagram, dest2).await;
+                                    let _ = socket2.send_to(&rtp_send_buf, dest2).await;
                                 }
                             }
                         } else {
@@ -503,4 +577,53 @@ async fn rtp_output_redundant_loop(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RFC 2250 RTP header validation: V=2, PT=33 (MP2T), monotonic seq,
+    /// stable SSRC across calls.
+    #[test]
+    fn rtp_wrap_state_builds_rfc2250_header() {
+        let mut s = RtpWrapState::new();
+        let initial_ssrc = s.ssrc;
+        let h1 = s.build_header(0x12345678);
+        let h2 = s.build_header(0x12345679);
+
+        // Byte 0: V=2 (top 2 bits = 10), P=0, X=0, CC=0  → 0x80
+        assert_eq!(h1[0], 0x80);
+        assert_eq!(h2[0], 0x80);
+
+        // Byte 1: M=0, PT=33 (MP2T)  → 0x21
+        assert_eq!(h1[1], 33);
+        assert_eq!(h2[1], 33);
+
+        // Sequence number must advance by exactly 1
+        let seq1 = u16::from_be_bytes([h1[2], h1[3]]);
+        let seq2 = u16::from_be_bytes([h2[2], h2[3]]);
+        assert_eq!(seq2.wrapping_sub(seq1), 1);
+
+        // Timestamp written as big-endian u32
+        assert_eq!(u32::from_be_bytes([h1[4], h1[5], h1[6], h1[7]]), 0x12345678);
+        assert_eq!(u32::from_be_bytes([h2[4], h2[5], h2[6], h2[7]]), 0x12345679);
+
+        // SSRC stable across calls and big-endian encoded
+        let ssrc1 = u32::from_be_bytes([h1[8], h1[9], h1[10], h1[11]]);
+        let ssrc2 = u32::from_be_bytes([h2[8], h2[9], h2[10], h2[11]]);
+        assert_eq!(ssrc1, initial_ssrc);
+        assert_eq!(ssrc2, initial_ssrc);
+    }
+
+    /// Sequence wraps cleanly past 0xFFFF.
+    #[test]
+    fn rtp_wrap_state_sequence_wraps() {
+        let mut s = RtpWrapState::new();
+        s.seq = 0xFFFF;
+        let h1 = s.build_header(0);
+        let h2 = s.build_header(0);
+        assert_eq!(u16::from_be_bytes([h1[2], h1[3]]), 0xFFFF);
+        assert_eq!(u16::from_be_bytes([h2[2], h2[3]]), 0x0000);
+    }
 }

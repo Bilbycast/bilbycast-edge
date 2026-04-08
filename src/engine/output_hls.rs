@@ -491,15 +491,41 @@ fn build_remux_args(enc: &AudioEncodeConfig) -> Result<Vec<String>, String> {
             ]);
         }
         AudioCodec::HeAacV1 => {
+            // HE-AAC v1 / v2 encoding is only reliably supported by
+            // `libfdk_aac`. ffmpeg's native `aac` encoder hard-rejects
+            // these profiles with "Profile not supported!" and `aac_at`
+            // (Apple AudioToolbox) silently downgrades to LC, neither of
+            // which is acceptable for a broadcast contribution chain. We
+            // refuse to build args when libfdk_aac isn't present so the
+            // operator gets a clear error at output startup instead of
+            // cryptic per-segment ffmpeg `-22` failures.
+            if !crate::engine::audio_encode::check_libfdk_aac_available() {
+                return Err(
+                    "he_aac_v1 requires an ffmpeg build with libfdk_aac (the native ffmpeg \
+                     `aac` encoder does not support the aac_he profile). Install ffmpeg with \
+                     `--enable-libfdk-aac` (e.g. via the homebrew-ffmpeg/ffmpeg tap on macOS) \
+                     and restart the edge node, or switch this output to `aac_lc`."
+                        .into(),
+                );
+            }
             args.extend([
-                "-c:a".into(), "aac".into(),
+                "-c:a".into(), "libfdk_aac".into(),
                 "-profile:a".into(), "aac_he".into(),
                 "-b:a".into(), bitrate,
             ]);
         }
         AudioCodec::HeAacV2 => {
+            if !crate::engine::audio_encode::check_libfdk_aac_available() {
+                return Err(
+                    "he_aac_v2 requires an ffmpeg build with libfdk_aac (the native ffmpeg \
+                     `aac` encoder does not support the aac_he_v2 profile). Install ffmpeg with \
+                     `--enable-libfdk-aac` (e.g. via the homebrew-ffmpeg/ffmpeg tap on macOS) \
+                     and restart the edge node, or switch this output to `aac_lc`."
+                        .into(),
+                );
+            }
             args.extend([
-                "-c:a".into(), "aac".into(),
+                "-c:a".into(), "libfdk_aac".into(),
                 "-profile:a".into(), "aac_he_v2".into(),
                 "-b:a".into(), bitrate,
             ]);
@@ -612,11 +638,33 @@ mod tests {
     }
 
     #[test]
-    fn build_remux_args_he_aac_profiles() {
-        let args1 = build_remux_args(&make_enc("he_aac_v1")).unwrap();
-        assert!(args1.join(" ").contains("-profile:a aac_he"));
-        let args2 = build_remux_args(&make_enc("he_aac_v2")).unwrap();
-        assert!(args2.join(" ").contains("-profile:a aac_he_v2"));
+    fn build_remux_args_he_aac_requires_libfdk_or_errors_clearly() {
+        // HE-AAC v1/v2 must request libfdk_aac (the native ffmpeg `aac`
+        // encoder hard-rejects the aac_he profiles). When libfdk_aac IS
+        // present we expect a libfdk_aac arg list with the right profile;
+        // when it's NOT present we expect an Err with a message that
+        // mentions libfdk_aac so the operator knows what to install.
+        for (codec, profile) in [
+            ("he_aac_v1", "aac_he"),
+            ("he_aac_v2", "aac_he_v2"),
+        ] {
+            match build_remux_args(&make_enc(codec)) {
+                Ok(args) => {
+                    let joined = args.join(" ");
+                    assert!(
+                        joined.contains("-c:a libfdk_aac"),
+                        "{codec}: expected libfdk_aac, got {joined}"
+                    );
+                    assert!(joined.contains(&format!("-profile:a {profile}")));
+                }
+                Err(msg) => {
+                    assert!(
+                        msg.contains("libfdk_aac"),
+                        "{codec}: error message should mention libfdk_aac, got: {msg}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
