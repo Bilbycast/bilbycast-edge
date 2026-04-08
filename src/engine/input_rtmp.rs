@@ -174,7 +174,7 @@ async fn process_media(
                                     for chunk in &ts_packets {
                                         combined.extend_from_slice(chunk);
                                     }
-                                    let recv_time = std::time::Instant::now().elapsed().as_micros() as u64;
+                                    let recv_time = wall_clock_micros();
                                     let packet = RtpPacket {
                                         data: combined.freeze(),
                                         sequence_number: seq_num,
@@ -236,7 +236,7 @@ async fn process_media(
                                     for chunk in &ts_packets {
                                         combined.extend_from_slice(chunk);
                                     }
-                                    let recv_time = std::time::Instant::now().elapsed().as_micros() as u64;
+                                    let recv_time = wall_clock_micros();
                                     let packet = RtpPacket {
                                         data: combined.freeze(),
                                         sequence_number: seq_num,
@@ -280,6 +280,23 @@ async fn process_media(
             }
         }
     }
+}
+
+/// Wall-clock microseconds since the Unix epoch.
+///
+/// Used as the `recv_time_us` field on `RtpPacket`s emitted by the RTMP
+/// input. Downstream consumers (notably the HLS output) compare this
+/// against the segment-start time to decide when to cut a new segment, so
+/// it must advance with real wall-clock time. The previous implementation
+/// used `Instant::now().elapsed()` which always returns ~0 µs (the elapsed
+/// time since the freshly-constructed Instant), so HLS segment cutting
+/// from RTMP-sourced flows never crossed the duration threshold and
+/// produced zero segments — see the 2026-04-09 Bug B fix in QUALITY_REPORT.md.
+fn wall_clock_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
 }
 
 /// Parse AVCDecoderConfigurationRecord to extract SPS and PPS.
@@ -378,4 +395,39 @@ fn length_prefixed_to_annex_b(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for Bug B (2026-04-09): RTMP packets must carry a
+    /// monotonically advancing wall-clock `recv_time_us` so the HLS output
+    /// can compare consecutive packets and decide when to cut a segment.
+    /// The previous implementation called `Instant::now().elapsed()` which
+    /// returns the duration since the *just-constructed* Instant — i.e.
+    /// approximately zero microseconds, every single call. With every
+    /// packet stamped at ~0 µs the HLS segment-boundary check
+    /// `elapsed_us >= segment_duration_us` never fired and zero segments
+    /// were uploaded.
+    #[test]
+    fn wall_clock_micros_advances_between_calls() {
+        let t1 = wall_clock_micros();
+        // Sleep enough to be visibly larger than any plausible per-call
+        // jitter in CI.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let t2 = wall_clock_micros();
+        assert!(
+            t2 > t1 + 10_000,
+            "wall_clock_micros() did not advance: t1={t1} t2={t2}"
+        );
+        // And the absolute value must look like a real Unix timestamp,
+        // not a tiny number of microseconds since process start. Anything
+        // after 2026-01-01 is fine.
+        let jan_2026_us: u64 = 1_767_225_600_000_000;
+        assert!(
+            t1 > jan_2026_us,
+            "wall_clock_micros() returned a non-Unix value: {t1}"
+        );
+    }
 }
