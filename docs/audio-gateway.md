@@ -40,6 +40,7 @@ operation, and WAN transport.
   - [Why 48 kHz only?](#why-48-khz-only)
   - [Mutually exclusive with FEC, program filtering, and 2022-7](#mutually-exclusive-with-fec-program-filtering-and-2022-7)
   - [Interop tests](#interop-tests)
+- [The `audio_encode` block — compressed-audio egress (RTMP / HLS / WebRTC)](#the-audio_encode-block--compressed-audio-egress-rtmp--hls--webrtc)
 - [Worked use cases](#worked-use-cases)
   - [1. Local AES67 → AES67 monitoring downmix (5.1 → stereo)](#1-local-aes67--aes67-monitoring-downmix-51--stereo)
   - [2. AES67 contribution Sydney → Perth via Bilbycast tunnel](#2-aes67-contribution-sydney--perth-via-bilbycast-tunnel)
@@ -818,6 +819,167 @@ existing `Unknown command` arm, so the protocol version is not bumped.
 
 ---
 
+## The `audio_encode` block — compressed-audio egress (RTMP / HLS / WebRTC)
+
+Bilbycast originally treated audio on the RTMP, HLS, and WebRTC outputs
+as **passthrough only**: AAC frames demuxed from the input TS were
+re-wrapped into FLV / TS / RTP and sent on. That left two big gaps:
+
+1. **No bitrate / sample rate normalisation.** A 320 kbps AAC contribution
+   feed went to YouTube at 320 kbps even when the operator wanted 96 kbps.
+2. **WebRTC silently dropped audio entirely** when the source was AAC,
+   because Opus is the only realistic WebRTC audio codec and there was
+   no decode/encode bridge.
+
+The `audio_encode` block, available on the RTMP, HLS, and WebRTC output
+types, fills both gaps. When set, the output decodes the input AAC-LC
+in-process via the Phase A `engine::audio_decode::AacDecoder`, runs the
+PCM through a long-running `ffmpeg` subprocess that produces the
+configured codec / bitrate / sample rate / channels, and re-injects the
+encoded frames into the output's normal egress path.
+
+The pure-Rust binary is unchanged: ffmpeg is invoked at runtime via
+`tokio::process::Command` and never linked. `testbed/check-binary-purity.sh`
+remains green. Outputs without `audio_encode` set keep working without
+ffmpeg installed at all.
+
+```jsonc
+{
+  "type": "rtmp",
+  "id": "yt-rtmp",
+  "name": "YouTube push",
+  "dest_url": "rtmps://a.rtmps.youtube.com/live2",
+  "stream_key": "...",
+  "audio_encode": {
+    "codec": "aac_lc",
+    "bitrate_kbps": 96
+  }
+}
+```
+
+### Codec × output validity matrix
+
+| Output | Allowed `codec` | Default | Notes |
+|---|---|---|---|
+| `rtmp` | `aac_lc`, `he_aac_v1`, `he_aac_v2` | `aac_lc` | FLV only carries AAC. HE-AAC v2 (`aac_he_v2`) requires an ffmpeg build with `libfdk_aac`; if unavailable the encoder fails fast on the first frame. |
+| `hls` | `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3` | `aac_lc` | HLS-TS supports MP2 (stream type 0x04) and AC-3 (private_stream_1) so long as the consumer's player does. |
+| `webrtc` | `opus` | `opus` | WebRTC realistically only does Opus. Validation also rejects `audio_encode` + `video_only=true` (an audio MID must be negotiated in SDP). |
+
+The validator enforces this matrix at config load time and on every
+`update_config` manager command — invalid combinations are rejected
+without touching the running flows.
+
+### Bitrate / sample rate / channel defaults
+
+| Codec | Default bitrate (kbps) |
+|---|---|
+| `aac_lc` | 128 |
+| `he_aac_v1` | 64 |
+| `he_aac_v2` | 32 |
+| `opus` | 96 |
+| `mp2` | 192 |
+| `ac3` | 192 |
+
+If `sample_rate` is unset, the encoder uses the input PCM sample rate.
+**Opus is always carried at 48 kHz on the wire** regardless of
+`sample_rate`, per RFC 7587. If `channels` is unset, the encoder uses
+the input channel count (1 or 2).
+
+### Same-codec passthrough fast path (RTMP only)
+
+The RTMP output detects the case where you set `audio_encode = { codec:
+aac_lc }` with no overrides on an AAC-LC source, and skips both decoder
+and encoder construction — the existing zero-cost passthrough path runs
+unchanged. This is the right behaviour for "I want to confirm the
+config schema accepts audio_encode but I don't actually need to
+re-encode anything." Any field override (`bitrate_kbps`, `sample_rate`,
+`channels`) forces the full decode/encode chain.
+
+HLS does **not** implement this fast path because we'd have to inspect
+the source TS to detect AAC-LC vs HE-AAC, which requires PMT + audio
+descriptor parsing. Operators who want HLS passthrough simply omit the
+`audio_encode` block. WebRTC also has no fast path — the source is
+always AAC, the sink is always Opus, so passthrough is impossible.
+
+### Failure modes
+
+The encoder is opt-in and fails fast with a clear `audio_encode`
+category event to the manager (Critical severity) when:
+
+- **ffmpeg is missing in `PATH`**: outputs with `audio_encode` set
+  refuse to start (HLS) or drop audio for the rest of the output's
+  lifetime after logging once (RTMP / WebRTC). Outputs without
+  `audio_encode` keep working.
+- **Input audio is not AAC-LC**: Phase A's decoder rejects HE-AAC,
+  AAC-Main, multichannel AAC, etc. The output drops audio and emits
+  the failure event so the operator sees the problem.
+- **`compressed_audio_input` is false**: the flow input cannot carry
+  TS audio (e.g. ST 2110-30, `rtp_audio` are PCM-only). The output
+  drops audio.
+- **Encoder spawn fails**: `ffmpeg` rejects the codec / profile flag
+  combination (e.g. `aac_he_v2` on a build without `libfdk_aac`).
+- **Restart cap exhausted**: the `engine::audio_encode` supervisor
+  restarts ffmpeg with exponential backoff up to 5 times in any 60-second
+  window. After that it gives up and emits the Critical event.
+
+The supervisor also emits **`audio_encode` Info** when the encoder
+starts successfully (with codec / bitrate / SR / channels in the event
+details) and **`audio_encode` Warning** on each restart (with the
+restart counter).
+
+### Marquee end-to-end chain: AAC → Opus WebRTC
+
+The biggest single use case for `audio_encode` is the Phase A + Phase B
+end-to-end chain: AAC contribution comes in via RTMP / SRT / RTSP /
+UDP-TS (decoded by Phase A's `AacDecoder`), runs through Phase B's
+`AudioEncoder` libopus subprocess, and is distributed via WebRTC WHEP
+or WHIP — all inside one bilbycast-edge process with no external
+transcoder.
+
+```jsonc
+{
+  "id": "aac-to-opus-distro",
+  "name": "RTMP AAC contribution -> Opus WHEP distribution",
+  "input": {
+    "type": "rtmp",
+    "listen_addr": "0.0.0.0:1935",
+    "app": "live",
+    "stream_key": "src"
+  },
+  "outputs": [{
+    "type": "webrtc",
+    "id": "whep-out",
+    "name": "WHEP browser distribution",
+    "mode": "whep_server",
+    "video_only": false,
+    "audio_encode": { "codec": "opus", "bitrate_kbps": 96 }
+  }]
+}
+```
+
+See `testbed/AUDIO_ENCODE_TEST.md` for the operator-driven verification
+walkthrough including the `ffmpeg` producer command and the WHEP
+browser viewer step.
+
+### Performance
+
+- **One persistent ffmpeg per encoded RTMP / WebRTC output.** Each
+  long-lived subprocess has three concurrent driver tasks: stdin
+  writer (PCM in via a bounded(64) channel, drop-on-full so a slow
+  encoder never cascades backpressure into the input), stdout reader
+  + per-codec framer, stderr drainer (must always run or ffmpeg
+  deadlocks on a full pipe).
+- **HLS forks ffmpeg per segment** instead. The plan considered using
+  the per-codec encoder + a Rust TS muxer but the existing
+  `engine/rtmp/ts_mux.rs` only knows AAC, and adding MP2 / AC-3 PES
+  framing was disproportionate work for v1. Per-segment fork is
+  acceptable because HLS segments are typically 2-6 s and ffmpeg
+  startup is small relative to that.
+- **Drop-on-full** is by design. Slow ffmpeg → `OutputStatsAccumulator.
+  packets_dropped` increments. The data path is never blocked.
+
+---
+
 ## Validation rules quick reference
 
 The validator runs at config load time and on every `update_config`
@@ -845,6 +1007,13 @@ the running flows.
 | SRT `transport_mode == "audio_302m"` | rejects `packet_filter`, `program_number`, `redundancy` |
 | UDP `transport_mode == "audio_302m"` | rejects `program_number` |
 | SMPTE 302M channel count (when 302M mode active) | 2, 4, 6, 8 (Bilbycast auto-promotes mono → stereo) |
+| `audio_encode.codec` (RTMP) | `aac_lc`, `he_aac_v1`, `he_aac_v2` |
+| `audio_encode.codec` (HLS) | `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3` |
+| `audio_encode.codec` (WebRTC) | `opus` |
+| `audio_encode.bitrate_kbps` | 16..=512 |
+| `audio_encode.sample_rate` | 8000, 16000, 22050, 24000, 32000, 44100, 48000 |
+| `audio_encode.channels` | 1 or 2 |
+| `audio_encode` on WebRTC + `video_only=true` | rejected (audio MID required in SDP) |
 
 ---
 
