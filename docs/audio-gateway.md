@@ -1057,34 +1057,30 @@ guide that are marked READY.
    combined with `redundancy` to surface this constraint at config
    load time.
 
-4. **Manager UI: edit-modal populator for the transcode block.** The
-   create-flow path in the manager UI fully supports the new
-   `transcode` block and the SRT `transport_mode` selector. The
-   edit-flow path round-trips raw JSON correctly (so the persisted
-   config is preserved across edits) but the form fields stay empty
-   when re-opening an existing flow with a `transcode` block — you'll
-   need to re-enter the values or edit raw JSON in the YAML view. The
-   create-flow path is the primary surface and is fully wired.
-
-5. **Manager UI: dedicated `rtp_audio` option in the output-type
+4. **Manager UI: dedicated `rtp_audio` option in the output-type
    dropdown.** The runtime supports `OutputConfig::RtpAudio` end-to-end,
    but the manager UI dropdown still hides it behind raw JSON. Edit the
-   flow config directly to use `"type": "rtp_audio"` for now.
+   flow config directly to use `"type": "rtp_audio"` for now. The
+   underlying gap is wider than just the dropdown — `manager-core`'s
+   `OutputConfig` enum is missing the `RtpAudio`, `St2110_30`,
+   `St2110_31`, and `St2110_40` variants entirely, plus the
+   `TranscodeJson` mirror struct. Closing those is tracked as a
+   separate manager mirror catch-up effort.
 
-6. **Custom channel-map gains in JSON.** The `transcode.channel_map`
+5. **Custom channel-map gains in JSON.** The `transcode.channel_map`
    field currently treats every routed input as unity gain. For
    non-unity routing today, use one of the named presets (which apply
    −3 dB / −6 dB internally). First-class JSON support for per-entry
    gains (`[[in_ch, gain], ...]`) is on the roadmap.
 
-7. **L20 wire format.** L20 is accepted by the validator and the
+6. **L20 wire format.** L20 is accepted by the validator and the
    transcoder; it's serialized on the wire as L24 with the bottom 4
    bits zeroed per RFC 3190 §4.5. If you specifically need L20-aware
    receivers to advertise L20 in their SDP, raise this with the
    maintainer — the on-the-wire bytes are correct but the NMOS
    advertisement may need a follow-up to surface L20 explicitly.
 
-8. **Latency benchmark numbers per use case.** The plan called for
+7. **Latency benchmark numbers per use case.** The plan called for
    measured `transcode_latency_us` and glass-to-glass numbers per use
    case to be reported here. Those need a real test bench (or `tc qdisc`
    network simulation) and will be added once the bench is set up. The
