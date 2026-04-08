@@ -117,9 +117,9 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
     interop tests, and worked use cases.
 
 ### RTMP/RTMPS
-- **Direction:** Output only (publish)
+- **Direction:** Input (publish) and Output (publish)
 - **Transport:** TCP (RTMP) or TLS over TCP (RTMPS)
-- **Use case:** Delivering to Twitch, YouTube Live, Facebook Live
+- **Use case:** Delivering to Twitch, YouTube Live, Facebook Live; ingesting from OBS, Wirecast, ffmpeg
 - **Features:**
   - Pure Rust RTMP protocol implementation (handshake, chunking, AMF0)
   - Demuxes H.264 and AAC from MPEG-2 TS, muxes into FLV
@@ -127,8 +127,8 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
   - Reconnection with configurable delay and max attempts
   - Non-blocking: uses mpsc bridge pattern, never blocks other outputs
   - **MPTS-aware:** on an MPTS input, selects program by `program_number` or (default) locks onto the lowest-numbered program in the PAT
+  - **Optional `audio_encode` block (Phase B):** runs the input AAC through the ffmpeg-sidecar encoder so the operator can normalise bitrate / sample rate / channel count or upgrade to HE-AAC v1/v2 (`aac_lc`, `he_aac_v1`, `he_aac_v2`). Same-codec passthrough fast path skips both decoder and encoder when the source is already AAC-LC and no overrides are set. Requires ffmpeg in PATH at runtime; outputs without `audio_encode` keep working without ffmpeg installed. See [audio-gateway.md](audio-gateway.md#the-audio_encode-block--compressed-audio-egress-rtmp--hls--webrtc).
 - **Limitations:**
-  - Output only. RTMP input (ingest from OBS etc.) is not implemented.
   - Only H.264 video and AAC audio. HEVC/VP9 not supported via RTMP.
   - RTMPS (TLS) uses the `tls` feature (enabled by default).
   - Single-program by spec — only one program can be published per output.
@@ -144,6 +144,7 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
   - Optional Bearer token authentication
   - Async HTTP upload, non-blocking to other outputs
   - **MPTS passthrough** (default) or optional MPTS→SPTS program filter via `program_number` — filtered segments carry a rewritten single-program TS
+  - **Optional `audio_encode` block (Phase B):** each segment is piped through `ffmpeg -i pipe:0 -c:v copy -c:a {codec} -f mpegts pipe:1` before HTTP PUT. Allowed codecs: `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`. Per-segment fork rather than a long-lived encoder because HLS segments are 2-6 s and ffmpeg startup is small relative to that — also lets MP2/AC-3 work without a new TS muxer. Requires ffmpeg in PATH; the output refuses to start if ffmpeg is missing and emits a Critical `audio_encode` event.
 - **Limitations:**
   - Output only. Segment-based transport inherently adds 1-4 seconds of latency.
   - Uses a minimal built-in HTTP client (not a full HTTP/2 client).
@@ -210,7 +211,7 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
   - **WHEP output** (server): Serve browser viewers — endpoint at `/api/v1/flows/{id}/whep`
   - **WHEP input** (client): Pull media from external WHEP servers
 - **Video:** H.264 only (RFC 6184 RTP packetization/depacketization)
-- **Audio:** Opus passthrough. Opus flows natively on WebRTC paths and gets muxed into MPEG-TS for SRT/RTP/UDP outputs. AAC sources going to WebRTC output automatically fall back to video-only (no C-library transcoding).
+- **Audio:** Opus passthrough by default. Opus flows natively on WebRTC paths and gets muxed into MPEG-TS for SRT/RTP/UDP outputs. **Without `audio_encode`, AAC sources going to a WebRTC output automatically fall back to video-only.** Setting an `audio_encode` block (codec: `opus`) enables the Phase B chain: input AAC-LC is decoded in-process via the Phase A `engine::audio_decode::AacDecoder` and re-encoded as Opus via the Phase B ffmpeg-sidecar `engine::audio_encode::AudioEncoder`, then written to the WebRTC audio MID via str0m. This is the marquee Phase A+B chain — **AAC RTMP contribution → Opus WebRTC distribution** — all inside one bilbycast-edge process with no external transcoder. Requires `video_only=false` and ffmpeg in PATH.
 - **MPTS-aware outputs:** on an MPTS input, WHIP/WHEP outputs select program by `program_number` or (default) lock onto the lowest-numbered program in the PAT. Single-program by spec.
 - **Interoperability:** Compatible with OBS, browsers, Cloudflare, LiveKit, and other standard WHIP/WHEP implementations.
 - **Security:** Bearer token authentication on WHIP/WHEP endpoints, DTLS/SRTP encryption, ICE-lite for server modes.

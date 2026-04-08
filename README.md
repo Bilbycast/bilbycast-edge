@@ -13,14 +13,25 @@ Supports NMOS IS-04 (Discovery & Registration) and IS-05 (Connection Management)
 | SRT      | Yes   | Yes    | Caller, listener, rendezvous modes; AES encryption; Stream ID access control; 2022-7 redundancy. **`transport_mode: "audio_302m"`** for SMPTE 302M LPCM-in-MPEG-TS over SRT (output side; input demux deferred) |
 | RTP      | Yes   | Yes    | RTP-wrapped over UDP; unicast and multicast; SMPTE 2022-1 FEC; DSCP QoS |
 | UDP      | Yes   | Yes    | Raw MPEG-TS over UDP; unicast and multicast; DSCP QoS marking. **`transport_mode: "audio_302m"`** for SMPTE 302M LPCM-in-MPEG-TS over UDP |
-| RTMP     | Yes   | Yes    | H.264/AAC; accepts publish from OBS/ffmpeg; supports RTMPS (TLS) |
+| RTMP     | Yes   | Yes    | H.264/AAC; accepts publish from OBS/ffmpeg; supports RTMPS (TLS); optional `audio_encode` re-encode block (AAC-LC / HE-AAC v1/v2) |
 | RTSP     | Yes   | No     | Pull H.264/H.265 from IP cameras/media servers; TCP/UDP transport; auto-reconnect |
-| HLS      | No    | Yes    | Segment-based ingest; supports HEVC/HDR         |
-| WebRTC   | Yes   | Yes    | WHIP/WHEP; H.264 video + Opus audio (enabled by default) |
+| HLS      | No    | Yes    | Segment-based ingest; supports HEVC/HDR; optional `audio_encode` per-segment re-encode (AAC family / MP2 / AC-3) |
+| WebRTC   | Yes   | Yes    | WHIP/WHEP; H.264 video + Opus audio (enabled by default). Optional `audio_encode` block enables AAC → Opus on-the-fly via the ffmpeg sidecar |
 | **SMPTE ST 2110-30** | Yes | Yes | RFC 3551 PCM audio (L16/L24); 2022-7 dual-network; PTP slave via external `ptp4l`. Optional per-output `transcode` block (sample-rate / bit-depth / channel routing) |
 | **SMPTE ST 2110-31** | Yes | Yes | AES3 transparent audio (24-bit), preserves Dolby E and AES3 sub-frame bits |
 | **SMPTE ST 2110-40** | Yes | Yes | RFC 8331 ancillary data (SCTE-104, SMPTE 12M timecode, CEA-608/708 captions) |
 | **`rtp_audio`** | Yes | Yes | Generic RFC 3551 PCM-over-RTP — wire-identical to ST 2110-30 but **no PTP requirement**, sample rates 32 / 44.1 / 48 / 88.2 / 96 kHz. For radio contribution, talkback, ffmpeg / OBS interop. Same `transcode` block as ST 2110-30. Output supports `transport_mode: "audio_302m"` (RTP/MP2T encapsulation per RFC 2250) |
+
+**Compressed-audio bridge (Phase A + Phase B):** AAC contribution audio
+carried in MPEG-TS over RTMP / RTSP / SRT / UDP / RTP can be decoded
+in-process via the pure-Rust `symphonia-codec-aac` (Phase A) and either
+land into the PCM-only ST 2110 / `rtp_audio` / SMPTE 302M outputs, or
+be re-encoded via an ffmpeg sidecar subprocess (Phase B) into AAC,
+HE-AAC v1/v2, Opus, MP2, or AC-3 for the RTMP, HLS, and WebRTC outputs.
+The pure-Rust binary stays unchanged — `ffmpeg` is invoked at runtime,
+never linked. The marquee chain is **AAC RTMP contribution → Opus
+WebRTC distribution** in a single bilbycast-edge process. See
+[`docs/audio-gateway.md`](docs/audio-gateway.md).
 
 ## Quick Start
 

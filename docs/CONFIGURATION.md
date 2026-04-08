@@ -584,7 +584,11 @@ Sends raw MPEG-TS over UDP without RTP headers. Datagrams are TS-aligned (7×188
 
 ### RTMP Output (`"type": "rtmp"`)
 
-H.264/AAC only. Supports RTMPS (TLS) via `rtmps://` URLs.
+H.264/AAC only. Supports RTMPS (TLS) via `rtmps://` URLs. Audio is
+passthrough by default; the optional `audio_encode` block runs the
+input AAC through the Phase B ffmpeg-sidecar encoder so the operator
+can normalise bitrate / sample rate / channel count or upgrade to
+HE-AAC v1/v2 — see [`audio-gateway.md`](audio-gateway.md#the-audio_encode-block--compressed-audio-egress-rtmp--hls--webrtc).
 
 | Field                      | Type    | Default | Description                                     |
 |----------------------------|---------|---------|-------------------------------------------------|
@@ -596,6 +600,7 @@ H.264/AAC only. Supports RTMPS (TLS) via `rtmps://` URLs.
 | `reconnect_delay_secs`     | `u64`   | `5`     | Delay between reconnection attempts             |
 | `max_reconnect_attempts`   | `u32?`  | `null`  | Maximum reconnect attempts (null = unlimited)   |
 | `program_number`           | `u16?`  | `null`  | MPTS program selector. `null` = lock onto the lowest program_number in the PAT (deterministic default for MPTS inputs); `Some(N)` = extract elementary streams from program N only. RTMP is single-program by spec, so this only changes *which* program is published. Must be `> 0`. |
+| `audio_encode`             | `AudioEncodeConfig?` | `null`  | Optional ffmpeg-sidecar audio encoder. Allowed `codec`: `aac_lc` (default), `he_aac_v1`, `he_aac_v2`. Requires ffmpeg in PATH at runtime; outputs without `audio_encode` set keep working without ffmpeg. The same-codec passthrough fast path applies when `codec == aac_lc` with no overrides on an AAC-LC source. See `AudioEncodeConfig` shape below. |
 
 ### HLS Output (`"type": "hls"`)
 
@@ -611,10 +616,21 @@ Segment-based HTTP ingest. Supports HEVC/HDR content.
 | `auth_token`           | `string?` | `null`  | Bearer token for Authorization header            |
 | `max_segments`         | `usize`   | `5`     | Maximum segments in rolling playlist             |
 | `program_number`       | `u16?`    | `null`  | MPTS → SPTS program filter. `null` = each segment carries the full MPTS; `Some(N)` = each segment carries only program N as a rewritten single-program TS. Must be `> 0`. |
+| `audio_encode`         | `AudioEncodeConfig?` | `null` | Optional per-segment ffmpeg remuxer. Allowed `codec`: `aac_lc` (default), `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`. Each segment is piped through `ffmpeg -i pipe:0 -c:v copy -c:a {codec} -f mpegts pipe:1`. Requires ffmpeg in PATH; the output refuses to start if ffmpeg is missing and emits a Critical `audio_encode` event. |
 
 ### WebRTC Output (`"type": "webrtc"`)
 
-WebRTC output supporting two modes: WHIP client (push to external endpoint) and WHEP server (serve viewers). The `webrtc` feature is enabled by default. Video: H.264 only; audio: Opus passthrough only (AAC sources fall back to video-only automatically).
+WebRTC output supporting two modes: WHIP client (push to external
+endpoint) and WHEP server (serve viewers). The `webrtc` feature is
+enabled by default. Video: H.264 only.
+
+**Audio:** by default the WebRTC output is video-only when the source
+carries AAC. Setting an `audio_encode` block (codec: `opus`) enables
+the Phase B chain — input AAC-LC is decoded in-process via the Phase A
+`AacDecoder`, encoded to Opus via the ffmpeg-sidecar `AudioEncoder`,
+and written to the WebRTC audio MID via str0m. This is the marquee
+"AAC contribution → Opus distribution" path. Requires `video_only=false`
+so SDP negotiates an audio MID.
 
 | Field          | Type      | Default        | Description                                     |
 |----------------|-----------|----------------|-------------------------------------------------|
@@ -626,8 +642,21 @@ WebRTC output supporting two modes: WHIP client (push to external endpoint) and 
 | `bearer_token` | `string?` | `null`         | Bearer token for authentication                  |
 | `max_viewers`  | `u32?`    | `10`           | Max concurrent viewers (WHEP server mode only, 1-100) |
 | `public_ip`    | `string?` | `null`         | Public IP for ICE candidates (NAT traversal)     |
-| `video_only`   | `bool`    | `false`        | Send only video (audio omitted)                  |
+| `video_only`   | `bool`    | `false`        | Send only video (audio omitted). Mutually exclusive with `audio_encode`. |
 | `program_number` | `u16?`  | `null`         | MPTS program selector. `null` = lock onto the lowest program_number in the PAT (deterministic default); `Some(N)` = extract elementary streams from program N only. WebRTC is single-program by spec, so this only changes *which* program is sent. Must be `> 0`. |
+| `audio_encode` | `AudioEncodeConfig?` | `null` | Optional ffmpeg-sidecar audio encoder. Only `codec: opus` is allowed for WebRTC. Validation rejects `audio_encode` + `video_only=true` (an audio MID must be negotiated in SDP). Requires ffmpeg in PATH; the encoder builds lazily on the first AAC frame after a viewer connects. |
+
+#### `AudioEncodeConfig` block (Phase B)
+
+Used by RTMP, HLS, and WebRTC outputs. Validation enforces a strict
+codec×output matrix at config load time — see [`audio-gateway.md`](audio-gateway.md#the-audio_encode-block--compressed-audio-egress-rtmp--hls--webrtc).
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `codec` | `string` | -- | One of: `aac_lc`, `he_aac_v1`, `he_aac_v2`, `opus`, `mp2`, `ac3`. RTMP allows AAC family only; HLS allows AAC family + `mp2` + `ac3`; WebRTC allows `opus` only. |
+| `bitrate_kbps` | `u32?` | per-codec default (AAC-LC=128, HE-AAC-v1=64, HE-AAC-v2=32, Opus=96, MP2=192, AC-3=192) | Output bitrate. Range 16..=512. |
+| `sample_rate` | `u32?` | input sample rate | Output sample rate (Hz). Allowed: 8000, 16000, 22050, 24000, 32000, 44100, 48000. Opus is always carried at 48 kHz on the wire regardless of this field. |
+| `channels` | `u8?` | input channel count | Output channel count, 1 or 2. |
 
 ### SMPTE ST 2110-30 / -31 Audio Output (`"type": "st2110_30"` / `"st2110_31"`)
 

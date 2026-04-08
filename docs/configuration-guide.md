@@ -768,7 +768,11 @@ Publishes to an RTMP/RTMPS server (e.g., Twitch, YouTube Live, Facebook Live). D
   "dest_url": "rtmp://live.twitch.tv/app",
   "stream_key": "live_123456789_abcdefghijklmnop",
   "reconnect_delay_secs": 5,
-  "max_reconnect_attempts": 10
+  "max_reconnect_attempts": 10,
+  "audio_encode": {
+    "codec": "aac_lc",
+    "bitrate_kbps": 96
+  }
 }
 ```
 
@@ -782,6 +786,7 @@ Publishes to an RTMP/RTMPS server (e.g., Twitch, YouTube Live, Facebook Live). D
 | `reconnect_delay_secs` | integer | No | `5` | Seconds to wait before reconnecting after a failure. Must be > 0. |
 | `max_reconnect_attempts` | integer | No | `null` (unlimited) | Maximum reconnection attempts. When `null`, reconnects indefinitely. |
 | `program_number` | integer | No | `null` | MPTS program selector. `null` = lock onto the lowest program_number in the PAT (deterministic default); `Some(N)` = extract elementary streams from program N only. RTMP is single-program by spec, so this only changes *which* program is published. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
+| `audio_encode` | object | No | `null` | Optional ffmpeg-sidecar audio encoder. Enables PCM → compressed re-encode so the operator can normalise bitrate / sample rate / channel count or upgrade to HE-AAC v1/v2. Allowed `codec`: `aac_lc`, `he_aac_v1`, `he_aac_v2`. Same-codec passthrough fast path applies on AAC-LC source with no field overrides. Requires ffmpeg in PATH. See the [`audio_encode` block](#the-audio_encode-block-phase-b) below and [`audio-gateway.md`](audio-gateway.md#the-audio_encode-block--compressed-audio-egress-rtmp--hls--webrtc). |
 
 **Limitations:**
 - Output only. RTMP input is not supported.
@@ -813,6 +818,7 @@ Segments MPEG-2 TS data and uploads via HTTP for HLS ingest (e.g., YouTube HLS).
 | `auth_token` | string | No | `null` | Bearer token sent with each HTTP upload request. |
 | `max_segments` | integer | No | `5` | Maximum segments in the rolling playlist. Range: 1-30. |
 | `program_number` | integer | No | `null` | MPTS → SPTS program filter. `null` = each segment carries the full MPTS; `Some(N)` = each segment carries only program N as a rewritten single-program TS. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
+| `audio_encode` | object | No | `null` | Optional per-segment ffmpeg remuxer. Each segment is piped through `ffmpeg -i pipe:0 -c:v copy -c:a {codec} -f mpegts pipe:1` before HTTP PUT. Allowed `codec`: `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`. Requires ffmpeg in PATH; the output refuses to start if ffmpeg is missing. See the [`audio_encode` block](#the-audio_encode-block-phase-b) below. |
 
 **Limitations:**
 - Output only. Segment-based transport inherently adds 1-4 seconds of latency.
@@ -859,10 +865,54 @@ Viewers POST an SDP offer to `/api/v1/flows/{flow_id}/whep` and receive an SDP a
 | `bearer_token` | string | No | `null` | Bearer token for authentication. |
 | `max_viewers` | integer | No | `10` | Max concurrent viewers (WHEP server mode only, 1-100). |
 | `public_ip` | string | No | `null` | Public IP for ICE candidates (NAT traversal). |
-| `video_only` | boolean | No | `false` | Only send video (audio omitted). AAC sources automatically fall back to video-only. |
+| `video_only` | boolean | No | `false` | Only send video (audio omitted). Mutually exclusive with `audio_encode` — validation rejects the combination because an audio MID must be negotiated in SDP for the encoder to write to. |
 | `program_number` | integer | No | `null` | MPTS program selector. `null` = lock onto the lowest program_number in the PAT (deterministic default); `Some(N)` = extract elementary streams from program N only. WebRTC is single-program by spec, so this only changes *which* program is sent. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
+| `audio_encode` | object | No | `null` | Optional ffmpeg-sidecar audio encoder. The only realistic codec for WebRTC is `opus`, and validation rejects anything else. When set, input AAC-LC is decoded in-process via the Phase A `AacDecoder`, encoded to Opus via the Phase B ffmpeg sidecar, and written to the WebRTC audio MID via str0m. This is the marquee Phase A+B "AAC contribution → Opus distribution" path. Requires `video_only=false` and ffmpeg in PATH. The encoder builds lazily on the first AAC frame after a viewer connects. See the [`audio_encode` block](#the-audio_encode-block-phase-b) below. |
 
-**Audio:** Opus passthrough only. Opus flows natively on WebRTC paths. AAC sources fall back to video-only automatically (no C-library transcoding available).
+**Audio:** Without `audio_encode`, the WebRTC output is video-only when
+the source carries AAC (Opus passthrough only — Opus flows natively on
+WebRTC paths). Setting an `audio_encode` block (codec: `opus`) enables
+the marquee Phase A+B chain: AAC decoded in-process via Phase A's
+`AacDecoder`, re-encoded as Opus via Phase B's ffmpeg sidecar
+`AudioEncoder`, written to the str0m audio MID. See
+[`audio-gateway.md`](audio-gateway.md#the-audio_encode-block--compressed-audio-egress-rtmp--hls--webrtc).
+
+### The `audio_encode` block (Phase B)
+
+Used by RTMP, HLS, and WebRTC outputs. Validation enforces a strict
+codec×output matrix at config load time: RTMP allows AAC-LC / HE-AAC
+v1 / HE-AAC v2; HLS allows the same plus MP2 / AC-3; WebRTC allows
+Opus only.
+
+```json
+{
+  "codec": "opus",
+  "bitrate_kbps": 96,
+  "sample_rate": 48000,
+  "channels": 2
+}
+```
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `codec` | string | Yes | - | One of: `aac_lc`, `he_aac_v1`, `he_aac_v2`, `opus`, `mp2`, `ac3`. Must be valid for the parent output type per the matrix above. |
+| `bitrate_kbps` | integer | No | per-codec default (AAC-LC=128, HE-AAC-v1=64, HE-AAC-v2=32, Opus=96, MP2=192, AC-3=192) | Output bitrate in kbps. Range 16..=512. |
+| `sample_rate` | integer | No | input sample rate | Output sample rate (Hz). Allowed: 8000, 16000, 22050, 24000, 32000, 44100, 48000. **Opus is always carried at 48 kHz on the wire** regardless of this field. |
+| `channels` | integer | No | input channel count | Output channel count, 1 or 2. |
+
+**Failure modes:** the encoder is opt-in. When ffmpeg is missing in
+PATH, the input is non-AAC-LC, the flow input cannot carry TS audio
+(PCM-only sources), or the encoder spawn / restart cap is exhausted,
+the output emits a Critical `audio_encode` event to the manager and
+audio is dropped silently for the rest of the output's lifetime
+(video continues). HLS refuses to start outright when ffmpeg is
+missing because it can't degrade gracefully. See
+[`events-and-alarms.md`](events-and-alarms.md#audio-encoder-audio_encode)
+for the full event reference.
+
+**HE-AAC v2 caveat:** `aac_he_v2` requires an ffmpeg build with
+`libfdk_aac`. If the host's ffmpeg doesn't have it, the encoder
+fails fast on the first frame and emits the failure event.
 
 ---
 

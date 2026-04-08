@@ -171,6 +171,31 @@ The disconnect event fires **once per connection cycle** — if the RTSP server 
 
 ---
 
+### Audio Encoder (`audio_encode`)
+
+ffmpeg-sidecar audio encoder lifecycle for the Phase B compressed-audio
+egress on RTMP, HLS, and WebRTC outputs. Emitted by the per-output
+build helpers (`output_rtmp::build_encoder_state`,
+`output_hls::hls_output_loop` startup gate,
+`output_webrtc::build_webrtc_encoder_state`) and the long-running
+encoder supervisor (`engine::audio_encode::supervisor_loop`).
+
+| Severity | Message | Trigger |
+|----------|---------|---------|
+| info | audio encoder started: output '{id}' codec={codec} {N} kbps | First successful ffmpeg spawn for an RTMP/WebRTC output, or HLS startup with `audio_encode` set. Details payload: `{ output_id, codec, bitrate_kbps, sample_rate, channels }` |
+| warning | audio encoder restarted: output '{id}' restart {N}/{max} | Supervisor restarted ffmpeg after a crash. Details payload: `{ output_id, restart_count, max_restarts }` |
+| warning | HLS output '{id}': segment {n} remux failed: {error} | Per-segment ffmpeg fork failed on a single HLS segment. The next segment may succeed |
+| critical | audio encoder failed: output '{id}' exhausted {N} restarts in {S} s | Supervisor gave up after MAX_RESTARTS in RESTART_WINDOW |
+| critical | RTMP/HLS/WebRTC output '{id}': audio_encode requires ffmpeg in PATH but it is not installed | ffmpeg missing at lazy-build time |
+| critical | output '{id}': audio_encode requires AAC-LC input ... got profile={p} | Phase A `AacDecoder` rejected the source AAC profile (HE-AAC, AAC-Main, multichannel, etc.) |
+| critical | output '{id}': audio_encode is set but the flow input cannot carry TS audio (PCM-only source) | `compressed_audio_input` is false (e.g. ST 2110-30, `rtp_audio` input) |
+| critical | output '{id}': audio_encode encoder spawn failed: {error} | `AudioEncoder::spawn` failed for any other reason (codec rejected by ffmpeg, etc.) |
+
+**Source**: `src/engine/audio_encode.rs`, `src/engine/output_rtmp.rs`,
+`src/engine/output_hls.rs`, `src/engine/output_webrtc.rs`.
+
+---
+
 ### Tunnel (`tunnel`)
 
 | Severity | Message | Trigger |
@@ -237,6 +262,7 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `rtsp` | 2 | RTSP input state |
 | `hls` | 2 | HLS output failures |
 | `webrtc` | 8 | WHIP/WHEP session lifecycle |
+| `audio_encode` | 7 | ffmpeg-sidecar audio encoder lifecycle (Phase B) |
 | `tunnel` | 8 | Tunnel connection state |
 | `manager` | 3 | Manager WebSocket connection |
 | `config` | 2 | Configuration changes |
@@ -244,7 +270,7 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `network_leg` | — | SMPTE 2022-7 Red/Blue per-leg loss / recovery (Phase 1) |
 | `nmos` | — | NMOS IS-04 / IS-05 / IS-08 controller activity (Phase 1) |
 | `scte104` | — | SCTE-104 splice events parsed from ST 2110-40 ANC (Phase 1) |
-| **Total** | **51** | |
+| **Total** | **58** | |
 
 ### Phase 1 ST 2110 categories
 
@@ -266,6 +292,6 @@ mapping:
 
 | Severity | Count | Description |
 |----------|-------|-------------|
-| critical | 11 | Service-impacting: flow/tunnel failures, auth rejection, both legs lost, bandwidth block |
-| warning | 18 | Degradation: disconnects, stale connections, upload failures, reconnects, bandwidth exceeded |
-| info | 22 | State changes: connections established, flows started, config updated, bandwidth recovery |
+| critical | 16 | Service-impacting: flow/tunnel failures, auth rejection, both legs lost, bandwidth block, audio_encode build/restart-cap failures |
+| warning | 20 | Degradation: disconnects, stale connections, upload failures, reconnects, bandwidth exceeded, audio_encode restart / per-segment HLS remux failure |
+| info | 23 | State changes: connections established, flows started, config updated, bandwidth recovery, audio_encode started |
