@@ -63,8 +63,26 @@ async fn whip_input_loop(
     mut session_rx: tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>,
     events: &EventSender,
 ) {
-    let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
-    let public_ip = config.public_ip.as_ref().and_then(|ip| ip.parse().ok());
+    let public_ip: Option<std::net::IpAddr> =
+        config.public_ip.as_ref().and_then(|ip| ip.parse().ok());
+    // Bind the WebRTC UDP socket to the public_ip when set, so the
+    // socket's local address (which we report as the destination on every
+    // incoming packet) matches the host candidate we advertise to the
+    // peer. Without this the agent's per-packet destination check inside
+    // the `is` ICE state machine sees `0.0.0.0:<port>` and refuses to
+    // pair the incoming STUN binding request with the local candidate
+    // (`Discarding STUN request on unknown interface: 0.0.0.0:<port>`),
+    // and the connection silently goes straight to Disconnected.
+    //
+    // When `public_ip` is unset we still bind to 0.0.0.0 (legacy
+    // behaviour) so existing LAN deployments that auto-detected an
+    // interface IP via the route-discovery probe keep working — but in
+    // that mode the destination-mismatch issue may still bite. Operators
+    // who hit it should set `public_ip` explicitly.
+    let bind_addr: std::net::SocketAddr = match public_ip {
+        Some(ip) => std::net::SocketAddr::new(ip, 0),
+        None => "0.0.0.0:0".parse().unwrap(),
+    };
 
     loop {
         // Wait for a WHIP publisher to connect

@@ -138,3 +138,37 @@ version = "0.19.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# ---------------------------------------------------------------------------
+# BILBYCAST PATCH: vendored `is` 0.8.0 with the strict-PRIORITY check on ICE
+# Binding Requests removed.
+#
+# Why: ffmpeg's WHIP muxer (and a few other production WHIP publishers)
+# sends ICE connectivity-check Binding Requests without the PRIORITY
+# attribute. RFC 5245 §7.1.2.1 says PRIORITY is mandatory, so it's
+# technically a peer bug, but `is` 0.8.0 hard-rejects the packets at parse
+# time and str0m never even sees them. The result is every ffmpeg-WHIP
+# publish stalls in ICE, DTLS times out at 5 s, and no media flows. See
+# the 2026-04-09 Bug A entry in testbed/QUALITY_REPORT.md.
+#
+# The patched `is` (only stun.rs differs from upstream — single hunk)
+# lives in `vendor/is/`. The diff against upstream is a single
+# comment-replacement block clearly marked `BILBYCAST PATCH`.
+#
+# WHEN UPGRADING str0m:
+#   1. Run `cargo update -p str0m`. If str0m's new version still depends
+#      on `is = "0.8"`, this patch keeps applying — done.
+#   2. If `cargo build` emits `warning: Patch ... was not used in the
+#      crate graph`, the patch's version range no longer matches. Either:
+#        a) re-vendor the matching `is` version (copy from
+#           ~/.cargo/registry/src/index.crates.io-*/is-X.Y.Z, re-apply
+#           the same one-hunk diff in vendor/is/src/stun.rs, update this
+#           comment and the path), OR
+#        b) check whether upstream `is` (or str0m) finally landed a
+#           permissive parser. If so, drop this entire
+#           `[patch.crates-io]` section and the `vendor/is/` tree.
+#   3. CI should grep the build output for `Patch .* was not used` and
+#      fail on match — guards against silent regression on str0m bumps.
+# ---------------------------------------------------------------------------
+[patch.crates-io]
+is = { path = "vendor/is" }

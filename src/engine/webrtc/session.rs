@@ -75,24 +75,44 @@ impl WebrtcSession {
             .set_ice_lite(true)
             .build(Instant::now());
 
-        // Add host candidate — resolve 0.0.0.0 to a real local IP
-        let candidate_ip = config.public_ip.unwrap_or_else(|| {
-            let ip = local_addr.ip();
-            if ip.is_unspecified() {
-                // Discover a real local IP by connecting a throwaway UDP socket
-                std::net::UdpSocket::bind("0.0.0.0:0")
-                    .and_then(|s| { s.connect("8.8.8.8:80")?; s.local_addr() })
-                    .map(|a| a.ip())
-                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
-            } else {
-                ip
-            }
-        });
-        let candidate_addr = SocketAddr::new(candidate_ip, local_addr.port());
-        rtc.add_local_candidate(
-            Candidate::host(candidate_addr, Protocol::Udp)
-                .map_err(|e| anyhow::anyhow!("ICE candidate error: {}", e))?,
+        // Build the host-candidate set the answer SDP will advertise.
+        //
+        // When the operator pinned a `public_ip` we honour it verbatim —
+        // they know the deployment topology better than we do (NAT 1:1
+        // mappings, behind-LB deployments). The caller has *also* bound
+        // the UDP socket to that exact IP so the destination address on
+        // every incoming packet matches the local candidate (see
+        // `engine::input_webrtc::whip_input_loop` for the matching bind
+        // logic — without it, the `is` ICE state machine discards every
+        // STUN binding request as `unknown interface`).
+        //
+        // When the bind is unspecified (`0.0.0.0`) we advertise both
+        // loopback **and** the route-discovered LAN IP, so same-host
+        // peers (loopback / dev / WHIP smoke tests) and real LAN peers
+        // both have a candidate they can reach. The previous
+        // implementation only advertised the LAN IP and silently broke
+        // loopback testing on macOS.
+        let port = local_addr.port();
+        let route_discovered_lan_ip = || -> Option<std::net::IpAddr> {
+            std::net::UdpSocket::bind("0.0.0.0:0")
+                .and_then(|s| { s.connect("8.8.8.8:80")?; s.local_addr() })
+                .ok()
+                .map(|a| a.ip())
+                .filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
+        };
+        let candidate_ips = select_local_candidate_ips(
+            local_addr.ip(),
+            config.public_ip,
+            route_discovered_lan_ip,
         );
+
+        for ip in &candidate_ips {
+            let cand_addr = SocketAddr::new(*ip, port);
+            let cand = Candidate::host(cand_addr, Protocol::Udp)
+                .map_err(|e| anyhow::anyhow!("ICE candidate error: {}", e))?;
+            rtc.add_local_candidate(cand);
+            tracing::debug!("WebRTC: added local ICE host candidate {cand_addr}");
+        }
 
         Ok(Self {
             rtc,
@@ -317,6 +337,45 @@ impl WebrtcSession {
     }
 }
 
+/// Pick the set of local IPs to advertise as ICE host candidates.
+///
+/// This is the pure-data half of `WebrtcSession::new`'s candidate-selection
+/// logic, broken out so it can be unit-tested without binding real
+/// sockets. The interesting cases are:
+///
+/// - **Operator pinned `public_ip`** — return exactly that IP. The operator
+///   knows the deployment topology better than we do (e.g. NAT 1:1
+///   mappings, behind-LB deployments), so honour it verbatim. The caller
+///   is expected to bind the UDP socket to that same IP so per-packet
+///   destination matches the local candidate.
+/// - **Bound to an unspecified address** (`0.0.0.0` / `::`) — advertise
+///   loopback **and** the route-discovered LAN IP, so both same-host
+///   peers (loopback / unit tests / WHIP smoke tests on a developer
+///   laptop) and real LAN peers can reach us. The previous implementation
+///   only advertised the LAN IP and silently broke loopback testing on
+///   macOS — see the 2026-04-09 Bug A fix in QUALITY_REPORT.md.
+/// - **Bound to a specific interface** — advertise that interface's IP.
+fn select_local_candidate_ips(
+    bound_ip: std::net::IpAddr,
+    pinned: Option<std::net::IpAddr>,
+    route_discovered_lan_ip: impl FnOnce() -> Option<std::net::IpAddr>,
+) -> Vec<std::net::IpAddr> {
+    if let Some(p) = pinned {
+        return vec![p];
+    }
+    if !bound_ip.is_unspecified() {
+        return vec![bound_ip];
+    }
+    let mut out: Vec<std::net::IpAddr> =
+        vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
+    if let Some(lan) = route_discovered_lan_ip() {
+        if !out.contains(&lan) {
+            out.push(lan);
+        }
+    }
+    out
+}
+
 /// Normalise an incoming SDP offer so str0m's overly strict parser will
 /// accept it.
 ///
@@ -395,5 +454,72 @@ mod tests {
         let offer = "v=0\ns=Whatever\nt=0 0\n";
         let out = normalise_sdp_offer_for_str0m(offer);
         assert_eq!(out, "v=0\ns=-\nt=0 0\n");
+    }
+
+    /// Bug A regression (2026-04-09): when the WebRTC socket is bound to
+    /// `0.0.0.0` and the operator did not pin a `public_ip`, we MUST
+    /// advertise loopback in addition to the LAN IP so same-host peers
+    /// (notably ffmpeg WHIP on a developer laptop) can reach us. The
+    /// previous implementation only advertised the LAN IP, which silently
+    /// broke loopback ICE/DTLS on macOS.
+    #[test]
+    fn select_candidate_ips_unspecified_bind_advertises_loopback_and_lan() {
+        let lan: std::net::IpAddr = "192.168.7.42".parse().unwrap();
+        let ips = select_local_candidate_ips(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            None,
+            || Some(lan),
+        );
+        assert_eq!(ips.len(), 2);
+        assert_eq!(ips[0], std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        assert_eq!(ips[1], lan);
+    }
+
+    #[test]
+    fn select_candidate_ips_unspecified_bind_falls_back_to_loopback_only() {
+        // No discoverable LAN IP (e.g. host has no default route).
+        let ips = select_local_candidate_ips(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            None,
+            || None,
+        );
+        assert_eq!(ips, vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]);
+    }
+
+    #[test]
+    fn select_candidate_ips_pinned_public_ip_wins() {
+        let pinned: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let ips = select_local_candidate_ips(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            Some(pinned),
+            || panic!("must not call route discovery when public_ip is pinned"),
+        );
+        assert_eq!(ips, vec![pinned]);
+    }
+
+    #[test]
+    fn select_candidate_ips_specific_bind_uses_bound_ip() {
+        let bound: std::net::IpAddr = "10.0.0.5".parse().unwrap();
+        let ips = select_local_candidate_ips(
+            bound,
+            None,
+            || panic!("must not call route discovery when bind is specific"),
+        );
+        assert_eq!(ips, vec![bound]);
+    }
+
+    #[test]
+    fn select_candidate_ips_dedupes_loopback_lan() {
+        // Pathological: route discovery returns loopback. Don't list twice.
+        let lo: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let ips = select_local_candidate_ips(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            None,
+            || Some(lo),
+        );
+        // Route-discovery filter inside `WebrtcSession::new` rejects
+        // loopback before passing it in, so this would normally be `None`,
+        // but the dedupe logic should still hold defensively.
+        assert_eq!(ips, vec![lo]);
     }
 }
