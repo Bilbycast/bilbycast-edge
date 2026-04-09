@@ -832,16 +832,16 @@ re-wrapped into FLV / TS / RTP and sent on. That left two big gaps:
    no decode/encode bridge.
 
 The `audio_encode` block, available on the RTMP, HLS, and WebRTC output
-types, fills both gaps. When set, the output decodes the input AAC-LC
-in-process via the Phase A `engine::audio_decode::AacDecoder`, runs the
-PCM through a long-running `ffmpeg` subprocess that produces the
-configured codec / bitrate / sample rate / channels, and re-injects the
-encoded frames into the output's normal egress path.
+types, fills both gaps. When set, the output decodes the input AAC
+in-process via the Phase A `engine::audio_decode::AacDecoder`, then
+re-encodes via Phase B's `engine::audio_encode::AudioEncoder`.
 
-The pure-Rust binary is unchanged: ffmpeg is invoked at runtime via
-`tokio::process::Command` and never linked. `testbed/check-binary-purity.sh`
-remains green. Outputs without `audio_encode` set keep working without
-ffmpeg installed at all.
+**Default (`fdk-aac` feature, on by default):** AAC codecs (AAC-LC,
+HE-AAC v1, HE-AAC v2) are encoded in-process via Fraunhofer FDK AAC —
+no subprocess, no ffmpeg dependency for AAC. Non-AAC codecs (Opus, MP2,
+AC-3) use an ffmpeg subprocess. **Fallback (no `fdk-aac` feature):** all
+codecs use an ffmpeg subprocess. Outputs without `audio_encode` set keep
+working without ffmpeg installed at all.
 
 ```jsonc
 {
@@ -861,7 +861,7 @@ ffmpeg installed at all.
 
 | Output | Allowed `codec` | Default | Notes |
 |---|---|---|---|
-| `rtmp` | `aac_lc`, `he_aac_v1`, `he_aac_v2` | `aac_lc` | FLV only carries AAC. HE-AAC v2 (`aac_he_v2`) requires an ffmpeg build with `libfdk_aac`; if unavailable the encoder fails fast on the first frame. |
+| `rtmp` | `aac_lc`, `he_aac_v1`, `he_aac_v2` | `aac_lc` | FLV only carries AAC. With the default `fdk-aac` feature, all AAC profiles are encoded in-process. Without it, HE-AAC v2 requires an ffmpeg build with `libfdk_aac`. |
 | `hls` | `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3` | `aac_lc` | HLS-TS supports MP2 (stream type 0x04) and AC-3 (private_stream_1) so long as the consumer's player does. |
 | `webrtc` | `opus` | `opus` | WebRTC realistically only does Opus. Validation also rejects `audio_encode` + `video_only=true` (an audio MID must be negotiated in SDP). |
 
@@ -906,21 +906,27 @@ always AAC, the sink is always Opus, so passthrough is impossible.
 The encoder is opt-in and fails fast with a clear `audio_encode`
 category event to the manager (Critical severity) when:
 
-- **ffmpeg is missing in `PATH`**: outputs with `audio_encode` set
-  refuse to start (HLS) or drop audio for the rest of the output's
-  lifetime after logging once (RTMP / WebRTC). Outputs without
-  `audio_encode` keep working.
-- **Input audio is not AAC-LC**: Phase A's decoder rejects HE-AAC,
-  AAC-Main, multichannel AAC, etc. The output drops audio and emits
-  the failure event so the operator sees the problem.
+- **ffmpeg is missing in `PATH`** (non-AAC codecs, or AAC without
+  `fdk-aac` feature): outputs with `audio_encode` set refuse to start
+  (HLS) or drop audio for the rest of the output's lifetime after
+  logging once (RTMP / WebRTC). AAC codecs with the `fdk-aac` feature
+  (default) do not require ffmpeg. Outputs without `audio_encode` keep
+  working without ffmpeg installed.
+- **Input audio is unsupported**: with the default `fdk-aac` feature,
+  the decoder supports AAC-LC, HE-AAC v1/v2, and multichannel up to
+  7.1. Without `fdk-aac`, the pure-Rust fallback supports AAC-LC
+  mono/stereo only — other profiles are rejected. The output drops
+  audio and emits the failure event so the operator sees the problem.
 - **`compressed_audio_input` is false**: the flow input cannot carry
   TS audio (e.g. ST 2110-30, `rtp_audio` are PCM-only). The output
   drops audio.
-- **Encoder spawn fails**: `ffmpeg` rejects the codec / profile flag
-  combination (e.g. `aac_he_v2` on a build without `libfdk_aac`).
-- **Restart cap exhausted**: the `engine::audio_encode` supervisor
-  restarts ffmpeg with exponential backoff up to 5 times in any 60-second
-  window. After that it gives up and emits the Critical event.
+- **Encoder configuration error**: the in-process FDK AAC encoder or
+  ffmpeg subprocess rejects the codec/profile combination.
+- **Restart cap exhausted** (ffmpeg backend only): the
+  `engine::audio_encode` supervisor restarts ffmpeg with exponential
+  backoff up to 5 times in any 60-second window. After that it gives
+  up and emits the Critical event. The in-process FDK AAC backend does
+  not use a subprocess and has no restart budget.
 
 The supervisor also emits **`audio_encode` Info** when the encoder
 starts successfully (with codec / bitrate / SR / channels in the event

@@ -626,8 +626,9 @@ enabled by default. Video: H.264 only.
 
 **Audio:** by default the WebRTC output is video-only when the source
 carries AAC. Setting an `audio_encode` block (codec: `opus`) enables
-the Phase B chain — input AAC-LC is decoded in-process via the Phase A
-`AacDecoder`, encoded to Opus via the ffmpeg-sidecar `AudioEncoder`,
+the Phase B chain — input AAC is decoded in-process via the Phase A
+`AacDecoder` (FDK AAC by default, supporting AAC-LC/HE-AAC v1/v2/multichannel),
+encoded to Opus via the `AudioEncoder` (ffmpeg subprocess for Opus),
 and written to the WebRTC audio MID via str0m. This is the marquee
 "AAC contribution → Opus distribution" path. Requires `video_only=false`
 so SDP negotiates an audio MID.

@@ -26,14 +26,17 @@ Supports NMOS IS-04 (Discovery & Registration) and IS-05 (Connection Management)
 
 **Compressed-audio bridge (Phase A + Phase B):** AAC contribution audio
 carried in MPEG-TS over RTMP / RTSP / SRT / UDP / RTP can be decoded
-in-process via the pure-Rust `symphonia-codec-aac` (Phase A) and either
-land into the PCM-only ST 2110 / `rtp_audio` / SMPTE 302M outputs, or
-be re-encoded via an ffmpeg sidecar subprocess (Phase B) into AAC,
+in-process (Phase A) and either land into the PCM-only ST 2110 /
+`rtp_audio` / SMPTE 302M outputs, or be re-encoded (Phase B) into AAC,
 HE-AAC v1/v2, Opus, MP2, or AC-3 for the RTMP, HLS, and WebRTC outputs.
-The pure-Rust binary stays unchanged — `ffmpeg` is invoked at runtime,
-never linked. The marquee chain is **AAC RTMP contribution → Opus
-WebRTC distribution** in a single bilbycast-edge process. See
-[`docs/audio-gateway.md`](docs/audio-gateway.md).
+**Default (`fdk-aac` feature):** decode and AAC encode use Fraunhofer FDK
+AAC in-process (via `bilbycast-fdk-aac-rs`) — supports AAC-LC, HE-AAC
+v1/v2, multichannel up to 7.1, no ffmpeg needed for AAC codecs. **Fallback:**
+decode uses `symphonia-codec-aac` (pure Rust, AAC-LC mono/stereo only);
+AAC encode uses ffmpeg subprocess. Non-AAC codecs (Opus, MP2, AC-3)
+always use ffmpeg subprocess. The marquee chain is **AAC RTMP
+contribution → Opus WebRTC distribution** in a single bilbycast-edge
+process. See [`docs/audio-gateway.md`](docs/audio-gateway.md).
 
 ## Quick Start
 
