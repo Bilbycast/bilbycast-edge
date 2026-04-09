@@ -451,7 +451,7 @@ pub async fn run_st2110_audio_output(
                                 if let Some(dec) = aac_decoder.as_ref() {
                                     stats.set_decode_stats(
                                         compressed_decode_stats.clone(),
-                                        "AAC-LC",
+                                        dec.codec_name(),
                                         dec.sample_rate(),
                                         dec.channels(),
                                     );

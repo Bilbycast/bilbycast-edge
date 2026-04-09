@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use serde::Serialize;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -67,7 +67,8 @@ pub struct TunnelStatsSnapshot {
 pub struct TunnelManager {
     tunnels: Arc<DashMap<String, TunnelRuntime>>,
     /// Manager node_id, used to identify this edge to relay nodes.
-    manager_node_id: Mutex<Option<String>>,
+    /// Set once during manager registration/auth.
+    manager_node_id: OnceLock<String>,
     /// Event sender for forwarding operational events to the manager.
     event_sender: EventSender,
 }
@@ -76,7 +77,7 @@ impl TunnelManager {
     pub fn new(event_sender: EventSender) -> Self {
         Self {
             tunnels: Arc::new(DashMap::new()),
-            manager_node_id: Mutex::new(None),
+            manager_node_id: OnceLock::new(),
             event_sender,
         }
     }
@@ -87,8 +88,10 @@ impl TunnelManager {
     }
 
     /// Set the manager node_id (called after manager registration/auth).
+    /// First call wins — subsequent calls with a different value are ignored
+    /// (OnceLock semantics).
     pub fn set_manager_node_id(&self, id: String) {
-        *self.manager_node_id.lock().unwrap() = Some(id);
+        let _ = self.manager_node_id.set(id);
     }
 
     /// Create and start a tunnel from the given configuration.
@@ -186,7 +189,7 @@ impl TunnelManager {
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid local_addr: {e}"))?;
 
-        let edge_id = self.manager_node_id.lock().unwrap().clone();
+        let edge_id = self.manager_node_id.get().cloned();
         let params = RelayTunnelParams {
             tunnel_id,
             relay_addr,

@@ -914,10 +914,17 @@ fn validate_audio_encode(
         }
     }
     if let Some(ch) = enc.channels {
-        if ch == 0 || ch > 2 {
+        // fdk-aac supports up to 8 channels (7.1) for AAC-LC. HE-AAC v1/v2
+        // and Opus are limited to 1-2 channels. MP2/AC-3 support up to 6.
+        let max_ch: u8 = match enc.codec.as_str() {
+            "aac_lc" => 8,
+            "ac3" => 6,
+            _ => 2, // he_aac_v1, he_aac_v2, opus, mp2
+        };
+        if ch == 0 || ch > max_ch {
             bail!(
-                "{context}: audio_encode.channels must be 1 or 2, got {}",
-                ch
+                "{context}: audio_encode.channels must be 1-{max_ch} for {}, got {}",
+                enc.codec, ch
             );
         }
     }
@@ -2409,16 +2416,35 @@ mod tests {
     }
 
     #[test]
-    fn validate_audio_encode_channels_1_or_2() {
+    fn validate_audio_encode_channels_per_codec() {
+        // AAC-LC: 1-8 channels (fdk-aac supports up to 7.1)
         let mut enc = make_audio_encode("aac_lc");
         enc.channels = Some(1);
         assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_ok());
         enc.channels = Some(2);
         assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_ok());
+        enc.channels = Some(6);
+        assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_ok(), "AAC-LC should allow 5.1");
+        enc.channels = Some(8);
+        assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_ok(), "AAC-LC should allow 7.1");
         enc.channels = Some(0);
         assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_err());
-        enc.channels = Some(6);
+        enc.channels = Some(9);
         assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_err());
+
+        // HE-AAC v1: 1-2 channels only
+        let mut enc_he = make_audio_encode("he_aac_v1");
+        enc_he.channels = Some(2);
+        assert!(validate_audio_encode(&enc_he, &["he_aac_v1"], "test").is_ok());
+        enc_he.channels = Some(6);
+        assert!(validate_audio_encode(&enc_he, &["he_aac_v1"], "test").is_err(), "HE-AAC v1 max 2ch");
+
+        // AC-3: up to 6 channels (5.1)
+        let mut enc_ac3 = make_audio_encode("ac3");
+        enc_ac3.channels = Some(6);
+        assert!(validate_audio_encode(&enc_ac3, &["ac3"], "test").is_ok(), "AC-3 should allow 5.1");
+        enc_ac3.channels = Some(8);
+        assert!(validate_audio_encode(&enc_ac3, &["ac3"], "test").is_err(), "AC-3 max 6ch");
     }
 
     #[test]

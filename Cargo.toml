@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-edge"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 license = "MPL-2.0"
@@ -52,10 +52,15 @@ rand = "0.10.0"
 rubato = "2.0.0"
 
 # Pure-Rust audio codec decoder (used by `engine::audio_decode` to convert
-# AAC-LC contribution audio from RTMP/RTSP/SRT-TS/UDP-TS sources into PCM
-# so it can land into the existing PCM-only audio outputs (ST 2110-30/-31,
-# rtp_audio, SMPTE 302M). MPL-2.0, 100% Rust, no C deps. Minimal feature
-# set: AAC codec only, no format demuxers (we already demux TS in-house).
+# ── AAC backend ─────────────────────────────────────────────────────────
+# Default: fdk-aac (C library via FFI). Supports AAC-LC, HE-AAC v1/v2,
+# multichannel up to 7.1, AAC-LD/ELD. Used for both decode and encode.
+# Fallback: symphonia (pure Rust, AAC-LC mono/stereo only).
+#
+# To disable fdk-aac: cargo build --no-default-features --features tls,webrtc
+# ────────────────────────────────────────────────────────────────────────
+aac-audio = { path = "../bilbycast-fdk-aac-rs/aac-audio", optional = true }
+aac-codec = { path = "../bilbycast-fdk-aac-rs/aac-codec", optional = true }
 symphonia = { version = "0.5.5", features = ["aac"], default-features = false }
 
 # Error handling
@@ -111,7 +116,10 @@ rustls-pemfile = "2.2.0"
 rcgen = "0.14.7"
 
 [features]
-default = ["tls", "webrtc"]
+default = ["tls", "webrtc", "fdk-aac"]
+# Enable in-process AAC decode/encode via Fraunhofer FDK AAC (C library).
+# Replaces symphonia (decode) and ffmpeg subprocess (AAC encode).
+fdk-aac = ["dep:aac-audio", "dep:aac-codec"]
 # Enable TLS (HTTPS on API + RTMPS) support via rustls/tokio-rustls/axum-server.
 tls = ["dep:tokio-rustls", "dep:axum-server"]
 # Enable WebRTC WHIP/WHEP input and output via str0m (pure Rust, sans-I/O).

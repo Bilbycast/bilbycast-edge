@@ -208,7 +208,7 @@ async fn run_rtp_audio_302m_output(
                                 if let Some(dec) = aac_decoder.as_ref() {
                                     stats.set_decode_stats(
                                         decode_stats.clone(),
-                                        "AAC-LC",
+                                        dec.codec_name(),
                                         dec.sample_rate(),
                                         dec.channels(),
                                     );

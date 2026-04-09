@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use dashmap::DashMap;
+use tokio::sync::watch;
 
 use super::models::*;
 use super::throughput::ThroughputEstimator;
@@ -26,10 +27,12 @@ pub struct OutputStatsAccumulator {
     pub packets_dropped: AtomicU64,
     pub fec_packets_sent: AtomicU64,
     throughput: Mutex<ThroughputEstimator>,
-    /// Cached SRT stats for primary leg, updated by the SRT output polling task.
-    pub srt_stats_cache: Arc<Mutex<Option<SrtLegStats>>>,
-    /// Cached SRT stats for redundancy leg, updated by the SRT output polling task.
-    pub srt_leg2_stats_cache: Arc<Mutex<Option<SrtLegStats>>>,
+    /// Cached SRT stats for primary leg, updated by the SRT output polling task
+    /// via a lock-free watch channel. Read via `borrow()`, write via `send()`.
+    pub srt_stats_cache: Arc<watch::Sender<Option<SrtLegStats>>>,
+    /// Cached SRT stats for redundancy leg, updated by the SRT output polling task
+    /// via a lock-free watch channel.
+    pub srt_leg2_stats_cache: Arc<watch::Sender<Option<SrtLegStats>>>,
     /// Optional handle to a per-output PCM transcoder's stats counters.
     /// Set once at output startup by `run_st2110_audio_output` (and any other
     /// output that runs a TranscodeStage). Reading is a single atomic load.
@@ -76,8 +79,8 @@ impl OutputStatsAccumulator {
             packets_dropped: AtomicU64::new(0),
             fec_packets_sent: AtomicU64::new(0),
             throughput: Mutex::new(ThroughputEstimator::new()),
-            srt_stats_cache: Arc::new(Mutex::new(None)),
-            srt_leg2_stats_cache: Arc::new(Mutex::new(None)),
+            srt_stats_cache: Arc::new(watch::channel(None).0),
+            srt_leg2_stats_cache: Arc::new(watch::channel(None).0),
             transcode_stats: OnceLock::new(),
             audio_decode_stats: OnceLock::new(),
             audio_encode_stats: OnceLock::new(),
@@ -186,8 +189,8 @@ impl OutputStatsAccumulator {
             bitrate_bps,
             packets_dropped: self.packets_dropped.load(Ordering::Relaxed),
             fec_packets_sent: self.fec_packets_sent.load(Ordering::Relaxed),
-            srt_stats: self.srt_stats_cache.lock().unwrap().clone(),
-            srt_leg2_stats: self.srt_leg2_stats_cache.lock().unwrap().clone(),
+            srt_stats: self.srt_stats_cache.borrow().clone(),
+            srt_leg2_stats: self.srt_leg2_stats_cache.borrow().clone(),
             transcode_stats,
             audio_decode_stats,
             audio_encode_stats,
@@ -730,10 +733,12 @@ pub struct FlowStatsAccumulator {
     pub input_config_meta: OnceLock<InputConfigMeta>,
     /// Per-output config metadata for topology display (set once per output).
     pub output_config_meta: DashMap<String, OutputConfigMeta>,
-    /// Cached SRT stats for primary input leg, updated by the SRT input polling task.
-    pub input_srt_stats_cache: Arc<Mutex<Option<SrtLegStats>>>,
-    /// Cached SRT stats for redundancy input leg, updated by the SRT input polling task.
-    pub input_srt_leg2_stats_cache: Arc<Mutex<Option<SrtLegStats>>>,
+    /// Cached SRT stats for primary input leg, updated by the SRT input polling task
+    /// via a lock-free watch channel.
+    pub input_srt_stats_cache: Arc<watch::Sender<Option<SrtLegStats>>>,
+    /// Cached SRT stats for redundancy input leg, updated by the SRT input polling task
+    /// via a lock-free watch channel.
+    pub input_srt_leg2_stats_cache: Arc<watch::Sender<Option<SrtLegStats>>>,
     /// Set to `true` by the bandwidth monitor when the input bitrate exceeds the configured limit.
     pub bandwidth_exceeded: AtomicBool,
     /// Set to `true` by the bandwidth monitor to gate the flow (block action).
@@ -803,8 +808,8 @@ impl FlowStatsAccumulator {
             thumbnail: OnceLock::new(),
             input_config_meta: OnceLock::new(),
             output_config_meta: DashMap::new(),
-            input_srt_stats_cache: Arc::new(Mutex::new(None)),
-            input_srt_leg2_stats_cache: Arc::new(Mutex::new(None)),
+            input_srt_stats_cache: Arc::new(watch::channel(None).0),
+            input_srt_leg2_stats_cache: Arc::new(watch::channel(None).0),
             bandwidth_exceeded: AtomicBool::new(false),
             bandwidth_blocked: AtomicBool::new(false),
             bandwidth_limit_mbps: OnceLock::new(),
@@ -905,8 +910,8 @@ impl FlowStatsAccumulator {
                     packets_lost,
                     packets_filtered: self.input_filtered.load(Ordering::Relaxed),
                     packets_recovered_fec: self.fec_recovered.load(Ordering::Relaxed),
-                    srt_stats: self.input_srt_stats_cache.lock().unwrap().clone(),
-                    srt_leg2_stats: self.input_srt_leg2_stats_cache.lock().unwrap().clone(),
+                    srt_stats: self.input_srt_stats_cache.borrow().clone(),
+                    srt_leg2_stats: self.input_srt_leg2_stats_cache.borrow().clone(),
                     redundancy_switches: self.redundancy_switches.load(Ordering::Relaxed),
                 }
             },

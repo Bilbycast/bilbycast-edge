@@ -336,47 +336,71 @@ pub fn check_libfdk_aac_available() -> bool {
     })
 }
 
-/// A spawned audio encoder, owning the bounded PCM input channel and the
-/// supervisor task that manages the ffmpeg subprocess. Drop the encoder
-/// (or cancel its `CancellationToken`) to tear down the subprocess.
+/// Audio encoder supporting two backends:
+/// - **In-process fdk-aac** (when `fdk-aac` feature is enabled): AAC-LC,
+///   HE-AAC v1, HE-AAC v2 encoded directly via the fdk-aac C library.
+///   No subprocess, no pipes, no restart budget. Lower latency.
+/// - **ffmpeg subprocess** (always available): All codecs including Opus,
+///   MP2, AC-3, and AAC when fdk-aac is disabled.
 pub struct AudioEncoder {
     params: EncoderParams,
-    pcm_tx: mpsc::Sender<PcmChunk>,
-    encoded_rx: mpsc::Receiver<EncodedFrame>,
-    /// Supervisor task handle. Held so the task is detached only on Drop.
-    _supervisor: JoinHandle<()>,
-    cancel: CancellationToken,
-    /// Bytes-per-frame for the input PCM (s32le interleaved): channels × 4.
-    bytes_per_frame: usize,
-    /// Scratch buffer for planar→interleaved conversion. Reused across
-    /// `submit_planar` calls to avoid per-call allocation.
-    pack_scratch: BytesMut,
+    backend: EncoderBackend,
     /// Shared lock-free counters exposed to the parent
     /// [`OutputStatsAccumulator`] via [`Self::stats_handle`].
     encode_stats: Arc<EncodeStats>,
 }
 
+/// Internal backend variants. The public API is identical regardless.
+enum EncoderBackend {
+    /// ffmpeg subprocess with supervisor, channels, and process management.
+    Ffmpeg {
+        pcm_tx: mpsc::Sender<PcmChunk>,
+        encoded_rx: mpsc::Receiver<EncodedFrame>,
+        _supervisor: JoinHandle<()>,
+        cancel: CancellationToken,
+        bytes_per_frame: usize,
+        pack_scratch: BytesMut,
+    },
+    /// In-process fdk-aac encoder. Synchronous — encode happens inline in
+    /// `submit_planar`, no channels or background tasks.
+    #[cfg(feature = "fdk-aac")]
+    InProcess {
+        encoder: aac_audio::AacEncoder,
+        /// Accumulator for samples when the encoder's frame_size doesn't
+        /// align with the decoder's output (e.g. HE-AAC needs 2048 samples
+        /// but decoder outputs 1024 per frame).
+        accumulator: Vec<Vec<f32>>,
+        accumulated_samples: usize,
+        /// Queue of encoded frames ready for drain/try_recv.
+        output_queue: std::collections::VecDeque<EncodedFrame>,
+        /// Running PTS in 90 kHz units.
+        pts_90k: u64,
+        pts_anchor_set: bool,
+        cancel: CancellationToken,
+    },
+}
+
 impl std::fmt::Debug for AudioEncoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let backend_name = match &self.backend {
+            EncoderBackend::Ffmpeg { .. } => "ffmpeg",
+            #[cfg(feature = "fdk-aac")]
+            EncoderBackend::InProcess { .. } => "fdk-aac",
+        };
         f.debug_struct("AudioEncoder")
             .field("params", &self.params)
+            .field("backend", &backend_name)
             .finish_non_exhaustive()
     }
 }
 
 impl AudioEncoder {
-    /// Spawn the encoder: validate params, build the ffmpeg command line,
-    /// and start the supervisor + child driver tasks. Returns
-    /// [`AudioEncoderError::FfmpegNotFound`] if ffmpeg is missing.
+    /// Spawn the encoder. For AAC codecs with the `fdk-aac` feature enabled,
+    /// uses an in-process fdk-aac encoder (no subprocess, no ffmpeg required).
+    /// For all other codecs (Opus, MP2, AC-3), or when `fdk-aac` is disabled,
+    /// spawns an ffmpeg subprocess with supervisor.
     ///
-    /// `flow_id` and `output_id` are tracing labels only; they appear in
-    /// log lines so operators can correlate encoder messages with the
-    /// flow/output that produced them.
-    ///
-    /// `stats` is the parent output's stats accumulator. The encoder
-    /// increments `packets_dropped` on bounded-channel-full events and
-    /// `packets_sent` / `bytes_sent` are NOT touched here (those belong
-    /// to the consumer that actually sends the encoded frame on the wire).
+    /// `flow_id` and `output_id` are tracing labels only.
     pub fn spawn(
         params: EncoderParams,
         cancel: CancellationToken,
@@ -385,8 +409,7 @@ impl AudioEncoder {
         stats: Arc<OutputStatsAccumulator>,
         events: Option<EventSender>,
     ) -> Result<Self, AudioEncoderError> {
-        // Reject obviously bad PCM formats early so we don't spawn ffmpeg
-        // for an unfixable input.
+        // Reject obviously bad PCM formats early.
         if params.channels == 0 || params.channels > 8 {
             return Err(AudioEncoderError::InvalidPcmFormat {
                 reason: format!("channels={} (must be 1..=8)", params.channels),
@@ -398,13 +421,32 @@ impl AudioEncoder {
             });
         }
 
+        // Try in-process fdk-aac for AAC codecs
+        #[cfg(feature = "fdk-aac")]
+        if matches!(params.codec, AudioCodec::AacLc | AudioCodec::HeAacV1 | AudioCodec::HeAacV2) {
+            return Self::spawn_in_process(params, cancel, &flow_id, &output_id);
+        }
+
+        // Fall through to ffmpeg subprocess for non-AAC codecs (or all codecs
+        // when fdk-aac feature is disabled)
+        Self::spawn_ffmpeg(params, cancel, flow_id, output_id, stats, events)
+    }
+
+    /// Spawn the ffmpeg subprocess backend. Used for Opus, MP2, AC-3, and
+    /// as fallback for AAC when fdk-aac feature is disabled.
+    fn spawn_ffmpeg(
+        params: EncoderParams,
+        cancel: CancellationToken,
+        flow_id: String,
+        output_id: String,
+        stats: Arc<OutputStatsAccumulator>,
+        events: Option<EventSender>,
+    ) -> Result<Self, AudioEncoderError> {
         if !check_ffmpeg_available() {
             return Err(AudioEncoderError::FfmpegNotFound);
         }
 
-        // HE-AAC needs libfdk_aac specifically — fail loudly if missing
-        // instead of producing zero output and cryptic ffmpeg `-22` errors
-        // per segment downstream.
+        // HE-AAC needs libfdk_aac in ffmpeg — fail loudly if missing
         if matches!(params.codec, AudioCodec::HeAacV1 | AudioCodec::HeAacV2)
             && !check_libfdk_aac_available()
         {
@@ -431,19 +473,79 @@ impl AudioEncoder {
 
         Ok(Self {
             params,
-            pcm_tx,
-            encoded_rx,
-            _supervisor: supervisor,
-            cancel,
-            bytes_per_frame,
-            pack_scratch: BytesMut::new(),
+            backend: EncoderBackend::Ffmpeg {
+                pcm_tx,
+                encoded_rx,
+                _supervisor: supervisor,
+                cancel,
+                bytes_per_frame,
+                pack_scratch: BytesMut::new(),
+            },
             encode_stats,
         })
     }
 
-    /// Shared handle to the lock-free encode-stage counters. Callers pass
-    /// this into [`crate::stats::collector::OutputStatsAccumulator::set_encode_stats`]
-    /// so the per-tick stats snapshot can read them.
+    /// Spawn the in-process fdk-aac encoder backend. No subprocess, no
+    /// pipes — encode happens synchronously in `submit_planar`.
+    #[cfg(feature = "fdk-aac")]
+    fn spawn_in_process(
+        params: EncoderParams,
+        cancel: CancellationToken,
+        flow_id: &str,
+        output_id: &str,
+    ) -> Result<Self, AudioEncoderError> {
+        let profile = match params.codec {
+            AudioCodec::AacLc => aac_codec::AacProfile::AacLc,
+            AudioCodec::HeAacV1 => aac_codec::AacProfile::HeAacV1,
+            AudioCodec::HeAacV2 => aac_codec::AacProfile::HeAacV2,
+            _ => unreachable!("spawn_in_process only called for AAC codecs"),
+        };
+
+        let config = aac_codec::EncoderConfig {
+            profile,
+            sample_rate: params.target_sample_rate,
+            channels: params.target_channels,
+            bitrate: params.target_bitrate_kbps * 1000, // kbps → bps
+            afterburner: true,
+            sbr_signaling: aac_codec::SbrSignaling::default(),
+            transport: aac_codec::TransportType::Adts,
+        };
+
+        let encoder = aac_audio::AacEncoder::open(&config).map_err(|e| {
+            AudioEncoderError::InvalidPcmFormat {
+                reason: format!("fdk-aac encoder init failed: {e}"),
+            }
+        })?;
+
+        let frame_size = encoder.frame_size() as usize;
+        let channels = params.target_channels as usize;
+
+        tracing::info!(
+            flow_id,
+            output_id,
+            codec = params.codec.as_str(),
+            frame_size,
+            "audio encoder: using in-process fdk-aac (no ffmpeg subprocess)"
+        );
+
+        let encode_stats = Arc::new(EncodeStats::new());
+
+        Ok(Self {
+            params,
+            backend: EncoderBackend::InProcess {
+                encoder,
+                accumulator: vec![Vec::with_capacity(frame_size); channels],
+                accumulated_samples: 0,
+                output_queue: std::collections::VecDeque::new(),
+                pts_90k: 0,
+                pts_anchor_set: false,
+                cancel,
+            },
+            encode_stats,
+        })
+    }
+
+    /// Shared handle to the lock-free encode-stage counters.
     pub fn stats_handle(&self) -> Arc<EncodeStats> {
         self.encode_stats.clone()
     }
@@ -455,16 +557,11 @@ impl AudioEncoder {
 
     /// Submit a planar f32 PCM frame from the upstream decoder.
     ///
-    /// Converts to interleaved s32le and `try_send`s onto the bounded PCM
-    /// channel. **Non-blocking.** On full / closed channel the chunk is
-    /// dropped silently — slow ffmpeg must never cascade backpressure into
-    /// the input task. The caller's stats accumulator is incremented on
-    /// drop. Returns `true` if the chunk was queued, `false` on drop.
+    /// **Non-blocking.** Returns `true` if the chunk was accepted, `false` on drop.
     pub fn submit_planar(&mut self, planar: &[Vec<f32>], pts: u64) -> bool {
         if planar.is_empty() {
             return false;
         }
-        // Validate channel count matches what we promised ffmpeg.
         if planar.len() != self.params.channels as usize {
             tracing::debug!(
                 "audio_encode: planar channel count {} != configured {}, dropping",
@@ -474,7 +571,6 @@ impl AudioEncoder {
             return false;
         }
         let frames = planar[0].len();
-        // All channels must have the same frame count.
         for ch in planar.iter().skip(1) {
             if ch.len() != frames {
                 tracing::debug!(
@@ -486,62 +582,143 @@ impl AudioEncoder {
             }
         }
 
-        let total_bytes = frames * self.bytes_per_frame;
-        self.pack_scratch.clear();
-        self.pack_scratch.reserve(total_bytes);
-        pack_planar_to_s32le_interleaved(planar, frames, &mut self.pack_scratch);
+        match &mut self.backend {
+            EncoderBackend::Ffmpeg {
+                pcm_tx,
+                bytes_per_frame,
+                pack_scratch,
+                ..
+            } => {
+                let total_bytes = frames * *bytes_per_frame;
+                pack_scratch.clear();
+                pack_scratch.reserve(total_bytes);
+                pack_planar_to_s32le_interleaved(planar, frames, pack_scratch);
 
-        let chunk = PcmChunk {
-            data: self.pack_scratch.clone().freeze(),
-            pts,
-        };
+                let chunk = PcmChunk {
+                    data: pack_scratch.clone().freeze(),
+                    pts,
+                };
 
-        match self.pcm_tx.try_send(chunk) {
-            Ok(()) => {
-                self.encode_stats.inc_submitted();
+                match pcm_tx.try_send(chunk) {
+                    Ok(()) => {
+                        self.encode_stats.inc_submitted();
+                        true
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        self.encode_stats.inc_dropped();
+                        false
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        self.encode_stats.inc_dropped();
+                        false
+                    }
+                }
+            }
+            #[cfg(feature = "fdk-aac")]
+            EncoderBackend::InProcess {
+                encoder,
+                accumulator,
+                accumulated_samples,
+                output_queue,
+                pts_90k,
+                pts_anchor_set,
+                ..
+            } => {
+                if !*pts_anchor_set {
+                    *pts_90k = pts;
+                    *pts_anchor_set = true;
+                }
+
+                let frame_size = encoder.frame_size() as usize;
+
+                // Append incoming samples to the accumulator
+                for (ch, samples) in planar.iter().enumerate() {
+                    accumulator[ch].extend_from_slice(samples);
+                }
+                *accumulated_samples += frames;
+
+                // Encode complete frames
+                while *accumulated_samples >= frame_size {
+                    // Extract one frame's worth of samples per channel
+                    let frame_planar: Vec<Vec<f32>> = accumulator
+                        .iter_mut()
+                        .map(|ch_buf| {
+                            let frame: Vec<f32> = ch_buf.drain(..frame_size).collect();
+                            frame
+                        })
+                        .collect();
+                    *accumulated_samples -= frame_size;
+
+                    match encoder.encode_frame(&frame_planar) {
+                        Ok(encoded) => {
+                            let current_pts = *pts_90k;
+                            // Advance PTS: samples * 90000 / sample_rate
+                            let sr = self.params.target_sample_rate as u64;
+                            if sr > 0 {
+                                *pts_90k = pts_90k.saturating_add(
+                                    (encoded.num_samples as u64) * 90_000 / sr,
+                                );
+                            }
+                            output_queue.push_back(EncodedFrame {
+                                data: Bytes::from(encoded.bytes),
+                                pts: current_pts,
+                            });
+                            self.encode_stats.inc_submitted();
+                        }
+                        Err(e) => {
+                            tracing::warn!("fdk-aac encode error: {e}");
+                            self.encode_stats.inc_dropped();
+                        }
+                    }
+                }
+
                 true
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                // Backpressure — silently drop. The encoder is slow or
-                // ffmpeg is restarting. The output's stats accumulator
-                // will reflect this on the consumer side too.
-                self.encode_stats.inc_dropped();
-                false
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.encode_stats.inc_dropped();
-                false
             }
         }
     }
 
     /// Pull the next encoded frame, if any. Non-blocking.
     pub fn try_recv(&mut self) -> Option<EncodedFrame> {
-        let frame = self.encoded_rx.try_recv().ok();
+        let frame = match &mut self.backend {
+            EncoderBackend::Ffmpeg { encoded_rx, .. } => encoded_rx.try_recv().ok(),
+            #[cfg(feature = "fdk-aac")]
+            EncoderBackend::InProcess { output_queue, .. } => output_queue.pop_front(),
+        };
         if frame.is_some() {
             self.encode_stats.inc_out(1);
         }
         frame
     }
 
-    /// Drain all currently-available encoded frames. Non-blocking — returns
-    /// an empty vec if the channel is empty.
+    /// Drain all currently-available encoded frames. Non-blocking.
     pub fn drain(&mut self) -> Vec<EncodedFrame> {
-        let mut out = Vec::new();
-        while let Ok(frame) = self.encoded_rx.try_recv() {
-            out.push(frame);
-        }
+        let out: Vec<EncodedFrame> = match &mut self.backend {
+            EncoderBackend::Ffmpeg { encoded_rx, .. } => {
+                let mut frames = Vec::new();
+                while let Ok(frame) = encoded_rx.try_recv() {
+                    frames.push(frame);
+                }
+                frames
+            }
+            #[cfg(feature = "fdk-aac")]
+            EncoderBackend::InProcess { output_queue, .. } => {
+                output_queue.drain(..).collect()
+            }
+        };
         if !out.is_empty() {
             self.encode_stats.inc_out(out.len() as u64);
         }
         out
     }
 
-    /// Cancel the supervisor and wait for it to exit. Used by tests; in
-    /// production the cancellation token is shared with the parent output
-    /// task and gets cancelled by the flow lifecycle.
+    /// Cancel the encoder. For ffmpeg backend, cancels the supervisor. For
+    /// in-process, cancels the token (no cleanup needed).
     pub fn cancel(&self) {
-        self.cancel.cancel();
+        match &self.backend {
+            EncoderBackend::Ffmpeg { cancel, .. } => cancel.cancel(),
+            #[cfg(feature = "fdk-aac")]
+            EncoderBackend::InProcess { cancel, .. } => cancel.cancel(),
+        }
     }
 }
 
@@ -2077,5 +2254,94 @@ mod tests {
             AudioEncoderError::InvalidPcmFormat { .. } => {}
             other => panic!("expected InvalidPcmFormat, got {other:?}"),
         }
+    }
+
+    /// Test the in-process fdk-aac encoder path. Submits silence frames
+    /// and verifies encoded ADTS output is produced.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn in_process_fdk_aac_encodes_silence() {
+        let params = EncoderParams {
+            codec: AudioCodec::AacLc,
+            sample_rate: 48_000,
+            channels: 2,
+            target_bitrate_kbps: 128,
+            target_sample_rate: 48_000,
+            target_channels: 2,
+        };
+        let cancel = CancellationToken::new();
+        let stats = Arc::new(OutputStatsAccumulator::new(
+            "test-output".into(),
+            "test output".into(),
+            "rtmp".into(),
+        ));
+        let mut enc = AudioEncoder::spawn(
+            params, cancel, "test-flow".into(), "test-output".into(), stats, None,
+        )
+        .expect("in-process fdk-aac encoder should open");
+
+        // Verify it chose the in-process backend
+        assert!(
+            matches!(&enc.backend, EncoderBackend::InProcess { .. }),
+            "should use in-process backend for AAC-LC with fdk-aac feature"
+        );
+
+        // Submit several frames of silence (1024 samples per frame, matching AAC-LC)
+        let silence = vec![vec![0.0f32; 1024]; 2];
+        for _ in 0..5 {
+            assert!(enc.submit_planar(&silence, 0));
+        }
+
+        // Drain encoded frames
+        let frames = enc.drain();
+        assert!(
+            !frames.is_empty(),
+            "should have produced encoded frames from silence"
+        );
+
+        // Verify ADTS sync word on first frame
+        let first = &frames[0];
+        assert!(first.data.len() >= 7, "encoded frame too small for ADTS");
+        assert_eq!(first.data[0], 0xFF, "ADTS sync byte 0");
+        assert_eq!(first.data[1] & 0xF0, 0xF0, "ADTS sync byte 1");
+    }
+
+    /// Test that HE-AAC v1 uses the in-process path when fdk-aac is enabled.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn in_process_he_aac_v1_encodes() {
+        let params = EncoderParams {
+            codec: AudioCodec::HeAacV1,
+            sample_rate: 44_100,
+            channels: 2,
+            target_bitrate_kbps: 64,
+            target_sample_rate: 44_100,
+            target_channels: 2,
+        };
+        let cancel = CancellationToken::new();
+        let stats = Arc::new(OutputStatsAccumulator::new(
+            "test-output".into(),
+            "test output".into(),
+            "rtmp".into(),
+        ));
+        let mut enc = AudioEncoder::spawn(
+            params, cancel, "test-flow".into(), "test-output".into(), stats, None,
+        )
+        .expect("HE-AAC v1 in-process encoder should open");
+
+        assert!(matches!(&enc.backend, EncoderBackend::InProcess { .. }));
+
+        // HE-AAC v1 frame_size is 2048 (SBR doubles), so we need to submit
+        // at least 2 × 1024-sample blocks before a frame is produced.
+        let silence = vec![vec![0.0f32; 1024]; 2];
+        for _ in 0..10 {
+            enc.submit_planar(&silence, 0);
+        }
+
+        let frames = enc.drain();
+        assert!(
+            !frames.is_empty(),
+            "HE-AAC v1 should produce encoded frames after accumulating enough samples"
+        );
     }
 }

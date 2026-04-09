@@ -9,8 +9,8 @@
 //! When a `TunnelCipher` is provided, all payloads are encrypted end-to-end
 //! before being sent through the relay. The relay sees only ciphertext.
 
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -22,6 +22,72 @@ use uuid::Uuid;
 
 use super::crypto::TunnelCipher;
 use super::protocol;
+
+/// Lock-free peer address cache using atomics.
+///
+/// Stores a `SocketAddr` (IPv4 or IPv6) as atomic fields so the UDP forwarder
+/// can update and read the peer address on every packet without locking.
+struct AtomicPeerAddr {
+    /// 0 = unset, 4 = IPv4, 6 = IPv6
+    family: AtomicU8,
+    /// IPv4: 4 bytes in network order stored in low 32 bits.
+    /// IPv6: full 128 bits stored as two AtomicU64.
+    ip_high: AtomicU64,
+    ip_low: AtomicU64,
+    port: AtomicU16,
+}
+
+impl AtomicPeerAddr {
+    fn new() -> Self {
+        Self {
+            family: AtomicU8::new(0),
+            ip_high: AtomicU64::new(0),
+            ip_low: AtomicU64::new(0),
+            port: AtomicU16::new(0),
+        }
+    }
+
+    fn store(&self, addr: SocketAddr) {
+        match addr.ip() {
+            IpAddr::V4(v4) => {
+                let bits = u32::from(v4) as u64;
+                self.ip_low.store(bits, Ordering::Relaxed);
+                self.ip_high.store(0, Ordering::Relaxed);
+                self.port.store(addr.port(), Ordering::Relaxed);
+                // Write family last to publish the complete address.
+                self.family.store(4, Ordering::Release);
+            }
+            IpAddr::V6(v6) => {
+                let octets = v6.octets();
+                let high = u64::from_be_bytes(octets[..8].try_into().unwrap());
+                let low = u64::from_be_bytes(octets[8..].try_into().unwrap());
+                self.ip_high.store(high, Ordering::Relaxed);
+                self.ip_low.store(low, Ordering::Relaxed);
+                self.port.store(addr.port(), Ordering::Relaxed);
+                self.family.store(6, Ordering::Release);
+            }
+        }
+    }
+
+    fn load(&self) -> Option<SocketAddr> {
+        let fam = self.family.load(Ordering::Acquire);
+        if fam == 0 {
+            return None;
+        }
+        let port = self.port.load(Ordering::Relaxed);
+        let ip = if fam == 4 {
+            IpAddr::V4(Ipv4Addr::from(self.ip_low.load(Ordering::Relaxed) as u32))
+        } else {
+            let high = self.ip_high.load(Ordering::Relaxed).to_be_bytes();
+            let low = self.ip_low.load(Ordering::Relaxed).to_be_bytes();
+            let mut octets = [0u8; 16];
+            octets[..8].copy_from_slice(&high);
+            octets[8..].copy_from_slice(&low);
+            IpAddr::V6(Ipv6Addr::from(octets))
+        };
+        Some(SocketAddr::new(ip, port))
+    }
+}
 
 /// Statistics for a UDP tunnel forwarder.
 #[derive(Debug, Default)]
@@ -55,9 +121,8 @@ pub async fn run_egress(
     );
 
     let socket = Arc::new(socket);
-    // Track the last sender address for return traffic
-    let peer_addr: Arc<tokio::sync::Mutex<Option<SocketAddr>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
+    // Track the last sender address for return traffic (lock-free)
+    let peer_addr = Arc::new(AtomicPeerAddr::new());
 
     let mut buf = vec![0u8; 2048];
 
@@ -66,11 +131,8 @@ pub async fn run_egress(
             // Local → QUIC: receive from local UDP socket, encrypt, send as QUIC datagram
             result = socket.recv_from(&mut buf) => {
                 let (len, from_addr) = result?;
-                // Remember sender for return traffic
-                {
-                    let mut pa = peer_addr.lock().await;
-                    *pa = Some(from_addr);
-                }
+                // Remember sender for return traffic (lock-free)
+                peer_addr.store(from_addr);
                 let payload = if let Some(ref c) = cipher {
                     match c.encrypt(&buf[..len]) {
                         Ok(encrypted) => encrypted,
@@ -111,8 +173,7 @@ pub async fn run_egress(
                     } else {
                         encrypted_payload.to_vec()
                     };
-                    let pa = peer_addr.lock().await;
-                    if let Some(addr) = *pa {
+                    if let Some(addr) = peer_addr.load() {
                         let _ = socket.send_to(&payload, addr).await;
                         stats.packets_received.fetch_add(1, Ordering::Relaxed);
                         stats.bytes_received.fetch_add(payload.len() as u64, Ordering::Relaxed);

@@ -491,7 +491,7 @@ async fn srt_output_forward_loop(
                                 if let Some(dec) = aac_decoder_302m.as_ref() {
                                     stats.set_decode_stats(
                                         decode_stats_302m.clone(),
-                                        "AAC-LC",
+                                        dec.codec_name(),
                                         dec.sample_rate(),
                                         dec.channels(),
                                     );

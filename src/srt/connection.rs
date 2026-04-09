@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use srt_protocol::config::{CryptoModeConfig, KeySize, RetransmitAlgo};
@@ -636,11 +637,11 @@ pub fn convert_srt_stats(stats: &srt_protocol::stats::SrtStats) -> SrtLegStats {
 }
 
 /// Spawn a background task that polls SRT socket stats every second and
-/// writes the result into the provided cache. Runs until the cancellation
-/// token fires.
+/// publishes the result via the provided lock-free watch channel. Runs
+/// until the cancellation token fires.
 pub fn spawn_srt_stats_poller(
     socket: Arc<SrtSocket>,
-    cache: Arc<std::sync::Mutex<Option<SrtLegStats>>>,
+    cache: Arc<watch::Sender<Option<SrtLegStats>>>,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -651,7 +652,7 @@ pub fn spawn_srt_stats_poller(
                 _ = interval.tick() => {
                     let stats = socket.stats().await;
                     let leg_stats = convert_srt_stats(&stats);
-                    *cache.lock().unwrap() = Some(leg_stats);
+                    let _ = cache.send(Some(leg_stats));
                 }
             }
         }

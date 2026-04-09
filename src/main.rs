@@ -399,6 +399,11 @@ async fn stats_publisher_loop(
     loop {
         interval.tick().await;
 
+        // Skip all work when nobody is listening to stats
+        if ws_tx.receiver_count() == 0 {
+            continue;
+        }
+
         let mut snapshots = flow_manager.stats().all_snapshots();
 
         // Enrich snapshots with computed bitrates

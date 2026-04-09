@@ -442,7 +442,7 @@ mod tests {
     fn build_es_packet(pid: u16, cc: u8) -> [u8; TS_PACKET_SIZE] {
         let mut pkt = [0xFFu8; TS_PACKET_SIZE];
         pkt[0] = TS_SYNC_BYTE;
-        pkt[1] = (((pid >> 8) as u8) & 0x1F);
+        pkt[1] = ((pid >> 8) as u8) & 0x1F;
         pkt[2] = (pid & 0xFF) as u8;
         pkt[3] = 0x10 | (cc & 0x0F);
         pkt

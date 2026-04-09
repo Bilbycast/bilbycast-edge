@@ -53,13 +53,11 @@ jobs:
       matrix:
         include:
           - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
+            target: x86_64-unknown-linux-gnu
             artifact_suffix: x86_64-linux
-            openssl_target: linux-x86_64
           - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
+            target: aarch64-unknown-linux-gnu
             artifact_suffix: aarch64-linux
-            openssl_target: linux-aarch64
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout bilbycast-libsrt-rs (path dependency)
@@ -67,6 +65,13 @@ jobs:
         with:
           repository: Bilbycast/bilbycast-libsrt-rs
           path: bilbycast-libsrt-rs
+          submodules: recursive
+
+      - name: Checkout bilbycast-fdk-aac-rs (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: Bilbycast/bilbycast-fdk-aac-rs
+          path: bilbycast-fdk-aac-rs
           submodules: recursive
 
       - name: Checkout bilbycast-edge
@@ -77,21 +82,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools musl-dev cmake clang pkg-config
-
-      - name: Build static OpenSSL for musl
-        run: |
-          OPENSSL_VERSION="3.4.1"
-          curl -LO "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
-          tar xzf "openssl-${OPENSSL_VERSION}.tar.gz"
-          cd "openssl-${OPENSSL_VERSION}"
-          CC=musl-gcc ./Configure \
-            --prefix=/usr/local/musl \
-            --openssldir=/usr/local/musl/ssl \
-            ${{ matrix.openssl_target }} \
-            no-shared no-async no-engine
-          make -j$(nproc)
-          sudo make install_sw
+          sudo apt-get install -y cmake clang libclang-dev pkg-config libssl-dev g++
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -111,21 +102,14 @@ jobs:
 
       - name: Build release binary
         working-directory: bilbycast-edge
-        env:
-          OPENSSL_DIR: /usr/local/musl
-          OPENSSL_STATIC: "1"
-          OPENSSL_NO_PKG_CONFIG: "1"
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          CC_aarch64_unknown_linux_musl: musl-gcc
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Verify binary is statically linked
+      - name: Verify binary
         run: |
           BINARY="bilbycast-edge/target/${{ matrix.target }}/release/bilbycast-edge"
           echo "=== File type ==="
           file "${BINARY}"
           echo "=== Dynamic dependencies ==="
-          # Static musl binaries should show "statically linked"
           ldd "${BINARY}" 2>&1 || true
 
       - name: Prepare artifact
@@ -173,7 +157,7 @@ jobs:
             --title "bilbycast-edge v${VERSION}" \
             --notes "Release of bilbycast-edge version ${VERSION}.
 
-          ## Binaries (static musl — no runtime dependencies)
+          ## Binaries (glibc — requires Ubuntu 24.04 or compatible)
           - \`bilbycast-edge-x86_64-linux\` — Linux x86_64 (amd64)
           - \`bilbycast-edge-aarch64-linux\` — Linux ARM64 (aarch64)
 

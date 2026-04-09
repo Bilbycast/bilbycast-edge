@@ -846,7 +846,7 @@ fn build_webrtc_encoder_state(
     let decode_stats = Arc::new(DecodeStats::new());
     stats.set_decode_stats(
         decode_stats.clone(),
-        "AAC-LC",
+        decoder.codec_name(),
         decoder.sample_rate(),
         decoder.channels(),
     );
