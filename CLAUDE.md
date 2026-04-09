@@ -27,11 +27,11 @@ Example configs in `config_examples/`. Interop testing uses `test-edge1.json` th
 
 ## External Crate Dependencies
 
-SRT support depends on sibling crates outside this repo:
-- `srt-transport` at `../bilbycast-srt/srt-transport`
-- `srt-protocol` at `../bilbycast-srt/srt-protocol`
+SRT support depends on one of two swappable sibling crate sets (identical public API):
+- **Pure Rust** (default): `srt-transport` + `srt-protocol` from `../bilbycast-srt/`
+- **libsrt wrapper**: `srt-transport` + `srt-protocol` from `../bilbycast-libsrt-rs/`
 
-These must be present for the project to compile.
+Switch by commenting/uncommenting two path lines in `Cargo.toml` — look for the `── SRT backend ──` block. Default is libsrt. No other code changes needed. The libsrt wrapper adds SRT bonding and guarantees FEC/encryption interop with all SRT devices; the pure-Rust version has zero C dependencies.
 
 ## Feature Flags
 

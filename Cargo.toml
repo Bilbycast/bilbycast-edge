@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-edge"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 license = "MPL-2.0"
@@ -79,9 +79,27 @@ webpki-roots = "1.0.6"
 futures-util = "0.3.32"
 url = "2.5.8"
 
-# SRT native (pure Rust)
-srt-transport = { path = "../bilbycast-srt/srt-transport" }
-srt-protocol = { path = "../bilbycast-srt/srt-protocol" }
+# ── SRT backend ──────────────────────────────────────────────────────────
+# Uncomment ONE pair below. Both expose identical public APIs (SrtSocket,
+# SrtListener, SrtStats, etc.). No other code changes needed to switch.
+#
+#   libsrt (default) — Haivision C library wrapper. Native SRT bonding,
+#                       guaranteed FEC/encryption interop with all SRT devices.
+#                       Requires: CMake, OpenSSL headers, clang (for build).
+#
+#   pure-rust        — bilbycast-srt. Zero C dependencies. FEC interop with
+#                       non-Rust SRT peers is broken (encryption ordering).
+#
+# To switch: comment out the active pair, uncomment the other, cargo build.
+# ─────────────────────────────────────────────────────────────────────────
+
+# Active: Haivision libsrt wrapper (default)
+srt-transport = { path = "../bilbycast-libsrt-rs/srt-transport" }
+srt-protocol = { path = "../bilbycast-libsrt-rs/srt-protocol" }
+
+# Alternative: Pure Rust (uncomment these, comment out the pair above)
+# srt-transport = { path = "../bilbycast-srt/srt-transport" }
+# srt-protocol = { path = "../bilbycast-srt/srt-protocol" }
 
 # QUIC transport for IP tunneling (relay and direct modes)
 quinn = "0.11.9"
