@@ -130,13 +130,30 @@ fn process_rtp_packet(packet: &RtpPacket, stats: &Tr101290Accumulator) {
         // PDV/Jitter: RFC 3550 exponential moving average
         // D(i-1,i) = |(recv_i - recv_{i-1}) - (ts_i - ts_{i-1})|
         // J = J + (|D| - J) / 16
+        //
+        // Bug #3 fix: rtp_ts is a u32 and `wrapping_sub` returns the
+        // unsigned distance — for backwards jumps (e.g. TS reset / RTSP
+        // re-sync) that distance is ~u32::MAX rather than a small
+        // negative number, producing 16 BILLION µs of fake jitter. We
+        // cast to i32 to interpret the wraparound as a signed delta,
+        // then drop the sample entirely if the resulting tick delta is
+        // implausibly large (more than 10 seconds at 90 kHz). Real
+        // jitter on a healthy stream is in the milliseconds.
         if let (Some(prev_recv_us), Some(prev_rtp_ts)) = (prev_recv, prev_ts) {
-            // recv delta in microseconds
             let recv_delta = recv_us as f64 - prev_recv_us as f64;
-            // RTP timestamp delta in microseconds (assume 90kHz clock → 1 tick = 11.11 us)
-            let ts_delta = rtp_ts.wrapping_sub(prev_rtp_ts) as f64 * (1_000_000.0 / 90_000.0);
-            let d = (recv_delta - ts_delta).abs();
-            state.jitter_us += (d - state.jitter_us) / 16.0;
+            let ts_delta_ticks_signed = rtp_ts.wrapping_sub(prev_rtp_ts) as i32;
+            // Sanity threshold: 10 seconds of 90 kHz ticks. Anything
+            // larger is a stream reset or a malformed packet, not real
+            // jitter — skip the EWMA update.
+            const MAX_PLAUSIBLE_TICK_DELTA: i32 = 90_000 * 10;
+            if ts_delta_ticks_signed.abs() <= MAX_PLAUSIBLE_TICK_DELTA {
+                let ts_delta = ts_delta_ticks_signed as f64 * (1_000_000.0 / 90_000.0);
+                let d = (recv_delta - ts_delta).abs();
+                // Clamp single-sample contribution to 1 second so a
+                // single bad packet can't poison the EWMA average.
+                let d_clamped = d.min(1_000_000.0);
+                state.jitter_us += (d_clamped - state.jitter_us) / 16.0;
+            }
         }
 
         // Update state AFTER reading previous values
@@ -743,5 +760,102 @@ mod tests {
         // Packet without adaptation field
         pkt[3] = 0x10; // payload only
         assert!(!ts_discontinuity_indicator(&pkt));
+    }
+
+    /// Bug #3 regression: a u32 RTP timestamp wraparound used to be
+    /// computed via `wrapping_sub` and cast to `f64`, producing a
+    /// 4-billion-tick "delta" that turned into a 16-billion-microsecond
+    /// jitter sample. The fix interprets the wraparound as a signed
+    /// delta and clamps any single sample to ≤1 second.
+    #[test]
+    fn jitter_handles_rtp_timestamp_wraparound_without_blowing_up() {
+        // Simulate the math from analyze_rtp_packet directly so we can
+        // verify the fix in isolation.
+        fn jitter_step_fixed(
+            prev_recv_us: u64,
+            recv_us: u64,
+            prev_rtp_ts: u32,
+            rtp_ts: u32,
+        ) -> Option<f64> {
+            let recv_delta = recv_us as f64 - prev_recv_us as f64;
+            let ts_delta_ticks_signed = rtp_ts.wrapping_sub(prev_rtp_ts) as i32;
+            const MAX_PLAUSIBLE_TICK_DELTA: i32 = 90_000 * 10;
+            if ts_delta_ticks_signed.abs() > MAX_PLAUSIBLE_TICK_DELTA {
+                return None;
+            }
+            let ts_delta = ts_delta_ticks_signed as f64 * (1_000_000.0 / 90_000.0);
+            let d = (recv_delta - ts_delta).abs();
+            Some(d.min(1_000_000.0))
+        }
+
+        // The OLD buggy code, for comparison:
+        fn jitter_step_old(
+            prev_recv_us: u64,
+            recv_us: u64,
+            prev_rtp_ts: u32,
+            rtp_ts: u32,
+        ) -> f64 {
+            let recv_delta = recv_us as f64 - prev_recv_us as f64;
+            let ts_delta = rtp_ts.wrapping_sub(prev_rtp_ts) as f64
+                * (1_000_000.0 / 90_000.0);
+            (recv_delta - ts_delta).abs()
+        }
+
+        // Normal step: ~33 ms apart, ~3000 ticks (33ms × 90 = 2970).
+        let d_normal = jitter_step_fixed(1_000_000, 1_033_000, 100_000, 102_970).unwrap();
+        assert!(d_normal < 1000.0, "normal jitter sample too high: {d_normal}");
+
+        // Forward wraparound: prev=u32::MAX-100, new=200 (+300 ticks =
+        // 3.3 ms of expected ts_delta). recv_delta = 33.3 ms wallclock,
+        // so |33.3-3.3| = 30 ms of measured jitter. Both old and new
+        // code give the same result for forward wraps because u32
+        // wrapping_sub already produces the right answer there.
+        let d_fwd_wrap = jitter_step_fixed(
+            2_000_000, 2_033_300, u32::MAX - 100, 200
+        ).unwrap();
+        assert!(
+            d_fwd_wrap < 100_000.0,
+            "forward wrap should give sane jitter, got {d_fwd_wrap}"
+        );
+
+        // The actual Bug #3 trigger: prev=200, new=u32::MAX-100.
+        // wrapping_sub = u32::MAX - 300 ≈ 4.29 BILLION ticks (forward
+        // jump) per the OLD code, which produces ~47 BILLION µs of fake
+        // jitter. The NEW code interprets the wraparound as i32 = -301
+        // ticks (small backward step), giving a sane jitter sample.
+        let d_bad = jitter_step_old(3_000_000, 3_033_000, 200, u32::MAX - 100);
+        assert!(
+            d_bad > 1e9,
+            "OLD code should produce huge fake jitter, got {d_bad}"
+        );
+        let d_fixed = jitter_step_fixed(3_000_000, 3_033_000, 200, u32::MAX - 100).unwrap();
+        assert!(
+            d_fixed < 100_000.0,
+            "FIXED code should produce sane jitter, got {d_fixed}"
+        );
+
+        // A genuinely huge backward step (RTSP source reset 11 seconds
+        // backwards, ts drops by 11×90_000 = 990_000): the signed
+        // delta is -990_000, which is more than the 10-second threshold,
+        // so the sample is dropped.
+        let result_huge_back = jitter_step_fixed(
+            4_000_000, 4_033_000, 1_000_000, 10_000
+        );
+        assert!(
+            result_huge_back.is_none(),
+            "expected >10s backward step to be dropped, got {result_huge_back:?}"
+        );
+
+        // A small reorder (90 ticks = 1 ms backward): accepted, ~34 ms
+        // jitter sample.
+        let d_reorder = jitter_step_fixed(5_000_000, 5_033_000, 5000, 4910).unwrap();
+        assert!(
+            d_reorder > 30_000.0 && d_reorder < 40_000.0,
+            "expected ~34 ms jitter, got {d_reorder}"
+        );
+
+        // Sanity: the worst-case acceptable sample is clamped to 1 s.
+        let d_clamped = jitter_step_fixed(0, 5_000_000, 0, 0).unwrap();
+        assert!(d_clamped <= 1_000_000.0);
     }
 }

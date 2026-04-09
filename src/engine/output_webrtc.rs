@@ -18,7 +18,7 @@ use crate::manager::events::{EventSender, EventSeverity};
 use crate::stats::collector::OutputStatsAccumulator;
 
 #[cfg(feature = "webrtc")]
-use super::audio_decode::{AacDecoder, sample_rate_from_index};
+use super::audio_decode::{AacDecoder, DecodeStats, sample_rate_from_index};
 #[cfg(feature = "webrtc")]
 use super::audio_encode::{AudioCodec, AudioEncoder, AudioEncoderError, EncoderParams};
 use super::packet::RtpPacket;
@@ -39,6 +39,7 @@ enum WebrtcEncoderState {
     Active {
         decoder: AacDecoder,
         encoder: AudioEncoder,
+        decode_stats: Arc<DecodeStats>,
     },
     /// Decoder or encoder construction failed once. Drop audio for the
     /// rest of the session's lifetime.
@@ -375,13 +376,20 @@ async fn whep_viewer_loop(
                                         );
                                     }
                                     if let (
-                                        WebrtcEncoderState::Active { decoder, encoder },
+                                        WebrtcEncoderState::Active { decoder, encoder, decode_stats },
                                         Some(audio_mid),
                                         Some(audio_pt),
                                     ) = (&mut encoder_state, audio_mid, audio_pt)
                                     {
-                                        if let Ok(planar) = decoder.decode_frame(&data) {
-                                            encoder.submit_planar(&planar, pts);
+                                        decode_stats.inc_input();
+                                        match decoder.decode_frame(&data) {
+                                            Ok(planar) => {
+                                                decode_stats.inc_output();
+                                                encoder.submit_planar(&planar, pts);
+                                            }
+                                            Err(_) => {
+                                                decode_stats.inc_error();
+                                            }
                                         }
                                         for frame in encoder.drain() {
                                             // Convert 90k PTS → 48k for Opus
@@ -622,13 +630,20 @@ async fn whip_client_loop(
                                             );
                                         }
                                         if let (
-                                            WebrtcEncoderState::Active { decoder, encoder },
+                                            WebrtcEncoderState::Active { decoder, encoder, decode_stats },
                                             Some(audio_mid),
                                             Some(audio_pt),
                                         ) = (&mut encoder_state, audio_mid, audio_pt)
                                         {
-                                            if let Ok(planar) = decoder.decode_frame(&data) {
-                                                encoder.submit_planar(&planar, pts);
+                                            decode_stats.inc_input();
+                                            match decoder.decode_frame(&data) {
+                                                Ok(planar) => {
+                                                    decode_stats.inc_output();
+                                                    encoder.submit_planar(&planar, pts);
+                                                }
+                                                Err(_) => {
+                                                    decode_stats.inc_error();
+                                                }
                                             }
                                             for frame in encoder.drain() {
                                                 let media_time = MediaTime::new(
@@ -826,5 +841,22 @@ fn build_webrtc_encoder_state(
         "WebRTC output '{}': audio_encode active (Opus, source {} Hz {} ch -> 48000 Hz {} ch, {} kbps)",
         output_id, input_sr, ch_cfg, target_ch, target_br,
     );
-    WebrtcEncoderState::Active { decoder, encoder }
+
+    // Register decode + encode stats with the shared per-output accumulator.
+    let decode_stats = Arc::new(DecodeStats::new());
+    stats.set_decode_stats(
+        decode_stats.clone(),
+        "AAC-LC",
+        decoder.sample_rate(),
+        decoder.channels(),
+    );
+    stats.set_encode_stats(
+        encoder.stats_handle(),
+        encoder.params().codec.as_str().to_string(),
+        encoder.params().target_sample_rate,
+        encoder.params().target_channels,
+        encoder.params().target_bitrate_kbps,
+    );
+
+    WebrtcEncoderState::Active { decoder, encoder, decode_stats }
 }

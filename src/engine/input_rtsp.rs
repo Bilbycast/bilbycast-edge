@@ -235,11 +235,16 @@ async fn run_rtsp_session(
                 let pts_90khz = frame.timestamp().elapsed().max(0) as u64;
                 let data = frame.data();
 
-                // FrameFormat::SIMPLE gives ADTS-wrapped AAC
-                // TsMuxer.mux_audio expects raw AAC + sample_rate_idx + channels
-                // ADTS header contains this info; for now pass through as raw
-                // Default: 48kHz (idx=3), stereo (2ch)
-                let ts_chunks = ts_muxer.mux_audio(data, pts_90khz, 3, 2);
+                // retina with `FrameFormat::SIMPLE` (set above) returns
+                // each AAC access unit already wrapped in a 7-byte ADTS
+                // header that bakes in the correct sample_rate_idx and
+                // channel_cfg from the SDP. Use `mux_audio_pre_adts` to
+                // wrap it directly in a PES — `mux_audio` would call
+                // `build_adts_frame` and double-wrap the bytes, which
+                // produces a stream that every downstream AAC decoder
+                // rejects with "channel element X.X is not allocated"
+                // (Bug #3, 2026-04-09 test report).
+                let ts_chunks = ts_muxer.mux_audio_pre_adts(data, pts_90khz);
 
                 if !ts_chunks.is_empty() {
                     let total_len: usize = ts_chunks.iter().map(|c| c.len()).sum();

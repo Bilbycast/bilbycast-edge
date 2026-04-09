@@ -18,10 +18,53 @@ use crate::srt::connection::{
 };
 use crate::stats::collector::OutputStatsAccumulator;
 
-use super::audio_302m::S302mOutputPipeline;
+use super::audio_302m::{S302mOutputPipeline, SRT_TS_DATAGRAM_BYTES};
 use super::audio_transcode::InputFormat;
 use super::packet::RtpPacket;
 use super::ts_program_filter::TsProgramFilter;
+
+/// Maximum SRT live-mode payload bytes per `srt_sendmsg` call.
+///
+/// SRT live mode delivers each `srt_sendmsg` as one logical message that the
+/// receiver reassembles before returning from `srt_recvmsg`. The libsrt
+/// receiver's default read buffer is 1456 bytes (one MSS minus headers); any
+/// reassembled message larger than that is silently truncated. To stay
+/// interoperable with `srt-live-transmit`, ffmpeg's libsrt input, hardware
+/// decoders, and any other libsrt-based consumer, every outbound buffer is
+/// chunked to ≤1316 bytes (= 7 × 188-byte MPEG-TS packets — the libsrt
+/// recommended live-mode default).
+///
+/// UDP/RTP-sourced broadcast packets are typically already 1316 bytes and
+/// pass through unchanged. RTMP/RTSP/WebRTC-sourced packets can be much
+/// larger (a TsMuxer-bundled I-frame can be tens of KB) and need to be
+/// split before they hit the SRT socket.
+const SRT_LIVE_MAX_MSG_BYTES: usize = SRT_TS_DATAGRAM_BYTES;
+
+/// Split `data` into ≤[`SRT_LIVE_MAX_MSG_BYTES`] chunks for SRT live-mode
+/// transmission. Pure synchronous helper used by [`srt_send_chunked`] and
+/// the unit tests so chunking behaviour can be verified without a real SRT
+/// socket.
+fn srt_chunk_for_live(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    data.chunks(SRT_LIVE_MAX_MSG_BYTES)
+}
+
+/// Send `data` over an SRT live-mode socket, splitting into ≤[`SRT_LIVE_MAX_MSG_BYTES`]
+/// chunks if needed. Returns the total number of bytes accepted by the socket
+/// or the first send error encountered.
+async fn srt_send_chunked(socket: &Arc<SrtSocket>, data: &[u8]) -> anyhow::Result<usize> {
+    if data.is_empty() {
+        return Ok(0);
+    }
+    let mut total = 0usize;
+    for chunk in srt_chunk_for_live(data) {
+        let n = socket
+            .send(chunk)
+            .await
+            .map_err(|e| anyhow::anyhow!("SRT send: {e}"))?;
+        total += n;
+    }
+    Ok(total)
+}
 
 /// Spawn a task that subscribes to the broadcast channel and sends
 /// RTP packets over an SRT connection. If redundancy is configured,
@@ -150,7 +193,7 @@ async fn srt_output_listener_loop(
                     }
                     result = test_rx.recv() => {
                         if let Ok(packet) = result {
-                            if socket.send(&packet.data).await.is_err() {
+                            if srt_send_chunked(&socket, &packet.data).await.is_err() {
                                 break false;
                             }
                             sent += 1;
@@ -310,8 +353,16 @@ async fn srt_output_forward_loop(
     let output_id = config.id.clone();
     let send_handle = tokio::spawn(async move {
         while let Some(data) = send_rx.recv().await {
-            match send_socket.send(&data).await {
+            // Chunk every outbound buffer into ≤SRT_LIVE_MAX_MSG_BYTES messages
+            // before handing them to the SRT socket. Protects every upstream
+            // code path (passthrough TS, program-filtered TS, 302M datagram,
+            // and the RTMP/RTSP/WebRTC TS-mux paths that bundle whole frames)
+            // from emitting oversized SRT live-mode messages that would be
+            // silently truncated by libsrt receivers.
+            match srt_send_chunked(&send_socket, &data).await {
                 Ok(sent) => {
+                    // Count one logical packet per upstream send call (the
+                    // chunking is invisible to upstream stats consumers).
                     send_stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                     send_stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
                 }
@@ -397,6 +448,11 @@ async fn srt_output_forward_loop(
     let mut aac_decoder_302m: Option<crate::engine::audio_decode::AacDecoder> = None;
     let mut logged_302m_init_failure = false;
     let mut logged_302m_decode_error: Option<String> = None;
+    // Lock-free decode counters shared with the per-output stats
+    // accumulator. Registered lazily the first time the decoder is built.
+    let decode_stats_302m =
+        std::sync::Arc::new(crate::engine::audio_decode::DecodeStats::new());
+    let mut decode_stats_302m_registered = false;
 
     let mut filter_scratch: Vec<u8> = Vec::new();
     let connection_lost = loop {
@@ -425,7 +481,23 @@ async fn srt_output_forward_loop(
                                 config,
                                 &mut logged_302m_init_failure,
                                 &mut logged_302m_decode_error,
+                                &decode_stats_302m,
                             );
+                            // Bind the decode counter handle to the output
+                            // stats accumulator once, lazily — we need the
+                            // decoder's sample rate / channel count to
+                            // label the stage for the UI.
+                            if !decode_stats_302m_registered {
+                                if let Some(dec) = aac_decoder_302m.as_ref() {
+                                    stats.set_decode_stats(
+                                        decode_stats_302m.clone(),
+                                        "AAC-LC",
+                                        dec.sample_rate(),
+                                        dec.channels(),
+                                    );
+                                    decode_stats_302m_registered = true;
+                                }
+                            }
                             if let Some(pipeline) = audio_302m.as_mut() {
                                 for datagram in pipeline.take_ready_datagrams() {
                                     match send_tx.try_send(datagram) {
@@ -647,7 +719,8 @@ async fn srt_output_redundant_loop(
         let output_id1 = config.id.clone();
         let send_handle1 = tokio::spawn(async move {
             while let Some(data) = send_rx_leg1.recv().await {
-                match send_socket1.send(&data).await {
+                // Same chunking discipline as the single-leg path.
+                match srt_send_chunked(&send_socket1, &data).await {
                     Ok(sent) => {
                         send_stats1.packets_sent.fetch_add(1, Ordering::Relaxed);
                         send_stats1.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
@@ -667,7 +740,7 @@ async fn srt_output_redundant_loop(
             let output_id2 = config.id.clone();
             let send_handle2 = tokio::spawn(async move {
                 while let Some(data) = send_rx_leg2.recv().await {
-                    match send_socket2.send(&data).await {
+                    match srt_send_chunked(&send_socket2, &data).await {
                         Ok(_) => {
                             // Don't double-count — leg1 already counted
                         }
@@ -813,6 +886,7 @@ fn srt_run_compressed_302m_step(
     config: &SrtOutputConfig,
     logged_init_failure: &mut bool,
     logged_decode_error: &mut Option<String>,
+    decode_stats: &std::sync::Arc<crate::engine::audio_decode::DecodeStats>,
 ) {
     use crate::engine::audio_decode::AacDecoder;
     use crate::engine::ts_demux::DemuxedFrame;
@@ -892,11 +966,14 @@ fn srt_run_compressed_302m_step(
             continue;
         };
 
+        decode_stats.inc_input();
         match dec.decode_frame(&data) {
             Ok(planar) => {
+                decode_stats.inc_output();
                 p.process_planar(&planar, packet.recv_time_us);
             }
             Err(e) => {
+                decode_stats.inc_error();
                 let kind = format!("{e}");
                 if logged_decode_error.as_deref() != Some(kind.as_str()) {
                     tracing::warn!(

@@ -20,6 +20,8 @@
 //! - PID 0x1000: PMT (Program Map Table)
 //! - PID 0x0100: Video PES (H.264)
 //! - PID 0x0101: Audio PES (AAC)
+use std::time::Instant;
+
 use bytes::{BufMut, BytesMut, Bytes};
 
 // TS constants
@@ -28,6 +30,14 @@ const TS_SYNC_BYTE: u8 = 0x47;
 const PMT_PID: u16 = 0x1000;
 const VIDEO_PID: u16 = 0x0100;
 const AUDIO_PID: u16 = 0x0101;
+
+/// Maximum wall-clock interval between PAT/PMT emissions.
+/// TR-101290 Priority 1 requires PSI tables to repeat at least every
+/// 500 ms; 360 ms gives a comfortable margin against jittered call-site
+/// cadence. Wall-clock (not media PTS) is the right reference because
+/// audio and video may use independent RTP base times so a media-PTS
+/// delta isn't a meaningful measure of real time.
+const PAT_PMT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(360);
 
 /// H.264 stream type in PMT (ISO 14496-10).
 const STREAM_TYPE_H264: u8 = 0x1B;
@@ -57,11 +67,35 @@ pub struct TsMuxer {
     /// audio elementary stream. Set to `Some(*b"BSSD")` for SMPTE 302M
     /// LPCM. When `None`, no registration descriptor is written.
     audio_registration: Option<[u8; 4]>,
-    /// Frame counter for periodic PAT/PMT emission.
-    /// Counts across both video and audio frames.
+    /// Frame counter for periodic PAT/PMT emission. Used as a fallback
+    /// when no time clock is available — see `last_pat_pmt_pts_90khz`
+    /// for the time-based primary path.
     pat_pmt_counter: u32,
     /// Whether PAT/PMT have been emitted at least once.
     pat_pmt_sent: bool,
+    /// Wall-clock instant of the last PAT/PMT emission. Used to enforce
+    /// the [`PAT_PMT_INTERVAL`] cadence required by TR-101290 P1.
+    /// `None` means we have not emitted yet.
+    last_pat_pmt_at: Option<Instant>,
+    /// Last audio PES PTS emitted, in 90 kHz ticks. Used to clamp the
+    /// audio elementary stream so the DTS we hand the downstream muxer
+    /// is strictly monotonic.
+    ///
+    /// Why this exists: RTMP carries millisecond-resolution timestamps
+    /// per chunk stream, but real AAC frames are spaced 21.333 ms apart
+    /// (1024 samples @ 48 kHz). Some publishers (notably ffmpeg with
+    /// `-f flv` against an AAC encoder) emit timestamps that occasionally
+    /// dip backward by 1 ms when the rounding crosses a boundary. AAC
+    /// has no B-frames so PTS == DTS, and any backward step lands as a
+    /// "non monotonically increasing dts" error in every downstream
+    /// muxer (`tsanalyze`, `ffmpeg -f null`, hardware decoders).
+    ///
+    /// Clamping at the muxer is the right layer because the same
+    /// `TsMuxer` is shared by RTMP, RTSP, and WebRTC inputs (see the
+    /// monorepo CLAUDE.md `engine/rtmp/ts_mux.rs` notes), so every
+    /// upstream gets the protection without each one re-implementing
+    /// the same state.
+    last_audio_pts_90khz: Option<u64>,
 }
 
 impl TsMuxer {
@@ -78,7 +112,33 @@ impl TsMuxer {
             audio_registration: None,
             pat_pmt_counter: 0,
             pat_pmt_sent: false,
+            last_pat_pmt_at: None,
+            last_audio_pts_90khz: None,
         }
+    }
+
+    /// Clamp an incoming audio PTS so the audio elementary stream PES
+    /// timestamps are strictly monotonic. Returns the clamped value and
+    /// updates internal state. Exposed at `pub(crate)` so it can be
+    /// unit-tested without going through the full TS mux/parse cycle.
+    ///
+    /// Behaviour:
+    /// - First call: passes the value through unchanged.
+    /// - Subsequent calls: if `pts_90khz <= last`, returns `last + 1`.
+    ///   Otherwise returns `pts_90khz` unchanged.
+    ///
+    /// We bump by exactly 1 tick (≈11.1 µs at 90 kHz) on a regression
+    /// rather than a larger value because the regressions seen in
+    /// practice are 1–2 ms at most, and a 1-tick advance is enough to
+    /// satisfy the strict-greater-than check in every downstream muxer
+    /// without distorting the audio clock more than necessary.
+    pub(crate) fn clamp_audio_pts(&mut self, pts_90khz: u64) -> u64 {
+        let clamped = match self.last_audio_pts_90khz {
+            Some(last) if pts_90khz <= last => last + 1,
+            _ => pts_90khz,
+        };
+        self.last_audio_pts_90khz = Some(clamped);
+        clamped
     }
 
     /// Set whether the stream has video (affects PMT).
@@ -116,17 +176,30 @@ impl TsMuxer {
     /// - On the very first frame (audio or video) to ensure players can
     ///   discover the program structure immediately.
     /// - Before every video keyframe (IDR) for fast channel-change.
-    /// - Every 40 frames (~1.3s at 30fps, well within the TR-101290
-    ///   500ms requirement for typical frame rates).
+    /// - Whenever more than [`PAT_PMT_INTERVAL_TICKS`] (≈ 360 ms) of media
+    ///   time has elapsed since the previous emission. This time-based
+    ///   gate replaces the old "every 40 calls" counter, which violated
+    ///   TR-101290 Priority 1 (PAT/PMT every 500 ms) on slow-frame-rate
+    ///   inputs — e.g. an RTSP camera sending video at 25 fps + AAC at
+    ///   ~16 fps yields ~41 calls/s and ~975 ms PAT/PMT cadence with
+    ///   the old counter (see Bug #3 in the 2026-04-09 test report).
     ///
     /// This is called from both `mux_video()` and `mux_audio()` so that
-    /// audio-only streams (e.g., RTSP cameras sending H.265 video that
-    /// we don't yet decode) still get valid program tables.
+    /// audio-only streams still get valid program tables.
     fn maybe_emit_pat_pmt(&mut self, force: bool) -> Vec<Bytes> {
-        self.pat_pmt_counter += 1;
-        if force || !self.pat_pmt_sent || self.pat_pmt_counter >= 40 {
+        self.pat_pmt_counter = self.pat_pmt_counter.saturating_add(1);
+        let now = Instant::now();
+        let elapsed_due = match self.last_pat_pmt_at {
+            Some(last) => now.duration_since(last) >= PAT_PMT_INTERVAL,
+            None => true,
+        };
+        // Belt-and-braces fallback: if `Instant::now()` is somehow frozen
+        // (it shouldn't be), the counter still forces a re-emit eventually.
+        let counter_due = self.pat_pmt_counter >= 40;
+        if force || !self.pat_pmt_sent || elapsed_due || counter_due {
             self.pat_pmt_counter = 0;
             self.pat_pmt_sent = true;
+            self.last_pat_pmt_at = Some(now);
             vec![
                 Bytes::from(self.build_pat()),
                 Bytes::from(self.build_pmt()),
@@ -139,15 +212,23 @@ impl TsMuxer {
     /// Mux a video access unit (H.264 NALUs in Annex B format) into TS packets.
     ///
     /// `dts_90khz` and `pts_90khz` are in 90kHz clock units.
-    /// `is_keyframe` indicates if this is an IDR frame (prepend PAT/PMT + PCR).
+    /// `is_keyframe` indicates if this is an IDR frame (prepend PAT/PMT).
+    ///
+    /// PCR is written into the adaptation field of the first TS packet of
+    /// **every** video frame (not just keyframes) so the PCR cadence
+    /// satisfies TR-101290 Priority 2 (≤ 100 ms). At 25 fps the resulting
+    /// cadence is ~40 ms; at 30 fps, ~33 ms. Cameras with long GOPs
+    /// (e.g. 2 s default on Reolink) used to emit PCR only every 2 s,
+    /// failing P2 — see Bug #3 in the 2026-04-09 test report.
     pub fn mux_video(&mut self, annex_b_data: &[u8], pts_90khz: u64, dts_90khz: u64, is_keyframe: bool) -> Vec<Bytes> {
         let mut packets = self.maybe_emit_pat_pmt(is_keyframe);
 
         // Build PES packet
         let pes = build_pes_packet(0xE0, annex_b_data, pts_90khz, Some(dts_90khz));
 
-        // Split PES into TS packets
-        let ts_pkts = self.packetize(VIDEO_PID, &pes, true, is_keyframe, Some(dts_90khz));
+        // Split PES into TS packets. Always write PCR (not just on
+        // keyframes) for TR-101290 P2 compliance.
+        let ts_pkts = self.packetize(VIDEO_PID, &pes, true, true, Some(dts_90khz));
         packets.extend(ts_pkts);
 
         packets
@@ -157,6 +238,9 @@ impl TsMuxer {
     ///
     /// Wraps the frame in an ADTS header before PES encapsulation.
     pub fn mux_audio(&mut self, raw_aac: &[u8], pts_90khz: u64, sample_rate_idx: u8, channels: u8) -> Vec<Bytes> {
+        // Enforce monotonic audio PTS — see `last_audio_pts_90khz` doc
+        // for the rationale (RTMP ms-rounded timestamps can dip backward).
+        let pts_90khz = self.clamp_audio_pts(pts_90khz);
         let mut packets = self.maybe_emit_pat_pmt(false);
 
         // Wrap in ADTS header
@@ -164,6 +248,30 @@ impl TsMuxer {
         let pes = build_pes_packet(0xC0, &adts_frame, pts_90khz, None);
         packets.extend(self.packetize(AUDIO_PID, &pes, true, false, None));
 
+        packets
+    }
+
+    /// Mux a pre-ADTS-framed AAC frame into TS packets.
+    ///
+    /// Use this when the upstream demuxer has already wrapped the AAC
+    /// frame in an ADTS header — most notably the `retina` RTSP client
+    /// when configured with `FrameFormat::SIMPLE`, which sets
+    /// `aac_framing: Adts` and hands us a complete ADTS frame per
+    /// audio access unit. Calling [`mux_audio`] with that data would
+    /// double-wrap the frame in another ADTS header, producing a
+    /// stream that every downstream AAC decoder rejects with
+    /// "channel element X.X is not allocated" — see Bug #3 in the
+    /// 2026-04-09 test report.
+    ///
+    /// `adts_frame` must include the 7-byte ADTS header followed by the
+    /// raw AAC payload. The header's sample rate / channel config bake
+    /// in the codec parameters, so this entry point does not take a
+    /// `sample_rate_idx` / `channels` argument.
+    pub fn mux_audio_pre_adts(&mut self, adts_frame: &[u8], pts_90khz: u64) -> Vec<Bytes> {
+        let pts_90khz = self.clamp_audio_pts(pts_90khz);
+        let mut packets = self.maybe_emit_pat_pmt(false);
+        let pes = build_pes_packet(0xC0, adts_frame, pts_90khz, None);
+        packets.extend(self.packetize(AUDIO_PID, &pes, true, false, None));
         packets
     }
 
@@ -585,6 +693,121 @@ mod tests {
         assert_eq!(pmt[es_start], 0x0F);
         let es_info_len = ((pmt[es_start + 3] & 0x0F) as usize) << 8 | pmt[es_start + 4] as usize;
         assert_eq!(es_info_len, 0);
+    }
+
+    /// Bug #11 (2026-04-09): RTMP-ingest → RTP transmux emitted
+    /// non-monotonic audio DTS because the source publisher fed
+    /// millisecond-rounded timestamps that occasionally regressed by
+    /// 1 tick when AAC's 21.333 ms frame interval crossed a ms boundary.
+    /// This test pumps a deliberately non-monotonic sequence through
+    /// `clamp_audio_pts` and asserts every clamped value is strictly
+    /// greater than the previous one.
+    #[test]
+    fn clamp_audio_pts_is_strictly_monotonic_under_regression() {
+        let mut muxer = TsMuxer::new();
+        // Realistic regressing sequence: AAC at 48 kHz wants 21.333 ms
+        // spacing → 1920 ticks @ 90 kHz. RTMP-ms-rounded sources emit
+        // values like 0, 1890, 3870, 5760, 7650, ... which are monotonic.
+        // But ffmpeg-as-publisher occasionally backs up by 1 ms = 90 ticks.
+        // Inject: monotonic chunk, 1-tick equal, 14-tick regression
+        // (matches the bug report's "dts 154629 >= 154615" example),
+        // and a 1004-µs ≈ 90-tick regression.
+        let raw: Vec<u64> = vec![
+            0,
+            1890,
+            3870,
+            5760,
+            7650,
+            7650,            // exact equal
+            9540,
+            9526,            // 14-tick regression
+            11430,
+            11340,           // 90-tick (≈1 ms) regression
+            13320,
+        ];
+        let mut clamped: Vec<u64> = Vec::new();
+        for ts in &raw {
+            clamped.push(muxer.clamp_audio_pts(*ts));
+        }
+        for w in clamped.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "clamped sequence must be strictly monotonic: prev={} cur={} (raw={raw:?} clamped={clamped:?})",
+                w[0],
+                w[1]
+            );
+        }
+        // First value passes through unchanged.
+        assert_eq!(clamped[0], 0);
+        // Forward-going values pass through unchanged.
+        assert_eq!(clamped[1], 1890);
+        assert_eq!(clamped[2], 3870);
+        // Equal value gets bumped by exactly 1 tick.
+        assert_eq!(clamped[5], 7651);
+    }
+
+    /// Verify the same property end-to-end through `mux_audio` by
+    /// extracting the PTS field from each emitted PES. This catches the
+    /// case where someone bypasses `clamp_audio_pts` and writes the raw
+    /// timestamp directly into the PES header.
+    #[test]
+    fn mux_audio_emits_monotonic_pes_pts_under_regression() {
+        let mut muxer = TsMuxer::new();
+        muxer.set_has_video(false);
+        muxer.set_has_audio(true);
+        let raw_aac = vec![0u8; 32];
+        // Raw timestamps with intentional regressions.
+        let raw_ts: Vec<u64> = vec![0, 1890, 3870, 3870, 5760, 5746, 7650];
+        let mut emitted_pts: Vec<u64> = Vec::new();
+        for ts in &raw_ts {
+            let packets = muxer.mux_audio(&raw_aac, *ts, 3, 2);
+            // Find the audio PES packet (PID 0x0101) with PUSI=1 and
+            // extract the 33-bit PTS field per ISO 13818-1 §2.4.3.6.
+            for pkt in &packets {
+                if pkt.len() != TS_PACKET_SIZE || pkt[0] != TS_SYNC_BYTE {
+                    continue;
+                }
+                let pid = ((pkt[1] as u16 & 0x1F) << 8) | pkt[2] as u16;
+                let pusi = (pkt[1] & 0x40) != 0;
+                if pid != AUDIO_PID || !pusi {
+                    continue;
+                }
+                let afc = (pkt[3] >> 4) & 0x03;
+                // Payload starts at byte 4 (no AF) or 4 + 1 + adaptation_field_length (with AF).
+                let payload_start = match afc {
+                    0b01 => 4,
+                    0b11 => 5 + pkt[4] as usize,
+                    _ => continue,
+                };
+                // PES header: start_code_prefix(3) + stream_id(1) + pkt_len(2) + flags(2) + hdr_data_len(1) = 9 bytes
+                // PTS bytes start at payload_start + 9.
+                let pts_off = payload_start + 9;
+                if pts_off + 5 > pkt.len() {
+                    continue;
+                }
+                let b0 = pkt[pts_off] as u64;
+                let b1 = pkt[pts_off + 1] as u64;
+                let b2 = pkt[pts_off + 2] as u64;
+                let b3 = pkt[pts_off + 3] as u64;
+                let b4 = pkt[pts_off + 4] as u64;
+                let pts = (((b0 >> 1) & 0x07) << 30)
+                    | (b1 << 22)
+                    | (((b2 >> 1) & 0x7F) << 15)
+                    | (b3 << 7)
+                    | ((b4 >> 1) & 0x7F);
+                emitted_pts.push(pts);
+                break;
+            }
+        }
+        assert_eq!(emitted_pts.len(), raw_ts.len(), "every audio frame must produce a PES with PTS");
+        for w in emitted_pts.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "PES PTS sequence must be strictly monotonic: prev={} cur={} (raw={raw_ts:?} emitted={emitted_pts:?})",
+                w[0],
+                w[1]
+            );
+        }
     }
 
     #[test]

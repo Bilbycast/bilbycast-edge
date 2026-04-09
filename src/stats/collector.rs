@@ -34,6 +34,34 @@ pub struct OutputStatsAccumulator {
     /// Set once at output startup by `run_st2110_audio_output` (and any other
     /// output that runs a TranscodeStage). Reading is a single atomic load.
     transcode_stats: OnceLock<Arc<crate::engine::audio_transcode::TranscodeStats>>,
+    /// Optional handle to the per-output AAC decode counters plus the
+    /// descriptors the UI needs to label the stage. Set once at output
+    /// startup by outputs that build an `engine::audio_decode::AacDecoder`.
+    audio_decode_stats: OnceLock<AudioDecodeStatsHandle>,
+    /// Optional handle to the per-output audio encode counters plus the
+    /// resolved target codec descriptors. Set once at output startup by
+    /// outputs that spawn an `engine::audio_encode::AudioEncoder`.
+    audio_encode_stats: OnceLock<AudioEncodeStatsHandle>,
+}
+
+/// Registered handle to a per-output decode stage's counters plus the
+/// steady-state descriptors the snapshot path needs to build a
+/// [`crate::stats::models::DecodeStatsSnapshot`].
+pub struct AudioDecodeStatsHandle {
+    pub stats: Arc<crate::engine::audio_decode::DecodeStats>,
+    pub input_codec: String,
+    pub output_sample_rate_hz: u32,
+    pub output_channels: u8,
+}
+
+/// Registered handle to a per-output encode stage's counters plus the
+/// resolved target codec / format descriptors.
+pub struct AudioEncodeStatsHandle {
+    pub stats: Arc<crate::engine::audio_encode::EncodeStats>,
+    pub output_codec: String,
+    pub target_sample_rate_hz: u32,
+    pub target_channels: u8,
+    pub target_bitrate_kbps: u32,
 }
 
 impl OutputStatsAccumulator {
@@ -51,6 +79,8 @@ impl OutputStatsAccumulator {
             srt_stats_cache: Arc::new(Mutex::new(None)),
             srt_leg2_stats_cache: Arc::new(Mutex::new(None)),
             transcode_stats: OnceLock::new(),
+            audio_decode_stats: OnceLock::new(),
+            audio_encode_stats: OnceLock::new(),
         }
     }
 
@@ -61,6 +91,44 @@ impl OutputStatsAccumulator {
         stats: Arc<crate::engine::audio_transcode::TranscodeStats>,
     ) {
         let _ = self.transcode_stats.set(stats);
+    }
+
+    /// Register the per-output audio decode stats handle. Called once at
+    /// output startup by outputs that instantiate an AAC decoder. Subsequent
+    /// calls are no-ops (first wins).
+    pub fn set_decode_stats(
+        &self,
+        stats: Arc<crate::engine::audio_decode::DecodeStats>,
+        input_codec: impl Into<String>,
+        output_sample_rate_hz: u32,
+        output_channels: u8,
+    ) {
+        let _ = self.audio_decode_stats.set(AudioDecodeStatsHandle {
+            stats,
+            input_codec: input_codec.into(),
+            output_sample_rate_hz,
+            output_channels,
+        });
+    }
+
+    /// Register the per-output audio encode stats handle. Called once at
+    /// output startup by outputs that spawn an [`crate::engine::audio_encode::AudioEncoder`].
+    /// Subsequent calls are no-ops (first wins).
+    pub fn set_encode_stats(
+        &self,
+        stats: Arc<crate::engine::audio_encode::EncodeStats>,
+        output_codec: impl Into<String>,
+        target_sample_rate_hz: u32,
+        target_channels: u8,
+        target_bitrate_kbps: u32,
+    ) {
+        let _ = self.audio_encode_stats.set(AudioEncodeStatsHandle {
+            stats,
+            output_codec: output_codec.into(),
+            target_sample_rate_hz,
+            target_channels,
+            target_bitrate_kbps,
+        });
     }
 
     /// Take a point-in-time snapshot of all atomic counters and return an
@@ -75,6 +143,29 @@ impl OutputStatsAccumulator {
                 dropped: t.dropped.load(Ordering::Relaxed),
                 format_resets: t.format_resets.load(Ordering::Relaxed),
                 last_latency_us: t.last_latency_us.load(Ordering::Relaxed),
+            }
+        });
+        let audio_decode_stats = self.audio_decode_stats.get().map(|h| {
+            crate::stats::models::DecodeStatsSnapshot {
+                input_frames: h.stats.input_frames.load(Ordering::Relaxed),
+                output_blocks: h.stats.output_blocks.load(Ordering::Relaxed),
+                decode_errors: h.stats.decode_errors.load(Ordering::Relaxed),
+                dropped_uninit: h.stats.dropped_uninit.load(Ordering::Relaxed),
+                input_codec: h.input_codec.clone(),
+                output_sample_rate_hz: h.output_sample_rate_hz,
+                output_channels: h.output_channels,
+            }
+        });
+        let audio_encode_stats = self.audio_encode_stats.get().map(|h| {
+            crate::stats::models::EncodeStatsSnapshot {
+                pcm_frames_submitted: h.stats.pcm_frames_submitted.load(Ordering::Relaxed),
+                pcm_frames_dropped: h.stats.pcm_frames_dropped.load(Ordering::Relaxed),
+                encoded_frames_out: h.stats.encoded_frames_out.load(Ordering::Relaxed),
+                supervisor_restarts: h.stats.supervisor_restarts.load(Ordering::Relaxed),
+                output_codec: h.output_codec.clone(),
+                target_sample_rate_hz: h.target_sample_rate_hz,
+                target_channels: h.target_channels,
+                target_bitrate_kbps: h.target_bitrate_kbps,
             }
         });
         OutputStats {
@@ -98,6 +189,8 @@ impl OutputStatsAccumulator {
             srt_stats: self.srt_stats_cache.lock().unwrap().clone(),
             srt_leg2_stats: self.srt_leg2_stats_cache.lock().unwrap().clone(),
             transcode_stats,
+            audio_decode_stats,
+            audio_encode_stats,
         }
     }
 }

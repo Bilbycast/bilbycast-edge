@@ -55,6 +55,7 @@
 
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -207,6 +208,49 @@ pub struct EncodedFrame {
     pub pts: u64,
 }
 
+/// Lock-free counters for the encode stage. Composed alongside the per-output
+/// [`OutputStatsAccumulator`] via [`AudioEncoder::stats_handle`] so the
+/// accumulator can read them without taking any locks on the data path.
+#[derive(Debug, Default)]
+pub struct EncodeStats {
+    /// PCM frames that were accepted into the bounded input channel.
+    pub pcm_frames_submitted: AtomicU64,
+    /// PCM frames dropped because the bounded input channel was full
+    /// (slow ffmpeg / restarting supervisor).
+    pub pcm_frames_dropped: AtomicU64,
+    /// Encoded codec frames successfully pulled out of the bounded output
+    /// channel by the consumer ([`AudioEncoder::drain`] / [`AudioEncoder::try_recv`]).
+    pub encoded_frames_out: AtomicU64,
+    /// Number of times the supervisor has respawned the ffmpeg subprocess.
+    pub supervisor_restarts: AtomicU64,
+}
+
+impl EncodeStats {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn inc_submitted(&self) {
+        self.pcm_frames_submitted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_dropped(&self) {
+        self.pcm_frames_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_out(&self, n: u64) {
+        self.encoded_frames_out.fetch_add(n, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_restart(&self) {
+        self.supervisor_restarts.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 // ── Constants ───────────────────────────────────────────────────────────────
 
 /// Maximum bytes accepted per stdin write before timing out and triggering
@@ -307,6 +351,9 @@ pub struct AudioEncoder {
     /// Scratch buffer for planar→interleaved conversion. Reused across
     /// `submit_planar` calls to avoid per-call allocation.
     pack_scratch: BytesMut,
+    /// Shared lock-free counters exposed to the parent
+    /// [`OutputStatsAccumulator`] via [`Self::stats_handle`].
+    encode_stats: Arc<EncodeStats>,
 }
 
 impl std::fmt::Debug for AudioEncoder {
@@ -368,6 +415,7 @@ impl AudioEncoder {
         let (encoded_tx, encoded_rx) = mpsc::channel::<EncodedFrame>(ENCODED_CHANNEL_DEPTH);
 
         let bytes_per_frame = (params.channels as usize) * 4;
+        let encode_stats = Arc::new(EncodeStats::new());
 
         let supervisor = tokio::spawn(supervisor_loop(
             params.clone(),
@@ -378,6 +426,7 @@ impl AudioEncoder {
             output_id,
             stats,
             events,
+            encode_stats.clone(),
         ));
 
         Ok(Self {
@@ -388,7 +437,15 @@ impl AudioEncoder {
             cancel,
             bytes_per_frame,
             pack_scratch: BytesMut::new(),
+            encode_stats,
         })
+    }
+
+    /// Shared handle to the lock-free encode-stage counters. Callers pass
+    /// this into [`crate::stats::collector::OutputStatsAccumulator::set_encode_stats`]
+    /// so the per-tick stats snapshot can read them.
+    pub fn stats_handle(&self) -> Arc<EncodeStats> {
+        self.encode_stats.clone()
     }
 
     /// Encoder parameters (mirrors what was passed to [`Self::spawn`]).
@@ -440,20 +497,31 @@ impl AudioEncoder {
         };
 
         match self.pcm_tx.try_send(chunk) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.encode_stats.inc_submitted();
+                true
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 // Backpressure — silently drop. The encoder is slow or
                 // ffmpeg is restarting. The output's stats accumulator
                 // will reflect this on the consumer side too.
+                self.encode_stats.inc_dropped();
                 false
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.encode_stats.inc_dropped();
+                false
+            }
         }
     }
 
     /// Pull the next encoded frame, if any. Non-blocking.
     pub fn try_recv(&mut self) -> Option<EncodedFrame> {
-        self.encoded_rx.try_recv().ok()
+        let frame = self.encoded_rx.try_recv().ok();
+        if frame.is_some() {
+            self.encode_stats.inc_out(1);
+        }
+        frame
     }
 
     /// Drain all currently-available encoded frames. Non-blocking — returns
@@ -462,6 +530,9 @@ impl AudioEncoder {
         let mut out = Vec::new();
         while let Ok(frame) = self.encoded_rx.try_recv() {
             out.push(frame);
+        }
+        if !out.is_empty() {
+            self.encode_stats.inc_out(out.len() as u64);
         }
         out
     }
@@ -485,8 +556,24 @@ fn build_ffmpeg_args(params: &EncoderParams) -> Vec<String> {
         "-nostats".into(),
         "-loglevel".into(),
         "warning".into(),
+        // -fflags +nobuffer reduces input-side buffering;
+        // -avioflags direct disables the libavio output buffer entirely so
+        //   each muxer write hits the pipe immediately;
+        // -fflags +flush_packets is the format-level form of -flush_packets
+        //   1; enables it explicitly here so the muxer flushes per packet;
+        // -analyzeduration 0 -probesize 32 stops ffmpeg from buffering
+        //   ~5 seconds of input before deciding what to do with raw PCM.
+        //   Without these two, ffmpeg waits for default `analyzeduration`
+        //   (5 s) of input before opening the decoder, which causes a
+        //   ~4-5 second startup latency on the encoded stream.
         "-fflags".into(),
-        "+nobuffer".into(),
+        "+nobuffer+flush_packets".into(),
+        "-avioflags".into(),
+        "direct".into(),
+        "-analyzeduration".into(),
+        "0".into(),
+        "-probesize".into(),
+        "32".into(),
         // Input: raw s32le PCM on stdin.
         "-f".into(),
         "s32le".into(),
@@ -1037,6 +1124,7 @@ async fn supervisor_loop(
     output_id: String,
     stats: Arc<OutputStatsAccumulator>,
     events: Option<EventSender>,
+    encode_stats: Arc<EncodeStats>,
 ) {
     tracing::info!(
         "audio_encode supervisor started: flow={} output={} codec={} sr={}/{} ch={}/{} br={}k",
@@ -1082,6 +1170,10 @@ async fn supervisor_loop(
 
         // Spawn ffmpeg.
         let args = build_ffmpeg_args(&params);
+        tracing::info!(
+            "audio_encode '{}' about to spawn ffmpeg with {} args",
+            output_id, args.len()
+        );
         let mut cmd = Command::new("ffmpeg");
         cmd.args(&args)
             .stdin(Stdio::piped())
@@ -1090,13 +1182,21 @@ async fn supervisor_loop(
             .kill_on_drop(true);
 
         let mut child = match cmd.spawn() {
-            Ok(c) => c,
+            Ok(c) => {
+                let pid = c.id().unwrap_or(0);
+                tracing::info!(
+                    "audio_encode '{}' ffmpeg sidecar spawned: pid={pid} args={:?}",
+                    output_id, args
+                );
+                c
+            }
             Err(e) => {
                 tracing::error!(
                     "audio_encode '{}' failed to spawn ffmpeg: {e}",
                     output_id
                 );
                 restart_count += 1;
+                encode_stats.inc_restart();
                 if restart_count > MAX_RESTARTS {
                     break;
                 }
@@ -1185,6 +1285,7 @@ async fn supervisor_loop(
                         );
                         // Force a restart attempt.
                         restart_count += 1;
+                        encode_stats.inc_restart();
                         proc_cancel.cancel();
                         let _ = writer_handle.await;
                         let _ = reader_handle.await;
@@ -1245,6 +1346,7 @@ async fn supervisor_loop(
         }
 
         restart_count += 1;
+        encode_stats.inc_restart();
         if restart_count > MAX_RESTARTS {
             tracing::error!(
                 "audio_encode '{}': giving up after {} restarts in {} seconds",
@@ -1319,14 +1421,39 @@ async fn stdin_writer_task(
     done_tx: tokio::sync::oneshot::Sender<mpsc::Receiver<PcmChunk>>,
     _stats: Arc<OutputStatsAccumulator>,
 ) {
+    tracing::debug!("audio_encode stdin_writer_task started");
+    let mut chunks_written = 0u64;
+    let mut bytes_written = 0u64;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             opt = pcm_rx.recv() => {
-                let Some(chunk) = opt else { break; };
+                let Some(chunk) = opt else {
+                    tracing::debug!(
+                        "audio_encode stdin_writer_task: pcm_rx closed after {chunks_written} chunks / {bytes_written} bytes",
+                    );
+                    break;
+                };
+                let chunk_len = chunk.data.len();
                 let write_fut = stdin.write_all(&chunk.data);
                 match tokio::time::timeout(STDIN_WRITE_TIMEOUT, write_fut).await {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        chunks_written += 1;
+                        bytes_written += chunk_len as u64;
+                        if chunks_written == 1 || chunks_written % 50 == 0 {
+                            tracing::debug!(
+                                "audio_encode stdin_writer_task: chunks={chunks_written} bytes={bytes_written}"
+                            );
+                        }
+                        // Flush each chunk so ffmpeg sees it promptly. Without
+                        // this, the OS pipe buffer can hold ~64 KB before
+                        // ffmpeg ever runs its read loop, delaying the first
+                        // encoded frame for several seconds.
+                        if let Err(e) = stdin.flush().await {
+                            tracing::debug!("audio_encode stdin flush failed: {e}");
+                            break;
+                        }
+                    }
                     Ok(Err(e)) => {
                         tracing::debug!("audio_encode stdin write failed: {e}");
                         break;
@@ -1339,6 +1466,9 @@ async fn stdin_writer_task(
             }
         }
     }
+    tracing::debug!(
+        "audio_encode stdin_writer_task exiting after {chunks_written} chunks / {bytes_written} bytes"
+    );
     let _ = stdin.shutdown().await;
     drop(stdin);
     let _ = done_tx.send(pcm_rx);
@@ -1353,6 +1483,7 @@ async fn stdout_reader_task(
     cancel: CancellationToken,
     done_tx: tokio::sync::oneshot::Sender<()>,
 ) {
+    tracing::debug!("audio_encode stdout_reader_task started");
     let mut reader = BufReader::new(stdout);
     let mut buf = [0u8; 8192];
     let mut framer = FramerState::new(params.codec, params.target_sample_rate);
@@ -1361,19 +1492,34 @@ async fn stdout_reader_task(
     // consumer is responsible for re-stamping with upstream PTS as needed.
     framer.set_anchor_pts(0);
 
+    let mut total_bytes_read = 0u64;
+    let mut total_frames_emitted = 0u64;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             r = reader.read(&mut buf) => {
                 match r {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        tracing::debug!(
+                            "audio_encode stdout_reader_task: EOF after {total_bytes_read} bytes / {total_frames_emitted} frames"
+                        );
+                        break;
+                    }
                     Ok(n) => {
+                        total_bytes_read += n as u64;
                         let frames = framer.feed(&buf[..n]);
+                        let n_frames = frames.len();
                         for f in frames {
                             // Drop on full — the consumer is too slow.
                             if encoded_tx.try_send(f).is_err() {
                                 tracing::debug!("audio_encode encoded_tx full, dropping frame");
                             }
+                        }
+                        total_frames_emitted += n_frames as u64;
+                        if total_frames_emitted == 1 || total_frames_emitted % 50 == 0 {
+                            tracing::debug!(
+                                "audio_encode stdout_reader_task: bytes={total_bytes_read} frames={total_frames_emitted}"
+                            );
                         }
                     }
                     Err(e) => {
@@ -1384,6 +1530,9 @@ async fn stdout_reader_task(
             }
         }
     }
+    tracing::debug!(
+        "audio_encode stdout_reader_task exiting after {total_bytes_read} bytes / {total_frames_emitted} frames"
+    );
     let _ = done_tx.send(());
 }
 
@@ -1699,6 +1848,208 @@ mod tests {
     fn check_ffmpeg_available_doesnt_panic() {
         // We don't assert the result — depends on the host machine.
         let _ = check_ffmpeg_available();
+    }
+
+    /// Bare-metal sanity test: spawn ffmpeg directly via tokio, feed it
+    /// raw PCM, and verify ADTS frames come out of stdout. This bypasses
+    /// the AudioEncoder framework entirely so we can isolate tokio/pipe
+    /// issues from bilbycast wiring issues.
+    #[tokio::test]
+    async fn raw_ffmpeg_pipe_produces_adts_bytes() {
+        if !check_ffmpeg_available() {
+            eprintln!("SKIPPED: ffmpeg not on PATH");
+            return;
+        }
+
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::io::stderr)
+            .with_test_writer()
+            .try_init();
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut child = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner", "-nostats", "-loglevel", "error",
+                "-f", "s32le", "-ar", "48000", "-ac", "2", "-i", "pipe:0",
+                "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "64k",
+                "-ar", "48000", "-ac", "2",
+                "-f", "adts", "-flush_packets", "1", "pipe:1",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("ffmpeg must spawn");
+
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+
+        // Drain stderr in the background.
+        let stderr_handle = tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let mut all = Vec::new();
+            while let Ok(n) = stderr.read(&mut buf).await {
+                if n == 0 { break; }
+                all.extend_from_slice(&buf[..n]);
+            }
+            all
+        });
+
+        // Reader: pull bytes from stdout for up to 5 s.
+        let reader_handle = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            let mut buf = [0u8; 8192];
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                tokio::select! {
+                    r = stdout.read(&mut buf) => {
+                        match r {
+                            Ok(0) => break,
+                            Ok(n) => bytes.extend_from_slice(&buf[..n]),
+                            Err(_) => break,
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                        if !bytes.is_empty() { break; }
+                    }
+                }
+                if bytes.len() >= 64 {
+                    // Got at least one ADTS frame's worth — done.
+                    break;
+                }
+            }
+            bytes
+        });
+
+        // Writer: 1 second of stereo s32 PCM (a 1kHz tone), paced at real
+        // time so ffmpeg's encoder sees a normal data rate. The encoder's
+        // internal output buffer is flushed when it has enough material;
+        // a real-time pace avoids confusing it with a 10 ms burst.
+        for i in 0..50 {
+            let mut chunk = Vec::with_capacity(1024 * 2 * 4);
+            for n in 0..1024 {
+                let t = (i * 1024 + n) as f32 / 48_000.0;
+                let v = (0.5 * (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * i32::MAX as f32) as i32;
+                chunk.extend_from_slice(&v.to_le_bytes());
+                chunk.extend_from_slice(&v.to_le_bytes());
+            }
+            stdin.write_all(&chunk).await.unwrap();
+            stdin.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Drop stdin so ffmpeg can flush its encoder buffer and exit. The
+        // reader will see the flushed bytes plus EOF.
+        drop(stdin);
+
+        let bytes = reader_handle.await.unwrap();
+        eprintln!("got {} bytes from ffmpeg stdout", bytes.len());
+        if bytes.len() < 7 {
+            let _ = child.wait().await;
+            let stderr_bytes = stderr_handle.await.unwrap();
+            eprintln!("ffmpeg stderr:\n{}", String::from_utf8_lossy(&stderr_bytes));
+            panic!("ffmpeg produced no ADTS bytes within 5 s of receiving 1 s of PCM");
+        }
+
+        // Verify the first bytes are ADTS sync (0xFF 0xFx).
+        assert_eq!(bytes[0], 0xFF, "first byte not 0xFF: {:#x}", bytes[0]);
+        assert_eq!(bytes[1] & 0xF0, 0xF0, "second byte not 0xFx: {:#x}", bytes[1]);
+
+        // Cleanup.
+        let _ = child.wait().await;
+        let _ = stderr_handle.await;
+    }
+
+    /// End-to-end integration test that proves the AudioEncoder pipeline
+    /// actually produces encoded ADTS frames when fed PCM. This test was
+    /// added to catch the Bug #7 regression: the supervisor was logged as
+    /// "started" but no encoded frames ever made it through to drain().
+    /// The bug turned out to be a wiring issue elsewhere; this test guards
+    /// against future regressions of the encoder data path itself.
+    #[tokio::test]
+    async fn encoder_produces_aac_frames_from_pcm_input() {
+        // Pipe tracing logs to stderr so test diagnostics are visible.
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::io::stderr)
+            .with_test_writer()
+            .try_init();
+
+        if !check_ffmpeg_available() {
+            eprintln!("SKIPPED: ffmpeg not on PATH");
+            return;
+        }
+
+        let params = EncoderParams {
+            codec: AudioCodec::AacLc,
+            sample_rate: 48_000,
+            channels: 2,
+            target_bitrate_kbps: 64,
+            target_sample_rate: 48_000,
+            target_channels: 2,
+        };
+        let cancel = CancellationToken::new();
+        let stats = Arc::new(OutputStatsAccumulator::new(
+            "test-output".into(),
+            "test output".into(),
+            "rtmp".into(),
+        ));
+
+        let mut encoder = AudioEncoder::spawn(
+            params, cancel.clone(), "test-flow".into(), "test-output".into(),
+            stats, None,
+        ).expect("encoder must spawn");
+
+        // Push PCM at near-real-time pace (one 1024-frame chunk every 21 ms,
+        // matching the 48 kHz frame rate). After each submit, drain any
+        // available encoded frames; succeed as soon as we see one.
+        let frames_per_chunk = 1024usize;
+        let chunks_target = 500; // ~10.7 s of audio at most
+        let mut got_drained: Option<Vec<EncodedFrame>> = None;
+        for i in 0..chunks_target {
+            let mut planar: Vec<Vec<f32>> = vec![vec![0.0; frames_per_chunk]; 2];
+            for ch in 0..2 {
+                for n in 0..frames_per_chunk {
+                    let t = (i * frames_per_chunk + n) as f32 / 48_000.0;
+                    planar[ch][n] =
+                        0.5 * (2.0 * std::f32::consts::PI * 1000.0 * t).sin();
+                }
+            }
+            encoder.submit_planar(&planar, (i * frames_per_chunk * 90_000 / 48_000) as u64);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let drained = encoder.drain();
+            if !drained.is_empty() {
+                got_drained = Some(drained);
+                break;
+            }
+        }
+
+        let drained = got_drained.expect(
+            "AudioEncoder did not produce any encoded ADTS frames within 10 s of \
+             real-time PCM input — check ffmpeg encoder buffering / flush settings",
+        );
+
+        let first = &drained[0];
+        assert!(
+            first.data.len() >= 7,
+            "ADTS frame too short: {} bytes",
+            first.data.len()
+        );
+        assert_eq!(
+            first.data[0], 0xFF,
+            "ADTS sync word byte 0 wrong: {:#x}",
+            first.data[0]
+        );
+        assert_eq!(
+            first.data[1] & 0xF0,
+            0xF0,
+            "ADTS sync word byte 1 wrong: {:#x}",
+            first.data[1]
+        );
+        eprintln!("got {} ADTS frames", drained.len());
+        cancel.cancel();
     }
 
     #[test]

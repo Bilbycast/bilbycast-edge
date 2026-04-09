@@ -400,6 +400,12 @@ pub async fn run_st2110_audio_output(
     // repeat on every frame.
     let mut logged_decoder_init_failure = false;
     let mut logged_decode_error_kind: Option<String> = None;
+    // Lock-free decode counters shared with the per-output stats accumulator.
+    // Registered lazily the first time we successfully construct the AAC
+    // decoder (because we need the decoder's sample rate / channel count).
+    let compressed_decode_stats =
+        std::sync::Arc::new(crate::engine::audio_decode::DecodeStats::new());
+    let mut compressed_decode_stats_registered = false;
 
     tracing::info!(
         "{label} output '{}' started -> red={} blue={:?} transcode={} compressed_input={}",
@@ -424,7 +430,7 @@ pub async fn run_st2110_audio_output(
                         //   (b) PCM transcode
                         //   (c) Byte-identical passthrough
                         let outputs: Vec<Bytes> = if let Some(demuxer) = ts_demuxer.as_mut() {
-                            run_compressed_audio_step(
+                            let out = run_compressed_audio_step(
                                 &packet,
                                 demuxer,
                                 &mut aac_decoder,
@@ -435,7 +441,24 @@ pub async fn run_st2110_audio_output(
                                 label,
                                 &mut logged_decoder_init_failure,
                                 &mut logged_decode_error_kind,
-                            )
+                                &compressed_decode_stats,
+                            );
+                            // Bind the decode counter handle to the output
+                            // stats accumulator once, lazily — we need the
+                            // decoder's sample rate / channel count to
+                            // label the stage for the UI.
+                            if !compressed_decode_stats_registered {
+                                if let Some(dec) = aac_decoder.as_ref() {
+                                    stats.set_decode_stats(
+                                        compressed_decode_stats.clone(),
+                                        "AAC-LC",
+                                        dec.sample_rate(),
+                                        dec.channels(),
+                                    );
+                                    compressed_decode_stats_registered = true;
+                                }
+                            }
+                            out
                         } else if let Some(stage) = transcode.as_mut() {
                             stage.process(&packet)
                         } else {
@@ -795,6 +818,7 @@ fn run_compressed_audio_step(
     label: &str,
     logged_init_failure: &mut bool,
     logged_decode_error: &mut Option<String>,
+    decode_stats: &std::sync::Arc<crate::engine::audio_decode::DecodeStats>,
 ) -> Vec<Bytes> {
     use crate::engine::audio_decode::AacDecoder;
     use crate::engine::ts_demux::DemuxedFrame;
@@ -905,12 +929,15 @@ fn run_compressed_audio_step(
             continue;
         };
 
+        decode_stats.inc_input();
         match dec.decode_frame(&data) {
             Ok(planar) => {
+                decode_stats.inc_output();
                 let pkts = stage.process_planar(&planar, packet.recv_time_us);
                 emitted.extend(pkts);
             }
             Err(e) => {
+                decode_stats.inc_error();
                 let kind = format!("{e}");
                 if logged_decode_error.as_deref() != Some(kind.as_str()) {
                     tracing::warn!(

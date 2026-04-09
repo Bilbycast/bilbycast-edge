@@ -19,7 +19,7 @@ use crate::config::models::RtmpOutputConfig;
 use crate::manager::events::{EventSender, EventSeverity};
 use crate::stats::collector::OutputStatsAccumulator;
 
-use super::audio_decode::{AacDecoder, sample_rate_from_index};
+use super::audio_decode::{AacDecoder, DecodeStats, sample_rate_from_index};
 use super::audio_encode::{AudioCodec, AudioEncoder, AudioEncoderError, EncoderParams};
 use super::packet::RtpPacket;
 use super::rtmp::client::RtmpClient;
@@ -40,6 +40,7 @@ enum EncoderState {
     Active {
         decoder: AacDecoder,
         encoder: AudioEncoder,
+        decode_stats: Arc<DecodeStats>,
     },
     /// Decoder or encoder construction failed once. Drop audio for the
     /// rest of the output's lifetime; the failure event was already
@@ -109,7 +110,16 @@ pub fn spawn_rtmp_output(
                         "RTMP output '{}': connection failed: {:#}",
                         config.id, e,
                     );
-                    wait_or_cancel(&cancel, config.reconnect_delay_secs).await;
+                    // Bug #10 fix: exponential backoff (1, 2, 4, 8, 16 s,
+                    // capped at max(reconnect_delay_secs, 30 s)). The old
+                    // code reconnected every reconnect_delay_secs (default
+                    // ~3 s) regardless of how many attempts had failed,
+                    // hammering an unreachable receiver and flooding logs.
+                    let backoff = rtmp_reconnect_backoff(
+                        attempt,
+                        config.reconnect_delay_secs,
+                    );
+                    wait_or_cancel(&cancel, backoff).await;
                     continue;
                 }
             };
@@ -130,7 +140,11 @@ pub fn spawn_rtmp_output(
                 }
                 Err(e) => {
                     tracing::warn!("RTMP output '{}': publish error: {:#}", config.id, e);
-                    wait_or_cancel(&cancel, config.reconnect_delay_secs).await;
+                    let backoff = rtmp_reconnect_backoff(
+                        attempt,
+                        config.reconnect_delay_secs,
+                    );
+                    wait_or_cancel(&cancel, backoff).await;
                 }
             }
         }
@@ -297,15 +311,18 @@ async fn publish_loop(
                             stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                             stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
                         }
-                        EncoderState::Active { decoder, encoder } => {
+                        EncoderState::Active { decoder, encoder, decode_stats } => {
                             // Decode AAC → planar f32 → submit to encoder.
                             // Errors are logged once at debug; we don't
                             // tear down the output on a single bad frame.
+                            decode_stats.inc_input();
                             match decoder.decode_frame(&data) {
                                 Ok(planar) => {
+                                    decode_stats.inc_output();
                                     encoder.submit_planar(&planar, pts);
                                 }
                                 Err(e) => {
+                                    decode_stats.inc_error();
                                     tracing::debug!(
                                         "RTMP output '{}': AAC decode failed: {e}",
                                         config.id
@@ -314,7 +331,14 @@ async fn publish_loop(
                             }
                             // Drain any encoded frames the encoder has
                             // ready and write them as FLV audio tags.
-                            for frame in encoder.drain() {
+                            let drained = encoder.drain();
+                            if !drained.is_empty() {
+                                tracing::debug!(
+                                    "RTMP output '{}': drained {} encoded frames",
+                                    config.id, drained.len()
+                                );
+                            }
+                            for frame in drained {
                                 let tag = build_aac_raw_tag(&frame.data);
                                 let tag_len = tag.len();
                                 client.send_audio(&tag, ts_ms).await?;
@@ -618,7 +642,27 @@ fn build_encoder_state(
         input_ch, target_ch,
         target_br,
     );
-    EncoderState::Active { decoder, encoder }
+
+    // Register decode + encode stats handles with the shared per-output
+    // accumulator so the stats snapshot path can surface them to the
+    // manager UI. First-wins semantics: if the output has previously been
+    // Lazy→Active cycled, this is a no-op.
+    let decode_stats = Arc::new(DecodeStats::new());
+    stats.set_decode_stats(
+        decode_stats.clone(),
+        "AAC-LC",
+        decoder.sample_rate(),
+        decoder.channels(),
+    );
+    stats.set_encode_stats(
+        encoder.stats_handle(),
+        encoder.params().codec.as_str().to_string(),
+        encoder.params().target_sample_rate,
+        encoder.params().target_channels,
+        encoder.params().target_bitrate_kbps,
+    );
+
+    EncoderState::Active { decoder, encoder, decode_stats }
 }
 
 /// Reverse of `sample_rate_from_index`: maps a sample rate (Hz) to its
@@ -641,4 +685,86 @@ fn sr_index_from_hz(hz: u32) -> Option<u8> {
         7_350 => 12,
         _ => return None,
     })
+}
+
+/// Compute the reconnect delay for an RTMP push output (Bug #10 fix).
+///
+/// `attempt` is the 1-indexed attempt number that just failed (i.e. the
+/// next reconnect is the `attempt+1`-th try). The schedule is:
+///
+/// | attempt | delay |
+/// |---|---|
+/// | 1 | 1 s    |
+/// | 2 | 2 s    |
+/// | 3 | 4 s    |
+/// | 4 | 8 s    |
+/// | 5 | 16 s   |
+/// | 6+ | 30 s (cap) |
+///
+/// The cap is the larger of `reconnect_delay_secs` (operator-configurable)
+/// and 30 s, so a flow that asks for a longer base delay still respects
+/// it. Calling code should pass the failed attempt count from the loop's
+/// own counter — the helper does no state-keeping itself so it stays
+/// trivially testable.
+pub(crate) fn rtmp_reconnect_backoff(
+    attempt: u32,
+    operator_floor_secs: u64,
+) -> u64 {
+    // 2^(attempt-1) seconds, capped at max(operator_floor_secs, 30).
+    // Exponent is clamped to 30 so the shift can never overflow u64.
+    let exponent = attempt.saturating_sub(1).min(30);
+    let exponential = 1u64 << exponent;
+    let cap = operator_floor_secs.max(30);
+    exponential.min(cap).max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify the exponential backoff schedule matches the docstring above.
+    #[test]
+    fn rtmp_reconnect_backoff_schedule() {
+        // Default 3 s operator floor → cap is 30 s.
+        assert_eq!(rtmp_reconnect_backoff(1, 3), 1);
+        assert_eq!(rtmp_reconnect_backoff(2, 3), 2);
+        assert_eq!(rtmp_reconnect_backoff(3, 3), 4);
+        assert_eq!(rtmp_reconnect_backoff(4, 3), 8);
+        assert_eq!(rtmp_reconnect_backoff(5, 3), 16);
+        assert_eq!(rtmp_reconnect_backoff(6, 3), 30);
+        assert_eq!(rtmp_reconnect_backoff(7, 3), 30);
+        assert_eq!(rtmp_reconnect_backoff(99, 3), 30);
+    }
+
+    /// A larger operator floor raises the cap above 30 s. The exponential
+    /// schedule continues doubling until it hits the cap.
+    #[test]
+    fn rtmp_reconnect_backoff_respects_operator_floor() {
+        // attempt=5 → 16, attempt=6 → 32 (still below 60 s cap).
+        assert_eq!(rtmp_reconnect_backoff(5, 60), 16);
+        assert_eq!(rtmp_reconnect_backoff(6, 60), 32);
+        // attempt=7 → 64, capped at operator floor 60.
+        assert_eq!(rtmp_reconnect_backoff(7, 60), 60);
+        assert_eq!(rtmp_reconnect_backoff(99, 60), 60);
+    }
+
+    /// Total reconnect attempts in 60 s of wall clock should be ≤ 7
+    /// (1+2+4+8+16+30 = 61 s for the first six tries). This matches the
+    /// Bug #10 verification gate.
+    #[test]
+    fn rtmp_reconnect_backoff_caps_attempts_per_minute() {
+        let mut elapsed: u64 = 0;
+        let mut attempts: u32 = 0;
+        let mut next: u32 = 1;
+        while elapsed < 60 {
+            elapsed += rtmp_reconnect_backoff(next, 3);
+            attempts += 1;
+            next += 1;
+        }
+        assert!(
+            attempts <= 7,
+            "expected ≤ 7 reconnect attempts in 60 s with the new \
+             backoff, got {attempts} (elapsed={elapsed}s)"
+        );
+    }
 }

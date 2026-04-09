@@ -272,6 +272,18 @@ pub struct OutputStats {
     /// audio essence). Absent otherwise (passthrough outputs).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcode_stats: Option<TranscodeStatsSnapshot>,
+    /// Per-output AAC decode stage statistics. Present only when the output
+    /// runs an `engine::audio_decode::AacDecoder` to turn compressed audio
+    /// (AAC-LC in MPEG-TS) into PCM for downstream PCM-only outputs or for a
+    /// PCM→encoder chain. Absent on pass-through outputs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_decode_stats: Option<DecodeStatsSnapshot>,
+    /// Per-output audio encode stage statistics. Present only when the
+    /// output runs an `engine::audio_encode::AudioEncoder` (ffmpeg sidecar)
+    /// to produce a compressed codec (AAC / HE-AAC / Opus / MP2 / AC-3) from
+    /// upstream PCM. Absent on pass-through outputs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_encode_stats: Option<EncodeStatsSnapshot>,
 }
 
 /// Per-output transcoder snapshot. Mirrors `engine::audio_transcode::TranscodeStats`
@@ -293,6 +305,57 @@ pub struct TranscodeStatsSnapshot {
     /// Most recent end-to-end transcode latency, in microseconds. Measured
     /// from the input packet's `recv_time_us` to emission time.
     pub last_latency_us: u64,
+}
+
+/// Per-output audio decode snapshot. Mirrors
+/// `engine::audio_decode::DecodeStats` at point-in-time plus a small set of
+/// steady-state descriptors so the manager UI can label the stage without
+/// having to cross-reference the output config.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DecodeStatsSnapshot {
+    /// Compressed audio frames fed into the decoder.
+    pub input_frames: u64,
+    /// PCM frame blocks emitted (one per successfully decoded input frame).
+    pub output_blocks: u64,
+    /// Frames that failed to decode (corrupt input, symphonia error).
+    pub decode_errors: u64,
+    /// Frames dropped because the decoder had not yet seen its init config.
+    pub dropped_uninit: u64,
+    /// Wire identifier of the input codec the decoder is handling. Always
+    /// `"AAC-LC"` in Phase A.
+    pub input_codec: String,
+    /// Output PCM sample rate in Hz.
+    pub output_sample_rate_hz: u32,
+    /// Output PCM channel count (1 or 2).
+    pub output_channels: u8,
+}
+
+/// Per-output audio encode snapshot. Mirrors
+/// `engine::audio_encode::EncodeStats` at point-in-time plus the resolved
+/// target codec / sample rate / channel count / bitrate so the manager UI
+/// can display what the encoder is actually producing.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct EncodeStatsSnapshot {
+    /// PCM frames that were accepted into the bounded input channel feeding
+    /// ffmpeg stdin.
+    pub pcm_frames_submitted: u64,
+    /// PCM frames dropped because the bounded input channel was full (slow
+    /// or restarting ffmpeg). These are distinct from the generic output
+    /// `packets_dropped` counter.
+    pub pcm_frames_dropped: u64,
+    /// Encoded codec frames successfully framed out of ffmpeg stdout.
+    pub encoded_frames_out: u64,
+    /// Number of times the ffmpeg subprocess supervisor restarted the
+    /// encoder (e.g. after a non-zero exit or spawn failure).
+    pub supervisor_restarts: u64,
+    /// Wire identifier of the target codec, e.g. `"aac_lc"`, `"opus"`.
+    pub output_codec: String,
+    /// Resolved target sample rate in Hz.
+    pub target_sample_rate_hz: u32,
+    /// Resolved target channel count.
+    pub target_channels: u8,
+    /// Resolved target bitrate in kbps.
+    pub target_bitrate_kbps: u32,
 }
 
 /// TR-101290 transport stream analysis statistics for a single flow.

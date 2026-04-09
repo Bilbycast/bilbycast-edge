@@ -103,6 +103,26 @@ async fn process_media(
     let mut audio_sample_rate_idx: u8 = 4; // default 44.1kHz
     let mut audio_channels: u8 = 2; // default stereo
 
+    // Audio PTS derivation state. RTMP carries millisecond-resolution
+    // timestamps but real AAC frames are 1024 samples ≈ 21.33 ms (48 kHz)
+    // or 23.22 ms (44.1 kHz). Multiplying ms*90 produces PES PTS deltas
+    // that oscillate between 23 ms and 24 ms (or 21 ms / 22 ms) — close
+    // on average but never exactly the AAC frame duration. Downstream
+    // tools that decode the AAC and re-derive frame timing from a
+    // sample counter (ffmpeg's `-f null` PCM pipeline, every audio
+    // muxer with strict DTS checks) flag the resulting irregular spacing
+    // as "non monotonically increasing dts" — see Bug #11 in the
+    // 2026-04-09 test report.
+    //
+    // The fix is to anchor a sample counter to the FIRST audio frame's
+    // RTMP timestamp and emit every subsequent PES PTS as exactly
+    // `anchor + frames * 1024 * 90000 / sample_rate`. This produces a
+    // strictly monotonic, evenly-spaced sequence whose deltas exactly
+    // match the AAC nominal frame duration, satisfying every downstream
+    // muxer regardless of how it computes DTS.
+    let mut audio_anchor_pts_90khz: Option<u64> = None;
+    let mut audio_frames_emitted: u64 = 0;
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -226,7 +246,19 @@ async fn process_media(
                             1 => {
                                 // Raw AAC frame
                                 let raw_aac = &data[2..];
-                                let pts_90khz = (timestamp_ms as u64) * 90;
+
+                                // Sample-counter-derived PTS — see
+                                // `audio_anchor_pts_90khz` doc above for the
+                                // rationale (Bug #11). The first frame
+                                // anchors to its RTMP-supplied wall time;
+                                // subsequent frames are spaced exactly one
+                                // AAC frame duration apart at 90 kHz.
+                                let sample_rate_hz = aac_sample_rate_hz(audio_sample_rate_idx);
+                                let anchor = *audio_anchor_pts_90khz
+                                    .get_or_insert_with(|| (timestamp_ms as u64) * 90);
+                                let pts_90khz = anchor
+                                    + audio_frames_emitted * 1024 * 90_000 / sample_rate_hz as u64;
+                                audio_frames_emitted += 1;
 
                                 let ts_packets = muxer.mux_audio(raw_aac, pts_90khz, audio_sample_rate_idx, audio_channels);
 
@@ -270,6 +302,10 @@ async fn process_media(
                             &flow_id,
                         );
                         has_sent_sps_pps = false;
+                        // Reset audio anchor so the next publisher restarts
+                        // the sample counter from its own RTMP wall time.
+                        audio_anchor_pts_90khz = None;
+                        audio_frames_emitted = 0;
                     }
                     None => {
                         // Channel closed
@@ -279,6 +315,34 @@ async fn process_media(
                 }
             }
         }
+    }
+}
+
+/// Map an MPEG-4 AAC `samplingFrequencyIndex` (per ISO 14496-3 §1.6.3.4
+/// Table 1.18) to the actual sample rate in Hz. Used to derive the
+/// per-frame PTS increment for the audio sample-counter clock (Bug #11).
+///
+/// Returns 44100 for unknown indices, matching the legacy
+/// `audio_sample_rate_idx` default in [`process_media`]. The escape
+/// value (idx 15, "explicit frequency in next 24 bits") is unsupported
+/// in the AAC sequence headers we receive over RTMP and falls through
+/// to the default.
+fn aac_sample_rate_hz(idx: u8) -> u32 {
+    match idx {
+        0 => 96_000,
+        1 => 88_200,
+        2 => 64_000,
+        3 => 48_000,
+        4 => 44_100,
+        5 => 32_000,
+        6 => 24_000,
+        7 => 22_050,
+        8 => 16_000,
+        9 => 12_000,
+        10 => 11_025,
+        11 => 8_000,
+        12 => 7_350,
+        _ => 44_100,
     }
 }
 
