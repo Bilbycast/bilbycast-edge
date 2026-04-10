@@ -7,6 +7,46 @@ use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::net::UdpSocket;
 
+/// Default receive socket buffer size (4 MB).
+///
+/// OS defaults are often 212 KB on Linux, far too small for broadcast video
+/// at multi-Gbps rates. 4 MB absorbs ~25 ms of burst at 1.5 Gbps without
+/// kernel drops. Operators needing higher throughput should tune via sysctl
+/// (`net.core.rmem_max`).
+const DEFAULT_RECV_BUF_SIZE: usize = 4 * 1024 * 1024;
+
+/// Default send socket buffer size (4 MB).
+const DEFAULT_SEND_BUF_SIZE: usize = 4 * 1024 * 1024;
+
+/// Apply receive and send socket buffer sizes via SO_RCVBUF / SO_SNDBUF.
+///
+/// Best-effort: logs a warning if the kernel clamps to a lower value (e.g.,
+/// `net.core.rmem_max` / `net.core.wmem_max` is too low) but does not fail.
+fn set_socket_buffers(socket: &Socket, recv_size: usize, send_size: usize) {
+    if let Err(e) = socket.set_recv_buffer_size(recv_size) {
+        tracing::warn!(
+            "Failed to set SO_RCVBUF to {} bytes: {e}. \
+             Increase net.core.rmem_max for optimal performance.",
+            recv_size
+        );
+    } else {
+        let actual = socket.recv_buffer_size().unwrap_or(0);
+        if actual < recv_size {
+            tracing::debug!(
+                "SO_RCVBUF requested {} bytes, kernel set {} bytes",
+                recv_size, actual
+            );
+        }
+    }
+    if let Err(e) = socket.set_send_buffer_size(send_size) {
+        tracing::warn!(
+            "Failed to set SO_SNDBUF to {} bytes: {e}. \
+             Increase net.core.wmem_max for optimal performance.",
+            send_size
+        );
+    }
+}
+
 /// Create a UDP socket bound to the given address with multicast support.
 /// If the bind address is a multicast group, automatically joins the group.
 /// `interface_addr` optionally specifies which local interface to join multicast on.
@@ -21,9 +61,21 @@ pub async fn bind_udp_input(
     if addr.ip().is_multicast() {
         bind_multicast_input(addr, interface_addr).await
     } else {
-        let sock = UdpSocket::bind(addr)
-            .await
+        let domain = if addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+            .context("Failed to create UDP socket")?;
+        socket.set_nonblocking(true)?;
+        set_socket_buffers(&socket, DEFAULT_RECV_BUF_SIZE, DEFAULT_SEND_BUF_SIZE);
+        socket
+            .bind(&SockAddr::from(addr))
             .with_context(|| format!("Failed to bind UDP socket to {addr}"))?;
+        let std_socket: std::net::UdpSocket = socket.into();
+        let sock = UdpSocket::from_std(std_socket)
+            .context("Failed to convert socket2 socket to tokio UdpSocket")?;
         tracing::info!("UDP input socket bound to {addr} (unicast)");
         Ok(sock)
     }
@@ -48,6 +100,7 @@ async fn bind_multicast_input(
     #[cfg(target_os = "macos")]
     socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;
+    set_socket_buffers(&socket, DEFAULT_RECV_BUF_SIZE, DEFAULT_SEND_BUF_SIZE);
 
     // Bind to wildcard address with the multicast port
     let bind_to: SocketAddr = match mcast_addr {
@@ -127,6 +180,7 @@ pub async fn create_udp_output(
         .context("Failed to create output UDP socket")?;
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
+    set_socket_buffers(&socket, DEFAULT_RECV_BUF_SIZE, DEFAULT_SEND_BUF_SIZE);
 
     socket
         .bind(&SockAddr::from(bind_to))

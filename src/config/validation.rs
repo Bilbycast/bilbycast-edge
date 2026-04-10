@@ -204,7 +204,9 @@ pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
         }
     }
 
-    validate_input(&flow.input)?;
+    if let Some(ref input) = flow.input {
+        validate_input(input)?;
+    }
 
     // If the flow's input is itself an uncompressed audio source we can pass
     // its (sample_rate, bit_depth, channels) shape down to per-output
@@ -214,7 +216,7 @@ pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
     // etc.) the audio_decode bridge runs at runtime and the upstream shape
     // isn't statically known here — None falls back to the output's own
     // declared shape, matching the legacy placeholder behaviour.
-    let upstream_audio = upstream_audio_shape(&flow.input);
+    let upstream_audio = flow.input.as_ref().and_then(upstream_audio_shape);
 
     let mut output_ids = HashSet::new();
     for output in &flow.outputs {
@@ -1574,7 +1576,7 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
-            input: InputConfig::Rtp(RtpInputConfig {
+            input: Some(InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,
                 fec_decode: None,
@@ -1583,7 +1585,7 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
-            }),
+            })),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
                 name: "Out 1".to_string(),
@@ -1594,6 +1596,7 @@ mod tests {
                 dscp: 46,
                 redundancy: None,
                 program_number: None,
+            delay: None,
             })],
         };
         assert!(validate_flow(&flow).is_ok());
@@ -1611,7 +1614,7 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
-            input: InputConfig::Rtp(RtpInputConfig {
+            input: Some(InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "not-an-address".to_string(),
                 interface_addr: None,
                 fec_decode: None,
@@ -1620,7 +1623,7 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
-            }),
+            })),
             outputs: vec![],
         };
         assert!(validate_flow(&flow).is_err());
@@ -1638,7 +1641,7 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
-            input: InputConfig::Srt(SrtInputConfig {
+            input: Some(InputConfig::Srt(SrtInputConfig {
                 mode: SrtMode::Caller,
                 local_addr: "0.0.0.0:9000".to_string(),
                 remote_addr: None,
@@ -1660,7 +1663,7 @@ mod tests {
                 payload_size: None, mss: None, tlpkt_drop: None, ip_ttl: None,
                 redundancy: None,
                 transport_mode: None,
-            }),
+            })),
             outputs: vec![],
         };
         assert!(validate_flow(&flow).is_err());
@@ -1678,6 +1681,7 @@ mod tests {
             manager: None,
             tunnels: Vec::new(),
             flow_groups: Vec::new(),
+            resource_limits: None,
             flows: vec![
                 FlowConfig {
                     id: "same-id".to_string(),
@@ -1689,7 +1693,7 @@ mod tests {
                     bandwidth_limit: None,
                     flow_group_id: None,
                     clock_domain: None,
-                    input: InputConfig::Rtp(RtpInputConfig {
+                    input: Some(InputConfig::Rtp(RtpInputConfig {
                         bind_addr: "0.0.0.0:5000".to_string(),
                         interface_addr: None,
                         fec_decode: None,
@@ -1698,7 +1702,7 @@ mod tests {
                         max_bitrate_mbps: None,
                         tr07_mode: None,
                         redundancy: None,
-                    }),
+                    })),
                     outputs: vec![],
                 },
                 FlowConfig {
@@ -1711,7 +1715,7 @@ mod tests {
                     bandwidth_limit: None,
                     flow_group_id: None,
                     clock_domain: None,
-                    input: InputConfig::Rtp(RtpInputConfig {
+                    input: Some(InputConfig::Rtp(RtpInputConfig {
                         bind_addr: "0.0.0.0:5001".to_string(),
                         interface_addr: None,
                         fec_decode: None,
@@ -1720,7 +1724,7 @@ mod tests {
                         max_bitrate_mbps: None,
                         tr07_mode: None,
                         redundancy: None,
-                    }),
+                    })),
                     outputs: vec![],
                 },
             ],
@@ -1740,7 +1744,7 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
-            input: InputConfig::Srt(SrtInputConfig {
+            input: Some(InputConfig::Srt(SrtInputConfig {
                 mode: SrtMode::Listener,
                 local_addr: "0.0.0.0:9000".to_string(),
                 remote_addr: None,
@@ -1762,7 +1766,7 @@ mod tests {
                 payload_size: None, mss: None, tlpkt_drop: None, ip_ttl: None,
                 redundancy: None,
                 transport_mode: None,
-            }),
+            })),
             outputs: vec![],
         };
         assert!(validate_flow(&flow).is_err());
@@ -1782,7 +1786,7 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
-            input: InputConfig::Rtp(RtpInputConfig {
+            input: Some(InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "[::]:5000".to_string(),
                 interface_addr: None,
                 fec_decode: None,
@@ -1791,7 +1795,7 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
-            }),
+            })),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
                 name: "Out 1".to_string(),
@@ -1802,6 +1806,7 @@ mod tests {
                 dscp: 46,
                 redundancy: None,
                 program_number: None,
+            delay: None,
             })],
         };
         assert!(validate_flow(&flow).is_ok());
@@ -1819,7 +1824,7 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
-            input: InputConfig::Rtp(RtpInputConfig {
+            input: Some(InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "239.1.1.1:5000".to_string(),
                 interface_addr: Some("192.168.1.100".to_string()),
                 fec_decode: None,
@@ -1828,7 +1833,7 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
-            }),
+            })),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
                 name: "Multicast Out".to_string(),
@@ -1839,6 +1844,7 @@ mod tests {
                 dscp: 46,
                 redundancy: None,
                 program_number: None,
+            delay: None,
             })],
         };
         assert!(validate_flow(&flow).is_ok());
@@ -1856,7 +1862,7 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
-            input: InputConfig::Rtp(RtpInputConfig {
+            input: Some(InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "[ff7e::1]:5000".to_string(),
                 interface_addr: Some("::1".to_string()),
                 fec_decode: None,
@@ -1865,7 +1871,7 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
-            }),
+            })),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
                 name: "IPv6 Mcast Out".to_string(),
@@ -1876,6 +1882,7 @@ mod tests {
                 dscp: 46,
                 redundancy: None,
                 program_number: None,
+            delay: None,
             })],
         };
         assert!(validate_flow(&flow).is_ok());
@@ -1895,7 +1902,7 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
-            input: InputConfig::Rtp(RtpInputConfig {
+            input: Some(InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "239.1.1.1:5000".to_string(),         // IPv4
                 interface_addr: Some("::1".to_string()),          // IPv6 - mismatch!
                 fec_decode: None,
@@ -1904,7 +1911,7 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
-            }),
+            })),
             outputs: vec![],
         };
         assert!(validate_flow(&flow).is_err());
@@ -1922,7 +1929,7 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
-            input: InputConfig::Rtp(RtpInputConfig {
+            input: Some(InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "[::]:5000".to_string(),
                 interface_addr: None,
                 fec_decode: None,
@@ -1931,7 +1938,7 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
-            }),
+            })),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
                 name: "Bad".to_string(),
@@ -1942,6 +1949,7 @@ mod tests {
                 dscp: 46,
                 redundancy: None,
                 program_number: None,
+            delay: None,
             })],
         };
         assert!(validate_flow(&flow).is_err());
@@ -1959,7 +1967,7 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
-            input: InputConfig::Rtp(RtpInputConfig {
+            input: Some(InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,
                 fec_decode: None,
@@ -1968,7 +1976,7 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
-            }),
+            })),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
                 name: "Bad".to_string(),
@@ -1979,6 +1987,7 @@ mod tests {
                 dscp: 46,
                 redundancy: None,
                 program_number: None,
+            delay: None,
             })],
         };
         assert!(validate_flow(&flow).is_err());
@@ -1996,7 +2005,7 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
-            input: InputConfig::Rtp(RtpInputConfig {
+            input: Some(InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,
                 fec_decode: None,
@@ -2005,7 +2014,7 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
-            }),
+            })),
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                 id: "out-1".to_string(),
                 name: "Bad".to_string(),
@@ -2016,6 +2025,7 @@ mod tests {
                 dscp: 46,
                 redundancy: None,
                 program_number: None,
+            delay: None,
             })],
         };
         assert!(validate_flow(&flow).is_err());
@@ -2195,7 +2205,7 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: Some("group-1".to_string()),
             clock_domain: Some(0),
-            input: InputConfig::St2110_30(st2110_30_input("239.10.10.1:5004")),
+            input: Some(InputConfig::St2110_30(st2110_30_input("239.10.10.1:5004"))),
             outputs: vec![OutputConfig::St2110_30(st2110_30_output(
                 "out-1",
                 "239.10.10.2:5004",
@@ -2230,7 +2240,7 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: Some("group-1".to_string()),
             clock_domain: Some(0),
-            input: InputConfig::St2110_30(st2110_30_input("239.10.10.1:5004")),
+            input: Some(InputConfig::St2110_30(st2110_30_input("239.10.10.1:5004"))),
             outputs: vec![],
         });
         config.flow_groups.push(FlowGroupConfig {
@@ -2249,7 +2259,7 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
-            input: InputConfig::St2110_30(st2110_30_input("239.10.10.2:5004")),
+            input: Some(InputConfig::St2110_30(st2110_30_input("239.10.10.2:5004"))),
             outputs: vec![],
         });
         assert!(validate_config(&config).is_err());
@@ -2268,7 +2278,7 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: Some("group-1".to_string()),
             clock_domain: Some(0),
-            input: InputConfig::St2110_30(st2110_30_input("239.10.10.1:5004")),
+            input: Some(InputConfig::St2110_30(st2110_30_input("239.10.10.1:5004"))),
             outputs: vec![],
         });
         config.flow_groups.push(FlowGroupConfig {

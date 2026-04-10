@@ -3,11 +3,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use bytes::Bytes;
 use srt_transport::SrtSocket;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::{SrtMode, SrtOutputConfig};
@@ -17,9 +19,11 @@ use crate::srt::connection::{
     connect_srt_output, connect_srt_redundancy_leg, spawn_srt_stats_poller,
 };
 use crate::stats::collector::OutputStatsAccumulator;
+use crate::util::time::now_us;
 
 use super::audio_302m::{S302mOutputPipeline, SRT_TS_DATAGRAM_BYTES};
 use super::audio_transcode::InputFormat;
+use super::delay_buffer::resolve_output_delay;
 use super::packet::RtpPacket;
 use super::ts_program_filter::TsProgramFilter;
 
@@ -78,6 +82,7 @@ pub fn spawn_srt_output(
     flow_id: String,
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
+    frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
 ) -> JoinHandle<()> {
     let broadcast_tx = broadcast_tx.clone();
 
@@ -85,9 +90,9 @@ pub fn spawn_srt_output(
         let result = if config.redundancy.is_some() {
             // Redundant SRT output does not support 302M mode, so the
             // compressed-audio bridge is not applicable here.
-            srt_output_redundant_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id).await
+            srt_output_redundant_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, frame_rate_rx).await
         } else {
-            srt_output_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, input_format, compressed_audio_input).await
+            srt_output_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, input_format, compressed_audio_input, frame_rate_rx).await
         };
         if let Err(e) = result {
             tracing::error!("SRT output '{}' exited with error: {e}", config.id);
@@ -114,10 +119,11 @@ async fn srt_output_loop(
     flow_id: &str,
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
+    frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
 ) -> anyhow::Result<()> {
     match config.mode {
-        SrtMode::Listener => srt_output_listener_loop(config, broadcast_tx, stats, cancel, events, flow_id, input_format, compressed_audio_input).await,
-        _ => srt_output_caller_loop(config, broadcast_tx, stats, cancel, events, flow_id, input_format, compressed_audio_input).await,
+        SrtMode::Listener => srt_output_listener_loop(config, broadcast_tx, stats, cancel, events, flow_id, input_format, compressed_audio_input, frame_rate_rx).await,
+        _ => srt_output_caller_loop(config, broadcast_tx, stats, cancel, events, flow_id, input_format, compressed_audio_input, frame_rate_rx).await,
     }
 }
 
@@ -133,6 +139,7 @@ async fn srt_output_listener_loop(
     flow_id: &str,
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
+    frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
 ) -> anyhow::Result<()> {
     let mut listener = bind_srt_listener_for_output(config).await?;
     let mut program_filter = config.program_number.map(|n| {
@@ -193,15 +200,23 @@ async fn srt_output_listener_loop(
                     }
                     result = test_rx.recv() => {
                         if let Ok(packet) = result {
-                            if srt_send_chunked(&socket, &packet.data).await.is_err() {
-                                break false;
-                            }
-                            sent += 1;
-                            // After sending some packets, check for ACKs periodically
-                            if sent % 100 == 0 {
-                                let srt_stats = socket.stats().await;
-                                if srt_stats.pkt_recv_ack_total > 0 {
-                                    break true;
+                            match srt_send_chunked(&socket, &packet.data).await {
+                                Ok(_) => {
+                                    sent += 1;
+                                    // After sending some packets, check for ACKs periodically
+                                    if sent % 100 == 0 {
+                                        let srt_stats = socket.stats().await;
+                                        if srt_stats.pkt_recv_ack_total > 0 {
+                                            break true;
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    // Send channel may be full if the I/O thread hasn't
+                                    // started draining yet. Yield briefly rather than
+                                    // declaring the connection dead — the ACK deadline
+                                    // is the real health check.
+                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                                 }
                             }
                         }
@@ -229,7 +244,7 @@ async fn srt_output_listener_loop(
         let poller_cancel = cancel.child_token();
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
 
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &socket, &mut program_filter, input_format, compressed_audio_input).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &socket, &mut program_filter, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -264,6 +279,7 @@ async fn srt_output_caller_loop(
     flow_id: &str,
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
+    frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
 ) -> anyhow::Result<()> {
     let mut program_filter = config.program_number.map(|n| {
         tracing::info!(
@@ -303,7 +319,7 @@ async fn srt_output_caller_loop(
         let poller_cancel = cancel.child_token();
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
 
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &socket, &mut program_filter, input_format, compressed_audio_input).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &socket, &mut program_filter, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -346,13 +362,14 @@ async fn srt_output_forward_loop(
     program_filter: &mut Option<TsProgramFilter>,
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
+    frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
 ) -> anyhow::Result<bool> {
-    let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<Bytes>(256);
+    let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<(Bytes, u64)>(256);
     let send_socket = socket.clone();
     let send_stats = stats.clone();
     let output_id = config.id.clone();
     let send_handle = tokio::spawn(async move {
-        while let Some(data) = send_rx.recv().await {
+        while let Some((data, recv_time_us)) = send_rx.recv().await {
             // Chunk every outbound buffer into ≤SRT_LIVE_MAX_MSG_BYTES messages
             // before handing them to the SRT socket. Protects every upstream
             // code path (passthrough TS, program-filtered TS, 302M datagram,
@@ -365,6 +382,7 @@ async fn srt_output_forward_loop(
                     // chunking is invisible to upstream stats consumers).
                     send_stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                     send_stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                    send_stats.record_latency(recv_time_us);
                 }
                 Err(e) => {
                     tracing::warn!("SRT output '{}' send error: {e}", output_id);
@@ -455,7 +473,38 @@ async fn srt_output_forward_loop(
     let mut decode_stats_302m_registered = false;
 
     let mut filter_scratch: Vec<u8> = Vec::new();
+
+    // Optional output delay buffer for stream synchronization.
+    // Only active for the normal TS path (not 302M, which is blocked
+    // by validation). The delay buffer queues filtered packets and
+    // releases them after the configured delay.
+    let resolved = if let Some(ref delay) = config.delay {
+        resolve_output_delay(delay, &config.id, frame_rate_rx, cancel).await
+    } else {
+        None
+    };
+    let (mut delay_buf, _frame_rate_watch) = match resolved {
+        Some((buf, watch)) => (Some(buf), watch),
+        None => (None, None),
+    };
+
+    let delay_sleep = tokio::time::sleep(Duration::from_secs(86400));
+    tokio::pin!(delay_sleep);
+
     let connection_lost = loop {
+        if let Some(ref db) = delay_buf {
+            if let Some(release_us) = db.next_release_time() {
+                let now = now_us();
+                let wait = release_us.saturating_sub(now);
+                delay_sleep.as_mut().reset(Instant::now() + Duration::from_micros(wait));
+            }
+        }
+
+        // Payloads to send via the SRT mpsc channel after the select.
+        // Each entry carries (data, recv_time_us) for end-to-end latency tracking.
+        let mut payloads_to_send: Vec<(Bytes, u64)> = Vec::new();
+        let mut got_connection_lost = false;
+
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("SRT output '{}' stopping (cancelled)", config.id);
@@ -483,10 +532,6 @@ async fn srt_output_forward_loop(
                                 &mut logged_302m_decode_error,
                                 &decode_stats_302m,
                             );
-                            // Bind the decode counter handle to the output
-                            // stats accumulator once, lazily — we need the
-                            // decoder's sample rate / channel count to
-                            // label the stage for the UI.
                             if !decode_stats_302m_registered {
                                 if let Some(dec) = aac_decoder_302m.as_ref() {
                                     stats.set_decode_stats(
@@ -500,7 +545,7 @@ async fn srt_output_forward_loop(
                             }
                             if let Some(pipeline) = audio_302m.as_mut() {
                                 for datagram in pipeline.take_ready_datagrams() {
-                                    match send_tx.try_send(datagram) {
+                                    match send_tx.try_send((datagram, packet.recv_time_us)) {
                                         Ok(()) => {}
                                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                             stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
@@ -522,7 +567,7 @@ async fn srt_output_forward_loop(
                         if let Some(pipeline) = audio_302m.as_mut() {
                             pipeline.process(&packet);
                             for datagram in pipeline.take_ready_datagrams() {
-                                match send_tx.try_send(datagram) {
+                                match send_tx.try_send((datagram, packet.recv_time_us)) {
                                     Ok(()) => {}
                                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                         stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
@@ -549,18 +594,19 @@ async fn srt_output_forward_loop(
                         } else {
                             packet.data
                         };
-                        match send_tx.try_send(payload) {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                tracing::warn!(
-                                    "SRT output '{}' connection lost, will reconnect",
-                                    config.id
-                                );
-                                break true;
-                            }
+
+                        if let Some(ref mut db) = delay_buf {
+                            // Re-wrap as RtpPacket for the delay buffer (using
+                            // the filtered payload but preserving timing metadata).
+                            db.push(RtpPacket {
+                                data: payload,
+                                sequence_number: packet.sequence_number,
+                                rtp_timestamp: packet.rtp_timestamp,
+                                recv_time_us: packet.recv_time_us,
+                                is_raw_ts: packet.is_raw_ts,
+                            });
+                        } else {
+                            payloads_to_send.push((payload, packet.recv_time_us));
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -581,6 +627,34 @@ async fn srt_output_forward_loop(
                     }
                 }
             }
+            _ = &mut delay_sleep, if delay_buf.as_ref().map_or(false, |db| db.len() > 0) => {
+                let db = delay_buf.as_mut().unwrap();
+                let now = now_us();
+                for packet in db.drain_ready(now) {
+                    payloads_to_send.push((packet.data, packet.recv_time_us));
+                }
+            }
+        }
+
+        // Send all collected payloads to the SRT send task.
+        for (payload, recv_time_us) in payloads_to_send {
+            match send_tx.try_send((payload, recv_time_us)) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::warn!(
+                        "SRT output '{}' connection lost, will reconnect",
+                        config.id
+                    );
+                    got_connection_lost = true;
+                    break;
+                }
+            }
+        }
+        if got_connection_lost {
+            break true;
         }
     };
 
@@ -611,6 +685,7 @@ async fn srt_output_redundant_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
 ) -> anyhow::Result<()> {
     let redundancy = config
         .redundancy
@@ -712,18 +787,19 @@ async fn srt_output_redundant_loop(
         let mut rx = broadcast_tx.subscribe();
 
         // Spawn async send tasks — one per leg.
-        let (send_tx_leg1, mut send_rx_leg1) = tokio::sync::mpsc::channel::<Bytes>(256);
+        let (send_tx_leg1, mut send_rx_leg1) = tokio::sync::mpsc::channel::<(Bytes, u64)>(256);
 
         let send_socket1 = socket_leg1.clone();
         let send_stats1 = stats.clone();
         let output_id1 = config.id.clone();
         let send_handle1 = tokio::spawn(async move {
-            while let Some(data) = send_rx_leg1.recv().await {
+            while let Some((data, recv_time_us)) = send_rx_leg1.recv().await {
                 // Same chunking discipline as the single-leg path.
                 match srt_send_chunked(&send_socket1, &data).await {
                     Ok(sent) => {
                         send_stats1.packets_sent.fetch_add(1, Ordering::Relaxed);
                         send_stats1.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                        send_stats1.record_latency(recv_time_us);
                     }
                     Err(e) => {
                         tracing::warn!("SRT output '{}' leg1 send error: {e}", output_id1);
@@ -735,11 +811,11 @@ async fn srt_output_redundant_loop(
 
         // Only spawn leg2 send task if leg2 is connected
         let send_tx_leg2_opt = if let Some(ref sock2) = socket_leg2 {
-            let (send_tx_leg2, mut send_rx_leg2) = tokio::sync::mpsc::channel::<Bytes>(256);
+            let (send_tx_leg2, mut send_rx_leg2) = tokio::sync::mpsc::channel::<(Bytes, u64)>(256);
             let send_socket2 = sock2.clone();
             let output_id2 = config.id.clone();
             let send_handle2 = tokio::spawn(async move {
-                while let Some(data) = send_rx_leg2.recv().await {
+                while let Some((data, _recv_time_us)) = send_rx_leg2.recv().await {
                     match srt_send_chunked(&send_socket2, &data).await {
                         Ok(_) => {
                             // Don't double-count — leg1 already counted
@@ -757,9 +833,33 @@ async fn srt_output_redundant_loop(
             None
         };
 
+        // Optional output delay buffer for stream synchronization.
+        let resolved = if let Some(ref delay) = config.delay {
+            resolve_output_delay(delay, &config.id, frame_rate_rx.clone(), &cancel).await
+        } else {
+            None
+        };
+        let (mut delay_buf, _frame_rate_watch) = match resolved {
+            Some((buf, watch)) => (Some(buf), watch),
+            None => (None, None),
+        };
+
+        let delay_sleep = tokio::time::sleep(Duration::from_secs(86400));
+        tokio::pin!(delay_sleep);
+
         // Packet forwarding loop — runs until both legs die or cancel
         let mut broadcast_closed = false;
         loop {
+            if let Some(ref db) = delay_buf {
+                if let Some(release_us) = db.next_release_time() {
+                    let now = now_us();
+                    let wait = release_us.saturating_sub(now);
+                    delay_sleep.as_mut().reset(Instant::now() + Duration::from_micros(wait));
+                }
+            }
+
+            let mut payloads_to_send: Vec<(Bytes, u64)> = Vec::new();
+
             tokio::select! {
                 _ = cancel.cancelled() => {
                     tracing::info!("SRT output '{}' (redundant) stopping (cancelled)", config.id);
@@ -777,8 +877,8 @@ async fn srt_output_redundant_loop(
                 result = rx.recv() => {
                     match result {
                         Ok(packet) => {
-                            // Apply program filter if configured. Skip both legs
-                            // when the filter eats the entire packet.
+                            // Apply program filter if configured.
+                            let recv_time_us = packet.recv_time_us;
                             let payload = if let Some(ref mut filter) = program_filter {
                                 match filter.filter_packet(&packet, &mut filter_scratch) {
                                     Some(b) => b,
@@ -787,34 +887,17 @@ async fn srt_output_redundant_loop(
                             } else {
                                 packet.data
                             };
-                            let leg1_ok = match send_tx_leg1.try_send(payload.clone()) {
-                                Ok(()) => true,
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                    stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                                    false
-                                }
-                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
-                            };
 
-                            let leg2_ok = if let Some(ref tx2) = send_tx_leg2_opt {
-                                match tx2.try_send(payload) {
-                                    Ok(()) => true,
-                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                        stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                                        false
-                                    }
-                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
-                                }
+                            if let Some(ref mut db) = delay_buf {
+                                db.push(RtpPacket {
+                                    data: payload,
+                                    sequence_number: packet.sequence_number,
+                                    rtp_timestamp: packet.rtp_timestamp,
+                                    recv_time_us: packet.recv_time_us,
+                                    is_raw_ts: packet.is_raw_ts,
+                                });
                             } else {
-                                false
-                            };
-
-                            if !leg1_ok && !leg2_ok {
-                                tracing::warn!(
-                                    "SRT output '{}' all legs lost, will reconnect",
-                                    config.id
-                                );
-                                break;
+                                payloads_to_send.push((payload, recv_time_us));
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -834,6 +917,51 @@ async fn srt_output_redundant_loop(
                         }
                     }
                 }
+                _ = &mut delay_sleep, if delay_buf.as_ref().map_or(false, |db| db.len() > 0) => {
+                    let db = delay_buf.as_mut().unwrap();
+                    let now = now_us();
+                    for packet in db.drain_ready(now) {
+                        payloads_to_send.push((packet.data, packet.recv_time_us));
+                    }
+                }
+            }
+
+            // Send to both legs
+            let mut all_legs_lost = false;
+            for (payload, recv_time_us) in payloads_to_send {
+                let leg1_ok = match send_tx_leg1.try_send((payload.clone(), recv_time_us)) {
+                    Ok(()) => true,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                        false
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+                };
+
+                let leg2_ok = if let Some(ref tx2) = send_tx_leg2_opt {
+                    match tx2.try_send((payload, recv_time_us)) {
+                        Ok(()) => true,
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                            false
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+                    }
+                } else {
+                    false
+                };
+
+                if !leg1_ok && !leg2_ok {
+                    tracing::warn!(
+                        "SRT output '{}' all legs lost, will reconnect",
+                        config.id
+                    );
+                    all_legs_lost = true;
+                    break;
+                }
+            }
+            if all_legs_lost {
+                break;
             }
         }
 

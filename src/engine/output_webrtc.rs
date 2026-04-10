@@ -329,6 +329,7 @@ async fn whep_viewer_loop(
             result = rx.recv() => {
                 match result {
                     Ok(packet) => {
+                        let recv_time_us = packet.recv_time_us;
                         let payload = strip_rtp_header(&packet);
                         if payload.is_empty() { continue; }
 
@@ -353,6 +354,7 @@ async fn whep_viewer_loop(
                                             }
                                             stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                                             stats.bytes_sent.fetch_add(rtp_payload.data.len() as u64, Ordering::Relaxed);
+                                            stats.record_latency(recv_time_us);
                                             rtp_seq = rtp_seq.wrapping_add(1);
                                         }
                                     }
@@ -411,6 +413,7 @@ async fn whep_viewer_loop(
                                             }
                                             stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                                             stats.bytes_sent.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
+                                            stats.record_latency(recv_time_us);
                                         }
                                     }
                                 }
@@ -585,6 +588,7 @@ async fn whip_client_loop(
                 result = rx.recv() => {
                     match result {
                         Ok(packet) => {
+                            let recv_time_us = packet.recv_time_us;
                             let payload = strip_rtp_header(&packet);
                             if payload.is_empty() { continue; }
 
@@ -609,6 +613,7 @@ async fn whip_client_loop(
                                                 }
                                                 stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                                                 stats.bytes_sent.fetch_add(rtp_payload.data.len() as u64, Ordering::Relaxed);
+                                                stats.record_latency(recv_time_us);
                                                 rtp_seq = rtp_seq.wrapping_add(1);
                                             }
                                         }
@@ -663,6 +668,7 @@ async fn whip_client_loop(
                                                 }
                                                 stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                                                 stats.bytes_sent.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
+                                                stats.record_latency(recv_time_us);
                                             }
                                         }
                                     }

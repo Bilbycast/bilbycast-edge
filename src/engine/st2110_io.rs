@@ -469,6 +469,7 @@ pub async fn run_st2110_audio_output(
                                 Ok(sent) => {
                                     stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                                     stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                                    stats.record_latency(packet.recv_time_us);
                                 }
                                 Err(e) => {
                                     tracing::warn!("{label} output '{}' red send error: {e}", config.id);
@@ -767,6 +768,7 @@ pub async fn run_st2110_anc_output(
                             Ok(sent) => {
                                 stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                                 stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                                stats.record_latency(packet.recv_time_us);
                             }
                             Err(e) => {
                                 tracing::warn!("ST2110-40 output '{}' red send error: {e}", config.id);

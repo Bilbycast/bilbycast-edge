@@ -135,6 +135,23 @@ pub fn save_config_split(
     Ok(())
 }
 
+/// Async wrapper around [`save_config_split`] that offloads the blocking
+/// file I/O to a Tokio blocking thread pool via `spawn_blocking`.
+///
+/// Use this from async contexts (API handlers, manager client) to avoid
+/// stalling the Tokio runtime during disk writes.
+pub async fn save_config_split_async(
+    config_path: std::path::PathBuf,
+    secrets_path: std::path::PathBuf,
+    config: AppConfig,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        save_config_split(&config_path, &secrets_path, &config)
+    })
+    .await
+    .context("Config save task panicked")?
+}
+
 /// Load secrets from a JSON file, decrypting if encrypted.
 ///
 /// Supports both encrypted (`v1:...`) and legacy unencrypted formats.
@@ -213,6 +230,7 @@ mod tests {
             server: ServerConfig::default(),
             monitor: None,
             manager: None,
+            resource_limits: None,
             tunnels: Vec::new(),
             flow_groups: Vec::new(),
             flows: vec![FlowConfig {
@@ -225,7 +243,7 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input: InputConfig::Rtp(RtpInputConfig {
+                input: Some(InputConfig::Rtp(RtpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
                     interface_addr: None,
                     fec_decode: None,
@@ -234,7 +252,7 @@ mod tests {
                     max_bitrate_mbps: None,
                     tr07_mode: None,
                     redundancy: None,
-                }),
+                })),
                 outputs: vec![],
             }],
         };

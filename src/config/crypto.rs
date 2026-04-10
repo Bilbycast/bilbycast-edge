@@ -33,12 +33,12 @@ const HKDF_INFO: &[u8] = b"aes-256-gcm-secrets-encryption";
 
 /// Derive a 32-byte encryption key from a seed string using HKDF-SHA256.
 fn derive_key(seed: &str) -> [u8; 32] {
-    use hmac::Mac;
+    use hmac::{KeyInit, Mac};
 
     type HmacSha256 = hmac::Hmac<sha2::Sha256>;
 
     // HKDF Extract: PRK = HMAC-SHA256(salt, seed)
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(HKDF_SALT)
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(HKDF_SALT)
         .expect("HMAC key can be any length");
     mac.update(seed.as_bytes());
     let prk = mac.finalize().into_bytes();
@@ -48,7 +48,7 @@ fn derive_key(seed: &str) -> [u8; 32] {
     expand_input.extend_from_slice(HKDF_INFO);
     expand_input.push(0x01);
 
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(&prk)
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&prk)
         .expect("HMAC key can be any length");
     mac.update(&expand_input);
     let okm = mac.finalize().into_bytes();

@@ -284,6 +284,31 @@ pub struct OutputStats {
     /// upstream PCM. Absent on pass-through outputs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_encode_stats: Option<EncodeStatsSnapshot>,
+    /// End-to-end latency from input receive to output send.
+    /// Present only when the output has actively sent packets in the last
+    /// reporting window (1 second). Backward-compatible addition — old manager
+    /// builds ignore unknown fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency: Option<OutputLatencyStats>,
+}
+
+/// Per-output end-to-end latency statistics for the last reporting window.
+///
+/// Measured from the input packet's `recv_time_us` (monotonic receive time)
+/// to the moment the output successfully sends the packet. The window resets
+/// on each 1-second stats snapshot.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct OutputLatencyStats {
+    /// Minimum end-to-end latency in microseconds during the window.
+    pub min_us: u64,
+    /// Average end-to-end latency in microseconds during the window.
+    pub avg_us: u64,
+    /// Maximum end-to-end latency in microseconds during the window.
+    pub max_us: u64,
+    /// Average latency expressed in video frames. Present only when the
+    /// flow's media analysis has detected a video frame rate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_frames: Option<f64>,
 }
 
 /// Per-output transcoder snapshot. Mirrors `engine::audio_transcode::TranscodeStats`

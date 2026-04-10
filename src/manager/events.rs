@@ -149,6 +149,9 @@ pub mod category {
     /// Emitted by the per-output encoder bridges in `engine::audio_encode`
     /// and the build helpers in output_rtmp / output_hls / output_webrtc.
     pub const AUDIO_ENCODE: &str = "audio_encode";
+    /// System resource threshold events (CPU/RAM warning, critical, recovery).
+    /// Emitted by `engine::resource_monitor`.
+    pub const SYSTEM_RESOURCES: &str = "system_resources";
 }
 
 /// Create an event sender/receiver pair.

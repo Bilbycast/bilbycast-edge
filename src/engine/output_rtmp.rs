@@ -192,6 +192,7 @@ async fn publish_loop(
                 }
             }
         };
+        let recv_time_us = packet.recv_time_us;
 
         // Extract TS payload (strip RTP header if needed)
         let ts_data = if packet.is_raw_ts {
@@ -246,6 +247,7 @@ async fn publish_loop(
                     client.send_video(&tag, ts_ms).await?;
                     stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                     stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
+                    stats.record_latency(recv_time_us);
                 }
                 DemuxedFrame::Aac { data, pts } => {
                     let ts_ms = pts_to_ms(pts, &mut base_pts);
@@ -310,6 +312,7 @@ async fn publish_loop(
                             client.send_audio(&tag, ts_ms).await?;
                             stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                             stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
+                            stats.record_latency(recv_time_us);
                         }
                         EncoderState::Active { decoder, encoder, decode_stats } => {
                             // Decode AAC → planar f32 → submit to encoder.
@@ -344,6 +347,7 @@ async fn publish_loop(
                                 client.send_audio(&tag, ts_ms).await?;
                                 stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                                 stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
+                                stats.record_latency(recv_time_us);
                             }
                         }
                         EncoderState::Failed | EncoderState::Lazy => {

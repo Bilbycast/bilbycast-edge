@@ -8,7 +8,7 @@ use axum::response::{Html, IntoResponse};
 use serde::{Deserialize, Serialize};
 
 use crate::api::server::AppState;
-use crate::config::persistence::save_config_split;
+use crate::config::persistence::save_config_split_async;
 use crate::config::validation::validate_config;
 use crate::manager::ManagerConfig;
 
@@ -218,7 +218,7 @@ pub async fn apply_setup(
     }
 
     // Save to disk
-    if let Err(e) = save_config_split(&state.config_path, &state.secrets_path, &config) {
+    if let Err(e) = save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone()).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(SetupResponse {

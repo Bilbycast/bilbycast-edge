@@ -228,6 +228,7 @@ async fn run_rtp_audio_302m_output(
                                     Ok(sent) => {
                                         stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                                         stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                                        stats.record_latency(packet.recv_time_us);
                                     }
                                     Err(e) => {
                                         tracing::warn!(

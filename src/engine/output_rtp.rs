@@ -3,17 +3,21 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::BytesMut;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::RtpOutputConfig;
 use crate::fec::encoder::FecEncoder;
 use crate::stats::collector::OutputStatsAccumulator;
 use crate::util::socket::create_udp_output;
+use crate::util::time::now_us;
 
+use super::delay_buffer::resolve_output_delay;
 use super::packet::RtpPacket;
 use super::ts_program_filter::TsProgramFilter;
 
@@ -85,14 +89,15 @@ pub fn spawn_rtp_output(
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     output_stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
+    frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
 
     tokio::spawn(async move {
         let result = if config.redundancy.is_some() {
-            rtp_output_redundant_loop(&config, &mut rx, output_stats, cancel).await
+            rtp_output_redundant_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx).await
         } else {
-            rtp_output_loop(&config, &mut rx, output_stats, cancel).await
+            rtp_output_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx).await
         };
         if let Err(e) = result {
             tracing::error!("RTP output '{}' exited with error: {e}", config.id);
@@ -120,6 +125,7 @@ async fn rtp_output_loop(
     rx: &mut broadcast::Receiver<RtpPacket>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
+    frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
 ) -> anyhow::Result<()> {
     let (socket, dest) =
         create_udp_output(&config.dest_addr, config.bind_addr.as_deref(), config.interface_addr.as_deref(), config.dscp).await?;
@@ -179,9 +185,48 @@ async fn rtp_output_loop(
     // Reusable scratch buffer for [12-byte RTP header || 1316-byte TS] datagrams.
     let mut rtp_send_buf = Vec::with_capacity(RTP_HEADER_SIZE + TS_PACKETS_PER_DATAGRAM * TS_PACKET_SIZE);
 
+    // Optional output delay buffer for stream synchronization.
+    let resolved = if let Some(ref delay) = config.delay {
+        resolve_output_delay(delay, &config.id, frame_rate_rx, &cancel).await
+    } else {
+        None
+    };
+    let (mut delay_buf, _frame_rate_watch) = match resolved {
+        Some((buf, watch)) => (Some(buf), watch),
+        None => (None, None),
+    };
+
+    // Pinned sleep for delay buffer drain timing. Reset each iteration
+    // from the front packet's release time. Starts with a distant deadline
+    // (effectively infinite) so it never fires when no delay is configured.
+    let delay_sleep = tokio::time::sleep(Duration::from_secs(86400));
+    tokio::pin!(delay_sleep);
+
     loop {
+        // Reset the delay timer to fire when the oldest buffered packet
+        // is due for release. Only meaningful when delay is active.
+        if let Some(ref db) = delay_buf {
+            if let Some(release_us) = db.next_release_time() {
+                let now = now_us();
+                let wait = release_us.saturating_sub(now);
+                delay_sleep.as_mut().reset(Instant::now() + Duration::from_micros(wait));
+            }
+        }
+
+        // Collect packets to send after the select (avoids duplicating
+        // the send logic between the recv and delay-drain branches).
+        let mut packets_to_send: Vec<RtpPacket> = Vec::new();
+
         tokio::select! {
             _ = cancel.cancelled() => {
+                if let Some(ref db) = delay_buf {
+                    if db.len() > 0 {
+                        tracing::debug!(
+                            "RTP output '{}' cancelled with {} buffered packets",
+                            config.id, db.len()
+                        );
+                    }
+                }
                 tracing::info!("RTP output '{}' stopping (cancelled)", config.id);
                 break;
             }
@@ -209,140 +254,12 @@ async fn rtp_output_loop(
                         } else {
                             packet
                         };
-                        if packet.is_raw_ts {
-                            // Raw TS: buffer and re-align to 188-byte boundaries.
-                            // SRT interop may deliver data in non-aligned chunks.
-                            if !is_raw_ts_stream {
-                                is_raw_ts_stream = true;
-                                tracing::info!(
-                                    "RTP output '{}': raw TS detected, enabling TS re-alignment ({} TS pkts/datagram)",
-                                    config.id,
-                                    TS_PACKETS_PER_DATAGRAM
-                                );
-                            }
 
-                            ts_realign_buf.extend_from_slice(&packet.data);
-
-                            // Find TS sync boundary on first data: scan for 0x47
-                            // at 188-byte intervals to confirm alignment.
-                            if !ts_sync_found {
-                                let min_bytes = TS_SYNC_CONFIRM_COUNT * TS_PACKET_SIZE;
-                                if ts_realign_buf.len() >= min_bytes {
-                                    let mut found_offset = None;
-                                    for offset in 0..TS_PACKET_SIZE {
-                                        let all_sync = (0..TS_SYNC_CONFIRM_COUNT).all(|i| {
-                                            let pos = offset + i * TS_PACKET_SIZE;
-                                            pos < ts_realign_buf.len()
-                                                && ts_realign_buf[pos] == TS_SYNC_BYTE
-                                        });
-                                        if all_sync {
-                                            found_offset = Some(offset);
-                                            break;
-                                        }
-                                    }
-
-                                    if let Some(offset) = found_offset {
-                                        if offset > 0 {
-                                            tracing::info!(
-                                                "RTP output '{}': TS sync found at offset {}, discarding {} leading bytes",
-                                                config.id,
-                                                offset,
-                                                offset
-                                            );
-                                            let _ = ts_realign_buf.split_to(offset);
-                                        } else {
-                                            tracing::info!(
-                                                "RTP output '{}': TS sync found at offset 0 (already aligned)",
-                                                config.id
-                                            );
-                                        }
-                                        ts_sync_found = true;
-                                    } else {
-                                        tracing::warn!(
-                                            "RTP output '{}': no TS sync found in {} bytes, discarding",
-                                            config.id,
-                                            ts_realign_buf.len()
-                                        );
-                                        ts_realign_buf.clear();
-                                    }
-                                }
-                            }
-
-                            // Send complete TS-aligned datagrams. Each
-                            // 1316-byte TS chunk is wrapped in a fresh 12-byte
-                            // RFC 2250 RTP header (PT=33 MP2T) before send so
-                            // downstream RTP receivers see proper framing.
-                            if ts_sync_found {
-                                while ts_realign_buf.len() >= ts_datagram_size {
-                                    let datagram = ts_realign_buf.split_to(ts_datagram_size);
-                                    let header = rtp_wrap.build_header(packet.rtp_timestamp);
-                                    rtp_send_buf.clear();
-                                    rtp_send_buf.extend_from_slice(&header);
-                                    rtp_send_buf.extend_from_slice(&datagram);
-                                    match socket.send_to(&rtp_send_buf, dest).await {
-                                        Ok(sent) => {
-                                            stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                            stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("RTP output '{}' send error: {e}", config.id);
-                                        }
-                                    }
-                                }
-                            }
+                        if let Some(ref mut db) = delay_buf {
+                            db.push(packet);
+                            // Don't send yet — the delay_sleep branch will drain
                         } else {
-                            // RTP-wrapped data: send as-is (already properly framed)
-                            match socket.send_to(&packet.data, dest).await {
-                                Ok(sent) => {
-                                    stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                    stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                                }
-                                Err(e) => {
-                                    tracing::warn!("RTP output '{}' send error: {e}", config.id);
-                                }
-                            }
-                        }
-
-                        // Generate and send FEC packets if enabled.
-                        //
-                        // The FEC encoder accumulates media payloads in an
-                        // L x D matrix (columns x rows). FEC repair packets
-                        // are emitted at two points:
-                        //   - A **column FEC packet** is emitted every L
-                        //     media packets (one column is full).
-                        //   - A **row FEC packet** is emitted every D
-                        //     media packets (one row is full).
-                        //   - When the full L x D matrix is complete, the
-                        //     final column and row packets are both emitted.
-                        //
-                        // The returned `fec_packets` vec is empty for most
-                        // calls and contains 1-2 packets when a column or
-                        // row boundary is reached.
-                        if let Some(ref mut encoder) = fec_encoder {
-                            let rtp_header_len = 12;
-                            let payload = if packet.data.len() > rtp_header_len {
-                                &packet.data[rtp_header_len..]
-                            } else {
-                                &packet.data[..]
-                            };
-
-                            let fec_packets = encoder.process(packet.sequence_number, payload);
-                            for fec_pkt in fec_packets {
-                                match socket.send_to(&fec_pkt, dest).await {
-                                    Ok(sent) => {
-                                        stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "RTP output '{}' FEC send error: {e}",
-                                            config.id
-                                        );
-                                    }
-                                }
-                            }
-                            // Sync FEC sent count back to stats accumulator
-                            let sent = fec_sent_counter.load(Ordering::Relaxed);
-                            stats.fec_packets_sent.store(sent, Ordering::Relaxed);
+                            packets_to_send.push(packet);
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -357,6 +274,133 @@ async fn rtp_output_loop(
                         break;
                     }
                 }
+            }
+            _ = &mut delay_sleep, if delay_buf.as_ref().map_or(false, |db| db.len() > 0) => {
+                let db = delay_buf.as_mut().unwrap();
+                let now = now_us();
+                for packet in db.drain_ready(now) {
+                    packets_to_send.push(packet);
+                }
+            }
+        }
+
+        // Process all packets collected from either the immediate recv path
+        // or the delay buffer drain. This shared code path avoids duplicating
+        // the raw-TS re-alignment, RTP wrapping, FEC, and socket send logic.
+        for packet in &packets_to_send {
+            if packet.is_raw_ts {
+                if !is_raw_ts_stream {
+                    is_raw_ts_stream = true;
+                    tracing::info!(
+                        "RTP output '{}': raw TS detected, enabling TS re-alignment ({} TS pkts/datagram)",
+                        config.id,
+                        TS_PACKETS_PER_DATAGRAM
+                    );
+                }
+
+                ts_realign_buf.extend_from_slice(&packet.data);
+
+                if !ts_sync_found {
+                    let min_bytes = TS_SYNC_CONFIRM_COUNT * TS_PACKET_SIZE;
+                    if ts_realign_buf.len() >= min_bytes {
+                        let mut found_offset = None;
+                        for offset in 0..TS_PACKET_SIZE {
+                            let all_sync = (0..TS_SYNC_CONFIRM_COUNT).all(|i| {
+                                let pos = offset + i * TS_PACKET_SIZE;
+                                pos < ts_realign_buf.len()
+                                    && ts_realign_buf[pos] == TS_SYNC_BYTE
+                            });
+                            if all_sync {
+                                found_offset = Some(offset);
+                                break;
+                            }
+                        }
+
+                        if let Some(offset) = found_offset {
+                            if offset > 0 {
+                                tracing::info!(
+                                    "RTP output '{}': TS sync found at offset {}, discarding {} leading bytes",
+                                    config.id,
+                                    offset,
+                                    offset
+                                );
+                                let _ = ts_realign_buf.split_to(offset);
+                            } else {
+                                tracing::info!(
+                                    "RTP output '{}': TS sync found at offset 0 (already aligned)",
+                                    config.id
+                                );
+                            }
+                            ts_sync_found = true;
+                        } else {
+                            tracing::warn!(
+                                "RTP output '{}': no TS sync found in {} bytes, discarding",
+                                config.id,
+                                ts_realign_buf.len()
+                            );
+                            ts_realign_buf.clear();
+                        }
+                    }
+                }
+
+                if ts_sync_found {
+                    while ts_realign_buf.len() >= ts_datagram_size {
+                        let datagram = ts_realign_buf.split_to(ts_datagram_size);
+                        let header = rtp_wrap.build_header(packet.rtp_timestamp);
+                        rtp_send_buf.clear();
+                        rtp_send_buf.extend_from_slice(&header);
+                        rtp_send_buf.extend_from_slice(&datagram);
+                        match socket.send_to(&rtp_send_buf, dest).await {
+                            Ok(sent) => {
+                                stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                                stats.record_latency(packet.recv_time_us);
+                            }
+                            Err(e) => {
+                                tracing::warn!("RTP output '{}' send error: {e}", config.id);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // RTP-wrapped data: send as-is (already properly framed)
+                match socket.send_to(&packet.data, dest).await {
+                    Ok(sent) => {
+                        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                        stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                        stats.record_latency(packet.recv_time_us);
+                    }
+                    Err(e) => {
+                        tracing::warn!("RTP output '{}' send error: {e}", config.id);
+                    }
+                }
+            }
+
+            // Generate and send FEC packets if enabled.
+            if let Some(ref mut encoder) = fec_encoder {
+                let rtp_header_len = 12;
+                let payload = if packet.data.len() > rtp_header_len {
+                    &packet.data[rtp_header_len..]
+                } else {
+                    &packet.data[..]
+                };
+
+                let fec_packets = encoder.process(packet.sequence_number, payload);
+                for fec_pkt in fec_packets {
+                    match socket.send_to(&fec_pkt, dest).await {
+                        Ok(sent) => {
+                            stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "RTP output '{}' FEC send error: {e}",
+                                config.id
+                            );
+                        }
+                    }
+                }
+                let sent = fec_sent_counter.load(Ordering::Relaxed);
+                stats.fec_packets_sent.store(sent, Ordering::Relaxed);
             }
         }
     }
@@ -378,6 +422,7 @@ async fn rtp_output_redundant_loop(
     rx: &mut broadcast::Receiver<RtpPacket>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
+    frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
 ) -> anyhow::Result<()> {
     let redundancy = config
         .redundancy
@@ -448,7 +493,31 @@ async fn rtp_output_redundant_loop(
     let mut rtp_wrap = RtpWrapState::new();
     let mut rtp_send_buf = Vec::with_capacity(RTP_HEADER_SIZE + TS_PACKETS_PER_DATAGRAM * TS_PACKET_SIZE);
 
+    // Optional output delay buffer for stream synchronization.
+    let resolved = if let Some(ref delay) = config.delay {
+        resolve_output_delay(delay, &config.id, frame_rate_rx, &cancel).await
+    } else {
+        None
+    };
+    let (mut delay_buf, _frame_rate_watch) = match resolved {
+        Some((buf, watch)) => (Some(buf), watch),
+        None => (None, None),
+    };
+
+    let delay_sleep = tokio::time::sleep(Duration::from_secs(86400));
+    tokio::pin!(delay_sleep);
+
     loop {
+        if let Some(ref db) = delay_buf {
+            if let Some(release_us) = db.next_release_time() {
+                let now = now_us();
+                let wait = release_us.saturating_sub(now);
+                delay_sleep.as_mut().reset(Instant::now() + Duration::from_micros(wait));
+            }
+        }
+
+        let mut packets_to_send: Vec<RtpPacket> = Vec::new();
+
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("RTP output '{}' (2022-7) stopping (cancelled)", config.id);
@@ -457,9 +526,6 @@ async fn rtp_output_redundant_loop(
             result = rx.recv() => {
                 match result {
                     Ok(packet) => {
-                        // Apply program filter (if enabled). Same semantics as
-                        // the single-leg path: skip the entire packet if the
-                        // filter eats it (no target-program TS in this datagram).
                         let packet = if let Some(ref mut filter) = program_filter {
                             match filter.filter_packet(&packet, &mut filter_scratch) {
                                 Some(filtered) => RtpPacket {
@@ -474,90 +540,11 @@ async fn rtp_output_redundant_loop(
                         } else {
                             packet
                         };
-                        if packet.is_raw_ts {
-                            // Raw TS: buffer and re-align, send to both legs
-                            if !is_raw_ts_stream {
-                                is_raw_ts_stream = true;
-                                tracing::info!(
-                                    "RTP output '{}': raw TS detected, enabling TS re-alignment ({} TS pkts/datagram)",
-                                    config.id,
-                                    TS_PACKETS_PER_DATAGRAM
-                                );
-                            }
 
-                            ts_realign_buf.extend_from_slice(&packet.data);
-
-                            if !ts_sync_found {
-                                let min_bytes = TS_SYNC_CONFIRM_COUNT * TS_PACKET_SIZE;
-                                if ts_realign_buf.len() >= min_bytes {
-                                    let mut found_offset = None;
-                                    for offset in 0..TS_PACKET_SIZE {
-                                        let all_sync = (0..TS_SYNC_CONFIRM_COUNT).all(|i| {
-                                            let pos = offset + i * TS_PACKET_SIZE;
-                                            pos < ts_realign_buf.len()
-                                                && ts_realign_buf[pos] == TS_SYNC_BYTE
-                                        });
-                                        if all_sync {
-                                            found_offset = Some(offset);
-                                            break;
-                                        }
-                                    }
-
-                                    if let Some(offset) = found_offset {
-                                        if offset > 0 {
-                                            let _ = ts_realign_buf.split_to(offset);
-                                        }
-                                        ts_sync_found = true;
-                                    } else {
-                                        ts_realign_buf.clear();
-                                    }
-                                }
-                            }
-
-                            if ts_sync_found {
-                                while ts_realign_buf.len() >= ts_datagram_size {
-                                    let datagram = ts_realign_buf.split_to(ts_datagram_size);
-                                    // Build the RTP-wrapped datagram once,
-                                    // send identical bytes to both legs so the
-                                    // receiver-side merger sees matching seq.
-                                    let header = rtp_wrap.build_header(packet.rtp_timestamp);
-                                    rtp_send_buf.clear();
-                                    rtp_send_buf.extend_from_slice(&header);
-                                    rtp_send_buf.extend_from_slice(&datagram);
-                                    if let Ok(sent) = socket1.send_to(&rtp_send_buf, dest1).await {
-                                        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                        stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                                    }
-                                    let _ = socket2.send_to(&rtp_send_buf, dest2).await;
-                                }
-                            }
+                        if let Some(ref mut db) = delay_buf {
+                            db.push(packet);
                         } else {
-                            // RTP-wrapped: send to both legs
-                            if let Ok(sent) = socket1.send_to(&packet.data, dest1).await {
-                                stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                            }
-                            let _ = socket2.send_to(&packet.data, dest2).await;
-                        }
-
-                        // FEC: generate and send to both legs
-                        if let Some(ref mut encoder) = fec_encoder {
-                            let rtp_header_len = 12;
-                            let payload = if packet.data.len() > rtp_header_len {
-                                &packet.data[rtp_header_len..]
-                            } else {
-                                &packet.data[..]
-                            };
-
-                            let fec_packets = encoder.process(packet.sequence_number, payload);
-                            for fec_pkt in &fec_packets {
-                                if let Ok(sent) = socket1.send_to(fec_pkt, dest1).await {
-                                    stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                                }
-                                let _ = socket2.send_to(fec_pkt, dest2).await;
-                            }
-                            let sent = fec_sent_counter.load(Ordering::Relaxed);
-                            stats.fec_packets_sent.store(sent, Ordering::Relaxed);
+                            packets_to_send.push(packet);
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -572,6 +559,98 @@ async fn rtp_output_redundant_loop(
                         break;
                     }
                 }
+            }
+            _ = &mut delay_sleep, if delay_buf.as_ref().map_or(false, |db| db.len() > 0) => {
+                let db = delay_buf.as_mut().unwrap();
+                let now = now_us();
+                for packet in db.drain_ready(now) {
+                    packets_to_send.push(packet);
+                }
+            }
+        }
+
+        for packet in &packets_to_send {
+            if packet.is_raw_ts {
+                if !is_raw_ts_stream {
+                    is_raw_ts_stream = true;
+                    tracing::info!(
+                        "RTP output '{}': raw TS detected, enabling TS re-alignment ({} TS pkts/datagram)",
+                        config.id,
+                        TS_PACKETS_PER_DATAGRAM
+                    );
+                }
+
+                ts_realign_buf.extend_from_slice(&packet.data);
+
+                if !ts_sync_found {
+                    let min_bytes = TS_SYNC_CONFIRM_COUNT * TS_PACKET_SIZE;
+                    if ts_realign_buf.len() >= min_bytes {
+                        let mut found_offset = None;
+                        for offset in 0..TS_PACKET_SIZE {
+                            let all_sync = (0..TS_SYNC_CONFIRM_COUNT).all(|i| {
+                                let pos = offset + i * TS_PACKET_SIZE;
+                                pos < ts_realign_buf.len()
+                                    && ts_realign_buf[pos] == TS_SYNC_BYTE
+                            });
+                            if all_sync {
+                                found_offset = Some(offset);
+                                break;
+                            }
+                        }
+
+                        if let Some(offset) = found_offset {
+                            if offset > 0 {
+                                let _ = ts_realign_buf.split_to(offset);
+                            }
+                            ts_sync_found = true;
+                        } else {
+                            ts_realign_buf.clear();
+                        }
+                    }
+                }
+
+                if ts_sync_found {
+                    while ts_realign_buf.len() >= ts_datagram_size {
+                        let datagram = ts_realign_buf.split_to(ts_datagram_size);
+                        let header = rtp_wrap.build_header(packet.rtp_timestamp);
+                        rtp_send_buf.clear();
+                        rtp_send_buf.extend_from_slice(&header);
+                        rtp_send_buf.extend_from_slice(&datagram);
+                        if let Ok(sent) = socket1.send_to(&rtp_send_buf, dest1).await {
+                            stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                            stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                            stats.record_latency(packet.recv_time_us);
+                        }
+                        let _ = socket2.send_to(&rtp_send_buf, dest2).await;
+                    }
+                }
+            } else {
+                if let Ok(sent) = socket1.send_to(&packet.data, dest1).await {
+                    stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                    stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                    stats.record_latency(packet.recv_time_us);
+                }
+                let _ = socket2.send_to(&packet.data, dest2).await;
+            }
+
+            // FEC: generate and send to both legs
+            if let Some(ref mut encoder) = fec_encoder {
+                let rtp_header_len = 12;
+                let payload = if packet.data.len() > rtp_header_len {
+                    &packet.data[rtp_header_len..]
+                } else {
+                    &packet.data[..]
+                };
+
+                let fec_packets = encoder.process(packet.sequence_number, payload);
+                for fec_pkt in &fec_packets {
+                    if let Ok(sent) = socket1.send_to(fec_pkt, dest1).await {
+                        stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                    }
+                    let _ = socket2.send_to(fec_pkt, dest2).await;
+                }
+                let sent = fec_sent_counter.load(Ordering::Relaxed);
+                stats.fec_packets_sent.store(sent, Ordering::Relaxed);
             }
         }
     }

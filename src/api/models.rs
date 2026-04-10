@@ -72,17 +72,18 @@ impl From<&FlowConfig> for FlowSummary {
         use crate::config::models::{InputConfig, OutputConfig};
 
         let (input_type, input_redundancy) = match &flow.input {
-            InputConfig::Rtp(_) => ("rtp", false),
-            InputConfig::Udp(_) => ("udp", false),
-            InputConfig::Srt(srt) => ("srt", srt.redundancy.is_some()),
-            InputConfig::Rtmp(_) => ("rtmp", false),
-            InputConfig::Rtsp(_) => ("rtsp", false),
-            InputConfig::Webrtc(_) => ("webrtc", false),
-            InputConfig::Whep(_) => ("whep", false),
-            InputConfig::St2110_30(c) => ("st2110_30", c.redundancy.is_some()),
-            InputConfig::St2110_31(c) => ("st2110_31", c.redundancy.is_some()),
-            InputConfig::St2110_40(c) => ("st2110_40", c.redundancy.is_some()),
-            InputConfig::RtpAudio(c) => ("rtp_audio", c.redundancy.is_some()),
+            Some(InputConfig::Rtp(_)) => ("rtp", false),
+            Some(InputConfig::Udp(_)) => ("udp", false),
+            Some(InputConfig::Srt(srt)) => ("srt", srt.redundancy.is_some()),
+            Some(InputConfig::Rtmp(_)) => ("rtmp", false),
+            Some(InputConfig::Rtsp(_)) => ("rtsp", false),
+            Some(InputConfig::Webrtc(_)) => ("webrtc", false),
+            Some(InputConfig::Whep(_)) => ("whep", false),
+            Some(InputConfig::St2110_30(c)) => ("st2110_30", c.redundancy.is_some()),
+            Some(InputConfig::St2110_31(c)) => ("st2110_31", c.redundancy.is_some()),
+            Some(InputConfig::St2110_40(c)) => ("st2110_40", c.redundancy.is_some()),
+            Some(InputConfig::RtpAudio(c)) => ("rtp_audio", c.redundancy.is_some()),
+            None => ("none", false),
         };
         let output_redundancy = flow.outputs.iter().any(|o| match o {
             OutputConfig::Srt(srt) => srt.redundancy.is_some(),

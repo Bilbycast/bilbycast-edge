@@ -21,10 +21,11 @@ use tokio_tungstenite::tungstenite::Message;
 use super::events::{Event, EventSeverity, build_event_envelope};
 
 use crate::config::models::{AppConfig, FlowConfig, FlowGroupConfig, OutputConfig};
-use crate::config::persistence::save_config_split;
+use crate::config::persistence::save_config_split_async;
 use crate::config::secrets::SecretsConfig;
 use crate::config::validation::{validate_config, validate_flow, validate_output, validate_tunnel};
 use crate::engine::manager::FlowManager;
+use crate::engine::resource_monitor::SystemResourceState;
 use crate::tunnel::TunnelConfig;
 use crate::tunnel::manager::TunnelManager;
 
@@ -204,11 +205,12 @@ pub fn start_manager_client(
     monitor_addr: Option<String>,
     webrtc_sessions: WebrtcRegistry,
     event_rx: mpsc::UnboundedReceiver<Event>,
+    resource_state: Arc<SystemResourceState>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         manager_client_loop(
             config, flow_manager, tunnel_manager, ws_stats_rx, app_config, config_path,
-            secrets_path, api_addr, monitor_addr, webrtc_sessions, event_rx,
+            secrets_path, api_addr, monitor_addr, webrtc_sessions, event_rx, resource_state,
         ).await;
     })
 }
@@ -225,6 +227,7 @@ async fn manager_client_loop(
     monitor_addr: Option<String>,
     webrtc_sessions: WebrtcRegistry,
     mut event_rx: mpsc::UnboundedReceiver<Event>,
+    resource_state: Arc<SystemResourceState>,
 ) {
     // If we already have a node_id from config, set it on the tunnel manager
     // so relay tunnels can identify this edge before the first manager connection.
@@ -250,6 +253,7 @@ async fn manager_client_loop(
             monitor_addr.as_deref(),
             &webrtc_sessions,
             &mut event_rx,
+            &resource_state,
         )
         .await
         {
@@ -309,6 +313,7 @@ async fn try_connect(
     monitor_addr: Option<&str>,
     webrtc_sessions: &WebrtcRegistry,
     event_rx: &mut mpsc::UnboundedReceiver<Event>,
+    resource_state: &Arc<SystemResourceState>,
 ) -> Result<ConnectResult, String> {
     // Enforce TLS — only wss:// connections are allowed
     if !config.url.starts_with("wss://") {
@@ -473,7 +478,7 @@ async fn try_connect(
     let mut stats_rx = ws_stats_tx.subscribe();
 
     // Send initial health
-    let health = build_health_message(flow_manager, api_addr, monitor_addr);
+    let health = build_health_message(flow_manager, api_addr, monitor_addr, resource_state);
     if let Ok(json) = serde_json::to_string(&health) {
         let _ = ws_write.send(Message::Text(json.into())).await;
     }
@@ -514,7 +519,8 @@ async fn try_connect(
                                 "tunnels": tunnel_statuses,
                                 "uptime_secs": 0,
                                 "active_flows": flow_manager.active_flow_count(),
-                                "total_flows": total_flows
+                                "total_flows": total_flows,
+                                "system_resources": build_system_resources_payload(resource_state)
                             }
                         });
                         if let Ok(json) = serde_json::to_string(&envelope) {
@@ -548,7 +554,8 @@ async fn try_connect(
                         "tunnels": tunnel_statuses,
                         "uptime_secs": 0,
                         "active_flows": flow_manager.active_flow_count(),
-                        "total_flows": flow_manager.active_flow_count()
+                        "total_flows": flow_manager.active_flow_count(),
+                        "system_resources": build_system_resources_payload(resource_state)
                     }
                 });
                 if let Ok(json) = serde_json::to_string(&envelope) {
@@ -581,7 +588,7 @@ async fn try_connect(
                 let pong = serde_json::json!({
                     "type": "health",
                     "timestamp": chrono::Utc::now().to_rfc3339(),
-                    "payload": build_health_payload(flow_manager, api_addr, monitor_addr)
+                    "payload": build_health_payload(flow_manager, api_addr, monitor_addr, resource_state)
                 });
                 if let Ok(json) = serde_json::to_string(&pong) {
                     if ws_write.send(Message::Text(json.into())).await.is_err() {
@@ -684,15 +691,15 @@ fn build_auth_message(config: &ManagerConfig) -> serde_json::Value {
     }
 }
 
-fn build_health_message(flow_manager: &FlowManager, api_addr: &str, monitor_addr: Option<&str>) -> serde_json::Value {
+fn build_health_message(flow_manager: &FlowManager, api_addr: &str, monitor_addr: Option<&str>, resource_state: &SystemResourceState) -> serde_json::Value {
     serde_json::json!({
         "type": "health",
         "timestamp": chrono::Utc::now().to_rfc3339(),
-        "payload": build_health_payload(flow_manager, api_addr, monitor_addr)
+        "payload": build_health_payload(flow_manager, api_addr, monitor_addr, resource_state)
     })
 }
 
-fn build_health_payload(flow_manager: &FlowManager, api_addr: &str, monitor_addr: Option<&str>) -> serde_json::Value {
+fn build_health_payload(flow_manager: &FlowManager, api_addr: &str, monitor_addr: Option<&str>, resource_state: &SystemResourceState) -> serde_json::Value {
     serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
@@ -707,7 +714,17 @@ fn build_health_payload(flow_manager: &FlowManager, api_addr: &str, monitor_addr
         // include this field are treated as "no advertised features" by
         // the manager — the field is `Option` with `serde(default)` on
         // the manager side.
-        "capabilities": edge_capabilities()
+        "capabilities": edge_capabilities(),
+        "system_resources": build_system_resources_payload(resource_state)
+    })
+}
+
+fn build_system_resources_payload(state: &SystemResourceState) -> serde_json::Value {
+    serde_json::json!({
+        "cpu_percent": state.cpu_percent_f64(),
+        "ram_percent": state.ram_percent_f64(),
+        "ram_used_mb": state.ram_used_mb.load(std::sync::atomic::Ordering::Relaxed),
+        "ram_total_mb": state.ram_total_mb.load(std::sync::atomic::Ordering::Relaxed)
     })
 }
 
@@ -734,6 +751,9 @@ fn edge_capabilities() -> Vec<&'static str> {
         // Phase B compressed-audio bridge: ffmpeg-sidecar audio encoder
         // on RTMP / HLS / WebRTC outputs.
         "audio-encode",
+        // Flow Router: this edge supports flows with no input (standalone
+        // output definitions connected at runtime via the manager's router).
+        "optional-input",
     ];
     if cfg!(feature = "ptp-internal") {
         caps.push("ptp-internal");
@@ -755,7 +775,7 @@ async fn persist_credentials(
         mgr.node_id = Some(node_id.to_string());
         mgr.node_secret = Some(node_secret.to_string());
     }
-    if let Err(e) = save_config_split(config_path, secrets_path, &cfg) {
+    if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), cfg.clone()).await {
         tracing::warn!("Failed to persist manager credentials: {e}");
     } else {
         tracing::info!("Manager credentials saved (node_secret → {})", secrets_path.display());
@@ -886,7 +906,7 @@ async fn execute_command(
             // Persist to config
             let mut cfg = app_config.write().await;
             cfg.flows.push(flow);
-            persist_config(&cfg, config_path, secrets_path);
+            persist_config(&cfg, config_path, secrets_path).await;
             Ok(())
         }
         "update_flow" => {
@@ -970,7 +990,7 @@ async fn execute_command(
             } else {
                 cfg.flows.push(new_flow);
             }
-            persist_config(&cfg, config_path, secrets_path);
+            persist_config(&cfg, config_path, secrets_path).await;
             Ok(())
         }
         "delete_flow" => {
@@ -983,7 +1003,7 @@ async fn execute_command(
             // Remove from config
             let mut cfg = app_config.write().await;
             cfg.flows.retain(|f| f.id != flow_id);
-            persist_config(&cfg, config_path, secrets_path);
+            persist_config(&cfg, config_path, secrets_path).await;
             Ok(())
         }
         "stop_flow" => {
@@ -998,7 +1018,7 @@ async fn execute_command(
             if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
                 flow.enabled = false;
             }
-            persist_config(&cfg, config_path, secrets_path);
+            persist_config(&cfg, config_path, secrets_path).await;
             Ok(())
         }
         "start_flow" | "restart_flow" => {
@@ -1030,7 +1050,7 @@ async fn execute_command(
             if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
                 flow.enabled = true;
             }
-            persist_config(&cfg, config_path, secrets_path);
+            persist_config(&cfg, config_path, secrets_path).await;
             Ok(())
         }
         "add_output" => {
@@ -1049,7 +1069,7 @@ async fn execute_command(
             if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
                 flow.outputs.push(output);
             }
-            persist_config(&cfg, config_path, secrets_path);
+            persist_config(&cfg, config_path, secrets_path).await;
             Ok(())
         }
         "remove_output" => {
@@ -1065,7 +1085,7 @@ async fn execute_command(
             if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
                 flow.outputs.retain(|o| o.id() != output_id);
             }
-            persist_config(&cfg, config_path, secrets_path);
+            persist_config(&cfg, config_path, secrets_path).await;
             Ok(())
         }
         "create_tunnel" => {
@@ -1084,7 +1104,7 @@ async fn execute_command(
             } else {
                 cfg.tunnels.push(tunnel);
             }
-            persist_config(&cfg, config_path, secrets_path);
+            persist_config(&cfg, config_path, secrets_path).await;
             Ok(())
         }
         "delete_tunnel" => {
@@ -1097,7 +1117,7 @@ async fn execute_command(
             // Remove from config
             let mut cfg = app_config.write().await;
             cfg.tunnels.retain(|t| t.id != tunnel_id);
-            persist_config(&cfg, config_path, secrets_path);
+            persist_config(&cfg, config_path, secrets_path).await;
             Ok(())
         }
         "update_config" => {
@@ -1250,7 +1270,7 @@ async fn execute_command(
                 cfg.server = new_config.server.clone();
                 cfg.monitor = new_config.monitor.clone();
                 cfg.flow_groups = new_config.flow_groups.clone();
-                if let Err(e) = save_config_split(config_path.as_path(), secrets_path.as_path(), &cfg) {
+                if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), cfg.clone()).await {
                     tracing::warn!("Failed to persist config after manager command: {e}");
                     tunnel_manager.event_sender().emit(
                         EventSeverity::Warning,
@@ -1287,7 +1307,7 @@ async fn execute_command(
         // ── SMPTE ST 2110 flow group mutation commands ──
         //
         // Mutate `cfg.flow_groups`, validate the resulting config, and persist
-        // via save_config_split. Pattern mirrors the `update_config` arm above.
+        // via save_config_split_async. Pattern mirrors the `update_config` arm above.
         "start_flow_group" => {
             // Start every member flow of a flow group atomically. The group
             // must already be persisted in `cfg.flow_groups`. The members are
@@ -1362,7 +1382,7 @@ async fn execute_command(
                 cfg.flow_groups.retain(|g| g.id != group.id);
                 return Err(format!("Invalid flow group: {e}").into());
             }
-            if let Err(e) = save_config_split(config_path.as_path(), secrets_path.as_path(), &cfg) {
+            if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), cfg.clone()).await {
                 tracing::warn!("Failed to persist config after add_flow_group: {e}");
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Warning,
@@ -1398,7 +1418,7 @@ async fn execute_command(
                 cfg.flow_groups[idx] = old;
                 return Err(format!("Invalid flow group update: {e}").into());
             }
-            if let Err(e) = save_config_split(config_path.as_path(), secrets_path.as_path(), &cfg) {
+            if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), cfg.clone()).await {
                 tracing::warn!("Failed to persist config after update_flow_group: {e}");
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Warning,
@@ -1441,7 +1461,7 @@ async fn execute_command(
             if cfg.flow_groups.len() == before {
                 return Err(format!("Flow group '{target_id}' not found").into());
             }
-            if let Err(e) = save_config_split(config_path.as_path(), secrets_path.as_path(), &cfg) {
+            if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), cfg.clone()).await {
                 tracing::warn!("Failed to persist config after remove_flow_group: {e}");
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Warning,
@@ -1486,7 +1506,7 @@ async fn execute_command(
                 }
                 return Err(format!("Invalid essence flow add: {e}").into());
             }
-            if let Err(e) = save_config_split(config_path.as_path(), secrets_path.as_path(), &cfg) {
+            if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), cfg.clone()).await {
                 tracing::warn!("Failed to persist config after add_essence_flow: {e}");
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Warning,
@@ -1539,7 +1559,7 @@ async fn execute_command(
                 }
                 return Err(format!("Invalid essence flow remove: {e}").into());
             }
-            if let Err(e) = save_config_split(config_path.as_path(), secrets_path.as_path(), &cfg) {
+            if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), cfg.clone()).await {
                 tracing::warn!("Failed to persist config after remove_essence_flow: {e}");
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Warning,
@@ -1575,7 +1595,7 @@ async fn execute_command(
                 } else {
                     return Err("No manager config present to update secret".into());
                 }
-                persist_config(&cfg, config_path, secrets_path);
+                persist_config(&cfg, config_path, secrets_path).await;
             }
 
             tracing::info!("Node secret rotated and persisted to secrets.json");
@@ -1641,8 +1661,11 @@ async fn diff_outputs(
 }
 
 /// Persist config to disk (fire-and-forget, logs on error).
-fn persist_config(config: &AppConfig, config_path: &PathBuf, secrets_path: &PathBuf) {
-    if let Err(e) = save_config_split(config_path.as_path(), secrets_path.as_path(), config) {
+///
+/// Offloads blocking file I/O to the Tokio blocking thread pool to avoid
+/// stalling the async manager client loop.
+async fn persist_config(config: &AppConfig, config_path: &PathBuf, secrets_path: &PathBuf) {
+    if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), config.clone()).await {
         tracing::warn!("Failed to persist config after manager command: {e}");
     }
 }

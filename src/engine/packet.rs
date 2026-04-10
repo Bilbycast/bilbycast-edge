@@ -6,8 +6,14 @@ use bytes::Bytes;
 /// Maximum RTP packet size for SMPTE 2022-2 (7 x 188 byte TS packets + 12 byte RTP header)
 pub const MAX_RTP_PACKET_SIZE: usize = 1500;
 
-/// Broadcast channel capacity for fan-out
-pub const BROADCAST_CHANNEL_CAPACITY: usize = 2048;
+/// Broadcast channel capacity for fan-out.
+///
+/// Sized for 4K/UHD at high bitrate with multiple outputs. At 1316 bytes
+/// per RTP packet (7×188 TS + 12 RTP header), 8192 slots ≈ 10 MB buffer
+/// providing ~3.4 seconds at 1080p50 or ~0.8 seconds at 100 Mbps 4K.
+/// Slow subscribers receive `RecvError::Lagged` and drop — the input is
+/// never blocked.
+pub const BROADCAST_CHANNEL_CAPACITY: usize = 8192;
 
 /// The packet that flows through broadcast channels.
 ///

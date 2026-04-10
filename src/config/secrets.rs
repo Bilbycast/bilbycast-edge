@@ -267,8 +267,8 @@ impl SecretsConfig {
     // format that stored flow secrets separately.
 
     fn merge_flow_secrets(fs: &FlowSecrets, flow: &mut FlowConfig) {
-        if let Some(ref is) = fs.input {
-            Self::merge_input_secrets(is, &mut flow.input);
+        if let (Some(is), Some(input)) = (&fs.input, &mut flow.input) {
+            Self::merge_input_secrets(is, input);
         }
         for output in &mut flow.outputs {
             if let Some(os) = fs.outputs.get(output.id()) {
@@ -497,7 +497,7 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input: InputConfig::Srt(SrtInputConfig {
+                input: Some(InputConfig::Srt(SrtInputConfig {
                     mode: SrtMode::Listener,
                     local_addr: "0.0.0.0:9000".to_string(),
                     remote_addr: None,
@@ -531,7 +531,7 @@ mod tests {
                     ip_ttl: None,
                     redundancy: None,
                     transport_mode: None,
-                }),
+                })),
                 outputs: vec![],
             }],
             tunnels: vec![TunnelConfig {
@@ -551,6 +551,7 @@ mod tests {
                 tls_cert_pem: None,
                 tls_key_pem: None,
             }],
+            resource_limits: None,
             flow_groups: vec![],
         };
 
@@ -583,7 +584,7 @@ mod tests {
         assert!(stripped.tunnels[0].tunnel_bind_secret.is_none());
         // SRT passphrase should still be present after strip_secrets
         match &stripped.flows[0].input {
-            InputConfig::Srt(srt) => {
+            Some(InputConfig::Srt(srt)) => {
                 assert_eq!(srt.passphrase, Some("my-secret-pass".to_string()));
             }
             _ => panic!("Expected SRT input"),
@@ -634,6 +635,7 @@ mod tests {
             monitor: None,
             manager: None,
             tunnels: vec![],
+            resource_limits: None,
             flow_groups: vec![],
             flows: vec![FlowConfig {
                 id: "srt-flow".to_string(),
@@ -645,7 +647,7 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input: InputConfig::Srt(SrtInputConfig {
+                input: Some(InputConfig::Srt(SrtInputConfig {
                     mode: SrtMode::Listener,
                     local_addr: "0.0.0.0:9000".to_string(),
                     remote_addr: None,
@@ -679,7 +681,7 @@ mod tests {
                     ip_ttl: None,
                     redundancy: None,
                     transport_mode: None,
-                }),
+                })),
                 outputs: vec![],
             }],
         };
@@ -698,6 +700,7 @@ mod tests {
             monitor: None,
             manager: None,
             tunnels: vec![],
+            resource_limits: None,
             flow_groups: vec![],
             flows: vec![FlowConfig {
                 id: "rtmp-flow".to_string(),
@@ -709,7 +712,7 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input: InputConfig::Rtp(RtpInputConfig {
+                input: Some(InputConfig::Rtp(RtpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
                     interface_addr: None,
                     fec_decode: None,
@@ -718,7 +721,7 @@ mod tests {
                     max_bitrate_mbps: None,
                     tr07_mode: None,
                     redundancy: None,
-                }),
+                })),
                 outputs: vec![OutputConfig::Rtmp(RtmpOutputConfig {
                     id: "rtmp-out".to_string(),
                     name: "RTMP Out".to_string(),
@@ -765,6 +768,7 @@ mod tests {
             monitor: None,
             manager: None,
             tunnels: vec![],
+            resource_limits: None,
             flow_groups: vec![],
             flows: vec![FlowConfig {
                 id: "srt-flow".to_string(),
@@ -776,7 +780,7 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input: InputConfig::Srt(SrtInputConfig {
+                input: Some(InputConfig::Srt(SrtInputConfig {
                     mode: SrtMode::Listener,
                     local_addr: "0.0.0.0:9000".to_string(),
                     remote_addr: None,
@@ -810,7 +814,7 @@ mod tests {
                     ip_ttl: None,
                     redundancy: None,
                     transport_mode: None,
-                }),
+                })),
                 outputs: vec![],
             }],
         };
@@ -818,7 +822,7 @@ mod tests {
         // Legacy merge should restore flow secrets from old secrets.json
         legacy_secrets.merge_into(&mut config);
         match &config.flows[0].input {
-            InputConfig::Srt(srt) => {
+            Some(InputConfig::Srt(srt)) => {
                 assert_eq!(srt.passphrase, Some("legacy-pass".to_string()));
             }
             _ => panic!("Expected SRT input"),

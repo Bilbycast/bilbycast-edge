@@ -14,6 +14,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::config::models::AppConfig;
 use crate::engine::manager::FlowManager;
+use crate::engine::resource_monitor::SystemResourceState;
 use crate::manager::events::EventSender;
 use crate::tunnel::manager::TunnelManager;
 
@@ -54,6 +55,8 @@ pub struct AppState {
     /// stage/activate). `None` is tolerated so unit tests that build a
     /// minimal AppState don't need to plumb the channel.
     pub event_sender: Option<EventSender>,
+    /// System resource state (CPU, RAM) for Prometheus metrics and API stats.
+    pub resource_state: Arc<SystemResourceState>,
 }
 
 /// Constructs the main Axum [`Router`] with all API routes, auth middleware, and layers.

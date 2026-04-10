@@ -234,6 +234,23 @@ encoder supervisor (`engine::audio_encode::supervisor_loop`).
 
 **Source**: `src/manager/client.rs`
 
+### System Resources (`system_resources`)
+
+| Severity | Message | Trigger |
+|----------|---------|---------|
+| warning | CPU usage {value}% exceeds warning threshold {threshold}% | CPU stays above warning threshold for grace period |
+| critical | CPU usage {value}% exceeds critical threshold {threshold}% | CPU stays above critical threshold for grace period |
+| warning | RAM usage {value}% exceeds warning threshold {threshold}% | RAM stays above warning threshold for grace period |
+| critical | RAM usage {value}% exceeds critical threshold {threshold}% | RAM stays above critical threshold for grace period |
+| warning | {metric} usage recovered below critical, still above warning | Metric drops below critical but remains above warning |
+| info | {metric} usage returned to normal | Metric drops below warning threshold |
+
+**Details**: `{ "metric": "cpu"|"ram", "current_percent": float, "warning_threshold": float, "critical_threshold": float }`
+
+**Source**: `src/engine/resource_monitor.rs`
+
+Requires `resource_limits` config block. When `critical_action` is `"gate_flows"`, new flow creation is rejected while any metric is in the critical state. Events fire on state transitions with a configurable grace period (default 10 seconds) to avoid flapping.
+
 ---
 
 ## Manager-Generated Events

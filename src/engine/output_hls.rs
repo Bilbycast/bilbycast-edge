@@ -258,6 +258,11 @@ async fn hls_output_loop(
                                 Ok(_) => {
                                     stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                                     stats.bytes_sent.fetch_add(segment_bytes, Ordering::Relaxed);
+                                    // Use the segment start time as the latency base — this
+                                    // captures both the segment accumulation time and the upload time.
+                                    if let Some(seg_start) = segment_start_us {
+                                        stats.record_latency(seg_start);
+                                    }
                                     tracing::debug!(
                                         "HLS output '{}': uploaded segment_{}.ts ({} bytes, {:.2}s)",
                                         config.id,

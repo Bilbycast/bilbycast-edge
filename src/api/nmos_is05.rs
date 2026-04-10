@@ -396,7 +396,8 @@ async fn get_receiver_transport_type(
     let config = state.config.read().await;
     let nid = nmos::node_uuid_from_config(&config);
     let flow = find_receiver(&config, &nid, &uuid)?;
-    Ok(Json(serde_json::json!(nmos::input_transport_of(&flow.input))))
+    let input = flow.input.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(serde_json::json!(nmos::input_transport_of(input))))
 }
 
 async fn get_receiver_constraints(
@@ -490,7 +491,8 @@ fn active_receiver_params(
     target: &Uuid,
 ) -> Result<TransportParams, StatusCode> {
     let flow = find_receiver(config, nid, target)?;
-    let param_set = match &flow.input {
+    let input = flow.input.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let param_set = match input {
         InputConfig::Rtp(c) => TransportParamSet {
             interface_ip: c.interface_addr.clone(),
             source_port: c.bind_addr.split(':').nth(1).and_then(|p| p.parse().ok()),

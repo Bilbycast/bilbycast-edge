@@ -3,18 +3,22 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use bytes::BytesMut;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::UdpOutputConfig;
 use crate::stats::collector::OutputStatsAccumulator;
 use crate::util::socket::create_udp_output;
+use crate::util::time::now_us;
 
 use super::audio_302m::S302mOutputPipeline;
 use super::audio_transcode::InputFormat;
+use super::delay_buffer::resolve_output_delay;
 use super::packet::RtpPacket;
 use super::ts_program_filter::TsProgramFilter;
 
@@ -46,6 +50,7 @@ pub fn spawn_udp_output(
     output_stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
     input_format: Option<InputFormat>,
+    frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
 
@@ -59,7 +64,7 @@ pub fn spawn_udp_output(
                     config.id
                 );
             }
-        } else if let Err(e) = udp_output_loop(&config, &mut rx, output_stats, cancel).await {
+        } else if let Err(e) = udp_output_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx).await {
             tracing::error!("UDP output '{}' exited with error: {e}", config.id);
         }
     })
@@ -92,7 +97,7 @@ async fn udp_output_loop_302m(
                  falling back to passthrough TS",
                 config.id
             );
-            return udp_output_loop(config, rx, stats, cancel).await;
+            return udp_output_loop(config, rx, stats, cancel, None).await;
         }
     };
 
@@ -137,6 +142,7 @@ async fn udp_output_loop_302m(
                                 Ok(sent) => {
                                     stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                                     stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                                    stats.record_latency(packet.recv_time_us);
                                 }
                                 Err(e) => {
                                     tracing::warn!("UDP output '{}' (302M) send error: {e}", config.id);
@@ -162,6 +168,7 @@ async fn udp_output_loop(
     rx: &mut broadcast::Receiver<RtpPacket>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
+    frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
 ) -> anyhow::Result<()> {
     let (socket, dest) =
         create_udp_output(&config.dest_addr, config.bind_addr.as_deref(), config.interface_addr.as_deref(), config.dscp).await?;
@@ -183,7 +190,31 @@ async fn udp_output_loop(
     let ts_datagram_size = TS_PACKETS_PER_DATAGRAM * TS_PACKET_SIZE;
     let mut ts_sync_found = false;
 
+    // Optional output delay buffer for stream synchronization.
+    let resolved = if let Some(ref delay) = config.delay {
+        resolve_output_delay(delay, &config.id, frame_rate_rx, &cancel).await
+    } else {
+        None
+    };
+    let (mut delay_buf, _frame_rate_watch) = match resolved {
+        Some((buf, watch)) => (Some(buf), watch),
+        None => (None, None),
+    };
+
+    let delay_sleep = tokio::time::sleep(Duration::from_secs(86400));
+    tokio::pin!(delay_sleep);
+
     loop {
+        if let Some(ref db) = delay_buf {
+            if let Some(release_us) = db.next_release_time() {
+                let now = now_us();
+                let wait = release_us.saturating_sub(now);
+                delay_sleep.as_mut().reset(Instant::now() + Duration::from_micros(wait));
+            }
+        }
+
+        let mut packets_to_send: Vec<RtpPacket> = Vec::new();
+
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("UDP output '{}' stopping (cancelled)", config.id);
@@ -192,83 +223,10 @@ async fn udp_output_loop(
             result = rx.recv() => {
                 match result {
                     Ok(packet) => {
-                        // Extract raw TS payload: strip RTP header if present
-                        let ts_data = if packet.is_raw_ts {
-                            &packet.data[..]
-                        } else if packet.data.len() > RTP_HEADER_MIN_SIZE {
-                            &packet.data[RTP_HEADER_MIN_SIZE..]
+                        if let Some(ref mut db) = delay_buf {
+                            db.push(packet);
                         } else {
-                            continue;
-                        };
-
-                        // Apply program filter (MPTS → SPTS) if configured.
-                        // The filter consumes raw TS bytes and emits raw TS
-                        // bytes belonging to the selected program only.
-                        if let Some(ref mut filter) = program_filter {
-                            filter_scratch.clear();
-                            filter.filter_into(ts_data, &mut filter_scratch);
-                            if filter_scratch.is_empty() {
-                                continue;
-                            }
-                            ts_buf.extend_from_slice(&filter_scratch);
-                        } else {
-                            ts_buf.extend_from_slice(ts_data);
-                        }
-
-                        // Find TS sync boundary on first data
-                        if !ts_sync_found {
-                            let min_bytes = TS_SYNC_CONFIRM_COUNT * TS_PACKET_SIZE;
-                            if ts_buf.len() >= min_bytes {
-                                let mut found_offset = None;
-                                for offset in 0..TS_PACKET_SIZE {
-                                    let all_sync = (0..TS_SYNC_CONFIRM_COUNT).all(|i| {
-                                        let pos = offset + i * TS_PACKET_SIZE;
-                                        pos < ts_buf.len() && ts_buf[pos] == TS_SYNC_BYTE
-                                    });
-                                    if all_sync {
-                                        found_offset = Some(offset);
-                                        break;
-                                    }
-                                }
-
-                                if let Some(offset) = found_offset {
-                                    if offset > 0 {
-                                        tracing::info!(
-                                            "UDP output '{}': TS sync found at offset {}, discarding {} leading bytes",
-                                            config.id, offset, offset
-                                        );
-                                        let _ = ts_buf.split_to(offset);
-                                    } else {
-                                        tracing::info!(
-                                            "UDP output '{}': TS sync found (already aligned)",
-                                            config.id
-                                        );
-                                    }
-                                    ts_sync_found = true;
-                                } else {
-                                    tracing::warn!(
-                                        "UDP output '{}': no TS sync found in {} bytes, discarding",
-                                        config.id, ts_buf.len()
-                                    );
-                                    ts_buf.clear();
-                                }
-                            }
-                        }
-
-                        // Send complete TS-aligned datagrams
-                        if ts_sync_found {
-                            while ts_buf.len() >= ts_datagram_size {
-                                let datagram = ts_buf.split_to(ts_datagram_size);
-                                match socket.send_to(&datagram, dest).await {
-                                    Ok(sent) => {
-                                        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                        stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("UDP output '{}' send error: {e}", config.id);
-                                    }
-                                }
-                            }
+                            packets_to_send.push(packet);
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -278,6 +236,93 @@ async fn udp_output_loop(
                     Err(broadcast::error::RecvError::Closed) => {
                         tracing::info!("UDP output '{}' broadcast channel closed", config.id);
                         break;
+                    }
+                }
+            }
+            _ = &mut delay_sleep, if delay_buf.as_ref().map_or(false, |db| db.len() > 0) => {
+                let db = delay_buf.as_mut().unwrap();
+                let now = now_us();
+                for packet in db.drain_ready(now) {
+                    packets_to_send.push(packet);
+                }
+            }
+        }
+
+        for packet in &packets_to_send {
+            // Extract raw TS payload: strip RTP header if present
+            let ts_data = if packet.is_raw_ts {
+                &packet.data[..]
+            } else if packet.data.len() > RTP_HEADER_MIN_SIZE {
+                &packet.data[RTP_HEADER_MIN_SIZE..]
+            } else {
+                continue;
+            };
+
+            // Apply program filter (MPTS → SPTS) if configured.
+            if let Some(ref mut filter) = program_filter {
+                filter_scratch.clear();
+                filter.filter_into(ts_data, &mut filter_scratch);
+                if filter_scratch.is_empty() {
+                    continue;
+                }
+                ts_buf.extend_from_slice(&filter_scratch);
+            } else {
+                ts_buf.extend_from_slice(ts_data);
+            }
+
+            // Find TS sync boundary on first data
+            if !ts_sync_found {
+                let min_bytes = TS_SYNC_CONFIRM_COUNT * TS_PACKET_SIZE;
+                if ts_buf.len() >= min_bytes {
+                    let mut found_offset = None;
+                    for offset in 0..TS_PACKET_SIZE {
+                        let all_sync = (0..TS_SYNC_CONFIRM_COUNT).all(|i| {
+                            let pos = offset + i * TS_PACKET_SIZE;
+                            pos < ts_buf.len() && ts_buf[pos] == TS_SYNC_BYTE
+                        });
+                        if all_sync {
+                            found_offset = Some(offset);
+                            break;
+                        }
+                    }
+
+                    if let Some(offset) = found_offset {
+                        if offset > 0 {
+                            tracing::info!(
+                                "UDP output '{}': TS sync found at offset {}, discarding {} leading bytes",
+                                config.id, offset, offset
+                            );
+                            let _ = ts_buf.split_to(offset);
+                        } else {
+                            tracing::info!(
+                                "UDP output '{}': TS sync found (already aligned)",
+                                config.id
+                            );
+                        }
+                        ts_sync_found = true;
+                    } else {
+                        tracing::warn!(
+                            "UDP output '{}': no TS sync found in {} bytes, discarding",
+                            config.id, ts_buf.len()
+                        );
+                        ts_buf.clear();
+                    }
+                }
+            }
+
+            // Send complete TS-aligned datagrams
+            if ts_sync_found {
+                while ts_buf.len() >= ts_datagram_size {
+                    let datagram = ts_buf.split_to(ts_datagram_size);
+                    match socket.send_to(&datagram, dest).await {
+                        Ok(sent) => {
+                            stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                            stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                            stats.record_latency(packet.recv_time_us);
+                        }
+                        Err(e) => {
+                            tracing::warn!("UDP output '{}' send error: {e}", config.id);
+                        }
                     }
                 }
             }

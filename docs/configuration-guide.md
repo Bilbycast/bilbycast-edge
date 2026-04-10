@@ -677,12 +677,14 @@ Sends RTP-wrapped MPEG-TS packets to a unicast or multicast destination. Support
 | `fec_encode` | object | No | `null` | SMPTE 2022-1 FEC encode parameters. See [FEC Configuration](#smpte-2022-1-fec-configuration). |
 | `dscp` | integer | No | `46` | DSCP value for QoS marking (RP 2129 C10). Range 0-63. Default 46 = Expedited Forwarding (RFC 4594). |
 | `program_number` | integer | No | `null` | MPTS → SPTS program filter. `null` = full MPTS passthrough; `Some(N)` = forward only program N as a rewritten single-program TS. Applied before FEC, so the receiver's FEC protects the filtered SPTS. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
+| `delay` | object | No | `null` | Output delay for stream synchronization. Modes: `{"mode":"fixed","ms":N}` adds constant delay; `{"mode":"target_ms","ms":N}` targets end-to-end latency (self-adjusting); `{"mode":"target_frames","frames":N,"fallback_ms":M}` targets latency in video frames (auto-detected fps). |
 
 **Validation rules:**
 - `id` cannot be empty.
 - `dest_addr`, `bind_addr`, and `interface_addr` must all use the same address family.
 - `dscp` must be 0-63.
 - `program_number` must be `> 0` if set (program_number 0 is reserved for the NIT).
+- `delay`: `fixed` ms 0-10000; `target_ms` ms 1-10000; `target_frames` frames 0.01-300, fallback_ms 0-10000.
 
 ### UDP Output
 
@@ -708,12 +710,14 @@ Sends raw MPEG-TS over UDP without RTP headers. Datagrams are TS-aligned (7×188
 | `interface_addr` | string | No | `null` | Network interface IP for multicast send. |
 | `dscp` | integer | No | `46` | DSCP value for QoS marking. Range 0-63. |
 | `program_number` | integer | No | `null` | MPTS → SPTS program filter. `null` = full MPTS passthrough; `Some(N)` = forward only program N as a rewritten single-program TS. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
+| `delay` | object | No | `null` | Output delay for stream synchronization (same modes as RTP output). Incompatible with `transport_mode: "audio_302m"`. |
 
 **Validation rules:**
 - `id` cannot be empty.
 - `dest_addr` must be a valid socket address.
 - `dscp` must be 0-63.
 - `program_number` must be `> 0` if set.
+- `delay`: same validation as RTP output. Incompatible with `transport_mode: "audio_302m"`.
 
 ### SRT Output
 
@@ -755,6 +759,7 @@ Sends RTP encapsulated in SRT.
 | `crypto_mode` | string | No | `null` | Cipher mode: `"aes-ctr"` (default) or `"aes-gcm"`. |
 | `redundancy` | object | No | `null` | SMPTE 2022-7 redundancy for a second SRT output leg. |
 | `program_number` | integer | No | `null` | MPTS → SPTS program filter. `null` = full MPTS passthrough; `Some(N)` = forward only program N as a rewritten single-program TS. Applied once and mirrored to both legs when 2022-7 is enabled. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
+| `delay_ms` | integer | No | `null` | Output delay in milliseconds (0–10000). When set and > 0, packets are buffered and released after this delay. Used for synchronizing parallel outputs with different processing latencies. Incompatible with `transport_mode: "audio_302m"`. |
 
 ### RTMP Output
 

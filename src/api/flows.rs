@@ -5,7 +5,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 
 use crate::config::models::{AppConfig, FlowConfig, OutputConfig};
-use crate::config::persistence::save_config_split;
+use crate::config::persistence::save_config_split_async;
 use crate::config::validation::{validate_config, validate_flow, validate_output};
 
 use super::auth::RequireAdmin;
@@ -107,7 +107,7 @@ pub async fn create_flow(
     }
 
     config.flows.push(flow.clone());
-    save_config_split(&state.config_path, &state.secrets_path, &config).map_err(|e| ApiError::Internal(e.to_string()))?;
+    save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone()).await.map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Start the flow in the engine if enabled
     if flow.enabled {
@@ -163,7 +163,7 @@ pub async fn update_flow(
     }
 
     config.flows[idx] = flow.clone();
-    save_config_split(&state.config_path, &state.secrets_path, &config).map_err(|e| ApiError::Internal(e.to_string()))?;
+    save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone()).await.map_err(|e| ApiError::Internal(e.to_string()))?;
 
     if flow.enabled {
         match state.flow_manager.create_flow(flow.clone()).await {
@@ -208,7 +208,7 @@ pub async fn delete_flow(
         .ok_or_else(|| ApiError::NotFound(format!("Flow '{flow_id}' not found")))?;
 
     config.flows.remove(idx);
-    save_config_split(&state.config_path, &state.secrets_path, &config).map_err(|e| ApiError::Internal(e.to_string()))?;
+    save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone()).await.map_err(|e| ApiError::Internal(e.to_string()))?;
 
     tracing::info!("Deleted flow '{}'", flow_id);
     Ok(Json(ApiResponse::ok(())))
@@ -384,7 +384,7 @@ pub async fn add_output(
     }
 
     flow.outputs.push(output.clone());
-    save_config_split(&state.config_path, &state.secrets_path, &config).map_err(|e| ApiError::Internal(e.to_string()))?;
+    save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone()).await.map_err(|e| ApiError::Internal(e.to_string()))?;
     drop(config);
 
     // Hot-add output to running flow
@@ -436,7 +436,7 @@ pub async fn remove_output(
         })?;
 
     flow.outputs.remove(idx);
-    save_config_split(&state.config_path, &state.secrets_path, &config).map_err(|e| ApiError::Internal(e.to_string()))?;
+    save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone()).await.map_err(|e| ApiError::Internal(e.to_string()))?;
 
     tracing::info!("Removed output '{}' from flow '{}'", output_id, flow_id);
     Ok(Json(ApiResponse::ok(())))
@@ -486,7 +486,7 @@ pub async fn replace_config(
 
     let mut config = state.config.write().await;
     *config = new_config.clone();
-    save_config_split(&state.config_path, &state.secrets_path, &config).map_err(|e| ApiError::Internal(e.to_string()))?;
+    save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone()).await.map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Start all enabled flows from new config
     for flow in &config.flows {

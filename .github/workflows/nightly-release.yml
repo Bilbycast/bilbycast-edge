@@ -21,7 +21,7 @@ jobs:
       should_release: ${{ steps.check_release.outputs.should_release }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Get version from Cargo.toml
         id: get_version
@@ -61,21 +61,21 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout bilbycast-libsrt-rs (path dependency)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: Bilbycast/bilbycast-libsrt-rs
           path: bilbycast-libsrt-rs
           submodules: recursive
 
       - name: Checkout bilbycast-fdk-aac-rs (path dependency)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: Bilbycast/bilbycast-fdk-aac-rs
           path: bilbycast-fdk-aac-rs
           submodules: recursive
 
       - name: Checkout bilbycast-edge
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: bilbycast-edge
 
@@ -90,7 +90,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -135,7 +135,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4

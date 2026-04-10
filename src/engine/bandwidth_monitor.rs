@@ -72,7 +72,7 @@ async fn bandwidth_monitor_loop(
         // estimator directly.
         let current_bps = {
             let bytes = stats.input_bytes.load(Ordering::Relaxed);
-            stats.input_throughput.lock().unwrap().sample(bytes)
+            stats.input_throughput.sample(bytes)
         };
 
         let is_over = current_bps > limit_bps;

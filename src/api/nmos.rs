@@ -463,7 +463,9 @@ fn build_device(
     let mut senders = Vec::new();
     let mut receivers = Vec::new();
     for flow in &config.flows {
-        receivers.push(receiver_uuid(nid, &flow.id).to_string());
+        if flow.input.is_some() {
+            receivers.push(receiver_uuid(nid, &flow.id).to_string());
+        }
         for output in &flow.outputs {
             senders.push(sender_uuid(nid, &flow.id, output_id(output)).to_string());
         }
@@ -489,20 +491,23 @@ async fn list_sources(State(state): State<AppState>) -> Json<Vec<NmosSource>> {
     let sources: Vec<NmosSource> = config
         .flows
         .iter()
-        .map(|f| NmosSource {
-            id: source_uuid(&nid, &f.id).to_string(),
-            version: nmos_version(),
-            label: f.name.clone(),
-            description: format!("{} input ({})", f.name, input_type_str(&f.input)),
-            tags: serde_json::json!({}),
-            format: input_format(&f.input).into(),
-            caps: source_caps(&f.input),
-            device_id: did.to_string(),
-            parents: vec![],
-            clock_name: f
-                .clock_domain
-                .map(|_| serde_json::Value::String("clk0".into()))
-                .unwrap_or(serde_json::Value::Null),
+        .filter_map(|f| {
+            let input = f.input.as_ref()?;
+            Some(NmosSource {
+                id: source_uuid(&nid, &f.id).to_string(),
+                version: nmos_version(),
+                label: f.name.clone(),
+                description: format!("{} input ({})", f.name, input_type_str(input)),
+                tags: serde_json::json!({}),
+                format: input_format(input).into(),
+                caps: source_caps(input),
+                device_id: did.to_string(),
+                parents: vec![],
+                clock_name: f
+                    .clock_domain
+                    .map(|_| serde_json::Value::String("clk0".into()))
+                    .unwrap_or(serde_json::Value::Null),
+            })
         })
         .collect();
     Json(sources)
@@ -516,16 +521,20 @@ async fn get_source(
     let nid = node_uuid(&config);
     let did = device_uuid(&nid);
     for f in &config.flows {
+        let input = match f.input.as_ref() {
+            Some(i) => i,
+            None => continue,
+        };
         let sid = source_uuid(&nid, &f.id);
         if id == sid.to_string() {
             return Ok(Json(NmosSource {
                 id: sid.to_string(),
                 version: nmos_version(),
                 label: f.name.clone(),
-                description: format!("{} input ({})", f.name, input_type_str(&f.input)),
+                description: format!("{} input ({})", f.name, input_type_str(input)),
                 tags: serde_json::json!({}),
-                format: input_format(&f.input).into(),
-                caps: source_caps(&f.input),
+                format: input_format(input).into(),
+                caps: source_caps(input),
                 device_id: did.to_string(),
                 parents: vec![],
                 clock_name: f
@@ -545,16 +554,21 @@ async fn list_flows(State(state): State<AppState>) -> Json<Vec<NmosFlow>> {
     let flows: Vec<NmosFlow> = config
         .flows
         .iter()
-        .map(|f| NmosFlow {
-            id: flow_uuid(&nid, &f.id).to_string(),
-            version: nmos_version(),
-            label: f.name.clone(),
-            description: format!("Flow: {}", f.name),
-            tags: serde_json::json!({}),
-            format: input_format(&f.input).into(),
-            source_id: source_uuid(&nid, &f.id).to_string(),
-            device_id: did.to_string(),
-            parents: vec![],
+        .map(|f| {
+            let format = f.input.as_ref()
+                .map(|i| input_format(i))
+                .unwrap_or("urn:x-nmos:format:mux");
+            NmosFlow {
+                id: flow_uuid(&nid, &f.id).to_string(),
+                version: nmos_version(),
+                label: f.name.clone(),
+                description: format!("Flow: {}", f.name),
+                tags: serde_json::json!({}),
+                format: format.into(),
+                source_id: source_uuid(&nid, &f.id).to_string(),
+                device_id: did.to_string(),
+                parents: vec![],
+            }
         })
         .collect();
     Json(flows)
@@ -570,13 +584,16 @@ async fn get_flow(
     for f in &config.flows {
         let fid = flow_uuid(&nid, &f.id);
         if id == fid.to_string() {
+            let format = f.input.as_ref()
+                .map(|i| input_format(i))
+                .unwrap_or("urn:x-nmos:format:mux");
             return Ok(Json(NmosFlow {
                 id: fid.to_string(),
                 version: nmos_version(),
                 label: f.name.clone(),
                 description: format!("Flow: {}", f.name),
                 tags: serde_json::json!({}),
-                format: input_format(&f.input).into(),
+                format: format.into(),
                 source_id: source_uuid(&nid, &f.id).to_string(),
                 device_id: did.to_string(),
                 parents: vec![],
@@ -654,18 +671,21 @@ async fn list_receivers(State(state): State<AppState>) -> Json<Vec<NmosReceiver>
     let receivers: Vec<NmosReceiver> = config
         .flows
         .iter()
-        .map(|f| NmosReceiver {
-            id: receiver_uuid(&nid, &f.id).to_string(),
-            version: nmos_version(),
-            label: f.name.clone(),
-            description: format!("{} receiver ({})", f.name, input_type_str(&f.input)),
-            tags: serde_json::json!({}),
-            format: input_format(&f.input).into(),
-            caps: receiver_caps(&f.input),
-            device_id: did.to_string(),
-            transport: input_transport(&f.input).into(),
-            interface_bindings: vec![],
-            subscription: serde_json::json!({"sender_id": null, "active": true}),
+        .filter_map(|f| {
+            let input = f.input.as_ref()?;
+            Some(NmosReceiver {
+                id: receiver_uuid(&nid, &f.id).to_string(),
+                version: nmos_version(),
+                label: f.name.clone(),
+                description: format!("{} receiver ({})", f.name, input_type_str(input)),
+                tags: serde_json::json!({}),
+                format: input_format(input).into(),
+                caps: receiver_caps(input),
+                device_id: did.to_string(),
+                transport: input_transport(input).into(),
+                interface_bindings: vec![],
+                subscription: serde_json::json!({"sender_id": null, "active": true}),
+            })
         })
         .collect();
     Json(receivers)
@@ -679,6 +699,10 @@ async fn get_receiver(
     let nid = node_uuid(&config);
     let did = device_uuid(&nid);
     for f in &config.flows {
+        let input = match f.input.as_ref() {
+            Some(i) => i,
+            None => continue,
+        };
         let rid = receiver_uuid(&nid, &f.id);
         if id == rid.to_string() {
             return Ok(Json(NmosReceiver {
@@ -688,13 +712,13 @@ async fn get_receiver(
                 description: format!(
                     "{} receiver ({})",
                     f.name,
-                    input_type_str(&f.input)
+                    input_type_str(input)
                 ),
                 tags: serde_json::json!({}),
-                format: input_format(&f.input).into(),
-                caps: receiver_caps(&f.input),
+                format: input_format(input).into(),
+                caps: receiver_caps(input),
                 device_id: did.to_string(),
-                transport: input_transport(&f.input).into(),
+                transport: input_transport(input).into(),
                 interface_bindings: vec![],
                 subscription: serde_json::json!({"sender_id": null, "active": true}),
             }));

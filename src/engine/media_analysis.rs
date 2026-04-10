@@ -39,6 +39,7 @@ pub fn spawn_media_analyzer(
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     stats: Arc<MediaAnalysisAccumulator>,
     cancel: CancellationToken,
+    frame_rate_tx: Option<tokio::sync::watch::Sender<Option<f64>>>,
 ) -> JoinHandle<()> {
     let rx = broadcast_tx.subscribe();
 
@@ -48,12 +49,16 @@ pub fn spawn_media_analyzer(
         populate_transport_info(flow_config, &mut state);
     }
 
-    tokio::spawn(media_analyzer_loop(rx, stats, cancel))
+    tokio::spawn(media_analyzer_loop(rx, stats, cancel, frame_rate_tx))
 }
 
 /// Extract transport-level information from the flow configuration.
 fn populate_transport_info(config: &FlowConfig, state: &mut MediaAnalysisState) {
-    match &config.input {
+    let input = match &config.input {
+        Some(i) => i,
+        None => return,
+    };
+    match input {
         InputConfig::Rtp(rtp) => {
             state.protocol = "rtp".to_string();
             state.payload_format = "rtp_ts".to_string();
@@ -123,6 +128,7 @@ async fn media_analyzer_loop(
     mut rx: broadcast::Receiver<RtpPacket>,
     stats: Arc<MediaAnalysisAccumulator>,
     cancel: CancellationToken,
+    frame_rate_tx: Option<tokio::sync::watch::Sender<Option<f64>>>,
 ) {
     tracing::info!("Media analyzer started");
 
@@ -131,6 +137,8 @@ async fn media_analyzer_loop(
 
     // Local parsing state (not shared — only accessed by this task)
     let mut payload_format_detected = false;
+    // Track last broadcast frame rate to avoid redundant watch sends.
+    let mut last_broadcast_fps: Option<f64> = None;
 
     loop {
         tokio::select! {
@@ -151,6 +159,22 @@ async fn media_analyzer_loop(
                             &stats,
                             &mut payload_format_detected,
                         );
+
+                        // Broadcast frame rate to output tasks that need it
+                        // (e.g., TargetFrames delay mode). Only send when the
+                        // value changes to avoid unnecessary wake-ups.
+                        if let Some(ref tx) = frame_rate_tx {
+                            let fps = {
+                                let state = stats.state.lock().unwrap();
+                                state.programs.iter()
+                                    .flat_map(|p| &p.video_streams)
+                                    .find_map(|v| v.frame_rate)
+                            };
+                            if fps != last_broadcast_fps {
+                                last_broadcast_fps = fps;
+                                let _ = tx.send(fps);
+                            }
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::debug!("Media analyzer lagged, skipped {n} packets");

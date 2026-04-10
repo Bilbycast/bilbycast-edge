@@ -148,6 +148,8 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 /// - `bilbycast_edge_flow_output_bitrate_bps` -- current output bitrate (bits/sec)
 /// - `bilbycast_edge_flow_output_packets_dropped` -- packets dropped due to lag
 /// - `bilbycast_edge_flow_output_fec_sent_total` -- FEC packets sent
+/// - `bilbycast_edge_flow_output_latency_us` -- end-to-end output latency (min/avg/max)
+/// - `bilbycast_edge_flow_output_latency_frames` -- end-to-end output latency in video frames
 ///
 /// **SRT-specific gauges** (labeled by `flow_id`, optionally `output_id` and `leg`):
 /// - `bilbycast_edge_srt_rtt_ms` -- SRT round-trip time in milliseconds
@@ -183,6 +185,37 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
         "bilbycast_edge_flows_active {}\n",
         state.flow_manager.active_flow_count()
     ));
+
+    // System resource metrics
+    {
+        use std::sync::atomic::Ordering;
+        let rs = &state.resource_state;
+        let cpu = rs.cpu_percent_f64();
+        let ram = rs.ram_percent_f64();
+        let ram_used = rs.ram_used_mb.load(Ordering::Relaxed) * 1024 * 1024;
+        let ram_total = rs.ram_total_mb.load(Ordering::Relaxed) * 1024 * 1024;
+        let critical = if rs.resources_critical.load(Ordering::Relaxed) { 1 } else { 0 };
+
+        output.push_str("\n# HELP bilbycast_edge_system_cpu_percent System CPU usage percentage\n");
+        output.push_str("# TYPE bilbycast_edge_system_cpu_percent gauge\n");
+        output.push_str(&format!("bilbycast_edge_system_cpu_percent {cpu:.1}\n"));
+
+        output.push_str("# HELP bilbycast_edge_system_ram_percent System RAM usage percentage\n");
+        output.push_str("# TYPE bilbycast_edge_system_ram_percent gauge\n");
+        output.push_str(&format!("bilbycast_edge_system_ram_percent {ram:.1}\n"));
+
+        output.push_str("# HELP bilbycast_edge_system_ram_used_bytes System RAM used in bytes\n");
+        output.push_str("# TYPE bilbycast_edge_system_ram_used_bytes gauge\n");
+        output.push_str(&format!("bilbycast_edge_system_ram_used_bytes {ram_used}\n"));
+
+        output.push_str("# HELP bilbycast_edge_system_ram_total_bytes System RAM total in bytes\n");
+        output.push_str("# TYPE bilbycast_edge_system_ram_total_bytes gauge\n");
+        output.push_str(&format!("bilbycast_edge_system_ram_total_bytes {ram_total}\n"));
+
+        output.push_str("# HELP bilbycast_edge_system_resources_critical Whether resources are in critical state\n");
+        output.push_str("# TYPE bilbycast_edge_system_resources_critical gauge\n");
+        output.push_str(&format!("bilbycast_edge_system_resources_critical {critical}\n"));
+    }
 
     // Per-flow input metrics
     if !flow_snapshots.is_empty() {
@@ -325,6 +358,43 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
                     "bilbycast_edge_flow_output_fec_sent_total{{flow_id=\"{}\",output_id=\"{}\"}} {}\n",
                     fs.flow_id, os.output_id, os.fec_packets_sent
                 ));
+            }
+        }
+
+        // End-to-end latency per output
+        output.push_str("\n# HELP bilbycast_edge_flow_output_latency_us End-to-end output latency in microseconds\n");
+        output.push_str("# TYPE bilbycast_edge_flow_output_latency_us gauge\n");
+        for fs in &flow_snapshots {
+            for os in &fs.outputs {
+                if let Some(ref lat) = os.latency {
+                    output.push_str(&format!(
+                        "bilbycast_edge_flow_output_latency_us{{flow_id=\"{}\",output_id=\"{}\",stat=\"min\"}} {}\n",
+                        fs.flow_id, os.output_id, lat.min_us
+                    ));
+                    output.push_str(&format!(
+                        "bilbycast_edge_flow_output_latency_us{{flow_id=\"{}\",output_id=\"{}\",stat=\"avg\"}} {}\n",
+                        fs.flow_id, os.output_id, lat.avg_us
+                    ));
+                    output.push_str(&format!(
+                        "bilbycast_edge_flow_output_latency_us{{flow_id=\"{}\",output_id=\"{}\",stat=\"max\"}} {}\n",
+                        fs.flow_id, os.output_id, lat.max_us
+                    ));
+                }
+            }
+        }
+
+        output.push_str("\n# HELP bilbycast_edge_flow_output_latency_frames End-to-end output latency in video frames\n");
+        output.push_str("# TYPE bilbycast_edge_flow_output_latency_frames gauge\n");
+        for fs in &flow_snapshots {
+            for os in &fs.outputs {
+                if let Some(ref lat) = os.latency {
+                    if let Some(frames) = lat.latency_frames {
+                        output.push_str(&format!(
+                            "bilbycast_edge_flow_output_latency_frames{{flow_id=\"{}\",output_id=\"{}\"}} {:.2}\n",
+                            fs.flow_id, os.output_id, frames
+                        ));
+                    }
+                }
             }
         }
 

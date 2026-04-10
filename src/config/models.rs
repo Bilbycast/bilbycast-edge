@@ -29,6 +29,11 @@ pub struct AppConfig {
     /// List of all configured flows
     #[serde(default)]
     pub flows: Vec<FlowConfig>,
+    /// Optional system resource monitoring thresholds (CPU, RAM).
+    /// When configured, the node samples system resources and fires events
+    /// when thresholds are exceeded. See [`ResourceLimitConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_limits: Option<ResourceLimitConfig>,
     /// Optional IP tunnels (relay or direct QUIC tunnels between edge nodes)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tunnels: Vec<crate::tunnel::TunnelConfig>,
@@ -51,6 +56,7 @@ impl Default for AppConfig {
             server: ServerConfig::default(),
             monitor: None,
             manager: None,
+            resource_limits: None,
             flows: Vec::new(),
             tunnels: Vec::new(),
             flow_groups: Vec::new(),
@@ -142,8 +148,12 @@ pub struct FlowConfig {
     /// monitoring. Inherits from `flow_group` if set there. Default: None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock_domain: Option<u8>,
-    /// The single input source for this flow
-    pub input: InputConfig,
+    /// The single input source for this flow. `None` when the flow contains
+    /// only outputs (e.g., standalone output definitions managed by the Flow
+    /// Router). The broadcast channel is created but silent until an input is
+    /// connected at runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<InputConfig>,
     /// One or more output destinations (fan-out)
     pub outputs: Vec<OutputConfig>,
 }
@@ -184,6 +194,61 @@ fn default_grace_period() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+/// System resource monitoring and threshold configuration.
+///
+/// When configured at the node level, the edge periodically samples CPU and RAM
+/// usage and fires events when thresholds are exceeded. Optionally gates new
+/// flow creation when resources are critical.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResourceLimitConfig {
+    /// CPU usage warning threshold (percent, 0-100). Default: 80.
+    #[serde(default = "default_cpu_warning")]
+    pub cpu_warning_percent: f64,
+    /// CPU usage critical threshold (percent, 0-100). Default: 95.
+    #[serde(default = "default_cpu_critical")]
+    pub cpu_critical_percent: f64,
+    /// RAM usage warning threshold (percent, 0-100). Default: 80.
+    #[serde(default = "default_ram_warning")]
+    pub ram_warning_percent: f64,
+    /// RAM usage critical threshold (percent, 0-100). Default: 95.
+    #[serde(default = "default_ram_critical")]
+    pub ram_critical_percent: f64,
+    /// Action when critical threshold is exceeded.
+    #[serde(default)]
+    pub critical_action: ResourceLimitAction,
+    /// Seconds the metric must continuously exceed the threshold before
+    /// triggering. Default: 10 seconds.
+    #[serde(default = "default_resource_grace")]
+    pub grace_period_secs: u32,
+}
+
+/// Action to take when a system resource critical threshold is exceeded.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceLimitAction {
+    /// Raise events only (default). Flows continue operating normally.
+    #[default]
+    Alarm,
+    /// Prevent new flows from starting while any resource is critical.
+    GateFlows,
+}
+
+fn default_cpu_warning() -> f64 {
+    80.0
+}
+fn default_cpu_critical() -> f64 {
+    95.0
+}
+fn default_ram_warning() -> f64 {
+    80.0
+}
+fn default_ram_critical() -> f64 {
+    95.0
+}
+fn default_resource_grace() -> u32 {
+    10
 }
 
 /// Input source configuration — RTP, UDP, SRT, RTMP, RTSP, or WebRTC
@@ -648,6 +713,50 @@ pub struct RtpOutputConfig {
     /// Must be > 0; program_number 0 is reserved for the NIT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_number: Option<u16>,
+    /// Optional output delay for stream synchronization.
+    /// See [`OutputDelay`] for the available modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay: Option<OutputDelay>,
+}
+
+/// Configurable output delay for stream synchronization.
+///
+/// Supports three modes:
+/// - **Fixed**: adds a constant delay in milliseconds on top of the base latency.
+/// - **TargetMs**: sets a target end-to-end latency in milliseconds. The system
+///   holds each packet until `recv_time_us + target` has elapsed, so the total
+///   output latency converges on the target regardless of base latency variations.
+/// - **TargetFrames**: like `TargetMs` but the target is expressed in video frames.
+///   Converted to milliseconds using the detected video frame rate. Falls back to
+///   `fallback_ms` if no frame rate is detected within 5 seconds of output start.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode")]
+pub enum OutputDelay {
+    /// Fixed delay added on top of the existing processing latency.
+    #[serde(rename = "fixed")]
+    Fixed {
+        /// Delay in milliseconds (0–10000).
+        ms: u64,
+    },
+    /// Target end-to-end latency. Each packet is released exactly this many
+    /// milliseconds after it was received at the input, dynamically absorbing
+    /// base latency variations.
+    #[serde(rename = "target_ms")]
+    TargetMs {
+        /// Target end-to-end latency in milliseconds (1–10000).
+        ms: u64,
+    },
+    /// Target end-to-end latency expressed in video frames. Requires a
+    /// detected video frame rate (H.264/H.265 SPS).
+    #[serde(rename = "target_frames")]
+    TargetFrames {
+        /// Number of frames of end-to-end latency (0.01–300.0).
+        frames: f64,
+        /// Fallback delay in milliseconds if no frame rate is detected
+        /// within 5 seconds of output start.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fallback_ms: Option<u64>,
+    },
 }
 
 fn default_dscp() -> u8 {
@@ -691,6 +800,10 @@ pub struct UdpOutputConfig {
     /// 302M LPCM audio.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_mode: Option<String>,
+    /// Optional output delay for stream synchronization.
+    /// Incompatible with `transport_mode: "audio_302m"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay: Option<OutputDelay>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -813,6 +926,10 @@ pub struct SrtOutputConfig {
     /// 302M LPCM in MPEG-TS over SRT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_mode: Option<String>,
+    /// Optional output delay for stream synchronization.
+    /// Incompatible with `transport_mode: "audio_302m"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay: Option<OutputDelay>,
 }
 
 /// SRT connection mode, determining which side initiates the handshake.
@@ -1528,6 +1645,7 @@ mod tests {
             server: ServerConfig::default(),
             monitor: None,
             manager: None,
+            resource_limits: None,
             tunnels: Vec::new(),
             flow_groups: Vec::new(),
             flows: vec![FlowConfig {
@@ -1540,7 +1658,7 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input: InputConfig::Rtp(RtpInputConfig {
+                input: Some(InputConfig::Rtp(RtpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
                     interface_addr: None,
                     fec_decode: None,
@@ -1549,7 +1667,7 @@ mod tests {
                     max_bitrate_mbps: None,
                     tr07_mode: None,
                     redundancy: None,
-                }),
+                })),
                 outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
                     id: "out-1".to_string(),
                     name: "Output 1".to_string(),
@@ -1560,6 +1678,7 @@ mod tests {
                     dscp: default_dscp(),
                     redundancy: None,
                     program_number: None,
+                    delay: None,
                 })],
             }],
         };
@@ -1599,7 +1718,7 @@ mod tests {
         }"#;
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.flows.len(), 1);
-        if let InputConfig::Srt(srt) = &config.flows[0].input {
+        if let Some(InputConfig::Srt(srt)) = &config.flows[0].input {
             assert!(srt.redundancy.is_some());
         } else {
             panic!("Expected SRT input");

@@ -547,7 +547,8 @@ Outputs are discriminated by the `"type"` field. All output types share `id` and
 | `packet_filter`    | `string?`               | `null`  | SRT FEC config string (see SRT Input for format details). |
 | `redundancy`       | `SrtRedundancyConfig?`  | `null`  | SMPTE 2022-7 second leg configuration           |
 | `program_number`   | `u16?`                  | `null`  | MPTS → SPTS program filter. `null` = passthrough (full MPTS); `Some(N)` = send only program N as a rewritten single-program TS. Must be `> 0`. See the **[MPTS → SPTS filtering](#mpts--spts-filtering)** section. |
-| `transport_mode`   | `string?`               | `null`  | `"ts"` (default) sends raw MPEG-TS as the existing path does. `"audio_302m"` runs the per-output transcode + SMPTE 302M packetizer + TsMuxer pipeline and ships 7×188-byte LPCM-in-MPEG-TS chunks over SRT. Mutually exclusive with `packet_filter`, `program_number`, and `redundancy`. The upstream input must be an audio essence (`st2110_30`, `st2110_31`, or `rtp_audio`). See [`audio-gateway.md`](audio-gateway.md). |
+| `transport_mode`   | `string?`               | `null`  | `"ts"` (default) sends raw MPEG-TS as the existing path does. `"audio_302m"` runs the per-output transcode + SMPTE 302M packetizer + TsMuxer pipeline and ships 7×188-byte LPCM-in-MPEG-TS chunks over SRT. Mutually exclusive with `packet_filter`, `program_number`, `redundancy`, and `delay`. The upstream input must be an audio essence (`st2110_30`, `st2110_31`, or `rtp_audio`). See [`audio-gateway.md`](audio-gateway.md). |
+| `delay`            | `OutputDelay?`          | `null`  | Output delay for stream synchronization. Three modes: `{"mode":"fixed","ms":N}` adds a constant delay; `{"mode":"target_ms","ms":N}` sets a target end-to-end latency (dynamically adjusts); `{"mode":"target_frames","frames":N,"fallback_ms":M}` sets target in video frames (auto-detected fps, optional ms fallback). Incompatible with `transport_mode: "audio_302m"`. |
 
 ### RTP Output (`"type": "rtp"`)
 
@@ -565,6 +566,7 @@ Sends RTP-wrapped MPEG-TS packets with RTP headers. Supports SMPTE 2022-1 FEC en
 | `dscp`           | `u8`                          | `46`    | DSCP value for QoS marking (0-63, default: 46 = Expedited Forwarding) |
 | `redundancy`     | `RtpOutputRedundancyConfig?`  | `null`  | SMPTE 2022-7 second leg configuration           |
 | `program_number` | `u16?`                        | `null`  | MPTS → SPTS program filter. `null` = passthrough (full MPTS); `Some(N)` = send only program N as a rewritten single-program TS. Applied before FEC and 2022-7 redundancy, so receivers see the filtered SPTS. Must be `> 0`. |
+| `delay`          | `OutputDelay?`                | `null`  | Output delay for stream synchronization. Three modes: `fixed` (constant delay), `target_ms` (target end-to-end latency), `target_frames` (target latency in video frames). See SRT Output for format details. |
 
 ### UDP Output (`"type": "udp"`)
 
@@ -580,7 +582,8 @@ Sends raw MPEG-TS over UDP without RTP headers. Datagrams are TS-aligned (7×188
 | `interface_addr`  | `string?` | `null`  | Network interface IP for multicast send          |
 | `dscp`           | `u8`       | `46`    | DSCP value for QoS marking (0-63, default: 46 = Expedited Forwarding) |
 | `program_number` | `u16?`     | `null`  | MPTS → SPTS program filter. `null` = passthrough (full MPTS); `Some(N)` = send only program N as a rewritten single-program TS. Must be `> 0`. |
-| `transport_mode` | `string?`  | `null`  | `"ts"` (default) sends raw MPEG-TS as the existing path does. `"audio_302m"` runs the per-output transcode + SMPTE 302M packetizer pipeline and emits 7×188-byte LPCM-in-MPEG-TS chunks as plain UDP datagrams (useful for legacy hardware decoders that consume raw MPEG-TS over UDP). Mutually exclusive with `program_number`. See [`audio-gateway.md`](audio-gateway.md). |
+| `transport_mode` | `string?`  | `null`  | `"ts"` (default) sends raw MPEG-TS as the existing path does. `"audio_302m"` runs the per-output transcode + SMPTE 302M packetizer pipeline and emits 7×188-byte LPCM-in-MPEG-TS chunks as plain UDP datagrams (useful for legacy hardware decoders that consume raw MPEG-TS over UDP). Mutually exclusive with `program_number` and `delay`. See [`audio-gateway.md`](audio-gateway.md). |
+| `delay`          | `OutputDelay?` | `null` | Output delay for stream synchronization. Three modes: `fixed` (constant delay), `target_ms` (target end-to-end latency), `target_frames` (target latency in video frames). Incompatible with `transport_mode: "audio_302m"`. See SRT Output for format details. |
 
 ### RTMP Output (`"type": "rtmp"`)
 

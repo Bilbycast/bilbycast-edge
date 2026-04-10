@@ -214,7 +214,7 @@ async fn get_io(State(state): State<AppState>) -> Json<IoResponse> {
 
     for f in &cfg.flows {
         // Inputs: an audio input contributes one IS-08 input.
-        if let InputConfig::St2110_30(c) | InputConfig::St2110_31(c) = &f.input {
+        if let Some(InputConfig::St2110_30(c) | InputConfig::St2110_31(c)) = &f.input {
             let id = format!("st2110_30:{}", f.id);
             inputs.insert(
                 id.clone(),

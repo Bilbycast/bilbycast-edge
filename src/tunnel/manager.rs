@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use serde::Serialize;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -32,8 +32,8 @@ struct TunnelRuntime {
     state_rx: watch::Receiver<RelayTunnelState>,
     udp_stats: Option<Arc<UdpForwarderStats>>,
     tcp_stats: Option<Arc<TcpForwarderStats>>,
-    throughput_in: Mutex<ThroughputEstimator>,
-    throughput_out: Mutex<ThroughputEstimator>,
+    throughput_in: ThroughputEstimator,
+    throughput_out: ThroughputEstimator,
 }
 
 /// Serializable tunnel status for API responses.
@@ -153,8 +153,8 @@ impl TunnelManager {
                 state_rx,
                 udp_stats,
                 tcp_stats,
-                throughput_in: Mutex::new(ThroughputEstimator::new()),
-                throughput_out: Mutex::new(ThroughputEstimator::new()),
+                throughput_in: ThroughputEstimator::new(),
+                throughput_out: ThroughputEstimator::new(),
             },
         );
 
@@ -371,12 +371,8 @@ fn build_status(runtime: &TunnelRuntime) -> TunnelStatus {
     }
 
     // Sample throughput estimators to compute bitrate
-    if let Ok(mut est) = runtime.throughput_in.lock() {
-        stats.bitrate_in_bps = est.sample(stats.bytes_received);
-    }
-    if let Ok(mut est) = runtime.throughput_out.lock() {
-        stats.bitrate_out_bps = est.sample(stats.bytes_sent);
-    }
+    stats.bitrate_in_bps = runtime.throughput_in.sample(stats.bytes_received);
+    stats.bitrate_out_bps = runtime.throughput_out.sample(stats.bytes_sent);
 
     TunnelStatus {
         id: runtime.config.id.clone(),

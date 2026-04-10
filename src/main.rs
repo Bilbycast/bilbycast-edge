@@ -140,7 +140,17 @@ async fn main() -> anyhow::Result<()> {
     let (ws_stats_tx, _) = broadcast::channel::<String>(64);
     let (event_sender, event_rx) = manager::event_channel();
     let global_stats = Arc::new(StatsCollector::new());
-    let flow_manager = Arc::new(FlowManager::new(global_stats.clone(), ffmpeg_available, event_sender.clone()));
+
+    // System resource monitoring (CPU, RAM)
+    let resource_state = Arc::new(engine::resource_monitor::SystemResourceState::new());
+    let resource_action = app_config.resource_limits.as_ref().map(|rl| rl.critical_action.clone());
+    let flow_manager = Arc::new(FlowManager::new(
+        global_stats.clone(),
+        ffmpeg_available,
+        event_sender.clone(),
+        resource_state.clone(),
+        resource_action,
+    ));
     let tunnel_manager = Arc::new(TunnelManager::new(event_sender.clone()));
 
     // Set the manager node_id on the tunnel manager so relay tunnels can identify this edge
@@ -187,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "webrtc")]
         webrtc_sessions: Some(Arc::new(api::webrtc::registry::WebrtcSessionRegistry::new())),
         event_sender: Some(event_sender.clone()),
+        resource_state: resource_state.clone(),
     };
 
     // Start all enabled flows from config
@@ -254,6 +265,14 @@ async fn main() -> anyhow::Result<()> {
     // Shared shutdown token for coordinated graceful shutdown
     let shutdown_token = CancellationToken::new();
 
+    // Spawn system resource monitor (CPU, RAM)
+    let _resource_monitor_handle = engine::resource_monitor::spawn_resource_monitor(
+        app_config.resource_limits.clone(),
+        resource_state.clone(),
+        event_sender.clone(),
+        shutdown_token.clone(),
+    );
+
     // Optionally start the monitor dashboard server
     let _monitor_handle = if let Some(ref monitor_config) = app_config.monitor {
         Some(
@@ -303,6 +322,7 @@ async fn main() -> anyhow::Result<()> {
                 #[cfg(not(feature = "webrtc"))]
                 (),
                 event_rx,
+                resource_state.clone(),
             );
         }
     }

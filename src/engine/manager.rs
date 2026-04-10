@@ -2,15 +2,17 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use anyhow::{Result, bail};
 use dashmap::DashMap;
 
-use crate::config::models::{FlowConfig, OutputConfig};
+use crate::config::models::{FlowConfig, OutputConfig, ResourceLimitAction};
 use crate::manager::events::{EventSender, EventSeverity};
 use crate::stats::collector::StatsCollector;
 
 use super::flow::FlowRuntime;
+use super::resource_monitor::SystemResourceState;
 
 /// Central coordinator for the lifecycle of all media flows in the system.
 ///
@@ -41,6 +43,10 @@ pub struct FlowManager {
     ffmpeg_available: bool,
     /// Event sender for forwarding operational events to the manager.
     event_sender: EventSender,
+    /// System resource state — read for flow gating when resources are critical.
+    resource_state: Arc<SystemResourceState>,
+    /// Action to take when resources are critical. `None` or `Alarm` = no gating.
+    resource_action: Option<ResourceLimitAction>,
 }
 
 impl FlowManager {
@@ -49,12 +55,20 @@ impl FlowManager {
     /// The provided [`StatsCollector`] is shared with every flow that is
     /// subsequently created, allowing the stats subsystem to aggregate
     /// metrics across all flows.
-    pub fn new(stats: Arc<StatsCollector>, ffmpeg_available: bool, event_sender: EventSender) -> Self {
+    pub fn new(
+        stats: Arc<StatsCollector>,
+        ffmpeg_available: bool,
+        event_sender: EventSender,
+        resource_state: Arc<SystemResourceState>,
+        resource_action: Option<ResourceLimitAction>,
+    ) -> Self {
         Self {
             flows: DashMap::new(),
             stats,
             ffmpeg_available,
             event_sender,
+            resource_state,
+            resource_action,
         }
     }
 
@@ -98,6 +112,16 @@ impl FlowManager {
     /// or if the underlying input/output tasks fail to initialize (e.g., socket
     /// bind failure, SRT connection error).
     pub async fn create_flow(&self, config: FlowConfig) -> Result<Arc<FlowRuntime>> {
+        // Gate flow creation when system resources are critical
+        if self.resource_state.resources_critical.load(Ordering::Relaxed) {
+            if matches!(self.resource_action, Some(ResourceLimitAction::GateFlows)) {
+                bail!(
+                    "Cannot start flow '{}': system resources critical (CPU or RAM threshold exceeded)",
+                    config.id
+                );
+            }
+        }
+
         if self.flows.contains_key(&config.id) {
             bail!("Flow '{}' is already running", config.id);
         }

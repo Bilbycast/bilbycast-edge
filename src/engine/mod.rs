@@ -20,7 +20,9 @@
 //! - **Redundancy duplicate** on SRT output (SMPTE 2022-7 dual-leg send)
 
 pub mod bandwidth_monitor;
+pub mod delay_buffer;
 pub mod flow;
+pub mod resource_monitor;
 pub mod input_rtmp;
 pub mod input_rtsp;
 #[cfg(feature = "webrtc")]

@@ -12,6 +12,10 @@ use tokio::sync::watch;
 use super::models::*;
 use super::throughput::ThroughputEstimator;
 
+// Note: `Mutex` is still imported for `Tr101290State`, `MediaAnalysisState`,
+// and `ThumbnailAccumulator` (non-hot-path, 1/sec snapshot reads).
+// `ThroughputEstimator` is now fully lock-free (atomic-based).
+
 /// Per-output atomic counters for a single output leg.
 ///
 /// Tracks `packets_sent`, `bytes_sent`, `packets_dropped`, and
@@ -26,7 +30,7 @@ pub struct OutputStatsAccumulator {
     pub bytes_sent: AtomicU64,
     pub packets_dropped: AtomicU64,
     pub fec_packets_sent: AtomicU64,
-    throughput: Mutex<ThroughputEstimator>,
+    throughput: ThroughputEstimator,
     /// Cached SRT stats for primary leg, updated by the SRT output polling task
     /// via a lock-free watch channel. Read via `borrow()`, write via `send()`.
     pub srt_stats_cache: Arc<watch::Sender<Option<SrtLegStats>>>,
@@ -45,6 +49,13 @@ pub struct OutputStatsAccumulator {
     /// resolved target codec descriptors. Set once at output startup by
     /// outputs that spawn an `engine::audio_encode::AudioEncoder`.
     audio_encode_stats: OnceLock<AudioEncodeStatsHandle>,
+
+    // ── End-to-end latency tracking ──────────────────────────────────
+    // Windowed min/avg/max, reset on each snapshot (1s).
+    latency_min_us: AtomicU64,
+    latency_max_us: AtomicU64,
+    latency_sum_us: AtomicU64,
+    latency_count: AtomicU64,
 }
 
 /// Registered handle to a per-output decode stage's counters plus the
@@ -78,12 +89,16 @@ impl OutputStatsAccumulator {
             bytes_sent: AtomicU64::new(0),
             packets_dropped: AtomicU64::new(0),
             fec_packets_sent: AtomicU64::new(0),
-            throughput: Mutex::new(ThroughputEstimator::new()),
+            throughput: ThroughputEstimator::new(),
             srt_stats_cache: Arc::new(watch::channel(None).0),
             srt_leg2_stats_cache: Arc::new(watch::channel(None).0),
             transcode_stats: OnceLock::new(),
             audio_decode_stats: OnceLock::new(),
             audio_encode_stats: OnceLock::new(),
+            latency_min_us: AtomicU64::new(u64::MAX),
+            latency_max_us: AtomicU64::new(0),
+            latency_sum_us: AtomicU64::new(0),
+            latency_count: AtomicU64::new(0),
         }
     }
 
@@ -134,11 +149,51 @@ impl OutputStatsAccumulator {
         });
     }
 
+    /// Record an end-to-end latency sample. Called on the hot path after
+    /// each successful output send. `recv_time_us` is the monotonic receive
+    /// time stamped on the packet at the flow's input.
+    #[inline]
+    pub fn record_latency(&self, recv_time_us: u64) {
+        let now = crate::util::time::now_us();
+        let latency = now.saturating_sub(recv_time_us);
+
+        // Update min (CAS loop — converges fast, few updates after first packets)
+        let mut cur = self.latency_min_us.load(Ordering::Relaxed);
+        while latency < cur {
+            match self.latency_min_us.compare_exchange_weak(
+                cur,
+                latency,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+
+        // Update max (CAS loop)
+        let mut cur = self.latency_max_us.load(Ordering::Relaxed);
+        while latency > cur {
+            match self.latency_max_us.compare_exchange_weak(
+                cur,
+                latency,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+
+        self.latency_sum_us.fetch_add(latency, Ordering::Relaxed);
+        self.latency_count.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Take a point-in-time snapshot of all atomic counters and return an
     /// [`OutputStats`] value suitable for JSON serialisation.
     pub fn snapshot(&self) -> OutputStats {
         let bytes = self.bytes_sent.load(Ordering::Relaxed);
-        let bitrate_bps = self.throughput.lock().unwrap().sample(bytes);
+        let bitrate_bps = self.throughput.sample(bytes);
         let transcode_stats = self.transcode_stats.get().map(|t| {
             crate::stats::models::TranscodeStatsSnapshot {
                 input_packets: t.input_packets.load(Ordering::Relaxed),
@@ -171,6 +226,25 @@ impl OutputStatsAccumulator {
                 target_bitrate_kbps: h.target_bitrate_kbps,
             }
         });
+
+        // Swap latency window and compute min/avg/max.
+        let lat_count = self.latency_count.swap(0, Ordering::Relaxed);
+        let latency = if lat_count > 0 {
+            let lat_min = self.latency_min_us.swap(u64::MAX, Ordering::Relaxed);
+            let lat_max = self.latency_max_us.swap(0, Ordering::Relaxed);
+            let lat_sum = self.latency_sum_us.swap(0, Ordering::Relaxed);
+            Some(OutputLatencyStats {
+                min_us: lat_min,
+                avg_us: lat_sum / lat_count,
+                max_us: lat_max,
+                latency_frames: None, // injected by FlowStatsAccumulator::snapshot()
+            })
+        } else {
+            // Reset min even if no samples (keeps it primed for the next window).
+            self.latency_min_us.store(u64::MAX, Ordering::Relaxed);
+            None
+        };
+
         OutputStats {
             output_id: self.output_id.clone(),
             output_name: self.output_name.clone(),
@@ -194,6 +268,7 @@ impl OutputStatsAccumulator {
             transcode_stats,
             audio_decode_stats,
             audio_encode_stats,
+            latency,
         }
     }
 }
@@ -722,7 +797,7 @@ pub struct FlowStatsAccumulator {
     pub redundancy_switches: AtomicU64,
     // Per-output stats
     pub output_stats: DashMap<String, Arc<OutputStatsAccumulator>>,
-    pub input_throughput: Mutex<ThroughputEstimator>,
+    pub input_throughput: ThroughputEstimator,
     /// TR-101290 analyzer stats, set once when the flow starts.
     pub tr101290: OnceLock<Arc<Tr101290Accumulator>>,
     /// Media analysis stats, set once when the flow starts (if enabled).
@@ -802,7 +877,7 @@ impl FlowStatsAccumulator {
             fec_recovered: AtomicU64::new(0),
             redundancy_switches: AtomicU64::new(0),
             output_stats: DashMap::new(),
-            input_throughput: Mutex::new(ThroughputEstimator::new()),
+            input_throughput: ThroughputEstimator::new(),
             tr101290: OnceLock::new(),
             media_analysis: OnceLock::new(),
             thumbnail: OnceLock::new(),
@@ -836,7 +911,7 @@ impl FlowStatsAccumulator {
     /// Take a point-in-time snapshot of all input counters and every registered
     /// output's counters, assembling them into a [`FlowStats`] value.
     pub fn snapshot(&self) -> FlowStats {
-        let outputs: Vec<OutputStats> = self
+        let mut outputs: Vec<OutputStats> = self
             .output_stats
             .iter()
             .map(|entry| {
@@ -857,7 +932,7 @@ impl FlowStatsAccumulator {
             .collect();
 
         let input_bytes = self.input_bytes.load(Ordering::Relaxed);
-        let input_bitrate = self.input_throughput.lock().unwrap().sample(input_bytes);
+        let input_bitrate = self.input_throughput.sample(input_bytes);
 
         let tr101290_snap = self.tr101290.get().map(|acc| acc.snapshot());
 
@@ -881,6 +956,21 @@ impl FlowStatsAccumulator {
 
         let media_analysis = self.media_analysis.get().map(|acc| acc.snapshot());
         let thumbnail = self.thumbnail.get().map(|acc| acc.snapshot());
+
+        // Inject frame-based latency into outputs when video frame rate is known.
+        if let Some(ref ma) = media_analysis {
+            let frame_rate = ma.video_streams.first().and_then(|v| v.frame_rate);
+            if let Some(fps) = frame_rate {
+                if fps > 0.0 {
+                    let us_per_frame = 1_000_000.0 / fps;
+                    for out in &mut outputs {
+                        if let Some(ref mut lat) = out.latency {
+                            lat.latency_frames = Some(lat.avg_us as f64 / us_per_frame);
+                        }
+                    }
+                }
+            }
+        }
 
         // Derive flow health (RP 2129 M6)
         let packets_lost = self.input_loss.load(Ordering::Relaxed);

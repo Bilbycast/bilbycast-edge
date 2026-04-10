@@ -161,17 +161,18 @@ impl FlowRuntime {
         let (broadcast_tx, _) = broadcast::channel::<RtpPacket>(BROADCAST_CHANNEL_CAPACITY);
 
         let input_type = match &config.input {
-            InputConfig::Rtp(_) => "rtp",
-            InputConfig::Udp(_) => "udp",
-            InputConfig::Srt(_) => "srt",
-            InputConfig::Rtmp(_) => "rtmp",
-            InputConfig::Rtsp(_) => "rtsp",
-            InputConfig::Webrtc(_) => "webrtc",
-            InputConfig::Whep(_) => "whep",
-            InputConfig::St2110_30(_) => "st2110_30",
-            InputConfig::St2110_31(_) => "st2110_31",
-            InputConfig::St2110_40(_) => "st2110_40",
-            InputConfig::RtpAudio(_) => "rtp_audio",
+            Some(InputConfig::Rtp(_)) => "rtp",
+            Some(InputConfig::Udp(_)) => "udp",
+            Some(InputConfig::Srt(_)) => "srt",
+            Some(InputConfig::Rtmp(_)) => "rtmp",
+            Some(InputConfig::Rtsp(_)) => "rtsp",
+            Some(InputConfig::Webrtc(_)) => "webrtc",
+            Some(InputConfig::Whep(_)) => "whep",
+            Some(InputConfig::St2110_30(_)) => "st2110_30",
+            Some(InputConfig::St2110_31(_)) => "st2110_31",
+            Some(InputConfig::St2110_40(_)) => "st2110_40",
+            Some(InputConfig::RtpAudio(_)) => "rtp_audio",
+            None => "none",
         };
 
         // Register flow stats
@@ -183,63 +184,65 @@ impl FlowRuntime {
 
         // Populate input config metadata for topology display
         use crate::stats::collector::InputConfigMeta;
-        let input_meta = match &config.input {
-            InputConfig::Rtp(c) => InputConfigMeta {
-                mode: None, local_addr: None, remote_addr: None,
-                listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
-                rtsp_url: None, whep_url: None,
-            },
-            InputConfig::Udp(c) => InputConfigMeta {
-                mode: None, local_addr: None, remote_addr: None,
-                listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
-                rtsp_url: None, whep_url: None,
-            },
-            InputConfig::Srt(c) => InputConfigMeta {
-                mode: Some(format!("{:?}", c.mode).to_lowercase()),
-                local_addr: Some(c.local_addr.clone()),
-                remote_addr: c.remote_addr.clone(),
-                listen_addr: None, bind_addr: None,
-                rtsp_url: None, whep_url: None,
-            },
-            InputConfig::Rtmp(c) => InputConfigMeta {
-                mode: None, local_addr: None, remote_addr: None,
-                listen_addr: Some(c.listen_addr.clone()), bind_addr: None,
-                rtsp_url: None, whep_url: None,
-            },
-            InputConfig::Rtsp(c) => InputConfigMeta {
-                mode: Some(format!("{:?}", c.transport).to_lowercase()),
-                local_addr: None, remote_addr: None,
-                listen_addr: None, bind_addr: None,
-                rtsp_url: Some(c.rtsp_url.clone()), whep_url: None,
-            },
-            InputConfig::Webrtc(_) => InputConfigMeta {
-                mode: Some("whip_server".to_string()), local_addr: None, remote_addr: None,
-                listen_addr: None, bind_addr: None,
-                rtsp_url: None, whep_url: None,
-            },
-            InputConfig::Whep(c) => InputConfigMeta {
-                mode: Some("whep_client".to_string()), local_addr: None,
-                remote_addr: None,
-                listen_addr: None, bind_addr: None,
-                rtsp_url: None, whep_url: Some(c.whep_url.clone()),
-            },
-            InputConfig::St2110_30(c) | InputConfig::St2110_31(c) => InputConfigMeta {
-                mode: None, local_addr: None, remote_addr: None,
-                listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
-                rtsp_url: None, whep_url: None,
-            },
-            InputConfig::St2110_40(c) => InputConfigMeta {
-                mode: None, local_addr: None, remote_addr: None,
-                listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
-                rtsp_url: None, whep_url: None,
-            },
-            InputConfig::RtpAudio(c) => InputConfigMeta {
-                mode: None, local_addr: None, remote_addr: None,
-                listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
-                rtsp_url: None, whep_url: None,
-            },
-        };
-        let _ = flow_stats.input_config_meta.set(input_meta);
+        if let Some(ref input) = config.input {
+            let input_meta = match input {
+                InputConfig::Rtp(c) => InputConfigMeta {
+                    mode: None, local_addr: None, remote_addr: None,
+                    listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
+                    rtsp_url: None, whep_url: None,
+                },
+                InputConfig::Udp(c) => InputConfigMeta {
+                    mode: None, local_addr: None, remote_addr: None,
+                    listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
+                    rtsp_url: None, whep_url: None,
+                },
+                InputConfig::Srt(c) => InputConfigMeta {
+                    mode: Some(format!("{:?}", c.mode).to_lowercase()),
+                    local_addr: Some(c.local_addr.clone()),
+                    remote_addr: c.remote_addr.clone(),
+                    listen_addr: None, bind_addr: None,
+                    rtsp_url: None, whep_url: None,
+                },
+                InputConfig::Rtmp(c) => InputConfigMeta {
+                    mode: None, local_addr: None, remote_addr: None,
+                    listen_addr: Some(c.listen_addr.clone()), bind_addr: None,
+                    rtsp_url: None, whep_url: None,
+                },
+                InputConfig::Rtsp(c) => InputConfigMeta {
+                    mode: Some(format!("{:?}", c.transport).to_lowercase()),
+                    local_addr: None, remote_addr: None,
+                    listen_addr: None, bind_addr: None,
+                    rtsp_url: Some(c.rtsp_url.clone()), whep_url: None,
+                },
+                InputConfig::Webrtc(_) => InputConfigMeta {
+                    mode: Some("whip_server".to_string()), local_addr: None, remote_addr: None,
+                    listen_addr: None, bind_addr: None,
+                    rtsp_url: None, whep_url: None,
+                },
+                InputConfig::Whep(c) => InputConfigMeta {
+                    mode: Some("whep_client".to_string()), local_addr: None,
+                    remote_addr: None,
+                    listen_addr: None, bind_addr: None,
+                    rtsp_url: None, whep_url: Some(c.whep_url.clone()),
+                },
+                InputConfig::St2110_30(c) | InputConfig::St2110_31(c) => InputConfigMeta {
+                    mode: None, local_addr: None, remote_addr: None,
+                    listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
+                    rtsp_url: None, whep_url: None,
+                },
+                InputConfig::St2110_40(c) => InputConfigMeta {
+                    mode: None, local_addr: None, remote_addr: None,
+                    listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
+                    rtsp_url: None, whep_url: None,
+                },
+                InputConfig::RtpAudio(c) => InputConfigMeta {
+                    mode: None, local_addr: None, remote_addr: None,
+                    listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
+                    rtsp_url: None, whep_url: None,
+                },
+            };
+            let _ = flow_stats.input_config_meta.set(input_meta);
+        }
 
         // Populate output config metadata
         for oc in &config.outputs {
@@ -249,148 +252,158 @@ impl FlowRuntime {
             );
         }
 
-        // Start input task
+        // Start input task (if present — flows with no input are standalone
+        // output definitions that receive data when the Flow Router connects
+        // an input at runtime).
         #[cfg(feature = "webrtc")]
         let mut whip_session_info: Option<(tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>, Option<String>)> = None;
-        let input_handle = match &config.input {
-            InputConfig::Rtp(rtp_config) => {
-                spawn_rtp_input(
-                    rtp_config.clone(),
+        let input_handle = if let Some(ref input) = config.input {
+            match input {
+                InputConfig::Rtp(rtp_config) => {
+                    spawn_rtp_input(
+                        rtp_config.clone(),
+                        broadcast_tx.clone(),
+                        flow_stats.clone(),
+                        cancel_token.child_token(),
+                    )
+                }
+                InputConfig::Udp(udp_config) => {
+                    spawn_udp_input(
+                        udp_config.clone(),
+                        broadcast_tx.clone(),
+                        flow_stats.clone(),
+                        cancel_token.child_token(),
+                    )
+                }
+                InputConfig::Srt(srt_config) => {
+                    spawn_srt_input(
+                        srt_config.clone(),
+                        broadcast_tx.clone(),
+                        flow_stats.clone(),
+                        cancel_token.child_token(),
+                        event_sender.clone(),
+                        config.id.clone(),
+                    )
+                }
+                InputConfig::Rtmp(rtmp_config) => {
+                    spawn_rtmp_input(
+                        rtmp_config.clone(),
+                        broadcast_tx.clone(),
+                        flow_stats.clone(),
+                        cancel_token.child_token(),
+                        event_sender.clone(),
+                        config.id.clone(),
+                    )
+                }
+                InputConfig::Rtsp(rtsp_config) => {
+                    super::input_rtsp::spawn_rtsp_input(
+                        rtsp_config.clone(),
+                        broadcast_tx.clone(),
+                        flow_stats.clone(),
+                        cancel_token.child_token(),
+                        event_sender.clone(),
+                        config.id.clone(),
+                    )
+                }
+                #[cfg(feature = "webrtc")]
+                InputConfig::Webrtc(webrtc_config) => {
+                    // Create channel for WHIP API handler → input task communication
+                    let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
+                    // Store session_tx and bearer_token for registration with WebrtcSessionRegistry
+                    whip_session_info = Some((session_tx, webrtc_config.bearer_token.clone()));
+                    super::input_webrtc::spawn_whip_input(
+                        webrtc_config.clone(),
+                        config.id.clone(),
+                        broadcast_tx.clone(),
+                        flow_stats.clone(),
+                        cancel_token.child_token(),
+                        session_rx,
+                        event_sender.clone(),
+                    )
+                }
+                #[cfg(not(feature = "webrtc"))]
+                InputConfig::Webrtc(_) => {
+                    let cancel = cancel_token.child_token();
+                    tokio::spawn(async move {
+                        tracing::warn!("WebRTC/WHIP input requires the `webrtc` cargo feature");
+                        cancel.cancelled().await;
+                    })
+                }
+                #[cfg(feature = "webrtc")]
+                InputConfig::Whep(whep_config) => {
+                    super::input_webrtc::spawn_whep_input(
+                        whep_config.clone(),
+                        broadcast_tx.clone(),
+                        flow_stats.clone(),
+                        cancel_token.child_token(),
+                        event_sender.clone(),
+                        config.id.clone(),
+                    )
+                }
+                #[cfg(not(feature = "webrtc"))]
+                InputConfig::Whep(_) => {
+                    let cancel = cancel_token.child_token();
+                    tokio::spawn(async move {
+                        tracing::warn!("WHEP input requires the `webrtc` cargo feature");
+                        cancel.cancelled().await;
+                    })
+                }
+                // The PTP clock_domain may be set on the flow itself or on the
+                // per-essence input config. The cloned local inherits the
+                // flow-level value when the essence does not override it; the
+                // stored InputConfig is untouched so update_flow's diff stays
+                // accurate.
+                InputConfig::St2110_30(c) => {
+                    let mut c = c.clone();
+                    c.clock_domain = c.clock_domain.or(config.clock_domain);
+                    super::input_st2110_30::spawn_st2110_30_input(
+                        c,
+                        broadcast_tx.clone(),
+                        flow_stats.clone(),
+                        cancel_token.child_token(),
+                        event_sender.clone(),
+                        config.id.clone(),
+                    )
+                }
+                InputConfig::St2110_31(c) => {
+                    let mut c = c.clone();
+                    c.clock_domain = c.clock_domain.or(config.clock_domain);
+                    super::input_st2110_31::spawn_st2110_31_input(
+                        c,
+                        broadcast_tx.clone(),
+                        flow_stats.clone(),
+                        cancel_token.child_token(),
+                        event_sender.clone(),
+                        config.id.clone(),
+                    )
+                }
+                InputConfig::St2110_40(c) => {
+                    let mut c = c.clone();
+                    c.clock_domain = c.clock_domain.or(config.clock_domain);
+                    super::input_st2110_40::spawn_st2110_40_input(
+                        c,
+                        broadcast_tx.clone(),
+                        flow_stats.clone(),
+                        cancel_token.child_token(),
+                        event_sender.clone(),
+                        config.id.clone(),
+                    )
+                }
+                InputConfig::RtpAudio(c) => super::input_rtp_audio::spawn_rtp_audio_input(
+                    c.clone(),
                     broadcast_tx.clone(),
                     flow_stats.clone(),
                     cancel_token.child_token(),
-                )
+                    Some(event_sender.clone()),
+                    Some(config.id.clone()),
+                ),
             }
-            InputConfig::Udp(udp_config) => {
-                spawn_udp_input(
-                    udp_config.clone(),
-                    broadcast_tx.clone(),
-                    flow_stats.clone(),
-                    cancel_token.child_token(),
-                )
-            }
-            InputConfig::Srt(srt_config) => {
-                spawn_srt_input(
-                    srt_config.clone(),
-                    broadcast_tx.clone(),
-                    flow_stats.clone(),
-                    cancel_token.child_token(),
-                    event_sender.clone(),
-                    config.id.clone(),
-                )
-            }
-            InputConfig::Rtmp(rtmp_config) => {
-                spawn_rtmp_input(
-                    rtmp_config.clone(),
-                    broadcast_tx.clone(),
-                    flow_stats.clone(),
-                    cancel_token.child_token(),
-                    event_sender.clone(),
-                    config.id.clone(),
-                )
-            }
-            InputConfig::Rtsp(rtsp_config) => {
-                super::input_rtsp::spawn_rtsp_input(
-                    rtsp_config.clone(),
-                    broadcast_tx.clone(),
-                    flow_stats.clone(),
-                    cancel_token.child_token(),
-                    event_sender.clone(),
-                    config.id.clone(),
-                )
-            }
-            #[cfg(feature = "webrtc")]
-            InputConfig::Webrtc(webrtc_config) => {
-                // Create channel for WHIP API handler → input task communication
-                let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
-                // Store session_tx and bearer_token for registration with WebrtcSessionRegistry
-                whip_session_info = Some((session_tx, webrtc_config.bearer_token.clone()));
-                super::input_webrtc::spawn_whip_input(
-                    webrtc_config.clone(),
-                    config.id.clone(),
-                    broadcast_tx.clone(),
-                    flow_stats.clone(),
-                    cancel_token.child_token(),
-                    session_rx,
-                    event_sender.clone(),
-                )
-            }
-            #[cfg(not(feature = "webrtc"))]
-            InputConfig::Webrtc(_) => {
-                let cancel = cancel_token.child_token();
-                tokio::spawn(async move {
-                    tracing::warn!("WebRTC/WHIP input requires the `webrtc` cargo feature");
-                    cancel.cancelled().await;
-                })
-            }
-            #[cfg(feature = "webrtc")]
-            InputConfig::Whep(whep_config) => {
-                super::input_webrtc::spawn_whep_input(
-                    whep_config.clone(),
-                    broadcast_tx.clone(),
-                    flow_stats.clone(),
-                    cancel_token.child_token(),
-                    event_sender.clone(),
-                    config.id.clone(),
-                )
-            }
-            #[cfg(not(feature = "webrtc"))]
-            InputConfig::Whep(_) => {
-                let cancel = cancel_token.child_token();
-                tokio::spawn(async move {
-                    tracing::warn!("WHEP input requires the `webrtc` cargo feature");
-                    cancel.cancelled().await;
-                })
-            }
-            // The PTP clock_domain may be set on the flow itself or on the
-            // per-essence input config. The cloned local inherits the
-            // flow-level value when the essence does not override it; the
-            // stored InputConfig is untouched so update_flow's diff stays
-            // accurate.
-            InputConfig::St2110_30(c) => {
-                let mut c = c.clone();
-                c.clock_domain = c.clock_domain.or(config.clock_domain);
-                super::input_st2110_30::spawn_st2110_30_input(
-                    c,
-                    broadcast_tx.clone(),
-                    flow_stats.clone(),
-                    cancel_token.child_token(),
-                    event_sender.clone(),
-                    config.id.clone(),
-                )
-            }
-            InputConfig::St2110_31(c) => {
-                let mut c = c.clone();
-                c.clock_domain = c.clock_domain.or(config.clock_domain);
-                super::input_st2110_31::spawn_st2110_31_input(
-                    c,
-                    broadcast_tx.clone(),
-                    flow_stats.clone(),
-                    cancel_token.child_token(),
-                    event_sender.clone(),
-                    config.id.clone(),
-                )
-            }
-            InputConfig::St2110_40(c) => {
-                let mut c = c.clone();
-                c.clock_domain = c.clock_domain.or(config.clock_domain);
-                super::input_st2110_40::spawn_st2110_40_input(
-                    c,
-                    broadcast_tx.clone(),
-                    flow_stats.clone(),
-                    cancel_token.child_token(),
-                    event_sender.clone(),
-                    config.id.clone(),
-                )
-            }
-            InputConfig::RtpAudio(c) => super::input_rtp_audio::spawn_rtp_audio_input(
-                c.clone(),
-                broadcast_tx.clone(),
-                flow_stats.clone(),
-                cancel_token.child_token(),
-                Some(event_sender.clone()),
-                Some(config.id.clone()),
-            ),
+        } else {
+            // No input — spawn a no-op task that waits for cancellation.
+            // The broadcast channel exists but is silent until the Flow Router
+            // connects an input.
+            let cancel = cancel_token.child_token();
+            tokio::spawn(async move { cancel.cancelled().await })
         };
 
         // Start TR-101290 analyzer (independent broadcast subscriber).
@@ -405,7 +418,7 @@ impl FlowRuntime {
         // of input type; for non-TS flows it just stays at zero.
         let tr101290_acc = Arc::new(Tr101290Accumulator::new());
         flow_stats.tr101290.set(tr101290_acc.clone()).ok();
-        let analyzer_handle = if config.input.is_ts_carrier() {
+        let analyzer_handle = if config.input.as_ref().map_or(false, |i| i.is_ts_carrier()) {
             spawn_tr101290_analyzer(
                 &broadcast_tx,
                 tr101290_acc,
@@ -417,10 +430,29 @@ impl FlowRuntime {
             tokio::spawn(async {})
         };
 
-        // Start media analysis (if enabled)
-        let media_analysis_handle = if config.media_analysis {
+        // Check if any output uses TargetFrames delay mode, which requires
+        // the detected video frame rate from media analysis. If so, create a
+        // watch channel to broadcast the frame rate to those output tasks.
+        let needs_frame_rate = config.outputs.iter().any(|o| {
+            let delay = match o {
+                OutputConfig::Rtp(c) => c.delay.as_ref(),
+                OutputConfig::Udp(c) => c.delay.as_ref(),
+                OutputConfig::Srt(c) => c.delay.as_ref(),
+                _ => None,
+            };
+            matches!(delay, Some(OutputDelay::TargetFrames { .. }))
+        });
+        let (frame_rate_tx, frame_rate_rx) = if needs_frame_rate {
+            let (tx, rx) = tokio::sync::watch::channel::<Option<f64>>(None);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        // Start media analysis (if enabled and input is present)
+        let media_analysis_handle = if config.media_analysis && config.input.is_some() {
             let (protocol, payload_format, fec_enabled, fec_type, redundancy_enabled, redundancy_type) =
-                match &config.input {
+                match config.input.as_ref().unwrap() {
                     InputConfig::Rtp(rtp) => {
                         let (fec_en, fec_ty) = if let Some(fec) = &rtp.fec_decode {
                             (true, Some(format!("SMPTE 2022-1 (L={}, D={})", fec.columns, fec.rows)))
@@ -508,13 +540,14 @@ impl FlowRuntime {
                 &broadcast_tx,
                 media_acc,
                 cancel_token.child_token(),
+                frame_rate_tx,
             ))
         } else {
             None
         };
 
-        // Start thumbnail generator (if enabled and ffmpeg available)
-        let thumbnail_handle = if config.thumbnail && ffmpeg_available {
+        // Start thumbnail generator (if enabled, ffmpeg available, and input is present)
+        let thumbnail_handle = if config.thumbnail && ffmpeg_available && config.input.is_some() {
             let thumb_acc = Arc::new(ThumbnailAccumulator::new());
             flow_stats.thumbnail.set(thumb_acc.clone()).ok();
             Some(spawn_thumbnail_generator(
@@ -548,15 +581,15 @@ impl FlowRuntime {
         // Resolve the upstream input audio format once so audio output spawn
         // modules can construct an optional TranscodeStage. Returns None for
         // non-audio inputs (video, MPEG-TS, etc.) — passthrough is selected.
-        let input_audio_format =
-            crate::engine::audio_transcode::InputFormat::from_input_config(&config.input);
+        let input_audio_format = config.input.as_ref()
+            .and_then(crate::engine::audio_transcode::InputFormat::from_input_config);
         // Resolve once whether the upstream input is a TS-bearing source that
         // could carry compressed audio (AAC). When true, audio output spawn
         // modules will run an in-line TsDemuxer + AacDecoder ahead of the
         // transcode chain so AAC contribution audio can land into PCM
         // outputs (ST 2110-30/-31, rtp_audio, SMPTE 302M).
-        let compressed_audio_input =
-            crate::engine::audio_decode::input_can_carry_ts_audio(&config.input);
+        let compressed_audio_input = config.input.as_ref()
+            .map_or(false, crate::engine::audio_decode::input_can_carry_ts_audio);
         for output_config in &config.outputs {
             // For WHEP server outputs, create the session channel so the HTTP
             // handler can forward SDP offers to the output task.
@@ -584,6 +617,7 @@ impl FlowRuntime {
                 compressed_audio_input,
                 #[cfg(feature = "webrtc")]
                 whep_rx,
+                frame_rate_rx.clone(),
             ).await?;
             output_handles.insert(output_config.id().to_string(), output_rt);
         }
@@ -635,6 +669,7 @@ impl FlowRuntime {
         compressed_audio_input: bool,
         #[cfg(feature = "webrtc")]
         whep_session_rx: Option<tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>>,
+        frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
     ) -> Result<OutputRuntime> {
         let output_cancel = parent_cancel.child_token();
 
@@ -651,6 +686,7 @@ impl FlowRuntime {
                     broadcast_tx,
                     output_stats.clone(),
                     output_cancel.clone(),
+                    frame_rate_rx,
                 );
 
                 Ok(OutputRuntime {
@@ -672,6 +708,7 @@ impl FlowRuntime {
                     output_stats.clone(),
                     output_cancel.clone(),
                     input_audio_format,
+                    frame_rate_rx,
                 );
 
                 Ok(OutputRuntime {
@@ -696,6 +733,7 @@ impl FlowRuntime {
                     flow_id.to_string(),
                     input_audio_format,
                     compressed_audio_input,
+                    frame_rate_rx,
                 );
 
                 Ok(OutputRuntime {
@@ -878,10 +916,10 @@ impl FlowRuntime {
         // with WebrtcSessionRegistry through this path). WHEP outputs defined
         // at flow creation time work correctly.
 
-        let input_audio_format =
-            crate::engine::audio_transcode::InputFormat::from_input_config(&self.config.input);
-        let compressed_audio_input =
-            crate::engine::audio_decode::input_can_carry_ts_audio(&self.config.input);
+        let input_audio_format = self.config.input.as_ref()
+            .and_then(crate::engine::audio_transcode::InputFormat::from_input_config);
+        let compressed_audio_input = self.config.input.as_ref()
+            .map_or(false, crate::engine::audio_decode::input_can_carry_ts_audio);
         let output_rt = Self::start_output(
             &output_config,
             &self.broadcast_tx,
@@ -892,6 +930,10 @@ impl FlowRuntime {
             input_audio_format,
             compressed_audio_input,
             #[cfg(feature = "webrtc")]
+            None,
+            // Hot-added outputs with TargetFrames delay won't get a frame rate
+            // channel — they'll fall back to fallback_ms. Full TargetFrames
+            // support requires a flow restart to wire up the watch channel.
             None,
         ).await?;
 

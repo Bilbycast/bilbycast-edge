@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-edge"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 license = "MPL-2.0"
@@ -63,12 +63,15 @@ aac-audio = { path = "../bilbycast-fdk-aac-rs/aac-audio", optional = true }
 aac-codec = { path = "../bilbycast-fdk-aac-rs/aac-codec", optional = true }
 symphonia = { version = "0.5.5", features = ["aac"], default-features = false }
 
+# System resource monitoring (CPU, RAM)
+sysinfo = "0.33.1"
+
 # Error handling
 anyhow = "1.0.102"
 
 # Auth (JWT / HMAC-SHA256)
-hmac = "0.12.1"
-sha2 = "0.10.9"
+hmac = "0.13.0"
+sha2 = "0.11.0"
 base64 = "0.22.1"
 serde_urlencoded = "0.7.1"
 
