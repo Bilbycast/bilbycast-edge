@@ -774,6 +774,8 @@ mod tests {
 
     fn audio_cfg(name: &str, bit_depth: u8, channels: u8) -> St2110AudioOutputConfig {
         St2110AudioOutputConfig {
+            active: true,
+            group: None,
             id: format!("{name}-id"),
             name: name.to_string(),
             dest_addr: "239.10.10.1:5004".to_string(),
@@ -794,6 +796,8 @@ mod tests {
 
     fn anc_cfg(name: &str) -> St2110AncillaryOutputConfig {
         St2110AncillaryOutputConfig {
+            active: true,
+            group: None,
             id: format!("{name}-id"),
             name: name.to_string(),
             dest_addr: "239.10.10.10:5006".to_string(),

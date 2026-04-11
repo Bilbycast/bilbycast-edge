@@ -523,6 +523,8 @@ mod tests {
                 node_secret: Some("secret-123".to_string()),
             }),
             inputs: vec![InputDefinition {
+                active: true,
+                group: None,
                 id: "srt-in".to_string(),
                 name: "SRT Input".to_string(),
                 config: InputConfig::Srt(srt_input_config(Some("my-secret-pass"))),
@@ -538,7 +540,7 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input_id: Some("srt-in".to_string()),
+                input_ids: vec!["srt-in".to_string()],
                 output_ids: vec![],
             }],
             tunnels: vec![TunnelConfig {
@@ -636,6 +638,8 @@ mod tests {
         // they live in top-level inputs/outputs, not in infrastructure secrets
         let config = AppConfig {
             inputs: vec![InputDefinition {
+                active: true,
+                group: None,
                 id: "srt-in".to_string(),
                 name: "SRT Input".to_string(),
                 config: InputConfig::Srt(srt_input_config(Some("my-secret-pass"))),
@@ -650,7 +654,7 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input_id: Some("srt-in".to_string()),
+                input_ids: vec!["srt-in".to_string()],
                 output_ids: vec![],
             }],
             ..Default::default()
@@ -663,6 +667,8 @@ mod tests {
     fn test_strip_secrets_preserves_flow_params() {
         let mut config = AppConfig {
             inputs: vec![InputDefinition {
+                active: true,
+                group: None,
                 id: "rtp-in".to_string(),
                 name: "RTP Input".to_string(),
                 config: InputConfig::Rtp(RtpInputConfig {
@@ -677,6 +683,8 @@ mod tests {
                 }),
             }],
             outputs: vec![OutputConfig::Rtmp(RtmpOutputConfig {
+                active: true,
+                group: None,
                 id: "rtmp-out".to_string(),
                 name: "RTMP Out".to_string(),
                 dest_url: "rtmp://live.twitch.tv/app".to_string(),
@@ -696,7 +704,7 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input_id: Some("rtp-in".to_string()),
+                input_ids: vec!["rtp-in".to_string()],
                 output_ids: vec!["rtmp-out".to_string()],
             }],
             ..Default::default()
@@ -729,6 +737,8 @@ mod tests {
         // In the new model, inputs are top-level.
         let mut config = AppConfig {
             inputs: vec![InputDefinition {
+                active: true,
+                group: None,
                 id: "srt-in".to_string(),
                 name: "SRT Input".to_string(),
                 config: InputConfig::Srt(srt_input_config(None)),
@@ -743,7 +753,7 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input_id: Some("srt-in".to_string()),
+                input_ids: vec!["srt-in".to_string()],
                 output_ids: vec![],
             }],
             ..Default::default()

@@ -12,7 +12,13 @@ pub struct FlowStats {
     pub flow_name: String,
     /// Current lifecycle state of the flow.
     pub state: FlowState,
-    /// Statistics for the flow's input leg.
+    /// ID of the currently active input, if any. When a flow has multiple
+    /// inputs configured, this identifies which one is currently publishing
+    /// to the broadcast channel. `None` when the flow has no inputs or is
+    /// idle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_input_id: Option<String>,
+    /// Statistics for the flow's active input leg.
     pub input: InputStats,
     /// Statistics for each configured output, one entry per output.
     pub outputs: Vec<OutputStats>,

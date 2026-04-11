@@ -834,6 +834,12 @@ pub struct FlowStatsAccumulator {
     /// have been bound. Absent for non-ST-2110 flows and for ST 2110 flows
     /// without a `redundancy` config (Red-only).
     pub red_blue_stats: OnceLock<Arc<crate::engine::st2110::redblue::RedBlueStats>>,
+    /// ID of the currently active input for this flow, if any. Updated by
+    /// `FlowRuntime` on startup and every `switch_active_input` call. The
+    /// snapshot path reads this into `FlowStats.active_input_id` so the
+    /// manager UI can show which input source is currently live. Empty
+    /// string = no active input (flow idle).
+    pub active_input_id: std::sync::RwLock<String>,
 }
 
 /// Lightweight input config metadata for topology display.
@@ -893,6 +899,16 @@ impl FlowStatsAccumulator {
             bandwidth_limit_mbps: OnceLock::new(),
             ptp_state: OnceLock::new(),
             red_blue_stats: OnceLock::new(),
+            active_input_id: std::sync::RwLock::new(String::new()),
+        }
+    }
+
+    /// Set or clear the currently active input ID. Called by `FlowRuntime`
+    /// during startup and on every input switch. The empty string means
+    /// "no active input" (the flow is idle).
+    pub fn set_active_input_id(&self, id: &str) {
+        if let Ok(mut guard) = self.active_input_id.write() {
+            *guard = id.to_string();
         }
     }
 
@@ -981,10 +997,16 @@ impl FlowStatsAccumulator {
         let bw_blocked = self.bandwidth_blocked.load(Ordering::Relaxed);
         let health = derive_flow_health(input_bitrate, packets_lost, &tr101290_snap, bw_exceeded, bw_blocked);
 
+        let active_input_id = self
+            .active_input_id
+            .read()
+            .ok()
+            .and_then(|g| if g.is_empty() { None } else { Some(g.clone()) });
         FlowStats {
             flow_id: self.flow_id.clone(),
             flow_name: self.flow_name.clone(),
             state: FlowState::Running,
+            active_input_id,
             input: {
                 let meta = self.input_config_meta.get();
                 InputStats {

@@ -143,6 +143,14 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/flows/{flow_id}/outputs/{output_id}",
             delete(flows::remove_output),
         )
+        .route(
+            "/api/v1/flows/{flow_id}/activate-input",
+            post(flows::activate_input),
+        )
+        .route(
+            "/api/v1/outputs/{output_id}/active",
+            post(flows::set_output_active),
+        )
         .route("/api/v1/config", put(flows::replace_config))
         .route("/api/v1/config/reload", post(flows::reload_config))
         .route("/api/v1/tunnels", post(tunnels::create_tunnel))

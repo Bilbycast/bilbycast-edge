@@ -108,27 +108,64 @@ pub async fn update_input(
         .position(|i| i.id == input_id)
         .ok_or_else(|| ApiError::NotFound(format!("Input '{input_id}' not found")))?;
 
+    // Diff the relevant fields so we can choose between a lightweight
+    // active-flip (no restart) and a full flow restart.
+    let old = config.inputs[idx].clone();
+    let active_changed = old.active != input.active;
+    let config_or_metadata_changed =
+        old.config != input.config || old.name != input.name || old.group != input.group;
+    let becoming_active = input.active && !old.active;
+
     config.inputs[idx] = input.clone();
 
-    // If a flow uses this input and is running, restart it
+    // Cascade: if this input is becoming active, passivate its siblings in
+    // the same flow.
+    if becoming_active {
+        let flow_opt = config.flow_using_input(&input_id).map(|f| f.id.clone());
+        if let Some(fid) = flow_opt {
+            let member_ids: Vec<String> = config
+                .flows
+                .iter()
+                .find(|f| f.id == fid)
+                .map(|f| f.input_ids.clone())
+                .unwrap_or_default();
+            for def in config.inputs.iter_mut() {
+                if def.id != input_id && member_ids.contains(&def.id) && def.active {
+                    def.active = false;
+                }
+            }
+        }
+    }
+
     let flow_id = config.flow_using_input(&input_id).map(|f| f.id.clone());
+
     if let Some(fid) = &flow_id {
         if state.flow_manager.is_running(fid) {
-            // Destroy and recreate the flow
-            if let Err(e) = state.flow_manager.destroy_flow(fid).await {
-                tracing::warn!("Failed to stop flow '{fid}' for input update: {e}");
-            }
-            if let Some(flow) = config.flows.iter().find(|f| f.id == *fid) {
-                if flow.enabled {
-                    match config.resolve_flow(flow) {
-                        Ok(resolved) => {
-                            match state.flow_manager.create_flow(resolved).await {
+            if config_or_metadata_changed {
+                // Full restart: input address/protocol/metadata changed,
+                // which requires respawning the protocol-specific receiver.
+                if let Err(e) = state.flow_manager.destroy_flow(fid).await {
+                    tracing::warn!("Failed to stop flow '{fid}' for input update: {e}");
+                }
+                if let Some(flow) = config.flows.iter().find(|f| f.id == *fid) {
+                    if flow.enabled {
+                        match config.resolve_flow(flow) {
+                            Ok(resolved) => match state.flow_manager.create_flow(resolved).await {
                                 Ok(_) => tracing::info!("Restarted flow '{fid}' after input update"),
                                 Err(e) => tracing::error!("Failed to restart flow '{fid}': {e}"),
-                            }
+                            },
+                            Err(e) => tracing::error!("Failed to resolve flow '{fid}': {e}"),
                         }
-                        Err(e) => tracing::error!("Failed to resolve flow '{fid}': {e}"),
                     }
+                }
+            } else if active_changed && becoming_active {
+                // Cheap path: just swap the active input watch channel.
+                if let Err(e) = state
+                    .flow_manager
+                    .switch_active_input(fid, &input_id)
+                    .await
+                {
+                    tracing::warn!("switch_active_input failed for '{fid}': {e}");
                 }
             }
         }

@@ -51,11 +51,12 @@ pub async fn gather_all_stats(state: &AppState) -> AllStatsResponse {
         .inputs
         .iter()
         .map(|inp_def| {
-            // Find the flow that references this input
+            // Find the flow that references this input (inputs are still
+            // exclusive to one flow, but a flow can hold multiple inputs).
             let assigned_flow = config
                 .flows
                 .iter()
-                .find(|f| f.input_id.as_deref() == Some(&inp_def.id));
+                .find(|f| f.input_ids.iter().any(|id| id == &inp_def.id));
 
             // If assigned, pull live stats from the flow snapshot
             let live = assigned_flow.and_then(|fc| {

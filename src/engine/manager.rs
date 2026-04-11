@@ -247,6 +247,61 @@ impl FlowManager {
         Ok(())
     }
 
+    /// Atomically switch the active input of a running flow.
+    ///
+    /// All inputs are already running (warm passive); the switch only
+    /// updates the active-input watch channel, so no task restart happens
+    /// and outputs see no discontinuity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the flow is not running or `new_input_id` is not
+    /// a member of the flow.
+    pub async fn switch_active_input(&self, flow_id: &str, new_input_id: &str) -> Result<()> {
+        let runtime = self
+            .flows
+            .get(flow_id)
+            .ok_or_else(|| anyhow::anyhow!("Flow '{}' is not running", flow_id))?;
+        runtime.switch_active_input(new_input_id).await?;
+        self.event_sender.emit_flow(
+            EventSeverity::Info,
+            "flow",
+            format!("Flow '{flow_id}': active input switched to '{new_input_id}'"),
+            flow_id,
+        );
+        Ok(())
+    }
+
+    /// Toggle an output active or passive on a running flow.
+    ///
+    /// Setting an output active spawns a fresh output task if one is not
+    /// already running; setting it passive cancels and removes the running
+    /// task while leaving the output config in place for a later re-activation.
+    pub async fn set_output_active(
+        &self,
+        flow_id: &str,
+        output_id: &str,
+        active: bool,
+    ) -> Result<()> {
+        let runtime = self
+            .flows
+            .get(flow_id)
+            .ok_or_else(|| anyhow::anyhow!("Flow '{}' is not running", flow_id))?;
+        runtime
+            .set_output_active(output_id, active, &runtime.stats)
+            .await?;
+        self.event_sender.emit_flow(
+            EventSeverity::Info,
+            "flow",
+            format!(
+                "Flow '{flow_id}': output '{output_id}' set {}",
+                if active { "active" } else { "passive" }
+            ),
+            flow_id,
+        );
+        Ok(())
+    }
+
     /// Atomically start every member flow of a flow group.
     ///
     /// Spawns each member's `FlowRuntime::start` in parallel via

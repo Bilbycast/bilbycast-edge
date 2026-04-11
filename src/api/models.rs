@@ -72,10 +72,15 @@ impl FlowSummary {
     /// from the top-level `AppConfig`. If a referenced input or output cannot
     /// be found, the summary degrades gracefully (input_type = "none", etc.).
     pub fn from_flow(flow: &FlowConfig, config: &AppConfig) -> Self {
-        // Resolve input
-        let resolved_input: Option<&InputConfig> = flow.input_id.as_deref().and_then(|iid| {
-            config.inputs.iter().find(|i| i.id == iid).map(|i| &i.config)
-        });
+        // Resolve the active input. A flow can now have multiple inputs, but
+        // the summary reflects whichever one is currently active (the single
+        // source publishing to the flow's broadcast channel).
+        let resolved_input: Option<&InputConfig> = flow
+            .input_ids
+            .iter()
+            .filter_map(|iid| config.inputs.iter().find(|i| i.id == *iid))
+            .find(|def| def.active)
+            .map(|def| &def.config);
 
         let (input_type, input_redundancy) = match resolved_input {
             Some(InputConfig::Rtp(_)) => ("rtp", false),

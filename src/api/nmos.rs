@@ -463,7 +463,7 @@ fn build_device(
     let mut senders = Vec::new();
     let mut receivers = Vec::new();
     for flow in &config.flows {
-        if flow.input_id.is_some() {
+        if !flow.input_ids.is_empty() {
             receivers.push(receiver_uuid(nid, &flow.id).to_string());
         }
         if let Ok(resolved) = config.resolve_flow(flow) {
@@ -495,7 +495,7 @@ async fn list_sources(State(state): State<AppState>) -> Json<Vec<NmosSource>> {
         .iter()
         .filter_map(|f| {
             let resolved = config.resolve_flow(f).ok()?;
-            let input = resolved.input.as_ref()?;
+            let input = &resolved.active_input()?.config;
             Some(NmosSource {
                 id: source_uuid(&nid, &f.id).to_string(),
                 version: nmos_version(),
@@ -528,8 +528,8 @@ async fn get_source(
             Ok(r) => r,
             Err(_) => continue,
         };
-        let input = match resolved.input.as_ref() {
-            Some(i) => i,
+        let input = match resolved.active_input() {
+            Some(def) => &def.config,
             None => continue,
         };
         let sid = source_uuid(&nid, &f.id);
@@ -562,7 +562,7 @@ async fn list_flows(State(state): State<AppState>) -> Json<Vec<NmosFlow>> {
         .flows
         .iter()
         .map(|f| {
-            let resolved_input = config.resolve_flow(f).ok().and_then(|r| r.input);
+            let resolved_input = config.resolve_flow(f).ok().and_then(|r| r.active_input().map(|d| d.config.clone()));
             let format = resolved_input.as_ref()
                 .map(|i| input_format(i))
                 .unwrap_or("urn:x-nmos:format:mux");
@@ -592,7 +592,7 @@ async fn get_flow(
     for f in &config.flows {
         let fid = flow_uuid(&nid, &f.id);
         if id == fid.to_string() {
-            let resolved_input = config.resolve_flow(f).ok().and_then(|r| r.input);
+            let resolved_input = config.resolve_flow(f).ok().and_then(|r| r.active_input().map(|d| d.config.clone()));
             let format = resolved_input.as_ref()
                 .map(|i| input_format(i))
                 .unwrap_or("urn:x-nmos:format:mux");
@@ -690,7 +690,7 @@ async fn list_receivers(State(state): State<AppState>) -> Json<Vec<NmosReceiver>
         .iter()
         .filter_map(|f| {
             let resolved = config.resolve_flow(f).ok()?;
-            let input = resolved.input?;
+            let input = resolved.active_input()?.config.clone();
             Some(NmosReceiver {
                 id: receiver_uuid(&nid, &f.id).to_string(),
                 version: nmos_version(),
@@ -721,8 +721,8 @@ async fn get_receiver(
             Ok(r) => r,
             Err(_) => continue,
         };
-        let input = match resolved.input {
-            Some(i) => i,
+        let input = match resolved.active_input() {
+            Some(def) => def.config.clone(),
             None => continue,
         };
         let rid = receiver_uuid(&nid, &f.id);

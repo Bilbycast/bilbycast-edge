@@ -69,6 +69,8 @@ pub fn spawn_rtp_audio_output(
     let synthesized = St2110AudioOutputConfig {
         id: config.id.clone(),
         name: config.name.clone(),
+        active: config.active,
+        group: config.group.clone(),
         dest_addr: config.dest_addr.clone(),
         bind_addr: config.bind_addr.clone(),
         interface_addr: config.interface_addr.clone(),

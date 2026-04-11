@@ -53,9 +53,10 @@ pub fn spawn_media_analyzer(
 }
 
 /// Extract transport-level information from the flow configuration.
+/// Uses the currently active input when a flow has multiple inputs.
 fn populate_transport_info(resolved: &ResolvedFlow, state: &mut MediaAnalysisState) {
-    let input = match &resolved.input {
-        Some(i) => i,
+    let input = match resolved.active_input() {
+        Some(def) => &def.config,
         None => return,
     };
     match input {

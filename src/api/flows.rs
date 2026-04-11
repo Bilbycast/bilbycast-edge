@@ -23,6 +23,22 @@ pub struct AddOutputRequest {
     pub output_id: String,
 }
 
+/// Request body for `POST /api/v1/flows/{flow_id}/activate-input` — selects
+/// which input of a multi-input flow is currently active.
+#[derive(Deserialize)]
+pub struct ActivateInputRequest {
+    /// ID of the input to activate. Must be one of the flow's `input_ids`.
+    pub input_id: String,
+}
+
+/// Request body for `POST /api/v1/outputs/{output_id}/active` — toggles an
+/// output between active (running task) and passive (persisted but not running).
+#[derive(Deserialize)]
+pub struct SetOutputActiveRequest {
+    /// New active state. `true` starts the output task, `false` stops it.
+    pub active: bool,
+}
+
 /// Register a WHIP input channel with the WebRTC session registry (if applicable).
 #[cfg(feature = "webrtc")]
 fn register_whip_if_needed(state: &AppState, runtime: &crate::engine::flow::FlowRuntime) {
@@ -620,4 +636,112 @@ pub async fn reload_config(
     let mut safe_config = new_config;
     safe_config.mask_secrets();
     Ok(Json(ApiResponse::ok(safe_config)))
+}
+
+/// `POST /api/v1/flows/{flow_id}/activate-input` — Select which input is active.
+///
+/// Atomically marks the target input `active = true` in the config, sets every
+/// other input on the same flow to `active = false`, and tells the running
+/// `FlowRuntime` to switch its active input. The actual switch is a single
+/// watch channel update — no task restart, no reconnect gap. Persists the
+/// updated config to disk.
+///
+/// # Errors
+///
+/// - `NotFound` if the flow does not exist.
+/// - `BadRequest` if `input_id` is not a member of the flow.
+pub async fn activate_input(
+    _admin: RequireAdmin,
+    State(state): State<AppState>,
+    Path(flow_id): Path<String>,
+    Json(req): Json<ActivateInputRequest>,
+) -> Result<Json<ApiResponse<FlowConfig>>, ApiError> {
+    let mut config = state.config.write().await;
+    // Locate the target flow and verify the input is a member.
+    let flow_idx = config
+        .flows
+        .iter()
+        .position(|f| f.id == flow_id)
+        .ok_or_else(|| ApiError::NotFound(format!("Flow '{}' not found", flow_id)))?;
+    if !config.flows[flow_idx].input_ids.iter().any(|id| id == &req.input_id) {
+        return Err(ApiError::BadRequest(format!(
+            "Input '{}' is not a member of flow '{}'",
+            req.input_id, flow_id
+        )));
+    }
+    // Flip active flags in config.inputs for the members of this flow.
+    let member_ids: Vec<String> = config.flows[flow_idx].input_ids.clone();
+    for def in config.inputs.iter_mut() {
+        if member_ids.contains(&def.id) {
+            def.active = def.id == req.input_id;
+        }
+    }
+    let flow_snapshot = config.flows[flow_idx].clone();
+    // Validate and persist before touching the runtime so a validation
+    // failure leaves the state unchanged.
+    validate_config(&config).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone())
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    drop(config);
+    // Apply the switch to the running flow. If the flow is not running we
+    // silently skip (the new active flag will take effect on next start).
+    if state.flow_manager.is_running(&flow_id) {
+        state
+            .flow_manager
+            .switch_active_input(&flow_id, &req.input_id)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+    }
+    Ok(Json(ApiResponse::ok(flow_snapshot)))
+}
+
+/// `POST /api/v1/outputs/{output_id}/active` — Toggle an output active/passive.
+///
+/// Persists the new active flag on the output config and, if the output is
+/// assigned to a running flow, starts or stops the output task accordingly.
+/// An output can be toggled without restarting the flow's input or any
+/// sibling outputs.
+///
+/// # Errors
+///
+/// - `NotFound` if the output does not exist.
+/// - `Internal` if the runtime toggle fails.
+pub async fn set_output_active(
+    _admin: RequireAdmin,
+    State(state): State<AppState>,
+    Path(output_id): Path<String>,
+    Json(req): Json<SetOutputActiveRequest>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let mut config = state.config.write().await;
+    // Update the output's active flag in the top-level outputs list.
+    let output = config
+        .outputs
+        .iter_mut()
+        .find(|o| o.id() == output_id)
+        .ok_or_else(|| ApiError::NotFound(format!("Output '{}' not found", output_id)))?;
+    output.set_active(req.active);
+    // Find the flow that owns this output (if any). Outputs are still
+    // exclusive to at most one flow.
+    let owning_flow_id = config
+        .flows
+        .iter()
+        .find(|f| f.output_ids.iter().any(|id| id == &output_id))
+        .map(|f| f.id.clone());
+    validate_config(&config).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone())
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    drop(config);
+    // Apply the toggle at runtime if the flow is running.
+    if let Some(flow_id) = owning_flow_id {
+        if state.flow_manager.is_running(&flow_id) {
+            state
+                .flow_manager
+                .set_output_active(&flow_id, &output_id, req.active)
+                .await
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+        }
+    }
+    Ok(Json(ApiResponse::ok(())))
 }

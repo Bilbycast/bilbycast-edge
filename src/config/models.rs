@@ -84,47 +84,76 @@ pub struct InputDefinition {
     pub id: String,
     /// Human-readable name (max 256 chars).
     pub name: String,
+    /// Whether this input is currently active. Within a flow, at most one
+    /// input may be active at a time; activating one automatically passivates
+    /// the others. All inputs run regardless of `active` (warm passive), but
+    /// only the active input publishes packets to the flow's broadcast
+    /// channel. Defaults to `true` for convenience when creating single-input
+    /// flows.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Optional free-form group tag (max 64 chars) for UI grouping and the
+    /// Phase 2 switchboard feature. Inputs with the same group can be
+    /// activated together across multiple edges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     /// The protocol-specific input configuration (flattened into the same JSON object).
     #[serde(flatten)]
     pub config: InputConfig,
 }
 
-/// A fully resolved flow — all references replaced with concrete configs.
+/// A fully resolved flow — all references replaced with concrete definitions.
 ///
-/// This is what the engine layer receives. The engine never sees `input_id` /
-/// `output_ids` references — only concrete `InputConfig` / `OutputConfig` values.
+/// This is what the engine layer receives. The engine never sees bare ID
+/// references — only concrete `InputDefinition` / `OutputConfig` values.
 #[derive(Debug, Clone)]
 pub struct ResolvedFlow {
-    /// The flow configuration (metadata only — `input_id` / `output_ids` are references).
+    /// The flow configuration (metadata only — `input_ids` / `output_ids` are references).
     pub config: FlowConfig,
-    /// The resolved input configuration (None if the flow has no input).
-    pub input: Option<InputConfig>,
-    /// The resolved output configurations.
+    /// The resolved input definitions, in the order declared on the flow.
+    /// At most one is marked `active = true`. An empty vector means the
+    /// flow has no inputs (output-only / test flow).
+    pub inputs: Vec<InputDefinition>,
+    /// The resolved output configurations (all of them, including passive).
     pub outputs: Vec<OutputConfig>,
 }
 
+impl ResolvedFlow {
+    /// Return the currently active input, if any. A flow is allowed to have
+    /// zero active inputs (idle) — the engine keeps outputs running but the
+    /// broadcast channel stays empty until an operator activates one.
+    pub fn active_input(&self) -> Option<&InputDefinition> {
+        self.inputs.iter().find(|i| i.active)
+    }
+
+    /// Iterate over the outputs that are currently marked active. Passive
+    /// outputs are skipped by the engine but remain in the flow config so
+    /// operators can toggle them on later without re-creating them.
+    pub fn active_outputs(&self) -> impl Iterator<Item = &OutputConfig> {
+        self.outputs.iter().filter(|o| o.active())
+    }
+}
+
 impl AppConfig {
-    /// Resolve a flow's `input_id` and `output_ids` references into concrete configs.
+    /// Resolve a flow's `input_ids` and `output_ids` references into concrete configs.
     ///
     /// Returns an error if any referenced input or output ID does not exist.
     pub fn resolve_flow(&self, flow: &FlowConfig) -> anyhow::Result<ResolvedFlow> {
-        let input = match &flow.input_id {
-            Some(input_id) => {
-                let def = self
-                    .inputs
-                    .iter()
-                    .find(|i| i.id == *input_id)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Flow '{}' references input '{}' which does not exist",
-                            flow.id,
-                            input_id
-                        )
-                    })?;
-                Some(def.config.clone())
-            }
-            None => None,
-        };
+        let mut inputs = Vec::with_capacity(flow.input_ids.len());
+        for input_id in &flow.input_ids {
+            let def = self
+                .inputs
+                .iter()
+                .find(|i| i.id == *input_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Flow '{}' references input '{}' which does not exist",
+                        flow.id,
+                        input_id
+                    )
+                })?;
+            inputs.push(def.clone());
+        }
 
         let mut outputs = Vec::with_capacity(flow.output_ids.len());
         for output_id in &flow.output_ids {
@@ -144,7 +173,7 @@ impl AppConfig {
 
         Ok(ResolvedFlow {
             config: flow.clone(),
-            input,
+            inputs,
             outputs,
         })
     }
@@ -153,7 +182,7 @@ impl AppConfig {
     pub fn flow_using_input(&self, input_id: &str) -> Option<&FlowConfig> {
         self.flows
             .iter()
-            .find(|f| f.input_id.as_deref() == Some(input_id))
+            .find(|f| f.input_ids.iter().any(|id| id == input_id))
     }
 
     /// Find the flow (if any) that references the given output ID.
@@ -211,11 +240,15 @@ pub struct MonitorConfig {
     pub listen_port: u16,
 }
 
-/// A Flow connects one input to one or more outputs by reference.
+/// A Flow connects one or more inputs to one or more outputs by reference.
 ///
-/// Flows contain only references (`input_id`, `output_ids`) plus flow-level
+/// Flows contain only references (`input_ids`, `output_ids`) plus flow-level
 /// metadata. The actual input and output configurations live in `AppConfig.inputs`
-/// and `AppConfig.outputs` respectively.
+/// and `AppConfig.outputs` respectively. A flow may have several inputs but at
+/// any moment at most one is active (publishing packets to the broadcast
+/// channel); activating one automatically passivates its siblings. All active
+/// outputs run in parallel; passive outputs exist in the config but have no
+/// running task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowConfig {
     /// Unique identifier for this flow
@@ -252,10 +285,12 @@ pub struct FlowConfig {
     /// monitoring. Inherits from `flow_group` if set there. Default: None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock_domain: Option<u8>,
-    /// Reference to a top-level input definition by ID. `None` when the flow
-    /// has no input (e.g., output-only flow).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_id: Option<String>,
+    /// References to top-level input definitions by ID. A flow may have
+    /// multiple inputs but at most one is active (publishing to the broadcast
+    /// channel) at a time. Empty means the flow has no inputs (output-only /
+    /// test flow).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_ids: Vec<String>,
     /// References to top-level output definitions by ID.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_ids: Vec<String>,
@@ -835,6 +870,57 @@ impl OutputConfig {
             OutputConfig::RtpAudio(_) => "rtp_audio",
         }
     }
+
+    /// Returns `true` if this output is currently marked active. Passive
+    /// outputs are persisted in config but not spawned by the engine.
+    pub fn active(&self) -> bool {
+        match self {
+            OutputConfig::Rtp(c) => c.active,
+            OutputConfig::Udp(c) => c.active,
+            OutputConfig::Srt(c) => c.active,
+            OutputConfig::Rtmp(c) => c.active,
+            OutputConfig::Hls(c) => c.active,
+            OutputConfig::Webrtc(c) => c.active,
+            OutputConfig::St2110_30(c) => c.active,
+            OutputConfig::St2110_31(c) => c.active,
+            OutputConfig::St2110_40(c) => c.active,
+            OutputConfig::RtpAudio(c) => c.active,
+        }
+    }
+
+    /// Sets the `active` flag on this output. Used by API handlers to toggle
+    /// an output between active and passive without republishing the full
+    /// output config.
+    pub fn set_active(&mut self, active: bool) {
+        match self {
+            OutputConfig::Rtp(c) => c.active = active,
+            OutputConfig::Udp(c) => c.active = active,
+            OutputConfig::Srt(c) => c.active = active,
+            OutputConfig::Rtmp(c) => c.active = active,
+            OutputConfig::Hls(c) => c.active = active,
+            OutputConfig::Webrtc(c) => c.active = active,
+            OutputConfig::St2110_30(c) => c.active = active,
+            OutputConfig::St2110_31(c) => c.active = active,
+            OutputConfig::St2110_40(c) => c.active = active,
+            OutputConfig::RtpAudio(c) => c.active = active,
+        }
+    }
+
+    /// Returns the optional free-form group tag for this output.
+    pub fn group(&self) -> Option<&str> {
+        match self {
+            OutputConfig::Rtp(c) => c.group.as_deref(),
+            OutputConfig::Udp(c) => c.group.as_deref(),
+            OutputConfig::Srt(c) => c.group.as_deref(),
+            OutputConfig::Rtmp(c) => c.group.as_deref(),
+            OutputConfig::Hls(c) => c.group.as_deref(),
+            OutputConfig::Webrtc(c) => c.group.as_deref(),
+            OutputConfig::St2110_30(c) => c.group.as_deref(),
+            OutputConfig::St2110_31(c) => c.group.as_deref(),
+            OutputConfig::St2110_40(c) => c.group.as_deref(),
+            OutputConfig::RtpAudio(c) => c.group.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -843,6 +929,15 @@ pub struct RtpOutputConfig {
     pub id: String,
     /// Human-readable name
     pub name: String,
+    /// Whether this output is currently active. Passive outputs are kept in
+    /// config but not spawned by the engine; they can be toggled on via the
+    /// API without re-creating the output. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Optional free-form group tag (max 64 chars) for UI grouping and the
+    /// Phase 2 switchboard feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     /// Destination address, e.g. "192.168.1.100:5004" or "239.1.2.1:5004"
     pub dest_addr: String,
     /// Source bind address (optional, defaults to "0.0.0.0:0")
@@ -928,6 +1023,14 @@ pub struct UdpOutputConfig {
     pub id: String,
     /// Human-readable name
     pub name: String,
+    /// Whether this output is currently active. Passive outputs are kept in
+    /// config but not spawned by the engine. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Optional free-form group tag (max 64 chars) for UI grouping and the
+    /// Phase 2 switchboard feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     /// Destination address, e.g. "192.168.1.100:5004" or "239.1.2.1:5004"
     pub dest_addr: String,
     /// Source bind address (optional, defaults to "0.0.0.0:0")
@@ -965,6 +1068,14 @@ pub struct SrtOutputConfig {
     pub id: String,
     /// Human-readable name
     pub name: String,
+    /// Whether this output is currently active. Passive outputs are kept in
+    /// config but not spawned by the engine. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Optional free-form group tag (max 64 chars) for UI grouping and the
+    /// Phase 2 switchboard feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     /// SRT connection mode
     pub mode: SrtMode,
     /// Local bind address.
@@ -1252,6 +1363,14 @@ pub struct RtmpOutputConfig {
     pub id: String,
     /// Human-readable name.
     pub name: String,
+    /// Whether this output is currently active. Passive outputs are kept in
+    /// config but not spawned by the engine. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Optional free-form group tag (max 64 chars) for UI grouping and the
+    /// Phase 2 switchboard feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     /// RTMP destination URL, e.g. "rtmp://live.twitch.tv/app" or "rtmps://a.rtmps.youtube.com/live2"
     pub dest_url: String,
     /// Stream key for authentication.
@@ -1299,6 +1418,14 @@ pub struct HlsOutputConfig {
     pub id: String,
     /// Human-readable name.
     pub name: String,
+    /// Whether this output is currently active. Passive outputs are kept in
+    /// config but not spawned by the engine. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Optional free-form group tag (max 64 chars) for UI grouping and the
+    /// Phase 2 switchboard feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     /// HLS ingest URL (base URL for segment and playlist uploads).
     pub ingest_url: String,
     /// Target segment duration in seconds (default: 2.0, range: 0.5-10.0).
@@ -1370,6 +1497,14 @@ pub struct WebrtcOutputConfig {
     pub id: String,
     /// Human-readable name.
     pub name: String,
+    /// Whether this output is currently active. Passive outputs are kept in
+    /// config but not spawned by the engine. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Optional free-form group tag (max 64 chars) for UI grouping and the
+    /// Phase 2 switchboard feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     /// Output mode: `"whip_client"` or `"whep_server"`. Default: `"whip_client"`.
     #[serde(default)]
     pub mode: WebrtcOutputMode,
@@ -1523,6 +1658,14 @@ pub struct St2110AudioOutputConfig {
     pub id: String,
     /// Human-readable name.
     pub name: String,
+    /// Whether this output is currently active. Passive outputs are kept in
+    /// config but not spawned by the engine. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Optional free-form group tag (max 64 chars) for UI grouping and the
+    /// Phase 2 switchboard feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     /// Primary (Red) destination address.
     pub dest_addr: String,
     /// Source bind address (optional, defaults to "0.0.0.0:0").
@@ -1616,6 +1759,14 @@ pub struct RtpAudioInputConfig {
 pub struct RtpAudioOutputConfig {
     pub id: String,
     pub name: String,
+    /// Whether this output is currently active. Passive outputs are kept in
+    /// config but not spawned by the engine. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Optional free-form group tag (max 64 chars) for UI grouping and the
+    /// Phase 2 switchboard feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     pub dest_addr: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_addr: Option<String>,
@@ -1677,6 +1828,14 @@ pub struct St2110AncillaryOutputConfig {
     pub id: String,
     /// Human-readable name.
     pub name: String,
+    /// Whether this output is currently active. Passive outputs are kept in
+    /// config but not spawned by the engine. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Optional free-form group tag (max 64 chars) for UI grouping and the
+    /// Phase 2 switchboard feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     /// Primary (Red) destination address.
     pub dest_addr: String,
     /// Source bind address (optional, defaults to "0.0.0.0:0").
@@ -1806,6 +1965,8 @@ mod tests {
             tunnels: Vec::new(),
             flow_groups: Vec::new(),
             inputs: vec![InputDefinition {
+                active: true,
+                group: None,
                 id: "rtp-in-1".to_string(),
                 name: "RTP Input".to_string(),
                 config: InputConfig::Rtp(RtpInputConfig {
@@ -1820,6 +1981,8 @@ mod tests {
                 }),
             }],
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
+                active: true,
+                group: None,
                 id: "rtp-out-1".to_string(),
                 name: "Output 1".to_string(),
                 dest_addr: "127.0.0.1:5004".to_string(),
@@ -1841,7 +2004,7 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input_id: Some("rtp-in-1".to_string()),
+                input_ids: vec!["rtp-in-1".to_string()],
                 output_ids: vec!["rtp-out-1".to_string()],
             }],
         };
@@ -1849,7 +2012,7 @@ mod tests {
         let parsed: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.flows.len(), 1);
         assert_eq!(parsed.flows[0].id, "test-flow");
-        assert_eq!(parsed.flows[0].input_id.as_deref(), Some("rtp-in-1"));
+        assert_eq!(parsed.flows[0].input_ids, vec!["rtp-in-1".to_string()]);
         assert_eq!(parsed.flows[0].output_ids, vec!["rtp-out-1"]);
         assert_eq!(parsed.inputs.len(), 1);
         assert_eq!(parsed.outputs.len(), 1);
@@ -1859,6 +2022,8 @@ mod tests {
     fn test_resolve_flow() {
         let config = AppConfig {
             inputs: vec![InputDefinition {
+                active: true,
+                group: None,
                 id: "in-1".to_string(),
                 name: "Input 1".to_string(),
                 config: InputConfig::Udp(UdpInputConfig {
@@ -1867,6 +2032,8 @@ mod tests {
                 }),
             }],
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
+                active: true,
+                group: None,
                 id: "out-1".to_string(),
                 name: "Output 1".to_string(),
                 dest_addr: "127.0.0.1:5004".to_string(),
@@ -1888,14 +2055,15 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input_id: Some("in-1".to_string()),
+                input_ids: vec!["in-1".to_string()],
                 output_ids: vec!["out-1".to_string()],
             }],
             ..Default::default()
         };
 
         let resolved = config.resolve_flow(&config.flows[0]).unwrap();
-        assert!(resolved.input.is_some());
+        assert_eq!(resolved.inputs.len(), 1);
+        assert!(resolved.active_input().is_some());
         assert_eq!(resolved.outputs.len(), 1);
         assert_eq!(resolved.outputs[0].id(), "out-1");
     }
@@ -1913,7 +2081,7 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input_id: Some("nonexistent".to_string()),
+                input_ids: vec!["nonexistent".to_string()],
                 output_ids: vec![],
             }],
             ..Default::default()
@@ -1950,7 +2118,7 @@ mod tests {
                 "id": "srt-flow",
                 "name": "SRT Flow",
                 "enabled": true,
-                "input_id": "srt-in",
+                "input_ids": ["srt-in"],
                 "output_ids": ["out-1"]
             }]
         }"#;
@@ -1961,7 +2129,7 @@ mod tests {
         } else {
             panic!("Expected SRT input");
         }
-        assert_eq!(config.flows[0].input_id.as_deref(), Some("srt-in"));
+        assert_eq!(config.flows[0].input_ids, vec!["srt-in".to_string()]);
     }
 
     #[test]
@@ -1987,7 +2155,7 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input_id: Some("in-1".to_string()),
+                input_ids: vec!["in-1".to_string()],
                 output_ids: vec!["out-1".to_string(), "out-2".to_string()],
             }],
             ..Default::default()

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -31,38 +31,51 @@ use super::thumbnail::spawn_thumbnail_generator;
 use super::tr101290::spawn_tr101290_analyzer;
 use crate::stats::collector::{MediaAnalysisAccumulator, ThumbnailAccumulator, Tr101290Accumulator};
 
-/// Runtime state for a single media flow (one input, N outputs).
+/// Runtime state for a single media flow (one or more inputs, N outputs).
 ///
 /// A `FlowRuntime` owns all the moving parts of a running flow:
 ///
-/// - **Input task** (`input_handle`): a Tokio task that reads packets from
-///   an RTP or SRT source and publishes them into the broadcast channel.
-/// - **Broadcast channel** (`broadcast_tx`): a Tokio `broadcast::Sender`
+/// - **Input runtimes** (`input_handles`): one [`InputRuntime`] per input
+///   assigned to the flow. All input tasks run simultaneously (warm passive),
+///   but only the currently active input's packets are forwarded onto the
+///   flow's main broadcast channel. Each input publishes to its own per-input
+///   broadcast channel; a small forwarder task drains the per-input channel
+///   and, when that input's ID matches the current `active_input_tx` value,
+///   re-publishes the packet onto `broadcast_tx`.
+/// - **Main broadcast channel** (`broadcast_tx`): a Tokio `broadcast::Sender`
 ///   that fans out every incoming packet to all subscribed outputs. The
 ///   channel is bounded to [`BROADCAST_CHANNEL_CAPACITY`] slots; slow
 ///   receivers that fall behind will receive a `Lagged` error and lose
 ///   packets rather than blocking the input.
+/// - **Active-input watch** (`active_input_tx`): a `tokio::sync::watch`
+///   channel carrying the ID of the currently active input. Switching inputs
+///   is a single `send(new_id)` — no task restart, no broadcast-channel
+///   churn, no gap from the outputs' perspective.
 /// - **Output tasks** (`output_handles`): a map of [`OutputRuntime`]
-///   instances, one per configured output destination.
+///   instances, one per active output destination. Passive outputs exist in
+///   `config.outputs` but have no running task.
 /// - **Cancellation token** (`cancel_token`): the parent token for the
-///   entire flow. Cancelling it signals both the input and every output
-///   task to shut down.
+///   entire flow. Cancelling it signals every input and output task to shut
+///   down.
 /// - **Stats accumulator** (`stats`): per-flow metrics (packets, bytes,
 ///   loss, FEC) that are periodically snapshotted by the stats subsystem.
 ///
 /// Outputs can be hot-added or removed at runtime via [`add_output`](Self::add_output)
-/// and [`remove_output`](Self::remove_output) without disturbing the input or
+/// and [`remove_output`](Self::remove_output) without disturbing the inputs or
 /// other outputs.
 pub struct FlowRuntime {
     pub config: ResolvedFlow,
-    /// The broadcast sender that the input writes into. Every output
-    /// subscribes to this sender to receive a copy of each packet.
+    /// The main broadcast sender that output tasks subscribe to. Fed by the
+    /// per-input forwarder tasks, but only while the active input gate is open.
     pub broadcast_tx: broadcast::Sender<RtpPacket>,
-    /// Tokio task handle for the input (RTP or SRT receiver).
-    /// Held for ownership — dropping a JoinHandle detaches the task.
-    /// Shutdown is driven by CancellationToken, not by aborting the handle.
-    #[allow(dead_code)]
-    pub input_handle: JoinHandle<()>,
+    /// Per-input runtime state. Each entry represents a running input task
+    /// plus its forwarder. Keyed by input ID so the map can be updated in
+    /// place when inputs are added/removed via `update_flow`.
+    pub input_handles: RwLock<HashMap<String, InputRuntime>>,
+    /// Watch channel holding the currently-active input ID. Empty string
+    /// means "no active input" (flow is idle — outputs are up but no packets
+    /// are being forwarded). Switching inputs is `active_input_tx.send(id)`.
+    pub active_input_tx: watch::Sender<String>,
     /// Output task handles, keyed by output_id. Protected by an async
     /// `RwLock` to allow concurrent reads (stats queries) and exclusive
     /// writes (hot-add / remove).
@@ -104,6 +117,34 @@ pub struct FlowRuntime {
     /// Event sender for emitting operational events to the manager.
     /// Stored so that hot-added outputs can also emit events.
     pub event_sender: EventSender,
+}
+
+/// Runtime state for a single input within a flow.
+///
+/// Each input has:
+/// - A Tokio task running the protocol-specific receiver (`input_handle`),
+///   which publishes every packet it reads onto its own per-input broadcast
+///   channel.
+/// - A forwarder task (`forwarder_handle`) that drains the per-input
+///   broadcast channel and, when the input is currently active, re-publishes
+///   packets onto the flow's main broadcast channel. When the input is
+///   passive the forwarder silently drops packets — the task still runs and
+///   updates its per-input stats so operators can see backup source health.
+/// - A child cancellation token (`cancel_token`) scoped to this input
+///   individually. Cancelling it stops just this input (and its forwarder)
+///   without disturbing sibling inputs or any outputs.
+pub struct InputRuntime {
+    /// The protocol-specific input task (rtp/srt/rtmp/... receiver).
+    /// Held for ownership — shutdown is driven via `cancel_token`.
+    #[allow(dead_code)]
+    pub input_handle: JoinHandle<()>,
+    /// The forwarder task that gates packets on the watch channel and
+    /// re-publishes them to the flow's main broadcast channel.
+    #[allow(dead_code)]
+    pub forwarder_handle: JoinHandle<()>,
+    /// Child cancellation token scoped to this input. Cancelling it stops
+    /// the input and its forwarder. Derived from the flow's parent token.
+    pub cancel_token: CancellationToken,
 }
 
 /// Runtime state for a single output within a flow.
@@ -160,7 +201,15 @@ impl FlowRuntime {
         // only needed to satisfy the channel constructor signature.
         let (broadcast_tx, _) = broadcast::channel::<RtpPacket>(BROADCAST_CHANNEL_CAPACITY);
 
-        let input_type = match &config.input {
+        // Pick the active input (if any) up front — used for stats registration,
+        // media analysis setup, and the initial value of the active-input watch.
+        let active_input_def = config.active_input();
+        let active_input_id: String = active_input_def
+            .map(|d| d.id.clone())
+            .unwrap_or_default();
+        let active_input_cfg: Option<&InputConfig> = active_input_def.map(|d| &d.config);
+
+        let input_type = match active_input_cfg {
             Some(InputConfig::Rtp(_)) => "rtp",
             Some(InputConfig::Udp(_)) => "udp",
             Some(InputConfig::Srt(_)) => "srt",
@@ -182,69 +231,22 @@ impl FlowRuntime {
             input_type.to_string(),
         );
 
-        // Populate input config metadata for topology display
-        use crate::stats::collector::InputConfigMeta;
-        if let Some(ref input) = config.input {
-            let input_meta = match input {
-                InputConfig::Rtp(c) => InputConfigMeta {
-                    mode: None, local_addr: None, remote_addr: None,
-                    listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
-                    rtsp_url: None, whep_url: None,
-                },
-                InputConfig::Udp(c) => InputConfigMeta {
-                    mode: None, local_addr: None, remote_addr: None,
-                    listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
-                    rtsp_url: None, whep_url: None,
-                },
-                InputConfig::Srt(c) => InputConfigMeta {
-                    mode: Some(format!("{:?}", c.mode).to_lowercase()),
-                    local_addr: c.local_addr.clone(),
-                    remote_addr: c.remote_addr.clone(),
-                    listen_addr: None, bind_addr: None,
-                    rtsp_url: None, whep_url: None,
-                },
-                InputConfig::Rtmp(c) => InputConfigMeta {
-                    mode: None, local_addr: None, remote_addr: None,
-                    listen_addr: Some(c.listen_addr.clone()), bind_addr: None,
-                    rtsp_url: None, whep_url: None,
-                },
-                InputConfig::Rtsp(c) => InputConfigMeta {
-                    mode: Some(format!("{:?}", c.transport).to_lowercase()),
-                    local_addr: None, remote_addr: None,
-                    listen_addr: None, bind_addr: None,
-                    rtsp_url: Some(c.rtsp_url.clone()), whep_url: None,
-                },
-                InputConfig::Webrtc(_) => InputConfigMeta {
-                    mode: Some("whip_server".to_string()), local_addr: None, remote_addr: None,
-                    listen_addr: None, bind_addr: None,
-                    rtsp_url: None, whep_url: None,
-                },
-                InputConfig::Whep(c) => InputConfigMeta {
-                    mode: Some("whep_client".to_string()), local_addr: None,
-                    remote_addr: None,
-                    listen_addr: None, bind_addr: None,
-                    rtsp_url: None, whep_url: Some(c.whep_url.clone()),
-                },
-                InputConfig::St2110_30(c) | InputConfig::St2110_31(c) => InputConfigMeta {
-                    mode: None, local_addr: None, remote_addr: None,
-                    listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
-                    rtsp_url: None, whep_url: None,
-                },
-                InputConfig::St2110_40(c) => InputConfigMeta {
-                    mode: None, local_addr: None, remote_addr: None,
-                    listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
-                    rtsp_url: None, whep_url: None,
-                },
-                InputConfig::RtpAudio(c) => InputConfigMeta {
-                    mode: None, local_addr: None, remote_addr: None,
-                    listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
-                    rtsp_url: None, whep_url: None,
-                },
-            };
+        // Watch channel carrying the currently-active input ID. All per-input
+        // forwarder tasks subscribe to this; switching inputs is a single
+        // send() that does not disturb any running task.
+        let (active_input_tx, active_input_watch_rx) = watch::channel(active_input_id.clone());
+        flow_stats.set_active_input_id(&active_input_id);
+
+        // Populate input config metadata for topology display from the
+        // currently active input. When there is no active input, we leave
+        // the stats meta empty and the UI shows "idle".
+        if let Some(input) = active_input_cfg {
+            let input_meta = build_input_config_meta(input);
             let _ = flow_stats.input_config_meta.set(input_meta);
         }
 
-        // Populate output config metadata
+        // Populate output config metadata (all outputs, active or passive —
+        // the manager UI shows passive outputs too, just with an inactive flag).
         for oc in &config.outputs {
             flow_stats.output_config_meta.insert(
                 oc.id().to_string(),
@@ -252,35 +254,43 @@ impl FlowRuntime {
             );
         }
 
-        // Start input task (if present — flows with no input are standalone
-        // output definitions that receive data when the Flow Router connects
-        // an input at runtime).
+        // Spawn every input task (warm passive). Each input publishes to its
+        // own per-input broadcast channel; a forwarder task drains it and
+        // gates on the active-input watch.
         #[cfg(feature = "webrtc")]
         let mut whip_session_info: Option<(tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>, Option<String>)> = None;
-        let input_handle = if let Some(ref input) = config.input {
-            match input {
+        let mut input_handles: HashMap<String, InputRuntime> = HashMap::new();
+        for input_def in &config.inputs {
+            let input_id = input_def.id.clone();
+            let input_cancel = cancel_token.child_token();
+            let (per_input_tx, _) = broadcast::channel::<RtpPacket>(BROADCAST_CHANNEL_CAPACITY);
+
+            #[cfg(feature = "webrtc")]
+            let mut this_whip_info: Option<(tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>, Option<String>)> = None;
+
+            let input_handle = match &input_def.config {
                 InputConfig::Rtp(rtp_config) => {
                     spawn_rtp_input(
                         rtp_config.clone(),
-                        broadcast_tx.clone(),
+                        per_input_tx.clone(),
                         flow_stats.clone(),
-                        cancel_token.child_token(),
+                        input_cancel.clone(),
                     )
                 }
                 InputConfig::Udp(udp_config) => {
                     spawn_udp_input(
                         udp_config.clone(),
-                        broadcast_tx.clone(),
+                        per_input_tx.clone(),
                         flow_stats.clone(),
-                        cancel_token.child_token(),
+                        input_cancel.clone(),
                     )
                 }
                 InputConfig::Srt(srt_config) => {
                     spawn_srt_input(
                         srt_config.clone(),
-                        broadcast_tx.clone(),
+                        per_input_tx.clone(),
                         flow_stats.clone(),
-                        cancel_token.child_token(),
+                        input_cancel.clone(),
                         event_sender.clone(),
                         config.config.id.clone(),
                     )
@@ -288,9 +298,9 @@ impl FlowRuntime {
                 InputConfig::Rtmp(rtmp_config) => {
                     spawn_rtmp_input(
                         rtmp_config.clone(),
-                        broadcast_tx.clone(),
+                        per_input_tx.clone(),
                         flow_stats.clone(),
-                        cancel_token.child_token(),
+                        input_cancel.clone(),
                         event_sender.clone(),
                         config.config.id.clone(),
                     )
@@ -298,32 +308,30 @@ impl FlowRuntime {
                 InputConfig::Rtsp(rtsp_config) => {
                     super::input_rtsp::spawn_rtsp_input(
                         rtsp_config.clone(),
-                        broadcast_tx.clone(),
+                        per_input_tx.clone(),
                         flow_stats.clone(),
-                        cancel_token.child_token(),
+                        input_cancel.clone(),
                         event_sender.clone(),
                         config.config.id.clone(),
                     )
                 }
                 #[cfg(feature = "webrtc")]
                 InputConfig::Webrtc(webrtc_config) => {
-                    // Create channel for WHIP API handler → input task communication
                     let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
-                    // Store session_tx and bearer_token for registration with WebrtcSessionRegistry
-                    whip_session_info = Some((session_tx, webrtc_config.bearer_token.clone()));
+                    this_whip_info = Some((session_tx, webrtc_config.bearer_token.clone()));
                     super::input_webrtc::spawn_whip_input(
                         webrtc_config.clone(),
                         config.config.id.clone(),
-                        broadcast_tx.clone(),
+                        per_input_tx.clone(),
                         flow_stats.clone(),
-                        cancel_token.child_token(),
+                        input_cancel.clone(),
                         session_rx,
                         event_sender.clone(),
                     )
                 }
                 #[cfg(not(feature = "webrtc"))]
                 InputConfig::Webrtc(_) => {
-                    let cancel = cancel_token.child_token();
+                    let cancel = input_cancel.clone();
                     tokio::spawn(async move {
                         tracing::warn!("WebRTC/WHIP input requires the `webrtc` cargo feature");
                         cancel.cancelled().await;
@@ -333,16 +341,16 @@ impl FlowRuntime {
                 InputConfig::Whep(whep_config) => {
                     super::input_webrtc::spawn_whep_input(
                         whep_config.clone(),
-                        broadcast_tx.clone(),
+                        per_input_tx.clone(),
                         flow_stats.clone(),
-                        cancel_token.child_token(),
+                        input_cancel.clone(),
                         event_sender.clone(),
                         config.config.id.clone(),
                     )
                 }
                 #[cfg(not(feature = "webrtc"))]
                 InputConfig::Whep(_) => {
-                    let cancel = cancel_token.child_token();
+                    let cancel = input_cancel.clone();
                     tokio::spawn(async move {
                         tracing::warn!("WHEP input requires the `webrtc` cargo feature");
                         cancel.cancelled().await;
@@ -350,17 +358,15 @@ impl FlowRuntime {
                 }
                 // The PTP clock_domain may be set on the flow itself or on the
                 // per-essence input config. The cloned local inherits the
-                // flow-level value when the essence does not override it; the
-                // stored InputConfig is untouched so update_flow's diff stays
-                // accurate.
+                // flow-level value when the essence does not override it.
                 InputConfig::St2110_30(c) => {
                     let mut c = c.clone();
                     c.clock_domain = c.clock_domain.or(config.config.clock_domain);
                     super::input_st2110_30::spawn_st2110_30_input(
                         c,
-                        broadcast_tx.clone(),
+                        per_input_tx.clone(),
                         flow_stats.clone(),
-                        cancel_token.child_token(),
+                        input_cancel.clone(),
                         event_sender.clone(),
                         config.config.id.clone(),
                     )
@@ -370,9 +376,9 @@ impl FlowRuntime {
                     c.clock_domain = c.clock_domain.or(config.config.clock_domain);
                     super::input_st2110_31::spawn_st2110_31_input(
                         c,
-                        broadcast_tx.clone(),
+                        per_input_tx.clone(),
                         flow_stats.clone(),
-                        cancel_token.child_token(),
+                        input_cancel.clone(),
                         event_sender.clone(),
                         config.config.id.clone(),
                     )
@@ -382,29 +388,59 @@ impl FlowRuntime {
                     c.clock_domain = c.clock_domain.or(config.config.clock_domain);
                     super::input_st2110_40::spawn_st2110_40_input(
                         c,
-                        broadcast_tx.clone(),
+                        per_input_tx.clone(),
                         flow_stats.clone(),
-                        cancel_token.child_token(),
+                        input_cancel.clone(),
                         event_sender.clone(),
                         config.config.id.clone(),
                     )
                 }
                 InputConfig::RtpAudio(c) => super::input_rtp_audio::spawn_rtp_audio_input(
                     c.clone(),
-                    broadcast_tx.clone(),
+                    per_input_tx.clone(),
                     flow_stats.clone(),
-                    cancel_token.child_token(),
+                    input_cancel.clone(),
                     Some(event_sender.clone()),
                     Some(config.config.id.clone()),
                 ),
+            };
+
+            // Spawn the forwarder: drains the per-input channel and forwards
+            // onto the main broadcast channel iff this input's ID matches the
+            // current value in the active-input watch.
+            let forwarder_handle = spawn_input_forwarder(
+                input_id.clone(),
+                per_input_tx.subscribe(),
+                broadcast_tx.clone(),
+                active_input_watch_rx.clone(),
+                input_cancel.clone(),
+            );
+
+            #[cfg(feature = "webrtc")]
+            {
+                if this_whip_info.is_some() {
+                    whip_session_info = this_whip_info;
+                }
             }
-        } else {
-            // No input — spawn a no-op task that waits for cancellation.
-            // The broadcast channel exists but is silent until the Flow Router
-            // connects an input.
-            let cancel = cancel_token.child_token();
-            tokio::spawn(async move { cancel.cancelled().await })
-        };
+
+            input_handles.insert(
+                input_id,
+                InputRuntime {
+                    input_handle,
+                    forwarder_handle,
+                    cancel_token: input_cancel,
+                },
+            );
+        }
+
+        // If the flow has no inputs at all, note it in the log. The broadcast
+        // channel will stay silent until inputs are added by the manager.
+        if input_handles.is_empty() {
+            tracing::debug!(
+                "Flow '{}' started with no inputs — awaiting input attachment",
+                config.config.id
+            );
+        }
 
         // Start TR-101290 analyzer (independent broadcast subscriber).
         //
@@ -418,7 +454,7 @@ impl FlowRuntime {
         // of input type; for non-TS flows it just stays at zero.
         let tr101290_acc = Arc::new(Tr101290Accumulator::new());
         flow_stats.tr101290.set(tr101290_acc.clone()).ok();
-        let analyzer_handle = if config.input.as_ref().map_or(false, |i| i.is_ts_carrier()) {
+        let analyzer_handle = if active_input_cfg.map_or(false, |i| i.is_ts_carrier()) {
             spawn_tr101290_analyzer(
                 &broadcast_tx,
                 tr101290_acc,
@@ -449,10 +485,13 @@ impl FlowRuntime {
             (None, None)
         };
 
-        // Start media analysis (if enabled and input is present)
-        let media_analysis_handle = if config.config.media_analysis && config.input.is_some() {
+        // Start media analysis (if enabled and an active input is present).
+        // Media analysis is always keyed on the currently active input —
+        // passive inputs don't reach the broadcast channel, so the analyzer
+        // would only see silence from them.
+        let media_analysis_handle = if config.config.media_analysis && active_input_cfg.is_some() {
             let (protocol, payload_format, fec_enabled, fec_type, redundancy_enabled, redundancy_type) =
-                match config.input.as_ref().unwrap() {
+                match active_input_cfg.unwrap() {
                     InputConfig::Rtp(rtp) => {
                         let (fec_en, fec_ty) = if let Some(fec) = &rtp.fec_decode {
                             (true, Some(format!("SMPTE 2022-1 (L={}, D={})", fec.columns, fec.rows)))
@@ -546,8 +585,9 @@ impl FlowRuntime {
             None
         };
 
-        // Start thumbnail generator (if enabled, ffmpeg available, and input is present)
-        let thumbnail_handle = if config.config.thumbnail && ffmpeg_available && config.input.is_some() {
+        // Start thumbnail generator (if enabled, ffmpeg available, and an
+        // active input is present)
+        let thumbnail_handle = if config.config.thumbnail && ffmpeg_available && active_input_cfg.is_some() {
             let thumb_acc = Arc::new(ThumbnailAccumulator::new());
             flow_stats.thumbnail.set(thumb_acc.clone()).ok();
             Some(spawn_thumbnail_generator(
@@ -578,19 +618,21 @@ impl FlowRuntime {
         #[cfg(feature = "webrtc")]
         let mut whep_session_info: Option<(tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>, Option<String>)> = None;
         let mut output_handles = HashMap::new();
-        // Resolve the upstream input audio format once so audio output spawn
+        // Resolve the active input's audio format once so audio output spawn
         // modules can construct an optional TranscodeStage. Returns None for
         // non-audio inputs (video, MPEG-TS, etc.) — passthrough is selected.
-        let input_audio_format = config.input.as_ref()
+        // When the flow has multiple inputs and the active one is swapped,
+        // outputs will need restarts to pick up the new format; most use
+        // cases keep a homogeneous set of inputs so passthrough stays
+        // applicable.
+        let input_audio_format = active_input_cfg
             .and_then(crate::engine::audio_transcode::InputFormat::from_input_config);
-        // Resolve once whether the upstream input is a TS-bearing source that
-        // could carry compressed audio (AAC). When true, audio output spawn
-        // modules will run an in-line TsDemuxer + AacDecoder ahead of the
-        // transcode chain so AAC contribution audio can land into PCM
-        // outputs (ST 2110-30/-31, rtp_audio, SMPTE 302M).
-        let compressed_audio_input = config.input.as_ref()
+        let compressed_audio_input = active_input_cfg
             .map_or(false, crate::engine::audio_decode::input_can_carry_ts_audio);
-        for output_config in &config.outputs {
+        // Loop over the *active* outputs only. Passive outputs are persisted
+        // in config but do not get a running task until the operator flips
+        // them active via the API.
+        for output_config in config.outputs.iter().filter(|o| o.active()) {
             // For WHEP server outputs, create the session channel so the HTTP
             // handler can forward SDP offers to the output task.
             #[cfg(feature = "webrtc")]
@@ -623,9 +665,11 @@ impl FlowRuntime {
         }
 
         tracing::info!(
-            "Flow '{}' ({}) started: {} input, {} output(s)",
+            "Flow '{}' ({}) started: {} input(s) (active: {}, type: {}), {} active output(s)",
             config.config.id,
             config.config.name,
+            input_handles.len(),
+            if active_input_id.is_empty() { "none" } else { active_input_id.as_str() },
             input_type,
             output_handles.len()
         );
@@ -633,7 +677,8 @@ impl FlowRuntime {
         Ok(Self {
             config,
             broadcast_tx,
-            input_handle,
+            input_handles: RwLock::new(input_handles),
+            active_input_tx,
             output_handles: RwLock::new(output_handles),
             cancel_token,
             stats: flow_stats,
@@ -647,6 +692,99 @@ impl FlowRuntime {
             whep_session_tx: whep_session_info,
             event_sender,
         })
+    }
+
+    /// Switch the currently active input of a running flow.
+    ///
+    /// This is a zero-task-restart operation: every input task already runs
+    /// (warm passive), so switching only requires publishing the new ID on
+    /// the `active_input_tx` watch channel. The forwarder tasks observe the
+    /// change on their next packet and flip which one forwards to the main
+    /// broadcast channel. Outputs see no discontinuity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `new_input_id` is not the ID of one of the flow's
+    /// registered inputs.
+    pub async fn switch_active_input(&self, new_input_id: &str) -> Result<()> {
+        let handles = self.input_handles.read().await;
+        if !handles.contains_key(new_input_id) {
+            bail!(
+                "Flow '{}': cannot switch to input '{}' — not a member of this flow",
+                self.config.config.id,
+                new_input_id
+            );
+        }
+        drop(handles);
+        self.active_input_tx
+            .send(new_input_id.to_string())
+            .map_err(|_| anyhow::anyhow!("active_input watch channel closed"))?;
+        self.stats.set_active_input_id(new_input_id);
+        tracing::info!(
+            "Flow '{}': switched active input to '{}'",
+            self.config.config.id,
+            new_input_id
+        );
+        Ok(())
+    }
+
+    /// Toggle an output between active (running task) and passive (no task).
+    ///
+    /// When `active = true`, a new output task is started as if the output
+    /// were being hot-added. When `active = false`, the running task is
+    /// cancelled and removed from `output_handles` — the output config
+    /// itself stays in `self.config.outputs` so it can be toggled back on
+    /// later without re-creating it.
+    pub async fn set_output_active(
+        &self,
+        output_id: &str,
+        active: bool,
+        flow_stats: &Arc<FlowStatsAccumulator>,
+    ) -> Result<()> {
+        if active {
+            // Do we already have a running task for this output?
+            {
+                let handles = self.output_handles.read().await;
+                if handles.contains_key(output_id) {
+                    return Ok(());
+                }
+            }
+            let output_cfg = self
+                .config
+                .outputs
+                .iter()
+                .find(|o| o.id() == output_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Flow '{}': output '{}' is not a member of this flow",
+                        self.config.config.id,
+                        output_id
+                    )
+                })?
+                .clone();
+            self.add_output(output_cfg, flow_stats).await
+        } else {
+            // Remove the running task if any; keep the output in config.
+            let maybe_rt = {
+                let mut handles = self.output_handles.write().await;
+                handles.remove(output_id)
+            };
+            if let Some(rt) = maybe_rt {
+                rt.cancel_token.cancel();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    rt.handle,
+                )
+                .await;
+                self.stats.unregister_output(output_id);
+                tracing::info!(
+                    "Flow '{}': output '{}' set passive",
+                    self.config.config.id,
+                    output_id
+                );
+            }
+            Ok(())
+        }
     }
 
     /// Start a single output task and return its [`OutputRuntime`] handle.
@@ -916,9 +1054,10 @@ impl FlowRuntime {
         // with WebrtcSessionRegistry through this path). WHEP outputs defined
         // at flow creation time work correctly.
 
-        let input_audio_format = self.config.input.as_ref()
+        let active_input_cfg = self.config.active_input().map(|d| &d.config);
+        let input_audio_format = active_input_cfg
             .and_then(crate::engine::audio_transcode::InputFormat::from_input_config);
-        let compressed_audio_input = self.config.input.as_ref()
+        let compressed_audio_input = active_input_cfg
             .map_or(false, crate::engine::audio_decode::input_can_carry_ts_audio);
         let output_rt = Self::start_output(
             &output_config,
@@ -999,7 +1138,118 @@ impl FlowRuntime {
         for handle in output_handles {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         }
+        // Await every input task + forwarder so their sockets are released.
+        let input_tasks: Vec<(JoinHandle<()>, JoinHandle<()>)> = {
+            let mut handles = self.input_handles.write().await;
+            handles
+                .drain()
+                .map(|(_, rt)| (rt.input_handle, rt.forwarder_handle))
+                .collect()
+        };
+        for (ih, fh) in input_tasks {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), ih).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fh).await;
+        }
     }
+}
+
+/// Build a topology-display [`InputConfigMeta`] from a concrete
+/// [`InputConfig`]. Used by `FlowRuntime::start` and by runtime updates that
+/// swap the active input without restarting the flow.
+fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::InputConfigMeta {
+    use crate::stats::collector::InputConfigMeta;
+    match input {
+        InputConfig::Rtp(c) => InputConfigMeta {
+            mode: None, local_addr: None, remote_addr: None,
+            listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
+            rtsp_url: None, whep_url: None,
+        },
+        InputConfig::Udp(c) => InputConfigMeta {
+            mode: None, local_addr: None, remote_addr: None,
+            listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
+            rtsp_url: None, whep_url: None,
+        },
+        InputConfig::Srt(c) => InputConfigMeta {
+            mode: Some(format!("{:?}", c.mode).to_lowercase()),
+            local_addr: c.local_addr.clone(),
+            remote_addr: c.remote_addr.clone(),
+            listen_addr: None, bind_addr: None,
+            rtsp_url: None, whep_url: None,
+        },
+        InputConfig::Rtmp(c) => InputConfigMeta {
+            mode: None, local_addr: None, remote_addr: None,
+            listen_addr: Some(c.listen_addr.clone()), bind_addr: None,
+            rtsp_url: None, whep_url: None,
+        },
+        InputConfig::Rtsp(c) => InputConfigMeta {
+            mode: Some(format!("{:?}", c.transport).to_lowercase()),
+            local_addr: None, remote_addr: None,
+            listen_addr: None, bind_addr: None,
+            rtsp_url: Some(c.rtsp_url.clone()), whep_url: None,
+        },
+        InputConfig::Webrtc(_) => InputConfigMeta {
+            mode: Some("whip_server".to_string()), local_addr: None, remote_addr: None,
+            listen_addr: None, bind_addr: None,
+            rtsp_url: None, whep_url: None,
+        },
+        InputConfig::Whep(c) => InputConfigMeta {
+            mode: Some("whep_client".to_string()), local_addr: None,
+            remote_addr: None,
+            listen_addr: None, bind_addr: None,
+            rtsp_url: None, whep_url: Some(c.whep_url.clone()),
+        },
+        InputConfig::St2110_30(c) | InputConfig::St2110_31(c) => InputConfigMeta {
+            mode: None, local_addr: None, remote_addr: None,
+            listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
+            rtsp_url: None, whep_url: None,
+        },
+        InputConfig::St2110_40(c) => InputConfigMeta {
+            mode: None, local_addr: None, remote_addr: None,
+            listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
+            rtsp_url: None, whep_url: None,
+        },
+        InputConfig::RtpAudio(c) => InputConfigMeta {
+            mode: None, local_addr: None, remote_addr: None,
+            listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
+            rtsp_url: None, whep_url: None,
+        },
+    }
+}
+
+/// Spawn the forwarder task for a single input. The forwarder drains the
+/// per-input broadcast channel and re-publishes packets onto the flow's main
+/// broadcast channel only while the `active_input_rx` watch value equals this
+/// input's ID. Passive inputs' packets are silently dropped — the per-input
+/// task keeps running so its stats continue to advance.
+fn spawn_input_forwarder(
+    input_id: String,
+    mut rx: broadcast::Receiver<RtpPacket>,
+    out_tx: broadcast::Sender<RtpPacket>,
+    active_input_rx: watch::Receiver<String>,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                r = rx.recv() => match r {
+                    Ok(pkt) => {
+                        // Hot-path: single atomic borrow of the watch value.
+                        if *active_input_rx.borrow() == input_id {
+                            let _ = out_tx.send(pkt);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Forwarder falling behind its per-input channel —
+                        // skip missed packets but keep the task alive.
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        }
+    })
 }
 
 /// Build topology-display metadata from an output config.

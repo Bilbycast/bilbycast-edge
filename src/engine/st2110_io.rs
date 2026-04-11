@@ -1086,6 +1086,8 @@ mod tests {
         // Spawn the output on `recv_addr` (the loopback receiver below).
         let recv_back = tokio::net::UdpSocket::bind(recv_addr).await.unwrap();
         let output_config = St2110AudioOutputConfig {
+            active: true,
+            group: None,
             id: "out1".into(),
             name: "out1".into(),
             dest_addr: recv_addr.to_string(),
@@ -1195,6 +1197,8 @@ mod tests {
 
         let recv_back = tokio::net::UdpSocket::bind(recv_addr).await.unwrap();
         let output_config = St2110AudioOutputConfig {
+            active: true,
+            group: None,
             id: "tx-out".into(),
             name: "tx-out".into(),
             dest_addr: recv_addr.to_string(),
@@ -1335,6 +1339,8 @@ mod tests {
 
         let recv_back = tokio::net::UdpSocket::bind(recv_addr).await.unwrap();
         let output_config = St2110AncillaryOutputConfig {
+            active: true,
+            group: None,
             id: "out1".into(),
             name: "out1".into(),
             dest_addr: recv_addr.to_string(),

@@ -245,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
             .flows
             .iter()
             .filter(|f| f.enabled)
-            .filter_map(|f| f.input_id.as_deref())
+            .flat_map(|f| f.input_ids.iter().map(|s| s.as_str()))
             .collect();
         standby_listeners.sync(&app_config.inputs, &assigned_input_ids);
         let standby_count = standby_listeners.snapshot().len();

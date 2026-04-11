@@ -774,8 +774,8 @@ fn edge_capabilities() -> Vec<&'static str> {
         // Phase B compressed-audio bridge: ffmpeg-sidecar audio encoder
         // on RTMP / HLS / WebRTC outputs.
         "audio-encode",
-        // Flow Router: this edge supports flows with no input (standalone
-        // output definitions connected at runtime via the manager's router).
+        // This edge supports flows with no input — standalone output
+        // definitions whose input is connected at runtime by the manager.
         "optional-input",
     ];
     if cfg!(feature = "ptp-internal") {
@@ -961,7 +961,7 @@ async fn execute_command(
             if let Some(old_flow) = old_flow {
                 if was_running && new_flow.enabled {
                     // Flow exists and should keep running — diff it
-                    let input_changed = old_flow.input_id != new_flow.input_id;
+                    let input_changed = old_flow.input_ids != new_flow.input_ids;
                     let meta_changed = old_flow.name != new_flow.name
                         || old_flow.media_analysis != new_flow.media_analysis
                         || old_flow.thumbnail != new_flow.thumbnail
@@ -1169,17 +1169,94 @@ async fn execute_command(
             let mut cfg = app_config.write().await;
             let idx = cfg.inputs.iter().position(|i| i.id == input_id)
                 .ok_or_else(|| format!("Input '{input_id}' not found"))?;
-            cfg.inputs[idx] = input;
-            // Restart any flow using this input
-            if let Some(flow) = cfg.flow_using_input(input_id).cloned() {
-                if flow.enabled && flow_manager.is_running(&flow.id) {
-                    let _ = flow_manager.destroy_flow(&flow.id).await;
-                    if let Ok(resolved) = cfg.resolve_flow(&flow) {
-                        match flow_manager.create_flow(resolved).await {
-                            Ok(_) => tracing::info!("Restarted flow '{}' after input update", flow.id),
-                            Err(e) => tracing::error!("Failed to restart flow '{}': {e}", flow.id),
+            let old = cfg.inputs[idx].clone();
+            let config_or_meta_changed =
+                old.config != input.config || old.name != input.name || old.group != input.group;
+            let becoming_active = input.active && !old.active;
+            cfg.inputs[idx] = input.clone();
+            // Cascade: if this input is becoming active, passivate siblings.
+            if becoming_active {
+                if let Some(flow) = cfg.flow_using_input(input_id).cloned() {
+                    let member_ids: Vec<String> = flow.input_ids.clone();
+                    for def in cfg.inputs.iter_mut() {
+                        if def.id != input_id && member_ids.contains(&def.id) && def.active {
+                            def.active = false;
                         }
                     }
+                }
+            }
+            if let Some(flow) = cfg.flow_using_input(input_id).cloned() {
+                if flow.enabled && flow_manager.is_running(&flow.id) {
+                    if config_or_meta_changed {
+                        // Full restart when the input's protocol config
+                        // changed — cheap active-flip path only applies to
+                        // pure active-state toggles.
+                        let _ = flow_manager.destroy_flow(&flow.id).await;
+                        if let Ok(resolved) = cfg.resolve_flow(&flow) {
+                            match flow_manager.create_flow(resolved).await {
+                                Ok(_) => tracing::info!("Restarted flow '{}' after input update", flow.id),
+                                Err(e) => tracing::error!("Failed to restart flow '{}': {e}", flow.id),
+                            }
+                        }
+                    } else if becoming_active {
+                        if let Err(e) = flow_manager.switch_active_input(&flow.id, input_id).await {
+                            tracing::warn!("switch_active_input failed for '{}': {e}", flow.id);
+                        }
+                    }
+                }
+            }
+            persist_config(&cfg, config_path, secrets_path).await;
+            Ok(None)
+        }
+        "activate_input" => {
+            let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?.to_string();
+            let input_id = action["input_id"].as_str().ok_or("Missing input_id")?.to_string();
+            tracing::info!("Manager command: activate_input '{input_id}' on flow '{flow_id}'");
+            let mut cfg = app_config.write().await;
+            let flow_idx = cfg
+                .flows
+                .iter()
+                .position(|f| f.id == flow_id)
+                .ok_or_else(|| format!("Flow '{flow_id}' not found"))?;
+            if !cfg.flows[flow_idx].input_ids.iter().any(|id| id == &input_id) {
+                return Err(format!(
+                    "Input '{input_id}' is not a member of flow '{flow_id}'"
+                ));
+            }
+            let member_ids: Vec<String> = cfg.flows[flow_idx].input_ids.clone();
+            for def in cfg.inputs.iter_mut() {
+                if member_ids.contains(&def.id) {
+                    def.active = def.id == input_id;
+                }
+            }
+            if flow_manager.is_running(&flow_id) {
+                if let Err(e) = flow_manager.switch_active_input(&flow_id, &input_id).await {
+                    tracing::warn!("switch_active_input failed for '{flow_id}': {e}");
+                }
+            }
+            persist_config(&cfg, config_path, secrets_path).await;
+            Ok(None)
+        }
+        "activate_output" => {
+            let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?.to_string();
+            let output_id = action["output_id"].as_str().ok_or("Missing output_id")?.to_string();
+            let active = action["active"].as_bool().ok_or("Missing active flag")?;
+            tracing::info!(
+                "Manager command: activate_output '{output_id}' on flow '{flow_id}' → active={active}"
+            );
+            let mut cfg = app_config.write().await;
+            let output = cfg
+                .outputs
+                .iter_mut()
+                .find(|o| o.id() == output_id)
+                .ok_or_else(|| format!("Output '{output_id}' not found"))?;
+            output.set_active(active);
+            if flow_manager.is_running(&flow_id) {
+                if let Err(e) = flow_manager
+                    .set_output_active(&flow_id, &output_id, active)
+                    .await
+                {
+                    tracing::warn!("set_output_active failed for '{flow_id}': {e}");
                 }
             }
             persist_config(&cfg, config_path, secrets_path).await;
@@ -1361,7 +1438,7 @@ async fn execute_command(
                             }
                         } else if was_running && should_run {
                             // Both running — check what changed
-                            let input_changed = old_flow.input_id != new_flow.input_id;
+                            let input_changed = old_flow.input_ids != new_flow.input_ids;
                             let meta_changed = old_flow.name != new_flow.name
                                 || old_flow.media_analysis != new_flow.media_analysis
                                 || old_flow.thumbnail != new_flow.thumbnail
@@ -1790,7 +1867,7 @@ async fn execute_command(
                 .find(|i| i.id == input_id)
                 .ok_or_else(|| format!("Input '{input_id}' not found"))?;
             // Reject if assigned to a running flow (port conflict)
-            if let Some(flow) = cfg.flows.iter().find(|f| f.input_id.as_deref() == Some(input_id)) {
+            if let Some(flow) = cfg.flows.iter().find(|f| f.input_ids.iter().any(|id| id == input_id)) {
                 if flow_manager.is_running(&flow.id) {
                     return Err(format!(
                         "Input '{input_id}' is in use by running flow '{}'",

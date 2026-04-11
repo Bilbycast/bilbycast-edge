@@ -232,6 +232,8 @@ mod tests {
             manager: None,
             resource_limits: None,
             inputs: vec![InputDefinition {
+                active: true,
+                group: None,
                 id: "in-1".to_string(),
                 name: "Input 1".to_string(),
                 config: InputConfig::Rtp(RtpInputConfig {
@@ -258,7 +260,7 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input_id: Some("in-1".to_string()),
+                input_ids: vec!["in-1".to_string()],
                 output_ids: vec![],
             }],
         };

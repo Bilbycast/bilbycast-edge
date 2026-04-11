@@ -217,13 +217,16 @@ async fn get_io(State(state): State<AppState>) -> Json<IoResponse> {
             Ok(r) => r,
             Err(_) => continue,
         };
-        // Inputs: an audio input contributes one IS-08 input.
-        if let Some(InputConfig::St2110_30(c) | InputConfig::St2110_31(c)) = &resolved.input {
-            let id = format!("st2110_30:{}", f.id);
-            inputs.insert(
-                id.clone(),
-                io_block_for_audio_input(&f.name, c),
-            );
+        // Inputs: an audio input contributes one IS-08 input. Uses the
+        // currently active input when the flow has multiple inputs.
+        if let Some(active) = resolved.active_input() {
+            if let InputConfig::St2110_30(c) | InputConfig::St2110_31(c) = &active.config {
+                let id = format!("st2110_30:{}", f.id);
+                inputs.insert(
+                    id.clone(),
+                    io_block_for_audio_input(&f.name, c),
+                );
+            }
         }
         // Outputs: each ST 2110-30/-31 output contributes one IS-08 output.
         for output in &resolved.outputs {

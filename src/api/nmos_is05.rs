@@ -453,7 +453,7 @@ fn find_receiver(
         if &rid == target {
             let resolved_input = config.resolve_flow(f)
                 .ok()
-                .and_then(|r| r.input);
+                .and_then(|r| r.active_input().map(|d| d.config.clone()));
             return Ok((f.id.clone(), resolved_input));
         }
     }
