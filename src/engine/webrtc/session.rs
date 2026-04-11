@@ -51,6 +51,11 @@ pub struct SessionConfig {
     pub bind_addr: SocketAddr,
     /// Public IP to advertise in ICE candidates (optional).
     pub public_ip: Option<std::net::IpAddr>,
+    /// Whether this session should behave as an ICE-Lite agent. Set this to
+    /// `true` for server-side roles (WHIP input, WHEP output) and `false` for
+    /// client-side roles (WHIP output, WHEP input) — str0m rejects the
+    /// handshake when both peers advertise `a=ice-lite`.
+    pub ice_lite: bool,
 }
 
 /// A WebRTC session wrapping str0m's `Rtc` state machine.
@@ -72,7 +77,7 @@ impl WebrtcSession {
         let local_addr = socket.local_addr()?;
 
         let mut rtc = Rtc::builder()
-            .set_ice_lite(true)
+            .set_ice_lite(config.ice_lite)
             .build(Instant::now());
 
         // Build the host-candidate set the answer SDP will advertise.

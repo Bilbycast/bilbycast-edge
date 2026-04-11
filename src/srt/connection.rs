@@ -22,7 +22,7 @@ use crate::stats::models::SrtLegStats;
 /// `From<&SrtRedundancyConfig>` to construct.
 pub struct SrtConnectionParams<'a> {
     pub mode: &'a SrtMode,
-    pub local_addr: &'a str,
+    pub local_addr: Option<&'a str>,
     pub remote_addr: Option<&'a str>,
     pub latency_ms: u64,
     pub recv_latency_ms: Option<u64>,
@@ -58,7 +58,7 @@ impl<'a> From<&'a SrtInputConfig> for SrtConnectionParams<'a> {
     fn from(c: &'a SrtInputConfig) -> Self {
         Self {
             mode: &c.mode,
-            local_addr: &c.local_addr,
+            local_addr: c.local_addr.as_deref(),
             remote_addr: c.remote_addr.as_deref(),
             latency_ms: c.latency_ms,
             recv_latency_ms: c.recv_latency_ms,
@@ -96,7 +96,7 @@ impl<'a> From<&'a SrtOutputConfig> for SrtConnectionParams<'a> {
     fn from(c: &'a SrtOutputConfig) -> Self {
         Self {
             mode: &c.mode,
-            local_addr: &c.local_addr,
+            local_addr: c.local_addr.as_deref(),
             remote_addr: c.remote_addr.as_deref(),
             latency_ms: c.latency_ms,
             recv_latency_ms: c.recv_latency_ms,
@@ -134,7 +134,7 @@ impl<'a> From<&'a SrtRedundancyConfig> for SrtConnectionParams<'a> {
     fn from(c: &'a SrtRedundancyConfig) -> Self {
         Self {
             mode: &c.mode,
-            local_addr: &c.local_addr,
+            local_addr: c.local_addr.as_deref(),
             remote_addr: c.remote_addr.as_deref(),
             latency_ms: c.latency_ms,
             recv_latency_ms: c.recv_latency_ms,
@@ -323,11 +323,12 @@ pub async fn connect_srt(p: &SrtConnectionParams<'_>) -> Result<Arc<SrtSocket>> 
             let remote_sa: SocketAddr = remote
                 .parse()
                 .context(format!("Invalid remote address: {remote}"))?;
-            let local_sa: SocketAddr = p.local_addr
+            let local_addr_str = p.local_addr.unwrap_or("0.0.0.0:0");
+            let local_sa: SocketAddr = local_addr_str
                 .parse()
-                .context(format!("Invalid local address: {}", p.local_addr))?;
+                .context(format!("Invalid local address: {}", local_addr_str))?;
 
-            tracing::info!("SRT caller connecting {} -> {}", p.local_addr, remote);
+            tracing::info!("SRT caller connecting {} -> {}", local_addr_str, remote);
 
             let builder = build_socket_builder(p);
             let sock = builder
@@ -340,11 +341,13 @@ pub async fn connect_srt(p: &SrtConnectionParams<'_>) -> Result<Arc<SrtSocket>> 
             Ok(Arc::new(sock))
         }
         SrtMode::Listener => {
-            let local_sa: SocketAddr = p.local_addr
+            let local_addr_str = p.local_addr
+                .ok_or_else(|| anyhow::anyhow!("Listener mode requires local_addr"))?;
+            let local_sa: SocketAddr = local_addr_str
                 .parse()
-                .context(format!("Invalid local address: {}", p.local_addr))?;
+                .context(format!("Invalid local address: {}", local_addr_str))?;
 
-            tracing::info!("SRT listener waiting on {}", p.local_addr);
+            tracing::info!("SRT listener waiting on {}", local_addr_str);
 
             let mut listener_builder = build_listener_builder(p);
 
@@ -369,17 +372,17 @@ pub async fn connect_srt(p: &SrtConnectionParams<'_>) -> Result<Arc<SrtSocket>> 
             let mut listener = listener_builder
                 .bind(local_sa)
                 .await
-                .context(format!("SRT listener bind on {} failed", p.local_addr))?;
+                .context(format!("SRT listener bind on {} failed", local_addr_str))?;
 
             let sock = listener
                 .accept()
                 .await
-                .context(format!("SRT listener accept on {} failed", p.local_addr))?;
+                .context(format!("SRT listener accept on {} failed", local_addr_str))?;
 
             // Close the listener after accepting one connection
             let _ = listener.close().await;
 
-            tracing::info!("SRT listener accepted connection on {}", p.local_addr);
+            tracing::info!("SRT listener accepted connection on {}", local_addr_str);
             Ok(Arc::new(sock))
         }
         SrtMode::Rendezvous => {
@@ -388,20 +391,22 @@ pub async fn connect_srt(p: &SrtConnectionParams<'_>) -> Result<Arc<SrtSocket>> 
             let remote_sa: SocketAddr = remote
                 .parse()
                 .context(format!("Invalid remote address: {remote}"))?;
-            let local_sa: SocketAddr = p.local_addr
+            let local_addr_str = p.local_addr
+                .ok_or_else(|| anyhow::anyhow!("Rendezvous mode requires local_addr"))?;
+            let local_sa: SocketAddr = local_addr_str
                 .parse()
-                .context(format!("Invalid local address: {}", p.local_addr))?;
+                .context(format!("Invalid local address: {}", local_addr_str))?;
 
-            tracing::info!("SRT rendezvous connecting {} <-> {}", p.local_addr, remote);
+            tracing::info!("SRT rendezvous connecting {} <-> {}", local_addr_str, remote);
 
             let builder = build_socket_builder(p);
             let sock = builder
                 .rendezvous(true)
                 .connect_rendezvous(local_sa, remote_sa)
                 .await
-                .context(format!("SRT rendezvous connect {} <-> {remote} failed", p.local_addr))?;
+                .context(format!("SRT rendezvous connect {} <-> {remote} failed", local_addr_str))?;
 
-            tracing::info!("SRT rendezvous connected {} <-> {}", p.local_addr, remote);
+            tracing::info!("SRT rendezvous connected {} <-> {}", local_addr_str, remote);
             Ok(Arc::new(sock))
         }
     }
@@ -481,9 +486,11 @@ pub async fn connect_srt_redundancy_leg(
 
 /// Bind an SRT listener without accepting any connection.
 pub async fn bind_srt_listener(p: &SrtConnectionParams<'_>) -> Result<SrtListener> {
-    let local_sa: SocketAddr = p.local_addr
+    let local_addr_str = p.local_addr
+        .ok_or_else(|| anyhow::anyhow!("Listener mode requires local_addr"))?;
+    let local_sa: SocketAddr = local_addr_str
         .parse()
-        .context(format!("Invalid local address: {}", p.local_addr))?;
+        .context(format!("Invalid local address: {}", local_addr_str))?;
 
     let mut listener_builder = build_listener_builder(p);
 
@@ -508,9 +515,9 @@ pub async fn bind_srt_listener(p: &SrtConnectionParams<'_>) -> Result<SrtListene
     let listener = listener_builder
         .bind(local_sa)
         .await
-        .context(format!("SRT listener bind on {} failed", p.local_addr))?;
+        .context(format!("SRT listener bind on {} failed", local_addr_str))?;
 
-    tracing::info!("SRT listener bound on {}", p.local_addr);
+    tracing::info!("SRT listener bound on {}", local_addr_str);
     Ok(listener)
 }
 

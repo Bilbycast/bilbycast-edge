@@ -276,32 +276,69 @@ impl TunnelManager {
         let event_sender = self.event_sender.clone();
 
         tokio::spawn(async move {
-            let result = run_direct_tunnel(
-                config_clone,
-                tunnel_id,
-                direction,
-                protocol,
-                local_addr,
-                tunnel_psk,
-                state_tx,
-                cancel.clone(),
-                udp_stats,
-                tcp_stats,
-            )
-            .await;
-
-            if let Err(e) = result {
-                if !cancel.is_cancelled() {
-                    tracing::error!(tunnel_id = %tunnel_id, "Direct tunnel failed: {e}");
-                    event_sender.emit_flow(
-                        EventSeverity::Critical,
-                        "tunnel",
-                        format!("Tunnel '{}' failed: {e}", config_name),
-                        &config_id,
-                    );
-                    // Remove from DashMap so manager re-push can re-create it
-                    tunnels.remove(&config_id);
+            // Retry the full direct-tunnel lifecycle (connect/accept + auth +
+            // forwarder) with exponential backoff. Without this, any transient
+            // failure — peer not yet reachable, QUIC timeout, forwarder drop —
+            // would strand the tunnel permanently until the manager re-pushes
+            // it. For standalone edges (no manager) that is never.
+            let mut attempt: u32 = 0;
+            let max_delay = std::time::Duration::from_secs(30);
+            loop {
+                if cancel.is_cancelled() {
+                    return;
                 }
+                let result = run_direct_tunnel(
+                    config_clone.clone(),
+                    tunnel_id,
+                    direction,
+                    protocol,
+                    local_addr,
+                    tunnel_psk.clone(),
+                    state_tx.clone(),
+                    cancel.clone(),
+                    udp_stats.clone(),
+                    tcp_stats.clone(),
+                )
+                .await;
+
+                if cancel.is_cancelled() {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        // Forwarder exited cleanly (peer closed the tunnel);
+                        // reset backoff and loop to re-establish.
+                        attempt = 0;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            tunnel_id = %tunnel_id,
+                            "Direct tunnel attempt {} failed: {e}",
+                            attempt + 1
+                        );
+                        event_sender.emit_flow(
+                            EventSeverity::Warning,
+                            "tunnel",
+                            format!("Tunnel '{}' attempt {} failed: {e}", config_name, attempt + 1),
+                            &config_id,
+                        );
+                        attempt = attempt.saturating_add(1);
+                    }
+                }
+
+                let delay = std::cmp::min(
+                    std::time::Duration::from_millis(500 * 2u64.pow(attempt.min(6))),
+                    max_delay,
+                );
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+            // Unreachable: loop exits only via cancel.
+            #[allow(unreachable_code)]
+            {
+                let _ = tunnels;
             }
         });
 

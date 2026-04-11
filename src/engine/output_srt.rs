@@ -171,7 +171,7 @@ async fn srt_output_listener_loop(
         tracing::info!(
             "SRT output '{}' connected: mode=listener local={}",
             config.id,
-            config.local_addr,
+            config.local_addr.as_deref().unwrap_or("auto"),
         );
         events.emit_flow(EventSeverity::Info, "srt", format!("SRT output '{}' connected", config.id), flow_id);
 
@@ -309,7 +309,7 @@ async fn srt_output_caller_loop(
             "SRT output '{}' connected: mode={:?} local={}",
             config.id,
             config.mode,
-            config.local_addr,
+            config.local_addr.as_deref().unwrap_or("auto"),
         );
         events.emit_flow(EventSeverity::Info, "srt", format!("SRT output '{}' connected", config.id), flow_id);
 
@@ -738,7 +738,7 @@ async fn srt_output_redundant_loop(
             "SRT output '{}' leg1 connected: mode={:?} local={}",
             config.id,
             config.mode,
-            config.local_addr
+            config.local_addr.as_deref().unwrap_or("auto")
         );
         events.emit_flow(EventSeverity::Info, "srt", format!("SRT output '{}' connected", config.id), flow_id);
 
@@ -779,7 +779,7 @@ async fn srt_output_redundant_loop(
                 "SRT output '{}' leg2 connected: mode={:?} local={}",
                 config.id,
                 redundancy.mode,
-                redundancy.local_addr
+                redundancy.local_addr.as_deref().unwrap_or("auto")
             );
         }
 

@@ -21,7 +21,7 @@ use crate::tunnel::manager::TunnelManager;
 use super::auth::{self, AuthState};
 use super::nmos_is05::Is05State;
 use super::nmos_is08::Is08State;
-use super::{flows, nmos, nmos_is05, nmos_is08, stats, tunnels, ws};
+use super::{flows, inputs, nmos, nmos_is05, nmos_is08, outputs, stats, tunnels, ws};
 
 /// Shared application state accessible from all Axum handlers via [`axum::extract::State`].
 #[derive(Clone)]
@@ -57,6 +57,8 @@ pub struct AppState {
     pub event_sender: Option<EventSender>,
     /// System resource state (CPU, RAM) for Prometheus metrics and API stats.
     pub resource_state: Arc<SystemResourceState>,
+    /// Standby listener manager for passive-type inputs not assigned to flows.
+    pub standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
 }
 
 /// Constructs the main Axum [`Router`] with all API routes, auth middleware, and layers.
@@ -95,6 +97,10 @@ pub fn build_router(state: AppState) -> Router {
     // --- Protected routes (require valid JWT when auth enabled) ---
     // Read-only routes: any authenticated role (admin or monitor)
     let read_routes = Router::new()
+        .route("/api/v1/inputs", get(inputs::list_inputs))
+        .route("/api/v1/inputs/{input_id}", get(inputs::get_input))
+        .route("/api/v1/outputs", get(outputs::list_outputs))
+        .route("/api/v1/outputs/{output_id}", get(outputs::get_output))
         .route("/api/v1/flows", get(flows::list_flows))
         .route("/api/v1/flows/{flow_id}", get(flows::get_flow))
         .route("/api/v1/stats", get(stats::all_stats))
@@ -114,6 +120,16 @@ pub fn build_router(state: AppState) -> Router {
     // Write routes: require admin role (enforced by RequireAdmin extractor in handlers,
     // middleware just validates the JWT is present and not expired)
     let write_routes = Router::new()
+        .route("/api/v1/inputs", post(inputs::create_input))
+        .route(
+            "/api/v1/inputs/{input_id}",
+            put(inputs::update_input).delete(inputs::delete_input),
+        )
+        .route("/api/v1/outputs", post(outputs::create_output))
+        .route(
+            "/api/v1/outputs/{output_id}",
+            put(outputs::update_output).delete(outputs::delete_output),
+        )
         .route("/api/v1/flows", post(flows::create_flow))
         .route(
             "/api/v1/flows/{flow_id}",

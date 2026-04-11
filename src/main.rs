@@ -152,6 +152,9 @@ async fn main() -> anyhow::Result<()> {
         resource_action,
     ));
     let tunnel_manager = Arc::new(TunnelManager::new(event_sender.clone()));
+    let standby_listeners = Arc::new(
+        engine::standby_listeners::StandbyListenerManager::new(event_sender.clone()),
+    );
 
     // Set the manager node_id on the tunnel manager so relay tunnels can identify this edge
     if let Some(ref mgr) = app_config.manager {
@@ -198,12 +201,20 @@ async fn main() -> anyhow::Result<()> {
         webrtc_sessions: Some(Arc::new(api::webrtc::registry::WebrtcSessionRegistry::new())),
         event_sender: Some(event_sender.clone()),
         resource_state: resource_state.clone(),
+        standby_listeners: Some(standby_listeners.clone()),
     };
 
     // Start all enabled flows from config
     for flow in &app_config.flows {
         if flow.enabled {
-            match flow_manager.create_flow(flow.clone()).await {
+            let resolved = match app_config.resolve_flow(flow) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("Failed to resolve flow '{}': {}", flow.id, e);
+                    continue;
+                }
+            };
+            match flow_manager.create_flow(resolved).await {
                 Ok(_runtime) => {
                     tracing::info!("Auto-started flow '{}'", flow.id);
                     // Register WHIP input channel with session registry if this is a WebRTC flow
@@ -225,6 +236,21 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(e) => tracing::error!("Failed to auto-start flow '{}': {e}", flow.id),
             }
+        }
+    }
+
+    // Initialize standby listeners for unassigned passive inputs
+    {
+        let assigned_input_ids: Vec<&str> = app_config
+            .flows
+            .iter()
+            .filter(|f| f.enabled)
+            .filter_map(|f| f.input_id.as_deref())
+            .collect();
+        standby_listeners.sync(&app_config.inputs, &assigned_input_ids);
+        let standby_count = standby_listeners.snapshot().len();
+        if standby_count > 0 {
+            tracing::info!("Started {standby_count} standby listener(s) for unassigned inputs");
         }
     }
 
@@ -323,6 +349,7 @@ async fn main() -> anyhow::Result<()> {
                 (),
                 event_rx,
                 resource_state.clone(),
+                Some(standby_listeners.clone()),
             );
         }
     }

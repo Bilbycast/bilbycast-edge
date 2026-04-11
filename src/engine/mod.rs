@@ -75,6 +75,14 @@ pub mod audio_encode;
 /// the TS muxer (which wraps the PES payload in `stream_type = 0x06`).
 pub mod audio_302m;
 
+/// Short-lived connection test tasks for validating input/output configs
+/// without requiring a running flow.
+pub mod test_connection;
+
+/// Standby listener manager for passive-type inputs that are not assigned
+/// to running flows. Keeps sockets bound so users can see connection status.
+pub mod standby_listeners;
+
 /// SMPTE ST 2110 essence-flow support (audio, ancillary, future video).
 ///
 /// Phase 1 lands the foundation in three pure-Rust submodules:

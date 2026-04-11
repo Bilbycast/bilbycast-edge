@@ -96,8 +96,8 @@ async fn whip_input_loop(
 
         tracing::info!("WHIP publisher connecting to flow '{}'", flow_id);
 
-        // Create WebRTC session
-        let session_config = SessionConfig { bind_addr, public_ip };
+        // Create WebRTC session. WHIP input is the server side — ICE-Lite.
+        let session_config = SessionConfig { bind_addr, public_ip, ice_lite: true };
         let mut session = match WebrtcSession::new(&session_config).await {
             Ok(s) => s,
             Err(e) => {
@@ -219,7 +219,8 @@ async fn whep_input_loop(
     flow_id: &str,
 ) {
     let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
-    let session_config = SessionConfig { bind_addr, public_ip: None };
+    // WHEP input is the client side — full ICE (not ICE-Lite).
+    let session_config = SessionConfig { bind_addr, public_ip: None, ice_lite: false };
 
     let mut backoff_secs = 1u64;
 

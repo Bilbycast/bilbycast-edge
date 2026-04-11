@@ -158,9 +158,13 @@ async fn whep_server_loop(
 ) {
     use super::webrtc::session::{SessionConfig, WebrtcSession};
 
-    let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
-    let public_ip = config.public_ip.as_ref().and_then(|ip| ip.parse().ok());
-    let session_config = SessionConfig { bind_addr, public_ip };
+    let public_ip: Option<std::net::IpAddr> = config.public_ip.as_ref().and_then(|ip| ip.parse().ok());
+    let bind_addr: std::net::SocketAddr = match public_ip {
+        Some(ip) => std::net::SocketAddr::new(ip, 0),
+        None => "0.0.0.0:0".parse().unwrap(),
+    };
+    // WHEP output is the server side — ICE-Lite.
+    let session_config = SessionConfig { bind_addr, public_ip, ice_lite: true };
 
     loop {
         // Wait for a viewer to connect via WHEP
@@ -464,9 +468,18 @@ async fn whip_client_loop(
         }
     };
 
-    let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
-    let public_ip = config.public_ip.as_ref().and_then(|ip| ip.parse().ok());
-    let session_config = SessionConfig { bind_addr, public_ip };
+    let public_ip: Option<std::net::IpAddr> = config.public_ip.as_ref().and_then(|ip| ip.parse().ok());
+    // When public_ip is pinned we also bind the UDP socket to that address,
+    // so the destination IP on every incoming packet matches the local ICE
+    // candidate. Without this, str0m's ICE state machine discards STUN
+    // binding requests as "unknown interface" and the connection silently
+    // fails to complete. Same fix as input_webrtc.
+    let bind_addr: std::net::SocketAddr = match public_ip {
+        Some(ip) => std::net::SocketAddr::new(ip, 0),
+        None => "0.0.0.0:0".parse().unwrap(),
+    };
+    // WHIP output is the client side — full ICE (not ICE-Lite).
+    let session_config = SessionConfig { bind_addr, public_ip, ice_lite: false };
     let mut backoff_secs = 1u64;
 
     'outer: loop {

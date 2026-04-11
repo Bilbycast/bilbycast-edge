@@ -60,6 +60,15 @@ td{padding:4px 8px;color:#c9d1d9;border-top:1px solid #21262d}
 .tunnel-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
 .tunnel-name{font-size:14px;font-weight:600;color:#f0f6fc}
 .tunnel-mode{font-size:11px;color:#8b949e;text-transform:uppercase}
+.inventory-section{padding:0 24px 16px;display:none}
+.inventory-section.visible{display:block}
+.inventory-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}
+.inv-card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px}
+.inv-card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.inv-card-name{font-size:14px;font-weight:600;color:#f0f6fc}
+.inv-card-type{font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:0.5px}
+.inv-badge-unassigned{background:rgba(139,148,158,0.15);color:#8b949e;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:600}
+.inv-badge-assigned{background:rgba(88,166,255,0.12);color:#58a6ff;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px}
 </style>
 </head>
 <body>
@@ -72,6 +81,14 @@ td{padding:4px 8px;color:#c9d1d9;border-top:1px solid #21262d}
 <div class="tunnel-section" id="tunnel-section">
   <div style="font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px;padding:0">IP Tunnels</div>
   <div class="tunnel-grid" id="tunnel-grid"></div>
+</div>
+<div class="inventory-section" id="inputs-section">
+  <div style="font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px;padding:0">Inputs</div>
+  <div class="inventory-grid" id="inputs-grid"></div>
+</div>
+<div class="inventory-section" id="outputs-section">
+  <div style="font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px;padding:0">Outputs</div>
+  <div class="inventory-grid" id="outputs-grid"></div>
 </div>
 <div class="container" id="flows"></div>
 <script>
@@ -532,6 +549,89 @@ function render_srt(srt, label) {
     '</div></div>';
 }
 
+function renderInputs(inputs) {
+  var section = document.getElementById('inputs-section');
+  if (!inputs || inputs.length === 0) {
+    section.classList.remove('visible');
+    return;
+  }
+  section.classList.add('visible');
+  var html = '';
+  for (var i = 0; i < inputs.length; i++) {
+    var inp = inputs[i];
+    var sc = inputHealthColor(inp, null);
+    var rgb = hexToRgb(sc);
+    html += '<div class="inv-card">';
+    html += '<div class="inv-card-header">';
+    html += '<span class="inv-card-name">' + esc(inp.input_name || inp.input_id) + '</span>';
+    html += '<span style="display:flex;gap:6px;align-items:center">';
+    html += '<span class="badge" style="background:rgba(' + rgb.r + ',' + rgb.g + ',' + rgb.b + ',0.15);color:' + sc + '">' + esc(inp.state || 'Unknown') + '</span>';
+    html += '<span class="inv-card-type">' + esc(inp.input_type) + '</span>';
+    html += '</span></div>';
+    if (inp.assigned_flow_name) {
+      html += '<div style="margin-bottom:6px"><span class="inv-badge-assigned" title="' + esc(inp.assigned_flow_id) + '">Flow: ' + esc(inp.assigned_flow_name) + '</span></div>';
+    } else {
+      html += '<div style="margin-bottom:6px"><span class="inv-badge-unassigned">Unassigned</span></div>';
+    }
+    html += '<div class="stats-grid">';
+    html += '<div class="stat"><div class="k">Packets</div><div class="v">' + fmt_num(inp.packets_received) + '</div></div>';
+    html += '<div class="stat"><div class="k">Bytes</div><div class="v">' + fmt_bytes(inp.bytes_received) + '</div></div>';
+    html += '<div class="stat"><div class="k">Bitrate</div><div class="v">' + fmt_bitrate(inp.bitrate_bps) + '</div></div>';
+    html += '<div class="stat"><div class="k">Lost</div><div class="v">' + fmt_num(inp.packets_lost) + '</div></div>';
+    if (inp.packets_recovered_fec) {
+      html += '<div class="stat"><div class="k">FEC Recovered</div><div class="v">' + fmt_num(inp.packets_recovered_fec) + '</div></div>';
+    }
+    if (inp.redundancy_switches) {
+      html += '<div class="stat"><div class="k">Redundancy Sw.</div><div class="v">' + fmt_num(inp.redundancy_switches) + '</div></div>';
+    }
+    html += '</div>';
+    html += render_srt(inp.srt_stats, 'SRT Leg1');
+    html += render_srt(inp.srt_leg2_stats, 'SRT Leg2');
+    html += '</div>';
+  }
+  document.getElementById('inputs-grid').innerHTML = html;
+}
+
+function renderOutputs(outputs) {
+  var section = document.getElementById('outputs-section');
+  if (!outputs || outputs.length === 0) {
+    section.classList.remove('visible');
+    return;
+  }
+  section.classList.add('visible');
+  var html = '';
+  for (var i = 0; i < outputs.length; i++) {
+    var o = outputs[i];
+    var sc = healthColor(o.state, o.packets_dropped, o.srt_stats);
+    var rgb = hexToRgb(sc);
+    html += '<div class="inv-card">';
+    html += '<div class="inv-card-header">';
+    html += '<span class="inv-card-name">' + esc(o.output_name || o.output_id) + '</span>';
+    html += '<span style="display:flex;gap:6px;align-items:center">';
+    html += '<span class="badge" style="background:rgba(' + rgb.r + ',' + rgb.g + ',' + rgb.b + ',0.15);color:' + sc + '">' + esc(o.state || 'Unknown') + '</span>';
+    html += '<span class="inv-card-type">' + esc(o.output_type) + '</span>';
+    html += '</span></div>';
+    if (o.assigned_flow_name) {
+      html += '<div style="margin-bottom:6px"><span class="inv-badge-assigned" title="' + esc(o.assigned_flow_id) + '">Flow: ' + esc(o.assigned_flow_name) + '</span></div>';
+    } else {
+      html += '<div style="margin-bottom:6px"><span class="inv-badge-unassigned">Unassigned</span></div>';
+    }
+    html += '<div class="stats-grid">';
+    html += '<div class="stat"><div class="k">Packets</div><div class="v">' + fmt_num(o.packets_sent) + '</div></div>';
+    html += '<div class="stat"><div class="k">Bytes</div><div class="v">' + fmt_bytes(o.bytes_sent) + '</div></div>';
+    html += '<div class="stat"><div class="k">Bitrate</div><div class="v">' + fmt_bitrate(o.bitrate_bps) + '</div></div>';
+    html += '<div class="stat"><div class="k">Dropped</div><div class="v">' + fmt_num(o.packets_dropped) + '</div></div>';
+    if (o.fec_packets_sent) {
+      html += '<div class="stat"><div class="k">FEC Sent</div><div class="v">' + fmt_num(o.fec_packets_sent) + '</div></div>';
+    }
+    html += '</div>';
+    html += render_srt(o.srt_stats, 'SRT Leg1');
+    html += render_srt(o.srt_leg2_stats, 'SRT Leg2');
+    html += '</div>';
+  }
+  document.getElementById('outputs-grid').innerHTML = html;
+}
+
 function render(data) {
   const sys = data.system;
   document.getElementById('version').textContent = 'v' + sys.version;
@@ -543,6 +643,9 @@ function render(data) {
   }
   sysHtml += '<div class="stat-box"><div class="label">Version</div><div class="value">' + sys.version + '</div></div>';
   document.getElementById('system-bar').innerHTML = sysHtml;
+
+  renderInputs(data.inputs || []);
+  renderOutputs(data.outputs || []);
 
   const flows = data.flows || [];
   const container = document.getElementById('flows');

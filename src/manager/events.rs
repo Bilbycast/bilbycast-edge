@@ -40,6 +40,8 @@ pub struct Event {
     pub message: String,
     pub details: Option<serde_json::Value>,
     pub flow_id: Option<String>,
+    pub input_id: Option<String>,
+    pub output_id: Option<String>,
 }
 
 /// Clonable handle for sending events from any component.
@@ -65,6 +67,8 @@ impl EventSender {
             message: message.into(),
             details: None,
             flow_id: None,
+            input_id: None,
+            output_id: None,
         });
     }
 
@@ -82,6 +86,89 @@ impl EventSender {
             message: message.into(),
             details: None,
             flow_id: Some(flow_id.to_string()),
+            input_id: None,
+            output_id: None,
+        });
+    }
+
+    /// Convenience: send an input-scoped event.
+    pub fn emit_input(
+        &self,
+        severity: EventSeverity,
+        category: &str,
+        message: impl Into<String>,
+        input_id: &str,
+    ) {
+        self.send(Event {
+            severity,
+            category: category.to_string(),
+            message: message.into(),
+            details: None,
+            flow_id: None,
+            input_id: Some(input_id.to_string()),
+            output_id: None,
+        });
+    }
+
+    /// Convenience: send an output-scoped event.
+    #[allow(dead_code)]
+    pub fn emit_output(
+        &self,
+        severity: EventSeverity,
+        category: &str,
+        message: impl Into<String>,
+        output_id: &str,
+    ) {
+        self.send(Event {
+            severity,
+            category: category.to_string(),
+            message: message.into(),
+            details: None,
+            flow_id: None,
+            input_id: None,
+            output_id: Some(output_id.to_string()),
+        });
+    }
+
+    /// Convenience: send an input-scoped event with structured details.
+    #[allow(dead_code)]
+    pub fn emit_input_with_details(
+        &self,
+        severity: EventSeverity,
+        category: &str,
+        message: impl Into<String>,
+        input_id: &str,
+        details: serde_json::Value,
+    ) {
+        self.send(Event {
+            severity,
+            category: category.to_string(),
+            message: message.into(),
+            details: Some(details),
+            flow_id: None,
+            input_id: Some(input_id.to_string()),
+            output_id: None,
+        });
+    }
+
+    /// Convenience: send an output-scoped event with structured details.
+    #[allow(dead_code)]
+    pub fn emit_output_with_details(
+        &self,
+        severity: EventSeverity,
+        category: &str,
+        message: impl Into<String>,
+        output_id: &str,
+        details: serde_json::Value,
+    ) {
+        self.send(Event {
+            severity,
+            category: category.to_string(),
+            message: message.into(),
+            details: Some(details),
+            flow_id: None,
+            input_id: None,
+            output_id: Some(output_id.to_string()),
         });
     }
 
@@ -114,6 +201,8 @@ impl EventSender {
             message: message.into(),
             details: Some(details),
             flow_id: flow_id.map(|s| s.to_string()),
+            input_id: None,
+            output_id: None,
         });
     }
 }
@@ -175,6 +264,12 @@ pub fn build_event_envelope(event: &Event) -> serde_json::Value {
     }
     if let Some(ref flow_id) = event.flow_id {
         payload["flow_id"] = serde_json::Value::String(flow_id.clone());
+    }
+    if let Some(ref input_id) = event.input_id {
+        payload["input_id"] = serde_json::Value::String(input_id.clone());
+    }
+    if let Some(ref output_id) = event.output_id {
+        payload["output_id"] = serde_json::Value::String(output_id.clone());
     }
     serde_json::json!({
         "type": "event",

@@ -26,7 +26,15 @@ pub struct AppConfig {
     /// Optional manager connection for centralized monitoring
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager: Option<crate::manager::ManagerConfig>,
-    /// List of all configured flows
+    /// Top-level input definitions. Each input is independently configurable
+    /// and can be referenced by flows via `input_id`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<InputDefinition>,
+    /// Top-level output definitions. Each output is independently configurable
+    /// and can be referenced by flows via `output_ids`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<OutputConfig>,
+    /// Flows connect one input to one or more outputs by reference.
     #[serde(default)]
     pub flows: Vec<FlowConfig>,
     /// Optional system resource monitoring thresholds (CPU, RAM).
@@ -49,18 +57,110 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             node_id: None,
             device_name: None,
             setup_enabled: true,
             server: ServerConfig::default(),
             monitor: None,
             manager: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
             resource_limits: None,
             flows: Vec::new(),
             tunnels: Vec::new(),
             flow_groups: Vec::new(),
         }
+    }
+}
+
+/// A standalone input definition, referenceable by flows.
+///
+/// Wraps an [`InputConfig`] with an ID and human-readable name so that
+/// inputs can be created, listed, and managed independently of flows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InputDefinition {
+    /// Unique identifier for this input (max 64 chars).
+    pub id: String,
+    /// Human-readable name (max 256 chars).
+    pub name: String,
+    /// The protocol-specific input configuration (flattened into the same JSON object).
+    #[serde(flatten)]
+    pub config: InputConfig,
+}
+
+/// A fully resolved flow — all references replaced with concrete configs.
+///
+/// This is what the engine layer receives. The engine never sees `input_id` /
+/// `output_ids` references — only concrete `InputConfig` / `OutputConfig` values.
+#[derive(Debug, Clone)]
+pub struct ResolvedFlow {
+    /// The flow configuration (metadata only — `input_id` / `output_ids` are references).
+    pub config: FlowConfig,
+    /// The resolved input configuration (None if the flow has no input).
+    pub input: Option<InputConfig>,
+    /// The resolved output configurations.
+    pub outputs: Vec<OutputConfig>,
+}
+
+impl AppConfig {
+    /// Resolve a flow's `input_id` and `output_ids` references into concrete configs.
+    ///
+    /// Returns an error if any referenced input or output ID does not exist.
+    pub fn resolve_flow(&self, flow: &FlowConfig) -> anyhow::Result<ResolvedFlow> {
+        let input = match &flow.input_id {
+            Some(input_id) => {
+                let def = self
+                    .inputs
+                    .iter()
+                    .find(|i| i.id == *input_id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Flow '{}' references input '{}' which does not exist",
+                            flow.id,
+                            input_id
+                        )
+                    })?;
+                Some(def.config.clone())
+            }
+            None => None,
+        };
+
+        let mut outputs = Vec::with_capacity(flow.output_ids.len());
+        for output_id in &flow.output_ids {
+            let out = self
+                .outputs
+                .iter()
+                .find(|o| o.id() == output_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Flow '{}' references output '{}' which does not exist",
+                        flow.id,
+                        output_id
+                    )
+                })?;
+            outputs.push(out.clone());
+        }
+
+        Ok(ResolvedFlow {
+            config: flow.clone(),
+            input,
+            outputs,
+        })
+    }
+
+    /// Find the flow (if any) that references the given input ID.
+    pub fn flow_using_input(&self, input_id: &str) -> Option<&FlowConfig> {
+        self.flows
+            .iter()
+            .find(|f| f.input_id.as_deref() == Some(input_id))
+    }
+
+    /// Find the flow (if any) that references the given output ID.
+    pub fn flow_using_output(&self, output_id: &str) -> Option<&FlowConfig> {
+        self.flows
+            .iter()
+            .find(|f| f.output_ids.iter().any(|id| id == output_id))
     }
 }
 
@@ -111,7 +211,11 @@ pub struct MonitorConfig {
     pub listen_port: u16,
 }
 
-/// A Flow is the unit of configuration: one input fanning out to N outputs.
+/// A Flow connects one input to one or more outputs by reference.
+///
+/// Flows contain only references (`input_id`, `output_ids`) plus flow-level
+/// metadata. The actual input and output configurations live in `AppConfig.inputs`
+/// and `AppConfig.outputs` respectively.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowConfig {
     /// Unique identifier for this flow
@@ -148,14 +252,13 @@ pub struct FlowConfig {
     /// monitoring. Inherits from `flow_group` if set there. Default: None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock_domain: Option<u8>,
-    /// The single input source for this flow. `None` when the flow contains
-    /// only outputs (e.g., standalone output definitions managed by the Flow
-    /// Router). The broadcast channel is created but silent until an input is
-    /// connected at runtime.
+    /// Reference to a top-level input definition by ID. `None` when the flow
+    /// has no input (e.g., output-only flow).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input: Option<InputConfig>,
-    /// One or more output destinations (fan-out)
-    pub outputs: Vec<OutputConfig>,
+    pub input_id: Option<String>,
+    /// References to top-level output definitions by ID.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_ids: Vec<String>,
 }
 
 /// Bandwidth limit configuration for per-flow trust boundary enforcement.
@@ -297,6 +400,23 @@ pub enum InputConfig {
 }
 
 impl InputConfig {
+    /// Returns the type name string (e.g. "srt", "rtp", "udp").
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            InputConfig::Rtp(_) => "rtp",
+            InputConfig::Udp(_) => "udp",
+            InputConfig::Srt(_) => "srt",
+            InputConfig::Rtmp(_) => "rtmp",
+            InputConfig::Rtsp(_) => "rtsp",
+            InputConfig::Webrtc(_) => "webrtc",
+            InputConfig::Whep(_) => "whep",
+            InputConfig::St2110_30(_) => "st2110_30",
+            InputConfig::St2110_31(_) => "st2110_31",
+            InputConfig::St2110_40(_) => "st2110_40",
+            InputConfig::RtpAudio(_) => "rtp_audio",
+        }
+    }
+
     /// Returns true when this input produces MPEG-TS bytes (with or without
     /// an RTP wrapper) on the broadcast channel.
     ///
@@ -371,8 +491,10 @@ pub struct UdpInputConfig {
 pub struct SrtInputConfig {
     /// SRT connection mode
     pub mode: SrtMode,
-    /// Local bind address, e.g. "0.0.0.0:9000"
-    pub local_addr: String,
+    /// Local bind address, e.g. "0.0.0.0:9000".
+    /// Required for listener/rendezvous. Optional for caller (defaults to "0.0.0.0:0").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_addr: Option<String>,
     /// Remote address (required for caller and rendezvous modes)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_addr: Option<String>,
@@ -682,6 +804,37 @@ impl OutputConfig {
         }
     }
 
+    /// Returns the human-readable name of this output.
+    pub fn name(&self) -> &str {
+        match self {
+            OutputConfig::Rtp(c) => &c.name,
+            OutputConfig::Udp(c) => &c.name,
+            OutputConfig::Srt(c) => &c.name,
+            OutputConfig::Rtmp(c) => &c.name,
+            OutputConfig::Hls(c) => &c.name,
+            OutputConfig::Webrtc(c) => &c.name,
+            OutputConfig::St2110_30(c) => &c.name,
+            OutputConfig::St2110_31(c) => &c.name,
+            OutputConfig::St2110_40(c) => &c.name,
+            OutputConfig::RtpAudio(c) => &c.name,
+        }
+    }
+
+    /// Returns the type name string (e.g. "srt", "rtp", "udp").
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            OutputConfig::Rtp(_) => "rtp",
+            OutputConfig::Udp(_) => "udp",
+            OutputConfig::Srt(_) => "srt",
+            OutputConfig::Rtmp(_) => "rtmp",
+            OutputConfig::Hls(_) => "hls",
+            OutputConfig::Webrtc(_) => "webrtc",
+            OutputConfig::St2110_30(_) => "st2110_30",
+            OutputConfig::St2110_31(_) => "st2110_31",
+            OutputConfig::St2110_40(_) => "st2110_40",
+            OutputConfig::RtpAudio(_) => "rtp_audio",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -814,8 +967,10 @@ pub struct SrtOutputConfig {
     pub name: String,
     /// SRT connection mode
     pub mode: SrtMode,
-    /// Local bind address
-    pub local_addr: String,
+    /// Local bind address.
+    /// Required for listener/rendezvous. Optional for caller (defaults to "0.0.0.0:0").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_addr: Option<String>,
     /// Remote address (required for caller and rendezvous)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_addr: Option<String>,
@@ -962,8 +1117,10 @@ pub enum SrtMode {
 pub struct SrtRedundancyConfig {
     /// SRT mode for the second leg
     pub mode: SrtMode,
-    /// Local bind address for leg 2
-    pub local_addr: String,
+    /// Local bind address for leg 2.
+    /// Required for listener/rendezvous. Optional for caller (defaults to "0.0.0.0:0").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_addr: Option<String>,
     /// Remote address for leg 2 (for caller/rendezvous)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_addr: Option<String>,
@@ -1638,7 +1795,7 @@ mod tests {
     #[test]
     fn test_roundtrip_config() {
         let config = AppConfig {
-            version: 1,
+            version: 2,
             node_id: None,
             device_name: None,
             setup_enabled: true,
@@ -1648,6 +1805,32 @@ mod tests {
             resource_limits: None,
             tunnels: Vec::new(),
             flow_groups: Vec::new(),
+            inputs: vec![InputDefinition {
+                id: "rtp-in-1".to_string(),
+                name: "RTP Input".to_string(),
+                config: InputConfig::Rtp(RtpInputConfig {
+                    bind_addr: "0.0.0.0:5000".to_string(),
+                    interface_addr: None,
+                    fec_decode: None,
+                    allowed_sources: None,
+                    allowed_payload_types: None,
+                    max_bitrate_mbps: None,
+                    tr07_mode: None,
+                    redundancy: None,
+                }),
+            }],
+            outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
+                id: "rtp-out-1".to_string(),
+                name: "Output 1".to_string(),
+                dest_addr: "127.0.0.1:5004".to_string(),
+                bind_addr: None,
+                interface_addr: None,
+                fec_encode: None,
+                dscp: default_dscp(),
+                redundancy: None,
+                program_number: None,
+                delay: None,
+            })],
             flows: vec![FlowConfig {
                 id: "test-flow".to_string(),
                 name: "Test Flow".to_string(),
@@ -1658,78 +1841,162 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input: Some(InputConfig::Rtp(RtpInputConfig {
-                    bind_addr: "0.0.0.0:5000".to_string(),
-                    interface_addr: None,
-                    fec_decode: None,
-                    allowed_sources: None,
-                    allowed_payload_types: None,
-                    max_bitrate_mbps: None,
-                    tr07_mode: None,
-                    redundancy: None,
-                })),
-                outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
-                    id: "out-1".to_string(),
-                    name: "Output 1".to_string(),
-                    dest_addr: "127.0.0.1:5004".to_string(),
-                    bind_addr: None,
-                    interface_addr: None,
-                    fec_encode: None,
-                    dscp: default_dscp(),
-                    redundancy: None,
-                    program_number: None,
-                    delay: None,
-                })],
+                input_id: Some("rtp-in-1".to_string()),
+                output_ids: vec!["rtp-out-1".to_string()],
             }],
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
         let parsed: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.flows.len(), 1);
         assert_eq!(parsed.flows[0].id, "test-flow");
+        assert_eq!(parsed.flows[0].input_id.as_deref(), Some("rtp-in-1"));
+        assert_eq!(parsed.flows[0].output_ids, vec!["rtp-out-1"]);
+        assert_eq!(parsed.inputs.len(), 1);
+        assert_eq!(parsed.outputs.len(), 1);
+    }
+
+    #[test]
+    fn test_resolve_flow() {
+        let config = AppConfig {
+            inputs: vec![InputDefinition {
+                id: "in-1".to_string(),
+                name: "Input 1".to_string(),
+                config: InputConfig::Udp(UdpInputConfig {
+                    bind_addr: "0.0.0.0:5000".to_string(),
+                    interface_addr: None,
+                }),
+            }],
+            outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
+                id: "out-1".to_string(),
+                name: "Output 1".to_string(),
+                dest_addr: "127.0.0.1:5004".to_string(),
+                bind_addr: None,
+                interface_addr: None,
+                fec_encode: None,
+                dscp: default_dscp(),
+                redundancy: None,
+                program_number: None,
+                delay: None,
+            })],
+            flows: vec![FlowConfig {
+                id: "flow-1".to_string(),
+                name: "Flow 1".to_string(),
+                enabled: true,
+                media_analysis: true,
+                thumbnail: true,
+                thumbnail_program_number: None,
+                bandwidth_limit: None,
+                flow_group_id: None,
+                clock_domain: None,
+                input_id: Some("in-1".to_string()),
+                output_ids: vec!["out-1".to_string()],
+            }],
+            ..Default::default()
+        };
+
+        let resolved = config.resolve_flow(&config.flows[0]).unwrap();
+        assert!(resolved.input.is_some());
+        assert_eq!(resolved.outputs.len(), 1);
+        assert_eq!(resolved.outputs[0].id(), "out-1");
+    }
+
+    #[test]
+    fn test_resolve_flow_missing_input() {
+        let config = AppConfig {
+            flows: vec![FlowConfig {
+                id: "flow-1".to_string(),
+                name: "Flow 1".to_string(),
+                enabled: true,
+                media_analysis: true,
+                thumbnail: true,
+                thumbnail_program_number: None,
+                bandwidth_limit: None,
+                flow_group_id: None,
+                clock_domain: None,
+                input_id: Some("nonexistent".to_string()),
+                output_ids: vec![],
+            }],
+            ..Default::default()
+        };
+
+        assert!(config.resolve_flow(&config.flows[0]).is_err());
     }
 
     #[test]
     fn test_srt_config_with_redundancy() {
         let json = r#"{
-            "version": 1,
+            "version": 2,
             "server": { "listen_addr": "0.0.0.0", "listen_port": 8080 },
+            "inputs": [{
+                "id": "srt-in",
+                "name": "SRT Redundant",
+                "type": "srt",
+                "mode": "listener",
+                "local_addr": "0.0.0.0:9000",
+                "latency_ms": 500,
+                "redundancy": {
+                    "mode": "listener",
+                    "local_addr": "0.0.0.0:9001",
+                    "latency_ms": 500
+                }
+            }],
+            "outputs": [{
+                "type": "rtp",
+                "id": "out-1",
+                "name": "Output",
+                "dest_addr": "192.168.1.50:5004"
+            }],
             "flows": [{
                 "id": "srt-flow",
                 "name": "SRT Flow",
                 "enabled": true,
-                "input": {
-                    "type": "srt",
-                    "mode": "listener",
-                    "local_addr": "0.0.0.0:9000",
-                    "latency_ms": 500,
-                    "redundancy": {
-                        "mode": "listener",
-                        "local_addr": "0.0.0.0:9001",
-                        "latency_ms": 500
-                    }
-                },
-                "outputs": [{
-                    "type": "rtp",
-                    "id": "out-1",
-                    "name": "Output",
-                    "dest_addr": "192.168.1.50:5004"
-                }]
+                "input_id": "srt-in",
+                "output_ids": ["out-1"]
             }]
         }"#;
         let config: AppConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.flows.len(), 1);
-        if let Some(InputConfig::Srt(srt)) = &config.flows[0].input {
+        assert_eq!(config.inputs.len(), 1);
+        if let InputConfig::Srt(srt) = &config.inputs[0].config {
             assert!(srt.redundancy.is_some());
         } else {
             panic!("Expected SRT input");
         }
+        assert_eq!(config.flows[0].input_id.as_deref(), Some("srt-in"));
     }
 
     #[test]
     fn test_default_config() {
         let config = AppConfig::default();
-        assert_eq!(config.version, 1);
+        assert_eq!(config.version, 2);
         assert_eq!(config.server.listen_port, 8080);
         assert!(config.flows.is_empty());
+        assert!(config.inputs.is_empty());
+        assert!(config.outputs.is_empty());
+    }
+
+    #[test]
+    fn test_flow_using_input_output() {
+        let config = AppConfig {
+            flows: vec![FlowConfig {
+                id: "f1".to_string(),
+                name: "F1".to_string(),
+                enabled: true,
+                media_analysis: true,
+                thumbnail: true,
+                thumbnail_program_number: None,
+                bandwidth_limit: None,
+                flow_group_id: None,
+                clock_domain: None,
+                input_id: Some("in-1".to_string()),
+                output_ids: vec!["out-1".to_string(), "out-2".to_string()],
+            }],
+            ..Default::default()
+        };
+
+        assert!(config.flow_using_input("in-1").is_some());
+        assert!(config.flow_using_input("in-2").is_none());
+        assert!(config.flow_using_output("out-1").is_some());
+        assert!(config.flow_using_output("out-2").is_some());
+        assert!(config.flow_using_output("out-3").is_none());
     }
 }

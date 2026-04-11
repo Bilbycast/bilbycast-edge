@@ -216,13 +216,13 @@ mod tests {
         let path = Path::new("/tmp/nonexistent_bilbycast_edge_config_test.json");
         let config = load_config(path).unwrap();
         assert!(config.flows.is_empty());
-        assert_eq!(config.version, 1);
+        assert_eq!(config.version, 2);
     }
 
     #[test]
     fn test_save_and_load_roundtrip() {
         let tmp = NamedTempFile::new().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             version: 1,
             node_id: None,
             device_name: None,
@@ -231,6 +231,21 @@ mod tests {
             monitor: None,
             manager: None,
             resource_limits: None,
+            inputs: vec![InputDefinition {
+                id: "in-1".to_string(),
+                name: "Input 1".to_string(),
+                config: InputConfig::Rtp(RtpInputConfig {
+                    bind_addr: "0.0.0.0:5000".to_string(),
+                    interface_addr: None,
+                    fec_decode: None,
+                    allowed_sources: None,
+                    allowed_payload_types: None,
+                    max_bitrate_mbps: None,
+                    tr07_mode: None,
+                    redundancy: None,
+                }),
+            }],
+            outputs: Vec::new(),
             tunnels: Vec::new(),
             flow_groups: Vec::new(),
             flows: vec![FlowConfig {
@@ -243,17 +258,8 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input: Some(InputConfig::Rtp(RtpInputConfig {
-                    bind_addr: "0.0.0.0:5000".to_string(),
-                    interface_addr: None,
-                    fec_decode: None,
-                    allowed_sources: None,
-                    allowed_payload_types: None,
-                    max_bitrate_mbps: None,
-                    tr07_mode: None,
-                    redundancy: None,
-                })),
-                outputs: vec![],
+                input_id: Some("in-1".to_string()),
+                output_ids: vec![],
             }],
         };
 

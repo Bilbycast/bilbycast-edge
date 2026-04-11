@@ -13,7 +13,9 @@
 pub mod auth;
 pub mod errors;
 pub mod flows;
+pub mod inputs;
 pub mod models;
+pub mod outputs;
 pub mod nmos;
 pub mod nmos_is05;
 pub mod nmos_is08;

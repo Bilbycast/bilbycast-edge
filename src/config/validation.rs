@@ -11,10 +11,18 @@ use super::models::*;
 /// Validates the entire application configuration.
 ///
 /// Performs the following checks:
-/// 1. **Duplicate flow IDs**: ensures no two flows share the same `id` value.
-/// 2. **Per-flow validation**: delegates to [`validate_flow`] for each flow, which
-///    checks ID/name non-emptiness, input validity, duplicate output IDs, and
-///    individual output validity.
+/// 1. **Top-level inputs**: duplicate ID detection, per-input validation via
+///    [`validate_input_definition`].
+/// 2. **Top-level outputs**: duplicate ID detection, per-output validation via
+///    [`validate_output`].
+/// 3. **Flows**: duplicate flow ID detection, per-flow metadata validation via
+///    [`validate_flow`], `input_id` / `output_ids` reference resolution against
+///    the top-level definitions, and assignment uniqueness (no input or output
+///    used by more than one flow).
+/// 4. **Upstream-aware output re-validation**: outputs whose flow has an
+///    uncompressed audio input are re-validated with the real upstream audio
+///    shape so transcode channel-map presets resolve correctly.
+/// 5. **Flow groups**: cross-references between flows and groups.
 ///
 /// # Errors
 ///
@@ -94,12 +102,92 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
         }
     }
 
+    // ── Top-level input definitions ──────────────────────────────────
+    let mut input_ids: HashSet<String> = HashSet::new();
+    for def in &config.inputs {
+        if !input_ids.insert(def.id.clone()) {
+            bail!("Duplicate top-level input ID: {}", def.id);
+        }
+        validate_input_definition(def)?;
+    }
+
+    // ── Top-level output definitions ──────────────────────────────────
+    let mut output_ids_set: HashSet<String> = HashSet::new();
+    for output in &config.outputs {
+        let oid = output.id().to_string();
+        if !output_ids_set.insert(oid.clone()) {
+            bail!("Duplicate top-level output ID: {}", oid);
+        }
+        // Determine upstream audio shape from the flow that owns this output
+        // (if any). At this stage we validate outputs standalone — transcode
+        // channel-map presets will be resolved against the output's own declared
+        // shape when no upstream is known.
+        validate_output(output)?;
+    }
+
+    // ── Flow definitions ──────────────────────────────────────────────
     let mut flow_ids: HashSet<String> = HashSet::new();
+    let mut assigned_inputs: HashSet<String> = HashSet::new();
+    let mut assigned_outputs: HashSet<String> = HashSet::new();
     for flow in &config.flows {
         if !flow_ids.insert(flow.id.clone()) {
             bail!("Duplicate flow ID: {}", flow.id);
         }
         validate_flow(flow)?;
+
+        // Validate input_id reference
+        if let Some(ref iid) = flow.input_id {
+            if !input_ids.contains(iid) {
+                bail!(
+                    "Flow '{}': input_id '{}' does not reference a defined top-level input",
+                    flow.id, iid
+                );
+            }
+            if !assigned_inputs.insert(iid.clone()) {
+                bail!(
+                    "Flow '{}': input '{}' is already assigned to another flow",
+                    flow.id, iid
+                );
+            }
+        }
+
+        // Validate output_ids references
+        let mut flow_output_ids = HashSet::new();
+        for oid in &flow.output_ids {
+            if !flow_output_ids.insert(oid.clone()) {
+                bail!("Flow '{}': duplicate output_id reference '{}'", flow.id, oid);
+            }
+            if !output_ids_set.contains(oid) {
+                bail!(
+                    "Flow '{}': output_id '{}' does not reference a defined top-level output",
+                    flow.id, oid
+                );
+            }
+            if !assigned_outputs.insert(oid.clone()) {
+                bail!(
+                    "Flow '{}': output '{}' is already assigned to another flow",
+                    flow.id, oid
+                );
+            }
+        }
+    }
+
+    // ── Upstream-aware output validation ──────────────────────────────
+    // Now that we know which input feeds each output (via flows), re-validate
+    // outputs that have transcode blocks with the real upstream audio shape
+    // so channel-map presets resolve against the actual input channel count.
+    for flow in &config.flows {
+        let upstream_audio = flow.input_id.as_ref().and_then(|iid| {
+            config.inputs.iter().find(|d| d.id == *iid)
+                .and_then(|d| upstream_audio_shape(&d.config))
+        });
+        if upstream_audio.is_some() {
+            for oid in &flow.output_ids {
+                if let Some(output) = config.outputs.iter().find(|o| o.id() == oid) {
+                    validate_output_with_input(output, upstream_audio)?;
+                }
+            }
+        }
     }
 
     // Validate ST 2110 flow groups (essence bundles).
@@ -131,16 +219,17 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-/// Validates a single flow configuration.
+/// Validates a single flow configuration (metadata only).
 ///
 /// Performs the following checks in order:
-/// 1. **Non-empty ID**: the flow `id` must not be an empty string.
-/// 2. **Non-empty name**: the flow `name` must not be an empty string.
-/// 3. **Input validation**: delegates to `validate_input` to check the input
-///    source configuration (bind addresses, SRT mode requirements, FEC params, etc.).
-/// 4. **Duplicate output IDs**: ensures no two outputs within this flow share the
-///    same `id` value.
-/// 5. **Per-output validation**: delegates to `validate_output` for each output.
+/// 1. **Non-empty ID**: the flow `id` must not be an empty string (max 64 chars).
+/// 2. **Non-empty name**: the flow `name` must not be an empty string (max 256 chars).
+/// 3. **`input_id` / `output_ids` format**: validates string length constraints.
+/// 4. **Metadata**: thumbnail_program_number, flow_group_id, clock_domain,
+///    bandwidth_limit.
+///
+/// Input/output existence and assignment uniqueness are validated at the
+/// config level in [`validate_config`].
 ///
 /// # Errors
 ///
@@ -176,6 +265,26 @@ pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
     }
     validate_clock_domain(flow.clock_domain, &format!("Flow '{}'", flow.id))?;
 
+    // Validate input_id reference format (length only — existence checked in validate_config)
+    if let Some(ref iid) = flow.input_id {
+        if iid.is_empty() {
+            bail!("Flow '{}': input_id must not be an empty string", flow.id);
+        }
+        if iid.len() > 64 {
+            bail!("Flow '{}': input_id must be at most 64 characters", flow.id);
+        }
+    }
+
+    // Validate output_ids reference format
+    for oid in &flow.output_ids {
+        if oid.is_empty() {
+            bail!("Flow '{}': output_ids must not contain empty strings", flow.id);
+        }
+        if oid.len() > 64 {
+            bail!("Flow '{}': output_id '{}' must be at most 64 characters", flow.id, oid);
+        }
+    }
+
     // Validate bandwidth limit if configured
     if let Some(ref bw) = flow.bandwidth_limit {
         if bw.max_bitrate_mbps <= 0.0 {
@@ -204,28 +313,9 @@ pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
         }
     }
 
-    if let Some(ref input) = flow.input {
-        validate_input(input)?;
-    }
-
-    // If the flow's input is itself an uncompressed audio source we can pass
-    // its (sample_rate, bit_depth, channels) shape down to per-output
-    // transcode validation so that channel-map presets and matrix rules are
-    // checked against the *actual* upstream channel count, not the output's
-    // own placeholder. For non-audio inputs (RTMP/RTSP/UDP/SRT carrying TS,
-    // etc.) the audio_decode bridge runs at runtime and the upstream shape
-    // isn't statically known here — None falls back to the output's own
-    // declared shape, matching the legacy placeholder behaviour.
-    let upstream_audio = flow.input.as_ref().and_then(upstream_audio_shape);
-
-    let mut output_ids = HashSet::new();
-    for output in &flow.outputs {
-        let oid = output.id();
-        if !output_ids.insert(oid.to_string()) {
-            bail!("Duplicate output ID '{}' in flow '{}'", oid, flow.id);
-        }
-        validate_output_with_input(output, upstream_audio)?;
-    }
+    // Note: input/output validation is done at the top level in validate_config()
+    // since inputs and outputs are now independent top-level definitions referenced
+    // by flows via input_id / output_ids.
 
     Ok(())
 }
@@ -242,6 +332,27 @@ fn upstream_audio_shape(input: &InputConfig) -> Option<(u32, u8, u8)> {
         InputConfig::RtpAudio(c) => Some((c.sample_rate, c.bit_depth, c.channels)),
         _ => None,
     }
+}
+
+/// Validates a top-level input definition.
+///
+/// Checks that `id` and `name` are non-empty and within length limits, then
+/// delegates to [`validate_input`] for protocol-specific validation.
+pub fn validate_input_definition(def: &InputDefinition) -> Result<()> {
+    if def.id.is_empty() {
+        bail!("Input definition ID cannot be empty");
+    }
+    if def.id.len() > 64 {
+        bail!("Input definition ID must be at most 64 characters");
+    }
+    if def.name.is_empty() {
+        bail!("Input definition name cannot be empty");
+    }
+    if def.name.len() > 256 {
+        bail!("Input definition name must be at most 256 characters");
+    }
+    validate_input(&def.config)?;
+    Ok(())
 }
 
 /// Validates the input source configuration for a flow.
@@ -326,7 +437,18 @@ fn validate_input(input: &InputConfig) -> Result<()> {
             }
         }
         InputConfig::Srt(srt) => {
-            validate_socket_addr(&srt.local_addr, "SRT input local_addr")?;
+            match srt.mode {
+                SrtMode::Listener | SrtMode::Rendezvous => {
+                    let addr = srt.local_addr.as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("SRT input local_addr is required for {:?} mode", srt.mode))?;
+                    validate_socket_addr(addr, "SRT input local_addr")?;
+                }
+                SrtMode::Caller => {
+                    if let Some(ref addr) = srt.local_addr {
+                        validate_socket_addr(addr, "SRT input local_addr")?;
+                    }
+                }
+            }
             validate_srt_common(
                 &srt.mode, &srt.remote_addr,
                 srt.passphrase.as_deref(), srt.aes_key_len, srt.crypto_mode.as_deref(),
@@ -1037,7 +1159,18 @@ pub fn validate_output_with_input(
             validate_id(&srt.id, "SRT output")?;
             validate_name(&srt.name, "SRT output")?;
             validate_program_number(srt.program_number, &format!("SRT output '{}'", srt.id))?;
-            validate_socket_addr(&srt.local_addr, "SRT output local_addr")?;
+            match srt.mode {
+                SrtMode::Listener | SrtMode::Rendezvous => {
+                    let addr = srt.local_addr.as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("SRT output local_addr is required for {:?} mode", srt.mode))?;
+                    validate_socket_addr(addr, "SRT output local_addr")?;
+                }
+                SrtMode::Caller => {
+                    if let Some(ref addr) = srt.local_addr {
+                        validate_socket_addr(addr, "SRT output local_addr")?;
+                    }
+                }
+            }
             validate_srt_common(
                 &srt.mode, &srt.remote_addr,
                 srt.passphrase.as_deref(), srt.aes_key_len, srt.crypto_mode.as_deref(),
@@ -1379,7 +1512,18 @@ fn validate_srt_common(
 }
 
 fn validate_srt_redundancy(red: &SrtRedundancyConfig, context: &str) -> Result<()> {
-    validate_socket_addr(&red.local_addr, &format!("{context} redundancy local_addr"))?;
+    match red.mode {
+        SrtMode::Listener | SrtMode::Rendezvous => {
+            let addr = red.local_addr.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("{context} redundancy local_addr is required for {:?} mode", red.mode))?;
+            validate_socket_addr(addr, &format!("{context} redundancy local_addr"))?;
+        }
+        SrtMode::Caller => {
+            if let Some(ref addr) = red.local_addr {
+                validate_socket_addr(addr, &format!("{context} redundancy local_addr"))?;
+            }
+        }
+    }
     validate_srt_common(
         &red.mode, &red.remote_addr,
         red.passphrase.as_deref(), red.aes_key_len, red.crypto_mode.as_deref(),
@@ -1564,9 +1708,40 @@ pub fn validate_tunnel(tunnel: &crate::tunnel::TunnelConfig) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_valid_rtp_flow() {
-        let flow = FlowConfig {
+    /// Helper: build a minimal valid AppConfig with one flow referencing one
+    /// top-level input and one top-level output.
+    fn make_config_with_rtp(
+        input_bind: &str,
+        output_dest: &str,
+    ) -> AppConfig {
+        let mut config = AppConfig::default();
+        config.inputs.push(InputDefinition {
+            id: "in-1".to_string(),
+            name: "Input 1".to_string(),
+            config: InputConfig::Rtp(RtpInputConfig {
+                bind_addr: input_bind.to_string(),
+                interface_addr: None,
+                fec_decode: None,
+                allowed_sources: None,
+                allowed_payload_types: None,
+                max_bitrate_mbps: None,
+                tr07_mode: None,
+                redundancy: None,
+            }),
+        });
+        config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
+            id: "out-1".to_string(),
+            name: "Out 1".to_string(),
+            dest_addr: output_dest.to_string(),
+            bind_addr: None,
+            interface_addr: None,
+            fec_encode: None,
+            dscp: 46,
+            redundancy: None,
+            program_number: None,
+            delay: None,
+        }));
+        config.flows.push(FlowConfig {
             id: "f1".to_string(),
             name: "Flow 1".to_string(),
             enabled: true,
@@ -1576,7 +1751,92 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
-            input: Some(InputConfig::Rtp(RtpInputConfig {
+            input_id: Some("in-1".to_string()),
+            output_ids: vec!["out-1".to_string()],
+        });
+        config
+    }
+
+    /// Helper: build an AppConfig with a single RTP input (no output) in a flow.
+    fn make_config_input_only(input_config: InputConfig) -> AppConfig {
+        let mut config = AppConfig::default();
+        config.inputs.push(InputDefinition {
+            id: "in-1".to_string(),
+            name: "Input 1".to_string(),
+            config: input_config,
+        });
+        config.flows.push(FlowConfig {
+            id: "f1".to_string(),
+            name: "Flow 1".to_string(),
+            enabled: true,
+            media_analysis: true,
+            thumbnail: true,
+            thumbnail_program_number: None,
+            bandwidth_limit: None,
+            flow_group_id: None,
+            clock_domain: None,
+            input_id: Some("in-1".to_string()),
+            output_ids: vec![],
+        });
+        config
+    }
+
+    #[test]
+    fn test_valid_rtp_flow() {
+        let config = make_config_with_rtp("0.0.0.0:5000", "127.0.0.1:5004");
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_invalid_bind_addr() {
+        let config = make_config_input_only(InputConfig::Rtp(RtpInputConfig {
+            bind_addr: "not-an-address".to_string(),
+            interface_addr: None,
+            fec_decode: None,
+            allowed_sources: None,
+            allowed_payload_types: None,
+            max_bitrate_mbps: None,
+            tr07_mode: None,
+            redundancy: None,
+        }));
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_srt_caller_missing_remote() {
+        let config = make_config_input_only(InputConfig::Srt(SrtInputConfig {
+            mode: SrtMode::Caller,
+            local_addr: Some("0.0.0.0:9000".to_string()),
+            remote_addr: None,
+            latency_ms: 120,
+            peer_idle_timeout_secs: 30,
+            recv_latency_ms: None,
+            peer_latency_ms: None,
+            passphrase: None,
+            aes_key_len: None,
+            crypto_mode: None,
+            max_rexmit_bw: None,
+            stream_id: None,
+            packet_filter: None,
+            max_bw: None, input_bw: None, overhead_bw: None,
+            enforced_encryption: None, connect_timeout_secs: None,
+            flight_flag_size: None, send_buffer_size: None, recv_buffer_size: None,
+            ip_tos: None, retransmit_algo: None, send_drop_delay: None,
+            loss_max_ttl: None, km_refresh_rate: None, km_pre_announce: None,
+            payload_size: None, mss: None, tlpkt_drop: None, ip_ttl: None,
+            redundancy: None,
+            transport_mode: None,
+        }));
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_duplicate_flow_ids() {
+        let mut config = AppConfig::default();
+        config.inputs.push(InputDefinition {
+            id: "in-1".to_string(),
+            name: "Input 1".to_string(),
+            config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,
                 fec_decode: None,
@@ -1585,37 +1845,13 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
-            })),
-            outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
-                id: "out-1".to_string(),
-                name: "Out 1".to_string(),
-                dest_addr: "127.0.0.1:5004".to_string(),
-                bind_addr: None,
-                interface_addr: None,
-                fec_encode: None,
-                dscp: 46,
-                redundancy: None,
-                program_number: None,
-            delay: None,
-            })],
-        };
-        assert!(validate_flow(&flow).is_ok());
-    }
-
-    #[test]
-    fn test_invalid_bind_addr() {
-        let flow = FlowConfig {
-            id: "f1".to_string(),
-            name: "Flow 1".to_string(),
-            enabled: true,
-            media_analysis: true,
-            thumbnail: true,
-            thumbnail_program_number: None,
-            bandwidth_limit: None,
-            flow_group_id: None,
-            clock_domain: None,
-            input: Some(InputConfig::Rtp(RtpInputConfig {
-                bind_addr: "not-an-address".to_string(),
+            }),
+        });
+        config.inputs.push(InputDefinition {
+            id: "in-2".to_string(),
+            name: "Input 2".to_string(),
+            config: InputConfig::Rtp(RtpInputConfig {
+                bind_addr: "0.0.0.0:5001".to_string(),
                 interface_addr: None,
                 fec_decode: None,
                 allowed_sources: None,
@@ -1623,16 +1859,10 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
-            })),
-            outputs: vec![],
-        };
-        assert!(validate_flow(&flow).is_err());
-    }
-
-    #[test]
-    fn test_srt_caller_missing_remote() {
-        let flow = FlowConfig {
-            id: "f1".to_string(),
+            }),
+        });
+        config.flows.push(FlowConfig {
+            id: "same-id".to_string(),
             name: "Flow 1".to_string(),
             enabled: true,
             media_analysis: true,
@@ -1641,180 +1871,91 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
-            input: Some(InputConfig::Srt(SrtInputConfig {
-                mode: SrtMode::Caller,
-                local_addr: "0.0.0.0:9000".to_string(),
-                remote_addr: None,
-                latency_ms: 120,
-                peer_idle_timeout_secs: 30,
-                recv_latency_ms: None,
-                peer_latency_ms: None,
-                passphrase: None,
-                aes_key_len: None,
-                crypto_mode: None,
-                max_rexmit_bw: None,
-                stream_id: None,
-                packet_filter: None,
-                max_bw: None, input_bw: None, overhead_bw: None,
-                enforced_encryption: None, connect_timeout_secs: None,
-                flight_flag_size: None, send_buffer_size: None, recv_buffer_size: None,
-                ip_tos: None, retransmit_algo: None, send_drop_delay: None,
-                loss_max_ttl: None, km_refresh_rate: None, km_pre_announce: None,
-                payload_size: None, mss: None, tlpkt_drop: None, ip_ttl: None,
-                redundancy: None,
-                transport_mode: None,
-            })),
-            outputs: vec![],
-        };
-        assert!(validate_flow(&flow).is_err());
-    }
-
-    #[test]
-    fn test_duplicate_flow_ids() {
-        let config = AppConfig {
-            version: 1,
-            node_id: None,
-            device_name: None,
-            setup_enabled: true,
-            server: ServerConfig::default(),
-            monitor: None,
-            manager: None,
-            tunnels: Vec::new(),
-            flow_groups: Vec::new(),
-            resource_limits: None,
-            flows: vec![
-                FlowConfig {
-                    id: "same-id".to_string(),
-                    name: "Flow 1".to_string(),
-                    enabled: true,
-                    media_analysis: true,
+            input_id: Some("in-1".to_string()),
+            output_ids: vec![],
+        });
+        config.flows.push(FlowConfig {
+            id: "same-id".to_string(),
+            name: "Flow 2".to_string(),
+            enabled: true,
+            media_analysis: true,
             thumbnail: true,
             thumbnail_program_number: None,
-                    bandwidth_limit: None,
-                    flow_group_id: None,
-                    clock_domain: None,
-                    input: Some(InputConfig::Rtp(RtpInputConfig {
-                        bind_addr: "0.0.0.0:5000".to_string(),
-                        interface_addr: None,
-                        fec_decode: None,
-                        allowed_sources: None,
-                        allowed_payload_types: None,
-                        max_bitrate_mbps: None,
-                        tr07_mode: None,
-                        redundancy: None,
-                    })),
-                    outputs: vec![],
-                },
-                FlowConfig {
-                    id: "same-id".to_string(),
-                    name: "Flow 2".to_string(),
-                    enabled: true,
-                    media_analysis: true,
-            thumbnail: true,
-            thumbnail_program_number: None,
-                    bandwidth_limit: None,
-                    flow_group_id: None,
-                    clock_domain: None,
-                    input: Some(InputConfig::Rtp(RtpInputConfig {
-                        bind_addr: "0.0.0.0:5001".to_string(),
-                        interface_addr: None,
-                        fec_decode: None,
-                        allowed_sources: None,
-                        allowed_payload_types: None,
-                        max_bitrate_mbps: None,
-                        tr07_mode: None,
-                        redundancy: None,
-                    })),
-                    outputs: vec![],
-                },
-            ],
-        };
+            bandwidth_limit: None,
+            flow_group_id: None,
+            clock_domain: None,
+            input_id: Some("in-2".to_string()),
+            output_ids: vec![],
+        });
         assert!(validate_config(&config).is_err());
     }
 
     #[test]
     fn test_passphrase_length() {
-        let flow = FlowConfig {
-            id: "f1".to_string(),
-            name: "Flow 1".to_string(),
-            enabled: true,
-            media_analysis: true,
-            thumbnail: true,
-            thumbnail_program_number: None,
-            bandwidth_limit: None,
-            flow_group_id: None,
-            clock_domain: None,
-            input: Some(InputConfig::Srt(SrtInputConfig {
-                mode: SrtMode::Listener,
-                local_addr: "0.0.0.0:9000".to_string(),
-                remote_addr: None,
-                latency_ms: 120,
-                peer_idle_timeout_secs: 30,
-                recv_latency_ms: None,
-                peer_latency_ms: None,
-                passphrase: Some("short".to_string()),
-                aes_key_len: None,
-                crypto_mode: None,
-                max_rexmit_bw: None,
-                stream_id: None,
-                packet_filter: None,
-                max_bw: None, input_bw: None, overhead_bw: None,
-                enforced_encryption: None, connect_timeout_secs: None,
-                flight_flag_size: None, send_buffer_size: None, recv_buffer_size: None,
-                ip_tos: None, retransmit_algo: None, send_drop_delay: None,
-                loss_max_ttl: None, km_refresh_rate: None, km_pre_announce: None,
-                payload_size: None, mss: None, tlpkt_drop: None, ip_ttl: None,
-                redundancy: None,
-                transport_mode: None,
-            })),
-            outputs: vec![],
-        };
-        assert!(validate_flow(&flow).is_err());
+        let config = make_config_input_only(InputConfig::Srt(SrtInputConfig {
+            mode: SrtMode::Listener,
+            local_addr: Some("0.0.0.0:9000".to_string()),
+            remote_addr: None,
+            latency_ms: 120,
+            peer_idle_timeout_secs: 30,
+            recv_latency_ms: None,
+            peer_latency_ms: None,
+            passphrase: Some("short".to_string()),
+            aes_key_len: None,
+            crypto_mode: None,
+            max_rexmit_bw: None,
+            stream_id: None,
+            packet_filter: None,
+            max_bw: None, input_bw: None, overhead_bw: None,
+            enforced_encryption: None, connect_timeout_secs: None,
+            flight_flag_size: None, send_buffer_size: None, recv_buffer_size: None,
+            ip_tos: None, retransmit_algo: None, send_drop_delay: None,
+            loss_max_ttl: None, km_refresh_rate: None, km_pre_announce: None,
+            payload_size: None, mss: None, tlpkt_drop: None, ip_ttl: None,
+            redundancy: None,
+            transport_mode: None,
+        }));
+        assert!(validate_config(&config).is_err());
     }
 
     // --- IPv6 address validation tests ---
 
     #[test]
     fn test_valid_ipv6_unicast_rtp_flow() {
-        let flow = FlowConfig {
-            id: "f1".to_string(),
-            name: "IPv6 Unicast".to_string(),
-            enabled: true,
-            media_analysis: true,
-            thumbnail: true,
-            thumbnail_program_number: None,
-            bandwidth_limit: None,
-            flow_group_id: None,
-            clock_domain: None,
-            input: Some(InputConfig::Rtp(RtpInputConfig {
-                bind_addr: "[::]:5000".to_string(),
-                interface_addr: None,
+        let config = make_config_with_rtp("[::]:5000", "[::1]:5004");
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_valid_ipv4_multicast_rtp_flow() {
+        let mut config = AppConfig::default();
+        config.inputs.push(InputDefinition {
+            id: "in-1".to_string(),
+            name: "Input 1".to_string(),
+            config: InputConfig::Rtp(RtpInputConfig {
+                bind_addr: "239.1.1.1:5000".to_string(),
+                interface_addr: Some("192.168.1.100".to_string()),
                 fec_decode: None,
                 allowed_sources: None,
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
-            })),
-            outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
-                id: "out-1".to_string(),
-                name: "Out 1".to_string(),
-                dest_addr: "[::1]:5004".to_string(),
-                bind_addr: None,
-                interface_addr: None,
-                fec_encode: None,
-                dscp: 46,
-                redundancy: None,
-                program_number: None,
+            }),
+        });
+        config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
+            id: "out-1".to_string(),
+            name: "Multicast Out".to_string(),
+            dest_addr: "239.1.2.1:5004".to_string(),
+            bind_addr: None,
+            interface_addr: Some("192.168.1.100".to_string()),
+            fec_encode: None,
+            dscp: 46,
+            redundancy: None,
+            program_number: None,
             delay: None,
-            })],
-        };
-        assert!(validate_flow(&flow).is_ok());
-    }
-
-    #[test]
-    fn test_valid_ipv4_multicast_rtp_flow() {
-        let flow = FlowConfig {
+        }));
+        config.flows.push(FlowConfig {
             id: "f1".to_string(),
             name: "IPv4 Multicast".to_string(),
             enabled: true,
@@ -1824,35 +1965,42 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
-            input: Some(InputConfig::Rtp(RtpInputConfig {
-                bind_addr: "239.1.1.1:5000".to_string(),
-                interface_addr: Some("192.168.1.100".to_string()),
+            input_id: Some("in-1".to_string()),
+            output_ids: vec!["out-1".to_string()],
+        });
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_valid_ipv6_multicast_rtp_flow() {
+        let mut config = AppConfig::default();
+        config.inputs.push(InputDefinition {
+            id: "in-1".to_string(),
+            name: "Input 1".to_string(),
+            config: InputConfig::Rtp(RtpInputConfig {
+                bind_addr: "[ff7e::1]:5000".to_string(),
+                interface_addr: Some("::1".to_string()),
                 fec_decode: None,
                 allowed_sources: None,
                 allowed_payload_types: None,
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
-            })),
-            outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
-                id: "out-1".to_string(),
-                name: "Multicast Out".to_string(),
-                dest_addr: "239.1.2.1:5004".to_string(),
-                bind_addr: None,
-                interface_addr: Some("192.168.1.100".to_string()),
-                fec_encode: None,
-                dscp: 46,
-                redundancy: None,
-                program_number: None,
+            }),
+        });
+        config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
+            id: "out-1".to_string(),
+            name: "IPv6 Mcast Out".to_string(),
+            dest_addr: "[ff7e::2]:5004".to_string(),
+            bind_addr: None,
+            interface_addr: Some("::1".to_string()),
+            fec_encode: None,
+            dscp: 46,
+            redundancy: None,
+            program_number: None,
             delay: None,
-            })],
-        };
-        assert!(validate_flow(&flow).is_ok());
-    }
-
-    #[test]
-    fn test_valid_ipv6_multicast_rtp_flow() {
-        let flow = FlowConfig {
+        }));
+        config.flows.push(FlowConfig {
             id: "f1".to_string(),
             name: "IPv6 Multicast".to_string(),
             enabled: true,
@@ -1862,74 +2010,36 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
-            input: Some(InputConfig::Rtp(RtpInputConfig {
-                bind_addr: "[ff7e::1]:5000".to_string(),
-                interface_addr: Some("::1".to_string()),
-                fec_decode: None,
-                allowed_sources: None,
-                allowed_payload_types: None,
-                max_bitrate_mbps: None,
-                tr07_mode: None,
-                redundancy: None,
-            })),
-            outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
-                id: "out-1".to_string(),
-                name: "IPv6 Mcast Out".to_string(),
-                dest_addr: "[ff7e::2]:5004".to_string(),
-                bind_addr: None,
-                interface_addr: Some("::1".to_string()),
-                fec_encode: None,
-                dscp: 46,
-                redundancy: None,
-                program_number: None,
-            delay: None,
-            })],
-        };
-        assert!(validate_flow(&flow).is_ok());
+            input_id: Some("in-1".to_string()),
+            output_ids: vec!["out-1".to_string()],
+        });
+        assert!(validate_config(&config).is_ok());
     }
 
     // --- Address family mismatch tests ---
 
     #[test]
     fn test_rtp_input_mismatched_addr_family() {
-        let flow = FlowConfig {
-            id: "f1".to_string(),
-            name: "Mismatched".to_string(),
-            enabled: true,
-            media_analysis: true,
-            thumbnail: true,
-            thumbnail_program_number: None,
-            bandwidth_limit: None,
-            flow_group_id: None,
-            clock_domain: None,
-            input: Some(InputConfig::Rtp(RtpInputConfig {
-                bind_addr: "239.1.1.1:5000".to_string(),         // IPv4
-                interface_addr: Some("::1".to_string()),          // IPv6 - mismatch!
-                fec_decode: None,
-                allowed_sources: None,
-                allowed_payload_types: None,
-                max_bitrate_mbps: None,
-                tr07_mode: None,
-                redundancy: None,
-            })),
-            outputs: vec![],
-        };
-        assert!(validate_flow(&flow).is_err());
+        let config = make_config_input_only(InputConfig::Rtp(RtpInputConfig {
+            bind_addr: "239.1.1.1:5000".to_string(),         // IPv4
+            interface_addr: Some("::1".to_string()),          // IPv6 - mismatch!
+            fec_decode: None,
+            allowed_sources: None,
+            allowed_payload_types: None,
+            max_bitrate_mbps: None,
+            tr07_mode: None,
+            redundancy: None,
+        }));
+        assert!(validate_config(&config).is_err());
     }
 
     #[test]
     fn test_rtp_output_mismatched_dest_bind_family() {
-        let flow = FlowConfig {
-            id: "f1".to_string(),
-            name: "Mismatched".to_string(),
-            enabled: true,
-            media_analysis: true,
-            thumbnail: true,
-            thumbnail_program_number: None,
-            bandwidth_limit: None,
-            flow_group_id: None,
-            clock_domain: None,
-            input: Some(InputConfig::Rtp(RtpInputConfig {
+        let mut config = AppConfig::default();
+        config.inputs.push(InputDefinition {
+            id: "in-1".to_string(),
+            name: "Input 1".to_string(),
+            config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "[::]:5000".to_string(),
                 interface_addr: None,
                 fec_decode: None,
@@ -1938,26 +2048,21 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
-            })),
-            outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
-                id: "out-1".to_string(),
-                name: "Bad".to_string(),
-                dest_addr: "[::1]:5004".to_string(),            // IPv6
-                bind_addr: Some("0.0.0.0:0".to_string()),      // IPv4 - mismatch!
-                interface_addr: None,
-                fec_encode: None,
-                dscp: 46,
-                redundancy: None,
-                program_number: None,
+            }),
+        });
+        config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
+            id: "out-1".to_string(),
+            name: "Bad".to_string(),
+            dest_addr: "[::1]:5004".to_string(),            // IPv6
+            bind_addr: Some("0.0.0.0:0".to_string()),      // IPv4 - mismatch!
+            interface_addr: None,
+            fec_encode: None,
+            dscp: 46,
+            redundancy: None,
+            program_number: None,
             delay: None,
-            })],
-        };
-        assert!(validate_flow(&flow).is_err());
-    }
-
-    #[test]
-    fn test_rtp_output_mismatched_dest_iface_family() {
-        let flow = FlowConfig {
+        }));
+        config.flows.push(FlowConfig {
             id: "f1".to_string(),
             name: "Mismatched".to_string(),
             enabled: true,
@@ -1967,7 +2072,19 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
-            input: Some(InputConfig::Rtp(RtpInputConfig {
+            input_id: Some("in-1".to_string()),
+            output_ids: vec!["out-1".to_string()],
+        });
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_rtp_output_mismatched_dest_iface_family() {
+        let mut config = AppConfig::default();
+        config.inputs.push(InputDefinition {
+            id: "in-1".to_string(),
+            name: "Input 1".to_string(),
+            config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,
                 fec_decode: None,
@@ -1976,26 +2093,66 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
-            })),
-            outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
-                id: "out-1".to_string(),
-                name: "Bad".to_string(),
-                dest_addr: "239.1.1.1:5004".to_string(),       // IPv4
-                bind_addr: None,
-                interface_addr: Some("::1".to_string()),        // IPv6 - mismatch!
-                fec_encode: None,
-                dscp: 46,
-                redundancy: None,
-                program_number: None,
+            }),
+        });
+        config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
+            id: "out-1".to_string(),
+            name: "Bad".to_string(),
+            dest_addr: "239.1.1.1:5004".to_string(),       // IPv4
+            bind_addr: None,
+            interface_addr: Some("::1".to_string()),        // IPv6 - mismatch!
+            fec_encode: None,
+            dscp: 46,
+            redundancy: None,
+            program_number: None,
             delay: None,
-            })],
-        };
-        assert!(validate_flow(&flow).is_err());
+        }));
+        config.flows.push(FlowConfig {
+            id: "f1".to_string(),
+            name: "Mismatched".to_string(),
+            enabled: true,
+            media_analysis: true,
+            thumbnail: true,
+            thumbnail_program_number: None,
+            bandwidth_limit: None,
+            flow_group_id: None,
+            clock_domain: None,
+            input_id: Some("in-1".to_string()),
+            output_ids: vec!["out-1".to_string()],
+        });
+        assert!(validate_config(&config).is_err());
     }
 
     #[test]
     fn test_rtp_output_invalid_interface_addr() {
-        let flow = FlowConfig {
+        let mut config = AppConfig::default();
+        config.inputs.push(InputDefinition {
+            id: "in-1".to_string(),
+            name: "Input 1".to_string(),
+            config: InputConfig::Rtp(RtpInputConfig {
+                bind_addr: "0.0.0.0:5000".to_string(),
+                interface_addr: None,
+                fec_decode: None,
+                allowed_sources: None,
+                allowed_payload_types: None,
+                max_bitrate_mbps: None,
+                tr07_mode: None,
+                redundancy: None,
+            }),
+        });
+        config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
+            id: "out-1".to_string(),
+            name: "Bad".to_string(),
+            dest_addr: "239.1.1.1:5004".to_string(),
+            bind_addr: None,
+            interface_addr: Some("not-an-ip".to_string()),
+            fec_encode: None,
+            dscp: 46,
+            redundancy: None,
+            program_number: None,
+            delay: None,
+        }));
+        config.flows.push(FlowConfig {
             id: "f1".to_string(),
             name: "Bad iface".to_string(),
             enabled: true,
@@ -2005,30 +2162,10 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
-            input: Some(InputConfig::Rtp(RtpInputConfig {
-                bind_addr: "0.0.0.0:5000".to_string(),
-                interface_addr: None,
-                fec_decode: None,
-                allowed_sources: None,
-                allowed_payload_types: None,
-                max_bitrate_mbps: None,
-                tr07_mode: None,
-                redundancy: None,
-            })),
-            outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
-                id: "out-1".to_string(),
-                name: "Bad".to_string(),
-                dest_addr: "239.1.1.1:5004".to_string(),
-                bind_addr: None,
-                interface_addr: Some("not-an-ip".to_string()),
-                fec_encode: None,
-                dscp: 46,
-                redundancy: None,
-                program_number: None,
-            delay: None,
-            })],
-        };
-        assert!(validate_flow(&flow).is_err());
+            input_id: Some("in-1".to_string()),
+            output_ids: vec!["out-1".to_string()],
+        });
+        assert!(validate_config(&config).is_err());
     }
 
     // ─────────────── SMPTE ST 2110 validation tests ───────────────
@@ -2195,7 +2332,17 @@ mod tests {
 
     #[test]
     fn test_flow_with_st2110_input_validates() {
-        let flow = FlowConfig {
+        let mut config = AppConfig::default();
+        config.inputs.push(InputDefinition {
+            id: "in-audio".to_string(),
+            name: "Audio In".to_string(),
+            config: InputConfig::St2110_30(st2110_30_input("239.10.10.1:5004")),
+        });
+        config.outputs.push(OutputConfig::St2110_30(st2110_30_output(
+            "out-1",
+            "239.10.10.2:5004",
+        )));
+        config.flows.push(FlowConfig {
             id: "audio-flow".to_string(),
             name: "Audio".to_string(),
             enabled: true,
@@ -2205,13 +2352,16 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: Some("group-1".to_string()),
             clock_domain: Some(0),
-            input: Some(InputConfig::St2110_30(st2110_30_input("239.10.10.1:5004"))),
-            outputs: vec![OutputConfig::St2110_30(st2110_30_output(
-                "out-1",
-                "239.10.10.2:5004",
-            ))],
-        };
-        validate_flow(&flow).expect("valid ST 2110 flow");
+            input_id: Some("in-audio".to_string()),
+            output_ids: vec!["out-1".to_string()],
+        });
+        config.flow_groups.push(FlowGroupConfig {
+            id: "group-1".to_string(),
+            name: "Group 1".to_string(),
+            clock_domain: Some(0),
+            flows: vec!["audio-flow".to_string()],
+        });
+        validate_config(&config).expect("valid ST 2110 flow");
     }
 
     #[test]
@@ -2230,6 +2380,16 @@ mod tests {
     fn test_flow_group_back_reference_must_match() {
         // Flow declares membership in group-1 but is not listed as a member.
         let mut config = AppConfig::default();
+        config.inputs.push(InputDefinition {
+            id: "in-1".to_string(),
+            name: "In 1".to_string(),
+            config: InputConfig::St2110_30(st2110_30_input("239.10.10.1:5004")),
+        });
+        config.inputs.push(InputDefinition {
+            id: "in-2".to_string(),
+            name: "In 2".to_string(),
+            config: InputConfig::St2110_30(st2110_30_input("239.10.10.2:5004")),
+        });
         config.flows.push(FlowConfig {
             id: "audio-flow".to_string(),
             name: "Audio".to_string(),
@@ -2240,8 +2400,8 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: Some("group-1".to_string()),
             clock_domain: Some(0),
-            input: Some(InputConfig::St2110_30(st2110_30_input("239.10.10.1:5004"))),
-            outputs: vec![],
+            input_id: Some("in-1".to_string()),
+            output_ids: vec![],
         });
         config.flow_groups.push(FlowGroupConfig {
             id: "group-1".to_string(),
@@ -2259,8 +2419,8 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
-            input: Some(InputConfig::St2110_30(st2110_30_input("239.10.10.2:5004"))),
-            outputs: vec![],
+            input_id: Some("in-2".to_string()),
+            output_ids: vec![],
         });
         assert!(validate_config(&config).is_err());
     }
@@ -2268,6 +2428,11 @@ mod tests {
     #[test]
     fn test_flow_group_round_trip_ok() {
         let mut config = AppConfig::default();
+        config.inputs.push(InputDefinition {
+            id: "in-1".to_string(),
+            name: "In 1".to_string(),
+            config: InputConfig::St2110_30(st2110_30_input("239.10.10.1:5004")),
+        });
         config.flows.push(FlowConfig {
             id: "audio-flow".to_string(),
             name: "Audio".to_string(),
@@ -2278,8 +2443,8 @@ mod tests {
             bandwidth_limit: None,
             flow_group_id: Some("group-1".to_string()),
             clock_domain: Some(0),
-            input: Some(InputConfig::St2110_30(st2110_30_input("239.10.10.1:5004"))),
-            outputs: vec![],
+            input_id: Some("in-1".to_string()),
+            output_ids: vec![],
         });
         config.flow_groups.push(FlowGroupConfig {
             id: "group-1".to_string(),

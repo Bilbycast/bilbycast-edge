@@ -4,22 +4,32 @@
 use axum::Json;
 use axum::extract::{Path, State};
 
-use crate::config::models::{AppConfig, FlowConfig, OutputConfig};
+use serde::Deserialize;
+
+use crate::config::models::{AppConfig, FlowConfig};
 use crate::config::persistence::save_config_split_async;
-use crate::config::validation::{validate_config, validate_flow, validate_output};
+use crate::config::validation::{validate_config, validate_flow};
 
 use super::auth::RequireAdmin;
 use super::errors::ApiError;
 use super::models::{ApiResponse, FlowListResponse, FlowSummary};
 use super::server::AppState;
 
+/// Request body for `POST /api/v1/flows/{flow_id}/outputs` — assigns an existing
+/// output (by ID) to a flow.
+#[derive(Deserialize)]
+pub struct AddOutputRequest {
+    /// The ID of the output to assign (must already exist in `AppConfig.outputs`).
+    pub output_id: String,
+}
+
 /// Register a WHIP input channel with the WebRTC session registry (if applicable).
 #[cfg(feature = "webrtc")]
 fn register_whip_if_needed(state: &AppState, runtime: &crate::engine::flow::FlowRuntime) {
     if let Some((tx, bearer_token)) = &runtime.whip_session_tx {
         if let Some(ref registry) = state.webrtc_sessions {
-            registry.register_whip_input(&runtime.config.id, tx.clone(), bearer_token.clone());
-            tracing::info!("Registered WHIP input for flow '{}'", runtime.config.id);
+            registry.register_whip_input(&runtime.config.config.id, tx.clone(), bearer_token.clone());
+            tracing::info!("Registered WHIP input for flow '{}'", runtime.config.config.id);
         }
     }
 }
@@ -29,10 +39,16 @@ fn register_whip_if_needed(state: &AppState, runtime: &crate::engine::flow::Flow
 fn register_whep_if_needed(state: &AppState, runtime: &crate::engine::flow::FlowRuntime) {
     if let Some((tx, bearer_token)) = &runtime.whep_session_tx {
         if let Some(ref registry) = state.webrtc_sessions {
-            registry.register_whep_output(&runtime.config.id, tx.clone(), bearer_token.clone());
-            tracing::info!("Registered WHEP output for flow '{}'", runtime.config.id);
+            registry.register_whep_output(&runtime.config.config.id, tx.clone(), bearer_token.clone());
+            tracing::info!("Registered WHEP output for flow '{}'", runtime.config.config.id);
         }
     }
+}
+
+/// Resolve a flow's references against the config and return a `ResolvedFlow`.
+/// Maps resolution errors to `ApiError::BadRequest`.
+fn resolve_flow(config: &AppConfig, flow: &FlowConfig) -> Result<crate::config::models::ResolvedFlow, ApiError> {
+    config.resolve_flow(flow).map_err(|e| ApiError::BadRequest(e.to_string()))
 }
 
 /// `GET /api/v1/flows` -- List all configured flows.
@@ -49,14 +65,14 @@ pub async fn list_flows(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<FlowListResponse>>, ApiError> {
     let config = state.config.read().await;
-    let flows: Vec<FlowSummary> = config.flows.iter().map(FlowSummary::from).collect();
+    let flows: Vec<FlowSummary> = config.flows.iter().map(|f| FlowSummary::from_flow(f, &config)).collect();
     Ok(Json(ApiResponse::ok(FlowListResponse { flows })))
 }
 
 /// `GET /api/v1/flows/{flow_id}` -- Retrieve a single flow by its ID.
 ///
-/// Returns the full [`FlowConfig`] for the requested flow, including input configuration
-/// and all output definitions.
+/// Returns the full [`FlowConfig`] for the requested flow, including its `input_id`
+/// and `output_ids` references.
 ///
 /// # Errors
 ///
@@ -106,12 +122,15 @@ pub async fn create_flow(
         )));
     }
 
+    // Resolve references before persisting to catch dangling input_id/output_ids early
+    let resolved = resolve_flow(&config, &flow)?;
+
     config.flows.push(flow.clone());
     save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone()).await.map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Start the flow in the engine if enabled
     if flow.enabled {
-        match state.flow_manager.create_flow(flow.clone()).await {
+        match state.flow_manager.create_flow(resolved).await {
             Ok(_runtime) => {
                 #[cfg(feature = "webrtc")]
                 register_whip_if_needed(&state, &_runtime);
@@ -163,10 +182,14 @@ pub async fn update_flow(
     }
 
     config.flows[idx] = flow.clone();
+
+    // Resolve references before persisting to catch dangling input_id/output_ids early
+    let resolved = resolve_flow(&config, &flow)?;
+
     save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone()).await.map_err(|e| ApiError::Internal(e.to_string()))?;
 
     if flow.enabled {
-        match state.flow_manager.create_flow(flow.clone()).await {
+        match state.flow_manager.create_flow(resolved).await {
             Ok(_runtime) => {
                 #[cfg(feature = "webrtc")]
                 register_whip_if_needed(&state, &_runtime);
@@ -241,12 +264,13 @@ pub async fn start_flow(
         .find(|f| f.id == flow_id)
         .ok_or_else(|| ApiError::NotFound(format!("Flow '{flow_id}' not found")))?
         .clone();
+    let resolved = resolve_flow(&config, &flow)?;
 
     drop(config); // release read lock before async engine call
 
     let runtime = state
         .flow_manager
-        .create_flow(flow)
+        .create_flow(resolved)
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to start flow '{flow_id}': {e}")))?;
 
@@ -321,6 +345,7 @@ pub async fn restart_flow(
         .find(|f| f.id == flow_id)
         .ok_or_else(|| ApiError::NotFound(format!("Flow '{flow_id}' not found")))?
         .clone();
+    let resolved = resolve_flow(&config, &flow)?;
     drop(config);
 
     // Stop if running
@@ -331,7 +356,7 @@ pub async fn restart_flow(
     // Start
     let runtime = state
         .flow_manager
-        .create_flow(flow)
+        .create_flow(resolved)
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to restart flow '{flow_id}': {e}")))?;
 
@@ -344,68 +369,91 @@ pub async fn restart_flow(
     Ok(Json(ApiResponse::ok(())))
 }
 
-/// `POST /api/v1/flows/{flow_id}/outputs` -- Add a new output to an existing flow.
+/// `POST /api/v1/flows/{flow_id}/outputs` -- Assign an existing output to a flow.
 ///
-/// Accepts a JSON [`OutputConfig`] body, validates it, appends it to the flow's output
-/// list, and persists the change to disk. If the flow is currently running, the output
-/// is hot-added to the engine without stopping the flow. Returns the created output
-/// configuration on success.
+/// Accepts a JSON body with an `output_id` field. The output must already exist in
+/// `AppConfig.outputs`. The output_id is appended to the flow's `output_ids` list
+/// and persisted to disk. If the flow is currently running, the output is hot-added
+/// to the engine without stopping the flow.
 ///
 /// # Errors
 ///
-/// - [`ApiError::BadRequest`] (400) if the output config fails validation.
-/// - [`ApiError::NotFound`] (404) if no flow with the given `flow_id` exists.
-/// - [`ApiError::Conflict`] (409) if an output with the same ID already exists in the flow.
+/// - [`ApiError::NotFound`] (404) if the flow or the referenced output does not exist.
+/// - [`ApiError::Conflict`] (409) if the output is already assigned to this flow or
+///   is assigned to another flow.
 /// - [`ApiError::Internal`] (500) if persisting the config to disk fails.
 ///
-/// Note: if hot-adding the output to a running flow fails, the output is still persisted
-/// to config and a warning is logged.
+/// Note: if hot-adding the output to a running flow fails, the assignment is still
+/// persisted to config and a warning is logged.
 pub async fn add_output(
     _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(flow_id): Path<String>,
-    Json(output): Json<OutputConfig>,
-) -> Result<Json<ApiResponse<OutputConfig>>, ApiError> {
-    validate_output(&output).map_err(|e: anyhow::Error| ApiError::BadRequest(e.to_string()))?;
+    Json(req): Json<AddOutputRequest>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let output_id = req.output_id;
 
     let mut config = state.config.write().await;
 
-    let flow = config
+    // Verify the flow exists
+    let flow_idx = config
         .flows
-        .iter_mut()
-        .find(|f| f.id == flow_id)
+        .iter()
+        .position(|f| f.id == flow_id)
         .ok_or_else(|| ApiError::NotFound(format!("Flow '{flow_id}' not found")))?;
 
-    let output_id = output.id().to_string();
-    if flow.outputs.iter().any(|o| o.id() == output_id) {
+    // Verify the output exists in AppConfig.outputs
+    let output = config
+        .outputs
+        .iter()
+        .find(|o| o.id() == output_id)
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("Output '{output_id}' does not exist in the configuration"))
+        })?
+        .clone();
+
+    // Check the output isn't already assigned to this flow
+    if config.flows[flow_idx].output_ids.contains(&output_id) {
         return Err(ApiError::Conflict(format!(
-            "Output '{output_id}' already exists in flow '{flow_id}'"
+            "Output '{output_id}' is already assigned to flow '{flow_id}'"
         )));
     }
 
-    flow.outputs.push(output.clone());
+    // Check the output isn't assigned to another flow
+    for f in &config.flows {
+        if f.id != flow_id && f.output_ids.contains(&output_id) {
+            return Err(ApiError::Conflict(format!(
+                "Output '{output_id}' is already assigned to flow '{}'",
+                f.id
+            )));
+        }
+    }
+
+    config.flows[flow_idx].output_ids.push(output_id.clone());
     save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone()).await.map_err(|e| ApiError::Internal(e.to_string()))?;
     drop(config);
 
     // Hot-add output to running flow
     if state.flow_manager.is_running(&flow_id) {
-        if let Err(e) = state.flow_manager.add_output(&flow_id, output.clone()).await {
-            tracing::warn!("Output '{output_id}' persisted but failed to hot-add: {e}");
+        if let Err(e) = state.flow_manager.add_output(&flow_id, output).await {
+            tracing::warn!("Output '{output_id}' assigned but failed to hot-add: {e}");
         }
     }
 
-    tracing::info!("Added output '{}' to flow '{}'", output_id, flow_id);
-    Ok(Json(ApiResponse::ok(output)))
+    tracing::info!("Assigned output '{}' to flow '{}'", output_id, flow_id);
+    Ok(Json(ApiResponse::ok(())))
 }
 
-/// `DELETE /api/v1/flows/{flow_id}/outputs/{output_id}` -- Remove an output from a flow.
+/// `DELETE /api/v1/flows/{flow_id}/outputs/{output_id}` -- Unassign an output from a flow.
 ///
-/// If the flow is currently running, the output is hot-removed from the engine first.
-/// Then the output is removed from the in-memory config and persisted to disk.
+/// Removes the `output_id` from the flow's `output_ids` list. The output definition
+/// remains in `AppConfig.outputs` (it is simply unassigned from the flow). If the flow
+/// is currently running, the output is hot-removed from the engine first.
 ///
 /// # Errors
 ///
-/// - [`ApiError::NotFound`] (404) if the flow or the output within it does not exist.
+/// - [`ApiError::NotFound`] (404) if the flow does not exist or the output_id is not
+///   assigned to the flow.
 /// - [`ApiError::Internal`] (500) if persisting the config to disk fails.
 pub async fn remove_output(
     _admin: RequireAdmin,
@@ -426,19 +474,19 @@ pub async fn remove_output(
         .ok_or_else(|| ApiError::NotFound(format!("Flow '{flow_id}' not found")))?;
 
     let idx = flow
-        .outputs
+        .output_ids
         .iter()
-        .position(|o| o.id() == output_id)
+        .position(|oid| oid == &output_id)
         .ok_or_else(|| {
             ApiError::NotFound(format!(
-                "Output '{output_id}' not found in flow '{flow_id}'"
+                "Output '{output_id}' is not assigned to flow '{flow_id}'"
             ))
         })?;
 
-    flow.outputs.remove(idx);
+    flow.output_ids.remove(idx);
     save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone()).await.map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    tracing::info!("Removed output '{}' from flow '{}'", output_id, flow_id);
+    tracing::info!("Unassigned output '{}' from flow '{}'", output_id, flow_id);
     Ok(Json(ApiResponse::ok(())))
 }
 
@@ -491,14 +539,19 @@ pub async fn replace_config(
     // Start all enabled flows from new config
     for flow in &config.flows {
         if flow.enabled {
-            match state.flow_manager.create_flow(flow.clone()).await {
-                Ok(_runtime) => {
-                    #[cfg(feature = "webrtc")]
-                    register_whip_if_needed(&state, &_runtime);
-                    #[cfg(feature = "webrtc")]
-                    register_whep_if_needed(&state, &_runtime);
+            match config.resolve_flow(flow) {
+                Ok(resolved) => {
+                    match state.flow_manager.create_flow(resolved).await {
+                        Ok(_runtime) => {
+                            #[cfg(feature = "webrtc")]
+                            register_whip_if_needed(&state, &_runtime);
+                            #[cfg(feature = "webrtc")]
+                            register_whep_if_needed(&state, &_runtime);
+                        }
+                        Err(e) => tracing::error!("Failed to start flow '{}' after config replace: {e}", flow.id),
+                    }
                 }
-                Err(e) => tracing::error!("Failed to start flow '{}' after config replace: {e}", flow.id),
+                Err(e) => tracing::error!("Failed to resolve flow '{}' after config replace: {e}", flow.id),
             }
         }
     }
@@ -542,14 +595,19 @@ pub async fn reload_config(
     // Start all enabled flows from reloaded config
     for flow in &config.flows {
         if flow.enabled {
-            match state.flow_manager.create_flow(flow.clone()).await {
-                Ok(_runtime) => {
-                    #[cfg(feature = "webrtc")]
-                    register_whip_if_needed(&state, &_runtime);
-                    #[cfg(feature = "webrtc")]
-                    register_whep_if_needed(&state, &_runtime);
+            match config.resolve_flow(flow) {
+                Ok(resolved) => {
+                    match state.flow_manager.create_flow(resolved).await {
+                        Ok(_runtime) => {
+                            #[cfg(feature = "webrtc")]
+                            register_whip_if_needed(&state, &_runtime);
+                            #[cfg(feature = "webrtc")]
+                            register_whep_if_needed(&state, &_runtime);
+                        }
+                        Err(e) => tracing::error!("Failed to start flow '{}' after config reload: {e}", flow.id),
+                    }
                 }
-                Err(e) => tracing::error!("Failed to start flow '{}' after config reload: {e}", flow.id),
+                Err(e) => tracing::error!("Failed to resolve flow '{}' after config reload: {e}", flow.id),
             }
         }
     }

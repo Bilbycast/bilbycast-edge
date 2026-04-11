@@ -35,7 +35,7 @@ const BITRATE_CALC_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Spawn the media analyzer as an independent broadcast subscriber.
 pub fn spawn_media_analyzer(
-    flow_config: &FlowConfig,
+    resolved_flow: &ResolvedFlow,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     stats: Arc<MediaAnalysisAccumulator>,
     cancel: CancellationToken,
@@ -46,15 +46,15 @@ pub fn spawn_media_analyzer(
     // Pre-populate transport-level info from config
     {
         let mut state = stats.state.lock().unwrap();
-        populate_transport_info(flow_config, &mut state);
+        populate_transport_info(resolved_flow, &mut state);
     }
 
     tokio::spawn(media_analyzer_loop(rx, stats, cancel, frame_rate_tx))
 }
 
 /// Extract transport-level information from the flow configuration.
-fn populate_transport_info(config: &FlowConfig, state: &mut MediaAnalysisState) {
-    let input = match &config.input {
+fn populate_transport_info(resolved: &ResolvedFlow, state: &mut MediaAnalysisState) {
+    let input = match &resolved.input {
         Some(i) => i,
         None => return,
     };

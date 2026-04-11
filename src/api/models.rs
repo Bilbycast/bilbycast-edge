@@ -3,8 +3,8 @@
 
 use serde::Serialize;
 
-use crate::config::models::FlowConfig;
-use crate::stats::models::FlowStats;
+use crate::config::models::{AppConfig, FlowConfig, InputConfig, OutputConfig};
+use crate::stats::models::{FlowStats, SrtLegStats};
 
 /// Generic JSON response envelope used by all API endpoints.
 ///
@@ -67,11 +67,17 @@ pub struct FlowSummary {
     pub output_redundancy: bool,
 }
 
-impl From<&FlowConfig> for FlowSummary {
-    fn from(flow: &FlowConfig) -> Self {
-        use crate::config::models::{InputConfig, OutputConfig};
+impl FlowSummary {
+    /// Build a flow summary by resolving the flow's input/output references
+    /// from the top-level `AppConfig`. If a referenced input or output cannot
+    /// be found, the summary degrades gracefully (input_type = "none", etc.).
+    pub fn from_flow(flow: &FlowConfig, config: &AppConfig) -> Self {
+        // Resolve input
+        let resolved_input: Option<&InputConfig> = flow.input_id.as_deref().and_then(|iid| {
+            config.inputs.iter().find(|i| i.id == iid).map(|i| &i.config)
+        });
 
-        let (input_type, input_redundancy) = match &flow.input {
+        let (input_type, input_redundancy) = match resolved_input {
             Some(InputConfig::Rtp(_)) => ("rtp", false),
             Some(InputConfig::Udp(_)) => ("udp", false),
             Some(InputConfig::Srt(srt)) => ("srt", srt.redundancy.is_some()),
@@ -85,19 +91,28 @@ impl From<&FlowConfig> for FlowSummary {
             Some(InputConfig::RtpAudio(c)) => ("rtp_audio", c.redundancy.is_some()),
             None => ("none", false),
         };
-        let output_redundancy = flow.outputs.iter().any(|o| match o {
+
+        // Resolve outputs
+        let resolved_outputs: Vec<&OutputConfig> = flow
+            .output_ids
+            .iter()
+            .filter_map(|oid| config.outputs.iter().find(|o| o.id() == oid))
+            .collect();
+
+        let output_redundancy = resolved_outputs.iter().any(|o| match o {
             OutputConfig::Srt(srt) => srt.redundancy.is_some(),
             OutputConfig::St2110_30(c) | OutputConfig::St2110_31(c) => c.redundancy.is_some(),
             OutputConfig::St2110_40(c) => c.redundancy.is_some(),
             OutputConfig::RtpAudio(c) => c.redundancy.is_some(),
             _ => false,
         });
+
         Self {
             id: flow.id.clone(),
             name: flow.name.clone(),
             enabled: flow.enabled,
             input_type: input_type.to_string(),
-            output_count: flow.outputs.len(),
+            output_count: resolved_outputs.len(),
             input_redundancy,
             output_redundancy,
         }
@@ -114,6 +129,55 @@ pub struct AllStatsResponse {
     pub flows: Vec<FlowStats>,
     /// System-wide metrics (uptime, flow counts, version).
     pub system: SystemStats,
+    /// Independent input inventory with live stats (when assigned to a running flow).
+    pub inputs: Vec<InputStatusEntry>,
+    /// Independent output inventory with live stats (when assigned to a running flow).
+    pub outputs: Vec<OutputStatusEntry>,
+}
+
+/// Status entry for a single top-level input, with live stats when assigned to a flow.
+#[derive(Serialize)]
+pub struct InputStatusEntry {
+    pub input_id: String,
+    pub input_name: String,
+    pub input_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assigned_flow_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assigned_flow_name: Option<String>,
+    pub state: String,
+    pub packets_received: u64,
+    pub bytes_received: u64,
+    pub bitrate_bps: u64,
+    pub packets_lost: u64,
+    pub packets_recovered_fec: u64,
+    pub redundancy_switches: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub srt_stats: Option<SrtLegStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub srt_leg2_stats: Option<SrtLegStats>,
+}
+
+/// Status entry for a single top-level output, with live stats when assigned to a flow.
+#[derive(Serialize)]
+pub struct OutputStatusEntry {
+    pub output_id: String,
+    pub output_name: String,
+    pub output_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assigned_flow_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assigned_flow_name: Option<String>,
+    pub state: String,
+    pub packets_sent: u64,
+    pub bytes_sent: u64,
+    pub bitrate_bps: u64,
+    pub packets_dropped: u64,
+    pub fec_packets_sent: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub srt_stats: Option<SrtLegStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub srt_leg2_stats: Option<SrtLegStats>,
 }
 
 /// System-wide metrics included in the stats and health responses.

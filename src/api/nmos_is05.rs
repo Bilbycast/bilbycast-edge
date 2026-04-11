@@ -144,7 +144,11 @@ async fn list_senders(State(state): State<AppState>) -> Json<Vec<String>> {
     let nid = nmos::node_uuid_from_config(&config);
     let mut ids = Vec::new();
     for f in &config.flows {
-        for output in &f.outputs {
+        let resolved = match config.resolve_flow(f) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for output in &resolved.outputs {
             let sid = nmos::sender_uuid_for(&nid, &f.id, nmos::output_id_of(output));
             ids.push(format!("{}/", sid));
         }
@@ -319,8 +323,8 @@ async fn patch_receiver_staged(
     let receiver_flow_id = {
         let config = state.config.read().await;
         let nid = nmos::node_uuid_from_config(&config);
-        let f = find_receiver(&config, &nid, &uuid)?;
-        f.id.clone()
+        let (flow_id, _) = find_receiver(&config, &nid, &uuid)?;
+        flow_id
     };
 
     let should_activate = patch
@@ -395,8 +399,8 @@ async fn get_receiver_transport_type(
     let uuid = Uuid::parse_str(&id).map_err(|_| StatusCode::NOT_FOUND)?;
     let config = state.config.read().await;
     let nid = nmos::node_uuid_from_config(&config);
-    let flow = find_receiver(&config, &nid, &uuid)?;
-    let input = flow.input.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let (_, resolved_input) = find_receiver(&config, &nid, &uuid)?;
+    let input = resolved_input.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(serde_json::json!(nmos::input_transport_of(input))))
 }
 
@@ -418,13 +422,17 @@ async fn get_receiver_constraints(
 
 // ── Helpers ──
 
-fn find_sender<'a>(
-    config: &'a crate::config::models::AppConfig,
+fn find_sender(
+    config: &crate::config::models::AppConfig,
     nid: &Uuid,
     target: &Uuid,
 ) -> Result<(String, OutputConfig), StatusCode> {
     for f in &config.flows {
-        for output in &f.outputs {
+        let resolved = match config.resolve_flow(f) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for output in &resolved.outputs {
             let sid = nmos::sender_uuid_for(nid, &f.id, nmos::output_id_of(output));
             if &sid == target {
                 return Ok((f.id.clone(), output.clone()));
@@ -434,15 +442,19 @@ fn find_sender<'a>(
     Err(StatusCode::NOT_FOUND)
 }
 
-fn find_receiver<'a>(
-    config: &'a crate::config::models::AppConfig,
+/// Returns (flow_id, resolved_input) for the receiver matching `target`.
+fn find_receiver(
+    config: &crate::config::models::AppConfig,
     nid: &Uuid,
     target: &Uuid,
-) -> Result<&'a crate::config::models::FlowConfig, StatusCode> {
+) -> Result<(String, Option<InputConfig>), StatusCode> {
     for f in &config.flows {
         let rid = nmos::receiver_uuid_for(nid, &f.id);
         if &rid == target {
-            return Ok(f);
+            let resolved_input = config.resolve_flow(f)
+                .ok()
+                .and_then(|r| r.input);
+            return Ok((f.id.clone(), resolved_input));
         }
     }
     Err(StatusCode::NOT_FOUND)
@@ -472,8 +484,8 @@ fn active_sender_params(
         OutputConfig::Srt(c) => TransportParamSet {
             destination_ip: c.remote_addr.as_deref().map(|a| a.split(':').next().unwrap_or("").to_string()),
             destination_port: c.remote_addr.as_deref().and_then(|a| a.split(':').nth(1).and_then(|p| p.parse().ok())),
-            source_ip: Some(c.local_addr.split(':').next().unwrap_or("").to_string()),
-            source_port: c.local_addr.split(':').nth(1).and_then(|p| p.parse().ok()),
+            source_ip: c.local_addr.as_deref().map(|a| a.split(':').next().unwrap_or("").to_string()),
+            source_port: c.local_addr.as_deref().and_then(|a| a.split(':').nth(1).and_then(|p| p.parse().ok())),
             ..Default::default()
         },
         _ => TransportParamSet::default(),
@@ -490,8 +502,8 @@ fn active_receiver_params(
     nid: &Uuid,
     target: &Uuid,
 ) -> Result<TransportParams, StatusCode> {
-    let flow = find_receiver(config, nid, target)?;
-    let input = flow.input.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let (_, resolved_input) = find_receiver(config, nid, target)?;
+    let input = resolved_input.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let param_set = match input {
         InputConfig::Rtp(c) => TransportParamSet {
             interface_ip: c.interface_addr.clone(),
@@ -504,8 +516,8 @@ fn active_receiver_params(
             ..Default::default()
         },
         InputConfig::Srt(c) => TransportParamSet {
-            source_ip: Some(c.local_addr.split(':').next().unwrap_or("").to_string()),
-            source_port: c.local_addr.split(':').nth(1).and_then(|p| p.parse().ok()),
+            source_ip: c.local_addr.as_deref().map(|a| a.split(':').next().unwrap_or("").to_string()),
+            source_port: c.local_addr.as_deref().and_then(|a| a.split(':').nth(1).and_then(|p| p.parse().ok())),
             destination_ip: c.remote_addr.as_deref().map(|a| a.split(':').next().unwrap_or("").to_string()),
             destination_port: c.remote_addr.as_deref().and_then(|a| a.split(':').nth(1).and_then(|p| p.parse().ok())),
             ..Default::default()

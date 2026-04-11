@@ -9,7 +9,10 @@ use axum::response::IntoResponse;
 use crate::stats::models::FlowStats;
 
 use super::errors::ApiError;
-use super::models::{AllStatsResponse, ApiResponse, HealthResponse, SystemStats};
+use super::models::{
+    AllStatsResponse, ApiResponse, HealthResponse, InputStatusEntry, OutputStatusEntry,
+    SystemStats,
+};
 use super::server::AppState;
 
 /// `GET /api/v1/stats` -- Retrieve aggregated system and per-flow statistics.
@@ -43,6 +46,91 @@ pub async fn gather_all_stats(state: &AppState) -> AllStatsResponse {
         }
     }
 
+    // Build independent input inventory with live stats
+    let inputs: Vec<InputStatusEntry> = config
+        .inputs
+        .iter()
+        .map(|inp_def| {
+            // Find the flow that references this input
+            let assigned_flow = config
+                .flows
+                .iter()
+                .find(|f| f.input_id.as_deref() == Some(&inp_def.id));
+
+            // If assigned, pull live stats from the flow snapshot
+            let live = assigned_flow.and_then(|fc| {
+                flow_stats.iter().find(|fs| fs.flow_id == fc.id)
+            });
+
+            // Check standby listener status for unassigned inputs
+            let standby = state.standby_listeners.as_ref()
+                .and_then(|sl| sl.get_status(&inp_def.id));
+
+            InputStatusEntry {
+                input_id: inp_def.id.clone(),
+                input_name: inp_def.name.clone(),
+                input_type: inp_def.config.type_name().to_string(),
+                assigned_flow_id: assigned_flow.map(|f| f.id.clone()),
+                assigned_flow_name: assigned_flow.map(|f| f.name.clone()),
+                state: live
+                    .map(|fs| fs.input.state.clone())
+                    .or_else(|| standby.as_ref().map(|s| s.state.clone()))
+                    .unwrap_or_else(|| {
+                        if assigned_flow.is_some() { "Idle".to_string() } else { "Unassigned".to_string() }
+                    }),
+                packets_received: live.map(|fs| fs.input.packets_received).unwrap_or(0),
+                bytes_received: live.map(|fs| fs.input.bytes_received).unwrap_or(0),
+                bitrate_bps: live.map(|fs| fs.input.bitrate_bps).unwrap_or(0),
+                packets_lost: live.map(|fs| fs.input.packets_lost).unwrap_or(0),
+                packets_recovered_fec: live.map(|fs| fs.input.packets_recovered_fec).unwrap_or(0),
+                redundancy_switches: live.map(|fs| fs.input.redundancy_switches).unwrap_or(0),
+                srt_stats: live.and_then(|fs| fs.input.srt_stats.clone()),
+                srt_leg2_stats: live.and_then(|fs| fs.input.srt_leg2_stats.clone()),
+            }
+        })
+        .collect();
+
+    // Build independent output inventory with live stats
+    let outputs: Vec<OutputStatusEntry> = config
+        .outputs
+        .iter()
+        .map(|out_cfg| {
+            let out_id = out_cfg.id();
+            let assigned_flow = config
+                .flows
+                .iter()
+                .find(|f| f.output_ids.iter().any(|oid| oid == out_id));
+
+            // Find the matching OutputStats within the flow snapshot
+            let live_output = assigned_flow.and_then(|fc| {
+                flow_stats
+                    .iter()
+                    .find(|fs| fs.flow_id == fc.id)
+                    .and_then(|fs| fs.outputs.iter().find(|os| os.output_id == out_id))
+            });
+
+            OutputStatusEntry {
+                output_id: out_id.to_string(),
+                output_name: out_cfg.name().to_string(),
+                output_type: out_cfg.type_name().to_string(),
+                assigned_flow_id: assigned_flow.map(|f| f.id.clone()),
+                assigned_flow_name: assigned_flow.map(|f| f.name.clone()),
+                state: live_output
+                    .map(|os| os.state.clone())
+                    .unwrap_or_else(|| {
+                        if assigned_flow.is_some() { "Idle".to_string() } else { "Unassigned".to_string() }
+                    }),
+                packets_sent: live_output.map(|os| os.packets_sent).unwrap_or(0),
+                bytes_sent: live_output.map(|os| os.bytes_sent).unwrap_or(0),
+                bitrate_bps: live_output.map(|os| os.bitrate_bps).unwrap_or(0),
+                packets_dropped: live_output.map(|os| os.packets_dropped).unwrap_or(0),
+                fec_packets_sent: live_output.map(|os| os.fec_packets_sent).unwrap_or(0),
+                srt_stats: live_output.and_then(|os| os.srt_stats.clone()),
+                srt_leg2_stats: live_output.and_then(|os| os.srt_leg2_stats.clone()),
+            }
+        })
+        .collect();
+
     AllStatsResponse {
         system: SystemStats {
             uptime_secs: uptime,
@@ -51,6 +139,8 @@ pub async fn gather_all_stats(state: &AppState) -> AllStatsResponse {
             version: env!("CARGO_PKG_VERSION").to_string(),
         },
         flows: flow_stats,
+        inputs,
+        outputs,
     }
 }
 

@@ -63,7 +63,7 @@ If neither file exists at startup, an empty default configuration is used. Both 
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "device_name": "Studio-A Encoder",
   "setup_enabled": true,
   "server": {
@@ -96,58 +96,64 @@ If neither file exists at startup, an empty default configuration is used. Both 
     "listen_addr": "0.0.0.0",
     "listen_port": 9090
   },
+  "inputs": [
+    {
+      "id": "rtp-in",
+      "name": "Main RTP Input",
+      "type": "rtp",
+      "bind_addr": "239.1.1.1:5000",
+      "interface_addr": "192.168.1.100",
+      "fec_decode": {
+        "columns": 10,
+        "rows": 10
+      },
+      "allowed_sources": ["10.0.0.1", "10.0.0.2"],
+      "allowed_payload_types": [33],
+      "max_bitrate_mbps": 100.0,
+      "tr07_mode": true
+    }
+  ],
+  "outputs": [
+    {
+      "type": "rtp",
+      "id": "rtp-local",
+      "name": "Local Playout",
+      "dest_addr": "192.168.1.50:5004",
+      "interface_addr": "192.168.1.100",
+      "fec_encode": {
+        "columns": 10,
+        "rows": 10
+      },
+      "dscp": 46
+    },
+    {
+      "type": "srt",
+      "id": "srt-remote",
+      "name": "Remote Site via SRT",
+      "mode": "caller",
+      "local_addr": "0.0.0.0:0",
+      "remote_addr": "203.0.113.10:9000",
+      "latency_ms": 500,
+      "passphrase": "my-encryption-passphrase",
+      "aes_key_len": 32
+    },
+    {
+      "type": "rtmp",
+      "id": "twitch-out",
+      "name": "Twitch Stream",
+      "dest_url": "rtmp://live.twitch.tv/app",
+      "stream_key": "live_123456789_abcdefghijklmnop",
+      "reconnect_delay_secs": 5,
+      "max_reconnect_attempts": 10
+    }
+  ],
   "flows": [
     {
       "id": "main-feed",
       "name": "Main Program Feed",
       "enabled": true,
-      "input": {
-        "type": "rtp",
-        "bind_addr": "239.1.1.1:5000",
-        "interface_addr": "192.168.1.100",
-        "fec_decode": {
-          "columns": 10,
-          "rows": 10
-        },
-        "allowed_sources": ["10.0.0.1", "10.0.0.2"],
-        "allowed_payload_types": [33],
-        "max_bitrate_mbps": 100.0,
-        "tr07_mode": true
-      },
-      "outputs": [
-        {
-          "type": "rtp",
-          "id": "rtp-local",
-          "name": "Local Playout",
-          "dest_addr": "192.168.1.50:5004",
-          "interface_addr": "192.168.1.100",
-          "fec_encode": {
-            "columns": 10,
-            "rows": 10
-          },
-          "dscp": 46
-        },
-        {
-          "type": "srt",
-          "id": "srt-remote",
-          "name": "Remote Site via SRT",
-          "mode": "caller",
-          "local_addr": "0.0.0.0:0",
-          "remote_addr": "203.0.113.10:9000",
-          "latency_ms": 500,
-          "passphrase": "my-encryption-passphrase",
-          "aes_key_len": 32
-        },
-        {
-          "type": "rtmp",
-          "id": "twitch-out",
-          "name": "Twitch Stream",
-          "dest_url": "rtmp://live.twitch.tv/app",
-          "stream_key": "live_123456789_abcdefghijklmnop",
-          "reconnect_delay_secs": 5,
-          "max_reconnect_attempts": 10
-        }
-      ]
+      "input_id": "rtp-in",
+      "output_ids": ["rtp-local", "srt-remote", "twitch-out"]
     }
   ]
 }
@@ -159,14 +165,16 @@ If neither file exists at startup, an empty default configuration is used. Both 
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `version` | integer | Yes | - | Schema version. Currently must be `1`. |
+| `version` | integer | Yes | - | Schema version. Must be `2`. |
 | `node_id` | string | No | Auto-generated | Persistent UUID v4 identifying this edge node. Auto-generated on first startup and saved to config. Used as the NMOS IS-04 Node ID. |
 | `device_name` | string | No | `null` | Optional human-readable label for this edge node (e.g. "Studio-A Encoder"). Max 256 characters. |
 | `setup_enabled` | boolean | No | `true` | When true, the browser-based setup wizard is accessible at `/setup`. Set to false to disable after provisioning. |
 | `server` | object | Yes | - | API server configuration. |
 | `monitor` | object | No | `null` | Web monitoring dashboard configuration. |
 | `manager` | object | No | `null` | Manager WebSocket connection configuration. See [Manager Configuration](#manager-configuration). |
-| `flows` | array | No | `[]` | List of flow configurations. See [Flow Configuration](#flow-configuration). |
+| `inputs` | array | No | `[]` | Top-level input definitions. Each is an `InputDefinition` with `id`, `name`, and flattened protocol-specific fields (enum-tagged by `type`). See [Input Types](#input-types). Inputs exist independently and are referenced by flows via `input_id`. |
+| `outputs` | array | No | `[]` | Top-level output definitions. Each is an `OutputConfig` with `id`, `name`, and protocol-specific fields (enum-tagged by `type`). See [Output Types](#output-types). Outputs exist independently and are referenced by flows via `output_ids`. |
+| `flows` | array | No | `[]` | List of flow configurations. Each flow references one input and zero or more outputs by ID. See [Flow Configuration](#flow-configuration). |
 | `tunnels` | array | No | `[]` | List of IP tunnel configurations. See [Tunnel Configuration](#tunnel-configuration). |
 
 ---
@@ -404,15 +412,17 @@ One edge has a public IP. Direct QUIC connection between edges — no relay need
 
 ## Flow Configuration
 
-Each flow defines one input source fanning out to one or more output destinations.
+Flows connect one input to zero or more outputs by reference. Inputs and outputs are defined as independent top-level entities in the `inputs` and `outputs` arrays; a flow references them by ID via `input_id` and `output_ids`. An input or output can only be assigned to one flow at a time. Unassigned inputs and outputs are configured but not running.
+
+At startup (or on create/update), `AppConfig::resolve_flow()` dereferences the IDs into a `ResolvedFlow` containing the full `InputDefinition` and `Vec<OutputConfig>`. The engine only ever sees `ResolvedFlow`.
 
 ```json
 {
   "id": "main-feed",
   "name": "Main Program Feed",
   "enabled": true,
-  "input": { ... },
-  "outputs": [ ... ]
+  "input_id": "rtp-in",
+  "output_ids": ["rtp-local", "srt-remote", "twitch-out"]
 }
 ```
 
@@ -425,8 +435,8 @@ Each flow defines one input source fanning out to one or more output destination
 | `thumbnail` | boolean | No | `true` | Enable thumbnail generation (requires ffmpeg). |
 | `thumbnail_program_number` | integer | No | `null` | When the input is an MPTS, render the thumbnail from this MPEG-TS program only. `null` lets ffmpeg pick the first program it finds. Must be `> 0` if set. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 | `bandwidth_limit` | object | No | `null` | Per-flow bandwidth monitoring (RP 2129). See [Bandwidth Limit](#bandwidth-limit). |
-| `input` | object | Yes | - | Input source configuration (RTP, UDP, SRT, RTMP, RTSP, WebRTC, or WHEP). |
-| `outputs` | array | Yes | - | Output destination configurations. Can be empty. Output IDs must be unique within the flow. |
+| `input_id` | string | Yes | - | ID of an input from the top-level `inputs` array. The referenced input must exist and must not already be assigned to another flow. |
+| `output_ids` | array of strings | No | `[]` | IDs of outputs from the top-level `outputs` array. Each referenced output must exist and must not already be assigned to another flow. Can be empty (input-only flow). |
 
 ### Bandwidth Limit
 
@@ -458,7 +468,9 @@ Optional per-flow bandwidth monitoring for SMPTE RP 2129 trust boundary enforcem
 
 ## Input Types
 
-The `input` object uses a `type` discriminator field to determine which input variant is used: `rtp`, `udp`, `srt`, `rtmp`, `rtsp`, `webrtc`, or `whep`.
+Each entry in the top-level `inputs` array is an `InputDefinition` with `id`, `name`, and the protocol-specific fields flattened in (enum-tagged by `type`). Inputs are independent top-level entities that exist whether or not they are assigned to a flow. They are managed via REST at `/api/v1/inputs` (CRUD) and via manager WebSocket commands.
+
+The `type` discriminator field determines which input variant is used: `rtp`, `udp`, `srt`, `rtmp`, `rtsp`, `webrtc`, or `whep`.
 
 ### RTP Input
 
@@ -644,7 +656,9 @@ Pulls media from an external WHEP server. The edge acts as a WHEP client. The `w
 
 ## Output Types
 
-Each output has a `type` discriminator. All outputs share `id` and `name` fields.
+Each entry in the top-level `outputs` array is an `OutputConfig` with `id`, `name`, and protocol-specific fields (enum-tagged by `type`). Outputs are independent top-level entities that exist whether or not they are assigned to a flow. They are managed via REST at `/api/v1/outputs` (CRUD) and via manager WebSocket commands.
+
+All outputs share `id` and `name` fields.
 
 ### RTP Output
 
@@ -669,7 +683,7 @@ Sends RTP-wrapped MPEG-TS packets to a unicast or multicast destination. Support
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `type` | string | Yes | - | Must be `"rtp"`. |
-| `id` | string | Yes | - | Unique output ID within the flow. Cannot be empty. |
+| `id` | string | Yes | - | Unique output ID. Cannot be empty. |
 | `name` | string | Yes | - | Human-readable display name. |
 | `dest_addr` | string | Yes | - | Destination socket address (`ip:port`). For multicast, use the group address (e.g., `"239.1.2.1:5004"`). IPv6: `"[::1]:5004"`. |
 | `bind_addr` | string | No | `"0.0.0.0:0"` | Source bind address. Use to control the source IP/port of outgoing packets. Must be same address family as `dest_addr`. |
@@ -703,7 +717,7 @@ Sends raw MPEG-TS over UDP without RTP headers. Datagrams are TS-aligned (7×188
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `type` | string | Yes | - | Must be `"udp"`. |
-| `id` | string | Yes | - | Unique output ID within the flow. |
+| `id` | string | Yes | - | Unique output ID. |
 | `name` | string | Yes | - | Human-readable display name. |
 | `dest_addr` | string | Yes | - | Destination socket address (`ip:port`). For multicast, use the group address. |
 | `bind_addr` | string | No | `"0.0.0.0:0"` | Source bind address. Must be same address family as `dest_addr`. |
@@ -748,7 +762,7 @@ Sends RTP encapsulated in SRT.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `type` | string | Yes | - | Must be `"srt"`. |
-| `id` | string | Yes | - | Unique output ID within the flow. Cannot be empty. |
+| `id` | string | Yes | - | Unique output ID. Cannot be empty. |
 | `name` | string | Yes | - | Human-readable display name. |
 | `mode` | string | Yes | - | SRT connection mode: `"caller"`, `"listener"`, or `"rendezvous"`. |
 | `local_addr` | string | Yes | - | Local socket address to bind. Use `"0.0.0.0:0"` for caller mode (ephemeral port). |
@@ -944,10 +958,12 @@ All outputs — and the thumbnail generator — accept an optional `program_numb
 
 ```json
 {
-  "id": "mpts-flow",
-  "name": "Dual-program feed",
-  "thumbnail_program_number": 1,
-  "input": { "type": "udp", "bind_addr": "0.0.0.0:5020" },
+  "inputs": [
+    {
+      "id": "mpts-in", "name": "MPTS Source",
+      "type": "udp", "bind_addr": "0.0.0.0:5020"
+    }
+  ],
   "outputs": [
     {
       "type": "udp", "id": "archive", "name": "Archive full MPTS",
@@ -963,6 +979,14 @@ All outputs — and the thumbnail generator — accept an optional `program_numb
       "dest_url": "rtmp://live.example.com/app",
       "stream_key": "my-key",
       "program_number": 2
+    }
+  ],
+  "flows": [
+    {
+      "id": "mpts-flow", "name": "Dual-program feed",
+      "thumbnail_program_number": 1,
+      "input_id": "mpts-in",
+      "output_ids": ["archive", "prog1-viewer", "prog2-rtmp"]
     }
   ]
 }
@@ -1088,15 +1112,17 @@ RUST_LOG=bilbycast_edge=debug,tower_http=info bilbycast-edge --config config.jso
 
 ## Config Persistence Behavior
 
-bilbycast-edge automatically persists configuration changes to disk when flows are modified through the API. Flow configs (including user parameters like SRT passphrases, RTSP credentials, RTMP keys) go to `config.json`, infrastructure secrets go to `secrets.json`:
+bilbycast-edge automatically persists configuration changes to disk when inputs, outputs, or flows are modified through the API. Operational config (including user parameters like SRT passphrases, RTSP credentials, RTMP keys) goes to `config.json`, infrastructure secrets go to `secrets.json`:
 
-- **Create flow** (`POST /api/v1/flows`) -- Appends the new flow and saves (flow parameters stay in `config.json`).
+- **Create/Update/Delete input** (`POST/PUT/DELETE /api/v1/inputs[/{id}]`) -- Modifies the top-level `inputs` array and saves.
+- **Create/Update/Delete output** (`POST/PUT/DELETE /api/v1/outputs[/{id}]`) -- Modifies the top-level `outputs` array and saves.
+- **Create flow** (`POST /api/v1/flows`) -- Appends the new flow and saves.
 - **Update flow** (`PUT /api/v1/flows/{id}`) -- Replaces the flow in-place and saves.
 - **Delete flow** (`DELETE /api/v1/flows/{id}`) -- Removes the flow and saves.
-- **Add output** (`POST /api/v1/flows/{id}/outputs`) -- Appends the output and saves.
-- **Remove output** (`DELETE /api/v1/flows/{id}/outputs/{oid}`) -- Removes the output and saves.
+- **Add output** (`POST /api/v1/flows/{id}/outputs`) -- Assigns an existing output to the flow by ID and saves.
+- **Remove output** (`DELETE /api/v1/flows/{id}/outputs/{oid}`) -- Unassigns the output from the flow and saves.
 - **Replace config** (`PUT /api/v1/config`) -- Replaces the entire config and saves.
-- **Get config** (`GET /api/v1/config`) -- Returns the config with infrastructure secrets stripped. Flow parameters (passphrases, credentials, keys) are included in the response.
+- **Get config** (`GET /api/v1/config`) -- Returns the config with infrastructure secrets stripped. User parameters (passphrases, credentials, keys) are included in the response.
 
 ### Atomic writes
 
@@ -1108,11 +1134,13 @@ If the config file does not exist when bilbycast-edge starts, an empty default c
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "server": {
     "listen_addr": "0.0.0.0",
     "listen_port": 8080
   },
+  "inputs": [],
+  "outputs": [],
   "flows": []
 }
 ```
@@ -1129,28 +1157,34 @@ Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "server": {
     "listen_addr": "0.0.0.0",
     "listen_port": 8080
   },
+  "inputs": [
+    {
+      "id": "rtp-in",
+      "name": "RTP Receive",
+      "type": "rtp",
+      "bind_addr": "0.0.0.0:5000"
+    }
+  ],
+  "outputs": [
+    {
+      "type": "rtp",
+      "id": "out-1",
+      "name": "Forwarded Output",
+      "dest_addr": "192.168.1.50:5004"
+    }
+  ],
   "flows": [
     {
       "id": "passthrough",
       "name": "RTP Passthrough",
       "enabled": true,
-      "input": {
-        "type": "rtp",
-        "bind_addr": "0.0.0.0:5000"
-      },
-      "outputs": [
-        {
-          "type": "rtp",
-          "id": "out-1",
-          "name": "Forwarded Output",
-          "dest_addr": "192.168.1.50:5004"
-        }
-      ]
+      "input_id": "rtp-in",
+      "output_ids": ["out-1"]
     }
   ]
 }
@@ -1160,43 +1194,49 @@ Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "server": {
     "listen_addr": "0.0.0.0",
     "listen_port": 8080
   },
+  "inputs": [
+    {
+      "id": "mcast-in",
+      "name": "Multicast with FEC and Trust Boundary",
+      "type": "rtp",
+      "bind_addr": "239.1.1.1:5000",
+      "interface_addr": "10.0.0.100",
+      "fec_decode": {
+        "columns": 10,
+        "rows": 10
+      },
+      "allowed_sources": ["10.0.0.1"],
+      "allowed_payload_types": [33],
+      "max_bitrate_mbps": 50.0,
+      "tr07_mode": true
+    }
+  ],
+  "outputs": [
+    {
+      "type": "rtp",
+      "id": "local-out",
+      "name": "Local Multicast Output",
+      "dest_addr": "239.1.2.1:5004",
+      "interface_addr": "10.0.0.100",
+      "fec_encode": {
+        "columns": 10,
+        "rows": 10
+      },
+      "dscp": 46
+    }
+  ],
   "flows": [
     {
       "id": "multicast-feed",
       "name": "Multicast with FEC and Trust Boundary",
       "enabled": true,
-      "input": {
-        "type": "rtp",
-        "bind_addr": "239.1.1.1:5000",
-        "interface_addr": "10.0.0.100",
-        "fec_decode": {
-          "columns": 10,
-          "rows": 10
-        },
-        "allowed_sources": ["10.0.0.1"],
-        "allowed_payload_types": [33],
-        "max_bitrate_mbps": 50.0,
-        "tr07_mode": true
-      },
-      "outputs": [
-        {
-          "type": "rtp",
-          "id": "local-out",
-          "name": "Local Multicast Output",
-          "dest_addr": "239.1.2.1:5004",
-          "interface_addr": "10.0.0.100",
-          "fec_encode": {
-            "columns": 10,
-            "rows": 10
-          },
-          "dscp": 46
-        }
-      ]
+      "input_id": "mcast-in",
+      "output_ids": ["local-out"]
     }
   ]
 }
@@ -1206,52 +1246,58 @@ Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "server": {
     "listen_addr": "0.0.0.0",
     "listen_port": 8080
   },
+  "inputs": [
+    {
+      "id": "srt-in",
+      "name": "SRT Redundant Input",
+      "type": "srt",
+      "mode": "listener",
+      "local_addr": "0.0.0.0:9000",
+      "latency_ms": 500,
+      "passphrase": "my-secure-passphrase-1234",
+      "aes_key_len": 32,
+      "redundancy": {
+        "mode": "listener",
+        "local_addr": "0.0.0.0:9001",
+        "latency_ms": 500,
+        "passphrase": "my-secure-passphrase-1234",
+        "aes_key_len": 32
+      }
+    }
+  ],
+  "outputs": [
+    {
+      "type": "srt",
+      "id": "srt-out",
+      "name": "SRT Redundant Output",
+      "mode": "caller",
+      "local_addr": "0.0.0.0:0",
+      "remote_addr": "203.0.113.10:9000",
+      "latency_ms": 500,
+      "passphrase": "output-passphrase-1234567",
+      "aes_key_len": 32,
+      "redundancy": {
+        "mode": "caller",
+        "local_addr": "0.0.0.0:0",
+        "remote_addr": "203.0.113.11:9000",
+        "latency_ms": 500,
+        "passphrase": "output-passphrase-1234567",
+        "aes_key_len": 32
+      }
+    }
+  ],
   "flows": [
     {
       "id": "srt-redundant",
       "name": "SRT with Hitless Redundancy",
       "enabled": true,
-      "input": {
-        "type": "srt",
-        "mode": "listener",
-        "local_addr": "0.0.0.0:9000",
-        "latency_ms": 500,
-        "passphrase": "my-secure-passphrase-1234",
-        "aes_key_len": 32,
-        "redundancy": {
-          "mode": "listener",
-          "local_addr": "0.0.0.0:9001",
-          "latency_ms": 500,
-          "passphrase": "my-secure-passphrase-1234",
-          "aes_key_len": 32
-        }
-      },
-      "outputs": [
-        {
-          "type": "srt",
-          "id": "srt-out",
-          "name": "SRT Redundant Output",
-          "mode": "caller",
-          "local_addr": "0.0.0.0:0",
-          "remote_addr": "203.0.113.10:9000",
-          "latency_ms": 500,
-          "passphrase": "output-passphrase-1234567",
-          "aes_key_len": 32,
-          "redundancy": {
-            "mode": "caller",
-            "local_addr": "0.0.0.0:0",
-            "remote_addr": "203.0.113.11:9000",
-            "latency_ms": 500,
-            "passphrase": "output-passphrase-1234567",
-            "aes_key_len": 32
-          }
-        }
-      ]
+      "input_id": "srt-in",
+      "output_ids": ["srt-out"]
     }
   ]
 }
@@ -1261,52 +1307,58 @@ Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "server": {
     "listen_addr": "0.0.0.0",
     "listen_port": 8080
   },
+  "inputs": [
+    {
+      "id": "mcast-in",
+      "name": "Multicast Source",
+      "type": "rtp",
+      "bind_addr": "239.1.1.1:5000",
+      "interface_addr": "192.168.1.100"
+    }
+  ],
+  "outputs": [
+    {
+      "type": "rtp",
+      "id": "local",
+      "name": "Local Playout",
+      "dest_addr": "192.168.1.50:5004"
+    },
+    {
+      "type": "srt",
+      "id": "remote-srt",
+      "name": "Remote Site SRT",
+      "mode": "caller",
+      "local_addr": "0.0.0.0:0",
+      "remote_addr": "203.0.113.10:9000",
+      "latency_ms": 300
+    },
+    {
+      "type": "rtmp",
+      "id": "twitch",
+      "name": "Twitch",
+      "dest_url": "rtmp://live.twitch.tv/app",
+      "stream_key": "live_xxxxxxxxxxxx"
+    },
+    {
+      "type": "hls",
+      "id": "youtube-hls",
+      "name": "YouTube HLS",
+      "ingest_url": "https://a.upload.youtube.com/http_upload_hls?cid=xxxx",
+      "segment_duration_secs": 2.0
+    }
+  ],
   "flows": [
     {
       "id": "multi-output",
       "name": "Multi-Output Fan-Out",
       "enabled": true,
-      "input": {
-        "type": "rtp",
-        "bind_addr": "239.1.1.1:5000",
-        "interface_addr": "192.168.1.100"
-      },
-      "outputs": [
-        {
-          "type": "rtp",
-          "id": "local",
-          "name": "Local Playout",
-          "dest_addr": "192.168.1.50:5004"
-        },
-        {
-          "type": "srt",
-          "id": "remote-srt",
-          "name": "Remote Site SRT",
-          "mode": "caller",
-          "local_addr": "0.0.0.0:0",
-          "remote_addr": "203.0.113.10:9000",
-          "latency_ms": 300
-        },
-        {
-          "type": "rtmp",
-          "id": "twitch",
-          "name": "Twitch",
-          "dest_url": "rtmp://live.twitch.tv/app",
-          "stream_key": "live_xxxxxxxxxxxx"
-        },
-        {
-          "type": "hls",
-          "id": "youtube-hls",
-          "name": "YouTube HLS",
-          "ingest_url": "https://a.upload.youtube.com/http_upload_hls?cid=xxxx",
-          "segment_duration_secs": 2.0
-        }
-      ]
+      "input_id": "mcast-in",
+      "output_ids": ["local", "remote-srt", "twitch", "youtube-hls"]
     }
   ]
 }
@@ -1316,7 +1368,7 @@ Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "server": {
     "listen_addr": "0.0.0.0",
     "listen_port": 8443,
@@ -1347,40 +1399,46 @@ Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json
     "listen_addr": "0.0.0.0",
     "listen_port": 9090
   },
+  "inputs": [
+    {
+      "id": "rtp-in",
+      "name": "Main RTP Input",
+      "type": "rtp",
+      "bind_addr": "239.1.1.1:5000",
+      "interface_addr": "10.0.0.100",
+      "fec_decode": {
+        "columns": 10,
+        "rows": 10
+      }
+    }
+  ],
+  "outputs": [
+    {
+      "type": "rtp",
+      "id": "local-playout",
+      "name": "Local Playout",
+      "dest_addr": "10.0.0.50:5004",
+      "dscp": 46
+    },
+    {
+      "type": "srt",
+      "id": "remote-site",
+      "name": "Remote Site",
+      "mode": "caller",
+      "local_addr": "0.0.0.0:0",
+      "remote_addr": "203.0.113.10:9000",
+      "latency_ms": 500,
+      "passphrase": "secure-transport-key-1234",
+      "aes_key_len": 32
+    }
+  ],
   "flows": [
     {
       "id": "main-feed",
       "name": "Main Program Feed",
       "enabled": true,
-      "input": {
-        "type": "rtp",
-        "bind_addr": "239.1.1.1:5000",
-        "interface_addr": "10.0.0.100",
-        "fec_decode": {
-          "columns": 10,
-          "rows": 10
-        }
-      },
-      "outputs": [
-        {
-          "type": "rtp",
-          "id": "local-playout",
-          "name": "Local Playout",
-          "dest_addr": "10.0.0.50:5004",
-          "dscp": 46
-        },
-        {
-          "type": "srt",
-          "id": "remote-site",
-          "name": "Remote Site",
-          "mode": "caller",
-          "local_addr": "0.0.0.0:0",
-          "remote_addr": "203.0.113.10:9000",
-          "latency_ms": 500,
-          "passphrase": "secure-transport-key-1234",
-          "aes_key_len": 32
-        }
-      ]
+      "input_id": "rtp-in",
+      "output_ids": ["local-playout", "remote-site"]
     }
   ]
 }
@@ -1390,30 +1448,36 @@ Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "server": {
     "listen_addr": "0.0.0.0",
     "listen_port": 8080
   },
+  "inputs": [
+    {
+      "id": "ipv6-in",
+      "name": "IPv6 Multicast Input",
+      "type": "rtp",
+      "bind_addr": "[ff7e::1]:5000",
+      "interface_addr": "::1"
+    }
+  ],
+  "outputs": [
+    {
+      "type": "rtp",
+      "id": "ipv6-out",
+      "name": "IPv6 Output",
+      "dest_addr": "[ff7e::2]:5004",
+      "interface_addr": "::1"
+    }
+  ],
   "flows": [
     {
       "id": "ipv6-mcast",
       "name": "IPv6 Multicast Flow",
       "enabled": true,
-      "input": {
-        "type": "rtp",
-        "bind_addr": "[ff7e::1]:5000",
-        "interface_addr": "::1"
-      },
-      "outputs": [
-        {
-          "type": "rtp",
-          "id": "ipv6-out",
-          "name": "IPv6 Output",
-          "dest_addr": "[ff7e::2]:5004",
-          "interface_addr": "::1"
-        }
-      ]
+      "input_id": "ipv6-in",
+      "output_ids": ["ipv6-out"]
     }
   ]
 }
@@ -1450,25 +1514,33 @@ deserialize unchanged.
 
 ```json
 {
+  "id": "st2110-30-in",
+  "name": "Studio A — stereo",
+  "type": "st2110_30",
+  "bind_addr": "239.0.0.10:5000",
+  "interface_addr": "10.0.0.5",
+  "sample_rate": 48000,
+  "bit_depth": 24,
+  "channels": 2,
+  "packet_time_us": 1000,
+  "payload_type": 97,
+  "redundancy": {
+    "addr": "239.1.0.10:5000",
+    "interface_addr": "10.1.0.5"
+  }
+}
+```
+
+A flow referencing this input would set `clock_domain` and `flow_group_id` at the flow level:
+
+```json
+{
   "id": "studio-a-stereo",
   "name": "Studio A — stereo",
   "enabled": true,
   "clock_domain": 0,
-  "input": {
-    "type": "st2110_30",
-    "bind_addr": "239.0.0.10:5000",
-    "interface_addr": "10.0.0.5",
-    "sample_rate": 48000,
-    "bit_depth": 24,
-    "channels": 2,
-    "packet_time_us": 1000,
-    "payload_type": 97,
-    "redundancy": {
-      "addr": "239.1.0.10:5000",
-      "interface_addr": "10.1.0.5"
-    }
-  },
-  "outputs": []
+  "input_id": "st2110-30-in",
+  "output_ids": []
 }
 ```
 
@@ -1538,37 +1610,51 @@ no NMOS `clock_domain` advertising, and a relaxed sample-rate set
 over the public internet, talkback between studios that don't share a
 PTP fabric, and ffmpeg / OBS / GStreamer interop.
 
+Input definition in the top-level `inputs` array:
+
+```json
+{
+  "id": "perth-receive-in",
+  "name": "Sydney → Perth contribution receiver",
+  "type": "rtp_audio",
+  "bind_addr": "0.0.0.0:5004",
+  "sample_rate": 48000,
+  "bit_depth": 24,
+  "channels": 2,
+  "packet_time_us": 4000,
+  "payload_type": 97
+}
+```
+
+Output definition in the top-level `outputs` array:
+
+```json
+{
+  "type": "st2110_30",
+  "id": "perth-monitor",
+  "name": "Perth monitor multicast",
+  "dest_addr": "239.20.0.10:5004",
+  "sample_rate": 44100,
+  "bit_depth": 16,
+  "channels": 2,
+  "packet_time_us": 1000,
+  "payload_type": 97,
+  "transcode": {
+    "sample_rate": 44100,
+    "bit_depth": 16,
+    "channels": 2
+  }
+}
+```
+
+Flow wiring them together:
+
 ```json
 {
   "id": "perth-receive",
-  "name": "Sydney → Perth contribution receiver",
-  "input": {
-    "type": "rtp_audio",
-    "bind_addr": "0.0.0.0:5004",
-    "sample_rate": 48000,
-    "bit_depth": 24,
-    "channels": 2,
-    "packet_time_us": 4000,
-    "payload_type": 97
-  },
-  "outputs": [
-    {
-      "type": "st2110_30",
-      "id": "perth-monitor",
-      "name": "Perth monitor multicast",
-      "dest_addr": "239.20.0.10:5004",
-      "sample_rate": 44100,
-      "bit_depth": 16,
-      "channels": 2,
-      "packet_time_us": 1000,
-      "payload_type": 97,
-      "transcode": {
-        "sample_rate": 44100,
-        "bit_depth": 16,
-        "channels": 2
-      }
-    }
-  ]
+  "name": "Sydney → Perth contribution",
+  "input_id": "perth-receive-in",
+  "output_ids": ["perth-monitor"]
 }
 ```
 
@@ -1612,28 +1698,42 @@ constraint rationale, and the four runnable interop test scripts in
 
 ### ST 2110-40 ancillary input/output
 
+Input in the top-level `inputs` array:
+
+```json
+{
+  "id": "anc-in",
+  "name": "ANC input (timecode + SCTE-104)",
+  "type": "st2110_40",
+  "bind_addr": "239.0.0.20:5000",
+  "interface_addr": "10.0.0.5",
+  "payload_type": 100
+}
+```
+
+Output in the top-level `outputs` array:
+
+```json
+{
+  "type": "st2110_40",
+  "id": "anc-out",
+  "name": "ANC loopback",
+  "dest_addr": "239.2.0.20:5000",
+  "dscp": 46,
+  "payload_type": 100
+}
+```
+
+Flow:
+
 ```json
 {
   "id": "anc-flow",
   "name": "ANC (timecode + SCTE-104)",
   "enabled": true,
   "clock_domain": 0,
-  "input": {
-    "type": "st2110_40",
-    "bind_addr": "239.0.0.20:5000",
-    "interface_addr": "10.0.0.5",
-    "payload_type": 100
-  },
-  "outputs": [
-    {
-      "type": "st2110_40",
-      "id": "anc-out",
-      "name": "ANC loopback",
-      "dest_addr": "239.2.0.20:5000",
-      "dscp": 46,
-      "payload_type": 100
-    }
-  ]
+  "input_id": "anc-in",
+  "output_ids": ["anc-out"]
 }
 ```
 
@@ -1676,8 +1776,10 @@ config:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "server": { "...": "..." },
+  "inputs": [ "..." ],
+  "outputs": [ "..." ],
   "flow_groups": [
     {
       "id": "studio-a-program",

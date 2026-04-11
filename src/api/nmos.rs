@@ -463,11 +463,13 @@ fn build_device(
     let mut senders = Vec::new();
     let mut receivers = Vec::new();
     for flow in &config.flows {
-        if flow.input.is_some() {
+        if flow.input_id.is_some() {
             receivers.push(receiver_uuid(nid, &flow.id).to_string());
         }
-        for output in &flow.outputs {
-            senders.push(sender_uuid(nid, &flow.id, output_id(output)).to_string());
+        if let Ok(resolved) = config.resolve_flow(flow) {
+            for output in &resolved.outputs {
+                senders.push(sender_uuid(nid, &flow.id, output_id(output)).to_string());
+            }
         }
     }
     NmosDevice {
@@ -492,7 +494,8 @@ async fn list_sources(State(state): State<AppState>) -> Json<Vec<NmosSource>> {
         .flows
         .iter()
         .filter_map(|f| {
-            let input = f.input.as_ref()?;
+            let resolved = config.resolve_flow(f).ok()?;
+            let input = resolved.input.as_ref()?;
             Some(NmosSource {
                 id: source_uuid(&nid, &f.id).to_string(),
                 version: nmos_version(),
@@ -521,7 +524,11 @@ async fn get_source(
     let nid = node_uuid(&config);
     let did = device_uuid(&nid);
     for f in &config.flows {
-        let input = match f.input.as_ref() {
+        let resolved = match config.resolve_flow(f) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let input = match resolved.input.as_ref() {
             Some(i) => i,
             None => continue,
         };
@@ -555,7 +562,8 @@ async fn list_flows(State(state): State<AppState>) -> Json<Vec<NmosFlow>> {
         .flows
         .iter()
         .map(|f| {
-            let format = f.input.as_ref()
+            let resolved_input = config.resolve_flow(f).ok().and_then(|r| r.input);
+            let format = resolved_input.as_ref()
                 .map(|i| input_format(i))
                 .unwrap_or("urn:x-nmos:format:mux");
             NmosFlow {
@@ -584,7 +592,8 @@ async fn get_flow(
     for f in &config.flows {
         let fid = flow_uuid(&nid, &f.id);
         if id == fid.to_string() {
-            let format = f.input.as_ref()
+            let resolved_input = config.resolve_flow(f).ok().and_then(|r| r.input);
+            let format = resolved_input.as_ref()
                 .map(|i| input_format(i))
                 .unwrap_or("urn:x-nmos:format:mux");
             return Ok(Json(NmosFlow {
@@ -610,7 +619,11 @@ async fn list_senders(State(state): State<AppState>) -> Json<Vec<NmosSender>> {
     let mut senders = Vec::new();
     for f in &config.flows {
         let fid = flow_uuid(&nid, &f.id);
-        for output in &f.outputs {
+        let resolved = match config.resolve_flow(f) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for output in &resolved.outputs {
             senders.push(NmosSender {
                 id: sender_uuid(&nid, &f.id, output_id(output)).to_string(),
                 version: nmos_version(),
@@ -638,7 +651,11 @@ async fn get_sender(
     let did = device_uuid(&nid);
     for f in &config.flows {
         let fid = flow_uuid(&nid, &f.id);
-        for output in &f.outputs {
+        let resolved = match config.resolve_flow(f) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for output in &resolved.outputs {
             let sid = sender_uuid(&nid, &f.id, output_id(output));
             if id == sid.to_string() {
                 return Ok(Json(NmosSender {
@@ -672,17 +689,18 @@ async fn list_receivers(State(state): State<AppState>) -> Json<Vec<NmosReceiver>
         .flows
         .iter()
         .filter_map(|f| {
-            let input = f.input.as_ref()?;
+            let resolved = config.resolve_flow(f).ok()?;
+            let input = resolved.input?;
             Some(NmosReceiver {
                 id: receiver_uuid(&nid, &f.id).to_string(),
                 version: nmos_version(),
                 label: f.name.clone(),
-                description: format!("{} receiver ({})", f.name, input_type_str(input)),
+                description: format!("{} receiver ({})", f.name, input_type_str(&input)),
                 tags: serde_json::json!({}),
-                format: input_format(input).into(),
-                caps: receiver_caps(input),
+                format: input_format(&input).into(),
+                caps: receiver_caps(&input),
                 device_id: did.to_string(),
-                transport: input_transport(input).into(),
+                transport: input_transport(&input).into(),
                 interface_bindings: vec![],
                 subscription: serde_json::json!({"sender_id": null, "active": true}),
             })
@@ -699,7 +717,11 @@ async fn get_receiver(
     let nid = node_uuid(&config);
     let did = device_uuid(&nid);
     for f in &config.flows {
-        let input = match f.input.as_ref() {
+        let resolved = match config.resolve_flow(f) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let input = match resolved.input {
             Some(i) => i,
             None => continue,
         };
@@ -712,13 +734,13 @@ async fn get_receiver(
                 description: format!(
                     "{} receiver ({})",
                     f.name,
-                    input_type_str(input)
+                    input_type_str(&input)
                 ),
                 tags: serde_json::json!({}),
-                format: input_format(input).into(),
-                caps: receiver_caps(input),
+                format: input_format(&input).into(),
+                caps: receiver_caps(&input),
                 device_id: did.to_string(),
-                transport: input_transport(input).into(),
+                transport: input_transport(&input).into(),
                 interface_bindings: vec![],
                 subscription: serde_json::json!({"sender_id": null, "active": true}),
             }));

@@ -54,7 +54,9 @@ The system is split into three planes:
 
 ### Core Data Flow Model
 
-Each **flow** has exactly one input and N outputs connected via a `tokio::broadcast::channel(2048)`. The `FlowManager` (`src/engine/manager.rs`) holds all active flows in a `DashMap<FlowId, Arc<FlowRuntime>>`.
+**Inputs** and **outputs** are independent top-level entities in the config (`inputs` and `outputs` arrays). Each has a stable ID and name. **Flows** connect one input to N outputs by reference (`input_id` + `output_ids`). At startup (or on create/update), `AppConfig::resolve_flow()` dereferences the IDs into a `ResolvedFlow` containing the full `InputDefinition` and `Vec<OutputConfig>`. The engine only ever sees `ResolvedFlow` — the reference-resolution boundary lives in the API/config layer, not the engine.
+
+At runtime, each flow still has exactly one input and N outputs connected via a `tokio::broadcast::channel(2048)`. The `FlowManager` (`src/engine/manager.rs`) holds all active flows in a `DashMap<FlowId, Arc<FlowRuntime>>`. Hot-add/remove of outputs, backpressure rules, and fan-out behavior are unchanged.
 
 ```
 FlowManager (DashMap)
@@ -85,7 +87,7 @@ All data flows through a single type: `RtpPacket { data: Bytes, sequence_number:
 
 | Module | Key Files | Purpose |
 |--------|-----------|---------|
-| `engine/` | `manager.rs`, `flow.rs`, `packet.rs` | Flow lifecycle, FlowRuntime bring-up/teardown |
+| `engine/` | `manager.rs`, `flow.rs`, `packet.rs` | Flow lifecycle, FlowRuntime bring-up/teardown. `create_flow()` and `FlowRuntime::start()` accept `ResolvedFlow` (not raw config references) |
 | `engine/` | `input_rtp.rs`, `input_udp.rs`, `input_srt.rs`, `input_rtmp.rs` | Protocol-specific input tasks |
 | `engine/` | `delay_buffer.rs` | Per-output delay buffer for stream synchronization. `DelayBuffer` queues packets and releases them after a configurable delay. `resolve_output_delay()` is the entry point that resolves an `OutputDelay` config into a `DelayBuffer`, handling the async frame-rate wait for `TargetFrames` mode. Non-blocking, zero-copy (moves only the `RtpPacket` struct, not the `Bytes` data). Used to align parallel outputs with different processing latencies (e.g., clean feed vs. commentary-processed feed). |
 | `engine/` | `output_rtp.rs`, `output_udp.rs`, `output_srt.rs`, `output_rtmp.rs`, `output_hls.rs`, `output_webrtc.rs` | Protocol-specific output tasks. Every variant accepts an optional `program_number: u16` in its config. SRT, RTP, and UDP outputs also accept an optional `delay: OutputDelay` for stream synchronization — supports fixed delay (ms), target end-to-end latency (ms), or target latency in video frames (auto-detected fps). TS-native outputs (UDP/RTP/SRT/HLS) run a `TsProgramFilter` inline when set (MPTS→SPTS rewrite with FEC/2022-7 operating on the filtered bytes); re-muxing outputs (RTMP/WebRTC) pass the selector into `TsDemuxer::new` which either picks a specific program's PMT or — when unset — locks onto the lowest `program_number` in the PAT (deterministic default). **Audio encode (Phase B):** RTMP, HLS, and WebRTC outputs accept an optional `audio_encode` block. When set, the output decodes the input AAC-LC via `engine::audio_decode::AacDecoder` (Phase A), runs the planar f32 PCM through an `engine::audio_encode::AudioEncoder` ffmpeg subprocess that emits the configured codec (`aac_lc` / `he_aac_v1` / `he_aac_v2` / `opus` / `mp2` / `ac3` per the codec×output matrix), and re-injects the encoded frames into the egress path. RTMP and WebRTC use one persistent ffmpeg per output; HLS forks ffmpeg per segment as a TS-in/TS-out remuxer (`-c:v copy -c:a {codec}`). The pure-Rust binary is unchanged — ffmpeg is invoked at runtime via subprocess, never linked. Outputs without `audio_encode` set keep working without ffmpeg installed |
@@ -104,11 +106,13 @@ All data flows through a single type: `RtpPacket { data: Bytes, sequence_number:
 | `api/` | `webrtc.rs` | WHIP/WHEP HTTP endpoint handlers and session registry. **Important:** When a WebRTC/WHIP flow is created, its `whip_session_tx` (stored in `FlowRuntime`) must be registered with `WebrtcSessionRegistry` via `register_whip_input()` — this wiring happens in `main.rs`, `api/flows.rs`, and `manager/client.rs` after every `create_flow` call |
 | `fec/` | `encoder.rs`, `decoder.rs`, `matrix.rs` | SMPTE 2022-1 FEC (XOR column×row) |
 | `redundancy/` | `merger.rs` | SMPTE 2022-7 hitless merge (seq dedup from dual RTP or SRT legs) |
-| `api/` | `server.rs`, `auth.rs`, `flows.rs`, `stats.rs`, `tunnels.rs`, `ws.rs`, `nmos.rs`, `nmos_is05.rs` | Axum REST API, OAuth2/JWT, WebSocket stats, NMOS IS-04 Node API, NMOS IS-05 Connection Management |
-| `config/` | `models.rs`, `validation.rs`, `persistence.rs`, `secrets.rs` | JSON config, enum-tagged types, atomic save, secrets split (`config.json` + `secrets.json`) |
+| `api/` | `inputs.rs`, `outputs.rs` | CRUD endpoints for independent top-level inputs and outputs |
+| `api/` | `flows.rs` | Flow CRUD. Resolves `input_id`/`output_ids` references via `AppConfig::resolve_flow()` before engine calls. `add_output` takes an `output_id` (not inline config) and assigns it; `remove_output` unassigns an output from the flow |
+| `api/` | `server.rs`, `auth.rs`, `stats.rs`, `tunnels.rs`, `ws.rs`, `nmos.rs`, `nmos_is05.rs` | Axum REST API, OAuth2/JWT, WebSocket stats, NMOS IS-04 Node API, NMOS IS-05 Connection Management |
+| `config/` | `models.rs`, `validation.rs`, `persistence.rs`, `secrets.rs` | JSON config (version 2), enum-tagged types, atomic save, secrets split (`config.json` + `secrets.json`). `models.rs` defines `InputDefinition`, `OutputConfig` (top-level), `FlowConfig` (with `input_id`/`output_ids` references), `ResolvedFlow`, and the `AppConfig::resolve_flow()` method |
 | `stats/` | `collector.rs`, `models.rs`, `throughput.rs` | Lock-free stats registry, bitrate estimation |
 | `tunnel/` | `manager.rs`, `relay_client.rs`, `udp_forwarder.rs`, `tcp_forwarder.rs`, `crypto.rs`, `auth.rs` | QUIC-based IP tunnels (relay/direct), end-to-end encryption, HMAC-SHA256 bind authentication. `protocol.rs` defines `TUNNEL_PROTOCOL_VERSION`, `ParsedMessage<T>` + `read_message_resilient()` for graceful handling of unknown message types, and `Hello`/`HelloAck` handshake for version detection |
-| `manager/` | `client.rs`, `config.rs`, `events.rs` | WebSocket client to bilbycast-manager. Sends stats (1s), health (15s), thumbnails (10s), and operational events. `events.rs` defines `EventSender`/`EventSeverity`/`Event` types and the event channel. See `docs/events-and-alarms.md` for the full event reference. Auth payload includes `protocol_version` and `software_version` for compatibility detection. Handles commands: get_config, create/delete/start/stop flow, update_flow (diff-based), update_config (diff-based), add/remove output, create/delete tunnel. **GetConfig strips secrets** — `strip_secrets()` removes all sensitive fields before serializing the response, so the manager never receives `node_secret`, tunnel keys, SRT passphrases, etc. **UpdateConfig merges secrets** — incoming config from manager (which lacks secrets) is merged with existing local secrets before applying. **Config updates use diff logic** — `update_flow` and `update_config` compare old vs new using `PartialEq` and only restart flows when input/metadata changes; output-only changes are applied surgically via hot-add/remove without disrupting other outputs or SRT connections |
+| `manager/` | `client.rs`, `config.rs`, `events.rs` | WebSocket client to bilbycast-manager. Sends stats (1s), health (15s), thumbnails (10s), and operational events. `events.rs` defines `EventSender`/`EventSeverity`/`Event` types and the event channel. See `docs/events-and-alarms.md` for the full event reference. Auth payload includes `protocol_version` and `software_version` for compatibility detection. Handles commands: get_config, create/delete/start/stop flow, update_flow (diff-based), update_config (diff-based), add/remove output, create/delete tunnel, **plus 6 new input/output CRUD command handlers** (create/update/delete input, create/update/delete output). **GetConfig strips secrets** — `strip_secrets()` removes all sensitive fields before serializing the response, so the manager never receives `node_secret`, tunnel keys, SRT passphrases, etc. **UpdateConfig merges secrets** — incoming config from manager (which lacks secrets) is merged with existing local secrets before applying. **Config updates use diff logic** — `update_flow` and `update_config` compare old vs new using `PartialEq` and only restart flows when input/metadata changes; output-only changes are applied surgically via hot-add/remove without disrupting other outputs or SRT connections |
 | `monitor/` | `server.rs`, `dashboard.rs` | Embedded HTML/JS dashboard on separate port |
 | `setup/` | `handlers.rs`, `wizard.rs` | Browser-based setup wizard for initial provisioning (inline HTML, gated by `setup_enabled` config flag) |
 | `srt/` | `connection.rs` | SRT socket config via `SrtConnectionParams` struct, stats polling (45+ fields including FEC, ACK/NAK, flow control, buffer state), `convert_srt_stats()` |
@@ -140,8 +144,9 @@ SRT uses AES-128/192/256 encryption + passphrase auth with selectable cipher mod
 - RTP bitrate limit max 10 Gbps, HLS segments 0.5-10s, RTMP URL scheme validation
 - `program_number` (on every output) and `thumbnail_program_number` (on flow): must be `> 0` if set — program number 0 is reserved for the NIT in the MPEG-TS spec and never identifies a real program
 - Tunnel config: tunnel ID must be valid UUID, mode-specific required fields, address validation, PSK length limits, `tunnel_encryption_key` must be exactly 64 hex chars (32 bytes) when present (required for relay mode, optional for direct mode), `tunnel_bind_secret` must be exactly 64 hex chars if present
-- **Manager commands are validated before execution** — `create_flow`, `update_flow`, `add_output`, `update_config`, and `create_tunnel` all call their respective validation functions after deserialization
-- Duplicate flow ID detection on create
+- **Manager commands are validated before execution** — `create_flow`, `update_flow`, `add_output`, `update_config`, `create_tunnel`, and the new input/output CRUD commands all call their respective validation functions after deserialization
+- **Inputs and outputs are validated independently** — each is validated when created or updated, regardless of whether it is assigned to a flow
+- **Assignment uniqueness is enforced** — an input or output cannot be assigned to multiple flows simultaneously. Duplicate input/output/flow ID detection on create
 
 **Manager connection**: The WebSocket client to bilbycast-manager enforces `wss://` (TLS). Plaintext `ws://` URLs are rejected at connection time. Self-signed cert mode (`accept_self_signed_cert: true`) requires `BILBYCAST_ALLOW_INSECURE=1` env var as a safety guard. Optional certificate pinning (`cert_fingerprint`) validates the server's SHA-256 certificate fingerprint against a configured value, protecting against compromised CAs. Secret rotation (`rotate_secret` command) allows the manager to replace the node's authentication secret over the active WebSocket connection.
 
@@ -150,6 +155,8 @@ SRT uses AES-128/192/256 encryption + passphrase auth with selectable cipher mod
 - Public: `/health`, `/oauth/token`, `/metrics`, `/setup` (gated by `setup_enabled`)
 - Read-only (JWT or auth-disabled): `GET /api/v1/*`
 - Admin (requires `admin` role): `POST/PUT/DELETE /api/v1/*`
+- **Inputs**: `GET /api/v1/inputs` (list), `POST /api/v1/inputs` (create), `GET /api/v1/inputs/{id}`, `PUT /api/v1/inputs/{id}`, `DELETE /api/v1/inputs/{id}`
+- **Outputs**: `GET /api/v1/outputs` (list), `POST /api/v1/outputs` (create), `GET /api/v1/outputs/{id}`, `PUT /api/v1/outputs/{id}`, `DELETE /api/v1/outputs/{id}`
 - WebSocket: `/api/v1/ws/stats` (1/sec stats broadcast)
 - NMOS IS-04 (public, no auth): `/x-nmos/node/v1.3/` — Node, Device, Source, Flow, Sender, Receiver resources. ST 2110-30/-31 inputs report `urn:x-nmos:format:audio`; ST 2110-40 inputs report `urn:x-nmos:format:data`. Receiver caps include BCP-004 constraint sets for ST 2110 audio (sample_rate / channel_count / sample_depth)
 - NMOS IS-05 (public, no auth): `/x-nmos/connection/v1.1/` — Staged/active transport parameter management for senders and receivers
@@ -158,7 +165,7 @@ SRT uses AES-128/192/256 encryption + passphrase auth with selectable cipher mod
 
 ## Adding New Input/Output Types
 
-Follow this pattern when extending protocol support:
+Inputs and outputs are top-level entities in the config. Flows reference them by ID. Follow this pattern when extending protocol support:
 
 | Step | File | What to do |
 |------|------|------------|
@@ -180,7 +187,15 @@ pub fn spawn_xxx_output(
 
 ## Configuration
 
-Full reference in `docs/CONFIGURATION.md`. Config is JSON with enum-tagged input/output types (e.g., `"type": "srt"`, `"mode": "caller"`). Validation runs at load time and on every manager command — not per-packet. When adding new config fields, always add validation in `src/config/validation.rs`.
+Full reference in `docs/CONFIGURATION.md`. Config version is **2**. The JSON structure has three top-level arrays:
+
+- **`inputs`** — Array of `InputDefinition` objects. Each has `id`, `name`, and flattened `InputConfig` fields (enum-tagged by `"type"`, e.g., `"type": "srt"`, `"mode": "listener"`).
+- **`outputs`** — Array of `OutputConfig` objects. Each has `id`, `name`, and protocol-specific fields (enum-tagged by `"type"`).
+- **`flows`** — Array of `FlowConfig` objects. Each has `id`, `name`, `input_id` (references an input), and `output_ids` (array of output IDs). The engine resolves these references via `AppConfig::resolve_flow()` into `ResolvedFlow` before starting.
+
+An input or output can exist without being assigned to any flow. Assignment uniqueness is enforced: an input can only be used by one flow at a time, and each output can only be assigned to one flow at a time.
+
+Validation runs at load time and on every manager command — not per-packet. When adding new config fields, always add validation in `src/config/validation.rs`.
 
 ### Config/Secrets Split
 
@@ -195,9 +210,9 @@ At runtime, both files merge into a single `AppConfig` in memory — all existin
 - Node-level: `manager.node_secret`, `manager.registration_token`, `server.tls`, `server.auth` (jwt_secret, client credentials)
 - Per-tunnel (keyed by ID): `tunnel_encryption_key`, `tunnel_bind_secret`, `tunnel_psk`, `tls_cert_pem`, `tls_key_pem`
 
-**Flow parameters in `config.json`** (NOT in secrets.json):
+**Input/output parameters in `config.json`** (NOT in secrets.json):
 - SRT `passphrase`, RTMP `stream_key`, RTSP `username`/`password`, WebRTC `bearer_token`, HLS `auth_token`
-- These stay in config.json so they are visible in the manager UI and survive round-trip config updates
+- These live in the top-level `inputs` and `outputs` arrays in config.json so they are visible in the manager UI and survive round-trip config updates
 
 **Key implementation files:**
 - `src/config/secrets.rs` — `SecretsConfig` struct, `extract_from()`, `merge_into()`, `has_secrets()`, and `AppConfig::strip_secrets()`

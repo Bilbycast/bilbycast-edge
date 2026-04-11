@@ -20,10 +20,10 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::events::{Event, EventSeverity, build_event_envelope};
 
-use crate::config::models::{AppConfig, FlowConfig, FlowGroupConfig, OutputConfig};
+use crate::config::models::{AppConfig, FlowConfig, FlowGroupConfig, InputDefinition, OutputConfig, ResolvedFlow};
 use crate::config::persistence::save_config_split_async;
 use crate::config::secrets::SecretsConfig;
-use crate::config::validation::{validate_config, validate_flow, validate_output, validate_tunnel};
+use crate::config::validation::{validate_config, validate_flow, validate_input_definition, validate_output, validate_tunnel};
 use crate::engine::manager::FlowManager;
 use crate::engine::resource_monitor::SystemResourceState;
 use crate::tunnel::TunnelConfig;
@@ -46,8 +46,8 @@ fn register_whip_if_needed(
 ) {
     if let Some((tx, bearer_token)) = &runtime.whip_session_tx {
         if let Some(registry) = webrtc_sessions {
-            registry.register_whip_input(&runtime.config.id, tx.clone(), bearer_token.clone());
-            tracing::info!("Registered WHIP input for flow '{}'", runtime.config.id);
+            registry.register_whip_input(&runtime.config.config.id, tx.clone(), bearer_token.clone());
+            tracing::info!("Registered WHIP input for flow '{}'", runtime.config.config.id);
         }
     }
 }
@@ -60,8 +60,8 @@ fn register_whep_if_needed(
 ) {
     if let Some((tx, bearer_token)) = &runtime.whep_session_tx {
         if let Some(registry) = webrtc_sessions {
-            registry.register_whep_output(&runtime.config.id, tx.clone(), bearer_token.clone());
-            tracing::info!("Registered WHEP output for flow '{}'", runtime.config.id);
+            registry.register_whep_output(&runtime.config.config.id, tx.clone(), bearer_token.clone());
+            tracing::info!("Registered WHEP output for flow '{}'", runtime.config.config.id);
         }
     }
 }
@@ -206,11 +206,13 @@ pub fn start_manager_client(
     webrtc_sessions: WebrtcRegistry,
     event_rx: mpsc::UnboundedReceiver<Event>,
     resource_state: Arc<SystemResourceState>,
+    standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         manager_client_loop(
             config, flow_manager, tunnel_manager, ws_stats_rx, app_config, config_path,
             secrets_path, api_addr, monitor_addr, webrtc_sessions, event_rx, resource_state,
+            standby_listeners,
         ).await;
     })
 }
@@ -228,6 +230,7 @@ async fn manager_client_loop(
     webrtc_sessions: WebrtcRegistry,
     mut event_rx: mpsc::UnboundedReceiver<Event>,
     resource_state: Arc<SystemResourceState>,
+    standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
 ) {
     // If we already have a node_id from config, set it on the tunnel manager
     // so relay tunnels can identify this edge before the first manager connection.
@@ -254,6 +257,7 @@ async fn manager_client_loop(
             &webrtc_sessions,
             &mut event_rx,
             &resource_state,
+            &standby_listeners,
         )
         .await
         {
@@ -314,6 +318,7 @@ async fn try_connect(
     webrtc_sessions: &WebrtcRegistry,
     event_rx: &mut mpsc::UnboundedReceiver<Event>,
     resource_state: &Arc<SystemResourceState>,
+    standby_listeners: &Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
 ) -> Result<ConnectResult, String> {
     // Enforce TLS — only wss:// connections are allowed
     if !config.url.starts_with("wss://") {
@@ -511,17 +516,26 @@ async fn try_connect(
                         let flows_value = serde_json::from_str::<serde_json::Value>(&stats_json).unwrap_or_default();
                         let total_flows = flows_value.as_array().map_or(0, |a| a.len());
 
+                        let standby = standby_listeners.as_ref()
+                            .map(|sl| sl.snapshot().into_iter()
+                                .map(|s| serde_json::to_value(s).unwrap_or_default())
+                                .collect::<Vec<_>>());
+
+                        let mut payload = serde_json::json!({
+                            "flows": flows_value,
+                            "tunnels": tunnel_statuses,
+                            "uptime_secs": 0,
+                            "active_flows": flow_manager.active_flow_count(),
+                            "total_flows": total_flows,
+                            "system_resources": build_system_resources_payload(resource_state)
+                        });
+                        if let Some(sb) = standby {
+                            payload["standby_inputs"] = serde_json::Value::Array(sb);
+                        }
                         let envelope = serde_json::json!({
                             "type": "stats",
                             "timestamp": chrono::Utc::now().to_rfc3339(),
-                            "payload": {
-                                "flows": flows_value,
-                                "tunnels": tunnel_statuses,
-                                "uptime_secs": 0,
-                                "active_flows": flow_manager.active_flow_count(),
-                                "total_flows": total_flows,
-                                "system_resources": build_system_resources_payload(resource_state)
-                            }
+                            "payload": payload
                         });
                         if let Ok(json) = serde_json::to_string(&envelope) {
                             if ws_write.send(Message::Text(json.into())).await.is_err() {
@@ -546,17 +560,26 @@ async fn try_connect(
                     .map(|ts| serde_json::to_value(ts).unwrap_or_default())
                     .collect();
 
+                let standby = standby_listeners.as_ref()
+                    .map(|sl| sl.snapshot().into_iter()
+                        .map(|s| serde_json::to_value(s).unwrap_or_default())
+                        .collect::<Vec<_>>());
+
+                let mut payload = serde_json::json!({
+                    "flows": [],
+                    "tunnels": tunnel_statuses,
+                    "uptime_secs": 0,
+                    "active_flows": flow_manager.active_flow_count(),
+                    "total_flows": flow_manager.active_flow_count(),
+                    "system_resources": build_system_resources_payload(resource_state)
+                });
+                if let Some(sb) = standby {
+                    payload["standby_inputs"] = serde_json::Value::Array(sb);
+                }
                 let envelope = serde_json::json!({
                     "type": "stats",
                     "timestamp": chrono::Utc::now().to_rfc3339(),
-                    "payload": {
-                        "flows": [],
-                        "tunnels": tunnel_statuses,
-                        "uptime_secs": 0,
-                        "active_flows": flow_manager.active_flow_count(),
-                        "total_flows": flow_manager.active_flow_count(),
-                        "system_resources": build_system_resources_payload(resource_state)
-                    }
+                    "payload": payload
                 });
                 if let Ok(json) = serde_json::to_string(&envelope) {
                     if ws_write.send(Message::Text(json.into())).await.is_err() {
@@ -849,14 +872,19 @@ async fn handle_manager_message<S>(
             )
             .await;
 
+            let mut payload = serde_json::json!({
+                "command_id": command_id,
+                "success": result.is_ok(),
+            });
+            match &result {
+                Ok(Some(data)) => { payload["data"] = data.clone(); }
+                Err(e) => { payload["error"] = serde_json::Value::String(e.clone()); }
+                _ => {}
+            }
             let ack = serde_json::json!({
                 "type": "command_ack",
                 "timestamp": chrono::Utc::now().to_rfc3339(),
-                "payload": {
-                    "command_id": command_id,
-                    "success": result.is_ok(),
-                    "error": result.err()
-                }
+                "payload": payload
             });
             if let Ok(json) = serde_json::to_string(&ack) {
                 let _ = ws_write.send(Message::Text(json.into())).await;
@@ -881,7 +909,7 @@ async fn execute_command(
     config_path: &PathBuf,
     secrets_path: &PathBuf,
     _webrtc_sessions: &WebrtcRegistry,
-) -> Result<(), String> {
+) -> Result<Option<serde_json::Value>, String> {
     match action_type {
         "create_flow" => {
             let flow: FlowConfig = serde_json::from_value(action["flow"].clone())
@@ -895,8 +923,12 @@ async fn execute_command(
                 }
             }
             tracing::info!("Manager command: create flow '{}'", flow.id);
+            let resolved = {
+                let cfg = app_config.read().await;
+                cfg.resolve_flow(&flow).map_err(|e| e.to_string())?
+            };
             let _runtime = flow_manager
-                .create_flow(flow.clone())
+                .create_flow(resolved)
                 .await
                 .map_err(|e| e.to_string())?;
             #[cfg(feature = "webrtc")]
@@ -907,7 +939,7 @@ async fn execute_command(
             let mut cfg = app_config.write().await;
             cfg.flows.push(flow);
             persist_config(&cfg, config_path, secrets_path).await;
-            Ok(())
+            Ok(None)
         }
         "update_flow" => {
             let new_flow: FlowConfig = serde_json::from_value(action["flow"].clone())
@@ -929,7 +961,7 @@ async fn execute_command(
             if let Some(old_flow) = old_flow {
                 if was_running && new_flow.enabled {
                     // Flow exists and should keep running — diff it
-                    let input_changed = old_flow.input != new_flow.input;
+                    let input_changed = old_flow.input_id != new_flow.input_id;
                     let meta_changed = old_flow.name != new_flow.name
                         || old_flow.media_analysis != new_flow.media_analysis
                         || old_flow.thumbnail != new_flow.thumbnail
@@ -939,8 +971,12 @@ async fn execute_command(
                         // Input or metadata changed — must restart entire flow
                         tracing::info!("Update flow '{flow_id}': restarting (input changed={input_changed}, meta changed={meta_changed})");
                         let _ = flow_manager.destroy_flow(flow_id).await;
+                        let resolved = {
+                            let cfg = app_config.read().await;
+                            cfg.resolve_flow(&new_flow).map_err(|e| e.to_string())?
+                        };
                         let _runtime = flow_manager
-                            .create_flow(new_flow.clone())
+                            .create_flow(resolved)
                             .await
                             .map_err(|e| e.to_string())?;
                         #[cfg(feature = "webrtc")]
@@ -950,8 +986,9 @@ async fn execute_command(
                     } else {
                         // Only outputs changed — diff surgically
                         tracing::info!("Update flow '{flow_id}': input unchanged, diffing outputs ({} old → {} new)",
-                            old_flow.outputs.len(), new_flow.outputs.len());
-                        diff_outputs(flow_manager, flow_id, &old_flow.outputs, &new_flow.outputs).await;
+                            old_flow.output_ids.len(), new_flow.output_ids.len());
+                        let cfg = app_config.read().await;
+                        diff_outputs(flow_manager, flow_id, &old_flow.output_ids, &new_flow.output_ids, &cfg).await;
                     }
                 } else if was_running && !new_flow.enabled {
                     // Disable
@@ -960,8 +997,12 @@ async fn execute_command(
                 } else if !was_running && new_flow.enabled {
                     // Enable / start
                     tracing::info!("Update flow '{flow_id}': starting");
+                    let resolved = {
+                        let cfg = app_config.read().await;
+                        cfg.resolve_flow(&new_flow).map_err(|e| e.to_string())?
+                    };
                     let _runtime = flow_manager
-                        .create_flow(new_flow.clone())
+                        .create_flow(resolved)
                         .await
                         .map_err(|e| e.to_string())?;
                     #[cfg(feature = "webrtc")]
@@ -973,8 +1014,12 @@ async fn execute_command(
                 // No old flow — create new
                 tracing::info!("Update flow '{flow_id}': creating (no previous config)");
                 let _ = flow_manager.destroy_flow(flow_id).await; // in case running without config
+                let resolved = {
+                    let cfg = app_config.read().await;
+                    cfg.resolve_flow(&new_flow).map_err(|e| e.to_string())?
+                };
                 let _runtime = flow_manager
-                    .create_flow(new_flow.clone())
+                    .create_flow(resolved)
                     .await
                     .map_err(|e| e.to_string())?;
                 #[cfg(feature = "webrtc")]
@@ -991,7 +1036,7 @@ async fn execute_command(
                 cfg.flows.push(new_flow);
             }
             persist_config(&cfg, config_path, secrets_path).await;
-            Ok(())
+            Ok(None)
         }
         "delete_flow" => {
             let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?;
@@ -1004,7 +1049,7 @@ async fn execute_command(
             let mut cfg = app_config.write().await;
             cfg.flows.retain(|f| f.id != flow_id);
             persist_config(&cfg, config_path, secrets_path).await;
-            Ok(())
+            Ok(None)
         }
         "stop_flow" => {
             let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?;
@@ -1019,7 +1064,7 @@ async fn execute_command(
                 flow.enabled = false;
             }
             persist_config(&cfg, config_path, secrets_path).await;
-            Ok(())
+            Ok(None)
         }
         "start_flow" | "restart_flow" => {
             let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?;
@@ -1029,16 +1074,16 @@ async fn execute_command(
                 let _ = flow_manager.destroy_flow(flow_id).await;
             }
             // Find flow config and start it
-            let flow_config = {
+            let resolved = {
                 let cfg = app_config.read().await;
-                cfg.flows
+                let flow_config = cfg.flows
                     .iter()
                     .find(|f| f.id == flow_id)
-                    .cloned()
-                    .ok_or_else(|| format!("Flow '{flow_id}' not found in config"))?
+                    .ok_or_else(|| format!("Flow '{flow_id}' not found in config"))?;
+                cfg.resolve_flow(flow_config).map_err(|e| e.to_string())?
             };
             let _runtime = flow_manager
-                .create_flow(flow_config)
+                .create_flow(resolved)
                 .await
                 .map_err(|e| e.to_string())?;
             #[cfg(feature = "webrtc")]
@@ -1051,7 +1096,7 @@ async fn execute_command(
                 flow.enabled = true;
             }
             persist_config(&cfg, config_path, secrets_path).await;
-            Ok(())
+            Ok(None)
         }
         "add_output" => {
             let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?;
@@ -1064,13 +1109,21 @@ async fn execute_command(
                 .add_output(flow_id, output.clone())
                 .await
                 .map_err(|e| e.to_string())?;
-            // Add to config
+            // Add to config: store output in top-level outputs and reference from flow
             let mut cfg = app_config.write().await;
+            let output_id = output.id().to_string();
+            // Add to top-level outputs if not already present
+            if !cfg.outputs.iter().any(|o| o.id() == output_id) {
+                cfg.outputs.push(output);
+            }
+            // Add output_id reference to the flow
             if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
-                flow.outputs.push(output);
+                if !flow.output_ids.contains(&output_id) {
+                    flow.output_ids.push(output_id);
+                }
             }
             persist_config(&cfg, config_path, secrets_path).await;
-            Ok(())
+            Ok(None)
         }
         "remove_output" => {
             let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?;
@@ -1080,13 +1133,122 @@ async fn execute_command(
                 .remove_output(flow_id, output_id)
                 .await
                 .map_err(|e| e.to_string())?;
-            // Remove from config
+            // Remove output_id reference from the flow (and optionally from top-level outputs)
             let mut cfg = app_config.write().await;
             if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
-                flow.outputs.retain(|o| o.id() != output_id);
+                flow.output_ids.retain(|id| id != output_id);
+            }
+            // Remove from top-level outputs if no other flow references it
+            let still_referenced = cfg.flows.iter().any(|f| f.output_ids.iter().any(|id| id == output_id));
+            if !still_referenced {
+                cfg.outputs.retain(|o| o.id() != output_id);
             }
             persist_config(&cfg, config_path, secrets_path).await;
-            Ok(())
+            Ok(None)
+        }
+        // ── Independent input CRUD ──
+        "create_input" => {
+            let input: InputDefinition = serde_json::from_value(action["input"].clone())
+                .map_err(|e| format!("Invalid input config: {e}"))?;
+            validate_input_definition(&input).map_err(|e| format!("Invalid input: {e}"))?;
+            tracing::info!("Manager command: create input '{}' ({})", input.id, input.config.type_name());
+            let mut cfg = app_config.write().await;
+            if cfg.inputs.iter().any(|i| i.id == input.id) {
+                return Err(format!("Input '{}' already exists", input.id));
+            }
+            cfg.inputs.push(input);
+            persist_config(&cfg, config_path, secrets_path).await;
+            Ok(None)
+        }
+        "update_input" => {
+            let input_id = action["input_id"].as_str().ok_or("Missing input_id")?;
+            let input: InputDefinition = serde_json::from_value(action["input"].clone())
+                .map_err(|e| format!("Invalid input config: {e}"))?;
+            validate_input_definition(&input).map_err(|e| format!("Invalid input: {e}"))?;
+            tracing::info!("Manager command: update input '{input_id}'");
+            let mut cfg = app_config.write().await;
+            let idx = cfg.inputs.iter().position(|i| i.id == input_id)
+                .ok_or_else(|| format!("Input '{input_id}' not found"))?;
+            cfg.inputs[idx] = input;
+            // Restart any flow using this input
+            if let Some(flow) = cfg.flow_using_input(input_id).cloned() {
+                if flow.enabled && flow_manager.is_running(&flow.id) {
+                    let _ = flow_manager.destroy_flow(&flow.id).await;
+                    if let Ok(resolved) = cfg.resolve_flow(&flow) {
+                        match flow_manager.create_flow(resolved).await {
+                            Ok(_) => tracing::info!("Restarted flow '{}' after input update", flow.id),
+                            Err(e) => tracing::error!("Failed to restart flow '{}': {e}", flow.id),
+                        }
+                    }
+                }
+            }
+            persist_config(&cfg, config_path, secrets_path).await;
+            Ok(None)
+        }
+        "delete_input" => {
+            let input_id = action["input_id"].as_str().ok_or("Missing input_id")?;
+            tracing::info!("Manager command: delete input '{input_id}'");
+            let mut cfg = app_config.write().await;
+            if cfg.flow_using_input(input_id).is_some() {
+                return Err(format!("Input '{input_id}' is assigned to a flow — unassign first"));
+            }
+            let before = cfg.inputs.len();
+            cfg.inputs.retain(|i| i.id != input_id);
+            if cfg.inputs.len() == before {
+                return Err(format!("Input '{input_id}' not found"));
+            }
+            persist_config(&cfg, config_path, secrets_path).await;
+            Ok(None)
+        }
+        // ── Independent output CRUD ──
+        "create_output" => {
+            let output: OutputConfig = serde_json::from_value(action["output"].clone())
+                .map_err(|e| format!("Invalid output config: {e}"))?;
+            validate_output(&output).map_err(|e| format!("Invalid output: {e}"))?;
+            tracing::info!("Manager command: create output '{}' ({})", output.id(), output.type_name());
+            let mut cfg = app_config.write().await;
+            if cfg.outputs.iter().any(|o| o.id() == output.id()) {
+                return Err(format!("Output '{}' already exists", output.id()));
+            }
+            cfg.outputs.push(output);
+            persist_config(&cfg, config_path, secrets_path).await;
+            Ok(None)
+        }
+        "update_output" => {
+            let output_id = action["output_id"].as_str().ok_or("Missing output_id")?;
+            let output: OutputConfig = serde_json::from_value(action["output"].clone())
+                .map_err(|e| format!("Invalid output config: {e}"))?;
+            validate_output(&output).map_err(|e| format!("Invalid output: {e}"))?;
+            tracing::info!("Manager command: update output '{output_id}'");
+            let mut cfg = app_config.write().await;
+            let idx = cfg.outputs.iter().position(|o| o.id() == output_id)
+                .ok_or_else(|| format!("Output '{output_id}' not found"))?;
+            let old_output = cfg.outputs[idx].clone();
+            cfg.outputs[idx] = output.clone();
+            // Hot-swap on running flow if the config actually changed
+            if let Some(flow) = cfg.flow_using_output(output_id).cloned() {
+                if flow_manager.is_running(&flow.id) && old_output != output {
+                    let _ = flow_manager.remove_output(&flow.id, output_id).await;
+                    let _ = flow_manager.add_output(&flow.id, output).await;
+                }
+            }
+            persist_config(&cfg, config_path, secrets_path).await;
+            Ok(None)
+        }
+        "delete_output" => {
+            let output_id = action["output_id"].as_str().ok_or("Missing output_id")?;
+            tracing::info!("Manager command: delete output '{output_id}'");
+            let mut cfg = app_config.write().await;
+            if cfg.flow_using_output(output_id).is_some() {
+                return Err(format!("Output '{output_id}' is assigned to a flow — unassign first"));
+            }
+            let before = cfg.outputs.len();
+            cfg.outputs.retain(|o| o.id() != output_id);
+            if cfg.outputs.len() == before {
+                return Err(format!("Output '{output_id}' not found"));
+            }
+            persist_config(&cfg, config_path, secrets_path).await;
+            Ok(None)
         }
         "create_tunnel" => {
             let tunnel: TunnelConfig = serde_json::from_value(action["tunnel"].clone())
@@ -1105,7 +1267,7 @@ async fn execute_command(
                 cfg.tunnels.push(tunnel);
             }
             persist_config(&cfg, config_path, secrets_path).await;
-            Ok(())
+            Ok(None)
         }
         "delete_tunnel" => {
             let tunnel_id = action["tunnel_id"].as_str().ok_or("Missing tunnel_id")?;
@@ -1118,7 +1280,7 @@ async fn execute_command(
             let mut cfg = app_config.write().await;
             cfg.tunnels.retain(|t| t.id != tunnel_id);
             persist_config(&cfg, config_path, secrets_path).await;
-            Ok(())
+            Ok(None)
         }
         "update_config" => {
             let mut new_config: AppConfig = serde_json::from_value(action["config"].clone())
@@ -1160,14 +1322,17 @@ async fn execute_command(
                         // Brand-new flow
                         if new_flow.enabled {
                             tracing::info!("Config diff: creating new flow '{id}'");
-                            match flow_manager.create_flow(new_flow.clone()).await {
-                                Ok(_runtime) => {
-                                    #[cfg(feature = "webrtc")]
-                                    register_whip_if_needed(_webrtc_sessions, &_runtime);
-                                    #[cfg(feature = "webrtc")]
-                                    register_whep_if_needed(_webrtc_sessions, &_runtime);
+                            match new_config.resolve_flow(new_flow) {
+                                Ok(resolved) => match flow_manager.create_flow(resolved).await {
+                                    Ok(_runtime) => {
+                                        #[cfg(feature = "webrtc")]
+                                        register_whip_if_needed(_webrtc_sessions, &_runtime);
+                                        #[cfg(feature = "webrtc")]
+                                        register_whep_if_needed(_webrtc_sessions, &_runtime);
+                                    }
+                                    Err(e) => tracing::warn!("Failed to start new flow '{id}': {e}"),
                                 }
-                                Err(e) => tracing::warn!("Failed to start new flow '{id}': {e}"),
+                                Err(e) => tracing::warn!("Failed to resolve new flow '{id}': {e}"),
                             }
                         }
                     }
@@ -1182,18 +1347,21 @@ async fn execute_command(
                         } else if !was_running && should_run {
                             // Was stopped, now enabled → start
                             tracing::info!("Config diff: enabling flow '{id}'");
-                            match flow_manager.create_flow(new_flow.clone()).await {
-                                Ok(_runtime) => {
-                                    #[cfg(feature = "webrtc")]
-                                    register_whip_if_needed(_webrtc_sessions, &_runtime);
-                                    #[cfg(feature = "webrtc")]
-                                    register_whep_if_needed(_webrtc_sessions, &_runtime);
+                            match new_config.resolve_flow(new_flow) {
+                                Ok(resolved) => match flow_manager.create_flow(resolved).await {
+                                    Ok(_runtime) => {
+                                        #[cfg(feature = "webrtc")]
+                                        register_whip_if_needed(_webrtc_sessions, &_runtime);
+                                        #[cfg(feature = "webrtc")]
+                                        register_whep_if_needed(_webrtc_sessions, &_runtime);
+                                    }
+                                    Err(e) => tracing::warn!("Failed to start flow '{id}': {e}"),
                                 }
-                                Err(e) => tracing::warn!("Failed to start flow '{id}': {e}"),
+                                Err(e) => tracing::warn!("Failed to resolve flow '{id}': {e}"),
                             }
                         } else if was_running && should_run {
                             // Both running — check what changed
-                            let input_changed = old_flow.input != new_flow.input;
+                            let input_changed = old_flow.input_id != new_flow.input_id;
                             let meta_changed = old_flow.name != new_flow.name
                                 || old_flow.media_analysis != new_flow.media_analysis
                                 || old_flow.thumbnail != new_flow.thumbnail
@@ -1203,20 +1371,23 @@ async fn execute_command(
                                 // Input or flow metadata changed → must restart entire flow
                                 tracing::info!("Config diff: restarting flow '{id}' (input changed={input_changed}, meta changed={meta_changed})");
                                 let _ = flow_manager.destroy_flow(id).await;
-                                match flow_manager.create_flow(new_flow.clone()).await {
-                                    Ok(_runtime) => {
-                                        #[cfg(feature = "webrtc")]
-                                        register_whip_if_needed(_webrtc_sessions, &_runtime);
-                                        #[cfg(feature = "webrtc")]
-                                        register_whep_if_needed(_webrtc_sessions, &_runtime);
+                                match new_config.resolve_flow(new_flow) {
+                                    Ok(resolved) => match flow_manager.create_flow(resolved).await {
+                                        Ok(_runtime) => {
+                                            #[cfg(feature = "webrtc")]
+                                            register_whip_if_needed(_webrtc_sessions, &_runtime);
+                                            #[cfg(feature = "webrtc")]
+                                            register_whep_if_needed(_webrtc_sessions, &_runtime);
+                                        }
+                                        Err(e) => tracing::warn!("Failed to restart flow '{id}': {e}"),
                                     }
-                                    Err(e) => tracing::warn!("Failed to restart flow '{id}': {e}"),
+                                    Err(e) => tracing::warn!("Failed to resolve flow '{id}': {e}"),
                                 }
                             } else {
                                 // Input unchanged — diff outputs surgically
                                 tracing::info!("Config diff: flow '{id}' unchanged, diffing outputs ({} old → {} new)",
-                                    old_flow.outputs.len(), new_flow.outputs.len());
-                                diff_outputs(flow_manager, id, &old_flow.outputs, &new_flow.outputs).await;
+                                    old_flow.output_ids.len(), new_flow.output_ids.len());
+                                diff_outputs_with_configs(flow_manager, id, &old_flow.output_ids, &new_flow.output_ids, &old_config, &new_config).await;
                             }
                         }
                         // else: !was_running && !should_run → no-op
@@ -1265,6 +1436,8 @@ async fn execute_command(
             // Apply new config and persist
             {
                 let mut cfg = app_config.write().await;
+                cfg.inputs = new_config.inputs.clone();
+                cfg.outputs = new_config.outputs.clone();
                 cfg.flows = new_config.flows.clone();
                 cfg.tunnels = new_config.tunnels.clone();
                 cfg.server = new_config.server.clone();
@@ -1286,7 +1459,7 @@ async fn execute_command(
                 "Configuration updated",
             );
 
-            Ok(())
+            Ok(None)
         }
         // ── SMPTE ST 2110 (Phase 1) read commands ──
         //
@@ -1302,7 +1475,7 @@ async fn execute_command(
             tracing::info!(
                 "Manager command: {action_type} (Phase 1 stub — acked, NMOS state served via REST)"
             );
-            Ok(())
+            Ok(None)
         }
         // ── SMPTE ST 2110 flow group mutation commands ──
         //
@@ -1324,12 +1497,12 @@ async fn execute_command(
                 .iter()
                 .find(|g| g.id == group_id)
                 .ok_or_else(|| format!("Flow group '{group_id}' not found"))?;
-            let members: Vec<crate::config::models::FlowConfig> = group
+            let flow_configs: Vec<&FlowConfig> = group
                 .flows
                 .iter()
-                .filter_map(|fid| cfg.flows.iter().find(|f| f.id == *fid).cloned())
+                .filter_map(|fid| cfg.flows.iter().find(|f| f.id == *fid))
                 .collect();
-            if members.len() != group.flows.len() {
+            if flow_configs.len() != group.flows.len() {
                 let missing: Vec<String> = group
                     .flows
                     .iter()
@@ -1342,12 +1515,17 @@ async fn execute_command(
                 )
                 .into());
             }
+            let members: Vec<ResolvedFlow> = flow_configs
+                .iter()
+                .map(|fc| cfg.resolve_flow(fc))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to resolve flow group members: {e}"))?;
             drop(cfg);
             flow_manager
                 .start_flow_group(&group_id, members)
                 .await
                 .map_err(|e| format!("start_flow_group failed: {e}"))?;
-            Ok(())
+            Ok(None)
         }
         "stop_flow_group" => {
             let group_id = action["flow_group_id"]
@@ -1366,7 +1544,7 @@ async fn execute_command(
                 .stop_flow_group(&group_id, &member_ids)
                 .await
                 .map_err(|e| format!("stop_flow_group failed: {e}"))?;
-            Ok(())
+            Ok(None)
         }
         "add_flow_group" => {
             let group: FlowGroupConfig = serde_json::from_value(action["flow_group"].clone())
@@ -1396,7 +1574,7 @@ async fn execute_command(
                     format!("Flow group '{}' added", group.id),
                 );
             }
-            Ok(())
+            Ok(None)
         }
         "update_flow_group" => {
             let new_group: FlowGroupConfig =
@@ -1432,7 +1610,7 @@ async fn execute_command(
                     format!("Flow group '{target_id}' updated"),
                 );
             }
-            Ok(())
+            Ok(None)
         }
         "remove_flow_group" => {
             let target_id = action["flow_group_id"]
@@ -1475,7 +1653,7 @@ async fn execute_command(
                     format!("Flow group '{target_id}' removed"),
                 );
             }
-            Ok(())
+            Ok(None)
         }
         "add_essence_flow" => {
             let group_id = action["flow_group_id"]
@@ -1520,7 +1698,7 @@ async fn execute_command(
                     format!("Flow '{flow_id}' added to group '{group_id}'"),
                 );
             }
-            Ok(())
+            Ok(None)
         }
         "remove_essence_flow" => {
             // Note: removing an essence flow from a group does NOT clear the
@@ -1575,7 +1753,7 @@ async fn execute_command(
                     format!("Flow '{flow_id}' removed from group '{group_id}'"),
                 );
             }
-            Ok(())
+            Ok(None)
         }
         "rotate_secret" => {
             let new_secret = action["new_secret"]
@@ -1599,7 +1777,59 @@ async fn execute_command(
             }
 
             tracing::info!("Node secret rotated and persisted to secrets.json");
-            Ok(())
+            Ok(None)
+        }
+        "test_input" => {
+            let input_id = action["input_id"]
+                .as_str()
+                .ok_or("Missing input_id")?;
+            let cfg = app_config.read().await;
+            let input_def = cfg
+                .inputs
+                .iter()
+                .find(|i| i.id == input_id)
+                .ok_or_else(|| format!("Input '{input_id}' not found"))?;
+            // Reject if assigned to a running flow (port conflict)
+            if let Some(flow) = cfg.flows.iter().find(|f| f.input_id.as_deref() == Some(input_id)) {
+                if flow_manager.is_running(&flow.id) {
+                    return Err(format!(
+                        "Input '{input_id}' is in use by running flow '{}'",
+                        flow.id
+                    ));
+                }
+            }
+            let input_config = input_def.config.clone();
+            drop(cfg);
+
+            tracing::info!("Testing input '{input_id}'");
+            let result = crate::engine::test_connection::test_input(&input_config).await;
+            Ok(Some(serde_json::to_value(result).unwrap()))
+        }
+        "test_output" => {
+            let output_id = action["output_id"]
+                .as_str()
+                .ok_or("Missing output_id")?;
+            let cfg = app_config.read().await;
+            let output = cfg
+                .outputs
+                .iter()
+                .find(|o| o.id() == output_id)
+                .ok_or_else(|| format!("Output '{output_id}' not found"))?;
+            // Reject if assigned to a running flow (port conflict)
+            if let Some(flow) = cfg.flows.iter().find(|f| f.output_ids.iter().any(|oid| oid == output_id)) {
+                if flow_manager.is_running(&flow.id) {
+                    return Err(format!(
+                        "Output '{output_id}' is in use by running flow '{}'",
+                        flow.id
+                    ));
+                }
+            }
+            let output_config = output.clone();
+            drop(cfg);
+
+            tracing::info!("Testing output '{output_id}'");
+            let result = crate::engine::test_connection::test_output(&output_config).await;
+            Ok(Some(serde_json::to_value(result).unwrap()))
         }
         _ => Err(format!("Unknown command: {action_type}")),
     }
@@ -1607,22 +1837,53 @@ async fn execute_command(
 
 /// Diff outputs between old and new config, applying surgical hot-add/remove.
 ///
-/// Only outputs that actually changed are touched; unchanged outputs keep running
-/// without interruption.
+/// Compares old and new output ID lists. When IDs change, removes dropped outputs
+/// and adds new ones. When an ID is present in both lists, resolves the actual
+/// `OutputConfig` from both the old and new `AppConfig` and compares to detect
+/// config changes (e.g., address/port edits). Only outputs that actually changed
+/// are touched; unchanged outputs keep running without interruption.
+///
+/// For the `update_flow` command, `old_config` and `new_config` may be the same
+/// `AppConfig` reference (since output definitions live at the top level and the
+/// command only changes the flow). For `update_config`, they are the old and new
+/// configs respectively.
 async fn diff_outputs(
     flow_manager: &FlowManager,
     flow_id: &str,
-    old_outputs: &[OutputConfig],
-    new_outputs: &[OutputConfig],
+    old_output_ids: &[String],
+    new_output_ids: &[String],
+    new_config: &AppConfig,
 ) {
-    let old_map: HashMap<&str, &OutputConfig> =
-        old_outputs.iter().map(|o| (o.id(), o)).collect();
-    let new_map: HashMap<&str, &OutputConfig> =
-        new_outputs.iter().map(|o| (o.id(), o)).collect();
+    diff_outputs_inner(flow_manager, flow_id, old_output_ids, new_output_ids, new_config, new_config).await;
+}
 
-    // Remove outputs that are no longer present
-    for &id in old_map.keys() {
-        if !new_map.contains_key(id) {
+/// Inner implementation that accepts separate old/new configs for output resolution.
+async fn diff_outputs_with_configs(
+    flow_manager: &FlowManager,
+    flow_id: &str,
+    old_output_ids: &[String],
+    new_output_ids: &[String],
+    old_config: &AppConfig,
+    new_config: &AppConfig,
+) {
+    diff_outputs_inner(flow_manager, flow_id, old_output_ids, new_output_ids, old_config, new_config).await;
+}
+
+async fn diff_outputs_inner(
+    flow_manager: &FlowManager,
+    flow_id: &str,
+    old_output_ids: &[String],
+    new_output_ids: &[String],
+    old_config: &AppConfig,
+    new_config: &AppConfig,
+) {
+    use std::collections::HashSet;
+    let old_set: HashSet<&str> = old_output_ids.iter().map(|s| s.as_str()).collect();
+    let new_set: HashSet<&str> = new_output_ids.iter().map(|s| s.as_str()).collect();
+
+    // Remove outputs that are no longer referenced
+    for &id in &old_set {
+        if !new_set.contains(id) {
             tracing::info!("Config diff: removing output '{id}' from flow '{flow_id}'");
             if let Err(e) = flow_manager.remove_output(flow_id, id).await {
                 tracing::warn!("Failed to remove output '{id}' from flow '{flow_id}': {e}");
@@ -1631,20 +1892,29 @@ async fn diff_outputs(
     }
 
     // Add new outputs or replace changed ones
-    for (&id, &new_output) in &new_map {
-        match old_map.get(id) {
+    for &id in &new_set {
+        let new_output = match new_config.outputs.iter().find(|o| o.id() == id) {
+            Some(o) => o,
             None => {
-                // Brand-new output
-                tracing::info!("Config diff: adding output '{id}' to flow '{flow_id}'");
-                if let Err(e) = flow_manager.add_output(flow_id, new_output.clone()).await {
-                    tracing::warn!("Failed to add output '{id}' to flow '{flow_id}': {e}");
-                }
+                tracing::warn!("Config diff: output '{id}' referenced by flow '{flow_id}' but not found in top-level outputs");
+                continue;
             }
-            Some(&old_output) => {
-                // Output exists in both — check if config changed
-                if old_output != new_output {
+        };
+
+        if !old_set.contains(id) {
+            // Brand-new output reference
+            tracing::info!("Config diff: adding output '{id}' to flow '{flow_id}'");
+            if let Err(e) = flow_manager.add_output(flow_id, new_output.clone()).await {
+                tracing::warn!("Failed to add output '{id}' to flow '{flow_id}': {e}");
+            }
+        } else {
+            // Output exists in both old and new — check if the actual config changed
+            let old_output = old_config.outputs.iter().find(|o| o.id() == id);
+
+            match old_output {
+                Some(old) if old != new_output => {
                     tracing::warn!("Config diff: REPLACING output '{id}' in flow '{flow_id}' — configs differ!");
-                    tracing::warn!("  old: {:?}", serde_json::to_value(old_output).ok());
+                    tracing::warn!("  old: {:?}", serde_json::to_value(old).ok());
                     tracing::warn!("  new: {:?}", serde_json::to_value(new_output).ok());
                     if let Err(e) = flow_manager.remove_output(flow_id, id).await {
                         tracing::warn!("Failed to remove output '{id}' for replacement: {e}");
@@ -1652,8 +1922,16 @@ async fn diff_outputs(
                     if let Err(e) = flow_manager.add_output(flow_id, new_output.clone()).await {
                         tracing::warn!("Failed to re-add output '{id}' after replacement: {e}");
                     }
-                } else {
+                }
+                Some(_) => {
                     tracing::info!("Config diff: output '{id}' unchanged, keeping alive");
+                }
+                None => {
+                    // Old config doesn't have this output definition — treat as new
+                    tracing::info!("Config diff: output '{id}' not found in old config, adding to flow '{flow_id}'");
+                    if let Err(e) = flow_manager.add_output(flow_id, new_output.clone()).await {
+                        tracing::warn!("Failed to add output '{id}' to flow '{flow_id}': {e}");
+                    }
                 }
             }
         }

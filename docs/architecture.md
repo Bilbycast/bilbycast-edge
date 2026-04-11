@@ -79,6 +79,12 @@
 
 ## Data Plane: Packet Flow
 
+Inputs and outputs are independent top-level config entities referenced by
+flows via `input_id` and `output_ids`. At startup or on create/update,
+`AppConfig::resolve_flow()` dereferences these IDs into a `ResolvedFlow`
+(containing the full `InputDefinition` + `Vec<OutputConfig>`), which is what
+the engine's `FlowRuntime` receives. The engine never sees raw ID references.
+
 ```
   ┌─────────────────────────────────────────────────────────────────────────────┐
   │                              FlowRuntime                                   │
@@ -299,6 +305,50 @@ Key invariants:
 
 For the operator-facing description, configuration syntax, presets,
 and worked use cases, see the [Audio Gateway Guide](audio-gateway.md).
+
+## Configuration Model: Independent Inputs/Outputs
+
+Config version 2 separates inputs, outputs, and flows into three independent
+top-level arrays. Inputs and outputs are standalone entities with stable IDs;
+flows connect one input to N outputs by reference (`input_id` + `output_ids`).
+
+```
+  config.json (version 2)
+  ┌──────────────────────────────────────────────���───────┐
+  │  "inputs": [                                         │
+  │    { "id": "srt-in", "type": "srt", ... }            │
+  │    { "id": "rtp-in", "type": "rtp", ... }            │
+  │  ]                                                   │
+  │                                                      │
+  │  "outputs": [                                        │
+  │    { "id": "rtp-out", "type": "rtp", ... }           │
+  │    { "id": "srt-out", "type": "srt", ... }           │
+  │    { "id": "rtmp-out", "type": "rtmp", ... }         │
+  │  ]                                                   │
+  │                                                      │
+  │  "flows": [                                          │
+  │    { "id": "flow-1",                                 │
+  │      "input_id": "srt-in",        ◄── reference      │
+  │      "output_ids": ["rtp-out", "rtmp-out"] }         │
+  │  ]                                                   │
+  └──────────────────────────────────────────────────────┘
+```
+
+**Resolution boundary:** `AppConfig::resolve_flow()` dereferences the IDs
+into a `ResolvedFlow` containing the full `InputDefinition` and
+`Vec<OutputConfig>`. The engine only ever sees `ResolvedFlow` — the
+reference-resolution boundary lives in the API/config layer, not the engine.
+
+**Assignment constraints:**
+- An input can only be assigned to one flow at a time.
+- An output can only be assigned to one flow at a time.
+- Unassigned inputs/outputs are configured but not running.
+
+**REST API surface:**
+- `GET/POST /api/v1/inputs`, `GET/PUT/DELETE /api/v1/inputs/{id}`
+- `GET/POST /api/v1/outputs`, `GET/PUT/DELETE /api/v1/outputs/{id}`
+- Flows reference inputs/outputs by ID; `add_output` and `remove_output`
+  assign/unassign existing outputs rather than creating inline definitions.
 
 ## Adding New Input/Output Types
 

@@ -60,9 +60,13 @@ Events are queued in an unbounded in-memory channel. When the edge is not connec
 | info | Flow '{id}' stopped | Flow stopped by command or config change |
 | critical | Flow '{id}' failed to start: {error} | Flow startup error (input bind, output bind, validation) |
 | critical | Flow input lost: {error} | Input task exited unexpectedly |
-| info | Output '{id}' added to flow '{flow_id}' | Hot-add output succeeded |
-| info | Output '{id}' removed from flow '{flow_id}' | Hot-remove output succeeded |
+| info | Output '{id}' added to flow '{flow_id}' | Output assigned and started on a running flow |
+| info | Output '{id}' removed from flow '{flow_id}' | Output unassigned and stopped on a running flow |
 | warning | Output '{id}' failed to start on flow '{flow_id}': {error} | Output startup failure within a running flow |
+| info | Input '{id}' created | Independent input created via CRUD command |
+| info | Input '{id}' deleted | Independent input deleted via CRUD command |
+| info | Output '{id}' created | Independent output created via CRUD command |
+| info | Output '{id}' deleted | Independent output deleted via CRUD command |
 
 **Source**: `src/engine/manager.rs`, `src/engine/input_srt.rs`
 
@@ -271,7 +275,7 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 
 | Category | Count | Description |
 |----------|-------|-------------|
-| `flow` | 7 | Flow lifecycle (start/stop/fail, output add/remove) |
+| `flow` | 11 | Flow lifecycle (start/stop/fail, output add/remove, input/output CRUD) |
 | `bandwidth` | 4 | Per-flow bandwidth monitoring (alarm, block, recovery) |
 | `srt` | 9 | SRT input and output connection state |
 | `redundancy` | 3 | SMPTE 2022-7 dual-leg status |
@@ -287,7 +291,7 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `network_leg` | — | SMPTE 2022-7 Red/Blue per-leg loss / recovery (Phase 1) |
 | `nmos` | — | NMOS IS-04 / IS-05 / IS-08 controller activity (Phase 1) |
 | `scte104` | — | SCTE-104 splice events parsed from ST 2110-40 ANC (Phase 1) |
-| **Total** | **58** | |
+| **Total** | **62** | |
 
 ### Phase 1 ST 2110 categories
 
@@ -311,4 +315,4 @@ mapping:
 |----------|-------|-------------|
 | critical | 16 | Service-impacting: flow/tunnel failures, auth rejection, both legs lost, bandwidth block, audio_encode build/restart-cap failures |
 | warning | 20 | Degradation: disconnects, stale connections, upload failures, reconnects, bandwidth exceeded, audio_encode restart / per-segment HLS remux failure |
-| info | 23 | State changes: connections established, flows started, config updated, bandwidth recovery, audio_encode started |
+| info | 27 | State changes: connections established, flows started, config updated, bandwidth recovery, audio_encode started, input/output CRUD |

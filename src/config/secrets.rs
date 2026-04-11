@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::auth::AuthConfig;
 use crate::config::models::{
-    AppConfig, FlowConfig, InputConfig, OutputConfig, TlsConfig,
+    AppConfig, InputConfig, OutputConfig, TlsConfig,
 };
 
 /// Root secrets configuration, persisted to `secrets.json`.
@@ -249,30 +249,27 @@ impl SecretsConfig {
         }
 
         // Legacy flow secrets migration: if old secrets.json had flow secrets,
-        // merge them back into config so they are not lost during upgrade.
+        // merge them back into top-level inputs/outputs so they are not lost
+        // during upgrade. In the new model, inputs and outputs live at
+        // config.inputs / config.outputs (not inside flows).
         if !self.flows.is_empty() {
             tracing::info!(
                 "Migrating {} flow secret(s) from secrets.json back to config.json",
                 self.flows.len()
             );
-            for flow in &mut config.flows {
-                if let Some(fs) = self.flows.get(&flow.id) {
-                    Self::merge_flow_secrets(fs, flow);
+            for (_flow_id, fs) in &self.flows {
+                // Merge input secrets into top-level inputs
+                if let Some(is) = &fs.input {
+                    for input_def in &mut config.inputs {
+                        Self::merge_input_secrets(is, &mut input_def.config);
+                    }
                 }
-            }
-        }
-    }
-
-    // Legacy merge functions — used only during migration from old secrets.json
-    // format that stored flow secrets separately.
-
-    fn merge_flow_secrets(fs: &FlowSecrets, flow: &mut FlowConfig) {
-        if let (Some(is), Some(input)) = (&fs.input, &mut flow.input) {
-            Self::merge_input_secrets(is, input);
-        }
-        for output in &mut flow.outputs {
-            if let Some(os) = fs.outputs.get(output.id()) {
-                Self::merge_output_secrets(os, output);
+                // Merge output secrets into top-level outputs
+                for output in &mut config.outputs {
+                    if let Some(os) = fs.outputs.get(output.id()) {
+                        Self::merge_output_secrets(os, output);
+                    }
+                }
             }
         }
     }
@@ -469,6 +466,44 @@ mod tests {
     use crate::manager::ManagerConfig;
     use crate::tunnel::TunnelConfig;
 
+    fn srt_input_config(passphrase: Option<&str>) -> SrtInputConfig {
+        SrtInputConfig {
+            mode: SrtMode::Listener,
+            local_addr: Some("0.0.0.0:9000".to_string()),
+            remote_addr: None,
+            latency_ms: 120,
+            recv_latency_ms: None,
+            peer_latency_ms: None,
+            peer_idle_timeout_secs: 30,
+            passphrase: passphrase.map(|s| s.to_string()),
+            aes_key_len: None,
+            crypto_mode: None,
+            max_rexmit_bw: None,
+            stream_id: None,
+            packet_filter: None,
+            max_bw: None,
+            input_bw: None,
+            overhead_bw: None,
+            enforced_encryption: None,
+            connect_timeout_secs: None,
+            flight_flag_size: None,
+            send_buffer_size: None,
+            recv_buffer_size: None,
+            ip_tos: None,
+            retransmit_algo: None,
+            send_drop_delay: None,
+            loss_max_ttl: None,
+            km_refresh_rate: None,
+            km_pre_announce: None,
+            payload_size: None,
+            mss: None,
+            tlpkt_drop: None,
+            ip_ttl: None,
+            redundancy: None,
+            transport_mode: None,
+        }
+    }
+
     #[test]
     fn test_extract_and_merge_roundtrip() {
         let config = AppConfig {
@@ -487,6 +522,12 @@ mod tests {
                 node_id: Some("node-1".to_string()),
                 node_secret: Some("secret-123".to_string()),
             }),
+            inputs: vec![InputDefinition {
+                id: "srt-in".to_string(),
+                name: "SRT Input".to_string(),
+                config: InputConfig::Srt(srt_input_config(Some("my-secret-pass"))),
+            }],
+            outputs: vec![],
             flows: vec![FlowConfig {
                 id: "srt-flow".to_string(),
                 name: "SRT Flow".to_string(),
@@ -497,42 +538,8 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input: Some(InputConfig::Srt(SrtInputConfig {
-                    mode: SrtMode::Listener,
-                    local_addr: "0.0.0.0:9000".to_string(),
-                    remote_addr: None,
-                    latency_ms: 120,
-                    recv_latency_ms: None,
-                    peer_latency_ms: None,
-                    peer_idle_timeout_secs: 30,
-                    passphrase: Some("my-secret-pass".to_string()),
-                    aes_key_len: None,
-                    crypto_mode: None,
-                    max_rexmit_bw: None,
-                    stream_id: None,
-                    packet_filter: None,
-                    max_bw: None,
-                    input_bw: None,
-                    overhead_bw: None,
-                    enforced_encryption: None,
-                    connect_timeout_secs: None,
-                    flight_flag_size: None,
-                    send_buffer_size: None,
-                    recv_buffer_size: None,
-                    ip_tos: None,
-                    retransmit_algo: None,
-                    send_drop_delay: None,
-                    loss_max_ttl: None,
-                    km_refresh_rate: None,
-                    km_pre_announce: None,
-                    payload_size: None,
-                    mss: None,
-                    tlpkt_drop: None,
-                    ip_ttl: None,
-                    redundancy: None,
-                    transport_mode: None,
-                })),
-                outputs: vec![],
+                input_id: Some("srt-in".to_string()),
+                output_ids: vec![],
             }],
             tunnels: vec![TunnelConfig {
                 id: "tunnel-1".to_string(),
@@ -582,9 +589,9 @@ mod tests {
             .is_none());
         assert!(stripped.tunnels[0].tunnel_encryption_key.is_none());
         assert!(stripped.tunnels[0].tunnel_bind_secret.is_none());
-        // SRT passphrase should still be present after strip_secrets
-        match &stripped.flows[0].input {
-            Some(InputConfig::Srt(srt)) => {
+        // SRT passphrase should still be present in top-level input after strip_secrets
+        match &stripped.inputs[0].config {
+            InputConfig::Srt(srt) => {
                 assert_eq!(srt.passphrase, Some("my-secret-pass".to_string()));
             }
             _ => panic!("Expected SRT input"),
@@ -625,18 +632,14 @@ mod tests {
 
     #[test]
     fn test_has_secrets_ignores_flow_params() {
-        // Flow parameters (SRT passphrase, RTMP key, etc.) are NOT secrets
+        // Flow parameters (SRT passphrase, RTMP key, etc.) are NOT secrets —
+        // they live in top-level inputs/outputs, not in infrastructure secrets
         let config = AppConfig {
-            version: 1,
-            node_id: None,
-            device_name: None,
-            setup_enabled: true,
-            server: ServerConfig::default(),
-            monitor: None,
-            manager: None,
-            tunnels: vec![],
-            resource_limits: None,
-            flow_groups: vec![],
+            inputs: vec![InputDefinition {
+                id: "srt-in".to_string(),
+                name: "SRT Input".to_string(),
+                config: InputConfig::Srt(srt_input_config(Some("my-secret-pass"))),
+            }],
             flows: vec![FlowConfig {
                 id: "srt-flow".to_string(),
                 name: "SRT Flow".to_string(),
@@ -647,43 +650,10 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input: Some(InputConfig::Srt(SrtInputConfig {
-                    mode: SrtMode::Listener,
-                    local_addr: "0.0.0.0:9000".to_string(),
-                    remote_addr: None,
-                    latency_ms: 120,
-                    recv_latency_ms: None,
-                    peer_latency_ms: None,
-                    peer_idle_timeout_secs: 30,
-                    passphrase: Some("my-secret-pass".to_string()),
-                    aes_key_len: None,
-                    crypto_mode: None,
-                    max_rexmit_bw: None,
-                    stream_id: None,
-                    packet_filter: None,
-                    max_bw: None,
-                    input_bw: None,
-                    overhead_bw: None,
-                    enforced_encryption: None,
-                    connect_timeout_secs: None,
-                    flight_flag_size: None,
-                    send_buffer_size: None,
-                    recv_buffer_size: None,
-                    ip_tos: None,
-                    retransmit_algo: None,
-                    send_drop_delay: None,
-                    loss_max_ttl: None,
-                    km_refresh_rate: None,
-                    km_pre_announce: None,
-                    payload_size: None,
-                    mss: None,
-                    tlpkt_drop: None,
-                    ip_ttl: None,
-                    redundancy: None,
-                    transport_mode: None,
-                })),
-                outputs: vec![],
+                input_id: Some("srt-in".to_string()),
+                output_ids: vec![],
             }],
+            ..Default::default()
         };
         // Config with only flow params should NOT be considered as having secrets
         assert!(!has_secrets(&config));
@@ -692,16 +662,30 @@ mod tests {
     #[test]
     fn test_strip_secrets_preserves_flow_params() {
         let mut config = AppConfig {
-            version: 1,
-            node_id: None,
-            device_name: None,
-            setup_enabled: true,
-            server: ServerConfig::default(),
-            monitor: None,
-            manager: None,
-            tunnels: vec![],
-            resource_limits: None,
-            flow_groups: vec![],
+            inputs: vec![InputDefinition {
+                id: "rtp-in".to_string(),
+                name: "RTP Input".to_string(),
+                config: InputConfig::Rtp(RtpInputConfig {
+                    bind_addr: "0.0.0.0:5000".to_string(),
+                    interface_addr: None,
+                    fec_decode: None,
+                    allowed_sources: None,
+                    allowed_payload_types: None,
+                    max_bitrate_mbps: None,
+                    tr07_mode: None,
+                    redundancy: None,
+                }),
+            }],
+            outputs: vec![OutputConfig::Rtmp(RtmpOutputConfig {
+                id: "rtmp-out".to_string(),
+                name: "RTMP Out".to_string(),
+                dest_url: "rtmp://live.twitch.tv/app".to_string(),
+                stream_key: "my-stream-key".to_string(),
+                reconnect_delay_secs: 5,
+                max_reconnect_attempts: None,
+                program_number: None,
+                audio_encode: None,
+            })],
             flows: vec![FlowConfig {
                 id: "rtmp-flow".to_string(),
                 name: "RTMP Flow".to_string(),
@@ -712,32 +696,15 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input: Some(InputConfig::Rtp(RtpInputConfig {
-                    bind_addr: "0.0.0.0:5000".to_string(),
-                    interface_addr: None,
-                    fec_decode: None,
-                    allowed_sources: None,
-                    allowed_payload_types: None,
-                    max_bitrate_mbps: None,
-                    tr07_mode: None,
-                    redundancy: None,
-                })),
-                outputs: vec![OutputConfig::Rtmp(RtmpOutputConfig {
-                    id: "rtmp-out".to_string(),
-                    name: "RTMP Out".to_string(),
-                    dest_url: "rtmp://live.twitch.tv/app".to_string(),
-                    stream_key: "my-stream-key".to_string(),
-                    reconnect_delay_secs: 5,
-                    max_reconnect_attempts: None,
-                    program_number: None,
-                    audio_encode: None,
-                })],
+                input_id: Some("rtp-in".to_string()),
+                output_ids: vec!["rtmp-out".to_string()],
             }],
+            ..Default::default()
         };
 
-        // strip_secrets should preserve flow params
+        // strip_secrets should preserve flow params in top-level outputs
         config.strip_secrets();
-        match &config.flows[0].outputs[0] {
+        match &config.outputs[0] {
             OutputConfig::Rtmp(rtmp) => assert_eq!(rtmp.stream_key, "my-stream-key"),
             _ => panic!("Expected RTMP output"),
         }
@@ -758,18 +725,14 @@ mod tests {
             },
         );
 
-        // Config without the passphrase (as it was stripped in old format)
+        // Config without the passphrase (as it was stripped in old format).
+        // In the new model, inputs are top-level.
         let mut config = AppConfig {
-            version: 1,
-            node_id: None,
-            device_name: None,
-            setup_enabled: true,
-            server: ServerConfig::default(),
-            monitor: None,
-            manager: None,
-            tunnels: vec![],
-            resource_limits: None,
-            flow_groups: vec![],
+            inputs: vec![InputDefinition {
+                id: "srt-in".to_string(),
+                name: "SRT Input".to_string(),
+                config: InputConfig::Srt(srt_input_config(None)),
+            }],
             flows: vec![FlowConfig {
                 id: "srt-flow".to_string(),
                 name: "SRT Flow".to_string(),
@@ -780,49 +743,16 @@ mod tests {
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
-                input: Some(InputConfig::Srt(SrtInputConfig {
-                    mode: SrtMode::Listener,
-                    local_addr: "0.0.0.0:9000".to_string(),
-                    remote_addr: None,
-                    latency_ms: 120,
-                    recv_latency_ms: None,
-                    peer_latency_ms: None,
-                    peer_idle_timeout_secs: 30,
-                    passphrase: None,
-                    aes_key_len: None,
-                    crypto_mode: None,
-                    max_rexmit_bw: None,
-                    stream_id: None,
-                    packet_filter: None,
-                    max_bw: None,
-                    input_bw: None,
-                    overhead_bw: None,
-                    enforced_encryption: None,
-                    connect_timeout_secs: None,
-                    flight_flag_size: None,
-                    send_buffer_size: None,
-                    recv_buffer_size: None,
-                    ip_tos: None,
-                    retransmit_algo: None,
-                    send_drop_delay: None,
-                    loss_max_ttl: None,
-                    km_refresh_rate: None,
-                    km_pre_announce: None,
-                    payload_size: None,
-                    mss: None,
-                    tlpkt_drop: None,
-                    ip_ttl: None,
-                    redundancy: None,
-                    transport_mode: None,
-                })),
-                outputs: vec![],
+                input_id: Some("srt-in".to_string()),
+                output_ids: vec![],
             }],
+            ..Default::default()
         };
 
-        // Legacy merge should restore flow secrets from old secrets.json
+        // Legacy merge should restore flow secrets into top-level inputs
         legacy_secrets.merge_into(&mut config);
-        match &config.flows[0].input {
-            Some(InputConfig::Srt(srt)) => {
+        match &config.inputs[0].config {
+            InputConfig::Srt(srt) => {
                 assert_eq!(srt.passphrase, Some("legacy-pass".to_string()));
             }
             _ => panic!("Expected SRT input"),

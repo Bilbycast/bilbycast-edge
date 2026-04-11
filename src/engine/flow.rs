@@ -54,7 +54,7 @@ use crate::stats::collector::{MediaAnalysisAccumulator, ThumbnailAccumulator, Tr
 /// and [`remove_output`](Self::remove_output) without disturbing the input or
 /// other outputs.
 pub struct FlowRuntime {
-    pub config: FlowConfig,
+    pub config: ResolvedFlow,
     /// The broadcast sender that the input writes into. Every output
     /// subscribes to this sender to receive a copy of each packet.
     pub broadcast_tx: broadcast::Sender<RtpPacket>,
@@ -149,7 +149,7 @@ impl FlowRuntime {
     /// Returns an error if any output task fails to start (e.g., socket
     /// bind failure). The input task is spawned first and errors there are
     /// reported asynchronously via the task's log output.
-    pub async fn start(config: FlowConfig, global_stats: &crate::stats::collector::StatsCollector, ffmpeg_available: bool, event_sender: EventSender) -> Result<Self> {
+    pub async fn start(config: ResolvedFlow, global_stats: &crate::stats::collector::StatsCollector, ffmpeg_available: bool, event_sender: EventSender) -> Result<Self> {
         let cancel_token = CancellationToken::new();
         // The broadcast channel is bounded to BROADCAST_CHANNEL_CAPACITY slots.
         // When a slow output (receiver) cannot keep up, it will *not* block the
@@ -177,8 +177,8 @@ impl FlowRuntime {
 
         // Register flow stats
         let flow_stats = global_stats.register_flow(
-            config.id.clone(),
-            config.name.clone(),
+            config.config.id.clone(),
+            config.config.name.clone(),
             input_type.to_string(),
         );
 
@@ -198,7 +198,7 @@ impl FlowRuntime {
                 },
                 InputConfig::Srt(c) => InputConfigMeta {
                     mode: Some(format!("{:?}", c.mode).to_lowercase()),
-                    local_addr: Some(c.local_addr.clone()),
+                    local_addr: c.local_addr.clone(),
                     remote_addr: c.remote_addr.clone(),
                     listen_addr: None, bind_addr: None,
                     rtsp_url: None, whep_url: None,
@@ -282,7 +282,7 @@ impl FlowRuntime {
                         flow_stats.clone(),
                         cancel_token.child_token(),
                         event_sender.clone(),
-                        config.id.clone(),
+                        config.config.id.clone(),
                     )
                 }
                 InputConfig::Rtmp(rtmp_config) => {
@@ -292,7 +292,7 @@ impl FlowRuntime {
                         flow_stats.clone(),
                         cancel_token.child_token(),
                         event_sender.clone(),
-                        config.id.clone(),
+                        config.config.id.clone(),
                     )
                 }
                 InputConfig::Rtsp(rtsp_config) => {
@@ -302,7 +302,7 @@ impl FlowRuntime {
                         flow_stats.clone(),
                         cancel_token.child_token(),
                         event_sender.clone(),
-                        config.id.clone(),
+                        config.config.id.clone(),
                     )
                 }
                 #[cfg(feature = "webrtc")]
@@ -313,7 +313,7 @@ impl FlowRuntime {
                     whip_session_info = Some((session_tx, webrtc_config.bearer_token.clone()));
                     super::input_webrtc::spawn_whip_input(
                         webrtc_config.clone(),
-                        config.id.clone(),
+                        config.config.id.clone(),
                         broadcast_tx.clone(),
                         flow_stats.clone(),
                         cancel_token.child_token(),
@@ -337,7 +337,7 @@ impl FlowRuntime {
                         flow_stats.clone(),
                         cancel_token.child_token(),
                         event_sender.clone(),
-                        config.id.clone(),
+                        config.config.id.clone(),
                     )
                 }
                 #[cfg(not(feature = "webrtc"))]
@@ -355,38 +355,38 @@ impl FlowRuntime {
                 // accurate.
                 InputConfig::St2110_30(c) => {
                     let mut c = c.clone();
-                    c.clock_domain = c.clock_domain.or(config.clock_domain);
+                    c.clock_domain = c.clock_domain.or(config.config.clock_domain);
                     super::input_st2110_30::spawn_st2110_30_input(
                         c,
                         broadcast_tx.clone(),
                         flow_stats.clone(),
                         cancel_token.child_token(),
                         event_sender.clone(),
-                        config.id.clone(),
+                        config.config.id.clone(),
                     )
                 }
                 InputConfig::St2110_31(c) => {
                     let mut c = c.clone();
-                    c.clock_domain = c.clock_domain.or(config.clock_domain);
+                    c.clock_domain = c.clock_domain.or(config.config.clock_domain);
                     super::input_st2110_31::spawn_st2110_31_input(
                         c,
                         broadcast_tx.clone(),
                         flow_stats.clone(),
                         cancel_token.child_token(),
                         event_sender.clone(),
-                        config.id.clone(),
+                        config.config.id.clone(),
                     )
                 }
                 InputConfig::St2110_40(c) => {
                     let mut c = c.clone();
-                    c.clock_domain = c.clock_domain.or(config.clock_domain);
+                    c.clock_domain = c.clock_domain.or(config.config.clock_domain);
                     super::input_st2110_40::spawn_st2110_40_input(
                         c,
                         broadcast_tx.clone(),
                         flow_stats.clone(),
                         cancel_token.child_token(),
                         event_sender.clone(),
-                        config.id.clone(),
+                        config.config.id.clone(),
                     )
                 }
                 InputConfig::RtpAudio(c) => super::input_rtp_audio::spawn_rtp_audio_input(
@@ -395,7 +395,7 @@ impl FlowRuntime {
                     flow_stats.clone(),
                     cancel_token.child_token(),
                     Some(event_sender.clone()),
-                    Some(config.id.clone()),
+                    Some(config.config.id.clone()),
                 ),
             }
         } else {
@@ -450,7 +450,7 @@ impl FlowRuntime {
         };
 
         // Start media analysis (if enabled and input is present)
-        let media_analysis_handle = if config.media_analysis && config.input.is_some() {
+        let media_analysis_handle = if config.config.media_analysis && config.input.is_some() {
             let (protocol, payload_format, fec_enabled, fec_type, redundancy_enabled, redundancy_type) =
                 match config.input.as_ref().unwrap() {
                     InputConfig::Rtp(rtp) => {
@@ -547,24 +547,24 @@ impl FlowRuntime {
         };
 
         // Start thumbnail generator (if enabled, ffmpeg available, and input is present)
-        let thumbnail_handle = if config.thumbnail && ffmpeg_available && config.input.is_some() {
+        let thumbnail_handle = if config.config.thumbnail && ffmpeg_available && config.input.is_some() {
             let thumb_acc = Arc::new(ThumbnailAccumulator::new());
             flow_stats.thumbnail.set(thumb_acc.clone()).ok();
             Some(spawn_thumbnail_generator(
                 &broadcast_tx,
                 thumb_acc,
                 cancel_token.child_token(),
-                config.thumbnail_program_number,
+                config.config.thumbnail_program_number,
             ))
         } else {
             None
         };
 
         // Start bandwidth monitor (if configured)
-        let bandwidth_monitor_handle = if let Some(ref bw_limit) = config.bandwidth_limit {
+        let bandwidth_monitor_handle = if let Some(ref bw_limit) = config.config.bandwidth_limit {
             flow_stats.bandwidth_limit_mbps.set(bw_limit.max_bitrate_mbps).ok();
             Some(spawn_bandwidth_monitor(
-                config.id.clone(),
+                config.config.id.clone(),
                 bw_limit.clone(),
                 flow_stats.clone(),
                 event_sender.clone(),
@@ -612,7 +612,7 @@ impl FlowRuntime {
                 &flow_stats,
                 &cancel_token,
                 &event_sender,
-                &config.id,
+                &config.config.id,
                 input_audio_format,
                 compressed_audio_input,
                 #[cfg(feature = "webrtc")]
@@ -624,8 +624,8 @@ impl FlowRuntime {
 
         tracing::info!(
             "Flow '{}' ({}) started: {} input, {} output(s)",
-            config.id,
-            config.name,
+            config.config.id,
+            config.config.name,
             input_type,
             output_handles.len()
         );
@@ -926,7 +926,7 @@ impl FlowRuntime {
             flow_stats,
             &self.cancel_token,
             &self.event_sender,
-            &self.config.id,
+            &self.config.config.id,
             input_audio_format,
             compressed_audio_input,
             #[cfg(feature = "webrtc")]
@@ -946,7 +946,7 @@ impl FlowRuntime {
         let mut handles = self.output_handles.write().await;
         handles.insert(output_id.clone(), output_rt);
 
-        tracing::info!("Hot-added output '{}' to flow '{}'", output_id, self.config.id);
+        tracing::info!("Hot-added output '{}' to flow '{}'", output_id, self.config.config.id);
         Ok(())
     }
 
@@ -974,10 +974,10 @@ impl FlowRuntime {
                 output_rt.handle,
             ).await;
             self.stats.unregister_output(output_id);
-            tracing::info!("Removed output '{}' from flow '{}'", output_id, self.config.id);
+            tracing::info!("Removed output '{}' from flow '{}'", output_id, self.config.config.id);
             Ok(())
         } else {
-            bail!("Output '{}' not found in flow '{}'", output_id, self.config.id);
+            bail!("Output '{}' not found in flow '{}'", output_id, self.config.config.id);
         }
     }
 
@@ -988,7 +988,7 @@ impl FlowRuntime {
     /// cancel propagates to all tasks. The actual task cleanup (socket close,
     /// thread join) happens asynchronously inside each task's select loop.
     pub async fn stop(&self) {
-        tracing::info!("Stopping flow '{}' ({})", self.config.id, self.config.name);
+        tracing::info!("Stopping flow '{}' ({})", self.config.config.id, self.config.config.name);
         self.cancel_token.cancel();
         // Await all output task handles so sockets (especially SRT listeners)
         // are fully closed and ports released before the flow is considered stopped.
@@ -1011,7 +1011,7 @@ fn build_output_config_meta(config: &OutputConfig) -> OutputConfigMeta {
         OutputConfig::Srt(c) => OutputConfigMeta {
             mode: Some(format!("{:?}", c.mode).to_lowercase()),
             remote_addr: c.remote_addr.clone(),
-            local_addr: Some(c.local_addr.clone()),
+            local_addr: c.local_addr.clone(),
             dest_addr: None, dest_url: None, ingest_url: None, whip_url: None,
             program_number: c.program_number,
         },

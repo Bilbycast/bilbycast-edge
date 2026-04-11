@@ -245,11 +245,14 @@ impl OutputStatsAccumulator {
             None
         };
 
+        let packets_sent = self.packets_sent.load(Ordering::Relaxed);
+        let packets_dropped = self.packets_dropped.load(Ordering::Relaxed);
+
         OutputStats {
             output_id: self.output_id.clone(),
             output_name: self.output_name.clone(),
             output_type: self.output_type.clone(),
-            state: "active".to_string(),
+            state: derive_output_state(bitrate_bps, packets_sent, packets_dropped),
             mode: None,
             remote_addr: None,
             dest_addr: None,
@@ -258,10 +261,10 @@ impl OutputStatsAccumulator {
             whip_url: None,
             local_addr: None,
             program_number: None,
-            packets_sent: self.packets_sent.load(Ordering::Relaxed),
+            packets_sent,
             bytes_sent: bytes,
             bitrate_bps,
-            packets_dropped: self.packets_dropped.load(Ordering::Relaxed),
+            packets_dropped,
             fec_packets_sent: self.fec_packets_sent.load(Ordering::Relaxed),
             srt_stats: self.srt_stats_cache.borrow().clone(),
             srt_leg2_stats: self.srt_leg2_stats_cache.borrow().clone(),
@@ -986,7 +989,7 @@ impl FlowStatsAccumulator {
                 let meta = self.input_config_meta.get();
                 InputStats {
                     input_type: self.input_type.clone(),
-                    state: "receiving".to_string(),
+                    state: derive_input_state(input_bitrate, self.input_packets.load(Ordering::Relaxed)),
                     mode: meta.and_then(|m| m.mode.clone()),
                     local_addr: meta.and_then(|m| m.local_addr.clone()),
                     remote_addr: meta.and_then(|m| m.remote_addr.clone()),
@@ -1074,6 +1077,34 @@ fn red_blue_to_stats(
         },
         leg_switches: snap.leg_switches,
     }
+}
+
+/// Derive input connection state from counters.
+/// Called during the 1/sec snapshot — zero hot-path impact.
+fn derive_input_state(bitrate_bps: u64, packets_received: u64) -> String {
+    if bitrate_bps > 0 {
+        "receiving"
+    } else if packets_received > 0 {
+        "idle"
+    } else {
+        "waiting"
+    }
+    .to_string()
+}
+
+/// Derive output connection state from counters.
+/// Called during the 1/sec snapshot — zero hot-path impact.
+fn derive_output_state(bitrate_bps: u64, packets_sent: u64, packets_dropped: u64) -> String {
+    if bitrate_bps > 0 {
+        "active"
+    } else if packets_sent > 0 {
+        "idle"
+    } else if packets_dropped > 0 {
+        "dropping"
+    } else {
+        "waiting"
+    }
+    .to_string()
 }
 
 /// Derive flow health from available metrics (RP 2129 M6).

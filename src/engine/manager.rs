@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use anyhow::{Result, bail};
 use dashmap::DashMap;
 
-use crate::config::models::{FlowConfig, OutputConfig, ResourceLimitAction};
+use crate::config::models::{OutputConfig, ResolvedFlow, ResourceLimitAction};
 use crate::manager::events::{EventSender, EventSeverity};
 use crate::stats::collector::StatsCollector;
 
@@ -111,22 +111,22 @@ impl FlowManager {
     /// Returns an error if a flow with the same `config.id` is already running
     /// or if the underlying input/output tasks fail to initialize (e.g., socket
     /// bind failure, SRT connection error).
-    pub async fn create_flow(&self, config: FlowConfig) -> Result<Arc<FlowRuntime>> {
+    pub async fn create_flow(&self, config: ResolvedFlow) -> Result<Arc<FlowRuntime>> {
         // Gate flow creation when system resources are critical
         if self.resource_state.resources_critical.load(Ordering::Relaxed) {
             if matches!(self.resource_action, Some(ResourceLimitAction::GateFlows)) {
                 bail!(
                     "Cannot start flow '{}': system resources critical (CPU or RAM threshold exceeded)",
-                    config.id
+                    config.config.id
                 );
             }
         }
 
-        if self.flows.contains_key(&config.id) {
-            bail!("Flow '{}' is already running", config.id);
+        if self.flows.contains_key(&config.config.id) {
+            bail!("Flow '{}' is already running", config.config.id);
         }
 
-        let flow_id = config.id.clone();
+        let flow_id = config.config.id.clone();
         match FlowRuntime::start(config.clone(), &self.stats, self.ffmpeg_available, self.event_sender.clone()).await {
             Ok(runtime) => {
                 let runtime = Arc::new(runtime);
@@ -265,15 +265,15 @@ impl FlowManager {
     pub async fn start_flow_group(
         &self,
         group_id: &str,
-        members: Vec<FlowConfig>,
+        members: Vec<ResolvedFlow>,
     ) -> Result<()> {
         if members.is_empty() {
             bail!("Flow group '{}' has no members to start", group_id);
         }
         // Avoid double-starting members that are already running.
-        let already_running: Vec<&FlowConfig> = members
+        let already_running: Vec<&ResolvedFlow> = members
             .iter()
-            .filter(|f| self.flows.contains_key(&f.id))
+            .filter(|f| self.flows.contains_key(&f.config.id))
             .collect();
         if !already_running.is_empty() {
             bail!(
@@ -281,7 +281,7 @@ impl FlowManager {
                 group_id,
                 already_running
                     .iter()
-                    .map(|f| f.id.as_str())
+                    .map(|f| f.config.id.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
             );
@@ -292,7 +292,7 @@ impl FlowManager {
             members
                 .iter()
                 .cloned()
-                .map(|cfg| async move { (cfg.id.clone(), self.create_flow(cfg).await) }),
+                .map(|cfg| async move { (cfg.config.id.clone(), self.create_flow(cfg).await) }),
         )
         .await;
 
