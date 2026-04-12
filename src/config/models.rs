@@ -126,12 +126,6 @@ impl ResolvedFlow {
         self.inputs.iter().find(|i| i.active)
     }
 
-    /// Iterate over the outputs that are currently marked active. Passive
-    /// outputs are skipped by the engine but remain in the flow config so
-    /// operators can toggle them on later without re-creating them.
-    pub fn active_outputs(&self) -> impl Iterator<Item = &OutputConfig> {
-        self.outputs.iter().filter(|o| o.active())
-    }
 }
 
 impl AppConfig {

@@ -152,7 +152,7 @@ If neither file exists at startup, an empty default configuration is used. Both 
       "id": "main-feed",
       "name": "Main Program Feed",
       "enabled": true,
-      "input_id": "rtp-in",
+      "input_ids": ["rtp-in"],
       "output_ids": ["rtp-local", "srt-remote", "twitch-out"]
     }
   ]
@@ -172,9 +172,9 @@ If neither file exists at startup, an empty default configuration is used. Both 
 | `server` | object | Yes | - | API server configuration. |
 | `monitor` | object | No | `null` | Web monitoring dashboard configuration. |
 | `manager` | object | No | `null` | Manager WebSocket connection configuration. See [Manager Configuration](#manager-configuration). |
-| `inputs` | array | No | `[]` | Top-level input definitions. Each is an `InputDefinition` with `id`, `name`, and flattened protocol-specific fields (enum-tagged by `type`). See [Input Types](#input-types). Inputs exist independently and are referenced by flows via `input_id`. |
+| `inputs` | array | No | `[]` | Top-level input definitions. Each is an `InputDefinition` with `id`, `name`, and flattened protocol-specific fields (enum-tagged by `type`). See [Input Types](#input-types). Inputs exist independently and are referenced by flows via `input_ids`. |
 | `outputs` | array | No | `[]` | Top-level output definitions. Each is an `OutputConfig` with `id`, `name`, and protocol-specific fields (enum-tagged by `type`). See [Output Types](#output-types). Outputs exist independently and are referenced by flows via `output_ids`. |
-| `flows` | array | No | `[]` | List of flow configurations. Each flow references one input and zero or more outputs by ID. See [Flow Configuration](#flow-configuration). |
+| `flows` | array | No | `[]` | List of flow configurations. Each flow references one or more inputs (one active at a time) and zero or more outputs by ID. See [Flow Configuration](#flow-configuration). |
 | `tunnels` | array | No | `[]` | List of IP tunnel configurations. See [Tunnel Configuration](#tunnel-configuration). |
 
 ---
@@ -412,16 +412,16 @@ One edge has a public IP. Direct QUIC connection between edges — no relay need
 
 ## Flow Configuration
 
-Flows connect one input to zero or more outputs by reference. Inputs and outputs are defined as independent top-level entities in the `inputs` and `outputs` arrays; a flow references them by ID via `input_id` and `output_ids`. An input or output can only be assigned to one flow at a time. Unassigned inputs and outputs are configured but not running.
+Flows connect one or more inputs to zero or more outputs by reference. A flow may have multiple inputs but at most one is active (publishing to the broadcast channel) at a time. Inputs and outputs are defined as independent top-level entities in the `inputs` and `outputs` arrays; a flow references them by ID via `input_ids` and `output_ids`. An input or output can only be assigned to one flow at a time. Unassigned inputs and outputs are configured but not running.
 
-At startup (or on create/update), `AppConfig::resolve_flow()` dereferences the IDs into a `ResolvedFlow` containing the full `InputDefinition` and `Vec<OutputConfig>`. The engine only ever sees `ResolvedFlow`.
+At startup (or on create/update), `AppConfig::resolve_flow()` dereferences the IDs into a `ResolvedFlow` containing `Vec<InputDefinition>` and `Vec<OutputConfig>`. The engine only ever sees `ResolvedFlow`.
 
 ```json
 {
   "id": "main-feed",
   "name": "Main Program Feed",
   "enabled": true,
-  "input_id": "rtp-in",
+  "input_ids": ["rtp-in"],
   "output_ids": ["rtp-local", "srt-remote", "twitch-out"]
 }
 ```
@@ -435,7 +435,7 @@ At startup (or on create/update), `AppConfig::resolve_flow()` dereferences the I
 | `thumbnail` | boolean | No | `true` | Enable thumbnail generation (requires ffmpeg). |
 | `thumbnail_program_number` | integer | No | `null` | When the input is an MPTS, render the thumbnail from this MPEG-TS program only. `null` lets ffmpeg pick the first program it finds. Must be `> 0` if set. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 | `bandwidth_limit` | object | No | `null` | Per-flow bandwidth monitoring (RP 2129). See [Bandwidth Limit](#bandwidth-limit). |
-| `input_id` | string | Yes | - | ID of an input from the top-level `inputs` array. The referenced input must exist and must not already be assigned to another flow. |
+| `input_ids` | array of strings | No | `[]` | IDs of inputs from the top-level `inputs` array. Each referenced input must exist and must not already be assigned to another flow. At most one input may be active at a time. Can be empty (output-only flow). |
 | `output_ids` | array of strings | No | `[]` | IDs of outputs from the top-level `outputs` array. Each referenced output must exist and must not already be assigned to another flow. Can be empty (input-only flow). |
 
 ### Bandwidth Limit
@@ -985,7 +985,7 @@ All outputs — and the thumbnail generator — accept an optional `program_numb
     {
       "id": "mpts-flow", "name": "Dual-program feed",
       "thumbnail_program_number": 1,
-      "input_id": "mpts-in",
+      "input_ids": ["mpts-in"],
       "output_ids": ["archive", "prog1-viewer", "prog2-rtmp"]
     }
   ]
@@ -1183,7 +1183,7 @@ Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json
       "id": "passthrough",
       "name": "RTP Passthrough",
       "enabled": true,
-      "input_id": "rtp-in",
+      "input_ids": ["rtp-in"],
       "output_ids": ["out-1"]
     }
   ]
@@ -1235,7 +1235,7 @@ Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json
       "id": "multicast-feed",
       "name": "Multicast with FEC and Trust Boundary",
       "enabled": true,
-      "input_id": "mcast-in",
+      "input_ids": ["mcast-in"],
       "output_ids": ["local-out"]
     }
   ]
@@ -1296,7 +1296,7 @@ Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json
       "id": "srt-redundant",
       "name": "SRT with Hitless Redundancy",
       "enabled": true,
-      "input_id": "srt-in",
+      "input_ids": ["srt-in"],
       "output_ids": ["srt-out"]
     }
   ]
@@ -1357,7 +1357,7 @@ Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json
       "id": "multi-output",
       "name": "Multi-Output Fan-Out",
       "enabled": true,
-      "input_id": "mcast-in",
+      "input_ids": ["mcast-in"],
       "output_ids": ["local", "remote-srt", "twitch", "youtube-hls"]
     }
   ]
@@ -1437,7 +1437,7 @@ Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json
       "id": "main-feed",
       "name": "Main Program Feed",
       "enabled": true,
-      "input_id": "rtp-in",
+      "input_ids": ["rtp-in"],
       "output_ids": ["local-playout", "remote-site"]
     }
   ]
@@ -1476,7 +1476,7 @@ Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json
       "id": "ipv6-mcast",
       "name": "IPv6 Multicast Flow",
       "enabled": true,
-      "input_id": "ipv6-in",
+      "input_ids": ["ipv6-in"],
       "output_ids": ["ipv6-out"]
     }
   ]
@@ -1539,7 +1539,7 @@ A flow referencing this input would set `clock_domain` and `flow_group_id` at th
   "name": "Studio A — stereo",
   "enabled": true,
   "clock_domain": 0,
-  "input_id": "st2110-30-in",
+  "input_ids": ["st2110-30-in"],
   "output_ids": []
 }
 ```
@@ -1653,7 +1653,7 @@ Flow wiring them together:
 {
   "id": "perth-receive",
   "name": "Sydney → Perth contribution",
-  "input_id": "perth-receive-in",
+  "input_ids": ["perth-receive-in"],
   "output_ids": ["perth-monitor"]
 }
 ```
@@ -1732,7 +1732,7 @@ Flow:
   "name": "ANC (timecode + SCTE-104)",
   "enabled": true,
   "clock_domain": 0,
-  "input_id": "anc-in",
+  "input_ids": ["anc-in"],
   "output_ids": ["anc-out"]
 }
 ```

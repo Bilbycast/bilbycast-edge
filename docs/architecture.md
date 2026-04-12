@@ -80,9 +80,10 @@
 ## Data Plane: Packet Flow
 
 Inputs and outputs are independent top-level config entities referenced by
-flows via `input_id` and `output_ids`. At startup or on create/update,
+flows via `input_ids` and `output_ids`. A flow may have multiple inputs but at
+most one is active at a time. At startup or on create/update,
 `AppConfig::resolve_flow()` dereferences these IDs into a `ResolvedFlow`
-(containing the full `InputDefinition` + `Vec<OutputConfig>`), which is what
+(containing `Vec<InputDefinition>` + `Vec<OutputConfig>`), which is what
 the engine's `FlowRuntime` receives. The engine never sees raw ID references.
 
 ```
@@ -310,7 +311,7 @@ and worked use cases, see the [Audio Gateway Guide](audio-gateway.md).
 
 Config version 2 separates inputs, outputs, and flows into three independent
 top-level arrays. Inputs and outputs are standalone entities with stable IDs;
-flows connect one input to N outputs by reference (`input_id` + `output_ids`).
+flows connect one or more inputs (one active at a time) to N outputs by reference (`input_ids` + `output_ids`).
 
 ```
   config.json (version 2)
@@ -328,7 +329,7 @@ flows connect one input to N outputs by reference (`input_id` + `output_ids`).
   │                                                      │
   │  "flows": [                                          │
   │    { "id": "flow-1",                                 │
-  │      "input_id": "srt-in",        ◄── reference      │
+  │      "input_ids": ["srt-in"],      ◄── reference      │
   │      "output_ids": ["rtp-out", "rtmp-out"] }         │
   │  ]                                                   │
   └──────────────────────────────────────────────────────┘

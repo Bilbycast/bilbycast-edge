@@ -144,6 +144,7 @@ pub struct InputRuntime {
     pub forwarder_handle: JoinHandle<()>,
     /// Child cancellation token scoped to this input. Cancelling it stops
     /// the input and its forwarder. Derived from the flow's parent token.
+    #[allow(dead_code)]
     pub cancel_token: CancellationToken,
 }
 

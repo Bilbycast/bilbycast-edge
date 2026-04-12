@@ -2,7 +2,7 @@
 
 > 🌐 Learn more at **[bilbycast.com](https://bilbycast.com)** — the official website for the Bilbycast broadcast media transport suite.
 
-Media transport edge node supporting SRT, RTP, UDP, RTMP, HLS, and WebRTC protocols. Each node runs one or more flows, where a flow consists of a single input fanning out to multiple outputs, with support for SMPTE 2022-1 FEC and SMPTE 2022-7 hitless redundancy.
+Media transport edge node supporting SRT, RTP, UDP, RTMP, HLS, and WebRTC protocols. Each node runs one or more flows, where a flow consists of one or more inputs (one active at a time) fanning out to multiple outputs, with support for SMPTE 2022-1 FEC and SMPTE 2022-7 hitless redundancy.
 
 Full MPTS (multi-program transport stream) support end-to-end on UDP/RTP/SRT/HLS with optional per-output `program_number` down-selection for extracting a single program as a rewritten SPTS. RTMP/WebRTC outputs and the thumbnail generator lock onto a chosen program deterministically.
 

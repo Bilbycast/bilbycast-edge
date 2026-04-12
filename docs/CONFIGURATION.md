@@ -342,7 +342,7 @@ One edge has a public IP. Direct QUIC connection — no relay needed.
 
 ## Flows Section
 
-An array of flow definitions. Each flow has one input and one or more outputs.
+An array of flow definitions. Each flow has one or more inputs (one active at a time) and one or more outputs.
 
 | Field     | Type             | Default | Description                              |
 |-----------|------------------|---------|------------------------------------------|
@@ -353,7 +353,7 @@ An array of flow definitions. Each flow has one input and one or more outputs.
 | `thumbnail`       | `bool`           | `true`  | Enable thumbnail generation for visual flow preview (requires ffmpeg on the device). |
 | `thumbnail_program_number` | `u16?`   | `null`  | When the input is an MPTS, render the thumbnail from this MPEG-TS program only. `null` lets ffmpeg pick the first program it finds. Must be `> 0` if set. See the **[MPTS → SPTS filtering](#mpts--spts-filtering)** section. |
 | `bandwidth_limit` | `BandwidthLimitConfig?` | `null` | Per-flow bandwidth monitoring for trust boundary enforcement (RP 2129). See below. |
-| `input`           | `InputConfig`    | --      | Single input source                      |
+| `input_ids`       | `string[]`       | `[]`    | One or more input sources (one active at a time) |
 | `outputs`         | `OutputConfig[]` | --      | One or more output destinations          |
 
 ### Bandwidth Limit (`bandwidth_limit`)

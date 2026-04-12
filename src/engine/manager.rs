@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use dashmap::DashMap;
 
 use crate::config::models::{OutputConfig, ResolvedFlow, ResourceLimitAction};
-use crate::manager::events::{EventSender, EventSeverity};
+use crate::manager::events::{Event, EventSender, EventSeverity};
 use crate::stats::collector::StatsCollector;
 
 use super::flow::FlowRuntime;
@@ -262,13 +262,19 @@ impl FlowManager {
             .flows
             .get(flow_id)
             .ok_or_else(|| anyhow::anyhow!("Flow '{}' is not running", flow_id))?;
+        let previous_input_id = runtime.active_input_tx.borrow().clone();
         runtime.switch_active_input(new_input_id).await?;
-        self.event_sender.emit_flow(
-            EventSeverity::Info,
-            "flow",
-            format!("Flow '{flow_id}': active input switched to '{new_input_id}'"),
-            flow_id,
-        );
+        self.event_sender.send(Event {
+            severity: EventSeverity::Info,
+            category: "flow".to_string(),
+            message: format!("Flow '{flow_id}': active input switched to '{new_input_id}'"),
+            details: Some(serde_json::json!({
+                "previous_input_id": previous_input_id,
+            })),
+            flow_id: Some(flow_id.to_string()),
+            input_id: Some(new_input_id.to_string()),
+            output_id: None,
+        });
         Ok(())
     }
 
@@ -290,15 +296,20 @@ impl FlowManager {
         runtime
             .set_output_active(output_id, active, &runtime.stats)
             .await?;
-        self.event_sender.emit_flow(
-            EventSeverity::Info,
-            "flow",
-            format!(
+        self.event_sender.send(Event {
+            severity: EventSeverity::Info,
+            category: "flow".to_string(),
+            message: format!(
                 "Flow '{flow_id}': output '{output_id}' set {}",
                 if active { "active" } else { "passive" }
             ),
-            flow_id,
-        );
+            details: Some(serde_json::json!({
+                "active": active,
+            })),
+            flow_id: Some(flow_id.to_string()),
+            input_id: None,
+            output_id: Some(output_id.to_string()),
+        });
         Ok(())
     }
 
