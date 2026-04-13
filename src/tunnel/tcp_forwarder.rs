@@ -46,7 +46,9 @@ pub async fn run_egress(
     cancel: CancellationToken,
     cipher: Option<Arc<TunnelCipher>>,
 ) -> Result<()> {
-    let listener = TcpListener::bind(local_addr).await?;
+    let listener = TcpListener::bind(local_addr).await.map_err(|e| {
+        crate::util::port_error::annotate_bind_error(e, local_addr, "TCP tunnel egress")
+    })?;
     tracing::info!(
         tunnel_id = %tunnel_id,
         local_addr = %local_addr,

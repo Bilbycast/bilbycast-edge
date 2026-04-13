@@ -220,6 +220,7 @@ impl TunnelManager {
         tokio::spawn(async move {
             let result = run_relay_tunnel(
                 params,
+                config_name.clone(),
                 direction,
                 protocol,
                 local_addr,
@@ -311,6 +312,22 @@ impl TunnelManager {
                         attempt = 0;
                     }
                     Err(e) => {
+                        // Port conflicts are permanent — don't retry
+                        if crate::util::port_error::anyhow_is_addr_in_use(&e) {
+                            tracing::error!(
+                                tunnel_id = %tunnel_id,
+                                "Direct tunnel local port conflict, stopping: {e}"
+                            );
+                            event_sender.emit_flow(
+                                EventSeverity::Critical,
+                                "port_conflict",
+                                format!("Tunnel '{}' stopped: {e}", config_name),
+                                &config_id,
+                            );
+                            tunnels.remove(&config_id);
+                            return;
+                        }
+
                         tracing::warn!(
                             tunnel_id = %tunnel_id,
                             "Direct tunnel attempt {} failed: {e}",
@@ -429,6 +446,7 @@ fn build_status(runtime: &TunnelRuntime) -> TunnelStatus {
 /// automatically recovers when the relay restarts or the QUIC connection drops.
 async fn run_relay_tunnel(
     params: RelayTunnelParams,
+    tunnel_name: String,
     direction: TunnelDirection,
     protocol: TunnelProtocol,
     local_addr: SocketAddr,
@@ -468,6 +486,21 @@ async fn run_relay_tunnel(
         // Connection lost — log and prepare to reconnect
         match result {
             Err(ref e) => {
+                // Port conflicts are permanent — don't retry, escalate immediately
+                if crate::util::port_error::anyhow_is_addr_in_use(e) {
+                    tracing::error!(
+                        tunnel_id = %tunnel_id,
+                        "Tunnel local port conflict, stopping tunnel: {e}"
+                    );
+                    event_sender.emit_flow(
+                        EventSeverity::Critical,
+                        "port_conflict",
+                        format!("Tunnel '{}' stopped: {e}", tunnel_name),
+                        &tunnel_id_str,
+                    );
+                    return Err(anyhow::anyhow!("{e}"));
+                }
+
                 tracing::warn!(
                     tunnel_id = %tunnel_id,
                     "Relay tunnel connection lost: {e}, reconnecting in {reconnect_delay:?}"

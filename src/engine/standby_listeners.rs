@@ -268,8 +268,16 @@ async fn run_udp_standby(
             s
         }
         Err(e) => {
+            let msg = if crate::util::port_error::is_addr_in_use(&e) {
+                format!(
+                    "Port conflict: could not bind to {bind_addr} \
+                     — address already in use"
+                )
+            } else {
+                format!("{e}")
+            };
             *status.state.write().unwrap() = "bind_failed".to_string();
-            *status.error.write().unwrap() = Some(format!("{e}"));
+            *status.error.write().unwrap() = Some(msg);
             return;
         }
     };
@@ -319,8 +327,16 @@ async fn run_tcp_standby(
             l
         }
         Err(e) => {
+            let msg = if crate::util::port_error::is_addr_in_use(&e) {
+                format!(
+                    "Port conflict: could not bind to {listen_addr} \
+                     — address already in use"
+                )
+            } else {
+                format!("{e}")
+            };
             *status.state.write().unwrap() = "bind_failed".to_string();
-            *status.error.write().unwrap() = Some(format!("{e}"));
+            *status.error.write().unwrap() = Some(msg);
             return;
         }
     };

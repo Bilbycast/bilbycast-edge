@@ -25,6 +25,7 @@ use super::output_srt::spawn_srt_output;
 use super::output_udp::spawn_udp_output;
 use super::output_webrtc::spawn_webrtc_output;
 use super::packet::{BROADCAST_CHANNEL_CAPACITY, RtpPacket};
+use super::ts_continuity_fixer::{ProcessResult, TsContinuityFixer};
 use super::bandwidth_monitor::spawn_bandwidth_monitor;
 use super::media_analysis::spawn_media_analyzer;
 use super::thumbnail::spawn_thumbnail_generator;
@@ -146,6 +147,9 @@ pub struct InputRuntime {
     /// the input and its forwarder. Derived from the flow's parent token.
     #[allow(dead_code)]
     pub cancel_token: CancellationToken,
+    /// Per-input thumbnail generation task handle (if enabled and ffmpeg available).
+    #[allow(dead_code)]
+    pub thumbnail_handle: Option<JoinHandle<()>>,
 }
 
 /// Runtime state for a single output within a flow.
@@ -254,6 +258,11 @@ impl FlowRuntime {
                 build_output_config_meta(oc),
             );
         }
+
+        // Shared TS continuity fixer for seamless input switching. Ensures
+        // CC counters are continuous and discontinuity_indicator is set when
+        // switching between inputs, preventing external decoders from losing lock.
+        let continuity_fixer = Arc::new(std::sync::Mutex::new(TsContinuityFixer::new()));
 
         // Spawn every input task (warm passive). Each input publishes to its
         // own per-input broadcast channel; a forwarder task drains it and
@@ -408,14 +417,32 @@ impl FlowRuntime {
 
             // Spawn the forwarder: drains the per-input channel and forwards
             // onto the main broadcast channel iff this input's ID matches the
-            // current value in the active-input watch.
+            // current value in the active-input watch. The shared continuity
+            // fixer ensures CC counters are seamless across input switches.
             let forwarder_handle = spawn_input_forwarder(
                 input_id.clone(),
                 per_input_tx.subscribe(),
                 broadcast_tx.clone(),
                 active_input_watch_rx.clone(),
                 input_cancel.clone(),
+                continuity_fixer.clone(),
             );
+
+            // Spawn per-input thumbnail generator (subscribes to the input's
+            // own broadcast channel so it captures this source's video even
+            // when the input is passive / not currently active).
+            let thumbnail_handle = if config.config.thumbnail && ffmpeg_available {
+                let thumb_acc = Arc::new(ThumbnailAccumulator::new());
+                flow_stats.per_input_thumbnails.insert(input_id.clone(), thumb_acc.clone());
+                Some(spawn_thumbnail_generator(
+                    &per_input_tx,
+                    thumb_acc,
+                    input_cancel.child_token(),
+                    None, // no program filter for per-input thumbnails (pre-filter stream)
+                ))
+            } else {
+                None
+            };
 
             #[cfg(feature = "webrtc")]
             {
@@ -430,6 +457,7 @@ impl FlowRuntime {
                     input_handle,
                     forwarder_handle,
                     cancel_token: input_cancel,
+                    thumbnail_handle,
                 },
             );
         }
@@ -581,6 +609,8 @@ impl FlowRuntime {
                 media_acc,
                 cancel_token.child_token(),
                 frame_rate_tx,
+                active_input_tx.subscribe(),
+                config.inputs.clone(),
             ))
         } else {
             None
@@ -1222,23 +1252,65 @@ fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::Inpu
 /// broadcast channel only while the `active_input_rx` watch value equals this
 /// input's ID. Passive inputs' packets are silently dropped — the per-input
 /// task keeps running so its stats continue to advance.
+///
+/// The shared `continuity_fixer` ensures seamless TS continuity counter
+/// progression when switching between inputs, and injects cached PAT/PMT
+/// packets at the switch boundary so external decoders can re-acquire quickly.
 fn spawn_input_forwarder(
     input_id: String,
     mut rx: broadcast::Receiver<RtpPacket>,
     out_tx: broadcast::Sender<RtpPacket>,
     active_input_rx: watch::Receiver<String>,
     cancel: CancellationToken,
+    continuity_fixer: Arc<std::sync::Mutex<TsContinuityFixer>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut was_active = *active_input_rx.borrow() == input_id;
         loop {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return,
                 r = rx.recv() => match r {
                     Ok(pkt) => {
-                        // Hot-path: single atomic borrow of the watch value.
-                        if *active_input_rx.borrow() == input_id {
-                            let _ = out_tx.send(pkt);
+                        let is_active = *active_input_rx.borrow() == input_id;
+
+                        if is_active && !was_active {
+                            // This input just became active — trigger switch
+                            // to fix CC counters and inject cached PSI.
+                            let injected = continuity_fixer.lock().unwrap().on_switch(&input_id);
+                            tracing::info!(
+                                "Input forwarder '{}': switch detected, injecting {} PSI packets",
+                                input_id, injected.len()
+                            );
+                            for inj_pkt in injected {
+                                let _ = out_tx.send(inj_pkt);
+                            }
+                        }
+                        was_active = is_active;
+
+                        if is_active {
+                            let mut fixer = continuity_fixer.lock().unwrap();
+                            match fixer.process_packet(&input_id, &pkt) {
+                                ProcessResult::Rewritten(fixed_data) => {
+                                    drop(fixer);
+                                    let _ = out_tx.send(RtpPacket {
+                                        data: fixed_data,
+                                        sequence_number: pkt.sequence_number,
+                                        rtp_timestamp: pkt.rtp_timestamp,
+                                        recv_time_us: pkt.recv_time_us,
+                                        is_raw_ts: pkt.is_raw_ts,
+                                    });
+                                }
+                                ProcessResult::Unchanged => {
+                                    // Hot path: no rewrite needed, forward unchanged.
+                                    drop(fixer);
+                                    let _ = out_tx.send(pkt);
+                                }
+                            }
+                        } else {
+                            // Passive — observe PSI for cache pre-warming so
+                            // PAT/PMT is ready for injection on switch.
+                            continuity_fixer.lock().unwrap().observe_passive(&input_id, &pkt);
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {

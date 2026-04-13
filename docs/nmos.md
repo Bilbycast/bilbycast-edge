@@ -56,6 +56,27 @@ selected interface, or `mdns-sd` daemon errors) are logged once and
 swallowed; flow startup is never blocked. The handle is dropped on
 process exit, which unregisters the service cleanly.
 
+## Authentication
+
+By default, NMOS endpoints are public (no auth required) for compatibility with standard NMOS controllers. This matches typical broadcast facility deployments where NMOS operates on a closed management network.
+
+For deployments on untrusted or shared networks, set `nmos_require_auth: true` in the `auth` configuration block. When enabled, all NMOS IS-04, IS-05, and IS-08 endpoints require a valid JWT Bearer token (the same tokens issued by `/oauth/token`). Both `admin` and `monitor` roles have full access to NMOS endpoints.
+
+```json
+{
+  "server": {
+    "auth": {
+      "enabled": true,
+      "jwt_secret": "...",
+      "nmos_require_auth": true,
+      "clients": [...]
+    }
+  }
+}
+```
+
+NMOS controllers must obtain a token via the OAuth endpoint first, then include `Authorization: Bearer <token>` in all NMOS requests. If `nmos_require_auth` is `true` but `enabled` is `false`, a warning is logged and NMOS endpoints remain public.
+
 ## Backward compatibility
 
 Multi-essence audio + data resources are additive — old NMOS controllers

@@ -531,6 +531,10 @@ pub struct VideoStreamState {
     pub profile: Option<String>,
     pub level: Option<String>,
     pub sps_detected: bool,
+    // PTS-based frame rate detection fallback (when VUI timing is absent)
+    pub last_pts: Option<u64>,
+    pub pts_frame_count: u32,
+    pub pts_interval_sum: u64,
 }
 
 /// Internal state for a detected audio stream.
@@ -574,6 +578,23 @@ impl MediaAnalysisAccumulator {
                 total_bitrate_bps: 0,
             }),
         }
+    }
+
+    /// Reset all accumulated state. Called when the flow's active input
+    /// switches so the analyzer starts fresh for the new input.
+    pub fn reset_state(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.programs.clear();
+        state.pid_bytes.clear();
+        state.pid_bitrates.clear();
+        state.total_bitrate_bps = 0;
+        state.last_bitrate_calc = Instant::now();
+        state.protocol = String::new();
+        state.payload_format = String::new();
+        state.fec_enabled = false;
+        state.fec_type = None;
+        state.redundancy_enabled = false;
+        state.redundancy_type = None;
     }
 
     /// Take a point-in-time snapshot for JSON serialisation.
@@ -694,8 +715,8 @@ impl MediaAnalysisAccumulator {
 // ── Thumbnail Accumulator ─────────────────────────────────────────────────
 
 /// Number of consecutive identical thumbnail captures before raising a
-/// "frozen" alarm. At 10 s per capture this corresponds to ~30 s.
-const FREEZE_THRESHOLD: u64 = 3;
+/// "frozen" alarm. At 5 s per capture this corresponds to ~30 s.
+const FREEZE_THRESHOLD: u64 = 6;
 
 /// Thumbnail generation accumulator. The thumbnail task writes the latest
 /// JPEG bytes; the 1/sec snapshot path reads the counters.
@@ -807,6 +828,10 @@ pub struct FlowStatsAccumulator {
     pub media_analysis: OnceLock<Arc<MediaAnalysisAccumulator>>,
     /// Thumbnail generation stats, set once when the flow starts (if enabled and ffmpeg available).
     pub thumbnail: OnceLock<Arc<ThumbnailAccumulator>>,
+    /// Per-input thumbnail accumulators, keyed by input ID. Each input in
+    /// a multi-input flow gets its own thumbnail generator subscribing to
+    /// the input's dedicated broadcast channel (not the flow's main channel).
+    pub per_input_thumbnails: DashMap<String, Arc<ThumbnailAccumulator>>,
     /// Input config metadata for topology display (set once at flow start).
     pub input_config_meta: OnceLock<InputConfigMeta>,
     /// Per-output config metadata for topology display (set once per output).
@@ -890,6 +915,7 @@ impl FlowStatsAccumulator {
             tr101290: OnceLock::new(),
             media_analysis: OnceLock::new(),
             thumbnail: OnceLock::new(),
+            per_input_thumbnails: DashMap::new(),
             input_config_meta: OnceLock::new(),
             output_config_meta: DashMap::new(),
             input_srt_stats_cache: Arc::new(watch::channel(None).0),

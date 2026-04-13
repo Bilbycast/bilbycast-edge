@@ -515,7 +515,21 @@ pub async fn bind_srt_listener(p: &SrtConnectionParams<'_>) -> Result<SrtListene
     let listener = listener_builder
         .bind(local_sa)
         .await
-        .context(format!("SRT listener bind on {} failed", local_addr_str))?;
+        .map_err(|e| {
+            let err_str = e.to_string();
+            if err_str.contains("Address already in use")
+                || err_str.contains("address already in use")
+                || err_str.contains("EADDRINUSE")
+            {
+                anyhow::anyhow!(
+                    "Port conflict: SRT listener could not bind to {local_addr_str} \
+                     — address already in use. \
+                     Check whether another service or edge component is using this port."
+                )
+            } else {
+                anyhow::anyhow!("SRT listener bind on {local_addr_str} failed: {e}")
+            }
+        })?;
 
     tracing::info!("SRT listener bound on {}", local_addr_str);
     Ok(listener)

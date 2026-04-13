@@ -67,7 +67,7 @@ Events are queued in an unbounded in-memory channel. When the edge is not connec
 | info | Input '{id}' deleted | Independent input deleted via CRUD command |
 | info | Output '{id}' created | Independent output created via CRUD command |
 | info | Output '{id}' deleted | Independent output deleted via CRUD command |
-| info | Flow '{flow_id}': active input switched to '{input_id}' | Input switched via API or manager command. `input_id` set on event. Details: `{ previous_input_id }` |
+| info | Flow '{flow_id}': active input switched to '{input_id}' | Input switched via API or manager command. `input_id` set on event. Details: `{ previous_input_id }`. The TS continuity fixer automatically resets CC state (creating a clean break), injects the new input's cached PAT/PMT (version-bumped to force re-parse), and forwards all packets immediately. Fully format-agnostic — inputs can use different codecs, containers, and transports (e.g., H.264, H.265, JPEG XS, uncompressed ST 2110, any audio). For non-TS transports the fixer is transparent. |
 | info | Flow '{flow_id}': output '{output_id}' set active/passive | Output toggled via API or manager command. `output_id` set on event. Details: `{ active: bool }` |
 
 **Source**: `src/engine/manager.rs`, `src/engine/input_srt.rs`

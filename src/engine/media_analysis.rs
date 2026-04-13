@@ -40,25 +40,29 @@ pub fn spawn_media_analyzer(
     stats: Arc<MediaAnalysisAccumulator>,
     cancel: CancellationToken,
     frame_rate_tx: Option<tokio::sync::watch::Sender<Option<f64>>>,
+    active_input_rx: tokio::sync::watch::Receiver<String>,
+    inputs: Vec<InputDefinition>,
 ) -> JoinHandle<()> {
     let rx = broadcast_tx.subscribe();
 
     // Pre-populate transport-level info from config
-    {
+    if let Some(def) = resolved_flow.active_input() {
         let mut state = stats.state.lock().unwrap();
-        populate_transport_info(resolved_flow, &mut state);
+        populate_transport_info(&def.config, &mut state);
     }
 
-    tokio::spawn(media_analyzer_loop(rx, stats, cancel, frame_rate_tx))
+    tokio::spawn(media_analyzer_loop(
+        rx,
+        stats,
+        cancel,
+        frame_rate_tx,
+        active_input_rx,
+        inputs,
+    ))
 }
 
-/// Extract transport-level information from the flow configuration.
-/// Uses the currently active input when a flow has multiple inputs.
-fn populate_transport_info(resolved: &ResolvedFlow, state: &mut MediaAnalysisState) {
-    let input = match resolved.active_input() {
-        Some(def) => &def.config,
-        None => return,
-    };
+/// Extract transport-level information from an input configuration.
+fn populate_transport_info(input: &InputConfig, state: &mut MediaAnalysisState) {
     match input {
         InputConfig::Rtp(rtp) => {
             state.protocol = "rtp".to_string();
@@ -130,11 +134,18 @@ async fn media_analyzer_loop(
     stats: Arc<MediaAnalysisAccumulator>,
     cancel: CancellationToken,
     frame_rate_tx: Option<tokio::sync::watch::Sender<Option<f64>>>,
+    mut active_input_rx: tokio::sync::watch::Receiver<String>,
+    inputs: Vec<InputDefinition>,
 ) {
     tracing::info!("Media analyzer started");
 
     let mut bitrate_interval = tokio::time::interval(BITRATE_CALC_INTERVAL);
     bitrate_interval.tick().await; // consume first immediate tick
+
+    // Mark the initial value as seen so the changed() arm doesn't fire
+    // spuriously on startup.
+    active_input_rx.mark_changed();
+    let _ = active_input_rx.borrow_and_update();
 
     // Local parsing state (not shared — only accessed by this task)
     let mut payload_format_detected = false;
@@ -142,10 +153,51 @@ async fn media_analyzer_loop(
     let mut last_broadcast_fps: Option<f64> = None;
 
     loop {
+        // biased: ensure cancel and input-switch reset are processed before
+        // any queued packets, preventing stale injected PSI from poisoning
+        // state after a reset.
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => {
                 tracing::info!("Media analyzer stopping (cancelled)");
                 break;
+            }
+
+            // React to active input changes: reset all state and
+            // re-populate transport info from the new input's config.
+            Ok(()) = active_input_rx.changed() => {
+                let new_id = active_input_rx.borrow_and_update().clone();
+
+                // Snapshot the current frame rate before resetting state so
+                // the UI doesn't flash "detecting..." during the switch.
+                // The natural detection path will update the watch when the
+                // new input's SPS/VUI is parsed.
+                let preserved_fps = {
+                    let state = stats.state.lock().unwrap();
+                    state.programs.iter()
+                        .flat_map(|p| &p.video_streams)
+                        .find_map(|v| v.frame_rate)
+                };
+
+                stats.reset_state();
+                payload_format_detected = false;
+                last_broadcast_fps = preserved_fps;
+
+                if let Some(def) = inputs.iter().find(|i| i.id == new_id) {
+                    let mut state = stats.state.lock().unwrap();
+                    populate_transport_info(&def.config, &mut state);
+                }
+
+                // Only send None if frame rate was already unknown before
+                // the switch. Otherwise preserve the old value — the
+                // detection loop will update it when the new rate differs.
+                if preserved_fps.is_none() {
+                    if let Some(ref tx) = frame_rate_tx {
+                        let _ = tx.send(None);
+                    }
+                }
+
+                tracing::info!("Media analyzer reset for new active input '{new_id}'");
             }
 
             _ = bitrate_interval.tick() => {
@@ -304,12 +356,12 @@ fn process_ts_packet(pkt: &[u8], state: &mut MediaAnalysisState) {
             return;
         }
 
-        // Check if this PID is a known video stream that needs SPS detection
+        // Check if this PID is a known video stream that needs SPS or frame rate detection
         let needs_video_parse = state
             .programs
             .iter()
             .flat_map(|p| p.video_streams.iter())
-            .any(|v| v.pid == pid && !v.sps_detected);
+            .any(|v| v.pid == pid && (!v.sps_detected || v.frame_rate.is_none()));
         let needs_audio_parse = state
             .programs
             .iter()
@@ -396,6 +448,9 @@ fn parse_pmt_streams(pkt: &[u8], program: &mut ProgramState) {
                     profile: None,
                     level: None,
                     sps_detected: false,
+                    last_pts: None,
+                    pts_frame_count: 0,
+                    pts_interval_sum: 0,
                 });
             }
             0x24 => {
@@ -409,6 +464,9 @@ fn parse_pmt_streams(pkt: &[u8], program: &mut ProgramState) {
                     profile: None,
                     level: None,
                     sps_detected: false,
+                    last_pts: None,
+                    pts_frame_count: 0,
+                    pts_interval_sum: 0,
                 });
             }
             0x61 => {
@@ -422,6 +480,9 @@ fn parse_pmt_streams(pkt: &[u8], program: &mut ProgramState) {
                     profile: None,
                     level: None,
                     sps_detected: true, // No SPS to detect for JPEG XS
+                    last_pts: None,
+                    pts_frame_count: 0,
+                    pts_interval_sum: 0,
                 });
             }
             0x01 | 0x02 => {
@@ -439,6 +500,9 @@ fn parse_pmt_streams(pkt: &[u8], program: &mut ProgramState) {
                     profile: None,
                     level: None,
                     sps_detected: true, // Not parsing sequence headers for legacy codecs
+                    last_pts: None,
+                    pts_frame_count: 0,
+                    pts_interval_sum: 0,
                 });
             }
             // Audio stream types
@@ -629,79 +693,167 @@ fn try_parse_video_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
     }
     let es_data = &payload[es_start..];
 
-    // Determine codec from stream state (search across all programs)
-    let stream_type = state
+    // Determine codec and SPS state from stream state
+    let (stream_type, sps_detected) = match state
         .programs
         .iter()
         .flat_map(|p| p.video_streams.iter())
         .find(|v| v.pid == pid)
-        .map(|v| v.stream_type);
-    let stream_type = match stream_type {
-        Some(t) => t,
+    {
+        Some(v) => (v.stream_type, v.sps_detected),
         None => return,
     };
 
-    match stream_type {
-        0x1B => {
-            // H.264/AVC — look for SPS NAL unit (type 7)
-            if let Some(sps_info) = find_and_parse_h264_sps(es_data) {
-                tracing::info!(
-                    "Media analysis: H.264 PID 0x{:04X}: {}x{}{}, profile={}, level={}",
-                    pid,
-                    sps_info.width,
-                    sps_info.height,
-                    sps_info
-                        .frame_rate
-                        .map(|f| format!(", {:.2} fps", f))
-                        .unwrap_or_default(),
-                    sps_info.profile,
-                    sps_info.level,
-                );
-                if let Some(v) = state
-                    .programs
-                    .iter_mut()
-                    .find_map(|p| p.video_streams.iter_mut().find(|v| v.pid == pid))
-                {
-                    v.width = Some(sps_info.width);
-                    v.height = Some(sps_info.height);
-                    v.frame_rate = sps_info.frame_rate;
-                    v.profile = Some(sps_info.profile);
-                    v.level = Some(sps_info.level);
-                    v.sps_detected = true;
+    // SPS-based detection (codec, resolution, profile, level, and optionally frame rate from VUI)
+    if !sps_detected {
+        match stream_type {
+            0x1B => {
+                // H.264/AVC — look for SPS NAL unit (type 7)
+                if let Some(sps_info) = find_and_parse_h264_sps(es_data) {
+                    tracing::info!(
+                        "Media analysis: H.264 PID 0x{:04X}: {}x{}{}, profile={}, level={}",
+                        pid,
+                        sps_info.width,
+                        sps_info.height,
+                        sps_info
+                            .frame_rate
+                            .map(|f| format!(", {:.2} fps", f))
+                            .unwrap_or_default(),
+                        sps_info.profile,
+                        sps_info.level,
+                    );
+                    if let Some(v) = state
+                        .programs
+                        .iter_mut()
+                        .find_map(|p| p.video_streams.iter_mut().find(|v| v.pid == pid))
+                    {
+                        v.width = Some(sps_info.width);
+                        v.height = Some(sps_info.height);
+                        v.frame_rate = sps_info.frame_rate;
+                        v.profile = Some(sps_info.profile);
+                        v.level = Some(sps_info.level);
+                        v.sps_detected = true;
+                    }
                 }
             }
-        }
-        0x24 => {
-            // H.265/HEVC — look for SPS NAL unit (type 33)
-            if let Some(sps_info) = find_and_parse_h265_sps(es_data) {
-                tracing::info!(
-                    "Media analysis: H.265 PID 0x{:04X}: {}x{}{}, profile={}, level={}",
-                    pid,
-                    sps_info.width,
-                    sps_info.height,
-                    sps_info
-                        .frame_rate
-                        .map(|f| format!(", {:.2} fps", f))
-                        .unwrap_or_default(),
-                    sps_info.profile,
-                    sps_info.level,
-                );
-                if let Some(v) = state
-                    .programs
-                    .iter_mut()
-                    .find_map(|p| p.video_streams.iter_mut().find(|v| v.pid == pid))
-                {
-                    v.width = Some(sps_info.width);
-                    v.height = Some(sps_info.height);
-                    v.frame_rate = sps_info.frame_rate;
-                    v.profile = Some(sps_info.profile);
-                    v.level = Some(sps_info.level);
-                    v.sps_detected = true;
+            0x24 => {
+                // H.265/HEVC — look for SPS NAL unit (type 33)
+                if let Some(sps_info) = find_and_parse_h265_sps(es_data) {
+                    tracing::info!(
+                        "Media analysis: H.265 PID 0x{:04X}: {}x{}{}, profile={}, level={}",
+                        pid,
+                        sps_info.width,
+                        sps_info.height,
+                        sps_info
+                            .frame_rate
+                            .map(|f| format!(", {:.2} fps", f))
+                            .unwrap_or_default(),
+                        sps_info.profile,
+                        sps_info.level,
+                    );
+                    if let Some(v) = state
+                        .programs
+                        .iter_mut()
+                        .find_map(|p| p.video_streams.iter_mut().find(|v| v.pid == pid))
+                    {
+                        v.width = Some(sps_info.width);
+                        v.height = Some(sps_info.height);
+                        v.frame_rate = sps_info.frame_rate;
+                        v.profile = Some(sps_info.profile);
+                        v.level = Some(sps_info.level);
+                        v.sps_detected = true;
+                    }
                 }
             }
+            _ => {}
         }
-        _ => {}
     }
+
+    // Timestamp-based frame rate fallback — runs when VUI timing didn't provide a frame rate.
+    // Uses DTS (monotonic) when B-frames are present, PTS otherwise.
+    let needs_ts_fps = state
+        .programs
+        .iter()
+        .flat_map(|p| p.video_streams.iter())
+        .any(|v| v.pid == pid && v.frame_rate.is_none());
+
+    if needs_ts_fps {
+        if let Some(ts) = extract_pes_decode_timestamp(payload) {
+            if let Some(v) = state
+                .programs
+                .iter_mut()
+                .find_map(|p| p.video_streams.iter_mut().find(|v| v.pid == pid))
+            {
+                if let Some(prev_ts) = v.last_pts {
+                    // Timestamps are 33-bit and wrap at 2^33. Handle wraparound.
+                    let delta = if ts >= prev_ts {
+                        ts - prev_ts
+                    } else {
+                        (1u64 << 33) - prev_ts + ts
+                    };
+                    // Sanity bounds: ignore deltas outside the range of valid broadcast
+                    // frame rates. Min 1200 ticks (~75 fps ceiling) filters out non-frame
+                    // PES packets (parameter sets with near-duplicate timestamps).
+                    // Max 90000 ticks (1 fps floor) filters out stale/wrapped values.
+                    if delta >= 1200 && delta <= 90_000 {
+                        v.pts_interval_sum += delta;
+                        v.pts_frame_count += 1;
+
+                        // After 30 samples, compute frame rate
+                        const PTS_SAMPLES_NEEDED: u32 = 30;
+                        if v.pts_frame_count >= PTS_SAMPLES_NEEDED {
+                            let avg_interval =
+                                v.pts_interval_sum as f64 / v.pts_frame_count as f64;
+                            if avg_interval > 0.0 {
+                                let fps = 90_000.0 / avg_interval;
+                                tracing::info!(
+                                    "Media analysis: PID 0x{:04X} frame rate detected from DTS/PTS: {:.2} fps",
+                                    pid, fps
+                                );
+                                v.frame_rate = Some(fps);
+                            }
+                        }
+                    }
+                }
+                v.last_pts = Some(ts);
+            }
+        }
+    }
+}
+
+/// Extract a monotonic decode timestamp from a PES header for frame rate measurement.
+/// Returns DTS when present (B-frames), otherwise PTS (which is monotonic when no B-frames).
+/// Value is a 33-bit timestamp in 90kHz clock ticks.
+fn extract_pes_decode_timestamp(pes: &[u8]) -> Option<u64> {
+    // PES header: [0x00, 0x00, 0x01, stream_id, len_hi, len_lo, flags1, flags2, hdr_data_len, ...]
+    // flags2 byte (index 7): bits 7-6 = PTS_DTS_flags
+    //   0b10 = PTS only (no B-frames, PTS is monotonic)
+    //   0b11 = PTS + DTS (B-frames present, use DTS)
+    if pes.len() < 14 {
+        return None;
+    }
+    let pts_dts_flags = (pes[7] >> 6) & 0x03;
+    if pts_dts_flags == 0b11 && pes.len() >= 19 {
+        // DTS present — 5 bytes starting at index 14 (after the 5-byte PTS)
+        let b = &pes[14..19];
+        let dts = (((b[0] as u64 >> 1) & 0x07) << 30)
+            | ((b[1] as u64) << 22)
+            | (((b[2] as u64 >> 1) & 0x7F) << 15)
+            | ((b[3] as u64) << 7)
+            | ((b[4] as u64 >> 1) & 0x7F);
+        return Some(dts);
+    }
+    if pts_dts_flags == 0b10 {
+        // PTS only — monotonic (no B-frames)
+        let b = &pes[9..14];
+        let pts = (((b[0] as u64 >> 1) & 0x07) << 30)
+            | ((b[1] as u64) << 22)
+            | (((b[2] as u64 >> 1) & 0x7F) << 15)
+            | ((b[3] as u64) << 7)
+            | ((b[4] as u64 >> 1) & 0x7F);
+        return Some(pts);
+    }
+    None
 }
 
 /// Try to extract audio codec details from a PES-start TS packet.
@@ -1079,18 +1231,32 @@ fn parse_h265_sps_clean(mut reader: BitReader, sps_max_sub_layers_minus1: u8) ->
     reader.read_bits(16)?;
     let general_level_idc = reader.read_bits(8)? as u8;
 
-    // Skip sub-layer info
+    // Skip sub-layer info (ITU-T H.265 §7.3.3)
     if sps_max_sub_layers_minus1 > 0 {
-        for _ in 0..sps_max_sub_layers_minus1 {
-            reader.read_bits(2)?; // sub_layer_profile_present_flag + sub_layer_level_present_flag
+        let mut sub_layer_profile_present = [false; 8];
+        let mut sub_layer_level_present = [false; 8];
+        for i in 0..sps_max_sub_layers_minus1 as usize {
+            sub_layer_profile_present[i] = reader.read_bits(1)? == 1;
+            sub_layer_level_present[i] = reader.read_bits(1)? == 1;
         }
         if sps_max_sub_layers_minus1 < 8 {
             for _ in sps_max_sub_layers_minus1..8 {
                 reader.read_bits(2)?; // reserved_zero_2bits
             }
         }
-        // Skip sub-layer profile/level data (complex, just skip conservatively)
-        // This is a simplification — may fail on streams with many sub-layers
+        for i in 0..sps_max_sub_layers_minus1 as usize {
+            if sub_layer_profile_present[i] {
+                // sub_layer_profile_space(2) + sub_layer_tier_flag(1) + sub_layer_profile_idc(5)
+                reader.read_bits(8)?;
+                reader.read_bits(32)?; // sub_layer_profile_compatibility_flag[32]
+                // sub_layer_constraint flags (48 bits)
+                reader.read_bits(32)?;
+                reader.read_bits(16)?;
+            }
+            if sub_layer_level_present[i] {
+                reader.read_bits(8)?; // sub_layer_level_idc
+            }
+        }
     }
 
     let _sps_seq_parameter_set_id = reader.read_exp_golomb()?;
@@ -1115,9 +1281,100 @@ fn parse_h265_sps_clean(mut reader: BitReader, sps_max_sub_layers_minus1: u8) ->
         height = (pic_height_in_luma_samples as u32 - sub_height_c * (top + bottom)) as u16;
     }
 
-    // Try to get timing info (skip ahead to VUI)
-    // This requires parsing many more fields — for now, frame rate will be None for HEVC
-    // unless we add full VUI parsing later.
+    // Parse remaining SPS fields to reach VUI (ITU-T H.265 §7.3.2.2.1)
+    // Wrapped in a closure so any parse failure falls back to frame_rate: None
+    let frame_rate = (|| -> Option<f64> {
+        let bit_depth_luma_minus8 = reader.read_exp_golomb()?;
+        let bit_depth_chroma_minus8 = reader.read_exp_golomb()?;
+        let log2_max_pic_order_cnt_lsb_minus4 = reader.read_exp_golomb()?;
+        tracing::debug!(
+            "H.265 SPS VUI parse: bit_depth_luma_m8={}, bit_depth_chroma_m8={}, log2_max_poc_lsb_m4={}",
+            bit_depth_luma_minus8, bit_depth_chroma_minus8, log2_max_pic_order_cnt_lsb_minus4
+        );
+
+        let sps_sub_layer_ordering_info_present_flag = reader.read_bits(1)?;
+        let start = if sps_sub_layer_ordering_info_present_flag == 1 {
+            0
+        } else {
+            sps_max_sub_layers_minus1
+        };
+        for _ in start..=sps_max_sub_layers_minus1 {
+            reader.read_exp_golomb()?; // max_dec_pic_buffering_minus1
+            reader.read_exp_golomb()?; // max_num_reorder_pics
+            reader.read_exp_golomb()?; // max_latency_increase_plus1
+        }
+        tracing::debug!("H.265 SPS VUI parse: passed sub-layer ordering");
+
+        let _log2_min_luma_coding_block_size_minus3 = reader.read_exp_golomb()?;
+        let _log2_diff_max_min_luma_coding_block_size = reader.read_exp_golomb()?;
+        let _log2_min_luma_transform_block_size_minus2 = reader.read_exp_golomb()?;
+        let _log2_diff_max_min_luma_transform_block_size = reader.read_exp_golomb()?;
+        let _max_transform_hierarchy_depth_inter = reader.read_exp_golomb()?;
+        let _max_transform_hierarchy_depth_intra = reader.read_exp_golomb()?;
+
+        let scaling_list_enabled_flag = reader.read_bits(1)?;
+        tracing::debug!("H.265 SPS VUI parse: scaling_list_enabled={}", scaling_list_enabled_flag);
+        if scaling_list_enabled_flag == 1 {
+            let sps_scaling_list_data_present_flag = reader.read_bits(1)?;
+            if sps_scaling_list_data_present_flag == 1 {
+                skip_h265_scaling_list_data(&mut reader)?;
+            }
+        }
+
+        let amp_enabled = reader.read_bits(1)?; // amp_enabled_flag
+        let sao_enabled = reader.read_bits(1)?; // sample_adaptive_offset_enabled_flag
+
+        let pcm_enabled_flag = reader.read_bits(1)?;
+        tracing::debug!("H.265 SPS VUI parse: amp={}, sao={}, pcm={}", amp_enabled, sao_enabled, pcm_enabled_flag);
+        if pcm_enabled_flag == 1 {
+            reader.read_bits(4)?; // pcm_sample_bit_depth_luma_minus1
+            reader.read_bits(4)?; // pcm_sample_bit_depth_chroma_minus1
+            reader.read_exp_golomb()?; // log2_min_pcm_luma_coding_block_size_minus3
+            reader.read_exp_golomb()?; // log2_diff_max_min_pcm_luma_coding_block_size
+            reader.read_bits(1)?; // pcm_loop_filter_disabled_flag
+        }
+
+        // Short-term ref pic sets — must track num_delta_pocs per set for inter-prediction
+        let num_short_term_ref_pic_sets = reader.read_exp_golomb()?;
+        tracing::debug!("H.265 SPS VUI parse: num_short_term_ref_pic_sets={}", num_short_term_ref_pic_sets);
+        let mut num_delta_pocs = Vec::with_capacity(num_short_term_ref_pic_sets as usize);
+        for i in 0..num_short_term_ref_pic_sets {
+            let ndp = parse_h265_short_term_ref_pic_set(
+                &mut reader,
+                i,
+                &num_delta_pocs,
+            )?;
+            num_delta_pocs.push(ndp);
+        }
+        tracing::debug!("H.265 SPS VUI parse: parsed all ref pic sets, num_delta_pocs={:?}", num_delta_pocs);
+
+        // Long-term ref pics
+        let long_term_ref_pics_present_flag = reader.read_bits(1)?;
+        tracing::debug!("H.265 SPS VUI parse: long_term_ref_pics_present={}", long_term_ref_pics_present_flag);
+        if long_term_ref_pics_present_flag == 1 {
+            let num_long_term_ref_pics_sps = reader.read_exp_golomb()?;
+            let log2_max_pic_order_cnt_lsb = log2_max_pic_order_cnt_lsb_minus4 + 4;
+            for _ in 0..num_long_term_ref_pics_sps {
+                reader.read_bits(log2_max_pic_order_cnt_lsb as u8)?; // lt_ref_pic_poc_lsb_sps
+                reader.read_bits(1)?; // used_by_curr_pic_lt_sps_flag
+            }
+        }
+
+        let temporal_mvp = reader.read_bits(1)?; // sps_temporal_mvp_enabled_flag
+        let strong_intra = reader.read_bits(1)?; // strong_intra_smoothing_enabled_flag
+
+        let vui_parameters_present_flag = reader.read_bits(1)?;
+        tracing::debug!(
+            "H.265 SPS VUI parse: temporal_mvp={}, strong_intra={}, vui_present={}",
+            temporal_mvp, strong_intra, vui_parameters_present_flag
+        );
+        if vui_parameters_present_flag == 1 {
+            let result = parse_h265_vui_timing(&mut reader);
+            tracing::debug!("H.265 SPS VUI parse: vui_timing result={:?}", result);
+            return result;
+        }
+        None
+    })();
 
     let profile = match general_profile_idc {
         1 => "Main",
@@ -1137,10 +1394,140 @@ fn parse_h265_sps_clean(mut reader: BitReader, sps_max_sub_layers_minus1: u8) ->
     Some(SpsInfo {
         width,
         height,
-        frame_rate: None, // HEVC VUI timing parsing is complex; omitted for now
+        frame_rate,
         profile: profile.to_string(),
         level,
     })
+}
+
+/// Parse VUI timing info from H.265 SPS to extract frame rate.
+/// Nearly identical to H.264 VUI, but H.265 timing uses `vui_num_units_in_tick`
+/// and `vui_time_scale` directly (no ×2 divisor like H.264).
+fn parse_h265_vui_timing(reader: &mut BitReader) -> Option<f64> {
+    // aspect_ratio_info_present_flag
+    if reader.read_bits(1)? == 1 {
+        let sar_idc = reader.read_bits(8)?;
+        if sar_idc == 255 {
+            reader.read_bits(16)?; // sar_width
+            reader.read_bits(16)?; // sar_height
+        }
+    }
+    // overscan_info_present_flag
+    if reader.read_bits(1)? == 1 {
+        reader.read_bits(1)?; // overscan_appropriate_flag
+    }
+    // video_signal_type_present_flag
+    if reader.read_bits(1)? == 1 {
+        reader.read_bits(3)?; // video_format
+        reader.read_bits(1)?; // video_full_range_flag
+        if reader.read_bits(1)? == 1 {
+            // colour_description_present_flag
+            reader.read_bits(8)?; // colour_primaries
+            reader.read_bits(8)?; // transfer_characteristics
+            reader.read_bits(8)?; // matrix_coefficients
+        }
+    }
+    // chroma_loc_info_present_flag
+    if reader.read_bits(1)? == 1 {
+        reader.read_exp_golomb()?; // chroma_sample_loc_type_top_field
+        reader.read_exp_golomb()?; // chroma_sample_loc_type_bottom_field
+    }
+    // neutral_chroma_indication_flag, field_seq_flag, frame_field_info_present_flag
+    reader.read_bits(1)?;
+    reader.read_bits(1)?;
+    reader.read_bits(1)?;
+    // default_display_window_flag
+    if reader.read_bits(1)? == 1 {
+        reader.read_exp_golomb()?; // def_disp_win_left_offset
+        reader.read_exp_golomb()?; // def_disp_win_right_offset
+        reader.read_exp_golomb()?; // def_disp_win_top_offset
+        reader.read_exp_golomb()?; // def_disp_win_bottom_offset
+    }
+    // vui_timing_info_present_flag
+    let timing_info_present = reader.read_bits(1)?;
+    tracing::debug!("H.265 VUI: timing_info_present={}", timing_info_present);
+    if timing_info_present == 1 {
+        let num_units_in_tick = reader.read_bits(32)?;
+        let time_scale = reader.read_bits(32)?;
+        tracing::debug!("H.265 VUI: num_units_in_tick={}, time_scale={}", num_units_in_tick, time_scale);
+        if num_units_in_tick > 0 {
+            return Some(time_scale as f64 / num_units_in_tick as f64);
+        }
+    }
+    None
+}
+
+/// Skip H.265 scaling list data (ITU-T H.265 §7.3.4).
+fn skip_h265_scaling_list_data(reader: &mut BitReader) -> Option<()> {
+    for size_id in 0..4u32 {
+        let count = if size_id == 3 { 2 } else { 6 };
+        for _ in 0..count {
+            let scaling_list_pred_mode_flag = reader.read_bits(1)?;
+            if scaling_list_pred_mode_flag == 0 {
+                reader.read_exp_golomb()?; // scaling_list_pred_matrix_id_delta
+            } else {
+                let coef_num = std::cmp::min(64, 1 << (4 + (size_id << 1)));
+                if size_id > 1 {
+                    reader.read_signed_exp_golomb()?; // scaling_list_dc_coef_minus8
+                }
+                for _ in 0..coef_num {
+                    reader.read_signed_exp_golomb()?; // scaling_list_delta_coef
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+/// Parse one H.265 short-term ref pic set (ITU-T H.265 §7.3.7).
+/// Returns NumDeltaPocs for this set (needed by subsequent inter-predicted sets).
+fn parse_h265_short_term_ref_pic_set(
+    reader: &mut BitReader,
+    idx: u32,
+    prev_num_delta_pocs: &[u32],
+) -> Option<u32> {
+    let inter_ref_pic_set_prediction_flag = if idx > 0 {
+        reader.read_bits(1)? == 1
+    } else {
+        false
+    };
+
+    if inter_ref_pic_set_prediction_flag {
+        let delta_idx_minus1 = reader.read_exp_golomb()?;
+        let ref_idx = idx.checked_sub(delta_idx_minus1 + 1)?;
+        let ref_num_delta_pocs = *prev_num_delta_pocs.get(ref_idx as usize)?;
+
+        reader.read_bits(1)?; // delta_rps_sign
+        reader.read_exp_golomb()?; // abs_delta_rps_minus1
+
+        // For each delta poc in the reference set + 1, read used_by_curr_pic_flag
+        // and conditionally use_delta_flag
+        let mut num_delta_pocs = 0u32;
+        for _ in 0..=ref_num_delta_pocs {
+            let used_by_curr_pic_flag = reader.read_bits(1)?;
+            if used_by_curr_pic_flag == 0 {
+                let use_delta_flag = reader.read_bits(1)?;
+                if use_delta_flag == 1 {
+                    num_delta_pocs += 1;
+                }
+            } else {
+                num_delta_pocs += 1;
+            }
+        }
+        Some(num_delta_pocs)
+    } else {
+        let num_negative_pics = reader.read_exp_golomb()?;
+        let num_positive_pics = reader.read_exp_golomb()?;
+        for _ in 0..num_negative_pics {
+            reader.read_exp_golomb()?; // delta_poc_s0_minus1
+            reader.read_bits(1)?; // used_by_curr_pic_s0_flag
+        }
+        for _ in 0..num_positive_pics {
+            reader.read_exp_golomb()?; // delta_poc_s1_minus1
+            reader.read_bits(1)?; // used_by_curr_pic_s1_flag
+        }
+        Some(num_negative_pics + num_positive_pics)
+    }
 }
 
 // ── AAC ADTS Parser ─────────────────────────────────────────────────────

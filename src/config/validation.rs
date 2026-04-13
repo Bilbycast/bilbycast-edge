@@ -73,6 +73,11 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
                 }
             }
         }
+        if auth.nmos_require_auth && !auth.enabled {
+            tracing::warn!(
+                "nmos_require_auth is true but auth is disabled — NMOS endpoints will remain public"
+            );
+        }
     }
 
     // Validate device name if present
@@ -238,6 +243,9 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
             }
         }
     }
+
+    // Cross-component port conflict detection
+    validate_port_conflicts(config)?;
 
     Ok(())
 }
@@ -1750,6 +1758,253 @@ pub fn validate_tunnel(tunnel: &crate::tunnel::TunnelConfig) -> Result<()> {
     Ok(())
 }
 
+// ── Port conflict detection ──────────────────────────────────────────
+
+/// Protocol family for port conflict grouping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Proto {
+    Tcp,
+    Udp,
+}
+
+impl std::fmt::Display for Proto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Proto::Tcp => write!(f, "TCP"),
+            Proto::Udp => write!(f, "UDP"),
+        }
+    }
+}
+
+/// A port that a component intends to bind.
+struct BoundPort {
+    port: u16,
+    proto: Proto,
+    /// True when bound to 0.0.0.0 / :: (conflicts with any specific IP on same port).
+    wildcard: bool,
+    ip: std::net::IpAddr,
+    label: String,
+}
+
+/// Check whether two bound-port entries conflict.
+///
+/// Two entries conflict when they share the same port and protocol AND either
+/// one is a wildcard bind or both specify the same IP.
+fn ports_conflict(a: &BoundPort, b: &BoundPort) -> bool {
+    a.port == b.port
+        && a.proto == b.proto
+        && (a.wildcard || b.wildcard || a.ip == b.ip)
+}
+
+/// Validates that no two components in the config try to bind the same local
+/// port.  Called at the end of [`validate_config`] after individual component
+/// validation has already passed.
+fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
+    let mut ports: Vec<BoundPort> = Vec::new();
+
+    // Helper: parse a socket address and register it, checking for conflicts.
+    let mut register = |addr_str: &str, proto: Proto, label: String| -> Result<()> {
+        let addr: SocketAddr = match addr_str.parse() {
+            Ok(a) => a,
+            Err(_) => return Ok(()), // unparseable addresses are caught by other validators
+        };
+
+        // Skip ephemeral ports (port 0) — the OS picks a random port at bind time.
+        if addr.port() == 0 {
+            return Ok(());
+        }
+
+        // Skip multicast addresses — multiple binds with SO_REUSEADDR are valid.
+        if addr.ip().is_multicast() {
+            return Ok(());
+        }
+
+        let entry = BoundPort {
+            port: addr.port(),
+            proto,
+            wildcard: addr.ip().is_unspecified(),
+            ip: addr.ip(),
+            label,
+        };
+
+        for existing in &ports {
+            if ports_conflict(existing, &entry) {
+                bail!(
+                    "Port conflict: {} and {} both bind {} port {}. \
+                     Change one of their addresses to avoid the conflict.",
+                    existing.label,
+                    entry.label,
+                    proto,
+                    addr.port()
+                );
+            }
+        }
+
+        ports.push(entry);
+        Ok(())
+    };
+
+    // ── Edge API server ──
+    let server_addr = format!("{}:{}", config.server.listen_addr, config.server.listen_port);
+    register(&server_addr, Proto::Tcp, "Edge API server".to_string())?;
+
+    // ── Monitor dashboard ──
+    if let Some(ref monitor) = config.monitor {
+        let monitor_addr = format!("{}:{}", monitor.listen_addr, monitor.listen_port);
+        register(&monitor_addr, Proto::Tcp, "Monitor dashboard".to_string())?;
+    }
+
+    // ── Tunnels ──
+    for tunnel in &config.tunnels {
+        if !tunnel.enabled {
+            continue;
+        }
+        let proto = match tunnel.protocol {
+            crate::tunnel::config::TunnelProtocol::Tcp => Proto::Tcp,
+            crate::tunnel::config::TunnelProtocol::Udp => Proto::Udp,
+        };
+        // Egress tunnels bind local_addr to listen for local traffic.
+        // Ingress tunnels use local_addr as a forward destination (no local bind).
+        if tunnel.direction == crate::tunnel::config::TunnelDirection::Egress {
+            register(
+                &tunnel.local_addr,
+                proto,
+                format!("Tunnel '{}' ({} egress)", tunnel.name, proto),
+            )?;
+        }
+        // Direct mode ingress binds a QUIC listener on direct_listen_addr.
+        if tunnel.mode == crate::tunnel::config::TunnelMode::Direct
+            && tunnel.direction == crate::tunnel::config::TunnelDirection::Ingress
+        {
+            if let Some(ref addr) = tunnel.direct_listen_addr {
+                register(
+                    addr,
+                    Proto::Udp, // QUIC runs over UDP
+                    format!("Tunnel '{}' (direct QUIC listener)", tunnel.name),
+                )?;
+            }
+        }
+    }
+
+    // ── Inputs ──
+    for input in &config.inputs {
+        let label_prefix = format!("Input '{}'", input.name);
+        match &input.config {
+            InputConfig::Rtp(cfg) => {
+                register(&cfg.bind_addr, Proto::Udp, format!("{label_prefix} (RTP)"))?;
+                if let Some(ref red) = cfg.redundancy {
+                    register(
+                        &red.bind_addr,
+                        Proto::Udp,
+                        format!("{label_prefix} (RTP redundancy leg 2)"),
+                    )?;
+                }
+            }
+            InputConfig::Udp(cfg) => {
+                register(&cfg.bind_addr, Proto::Udp, format!("{label_prefix} (UDP)"))?;
+            }
+            InputConfig::Srt(cfg) => {
+                // Only listener and rendezvous modes bind a specific port.
+                if cfg.mode != SrtMode::Caller {
+                    if let Some(ref addr) = cfg.local_addr {
+                        register(addr, Proto::Udp, format!("{label_prefix} (SRT listener)"))?;
+                    }
+                }
+                if let Some(ref red) = cfg.redundancy {
+                    if red.mode != SrtMode::Caller {
+                        if let Some(ref addr) = red.local_addr {
+                            register(
+                                addr,
+                                Proto::Udp,
+                                format!("{label_prefix} (SRT redundancy leg 2)"),
+                            )?;
+                        }
+                    }
+                }
+            }
+            InputConfig::Rtmp(cfg) => {
+                register(
+                    &cfg.listen_addr,
+                    Proto::Tcp,
+                    format!("{label_prefix} (RTMP server)"),
+                )?;
+            }
+            InputConfig::St2110_30(cfg) | InputConfig::St2110_31(cfg) => {
+                register(&cfg.bind_addr, Proto::Udp, format!("{label_prefix} (ST 2110)"))?;
+                if let Some(ref red) = cfg.redundancy {
+                    register(
+                        &red.addr,
+                        Proto::Udp,
+                        format!("{label_prefix} (ST 2110 redundancy leg 2)"),
+                    )?;
+                }
+            }
+            InputConfig::St2110_40(cfg) => {
+                register(
+                    &cfg.bind_addr,
+                    Proto::Udp,
+                    format!("{label_prefix} (ST 2110-40)"),
+                )?;
+                if let Some(ref red) = cfg.redundancy {
+                    register(
+                        &red.addr,
+                        Proto::Udp,
+                        format!("{label_prefix} (ST 2110-40 redundancy leg 2)"),
+                    )?;
+                }
+            }
+            InputConfig::RtpAudio(cfg) => {
+                register(
+                    &cfg.bind_addr,
+                    Proto::Udp,
+                    format!("{label_prefix} (RTP audio)"),
+                )?;
+                if let Some(ref red) = cfg.redundancy {
+                    register(
+                        &red.addr,
+                        Proto::Udp,
+                        format!("{label_prefix} (RTP audio redundancy leg 2)"),
+                    )?;
+                }
+            }
+            // RTSP, WebRTC, and WHEP inputs don't bind specific local ports.
+            InputConfig::Rtsp(_) | InputConfig::Webrtc(_) | InputConfig::Whep(_) => {}
+        }
+    }
+
+    // ── Outputs (only those that bind specific local ports) ──
+    for output in &config.outputs {
+        let label_prefix = format!("Output '{}'", output.name());
+        match output {
+            OutputConfig::Srt(cfg) => {
+                // Listener/rendezvous outputs bind local_addr.
+                if cfg.mode != SrtMode::Caller {
+                    if let Some(ref addr) = cfg.local_addr {
+                        register(addr, Proto::Udp, format!("{label_prefix} (SRT listener)"))?;
+                    }
+                }
+                if let Some(ref red) = cfg.redundancy {
+                    if red.mode != SrtMode::Caller {
+                        if let Some(ref addr) = red.local_addr {
+                            register(
+                                addr,
+                                Proto::Udp,
+                                format!("{label_prefix} (SRT redundancy leg 2)"),
+                            )?;
+                        }
+                    }
+                }
+            }
+            // RTP/UDP/ST2110/RtpAudio output bind_addr is optional and defaults
+            // to "0.0.0.0:0" (ephemeral), so only register if explicitly set
+            // and non-zero.
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2793,5 +3048,221 @@ mod tests {
         assert!(err.contains("video_only=false"), "got: {err}");
         // AAC on WebRTC → must reject.
         assert!(validate_output(&make("aac_lc", false)).is_err());
+    }
+
+    // ── Port conflict tests ──────────────────────────────────────────
+
+    /// Helper: build a minimal config with tunnels only (no flows).
+    /// Uses a non-conflicting server port (18888) so tunnel port tests are isolated.
+    fn make_tunnel_config(tunnels: Vec<crate::tunnel::TunnelConfig>) -> AppConfig {
+        let mut config = AppConfig::default();
+        config.server.listen_port = 18888;
+        config.tunnels = tunnels;
+        config
+    }
+
+    fn make_test_tunnel(
+        name: &str,
+        local_addr: &str,
+        protocol: crate::tunnel::config::TunnelProtocol,
+        direction: crate::tunnel::config::TunnelDirection,
+    ) -> crate::tunnel::TunnelConfig {
+        crate::tunnel::TunnelConfig {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            enabled: true,
+            protocol,
+            mode: crate::tunnel::config::TunnelMode::Relay,
+            direction,
+            local_addr: local_addr.to_string(),
+            relay_addr: Some("127.0.0.1:4433".to_string()),
+            tunnel_encryption_key: None,
+            tunnel_bind_secret: None,
+            peer_addr: None,
+            direct_listen_addr: None,
+            tunnel_psk: None,
+            tls_cert_pem: None,
+            tls_key_pem: None,
+        }
+    }
+
+    #[test]
+    fn port_conflict_two_tunnels_same_port() {
+        use crate::tunnel::config::{TunnelDirection, TunnelProtocol};
+
+        let config = make_tunnel_config(vec![
+            make_test_tunnel("t1", "0.0.0.0:8080", TunnelProtocol::Tcp, TunnelDirection::Egress),
+            make_test_tunnel("t2", "0.0.0.0:8080", TunnelProtocol::Tcp, TunnelDirection::Egress),
+        ]);
+        let err = validate_config(&config).unwrap_err().to_string();
+        assert!(err.contains("Port conflict"), "got: {err}");
+        assert!(err.contains("8080"), "got: {err}");
+    }
+
+    #[test]
+    fn port_conflict_tunnel_vs_server() {
+        use crate::tunnel::config::{TunnelDirection, TunnelProtocol};
+
+        let mut config = AppConfig::default();
+        config.server.listen_port = 8080;
+        config.server.listen_addr = "0.0.0.0".to_string();
+        config.tunnels.push(make_test_tunnel(
+            "t1",
+            "0.0.0.0:8080",
+            TunnelProtocol::Tcp,
+            TunnelDirection::Egress,
+        ));
+        let err = validate_config(&config).unwrap_err().to_string();
+        assert!(err.contains("Port conflict"), "got: {err}");
+        assert!(err.contains("Edge API server"), "got: {err}");
+    }
+
+    #[test]
+    fn port_conflict_tunnel_vs_srt_input() {
+        use crate::tunnel::config::{TunnelDirection, TunnelProtocol};
+
+        let mut config = make_config_with_rtp("0.0.0.0:5000", "127.0.0.1:6000");
+        // Replace the RTP input with an SRT listener on port 9000
+        config.inputs[0] = InputDefinition {
+            active: true,
+            group: None,
+            id: "in-1".to_string(),
+            name: "SRT In".to_string(),
+            config: InputConfig::Srt(SrtInputConfig {
+                mode: SrtMode::Listener,
+                local_addr: Some("0.0.0.0:9000".to_string()),
+                remote_addr: None,
+                latency_ms: 200,
+                recv_latency_ms: None,
+                peer_latency_ms: None,
+                peer_idle_timeout_secs: 30,
+                passphrase: None,
+                aes_key_len: None,
+                crypto_mode: None,
+                max_rexmit_bw: None,
+                stream_id: None,
+                packet_filter: None,
+                max_bw: None,
+                input_bw: None,
+                overhead_bw: None,
+                enforced_encryption: None,
+                connect_timeout_secs: None,
+                flight_flag_size: None,
+                send_buffer_size: None,
+                recv_buffer_size: None,
+                ip_tos: None,
+                retransmit_algo: None,
+                send_drop_delay: None,
+                loss_max_ttl: None,
+                km_refresh_rate: None,
+                km_pre_announce: None,
+                payload_size: None,
+                mss: None,
+                tlpkt_drop: None,
+                ip_ttl: None,
+                redundancy: None,
+                transport_mode: None,
+            }),
+        };
+        // Add a UDP tunnel egress on the same port
+        config.tunnels.push(make_test_tunnel(
+            "t1",
+            "0.0.0.0:9000",
+            TunnelProtocol::Udp,
+            TunnelDirection::Egress,
+        ));
+        let err = validate_config(&config).unwrap_err().to_string();
+        assert!(err.contains("Port conflict"), "got: {err}");
+        assert!(err.contains("9000"), "got: {err}");
+    }
+
+    #[test]
+    fn no_port_conflict_different_protocols() {
+        use crate::tunnel::config::{TunnelDirection, TunnelProtocol};
+
+        // TCP tunnel on 8080 + UDP tunnel on 8080 — different protocols, no conflict
+        let config = make_tunnel_config(vec![
+            make_test_tunnel("t1", "0.0.0.0:8080", TunnelProtocol::Tcp, TunnelDirection::Egress),
+            make_test_tunnel("t2", "0.0.0.0:8080", TunnelProtocol::Udp, TunnelDirection::Egress),
+        ]);
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn no_port_conflict_multicast_addresses() {
+        // Two RTP inputs on the same multicast address — valid with SO_REUSEADDR
+        let mut config = AppConfig::default();
+        config.inputs.push(InputDefinition {
+            active: true,
+            group: None,
+            id: "in-1".to_string(),
+            name: "Mcast 1".to_string(),
+            config: InputConfig::Rtp(RtpInputConfig {
+                bind_addr: "239.1.1.1:5000".to_string(),
+                interface_addr: None,
+                fec_decode: None,
+                allowed_sources: None,
+                allowed_payload_types: None,
+                max_bitrate_mbps: None,
+                tr07_mode: None,
+                redundancy: None,
+            }),
+        });
+        config.inputs.push(InputDefinition {
+            active: true,
+            group: None,
+            id: "in-2".to_string(),
+            name: "Mcast 2".to_string(),
+            config: InputConfig::Rtp(RtpInputConfig {
+                bind_addr: "239.1.1.1:5000".to_string(),
+                interface_addr: None,
+                fec_decode: None,
+                allowed_sources: None,
+                allowed_payload_types: None,
+                max_bitrate_mbps: None,
+                tr07_mode: None,
+                redundancy: None,
+            }),
+        });
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn no_port_conflict_disabled_tunnel() {
+        use crate::tunnel::config::{TunnelDirection, TunnelProtocol};
+
+        let mut t2 = make_test_tunnel("t2", "0.0.0.0:8080", TunnelProtocol::Tcp, TunnelDirection::Egress);
+        t2.enabled = false; // disabled tunnels should be skipped
+        let config = make_tunnel_config(vec![
+            make_test_tunnel("t1", "0.0.0.0:8080", TunnelProtocol::Tcp, TunnelDirection::Egress),
+            t2,
+        ]);
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn no_port_conflict_ingress_tunnel_does_not_bind_local_addr() {
+        use crate::tunnel::config::{TunnelDirection, TunnelProtocol};
+
+        // Ingress tunnels forward to local_addr (connect, not bind), so no conflict
+        // with an egress tunnel on the same port.
+        let config = make_tunnel_config(vec![
+            make_test_tunnel("egress", "0.0.0.0:8080", TunnelProtocol::Tcp, TunnelDirection::Egress),
+            make_test_tunnel("ingress", "127.0.0.1:8080", TunnelProtocol::Tcp, TunnelDirection::Ingress),
+        ]);
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn port_conflict_wildcard_vs_specific_ip() {
+        use crate::tunnel::config::{TunnelDirection, TunnelProtocol};
+
+        // 0.0.0.0:8080 conflicts with 192.168.1.1:8080
+        let config = make_tunnel_config(vec![
+            make_test_tunnel("t1", "0.0.0.0:8080", TunnelProtocol::Tcp, TunnelDirection::Egress),
+            make_test_tunnel("t2", "192.168.1.1:8080", TunnelProtocol::Tcp, TunnelDirection::Egress),
+        ]);
+        let err = validate_config(&config).unwrap_err().to_string();
+        assert!(err.contains("Port conflict"), "got: {err}");
     }
 }

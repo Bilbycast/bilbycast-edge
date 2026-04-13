@@ -256,8 +256,8 @@ pub struct FlowConfig {
     /// Default: true. Set to false to save CPU on resource-constrained devices.
     #[serde(default = "default_true")]
     pub media_analysis: bool,
-    /// Enable thumbnail generation for visual flow preview (requires ffmpeg on the device).
-    /// Default: true. Thumbnails are only produced when ffmpeg is detected at startup.
+    /// Enable thumbnail generation for visual flow preview.
+    /// Default: true. Uses in-process libavcodec (no external ffmpeg required).
     #[serde(default = "default_true")]
     pub thumbnail: bool,
     /// MPEG-TS program_number whose video to render in the thumbnail when

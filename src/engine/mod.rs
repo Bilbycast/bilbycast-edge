@@ -44,6 +44,7 @@ pub mod thumbnail;
 pub mod tr101290;
 pub mod ts_demux;
 pub mod ts_parse;
+pub mod ts_continuity_fixer;
 pub mod ts_program_filter;
 #[cfg(feature = "webrtc")]
 pub mod webrtc;

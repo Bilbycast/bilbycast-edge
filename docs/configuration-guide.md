@@ -78,6 +78,8 @@ If neither file exists at startup, an empty default configuration is used. Both 
       "jwt_secret": "a-cryptographically-random-string-of-at-least-32-characters",
       "token_lifetime_secs": 3600,
       "public_metrics": true,
+      "nmos_require_auth": false,
+      "token_rate_limit_per_minute": 10,
       "clients": [
         {
           "client_id": "admin",
@@ -236,6 +238,8 @@ Optional sub-object of `server`. See the [Security Guide](api-security.md) for d
     "jwt_secret": "at-least-32-characters-of-random-data",
     "token_lifetime_secs": 3600,
     "public_metrics": true,
+    "nmos_require_auth": false,
+    "token_rate_limit_per_minute": 10,
     "clients": [
       {
         "client_id": "admin",
@@ -253,6 +257,8 @@ Optional sub-object of `server`. See the [Security Guide](api-security.md) for d
 | `jwt_secret` | string | Yes (if enabled) | - | HMAC-SHA256 signing secret. Must be >= 32 characters. |
 | `token_lifetime_secs` | integer | No | `3600` | JWT token lifetime in seconds. |
 | `public_metrics` | boolean | No | `true` | Whether `/metrics` and `/health` are accessible without auth. |
+| `nmos_require_auth` | boolean | No | `false` | When `true`, NMOS IS-04/IS-05/IS-08 endpoints require JWT Bearer auth. |
+| `token_rate_limit_per_minute` | integer | No | `10` | Max OAuth token requests per minute per IP. Set to `0` to disable. |
 | `clients` | array | Yes (if enabled) | - | Registered OAuth clients. At least one required. |
 
 **Client fields:**
@@ -432,11 +438,49 @@ At startup (or on create/update), `AppConfig::resolve_flow()` dereferences the I
 | `name` | string | Yes | - | Human-readable display name. Cannot be empty. |
 | `enabled` | boolean | No | `true` | Whether to auto-start this flow on startup or creation. |
 | `media_analysis` | boolean | No | `true` | Enable media content analysis (codec, resolution, frame rate detection). |
-| `thumbnail` | boolean | No | `true` | Enable thumbnail generation (requires ffmpeg). |
-| `thumbnail_program_number` | integer | No | `null` | When the input is an MPTS, render the thumbnail from this MPEG-TS program only. `null` lets ffmpeg pick the first program it finds. Must be `> 0` if set. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
+| `thumbnail` | boolean | No | `true` | Enable thumbnail generation (in-process via libavcodec; no external ffmpeg required). |
+| `thumbnail_program_number` | integer | No | `null` | When the input is an MPTS, render the thumbnail from this MPEG-TS program only. `null` uses the first program found. Must be `> 0` if set. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 | `bandwidth_limit` | object | No | `null` | Per-flow bandwidth monitoring (RP 2129). See [Bandwidth Limit](#bandwidth-limit). |
 | `input_ids` | array of strings | No | `[]` | IDs of inputs from the top-level `inputs` array. Each referenced input must exist and must not already be assigned to another flow. At most one input may be active at a time. Can be empty (output-only flow). |
 | `output_ids` | array of strings | No | `[]` | IDs of outputs from the top-level `outputs` array. Each referenced output must exist and must not already be assigned to another flow. Can be empty (input-only flow). |
+
+### Multi-Input Flows and Seamless Switching
+
+A flow can reference multiple inputs via `input_ids`. All inputs run simultaneously ("warm passive") — they maintain their connections and stats even while not active. At most one input is active (publishing to the broadcast channel) at a time. Switch the active input via `POST /api/v1/flows/{flow_id}/activate-input` with `{ "input_id": "..." }`.
+
+**TS continuity fixer:** When switching between inputs, bilbycast automatically ensures clean MPEG-TS transitions for downstream receivers:
+
+- **CC state reset** — Output-side continuity counter tracking is cleared on switch. The new input's original CC values pass through, creating a natural CC jump that receivers detect as "packet loss" — they flush PES buffers and resync on the next PES start (PUSI=1).
+- **Per-input PSI caching** — Each input maintains its own PAT/PMT cache independently. On switch, the *new* input's cached PSI is injected immediately so receivers can re-acquire the stream structure without waiting for the next natural PAT/PMT cycle.
+- **PSI version bump** — Injected PAT/PMT packets have their `version_number` incremented (with CRC32 recalculated). This forces receivers to re-parse the tables even when inputs share the same PSI version number, which is critical for detecting codec changes (e.g., switching between an H.264 and an H.265 source).
+- **Immediate forwarding** — All packets (video, audio, data) are forwarded immediately after a switch. **Fully format-agnostic**: inputs can use any codec, container, or transport — H.264, H.265/HEVC, JPEG XS, JPEG 2000, uncompressed video, SMPTE ST 2110-30/-31/-40 (PCM, AES3, ancillary), AAC, HE-AAC, Opus, MP2, AC-3, LPCM, SMPTE 302M, or any future format. Inputs do not need to match each other in codec, resolution, frame rate, sample rate, channel count, or stream structure. For non-TS transports (e.g., raw ST 2110 RTP), the switch mechanism works identically — the fixer is transparent. Receivers may show a brief glitch (up to one GOP for compressed video) while the decoder resyncs.
+
+This is fully automatic — no configuration required. The fixer has zero overhead when a flow uses only a single input (it does not activate until the first switch occurs).
+
+**Example: dual-input flow with primary/backup**
+
+```json
+{
+  "inputs": [
+    { "id": "primary-srt", "name": "Primary SRT Feed", "type": "srt", "mode": "listener", "local_addr": "0.0.0.0:9000", "active": true },
+    { "id": "backup-srt", "name": "Backup SRT Feed", "type": "srt", "mode": "listener", "local_addr": "0.0.0.0:9001", "active": false }
+  ],
+  "outputs": [
+    { "id": "rtp-out", "name": "RTP Distribution", "type": "rtp", "dest_addr": "239.1.1.1:5000" }
+  ],
+  "flows": [
+    { "id": "main-feed", "name": "Main Program", "input_ids": ["primary-srt", "backup-srt"], "output_ids": ["rtp-out"] }
+  ]
+}
+```
+
+Switch to the backup input:
+```bash
+curl -X POST http://localhost:8080/api/v1/flows/main-feed/activate-input \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "input_id": "backup-srt" }'
+```
 
 ### Bandwidth Limit
 
@@ -1381,6 +1425,8 @@ Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json
       "jwt_secret": "K7nXp2qR8vF3mBwYd0hL5jZ1tA6gCeHsN9uIoP4xWkQrJfMaVbDcEiGyTlUwSzO",
       "token_lifetime_secs": 3600,
       "public_metrics": true,
+      "nmos_require_auth": true,
+      "token_rate_limit_per_minute": 10,
       "clients": [
         {
           "client_id": "ops-admin",

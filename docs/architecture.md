@@ -140,6 +140,79 @@ the engine's `FlowRuntime` receives. The engine never sees raw ID references.
   └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+## Input Switching & TS Continuity
+
+When a flow has multiple inputs (one active, others standby), all inputs run
+simultaneously ("warm passive"). Switching the active input is a single
+`watch::send()` — no task restart, no reconnect gap. The per-input forwarder
+tasks gate packets onto the main broadcast channel based on the current active
+input ID.
+
+A shared **TS continuity fixer** (`engine/ts_continuity_fixer.rs`) sits in the
+forwarder path to ensure external receivers (hardware decoders, ffplay, VLC,
+broadcast IRDs) do not lose lock during a switch:
+
+```
+  Input A (active)  ──▶  per-input broadcast  ──▶  Forwarder A ──┐
+                                                                   │
+                                                   ┌───────────┐  │
+                                                   │ TS Contin- │◀─┘  (shared, Arc<Mutex>)
+                                                   │ uity Fixer │◀─┐
+                                                   └─────┬─────┘  │
+                                                         │        │
+  Input B (passive) ──▶  per-input broadcast  ──▶  Forwarder B ──┘
+                                                   (observe PSI
+                                                    for cache)
+                                                         │
+                                                         ▼
+                                                  broadcast::channel
+                                                    (to outputs)
+```
+
+**What it does on switch:**
+
+1. **CC state reset** — Output-side continuity counter tracking is cleared on
+   switch. The new input's original CC values pass through, creating a natural
+   CC jump on all PIDs. Receivers detect this as "packet loss," flush their PES
+   buffers, and resync on the next PES start (PUSI=1). This is more reliable
+   than trying to maintain CC continuity — it gives receivers a clean break
+   signal that works regardless of codec or stream structure.
+
+2. **Per-input PSI caching** — Each input has its own PAT/PMT cache (not
+   shared). Passive inputs observe PSI tables while running warm. On switch,
+   the *new* input's cached PAT and PMTs are immediately injected before the
+   first data packet, so receivers can re-acquire the stream structure without
+   waiting for the next natural PAT/PMT cycle (~200 ms).
+
+3. **PSI version bump** — Injected PAT/PMT packets have their `version_number`
+   field incremented (with CRC32 recalculated). This forces receivers to
+   re-parse the tables even when both inputs happen to use the same PSI
+   version number (e.g., two independent ffmpeg sources both start at version
+   0). Without this, receivers skip the new PMT, don't detect codec changes
+   (e.g., H.264 → H.265), and freeze.
+
+4. **Immediate forwarding** — All packets (video, audio, data) are forwarded
+   immediately after a switch. The CC jump signals receivers to flush and
+   resync on the next PES start. **Fully format-agnostic**: inputs can use
+   any codec, container, or transport — H.264, H.265/HEVC, JPEG XS,
+   JPEG 2000, uncompressed video, SMPTE ST 2110-30/-31/-40, AAC, HE-AAC,
+   Opus, MP2, AC-3, LPCM, SMPTE 302M, or any future format. Inputs do not
+   need to share the same codec, resolution, frame rate, sample rate, channel
+   count, or stream structure. For non-TS transports (e.g., raw ST 2110 RTP),
+   the fixer is transparent — the switch mechanism (watch channel) works
+   identically. Receivers may show a brief glitch (up to one GOP for
+   compressed video) while the decoder resyncs.
+
+**Zero-cost when not switching:** Before the first switch occurs, the fixer
+passes packets through unchanged — a single `bool` check per packet, no
+allocations, no copies. CC state is tracked passively so it is accurate if a
+switch occurs later.
+
+**Downstream safety:** The fixer operates strictly at the TS packet level
+(188-byte boundaries). RTP headers are preserved unchanged. No output, FEC
+encoder, delay buffer, program filter, or analyzer is affected — they all
+treat TS payloads as opaque bytes or maintain independent state.
+
 ## Concurrency & Shutdown Model
 
 ```

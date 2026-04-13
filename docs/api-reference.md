@@ -615,6 +615,62 @@ curl -X POST http://localhost:8080/api/v1/flows/main-feed/restart \
 
 ---
 
+### POST /api/v1/flows/{flow_id}/activate-input
+
+Switch the active input on a multi-input flow. Atomically marks the target input as active and all other inputs on the flow as passive. If the flow is running, the switch is applied immediately via the engine's watch channel — no task restart, no reconnect gap.
+
+A built-in **TS continuity fixer** ensures clean switching for downstream receivers: output-side CC state is reset (creating a clean-break CC jump that receivers handle via packet-loss recovery), and the new input's cached PAT/PMT is injected immediately with a bumped `version_number` (forcing receivers to re-parse the tables and detect any codec/structure changes). All packets (video, audio, data) are forwarded immediately. **Fully format-agnostic — inputs can use different codecs, containers, and transports** (e.g., H.264 on one input, H.265 on another, JPEG XS on a third, uncompressed ST 2110 on a fourth). Works for any video, audio, or data format. For non-TS transports (raw ST 2110 RTP), the fixer is transparent.
+
+**Auth:** Requires `admin` role.
+
+**Path parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `flow_id` | string | Flow containing the inputs |
+
+**Request body:**
+
+```json
+{
+  "input_id": "backup-srt"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `input_id` | string | Yes | ID of the input to activate. Must be a member of the flow's `input_ids`. |
+
+**Response (200):**
+
+```json
+{
+  "success": true,
+  "data": { ... }
+}
+```
+
+Returns the updated `FlowConfig`.
+
+**Error responses:**
+
+| Status | Condition |
+|--------|-----------|
+| 400 | Input is not a member of the flow |
+| 404 | Flow not found |
+| 500 | Failed to persist config to disk |
+
+**curl example:**
+
+```bash
+curl -X POST http://localhost:8080/api/v1/flows/main-feed/activate-input \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "input_id": "backup-srt" }'
+```
+
+---
+
 ## Outputs
 
 ### POST /api/v1/flows/{flow_id}/outputs
@@ -1380,7 +1436,7 @@ All API errors return a JSON body with `"success": false` and an `"error"` messa
 | Method | Path | Auth | Role | Description |
 |--------|------|------|------|-------------|
 | GET | `/health` | No | - | Health check |
-| POST | `/oauth/token` | No | - | Get JWT token |
+| POST | `/oauth/token` | No (rate-limited) | - | Get JWT token |
 | GET | `/metrics` | Configurable | any | Prometheus metrics |
 | GET | `/api/v1/flows` | Yes | any | List all flows |
 | GET | `/api/v1/flows/{flow_id}` | Yes | any | Get flow details |
@@ -1390,6 +1446,7 @@ All API errors return a JSON body with `"success": false` and an `"error"` messa
 | POST | `/api/v1/flows/{flow_id}/start` | Yes | admin | Start flow |
 | POST | `/api/v1/flows/{flow_id}/stop` | Yes | admin | Stop flow |
 | POST | `/api/v1/flows/{flow_id}/restart` | Yes | admin | Restart flow |
+| POST | `/api/v1/flows/{flow_id}/activate-input` | Yes | admin | Switch active input (seamless TS continuity) |
 | POST | `/api/v1/flows/{flow_id}/outputs` | Yes | admin | Add output |
 | DELETE | `/api/v1/flows/{flow_id}/outputs/{output_id}` | Yes | admin | Remove output |
 | POST | `/api/v1/flows/{flow_id}/whip` | Yes | admin | WHIP: Accept WebRTC publisher (SDP offer → answer) |
@@ -1406,27 +1463,32 @@ All API errors return a JSON body with `"success": false` and an `"error"` messa
 | PUT | `/api/v1/config` | Yes | admin | Replace entire config |
 | POST | `/api/v1/config/reload` | Yes | admin | Reload config from disk |
 | GET | `/api/v1/ws/stats` | Yes | any | WebSocket stats stream |
-| GET | `/x-nmos/node/v1.3/` | No | - | NMOS IS-04: Node API root |
-| GET | `/x-nmos/node/v1.3/self` | No | - | NMOS IS-04: Node resource |
-| GET | `/x-nmos/node/v1.3/devices/` | No | - | NMOS IS-04: List devices |
-| GET | `/x-nmos/node/v1.3/devices/{id}` | No | - | NMOS IS-04: Get device |
-| GET | `/x-nmos/node/v1.3/sources/` | No | - | NMOS IS-04: List sources |
-| GET | `/x-nmos/node/v1.3/sources/{id}` | No | - | NMOS IS-04: Get source |
-| GET | `/x-nmos/node/v1.3/flows/` | No | - | NMOS IS-04: List flows |
-| GET | `/x-nmos/node/v1.3/flows/{id}` | No | - | NMOS IS-04: Get flow |
-| GET | `/x-nmos/node/v1.3/senders/` | No | - | NMOS IS-04: List senders |
-| GET | `/x-nmos/node/v1.3/senders/{id}` | No | - | NMOS IS-04: Get sender |
-| GET | `/x-nmos/node/v1.3/receivers/` | No | - | NMOS IS-04: List receivers |
-| GET | `/x-nmos/node/v1.3/receivers/{id}` | No | - | NMOS IS-04: Get receiver |
-| GET | `/x-nmos/connection/v1.1/single/senders/` | No | - | NMOS IS-05: List senders |
-| GET | `/x-nmos/connection/v1.1/single/senders/{id}/staged` | No | - | NMOS IS-05: Get staged params |
-| PATCH | `/x-nmos/connection/v1.1/single/senders/{id}/staged` | No | - | NMOS IS-05: Update staged + activate |
-| GET | `/x-nmos/connection/v1.1/single/senders/{id}/active` | No | - | NMOS IS-05: Get active params |
-| GET | `/x-nmos/connection/v1.1/single/senders/{id}/transporttype` | No | - | NMOS IS-05: Get transport type |
-| GET | `/x-nmos/connection/v1.1/single/senders/{id}/constraints` | No | - | NMOS IS-05: Get constraints |
-| GET | `/x-nmos/connection/v1.1/single/receivers/` | No | - | NMOS IS-05: List receivers |
-| GET | `/x-nmos/connection/v1.1/single/receivers/{id}/staged` | No | - | NMOS IS-05: Get staged params |
-| PATCH | `/x-nmos/connection/v1.1/single/receivers/{id}/staged` | No | - | NMOS IS-05: Update staged + activate |
-| GET | `/x-nmos/connection/v1.1/single/receivers/{id}/active` | No | - | NMOS IS-05: Get active params |
-| GET | `/x-nmos/connection/v1.1/single/receivers/{id}/transporttype` | No | - | NMOS IS-05: Get transport type |
-| GET | `/x-nmos/connection/v1.1/single/receivers/{id}/constraints` | No | - | NMOS IS-05: Get constraints |
+| GET | `/x-nmos/node/v1.3/` | Configurable | any | NMOS IS-04: Node API root |
+| GET | `/x-nmos/node/v1.3/self` | Configurable | any | NMOS IS-04: Node resource |
+| GET | `/x-nmos/node/v1.3/devices/` | Configurable | any | NMOS IS-04: List devices |
+| GET | `/x-nmos/node/v1.3/devices/{id}` | Configurable | any | NMOS IS-04: Get device |
+| GET | `/x-nmos/node/v1.3/sources/` | Configurable | any | NMOS IS-04: List sources |
+| GET | `/x-nmos/node/v1.3/sources/{id}` | Configurable | any | NMOS IS-04: Get source |
+| GET | `/x-nmos/node/v1.3/flows/` | Configurable | any | NMOS IS-04: List flows |
+| GET | `/x-nmos/node/v1.3/flows/{id}` | Configurable | any | NMOS IS-04: Get flow |
+| GET | `/x-nmos/node/v1.3/senders/` | Configurable | any | NMOS IS-04: List senders |
+| GET | `/x-nmos/node/v1.3/senders/{id}` | Configurable | any | NMOS IS-04: Get sender |
+| GET | `/x-nmos/node/v1.3/receivers/` | Configurable | any | NMOS IS-04: List receivers |
+| GET | `/x-nmos/node/v1.3/receivers/{id}` | Configurable | any | NMOS IS-04: Get receiver |
+| GET | `/x-nmos/connection/v1.1/single/senders/` | Configurable | any | NMOS IS-05: List senders |
+| GET | `/x-nmos/connection/v1.1/single/senders/{id}/staged` | Configurable | any | NMOS IS-05: Get staged params |
+| PATCH | `/x-nmos/connection/v1.1/single/senders/{id}/staged` | Configurable | any | NMOS IS-05: Update staged + activate |
+| GET | `/x-nmos/connection/v1.1/single/senders/{id}/active` | Configurable | any | NMOS IS-05: Get active params |
+| GET | `/x-nmos/connection/v1.1/single/senders/{id}/transporttype` | Configurable | any | NMOS IS-05: Get transport type |
+| GET | `/x-nmos/connection/v1.1/single/senders/{id}/constraints` | Configurable | any | NMOS IS-05: Get constraints |
+| GET | `/x-nmos/connection/v1.1/single/receivers/` | Configurable | any | NMOS IS-05: List receivers |
+| GET | `/x-nmos/connection/v1.1/single/receivers/{id}/staged` | Configurable | any | NMOS IS-05: Get staged params |
+| PATCH | `/x-nmos/connection/v1.1/single/receivers/{id}/staged` | Configurable | any | NMOS IS-05: Update staged + activate |
+| GET | `/x-nmos/connection/v1.1/single/receivers/{id}/active` | Configurable | any | NMOS IS-05: Get active params |
+| GET | `/x-nmos/connection/v1.1/single/receivers/{id}/transporttype` | Configurable | any | NMOS IS-05: Get transport type |
+| GET | `/x-nmos/connection/v1.1/single/receivers/{id}/constraints` | Configurable | any | NMOS IS-05: Get constraints |
+
+**Auth notes:**
+- "Configurable" for NMOS: public by default, requires JWT when `nmos_require_auth: true`
+- "Configurable" for `/metrics`: public by default, requires JWT when `public_metrics: false`
+- `/oauth/token` is rate-limited to 10 requests/minute per IP by default (configurable via `token_rate_limit_per_minute`)

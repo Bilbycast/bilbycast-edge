@@ -63,6 +63,16 @@ aac-audio = { path = "../bilbycast-fdk-aac-rs/aac-audio", optional = true }
 aac-codec = { path = "../bilbycast-fdk-aac-rs/aac-codec", optional = true }
 symphonia = { version = "0.5.5", features = ["aac"], default-features = false }
 
+# ── Video thumbnail backend ────────────────────────────────────────────
+# Default: in-process video decode + JPEG encode via FFmpeg C libraries.
+# Replaces the ffmpeg subprocess for thumbnail generation.
+# Fallback: ffmpeg subprocess (when video-thumbnail feature is disabled).
+#
+# To disable: cargo build --no-default-features --features tls,webrtc,fdk-aac
+# ────────────────────────────────────────────────────────────────────────
+video-engine = { path = "../bilbycast-ffmpeg-video-rs/video-engine", optional = true }
+video-codec = { path = "../bilbycast-ffmpeg-video-rs/video-codec", optional = true }
+
 # System resource monitoring (CPU, RAM)
 sysinfo = "0.33.1"
 
@@ -119,10 +129,13 @@ rustls-pemfile = "2.2.0"
 rcgen = "0.14.7"
 
 [features]
-default = ["tls", "webrtc", "fdk-aac"]
+default = ["tls", "webrtc", "fdk-aac", "video-thumbnail"]
 # Enable in-process AAC decode/encode via Fraunhofer FDK AAC (C library).
 # Replaces symphonia (decode) and ffmpeg subprocess (AAC encode).
 fdk-aac = ["dep:aac-audio", "dep:aac-codec"]
+# Enable in-process video decode + JPEG thumbnail via FFmpeg libavcodec/libswscale.
+# Replaces the ffmpeg subprocess for thumbnail generation.
+video-thumbnail = ["dep:video-engine", "dep:video-codec"]
 # Enable TLS (HTTPS on API + RTMPS) support via rustls/tokio-rustls/axum-server.
 tls = ["dep:tokio-rustls", "dep:axum-server"]
 # Enable WebRTC WHIP/WHEP input and output via str0m (pure Rust, sans-I/O).

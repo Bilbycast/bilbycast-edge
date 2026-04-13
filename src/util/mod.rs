@@ -11,6 +11,7 @@
 //! - [`time`] -- Monotonic microsecond clock initialized once at startup via
 //!   `init_epoch()`. Provides `now_us()` for low-overhead timestamping.
 
+pub mod port_error;
 pub mod rtp_parse;
 pub mod socket;
 pub mod time;

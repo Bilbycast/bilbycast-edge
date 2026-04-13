@@ -378,6 +378,24 @@ enum EncoderBackend {
         pts_anchor_set: bool,
         cancel: CancellationToken,
     },
+    /// In-process audio encoder via FFmpeg libavcodec (Opus, MP2, AC-3).
+    /// Synchronous — encode happens inline in `submit_planar`.
+    #[cfg(feature = "video-thumbnail")]
+    InProcessLibav {
+        encoder: video_engine::AudioEncoder,
+        accumulator: Vec<Vec<f32>>,
+        accumulated_samples: usize,
+        output_queue: std::collections::VecDeque<EncodedFrame>,
+        pts_90k: u64,
+        pts_anchor_set: bool,
+        cancel: CancellationToken,
+        /// Optional sample rate converter (rubato) when the input PCM rate
+        /// differs from the encoder's target rate (e.g. 44.1 kHz AAC → 48 kHz
+        /// Opus). `None` when rates match and no conversion is needed.
+        resampler: Option<rubato::Async<f32>>,
+        /// Scratch buffer for resampler output (one Vec per channel).
+        resample_out: Vec<Vec<f32>>,
+    },
 }
 
 impl std::fmt::Debug for AudioEncoder {
@@ -386,6 +404,8 @@ impl std::fmt::Debug for AudioEncoder {
             EncoderBackend::Ffmpeg { .. } => "ffmpeg",
             #[cfg(feature = "fdk-aac")]
             EncoderBackend::InProcess { .. } => "fdk-aac",
+            #[cfg(feature = "video-thumbnail")]
+            EncoderBackend::InProcessLibav { .. } => "libavcodec",
         };
         f.debug_struct("AudioEncoder")
             .field("params", &self.params)
@@ -427,8 +447,14 @@ impl AudioEncoder {
             return Self::spawn_in_process(params, cancel, &flow_id, &output_id);
         }
 
+        // Try in-process libavcodec for Opus/MP2/AC-3
+        #[cfg(feature = "video-thumbnail")]
+        if matches!(params.codec, AudioCodec::Opus | AudioCodec::Mp2 | AudioCodec::Ac3) {
+            return Self::spawn_in_process_libav(params, cancel, &flow_id, &output_id);
+        }
+
         // Fall through to ffmpeg subprocess for non-AAC codecs (or all codecs
-        // when fdk-aac feature is disabled)
+        // when in-process features are disabled)
         Self::spawn_ffmpeg(params, cancel, flow_id, output_id, stats, events)
     }
 
@@ -540,6 +566,114 @@ impl AudioEncoder {
                 pts_90k: 0,
                 pts_anchor_set: false,
                 cancel,
+            },
+            encode_stats,
+        })
+    }
+
+    /// Spawn the in-process libavcodec encoder backend for Opus, MP2, AC-3.
+    /// No subprocess, no pipes — encode happens synchronously in `submit_planar`.
+    ///
+    /// When the input sample rate differs from the target (e.g. 44.1 kHz AAC
+    /// source → 48 kHz Opus), a `rubato` async resampler is created to convert
+    /// the PCM before encoding. This mirrors the `-ar` flag in the ffmpeg
+    /// subprocess path.
+    #[cfg(feature = "video-thumbnail")]
+    fn spawn_in_process_libav(
+        params: EncoderParams,
+        cancel: CancellationToken,
+        flow_id: &str,
+        output_id: &str,
+    ) -> Result<Self, AudioEncoderError> {
+        let codec_type = match params.codec {
+            AudioCodec::Opus => video_codec::AudioCodecType::Opus,
+            AudioCodec::Mp2 => video_codec::AudioCodecType::Mp2,
+            AudioCodec::Ac3 => video_codec::AudioCodecType::Ac3,
+            _ => unreachable!("spawn_in_process_libav only called for Opus/MP2/AC-3"),
+        };
+
+        let config = video_codec::AudioEncoderConfig {
+            codec: codec_type,
+            sample_rate: params.target_sample_rate,
+            channels: params.target_channels,
+            bitrate_kbps: params.target_bitrate_kbps,
+        };
+
+        let encoder = video_engine::AudioEncoder::open(&config).map_err(|e| {
+            AudioEncoderError::InvalidPcmFormat {
+                reason: format!("libavcodec audio encoder init failed: {e}"),
+            }
+        })?;
+
+        let frame_size = encoder.frame_size();
+        let channels = params.target_channels as usize;
+
+        // Build a rubato resampler when input and target rates differ.
+        let needs_resample = params.sample_rate != params.target_sample_rate
+            && params.sample_rate > 0
+            && params.target_sample_rate > 0;
+
+        let (resampler, resample_out) = if needs_resample {
+            use rubato::Resampler;
+            let ratio = params.target_sample_rate as f64 / params.sample_rate as f64;
+            let sinc_params = rubato::SincInterpolationParameters {
+                sinc_len: 64,
+                f_cutoff: 0.92,
+                interpolation: rubato::SincInterpolationType::Linear,
+                oversampling_factor: 128,
+                window: rubato::WindowFunction::Hann,
+            };
+            // Use a reasonable chunk size — 1024 samples is typical for AAC frame output.
+            let chunk_size = 1024;
+            let r = rubato::Async::<f32>::new_sinc(
+                ratio,
+                2.0,
+                &sinc_params,
+                chunk_size,
+                channels,
+                rubato::FixedAsync::Input,
+            )
+            .map_err(|e| AudioEncoderError::InvalidPcmFormat {
+                reason: format!("rubato resampler init failed: {e}"),
+            })?;
+            let max_out = r.output_frames_max();
+            let scratch = (0..channels).map(|_| vec![0.0f32; max_out]).collect();
+            tracing::info!(
+                flow_id,
+                output_id,
+                input_sr = params.sample_rate,
+                target_sr = params.target_sample_rate,
+                "audio encoder: resampling {} Hz → {} Hz",
+                params.sample_rate,
+                params.target_sample_rate
+            );
+            (Some(r), scratch)
+        } else {
+            (None, Vec::new())
+        };
+
+        tracing::info!(
+            flow_id,
+            output_id,
+            codec = params.codec.as_str(),
+            frame_size,
+            "audio encoder: using in-process libavcodec (no ffmpeg subprocess)"
+        );
+
+        let encode_stats = Arc::new(EncodeStats::new());
+
+        Ok(Self {
+            params,
+            backend: EncoderBackend::InProcessLibav {
+                encoder,
+                accumulator: vec![Vec::with_capacity(frame_size); channels],
+                accumulated_samples: 0,
+                output_queue: std::collections::VecDeque::new(),
+                pts_90k: 0,
+                pts_anchor_set: false,
+                cancel,
+                resampler,
+                resample_out,
             },
             encode_stats,
         })
@@ -674,6 +808,109 @@ impl AudioEncoder {
 
                 true
             }
+            #[cfg(feature = "video-thumbnail")]
+            EncoderBackend::InProcessLibav {
+                encoder,
+                accumulator,
+                accumulated_samples,
+                output_queue,
+                pts_90k,
+                pts_anchor_set,
+                resampler,
+                resample_out,
+                ..
+            } => {
+                if !*pts_anchor_set {
+                    *pts_90k = pts;
+                    *pts_anchor_set = true;
+                }
+
+                let frame_size = encoder.frame_size();
+
+                // If a resampler is active, convert the input PCM to the
+                // target sample rate before accumulation. Otherwise pass
+                // through directly.
+                if let Some(resampler) = resampler {
+                    use rubato::Resampler;
+                    use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
+
+                    let channels = planar.len();
+                    let in_adapter = match SequentialSliceOfVecs::new(
+                        planar,
+                        channels,
+                        frames,
+                    ) {
+                        Ok(a) => a,
+                        Err(_) => {
+                            self.encode_stats.inc_dropped();
+                            return false;
+                        }
+                    };
+                    let out_max = resample_out.first().map(|v| v.len()).unwrap_or(0);
+                    let mut out_adapter = match SequentialSliceOfVecs::new_mut(
+                        resample_out.as_mut_slice(),
+                        channels,
+                        out_max,
+                    ) {
+                        Ok(a) => a,
+                        Err(_) => {
+                            self.encode_stats.inc_dropped();
+                            return false;
+                        }
+                    };
+                    match resampler.process_into_buffer(&in_adapter, &mut out_adapter, None) {
+                        Ok((_, produced)) => {
+                            for (ch, buf) in resample_out.iter().enumerate() {
+                                accumulator[ch].extend_from_slice(&buf[..produced]);
+                            }
+                            *accumulated_samples += produced;
+                        }
+                        Err(e) => {
+                            tracing::debug!("libavcodec resampler error: {e}");
+                            self.encode_stats.inc_dropped();
+                            return true;
+                        }
+                    }
+                } else {
+                    for (ch, samples) in planar.iter().enumerate() {
+                        accumulator[ch].extend_from_slice(samples);
+                    }
+                    *accumulated_samples += frames;
+                }
+
+                while *accumulated_samples >= frame_size {
+                    let frame_planar: Vec<Vec<f32>> = accumulator
+                        .iter_mut()
+                        .map(|ch_buf| ch_buf.drain(..frame_size).collect())
+                        .collect();
+                    *accumulated_samples -= frame_size;
+
+                    match encoder.encode_frame(&frame_planar) {
+                        Ok(encoded_frames) => {
+                            for ef in encoded_frames {
+                                let current_pts = *pts_90k;
+                                let sr = encoder.sample_rate() as u64;
+                                if sr > 0 {
+                                    *pts_90k = pts_90k.saturating_add(
+                                        (ef.num_samples as u64) * 90_000 / sr,
+                                    );
+                                }
+                                output_queue.push_back(EncodedFrame {
+                                    data: ef.data,
+                                    pts: current_pts,
+                                });
+                                self.encode_stats.inc_submitted();
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("libavcodec audio encode error: {e}");
+                            self.encode_stats.inc_dropped();
+                        }
+                    }
+                }
+
+                true
+            }
         }
     }
 
@@ -683,6 +920,8 @@ impl AudioEncoder {
             EncoderBackend::Ffmpeg { encoded_rx, .. } => encoded_rx.try_recv().ok(),
             #[cfg(feature = "fdk-aac")]
             EncoderBackend::InProcess { output_queue, .. } => output_queue.pop_front(),
+            #[cfg(feature = "video-thumbnail")]
+            EncoderBackend::InProcessLibav { output_queue, .. } => output_queue.pop_front(),
         };
         if frame.is_some() {
             self.encode_stats.inc_out(1);
@@ -704,6 +943,10 @@ impl AudioEncoder {
             EncoderBackend::InProcess { output_queue, .. } => {
                 output_queue.drain(..).collect()
             }
+            #[cfg(feature = "video-thumbnail")]
+            EncoderBackend::InProcessLibav { output_queue, .. } => {
+                output_queue.drain(..).collect()
+            }
         };
         if !out.is_empty() {
             self.encode_stats.inc_out(out.len() as u64);
@@ -718,6 +961,8 @@ impl AudioEncoder {
             EncoderBackend::Ffmpeg { cancel, .. } => cancel.cancel(),
             #[cfg(feature = "fdk-aac")]
             EncoderBackend::InProcess { cancel, .. } => cancel.cancel(),
+            #[cfg(feature = "video-thumbnail")]
+            EncoderBackend::InProcessLibav { cancel, .. } => cancel.cancel(),
         }
     }
 }

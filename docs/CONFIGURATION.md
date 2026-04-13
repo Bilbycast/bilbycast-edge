@@ -141,6 +141,8 @@ OAuth 2.0 client credentials authentication with JWT (HMAC-SHA256). When absent 
 | `token_lifetime_secs`  | `u64`          | `3600`  | Token validity period in seconds               |
 | `clients`              | `AuthClient[]` | --      | List of registered OAuth clients               |
 | `public_metrics`       | `bool`         | `true`  | Allow unauthenticated access to `/metrics` and `/health` |
+| `nmos_require_auth`    | `bool`         | `false` | Require JWT Bearer auth on NMOS IS-04/IS-05/IS-08 endpoints |
+| `token_rate_limit_per_minute` | `u32`   | `10`    | Max OAuth token requests per minute per IP (0 = disabled) |
 
 Each client entry:
 
@@ -350,8 +352,8 @@ An array of flow definitions. Each flow has one or more inputs (one active at a 
 | `name`            | `string`         | --      | Human-readable name                      |
 | `enabled`         | `bool`           | `true`  | Auto-start when the application starts   |
 | `media_analysis`  | `bool`           | `true`  | Enable media content analysis (codec, resolution, frame rate detection). Set to `false` to save CPU on resource-constrained devices. |
-| `thumbnail`       | `bool`           | `true`  | Enable thumbnail generation for visual flow preview (requires ffmpeg on the device). |
-| `thumbnail_program_number` | `u16?`   | `null`  | When the input is an MPTS, render the thumbnail from this MPEG-TS program only. `null` lets ffmpeg pick the first program it finds. Must be `> 0` if set. See the **[MPTS → SPTS filtering](#mpts--spts-filtering)** section. |
+| `thumbnail`       | `bool`           | `true`  | Enable thumbnail generation for visual flow preview (in-process via libavcodec; no external ffmpeg required). |
+| `thumbnail_program_number` | `u16?`   | `null`  | When the input is an MPTS, render the thumbnail from this MPEG-TS program only. `null` uses the first program found. Must be `> 0` if set. See the **[MPTS → SPTS filtering](#mpts--spts-filtering)** section. |
 | `bandwidth_limit` | `BandwidthLimitConfig?` | `null` | Per-flow bandwidth monitoring for trust boundary enforcement (RP 2129). See below. |
 | `input_ids`       | `string[]`       | `[]`    | One or more input sources (one active at a time) |
 | `outputs`         | `OutputConfig[]` | --      | One or more output destinations          |

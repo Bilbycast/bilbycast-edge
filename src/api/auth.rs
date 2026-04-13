@@ -12,10 +12,11 @@
 //! When [`AuthConfig::enabled`] is `false` (or no `AuthState` is provided), all
 //! requests pass through without authentication.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{FromRequestParts, Request, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
@@ -23,6 +24,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine as _;
+use dashmap::DashMap;
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -49,6 +51,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_token_rate_limit() -> u32 {
+    10
+}
+
 /// Top-level authentication configuration block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
@@ -64,6 +70,13 @@ pub struct AuthConfig {
     /// When `true`, unauthenticated requests to `/metrics` and `/health` are allowed.
     #[serde(default = "default_true")]
     pub public_metrics: bool,
+    /// When `true`, NMOS IS-04/IS-05/IS-08 endpoints require JWT Bearer auth.
+    /// Default `false` for backward compatibility with existing NMOS controllers.
+    #[serde(default)]
+    pub nmos_require_auth: bool,
+    /// Maximum OAuth token requests per minute per IP address. Set to 0 to disable.
+    #[serde(default = "default_token_rate_limit")]
+    pub token_rate_limit_per_minute: u32,
 }
 
 /// A single registered OAuth client (client_credentials grant).
@@ -105,6 +118,54 @@ impl AuthState {
     pub fn new(config: AuthConfig) -> Self {
         let hmac_key = config.jwt_secret.as_bytes().to_vec();
         Self { config, hmac_key }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-IP rate limiter for the /oauth/token endpoint
+// ---------------------------------------------------------------------------
+
+/// Simple per-IP token bucket rate limiter for the OAuth token endpoint.
+///
+/// Each IP address gets `max_per_minute` tokens that refill linearly over 60 seconds.
+/// Stale entries (no request in 5 minutes) are evicted on each `check()` call.
+pub struct TokenEndpointRateLimiter {
+    /// Per-IP state: (remaining_tokens, last_refill_time)
+    buckets: DashMap<IpAddr, (f64, Instant)>,
+    max_per_minute: u32,
+}
+
+impl TokenEndpointRateLimiter {
+    pub fn new(max_per_minute: u32) -> Self {
+        Self {
+            buckets: DashMap::new(),
+            max_per_minute,
+        }
+    }
+
+    /// Returns `true` if the request is allowed, `false` if rate-limited.
+    pub fn check(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let max = self.max_per_minute as f64;
+        let refill_rate = max / 60.0; // tokens per second
+
+        // Piggyback cleanup: evict stale entries older than 5 minutes
+        self.buckets.retain(|_, (_, last)| now.duration_since(*last).as_secs() < 300);
+
+        let mut entry = self.buckets.entry(ip).or_insert_with(|| (max, now));
+        let (ref mut tokens, ref mut last_refill) = *entry;
+
+        // Refill tokens based on elapsed time
+        let elapsed = now.duration_since(*last_refill).as_secs_f64();
+        *tokens = (*tokens + elapsed * refill_rate).min(max);
+        *last_refill = now;
+
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -284,12 +345,29 @@ pub struct TokenResponse {
 /// `grant_type=client_credentials`, `client_id`, and `client_secret`.
 ///
 /// On success, returns a signed JWT with the client's role.
+/// Rate-limited per client IP when configured.
 pub async fn oauth_token_handler(
     State(state): State<super::server::AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     body: axum::body::Bytes,
-) -> Result<Json<TokenResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let auth = state.auth_state.as_ref()
         .ok_or_else(|| ApiError::BadRequest("authentication is not enabled".into()))?;
+
+    // Rate limit check
+    if let Some(ref limiter) = state.token_rate_limiter {
+        if !limiter.check(addr.ip()) {
+            return Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", "60")],
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "rate limit exceeded, try again later"
+                })),
+            )
+                .into_response());
+        }
+    }
 
     // Try to parse as form-urlencoded first, then as JSON.
     let params: TokenRequest = serde_urlencoded::from_bytes(&body)
@@ -335,7 +413,8 @@ pub async fn oauth_token_handler(
         token_type: "bearer".to_string(),
         expires_in: auth.config.token_lifetime_secs,
         role: client.role.clone(),
-    }))
+    })
+    .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -443,5 +522,60 @@ mod tests {
             serde_json::from_slice(&decoded).expect("header should be valid JSON");
         assert_eq!(header["alg"], "HS256");
         assert_eq!(header["typ"], "JWT");
+    }
+
+    #[test]
+    fn rate_limiter_allows_within_limit() {
+        let limiter = TokenEndpointRateLimiter::new(10);
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+
+        // First 10 requests should be allowed
+        for i in 0..10 {
+            assert!(limiter.check(ip), "request {i} should be allowed");
+        }
+
+        // 11th request should be rejected
+        assert!(!limiter.check(ip), "11th request should be rejected");
+    }
+
+    #[test]
+    fn rate_limiter_per_ip_isolation() {
+        let limiter = TokenEndpointRateLimiter::new(2);
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+
+        // Exhaust ip1's budget
+        assert!(limiter.check(ip1));
+        assert!(limiter.check(ip1));
+        assert!(!limiter.check(ip1));
+
+        // ip2 should still be allowed
+        assert!(limiter.check(ip2));
+        assert!(limiter.check(ip2));
+        assert!(!limiter.check(ip2));
+    }
+
+    #[test]
+    fn rate_limiter_refills_over_time() {
+        let limiter = TokenEndpointRateLimiter::new(60); // 1 per second
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Exhaust all tokens
+        for _ in 0..60 {
+            assert!(limiter.check(ip));
+        }
+        assert!(!limiter.check(ip));
+
+        // Manually advance the last_refill time to simulate elapsed time.
+        // The bucket stores (tokens, last_refill). Set last_refill 2 seconds
+        // in the past so the next check() refills ~2 tokens.
+        if let Some(mut entry) = limiter.buckets.get_mut(&ip) {
+            entry.1 = Instant::now() - std::time::Duration::from_secs(2);
+        }
+
+        // Should now have ~2 tokens refilled
+        assert!(limiter.check(ip));
+        assert!(limiter.check(ip));
+        assert!(!limiter.check(ip));
     }
 }

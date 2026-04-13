@@ -128,12 +128,18 @@ async fn main() -> anyhow::Result<()> {
         app_config.server.listen_addr, app_config.server.listen_port
     );
 
-    // Detect ffmpeg availability (for optional thumbnail generation)
-    let ffmpeg_available = engine::thumbnail::check_ffmpeg_available();
+    // Detect thumbnail generation capability
+    let ffmpeg_available = engine::thumbnail::check_thumbnail_available();
     if ffmpeg_available {
-        tracing::info!("ffmpeg detected — flow thumbnail generation available");
+        #[cfg(feature = "video-thumbnail")]
+        tracing::info!("video-thumbnail: in-process (libavcodec) — flow thumbnail generation available");
+        #[cfg(not(feature = "video-thumbnail"))]
+        tracing::info!("video-thumbnail: ffmpeg subprocess — flow thumbnail generation available");
     } else {
-        tracing::info!("ffmpeg not found — flow thumbnail generation disabled");
+        #[cfg(not(feature = "video-thumbnail"))]
+        tracing::info!("ffmpeg not found — flow thumbnail generation disabled (install ffmpeg or enable the video-thumbnail feature)");
+        #[cfg(feature = "video-thumbnail")]
+        tracing::info!("thumbnail generation unavailable");
     }
 
     // Create shared state
@@ -181,6 +187,17 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("API authentication is DISABLED — all endpoints are open");
     }
 
+    // Build rate limiter for /oauth/token endpoint
+    let token_rate_limiter = auth_state.as_ref().and_then(|a| {
+        let limit = a.config.token_rate_limit_per_minute;
+        if limit > 0 {
+            tracing::info!("OAuth token endpoint rate limit: {limit} requests/minute per IP");
+            Some(Arc::new(api::auth::TokenEndpointRateLimiter::new(limit)))
+        } else {
+            None
+        }
+    });
+
     let state = AppState {
         config: Arc::new(RwLock::new(app_config.clone())),
         config_path: cli.config.clone(),
@@ -202,6 +219,7 @@ async fn main() -> anyhow::Result<()> {
         event_sender: Some(event_sender.clone()),
         resource_state: resource_state.clone(),
         standby_listeners: Some(standby_listeners.clone()),
+        token_rate_limiter,
     };
 
     // Start all enabled flows from config
@@ -386,11 +404,16 @@ async fn main() -> anyhow::Result<()> {
 
             axum_server::bind_rustls(addr, rustls_config)
                 .handle(handle)
-                .serve(router.into_make_service())
-                .await?;
+                .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                .await
+                .map_err(|e| anyhow::anyhow!(
+                    "Edge API server failed to start on {listen_addr}: {e}"
+                ))?;
         } else {
-            let listener = TcpListener::bind(&listen_addr).await?;
-            axum::serve(listener, router)
+            let listener = TcpListener::bind(&listen_addr).await.map_err(|e| {
+                crate::util::port_error::annotate_bind_error(e, &listen_addr, "Edge API server")
+            })?;
+            axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .with_graceful_shutdown(async move {
                     shutdown_token.cancelled().await;
                 })
@@ -403,8 +426,10 @@ async fn main() -> anyhow::Result<()> {
         if app_config.server.tls.is_some() {
             tracing::warn!("TLS is configured but the 'tls' feature is not enabled. Build with --features tls to enable HTTPS.");
         }
-        let listener = TcpListener::bind(&listen_addr).await?;
-        axum::serve(listener, router)
+        let listener = TcpListener::bind(&listen_addr).await.map_err(|e| {
+            crate::util::port_error::annotate_bind_error(e, &listen_addr, "Edge API server")
+        })?;
+        axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .with_graceful_shutdown(async move {
                 shutdown_token.cancelled().await;
             })

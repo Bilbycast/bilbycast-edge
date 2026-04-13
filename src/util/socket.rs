@@ -72,7 +72,7 @@ pub async fn bind_udp_input(
         set_socket_buffers(&socket, DEFAULT_RECV_BUF_SIZE, DEFAULT_SEND_BUF_SIZE);
         socket
             .bind(&SockAddr::from(addr))
-            .with_context(|| format!("Failed to bind UDP socket to {addr}"))?;
+            .map_err(|e| crate::util::port_error::annotate_bind_error(e, addr, "UDP/RTP input"))?;
         let std_socket: std::net::UdpSocket = socket.into();
         let sock = UdpSocket::from_std(std_socket)
             .context("Failed to convert socket2 socket to tokio UdpSocket")?;

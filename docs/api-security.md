@@ -31,6 +31,8 @@ bilbycast-edge implements a self-contained API security layer with the following
 3. **Role-Based Access Control** -- Two roles (`admin` and `monitor`) control access to API endpoints. Read-only endpoints accept any role; mutation endpoints require `admin`.
 4. **TLS/HTTPS** -- Optional TLS termination using PEM-encoded certificates, powered by `rustls` (pure Rust, no OpenSSL dependency).
 5. **Public endpoints** -- `/health`, `/oauth/token`, and `/setup` are always accessible without authentication. `/metrics` is public by default but can be placed behind auth. The `/setup` wizard is gated by the `setup_enabled` config flag (default: true) and is intended for initial provisioning of unconfigured nodes.
+6. **NMOS endpoint auth** -- NMOS IS-04, IS-05, and IS-08 endpoints are public by default for compatibility with NMOS controllers. When `nmos_require_auth` is `true`, these endpoints require the same JWT Bearer auth as the rest of the API. Both `admin` and `monitor` roles have access.
+7. **OAuth token rate limiting** -- The `/oauth/token` endpoint is rate-limited per client IP address to prevent brute-force attacks on client credentials. Default: 10 requests per minute per IP. Configurable via `token_rate_limit_per_minute`.
 
 When the `auth` configuration block is absent or has `enabled: false`, all endpoints are open with no authentication. This is suitable for development but should never be used in production.
 
@@ -170,6 +172,7 @@ bilbycast-edge supports two roles:
 | `/setup` | POST | Yes | Yes | Yes (if setup_enabled) |
 | `/setup/status` | GET | Yes | Yes | Yes (if setup_enabled) |
 | `/metrics` | GET | Yes | Yes | Yes (if public_metrics) |
+| `/x-nmos/**` | GET/PATCH/POST | Yes | Yes | Yes (unless nmos_require_auth) |
 | `/api/v1/flows` | GET | Yes | Yes | Yes |
 | `/api/v1/flows/{id}` | GET | Yes | Yes | Yes |
 | `/api/v1/flows` | POST | Yes | **No (403)** | Yes |
@@ -279,6 +282,8 @@ The `auth` block is an optional sub-object of `server`. It is stored in `secrets
       "jwt_secret": "a-secret-that-is-at-least-32-characters-long-for-security",
       "token_lifetime_secs": 3600,
       "public_metrics": true,
+      "nmos_require_auth": false,
+      "token_rate_limit_per_minute": 10,
       "clients": [
         {
           "client_id": "admin-client",
@@ -304,6 +309,8 @@ The `auth` block is an optional sub-object of `server`. It is stored in `secrets
 | `jwt_secret` | string | - | HMAC-SHA256 secret for signing/verifying JWTs. Must be at least 32 characters. |
 | `token_lifetime_secs` | integer | `3600` | Token validity duration in seconds (default: 1 hour). |
 | `public_metrics` | boolean | `true` | When `true`, `/metrics` and `/health` are accessible without auth. When `false`, `/metrics` requires a valid JWT. |
+| `nmos_require_auth` | boolean | `false` | When `true`, NMOS IS-04, IS-05, and IS-08 endpoints require JWT Bearer auth. Default `false` for backward compatibility with NMOS controllers. |
+| `token_rate_limit_per_minute` | integer | `10` | Maximum OAuth token requests per minute per IP address. Set to `0` to disable rate limiting. |
 | `clients` | array | - | List of registered OAuth clients. At least one client must be configured when auth is enabled. |
 
 ### Client fields
@@ -322,6 +329,7 @@ When `enabled: true`, the following validation rules are enforced at startup and
 - At least one client must be configured.
 - Each client's `client_id` and `client_secret` must be non-empty.
 - Each client's `role` must be exactly `"admin"` or `"monitor"`.
+- If `nmos_require_auth` is `true` but `enabled` is `false`, a warning is logged and NMOS endpoints remain public.
 
 ---
 
@@ -614,6 +622,8 @@ Note: Query parameter authentication is less secure than headers because tokens 
       "jwt_secret": "use-openssl-rand-base64-64-to-generate-this-very-long-secret-string",
       "token_lifetime_secs": 1800,
       "public_metrics": false,
+      "nmos_require_auth": true,
+      "token_rate_limit_per_minute": 10,
       "clients": [
         { "client_id": "ops-admin", "client_secret": "secret-1", "role": "admin" },
         { "client_id": "automation", "client_secret": "secret-2", "role": "admin" },
@@ -657,11 +667,17 @@ Note: Query parameter authentication is less secure than headers because tokens 
 - For automation scripts that run continuously, consider longer lifetimes (e.g., 86400 for 24 hours) combined with token refresh logic.
 - For interactive operator use, shorter lifetimes (1800 seconds / 30 minutes) reduce risk from token theft.
 
+### NMOS endpoint security
+
+- NMOS IS-04/IS-05/IS-08 endpoints are public by default (`nmos_require_auth: false`) for compatibility with standard NMOS controllers.
+- On untrusted networks, set `nmos_require_auth: true` to require JWT Bearer auth on all NMOS endpoints. NMOS controllers must obtain a token from `/oauth/token` first, then include `Authorization: Bearer <token>` in all NMOS requests.
+- Both `admin` and `monitor` roles have full access to NMOS endpoints (they are read-heavy with limited write operations via IS-05/IS-08 PATCH/POST).
+
 ### Network security
 
 - Restrict API access to trusted networks using firewall rules.
 - The monitor dashboard (if enabled) runs on a separate port and does not share auth with the API.
-- Consider running behind a reverse proxy (nginx, Caddy) for additional features like rate limiting and IP allowlisting.
+- The `/oauth/token` endpoint is rate-limited to 10 requests/minute per IP by default. Adjust `token_rate_limit_per_minute` or set to `0` to disable. When rate-limited, the endpoint returns HTTP 429 with a `Retry-After: 60` header.
 
 ### Config file security
 
@@ -686,7 +702,7 @@ A future release may support delegating authentication to an external identity p
 
 ### NMOS IS-10 (Authorization)
 
-bilbycast-edge implements NMOS IS-04 (Node API v1.3) and IS-05 (Connection Management v1.1). These endpoints are currently unauthenticated for compatibility with NMOS controllers. The AMWA NMOS IS-10 specification defines an authorization framework for broadcast media networks. A future release may implement IS-10 compatibility, allowing bilbycast-edge to secure the NMOS endpoints using authorization tokens issued by a central NMOS Authorization Server and validated using JWKs (JSON Web Key Sets).
+bilbycast-edge supports optional JWT Bearer auth on NMOS endpoints via `nmos_require_auth: true` (see [Auth Configuration Reference](#auth-configuration-reference)). This uses the same local JWT mechanism as the rest of the API. A future release may additionally implement AMWA NMOS IS-10 compatibility, allowing bilbycast-edge to validate authorization tokens issued by a central NMOS Authorization Server using JWKs (JSON Web Key Sets) for integration with facility-wide NMOS auth infrastructure.
 
 ### API key authentication
 

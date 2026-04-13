@@ -59,6 +59,8 @@ pub struct AppState {
     pub resource_state: Arc<SystemResourceState>,
     /// Standby listener manager for passive-type inputs not assigned to flows.
     pub standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
+    /// Per-IP rate limiter for the `/oauth/token` endpoint (None = no limiting).
+    pub token_rate_limiter: Option<Arc<auth::TokenEndpointRateLimiter>>,
 }
 
 /// Constructs the main Axum [`Router`] with all API routes, auth middleware, and layers.
@@ -176,11 +178,25 @@ pub fn build_router(state: AppState) -> Router {
             auth::auth_middleware,
         ));
 
-    // NMOS IS-04, IS-05, and IS-08 routes (public, no auth — for NMOS controller compatibility)
+    // NMOS IS-04, IS-05, and IS-08 routes — optionally protected by JWT auth.
+    // Default is public (no auth) for backward compatibility with NMOS controllers.
     let nmos_routes = Router::new()
         .nest("/x-nmos/node/v1.3", nmos::nmos_node_router())
         .nest("/x-nmos/connection/v1.1", nmos_is05::nmos_connection_router())
         .nest("/x-nmos/channelmapping/v1.0", nmos_is08::nmos_is08_router());
+
+    let nmos_routes = if auth_state
+        .as_ref()
+        .map_or(false, |a| a.config.nmos_require_auth)
+    {
+        tracing::info!("NMOS endpoints require JWT Bearer authentication");
+        nmos_routes.route_layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            auth::auth_middleware,
+        ))
+    } else {
+        nmos_routes
+    };
 
     // Merge everything
     Router::new()

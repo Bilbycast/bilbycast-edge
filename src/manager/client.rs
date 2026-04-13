@@ -495,8 +495,8 @@ async fn try_connect(
     let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
     stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Thumbnail polling: check for new thumbnails every 10 seconds
-    let mut thumbnail_interval = tokio::time::interval(Duration::from_secs(10));
+    // Thumbnail polling: check for new thumbnails every 5 seconds
+    let mut thumbnail_interval = tokio::time::interval(Duration::from_secs(5));
     thumbnail_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Track last-sent generation per flow to avoid re-sending unchanged thumbnails
     let mut thumbnail_generations: HashMap<String, u64> = HashMap::new();
@@ -620,18 +620,20 @@ async fn try_connect(
                 }
             }
 
-            // Send new thumbnails to manager
+            // Send new thumbnails to manager (flow-level + per-input)
             _ = thumbnail_interval.tick() => {
                 use base64::Engine;
                 let stats = flow_manager.stats();
                 for entry in stats.flow_stats.iter() {
                     let flow_id = entry.key().clone();
                     let acc = entry.value();
+
+                    // Flow-level thumbnail (what outputs are sending)
                     if let Some(thumb_acc) = acc.thumbnail.get() {
                         let thumb_gen = thumb_acc.generation.load(std::sync::atomic::Ordering::Relaxed);
-                        let prev = thumbnail_generations.get(&flow_id).copied().unwrap_or(0);
+                        let gen_key = format!("flow:{flow_id}");
+                        let prev = thumbnail_generations.get(&gen_key).copied().unwrap_or(0);
                         if thumb_gen > prev {
-                            // Clone JPEG data out of the mutex before any .await
                             let jpeg_clone = thumb_acc.latest_jpeg.lock().unwrap()
                                 .as_ref()
                                 .map(|(jpeg, _)| jpeg.clone());
@@ -652,7 +654,41 @@ async fn try_connect(
                                         break;
                                     }
                                 }
-                                thumbnail_generations.insert(flow_id, thumb_gen);
+                                thumbnail_generations.insert(gen_key, thumb_gen);
+                            }
+                        }
+                    }
+
+                    // Per-input thumbnails (what each source is receiving)
+                    for per_input in acc.per_input_thumbnails.iter() {
+                        let input_id = per_input.key().clone();
+                        let thumb_acc = per_input.value();
+                        let thumb_gen = thumb_acc.generation.load(std::sync::atomic::Ordering::Relaxed);
+                        let gen_key = format!("input:{flow_id}:{input_id}");
+                        let prev = thumbnail_generations.get(&gen_key).copied().unwrap_or(0);
+                        if thumb_gen > prev {
+                            let jpeg_clone = thumb_acc.latest_jpeg.lock().unwrap()
+                                .as_ref()
+                                .map(|(jpeg, _)| jpeg.clone());
+                            if let Some(jpeg) = jpeg_clone {
+                                let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
+                                let envelope = serde_json::json!({
+                                    "type": "thumbnail",
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                    "payload": {
+                                        "flow_id": flow_id,
+                                        "input_id": input_id,
+                                        "data": b64,
+                                        "width": 320,
+                                        "height": 180
+                                    }
+                                });
+                                if let Ok(json) = serde_json::to_string(&envelope) {
+                                    if ws_write.send(Message::Text(json.into())).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                thumbnail_generations.insert(gen_key, thumb_gen);
                             }
                         }
                     }

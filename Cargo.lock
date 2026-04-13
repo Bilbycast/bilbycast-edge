@@ -397,6 +397,8 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "video-codec",
+ "video-engine",
  "webpki-roots 1.0.6",
 ]
 
@@ -1749,6 +1751,15 @@ checksum = "48f5d2a454e16a5ea0f4ced81bd44e4cfc7bd3a507b61887c99fd3538b28e4af"
 
 [[package]]
 name = "libfdk-aac-sys"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "cmake",
+ "pkg-config",
+]
+
+[[package]]
+name = "libffmpeg-video-sys"
 version = "0.1.0"
 dependencies = [
  "bindgen",
@@ -3610,6 +3621,22 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "video-codec"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "video-engine"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "libffmpeg-video-sys",
+ "video-codec",
+]
 
 [[package]]
 name = "visibility"

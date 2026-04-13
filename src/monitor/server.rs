@@ -24,6 +24,7 @@ fn build_monitor_router(state: AppState) -> Router {
         .route("/", get(dashboard_page))
         .route("/api/stats", get(monitor_stats))
         .route("/api/thumbnail/{flow_id}", get(monitor_thumbnail))
+        .route("/api/thumbnail/{flow_id}/input/{input_id}", get(monitor_input_thumbnail))
         .route("/api/tunnels", get(monitor_tunnels))
         .route("/api/ws", get(monitor_ws))
         .with_state(state)
@@ -46,6 +47,33 @@ async fn monitor_thumbnail(
         return Err(StatusCode::NOT_FOUND);
     };
     let Some(thumb_acc) = acc.thumbnail.get() else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let guard = thumb_acc.latest_jpeg.lock().unwrap();
+    let Some((jpeg_data, _ts)) = guard.as_ref() else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let data = jpeg_data.clone();
+    drop(guard);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", "image/jpeg".parse().unwrap());
+    headers.insert(
+        "cache-control",
+        "no-cache, no-store, must-revalidate".parse().unwrap(),
+    );
+    Ok((headers, data))
+}
+
+async fn monitor_input_thumbnail(
+    State(state): State<AppState>,
+    Path((flow_id, input_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let stats = state.flow_manager.stats();
+    let Some(acc) = stats.flow_stats.get(&flow_id) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let Some(thumb_acc) = acc.per_input_thumbnails.get(&input_id) else {
         return Err(StatusCode::NOT_FOUND);
     };
     let guard = thumb_acc.latest_jpeg.lock().unwrap();
@@ -109,7 +137,9 @@ pub async fn start_monitor_server(
     shutdown_token: CancellationToken,
 ) -> anyhow::Result<JoinHandle<()>> {
     let addr = format!("{}:{}", config.listen_addr, config.listen_port);
-    let listener = TcpListener::bind(&addr).await?;
+    let listener = TcpListener::bind(&addr).await.map_err(|e| {
+        crate::util::port_error::annotate_bind_error(e, &addr, "Monitor dashboard server")
+    })?;
     tracing::info!("Monitor dashboard listening on {addr}");
 
     let router = build_monitor_router(state);
