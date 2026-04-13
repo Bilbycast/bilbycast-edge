@@ -74,6 +74,13 @@ jobs:
           path: bilbycast-fdk-aac-rs
           submodules: recursive
 
+      - name: Checkout bilbycast-ffmpeg-video-rs (path dependency)
+        uses: actions/checkout@v5
+        with:
+          repository: Bilbycast/bilbycast-ffmpeg-video-rs
+          path: bilbycast-ffmpeg-video-rs
+          submodules: recursive
+
       - name: Checkout bilbycast-edge
         uses: actions/checkout@v5
         with:
@@ -82,7 +89,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake clang libclang-dev pkg-config libssl-dev g++
+          sudo apt-get install -y cmake make clang libclang-dev pkg-config libssl-dev g++
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
