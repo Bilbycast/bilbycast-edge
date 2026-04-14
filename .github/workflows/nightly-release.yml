@@ -80,6 +80,7 @@ jobs:
           repository: Bilbycast/bilbycast-ffmpeg-video-rs
           path: bilbycast-ffmpeg-video-rs
           submodules: recursive
+          fetch-depth: 0
 
       - name: Checkout bilbycast-edge
         uses: actions/checkout@v5
