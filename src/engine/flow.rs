@@ -118,6 +118,11 @@ pub struct FlowRuntime {
     /// Event sender for emitting operational events to the manager.
     /// Stored so that hot-added outputs can also emit events.
     pub event_sender: EventSender,
+    /// Watch channel receiver for the detected video frame rate (fps).
+    /// Created when media analysis is enabled so that hot-added outputs
+    /// with `TargetFrames` delay mode can subscribe to frame rate updates
+    /// instead of falling back to `fallback_ms`.
+    pub frame_rate_rx: Option<watch::Receiver<Option<f64>>>,
 }
 
 /// Runtime state for a single input within a flow.
@@ -495,19 +500,13 @@ impl FlowRuntime {
             tokio::spawn(async {})
         };
 
-        // Check if any output uses TargetFrames delay mode, which requires
-        // the detected video frame rate from media analysis. If so, create a
-        // watch channel to broadcast the frame rate to those output tasks.
-        let needs_frame_rate = config.outputs.iter().any(|o| {
-            let delay = match o {
-                OutputConfig::Rtp(c) => c.delay.as_ref(),
-                OutputConfig::Udp(c) => c.delay.as_ref(),
-                OutputConfig::Srt(c) => c.delay.as_ref(),
-                _ => None,
-            };
-            matches!(delay, Some(OutputDelay::TargetFrames { .. }))
-        });
-        let (frame_rate_tx, frame_rate_rx) = if needs_frame_rate {
+        // Create a watch channel to broadcast the detected video frame rate
+        // to output tasks that use TargetFrames delay mode. The channel is
+        // created whenever media analysis is enabled (not just when current
+        // outputs need it) so that outputs hot-added later via the manager
+        // can also subscribe to frame rate updates instead of falling back
+        // to fallback_ms.
+        let (frame_rate_tx, frame_rate_rx) = if config.config.media_analysis && active_input_cfg.is_some() {
             let (tx, rx) = tokio::sync::watch::channel::<Option<f64>>(None);
             (Some(tx), Some(rx))
         } else {
@@ -722,6 +721,7 @@ impl FlowRuntime {
             #[cfg(feature = "webrtc")]
             whep_session_tx: whep_session_info,
             event_sender,
+            frame_rate_rx,
         })
     }
 
@@ -1101,10 +1101,7 @@ impl FlowRuntime {
             compressed_audio_input,
             #[cfg(feature = "webrtc")]
             None,
-            // Hot-added outputs with TargetFrames delay won't get a frame rate
-            // channel — they'll fall back to fallback_ms. Full TargetFrames
-            // support requires a flow restart to wire up the watch channel.
-            None,
+            self.frame_rate_rx.clone(),
         ).await?;
 
         // Update output config metadata so stats snapshots reflect the new address/port
