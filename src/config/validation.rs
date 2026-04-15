@@ -1043,6 +1043,85 @@ fn validate_program_number(prog: Option<u16>, context: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate a `video_encode` block. The backend allowlist is
+/// output-specific (future work — for now every TS-transport output
+/// accepts the same set: x264/x265/nvenc variants). Validation here
+/// enforces schema-level bounds (codec name, dimensions, fps, bitrate,
+/// gop, preset, profile) regardless of which backends the current build
+/// actually has compiled in. Unavailable backends are surfaced as a
+/// runtime error when the output starts.
+fn validate_video_encode(
+    enc: &crate::config::models::VideoEncodeConfig,
+    context: &str,
+) -> anyhow::Result<()> {
+    match enc.codec.as_str() {
+        "x264" | "x265" | "h264_nvenc" | "hevc_nvenc" => {}
+        other => bail!(
+            "{context}: video_encode.codec '{other}' is not recognised; \
+             expected one of x264, x265, h264_nvenc, hevc_nvenc"
+        ),
+    }
+    if let Some(w) = enc.width {
+        if !(64..=7680).contains(&w) {
+            bail!("{context}: video_encode.width must be 64..=7680, got {w}");
+        }
+    }
+    if let Some(h) = enc.height {
+        if !(64..=4320).contains(&h) {
+            bail!("{context}: video_encode.height must be 64..=4320, got {h}");
+        }
+    }
+    match (enc.fps_num, enc.fps_den) {
+        (Some(_), None) | (None, Some(_)) => bail!(
+            "{context}: video_encode.fps_num and fps_den must be set together"
+        ),
+        (Some(n), Some(d)) => {
+            if n == 0 || d == 0 {
+                bail!(
+                    "{context}: video_encode.fps_num and fps_den must be non-zero (got {n}/{d})"
+                );
+            }
+            // 1 fps up to 240 fps is the useful range for broadcast.
+            let ratio = n as f64 / d as f64;
+            if !(0.5..=240.0).contains(&ratio) {
+                bail!("{context}: video_encode effective frame rate {ratio:.3} is out of range (0.5..=240)");
+            }
+        }
+        (None, None) => {}
+    }
+    if let Some(b) = enc.bitrate_kbps {
+        if !(100..=100_000).contains(&b) {
+            bail!("{context}: video_encode.bitrate_kbps must be 100..=100000, got {b}");
+        }
+    }
+    if let Some(g) = enc.gop_size {
+        if !(1..=600).contains(&g) {
+            bail!("{context}: video_encode.gop_size must be 1..=600, got {g}");
+        }
+    }
+    if let Some(ref p) = enc.preset {
+        match p.as_str() {
+            "ultrafast" | "superfast" | "veryfast" | "faster" | "fast" | "medium"
+            | "slow" | "slower" | "veryslow" => {}
+            other => bail!(
+                "{context}: video_encode.preset '{other}' is not recognised; \
+                 expected one of ultrafast, superfast, veryfast, faster, fast, \
+                 medium, slow, slower, veryslow"
+            ),
+        }
+    }
+    if let Some(ref pr) = enc.profile {
+        match pr.as_str() {
+            "baseline" | "main" | "high" => {}
+            other => bail!(
+                "{context}: video_encode.profile '{other}' is not recognised; \
+                 expected one of baseline, main, high"
+            ),
+        }
+    }
+    Ok(())
+}
+
 /// Validate an `audio_encode` block. Each output type passes its allowed
 /// codec set so we can reject invalid combinations (e.g. Opus on RTMP)
 /// at config load time rather than at output start time.
@@ -1178,6 +1257,40 @@ pub fn validate_output_with_input(
                     bail!("RTP output '{}' redundancy: leg 1 ({}) and leg 2 ({}) must use the same address family", rtp.id, rtp.dest_addr, red.dest_addr);
                 }
             }
+            if let Some(ref enc) = rtp.audio_encode {
+                if rtp.redundancy.is_some() {
+                    bail!(
+                        "RTP output '{}': audio_encode is not yet supported with SMPTE 2022-7 redundancy",
+                        rtp.id
+                    );
+                }
+                if rtp.fec_encode.is_some() {
+                    bail!(
+                        "RTP output '{}': audio_encode is not yet supported with SMPTE 2022-1 FEC encode",
+                        rtp.id
+                    );
+                }
+                validate_audio_encode(
+                    enc,
+                    &["aac_lc", "he_aac_v1", "he_aac_v2", "mp2", "ac3"],
+                    &format!("RTP output '{}'", rtp.id),
+                )?;
+            }
+            if let Some(ref enc) = rtp.video_encode {
+                if rtp.redundancy.is_some() {
+                    bail!(
+                        "RTP output '{}': video_encode is not yet supported with SMPTE 2022-7 redundancy",
+                        rtp.id
+                    );
+                }
+                if rtp.fec_encode.is_some() {
+                    bail!(
+                        "RTP output '{}': video_encode is not yet supported with SMPTE 2022-1 FEC encode",
+                        rtp.id
+                    );
+                }
+                validate_video_encode(enc, &format!("RTP output '{}'", rtp.id))?;
+            }
         }
         OutputConfig::Udp(udp) => {
             validate_id(&udp.id, "UDP output")?;
@@ -1207,6 +1320,28 @@ pub fn validate_output_with_input(
                         udp.id
                     );
                 }
+            }
+            if let Some(ref enc) = udp.audio_encode {
+                if udp.transport_mode.as_deref() == Some("audio_302m") {
+                    bail!(
+                        "UDP output '{}': audio_encode is incompatible with transport_mode 'audio_302m'",
+                        udp.id
+                    );
+                }
+                validate_audio_encode(
+                    enc,
+                    &["aac_lc", "he_aac_v1", "he_aac_v2", "mp2", "ac3"],
+                    &format!("UDP output '{}'", udp.id),
+                )?;
+            }
+            if let Some(ref enc) = udp.video_encode {
+                if udp.transport_mode.as_deref() == Some("audio_302m") {
+                    bail!(
+                        "UDP output '{}': video_encode is incompatible with transport_mode 'audio_302m'",
+                        udp.id
+                    );
+                }
+                validate_video_encode(enc, &format!("UDP output '{}'", udp.id))?;
             }
         }
         OutputConfig::Srt(srt) => {
@@ -1267,6 +1402,52 @@ pub fn validate_output_with_input(
                         );
                     }
                 }
+            }
+            if let Some(ref enc) = srt.audio_encode {
+                if srt.transport_mode.as_deref() == Some("audio_302m") {
+                    bail!(
+                        "SRT output '{}': audio_encode is incompatible with transport_mode 'audio_302m'",
+                        srt.id
+                    );
+                }
+                if srt.redundancy.is_some() {
+                    bail!(
+                        "SRT output '{}': audio_encode is not yet supported with SMPTE 2022-7 redundancy",
+                        srt.id
+                    );
+                }
+                if srt.packet_filter.is_some() {
+                    bail!(
+                        "SRT output '{}': audio_encode is not yet supported with SRT FEC (packet_filter)",
+                        srt.id
+                    );
+                }
+                validate_audio_encode(
+                    enc,
+                    &["aac_lc", "he_aac_v1", "he_aac_v2", "mp2", "ac3"],
+                    &format!("SRT output '{}'", srt.id),
+                )?;
+            }
+            if let Some(ref enc) = srt.video_encode {
+                if srt.transport_mode.as_deref() == Some("audio_302m") {
+                    bail!(
+                        "SRT output '{}': video_encode is incompatible with transport_mode 'audio_302m'",
+                        srt.id
+                    );
+                }
+                if srt.redundancy.is_some() {
+                    bail!(
+                        "SRT output '{}': video_encode is not yet supported with SMPTE 2022-7 redundancy",
+                        srt.id
+                    );
+                }
+                if srt.packet_filter.is_some() {
+                    bail!(
+                        "SRT output '{}': video_encode is not yet supported with SRT FEC (packet_filter)",
+                        srt.id
+                    );
+                }
+                validate_video_encode(enc, &format!("SRT output '{}'", srt.id))?;
             }
         }
         OutputConfig::Rtmp(rtmp) => {
@@ -2045,6 +2226,8 @@ mod tests {
             redundancy: None,
             program_number: None,
             delay: None,
+            audio_encode: None,
+            video_encode: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -2269,6 +2452,8 @@ mod tests {
             redundancy: None,
             program_number: None,
             delay: None,
+            audio_encode: None,
+            video_encode: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -2318,6 +2503,8 @@ mod tests {
             redundancy: None,
             program_number: None,
             delay: None,
+            audio_encode: None,
+            video_encode: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -2384,6 +2571,8 @@ mod tests {
             redundancy: None,
             program_number: None,
             delay: None,
+            audio_encode: None,
+            video_encode: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -2433,6 +2622,8 @@ mod tests {
             redundancy: None,
             program_number: None,
             delay: None,
+            audio_encode: None,
+            video_encode: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -2482,6 +2673,8 @@ mod tests {
             redundancy: None,
             program_number: None,
             delay: None,
+            audio_encode: None,
+            video_encode: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),

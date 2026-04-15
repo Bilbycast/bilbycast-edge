@@ -67,6 +67,13 @@ pub fn spawn_rtmp_output(
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
 
+    output_stats.set_egress_static(crate::stats::collector::EgressMediaSummaryStatic {
+        transport_mode: Some("flv".to_string()),
+        video_passthrough: true, // RTMP video is always passthrough today
+        audio_passthrough: config.audio_encode.is_none(),
+        audio_only: false,
+    });
+
     tokio::spawn(async move {
         tracing::info!(
             "RTMP output '{}' started -> {}",

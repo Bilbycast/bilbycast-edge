@@ -46,6 +46,8 @@ pub mod ts_demux;
 pub mod ts_parse;
 pub mod ts_continuity_fixer;
 pub mod ts_program_filter;
+pub mod ts_audio_replace;
+pub mod ts_video_replace;
 #[cfg(feature = "webrtc")]
 pub mod webrtc;
 

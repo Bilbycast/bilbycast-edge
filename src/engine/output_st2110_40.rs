@@ -23,6 +23,14 @@ pub fn spawn_st2110_40_output(
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
     let id = config.id.clone();
+
+    output_stats.set_egress_static(crate::stats::collector::EgressMediaSummaryStatic {
+        transport_mode: Some("st2110-40".to_string()),
+        video_passthrough: false,
+        audio_passthrough: false,
+        audio_only: false,
+    });
+
     tokio::spawn(async move {
         if let Err(e) = run_st2110_anc_output(config, &mut rx, output_stats, cancel).await {
             tracing::error!("ST 2110-40 output '{id}' exited with error: {e}");

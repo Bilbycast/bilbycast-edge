@@ -36,6 +36,11 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
   depth / channel routing), the `rtp_audio` no-PTP variant, and SMPTE
   302M LPCM-in-MPEG-TS over SRT / UDP / RTP-MP2T (`transport_mode:
   "audio_302m"`).
+- **Transcoding (`audio_encode` + `video_encode`)** — see
+  [`transcoding.md`](transcoding.md) for the per-output support matrix,
+  the licence-gated `video-encoder-*` Cargo features (x264, x265,
+  NVENC), Linux build instructions, and the running list of Phase 4
+  deferred items.
 - [MPTS → SPTS filtering](#mpts--spts-filtering)
 - [SMPTE 2022-1 FEC Configuration](#smpte-2022-1-fec-configuration)
 - [SMPTE 2022-7 SRT Redundancy](#smpte-2022-7-srt-redundancy)

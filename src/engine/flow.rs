@@ -250,9 +250,12 @@ impl FlowRuntime {
         // Populate input config metadata for topology display from the
         // currently active input. When there is no active input, we leave
         // the stats meta empty and the UI shows "idle".
+        //
+        // Uses the same setter the switch path calls so the UI sees fresh
+        // `input_type` + `InputConfigMeta` after every `switch_active_input`.
         if let Some(input) = active_input_cfg {
             let input_meta = build_input_config_meta(input);
-            let _ = flow_stats.input_config_meta.set(input_meta);
+            flow_stats.update_active_input_meta(input_type, input_meta);
         }
 
         // Populate output config metadata (all outputs, active or passive —
@@ -751,6 +754,34 @@ impl FlowRuntime {
             .send(new_input_id.to_string())
             .map_err(|_| anyhow::anyhow!("active_input watch channel closed"))?;
         self.stats.set_active_input_id(new_input_id);
+
+        // Refresh the header fields that the snapshot emits (input_type,
+        // mode, addresses). Without this the manager UI keeps showing the
+        // first-activated input's transport and address after a switch —
+        // only the active_input_id badge would flip, not the header text.
+        if let Some(new_def) = self
+            .config
+            .inputs
+            .iter()
+            .find(|d| d.id == new_input_id)
+        {
+            let new_input_type = match &new_def.config {
+                InputConfig::Rtp(_) => "rtp",
+                InputConfig::Udp(_) => "udp",
+                InputConfig::Srt(_) => "srt",
+                InputConfig::Rtmp(_) => "rtmp",
+                InputConfig::Rtsp(_) => "rtsp",
+                InputConfig::Webrtc(_) => "webrtc",
+                InputConfig::Whep(_) => "whep",
+                InputConfig::St2110_30(_) => "st2110_30",
+                InputConfig::St2110_31(_) => "st2110_31",
+                InputConfig::St2110_40(_) => "st2110_40",
+                InputConfig::RtpAudio(_) => "rtp_audio",
+            };
+            let new_meta = build_input_config_meta(&new_def.config);
+            self.stats.update_active_input_meta(new_input_type, new_meta);
+        }
+
         tracing::info!(
             "Flow '{}': switched active input to '{}'",
             self.config.config.id,

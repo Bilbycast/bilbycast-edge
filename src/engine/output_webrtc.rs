@@ -65,6 +65,13 @@ pub fn spawn_webrtc_output(
 ) -> JoinHandle<()> {
     let rx = broadcast_tx.subscribe();
 
+    output_stats.set_egress_static(crate::stats::collector::EgressMediaSummaryStatic {
+        transport_mode: Some("webrtc".to_string()),
+        video_passthrough: true,
+        audio_passthrough: config.audio_encode.is_none(),
+        audio_only: false,
+    });
+
     #[cfg(feature = "webrtc")]
     {
         use crate::config::models::WebrtcOutputMode;

@@ -46,6 +46,20 @@ pub fn spawn_rtp_audio_output(
     let id = config.id.clone();
     let flow_id = flow_id.to_string();
 
+    output_stats.set_egress_static(crate::stats::collector::EgressMediaSummaryStatic {
+        transport_mode: Some(
+            if matches!(config.transport_mode.as_deref(), Some("audio_302m")) {
+                "audio_302m".to_string()
+            } else {
+                "rtp".to_string()
+            },
+        ),
+        video_passthrough: false,
+        audio_passthrough: config.transcode.is_none()
+            && !matches!(config.transport_mode.as_deref(), Some("audio_302m")),
+        audio_only: true,
+    });
+
     // Branch on transport_mode. The 302M path runs its own dedicated loop;
     // the default path delegates to the existing ST 2110 audio runtime
     // (which already supports the standard `transcode` block).

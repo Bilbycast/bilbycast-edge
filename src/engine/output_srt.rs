@@ -25,7 +25,9 @@ use super::audio_302m::{S302mOutputPipeline, SRT_TS_DATAGRAM_BYTES};
 use super::audio_transcode::InputFormat;
 use super::delay_buffer::resolve_output_delay;
 use super::packet::RtpPacket;
+use super::ts_audio_replace::TsAudioReplacer;
 use super::ts_program_filter::TsProgramFilter;
+use super::ts_video_replace::TsVideoReplacer;
 
 /// Maximum SRT live-mode payload bytes per `srt_sendmsg` call.
 ///
@@ -85,6 +87,24 @@ pub fn spawn_srt_output(
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
 ) -> JoinHandle<()> {
     let broadcast_tx = broadcast_tx.clone();
+
+    // Register the static portion of this output's egress media summary so
+    // the manager UI can render the pipeline / format badges from the very
+    // first stats snapshot. Audio-passthrough is `true` only when no
+    // `audio_encode` block is present; video-passthrough mirrors `video_encode`.
+    output_stats.set_egress_static(crate::stats::collector::EgressMediaSummaryStatic {
+        transport_mode: Some(
+            if matches!(config.transport_mode.as_deref(), Some("audio_302m")) {
+                "audio_302m".to_string()
+            } else {
+                "ts".to_string()
+            },
+        ),
+        video_passthrough: config.video_encode.is_none(),
+        audio_passthrough: config.audio_encode.is_none()
+            && !matches!(config.transport_mode.as_deref(), Some("audio_302m")),
+        audio_only: matches!(config.transport_mode.as_deref(), Some("audio_302m")),
+    });
 
     tokio::spawn(async move {
         let result = if config.redundancy.is_some() {
@@ -149,6 +169,8 @@ async fn srt_output_listener_loop(
         );
         TsProgramFilter::new(n)
     });
+    let mut audio_replacer = build_audio_replacer(config);
+    let mut video_replacer = build_video_replacer(config, &stats);
 
     loop {
         let socket = match accept_srt_connection(&mut listener, &cancel).await {
@@ -244,7 +266,7 @@ async fn srt_output_listener_loop(
         let poller_cancel = cancel.child_token();
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
 
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &socket, &mut program_filter, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &socket, &mut program_filter, &mut audio_replacer, &mut video_replacer, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -288,6 +310,8 @@ async fn srt_output_caller_loop(
         );
         TsProgramFilter::new(n)
     });
+    let mut audio_replacer = build_audio_replacer(config);
+    let mut video_replacer = build_video_replacer(config, &stats);
     loop {
         let socket = match connect_srt_output(config, &cancel).await {
             Ok(s) => s,
@@ -319,7 +343,7 @@ async fn srt_output_caller_loop(
         let poller_cancel = cancel.child_token();
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
 
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &socket, &mut program_filter, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &socket, &mut program_filter, &mut audio_replacer, &mut video_replacer, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -352,6 +376,81 @@ async fn srt_output_caller_loop(
 ///
 /// `program_filter` is owned by the caller so its PAT/PMT state survives
 /// reconnects.
+/// Resolve an `audio_encode` config into a [`TsAudioReplacer`]. Logs and
+/// returns `None` when the codec isn't supported by this build.
+fn build_audio_replacer(config: &SrtOutputConfig) -> Option<TsAudioReplacer> {
+    let enc = config.audio_encode.as_ref()?;
+    match TsAudioReplacer::new(enc) {
+        Ok(r) => {
+            tracing::info!(
+                "SRT output '{}': audio_encode active ({})",
+                config.id,
+                r.target_description()
+            );
+            Some(r)
+        }
+        Err(e) => {
+            tracing::error!(
+                "SRT output '{}': audio_encode rejected: {e}; audio will be left untouched",
+                config.id
+            );
+            None
+        }
+    }
+}
+
+/// Resolve the `video_encode` config into a [`TsVideoReplacer`] and register
+/// its atomic stats handle on the output's accumulator. The descriptors
+/// (codec / width / height / fps / bitrate) come from the config — the actual
+/// runtime values may differ on first-frame discovery (see
+/// [`TsVideoReplacer`] MVP scope).
+fn build_video_replacer(
+    config: &SrtOutputConfig,
+    stats: &OutputStatsAccumulator,
+) -> Option<TsVideoReplacer> {
+    let enc = config.video_encode.as_ref()?;
+    match TsVideoReplacer::new(enc) {
+        Ok(r) => {
+            let backend = match enc.codec.as_str() {
+                "x264" | "x265" => enc.codec.clone(),
+                "h264_nvenc" | "hevc_nvenc" => "nvenc".to_string(),
+                other => other.to_string(),
+            };
+            let target_codec = match enc.codec.as_str() {
+                "x264" | "h264_nvenc" => "h264",
+                "x265" | "hevc_nvenc" => "hevc",
+                other => other,
+            };
+            stats.set_video_encode_stats(
+                r.stats_handle(),
+                String::new(),
+                target_codec.to_string(),
+                enc.width.unwrap_or(0),
+                enc.height.unwrap_or(0),
+                match (enc.fps_num, enc.fps_den) {
+                    (Some(n), Some(d)) if d > 0 => n as f32 / d as f32,
+                    _ => 0.0,
+                },
+                enc.bitrate_kbps.unwrap_or(0),
+                backend,
+            );
+            tracing::info!(
+                "SRT output '{}': video_encode active ({})",
+                config.id,
+                r.target_description()
+            );
+            Some(r)
+        }
+        Err(e) => {
+            tracing::error!(
+                "SRT output '{}': video_encode rejected: {e}; video will be left untouched",
+                config.id
+            );
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn srt_output_forward_loop(
     config: &SrtOutputConfig,
@@ -360,6 +459,8 @@ async fn srt_output_forward_loop(
     cancel: &CancellationToken,
     socket: &Arc<SrtSocket>,
     program_filter: &mut Option<TsProgramFilter>,
+    audio_replacer: &mut Option<TsAudioReplacer>,
+    video_replacer: &mut Option<TsVideoReplacer>,
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
@@ -593,6 +694,52 @@ async fn srt_output_forward_loop(
                             }
                         } else {
                             packet.data
+                        };
+
+                        // Apply audio ES replacement + video ES replacement
+                        // if configured. Each replacer owns its own TS state
+                        // and only touches its own elementary stream, so
+                        // stacking them is safe. Validation guarantees these
+                        // are not combined with redundancy, FEC, or 302M.
+                        let need_strip = audio_replacer.is_some() || video_replacer.is_some();
+                        let payload = if need_strip {
+                            const RTP_HEADER_MIN: usize = 12;
+                            let ts_in: &[u8] = if packet.is_raw_ts {
+                                &payload[..]
+                            } else if payload.len() > RTP_HEADER_MIN {
+                                &payload[RTP_HEADER_MIN..]
+                            } else {
+                                continue;
+                            };
+
+                            let mut a_out: Vec<u8> = Vec::new();
+                            let after_audio: &[u8] =
+                                if let Some(replacer) = audio_replacer.as_mut() {
+                                    tokio::task::block_in_place(|| {
+                                        replacer.process(ts_in, &mut a_out);
+                                    });
+                                    &a_out
+                                } else {
+                                    ts_in
+                                };
+
+                            let mut v_out: Vec<u8> = Vec::new();
+                            let final_bytes: &[u8] =
+                                if let Some(vreplacer) = video_replacer.as_mut() {
+                                    tokio::task::block_in_place(|| {
+                                        vreplacer.process(after_audio, &mut v_out);
+                                    });
+                                    &v_out
+                                } else {
+                                    after_audio
+                                };
+
+                            if final_bytes.is_empty() {
+                                continue;
+                            }
+                            Bytes::copy_from_slice(final_bytes)
+                        } else {
+                            payload
                         };
 
                         if let Some(ref mut db) = delay_buf {

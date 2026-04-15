@@ -817,6 +817,22 @@ fn edge_capabilities() -> Vec<&'static str> {
     if cfg!(feature = "ptp-internal") {
         caps.push("ptp-internal");
     }
+    if cfg!(any(
+        feature = "video-encoder-x264",
+        feature = "video-encoder-x265",
+        feature = "video-encoder-nvenc"
+    )) {
+        caps.push("video-encode");
+    }
+    if cfg!(feature = "video-encoder-x264") {
+        caps.push("video-encoder-x264");
+    }
+    if cfg!(feature = "video-encoder-x265") {
+        caps.push("video-encoder-x265");
+    }
+    if cfg!(feature = "video-encoder-nvenc") {
+        caps.push("video-encoder-nvenc");
+    }
     caps
 }
 

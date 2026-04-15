@@ -49,6 +49,16 @@ pub struct OutputStatsAccumulator {
     /// resolved target codec descriptors. Set once at output startup by
     /// outputs that spawn an `engine::audio_encode::AudioEncoder`.
     audio_encode_stats: OnceLock<AudioEncodeStatsHandle>,
+    /// Optional handle to the per-output video encode counters plus the
+    /// resolved target codec / geometry descriptors. Set once at output
+    /// startup by outputs that build an
+    /// `engine::ts_video_replace::TsVideoReplacer`.
+    video_encode_stats: OnceLock<VideoEncodeStatsHandle>,
+    /// Optional snapshot-time descriptors used to build
+    /// [`crate::stats::models::EgressMediaSummary`]. Set once at output
+    /// startup with everything that doesn't change at runtime — the dynamic
+    /// passthrough fields are merged in at `FlowStatsAccumulator::snapshot()`.
+    egress_static: OnceLock<EgressMediaSummaryStatic>,
 
     // ── End-to-end latency tracking ──────────────────────────────────
     // Windowed min/avg/max, reset on each snapshot (1s).
@@ -78,6 +88,41 @@ pub struct AudioEncodeStatsHandle {
     pub target_bitrate_kbps: u32,
 }
 
+/// Registered handle to a per-output video encode stage's counters plus the
+/// resolved target codec / geometry descriptors. The atomic counters live in
+/// `crate::engine::ts_video_replace::VideoEncodeStats`; everything else is
+/// fixed at output startup.
+pub struct VideoEncodeStatsHandle {
+    pub stats: Arc<crate::engine::ts_video_replace::VideoEncodeStats>,
+    pub input_codec: String,
+    pub output_codec: String,
+    pub output_width: u32,
+    pub output_height: u32,
+    pub output_fps: f32,
+    pub output_bitrate_kbps: u32,
+    pub encoder_backend: String,
+}
+
+/// Static (set-once-at-output-startup) descriptors used to build the egress
+/// media summary in the per-flow snapshot path. Anything that depends on live
+/// stats (encode bitrate, decode codec, etc.) is layered in by the snapshot
+/// path itself, so this struct only carries values that don't change while
+/// the output is running.
+#[derive(Debug, Clone, Default)]
+pub struct EgressMediaSummaryStatic {
+    /// `"ts"`, `"rtp"`, `"audio_302m"`, `"st2110-30"`, `"st2110-31"`,
+    /// `"st2110-40"`, `"flv"`, `"hls"`, `"webrtc"`.
+    pub transport_mode: Option<String>,
+    /// `true` when the output forwards the input video unchanged (no
+    /// `video_encode` block, no decode-and-remux).
+    pub video_passthrough: bool,
+    /// `true` when the output forwards the input audio unchanged (no
+    /// `audio_encode`, no `audio_decode`, no PCM `transcode`).
+    pub audio_passthrough: bool,
+    /// `true` when this output produces no video essence (audio-only outputs).
+    pub audio_only: bool,
+}
+
 impl OutputStatsAccumulator {
     /// Create a new accumulator with all counters initialised to zero.
     pub fn new(output_id: String, output_name: String, output_type: String) -> Self {
@@ -95,6 +140,8 @@ impl OutputStatsAccumulator {
             transcode_stats: OnceLock::new(),
             audio_decode_stats: OnceLock::new(),
             audio_encode_stats: OnceLock::new(),
+            video_encode_stats: OnceLock::new(),
+            egress_static: OnceLock::new(),
             latency_min_us: AtomicU64::new(u64::MAX),
             latency_max_us: AtomicU64::new(0),
             latency_sum_us: AtomicU64::new(0),
@@ -148,6 +195,49 @@ impl OutputStatsAccumulator {
             target_bitrate_kbps,
         });
     }
+
+    /// Register the per-output video encode stats handle. Called once at
+    /// output startup by outputs that build a
+    /// [`crate::engine::ts_video_replace::TsVideoReplacer`]. Subsequent calls
+    /// are no-ops (first wins).
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_video_encode_stats(
+        &self,
+        stats: Arc<crate::engine::ts_video_replace::VideoEncodeStats>,
+        input_codec: impl Into<String>,
+        output_codec: impl Into<String>,
+        output_width: u32,
+        output_height: u32,
+        output_fps: f32,
+        output_bitrate_kbps: u32,
+        encoder_backend: impl Into<String>,
+    ) {
+        let _ = self.video_encode_stats.set(VideoEncodeStatsHandle {
+            stats,
+            input_codec: input_codec.into(),
+            output_codec: output_codec.into(),
+            output_width,
+            output_height,
+            output_fps,
+            output_bitrate_kbps,
+            encoder_backend: encoder_backend.into(),
+        });
+    }
+
+    /// Register the static portion of this output's egress media summary.
+    /// Called once at output startup with values that don't change at
+    /// runtime; the dynamic codec/format fields are merged in at snapshot
+    /// time by [`FlowStatsAccumulator::snapshot`].
+    pub fn set_egress_static(&self, descriptor: EgressMediaSummaryStatic) {
+        let _ = self.egress_static.set(descriptor);
+    }
+
+    /// Borrow the static egress descriptor (used by the per-flow snapshot
+    /// path to build [`crate::stats::models::EgressMediaSummary`]).
+    pub fn egress_static(&self) -> Option<&EgressMediaSummaryStatic> {
+        self.egress_static.get()
+    }
+
 
     /// Record an end-to-end latency sample. Called on the hot path after
     /// each successful output send. `recv_time_us` is the monotonic receive
@@ -226,6 +316,22 @@ impl OutputStatsAccumulator {
                 target_bitrate_kbps: h.target_bitrate_kbps,
             }
         });
+        let video_encode_stats = self.video_encode_stats.get().map(|h| {
+            crate::stats::models::VideoEncodeStatsSnapshot {
+                input_frames: h.stats.input_frames.load(Ordering::Relaxed),
+                output_frames: h.stats.output_frames.load(Ordering::Relaxed),
+                dropped_frames: h.stats.dropped_frames.load(Ordering::Relaxed),
+                input_codec: h.input_codec.clone(),
+                output_codec: h.output_codec.clone(),
+                output_width: h.output_width,
+                output_height: h.output_height,
+                output_fps: h.output_fps,
+                output_bitrate_kbps: h.output_bitrate_kbps,
+                encoder_backend: h.encoder_backend.clone(),
+                last_latency_us: h.stats.last_latency_us.load(Ordering::Relaxed),
+                supervisor_restarts: h.stats.supervisor_restarts.load(Ordering::Relaxed),
+            }
+        });
 
         // Swap latency window and compute min/avg/max.
         let lat_count = self.latency_count.swap(0, Ordering::Relaxed);
@@ -271,7 +377,13 @@ impl OutputStatsAccumulator {
             transcode_stats,
             audio_decode_stats,
             audio_encode_stats,
+            video_encode_stats,
             latency,
+            // Filled in by `FlowStatsAccumulator::snapshot()` so it can merge
+            // the flow's input MediaAnalysis with this output's per-stage
+            // stats. Leaving as None here keeps the per-output snapshot
+            // self-contained.
+            egress_summary: None,
         }
     }
 }
@@ -810,7 +922,10 @@ impl ThumbnailAccumulator {
 pub struct FlowStatsAccumulator {
     pub flow_id: String,
     pub flow_name: String,
-    pub input_type: String,
+    /// Active input's transport type (e.g. `"srt"`, `"rtp"`). Stored behind
+    /// an `RwLock` so it can be rewritten when the active input switches —
+    /// the snapshot path reads it into `InputStats.input_type`.
+    pub input_type: std::sync::RwLock<String>,
     pub started_at: Instant,
     // Input counters
     pub input_packets: AtomicU64,
@@ -832,8 +947,12 @@ pub struct FlowStatsAccumulator {
     /// a multi-input flow gets its own thumbnail generator subscribing to
     /// the input's dedicated broadcast channel (not the flow's main channel).
     pub per_input_thumbnails: DashMap<String, Arc<ThumbnailAccumulator>>,
-    /// Input config metadata for topology display (set once at flow start).
-    pub input_config_meta: OnceLock<InputConfigMeta>,
+    /// Input config metadata for the currently active input (topology /
+    /// header display). Rewritten by `update_active_input_meta` on every
+    /// `FlowRuntime::switch_active_input` call so the snapshot reflects the
+    /// live input's `mode` / address fields, not the input that happened to
+    /// be active at flow start.
+    pub input_config_meta: std::sync::RwLock<Option<InputConfigMeta>>,
     /// Per-output config metadata for topology display (set once per output).
     pub output_config_meta: DashMap<String, OutputConfigMeta>,
     /// Cached SRT stats for primary input leg, updated by the SRT input polling task
@@ -902,7 +1021,7 @@ impl FlowStatsAccumulator {
         Self {
             flow_id,
             flow_name,
-            input_type,
+            input_type: std::sync::RwLock::new(input_type),
             started_at: Instant::now(),
             input_packets: AtomicU64::new(0),
             input_bytes: AtomicU64::new(0),
@@ -916,7 +1035,7 @@ impl FlowStatsAccumulator {
             media_analysis: OnceLock::new(),
             thumbnail: OnceLock::new(),
             per_input_thumbnails: DashMap::new(),
-            input_config_meta: OnceLock::new(),
+            input_config_meta: std::sync::RwLock::new(None),
             output_config_meta: DashMap::new(),
             input_srt_stats_cache: Arc::new(watch::channel(None).0),
             input_srt_leg2_stats_cache: Arc::new(watch::channel(None).0),
@@ -935,6 +1054,20 @@ impl FlowStatsAccumulator {
     pub fn set_active_input_id(&self, id: &str) {
         if let Ok(mut guard) = self.active_input_id.write() {
             *guard = id.to_string();
+        }
+    }
+
+    /// Replace the header fields (`input_type` + `InputConfigMeta`) that the
+    /// snapshot path reports to the manager. Called once at flow start and
+    /// again on every `switch_active_input` so the UI sees the *live* input's
+    /// transport / mode / address rather than the one that happened to be
+    /// active when the flow was first registered.
+    pub fn update_active_input_meta(&self, input_type: &str, meta: InputConfigMeta) {
+        if let Ok(mut g) = self.input_type.write() {
+            *g = input_type.to_string();
+        }
+        if let Ok(mut g) = self.input_config_meta.write() {
+            *g = Some(meta);
         }
     }
 
@@ -1017,6 +1150,26 @@ impl FlowStatsAccumulator {
             }
         }
 
+        // Build per-output EgressMediaSummary. Combines the static descriptors
+        // each output registered at startup with its live encode/decode/transcode
+        // stats and the cached input MediaAnalysis. Zero new CPU on the data
+        // plane — every field is read from values already computed elsewhere.
+        for out in &mut outputs {
+            let acc = match self.output_stats.get(&out.output_id) {
+                Some(a) => a.value().clone(),
+                None => continue,
+            };
+            out.egress_summary = build_egress_summary(
+                acc.as_ref(),
+                out.program_number,
+                media_analysis.as_ref(),
+                out.transcode_stats.as_ref(),
+                out.audio_decode_stats.as_ref(),
+                out.audio_encode_stats.as_ref(),
+                out.video_encode_stats.as_ref(),
+            );
+        }
+
         // Derive flow health (RP 2129 M6)
         let packets_lost = self.input_loss.load(Ordering::Relaxed);
         let bw_exceeded = self.bandwidth_exceeded.load(Ordering::Relaxed);
@@ -1034,9 +1187,15 @@ impl FlowStatsAccumulator {
             state: FlowState::Running,
             active_input_id,
             input: {
-                let meta = self.input_config_meta.get();
+                let input_type = self
+                    .input_type
+                    .read()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                let meta_guard = self.input_config_meta.read().ok();
+                let meta = meta_guard.as_ref().and_then(|g| g.as_ref());
                 InputStats {
-                    input_type: self.input_type.clone(),
+                    input_type,
                     state: derive_input_state(input_bitrate, self.input_packets.load(Ordering::Relaxed)),
                     mode: meta.and_then(|m| m.mode.clone()),
                     local_addr: meta.and_then(|m| m.local_addr.clone()),
@@ -1125,6 +1284,145 @@ fn red_blue_to_stats(
         },
         leg_switches: snap.leg_switches,
     }
+}
+
+/// Build the per-output egress media summary at snapshot time.
+///
+/// Combines the static descriptors registered when the output started
+/// (`EgressMediaSummaryStatic`) with this output's live encode/decode/transcode
+/// stats and the cached input `MediaAnalysisStats`. Returns `None` only when
+/// the output didn't register a static descriptor — in that case the manager
+/// UI degrades to its previous behaviour.
+fn build_egress_summary(
+    acc: &OutputStatsAccumulator,
+    program_number: Option<u16>,
+    media_analysis: Option<&crate::stats::models::MediaAnalysisStats>,
+    transcode: Option<&crate::stats::models::TranscodeStatsSnapshot>,
+    audio_decode: Option<&crate::stats::models::DecodeStatsSnapshot>,
+    audio_encode: Option<&crate::stats::models::EncodeStatsSnapshot>,
+    video_encode: Option<&crate::stats::models::VideoEncodeStatsSnapshot>,
+) -> Option<crate::stats::models::EgressMediaSummary> {
+    let stat_desc = acc.egress_static()?;
+
+    let mut summary = crate::stats::models::EgressMediaSummary {
+        transport_mode: stat_desc.transport_mode.clone(),
+        program_number,
+        ..Default::default()
+    };
+
+    // Pick the source video / audio descriptor from the input MediaAnalysis.
+    // If a `program_number` is set, prefer that program's streams; otherwise
+    // fall back to the flat union (which is the lowest-program-number default).
+    let (src_video, src_audio) = if let Some(ma) = media_analysis {
+        let prog = program_number.and_then(|pn| ma.programs.iter().find(|p| p.program_number == pn));
+        let v = prog
+            .and_then(|p| p.video_streams.first())
+            .or_else(|| ma.video_streams.first());
+        let a = prog
+            .and_then(|p| p.audio_streams.first())
+            .or_else(|| ma.audio_streams.first());
+        (v, a)
+    } else {
+        (None, None)
+    };
+
+    // ── Pipeline tags (ordered) ───────────────────────────────────────────
+    if program_number.is_some() {
+        summary.pipeline.push("program_filter".to_string());
+    }
+    if audio_decode.is_some() {
+        summary.pipeline.push("audio_decode".to_string());
+    }
+    if transcode.is_some() {
+        summary.pipeline.push("audio_transcode_pcm".to_string());
+    }
+    if audio_encode.is_some() {
+        summary.pipeline.push("audio_encode".to_string());
+    }
+    if video_encode.is_some() {
+        summary.pipeline.push("video_encode".to_string());
+    }
+    if stat_desc
+        .transport_mode
+        .as_deref()
+        .map(|t| t == "audio_302m")
+        .unwrap_or(false)
+    {
+        summary.pipeline.push("audio_302m".to_string());
+    }
+    if summary.pipeline.is_empty() && (stat_desc.audio_passthrough || stat_desc.video_passthrough) {
+        summary.pipeline.push("passthrough".to_string());
+    }
+
+    // ── Video fields ──────────────────────────────────────────────────────
+    if !stat_desc.audio_only {
+        if let Some(ve) = video_encode {
+            summary.video_codec = Some(ve.output_codec.clone());
+            if ve.output_width > 0 && ve.output_height > 0 {
+                summary.video_resolution =
+                    Some(format!("{}x{}", ve.output_width, ve.output_height));
+            } else if let Some(v) = src_video {
+                summary.video_resolution = v.resolution.clone();
+            }
+            if ve.output_fps > 0.0 {
+                summary.video_fps = Some(ve.output_fps);
+            } else if let Some(v) = src_video {
+                summary.video_fps = v.frame_rate.map(|f| f as f32);
+            }
+            if ve.output_bitrate_kbps > 0 {
+                summary.video_bitrate_kbps = Some(ve.output_bitrate_kbps);
+            }
+        } else if stat_desc.video_passthrough {
+            if let Some(v) = src_video {
+                summary.video_codec = Some(v.codec.clone());
+                summary.video_resolution = v.resolution.clone();
+                summary.video_fps = v.frame_rate.map(|f| f as f32);
+                if v.bitrate_bps > 0 {
+                    summary.video_bitrate_kbps = Some((v.bitrate_bps / 1000) as u32);
+                }
+            }
+        }
+    }
+
+    // ── Audio fields ──────────────────────────────────────────────────────
+    if let Some(ae) = audio_encode {
+        summary.audio_codec = Some(ae.output_codec.clone());
+        if ae.target_sample_rate_hz > 0 {
+            summary.audio_sample_rate_hz = Some(ae.target_sample_rate_hz);
+        }
+        if ae.target_channels > 0 {
+            summary.audio_channels = Some(ae.target_channels);
+        }
+        if ae.target_bitrate_kbps > 0 {
+            summary.audio_bitrate_kbps = Some(ae.target_bitrate_kbps);
+        }
+    } else if let Some(ts) = transcode {
+        // PCM transcode (no codec change) — describe the PCM output we know
+        // about. The transcode block doesn't carry SR/channels, so fall back
+        // to whatever the audio_decode handle reports.
+        let _ = ts;
+        if let Some(ad) = audio_decode {
+            summary.audio_codec = Some("pcm".to_string());
+            summary.audio_sample_rate_hz = Some(ad.output_sample_rate_hz);
+            summary.audio_channels = Some(ad.output_channels);
+        }
+    } else if let Some(ad) = audio_decode {
+        // Decode-only (no re-encode) — output is PCM at the decoded format.
+        summary.audio_codec = Some("pcm".to_string());
+        summary.audio_sample_rate_hz = Some(ad.output_sample_rate_hz);
+        summary.audio_channels = Some(ad.output_channels);
+    } else if stat_desc.audio_passthrough {
+        if let Some(a) = src_audio {
+            summary.audio_codec = Some(a.codec.clone());
+            summary.audio_sample_rate_hz = a.sample_rate_hz;
+            summary.audio_channels = a.channels;
+            if a.bitrate_bps > 0 {
+                summary.audio_bitrate_kbps = Some((a.bitrate_bps / 1000) as u32);
+            }
+        }
+    }
+
+    Some(summary)
 }
 
 /// Derive input connection state from counters.

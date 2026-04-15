@@ -959,6 +959,24 @@ pub struct RtpOutputConfig {
     /// See [`OutputDelay`] for the available modes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay: Option<OutputDelay>,
+    /// Optional audio encode block. When set, the output runs its incoming
+    /// MPEG-TS through a streaming audio-ES replacer: the source AAC-LC
+    /// audio is decoded, re-encoded into the configured codec, and muxed
+    /// back into the output TS (PMT is rewritten with the new stream_type).
+    /// Video and other elementary streams pass through untouched. RTP
+    /// carries TS, so every codec supported by the in-process encoder is
+    /// valid here (`aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`;
+    /// `opus` is rejected because there is no standard TS mapping).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional video encode block. When set, the output decodes the
+    /// incoming H.264 / HEVC video elementary stream, optionally
+    /// re-scales, re-encodes via the configured backend, and muxes the
+    /// resulting bitstream back into the output TS. Availability of each
+    /// backend depends on the Cargo features enabled at build time
+    /// (`video-encoder-x264`, `video-encoder-x265`, `video-encoder-nvenc`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode: Option<VideoEncodeConfig>,
 }
 
 /// Configurable output delay for stream synchronization.
@@ -1054,6 +1072,15 @@ pub struct UdpOutputConfig {
     /// Incompatible with `transport_mode: "audio_302m"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay: Option<OutputDelay>,
+    /// Optional audio encode block. See [`RtpOutputConfig::audio_encode`]
+    /// for the semantics. Incompatible with `transport_mode = "audio_302m"`
+    /// (the 302M path already owns the TS stream and carries no video).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional video encode block. See [`RtpOutputConfig::video_encode`]
+    /// for the semantics. Incompatible with `transport_mode = "audio_302m"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode: Option<VideoEncodeConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1190,6 +1217,15 @@ pub struct SrtOutputConfig {
     /// Incompatible with `transport_mode: "audio_302m"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay: Option<OutputDelay>,
+    /// Optional audio encode block. See [`RtpOutputConfig::audio_encode`]
+    /// for the semantics. Incompatible with `transport_mode = "audio_302m"`
+    /// (the 302M path already owns the TS stream and carries no video).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional video encode block. See [`RtpOutputConfig::video_encode`]
+    /// for the semantics. Incompatible with `transport_mode = "audio_302m"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode: Option<VideoEncodeConfig>,
 }
 
 /// SRT connection mode, determining which side initiates the handshake.
@@ -1533,6 +1569,60 @@ pub struct WebrtcOutputConfig {
     /// the output is video-only by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_encode: Option<AudioEncodeConfig>,
+}
+
+/// Video encoder configuration block. Used by SRT, UDP, and RTP outputs
+/// (as `video_encode`) to enable end-to-end video transcoding inside the
+/// MPEG-TS stream: the output decodes the source H.264/HEVC elementary
+/// stream, rescales (when `width` / `height` change), re-encodes via
+/// `video-engine::VideoEncoder`, and re-muxes the resulting bitstream
+/// back into the output TS with a fresh PMT (if the target codec
+/// differs from the source).
+///
+/// The valid backend set depends on which Cargo features were enabled at
+/// build time:
+/// - `video-encoder-x264` → `x264` (GPL v2+).
+/// - `video-encoder-x265` → `x265` (GPL v2+).
+/// - `video-encoder-nvenc` → `h264_nvenc` / `hevc_nvenc`.
+///
+/// Validation in `config::validation` enforces field bounds at config
+/// load time. Unavailable backends are surfaced as a runtime error when
+/// the output starts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VideoEncodeConfig {
+    /// Encoder backend. One of: `x264`, `x265`, `h264_nvenc`, `hevc_nvenc`.
+    pub codec: String,
+    /// Output width in pixels. When unset, the encoder uses the source
+    /// resolution. Range: 64–7680.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// Output height in pixels. When unset, uses the source resolution.
+    /// Range: 64–4320.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// Output frame-rate numerator (e.g. 30000 for 29.97 fps). Defaults
+    /// to the source frame rate detected from the input stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps_num: Option<u32>,
+    /// Output frame-rate denominator (e.g. 1001 for 29.97 fps).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps_den: Option<u32>,
+    /// Target average bitrate in kbps. Range: 100–100_000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate_kbps: Option<u32>,
+    /// Keyframe interval (GOP size) in frames. Defaults to 2× the frame
+    /// rate (two-second GOPs). Range: 1–600.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gop_size: Option<u32>,
+    /// Speed/quality preset. One of: `ultrafast`, `superfast`, `veryfast`,
+    /// `faster`, `fast`, `medium`, `slow`, `slower`, `veryslow`. Default:
+    /// `medium`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// H.264/HEVC profile target. One of: `baseline`, `main`, `high`.
+    /// When unset, the encoder chooses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// Audio encoder configuration block. Used by RTMP, HLS, and WebRTC
@@ -1987,6 +2077,8 @@ mod tests {
                 redundancy: None,
                 program_number: None,
                 delay: None,
+                audio_encode: None,
+                video_encode: None,
             })],
             flows: vec![FlowConfig {
                 id: "test-flow".to_string(),
@@ -2038,6 +2130,8 @@ mod tests {
                 redundancy: None,
                 program_number: None,
                 delay: None,
+                audio_encode: None,
+                video_encode: None,
             })],
             flows: vec![FlowConfig {
                 id: "flow-1".to_string(),

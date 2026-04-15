@@ -56,6 +56,13 @@ pub fn spawn_hls_output(
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
 
+    output_stats.set_egress_static(crate::stats::collector::EgressMediaSummaryStatic {
+        transport_mode: Some("hls".to_string()),
+        video_passthrough: true,
+        audio_passthrough: config.audio_encode.is_none(),
+        audio_only: false,
+    });
+
     tokio::spawn(async move {
         if let Err(e) = hls_output_loop(&config, &mut rx, output_stats, cancel, &event_sender, &flow_id).await {
             tracing::error!("HLS output '{}' exited with error: {e}", config.id);

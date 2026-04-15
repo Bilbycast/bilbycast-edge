@@ -28,6 +28,14 @@ pub fn spawn_st2110_31_output(
     let mut rx = broadcast_tx.subscribe();
     let id = config.id.clone();
     let flow_id = flow_id.to_string();
+
+    output_stats.set_egress_static(crate::stats::collector::EgressMediaSummaryStatic {
+        transport_mode: Some("st2110-31".to_string()),
+        video_passthrough: false,
+        audio_passthrough: config.transcode.is_none(),
+        audio_only: true,
+    });
+
     tokio::spawn(async move {
         if let Err(e) = run_st2110_audio_output(
             config,

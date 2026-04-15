@@ -290,12 +290,24 @@ pub struct OutputStats {
     /// upstream PCM. Absent on pass-through outputs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_encode_stats: Option<EncodeStatsSnapshot>,
+    /// Per-output video encode stage statistics. Present only when the output
+    /// runs an `engine::ts_video_replace::TsVideoReplacer` (i.e. the output
+    /// config has a `video_encode` block). Absent on pass-through video outputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode_stats: Option<VideoEncodeStatsSnapshot>,
     /// End-to-end latency from input receive to output send.
     /// Present only when the output has actively sent packets in the last
     /// reporting window (1 second). Backward-compatible addition — old manager
     /// builds ignore unknown fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency: Option<OutputLatencyStats>,
+    /// Compact, snapshot-time description of the egress media for this output:
+    /// pipeline stages traversed, output codecs, and high-level format. Built
+    /// by the per-flow stats path from the output's static config + any
+    /// active encode/decode/transcode stages + the cached input
+    /// `MediaAnalysis`. Backward-compatible addition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_summary: Option<EgressMediaSummary>,
 }
 
 /// Per-output end-to-end latency statistics for the last reporting window.
@@ -387,6 +399,97 @@ pub struct EncodeStatsSnapshot {
     pub target_channels: u8,
     /// Resolved target bitrate in kbps.
     pub target_bitrate_kbps: u32,
+}
+
+/// Per-output video encode snapshot. Mirrors `engine::ts_video_replace::VideoEncodeStats`
+/// at point-in-time plus the resolved input/output codec and target frame
+/// geometry so the manager UI can label the stage without cross-referencing
+/// the output config.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct VideoEncodeStatsSnapshot {
+    /// Compressed video frames fed into the decoder.
+    pub input_frames: u64,
+    /// Encoded video frames emitted by the encoder.
+    pub output_frames: u64,
+    /// Frames dropped inside the replacer (decode error, encoder backpressure,
+    /// supervisor restart). Distinct from the broadcast-channel `packets_dropped`.
+    pub dropped_frames: u64,
+    /// Wire identifier of the input codec (e.g. `"h264"`, `"hevc"`).
+    pub input_codec: String,
+    /// Wire identifier of the target codec.
+    pub output_codec: String,
+    /// Target frame width in pixels (0 if not yet known).
+    pub output_width: u32,
+    /// Target frame height in pixels.
+    pub output_height: u32,
+    /// Target frame rate (0.0 if not yet known).
+    pub output_fps: f32,
+    /// Target bitrate in kbps.
+    pub output_bitrate_kbps: u32,
+    /// Encoder backend label (`"x264"`, `"x265"`, `"nvenc"`).
+    pub encoder_backend: String,
+    /// Most recent end-to-end frame latency through the replacer, in microseconds.
+    pub last_latency_us: u64,
+    /// Number of times the encoder supervisor restarted the backend.
+    pub supervisor_restarts: u64,
+}
+
+/// Snapshot-time description of the egress media for a single output.
+///
+/// Composed from three sources:
+/// - The output's static config (program filter, transport mode, audio/video
+///   encode descriptors).
+/// - The flow's cached input [`MediaAnalysis`] (used for whatever passes through
+///   unchanged — codec, resolution, frame rate, audio sample rate / channels).
+/// - Live encode / decode / transcode stats handles when active.
+///
+/// `pipeline` is an ordered list of tags identifying the stages a packet
+/// traverses on its way out: `"passthrough"`, `"program_filter"`,
+/// `"audio_decode"`, `"audio_encode"`, `"audio_transcode_pcm"`, `"audio_302m"`,
+/// `"video_encode"`, `"ts_audio_replace"`, `"ts_video_replace"`. Receivers should
+/// treat unknown tags as opaque and render them in display order.
+///
+/// All fields are optional and backward-compatible additions — older manager
+/// builds simply ignore the block.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct EgressMediaSummary {
+    /// Codec of the video essence on this output (e.g. `"h264"`, `"hevc"`,
+    /// `"jpeg_xs"`). `None` for audio-only outputs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_codec: Option<String>,
+    /// Encoded video resolution as `"WIDTHxHEIGHT"` (e.g. `"1920x1080"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_resolution: Option<String>,
+    /// Encoded video frame rate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_fps: Option<f32>,
+    /// Video bitrate in kbps when the output is actively re-encoding video.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_bitrate_kbps: Option<u32>,
+    /// Codec of the audio essence on this output (e.g. `"aac_lc"`, `"opus"`,
+    /// `"mp2"`, `"ac3"`, `"s302m"`, `"l24"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_codec: Option<String>,
+    /// Audio sample rate in Hz.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_sample_rate_hz: Option<u32>,
+    /// Audio channel count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_channels: Option<u8>,
+    /// Audio bitrate in kbps when the output is actively re-encoding audio.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_bitrate_kbps: Option<u32>,
+    /// MPTS program filter applied by this output (`None` = passthrough or auto).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
+    /// High-level transport descriptor (`"ts"`, `"rtp"`, `"audio_302m"`,
+    /// `"st2110-30"`, `"st2110-31"`, `"st2110-40"`, `"flv"`, `"hls"`,
+    /// `"webrtc"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_mode: Option<String>,
+    /// Ordered pipeline stage tags. Empty when the output is pure passthrough.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pipeline: Vec<String>,
 }
 
 /// TR-101290 transport stream analysis statistics for a single flow.

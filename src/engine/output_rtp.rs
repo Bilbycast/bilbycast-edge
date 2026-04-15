@@ -19,7 +19,9 @@ use crate::util::time::now_us;
 
 use super::delay_buffer::resolve_output_delay;
 use super::packet::RtpPacket;
+use super::ts_audio_replace::TsAudioReplacer;
 use super::ts_program_filter::TsProgramFilter;
+use super::ts_video_replace::TsVideoReplacer;
 
 /// TS sync byte.
 const TS_SYNC_BYTE: u8 = 0x47;
@@ -92,6 +94,13 @@ pub fn spawn_rtp_output(
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
+
+    output_stats.set_egress_static(crate::stats::collector::EgressMediaSummaryStatic {
+        transport_mode: Some("rtp".to_string()),
+        video_passthrough: config.video_encode.is_none(),
+        audio_passthrough: config.audio_encode.is_none(),
+        audio_only: false,
+    });
 
     tokio::spawn(async move {
         let result = if config.redundancy.is_some() {
@@ -175,6 +184,77 @@ async fn rtp_output_loop(
         TsProgramFilter::new(n)
     });
     let mut filter_scratch: Vec<u8> = Vec::new();
+
+    // Optional audio ES replacement. When set, all outgoing packets are
+    // forced through the raw-TS path (the original RTP framing is
+    // discarded and rebuilt) because the replacer rewrites payload bytes.
+    let mut audio_replacer = match config.audio_encode.as_ref() {
+        Some(enc) => match TsAudioReplacer::new(enc) {
+            Ok(r) => {
+                tracing::info!(
+                    "RTP output '{}': audio_encode active ({})",
+                    config.id,
+                    r.target_description()
+                );
+                Some(r)
+            }
+            Err(e) => {
+                tracing::error!(
+                    "RTP output '{}': audio_encode rejected: {e}; audio will be left untouched",
+                    config.id
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let mut replace_scratch: Vec<u8> = Vec::new();
+
+    // Optional video ES replacement.
+    let mut video_replacer = match config.video_encode.as_ref() {
+        Some(enc) => match TsVideoReplacer::new(enc) {
+            Ok(r) => {
+                let backend = match enc.codec.as_str() {
+                    "x264" | "x265" => enc.codec.clone(),
+                    "h264_nvenc" | "hevc_nvenc" => "nvenc".to_string(),
+                    other => other.to_string(),
+                };
+                let target_codec = match enc.codec.as_str() {
+                    "x264" | "h264_nvenc" => "h264",
+                    "x265" | "hevc_nvenc" => "hevc",
+                    other => other,
+                };
+                stats.set_video_encode_stats(
+                    r.stats_handle(),
+                    String::new(),
+                    target_codec.to_string(),
+                    enc.width.unwrap_or(0),
+                    enc.height.unwrap_or(0),
+                    match (enc.fps_num, enc.fps_den) {
+                        (Some(n), Some(d)) if d > 0 => n as f32 / d as f32,
+                        _ => 0.0,
+                    },
+                    enc.bitrate_kbps.unwrap_or(0),
+                    backend,
+                );
+                tracing::info!(
+                    "RTP output '{}': video_encode active ({})",
+                    config.id,
+                    r.target_description()
+                );
+                Some(r)
+            }
+            Err(e) => {
+                tracing::error!(
+                    "RTP output '{}': video_encode rejected: {e}; video will be left untouched",
+                    config.id
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let mut video_replace_scratch: Vec<u8> = Vec::new();
 
     // RTP wrap state for raw-TS payloads. Random SSRC + monotonic seq so this
     // output emits RFC 2250-compliant RTP/MPEG-TS even when its upstream
@@ -288,7 +368,13 @@ async fn rtp_output_loop(
         // or the delay buffer drain. This shared code path avoids duplicating
         // the raw-TS re-alignment, RTP wrapping, FEC, and socket send logic.
         for packet in &packets_to_send {
-            if packet.is_raw_ts {
+            // When audio_encode or video_encode is active we must rewrite
+            // TS bytes, so even RTP-wrapped inputs get stripped and forced
+            // through the raw-TS path (output is then re-wrapped with
+            // fresh RTP framing).
+            let force_raw_ts = audio_replacer.is_some() || video_replacer.is_some();
+
+            if packet.is_raw_ts || force_raw_ts {
                 if !is_raw_ts_stream {
                     is_raw_ts_stream = true;
                     tracing::info!(
@@ -298,7 +384,37 @@ async fn rtp_output_loop(
                     );
                 }
 
-                ts_realign_buf.extend_from_slice(&packet.data);
+                // Extract TS payload: strip RTP header if forced-raw and
+                // the input was RTP-wrapped; otherwise use packet.data as-is.
+                let ts_input: &[u8] = if !packet.is_raw_ts && force_raw_ts {
+                    if packet.data.len() > RTP_HEADER_SIZE {
+                        &packet.data[RTP_HEADER_SIZE..]
+                    } else {
+                        continue;
+                    }
+                } else {
+                    &packet.data[..]
+                };
+
+                // Chain: ts_input → audio_replacer → video_replacer → ts_realign_buf.
+                let after_audio: &[u8] = if let Some(ref mut replacer) = audio_replacer {
+                    replace_scratch.clear();
+                    tokio::task::block_in_place(|| {
+                        replacer.process(ts_input, &mut replace_scratch);
+                    });
+                    &replace_scratch
+                } else {
+                    ts_input
+                };
+                if let Some(ref mut vreplacer) = video_replacer {
+                    video_replace_scratch.clear();
+                    tokio::task::block_in_place(|| {
+                        vreplacer.process(after_audio, &mut video_replace_scratch);
+                    });
+                    ts_realign_buf.extend_from_slice(&video_replace_scratch);
+                } else {
+                    ts_realign_buf.extend_from_slice(after_audio);
+                }
 
                 if !ts_sync_found {
                     let min_bytes = TS_SYNC_CONFIRM_COUNT * TS_PACKET_SIZE;
