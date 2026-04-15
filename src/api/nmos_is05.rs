@@ -522,6 +522,10 @@ fn active_receiver_params(
             destination_port: c.remote_addr.as_deref().and_then(|a| a.split(':').nth(1).and_then(|p| p.parse().ok())),
             ..Default::default()
         },
+        InputConfig::Rist(c) => TransportParamSet {
+            source_port: c.bind_addr.split(':').nth(1).and_then(|p| p.parse().ok()),
+            ..Default::default()
+        },
         InputConfig::Rtmp(c) => TransportParamSet {
             source_port: c.listen_addr.split(':').nth(1).and_then(|p| p.parse().ok()),
             ..Default::default()
@@ -548,6 +552,20 @@ fn active_receiver_params(
             source_port: c.bind_addr.split(':').nth(1).and_then(|p| p.parse().ok()),
             ..Default::default()
         },
+        InputConfig::St2110_20(c) => TransportParamSet {
+            interface_ip: c.interface_addr.clone(),
+            source_port: c.bind_addr.split(':').nth(1).and_then(|p| p.parse().ok()),
+            ..Default::default()
+        },
+        InputConfig::St2110_23(c) => {
+            // Report primary sub-stream only for IS-05 transport params.
+            let first = c.sub_streams.first();
+            TransportParamSet {
+                interface_ip: first.and_then(|s| s.interface_addr.clone()),
+                source_port: first.and_then(|s| s.bind_addr.split(':').nth(1).and_then(|p| p.parse().ok())),
+                ..Default::default()
+            }
+        }
     };
     Ok(TransportParams {
         transport_params: vec![param_set],

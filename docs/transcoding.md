@@ -203,9 +203,11 @@ commit message or release note and delete the bullet.
   these combinations. Lifting the restriction means running the
   replacer upstream of the FEC encoder and preserving the RTP
   sequence-number space across re-muxing.
-- **`VideoScaler` output in plain YUV420P.** The scaler currently
-  hard-codes YUVJ420P (MJPEG full range). Adding a target-format
-  parameter is a small change in `video-engine::scaler`.
+- **~~`VideoScaler` output in plain YUV420P.~~** Done as part of the
+  ST 2110-20 work: `VideoScaler::new_with_dst_format()` now supports
+  `ScalerDstFormat::{Yuvj420p, Yuv422p8, Yuv422p10le}`. The existing
+  `VideoScaler::new()` constructor defaults to `Yuvj420p` and is
+  behaviour-compatible.
 - **Source-driven frame-rate detection.** Parse the SPS / VPS during
   decode-warm-up and feed detected fps into the encoder before first
   frame. Avoids the default-30fps fallback above.
@@ -224,6 +226,51 @@ commit message or release note and delete the bullet.
   the existing C dependency set; it needs updating to recognise
   libx264 / libx265 / NVENC as expected when the matching feature is
   on.
+
+### ST 2110-20 / -23 uncompressed video (Phase 2)
+
+ST 2110-20 and -23 reuse the same `VideoEncoder` / `VideoDecoder` /
+`VideoScaler` infrastructure as `video_encode`, but plug in at the
+input and output edges rather than inside a TS replacer:
+
+- **Ingress (`st2110_20`, `st2110_23` inputs)** — RFC 4175 depacketize
+  → raw-frame mpsc → `spawn_blocking` worker running `VideoEncoder`
+  (x264/x265/NVENC) → `TsMuxer` → `RtpPacket { is_raw_ts: true }` onto
+  the flow's broadcast channel. Configured via a **mandatory**
+  `video_encode` block on the input. Validation rejects inputs with
+  no encoder block; encoder backends obey the same Cargo-feature gate
+  as output `video_encode` (default LGPL-clean build cannot drive -20
+  inputs at runtime).
+- **Egress (`st2110_20`, `st2110_23` outputs)** — subscribe to the
+  broadcast, `TsDemuxer` → NALU mpsc → `spawn_blocking` worker running
+  `VideoDecoder` + `VideoScaler::new_with_dst_format()` → pack planar
+  YUV into RFC 4175 pgroups → `Rfc4175Packetizer` → `UdpSocket::send_to`
+  (Red + optional Blue). No `video_encode` block is accepted; the
+  decode step is implicit.
+- **Pixel formats** — Phase 2 supports 4:2:2 at 8-bit (`pgroup=4`) and
+  10-bit LE (`pgroup=5`). 4:2:0 / 4:4:4 / 12-bit / RGB are validated-
+  and-rejected. Bit-depth reduction before the encoder is a simple
+  `>> 2` (no dithering); adequate for contribution but a follow-up
+  item for mastering-grade workflows.
+- **ST 2110-23** — partition modes `two_sample_interleave` (2SI) and
+  `sample_row` are supported; `sample_column` is validated-and-rejected.
+  The reassembler at ingress is timestamp-keyed with `max_in_flight=4`
+  to bound memory.
+- **Non-blocking** — all codec work runs on `spawn_blocking`; between
+  reactor tasks and blocking workers we use bounded mpsc channels
+  with drop-on-lag (same policy as broadcast channel lag). The tokio
+  reactor is never blocked.
+
+Testbed config: `testbed/configs/st2110-video-loopback-edge.json`
+exercises an `st2110_20` input encoding to H.264 into an SRT listener.
+
+**Deferred (still to land)**:
+- ST 2110-22 (JPEG XS) — pending a libjxs wrapper crate.
+- `sample_column` partition mode for ST 2110-23.
+- 4:2:0 / 4:4:4 / 12-bit / RGB pgroup formats.
+- PTP-derived RTP timestamps on the egress packetizer (currently uses
+  a monotonic counter derived from upstream DTS).
+- Dithered 10→8 bit conversion feeding the H.264/HEVC encoder.
 
 ### Compressed-audio bridge — current coverage
 
@@ -256,6 +303,11 @@ options the current binary cannot satisfy.
 | `video-encoder-x264`        | Built with `--features video-encoder-x264`.                    |
 | `video-encoder-x265`        | Built with `--features video-encoder-x265`.                    |
 | `video-encoder-nvenc`       | Built with `--features video-encoder-nvenc`.                   |
+
+A follow-up will add an `st2110-video` capability flag so the manager
+UI can offer the ST 2110-20 / -23 pixel-format / partition-mode
+pickers only when the edge's decoder (`video-thumbnail` feature) and
+at least one encoder (`video-encoder-*` feature) are both compiled in.
 
 A manager UI that wants to offer `video_encode` should check
 `video-encode` first (to decide whether to render the block at all)

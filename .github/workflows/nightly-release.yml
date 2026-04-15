@@ -85,6 +85,13 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+      - name: Checkout bilbycast-rist (path dependency)
+        uses: actions/checkout@v5
+        with:
+          repository: Bilbycast/bilbycast-rist
+          path: bilbycast-rist
+          submodules: recursive
+
       - name: Checkout bilbycast-edge
         uses: actions/checkout@v5
         with:

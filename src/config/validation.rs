@@ -511,6 +511,9 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                 }
             }
         }
+        InputConfig::Rist(rist) => {
+            validate_rist_input(rist)?;
+        }
         InputConfig::Rtmp(rtmp) => {
             validate_socket_addr(&rtmp.listen_addr, "RTMP input listen_addr")?;
             if rtmp.app.is_empty() {
@@ -576,6 +579,8 @@ fn validate_input(input: &InputConfig) -> Result<()> {
         InputConfig::St2110_30(c) => validate_st2110_audio_input(c, St2110Profile::Pcm)?,
         InputConfig::St2110_31(c) => validate_st2110_audio_input(c, St2110Profile::Aes3)?,
         InputConfig::St2110_40(c) => validate_st2110_ancillary_input(c)?,
+        InputConfig::St2110_20(c) => validate_st2110_video_input(c)?,
+        InputConfig::St2110_23(c) => validate_st2110_23_input(c)?,
         InputConfig::RtpAudio(c) => validate_rtp_audio_input(c)?,
     }
     Ok(())
@@ -770,6 +775,130 @@ fn validate_st2110_ancillary_output(c: &St2110AncillaryOutputConfig) -> Result<(
     if let Some(ref red) = c.redundancy {
         validate_red_blue_bind(red, &c.dest_addr, &format!("ST 2110-40 output '{}' redundancy", c.id))?;
     }
+    Ok(())
+}
+
+fn validate_video_dims(width: u32, height: u32, fps_num: u32, fps_den: u32, ctx: &str) -> Result<()> {
+    if !(64..=8192).contains(&width) || width % 2 != 0 {
+        bail!("{ctx}: width must be 64..=8192 and even, got {width}");
+    }
+    if !(64..=8192).contains(&height) || height % 2 != 0 {
+        bail!("{ctx}: height must be 64..=8192 and even, got {height}");
+    }
+    if fps_den == 0 {
+        bail!("{ctx}: frame_rate_den must be > 0");
+    }
+    let fps = fps_num as f64 / fps_den as f64;
+    if !(1.0..=240.0).contains(&fps) {
+        bail!("{ctx}: frame_rate must be between 1 and 240 fps, got {fps:.3}");
+    }
+    Ok(())
+}
+
+fn validate_payload_budget(n: usize, ctx: &str) -> Result<()> {
+    if !(512..=8952).contains(&n) {
+        bail!("{ctx}: payload_budget must be 512..=8952, got {n}");
+    }
+    Ok(())
+}
+
+fn validate_st2110_video_input(c: &St2110VideoInputConfig) -> Result<()> {
+    const LABEL: &str = "ST 2110-20 input";
+    validate_socket_addr(&c.bind_addr, &format!("{LABEL} bind_addr"))?;
+    if let Some(ref iface) = c.interface_addr {
+        validate_ip_addr(iface, &format!("{LABEL} interface_addr"))?;
+    }
+    validate_video_dims(c.width, c.height, c.frame_rate_num, c.frame_rate_den, LABEL)?;
+    validate_rtp_payload_type(c.payload_type, LABEL)?;
+    validate_clock_domain(c.clock_domain, LABEL)?;
+    if let Some(ref sources) = c.allowed_sources {
+        for s in sources {
+            validate_ip_addr(s, &format!("{LABEL} allowed_sources"))?;
+        }
+    }
+    if let Some(rate) = c.max_bitrate_mbps {
+        if rate <= 0.0 || rate > 100_000.0 {
+            bail!("{LABEL}: max_bitrate_mbps must be > 0 and <= 100000, got {rate}");
+        }
+    }
+    if let Some(ref red) = c.redundancy {
+        validate_red_blue_bind(red, &c.bind_addr, &format!("{LABEL} redundancy"))?;
+    }
+    validate_video_encode(&c.video_encode, LABEL)?;
+    Ok(())
+}
+
+fn validate_st2110_video_output(c: &St2110VideoOutputConfig) -> Result<()> {
+    let label = format!("ST 2110-20 output '{}'", c.id);
+    validate_id(&c.id, "ST 2110-20 output")?;
+    validate_name(&c.name, "ST 2110-20 output")?;
+    validate_socket_addr(&c.dest_addr, &format!("{label} dest_addr"))?;
+    if let Some(ref bind) = c.bind_addr {
+        validate_socket_addr(bind, &format!("{label} bind_addr"))?;
+    }
+    if let Some(ref iface) = c.interface_addr {
+        validate_ip_addr(iface, &format!("{label} interface_addr"))?;
+    }
+    validate_video_dims(c.width, c.height, c.frame_rate_num, c.frame_rate_den, &label)?;
+    validate_rtp_payload_type(c.payload_type, &label)?;
+    validate_clock_domain(c.clock_domain, &label)?;
+    if c.dscp > 63 {
+        bail!("{label}: DSCP must be 0-63, got {}", c.dscp);
+    }
+    if let Some(ref red) = c.redundancy {
+        validate_red_blue_bind(red, &c.dest_addr, &format!("{label} redundancy"))?;
+    }
+    validate_payload_budget(c.payload_budget, &label)?;
+    Ok(())
+}
+
+fn validate_st2110_23_input(c: &St2110_23InputConfig) -> Result<()> {
+    const LABEL: &str = "ST 2110-23 input";
+    if !(2..=16).contains(&c.sub_streams.len()) {
+        bail!("{LABEL}: sub_streams must have 2..=16 entries, got {}", c.sub_streams.len());
+    }
+    for (i, s) in c.sub_streams.iter().enumerate() {
+        validate_socket_addr(&s.bind_addr, &format!("{LABEL} sub_streams[{i}] bind_addr"))?;
+        if let Some(ref iface) = s.interface_addr {
+            validate_ip_addr(iface, &format!("{LABEL} sub_streams[{i}] interface_addr"))?;
+        }
+        validate_rtp_payload_type(s.payload_type, &format!("{LABEL} sub_streams[{i}]"))?;
+        if let Some(ref red) = s.redundancy {
+            validate_red_blue_bind(red, &s.bind_addr, &format!("{LABEL} sub_streams[{i}] redundancy"))?;
+        }
+    }
+    validate_video_dims(c.width, c.height, c.frame_rate_num, c.frame_rate_den, LABEL)?;
+    validate_clock_domain(c.clock_domain, LABEL)?;
+    validate_video_encode(&c.video_encode, LABEL)?;
+    Ok(())
+}
+
+fn validate_st2110_23_output(c: &St2110_23OutputConfig) -> Result<()> {
+    let label = format!("ST 2110-23 output '{}'", c.id);
+    validate_id(&c.id, "ST 2110-23 output")?;
+    validate_name(&c.name, "ST 2110-23 output")?;
+    if !(2..=16).contains(&c.sub_streams.len()) {
+        bail!("{label}: sub_streams must have 2..=16 entries, got {}", c.sub_streams.len());
+    }
+    for (i, s) in c.sub_streams.iter().enumerate() {
+        validate_socket_addr(&s.dest_addr, &format!("{label} sub_streams[{i}] dest_addr"))?;
+        if let Some(ref bind) = s.bind_addr {
+            validate_socket_addr(bind, &format!("{label} sub_streams[{i}] bind_addr"))?;
+        }
+        if let Some(ref iface) = s.interface_addr {
+            validate_ip_addr(iface, &format!("{label} sub_streams[{i}] interface_addr"))?;
+        }
+        validate_rtp_payload_type(s.payload_type, &format!("{label} sub_streams[{i}]"))?;
+        if let Some(ref red) = s.redundancy {
+            validate_red_blue_bind(red, &s.dest_addr, &format!("{label} sub_streams[{i}] redundancy"))?;
+        }
+    }
+    validate_video_dims(c.width, c.height, c.frame_rate_num, c.frame_rate_den, &label)?;
+    validate_clock_domain(c.clock_domain, &label)?;
+    if c.dscp > 63 {
+        bail!("{label}: DSCP must be 0-63, got {}", c.dscp);
+    }
+    validate_payload_budget(c.payload_budget, &label)?;
     Ok(())
 }
 
@@ -1450,6 +1579,9 @@ pub fn validate_output_with_input(
                 validate_video_encode(enc, &format!("SRT output '{}'", srt.id))?;
             }
         }
+        OutputConfig::Rist(rist) => {
+            validate_rist_output(rist)?;
+        }
         OutputConfig::Rtmp(rtmp) => {
             validate_id(&rtmp.id, "RTMP output")?;
             validate_name(&rtmp.name, "RTMP output")?;
@@ -1564,6 +1696,8 @@ pub fn validate_output_with_input(
             validate_st2110_audio_output(c, St2110Profile::Aes3, upstream_audio)?
         }
         OutputConfig::St2110_40(c) => validate_st2110_ancillary_output(c)?,
+        OutputConfig::St2110_20(c) => validate_st2110_video_output(c)?,
+        OutputConfig::St2110_23(c) => validate_st2110_23_output(c)?,
         OutputConfig::RtpAudio(c) => validate_rtp_audio_output(c, upstream_audio)?,
     }
     Ok(())
@@ -1770,6 +1904,148 @@ fn validate_srt_redundancy(red: &SrtRedundancyConfig, context: &str) -> Result<(
         red.mss, red.ip_ttl,
         &format!("{context} redundancy"),
     )
+}
+
+/// Validates a RIST address: must parse as SocketAddr and the port must be
+/// even (RIST uses port P for RTP and P+1 for RTCP).
+fn validate_rist_addr(addr: &str, context: &str) -> Result<()> {
+    validate_socket_addr(addr, context)?;
+    let sa: SocketAddr = addr.parse().unwrap();
+    if sa.port() != 0 && sa.port() % 2 != 0 {
+        bail!(
+            "{context}: RIST port must be even (RTCP binds on port+1), got {}",
+            sa.port()
+        );
+    }
+    Ok(())
+}
+
+fn validate_rist_common_knobs(
+    buffer_ms: Option<u32>,
+    max_nack_retries: Option<u32>,
+    cname: Option<&str>,
+    rtcp_interval_ms: Option<u32>,
+    context: &str,
+) -> Result<()> {
+    if let Some(b) = buffer_ms {
+        if !(50..=30_000).contains(&b) {
+            bail!("{context}: buffer_ms must be 50-30000, got {b}");
+        }
+    }
+    if let Some(r) = max_nack_retries {
+        if r > 50 {
+            bail!("{context}: max_nack_retries must be ≤ 50, got {r}");
+        }
+    }
+    if let Some(c) = cname {
+        if c.len() > 256 {
+            bail!("{context}: cname must be at most 256 characters");
+        }
+    }
+    if let Some(i) = rtcp_interval_ms {
+        if i == 0 || i > 1000 {
+            bail!("{context}: rtcp_interval_ms must be 1-1000 (TR-06-1 prefers ≤100), got {i}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_rist_input(rist: &RistInputConfig) -> Result<()> {
+    validate_rist_addr(&rist.bind_addr, "RIST input bind_addr")?;
+    validate_rist_common_knobs(
+        rist.buffer_ms,
+        rist.max_nack_retries,
+        rist.cname.as_deref(),
+        rist.rtcp_interval_ms,
+        "RIST input",
+    )?;
+    if let Some(ref red) = rist.redundancy {
+        validate_rist_addr(&red.bind_addr, "RIST input redundancy bind_addr")?;
+        if red.bind_addr == rist.bind_addr {
+            bail!("RIST input redundancy: leg 2 bind_addr must differ from leg 1");
+        }
+        let leg1: SocketAddr = rist.bind_addr.parse()?;
+        let leg2: SocketAddr = red.bind_addr.parse()?;
+        if leg1.is_ipv4() != leg2.is_ipv4() {
+            bail!("RIST input redundancy: leg 1 and leg 2 must use the same address family");
+        }
+    }
+    Ok(())
+}
+
+fn validate_rist_output(rist: &RistOutputConfig) -> Result<()> {
+    validate_id(&rist.id, "RIST output")?;
+    validate_name(&rist.name, "RIST output")?;
+    validate_output_group(rist.group.as_deref(), &rist.id)?;
+    validate_program_number(rist.program_number, &format!("RIST output '{}'", rist.id))?;
+    validate_rist_addr(&rist.remote_addr, &format!("RIST output '{}' remote_addr", rist.id))?;
+    if let Some(ref local) = rist.local_addr {
+        validate_rist_addr(local, &format!("RIST output '{}' local_addr", rist.id))?;
+    }
+    validate_rist_common_knobs(
+        rist.buffer_ms,
+        None,
+        rist.cname.as_deref(),
+        rist.rtcp_interval_ms,
+        &format!("RIST output '{}'", rist.id),
+    )?;
+    if let Some(cap) = rist.retransmit_buffer_capacity {
+        if cap < 64 || cap > 65_536 {
+            bail!(
+                "RIST output '{}': retransmit_buffer_capacity must be 64-65536, got {cap}",
+                rist.id
+            );
+        }
+    }
+    if let Some(ref red) = rist.redundancy {
+        validate_rist_addr(
+            &red.remote_addr,
+            &format!("RIST output '{}' redundancy remote_addr", rist.id),
+        )?;
+        if red.remote_addr == rist.remote_addr {
+            bail!(
+                "RIST output '{}': redundancy leg 2 remote_addr must differ from leg 1",
+                rist.id
+            );
+        }
+        if let Some(ref local) = red.local_addr {
+            validate_rist_addr(
+                local,
+                &format!("RIST output '{}' redundancy local_addr", rist.id),
+            )?;
+        }
+        let leg1: SocketAddr = rist.remote_addr.parse()?;
+        let leg2: SocketAddr = red.remote_addr.parse()?;
+        if leg1.is_ipv4() != leg2.is_ipv4() {
+            bail!(
+                "RIST output '{}': redundancy leg 1 and leg 2 must use the same address family",
+                rist.id
+            );
+        }
+    }
+    if let Some(ref enc) = rist.audio_encode {
+        if rist.redundancy.is_some() {
+            bail!(
+                "RIST output '{}': audio_encode is not yet supported with SMPTE 2022-7 redundancy",
+                rist.id
+            );
+        }
+        validate_audio_encode(
+            enc,
+            &["aac_lc", "he_aac_v1", "he_aac_v2", "mp2", "ac3"],
+            &format!("RIST output '{}'", rist.id),
+        )?;
+    }
+    if let Some(ref enc) = rist.video_encode {
+        if rist.redundancy.is_some() {
+            bail!(
+                "RIST output '{}': video_encode is not yet supported with SMPTE 2022-7 redundancy",
+                rist.id
+            );
+        }
+        validate_video_encode(enc, &format!("RIST output '{}'", rist.id))?;
+    }
+    Ok(())
 }
 
 /// Validates that the RTP input bind address and interface address use the same address family.
@@ -2103,6 +2379,30 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
                     }
                 }
             }
+            InputConfig::Rist(cfg) => {
+                // RIST binds RTP on the even port and RTCP on port+1. Register
+                // both so a clashing input is caught at config load time.
+                register(&cfg.bind_addr, Proto::Udp, format!("{label_prefix} (RIST RTP)"))?;
+                if let Ok(sa) = cfg.bind_addr.parse::<SocketAddr>() {
+                    let rtcp = SocketAddr::new(sa.ip(), sa.port().wrapping_add(1));
+                    register(&rtcp.to_string(), Proto::Udp, format!("{label_prefix} (RIST RTCP)"))?;
+                }
+                if let Some(ref red) = cfg.redundancy {
+                    register(
+                        &red.bind_addr,
+                        Proto::Udp,
+                        format!("{label_prefix} (RIST leg 2 RTP)"),
+                    )?;
+                    if let Ok(sa) = red.bind_addr.parse::<SocketAddr>() {
+                        let rtcp = SocketAddr::new(sa.ip(), sa.port().wrapping_add(1));
+                        register(
+                            &rtcp.to_string(),
+                            Proto::Udp,
+                            format!("{label_prefix} (RIST leg 2 RTCP)"),
+                        )?;
+                    }
+                }
+            }
             InputConfig::Rtmp(cfg) => {
                 register(
                     &cfg.listen_addr,
@@ -2146,6 +2446,28 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
                         Proto::Udp,
                         format!("{label_prefix} (RTP audio redundancy leg 2)"),
                     )?;
+                }
+            }
+            InputConfig::St2110_20(cfg) => {
+                register(&cfg.bind_addr, Proto::Udp, format!("{label_prefix} (ST 2110-20)"))?;
+                if let Some(ref red) = cfg.redundancy {
+                    register(&red.addr, Proto::Udp, format!("{label_prefix} (ST 2110-20 leg 2)"))?;
+                }
+            }
+            InputConfig::St2110_23(cfg) => {
+                for (i, s) in cfg.sub_streams.iter().enumerate() {
+                    register(
+                        &s.bind_addr,
+                        Proto::Udp,
+                        format!("{label_prefix} (ST 2110-23 sub_streams[{i}])"),
+                    )?;
+                    if let Some(ref red) = s.redundancy {
+                        register(
+                            &red.addr,
+                            Proto::Udp,
+                            format!("{label_prefix} (ST 2110-23 sub_streams[{i}] leg 2)"),
+                        )?;
+                    }
                 }
             }
             // RTSP, WebRTC, and WHEP inputs don't bind specific local ports.

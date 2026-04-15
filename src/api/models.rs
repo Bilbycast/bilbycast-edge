@@ -86,6 +86,7 @@ impl FlowSummary {
             Some(InputConfig::Rtp(_)) => ("rtp", false),
             Some(InputConfig::Udp(_)) => ("udp", false),
             Some(InputConfig::Srt(srt)) => ("srt", srt.redundancy.is_some()),
+            Some(InputConfig::Rist(rist)) => ("rist", rist.redundancy.is_some()),
             Some(InputConfig::Rtmp(_)) => ("rtmp", false),
             Some(InputConfig::Rtsp(_)) => ("rtsp", false),
             Some(InputConfig::Webrtc(_)) => ("webrtc", false),
@@ -93,6 +94,8 @@ impl FlowSummary {
             Some(InputConfig::St2110_30(c)) => ("st2110_30", c.redundancy.is_some()),
             Some(InputConfig::St2110_31(c)) => ("st2110_31", c.redundancy.is_some()),
             Some(InputConfig::St2110_40(c)) => ("st2110_40", c.redundancy.is_some()),
+            Some(InputConfig::St2110_20(c)) => ("st2110_20", c.redundancy.is_some()),
+            Some(InputConfig::St2110_23(c)) => ("st2110_23", c.sub_streams.iter().any(|s| s.redundancy.is_some())),
             Some(InputConfig::RtpAudio(c)) => ("rtp_audio", c.redundancy.is_some()),
             None => ("none", false),
         };
@@ -108,6 +111,8 @@ impl FlowSummary {
             OutputConfig::Srt(srt) => srt.redundancy.is_some(),
             OutputConfig::St2110_30(c) | OutputConfig::St2110_31(c) => c.redundancy.is_some(),
             OutputConfig::St2110_40(c) => c.redundancy.is_some(),
+            OutputConfig::St2110_20(c) => c.redundancy.is_some(),
+            OutputConfig::St2110_23(c) => c.sub_streams.iter().any(|s| s.redundancy.is_some()),
             OutputConfig::RtpAudio(c) => c.redundancy.is_some(),
             _ => false,
         });

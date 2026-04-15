@@ -40,3 +40,4 @@ pub mod redblue;
 pub mod scte104;
 pub mod sdp;
 pub mod timecode;
+pub mod video;

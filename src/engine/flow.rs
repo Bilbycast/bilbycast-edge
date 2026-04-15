@@ -14,11 +14,13 @@ use crate::config::models::*;
 use crate::manager::events::EventSender;
 use crate::stats::collector::{FlowStatsAccumulator, OutputConfigMeta, OutputStatsAccumulator};
 
+use super::input_rist::spawn_rist_input;
 use super::input_rtmp::spawn_rtmp_input;
 use super::input_rtp::spawn_rtp_input;
 use super::input_srt::spawn_srt_input;
 use super::input_udp::spawn_udp_input;
 use super::output_hls::spawn_hls_output;
+use super::output_rist::spawn_rist_output;
 use super::output_rtmp::spawn_rtmp_output;
 use super::output_rtp::spawn_rtp_output;
 use super::output_srt::spawn_srt_output;
@@ -223,6 +225,7 @@ impl FlowRuntime {
             Some(InputConfig::Rtp(_)) => "rtp",
             Some(InputConfig::Udp(_)) => "udp",
             Some(InputConfig::Srt(_)) => "srt",
+            Some(InputConfig::Rist(_)) => "rist",
             Some(InputConfig::Rtmp(_)) => "rtmp",
             Some(InputConfig::Rtsp(_)) => "rtsp",
             Some(InputConfig::Webrtc(_)) => "webrtc",
@@ -230,6 +233,8 @@ impl FlowRuntime {
             Some(InputConfig::St2110_30(_)) => "st2110_30",
             Some(InputConfig::St2110_31(_)) => "st2110_31",
             Some(InputConfig::St2110_40(_)) => "st2110_40",
+            Some(InputConfig::St2110_20(_)) => "st2110_20",
+            Some(InputConfig::St2110_23(_)) => "st2110_23",
             Some(InputConfig::RtpAudio(_)) => "rtp_audio",
             None => "none",
         };
@@ -306,6 +311,16 @@ impl FlowRuntime {
                 InputConfig::Srt(srt_config) => {
                     spawn_srt_input(
                         srt_config.clone(),
+                        per_input_tx.clone(),
+                        flow_stats.clone(),
+                        input_cancel.clone(),
+                        event_sender.clone(),
+                        config.config.id.clone(),
+                    )
+                }
+                InputConfig::Rist(rist_config) => {
+                    spawn_rist_input(
+                        rist_config.clone(),
                         per_input_tx.clone(),
                         flow_stats.clone(),
                         input_cancel.clone(),
@@ -421,6 +436,26 @@ impl FlowRuntime {
                     Some(event_sender.clone()),
                     Some(config.config.id.clone()),
                 ),
+                InputConfig::St2110_20(c) => {
+                    let mut c = c.clone();
+                    c.clock_domain = c.clock_domain.or(config.config.clock_domain);
+                    super::input_st2110_20::spawn_st2110_20_input(
+                        c,
+                        per_input_tx.clone(),
+                        flow_stats.clone(),
+                        input_cancel.clone(),
+                    )
+                }
+                InputConfig::St2110_23(c) => {
+                    let mut c = c.clone();
+                    c.clock_domain = c.clock_domain.or(config.config.clock_domain);
+                    super::input_st2110_23::spawn_st2110_23_input(
+                        c,
+                        per_input_tx.clone(),
+                        flow_stats.clone(),
+                        input_cancel.clone(),
+                    )
+                }
             };
 
             // Spawn the forwarder: drains the per-input channel and forwards
@@ -547,6 +582,14 @@ impl FlowRuntime {
                         };
                         ("srt".to_string(), "unknown".to_string(), false, None, red_en, red_ty)
                     }
+                    InputConfig::Rist(rist) => {
+                        let (red_en, red_ty) = if rist.redundancy.is_some() {
+                            (true, Some("SMPTE 2022-7".to_string()))
+                        } else {
+                            (false, None)
+                        };
+                        ("rist".to_string(), "raw_ts".to_string(), false, None, red_en, red_ty)
+                    }
                     InputConfig::Rtmp(_) => {
                         ("rtmp".to_string(), "raw_ts".to_string(), false, None, false, None)
                     }
@@ -582,6 +625,17 @@ impl FlowRuntime {
                             (false, None)
                         };
                         ("st2110_40".to_string(), "anc".to_string(), false, None, red_en, red_ty)
+                    }
+                    InputConfig::St2110_20(c) => {
+                        let (red_en, red_ty) = if c.redundancy.is_some() {
+                            (true, Some("SMPTE 2022-7".to_string()))
+                        } else {
+                            (false, None)
+                        };
+                        ("st2110_20".to_string(), "rfc4175_ycbcr422".to_string(), false, None, red_en, red_ty)
+                    }
+                    InputConfig::St2110_23(_c) => {
+                        ("st2110_23".to_string(), "rfc4175_ycbcr422_multi".to_string(), false, None, true, Some("SMPTE 2110-23 multi-stream".to_string()))
                     }
                     InputConfig::RtpAudio(c) => {
                         let (red_en, red_ty) = if c.redundancy.is_some() {
@@ -769,6 +823,7 @@ impl FlowRuntime {
                 InputConfig::Rtp(_) => "rtp",
                 InputConfig::Udp(_) => "udp",
                 InputConfig::Srt(_) => "srt",
+                InputConfig::Rist(_) => "rist",
                 InputConfig::Rtmp(_) => "rtmp",
                 InputConfig::Rtsp(_) => "rtsp",
                 InputConfig::Webrtc(_) => "webrtc",
@@ -776,6 +831,8 @@ impl FlowRuntime {
                 InputConfig::St2110_30(_) => "st2110_30",
                 InputConfig::St2110_31(_) => "st2110_31",
                 InputConfig::St2110_40(_) => "st2110_40",
+                InputConfig::St2110_20(_) => "st2110_20",
+                InputConfig::St2110_23(_) => "st2110_23",
                 InputConfig::RtpAudio(_) => "rtp_audio",
             };
             let new_meta = build_input_config_meta(&new_def.config);
@@ -942,6 +999,29 @@ impl FlowRuntime {
                     stats: output_stats,
                 })
             }
+            OutputConfig::Rist(rist_config) => {
+                let output_stats = flow_stats.register_output(
+                    rist_config.id.clone(),
+                    rist_config.name.clone(),
+                    "rist".to_string(),
+                );
+
+                let handle = spawn_rist_output(
+                    rist_config.clone(),
+                    broadcast_tx,
+                    output_stats.clone(),
+                    output_cancel.clone(),
+                    frame_rate_rx,
+                    event_sender.clone(),
+                    flow_id.to_string(),
+                );
+
+                Ok(OutputRuntime {
+                    handle,
+                    cancel_token: output_cancel,
+                    stats: output_stats,
+                })
+            }
             OutputConfig::Rtmp(rtmp_config) => {
                 let output_stats = flow_stats.register_output(
                     rtmp_config.id.clone(),
@@ -1093,6 +1173,42 @@ impl FlowRuntime {
                     stats: output_stats,
                 })
             }
+            OutputConfig::St2110_20(c) => {
+                let output_stats = flow_stats.register_output(
+                    c.id.clone(),
+                    c.name.clone(),
+                    "st2110_20".to_string(),
+                );
+                let handle = super::output_st2110_20::spawn_st2110_20_output(
+                    c.clone(),
+                    broadcast_tx,
+                    output_stats.clone(),
+                    output_cancel.clone(),
+                );
+                Ok(OutputRuntime {
+                    handle,
+                    cancel_token: output_cancel,
+                    stats: output_stats,
+                })
+            }
+            OutputConfig::St2110_23(c) => {
+                let output_stats = flow_stats.register_output(
+                    c.id.clone(),
+                    c.name.clone(),
+                    "st2110_23".to_string(),
+                );
+                let handle = super::output_st2110_23::spawn_st2110_23_output(
+                    c.clone(),
+                    broadcast_tx,
+                    output_stats.clone(),
+                    output_cancel.clone(),
+                );
+                Ok(OutputRuntime {
+                    handle,
+                    cancel_token: output_cancel,
+                    stats: output_stats,
+                })
+            }
         }
     }
 
@@ -1235,6 +1351,11 @@ fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::Inpu
             listen_addr: None, bind_addr: None,
             rtsp_url: None, whep_url: None,
         },
+        InputConfig::Rist(c) => InputConfigMeta {
+            mode: None, local_addr: None, remote_addr: None,
+            listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
+            rtsp_url: None, whep_url: None,
+        },
         InputConfig::Rtmp(c) => InputConfigMeta {
             mode: None, local_addr: None, remote_addr: None,
             listen_addr: Some(c.listen_addr.clone()), bind_addr: None,
@@ -1265,6 +1386,17 @@ fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::Inpu
         InputConfig::St2110_40(c) => InputConfigMeta {
             mode: None, local_addr: None, remote_addr: None,
             listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
+            rtsp_url: None, whep_url: None,
+        },
+        InputConfig::St2110_20(c) => InputConfigMeta {
+            mode: None, local_addr: None, remote_addr: None,
+            listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
+            rtsp_url: None, whep_url: None,
+        },
+        InputConfig::St2110_23(c) => InputConfigMeta {
+            mode: None, local_addr: None, remote_addr: None,
+            listen_addr: None,
+            bind_addr: c.sub_streams.first().map(|s| s.bind_addr.clone()),
             rtsp_url: None, whep_url: None,
         },
         InputConfig::RtpAudio(c) => InputConfigMeta {
@@ -1366,6 +1498,13 @@ fn build_output_config_meta(config: &OutputConfig) -> OutputConfigMeta {
             dest_addr: None, dest_url: None, ingest_url: None, whip_url: None,
             program_number: c.program_number,
         },
+        OutputConfig::Rist(c) => OutputConfigMeta {
+            mode: None,
+            remote_addr: Some(c.remote_addr.clone()),
+            local_addr: c.local_addr.clone(),
+            dest_addr: None, dest_url: None, ingest_url: None, whip_url: None,
+            program_number: c.program_number,
+        },
         OutputConfig::Rtp(c) => OutputConfigMeta {
             mode: None, remote_addr: None, local_addr: None,
             dest_addr: Some(c.dest_addr.clone()),
@@ -1403,6 +1542,18 @@ fn build_output_config_meta(config: &OutputConfig) -> OutputConfigMeta {
         OutputConfig::St2110_40(c) => OutputConfigMeta {
             mode: None, remote_addr: None, local_addr: None,
             dest_addr: Some(c.dest_addr.clone()),
+            dest_url: None, ingest_url: None, whip_url: None,
+            program_number: None,
+        },
+        OutputConfig::St2110_20(c) => OutputConfigMeta {
+            mode: None, remote_addr: None, local_addr: None,
+            dest_addr: Some(c.dest_addr.clone()),
+            dest_url: None, ingest_url: None, whip_url: None,
+            program_number: None,
+        },
+        OutputConfig::St2110_23(c) => OutputConfigMeta {
+            mode: None, remote_addr: None, local_addr: None,
+            dest_addr: c.sub_streams.first().map(|s| s.dest_addr.clone()),
             dest_url: None, ingest_url: None, whip_url: None,
             program_number: None,
         },

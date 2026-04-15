@@ -28,9 +28,11 @@ pub mod input_rtsp;
 #[cfg(feature = "webrtc")]
 pub mod input_webrtc;
 pub mod media_analysis;
+pub mod input_rist;
 pub mod input_rtp;
 pub mod input_srt;
 pub mod input_udp;
+pub mod output_rist;
 pub mod output_udp;
 pub mod manager;
 pub mod output_hls;
@@ -104,12 +106,21 @@ pub mod st2110;
 /// in this module so the recv/send/RedBluePair plumbing lives in one place.
 pub mod st2110_io;
 
+/// Shared runtime helpers for ST 2110-20 / -23 (uncompressed video). Heavy
+/// codec work (encode / decode / scale) runs on dedicated blocking workers so
+/// the tokio reactor is never blocked.
+pub mod st2110_video_io;
+
 pub mod input_st2110_30;
 pub mod input_st2110_31;
 pub mod input_st2110_40;
+pub mod input_st2110_20;
+pub mod input_st2110_23;
 pub mod output_st2110_30;
 pub mod output_st2110_31;
 pub mod output_st2110_40;
+pub mod output_st2110_20;
+pub mod output_st2110_23;
 
 /// Generic RFC 3551 PCM-over-RTP audio input. Wire-identical to ST 2110-30
 /// but with no PTP / RFC 7273 / NMOS clock_domain. Drives the same shared

@@ -1,17 +1,17 @@
 [package]
 name = "bilbycast-edge"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 license = "MPL-2.0"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.51.0", features = ["full"] }
+tokio = { version = "1.52.0", features = ["full"] }
 tokio-util = "0.7.18"
 
 # HTTP framework
-axum = { version = "0.8.8", features = ["ws"] }
+axum = { version = "0.8.9", features = ["ws"] }
 tower-http = { version = "0.6.8", features = ["cors", "trace"] }
 
 # Serialization
@@ -43,7 +43,7 @@ socket2 = "0.6.3"
 libc = "0.2.184"
 
 # Random
-rand = "0.10.0"
+rand = "0.10.1"
 
 # Pure-Rust audio sample rate conversion (used by the per-output PCM
 # transcode stage in `engine::audio_transcode` to bridge mismatched
@@ -74,7 +74,7 @@ video-engine = { path = "../bilbycast-ffmpeg-video-rs/video-engine", optional = 
 video-codec = { path = "../bilbycast-ffmpeg-video-rs/video-codec", optional = true }
 
 # System resource monitoring (CPU, RAM)
-sysinfo = "0.33.1"
+sysinfo = "0.38.4"
 
 # Error handling
 anyhow = "1.0.102"
@@ -118,6 +118,14 @@ srt-protocol = { path = "../bilbycast-libsrt-rs/srt-protocol" }
 # Alternative: Pure Rust (uncomment these, comment out the pair above)
 # srt-transport = { path = "../bilbycast-srt/srt-transport" }
 # srt-protocol = { path = "../bilbycast-srt/srt-protocol" }
+
+# ── RIST backend ─────────────────────────────────────────────────────────
+# Pure-Rust RIST Simple Profile (TR-06-1:2020). Zero C dependencies.
+# Wire-verified interop with librist 0.2.11 (ristsender / ristreceiver).
+# No feature flag — always compiled in, same treatment as SRT above.
+# ─────────────────────────────────────────────────────────────────────────
+rist-transport = { path = "../bilbycast-rist/rist-transport" }
+rist-protocol = { path = "../bilbycast-rist/rist-protocol" }
 
 # QUIC transport for IP tunneling (relay and direct modes)
 quinn = "0.11.9"

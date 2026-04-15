@@ -797,10 +797,13 @@ fn build_system_resources_payload(state: &SystemResourceState) -> serde_json::Va
 /// reflected as an additional `"ptp-internal"` string for completeness.
 fn edge_capabilities() -> Vec<&'static str> {
     let mut caps = vec![
-        // SMPTE ST 2110 Phase 1
+        // SMPTE ST 2110 Phase 1 (audio + ancillary)
         "st2110-30",
         "st2110-31",
         "st2110-40",
+        // SMPTE ST 2110 Phase 2 (uncompressed video, RFC 4175)
+        "st2110-20",
+        "st2110-23",
         "ptp",
         "is-04",
         "is-05",

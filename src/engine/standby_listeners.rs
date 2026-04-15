@@ -183,12 +183,16 @@ impl StandbyListenerManager {
 fn is_passive_listener(config: &InputConfig) -> bool {
     match config {
         InputConfig::Srt(c) => c.mode == SrtMode::Listener,
+        InputConfig::Rist(_) => true,
         InputConfig::Rtp(_) => true,
         InputConfig::Udp(_) => true,
         InputConfig::Rtmp(_) => true,
         InputConfig::St2110_30(_) => true,
         InputConfig::St2110_31(_) => true,
         InputConfig::St2110_40(_) => true,
+        InputConfig::St2110_20(_) => true,
+        // -23 binds N sockets; skip standby monitoring for Phase 2.
+        InputConfig::St2110_23(_) => false,
         InputConfig::RtpAudio(_) => true,
         // Callers/pullers and WebRTC (needs full HTTP/ICE stack) are NOT passive
         InputConfig::Webrtc(_) | InputConfig::Rtsp(_) | InputConfig::Whep(_) => false,
@@ -217,6 +221,9 @@ async fn run_standby_listener(
         InputConfig::St2110_40(ref anc) => {
             run_udp_standby(&anc.bind_addr, &status, &cancel).await;
         }
+        InputConfig::St2110_20(ref v) => {
+            run_udp_standby(&v.bind_addr, &status, &cancel).await;
+        }
         InputConfig::RtpAudio(ref rtp_audio) => {
             run_udp_standby(&rtp_audio.bind_addr, &status, &cancel).await;
         }
@@ -226,6 +233,9 @@ async fn run_standby_listener(
         InputConfig::Srt(ref srt) if srt.mode == SrtMode::Listener => {
             let addr = srt.local_addr.as_deref().unwrap_or("0.0.0.0:0");
             run_udp_standby(addr, &status, &cancel).await;
+        }
+        InputConfig::Rist(ref rist) => {
+            run_udp_standby(&rist.bind_addr, &status, &cancel).await;
         }
         _ => {
             *status.state.write().unwrap() = "unsupported".to_string();

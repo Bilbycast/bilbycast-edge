@@ -396,6 +396,12 @@ pub enum InputConfig {
     /// Receive RTP over SRT
     #[serde(rename = "srt")]
     Srt(SrtInputConfig),
+    /// Receive RIST Simple Profile (TR-06-1:2020) — reliable RTP transport
+    /// with RTCP NACK-based retransmission. Interoperable with librist
+    /// `ristsender` / `ristreceiver`. Binds an even RTP port P and RTCP
+    /// port P+1 locally; learns the peer's RTCP address dynamically.
+    #[serde(rename = "rist")]
+    Rist(RistInputConfig),
     /// Receive H.264/AAC via RTMP (accept publish from OBS, ffmpeg, etc.)
     #[serde(rename = "rtmp")]
     Rtmp(RtmpInputConfig),
@@ -420,6 +426,20 @@ pub enum InputConfig {
     /// SMPTE 12M timecode, CEA-608/708 captions, and other ANC essence.
     #[serde(rename = "st2110_40")]
     St2110_40(St2110AncillaryInputConfig),
+    /// Receive SMPTE ST 2110-20 uncompressed video over RTP (RFC 4175).
+    /// Ingress frames are decoded from the wire, fed into an in-process
+    /// H.264/HEVC encoder (configured via `video_encode`), and published as
+    /// MPEG-TS packets onto the flow's broadcast channel. An encoder backend
+    /// feature (`video-encoder-x264` / `-x265` / `-nvenc`) must be compiled
+    /// in; validation rejects the input otherwise.
+    #[serde(rename = "st2110_20")]
+    St2110_20(St2110VideoInputConfig),
+    /// Receive SMPTE ST 2110-23 (single video essence across multiple -20
+    /// sub-streams). Binds N receivers, reassembles the full frame per the
+    /// configured partition mode, then funnels through the same encode path
+    /// as ST 2110-20.
+    #[serde(rename = "st2110_23")]
+    St2110_23(St2110_23InputConfig),
     /// Receive RFC 3551 PCM audio over RTP/UDP without ST 2110 constraints.
     /// No PTP requirement, no RFC 7273 timing reference, no clock_domain
     /// advertising in NMOS. Useful for radio contribution feeds, talkback,
@@ -435,6 +455,7 @@ impl InputConfig {
             InputConfig::Rtp(_) => "rtp",
             InputConfig::Udp(_) => "udp",
             InputConfig::Srt(_) => "srt",
+            InputConfig::Rist(_) => "rist",
             InputConfig::Rtmp(_) => "rtmp",
             InputConfig::Rtsp(_) => "rtsp",
             InputConfig::Webrtc(_) => "webrtc",
@@ -442,6 +463,8 @@ impl InputConfig {
             InputConfig::St2110_30(_) => "st2110_30",
             InputConfig::St2110_31(_) => "st2110_31",
             InputConfig::St2110_40(_) => "st2110_40",
+            InputConfig::St2110_20(_) => "st2110_20",
+            InputConfig::St2110_23(_) => "st2110_23",
             InputConfig::RtpAudio(_) => "rtp_audio",
         }
     }
@@ -459,10 +482,16 @@ impl InputConfig {
             InputConfig::Rtp(_)
             | InputConfig::Udp(_)
             | InputConfig::Srt(_)
+            | InputConfig::Rist(_)
             | InputConfig::Rtmp(_)
             | InputConfig::Rtsp(_)
             | InputConfig::Webrtc(_)
-            | InputConfig::Whep(_) => true,
+            | InputConfig::Whep(_)
+            // ST 2110-20/-23 decode RFC 4175 on ingress and publish the
+            // flow as encoded H.264/HEVC MPEG-TS into the broadcast channel,
+            // so downstream consumers treat them as TS carriers.
+            | InputConfig::St2110_20(_)
+            | InputConfig::St2110_23(_) => true,
             InputConfig::St2110_30(_)
             | InputConfig::St2110_31(_)
             | InputConfig::St2110_40(_)
@@ -790,6 +819,12 @@ pub enum OutputConfig {
     /// Send RTP over SRT
     #[serde(rename = "srt")]
     Srt(SrtOutputConfig),
+    /// Send via RIST Simple Profile (TR-06-1:2020) — reliable RTP transport
+    /// with RTCP NACK-based retransmission. Interoperable with librist
+    /// `ristreceiver`. Binds an even RTP port P and RTCP port P+1 locally;
+    /// transmits to `remote_addr` (peer's RTP port).
+    #[serde(rename = "rist")]
+    Rist(RistOutputConfig),
     /// Publish to RTMP/RTMPS server (e.g. Twitch, YouTube)
     #[serde(rename = "rtmp")]
     Rtmp(RtmpOutputConfig),
@@ -808,6 +843,17 @@ pub enum OutputConfig {
     /// Send SMPTE ST 2110-40 ancillary data over RTP.
     #[serde(rename = "st2110_40")]
     St2110_40(St2110AncillaryOutputConfig),
+    /// Send SMPTE ST 2110-20 uncompressed video over RTP (RFC 4175).
+    /// The output decodes the flow's source H.264/HEVC TS, scales/converts
+    /// into planar 4:2:2 at the configured bit depth, then RFC 4175
+    /// packetizes onto the wire. Requires the `video-thumbnail` feature
+    /// for in-process decoding (default on).
+    #[serde(rename = "st2110_20")]
+    St2110_20(St2110VideoOutputConfig),
+    /// Send SMPTE ST 2110-23 — one video essence split across N ST 2110-20
+    /// sub-streams per the configured partition mode.
+    #[serde(rename = "st2110_23")]
+    St2110_23(St2110_23OutputConfig),
     /// Send PCM audio via RFC 3551 RTP/UDP without ST 2110 constraints
     /// (no PTP, no RFC 7273 timing, no NMOS clock_domain advertising).
     /// Supports the same `transcode` block as ST 2110-30 outputs and
@@ -823,12 +869,15 @@ impl OutputConfig {
             OutputConfig::Rtp(c) => &c.id,
             OutputConfig::Udp(c) => &c.id,
             OutputConfig::Srt(c) => &c.id,
+            OutputConfig::Rist(c) => &c.id,
             OutputConfig::Rtmp(c) => &c.id,
             OutputConfig::Hls(c) => &c.id,
             OutputConfig::Webrtc(c) => &c.id,
             OutputConfig::St2110_30(c) => &c.id,
             OutputConfig::St2110_31(c) => &c.id,
             OutputConfig::St2110_40(c) => &c.id,
+            OutputConfig::St2110_20(c) => &c.id,
+            OutputConfig::St2110_23(c) => &c.id,
             OutputConfig::RtpAudio(c) => &c.id,
         }
     }
@@ -839,12 +888,15 @@ impl OutputConfig {
             OutputConfig::Rtp(c) => &c.name,
             OutputConfig::Udp(c) => &c.name,
             OutputConfig::Srt(c) => &c.name,
+            OutputConfig::Rist(c) => &c.name,
             OutputConfig::Rtmp(c) => &c.name,
             OutputConfig::Hls(c) => &c.name,
             OutputConfig::Webrtc(c) => &c.name,
             OutputConfig::St2110_30(c) => &c.name,
             OutputConfig::St2110_31(c) => &c.name,
             OutputConfig::St2110_40(c) => &c.name,
+            OutputConfig::St2110_20(c) => &c.name,
+            OutputConfig::St2110_23(c) => &c.name,
             OutputConfig::RtpAudio(c) => &c.name,
         }
     }
@@ -855,12 +907,15 @@ impl OutputConfig {
             OutputConfig::Rtp(_) => "rtp",
             OutputConfig::Udp(_) => "udp",
             OutputConfig::Srt(_) => "srt",
+            OutputConfig::Rist(_) => "rist",
             OutputConfig::Rtmp(_) => "rtmp",
             OutputConfig::Hls(_) => "hls",
             OutputConfig::Webrtc(_) => "webrtc",
             OutputConfig::St2110_30(_) => "st2110_30",
             OutputConfig::St2110_31(_) => "st2110_31",
             OutputConfig::St2110_40(_) => "st2110_40",
+            OutputConfig::St2110_20(_) => "st2110_20",
+            OutputConfig::St2110_23(_) => "st2110_23",
             OutputConfig::RtpAudio(_) => "rtp_audio",
         }
     }
@@ -872,12 +927,15 @@ impl OutputConfig {
             OutputConfig::Rtp(c) => c.active,
             OutputConfig::Udp(c) => c.active,
             OutputConfig::Srt(c) => c.active,
+            OutputConfig::Rist(c) => c.active,
             OutputConfig::Rtmp(c) => c.active,
             OutputConfig::Hls(c) => c.active,
             OutputConfig::Webrtc(c) => c.active,
             OutputConfig::St2110_30(c) => c.active,
             OutputConfig::St2110_31(c) => c.active,
             OutputConfig::St2110_40(c) => c.active,
+            OutputConfig::St2110_20(c) => c.active,
+            OutputConfig::St2110_23(c) => c.active,
             OutputConfig::RtpAudio(c) => c.active,
         }
     }
@@ -890,12 +948,15 @@ impl OutputConfig {
             OutputConfig::Rtp(c) => c.active = active,
             OutputConfig::Udp(c) => c.active = active,
             OutputConfig::Srt(c) => c.active = active,
+            OutputConfig::Rist(c) => c.active = active,
             OutputConfig::Rtmp(c) => c.active = active,
             OutputConfig::Hls(c) => c.active = active,
             OutputConfig::Webrtc(c) => c.active = active,
             OutputConfig::St2110_30(c) => c.active = active,
             OutputConfig::St2110_31(c) => c.active = active,
             OutputConfig::St2110_40(c) => c.active = active,
+            OutputConfig::St2110_20(c) => c.active = active,
+            OutputConfig::St2110_23(c) => c.active = active,
             OutputConfig::RtpAudio(c) => c.active = active,
         }
     }
@@ -906,12 +967,15 @@ impl OutputConfig {
             OutputConfig::Rtp(c) => c.group.as_deref(),
             OutputConfig::Udp(c) => c.group.as_deref(),
             OutputConfig::Srt(c) => c.group.as_deref(),
+            OutputConfig::Rist(c) => c.group.as_deref(),
             OutputConfig::Rtmp(c) => c.group.as_deref(),
             OutputConfig::Hls(c) => c.group.as_deref(),
             OutputConfig::Webrtc(c) => c.group.as_deref(),
             OutputConfig::St2110_30(c) => c.group.as_deref(),
             OutputConfig::St2110_31(c) => c.group.as_deref(),
             OutputConfig::St2110_40(c) => c.group.as_deref(),
+            OutputConfig::St2110_20(c) => c.group.as_deref(),
+            OutputConfig::St2110_23(c) => c.group.as_deref(),
             OutputConfig::RtpAudio(c) => c.group.as_deref(),
         }
     }
@@ -1377,6 +1441,103 @@ pub struct RtpOutputRedundancyConfig {
     /// DSCP value for leg 2 (optional, defaults to parent's dscp)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dscp: Option<u8>,
+}
+
+/// RIST Simple Profile (TR-06-1:2020) input. Binds a dual-port UDP channel
+/// (RTP on even port P, RTCP on P+1) and decodes the reliable-RTP stream
+/// delivered by a remote `ristsender` or equivalent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RistInputConfig {
+    /// Local bind address, e.g. "0.0.0.0:6000". The port **must be even** —
+    /// RIST binds RTCP on port+1.
+    pub bind_addr: String,
+    /// Receiver jitter / retransmit buffer depth in milliseconds.
+    /// Default 1000 ms, range 50–30000 ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_ms: Option<u32>,
+    /// Maximum NACK retransmission attempts per lost packet. Default 10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_nack_retries: Option<u32>,
+    /// CNAME emitted in RTCP SDES packets (optional, auto-generated if absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cname: Option<String>,
+    /// RTCP emission interval in milliseconds (TR-06-1 requires ≤ 100 ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtcp_interval_ms: Option<u32>,
+    /// Optional SMPTE 2022-7 redundancy (merge two RIST legs).
+    /// The primary `bind_addr` is leg 1; this defines leg 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<RistInputRedundancyConfig>,
+}
+
+/// RIST Simple Profile (TR-06-1:2020) output. Binds a local dual-port UDP
+/// channel and transmits reliable RTP to the peer's even RTP port; the
+/// peer's RTCP traffic is learned dynamically (no P+1 assumption).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RistOutputConfig {
+    /// Unique output ID within this flow.
+    pub id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Whether this output is currently active. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Optional free-form group tag (max 64 chars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Remote RIST address, e.g. "203.0.113.10:6000". Port must be even.
+    pub remote_addr: String,
+    /// Local bind address for the sender's RTP socket. Optional — defaults
+    /// to "0.0.0.0:0" (ephemeral even port). When set, the port must be even.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_addr: Option<String>,
+    /// Sender retransmit buffer depth in milliseconds. Default 1000 ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_ms: Option<u32>,
+    /// Retransmit buffer capacity in packets (sender side). Default 2048.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retransmit_buffer_capacity: Option<usize>,
+    /// CNAME emitted in RTCP SDES packets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cname: Option<String>,
+    /// RTCP emission interval in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtcp_interval_ms: Option<u32>,
+    /// Optional SMPTE 2022-7 redundancy (duplicate output to a second leg).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<RistOutputRedundancyConfig>,
+    /// If set, filter the (possibly MPTS) input stream down to this single
+    /// program. Must be > 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
+    /// Optional output delay for stream synchronization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay: Option<OutputDelay>,
+    /// Optional audio encode block (AAC-LC / HE-AAC / MP2 / AC-3). See
+    /// [`RtpOutputConfig::audio_encode`] for semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional video encode block (x264 / x265 / NVENC, feature-gated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode: Option<VideoEncodeConfig>,
+}
+
+/// SMPTE 2022-7 redundancy config for a RIST input (leg 2).
+/// The primary `bind_addr` in the parent RistInputConfig is leg 1.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RistInputRedundancyConfig {
+    /// Bind address for leg 2. Port must be even.
+    pub bind_addr: String,
+}
+
+/// SMPTE 2022-7 redundancy config for a RIST output (leg 2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RistOutputRedundancyConfig {
+    /// Remote address for leg 2. Port must be even.
+    pub remote_addr: String,
+    /// Local bind address for leg 2 (optional). When set, port must be even.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_addr: Option<String>,
 }
 
 /// RTMP/RTMPS output configuration for publishing to streaming platforms.
@@ -1943,6 +2104,193 @@ pub struct St2110AncillaryOutputConfig {
     /// Optional fixed RTP SSRC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssrc: Option<u32>,
+}
+
+// ── ST 2110-20 / -23 video configuration ────────────────────────────────
+
+/// RFC 4175 pixel format for ST 2110-20 / -23 on the wire.
+///
+/// Phase 2 supports 4:2:2 YCbCr at 8-bit or 10-bit. Other formats are
+/// rejected by validation and will be added in later phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum St2110VideoPixelFormat {
+    #[serde(rename = "yuv422_8bit")]
+    Yuv422_8bit,
+    #[serde(rename = "yuv422_10bit")]
+    Yuv422_10bit,
+}
+
+impl St2110VideoPixelFormat {
+
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Yuv422_8bit => "yuv422_8bit",
+            Self::Yuv422_10bit => "yuv422_10bit",
+        }
+    }
+    pub fn depth(self) -> u8 {
+        match self {
+            Self::Yuv422_8bit => 8,
+            Self::Yuv422_10bit => 10,
+        }
+    }
+}
+
+/// Partition mode for ST 2110-23 multi-stream video.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum St2110_23PartitionModeConfig {
+    #[serde(rename = "two_sample_interleave")]
+    TwoSampleInterleave,
+    #[serde(rename = "sample_row")]
+    SampleRow,
+}
+
+/// ST 2110-20 (uncompressed video) input configuration. Inputs MUST include
+/// a `video_encode` block — the encoded MPEG-TS is what enters the flow's
+/// broadcast channel. An encoder backend feature (`video-encoder-x264`,
+/// `-x265`, or `-nvenc`) must be compiled in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct St2110VideoInputConfig {
+    pub bind_addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<RedBlueBindConfig>,
+    pub width: u32,
+    pub height: u32,
+    /// Frame-rate numerator (e.g. 30000 for 29.97 fps, 60 for 60 fps).
+    pub frame_rate_num: u32,
+    /// Frame-rate denominator (e.g. 1001 for 29.97 fps, 1 for 60 fps).
+    pub frame_rate_den: u32,
+    /// Wire pgroup format. Only `yuv422_8bit` and `yuv422_10bit` are accepted
+    /// by validation in Phase 2.
+    pub pixel_format: St2110VideoPixelFormat,
+    /// Dynamic RTP payload type (96..=127). Default: 96.
+    #[serde(default = "default_st2110_video_pt")]
+    pub payload_type: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_domain: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_sources: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bitrate_mbps: Option<f64>,
+    /// Mandatory encoder block. The ingress pipeline depacketizes RFC 4175,
+    /// decodes pixel data, then feeds the raw YUV into this encoder. Output
+    /// H.264/HEVC bitstream is muxed into MPEG-TS and published on the
+    /// broadcast channel.
+    pub video_encode: VideoEncodeConfig,
+}
+
+/// ST 2110-20 (uncompressed video) output configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct St2110VideoOutputConfig {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    pub dest_addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<RedBlueBindConfig>,
+    pub width: u32,
+    pub height: u32,
+    pub frame_rate_num: u32,
+    pub frame_rate_den: u32,
+    pub pixel_format: St2110VideoPixelFormat,
+    #[serde(default = "default_st2110_video_pt")]
+    pub payload_type: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_domain: Option<u8>,
+    #[serde(default = "default_dscp")]
+    pub dscp: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssrc: Option<u32>,
+    /// RTP payload budget per datagram (bytes of payload excluding the RTP
+    /// header and RFC 4175 triplet headers). Typical 1428 for 1500-byte MTU.
+    #[serde(default = "default_st2110_video_payload_budget")]
+    pub payload_budget: usize,
+}
+
+/// Per-sub-stream bind (ST 2110-23 input). Each sub-stream is a valid -20
+/// receiver for one partition of the full video essence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct St2110_23SubStreamBind {
+    pub bind_addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<RedBlueBindConfig>,
+    #[serde(default = "default_st2110_video_pt")]
+    pub payload_type: u8,
+}
+
+/// Per-sub-stream destination (ST 2110-23 output).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct St2110_23SubStreamDest {
+    pub dest_addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<RedBlueBindConfig>,
+    #[serde(default = "default_st2110_video_pt")]
+    pub payload_type: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssrc: Option<u32>,
+}
+
+/// ST 2110-23 input: multiple -20 sub-streams reassembled into one essence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct St2110_23InputConfig {
+    pub sub_streams: Vec<St2110_23SubStreamBind>,
+    pub partition_mode: St2110_23PartitionModeConfig,
+    pub width: u32,
+    pub height: u32,
+    pub frame_rate_num: u32,
+    pub frame_rate_den: u32,
+    pub pixel_format: St2110VideoPixelFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_domain: Option<u8>,
+    pub video_encode: VideoEncodeConfig,
+}
+
+/// ST 2110-23 output: one essence split into N sub-stream -20 senders.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct St2110_23OutputConfig {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    pub sub_streams: Vec<St2110_23SubStreamDest>,
+    pub partition_mode: St2110_23PartitionModeConfig,
+    pub width: u32,
+    pub height: u32,
+    pub frame_rate_num: u32,
+    pub frame_rate_den: u32,
+    pub pixel_format: St2110VideoPixelFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_domain: Option<u8>,
+    #[serde(default = "default_dscp")]
+    pub dscp: u8,
+    #[serde(default = "default_st2110_video_payload_budget")]
+    pub payload_budget: usize,
+}
+
+fn default_st2110_video_pt() -> u8 {
+    96
+}
+
+fn default_st2110_video_payload_budget() -> usize {
+    1428
 }
 
 /// SMPTE ST 2110 flow group ("essence bundle") configuration.

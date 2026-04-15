@@ -1,14 +1,14 @@
 # NMOS support
 
-bilbycast-edge implements the broadcast-audio subset of the AMWA NMOS
-specifications:
+bilbycast-edge implements the broadcast-audio, broadcast-data, and
+uncompressed-video subsets of the AMWA NMOS specifications:
 
 | Spec | Endpoint | Status |
 |------|----------|--------|
 | IS-04 v1.3 | `/x-nmos/node/v1.3/` | self, devices, sources, flows, senders, receivers |
 | IS-05 v1.1 | `/x-nmos/connection/v1.1/` | single sender/receiver staged + active + transporttype + constraints |
 | IS-08 v1.0 | `/x-nmos/channelmapping/v1.0/` | io, map/active, map/staged, map/activate (active map persists to disk) |
-| BCP-004 | embedded in IS-04 receiver caps | constraint_sets for ST 2110 audio inputs |
+| BCP-004 | embedded in IS-04 receiver caps | constraint_sets for ST 2110 audio, data, and video inputs |
 | mDNS-SD | `_nmos-node._tcp` | best-effort registration via `mdns-sd` (pure Rust) |
 
 ## Format detection
@@ -17,12 +17,25 @@ Each flow's input is classified at IS-04 list time:
 
 - `InputConfig::St2110_30` / `St2110_31` → `urn:x-nmos:format:audio`
 - `InputConfig::St2110_40` → `urn:x-nmos:format:data`
+- `InputConfig::St2110_20` / `St2110_23` → `urn:x-nmos:format:video`
 - everything else → `urn:x-nmos:format:mux`
 
-The same classifier drives the receiver `caps` block. Audio receivers
-advertise BCP-004 constraint sets keyed by `urn:x-nmos:cap:format:*`
-URNs (sample_rate, channel_count, sample_depth) so NMOS controllers can
-reject incompatible senders before activation.
+The same classifier drives the receiver `caps` block:
+
+- **Audio receivers** advertise BCP-004 constraint sets
+  (`urn:x-nmos:cap:format:sample_rate`, `channel_count`, `sample_depth`).
+- **Data receivers** advertise `media_types: ["video/smpte291"]`.
+- **Video receivers** (ST 2110-20 / -23) advertise
+  `media_types: ["video/raw"]` with BCP-004 constraints:
+  - `urn:x-nmos:cap:format:color_sampling` = `YCbCr-4:2:2`
+  - `urn:x-nmos:cap:format:component_depth` ∈ {8, 10}
+  - `urn:x-nmos:cap:format:frame_width`, `frame_height` — the
+    configured resolution
+  - `urn:x-nmos:cap:format:grain_rate` — the configured
+    `frame_rate_num` / `frame_rate_den`
+
+NMOS controllers use these constraint sets to reject incompatible
+senders before activation.
 
 ## Clocks
 
@@ -79,12 +92,22 @@ NMOS controllers must obtain a token via the OAuth endpoint first, then include 
 
 ## Backward compatibility
 
-Multi-essence audio + data resources are additive — old NMOS controllers
-that only consumed `format:mux` continue to work because mux flows are
-still classified the same way. The IS-08 router is mounted under a fresh
-URL prefix and is invisible to controllers that don't speak it. The
-mDNS-SD registration is supplementary to manual NMOS registry
-configuration.
+Multi-essence audio + data + video resources are additive — old NMOS
+controllers that only consumed `format:mux` continue to work because
+mux flows are still classified the same way. ST 2110-20 / -23 flows
+advertise `format:video` with `video/raw` media type; controllers that
+don't recognise `video/raw` will see the flow but ignore the constraint
+set (graceful degrade). The IS-08 router is mounted under a fresh URL
+prefix and is invisible to controllers that don't speak it. The mDNS-SD
+registration is supplementary to manual NMOS registry configuration.
+
+## IS-05 and ST 2110-23
+
+IS-05 `/transportparams` reports the **primary sub-stream leg** for
+ST 2110-23 receivers (the first entry in `sub_streams`). Multi-leg
+transport params for the full -23 sub-stream set are a pending
+enhancement — IS-05 clients can still stage and activate the receiver
+from the primary leg.
 
 ## Pending external validation
 

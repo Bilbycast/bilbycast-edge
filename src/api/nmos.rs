@@ -110,12 +110,15 @@ fn input_transport(input: &InputConfig) -> &'static str {
         InputConfig::Rtp(_) => "urn:x-nmos:transport:rtp",
         InputConfig::Udp(_) => "urn:x-nmos:transport:rtp",
         InputConfig::Srt(_) => "urn:x-nmos:transport:rtp",
+        InputConfig::Rist(_) => "urn:x-nmos:transport:rtp",
         InputConfig::Rtmp(_) => "urn:x-nmos:transport:rtp",
         InputConfig::Rtsp(_) => "urn:x-nmos:transport:rtp",
         InputConfig::Webrtc(_) | InputConfig::Whep(_) => "urn:x-nmos:transport:websocket",
-        InputConfig::St2110_30(_) | InputConfig::St2110_31(_) | InputConfig::St2110_40(_) => {
-            "urn:x-nmos:transport:rtp"
-        }
+        InputConfig::St2110_30(_)
+        | InputConfig::St2110_31(_)
+        | InputConfig::St2110_40(_)
+        | InputConfig::St2110_20(_)
+        | InputConfig::St2110_23(_) => "urn:x-nmos:transport:rtp",
         InputConfig::RtpAudio(_) => "urn:x-nmos:transport:rtp",
     }
 }
@@ -125,12 +128,15 @@ fn output_transport(output: &OutputConfig) -> &'static str {
         OutputConfig::Rtp(_) => "urn:x-nmos:transport:rtp",
         OutputConfig::Udp(_) => "urn:x-nmos:transport:rtp",
         OutputConfig::Srt(_) => "urn:x-nmos:transport:rtp",
+        OutputConfig::Rist(_) => "urn:x-nmos:transport:rtp",
         OutputConfig::Rtmp(_) => "urn:x-nmos:transport:rtp",
         OutputConfig::Hls(_) => "urn:x-nmos:transport:rtp",
         OutputConfig::Webrtc(_) => "urn:x-nmos:transport:websocket",
-        OutputConfig::St2110_30(_) | OutputConfig::St2110_31(_) | OutputConfig::St2110_40(_) => {
-            "urn:x-nmos:transport:rtp"
-        }
+        OutputConfig::St2110_30(_)
+        | OutputConfig::St2110_31(_)
+        | OutputConfig::St2110_40(_)
+        | OutputConfig::St2110_20(_)
+        | OutputConfig::St2110_23(_) => "urn:x-nmos:transport:rtp",
         OutputConfig::RtpAudio(_) => "urn:x-nmos:transport:rtp",
     }
 }
@@ -144,6 +150,7 @@ fn input_format(input: &InputConfig) -> &'static str {
     match input {
         InputConfig::St2110_30(_) | InputConfig::St2110_31(_) => "urn:x-nmos:format:audio",
         InputConfig::St2110_40(_) => "urn:x-nmos:format:data",
+        InputConfig::St2110_20(_) | InputConfig::St2110_23(_) => "urn:x-nmos:format:video",
         _ => "urn:x-nmos:format:mux",
     }
 }
@@ -157,6 +164,7 @@ fn output_format(output: &OutputConfig) -> &'static str {
     match output {
         OutputConfig::St2110_30(_) | OutputConfig::St2110_31(_) => "urn:x-nmos:format:audio",
         OutputConfig::St2110_40(_) => "urn:x-nmos:format:data",
+        OutputConfig::St2110_20(_) | OutputConfig::St2110_23(_) => "urn:x-nmos:format:video",
         _ => "urn:x-nmos:format:mux",
     }
 }
@@ -207,6 +215,28 @@ fn receiver_caps(input: &InputConfig) -> serde_json::Value {
     match input {
         InputConfig::St2110_30(c) | InputConfig::St2110_31(c) => audio_receiver_caps(c),
         InputConfig::St2110_40(_) => anc_receiver_caps(),
+        InputConfig::St2110_20(c) => serde_json::json!({
+            "media_types": ["video/raw"],
+            "constraint_sets": [{
+                "urn:x-nmos:cap:format:media_type": {"enum": ["video/raw"]},
+                "urn:x-nmos:cap:format:color_sampling": {"enum": ["YCbCr-4:2:2"]},
+                "urn:x-nmos:cap:format:component_depth": {"enum": [c.pixel_format.depth() as u64]},
+                "urn:x-nmos:cap:format:frame_width": {"enum": [c.width as u64]},
+                "urn:x-nmos:cap:format:frame_height": {"enum": [c.height as u64]},
+                "urn:x-nmos:cap:format:grain_rate": {"enum": [{"numerator": c.frame_rate_num, "denominator": c.frame_rate_den}]}
+            }]
+        }),
+        InputConfig::St2110_23(c) => serde_json::json!({
+            "media_types": ["video/raw"],
+            "constraint_sets": [{
+                "urn:x-nmos:cap:format:media_type": {"enum": ["video/raw"]},
+                "urn:x-nmos:cap:format:color_sampling": {"enum": ["YCbCr-4:2:2"]},
+                "urn:x-nmos:cap:format:component_depth": {"enum": [c.pixel_format.depth() as u64]},
+                "urn:x-nmos:cap:format:frame_width": {"enum": [c.width as u64]},
+                "urn:x-nmos:cap:format:frame_height": {"enum": [c.height as u64]},
+                "urn:x-nmos:cap:format:grain_rate": {"enum": [{"numerator": c.frame_rate_num, "denominator": c.frame_rate_den}]}
+            }]
+        }),
         _ => serde_json::json!({"media_types": ["video/MP2T"]}),
     }
 }
@@ -226,6 +256,9 @@ fn source_caps(input: &InputConfig) -> serde_json::Value {
             }]
         }),
         InputConfig::St2110_40(_) => serde_json::json!({"media_types": ["video/smpte291"]}),
+        InputConfig::St2110_20(_) | InputConfig::St2110_23(_) => {
+            serde_json::json!({"media_types": ["video/raw"]})
+        }
         _ => serde_json::json!({}),
     }
 }
@@ -235,6 +268,7 @@ fn input_type_str(input: &InputConfig) -> &'static str {
         InputConfig::Rtp(_) => "rtp",
         InputConfig::Udp(_) => "udp",
         InputConfig::Srt(_) => "srt",
+        InputConfig::Rist(_) => "rist",
         InputConfig::Rtmp(_) => "rtmp",
         InputConfig::Rtsp(_) => "rtsp",
         InputConfig::Webrtc(_) => "webrtc",
@@ -242,6 +276,8 @@ fn input_type_str(input: &InputConfig) -> &'static str {
         InputConfig::St2110_30(_) => "st2110_30",
         InputConfig::St2110_31(_) => "st2110_31",
         InputConfig::St2110_40(_) => "st2110_40",
+        InputConfig::St2110_20(_) => "st2110_20",
+        InputConfig::St2110_23(_) => "st2110_23",
         InputConfig::RtpAudio(_) => "rtp_audio",
     }
 }
@@ -251,12 +287,15 @@ fn output_id(output: &OutputConfig) -> &str {
         OutputConfig::Rtp(c) => &c.id,
         OutputConfig::Udp(c) => &c.id,
         OutputConfig::Srt(c) => &c.id,
+        OutputConfig::Rist(c) => &c.id,
         OutputConfig::Rtmp(c) => &c.id,
         OutputConfig::Hls(c) => &c.id,
         OutputConfig::Webrtc(c) => &c.id,
         OutputConfig::St2110_30(c) => &c.id,
         OutputConfig::St2110_31(c) => &c.id,
         OutputConfig::St2110_40(c) => &c.id,
+        OutputConfig::St2110_20(c) => &c.id,
+        OutputConfig::St2110_23(c) => &c.id,
         OutputConfig::RtpAudio(c) => &c.id,
     }
 }
@@ -266,12 +305,15 @@ fn output_name(output: &OutputConfig) -> &str {
         OutputConfig::Rtp(c) => &c.name,
         OutputConfig::Udp(c) => &c.name,
         OutputConfig::Srt(c) => &c.name,
+        OutputConfig::Rist(c) => &c.name,
         OutputConfig::Rtmp(c) => &c.name,
         OutputConfig::Hls(c) => &c.name,
         OutputConfig::Webrtc(c) => &c.name,
         OutputConfig::St2110_30(c) => &c.name,
         OutputConfig::St2110_31(c) => &c.name,
         OutputConfig::St2110_40(c) => &c.name,
+        OutputConfig::St2110_20(c) => &c.name,
+        OutputConfig::St2110_23(c) => &c.name,
         OutputConfig::RtpAudio(c) => &c.name,
     }
 }

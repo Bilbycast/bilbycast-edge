@@ -42,6 +42,21 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
   - Automatic reconnection
   - **`transport_mode: "audio_302m"`** (deferred — see [audio-gateway.md](audio-gateway.md#limitations-and-deferred-items)): demux SMPTE 302M LPCM-in-MPEG-TS from `ffmpeg -c:a s302m`, `srt-live-transmit`, or hardware encoders, and republish as RTP audio packets onto the broadcast channel
 
+### RIST Simple Profile (VSF TR-06-1:2020)
+- **Direction:** Input and Output
+- **Transport:** UDP (RTP on even port P, RTCP on P+1) with RTCP NACK retransmission
+- **Implementation:** Pure-Rust `bilbycast-rist` v0.2.0 (zero C deps, wire-verified interop with librist 0.2.11 `ristsender` / `ristreceiver`)
+- **Features:**
+  - Reliable RTP transport with NACK-based retransmission, configurable jitter / retransmit buffer depth
+  - RTCP SR/RR/SDES and RTT echo, TR-06-1-compliant (RTCP interval ≤ 100 ms)
+  - Dynamic RTCP source-address learning — no P+1 assumption on the receive side, so librist senders bound to ephemeral RTCP ports interop cleanly
+  - SMPTE 2022-7 dual-leg hitless redundancy (two RistSockets merged via the shared `HitlessMerger`)
+  - Payload carried as `RtpPacket { is_raw_ts: true }` — the RIST layer strips RTP before delivery, so the flow pipeline sees raw MPEG-TS
+- **Limitations (v1):**
+  - No PSK or DTLS encryption yet (stubbed in bilbycast-rist; use QUIC tunnels or a trusted network segment for confidentiality)
+  - No FEC (RIST Main Profile / TR-06-2 is deferred pending a GRE-over-UDP encapsulation)
+  - Input accepts both single-leg and SMPTE 2022-7 dual-leg; Output also supports SMPTE 2022-7 dual-leg (duplicates outbound packets to both sockets)
+
 ### `rtp_audio` (RFC 3551 PCM over RTP, no PTP)
 - **Direction:** Input and Output
 - **Transport:** UDP unicast or multicast, IPv4 and IPv6
@@ -115,6 +130,18 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
     `packet_filter`, `program_number`, and 2022-7 redundancy. See
     [audio-gateway.md](audio-gateway.md) for the full pipeline,
     interop tests, and worked use cases.
+
+### RIST Simple Profile (VSF TR-06-1:2020)
+- **Direction:** Output
+- **Transport:** UDP (RTP on even port P, RTCP on P+1) with RTCP NACK retransmission
+- **Implementation:** Pure-Rust `bilbycast-rist` v0.2.0 (zero C deps, wire-verified against librist 0.2.11)
+- **Features:**
+  - Reliable RTP transmission, NACK-driven retransmit with configurable buffer depth
+  - RTCP SR/SDES emission, RTT echo, NTP-aligned RTP timestamps for precise receiver output timing
+  - SMPTE 2022-7 dual-leg red/blue duplication (two RistSockets, one per `remote_addr`)
+  - **MPTS passthrough** or optional MPTS→SPTS program filter via `program_number`
+  - Shared `TsAudioReplacer` / `TsVideoReplacer` stages (same `audio_encode` / `video_encode` matrix as SRT / UDP / RTP outputs)
+  - Output delay block for stream synchronisation (fixed ms, target latency ms, or target frames)
 
 ### RTMP/RTMPS
 - **Direction:** Input (publish) and Output (publish)
@@ -200,6 +227,53 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
   - Same SMPTE 2022-7 dual-network and source allow-list options as -30/-31
   - SCTE-104 messages auto-detected and emitted as `scte104` events
 - **NMOS:** advertised as `urn:x-nmos:format:data` in IS-04
+
+### SMPTE ST 2110-20 (uncompressed video, Phase 2)
+- **Direction:** Input and Output
+- **Transport:** RFC 4175 RTP/UDP
+- **Pixel formats:** YCbCr-4:2:2 at 8-bit (pgroup=4 bytes/2 pixels) and
+  10-bit LE (pgroup=5 bytes/2 pixels). Other RFC 4175 formats are
+  validated-and-rejected in Phase 2.
+- **Non-blocking pipeline:**
+  - **Input:** RedBluePair → `Rfc4175Depacketizer` → bounded mpsc →
+    `spawn_blocking` worker running `video-engine::VideoEncoder`
+    (x264/x265/NVENC, selected by `video_encode.codec`) →
+    `TsMuxer` → `RtpPacket { is_raw_ts: true }` onto the flow's
+    broadcast. The `video_encode` block is **mandatory** — ingress is
+    always a pixel-to-compressed conversion.
+  - **Output:** broadcast → `TsDemuxer` → bounded mpsc →
+    `spawn_blocking` worker running `video-engine::VideoDecoder` +
+    `VideoScaler::new_with_dst_format` (new 4:2:2 8/10-bit targets)
+    → pgroup pack → `Rfc4175Packetizer` → `UdpSocket::send_to`
+    (Red + optional Blue). No encoder block is accepted.
+- **2022-7 Red/Blue:** per-input and per-output via the existing
+  `redundancy` field.
+- **Feature gating:** ST 2110-20 **inputs** require a compile-time
+  `video-encoder-*` feature (x264 / x265 / NVENC). Default LGPL-clean
+  builds will deserialize the config but the encode worker logs an
+  error and drops frames. ST 2110-20 **outputs** only need the
+  `video-thumbnail` feature (default on).
+- **NMOS:** advertised as `urn:x-nmos:format:video` in IS-04 with
+  BCP-004 receiver caps declaring `video/raw`,
+  `color_sampling=YCbCr-4:2:2`, `component_depth` ∈ {8, 10},
+  `frame_width`, `frame_height`, and `grain_rate` (from the configured
+  `frame_rate_num`/`frame_rate_den`).
+
+### SMPTE ST 2110-23 (single video essence over multiple -20 streams)
+- **Direction:** Input and Output
+- **Transport:** N independent RFC 4175 RTP/UDP sub-streams carrying
+  partitions of one essence
+- **Partition modes (Phase 2):** `two_sample_interleave` (2SI),
+  `sample_row`. `sample_column` is validated-and-rejected.
+- **Reassembler / partitioner:** lives in
+  `src/engine/st2110/video.rs` and reuses the same encode / decode
+  workers as ST 2110-20 once the essence is reassembled / before it
+  is split. The reassembler is timestamp-keyed with `max_in_flight=4`
+  to bound memory under asymmetric loss.
+- **2022-7 Red/Blue:** configurable per sub-stream.
+- **NMOS:** advertised as `urn:x-nmos:format:video` with BCP-004 caps
+  identical to the -20 shape (the multi-stream decomposition is a
+  transport detail, not a format difference).
 
 ### WebRTC (WHIP/WHEP)
 - **Direction:** Input and Output

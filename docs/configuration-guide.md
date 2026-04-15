@@ -1534,14 +1534,30 @@ Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json
 }
 ```
 
-## SMPTE ST 2110 (Phase 1)
+## SMPTE ST 2110
 
-bilbycast-edge supports the broadcast-audio and broadcast-data subset of
-SMPTE ST 2110: **ST 2110-30** (linear PCM L16/L24), **ST 2110-31** (AES3
-transparent for Dolby E and similar), and **ST 2110-40** (RFC 8331
-ancillary data including SCTE-104, SMPTE 12M timecode, CEA-608/708
-captions). Video essences (ST 2110-22 JPEG XS, ST 2110-20 uncompressed)
-are reserved for Phase 2 and Phase 3.
+bilbycast-edge supports the broadcast-audio, broadcast-data, and
+uncompressed-video subsets of SMPTE ST 2110:
+
+- **Phase 1** (audio / data):
+  - **ST 2110-30** — linear PCM L16/L24.
+  - **ST 2110-31** — AES3 transparent for Dolby E and similar.
+  - **ST 2110-40** — RFC 8331 ancillary data including SCTE-104,
+    SMPTE 12M timecode, CEA-608/708 captions.
+- **Phase 2** (uncompressed video):
+  - **ST 2110-20** — RFC 4175 uncompressed video. Inputs decode from
+    the wire and encode into H.264/HEVC MPEG-TS via an in-process
+    encoder (`x264`/`x265`/`h264_nvenc`/`hevc_nvenc`); outputs decode
+    the flow's source TS and RFC 4175-packetize onto the wire. Pixel
+    formats: **YCbCr-4:2:2 at 8-bit and 10-bit** (other formats are
+    rejected by validation). Requires a `video-encoder-*` feature at
+    build time for inputs; the `video-thumbnail` feature (default on)
+    is enough for outputs.
+  - **ST 2110-23** — a single uncompressed video essence split across
+    N ST 2110-20 sub-streams. Partition modes: `two_sample_interleave`
+    (2SI) and `sample_row`.
+- **Deferred**: ST 2110-22 (JPEG XS) is not yet supported; integration
+  is tracked under Phase 2 follow-up work.
 
 PTP integration is best-effort and reads from an external `ptp4l`
 daemon's management Unix socket — no PTP daemon ships in the edge. SMPTE
@@ -1788,6 +1804,125 @@ Flow:
 }
 ```
 
+### ST 2110-20 uncompressed video input
+
+Mandatory `video_encode` block — the ingress pipeline depacketizes RFC
+4175, pushes raw frames into a blocking worker that feeds the encoder,
+then muxes the H.264/HEVC output into MPEG-TS for the flow.
+
+```json
+{
+  "id": "stadium-cam-in",
+  "name": "Stadium camera (uncompressed 1080p60)",
+  "type": "st2110_20",
+  "bind_addr": "239.0.0.30:5000",
+  "interface_addr": "10.0.0.5",
+  "width": 1920,
+  "height": 1080,
+  "frame_rate_num": 60,
+  "frame_rate_den": 1,
+  "pixel_format": "yuv422_10bit",
+  "payload_type": 96,
+  "video_encode": {
+    "codec": "x264",
+    "bitrate_kbps": 15000,
+    "preset": "veryfast",
+    "profile": "high"
+  },
+  "redundancy": {
+    "addr": "239.1.0.30:5000",
+    "interface_addr": "10.1.0.5"
+  }
+}
+```
+
+### ST 2110-20 uncompressed video output
+
+```json
+{
+  "type": "st2110_20",
+  "id": "monitor-uncompressed",
+  "name": "Uncompressed monitor feed",
+  "dest_addr": "239.2.0.30:5000",
+  "interface_addr": "10.0.0.5",
+  "width": 1920,
+  "height": 1080,
+  "frame_rate_num": 60,
+  "frame_rate_den": 1,
+  "pixel_format": "yuv422_10bit",
+  "payload_type": 96,
+  "dscp": 46,
+  "payload_budget": 1428
+}
+```
+
+The output decodes the flow's source H.264/HEVC TS in an in-process
+blocking worker (`VideoDecoder` → `VideoScaler` → pgroup pack), then
+RFC 4175-packetizes onto the wire (Red + optional Blue). `payload_budget`
+is the per-datagram byte budget for RTP payload (defaults to `1428`
+which is safe for 1500-byte MTU; raise for jumbo frames). No
+`video_encode` block is allowed on the output — the decode step is
+implicit.
+
+### ST 2110-23 multi-stream video
+
+ST 2110-23 binds N ST 2110-20 receivers/senders that carry partitions
+of one video essence. The reassembler / partitioner lives in
+[`src/engine/st2110/video.rs`](../src/engine/st2110/video.rs).
+
+Input:
+
+```json
+{
+  "id": "uhd-multi-in",
+  "name": "UHDTV1 (4 sub-streams, 2SI)",
+  "type": "st2110_23",
+  "partition_mode": "two_sample_interleave",
+  "width": 3840,
+  "height": 2160,
+  "frame_rate_num": 60,
+  "frame_rate_den": 1,
+  "pixel_format": "yuv422_10bit",
+  "sub_streams": [
+    { "bind_addr": "239.0.0.40:5000", "payload_type": 96 },
+    { "bind_addr": "239.0.0.41:5000", "payload_type": 96 },
+    { "bind_addr": "239.0.0.42:5000", "payload_type": 96 },
+    { "bind_addr": "239.0.0.43:5000", "payload_type": 96 }
+  ],
+  "video_encode": {
+    "codec": "hevc_nvenc",
+    "bitrate_kbps": 40000
+  }
+}
+```
+
+Output:
+
+```json
+{
+  "type": "st2110_23",
+  "id": "uhd-multi-out",
+  "name": "UHDTV1 sender (4 × 2SI)",
+  "partition_mode": "two_sample_interleave",
+  "width": 3840,
+  "height": 2160,
+  "frame_rate_num": 60,
+  "frame_rate_den": 1,
+  "pixel_format": "yuv422_10bit",
+  "sub_streams": [
+    { "dest_addr": "239.2.0.40:5000" },
+    { "dest_addr": "239.2.0.41:5000" },
+    { "dest_addr": "239.2.0.42:5000" },
+    { "dest_addr": "239.2.0.43:5000" }
+  ],
+  "dscp": 46,
+  "payload_budget": 1428
+}
+```
+
+Each sub-stream accepts its own `redundancy` block for independent
+2022-7 Red/Blue duplication.
+
 ### Validation limits
 
 | Field | Allowed values |
@@ -1800,12 +1935,26 @@ Flow:
 | `payload_type` | `96`–`127` |
 | `clock_domain` | `0`–`127` |
 | `dscp` | `0`–`63` (default `46` / EF) |
+| ST 2110-20/-23 `pixel_format` | `"yuv422_8bit"`, `"yuv422_10bit"` |
+| ST 2110-20/-23 `width` / `height` | `64`–`8192`, even |
+| ST 2110-20/-23 `frame_rate` | `1`–`240` fps (num/den) |
+| ST 2110-20/-23 `payload_budget` | `512`–`8952` bytes |
+| ST 2110-23 `sub_streams` length | `2`–`16` |
+| ST 2110-23 `partition_mode` | `"two_sample_interleave"`, `"sample_row"` |
 | `rtp_audio.sample_rate` | `32000`, `44100`, `48000`, `88200`, `96000` |
 | `rtp_audio.bit_depth` | `16`, `24` |
 | `transcode.sample_rate` | `32000`, `44100`, `48000`, `88200`, `96000` |
 | `transcode.bit_depth` | `16`, `20`, `24` |
 | `transcode.channels` | `1`..=`16` |
 | SRT/UDP/`rtp_audio` `transport_mode` | `"ts"` (default — UDP/SRT), `"rtp"` (default — `rtp_audio`), `"audio_302m"` |
+
+ST 2110-20/-23 inputs **require** a `video_encode` block — the config
+is rejected otherwise — because ingress is always a pixel-to-compressed
+conversion. ST 2110-20/-23 outputs reject `video_encode` entirely
+because the decode step is implicit. Encoder backends obey the same
+Cargo-feature opt-in gate as existing `video_encode` outputs: default
+LGPL-clean builds accept the config but the encode worker logs an
+error and drops frames at runtime.
 
 When `transport_mode == "audio_302m"`:
 

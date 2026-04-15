@@ -88,6 +88,14 @@ fn populate_transport_info(input: &InputConfig, state: &mut MediaAnalysisState) 
                 state.redundancy_type = Some("SMPTE 2022-7".to_string());
             }
         }
+        InputConfig::Rist(rist) => {
+            state.protocol = "rist".to_string();
+            state.payload_format = "raw_ts".to_string();
+            if rist.redundancy.is_some() {
+                state.redundancy_enabled = true;
+                state.redundancy_type = Some("SMPTE 2022-7".to_string());
+            }
+        }
         InputConfig::Rtmp(_) => {
             state.protocol = "rtmp".to_string();
             state.payload_format = "raw_ts".to_string();
@@ -123,6 +131,14 @@ fn populate_transport_info(input: &InputConfig, state: &mut MediaAnalysisState) 
             } else {
                 "pcm_l24".to_string()
             };
+        }
+        InputConfig::St2110_20(_) => {
+            state.protocol = "st2110_20".to_string();
+            state.payload_format = "rfc4175_ycbcr422".to_string();
+        }
+        InputConfig::St2110_23(_) => {
+            state.protocol = "st2110_23".to_string();
+            state.payload_format = "rfc4175_ycbcr422_multi".to_string();
         }
     }
 }

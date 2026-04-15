@@ -311,11 +311,13 @@ impl SecretsConfig {
                     whep.bearer_token = is.bearer_token.clone();
                 }
             }
-            InputConfig::Rtp(_) | InputConfig::Udp(_) => {}
+            InputConfig::Rtp(_) | InputConfig::Udp(_) | InputConfig::Rist(_) => {}
             // SMPTE ST 2110 inputs carry no per-input secrets in Phase 1.
             InputConfig::St2110_30(_)
             | InputConfig::St2110_31(_)
             | InputConfig::St2110_40(_)
+            | InputConfig::St2110_20(_)
+            | InputConfig::St2110_23(_)
             | InputConfig::RtpAudio(_) => {}
         }
     }
@@ -351,11 +353,13 @@ impl SecretsConfig {
                     webrtc.bearer_token = os.bearer_token.clone();
                 }
             }
-            OutputConfig::Rtp(_) | OutputConfig::Udp(_) => {}
+            OutputConfig::Rtp(_) | OutputConfig::Udp(_) | OutputConfig::Rist(_) => {}
             // SMPTE ST 2110 outputs carry no per-output secrets in Phase 1.
             OutputConfig::St2110_30(_)
             | OutputConfig::St2110_31(_)
             | OutputConfig::St2110_40(_)
+            | OutputConfig::St2110_20(_)
+            | OutputConfig::St2110_23(_)
             | OutputConfig::RtpAudio(_) => {}
         }
     }

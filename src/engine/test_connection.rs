@@ -81,6 +81,7 @@ pub async fn test_input(config: &InputConfig) -> TestResult {
     let result = tokio::time::timeout(TEST_TIMEOUT, async {
         match config {
             InputConfig::Srt(srt) => test_srt_input(srt, &cancel).await,
+            InputConfig::Rist(rist) => test_udp_bind(&rist.bind_addr, "RIST").await,
             InputConfig::Rtp(rtp) => test_udp_bind(&rtp.bind_addr, "RTP").await,
             InputConfig::Udp(udp) => test_udp_bind(&udp.bind_addr, "UDP").await,
             InputConfig::Rtmp(rtmp) => test_tcp_listen(&rtmp.listen_addr, "RTMP").await,
@@ -99,6 +100,16 @@ pub async fn test_input(config: &InputConfig) -> TestResult {
             }
             InputConfig::RtpAudio(rtp_audio) => {
                 test_udp_bind(&rtp_audio.bind_addr, "RTP Audio").await
+            }
+            InputConfig::St2110_20(v) => {
+                test_udp_bind(&v.bind_addr, "ST 2110-20 video").await
+            }
+            InputConfig::St2110_23(v) => {
+                if let Some(first) = v.sub_streams.first() {
+                    test_udp_bind(&first.bind_addr, "ST 2110-23 video (sub_stream[0])").await
+                } else {
+                    TestResult::err("ST 2110-23 input missing sub_streams", start.elapsed())
+                }
             }
         }
     })
@@ -120,6 +131,7 @@ pub async fn test_output(config: &OutputConfig) -> TestResult {
     let result = tokio::time::timeout(TEST_TIMEOUT, async {
         match config {
             OutputConfig::Srt(srt) => test_srt_output(srt, &cancel).await,
+            OutputConfig::Rist(rist) => test_udp_send_socket(&rist.remote_addr, "RIST").await,
             OutputConfig::Rtp(rtp) => test_udp_send_socket(&rtp.dest_addr, "RTP").await,
             OutputConfig::Udp(udp) => test_udp_send_socket(&udp.dest_addr, "UDP").await,
             OutputConfig::Rtmp(rtmp) => test_tcp_connect_url(&rtmp.dest_url, "RTMP").await,
@@ -137,6 +149,16 @@ pub async fn test_output(config: &OutputConfig) -> TestResult {
             }
             OutputConfig::RtpAudio(rtp_audio) => {
                 test_udp_send_socket(&rtp_audio.dest_addr, "RTP Audio").await
+            }
+            OutputConfig::St2110_20(v) => {
+                test_udp_send_socket(&v.dest_addr, "ST 2110-20 video").await
+            }
+            OutputConfig::St2110_23(v) => {
+                if let Some(first) = v.sub_streams.first() {
+                    test_udp_send_socket(&first.dest_addr, "ST 2110-23 video (sub_stream[0])").await
+                } else {
+                    TestResult::err("ST 2110-23 output missing sub_streams", start.elapsed())
+                }
             }
         }
     })
