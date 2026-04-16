@@ -41,6 +41,11 @@ enum EncoderState {
         decoder: AacDecoder,
         encoder: AudioEncoder,
         decode_stats: Arc<DecodeStats>,
+        /// Optional planar PCM shuffle / resample stage between decoder and
+        /// encoder. `None` unless `config.transcode` was set. Passthrough
+        /// fast-paths inside `PlanarAudioTranscoder` mean an empty block is
+        /// effectively a clone.
+        transcoder: Option<super::audio_transcode::PlanarAudioTranscoder>,
     },
     /// Decoder or encoder construction failed once. Drop audio for the
     /// rest of the output's lifetime; the failure event was already
@@ -321,15 +326,30 @@ async fn publish_loop(
                             stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
                             stats.record_latency(recv_time_us);
                         }
-                        EncoderState::Active { decoder, encoder, decode_stats } => {
-                            // Decode AAC → planar f32 → submit to encoder.
-                            // Errors are logged once at debug; we don't
-                            // tear down the output on a single bad frame.
+                        EncoderState::Active { decoder, encoder, decode_stats, transcoder } => {
+                            // Decode AAC → optional planar shuffle/SRC →
+                            // submit to encoder. Errors are logged once at
+                            // debug; we don't tear down the output on a
+                            // single bad frame.
                             decode_stats.inc_input();
                             match decoder.decode_frame(&data) {
                                 Ok(planar) => {
                                     decode_stats.inc_output();
-                                    encoder.submit_planar(&planar, pts);
+                                    if let Some(tc) = transcoder.as_mut() {
+                                        match tc.process(&planar) {
+                                            Ok(shuffled) => {
+                                                encoder.submit_planar(&shuffled, pts);
+                                            }
+                                            Err(e) => {
+                                                tracing::debug!(
+                                                    "RTMP output '{}': transcode failed: {e}",
+                                                    config.id
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        encoder.submit_planar(&planar, pts);
+                                    }
                                 }
                                 Err(e) => {
                                     decode_stats.inc_error();
@@ -571,10 +591,12 @@ fn build_encoder_state(
     };
 
     // Same-codec fast path: AAC-LC input → AAC-LC output, no overrides.
+    // Disabled when a transcode block is present — transcode requires the
+    // decode→encode pipeline to apply channel remap / SRC.
     let no_overrides = enc_cfg.bitrate_kbps.is_none()
         && enc_cfg.sample_rate.is_none()
         && enc_cfg.channels.is_none();
-    if codec == AudioCodec::AacLc && no_overrides {
+    if codec == AudioCodec::AacLc && no_overrides && config.transcode.is_none() {
         tracing::info!(
             "RTMP output '{}': audio_encode same-codec passthrough (AAC-LC {} Hz {} ch)",
             config.id, input_sr, input_ch
@@ -582,14 +604,58 @@ fn build_encoder_state(
         return EncoderState::Transparent;
     }
 
-    let target_sr = enc_cfg.sample_rate.unwrap_or(input_sr);
-    let target_ch = enc_cfg.channels.unwrap_or(input_ch);
+    // Resolve the encoder's input shape. When a transcode block is set it
+    // wins — fold any audio_encode overrides into it as fallbacks for fields
+    // the block leaves unset, build the transcoder, and use its output as
+    // the encoder input.
+    let (target_sr, target_ch, transcoder) = if let Some(tj_in) = config.transcode.as_ref() {
+        let merged = super::audio_transcode::TranscodeJson {
+            sample_rate: tj_in.sample_rate.or(enc_cfg.sample_rate),
+            channels: tj_in.channels.or(enc_cfg.channels),
+            ..tj_in.clone()
+        };
+        match super::audio_transcode::PlanarAudioTranscoder::new(
+            input_sr,
+            input_ch,
+            &merged,
+        ) {
+            Ok(tc) => (tc.out_sample_rate(), tc.out_channels(), Some(tc)),
+            Err(e) => {
+                let msg = format!(
+                    "RTMP output '{}': audio_encode transcode build failed: {e}",
+                    config.id
+                );
+                tracing::error!("{msg}");
+                event_sender.emit_flow(
+                    EventSeverity::Critical,
+                    crate::manager::events::category::AUDIO_ENCODE,
+                    msg,
+                    flow_id,
+                );
+                return EncoderState::Failed;
+            }
+        }
+    } else {
+        (
+            enc_cfg.sample_rate.unwrap_or(input_sr),
+            enc_cfg.channels.unwrap_or(input_ch),
+            None,
+        )
+    };
     let target_br = enc_cfg.bitrate_kbps.unwrap_or_else(|| codec.default_bitrate_kbps());
 
+    // When a transcoder is in front of the encoder, it has already aligned
+    // the PCM to (target_sr, target_ch), so the encoder sees its target
+    // format as input and performs no internal SRC / channel mapping.
+    let (enc_in_sr, enc_in_ch) = if transcoder.is_some() {
+        (target_sr, target_ch)
+    } else {
+        (input_sr, input_ch)
+    };
     let params = EncoderParams {
         codec,
-        sample_rate: input_sr,
-        channels: input_ch,
+        sample_rate: enc_in_sr,
+        channels: enc_in_ch,
         target_bitrate_kbps: target_br,
         target_sample_rate: target_sr,
         target_channels: target_ch,
@@ -673,7 +739,7 @@ fn build_encoder_state(
         encoder.params().target_bitrate_kbps,
     );
 
-    EncoderState::Active { decoder, encoder, decode_stats }
+    EncoderState::Active { decoder, encoder, decode_stats, transcoder }
 }
 
 /// Reverse of `sample_rate_from_index`: maps a sample rate (Hz) to its

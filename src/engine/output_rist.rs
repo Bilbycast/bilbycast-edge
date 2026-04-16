@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 use rist_transport::{RistSocket, RistSocketConfig};
 
 use crate::config::models::{RistOutputConfig, RistOutputRedundancyConfig};
-use crate::manager::events::{EventSender, EventSeverity};
+use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::OutputStatsAccumulator;
 use crate::util::time::now_us;
 
@@ -78,7 +78,7 @@ pub fn spawn_rist_output(
             tracing::error!("RIST output '{}' exited with error: {e}", config.id);
             event_sender.emit_flow(
                 EventSeverity::Critical,
-                "rist",
+                category::RIST,
                 format!("RIST output '{}' exited with error: {e}", config.id),
                 &flow_id,
             );
@@ -199,7 +199,7 @@ async fn rist_output_loop(
     );
     events.emit_flow(
         EventSeverity::Info,
-        "rist",
+        category::RIST,
         format!("RIST output '{}' connected -> {}", config.id, remote),
         flow_id,
     );
@@ -208,12 +208,19 @@ async fn rist_output_loop(
     let mut filter_scratch: Vec<u8> = Vec::new();
 
     let mut audio_replacer = match config.audio_encode.as_ref() {
-        Some(enc) => match TsAudioReplacer::new(enc) {
+        Some(enc) => match TsAudioReplacer::new(enc, config.transcode.clone()) {
             Ok(r) => {
                 tracing::info!(
                     "RIST output '{}': audio_encode active ({})",
                     config.id,
                     r.target_description()
+                );
+                events.emit_output_with_details(
+                    EventSeverity::Info,
+                    category::AUDIO_ENCODE,
+                    format!("TS audio encoder started: output '{}'", config.id),
+                    &config.id,
+                    serde_json::json!({ "codec": enc.codec }),
                 );
                 Some(r)
             }
@@ -221,6 +228,13 @@ async fn rist_output_loop(
                 tracing::error!(
                     "RIST output '{}': audio_encode rejected: {e}; audio will be left untouched",
                     config.id
+                );
+                events.emit_output_with_details(
+                    EventSeverity::Critical,
+                    category::AUDIO_ENCODE,
+                    format!("TS audio encoder failed: output '{}': {e}", config.id),
+                    &config.id,
+                    serde_json::json!({ "error": e.to_string() }),
                 );
                 None
             }
@@ -260,12 +274,26 @@ async fn rist_output_loop(
                     config.id,
                     r.target_description()
                 );
+                events.emit_output_with_details(
+                    EventSeverity::Info,
+                    category::VIDEO_ENCODE,
+                    format!("Video encoder started: output '{}'", config.id),
+                    &config.id,
+                    serde_json::json!({ "codec": enc.codec }),
+                );
                 Some(r)
             }
             Err(e) => {
                 tracing::error!(
                     "RIST output '{}': video_encode rejected: {e}; video will be left untouched",
                     config.id
+                );
+                events.emit_output_with_details(
+                    EventSeverity::Critical,
+                    category::VIDEO_ENCODE,
+                    format!("Video encoder failed: output '{}': {e}", config.id),
+                    &config.id,
+                    serde_json::json!({ "error": e.to_string() }),
                 );
                 None
             }

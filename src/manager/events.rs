@@ -241,6 +241,27 @@ pub mod category {
     /// System resource threshold events (CPU/RAM warning, critical, recovery).
     /// Emitted by `engine::resource_monitor`.
     pub const SYSTEM_RESOURCES: &str = "system_resources";
+    // ── Protocol and infrastructure categories ──
+    /// RIST Simple Profile connection lifecycle.
+    pub const RIST: &str = "rist";
+    /// RTP input bind and lifecycle events.
+    pub const RTP: &str = "rtp";
+    /// UDP input bind and lifecycle events.
+    pub const UDP: &str = "udp";
+    /// Video transcoding lifecycle (TsVideoReplacer start / fail).
+    pub const VIDEO_ENCODE: &str = "video_encode";
+    /// Flow group start/stop events.
+    pub const FLOW_GROUP: &str = "flow_group";
+    /// Configuration change events.
+    pub const CONFIG: &str = "config";
+    /// Manager WebSocket connection lifecycle.
+    pub const MANAGER: &str = "manager";
+    /// SMPTE 2022-7 SRT redundancy leg events.
+    pub const REDUNDANCY: &str = "redundancy";
+    /// Standby SRT listener port management.
+    pub const STANDBY: &str = "standby";
+    /// Tunnel port conflict events.
+    pub const PORT_CONFLICT: &str = "port_conflict";
 }
 
 /// Create an event sender/receiver pair.

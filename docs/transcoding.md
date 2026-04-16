@@ -1,9 +1,9 @@
-# Transcoding reference — audio_encode + video_encode
+# Transcoding reference — audio_encode + transcode + video_encode
 
-This document is the canonical reference for the `audio_encode` and
-`video_encode` output blocks in `bilbycast-edge`, plus a running record
-of the known limitations and work deferred for later phases. When
-planning follow-up work, start here.
+This document is the canonical reference for the `audio_encode`,
+`transcode`, and `video_encode` output blocks in `bilbycast-edge`, plus
+a running record of the known limitations and work deferred for later
+phases. When planning follow-up work, start here.
 
 ---
 
@@ -12,16 +12,18 @@ planning follow-up work, start here.
 Legend: ✅ = wired and tested, ⏳ = planned (tracked below), ❌ = not
 applicable / by design.
 
-| Output     | `audio_encode` | `video_encode` | Notes |
-|------------|:--------------:|:--------------:|-------|
-| **SRT**    | ✅              | ✅              | Both transforms stack; forces raw-TS egress when either is set. |
-| **UDP**    | ✅              | ✅              | Same as SRT. |
-| **RTP**    | ✅              | ✅              | Strips source RTP framing, rewraps with fresh RFC 2250 headers. |
-| **RTMP**   | ✅              | ⏳              | Audio only today (Phase B). Video re-encode wiring is Phase 4d. |
-| **HLS**    | ✅              | ⏳              | Audio only today (per-segment remux). Video re-encode wiring is Phase 4d. |
-| **WebRTC** | ✅              | ⏳              | Audio (Opus) only today. H.264 re-encode wiring is Phase 4d. |
-| **ST 2110-30 / -31 / `rtp_audio`** | ✅ (auto via compressed-audio bridge) | ❌ | Uncompressed audio transports; video is not carried here. |
-| **ST 2110-40** | ❌ | ❌ | Ancillary data — no codec concept. |
+| Output     | `audio_encode` | `transcode` (channel shuffle / SRC) | `video_encode` | Notes |
+|------------|:--------------:|:-----------------------------------:|:--------------:|-------|
+| **SRT**    | ✅              | ✅ (requires `audio_encode`) | ✅ | Both transforms stack; forces raw-TS egress when either is set. |
+| **UDP**    | ✅              | ✅ (requires `audio_encode`) | ✅ | Same as SRT. |
+| **RTP**    | ✅              | ✅ (requires `audio_encode`) | ✅ | Strips source RTP framing, rewraps with fresh RFC 2250 headers. |
+| **RIST**   | ✅              | ✅ (requires `audio_encode`) | ✅ | TS-carrying; same plumbing as SRT/UDP/RTP. |
+| **RTMP**   | ✅              | ✅ (requires `audio_encode`) | ⏳ | Transcode disables the same-codec AAC passthrough fast-path. Video re-encode is Phase 4d. |
+| **HLS**    | ✅              | ✅ (in-process remux only) | ⏳ | `video-thumbnail` feature required for transcode; subprocess fallback ignores it with a warning. |
+| **WebRTC** | ✅              | ✅ (`transcode.channels` overrides Opus channel count; unset keeps source) | ⏳ | H.264 re-encode wiring is Phase 4d. |
+| **ST 2110-30 / `rtp_audio`** | ✅ (auto via compressed-audio bridge) | ✅ (native PCM transcode, bit-depth + SRC + shuffle) | ❌ | Uncompressed PCM outputs; transcode is first-class here. |
+| **ST 2110-31** | ✅ | ❌ (AES3 opaque — channel labels inside SMPTE 337M payload, not addressable from the pipeline) | ❌ | |
+| **ST 2110-40** | ❌ | ❌ | ❌ | Ancillary data — no codec concept. |
 
 ---
 
@@ -68,6 +70,97 @@ video and other PIDs pass through unchanged.
 - Encoder: `bilbycast-fdk-aac-rs::AacEncoder` for AAC family;
   `video-engine::AudioEncoder` (libavcodec) for MP2 / AC-3. Opus uses
   libopus in the same crate; unused on TS outputs.
+
+---
+
+## `transcode` — channel shuffle / sample-rate conversion
+
+Sits between the AAC decoder and the target encoder in the
+`audio_encode` pipeline. Every output that supports `audio_encode` also
+accepts an optional `transcode` block (except ST 2110-31, where AES3
+framing is opaque to the pipeline). Unset fields pass through that
+stage — so an empty `transcode: {}` is a no-op and setting only
+`channel_map_preset` runs no sample-rate conversion. This is the
+"option 3" design: one block, three logically independent sub-stages
+(channel matrix, sample-rate conversion, bit-depth quantization), each
+of which is skipped whenever the corresponding fields are unset.
+
+`transcode` has no effect without `audio_encode` — validation rejects
+the combination at load time.
+
+### Schema
+
+```jsonc
+"transcode": {
+  "channels":              2,     // optional; defaults to source
+  "sample_rate":           48000, // optional; defaults to source
+  "channel_map_preset":    "stereo_to_mono_3db", // OR channel_map / channel_map_with_gain
+  "channel_map":           [[0], [1]],           // per-output-channel unity-gain source list
+  "channel_map_with_gain": [[[0, 1.0]], [[1, 0.7071]]], // per-output-channel [[src_ch, gain], ...]
+  "src_quality":           "high",  // "high" (default) | "fast"
+  "dither":                "tpdf"   // "tpdf" (default) | "none"; only applied to PCM outputs
+}
+```
+
+The three channel-routing forms (`channel_map`, `channel_map_with_gain`,
+`channel_map_preset`) are mutually exclusive. Presets:
+`mono_to_stereo`, `stereo_to_mono_3db`, `stereo_to_mono_6db`,
+`5_1_to_stereo_bs775`, `7_1_to_stereo_bs775`, `4ch_to_stereo_lt_rt`.
+
+### Resolution rule
+
+When both blocks set the same field, `transcode` wins. `audio_encode`'s
+`sample_rate` / `channels` are used as fallbacks for fields that
+`transcode` leaves unset. Example:
+
+- `audio_encode.channels = 2` + `transcode.channels = 1` → encoder sees
+  mono PCM (transcode wins).
+- `audio_encode.sample_rate = 44100` + `transcode.sample_rate` unset →
+  encoder ingests at 44100 Hz (fallback).
+- Neither set → encoder follows the source.
+
+On WebRTC: Opus is always 48 kHz on the wire. `transcode.sample_rate`
+only chooses the PCM rate the encoder ingests; Opus resamples
+internally to 48 kHz. `transcode.channels` overrides the Opus
+channel count; if unset, the Opus encoder follows the source.
+
+### Engine internals
+
+- Core stage: `src/engine/audio_transcode.rs::PlanarAudioTranscoder`
+  (planar f32 in, planar f32 out). Uses the same `ChannelMatrix`,
+  `rubato`-based SRC, and preset expander as the PCM path for
+  ST 2110-30.
+- Fast paths: full passthrough when rate+channels+matrix are identity,
+  matrix-only when rates match, matrix+rubato otherwise.
+- Wiring:
+  - TS outputs (SRT / UDP / RTP / RIST): inserted inside
+    `ts_audio_replace::TsAudioReplacer` between decoder and encoder.
+  - RTMP: `EncoderState::Active.transcoder`; disables the same-codec
+    fast path because PCM must be decoded to apply the shuffle.
+  - HLS: constructed fresh per segment inside `remux_ts_audio_inprocess`.
+  - WebRTC: `WebrtcEncoderState::Active.transcoder`, on both the WHEP
+    viewer loop and the WHIP client loop.
+
+### Example — downmix a 5.1 AAC source to stereo on an SRT TS output
+
+```jsonc
+{
+  "type": "srt",
+  "id": "srt-stereo-feed",
+  "audio_encode": { "codec": "aac_lc", "bitrate_kbps": 128 },
+  "transcode":    { "channels": 2, "channel_map_preset": "5_1_to_stereo_bs775" }
+}
+```
+
+### Example — swap L/R on an RTMP publish, no SRC
+
+```jsonc
+{
+  "type": "rtmp",
+  "audio_encode": { "codec": "aac_lc" },
+  "transcode":    { "channels": 2, "channel_map": [[1], [0]] }
+}
+```
 
 ---
 

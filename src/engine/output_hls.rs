@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::{AudioEncodeConfig, HlsOutputConfig};
-use crate::manager::events::{EventSender, EventSeverity};
+use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::OutputStatsAccumulator;
 
 use super::audio_encode::AudioCodec;
@@ -68,7 +68,7 @@ pub fn spawn_hls_output(
             tracing::error!("HLS output '{}' exited with error: {e}", config.id);
             event_sender.emit_flow(
                 EventSeverity::Critical,
-                "hls",
+                category::HLS,
                 format!("HLS output '{}' error: {e}", config.id),
                 &flow_id,
             );
@@ -102,7 +102,7 @@ async fn hls_output_loop(
 
     // Resolve audio_encode at startup.
     let audio_encode_config: Option<ResolvedAudioEncode> = match &config.audio_encode {
-        Some(enc) => match resolve_audio_encode(enc, &config.id) {
+        Some(enc) => match resolve_audio_encode(enc, config.transcode.clone(), &config.id) {
             Ok(resolved) => {
                 tracing::info!(
                     "HLS output '{}': audio_encode active codec={} bitrate={:?}k sr={:?} ch={:?}",
@@ -272,7 +272,7 @@ async fn hls_output_loop(
                                     );
                                     event_sender.emit_flow(
                                         EventSeverity::Warning,
-                                        "hls",
+                                        category::HLS,
                                         format!("HLS output '{}': segment upload failed: {e}", config.id),
                                         flow_id,
                                     );
@@ -403,6 +403,15 @@ async fn http_put(
 ) -> anyhow::Result<()> {
     let (host, port, path) = parse_url(url)?;
 
+    // Defence in depth: even if validation is bypassed, refuse to inline CRLF
+    // into the raw HTTP request line or headers.
+    let has_crlf = |s: &str| s.bytes().any(|b| b == b'\r' || b == b'\n');
+    if has_crlf(&host) || has_crlf(&path) || has_crlf(content_type)
+        || auth_token.map_or(false, has_crlf)
+    {
+        anyhow::bail!("HTTP PUT refused: header injection attempt in URL or headers");
+    }
+
     let addr = format!("{host}:{port}");
     let mut stream = TcpStream::connect(&addr).await
         .map_err(|e| anyhow::anyhow!("connect to {addr}: {e}"))?;
@@ -459,6 +468,11 @@ struct ResolvedAudioEncode {
     bitrate_kbps: u32,
     sample_rate: Option<u32>,
     channels: Option<u8>,
+    /// Optional planar PCM shuffle / resample block, applied between the
+    /// AAC decoder and the target encoder. Only honoured on the in-process
+    /// remux path (`video-thumbnail` feature); the subprocess fallback
+    /// logs a warning and ignores it.
+    transcode: Option<super::audio_transcode::TranscodeJson>,
     /// Pre-built ffmpeg args (only used for subprocess fallback).
     #[cfg(not(feature = "video-thumbnail"))]
     ffmpeg_args: Vec<String>,
@@ -466,7 +480,11 @@ struct ResolvedAudioEncode {
 
 /// Resolve and validate audio encode config at output startup.
 #[allow(unused_variables)]
-fn resolve_audio_encode(enc: &AudioEncodeConfig, output_id: &str) -> Result<ResolvedAudioEncode, String> {
+fn resolve_audio_encode(
+    enc: &AudioEncodeConfig,
+    transcode: Option<super::audio_transcode::TranscodeJson>,
+    output_id: &str,
+) -> Result<ResolvedAudioEncode, String> {
     let codec = AudioCodec::parse(&enc.codec)
         .ok_or_else(|| format!("unknown codec '{}'", enc.codec))?;
 
@@ -485,12 +503,19 @@ fn resolve_audio_encode(enc: &AudioEncodeConfig, output_id: &str) -> Result<Reso
                 "HLS output '{output_id}': audio_encode requires ffmpeg in PATH but it is not installed"
             ));
         }
+        if transcode.is_some() {
+            tracing::warn!(
+                "HLS output '{output_id}': transcode block ignored in ffmpeg subprocess fallback — \
+                 enable the `video-thumbnail` feature for in-process channel shuffle / SRC"
+            );
+        }
         let ffmpeg_args = build_remux_args(enc)?;
         Ok(ResolvedAudioEncode {
             codec,
             bitrate_kbps,
             sample_rate: enc.sample_rate,
             channels: enc.channels,
+            transcode,
             ffmpeg_args,
         })
     }
@@ -514,6 +539,7 @@ fn resolve_audio_encode(enc: &AudioEncodeConfig, output_id: &str) -> Result<Reso
             bitrate_kbps,
             sample_rate: enc.sample_rate,
             channels: enc.channels,
+            transcode,
         })
     }
 }
@@ -532,9 +558,17 @@ async fn remux_segment_audio(
         let bitrate_kbps = enc.bitrate_kbps;
         let sample_rate = enc.sample_rate;
         let channels = enc.channels;
+        let transcode = enc.transcode.clone();
 
         tokio::task::spawn_blocking(move || {
-            remux_ts_audio_inprocess(&segment_owned, codec, bitrate_kbps, sample_rate, channels)
+            remux_ts_audio_inprocess(
+                &segment_owned,
+                codec,
+                bitrate_kbps,
+                sample_rate,
+                channels,
+                transcode,
+            )
         })
         .await
         .map_err(|e| format!("remux task panicked: {e}"))?
@@ -557,6 +591,7 @@ fn remux_ts_audio_inprocess(
     bitrate_kbps: u32,
     sample_rate_override: Option<u32>,
     channels_override: Option<u8>,
+    transcode: Option<super::audio_transcode::TranscodeJson>,
 ) -> Result<Vec<u8>, String> {
     use super::ts_parse::{ts_pid, ts_pusi, ts_has_payload, ts_payload_offset,
                           parse_pat_programs, PAT_PID};
@@ -672,6 +707,7 @@ fn remux_ts_audio_inprocess(
         bitrate_kbps,
         sample_rate_override,
         channels_override,
+        transcode.as_ref(),
     )?;
 
     // ── Build output segment ──
@@ -929,6 +965,7 @@ fn encode_audio_pcm(
     bitrate_kbps: u32,
     sample_rate_override: Option<u32>,
     channels_override: Option<u8>,
+    transcode: Option<&super::audio_transcode::TranscodeJson>,
 ) -> Result<Vec<RemuxEncodedFrame>, String> {
     if pcm_frames.is_empty() {
         return Ok(Vec::new());
@@ -936,13 +973,41 @@ fn encode_audio_pcm(
 
     let source_sr = pcm_frames[0].sample_rate;
     let source_ch = pcm_frames[0].channels;
-    let target_sr = sample_rate_override.unwrap_or(source_sr);
-    let target_ch = channels_override.unwrap_or(source_ch);
+
+    // Resolve the encoder target. When transcode is set, it wins and folds
+    // any audio_encode overrides as fallbacks; the planar transcoder then
+    // aligns every decoded frame to (target_sr, target_ch) before the
+    // encoder runs.
+    let (target_sr, target_ch, mut transcoder) = if let Some(tj_in) = transcode {
+        let merged = super::audio_transcode::TranscodeJson {
+            sample_rate: tj_in.sample_rate.or(sample_rate_override),
+            channels: tj_in.channels.or(channels_override),
+            ..tj_in.clone()
+        };
+        let tc = super::audio_transcode::PlanarAudioTranscoder::new(
+            source_sr, source_ch, &merged,
+        )
+        .map_err(|e| format!("transcode build failed: {e}"))?;
+        (tc.out_sample_rate(), tc.out_channels(), Some(tc))
+    } else {
+        (
+            sample_rate_override.unwrap_or(source_sr),
+            channels_override.unwrap_or(source_ch),
+            None,
+        )
+    };
 
     // For AAC codecs, use fdk-aac directly
     #[cfg(feature = "fdk-aac")]
     if matches!(codec, AudioCodec::AacLc | AudioCodec::HeAacV1 | AudioCodec::HeAacV2) {
-        return encode_audio_pcm_aac(pcm_frames, codec, bitrate_kbps, target_sr, target_ch);
+        return encode_audio_pcm_aac(
+            pcm_frames,
+            codec,
+            bitrate_kbps,
+            target_sr,
+            target_ch,
+            transcoder.as_mut(),
+        );
     }
 
     // For Opus/MP2/AC-3, use the video-engine AudioEncoder
@@ -969,13 +1034,29 @@ fn encode_audio_pcm(
     let mut pts_90k = pcm_frames.first().map(|f| f.pts).unwrap_or(0);
 
     for pcm in pcm_frames {
+        // Apply the optional planar transcoder first; without one the
+        // source PCM is fed in directly (matching the pre-transcode path).
+        let planar_for_encoder: Vec<Vec<f32>> =
+            if let Some(tc) = transcoder.as_mut() {
+                match tc.process(&pcm.planar) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::debug!("transcode failed in HLS remux: {e}");
+                        continue;
+                    }
+                }
+            } else {
+                pcm.planar.clone()
+            };
         // Accumulate samples (handle channel count mismatch by truncating/padding)
         for ch in 0..target_ch as usize {
-            if ch < pcm.planar.len() {
-                accumulator[ch].extend_from_slice(&pcm.planar[ch]);
-            } else {
+            if ch < planar_for_encoder.len() {
+                accumulator[ch].extend_from_slice(&planar_for_encoder[ch]);
+            } else if !planar_for_encoder.is_empty() {
                 // Pad missing channels with silence
-                accumulator[ch].extend(std::iter::repeat(0.0f32).take(pcm.planar[0].len()));
+                accumulator[ch].extend(
+                    std::iter::repeat(0.0f32).take(planar_for_encoder[0].len()),
+                );
             }
         }
 
@@ -1031,6 +1112,7 @@ fn encode_audio_pcm_aac(
     bitrate_kbps: u32,
     target_sr: u32,
     target_ch: u8,
+    mut transcoder: Option<&mut super::audio_transcode::PlanarAudioTranscoder>,
 ) -> Result<Vec<RemuxEncodedFrame>, String> {
     let profile = match codec {
         AudioCodec::AacLc => aac_codec::AacProfile::AacLc,
@@ -1058,11 +1140,25 @@ fn encode_audio_pcm_aac(
     let mut pts_90k = pcm_frames.first().map(|f| f.pts).unwrap_or(0);
 
     for pcm in pcm_frames {
-        for ch in 0..target_ch as usize {
-            if ch < pcm.planar.len() {
-                accumulator[ch].extend_from_slice(&pcm.planar[ch]);
+        let planar_for_encoder: Vec<Vec<f32>> =
+            if let Some(tc) = transcoder.as_deref_mut() {
+                match tc.process(&pcm.planar) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::debug!("transcode failed in HLS AAC remux: {e}");
+                        continue;
+                    }
+                }
             } else {
-                accumulator[ch].extend(std::iter::repeat(0.0f32).take(pcm.planar[0].len()));
+                pcm.planar.clone()
+            };
+        for ch in 0..target_ch as usize {
+            if ch < planar_for_encoder.len() {
+                accumulator[ch].extend_from_slice(&planar_for_encoder[ch]);
+            } else if !planar_for_encoder.is_empty() {
+                accumulator[ch].extend(
+                    std::iter::repeat(0.0f32).take(planar_for_encoder[0].len()),
+                );
             }
         }
 

@@ -11,6 +11,7 @@
 use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -33,7 +34,7 @@ pub fn verify_token(token: &str, secret: &str) -> Option<String> {
     let payload = String::from_utf8(decoded).ok()?;
     let (identity, provided_sig) = payload.split_once(':')?;
     let expected_sig = compute_hmac(identity, secret);
-    if provided_sig == expected_sig {
+    if bool::from(provided_sig.as_bytes().ct_eq(expected_sig.as_bytes())) {
         Some(identity.to_string())
     } else {
         None
@@ -79,5 +80,23 @@ mod tests {
     fn test_wrong_secret() {
         let token = generate_token("edge-1", "correct");
         assert_eq!(verify_token(&token, "wrong"), None);
+    }
+
+    #[test]
+    fn test_same_length_different_signature() {
+        let token = generate_token("edge-1", "correct");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&token)
+            .expect("valid base64");
+        let payload = String::from_utf8(decoded).expect("valid utf8");
+        let (identity, sig) = payload.split_once(':').expect("valid payload");
+        // Flip the first hex char to a different hex char — same length, different value.
+        let mut tampered = sig.to_string();
+        let first = tampered.remove(0);
+        let replacement = if first == '0' { '1' } else { '0' };
+        tampered.insert(0, replacement);
+        let tampered_token = base64::engine::general_purpose::STANDARD
+            .encode(format!("{identity}:{tampered}").as_bytes());
+        assert_eq!(verify_token(&tampered_token, "correct"), None);
     }
 }

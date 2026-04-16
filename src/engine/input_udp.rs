@@ -10,6 +10,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::UdpInputConfig;
+use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::FlowStatsAccumulator;
 use crate::util::socket::bind_udp_input;
 use crate::util::time::now_us;
@@ -31,10 +32,13 @@ pub fn spawn_udp_input(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
+    event_sender: EventSender,
+    flow_id: String,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = udp_input_loop(config, broadcast_tx, stats, cancel).await {
+        if let Err(e) = udp_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id).await {
             tracing::error!("UDP input task exited with error: {e}");
+            event_sender.emit_flow(EventSeverity::Critical, category::FLOW, format!("Flow input lost: {e}"), &flow_id);
         }
     })
 }
@@ -44,8 +48,31 @@ async fn udp_input_loop(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
+    events: &EventSender,
+    flow_id: &str,
 ) -> anyhow::Result<()> {
-    let socket = bind_udp_input(&config.bind_addr, config.interface_addr.as_deref()).await?;
+    let socket = match bind_udp_input(&config.bind_addr, config.interface_addr.as_deref()).await {
+        Ok(s) => {
+            events.emit_flow_with_details(
+                EventSeverity::Info,
+                category::UDP,
+                format!("UDP input listening on {}", config.bind_addr),
+                flow_id,
+                serde_json::json!({"bind_addr": config.bind_addr}),
+            );
+            s
+        }
+        Err(e) => {
+            events.emit_flow_with_details(
+                EventSeverity::Critical,
+                category::UDP,
+                format!("UDP input bind failed on {}: {e}", config.bind_addr),
+                flow_id,
+                serde_json::json!({"bind_addr": config.bind_addr, "error": e.to_string()}),
+            );
+            return Err(e);
+        }
+    };
 
     tracing::info!("UDP input started on {}", config.bind_addr);
 

@@ -1033,6 +1033,13 @@ pub struct RtpOutputConfig {
     /// `opus` is rejected because there is no standard TS mapping).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional audio channel shuffle / sample-rate transcode applied to
+    /// the decoded PCM **before** `audio_encode` re-encodes. Any unset
+    /// field passes through that stage (e.g. set only `channel_map_preset`
+    /// to shuffle channels without resampling). Ignored when
+    /// `audio_encode` is not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
     /// Optional video encode block. When set, the output decodes the
     /// incoming H.264 / HEVC video elementary stream, optionally
     /// re-scales, re-encodes via the configured backend, and muxes the
@@ -1141,6 +1148,12 @@ pub struct UdpOutputConfig {
     /// (the 302M path already owns the TS stream and carries no video).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional audio channel shuffle / sample-rate transcode applied to
+    /// the decoded PCM **before** `audio_encode` re-encodes. Any unset
+    /// field passes through that stage. Ignored when `audio_encode` is
+    /// not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
     /// Optional video encode block. See [`RtpOutputConfig::video_encode`]
     /// for the semantics. Incompatible with `transport_mode = "audio_302m"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1286,6 +1299,12 @@ pub struct SrtOutputConfig {
     /// (the 302M path already owns the TS stream and carries no video).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional audio channel shuffle / sample-rate transcode applied to
+    /// the decoded PCM **before** `audio_encode` re-encodes. Any unset
+    /// field passes through that stage. Ignored when `audio_encode` is
+    /// not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
     /// Optional video encode block. See [`RtpOutputConfig::video_encode`]
     /// for the semantics. Incompatible with `transport_mode = "audio_302m"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1517,6 +1536,12 @@ pub struct RistOutputConfig {
     /// [`RtpOutputConfig::audio_encode`] for semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional audio channel shuffle / sample-rate transcode applied to
+    /// the decoded PCM **before** `audio_encode` re-encodes. Any unset
+    /// field passes through that stage. Ignored when `audio_encode` is
+    /// not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
     /// Optional video encode block (x264 / x265 / NVENC, feature-gated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
@@ -1588,6 +1613,12 @@ pub struct RtmpOutputConfig {
     /// without ffmpeg.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional audio channel shuffle / sample-rate transcode applied to
+    /// the decoded PCM **before** `audio_encode` re-encodes. Any unset
+    /// field passes through that stage. Ignored when `audio_encode` is
+    /// not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
 }
 
 fn default_reconnect_delay() -> u64 {
@@ -1643,6 +1674,13 @@ pub struct HlsOutputConfig {
     /// AAC-LC source) skips the re-mux and falls back to passthrough.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional audio channel shuffle / sample-rate transcode applied to
+    /// the decoded PCM **before** `audio_encode` re-encodes. Any unset
+    /// field passes through that stage. Ignored when `audio_encode` is
+    /// not set; setting `transcode` disables the same-codec passthrough
+    /// fast-path because the PCM must be decoded to apply the shuffle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
 }
 
 fn default_segment_duration() -> f64 {
@@ -1730,6 +1768,15 @@ pub struct WebrtcOutputConfig {
     /// the output is video-only by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional audio channel shuffle / sample-rate transcode applied to
+    /// the decoded PCM **before** the Opus encoder. When
+    /// `transcode.channels` is set, it overrides the Opus encoder's
+    /// channel count (so you can force a stereo source down to mono).
+    /// When unset, Opus follows the source channel count. Any other
+    /// unset field passes through that stage. Ignored when
+    /// `audio_encode` is not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
 }
 
 /// Video encoder configuration block. Used by SRT, UDP, and RTP outputs
@@ -1954,6 +2001,19 @@ pub struct St2110AudioOutputConfig {
     /// is used (default behavior).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Audio track selector for de-embedding from MPEG-TS inputs.
+    ///
+    /// When the upstream input carries MPEG-TS (SRT, RTP, UDP, RTMP, RTSP),
+    /// the TS may contain multiple audio elementary streams (e.g., different
+    /// languages). This field selects which audio track to extract:
+    ///
+    /// - `None` (default): use the first audio track found in the PMT.
+    /// - `Some(0)`: first audio track, `Some(1)`: second audio track, etc.
+    ///
+    /// Ignored when the upstream input is a native audio essence (ST 2110-30,
+    /// ST 2110-31, rtp_audio).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_track_index: Option<u8>,
 }
 
 /// Generic RFC 3551 PCM-over-RTP audio input — no ST 2110 baggage.
@@ -2033,6 +2093,10 @@ pub struct RtpAudioOutputConfig {
     /// Optional per-output PCM transcode block (see St2110AudioOutputConfig.transcode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Audio track selector for de-embedding from MPEG-TS inputs.
+    /// See [`St2110AudioOutputConfig::audio_track_index`] for details.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_track_index: Option<u8>,
     /// Transport mode: `"rtp"` (default) sends RFC 3551 PCM over UDP,
     /// `"audio_302m"` wraps the PCM as SMPTE 302M LPCM in MPEG-TS and sends
     /// the TS via RTP/MP2T (RFC 2250). The 302M mode is implemented in
@@ -2426,6 +2490,7 @@ mod tests {
                 program_number: None,
                 delay: None,
                 audio_encode: None,
+                transcode: None,
                 video_encode: None,
             })],
             flows: vec![FlowConfig {
@@ -2479,6 +2544,7 @@ mod tests {
                 program_number: None,
                 delay: None,
                 audio_encode: None,
+                transcode: None,
                 video_encode: None,
             })],
             flows: vec![FlowConfig {

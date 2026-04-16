@@ -18,7 +18,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 
-use super::events::{Event, EventSeverity, build_event_envelope};
+use super::events::{Event, EventSeverity, build_event_envelope, category};
 
 use crate::config::models::{AppConfig, FlowConfig, FlowGroupConfig, InputDefinition, OutputConfig, ResolvedFlow};
 use crate::config::persistence::save_config_split_async;
@@ -285,7 +285,7 @@ async fn manager_client_loop(
                 tracing::warn!("Manager connection failed: {e}");
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Warning,
-                    "manager",
+                    category::MANAGER,
                     "Manager connection lost, reconnecting",
                 );
             }
@@ -429,7 +429,7 @@ async fn try_connect(
                     tracing::info!("Authenticated with manager");
                     tunnel_manager.event_sender().emit(
                         EventSeverity::Info,
-                        "manager",
+                        category::MANAGER,
                         "Connected to manager",
                     );
                 }
@@ -446,7 +446,7 @@ async fn try_connect(
                     tracing::info!("Registered with manager: node_id={node_id}");
                     tunnel_manager.event_sender().emit(
                         EventSeverity::Info,
-                        "manager",
+                        category::MANAGER,
                         "Connected to manager",
                     );
 
@@ -463,7 +463,7 @@ async fn try_connect(
                         .unwrap_or("Unknown auth error");
                     tunnel_manager.event_sender().emit(
                         EventSeverity::Critical,
-                        "manager",
+                        category::MANAGER,
                         format!("Manager authentication failed: {msg}"),
                     );
                     return Err(format!("Auth rejected: {msg}"));
@@ -853,6 +853,12 @@ async fn persist_credentials(
         mgr.node_id = Some(node_id.to_string());
         mgr.node_secret = Some(node_secret.to_string());
     }
+    // Node is now provisioned — close the setup wizard so /setup stops
+    // accepting reconfiguration. Idempotent on reconnect.
+    if cfg.setup_enabled {
+        cfg.setup_enabled = false;
+        tracing::info!("Setup wizard disabled after successful manager registration");
+    }
     if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), cfg.clone()).await {
         tracing::warn!("Failed to persist manager credentials: {e}");
     } else {
@@ -1211,8 +1217,13 @@ async fn execute_command(
             if cfg.inputs.iter().any(|i| i.id == input.id) {
                 return Err(format!("Input '{}' already exists", input.id));
             }
+            let id = input.id.clone();
             cfg.inputs.push(input);
             persist_config(&cfg, config_path, secrets_path).await;
+            flow_manager.event_sender().emit_input(
+                EventSeverity::Info, category::FLOW,
+                format!("Input '{}' created", id), &id,
+            );
             Ok(None)
         }
         "update_input" => {
@@ -1261,6 +1272,10 @@ async fn execute_command(
                 }
             }
             persist_config(&cfg, config_path, secrets_path).await;
+            flow_manager.event_sender().emit_input(
+                EventSeverity::Info, category::FLOW,
+                format!("Input '{}' updated", input_id), input_id,
+            );
             Ok(None)
         }
         "activate_input" => {
@@ -1330,6 +1345,10 @@ async fn execute_command(
                 return Err(format!("Input '{input_id}' not found"));
             }
             persist_config(&cfg, config_path, secrets_path).await;
+            flow_manager.event_sender().emit_input(
+                EventSeverity::Info, category::FLOW,
+                format!("Input '{}' deleted", input_id), input_id,
+            );
             Ok(None)
         }
         // ── Independent output CRUD ──
@@ -1342,8 +1361,13 @@ async fn execute_command(
             if cfg.outputs.iter().any(|o| o.id() == output.id()) {
                 return Err(format!("Output '{}' already exists", output.id()));
             }
+            let id = output.id().to_string();
             cfg.outputs.push(output);
             persist_config(&cfg, config_path, secrets_path).await;
+            flow_manager.event_sender().emit_output(
+                EventSeverity::Info, category::FLOW,
+                format!("Output '{}' created", id), &id,
+            );
             Ok(None)
         }
         "update_output" => {
@@ -1365,6 +1389,10 @@ async fn execute_command(
                 }
             }
             persist_config(&cfg, config_path, secrets_path).await;
+            flow_manager.event_sender().emit_output(
+                EventSeverity::Info, category::FLOW,
+                format!("Output '{}' updated", output_id), output_id,
+            );
             Ok(None)
         }
         "delete_output" => {
@@ -1380,6 +1408,10 @@ async fn execute_command(
                 return Err(format!("Output '{output_id}' not found"));
             }
             persist_config(&cfg, config_path, secrets_path).await;
+            flow_manager.event_sender().emit_output(
+                EventSeverity::Info, category::FLOW,
+                format!("Output '{}' deleted", output_id), output_id,
+            );
             Ok(None)
         }
         "create_tunnel" => {
@@ -1579,7 +1611,7 @@ async fn execute_command(
                     tracing::warn!("Failed to persist config after manager command: {e}");
                     tunnel_manager.event_sender().emit(
                         EventSeverity::Warning,
-                        "config",
+                        category::CONFIG,
                         format!("Failed to persist configuration: {e}"),
                     );
                 }
@@ -1587,7 +1619,7 @@ async fn execute_command(
 
             tunnel_manager.event_sender().emit(
                 EventSeverity::Info,
-                "config",
+                category::CONFIG,
                 "Configuration updated",
             );
 
@@ -1696,13 +1728,13 @@ async fn execute_command(
                 tracing::warn!("Failed to persist config after add_flow_group: {e}");
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Warning,
-                    "config",
+                    category::CONFIG,
                     format!("Failed to persist flow group '{}': {e}", group.id),
                 );
             } else {
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Info,
-                    "config",
+                    category::CONFIG,
                     format!("Flow group '{}' added", group.id),
                 );
             }
@@ -1732,13 +1764,13 @@ async fn execute_command(
                 tracing::warn!("Failed to persist config after update_flow_group: {e}");
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Warning,
-                    "config",
+                    category::CONFIG,
                     format!("Failed to persist flow group '{target_id}': {e}"),
                 );
             } else {
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Info,
-                    "config",
+                    category::CONFIG,
                     format!("Flow group '{target_id}' updated"),
                 );
             }
@@ -1775,13 +1807,13 @@ async fn execute_command(
                 tracing::warn!("Failed to persist config after remove_flow_group: {e}");
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Warning,
-                    "config",
+                    category::CONFIG,
                     format!("Failed to persist removal of flow group '{target_id}': {e}"),
                 );
             } else {
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Info,
-                    "config",
+                    category::CONFIG,
                     format!("Flow group '{target_id}' removed"),
                 );
             }
@@ -1820,13 +1852,13 @@ async fn execute_command(
                 tracing::warn!("Failed to persist config after add_essence_flow: {e}");
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Warning,
-                    "config",
+                    category::CONFIG,
                     format!("Failed to persist add_essence_flow '{flow_id}' → '{group_id}': {e}"),
                 );
             } else {
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Info,
-                    "config",
+                    category::CONFIG,
                     format!("Flow '{flow_id}' added to group '{group_id}'"),
                 );
             }
@@ -1873,7 +1905,7 @@ async fn execute_command(
                 tracing::warn!("Failed to persist config after remove_essence_flow: {e}");
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Warning,
-                    "config",
+                    category::CONFIG,
                     format!(
                         "Failed to persist remove_essence_flow '{flow_id}' from '{group_id}': {e}"
                     ),
@@ -1881,7 +1913,7 @@ async fn execute_command(
             } else {
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Info,
-                    "config",
+                    category::CONFIG,
                     format!("Flow '{flow_id}' removed from group '{group_id}'"),
                 );
             }

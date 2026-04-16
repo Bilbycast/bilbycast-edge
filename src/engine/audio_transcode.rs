@@ -224,6 +224,14 @@ impl ChannelMatrix {
             .flat_map(|row| row.iter().map(|(ch, _)| *ch))
             .max()
     }
+
+    /// True when the matrix is an identity (row N picks input channel N at
+    /// unity gain). Used by fast-path planar transcoders to skip the mul.
+    pub fn is_identity(&self) -> bool {
+        self.0.iter().enumerate().all(|(row_idx, row)| {
+            row.len() == 1 && row[0].0 as usize == row_idx && (row[0].1 - 1.0).abs() < 1e-6
+        })
+    }
 }
 
 // ── MatrixSource: static or IS-08-tracked routing ──────────────────────────
@@ -366,7 +374,8 @@ pub fn derive_matrix_from_is08(
             (Some(src), Some(idx))
                 if src == input_id && (idx as u8) < in_channels =>
             {
-                vec![(idx as u8, 1.0_f32)]
+                let gain = ch_entry.gain.unwrap_or(1.0_f32).max(0.0);
+                vec![(idx as u8, gain)]
             }
             _ => Vec::new(),
         };
@@ -396,11 +405,38 @@ pub struct TranscodeJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channels: Option<u8>,
     /// Explicit channel routing matrix: `channel_map[out_ch] = [in_ch_1, in_ch_2, ...]`.
-    /// All gains are unity. Use [`channel_map_preset`] for surround downmixes
-    /// with non-unity gains.
+    /// All gains are unity. Use [`channel_map_with_gain`] for per-channel gain
+    /// control, or [`channel_map_preset`] for named surround downmixes.
+    ///
+    /// Mutually exclusive with `channel_map_with_gain` and `channel_map_preset`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_map: Option<Vec<Vec<u8>>>,
-    /// Named downmix preset. Mutually exclusive with `channel_map`.
+    /// Explicit channel routing matrix with per-input-channel gain control:
+    /// `channel_map_with_gain[out_ch] = [[in_ch, gain], ...]`.
+    ///
+    /// Each entry is `[input_channel_index, linear_gain]` where gain is a
+    /// linear multiplier (1.0 = unity, 0.5 ≈ -6 dB, 0.707 ≈ -3 dB, 0.0 = mute).
+    ///
+    /// Example — swap L/R with the right channel attenuated by 3 dB:
+    /// ```json
+    /// "channel_map_with_gain": [
+    ///   [[1, 1.0]],
+    ///   [[0, 0.707]]
+    /// ]
+    /// ```
+    ///
+    /// Example — mix channels 0 and 2 at different levels into output channel 0:
+    /// ```json
+    /// "channel_map_with_gain": [
+    ///   [[0, 0.8], [2, 0.3]]
+    /// ]
+    /// ```
+    ///
+    /// Mutually exclusive with `channel_map` and `channel_map_preset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_map_with_gain: Option<Vec<Vec<[f64; 2]>>>,
+    /// Named downmix preset. Mutually exclusive with `channel_map` and
+    /// `channel_map_with_gain`.
     ///
     /// Supported: `mono_to_stereo`, `stereo_to_mono_3db`, `stereo_to_mono_6db`,
     /// `5_1_to_stereo_bs775`, `7_1_to_stereo_bs775`, `4ch_to_stereo_lt_rt`.
@@ -611,65 +647,111 @@ pub fn resolve_transcode(
         ));
     }
 
-    let channel_matrix = match (json.channel_map.as_ref(), json.channel_map_preset.as_deref()) {
-        (Some(_), Some(_)) => {
-            return Err(
-                "transcode.channel_map and transcode.channel_map_preset are mutually exclusive"
-                    .to_string(),
-            );
+    // Exactly one of channel_map, channel_map_with_gain, channel_map_preset
+    // may be set. Count the number specified and reject if more than one.
+    let map_sources = [
+        json.channel_map.is_some(),
+        json.channel_map_with_gain.is_some(),
+        json.channel_map_preset.is_some(),
+    ];
+    if map_sources.iter().filter(|&&v| v).count() > 1 {
+        return Err(
+            "transcode: channel_map, channel_map_with_gain, and channel_map_preset \
+             are mutually exclusive — specify at most one"
+                .to_string(),
+        );
+    }
+
+    let channel_matrix = if let Some(map) = json.channel_map.as_ref() {
+        // Unity-gain index-only matrix.
+        if map.len() != out_channels as usize {
+            return Err(format!(
+                "transcode.channel_map has {} rows but transcode.channels is {}",
+                map.len(),
+                out_channels
+            ));
         }
-        (Some(map), None) => {
-            if map.len() != out_channels as usize {
+        let mat = ChannelMatrix(
+            map.iter()
+                .map(|row| row.iter().map(|&ch| (ch, 1.0_f32)).collect())
+                .collect(),
+        );
+        if let Some(max) = mat.max_input_channel() {
+            if max >= input.channels {
                 return Err(format!(
-                    "transcode.channel_map has {} rows but transcode.channels is {}",
-                    map.len(),
-                    out_channels
+                    "transcode.channel_map references input channel {max} but input has only {} channels",
+                    input.channels
                 ));
             }
-            let mat = ChannelMatrix(
-                map.iter()
-                    .map(|row| row.iter().map(|&ch| (ch, 1.0_f32)).collect())
-                    .collect(),
-            );
-            if let Some(max) = mat.max_input_channel() {
-                if max >= input.channels {
-                    return Err(format!(
-                        "transcode.channel_map references input channel {max} but input has only {} channels",
-                        input.channels
-                    ));
-                }
-            }
-            mat
         }
-        (None, Some(preset)) => {
-            let mat = expand_preset(preset, input.channels)?;
-            if mat.out_channels() as u8 != out_channels {
+        mat
+    } else if let Some(map) = json.channel_map_with_gain.as_ref() {
+        // Per-channel gain matrix: each entry is [channel_index, gain].
+        if map.len() != out_channels as usize {
+            return Err(format!(
+                "transcode.channel_map_with_gain has {} rows but transcode.channels is {}",
+                map.len(),
+                out_channels
+            ));
+        }
+        let mat = ChannelMatrix(
+            map.iter()
+                .enumerate()
+                .map(|(row_idx, row)| {
+                    row.iter()
+                        .enumerate()
+                        .map(|(col_idx, pair)| {
+                            let ch = pair[0] as u8;
+                            let gain = pair[1] as f32;
+                            if gain < 0.0 {
+                                tracing::warn!(
+                                    "transcode.channel_map_with_gain[{}][{}]: negative gain {:.3} \
+                                     clamped to 0.0 (use positive values only)",
+                                    row_idx, col_idx, gain
+                                );
+                            }
+                            (ch, gain.max(0.0))
+                        })
+                        .collect()
+                })
+                .collect(),
+        );
+        if let Some(max) = mat.max_input_channel() {
+            if max >= input.channels {
                 return Err(format!(
-                    "channel_map_preset '{preset}' produces {} channels but transcode.channels is {}",
-                    mat.out_channels(),
-                    out_channels
+                    "transcode.channel_map_with_gain references input channel {max} but input has only {} channels",
+                    input.channels
                 ));
             }
-            mat
         }
-        (None, None) => {
-            // Default: identity if channel counts match, mono→stereo dup if
-            // expanding 1→2, sum-to-mono otherwise. We pick the conservative
-            // identity here and let the validator reject mismatched defaults
-            // so the operator must be explicit.
-            if out_channels == input.channels {
-                ChannelMatrix::identity(input.channels)
-            } else if input.channels == 1 && out_channels == 2 {
-                expand_preset("mono_to_stereo", 1)?
-            } else if input.channels == 2 && out_channels == 1 {
-                expand_preset("stereo_to_mono_3db", 2)?
-            } else {
-                return Err(format!(
-                    "transcode: input has {} channels and output has {} channels — \
-                     specify channel_map or channel_map_preset",
-                    input.channels, out_channels
-                ));
-            }
+        mat
+    } else if let Some(preset) = json.channel_map_preset.as_deref() {
+        let mat = expand_preset(preset, input.channels)?;
+        if mat.out_channels() as u8 != out_channels {
+            return Err(format!(
+                "channel_map_preset '{preset}' produces {} channels but transcode.channels is {}",
+                mat.out_channels(),
+                out_channels
+            ));
+        }
+        mat
+    } else {
+        // Default: identity if channel counts match, mono→stereo dup if
+        // expanding 1→2, sum-to-mono otherwise. We pick the conservative
+        // identity here and let the validator reject mismatched defaults
+        // so the operator must be explicit.
+        if out_channels == input.channels {
+            ChannelMatrix::identity(input.channels)
+        } else if input.channels == 1 && out_channels == 2 {
+            expand_preset("mono_to_stereo", 1)?
+        } else if input.channels == 2 && out_channels == 1 {
+            expand_preset("stereo_to_mono_3db", 2)?
+        } else {
+            return Err(format!(
+                "transcode: input has {} channels and output has {} channels — \
+                 specify channel_map, channel_map_with_gain, or channel_map_preset",
+                input.channels, out_channels
+            ));
         }
     };
 
@@ -1386,6 +1468,199 @@ impl TranscodeStage {
     }
 }
 
+// ── Planar PCM → PCM transcoder (for encoded-audio pipelines) ──────────────
+
+/// Planar-f32-in / planar-f32-out transcode stage used by the AAC decode →
+/// audio encode bridge. This is the "option 3" shuffle stage: it sits between
+/// [`crate::engine::audio_decode::AacDecoder`] and
+/// [`crate::engine::audio_encode::AudioEncoder`] on every video-carrying
+/// output (SRT/UDP/RTP/RIST TS, RTMP, HLS, WebRTC), applying a channel
+/// routing matrix and an optional sample-rate conversion before the encoder
+/// runs.
+///
+/// Unlike [`TranscodeStage`] (which carries PCM RTP in and out), there is no
+/// bit-depth stage here — encoders accept f32 directly — and no packetizer.
+///
+/// Fast paths (all determined at construction time):
+/// - All fields unset and channel count matches source → full passthrough
+///   (input is cloned; no matrix mul, no SRC).
+/// - Channels + matrix form an identity, output rate == input rate →
+///   passthrough without matrix mul.
+/// - Output rate == input rate → matrix mul only, no rubato.
+/// - Otherwise: matrix then rubato.
+pub struct PlanarAudioTranscoder {
+    in_rate: u32,
+    in_channels: u8,
+    out_rate: u32,
+    out_channels: u8,
+    matrix: ChannelMatrix,
+    matrix_is_identity: bool,
+    rate_unchanged: bool,
+    routed_scratch: Vec<Vec<f32>>,
+    resampler: Option<Async<f32>>,
+    resample_out_scratch: Vec<Vec<f32>>,
+    resampler_chunk_in: usize,
+    src_quality: SrcQuality,
+}
+
+impl PlanarAudioTranscoder {
+    /// Build a new planar transcoder against a discovered input format.
+    ///
+    /// `in_rate` and `in_channels` come from the upstream codec (typically the
+    /// AAC decoder's first decoded frame). The concrete target is resolved
+    /// from `json` against that input — unset fields fall back to the
+    /// upstream values, so an empty `TranscodeJson` yields a pure passthrough.
+    pub fn new(
+        in_rate: u32,
+        in_channels: u8,
+        json: &TranscodeJson,
+    ) -> Result<Self, String> {
+        if in_channels == 0 {
+            return Err("PlanarAudioTranscoder: in_channels must be > 0".to_string());
+        }
+        // Bit depth is irrelevant for the planar path, but `resolve_transcode`
+        // requires it. Use L24 as a neutral placeholder — the resolver won't
+        // inspect it beyond storing it on the TranscodeConfig, and the field
+        // is ignored by this struct.
+        let cfg = resolve_transcode(
+            json,
+            InputFormat {
+                sample_rate: in_rate,
+                bit_depth: BitDepth::L24,
+                channels: in_channels,
+            },
+        )?;
+        let matrix_is_identity =
+            cfg.out_channels == in_channels && cfg.channel_matrix.is_identity();
+        let rate_unchanged = cfg.out_sample_rate == in_rate;
+        Ok(Self {
+            in_rate,
+            in_channels,
+            out_rate: cfg.out_sample_rate,
+            out_channels: cfg.out_channels,
+            matrix: cfg.channel_matrix,
+            matrix_is_identity,
+            rate_unchanged,
+            routed_scratch: vec![Vec::new(); cfg.out_channels as usize],
+            resampler: None,
+            resample_out_scratch: Vec::new(),
+            resampler_chunk_in: 0,
+            src_quality: cfg.src_quality,
+        })
+    }
+
+    pub fn out_sample_rate(&self) -> u32 {
+        self.out_rate
+    }
+
+    pub fn out_channels(&self) -> u8 {
+        self.out_channels
+    }
+
+    pub fn in_sample_rate(&self) -> u32 {
+        self.in_rate
+    }
+
+    pub fn in_channels(&self) -> u8 {
+        self.in_channels
+    }
+
+    /// True when this transcoder is a pure passthrough (same rate, identity
+    /// matrix, same channel count). Callers MAY use this to skip `process`
+    /// entirely, but it's safe to call `process` either way — the full-pass
+    /// path just clones the input vectors.
+    pub fn is_passthrough(&self) -> bool {
+        self.matrix_is_identity && self.rate_unchanged
+    }
+
+    /// Transcode one chunk of planar f32 samples. `planar_in` must have
+    /// exactly `in_channels` rows; each row must be the same length.
+    /// Returns planar f32 at the target rate and channel count.
+    pub fn process(&mut self, planar_in: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, String> {
+        if planar_in.len() != self.in_channels as usize {
+            return Err(format!(
+                "PlanarAudioTranscoder: expected {} input channels, got {}",
+                self.in_channels,
+                planar_in.len()
+            ));
+        }
+        let n_in = planar_in.first().map(|c| c.len()).unwrap_or(0);
+        if n_in == 0 {
+            return Ok((0..self.out_channels as usize).map(|_| Vec::new()).collect());
+        }
+        if planar_in.iter().any(|c| c.len() != n_in) {
+            return Err("PlanarAudioTranscoder: channels have mismatched frame counts".to_string());
+        }
+
+        // Full passthrough fast-path.
+        if self.matrix_is_identity && self.rate_unchanged {
+            return Ok(planar_in.iter().map(|c| c.clone()).collect());
+        }
+
+        // Channel matrix stage.
+        if self.matrix_is_identity {
+            for (dst, src) in self.routed_scratch.iter_mut().zip(planar_in.iter()) {
+                dst.clear();
+                dst.extend_from_slice(src);
+            }
+        } else {
+            apply_channel_matrix(planar_in, &self.matrix, &mut self.routed_scratch)?;
+        }
+
+        // SRC fast-path: same rate, matrix already applied.
+        if self.rate_unchanged {
+            return Ok(self.routed_scratch.iter().map(|c| c.clone()).collect());
+        }
+
+        // Rubato SRC: lazy construct (input chunk size comes from the first
+        // call; rebuilt on any chunk-size change).
+        if self.resampler.is_none() || self.resampler_chunk_in != n_in {
+            let ratio = self.out_rate as f64 / self.in_rate as f64;
+            let params = sinc_params_for(self.src_quality);
+            let r = Async::<f32>::new_sinc(
+                ratio,
+                2.0,
+                &params,
+                n_in,
+                self.out_channels as usize,
+                FixedAsync::Input,
+            )
+            .map_err(|e| format!("PlanarAudioTranscoder: rubato init failed: {e}"))?;
+            let max_out = r.output_frames_max();
+            self.resample_out_scratch = (0..self.out_channels as usize)
+                .map(|_| vec![0.0f32; max_out])
+                .collect();
+            self.resampler = Some(r);
+            self.resampler_chunk_in = n_in;
+        }
+        let r = self.resampler.as_mut().unwrap();
+        let channels = self.out_channels as usize;
+        let out_frames_max = self
+            .resample_out_scratch
+            .first()
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let in_adapter =
+            SequentialSliceOfVecs::new(self.routed_scratch.as_slice(), channels, n_in)
+                .map_err(|e| format!("PlanarAudioTranscoder: in adapter: {e}"))?;
+        let mut out_adapter = SequentialSliceOfVecs::new_mut(
+            self.resample_out_scratch.as_mut_slice(),
+            channels,
+            out_frames_max,
+        )
+        .map_err(|e| format!("PlanarAudioTranscoder: out adapter: {e}"))?;
+        let written = r
+            .process_into_buffer(&in_adapter, &mut out_adapter, None)
+            .map(|(_used, w)| w)
+            .map_err(|e| format!("PlanarAudioTranscoder: rubato process: {e}"))?;
+        Ok(self
+            .resample_out_scratch
+            .iter()
+            .map(|c| c[..written].to_vec())
+            .collect())
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn sinc_params_for(quality: SrcQuality) -> SincInterpolationParameters {
@@ -1584,6 +1859,7 @@ mod tests {
             bit_depth: Some(16),
             channels: Some(2),
             channel_map: None,
+            channel_map_with_gain: None,
             channel_map_preset: Some("5_1_to_stereo_bs775".to_string()),
             packet_time_us: Some(4_000),
             payload_type: Some(96),
@@ -1779,10 +2055,12 @@ mod tests {
         out.channels.push(ChannelEntry {
             input: Some("st2110_30:flow1".into()),
             channel_index: Some(0),
+            gain: None,
         });
         out.channels.push(ChannelEntry {
             input: Some("st2110_30:flow1".into()),
             channel_index: Some(1),
+            gain: None,
         });
         map.outputs.insert("st2110_30:flow1:out1".into(), out);
 
@@ -1807,10 +2085,12 @@ mod tests {
         out.channels.push(ChannelEntry {
             input: Some("st2110_30:flow1".into()),
             channel_index: Some(1),
+            gain: None,
         });
         out.channels.push(ChannelEntry {
             input: Some("st2110_30:flow1".into()),
             channel_index: Some(0),
+            gain: None,
         });
         map.outputs.insert("st2110_30:flow1:out1".into(), out);
         let m = derive_matrix_from_is08(
@@ -1830,10 +2110,11 @@ mod tests {
         use crate::api::nmos_is08::{ChannelEntry, ChannelMap, OutputMapping};
         let mut map = ChannelMap::default();
         let mut out = OutputMapping::default();
-        out.channels.push(ChannelEntry { input: None, channel_index: None });
+        out.channels.push(ChannelEntry { input: None, channel_index: None, gain: None });
         out.channels.push(ChannelEntry {
             input: Some("st2110_30:other-flow".into()),
             channel_index: Some(0),
+            gain: None,
         });
         map.outputs.insert("st2110_30:flow1:out1".into(), out);
         let m = derive_matrix_from_is08(
@@ -1888,10 +2169,12 @@ mod tests {
         out.channels.push(ChannelEntry {
             input: Some("st2110_30:flow1".into()),
             channel_index: Some(1),
+            gain: None,
         });
         out.channels.push(ChannelEntry {
             input: Some("st2110_30:flow1".into()),
             channel_index: Some(0),
+            gain: None,
         });
         new_map.outputs.insert("st2110_30:flow1:out1".into(), out);
         tx.send(Arc::new(new_map)).unwrap();
@@ -1912,5 +2195,111 @@ mod tests {
         let mean = sum / 10_000.0;
         // Mean of TPDF distribution is 0; allow noise.
         assert!(mean.abs() < 0.05, "mean {mean} not centered");
+    }
+
+    // ── PlanarAudioTranscoder tests ──────────────────────────────────────
+
+    /// Empty transcode block on a planar transcoder must pass samples
+    /// through unchanged — this is the option-3 contract.
+    #[test]
+    fn planar_transcoder_empty_is_passthrough() {
+        let planar_in: Vec<Vec<f32>> = vec![
+            vec![0.1, 0.2, 0.3, 0.4],
+            vec![-0.1, -0.2, -0.3, -0.4],
+        ];
+        let tj = TranscodeJson::default();
+        let mut tc = PlanarAudioTranscoder::new(48_000, 2, &tj).unwrap();
+        assert!(tc.is_passthrough());
+        assert_eq!(tc.out_sample_rate(), 48_000);
+        assert_eq!(tc.out_channels(), 2);
+        let out = tc.process(&planar_in).unwrap();
+        assert_eq!(out, planar_in);
+    }
+
+    /// `channel_map_preset = stereo_to_mono_3db` collapses 2 → 1 with a
+    /// -3 dB mix of L and R. No SRC should run — same input/output rate.
+    #[test]
+    fn planar_transcoder_stereo_to_mono_3db_preset() {
+        let planar_in: Vec<Vec<f32>> = vec![
+            vec![0.5, 0.3, -0.2],
+            vec![0.5, 0.3, -0.2],
+        ];
+        let tj = TranscodeJson {
+            channels: Some(1),
+            channel_map_preset: Some("stereo_to_mono_3db".to_string()),
+            ..TranscodeJson::default()
+        };
+        let mut tc = PlanarAudioTranscoder::new(48_000, 2, &tj).unwrap();
+        assert_eq!(tc.out_channels(), 1);
+        assert_eq!(tc.out_sample_rate(), 48_000);
+        assert!(!tc.is_passthrough());
+        let out = tc.process(&planar_in).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].len(), 3);
+        // Expected: each sample * 0.707 + same * 0.707 ≈ 1.414 * sample.
+        let gain = 2.0_f32 * 0.707_106_77;
+        for i in 0..3 {
+            let expected = planar_in[0][i] * gain;
+            assert!(
+                (out[0][i] - expected).abs() < 1e-5,
+                "sample {i}: got {}, want {expected}",
+                out[0][i]
+            );
+        }
+    }
+
+    /// Setting only `transcode.sample_rate` with the same value as the
+    /// source must still be a passthrough (no rubato invocation).
+    #[test]
+    fn planar_transcoder_same_rate_is_passthrough_on_rate() {
+        let planar_in: Vec<Vec<f32>> = vec![vec![0.25; 16]];
+        let tj = TranscodeJson {
+            sample_rate: Some(48_000),
+            ..TranscodeJson::default()
+        };
+        let mut tc = PlanarAudioTranscoder::new(48_000, 1, &tj).unwrap();
+        assert!(tc.is_passthrough());
+        let out = tc.process(&planar_in).unwrap();
+        assert_eq!(out, planar_in);
+    }
+
+    /// Channel swap via explicit `channel_map`: out[0] = in[1], out[1] = in[0].
+    #[test]
+    fn planar_transcoder_lr_swap_via_channel_map() {
+        let planar_in: Vec<Vec<f32>> = vec![
+            vec![0.1, 0.2, 0.3],
+            vec![-0.1, -0.2, -0.3],
+        ];
+        let tj = TranscodeJson {
+            channels: Some(2),
+            channel_map: Some(vec![vec![1], vec![0]]),
+            ..TranscodeJson::default()
+        };
+        let mut tc = PlanarAudioTranscoder::new(48_000, 2, &tj).unwrap();
+        let out = tc.process(&planar_in).unwrap();
+        assert_eq!(out[0], planar_in[1]);
+        assert_eq!(out[1], planar_in[0]);
+    }
+
+    /// Rejects mismatched input channel count so callers get a clear error
+    /// rather than silently zero-padding the wrong plane.
+    #[test]
+    fn planar_transcoder_rejects_channel_count_mismatch() {
+        let tj = TranscodeJson::default();
+        let mut tc = PlanarAudioTranscoder::new(48_000, 2, &tj).unwrap();
+        let wrong: Vec<Vec<f32>> = vec![vec![0.0; 4]]; // only 1 channel
+        assert!(tc.process(&wrong).is_err());
+    }
+
+    #[test]
+    fn channel_matrix_is_identity_helper() {
+        assert!(ChannelMatrix::identity(2).is_identity());
+        assert!(ChannelMatrix::identity(5).is_identity());
+        // Single non-identity entry breaks it.
+        let m = ChannelMatrix(vec![vec![(1, 1.0)], vec![(0, 1.0)]]);
+        assert!(!m.is_identity());
+        // Two sources on the same row breaks it.
+        let m = ChannelMatrix(vec![vec![(0, 1.0), (1, 0.5)]]);
+        assert!(!m.is_identity());
     }
 }

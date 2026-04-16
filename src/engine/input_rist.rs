@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 use rist_transport::{RistSocket, RistSocketConfig};
 
 use crate::config::models::RistInputConfig;
-use crate::manager::events::{EventSender, EventSeverity};
+use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::redundancy::merger::{ActiveLeg, HitlessMerger};
 use crate::stats::collector::FlowStatsAccumulator;
 use crate::util::time::now_us;
@@ -60,7 +60,7 @@ pub fn spawn_rist_input(
             tracing::error!("RIST input task exited with error: {e}");
             event_sender.emit_flow(
                 EventSeverity::Critical,
-                "rist",
+                category::RIST,
                 format!("RIST input lost: {e}"),
                 &flow_id,
             );
@@ -98,7 +98,7 @@ async fn rist_input_loop(
     let mut socket = RistSocket::receiver(sc).await.map_err(|e| {
         events.emit_flow(
             EventSeverity::Critical,
-            "rist",
+            category::RIST,
             format!("RIST input bind failed: {e}"),
             flow_id,
         );
@@ -108,7 +108,7 @@ async fn rist_input_loop(
     tracing::info!("RIST input started on {}", bind);
     events.emit_flow(
         EventSeverity::Info,
-        "rist",
+        category::RIST,
         format!("RIST input listening on {}", bind),
         flow_id,
     );
@@ -206,7 +206,7 @@ async fn rist_input_redundant_loop(
     );
     events.emit_flow(
         EventSeverity::Info,
-        "rist",
+        category::RIST,
         format!(
             "RIST input listening (2022-7): leg1={} leg2={}",
             leg1_addr, leg2_addr

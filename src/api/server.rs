@@ -187,7 +187,7 @@ pub fn build_router(state: AppState) -> Router {
 
     let nmos_routes = if auth_state
         .as_ref()
-        .map_or(false, |a| a.config.nmos_require_auth)
+        .map_or(false, |a| a.config.nmos_require_auth_effective())
     {
         tracing::info!("NMOS endpoints require JWT Bearer authentication");
         nmos_routes.route_layer(middleware::from_fn_with_state(

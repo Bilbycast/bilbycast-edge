@@ -23,7 +23,7 @@ use super::protocol::{
     TUNNEL_PROTOCOL_VERSION,
 };
 use super::quic;
-use crate::manager::events::{EventSender, EventSeverity};
+use crate::manager::events::{EventSender, EventSeverity, category};
 
 /// State of the relay tunnel connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,11 +157,12 @@ pub async fn connect_and_bind(
                             direction = %params.direction,
                             "Tunnel ready"
                         );
-                        event_sender.emit_flow(
+                        event_sender.emit_flow_with_details(
                             EventSeverity::Info,
-                            "tunnel",
+                            category::TUNNEL,
                             "Tunnel connected to relay",
                             &params.tunnel_id.to_string(),
+                            serde_json::json!({ "relay_addr": params.relay_addr.to_string() }),
                         );
                         break;
                     }
@@ -205,11 +206,12 @@ pub async fn connect_and_bind(
                                     direction = %params.direction,
                                     "Tunnel ready (via notification)"
                                 );
-                                event_sender.emit_flow(
+                                event_sender.emit_flow_with_details(
                                     EventSeverity::Info,
-                                    "tunnel",
+                                    category::TUNNEL,
                                     "Tunnel connected to relay",
                                     &params.tunnel_id.to_string(),
+                                    serde_json::json!({ "relay_addr": params.relay_addr.to_string() }),
                                 );
                                 break;
                             }
@@ -254,11 +256,12 @@ pub async fn connect_and_bind(
                         Ok(ParsedMessage::Known(RelayMessage::Pong | RelayMessage::HelloAck { .. })) => {}
                         Ok(ParsedMessage::Known(RelayMessage::TunnelDown { tunnel_id: tid, reason })) if tid == tunnel_id => {
                             tracing::warn!(tunnel_id = %tid, reason = %reason, "Tunnel down");
-                            reader_event_sender.emit_flow(
+                            reader_event_sender.emit_flow_with_details(
                                 EventSeverity::Warning,
-                                "tunnel",
+                                category::TUNNEL,
                                 format!("Tunnel peer disconnected: {reason}"),
                                 &tunnel_id_str,
+                                serde_json::json!({ "reason": reason }),
                             );
                             state_tx_clone.send_replace(RelayTunnelState::Down);
                             break;
@@ -271,11 +274,12 @@ pub async fn connect_and_bind(
                         }
                         Err(e) => {
                             tracing::warn!("Relay control stream error: {e}");
-                            reader_event_sender.emit_flow(
+                            reader_event_sender.emit_flow_with_details(
                                 EventSeverity::Warning,
-                                "tunnel",
+                                category::TUNNEL,
                                 format!("Tunnel disconnected from relay: {e}"),
                                 &tunnel_id_str,
+                                serde_json::json!({ "reason": e.to_string() }),
                             );
                             state_tx_clone.send_replace(RelayTunnelState::Down);
                             break;
@@ -310,18 +314,20 @@ pub async fn connect_with_retry(
                 let err_msg = e.to_string();
                 // Detect bind rejection
                 if err_msg.contains("bind_rejected") || err_msg.contains("BindRejected") {
-                    event_sender.emit_flow(
+                    event_sender.emit_flow_with_details(
                         EventSeverity::Critical,
-                        "tunnel",
+                        category::TUNNEL,
                         format!("Tunnel bind rejected by relay: {e}"),
                         &params.tunnel_id.to_string(),
+                        serde_json::json!({ "relay_addr": params.relay_addr.to_string() }),
                     );
                 } else {
-                    event_sender.emit_flow(
+                    event_sender.emit_flow_with_details(
                         EventSeverity::Warning,
-                        "tunnel",
+                        category::TUNNEL,
                         format!("Tunnel connection to relay failed: {e}"),
                         &params.tunnel_id.to_string(),
+                        serde_json::json!({ "relay_addr": params.relay_addr.to_string() }),
                     );
                 }
                 tracing::warn!(

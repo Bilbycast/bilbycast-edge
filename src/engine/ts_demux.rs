@@ -57,13 +57,17 @@ pub struct TsDemuxer {
     /// PAT (deterministic default for MPTS inputs). If `Some(N)`, only the
     /// PMT for program N is honoured; other programs are ignored.
     target_program: Option<u16>,
+    /// Audio track selector for multi-audio-track programs. If `None`, the
+    /// first audio PID in the PMT is used (default). If `Some(N)`, the Nth
+    /// audio track (0-based) is selected.
+    audio_track_index: Option<u8>,
     /// PMT PID we're locked onto (set after the first PAT is parsed).
     selected_pmt_pid: Option<u16>,
     /// Video PID (H.264 or H.265) discovered from the selected PMT.
     video_pid: Option<u16>,
     /// Video stream type.
     video_stream_type: u8,
-    /// Audio PID discovered from the selected PMT.
+    /// Audio PID discovered from the selected PMT (after track selection).
     audio_pid: Option<u16>,
     /// Per-PID PES reassembly.
     pes_assemblers: HashMap<u16, PesAssembler>,
@@ -87,6 +91,31 @@ impl TsDemuxer {
     pub fn new(target_program: Option<u16>) -> Self {
         Self {
             target_program,
+            audio_track_index: None,
+            selected_pmt_pid: None,
+            video_pid: None,
+            video_stream_type: 0,
+            audio_pid: None,
+            pes_assemblers: HashMap::new(),
+            cached_sps: None,
+            cached_pps: None,
+            cached_aac_config: None,
+        }
+    }
+
+    /// Create a new demuxer with audio track selection.
+    ///
+    /// `audio_track_index` selects which audio track to extract when the
+    /// PMT contains multiple audio elementary streams:
+    /// - `None` — use the first audio track found (default).
+    /// - `Some(0)` — first audio track, `Some(1)` — second, etc.
+    ///
+    /// If the requested track index exceeds the number of audio tracks in
+    /// the PMT, the first audio track is used as a fallback.
+    pub fn with_audio_track(target_program: Option<u16>, audio_track_index: Option<u8>) -> Self {
+        Self {
+            target_program,
+            audio_track_index,
             selected_pmt_pid: None,
             video_pid: None,
             video_stream_type: 0,
@@ -190,6 +219,9 @@ impl TsDemuxer {
     }
 
     /// Parse PMT to discover video and audio PIDs.
+    ///
+    /// Collects all audio elementary streams in PMT order, then selects the
+    /// one at `audio_track_index` (or the first if unset / out of range).
     fn parse_pmt(&mut self, pkt: &[u8]) {
         let mut offset = 4;
         if ts_has_adaptation(pkt) {
@@ -219,6 +251,9 @@ impl TsDemuxer {
         let data_end = (offset + 3 + section_length)
             .min(TS_PACKET_SIZE)
             .saturating_sub(4);
+
+        // Collect all audio tracks in PMT order for track selection.
+        let mut audio_tracks: Vec<(u16, u8)> = Vec::new(); // (es_pid, stream_type)
 
         let mut pos = data_start;
         while pos + 5 <= data_end {
@@ -253,37 +288,51 @@ impl TsDemuxer {
                     }
                 }
                 STREAM_TYPE_PRIVATE if is_opus => {
-                    if self.audio_pid != Some(es_pid) {
-                        tracing::info!("TS demux: Opus audio PID 0x{:04X}", es_pid);
-                        self.audio_pid = Some(es_pid);
-                        self.pes_assemblers.insert(
-                            es_pid,
-                            PesAssembler {
-                                buffer: Vec::with_capacity(16 * 1024),
-                                started: false,
-                                stream_type,
-                            },
-                        );
-                    }
+                    audio_tracks.push((es_pid, stream_type));
                 }
                 STREAM_TYPE_AAC_ADTS => {
-                    if self.audio_pid != Some(es_pid) {
-                        tracing::info!("TS demux: AAC audio PID 0x{:04X}", es_pid);
-                        self.audio_pid = Some(es_pid);
-                        self.pes_assemblers.insert(
-                            es_pid,
-                            PesAssembler {
-                                buffer: Vec::with_capacity(16 * 1024),
-                                started: false,
-                                stream_type,
-                            },
-                        );
-                    }
+                    audio_tracks.push((es_pid, stream_type));
                 }
                 _ => {}
             }
 
             pos += 5 + es_info_length;
+        }
+
+        // Select the audio track based on audio_track_index.
+        if !audio_tracks.is_empty() {
+            let idx = self
+                .audio_track_index
+                .map(|i| (i as usize).min(audio_tracks.len() - 1))
+                .unwrap_or(0);
+            let (selected_pid, selected_type) = audio_tracks[idx];
+
+            if self.audio_pid != Some(selected_pid) {
+                let codec_name = match selected_type {
+                    STREAM_TYPE_AAC_ADTS => "AAC",
+                    STREAM_TYPE_PRIVATE => "Opus",
+                    _ => "unknown",
+                };
+                tracing::info!(
+                    "TS demux: {} audio PID 0x{:04X} (track {}/{} selected{})",
+                    codec_name,
+                    selected_pid,
+                    idx,
+                    audio_tracks.len(),
+                    self.audio_track_index
+                        .map(|i| format!(", requested index {i}"))
+                        .unwrap_or_default(),
+                );
+                self.audio_pid = Some(selected_pid);
+                self.pes_assemblers.insert(
+                    selected_pid,
+                    PesAssembler {
+                        buffer: Vec::with_capacity(16 * 1024),
+                        started: false,
+                        stream_type: selected_type,
+                    },
+                );
+            }
         }
     }
 

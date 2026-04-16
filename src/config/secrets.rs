@@ -697,6 +697,7 @@ mod tests {
                 max_reconnect_attempts: None,
                 program_number: None,
                 audio_encode: None,
+                transcode: None,
             })],
             flows: vec![FlowConfig {
                 id: "rtmp-flow".to_string(),

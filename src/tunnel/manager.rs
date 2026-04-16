@@ -22,7 +22,7 @@ use super::config::{TunnelConfig, TunnelDirection, TunnelMode, TunnelProtocol};
 use super::relay_client::{self, RelayTunnelParams, RelayTunnelState};
 use super::tcp_forwarder::{self, TcpForwarderStats};
 use super::udp_forwarder::{self, UdpForwarderStats};
-use crate::manager::events::{EventSender, EventSeverity};
+use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::throughput::ThroughputEstimator;
 
 /// Runtime state for an active tunnel.
@@ -158,11 +158,12 @@ impl TunnelManager {
             },
         );
 
-        self.event_sender.emit_flow(
+        self.event_sender.emit_flow_with_details(
             EventSeverity::Info,
-            "tunnel",
+            category::TUNNEL,
             format!("Tunnel '{}' started", tunnel_name),
             &tunnel_id_str,
+            serde_json::json!({ "tunnel_name": tunnel_name }),
         );
 
         Ok(())
@@ -236,11 +237,12 @@ impl TunnelManager {
             if let Err(e) = result {
                 if !cancel.is_cancelled() {
                     tracing::error!(tunnel_id = %config_id, "Relay tunnel failed: {e}");
-                    event_sender.emit_flow(
+                    event_sender.emit_flow_with_details(
                         EventSeverity::Critical,
-                        "tunnel",
+                        category::TUNNEL,
                         format!("Tunnel '{}' failed: {e}", config_name),
                         &config_id,
+                        serde_json::json!({ "tunnel_name": config_name }),
                     );
                     // Remove from DashMap so manager re-push can re-create it
                     tunnels.remove(&config_id);
@@ -318,11 +320,12 @@ impl TunnelManager {
                                 tunnel_id = %tunnel_id,
                                 "Direct tunnel local port conflict, stopping: {e}"
                             );
-                            event_sender.emit_flow(
+                            event_sender.emit_flow_with_details(
                                 EventSeverity::Critical,
-                                "port_conflict",
+                                category::PORT_CONFLICT,
                                 format!("Tunnel '{}' stopped: {e}", config_name),
                                 &config_id,
+                                serde_json::json!({ "tunnel_name": config_name }),
                             );
                             tunnels.remove(&config_id);
                             return;
@@ -333,11 +336,12 @@ impl TunnelManager {
                             "Direct tunnel attempt {} failed: {e}",
                             attempt + 1
                         );
-                        event_sender.emit_flow(
+                        event_sender.emit_flow_with_details(
                             EventSeverity::Warning,
-                            "tunnel",
+                            category::TUNNEL,
                             format!("Tunnel '{}' attempt {} failed: {e}", config_name, attempt + 1),
                             &config_id,
+                            serde_json::json!({ "tunnel_name": config_name, "attempt": attempt + 1 }),
                         );
                         attempt = attempt.saturating_add(1);
                     }
@@ -373,11 +377,12 @@ impl TunnelManager {
         runtime.cancel.cancel();
         tracing::info!(tunnel_id = %id, "Tunnel destroyed");
 
-        self.event_sender.emit_flow(
+        self.event_sender.emit_flow_with_details(
             EventSeverity::Info,
-            "tunnel",
+            category::TUNNEL,
             format!("Tunnel '{}' stopped", tunnel_name),
             id,
+            serde_json::json!({ "tunnel_name": tunnel_name }),
         );
 
         Ok(())
@@ -492,11 +497,12 @@ async fn run_relay_tunnel(
                         tunnel_id = %tunnel_id,
                         "Tunnel local port conflict, stopping tunnel: {e}"
                     );
-                    event_sender.emit_flow(
+                    event_sender.emit_flow_with_details(
                         EventSeverity::Critical,
-                        "port_conflict",
+                        category::PORT_CONFLICT,
                         format!("Tunnel '{}' stopped: {e}", tunnel_name),
                         &tunnel_id_str,
+                        serde_json::json!({ "tunnel_name": tunnel_name }),
                     );
                     return Err(anyhow::anyhow!("{e}"));
                 }
@@ -505,11 +511,12 @@ async fn run_relay_tunnel(
                     tunnel_id = %tunnel_id,
                     "Relay tunnel connection lost: {e}, reconnecting in {reconnect_delay:?}"
                 );
-                event_sender.emit_flow(
+                event_sender.emit_flow_with_details(
                     EventSeverity::Warning,
-                    "tunnel",
+                    category::TUNNEL,
                     format!("Tunnel disconnected from relay: {e}"),
                     &tunnel_id_str,
+                    serde_json::json!({ "tunnel_name": tunnel_name, "reason": e.to_string() }),
                 );
             }
             Ok(()) => {
@@ -517,11 +524,12 @@ async fn run_relay_tunnel(
                     tunnel_id = %tunnel_id,
                     "Relay tunnel forwarder exited, reconnecting in {reconnect_delay:?}"
                 );
-                event_sender.emit_flow(
+                event_sender.emit_flow_with_details(
                     EventSeverity::Warning,
-                    "tunnel",
+                    category::TUNNEL,
                     "Tunnel disconnected from relay",
                     &tunnel_id_str,
+                    serde_json::json!({ "tunnel_name": tunnel_name, "reason": "forwarder exited cleanly" }),
                 );
             }
         }

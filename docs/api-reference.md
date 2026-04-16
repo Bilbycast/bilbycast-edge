@@ -75,7 +75,7 @@ curl http://localhost:8080/health
 
 ## Setup Wizard
 
-Browser-based initial provisioning for edge nodes deployed on COTS hardware. All setup endpoints are public (no authentication required). Access is controlled by the `setup_enabled` config flag (default: `true`).
+Browser-based initial provisioning for edge nodes deployed on COTS hardware. All setup endpoints are public (no authentication required). Access is controlled by the `setup_enabled` config flag (default: `true`). Once the node completes its first successful registration with a manager, the flag is automatically flipped to `false` and persisted to disk — subsequent requests to `/setup` return the "Setup Disabled" page.
 
 ### GET /setup
 
@@ -1489,6 +1489,6 @@ All API errors return a JSON body with `"success": false` and an `"error"` messa
 | GET | `/x-nmos/connection/v1.1/single/receivers/{id}/constraints` | Configurable | any | NMOS IS-05: Get constraints |
 
 **Auth notes:**
-- "Configurable" for NMOS: public by default, requires JWT when `nmos_require_auth: true`
+- "Configurable" for NMOS: requires JWT whenever `auth.enabled: true` (the secure-by-default). Set `nmos_require_auth: false` to opt out — a `SECURITY:` warning is logged at startup.
 - "Configurable" for `/metrics`: public by default, requires JWT when `public_metrics: false`
 - `/oauth/token` is rate-limited to 10 requests/minute per IP by default (configurable via `token_rate_limit_per_minute`)

@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::{SrtInputConfig, SrtMode};
-use crate::manager::events::{EventSender, EventSeverity};
+use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::redundancy::merger::{ActiveLeg, HitlessMerger};
 use crate::srt::connection::{
     accept_srt_connection, bind_srt_listener_for_input, bind_srt_listener_for_redundancy,
@@ -99,7 +99,7 @@ pub fn spawn_srt_input(
         };
         if let Err(e) = result {
             tracing::error!("SRT input task exited with error: {e}");
-            event_sender.emit_flow(EventSeverity::Critical, "flow", format!("Flow input lost: {e}"), &flow_id);
+            event_sender.emit_flow(EventSeverity::Critical, category::FLOW, format!("Flow input lost: {e}"), &flow_id);
         }
     })
 }
@@ -148,7 +148,16 @@ async fn srt_input_listener_loop(
             }
             Err(e) => {
                 tracing::error!("SRT input accept failed: {e}");
-                events.emit_flow(EventSeverity::Critical, "srt", format!("SRT input connection failed: {e}"), flow_id);
+                events.emit_flow_with_details(
+                    EventSeverity::Critical, category::SRT,
+                    format!("SRT input connection failed: {e}"), flow_id,
+                    serde_json::json!({
+                        "mode": "listener",
+                        "local_addr": config.local_addr.as_deref().unwrap_or("auto"),
+                        "stream_id": config.stream_id.as_deref().unwrap_or(""),
+                        "error": e.to_string(),
+                    }),
+                );
                 let _ = listener.close().await;
                 return Err(e);
             }
@@ -158,7 +167,15 @@ async fn srt_input_listener_loop(
             "SRT input connected: mode=listener local={}",
             config.local_addr.as_deref().unwrap_or("auto"),
         );
-        events.emit_flow(EventSeverity::Info, "srt", "SRT input connected (mode=listener)", flow_id);
+        events.emit_flow_with_details(
+            EventSeverity::Info, category::SRT,
+            "SRT input connected (mode=listener)", flow_id,
+            serde_json::json!({
+                "mode": "listener",
+                "local_addr": config.local_addr.as_deref().unwrap_or("auto"),
+                "stream_id": config.stream_id.as_deref().unwrap_or(""),
+            }),
+        );
 
         let poller_cancel = cancel.child_token();
         spawn_srt_stats_poller(socket.clone(), stats.input_srt_stats_cache.clone(), poller_cancel.clone());
@@ -175,7 +192,14 @@ async fn srt_input_listener_loop(
             return Ok(());
         }
 
-        events.emit_flow(EventSeverity::Warning, "srt", "SRT input disconnected, reconnecting", flow_id);
+        events.emit_flow_with_details(
+            EventSeverity::Warning, category::SRT,
+            "SRT input disconnected, reconnecting", flow_id,
+            serde_json::json!({
+                "mode": "listener",
+                "local_addr": config.local_addr.as_deref().unwrap_or("auto"),
+            }),
+        );
 
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -213,7 +237,16 @@ async fn srt_input_caller_loop(
                     return Ok(());
                 }
                 tracing::error!("SRT input connection failed: {e}");
-                events.emit_flow(EventSeverity::Critical, "srt", format!("SRT input connection failed: {e}"), flow_id);
+                events.emit_flow_with_details(
+                    EventSeverity::Critical, category::SRT,
+                    format!("SRT input connection failed: {e}"), flow_id,
+                    serde_json::json!({
+                        "mode": format!("{:?}", config.mode),
+                        "remote_addr": config.remote_addr.as_deref().unwrap_or(""),
+                        "stream_id": config.stream_id.as_deref().unwrap_or(""),
+                        "error": e.to_string(),
+                    }),
+                );
                 return Err(e);
             }
         };
@@ -223,7 +256,16 @@ async fn srt_input_caller_loop(
             config.mode,
             config.local_addr.as_deref().unwrap_or("auto"),
         );
-        events.emit_flow(EventSeverity::Info, "srt", format!("SRT input connected (mode={:?})", config.mode), flow_id);
+        events.emit_flow_with_details(
+            EventSeverity::Info, category::SRT,
+            format!("SRT input connected (mode={:?})", config.mode), flow_id,
+            serde_json::json!({
+                "mode": format!("{:?}", config.mode),
+                "local_addr": config.local_addr.as_deref().unwrap_or("auto"),
+                "remote_addr": config.remote_addr.as_deref().unwrap_or(""),
+                "stream_id": config.stream_id.as_deref().unwrap_or(""),
+            }),
+        );
 
         let poller_cancel = cancel.child_token();
         spawn_srt_stats_poller(socket.clone(), stats.input_srt_stats_cache.clone(), poller_cancel.clone());
@@ -239,7 +281,14 @@ async fn srt_input_caller_loop(
             break;
         }
 
-        events.emit_flow(EventSeverity::Warning, "srt", "SRT input disconnected, reconnecting", flow_id);
+        events.emit_flow_with_details(
+            EventSeverity::Warning, category::SRT,
+            "SRT input disconnected, reconnecting", flow_id,
+            serde_json::json!({
+                "mode": format!("{:?}", config.mode),
+                "remote_addr": config.remote_addr.as_deref().unwrap_or(""),
+            }),
+        );
 
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -430,7 +479,15 @@ async fn srt_input_redundant_loop(
             config.mode,
             config.local_addr.as_deref().unwrap_or("auto")
         );
-        events.emit_flow(EventSeverity::Info, "srt", "SRT input connected (mode=listener, redundant leg 1)", flow_id);
+        events.emit_flow_with_details(
+            EventSeverity::Info, category::SRT,
+            "SRT input connected (mode=listener, redundant leg 1)", flow_id,
+            serde_json::json!({
+                "mode": "listener",
+                "leg": 1,
+                "local_addr": config.local_addr.as_deref().unwrap_or("auto"),
+            }),
+        );
 
         // --- Connect/accept leg 2 (best-effort) ---
         let socket_leg2 = if let Some(ref mut listener) = listener_leg2 {
@@ -521,11 +578,11 @@ async fn srt_input_redundant_loop(
                         }
                         Err(_) => {
                             tracing::warn!("SRT input leg1 connection lost");
-                            events.emit_flow(EventSeverity::Warning, "redundancy", "Redundant leg 1 lost", flow_id);
+                            events.emit_flow(EventSeverity::Warning, category::REDUNDANCY, "Redundant leg 1 lost", flow_id);
                             leg1_alive = false;
                             if !leg2_alive {
                                 tracing::warn!("SRT input (redundant) both legs lost, will reconnect");
-                                events.emit_flow(EventSeverity::Critical, "redundancy", "Both redundant legs lost", flow_id);
+                                events.emit_flow(EventSeverity::Critical, category::REDUNDANCY, "Both redundant legs lost", flow_id);
                                 break;
                             }
                         }
@@ -552,11 +609,11 @@ async fn srt_input_redundant_loop(
                         }
                         Err(_) => {
                             tracing::warn!("SRT input leg2 connection lost");
-                            events.emit_flow(EventSeverity::Warning, "redundancy", "Redundant leg 2 lost", flow_id);
+                            events.emit_flow(EventSeverity::Warning, category::REDUNDANCY, "Redundant leg 2 lost", flow_id);
                             leg2_alive = false;
                             if !leg1_alive {
                                 tracing::warn!("SRT input (redundant) both legs lost, will reconnect");
-                                events.emit_flow(EventSeverity::Critical, "redundancy", "Both redundant legs lost", flow_id);
+                                events.emit_flow(EventSeverity::Critical, category::REDUNDANCY, "Both redundant legs lost", flow_id);
                                 break;
                             }
                         }

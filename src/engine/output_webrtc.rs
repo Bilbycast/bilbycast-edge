@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::WebrtcOutputConfig;
-use crate::manager::events::{EventSender, EventSeverity};
+use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::OutputStatsAccumulator;
 
 #[cfg(feature = "webrtc")]
@@ -40,6 +40,11 @@ enum WebrtcEncoderState {
         decoder: AacDecoder,
         encoder: AudioEncoder,
         decode_stats: Arc<DecodeStats>,
+        /// Optional planar PCM shuffle / sample-rate stage between the
+        /// decoder and the Opus encoder. `None` unless `config.transcode`
+        /// was set. When `transcode.channels` is set it wins over the Opus
+        /// encoder's channel count (the encoder reconfigures to match).
+        transcoder: Option<super::audio_transcode::PlanarAudioTranscoder>,
     },
     /// Decoder or encoder construction failed once. Drop audio for the
     /// rest of the session's lifetime.
@@ -201,7 +206,7 @@ async fn whep_server_loop(
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("WHEP output '{}': failed to create session: {}", config.id, e);
-                events.emit_flow(EventSeverity::Warning, "webrtc", format!("WebRTC session creation failed: {e}"), flow_id);
+                events.emit_flow(EventSeverity::Warning, category::WEBRTC, format!("WebRTC session creation failed: {e}"), flow_id);
                 let _ = msg.reply.send(Err(e));
                 continue;
             }
@@ -230,6 +235,7 @@ async fn whep_server_loop(
         let viewer_events = events.clone();
         let viewer_flow_id = flow_id.to_string();
         let viewer_audio_encode = config.audio_encode.clone();
+        let viewer_transcode = config.transcode.clone();
         let viewer_compressed = compressed_audio_input;
 
         tokio::spawn(async move {
@@ -245,6 +251,7 @@ async fn whep_server_loop(
                 &viewer_events,
                 &viewer_flow_id,
                 viewer_audio_encode,
+                viewer_transcode,
                 viewer_compressed,
             ).await;
         });
@@ -267,6 +274,7 @@ async fn whep_viewer_loop(
     events: &EventSender,
     flow_id: &str,
     audio_encode: Option<crate::config::models::AudioEncodeConfig>,
+    transcode: Option<super::audio_transcode::TranscodeJson>,
     compressed_audio_input: bool,
 ) {
     use super::ts_parse::strip_rtp_header;
@@ -282,17 +290,21 @@ async fn whep_viewer_loop(
         match event {
             SessionEvent::Connected => {
                 tracing::info!("WHEP viewer '{}' connected on output '{}'", session_id, output_id);
-                events.emit_flow(EventSeverity::Info, "webrtc", "WHEP viewer connected", flow_id);
+                events.emit_flow(EventSeverity::Info, category::WEBRTC, "WHEP viewer connected", flow_id);
                 break;
             }
             SessionEvent::Disconnected => {
                 tracing::info!("WHEP viewer '{}' disconnected during setup", session_id);
-                events.emit_flow(EventSeverity::Info, "webrtc", "WHEP viewer disconnected", flow_id);
+                events.emit_flow(EventSeverity::Info, category::WEBRTC, "WHEP viewer disconnected", flow_id);
                 return;
             }
             _ => continue,
         }
     }
+
+    // str0m may emit MediaAdded *after* Connected. Flush any pending
+    // events so video_mid / audio_mid are populated before we read them.
+    session.drain_pending_events();
 
     // Get the video MID and PT
     let video_mid = match session.video_mid {
@@ -329,7 +341,9 @@ async fn whep_viewer_loop(
             WebrtcEncoderState::Disabled
         };
 
-    // Send loop: demux TS → packetize H.264 → send via str0m
+    // Send loop: demux TS → packetize H.264 → send via str0m.
+    // Also processes incoming RTCP/STUN via drive_udp_io() to keep
+    // the session alive (same pattern as whip_client_loop).
     let mut demuxer = TsDemuxer::new(program_number);
     let mut rtp_seq: u16 = 0;
 
@@ -379,6 +393,7 @@ async fn whep_viewer_loop(
                                     if matches!(encoder_state, WebrtcEncoderState::Lazy) {
                                         encoder_state = build_webrtc_encoder_state(
                                             audio_encode.as_ref(),
+                                            transcode.as_ref(),
                                             &demuxer,
                                             compressed_audio_input,
                                             &cancel,
@@ -389,7 +404,7 @@ async fn whep_viewer_loop(
                                         );
                                     }
                                     if let (
-                                        WebrtcEncoderState::Active { decoder, encoder, decode_stats },
+                                        WebrtcEncoderState::Active { decoder, encoder, decode_stats, transcoder },
                                         Some(audio_mid),
                                         Some(audio_pt),
                                     ) = (&mut encoder_state, audio_mid, audio_pt)
@@ -398,7 +413,21 @@ async fn whep_viewer_loop(
                                         match decoder.decode_frame(&data) {
                                             Ok(planar) => {
                                                 decode_stats.inc_output();
-                                                encoder.submit_planar(&planar, pts);
+                                                if let Some(tc) = transcoder.as_mut() {
+                                                    match tc.process(&planar) {
+                                                        Ok(shuffled) => {
+                                                            encoder.submit_planar(&shuffled, pts);
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::debug!(
+                                                                "WHEP viewer '{}' transcode failed: {}",
+                                                                session_id, e
+                                                            );
+                                                        }
+                                                    }
+                                                } else {
+                                                    encoder.submit_planar(&planar, pts);
+                                                }
                                             }
                                             Err(_) => {
                                                 decode_stats.inc_error();
@@ -431,9 +460,15 @@ async fn whep_viewer_loop(
                             }
                         }
 
-                        // Drive str0m (send any queued output)
-                        while let Ok(str0m::Output::Transmit(t)) = session.rtc_poll_output() {
-                            let _ = session.send_udp(&t).await;
+                        // Drive str0m: process incoming RTCP/STUN + send queued output.
+                        if let Some(ev) = session.drive_udp_io().await {
+                            match ev {
+                                SessionEvent::Disconnected => {
+                                    tracing::info!("WHEP viewer '{}' disconnected during send", session_id);
+                                    break;
+                                }
+                                _ => {}
+                            }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -446,7 +481,7 @@ async fn whep_viewer_loop(
     }
 
     tracing::info!("WHEP viewer '{}' disconnected from output '{}'", session_id, output_id);
-    events.emit_flow(EventSeverity::Info, "webrtc", "WHEP viewer disconnected", flow_id);
+    events.emit_flow(EventSeverity::Info, category::WEBRTC, "WHEP viewer disconnected", flow_id);
 }
 
 /// WHIP client output loop — pushes media to an external WHIP endpoint.
@@ -495,7 +530,7 @@ async fn whip_client_loop(
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("WHIP client '{}': session error: {}", config.id, e);
-                events.emit_flow(EventSeverity::Warning, "webrtc", format!("WebRTC session creation failed: {e}"), flow_id);
+                events.emit_flow(EventSeverity::Warning, category::WEBRTC, format!("WebRTC session creation failed: {e}"), flow_id);
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
@@ -543,7 +578,7 @@ async fn whip_client_loop(
         }
 
         backoff_secs = 1;
-        tracing::info!("WHIP client '{}' connected to {}", config.id, whip_url);
+        tracing::info!("WHIP client '{}' signaling complete, waiting for ICE/DTLS", config.id);
 
         // Wait for ICE+DTLS to complete
         let child_cancel = cancel.child_token();
@@ -563,6 +598,10 @@ async fn whip_client_loop(
                 _ => continue,
             }
         }
+
+        // str0m may emit MediaAdded *after* Connected. Flush any pending
+        // events so video_mid / audio_mid are populated before we read them.
+        session.drain_pending_events();
 
         // Get the video PT
         let video_mid = match session.video_mid {
@@ -590,6 +629,7 @@ async fn whip_client_loop(
         };
 
         let audio_encode = config.audio_encode.clone();
+        let transcode = config.transcode.clone();
         let mut encoder_state: WebrtcEncoderState =
             if audio_encode.is_some() && audio_mid.is_some() && audio_pt.is_some() {
                 WebrtcEncoderState::Lazy
@@ -597,7 +637,12 @@ async fn whip_client_loop(
                 WebrtcEncoderState::Disabled
             };
 
-        // Send loop: demux TS → packetize H.264 → send via str0m
+        // Send loop: demux TS → packetize H.264 → send via str0m.
+        //
+        // We must also process incoming UDP (RTCP receiver reports, STUN
+        // keepalives) so str0m can maintain the connection. Without this
+        // the remote peer never receives RTCP feedback, timers expire,
+        // and the session silently dies.
         let mut demuxer = TsDemuxer::new(config.program_number);
         let mut rtp_seq: u16 = 0;
 
@@ -645,6 +690,7 @@ async fn whip_client_loop(
                                         if matches!(encoder_state, WebrtcEncoderState::Lazy) {
                                             encoder_state = build_webrtc_encoder_state(
                                                 audio_encode.as_ref(),
+                                                transcode.as_ref(),
                                                 &demuxer,
                                                 compressed_audio_input,
                                                 &cancel,
@@ -655,7 +701,7 @@ async fn whip_client_loop(
                                             );
                                         }
                                         if let (
-                                            WebrtcEncoderState::Active { decoder, encoder, decode_stats },
+                                            WebrtcEncoderState::Active { decoder, encoder, decode_stats, transcoder },
                                             Some(audio_mid),
                                             Some(audio_pt),
                                         ) = (&mut encoder_state, audio_mid, audio_pt)
@@ -664,7 +710,21 @@ async fn whip_client_loop(
                                             match decoder.decode_frame(&data) {
                                                 Ok(planar) => {
                                                     decode_stats.inc_output();
-                                                    encoder.submit_planar(&planar, pts);
+                                                    if let Some(tc) = transcoder.as_mut() {
+                                                        match tc.process(&planar) {
+                                                            Ok(shuffled) => {
+                                                                encoder.submit_planar(&shuffled, pts);
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::debug!(
+                                                                    "WHIP '{}' transcode failed: {}",
+                                                                    config.id, e
+                                                                );
+                                                            }
+                                                        }
+                                                    } else {
+                                                        encoder.submit_planar(&planar, pts);
+                                                    }
                                                 }
                                                 Err(_) => {
                                                     decode_stats.inc_error();
@@ -695,10 +755,20 @@ async fn whip_client_loop(
                                 }
                             }
 
-                            // Drive str0m (send any queued output)
-                            // poll_event would block, so just drain transmits
-                            while let Ok(str0m::Output::Transmit(t)) = session.rtc_poll_output() {
-                                let _ = session.send_udp(&t).await;
+                            // Drive str0m: process incoming RTCP/STUN + send queued output.
+                            if let Some(ev) = session.drive_udp_io().await {
+                                match ev {
+                                    super::webrtc::session::SessionEvent::Disconnected => {
+                                        tracing::warn!("WHIP client '{}' disconnected during send", config.id);
+                                        events.emit_flow(EventSeverity::Info, category::WEBRTC, "WHIP client disconnected", flow_id);
+                                        continue 'outer;
+                                    }
+                                    super::webrtc::session::SessionEvent::KeyframeRequest { .. } => {
+                                        // We can't generate keyframes — log and ignore.
+                                        tracing::debug!("WHIP client '{}': received PLI/FIR (ignored, passthrough mode)", config.id);
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -722,6 +792,7 @@ async fn whip_client_loop(
 #[cfg(feature = "webrtc")]
 fn build_webrtc_encoder_state(
     audio_encode: Option<&crate::config::models::AudioEncodeConfig>,
+    transcode: Option<&super::audio_transcode::TranscodeJson>,
     demuxer: &super::ts_demux::TsDemuxer,
     compressed_audio_input: bool,
     cancel: &CancellationToken,
@@ -800,13 +871,44 @@ fn build_webrtc_encoder_state(
         return WebrtcEncoderState::Failed;
     }
 
-    let target_ch = enc_cfg.channels.unwrap_or(ch_cfg);
+    // When a transcode block is set it wins: transcode.channels overrides
+    // the Opus encoder's channel count, and transcode.sample_rate (if set)
+    // chooses the PCM rate the encoder ingests. When unset the Opus encoder
+    // follows the source, matching the pre-transcode behaviour.
+    // Opus on the wire is always 48 kHz regardless of either block.
+    let (enc_in_sr, target_ch, transcoder) = if let Some(tj_in) = transcode {
+        let merged = super::audio_transcode::TranscodeJson {
+            sample_rate: tj_in.sample_rate,
+            channels: tj_in.channels.or(enc_cfg.channels),
+            ..tj_in.clone()
+        };
+        match super::audio_transcode::PlanarAudioTranscoder::new(
+            input_sr, ch_cfg, &merged,
+        ) {
+            Ok(tc) => (tc.out_sample_rate(), tc.out_channels(), Some(tc)),
+            Err(e) => {
+                let msg = format!(
+                    "WebRTC output '{output_id}': audio_encode transcode build failed: {e}"
+                );
+                tracing::error!("{msg}");
+                events.emit_flow(
+                    EventSeverity::Critical,
+                    crate::manager::events::category::AUDIO_ENCODE,
+                    msg,
+                    flow_id,
+                );
+                return WebrtcEncoderState::Failed;
+            }
+        }
+    } else {
+        (input_sr, enc_cfg.channels.unwrap_or(ch_cfg), None)
+    };
     let target_br = enc_cfg.bitrate_kbps.unwrap_or_else(|| codec.default_bitrate_kbps());
 
     let params = EncoderParams {
         codec,
-        sample_rate: input_sr,
-        channels: ch_cfg,
+        sample_rate: enc_in_sr,
+        channels: target_ch,
         target_bitrate_kbps: target_br,
         // Opus is always 48 kHz on the wire regardless of operator input.
         target_sample_rate: 48_000,
@@ -884,5 +986,5 @@ fn build_webrtc_encoder_state(
         encoder.params().target_bitrate_kbps,
     );
 
-    WebrtcEncoderState::Active { decoder, encoder, decode_stats }
+    WebrtcEncoderState::Active { decoder, encoder, decode_stats, transcoder }
 }

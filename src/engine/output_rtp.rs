@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::models::RtpOutputConfig;
 use crate::fec::encoder::FecEncoder;
+use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::OutputStatsAccumulator;
 use crate::util::socket::create_udp_output;
 use crate::util::time::now_us;
@@ -92,6 +93,7 @@ pub fn spawn_rtp_output(
     output_stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
+    events: EventSender,
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
 
@@ -106,7 +108,7 @@ pub fn spawn_rtp_output(
         let result = if config.redundancy.is_some() {
             rtp_output_redundant_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx).await
         } else {
-            rtp_output_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx).await
+            rtp_output_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx, &events).await
         };
         if let Err(e) = result {
             tracing::error!("RTP output '{}' exited with error: {e}", config.id);
@@ -135,6 +137,7 @@ async fn rtp_output_loop(
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
+    events: &EventSender,
 ) -> anyhow::Result<()> {
     let (socket, dest) =
         create_udp_output(&config.dest_addr, config.bind_addr.as_deref(), config.interface_addr.as_deref(), config.dscp).await?;
@@ -189,12 +192,19 @@ async fn rtp_output_loop(
     // forced through the raw-TS path (the original RTP framing is
     // discarded and rebuilt) because the replacer rewrites payload bytes.
     let mut audio_replacer = match config.audio_encode.as_ref() {
-        Some(enc) => match TsAudioReplacer::new(enc) {
+        Some(enc) => match TsAudioReplacer::new(enc, config.transcode.clone()) {
             Ok(r) => {
                 tracing::info!(
                     "RTP output '{}': audio_encode active ({})",
                     config.id,
                     r.target_description()
+                );
+                events.emit_output_with_details(
+                    EventSeverity::Info,
+                    category::AUDIO_ENCODE,
+                    format!("TS audio encoder started: output '{}'", config.id),
+                    &config.id,
+                    serde_json::json!({ "codec": enc.codec }),
                 );
                 Some(r)
             }
@@ -202,6 +212,13 @@ async fn rtp_output_loop(
                 tracing::error!(
                     "RTP output '{}': audio_encode rejected: {e}; audio will be left untouched",
                     config.id
+                );
+                events.emit_output_with_details(
+                    EventSeverity::Critical,
+                    category::AUDIO_ENCODE,
+                    format!("TS audio encoder failed: output '{}': {e}", config.id),
+                    &config.id,
+                    serde_json::json!({ "error": e.to_string() }),
                 );
                 None
             }
@@ -242,12 +259,26 @@ async fn rtp_output_loop(
                     config.id,
                     r.target_description()
                 );
+                events.emit_output_with_details(
+                    EventSeverity::Info,
+                    category::VIDEO_ENCODE,
+                    format!("Video encoder started: output '{}'", config.id),
+                    &config.id,
+                    serde_json::json!({ "codec": enc.codec }),
+                );
                 Some(r)
             }
             Err(e) => {
                 tracing::error!(
                     "RTP output '{}': video_encode rejected: {e}; video will be left untouched",
                     config.id
+                );
+                events.emit_output_with_details(
+                    EventSeverity::Critical,
+                    category::VIDEO_ENCODE,
+                    format!("Video encoder failed: output '{}': {e}", config.id),
+                    &config.id,
+                    serde_json::json!({ "error": e.to_string() }),
                 );
                 None
             }

@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::models::RtpInputConfig;
 use crate::fec::decoder::FecDecoder;
+use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::redundancy::merger::{ActiveLeg, HitlessMerger};
 use crate::stats::collector::FlowStatsAccumulator;
 use crate::util::rtp_parse::{is_likely_rtp, parse_rtp_sequence_number, parse_rtp_timestamp};
@@ -30,15 +31,18 @@ pub fn spawn_rtp_input(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
+    event_sender: EventSender,
+    flow_id: String,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let result = if config.redundancy.is_some() {
-            rtp_input_redundant_loop(config, broadcast_tx, stats, cancel).await
+            rtp_input_redundant_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id).await
         } else {
-            rtp_input_loop(config, broadcast_tx, stats, cancel).await
+            rtp_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id).await
         };
         if let Err(e) = result {
             tracing::error!("RTP input task exited with error: {e}");
+            event_sender.emit_flow(EventSeverity::Critical, category::FLOW, format!("Flow input lost: {e}"), &flow_id);
         }
     })
 }
@@ -110,8 +114,31 @@ async fn rtp_input_loop(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
+    events: &EventSender,
+    flow_id: &str,
 ) -> anyhow::Result<()> {
-    let socket = bind_udp_input(&config.bind_addr, config.interface_addr.as_deref()).await?;
+    let socket = match bind_udp_input(&config.bind_addr, config.interface_addr.as_deref()).await {
+        Ok(s) => {
+            events.emit_flow_with_details(
+                EventSeverity::Info,
+                category::RTP,
+                format!("RTP input listening on {}", config.bind_addr),
+                flow_id,
+                serde_json::json!({"bind_addr": config.bind_addr}),
+            );
+            s
+        }
+        Err(e) => {
+            events.emit_flow_with_details(
+                EventSeverity::Critical,
+                category::RTP,
+                format!("RTP input bind failed on {}: {e}", config.bind_addr),
+                flow_id,
+                serde_json::json!({"bind_addr": config.bind_addr, "error": e.to_string()}),
+            );
+            return Err(e);
+        }
+    };
 
     tracing::info!("RTP input started on {}", config.bind_addr);
 
@@ -264,14 +291,58 @@ async fn rtp_input_redundant_loop(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
+    events: &EventSender,
+    flow_id: &str,
 ) -> anyhow::Result<()> {
     let redundancy = config
         .redundancy
         .as_ref()
         .expect("redundancy config must be present");
 
-    let socket1 = bind_udp_input(&config.bind_addr, config.interface_addr.as_deref()).await?;
-    let socket2 = bind_udp_input(&redundancy.bind_addr, redundancy.interface_addr.as_deref()).await?;
+    let socket1 = match bind_udp_input(&config.bind_addr, config.interface_addr.as_deref()).await {
+        Ok(s) => {
+            events.emit_flow_with_details(
+                EventSeverity::Info,
+                category::RTP,
+                format!("RTP input leg 1 listening on {}", config.bind_addr),
+                flow_id,
+                serde_json::json!({"bind_addr": config.bind_addr, "leg": 1}),
+            );
+            s
+        }
+        Err(e) => {
+            events.emit_flow_with_details(
+                EventSeverity::Critical,
+                category::RTP,
+                format!("RTP input leg 1 bind failed on {}: {e}", config.bind_addr),
+                flow_id,
+                serde_json::json!({"bind_addr": config.bind_addr, "leg": 1, "error": e.to_string()}),
+            );
+            return Err(e);
+        }
+    };
+    let socket2 = match bind_udp_input(&redundancy.bind_addr, redundancy.interface_addr.as_deref()).await {
+        Ok(s) => {
+            events.emit_flow_with_details(
+                EventSeverity::Info,
+                category::RTP,
+                format!("RTP input leg 2 listening on {}", redundancy.bind_addr),
+                flow_id,
+                serde_json::json!({"bind_addr": redundancy.bind_addr, "leg": 2}),
+            );
+            s
+        }
+        Err(e) => {
+            events.emit_flow_with_details(
+                EventSeverity::Critical,
+                category::RTP,
+                format!("RTP input leg 2 bind failed on {}: {e}", redundancy.bind_addr),
+                flow_id,
+                serde_json::json!({"bind_addr": redundancy.bind_addr, "leg": 2, "error": e.to_string()}),
+            );
+            return Err(e);
+        }
+    };
 
     tracing::info!(
         "RTP input started with 2022-7 redundancy: leg1={} leg2={}",

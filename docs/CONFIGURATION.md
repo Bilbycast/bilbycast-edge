@@ -89,7 +89,7 @@ On startup, the edge loads its config from both `config.json` and `secrets.json`
 |-----------|-----------|---------|-------------|
 | `node_id` | `string?` | Auto-generated | Persistent UUID v4 identifying this edge node. Auto-generated on first startup and saved to config. Used as the NMOS IS-04 Node ID. All NMOS resource UUIDs are derived from this value (UUID v5), so they remain stable across restarts. |
 | `device_name` | `string?` | `null` | Optional human-readable label for this edge node (e.g. "Studio-A Encoder"). Max 256 characters. |
-| `setup_enabled` | `bool` | `true` | When true, the browser-based setup wizard is accessible at `/setup`. Set to false to disable it after provisioning. |
+| `setup_enabled` | `bool` | `true` | When true, the browser-based setup wizard is accessible at `/setup`. Automatically flipped to `false` (and persisted) after the node's first successful manager registration; operators can also flip it manually. |
 
 ---
 
@@ -141,7 +141,7 @@ OAuth 2.0 client credentials authentication with JWT (HMAC-SHA256). When absent 
 | `token_lifetime_secs`  | `u64`          | `3600`  | Token validity period in seconds               |
 | `clients`              | `AuthClient[]` | --      | List of registered OAuth clients               |
 | `public_metrics`       | `bool`         | `true`  | Allow unauthenticated access to `/metrics` and `/health` |
-| `nmos_require_auth`    | `bool`         | `false` | Require JWT Bearer auth on NMOS IS-04/IS-05/IS-08 endpoints |
+| `nmos_require_auth`    | `Option<bool>` | unset → `true` when `enabled: true` | Require JWT Bearer auth on NMOS IS-04/IS-05/IS-08 endpoints. Secure-by-default: when `enabled: true` and the field is unset, NMOS is protected. Set to `false` to explicitly opt out (logs a `SECURITY:` warning). |
 | `token_rate_limit_per_minute` | `u32`   | `10`    | Max OAuth token requests per minute per IP (0 = disabled) |
 
 Each client entry:
@@ -551,6 +551,9 @@ Outputs are discriminated by the `"type"` field. All output types share `id` and
 | `program_number`   | `u16?`                  | `null`  | MPTS → SPTS program filter. `null` = passthrough (full MPTS); `Some(N)` = send only program N as a rewritten single-program TS. Must be `> 0`. See the **[MPTS → SPTS filtering](#mpts--spts-filtering)** section. |
 | `transport_mode`   | `string?`               | `null`  | `"ts"` (default) sends raw MPEG-TS as the existing path does. `"audio_302m"` runs the per-output transcode + SMPTE 302M packetizer + TsMuxer pipeline and ships 7×188-byte LPCM-in-MPEG-TS chunks over SRT. Mutually exclusive with `packet_filter`, `program_number`, `redundancy`, and `delay`. The upstream input must be an audio essence (`st2110_30`, `st2110_31`, or `rtp_audio`). See [`audio-gateway.md`](audio-gateway.md). |
 | `delay`            | `OutputDelay?`          | `null`  | Output delay for stream synchronization. Three modes: `{"mode":"fixed","ms":N}` adds a constant delay; `{"mode":"target_ms","ms":N}` sets a target end-to-end latency (dynamically adjusts); `{"mode":"target_frames","frames":N,"fallback_ms":M}` sets target in video frames (auto-detected fps, optional ms fallback). Incompatible with `transport_mode: "audio_302m"`. |
+| `audio_encode`     | `AudioEncodeConfig?`    | `null`  | Optional audio re-encode (Phase B). `codec` ∈ {`aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`}. Rewrites the TS audio ES in place via `TsAudioReplacer`. Incompatible with `transport_mode: "audio_302m"`, 2022-7 redundancy, and SRT FEC (`packet_filter`). See `AudioEncodeConfig` block below. |
+| `transcode`        | `TranscodeJson?`        | `null`  | Optional channel shuffle / sample-rate conversion applied to decoded PCM **before** `audio_encode` re-encodes. Ignored when `audio_encode` is unset. See [`transcoding.md`](transcoding.md#transcode--channel-shuffle--sample-rate-conversion) for full schema and resolution rules. |
+| `video_encode`     | `VideoEncodeConfig?`    | `null`  | Optional video re-encode (Phase 4, feature-gated — x264 / x265 / NVENC). See [`transcoding.md`](transcoding.md). |
 
 ### RTP Output (`"type": "rtp"`)
 
@@ -569,6 +572,9 @@ Sends RTP-wrapped MPEG-TS packets with RTP headers. Supports SMPTE 2022-1 FEC en
 | `redundancy`     | `RtpOutputRedundancyConfig?`  | `null`  | SMPTE 2022-7 second leg configuration           |
 | `program_number` | `u16?`                        | `null`  | MPTS → SPTS program filter. `null` = passthrough (full MPTS); `Some(N)` = send only program N as a rewritten single-program TS. Applied before FEC and 2022-7 redundancy, so receivers see the filtered SPTS. Must be `> 0`. |
 | `delay`          | `OutputDelay?`                | `null`  | Output delay for stream synchronization. Three modes: `fixed` (constant delay), `target_ms` (target end-to-end latency), `target_frames` (target latency in video frames). See SRT Output for format details. |
+| `audio_encode`   | `AudioEncodeConfig?`          | `null`  | Optional audio re-encode (Phase B). `codec` ∈ {`aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`}. Rewrites the TS audio ES in place via `TsAudioReplacer`. Incompatible with 2022-7 redundancy and SMPTE 2022-1 FEC encode. See `AudioEncodeConfig` block below. |
+| `transcode`      | `TranscodeJson?`              | `null`  | Optional channel shuffle / sample-rate conversion applied to decoded PCM **before** `audio_encode` re-encodes. Ignored when `audio_encode` is unset. See [`transcoding.md`](transcoding.md#transcode--channel-shuffle--sample-rate-conversion). |
+| `video_encode`   | `VideoEncodeConfig?`          | `null`  | Optional video re-encode (Phase 4, feature-gated). See [`transcoding.md`](transcoding.md). |
 
 ### UDP Output (`"type": "udp"`)
 
@@ -586,6 +592,9 @@ Sends raw MPEG-TS over UDP without RTP headers. Datagrams are TS-aligned (7×188
 | `program_number` | `u16?`     | `null`  | MPTS → SPTS program filter. `null` = passthrough (full MPTS); `Some(N)` = send only program N as a rewritten single-program TS. Must be `> 0`. |
 | `transport_mode` | `string?`  | `null`  | `"ts"` (default) sends raw MPEG-TS as the existing path does. `"audio_302m"` runs the per-output transcode + SMPTE 302M packetizer pipeline and emits 7×188-byte LPCM-in-MPEG-TS chunks as plain UDP datagrams (useful for legacy hardware decoders that consume raw MPEG-TS over UDP). Mutually exclusive with `program_number` and `delay`. See [`audio-gateway.md`](audio-gateway.md). |
 | `delay`          | `OutputDelay?` | `null` | Output delay for stream synchronization. Three modes: `fixed` (constant delay), `target_ms` (target end-to-end latency), `target_frames` (target latency in video frames). Incompatible with `transport_mode: "audio_302m"`. See SRT Output for format details. |
+| `audio_encode`   | `AudioEncodeConfig?` | `null` | Optional audio re-encode (Phase B). `codec` ∈ {`aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`}. Rewrites the TS audio ES in place via `TsAudioReplacer`. Incompatible with `transport_mode: "audio_302m"`. See `AudioEncodeConfig` block below. |
+| `transcode`      | `TranscodeJson?` | `null` | Optional channel shuffle / sample-rate conversion applied to decoded PCM **before** `audio_encode` re-encodes. Ignored when `audio_encode` is unset. See [`transcoding.md`](transcoding.md#transcode--channel-shuffle--sample-rate-conversion). |
+| `video_encode`   | `VideoEncodeConfig?` | `null` | Optional video re-encode (Phase 4, feature-gated). See [`transcoding.md`](transcoding.md). |
 
 ### RTMP Output (`"type": "rtmp"`)
 
@@ -605,7 +614,8 @@ HE-AAC v1/v2 — see [`audio-gateway.md`](audio-gateway.md#the-audio_encode-bloc
 | `reconnect_delay_secs`     | `u64`   | `5`     | Delay between reconnection attempts             |
 | `max_reconnect_attempts`   | `u32?`  | `null`  | Maximum reconnect attempts (null = unlimited)   |
 | `program_number`           | `u16?`  | `null`  | MPTS program selector. `null` = lock onto the lowest program_number in the PAT (deterministic default for MPTS inputs); `Some(N)` = extract elementary streams from program N only. RTMP is single-program by spec, so this only changes *which* program is published. Must be `> 0`. |
-| `audio_encode`             | `AudioEncodeConfig?` | `null`  | Optional ffmpeg-sidecar audio encoder. Allowed `codec`: `aac_lc` (default), `he_aac_v1`, `he_aac_v2`. Requires ffmpeg in PATH at runtime; outputs without `audio_encode` set keep working without ffmpeg. The same-codec passthrough fast path applies when `codec == aac_lc` with no overrides on an AAC-LC source. See `AudioEncodeConfig` shape below. |
+| `audio_encode`             | `AudioEncodeConfig?` | `null`  | Optional ffmpeg-sidecar audio encoder. Allowed `codec`: `aac_lc` (default), `he_aac_v1`, `he_aac_v2`. Requires ffmpeg in PATH at runtime; outputs without `audio_encode` set keep working without ffmpeg. The same-codec passthrough fast path applies when `codec == aac_lc` with no overrides on an AAC-LC source (disabled when `transcode` is set). See `AudioEncodeConfig` shape below. |
+| `transcode`                | `TranscodeJson?`     | `null`  | Optional channel shuffle / sample-rate conversion applied to decoded PCM **before** `audio_encode` re-encodes. Setting `transcode` disables the same-codec passthrough fast path. Ignored when `audio_encode` is unset. See [`transcoding.md`](transcoding.md#transcode--channel-shuffle--sample-rate-conversion). |
 
 ### HLS Output (`"type": "hls"`)
 
@@ -622,6 +632,7 @@ Segment-based HTTP ingest. Supports HEVC/HDR content.
 | `max_segments`         | `usize`   | `5`     | Maximum segments in rolling playlist             |
 | `program_number`       | `u16?`    | `null`  | MPTS → SPTS program filter. `null` = each segment carries the full MPTS; `Some(N)` = each segment carries only program N as a rewritten single-program TS. Must be `> 0`. |
 | `audio_encode`         | `AudioEncodeConfig?` | `null` | Optional per-segment ffmpeg remuxer. Allowed `codec`: `aac_lc` (default), `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`. Each segment is piped through `ffmpeg -i pipe:0 -c:v copy -c:a {codec} -f mpegts pipe:1`. Requires ffmpeg in PATH; the output refuses to start if ffmpeg is missing and emits a Critical `audio_encode` event. |
+| `transcode`            | `TranscodeJson?`     | `null` | Optional channel shuffle / sample-rate conversion applied to decoded PCM **before** `audio_encode` re-encodes. Honoured only on the in-process remux path (`video-thumbnail` feature, default); the subprocess fallback logs a warning and ignores it. Ignored when `audio_encode` is unset. See [`transcoding.md`](transcoding.md#transcode--channel-shuffle--sample-rate-conversion). |
 
 ### WebRTC Output (`"type": "webrtc"`)
 
@@ -651,11 +662,17 @@ so SDP negotiates an audio MID.
 | `video_only`   | `bool`    | `false`        | Send only video (audio omitted). Mutually exclusive with `audio_encode`. |
 | `program_number` | `u16?`  | `null`         | MPTS program selector. `null` = lock onto the lowest program_number in the PAT (deterministic default); `Some(N)` = extract elementary streams from program N only. WebRTC is single-program by spec, so this only changes *which* program is sent. Must be `> 0`. |
 | `audio_encode` | `AudioEncodeConfig?` | `null` | Optional ffmpeg-sidecar audio encoder. Only `codec: opus` is allowed for WebRTC. Validation rejects `audio_encode` + `video_only=true` (an audio MID must be negotiated in SDP). Requires ffmpeg in PATH; the encoder builds lazily on the first AAC frame after a viewer connects. |
+| `transcode`    | `TranscodeJson?`     | `null` | Optional channel shuffle / sample-rate conversion applied to decoded PCM **before** the Opus encoder. `transcode.channels` overrides the Opus encoder's channel count; unset keeps the source channel count. Opus on the wire is always 48 kHz regardless of either block. Ignored when `audio_encode` is unset. See [`transcoding.md`](transcoding.md#transcode--channel-shuffle--sample-rate-conversion). |
 
 #### `AudioEncodeConfig` block (Phase B)
 
-Used by RTMP, HLS, and WebRTC outputs. Validation enforces a strict
-codec×output matrix at config load time — see [`audio-gateway.md`](audio-gateway.md#the-audio_encode-block--compressed-audio-egress-rtmp--hls--webrtc).
+Used by RTMP, HLS, WebRTC, and the TS-carrying SRT / UDP / RTP / RIST
+outputs. Validation enforces a strict codec×output matrix at config
+load time — see [`audio-gateway.md`](audio-gateway.md#the-audio_encode-block--compressed-audio-egress-rtmp--hls--webrtc).
+Every output that accepts `audio_encode` also accepts an optional
+companion `transcode` block (channel shuffle / sample-rate conversion
+applied to the decoded PCM before re-encoding). Full reference:
+[`transcoding.md`](transcoding.md#transcode--channel-shuffle--sample-rate-conversion).
 
 | Field | Type | Default | Description |
 |---|---|---|---|

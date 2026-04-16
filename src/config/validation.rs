@@ -73,10 +73,27 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
                 }
             }
         }
-        if auth.nmos_require_auth && !auth.enabled {
-            tracing::warn!(
-                "nmos_require_auth is true but auth is disabled — NMOS endpoints will remain public"
-            );
+        match (auth.enabled, auth.nmos_require_auth) {
+            (true, Some(false)) => {
+                tracing::warn!(
+                    "SECURITY: auth is enabled but nmos_require_auth was explicitly set to \
+                     false — NMOS IS-04/IS-05/IS-08 will be reachable unauthenticated. \
+                     Remove this field or set it to true to protect NMOS endpoints."
+                );
+            }
+            (true, None) => {
+                tracing::info!(
+                    "NMOS IS-04/IS-05/IS-08 endpoints will require JWT Bearer auth by default \
+                     (auth.enabled is true and nmos_require_auth is unset). Set \
+                     nmos_require_auth: false to opt out."
+                );
+            }
+            (false, Some(true)) => {
+                tracing::warn!(
+                    "nmos_require_auth is true but auth is disabled — NMOS endpoints will remain public"
+                );
+            }
+            _ => {}
         }
     }
 
@@ -673,6 +690,15 @@ fn validate_st2110_audio_output(
             &format!("{label} output '{}' transcode", c.id),
         )?;
     }
+    if let Some(idx) = c.audio_track_index {
+        if idx > 15 {
+            bail!(
+                "{label} output '{}': audio_track_index must be 0-15, got {}",
+                c.id,
+                idx
+            );
+        }
+    }
     Ok(())
 }
 
@@ -714,10 +740,61 @@ pub(crate) fn validate_transcode_block(
             bail!("{context}.payload_type must be in dynamic range 96-127, got {pt}");
         }
     }
-    if tj.channel_map.is_some() && tj.channel_map_preset.is_some() {
-        bail!(
-            "{context}: channel_map and channel_map_preset are mutually exclusive"
-        );
+    {
+        let sources = [
+            tj.channel_map.is_some(),
+            tj.channel_map_with_gain.is_some(),
+            tj.channel_map_preset.is_some(),
+        ];
+        if sources.iter().filter(|&&v| v).count() > 1 {
+            bail!(
+                "{context}: channel_map, channel_map_with_gain, and channel_map_preset \
+                 are mutually exclusive — specify at most one"
+            );
+        }
+    }
+    // Validate channel_map_with_gain entries.
+    if let Some(ref map) = tj.channel_map_with_gain {
+        if let Some(ch) = tj.channels {
+            if map.len() != ch as usize {
+                bail!(
+                    "{context}: channel_map_with_gain has {} rows but channels is {}",
+                    map.len(),
+                    ch
+                );
+            }
+        }
+        for (row_idx, row) in map.iter().enumerate() {
+            for (col_idx, pair) in row.iter().enumerate() {
+                let ch_idx = pair[0];
+                let gain = pair[1];
+                if ch_idx < 0.0 || ch_idx != ch_idx.floor() {
+                    bail!(
+                        "{context}: channel_map_with_gain[{row_idx}][{col_idx}][0] must be \
+                         a non-negative integer channel index, got {ch_idx}"
+                    );
+                }
+                if ch_idx as u8 >= in_channels {
+                    bail!(
+                        "{context}: channel_map_with_gain[{row_idx}][{col_idx}] references \
+                         input channel {} but input has only {in_channels} channels",
+                        ch_idx as u8
+                    );
+                }
+                if gain < 0.0 {
+                    bail!(
+                        "{context}: channel_map_with_gain[{row_idx}][{col_idx}][1] gain must \
+                         be non-negative, got {gain}"
+                    );
+                }
+                if gain > 10.0 {
+                    bail!(
+                        "{context}: channel_map_with_gain[{row_idx}][{col_idx}][1] gain must \
+                         be at most 10.0 (+20 dB), got {gain}"
+                    );
+                }
+            }
+        }
     }
     // Structural cross-checks via the resolver — this catches matrix-shape /
     // out-of-bounds / unknown-preset errors with one consistent code path.
@@ -736,6 +813,107 @@ pub(crate) fn validate_transcode_block(
         },
     )
     .map_err(|e| anyhow::anyhow!("{context}: {e}"))?;
+    Ok(())
+}
+
+/// Validate a JSON `transcode` block without knowing the upstream input
+/// format. Used on TS / RTMP / HLS / WebRTC outputs where the audio arrives
+/// AAC-encoded inside the transport stream — the actual input rate and
+/// channel count are reported by the decoder at runtime, so input-relative
+/// checks (preset channel-count match, matrix index range) are deferred.
+/// All range, enum, and mutual-exclusion checks still run here.
+pub(crate) fn validate_transcode_block_deferred(
+    tj: &crate::engine::audio_transcode::TranscodeJson,
+    context: &str,
+) -> Result<()> {
+    if let Some(sr) = tj.sample_rate {
+        if !matches!(sr, 32_000 | 44_100 | 48_000 | 88_200 | 96_000) {
+            bail!(
+                "{context}.sample_rate must be one of 32000, 44100, 48000, 88200, 96000, got {sr}"
+            );
+        }
+    }
+    if let Some(bd) = tj.bit_depth {
+        if !matches!(bd, 16 | 20 | 24) {
+            bail!("{context}.bit_depth must be 16, 20, or 24, got {bd}");
+        }
+    }
+    if let Some(ch) = tj.channels {
+        if ch == 0 || ch > 16 {
+            bail!("{context}.channels must be 1..=16, got {ch}");
+        }
+    }
+    if let Some(pt) = tj.packet_time_us {
+        if !matches!(pt, 125 | 250 | 333 | 500 | 1_000 | 4_000) {
+            bail!(
+                "{context}.packet_time_us must be one of 125, 250, 333, 500, 1000, 4000, got {pt}"
+            );
+        }
+    }
+    if let Some(pt) = tj.payload_type {
+        if !(96..=127).contains(&pt) {
+            bail!("{context}.payload_type must be in dynamic range 96-127, got {pt}");
+        }
+    }
+    let sources = [
+        tj.channel_map.is_some(),
+        tj.channel_map_with_gain.is_some(),
+        tj.channel_map_preset.is_some(),
+    ];
+    if sources.iter().filter(|&&v| v).count() > 1 {
+        bail!(
+            "{context}: channel_map, channel_map_with_gain, and channel_map_preset \
+             are mutually exclusive — specify at most one"
+        );
+    }
+    if let Some(ref map) = tj.channel_map {
+        if let Some(ch) = tj.channels {
+            if map.len() != ch as usize {
+                bail!(
+                    "{context}: channel_map has {} rows but channels is {}",
+                    map.len(),
+                    ch
+                );
+            }
+        }
+    }
+    if let Some(ref map) = tj.channel_map_with_gain {
+        if let Some(ch) = tj.channels {
+            if map.len() != ch as usize {
+                bail!(
+                    "{context}: channel_map_with_gain has {} rows but channels is {}",
+                    map.len(),
+                    ch
+                );
+            }
+        }
+        for (row_idx, row) in map.iter().enumerate() {
+            for (col_idx, pair) in row.iter().enumerate() {
+                let ch_idx = pair[0];
+                let gain = pair[1];
+                if ch_idx < 0.0 || ch_idx != ch_idx.floor() {
+                    bail!(
+                        "{context}: channel_map_with_gain[{row_idx}][{col_idx}][0] must be \
+                         a non-negative integer channel index, got {ch_idx}"
+                    );
+                }
+                if gain < 0.0 {
+                    bail!(
+                        "{context}: channel_map_with_gain[{row_idx}][{col_idx}][1] gain must \
+                         be non-negative, got {gain}"
+                    );
+                }
+                if gain > 10.0 {
+                    bail!(
+                        "{context}: channel_map_with_gain[{row_idx}][{col_idx}][1] gain must \
+                         be at most 10.0 (+20 dB), got {gain}"
+                    );
+                }
+            }
+        }
+    }
+    // Preset name validity against actual input channel count is deferred to
+    // runtime (the preset → matrix resolver checks it there).
     Ok(())
 }
 
@@ -968,6 +1146,15 @@ fn validate_rtp_audio_output(
             in_ch,
             &format!("rtp_audio output '{}' transcode", c.id),
         )?;
+    }
+    if let Some(idx) = c.audio_track_index {
+        if idx > 15 {
+            bail!(
+                "rtp_audio output '{}': audio_track_index must be 0-15, got {}",
+                c.id,
+                idx
+            );
+        }
     }
     if let Some(ref tm) = c.transport_mode {
         if !matches!(tm.as_str(), "rtp" | "audio_302m") {
@@ -1405,6 +1592,18 @@ pub fn validate_output_with_input(
                     &format!("RTP output '{}'", rtp.id),
                 )?;
             }
+            if let Some(ref tj) = rtp.transcode {
+                if rtp.audio_encode.is_none() {
+                    bail!(
+                        "RTP output '{}': transcode has no effect without audio_encode set",
+                        rtp.id
+                    );
+                }
+                validate_transcode_block_deferred(
+                    tj,
+                    &format!("RTP output '{}' transcode", rtp.id),
+                )?;
+            }
             if let Some(ref enc) = rtp.video_encode {
                 if rtp.redundancy.is_some() {
                     bail!(
@@ -1461,6 +1660,18 @@ pub fn validate_output_with_input(
                     enc,
                     &["aac_lc", "he_aac_v1", "he_aac_v2", "mp2", "ac3"],
                     &format!("UDP output '{}'", udp.id),
+                )?;
+            }
+            if let Some(ref tj) = udp.transcode {
+                if udp.audio_encode.is_none() {
+                    bail!(
+                        "UDP output '{}': transcode has no effect without audio_encode set",
+                        udp.id
+                    );
+                }
+                validate_transcode_block_deferred(
+                    tj,
+                    &format!("UDP output '{}' transcode", udp.id),
                 )?;
             }
             if let Some(ref enc) = udp.video_encode {
@@ -1557,6 +1768,18 @@ pub fn validate_output_with_input(
                     &format!("SRT output '{}'", srt.id),
                 )?;
             }
+            if let Some(ref tj) = srt.transcode {
+                if srt.audio_encode.is_none() {
+                    bail!(
+                        "SRT output '{}': transcode has no effect without audio_encode set",
+                        srt.id
+                    );
+                }
+                validate_transcode_block_deferred(
+                    tj,
+                    &format!("SRT output '{}' transcode", srt.id),
+                )?;
+            }
             if let Some(ref enc) = srt.video_encode {
                 if srt.transport_mode.as_deref() == Some("audio_302m") {
                     bail!(
@@ -1608,6 +1831,18 @@ pub fn validate_output_with_input(
                     &format!("RTMP output '{}'", rtmp.id),
                 )?;
             }
+            if let Some(ref tj) = rtmp.transcode {
+                if rtmp.audio_encode.is_none() {
+                    bail!(
+                        "RTMP output '{}': transcode has no effect without audio_encode set",
+                        rtmp.id
+                    );
+                }
+                validate_transcode_block_deferred(
+                    tj,
+                    &format!("RTMP output '{}' transcode", rtmp.id),
+                )?;
+            }
         }
         OutputConfig::Hls(hls) => {
             validate_id(&hls.id, "HLS output")?;
@@ -1619,9 +1854,26 @@ pub fn validate_output_with_input(
             if hls.ingest_url.len() > 2048 {
                 bail!("HLS output '{}': ingest_url must be at most 2048 characters", hls.id);
             }
+            // HLS segments are pushed via raw HTTP PUT with the URL inlined into the
+            // request line. CRLF or other ASCII control bytes would allow header
+            // injection / request smuggling against the ingest server.
+            if hls.ingest_url.chars().any(|c| c.is_ascii_control()) {
+                bail!(
+                    "HLS output '{}': ingest_url must not contain ASCII control characters",
+                    hls.id
+                );
+            }
             if let Some(ref token) = hls.auth_token {
                 if token.len() > 4096 {
                     bail!("HLS output '{}': auth_token must be at most 4096 characters", hls.id);
+                }
+                // Bearer tokens are inlined into the Authorization header — reject
+                // control or whitespace bytes that could inject extra headers.
+                if token.chars().any(|c| c.is_ascii_control() || c.is_whitespace()) {
+                    bail!(
+                        "HLS output '{}': auth_token must not contain control or whitespace characters",
+                        hls.id
+                    );
                 }
             }
             if hls.segment_duration_secs < 0.5 || hls.segment_duration_secs > 10.0 {
@@ -1638,6 +1890,18 @@ pub fn validate_output_with_input(
                     enc,
                     &["aac_lc", "he_aac_v1", "he_aac_v2", "mp2", "ac3"],
                     &format!("HLS output '{}'", hls.id),
+                )?;
+            }
+            if let Some(ref tj) = hls.transcode {
+                if hls.audio_encode.is_none() {
+                    bail!(
+                        "HLS output '{}': transcode has no effect without audio_encode set",
+                        hls.id
+                    );
+                }
+                validate_transcode_block_deferred(
+                    tj,
+                    &format!("HLS output '{}' transcode", hls.id),
                 )?;
             }
         }
@@ -1686,6 +1950,18 @@ pub fn validate_output_with_input(
                     enc,
                     &["opus"],
                     &format!("WebRTC output '{}'", webrtc.id),
+                )?;
+            }
+            if let Some(ref tj) = webrtc.transcode {
+                if webrtc.audio_encode.is_none() {
+                    bail!(
+                        "WebRTC output '{}': transcode has no effect without audio_encode set",
+                        webrtc.id
+                    );
+                }
+                validate_transcode_block_deferred(
+                    tj,
+                    &format!("WebRTC output '{}' transcode", webrtc.id),
                 )?;
             }
         }
@@ -2034,6 +2310,18 @@ fn validate_rist_output(rist: &RistOutputConfig) -> Result<()> {
             enc,
             &["aac_lc", "he_aac_v1", "he_aac_v2", "mp2", "ac3"],
             &format!("RIST output '{}'", rist.id),
+        )?;
+    }
+    if let Some(ref tj) = rist.transcode {
+        if rist.audio_encode.is_none() {
+            bail!(
+                "RIST output '{}': transcode has no effect without audio_encode set",
+                rist.id
+            );
+        }
+        validate_transcode_block_deferred(
+            tj,
+            &format!("RIST output '{}' transcode", rist.id),
         )?;
     }
     if let Some(ref enc) = rist.video_encode {
@@ -2549,6 +2837,7 @@ mod tests {
             program_number: None,
             delay: None,
             audio_encode: None,
+            transcode: None,
             video_encode: None,
         }));
         config.flows.push(FlowConfig {
@@ -2775,6 +3064,7 @@ mod tests {
             program_number: None,
             delay: None,
             audio_encode: None,
+            transcode: None,
             video_encode: None,
         }));
         config.flows.push(FlowConfig {
@@ -2826,6 +3116,7 @@ mod tests {
             program_number: None,
             delay: None,
             audio_encode: None,
+            transcode: None,
             video_encode: None,
         }));
         config.flows.push(FlowConfig {
@@ -2894,6 +3185,7 @@ mod tests {
             program_number: None,
             delay: None,
             audio_encode: None,
+            transcode: None,
             video_encode: None,
         }));
         config.flows.push(FlowConfig {
@@ -2945,6 +3237,7 @@ mod tests {
             program_number: None,
             delay: None,
             audio_encode: None,
+            transcode: None,
             video_encode: None,
         }));
         config.flows.push(FlowConfig {
@@ -2996,6 +3289,7 @@ mod tests {
             program_number: None,
             delay: None,
             audio_encode: None,
+            transcode: None,
             video_encode: None,
         }));
         config.flows.push(FlowConfig {
@@ -3051,6 +3345,7 @@ mod tests {
             dscp: 46,
             ssrc: None,
             transcode: None,
+            audio_track_index: None,
         }
     }
 
@@ -3497,6 +3792,7 @@ mod tests {
                 sample_rate: None,
                 channels: None,
             }),
+            transcode: None,
         });
         assert!(validate_output(&make("aac_lc")).is_ok());
         assert!(validate_output(&make("he_aac_v1")).is_ok());
@@ -3525,11 +3821,69 @@ mod tests {
                 sample_rate: None,
                 channels: None,
             }),
+            transcode: None,
         });
         assert!(validate_output(&make("aac_lc")).is_ok());
         assert!(validate_output(&make("mp2")).is_ok());
         assert!(validate_output(&make("ac3")).is_ok());
         assert!(validate_output(&make("opus")).is_err());
+    }
+
+    #[test]
+    fn validate_output_hls_rejects_crlf_in_ingest_url() {
+        use crate::config::models::{HlsOutputConfig, OutputConfig};
+        let make = |url: &str| OutputConfig::Hls(HlsOutputConfig {
+            active: true,
+            group: None,
+            id: "hls1".into(),
+            name: "hls 1".into(),
+            ingest_url: url.into(),
+            segment_duration_secs: 2.0,
+            auth_token: None,
+            max_segments: 5,
+            program_number: None,
+            audio_encode: None,
+            transcode: None,
+        });
+        assert!(validate_output(&make("https://example.com/hls")).is_ok());
+        let err = validate_output(&make("https://example.com/hls\r\nX-Injected: 1"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ASCII control"), "unexpected error: {err}");
+        assert!(
+            validate_output(&make("https://example.com/hls\nfoo")).is_err()
+        );
+        assert!(
+            validate_output(&make("https://example.com/hls\0null")).is_err()
+        );
+    }
+
+    #[test]
+    fn validate_output_hls_rejects_crlf_in_auth_token() {
+        use crate::config::models::{HlsOutputConfig, OutputConfig};
+        let make = |token: &str| OutputConfig::Hls(HlsOutputConfig {
+            active: true,
+            group: None,
+            id: "hls1".into(),
+            name: "hls 1".into(),
+            ingest_url: "https://example.com/hls".into(),
+            segment_duration_secs: 2.0,
+            auth_token: Some(token.into()),
+            max_segments: 5,
+            program_number: None,
+            audio_encode: None,
+            transcode: None,
+        });
+        assert!(validate_output(&make("abc123DEF")).is_ok());
+        let err = validate_output(&make("Bearer xxx\r\nX-Injected: 1"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("control or whitespace"),
+            "unexpected error: {err}"
+        );
+        assert!(validate_output(&make("has space")).is_err());
+        assert!(validate_output(&make("tab\there")).is_err());
     }
 
     #[test]
@@ -3555,6 +3909,7 @@ mod tests {
                 sample_rate: None,
                 channels: None,
             }),
+            transcode: None,
         });
         // Opus + audio MID negotiated → OK.
         assert!(validate_output(&make("opus", false)).is_ok());

@@ -390,7 +390,10 @@ pub async fn run_st2110_audio_output(
     // sample rate and channel count.
     let mut ts_demuxer: Option<crate::engine::ts_demux::TsDemuxer> =
         if compressed_audio_input {
-            Some(crate::engine::ts_demux::TsDemuxer::new(None))
+            Some(crate::engine::ts_demux::TsDemuxer::with_audio_track(
+                None,
+                config.audio_track_index,
+            ))
         } else {
             None
         };
@@ -1103,6 +1106,7 @@ mod tests {
             dscp: 46,
             ssrc: None,
             transcode: None,
+            audio_track_index: None,
         };
         let out_stats = Arc::new(OutputStatsAccumulator::new(
             "out1".into(),
@@ -1214,6 +1218,7 @@ mod tests {
             dscp: 46,
             ssrc: Some(0xDEADBEEF),
             transcode: Some(crate::engine::audio_transcode::TranscodeJson::default()),
+            audio_track_index: None,
         };
         let out_stats = Arc::new(OutputStatsAccumulator::new(
             "tx-out".into(),

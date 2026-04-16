@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::{RtspInputConfig, RtspTransport};
-use crate::manager::events::{EventSender, EventSeverity};
+use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::FlowStatsAccumulator;
 
 use super::packet::RtpPacket;
@@ -69,11 +69,15 @@ async fn rtsp_input_loop(
                 );
                 // Emit disconnect event once per connection cycle (not on every retry)
                 if disconnect_event_pending {
-                    event_sender.emit_flow(
-                        EventSeverity::Warning,
-                        "rtsp",
+                    event_sender.emit_flow_with_details(
+                        EventSeverity::Warning, category::RTSP,
                         format!("RTSP input disconnected: {e}. Reconnecting in {}s", config.reconnect_delay_secs),
                         &flow_id,
+                        serde_json::json!({
+                            "url": config.rtsp_url,
+                            "reconnect_delay_secs": config.reconnect_delay_secs,
+                            "error": e.to_string(),
+                        }),
                     );
                     disconnect_event_pending = false;
                 }
@@ -167,11 +171,12 @@ async fn run_rtsp_session(
         .demuxed()?;
 
     tracing::info!("RTSP: connected and playing from {}", config.rtsp_url);
-    event_sender.emit_flow(
-        EventSeverity::Info,
-        "rtsp",
-        format!("RTSP connected to {}", config.rtsp_url),
-        flow_id,
+    event_sender.emit_flow_with_details(
+        EventSeverity::Info, category::RTSP,
+        format!("RTSP connected to {}", config.rtsp_url), flow_id,
+        serde_json::json!({
+            "url": config.rtsp_url,
+        }),
     );
     *disconnect_event_pending = true;
 

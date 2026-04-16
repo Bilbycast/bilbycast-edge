@@ -33,7 +33,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::RtmpInputConfig;
-use crate::manager::events::{EventSender, EventSeverity};
+use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::FlowStatsAccumulator;
 
 use super::packet::RtpPacket;
@@ -72,11 +72,11 @@ pub fn spawn_rtmp_input(
         tokio::spawn(async move {
             if let Err(e) = run_rtmp_server(server_config, media_tx, is_pub, cancel_server).await {
                 tracing::error!("RTMP server error: {e:#}");
-                server_event_sender.emit_flow(
-                    EventSeverity::Critical,
-                    "rtmp",
+                server_event_sender.emit_flow_with_details(
+                    EventSeverity::Critical, category::RTMP,
                     format!("RTMP server error: {e}"),
                     &server_flow_id,
+                    serde_json::json!({ "error": e.to_string() }),
                 );
             }
         });
@@ -155,7 +155,7 @@ async fn process_media(
                                     tracing::info!("RTMP: received AVC sequence header (SPS+PPS)");
                                     event_sender.emit_flow(
                                         EventSeverity::Info,
-                                        "rtmp",
+                                        category::RTMP,
                                         "RTMP publisher connected",
                                         &flow_id,
                                     );
@@ -297,7 +297,7 @@ async fn process_media(
                         tracing::info!("RTMP publisher disconnected, waiting for reconnection");
                         event_sender.emit_flow(
                             EventSeverity::Warning,
-                            "rtmp",
+                            category::RTMP,
                             "RTMP publisher disconnected",
                             &flow_id,
                         );

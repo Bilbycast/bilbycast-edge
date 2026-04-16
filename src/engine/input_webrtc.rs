@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 #[cfg(feature = "webrtc")]
 use crate::config::models::WebrtcInputConfig;
 #[cfg(feature = "webrtc")]
-use crate::manager::events::{EventSender, EventSeverity};
+use crate::manager::events::{EventSender, EventSeverity, category};
 #[cfg(feature = "webrtc")]
 use crate::stats::collector::FlowStatsAccumulator;
 
@@ -102,7 +102,7 @@ async fn whip_input_loop(
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("Failed to create WebRTC session: {}", e);
-                events.emit_flow(EventSeverity::Warning, "webrtc", format!("WebRTC session failed: {e}"), flow_id);
+                events.emit_flow(EventSeverity::Warning, category::WEBRTC, format!("WebRTC session failed: {e}"), flow_id);
                 let _ = msg.reply.send(Err(e));
                 continue;
             }
@@ -174,11 +174,11 @@ async fn whip_input_loop(
                 }
                 SessionEvent::Connected => {
                     tracing::info!("WHIP publisher connected on flow '{}'", flow_id);
-                    events.emit_flow(EventSeverity::Info, "webrtc", "WHIP publisher connected", flow_id);
+                    events.emit_flow(EventSeverity::Info, category::WEBRTC, "WHIP publisher connected", flow_id);
                 }
                 SessionEvent::Disconnected => {
                     tracing::info!("WHIP publisher disconnected from flow '{}', waiting for next", flow_id);
-                    events.emit_flow(EventSeverity::Info, "webrtc", "WHIP publisher disconnected", flow_id);
+                    events.emit_flow(EventSeverity::Info, category::WEBRTC, "WHIP publisher disconnected", flow_id);
                     break; // Go back to waiting for next publisher
                 }
                 SessionEvent::KeyframeRequest { .. } => {
@@ -230,7 +230,7 @@ async fn whep_input_loop(
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("WHEP: failed to create session: {}", e);
-                events.emit_flow(EventSeverity::Warning, "webrtc", format!("WebRTC session failed: {e}"), flow_id);
+                events.emit_flow(EventSeverity::Warning, category::WEBRTC, format!("WebRTC session failed: {e}"), flow_id);
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
@@ -278,7 +278,7 @@ async fn whep_input_loop(
 
         backoff_secs = 1; // Reset on successful connection
         tracing::info!("WHEP connected to {}", config.whep_url);
-        events.emit_flow(EventSeverity::Info, "webrtc", "WHEP connected", flow_id);
+        events.emit_flow(EventSeverity::Info, category::WEBRTC, "WHEP connected", flow_id);
 
         let mut ts_muxer = crate::engine::rtmp::ts_mux::TsMuxer::new();
         let mut seq_num: u16 = 0;
@@ -321,7 +321,7 @@ async fn whep_input_loop(
                 }
                 SessionEvent::Disconnected => {
                     tracing::warn!("WHEP disconnected, reconnecting...");
-                    events.emit_flow(EventSeverity::Info, "webrtc", "WHEP disconnected", flow_id);
+                    events.emit_flow(EventSeverity::Info, category::WEBRTC, "WHEP disconnected", flow_id);
                     break; // Reconnect
                 }
                 _ => {}

@@ -201,7 +201,7 @@ For COTS hardware deployed at venues where SSH access is impractical:
 
 5. **Restart the service** to apply the new settings (e.g., `systemctl restart bilbycast-edge`).
 
-The setup wizard is enabled by default (`setup_enabled: true` in config). Set it to `false` after provisioning to disable access. The wizard requires no authentication -- it is intended for initial setup of unconfigured nodes.
+The setup wizard is enabled by default (`setup_enabled: true` in config). It auto-disables itself (writing `setup_enabled: false` to disk) as soon as the node completes its first successful registration with a manager, so `/setup` stops accepting reconfiguration after provisioning. Operators can also flip the flag manually. The wizard requires no authentication -- it is intended for initial setup of unconfigured nodes.
 
 ## CLI Options
 

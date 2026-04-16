@@ -248,7 +248,7 @@ async fn run_standby_listener(
         let err_msg = status.error.read().unwrap().clone().unwrap_or_default();
         event_sender.emit_input(
             crate::manager::events::EventSeverity::Warning,
-            "standby",
+            crate::manager::events::category::STANDBY,
             format!("Standby listener for input '{input_id}' failed: {err_msg}"),
             &input_id,
         );

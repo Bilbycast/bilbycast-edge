@@ -15,7 +15,7 @@ use tokio::time::{Duration, interval};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::{BandwidthLimitAction, BandwidthLimitConfig};
-use crate::manager::events::{EventSender, EventSeverity};
+use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::FlowStatsAccumulator;
 
 /// Spawn the bandwidth monitor task for a flow.
@@ -101,7 +101,7 @@ async fn bandwidth_monitor_loop(
                     let current_mbps = current_bps as f64 / 1_000_000.0;
                     event_sender.emit_flow_with_details(
                         EventSeverity::Info,
-                        "bandwidth",
+                        category::BANDWIDTH,
                         format!(
                             "Flow '{}' bandwidth returned to normal, unblocked ({:.1} Mbps <= {:.1} Mbps)",
                             flow_id, current_mbps, config.max_bitrate_mbps
@@ -146,7 +146,7 @@ async fn bandwidth_monitor_loop(
                     BandwidthLimitAction::Alarm => {
                         event_sender.emit_flow_with_details(
                             EventSeverity::Warning,
-                            "bandwidth",
+                            category::BANDWIDTH,
                             format!(
                                 "Flow '{}' bandwidth exceeded limit ({:.1} Mbps > {:.1} Mbps)",
                                 flow_id, current_mbps, config.max_bitrate_mbps
@@ -168,7 +168,7 @@ async fn bandwidth_monitor_loop(
                         blocked_secs = 0;
                         event_sender.emit_flow_with_details(
                             EventSeverity::Critical,
-                            "bandwidth",
+                            category::BANDWIDTH,
                             format!(
                                 "Flow '{}' blocked: bandwidth exceeded limit ({:.1} Mbps > {:.1} Mbps)",
                                 flow_id, current_mbps, config.max_bitrate_mbps
@@ -196,7 +196,7 @@ async fn bandwidth_monitor_loop(
                 triggered = false;
                 event_sender.emit_flow_with_details(
                     EventSeverity::Info,
-                    "bandwidth",
+                    category::BANDWIDTH,
                     format!(
                         "Flow '{}' bandwidth returned to normal ({:.1} Mbps <= {:.1} Mbps)",
                         flow_id, current_mbps, config.max_bitrate_mbps

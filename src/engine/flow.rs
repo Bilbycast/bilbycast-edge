@@ -298,6 +298,8 @@ impl FlowRuntime {
                         per_input_tx.clone(),
                         flow_stats.clone(),
                         input_cancel.clone(),
+                        event_sender.clone(),
+                        config.config.id.clone(),
                     )
                 }
                 InputConfig::Udp(udp_config) => {
@@ -306,6 +308,8 @@ impl FlowRuntime {
                         per_input_tx.clone(),
                         flow_stats.clone(),
                         input_cancel.clone(),
+                        event_sender.clone(),
+                        config.config.id.clone(),
                     )
                 }
                 InputConfig::Srt(srt_config) => {
@@ -944,6 +948,7 @@ impl FlowRuntime {
                     output_stats.clone(),
                     output_cancel.clone(),
                     frame_rate_rx,
+                    event_sender.clone(),
                 );
 
                 Ok(OutputRuntime {
@@ -966,6 +971,7 @@ impl FlowRuntime {
                     output_cancel.clone(),
                     input_audio_format,
                     frame_rate_rx,
+                    event_sender.clone(),
                 );
 
                 Ok(OutputRuntime {

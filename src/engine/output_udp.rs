@@ -12,6 +12,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::UdpOutputConfig;
+use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::OutputStatsAccumulator;
 use crate::util::socket::create_udp_output;
 use crate::util::time::now_us;
@@ -53,6 +54,7 @@ pub fn spawn_udp_output(
     cancel: CancellationToken,
     input_format: Option<InputFormat>,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
+    events: EventSender,
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
 
@@ -73,14 +75,14 @@ pub fn spawn_udp_output(
     tokio::spawn(async move {
         if matches!(config.transport_mode.as_deref(), Some("audio_302m")) {
             if let Err(e) =
-                udp_output_loop_302m(&config, &mut rx, output_stats, cancel, input_format).await
+                udp_output_loop_302m(&config, &mut rx, output_stats, cancel, input_format, &events).await
             {
                 tracing::error!(
                     "UDP output '{}' (audio_302m) exited with error: {e}",
                     config.id
                 );
             }
-        } else if let Err(e) = udp_output_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx).await {
+        } else if let Err(e) = udp_output_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx, &events).await {
             tracing::error!("UDP output '{}' exited with error: {e}", config.id);
         }
     })
@@ -96,6 +98,7 @@ async fn udp_output_loop_302m(
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
     input_format: Option<InputFormat>,
+    events: &EventSender,
 ) -> anyhow::Result<()> {
     let (socket, dest) = create_udp_output(
         &config.dest_addr,
@@ -113,7 +116,7 @@ async fn udp_output_loop_302m(
                  falling back to passthrough TS",
                 config.id
             );
-            return udp_output_loop(config, rx, stats, cancel, None).await;
+            return udp_output_loop(config, rx, stats, cancel, None, events).await;
         }
     };
 
@@ -185,6 +188,7 @@ async fn udp_output_loop(
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
+    events: &EventSender,
 ) -> anyhow::Result<()> {
     let (socket, dest) =
         create_udp_output(&config.dest_addr, config.bind_addr.as_deref(), config.interface_addr.as_deref(), config.dscp).await?;
@@ -203,12 +207,19 @@ async fn udp_output_loop(
 
     // Optional audio ES replacement (decode + re-encode audio in the TS).
     let mut audio_replacer = match config.audio_encode.as_ref() {
-        Some(enc) => match TsAudioReplacer::new(enc) {
+        Some(enc) => match TsAudioReplacer::new(enc, config.transcode.clone()) {
             Ok(r) => {
                 tracing::info!(
                     "UDP output '{}': audio_encode active ({})",
                     config.id,
                     r.target_description()
+                );
+                events.emit_output_with_details(
+                    EventSeverity::Info,
+                    category::AUDIO_ENCODE,
+                    format!("TS audio encoder started: output '{}'", config.id),
+                    &config.id,
+                    serde_json::json!({ "codec": enc.codec }),
                 );
                 Some(r)
             }
@@ -216,6 +227,13 @@ async fn udp_output_loop(
                 tracing::error!(
                     "UDP output '{}': audio_encode rejected: {e}; audio will be left untouched",
                     config.id
+                );
+                events.emit_output_with_details(
+                    EventSeverity::Critical,
+                    category::AUDIO_ENCODE,
+                    format!("TS audio encoder failed: output '{}': {e}", config.id),
+                    &config.id,
+                    serde_json::json!({ "error": e.to_string() }),
                 );
                 None
             }
@@ -256,12 +274,26 @@ async fn udp_output_loop(
                     config.id,
                     r.target_description()
                 );
+                events.emit_output_with_details(
+                    EventSeverity::Info,
+                    category::VIDEO_ENCODE,
+                    format!("Video encoder started: output '{}'", config.id),
+                    &config.id,
+                    serde_json::json!({ "codec": enc.codec }),
+                );
                 Some(r)
             }
             Err(e) => {
                 tracing::error!(
                     "UDP output '{}': video_encode rejected: {e}; video will be left untouched",
                     config.id
+                );
+                events.emit_output_with_details(
+                    EventSeverity::Critical,
+                    category::VIDEO_ENCODE,
+                    format!("Video encoder failed: output '{}': {e}", config.id),
+                    &config.id,
+                    serde_json::json!({ "error": e.to_string() }),
                 );
                 None
             }

@@ -98,6 +98,7 @@ pub fn spawn_rtp_audio_output(
         dscp: config.dscp,
         ssrc: config.ssrc,
         transcode: config.transcode.clone(),
+        audio_track_index: config.audio_track_index,
     };
 
     tokio::spawn(async move {
@@ -170,7 +171,10 @@ async fn run_rtp_audio_302m_output(
 
     // Compressed-audio bridge state: only built if compressed_audio_input.
     let mut ts_demuxer: Option<crate::engine::ts_demux::TsDemuxer> = if compressed_audio_input {
-        Some(crate::engine::ts_demux::TsDemuxer::new(None))
+        Some(crate::engine::ts_demux::TsDemuxer::with_audio_track(
+            None,
+            config.audio_track_index,
+        ))
     } else {
         None
     };

@@ -819,7 +819,7 @@ existing `Unknown command` arm, so the protocol version is not bumped.
 
 ---
 
-## The `audio_encode` block — compressed-audio egress (RTMP / HLS / WebRTC)
+## The `audio_encode` block — compressed-audio egress (RTMP / HLS / WebRTC / TS)
 
 Bilbycast originally treated audio on the RTMP, HLS, and WebRTC outputs
 as **passthrough only**: AAC frames demuxed from the input TS were
@@ -832,9 +832,18 @@ re-wrapped into FLV / TS / RTP and sent on. That left two big gaps:
    no decode/encode bridge.
 
 The `audio_encode` block, available on the RTMP, HLS, and WebRTC output
-types, fills both gaps. When set, the output decodes the input AAC
-in-process via the Phase A `engine::audio_decode::AacDecoder`, then
-re-encodes via Phase B's `engine::audio_encode::AudioEncoder`.
+types — and, since the Phase B extension, on the **SRT, UDP, RTP, and
+RIST TS outputs** via `engine::ts_audio_replace::TsAudioReplacer` —
+fills both gaps. When set, the output decodes the input AAC in-process
+via the Phase A `engine::audio_decode::AacDecoder`, then re-encodes via
+Phase B's `engine::audio_encode::AudioEncoder`.
+
+Each of these outputs also accepts an optional companion `transcode`
+block that inserts a channel shuffle / sample-rate conversion stage
+between the decoder and the encoder. Unset fields in `transcode` pass
+through that stage — leave it empty and the pipeline is the plain
+decode → encode chain described above. Full reference:
+[`transcoding.md`](transcoding.md#transcode--channel-shuffle--sample-rate-conversion).
 
 **Default (`fdk-aac` feature, on by default):** AAC codecs (AAC-LC,
 HE-AAC v1, HE-AAC v2) are encoded in-process via Fraunhofer FDK AAC —
@@ -864,6 +873,7 @@ working without ffmpeg installed at all.
 | `rtmp` | `aac_lc`, `he_aac_v1`, `he_aac_v2` | `aac_lc` | FLV only carries AAC. With the default `fdk-aac` feature, all AAC profiles are encoded in-process. Without it, HE-AAC v2 requires an ffmpeg build with `libfdk_aac`. |
 | `hls` | `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3` | `aac_lc` | HLS-TS supports MP2 (stream type 0x04) and AC-3 (private_stream_1) so long as the consumer's player does. |
 | `webrtc` | `opus` | `opus` | WebRTC realistically only does Opus. Validation also rejects `audio_encode` + `video_only=true` (an audio MID must be negotiated in SDP). |
+| `srt`, `udp`, `rtp`, `rist` (TS) | `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3` | `aac_lc` | `opus` is rejected — MPEG-TS has no standard Opus mapping. Incompatible with `transport_mode: "audio_302m"`, SMPTE 2022-7 redundancy, and SMPTE 2022-1 / SRT FEC (validation rejects at load time). |
 
 The validator enforces this matrix at config load time and on every
 `update_config` manager command — invalid combinations are rejected

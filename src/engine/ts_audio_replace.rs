@@ -32,6 +32,7 @@
 use crate::config::models::AudioEncodeConfig;
 
 use super::audio_encode::AudioCodec;
+use super::audio_transcode::{PlanarAudioTranscoder, TranscodeJson};
 use super::ts_parse::{
     mpeg2_crc32, parse_pat_programs, ts_has_adaptation, ts_has_payload, ts_payload_offset, ts_pid,
     ts_pusi, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
@@ -132,15 +133,32 @@ pub struct TsAudioReplacer {
     resolved_sample_rate: u32,
     /// True after codecs are initialised (decoder + encoder both open).
     codecs_ready: bool,
+
+    /// Optional channel-shuffle / sample-rate transcode block. Applied in
+    /// planar PCM form between the AAC decoder and the target encoder.
+    /// `None` preserves the pre-transcode behaviour exactly.
+    transcode_cfg: Option<TranscodeJson>,
+    /// Lazily constructed planar transcoder. Opened on the first decoded
+    /// frame, once the input rate + channel count are known.
+    transcoder: Option<PlanarAudioTranscoder>,
 }
 
 impl TsAudioReplacer {
-    /// Build a new replacer from an `audio_encode` block.
+    /// Build a new replacer from an `audio_encode` block and an optional
+    /// `transcode` block.
     ///
     /// This only parses and validates the codec — all heavy codec state is
     /// opened lazily when the first PES is flushed, so a replacer for a
     /// flow that never carries audio costs essentially nothing.
-    pub fn new(cfg: &AudioEncodeConfig) -> Result<Self, TsAudioReplaceError> {
+    ///
+    /// When `transcode` is `Some`, the decoded PCM is run through a planar
+    /// channel-shuffle / sample-rate stage before the target encoder. Unset
+    /// fields inside the block fall back to the encoder's own overrides and
+    /// then the source format, so an empty block is a no-op.
+    pub fn new(
+        cfg: &AudioEncodeConfig,
+        transcode: Option<TranscodeJson>,
+    ) -> Result<Self, TsAudioReplaceError> {
         let codec = AudioCodec::parse(&cfg.codec)
             .ok_or_else(|| TsAudioReplaceError::UnknownCodec(cfg.codec.clone()))?;
 
@@ -182,6 +200,8 @@ impl TsAudioReplacer {
             resolved_channels: 0,
             resolved_sample_rate: 0,
             codecs_ready: false,
+            transcode_cfg: transcode,
+            transcoder: None,
         })
     }
 
@@ -415,21 +435,73 @@ impl TsAudioReplacer {
             // ── Phase 2: feed PCM into encoder ──
             for d in decoded_frames {
                 if !self.codecs_ready {
-                    self.resolved_sample_rate =
-                        self.sample_rate_override.unwrap_or(d.sample_rate);
-                    self.resolved_channels =
-                        self.channels_override.unwrap_or(d.channels);
+                    // Resolve the encoder target. When a transcode block is
+                    // present it wins: build the planar transcoder first and
+                    // let its output format drive the encoder. Any
+                    // audio_encode.sample_rate / channels fields fold in as
+                    // fallbacks for fields the transcode block leaves unset.
+                    if let Some(ref tj_in) = self.transcode_cfg {
+                        let merged = TranscodeJson {
+                            sample_rate: tj_in.sample_rate.or(self.sample_rate_override),
+                            channels: tj_in.channels.or(self.channels_override),
+                            ..tj_in.clone()
+                        };
+                        match PlanarAudioTranscoder::new(
+                            d.sample_rate,
+                            d.channels,
+                            &merged,
+                        ) {
+                            Ok(tc) => {
+                                self.resolved_sample_rate = tc.out_sample_rate();
+                                self.resolved_channels = tc.out_channels();
+                                self.transcoder = Some(tc);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "TsAudioReplacer: transcode init failed ({e}); \
+                                     dropping this PES"
+                                );
+                                return Err(());
+                            }
+                        }
+                    } else {
+                        self.resolved_sample_rate =
+                            self.sample_rate_override.unwrap_or(d.sample_rate);
+                        self.resolved_channels =
+                            self.channels_override.unwrap_or(d.channels);
+                    }
                     self.accumulator =
                         vec![Vec::new(); self.resolved_channels as usize];
                     self.init_encoder()?;
                     self.codecs_ready = true;
                 }
+                // Apply transcode if present; otherwise forward source PCM
+                // directly. Both paths produce planar f32 at
+                // `resolved_channels` channels.
+                let shuffled_planar: Vec<Vec<f32>> =
+                    if let Some(ref mut tc) = self.transcoder {
+                        match tc.process(&d.planar) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "TsAudioReplacer: transcode process failed ({e}); \
+                                     dropping frame"
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        d.planar
+                    };
                 for ch in 0..self.resolved_channels as usize {
-                    if ch < d.planar.len() {
-                        self.accumulator[ch].extend_from_slice(&d.planar[ch]);
-                    } else if !d.planar.is_empty() {
+                    if ch < shuffled_planar.len() {
                         self.accumulator[ch]
-                            .extend(std::iter::repeat(0.0f32).take(d.planar[0].len()));
+                            .extend_from_slice(&shuffled_planar[ch]);
+                    } else if !shuffled_planar.is_empty() {
+                        self.accumulator[ch].extend(
+                            std::iter::repeat(0.0f32)
+                                .take(shuffled_planar[0].len()),
+                        );
                     }
                 }
                 self.drain_encoder(output)?;
@@ -817,7 +889,7 @@ mod tests {
     #[test]
     fn rejects_opus_because_no_ts_mapping() {
         assert!(matches!(
-            TsAudioReplacer::new(&enc("opus")),
+            TsAudioReplacer::new(&enc("opus"), None),
             Err(TsAudioReplaceError::UnsupportedCodec(_))
         ));
     }
@@ -825,21 +897,21 @@ mod tests {
     #[test]
     fn rejects_unknown_codec() {
         assert!(matches!(
-            TsAudioReplacer::new(&enc("flac")),
+            TsAudioReplacer::new(&enc("flac"), None),
             Err(TsAudioReplaceError::UnknownCodec(_))
         ));
     }
 
     #[test]
     fn accepts_aac_lc_and_mp2_and_ac3() {
-        assert!(TsAudioReplacer::new(&enc("aac_lc")).is_ok());
-        assert!(TsAudioReplacer::new(&enc("mp2")).is_ok());
-        assert!(TsAudioReplacer::new(&enc("ac3")).is_ok());
+        assert!(TsAudioReplacer::new(&enc("aac_lc"), None).is_ok());
+        assert!(TsAudioReplacer::new(&enc("mp2"), None).is_ok());
+        assert!(TsAudioReplacer::new(&enc("ac3"), None).is_ok());
     }
 
     #[test]
     fn process_empty_input_is_noop() {
-        let mut r = TsAudioReplacer::new(&enc("aac_lc")).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
         let mut out = Vec::new();
         r.process(&[], &mut out);
         assert!(out.is_empty());
@@ -847,7 +919,7 @@ mod tests {
 
     #[test]
     fn process_misaligned_input_is_passthrough() {
-        let mut r = TsAudioReplacer::new(&enc("aac_lc")).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
         let mut out = Vec::new();
         let input = vec![0x00u8; 100]; // not 188-aligned
         r.process(&input, &mut out);
@@ -856,7 +928,7 @@ mod tests {
 
     #[test]
     fn process_unknown_pid_passes_through_verbatim() {
-        let mut r = TsAudioReplacer::new(&enc("aac_lc")).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
         let mut pkt = [0xFFu8; 188];
         pkt[0] = TS_SYNC_BYTE;
         // PID 0x1FFF (null) — not the PAT, not a PMT, not audio.

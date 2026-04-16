@@ -791,6 +791,7 @@ mod tests {
             dscp: 46,
             ssrc: None,
             transcode: None,
+            audio_track_index: None,
         }
     }
 

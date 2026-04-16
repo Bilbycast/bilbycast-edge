@@ -13,7 +13,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::{SrtMode, SrtOutputConfig};
-use crate::manager::events::{EventSender, EventSeverity};
+use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::srt::connection::{
     accept_srt_connection, bind_srt_listener_for_output, bind_srt_listener_for_redundancy,
     connect_srt_output, connect_srt_redundancy_leg, spawn_srt_stats_poller,
@@ -156,7 +156,7 @@ async fn srt_output_listener_loop(
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
-    flow_id: &str,
+    _flow_id: &str,
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
@@ -169,8 +169,8 @@ async fn srt_output_listener_loop(
         );
         TsProgramFilter::new(n)
     });
-    let mut audio_replacer = build_audio_replacer(config);
-    let mut video_replacer = build_video_replacer(config, &stats);
+    let mut audio_replacer = build_audio_replacer(config, events);
+    let mut video_replacer = build_video_replacer(config, &stats, events);
 
     loop {
         let socket = match accept_srt_connection(&mut listener, &cancel).await {
@@ -195,7 +195,15 @@ async fn srt_output_listener_loop(
             config.id,
             config.local_addr.as_deref().unwrap_or("auto"),
         );
-        events.emit_flow(EventSeverity::Info, "srt", format!("SRT output '{}' connected", config.id), flow_id);
+        events.emit_output_with_details(
+            EventSeverity::Info, category::SRT,
+            format!("SRT output '{}' connected", config.id), &config.id,
+            serde_json::json!({
+                "mode": "listener",
+                "local_addr": config.local_addr.as_deref().unwrap_or("auto"),
+                "stream_id": config.stream_id.as_deref().unwrap_or(""),
+            }),
+        );
 
         // Validate the connection is alive before committing to it.
         // Under high delay/loss, the listener may accept a stale connection
@@ -253,7 +261,7 @@ async fn srt_output_listener_loop(
                 "SRT output '{}' stale connection detected, re-accepting...",
                 config.id
             );
-            events.emit_flow(EventSeverity::Warning, "srt", format!("SRT output '{}' stale connection detected", config.id), flow_id);
+            events.emit_output(EventSeverity::Warning, category::SRT, format!("SRT output '{}' stale connection detected", config.id), &config.id);
             let _ = socket.close().await;
             continue;
         }
@@ -285,7 +293,14 @@ async fn srt_output_listener_loop(
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
         }
 
-        events.emit_flow(EventSeverity::Warning, "srt", format!("SRT output '{}' disconnected", config.id), flow_id);
+        events.emit_output_with_details(
+            EventSeverity::Warning, category::SRT,
+            format!("SRT output '{}' disconnected", config.id), &config.id,
+            serde_json::json!({
+                "mode": "listener",
+                "local_addr": config.local_addr.as_deref().unwrap_or("auto"),
+            }),
+        );
         tracing::info!("SRT output '{}' waiting for caller to reconnect...", config.id);
     }
 }
@@ -298,7 +313,7 @@ async fn srt_output_caller_loop(
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
-    flow_id: &str,
+    _flow_id: &str,
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
@@ -310,8 +325,8 @@ async fn srt_output_caller_loop(
         );
         TsProgramFilter::new(n)
     });
-    let mut audio_replacer = build_audio_replacer(config);
-    let mut video_replacer = build_video_replacer(config, &stats);
+    let mut audio_replacer = build_audio_replacer(config, events);
+    let mut video_replacer = build_video_replacer(config, &stats, events);
     loop {
         let socket = match connect_srt_output(config, &cancel).await {
             Ok(s) => s,
@@ -324,7 +339,16 @@ async fn srt_output_caller_loop(
                     return Ok(());
                 }
                 tracing::error!("SRT output '{}' connection failed: {e}", config.id);
-                events.emit_flow(EventSeverity::Critical, "srt", format!("SRT output '{}' connection failed: {e}", config.id), flow_id);
+                events.emit_output_with_details(
+                    EventSeverity::Critical, category::SRT,
+                    format!("SRT output '{}' connection failed: {e}", config.id), &config.id,
+                    serde_json::json!({
+                        "mode": format!("{:?}", config.mode),
+                        "remote_addr": config.remote_addr.as_deref().unwrap_or(""),
+                        "stream_id": config.stream_id.as_deref().unwrap_or(""),
+                        "error": e.to_string(),
+                    }),
+                );
                 return Err(e);
             }
         };
@@ -335,7 +359,16 @@ async fn srt_output_caller_loop(
             config.mode,
             config.local_addr.as_deref().unwrap_or("auto"),
         );
-        events.emit_flow(EventSeverity::Info, "srt", format!("SRT output '{}' connected", config.id), flow_id);
+        events.emit_output_with_details(
+            EventSeverity::Info, category::SRT,
+            format!("SRT output '{}' connected", config.id), &config.id,
+            serde_json::json!({
+                "mode": format!("{:?}", config.mode),
+                "local_addr": config.local_addr.as_deref().unwrap_or("auto"),
+                "remote_addr": config.remote_addr.as_deref().unwrap_or(""),
+                "stream_id": config.stream_id.as_deref().unwrap_or(""),
+            }),
+        );
 
         // Subscribe AFTER the peer connects so no stale packets accumulate
         let mut rx = broadcast_tx.subscribe();
@@ -360,7 +393,14 @@ async fn srt_output_caller_loop(
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
         }
 
-        events.emit_flow(EventSeverity::Warning, "srt", format!("SRT output '{}' disconnected", config.id), flow_id);
+        events.emit_output_with_details(
+            EventSeverity::Warning, category::SRT,
+            format!("SRT output '{}' disconnected", config.id), &config.id,
+            serde_json::json!({
+                "mode": format!("{:?}", config.mode),
+                "remote_addr": config.remote_addr.as_deref().unwrap_or(""),
+            }),
+        );
         tracing::info!("SRT output '{}' attempting reconnection...", config.id);
     }
 
@@ -378,14 +418,21 @@ async fn srt_output_caller_loop(
 /// reconnects.
 /// Resolve an `audio_encode` config into a [`TsAudioReplacer`]. Logs and
 /// returns `None` when the codec isn't supported by this build.
-fn build_audio_replacer(config: &SrtOutputConfig) -> Option<TsAudioReplacer> {
+fn build_audio_replacer(config: &SrtOutputConfig, events: &EventSender) -> Option<TsAudioReplacer> {
     let enc = config.audio_encode.as_ref()?;
-    match TsAudioReplacer::new(enc) {
+    match TsAudioReplacer::new(enc, config.transcode.clone()) {
         Ok(r) => {
             tracing::info!(
                 "SRT output '{}': audio_encode active ({})",
                 config.id,
                 r.target_description()
+            );
+            events.emit_output_with_details(
+                EventSeverity::Info,
+                category::AUDIO_ENCODE,
+                format!("TS audio encoder started: output '{}'", config.id),
+                &config.id,
+                serde_json::json!({ "codec": enc.codec }),
             );
             Some(r)
         }
@@ -393,6 +440,13 @@ fn build_audio_replacer(config: &SrtOutputConfig) -> Option<TsAudioReplacer> {
             tracing::error!(
                 "SRT output '{}': audio_encode rejected: {e}; audio will be left untouched",
                 config.id
+            );
+            events.emit_output_with_details(
+                EventSeverity::Critical,
+                category::AUDIO_ENCODE,
+                format!("TS audio encoder failed: output '{}': {e}", config.id),
+                &config.id,
+                serde_json::json!({ "error": e.to_string() }),
             );
             None
         }
@@ -407,6 +461,7 @@ fn build_audio_replacer(config: &SrtOutputConfig) -> Option<TsAudioReplacer> {
 fn build_video_replacer(
     config: &SrtOutputConfig,
     stats: &OutputStatsAccumulator,
+    events: &EventSender,
 ) -> Option<TsVideoReplacer> {
     let enc = config.video_encode.as_ref()?;
     match TsVideoReplacer::new(enc) {
@@ -439,12 +494,26 @@ fn build_video_replacer(
                 config.id,
                 r.target_description()
             );
+            events.emit_output_with_details(
+                EventSeverity::Info,
+                category::VIDEO_ENCODE,
+                format!("Video encoder started: output '{}'", config.id),
+                &config.id,
+                serde_json::json!({ "codec": enc.codec }),
+            );
             Some(r)
         }
         Err(e) => {
             tracing::error!(
                 "SRT output '{}': video_encode rejected: {e}; video will be left untouched",
                 config.id
+            );
+            events.emit_output_with_details(
+                EventSeverity::Critical,
+                category::VIDEO_ENCODE,
+                format!("Video encoder failed: output '{}': {e}", config.id),
+                &config.id,
+                serde_json::json!({ "error": e.to_string() }),
             );
             None
         }
@@ -831,7 +900,7 @@ async fn srt_output_redundant_loop(
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
-    flow_id: &str,
+    _flow_id: &str,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
 ) -> anyhow::Result<()> {
     let redundancy = config
@@ -887,7 +956,15 @@ async fn srt_output_redundant_loop(
             config.mode,
             config.local_addr.as_deref().unwrap_or("auto")
         );
-        events.emit_flow(EventSeverity::Info, "srt", format!("SRT output '{}' connected", config.id), flow_id);
+        events.emit_output_with_details(
+            EventSeverity::Info, category::SRT,
+            format!("SRT output '{}' connected", config.id), &config.id,
+            serde_json::json!({
+                "mode": format!("{:?}", config.mode),
+                "leg": 1,
+                "local_addr": config.local_addr.as_deref().unwrap_or("auto"),
+            }),
+        );
 
         // Connect/accept leg 2 (best-effort — fall back to single-leg if it fails)
         let socket_leg2 = if let Some(ref mut listener) = listener_leg2 {
@@ -1138,7 +1215,14 @@ async fn srt_output_redundant_loop(
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
         }
 
-        events.emit_flow(EventSeverity::Warning, "srt", format!("SRT output '{}' disconnected", config.id), flow_id);
+        events.emit_output_with_details(
+            EventSeverity::Warning, category::SRT,
+            format!("SRT output '{}' disconnected", config.id), &config.id,
+            serde_json::json!({
+                "mode": format!("{:?}", config.mode),
+                "redundant": true,
+            }),
+        );
         tracing::info!("SRT output '{}' (redundant) attempting reconnection...", config.id);
     }
 }

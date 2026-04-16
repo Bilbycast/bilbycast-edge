@@ -83,7 +83,6 @@ If neither file exists at startup, an empty default configuration is used. Both 
       "jwt_secret": "a-cryptographically-random-string-of-at-least-32-characters",
       "token_lifetime_secs": 3600,
       "public_metrics": true,
-      "nmos_require_auth": false,
       "token_rate_limit_per_minute": 10,
       "clients": [
         {
@@ -175,7 +174,7 @@ If neither file exists at startup, an empty default configuration is used. Both 
 | `version` | integer | Yes | - | Schema version. Must be `2`. |
 | `node_id` | string | No | Auto-generated | Persistent UUID v4 identifying this edge node. Auto-generated on first startup and saved to config. Used as the NMOS IS-04 Node ID. |
 | `device_name` | string | No | `null` | Optional human-readable label for this edge node (e.g. "Studio-A Encoder"). Max 256 characters. |
-| `setup_enabled` | boolean | No | `true` | When true, the browser-based setup wizard is accessible at `/setup`. Set to false to disable after provisioning. |
+| `setup_enabled` | boolean | No | `true` | When true, the browser-based setup wizard is accessible at `/setup`. Automatically flipped to `false` (and persisted to disk) after the node completes its first successful registration with a manager. Operators can also flip it manually. |
 | `server` | object | Yes | - | API server configuration. |
 | `monitor` | object | No | `null` | Web monitoring dashboard configuration. |
 | `manager` | object | No | `null` | Manager WebSocket connection configuration. See [Manager Configuration](#manager-configuration). |
@@ -243,7 +242,6 @@ Optional sub-object of `server`. See the [Security Guide](api-security.md) for d
     "jwt_secret": "at-least-32-characters-of-random-data",
     "token_lifetime_secs": 3600,
     "public_metrics": true,
-    "nmos_require_auth": false,
     "token_rate_limit_per_minute": 10,
     "clients": [
       {
@@ -262,7 +260,7 @@ Optional sub-object of `server`. See the [Security Guide](api-security.md) for d
 | `jwt_secret` | string | Yes (if enabled) | - | HMAC-SHA256 signing secret. Must be >= 32 characters. |
 | `token_lifetime_secs` | integer | No | `3600` | JWT token lifetime in seconds. |
 | `public_metrics` | boolean | No | `true` | Whether `/metrics` and `/health` are accessible without auth. |
-| `nmos_require_auth` | boolean | No | `false` | When `true`, NMOS IS-04/IS-05/IS-08 endpoints require JWT Bearer auth. |
+| `nmos_require_auth` | boolean (optional) | No | *unset* → `true` when `enabled: true`, else `false` | Overrides the default. When unset and `enabled: true`, NMOS IS-04/IS-05/IS-08 require JWT Bearer auth. Set to `false` to explicitly leave NMOS public even when auth is enabled (a `SECURITY:` warning is logged). |
 | `token_rate_limit_per_minute` | integer | No | `10` | Max OAuth token requests per minute per IP. Set to `0` to disable. |
 | `clients` | array | Yes (if enabled) | - | Registered OAuth clients. At least one required. |
 
@@ -947,10 +945,20 @@ the marquee Phase A+B chain: AAC decoded in-process via Phase A's
 
 ### The `audio_encode` block (Phase B)
 
-Used by RTMP, HLS, and WebRTC outputs. Validation enforces a strict
+Used by RTMP, HLS, WebRTC, and — since the Phase B extension — SRT,
+UDP, RTP, and RIST TS outputs. Validation enforces a strict
 codec×output matrix at config load time: RTMP allows AAC-LC / HE-AAC
-v1 / HE-AAC v2; HLS allows the same plus MP2 / AC-3; WebRTC allows
-Opus only.
+v1 / HE-AAC v2; HLS and the TS outputs allow the same plus MP2 / AC-3;
+WebRTC allows Opus only.
+
+Every output that accepts `audio_encode` also accepts an optional
+companion `transcode` block (channel shuffle / sample-rate /
+bit-depth conversion applied to the decoded PCM *before* re-encoding).
+When both blocks set the same field, `transcode` wins; `audio_encode`
+fields are used as fallbacks for what `transcode` leaves unset. See
+[`transcoding.md`](transcoding.md#transcode--channel-shuffle--sample-rate-conversion)
+for the resolution rules, per-output coverage matrix, and worked
+examples.
 
 ```json
 {

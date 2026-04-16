@@ -63,14 +63,16 @@ Events are queued in an unbounded in-memory channel. When the edge is not connec
 | info | Output '{id}' added to flow '{flow_id}' | Output assigned and started on a running flow |
 | info | Output '{id}' removed from flow '{flow_id}' | Output unassigned and stopped on a running flow |
 | warning | Output '{id}' failed to start on flow '{flow_id}': {error} | Output startup failure within a running flow |
-| info | Input '{id}' created | Independent input created via CRUD command |
-| info | Input '{id}' deleted | Independent input deleted via CRUD command |
-| info | Output '{id}' created | Independent output created via CRUD command |
-| info | Output '{id}' deleted | Independent output deleted via CRUD command |
+| info | Input '{id}' created | Independent input created via CRUD command. `input_id` set on event |
+| info | Input '{id}' updated | Independent input updated via CRUD command. `input_id` set on event |
+| info | Input '{id}' deleted | Independent input deleted via CRUD command. `input_id` set on event |
+| info | Output '{id}' created | Independent output created via CRUD command. `output_id` set on event |
+| info | Output '{id}' updated | Independent output updated via CRUD command. `output_id` set on event |
+| info | Output '{id}' deleted | Independent output deleted via CRUD command. `output_id` set on event |
 | info | Flow '{flow_id}': active input switched to '{input_id}' | Input switched via API or manager command. `input_id` set on event. Details: `{ previous_input_id }`. The TS continuity fixer automatically resets CC state (creating a clean break), injects the new input's cached PAT/PMT (version-bumped to force re-parse), and forwards all packets immediately. Fully format-agnostic — inputs can use different codecs, containers, and transports (e.g., H.264, H.265, JPEG XS, uncompressed ST 2110, any audio). For non-TS transports the fixer is transparent. |
 | info | Flow '{flow_id}': output '{output_id}' set active/passive | Output toggled via API or manager command. `output_id` set on event. Details: `{ active: bool }` |
 
-**Source**: `src/engine/manager.rs`, `src/engine/input_srt.rs`
+**Source**: `src/engine/manager.rs`, `src/manager/client.rs`
 
 ---
 
@@ -91,22 +93,22 @@ Events are queued in an unbounded in-memory channel. When the edge is not connec
 
 #### SRT Input
 
-| Severity | Message | Trigger |
-|----------|---------|---------|
-| info | SRT input connected (mode=listener) | Listener accepted a caller connection |
-| info | SRT input connected (mode={mode}) | Caller connected to remote |
-| info | SRT input connected (mode=listener, redundant leg 1) | Redundant leg 1 accepted |
-| warning | SRT input disconnected, reconnecting | Peer disconnected, reconnection in progress |
-| critical | SRT input connection failed: {error} | Listener accept or caller connect failed |
+| Severity | Message | Trigger | Details |
+|----------|---------|---------|---------|
+| info | SRT input connected (mode=listener) | Listener accepted a caller connection | `{ mode, local_addr, stream_id }` |
+| info | SRT input connected (mode={mode}) | Caller connected to remote | `{ mode, local_addr, remote_addr, stream_id }` |
+| info | SRT input connected (mode=listener, redundant leg 1) | Redundant leg 1 accepted | `{ mode, leg, local_addr }` |
+| warning | SRT input disconnected, reconnecting | Peer disconnected, reconnection in progress | `{ mode, local_addr }` or `{ mode, remote_addr }` |
+| critical | SRT input connection failed: {error} | Listener accept or caller connect failed | `{ mode, local_addr/remote_addr, stream_id, error }` |
 
 #### SRT Output
 
-| Severity | Message | Trigger |
-|----------|---------|---------|
-| info | SRT output '{id}' connected | Peer connected (listener) or caller connected |
-| warning | SRT output '{id}' disconnected | Peer disconnected or connection lost |
-| warning | SRT output '{id}' stale connection detected | No ACK received after timeout, re-accepting |
-| critical | SRT output '{id}' connection failed: {error} | Caller can't reach remote, or bind fails |
+| Severity | Message | Trigger | Details |
+|----------|---------|---------|---------|
+| info | SRT output '{id}' connected | Peer connected (listener) or caller connected. `output_id` set on event | `{ mode, local_addr, remote_addr, stream_id }` |
+| warning | SRT output '{id}' disconnected | Peer disconnected or connection lost. `output_id` set on event | `{ mode, local_addr/remote_addr }` |
+| warning | SRT output '{id}' stale connection detected | No ACK received after timeout, re-accepting. `output_id` set on event | |
+| critical | SRT output '{id}' connection failed: {error} | Caller can't reach remote, or bind fails. `output_id` set on event | `{ mode, remote_addr, stream_id, error }` |
 
 **Source**: `src/engine/input_srt.rs`, `src/engine/output_srt.rs`
 
@@ -126,11 +128,11 @@ Events are queued in an unbounded in-memory channel. When the edge is not connec
 
 ### RTMP (`rtmp`)
 
-| Severity | Message | Trigger |
-|----------|---------|---------|
-| info | RTMP publisher connected | Client connected and started publishing |
-| warning | RTMP publisher disconnected | Publisher disconnected |
-| critical | RTMP server error: {error} | Server bind or accept failure |
+| Severity | Message | Trigger | Details |
+|----------|---------|---------|---------|
+| info | RTMP publisher connected | Client connected and started publishing | |
+| warning | RTMP publisher disconnected | Publisher disconnected | |
+| critical | RTMP server error: {error} | Server bind or accept failure | `{ error }` |
 
 **Source**: `src/engine/input_rtmp.rs`
 
@@ -138,10 +140,10 @@ Events are queued in an unbounded in-memory channel. When the edge is not connec
 
 ### RTSP (`rtsp`)
 
-| Severity | Message | Trigger |
-|----------|---------|---------|
-| info | RTSP connected to {url} | RTSP DESCRIBE/SETUP/PLAY succeeded |
-| warning | RTSP input disconnected: {error}. Reconnecting in {n}s | Stream lost after a successful connection |
+| Severity | Message | Trigger | Details |
+|----------|---------|---------|---------|
+| info | RTSP connected to {url} | RTSP DESCRIBE/SETUP/PLAY succeeded | `{ url }` |
+| warning | RTSP input disconnected: {error}. Reconnecting in {n}s | Stream lost after a successful connection | `{ url, reconnect_delay_secs, error }` |
 
 The disconnect event fires **once per connection cycle** — if the RTSP server is unreachable and the edge retries repeatedly, only the first failure emits an event. A new "connected" event followed by a new "disconnected" event will fire when the connection is established and then lost again.
 
@@ -196,24 +198,68 @@ encoder supervisor (`engine::audio_encode::supervisor_loop`).
 | critical | output '{id}': audio_encode requires AAC-LC input ... got profile={p} | Phase A `AacDecoder` rejected the source AAC profile (HE-AAC, AAC-Main, multichannel, etc.) |
 | critical | output '{id}': audio_encode is set but the flow input cannot carry TS audio (PCM-only source) | `compressed_audio_input` is false (e.g. ST 2110-30, `rtp_audio` input) |
 | critical | output '{id}': audio_encode encoder spawn failed: {error} | `AudioEncoder::spawn` failed for any other reason (codec rejected by ffmpeg, etc.) |
+| info | TS audio encoder started: output '{id}' | In-process TsAudioReplacer created for SRT/RIST/RTP/UDP outputs. `output_id` set on event | `{ codec }` |
+| critical | TS audio encoder failed: output '{id}': {error} | TsAudioReplacer construction rejected. `output_id` set on event | `{ error }` |
 
 **Source**: `src/engine/audio_encode.rs`, `src/engine/output_rtmp.rs`,
-`src/engine/output_hls.rs`, `src/engine/output_webrtc.rs`.
+`src/engine/output_hls.rs`, `src/engine/output_webrtc.rs`,
+`src/engine/output_srt.rs`, `src/engine/output_rist.rs`,
+`src/engine/output_rtp.rs`, `src/engine/output_udp.rs`.
+
+---
+
+### Video Encoder (`video_encode`)
+
+In-process video transcoding lifecycle for TS outputs (SRT, RIST, RTP, UDP).
+Emitted at `TsVideoReplacer::new()` call sites in each output module.
+
+| Severity | Message | Trigger | Details |
+|----------|---------|---------|---------|
+| info | Video encoder started: output '{id}' | TsVideoReplacer created successfully. `output_id` set on event | `{ codec }` |
+| critical | Video encoder failed: output '{id}': {error} | TsVideoReplacer construction rejected (missing feature, unsupported codec). `output_id` set on event | `{ error }` |
+
+**Source**: `src/engine/output_srt.rs`, `src/engine/output_rist.rs`,
+`src/engine/output_rtp.rs`, `src/engine/output_udp.rs`.
+
+---
+
+### RTP Input (`rtp`)
+
+| Severity | Message | Trigger | Details |
+|----------|---------|---------|---------|
+| info | RTP input listening on {addr} | Socket successfully bound | `{ bind_addr }` |
+| critical | RTP input bind failed: {error} | UDP socket bind failed (port in use, permission denied) | `{ bind_addr, error }` |
+
+For redundant RTP inputs, each leg emits its own bind event with a `leg` field in details.
+
+**Source**: `src/engine/input_rtp.rs`
+
+---
+
+### UDP Input (`udp`)
+
+| Severity | Message | Trigger | Details |
+|----------|---------|---------|---------|
+| info | UDP input listening on {addr} | Socket successfully bound | `{ bind_addr }` |
+| critical | UDP input bind failed: {error} | UDP socket bind failed (port in use, permission denied) | `{ bind_addr, error }` |
+
+**Source**: `src/engine/input_udp.rs`
 
 ---
 
 ### Tunnel (`tunnel`)
 
-| Severity | Message | Trigger |
-|----------|---------|---------|
-| info | Tunnel '{name}' started | Tunnel created and connecting |
-| info | Tunnel '{name}' stopped | Tunnel stopped by command or config change |
-| info | Tunnel connected to relay | QUIC connection established and TunnelReady received |
-| warning | Tunnel disconnected from relay: {reason} | QUIC connection lost or forwarder exited |
-| warning | Tunnel peer disconnected: {reason} | Relay reported peer unbound (TunnelDown) |
-| warning | Tunnel connection to relay failed: {error} | QUIC connect or TLS error |
-| critical | Tunnel '{name}' failed: {error} | Tunnel task exited with fatal error |
-| critical | Tunnel bind rejected by relay: {reason} | HMAC bind token verification failed |
+| Severity | Message | Trigger | Details |
+|----------|---------|---------|---------|
+| info | Tunnel '{name}' started | Tunnel created and connecting | `{ tunnel_name }` |
+| info | Tunnel '{name}' stopped | Tunnel stopped by command or config change | `{ tunnel_name }` |
+| info | Tunnel connected to relay | QUIC connection established and TunnelReady received | `{ relay_addr }` |
+| warning | Tunnel disconnected from relay: {reason} | QUIC connection lost or forwarder exited | `{ reason }` |
+| warning | Tunnel peer disconnected: {reason} | Relay reported peer unbound (TunnelDown) | `{ reason }` |
+| warning | Tunnel connection to relay failed: {error} | QUIC connect or TLS error | `{ relay_addr }` |
+| warning | Tunnel '{name}' attempt {N} failed: {error} | Direct-mode retry failed | `{ tunnel_name, attempt }` |
+| critical | Tunnel '{name}' failed: {error} | Tunnel task exited with fatal error | `{ tunnel_name }` |
+| critical | Tunnel bind rejected by relay: {reason} | HMAC bind token verification failed | `{ relay_addr }` |
 
 **Source**: `src/tunnel/manager.rs`, `src/tunnel/relay_client.rs`
 
@@ -255,6 +301,10 @@ encoder supervisor (`engine::audio_encode::supervisor_loop`).
 
 **Source**: `src/engine/resource_monitor.rs`
 
+| warning | Flow '{id}' creation blocked: system resources critical | Flow creation rejected because `critical_action` is `"gate_flows"` and a metric is in critical state | `{ flow_id }` |
+
+**Source**: `src/engine/resource_monitor.rs`, `src/engine/manager.rs`
+
 Requires `resource_limits` config block. When `critical_action` is `"gate_flows"`, new flow creation is rejected while any metric is in the critical state. Events fire on state transitions with a configurable grace period (default 10 seconds) to avoid flapping.
 
 ---
@@ -277,23 +327,28 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 
 | Category | Count | Description |
 |----------|-------|-------------|
-| `flow` | 11 | Flow lifecycle (start/stop/fail, output add/remove, input/output CRUD) |
+| `flow` | 13 | Flow lifecycle (start/stop/fail, output add/remove, input/output CRUD including update) |
 | `bandwidth` | 4 | Per-flow bandwidth monitoring (alarm, block, recovery) |
-| `srt` | 9 | SRT input and output connection state |
+| `srt` | 9 | SRT input and output connection state (now with structured details) |
 | `redundancy` | 3 | SMPTE 2022-7 dual-leg status |
 | `rtmp` | 3 | RTMP publisher connections |
-| `rtsp` | 2 | RTSP input state |
+| `rtsp` | 2 | RTSP input state (now with structured details) |
 | `hls` | 2 | HLS output failures |
 | `webrtc` | 8 | WHIP/WHEP session lifecycle |
-| `audio_encode` | 7 | ffmpeg-sidecar audio encoder lifecycle (Phase B) |
-| `tunnel` | 8 | Tunnel connection state |
+| `audio_encode` | 9 | Audio encoder lifecycle — ffmpeg sidecar (RTMP/HLS/WebRTC) + in-process TsAudioReplacer (SRT/RIST/RTP/UDP) |
+| `video_encode` | 2 | Video transcoder lifecycle — in-process TsVideoReplacer (SRT/RIST/RTP/UDP) |
+| `tunnel` | 9 | Tunnel connection state (now with structured details) |
 | `manager` | 3 | Manager WebSocket connection |
 | `config` | 2 | Configuration changes |
+| `system_resources` | 7 | CPU/RAM threshold monitoring + flow creation gating |
+| `rtp` | 2 | RTP input bind and lifecycle |
+| `udp` | 2 | UDP input bind and lifecycle |
+| `rist` | 4 | RIST Simple Profile connection lifecycle |
 | `ptp` | — | SMPTE ST 2110 PTP slave clock state changes (Phase 1) |
 | `network_leg` | — | SMPTE 2022-7 Red/Blue per-leg loss / recovery (Phase 1) |
 | `nmos` | — | NMOS IS-04 / IS-05 / IS-08 controller activity (Phase 1) |
 | `scte104` | — | SCTE-104 splice events parsed from ST 2110-40 ANC (Phase 1) |
-| **Total** | **62** | |
+| **Total** | **84** | |
 
 ### Phase 1 ST 2110 categories
 
@@ -315,6 +370,6 @@ mapping:
 
 | Severity | Count | Description |
 |----------|-------|-------------|
-| critical | 16 | Service-impacting: flow/tunnel failures, auth rejection, both legs lost, bandwidth block, audio_encode build/restart-cap failures |
-| warning | 20 | Degradation: disconnects, stale connections, upload failures, reconnects, bandwidth exceeded, audio_encode restart / per-segment HLS remux failure |
-| info | 27 | State changes: connections established, flows started, config updated, bandwidth recovery, audio_encode started, input/output CRUD |
+| critical | 22 | Service-impacting: flow/tunnel failures, auth rejection, both legs lost, bandwidth block, audio/video encoder failures, bind failures (RTP/UDP/RIST) |
+| warning | 22 | Degradation: disconnects, stale connections, upload failures, reconnects, bandwidth exceeded, audio_encode restart, resource gating, tunnel retry |
+| info | 40 | State changes: connections established, flows started, config updated, bandwidth recovery, encoder started, input/output CRUD, bind success (RTP/UDP) |

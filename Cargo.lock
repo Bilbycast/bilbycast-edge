@@ -349,7 +349,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bilbycast-edge"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "aac-audio",
  "aac-codec",
@@ -387,6 +387,7 @@ dependencies = [
  "str0m",
  "strum",
  "strum_macros",
+ "subtle",
  "symphonia",
  "sysinfo",
  "tempfile",

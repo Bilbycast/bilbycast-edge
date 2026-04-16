@@ -162,6 +162,12 @@ pub struct ChannelEntry {
     pub input: Option<String>,
     /// 0-based channel index inside the source input. `null` when `input` is null.
     pub channel_index: Option<u32>,
+    /// Linear gain for this channel contribution (1.0 = unity, 0.5 ≈ -6 dB,
+    /// 0.707 ≈ -3 dB, 0.0 = mute). When absent, defaults to 1.0 (unity gain).
+    /// This is a bilbycast extension to IS-08 — standard NMOS controllers may
+    /// omit it; the default ensures backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gain: Option<f32>,
 }
 
 /// IS-08 IO listing payload.
@@ -333,10 +339,12 @@ mod tests {
         out.channels.push(ChannelEntry {
             input: Some("st2110_30:flow1".into()),
             channel_index: Some(0),
+            gain: None,
         });
         out.channels.push(ChannelEntry {
             input: Some("st2110_30:flow1".into()),
             channel_index: Some(1),
+            gain: None,
         });
         m.outputs.insert("st2110_30:flow2:out1".into(), out);
         let s = serde_json::to_string(&m).unwrap();
@@ -373,6 +381,7 @@ mod tests {
                 channels: vec![ChannelEntry {
                     input: Some("st2110_30:f".into()),
                     channel_index: Some(0),
+                    gain: None,
                 }],
             },
         );

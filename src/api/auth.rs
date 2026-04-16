@@ -70,13 +70,28 @@ pub struct AuthConfig {
     /// When `true`, unauthenticated requests to `/metrics` and `/health` are allowed.
     #[serde(default = "default_true")]
     pub public_metrics: bool,
-    /// When `true`, NMOS IS-04/IS-05/IS-08 endpoints require JWT Bearer auth.
-    /// Default `false` for backward compatibility with existing NMOS controllers.
+    /// Explicit control over whether NMOS IS-04/IS-05/IS-08 endpoints require
+    /// JWT Bearer auth. When unset (`None`), defaults to `true` whenever
+    /// `enabled` is `true` — i.e. NMOS is protected by default once auth is
+    /// on. Set to `Some(false)` to intentionally leave NMOS public (a loud
+    /// startup warning is logged). Call [`AuthConfig::nmos_require_auth_effective`]
+    /// instead of reading this field directly.
     #[serde(default)]
-    pub nmos_require_auth: bool,
+    pub nmos_require_auth: Option<bool>,
     /// Maximum OAuth token requests per minute per IP address. Set to 0 to disable.
     #[serde(default = "default_token_rate_limit")]
     pub token_rate_limit_per_minute: u32,
+}
+
+impl AuthConfig {
+    /// Effective NMOS auth policy:
+    /// - `true` when auth is enabled and the operator did not explicitly
+    ///   opt out (`nmos_require_auth` is `None` or `Some(true)`).
+    /// - `false` when auth is disabled, or when the operator explicitly set
+    ///   `nmos_require_auth: false`.
+    pub fn nmos_require_auth_effective(&self) -> bool {
+        self.enabled && self.nmos_require_auth != Some(false)
+    }
 }
 
 /// A single registered OAuth client (client_credentials grant).

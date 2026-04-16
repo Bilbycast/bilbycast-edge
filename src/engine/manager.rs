@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use dashmap::DashMap;
 
 use crate::config::models::{OutputConfig, ResolvedFlow, ResourceLimitAction};
-use crate::manager::events::{Event, EventSender, EventSeverity};
+use crate::manager::events::{Event, EventSender, EventSeverity, category};
 use crate::stats::collector::StatsCollector;
 
 use super::flow::FlowRuntime;
@@ -115,6 +115,13 @@ impl FlowManager {
         // Gate flow creation when system resources are critical
         if self.resource_state.resources_critical.load(Ordering::Relaxed) {
             if matches!(self.resource_action, Some(ResourceLimitAction::GateFlows)) {
+                self.event_sender.emit_flow_with_details(
+                    EventSeverity::Warning,
+                    category::SYSTEM_RESOURCES,
+                    format!("Flow '{}' creation blocked: system resources critical", config.config.id),
+                    &config.config.id,
+                    serde_json::json!({"flow_id": config.config.id}),
+                );
                 bail!(
                     "Cannot start flow '{}': system resources critical (CPU or RAM threshold exceeded)",
                     config.config.id
@@ -133,7 +140,7 @@ impl FlowManager {
                 self.flows.insert(flow_id.clone(), runtime.clone());
                 self.event_sender.emit_flow(
                     EventSeverity::Info,
-                    "flow",
+                    category::FLOW,
                     format!("Flow '{}' started", flow_id),
                     &flow_id,
                 );
@@ -142,7 +149,7 @@ impl FlowManager {
             Err(e) => {
                 self.event_sender.emit_flow(
                     EventSeverity::Critical,
-                    "flow",
+                    category::FLOW,
                     format!("Flow '{}' failed to start: {e}", flow_id),
                     &flow_id,
                 );
@@ -166,7 +173,7 @@ impl FlowManager {
             self.stats.unregister_flow(flow_id);
             self.event_sender.emit_flow(
                 EventSeverity::Info,
-                "flow",
+                category::FLOW,
                 format!("Flow '{flow_id}' stopped"),
                 flow_id,
             );
@@ -206,7 +213,7 @@ impl FlowManager {
             Ok(()) => {
                 self.event_sender.emit_flow(
                     EventSeverity::Info,
-                    "flow",
+                    category::FLOW,
                     format!("Output '{output_id}' added to flow '{flow_id}'"),
                     flow_id,
                 );
@@ -215,7 +222,7 @@ impl FlowManager {
             Err(e) => {
                 self.event_sender.emit_flow(
                     EventSeverity::Warning,
-                    "flow",
+                    category::FLOW,
                     format!("Output '{output_id}' failed to start on flow '{flow_id}': {e}"),
                     flow_id,
                 );
@@ -240,7 +247,7 @@ impl FlowManager {
         runtime.remove_output(output_id).await?;
         self.event_sender.emit_flow(
             EventSeverity::Info,
-            "flow",
+            category::FLOW,
             format!("Output '{output_id}' removed from flow '{flow_id}'"),
             flow_id,
         );
@@ -266,7 +273,7 @@ impl FlowManager {
         runtime.switch_active_input(new_input_id).await?;
         self.event_sender.send(Event {
             severity: EventSeverity::Info,
-            category: "flow".to_string(),
+            category: category::FLOW.to_string(),
             message: format!("Flow '{flow_id}': active input switched to '{new_input_id}'"),
             details: Some(serde_json::json!({
                 "previous_input_id": previous_input_id,
@@ -298,7 +305,7 @@ impl FlowManager {
             .await?;
         self.event_sender.send(Event {
             severity: EventSeverity::Info,
-            category: "flow".to_string(),
+            category: category::FLOW.to_string(),
             message: format!(
                 "Flow '{flow_id}': output '{output_id}' set {}",
                 if active { "active" } else { "passive" }
@@ -388,7 +395,7 @@ impl FlowManager {
             }
             self.event_sender.emit(
                 EventSeverity::Critical,
-                "flow_group",
+                category::FLOW_GROUP,
                 format!("Flow group '{group_id}' start rolled back: member '{failed_id}' failed: {err}"),
             );
             bail!(
@@ -398,7 +405,7 @@ impl FlowManager {
 
         self.event_sender.emit(
             EventSeverity::Info,
-            "flow_group",
+            category::FLOW_GROUP,
             format!(
                 "Flow group '{group_id}' started ({} members)",
                 started_ids.len()
@@ -430,7 +437,7 @@ impl FlowManager {
         }
         self.event_sender.emit(
             EventSeverity::Info,
-            "flow_group",
+            category::FLOW_GROUP,
             format!(
                 "Flow group '{group_id}' stopped ({} members; {} failures)",
                 member_ids.len() - failures.len(),

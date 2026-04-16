@@ -371,6 +371,17 @@ Key invariants:
   block, no `TranscodeStage` is constructed and the existing
   byte-identical passthrough path runs unchanged. The stage is purely
   opt-in per output.
+- **Compressed-audio outputs share the same transcoder.** On RTMP, HLS,
+  WebRTC, and the TS-carrying SRT / UDP / RTP / RIST outputs, a slim
+  planar-f32-only variant — `engine::audio_transcode::PlanarAudioTranscoder`
+  — sits between the AAC decoder and the target encoder inside the
+  `audio_encode` pipeline (see `ts_audio_replace.rs`, `output_rtmp.rs`,
+  `output_hls.rs`, `output_webrtc.rs`). It reuses `ChannelMatrix`,
+  `apply_channel_matrix`, `expand_preset`, and rubato SRC, but skips the
+  RTP PCM wire encoding (encoders accept f32 directly) and skips
+  bit-depth / dither (irrelevant for compressed codecs). Same fast-paths
+  — empty block is a full passthrough, identity matrix skips the
+  mul, rate match skips rubato.
 - **SMPTE 302M bit packing matches ffmpeg.** `S302mPacketizer` and
   `S302mDepacketizer` follow ffmpeg's `libavcodec/s302menc.c` /
   `s302mdec.c` byte-for-byte; round trips are sample-exact at 16-bit
