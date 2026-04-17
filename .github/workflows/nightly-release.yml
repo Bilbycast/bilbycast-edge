@@ -122,7 +122,15 @@ jobs:
       - name: Install video-encoder build dependencies (full variant only)
         if: matrix.variant == 'full'
         run: |
-          sudo apt-get install -y libx264-dev libx265-dev nv-codec-headers
+          sudo apt-get install -y libx264-dev libx265-dev
+          # nv-codec-headers is not packaged for Ubuntu 24.04 (noble); install
+          # from source. Header-only package — `make install` drops headers +
+          # ffnvcodec.pc into $PREFIX. Pinned to a tag compatible with vendored
+          # FFmpeg n7.1.3 (needs nv-codec-headers >= 11.1).
+          NV_CODEC_HEADERS_VERSION="n12.2.72.0"
+          git clone --depth 1 --branch "${NV_CODEC_HEADERS_VERSION}" \
+            https://github.com/FFmpeg/nv-codec-headers.git /tmp/nv-codec-headers
+          sudo make -C /tmp/nv-codec-headers PREFIX=/usr/local install
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
