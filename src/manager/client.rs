@@ -1427,8 +1427,9 @@ async fn execute_command(
             Ok(None)
         }
         "create_tunnel" => {
-            let tunnel: TunnelConfig = serde_json::from_value(action["tunnel"].clone())
+            let mut tunnel: TunnelConfig = serde_json::from_value(action["tunnel"].clone())
                 .map_err(|e| format!("Invalid tunnel config: {e}"))?;
+            tunnel.normalize_relay_addrs();
             validate_tunnel(&tunnel).map_err(|e| format!("Invalid tunnel config: {e}"))?;
             tracing::info!("Manager command: create tunnel '{}'", tunnel.id);
             tunnel_manager
@@ -1461,6 +1462,12 @@ async fn execute_command(
         "update_config" => {
             let mut new_config: AppConfig = serde_json::from_value(action["config"].clone())
                 .map_err(|e| format!("Invalid config: {e}"))?;
+
+            // Migrate any legacy `tunnel.relay_addr` fields into `relay_addrs`
+            // before validation and secret merging.
+            for tunnel in &mut new_config.tunnels {
+                tunnel.normalize_relay_addrs();
+            }
 
             // The manager doesn't have infrastructure secrets (GetConfig strips
             // node credentials, TLS, and tunnel keys), so merge the node's

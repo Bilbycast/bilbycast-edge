@@ -7,7 +7,7 @@
 //! Each tunnel runs as a set of tokio tasks coordinated by a CancellationToken.
 
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,6 +30,9 @@ struct TunnelRuntime {
     config: TunnelConfig,
     cancel: CancellationToken,
     state_rx: watch::Receiver<RelayTunnelState>,
+    /// Index of the currently-active relay within `config.relay_addrs`
+    /// (only meaningful for relay-mode tunnels).
+    active_relay_idx_rx: Option<watch::Receiver<usize>>,
     udp_stats: Option<Arc<UdpForwarderStats>>,
     tcp_stats: Option<Arc<TcpForwarderStats>>,
     throughput_in: ThroughputEstimator,
@@ -46,6 +49,16 @@ pub struct TunnelStatus {
     pub direction: String,
     pub local_addr: String,
     pub state: String,
+    /// Configured relay addresses in priority order (relay mode only).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub relay_addrs: Vec<String>,
+    /// Index of the currently-active relay (0 = primary). Only present for
+    /// running relay-mode tunnels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_relay_idx: Option<usize>,
+    /// Convenience copy of `relay_addrs[active_relay_idx]`, suitable for the UI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_relay_addr: Option<String>,
     pub stats: TunnelStatsSnapshot,
 }
 
@@ -128,20 +141,24 @@ impl TunnelManager {
             None
         };
 
-        match config.mode {
+        let active_relay_idx_rx = match config.mode {
             TunnelMode::Relay => {
-                self.start_relay_tunnel(
-                    &config, tunnel_id, cancel.clone(), state_tx,
-                    udp_stats.clone(), tcp_stats.clone(),
-                ).await?;
+                let rx = self
+                    .start_relay_tunnel(
+                        &config, tunnel_id, cancel.clone(), state_tx,
+                        udp_stats.clone(), tcp_stats.clone(),
+                    )
+                    .await?;
+                Some(rx)
             }
             TunnelMode::Direct => {
                 self.start_direct_tunnel(
                     &config, tunnel_id, cancel.clone(), state_tx,
                     udp_stats.clone(), tcp_stats.clone(),
                 ).await?;
+                None
             }
-        }
+        };
 
         let tunnel_name = config.name.clone();
         let tunnel_id_str = config.id.clone();
@@ -151,6 +168,7 @@ impl TunnelManager {
                 config,
                 cancel,
                 state_rx,
+                active_relay_idx_rx,
                 udp_stats,
                 tcp_stats,
                 throughput_in: ThroughputEstimator::new(),
@@ -177,13 +195,20 @@ impl TunnelManager {
         state_tx: watch::Sender<RelayTunnelState>,
         udp_stats: Option<Arc<UdpForwarderStats>>,
         tcp_stats: Option<Arc<TcpForwarderStats>>,
-    ) -> anyhow::Result<()> {
-        let relay_addr: SocketAddr = config
-            .relay_addr
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("relay_addr required for relay mode"))?
-            .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid relay_addr: {e}"))?;
+    ) -> anyhow::Result<watch::Receiver<usize>> {
+        // Resolve ordered relay list (primary + optional backup). Validation has
+        // already enforced length, format, and uniqueness.
+        let relay_addrs: Vec<SocketAddr> = config
+            .effective_relays()
+            .into_iter()
+            .map(|s| {
+                s.parse::<SocketAddr>()
+                    .map_err(|e| anyhow::anyhow!("Invalid relay address '{s}': {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if relay_addrs.is_empty() {
+            anyhow::bail!("at least one relay address required for relay mode");
+        }
 
         let local_addr: SocketAddr = config
             .local_addr
@@ -193,11 +218,12 @@ impl TunnelManager {
         let edge_id = self.manager_node_id.get().cloned();
         let params = RelayTunnelParams {
             tunnel_id,
-            relay_addr,
+            relay_addrs,
             direction: config.direction,
             protocol: config.protocol,
             edge_id,
             tunnel_bind_secret: config.tunnel_bind_secret.clone(),
+            failback_rtt_gate_ms: config.failback_rtt_gate_ms(),
         };
 
         // Create cipher from encryption key
@@ -217,6 +243,11 @@ impl TunnelManager {
         let tunnels = self.tunnels.clone();
         let event_sender = self.event_sender.clone();
 
+        // Channel for publishing the active relay index. Created here (not
+        // inside the spawned task) so the TunnelRuntime can hold the receiver
+        // for status snapshots without race-on-spawn.
+        let (active_idx_tx, active_idx_rx) = watch::channel(0usize);
+
         // Spawn the tunnel lifecycle task
         tokio::spawn(async move {
             let result = run_relay_tunnel(
@@ -226,6 +257,7 @@ impl TunnelManager {
                 protocol,
                 local_addr,
                 state_tx,
+                active_idx_tx,
                 cancel.clone(),
                 udp_stats,
                 tcp_stats,
@@ -250,7 +282,7 @@ impl TunnelManager {
             }
         });
 
-        Ok(())
+        Ok(active_idx_rx)
     }
 
     async fn start_direct_tunnel(
@@ -433,6 +465,16 @@ fn build_status(runtime: &TunnelRuntime) -> TunnelStatus {
     stats.bitrate_in_bps = runtime.throughput_in.sample(stats.bytes_received);
     stats.bitrate_out_bps = runtime.throughput_out.sample(stats.bytes_sent);
 
+    let relay_addrs: Vec<String> = runtime
+        .config
+        .effective_relays()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let active_relay_idx = runtime.active_relay_idx_rx.as_ref().map(|rx| *rx.borrow());
+    let active_relay_addr = active_relay_idx
+        .and_then(|idx| relay_addrs.get(idx).cloned());
+
     TunnelStatus {
         id: runtime.config.id.clone(),
         name: runtime.config.name.clone(),
@@ -441,6 +483,9 @@ fn build_status(runtime: &TunnelRuntime) -> TunnelStatus {
         direction: runtime.config.direction.to_string(),
         local_addr: runtime.config.local_addr.clone(),
         state: state.to_string(),
+        relay_addrs,
+        active_relay_idx,
+        active_relay_addr,
         stats,
     }
 }
@@ -449,6 +494,7 @@ fn build_status(runtime: &TunnelRuntime) -> TunnelStatus {
 ///
 /// Wraps the connect+forward cycle in a reconnection loop so the tunnel
 /// automatically recovers when the relay restarts or the QUIC connection drops.
+#[allow(clippy::too_many_arguments)]
 async fn run_relay_tunnel(
     params: RelayTunnelParams,
     tunnel_name: String,
@@ -456,6 +502,7 @@ async fn run_relay_tunnel(
     protocol: TunnelProtocol,
     local_addr: SocketAddr,
     state_tx: watch::Sender<RelayTunnelState>,
+    active_idx_tx: watch::Sender<usize>,
     cancel: CancellationToken,
     udp_stats: Option<Arc<UdpForwarderStats>>,
     tcp_stats: Option<Arc<TcpForwarderStats>>,
@@ -466,23 +513,84 @@ async fn run_relay_tunnel(
     let tunnel_id_str = tunnel_id.to_string();
     let reconnect_delay = Duration::from_secs(1);
 
+    // Active relay index — persists across reconnects so the forwarder stays
+    // sticky on the same relay unless it fails to reconnect. Shared Arc lets
+    // the failback probe update it atomically from another task.
+    let active_idx = Arc::new(AtomicUsize::new(0));
+    let has_backup = params.relay_addrs.len() > 1;
+
     loop {
-        // Connect with retry (handles its own internal backoff for initial connect)
-        let conn = relay_client::connect_with_retry(&params, &state_tx, cancel.clone(), event_sender.clone()).await?;
+        // Per-connection cancel token. Fires either on parent shutdown or when
+        // the failback probe decides to swap relays.
+        let conn_cancel = cancel.child_token();
+
+        // Resolve the active index for this attempt, run the failover walker,
+        // then publish the result back to the shared atomic.
+        let mut idx_local = active_idx.load(Ordering::Relaxed);
+        let conn = relay_client::connect_with_retry(
+            &params,
+            &mut idx_local,
+            &active_idx_tx,
+            &state_tx,
+            conn_cancel.clone(),
+            event_sender.clone(),
+        )
+        .await?;
+        active_idx.store(idx_local, Ordering::Relaxed);
 
         tracing::info!(
             tunnel_id = %tunnel_id,
             direction = %direction,
             protocol = %protocol,
             encrypted = cipher.is_some(),
+            relay_idx = idx_local,
             "Relay tunnel connected, starting forwarder"
         );
 
-        // Run the forwarder — blocks until the QUIC connection drops
+        // Spawn the failback probe if a backup relay is configured AND we are
+        // currently not on the primary. The probe periodically measures
+        // relay_addrs[0] and triggers a failback when its RTT is within the
+        // configured gate relative to the active connection.
+        let probe_handle = if has_backup && idx_local != 0 {
+            let probe_relay = params.relay_addrs[0];
+            let probe_gate_ms = params.failback_rtt_gate_ms;
+            let probe_active_idx = Arc::clone(&active_idx);
+            let probe_conn = conn.clone();
+            let probe_conn_cancel = conn_cancel.clone();
+            let probe_parent_cancel = cancel.clone();
+            let probe_tunnel_id = tunnel_id;
+            let probe_tunnel_id_str = tunnel_id_str.clone();
+            let probe_events = event_sender.clone();
+            Some(tokio::spawn(async move {
+                run_failback_probe(
+                    probe_tunnel_id,
+                    probe_tunnel_id_str,
+                    probe_relay,
+                    probe_gate_ms,
+                    probe_conn,
+                    probe_active_idx,
+                    probe_conn_cancel,
+                    probe_parent_cancel,
+                    probe_events,
+                )
+                .await;
+            }))
+        } else {
+            None
+        };
+
+        // Run the forwarder — blocks until the QUIC connection drops or the
+        // failback probe triggers conn_cancel.
         let result = run_forwarder(
-            tunnel_id, protocol, direction, local_addr, conn, cancel.clone(),
+            tunnel_id, protocol, direction, local_addr, conn, conn_cancel.clone(),
             udp_stats.clone(), tcp_stats.clone(), cipher.clone(),
         ).await;
+
+        // Stop the probe (it will also exit on its own when conn_cancel fires,
+        // but abort() is cheap and removes the race with parent shutdown).
+        if let Some(h) = probe_handle {
+            h.abort();
+        }
 
         if cancel.is_cancelled() {
             return Ok(());
@@ -539,6 +647,77 @@ async fn run_relay_tunnel(
         tokio::select! {
             _ = tokio::time::sleep(reconnect_delay) => {}
             _ = cancel.cancelled() => return Ok(()),
+        }
+    }
+}
+
+/// Background task that probes the primary relay while we're running on a
+/// backup. When the primary is reachable AND its RTT is within the configured
+/// gate relative to the active connection, it sets `active_idx = 0` and
+/// cancels `conn_cancel` to force the reconnect loop to swap relays.
+#[allow(clippy::too_many_arguments)]
+async fn run_failback_probe(
+    tunnel_id: Uuid,
+    tunnel_id_str: String,
+    primary_relay: SocketAddr,
+    rtt_gate_ms: u32,
+    active_conn: quinn::Connection,
+    active_idx: Arc<AtomicUsize>,
+    conn_cancel: CancellationToken,
+    parent_cancel: CancellationToken,
+    event_sender: EventSender,
+) {
+    let gate = Duration::from_millis(rtt_gate_ms as u64);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(relay_client::FAILBACK_PROBE_INTERVAL) => {}
+            _ = conn_cancel.cancelled() => return,
+            _ = parent_cancel.cancelled() => return,
+        }
+
+        // Already on primary — nothing to fail back to.
+        if active_idx.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+
+        let probe_result = relay_client::measure_relay_rtt(primary_relay, parent_cancel.clone()).await;
+        let primary_rtt = match probe_result {
+            Ok(rtt) => rtt,
+            Err(e) => {
+                tracing::debug!(
+                    tunnel_id = %tunnel_id,
+                    "Primary relay probe failed: {e}"
+                );
+                continue;
+            }
+        };
+
+        let active_rtt = active_conn.rtt();
+
+        // Allow failback if primary_rtt <= active_rtt + gate.
+        let acceptable = primary_rtt <= active_rtt.saturating_add(gate);
+
+        tracing::info!(
+            tunnel_id = %tunnel_id,
+            "Failback probe: primary_rtt={primary_rtt:?}, active_rtt={active_rtt:?}, gate={gate:?}, acceptable={acceptable}"
+        );
+
+        if acceptable {
+            active_idx.store(0, Ordering::Relaxed);
+            event_sender.emit_flow_with_details(
+                EventSeverity::Info,
+                category::TUNNEL,
+                format!("Tunnel failing back to primary relay {primary_relay}"),
+                &tunnel_id_str,
+                serde_json::json!({
+                    "primary_relay_addr": primary_relay.to_string(),
+                    "primary_rtt_ms": primary_rtt.as_millis(),
+                    "active_rtt_ms": active_rtt.as_millis(),
+                    "gate_ms": rtt_gate_ms,
+                }),
+            );
+            conn_cancel.cancel();
+            return;
         }
     }
 }

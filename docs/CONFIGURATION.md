@@ -248,7 +248,9 @@ An array of IP tunnel definitions. Tunnels create encrypted point-to-point links
 | `mode`                 | `string`  | --      | Connectivity mode: `"relay"` (both edges behind NAT, traffic via relay) or `"direct"` (direct QUIC between edges) |
 | `direction`            | `string`  | --      | This edge's role: `"ingress"` (receives tunnel traffic, forwards to `local_addr`) or `"egress"` (listens on `local_addr`, sends into tunnel) |
 | `local_addr`           | `string`  | --      | Local address. For **egress**: listen address for local traffic to tunnel (e.g. `"0.0.0.0:9000"`). For **ingress**: forward address for received tunnel traffic (e.g. `"127.0.0.1:9000"`). |
-| `relay_addr`           | `string?` | `null`  | Relay server QUIC address, e.g. `"relay.example.com:4433"`. **Required for relay mode.** |
+| `relay_addrs`          | `string[]`| `[]`    | Ordered relay server QUIC addresses. Index 0 is the primary; a second entry enables automatic primary↔backup failover. Max 2 entries. **Required for relay mode.** |
+| `relay_addr`           | `string?` | `null`  | **Legacy.** Single relay address. Accepted on load and migrated into `relay_addrs[0]`. Prefer `relay_addrs`. |
+| `max_rtt_failback_increase_ms` | `u32?` | `50` | RTT gate for failback from backup to primary. Failback is refused if the primary's measured RTT exceeds the active backup's by more than this many ms. |
 | `tunnel_encryption_key`| `string?` | `null`  | End-to-end encryption key (hex-encoded, exactly 64 chars = 32 bytes). Both edges must have the same key (distributed by manager). **Required for relay mode** (relay sees only ciphertext). Optional for direct mode (defense-in-depth). **Stored in `secrets.json`.** |
 | `tunnel_bind_secret`   | `string?` | `null`  | Shared secret for relay bind authentication (hex-encoded, exactly 64 chars = 32 bytes). Used to compute HMAC-SHA256 bind tokens. **Stored in `secrets.json`.** |
 | `peer_addr`            | `string?` | `null`  | Remote peer QUIC address, e.g. `"203.0.113.50:4433"`. **Required for direct mode, egress direction.** |
@@ -271,7 +273,10 @@ Both edges behind NAT, traffic forwarded through a bilbycast-relay server. End-t
   "mode": "relay",
   "direction": "egress",
   "local_addr": "0.0.0.0:9000",
-  "relay_addr": "relay.example.com:4433",
+  "relay_addrs": [
+    "relay-primary.example.com:4433",
+    "relay-backup.example.com:4433"
+  ],
   "tunnel_encryption_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "tunnel_bind_secret": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 }
@@ -287,13 +292,18 @@ Both edges behind NAT, traffic forwarded through a bilbycast-relay server. End-t
   "mode": "relay",
   "direction": "ingress",
   "local_addr": "127.0.0.1:9000",
-  "relay_addr": "relay.example.com:4433",
+  "relay_addrs": [
+    "relay-primary.example.com:4433",
+    "relay-backup.example.com:4433"
+  ],
   "tunnel_encryption_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "tunnel_bind_secret": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 }
 ```
 
-Both edges must use the same `id`, `tunnel_encryption_key`, and `tunnel_bind_secret`. The manager distributes these automatically when creating tunnels.
+Both edges must use the same `id`, `relay_addrs` ordering, `tunnel_encryption_key`, and `tunnel_bind_secret`. The manager distributes these automatically when creating tunnels. With two entries in `relay_addrs`, the edges automatically fail over to the backup when the primary goes down and fail back when the primary recovers (RTT-gated). See [Redundant Relay Failover](configuration-guide.md#redundant-relay-failover) in the configuration guide for the timing budget.
+
+If only a single relay is needed, `relay_addrs` may contain just one entry (or the legacy `"relay_addr": "host:port"` form is still accepted).
 
 ### Direct Mode Example
 
@@ -332,7 +342,7 @@ One edge has a public IP. Direct QUIC connection — no relay needed.
 ### Validation Rules
 
 - `id` must be a valid UUID
-- `relay_addr` required when `mode` is `relay`
+- `relay_addrs` (or legacy `relay_addr`) required when `mode` is `relay`; at least one, at most two entries; duplicates rejected
 - `tunnel_encryption_key` required when `mode` is `relay`, must be exactly 64 hex chars (32 bytes)
 - `tunnel_bind_secret` must be exactly 64 hex chars if present
 - `peer_addr` required when `mode` is `direct` and `direction` is `egress`
@@ -1175,7 +1185,10 @@ SMPTE 2022-1 Forward Error Correction parameters.
       "mode": "relay",
       "direction": "egress",
       "local_addr": "0.0.0.0:9100",
-      "relay_addr": "relay.example.com:4433",
+      "relay_addrs": [
+        "relay-primary.example.com:4433",
+        "relay-backup.example.com:4433"
+      ],
       "tunnel_encryption_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
       "tunnel_bind_secret": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
     }

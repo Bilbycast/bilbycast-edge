@@ -1226,11 +1226,19 @@ List all active IP tunnels.
       "direction": "egress",
       "state": "Connected",
       "local_addr": "0.0.0.0:9000",
-      "relay_addr": "relay.example.com:4433"
+      "relay_addrs": [
+        "relay-primary.example.com:4433",
+        "relay-backup.example.com:4433"
+      ],
+      "active_relay_idx": 0,
+      "active_relay_addr": "relay-primary.example.com:4433",
+      "stats": { "packets_sent": 0, "packets_received": 0, "bytes_sent": 0, "bytes_received": 0 }
     }
   ]
 }
 ```
+
+`active_relay_idx` and `active_relay_addr` only appear for running relay-mode tunnels and reflect which relay is currently carrying traffic (0 = primary). When the primary is unreachable and failover occurs, these flip to `1` / the backup address.
 
 ### GET /api/v1/tunnels/{id}
 
@@ -1249,7 +1257,13 @@ Get status of a specific tunnel.
   "direction": "egress",
   "state": "Connected",
   "local_addr": "0.0.0.0:9000",
-  "relay_addr": "relay.example.com:4433"
+  "relay_addrs": [
+    "relay-primary.example.com:4433",
+    "relay-backup.example.com:4433"
+  ],
+  "active_relay_idx": 1,
+  "active_relay_addr": "relay-backup.example.com:4433",
+  "stats": { "packets_sent": 0, "packets_received": 0, "bytes_sent": 0, "bytes_received": 0 }
 }
 ```
 
@@ -1280,10 +1294,15 @@ Create a new IP tunnel. The tunnel configuration is validated before creation.
   "mode": "relay",
   "direction": "egress",
   "local_addr": "0.0.0.0:9000",
-  "relay_addr": "relay.example.com:4433",
+  "relay_addrs": [
+    "relay-primary.example.com:4433",
+    "relay-backup.example.com:4433"
+  ],
   "tunnel_encryption_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 }
 ```
+
+`relay_addrs` is an ordered list (primary first, optional backup second). A single-relay tunnel uses a one-element list. The legacy single-field `"relay_addr": "host:port"` form is still accepted and migrated automatically.
 
 **Response (201 Created):**
 

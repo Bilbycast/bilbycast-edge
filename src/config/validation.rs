@@ -2507,10 +2507,58 @@ pub fn validate_tunnel(tunnel: &crate::tunnel::TunnelConfig) -> Result<()> {
     // Mode-specific validation
     match tunnel.mode {
         crate::tunnel::config::TunnelMode::Relay => {
-            let relay_addr = tunnel.relay_addr.as_deref()
-                .ok_or_else(|| anyhow::anyhow!("Tunnel '{}': relay_addr is required for relay mode", tunnel.id))?;
-            if relay_addr.is_empty() || relay_addr.len() > 256 {
-                bail!("Tunnel '{}': relay_addr must be 1-256 characters", tunnel.id);
+            let relays = tunnel.effective_relays();
+            if relays.is_empty() {
+                bail!(
+                    "Tunnel '{}': at least one relay address is required for relay mode (set `relay_addrs`)",
+                    tunnel.id
+                );
+            }
+            if relays.len() > crate::tunnel::config::MAX_RELAY_ADDRS {
+                bail!(
+                    "Tunnel '{}': at most {} relay addresses are allowed (primary + backup), got {}",
+                    tunnel.id,
+                    crate::tunnel::config::MAX_RELAY_ADDRS,
+                    relays.len()
+                );
+            }
+            let mut seen: std::collections::HashSet<std::net::SocketAddr> =
+                std::collections::HashSet::new();
+            for (idx, addr) in relays.iter().enumerate() {
+                if addr.is_empty() || addr.len() > 256 {
+                    bail!(
+                        "Tunnel '{}': relay_addrs[{}] must be 1-256 characters",
+                        tunnel.id,
+                        idx
+                    );
+                }
+                let parsed: std::net::SocketAddr = addr.parse().map_err(|e| {
+                    anyhow::anyhow!(
+                        "Tunnel '{}': relay_addrs[{}] is not a valid socket address: {}",
+                        tunnel.id,
+                        idx,
+                        e
+                    )
+                })?;
+                if !seen.insert(parsed) {
+                    bail!(
+                        "Tunnel '{}': relay_addrs contains duplicate address '{}'",
+                        tunnel.id,
+                        addr
+                    );
+                }
+            }
+
+            // Failback RTT gate: only meaningful with a backup relay, and must
+            // be a sensible value (0..=5000 ms).
+            if let Some(gate) = tunnel.max_rtt_failback_increase_ms
+                && gate > 5000
+            {
+                bail!(
+                    "Tunnel '{}': max_rtt_failback_increase_ms must be <= 5000 (got {})",
+                    tunnel.id,
+                    gate
+                );
             }
         }
         crate::tunnel::config::TunnelMode::Direct => {
@@ -4074,7 +4122,9 @@ mod tests {
             mode: crate::tunnel::config::TunnelMode::Relay,
             direction,
             local_addr: local_addr.to_string(),
-            relay_addr: Some("127.0.0.1:4433".to_string()),
+            relay_addrs: vec!["127.0.0.1:4433".to_string()],
+            relay_addr: None,
+            max_rtt_failback_increase_ms: None,
             tunnel_encryption_key: None,
             tunnel_bind_secret: None,
             peer_addr: None,
@@ -4263,5 +4313,96 @@ mod tests {
         ]);
         let err = validate_config(&config).unwrap_err().to_string();
         assert!(err.contains("Port conflict"), "got: {err}");
+    }
+
+    // ── Dual-relay validation tests ──
+
+    fn make_dual_relay_tunnel(relay_addrs: Vec<&str>) -> crate::tunnel::TunnelConfig {
+        use crate::tunnel::config::{TunnelDirection, TunnelProtocol};
+        let mut t = make_test_tunnel(
+            "dual",
+            "127.0.0.1:9000",
+            TunnelProtocol::Udp,
+            TunnelDirection::Ingress,
+        );
+        t.relay_addrs = relay_addrs.into_iter().map(str::to_string).collect();
+        t.relay_addr = None;
+        // encryption key required for relay mode
+        t.tunnel_encryption_key = Some("a".repeat(64));
+        t
+    }
+
+    #[test]
+    fn dual_relay_accepts_two_valid_addresses() {
+        let t = make_dual_relay_tunnel(vec!["127.0.0.1:4433", "127.0.0.1:4434"]);
+        validate_tunnel(&t).unwrap();
+    }
+
+    #[test]
+    fn dual_relay_accepts_single_address() {
+        let t = make_dual_relay_tunnel(vec!["127.0.0.1:4433"]);
+        validate_tunnel(&t).unwrap();
+    }
+
+    #[test]
+    fn dual_relay_rejects_empty_list() {
+        let t = make_dual_relay_tunnel(vec![]);
+        let err = validate_tunnel(&t).unwrap_err().to_string();
+        assert!(err.contains("at least one relay address"), "got: {err}");
+    }
+
+    #[test]
+    fn dual_relay_rejects_three_addresses() {
+        let t =
+            make_dual_relay_tunnel(vec!["127.0.0.1:4433", "127.0.0.1:4434", "127.0.0.1:4435"]);
+        let err = validate_tunnel(&t).unwrap_err().to_string();
+        assert!(err.contains("at most 2 relay addresses"), "got: {err}");
+    }
+
+    #[test]
+    fn dual_relay_rejects_duplicate_addresses() {
+        let t = make_dual_relay_tunnel(vec!["127.0.0.1:4433", "127.0.0.1:4433"]);
+        let err = validate_tunnel(&t).unwrap_err().to_string();
+        assert!(err.contains("duplicate address"), "got: {err}");
+    }
+
+    #[test]
+    fn dual_relay_rejects_invalid_socket_addr() {
+        let t = make_dual_relay_tunnel(vec!["127.0.0.1:4433", "not-a-host:port"]);
+        let err = validate_tunnel(&t).unwrap_err().to_string();
+        assert!(err.contains("not a valid socket address"), "got: {err}");
+    }
+
+    #[test]
+    fn dual_relay_rejects_out_of_range_rtt_gate() {
+        let mut t = make_dual_relay_tunnel(vec!["127.0.0.1:4433", "127.0.0.1:4434"]);
+        t.max_rtt_failback_increase_ms = Some(10_000);
+        let err = validate_tunnel(&t).unwrap_err().to_string();
+        assert!(
+            err.contains("max_rtt_failback_increase_ms must be <= 5000"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn dual_relay_accepts_rtt_gate_at_bound() {
+        let mut t = make_dual_relay_tunnel(vec!["127.0.0.1:4433", "127.0.0.1:4434"]);
+        t.max_rtt_failback_increase_ms = Some(5000);
+        validate_tunnel(&t).unwrap();
+    }
+
+    #[test]
+    fn legacy_relay_addr_still_accepted() {
+        use crate::tunnel::config::{TunnelDirection, TunnelProtocol};
+        let mut t = make_test_tunnel(
+            "legacy",
+            "127.0.0.1:9000",
+            TunnelProtocol::Udp,
+            TunnelDirection::Ingress,
+        );
+        t.relay_addrs = vec![];
+        t.relay_addr = Some("127.0.0.1:4433".to_string());
+        t.tunnel_encryption_key = Some("a".repeat(64));
+        validate_tunnel(&t).unwrap();
     }
 }

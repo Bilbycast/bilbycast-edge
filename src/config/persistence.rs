@@ -20,8 +20,13 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-    let config: AppConfig = serde_json::from_str(&contents)
+    let mut config: AppConfig = serde_json::from_str(&contents)
         .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+
+    // Migrate legacy `tunnel.relay_addr` (string) → `tunnel.relay_addrs` (vec).
+    for tunnel in &mut config.tunnels {
+        tunnel.normalize_relay_addrs();
+    }
 
     tracing::info!(
         "Loaded config with {} flow(s) from {}",

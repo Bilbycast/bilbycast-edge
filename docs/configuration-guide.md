@@ -347,6 +347,8 @@ IP tunnels create encrypted point-to-point links between edge nodes, either thro
 
 Both edges connect outbound to a bilbycast-relay server. The relay pairs them by tunnel UUID and forwards traffic. End-to-end encryption ensures the relay cannot read payloads.
 
+`relay_addrs` is an ordered list: index 0 is the primary, and an optional second entry is the backup. When the primary becomes unreachable, the edge automatically fails over to the backup; when the primary recovers, an RTT-gated probe fails back (see [Redundant Relay Failover](#redundant-relay-failover)).
+
 ```json
 {
   "tunnels": [
@@ -357,13 +359,18 @@ Both edges connect outbound to a bilbycast-relay server. The relay pairs them by
       "mode": "relay",
       "direction": "egress",
       "local_addr": "0.0.0.0:9000",
-      "relay_addr": "relay.example.com:4433",
+      "relay_addrs": [
+        "relay-primary.example.com:4433",
+        "relay-backup.example.com:4433"
+      ],
       "tunnel_encryption_key": "0123456789abcdef...",
       "tunnel_bind_secret": "fedcba9876543210..."
     }
   ]
 }
 ```
+
+The legacy single-field `"relay_addr": "host:port"` form is still accepted on load and migrated into `relay_addrs[0]` automatically, but new configs should use `relay_addrs`.
 
 ### Direct Mode
 
@@ -397,7 +404,9 @@ One edge has a public IP. Direct QUIC connection between edges — no relay need
 | `mode` | string | Yes | - | `"relay"` (via relay server) or `"direct"` (QUIC peer-to-peer). |
 | `direction` | string | Yes | - | `"ingress"` (receives tunnel traffic, forwards to `local_addr`) or `"egress"` (listens on `local_addr`, sends into tunnel). |
 | `local_addr` | string | Yes | - | For **egress**: listen address for local traffic to tunnel (e.g. `"0.0.0.0:9000"`). For **ingress**: forward destination for received traffic (e.g. `"127.0.0.1:9000"`). |
-| `relay_addr` | string | Relay mode | `null` | Relay server QUIC address (e.g. `"relay.example.com:4433"`). Required for relay mode. |
+| `relay_addrs` | string[] | Relay mode | `[]` | Ordered list of relay server QUIC addresses (e.g. `["relay1:4433", "relay2:4433"]`). Index 0 is the primary; a second entry enables automatic primary↔backup failover. Max 2 entries. Required for relay mode. |
+| `relay_addr` | string | No | `null` | **Legacy.** Single relay address. Accepted on load for backward compatibility and migrated into `relay_addrs[0]`. Prefer `relay_addrs` in new configs. |
+| `max_rtt_failback_increase_ms` | integer | No | `50` | When the active backup is in use and the primary recovers, failback is refused if the primary's measured QUIC RTT exceeds the backup's by more than this many ms. Prevents flapping back to a degraded primary. |
 | `tunnel_encryption_key` | string | Relay mode | `null` | End-to-end ChaCha20-Poly1305 encryption key. Hex-encoded, exactly 64 chars (32 bytes). Required for relay mode. Both edges must share the same key. **Stored in `secrets.json`.** |
 | `tunnel_bind_secret` | string | No | `null` | HMAC-SHA256 bind authentication secret. Hex-encoded, exactly 64 chars. Proves authorization to bind on the relay. **Stored in `secrets.json`.** |
 | `peer_addr` | string | Direct egress | `null` | Remote peer QUIC address (e.g. `"203.0.113.50:4433"`). Required for direct mode, egress direction. |
@@ -409,13 +418,25 @@ One edge has a public IP. Direct QUIC connection between edges — no relay need
 ### Tunnel Validation Rules
 
 - `id` must be a valid UUID.
-- `relay_addr` required when `mode` is `"relay"`.
+- `relay_addrs` (or legacy `relay_addr`) required when `mode` is `"relay"`; at least one, at most two entries; each 1–256 chars; duplicates rejected.
 - `tunnel_encryption_key` required for relay mode; must be exactly 64 hex characters.
 - `tunnel_bind_secret` must be exactly 64 hex characters if present.
 - `peer_addr` required for direct mode egress.
 - `direct_listen_addr` required for direct mode ingress.
 - `tunnel_psk` must be exactly 64 hex characters if present.
 - All address fields must be valid socket addresses.
+
+### Redundant Relay Failover
+
+When `relay_addrs` contains a second entry, the edge provides automatic primary↔backup failover:
+
+- **Detection.** The QUIC transport uses a 5 s keep-alive interval and a 25 s max-idle timeout, so a dead relay is detected after ~25 s of silence. This tolerates typical Starlink satellite handovers and mobile cell-handoffs without flapping.
+- **Failover.** Once the primary is detected down, the edge reconnects and walks to the next relay in `relay_addrs`. Each reconnect attempt is bounded to 6 s so a dead primary cannot stall the loop behind the transport timeout. Expected end-to-end failover budget is **~30–40 s** on WAN links (both edges detect independently; the slower side sets total latency).
+- **Waiting convergence.** If the two edges initially land on different relays, the first-to-bind sees `Waiting`; after 10 s it steps forward to the next relay so the pair converges on the same one.
+- **Failback.** A background probe (every 60 s) measures the primary's QUIC RTT. When the primary's RTT is within `max_rtt_failback_increase_ms` (default 50 ms) of the currently-active backup, traffic fails back to the primary. This RTT gate prevents returning to a degraded primary that is reachable but slow.
+- **Event visibility.** Each failover emits a Warning event to the manager with `from_relay_addr`, `to_relay_addr`, `from_idx`, `to_idx` details.
+
+Failover is only engaged for tunnels with two relays configured. A tunnel with a single `relay_addrs` entry will simply reconnect to that same address until it returns.
 
 ---
 

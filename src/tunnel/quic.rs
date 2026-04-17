@@ -31,7 +31,10 @@ pub fn make_client_endpoint(alpn: &[u8]) -> anyhow::Result<Endpoint> {
     // 2 MB datagram buffers for SRT traffic (~1500 packets in-flight).
     transport.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
     transport.datagram_send_buffer_size(2 * 1024 * 1024);
-    transport.keep_alive_interval(Some(Duration::from_secs(15)));
+    // Failover tuning: 5 missed keep-alives before declaring dead, tolerates
+    // typical Starlink handovers / mobile cell-handoffs without flapping.
+    transport.keep_alive_interval(Some(Duration::from_secs(5)));
+    transport.max_idle_timeout(Some(Duration::from_secs(25).try_into()?));
 
     let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
@@ -92,7 +95,8 @@ pub fn make_server_endpoint(
     transport.max_concurrent_uni_streams(256u32.into());
     transport.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
     transport.datagram_send_buffer_size(2 * 1024 * 1024);
-    transport.keep_alive_interval(Some(Duration::from_secs(15)));
+    transport.keep_alive_interval(Some(Duration::from_secs(5)));
+    transport.max_idle_timeout(Some(Duration::from_secs(25).try_into()?));
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
