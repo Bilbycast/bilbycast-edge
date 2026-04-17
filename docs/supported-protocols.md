@@ -251,10 +251,12 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
 - **2022-7 Red/Blue:** per-input and per-output via the existing
   `redundancy` field.
 - **Feature gating:** ST 2110-20 **inputs** require a compile-time
-  `video-encoder-*` feature (x264 / x265 / NVENC). Default LGPL-clean
-  builds will deserialize the config but the encode worker logs an
-  error and drops frames. ST 2110-20 **outputs** only need the
-  `video-thumbnail` feature (default on).
+  `video-encoder-*` feature (x264 / x265 / NVENC) or the
+  `video-encoders-full` composite. The default `cargo build` has no
+  software video encoders, so it will deserialize the config but the
+  encode worker logs an error and drops frames. The `*-linux-full`
+  release binary includes all three encoders. ST 2110-20 **outputs**
+  only need the `video-thumbnail` feature (default on).
 - **NMOS:** advertised as `urn:x-nmos:format:video` in IS-04 with
   BCP-004 receiver caps declaring `video/raw`,
   `color_sampling=YCbCr-4:2:2`, `component_depth` ∈ {8, 10},

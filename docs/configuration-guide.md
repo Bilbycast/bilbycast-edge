@@ -1960,9 +1960,11 @@ ST 2110-20/-23 inputs **require** a `video_encode` block — the config
 is rejected otherwise — because ingress is always a pixel-to-compressed
 conversion. ST 2110-20/-23 outputs reject `video_encode` entirely
 because the decode step is implicit. Encoder backends obey the same
-Cargo-feature opt-in gate as existing `video_encode` outputs: default
-LGPL-clean builds accept the config but the encode worker logs an
-error and drops frames at runtime.
+Cargo-feature opt-in gate as existing `video_encode` outputs: the
+default `cargo build` has no software video encoders, so it accepts
+the config but the encode worker logs an error and drops frames at
+runtime. The `*-linux-full` release binary (built with the
+`video-encoders-full` composite) has all three encoders compiled in.
 
 When `transport_mode == "audio_302m"`:
 

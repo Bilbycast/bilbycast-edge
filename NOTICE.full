@@ -1,0 +1,107 @@
+bilbycast-edge (full variant)
+=============================
+
+This binary is a combined work distributed under the terms of the
+GNU Affero General Public License, version 3 or later
+(AGPL-3.0-or-later). See LICENSE (and COPYING.GPL for the GPL-3.0
+text that covers libx264 / libx265 via their GPL-2.0-or-later
+upgrade clause).
+
+The bilbycast source code is offered under two licences, at your
+choice:
+
+ 1. AGPL-3.0-or-later (LICENSE) — the default for open-source users.
+ 2. A commercial licence from Softside Tech Pty Ltd — for OEMs,
+    hardware integrators, SaaS providers, and other commercial
+    users who need to embed or operate bilbycast without AGPL's
+    copyleft. Contact commercial@softsidetech.com for terms. See
+    LICENSE.commercial.
+
+The combination with libx264 and libx265 (both GPL-2.0-or-later) is
+permitted because AGPL-3.0 is explicitly GPL-3.0-compatible
+(AGPL § 13) and libx264 / libx265 may be redistributed under
+GPL-3.0 via their "or later" clause. The full GPL-3.0 text is at
+COPYING.GPL for reference.
+
+Important: a Softside commercial licence covers the bilbycast source
+code only. It does not — and cannot — relicense libx264 or libx265,
+which are owned by VideoLAN and MulticoreWare respectively. If you
+distribute this `-full` binary under a commercial licence, the
+libx264 and libx265 portions of the combined work remain subject to
+GPL-2.0-or-later, and their copyleft obligations (source offer,
+preservation of licence notices, no additional restrictions) continue
+to apply. Commercial customers who need to avoid GPL entirely should
+use the default variant (no software video encoders) or build with
+`video-encoder-nvenc` only — NVENC's API layer is LGPL-compatible
+and patent coverage is provided by NVIDIA at the hardware/driver
+layer. See LICENSE.commercial for the full scope statement.
+
+Bundled third-party components
+------------------------------
+
+| Component                  | Version  | Licence                         |
+|----------------------------|----------|---------------------------------|
+| bilbycast-srt              | same tag | MPL-2.0 (Softside Tech)         |
+| bilbycast-libsrt-rs        | same tag | MPL-2.0 (Softside Tech)         |
+| bilbycast-rist             | same tag | MPL-2.0 (Softside Tech)         |
+| bilbycast-fdk-aac-rs       | same tag | MPL-2.0 (Softside Tech)         |
+| bilbycast-ffmpeg-video-rs  | same tag | MPL-2.0 (Softside Tech)         |
+| FFmpeg (libavcodec,        | n7.1.3   | LGPL-2.1-or-later, elevated to  |
+|  libavutil, libswscale)    |          | GPL-2.0-or-later via            |
+|                            |          | --enable-gpl at configure time  |
+| libx264                    | {VER}    | GPL-2.0-or-later                |
+| libx265                    | {VER}    | GPL-2.0-or-later                |
+| nv-codec-headers (NVENC)   | {VER}    | LGPL-2.1-or-later (headers      |
+|                            |          | only; runtime libnvidia-encode  |
+|                            |          | ships with NVIDIA's proprietary |
+|                            |          | driver)                         |
+| libopus                    | 1.5.2    | BSD-3-Clause                    |
+| Fraunhofer FDK AAC         | 2.0.3    | FDK AAC Codec Library License   |
+|                            |          | (permissive, with patent notice)|
+| Rust crates                | —        | MIT / Apache-2.0 / BSD-3-Clause |
+|                            |          | (see Cargo.lock)                |
+
+The MPL-2.0 Softside Tech library crates remain available under
+MPL-2.0 terms; they are combined into this AGPL Larger Work
+pursuant to MPL-2.0 § 3.3.
+
+Source code availability
+------------------------
+
+The complete corresponding source code for this binary is available
+across the bilbycast repositories on GitHub at the matching tag:
+
+    https://github.com/<org>/bilbycast-edge/tree/v{VER}
+    https://github.com/<org>/bilbycast-srt/tree/v{VER}
+    https://github.com/<org>/bilbycast-libsrt-rs/tree/v{VER}
+    https://github.com/<org>/bilbycast-rist/tree/v{VER}
+    https://github.com/<org>/bilbycast-fdk-aac-rs/tree/v{VER}
+    https://github.com/<org>/bilbycast-ffmpeg-video-rs/tree/v{VER}
+
+Per AGPL-3.0 § 6, a written offer valid for three years to provide
+the source on physical media is available on request at
+reza@softsidetech.com.
+
+If you modify bilbycast and operate it as a network service,
+AGPL § 13 requires you to make the complete corresponding source
+code of your modified version available to your users. The
+commercial licence from Softside Tech removes that obligation.
+
+Patent notice
+-------------
+
+H.264 / AVC and H.265 / HEVC are patent-encumbered codecs.
+Separate patent licences may be required from MPEG-LA, Access
+Advance, Velos Media, and other rights holders for commercial
+deployments that encode or decode these codecs. The bilbycast
+project and its maintainers make no representation that any such
+patent licences are granted with this binary. Operators are
+responsible for obtaining patent licences appropriate to their
+jurisdiction and use case.
+
+NVENC on NVIDIA hardware carries separate patent coverage paid by
+NVIDIA at the hardware layer; this is often the lowest-friction
+commercial path for production H.264 / H.265 encode.
+
+This notice is not legal advice. Consult a qualified IP attorney
+for your specific deployment.

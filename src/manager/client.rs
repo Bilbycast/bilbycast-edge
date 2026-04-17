@@ -836,6 +836,18 @@ fn edge_capabilities() -> Vec<&'static str> {
     if cfg!(feature = "video-encoder-nvenc") {
         caps.push("video-encoder-nvenc");
     }
+    if cfg!(feature = "fdk-aac") {
+        caps.push("fdk-aac");
+    }
+    if cfg!(feature = "video-thumbnail") {
+        caps.push("video-thumbnail");
+    }
+    if cfg!(feature = "webrtc") {
+        caps.push("webrtc");
+    }
+    if cfg!(feature = "tls") {
+        caps.push("tls");
+    }
     caps
 }
 

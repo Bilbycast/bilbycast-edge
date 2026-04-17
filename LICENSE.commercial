@@ -1,0 +1,63 @@
+bilbycast Commercial License
+============================
+
+The code in this repository is dual-licensed:
+
+1. The open-source licence — see LICENSE (GNU Affero General Public
+   License, version 3 or later). Free to use for review, private
+   deployment, and any use where you are comfortable with AGPL's
+   source-disclosure obligations (including § 13's network-copyleft
+   for operators of modified network services).
+
+2. A commercial licence from Softside Tech Pty Ltd — for OEMs,
+   hardware integrators, SaaS providers, and other commercial users
+   who need to embed, ship, or operate bilbycast without AGPL's
+   copyleft obligations. Typical use cases:
+
+   - Integrating bilbycast into a closed-source hardware product
+     (encoder / gateway / appliance)
+   - Operating bilbycast as part of a SaaS or managed service
+     without releasing the source of your modifications or
+     surrounding stack under AGPL
+   - Redistributing bilbycast as part of a commercial software
+     bundle under terms other than AGPL
+
+To obtain a commercial licence, or to discuss whether your use
+case needs one, please contact:
+
+    Softside Tech Pty Ltd
+    commercial@softsidetech.com
+
+If you're unsure which licence fits your use case, email us — we're
+happy to help you work it out before you invest engineering time.
+
+Scope — third-party GPL components
+----------------------------------
+
+The commercial licence from Softside Tech covers the bilbycast
+source code only (bilbycast-edge and its sibling Softside crates:
+bilbycast-srt, bilbycast-libsrt-rs, bilbycast-rist,
+bilbycast-fdk-aac-rs, bilbycast-ffmpeg-video-rs). Softside does not
+hold copyright in third-party libraries and cannot relicense them.
+
+In particular, the `*-full` release variant (and any build with
+`--features video-encoder-x264` or `video-encoder-x265`) bundles
+libx264 and libx265, which are distributed under GPL-2.0-or-later.
+Those libraries' GPL terms continue to apply to the portions of the
+combined binary they cover, regardless of any commercial licence
+you hold for the bilbycast source code.
+
+Commercial customers who need to avoid GPL copyleft entirely should:
+
+  a) Use the default release variant (no software video encoders), or
+  b) Build with `video-encoder-nvenc` only — NVENC's API layer is
+     LGPL-compatible and patent coverage is provided by NVIDIA at
+     the hardware/driver layer, or
+  c) Accept that the libx264 / libx265 portions of their deployment
+     remain subject to GPL-2.0-or-later.
+
+FFmpeg (libavcodec / libavutil / libswscale), libopus, and Fraunhofer
+FDK AAC have their own licences — see NOTICE / NOTICE.full for the
+full bundled-library manifest. If you are unsure whether a specific
+build configuration is compatible with your intended distribution
+model, email commercial@softsidetech.com before shipping.

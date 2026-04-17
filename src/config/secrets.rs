@@ -698,6 +698,7 @@ mod tests {
                 program_number: None,
                 audio_encode: None,
                 transcode: None,
+                video_encode: None,
             })],
             flows: vec![FlowConfig {
                 id: "rtmp-flow".to_string(),

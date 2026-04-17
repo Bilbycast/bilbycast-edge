@@ -15,8 +15,8 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::models::RtmpOutputConfig;
-use crate::manager::events::{EventSender, EventSeverity};
+use crate::config::models::{RtmpOutputConfig, VideoEncodeConfig};
+use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::OutputStatsAccumulator;
 
 use super::audio_decode::{AacDecoder, DecodeStats, sample_rate_from_index};
@@ -24,6 +24,7 @@ use super::audio_encode::{AudioCodec, AudioEncoder, AudioEncoderError, EncoderPa
 use super::packet::RtpPacket;
 use super::rtmp::client::RtmpClient;
 use super::ts_demux::{DemuxedFrame, TsDemuxer};
+use super::ts_video_replace::VideoEncodeStats;
 
 /// Per-output encoder state for the audio_encode bridge. Built lazily on
 /// the first AAC frame so we can read the demuxer's cached AAC config and
@@ -53,6 +54,57 @@ enum EncoderState {
     Failed,
 }
 
+/// Per-output video transcoding state. Mirrors the shape of
+/// [`EncoderState`] for audio: lazy-open on the first source frame,
+/// fallback to drop-video on any error.
+///
+/// The decoder is opened as soon as we learn the source `stream_type`
+/// from the PMT (H.264 = 0x1B, HEVC = 0x24). The encoder is deferred
+/// until we get the first decoded frame, because the encoder needs the
+/// source resolution — the `video_encode` config may leave `width` /
+/// `height` unset and we currently use the source resolution.
+enum VideoEncoderState {
+    /// `video_encode` is unset. Passthrough every frame verbatim (H.264
+    /// via classic FLV, HEVC via Enhanced RTMP).
+    Disabled,
+    /// `video_encode` is set; we haven't built the decoder + encoder yet.
+    #[cfg(feature = "video-thumbnail")]
+    Lazy { cfg: VideoEncodeConfig },
+    /// `video_encode` pipeline is live.
+    #[cfg(feature = "video-thumbnail")]
+    Active(Box<VideoActive>),
+    /// Decoder or encoder construction failed; drop video for the rest
+    /// of the output's lifetime. The failure event was already emitted.
+    Failed,
+}
+
+#[cfg(feature = "video-thumbnail")]
+struct VideoActive {
+    decoder: video_engine::VideoDecoder,
+    /// Opened on the first decoded frame so we can pick up the source
+    /// resolution when the operator didn't specify one.
+    encoder: Option<video_engine::VideoEncoder>,
+    backend: video_codec::VideoEncoderCodec,
+    target_family: video_codec::VideoCodec,
+    requested_width: Option<u32>,
+    requested_height: Option<u32>,
+    fps_num: Option<u32>,
+    fps_den: Option<u32>,
+    bitrate_kbps: u32,
+    gop_size: Option<u32>,
+    preset: video_codec::VideoPreset,
+    profile: video_codec::VideoProfile,
+    /// Cached FLV sequence-header payload built from the encoder's
+    /// `extradata` on first-encoder-open. `None` until the encoder opens
+    /// and emits its out-of-band SPS/PPS (or VPS/SPS/PPS).
+    sequence_header_tag: Option<Vec<u8>>,
+    /// True once we've written the sequence header to the RTMP peer.
+    sequence_header_sent: bool,
+    /// Monotonic PTS anchor in the encoder's 1 / fps_num time base.
+    out_frame_count: i64,
+    stats: Arc<VideoEncodeStats>,
+}
+
 /// Spawn an async task that consumes RTP packets from the broadcast channel,
 /// demuxes H.264/AAC from the MPEG-TS payload, and publishes to an RTMP server.
 ///
@@ -74,7 +126,7 @@ pub fn spawn_rtmp_output(
 
     output_stats.set_egress_static(crate::stats::collector::EgressMediaSummaryStatic {
         transport_mode: Some("flv".to_string()),
-        video_passthrough: true, // RTMP video is always passthrough today
+        video_passthrough: config.video_encode.is_none(),
         audio_passthrough: config.audio_encode.is_none(),
         audio_only: false,
     });
@@ -186,6 +238,12 @@ async fn publish_loop(
     } else {
         EncoderState::Disabled
     };
+    let mut video_state = init_video_encoder_state(
+        config,
+        stats,
+        flow_id,
+        event_sender,
+    );
     loop {
         let packet = tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
@@ -229,37 +287,44 @@ async fn publish_loop(
             match frame {
                 DemuxedFrame::H264 { nalus, pts, is_keyframe } => {
                     let ts_ms = pts_to_ms(pts, &mut base_pts);
-
-                    // Send sequence header on first keyframe
-                    if is_keyframe && !sent_video_header {
-                        if let (Some(sps), Some(pps)) = (demuxer.cached_sps(), demuxer.cached_pps()) {
-                            let header = build_avc_sequence_header(sps, pps);
-                            client.send_video(&header, ts_ms).await?;
-                            sent_video_header = true;
-                            tracing::debug!("RTMP output '{}': sent AVC sequence header", config.id);
-                        }
+                    if process_video_frame(
+                        VideoFrameSource::H264 { nalus: &nalus, is_keyframe },
+                        pts,
+                        ts_ms,
+                        recv_time_us,
+                        &demuxer,
+                        &mut sent_video_header,
+                        &mut video_state,
+                        client,
+                        config,
+                        stats,
+                        flow_id,
+                        event_sender,
+                    )
+                    .await?
+                    {
+                        // Success (or transient skip); nothing else to do.
                     }
-
-                    // Don't send video data before sequence header
-                    if !sent_video_header {
-                        continue;
+                }
+                DemuxedFrame::H265 { nalus, pts, is_keyframe } => {
+                    let ts_ms = pts_to_ms(pts, &mut base_pts);
+                    if process_video_frame(
+                        VideoFrameSource::H265 { nalus: &nalus, is_keyframe },
+                        pts,
+                        ts_ms,
+                        recv_time_us,
+                        &demuxer,
+                        &mut sent_video_header,
+                        &mut video_state,
+                        client,
+                        config,
+                        stats,
+                        flow_id,
+                        event_sender,
+                    )
+                    .await?
+                    {
                     }
-
-                    // Re-send sequence header on each keyframe (some servers need this)
-                    if is_keyframe && sent_video_header {
-                        if let (Some(sps), Some(pps)) = (demuxer.cached_sps(), demuxer.cached_pps()) {
-                            let header = build_avc_sequence_header(sps, pps);
-                            client.send_video(&header, ts_ms).await?;
-                        }
-                    }
-
-                    // Build FLV video NALU tag
-                    let tag = build_avc_nalu_tag(&nalus, is_keyframe);
-                    let tag_len = tag.len();
-                    client.send_video(&tag, ts_ms).await?;
-                    stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                    stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
-                    stats.record_latency(recv_time_us);
                 }
                 DemuxedFrame::Aac { data, pts } => {
                     let ts_ms = pts_to_ms(pts, &mut base_pts);
@@ -371,7 +436,12 @@ async fn publish_loop(
                             for frame in drained {
                                 let tag = build_aac_raw_tag(&frame.data);
                                 let tag_len = tag.len();
-                                client.send_audio(&tag, ts_ms).await?;
+                                // Use the encoder's per-frame PTS (90 kHz)
+                                // for the FLV tag so AAC frames drained as
+                                // a batch don't all share the source PES
+                                // ts_ms — keeps DTS strictly monotonic.
+                                let frame_ts_ms = (frame.pts / 90) as u32;
+                                client.send_audio(&tag, frame_ts_ms).await?;
                                 stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                                 stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
                                 stats.record_latency(recv_time_us);
@@ -455,6 +525,827 @@ fn build_avc_nalu_tag(nalus: &[Vec<u8>], is_keyframe: bool) -> Vec<u8> {
     }
 
     buf.to_vec()
+}
+
+/// FourCC identifier for HEVC in the Enhanced RTMP v2 extended VideoTagHeader.
+const FOURCC_HVC1: [u8; 4] = [b'h', b'v', b'c', b'1'];
+
+/// Build an Enhanced RTMP v2 SequenceStart tag payload for HEVC.
+///
+/// Layout: `0x90 "hvc1" <HEVCDecoderConfigurationRecord>`
+/// - first byte: `IsExHeader(1) | FrameType(1=key) | PacketType(0=SequenceStart)`.
+/// - next four bytes: ASCII FourCC `hvc1`.
+/// - body: the hvcC blob emitted by libx265 / hevc_nvenc when the encoder is
+///   opened with `global_header = true`.
+fn build_hevc_sequence_header_from_hvcc(extradata: &[u8]) -> Vec<u8> {
+    // libx265's `extradata` (with `global_header = true`) is an Annex-B
+    // VPS+SPS+PPS bytestream, *not* a HEVCDecoderConfigurationRecord. The
+    // MP4/Matroska muxers run `hevc_mp4toannexb` on the way out — we mux
+    // into FLV ourselves, so we have to assemble the hvcC here. Detect a
+    // pre-built hvcC by `configurationVersion == 0x01` as the first byte;
+    // otherwise split the Annex-B and rebuild.
+    let hvcc = if !extradata.is_empty() && extradata[0] == 0x01 {
+        extradata.to_vec()
+    } else {
+        match build_hvcc_from_annex_b(extradata) {
+            Some(blob) => blob,
+            None => {
+                tracing::warn!(
+                    "RTMP video_encode: HEVC extradata had no VPS/SPS/PPS NALs ({} bytes)",
+                    extradata.len()
+                );
+                return Vec::new();
+            }
+        }
+    };
+    let mut buf = BytesMut::with_capacity(5 + hvcc.len());
+    buf.put_u8(0x80 | (1 << 4) | 0); // Ex | keyframe | PacketType=SequenceStart
+    buf.put_slice(&FOURCC_HVC1);
+    buf.put_slice(&hvcc);
+    buf.to_vec()
+}
+
+/// Assemble a HEVCDecoderConfigurationRecord (per ISO/IEC 14496-15 §8.3.3.1.2)
+/// from an Annex-B VPS/SPS/PPS bytestream as emitted by libx265. We pull
+/// profile_space / tier / profile_idc / level_idc straight from the SPS
+/// (which mirrors them from the VPS), and use safe defaults for the rest.
+fn build_hvcc_from_annex_b(extradata: &[u8]) -> Option<Vec<u8>> {
+    let nalus = super::ts_demux::split_annex_b_nalus(extradata);
+    let mut vps: Option<&[u8]> = None;
+    let mut sps: Option<&[u8]> = None;
+    let mut pps: Option<&[u8]> = None;
+    for n in &nalus {
+        if n.is_empty() { continue; }
+        let t = (n[0] >> 1) & 0x3F;
+        match t {
+            32 if vps.is_none() => vps = Some(n),
+            33 if sps.is_none() => sps = Some(n),
+            34 if pps.is_none() => pps = Some(n),
+            _ => {}
+        }
+    }
+    let (vps, sps, pps) = match (vps, sps, pps) {
+        (Some(v), Some(s), Some(p)) => (v, s, p),
+        _ => return None,
+    };
+    // Pull profile/tier/level from the SPS profile_tier_level() structure,
+    // which immediately follows the 4-bit sps_video_parameter_set_id +
+    // 3-bit sps_max_sub_layers_minus1 + 1-bit sps_temporal_id_nesting_flag
+    // = first byte after the 2-byte NAL header.
+    if sps.len() < 2 + 12 { return None; }
+    let ptl = &sps[2..];
+    let profile_space_tier_profile = ptl[0];
+    let profile_compat: [u8; 4] = [ptl[1], ptl[2], ptl[3], ptl[4]];
+    let constraint: [u8; 6] = [ptl[5], ptl[6], ptl[7], ptl[8], ptl[9], ptl[10]];
+    let level_idc = ptl[11];
+
+    let mut out = Vec::with_capacity(64 + vps.len() + sps.len() + pps.len());
+    out.push(0x01); // configurationVersion
+    out.push(profile_space_tier_profile);
+    out.extend_from_slice(&profile_compat);
+    out.extend_from_slice(&constraint);
+    out.push(level_idc);
+    out.extend_from_slice(&[0xF0, 0x00]); // reserved | min_spatial_segmentation_idc=0
+    out.push(0xFC); // reserved | parallelismType=0
+    out.push(0xFD); // reserved | chroma_format_idc=1 (4:2:0)
+    out.push(0xF8); // reserved | bitDepthLumaMinus8=0
+    out.push(0xF8); // reserved | bitDepthChromaMinus8=0
+    out.extend_from_slice(&[0x00, 0x00]); // avgFrameRate=0
+    // constantFrameRate(2)=0 | numTemporalLayers(3)=1 | temporalIdNested(1)=1 | lengthSizeMinusOne(2)=3
+    out.push((1 << 3) | (1 << 2) | 0x03);
+    out.push(3); // numOfArrays = VPS, SPS, PPS
+
+    for (nal_type, nal) in [(32u8, vps), (33, sps), (34, pps)] {
+        out.push(0x80 | nal_type); // array_completeness=1 | reserved | NAL_unit_type
+        out.extend_from_slice(&[0x00, 0x01]); // numNalus = 1
+        let len = nal.len() as u16;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(nal);
+    }
+    Some(out)
+}
+
+/// Build an Enhanced RTMP v2 CodedFramesX tag payload for HEVC.
+///
+/// Uses `PacketType=3` (CodedFramesX) which omits the 3-byte composition time
+/// offset that `CodedFrames` carries — we encode with `max_b_frames = 0`, so
+/// CTS ≡ PTS ≡ DTS and the field would always be zero anyway.
+///
+/// Layout: `<0x93|0xA3> "hvc1" <AVCC-framed NAL units>`
+fn build_hevc_coded_frames_tag(avcc_nalus: &[u8], is_keyframe: bool) -> Vec<u8> {
+    let frame_type: u8 = if is_keyframe { 1 } else { 2 };
+    let mut buf = BytesMut::with_capacity(5 + avcc_nalus.len());
+    buf.put_u8(0x80 | (frame_type << 4) | 3); // Ex | key/inter | PacketType=CodedFramesX
+    buf.put_slice(&FOURCC_HVC1);
+    buf.put_slice(avcc_nalus);
+    buf.to_vec()
+}
+
+/// Build a classic-FLV `AVCPacketType=1` NALU tag from an already-AVCC-framed
+/// byte stream. Companion to [`build_avc_nalu_tag`] but skips the Vec<Vec<u8>>
+/// round-trip when the caller already has length-prefixed NALUs in one buffer
+/// (the output of [`annex_b_to_avcc`]).
+fn build_avc_nalu_tag_raw(avcc_nalus: &[u8], is_keyframe: bool) -> Vec<u8> {
+    let mut buf = BytesMut::with_capacity(5 + avcc_nalus.len());
+    let frame_type: u8 = if is_keyframe { 0x17 } else { 0x27 };
+    buf.put_u8(frame_type);
+    buf.put_u8(0x01); // AVCPacketType = NALU
+    buf.put_u8(0x00); // composition time offset (B-frames disabled at encoder)
+    buf.put_u8(0x00);
+    buf.put_u8(0x00);
+    buf.put_slice(avcc_nalus);
+    buf.to_vec()
+}
+
+/// Build a classic-FLV AVC sequence header tag from libx264's `extradata`.
+///
+/// libx264 emits Annex-B-framed SPS + PPS in extradata (start codes, no
+/// length prefixes) — it does *not* produce a ready-made
+/// AVCDecoderConfigurationRecord. The MP4/FLV muxer normally converts via
+/// the `h264_mp4toannexb` BSF, but we mux into FLV ourselves so we have to
+/// do the conversion here. We split on Annex-B, pick the SPS (type 7) and
+/// the first PPS (type 8), and build a proper DCR via
+/// `build_avc_sequence_header`. As a fallback, when extradata already
+/// looks like a DCR (first byte = `0x01`), we wrap it directly.
+fn build_avc_sequence_header_from_avcc(extradata: &[u8]) -> Vec<u8> {
+    if !extradata.is_empty() && extradata[0] == 0x01 {
+        let mut buf = BytesMut::with_capacity(5 + extradata.len());
+        buf.put_u8(0x17);
+        buf.put_u8(0x00);
+        buf.put_u8(0x00);
+        buf.put_u8(0x00);
+        buf.put_u8(0x00);
+        buf.put_slice(extradata);
+        return buf.to_vec();
+    }
+
+    let nalus = super::ts_demux::split_annex_b_nalus(extradata);
+    let mut sps: Option<&[u8]> = None;
+    let mut pps: Option<&[u8]> = None;
+    for n in &nalus {
+        if n.is_empty() { continue; }
+        match n[0] & 0x1F {
+            7 if sps.is_none() => sps = Some(n),
+            8 if pps.is_none() => pps = Some(n),
+            _ => {}
+        }
+    }
+    match (sps, pps) {
+        (Some(sps), Some(pps)) => build_avc_sequence_header(sps, pps),
+        _ => {
+            tracing::warn!(
+                "RTMP video_encode: encoder extradata had no SPS/PPS NALs ({} bytes)",
+                extradata.len()
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Convert an Annex-B byte stream (NAL units delimited by `00 00 00 01` /
+/// `00 00 01` start codes) into AVCC framing (each NAL prefixed by a 4-byte
+/// big-endian length, no start codes). Works for both H.264 and HEVC.
+///
+/// Used on the output side for:
+/// - the classic-FLV AVC NALU tag body, and
+/// - the Enhanced-RTMP `hvc1` `CodedFramesX` tag body.
+pub(crate) fn annex_b_to_avcc(data: &[u8]) -> Vec<u8> {
+    let nalus = super::ts_demux::split_annex_b_nalus(data);
+    let mut out = Vec::with_capacity(data.len() + nalus.len() * 4);
+    for nalu in nalus {
+        out.extend_from_slice(&(nalu.len() as u32).to_be_bytes());
+        out.extend_from_slice(&nalu);
+    }
+    out
+}
+
+/// Concatenate a list of NAL units (as returned by the TS demuxer) back into
+/// an Annex-B byte stream suitable for `VideoDecoder::send_packet`.
+#[cfg(feature = "video-thumbnail")]
+fn nalus_to_annex_b(nalus: &[Vec<u8>]) -> Vec<u8> {
+    let total = nalus.iter().map(|n| 4 + n.len()).sum();
+    let mut out = Vec::with_capacity(total);
+    for nalu in nalus {
+        out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        out.extend_from_slice(nalu);
+    }
+    out
+}
+
+/// Borrowed view of the source NAL units for one access unit.
+enum VideoFrameSource<'a> {
+    H264 { nalus: &'a [Vec<u8>], is_keyframe: bool },
+    H265 { nalus: &'a [Vec<u8>], is_keyframe: bool },
+}
+
+impl<'a> VideoFrameSource<'a> {
+    fn nalus(&self) -> &'a [Vec<u8>] {
+        match self {
+            VideoFrameSource::H264 { nalus, .. } | VideoFrameSource::H265 { nalus, .. } => nalus,
+        }
+    }
+    fn is_keyframe(&self) -> bool {
+        match self {
+            VideoFrameSource::H264 { is_keyframe, .. }
+            | VideoFrameSource::H265 { is_keyframe, .. } => *is_keyframe,
+        }
+    }
+    fn is_h264(&self) -> bool {
+        matches!(self, VideoFrameSource::H264 { .. })
+    }
+}
+
+/// Initialise the per-output video encoder state machine at startup.
+///
+/// If `video_encode` is unset, returns `Disabled` and video is passed
+/// through untouched. Otherwise returns `Lazy` (or `Failed` when the
+/// build has no `video-thumbnail` support at all).
+fn init_video_encoder_state(
+    config: &RtmpOutputConfig,
+    stats: &Arc<OutputStatsAccumulator>,
+    flow_id: &str,
+    event_sender: &EventSender,
+) -> VideoEncoderState {
+    let Some(enc_cfg) = config.video_encode.as_ref() else {
+        return VideoEncoderState::Disabled;
+    };
+    let _ = (stats, flow_id, event_sender);
+    #[cfg(feature = "video-thumbnail")]
+    {
+        VideoEncoderState::Lazy { cfg: enc_cfg.clone() }
+    }
+    #[cfg(not(feature = "video-thumbnail"))]
+    {
+        let msg = format!(
+            "RTMP output '{}': video_encode requested but this build lacks \
+             the `video-thumbnail` feature (no in-process video codec library)",
+            config.id
+        );
+        tracing::error!("{msg}");
+        event_sender.emit_output_with_details(
+            EventSeverity::Critical,
+            category::VIDEO_ENCODE,
+            msg,
+            &config.id,
+            serde_json::json!({ "codec": enc_cfg.codec }),
+        );
+        VideoEncoderState::Failed
+    }
+}
+
+#[cfg(feature = "video-thumbnail")]
+fn resolve_backend(
+    codec: &str,
+    output_id: &str,
+    event_sender: &EventSender,
+) -> Option<video_codec::VideoEncoderCodec> {
+    match codec {
+        "x264" => Some(video_codec::VideoEncoderCodec::X264),
+        "x265" => Some(video_codec::VideoEncoderCodec::X265),
+        "h264_nvenc" => Some(video_codec::VideoEncoderCodec::H264Nvenc),
+        "hevc_nvenc" => Some(video_codec::VideoEncoderCodec::HevcNvenc),
+        other => {
+            let msg = format!(
+                "RTMP output '{}': video_encode unknown codec '{other}'",
+                output_id
+            );
+            tracing::error!("{msg}");
+            event_sender.emit_output_with_details(
+                EventSeverity::Critical,
+                category::VIDEO_ENCODE,
+                msg,
+                output_id,
+                serde_json::json!({ "codec": other }),
+            );
+            None
+        }
+    }
+}
+
+#[cfg(feature = "video-thumbnail")]
+fn resolve_preset(s: Option<&str>) -> video_codec::VideoPreset {
+    match s {
+        Some("ultrafast") => video_codec::VideoPreset::Ultrafast,
+        Some("superfast") => video_codec::VideoPreset::Superfast,
+        Some("veryfast") => video_codec::VideoPreset::Veryfast,
+        Some("faster") => video_codec::VideoPreset::Faster,
+        Some("fast") => video_codec::VideoPreset::Fast,
+        Some("slow") => video_codec::VideoPreset::Slow,
+        Some("slower") => video_codec::VideoPreset::Slower,
+        Some("veryslow") => video_codec::VideoPreset::Veryslow,
+        _ => video_codec::VideoPreset::Medium,
+    }
+}
+
+#[cfg(feature = "video-thumbnail")]
+fn resolve_profile(s: Option<&str>) -> video_codec::VideoProfile {
+    match s {
+        Some("baseline") => video_codec::VideoProfile::Baseline,
+        Some("main") => video_codec::VideoProfile::Main,
+        Some("high") => video_codec::VideoProfile::High,
+        _ => video_codec::VideoProfile::Auto,
+    }
+}
+
+/// Core per-frame handler: dispatches passthrough vs transcode, sends the
+/// necessary FLV tags to the RTMP peer, and updates per-output stats.
+///
+/// Returns `Ok(true)` on success (or a transient skip such as missing
+/// sequence header on a non-keyframe), `Err` on RTMP send failure (which
+/// the caller treats as a reconnect trigger).
+#[allow(clippy::too_many_arguments)]
+async fn process_video_frame(
+    src: VideoFrameSource<'_>,
+    pts_90k: u64,
+    ts_ms: u32,
+    recv_time_us: u64,
+    demuxer: &TsDemuxer,
+    sent_video_header: &mut bool,
+    video_state: &mut VideoEncoderState,
+    client: &mut RtmpClient,
+    config: &RtmpOutputConfig,
+    stats: &Arc<OutputStatsAccumulator>,
+    flow_id: &str,
+    event_sender: &EventSender,
+) -> anyhow::Result<bool> {
+    match video_state {
+        VideoEncoderState::Disabled => {
+            passthrough_video(&src, ts_ms, recv_time_us, demuxer, sent_video_header, client, config, stats).await
+        }
+        VideoEncoderState::Failed => {
+            // Decoder/encoder already failed once — drop video silently
+            // so the output keeps running audio.
+            Ok(true)
+        }
+        #[cfg(feature = "video-thumbnail")]
+        VideoEncoderState::Lazy { cfg } => {
+            let cfg = cfg.clone();
+            *video_state = open_video_active(
+                &cfg,
+                src.is_h264(),
+                config,
+                stats,
+                event_sender,
+            );
+            if matches!(video_state, VideoEncoderState::Failed) {
+                return Ok(true);
+            }
+            // Fall through to Active on the very same frame.
+            encode_one_frame(&src, pts_90k, ts_ms, recv_time_us, sent_video_header, video_state, client, config, stats, flow_id, event_sender).await
+        }
+        #[cfg(feature = "video-thumbnail")]
+        VideoEncoderState::Active(_) => {
+            encode_one_frame(&src, pts_90k, ts_ms, recv_time_us, sent_video_header, video_state, client, config, stats, flow_id, event_sender).await
+        }
+    }
+}
+
+/// H.264 (classic FLV) or H.265 (Enhanced RTMP) passthrough — no re-encode.
+#[allow(clippy::too_many_arguments)]
+async fn passthrough_video(
+    src: &VideoFrameSource<'_>,
+    ts_ms: u32,
+    recv_time_us: u64,
+    demuxer: &TsDemuxer,
+    sent_video_header: &mut bool,
+    client: &mut RtmpClient,
+    config: &RtmpOutputConfig,
+    stats: &Arc<OutputStatsAccumulator>,
+) -> anyhow::Result<bool> {
+    let nalus = src.nalus();
+    let is_keyframe = src.is_keyframe();
+
+    match src {
+        VideoFrameSource::H264 { .. } => {
+            // Send sequence header on first keyframe
+            if is_keyframe && !*sent_video_header {
+                if let (Some(sps), Some(pps)) = (demuxer.cached_sps(), demuxer.cached_pps()) {
+                    let header = build_avc_sequence_header(sps, pps);
+                    client.send_video(&header, ts_ms).await?;
+                    *sent_video_header = true;
+                    tracing::debug!("RTMP output '{}': sent AVC sequence header", config.id);
+                }
+            }
+            if !*sent_video_header {
+                return Ok(true);
+            }
+            // Re-send sequence header on each keyframe (some servers need this)
+            if is_keyframe {
+                if let (Some(sps), Some(pps)) = (demuxer.cached_sps(), demuxer.cached_pps()) {
+                    let header = build_avc_sequence_header(sps, pps);
+                    client.send_video(&header, ts_ms).await?;
+                }
+            }
+            let tag = build_avc_nalu_tag(nalus, is_keyframe);
+            let tag_len = tag.len();
+            client.send_video(&tag, ts_ms).await?;
+            stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+            stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
+            stats.record_latency(recv_time_us);
+        }
+        VideoFrameSource::H265 { .. } => {
+            // HEVC passthrough over Enhanced RTMP. Build hvcC from cached
+            // VPS / SPS / PPS on first keyframe.
+            if is_keyframe && !*sent_video_header {
+                if let Some(hvcc) = build_hvcc_from_cached(demuxer) {
+                    let header = build_hevc_sequence_header_from_hvcc(&hvcc);
+                    client.send_video(&header, ts_ms).await?;
+                    *sent_video_header = true;
+                    tracing::debug!("RTMP output '{}': sent HEVC sequence header", config.id);
+                }
+            }
+            if !*sent_video_header {
+                return Ok(true);
+            }
+            if is_keyframe {
+                if let Some(hvcc) = build_hvcc_from_cached(demuxer) {
+                    let header = build_hevc_sequence_header_from_hvcc(&hvcc);
+                    client.send_video(&header, ts_ms).await?;
+                }
+            }
+            // Filter out VPS/SPS/PPS from the coded-frames payload — they
+            // travel out-of-band via the sequence header.
+            let avcc = annex_b_to_avcc_filtered_h265(nalus);
+            if avcc.is_empty() {
+                return Ok(true);
+            }
+            let tag = build_hevc_coded_frames_tag(&avcc, is_keyframe);
+            let tag_len = tag.len();
+            client.send_video(&tag, ts_ms).await?;
+            stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+            stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
+            stats.record_latency(recv_time_us);
+        }
+    }
+    Ok(true)
+}
+
+/// Assemble an `HEVCDecoderConfigurationRecord` (hvcC) from the cached
+/// VPS / SPS / PPS emitted by the TS demuxer. Returns `None` if any of the
+/// three parameter sets is missing yet.
+fn build_hvcc_from_cached(demuxer: &TsDemuxer) -> Option<Vec<u8>> {
+    let vps = demuxer.cached_h265_vps()?;
+    let sps = demuxer.cached_h265_sps()?;
+    let pps = demuxer.cached_h265_pps()?;
+    Some(build_hvcc(vps, sps, pps))
+}
+
+/// Build a minimal `HEVCDecoderConfigurationRecord` (ISO/IEC 14496-15 §8.3.2).
+///
+/// We do not have the full SPS/VPS/PPS parser needed to populate every
+/// profile field, so the record's profile_tier_level bits are left at zero
+/// — receivers that only care about parsing the payload (e.g. ffmpeg,
+/// OBS Studio, Wowza with E-RTMP) accept this. Strict conformance checkers
+/// may reject it; such profiles should use video_encode to let the encoder
+/// emit its own hvcC.
+fn build_hvcc(vps: &[u8], sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    let mut buf = BytesMut::new();
+    // configurationVersion
+    buf.put_u8(1);
+    // general_profile_space (2) | general_tier_flag (1) | general_profile_idc (5)
+    buf.put_u8(0);
+    // general_profile_compatibility_flags (32 bits)
+    buf.put_u32(0);
+    // general_constraint_indicator_flags (48 bits)
+    buf.put_u8(0);
+    buf.put_u8(0);
+    buf.put_u8(0);
+    buf.put_u8(0);
+    buf.put_u8(0);
+    buf.put_u8(0);
+    // general_level_idc
+    buf.put_u8(0);
+    // min_spatial_segmentation_idc (12 bits) + reserved (4 bits)
+    buf.put_u8(0xF0);
+    buf.put_u8(0x00);
+    // parallelismType (2 bits) + reserved (6 bits)
+    buf.put_u8(0xFC);
+    // chromaFormat (2 bits) + reserved (6 bits) — 0x01 = 4:2:0
+    buf.put_u8(0xFC | 0x01);
+    // bitDepthLumaMinus8 (3 bits) + reserved (5 bits)
+    buf.put_u8(0xF8);
+    // bitDepthChromaMinus8 (3 bits) + reserved (5 bits)
+    buf.put_u8(0xF8);
+    // avgFrameRate (16 bits)
+    buf.put_u16(0);
+    // constantFrameRate (2) | numTemporalLayers (3) | temporalIdNested (1) | lengthSizeMinusOne (2) = 0x0F
+    buf.put_u8(0x0F);
+    // numOfArrays
+    buf.put_u8(3);
+    // Array[0]: VPS (NAL type 32)
+    push_hvcc_nal_array(&mut buf, 32, &[vps]);
+    // Array[1]: SPS (NAL type 33)
+    push_hvcc_nal_array(&mut buf, 33, &[sps]);
+    // Array[2]: PPS (NAL type 34)
+    push_hvcc_nal_array(&mut buf, 34, &[pps]);
+    buf.to_vec()
+}
+
+fn push_hvcc_nal_array(buf: &mut BytesMut, nal_type: u8, nals: &[&[u8]]) {
+    // array_completeness (1) | reserved (1) | nal_unit_type (6)
+    buf.put_u8(0x80 | (nal_type & 0x3F));
+    // numNalus
+    buf.put_u16(nals.len() as u16);
+    for n in nals {
+        buf.put_u16(n.len() as u16);
+        buf.put_slice(n);
+    }
+}
+
+/// Convert a list of HEVC NALUs to AVCC framing, filtering out VPS / SPS /
+/// PPS (which ride in the hvcC sequence header, not the coded-frames body).
+fn annex_b_to_avcc_filtered_h265(nalus: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for n in nalus {
+        if n.is_empty() {
+            continue;
+        }
+        let nal_type = (n[0] >> 1) & 0x3F;
+        if matches!(nal_type, 32 | 33 | 34) {
+            continue;
+        }
+        out.extend_from_slice(&(n.len() as u32).to_be_bytes());
+        out.extend_from_slice(n);
+    }
+    out
+}
+
+#[cfg(feature = "video-thumbnail")]
+fn open_video_active(
+    cfg: &VideoEncodeConfig,
+    source_is_h264: bool,
+    config: &RtmpOutputConfig,
+    stats: &Arc<OutputStatsAccumulator>,
+    event_sender: &EventSender,
+) -> VideoEncoderState {
+    let Some(backend) = resolve_backend(&cfg.codec, &config.id, event_sender) else {
+        return VideoEncoderState::Failed;
+    };
+    let source_codec = if source_is_h264 {
+        video_codec::VideoCodec::H264
+    } else {
+        video_codec::VideoCodec::Hevc
+    };
+    let decoder = match video_engine::VideoDecoder::open(source_codec) {
+        Ok(d) => d,
+        Err(e) => {
+            let msg = format!(
+                "RTMP output '{}': video_encode failed to open decoder for {:?}: {e}",
+                config.id, source_codec
+            );
+            tracing::error!("{msg}");
+            event_sender.emit_output_with_details(
+                EventSeverity::Critical,
+                category::VIDEO_ENCODE,
+                msg,
+                &config.id,
+                serde_json::json!({ "codec": cfg.codec }),
+            );
+            return VideoEncoderState::Failed;
+        }
+    };
+    let target_family = backend.family();
+    let stats_handle = Arc::new(VideoEncodeStats::default());
+    let backend_tag = match backend {
+        video_codec::VideoEncoderCodec::X264 => "x264",
+        video_codec::VideoEncoderCodec::X265 => "x265",
+        video_codec::VideoEncoderCodec::H264Nvenc | video_codec::VideoEncoderCodec::HevcNvenc => {
+            "nvenc"
+        }
+    };
+    let target_codec = match target_family {
+        video_codec::VideoCodec::H264 => "h264",
+        video_codec::VideoCodec::Hevc => "hevc",
+    };
+    stats.set_video_encode_stats(
+        stats_handle.clone(),
+        String::new(),
+        target_codec.to_string(),
+        cfg.width.unwrap_or(0),
+        cfg.height.unwrap_or(0),
+        match (cfg.fps_num, cfg.fps_den) {
+            (Some(n), Some(d)) if d > 0 => n as f32 / d as f32,
+            _ => 0.0,
+        },
+        cfg.bitrate_kbps.unwrap_or(4000),
+        backend_tag.to_string(),
+    );
+    tracing::info!(
+        "RTMP output '{}': video_encode active ({} @ {} kbps)",
+        config.id,
+        backend_tag,
+        cfg.bitrate_kbps.unwrap_or(4000),
+    );
+    event_sender.emit_output_with_details(
+        EventSeverity::Info,
+        category::VIDEO_ENCODE,
+        format!("Video encoder started: output '{}'", config.id),
+        &config.id,
+        serde_json::json!({ "codec": cfg.codec }),
+    );
+    VideoEncoderState::Active(Box::new(VideoActive {
+        decoder,
+        encoder: None,
+        backend,
+        target_family,
+        requested_width: cfg.width,
+        requested_height: cfg.height,
+        fps_num: cfg.fps_num,
+        fps_den: cfg.fps_den,
+        bitrate_kbps: cfg.bitrate_kbps.unwrap_or(4000),
+        gop_size: cfg.gop_size,
+        preset: resolve_preset(cfg.preset.as_deref()),
+        profile: resolve_profile(cfg.profile.as_deref()),
+        sequence_header_tag: None,
+        sequence_header_sent: false,
+        out_frame_count: 0,
+        stats: stats_handle,
+    }))
+}
+
+/// Push one source access unit through the decoder, drain decoded frames
+/// through the encoder, and emit FLV tags per encoded frame.
+#[cfg(feature = "video-thumbnail")]
+#[allow(clippy::too_many_arguments)]
+async fn encode_one_frame(
+    src: &VideoFrameSource<'_>,
+    _pts_90k: u64,
+    _ts_ms: u32,
+    recv_time_us: u64,
+    sent_video_header: &mut bool,
+    video_state: &mut VideoEncoderState,
+    client: &mut RtmpClient,
+    config: &RtmpOutputConfig,
+    stats: &Arc<OutputStatsAccumulator>,
+    _flow_id: &str,
+    event_sender: &EventSender,
+) -> anyhow::Result<bool> {
+    let active = match video_state {
+        VideoEncoderState::Active(a) => a,
+        _ => return Ok(true),
+    };
+
+    // Concatenate the source NALUs back into an Annex-B chunk for the
+    // decoder. In-process codec work runs inside `block_in_place` so the
+    // tokio reactor isn't held while we spend single-digit milliseconds
+    // per frame.
+    let annex_b = nalus_to_annex_b(src.nalus());
+    let block_result: Result<Vec<(Vec<u8>, bool, i64)>, String> =
+        tokio::task::block_in_place(|| -> Result<Vec<(Vec<u8>, bool, i64)>, String> {
+            active.stats.input_frames.fetch_add(1, Ordering::Relaxed);
+            if let Err(e) = active.decoder.send_packet(&annex_b) {
+                tracing::debug!("RTMP output '{}': decoder send_packet: {e:?}", config.id);
+            }
+            let mut out = Vec::new();
+            loop {
+                let frame = match active.decoder.receive_frame() {
+                    Ok(f) => f,
+                    Err(_) => break,
+                };
+                if active.encoder.is_none() {
+                    let src_w = frame.width();
+                    let src_h = frame.height();
+                    if let (Some(rw), Some(rh)) = (active.requested_width, active.requested_height)
+                    {
+                        if rw != src_w || rh != src_h {
+                            tracing::warn!(
+                                "RTMP output '{}': video_encode resolution change {}x{} -> {}x{} requested \
+                                 but scaling is not implemented yet; using source resolution",
+                                config.id, src_w, src_h, rw, rh
+                            );
+                        }
+                    }
+                    let (fps_num, fps_den) = match (active.fps_num, active.fps_den) {
+                        (Some(n), Some(d)) => (n, d),
+                        _ => (30, 1),
+                    };
+                    let gop_size = active.gop_size.unwrap_or(fps_num.max(1) * 2);
+                    let enc_cfg = video_codec::VideoEncoderConfig {
+                        codec: active.backend,
+                        width: src_w,
+                        height: src_h,
+                        fps_num,
+                        fps_den,
+                        bitrate_kbps: active.bitrate_kbps,
+                        gop_size,
+                        preset: active.preset,
+                        profile: active.profile,
+                        // Emit SPS/PPS (H.264) or VPS/SPS/PPS (HEVC) in
+                        // out-of-band extradata — the FLV sequence header
+                        // format expects the full DecoderConfigurationRecord.
+                        global_header: true,
+                    };
+                    let enc = match video_engine::VideoEncoder::open(&enc_cfg) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            return Err(format!("encoder open failed: {e}"));
+                        }
+                    };
+                    if let Some(ed) = enc.extradata() {
+                        active.sequence_header_tag = Some(match active.target_family {
+                            video_codec::VideoCodec::H264 => {
+                                build_avc_sequence_header_from_avcc(ed)
+                            }
+                            video_codec::VideoCodec::Hevc => {
+                                build_hevc_sequence_header_from_hvcc(ed)
+                            }
+                        });
+                    }
+                    active.encoder = Some(enc);
+                }
+                let (y, y_s, u, u_s, v, v_s) = match frame.yuv_planes() {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let enc = active.encoder.as_mut().unwrap();
+                let encoded = match enc.encode_frame(
+                    y, y_s, u, u_s, v, v_s,
+                    Some(active.out_frame_count),
+                ) {
+                    Ok(frames) => frames,
+                    Err(e) => {
+                        tracing::debug!("RTMP output '{}': encode error: {e}", config.id);
+                        active
+                            .stats
+                            .dropped_frames
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+                active.out_frame_count += 1;
+                for ef in encoded {
+                    out.push((ef.data, ef.keyframe, ef.pts));
+                    active.stats.output_frames.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Ok(out)
+        });
+
+    // Only encoder *open* failure flips us to Failed. Decoder priming —
+    // when the H.264/HEVC decoder needs several access units before it
+    // emits its first frame — produces an empty `Ok(vec![])` and must
+    // not terminate the encode pipeline.
+    let encoded: Vec<(Vec<u8>, bool, i64)> = match block_result {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::error!("RTMP output '{}': video_encode: {e}", config.id);
+            event_sender.emit_output_with_details(
+                EventSeverity::Critical,
+                category::VIDEO_ENCODE,
+                format!("Video encoder failed: output '{}': {e}", config.id),
+                &config.id,
+                serde_json::json!({ "error": e }),
+            );
+            *video_state = VideoEncoderState::Failed;
+            return Ok(true);
+        }
+    };
+
+    let active = match video_state {
+        VideoEncoderState::Active(a) => a,
+        _ => return Ok(true),
+    };
+
+    // Convert encoder-PTS (in 1/fps_num ticks) to FLV-style milliseconds.
+    // Using the encoder's per-frame PTS — instead of replaying the source
+    // `ts_ms` for every output frame in this batch — keeps DTS strictly
+    // monotonic when the decoder drains several queued frames at once
+    // (which is the common path on the very first non-IDR access units).
+    let (fps_num, fps_den) = match (active.fps_num, active.fps_den) {
+        (Some(n), Some(d)) => (n.max(1), d.max(1)),
+        _ => (30, 1),
+    };
+    for (annex_b_encoded, keyframe, enc_pts) in encoded {
+        let frame_ts_ms = (enc_pts.max(0) as u64 * 1000 * fps_den as u64 / fps_num as u64) as u32;
+        // Send the sequence header once, then re-send on each subsequent
+        // keyframe (mirrors the passthrough policy — some servers require
+        // the ASC before they start demuxing).
+        if let Some(hdr) = active.sequence_header_tag.as_ref() {
+            if !active.sequence_header_sent {
+                client.send_video(hdr, frame_ts_ms).await?;
+                active.sequence_header_sent = true;
+                *sent_video_header = true;
+                tracing::debug!(
+                    "RTMP output '{}': sent transcoded video sequence header",
+                    config.id
+                );
+            } else if keyframe {
+                client.send_video(hdr, frame_ts_ms).await?;
+            }
+        }
+
+        let avcc = annex_b_to_avcc(&annex_b_encoded);
+        let tag = match active.target_family {
+            video_codec::VideoCodec::H264 => build_avc_nalu_tag_raw(&avcc, keyframe),
+            video_codec::VideoCodec::Hevc => build_hevc_coded_frames_tag(&avcc, keyframe),
+        };
+        let tag_len = tag.len();
+        client.send_video(&tag, frame_ts_ms).await?;
+        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+        stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
+        stats.record_latency(recv_time_us);
+    }
+    Ok(true)
 }
 
 /// Build an AAC sequence header FLV audio tag (AudioSpecificConfig).
@@ -823,6 +1714,50 @@ mod tests {
         // attempt=7 → 64, capped at operator floor 60.
         assert_eq!(rtmp_reconnect_backoff(7, 60), 60);
         assert_eq!(rtmp_reconnect_backoff(99, 60), 60);
+    }
+
+    #[test]
+    fn annex_b_to_avcc_handles_start_code_variants() {
+        // Two NALUs separated by a 4-byte and a 3-byte start code.
+        let input: Vec<u8> = vec![
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E,
+            0x00, 0x00, 0x01, 0x68, 0xCE, 0x38, 0x80,
+        ];
+        let avcc = annex_b_to_avcc(&input);
+        assert_eq!(
+            avcc,
+            vec![
+                0x00, 0x00, 0x00, 0x04, 0x67, 0x42, 0x00, 0x1E,
+                0x00, 0x00, 0x00, 0x04, 0x68, 0xCE, 0x38, 0x80,
+            ]
+        );
+    }
+
+    #[test]
+    fn annex_b_to_avcc_empty_input_is_empty() {
+        assert!(annex_b_to_avcc(&[]).is_empty());
+        assert!(annex_b_to_avcc(&[0x00, 0x00, 0x00]).is_empty());
+    }
+
+    #[test]
+    fn build_hevc_sequence_header_shape() {
+        // hvcC body is opaque to this test — we just check that the framing
+        // bytes around it match the Enhanced RTMP v2 spec.
+        let hvcc = [0xAA, 0xBB, 0xCC];
+        let tag = build_hevc_sequence_header_from_hvcc(&hvcc);
+        assert_eq!(tag[0], 0x90, "IsEx(1) | FrameType(1=key) | PacketType(0)");
+        assert_eq!(&tag[1..5], b"hvc1", "FourCC");
+        assert_eq!(&tag[5..], &hvcc);
+    }
+
+    #[test]
+    fn build_hevc_coded_frames_tag_shape() {
+        let avcc = [0x01, 0x02];
+        let kf = build_hevc_coded_frames_tag(&avcc, true);
+        assert_eq!(kf[0], 0x93, "IsEx | keyframe | PacketType=CodedFramesX");
+        assert_eq!(&kf[1..5], b"hvc1");
+        let inter = build_hevc_coded_frames_tag(&avcc, false);
+        assert_eq!(inter[0], 0xA3, "IsEx | inter | PacketType=CodedFramesX");
     }
 
     /// Total reconnect attempts in 60 s of wall clock should be ≤ 7

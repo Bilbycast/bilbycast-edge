@@ -1,0 +1,50 @@
+bilbycast-edge (default variant)
+================================
+
+Licensed under the GNU Affero General Public License, version 3 or
+later (AGPL-3.0-or-later). See LICENSE for the full text.
+
+Alternative commercial licensing is available from Softside Tech
+Pty Ltd for OEM, hardware, and SaaS integrators who need to embed
+bilbycast without AGPL's copyleft — contact
+commercial@softsidetech.com. See LICENSE.commercial.
+
+Bundled third-party components
+------------------------------
+
+| Component                  | Version  | Licence                         |
+|----------------------------|----------|---------------------------------|
+| bilbycast-srt              | same tag | MPL-2.0                         |
+| bilbycast-libsrt-rs        | same tag | MPL-2.0                         |
+| bilbycast-rist             | same tag | MPL-2.0                         |
+| bilbycast-fdk-aac-rs       | same tag | MPL-2.0                         |
+| bilbycast-ffmpeg-video-rs  | same tag | MPL-2.0                         |
+| FFmpeg (libavcodec,        | n7.1.3   | LGPL-2.1-or-later               |
+|  libavutil, libswscale)    |          |                                 |
+| libopus                    | 1.5.2    | BSD-3-Clause                    |
+| Fraunhofer FDK AAC         | 2.0.3    | FDK AAC Codec Library License   |
+| Rust crates                | —        | MIT / Apache-2.0 / BSD-3-Clause |
+|                            |          | (see Cargo.lock)                |
+
+The MPL-2.0 library crates remain available under
+MPL-2.0 terms; they are combined into this AGPL Larger Work
+pursuant to MPL-2.0 § 3.3 (Distribution of a Larger Work), and
+MPL § 1.12 / § 3.3 explicitly list AGPL as a compatible Secondary
+License.
+
+Source code availability
+------------------------
+
+The complete corresponding source code for this binary is at:
+
+    https://github.com/<org>/bilbycast-edge/tree/v{VER}
+
+(Replace `<org>/<VER>` at release-package time with the actual
+GitHub organisation and tag.)
+
+This variant does NOT include libx264 or libx265. For a
+transcoding-capable binary see the -full variant, which bundles
+libx264 + libx265 + NVENC and ships with its own NOTICE.full.
+
+This notice is not legal advice. Consult a qualified IP attorney
+for your specific deployment.

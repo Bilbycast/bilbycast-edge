@@ -1,9 +1,9 @@
 [package]
 name = "bilbycast-edge"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
-license = "MPL-2.0"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 # Async runtime
@@ -147,9 +147,10 @@ fdk-aac = ["dep:aac-audio", "dep:aac-codec"]
 video-thumbnail = ["dep:video-engine", "dep:video-codec"]
 # Enable libx264 H.264 video encoding inside the vendored FFmpeg build.
 # **LICENSING:** libx264 is GPL v2+. Binaries built with this feature
-# inherit GPL terms. The feature also requires libx264-dev (or
-# equivalent) to be installed on the host. Off by default so nightly
-# release builds stay LGPL-clean.
+# are an AGPL-3.0-or-later combined work (see NOTICE.full). Requires
+# libx264-dev (or equivalent) installed on the host. Off by default;
+# enabled by the `video-encoders-full` composite in the `*-full`
+# release artefact.
 video-encoder-x264 = ["video-thumbnail", "video-engine/video-encoder-x264"]
 # Enable libx265 HEVC video encoding. Same licensing implications as
 # `video-encoder-x264` (GPL v2+). Off by default.
@@ -158,6 +159,17 @@ video-encoder-x265 = ["video-thumbnail", "video-engine/video-encoder-x265"]
 # layer; requires an NVIDIA driver at runtime and nv-codec-headers at
 # build time. Off by default.
 video-encoder-nvenc = ["video-thumbnail", "video-engine/video-encoder-nvenc"]
+# Bundle all three video encoders (x264 + x265 + NVENC). Used by the
+# GitHub Actions release matrix to produce the `*-full` artefact. At
+# runtime, operators pick the per-flow codec; NVENC activates only on
+# hosts with NVIDIA driver + hardware, otherwise x264/x265 run on CPU.
+# Inherits libx264's + libx265's GPL v2+ terms — the resulting binary
+# is an AGPL-3.0-or-later combined work (see NOTICE.full).
+video-encoders-full = [
+    "video-encoder-x264",
+    "video-encoder-x265",
+    "video-encoder-nvenc",
+]
 # Enable TLS (HTTPS on API + RTMPS) support via rustls/tokio-rustls/axum-server.
 tls = ["dep:tokio-rustls", "dep:axum-server"]
 # Enable WebRTC WHIP/WHEP input and output via str0m (pure Rust, sans-I/O).
@@ -184,6 +196,15 @@ optional = true
 [dependencies.str0m]
 version = "0.18.0"
 optional = true
+# Use OpenSSL DTLS backend instead of the default aws-lc-rs + dimpl. The
+# pure-Rust dimpl DTLS implementation stalls when the active side (WHEP
+# client) is talking to a localhost passive server (str0m WHEP server) —
+# DTLS handshake never reaches Connected even though ICE succeeds and the
+# server's certificate is received. The OpenSSL backend uses a battle-tested
+# DTLS stack and avoids this. Adds an OpenSSL build-time dep but bilbycast
+# already links OpenSSL via libsrt-rs so no new system requirement.
+default-features = false
+features = ["openssl"]
 
 [dependencies.reqwest]
 version = "0.13.2"

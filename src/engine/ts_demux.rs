@@ -29,6 +29,15 @@ pub enum DemuxedFrame {
         /// Whether this is a keyframe (contains IDR NALU).
         is_keyframe: bool,
     },
+    /// Complete H.265 / HEVC access unit (one or more NALUs in Annex B format).
+    H265 {
+        /// NAL units with 0x00000001 start codes stripped.
+        nalus: Vec<Vec<u8>>,
+        /// Presentation timestamp in 90 kHz clock ticks.
+        pts: u64,
+        /// Whether this is a keyframe (IDR_W_RADL, IDR_N_LP, or CRA_NUT).
+        is_keyframe: bool,
+    },
     /// Opus audio frame (not yet supported for output — placeholder variant).
     Opus,
     /// AAC audio frame (raw, ADTS header stripped).
@@ -75,6 +84,13 @@ pub struct TsDemuxer {
     cached_sps: Option<Vec<u8>>,
     /// Cached PPS NALU for late joiners.
     cached_pps: Option<Vec<u8>>,
+    /// Cached HEVC VPS NALU.
+    cached_h265_vps: Option<Vec<u8>>,
+    /// Cached HEVC SPS NALU (distinct from `cached_sps` to avoid collision
+    /// with H.264 when the PMT codec changes mid-flow).
+    cached_h265_sps: Option<Vec<u8>>,
+    /// Cached HEVC PPS NALU.
+    cached_h265_pps: Option<Vec<u8>>,
     /// Cached AAC config: (profile, sample_rate_index, channel_config) from first ADTS header.
     cached_aac_config: Option<(u8, u8, u8)>,
 }
@@ -99,6 +115,9 @@ impl TsDemuxer {
             pes_assemblers: HashMap::new(),
             cached_sps: None,
             cached_pps: None,
+            cached_h265_vps: None,
+            cached_h265_sps: None,
+            cached_h265_pps: None,
             cached_aac_config: None,
         }
     }
@@ -123,6 +142,9 @@ impl TsDemuxer {
             pes_assemblers: HashMap::new(),
             cached_sps: None,
             cached_pps: None,
+            cached_h265_vps: None,
+            cached_h265_sps: None,
+            cached_h265_pps: None,
             cached_aac_config: None,
         }
     }
@@ -135,6 +157,27 @@ impl TsDemuxer {
     /// Get the cached PPS NALU.
     pub fn cached_pps(&self) -> Option<&[u8]> {
         self.cached_pps.as_deref()
+    }
+
+    /// Get the cached HEVC VPS NALU.
+    pub fn cached_h265_vps(&self) -> Option<&[u8]> {
+        self.cached_h265_vps.as_deref()
+    }
+
+    /// Get the cached HEVC SPS NALU.
+    pub fn cached_h265_sps(&self) -> Option<&[u8]> {
+        self.cached_h265_sps.as_deref()
+    }
+
+    /// Get the cached HEVC PPS NALU.
+    pub fn cached_h265_pps(&self) -> Option<&[u8]> {
+        self.cached_h265_pps.as_deref()
+    }
+
+    /// Source video stream_type as seen in the PMT (0x1B = H.264, 0x24 = HEVC, 0 = unknown).
+    #[allow(dead_code)]
+    pub fn video_stream_type(&self) -> u8 {
+        self.video_stream_type
     }
 
     /// Get the cached AAC config: (profile, sample_rate_index, channel_config).
@@ -439,6 +482,26 @@ impl TsDemuxer {
                     is_keyframe,
                 }]
             }
+            STREAM_TYPE_H265 => {
+                let nalus = self.extract_h265_nalus(es_data);
+                if nalus.is_empty() {
+                    return Vec::new();
+                }
+                // HEVC NAL unit type is bits 1..6 of the first header byte.
+                // IDR_W_RADL = 19, IDR_N_LP = 20, CRA_NUT = 21 are keyframes.
+                let is_keyframe = nalus.iter().any(|n| {
+                    if n.is_empty() {
+                        return false;
+                    }
+                    let nt = (n[0] >> 1) & 0x3F;
+                    matches!(nt, 19 | 20 | 21)
+                });
+                vec![DemuxedFrame::H265 {
+                    nalus,
+                    pts: pts.unwrap_or(0),
+                    is_keyframe,
+                }]
+            }
             STREAM_TYPE_PRIVATE if Some(pid) == self.audio_pid => {
                 vec![DemuxedFrame::Opus]
             }
@@ -453,68 +516,36 @@ impl TsDemuxer {
     /// Extract individual H.264 NALUs from Annex B byte stream.
     /// Splits on 0x00000001 or 0x000001 start codes.
     fn extract_h264_nalus(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
-        let mut nalus = Vec::new();
-        let mut i = 0;
-
-        // Find start codes and extract NALUs
-        while i < data.len() {
-            // Look for start code: 0x000001 or 0x00000001
-            let (start_code_len, found) = if i + 3 < data.len()
-                && data[i] == 0x00
-                && data[i + 1] == 0x00
-                && data[i + 2] == 0x00
-                && data[i + 3] == 0x01
-            {
-                (4, true)
-            } else if i + 2 < data.len()
-                && data[i] == 0x00
-                && data[i + 1] == 0x00
-                && data[i + 2] == 0x01
-            {
-                (3, true)
-            } else {
-                (0, false)
-            };
-
-            if !found {
-                i += 1;
-                continue;
+        let raw = split_annex_b_nalus(data);
+        let mut nalus = Vec::with_capacity(raw.len());
+        for nalu in raw {
+            let nalu_type = nalu[0] & 0x1F;
+            // Cache SPS/PPS for late joiners
+            if nalu_type == 7 {
+                self.cached_sps = Some(nalu.clone());
+            } else if nalu_type == 8 {
+                self.cached_pps = Some(nalu.clone());
             }
-
-            let nalu_start = i + start_code_len;
-
-            // Find end of this NALU (next start code or end of data)
-            let mut nalu_end = data.len();
-            let mut j = nalu_start + 1;
-            while j + 2 < data.len() {
-                if data[j] == 0x00
-                    && data[j + 1] == 0x00
-                    && (data[j + 2] == 0x01
-                        || (j + 3 < data.len() && data[j + 2] == 0x00 && data[j + 3] == 0x01))
-                {
-                    nalu_end = j;
-                    break;
-                }
-                j += 1;
-            }
-
-            if nalu_start < nalu_end {
-                let nalu = &data[nalu_start..nalu_end];
-                if !nalu.is_empty() {
-                    let nalu_type = nalu[0] & 0x1F;
-                    // Cache SPS/PPS for late joiners
-                    if nalu_type == 7 {
-                        self.cached_sps = Some(nalu.to_vec());
-                    } else if nalu_type == 8 {
-                        self.cached_pps = Some(nalu.to_vec());
-                    }
-                    nalus.push(nalu.to_vec());
-                }
-            }
-
-            i = nalu_end;
+            nalus.push(nalu);
         }
+        nalus
+    }
 
+    /// Extract individual HEVC NALUs from Annex B byte stream, caching
+    /// VPS / SPS / PPS for late joiners.
+    fn extract_h265_nalus(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
+        let raw = split_annex_b_nalus(data);
+        let mut nalus = Vec::with_capacity(raw.len());
+        for nalu in raw {
+            let nalu_type = (nalu[0] >> 1) & 0x3F;
+            match nalu_type {
+                32 => self.cached_h265_vps = Some(nalu.clone()),
+                33 => self.cached_h265_sps = Some(nalu.clone()),
+                34 => self.cached_h265_pps = Some(nalu.clone()),
+                _ => {}
+            }
+            nalus.push(nalu);
+        }
         nalus
     }
 
@@ -578,6 +609,66 @@ impl TsDemuxer {
 
         frames
     }
+}
+
+/// Split an Annex-B byte stream into individual NAL units. Start codes
+/// (0x000001 or 0x00000001) are stripped from each emitted slice.
+///
+/// Shared between H.264 and HEVC paths — Annex-B framing is identical; only
+/// the NAL-header parsing differs.
+pub(crate) fn split_annex_b_nalus(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut nalus = Vec::new();
+    let mut i = 0;
+
+    while i < data.len() {
+        let (start_code_len, found) = if i + 3 < data.len()
+            && data[i] == 0x00
+            && data[i + 1] == 0x00
+            && data[i + 2] == 0x00
+            && data[i + 3] == 0x01
+        {
+            (4, true)
+        } else if i + 2 < data.len()
+            && data[i] == 0x00
+            && data[i + 1] == 0x00
+            && data[i + 2] == 0x01
+        {
+            (3, true)
+        } else {
+            (0, false)
+        };
+
+        if !found {
+            i += 1;
+            continue;
+        }
+
+        let nalu_start = i + start_code_len;
+        let mut nalu_end = data.len();
+        let mut j = nalu_start + 1;
+        while j + 2 < data.len() {
+            if data[j] == 0x00
+                && data[j + 1] == 0x00
+                && (data[j + 2] == 0x01
+                    || (j + 3 < data.len() && data[j + 2] == 0x00 && data[j + 3] == 0x01))
+            {
+                nalu_end = j;
+                break;
+            }
+            j += 1;
+        }
+
+        if nalu_start < nalu_end {
+            let nalu = &data[nalu_start..nalu_end];
+            if !nalu.is_empty() {
+                nalus.push(nalu.to_vec());
+            }
+        }
+
+        i = nalu_end;
+    }
+
+    nalus
 }
 
 /// Parse a 5-byte PTS field from PES header.

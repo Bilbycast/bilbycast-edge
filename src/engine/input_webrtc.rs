@@ -280,6 +280,35 @@ async fn whep_input_loop(
         tracing::info!("WHEP connected to {}", config.whep_url);
         events.emit_flow(EventSeverity::Info, category::WEBRTC, "WHEP connected", flow_id);
 
+        // Wait for ICE + DTLS handshake to complete before entering the
+        // receive loop. Without this, the active-DTLS side of the WHEP
+        // client may stall: incoming RTP arrives before DTLS finishes and
+        // poll_event's tokio::select races between the recv arm and the
+        // sleep arm in a way that starves the DTLS handshake state machine.
+        // Explicitly draining poll_event until Connected mirrors what the
+        // WHIP client output does and lets ICE/DTLS reliably complete first.
+        let mut connected = false;
+        loop {
+            match session.poll_event(&cancel).await {
+                SessionEvent::Connected => {
+                    connected = true;
+                    break;
+                }
+                SessionEvent::Disconnected => {
+                    tracing::warn!("WHEP disconnected during handshake, will retry");
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        if !connected {
+            continue;
+        }
+
+        // str0m may emit MediaAdded *after* Connected. Flush any pending
+        // events so video_mid is populated before media starts arriving.
+        session.drain_pending_events();
+
         let mut ts_muxer = crate::engine::rtmp::ts_mux::TsMuxer::new();
         let mut seq_num: u16 = 0;
 

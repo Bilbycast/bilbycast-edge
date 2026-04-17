@@ -270,6 +270,33 @@ impl WebrtcSession {
         Ok(())
     }
 
+    /// Drain str0m's pending output queue, sending any queued UDP transmits
+    /// to the wire. This MUST be called between consecutive `write_media`
+    /// calls — str0m queues writes in `to_payload` (cap 100) and only
+    /// drains them via `handle_timeout`, which is reached from a
+    /// `Output::Timeout` poll cycle. Without this drain, the inner H.264
+    /// fragmentation loop overflows the queue after 100 writes and every
+    /// subsequent `write_media` returns `Err("Consecutive calls to write()
+    /// without poll_output() in between")`. We feed an `Input::Timeout`
+    /// so the per-write payload queue is processed eagerly. Cheap when
+    /// there's nothing pending (one no-op timeout + one no-op poll).
+    pub async fn drain_outputs(&mut self) {
+        // Feed a current-time timeout so str0m runs `do_payload` and turns
+        // the just-written sample into RTP packets ready for `poll_output`.
+        let _ = self.rtc.handle_input(Input::Timeout(Instant::now()));
+        loop {
+            match self.rtc.poll_output() {
+                Ok(Output::Transmit(transmit)) => {
+                    let _ = self.socket.send_to(&transmit.contents, transmit.destination).await;
+                }
+                Ok(Output::Event(event)) => {
+                    let _ = self.handle_event(event);
+                }
+                Ok(Output::Timeout(_)) | Err(_) => break,
+            }
+        }
+    }
+
     /// Get the first negotiated payload type for a given MID.
     pub fn get_pt(&mut self, mid: Mid) -> Option<Pt> {
         let writer = self.rtc.writer(mid)?;

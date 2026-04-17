@@ -53,14 +53,31 @@ jobs:
     needs: check-version
     if: needs.check-version.outputs.should_release == 'true'
     strategy:
+      fail-fast: false
       matrix:
         include:
+          # ─── default variant: no video encoders (AGPL-3.0-or-later only) ───
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact_suffix: x86_64-linux
+            variant: default
+            cargo_features: ""
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_suffix: aarch64-linux
+            variant: default
+            cargo_features: ""
+          # ─── full variant: libx264 + libx265 + NVENC (AGPL + GPL bundle) ───
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact_suffix: x86_64-linux-full
+            variant: full
+            cargo_features: "video-encoders-full"
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_suffix: aarch64-linux-full
+            variant: full
+            cargo_features: "video-encoders-full"
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout bilbycast-libsrt-rs (path dependency)
@@ -97,10 +114,15 @@ jobs:
         with:
           path: bilbycast-edge
 
-      - name: Install build dependencies
+      - name: Install common build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake make clang libclang-dev pkg-config libssl-dev g++
+
+      - name: Install video-encoder build dependencies (full variant only)
+        if: matrix.variant == 'full'
+        run: |
+          sudo apt-get install -y libx264-dev libx265-dev nv-codec-headers
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -114,13 +136,18 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bilbycast-edge/target
-          key: ${{ matrix.target }}-cargo-edge-${{ hashFiles('bilbycast-edge/Cargo.lock') }}
+          key: ${{ matrix.target }}-${{ matrix.variant }}-cargo-edge-${{ hashFiles('bilbycast-edge/Cargo.lock') }}
           restore-keys: |
-            ${{ matrix.target }}-cargo-edge-
+            ${{ matrix.target }}-${{ matrix.variant }}-cargo-edge-
 
       - name: Build release binary
         working-directory: bilbycast-edge
-        run: cargo build --release --target ${{ matrix.target }}
+        run: |
+          if [ -n "${{ matrix.cargo_features }}" ]; then
+            cargo build --release --target ${{ matrix.target }} --features "${{ matrix.cargo_features }}"
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
 
       - name: Verify binary
         run: |
@@ -129,22 +156,65 @@ jobs:
           file "${BINARY}"
           echo "=== Dynamic dependencies ==="
           ldd "${BINARY}" 2>&1 || true
+          echo "=== Checking for libx264/libx265 (variant: ${{ matrix.variant }}) ==="
+          if [ "${{ matrix.variant }}" = "full" ]; then
+            if ! ldd "${BINARY}" | grep -qE 'libx264|libx265'; then
+              echo "ERROR: full variant binary is missing libx264 or libx265 linkage"
+              exit 1
+            fi
+            echo "OK: full variant links libx264 and libx265"
+          else
+            if ldd "${BINARY}" | grep -qE 'libx264|libx265'; then
+              echo "ERROR: default variant binary unexpectedly links libx264/libx265"
+              exit 1
+            fi
+            echo "OK: default variant has no libx264/libx265 linkage"
+          fi
 
-      - name: Prepare artifact
+      - name: Package tarball
         run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
           BINARY="bilbycast-edge/target/${{ matrix.target }}/release/bilbycast-edge"
-          ARTIFACT="bilbycast-edge-${{ matrix.artifact_suffix }}"
-          cp "${BINARY}" "${ARTIFACT}"
-          chmod +x "${ARTIFACT}"
-          sha256sum "${ARTIFACT}" > "${ARTIFACT}.sha256"
+          STAGE="bilbycast-edge-${VERSION}-${{ matrix.artifact_suffix }}"
+          mkdir -p "${STAGE}"
+          cp "${BINARY}" "${STAGE}/bilbycast-edge"
+          chmod +x "${STAGE}/bilbycast-edge"
+
+          # Copy the licence + bundled-library manifest the variant needs.
+          cp bilbycast-edge/LICENSE            "${STAGE}/LICENSE"
+          cp bilbycast-edge/LICENSE.commercial "${STAGE}/LICENSE.commercial"
+          cp bilbycast-edge/README.md          "${STAGE}/README.md"
+          if [ "${{ matrix.variant }}" = "full" ]; then
+            cp bilbycast-edge/NOTICE.full "${STAGE}/NOTICE"
+            cp bilbycast-edge/COPYING.GPL "${STAGE}/COPYING.GPL"
+          else
+            cp bilbycast-edge/NOTICE "${STAGE}/NOTICE"
+          fi
+
+          # Fill in `{VER}` and `<org>` placeholders in the NOTICE so the
+          # shipped file points at the actual tag + repo.
+          sed -i \
+            -e "s|{VER}|${VERSION}|g" \
+            -e "s|<org>|${GITHUB_REPOSITORY_OWNER}|g" \
+            "${STAGE}/NOTICE"
+
+          if [ -d bilbycast-edge/config_examples ]; then
+            cp -r bilbycast-edge/config_examples "${STAGE}/config_examples"
+          fi
+
+          TARBALL="${STAGE}.tar.gz"
+          tar czf "${TARBALL}" "${STAGE}"
+          sha256sum "${TARBALL}" > "${TARBALL}.sha256"
+          echo "Packaged ${TARBALL} ($(du -h ${TARBALL} | cut -f1))"
+          ls -l "${TARBALL}" "${TARBALL}.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: bilbycast-edge-${{ matrix.artifact_suffix }}
           path: |
-            bilbycast-edge-${{ matrix.artifact_suffix }}
-            bilbycast-edge-${{ matrix.artifact_suffix }}.sha256
+            bilbycast-edge-${{ needs.check-version.outputs.version }}-${{ matrix.artifact_suffix }}.tar.gz
+            bilbycast-edge-${{ needs.check-version.outputs.version }}-${{ matrix.artifact_suffix }}.tar.gz.sha256
           retention-days: 1
 
   release:
@@ -175,16 +245,38 @@ jobs:
             --title "bilbycast-edge v${VERSION}" \
             --notes "Release of bilbycast-edge version ${VERSION}.
 
-          ## Binaries (glibc — requires Ubuntu 24.04 or compatible)
-          - \`bilbycast-edge-x86_64-linux\` — Linux x86_64 (amd64)
-          - \`bilbycast-edge-aarch64-linux\` — Linux ARM64 (aarch64)
+          ## Binaries
 
-          Verify checksums:
+          Two variants per architecture — pick one based on your transcoding needs:
+
+          ### \`*-linux\` (default variant)
+          No H.264 / H.265 software encoders bundled. AGPL-3.0-or-later binary.
+          - \`bilbycast-edge-${VERSION}-x86_64-linux.tar.gz\` — Linux x86_64 (amd64)
+          - \`bilbycast-edge-${VERSION}-aarch64-linux.tar.gz\` — Linux ARM64 (aarch64)
+
+          ### \`*-linux-full\` (full variant)
+          Includes libx264 + libx265 + NVENC. NVENC activates automatically on hosts with an NVIDIA driver; x264 / x265 handle everything else. This binary is an **AGPL-3.0-or-later combined work** that bundles GPL-2.0-or-later code — see \`NOTICE\` inside the tarball.
+          - \`bilbycast-edge-${VERSION}-x86_64-linux-full.tar.gz\` — Linux x86_64 (amd64)
+          - \`bilbycast-edge-${VERSION}-aarch64-linux-full.tar.gz\` — Linux ARM64 (aarch64)
+
+          Install \`libx264\` and \`libx265\` runtime packages before running the \`-full\` binary: \`sudo apt install libx264-dev libx265-dev\`. No extra packages needed for NVENC beyond the NVIDIA driver.
+
+          ## Verify checksums
           \`\`\`
-          sha256sum -c bilbycast-edge-x86_64-linux.sha256
-          sha256sum -c bilbycast-edge-aarch64-linux.sha256
-          \`\`\`" \
-            artifacts/bilbycast-edge-x86_64-linux \
-            artifacts/bilbycast-edge-x86_64-linux.sha256 \
-            artifacts/bilbycast-edge-aarch64-linux \
-            artifacts/bilbycast-edge-aarch64-linux.sha256
+          sha256sum -c *.sha256
+          \`\`\`
+
+          ## Licensing
+          bilbycast-edge is dual-licensed: AGPL-3.0-or-later for open-source use, commercial licence from Softside Tech Pty Ltd for OEM / SaaS / closed-source integration. See \`LICENSE\`, \`LICENSE.commercial\`, and the per-variant \`NOTICE\` file inside each tarball.
+
+          **Commercial-licence customers using \`-full\`**: the Softside commercial licence covers bilbycast source only — it does not relicense libx264 / libx265, which remain GPL-2.0-or-later inside the \`-full\` binary. To avoid GPL copyleft entirely, use the default variant or build from source with \`video-encoder-nvenc\` only. See \`LICENSE.commercial\` for the scope statement.
+
+          **Patent notice**: H.264 / H.265 patent licensing (MPEG-LA, Access Advance, Velos Media) is separate from software copyright and is the operator's responsibility in commercial deployments. See \`NOTICE\` in the \`-full\` tarball." \
+            artifacts/bilbycast-edge-${VERSION}-x86_64-linux.tar.gz \
+            artifacts/bilbycast-edge-${VERSION}-x86_64-linux.tar.gz.sha256 \
+            artifacts/bilbycast-edge-${VERSION}-aarch64-linux.tar.gz \
+            artifacts/bilbycast-edge-${VERSION}-aarch64-linux.tar.gz.sha256 \
+            artifacts/bilbycast-edge-${VERSION}-x86_64-linux-full.tar.gz \
+            artifacts/bilbycast-edge-${VERSION}-x86_64-linux-full.tar.gz.sha256 \
+            artifacts/bilbycast-edge-${VERSION}-aarch64-linux-full.tar.gz \
+            artifacts/bilbycast-edge-${VERSION}-aarch64-linux-full.tar.gz.sha256

@@ -18,9 +18,9 @@ applicable / by design.
 | **UDP**    | ✅              | ✅ (requires `audio_encode`) | ✅ | Same as SRT. |
 | **RTP**    | ✅              | ✅ (requires `audio_encode`) | ✅ | Strips source RTP framing, rewraps with fresh RFC 2250 headers. |
 | **RIST**   | ✅              | ✅ (requires `audio_encode`) | ✅ | TS-carrying; same plumbing as SRT/UDP/RTP. |
-| **RTMP**   | ✅              | ✅ (requires `audio_encode`) | ⏳ | Transcode disables the same-codec AAC passthrough fast-path. Video re-encode is Phase 4d. |
+| **RTMP**   | ✅              | ✅ (requires `audio_encode`) | ✅ | H.264 target rides classic FLV; HEVC target rides [Enhanced RTMP v2](https://veovera.org/docs/enhanced/enhanced-rtmp-v2) with FourCC `hvc1`. Transcode disables the same-codec AAC passthrough fast-path. HEVC passthrough (no `video_encode` set) also emits E-RTMP tags. |
 | **HLS**    | ✅              | ✅ (in-process remux only) | ⏳ | `video-thumbnail` feature required for transcode; subprocess fallback ignores it with a warning. |
-| **WebRTC** | ✅              | ✅ (`transcode.channels` overrides Opus channel count; unset keeps source) | ⏳ | H.264 re-encode wiring is Phase 4d. |
+| **WebRTC** | ✅              | ✅ (`transcode.channels` overrides Opus channel count; unset keeps source) | ✅ | H.264 target only (browsers do not decode HEVC); SPS/PPS emitted in-band on every IDR via `global_header = false`. HEVC sources are decoded and re-encoded to H.264 automatically. No scaling / no force-IDR on PLI yet (encoder GOP cadence drives keyframes). |
 | **ST 2110-30 / `rtp_audio`** | ✅ (auto via compressed-audio bridge) | ✅ (native PCM transcode, bit-depth + SRC + shuffle) | ❌ | Uncompressed PCM outputs; transcode is first-class here. |
 | **ST 2110-31** | ✅ | ❌ (AES3 opaque — channel labels inside SMPTE 337M payload, not addressable from the pipeline) | ❌ | |
 | **ST 2110-40** | ❌ | ❌ | ❌ | Ancillary data — no codec concept. |
@@ -199,26 +199,43 @@ See the licensing notes in the main `bilbycast-edge/CLAUDE.md`:
 
 | Backend       | Feature flag              | Library needed (Linux)       | License impact            |
 |---------------|---------------------------|------------------------------|---------------------------|
-| `x264`        | `video-encoder-x264`      | `apt install libx264-dev`    | **GPL v2+** — infects the built binary. |
-| `x265`        | `video-encoder-x265`      | `apt install libx265-dev`    | **GPL v2+** — infects the built binary. |
-| `h264_nvenc`  | `video-encoder-nvenc`     | `nv-codec-headers` + NVIDIA driver (runtime) | Royalty-free; LGPL-clean at the API layer. |
+| `x264`        | `video-encoder-x264`      | `apt install libx264-dev`    | **GPL v2+** — binary becomes AGPL-3.0-or-later combined work (see `NOTICE.full`). |
+| `x265`        | `video-encoder-x265`      | `apt install libx265-dev`    | **GPL v2+** — same implications as x264. |
+| `h264_nvenc`  | `video-encoder-nvenc`     | `nv-codec-headers` + NVIDIA driver (runtime) | Royalty-free; API-layer LGPL-compatible. No GPL bundle. |
 | `hevc_nvenc`  | `video-encoder-nvenc`     | same                         | same                      |
 
-Default release build is LGPL-clean (no video encoder backends). Runtime
-error `video encoder disabled: rebuild with …` surfaces when a config
-targets a codec whose feature flag was not enabled at build.
+Default release build has no software video encoders (AGPL-only
+binary). The composite `video-encoders-full` feature bundles all
+three encoders and is used by the GitHub Actions release workflow
+to produce the `*-linux-full` variant — see
+[`docs/installation.md`](installation.md) for the two-channel
+release model. Runtime error `video encoder disabled: rebuild with
+…` surfaces when a config targets a codec whose feature flag was
+not enabled at build.
+
+**Commercial licensing + GPL**: bilbycast-edge source is dual-licensed
+(AGPL-3.0-or-later / commercial from Softside Tech). The Softside
+commercial licence covers bilbycast source only — it cannot
+relicense libx264 or libx265, which remain GPL-2.0-or-later inside
+any binary built with those features. If you distribute under a
+commercial licence and need to avoid GPL copyleft on the encoder
+portions, either (a) ship the default variant without software video
+encoders, or (b) build with `video-encoder-nvenc` only (LGPL API
+layer; NVIDIA handles H.264/H.265 patent coverage at the hardware
+layer). See [`LICENSE.commercial`](../LICENSE.commercial) and the
+bundled `NOTICE.full` for the full scope statement.
 
 ```bash
-# Linux — x264 opt-in build
-sudo apt install libx264-dev
+# Linux — default build (no video encoders, matches *-linux release):
+cargo build --release
+
+# Linux — full build (bundles x264 + x265 + NVENC, matches *-linux-full release):
+sudo apt install libx264-dev libx265-dev nv-codec-headers
+cargo build --release --features video-encoders-full
+
+# Linux — individual opt-ins (à la carte):
 cargo build --release --features video-encoder-x264
-
-# Linux — x265 opt-in build
-sudo apt install libx265-dev
 cargo build --release --features video-encoder-x265
-
-# Linux — NVENC opt-in build (requires NVIDIA GPU at runtime)
-sudo apt install nv-codec-headers
 cargo build --release --features video-encoder-nvenc
 ```
 
@@ -268,30 +285,47 @@ commit message or release note and delete the bullet.
    its own GOP cadence, ignoring the source PES PTS alignment. This is
    fine for distribution receivers but can trip HLS segment boundaries
    once that path is wired up (Phase 4d).
-6. **No extradata injection on reconnect.** The encoder emits SPS/PPS
-   inline (`global_header: false`). If a downstream client connects
-   mid-GOP, it must wait for the next IDR. Good enough for MPEG-TS
-   contribution; not enough for some WebRTC / RTMP flows — Phase 4d
-   will switch to global_header for those transports and prepend
-   extradata to each PES.
+6. **No extradata injection on reconnect.** The TS video replacer
+   emits SPS/PPS inline (`global_header: false`). If a downstream
+   client connects mid-GOP, it must wait for the next IDR. Good
+   enough for MPEG-TS contribution and for WebRTC RTP (the RFC 6184
+   packetizer carries inline SPS/PPS per IDR natively); RTMP
+   `VideoEncoderState` already uses `global_header: true` for the
+   FLV sequence header.
 7. **PTS anchoring is simplistic.** The output stream uses the first
    source PES PTS as the anchor, then advances by `90_000 / fps` per
    emitted frame. A/V drift relative to the (still-passthrough) audio
    stream is therefore bounded by encoder buffering; sustained drift
    would need explicit PES PTS re-sync from the source.
 
+### Phase 4d — container / RTP output video_encode
+
+Each of these outputs owns its own demux + re-mux pipeline; video_encode
+plugs in via those paths rather than the TS-stream replacer.
+
+- **RTMP: done** — see `engine::output_rtmp::VideoEncoderState`. H.264
+  targets use classic FLV `VideoData`; HEVC targets use the Enhanced
+  RTMP v2 extended VideoTagHeader (FourCC `hvc1`, PacketType
+  `CodedFramesX`). The encoder is opened with `global_header = true`
+  so the FLV sequence header is built once from `VideoEncoder::extradata()`.
+- **WebRTC: done** — see `engine::output_webrtc::WebrtcVideoEncoderState`.
+  H.264-only target (WebRTC browsers do not decode HEVC; validation
+  rejects `x265` / `hevc_nvenc`). The encoder is opened with
+  `global_header = false` so SPS / PPS travel in-band on every IDR;
+  `engine::webrtc::rtp_h264::H264Packetizer` forwards them as ordinary
+  NAL units. HEVC source streams are decoded and re-encoded to H.264
+  automatically. MVP limitations: no output scaling (requested
+  width/height are logged and the source resolution is used), and
+  PLI / FIR from the receiver is still logged-and-ignored — the
+  encoder's configured GOP (default 2× fps) drives keyframe cadence.
+  Force-IDR on PLI is tracked under a follow-up.
+
 ### Deferred items (still to implement)
 
-- **Phase 4d — RTMP / HLS / WebRTC video_encode.** Each output owns
-  its own demux + re-mux pipeline; video_encode has to plug in via
-  those paths rather than the TS-stream replacer:
-  - RTMP: feed `EncodedVideoFrame` into `engine/rtmp/ts_mux.rs` or
-    directly into the FLV tag writer, passing extradata as the AVC
-    config record.
-  - HLS: slot `VideoEncoder` into the segment remuxer
-    (`engine/output_hls.rs`), align IDRs to segment boundaries.
-  - WebRTC: emit Annex-B NALUs into `engine/webrtc/rtp_h264.rs` with
-    fresh SPS/PPS packets per IDR.
+- **Phase 4d — HLS video_encode.** Slot `VideoEncoder` into the HLS
+  segment remuxer (`engine/output_hls.rs`), align IDRs to segment
+  boundaries. HLS is the only remaining output type without
+  `video_encode`.
 - **Video transcode + FEC / redundancy.** Current validation rejects
   these combinations. Lifting the restriction means running the
   replacer upstream of the FEC encoder and preserving the RTP
@@ -304,21 +338,16 @@ commit message or release note and delete the bullet.
 - **Source-driven frame-rate detection.** Parse the SPS / VPS during
   decode-warm-up and feed detected fps into the encoder before first
   frame. Avoids the default-30fps fallback above.
-- **`extradata` out-of-band for container-bound outputs.** When
-  Phase 4d lands, RTMP / WebRTC / HLS will need `global_header: true`
-  and access to `VideoEncoder::extradata()`.
+- **`extradata` out-of-band for HLS.** HLS (still deferred) needs
+  `global_header: true` and access to `VideoEncoder::extradata()`
+  for the init segment / fMP4 moov. RTMP already uses this mode;
+  WebRTC uses `global_header: false` by design (SPS/PPS in-band per
+  IDR is the standard RFC 6184 approach and handled natively by
+  `H264Packetizer`).
 - **Feature forwarding to bilbycast-manager UI.** The operator UI
   currently exposes `audio_encode` but not `video_encode`. Manager
   schema update + form rendering needed before non-CLI operators can
   configure it.
-- **Licensing gate in release pipeline.** Nightly CI currently builds
-  LGPL-clean. Once operator demand is validated we'll add a second
-  matrix entry for `--features video-encoder-x264` with a
-  prominently-labelled GPL artefact.
-- **Binary purity gate.** `testbed/check-binary-purity.sh` knows about
-  the existing C dependency set; it needs updating to recognise
-  libx264 / libx265 / NVENC as expected when the matching feature is
-  on.
 
 ### ST 2110-20 / -23 uncompressed video (Phase 2)
 
@@ -332,8 +361,9 @@ input and output edges rather than inside a TS replacer:
   the flow's broadcast channel. Configured via a **mandatory**
   `video_encode` block on the input. Validation rejects inputs with
   no encoder block; encoder backends obey the same Cargo-feature gate
-  as output `video_encode` (default LGPL-clean build cannot drive -20
-  inputs at runtime).
+  as output `video_encode` (default build without `video-encoders-full`
+  or an individual `video-encoder-*` opt-in cannot drive -20 inputs at
+  runtime).
 - **Egress (`st2110_20`, `st2110_23` outputs)** — subscribe to the
   broadcast, `TsDemuxer` → NALU mpsc → `spawn_blocking` worker running
   `VideoDecoder` + `VideoScaler::new_with_dst_format()` → pack planar
@@ -380,8 +410,9 @@ is wanted later for parity with `audio_encode`.
 - `testbed/configs/audio-encode-srt-edge.json` — exercises audio_encode
   to MP2 (SRT), AC-3 (UDP), AAC-LC 64 kbps (RTP), and video_encode to
   2 Mbps libx264 (SRT). The video output only works when the edge is
-  built with `--features video-encoder-x264`; on an LGPL-clean build
-  it logs an error and falls back to passthrough.
+  built with `--features video-encoder-x264` (or the composite
+  `--features video-encoders-full`); a default build logs an error
+  and falls back to passthrough.
 
 ## Capability advertisement (WS protocol)
 

@@ -1567,12 +1567,16 @@ pub struct RistOutputRedundancyConfig {
 
 /// RTMP/RTMPS output configuration for publishing to streaming platforms.
 ///
-/// Demuxes H.264/AAC from the MPEG-2 TS stream, muxes into FLV, and publishes
-/// via the RTMP protocol. Supports RTMPS (RTMP over TLS) via `rustls`.
+/// Demuxes H.264/HEVC and AAC from the MPEG-2 TS stream, muxes into FLV, and
+/// publishes via the RTMP protocol. Supports RTMPS (RTMP over TLS) via
+/// `rustls`. H.264 uses classic FLV `CodecID=7`; HEVC rides over
+/// [Enhanced RTMP v2](https://veovera.org/docs/enhanced/enhanced-rtmp-v2)
+/// with FourCC `hvc1` — receivers must understand E-RTMP for HEVC output.
 ///
 /// # Limitations
 /// - Output only (publish). RTMP input is not supported.
-/// - Only H.264 video and AAC audio are supported (no HEVC/VP9).
+/// - HEVC passthrough and HEVC re-encode emit E-RTMP tags; legacy FLV
+///   receivers expecting only classic AVC will not decode HEVC outputs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RtmpOutputConfig {
     /// Unique output ID within this flow.
@@ -1619,6 +1623,12 @@ pub struct RtmpOutputConfig {
     /// not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Optional video encode block (x264 / x265 / NVENC, feature-gated).
+    /// H.264 targets are packed as classic FLV VideoData; HEVC targets
+    /// emit Enhanced RTMP v2 tags (FourCC `hvc1`). When unset, video is
+    /// passed through — only H.264 passthrough is supported today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode: Option<VideoEncodeConfig>,
 }
 
 fn default_reconnect_delay() -> u64 {
@@ -1777,6 +1787,14 @@ pub struct WebrtcOutputConfig {
     /// `audio_encode` is not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Optional video encode block. When set, the output decodes the
+    /// source H.264/HEVC video, re-encodes via the selected backend
+    /// (`x264` or `h264_nvenc` — browsers do not decode HEVC), and
+    /// emits fresh RTP H.264 packets per RFC 6184 with SPS/PPS
+    /// inline on every IDR. Enables HEVC-source → WebRTC viewers and
+    /// bitrate/profile transcoding for H.264 sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode: Option<VideoEncodeConfig>,
 }
 
 /// Video encoder configuration block. Used by SRT, UDP, and RTP outputs

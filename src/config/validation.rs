@@ -28,6 +28,21 @@ use super::models::*;
 ///
 /// Returns an error describing the first validation failure encountered.
 pub fn validate_config(config: &AppConfig) -> Result<()> {
+    // Schema version gate. The current schema is v2, where inputs and outputs
+    // live in top-level `inputs` / `outputs` arrays and flows reference them
+    // by ID. Older v1 configs nested `input` and `outputs` inside each flow;
+    // serde silently ignores those unknown fields, which would produce a
+    // running flow with zero inputs/outputs and no error. Fail closed instead
+    // and tell the operator how to migrate.
+    if config.version != 2 {
+        bail!(
+            "Unsupported config schema version {} — this build requires version 2. \
+             If this is a legacy v1 config (with nested `input`/`outputs` inside flows), \
+             run `python3 testbed/quality/migrate_v1_to_v2.py` to migrate it in place.",
+            config.version
+        );
+    }
+
     // Validate monitor config if present
     if let Some(ref monitor) = config.monitor {
         let monitor_addr = format!("{}:{}", monitor.listen_addr, monitor.listen_port);
@@ -675,20 +690,27 @@ fn validate_st2110_audio_output(
         validate_red_blue_bind(red, &c.dest_addr, &format!("{label} output '{}' redundancy", c.id))?;
     }
     if let Some(ref tj) = c.transcode {
-        // Use the parent flow's upstream audio shape when available so
-        // channel-map presets are resolved against the *real* upstream
-        // channel count. Falls back to the output's own declared shape
-        // when the upstream is non-audio (e.g. RTMP/RTSP feeding the
-        // audio_decode bridge — runtime resolves the actual format then).
-        let (in_sr, in_bd, in_ch) = upstream_audio
-            .unwrap_or((c.sample_rate, c.bit_depth, c.channels));
-        validate_transcode_block(
-            tj,
-            in_sr,
-            in_bd,
-            in_ch,
-            &format!("{label} output '{}' transcode", c.id),
-        )?;
+        // When the parent flow's upstream audio shape is known, validate
+        // channel-map presets against the *real* upstream channel count.
+        // When the upstream isn't known (standalone output validation, or
+        // upstream is non-audio like RTMP/RTSP feeding the audio_decode
+        // bridge), fall back to the deferred validator: range checks only,
+        // skip the input-shape-dependent preset/matrix checks. Those run
+        // again at flow-resolution time when the upstream is bound.
+        if let Some((in_sr, in_bd, in_ch)) = upstream_audio {
+            validate_transcode_block(
+                tj,
+                in_sr,
+                in_bd,
+                in_ch,
+                &format!("{label} output '{}' transcode", c.id),
+            )?;
+        } else {
+            validate_transcode_block_deferred(
+                tj,
+                &format!("{label} output '{}' transcode", c.id),
+            )?;
+        }
     }
     if let Some(idx) = c.audio_track_index {
         if idx > 15 {
@@ -1135,17 +1157,25 @@ fn validate_rtp_audio_output(
         validate_red_blue_bind(red, &c.dest_addr, &format!("rtp_audio output '{}' redundancy", c.id))?;
     }
     if let Some(ref tj) = c.transcode {
-        // See st2110_audio_output: prefer the parent flow's upstream shape
-        // when known so channel-map presets resolve against the real input.
-        let (in_sr, in_bd, in_ch) = upstream_audio
-            .unwrap_or((c.sample_rate, c.bit_depth, c.channels));
-        validate_transcode_block(
-            tj,
-            in_sr,
-            in_bd,
-            in_ch,
-            &format!("rtp_audio output '{}' transcode", c.id),
-        )?;
+        // See st2110_audio_output: when the upstream input is known via the
+        // flow context, validate the matrix shape against the *real* input
+        // channel count. Otherwise defer the input-shape-dependent checks
+        // until flow resolution — falling back to the output's own channel
+        // count silently rejects valid configs (e.g. stereo→mono presets).
+        if let Some((in_sr, in_bd, in_ch)) = upstream_audio {
+            validate_transcode_block(
+                tj,
+                in_sr,
+                in_bd,
+                in_ch,
+                &format!("rtp_audio output '{}' transcode", c.id),
+            )?;
+        } else {
+            validate_transcode_block_deferred(
+                tj,
+                &format!("rtp_audio output '{}' transcode", c.id),
+            )?;
+        }
     }
     if let Some(idx) = c.audio_track_index {
         if idx > 15 {
@@ -1376,6 +1406,31 @@ fn validate_video_encode(
             "{context}: video_encode.codec '{other}' is not recognised; \
              expected one of x264, x265, h264_nvenc, hevc_nvenc"
         ),
+    }
+    // Reject codecs whose backend wasn't compiled into this build. Runtime
+    // would surface a Critical event and passthrough the video anyway, but
+    // that's confusing UX — catch it here so the manager's command_ack
+    // carries a human-readable "rebuild with ..." message straight into
+    // the modal error banner.
+    let backend_feature: Option<&'static str> = match enc.codec.as_str() {
+        "x264" => {
+            if cfg!(feature = "video-encoder-x264") { None } else { Some("video-encoder-x264") }
+        }
+        "x265" => {
+            if cfg!(feature = "video-encoder-x265") { None } else { Some("video-encoder-x265") }
+        }
+        "h264_nvenc" | "hevc_nvenc" => {
+            if cfg!(feature = "video-encoder-nvenc") { None } else { Some("video-encoder-nvenc") }
+        }
+        _ => None,
+    };
+    if let Some(feat) = backend_feature {
+        bail!(
+            "{context}: video_encode.codec '{codec}' requires this edge to be built \
+             with the `{feat}` Cargo feature; rebuild the edge or pick a codec whose \
+             backend is compiled in",
+            codec = enc.codec,
+        );
     }
     if let Some(w) = enc.width {
         if !(64..=7680).contains(&w) {
@@ -1843,6 +1898,9 @@ pub fn validate_output_with_input(
                     &format!("RTMP output '{}' transcode", rtmp.id),
                 )?;
             }
+            if let Some(ref enc) = rtmp.video_encode {
+                validate_video_encode(enc, &format!("RTMP output '{}'", rtmp.id))?;
+            }
         }
         OutputConfig::Hls(hls) => {
             validate_id(&hls.id, "HLS output")?;
@@ -1962,6 +2020,23 @@ pub fn validate_output_with_input(
                 validate_transcode_block_deferred(
                     tj,
                     &format!("WebRTC output '{}' transcode", webrtc.id),
+                )?;
+            }
+            if let Some(ref ve) = webrtc.video_encode {
+                // Reject HEVC encoders *before* the generic validator so
+                // operators don't get a misleading "rebuild with x265"
+                // suggestion — WebRTC browsers can't decode HEVC at all,
+                // so rebuilding wouldn't help.
+                match ve.codec.as_str() {
+                    "x265" | "hevc_nvenc" => bail!(
+                        "WebRTC output '{}': video_encode.codec '{}' is not supported — WebRTC browsers only decode H.264 (use 'x264' or 'h264_nvenc')",
+                        webrtc.id, ve.codec,
+                    ),
+                    _ => {}
+                }
+                validate_video_encode(
+                    ve,
+                    &format!("WebRTC output '{}'", webrtc.id),
                 )?;
             }
         }
@@ -3793,6 +3868,7 @@ mod tests {
                 channels: None,
             }),
             transcode: None,
+            video_encode: None,
         });
         assert!(validate_output(&make("aac_lc")).is_ok());
         assert!(validate_output(&make("he_aac_v1")).is_ok());
@@ -3910,6 +3986,7 @@ mod tests {
                 channels: None,
             }),
             transcode: None,
+            video_encode: None,
         });
         // Opus + audio MID negotiated → OK.
         assert!(validate_output(&make("opus", false)).is_ok());
@@ -3918,6 +3995,58 @@ mod tests {
         assert!(err.contains("video_only=false"), "got: {err}");
         // AAC on WebRTC → must reject.
         assert!(validate_output(&make("aac_lc", false)).is_err());
+    }
+
+    #[test]
+    fn validate_output_webrtc_video_encode_rejects_hevc() {
+        // WebRTC browsers don't decode HEVC; the validator must reject
+        // H.265-targeting encoders so operators get a clear error at
+        // save time rather than a silently-broken viewer.
+        use crate::config::models::{
+            OutputConfig, VideoEncodeConfig, WebrtcOutputConfig, WebrtcOutputMode,
+        };
+        let make = |codec: &str| OutputConfig::Webrtc(WebrtcOutputConfig {
+            active: true,
+            group: None,
+            id: "wrtc1".into(),
+            name: "wrtc 1".into(),
+            mode: WebrtcOutputMode::WhepServer,
+            whip_url: None,
+            bearer_token: None,
+            max_viewers: Some(10),
+            public_ip: None,
+            video_only: false,
+            program_number: None,
+            audio_encode: None,
+            transcode: None,
+            video_encode: Some(VideoEncodeConfig {
+                codec: codec.into(),
+                width: None,
+                height: None,
+                fps_num: None,
+                fps_den: None,
+                bitrate_kbps: Some(4000),
+                gop_size: None,
+                preset: None,
+                profile: None,
+            }),
+        });
+        // H.264 backends are accepted only when the feature is compiled
+        // in; on the default build this still passes through `validate_video_encode`
+        // cleanly when the backend matches the compile-time features.
+        // The HEVC rejection is purely a WebRTC rule, so we can exercise
+        // it regardless of which backend features are enabled — the HEVC
+        // rule triggers before backend-feature validation.
+        let err = validate_output(&make("x265")).unwrap_err().to_string();
+        assert!(
+            err.contains("WebRTC browsers only decode H.264"),
+            "expected HEVC rejection, got: {err}"
+        );
+        let err = validate_output(&make("hevc_nvenc")).unwrap_err().to_string();
+        assert!(
+            err.contains("WebRTC browsers only decode H.264"),
+            "expected HEVC rejection, got: {err}"
+        );
     }
 
     // ── Port conflict tests ──────────────────────────────────────────

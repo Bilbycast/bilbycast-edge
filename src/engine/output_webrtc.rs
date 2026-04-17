@@ -21,6 +21,10 @@ use crate::stats::collector::OutputStatsAccumulator;
 use super::audio_decode::{AacDecoder, DecodeStats, sample_rate_from_index};
 #[cfg(feature = "webrtc")]
 use super::audio_encode::{AudioCodec, AudioEncoder, AudioEncoderError, EncoderParams};
+#[cfg(all(feature = "webrtc", feature = "video-thumbnail"))]
+use super::ts_video_replace::VideoEncodeStats;
+#[cfg(feature = "webrtc")]
+use crate::config::models::VideoEncodeConfig;
 use super::packet::RtpPacket;
 
 /// Per-output encoder state for the WebRTC audio_encode bridge. Mirrors the
@@ -51,6 +55,452 @@ enum WebrtcEncoderState {
     Failed,
 }
 
+/// Per-WebRTC-session video transcoding state. Parallels
+/// [`WebrtcEncoderState`] but for video: opens the decoder+encoder on
+/// the first video access unit and transitions to `Active` for the
+/// rest of the session. RTMP's `VideoEncoderState` is the closest
+/// analogue, except RTMP builds an out-of-band FLV sequence header
+/// (`global_header = true`) while WebRTC emits SPS/PPS inline on every
+/// IDR (`global_header = false`) so H264Packetizer can feed them into
+/// RTP as ordinary NAL units.
+#[cfg(feature = "webrtc")]
+enum WebrtcVideoEncoderState {
+    /// `video_encode` unset. Passthrough H.264, drop HEVC (pre-Phase 4d).
+    Disabled,
+    /// `video_encode` set; decoder+encoder will be built on the first
+    /// source access unit.
+    #[cfg(feature = "video-thumbnail")]
+    Lazy { cfg: VideoEncodeConfig },
+    /// Decode → re-encode pipeline is live.
+    #[cfg(feature = "video-thumbnail")]
+    Active(Box<WebrtcVideoActive>),
+    /// Decoder or encoder construction failed once. Drop video for the
+    /// rest of the session's lifetime.
+    Failed,
+}
+
+#[cfg(all(feature = "webrtc", feature = "video-thumbnail"))]
+struct WebrtcVideoActive {
+    decoder: video_engine::VideoDecoder,
+    /// Opened on the first decoded frame so we can pick up the source
+    /// resolution when the operator didn't specify one.
+    encoder: Option<video_engine::VideoEncoder>,
+    backend: video_codec::VideoEncoderCodec,
+    requested_width: Option<u32>,
+    requested_height: Option<u32>,
+    fps_num: Option<u32>,
+    fps_den: Option<u32>,
+    bitrate_kbps: u32,
+    gop_size: Option<u32>,
+    preset: video_codec::VideoPreset,
+    profile: video_codec::VideoProfile,
+    /// Monotonic PTS counter in encoder time base. We pass the source
+    /// 90 kHz PTS to `write_media` for correct lip-sync, but the encoder
+    /// itself gets a monotonic `out_frame_count` so libx264 / NVENC rate
+    /// control behaves predictably.
+    out_frame_count: i64,
+    stats: Arc<VideoEncodeStats>,
+}
+
+/// Resolve a `video_encode.codec` string into a [`VideoEncoderCodec`] for
+/// WebRTC. Only H.264 backends are allowed; validation rejects HEVC at
+/// config-load, but guard against it at runtime too.
+#[cfg(all(feature = "webrtc", feature = "video-thumbnail"))]
+fn resolve_webrtc_video_backend(
+    codec: &str,
+    output_id: &str,
+    flow_id: &str,
+    event_sender: &EventSender,
+) -> Option<video_codec::VideoEncoderCodec> {
+    match codec {
+        "x264" => Some(video_codec::VideoEncoderCodec::X264),
+        "h264_nvenc" => Some(video_codec::VideoEncoderCodec::H264Nvenc),
+        other => {
+            let msg = format!(
+                "WebRTC output '{}': video_encode codec '{other}' not supported — WebRTC browsers only decode H.264",
+                output_id
+            );
+            tracing::error!("{msg}");
+            event_sender.emit_flow(
+                EventSeverity::Critical,
+                category::VIDEO_ENCODE,
+                msg,
+                flow_id,
+            );
+            None
+        }
+    }
+}
+
+#[cfg(all(feature = "webrtc", feature = "video-thumbnail"))]
+fn resolve_webrtc_video_preset(s: Option<&str>) -> video_codec::VideoPreset {
+    match s {
+        Some("ultrafast") => video_codec::VideoPreset::Ultrafast,
+        Some("superfast") => video_codec::VideoPreset::Superfast,
+        Some("veryfast") => video_codec::VideoPreset::Veryfast,
+        Some("faster") => video_codec::VideoPreset::Faster,
+        Some("fast") => video_codec::VideoPreset::Fast,
+        Some("slow") => video_codec::VideoPreset::Slow,
+        Some("slower") => video_codec::VideoPreset::Slower,
+        Some("veryslow") => video_codec::VideoPreset::Veryslow,
+        _ => video_codec::VideoPreset::Medium,
+    }
+}
+
+#[cfg(all(feature = "webrtc", feature = "video-thumbnail"))]
+fn resolve_webrtc_video_profile(s: Option<&str>) -> video_codec::VideoProfile {
+    match s {
+        Some("baseline") => video_codec::VideoProfile::Baseline,
+        Some("main") => video_codec::VideoProfile::Main,
+        Some("high") => video_codec::VideoProfile::High,
+        _ => video_codec::VideoProfile::Auto,
+    }
+}
+
+/// Initialise the per-session video encoder state. Called once per WHEP
+/// viewer loop / WHIP client loop at startup. Returns `Disabled` when
+/// `video_encode` is unset so the hot path can passthrough H.264 without
+/// any extra branches.
+#[cfg(feature = "webrtc")]
+fn init_webrtc_video_encoder_state(
+    video_encode: Option<&VideoEncodeConfig>,
+) -> WebrtcVideoEncoderState {
+    match video_encode {
+        None => WebrtcVideoEncoderState::Disabled,
+        #[cfg(feature = "video-thumbnail")]
+        Some(cfg) => WebrtcVideoEncoderState::Lazy { cfg: cfg.clone() },
+        #[cfg(not(feature = "video-thumbnail"))]
+        Some(_) => WebrtcVideoEncoderState::Failed,
+    }
+}
+
+/// Open the decoder+stats for a WebRTC video_encode pipeline and flip
+/// the state into `Active`. Mirrors RTMP's `open_video_active` but
+/// specialised to WebRTC's H.264-only output constraint.
+#[cfg(all(feature = "webrtc", feature = "video-thumbnail"))]
+fn open_webrtc_video_active(
+    cfg: &VideoEncodeConfig,
+    source_is_h264: bool,
+    output_id: &str,
+    flow_id: &str,
+    output_stats: &Arc<OutputStatsAccumulator>,
+    event_sender: &EventSender,
+) -> WebrtcVideoEncoderState {
+    let Some(backend) = resolve_webrtc_video_backend(&cfg.codec, output_id, flow_id, event_sender)
+    else {
+        return WebrtcVideoEncoderState::Failed;
+    };
+    let source_codec = if source_is_h264 {
+        video_codec::VideoCodec::H264
+    } else {
+        video_codec::VideoCodec::Hevc
+    };
+    let decoder = match video_engine::VideoDecoder::open(source_codec) {
+        Ok(d) => d,
+        Err(e) => {
+            let msg = format!(
+                "WebRTC output '{}': video_encode failed to open decoder for {:?}: {e}",
+                output_id, source_codec
+            );
+            tracing::error!("{msg}");
+            event_sender.emit_flow(
+                EventSeverity::Critical,
+                category::VIDEO_ENCODE,
+                msg,
+                flow_id,
+            );
+            return WebrtcVideoEncoderState::Failed;
+        }
+    };
+    let stats_handle = Arc::new(VideoEncodeStats::default());
+    let backend_tag = match backend {
+        video_codec::VideoEncoderCodec::X264 => "x264",
+        video_codec::VideoEncoderCodec::H264Nvenc => "nvenc",
+        _ => "unknown",
+    };
+    output_stats.set_video_encode_stats(
+        stats_handle.clone(),
+        String::new(),
+        "h264".to_string(),
+        cfg.width.unwrap_or(0),
+        cfg.height.unwrap_or(0),
+        match (cfg.fps_num, cfg.fps_den) {
+            (Some(n), Some(d)) if d > 0 => n as f32 / d as f32,
+            _ => 0.0,
+        },
+        cfg.bitrate_kbps.unwrap_or(4000),
+        backend_tag.to_string(),
+    );
+    tracing::info!(
+        "WebRTC output '{}': video_encode active ({} @ {} kbps, source {:?})",
+        output_id,
+        backend_tag,
+        cfg.bitrate_kbps.unwrap_or(4000),
+        source_codec,
+    );
+    event_sender.emit_flow(
+        EventSeverity::Info,
+        category::VIDEO_ENCODE,
+        format!("Video encoder started: output '{}'", output_id),
+        flow_id,
+    );
+    WebrtcVideoEncoderState::Active(Box::new(WebrtcVideoActive {
+        decoder,
+        encoder: None,
+        backend,
+        requested_width: cfg.width,
+        requested_height: cfg.height,
+        fps_num: cfg.fps_num,
+        fps_den: cfg.fps_den,
+        bitrate_kbps: cfg.bitrate_kbps.unwrap_or(4000),
+        gop_size: cfg.gop_size,
+        preset: resolve_webrtc_video_preset(cfg.preset.as_deref()),
+        profile: resolve_webrtc_video_profile(cfg.profile.as_deref()),
+        out_frame_count: 0,
+        stats: stats_handle,
+    }))
+}
+
+/// Concatenate source NAL units (no start codes) back into an Annex-B
+/// byte stream suitable for `VideoDecoder::send_packet`.
+#[cfg(all(feature = "webrtc", feature = "video-thumbnail"))]
+fn nalus_to_annex_b_webrtc(nalus: &[Vec<u8>]) -> Vec<u8> {
+    let total: usize = nalus.iter().map(|n| 4 + n.len()).sum();
+    let mut out = Vec::with_capacity(total);
+    for nalu in nalus {
+        out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        out.extend_from_slice(nalu);
+    }
+    out
+}
+
+/// Push one source access unit through the decoder + encoder and return
+/// the encoder's Annex-B output (with any emitted SPS/PPS inline on
+/// IDRs). Flips `video_state` to `Failed` on a terminal error; returns
+/// an empty vec while the encoder opens (same convention as RTMP).
+#[cfg(all(feature = "webrtc", feature = "video-thumbnail"))]
+fn encode_one_video_frame_webrtc(
+    video_state: &mut WebrtcVideoEncoderState,
+    nalus: &[Vec<u8>],
+    output_id: &str,
+) -> Vec<Vec<u8>> {
+    let active = match video_state {
+        WebrtcVideoEncoderState::Active(a) => a,
+        _ => return Vec::new(),
+    };
+    let annex_b = nalus_to_annex_b_webrtc(nalus);
+    let block_result: Result<Vec<Vec<u8>>, String> = tokio::task::block_in_place(|| -> Result<Vec<Vec<u8>>, String> {
+        active.stats.input_frames.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = active.decoder.send_packet(&annex_b) {
+            tracing::debug!("WebRTC output '{}': decoder send_packet: {e:?}", output_id);
+        }
+        let mut out = Vec::new();
+        loop {
+            let frame = match active.decoder.receive_frame() {
+                Ok(f) => f,
+                Err(_) => break,
+            };
+            if active.encoder.is_none() {
+                let src_w = frame.width();
+                let src_h = frame.height();
+                if let (Some(rw), Some(rh)) = (active.requested_width, active.requested_height) {
+                    if rw != src_w || rh != src_h {
+                        tracing::warn!(
+                            "WebRTC output '{}': video_encode resolution change {}x{} -> {}x{} requested \
+                             but scaling is not implemented yet; using source resolution",
+                            output_id, src_w, src_h, rw, rh
+                        );
+                    }
+                }
+                let (fps_num, fps_den) = match (active.fps_num, active.fps_den) {
+                    (Some(n), Some(d)) => (n, d),
+                    _ => (30, 1),
+                };
+                let gop_size = active.gop_size.unwrap_or(fps_num.max(1) * 2);
+                let enc_cfg = video_codec::VideoEncoderConfig {
+                    codec: active.backend,
+                    width: src_w,
+                    height: src_h,
+                    fps_num,
+                    fps_den,
+                    bitrate_kbps: active.bitrate_kbps,
+                    gop_size,
+                    preset: active.preset,
+                    profile: active.profile,
+                    // WebRTC has no out-of-band codec-config channel;
+                    // emit SPS/PPS in-band on every IDR so late-joining
+                    // browsers can decode as soon as they see a keyframe.
+                    global_header: false,
+                };
+                let enc = match video_engine::VideoEncoder::open(&enc_cfg) {
+                    Ok(e) => e,
+                    Err(e) => return Err(format!("encoder open failed: {e}")),
+                };
+                active.encoder = Some(enc);
+            }
+            let (y, y_s, u, u_s, v, v_s) = match frame.yuv_planes() {
+                Some(p) => p,
+                None => continue,
+            };
+            let enc = active.encoder.as_mut().unwrap();
+            let encoded_frames = match enc.encode_frame(
+                y, y_s, u, u_s, v, v_s,
+                Some(active.out_frame_count),
+            ) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    tracing::debug!("WebRTC output '{}': encode error: {e}", output_id);
+                    active.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            active.out_frame_count += 1;
+            for ef in encoded_frames {
+                out.push(ef.data);
+                active.stats.output_frames.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(out)
+    });
+
+    // Only encoder *open* failure flips us to Failed. Decoder priming
+    // (no frames produced yet on the first few input access units)
+    // returns Ok(vec![]) — keep state Active and try again next frame.
+    match block_result {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::error!("WebRTC output '{}': video_encode: {e}", output_id);
+            *video_state = WebrtcVideoEncoderState::Failed;
+            Vec::new()
+        }
+    }
+}
+
+/// Handle one demuxed video access unit: passthrough H.264, encode HEVC
+/// (or H.264 if `video_encode` is set), then RFC 6184 packetize and hand
+/// to str0m. Shared by the WHIP client loop and the WHEP per-viewer loop.
+///
+/// `source_is_h264` distinguishes the source codec; HEVC sources without
+/// `video_encode` are dropped here (pre-Phase 4d behaviour). With
+/// `video_encode`, both source codecs are decoded and re-encoded as
+/// H.264 so every WebRTC browser can decode the output.
+#[cfg(feature = "webrtc")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_webrtc_video_frame(
+    source_is_h264: bool,
+    nalus: &[Vec<u8>],
+    pts: u64,
+    recv_time_us: u64,
+    video_state: &mut WebrtcVideoEncoderState,
+    session: &mut super::webrtc::session::WebrtcSession,
+    video_mid: str0m::media::Mid,
+    video_pt: str0m::media::Pt,
+    stats: &Arc<OutputStatsAccumulator>,
+    output_id: &str,
+    #[cfg_attr(not(feature = "video-thumbnail"), allow(unused_variables))]
+    flow_id: &str,
+    #[cfg_attr(not(feature = "video-thumbnail"), allow(unused_variables))]
+    events: &EventSender,
+) {
+    use super::webrtc::rtp_h264::H264Packetizer;
+    use str0m::media::{Frequency, MediaTime};
+    use std::time::Instant;
+
+    // Disabled + HEVC source → drop (pre-Phase 4d behaviour).
+    if matches!(video_state, WebrtcVideoEncoderState::Disabled) && !source_is_h264 {
+        return;
+    }
+    // Failed → drop video for the rest of the session.
+    if matches!(video_state, WebrtcVideoEncoderState::Failed) {
+        return;
+    }
+
+    // Lazy-open the decoder + encoder scaffolding on the first video
+    // access unit. Falls through to the encode path on the same frame.
+    #[cfg(feature = "video-thumbnail")]
+    if matches!(video_state, WebrtcVideoEncoderState::Lazy { .. }) {
+        let cfg = match video_state {
+            WebrtcVideoEncoderState::Lazy { cfg } => cfg.clone(),
+            _ => unreachable!(),
+        };
+        *video_state = open_webrtc_video_active(
+            &cfg, source_is_h264, output_id, flow_id, stats, events,
+        );
+        if matches!(video_state, WebrtcVideoEncoderState::Failed) {
+            return;
+        }
+    }
+
+    // Decide the final NALU stream to packetize — either the source
+    // NALUs (passthrough) or the encoder's Annex-B output split back
+    // into NAL units.
+    //
+    // `owned` keeps the encoder-produced NALUs alive when we go down the
+    // encode path; `send_nalus` borrows either from `nalus` (passthrough)
+    // or from `owned`.
+    let owned: Vec<Vec<u8>>;
+    let send_nalus: &[Vec<u8>];
+
+    #[cfg(feature = "video-thumbnail")]
+    {
+        if matches!(video_state, WebrtcVideoEncoderState::Active(_)) {
+            let encoded = encode_one_video_frame_webrtc(video_state, nalus, output_id);
+            if matches!(video_state, WebrtcVideoEncoderState::Failed) {
+                return;
+            }
+            if encoded.is_empty() {
+                // Encoder still priming — no output yet.
+                return;
+            }
+            let mut collected: Vec<Vec<u8>> = Vec::new();
+            for annex_b in &encoded {
+                let mut parts = super::ts_demux::split_annex_b_nalus(annex_b);
+                collected.append(&mut parts);
+            }
+            if collected.is_empty() {
+                return;
+            }
+            owned = collected;
+            send_nalus = &owned;
+        } else {
+            send_nalus = nalus;
+            owned = Vec::new();
+            let _ = &owned;
+        }
+    }
+
+    #[cfg(not(feature = "video-thumbnail"))]
+    {
+        send_nalus = nalus;
+        owned = Vec::new();
+        let _ = &owned;
+    }
+
+    let nalu_count = send_nalus.len();
+    for (i, nalu) in send_nalus.iter().enumerate() {
+        let is_last = i == nalu_count - 1;
+        let rtp_payloads = H264Packetizer::packetize(nalu, is_last);
+        for rtp_payload in &rtp_payloads {
+            let media_time = MediaTime::new(pts, Frequency::NINETY_KHZ);
+            if let Err(e) = session.write_media(
+                video_mid,
+                video_pt,
+                Instant::now(),
+                media_time,
+                &rtp_payload.data,
+            ) {
+                tracing::debug!("WebRTC output '{}' write error: {}", output_id, e);
+            }
+            // str0m requires poll_output between consecutive writes —
+            // drain or the next write_media is silently rejected.
+            session.drain_outputs().await;
+            stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+            stats.bytes_sent.fetch_add(rtp_payload.data.len() as u64, Ordering::Relaxed);
+            stats.record_latency(recv_time_us);
+        }
+    }
+}
+
 /// Spawn a WebRTC output task (WHIP client or WHEP server depending on config mode).
 ///
 /// For WHEP server mode, `session_rx` must be provided — it receives SDP offers
@@ -72,7 +522,7 @@ pub fn spawn_webrtc_output(
 
     output_stats.set_egress_static(crate::stats::collector::EgressMediaSummaryStatic {
         transport_mode: Some("webrtc".to_string()),
-        video_passthrough: true,
+        video_passthrough: config.video_encode.is_none(),
         audio_passthrough: config.audio_encode.is_none(),
         audio_only: false,
     });
@@ -237,6 +687,7 @@ async fn whep_server_loop(
         let viewer_audio_encode = config.audio_encode.clone();
         let viewer_transcode = config.transcode.clone();
         let viewer_compressed = compressed_audio_input;
+        let viewer_video_encode = config.video_encode.clone();
 
         tokio::spawn(async move {
             whep_viewer_loop(
@@ -253,6 +704,7 @@ async fn whep_server_loop(
                 viewer_audio_encode,
                 viewer_transcode,
                 viewer_compressed,
+                viewer_video_encode,
             ).await;
         });
     }
@@ -276,10 +728,10 @@ async fn whep_viewer_loop(
     audio_encode: Option<crate::config::models::AudioEncodeConfig>,
     transcode: Option<super::audio_transcode::TranscodeJson>,
     compressed_audio_input: bool,
+    video_encode: Option<VideoEncodeConfig>,
 ) {
     use super::ts_parse::strip_rtp_header;
     use super::webrtc::ts_demux::TsDemuxer;
-    use super::webrtc::rtp_h264::H264Packetizer;
     use super::webrtc::session::SessionEvent;
     use str0m::media::MediaTime;
     use std::time::Instant;
@@ -340,12 +792,13 @@ async fn whep_viewer_loop(
         } else {
             WebrtcEncoderState::Disabled
         };
+    let mut video_encoder_state: WebrtcVideoEncoderState =
+        init_webrtc_video_encoder_state(video_encode.as_ref());
 
     // Send loop: demux TS → packetize H.264 → send via str0m.
     // Also processes incoming RTCP/STUN via drive_udp_io() to keep
     // the session alive (same pattern as whip_client_loop).
     let mut demuxer = TsDemuxer::new(program_number);
-    let mut rtp_seq: u16 = 0;
 
     loop {
         tokio::select! {
@@ -362,27 +815,36 @@ async fn whep_viewer_loop(
                         for frame in frames {
                             match frame {
                                 super::webrtc::ts_demux::DemuxedFrame::H264 { nalus, pts, .. } => {
-                                    let nalu_count = nalus.len();
-                                    for (i, nalu) in nalus.iter().enumerate() {
-                                        let is_last = i == nalu_count - 1;
-                                        let rtp_payloads = H264Packetizer::packetize(nalu, is_last);
-                                        for rtp_payload in &rtp_payloads {
-                                            let media_time = MediaTime::new(pts, str0m::media::Frequency::NINETY_KHZ);
-                                            if let Err(e) = session.write_media(
-                                                video_mid,
-                                                video_pt,
-                                                Instant::now(),
-                                                media_time,
-                                                &rtp_payload.data,
-                                            ) {
-                                                tracing::debug!("WHEP viewer '{}' write error: {}", session_id, e);
-                                            }
-                                            stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                            stats.bytes_sent.fetch_add(rtp_payload.data.len() as u64, Ordering::Relaxed);
-                                            stats.record_latency(recv_time_us);
-                                            rtp_seq = rtp_seq.wrapping_add(1);
-                                        }
-                                    }
+                                    handle_webrtc_video_frame(
+                                        true,
+                                        &nalus,
+                                        pts,
+                                        recv_time_us,
+                                        &mut video_encoder_state,
+                                        &mut session,
+                                        video_mid,
+                                        video_pt,
+                                        &stats,
+                                        output_id,
+                                        flow_id,
+                                        events,
+                                    ).await;
+                                }
+                                super::webrtc::ts_demux::DemuxedFrame::H265 { nalus, pts, .. } => {
+                                    handle_webrtc_video_frame(
+                                        false,
+                                        &nalus,
+                                        pts,
+                                        recv_time_us,
+                                        &mut video_encoder_state,
+                                        &mut session,
+                                        video_mid,
+                                        video_pt,
+                                        &stats,
+                                        output_id,
+                                        flow_id,
+                                        events,
+                                    ).await;
                                 }
                                 super::webrtc::ts_demux::DemuxedFrame::Opus => {
                                     // TODO: handle native Opus passthrough
@@ -451,6 +913,7 @@ async fn whep_viewer_loop(
                                                     session_id, e
                                                 );
                                             }
+                                            session.drain_outputs().await;
                                             stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                                             stats.bytes_sent.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
                                             stats.record_latency(recv_time_us);
@@ -499,7 +962,6 @@ async fn whip_client_loop(
     use super::ts_parse::strip_rtp_header;
     use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
     use super::webrtc::ts_demux::TsDemuxer;
-    use super::webrtc::rtp_h264::H264Packetizer;
     use str0m::media::MediaTime;
 
     let whip_url = match &config.whip_url {
@@ -636,6 +1098,8 @@ async fn whip_client_loop(
             } else {
                 WebrtcEncoderState::Disabled
             };
+        let mut video_encoder_state: WebrtcVideoEncoderState =
+            init_webrtc_video_encoder_state(config.video_encode.as_ref());
 
         // Send loop: demux TS → packetize H.264 → send via str0m.
         //
@@ -644,7 +1108,6 @@ async fn whip_client_loop(
         // the remote peer never receives RTCP feedback, timers expire,
         // and the session silently dies.
         let mut demuxer = TsDemuxer::new(config.program_number);
-        let mut rtp_seq: u16 = 0;
 
         loop {
             tokio::select! {
@@ -661,27 +1124,36 @@ async fn whip_client_loop(
                             for frame in frames {
                                 match frame {
                                     super::webrtc::ts_demux::DemuxedFrame::H264 { nalus, pts, .. } => {
-                                        let nalu_count = nalus.len();
-                                        for (i, nalu) in nalus.iter().enumerate() {
-                                            let is_last = i == nalu_count - 1;
-                                            let rtp_payloads = H264Packetizer::packetize(nalu, is_last);
-                                            for rtp_payload in &rtp_payloads {
-                                                let media_time = MediaTime::new(pts, str0m::media::Frequency::NINETY_KHZ);
-                                                if let Err(e) = session.write_media(
-                                                    video_mid,
-                                                    video_pt,
-                                                    Instant::now(),
-                                                    media_time,
-                                                    &rtp_payload.data,
-                                                ) {
-                                                    tracing::debug!("WHIP write error: {}", e);
-                                                }
-                                                stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                                stats.bytes_sent.fetch_add(rtp_payload.data.len() as u64, Ordering::Relaxed);
-                                                stats.record_latency(recv_time_us);
-                                                rtp_seq = rtp_seq.wrapping_add(1);
-                                            }
-                                        }
+                                        handle_webrtc_video_frame(
+                                            true,
+                                            &nalus,
+                                            pts,
+                                            recv_time_us,
+                                            &mut video_encoder_state,
+                                            &mut session,
+                                            video_mid,
+                                            video_pt,
+                                            &stats,
+                                            &config.id,
+                                            flow_id,
+                                            events,
+                                        ).await;
+                                    }
+                                    super::webrtc::ts_demux::DemuxedFrame::H265 { nalus, pts, .. } => {
+                                        handle_webrtc_video_frame(
+                                            false,
+                                            &nalus,
+                                            pts,
+                                            recv_time_us,
+                                            &mut video_encoder_state,
+                                            &mut session,
+                                            video_mid,
+                                            video_pt,
+                                            &stats,
+                                            &config.id,
+                                            flow_id,
+                                            events,
+                                        ).await;
                                     }
                                     super::webrtc::ts_demux::DemuxedFrame::Opus => {
                                         // Native Opus passthrough not yet implemented
@@ -746,6 +1218,7 @@ async fn whip_client_loop(
                                                         "WHIP audio write error: {}", e
                                                     );
                                                 }
+                                                session.drain_outputs().await;
                                                 stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                                                 stats.bytes_sent.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
                                                 stats.record_latency(recv_time_us);

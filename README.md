@@ -231,6 +231,30 @@ Options:
 - [API Security](docs/api-security.md) — TLS, JWT, RBAC, ingress filters
 - [Architecture](docs/architecture.md) — internal structure of the edge process
 
-## License
+## Licensing
 
-This project is licensed under the [Elastic License 2.0](LICENSE). For use cases not covered by ELv2 (OEM, managed services, resale), a commercial license is available from Softside Tech Pty Ltd — contact admin@softsidetech.com.
+bilbycast-edge is **dual-licensed**:
+
+- **AGPL-3.0-or-later** for open-source users — free for review, private use, small-scale deployment, and any use where you are comfortable releasing the source of your modifications and any network service built on top of bilbycast under AGPL terms. See [LICENSE](LICENSE).
+- **Commercial licence** from Softside Tech Pty Ltd for OEMs, hardware integrators, SaaS providers, and commercial customers who need to ship bilbycast inside a closed-source product or operate it as a network service without AGPL § 13's source-release obligation. Contact **commercial@softsidetech.com** for terms. See [LICENSE.commercial](LICENSE.commercial).
+
+AGPL's network-copyleft (§ 13) means that if you modify bilbycast and run it as a service accessed by users over a network, those users must be able to obtain the complete corresponding source of your modified version. The commercial licence removes that obligation.
+
+Contributions are accepted under the Developer Certificate of Origin — see [DCO.md](DCO.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Choosing a release binary
+
+Two variants are published on each tagged release, for Linux x86_64 and Linux ARM64:
+
+| Variant      | When to use                                       | Binary licence       |
+|--------------|---------------------------------------------------|----------------------|
+| `*-default`  | No H.264/H.265 transcoding needed                  | AGPL-3.0-or-later    |
+| `*-full`     | You need H.264/H.265 transcoding out of the box   | AGPL-3.0-or-later combined work (bundles libx264 + libx265 under GPL-2.0-or-later; see `NOTICE.full` inside the tarball) |
+
+The `*-full` binary also includes NVENC support for NVIDIA hardware — select `codec: "h264_nvenc"` / `"hevc_nvenc"` in your flow config when running on an NVIDIA host; x264/x265 handle everything else.
+
+See [docs/installation.md](docs/installation.md) for download and install instructions per OS.
+
+**Commercial-licence customers**: a Softside Tech commercial licence covers the bilbycast source only — it cannot relicense libx264 / libx265, which remain GPL-2.0-or-later in the `*-full` variant. Commercial deployments that need to avoid GPL copyleft should use the default variant or build with `video-encoder-nvenc` only (LGPL API layer; NVIDIA covers H.264/H.265 patents at the hardware layer). See [LICENSE.commercial](LICENSE.commercial) for the full scope statement.
+
+**Patent notice**: H.264 / H.265 (AVC / HEVC) are patent-encumbered codecs. Patent licensing from MPEG-LA, Access Advance, Velos Media, and other rights holders is separate from software copyright and is the responsibility of the operator in commercial deployments. See the `NOTICE.full` file inside the `*-full` tarball for details.
