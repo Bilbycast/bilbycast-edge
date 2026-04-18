@@ -45,6 +45,11 @@ pub struct OutputStatsAccumulator {
     /// Shared RIST counters for the SMPTE 2022-7 leg 2 output (when redundancy
     /// is configured).
     rist_leg2_stats_handle: OnceLock<Arc<rist_transport::RistConnStats>>,
+    /// Shared bond stats handle — aggregate `BondConnStats` plus
+    /// per-path `PathStats`. Populated by
+    /// `engine::output_bonded::spawn_bonded_output` after the
+    /// `BondSocket` is built.
+    bond_stats_handle: OnceLock<BondStatsHandle>,
     /// Optional handle to a per-output PCM transcoder's stats counters.
     /// Set once at output startup by `run_st2110_audio_output` (and any other
     /// output that runs a TranscodeStage). Reading is a single atomic load.
@@ -147,6 +152,7 @@ impl OutputStatsAccumulator {
             srt_leg2_stats_cache: Arc::new(watch::channel(None).0),
             rist_stats_handle: OnceLock::new(),
             rist_leg2_stats_handle: OnceLock::new(),
+            bond_stats_handle: OnceLock::new(),
             transcode_stats: OnceLock::new(),
             audio_decode_stats: OnceLock::new(),
             audio_encode_stats: OnceLock::new(),
@@ -178,6 +184,13 @@ impl OutputStatsAccumulator {
     /// Register the SMPTE 2022-7 second-leg RIST socket's stats handle.
     pub fn set_rist_leg2_stats(&self, stats: Arc<rist_transport::RistConnStats>) {
         let _ = self.rist_leg2_stats_handle.set(stats);
+    }
+
+    /// Register the bond stats handle for a bonded output. Called
+    /// once after the `BondSocket::sender` is built. Subsequent
+    /// calls are no-ops (first wins).
+    pub fn set_bond_stats(&self, handle: BondStatsHandle) {
+        let _ = self.bond_stats_handle.set(handle);
     }
 
     /// Register the per-output audio decode stats handle. Called once at
@@ -404,6 +417,10 @@ impl OutputStatsAccumulator {
                 .rist_leg2_stats_handle
                 .get()
                 .map(|h| rist_conn_to_leg_stats(h.as_ref(), packets_sent > 0)),
+            bond_stats: self
+                .bond_stats_handle
+                .get()
+                .map(bond_handle_to_leg_stats),
             transcode_stats,
             audio_decode_stats,
             audio_encode_stats,
@@ -991,6 +1008,10 @@ pub struct FlowStatsAccumulator {
     /// Cached SRT stats for redundancy input leg, updated by the SRT input polling task
     /// via a lock-free watch channel.
     pub input_srt_leg2_stats_cache: Arc<watch::Sender<Option<SrtLegStats>>>,
+    /// Shared bond stats handle for bonded inputs — the only input
+    /// type that aggregates N paths at the transport layer.
+    /// Populated by `engine::input_bonded::spawn_bonded_input`.
+    input_bond_stats_handle: OnceLock<BondStatsHandle>,
     /// Shared RIST connection-level counters for the primary input leg.
     input_rist_stats_handle: OnceLock<Arc<rist_transport::RistConnStats>>,
     /// Shared RIST counters for the SMPTE 2022-7 second input leg.
@@ -1090,6 +1111,7 @@ impl FlowStatsAccumulator {
             output_config_meta: DashMap::new(),
             input_srt_stats_cache: Arc::new(watch::channel(None).0),
             input_srt_leg2_stats_cache: Arc::new(watch::channel(None).0),
+            input_bond_stats_handle: OnceLock::new(),
             input_rist_stats_handle: OnceLock::new(),
             input_rist_leg2_stats_handle: OnceLock::new(),
             bandwidth_exceeded: AtomicBool::new(false),
@@ -1224,6 +1246,12 @@ impl FlowStatsAccumulator {
     /// Register the SMPTE 2022-7 second-leg RIST input's stats handle.
     pub fn set_input_rist_leg2_stats(&self, stats: Arc<rist_transport::RistConnStats>) {
         let _ = self.input_rist_leg2_stats_handle.set(stats);
+    }
+
+    /// Register the bond stats handle for a bonded input. Called
+    /// once after `BondSocket::receiver` is built.
+    pub fn set_input_bond_stats(&self, handle: BondStatsHandle) {
+        let _ = self.input_bond_stats_handle.set(handle);
     }
 
     /// Replace the header fields (`input_type` + `InputConfigMeta`) that the
@@ -1488,6 +1516,10 @@ impl FlowStatsAccumulator {
                     srt_leg2_stats: self.input_srt_leg2_stats_cache.borrow().clone(),
                     rist_stats: rist_input_stats,
                     rist_leg2_stats: rist_input_leg2_stats,
+                    bond_stats: self
+                        .input_bond_stats_handle
+                        .get()
+                        .map(bond_handle_to_leg_stats),
                     redundancy_switches: self.redundancy_switches.load(Ordering::Relaxed),
                     transcode_stats: in_transcode,
                     audio_decode_stats: in_audio_decode,
@@ -1578,6 +1610,112 @@ pub fn rist_snapshot_to_leg_stats(
 /// Convenience for the output-stats path: always snapshots as a sender.
 fn rist_conn_to_leg_stats(stats: &rist_transport::RistConnStats, active: bool) -> RistLegStats {
     rist_snapshot_to_leg_stats(&stats.snapshot(), RistStatsRole::Sender, active)
+}
+
+// ── Bonding stats ──────────────────────────────────────────────────────────
+
+/// Per-path stats handle registered on an input or output
+/// accumulator alongside the aggregate [`BondStatsHandle`]. Carries
+/// the operator-facing name + transport label so the snapshot
+/// output is self-describing without the edge needing to re-consult
+/// the flow config.
+#[derive(Clone, Debug)]
+pub struct BondPathStatsHandle {
+    pub id: u8,
+    pub name: String,
+    pub transport: String,
+    pub stats: Arc<bonding_protocol::stats::PathStats>,
+}
+
+/// Aggregate + per-path bond stats handle. One per bonded input or
+/// output accumulator.
+#[derive(Clone, Debug)]
+pub struct BondStatsHandle {
+    pub flow_id: u32,
+    pub role: BondStatsRole,
+    pub scheduler: String,
+    pub conn_stats: Arc<bonding_protocol::stats::BondConnStats>,
+    pub paths: Vec<BondPathStatsHandle>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BondStatsRole {
+    Sender,
+    Receiver,
+}
+
+/// Convert a live [`BondStatsHandle`] into the wire-shaped
+/// [`BondLegStats`] carried by `InputStats` / `OutputStats`.
+pub fn bond_handle_to_leg_stats(h: &BondStatsHandle) -> BondLegStats {
+    let snap = h.conn_stats.snapshot();
+    let role = match h.role {
+        BondStatsRole::Sender => "sender".to_string(),
+        BondStatsRole::Receiver => "receiver".to_string(),
+    };
+    let paths: Vec<BondPathLegStats> = h
+        .paths
+        .iter()
+        .map(|p| {
+            let ps = p.stats.snapshot();
+            BondPathLegStats {
+                id: p.id,
+                name: p.name.clone(),
+                transport: p.transport.clone(),
+                state: if ps.dead { "dead" } else { "alive" }.to_string(),
+                rtt_ms: ps.rtt_ms(),
+                jitter_us: ps.jitter_us,
+                loss_fraction: ps.loss_fraction(),
+                throughput_bps: ps.throughput_bps,
+                queue_depth: ps.queue_depth,
+                packets_sent: ps.packets_sent,
+                bytes_sent: ps.bytes_sent,
+                packets_received: ps.packets_received,
+                bytes_received: ps.bytes_received,
+                nacks_sent: ps.nacks_sent,
+                nacks_received: ps.nacks_received,
+                retransmits_sent: ps.retransmits_sent,
+                retransmits_received: ps.retransmits_received,
+                keepalives_sent: ps.keepalives_sent,
+                keepalives_received: ps.keepalives_received,
+            }
+        })
+        .collect();
+
+    // Aggregate state: "up" if any path alive and any traffic
+    // observed; "degraded" if one or more paths are dead; "idle" if
+    // everything's zero.
+    let any_dead = paths.iter().any(|p| p.state == "dead");
+    let any_activity = match h.role {
+        BondStatsRole::Sender => snap.packets_sent > 0,
+        BondStatsRole::Receiver => snap.packets_received > 0,
+    };
+    let state = if any_dead {
+        "degraded".to_string()
+    } else if any_activity {
+        "up".to_string()
+    } else {
+        "idle".to_string()
+    };
+
+    BondLegStats {
+        state,
+        flow_id: h.flow_id,
+        role,
+        scheduler: h.scheduler.clone(),
+        packets_sent: snap.packets_sent,
+        bytes_sent: snap.bytes_sent,
+        packets_retransmitted: snap.packets_retransmitted,
+        packets_duplicated: snap.packets_duplicated,
+        packets_dropped_no_path: snap.packets_dropped_no_path,
+        packets_received: snap.packets_received,
+        bytes_received: snap.bytes_received,
+        packets_delivered: snap.packets_delivered,
+        gaps_recovered: snap.gaps_recovered,
+        gaps_lost: snap.gaps_lost,
+        duplicates_received: snap.duplicates_received,
+        reassembly_overflow: snap.reassembly_overflow,
+        paths,
+    }
 }
 
 fn ptp_state_to_stats(handle: &crate::engine::st2110::ptp::PtpStateHandle) -> PtpStateStats {

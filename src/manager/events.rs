@@ -250,6 +250,13 @@ pub mod category {
     pub const UDP: &str = "udp";
     /// Video transcoding lifecycle (TsVideoReplacer start / fail).
     pub const VIDEO_ENCODE: &str = "video_encode";
+    /// Media-aware bonding lifecycle (bond socket bind, path failover,
+    /// NACK-driven retransmits exhausted). Scoped to flows that carry a
+    /// `bonded` input or output.
+    pub const MEDIA: &str = "media";
+    /// Bonded input/output lifecycle (kept distinct from `media` so
+    /// operators can filter the event feed).
+    pub const BOND: &str = "bond";
     /// Flow group start/stop events.
     pub const FLOW_GROUP: &str = "flow_group";
     /// Configuration change events.

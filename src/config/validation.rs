@@ -732,8 +732,190 @@ fn validate_input(input: &InputConfig) -> Result<()> {
         InputConfig::St2110_20(c) => validate_st2110_video_input(c)?,
         InputConfig::St2110_23(c) => validate_st2110_23_input(c)?,
         InputConfig::RtpAudio(c) => validate_rtp_audio_input(c)?,
+        InputConfig::Bonded(c) => validate_bonded_input(c)?,
     }
     Ok(())
+}
+
+/// Validate a bonded input config. Checks path IDs unique, path
+/// count ≥ 1, role semantics consistent with receiver side, and
+/// that each path has the addresses required for its role.
+fn validate_bonded_input(c: &crate::config::models::BondedInputConfig) -> Result<()> {
+    if c.paths.is_empty() {
+        return Err(anyhow::anyhow!("bonded input: at least one path required"));
+    }
+    let mut ids = std::collections::HashSet::new();
+    for p in &c.paths {
+        if !ids.insert(p.id) {
+            return Err(anyhow::anyhow!(
+                "bonded input: duplicate path id {}",
+                p.id
+            ));
+        }
+        validate_bond_path_transport(&p.transport, /* sender_mode */ false, &p.name)?;
+    }
+    if let Some(ms) = c.hold_ms {
+        if !(10..=30_000).contains(&ms) {
+            return Err(anyhow::anyhow!(
+                "bonded input hold_ms must be in [10, 30000], got {ms}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Shared path-transport validation for bonded input/output.
+fn validate_bond_path_transport(
+    t: &crate::config::models::BondPathTransportConfig,
+    sender_mode: bool,
+    path_name: &str,
+) -> Result<()> {
+    use crate::config::models::{BondPathTransportConfig, BondQuicRole, BondRistRole};
+    match t {
+        BondPathTransportConfig::Udp { bind, remote } => {
+            if let Some(b) = bind {
+                validate_socket_addr(b, "bonded UDP path bind")?;
+            }
+            if let Some(r) = remote {
+                validate_socket_addr(r, "bonded UDP path remote")?;
+            }
+            if sender_mode && remote.is_none() && bind.is_none() {
+                return Err(anyhow::anyhow!(
+                    "bonded UDP path '{path_name}' (sender) requires at least remote or bind"
+                ));
+            }
+            if !sender_mode && bind.is_none() {
+                return Err(anyhow::anyhow!(
+                    "bonded UDP path '{path_name}' (receiver) requires bind"
+                ));
+            }
+        }
+        BondPathTransportConfig::Rist {
+            role,
+            remote,
+            local_bind,
+            buffer_ms,
+        } => {
+            let expected_role = if sender_mode {
+                BondRistRole::Sender
+            } else {
+                BondRistRole::Receiver
+            };
+            if *role != expected_role {
+                return Err(anyhow::anyhow!(
+                    "bonded RIST path '{path_name}' role mismatch: side is {} but role is {}",
+                    if sender_mode { "output/sender" } else { "input/receiver" },
+                    match role {
+                        BondRistRole::Sender => "sender",
+                        BondRistRole::Receiver => "receiver",
+                    }
+                ));
+            }
+            match role {
+                BondRistRole::Sender => {
+                    let r = remote.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("bonded RIST path '{path_name}' sender role requires remote")
+                    })?;
+                    validate_socket_addr(r, "bonded RIST path remote")?;
+                }
+                BondRistRole::Receiver => {
+                    let b = local_bind.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "bonded RIST path '{path_name}' receiver role requires local_bind"
+                        )
+                    })?;
+                    validate_socket_addr(b, "bonded RIST path local_bind")?;
+                }
+            }
+            if let Some(ms) = buffer_ms {
+                if !(50..=30_000).contains(ms) {
+                    return Err(anyhow::anyhow!(
+                        "bonded RIST path '{path_name}' buffer_ms must be in [50, 30000]"
+                    ));
+                }
+            }
+        }
+        BondPathTransportConfig::Quic {
+            role,
+            addr,
+            server_name,
+            tls,
+        } => {
+            let expected = if sender_mode {
+                BondQuicRole::Client
+            } else {
+                BondQuicRole::Server
+            };
+            if *role != expected {
+                return Err(anyhow::anyhow!(
+                    "bonded QUIC path '{path_name}' role mismatch: side expects {} but got {}",
+                    match expected {
+                        BondQuicRole::Client => "client",
+                        BondQuicRole::Server => "server",
+                    },
+                    match role {
+                        BondQuicRole::Client => "client",
+                        BondQuicRole::Server => "server",
+                    }
+                ));
+            }
+            validate_socket_addr(addr, "bonded QUIC path addr")?;
+            if matches!(role, BondQuicRole::Client) && server_name.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "bonded QUIC client path '{path_name}' requires server_name"
+                ));
+            }
+            validate_bond_tls(tls, path_name)?;
+        }
+    }
+    Ok(())
+}
+
+/// Extract the local UDP port to register (receiver-side paths) so
+/// the port-conflict check can spot bonded inputs colliding with
+/// other services. Returns `None` for paths that don't pin a port
+/// (sender-role RIST, QUIC client, UDP sender-mode with no bind).
+fn bond_path_bind_addr(t: &crate::config::models::BondPathTransportConfig) -> Option<String> {
+    use crate::config::models::{BondPathTransportConfig, BondQuicRole, BondRistRole};
+    match t {
+        BondPathTransportConfig::Udp { bind, .. } => bind.clone(),
+        BondPathTransportConfig::Rist {
+            role, local_bind, ..
+        } if *role == BondRistRole::Receiver => local_bind.clone(),
+        BondPathTransportConfig::Quic {
+            role: BondQuicRole::Server,
+            addr,
+            ..
+        } => Some(addr.clone()),
+        _ => None,
+    }
+}
+
+fn validate_bond_tls(
+    tls: &crate::config::models::BondQuicTls,
+    path_name: &str,
+) -> Result<()> {
+    use crate::config::models::BondQuicTls;
+    match tls {
+        BondQuicTls::SelfSigned => Ok(()),
+        BondQuicTls::Pem {
+            cert_chain_path,
+            private_key_path,
+            ..
+        } => {
+            if cert_chain_path.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "bonded QUIC path '{path_name}' TLS pem requires cert_chain_path"
+                ));
+            }
+            if private_key_path.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "bonded QUIC path '{path_name}' TLS pem requires private_key_path"
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// SMPTE ST 2110 audio profile selector — controls per-format validation
@@ -2428,6 +2610,45 @@ pub fn validate_output_with_input(
         OutputConfig::St2110_20(c) => validate_st2110_video_output(c)?,
         OutputConfig::St2110_23(c) => validate_st2110_23_output(c)?,
         OutputConfig::RtpAudio(c) => validate_rtp_audio_output(c, upstream_audio)?,
+        OutputConfig::Bonded(c) => validate_bonded_output(c)?,
+    }
+    Ok(())
+}
+
+fn validate_bonded_output(c: &crate::config::models::BondedOutputConfig) -> Result<()> {
+    if c.id.is_empty() || c.id.len() > 64 {
+        return Err(anyhow::anyhow!(
+            "bonded output id length must be in [1, 64]"
+        ));
+    }
+    if c.name.len() > 256 {
+        return Err(anyhow::anyhow!("bonded output name too long (>256 chars)"));
+    }
+    validate_output_group(c.group.as_deref(), &c.id)?;
+    if c.paths.is_empty() {
+        return Err(anyhow::anyhow!(
+            "bonded output '{}': at least one path required",
+            c.id
+        ));
+    }
+    let mut ids = std::collections::HashSet::new();
+    for p in &c.paths {
+        if !ids.insert(p.id) {
+            return Err(anyhow::anyhow!(
+                "bonded output '{}': duplicate path id {}",
+                c.id,
+                p.id
+            ));
+        }
+        validate_bond_path_transport(&p.transport, /* sender_mode */ true, &p.name)?;
+    }
+    if let Some(pn) = c.program_number {
+        if pn == 0 {
+            return Err(anyhow::anyhow!(
+                "bonded output '{}' program_number must be > 0",
+                c.id
+            ));
+        }
     }
     Ok(())
 }
@@ -3261,6 +3482,21 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
             }
             // RTSP, WebRTC, and WHEP inputs don't bind specific local ports.
             InputConfig::Rtsp(_) | InputConfig::Webrtc(_) | InputConfig::Whep(_) => {}
+            // Bonded inputs bind per-path — register each receiver-role
+            // path's local port. Client / sender-role paths don't
+            // occupy a specific local port so there's nothing to
+            // pre-register for conflict detection.
+            InputConfig::Bonded(cfg) => {
+                for (i, p) in cfg.paths.iter().enumerate() {
+                    if let Some(bind) = bond_path_bind_addr(&p.transport) {
+                        register(
+                            &bind,
+                            Proto::Udp,
+                            format!("{label_prefix} (bonded path[{i}] {})", p.name),
+                        )?;
+                    }
+                }
+            }
         }
     }
 

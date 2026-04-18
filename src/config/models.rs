@@ -446,6 +446,12 @@ pub enum InputConfig {
     /// and any general PCM-over-RTP source where ST 2110 is overkill.
     #[serde(rename = "rtp_audio")]
     RtpAudio(RtpAudioInputConfig),
+    /// Receive a bonded flow across N paths (UDP / QUIC / RIST), reassemble
+    /// in bond-sequence order, and publish payloads onto the flow's
+    /// broadcast channel. Intended for aggregating cellular / satellite /
+    /// ethernet links like a Peplink SpeedFusion tunnel, but media-aware.
+    #[serde(rename = "bonded")]
+    Bonded(BondedInputConfig),
 }
 
 impl InputConfig {
@@ -466,6 +472,7 @@ impl InputConfig {
             InputConfig::St2110_20(_) => "st2110_20",
             InputConfig::St2110_23(_) => "st2110_23",
             InputConfig::RtpAudio(_) => "rtp_audio",
+            InputConfig::Bonded(_) => "bonded",
         }
     }
 
@@ -491,7 +498,12 @@ impl InputConfig {
             // flow as encoded H.264/HEVC MPEG-TS into the broadcast channel,
             // so downstream consumers treat them as TS carriers.
             | InputConfig::St2110_20(_)
-            | InputConfig::St2110_23(_) => true,
+            | InputConfig::St2110_23(_)
+            // Bonded inputs carry whatever the sender bonded — in the
+            // common broadcast case that's MPEG-TS, so treat as a TS
+            // carrier. Downstream analysers can still be turned off via
+            // `media_analysis: false` on the flow.
+            | InputConfig::Bonded(_) => true,
             // PCM-only inputs become TS carriers when `audio_encode` is set —
             // the input task muxes the encoded audio into an audio-only TS.
             InputConfig::St2110_30(c) => c.audio_encode.is_some(),
@@ -943,6 +955,11 @@ pub enum OutputConfig {
     /// optionally MPEG-TS / SMPTE 302M wrapping via `transport_mode`.
     #[serde(rename = "rtp_audio")]
     RtpAudio(RtpAudioOutputConfig),
+    /// Send the flow across N bonded paths (UDP / QUIC / RIST) with a
+    /// media-aware scheduler that duplicates IDR frames across the two
+    /// best paths. Pair with a `bonded` input at the far end.
+    #[serde(rename = "bonded")]
+    Bonded(BondedOutputConfig),
 }
 
 impl OutputConfig {
@@ -962,6 +979,7 @@ impl OutputConfig {
             OutputConfig::St2110_20(c) => &c.id,
             OutputConfig::St2110_23(c) => &c.id,
             OutputConfig::RtpAudio(c) => &c.id,
+            OutputConfig::Bonded(c) => &c.id,
         }
     }
 
@@ -981,6 +999,7 @@ impl OutputConfig {
             OutputConfig::St2110_20(c) => &c.name,
             OutputConfig::St2110_23(c) => &c.name,
             OutputConfig::RtpAudio(c) => &c.name,
+            OutputConfig::Bonded(c) => &c.name,
         }
     }
 
@@ -1000,6 +1019,7 @@ impl OutputConfig {
             OutputConfig::St2110_20(_) => "st2110_20",
             OutputConfig::St2110_23(_) => "st2110_23",
             OutputConfig::RtpAudio(_) => "rtp_audio",
+            OutputConfig::Bonded(_) => "bonded",
         }
     }
 
@@ -1020,6 +1040,7 @@ impl OutputConfig {
             OutputConfig::St2110_20(c) => c.active,
             OutputConfig::St2110_23(c) => c.active,
             OutputConfig::RtpAudio(c) => c.active,
+            OutputConfig::Bonded(c) => c.active,
         }
     }
 
@@ -1041,6 +1062,7 @@ impl OutputConfig {
             OutputConfig::St2110_20(c) => c.active = active,
             OutputConfig::St2110_23(c) => c.active = active,
             OutputConfig::RtpAudio(c) => c.active = active,
+            OutputConfig::Bonded(c) => c.active = active,
         }
     }
 
@@ -1060,6 +1082,7 @@ impl OutputConfig {
             OutputConfig::St2110_20(c) => c.group.as_deref(),
             OutputConfig::St2110_23(c) => c.group.as_deref(),
             OutputConfig::RtpAudio(c) => c.group.as_deref(),
+            OutputConfig::Bonded(c) => c.group.as_deref(),
         }
     }
 }
@@ -1655,6 +1678,181 @@ pub struct RistOutputRedundancyConfig {
     /// Local bind address for leg 2 (optional). When set, port must be even.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_addr: Option<String>,
+}
+
+// ── Bonded input / output ────────────────────────────────────────────────────
+//
+// Media-aware multi-path bonding (see bilbycast-bonding). Each `BondedInputConfig`
+// / `BondedOutputConfig` maps 1:1 to a `BondSocket::{sender,receiver}` built from
+// a list of paths (UDP / QUIC / RIST). Engine's `input_bonded.rs` and
+// `output_bonded.rs` are the thin adapters that publish bonded payloads onto the
+// flow's broadcast channel as `RtpPacket { is_raw_ts: true, .. }`, and subscribe
+// to the channel to emit bond frames respectively.
+
+/// Bonded input — reassembles a bond flow arriving on N paths and publishes the
+/// delivered payloads into the flow's broadcast channel. Use this as the
+/// `receiver` side of a `bilbycast-bonder` (or edge-to-edge bond) link.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BondedInputConfig {
+    /// Bond-layer flow identifier — must match the sender end.
+    pub bond_flow_id: u32,
+    /// Paths to bind on.
+    pub paths: Vec<BondPathConfig>,
+    /// Reassembly hold time in milliseconds. Default 500 ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_ms: Option<u32>,
+    /// Base NACK delay in milliseconds. Default 30 ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nack_delay_ms: Option<u32>,
+    /// Max NACK retries per gap. Default 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_nack_retries: Option<u32>,
+    /// Keepalive interval in milliseconds. Default 200 ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_ms: Option<u32>,
+}
+
+/// Bonded output — subscribes to the flow's broadcast channel, frames each
+/// packet into the bond header, and transmits across N paths using the
+/// configured scheduler. IDR-duplication and NAL-aware priority are enabled
+/// by default via [`BondSchedulerKind::MediaAware`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BondedOutputConfig {
+    /// Unique output ID within the flow.
+    pub id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Whether this output is currently active.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Optional free-form group tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Bond-layer flow identifier — must match the receiver end.
+    pub bond_flow_id: u32,
+    /// Paths to transmit across.
+    pub paths: Vec<BondPathConfig>,
+    /// Scheduling policy.
+    #[serde(default)]
+    pub scheduler: BondSchedulerKind,
+    /// Sender retransmit buffer capacity in packets. Default 8192.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retransmit_capacity: Option<usize>,
+    /// Keepalive interval in milliseconds. Default 200 ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_ms: Option<u32>,
+    /// Optional MPTS `program_number` filter applied before bonding (mirrors
+    /// other TS-native outputs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
+}
+
+/// A single bond leg definition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BondPathConfig {
+    /// Path identifier — must be unique within the paths array.
+    pub id: u8,
+    /// Operator-visible name (e.g. `"lte-0"`, `"starlink"`).
+    pub name: String,
+    /// Scheduler weight hint; higher = more traffic at steady state.
+    #[serde(default = "default_bond_weight")]
+    pub weight_hint: u32,
+    /// Transport flavour.
+    pub transport: BondPathTransportConfig,
+}
+
+fn default_bond_weight() -> u32 {
+    1
+}
+
+/// Transport enum for a single bond leg.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BondPathTransportConfig {
+    /// Raw UDP — bidirectional, simplest path.
+    Udp {
+        /// Local bind `ip:port`. Optional on the sender side
+        /// (ephemeral), required on the receiver side.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bind: Option<String>,
+        /// Remote peer `ip:port`. Required on the sender side.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote: Option<String>,
+    },
+    /// RIST Simple Profile leg. Unidirectional at the bond layer; set
+    /// `role` to match the bonded-input-or-output side of this path.
+    Rist {
+        role: BondRistRole,
+        /// Remote RIST receiver (sender role). Ignored in receiver role.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote: Option<String>,
+        /// Local bind. Required on receiver role; optional on sender.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_bind: Option<String>,
+        /// RIST buffer in milliseconds (default 1000 ms).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        buffer_ms: Option<u32>,
+    },
+    /// QUIC path (TLS 1.3 + DATAGRAM extension). Full-duplex.
+    Quic {
+        role: BondQuicRole,
+        /// Client: remote `host:port`. Server: local bind.
+        addr: String,
+        /// Client: server name for SNI/ALPN. Ignored on server role.
+        #[serde(default)]
+        server_name: String,
+        tls: BondQuicTls,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BondRistRole {
+    Sender,
+    Receiver,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BondQuicRole {
+    Client,
+    Server,
+}
+
+/// QUIC TLS material.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum BondQuicTls {
+    /// Self-signed in-process (dev / loopback / trusted LAN).
+    SelfSigned,
+    /// PEM cert chain + private key, loaded from on-disk paths.
+    Pem {
+        cert_chain_path: String,
+        private_key_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_trust_root_path: Option<String>,
+    },
+}
+
+/// Scheduling policy for a bonded output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BondSchedulerKind {
+    /// Equal-weight rotation — simplest policy, fine for links with
+    /// nearly identical health.
+    RoundRobin,
+    /// RTT-weighted rotation — sends more traffic to lower-RTT paths
+    /// and duplicates `Critical`-priority packets across the two
+    /// lowest-RTT paths.
+    WeightedRtt,
+    /// RTT-weighted plus NAL-type detection: walks H.264 / HEVC NAL
+    /// boundaries in the outbound TS stream, tags SPS / PPS / IDR
+    /// (H.264 types 7, 8, 5; HEVC VPS/SPS/PPS/IDR_W_RADL/IDR_N_LP)
+    /// as `Priority::Critical` so the scheduler duplicates them
+    /// across the two best paths. Falls back to single-path for
+    /// non-IDR frames. **Default for broadcast flows.**
+    #[default]
+    MediaAware,
 }
 
 /// RTMP/RTMPS output configuration for publishing to streaming platforms.

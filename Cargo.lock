@@ -342,7 +342,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bilbycast-edge"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "aac-audio",
  "aac-codec",
@@ -351,6 +351,8 @@ dependencies = [
  "axum",
  "axum-server",
  "base64",
+ "bonding-protocol",
+ "bonding-transport",
  "bytes",
  "chrono",
  "clap",
@@ -361,7 +363,7 @@ dependencies = [
  "mdns-sd",
  "quinn",
  "rand 0.10.1",
- "rcgen",
+ "rcgen 0.14.7",
  "reqwest",
  "retina",
  "ring",
@@ -452,6 +454,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdd35008169921d80bc60d3d0ab416eecb028c4cd653352907921d95084790be"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "bonding-protocol"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "log",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bonding-transport"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bonding-protocol",
+ "bytes",
+ "log",
+ "quinn",
+ "rcgen 0.13.2",
+ "rist-transport",
+ "rustls",
+ "rustls-pemfile",
+ "socket2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -2330,6 +2360,19 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "rcgen"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+dependencies = [
+ "pem",
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "yasna",
+]
 
 [[package]]
 name = "rcgen"

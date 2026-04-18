@@ -140,6 +140,13 @@ fn populate_transport_info(input: &InputConfig, state: &mut MediaAnalysisState) 
             state.protocol = "st2110_23".to_string();
             state.payload_format = "rfc4175_ycbcr422_multi".to_string();
         }
+        InputConfig::Bonded(_) => {
+            // Underlying transport is opaque to the analyzer — a bonded
+            // flow aggregates N heterogeneous paths. Surface `bonded`
+            // so the UI renders the topology correctly.
+            state.protocol = "bonded".to_string();
+            state.payload_format = "raw_ts".to_string();
+        }
     }
 }
 

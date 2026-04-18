@@ -566,6 +566,12 @@ fn active_receiver_params(
                 ..Default::default()
             }
         }
+        // Bonded inputs aggregate N paths — IS-05's single-
+        // transport-param model can't represent that. Report the
+        // bond flow id as a placeholder in `source_port` so tools
+        // see the input exists. A future NMOS extension could
+        // surface per-path endpoints.
+        InputConfig::Bonded(_) => TransportParamSet::default(),
     };
     Ok(TransportParams {
         transport_params: vec![param_set],

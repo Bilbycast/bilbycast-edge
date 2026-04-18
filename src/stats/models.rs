@@ -219,6 +219,10 @@ pub struct InputStats {
     /// RIST-level statistics for the redundancy (second) input leg (if SMPTE 2022-7).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rist_leg2_stats: Option<RistLegStats>,
+    /// Bonding-level statistics for this input, including per-path detail.
+    /// Populated only for bonded inputs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bond_stats: Option<BondLegStats>,
     /// Number of times the active input leg switched between leg 1 and leg 2.
     pub redundancy_switches: u64,
     /// Per-input PCM transcode stage statistics. Present only when the input
@@ -309,6 +313,10 @@ pub struct OutputStats {
     /// RIST-level statistics for the redundancy (second) output leg (if SMPTE 2022-7).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rist_leg2_stats: Option<RistLegStats>,
+    /// Bonding-level statistics for this output, including per-path
+    /// detail. Populated only for bonded outputs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bond_stats: Option<BondLegStats>,
     /// Per-output PCM transcode stage statistics. Present only when the
     /// output runs an `engine::audio_transcode::TranscodeStage` (i.e., the
     /// output config has a `transcode` block AND the upstream input is an
@@ -794,6 +802,85 @@ pub struct RistLegStats {
     /// from `packets_recovered`, which also includes natural
     /// out-of-order arrivals that happen to fill a gap.
     pub retransmits_received: u64,
+}
+
+/// Bonded flow connection-level statistics. Populated from
+/// [`bonding_protocol::stats::BondConnStats`] and the per-path
+/// [`bonding_protocol::stats::PathStats`] by
+/// [`engine::input_bonded`] / [`engine::output_bonded`] at
+/// stats-snapshot time.
+///
+/// One `BondLegStats` per bonded input or output — the `paths` Vec
+/// carries per-path detail so the manager UI can show each leg's
+/// RTT, loss, throughput, and liveness independently of the
+/// aggregate.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct BondLegStats {
+    /// Overall bond state — `"up"` when at least one path is alive
+    /// and traffic is flowing, `"idle"` when no paths have carried
+    /// traffic, `"degraded"` when one or more paths have been
+    /// declared dead.
+    pub state: String,
+    /// Bond-protocol flow identifier matched between sender and
+    /// receiver. Opaque to the UI — useful for log correlation.
+    pub flow_id: u32,
+    /// `"sender"` or `"receiver"` — which side of the bond this
+    /// stats entry describes.
+    pub role: String,
+    /// Scheduler kind configured on this output (sender side only:
+    /// `"round_robin"`, `"weighted_rtt"`, `"media_aware"`). Empty
+    /// string on the receiver side.
+    pub scheduler: String,
+
+    // ── Aggregate sender-side counters ──
+    pub packets_sent: u64,
+    pub bytes_sent: u64,
+    pub packets_retransmitted: u64,
+    /// Packets intentionally duplicated by the scheduler (e.g.
+    /// `Critical`-priority IDR frames sent on two paths).
+    pub packets_duplicated: u64,
+    /// Packets the scheduler couldn't dispatch because no path was
+    /// alive — failed-hard bonds register here.
+    pub packets_dropped_no_path: u64,
+
+    // ── Aggregate receiver-side counters ──
+    pub packets_received: u64,
+    pub bytes_received: u64,
+    pub packets_delivered: u64,
+    pub gaps_recovered: u64,
+    pub gaps_lost: u64,
+    pub duplicates_received: u64,
+    pub reassembly_overflow: u64,
+
+    /// Per-path detail. One entry per path registered at socket
+    /// creation. Order matches the config.
+    pub paths: Vec<BondPathLegStats>,
+}
+
+/// Per-path counters for a bonded flow.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct BondPathLegStats {
+    pub id: u8,
+    pub name: String,
+    /// `"udp"`, `"quic"`, or `"rist"`.
+    pub transport: String,
+    /// `"alive"` or `"dead"`.
+    pub state: String,
+    pub rtt_ms: f64,
+    pub jitter_us: u64,
+    pub loss_fraction: f64,
+    pub throughput_bps: u64,
+    pub queue_depth: u64,
+    pub packets_sent: u64,
+    pub bytes_sent: u64,
+    pub packets_received: u64,
+    pub bytes_received: u64,
+    pub nacks_sent: u64,
+    pub nacks_received: u64,
+    pub retransmits_sent: u64,
+    pub retransmits_received: u64,
+    pub keepalives_sent: u64,
+    pub keepalives_received: u64,
 }
 
 // ── Media Analysis ────────────────────────────────────────────────────────

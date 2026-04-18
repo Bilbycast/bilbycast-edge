@@ -77,6 +77,37 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
     audio as SMPTE 302M-in-MPEG-TS inside RFC 2250 RTP/MP2T (PT 33)
     — useful for hardware decoders that consume MPEG-TS over RTP
 
+### Bonded (multi-path aggregation)
+- **Direction:** Input and Output
+- **Transport:** N heterogeneous paths over UDP, QUIC (RFC 9221 DATAGRAM),
+  or RIST Simple Profile, chosen per-path
+- **Payload:** Any bytes — MPEG-TS, RTP, or raw — framed inside a 12-byte
+  bond header with 32-bit sequence across all paths
+- **Scheduler:** `media_aware` (default, walks H.264/HEVC NAL units and
+  duplicates IDR frames across the two lowest-RTT paths), `weighted_rtt`,
+  or `round_robin`
+- **Why it exists:** Peplink-class path aggregation for broadcast —
+  outperforms per-protocol bonding (SRT groups, RIST 2022-7) on mixed-link
+  heterogeneous scenarios (5G + Starlink + fibre), with frame-accurate
+  failover through IDR duplication rather than stream-wide doubling
+- **Features:**
+  - NACK-driven ARQ over a 32-bit sequence space with per-path retransmit
+    targeting
+  - Reassembly buffer with configurable `hold_ms` for late-arrival
+    tolerance
+  - Per-path keepalives → live RTT, jitter, loss, throughput stats
+    exposed through the manager UI and Prometheus
+  - QUIC paths negotiate ALPN `bilbycast-bond` (self-signed dev mode
+    and production PEM mode both supported)
+  - `program_number` filter on the output side for MPTS → SPTS
+    down-selection before bonding
+- **When not to use it:** For two SRT legs to the same SRT receiver use
+  libsrt socket groups (configured on the SRT output `redundancy`
+  block); for two RIST legs use RIST native SMPTE 2022-7. Bonded is the
+  universal option for N ≥ 2 heterogeneous links carrying any inner
+  protocol — see [bonding.md](bonding.md) for the full config schema,
+  worked examples, and tuning guidance.
+
 ## Output Protocols
 
 ### RTP (SMPTE ST 2022-2)

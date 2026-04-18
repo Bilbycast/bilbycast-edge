@@ -97,6 +97,10 @@ impl FlowSummary {
             Some(InputConfig::St2110_20(c)) => ("st2110_20", c.redundancy.is_some()),
             Some(InputConfig::St2110_23(c)) => ("st2110_23", c.sub_streams.iter().any(|s| s.redundancy.is_some())),
             Some(InputConfig::RtpAudio(c)) => ("rtp_audio", c.redundancy.is_some()),
+            // Bonded inputs use path-level redundancy (N>=2 paths implies
+            // redundancy from the topology view). Flag as redundant when
+            // more than one path is configured.
+            Some(InputConfig::Bonded(c)) => ("bonded", c.paths.len() > 1),
             None => ("none", false),
         };
 

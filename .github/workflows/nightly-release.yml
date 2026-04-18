@@ -106,6 +106,12 @@ jobs:
           path: bilbycast-rist
           submodules: recursive
 
+      - name: Checkout bilbycast-bonding (path dependency)
+        uses: actions/checkout@v5
+        with:
+          repository: Bilbycast/bilbycast-bonding
+          path: bilbycast-bonding
+
       - name: Checkout bilbycast-edge
         uses: actions/checkout@v5
         with:

@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-edge"
-version = "0.22.0"
+version = "0.23.0"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 license = "AGPL-3.0-or-later"
@@ -127,6 +127,15 @@ srt-protocol = { path = "../bilbycast-libsrt-rs/srt-protocol" }
 # ─────────────────────────────────────────────────────────────────────────
 rist-transport = { path = "../bilbycast-rist/rist-transport" }
 rist-protocol = { path = "../bilbycast-rist/rist-protocol" }
+
+# ── Bonding stack ────────────────────────────────────────────────────────
+# Media-aware multi-path bonding (Peplink-class). Pure-Rust reassembly +
+# scheduler; path transports include UDP, QUIC, and RIST. Edge consumes it
+# to expose `BondedInputConfig` / `BondedOutputConfig` as new flow input /
+# output variants. Non-bonded flows don't touch this code.
+# ─────────────────────────────────────────────────────────────────────────
+bonding-transport = { path = "../bilbycast-bonding/bonding-transport", default-features = false, features = ["path-udp", "path-rist", "path-quic"] }
+bonding-protocol = { path = "../bilbycast-bonding/bonding-protocol" }
 
 # QUIC transport for IP tunneling (relay and direct modes)
 quinn = "0.11.9"

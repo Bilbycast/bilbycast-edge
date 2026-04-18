@@ -111,6 +111,21 @@ pub async fn test_input(config: &InputConfig) -> TestResult {
                     TestResult::err("ST 2110-23 input missing sub_streams", start.elapsed())
                 }
             }
+            InputConfig::Bonded(c) => {
+                // Paths carry their own bind semantics — a shallow
+                // test just confirms at least one path is
+                // configured. Deep testing requires spinning the
+                // full bond socket; do that by starting the flow.
+                if c.paths.is_empty() {
+                    TestResult::err("bonded input has zero paths", start.elapsed())
+                } else {
+                    TestResult::ok(
+                        "configured",
+                        format!("bonded input with {} path(s)", c.paths.len()),
+                        start.elapsed(),
+                    )
+                }
+            }
         }
     })
     .await;
@@ -158,6 +173,17 @@ pub async fn test_output(config: &OutputConfig) -> TestResult {
                     test_udp_send_socket(&first.dest_addr, "ST 2110-23 video (sub_stream[0])").await
                 } else {
                     TestResult::err("ST 2110-23 output missing sub_streams", start.elapsed())
+                }
+            }
+            OutputConfig::Bonded(c) => {
+                if c.paths.is_empty() {
+                    TestResult::err("bonded output has zero paths", start.elapsed())
+                } else {
+                    TestResult::ok(
+                        "configured",
+                        format!("bonded output with {} path(s)", c.paths.len()),
+                        start.elapsed(),
+                    )
                 }
             }
         }

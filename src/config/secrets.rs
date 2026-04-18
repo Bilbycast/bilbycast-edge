@@ -319,6 +319,12 @@ impl SecretsConfig {
             | InputConfig::St2110_20(_)
             | InputConfig::St2110_23(_)
             | InputConfig::RtpAudio(_) => {}
+            // Bonded inputs reference TLS material by on-disk path in
+            // their `BondQuicTls::Pem` variant; the path strings
+            // themselves aren't secrets (they're fine in config.json),
+            // and the cert / key files are read lazily at path
+            // construction. Nothing to merge at this layer.
+            InputConfig::Bonded(_) => {}
         }
     }
 
@@ -361,6 +367,9 @@ impl SecretsConfig {
             | OutputConfig::St2110_20(_)
             | OutputConfig::St2110_23(_)
             | OutputConfig::RtpAudio(_) => {}
+            // Bonded outputs: see note on the input side — TLS
+            // material references paths, not inline secrets.
+            OutputConfig::Bonded(_) => {}
         }
     }
 }

@@ -582,6 +582,103 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
             }
         }
 
+        // Bond-specific metrics (per-flow + per-path)
+        output.push_str("\n# HELP bilbycast_edge_bond_rtt_ms Bond path round-trip time in milliseconds\n");
+        output.push_str("# TYPE bilbycast_edge_bond_rtt_ms gauge\n");
+        output.push_str("# HELP bilbycast_edge_bond_loss_fraction Bond path loss rate (0.0-1.0)\n");
+        output.push_str("# TYPE bilbycast_edge_bond_loss_fraction gauge\n");
+        output.push_str("# HELP bilbycast_edge_bond_path_packets_sent Bond packets sent on path\n");
+        output.push_str("# TYPE bilbycast_edge_bond_path_packets_sent counter\n");
+        output.push_str("# HELP bilbycast_edge_bond_path_packets_received Bond packets received on path\n");
+        output.push_str("# TYPE bilbycast_edge_bond_path_packets_received counter\n");
+        output.push_str("# HELP bilbycast_edge_bond_path_retransmits_sent Bond retransmits emitted on path (sender side)\n");
+        output.push_str("# TYPE bilbycast_edge_bond_path_retransmits_sent counter\n");
+        output.push_str("# HELP bilbycast_edge_bond_path_nacks_sent Bond NACKs sent on path (receiver side)\n");
+        output.push_str("# TYPE bilbycast_edge_bond_path_nacks_sent counter\n");
+        output.push_str("# HELP bilbycast_edge_bond_path_nacks_received Bond NACKs received on path (sender side)\n");
+        output.push_str("# TYPE bilbycast_edge_bond_path_nacks_received counter\n");
+        output.push_str("# HELP bilbycast_edge_bond_path_keepalives_sent Bond keepalives sent on path\n");
+        output.push_str("# TYPE bilbycast_edge_bond_path_keepalives_sent counter\n");
+        output.push_str("# HELP bilbycast_edge_bond_path_dead Bond path liveness (1=dead, 0=alive)\n");
+        output.push_str("# TYPE bilbycast_edge_bond_path_dead gauge\n");
+        output.push_str("# HELP bilbycast_edge_bond_gaps_recovered Bond sequence gaps recovered by ARQ\n");
+        output.push_str("# TYPE bilbycast_edge_bond_gaps_recovered counter\n");
+        output.push_str("# HELP bilbycast_edge_bond_gaps_lost Bond sequence gaps not recovered\n");
+        output.push_str("# TYPE bilbycast_edge_bond_gaps_lost counter\n");
+        output.push_str("# HELP bilbycast_edge_bond_packets_duplicated Bond packets duplicated across paths (sender side)\n");
+        output.push_str("# TYPE bilbycast_edge_bond_packets_duplicated counter\n");
+        for fs in &flow_snapshots {
+            let emit_bond = |out: &mut String, owner_labels: &str, bond: &crate::stats::models::BondLegStats| {
+                out.push_str(&format!(
+                    "bilbycast_edge_bond_gaps_recovered{{{}}} {}\n",
+                    owner_labels, bond.gaps_recovered
+                ));
+                out.push_str(&format!(
+                    "bilbycast_edge_bond_gaps_lost{{{}}} {}\n",
+                    owner_labels, bond.gaps_lost
+                ));
+                out.push_str(&format!(
+                    "bilbycast_edge_bond_packets_duplicated{{{}}} {}\n",
+                    owner_labels, bond.packets_duplicated
+                ));
+                for path in &bond.paths {
+                    let path_labels = format!(
+                        "{},path_id=\"{}\",path_name=\"{}\",transport=\"{}\"",
+                        owner_labels, path.id, path.name, path.transport
+                    );
+                    out.push_str(&format!(
+                        "bilbycast_edge_bond_rtt_ms{{{}}} {:.2}\n",
+                        path_labels, path.rtt_ms
+                    ));
+                    out.push_str(&format!(
+                        "bilbycast_edge_bond_loss_fraction{{{}}} {:.6}\n",
+                        path_labels, path.loss_fraction
+                    ));
+                    out.push_str(&format!(
+                        "bilbycast_edge_bond_path_packets_sent{{{}}} {}\n",
+                        path_labels, path.packets_sent
+                    ));
+                    out.push_str(&format!(
+                        "bilbycast_edge_bond_path_packets_received{{{}}} {}\n",
+                        path_labels, path.packets_received
+                    ));
+                    out.push_str(&format!(
+                        "bilbycast_edge_bond_path_retransmits_sent{{{}}} {}\n",
+                        path_labels, path.retransmits_sent
+                    ));
+                    out.push_str(&format!(
+                        "bilbycast_edge_bond_path_nacks_sent{{{}}} {}\n",
+                        path_labels, path.nacks_sent
+                    ));
+                    out.push_str(&format!(
+                        "bilbycast_edge_bond_path_nacks_received{{{}}} {}\n",
+                        path_labels, path.nacks_received
+                    ));
+                    out.push_str(&format!(
+                        "bilbycast_edge_bond_path_keepalives_sent{{{}}} {}\n",
+                        path_labels, path.keepalives_sent
+                    ));
+                    out.push_str(&format!(
+                        "bilbycast_edge_bond_path_dead{{{}}} {}\n",
+                        path_labels, if path.state == "dead" { 1 } else { 0 }
+                    ));
+                }
+            };
+            if let Some(ref bond) = fs.input.bond_stats {
+                let lab = format!("flow_id=\"{}\",leg_role=\"input\"", fs.flow_id);
+                emit_bond(&mut output, &lab, bond);
+            }
+            for os in &fs.outputs {
+                if let Some(ref bond) = os.bond_stats {
+                    let lab = format!(
+                        "flow_id=\"{}\",output_id=\"{}\",leg_role=\"output\"",
+                        fs.flow_id, os.output_id
+                    );
+                    emit_bond(&mut output, &lab, bond);
+                }
+            }
+        }
+
         // TR-101290 metrics
         output.push_str("\n# HELP bilbycast_edge_tr101290_ts_packets_total TS packets analyzed\n");
         output.push_str("# TYPE bilbycast_edge_tr101290_ts_packets_total counter\n");

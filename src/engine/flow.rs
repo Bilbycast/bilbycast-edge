@@ -236,6 +236,7 @@ impl FlowRuntime {
             Some(InputConfig::St2110_20(_)) => "st2110_20",
             Some(InputConfig::St2110_23(_)) => "st2110_23",
             Some(InputConfig::RtpAudio(_)) => "rtp_audio",
+            Some(InputConfig::Bonded(_)) => "bonded",
             None => "none",
         };
 
@@ -470,6 +471,15 @@ impl FlowRuntime {
                         input_cancel.clone(),
                     )
                 }
+                InputConfig::Bonded(c) => super::input_bonded::spawn_bonded_input(
+                    c.clone(),
+                    per_input_tx.clone(),
+                    flow_stats.clone(),
+                    input_cancel.clone(),
+                    event_sender.clone(),
+                    config.config.id.clone(),
+                    input_id.clone(),
+                ),
             };
 
             // Spawn the forwarder: drains the per-input channel and forwards
@@ -663,6 +673,24 @@ impl FlowRuntime {
                         };
                         ("rtp_audio".to_string(), payload_fmt, false, None, red_en, red_ty)
                     }
+                    InputConfig::Bonded(c) => {
+                        // Bonded inputs aggregate N paths — surface the
+                        // path count as the "redundancy" signal the UI
+                        // uses for multi-path flows.
+                        let multi = c.paths.len() > 1;
+                        (
+                            "bonded".to_string(),
+                            "raw_ts".to_string(),
+                            false,
+                            None,
+                            multi,
+                            if multi {
+                                Some(format!("bonded ({} paths)", c.paths.len()))
+                            } else {
+                                None
+                            },
+                        )
+                    }
                 };
             let media_acc = Arc::new(MediaAnalysisAccumulator::new(
                 protocol,
@@ -848,6 +876,7 @@ impl FlowRuntime {
                 InputConfig::St2110_20(_) => "st2110_20",
                 InputConfig::St2110_23(_) => "st2110_23",
                 InputConfig::RtpAudio(_) => "rtp_audio",
+                InputConfig::Bonded(_) => "bonded",
             };
             let new_meta = build_input_config_meta(&new_def.config);
             self.stats.update_active_input_meta(new_input_type, new_meta);
@@ -1225,6 +1254,26 @@ impl FlowRuntime {
                     stats: output_stats,
                 })
             }
+            OutputConfig::Bonded(c) => {
+                let output_stats = flow_stats.register_output(
+                    c.id.clone(),
+                    c.name.clone(),
+                    "bonded".to_string(),
+                );
+                let handle = super::output_bonded::spawn_bonded_output(
+                    c.clone(),
+                    broadcast_tx,
+                    output_stats.clone(),
+                    output_cancel.clone(),
+                    event_sender.clone(),
+                    flow_id.to_string(),
+                );
+                Ok(OutputRuntime {
+                    handle,
+                    cancel_token: output_cancel,
+                    stats: output_stats,
+                })
+            }
         }
     }
 
@@ -1420,6 +1469,17 @@ fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::Inpu
             listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
             rtsp_url: None, whep_url: None,
         },
+        InputConfig::Bonded(c) => InputConfigMeta {
+            // Use the first path's identifier as a topology hint;
+            // the full picture comes from bond stats, not this meta.
+            mode: Some(format!("bonded ({} paths)", c.paths.len())),
+            local_addr: None,
+            remote_addr: None,
+            listen_addr: None,
+            bind_addr: None,
+            rtsp_url: None,
+            whep_url: None,
+        },
     }
 }
 
@@ -1578,6 +1638,16 @@ fn build_output_config_meta(config: &OutputConfig) -> OutputConfigMeta {
             dest_addr: Some(c.dest_addr.clone()),
             dest_url: None, ingest_url: None, whip_url: None,
             program_number: None,
+        },
+        OutputConfig::Bonded(c) => OutputConfigMeta {
+            mode: Some(format!("bonded ({} paths, {:?})", c.paths.len(), c.scheduler)),
+            remote_addr: None,
+            local_addr: None,
+            dest_addr: None,
+            dest_url: None,
+            ingest_url: None,
+            whip_url: None,
+            program_number: c.program_number,
         },
     }
 }

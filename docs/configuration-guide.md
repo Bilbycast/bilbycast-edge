@@ -41,6 +41,13 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
   the licence-gated `video-encoder-*` Cargo features (x264, x265,
   NVENC), Linux build instructions, and the running list of Phase 4
   deferred items.
+- **Multi-path bonding (`bonded` input / output type)** — see
+  [`bonding.md`](bonding.md) for the full config schema (paths, scheduler,
+  per-transport options for UDP / QUIC / RIST), worked edge-to-edge
+  examples, stats / Prometheus reference, and tuning guidance. This is
+  the Peplink-class aggregation path for N heterogeneous links; protocol-
+  native bonding (SRT socket groups, RIST 2022-7) remains the right
+  choice for homogeneous two-leg setups.
 - [MPTS → SPTS filtering](#mpts--spts-filtering)
 - [SMPTE 2022-1 FEC Configuration](#smpte-2022-1-fec-configuration)
 - [SMPTE 2022-7 SRT Redundancy](#smpte-2022-7-srt-redundancy)

@@ -196,6 +196,11 @@ fn is_passive_listener(config: &InputConfig) -> bool {
         InputConfig::RtpAudio(_) => true,
         // Callers/pullers and WebRTC (needs full HTTP/ICE stack) are NOT passive
         InputConfig::Webrtc(_) | InputConfig::Rtsp(_) | InputConfig::Whep(_) => false,
+        // Bonded inputs bind N paths, some of which are active
+        // clients (QUIC client role). Standby-listener monitoring
+        // isn't meaningful for a heterogeneous bond — the full bond
+        // socket must be up for traffic to flow, so skip it here.
+        InputConfig::Bonded(_) => false,
     }
 }
 

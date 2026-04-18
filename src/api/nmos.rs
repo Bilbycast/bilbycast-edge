@@ -120,6 +120,11 @@ fn input_transport(input: &InputConfig) -> &'static str {
         | InputConfig::St2110_20(_)
         | InputConfig::St2110_23(_) => "urn:x-nmos:transport:rtp",
         InputConfig::RtpAudio(_) => "urn:x-nmos:transport:rtp",
+        // Bonded inputs don't have a standard NMOS transport URN —
+        // advertise as rtp for now so downstream NMOS clients see the
+        // flow at all. A future NMOS extension could register a
+        // bonding-specific URN.
+        InputConfig::Bonded(_) => "urn:x-nmos:transport:rtp",
     }
 }
 
@@ -138,6 +143,7 @@ fn output_transport(output: &OutputConfig) -> &'static str {
         | OutputConfig::St2110_20(_)
         | OutputConfig::St2110_23(_) => "urn:x-nmos:transport:rtp",
         OutputConfig::RtpAudio(_) => "urn:x-nmos:transport:rtp",
+        OutputConfig::Bonded(_) => "urn:x-nmos:transport:rtp",
     }
 }
 
@@ -279,6 +285,7 @@ fn input_type_str(input: &InputConfig) -> &'static str {
         InputConfig::St2110_20(_) => "st2110_20",
         InputConfig::St2110_23(_) => "st2110_23",
         InputConfig::RtpAudio(_) => "rtp_audio",
+        InputConfig::Bonded(_) => "bonded",
     }
 }
 
@@ -297,6 +304,7 @@ fn output_id(output: &OutputConfig) -> &str {
         OutputConfig::St2110_20(c) => &c.id,
         OutputConfig::St2110_23(c) => &c.id,
         OutputConfig::RtpAudio(c) => &c.id,
+        OutputConfig::Bonded(c) => &c.id,
     }
 }
 
@@ -315,6 +323,7 @@ fn output_name(output: &OutputConfig) -> &str {
         OutputConfig::St2110_20(c) => &c.name,
         OutputConfig::St2110_23(c) => &c.name,
         OutputConfig::RtpAudio(c) => &c.name,
+        OutputConfig::Bonded(c) => &c.name,
     }
 }
 
