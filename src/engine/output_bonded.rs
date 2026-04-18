@@ -33,7 +33,9 @@ use bonding_transport::{
 };
 
 use crate::config::models::{BondedOutputConfig, BondSchedulerKind};
-use crate::manager::events::{EventSender, EventSeverity, category};
+use crate::manager::events::{
+    BondEventScope, EventSender, EventSeverity, category, run_bond_event_forwarder,
+};
 use crate::stats::collector::OutputStatsAccumulator;
 
 use super::input_bonded::{parse_sockaddr, translate_tls};
@@ -147,6 +149,17 @@ async fn bonded_output_loop(
         ),
         flow_id,
     );
+
+    // Forward bonding lifecycle events (per-path alive/dead +
+    // bond-aggregate transitions) to the manager event feed.
+    tokio::spawn(run_bond_event_forwarder(
+        socket.subscribe_events(),
+        events.clone(),
+        flow_id.to_string(),
+        BondEventScope::Output,
+        config.id.clone(),
+        cancel.clone(),
+    ));
 
     // Optional media-aware scheduler state.
     let mut media_sched = match config.scheduler {

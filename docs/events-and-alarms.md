@@ -114,6 +114,40 @@ Events are queued in an unbounded in-memory channel. When the edge is not connec
 
 ---
 
+### Bonding (`bond`)
+
+Emitted by bonded inputs and outputs (`src/engine/input_bonded.rs`,
+`src/engine/output_bonded.rs`) when the underlying
+`bonding_transport::BondSocket` signals a path lifecycle transition
+or a change in the aggregate bond health. Stats-level per-path
+metrics (RTT, loss, throughput, alive/dead) continue to flow every
+stats snapshot regardless — these events are transition-only alarms
+meant to complement the live stats pane.
+
+| Severity | Message | Trigger | Details |
+|----------|---------|---------|---------|
+| info | bonded {input\|output} path '{name}' (#{id}) alive (M/N paths up) | A previously-dead path saw a keepalive ack (sender) or an inbound datagram (receiver) | `{ path_id, path_name, scope, alive_count, total }` |
+| warning | bonded {input\|output} path '{name}' (#{id}) dead: {reason} (M/N paths up) | No keepalive ack within `keepalive_miss_threshold × keepalive_interval` (sender) or no inbound packet within the same window (receiver) | `{ path_id, path_name, scope, reason, alive_count, total }` |
+| warning | bonded {input\|output} degraded — 1/N paths up (redundancy lost) | Bond dropped from ≥ 2 alive paths to exactly one | `{ path_id, path_name, scope, alive_count, total }` |
+| critical | bonded {input\|output} down — 0/N paths up (media plane offline) | Every path went dead | `{ path_id, path_name, scope, alive_count: 0, total }` |
+| info | bonded {input\|output} recovered — M/N paths up | Bond returned to ≥ 2 alive paths after a Degraded or Down state | `{ path_id, path_name, scope, alive_count, total }` |
+
+**`reason`** is one of `keepalive_timeout`, `receive_timeout`,
+`transport_error`. Per-path events are **flap-deduped with a 2 s
+grace window** — an alive↔dead transition arriving within 2 s of the
+opposite transition for the same path is suppressed so a flapping
+link doesn't flood the events feed (stats still reflect reality via
+`PathStats.dead`). Bond-aggregate events (`degraded` / `down` /
+`recovered`) always emit and are not flap-deduped.
+
+**Source**: `src/engine/input_bonded.rs`,
+`src/engine/output_bonded.rs`, forwarder helper in
+`src/manager/events.rs::run_bond_event_forwarder`. Liveness detection
+and event generation live inside `bilbycast-bonding` at
+`bonding-transport/src/health.rs` + `sender.rs` + `receiver.rs`.
+
+---
+
 ### SMPTE 2022-7 Redundancy (`redundancy`)
 
 | Severity | Message | Trigger |
@@ -344,6 +378,7 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `rtp` | 2 | RTP input bind and lifecycle |
 | `udp` | 2 | UDP input bind and lifecycle |
 | `rist` | 4 | RIST Simple Profile connection lifecycle |
+| `bond` | 5 | Bonded input/output — per-path alive/dead + bond-aggregate degraded/down/recovered |
 | `ptp` | — | SMPTE ST 2110 PTP slave clock state changes (Phase 1) |
 | `network_leg` | — | SMPTE 2022-7 Red/Blue per-leg loss / recovery (Phase 1) |
 | `nmos` | — | NMOS IS-04 / IS-05 / IS-08 controller activity (Phase 1) |
