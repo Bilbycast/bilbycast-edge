@@ -6,7 +6,15 @@ no-default-features = false
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "warn"
-ignore = []
+ignore = [
+    # rustls-pemfile 2.2.0 is the final release; the crate was archived in
+    # August 2025 and its code lives on inside rustls-pki-types >= 1.9.0 via
+    # the PemObject trait. Not a vulnerability — no safe upgrade exists.
+    # TODO: migrate tunnel/quic.rs and bilbycast-bonding/bonding-transport
+    # off rustls-pemfile onto rustls_pki_types::pem::PemObject, then drop
+    # this ignore.
+    "RUSTSEC-2025-0134",
+]
 
 [licenses]
 confidence-threshold = 0.8
@@ -32,6 +40,10 @@ allow = [
     # FFmpeg wrappers
     "LGPL-2.1-or-later",
     "LGPL-3.0-or-later",
+    # Mozilla's webpki-roots / webpki-root-certs publish the CA bundle
+    # under CDLA-Permissive-2.0 — OSI-compatible permissive terms for
+    # bundled trust-store data, pulled in transitively by quinn + reqwest.
+    "CDLA-Permissive-2.0",
 ]
 exceptions = []
 
@@ -43,6 +55,11 @@ license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Intra-workspace path deps (../bilbycast-fdk-aac-rs/aac-audio, etc.)
+# don't declare versions — cargo-deny flags these as wildcards. They're
+# always built from the pinned sibling checkouts in CI, so they aren't
+# the supply-chain risk the wildcards rule is meant to catch.
+allow-wildcard-paths = true
 highlight = "all"
 allow = []
 deny = []
