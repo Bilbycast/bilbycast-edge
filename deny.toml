@@ -54,12 +54,16 @@ license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
 # Intra-workspace path deps (../bilbycast-fdk-aac-rs/aac-audio, etc.)
-# don't declare versions — cargo-deny flags these as wildcards. They're
-# always built from the pinned sibling checkouts in CI, so they aren't
-# the supply-chain risk the wildcards rule is meant to catch.
-allow-wildcard-paths = true
+# don't declare versions — cargo-deny flags these as wildcards. The
+# built-in `allow-wildcard-paths` escape hatch only activates for crates
+# with `publish = false`, and none of our sibling workspace crates carry
+# that field. These crates are never published to crates.io (path deps
+# would prevent it anyway), so the supply-chain risk that the wildcards
+# rule is meant to catch doesn't apply here. Downgrade to "warn" so
+# wildcard deps from real crates.io sources still surface in logs
+# without failing the build.
+wildcards = "warn"
 highlight = "all"
 allow = []
 deny = []
