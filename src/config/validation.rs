@@ -772,7 +772,11 @@ fn validate_bond_path_transport(
 ) -> Result<()> {
     use crate::config::models::{BondPathTransportConfig, BondQuicRole, BondRistRole};
     match t {
-        BondPathTransportConfig::Udp { bind, remote } => {
+        BondPathTransportConfig::Udp {
+            bind,
+            remote,
+            interface,
+        } => {
             if let Some(b) = bind {
                 validate_socket_addr(b, "bonded UDP path bind")?;
             }
@@ -788,6 +792,21 @@ fn validate_bond_path_transport(
                 return Err(anyhow::anyhow!(
                     "bonded UDP path '{path_name}' (receiver) requires bind"
                 ));
+            }
+            if let Some(iface) = interface {
+                // IFNAMSIZ is 16 on Linux (15 chars + NUL). Keep this
+                // the portable limit so configs validate the same on
+                // every platform.
+                if iface.is_empty() || iface.len() > 15 {
+                    return Err(anyhow::anyhow!(
+                        "bonded UDP path '{path_name}' interface name must be 1..=15 chars"
+                    ));
+                }
+                if iface.contains('\0') {
+                    return Err(anyhow::anyhow!(
+                        "bonded UDP path '{path_name}' interface must not contain NUL"
+                    ));
+                }
             }
         }
         BondPathTransportConfig::Rist {

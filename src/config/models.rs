@@ -1778,6 +1778,13 @@ pub enum BondPathTransportConfig {
         /// Remote peer `ip:port`. Required on the sender side.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remote: Option<String>,
+        /// Optional NIC pin (e.g. `"eth0"`, `"wwan0"`). Forces
+        /// egress onto a specific interface regardless of the
+        /// routing table. Without this, multiple paths with the
+        /// same destination will typically all use the default
+        /// route. See `bilbycast-bonding/docs/nic-pinning.md`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interface: Option<String>,
     },
     /// RIST Simple Profile leg. Unidirectional at the bond layer; set
     /// `role` to match the bonded-input-or-output side of this path.

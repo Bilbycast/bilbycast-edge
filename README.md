@@ -2,41 +2,74 @@
 
 > 🌐 Learn more at **[bilbycast.com](https://bilbycast.com)** — the official website for the Bilbycast broadcast media transport suite.
 
-Media transport edge node supporting SRT, RTP, UDP, RTMP, HLS, and WebRTC protocols. Each node runs one or more flows, where a flow consists of one or more inputs (one active at a time) fanning out to multiple outputs, with support for SMPTE 2022-1 FEC and SMPTE 2022-7 hitless redundancy.
+Media transport edge node supporting SRT, RIST Simple Profile (VSF TR-06-1), RTP, UDP, RTMP, RTSP, HLS, and WebRTC (WHIP/WHEP) protocols, plus SMPTE ST 2110-30/-31/-40 (Phase 1 audio + data) and ST 2110-20/-23 (Phase 2 uncompressed video, RFC 4175 YCbCr-4:2:2 at 8/10-bit). Inputs, outputs, and flows are independently configurable top-level entities: inputs and outputs live in their own config arrays with stable IDs, and flows reference them via `input_ids` + `output_ids`. A flow may have multiple inputs (one active at a time, zero-gap seamless switching via `POST /api/v1/flows/{id}/activate-input`) fanning out to multiple outputs, with SMPTE 2022-1 FEC and SMPTE 2022-7 hitless redundancy (including 2022-7 Red/Blue dual-network support for ST 2110).
 
-Full MPTS (multi-program transport stream) support end-to-end on UDP/RTP/SRT/HLS with optional per-output `program_number` down-selection for extracting a single program as a rewritten SPTS. RTMP/WebRTC outputs and the thumbnail generator lock onto a chosen program deterministically.
+Full MPTS (multi-program transport stream) support end-to-end on UDP/RTP/SRT/HLS with optional per-output `program_number` down-selection for extracting a single program as a rewritten SPTS. RTMP/WebRTC outputs and the thumbnail generator lock onto a chosen program deterministically. A flow-level `thumbnail_program_number` picks which program feeds the manager UI preview.
 
-Supports NMOS IS-04 (Discovery & Registration) and IS-05 (Connection Management) for integration with broadcast control systems. Exposes Prometheus metrics for monitoring.
+Supports NMOS IS-04 (Discovery & Registration), IS-05 (Connection Management), IS-08 (Audio Channel Mapping), and BCP-004 receiver capabilities — optionally auth-protected — with mDNS-SD `_nmos-node._tcp` registration for integration with broadcast control systems. Exposes Prometheus `/metrics` for monitoring and WHIP/WHEP signaling endpoints for WebRTC.
 
 ## Supported Protocols
 
 | Protocol | Input | Output | Notes                                          |
 |----------|-------|--------|-------------------------------------------------|
-| SRT      | Yes   | Yes    | Caller, listener, rendezvous modes; AES encryption; Stream ID access control; 2022-7 redundancy. **`transport_mode: "audio_302m"`** for SMPTE 302M LPCM-in-MPEG-TS over SRT (output side; input demux deferred) |
-| RTP      | Yes   | Yes    | RTP-wrapped over UDP; unicast and multicast; SMPTE 2022-1 FEC; DSCP QoS |
-| UDP      | Yes   | Yes    | Raw MPEG-TS over UDP; unicast and multicast; DSCP QoS marking. **`transport_mode: "audio_302m"`** for SMPTE 302M LPCM-in-MPEG-TS over UDP |
-| RTMP     | Yes   | Yes    | H.264/AAC; accepts publish from OBS/ffmpeg; supports RTMPS (TLS); optional `audio_encode` re-encode block (AAC-LC / HE-AAC v1/v2) |
+| SRT      | Yes   | Yes    | Caller, listener, rendezvous modes; AES-128/192/256 encryption (CTR or GCM); Stream ID access control; SRT FEC (row/col/staircase, ARQ modes); 2022-7 redundancy. Optional `audio_encode` / `video_encode` + companion `transcode` blocks. **`transport_mode: "audio_302m"`** for SMPTE 302M LPCM-in-MPEG-TS (output side; input demux deferred) |
+| RIST     | Yes   | Yes    | Simple Profile (VSF TR-06-1:2020), RTCP NACK-driven retransmission, dual-leg 2022-7, pure-Rust `bilbycast-rist`, wire-verified interop with librist 0.2.11. Same optional `audio_encode` / `video_encode` / `transcode` as SRT |
+| RTP      | Yes   | Yes    | RTP-wrapped over UDP; unicast and multicast; SMPTE 2022-1 FEC; DSCP QoS; optional `audio_encode` / `video_encode` / `transcode` |
+| UDP      | Yes   | Yes    | Raw MPEG-TS over UDP; unicast and multicast; DSCP QoS marking; optional `audio_encode` / `video_encode` / `transcode`. **`transport_mode: "audio_302m"`** for SMPTE 302M LPCM-in-MPEG-TS |
+| RTMP     | Yes   | Yes    | H.264/AAC + HEVC via Enhanced RTMP v2 (`hvc1`); accepts publish from OBS/ffmpeg; supports RTMPS (TLS); optional `audio_encode` (AAC-LC / HE-AAC v1/v2) and `video_encode` (H.264 / HEVC via libx264 / libx265 / NVENC) |
 | RTSP     | Yes   | No     | Pull H.264/H.265 from IP cameras/media servers; TCP/UDP transport; auto-reconnect |
-| HLS      | No    | Yes    | Segment-based ingest; supports HEVC/HDR; optional `audio_encode` per-segment re-encode (AAC family / MP2 / AC-3) |
-| WebRTC   | Yes   | Yes    | WHIP/WHEP; H.264 video + Opus audio (enabled by default). Optional `audio_encode` block enables AAC → Opus on-the-fly via the ffmpeg sidecar |
-| **SMPTE ST 2110-30** | Yes | Yes | RFC 3551 PCM audio (L16/L24); 2022-7 dual-network; PTP slave via external `ptp4l`. Optional per-output `transcode` block (sample-rate / bit-depth / channel routing) |
+| HLS      | No    | Yes    | Segment-based egress; supports HEVC/HDR; in-process TS audio remuxing (default `video-thumbnail` feature); optional `audio_encode` per-segment re-encode (AAC family / MP2 / AC-3) |
+| WebRTC   | Yes   | Yes    | WHIP/WHEP (both client and server modes) via pure-Rust `str0m`; H.264 video + Opus audio (enabled by default); optional `audio_encode` (AAC → Opus in-process) and `video_encode` (H.264-only target — HEVC source auto-decoded and re-encoded to H.264 so browsers can play it) |
+| **SMPTE ST 2110-30** | Yes | Yes | RFC 3551 PCM audio (L16/L24); 2022-7 Red/Blue dual-network; PTP slave via external `ptp4l`. Optional per-output `transcode` block (sample-rate / bit-depth / channel routing) |
 | **SMPTE ST 2110-31** | Yes | Yes | AES3 transparent audio (24-bit), preserves Dolby E and AES3 sub-frame bits |
 | **SMPTE ST 2110-40** | Yes | Yes | RFC 8331 ancillary data (SCTE-104, SMPTE 12M timecode, CEA-608/708 captions) |
+| **SMPTE ST 2110-20** | Yes | Yes | Uncompressed video (RFC 4175 YCbCr-4:2:2 at 8/10-bit); 2022-7 Red/Blue dual-network. Inputs re-encode to H.264/HEVC via `video_encode` (requires a compiled-in software/NVENC encoder); outputs decode and scale to 4:2:2 planar for RFC 4175 packetization |
+| **SMPTE ST 2110-23** | Yes | Yes | Multi-stream single-essence video — 2SI and sample-row partition modes; otherwise same pipeline as -20 |
 | **`rtp_audio`** | Yes | Yes | Generic RFC 3551 PCM-over-RTP — wire-identical to ST 2110-30 but **no PTP requirement**, sample rates 32 / 44.1 / 48 / 88.2 / 96 kHz. For radio contribution, talkback, ffmpeg / OBS interop. Same `transcode` block as ST 2110-30. Output supports `transport_mode: "audio_302m"` (RTP/MP2T encapsulation per RFC 2250) |
 
 **Compressed-audio bridge (Phase A + Phase B):** AAC contribution audio
 carried in MPEG-TS over RTMP / RTSP / SRT / UDP / RTP can be decoded
 in-process (Phase A) and either land into the PCM-only ST 2110 /
 `rtp_audio` / SMPTE 302M outputs, or be re-encoded (Phase B) into AAC,
-HE-AAC v1/v2, Opus, MP2, or AC-3 for the RTMP, HLS, and WebRTC outputs.
-**Default (`fdk-aac` feature):** decode and AAC encode use Fraunhofer FDK
-AAC in-process (via `bilbycast-fdk-aac-rs`) — supports AAC-LC, HE-AAC
-v1/v2, multichannel up to 7.1, no ffmpeg needed for AAC codecs. **Fallback:**
-decode uses `symphonia-codec-aac` (pure Rust, AAC-LC mono/stereo only);
-AAC encode uses ffmpeg subprocess. Non-AAC codecs (Opus, MP2, AC-3)
-always use ffmpeg subprocess. The marquee chain is **AAC RTMP
-contribution → Opus WebRTC distribution** in a single bilbycast-edge
-process. See [`docs/audio-gateway.md`](docs/audio-gateway.md).
+HE-AAC v1/v2, Opus, MP2, or AC-3 for the RTMP, HLS, WebRTC, **and SRT /
+RIST / UDP / RTP TS outputs**. TS outputs rewrite only the audio ES and
+PMT stream_type in place via the streaming `TsAudioReplacer`; video and
+other PIDs pass through untouched. Every output that accepts
+`audio_encode` also accepts an optional companion `transcode` block
+(channel shuffle / sample-rate / bit-depth conversion) — `transcode`
+wins on conflicting fields.
+**Default (`fdk-aac` + `video-thumbnail` features):** decode and AAC
+encode use Fraunhofer FDK AAC in-process (via `bilbycast-fdk-aac-rs`) —
+AAC-LC, HE-AAC v1/v2, multichannel up to 7.1. Opus / MP2 / AC-3 use
+in-process libavcodec (via `bilbycast-ffmpeg-video-rs`). **No external
+ffmpeg binary required.** **Fallback (features disabled):** decode uses
+`symphonia-codec-aac` (pure Rust, AAC-LC mono/stereo only); encode uses
+ffmpeg subprocess. The marquee chain is **AAC RTMP contribution → Opus
+WebRTC distribution** in a single bilbycast-edge process. See
+[`docs/audio-gateway.md`](docs/audio-gateway.md).
+
+**Video transcoding (Phase 4):** SRT, RIST, UDP, RTP, RTMP, **and
+WebRTC** outputs accept an optional `video_encode` block. TS-carrying
+outputs run `TsVideoReplacer` (source H.264/HEVC → decode → re-encode →
+re-mux, with a fresh PMT when the codec family changes); RTMP emits
+classic FLV for H.264 and Enhanced RTMP v2 `hvc1` for HEVC; WebRTC is
+H.264-only target (browsers do not decode HEVC — HEVC source is
+auto-transcoded to H.264). HLS `video_encode` is the only remaining
+deferred transport. Software encoders (libx264 / libx265) are opt-in
+via the `video-encoder-x264` / `video-encoder-x265` Cargo features and
+are GPL-2.0-or-later — binaries built with them are an AGPL-3.0-or-later
+combined work. NVENC (`video-encoder-nvenc`) is LGPL-clean at the API
+layer. The composite `video-encoders-full` feature bundles all three
+and is used by the `*-linux-full` release channel. See
+[`docs/transcoding.md`](docs/transcoding.md) for the licensing and
+capability matrix.
+
+**Output delay:** SRT, RIST, RTP, and UDP outputs accept an optional
+`delay` block for synchronizing parallel output paths with different
+processing latencies (e.g., a clean feed alongside a
+commentary-processed feed). Three modes: `fixed` (constant ms delay),
+`target_ms` (target end-to-end latency, self-adjusting), `target_frames`
+(target latency in video frames using auto-detected frame rate).
 
 ## Quick Start
 
@@ -49,31 +82,39 @@ process. See [`docs/audio-gateway.md`](docs/audio-gateway.md).
    cargo build --release
    ```
 
-3. **Create a config file** (`config.json`) with server and flow definitions:
+3. **Create a config file** (`config.json`) with independent inputs, outputs, and flows that reference them:
    ```json
    {
-     "version": 1,
+     "version": 2,
      "server": { "listen_addr": "0.0.0.0", "listen_port": 8080 },
      "monitor": { "listen_addr": "0.0.0.0", "listen_port": 9090 },
+     "inputs": [
+       {
+         "id": "srt-in-1",
+         "name": "SRT Listener",
+         "active": true,
+         "type": "srt",
+         "mode": "listener",
+         "local_addr": "0.0.0.0:9000",
+         "latency_ms": 120
+       }
+     ],
+     "outputs": [
+       {
+         "id": "rtp-out-1",
+         "name": "RTP Output",
+         "active": true,
+         "type": "rtp",
+         "dest_addr": "192.168.1.100:5004"
+       }
+     ],
      "flows": [
        {
          "id": "srt-to-rtp",
          "name": "SRT Input to RTP Output",
          "enabled": true,
-         "input": {
-           "type": "srt",
-           "mode": "listener",
-           "local_addr": "0.0.0.0:9000",
-           "latency_ms": 120
-         },
-         "outputs": [
-           {
-             "type": "rtp",
-             "id": "out-1",
-             "name": "RTP Output",
-             "dest_addr": "192.168.1.100:5004"
-           }
-         ]
+         "input_ids": ["srt-in-1"],
+         "output_ids": ["rtp-out-1"]
        }
      ]
    }
@@ -97,11 +138,13 @@ process. See [`docs/audio-gateway.md`](docs/audio-gateway.md).
    **config.json**:
    ```json
    {
-     "version": 1,
+     "version": 2,
      "server": {
        "listen_addr": "0.0.0.0",
        "listen_port": 8080
      },
+     "inputs": [],
+     "outputs": [],
      "flows": []
    }
    ```
@@ -109,7 +152,7 @@ process. See [`docs/audio-gateway.md`](docs/audio-gateway.md).
    **secrets.json** (set `chmod 600 secrets.json`):
    ```json
    {
-     "version": 1,
+     "version": 2,
      "server_auth": {
        "enabled": true,
        "jwt_secret": "your-secret-key-at-least-32-characters",
@@ -161,12 +204,14 @@ process. See [`docs/audio-gateway.md`](docs/audio-gateway.md).
    **config.json**:
    ```json
    {
-     "version": 1,
+     "version": 2,
      "server": { "listen_addr": "0.0.0.0", "listen_port": 8080 },
      "manager": {
        "enabled": true,
        "url": "wss://manager-host:8443/ws/node"
      },
+     "inputs": [],
+     "outputs": [],
      "flows": []
    }
    ```
@@ -174,7 +219,7 @@ process. See [`docs/audio-gateway.md`](docs/audio-gateway.md).
    **secrets.json** (optional — or use the setup wizard instead):
    ```json
    {
-     "version": 1,
+     "version": 2,
      "manager_registration_token": "<token-from-manager>"
    }
    ```
@@ -183,7 +228,7 @@ process. See [`docs/audio-gateway.md`](docs/audio-gateway.md).
 
 4. **Start the node** -- it connects to the manager, authenticates with the registration token, and receives a permanent `node_id` and `node_secret`.
 
-5. **The node appears** in the manager dashboard and can be configured and monitored remotely. Commands from the manager (create flow, delete flow, add/remove output) are executed automatically.
+5. **The node appears** in the manager dashboard and can be configured and monitored remotely. Commands from the manager (create/update/delete input, create/update/delete output, create/update/delete flow, start/stop flow, rotate secret) are executed automatically.
 
 6. **Credentials are saved automatically** after registration: `node_id` goes to `config.json`, `node_secret` goes to `secrets.json` (with `0600` permissions). The `registration_token` is cleared. On subsequent starts, the node reconnects using the saved credentials. The connection uses exponential backoff (1s to 60s) for automatic reconnection.
 
@@ -246,15 +291,15 @@ Contributions are accepted under the Developer Certificate of Origin — see [DC
 
 Two variants are published on each tagged release, for Linux x86_64 and Linux ARM64:
 
-| Variant      | When to use                                       | Binary licence       |
-|--------------|---------------------------------------------------|----------------------|
-| `*-default`  | No H.264/H.265 transcoding needed                  | AGPL-3.0-or-later    |
-| `*-full`     | You need H.264/H.265 transcoding out of the box   | AGPL-3.0-or-later combined work (bundles libx264 + libx265 under GPL-2.0-or-later; see `NOTICE.full` inside the tarball) |
+| Variant          | When to use                                       | Binary licence       |
+|------------------|---------------------------------------------------|----------------------|
+| `*-linux`        | No H.264/H.265 transcoding needed (pass-through only) | AGPL-3.0-or-later    |
+| `*-linux-full`   | You need H.264/H.265 transcoding out of the box   | AGPL-3.0-or-later combined work (bundles libx264 + libx265 under GPL-2.0-or-later; see `NOTICE.full` inside the tarball) |
 
-The `*-full` binary also includes NVENC support for NVIDIA hardware — select `codec: "h264_nvenc"` / `"hevc_nvenc"` in your flow config when running on an NVIDIA host; x264/x265 handle everything else.
+The `*-linux-full` binary also includes NVENC support for NVIDIA hardware — select `codec: "h264_nvenc"` / `"hevc_nvenc"` in your flow config when running on an NVIDIA host; x264/x265 handle everything else.
 
 See [docs/installation.md](docs/installation.md) for download and install instructions per OS.
 
-**Commercial-licence customers**: a Softside Tech commercial licence covers the bilbycast source only — it cannot relicense libx264 / libx265, which remain GPL-2.0-or-later in the `*-full` variant. Commercial deployments that need to avoid GPL copyleft should use the default variant or build with `video-encoder-nvenc` only (LGPL API layer; NVIDIA covers H.264/H.265 patents at the hardware layer). See [LICENSE.commercial](LICENSE.commercial) for the full scope statement.
+**Commercial-licence customers**: a Softside Tech commercial licence covers the bilbycast source only — it cannot relicense libx264 / libx265, which remain GPL-2.0-or-later in the `*-linux-full` variant. Commercial deployments that need to avoid GPL copyleft should use the default (`*-linux`) variant or build with `video-encoder-nvenc` only (LGPL API layer; NVIDIA covers H.264/H.265 patents at the hardware layer). See [LICENSE.commercial](LICENSE.commercial) for the full scope statement.
 
-**Patent notice**: H.264 / H.265 (AVC / HEVC) are patent-encumbered codecs. Patent licensing from MPEG-LA, Access Advance, Velos Media, and other rights holders is separate from software copyright and is the responsibility of the operator in commercial deployments. See the `NOTICE.full` file inside the `*-full` tarball for details.
+**Patent notice**: H.264 / H.265 (AVC / HEVC) are patent-encumbered codecs. Patent licensing from MPEG-LA, Access Advance, Velos Media, and other rights holders is separate from software copyright and is the responsibility of the operator in commercial deployments. See the `NOTICE.full` file inside the `*-linux-full` tarball for details.

@@ -251,9 +251,14 @@ fn translate_transport_for_sender(
     use crate::config::models::{BondPathTransportConfig, BondQuicRole, BondRistRole};
     use bonding_transport::{QuicRole as BondQuicRoleTx, RistRole as BondRistRoleTx};
     Ok(match t {
-        BondPathTransportConfig::Udp { bind, remote } => BondPathTxTransport::Udp {
+        BondPathTransportConfig::Udp {
+            bind,
+            remote,
+            interface,
+        } => BondPathTxTransport::Udp {
             bind: bind.as_deref().map(parse_sockaddr).transpose()?,
             remote: remote.as_deref().map(parse_sockaddr).transpose()?,
+            interface: interface.clone(),
         },
         BondPathTransportConfig::Rist {
             role,

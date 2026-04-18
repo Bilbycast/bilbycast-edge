@@ -146,11 +146,23 @@ Each entry in `paths` has a common shell plus a `transport` block:
 **UDP path** (bidirectional, simplest):
 
 ```json
-{ "type": "udp", "bind": "10.0.0.1:5000", "remote": "203.0.113.5:6000" }
+{ "type": "udp", "bind": "10.0.0.1:5000", "remote": "203.0.113.5:6000", "interface": "wwan0" }
 ```
 
 Sender: `remote` required, `bind` optional (ephemeral if omitted).
 Receiver: `bind` required, `remote` ignored.
+
+**`interface`** (optional, string, 1–15 chars) — pins egress to a
+specific NIC (e.g. `"wwan0"`, `"eth0"`). Critical when multiple paths
+share a destination IP: without pinning, the kernel routing table
+collapses them onto the same default route and the bond is cosmetic.
+Linux uses `SO_BINDTODEVICE` and requires `CAP_NET_RAW` — grant with
+`sudo setcap cap_net_raw+ep /path/to/bilbycast-edge` or a systemd
+`AmbientCapabilities=CAP_NET_RAW` line; the edge itself does not need
+root. macOS / FreeBSD use `IP_BOUND_IF` and are unprivileged. Omit
+the field to let the kernel decide (or to use source-IP binding +
+`ip rule` policy routing instead). Full reference:
+[`bilbycast-bonding/docs/nic-pinning.md`](../../bilbycast-bonding/docs/nic-pinning.md).
 
 **RIST path** (unidirectional at the bond layer; per-leg ARQ from the RIST
 protocol itself):
