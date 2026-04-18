@@ -122,7 +122,10 @@ jobs:
       - name: Install video-encoder build dependencies (full variant only)
         if: matrix.variant == 'full'
         run: |
-          sudo apt-get install -y libx264-dev libx265-dev
+          # libnuma-dev is required because Ubuntu's x265.pc declares `-lnuma`
+          # in Libs.private — FFmpeg configure's link-test for x265 fails with
+          # `ld: cannot find -lnuma` without the -dev symlink.
+          sudo apt-get install -y libx264-dev libx265-dev libnuma-dev
           # nv-codec-headers is not packaged for Ubuntu 24.04 (noble); install
           # from source. Header-only package — `make install` drops headers +
           # ffnvcodec.pc into $PREFIX. Pinned to a tag compatible with vendored
