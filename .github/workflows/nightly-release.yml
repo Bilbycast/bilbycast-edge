@@ -11,9 +11,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Opt into Node.js 24 for actions still pinned to Node 20 (upload/download-artifact@v4).
-  # Node 20 is removed from runners on 2026-09-16.
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   check-version:
@@ -220,7 +217,7 @@ jobs:
           ls -l "${TARBALL}" "${TARBALL}.sha256"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bilbycast-edge-${{ matrix.artifact_suffix }}
           path: |
@@ -237,7 +234,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: artifacts
           merge-multiple: true
