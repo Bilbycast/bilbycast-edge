@@ -37,6 +37,14 @@ pub struct OutputStatsAccumulator {
     /// Cached SRT stats for redundancy leg, updated by the SRT output polling task
     /// via a lock-free watch channel.
     pub srt_leg2_stats_cache: Arc<watch::Sender<Option<SrtLegStats>>>,
+    /// Shared RIST connection-level counters for the primary output leg.
+    /// Stored as an `Arc` handle because the `RistSocket` sender task owns
+    /// and mutates the counters directly — snapshotting is a cheap atomic
+    /// load.
+    rist_stats_handle: OnceLock<Arc<rist_transport::RistConnStats>>,
+    /// Shared RIST counters for the SMPTE 2022-7 leg 2 output (when redundancy
+    /// is configured).
+    rist_leg2_stats_handle: OnceLock<Arc<rist_transport::RistConnStats>>,
     /// Optional handle to a per-output PCM transcoder's stats counters.
     /// Set once at output startup by `run_st2110_audio_output` (and any other
     /// output that runs a TranscodeStage). Reading is a single atomic load.
@@ -137,6 +145,8 @@ impl OutputStatsAccumulator {
             throughput: ThroughputEstimator::new(),
             srt_stats_cache: Arc::new(watch::channel(None).0),
             srt_leg2_stats_cache: Arc::new(watch::channel(None).0),
+            rist_stats_handle: OnceLock::new(),
+            rist_leg2_stats_handle: OnceLock::new(),
             transcode_stats: OnceLock::new(),
             audio_decode_stats: OnceLock::new(),
             audio_encode_stats: OnceLock::new(),
@@ -156,6 +166,18 @@ impl OutputStatsAccumulator {
         stats: Arc<crate::engine::audio_transcode::TranscodeStats>,
     ) {
         let _ = self.transcode_stats.set(stats);
+    }
+
+    /// Register the primary RIST socket's shared stats handle. Called once
+    /// after the `RistSocket` is built for this output. Subsequent calls are
+    /// no-ops so a later `set_rist_leg2_stats` never overwrites leg 1.
+    pub fn set_rist_stats(&self, stats: Arc<rist_transport::RistConnStats>) {
+        let _ = self.rist_stats_handle.set(stats);
+    }
+
+    /// Register the SMPTE 2022-7 second-leg RIST socket's stats handle.
+    pub fn set_rist_leg2_stats(&self, stats: Arc<rist_transport::RistConnStats>) {
+        let _ = self.rist_leg2_stats_handle.set(stats);
     }
 
     /// Register the per-output audio decode stats handle. Called once at
@@ -374,6 +396,14 @@ impl OutputStatsAccumulator {
             fec_packets_sent: self.fec_packets_sent.load(Ordering::Relaxed),
             srt_stats: self.srt_stats_cache.borrow().clone(),
             srt_leg2_stats: self.srt_leg2_stats_cache.borrow().clone(),
+            rist_stats: self
+                .rist_stats_handle
+                .get()
+                .map(|h| rist_conn_to_leg_stats(h.as_ref(), packets_sent > 0)),
+            rist_leg2_stats: self
+                .rist_leg2_stats_handle
+                .get()
+                .map(|h| rist_conn_to_leg_stats(h.as_ref(), packets_sent > 0)),
             transcode_stats,
             audio_decode_stats,
             audio_encode_stats,
@@ -961,6 +991,10 @@ pub struct FlowStatsAccumulator {
     /// Cached SRT stats for redundancy input leg, updated by the SRT input polling task
     /// via a lock-free watch channel.
     pub input_srt_leg2_stats_cache: Arc<watch::Sender<Option<SrtLegStats>>>,
+    /// Shared RIST connection-level counters for the primary input leg.
+    input_rist_stats_handle: OnceLock<Arc<rist_transport::RistConnStats>>,
+    /// Shared RIST counters for the SMPTE 2022-7 second input leg.
+    input_rist_leg2_stats_handle: OnceLock<Arc<rist_transport::RistConnStats>>,
     /// Set to `true` by the bandwidth monitor when the input bitrate exceeds the configured limit.
     pub bandwidth_exceeded: AtomicBool,
     /// Set to `true` by the bandwidth monitor to gate the flow (block action).
@@ -984,6 +1018,23 @@ pub struct FlowStatsAccumulator {
     /// manager UI can show which input source is currently live. Empty
     /// string = no active input (flow idle).
     pub active_input_id: std::sync::RwLock<String>,
+    /// Per-input-id map of PCM transcoder stats handles (channel shuffle /
+    /// sample-rate conversion on the ingest leg). At snapshot time the
+    /// collector reads the entry keyed by `active_input_id` so passive inputs'
+    /// handles don't leak into the reported ingress pipeline after a switch.
+    input_transcode_stats:
+        DashMap<String, Arc<crate::engine::audio_transcode::TranscodeStats>>,
+    /// Per-input-id map of AAC decode stage handles + descriptors.
+    input_audio_decode_stats: DashMap<String, AudioDecodeStatsHandle>,
+    /// Per-input-id map of audio encode stage handles + target codec descriptors.
+    input_audio_encode_stats: DashMap<String, AudioEncodeStatsHandle>,
+    /// Per-input-id map of video encode stage handles + target codec / geometry
+    /// descriptors. Populated by ST 2110-20/-23 inputs or by Group A inputs
+    /// that configured a `video_encode` block (via the `InputTranscoder`).
+    input_video_encode_stats: DashMap<String, VideoEncodeStatsHandle>,
+    /// Per-input-id map of static ingress-summary descriptors. The dynamic
+    /// codec/format fields are merged in at `FlowStatsAccumulator::snapshot()`.
+    ingress_static: DashMap<String, EgressMediaSummaryStatic>,
 }
 
 /// Lightweight input config metadata for topology display.
@@ -1039,13 +1090,120 @@ impl FlowStatsAccumulator {
             output_config_meta: DashMap::new(),
             input_srt_stats_cache: Arc::new(watch::channel(None).0),
             input_srt_leg2_stats_cache: Arc::new(watch::channel(None).0),
+            input_rist_stats_handle: OnceLock::new(),
+            input_rist_leg2_stats_handle: OnceLock::new(),
             bandwidth_exceeded: AtomicBool::new(false),
             bandwidth_blocked: AtomicBool::new(false),
             bandwidth_limit_mbps: OnceLock::new(),
             ptp_state: OnceLock::new(),
             red_blue_stats: OnceLock::new(),
             active_input_id: std::sync::RwLock::new(String::new()),
+            input_transcode_stats: DashMap::new(),
+            input_audio_decode_stats: DashMap::new(),
+            input_audio_encode_stats: DashMap::new(),
+            input_video_encode_stats: DashMap::new(),
+            ingress_static: DashMap::new(),
         }
+    }
+
+    /// Register an input-side PCM transcoder's stats handle for a specific
+    /// input. Called at flow start by each input that instantiates a transcode
+    /// stage. Keyed by `input_id` so a multi-input flow can track each input's
+    /// pipeline independently and report only the active input's stats.
+    #[allow(dead_code)]
+    pub fn set_input_transcode_stats(
+        &self,
+        input_id: &str,
+        stats: Arc<crate::engine::audio_transcode::TranscodeStats>,
+    ) {
+        self.input_transcode_stats.insert(input_id.to_string(), stats);
+    }
+
+    /// Register an input-side audio decode stats handle.
+    #[allow(dead_code)]
+    pub fn set_input_decode_stats(
+        &self,
+        input_id: &str,
+        stats: Arc<crate::engine::audio_decode::DecodeStats>,
+        input_codec: impl Into<String>,
+        output_sample_rate_hz: u32,
+        output_channels: u8,
+    ) {
+        self.input_audio_decode_stats.insert(
+            input_id.to_string(),
+            AudioDecodeStatsHandle {
+                stats,
+                input_codec: input_codec.into(),
+                output_sample_rate_hz,
+                output_channels,
+            },
+        );
+    }
+
+    /// Register an input-side audio encode stats handle.
+    #[allow(dead_code)]
+    pub fn set_input_encode_stats(
+        &self,
+        input_id: &str,
+        stats: Arc<crate::engine::audio_encode::EncodeStats>,
+        output_codec: impl Into<String>,
+        target_sample_rate_hz: u32,
+        target_channels: u8,
+        target_bitrate_kbps: u32,
+    ) {
+        self.input_audio_encode_stats.insert(
+            input_id.to_string(),
+            AudioEncodeStatsHandle {
+                stats,
+                output_codec: output_codec.into(),
+                target_sample_rate_hz,
+                target_channels,
+                target_bitrate_kbps,
+            },
+        );
+    }
+
+    /// Register an input-side video encode stats handle for a specific input.
+    /// Called at flow start by ST 2110-20/-23 inputs or by Group A inputs that
+    /// run a `TsVideoReplacer` on the ingest leg.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_input_video_encode_stats(
+        &self,
+        input_id: &str,
+        stats: Arc<crate::engine::ts_video_replace::VideoEncodeStats>,
+        input_codec: impl Into<String>,
+        output_codec: impl Into<String>,
+        output_width: u32,
+        output_height: u32,
+        output_fps: f32,
+        output_bitrate_kbps: u32,
+        encoder_backend: impl Into<String>,
+    ) {
+        self.input_video_encode_stats.insert(
+            input_id.to_string(),
+            VideoEncodeStatsHandle {
+                stats,
+                input_codec: input_codec.into(),
+                output_codec: output_codec.into(),
+                output_width,
+                output_height,
+                output_fps,
+                output_bitrate_kbps,
+                encoder_backend: encoder_backend.into(),
+            },
+        );
+    }
+
+    /// Register the static portion of an input's ingress media summary.
+    /// Called at flow start, once per input, with values derived from that
+    /// input's config. Snapshot reads only the active input's entry.
+    pub fn set_ingress_static(
+        &self,
+        input_id: &str,
+        descriptor: EgressMediaSummaryStatic,
+    ) {
+        self.ingress_static
+            .insert(input_id.to_string(), descriptor);
     }
 
     /// Set or clear the currently active input ID. Called by `FlowRuntime`
@@ -1055,6 +1213,17 @@ impl FlowStatsAccumulator {
         if let Ok(mut guard) = self.active_input_id.write() {
             *guard = id.to_string();
         }
+    }
+
+    /// Register the primary RIST input's shared stats handle. Called once
+    /// when the `RistSocket::receiver` is built for this flow.
+    pub fn set_input_rist_stats(&self, stats: Arc<rist_transport::RistConnStats>) {
+        let _ = self.input_rist_stats_handle.set(stats);
+    }
+
+    /// Register the SMPTE 2022-7 second-leg RIST input's stats handle.
+    pub fn set_input_rist_leg2_stats(&self, stats: Arc<rist_transport::RistConnStats>) {
+        let _ = self.input_rist_leg2_stats_handle.set(stats);
     }
 
     /// Replace the header fields (`input_type` + `InputConfigMeta`) that the
@@ -1159,8 +1328,8 @@ impl FlowStatsAccumulator {
                 Some(a) => a.value().clone(),
                 None => continue,
             };
-            out.egress_summary = build_egress_summary(
-                acc.as_ref(),
+            out.egress_summary = build_pipeline_summary(
+                acc.egress_static(),
                 out.program_number,
                 media_analysis.as_ref(),
                 out.transcode_stats.as_ref(),
@@ -1170,8 +1339,41 @@ impl FlowStatsAccumulator {
             );
         }
 
+        // Snapshot RIST input stats (primary + 2022-7 leg 2 when present).
+        // The RIST receiver task owns `packets_lost` / `packets_recovered`
+        // inside the `RistConnStats` Arc — surface those here and use them
+        // to drive the generic `input.packets_lost` field for RIST flows
+        // (RIST has its own gap/loss accounting, separate from `input_loss`
+        // which is wired by RTP/SRT inputs).
+        let rist_input_primary_snapshot = self
+            .input_rist_stats_handle
+            .get()
+            .map(|h| h.snapshot());
+        let rist_input_leg2_snapshot = self
+            .input_rist_leg2_stats_handle
+            .get()
+            .map(|h| h.snapshot());
+        let rist_input_has_packets = rist_input_primary_snapshot
+            .as_ref()
+            .map(|s| s.packets_received > 0)
+            .unwrap_or(false);
+        let rist_input_stats = rist_input_primary_snapshot
+            .as_ref()
+            .map(|s| rist_snapshot_to_leg_stats(s, RistStatsRole::Receiver, rist_input_has_packets));
+        let rist_input_leg2_stats = rist_input_leg2_snapshot
+            .as_ref()
+            .map(|s| rist_snapshot_to_leg_stats(s, RistStatsRole::Receiver, s.packets_received > 0));
+
         // Derive flow health (RP 2129 M6)
-        let packets_lost = self.input_loss.load(Ordering::Relaxed);
+        let rist_loss = rist_input_primary_snapshot
+            .as_ref()
+            .map(|s| s.packets_lost)
+            .unwrap_or(0)
+            + rist_input_leg2_snapshot
+                .as_ref()
+                .map(|s| s.packets_lost)
+                .unwrap_or(0);
+        let packets_lost = self.input_loss.load(Ordering::Relaxed).max(rist_loss);
         let bw_exceeded = self.bandwidth_exceeded.load(Ordering::Relaxed);
         let bw_blocked = self.bandwidth_blocked.load(Ordering::Relaxed);
         let health = derive_flow_health(input_bitrate, packets_lost, &tr101290_snap, bw_exceeded, bw_blocked);
@@ -1185,7 +1387,7 @@ impl FlowStatsAccumulator {
             flow_id: self.flow_id.clone(),
             flow_name: self.flow_name.clone(),
             state: FlowState::Running,
-            active_input_id,
+            active_input_id: active_input_id.clone(),
             input: {
                 let input_type = self
                     .input_type
@@ -1194,6 +1396,78 @@ impl FlowStatsAccumulator {
                     .unwrap_or_default();
                 let meta_guard = self.input_config_meta.read().ok();
                 let meta = meta_guard.as_ref().and_then(|g| g.as_ref());
+
+                // Ingress stats/summary are keyed by input_id so a multi-input
+                // flow reports only the currently-active input's pipeline.
+                // Empty key = no active input → all lookups return None, so the
+                // UI shows no transcode/encode badges at all (same as idle).
+                let active_key = active_input_id.as_deref().unwrap_or("");
+                let in_transcode =
+                    self.input_transcode_stats.get(active_key).map(|t| {
+                        crate::stats::models::TranscodeStatsSnapshot {
+                            input_packets: t.input_packets.load(Ordering::Relaxed),
+                            output_packets: t.output_packets.load(Ordering::Relaxed),
+                            dropped: t.dropped.load(Ordering::Relaxed),
+                            format_resets: t.format_resets.load(Ordering::Relaxed),
+                            last_latency_us: t.last_latency_us.load(Ordering::Relaxed),
+                        }
+                    });
+                let in_audio_decode =
+                    self.input_audio_decode_stats.get(active_key).map(|h| {
+                        crate::stats::models::DecodeStatsSnapshot {
+                            input_frames: h.stats.input_frames.load(Ordering::Relaxed),
+                            output_blocks: h.stats.output_blocks.load(Ordering::Relaxed),
+                            decode_errors: h.stats.decode_errors.load(Ordering::Relaxed),
+                            dropped_uninit: h.stats.dropped_uninit.load(Ordering::Relaxed),
+                            input_codec: h.input_codec.clone(),
+                            output_sample_rate_hz: h.output_sample_rate_hz,
+                            output_channels: h.output_channels,
+                        }
+                    });
+                let in_audio_encode =
+                    self.input_audio_encode_stats.get(active_key).map(|h| {
+                        crate::stats::models::EncodeStatsSnapshot {
+                            pcm_frames_submitted: h.stats.pcm_frames_submitted.load(Ordering::Relaxed),
+                            pcm_frames_dropped: h.stats.pcm_frames_dropped.load(Ordering::Relaxed),
+                            encoded_frames_out: h.stats.encoded_frames_out.load(Ordering::Relaxed),
+                            supervisor_restarts: h.stats.supervisor_restarts.load(Ordering::Relaxed),
+                            output_codec: h.output_codec.clone(),
+                            target_sample_rate_hz: h.target_sample_rate_hz,
+                            target_channels: h.target_channels,
+                            target_bitrate_kbps: h.target_bitrate_kbps,
+                        }
+                    });
+                let in_video_encode =
+                    self.input_video_encode_stats.get(active_key).map(|h| {
+                        crate::stats::models::VideoEncodeStatsSnapshot {
+                            input_frames: h.stats.input_frames.load(Ordering::Relaxed),
+                            output_frames: h.stats.output_frames.load(Ordering::Relaxed),
+                            dropped_frames: h.stats.dropped_frames.load(Ordering::Relaxed),
+                            input_codec: h.input_codec.clone(),
+                            output_codec: h.output_codec.clone(),
+                            output_width: h.output_width,
+                            output_height: h.output_height,
+                            output_fps: h.output_fps,
+                            output_bitrate_kbps: h.output_bitrate_kbps,
+                            encoder_backend: h.encoder_backend.clone(),
+                            last_latency_us: h.stats.last_latency_us.load(Ordering::Relaxed),
+                            supervisor_restarts: h.stats.supervisor_restarts.load(Ordering::Relaxed),
+                        }
+                    });
+                let ingress_static_snap = self
+                    .ingress_static
+                    .get(active_key)
+                    .map(|e| e.value().clone());
+                let ingress_summary = build_pipeline_summary(
+                    ingress_static_snap.as_ref(),
+                    None, // ingress does not apply output-side MPTS program filtering
+                    media_analysis.as_ref(),
+                    in_transcode.as_ref(),
+                    in_audio_decode.as_ref(),
+                    in_audio_encode.as_ref(),
+                    in_video_encode.as_ref(),
+                );
+
                 InputStats {
                     input_type,
                     state: derive_input_state(input_bitrate, self.input_packets.load(Ordering::Relaxed)),
@@ -1212,7 +1486,14 @@ impl FlowStatsAccumulator {
                     packets_recovered_fec: self.fec_recovered.load(Ordering::Relaxed),
                     srt_stats: self.input_srt_stats_cache.borrow().clone(),
                     srt_leg2_stats: self.input_srt_leg2_stats_cache.borrow().clone(),
+                    rist_stats: rist_input_stats,
+                    rist_leg2_stats: rist_input_leg2_stats,
                     redundancy_switches: self.redundancy_switches.load(Ordering::Relaxed),
+                    transcode_stats: in_transcode,
+                    audio_decode_stats: in_audio_decode,
+                    audio_encode_stats: in_audio_encode,
+                    video_encode_stats: in_video_encode,
+                    ingress_summary,
                 }
             },
             outputs,
@@ -1242,6 +1523,63 @@ impl FlowStatsAccumulator {
 
 /// Convert a live `engine::st2110::ptp::PtpState` into the wire-shaped
 /// `PtpStateStats` carried by `FlowStats`. Pure mapping — no I/O, no locks.
+/// Socket role for RIST stats conversion. Mirrors `rist_transport::RistRole`
+/// but stays local so the `RistLegStats` serde type never leaks a crate
+/// boundary.
+#[derive(Clone, Copy)]
+pub enum RistStatsRole {
+    Sender,
+    Receiver,
+}
+
+/// Convert a RIST connection-level snapshot into the wire-shaped
+/// [`RistLegStats`] the stats API surfaces. Infers a human-readable state
+/// string from whether packets have flowed in the current reporting window.
+pub fn rist_snapshot_to_leg_stats(
+    snap: &rist_transport::RistConnStatsSnapshot,
+    role: RistStatsRole,
+    active: bool,
+) -> RistLegStats {
+    let (role_name, state) = match role {
+        RistStatsRole::Sender => (
+            "sender".to_string(),
+            if active { "sending" } else { "idle" }.to_string(),
+        ),
+        RistStatsRole::Receiver => (
+            "receiver".to_string(),
+            if snap.packets_received > 0 {
+                "receiving"
+            } else {
+                "idle"
+            }
+            .to_string(),
+        ),
+    };
+    RistLegStats {
+        state,
+        role: role_name,
+        rtt_ms: snap.rtt_ms(),
+        jitter_us: snap.jitter_us,
+        packets_sent: snap.packets_sent,
+        bytes_sent: snap.bytes_sent,
+        pkt_retransmit_total: snap.packets_retransmitted,
+        nack_received_total: snap.nacks_received,
+        packets_received: snap.packets_received,
+        bytes_received: snap.bytes_received,
+        packets_lost: snap.packets_lost,
+        packets_recovered: snap.packets_recovered,
+        nack_sent_total: snap.nacks_sent,
+        duplicates: snap.duplicates,
+        reorder_drops: snap.reorder_drops,
+        retransmits_received: snap.retransmits_received,
+    }
+}
+
+/// Convenience for the output-stats path: always snapshots as a sender.
+fn rist_conn_to_leg_stats(stats: &rist_transport::RistConnStats, active: bool) -> RistLegStats {
+    rist_snapshot_to_leg_stats(&stats.snapshot(), RistStatsRole::Sender, active)
+}
+
 fn ptp_state_to_stats(handle: &crate::engine::st2110::ptp::PtpStateHandle) -> PtpStateStats {
     use crate::engine::st2110::ptp::PtpLockState;
     let s = handle.snapshot();
@@ -1286,15 +1624,14 @@ fn red_blue_to_stats(
     }
 }
 
-/// Build the per-output egress media summary at snapshot time.
+/// Build a pipeline (ingress or egress) media summary at snapshot time.
 ///
-/// Combines the static descriptors registered when the output started
-/// (`EgressMediaSummaryStatic`) with this output's live encode/decode/transcode
-/// stats and the cached input `MediaAnalysisStats`. Returns `None` only when
-/// the output didn't register a static descriptor — in that case the manager
-/// UI degrades to its previous behaviour.
-fn build_egress_summary(
-    acc: &OutputStatsAccumulator,
+/// Combines the static descriptors registered at start-up with live
+/// encode/decode/transcode stats and the cached input `MediaAnalysisStats`.
+/// Returns `None` when no static descriptor was registered — callers then
+/// degrade to their previous behaviour.
+fn build_pipeline_summary(
+    stat_desc: Option<&EgressMediaSummaryStatic>,
     program_number: Option<u16>,
     media_analysis: Option<&crate::stats::models::MediaAnalysisStats>,
     transcode: Option<&crate::stats::models::TranscodeStatsSnapshot>,
@@ -1302,7 +1639,7 @@ fn build_egress_summary(
     audio_encode: Option<&crate::stats::models::EncodeStatsSnapshot>,
     video_encode: Option<&crate::stats::models::VideoEncodeStatsSnapshot>,
 ) -> Option<crate::stats::models::EgressMediaSummary> {
-    let stat_desc = acc.egress_static()?;
+    let stat_desc = stat_desc?;
 
     let mut summary = crate::stats::models::EgressMediaSummary {
         transport_mode: stat_desc.transport_mode.clone(),

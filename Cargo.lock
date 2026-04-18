@@ -342,7 +342,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bilbycast-edge"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "aac-audio",
  "aac-codec",
@@ -2480,7 +2480,7 @@ dependencies = [
 
 [[package]]
 name = "rist-protocol"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "log",
@@ -2490,7 +2490,7 @@ dependencies = [
 
 [[package]]
 name = "rist-transport"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3552,14 +3552,14 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "video-codec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "video-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "libffmpeg-video-sys",

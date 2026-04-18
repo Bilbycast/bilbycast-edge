@@ -90,10 +90,12 @@ struct WebrtcVideoActive {
     requested_height: Option<u32>,
     fps_num: Option<u32>,
     fps_den: Option<u32>,
-    bitrate_kbps: u32,
-    gop_size: Option<u32>,
-    preset: video_codec::VideoPreset,
-    profile: video_codec::VideoProfile,
+    /// Full `video_encode` block — handed to
+    /// `video_encode_util::build_encoder_config` at lazy open-time,
+    /// covering bitrate / gop / preset / profile plus advanced knobs
+    /// (chroma / bit_depth / RC / CRF / bframes / refs / level / tune
+    /// / colour metadata).
+    encode_cfg: VideoEncodeConfig,
     /// Monotonic PTS counter in encoder time base. We pass the source
     /// 90 kHz PTS to `write_media` for correct lip-sync, but the encoder
     /// itself gets a monotonic `out_frame_count` so libx264 / NVENC rate
@@ -129,31 +131,6 @@ fn resolve_webrtc_video_backend(
             );
             None
         }
-    }
-}
-
-#[cfg(all(feature = "webrtc", feature = "video-thumbnail"))]
-fn resolve_webrtc_video_preset(s: Option<&str>) -> video_codec::VideoPreset {
-    match s {
-        Some("ultrafast") => video_codec::VideoPreset::Ultrafast,
-        Some("superfast") => video_codec::VideoPreset::Superfast,
-        Some("veryfast") => video_codec::VideoPreset::Veryfast,
-        Some("faster") => video_codec::VideoPreset::Faster,
-        Some("fast") => video_codec::VideoPreset::Fast,
-        Some("slow") => video_codec::VideoPreset::Slow,
-        Some("slower") => video_codec::VideoPreset::Slower,
-        Some("veryslow") => video_codec::VideoPreset::Veryslow,
-        _ => video_codec::VideoPreset::Medium,
-    }
-}
-
-#[cfg(all(feature = "webrtc", feature = "video-thumbnail"))]
-fn resolve_webrtc_video_profile(s: Option<&str>) -> video_codec::VideoProfile {
-    match s {
-        Some("baseline") => video_codec::VideoProfile::Baseline,
-        Some("main") => video_codec::VideoProfile::Main,
-        Some("high") => video_codec::VideoProfile::High,
-        _ => video_codec::VideoProfile::Auto,
     }
 }
 
@@ -252,10 +229,7 @@ fn open_webrtc_video_active(
         requested_height: cfg.height,
         fps_num: cfg.fps_num,
         fps_den: cfg.fps_den,
-        bitrate_kbps: cfg.bitrate_kbps.unwrap_or(4000),
-        gop_size: cfg.gop_size,
-        preset: resolve_webrtc_video_preset(cfg.preset.as_deref()),
-        profile: resolve_webrtc_video_profile(cfg.profile.as_deref()),
+        encode_cfg: cfg.clone(),
         out_frame_count: 0,
         stats: stats_handle,
     }))
@@ -316,22 +290,18 @@ fn encode_one_video_frame_webrtc(
                     (Some(n), Some(d)) => (n, d),
                     _ => (30, 1),
                 };
-                let gop_size = active.gop_size.unwrap_or(fps_num.max(1) * 2);
-                let enc_cfg = video_codec::VideoEncoderConfig {
-                    codec: active.backend,
-                    width: src_w,
-                    height: src_h,
+                // WebRTC has no out-of-band codec-config channel; emit
+                // SPS/PPS in-band on every IDR so late-joining browsers
+                // can decode as soon as they see a keyframe.
+                let enc_cfg = crate::engine::video_encode_util::build_encoder_config(
+                    &active.encode_cfg,
+                    active.backend,
+                    src_w,
+                    src_h,
                     fps_num,
                     fps_den,
-                    bitrate_kbps: active.bitrate_kbps,
-                    gop_size,
-                    preset: active.preset,
-                    profile: active.profile,
-                    // WebRTC has no out-of-band codec-config channel;
-                    // emit SPS/PPS in-band on every IDR so late-joining
-                    // browsers can decode as soon as they see a keyframe.
-                    global_header: false,
-                };
+                    false,
+                );
                 let enc = match video_engine::VideoEncoder::open(&enc_cfg) {
                     Ok(e) => e,
                     Err(e) => return Err(format!("encoder open failed: {e}")),

@@ -213,8 +213,39 @@ pub struct InputStats {
     /// SRT-level statistics for the redundancy (second) input leg (if SMPTE 2022-7).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub srt_leg2_stats: Option<SrtLegStats>,
+    /// RIST-level statistics for the primary input leg (if RIST transport).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rist_stats: Option<RistLegStats>,
+    /// RIST-level statistics for the redundancy (second) input leg (if SMPTE 2022-7).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rist_leg2_stats: Option<RistLegStats>,
     /// Number of times the active input leg switched between leg 1 and leg 2.
     pub redundancy_switches: u64,
+    /// Per-input PCM transcode stage statistics. Present only when the input
+    /// runs an `engine::audio_transcode::TranscodeStage` (i.e. the input config
+    /// has a `transcode` block). Absent on passthrough inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode_stats: Option<TranscodeStatsSnapshot>,
+    /// Per-input audio decode stage statistics. Present when the input runs
+    /// an AAC decoder as part of its ingress transcode pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_decode_stats: Option<DecodeStatsSnapshot>,
+    /// Per-input audio encode stage statistics. Present when the input runs
+    /// `engine::audio_encode::AudioEncoder` as part of ingress normalization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode_stats: Option<EncodeStatsSnapshot>,
+    /// Per-input video encode stage statistics. Present when the input runs
+    /// `video-engine::VideoEncoder` (ST 2110-20/-23 RFC 4175 ingress, or an
+    /// `engine::ts_video_replace::TsVideoReplacer` fed by the InputTranscoder
+    /// composer on Group A inputs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode_stats: Option<VideoEncodeStatsSnapshot>,
+    /// Compact, snapshot-time description of the media arriving on this input:
+    /// pipeline stages traversed, resolved codecs, and high-level format.
+    /// Mirrors the per-output [`EgressMediaSummary`] so the manager UI can
+    /// render the ingress pipeline with the same renderer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_summary: Option<EgressMediaSummary>,
 }
 
 /// Statistics for a single output leg of a flow.
@@ -272,6 +303,12 @@ pub struct OutputStats {
     /// SRT-level statistics for the redundancy (second) output leg (if SMPTE 2022-7).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub srt_leg2_stats: Option<SrtLegStats>,
+    /// RIST-level statistics for the primary output leg (if RIST transport).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rist_stats: Option<RistLegStats>,
+    /// RIST-level statistics for the redundancy (second) output leg (if SMPTE 2022-7).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rist_leg2_stats: Option<RistLegStats>,
     /// Per-output PCM transcode stage statistics. Present only when the
     /// output runs an `engine::audio_transcode::TranscodeStage` (i.e., the
     /// output config has a `transcode` block AND the upstream input is an
@@ -434,7 +471,10 @@ pub struct VideoEncodeStatsSnapshot {
     pub supervisor_restarts: u64,
 }
 
-/// Snapshot-time description of the egress media for a single output.
+/// Snapshot-time description of the egress (or ingress) media for a single
+/// output or input. Reused for both legs of a flow — when populated as
+/// [`InputStats::ingress_summary`] it describes the transcoded media entering
+/// the flow's broadcast channel.
 ///
 /// Composed from three sources:
 /// - The output's static config (program filter, transport mode, audio/video
@@ -707,6 +747,53 @@ pub struct SrtLegStats {
 
     /// Milliseconds since the SRT socket was connected (socket uptime).
     pub uptime_ms: i64,
+}
+
+/// RIST Simple Profile connection-level statistics for a single RIST
+/// socket/leg. Populated from [`rist_transport::RistConnStats`] by
+/// [`engine::input_rist`] / [`engine::output_rist`] at stats-snapshot time.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct RistLegStats {
+    /// Human-readable RIST state, e.g. `"receiving"`, `"sending"`, `"idle"`.
+    pub state: String,
+    /// Socket role: `"sender"` or `"receiver"`.
+    pub role: String,
+    /// Smoothed round-trip time in milliseconds.
+    pub rtt_ms: f64,
+    /// Interarrival jitter (RFC 3550 A.8) in microseconds.
+    pub jitter_us: u64,
+
+    // ── Sender-side counters ──
+    /// Total RTP packets transmitted (including retransmissions).
+    pub packets_sent: u64,
+    /// Total bytes transmitted.
+    pub bytes_sent: u64,
+    /// Total packets retransmitted in response to NACKs.
+    pub pkt_retransmit_total: u64,
+    /// Total packets requested via NACKs received from the receiver.
+    pub nack_received_total: u64,
+
+    // ── Receiver-side counters ──
+    /// Total RTP packets received (unique + retransmits).
+    pub packets_received: u64,
+    /// Total bytes received.
+    pub bytes_received: u64,
+    /// Total packets NOT recovered by ARQ — dropped before delivery.
+    pub packets_lost: u64,
+    /// Total lost packets subsequently recovered via retransmit.
+    pub packets_recovered: u64,
+    /// Total NACK feedback messages sent to the peer.
+    pub nack_sent_total: u64,
+    /// Total duplicate packets ignored at the reorder buffer.
+    pub duplicates: u64,
+    /// Total packets dropped because the application consumer was lagging
+    /// or the packet arrived outside the reorder window.
+    pub reorder_drops: u64,
+    /// Total RTP data packets received with the RIST retransmit flag set
+    /// (SSRC LSB=1). Authoritative count of ARQ deliveries — distinct
+    /// from `packets_recovered`, which also includes natural
+    /// out-of-order arrivals that happen to fill a gap.
+    pub retransmits_received: u64,
 }
 
 // ── Media Analysis ────────────────────────────────────────────────────────

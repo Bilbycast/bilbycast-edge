@@ -505,6 +505,9 @@ mod tests {
             ip_ttl: None,
             redundancy: None,
             transport_mode: None,
+            audio_encode: None,
+            transcode: None,
+            video_encode: None,
         }
     }
 
@@ -686,6 +689,9 @@ mod tests {
                     max_bitrate_mbps: None,
                     tr07_mode: None,
                     redundancy: None,
+                    audio_encode: None,
+                    transcode: None,
+                    video_encode: None,
                 }),
             }],
             outputs: vec![OutputConfig::Rtmp(RtmpOutputConfig {

@@ -54,6 +54,8 @@ pub fn spawn_rtp_audio_input(
         clock_domain: None,
         allowed_sources: config.allowed_sources.clone(),
         max_bitrate_mbps: None,
+        transcode: config.transcode.clone(),
+        audio_encode: config.audio_encode.clone(),
     };
 
     tokio::spawn(async move {

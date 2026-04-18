@@ -226,6 +226,63 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
                 );
             }
         }
+
+        // Broadcast-channel shape compatibility.
+        //
+        // Every input on the flow must publish the same shape onto the main
+        // broadcast channel, otherwise outputs would see random format switches
+        // when the active input changes. Two shapes are possible:
+        //
+        //   * "ts"      — MPEG-TS bytes (native TS transports, and PCM inputs
+        //                 with `audio_encode` set, which mux into audio-only TS)
+        //   * "pcm_rtp" — raw RTP (ST 2110-30/-31, rtp_audio, ST 2110-40)
+        //
+        // ST 2110-40 (ANC) is non-media and passes through regardless — it has
+        // no broadcast shape of its own. We skip it in the compatibility check.
+        let flow_inputs: Vec<&InputConfig> = flow
+            .input_ids
+            .iter()
+            .filter_map(|iid| config.inputs.iter().find(|d| d.id == *iid).map(|d| &d.config))
+            .filter(|c| !matches!(c, InputConfig::St2110_40(_)))
+            .collect();
+        if flow_inputs.len() >= 2 {
+            let first_shape = flow_inputs[0].produces_ts();
+            for (idx, inp) in flow_inputs.iter().enumerate().skip(1) {
+                if inp.produces_ts() != first_shape {
+                    bail!(
+                        "Flow '{}': input #0 produces {} but input #{} produces {} — \
+                         all inputs on a flow must share the same broadcast-channel shape. \
+                         Add `audio_encode` to the PCM input(s) to convert them to TS, or \
+                         remove `audio_encode` so the flow stays on PCM-RTP.",
+                        flow.id,
+                        if first_shape { "MPEG-TS" } else { "PCM-RTP" },
+                        idx,
+                        if inp.produces_ts() { "MPEG-TS" } else { "PCM-RTP" },
+                    );
+                }
+            }
+        }
+
+        // If the flow broadcasts TS (either natively or because a PCM input has
+        // `audio_encode` set), PCM-only outputs cannot attach: they depacketize
+        // RTP PCM and would silently produce noise if fed encoded TS.
+        let flow_produces_ts = flow_inputs.first().map(|c| c.produces_ts()).unwrap_or(false);
+        if flow_produces_ts {
+            for oid in &flow.output_ids {
+                let Some(output) = config.outputs.iter().find(|o| o.id() == oid) else {
+                    continue;
+                };
+                if output_is_pcm_only(output) {
+                    bail!(
+                        "Flow '{}': output '{}' expects raw PCM-RTP on the broadcast \
+                         channel, but this flow's inputs produce MPEG-TS (either natively \
+                         or via `audio_encode` on a PCM input). Remove the PCM-only output \
+                         from this flow, or remove `audio_encode` from the PCM input(s).",
+                        flow.id, oid
+                    );
+                }
+            }
+        }
     }
 
     // ── Upstream-aware output validation ──────────────────────────────
@@ -383,6 +440,19 @@ pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
     Ok(())
 }
 
+/// Returns true when this output expects raw PCM-RTP on the flow's broadcast
+/// channel. Used by the flow-level shape-compatibility check: these outputs
+/// cannot attach to a flow whose inputs produce MPEG-TS.
+fn output_is_pcm_only(output: &OutputConfig) -> bool {
+    matches!(
+        output,
+        OutputConfig::St2110_30(_)
+            | OutputConfig::St2110_31(_)
+            | OutputConfig::St2110_40(_)
+            | OutputConfig::RtpAudio(_)
+    )
+}
+
 /// If `input` is itself an uncompressed audio source, return its
 /// `(sample_rate, bit_depth, channels)` shape so per-output transcode
 /// validation can check matrices against the real upstream channel count
@@ -489,6 +559,12 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                     }
                 }
             }
+            validate_input_transcode_group_a(
+                rtp.audio_encode.as_ref(),
+                rtp.transcode.as_ref(),
+                rtp.video_encode.as_ref(),
+                "RTP input",
+            )?;
         }
         InputConfig::Udp(udp) => {
             validate_socket_addr(&udp.bind_addr, "UDP input bind_addr")?;
@@ -506,6 +582,12 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                     );
                 }
             }
+            validate_input_transcode_group_a(
+                udp.audio_encode.as_ref(),
+                udp.transcode.as_ref(),
+                udp.video_encode.as_ref(),
+                "UDP input",
+            )?;
         }
         InputConfig::Srt(srt) => {
             match srt.mode {
@@ -542,9 +624,21 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                     );
                 }
             }
+            validate_input_transcode_group_a(
+                srt.audio_encode.as_ref(),
+                srt.transcode.as_ref(),
+                srt.video_encode.as_ref(),
+                "SRT input",
+            )?;
         }
         InputConfig::Rist(rist) => {
             validate_rist_input(rist)?;
+            validate_input_transcode_group_a(
+                rist.audio_encode.as_ref(),
+                rist.transcode.as_ref(),
+                rist.video_encode.as_ref(),
+                "RIST input",
+            )?;
         }
         InputConfig::Rtmp(rtmp) => {
             validate_socket_addr(&rtmp.listen_addr, "RTMP input listen_addr")?;
@@ -559,6 +653,12 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                     bail!("RTMP input stream_key must be at most 256 characters");
                 }
             }
+            validate_input_transcode_group_a(
+                rtmp.audio_encode.as_ref(),
+                rtmp.transcode.as_ref(),
+                rtmp.video_encode.as_ref(),
+                "RTMP input",
+            )?;
         }
         InputConfig::Rtsp(rtsp) => {
             if !rtsp.rtsp_url.starts_with("rtsp://") && !rtsp.rtsp_url.starts_with("rtsps://") {
@@ -577,6 +677,12 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                     bail!("RTSP input: password must be at most 256 characters");
                 }
             }
+            validate_input_transcode_group_a(
+                rtsp.audio_encode.as_ref(),
+                rtsp.transcode.as_ref(),
+                rtsp.video_encode.as_ref(),
+                "RTSP input",
+            )?;
         }
         InputConfig::Webrtc(webrtc) => {
             if let Some(ref token) = webrtc.bearer_token {
@@ -594,6 +700,12 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                     bail!("WebRTC input: stun_server must be at most 2048 characters");
                 }
             }
+            validate_input_transcode_group_a(
+                webrtc.audio_encode.as_ref(),
+                webrtc.transcode.as_ref(),
+                webrtc.video_encode.as_ref(),
+                "WebRTC input",
+            )?;
         }
         InputConfig::Whep(whep) => {
             if !whep.whep_url.starts_with("http://") && !whep.whep_url.starts_with("https://") {
@@ -607,6 +719,12 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                     bail!("WHEP input: bearer_token must be at most 4096 characters");
                 }
             }
+            validate_input_transcode_group_a(
+                whep.audio_encode.as_ref(),
+                whep.transcode.as_ref(),
+                whep.video_encode.as_ref(),
+                "WHEP input",
+            )?;
         }
         InputConfig::St2110_30(c) => validate_st2110_audio_input(c, St2110Profile::Pcm)?,
         InputConfig::St2110_31(c) => validate_st2110_audio_input(c, St2110Profile::Aes3)?,
@@ -662,6 +780,67 @@ fn validate_st2110_audio_input(c: &St2110AudioInputConfig, profile: St2110Profil
     if let Some(ref red) = c.redundancy {
         validate_red_blue_bind(red, &c.bind_addr, &format!("{label} input redundancy"))?;
     }
+
+    // Transcode / audio_encode on PCM inputs.
+    //
+    // ST 2110-31 (AES3-transparent): both are rejected. The payload carries
+    // SMPTE 337M sub-frames (possibly Dolby E); running it through a linear
+    // PCM transcoder or decoder would silently destroy metadata. This matches
+    // the existing output-side exclusion.
+    //
+    // ST 2110-30 (linear PCM): the input-shape is known at config time, so
+    // `transcode` uses the eager validator. `audio_encode` is valid but changes
+    // the flow's broadcast-channel shape (PCM-RTP → audio-only TS) — the
+    // flow-level check in `validate_config` rejects incompatible outputs on
+    // the same flow.
+    match profile {
+        St2110Profile::Aes3 => {
+            if c.transcode.is_some() {
+                bail!(
+                    "{label} input: transcode is not supported on AES3-transparent inputs — \
+                     the payload carries SMPTE 337M sub-frames that a linear-PCM transcoder \
+                     would corrupt",
+                );
+            }
+            if c.audio_encode.is_some() {
+                bail!(
+                    "{label} input: audio_encode is not supported on AES3-transparent inputs \
+                     — the payload cannot be decoded to linear PCM without an AES3/337M \
+                     parser (not currently implemented)",
+                );
+            }
+        }
+        St2110Profile::Pcm => {
+            if let Some(ref tj) = c.transcode {
+                validate_transcode_block(
+                    tj,
+                    c.sample_rate,
+                    c.bit_depth,
+                    c.channels,
+                    &format!("{label} input transcode"),
+                )?;
+            }
+            if let Some(ref ae) = c.audio_encode {
+                validate_audio_encode(
+                    ae,
+                    TS_INPUT_AUDIO_CODECS,
+                    &format!("{label} input"),
+                )?;
+                // The runtime PCM-to-compressed-TS muxer is not yet wired —
+                // see `engine::input_pcm_encode::PcmInputError::\
+                // AudioEncodeNotYetImplemented`. Reject here so operators
+                // get a clear error instead of silently falling back to
+                // PCM passthrough at flow start.
+                bail!(
+                    "{label} input: audio_encode on a PCM-only input is not yet supported at \
+                     runtime (the PCM→compressed-TS muxer is pending). This will be enabled \
+                     in a follow-up release; for now, drop audio_encode or use a compressed \
+                     audio input type (SRT/UDP/RTP/RTMP with AAC) instead",
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1126,6 +1305,26 @@ fn validate_rtp_audio_input(c: &RtpAudioInputConfig) -> Result<()> {
     if let Some(ref red) = c.redundancy {
         validate_red_blue_bind(red, &c.bind_addr, "rtp_audio input redundancy")?;
     }
+    if let Some(ref tj) = c.transcode {
+        validate_transcode_block(
+            tj,
+            c.sample_rate,
+            c.bit_depth,
+            c.channels,
+            "rtp_audio input transcode",
+        )?;
+    }
+    if let Some(ref ae) = c.audio_encode {
+        validate_audio_encode(ae, TS_INPUT_AUDIO_CODECS, "rtp_audio input")?;
+        // Same reason as ST 2110-30 — the PCM→compressed-TS muxer for
+        // PCM-only inputs is not yet wired. Reject up-front rather than
+        // letting the runtime silently fall back to PCM passthrough.
+        bail!(
+            "rtp_audio input: audio_encode on a PCM-only input is not yet supported at \
+             runtime (the PCM→compressed-TS muxer is pending). Drop audio_encode or use \
+             a compressed audio input (SRT/UDP/RTP/RTMP with AAC) instead",
+        );
+    }
     Ok(())
 }
 
@@ -1483,10 +1682,162 @@ fn validate_video_encode(
     }
     if let Some(ref pr) = enc.profile {
         match pr.as_str() {
-            "baseline" | "main" | "high" => {}
+            "baseline" | "main" | "high" | "high10" | "high422" | "high444" | "main10" => {}
             other => bail!(
                 "{context}: video_encode.profile '{other}' is not recognised; \
-                 expected one of baseline, main, high"
+                 expected one of baseline, main, high, high10, high422, high444, main10"
+            ),
+        }
+    }
+    // ── chroma / bit depth ────────────────────────────────────────────
+    let chroma_str: Option<&str> = enc.chroma.as_deref();
+    if let Some(c) = chroma_str {
+        match c {
+            "yuv420p" | "yuv422p" | "yuv444p" => {}
+            other => bail!(
+                "{context}: video_encode.chroma '{other}' is not recognised; \
+                 expected one of yuv420p, yuv422p, yuv444p"
+            ),
+        }
+    }
+    if let Some(bd) = enc.bit_depth {
+        if bd != 8 && bd != 10 {
+            bail!(
+                "{context}: video_encode.bit_depth must be 8 or 10, got {bd}"
+            );
+        }
+    }
+    // NVENC backend restrictions — catch at validation time rather than
+    // at encoder-open.
+    match (enc.codec.as_str(), chroma_str, enc.bit_depth) {
+        ("h264_nvenc", _, Some(10)) => bail!(
+            "{context}: h264_nvenc does not support 10-bit encoding; \
+             use hevc_nvenc, x264, or x265 instead"
+        ),
+        ("h264_nvenc" | "hevc_nvenc", Some("yuv444p"), _) => bail!(
+            "{context}: NVENC backends do not support chroma=yuv444p; \
+             use x264 or x265 instead"
+        ),
+        _ => {}
+    }
+    // Profile ↔ chroma/bit_depth compatibility.
+    match (
+        enc.profile.as_deref(),
+        chroma_str.unwrap_or("yuv420p"),
+        enc.bit_depth.unwrap_or(8),
+    ) {
+        (Some("high10"), _, 8) => bail!(
+            "{context}: video_encode.profile=high10 requires bit_depth=10"
+        ),
+        (Some("main10"), _, 8) => bail!(
+            "{context}: video_encode.profile=main10 requires bit_depth=10"
+        ),
+        (Some("high422"), "yuv420p", _) | (Some("high422"), "yuv444p", _) => bail!(
+            "{context}: video_encode.profile=high422 requires chroma=yuv422p"
+        ),
+        (Some("high444"), "yuv420p", _) | (Some("high444"), "yuv422p", _) => bail!(
+            "{context}: video_encode.profile=high444 requires chroma=yuv444p"
+        ),
+        _ => {}
+    }
+    // ── rate control ──────────────────────────────────────────────────
+    if let Some(ref rc) = enc.rate_control {
+        match rc.as_str() {
+            "vbr" | "cbr" | "crf" | "abr" => {}
+            other => bail!(
+                "{context}: video_encode.rate_control '{other}' is not recognised; \
+                 expected one of vbr, cbr, crf, abr"
+            ),
+        }
+    }
+    if let Some(crf) = enc.crf {
+        if crf > 51 {
+            bail!(
+                "{context}: video_encode.crf must be 0..=51, got {crf}"
+            );
+        }
+    }
+    if let Some(mb) = enc.max_bitrate_kbps {
+        if !(100..=100_000).contains(&mb) {
+            bail!(
+                "{context}: video_encode.max_bitrate_kbps must be 100..=100000, got {mb}"
+            );
+        }
+        if let Some(br) = enc.bitrate_kbps {
+            if mb < br {
+                bail!(
+                    "{context}: video_encode.max_bitrate_kbps ({mb}) must be >= bitrate_kbps ({br})"
+                );
+            }
+        }
+    }
+    // ── frame structure ───────────────────────────────────────────────
+    if let Some(bf) = enc.bframes {
+        if bf > 16 {
+            bail!("{context}: video_encode.bframes must be 0..=16, got {bf}");
+        }
+    }
+    if let Some(rf) = enc.refs {
+        if !(1..=16).contains(&rf) {
+            bail!("{context}: video_encode.refs must be 1..=16, got {rf}");
+        }
+    }
+    if let Some(ref lv) = enc.level {
+        if lv.len() > 8 {
+            bail!(
+                "{context}: video_encode.level string too long (max 8 chars)"
+            );
+        }
+        if !lv.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            bail!(
+                "{context}: video_encode.level must contain only digits and '.', got '{lv}'"
+            );
+        }
+    }
+    if let Some(ref t) = enc.tune {
+        match t.as_str() {
+            // Empty string = unset (encoder default).
+            "" | "zerolatency" | "film" | "animation" | "grain" | "stillimage"
+            | "fastdecode" | "psnr" | "ssim" => {}
+            other => bail!(
+                "{context}: video_encode.tune '{other}' is not recognised; \
+                 expected one of (empty), zerolatency, film, animation, grain, \
+                 stillimage, fastdecode, psnr, ssim"
+            ),
+        }
+    }
+    // ── colour metadata ───────────────────────────────────────────────
+    if let Some(ref p) = enc.color_primaries {
+        match p.as_str() {
+            "" | "bt709" | "bt2020" | "smpte170m" | "smpte240m" | "bt470m" | "bt470bg" => {}
+            other => bail!(
+                "{context}: video_encode.color_primaries '{other}' is not recognised"
+            ),
+        }
+    }
+    if let Some(ref t) = enc.color_transfer {
+        match t.as_str() {
+            "" | "bt709" | "smpte170m" | "smpte2084" | "pq" | "arib-std-b67" | "hlg"
+            | "bt2020-10" | "bt2020-12" => {}
+            other => bail!(
+                "{context}: video_encode.color_transfer '{other}' is not recognised"
+            ),
+        }
+    }
+    if let Some(ref m) = enc.color_matrix {
+        match m.as_str() {
+            "" | "bt709" | "bt2020nc" | "bt2020c" | "smpte170m" | "smpte240m" => {}
+            other => bail!(
+                "{context}: video_encode.color_matrix '{other}' is not recognised"
+            ),
+        }
+    }
+    if let Some(ref r) = enc.color_range {
+        match r.as_str() {
+            "" | "tv" | "limited" | "mpeg" | "pc" | "full" | "jpeg" => {}
+            other => bail!(
+                "{context}: video_encode.color_range '{other}' is not recognised; \
+                 expected one of tv, pc"
             ),
         }
     }
@@ -1540,6 +1891,33 @@ fn validate_audio_encode(
                 enc.codec, ch
             );
         }
+    }
+    Ok(())
+}
+
+/// TS-carrying inputs accept the same audio codec set as TS outputs — Opus
+/// has no standard MPEG-TS mapping, so it is excluded.
+const TS_INPUT_AUDIO_CODECS: &[&str] = &["aac_lc", "he_aac_v1", "he_aac_v2", "mp2", "ac3"];
+
+/// Apply the standard Group-A (TS-carrying input) transcoding validation:
+/// video_encode + audio_encode + transcode. All three are optional; any
+/// combination may be set or unset. The upstream audio shape is unknown at
+/// config-load time (codec and channel count come from the live stream), so
+/// transcode validation uses the deferred variant.
+fn validate_input_transcode_group_a(
+    audio_encode: Option<&crate::config::models::AudioEncodeConfig>,
+    transcode: Option<&crate::engine::audio_transcode::TranscodeJson>,
+    video_encode: Option<&crate::config::models::VideoEncodeConfig>,
+    label: &str,
+) -> Result<()> {
+    if let Some(ve) = video_encode {
+        validate_video_encode(ve, label)?;
+    }
+    if let Some(ae) = audio_encode {
+        validate_audio_encode(ae, TS_INPUT_AUDIO_CODECS, label)?;
+    }
+    if let Some(tj) = transcode {
+        validate_transcode_block_deferred(tj, &format!("{label} transcode"))?;
     }
     Ok(())
 }
@@ -2944,6 +3322,9 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
+                audio_encode: None,
+                transcode: None,
+                video_encode: None,
             }),
         });
         config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
@@ -3022,6 +3403,9 @@ mod tests {
             max_bitrate_mbps: None,
             tr07_mode: None,
             redundancy: None,
+            audio_encode: None,
+            transcode: None,
+            video_encode: None,
         }));
         assert!(validate_config(&config).is_err());
     }
@@ -3050,6 +3434,9 @@ mod tests {
             payload_size: None, mss: None, tlpkt_drop: None, ip_ttl: None,
             redundancy: None,
             transport_mode: None,
+            audio_encode: None,
+            transcode: None,
+            video_encode: None,
         }));
         assert!(validate_config(&config).is_err());
     }
@@ -3071,6 +3458,9 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
+                audio_encode: None,
+                transcode: None,
+                video_encode: None,
             }),
         });
         config.inputs.push(InputDefinition {
@@ -3087,6 +3477,9 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
+                audio_encode: None,
+                transcode: None,
+                video_encode: None,
             }),
         });
         config.flows.push(FlowConfig {
@@ -3142,6 +3535,9 @@ mod tests {
             payload_size: None, mss: None, tlpkt_drop: None, ip_ttl: None,
             redundancy: None,
             transport_mode: None,
+            audio_encode: None,
+            transcode: None,
+            video_encode: None,
         }));
         assert!(validate_config(&config).is_err());
     }
@@ -3171,6 +3567,9 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
+                audio_encode: None,
+                transcode: None,
+                video_encode: None,
             }),
         });
         config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
@@ -3223,6 +3622,9 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
+                audio_encode: None,
+                transcode: None,
+                video_encode: None,
             }),
         });
         config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
@@ -3271,6 +3673,9 @@ mod tests {
             max_bitrate_mbps: None,
             tr07_mode: None,
             redundancy: None,
+            audio_encode: None,
+            transcode: None,
+            video_encode: None,
         }));
         assert!(validate_config(&config).is_err());
     }
@@ -3292,6 +3697,9 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
+                audio_encode: None,
+                transcode: None,
+                video_encode: None,
             }),
         });
         config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
@@ -3344,6 +3752,9 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
+                audio_encode: None,
+                transcode: None,
+                video_encode: None,
             }),
         });
         config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
@@ -3396,6 +3807,9 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
+                audio_encode: None,
+                transcode: None,
+                video_encode: None,
             }),
         });
         config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
@@ -3446,6 +3860,8 @@ mod tests {
             clock_domain: Some(0),
             allowed_sources: None,
             max_bitrate_mbps: None,
+            audio_encode: None,
+            transcode: None,
         }
     }
 
@@ -4077,6 +4493,19 @@ mod tests {
                 gop_size: None,
                 preset: None,
                 profile: None,
+                chroma: None,
+                bit_depth: None,
+                rate_control: None,
+                crf: None,
+                max_bitrate_kbps: None,
+                bframes: None,
+                refs: None,
+                level: None,
+                tune: None,
+                color_primaries: None,
+                color_transfer: None,
+                color_matrix: None,
+                color_range: None,
             }),
         });
         // H.264 backends are accepted only when the feature is compiled
@@ -4211,6 +4640,9 @@ mod tests {
                 ip_ttl: None,
                 redundancy: None,
                 transport_mode: None,
+                audio_encode: None,
+                transcode: None,
+                video_encode: None,
             }),
         };
         // Add a UDP tunnel egress on the same port
@@ -4255,6 +4687,9 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
+                audio_encode: None,
+                transcode: None,
+                video_encode: None,
             }),
         });
         config.inputs.push(InputDefinition {
@@ -4271,6 +4706,9 @@ mod tests {
                 max_bitrate_mbps: None,
                 tr07_mode: None,
                 redundancy: None,
+                audio_encode: None,
+                transcode: None,
+                video_encode: None,
             }),
         });
         assert!(validate_config(&config).is_ok());

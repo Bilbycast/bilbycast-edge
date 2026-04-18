@@ -90,10 +90,12 @@ struct VideoActive {
     requested_height: Option<u32>,
     fps_num: Option<u32>,
     fps_den: Option<u32>,
-    bitrate_kbps: u32,
-    gop_size: Option<u32>,
-    preset: video_codec::VideoPreset,
-    profile: video_codec::VideoProfile,
+    /// Snapshot of the full `video_encode` block — the lazy encoder
+    /// opener hands this to `video_encode_util::build_encoder_config`
+    /// which covers bitrate / gop / preset / profile plus the advanced
+    /// knobs (chroma / bit_depth / rate_control / CRF / bframes / refs /
+    /// level / tune / colour metadata).
+    encode_cfg: crate::config::models::VideoEncodeConfig,
     /// Cached FLV sequence-header payload built from the encoder's
     /// `extradata` on first-encoder-open. `None` until the encoder opens
     /// and emits its out-of-band SPS/PPS (or VPS/SPS/PPS).
@@ -822,31 +824,6 @@ fn resolve_backend(
     }
 }
 
-#[cfg(feature = "video-thumbnail")]
-fn resolve_preset(s: Option<&str>) -> video_codec::VideoPreset {
-    match s {
-        Some("ultrafast") => video_codec::VideoPreset::Ultrafast,
-        Some("superfast") => video_codec::VideoPreset::Superfast,
-        Some("veryfast") => video_codec::VideoPreset::Veryfast,
-        Some("faster") => video_codec::VideoPreset::Faster,
-        Some("fast") => video_codec::VideoPreset::Fast,
-        Some("slow") => video_codec::VideoPreset::Slow,
-        Some("slower") => video_codec::VideoPreset::Slower,
-        Some("veryslow") => video_codec::VideoPreset::Veryslow,
-        _ => video_codec::VideoPreset::Medium,
-    }
-}
-
-#[cfg(feature = "video-thumbnail")]
-fn resolve_profile(s: Option<&str>) -> video_codec::VideoProfile {
-    match s {
-        Some("baseline") => video_codec::VideoProfile::Baseline,
-        Some("main") => video_codec::VideoProfile::Main,
-        Some("high") => video_codec::VideoProfile::High,
-        _ => video_codec::VideoProfile::Auto,
-    }
-}
-
 /// Core per-frame handler: dispatches passthrough vs transcode, sends the
 /// necessary FLV tags to the RTMP peer, and updates per-output stats.
 ///
@@ -1152,10 +1129,7 @@ fn open_video_active(
         requested_height: cfg.height,
         fps_num: cfg.fps_num,
         fps_den: cfg.fps_den,
-        bitrate_kbps: cfg.bitrate_kbps.unwrap_or(4000),
-        gop_size: cfg.gop_size,
-        preset: resolve_preset(cfg.preset.as_deref()),
-        profile: resolve_profile(cfg.profile.as_deref()),
+        encode_cfg: cfg.clone(),
         sequence_header_tag: None,
         sequence_header_sent: false,
         out_frame_count: 0,
@@ -1219,22 +1193,18 @@ async fn encode_one_frame(
                         (Some(n), Some(d)) => (n, d),
                         _ => (30, 1),
                     };
-                    let gop_size = active.gop_size.unwrap_or(fps_num.max(1) * 2);
-                    let enc_cfg = video_codec::VideoEncoderConfig {
-                        codec: active.backend,
-                        width: src_w,
-                        height: src_h,
+                    // Emit SPS/PPS (H.264) or VPS/SPS/PPS (HEVC) in
+                    // out-of-band extradata — the FLV sequence header
+                    // format expects the full DecoderConfigurationRecord.
+                    let enc_cfg = crate::engine::video_encode_util::build_encoder_config(
+                        &active.encode_cfg,
+                        active.backend,
+                        src_w,
+                        src_h,
                         fps_num,
                         fps_den,
-                        bitrate_kbps: active.bitrate_kbps,
-                        gop_size,
-                        preset: active.preset,
-                        profile: active.profile,
-                        // Emit SPS/PPS (H.264) or VPS/SPS/PPS (HEVC) in
-                        // out-of-band extradata — the FLV sequence header
-                        // format expects the full DecoderConfigurationRecord.
-                        global_header: true,
-                    };
+                        true,
+                    );
                     let enc = match video_engine::VideoEncoder::open(&enc_cfg) {
                         Ok(e) => e,
                         Err(e) => {

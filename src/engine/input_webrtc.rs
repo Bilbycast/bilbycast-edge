@@ -26,6 +26,8 @@ use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::FlowStatsAccumulator;
 
 #[cfg(feature = "webrtc")]
+use super::input_transcode::{publish_input_packet, InputTranscoder};
+#[cfg(feature = "webrtc")]
 use super::packet::RtpPacket;
 #[cfg(feature = "webrtc")]
 use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
@@ -40,6 +42,7 @@ use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
 pub fn spawn_whip_input(
     config: WebrtcInputConfig,
     flow_id: String,
+    input_id: String,
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
@@ -48,7 +51,30 @@ pub fn spawn_whip_input(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         tracing::info!("WHIP input started for flow '{}', waiting for publisher", flow_id);
-        whip_input_loop(config, &flow_id, broadcast_tx, stats, cancel, session_rx, &event_sender).await;
+        let mut transcoder = match InputTranscoder::new(
+            config.audio_encode.as_ref(),
+            config.transcode.as_ref(),
+            config.video_encode.as_ref(),
+        ) {
+            Ok(t) => {
+                if let Some(ref t) = t {
+                    tracing::info!("WHIP input: ingress transcode active — {}", t.describe());
+                }
+                t
+            }
+            Err(e) => {
+                tracing::error!("WHIP input: transcode setup failed, passthrough: {e}");
+                None
+            }
+        };
+        super::input_transcode::register_ingress_stats(
+            stats.as_ref(),
+            &input_id,
+            transcoder.as_ref(),
+            config.audio_encode.as_ref(),
+            config.video_encode.as_ref(),
+        );
+        whip_input_loop(config, &flow_id, broadcast_tx, stats, cancel, session_rx, &event_sender, &mut transcoder).await;
         tracing::info!("WHIP input stopped for flow '{}'", flow_id);
     })
 }
@@ -62,6 +88,7 @@ async fn whip_input_loop(
     cancel: CancellationToken,
     mut session_rx: tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>,
     events: &EventSender,
+    transcoder: &mut Option<InputTranscoder>,
 ) {
     let public_ip: Option<std::net::IpAddr> =
         config.public_ip.as_ref().and_then(|ip| ip.parse().ok());
@@ -164,7 +191,7 @@ async fn whip_input_loop(
                             stats.input_packets.fetch_add(1, Ordering::Relaxed);
                             stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
                             if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                                let _ = broadcast_tx.send(pkt);
+                                publish_input_packet(transcoder, &broadcast_tx, pkt);
                             } else {
                                 stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                             }
@@ -202,10 +229,34 @@ pub fn spawn_whep_input(
     cancel: CancellationToken,
     event_sender: EventSender,
     flow_id: String,
+    input_id: String,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         tracing::info!("WHEP input started, connecting to {}", config.whep_url);
-        whep_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id).await;
+        let mut transcoder = match InputTranscoder::new(
+            config.audio_encode.as_ref(),
+            config.transcode.as_ref(),
+            config.video_encode.as_ref(),
+        ) {
+            Ok(t) => {
+                if let Some(ref t) = t {
+                    tracing::info!("WHEP input: ingress transcode active — {}", t.describe());
+                }
+                t
+            }
+            Err(e) => {
+                tracing::error!("WHEP input: transcode setup failed, passthrough: {e}");
+                None
+            }
+        };
+        super::input_transcode::register_ingress_stats(
+            stats.as_ref(),
+            &input_id,
+            transcoder.as_ref(),
+            config.audio_encode.as_ref(),
+            config.video_encode.as_ref(),
+        );
+        whep_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder).await;
     })
 }
 
@@ -217,6 +268,7 @@ async fn whep_input_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    transcoder: &mut Option<InputTranscoder>,
 ) {
     let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
     // WHEP input is the client side — full ICE (not ICE-Lite).
@@ -341,7 +393,7 @@ async fn whep_input_loop(
                             stats.input_packets.fetch_add(1, Ordering::Relaxed);
                             stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
                             if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                                let _ = broadcast_tx.send(pkt);
+                                publish_input_packet(transcoder, &broadcast_tx, pkt);
                             } else {
                                 stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                             }

@@ -20,6 +20,7 @@ use crate::util::rtp_parse::{is_likely_rtp, parse_rtp_sequence_number, parse_rtp
 use crate::util::socket::bind_udp_input;
 use crate::util::time::now_us;
 
+use super::input_transcode::{publish_input_packet, InputTranscoder};
 use super::packet::{MAX_RTP_PACKET_SIZE, RtpPacket};
 
 /// Spawn a task that receives RTP packets from a UDP socket and
@@ -33,12 +34,36 @@ pub fn spawn_rtp_input(
     cancel: CancellationToken,
     event_sender: EventSender,
     flow_id: String,
+    input_id: String,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut transcoder = match InputTranscoder::new(
+            config.audio_encode.as_ref(),
+            config.transcode.as_ref(),
+            config.video_encode.as_ref(),
+        ) {
+            Ok(t) => {
+                if let Some(ref t) = t {
+                    tracing::info!("RTP input: ingress transcode active — {}", t.describe());
+                }
+                t
+            }
+            Err(e) => {
+                tracing::error!("RTP input: transcode setup failed, passthrough: {e}");
+                None
+            }
+        };
+        super::input_transcode::register_ingress_stats(
+            stats.as_ref(),
+            &input_id,
+            transcoder.as_ref(),
+            config.audio_encode.as_ref(),
+            config.video_encode.as_ref(),
+        );
         let result = if config.redundancy.is_some() {
-            rtp_input_redundant_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id).await
+            rtp_input_redundant_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder).await
         } else {
-            rtp_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id).await
+            rtp_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder).await
         };
         if let Err(e) = result {
             tracing::error!("RTP input task exited with error: {e}");
@@ -116,6 +141,7 @@ async fn rtp_input_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    transcoder: &mut Option<InputTranscoder>,
 ) -> anyhow::Result<()> {
     let socket = match bind_udp_input(&config.bind_addr, config.interface_addr.as_deref()).await {
         Ok(s) => {
@@ -249,7 +275,7 @@ async fn rtp_input_loop(
                         if let Some(ref mut decoder) = fec_decoder {
                             let packets = decoder.process_media(seq, ts, &bytes_data);
                             for pkt in packets {
-                                let _ = broadcast_tx.send(pkt);
+                                publish_input_packet(transcoder, &broadcast_tx, pkt);
                             }
                         } else {
                             let packet = RtpPacket {
@@ -259,7 +285,7 @@ async fn rtp_input_loop(
                                 recv_time_us: now_us(),
                                 is_raw_ts: false,
                             };
-                            let _ = broadcast_tx.send(packet);
+                            publish_input_packet(transcoder, &broadcast_tx, packet);
                         }
                     }
                     Err(e) => {
@@ -293,6 +319,7 @@ async fn rtp_input_redundant_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    transcoder: &mut Option<InputTranscoder>,
 ) -> anyhow::Result<()> {
     let redundancy = config
         .redundancy
@@ -407,7 +434,7 @@ async fn rtp_input_redundant_loop(
                         &buf1[..len], src.ip(), ActiveLeg::Leg1,
                         &source_filter, &pt_filter, &mut rate_limiter,
                         &mut fec_decoder_leg1, &mut merger, &mut prev_active_leg,
-                        &broadcast_tx, &stats,
+                        &broadcast_tx, &stats, transcoder,
                     );
                 }
             }
@@ -417,7 +444,7 @@ async fn rtp_input_redundant_loop(
                         &buf2[..len], src.ip(), ActiveLeg::Leg2,
                         &source_filter, &pt_filter, &mut rate_limiter,
                         &mut fec_decoder_leg2, &mut merger, &mut prev_active_leg,
-                        &broadcast_tx, &stats,
+                        &broadcast_tx, &stats, transcoder,
                     );
                 }
             }
@@ -442,6 +469,7 @@ fn process_redundant_rtp_packet(
     prev_active_leg: &mut ActiveLeg,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     stats: &FlowStatsAccumulator,
+    transcoder: &mut Option<InputTranscoder>,
 ) {
     // C5: Source IP filter
     if let Some(allowed) = source_filter {
@@ -489,7 +517,7 @@ fn process_redundant_rtp_packet(
                 stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
                 // Bandwidth limit enforcement
                 if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                    let _ = broadcast_tx.send(pkt);
+                    publish_input_packet(transcoder, broadcast_tx, pkt);
                 } else {
                     stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                 }
@@ -515,7 +543,7 @@ fn process_redundant_rtp_packet(
                     recv_time_us: now_us(),
                     is_raw_ts: false,
                 };
-                let _ = broadcast_tx.send(packet);
+                publish_input_packet(transcoder, broadcast_tx, packet);
             }
         }
     }

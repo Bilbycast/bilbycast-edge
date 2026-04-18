@@ -36,6 +36,7 @@ use crate::redundancy::merger::{ActiveLeg, HitlessMerger};
 use crate::stats::collector::FlowStatsAccumulator;
 use crate::util::time::now_us;
 
+use super::input_transcode::{publish_input_packet, InputTranscoder};
 use super::packet::RtpPacket;
 
 const TS_PACKET_SIZE: usize = 188;
@@ -48,13 +49,37 @@ pub fn spawn_rist_input(
     cancel: CancellationToken,
     event_sender: EventSender,
     flow_id: String,
+    input_id: String,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut transcoder = match InputTranscoder::new(
+            config.audio_encode.as_ref(),
+            config.transcode.as_ref(),
+            config.video_encode.as_ref(),
+        ) {
+            Ok(t) => {
+                if let Some(ref t) = t {
+                    tracing::info!("RIST input: ingress transcode active — {}", t.describe());
+                }
+                t
+            }
+            Err(e) => {
+                tracing::error!("RIST input: transcode setup failed, passthrough: {e}");
+                None
+            }
+        };
+        super::input_transcode::register_ingress_stats(
+            stats.as_ref(),
+            &input_id,
+            transcoder.as_ref(),
+            config.audio_encode.as_ref(),
+            config.video_encode.as_ref(),
+        );
         let result = if config.redundancy.is_some() {
-            rist_input_redundant_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id)
+            rist_input_redundant_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder)
                 .await
         } else {
-            rist_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id).await
+            rist_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder).await
         };
         if let Err(e) = result {
             tracing::error!("RIST input task exited with error: {e}");
@@ -91,6 +116,7 @@ async fn rist_input_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    transcoder: &mut Option<InputTranscoder>,
 ) -> anyhow::Result<()> {
     let bind: SocketAddr = config.bind_addr.parse()?;
     let sc = socket_config_for(&config, bind);
@@ -104,6 +130,8 @@ async fn rist_input_loop(
         );
         anyhow::anyhow!("RIST receiver bind failed: {e}")
     })?;
+
+    stats.set_input_rist_stats(socket.stats());
 
     tracing::info!("RIST input started on {}", bind);
     events.emit_flow(
@@ -132,6 +160,7 @@ async fn rist_input_loop(
                             &stats,
                             &mut seq_counter,
                             &mut ts_counter,
+                            transcoder,
                         );
                     }
                     None => {
@@ -151,6 +180,7 @@ fn publish(
     stats: &Arc<FlowStatsAccumulator>,
     seq_counter: &mut u16,
     ts_counter: &mut u32,
+    transcoder: &mut Option<InputTranscoder>,
 ) {
     let seq = *seq_counter;
     *seq_counter = seq_counter.wrapping_add(1);
@@ -173,7 +203,7 @@ fn publish(
         is_raw_ts: true,
     };
 
-    let _ = broadcast_tx.send(packet);
+    publish_input_packet(transcoder, broadcast_tx, packet);
 }
 
 async fn rist_input_redundant_loop(
@@ -183,6 +213,7 @@ async fn rist_input_redundant_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    transcoder: &mut Option<InputTranscoder>,
 ) -> anyhow::Result<()> {
     let redundancy = config
         .redundancy
@@ -198,6 +229,9 @@ async fn rist_input_redundant_loop(
     let mut socket_leg2 = RistSocket::receiver(socket_config_for(&config, leg2_addr))
         .await
         .map_err(|e| anyhow::anyhow!("RIST input leg 2 bind failed: {e}"))?;
+
+    stats.set_input_rist_stats(socket_leg1.stats());
+    stats.set_input_rist_leg2_stats(socket_leg2.stats());
 
     tracing::info!(
         "RIST input started with 2022-7 redundancy: leg1={} leg2={}",
@@ -231,7 +265,7 @@ async fn rist_input_redundant_loop(
                 Some(data) => handle_redundant_leg(
                     &data, ActiveLeg::Leg1, &mut merger,
                     &mut seq_counter_leg1, &mut ts_counter,
-                    &broadcast_tx, &stats,
+                    &broadcast_tx, &stats, transcoder,
                 ),
                 None => {
                     tracing::warn!("RIST input leg 1 closed");
@@ -242,7 +276,7 @@ async fn rist_input_redundant_loop(
                 Some(data) => handle_redundant_leg(
                     &data, ActiveLeg::Leg2, &mut merger,
                     &mut seq_counter_leg2, &mut ts_counter,
-                    &broadcast_tx, &stats,
+                    &broadcast_tx, &stats, transcoder,
                 ),
                 None => {
                     tracing::warn!("RIST input leg 2 closed");
@@ -261,6 +295,7 @@ fn handle_redundant_leg(
     ts_counter: &mut u32,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     stats: &Arc<FlowStatsAccumulator>,
+    transcoder: &mut Option<InputTranscoder>,
 ) {
     let seq = *leg_seq;
     *leg_seq = leg_seq.wrapping_add(1);
@@ -288,5 +323,5 @@ fn handle_redundant_leg(
         is_raw_ts: true,
     };
 
-    let _ = broadcast_tx.send(packet);
+    publish_input_packet(transcoder, broadcast_tx, packet);
 }

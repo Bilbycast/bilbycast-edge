@@ -36,6 +36,7 @@ use crate::config::models::RtmpInputConfig;
 use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::FlowStatsAccumulator;
 
+use super::input_transcode::{publish_input_packet, InputTranscoder};
 use super::packet::RtpPacket;
 use super::rtmp::server::{RtmpMediaMessage, RtmpServerConfig, run_rtmp_server};
 use super::rtmp::ts_mux::TsMuxer;
@@ -51,6 +52,7 @@ pub fn spawn_rtmp_input(
     cancel: CancellationToken,
     event_sender: EventSender,
     flow_id: String,
+    input_id: String,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         tracing::info!("RTMP input starting on {} (app='{}')", config.listen_addr, config.app);
@@ -82,7 +84,30 @@ pub fn spawn_rtmp_input(
         });
 
         // Process media messages from the RTMP server
-        process_media(media_rx, broadcast_tx, stats, cancel, event_sender, flow_id).await;
+        let mut transcoder = match InputTranscoder::new(
+            config.audio_encode.as_ref(),
+            config.transcode.as_ref(),
+            config.video_encode.as_ref(),
+        ) {
+            Ok(t) => {
+                if let Some(ref t) = t {
+                    tracing::info!("RTMP input: ingress transcode active — {}", t.describe());
+                }
+                t
+            }
+            Err(e) => {
+                tracing::error!("RTMP input: transcode setup failed, passthrough: {e}");
+                None
+            }
+        };
+        super::input_transcode::register_ingress_stats(
+            stats.as_ref(),
+            &input_id,
+            transcoder.as_ref(),
+            config.audio_encode.as_ref(),
+            config.video_encode.as_ref(),
+        );
+        process_media(media_rx, broadcast_tx, stats, cancel, event_sender, flow_id, &mut transcoder).await;
     })
 }
 
@@ -94,6 +119,7 @@ async fn process_media(
     cancel: CancellationToken,
     event_sender: EventSender,
     flow_id: String,
+    transcoder: &mut Option<InputTranscoder>,
 ) {
     let mut muxer = TsMuxer::new();
     let mut seq_num: u16 = 0;
@@ -206,7 +232,7 @@ async fn process_media(
                                     stats.input_packets.fetch_add(1, Ordering::Relaxed);
                                     stats.input_bytes.fetch_add(total_len as u64, Ordering::Relaxed);
                                     if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                                        let _ = broadcast_tx.send(packet);
+                                        publish_input_packet(transcoder, &broadcast_tx, packet);
                                     } else {
                                         stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                                     }
@@ -280,7 +306,7 @@ async fn process_media(
                                     stats.input_packets.fetch_add(1, Ordering::Relaxed);
                                     stats.input_bytes.fetch_add(total_len as u64, Ordering::Relaxed);
                                     if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                                        let _ = broadcast_tx.send(packet);
+                                        publish_input_packet(transcoder, &broadcast_tx, packet);
                                     } else {
                                         stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                                     }

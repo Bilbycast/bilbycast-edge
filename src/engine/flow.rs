@@ -300,6 +300,7 @@ impl FlowRuntime {
                         input_cancel.clone(),
                         event_sender.clone(),
                         config.config.id.clone(),
+                        input_id.clone(),
                     )
                 }
                 InputConfig::Udp(udp_config) => {
@@ -310,6 +311,7 @@ impl FlowRuntime {
                         input_cancel.clone(),
                         event_sender.clone(),
                         config.config.id.clone(),
+                        input_id.clone(),
                     )
                 }
                 InputConfig::Srt(srt_config) => {
@@ -320,6 +322,7 @@ impl FlowRuntime {
                         input_cancel.clone(),
                         event_sender.clone(),
                         config.config.id.clone(),
+                        input_id.clone(),
                     )
                 }
                 InputConfig::Rist(rist_config) => {
@@ -330,6 +333,7 @@ impl FlowRuntime {
                         input_cancel.clone(),
                         event_sender.clone(),
                         config.config.id.clone(),
+                        input_id.clone(),
                     )
                 }
                 InputConfig::Rtmp(rtmp_config) => {
@@ -340,6 +344,7 @@ impl FlowRuntime {
                         input_cancel.clone(),
                         event_sender.clone(),
                         config.config.id.clone(),
+                        input_id.clone(),
                     )
                 }
                 InputConfig::Rtsp(rtsp_config) => {
@@ -350,6 +355,7 @@ impl FlowRuntime {
                         input_cancel.clone(),
                         event_sender.clone(),
                         config.config.id.clone(),
+                        input_id.clone(),
                     )
                 }
                 #[cfg(feature = "webrtc")]
@@ -359,6 +365,7 @@ impl FlowRuntime {
                     super::input_webrtc::spawn_whip_input(
                         webrtc_config.clone(),
                         config.config.id.clone(),
+                        input_id.clone(),
                         per_input_tx.clone(),
                         flow_stats.clone(),
                         input_cancel.clone(),
@@ -383,6 +390,7 @@ impl FlowRuntime {
                         input_cancel.clone(),
                         event_sender.clone(),
                         config.config.id.clone(),
+                        input_id.clone(),
                     )
                 }
                 #[cfg(not(feature = "webrtc"))]
@@ -445,6 +453,7 @@ impl FlowRuntime {
                     c.clock_domain = c.clock_domain.or(config.config.clock_domain);
                     super::input_st2110_20::spawn_st2110_20_input(
                         c,
+                        input_id.clone(),
                         per_input_tx.clone(),
                         flow_stats.clone(),
                         input_cancel.clone(),
@@ -455,6 +464,7 @@ impl FlowRuntime {
                     c.clock_domain = c.clock_domain.or(config.config.clock_domain);
                     super::input_st2110_23::spawn_st2110_23_input(
                         c,
+                        input_id.clone(),
                         per_input_tx.clone(),
                         flow_stats.clone(),
                         input_cancel.clone(),

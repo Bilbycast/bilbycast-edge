@@ -15,6 +15,7 @@ use crate::stats::collector::FlowStatsAccumulator;
 use crate::util::socket::bind_udp_input;
 use crate::util::time::now_us;
 
+use super::input_transcode::{publish_input_packet, InputTranscoder};
 use super::packet::{MAX_RTP_PACKET_SIZE, RtpPacket};
 
 /// TS packet size used for synthetic timestamp calculation.
@@ -34,9 +35,33 @@ pub fn spawn_udp_input(
     cancel: CancellationToken,
     event_sender: EventSender,
     flow_id: String,
+    input_id: String,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = udp_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id).await {
+        let mut transcoder = match InputTranscoder::new(
+            config.audio_encode.as_ref(),
+            config.transcode.as_ref(),
+            config.video_encode.as_ref(),
+        ) {
+            Ok(t) => {
+                if let Some(ref t) = t {
+                    tracing::info!("UDP input: ingress transcode active — {}", t.describe());
+                }
+                t
+            }
+            Err(e) => {
+                tracing::error!("UDP input: transcode setup failed, passthrough: {e}");
+                None
+            }
+        };
+        super::input_transcode::register_ingress_stats(
+            stats.as_ref(),
+            &input_id,
+            transcoder.as_ref(),
+            config.audio_encode.as_ref(),
+            config.video_encode.as_ref(),
+        );
+        if let Err(e) = udp_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder).await {
             tracing::error!("UDP input task exited with error: {e}");
             event_sender.emit_flow(EventSeverity::Critical, category::FLOW, format!("Flow input lost: {e}"), &flow_id);
         }
@@ -50,6 +75,7 @@ async fn udp_input_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    transcoder: &mut Option<InputTranscoder>,
 ) -> anyhow::Result<()> {
     let socket = match bind_udp_input(&config.bind_addr, config.interface_addr.as_deref()).await {
         Ok(s) => {
@@ -116,7 +142,7 @@ async fn udp_input_loop(
                             is_raw_ts: true,
                         };
 
-                        let _ = broadcast_tx.send(packet);
+                        publish_input_packet(transcoder, &broadcast_tx, packet);
                     }
                     Err(e) => {
                         tracing::warn!("UDP input recv error: {e}");

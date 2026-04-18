@@ -492,11 +492,22 @@ impl InputConfig {
             // so downstream consumers treat them as TS carriers.
             | InputConfig::St2110_20(_)
             | InputConfig::St2110_23(_) => true,
-            InputConfig::St2110_30(_)
-            | InputConfig::St2110_31(_)
-            | InputConfig::St2110_40(_)
-            | InputConfig::RtpAudio(_) => false,
+            // PCM-only inputs become TS carriers when `audio_encode` is set —
+            // the input task muxes the encoded audio into an audio-only TS.
+            InputConfig::St2110_30(c) => c.audio_encode.is_some(),
+            InputConfig::RtpAudio(c) => c.audio_encode.is_some(),
+            InputConfig::St2110_31(_) | InputConfig::St2110_40(_) => false,
         }
+    }
+
+    /// Returns true when the input produces MPEG-TS on the broadcast channel.
+    ///
+    /// This is a synonym of [`Self::is_ts_carrier`] kept as a separate name so
+    /// call sites that check shape compatibility for a flow (where the question
+    /// is "does this input *produce* TS?") read clearly. Both methods return
+    /// the same value.
+    pub fn produces_ts(&self) -> bool {
+        self.is_ts_carrier()
     }
 }
 
@@ -529,6 +540,24 @@ pub struct RtpInputConfig {
     /// Optional: enable SMPTE 2022-7 redundancy (merge from two UDP legs)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<RtpRedundancyConfig>,
+    /// Optional audio re-encode applied at ingress. When set, the input task
+    /// decodes the source audio ES, optionally transcodes planar PCM via
+    /// `transcode`, re-encodes to the configured codec, and re-muxes the
+    /// replacement ES back into the broadcast TS before fan-out. Identical
+    /// semantics to the output-side `audio_encode` block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional planar PCM transcode (channel shuffle / sample-rate / bit-depth)
+    /// applied between decode and `audio_encode`. Ignored when `audio_encode`
+    /// is not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Optional video re-encode applied at ingress. Decodes the source video
+    /// ES, re-encodes via the configured backend, and re-muxes the output TS.
+    /// Feature-gated (`video-encoder-x264` / `-x265` / `-nvenc`) — validation
+    /// fails early if the backend is not compiled in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode: Option<VideoEncodeConfig>,
 }
 
 /// Raw UDP input — receives datagrams without requiring RTP headers.
@@ -543,6 +572,15 @@ pub struct UdpInputConfig {
     /// Network interface IP for multicast join (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interface_addr: Option<String>,
+    /// Optional ingress audio re-encode. See [`RtpInputConfig::audio_encode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional planar PCM transcode. See [`RtpInputConfig::transcode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Optional ingress video re-encode. See [`RtpInputConfig::video_encode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode: Option<VideoEncodeConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -670,6 +708,15 @@ pub struct SrtInputConfig {
     /// but the runtime falls back to standard auto-detect with a warning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_mode: Option<String>,
+    /// Optional ingress audio re-encode. See [`RtpInputConfig::audio_encode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional planar PCM transcode. See [`RtpInputConfig::transcode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Optional ingress video re-encode. See [`RtpInputConfig::video_encode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode: Option<VideoEncodeConfig>,
 }
 
 /// RTMP input configuration — runs an RTMP server that accepts publish connections.
@@ -704,6 +751,15 @@ pub struct RtmpInputConfig {
     /// For broadcast use, typically only one publisher is active at a time.
     #[serde(default = "default_max_publishers")]
     pub max_publishers: u32,
+    /// Optional ingress audio re-encode. See [`RtpInputConfig::audio_encode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional planar PCM transcode. See [`RtpInputConfig::transcode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Optional ingress video re-encode. See [`RtpInputConfig::video_encode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode: Option<VideoEncodeConfig>,
 }
 
 fn default_rtmp_app() -> String {
@@ -750,6 +806,15 @@ pub struct RtspInputConfig {
     /// Reconnect delay in seconds after connection loss (default: 5).
     #[serde(default = "default_rtsp_reconnect")]
     pub reconnect_delay_secs: u64,
+    /// Optional ingress audio re-encode. See [`RtpInputConfig::audio_encode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional planar PCM transcode. See [`RtpInputConfig::transcode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Optional ingress video re-encode. See [`RtpInputConfig::video_encode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode: Option<VideoEncodeConfig>,
 }
 
 fn default_rtsp_timeout() -> u64 {
@@ -780,6 +845,15 @@ pub struct WebrtcInputConfig {
     /// STUN server URL for ICE candidate gathering (optional, ICE-lite doesn't need it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stun_server: Option<String>,
+    /// Optional ingress audio re-encode. See [`RtpInputConfig::audio_encode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional planar PCM transcode. See [`RtpInputConfig::transcode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Optional ingress video re-encode. See [`RtpInputConfig::video_encode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode: Option<VideoEncodeConfig>,
 }
 
 /// WebRTC/WHEP input configuration — pulls media from an external WHEP server.
@@ -796,6 +870,15 @@ pub struct WhepInputConfig {
     /// When true, only video is received (audio tracks ignored).
     #[serde(default)]
     pub video_only: bool,
+    /// Optional ingress audio re-encode. See [`RtpInputConfig::audio_encode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional planar PCM transcode. See [`RtpInputConfig::transcode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Optional ingress video re-encode. See [`RtpInputConfig::video_encode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode: Option<VideoEncodeConfig>,
 }
 
 fn default_latency() -> u64 {
@@ -1487,6 +1570,15 @@ pub struct RistInputConfig {
     /// The primary `bind_addr` is leg 1; this defines leg 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<RistInputRedundancyConfig>,
+    /// Optional ingress audio re-encode. See [`RtpInputConfig::audio_encode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional planar PCM transcode. See [`RtpInputConfig::transcode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Optional ingress video re-encode. See [`RtpInputConfig::video_encode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode: Option<VideoEncodeConfig>,
 }
 
 /// RIST Simple Profile (TR-06-1:2020) output. Binds a local dual-port UDP
@@ -1845,10 +1937,71 @@ pub struct VideoEncodeConfig {
     /// `medium`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
-    /// H.264/HEVC profile target. One of: `baseline`, `main`, `high`.
-    /// When unset, the encoder chooses.
+    /// H.264/HEVC profile target. One of: `baseline`, `main`, `high`,
+    /// `high10`, `high422`, `high444`, `main10`. When unset, the encoder
+    /// chooses. Higher profiles (`high10` / `high422` / `high444`,
+    /// `main10`) must be combined with a matching `chroma` /
+    /// `bit_depth`; validation enforces this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// Chroma subsampling for the encoded bitstream. One of: `yuv420p`
+    /// (default — preserves legacy behaviour), `yuv422p`, `yuv444p`.
+    /// NVENC backends only support `yuv420p` / `yuv422p`; validation
+    /// rejects `yuv444p` with NVENC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chroma: Option<String>,
+    /// Sample bit depth. One of: `8` (default), `10`. NVENC H.264 is
+    /// 8-bit only; validation rejects `10` on `h264_nvenc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bit_depth: Option<u8>,
+    /// Rate-control mode. One of: `vbr` (default — legacy behaviour),
+    /// `cbr`, `crf`, `abr`. In `crf` mode `bitrate_kbps` is ignored and
+    /// `crf` drives quantisation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_control: Option<String>,
+    /// Constant rate factor (quality target) for `rate_control == "crf"`.
+    /// Range: 0..=51 (lower = better quality; broadcast typical 18..=28).
+    /// For NVENC this is translated to `cq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crf: Option<u8>,
+    /// Max bitrate cap in kbps for VBR (`rc_max_rate`) or CBR ceiling.
+    /// Range: 100..=100_000. Ignored in `crf` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bitrate_kbps: Option<u32>,
+    /// Consecutive B-frames. `0` (default) preserves legacy behaviour
+    /// (no B-frames). Range: 0..=16.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bframes: Option<u8>,
+    /// Reference frames count. When unset, the encoder uses its default.
+    /// Range: 1..=16.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refs: Option<u8>,
+    /// Codec level — e.g. `"3.0"`, `"4.0"`, `"5.1"`. When unset, the
+    /// encoder selects based on resolution / bitrate / framerate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    /// Encoder `tune` hint — one of: `zerolatency` (default), `film`,
+    /// `animation`, `grain`, `stillimage`, `fastdecode`, `psnr`, `ssim`.
+    /// Empty string means "unset" (encoder chooses). Only x264 / x265
+    /// accept all values; NVENC tolerates `zerolatency` and otherwise
+    /// ignores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tune: Option<String>,
+    /// Colour primaries — one of: `bt709`, `bt2020`, `smpte170m`,
+    /// `smpte240m`, `bt470m`, `bt470bg`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_primaries: Option<String>,
+    /// Transfer characteristics — one of: `bt709`, `smpte170m`,
+    /// `smpte2084` (PQ), `arib-std-b67` (HLG), `bt2020-10`, `bt2020-12`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_transfer: Option<String>,
+    /// Matrix coefficients — one of: `bt709`, `bt2020nc`, `bt2020c`,
+    /// `smpte170m`, `smpte240m`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_matrix: Option<String>,
+    /// Colour range — `tv` (limited, default) or `pc` (full).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_range: Option<String>,
 }
 
 /// Audio encoder configuration block. Used by RTMP, HLS, and WebRTC
@@ -1959,6 +2112,23 @@ pub struct St2110AudioInputConfig {
     /// Maximum ingress bitrate in Mbps (RP 2129 C7). Excess packets dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bitrate_mbps: Option<f64>,
+    /// Optional planar PCM transcode applied between PCM depacketization and
+    /// re-packetization. Unset fields pass through (so an empty block is a
+    /// no-op). Broadcast channel shape stays PCM-RTP — outputs on the same
+    /// flow keep receiving raw PCM. **Rejected on ST 2110-31 (AES3)** —
+    /// validation refuses the block because AES3 sub-frames carry SMPTE 337M
+    /// payload (possibly Dolby E) that a linear-PCM transcoder would corrupt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Optional ingress audio re-encode. When set, the PCM input is
+    /// depacketized, optionally transcoded, encoded into the configured codec
+    /// (`aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`), and muxed into an
+    /// audio-only MPEG-TS stream. **This changes the broadcast channel shape**
+    /// from PCM-RTP to MPEG-TS: ST 2110-30/-31 and 302M-mode outputs can no
+    /// longer attach to the same flow. Validation enforces the compatibility
+    /// rules. **Rejected on ST 2110-31 (AES3)** — see `transcode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
 }
 
 /// SMPTE ST 2110-30 / -31 audio output configuration.
@@ -2073,6 +2243,12 @@ pub struct RtpAudioInputConfig {
     /// Source IP allow-list (RP 2129 C5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_sources: Option<Vec<String>>,
+    /// Optional planar PCM transcode. See [`St2110AudioInputConfig::transcode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Optional ingress audio re-encode. See [`St2110AudioInputConfig::audio_encode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
 }
 
 /// Generic RFC 3551 PCM-over-RTP audio output. See [`RtpAudioInputConfig`]
@@ -2492,6 +2668,9 @@ mod tests {
                     max_bitrate_mbps: None,
                     tr07_mode: None,
                     redundancy: None,
+                    audio_encode: None,
+                    transcode: None,
+                    video_encode: None,
                 }),
             }],
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
@@ -2546,6 +2725,9 @@ mod tests {
                 config: InputConfig::Udp(UdpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
                     interface_addr: None,
+                    audio_encode: None,
+                    transcode: None,
+                    video_encode: None,
                 }),
             }],
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {

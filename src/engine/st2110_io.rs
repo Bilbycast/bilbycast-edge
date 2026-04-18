@@ -56,6 +56,7 @@ use crate::util::rtp_parse::{is_likely_rtp, parse_rtp_sequence_number, parse_rtp
 use crate::util::socket::{bind_udp_input, create_udp_output};
 use crate::util::time::now_us;
 
+use super::input_pcm_encode::PcmInputProcessor;
 use super::packet::RtpPacket;
 use super::st2110::ancillary::unpack_ancillary;
 use super::st2110::audio::{PcmDepacketizer, PcmFormat};
@@ -187,6 +188,32 @@ pub async fn run_st2110_audio_input(
     let depacketizer =
         PcmDepacketizer::new(pcm_format_for_depth(config.bit_depth), config.payload_type, config.channels);
 
+    // Build the optional ingress processor (`transcode` / `audio_encode`).
+    // Validation rejects these fields for AES3 (-31) so in practice this is
+    // only active for -30. `audio_encode` currently returns an error and we
+    // fall back to passthrough with a clear log.
+    let mut processor: Option<PcmInputProcessor> = match PcmInputProcessor::new(
+        config.sample_rate,
+        config.bit_depth,
+        config.channels,
+        config.transcode.as_ref(),
+        config.audio_encode.as_ref(),
+        /* ssrc */ 0,
+        /* initial_seq */ 0,
+        /* initial_timestamp */ 0,
+    ) {
+        Ok(p) => {
+            if p.is_some() {
+                tracing::info!("{label} input: ingress PCM processor active");
+            }
+            p
+        }
+        Err(e) => {
+            tracing::warn!("{label} input: PCM processor disabled, passthrough: {e}");
+            None
+        }
+    };
+
     // The recv loop in RedBluePair owns the sockets, so we cannot easily reach
     // out for source-IP filtering at this layer (it ignores src). Apply source
     // filtering inline by reading via a single-leg path when no Blue is set.
@@ -201,6 +228,7 @@ pub async fn run_st2110_audio_input(
             broadcast_tx,
             stats,
             cancel,
+            processor,
         )
         .await
     } else {
@@ -210,7 +238,7 @@ pub async fn run_st2110_audio_input(
         let label_owned = label.to_string();
         let tx = broadcast_tx;
         pair.recv_loop(cancel, move |payload, _leg, _seq| {
-            forward_audio_packet(&payload, &depacketizer, &tx, &stats_clone, &label_owned);
+            forward_audio_packet(&payload, &depacketizer, &tx, &stats_clone, &label_owned, &mut processor);
             true
         })
         .await;
@@ -230,6 +258,7 @@ async fn run_audio_input_single_with_filter(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
+    mut processor: Option<PcmInputProcessor>,
 ) -> Result<()> {
     let socket = bind_udp_input(&config.bind_addr, config.interface_addr.as_deref()).await?;
     let mut buf = vec![0u8; MAX_DGRAM];
@@ -252,6 +281,7 @@ async fn run_audio_input_single_with_filter(
                             &broadcast_tx,
                             &stats,
                             label,
+                            &mut processor,
                         );
                     }
                     Err(e) => {
@@ -271,6 +301,7 @@ fn forward_audio_packet(
     tx: &broadcast::Sender<RtpPacket>,
     stats: &FlowStatsAccumulator,
     label: &str,
+    processor: &mut Option<PcmInputProcessor>,
 ) {
     if !is_likely_rtp(data) {
         return;
@@ -297,7 +328,29 @@ fn forward_audio_packet(
         recv_time_us: now_us(),
         is_raw_ts: false,
     };
-    let _ = tx.send(packet);
+
+    // Route through the optional PCM processor. When absent, passthrough.
+    // Codec-class work runs on a blocking worker so the reactor is never
+    // stalled — matches the output-side rule.
+    match processor.as_mut() {
+        Some(p) => {
+            let outs = tokio::task::block_in_place(|| p.process(&packet));
+            let shape_change = p.shape_change();
+            for data_out in outs {
+                let out_pkt = RtpPacket {
+                    data: data_out,
+                    sequence_number: packet.sequence_number,
+                    rtp_timestamp: packet.rtp_timestamp,
+                    recv_time_us: packet.recv_time_us,
+                    is_raw_ts: shape_change,
+                };
+                let _ = tx.send(out_pkt);
+            }
+        }
+        None => {
+            let _ = tx.send(packet);
+        }
+    }
 }
 
 // ─────────────────────────── Audio (-30 / -31) output ──────────────────────────
@@ -1068,6 +1121,8 @@ mod tests {
             clock_domain: None,
             allowed_sources: None,
             max_bitrate_mbps: None,
+            audio_encode: None,
+            transcode: None,
         };
         let (tx, _rx0) = broadcast::channel::<RtpPacket>(64);
         let flow_stats = Arc::new(FlowStatsAccumulator::new(
@@ -1181,6 +1236,8 @@ mod tests {
             clock_domain: None,
             allowed_sources: None,
             max_bitrate_mbps: None,
+            audio_encode: None,
+            transcode: None,
         };
         let (tx, _rx0) = broadcast::channel::<RtpPacket>(64);
         let flow_stats = Arc::new(FlowStatsAccumulator::new(
@@ -1432,6 +1489,8 @@ mod tests {
             clock_domain: Some(0),
             allowed_sources: None,
             max_bitrate_mbps: None,
+            audio_encode: None,
+            transcode: None,
         };
 
         let (tx, _rx0) = broadcast::channel::<RtpPacket>(64);

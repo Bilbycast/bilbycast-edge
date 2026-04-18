@@ -20,6 +20,7 @@ use crate::stats::collector::FlowStatsAccumulator;
 use crate::util::rtp_parse::{is_likely_rtp, parse_rtp_sequence_number, parse_rtp_timestamp};
 use crate::util::time::now_us;
 
+use super::input_transcode::{publish_input_packet, InputTranscoder};
 use super::packet::RtpPacket;
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -90,12 +91,46 @@ pub fn spawn_srt_input(
     cancel: CancellationToken,
     event_sender: EventSender,
     flow_id: String,
+    input_id: String,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // Build ingress transcoder once per connection cycle so PMT discovery
+        // state and codec buffers persist across reconnects within a single
+        // configured flow.
+        let mut transcoder = match InputTranscoder::new(
+            config.audio_encode.as_ref(),
+            config.transcode.as_ref(),
+            config.video_encode.as_ref(),
+        ) {
+            Ok(t) => {
+                if let Some(ref t) = t {
+                    tracing::info!("SRT input: ingress transcode active — {}", t.describe());
+                }
+                t
+            }
+            Err(e) => {
+                tracing::error!("SRT input: transcode setup failed, falling back to passthrough: {e}");
+                event_sender.emit_flow(
+                    EventSeverity::Critical,
+                    category::FLOW,
+                    format!("SRT input transcode disabled: {e}"),
+                    &flow_id,
+                );
+                None
+            }
+        };
+        super::input_transcode::register_ingress_stats(
+            stats.as_ref(),
+            &input_id,
+            transcoder.as_ref(),
+            config.audio_encode.as_ref(),
+            config.video_encode.as_ref(),
+        );
+
         let result = if config.redundancy.is_some() {
-            srt_input_redundant_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id).await
+            srt_input_redundant_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder).await
         } else {
-            srt_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id).await
+            srt_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder).await
         };
         if let Err(e) = result {
             tracing::error!("SRT input task exited with error: {e}");
@@ -115,10 +150,11 @@ async fn srt_input_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    transcoder: &mut Option<InputTranscoder>,
 ) -> anyhow::Result<()> {
     match config.mode {
-        SrtMode::Listener => srt_input_listener_loop(config, broadcast_tx, stats, cancel, events, flow_id).await,
-        _ => srt_input_caller_loop(config, broadcast_tx, stats, cancel, events, flow_id).await,
+        SrtMode::Listener => srt_input_listener_loop(config, broadcast_tx, stats, cancel, events, flow_id, transcoder).await,
+        _ => srt_input_caller_loop(config, broadcast_tx, stats, cancel, events, flow_id, transcoder).await,
     }
 }
 
@@ -131,6 +167,7 @@ async fn srt_input_listener_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    transcoder: &mut Option<InputTranscoder>,
 ) -> anyhow::Result<()> {
     let mut listener = bind_srt_listener_for_input(&config).await?;
     let mut format = SrtPayloadFormat::Unknown;
@@ -183,6 +220,7 @@ async fn srt_input_listener_loop(
         let disconnected = srt_input_recv_loop(
             &socket, &broadcast_tx, &stats, &cancel,
             &mut format, &mut last_seq, &mut raw_ts_seq_counter, &mut raw_ts_timestamp,
+            transcoder,
         ).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
@@ -222,6 +260,7 @@ async fn srt_input_caller_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    transcoder: &mut Option<InputTranscoder>,
 ) -> anyhow::Result<()> {
     let mut format = SrtPayloadFormat::Unknown;
     let mut last_seq: Option<u16> = None;
@@ -273,6 +312,7 @@ async fn srt_input_caller_loop(
         let disconnected = srt_input_recv_loop(
             &socket, &broadcast_tx, &stats, &cancel,
             &mut format, &mut last_seq, &mut raw_ts_seq_counter, &mut raw_ts_timestamp,
+            transcoder,
         ).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
@@ -317,6 +357,7 @@ async fn srt_input_recv_loop(
     last_seq: &mut Option<u16>,
     raw_ts_seq_counter: &mut u16,
     raw_ts_timestamp: &mut u32,
+    transcoder: &mut Option<InputTranscoder>,
 ) -> anyhow::Result<bool> {
     loop {
         tokio::select! {
@@ -391,7 +432,7 @@ async fn srt_input_recv_loop(
                             is_raw_ts: is_raw,
                         };
 
-                        let _ = broadcast_tx.send(packet);
+                        publish_input_packet(transcoder, broadcast_tx, packet);
                     }
                     Err(_) => {
                         tracing::warn!("SRT input connection lost, will reconnect");
@@ -424,6 +465,7 @@ async fn srt_input_redundant_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    transcoder: &mut Option<InputTranscoder>,
 ) -> anyhow::Result<()> {
     let redundancy = config
         .redundancy
@@ -574,6 +616,7 @@ async fn srt_input_redundant_loop(
                                 &mut prev_active_leg,
                                 &stats,
                                 &broadcast_tx,
+                                transcoder,
                             );
                         }
                         Err(_) => {
@@ -605,6 +648,7 @@ async fn srt_input_redundant_loop(
                                 &mut prev_active_leg,
                                 &stats,
                                 &broadcast_tx,
+                                transcoder,
                             );
                         }
                         Err(_) => {
@@ -671,6 +715,7 @@ fn process_redundant_packet(
     prev_active_leg: &mut ActiveLeg,
     stats: &Arc<FlowStatsAccumulator>,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
+    transcoder: &mut Option<InputTranscoder>,
 ) {
     let (seq, ts, is_raw) = match format {
         SrtPayloadFormat::RtpTs => {
@@ -729,6 +774,6 @@ fn process_redundant_packet(
             is_raw_ts: is_raw,
         };
 
-        let _ = broadcast_tx.send(packet);
+        publish_input_packet(transcoder, broadcast_tx, packet);
     }
 }

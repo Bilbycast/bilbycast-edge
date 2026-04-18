@@ -181,9 +181,12 @@ async fn rist_output_loop(
         config.retransmit_buffer_capacity,
     )
     .await?;
+    stats.set_rist_stats(socket_leg1.stats());
 
     let socket_leg2: Option<RistSocket> = if let Some(ref red) = config.redundancy {
-        Some(build_sender_redundancy(red, config).await?)
+        let s = build_sender_redundancy(red, config).await?;
+        stats.set_rist_leg2_stats(s.stats());
+        Some(s)
     } else {
         None
     };

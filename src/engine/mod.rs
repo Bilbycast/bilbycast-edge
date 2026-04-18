@@ -50,6 +50,22 @@ pub mod ts_continuity_fixer;
 pub mod ts_program_filter;
 pub mod ts_audio_replace;
 pub mod ts_video_replace;
+pub mod video_encode_util;
+
+/// Ingress-side audio + video transcoding composer for TS-carrying inputs.
+/// Wraps [`ts_audio_replace::TsAudioReplacer`] and [`ts_video_replace::TsVideoReplacer`]
+/// in the same audio-first-then-video order the TS outputs already use, so
+/// every Group A input (RTP, UDP, SRT, RIST, RTMP, RTSP, WebRTC) can normalise
+/// its feed once before the flow broadcast channel and amortise codec work
+/// across all attached outputs.
+pub mod input_transcode;
+
+/// Ingress-side PCM-shape processor for raw PCM-RTP inputs (ST 2110-30,
+/// `rtp_audio`). Depacketizes, optionally reshapes via `PlanarAudioTranscoder`
+/// (stays PCM), optionally encodes via `AudioEncoder` and muxes audio-only TS
+/// (shape-change: PCM-RTP → MPEG-TS). Runs entirely inside the input task via
+/// `tokio::task::block_in_place`.
+pub mod input_pcm_encode;
 #[cfg(feature = "webrtc")]
 pub mod webrtc;
 

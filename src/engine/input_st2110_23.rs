@@ -17,12 +17,13 @@ use super::st2110_video_io::run_st2110_23_input;
 
 pub fn spawn_st2110_23_input(
     config: St2110_23InputConfig,
+    input_id: String,
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run_st2110_23_input(config, broadcast_tx, stats, cancel).await {
+        if let Err(e) = run_st2110_23_input(config, input_id, broadcast_tx, stats, cancel).await {
             tracing::error!("ST 2110-23 input task exited with error: {e}");
         }
     })

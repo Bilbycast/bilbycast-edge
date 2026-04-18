@@ -27,6 +27,85 @@ applicable / by design.
 
 ---
 
+## Input × block support matrix
+
+The same three blocks can be set on almost every input, so a flow can
+normalise its feed *once* at ingress and amortise the codec cost across
+all attached outputs. The blocks carry identical semantics to their
+output counterparts (same structs, same validation, same backends), so
+anything documented below for outputs applies to inputs verbatim.
+
+| Input      | `audio_encode` | `transcode` | `video_encode` | Notes |
+|------------|:--------------:|:-----------:|:--------------:|-------|
+| **RTP**    | ✅ | ✅ (requires `audio_encode`) | ✅ | Strips the RTP header before the TS replacer; republishes as raw TS. |
+| **UDP**    | ✅ | ✅ | ✅ | Treated as raw TS. |
+| **SRT**    | ✅ | ✅ | ✅ | Auto-detects RTP/TS vs raw TS as before, then applies the replacer. |
+| **RIST**   | ✅ | ✅ | ✅ | Post-delivery reliable RTP, same plumbing as RTP. |
+| **RTMP**   | ✅ | ✅ | ✅ | Applied on the `TsMuxer` output, before broadcast. |
+| **RTSP**   | ✅ | ✅ | ✅ | Same as RTMP. |
+| **WebRTC (WHIP / WHEP)** | ✅ | ✅ | ✅ | Applied after the `ts_demux` re-mux. |
+| **ST 2110-20 / -23** | ❌ | ❌ | ✅ (**required**) | Uncompressed RFC 4175 → H.264/HEVC on ingest — mandatory, was shipped in Phase 2. |
+| **ST 2110-30** | ⏳ (see below) | ✅ (native PCM reshape) | ❌ | `transcode` reshapes linear PCM in place. `audio_encode` changes the broadcast-channel shape to TS (rejects PCM-only outputs on the same flow); runtime muxer lands in a follow-up and currently returns `AudioEncodeNotYetImplemented`, falling back to passthrough with a loud log. |
+| **`rtp_audio`** | ⏳ | ✅ | ❌ | Same story as ST 2110-30. |
+| **ST 2110-31** | ❌ | ❌ | ❌ | AES3 opaque — validation rejects any transcode/encode; would destroy SMPTE 337M metadata. |
+| **ST 2110-40** | ❌ | ❌ | ❌ | Ancillary data. |
+
+### Why use input-side transcoding?
+
+- **Fan-out optimisation.** A single ingress re-encode feeds many outputs
+  without per-output codec work.
+- **Codec harmonisation across inputs.** When a flow has multiple
+  inputs (active/standby), input-side `audio_encode` / `video_encode`
+  forces every input to emit the same codec so the broadcast channel
+  shape doesn't change on a switch. Validation enforces this at config
+  load time — a mixed-shape flow (PCM-passthrough + PCM-encoded-to-TS)
+  is rejected.
+- **Upgrading older sources.** An RTMP ingest carrying HEVC via enhanced
+  RTMP can be decoded and re-encoded to H.264 on ingress so legacy
+  outputs still work.
+
+### Flow-level shape compatibility (new)
+
+`validate_config` enforces two rules so the broadcast channel always
+carries a consistent shape:
+
+1. If any input in a flow produces MPEG-TS (natively, or via
+   `audio_encode` on a PCM input), every other input on the same flow
+   must also produce TS.
+2. When a flow's inputs produce TS, PCM-only outputs (ST 2110-30,
+   ST 2110-31, `rtp_audio`) cannot attach — they expect raw PCM-RTP on
+   the broadcast channel and would silently produce noise.
+
+ST 2110-40 inputs are exempt from these checks (they carry ancillary
+data and can mix freely with any media flow).
+
+### Implementation
+
+Group A (TS-carrying) inputs all route through
+`engine::input_transcode::InputTranscoder`, which composes the existing
+`TsAudioReplacer` + `TsVideoReplacer` (audio-first-then-video, same
+order the TS outputs already use) and calls them inside
+`tokio::task::block_in_place` to match the output-side non-blocking
+contract. Each input task adds exactly one helper call at the point
+where it publishes to the broadcast channel:
+
+```rust
+// before:
+let _ = broadcast_tx.send(packet);
+// after:
+publish_input_packet(&mut transcoder, &broadcast_tx, packet);
+```
+
+Group B (PCM-only) inputs use
+`engine::input_pcm_encode::PcmInputProcessor`, which wraps the existing
+`engine::audio_transcode::TranscodeStage` for the PCM → PCM path. The
+runtime audio-encode path for PCM inputs is scaffolded but currently
+returns `PcmInputError::AudioEncodeNotYetImplemented` — the input task
+logs a clear warning and falls back to passthrough so the flow still
+runs.
+
+---
+
 ## `audio_encode` — compressed-audio re-encoding
 
 Decodes the source audio ES (AAC-LC ADTS in MPEG-TS), rescales sample

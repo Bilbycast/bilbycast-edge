@@ -87,8 +87,11 @@ fn partition_mode_for(m: St2110_23PartitionModeConfig) -> St2110_23PartitionMode
 // ── INGRESS ────────────────────────────────────────────────────────────────
 
 /// Convert a configured `VideoEncodeConfig` to the codec crate's
-/// `VideoEncoderConfig`. Defaults fill in mandatory fields the operator may
-/// omit.
+/// `VideoEncoderConfig`. Delegates to
+/// [`crate::engine::video_encode_util::build_encoder_config`] so advanced
+/// knobs (chroma / bit_depth / rate_control / CRF / bframes / refs / level
+/// / tune / colour metadata) propagate through to the ST 2110-20/-23
+/// ingest encoder in lock-step with RTMP / WebRTC / TS video replacer.
 #[cfg(feature = "video-thumbnail")]
 fn build_encoder_config(
     enc: &VideoEncodeConfig,
@@ -97,7 +100,7 @@ fn build_encoder_config(
     fps_num: u32,
     fps_den: u32,
 ) -> Result<video_codec::VideoEncoderConfig> {
-    use video_codec::{VideoEncoderCodec, VideoPreset, VideoProfile};
+    use video_codec::VideoEncoderCodec;
     let codec = match enc.codec.as_str() {
         "x264" => VideoEncoderCodec::X264,
         "x265" => VideoEncoderCodec::X265,
@@ -105,40 +108,68 @@ fn build_encoder_config(
         "hevc_nvenc" => VideoEncoderCodec::HevcNvenc,
         other => return Err(anyhow!("unknown encoder codec '{other}'")),
     };
-    let preset = match enc.preset.as_deref() {
-        Some("ultrafast") => VideoPreset::Ultrafast,
-        Some("superfast") => VideoPreset::Superfast,
-        Some("veryfast") => VideoPreset::Veryfast,
-        Some("faster") => VideoPreset::Faster,
-        Some("fast") => VideoPreset::Fast,
-        Some("slow") => VideoPreset::Slow,
-        Some("slower") => VideoPreset::Slower,
-        Some("veryslow") => VideoPreset::Veryslow,
-        _ => VideoPreset::Medium,
+    Ok(crate::engine::video_encode_util::build_encoder_config(
+        enc, codec, width, height, fps_num, fps_den, false,
+    ))
+}
+
+/// Register an ST 2110-20/-23 ingress encoder's stats handle and static
+/// ingress summary descriptor on the flow accumulator, keyed by `input_id`,
+/// so the manager UI can surface this input's live encode target and
+/// per-frame counters (and stop reporting them after a switch to another
+/// input).
+fn register_ingress_video_encode_stats(
+    stats: &Arc<FlowStatsAccumulator>,
+    input_id: &str,
+    enc: &VideoEncodeConfig,
+    width: u32,
+    height: u32,
+    fps_num: u32,
+    fps_den: u32,
+) -> Arc<crate::engine::ts_video_replace::VideoEncodeStats> {
+    let handle = Arc::new(crate::engine::ts_video_replace::VideoEncodeStats::default());
+    let backend = match enc.codec.as_str() {
+        "x264" | "x265" => enc.codec.clone(),
+        "h264_nvenc" | "hevc_nvenc" => "nvenc".to_string(),
+        other => other.to_string(),
     };
-    let profile = match enc.profile.as_deref() {
-        Some("baseline") => VideoProfile::Baseline,
-        Some("main") => VideoProfile::Main,
-        Some("high") => VideoProfile::High,
-        _ => VideoProfile::Auto,
+    let target_codec = match enc.codec.as_str() {
+        "x264" | "h264_nvenc" => "h264",
+        "x265" | "hevc_nvenc" => "hevc",
+        other => other,
     };
-    Ok(video_codec::VideoEncoderConfig {
-        codec,
-        width: enc.width.unwrap_or(width),
-        height: enc.height.unwrap_or(height),
-        fps_num: enc.fps_num.unwrap_or(fps_num),
-        fps_den: enc.fps_den.unwrap_or(fps_den),
-        bitrate_kbps: enc.bitrate_kbps.unwrap_or(8_000),
-        gop_size: enc.gop_size.unwrap_or(2 * (fps_num / fps_den.max(1)).max(1)),
-        preset,
-        profile,
-        global_header: false,
-    })
+    let fps = if fps_den > 0 {
+        fps_num as f32 / fps_den as f32
+    } else {
+        0.0
+    };
+    stats.set_input_video_encode_stats(
+        input_id,
+        handle.clone(),
+        "raw".to_string(),
+        target_codec.to_string(),
+        width,
+        height,
+        fps,
+        enc.bitrate_kbps.unwrap_or(0),
+        backend,
+    );
+    stats.set_ingress_static(
+        input_id,
+        crate::stats::collector::EgressMediaSummaryStatic {
+            transport_mode: Some("ts".to_string()),
+            video_passthrough: false,
+            audio_passthrough: true,
+            audio_only: false,
+        },
+    );
+    handle
 }
 
 /// Run the ST 2110-20 input pipeline. Blocks forever until cancel.
 pub async fn run_st2110_20_input(
     config: St2110VideoInputConfig,
+    input_id: String,
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
@@ -164,6 +195,7 @@ pub async fn run_st2110_20_input(
     let height = config.height;
     let fps_num = config.frame_rate_num;
     let fps_den = config.frame_rate_den;
+    let encode_stats = register_ingress_video_encode_stats(&stats, &input_id, &enc_cfg, width, height, fps_num, fps_den);
     let tx_for_worker = broadcast_tx.clone();
     let stats_for_worker = stats.clone();
     let worker_cancel = cancel.clone();
@@ -178,6 +210,7 @@ pub async fn run_st2110_20_input(
             frame_rx,
             tx_for_worker,
             stats_for_worker,
+            encode_stats,
             worker_cancel,
         );
     });
@@ -219,6 +252,7 @@ fn encode_worker(
     mut frame_rx: mpsc::Receiver<RawVideoFrame>,
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
+    encode_stats: Arc<crate::engine::ts_video_replace::VideoEncodeStats>,
     cancel: CancellationToken,
 ) {
     use video_engine::VideoEncoder;
@@ -239,76 +273,194 @@ fn encode_worker(
     let mut ts_mux = TsMuxer::new();
     let mut pts: i64 = 0;
 
+    // Target chroma / bit depth chosen by the operator via video_encode
+    // (defaults: 4:2:0 8-bit for parity with pre-Phase-4 behaviour). When
+    // the target matches the source (4:2:2 + 10-bit), we skip the
+    // subsample / depth conversion entirely — the encoder handles native
+    // 4:2:2 10-bit planes.
+    let target_chroma = cfg.chroma;
+    let target_10bit = cfg.bit_depth == 10;
+
+    // Scratch buffers for chroma-subsample / bit-depth conversion.
+    // Long-lived — resized in-place each frame via `resize()` (only
+    // reallocates when capacity is insufficient) so steady-state runs
+    // produce zero allocations on the encode path for these. Replaces the
+    // per-frame `vec![0u8; ...]` allocations that used to appear on every
+    // 10-bit frame. The 8-bit Y plane still comes from
+    // `unpack_yuv422_8bit`, which allocates its own Vec; we move that in.
+    let mut cb_scratch: Vec<u8> = Vec::new();
+    let mut cr_scratch: Vec<u8> = Vec::new();
+    let mut y_bytes_scratch: Vec<u8> = Vec::new();
+    // Holds the Y plane for the 8-bit path (owned by unpack result, moved).
+    #[allow(unused_assignments)]
+    let mut y_scratch: Vec<u8> = Vec::new();
+
     while !cancel.is_cancelled() {
         let frame = match frame_rx.blocking_recv() {
             Some(f) => f,
             None => break,
         };
-        // Convert pgroup bytes to planar YUV 4:2:0 8-bit (encoder input).
-        let (y, u, v, y_w, y_h) = match fmt {
+
+        // Downsample source chroma rows from 4:2:2 to 4:2:0. No-op when
+        // the operator asked for 4:2:2 output — we keep the full chroma
+        // resolution.
+        let downsample_rows = matches!(target_chroma, video_codec::VideoChroma::Yuv420);
+
+        // Compute encoded-frame plane dimensions up-front based on target
+        // chroma + bit depth.
+        let w = frame.width as usize;
+        let h = frame.height as usize;
+        let enc_y_stride: usize;
+        let enc_c_stride: usize;
+        let enc_c_rows: usize;
+        let y_bytes: &[u8];
+        let u_bytes: &[u8];
+        let v_bytes: &[u8];
+
+        match fmt {
             PgroupFormat::Yuv422_8bit => {
-                let (y, cb, cr) = unpack_yuv422_8bit(&frame.pixels, frame.width, frame.height);
-                // 4:2:2 → 4:2:0 vertical subsample (drop every other chroma row).
-                let cw = (frame.width / 2) as usize;
-                let ch = (frame.height / 2) as usize;
-                let mut cb420 = vec![0u8; cw * ch];
-                let mut cr420 = vec![0u8; cw * ch];
-                for row in 0..ch {
-                    cb420[row * cw..(row + 1) * cw]
-                        .copy_from_slice(&cb[row * 2 * cw..row * 2 * cw + cw]);
-                    cr420[row * cw..(row + 1) * cw]
-                        .copy_from_slice(&cr[row * 2 * cw..row * 2 * cw + cw]);
+                // 8-bit source. Regardless of target bit depth we feed 8
+                // bits (no cheap up-conversion; 10-bit target with an
+                // 8-bit source is effectively lossless-passthrough from
+                // the encoder's perspective).
+                let (src_y, src_cb, src_cr) =
+                    unpack_yuv422_8bit(&frame.pixels, frame.width, frame.height);
+                let cw = w / 2;
+                if downsample_rows {
+                    let ch = h / 2;
+                    cb_scratch.resize(cw * ch, 0);
+                    cr_scratch.resize(cw * ch, 0);
+                    for row in 0..ch {
+                        let dst = row * cw;
+                        let src = row * 2 * cw;
+                        cb_scratch[dst..dst + cw].copy_from_slice(&src_cb[src..src + cw]);
+                        cr_scratch[dst..dst + cw].copy_from_slice(&src_cr[src..src + cw]);
+                    }
+                    y_scratch = src_y;
+                    enc_c_rows = ch;
+                } else {
+                    cb_scratch = src_cb;
+                    cr_scratch = src_cr;
+                    y_scratch = src_y;
+                    enc_c_rows = h;
                 }
-                (y, cb420, cr420, frame.width as usize, frame.height as usize)
+                enc_y_stride = w;
+                enc_c_stride = cw;
+                y_bytes = &y_scratch;
+                u_bytes = &cb_scratch;
+                v_bytes = &cr_scratch;
             }
             PgroupFormat::Yuv422_10bit => {
                 let (y10, cb10, cr10) =
                     unpack_yuv422_10bit(&frame.pixels, frame.width, frame.height);
-                // Simple 10→8 bit reduction: drop low 2 bits.
-                let y8: Vec<u8> = y10.iter().map(|&s| (s >> 2) as u8).collect();
-                let cw = (frame.width / 2) as usize;
-                let h = frame.height as usize;
-                let ch = h / 2;
-                let mut cb8 = vec![0u8; cw * ch];
-                let mut cr8 = vec![0u8; cw * ch];
-                for row in 0..ch {
-                    for x in 0..cw {
-                        cb8[row * cw + x] = (cb10[row * 2 * cw + x] >> 2) as u8;
-                        cr8[row * cw + x] = (cr10[row * 2 * cw + x] >> 2) as u8;
+                let cw = w / 2;
+                let bps = if target_10bit { 2 } else { 1 };
+                // Y plane (byte form).
+                y_bytes_scratch.resize(w * h * bps, 0);
+                if target_10bit {
+                    // Little-endian u16 pairs (pix_fmt YUV422P10LE).
+                    for (i, &s) in y10.iter().enumerate() {
+                        let b = s.to_le_bytes();
+                        y_bytes_scratch[i * 2] = b[0];
+                        y_bytes_scratch[i * 2 + 1] = b[1];
+                    }
+                } else {
+                    for (i, &s) in y10.iter().enumerate() {
+                        y_bytes_scratch[i] = (s >> 2) as u8;
                     }
                 }
-                (y8, cb8, cr8, frame.width as usize, h)
-            }
-        };
 
-        let y_stride = y_w;
-        let c_stride = y_w / 2;
-        let enc_out = encoder.encode_frame(&y, y_stride, &u, c_stride, &v, c_stride, Some(pts));
+                let c_rows_out = if downsample_rows { h / 2 } else { h };
+                cb_scratch.resize(cw * c_rows_out * bps, 0);
+                cr_scratch.resize(cw * c_rows_out * bps, 0);
+
+                match (downsample_rows, target_10bit) {
+                    (false, false) => {
+                        for row in 0..h {
+                            for x in 0..cw {
+                                cb_scratch[row * cw + x] = (cb10[row * cw + x] >> 2) as u8;
+                                cr_scratch[row * cw + x] = (cr10[row * cw + x] >> 2) as u8;
+                            }
+                        }
+                    }
+                    (false, true) => {
+                        for (i, &s) in cb10.iter().enumerate() {
+                            let b = s.to_le_bytes();
+                            cb_scratch[i * 2] = b[0];
+                            cb_scratch[i * 2 + 1] = b[1];
+                        }
+                        for (i, &s) in cr10.iter().enumerate() {
+                            let b = s.to_le_bytes();
+                            cr_scratch[i * 2] = b[0];
+                            cr_scratch[i * 2 + 1] = b[1];
+                        }
+                    }
+                    (true, false) => {
+                        for row in 0..c_rows_out {
+                            for x in 0..cw {
+                                cb_scratch[row * cw + x] =
+                                    (cb10[row * 2 * cw + x] >> 2) as u8;
+                                cr_scratch[row * cw + x] =
+                                    (cr10[row * 2 * cw + x] >> 2) as u8;
+                            }
+                        }
+                    }
+                    (true, true) => {
+                        for row in 0..c_rows_out {
+                            for x in 0..cw {
+                                let s_cb = cb10[row * 2 * cw + x].to_le_bytes();
+                                let s_cr = cr10[row * 2 * cw + x].to_le_bytes();
+                                cb_scratch[(row * cw + x) * 2] = s_cb[0];
+                                cb_scratch[(row * cw + x) * 2 + 1] = s_cb[1];
+                                cr_scratch[(row * cw + x) * 2] = s_cr[0];
+                                cr_scratch[(row * cw + x) * 2 + 1] = s_cr[1];
+                            }
+                        }
+                    }
+                }
+
+                enc_y_stride = w * bps;
+                enc_c_stride = cw * bps;
+                enc_c_rows = c_rows_out;
+                y_bytes = &y_bytes_scratch;
+                u_bytes = &cb_scratch;
+                v_bytes = &cr_scratch;
+            }
+        }
+
+        let _ = enc_c_rows; // documented — the encoder computes rows itself from pix_fmt
+        encode_stats.input_frames.fetch_add(1, Ordering::Relaxed);
+        let enc_out = encoder.encode_frame(
+            y_bytes, enc_y_stride, u_bytes, enc_c_stride, v_bytes, enc_c_stride,
+            Some(pts),
+        );
         pts += 1;
         let frames = match enc_out {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(error = %e, "ST 2110-20 input: encoder error");
+                encode_stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         };
         for ef in frames {
+            encode_stats.output_frames.fetch_add(1, Ordering::Relaxed);
             let ts_packets = ts_mux.mux_video(&ef.data, ef.pts as u64, ef.dts as u64, ef.keyframe);
-            let _ = y_h;
             for ts in ts_packets {
+                let ts_len = ts.len() as u64;
+                // `ts` is `Bytes` (from TsMuxer) — `Bytes::clone()` is a
+                // refcount bump, not a memcpy. Keep that semantics
+                // explicit so future refactors don't accidentally
+                // reintroduce a deep clone here.
                 let pkt = RtpPacket {
-                    data: ts.clone(),
+                    data: ts,
                     sequence_number: 0,
                     rtp_timestamp: ef.pts as u32,
                     recv_time_us: crate::util::time::now_us(),
                     is_raw_ts: true,
                 };
-                stats
-                    .input_packets
-                    .fetch_add(1, Ordering::Relaxed);
-                stats
-                    .input_bytes
-                    .fetch_add(ts.len() as u64, Ordering::Relaxed);
+                stats.input_packets.fetch_add(1, Ordering::Relaxed);
+                stats.input_bytes.fetch_add(ts_len, Ordering::Relaxed);
                 let _ = broadcast_tx.send(pkt);
             }
         }
@@ -326,6 +478,7 @@ fn encode_worker(
     _frame_rx: mpsc::Receiver<RawVideoFrame>,
     _broadcast_tx: broadcast::Sender<RtpPacket>,
     _stats: Arc<FlowStatsAccumulator>,
+    _encode_stats: Arc<crate::engine::ts_video_replace::VideoEncodeStats>,
     _cancel: CancellationToken,
 ) {
     tracing::error!(
@@ -615,6 +768,7 @@ fn bytes_le_to_u16(buf: &[u8], stride: usize, width: usize, height: usize) -> Ve
 
 pub async fn run_st2110_23_input(
     config: St2110_23InputConfig,
+    input_id: String,
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
@@ -630,6 +784,7 @@ pub async fn run_st2110_23_input(
     let height = config.height;
     let fps_num = config.frame_rate_num;
     let fps_den = config.frame_rate_den;
+    let encode_stats = register_ingress_video_encode_stats(&stats, &input_id, &enc_cfg, width, height, fps_num, fps_den);
     let tx_for_worker = broadcast_tx.clone();
     let stats_for_worker = stats.clone();
     let worker_cancel = cancel.clone();
@@ -644,6 +799,7 @@ pub async fn run_st2110_23_input(
             frame_rx,
             tx_for_worker,
             stats_for_worker,
+            encode_stats,
             worker_cancel,
         );
     });

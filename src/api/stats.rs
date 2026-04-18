@@ -521,6 +521,67 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
             }
         }
 
+        // RIST-specific metrics (when available)
+        output.push_str("\n# HELP bilbycast_edge_rist_rtt_ms RIST round-trip time in milliseconds\n");
+        output.push_str("# TYPE bilbycast_edge_rist_rtt_ms gauge\n");
+        output.push_str("# HELP bilbycast_edge_rist_nack_sent_total RIST NACK messages sent by receiver\n");
+        output.push_str("# TYPE bilbycast_edge_rist_nack_sent_total counter\n");
+        output.push_str("# HELP bilbycast_edge_rist_nack_received_total RIST NACK messages received by sender\n");
+        output.push_str("# TYPE bilbycast_edge_rist_nack_received_total counter\n");
+        output.push_str("# HELP bilbycast_edge_rist_retransmit_total RIST packets retransmitted by sender\n");
+        output.push_str("# TYPE bilbycast_edge_rist_retransmit_total counter\n");
+        output.push_str("# HELP bilbycast_edge_rist_packets_lost_total RIST packets not recovered by ARQ\n");
+        output.push_str("# TYPE bilbycast_edge_rist_packets_lost_total counter\n");
+        output.push_str("# HELP bilbycast_edge_rist_packets_recovered_total RIST packets recovered via retransmit\n");
+        output.push_str("# TYPE bilbycast_edge_rist_packets_recovered_total counter\n");
+        for fs in &flow_snapshots {
+            let push_leg = |out: &mut String, leg_label: &str, rist: &crate::stats::models::RistLegStats, owner_labels: &str| {
+                out.push_str(&format!(
+                    "bilbycast_edge_rist_rtt_ms{{{},leg=\"{}\"}} {:.1}\n",
+                    owner_labels, leg_label, rist.rtt_ms
+                ));
+                out.push_str(&format!(
+                    "bilbycast_edge_rist_nack_sent_total{{{},leg=\"{}\"}} {}\n",
+                    owner_labels, leg_label, rist.nack_sent_total
+                ));
+                out.push_str(&format!(
+                    "bilbycast_edge_rist_nack_received_total{{{},leg=\"{}\"}} {}\n",
+                    owner_labels, leg_label, rist.nack_received_total
+                ));
+                out.push_str(&format!(
+                    "bilbycast_edge_rist_retransmit_total{{{},leg=\"{}\"}} {}\n",
+                    owner_labels, leg_label, rist.pkt_retransmit_total
+                ));
+                out.push_str(&format!(
+                    "bilbycast_edge_rist_packets_lost_total{{{},leg=\"{}\"}} {}\n",
+                    owner_labels, leg_label, rist.packets_lost
+                ));
+                out.push_str(&format!(
+                    "bilbycast_edge_rist_packets_recovered_total{{{},leg=\"{}\"}} {}\n",
+                    owner_labels, leg_label, rist.packets_recovered
+                ));
+            };
+            let input_labels = format!("flow_id=\"{}\",leg_role=\"input\"", fs.flow_id);
+            if let Some(ref rist) = fs.input.rist_stats {
+                push_leg(&mut output, "leg1", rist, &input_labels);
+            }
+            if let Some(ref rist) = fs.input.rist_leg2_stats {
+                push_leg(&mut output, "leg2", rist, &input_labels);
+            }
+            for os in &fs.outputs {
+                let output_labels = format!(
+                    "flow_id=\"{}\",output_id=\"{}\",leg_role=\"output\"",
+                    fs.flow_id, os.output_id
+                );
+                if let Some(ref rist) = os.rist_stats {
+                    push_leg(&mut output, "leg1", rist, &output_labels);
+                }
+                if let Some(ref rist) = os.rist_leg2_stats {
+                    push_leg(&mut output, "leg2", rist, &output_labels);
+                }
+            }
+        }
+
         // TR-101290 metrics
         output.push_str("\n# HELP bilbycast_edge_tr101290_ts_packets_total TS packets analyzed\n");
         output.push_str("# TYPE bilbycast_edge_tr101290_ts_packets_total counter\n");

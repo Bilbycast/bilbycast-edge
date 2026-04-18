@@ -173,9 +173,7 @@ impl TsVideoReplacer {
 #[cfg(feature = "video-thumbnail")]
 mod inner {
     use super::*;
-    use video_codec::{
-        VideoCodec, VideoEncoderCodec, VideoEncoderConfig, VideoPreset, VideoProfile,
-    };
+    use video_codec::{VideoCodec, VideoEncoderCodec};
     use video_engine::{VideoDecoder, VideoEncoder};
 
     pub struct Inner {
@@ -186,10 +184,12 @@ mod inner {
         requested_height: Option<u32>,
         fps_num: Option<u32>,
         fps_den: Option<u32>,
-        bitrate_kbps: u32,
-        gop_size: Option<u32>,
-        preset: VideoPreset,
-        profile: VideoProfile,
+        /// Full `video_encode` config — threaded to
+        /// `video_encode_util::build_encoder_config` when the encoder is
+        /// opened on the first decoded frame, covering bitrate / gop /
+        /// preset / profile plus advanced knobs (chroma / bit_depth /
+        /// RC / CRF / bframes / refs / level / tune / colour metadata).
+        encode_cfg: VideoEncodeConfig,
 
         pmt_pid: Option<u16>,
         video_pid: Option<u16>,
@@ -225,17 +225,6 @@ mod inner {
             let target_family = backend.family();
             let target_stream_type = target_family.stream_type();
 
-            let preset = cfg
-                .preset
-                .as_deref()
-                .map(parse_preset)
-                .unwrap_or(VideoPreset::Medium);
-            let profile = cfg
-                .profile
-                .as_deref()
-                .map(parse_profile)
-                .unwrap_or(VideoProfile::Auto);
-
             let description = format!(
                 "{} @ {} kbps",
                 backend.ffmpeg_name(),
@@ -249,10 +238,7 @@ mod inner {
                 requested_height: cfg.height,
                 fps_num: cfg.fps_num,
                 fps_den: cfg.fps_den,
-                bitrate_kbps: cfg.bitrate_kbps.unwrap_or(4000),
-                gop_size: cfg.gop_size,
-                preset,
-                profile,
+                encode_cfg: cfg.clone(),
                 pmt_pid: None,
                 video_pid: None,
                 source_stream_type: 0,
@@ -463,20 +449,18 @@ mod inner {
                     self.pts_step_90k =
                         (90_000u64 * fps_den as u64) / fps_num.max(1) as u64;
 
-                    let gop_size = self.gop_size.unwrap_or(fps_num.max(1) * 2);
-
-                    let enc_cfg = VideoEncoderConfig {
-                        codec: self.backend,
-                        width: src_w,
-                        height: src_h,
+                    // Emit SPS/PPS inline in the bitstream (in-band) — MPEG-TS
+                    // has no out-of-band codec config channel, so every IDR
+                    // must carry SPS/PPS so mid-stream tune-ins can decode.
+                    let enc_cfg = crate::engine::video_encode_util::build_encoder_config(
+                        &self.encode_cfg,
+                        self.backend,
+                        src_w,
+                        src_h,
                         fps_num,
                         fps_den,
-                        bitrate_kbps: self.bitrate_kbps,
-                        gop_size,
-                        preset: self.preset,
-                        profile: self.profile,
-                        global_header: false, // emit SPS/PPS inline
-                    };
+                        false,
+                    );
                     match VideoEncoder::open(&enc_cfg) {
                         Ok(e) => self.encoder = Some(e),
                         Err(e) => {
@@ -539,29 +523,6 @@ mod inner {
         }
     }
 
-    fn parse_preset(s: &str) -> VideoPreset {
-        match s {
-            "ultrafast" => VideoPreset::Ultrafast,
-            "superfast" => VideoPreset::Superfast,
-            "veryfast" => VideoPreset::Veryfast,
-            "faster" => VideoPreset::Faster,
-            "fast" => VideoPreset::Fast,
-            "medium" => VideoPreset::Medium,
-            "slow" => VideoPreset::Slow,
-            "slower" => VideoPreset::Slower,
-            "veryslow" => VideoPreset::Veryslow,
-            _ => VideoPreset::Medium,
-        }
-    }
-
-    fn parse_profile(s: &str) -> VideoProfile {
-        match s {
-            "baseline" => VideoProfile::Baseline,
-            "main" => VideoProfile::Main,
-            "high" => VideoProfile::High,
-            _ => VideoProfile::Auto,
-        }
-    }
 }
 
 // ─────────────────────────── Shared helpers ───────────────────────────
@@ -787,6 +748,19 @@ mod tests {
             gop_size: None,
             preset: None,
             profile: None,
+            chroma: None,
+            bit_depth: None,
+            rate_control: None,
+            crf: None,
+            max_bitrate_kbps: None,
+            bframes: None,
+            refs: None,
+            level: None,
+            tune: None,
+            color_primaries: None,
+            color_transfer: None,
+            color_matrix: None,
+            color_range: None,
         }
     }
 
