@@ -1,5 +1,5 @@
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: MPL-2.0
+// Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 // Phase 1 step 2: foundation. Wired into the actual ST 2110 input tasks in
 // step 4; the public surface is exercised by unit tests in this module.

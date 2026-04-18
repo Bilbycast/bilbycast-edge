@@ -1,5 +1,5 @@
-// Copyright (c) 2026 Reza Rahimi / Softside Tech Pty Ltd. All rights reserved.
-// SPDX-License-Identifier: MPL-2.0
+// Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Shared resolution logic for building a `video_codec::VideoEncoderConfig`
 //! from the edge-side [`VideoEncodeConfig`].

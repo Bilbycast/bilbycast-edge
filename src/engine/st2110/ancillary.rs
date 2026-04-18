@@ -1,5 +1,5 @@
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: MPL-2.0
+// Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 // Phase 1 step 4: SMPTE ST 2110-40 ancillary data packetizer/depacketizer
 // per RFC 8331. SCTE-104, SMPTE 12M, and CEA-608/708 decoders are scoped
