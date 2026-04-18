@@ -1,0 +1,13 @@
+name: "bilbycast-edge CodeQL config"
+
+# Third-party vendored crates and test fixtures are out of scope for security
+# review: we don't own or maintain them, and CodeQL's hard-coded-credentials
+# rules fire on RFC 5769 test vectors inside libraries like `is` (ICE/STUN).
+paths-ignore:
+  - vendor/**
+  - "**/tests/**"
+  - "**/*_test.rs"
+  - "**/benches/**"
+
+queries:
+  - uses: security-and-quality
