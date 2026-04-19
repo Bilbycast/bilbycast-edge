@@ -39,6 +39,10 @@ pub mod output_rist;
 pub mod output_udp;
 pub mod manager;
 pub mod output_hls;
+/// Fragmented-MP4 (CMAF / CMAF-LL) HTTP-push output with optional CENC
+/// ClearKey encryption. Sibling to `output_hls` — same push model but
+/// fMP4 instead of MPEG-TS.
+pub mod cmaf;
 pub mod output_rtmp;
 pub mod output_rtp;
 pub mod output_srt;

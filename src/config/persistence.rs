@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn test_save_and_load_roundtrip() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut config = AppConfig {
+        let config = AppConfig {
             version: 1,
             node_id: None,
             device_name: None,

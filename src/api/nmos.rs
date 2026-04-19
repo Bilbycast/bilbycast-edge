@@ -136,6 +136,7 @@ fn output_transport(output: &OutputConfig) -> &'static str {
         OutputConfig::Rist(_) => "urn:x-nmos:transport:rtp",
         OutputConfig::Rtmp(_) => "urn:x-nmos:transport:rtp",
         OutputConfig::Hls(_) => "urn:x-nmos:transport:rtp",
+        OutputConfig::Cmaf(_) => "urn:x-nmos:transport:rtp",
         OutputConfig::Webrtc(_) => "urn:x-nmos:transport:websocket",
         OutputConfig::St2110_30(_)
         | OutputConfig::St2110_31(_)
@@ -297,6 +298,7 @@ fn output_id(output: &OutputConfig) -> &str {
         OutputConfig::Rist(c) => &c.id,
         OutputConfig::Rtmp(c) => &c.id,
         OutputConfig::Hls(c) => &c.id,
+        OutputConfig::Cmaf(c) => &c.id,
         OutputConfig::Webrtc(c) => &c.id,
         OutputConfig::St2110_30(c) => &c.id,
         OutputConfig::St2110_31(c) => &c.id,
@@ -316,6 +318,7 @@ fn output_name(output: &OutputConfig) -> &str {
         OutputConfig::Rist(c) => &c.name,
         OutputConfig::Rtmp(c) => &c.name,
         OutputConfig::Hls(c) => &c.name,
+        OutputConfig::Cmaf(c) => &c.name,
         OutputConfig::Webrtc(c) => &c.name,
         OutputConfig::St2110_30(c) => &c.name,
         OutputConfig::St2110_31(c) => &c.name,

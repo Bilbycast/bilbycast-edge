@@ -153,6 +153,9 @@ pub async fn test_output(config: &OutputConfig) -> TestResult {
             OutputConfig::Hls(hls) => {
                 TestResult::ok("configured", format!("HLS output configured for {}", hls.ingest_url), start.elapsed())
             }
+            OutputConfig::Cmaf(cmaf) => {
+                TestResult::ok("configured", format!("CMAF output configured for {}", cmaf.ingest_url), start.elapsed())
+            }
             OutputConfig::Webrtc(_) => {
                 TestResult::ok("ready", "WebRTC output — test requires active flow", start.elapsed())
             }

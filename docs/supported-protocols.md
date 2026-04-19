@@ -192,6 +192,26 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
   - RTMPS (TLS) uses the `tls` feature (enabled by default).
   - Single-program by spec — only one program can be published per output.
 
+### CMAF / CMAF-LL
+- **Direction:** Output only
+- **Transport:** HTTP PUT (standard) or HTTP PUT with chunked transfer encoding (LL-CMAF)
+- **Use case:** AWS MediaStore, Fastly OA, Akamai MSL, Wowza, nimble — any modern CDN ingest accepting fragmented-MP4 push
+- **Features:**
+  - ISO/IEC 23000-19 CMAF media profile (`cmfc` brand) with hand-rolled fMP4 muxer (no external MP4 crate dep)
+  - **Video:** H.264 + HEVC passthrough; optional `video_encode` block (libx264 / libx265 / NVENC, feature-gated) with explicit GoP alignment to `segment_duration_secs × fps` so segments always cut on IDR
+  - **Audio:** AAC-LC / HE-AAC v1 / HE-AAC v2 passthrough or re-encode (in-process via fdk-aac)
+  - **Manifests:** HLS `manifest.m3u8` and/or DASH `manifest.mpd` over the same fMP4 segments — emit either or both
+  - **Low-Latency CMAF:** `low_latency: true` + `chunk_duration_ms` (100-2000) emits one `moof+mdat` chunk per chunk_duration into a single chunked-transfer PUT per segment; HLS `#EXT-X-PART` rows + DASH `availabilityTimeOffset` advertise parts to LL-aware players. Targets <3 s glass-to-glass with 500 ms chunks
+  - **CENC encryption** (ISO/IEC 23001-7): `cenc` (AES-128 CTR) or `cbcs` (AES-128 CBC pattern 1:9 — FairPlay) with subsample encryption for H.264 / HEVC video, whole-sample encryption for AAC. ClearKey `pssh` emitted automatically; operators may add Widevine / PlayReady / FairPlay PSSH boxes via `pssh_boxes` (verbatim wrap into `moov`)
+  - **MPTS passthrough** or optional MPTS→SPTS program filter via `program_number`
+  - Optional Bearer token authentication via `auth_token`
+  - Codec work runs in `tokio::task::block_in_place`; LL chunked PUT uses `mpsc(8)` with `try_send` + drop-on-full so the broadcast subscriber is never blocked
+- **Limitations:**
+  - Output only. Standard mode adds 1-4 s latency; LL targets <3 s
+  - Source must emit IDR at least every `segment_duration_secs` unless `video_encode` is set
+  - LL ingests must accept HTTP/1.1 chunked transfer encoding on PUT (every major CDN does; static nginx does not)
+- **Reference:** [`docs/cmaf.md`](cmaf.md)
+
 ### HLS Ingest
 - **Direction:** Output only
 - **Transport:** HTTP PUT/POST over TCP

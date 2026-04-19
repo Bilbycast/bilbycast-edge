@@ -1112,6 +1112,26 @@ impl FlowRuntime {
                     stats: output_stats,
                 })
             }
+            OutputConfig::Cmaf(cmaf_config) => {
+                let output_stats = flow_stats.register_output(
+                    cmaf_config.id.clone(),
+                    cmaf_config.name.clone(),
+                    "cmaf".to_string(),
+                );
+                let handle = super::cmaf::spawn_cmaf_output(
+                    cmaf_config.clone(),
+                    broadcast_tx,
+                    output_stats.clone(),
+                    output_cancel.clone(),
+                    event_sender.clone(),
+                    flow_id.to_string(),
+                );
+                Ok(OutputRuntime {
+                    handle,
+                    cancel_token: output_cancel,
+                    stats: output_stats,
+                })
+            }
             OutputConfig::Webrtc(webrtc_config) => {
                 let output_stats = flow_stats.register_output(
                     webrtc_config.id.clone(),
@@ -1601,6 +1621,12 @@ fn build_output_config_meta(config: &OutputConfig) -> OutputConfigMeta {
         },
         OutputConfig::Hls(c) => OutputConfigMeta {
             mode: None, remote_addr: None, local_addr: None, dest_addr: None, dest_url: None,
+            ingest_url: Some(c.ingest_url.clone()), whip_url: None,
+            program_number: c.program_number,
+        },
+        OutputConfig::Cmaf(c) => OutputConfigMeta {
+            mode: Some(if c.low_latency { "cmaf-ll".to_string() } else { "cmaf".to_string() }),
+            remote_addr: None, local_addr: None, dest_addr: None, dest_url: None,
             ingest_url: Some(c.ingest_url.clone()), whip_url: None,
             program_number: c.program_number,
         },

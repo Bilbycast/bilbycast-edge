@@ -2542,6 +2542,164 @@ pub fn validate_output_with_input(
                 )?;
             }
         }
+        OutputConfig::Cmaf(cmaf) => {
+            fn validate_cenc_block(
+                cenc: &crate::config::models::CencConfig,
+                ctx: &str,
+            ) -> anyhow::Result<()> {
+                fn check_hex(s: &str, expected: usize, label: &str, ctx: &str) -> anyhow::Result<()> {
+                    if s.len() != expected {
+                        anyhow::bail!(
+                            "{ctx}: encryption.{label} must be exactly {expected} hex characters, got {}",
+                            s.len()
+                        );
+                    }
+                    if !s.chars().all(|c| c.is_ascii_hexdigit()) {
+                        anyhow::bail!("{ctx}: encryption.{label} must be hex-only");
+                    }
+                    Ok(())
+                }
+                check_hex(&cenc.key_id, 32, "key_id", ctx)?;
+                check_hex(&cenc.key, 32, "key", ctx)?;
+                match cenc.scheme.as_str() {
+                    "cenc" | "cbcs" => {}
+                    _ => anyhow::bail!(
+                        "{ctx}: encryption.scheme must be \"cenc\" or \"cbcs\", got \"{}\"",
+                        cenc.scheme
+                    ),
+                }
+                for (i, pssh_hex) in cenc.pssh_boxes.iter().enumerate() {
+                    if pssh_hex.len() % 2 != 0
+                        || !pssh_hex.chars().all(|c| c.is_ascii_hexdigit())
+                    {
+                        anyhow::bail!("{ctx}: encryption.pssh_boxes[{i}] must be even-length hex");
+                    }
+                    let bytes_len = pssh_hex.len() / 2;
+                    if bytes_len < 32 || bytes_len > 4096 {
+                        anyhow::bail!(
+                            "{ctx}: encryption.pssh_boxes[{i}] must decode to 32..=4096 bytes"
+                        );
+                    }
+                    // Sanity-check fourcc at bytes 4..8.
+                    let b4 = u8::from_str_radix(&pssh_hex[8..10], 16).unwrap_or(0);
+                    let b5 = u8::from_str_radix(&pssh_hex[10..12], 16).unwrap_or(0);
+                    let b6 = u8::from_str_radix(&pssh_hex[12..14], 16).unwrap_or(0);
+                    let b7 = u8::from_str_radix(&pssh_hex[14..16], 16).unwrap_or(0);
+                    if &[b4, b5, b6, b7] != b"pssh" {
+                        anyhow::bail!(
+                            "{ctx}: encryption.pssh_boxes[{i}] is not a valid pssh box (fourcc mismatch)"
+                        );
+                    }
+                }
+                Ok(())
+            }
+            validate_id(&cmaf.id, "CMAF output")?;
+            validate_name(&cmaf.name, "CMAF output")?;
+            validate_program_number(cmaf.program_number, &format!("CMAF output '{}'", cmaf.id))?;
+            if !cmaf.ingest_url.starts_with("http://") && !cmaf.ingest_url.starts_with("https://") {
+                bail!(
+                    "CMAF output '{}': ingest_url must start with http:// or https://",
+                    cmaf.id
+                );
+            }
+            if cmaf.ingest_url.len() > 2048 {
+                bail!(
+                    "CMAF output '{}': ingest_url must be at most 2048 characters",
+                    cmaf.id
+                );
+            }
+            // The URL is inlined into the HTTP request — reject CRLF / other
+            // control bytes that would permit header injection.
+            if cmaf.ingest_url.chars().any(|c| c.is_ascii_control()) {
+                bail!(
+                    "CMAF output '{}': ingest_url must not contain ASCII control characters",
+                    cmaf.id
+                );
+            }
+            if let Some(ref token) = cmaf.auth_token {
+                if token.len() > 4096 {
+                    bail!(
+                        "CMAF output '{}': auth_token must be at most 4096 characters",
+                        cmaf.id
+                    );
+                }
+                if token.chars().any(|c| c.is_ascii_control() || c.is_whitespace()) {
+                    bail!(
+                        "CMAF output '{}': auth_token must not contain control or whitespace characters",
+                        cmaf.id
+                    );
+                }
+            }
+            if cmaf.segment_duration_secs < 1.0 || cmaf.segment_duration_secs > 10.0 {
+                bail!(
+                    "CMAF output '{}': segment_duration_secs must be 1.0-10.0, got {}",
+                    cmaf.id, cmaf.segment_duration_secs
+                );
+            }
+            if cmaf.max_segments == 0 || cmaf.max_segments > 30 {
+                bail!(
+                    "CMAF output '{}': max_segments must be 1-30, got {}",
+                    cmaf.id, cmaf.max_segments
+                );
+            }
+            if cmaf.manifests.is_empty() {
+                bail!(
+                    "CMAF output '{}': manifests must be a non-empty subset of [\"hls\",\"dash\"]",
+                    cmaf.id
+                );
+            }
+            let mut seen_manifests = std::collections::HashSet::new();
+            for m in &cmaf.manifests {
+                if !seen_manifests.insert(m.as_str()) {
+                    bail!(
+                        "CMAF output '{}': duplicate manifest entry '{}'",
+                        cmaf.id, m
+                    );
+                }
+                match m.as_str() {
+                    "hls" | "dash" => {}
+                    other => {
+                        bail!(
+                            "CMAF output '{}': manifest entry '{}' must be \"hls\" or \"dash\"",
+                            cmaf.id, other
+                        );
+                    }
+                }
+            }
+            if cmaf.low_latency
+                && (cmaf.chunk_duration_ms < 100 || cmaf.chunk_duration_ms > 2000)
+            {
+                bail!(
+                    "CMAF output '{}': chunk_duration_ms must be 100-2000 when low_latency is true, got {}",
+                    cmaf.id, cmaf.chunk_duration_ms
+                );
+            }
+            if let Some(ref cenc) = cmaf.encryption {
+                validate_cenc_block(cenc, &format!("CMAF output '{}'", cmaf.id))?;
+            }
+            if let Some(ref enc) = cmaf.audio_encode {
+                validate_audio_encode(
+                    enc,
+                    &["aac_lc", "he_aac_v1", "he_aac_v2"],
+                    &format!("CMAF output '{}'", cmaf.id),
+                )?;
+            }
+            if let Some(ref tj) = cmaf.transcode {
+                if cmaf.audio_encode.is_none() {
+                    bail!(
+                        "CMAF output '{}': transcode has no effect without audio_encode set",
+                        cmaf.id
+                    );
+                }
+                validate_transcode_block_deferred(
+                    tj,
+                    &format!("CMAF output '{}' transcode", cmaf.id),
+                )?;
+            }
+            if let Some(ref ve) = cmaf.video_encode {
+                validate_video_encode(ve, &format!("CMAF output '{}'", cmaf.id))?;
+            }
+        }
         OutputConfig::Webrtc(webrtc) => {
             validate_id(&webrtc.id, "WebRTC output")?;
             validate_name(&webrtc.name, "WebRTC output")?;

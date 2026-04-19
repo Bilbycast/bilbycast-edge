@@ -874,6 +874,7 @@ working without ffmpeg installed at all.
 | `hls` | `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3` | `aac_lc` | HLS-TS supports MP2 (stream type 0x04) and AC-3 (private_stream_1) so long as the consumer's player does. |
 | `webrtc` | `opus` | `opus` | WebRTC realistically only does Opus. Validation also rejects `audio_encode` + `video_only=true` (an audio MID must be negotiated in SDP). |
 | `srt`, `udp`, `rtp`, `rist` (TS) | `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3` | `aac_lc` | `opus` is rejected — MPEG-TS has no standard Opus mapping. Incompatible with `transport_mode: "audio_302m"`, SMPTE 2022-7 redundancy, and SMPTE 2022-1 / SRT FEC (validation rejects at load time). |
+| `cmaf` | `aac_lc`, `he_aac_v1`, `he_aac_v2` | `aac_lc` | fMP4 audio sample entry is `mp4a` / `enca` (MPEG-4 AAC family). MP2 / AC-3 / Opus are rejected by validation — they are not part of the CMAF media profile. Compatible with `transcode` (channel shuffle / SRC) and with `encryption` (CENC ClearKey) on the same output. |
 
 The validator enforces this matrix at config load time and on every
 `update_config` manager command — invalid combinations are rejected

@@ -926,6 +926,10 @@ pub enum OutputConfig {
     /// Send TS segments via HLS ingest (e.g. YouTube HLS)
     #[serde(rename = "hls")]
     Hls(HlsOutputConfig),
+    /// Send fragmented-MP4 (CMAF / CMAF-LL) segments with HLS + DASH manifests,
+    /// optionally encrypted via ClearKey CENC. See [`CmafOutputConfig`].
+    #[serde(rename = "cmaf")]
+    Cmaf(CmafOutputConfig),
     /// Send via WebRTC/WHIP
     #[serde(rename = "webrtc")]
     Webrtc(WebrtcOutputConfig),
@@ -972,6 +976,7 @@ impl OutputConfig {
             OutputConfig::Rist(c) => &c.id,
             OutputConfig::Rtmp(c) => &c.id,
             OutputConfig::Hls(c) => &c.id,
+            OutputConfig::Cmaf(c) => &c.id,
             OutputConfig::Webrtc(c) => &c.id,
             OutputConfig::St2110_30(c) => &c.id,
             OutputConfig::St2110_31(c) => &c.id,
@@ -992,6 +997,7 @@ impl OutputConfig {
             OutputConfig::Rist(c) => &c.name,
             OutputConfig::Rtmp(c) => &c.name,
             OutputConfig::Hls(c) => &c.name,
+            OutputConfig::Cmaf(c) => &c.name,
             OutputConfig::Webrtc(c) => &c.name,
             OutputConfig::St2110_30(c) => &c.name,
             OutputConfig::St2110_31(c) => &c.name,
@@ -1012,6 +1018,7 @@ impl OutputConfig {
             OutputConfig::Rist(_) => "rist",
             OutputConfig::Rtmp(_) => "rtmp",
             OutputConfig::Hls(_) => "hls",
+            OutputConfig::Cmaf(_) => "cmaf",
             OutputConfig::Webrtc(_) => "webrtc",
             OutputConfig::St2110_30(_) => "st2110_30",
             OutputConfig::St2110_31(_) => "st2110_31",
@@ -1033,6 +1040,7 @@ impl OutputConfig {
             OutputConfig::Rist(c) => c.active,
             OutputConfig::Rtmp(c) => c.active,
             OutputConfig::Hls(c) => c.active,
+            OutputConfig::Cmaf(c) => c.active,
             OutputConfig::Webrtc(c) => c.active,
             OutputConfig::St2110_30(c) => c.active,
             OutputConfig::St2110_31(c) => c.active,
@@ -1055,6 +1063,7 @@ impl OutputConfig {
             OutputConfig::Rist(c) => c.active = active,
             OutputConfig::Rtmp(c) => c.active = active,
             OutputConfig::Hls(c) => c.active = active,
+            OutputConfig::Cmaf(c) => c.active = active,
             OutputConfig::Webrtc(c) => c.active = active,
             OutputConfig::St2110_30(c) => c.active = active,
             OutputConfig::St2110_31(c) => c.active = active,
@@ -1075,6 +1084,7 @@ impl OutputConfig {
             OutputConfig::Rist(c) => c.group.as_deref(),
             OutputConfig::Rtmp(c) => c.group.as_deref(),
             OutputConfig::Hls(c) => c.group.as_deref(),
+            OutputConfig::Cmaf(c) => c.group.as_deref(),
             OutputConfig::Webrtc(c) => c.group.as_deref(),
             OutputConfig::St2110_30(c) => c.group.as_deref(),
             OutputConfig::St2110_31(c) => c.group.as_deref(),
@@ -1996,6 +2006,152 @@ fn default_segment_duration() -> f64 {
 
 fn default_max_segments() -> usize {
     5
+}
+
+/// CMAF / CMAF-LL output.
+///
+/// Publishes fragmented-MP4 (CMAF per ISO/IEC 23000-19) segments alongside
+/// one or more manifests (HLS m3u8 and/or DASH .mpd) via HTTP push ingest.
+/// Each artifact is uploaded to `{ingest_url}/{filename}` — for example
+/// `https://ingest.example.com/live/init.mp4`, `.../seg-00042.m4s`,
+/// `.../manifest.m3u8`, `.../manifest.mpd`.
+///
+/// When `low_latency = true`, each media segment is sent as a single HTTP
+/// request with chunked transfer encoding, streaming CMAF chunks as they
+/// are produced (`chunk_duration_ms` apart). Standard mode (`low_latency = false`)
+/// buffers each segment to completion and uploads it with a single PUT.
+///
+/// Video is passed through unchanged by default (source must be H.264 or
+/// HEVC with IDR at least every `segment_duration_secs`). Setting
+/// `video_encode` forces a decode + re-encode with explicit GoP alignment —
+/// useful when the source cadence does not match the CMAF segment boundary.
+///
+/// Audio may be passed through (AAC carried in the source MPEG-TS) or
+/// re-encoded via the shared `audio_encode` + `transcode` stages. CMAF
+/// audio targets: `aac_lc`, `he_aac_v1`, `he_aac_v2`.
+///
+/// # Encryption
+///
+/// When `encryption` is set, segments are encrypted with Common Encryption
+/// (ISO/IEC 23001-7) using the operator-supplied `key_id` + `key`. The MVP
+/// ships ClearKey — the edge inserts a ClearKey `pssh` so W3C EME ClearKey
+/// clients can decrypt. Operators layering commercial DRM (Widevine /
+/// PlayReady / FairPlay) may provide pre-built `pssh_boxes` from their DRM
+/// vendor; the edge wraps them verbatim into the init segment's `moov`.
+///
+/// # Limitations
+///
+/// - Output only. Standard-mode segment-based transport adds 1-4 s latency;
+///   LL-CMAF with 500 ms chunks targets <3 s glass-to-glass.
+/// - Source must have an IDR at least every `segment_duration_secs` unless
+///   `video_encode` is set.
+/// - Phase 1 MVP: H.264 video + AAC audio; HEVC and encryption come in later
+///   phases.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CmafOutputConfig {
+    /// Unique output ID.
+    pub id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Whether this output is currently active. Passive outputs are kept in
+    /// config but not spawned by the engine. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Optional free-form group tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Base URL for segment / init / manifest uploads. Must begin with
+    /// `http://` or `https://`. Individual artifacts are PUT to
+    /// `{ingest_url}/{filename}` — keep a trailing path component (e.g.
+    /// `/live`) if the ingest expects one.
+    pub ingest_url: String,
+    /// Enable Low-Latency CMAF (chunked-transfer streaming PUT per segment
+    /// plus `#EXT-X-PART` / `availabilityTimeOffset` in manifests).
+    /// Default: `false` (standard whole-segment CMAF).
+    #[serde(default)]
+    pub low_latency: bool,
+    /// LL-CMAF chunk duration in milliseconds. Ignored when
+    /// `low_latency = false`. Range: 100-2000. Default: 500.
+    #[serde(default = "default_cmaf_chunk_duration_ms")]
+    pub chunk_duration_ms: u32,
+    /// Target segment (GoP) duration in seconds. Range: 1.0-10.0.
+    /// Default: 2.0. Segments always cut on IDR — this is advisory.
+    #[serde(default = "default_segment_duration")]
+    pub segment_duration_secs: f64,
+    /// Maximum number of segments in the rolling playlist. Range: 1-30.
+    /// Default: 5.
+    #[serde(default = "default_max_segments")]
+    pub max_segments: usize,
+    /// Manifests to publish. Non-empty subset of `["hls", "dash"]`.
+    /// Default: both. **Phase 1 MVP ships only `"hls"` — validation
+    /// rejects `"dash"` until Phase 2 lands.**
+    #[serde(default = "default_cmaf_manifests")]
+    pub manifests: Vec<String>,
+    /// Optional ClearKey CENC encryption. **Phase 1 MVP validation
+    /// rejects this field until Phase 5 lands.**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<CencConfig>,
+    /// Optional audio encode block. CMAF audio codecs: `aac_lc`,
+    /// `he_aac_v1`, `he_aac_v2`. **Phase 1 MVP validation rejects this
+    /// until Phase 3 lands — Phase 1 requires AAC passthrough.**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional PCM transcode (channel shuffle / SRC / bit-depth), sits
+    /// between the AAC decoder and `audio_encode`. Requires `audio_encode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Optional video encode block. When set, the output decodes the
+    /// source H.264/HEVC and re-encodes with explicit GoP alignment to the
+    /// CMAF segment duration. **Phase 1 MVP validation rejects this until
+    /// Phase 3 lands.** CMAF video codec must be H.264 (Phase 1) or HEVC
+    /// (Phase 2+); MPEG-DASH additionally supports hvc1/hev1 signalling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode: Option<VideoEncodeConfig>,
+    /// MPTS program filter. If the source is an MPTS, filter down to this
+    /// single program before segmenting. Must be `> 0` (program 0 is the
+    /// NIT).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
+    /// Optional Bearer token sent as `Authorization: Bearer {token}` on
+    /// every upload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+}
+
+/// Common Encryption (ISO/IEC 23001-7) configuration for a CMAF output.
+///
+/// The MVP ships ClearKey — the operator supplies `key_id` + `key` and the
+/// edge emits a ClearKey `pssh` so W3C EME ClearKey clients can decrypt.
+/// Commercial DRM systems (Widevine, PlayReady, FairPlay) can be layered
+/// by supplying pre-built `pssh_boxes` — the edge copies each entry
+/// verbatim into the init segment's `moov`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CencConfig {
+    /// Key ID, exactly 32 lowercase or uppercase hex characters (16 bytes).
+    /// Embedded in the `tenc.default_KID` field and the ClearKey `pssh`.
+    pub key_id: String,
+    /// AES-128 content key, exactly 32 hex characters (16 bytes).
+    /// **This is a secret. It is written to the node's config — clients
+    /// receive the key only via the ClearKey license flow or operator
+    /// DRM integration.**
+    pub key: String,
+    /// Encryption scheme: `"cenc"` (AES-128 CTR, the default) or `"cbcs"`
+    /// (AES-128 CBC with 1:9 block pattern, required for FairPlay).
+    pub scheme: String,
+    /// Optional pre-built `pssh` box payloads (hex-encoded), one per
+    /// additional DRM system. Each entry must be the full `pssh` box
+    /// starting from its size field. The edge validates the fourcc is
+    /// `pssh` and copies bytes verbatim into `moov`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pssh_boxes: Vec<String>,
+}
+
+fn default_cmaf_chunk_duration_ms() -> u32 {
+    500
+}
+
+fn default_cmaf_manifests() -> Vec<String> {
+    vec!["hls".to_string(), "dash".to_string()]
 }
 
 /// WebRTC output mode.

@@ -226,6 +226,9 @@ pub mod category {
     pub const RTMP: &str = "rtmp";
     pub const RTSP: &str = "rtsp";
     pub const HLS: &str = "hls";
+    /// CMAF / CMAF-LL output lifecycle (ingest connect, segment upload
+    /// failure, manifest upload failure, encryption init).
+    pub const CMAF: &str = "cmaf";
     pub const TUNNEL: &str = "tunnel";
     pub const FLOW: &str = "flow";
     pub const BANDWIDTH: &str = "bandwidth";

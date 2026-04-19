@@ -354,6 +354,11 @@ impl SecretsConfig {
                     hls.auth_token = os.auth_token.clone();
                 }
             }
+            OutputConfig::Cmaf(cmaf) => {
+                if os.auth_token.is_some() && cmaf.auth_token.is_none() {
+                    cmaf.auth_token = os.auth_token.clone();
+                }
+            }
             OutputConfig::Webrtc(webrtc) => {
                 if os.bearer_token.is_some() && webrtc.bearer_token.is_none() {
                     webrtc.bearer_token = os.bearer_token.clone();

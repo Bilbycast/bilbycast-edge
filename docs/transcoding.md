@@ -24,6 +24,7 @@ applicable / by design.
 | **ST 2110-30 / `rtp_audio`** | ✅ (auto via compressed-audio bridge) | ✅ (native PCM transcode, bit-depth + SRC + shuffle) | ❌ | Uncompressed PCM outputs; transcode is first-class here. |
 | **ST 2110-31** | ✅ | ❌ (AES3 opaque — channel labels inside SMPTE 337M payload, not addressable from the pipeline) | ❌ | |
 | **ST 2110-40** | ❌ | ❌ | ❌ | Ancillary data — no codec concept. |
+| **CMAF / CMAF-LL** | ✅ (AAC family only) | ✅ (requires `audio_encode`) | ✅ | fMP4 / CMAF segments with HLS m3u8 + DASH MPD; segmenter forces `gop_size = segment_duration × fps` when `video_encode` is set so segments always cut on IDR. Codec work runs in `block_in_place`. See [`docs/cmaf.md`](cmaf.md) for the full reference. |
 
 ---
 
@@ -131,7 +132,8 @@ video and other PIDs pass through unchanged.
 | RTMP         | `aac_lc`, `he_aac_v1`, `he_aac_v2`                 |
 | HLS          | `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`   |
 | WebRTC       | `opus`                                             |
-| **SRT / UDP / RTP (new)** | `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3` — `opus` is rejected here because MPEG-TS has no standard Opus mapping. |
+| **SRT / UDP / RTP** | `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3` — `opus` is rejected here because MPEG-TS has no standard Opus mapping. |
+| **CMAF / CMAF-LL** | `aac_lc`, `he_aac_v1`, `he_aac_v2` — fragmented-MP4 audio sample entry is `mp4a`/`enca` (MPEG-4 AAC family); MP2 / AC-3 / Opus are not used. |
 
 ### Rejected combinations (validation bails at load time)
 

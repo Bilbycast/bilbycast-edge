@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-edge"
-version = "0.25.0"
+version = "0.26.0"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 license = "AGPL-3.0-or-later"
@@ -9,6 +9,9 @@ license = "AGPL-3.0-or-later"
 # Async runtime
 tokio = { version = "1.52.0", features = ["full"] }
 tokio-util = "0.7.18"
+# Bridges `tokio::sync::mpsc::Receiver<T>` to `futures::Stream<Item=T>`,
+# which reqwest::Body::wrap_stream expects (used by CMAF-LL chunked PUT).
+tokio-stream = "0.1.17"
 
 # HTTP framework
 axum = { version = "0.8.9", features = ["ws"] }
@@ -88,6 +91,12 @@ subtle = "2.6"
 
 # Secrets encryption at rest (AES-256-GCM for secrets.json)
 aes-gcm = "0.11.0-rc.3"
+# Pure-Rust CENC ciphers for CMAF output (Common Encryption ISO/IEC 23001-7):
+#   cenc scheme → AES-128-CTR, cbcs scheme → AES-128-CBC with 1:9 block
+#   pattern. RustCrypto audited crates, MIT/Apache-2.0. Tiny binary cost.
+aes = "0.8"
+ctr = "0.9"
+cbc = "0.1"
 
 # UUID for flow IDs
 uuid = { version = "1.23.0", features = ["v4", "v5", "serde"] }
@@ -182,7 +191,7 @@ video-encoders-full = [
 # Enable TLS (HTTPS on API + RTMPS) support via rustls/tokio-rustls/axum-server.
 tls = ["dep:tokio-rustls", "dep:axum-server"]
 # Enable WebRTC WHIP/WHEP input and output via str0m (pure Rust, sans-I/O).
-webrtc = ["dep:str0m", "dep:reqwest"]
+webrtc = ["dep:str0m"]
 # (SMPTE ST 2110 — Phase 1) Optional in-process PTP slave clock via the
 # pure-Rust `statime` crate. The default deployment runs `ptp4l` (linuxptp)
 # externally and bilbycast reads its management socket; this feature exists
@@ -218,8 +227,12 @@ features = ["openssl"]
 [dependencies.reqwest]
 version = "0.13.2"
 default-features = false
-features = ["rustls"]
-optional = true
+# Used by:
+#  - WebRTC WHIP client signaling (feature-gated imports inside engine::webrtc)
+#  - CMAF output HTTP push ingest (segment / init / manifest PUTs)
+# rustls is the only TLS backend; `stream` enables Body::wrap_stream for
+# streaming uploads (CMAF-LL chunked transfer).
+features = ["rustls", "stream"]
 
 [dependencies.retina]
 version = "0.4.19"

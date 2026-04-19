@@ -917,6 +917,94 @@ Segments MPEG-2 TS data and uploads via HTTP for HLS ingest (e.g., YouTube HLS).
 **Limitations:**
 - Output only. Segment-based transport inherently adds 1-4 seconds of latency.
 
+### CMAF / CMAF-LL Output
+
+Publishes fragmented-MP4 (CMAF per ISO/IEC 23000-19) segments with HLS m3u8
+and/or DASH .mpd manifests to an operator-supplied HTTP push ingest. Sibling
+to the HLS output but with fMP4 segments — suitable for AWS MediaStore,
+Fastly, Akamai MSL, and any CDN that accepts CMAF HTTP PUT ingest. Supports
+H.264 / HEVC video passthrough or on-the-fly re-encoding, AAC audio
+passthrough or re-encoding, Low-Latency CMAF via chunked transfer, and
+ClearKey Common Encryption (`cenc` / `cbcs`) with optional Widevine /
+PlayReady PSSH passthrough.
+
+```json
+{
+  "type": "cmaf",
+  "id": "cmaf-cdn",
+  "name": "CMAF to CDN",
+  "ingest_url": "https://ingest.cdn.example.com/live",
+  "segment_duration_secs": 2.0,
+  "max_segments": 5,
+  "manifests": ["hls", "dash"],
+  "low_latency": false
+}
+```
+
+LL-CMAF example with DRM:
+
+```json
+{
+  "type": "cmaf",
+  "id": "cmaf-ll-drm",
+  "name": "LL-CMAF with ClearKey",
+  "ingest_url": "https://ingest.cdn.example.com/live",
+  "segment_duration_secs": 2.0,
+  "chunk_duration_ms": 500,
+  "low_latency": true,
+  "manifests": ["hls", "dash"],
+  "encryption": {
+    "scheme": "cenc",
+    "key_id": "0123456789abcdef0123456789abcdef",
+    "key": "fedcba9876543210fedcba9876543210",
+    "pssh_boxes": []
+  }
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `type` | string | Yes | - | Must be `"cmaf"`. |
+| `id` | string | Yes | - | Unique output ID. Max 64 chars. |
+| `name` | string | Yes | - | Human-readable display name. |
+| `ingest_url` | string | Yes | - | CMAF ingest base URL. Must start with `http://` or `https://`. Artifacts are PUT to `{ingest_url}/init.mp4`, `{ingest_url}/seg-{00001}.m4s`, `{ingest_url}/manifest.m3u8`, `{ingest_url}/manifest.mpd`. |
+| `segment_duration_secs` | float | No | `2.0` | Target segment duration in seconds. Range: 1.0-10.0. Segments cut on IDR — source must emit an IDR at least every `segment_duration_secs` unless `video_encode` is set (which forces GoP alignment). |
+| `max_segments` | integer | No | `5` | Rolling playlist window. Range: 1-30. |
+| `manifests` | array | No | `["hls","dash"]` | Subset of `{"hls", "dash"}`, non-empty. Both manifests reference the same fMP4 segments — enable either or both. |
+| `low_latency` | bool | No | `false` | Enable LL-CMAF: emits a moof+mdat chunk every `chunk_duration_ms` inside a single chunked-transfer PUT per segment, advertises parts via `#EXT-X-PART` (HLS) and `availabilityTimeOffset` (DASH). Target end-to-end latency <3 s with 500 ms chunks. |
+| `chunk_duration_ms` | integer | No | `500` | LL-CMAF chunk duration in ms. Range: 100-2000. Ignored when `low_latency = false`. |
+| `encryption` | object | No | `null` | Common Encryption configuration. See [`encryption`](#the-cmaf-encryption-block) below. |
+| `audio_encode` | object | No | `null` | Optional AAC re-encode. Allowed `codec`: `aac_lc`, `he_aac_v1`, `he_aac_v2`. Source must already be AAC (TsDemuxer decodes via fdk-aac). When omitted, the source AAC passes through unchanged. |
+| `video_encode` | object | No | `null` | Optional H.264 / HEVC re-encode with explicit GoP alignment to `segment_duration_secs`. See the [`video_encode` block](#the-video_encode-block) for backends and fields. H.264 → H.264 or HEVC → H.264 conversion is supported when the matching `video-encoder-*` Cargo feature is enabled. |
+| `program_number` | integer | No | `null` | MPTS → SPTS program filter. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
+| `auth_token` | string | No | `null` | Bearer token sent with every HTTP PUT / chunked PUT. |
+
+#### The CMAF `encryption` block
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `scheme` | string | Yes | - | Either `"cenc"` (AES-128 CTR, the CENC default) or `"cbcs"` (AES-128 CBC with 1:9 block pattern; required for Apple FairPlay). |
+| `key_id` | string | Yes | - | Key ID — exactly 32 hex characters (16 bytes). Embedded in `tenc.default_KID` and the ClearKey `pssh`. |
+| `key` | string | Yes | - | AES-128 content key — exactly 32 hex characters. This is a secret; clients receive the key via the ClearKey license flow or via your commercial DRM system's PSSH. |
+| `pssh_boxes` | array | No | `[]` | Operator-supplied pre-built `pssh` box payloads (hex-encoded), one per additional DRM system (Widevine, PlayReady, FairPlay). Each entry is the complete `pssh` box starting at the 4-byte size field; fourcc is sanity-checked at validation. The edge wraps them verbatim into `moov`. |
+
+When `encryption` is set, the edge:
+
+1. Emits `encv` / `enca` sample entries that wrap `avc1` / `hvc1` / `mp4a` via a `sinf/frma/schm/schi/tenc` chain (ISO/IEC 23001-7 §8).
+2. Subsample-encrypts each H.264 / HEVC sample — NAL length prefix + NAL header + 32 bytes of slice header are left clear; the rest of the VCL NAL payload is encrypted. Parameter-set NALs (SPS / PPS / VPS / SEI / AUD) stay fully clear. For `cbcs` the encrypted span is rounded down to a multiple of 16 bytes.
+3. AAC samples are whole-encrypted with no subsample split.
+4. Writes `senc` / `saio` / `saiz` into every `traf` with correctly back-patched offsets.
+5. Emits a ClearKey `pssh` (system ID `1077efec-c0b2-4d02-ace3-3c1e52e2fb4b`, version 1) into `moov`, plus any operator-supplied `pssh_boxes` verbatim.
+
+**Limitations:**
+
+- Output only. Standard-mode segment-based transport adds 1-4 s latency; LL-CMAF with 500 ms chunks targets <3 s glass-to-glass.
+- Source must emit an IDR at least every `segment_duration_secs` unless `video_encode` is set.
+- `video_encode` requires the `video-thumbnail` feature plus a matching `video-encoder-x264` / `-x265` / `-nvenc` backend compiled in.
+- Whip-style signaling is not needed — CMAF is stateless HTTP push.
+
+See [`docs/cmaf.md`](cmaf.md) for the full reference, ingest compatibility notes, and performance tuning.
+
 ### WebRTC Output
 
 Supports two modes: WHIP client (push to external endpoint) and WHEP server (serve viewers). The `webrtc` feature is enabled by default.
