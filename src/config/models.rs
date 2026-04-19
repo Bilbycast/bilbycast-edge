@@ -710,6 +710,11 @@ pub struct SrtInputConfig {
     /// Optional: enable 2022-7 redundancy on input (merge from two SRT legs)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<SrtRedundancyConfig>,
+    /// Optional: enable native libsrt SRT bonding (socket groups) on input.
+    /// Mutually exclusive with `redundancy`. Only supported with the libsrt
+    /// backend; the pure-Rust backend does not expose socket groups.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bonding: Option<SrtBondingConfig>,
     /// Transport mode for the SRT input stream. `"ts"` (default) auto-detects
     /// RTP/TS or raw TS as the existing path does. `"audio_302m"` forces a
     /// SMPTE 302M LPCM-in-MPEG-TS demux: the input task locates the BSSD
@@ -1392,6 +1397,11 @@ pub struct SrtOutputConfig {
     /// Optional: enable 2022-7 redundancy on output (duplicate to two SRT legs)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<SrtRedundancyConfig>,
+    /// Optional: enable native libsrt SRT bonding (socket groups) on output.
+    /// Mutually exclusive with `redundancy`. Only supported with the libsrt
+    /// backend; the pure-Rust backend does not expose socket groups.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bonding: Option<SrtBondingConfig>,
     /// If set, filter the (possibly MPTS) input stream down to this single
     /// MPEG-TS program before sending. Default: passthrough (full MPTS).
     /// Must be > 0; program_number 0 is reserved for the NIT.
@@ -1432,7 +1442,7 @@ pub struct SrtOutputConfig {
 /// The mode affects which address fields are required in the configuration:
 /// - `Caller` and `Rendezvous` require a `remote_addr`.
 /// - `Listener` only needs a `local_addr` to bind on.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SrtMode {
     /// Active mode: the SRT endpoint initiates the connection to a remote listener.
     /// Requires `remote_addr` to be specified. This is the most common mode for
@@ -1548,6 +1558,70 @@ pub struct SrtRedundancyConfig {
     /// IP Time To Live for leg 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip_ttl: Option<i32>,
+}
+
+/// Native libsrt SRT bonding mode (socket-group type).
+///
+/// Wire-compatible with libsrt's `SRT_GTYPE_*` socket groups — interoperable
+/// with `srt-live-transmit grp:BROADCAST://` / `grp:BACKUP://` and any other
+/// libsrt-based peer that speaks the bonding handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SrtBondingMode {
+    /// All member links active simultaneously. libsrt deduplicates on the
+    /// receiver. Equivalent to SMPTE 2022-7 hitless redundancy at the SRT
+    /// layer but negotiated in the handshake — a single bonded session from
+    /// the peer's perspective.
+    #[serde(rename = "broadcast")]
+    Broadcast,
+    /// Primary/backup: only the highest-priority healthy link carries data;
+    /// others stand by for automatic failover.
+    #[serde(rename = "backup")]
+    Backup,
+}
+
+/// One endpoint (member link) in an SRT bonding group.
+///
+/// Each bonded member is a separate SRT path — typically pinned to a
+/// different NIC / upstream network. The SRT config options on the parent
+/// `SrtInputConfig` / `SrtOutputConfig` (latency, encryption, stream_id,
+/// payload_size, etc.) apply to every member.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SrtBondingEndpoint {
+    /// Remote address (caller side) or local bind address (listener side).
+    /// For callers this is the peer listener; for listeners this is the
+    /// local bind address for this member. In caller mode every endpoint
+    /// must supply a remote address.
+    pub addr: String,
+    /// Optional local bind address for caller members (e.g. to pin the
+    /// member to a specific NIC / source IP). Ignored in listener mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_addr: Option<String>,
+    /// Backup-mode member priority. Lower values are preferred. Ignored in
+    /// broadcast mode. Default: 0 (all members equal — libsrt picks
+    /// deterministically).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u16>,
+}
+
+/// Native libsrt SRT bonding (socket group) config.
+///
+/// Mutually exclusive with [`SrtRedundancyConfig`] — bonding replaces the
+/// app-layer 2022-7 hitless merge with libsrt's native group handshake.
+/// Only supported with the libsrt backend; rejected at config validation
+/// time when the pure-Rust backend is active.
+///
+/// Broadcast mode is wire-compatible with SMPTE 2022-7-style redundancy at
+/// the SRT level. Backup mode is primary/backup failover. At least 2 and
+/// at most 8 endpoints are supported (libsrt's practical cap).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SrtBondingConfig {
+    /// Bonding mode: broadcast (all-active, dedup) or backup (primary/
+    /// failover).
+    pub mode: SrtBondingMode,
+    /// Member endpoints (2..=8). In caller mode each entry is a remote
+    /// listener peer; in listener mode each entry is a local bind address
+    /// that accepts one member of the group handshake.
+    pub endpoints: Vec<SrtBondingEndpoint>,
 }
 
 /// SMPTE 2022-7 redundancy config for an RTP input (leg 2).

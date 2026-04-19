@@ -518,6 +518,7 @@ mod tests {
             tlpkt_drop: None,
             ip_ttl: None,
             redundancy: None,
+            bonding: None,
             transport_mode: None,
             audio_encode: None,
             transcode: None,

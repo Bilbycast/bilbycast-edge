@@ -51,6 +51,7 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
 - [MPTS → SPTS filtering](#mpts--spts-filtering)
 - [SMPTE 2022-1 FEC Configuration](#smpte-2022-1-fec-configuration)
 - [SMPTE 2022-7 SRT Redundancy](#smpte-2022-7-srt-redundancy)
+- [Native libsrt SRT Bonding (Socket Groups)](#native-libsrt-srt-bonding-socket-groups)
 - [SRT Connection Modes](#srt-connection-modes)
 - [CLI Argument Overrides](#cli-argument-overrides)
 - [Config Persistence Behavior](#config-persistence-behavior)
@@ -1226,6 +1227,62 @@ For output: packets are duplicated and sent on both legs simultaneously.
 | `crypto_mode` | string | No | `null` | Cipher mode for leg 2: `"aes-ctr"` or `"aes-gcm"`. |
 
 Legs can use different SRT modes, different ports, different latency values, and even different encryption settings (though using the same settings is recommended for simplicity).
+
+---
+
+## Native libsrt SRT Bonding (Socket Groups)
+
+SRT inputs and outputs also support **native libsrt socket-group bonding** via an inline `bonding` block. Unlike `redundancy` (two independent SRT sessions merged at the app layer), bonding is the libsrt wire protocol — the peer sees a single bonded session and speaks the group handshake, making it interoperable with `srt-live-transmit grp:BROADCAST://` / `grp:BACKUP://`, Haivision socket groups, and any other libsrt peer.
+
+```json
+{
+  "type": "srt",
+  "mode": "caller",
+  "latency_ms": 200,
+  "bonding": {
+    "mode": "broadcast",
+    "endpoints": [
+      { "addr": "203.0.113.10:9000", "local_addr": "192.168.1.2:0" },
+      { "addr": "203.0.113.11:9000", "local_addr": "192.168.2.2:0" }
+    ]
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `mode` | string | Yes | `"broadcast"` (all members active, libsrt dedups) or `"backup"` (primary/failover). |
+| `endpoints` | array | Yes | 2–8 member entries. |
+| `endpoints[].addr` | string | Yes | Caller mode: remote peer address. Listener mode: the list is advisory — the parent `local_addr` is the single bind (libsrt group handshake is multiplexed on one listener). |
+| `endpoints[].local_addr` | string | No | Caller-only: source bind for this member (use to pin each leg to a different NIC). |
+| `endpoints[].weight` | integer | No | Backup-mode priority; **lower is preferred**. Ignored in broadcast. Default 0 = equal. |
+
+**Rules:**
+- `bonding` and `redundancy` are **mutually exclusive** on the same SRT input/output — bonding replaces the app-layer 2022-7 with the wire-native group handshake.
+- Bonding is **only supported on the libsrt backend**. The pure-Rust `bilbycast-srt` backend does not expose socket groups.
+- Bonded outputs compose with every other per-output stage: `program_number`, `audio_encode` (with optional companion `transcode`), `video_encode`, output `delay`, and `transport_mode: "audio_302m"`. The bonded path reuses the same forward-loop pipeline as the single-socket path — the only change is that packets land on `SrtGroup::send()` (caller mode) or on the accepted group-aware listener socket.
+- Every SRT option on the parent (latency, encryption, stream_id, packet_filter, MSS, payload_size, retransmit algo, etc.) applies to **all** members uniformly.
+- `rendezvous` mode does not support bonding (libsrt's group handshake has no rendezvous variant). Validation rejects the combination.
+
+**Per-leg stats** are surfaced via `srt_bonding_stats` on the input/output snapshot:
+```json
+{
+  "srt_bonding_stats": {
+    "mode": "broadcast",
+    "aggregate": { "state": "connected", "rtt_ms": 18.2, "recv_rate_mbps": 9.7, ... },
+    "members": [
+      { "endpoint": "203.0.113.10:9000", "socket_status": "connected",
+        "member_status": "running", "weight": 0, "stats": { ... } },
+      { "endpoint": "203.0.113.11:9000", "socket_status": "connected",
+        "member_status": "running", "weight": 0, "stats": { ... } }
+    ]
+  }
+}
+```
+
+`member_status` values: `running` (active), `idle` (standby backup), `pending` (negotiating), `broken`.
+
+**Testing interop:** see `testbed/flow-groups/srt-bonding.sh` (`./testbed/flows.sh srt-bonding`). Drives `srt-live-transmit` group callers against bonded edge listeners and vice versa.
 
 ---
 

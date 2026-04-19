@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-bilbycast-edge is a Rust media transport gateway for professional broadcast workflows. It bridges multiple protocols (SRT, RIST Simple Profile, RTP, UDP, RTMP, RTSP, HLS, WebRTC WHIP/WHEP, CMAF / CMAF-LL with optional ClearKey CENC encryption) with SMPTE 2022-1 FEC and SMPTE 2022-7 hitless redundancy. WebRTC support includes all four WHIP/WHEP modes (input and output, client and server) via the pure-Rust `str0m` WebRTC stack, interoperable with OBS, browsers, and standard WHIP/WHEP implementations. Designed for low-latency, uninterrupted media flow with broadcast-grade QoS.
+bilbycast-edge is a Rust media transport gateway for professional broadcast workflows. It bridges multiple protocols (SRT, RIST Simple Profile, RTP, UDP, RTMP, RTSP, HLS, WebRTC WHIP/WHEP, CMAF / CMAF-LL with optional ClearKey CENC encryption) with SMPTE 2022-1 FEC and SMPTE 2022-7 hitless redundancy. SRT additionally supports **native libsrt socket-group bonding** (`bonding: { mode: broadcast | backup, endpoints[] }` on SRT inputs/outputs) — wire-compatible with `srt-live-transmit grp://`, Haivision socket groups, and every other libsrt-based bonding peer — with per-member stats surfaced through the WS + Prometheus telemetry. Bonding is mutually exclusive with the app-layer `redundancy` block and requires the libsrt backend. WebRTC support includes all four WHIP/WHEP modes (input and output, client and server) via the pure-Rust `str0m` WebRTC stack, interoperable with OBS, browsers, and standard WHIP/WHEP implementations. Designed for low-latency, uninterrupted media flow with broadcast-grade QoS.
 
 ## Build Commands
 

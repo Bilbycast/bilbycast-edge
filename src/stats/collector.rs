@@ -37,6 +37,10 @@ pub struct OutputStatsAccumulator {
     /// Cached SRT stats for redundancy leg, updated by the SRT output polling task
     /// via a lock-free watch channel.
     pub srt_leg2_stats_cache: Arc<watch::Sender<Option<SrtLegStats>>>,
+    /// Cached native-libsrt bonding stats (aggregate + per-member) for an
+    /// SRT output whose config has a `bonding` block. Lock-free watch
+    /// channel, populated by `spawn_srt_group_stats_poller`.
+    pub srt_bonding_stats_cache: Arc<watch::Sender<Option<crate::stats::models::SrtBondingStats>>>,
     /// Shared RIST connection-level counters for the primary output leg.
     /// Stored as an `Arc` handle because the `RistSocket` sender task owns
     /// and mutates the counters directly — snapshotting is a cheap atomic
@@ -150,6 +154,7 @@ impl OutputStatsAccumulator {
             throughput: ThroughputEstimator::new(),
             srt_stats_cache: Arc::new(watch::channel(None).0),
             srt_leg2_stats_cache: Arc::new(watch::channel(None).0),
+            srt_bonding_stats_cache: Arc::new(watch::channel(None).0),
             rist_stats_handle: OnceLock::new(),
             rist_leg2_stats_handle: OnceLock::new(),
             bond_stats_handle: OnceLock::new(),
@@ -409,6 +414,7 @@ impl OutputStatsAccumulator {
             fec_packets_sent: self.fec_packets_sent.load(Ordering::Relaxed),
             srt_stats: self.srt_stats_cache.borrow().clone(),
             srt_leg2_stats: self.srt_leg2_stats_cache.borrow().clone(),
+            srt_bonding_stats: self.srt_bonding_stats_cache.borrow().clone(),
             rist_stats: self
                 .rist_stats_handle
                 .get()
@@ -1008,6 +1014,11 @@ pub struct FlowStatsAccumulator {
     /// Cached SRT stats for redundancy input leg, updated by the SRT input polling task
     /// via a lock-free watch channel.
     pub input_srt_leg2_stats_cache: Arc<watch::Sender<Option<SrtLegStats>>>,
+    /// Cached native-libsrt bonding stats (aggregate + per-member) for an
+    /// SRT input whose config has a `bonding` block. Lock-free watch
+    /// channel, populated by `spawn_srt_group_stats_poller`.
+    pub input_srt_bonding_stats_cache:
+        Arc<watch::Sender<Option<crate::stats::models::SrtBondingStats>>>,
     /// Shared bond stats handle for bonded inputs — the only input
     /// type that aggregates N paths at the transport layer.
     /// Populated by `engine::input_bonded::spawn_bonded_input`.
@@ -1111,6 +1122,7 @@ impl FlowStatsAccumulator {
             output_config_meta: DashMap::new(),
             input_srt_stats_cache: Arc::new(watch::channel(None).0),
             input_srt_leg2_stats_cache: Arc::new(watch::channel(None).0),
+            input_srt_bonding_stats_cache: Arc::new(watch::channel(None).0),
             input_bond_stats_handle: OnceLock::new(),
             input_rist_stats_handle: OnceLock::new(),
             input_rist_leg2_stats_handle: OnceLock::new(),
@@ -1514,6 +1526,7 @@ impl FlowStatsAccumulator {
                     packets_recovered_fec: self.fec_recovered.load(Ordering::Relaxed),
                     srt_stats: self.input_srt_stats_cache.borrow().clone(),
                     srt_leg2_stats: self.input_srt_leg2_stats_cache.borrow().clone(),
+                    srt_bonding_stats: self.input_srt_bonding_stats_cache.borrow().clone(),
                     rist_stats: rist_input_stats,
                     rist_leg2_stats: rist_input_leg2_stats,
                     bond_stats: self

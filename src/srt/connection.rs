@@ -9,11 +9,14 @@ use anyhow::{Context, Result, bail};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use srt_protocol::config::{CryptoModeConfig, KeySize, RetransmitAlgo};
-use srt_transport::{SrtListener, SrtSocket, SrtSocketBuilder};
+use srt_protocol::config::{CryptoModeConfig, KeySize, MemberStatus, RetransmitAlgo};
+use srt_transport::{GroupMode, SrtGroup, SrtGroupBuilder, SrtListener, SrtSocket, SrtSocketBuilder};
 
-use crate::config::models::{SrtInputConfig, SrtMode, SrtOutputConfig, SrtRedundancyConfig};
-use crate::stats::models::SrtLegStats;
+use crate::config::models::{
+    SrtBondingConfig, SrtBondingMode, SrtInputConfig, SrtMode, SrtOutputConfig,
+    SrtRedundancyConfig,
+};
+use crate::stats::models::{SrtBondingMemberStats, SrtBondingStats, SrtLegStats};
 
 /// Common SRT connection parameters extracted from any SRT config type.
 ///
@@ -678,4 +681,314 @@ pub fn spawn_srt_stats_poller(
             }
         }
     });
+}
+
+// ── SRT bonding (native libsrt socket group) helpers ──
+
+fn socket_status_str(s: srt_protocol::config::SocketStatus) -> &'static str {
+    use srt_protocol::config::SocketStatus::*;
+    match s {
+        Init => "init",
+        Opened => "opened",
+        Listening => "listening",
+        Connecting => "connecting",
+        Connected => "connected",
+        Broken => "broken",
+        Closing => "closing",
+        Closed => "closed",
+        NonExist => "nonexist",
+    }
+}
+
+fn member_status_str(s: MemberStatus) -> &'static str {
+    match s {
+        MemberStatus::Pending => "pending",
+        MemberStatus::Idle => "idle",
+        MemberStatus::Running => "running",
+        MemberStatus::Broken => "broken",
+    }
+}
+
+fn bonding_mode_str(m: &SrtBondingMode) -> &'static str {
+    match m {
+        SrtBondingMode::Broadcast => "broadcast",
+        SrtBondingMode::Backup => "backup",
+    }
+}
+
+pub(crate) fn srt_bonding_mode_to_group_mode(m: &SrtBondingMode) -> GroupMode {
+    match m {
+        SrtBondingMode::Broadcast => GroupMode::Broadcast,
+        SrtBondingMode::Backup => GroupMode::Backup,
+    }
+}
+
+/// Build an [`SrtGroupBuilder`] (bonded caller) from the SRT options on the
+/// parent input/output config, plus the bonding mode. Endpoints are added
+/// by the caller with `.add_endpoint(...)`.
+pub fn build_group_builder(p: &SrtConnectionParams, mode: GroupMode) -> SrtGroupBuilder {
+    let timeout = if p.peer_idle_timeout_secs == 0 { 30 } else { p.peer_idle_timeout_secs };
+    let mut builder = SrtGroup::builder(mode)
+        .latency(Duration::from_millis(p.latency_ms))
+        .live_mode()
+        .peer_idle_timeout(Duration::from_secs(timeout));
+
+    if let Some(recv) = p.recv_latency_ms {
+        builder = builder.receiver_latency(Duration::from_millis(recv));
+    }
+    if let Some(peer) = p.peer_latency_ms {
+        builder = builder.sender_latency(Duration::from_millis(peer));
+    }
+
+    if let Some(pass) = p.passphrase {
+        let key_size = match p.aes_key_len.unwrap_or(16) {
+            24 => KeySize::AES192,
+            32 => KeySize::AES256,
+            _ => KeySize::AES128,
+        };
+        builder = builder.encryption(pass, key_size);
+    }
+
+    if p.crypto_mode == Some("aes-gcm") {
+        builder = builder.crypto_mode(CryptoModeConfig::AesGcm);
+    }
+
+    if let Some(bw) = p.max_rexmit_bw {
+        builder = builder.max_rexmit_bw(bw);
+    }
+
+    if let Some(sid) = p.stream_id {
+        if !sid.is_empty() {
+            builder = builder.stream_id(sid.to_string());
+        }
+    }
+
+    if let Some(pf) = p.packet_filter {
+        if !pf.is_empty() {
+            builder = builder.packet_filter(pf.to_string());
+        }
+    }
+
+    if let Some(bw) = p.max_bw { builder = builder.max_bw(bw); }
+    if let Some(bw) = p.input_bw { builder = builder.input_bw(bw); }
+    if let Some(pct) = p.overhead_bw { builder = builder.overhead_bw(pct); }
+    if let Some(e) = p.enforced_encryption { builder = builder.enforced_encryption(e); }
+    if let Some(t) = p.connect_timeout_secs { builder = builder.connect_timeout(Duration::from_secs(t)); }
+    if let Some(s) = p.flight_flag_size { builder = builder.flight_flag_size(s); }
+    if let Some(s) = p.send_buffer_size { builder = builder.send_buffer_size(s * 1316); }
+    if let Some(s) = p.recv_buffer_size { builder = builder.recv_buffer_size(s * 1316); }
+    if let Some(t) = p.ip_tos { builder = builder.ip_tos(t); }
+    if p.retransmit_algo.is_some() { builder = builder.retransmit_algo(parse_retransmit_algo(p.retransmit_algo)); }
+    if let Some(d) = p.send_drop_delay { builder = builder.send_drop_delay(d); }
+    if let Some(t) = p.loss_max_ttl { builder = builder.loss_max_ttl(t); }
+    if let Some(r) = p.km_refresh_rate { builder = builder.km_refresh_rate(r); }
+    if let Some(r) = p.km_pre_announce { builder = builder.km_pre_announce(r); }
+    if let Some(s) = p.payload_size { builder = builder.payload_size(s); }
+    if let Some(s) = p.mss { builder = builder.mss(s); }
+    if let Some(t) = p.tlpkt_drop { builder = builder.tlpkt_drop(t); }
+    if let Some(t) = p.ip_ttl { builder = builder.ip_ttl(t); }
+
+    builder
+}
+
+/// Connect a bonded SRT group (caller side) given the parent SRT config
+/// and a bonding block. Each endpoint in `bond.endpoints` becomes one
+/// group member. With automatic retry on transient errors.
+pub async fn connect_srt_group(
+    p: &SrtConnectionParams<'_>,
+    bond: &SrtBondingConfig,
+    cancel: &CancellationToken,
+) -> Result<Arc<SrtGroup>> {
+    if !matches!(p.mode, SrtMode::Caller) {
+        bail!("SRT bonding caller-connect requires caller mode");
+    }
+    let mut builder = build_group_builder(p, srt_bonding_mode_to_group_mode(&bond.mode));
+    for ep in &bond.endpoints {
+        let sa: SocketAddr = ep
+            .addr
+            .parse()
+            .with_context(|| format!("parse bonding endpoint '{}'", ep.addr))?;
+        builder = builder.add_endpoint(sa);
+    }
+
+    // Retry with exponential back-off, same shape as single-socket connect.
+    let mut delay_ms: u64 = 250;
+    loop {
+        if cancel.is_cancelled() {
+            bail!("cancelled before SRT group connect");
+        }
+        // `SrtGroupBuilder::connect` consumes self, so rebuild on retry.
+        let mut retry_builder =
+            build_group_builder(p, srt_bonding_mode_to_group_mode(&bond.mode));
+        for ep in &bond.endpoints {
+            let sa: SocketAddr = ep.addr.parse().unwrap();
+            retry_builder = retry_builder.add_endpoint(sa);
+        }
+        let attempt = builder.connect().await;
+        match attempt {
+            Ok(group) => return Ok(group),
+            Err(e) => {
+                tracing::warn!("SRT group connect failed: {e}; retrying in {delay_ms}ms");
+                tokio::select! {
+                    _ = cancel.cancelled() => bail!("cancelled during SRT group reconnect"),
+                    _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                }
+                delay_ms = (delay_ms * 2).min(5000);
+                builder = retry_builder;
+            }
+        }
+    }
+}
+
+fn build_bonding_stats_snapshot(
+    group: &SrtGroup,
+    member_stats: Vec<srt_transport::GroupMemberStats>,
+    mode: &SrtBondingMode,
+) -> SrtBondingStats {
+    // Pull aggregate group-level stats synchronously via a quick poll.
+    // We don't await inside because callers already awaited member_stats.
+    let aggregate = SrtLegStats {
+        state: socket_status_str(group.status()).to_string(),
+        ..Default::default()
+    };
+    let members = member_stats
+        .into_iter()
+        .map(|m| {
+            let endpoint = m
+                .peer_addr
+                .map(|a| a.to_string())
+                .unwrap_or_else(String::new);
+            let stats = convert_srt_stats(&m.stats);
+            SrtBondingMemberStats {
+                endpoint,
+                socket_status: socket_status_str(m.socket_status).to_string(),
+                member_status: member_status_str(m.member_status).to_string(),
+                weight: m.weight,
+                stats,
+            }
+        })
+        .collect();
+    SrtBondingStats {
+        mode: bonding_mode_str(mode).to_string(),
+        aggregate,
+        members,
+    }
+}
+
+/// Spawn a background task that polls per-member SRT group stats every
+/// second and publishes the snapshot via the provided lock-free watch
+/// channel. Runs until the cancellation token fires.
+pub fn spawn_srt_group_stats_poller(
+    group: Arc<SrtGroup>,
+    mode: SrtBondingMode,
+    cache: Arc<watch::Sender<Option<SrtBondingStats>>>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    let agg_raw = group.stats().await;
+                    let members = group.member_stats().await;
+                    let mut snapshot = build_bonding_stats_snapshot(&group, members, &mode);
+                    // Overwrite aggregate with the real polled stats.
+                    snapshot.aggregate = convert_srt_stats(&agg_raw);
+                    snapshot.aggregate.state =
+                        socket_status_str(group.status()).to_string();
+                    let _ = cache.send(Some(snapshot));
+                }
+            }
+        }
+    });
+}
+
+/// Listener-side bonding stats poller.
+///
+/// An `SrtSocket` returned from a listener with `group_connect(true)` may
+/// be a group socket internally; `SrtSocket::member_stats()` returns the
+/// per-member data in that case and an empty vec for single-socket
+/// sessions (harmless for unbonded peers).
+pub fn spawn_srt_socket_group_stats_poller(
+    socket: Arc<SrtSocket>,
+    mode: SrtBondingMode,
+    cache: Arc<watch::Sender<Option<SrtBondingStats>>>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    let agg_raw = socket.stats().await;
+                    let members = socket.member_stats().await;
+                    let mut aggregate = convert_srt_stats(&agg_raw);
+                    aggregate.state =
+                        socket_status_str(socket.status()).to_string();
+                    let members = members
+                        .into_iter()
+                        .map(|m| {
+                            let endpoint = m
+                                .peer_addr
+                                .map(|a| a.to_string())
+                                .unwrap_or_else(String::new);
+                            let stats = convert_srt_stats(&m.stats);
+                            SrtBondingMemberStats {
+                                endpoint,
+                                socket_status:
+                                    socket_status_str(m.socket_status).to_string(),
+                                member_status:
+                                    member_status_str(m.member_status).to_string(),
+                                weight: m.weight,
+                                stats,
+                            }
+                        })
+                        .collect();
+                    let snapshot = SrtBondingStats {
+                        mode: bonding_mode_str(&mode).to_string(),
+                        aggregate,
+                        members,
+                    };
+                    let _ = cache.send(Some(snapshot));
+                }
+            }
+        }
+    });
+}
+
+/// Bind a listener for a bonded SRT **input** — same parameters as
+/// [`bind_srt_listener_for_input`] but with `SRTO_GROUPCONNECT=true` so
+/// the listener accepts native libsrt group handshakes from bonded
+/// callers.
+pub async fn bind_srt_listener_for_bonded_input(
+    config: &SrtInputConfig,
+) -> Result<SrtListener> {
+    let p = SrtConnectionParams::from(config);
+    build_listener_builder(&p)
+        .group_connect(true)
+        .bind(parse_local_bind(&p)?)
+        .await
+        .map_err(|e| anyhow::anyhow!("bonded SRT input listener bind: {e}"))
+}
+
+/// Bind a listener for a bonded SRT **output**.
+pub async fn bind_srt_listener_for_bonded_output(
+    config: &SrtOutputConfig,
+) -> Result<SrtListener> {
+    let p = SrtConnectionParams::from(config);
+    build_listener_builder(&p)
+        .group_connect(true)
+        .bind(parse_local_bind(&p)?)
+        .await
+        .map_err(|e| anyhow::anyhow!("bonded SRT output listener bind: {e}"))
+}
+
+fn parse_local_bind(p: &SrtConnectionParams) -> Result<SocketAddr> {
+    let addr = p
+        .local_addr
+        .ok_or_else(|| anyhow::anyhow!("SRT listener requires local_addr"))?;
+    addr.parse()
+        .with_context(|| format!("parse SRT listener local_addr '{addr}'"))
 }

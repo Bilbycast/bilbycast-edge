@@ -223,6 +223,11 @@ pub struct InputStats {
     /// Populated only for bonded inputs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bond_stats: Option<BondLegStats>,
+    /// Native libsrt SRT bonding (socket-group) per-member stats.
+    /// Populated only when the SRT input has a `bonding` block and the
+    /// libsrt backend is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub srt_bonding_stats: Option<SrtBondingStats>,
     /// Number of times the active input leg switched between leg 1 and leg 2.
     pub redundancy_switches: u64,
     /// Per-input PCM transcode stage statistics. Present only when the input
@@ -317,6 +322,11 @@ pub struct OutputStats {
     /// detail. Populated only for bonded outputs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bond_stats: Option<BondLegStats>,
+    /// Native libsrt SRT bonding (socket-group) per-member stats.
+    /// Populated only when the SRT output has a `bonding` block and the
+    /// libsrt backend is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub srt_bonding_stats: Option<SrtBondingStats>,
     /// Per-output PCM transcode stage statistics. Present only when the
     /// output runs an `engine::audio_transcode::TranscodeStage` (i.e., the
     /// output config has a `transcode` block AND the upstream input is an
@@ -755,6 +765,39 @@ pub struct SrtLegStats {
 
     /// Milliseconds since the SRT socket was connected (socket uptime).
     pub uptime_ms: i64,
+}
+
+/// One member link inside a native libsrt SRT bonding group.
+///
+/// Populated by the SRT bonding stats poller from
+/// `srt_transport::SrtGroup::member_stats()`. Each entry corresponds to one
+/// SRT path (one NIC / one peer) participating in the group.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SrtBondingMemberStats {
+    /// "ip:port" of the peer this member is connected to.
+    pub endpoint: String,
+    /// Underlying SRT socket status — `"connected"`, `"broken"`, etc.
+    pub socket_status: String,
+    /// Group-level member status — `"running"` (active), `"idle"` (standby
+    /// backup), `"pending"` (negotiating), `"broken"`.
+    pub member_status: String,
+    /// Backup-mode priority; lower is preferred. 0 in broadcast mode.
+    pub weight: u16,
+    /// Full SRT stats for this member link.
+    pub stats: SrtLegStats,
+}
+
+/// Aggregate + per-member stats for a native libsrt SRT bonding
+/// (socket-group) input or output.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SrtBondingStats {
+    /// Bonding mode string — `"broadcast"` or `"backup"`.
+    pub mode: String,
+    /// Aggregate group-level stats (what libsrt reports on the group
+    /// socket itself).
+    pub aggregate: SrtLegStats,
+    /// One entry per member link.
+    pub members: Vec<SrtBondingMemberStats>,
 }
 
 /// RIST Simple Profile connection-level statistics for a single RIST

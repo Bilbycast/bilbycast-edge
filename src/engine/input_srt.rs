@@ -3,6 +3,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+/// Maximum time we wait for the SMPTE 2022-7 leg-2 socket to complete its
+/// initial handshake before giving up and running the input in single-leg
+/// mode. Prevents a misconfigured or unreachable leg-2 peer from gating
+/// ingest on the healthy leg-1.
+const INITIAL_LEG2_CONNECT_BUDGET: Duration = Duration::from_secs(15);
 
 use bytes::Bytes;
 use tokio::sync::broadcast;
@@ -13,8 +20,10 @@ use crate::config::models::{SrtInputConfig, SrtMode};
 use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::redundancy::merger::{ActiveLeg, HitlessMerger};
 use crate::srt::connection::{
-    accept_srt_connection, bind_srt_listener_for_input, bind_srt_listener_for_redundancy,
-    connect_srt_input, connect_srt_redundancy_leg, spawn_srt_stats_poller,
+    accept_srt_connection, bind_srt_listener_for_bonded_input,
+    bind_srt_listener_for_input, bind_srt_listener_for_redundancy, connect_srt_group,
+    connect_srt_input, connect_srt_redundancy_leg, spawn_srt_group_stats_poller,
+    spawn_srt_socket_group_stats_poller, spawn_srt_stats_poller, SrtConnectionParams,
 };
 use crate::stats::collector::FlowStatsAccumulator;
 use crate::util::rtp_parse::{is_likely_rtp, parse_rtp_sequence_number, parse_rtp_timestamp};
@@ -127,7 +136,9 @@ pub fn spawn_srt_input(
             config.video_encode.as_ref(),
         );
 
-        let result = if config.redundancy.is_some() {
+        let result = if config.bonding.is_some() {
+            srt_input_bonded_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder).await
+        } else if config.redundancy.is_some() {
             srt_input_redundant_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder).await
         } else {
             srt_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder).await
@@ -472,7 +483,8 @@ async fn srt_input_redundant_loop(
         .as_ref()
         .expect("redundancy config must be present");
 
-    // Bind persistent listeners for any legs in listener mode
+    // Bind persistent listeners for any legs in listener mode.
+    // Both stay bound across outer reconnect cycles.
     let mut listener_leg1 = if config.mode == SrtMode::Listener {
         Some(bind_srt_listener_for_input(&config).await?)
     } else {
@@ -531,63 +543,112 @@ async fn srt_input_redundant_loop(
             }),
         );
 
-        // --- Connect/accept leg 2 (best-effort) ---
-        let socket_leg2 = if let Some(ref mut listener) = listener_leg2 {
-            match accept_srt_connection(listener, &cancel).await {
-                Ok(s) => Some(s),
-                Err(_) if cancel.is_cancelled() => {
-                    let _ = socket_leg1.close().await;
-                    if let Some(ref l) = listener_leg1 { let _ = l.close().await; }
-                    if let Some(ref l) = listener_leg2 { let _ = l.close().await; }
-                    return Ok(());
-                }
-                Err(e) => {
-                    tracing::warn!("SRT input leg2 accept failed: {e}, running single-leg");
-                    None
-                }
-            }
-        } else {
-            match connect_srt_redundancy_leg(redundancy, &cancel).await {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    if cancel.is_cancelled() {
-                        let _ = socket_leg1.close().await;
-                        if let Some(ref l) = listener_leg1 { let _ = l.close().await; }
-                        if let Some(ref l) = listener_leg2 { let _ = l.close().await; }
-                        return Ok(());
-                    }
-                    tracing::warn!("SRT input leg2 connection failed: {e}, running single-leg");
-                    None
-                }
-            }
-        };
-        if socket_leg2.is_some() {
-            tracing::info!(
-                "SRT input leg2 connected: mode={:?} local={}",
-                redundancy.mode,
-                redundancy.local_addr.as_deref().unwrap_or("auto")
-            );
-        }
-
         let mut merger = HitlessMerger::new();
         let mut prev_active_leg = ActiveLeg::None;
         let mut leg1_alive = true;
-        let mut leg2_alive = socket_leg2.is_some();
+        let mut socket_leg2: Option<Arc<srt_transport::SrtSocket>> = None;
+        let mut leg2_alive = false;
         let mut format = SrtPayloadFormat::Unknown;
         let mut raw_ts_seq_leg1: u16 = 0;
         let mut raw_ts_seq_leg2: u16 = 0;
         let mut raw_ts_timestamp: u32 = 0;
 
-        let dummy_leg2;
-        let socket_leg2_ref = match &socket_leg2 {
-            Some(s) => s,
-            None => {
-                dummy_leg2 = socket_leg1.clone();
-                &dummy_leg2
+        // Leg-2 connect future, pinned so we can poll it inside select! and
+        // only complete once per reconnect cycle. Bounded by
+        // INITIAL_LEG2_CONNECT_BUDGET so a dead or slow leg-2 peer never
+        // gates ingest on a healthy leg-1. While this is pending the
+        // select! below is already reading from leg-1.
+        let leg2_connect_fut = {
+            let events = events.clone();
+            let flow_id = flow_id.to_string();
+            let redundancy = redundancy.clone();
+            let cancel = cancel.clone();
+            let mut listener_leg2_mut = listener_leg2.take();
+            async move {
+                let result: (Option<Arc<srt_transport::SrtSocket>>, Option<srt_transport::SrtListener>) = if let Some(ref mut listener) = listener_leg2_mut {
+                    let r = tokio::time::timeout(
+                        INITIAL_LEG2_CONNECT_BUDGET,
+                        accept_srt_connection(listener, &cancel),
+                    ).await;
+                    match r {
+                        Ok(Ok(s)) => (Some(s), listener_leg2_mut),
+                        Ok(Err(_)) if cancel.is_cancelled() => (None, listener_leg2_mut),
+                        Ok(Err(e)) => {
+                            tracing::warn!("SRT input leg2 accept failed: {e}, running single-leg");
+                            (None, listener_leg2_mut)
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "SRT input leg2 did not come up within {:?} (accept timed out), running single-leg",
+                                INITIAL_LEG2_CONNECT_BUDGET,
+                            );
+                            events.emit_flow_with_details(
+                                EventSeverity::Warning, category::SRT,
+                                format!("SRT input 2022-7 leg 2 did not connect within {:?}; running single-leg", INITIAL_LEG2_CONNECT_BUDGET),
+                                &flow_id,
+                                serde_json::json!({
+                                    "mode": format!("{:?}", redundancy.mode),
+                                    "leg": 2, "reason": "accept timed out",
+                                    "budget_ms": INITIAL_LEG2_CONNECT_BUDGET.as_millis(),
+                                }),
+                            );
+                            (None, listener_leg2_mut)
+                        }
+                    }
+                } else {
+                    match tokio::time::timeout(
+                        INITIAL_LEG2_CONNECT_BUDGET,
+                        connect_srt_redundancy_leg(&redundancy, &cancel),
+                    ).await {
+                        Ok(Ok(s)) => (Some(s), None),
+                        Ok(Err(_)) if cancel.is_cancelled() => (None, None),
+                        Ok(Err(e)) => {
+                            tracing::warn!("SRT input leg2 connection failed: {e}, running single-leg");
+                            (None, None)
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "SRT input leg2 did not come up within {:?} (caller connect retry budget exhausted), running single-leg",
+                                INITIAL_LEG2_CONNECT_BUDGET,
+                            );
+                            events.emit_flow_with_details(
+                                EventSeverity::Warning, category::SRT,
+                                format!("SRT input 2022-7 leg 2 did not connect within {:?}; running single-leg", INITIAL_LEG2_CONNECT_BUDGET),
+                                &flow_id,
+                                serde_json::json!({
+                                    "mode": format!("{:?}", redundancy.mode),
+                                    "leg": 2, "reason": "caller connect retry budget exhausted",
+                                    "budget_ms": INITIAL_LEG2_CONNECT_BUDGET.as_millis(),
+                                }),
+                            );
+                            (None, None)
+                        }
+                    }
+                };
+                if result.0.is_some() {
+                    tracing::info!(
+                        "SRT input leg2 connected: mode={:?} local={}",
+                        redundancy.mode,
+                        redundancy.local_addr.as_deref().unwrap_or("auto")
+                    );
+                }
+                result
             }
         };
+        tokio::pin!(leg2_connect_fut);
+        let mut leg2_done = false;
 
         loop {
+            // Leg-2 recv future: only polls when we have a live leg-2
+            // socket. `std::future::pending()` never resolves, so the
+            // branch stays dormant until leg-2 arrives.
+            let leg2_recv = async {
+                match &socket_leg2 {
+                    Some(s) => s.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
+
             tokio::select! {
                 _ = cancel.cancelled() => {
                     tracing::info!("SRT input (redundant) stopping (cancelled)");
@@ -598,6 +659,18 @@ async fn srt_input_redundant_loop(
                     if let Some(ref l) = listener_leg1 { let _ = l.close().await; }
                     if let Some(ref l) = listener_leg2 { let _ = l.close().await; }
                     return Ok(());
+                }
+                (sock, returned_listener) = &mut leg2_connect_fut, if !leg2_done => {
+                    leg2_done = true;
+                    // Give the listener back so next outer-loop iteration can reuse it.
+                    if returned_listener.is_some() {
+                        listener_leg2 = returned_listener;
+                    }
+                    if let Some(s) = sock {
+                        socket_leg2 = Some(s);
+                        leg2_alive = true;
+                    }
+                    continue;
                 }
                 result = socket_leg1.recv(), if leg1_alive => {
                     match result {
@@ -631,7 +704,7 @@ async fn srt_input_redundant_loop(
                         }
                     }
                 }
-                result = socket_leg2_ref.recv(), if leg2_alive => {
+                result = leg2_recv, if leg2_alive => {
                     match result {
                         Ok(data) => {
                             if format == SrtPayloadFormat::Unknown {
@@ -676,7 +749,6 @@ async fn srt_input_redundant_loop(
             _ = cancel.cancelled() => {
                 tracing::info!("SRT input (redundant) stopping during reconnect delay");
                 if let Some(ref l) = listener_leg1 { let _ = l.close().await; }
-                if let Some(ref l) = listener_leg2 { let _ = l.close().await; }
                 return Ok(());
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
@@ -775,5 +847,326 @@ fn process_redundant_packet(
         };
 
         publish_input_packet(transcoder, broadcast_tx, packet);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native libsrt SRT bonding (socket groups)
+// ---------------------------------------------------------------------------
+
+/// Entry point for an SRT input whose config has a `bonding` block.
+///
+/// Dispatches between caller-side bonding (the edge initiates a group
+/// connection to N peer endpoints) and listener-side bonding (the edge
+/// listens on one bind address with `SRTO_GROUPCONNECT=true` and accepts
+/// bonded callers).
+async fn srt_input_bonded_loop(
+    config: SrtInputConfig,
+    broadcast_tx: broadcast::Sender<RtpPacket>,
+    stats: Arc<FlowStatsAccumulator>,
+    cancel: CancellationToken,
+    events: &EventSender,
+    flow_id: &str,
+    transcoder: &mut Option<InputTranscoder>,
+) -> anyhow::Result<()> {
+    match config.mode {
+        SrtMode::Listener => {
+            srt_input_bonded_listener_loop(
+                config, broadcast_tx, stats, cancel, events, flow_id, transcoder,
+            )
+            .await
+        }
+        _ => {
+            srt_input_bonded_caller_loop(
+                config, broadcast_tx, stats, cancel, events, flow_id, transcoder,
+            )
+            .await
+        }
+    }
+}
+
+async fn srt_input_bonded_caller_loop(
+    config: SrtInputConfig,
+    broadcast_tx: broadcast::Sender<RtpPacket>,
+    stats: Arc<FlowStatsAccumulator>,
+    cancel: CancellationToken,
+    events: &EventSender,
+    flow_id: &str,
+    transcoder: &mut Option<InputTranscoder>,
+) -> anyhow::Result<()> {
+    let bond = config.bonding.as_ref().expect("bonding must be set").clone();
+    let mut format = SrtPayloadFormat::Unknown;
+    let mut last_seq: Option<u16> = None;
+    let mut raw_ts_seq_counter: u16 = 0;
+    let mut raw_ts_timestamp: u32 = 0;
+
+    loop {
+        let params = SrtConnectionParams::from(&config);
+        let group = match connect_srt_group(&params, &bond, &cancel).await {
+            Ok(g) => g,
+            Err(e) => {
+                if cancel.is_cancelled() {
+                    return Ok(());
+                }
+                tracing::error!("SRT bonded input connect failed: {e}");
+                events.emit_flow_with_details(
+                    EventSeverity::Critical,
+                    category::SRT,
+                    format!("SRT bonded input connection failed: {e}"),
+                    flow_id,
+                    serde_json::json!({
+                        "mode": "caller-bonded",
+                        "bonding_mode": format!("{:?}", bond.mode),
+                        "endpoints": bond.endpoints.iter().map(|e| &e.addr).collect::<Vec<_>>(),
+                        "error": e.to_string(),
+                    }),
+                );
+                return Err(e);
+            }
+        };
+
+        tracing::info!(
+            "SRT bonded input connected: mode=caller bonding={:?} endpoints={}",
+            bond.mode,
+            bond.endpoints.len(),
+        );
+        events.emit_flow_with_details(
+            EventSeverity::Info,
+            category::SRT,
+            "SRT bonded input connected (caller)",
+            flow_id,
+            serde_json::json!({
+                "mode": "caller-bonded",
+                "bonding_mode": format!("{:?}", bond.mode),
+                "endpoints": bond.endpoints.iter().map(|e| &e.addr).collect::<Vec<_>>(),
+            }),
+        );
+
+        let poller_cancel = cancel.child_token();
+        spawn_srt_group_stats_poller(
+            group.clone(),
+            bond.mode,
+            stats.input_srt_bonding_stats_cache.clone(),
+            poller_cancel.clone(),
+        );
+
+        let disconnected = srt_bonded_group_recv_loop(
+            &group,
+            &broadcast_tx,
+            &stats,
+            &cancel,
+            &mut format,
+            &mut last_seq,
+            &mut raw_ts_seq_counter,
+            &mut raw_ts_timestamp,
+            transcoder,
+        )
+        .await?;
+        poller_cancel.cancel();
+        let _ = group.close().await;
+
+        if !disconnected {
+            break;
+        }
+
+        events.emit_flow_with_details(
+            EventSeverity::Warning,
+            category::SRT,
+            "SRT bonded input disconnected, reconnecting",
+            flow_id,
+            serde_json::json!({ "mode": "caller-bonded" }),
+        );
+        tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+        }
+    }
+
+    Ok(())
+}
+
+async fn srt_input_bonded_listener_loop(
+    config: SrtInputConfig,
+    broadcast_tx: broadcast::Sender<RtpPacket>,
+    stats: Arc<FlowStatsAccumulator>,
+    cancel: CancellationToken,
+    events: &EventSender,
+    flow_id: &str,
+    transcoder: &mut Option<InputTranscoder>,
+) -> anyhow::Result<()> {
+    let bond = config.bonding.as_ref().expect("bonding must be set").clone();
+    let mut listener = bind_srt_listener_for_bonded_input(&config).await?;
+    let mut format = SrtPayloadFormat::Unknown;
+    let mut last_seq: Option<u16> = None;
+    let mut raw_ts_seq_counter: u16 = 0;
+    let mut raw_ts_timestamp: u32 = 0;
+
+    loop {
+        let socket = match accept_srt_connection(&mut listener, &cancel).await {
+            Ok(s) => s,
+            Err(_) if cancel.is_cancelled() => {
+                let _ = listener.close().await;
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::error!("SRT bonded input accept failed: {e}");
+                events.emit_flow_with_details(
+                    EventSeverity::Critical,
+                    category::SRT,
+                    format!("SRT bonded input accept failed: {e}"),
+                    flow_id,
+                    serde_json::json!({
+                        "mode": "listener-bonded",
+                        "local_addr": config.local_addr.as_deref().unwrap_or("auto"),
+                        "error": e.to_string(),
+                    }),
+                );
+                let _ = listener.close().await;
+                return Err(e);
+            }
+        };
+
+        tracing::info!(
+            "SRT bonded input connected: mode=listener local={}",
+            config.local_addr.as_deref().unwrap_or("auto"),
+        );
+        events.emit_flow_with_details(
+            EventSeverity::Info,
+            category::SRT,
+            "SRT bonded input connected (listener)",
+            flow_id,
+            serde_json::json!({
+                "mode": "listener-bonded",
+                "bonding_mode": format!("{:?}", bond.mode),
+                "local_addr": config.local_addr.as_deref().unwrap_or("auto"),
+            }),
+        );
+
+        let poller_cancel = cancel.child_token();
+        spawn_srt_socket_group_stats_poller(
+            socket.clone(),
+            bond.mode,
+            stats.input_srt_bonding_stats_cache.clone(),
+            poller_cancel.clone(),
+        );
+
+        let disconnected = srt_input_recv_loop(
+            &socket,
+            &broadcast_tx,
+            &stats,
+            &cancel,
+            &mut format,
+            &mut last_seq,
+            &mut raw_ts_seq_counter,
+            &mut raw_ts_timestamp,
+            transcoder,
+        )
+        .await?;
+        poller_cancel.cancel();
+        let _ = socket.close().await;
+
+        if !disconnected {
+            let _ = listener.close().await;
+            return Ok(());
+        }
+
+        events.emit_flow_with_details(
+            EventSeverity::Warning,
+            category::SRT,
+            "SRT bonded input disconnected, reconnecting",
+            flow_id,
+            serde_json::json!({ "mode": "listener-bonded" }),
+        );
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                let _ = listener.close().await;
+                return Ok(());
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+        }
+    }
+}
+
+/// Receive loop for a bonded caller-side SRT group. Mirrors
+/// [`srt_input_recv_loop`] but reads from [`srt_transport::SrtGroup`]
+/// instead of an individual socket.
+#[allow(clippy::too_many_arguments)]
+async fn srt_bonded_group_recv_loop(
+    group: &Arc<srt_transport::SrtGroup>,
+    broadcast_tx: &broadcast::Sender<RtpPacket>,
+    stats: &Arc<FlowStatsAccumulator>,
+    cancel: &CancellationToken,
+    format: &mut SrtPayloadFormat,
+    last_seq: &mut Option<u16>,
+    raw_ts_seq_counter: &mut u16,
+    raw_ts_timestamp: &mut u32,
+    transcoder: &mut Option<InputTranscoder>,
+) -> anyhow::Result<bool> {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return Ok(false),
+            result = group.recv() => {
+                match result {
+                    Ok(data) => {
+                        if *format == SrtPayloadFormat::Unknown {
+                            *format = detect_format(&data);
+                            if *format == SrtPayloadFormat::Unknown {
+                                *format = SrtPayloadFormat::RawTs;
+                            }
+                        }
+                        let (seq, ts, is_raw) = match *format {
+                            SrtPayloadFormat::RtpTs => {
+                                if !is_likely_rtp(&data) {
+                                    continue;
+                                }
+                                let seq = parse_rtp_sequence_number(&data).unwrap_or(0);
+                                let ts = parse_rtp_timestamp(&data).unwrap_or(0);
+                                (seq, ts, false)
+                            }
+                            SrtPayloadFormat::RawTs | SrtPayloadFormat::Unknown => {
+                                let seq = *raw_ts_seq_counter;
+                                *raw_ts_seq_counter = raw_ts_seq_counter.wrapping_add(1);
+                                let ts_pkts = (data.len() / TS_PACKET_SIZE) as u32;
+                                *raw_ts_timestamp =
+                                    raw_ts_timestamp.wrapping_add(ts_pkts * 188 * 8);
+                                (seq, *raw_ts_timestamp, true)
+                            }
+                        };
+
+                        if let Some(prev) = *last_seq {
+                            let expected = prev.wrapping_add(1);
+                            if seq != expected {
+                                let gap = seq.wrapping_sub(expected) as u64;
+                                if gap > 0 && gap < 1000 {
+                                    stats.input_loss.fetch_add(gap, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        *last_seq = Some(seq);
+
+                        stats.input_packets.fetch_add(1, Ordering::Relaxed);
+                        stats.input_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+
+                        if stats.bandwidth_blocked.load(Ordering::Relaxed) {
+                            stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+
+                        let packet = RtpPacket {
+                            data,
+                            sequence_number: seq,
+                            rtp_timestamp: ts,
+                            recv_time_us: now_us(),
+                            is_raw_ts: is_raw,
+                        };
+                        publish_input_packet(transcoder, broadcast_tx, packet);
+                    }
+                    Err(_) => {
+                        tracing::warn!("SRT bonded input connection lost, will reconnect");
+                        return Ok(true);
+                    }
+                }
+            }
+        }
     }
 }

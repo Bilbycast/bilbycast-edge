@@ -613,8 +613,16 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                 srt.mss, srt.ip_ttl,
                 "SRT input",
             )?;
+            if srt.redundancy.is_some() && srt.bonding.is_some() {
+                bail!(
+                    "SRT input: `redundancy` and `bonding` are mutually exclusive (bonding is libsrt-native SMPTE 2022-7 / primary-backup; redundancy is the app-layer fallback)"
+                );
+            }
             if let Some(ref red) = srt.redundancy {
                 validate_srt_redundancy(red, "SRT input")?;
+            }
+            if let Some(ref bond) = srt.bonding {
+                validate_srt_bonding(bond, &srt.mode, "SRT input")?;
             }
             if let Some(ref tm) = srt.transport_mode {
                 if !matches!(tm.as_str(), "ts" | "audio_302m") {
@@ -2345,8 +2353,17 @@ pub fn validate_output_with_input(
                 srt.mss, srt.ip_ttl,
                 "SRT output",
             )?;
+            if srt.redundancy.is_some() && srt.bonding.is_some() {
+                bail!(
+                    "SRT output '{}': `redundancy` and `bonding` are mutually exclusive (bonding is libsrt-native SMPTE 2022-7 / primary-backup; redundancy is the app-layer fallback)",
+                    srt.id
+                );
+            }
             if let Some(ref red) = srt.redundancy {
                 validate_srt_redundancy(red, "SRT output")?;
+            }
+            if let Some(ref bond) = srt.bonding {
+                validate_srt_bonding(bond, &srt.mode, &format!("SRT output '{}'", srt.id))?;
             }
             if let Some(ref tm) = srt.transport_mode {
                 if !matches!(tm.as_str(), "ts" | "audio_302m") {
@@ -3004,6 +3021,43 @@ fn validate_srt_common(
         }
     }
 
+    Ok(())
+}
+
+fn validate_srt_bonding(bond: &SrtBondingConfig, mode: &SrtMode, context: &str) -> Result<()> {
+    // Rendezvous mode has no socket-group wire handshake in libsrt.
+    if matches!(mode, SrtMode::Rendezvous) {
+        bail!("{context}: bonding is not supported in rendezvous mode");
+    }
+    let n = bond.endpoints.len();
+    if n < 2 {
+        bail!("{context}: bonding requires at least 2 endpoints, got {n}");
+    }
+    if n > 8 {
+        bail!("{context}: bonding supports at most 8 endpoints, got {n}");
+    }
+    let mut seen = HashSet::new();
+    for (i, ep) in bond.endpoints.iter().enumerate() {
+        validate_socket_addr(&ep.addr, &format!("{context} bonding endpoint[{i}] addr"))?;
+        if !seen.insert(ep.addr.clone()) {
+            bail!("{context}: bonding endpoint[{i}] addr {} is a duplicate", ep.addr);
+        }
+        if let Some(ref la) = ep.local_addr {
+            validate_socket_addr(la, &format!("{context} bonding endpoint[{i}] local_addr"))?;
+            if matches!(mode, SrtMode::Listener) {
+                bail!(
+                    "{context}: bonding endpoint[{i}] local_addr is only valid in caller mode"
+                );
+            }
+        }
+        if let Some(w) = ep.weight {
+            if matches!(bond.mode, SrtBondingMode::Broadcast) && w != 0 {
+                bail!(
+                    "{context}: bonding endpoint[{i}] weight is only meaningful in backup mode"
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3846,6 +3900,7 @@ mod tests {
             loss_max_ttl: None, km_refresh_rate: None, km_pre_announce: None,
             payload_size: None, mss: None, tlpkt_drop: None, ip_ttl: None,
             redundancy: None,
+            bonding: None,
             transport_mode: None,
             audio_encode: None,
             transcode: None,
@@ -3947,6 +4002,7 @@ mod tests {
             loss_max_ttl: None, km_refresh_rate: None, km_pre_announce: None,
             payload_size: None, mss: None, tlpkt_drop: None, ip_ttl: None,
             redundancy: None,
+            bonding: None,
             transport_mode: None,
             audio_encode: None,
             transcode: None,
@@ -5052,6 +5108,7 @@ mod tests {
                 tlpkt_drop: None,
                 ip_ttl: None,
                 redundancy: None,
+                bonding: None,
                 transport_mode: None,
                 audio_encode: None,
                 transcode: None,
