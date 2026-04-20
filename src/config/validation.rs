@@ -2922,6 +2922,19 @@ fn validate_srt_common(
         if pf.len() > 512 {
             bail!("{context}: packet_filter must be at most 512 characters, got {}", pf.len());
         }
+        // libsrt 1.5.5 does not support negotiating the `SRT_CMD_FILTER`
+        // extension in rendezvous mode — both peers INDUCTION simultaneously
+        // and neither is the leader that advertises filter settings first.
+        // The handshake gets rejected with `ERROR:FILTER` and the connection
+        // silently loops on retry. Reject the combination at config load so
+        // operators don't deploy it unknowingly. (Observed in the 2026-04-20
+        // SRT interop run scenario C8; see
+        // `testbed/test_reports/srt_full_interop_2026-04-20/`.)
+        if matches!(mode, SrtMode::Rendezvous) {
+            bail!(
+                "{context}: SRT packet_filter (FEC) is not supported in rendezvous mode — libsrt rejects the handshake. Use listener/caller pair instead."
+            );
+        }
         match srt_protocol::fec::FecConfig::parse(pf) {
             Ok(fec_cfg) => {
                 if fec_cfg.cols == 0 || fec_cfg.cols > 256 {
@@ -3910,6 +3923,46 @@ mod tests {
     }
 
     #[test]
+    fn test_srt_rendezvous_with_fec_is_rejected() {
+        // Rationale: libsrt 1.5.5 does not negotiate `SRT_CMD_FILTER` in
+        // rendezvous mode — both peers reject the handshake with ERROR:FILTER.
+        // The config validator must hard-fail so operators don't deploy it.
+        let config = make_config_input_only(InputConfig::Srt(SrtInputConfig {
+            mode: SrtMode::Rendezvous,
+            local_addr: Some("127.0.0.1:9000".to_string()),
+            remote_addr: Some("127.0.0.1:9001".to_string()),
+            latency_ms: 300,
+            peer_idle_timeout_secs: 30,
+            recv_latency_ms: None,
+            peer_latency_ms: None,
+            passphrase: None,
+            aes_key_len: None,
+            crypto_mode: None,
+            max_rexmit_bw: None,
+            stream_id: None,
+            packet_filter: Some("fec,cols:10,rows:5,layout:staircase,arq:onreq".to_string()),
+            max_bw: None, input_bw: None, overhead_bw: None,
+            enforced_encryption: None, connect_timeout_secs: None,
+            flight_flag_size: None, send_buffer_size: None, recv_buffer_size: None,
+            ip_tos: None, retransmit_algo: None, send_drop_delay: None,
+            loss_max_ttl: None, km_refresh_rate: None, km_pre_announce: None,
+            payload_size: None, mss: None, tlpkt_drop: None, ip_ttl: None,
+            redundancy: None,
+            bonding: None,
+            transport_mode: None,
+            audio_encode: None,
+            transcode: None,
+            video_encode: None,
+        }));
+        let err = validate_config(&config).expect_err("rendezvous+FEC must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_lowercase().contains("rendezvous"),
+            "error should mention rendezvous: {msg}"
+        );
+    }
+
+    #[test]
     fn test_duplicate_flow_ids() {
         let mut config = AppConfig::default();
         config.inputs.push(InputDefinition {
@@ -4644,6 +4697,14 @@ mod tests {
     /// Existing testbed configs (SRT/RTP/RTMP/etc) must continue to deserialize
     /// and validate unchanged after the ST 2110 additions. This is the
     /// regression guard called out in the Phase 1 plan, step 1.
+    ///
+    /// Some configs in `testbed/configs/` deliberately exercise
+    /// feature-gated codecs (e.g. `video-encode-rtmp-hevc-edge.json`
+    /// uses `x265`). In the default `cargo test` build — which does
+    /// **not** enable `video-encoder-x264` / `-x265` / `-nvenc` —
+    /// those fail validation with a "requires Cargo feature" error,
+    /// and that's the correct behaviour. Treat that specific error
+    /// as a skip, not a test failure.
     #[test]
     fn test_existing_testbed_configs_still_load() {
         use std::fs;
@@ -4656,14 +4717,17 @@ mod tests {
             return;
         }
         let mut checked = 0usize;
+        let mut skipped_feature_gated = 0usize;
         for entry in fs::read_dir(&testbed_dir).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            // Edge configs only — skip the relay config which has a different shape.
+            // Edge configs only — skip the relay config (different
+            // shape) and the encrypted secrets file (opaque v1: blob,
+            // not JSON).
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name == "relay.json" {
+            if name == "relay.json" || name == "secrets.json" {
                 continue;
             }
             let raw = fs::read_to_string(&path)
@@ -4671,13 +4735,32 @@ mod tests {
             // Deserialize must succeed unchanged with the new optional fields.
             let cfg: AppConfig = serde_json::from_str(&raw)
                 .unwrap_or_else(|e| panic!("deserialize {}: {e}", path.display()));
-            // Loading must validate cleanly — the new ST 2110 additions should
-            // not introduce false positives on pre-existing configs.
-            validate_config(&cfg)
-                .unwrap_or_else(|e| panic!("validate {}: {e}", path.display()));
-            checked += 1;
+            // Validation must succeed OR fail only because a referenced
+            // codec needs a Cargo feature that wasn't compiled in for
+            // this test run. Any other error is a genuine regression.
+            match validate_config(&cfg) {
+                Ok(()) => checked += 1,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("requires this edge to be built with the")
+                        && msg.contains("Cargo feature")
+                    {
+                        skipped_feature_gated += 1;
+                    } else {
+                        panic!("validate {}: {e}", path.display());
+                    }
+                }
+            }
         }
-        assert!(checked > 0, "no testbed configs were checked");
+        assert!(
+            checked + skipped_feature_gated > 0,
+            "no testbed configs were checked"
+        );
+        assert!(
+            checked > 0,
+            "every testbed config required an uncompiled codec feature — build with \
+             --features video-encoder-x264 to exercise the full matrix"
+        );
     }
 
     // ── audio_encode validation tests ─────────────────────────────────
@@ -4688,6 +4771,7 @@ mod tests {
             bitrate_kbps: None,
             sample_rate: None,
             channels: None,
+            silent_fallback: false,
         }
     }
 
@@ -4782,6 +4866,28 @@ mod tests {
     }
 
     #[test]
+    fn audio_encode_silent_fallback_round_trips() {
+        // Explicit true survives a JSON round-trip and is honoured by validation.
+        let json = r#"{"codec":"aac_lc","silent_fallback":true}"#;
+        let parsed: crate::config::models::AudioEncodeConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.silent_fallback);
+        assert!(validate_audio_encode(&parsed, &["aac_lc"], "test").is_ok());
+
+        // Absent field defaults to false via `#[serde(default)]`.
+        let json = r#"{"codec":"aac_lc"}"#;
+        let parsed: crate::config::models::AudioEncodeConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.silent_fallback);
+
+        // `skip_serializing_if` hides the default — keeps existing configs
+        // byte-identical when the operator never touched this field.
+        let emitted = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            !emitted.contains("silent_fallback"),
+            "default-false must not serialise, got: {emitted}"
+        );
+    }
+
+    #[test]
     fn validate_output_rtmp_with_audio_encode() {
         use crate::config::models::{AudioEncodeConfig, OutputConfig, RtmpOutputConfig};
         let make = |codec: &str| OutputConfig::Rtmp(RtmpOutputConfig {
@@ -4799,6 +4905,7 @@ mod tests {
                 bitrate_kbps: None,
                 sample_rate: None,
                 channels: None,
+                silent_fallback: false,
             }),
             transcode: None,
             video_encode: None,
@@ -4829,6 +4936,7 @@ mod tests {
                 bitrate_kbps: None,
                 sample_rate: None,
                 channels: None,
+                silent_fallback: false,
             }),
             transcode: None,
         });
@@ -4917,6 +5025,7 @@ mod tests {
                 bitrate_kbps: None,
                 sample_rate: None,
                 channels: None,
+                silent_fallback: false,
             }),
             transcode: None,
             video_encode: None,

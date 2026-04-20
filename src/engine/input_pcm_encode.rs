@@ -213,6 +213,7 @@ mod tests {
             bitrate_kbps: Some(128),
             sample_rate: None,
             channels: None,
+            silent_fallback: false,
         };
         match PcmInputProcessor::new(48_000, 24, 2, None, Some(&ae), 0, 0, 0) {
             Err(PcmInputError::AudioEncodeNotYetImplemented { codec }) => {

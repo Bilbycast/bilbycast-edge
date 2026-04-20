@@ -901,6 +901,12 @@ pub struct ThumbnailAccumulator {
     freeze_count: AtomicU64,
     /// Current thumbnail alarm: `"black"`, `"frozen"`, or `None`.
     alarm: Mutex<Option<String>>,
+    /// External trigger for out-of-cycle captures. The per-input thumbnail
+    /// loop awaits this in addition to its 5s interval so events like "this
+    /// input just became active via a switch" can force an immediate
+    /// capture rather than waiting up to a full interval. The loop enforces
+    /// its own cooldown so floods are harmless.
+    pub refresh_trigger: Arc<tokio::sync::Notify>,
 }
 
 impl ThumbnailAccumulator {
@@ -913,7 +919,16 @@ impl ThumbnailAccumulator {
             prev_jpeg_hash: Mutex::new(None),
             freeze_count: AtomicU64::new(0),
             alarm: Mutex::new(None),
+            refresh_trigger: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Ask the thumbnail loop to capture a fresh frame at its next opportunity,
+    /// out-of-cycle from the 5s interval. Safe to call from any task; the loop
+    /// enforces a short cooldown so repeated calls do not overwhelm the
+    /// decoder.
+    pub fn request_refresh(&self) {
+        self.refresh_trigger.notify_one();
     }
 
     /// Store a newly captured thumbnail.
@@ -963,6 +978,32 @@ impl ThumbnailAccumulator {
     }
 }
 
+/// Per-input atomic counters for a single input leg within a flow.
+///
+/// Each input owns its own byte/packet counters plus a private
+/// [`ThroughputEstimator`], so a multi-input flow can report whether each
+/// configured source is currently receiving a feed independently of which
+/// one is switched live. Incremented from the shared per-input forwarder
+/// in `engine::flow::spawn_input_forwarder` on every packet that arrives
+/// on the input's dedicated broadcast channel — active or passive.
+pub struct PerInputCounters {
+    pub input_type: String,
+    pub bytes: AtomicU64,
+    pub packets: AtomicU64,
+    pub throughput: ThroughputEstimator,
+}
+
+impl PerInputCounters {
+    pub fn new(input_type: String) -> Self {
+        Self {
+            input_type,
+            bytes: AtomicU64::new(0),
+            packets: AtomicU64::new(0),
+            throughput: ThroughputEstimator::new(),
+        }
+    }
+}
+
 // ── Per-flow Accumulator ───────────────────────────────────────────────────
 
 /// Per-flow atomic counters for a single media flow (one input, N outputs).
@@ -1000,6 +1041,14 @@ pub struct FlowStatsAccumulator {
     /// a multi-input flow gets its own thumbnail generator subscribing to
     /// the input's dedicated broadcast channel (not the flow's main channel).
     pub per_input_thumbnails: DashMap<String, Arc<ThumbnailAccumulator>>,
+    /// Per-input byte/packet/throughput counters. One entry per input in the
+    /// flow, keyed by input ID. Populated at flow start by
+    /// `register_input_counters` and incremented by the shared per-input
+    /// forwarder — so every input's liveness (bitrate, packets_received) is
+    /// tracked regardless of whether the input is currently switched active.
+    /// The snapshot path reads this into `FlowStats.inputs_live` so the
+    /// manager UI can render a NO SIGNAL / feed-present state per input.
+    pub per_input_counters: DashMap<String, Arc<PerInputCounters>>,
     /// Input config metadata for the currently active input (topology /
     /// header display). Rewritten by `update_active_input_meta` on every
     /// `FlowRuntime::switch_active_input` call so the snapshot reflects the
@@ -1118,6 +1167,7 @@ impl FlowStatsAccumulator {
             media_analysis: OnceLock::new(),
             thumbnail: OnceLock::new(),
             per_input_thumbnails: DashMap::new(),
+            per_input_counters: DashMap::new(),
             input_config_meta: std::sync::RwLock::new(None),
             output_config_meta: DashMap::new(),
             input_srt_stats_cache: Arc::new(watch::channel(None).0),
@@ -1280,6 +1330,16 @@ impl FlowStatsAccumulator {
         }
     }
 
+    /// Register per-input counters for a specific input and return a shared
+    /// reference. Called once per input at flow start so the per-input
+    /// forwarder can increment bytes/packets for every packet flowing on that
+    /// input's dedicated broadcast channel, regardless of active/passive.
+    pub fn register_input_counters(&self, input_id: &str, input_type: &str) -> Arc<PerInputCounters> {
+        let c = Arc::new(PerInputCounters::new(input_type.to_string()));
+        self.per_input_counters.insert(input_id.to_string(), c.clone());
+        c
+    }
+
     /// Register a new output for this flow and return a shared reference to its
     /// [`OutputStatsAccumulator`]. The accumulator is inserted into the internal
     /// `DashMap` keyed by `output_id`.
@@ -1423,6 +1483,32 @@ impl FlowStatsAccumulator {
             .read()
             .ok()
             .and_then(|g| if g.is_empty() { None } else { Some(g.clone()) });
+
+        // Per-input liveness snapshot. One entry per registered input — lets
+        // the manager UI surface NO SIGNAL / feed-present independently of the
+        // currently switched input. Left as `None` when a flow has no inputs
+        // registered so the JSON shape stays stable for old builds.
+        let inputs_live: Vec<PerInputLive> = self
+            .per_input_counters
+            .iter()
+            .map(|entry| {
+                let input_id = entry.key().clone();
+                let c = entry.value();
+                let bytes = c.bytes.load(Ordering::Relaxed);
+                let packets = c.packets.load(Ordering::Relaxed);
+                let bitrate = c.throughput.sample(bytes);
+                PerInputLive {
+                    input_id,
+                    input_type: c.input_type.clone(),
+                    state: derive_input_state(bitrate, packets),
+                    packets_received: packets,
+                    bytes_received: bytes,
+                    bitrate_bps: bitrate,
+                }
+            })
+            .collect();
+        let inputs_live = if inputs_live.is_empty() { None } else { Some(inputs_live) };
+
         FlowStats {
             flow_id: self.flow_id.clone(),
             flow_name: self.flow_name.clone(),
@@ -1562,6 +1648,7 @@ impl FlowStatsAccumulator {
                 .get()
                 .map(|s| red_blue_to_stats(&s.snapshot())),
             essence_flows: None,
+            inputs_live,
         }
     }
 }

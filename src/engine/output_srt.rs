@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
+use srt_protocol::error::SrtError;
 use srt_transport::SrtSocket;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -65,19 +66,36 @@ fn srt_chunk_for_live(data: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// Send `data` over an SRT live-mode socket, splitting into ≤[`SRT_LIVE_MAX_MSG_BYTES`]
 /// chunks if needed. Returns the total number of bytes accepted by the socket
 /// or the first send error encountered.
-async fn srt_send_chunked(socket: &Arc<SrtSocket>, data: &[u8]) -> anyhow::Result<usize> {
+///
+/// Returns the raw [`SrtError`] so callers can distinguish transient
+/// backpressure ([`SrtError::AsyncSend`], now rare given the libsrt wrapper's
+/// awaiting send) from fatal connection errors that warrant a reconnect.
+async fn srt_send_chunked(socket: &Arc<SrtSocket>, data: &[u8]) -> Result<usize, SrtError> {
     if data.is_empty() {
         return Ok(0);
     }
     let mut total = 0usize;
     for chunk in srt_chunk_for_live(data) {
-        let n = socket
-            .send(chunk)
-            .await
-            .map_err(|e| anyhow::anyhow!("SRT send: {e}"))?;
+        let n = socket.send(chunk).await?;
         total += n;
     }
     Ok(total)
+}
+
+/// `true` when `err` represents a transient Rust-side backpressure condition
+/// on the Tokio → `srt-io` send channel rather than a genuine connection
+/// failure. Callers should **not** tear the connection down on these — drop
+/// the current packet, bump `packets_dropped`, and keep serving.
+///
+/// Historically `SrtSocket::send` used `try_send` onto a 256-slot mpsc and
+/// surfaced this error under bursty input (especially SRT + FEC on the send
+/// side). The 2026-04-20 interop run traced the "SRT flapping" failure mode
+/// to the forward loop treating this as fatal; the helper is retained as
+/// belt-and-suspenders even after the libsrt wrapper was switched to an
+/// awaiting send. See `testbed/test_reports/srt_full_interop_2026-04-20/`.
+#[inline]
+fn is_transient_backpressure(err: &SrtError) -> bool {
+    matches!(err, SrtError::AsyncSend)
 }
 
 /// Send sink for an SRT output — either a single socket (plain or accepted
@@ -94,7 +112,7 @@ enum SrtSendSink {
 }
 
 impl SrtSendSink {
-    async fn send_chunked(&self, data: &[u8]) -> anyhow::Result<usize> {
+    async fn send_chunked(&self, data: &[u8]) -> Result<usize, SrtError> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -103,10 +121,7 @@ impl SrtSendSink {
             SrtSendSink::Group(g) => {
                 let mut total = 0usize;
                 for chunk in srt_chunk_for_live(data) {
-                    let n = g
-                        .send(chunk)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("SRT group send: {e}"))?;
+                    let n = g.send(chunk).await?;
                     total += n;
                 }
                 Ok(total)
@@ -518,7 +533,7 @@ fn build_video_replacer(
     events: &EventSender,
 ) -> Option<TsVideoReplacer> {
     let enc = config.video_encode.as_ref()?;
-    match TsVideoReplacer::new(enc) {
+    match TsVideoReplacer::new(enc, None) {
         Ok(r) => {
             let backend = match enc.codec.as_str() {
                 "x264" | "x265" => enc.codec.clone(),
@@ -608,6 +623,11 @@ async fn srt_output_forward_loop(
                     send_stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                     send_stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
                     send_stats.record_latency(recv_time_us);
+                }
+                Err(e) if is_transient_backpressure(&e) => {
+                    // Rust-side send-channel was briefly full. Drop this
+                    // packet and continue — the connection is still healthy.
+                    send_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
                     tracing::warn!("SRT output '{}' send error: {e}", output_id);
@@ -1041,6 +1061,9 @@ async fn srt_output_redundant_loop(
                         send_stats1.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
                         send_stats1.record_latency(recv_time_us);
                     }
+                    Err(e) if is_transient_backpressure(&e) => {
+                        send_stats1.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
                     Err(e) => {
                         tracing::warn!("SRT output '{}' leg1 send error: {e}", output_id1);
                         break;
@@ -1193,6 +1216,13 @@ async fn srt_output_redundant_loop(
                             while let Some((data, _recv_time_us)) = rx2.recv().await {
                                 match srt_send_chunked(&send_socket2, &data).await {
                                     Ok(_) => { /* leg 1 already counted — avoid double-count */ }
+                                    Err(e) if is_transient_backpressure(&e) => {
+                                        // Transient Rust-side channel pressure
+                                        // on leg 2 only. Drop this packet and
+                                        // continue — leg 1 carries the dupe
+                                        // under 2022-7 so the receiver merge
+                                        // is unaffected.
+                                    }
                                     Err(e) => {
                                         tracing::warn!("SRT output '{}' leg2 send error: {e}", output_id2);
                                         break;

@@ -48,6 +48,7 @@ pub fn spawn_whip_input(
     cancel: CancellationToken,
     session_rx: tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>,
     event_sender: EventSender,
+    force_idr: Arc<std::sync::atomic::AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         tracing::info!("WHIP input started for flow '{}', waiting for publisher", flow_id);
@@ -55,6 +56,7 @@ pub fn spawn_whip_input(
             config.audio_encode.as_ref(),
             config.transcode.as_ref(),
             config.video_encode.as_ref(),
+            Some(force_idr.clone()),
         ) {
             Ok(t) => {
                 if let Some(ref t) = t {
@@ -230,6 +232,7 @@ pub fn spawn_whep_input(
     event_sender: EventSender,
     flow_id: String,
     input_id: String,
+    force_idr: Arc<std::sync::atomic::AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         tracing::info!("WHEP input started, connecting to {}", config.whep_url);
@@ -237,6 +240,7 @@ pub fn spawn_whep_input(
             config.audio_encode.as_ref(),
             config.transcode.as_ref(),
             config.video_encode.as_ref(),
+            Some(force_idr.clone()),
         ) {
             Ok(t) => {
                 if let Some(ref t) = t {

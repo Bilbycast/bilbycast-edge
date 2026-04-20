@@ -255,7 +255,13 @@ fn encode_worker(
     encode_stats: Arc<crate::engine::ts_video_replace::VideoEncodeStats>,
     cancel: CancellationToken,
 ) {
-    use video_engine::VideoEncoder;
+    // Build an encoder config once up-front — used for chroma/bit-depth
+    // decisions below and to spot backend-not-compiled-in errors
+    // synchronously. The shared `ScaledVideoEncoder` pipeline built
+    // right after it owns the real, lazy-opened encoder and — when the
+    // operator's `video_encode.width` / `.height` differ from the raw
+    // RFC 4175 frame dims — transparently wires a `VideoScaler` between
+    // plane scratch buffers and the encoder.
     let cfg = match build_encoder_config(&enc, width, height, fps_num, fps_den) {
         Ok(c) => c,
         Err(e) => {
@@ -263,13 +269,14 @@ fn encode_worker(
             return;
         }
     };
-    let mut encoder = match VideoEncoder::open(&cfg) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::error!(error = %e, "ST 2110-20 input: encoder open failed");
-            return;
-        }
-    };
+    let mut pipeline = crate::engine::video_encode_util::ScaledVideoEncoder::new(
+        enc.clone(),
+        cfg.codec,
+        fps_num,
+        fps_den,
+        false,
+        "ST 2110-20 input".to_string(),
+    );
     let mut ts_mux = TsMuxer::new();
     let mut pts: i64 = 0;
 
@@ -280,6 +287,13 @@ fn encode_worker(
     // 4:2:2 10-bit planes.
     let target_chroma = cfg.chroma;
     let target_10bit = cfg.bit_depth == 10;
+    let target_bit_depth: u8 = if target_10bit { 10 } else { 8 };
+
+    // AVPixelFormat describing the packed scratch planes we hand to the
+    // pipeline. The chroma-subsample / bit-depth conversion below
+    // normalises every source combination into one of these four
+    // layouts. `None` (e.g. 4:4:4) falls back to no-scale encode below.
+    let src_pix_fmt = video_engine::av_pix_fmt_for_yuv(target_chroma, target_bit_depth);
 
     // Scratch buffers for chroma-subsample / bit-depth conversion.
     // Long-lived — resized in-place each frame via `resize()` (only
@@ -430,14 +444,40 @@ fn encode_worker(
 
         let _ = enc_c_rows; // documented — the encoder computes rows itself from pix_fmt
         encode_stats.input_frames.fetch_add(1, Ordering::Relaxed);
-        let enc_out = encoder.encode_frame(
-            y_bytes, enc_y_stride, u_bytes, enc_c_stride, v_bytes, enc_c_stride,
+
+        // Route packed planes through the shared pipeline. When
+        // `src_pix_fmt` is `None` (e.g. 4:4:4 target) the pipeline
+        // can't plumb a scaler for this pixel format, so we force
+        // matching src=dst and skip scaling entirely — giving the
+        // pre-Phase-4 behaviour of passing planes verbatim.
+        let (src_w_hint, src_h_hint, src_fmt_hint) = match src_pix_fmt {
+            Some(fmt) => (frame.width, frame.height, fmt),
+            None => (
+                enc.width.unwrap_or(frame.width),
+                enc.height.unwrap_or(frame.height),
+                0i32,
+            ),
+        };
+        let enc_out = pipeline.encode_raw_planes(
+            src_w_hint,
+            src_h_hint,
+            src_fmt_hint,
+            y_bytes,
+            enc_y_stride,
+            u_bytes,
+            enc_c_stride,
+            v_bytes,
+            enc_c_stride,
             Some(pts),
         );
         pts += 1;
         let frames = match enc_out {
             Ok(f) => f,
             Err(e) => {
+                if !pipeline.is_open() {
+                    tracing::error!(error = %e, "ST 2110-20 input: encoder open failed");
+                    return;
+                }
                 tracing::warn!(error = %e, "ST 2110-20 input: encoder error");
                 encode_stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
                 continue;

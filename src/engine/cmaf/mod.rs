@@ -292,9 +292,40 @@ async fn run(
         match AudioReencoder::new(enc_cfg, &cancel, &config.id, flow_id) {
             Ok(reenc) => {
                 tracing::info!(
-                    "CMAF output '{}': audio re-encode active codec={}",
-                    config.id, enc_cfg.codec
+                    "CMAF output '{}': audio re-encode active codec={} silent_fallback={}",
+                    config.id, enc_cfg.codec, reenc.has_silent_fallback(),
                 );
+                // Silent-fallback path: build the AudioSegmenter eagerly
+                // using the declared target params so silent AAC frames
+                // can flow into the current segment before any source
+                // audio arrives. The ASC is synthesised from the
+                // declared sample_rate / channels (AOT=2, AAC-LC).
+                if reenc.has_silent_fallback() {
+                    if let Some((profile, sr_idx, ch_cfg)) = reenc.silent_fallback_track() {
+                        let asc = aac_audio_specific_config(profile, sr_idx, ch_cfg);
+                        let sample_rate = codecs::sample_rate_from_index(sr_idx);
+                        let track = AudioTrack {
+                            audio_specific_config: asc,
+                            sample_rate,
+                            channels: ch_cfg as u16,
+                            avg_bitrate: enc_cfg
+                                .bitrate_kbps
+                                .map(|k| k * 1000)
+                                .unwrap_or(128_000),
+                        };
+                        state.audio_seg = Some(AudioSegmenter::new(track, config.segment_duration_secs));
+                        state.audio_ready = true;
+                        tracing::info!(
+                            "CMAF output '{}': audio track pre-built for silent_fallback (sr={} ch={})",
+                            config.id, sample_rate, ch_cfg,
+                        );
+                    } else {
+                        tracing::warn!(
+                            "CMAF output '{}': silent_fallback target sample_rate has no ADTS index — silent-track init deferred",
+                            config.id,
+                        );
+                    }
+                }
                 state.audio_reencoder = Some(reenc);
             }
             Err(e) => {
@@ -359,11 +390,50 @@ async fn run(
         }
     }
 
+    // Silence tick: only armed when the AudioReencoder was built with
+    // `silent_fallback = true`.
+    let mut silence_interval: Option<tokio::time::Interval> = state
+        .audio_reencoder
+        .as_ref()
+        .and_then(|r| r.silence_chunk_duration())
+        .map(|d| {
+            let mut iv = tokio::time::interval(d);
+            iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            iv
+        });
+
     loop {
+        let silence_tick = async {
+            match silence_interval.as_mut() {
+                Some(iv) => { iv.tick().await; }
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("CMAF output '{}' stopping (cancelled)", config.id);
                 break;
+            }
+            _ = silence_tick => {
+                if let Some(reenc) = state.audio_reencoder.as_mut() {
+                    match tokio::task::block_in_place(|| reenc.encode_silence_if_needed()) {
+                        Ok(frames) if !frames.is_empty() => {
+                            if let Some(seg) = state.audio_seg.as_mut() {
+                                for (data, pts) in frames {
+                                    seg.push(&data, pts);
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::debug!(
+                                "CMAF output '{}': silent-fallback encode error: {e}",
+                                config.id
+                            );
+                        }
+                    }
+                }
+                continue;
             }
             result = rx.recv() => {
                 match result {
@@ -811,6 +881,8 @@ fn handle_audio_frame(
     // Phase 3: audio_encode hook — pump the source AAC frame through
     // the AudioReencoder and substitute the re-encoded frame(s).
     let frames_to_buffer: Vec<Vec<u8>> = if let Some(reenc) = state.audio_reencoder.as_mut() {
+        // Reset the silent-fallback drop watchdog — real audio is flowing.
+        reenc.mark_real_audio(pts);
         // Propagate the ADTS triplet from the demuxer so lazy decoder
         // construction inside AudioReencoder can succeed.
         if let Some((profile, sr_idx, ch_cfg)) = demuxer.cached_aac_config() {

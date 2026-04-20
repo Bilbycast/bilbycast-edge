@@ -36,12 +36,14 @@ pub fn spawn_udp_input(
     event_sender: EventSender,
     flow_id: String,
     input_id: String,
+    force_idr: Arc<std::sync::atomic::AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut transcoder = match InputTranscoder::new(
             config.audio_encode.as_ref(),
             config.transcode.as_ref(),
             config.video_encode.as_ref(),
+            Some(force_idr.clone()),
         ) {
             Ok(t) => {
                 if let Some(ref t) = t {

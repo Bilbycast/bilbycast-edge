@@ -55,6 +55,10 @@ use super::ts_program_filter::TsProgramFilter;
 /// How often to generate a thumbnail (seconds).
 const THUMBNAIL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Minimum gap between out-of-cycle captures driven by the external refresh
+/// trigger. Prevents a flood of switch events from stacking decode work.
+const TRIGGER_MIN_GAP: Duration = Duration::from_millis(500);
+
 /// Maximum TS data to buffer (~3 seconds at 10 Mbps ≈ 3.75 MB).
 const MAX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
@@ -141,6 +145,12 @@ async fn thumbnail_loop(
     let mut interval = tokio::time::interval(THUMBNAIL_INTERVAL);
     interval.tick().await; // consume first immediate tick
 
+    // External refresh trigger — switch_active_input calls notify_one() on
+    // the newly-active input's accumulator so its thumbnail refreshes within
+    // `TRIGGER_MIN_GAP` instead of waiting up to the full 5s interval.
+    let refresh_trigger = stats.refresh_trigger.clone();
+    let mut last_capture: Option<std::time::Instant> = None;
+
     // Ring buffer of recent TS packet data
     let mut ts_buffer: VecDeque<Bytes> = VecDeque::new();
     let mut buffer_bytes: usize = 0;
@@ -152,6 +162,52 @@ async fn thumbnail_loop(
             _ = cancel.cancelled() => {
                 tracing::info!("Thumbnail generator stopping (cancelled)");
                 break;
+            }
+
+            _ = refresh_trigger.notified() => {
+                // External trigger — capture now if we've got buffered data
+                // and the cooldown has elapsed. Skip silently otherwise; the
+                // next 5s interval tick will still fire.
+                let cooldown_ok = last_capture
+                    .map(|t| t.elapsed() >= TRIGGER_MIN_GAP)
+                    .unwrap_or(true);
+                if !cooldown_ok || buffer_bytes == 0 {
+                    continue;
+                }
+                let raw_ts = collect_buffer(&ts_buffer);
+                let ts_data: Bytes = if let Some(ref mut filter) = program_filter {
+                    filter_scratch.clear();
+                    filter.filter_into(&raw_ts, &mut filter_scratch);
+                    if filter_scratch.is_empty() {
+                        continue;
+                    }
+                    Bytes::copy_from_slice(&filter_scratch)
+                } else {
+                    raw_ts
+                };
+                match generate_thumbnail_dispatch(&ts_data).await {
+                    Ok(thumbnail_result) => {
+                        stats.store(thumbnail_result.jpeg.clone());
+                        let jpeg_hash = hash_jpeg(&thumbnail_result.jpeg);
+                        let is_frozen = stats.check_freeze(jpeg_hash);
+                        let is_black = thumbnail_result.luminance < BLACK_LUMINANCE_THRESHOLD;
+                        if is_black {
+                            stats.set_alarm(Some("black".to_string()));
+                        } else if is_frozen {
+                            stats.set_alarm(Some("frozen".to_string()));
+                        } else {
+                            stats.set_alarm(None);
+                        }
+                        last_capture = Some(std::time::Instant::now());
+                        // Re-align the periodic interval so the next scheduled
+                        // tick is 5s from now, not from whenever it last fired.
+                        interval.reset();
+                    }
+                    Err(e) => {
+                        tracing::debug!("Thumbnail trigger capture failed: {e}");
+                        stats.record_error();
+                    }
+                }
             }
 
             _ = interval.tick() => {
@@ -194,6 +250,7 @@ async fn thumbnail_loop(
                             } else {
                                 stats.set_alarm(None);
                             }
+                            last_capture = Some(std::time::Instant::now());
                         }
                         Err(e) => {
                             tracing::debug!("Thumbnail capture failed: {e}");

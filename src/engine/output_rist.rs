@@ -247,7 +247,7 @@ async fn rist_output_loop(
     let mut replace_scratch: Vec<u8> = Vec::new();
 
     let mut video_replacer = match config.video_encode.as_ref() {
-        Some(enc) => match TsVideoReplacer::new(enc) {
+        Some(enc) => match TsVideoReplacer::new(enc, None) {
             Ok(r) => {
                 let backend = match enc.codec.as_str() {
                     "x264" | "x265" => enc.codec.clone(),

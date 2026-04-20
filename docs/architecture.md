@@ -200,8 +200,22 @@ broadcast IRDs) do not lose lock during a switch:
    need to share the same codec, resolution, frame rate, sample rate, channel
    count, or stream structure. For non-TS transports (e.g., raw ST 2110 RTP),
    the fixer is transparent — the switch mechanism (watch channel) works
-   identically. Receivers may show a brief glitch (up to one GOP for
-   compressed video) while the decoder resyncs.
+   identically.
+
+5. **Force IDR on the newly-active ingress re-encoder** — When the incoming
+   input has an `video_encode` stage (ingress transcoding), the forwarder
+   asks its encoder to emit an IDR on the first post-switch frame via a
+   one-shot `AVFrame.pict_type = AV_PICTURE_TYPE_I` hint honoured by
+   libx264 / libx265 / NVENC. Without this, downstream decoders would have
+   to wait up to a full GOP (default 2 s at 30 fps) for the next natural
+   keyframe before they could display anything. Passthrough inputs (no
+   `video_encode`) have no encoder to signal and are unaffected — their
+   IDR cadence is whatever the upstream source chose.
+
+With mechanisms 1–5 combined, the visible switch latency at the receiver is
+one to two frames regardless of whether the target input is passthrough or
+ingress-transcoded. The pre-fix behaviour (switching *to* an ingress-
+transcoded input used to stall for up to one full GOP) is gone.
 
 **Zero-cost when not switching:** Before the first switch occurs, the fixer
 passes packets through unchanged — a single `bool` check per packet, no

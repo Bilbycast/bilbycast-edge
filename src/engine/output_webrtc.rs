@@ -21,6 +21,8 @@ use crate::stats::collector::OutputStatsAccumulator;
 use super::audio_decode::{AacDecoder, DecodeStats, sample_rate_from_index};
 #[cfg(feature = "webrtc")]
 use super::audio_encode::{AudioCodec, AudioEncoder, AudioEncoderError, EncoderParams};
+#[cfg(feature = "webrtc")]
+use super::audio_silence::SilenceGenerator;
 #[cfg(all(feature = "webrtc", feature = "video-thumbnail"))]
 use super::ts_video_replace::VideoEncodeStats;
 #[cfg(feature = "webrtc")]
@@ -40,8 +42,15 @@ enum WebrtcEncoderState {
     Lazy,
     /// Decoder + encoder running; each AAC frame goes through decode → encode
     /// → write_media to the WebRTC audio MID.
+    ///
+    /// When `silent_fallback` is set, the encoder is built eagerly at
+    /// session startup (before any source audio arrives) and the decoder
+    /// / transcoder are filled lazily on the first real AAC frame —
+    /// hence both are `Option`.
     Active {
-        decoder: AacDecoder,
+        /// `None` until the first real AAC frame arrives (silent-fallback
+        /// builds the encoder ahead of any source audio).
+        decoder: Option<AacDecoder>,
         encoder: AudioEncoder,
         decode_stats: Arc<DecodeStats>,
         /// Optional planar PCM shuffle / sample-rate stage between the
@@ -49,6 +58,12 @@ enum WebrtcEncoderState {
         /// was set. When `transcode.channels` is set it wins over the Opus
         /// encoder's channel count (the encoder reconfigures to match).
         transcoder: Option<super::audio_transcode::PlanarAudioTranscoder>,
+        /// Retained so the transcoder can be planned on the first real
+        /// AAC frame when silent-fallback built the encoder eagerly.
+        pending_transcode_cfg: Option<super::audio_transcode::TranscodeJson>,
+        /// Silent-PCM generator + audio-drop watchdog. `Some` iff
+        /// `audio_encode.silent_fallback = true`.
+        silence: Option<SilenceGenerator>,
     },
     /// Decoder or encoder construction failed once. Drop audio for the
     /// rest of the session's lifetime.
@@ -82,20 +97,12 @@ enum WebrtcVideoEncoderState {
 #[cfg(all(feature = "webrtc", feature = "video-thumbnail"))]
 struct WebrtcVideoActive {
     decoder: video_engine::VideoDecoder,
-    /// Opened on the first decoded frame so we can pick up the source
-    /// resolution when the operator didn't specify one.
-    encoder: Option<video_engine::VideoEncoder>,
-    backend: video_codec::VideoEncoderCodec,
-    requested_width: Option<u32>,
-    requested_height: Option<u32>,
-    fps_num: Option<u32>,
-    fps_den: Option<u32>,
-    /// Full `video_encode` block — handed to
-    /// `video_encode_util::build_encoder_config` at lazy open-time,
-    /// covering bitrate / gop / preset / profile plus advanced knobs
-    /// (chroma / bit_depth / RC / CRF / bframes / refs / level / tune
-    /// / colour metadata).
-    encode_cfg: VideoEncodeConfig,
+    /// Shared encoder pipeline — wraps `VideoEncoder` + optional
+    /// `VideoScaler`. WebRTC uses `global_header = false` because every
+    /// IDR already carries in-band SPS/PPS that the RFC 6184 packetizer
+    /// forwards verbatim; no out-of-band codec config channel is
+    /// needed. Lazy-opens on the first decoded frame.
+    pipeline: crate::engine::video_encode_util::ScaledVideoEncoder,
     /// Monotonic PTS counter in encoder time base. We pass the source
     /// 90 kHz PTS to `write_media` for correct lip-sync, but the encoder
     /// itself gets a monotonic `out_frame_count` so libx264 / NVENC rate
@@ -221,15 +228,21 @@ fn open_webrtc_video_active(
         format!("Video encoder started: output '{}'", output_id),
         flow_id,
     );
+    let (fps_num, fps_den) = match (cfg.fps_num, cfg.fps_den) {
+        (Some(n), Some(d)) => (n, d),
+        _ => (30, 1),
+    };
+    let pipeline = crate::engine::video_encode_util::ScaledVideoEncoder::new(
+        cfg.clone(),
+        backend,
+        fps_num,
+        fps_den,
+        false,
+        format!("WebRTC output '{}'", output_id),
+    );
     WebrtcVideoEncoderState::Active(Box::new(WebrtcVideoActive {
         decoder,
-        encoder: None,
-        backend,
-        requested_width: cfg.width,
-        requested_height: cfg.height,
-        fps_num: cfg.fps_num,
-        fps_den: cfg.fps_den,
-        encode_cfg: cfg.clone(),
+        pipeline,
         out_frame_count: 0,
         stats: stats_handle,
     }))
@@ -274,51 +287,12 @@ fn encode_one_video_frame_webrtc(
                 Ok(f) => f,
                 Err(_) => break,
             };
-            if active.encoder.is_none() {
-                let src_w = frame.width();
-                let src_h = frame.height();
-                if let (Some(rw), Some(rh)) = (active.requested_width, active.requested_height) {
-                    if rw != src_w || rh != src_h {
-                        tracing::warn!(
-                            "WebRTC output '{}': video_encode resolution change {}x{} -> {}x{} requested \
-                             but scaling is not implemented yet; using source resolution",
-                            output_id, src_w, src_h, rw, rh
-                        );
-                    }
-                }
-                let (fps_num, fps_den) = match (active.fps_num, active.fps_den) {
-                    (Some(n), Some(d)) => (n, d),
-                    _ => (30, 1),
-                };
-                // WebRTC has no out-of-band codec-config channel; emit
-                // SPS/PPS in-band on every IDR so late-joining browsers
-                // can decode as soon as they see a keyframe.
-                let enc_cfg = crate::engine::video_encode_util::build_encoder_config(
-                    &active.encode_cfg,
-                    active.backend,
-                    src_w,
-                    src_h,
-                    fps_num,
-                    fps_den,
-                    false,
-                );
-                let enc = match video_engine::VideoEncoder::open(&enc_cfg) {
-                    Ok(e) => e,
-                    Err(e) => return Err(format!("encoder open failed: {e}")),
-                };
-                active.encoder = Some(enc);
-            }
-            let (y, y_s, u, u_s, v, v_s) = match frame.yuv_planes() {
-                Some(p) => p,
-                None => continue,
-            };
-            let enc = active.encoder.as_mut().unwrap();
-            let encoded_frames = match enc.encode_frame(
-                y, y_s, u, u_s, v, v_s,
-                Some(active.out_frame_count),
-            ) {
+            let encoded_frames = match active.pipeline.encode(&frame, Some(active.out_frame_count)) {
                 Ok(frames) => frames,
                 Err(e) => {
+                    if !active.pipeline.is_open() {
+                        return Err(format!("encoder open failed: {e}"));
+                    }
                     tracing::debug!("WebRTC output '{}': encode error: {e}", output_id);
                     active.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
                     continue;
@@ -756,11 +730,28 @@ async fn whep_viewer_loop(
 
     // Build encoder state lazily on first AAC frame. The Lazy state only
     // makes sense when audio_encode is set AND audio MID was negotiated.
-    let mut encoder_state: WebrtcEncoderState =
-        if audio_encode.is_some() && audio_mid.is_some() && audio_pt.is_some() {
-            WebrtcEncoderState::Lazy
+    let mut encoder_state: WebrtcEncoderState = match audio_encode.as_ref() {
+        Some(cfg) if cfg.silent_fallback && audio_mid.is_some() && audio_pt.is_some() => {
+            build_webrtc_encoder_state_eager_for_silent_fallback(
+                audio_encode.as_ref(),
+                transcode.as_ref(),
+                &cancel,
+                &stats,
+                flow_id,
+                output_id,
+                events,
+            )
+        }
+        Some(_) if audio_mid.is_some() && audio_pt.is_some() => WebrtcEncoderState::Lazy,
+        _ => WebrtcEncoderState::Disabled,
+    };
+    let mut silence_interval: Option<tokio::time::Interval> =
+        if let WebrtcEncoderState::Active { silence: Some(sg), .. } = &encoder_state {
+            let mut iv = tokio::time::interval(sg.chunk_duration());
+            iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            Some(iv)
         } else {
-            WebrtcEncoderState::Disabled
+            None
         };
     let mut video_encoder_state: WebrtcVideoEncoderState =
         init_webrtc_video_encoder_state(video_encode.as_ref());
@@ -771,8 +762,26 @@ async fn whep_viewer_loop(
     let mut demuxer = TsDemuxer::new(program_number);
 
     loop {
+        let silence_tick = async {
+            match silence_interval.as_mut() {
+                Some(iv) => { iv.tick().await; }
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::select! {
             _ = cancel.cancelled() => break,
+
+            _ = silence_tick => {
+                emit_webrtc_silence_if_needed(
+                    &mut encoder_state,
+                    &mut session,
+                    audio_mid,
+                    audio_pt,
+                    &stats,
+                    output_id,
+                ).await;
+                continue;
+            }
 
             result = rx.recv() => {
                 match result {
@@ -836,13 +845,39 @@ async fn whep_viewer_loop(
                                         );
                                     }
                                     if let (
-                                        WebrtcEncoderState::Active { decoder, encoder, decode_stats, transcoder },
+                                        WebrtcEncoderState::Active {
+                                            decoder,
+                                            encoder,
+                                            decode_stats,
+                                            transcoder,
+                                            pending_transcode_cfg,
+                                            silence,
+                                        },
                                         Some(audio_mid),
                                         Some(audio_pt),
                                     ) = (&mut encoder_state, audio_mid, audio_pt)
                                     {
+                                        if decoder.is_none() {
+                                            if let Some(c) = demuxer.cached_aac_config() {
+                                                let ep = encoder.params().clone();
+                                                webrtc_lazy_build_decoder_and_transcoder(
+                                                    decoder,
+                                                    transcoder,
+                                                    pending_transcode_cfg,
+                                                    &ep,
+                                                    c,
+                                                    output_id,
+                                                );
+                                            }
+                                        }
+                                        if let Some(sg) = silence.as_mut() {
+                                            sg.mark_real_audio(pts);
+                                        }
+                                        let Some(dec) = decoder.as_mut() else {
+                                            continue;
+                                        };
                                         decode_stats.inc_input();
-                                        match decoder.decode_frame(&data) {
+                                        match dec.decode_frame(&data) {
                                             Ok(planar) => {
                                                 decode_stats.inc_output();
                                                 if let Some(tc) = transcoder.as_mut() {
@@ -1062,11 +1097,28 @@ async fn whip_client_loop(
 
         let audio_encode = config.audio_encode.clone();
         let transcode = config.transcode.clone();
-        let mut encoder_state: WebrtcEncoderState =
-            if audio_encode.is_some() && audio_mid.is_some() && audio_pt.is_some() {
-                WebrtcEncoderState::Lazy
+        let mut encoder_state: WebrtcEncoderState = match audio_encode.as_ref() {
+            Some(cfg) if cfg.silent_fallback && audio_mid.is_some() && audio_pt.is_some() => {
+                build_webrtc_encoder_state_eager_for_silent_fallback(
+                    audio_encode.as_ref(),
+                    transcode.as_ref(),
+                    &cancel,
+                    &stats,
+                    flow_id,
+                    &config.id,
+                    events,
+                )
+            }
+            Some(_) if audio_mid.is_some() && audio_pt.is_some() => WebrtcEncoderState::Lazy,
+            _ => WebrtcEncoderState::Disabled,
+        };
+        let mut silence_interval: Option<tokio::time::Interval> =
+            if let WebrtcEncoderState::Active { silence: Some(sg), .. } = &encoder_state {
+                let mut iv = tokio::time::interval(sg.chunk_duration());
+                iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                Some(iv)
             } else {
-                WebrtcEncoderState::Disabled
+                None
             };
         let mut video_encoder_state: WebrtcVideoEncoderState =
             init_webrtc_video_encoder_state(config.video_encode.as_ref());
@@ -1080,8 +1132,26 @@ async fn whip_client_loop(
         let mut demuxer = TsDemuxer::new(config.program_number);
 
         loop {
+            let silence_tick = async {
+                match silence_interval.as_mut() {
+                    Some(iv) => { iv.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            };
             tokio::select! {
                 _ = cancel.cancelled() => break 'outer,
+
+                _ = silence_tick => {
+                    emit_webrtc_silence_if_needed(
+                        &mut encoder_state,
+                        &mut session,
+                        audio_mid,
+                        audio_pt,
+                        &stats,
+                        &config.id,
+                    ).await;
+                    continue;
+                }
 
                 result = rx.recv() => {
                     match result {
@@ -1143,13 +1213,39 @@ async fn whip_client_loop(
                                             );
                                         }
                                         if let (
-                                            WebrtcEncoderState::Active { decoder, encoder, decode_stats, transcoder },
+                                            WebrtcEncoderState::Active {
+                                                decoder,
+                                                encoder,
+                                                decode_stats,
+                                                transcoder,
+                                                pending_transcode_cfg,
+                                                silence,
+                                            },
                                             Some(audio_mid),
                                             Some(audio_pt),
                                         ) = (&mut encoder_state, audio_mid, audio_pt)
                                         {
+                                            if decoder.is_none() {
+                                                if let Some(c) = demuxer.cached_aac_config() {
+                                                    let ep = encoder.params().clone();
+                                                    webrtc_lazy_build_decoder_and_transcoder(
+                                                        decoder,
+                                                        transcoder,
+                                                        pending_transcode_cfg,
+                                                        &ep,
+                                                        c,
+                                                        &config.id,
+                                                    );
+                                                }
+                                            }
+                                            if let Some(sg) = silence.as_mut() {
+                                                sg.mark_real_audio(pts);
+                                            }
+                                            let Some(dec) = decoder.as_mut() else {
+                                                continue;
+                                            };
                                             decode_stats.inc_input();
-                                            match decoder.decode_frame(&data) {
+                                            match dec.decode_frame(&data) {
                                                 Ok(planar) => {
                                                     decode_stats.inc_output();
                                                     if let Some(tc) = transcoder.as_mut() {
@@ -1429,5 +1525,250 @@ fn build_webrtc_encoder_state(
         encoder.params().target_bitrate_kbps,
     );
 
-    WebrtcEncoderState::Active { decoder, encoder, decode_stats, transcoder }
+    WebrtcEncoderState::Active {
+        decoder: Some(decoder),
+        encoder,
+        decode_stats,
+        transcoder,
+        pending_transcode_cfg: None,
+        silence: None,
+    }
+}
+
+/// Eager encoder construction for `silent_fallback = true` on a WebRTC
+/// session. Mirrors [`super::output_rtmp::build_encoder_state_eager_for_silent_fallback`]
+/// but tailored to Opus (48 kHz, stereo only).
+///
+/// Fine details:
+/// - WebRTC always emits Opus on the wire; the encoder is opened with
+///   input PCM at 48 kHz (the Opus internal clock) and the declared
+///   channel count (defaulting to stereo).
+/// - A real source AAC frame arriving later triggers lazy construction
+///   of the AAC decoder + a resampler to project its native rate onto
+///   48 kHz so the encoder sees a consistent PCM format.
+#[cfg(feature = "webrtc")]
+fn build_webrtc_encoder_state_eager_for_silent_fallback(
+    audio_encode: Option<&crate::config::models::AudioEncodeConfig>,
+    pending_transcode_cfg: Option<&super::audio_transcode::TranscodeJson>,
+    cancel: &CancellationToken,
+    stats: &Arc<OutputStatsAccumulator>,
+    flow_id: &str,
+    output_id: &str,
+    events: &EventSender,
+) -> WebrtcEncoderState {
+    let Some(enc_cfg) = audio_encode else {
+        return WebrtcEncoderState::Disabled;
+    };
+
+    let codec = match AudioCodec::parse(&enc_cfg.codec) {
+        Some(c) => c,
+        None => {
+            tracing::error!(
+                "WebRTC output '{}': audio_encode unknown codec '{}'", output_id, enc_cfg.codec
+            );
+            return WebrtcEncoderState::Failed;
+        }
+    };
+
+    // Browsers require Opus; the validator catches bad configs, but
+    // guard again here so an eager build doesn't start a non-Opus
+    // encoder on the back of a misconfigured silent_fallback block.
+    if !matches!(codec, AudioCodec::Opus) {
+        tracing::error!(
+            "WebRTC output '{}': silent_fallback requires codec=opus (got {})",
+            output_id, enc_cfg.codec
+        );
+        return WebrtcEncoderState::Failed;
+    }
+
+    // Opus is always 48 kHz on the wire regardless of the declared
+    // sample_rate; the channel count is honoured.
+    let target_sr = 48_000_u32;
+    let target_ch = enc_cfg.channels.unwrap_or(2).clamp(1, 2);
+    let target_br = enc_cfg.bitrate_kbps.unwrap_or_else(|| codec.default_bitrate_kbps());
+
+    let params = EncoderParams {
+        codec,
+        sample_rate: target_sr,
+        channels: target_ch,
+        target_bitrate_kbps: target_br,
+        target_sample_rate: target_sr,
+        target_channels: target_ch,
+    };
+
+    let encoder = match AudioEncoder::spawn(
+        params,
+        cancel.child_token(),
+        flow_id.to_string(),
+        output_id.to_string(),
+        stats.clone(),
+        Some(events.clone()),
+    ) {
+        Ok(e) => e,
+        Err(AudioEncoderError::FfmpegNotFound) => {
+            let msg = format!(
+                "WebRTC output '{}': audio_encode(silent_fallback) requires ffmpeg in PATH but it is not installed",
+                output_id
+            );
+            tracing::error!("{msg}");
+            events.emit_flow(EventSeverity::Critical, category::AUDIO_ENCODE, msg, flow_id);
+            return WebrtcEncoderState::Failed;
+        }
+        Err(e) => {
+            let msg = format!(
+                "WebRTC output '{}': audio_encode(silent_fallback) encoder spawn failed: {e}",
+                output_id
+            );
+            tracing::error!("{msg}");
+            events.emit_flow(EventSeverity::Critical, category::AUDIO_ENCODE, msg, flow_id);
+            return WebrtcEncoderState::Failed;
+        }
+    };
+
+    let decode_stats = Arc::new(DecodeStats::new());
+    stats.set_encode_stats(
+        encoder.stats_handle(),
+        encoder.params().codec.as_str().to_string(),
+        encoder.params().target_sample_rate,
+        encoder.params().target_channels,
+        encoder.params().target_bitrate_kbps,
+    );
+
+    let silence = SilenceGenerator::new(target_sr, target_ch, 0);
+
+    tracing::info!(
+        "WebRTC output '{}': audio_encode(silent_fallback) active (Opus 48000 Hz {} ch, {} kbps)",
+        output_id, target_ch, target_br,
+    );
+
+    WebrtcEncoderState::Active {
+        decoder: None,
+        encoder,
+        decode_stats,
+        transcoder: None,
+        pending_transcode_cfg: pending_transcode_cfg.cloned(),
+        silence: Some(silence),
+    }
+}
+
+/// Shared silence-tick handler for WebRTC sessions. Submits one
+/// zero-filled planar chunk to the encoder, drains any encoded Opus
+/// frames, and writes them to the audio MID. Early-returns when:
+/// - the encoder state is not Active with a silence generator, or
+/// - real audio has arrived within the grace window, or
+/// - the session has no audio MID / payload type (SDP negotiated
+///   video-only).
+#[cfg(feature = "webrtc")]
+async fn emit_webrtc_silence_if_needed(
+    state: &mut WebrtcEncoderState,
+    session: &mut super::webrtc::session::WebrtcSession,
+    audio_mid: Option<str0m::media::Mid>,
+    audio_pt: Option<str0m::media::Pt>,
+    stats: &Arc<OutputStatsAccumulator>,
+    output_id: &str,
+) {
+    use std::time::Instant;
+    use str0m::media::MediaTime;
+
+    let (Some(audio_mid), Some(audio_pt)) = (audio_mid, audio_pt) else {
+        return;
+    };
+    let WebrtcEncoderState::Active {
+        encoder,
+        silence: Some(sg),
+        ..
+    } = state
+    else {
+        return;
+    };
+    if !sg.should_emit() {
+        return;
+    }
+    if !sg.is_emitting() {
+        tracing::info!(
+            "WebRTC output '{}': source audio absent/stalled — starting silent-Opus injection",
+            output_id
+        );
+    }
+    let (planar, pts) = sg.next_chunk();
+    encoder.submit_planar(planar, pts);
+    for frame in encoder.drain() {
+        let media_time = MediaTime::new(
+            frame.pts * 48_000 / 90_000,
+            str0m::media::Frequency::FORTY_EIGHT_KHZ,
+        );
+        if let Err(e) = session.write_media(
+            audio_mid,
+            audio_pt,
+            Instant::now(),
+            media_time,
+            &frame.data,
+        ) {
+            tracing::debug!("WebRTC output '{}' silent audio write error: {}", output_id, e);
+            continue;
+        }
+        session.drain_outputs().await;
+        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+        stats.bytes_sent.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Lazy build of the AAC decoder + optional resampler on the first
+/// real source AAC frame observed while the WebRTC encoder is already
+/// running (the silent-fallback path). Mirrors the RTMP variant but
+/// always retargets the encoder's input format (48 kHz Opus internal
+/// clock, declared channel count).
+#[cfg(feature = "webrtc")]
+fn webrtc_lazy_build_decoder_and_transcoder(
+    decoder: &mut Option<AacDecoder>,
+    transcoder: &mut Option<super::audio_transcode::PlanarAudioTranscoder>,
+    pending_transcode_cfg: &Option<super::audio_transcode::TranscodeJson>,
+    encoder_params: &EncoderParams,
+    cached_aac: (u8, u8, u8),
+    output_id: &str,
+) {
+    let (profile, sr_idx, ch_cfg) = cached_aac;
+    if profile != 1 {
+        tracing::warn!(
+            "WebRTC output '{}': silent-fallback ignoring non-AAC-LC source frame (profile={profile})",
+            output_id
+        );
+        return;
+    }
+    let dec = match AacDecoder::from_adts_config(profile, sr_idx, ch_cfg) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(
+                "WebRTC output '{}': silent-fallback AacDecoder build failed: {e}",
+                output_id
+            );
+            return;
+        }
+    };
+    let source_sr = dec.sample_rate();
+    let source_ch = dec.channels();
+    *decoder = Some(dec);
+
+    let need_transcode = pending_transcode_cfg.is_some()
+        || source_sr != encoder_params.sample_rate
+        || source_ch != encoder_params.channels;
+    if !need_transcode {
+        *transcoder = None;
+        return;
+    }
+    let merged = super::audio_transcode::TranscodeJson {
+        sample_rate: Some(encoder_params.sample_rate),
+        channels: Some(encoder_params.channels),
+        ..pending_transcode_cfg.clone().unwrap_or_default()
+    };
+    match super::audio_transcode::PlanarAudioTranscoder::new(source_sr, source_ch, &merged) {
+        Ok(tc) => *transcoder = Some(tc),
+        Err(e) => {
+            tracing::warn!(
+                "WebRTC output '{}': silent-fallback transcoder build failed: {e}; source audio dropped, silence continues",
+                output_id
+            );
+            *decoder = None;
+        }
+    }
 }

@@ -221,24 +221,7 @@ impl FlowRuntime {
             .unwrap_or_default();
         let active_input_cfg: Option<&InputConfig> = active_input_def.map(|d| &d.config);
 
-        let input_type = match active_input_cfg {
-            Some(InputConfig::Rtp(_)) => "rtp",
-            Some(InputConfig::Udp(_)) => "udp",
-            Some(InputConfig::Srt(_)) => "srt",
-            Some(InputConfig::Rist(_)) => "rist",
-            Some(InputConfig::Rtmp(_)) => "rtmp",
-            Some(InputConfig::Rtsp(_)) => "rtsp",
-            Some(InputConfig::Webrtc(_)) => "webrtc",
-            Some(InputConfig::Whep(_)) => "whep",
-            Some(InputConfig::St2110_30(_)) => "st2110_30",
-            Some(InputConfig::St2110_31(_)) => "st2110_31",
-            Some(InputConfig::St2110_40(_)) => "st2110_40",
-            Some(InputConfig::St2110_20(_)) => "st2110_20",
-            Some(InputConfig::St2110_23(_)) => "st2110_23",
-            Some(InputConfig::RtpAudio(_)) => "rtp_audio",
-            Some(InputConfig::Bonded(_)) => "bonded",
-            None => "none",
-        };
+        let input_type = active_input_cfg.map(input_type_str).unwrap_or("none");
 
         // Register flow stats
         let flow_stats = global_stats.register_flow(
@@ -281,6 +264,12 @@ impl FlowRuntime {
         // Spawn every input task (warm passive). Each input publishes to its
         // own per-input broadcast channel; a forwarder task drains it and
         // gates on the active-input watch.
+        //
+        // Per-input `force_idr` flags let the forwarder ask an input's
+        // ingress video transcoder to emit an IDR on its next encoded frame.
+        // The flag is set when this input transitions from passive → active
+        // so downstream decoders get an immediate keyframe to resync on,
+        // rather than waiting up to a full GOP for the next natural IDR.
         #[cfg(feature = "webrtc")]
         let mut whip_session_info: Option<(tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>, Option<String>)> = None;
         let mut input_handles: HashMap<String, InputRuntime> = HashMap::new();
@@ -288,6 +277,14 @@ impl FlowRuntime {
             let input_id = input_def.id.clone();
             let input_cancel = cancel_token.child_token();
             let (per_input_tx, _) = broadcast::channel::<RtpPacket>(BROADCAST_CHANNEL_CAPACITY);
+            let force_idr = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            // Register per-input liveness counters. The forwarder increments
+            // these on every packet arriving from this input's broadcast
+            // channel so the manager UI can surface NO SIGNAL / feed-present
+            // state for passive inputs too.
+            let per_input_counters = flow_stats
+                .register_input_counters(&input_id, input_type_str(&input_def.config));
 
             #[cfg(feature = "webrtc")]
             let mut this_whip_info: Option<(tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>, Option<String>)> = None;
@@ -302,6 +299,7 @@ impl FlowRuntime {
                         event_sender.clone(),
                         config.config.id.clone(),
                         input_id.clone(),
+                        force_idr.clone(),
                     )
                 }
                 InputConfig::Udp(udp_config) => {
@@ -313,6 +311,7 @@ impl FlowRuntime {
                         event_sender.clone(),
                         config.config.id.clone(),
                         input_id.clone(),
+                        force_idr.clone(),
                     )
                 }
                 InputConfig::Srt(srt_config) => {
@@ -324,6 +323,7 @@ impl FlowRuntime {
                         event_sender.clone(),
                         config.config.id.clone(),
                         input_id.clone(),
+                        force_idr.clone(),
                     )
                 }
                 InputConfig::Rist(rist_config) => {
@@ -335,6 +335,7 @@ impl FlowRuntime {
                         event_sender.clone(),
                         config.config.id.clone(),
                         input_id.clone(),
+                        force_idr.clone(),
                     )
                 }
                 InputConfig::Rtmp(rtmp_config) => {
@@ -346,6 +347,7 @@ impl FlowRuntime {
                         event_sender.clone(),
                         config.config.id.clone(),
                         input_id.clone(),
+                        force_idr.clone(),
                     )
                 }
                 InputConfig::Rtsp(rtsp_config) => {
@@ -357,6 +359,7 @@ impl FlowRuntime {
                         event_sender.clone(),
                         config.config.id.clone(),
                         input_id.clone(),
+                        force_idr.clone(),
                     )
                 }
                 #[cfg(feature = "webrtc")]
@@ -372,6 +375,7 @@ impl FlowRuntime {
                         input_cancel.clone(),
                         session_rx,
                         event_sender.clone(),
+                        force_idr.clone(),
                     )
                 }
                 #[cfg(not(feature = "webrtc"))]
@@ -392,6 +396,7 @@ impl FlowRuntime {
                         event_sender.clone(),
                         config.config.id.clone(),
                         input_id.clone(),
+                        force_idr.clone(),
                     )
                 }
                 #[cfg(not(feature = "webrtc"))]
@@ -493,6 +498,8 @@ impl FlowRuntime {
                 active_input_watch_rx.clone(),
                 input_cancel.clone(),
                 continuity_fixer.clone(),
+                force_idr.clone(),
+                per_input_counters,
             );
 
             // Spawn per-input thumbnail generator (subscribes to the input's
@@ -861,25 +868,17 @@ impl FlowRuntime {
             .iter()
             .find(|d| d.id == new_input_id)
         {
-            let new_input_type = match &new_def.config {
-                InputConfig::Rtp(_) => "rtp",
-                InputConfig::Udp(_) => "udp",
-                InputConfig::Srt(_) => "srt",
-                InputConfig::Rist(_) => "rist",
-                InputConfig::Rtmp(_) => "rtmp",
-                InputConfig::Rtsp(_) => "rtsp",
-                InputConfig::Webrtc(_) => "webrtc",
-                InputConfig::Whep(_) => "whep",
-                InputConfig::St2110_30(_) => "st2110_30",
-                InputConfig::St2110_31(_) => "st2110_31",
-                InputConfig::St2110_40(_) => "st2110_40",
-                InputConfig::St2110_20(_) => "st2110_20",
-                InputConfig::St2110_23(_) => "st2110_23",
-                InputConfig::RtpAudio(_) => "rtp_audio",
-                InputConfig::Bonded(_) => "bonded",
-            };
+            let new_input_type = input_type_str(&new_def.config);
             let new_meta = build_input_config_meta(&new_def.config);
             self.stats.update_active_input_meta(new_input_type, new_meta);
+        }
+
+        // Ask the newly-active input's thumbnail generator to emit a frame
+        // immediately rather than waiting up to 5s for its next interval
+        // tick. The per-input generator has been buffering this input's TS
+        // the whole time it was passive, so the capture is accurate.
+        if let Some(thumb) = self.stats.per_input_thumbnails.get(new_input_id) {
+            thumb.request_refresh();
         }
 
         tracing::info!(
@@ -1416,6 +1415,29 @@ impl FlowRuntime {
 /// Build a topology-display [`InputConfigMeta`] from a concrete
 /// [`InputConfig`]. Used by `FlowRuntime::start` and by runtime updates that
 /// swap the active input without restarting the flow.
+/// Map an `InputConfig` variant to the short transport-type string carried
+/// on `InputStats.input_type` and `PerInputLive.input_type`. Kept in sync
+/// with the equivalent active-input lookup at flow startup.
+fn input_type_str(input: &InputConfig) -> &'static str {
+    match input {
+        InputConfig::Rtp(_) => "rtp",
+        InputConfig::Udp(_) => "udp",
+        InputConfig::Srt(_) => "srt",
+        InputConfig::Rist(_) => "rist",
+        InputConfig::Rtmp(_) => "rtmp",
+        InputConfig::Rtsp(_) => "rtsp",
+        InputConfig::Webrtc(_) => "webrtc",
+        InputConfig::Whep(_) => "whep",
+        InputConfig::St2110_30(_) => "st2110_30",
+        InputConfig::St2110_31(_) => "st2110_31",
+        InputConfig::St2110_40(_) => "st2110_40",
+        InputConfig::St2110_20(_) => "st2110_20",
+        InputConfig::St2110_23(_) => "st2110_23",
+        InputConfig::RtpAudio(_) => "rtp_audio",
+        InputConfig::Bonded(_) => "bonded",
+    }
+}
+
 fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::InputConfigMeta {
     use crate::stats::collector::InputConfigMeta;
     match input {
@@ -1512,6 +1534,12 @@ fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::Inpu
 /// The shared `continuity_fixer` ensures seamless TS continuity counter
 /// progression when switching between inputs, and injects cached PAT/PMT
 /// packets at the switch boundary so external decoders can re-acquire quickly.
+///
+/// `force_idr` is this input's one-shot IDR request flag. The forwarder sets
+/// it to `true` on a passive → active transition so that any ingress video
+/// re-encoder in this input's pipeline emits an IDR on its next frame —
+/// otherwise downstream decoders have to wait up to a full GOP for the next
+/// natural keyframe before they can display the switched feed.
 fn spawn_input_forwarder(
     input_id: String,
     mut rx: broadcast::Receiver<RtpPacket>,
@@ -1519,6 +1547,8 @@ fn spawn_input_forwarder(
     active_input_rx: watch::Receiver<String>,
     cancel: CancellationToken,
     continuity_fixer: Arc<std::sync::Mutex<TsContinuityFixer>>,
+    force_idr: Arc<std::sync::atomic::AtomicBool>,
+    per_input_counters: Arc<crate::stats::collector::PerInputCounters>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut was_active = *active_input_rx.borrow() == input_id;
@@ -1528,6 +1558,16 @@ fn spawn_input_forwarder(
                 _ = cancel.cancelled() => return,
                 r = rx.recv() => match r {
                     Ok(pkt) => {
+                        // Per-input liveness counters — incremented for every
+                        // packet regardless of active/passive, so the manager
+                        // UI can report feed-present state for all inputs.
+                        per_input_counters
+                            .bytes
+                            .fetch_add(pkt.data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        per_input_counters
+                            .packets
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
                         let is_active = *active_input_rx.borrow() == input_id;
 
                         if is_active && !was_active {
@@ -1541,6 +1581,10 @@ fn spawn_input_forwarder(
                             for inj_pkt in injected {
                                 let _ = out_tx.send(inj_pkt);
                             }
+                            // Ask any ingress video re-encoder on this input
+                            // to emit an IDR on its next frame. Passthrough
+                            // inputs ignore the flag (no encoder to signal).
+                            force_idr.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                         was_active = is_active;
 

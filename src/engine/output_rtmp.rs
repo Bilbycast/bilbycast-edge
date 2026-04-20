@@ -19,8 +19,9 @@ use crate::config::models::{RtmpOutputConfig, VideoEncodeConfig};
 use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::OutputStatsAccumulator;
 
-use super::audio_decode::{AacDecoder, DecodeStats, sample_rate_from_index};
+use super::audio_decode::{AacDecoder, DecodeStats, sample_rate_from_index, sr_index_from_hz};
 use super::audio_encode::{AudioCodec, AudioEncoder, AudioEncoderError, EncoderParams};
+use super::audio_silence::SilenceGenerator;
 use super::packet::RtpPacket;
 use super::rtmp::client::RtmpClient;
 use super::ts_demux::{DemuxedFrame, TsDemuxer};
@@ -38,8 +39,14 @@ enum EncoderState {
     /// codec / SR / channels — fast-path passthrough with no decode/encode.
     Transparent,
     /// Decoder + encoder are running. Each AAC frame goes through them.
+    /// When `silent_fallback` is set we build the encoder eagerly (with
+    /// declared target params) before any source audio arrives, so the
+    /// decoder and transcoder are lazily filled the first time real AAC
+    /// shows up — hence both are `Option`.
     Active {
-        decoder: AacDecoder,
+        /// `None` until the first real AAC frame arrives (silent-fallback
+        /// builds the encoder ahead of any source audio).
+        decoder: Option<AacDecoder>,
         encoder: AudioEncoder,
         decode_stats: Arc<DecodeStats>,
         /// Optional planar PCM shuffle / resample stage between decoder and
@@ -47,6 +54,14 @@ enum EncoderState {
         /// fast-paths inside `PlanarAudioTranscoder` mean an empty block is
         /// effectively a clone.
         transcoder: Option<super::audio_transcode::PlanarAudioTranscoder>,
+        /// Retained to re-plan the transcoder when silent-fallback sees
+        /// its first real AAC frame and needs to resample from the source
+        /// rate/channels to the encoder's declared input. `None` in the
+        /// legacy path (transcoder was already built against real params).
+        pending_transcode_cfg: Option<super::audio_transcode::TranscodeJson>,
+        /// Silent-PCM generator + audio-drop watchdog. `Some` iff
+        /// `audio_encode.silent_fallback = true`.
+        silence: Option<SilenceGenerator>,
     },
     /// Decoder or encoder construction failed once. Drop audio for the
     /// rest of the output's lifetime; the failure event was already
@@ -81,21 +96,19 @@ enum VideoEncoderState {
 #[cfg(feature = "video-thumbnail")]
 struct VideoActive {
     decoder: video_engine::VideoDecoder,
-    /// Opened on the first decoded frame so we can pick up the source
-    /// resolution when the operator didn't specify one.
-    encoder: Option<video_engine::VideoEncoder>,
-    backend: video_codec::VideoEncoderCodec,
+    /// Shared encoder pipeline — wraps `VideoEncoder` + optional
+    /// `VideoScaler`. Lazy-opens on the first decoded frame. When the
+    /// operator sets `video_encode.width` / `.height` to values that
+    /// differ from the source, the scaler Lanczos-resizes the decoded
+    /// frame to the target before encoding, instead of letting
+    /// libavcodec silently crop the top-left quadrant.
+    pipeline: crate::engine::video_encode_util::ScaledVideoEncoder,
     target_family: video_codec::VideoCodec,
-    requested_width: Option<u32>,
-    requested_height: Option<u32>,
-    fps_num: Option<u32>,
-    fps_den: Option<u32>,
-    /// Snapshot of the full `video_encode` block — the lazy encoder
-    /// opener hands this to `video_encode_util::build_encoder_config`
-    /// which covers bitrate / gop / preset / profile plus the advanced
-    /// knobs (chroma / bit_depth / rate_control / CRF / bframes / refs /
-    /// level / tune / colour metadata).
-    encode_cfg: crate::config::models::VideoEncodeConfig,
+    /// Cached encoder fps — needed to convert encoder-PTS into FLV-style
+    /// millisecond timestamps after each frame encode. Mirrors the
+    /// numbers the pipeline uses at lazy-open time.
+    fps_num: u32,
+    fps_den: u32,
     /// Cached FLV sequence-header payload built from the encoder's
     /// `extradata` on first-encoder-open. `None` until the encoder opens
     /// and emits its out-of-band SPS/PPS (or VPS/SPS/PPS).
@@ -235,11 +248,28 @@ async fn publish_loop(
     let mut base_pts: Option<u64> = None;
     // Lazy encoder: built on first AAC frame so we can read the demuxer's
     // cached AAC config and decide between Transparent / Active / Failed.
-    let mut encoder_state: EncoderState = if config.audio_encode.is_some() {
-        EncoderState::Lazy
-    } else {
-        EncoderState::Disabled
+    let mut encoder_state: EncoderState = match &config.audio_encode {
+        None => EncoderState::Disabled,
+        Some(cfg) if cfg.silent_fallback => {
+            // Build the encoder eagerly so the silence generator has a
+            // sink before any source audio (if any) ever arrives.
+            build_encoder_state_eager_for_silent_fallback(
+                config, cancel, stats, flow_id, event_sender,
+            )
+        }
+        Some(_) => EncoderState::Lazy,
     };
+    // Silence interval: ticks at the silence generator's chunk cadence
+    // (~21 ms @ 48 kHz / 1024 samples). Only present when
+    // `silent_fallback` is active and the eager-build succeeded.
+    let mut silence_interval: Option<tokio::time::Interval> =
+        if let EncoderState::Active { silence: Some(sg), .. } = &encoder_state {
+            let mut iv = tokio::time::interval(sg.chunk_duration());
+            iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            Some(iv)
+        } else {
+            None
+        };
     let mut video_state = init_video_encoder_state(
         config,
         stats,
@@ -247,8 +277,34 @@ async fn publish_loop(
         event_sender,
     );
     loop {
+        // Silence tick → inject one zero-filled chunk into the encoder
+        // if the watchdog says we should (no real audio within grace),
+        // then drain + write FLV audio tags.
+        let silence_tick = async {
+            match silence_interval.as_mut() {
+                Some(iv) => {
+                    iv.tick().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
         let packet = tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
+            _ = silence_tick => {
+                if let Err(e) = emit_silence_if_needed(
+                    config,
+                    client,
+                    &mut encoder_state,
+                    &mut sent_audio_header,
+                    stats,
+                )
+                .await
+                {
+                    return Err(e);
+                }
+                client.flush().await?;
+                continue;
+            }
             result = rx.recv() => {
                 match result {
                     Ok(pkt) => pkt,
@@ -333,6 +389,7 @@ async fn publish_loop(
 
                     // Lazy: build the encoder once we have the first
                     // ADTS frame (so we can read its profile / SR / ch).
+                    // Skipped when silent_fallback already eagerly built it.
                     if matches!(encoder_state, EncoderState::Lazy) {
                         encoder_state = build_encoder_state(
                             config,
@@ -354,12 +411,6 @@ async fn publish_loop(
                     if !sent_audio_header {
                         if let Some((profile, sr_idx, ch_cfg)) = demuxer.cached_aac_config() {
                             let _ = profile;
-                            // For Transparent / Disabled paths, write the
-                            // ASC from the demuxer's cached config so the
-                            // sample rate matches the source.
-                            // For Active path, the encoder may resample;
-                            // pull the resolved target SR/ch from the
-                            // encoder params.
                             let (asc_sr_idx, asc_ch_cfg) = match &encoder_state {
                                 EncoderState::Active { encoder, .. } => {
                                     let p = encoder.params();
@@ -370,7 +421,6 @@ async fn publish_loop(
                                 }
                                 _ => (sr_idx, ch_cfg),
                             };
-                            // ASC uses AOT=2 (AAC-LC) → ADTS profile=1.
                             let header = build_aac_sequence_header(1, asc_sr_idx, asc_ch_cfg);
                             client.send_audio(&header, ts_ms).await?;
                             sent_audio_header = true;
@@ -393,13 +443,46 @@ async fn publish_loop(
                             stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
                             stats.record_latency(recv_time_us);
                         }
-                        EncoderState::Active { decoder, encoder, decode_stats, transcoder } => {
-                            // Decode AAC → optional planar shuffle/SRC →
-                            // submit to encoder. Errors are logged once at
-                            // debug; we don't tear down the output on a
-                            // single bad frame.
+                        EncoderState::Active {
+                            decoder,
+                            encoder,
+                            decode_stats,
+                            transcoder,
+                            pending_transcode_cfg,
+                            silence,
+                        } => {
+                            // Silent-fallback mode: lazily build decoder +
+                            // resampler against the source's real AAC
+                            // config on the first real frame.
+                            if decoder.is_none() {
+                                if let Some((profile, sr_idx, ch_cfg)) =
+                                    demuxer.cached_aac_config()
+                                {
+                                    let encoder_params = encoder.params().clone();
+                                    lazy_build_decoder_and_transcoder(
+                                        decoder,
+                                        transcoder,
+                                        pending_transcode_cfg,
+                                        &encoder_params,
+                                        (profile, sr_idx, ch_cfg),
+                                        &config.id,
+                                    );
+                                }
+                            }
+                            // Reset the drop watchdog: real audio is
+                            // flowing, suppress silence until the next
+                            // grace-window expiry.
+                            if let Some(sg) = silence.as_mut() {
+                                sg.mark_real_audio(pts);
+                            }
+                            let Some(dec) = decoder.as_mut() else {
+                                // Decoder build failed (or we're still in
+                                // silent-only mode with an unusable source
+                                // codec). Silence stays active.
+                                continue;
+                            };
                             decode_stats.inc_input();
-                            match decoder.decode_frame(&data) {
+                            match dec.decode_frame(&data) {
                                 Ok(planar) => {
                                     decode_stats.inc_output();
                                     if let Some(tc) = transcoder.as_mut() {
@@ -1120,16 +1203,27 @@ fn open_video_active(
         &config.id,
         serde_json::json!({ "codec": cfg.codec }),
     );
+    // RTMP FLV sequence header is out-of-band: the encoder must emit
+    // extradata (SPS/PPS or VPS/SPS/PPS) so we can build the FLV header
+    // before any frame tags go on the wire. Hence `global_header = true`.
+    let (fps_num, fps_den) = match (cfg.fps_num, cfg.fps_den) {
+        (Some(n), Some(d)) => (n, d),
+        _ => (30, 1),
+    };
+    let pipeline = crate::engine::video_encode_util::ScaledVideoEncoder::new(
+        cfg.clone(),
+        backend,
+        fps_num,
+        fps_den,
+        true,
+        format!("RTMP output '{}'", config.id),
+    );
     VideoEncoderState::Active(Box::new(VideoActive {
         decoder,
-        encoder: None,
-        backend,
+        pipeline,
         target_family,
-        requested_width: cfg.width,
-        requested_height: cfg.height,
-        fps_num: cfg.fps_num,
-        fps_den: cfg.fps_den,
-        encode_cfg: cfg.clone(),
+        fps_num,
+        fps_den,
         sequence_header_tag: None,
         sequence_header_sent: false,
         out_frame_count: 0,
@@ -1176,72 +1270,34 @@ async fn encode_one_frame(
                     Ok(f) => f,
                     Err(_) => break,
                 };
-                if active.encoder.is_none() {
-                    let src_w = frame.width();
-                    let src_h = frame.height();
-                    if let (Some(rw), Some(rh)) = (active.requested_width, active.requested_height)
-                    {
-                        if rw != src_w || rh != src_h {
-                            tracing::warn!(
-                                "RTMP output '{}': video_encode resolution change {}x{} -> {}x{} requested \
-                                 but scaling is not implemented yet; using source resolution",
-                                config.id, src_w, src_h, rw, rh
-                            );
-                        }
-                    }
-                    let (fps_num, fps_den) = match (active.fps_num, active.fps_den) {
-                        (Some(n), Some(d)) => (n, d),
-                        _ => (30, 1),
-                    };
-                    // Emit SPS/PPS (H.264) or VPS/SPS/PPS (HEVC) in
-                    // out-of-band extradata — the FLV sequence header
-                    // format expects the full DecoderConfigurationRecord.
-                    let enc_cfg = crate::engine::video_encode_util::build_encoder_config(
-                        &active.encode_cfg,
-                        active.backend,
-                        src_w,
-                        src_h,
-                        fps_num,
-                        fps_den,
-                        true,
-                    );
-                    let enc = match video_engine::VideoEncoder::open(&enc_cfg) {
-                        Ok(e) => e,
-                        Err(e) => {
-                            return Err(format!("encoder open failed: {e}"));
-                        }
-                    };
-                    if let Some(ed) = enc.extradata() {
-                        active.sequence_header_tag = Some(match active.target_family {
-                            video_codec::VideoCodec::H264 => {
-                                build_avc_sequence_header_from_avcc(ed)
-                            }
-                            video_codec::VideoCodec::Hevc => {
-                                build_hevc_sequence_header_from_hvcc(ed)
-                            }
-                        });
-                    }
-                    active.encoder = Some(enc);
-                }
-                let (y, y_s, u, u_s, v, v_s) = match frame.yuv_planes() {
-                    Some(p) => p,
-                    None => continue,
-                };
-                let enc = active.encoder.as_mut().unwrap();
-                let encoded = match enc.encode_frame(
-                    y, y_s, u, u_s, v, v_s,
-                    Some(active.out_frame_count),
-                ) {
+                let was_open = active.pipeline.is_open();
+                let encoded = match active.pipeline.encode(&frame, Some(active.out_frame_count)) {
                     Ok(frames) => frames,
                     Err(e) => {
+                        if !active.pipeline.is_open() {
+                            // Terminal: encoder open failed.
+                            return Err(format!("encoder open failed: {e}"));
+                        }
                         tracing::debug!("RTMP output '{}': encode error: {e}", config.id);
-                        active
-                            .stats
-                            .dropped_frames
-                            .fetch_add(1, Ordering::Relaxed);
+                        active.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                 };
+                // First time the pipeline reported itself open, capture
+                // its extradata and build the FLV sequence header —
+                // classic AVC for H.264, Enhanced RTMP hvcC for HEVC.
+                if !was_open && active.pipeline.is_open() {
+                    if let Some(ed) = active.pipeline.extradata() {
+                        active.sequence_header_tag = Some(match active.target_family {
+                            video_codec::VideoCodec::H264 => {
+                                build_avc_sequence_header_from_avcc(&ed)
+                            }
+                            video_codec::VideoCodec::Hevc => {
+                                build_hevc_sequence_header_from_hvcc(&ed)
+                            }
+                        });
+                    }
+                }
                 active.out_frame_count += 1;
                 for ef in encoded {
                     out.push((ef.data, ef.keyframe, ef.pts));
@@ -1281,10 +1337,8 @@ async fn encode_one_frame(
     // `ts_ms` for every output frame in this batch — keeps DTS strictly
     // monotonic when the decoder drains several queued frames at once
     // (which is the common path on the very first non-IDR access units).
-    let (fps_num, fps_den) = match (active.fps_num, active.fps_den) {
-        (Some(n), Some(d)) => (n.max(1), d.max(1)),
-        _ => (30, 1),
-    };
+    let fps_num = active.fps_num.max(1);
+    let fps_den = active.fps_den.max(1);
     for (annex_b_encoded, keyframe, enc_pts) in encoded {
         let frame_ts_ms = (enc_pts.max(0) as u64 * 1000 * fps_den as u64 / fps_num as u64) as u32;
         // Send the sequence header once, then re-send on each subsequent
@@ -1600,30 +1654,261 @@ fn build_encoder_state(
         encoder.params().target_bitrate_kbps,
     );
 
-    EncoderState::Active { decoder, encoder, decode_stats, transcoder }
+    EncoderState::Active {
+        decoder: Some(decoder),
+        encoder,
+        decode_stats,
+        transcoder,
+        pending_transcode_cfg: None,
+        silence: None,
+    }
 }
 
-/// Reverse of `sample_rate_from_index`: maps a sample rate (Hz) to its
-/// 4-bit ADTS sample_rate_index field. Returns `None` for non-standard
-/// rates. Used when building the FLV ASC for an encoder that resampled.
-fn sr_index_from_hz(hz: u32) -> Option<u8> {
-    Some(match hz {
-        96_000 => 0,
-        88_200 => 1,
-        64_000 => 2,
-        48_000 => 3,
-        44_100 => 4,
-        32_000 => 5,
-        24_000 => 6,
-        22_050 => 7,
-        16_000 => 8,
-        12_000 => 9,
-        11_025 => 10,
-        8_000 => 11,
-        7_350 => 12,
-        _ => return None,
-    })
+/// Silence-tick handler: if the drop watchdog says real audio is
+/// missing, inject one zero-filled chunk into the encoder, send the
+/// FLV AAC sequence header on the first emission, drain any encoded
+/// frames the encoder has queued, and write them out as FLV audio
+/// tags.
+///
+/// This is idempotent and cheap when no silence is needed: it
+/// short-circuits on `should_emit() == false`.
+async fn emit_silence_if_needed(
+    config: &RtmpOutputConfig,
+    client: &mut RtmpClient,
+    encoder_state: &mut EncoderState,
+    sent_audio_header: &mut bool,
+    stats: &Arc<OutputStatsAccumulator>,
+) -> anyhow::Result<()> {
+    let EncoderState::Active {
+        encoder,
+        silence: Some(sg),
+        ..
+    } = encoder_state
+    else {
+        return Ok(());
+    };
+
+    if !sg.should_emit() {
+        return Ok(());
+    }
+
+    if !sg.is_emitting() {
+        tracing::info!(
+            "RTMP output '{}': source audio absent/stalled — starting silent-AAC injection",
+            config.id
+        );
+    }
+
+    let (planar, pts) = sg.next_chunk();
+    encoder.submit_planar(planar, pts);
+
+    if !*sent_audio_header {
+        let p = encoder.params();
+        if let Some(sr_idx) = sr_index_from_hz(p.target_sample_rate) {
+            let header = build_aac_sequence_header(1, sr_idx, p.target_channels);
+            client.send_audio(&header, 0).await?;
+            *sent_audio_header = true;
+            tracing::debug!(
+                "RTMP output '{}': sent AAC sequence header (silent-fallback)",
+                config.id
+            );
+        } else {
+            tracing::warn!(
+                "RTMP output '{}': silent-fallback target sample_rate {} has no ADTS index; deferring sequence header",
+                config.id, p.target_sample_rate
+            );
+        }
+    }
+
+    for frame in encoder.drain() {
+        let tag = build_aac_raw_tag(&frame.data);
+        let tag_len = tag.len();
+        let frame_ts_ms = (frame.pts / 90) as u32;
+        client.send_audio(&tag, frame_ts_ms).await?;
+        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+        stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
+    }
+
+    Ok(())
 }
+
+/// Eager encoder construction for `silent_fallback = true`.
+///
+/// The declared `audio_encode.sample_rate` / `channels` (defaulting to
+/// 48 kHz stereo) are used as both the encoder's input PCM format and
+/// its output target. This lets us spin up the encoder at output
+/// startup — before any source AAC frame has been seen — so the
+/// silence generator has somewhere to submit its zero-filled chunks.
+/// The source decoder + optional resampling transcoder are built
+/// lazily on the first real AAC frame (via
+/// [`lazy_build_decoder_and_transcoder`]).
+fn build_encoder_state_eager_for_silent_fallback(
+    config: &RtmpOutputConfig,
+    cancel: &CancellationToken,
+    stats: &Arc<OutputStatsAccumulator>,
+    flow_id: &str,
+    event_sender: &EventSender,
+) -> EncoderState {
+    let Some(enc_cfg) = config.audio_encode.as_ref() else {
+        return EncoderState::Disabled;
+    };
+
+    let Some(codec) = AudioCodec::parse(&enc_cfg.codec) else {
+        tracing::error!(
+            "RTMP output '{}': audio_encode unknown codec '{}'",
+            config.id, enc_cfg.codec
+        );
+        return EncoderState::Failed;
+    };
+
+    // Declared encoder params. These are also the silence generator's
+    // PCM format — so real audio arriving later with different params
+    // is run through a resampler (lazily built on first real frame).
+    let target_sr = enc_cfg.sample_rate.unwrap_or(48_000);
+    let target_ch = enc_cfg.channels.unwrap_or(2).clamp(1, 2);
+    let target_br = enc_cfg.bitrate_kbps.unwrap_or_else(|| codec.default_bitrate_kbps());
+
+    let params = EncoderParams {
+        codec,
+        sample_rate: target_sr,
+        channels: target_ch,
+        target_bitrate_kbps: target_br,
+        target_sample_rate: target_sr,
+        target_channels: target_ch,
+    };
+
+    let encoder = match AudioEncoder::spawn(
+        params,
+        cancel.child_token(),
+        flow_id.to_string(),
+        config.id.clone(),
+        stats.clone(),
+        Some(event_sender.clone()),
+    ) {
+        Ok(e) => e,
+        Err(AudioEncoderError::FfmpegNotFound) => {
+            let msg = format!(
+                "RTMP output '{}': audio_encode(silent_fallback) requires ffmpeg in PATH but it is not installed; silent-audio track disabled",
+                config.id
+            );
+            tracing::error!("{msg}");
+            event_sender.emit_flow(
+                EventSeverity::Critical,
+                crate::manager::events::category::AUDIO_ENCODE,
+                msg,
+                flow_id,
+            );
+            return EncoderState::Failed;
+        }
+        Err(e) => {
+            let msg = format!(
+                "RTMP output '{}': audio_encode(silent_fallback) encoder spawn failed: {e}",
+                config.id
+            );
+            tracing::error!("{msg}");
+            event_sender.emit_flow(
+                EventSeverity::Critical,
+                crate::manager::events::category::AUDIO_ENCODE,
+                msg,
+                flow_id,
+            );
+            return EncoderState::Failed;
+        }
+    };
+
+    let decode_stats = Arc::new(DecodeStats::new());
+    stats.set_encode_stats(
+        encoder.stats_handle(),
+        encoder.params().codec.as_str().to_string(),
+        encoder.params().target_sample_rate,
+        encoder.params().target_channels,
+        encoder.params().target_bitrate_kbps,
+    );
+
+    let silence = SilenceGenerator::new(target_sr, target_ch, 0);
+
+    tracing::info!(
+        "RTMP output '{}': audio_encode(silent_fallback) active codec={} target={} Hz {} ch {} kbps",
+        config.id,
+        encoder.params().codec.as_str(),
+        target_sr, target_ch, target_br,
+    );
+
+    EncoderState::Active {
+        decoder: None,
+        encoder,
+        decode_stats,
+        transcoder: None,
+        pending_transcode_cfg: config.transcode.clone(),
+        silence: Some(silence),
+    }
+}
+
+/// Build the source AAC decoder + optional resampler on the first real
+/// AAC frame observed while the encoder is already running (the
+/// silent-fallback path). Mutates the passed `decoder` / `transcoder`
+/// fields in place; logs and sets `decoder = None` on failure so we
+/// keep producing silence instead of crashing the output.
+fn lazy_build_decoder_and_transcoder(
+    decoder: &mut Option<AacDecoder>,
+    transcoder: &mut Option<super::audio_transcode::PlanarAudioTranscoder>,
+    pending_transcode_cfg: &Option<super::audio_transcode::TranscodeJson>,
+    encoder_params: &EncoderParams,
+    cached_aac: (u8, u8, u8),
+    output_id: &str,
+) {
+    let (profile, sr_idx, ch_cfg) = cached_aac;
+    if profile != 1 {
+        tracing::warn!(
+            "RTMP output '{}': silent-fallback ignoring non-AAC-LC source frame (profile={profile}); keeping silence track",
+            output_id
+        );
+        return;
+    }
+    let dec = match AacDecoder::from_adts_config(profile, sr_idx, ch_cfg) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(
+                "RTMP output '{}': silent-fallback AacDecoder build failed: {e}; keeping silence track",
+                output_id
+            );
+            return;
+        }
+    };
+    let source_sr = dec.sample_rate();
+    let source_ch = dec.channels();
+    *decoder = Some(dec);
+
+    let need_transcode = pending_transcode_cfg.is_some()
+        || source_sr != encoder_params.sample_rate
+        || source_ch != encoder_params.channels;
+    if !need_transcode {
+        *transcoder = None;
+        return;
+    }
+
+    let merged = super::audio_transcode::TranscodeJson {
+        sample_rate: Some(encoder_params.sample_rate),
+        channels: Some(encoder_params.channels),
+        ..pending_transcode_cfg.clone().unwrap_or_default()
+    };
+    match super::audio_transcode::PlanarAudioTranscoder::new(source_sr, source_ch, &merged) {
+        Ok(tc) => *transcoder = Some(tc),
+        Err(e) => {
+            tracing::warn!(
+                "RTMP output '{}': silent-fallback transcoder build failed: {e}; source audio will be dropped but silence continues",
+                output_id
+            );
+            // decoder stays set; without a transcoder, submitting
+            // planar at the wrong SR/channels would corrupt the
+            // encoder stream, so we drop real audio until a resample
+            // path can be built (next frame retries via this same
+            // helper because `transcoder.is_none()`).
+            *decoder = None;
+        }
+    }
+}
+
 
 /// Compute the reconnect delay for an RTMP push output (Bug #10 fix).
 ///
@@ -1711,13 +1996,28 @@ mod tests {
 
     #[test]
     fn build_hevc_sequence_header_shape() {
-        // hvcC body is opaque to this test — we just check that the framing
-        // bytes around it match the Enhanced RTMP v2 spec.
-        let hvcc = [0xAA, 0xBB, 0xCC];
+        // hvcC body is opaque to this test — we just check that the
+        // framing bytes around it match the Enhanced RTMP v2 spec.
+        // The first byte is the hvcC `configurationVersion` and must
+        // be 0x01 for `build_hevc_sequence_header_from_hvcc` to take
+        // the passthrough path; otherwise it parses the input as an
+        // Annex-B VPS+SPS+PPS stream and rejects a random blob.
+        let hvcc = [0x01, 0xBB, 0xCC];
         let tag = build_hevc_sequence_header_from_hvcc(&hvcc);
         assert_eq!(tag[0], 0x90, "IsEx(1) | FrameType(1=key) | PacketType(0)");
         assert_eq!(&tag[1..5], b"hvc1", "FourCC");
         assert_eq!(&tag[5..], &hvcc);
+    }
+
+    #[test]
+    fn build_hevc_sequence_header_returns_empty_on_unparseable_extradata() {
+        // Neither a pre-built hvcC (first byte 0x01) nor a valid
+        // Annex-B VPS/SPS/PPS stream → the function logs a warning and
+        // returns an empty Vec rather than panicking. The encode path
+        // treats an empty sequence-header tag as "don't emit"; the FLV
+        // muxer still works, just without the out-of-band codec config.
+        let garbage = [0xAA, 0xBB, 0xCC];
+        assert!(build_hevc_sequence_header_from_hvcc(&garbage).is_empty());
     }
 
     #[test]

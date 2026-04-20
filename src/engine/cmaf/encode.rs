@@ -29,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::models::{AudioEncodeConfig, VideoEncodeConfig};
 use crate::engine::audio_decode::AacDecoder;
 use crate::engine::audio_encode::{AudioCodec, AudioEncoder, EncoderParams};
+use crate::engine::audio_silence::SilenceGenerator;
 use crate::stats::collector::OutputStatsAccumulator;
 
 use super::fmp4::VideoCodec as CmafVideoCodec;
@@ -49,6 +50,12 @@ pub struct AudioReencoder {
     output_id: String,
     cancel: CancellationToken,
     out_stats: Arc<OutputStatsAccumulator>,
+    /// Silent-PCM generator + audio-drop watchdog. `Some` iff
+    /// `audio_encode.silent_fallback = true` on the CMAF output's
+    /// config — the encoder is then built eagerly (see [`Self::new`])
+    /// so silent AAC frames can start flowing before any source
+    /// audio arrives.
+    silence: Option<SilenceGenerator>,
 }
 
 struct LazyAudioInit {
@@ -77,9 +84,47 @@ impl AudioReencoder {
         let target_bitrate_kbps = cfg
             .bitrate_kbps
             .unwrap_or_else(|| target_codec.default_bitrate_kbps());
+        let out_stats = Arc::new(OutputStatsAccumulator::new(
+            "cmaf-audio-encode".to_string(),
+            "cmaf-audio-encode".to_string(),
+            "cmaf-audio-encode".to_string(),
+        ));
+
+        // Silent-fallback path: build the encoder eagerly using the
+        // declared target sample_rate / channels (defaulting to 48 kHz
+        // stereo) so the caller can start pushing silent PCM before
+        // any source audio ever shows up. The source decoder stays
+        // `None` until the first real AAC frame arrives.
+        let (encoder, silence) = if cfg.silent_fallback {
+            let sr = cfg.sample_rate.unwrap_or(48_000);
+            let ch = cfg.channels.unwrap_or(2).clamp(1, 2);
+            let params = EncoderParams {
+                codec: target_codec,
+                sample_rate: sr,
+                channels: ch,
+                target_bitrate_kbps,
+                target_sample_rate: sr,
+                target_channels: ch,
+            };
+            let enc = AudioEncoder::spawn(
+                params,
+                cancel.clone(),
+                flow_id.to_string(),
+                output_id.to_string(),
+                out_stats.clone(),
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!(
+                "CMAF audio_encode(silent_fallback) spawn failed: {e}"
+            ))?;
+            (Some(enc), Some(SilenceGenerator::new(sr, ch, 0)))
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             decoder: None,
-            encoder: None,
+            encoder,
             target_codec,
             target_bitrate_kbps,
             target_sample_rate: cfg.sample_rate,
@@ -88,14 +133,70 @@ impl AudioReencoder {
             flow_id: flow_id.to_string(),
             output_id: output_id.to_string(),
             cancel: cancel.clone(),
-            // Stats accumulator is optional for the encoder subsystem; we
-            // pass a detached handle because CMAF uses its own collector.
-            out_stats: Arc::new(OutputStatsAccumulator::new(
-                "cmaf-audio-encode".to_string(),
-                "cmaf-audio-encode".to_string(),
-                "cmaf-audio-encode".to_string(),
-            )),
+            out_stats,
+            silence,
         })
+    }
+
+    /// Whether this re-encoder was built with `silent_fallback = true`.
+    /// When true, the caller should drive a silence tick at
+    /// [`Self::silence_chunk_duration`] and call
+    /// [`Self::encode_silence_if_needed`] each tick.
+    pub fn has_silent_fallback(&self) -> bool {
+        self.silence.is_some()
+    }
+
+    /// Tokio-interval period for the silence watchdog tick. `None`
+    /// unless `silent_fallback` is active.
+    pub fn silence_chunk_duration(&self) -> Option<std::time::Duration> {
+        self.silence.as_ref().map(|sg| sg.chunk_duration())
+    }
+
+    /// AudioSpecificConfig tuple `(profile, sr_index, ch_cfg)` for the
+    /// silent-fallback track, so the caller can eagerly build the
+    /// CMAF `AudioSegmenter` before any source audio arrives. `None`
+    /// unless `silent_fallback` is active OR the declared sample_rate
+    /// isn't a standard ADTS-indexed rate.
+    pub fn silent_fallback_track(&self) -> Option<(u8, u8, u8)> {
+        let sr = self.target_sample_rate.unwrap_or(48_000);
+        let ch = self.target_channels.unwrap_or(2);
+        let sr_idx = crate::engine::audio_decode::sr_index_from_hz(sr)?;
+        self.silence.as_ref()?;
+        Some((1, sr_idx, ch))
+    }
+
+    /// Produce zero or more silent AAC frames `(data, pts)` if the drop
+    /// watchdog says real audio is absent or stalled. Idempotent and
+    /// cheap when audio is flowing — returns an empty vec when
+    /// `silent_fallback` is off OR when real audio arrived within the
+    /// grace window. The PTS attached to each emitted frame is the
+    /// encoder's output PTS so segment-boundary math stays consistent
+    /// with the real-audio path.
+    pub fn encode_silence_if_needed(&mut self) -> Result<Vec<(Vec<u8>, u64)>> {
+        let Some(sg) = self.silence.as_mut() else {
+            return Ok(Vec::new());
+        };
+        if !sg.should_emit() {
+            return Ok(Vec::new());
+        }
+        let Some(enc) = self.encoder.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let (planar, gen_pts) = sg.next_chunk();
+        enc.submit_planar(planar, gen_pts);
+        let mut out = Vec::new();
+        while let Some(f) = enc.try_recv() {
+            out.push((f.data.to_vec(), f.pts));
+        }
+        Ok(out)
+    }
+
+    /// Reset the drop watchdog on a real source AAC frame so silence
+    /// goes quiet for the grace window after it.
+    pub fn mark_real_audio(&mut self, pts: u64) {
+        if let Some(sg) = self.silence.as_mut() {
+            sg.mark_real_audio(pts);
+        }
     }
 
     /// Encode one source AAC frame. Returns zero or more re-encoded
@@ -168,15 +269,14 @@ impl AudioReencoder {
 #[cfg(feature = "video-thumbnail")]
 pub struct VideoReencoder {
     decoder: Option<video_engine::VideoDecoder>,
-    encoder: Option<video_engine::VideoEncoder>,
-    target_codec: video_codec::VideoEncoderCodec,
-    target_bitrate_kbps: u32,
-    target_width: Option<u32>,
-    target_height: Option<u32>,
-    target_fps_num: Option<u32>,
-    target_fps_den: Option<u32>,
-    /// GoP size = fps × segment_duration_secs. Forced at encoder open.
-    target_gop_size: Option<u32>,
+    /// Shared encoder pipeline — wraps `VideoEncoder` + optional
+    /// `VideoScaler`. CMAF carries SPS/PPS inline on every IDR
+    /// (segments are self-contained for DASH/HLS tune-in) so the
+    /// pipeline is opened with `global_header = false`. When the
+    /// operator sets `video_encode.width` / `.height`, the scaler
+    /// Lanczos-resizes the decoded frame instead of letting libavcodec
+    /// silently crop.
+    pipeline: crate::engine::video_encode_util::ScaledVideoEncoder,
     /// Output_id for tracing.
     output_id: String,
     /// Annex-B scratch buffer reused across frames to avoid allocs.
@@ -207,16 +307,31 @@ impl VideoReencoder {
             "hevc_nvenc" => video_codec::VideoEncoderCodec::HevcNvenc,
             other => bail!("unknown video codec: {other}"),
         };
+        let (fps_num, fps_den) = match (cfg.fps_num, cfg.fps_den) {
+            (Some(n), Some(d)) => (n, d),
+            _ => (30, 1),
+        };
+        // CMAF-LL segments are self-contained (DASH/HLS tune-in); SPS/PPS
+        // rides in-band on every IDR, so `global_header = false`. GOP
+        // size defaults to 60 (2s at 30 fps) when the operator didn't
+        // pick one — the pipeline's `build_encoder_config` applies
+        // `2 * fps` by default, but CMAF segmenters are happier with a
+        // steady 60-frame GoP regardless of fps.
+        let mut pipeline_cfg = cfg.clone();
+        if pipeline_cfg.gop_size.is_none() {
+            pipeline_cfg.gop_size = Some(60);
+        }
+        let pipeline = crate::engine::video_encode_util::ScaledVideoEncoder::new(
+            pipeline_cfg,
+            target_codec,
+            fps_num,
+            fps_den,
+            false,
+            format!("CMAF output '{}'", output_id),
+        );
         Ok(Self {
             decoder: None,
-            encoder: None,
-            target_codec,
-            target_bitrate_kbps: cfg.bitrate_kbps.unwrap_or(5_000),
-            target_width: cfg.width,
-            target_height: cfg.height,
-            target_fps_num: cfg.fps_num,
-            target_fps_den: cfg.fps_den,
-            target_gop_size: cfg.gop_size,
+            pipeline,
             output_id: output_id.to_string(),
             annex_b_scratch: Vec::with_capacity(256 * 1024),
             source_codec: None,
@@ -266,37 +381,18 @@ impl VideoReencoder {
             Err(_e) => return Ok(None), // encoder buffered
         };
 
-        // Lazy-open encoder now that we know the source resolution.
-        if self.encoder.is_none() {
-            let w = self.target_width.unwrap_or(decoded.width());
-            let h = self.target_height.unwrap_or(decoded.height());
-            let enc_cfg = video_codec::VideoEncoderConfig {
-                codec: self.target_codec,
-                width: w,
-                height: h,
-                fps_num: self.target_fps_num.unwrap_or(30),
-                fps_den: self.target_fps_den.unwrap_or(1),
-                bitrate_kbps: self.target_bitrate_kbps,
-                gop_size: self.target_gop_size.unwrap_or(60),
-                global_header: false,
-                tune: "zerolatency".to_string(),
-                ..Default::default()
-            };
-            let enc = video_engine::VideoEncoder::open(&enc_cfg)
-                .map_err(|e| anyhow::anyhow!("VideoEncoder open failed: {e}"))?;
-            tracing::info!(
-                "CMAF output '{}': video re-encoder opened {}x{}@{}kbps",
-                self.output_id, w, h, self.target_bitrate_kbps
-            );
-            self.encoder = Some(enc);
-        }
-        let enc = self.encoder.as_mut().unwrap();
-        let (y, y_s, u, u_s, v, v_s) = decoded
-            .yuv_planes()
-            .ok_or_else(|| anyhow::anyhow!("decoded frame has no planar YUV"))?;
-        let encoded = enc
-            .encode_frame(y, y_s, u, u_s, v, v_s, Some(pts as i64))
+        let was_open = self.pipeline.is_open();
+        let encoded = self
+            .pipeline
+            .encode(&decoded, Some(pts as i64))
             .map_err(|e| anyhow::anyhow!("VideoEncoder encode_frame failed: {e}"))?;
+        if !was_open && self.pipeline.is_open() {
+            let (w, h) = self.pipeline.dst_dimensions();
+            tracing::info!(
+                "CMAF output '{}': video re-encoder opened {}x{}",
+                self.output_id, w, h,
+            );
+        }
         if encoded.is_empty() {
             return Ok(None);
         }
@@ -379,6 +475,62 @@ fn split_annex_b_to_nalus(data: &[u8], out: &mut Vec<Vec<u8>>) {
         if end > s {
             out.push(data[s..end].to_vec());
         }
+    }
+}
+
+#[cfg(test)]
+mod reencoder_tests {
+    use super::*;
+    use crate::config::models::AudioEncodeConfig;
+
+    fn ae(codec: &str, silent_fallback: bool) -> AudioEncodeConfig {
+        AudioEncodeConfig {
+            codec: codec.to_string(),
+            bitrate_kbps: None,
+            sample_rate: None,
+            channels: None,
+            silent_fallback,
+        }
+    }
+
+    #[test]
+    fn silent_fallback_off_defers_encoder() {
+        let cancel = CancellationToken::new();
+        let r = AudioReencoder::new(&ae("aac_lc", false), &cancel, "out1", "flow1").unwrap();
+        assert!(!r.has_silent_fallback());
+        assert!(r.silence_chunk_duration().is_none());
+        assert!(r.silent_fallback_track().is_none());
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(any(feature = "fdk-aac", feature = "video-thumbnail")),
+        ignore = "audio_encode requires an in-process encoder backend or ffmpeg in PATH"
+    )]
+    fn silent_fallback_on_builds_eager_encoder() {
+        let cancel = CancellationToken::new();
+        let r = AudioReencoder::new(&ae("aac_lc", true), &cancel, "out2", "flow2");
+        // Accept ffmpeg-missing as a skip when no in-process backend is
+        // compiled in — the edge surfaces the error at runtime.
+        let r = match r {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("ffmpeg") || msg.contains("FfmpegNotFound"),
+                    "unexpected silent-fallback spawn error: {msg}"
+                );
+                return;
+            }
+        };
+        assert!(r.has_silent_fallback());
+        assert_eq!(
+            r.silence_chunk_duration(),
+            Some(std::time::Duration::from_nanos(21_333_333))
+        );
+        let track = r.silent_fallback_track().expect("default sr has ADTS index");
+        // profile=1 (AAC-LC), sr_idx=3 (48000 Hz), ch_cfg=2.
+        assert_eq!(track, (1, 3, 2));
     }
 }
 

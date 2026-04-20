@@ -96,6 +96,7 @@ impl InputTranscoder {
         audio_encode: Option<&AudioEncodeConfig>,
         transcode: Option<&TranscodeJson>,
         video_encode: Option<&VideoEncodeConfig>,
+        force_idr: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Option<Self>, InputTranscoderError> {
         if audio_encode.is_none() && transcode.is_none() && video_encode.is_none() {
             return Ok(None);
@@ -106,7 +107,7 @@ impl InputTranscoder {
             None => None,
         };
         let video = match video_encode {
-            Some(ve) => Some(TsVideoReplacer::new(ve)?),
+            Some(ve) => Some(TsVideoReplacer::new(ve, force_idr)?),
             None => None,
         };
 
@@ -184,6 +185,16 @@ impl InputTranscoder {
     /// codec health.
     pub fn video_stats(&self) -> Option<Arc<VideoEncodeStats>> {
         self.video.as_ref().map(|v| v.stats_handle())
+    }
+
+    /// One-shot IDR request handle for the ingress video transcoder, if a
+    /// video stage is active. The input forwarder normally passes its
+    /// external flag into [`Self::new`] instead; this accessor is for
+    /// tests and diagnostic tooling. Returns `None` for passthrough
+    /// inputs (no video encoder).
+    #[allow(dead_code)]
+    pub fn force_idr_handle(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        self.video.as_ref().map(|v| v.force_idr_handle())
     }
 
     /// Whether the composer has an active audio-encode stage.
@@ -368,7 +379,7 @@ mod tests {
 
     #[test]
     fn empty_config_returns_none() {
-        let t = InputTranscoder::new(None, None, None).expect("construct");
+        let t = InputTranscoder::new(None, None, None, None).expect("construct");
         assert!(t.is_none(), "all-None config must be idle (no stage)");
     }
 
@@ -381,7 +392,7 @@ mod tests {
             sample_rate: Some(48_000),
             ..Default::default()
         };
-        let t = InputTranscoder::new(None, Some(&tj), None).expect("construct");
+        let t = InputTranscoder::new(None, Some(&tj), None, None).expect("construct");
         assert!(t.is_none());
     }
 
@@ -392,8 +403,9 @@ mod tests {
             bitrate_kbps: Some(128),
             sample_rate: None,
             channels: None,
+            silent_fallback: false,
         };
-        let mut t = InputTranscoder::new(Some(&ae), None, None)
+        let mut t = InputTranscoder::new(Some(&ae), None, None, None)
             .expect("construct")
             .expect("stage");
         // Non-aligned input is passed through verbatim by TsAudioReplacer.

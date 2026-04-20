@@ -31,7 +31,7 @@
 //! blocking-aware context (same contract as `TsAudioReplacer`) because
 //! the in-process codec calls take single-digit milliseconds per frame.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::config::models::VideoEncodeConfig;
@@ -107,27 +107,48 @@ pub struct TsVideoReplacer {
     /// Shared atomic counters surfaced via [`Self::stats_handle`] so the
     /// per-output stats accumulator can register them at startup.
     stats: Arc<VideoEncodeStats>,
+    /// One-shot IDR request for the next encoded frame. External callers
+    /// (e.g. the input forwarder on a flow switch) flip this to `true`;
+    /// the replacer consumes and clears it before the next encode call.
+    /// The inner `Inner` holds a clone of this same `Arc`; this field is
+    /// only kept so [`Self::force_idr_handle`] can hand it back out.
+    #[allow(dead_code)]
+    force_idr_on_next_frame: Arc<AtomicBool>,
 }
 
 impl TsVideoReplacer {
     /// Build a new replacer from a `video_encode` block. Codec state is
     /// opened lazily on the first decoded frame.
+    ///
+    /// `force_idr`, when `Some`, is an externally-owned one-shot flag that
+    /// lets upstream logic (e.g. the input forwarder on flow switch) ask
+    /// the encoder to emit an IDR on its next frame. When `None`, the
+    /// replacer allocates its own handle — useful for output-side callers
+    /// that don't need external keyframe control.
     #[cfg(feature = "video-thumbnail")]
-    pub fn new(cfg: &VideoEncodeConfig) -> Result<Self, TsVideoReplaceError> {
+    pub fn new(
+        cfg: &VideoEncodeConfig,
+        force_idr: Option<Arc<AtomicBool>>,
+    ) -> Result<Self, TsVideoReplaceError> {
         let stats = Arc::new(VideoEncodeStats::default());
-        let inner = inner::Inner::from_config(cfg, stats.clone())?;
+        let force_idr = force_idr.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        let inner = inner::Inner::from_config(cfg, stats.clone(), force_idr.clone())?;
         let description = inner.target_description();
         Ok(Self {
             inner,
             description,
             stats,
+            force_idr_on_next_frame: force_idr,
         })
     }
 
     /// Stub constructor when `video-thumbnail` is compiled out — returns
     /// `VideoEngineMissing` so callers fail cleanly at output startup.
     #[cfg(not(feature = "video-thumbnail"))]
-    pub fn new(_cfg: &VideoEncodeConfig) -> Result<Self, TsVideoReplaceError> {
+    pub fn new(
+        _cfg: &VideoEncodeConfig,
+        _force_idr: Option<Arc<AtomicBool>>,
+    ) -> Result<Self, TsVideoReplaceError> {
         Err(TsVideoReplaceError::VideoEngineMissing)
     }
 
@@ -141,6 +162,19 @@ impl TsVideoReplacer {
     /// at output startup.
     pub fn stats_handle(&self) -> Arc<VideoEncodeStats> {
         self.stats.clone()
+    }
+
+    /// Shared handle to the one-shot IDR request flag. Setting this to
+    /// `true` causes the replacer's next encoded frame to be an IDR. The
+    /// flag is consumed (cleared) by the replacer once honoured, so rapid
+    /// repeated sets simply collapse into a single keyframe.
+    ///
+    /// Input-side callers normally pass their external flag into
+    /// [`Self::new`] instead; this accessor exists so output-side callers
+    /// (or tests) can retrieve the internally-created handle.
+    #[allow(dead_code)]
+    pub fn force_idr_handle(&self) -> Arc<AtomicBool> {
+        self.force_idr_on_next_frame.clone()
     }
 
     /// Feed one chunk of 188-byte-aligned TS into the replacer. Output
@@ -173,23 +207,15 @@ impl TsVideoReplacer {
 #[cfg(feature = "video-thumbnail")]
 mod inner {
     use super::*;
+    use crate::engine::video_encode_util::ScaledVideoEncoder;
     use video_codec::{VideoCodec, VideoEncoderCodec};
-    use video_engine::{VideoDecoder, VideoEncoder};
+    use video_engine::VideoDecoder;
 
     pub struct Inner {
-        backend: VideoEncoderCodec,
         #[allow(dead_code)]
         target_family: VideoCodec,
-        requested_width: Option<u32>,
-        requested_height: Option<u32>,
         fps_num: Option<u32>,
         fps_den: Option<u32>,
-        /// Full `video_encode` config — threaded to
-        /// `video_encode_util::build_encoder_config` when the encoder is
-        /// opened on the first decoded frame, covering bitrate / gop /
-        /// preset / profile plus advanced knobs (chroma / bit_depth /
-        /// RC / CRF / bframes / refs / level / tune / colour metadata).
-        encode_cfg: VideoEncodeConfig,
 
         pmt_pid: Option<u16>,
         video_pid: Option<u16>,
@@ -201,7 +227,12 @@ mod inner {
         pending_pts: Option<u64>,
 
         decoder: Option<VideoDecoder>,
-        encoder: Option<VideoEncoder>,
+        /// Shared encoder pipeline — wraps `VideoEncoder` + optional
+        /// `VideoScaler`. Lazy-opens on the first decoded frame and
+        /// handles the `video_encode.width` / `.height` override by
+        /// scaling the decoded frame to the target resolution instead
+        /// of letting libavcodec silently crop.
+        pipeline: ScaledVideoEncoder,
 
         out_video_cc: u8,
         /// PTS anchor in the encoder time base (1 / fps_num).
@@ -214,12 +245,14 @@ mod inner {
 
         description: String,
         stats: Arc<VideoEncodeStats>,
+        force_idr: Arc<AtomicBool>,
     }
 
     impl Inner {
         pub fn from_config(
             cfg: &VideoEncodeConfig,
             stats: Arc<VideoEncodeStats>,
+            force_idr: Arc<AtomicBool>,
         ) -> Result<Self, TsVideoReplaceError> {
             let backend = parse_codec(&cfg.codec)?;
             let target_family = backend.family();
@@ -231,14 +264,27 @@ mod inner {
                 cfg.bitrate_kbps.unwrap_or(4000),
             );
 
-            Ok(Self {
+            // Default to 30 fps at open-time — the pipeline will use the
+            // operator's fps_num/fps_den when set, otherwise it picks
+            // 30/1 at first-frame lazy-open. MPEG-TS outputs emit
+            // SPS/PPS in-band on every IDR (global_header = false).
+            let (fps_num, fps_den) = match (cfg.fps_num, cfg.fps_den) {
+                (Some(n), Some(d)) => (n, d),
+                _ => (30, 1),
+            };
+            let pipeline = ScaledVideoEncoder::new(
+                cfg.clone(),
                 backend,
+                fps_num,
+                fps_den,
+                false,
+                "ts_video_replace",
+            );
+
+            Ok(Self {
                 target_family,
-                requested_width: cfg.width,
-                requested_height: cfg.height,
                 fps_num: cfg.fps_num,
                 fps_den: cfg.fps_den,
-                encode_cfg: cfg.clone(),
                 pmt_pid: None,
                 video_pid: None,
                 source_stream_type: 0,
@@ -247,7 +293,7 @@ mod inner {
                 pes_started: false,
                 pending_pts: None,
                 decoder: None,
-                encoder: None,
+                pipeline,
                 out_video_cc: 0,
                 out_frame_count: 0,
                 pts_90k: 0,
@@ -255,11 +301,34 @@ mod inner {
                 pts_step_90k: 3000, // 30 fps default until we learn otherwise
                 description,
                 stats,
+                force_idr,
             })
         }
 
         pub fn target_description(&self) -> String {
             self.description.clone()
+        }
+
+        /// Drop decoder / PES / PTS state that is tied to the current
+        /// source stream. Called when the source codec or video PID
+        /// changes mid-flow (seamless input switching between inputs
+        /// with different codecs, or a PAT/PMT program re-layout).
+        ///
+        /// The encoder pipeline is intentionally *not* reset — it targets
+        /// the output's configured codec, which never changes.
+        fn reset_source_state(&mut self, reason: &str) {
+            tracing::info!("ts_video_replace: {reason}; reopening decoder");
+            self.pes_buffer.clear();
+            self.pes_started = false;
+            self.pending_pts = None;
+            self.decoder = None;
+            // Re-anchor PTS to the new input's first frame so downstream
+            // A/V stays in sync with the audio replacer (which will also
+            // re-anchor on the audio-PID codec swap).
+            self.pts_anchored = false;
+            // First post-switch encoded frame must be an IDR so receivers
+            // get a clean entry point right at the switch boundary.
+            self.force_idr.store(true, Ordering::Relaxed);
         }
 
         pub fn process(&mut self, input_ts: &[u8], output: &mut Vec<u8>) {
@@ -283,21 +352,40 @@ mod inner {
 
                 let pid = ts_pid(pkt);
 
-                if pid == PAT_PID && ts_pusi(pkt) && self.pmt_pid.is_none() {
+                if pid == PAT_PID && ts_pusi(pkt) {
                     let mut programs = parse_pat_programs(pkt);
                     if !programs.is_empty() {
                         programs.sort_by_key(|(num, _)| *num);
-                        self.pmt_pid = Some(programs[0].1);
+                        let new_pmt_pid = programs[0].1;
+                        if self.pmt_pid != Some(new_pmt_pid) {
+                            if self.pmt_pid.is_some() {
+                                // Input switched and chose a different PMT
+                                // PID — anything cached about the old
+                                // program is stale.
+                                self.video_pid = None;
+                                self.source_stream_type = 0;
+                                self.reset_source_state("PMT PID changed");
+                            }
+                            self.pmt_pid = Some(new_pmt_pid);
+                        }
                     }
                 }
 
                 if let Some(pmt_pid) = self.pmt_pid {
                     if pid == pmt_pid && ts_pusi(pkt) {
-                        if self.video_pid.is_none() {
-                            if let Some((vpid, vst)) = parse_pmt_video(pkt) {
-                                self.video_pid = Some(vpid);
-                                self.source_stream_type = vst;
+                        if let Some((vpid, vst)) = parse_pmt_video(pkt) {
+                            let codec_changed =
+                                self.source_stream_type != 0 && self.source_stream_type != vst;
+                            let pid_changed =
+                                self.video_pid.is_some() && self.video_pid != Some(vpid);
+                            if codec_changed || pid_changed {
+                                self.reset_source_state(&format!(
+                                    "source changed: stream_type {:#04x} -> {:#04x}, pid {:?} -> {}",
+                                    self.source_stream_type, vst, self.video_pid, vpid
+                                ));
                             }
+                            self.video_pid = Some(vpid);
+                            self.source_stream_type = vst;
                         }
                         // Only rewrite the PMT when the target codec family
                         // differs from the source. Same-family transcodes
@@ -335,8 +423,8 @@ mod inner {
                 let _ = self.consume_pes(&pes, output);
                 self.pes_started = false;
             }
-            if let Some(enc) = self.encoder.as_mut() {
-                if let Ok(frames) = enc.flush() {
+            if self.pipeline.is_open() {
+                if let Ok(frames) = self.pipeline.flush() {
                     let vpid = match self.video_pid {
                         Some(p) => p,
                         None => return,
@@ -422,72 +510,46 @@ mod inner {
             }
 
             // Drain every frame the decoder can produce right now.
+            // Refresh the 90 kHz PTS step on every loop iteration — the
+            // pipeline's lazy-open caches the fps it was constructed
+            // with, but we re-derive the step here once we know we're
+            // about to emit output.
+            let (fps_num, fps_den) = match (self.fps_num, self.fps_den) {
+                (Some(n), Some(d)) => (n, d),
+                _ => (30, 1),
+            };
+            self.pts_step_90k = (90_000u64 * fps_den as u64) / fps_num.max(1) as u64;
+
             loop {
                 let frame = match self.decoder.as_mut().unwrap().receive_frame() {
                     Ok(f) => f,
                     Err(_) => break,
                 };
 
-                if self.encoder.is_none() {
-                    let src_w = frame.width();
-                    let src_h = frame.height();
-                    if let (Some(rw), Some(rh)) =
-                        (self.requested_width, self.requested_height)
-                    {
-                        if rw != src_w || rh != src_h {
-                            tracing::warn!(
-                                "ts_video_replace: resolution change {}x{} -> {}x{} requested \
-                                 but scaling is not implemented yet; using source resolution",
-                                src_w, src_h, rw, rh
-                            );
-                        }
-                    }
-                    let (fps_num, fps_den) = match (self.fps_num, self.fps_den) {
-                        (Some(n), Some(d)) => (n, d),
-                        _ => (30, 1),
-                    };
-                    self.pts_step_90k =
-                        (90_000u64 * fps_den as u64) / fps_num.max(1) as u64;
+                // One-shot IDR request (forwarder signals on flow switch).
+                // Consume the flag here so the keyframe lands on the very
+                // first post-switch frame, not somewhere later in the GOP.
+                // This is a no-op until the encoder lazy-opens inside
+                // `pipeline.encode` below, but that's fine — the first
+                // frame after a switch is always an IDR anyway (decoder
+                // needs it to resync).
+                let force_idr_now = self.force_idr.swap(false, Ordering::Relaxed);
+                if force_idr_now {
+                    self.pipeline.force_next_keyframe();
+                }
 
-                    // Emit SPS/PPS inline in the bitstream (in-band) — MPEG-TS
-                    // has no out-of-band codec config channel, so every IDR
-                    // must carry SPS/PPS so mid-stream tune-ins can decode.
-                    let enc_cfg = crate::engine::video_encode_util::build_encoder_config(
-                        &self.encode_cfg,
-                        self.backend,
-                        src_w,
-                        src_h,
-                        fps_num,
-                        fps_den,
-                        false,
-                    );
-                    match VideoEncoder::open(&enc_cfg) {
-                        Ok(e) => self.encoder = Some(e),
-                        Err(e) => {
+                let encoded = match self.pipeline.encode(&frame, Some(self.out_frame_count)) {
+                    Ok(frames) => frames,
+                    Err(e) => {
+                        // `encoder_open_failed` is the only terminal
+                        // error shape; any per-frame encode error is
+                        // logged as a dropped frame and we keep going.
+                        if !self.pipeline.is_open() {
                             tracing::error!(
                                 "ts_video_replace: failed to open encoder: {e}"
                             );
                             return Err(());
                         }
-                    }
-                }
-
-                // Pull the three YUV planes straight out of the decoded
-                // frame. Non-planar pixel formats (unlikely for broadcast
-                // H.264/HEVC) are skipped.
-                let (y_data, y_stride, u_data, u_stride, v_data, v_stride) =
-                    match frame.yuv_planes() {
-                        Some(p) => p,
-                        None => continue,
-                    };
-
-                let enc = self.encoder.as_mut().unwrap();
-                let encoded = match enc.encode_frame(
-                    y_data, y_stride, u_data, u_stride, v_data, v_stride,
-                    Some(self.out_frame_count),
-                ) {
-                    Ok(frames) => frames,
-                    Err(e) => {
                         tracing::debug!("ts_video_replace: encode error: {e}");
                         self.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
                         continue;
@@ -766,20 +828,20 @@ mod tests {
 
     #[test]
     fn rejects_unknown_codec() {
-        assert!(TsVideoReplacer::new(&cfg("vp9")).is_err());
+        assert!(TsVideoReplacer::new(&cfg("vp9"), None).is_err());
     }
 
     #[test]
     fn accepts_x264_and_x265_and_nvenc() {
-        assert!(TsVideoReplacer::new(&cfg("x264")).is_ok());
-        assert!(TsVideoReplacer::new(&cfg("x265")).is_ok());
-        assert!(TsVideoReplacer::new(&cfg("h264_nvenc")).is_ok());
-        assert!(TsVideoReplacer::new(&cfg("hevc_nvenc")).is_ok());
+        assert!(TsVideoReplacer::new(&cfg("x264"), None).is_ok());
+        assert!(TsVideoReplacer::new(&cfg("x265"), None).is_ok());
+        assert!(TsVideoReplacer::new(&cfg("h264_nvenc"), None).is_ok());
+        assert!(TsVideoReplacer::new(&cfg("hevc_nvenc"), None).is_ok());
     }
 
     #[test]
     fn process_empty_input_is_noop() {
-        let mut r = TsVideoReplacer::new(&cfg("x264")).unwrap();
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
         let mut out = Vec::new();
         r.process(&[], &mut out);
         assert!(out.is_empty());
@@ -787,7 +849,7 @@ mod tests {
 
     #[test]
     fn process_misaligned_input_is_passthrough() {
-        let mut r = TsVideoReplacer::new(&cfg("x264")).unwrap();
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
         let mut out = Vec::new();
         let input = vec![0u8; 100];
         r.process(&input, &mut out);
@@ -796,7 +858,7 @@ mod tests {
 
     #[test]
     fn process_unknown_pid_passes_through_verbatim() {
-        let mut r = TsVideoReplacer::new(&cfg("x264")).unwrap();
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
         let mut pkt = [0xFFu8; 188];
         pkt[0] = TS_SYNC_BYTE;
         pkt[1] = 0x1F;
@@ -806,6 +868,165 @@ mod tests {
         let mut out = Vec::new();
         r.process(&pkt, &mut out);
         assert_eq!(&out[..], &pkt[..]);
+    }
+
+    /// Build a single-PAT-section TS packet pointing at one program
+    /// whose PMT lives at `pmt_pid`.
+    fn synth_pat(pmt_pid: u16) -> [u8; 188] {
+        let mut pkt = [0xFFu8; 188];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = 0x40; // PUSI=1, pid high bits = 0 (PAT_PID = 0)
+        pkt[2] = 0x00;
+        pkt[3] = 0x10; // payload only, CC=0
+        pkt[4] = 0x00; // pointer field
+        let s = 5;
+        pkt[s] = 0x00; // table_id = PAT
+        // section_length counts transport_stream_id(2) + version/cur(1) +
+        // section#(1) + last#(1) + one program entry(4) + CRC(4) = 13.
+        let section_length: u16 = 13;
+        pkt[s + 1] = 0xB0 | ((section_length >> 8) as u8 & 0x0F);
+        pkt[s + 2] = section_length as u8;
+        pkt[s + 3] = 0x00; // transport_stream_id hi
+        pkt[s + 4] = 0x01; // transport_stream_id lo
+        pkt[s + 5] = 0xC1; // reserved + version=0 + current=1
+        pkt[s + 6] = 0x00; // section#
+        pkt[s + 7] = 0x00; // last_section#
+        // one program entry: program_number=1, pmt_pid
+        pkt[s + 8] = 0x00;
+        pkt[s + 9] = 0x01;
+        pkt[s + 10] = 0xE0 | ((pmt_pid >> 8) as u8 & 0x1F);
+        pkt[s + 11] = pmt_pid as u8;
+        let crc = mpeg2_crc32(&pkt[s..s + 12]);
+        pkt[s + 12] = (crc >> 24) as u8;
+        pkt[s + 13] = (crc >> 16) as u8;
+        pkt[s + 14] = (crc >> 8) as u8;
+        pkt[s + 15] = crc as u8;
+        pkt
+    }
+
+    /// Build a minimal PMT TS packet with exactly one video ES entry.
+    fn synth_pmt(pmt_pid: u16, video_pid: u16, stream_type: u8) -> [u8; 188] {
+        let mut pkt = [0xFFu8; 188];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = 0x40 | ((pmt_pid >> 8) as u8 & 0x1F); // PUSI=1
+        pkt[2] = pmt_pid as u8;
+        pkt[3] = 0x10; // payload only, CC=0
+        pkt[4] = 0x00; // pointer field
+        let s = 5;
+        pkt[s] = 0x02; // table_id = PMT
+        // program_number(2) + vsn/cur(1) + sec#(1) + last#(1) + PCR_PID(2) + prog_info_len(2)
+        //   + ES: stream_type(1) + es_pid(2) + es_info_len(2) + CRC(4) = 18
+        let section_length: u16 = 18;
+        pkt[s + 1] = 0xB0 | ((section_length >> 8) as u8 & 0x0F);
+        pkt[s + 2] = section_length as u8;
+        pkt[s + 3] = 0x00; // program_number hi
+        pkt[s + 4] = 0x01; // program_number lo
+        pkt[s + 5] = 0xC1; // reserved + version + current
+        pkt[s + 6] = 0x00; // section#
+        pkt[s + 7] = 0x00; // last_section#
+        pkt[s + 8] = 0xE0 | ((video_pid >> 8) as u8 & 0x1F); // PCR_PID hi
+        pkt[s + 9] = video_pid as u8; // PCR_PID lo
+        pkt[s + 10] = 0xF0; // program_info_length hi (0)
+        pkt[s + 11] = 0x00;
+        pkt[s + 12] = stream_type;
+        pkt[s + 13] = 0xE0 | ((video_pid >> 8) as u8 & 0x1F);
+        pkt[s + 14] = video_pid as u8;
+        pkt[s + 15] = 0xF0; // es_info_length hi (0)
+        pkt[s + 16] = 0x00;
+        let crc = mpeg2_crc32(&pkt[s..s + 17]);
+        pkt[s + 17] = (crc >> 24) as u8;
+        pkt[s + 18] = (crc >> 16) as u8;
+        pkt[s + 19] = (crc >> 8) as u8;
+        pkt[s + 20] = crc as u8;
+        pkt
+    }
+
+    /// Confirms that our PMT synthesizer produces a packet
+    /// `parse_pmt_video` agrees with, so the codec-change test below
+    /// isn't observing parser failure instead of real behaviour.
+    #[test]
+    fn synth_pmt_round_trips_through_parser() {
+        let pkt = synth_pmt(0x1000, 0x0100, 0x1B);
+        assert_eq!(parse_pmt_video(&pkt), Some((0x0100, 0x1B)));
+        let pkt2 = synth_pmt(0x1000, 0x0100, 0x24);
+        assert_eq!(parse_pmt_video(&pkt2), Some((0x0100, 0x24)));
+    }
+
+    /// Confirms that our PAT synthesizer produces a packet
+    /// `parse_pat_programs` agrees with.
+    #[test]
+    fn synth_pat_round_trips_through_parser() {
+        let pkt = synth_pat(0x1000);
+        assert_eq!(parse_pat_programs(&pkt), vec![(1u16, 0x1000u16)]);
+    }
+
+    /// Seamless input switching between inputs with different video
+    /// codecs (H.264 → HEVC) must force the replacer's next encoded
+    /// frame to be an IDR. Before this fix the replacer ignored the
+    /// new PMT, kept its H.264 decoder, and silently dropped every
+    /// post-switch frame.
+    #[test]
+    fn codec_change_on_pmt_update_raises_force_idr() {
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        let force_idr = r.force_idr_handle();
+
+        // Initial program: H.264 (stream_type 0x1B).
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        r.process(&synth_pmt(0x1000, 0x0100, 0x1B), &mut out);
+        assert!(
+            !force_idr.load(Ordering::Relaxed),
+            "first PMT must not trigger a forced IDR"
+        );
+
+        // Input switch: same PMT PID and video PID, but the new input
+        // is HEVC (stream_type 0x24). This is exactly the scenario in
+        // the user report.
+        r.process(&synth_pmt(0x1000, 0x0100, 0x24), &mut out);
+        assert!(
+            force_idr.load(Ordering::Relaxed),
+            "codec change must force an IDR on the next encoded frame"
+        );
+    }
+
+    /// A PAT that moves the PMT PID (different program layout on the
+    /// new input) must also trigger the reset path, so we re-learn
+    /// everything downstream.
+    #[test]
+    fn pmt_pid_change_on_pat_update_raises_force_idr() {
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        let force_idr = r.force_idr_handle();
+
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        r.process(&synth_pmt(0x1000, 0x0100, 0x1B), &mut out);
+        assert!(!force_idr.load(Ordering::Relaxed));
+
+        // New input exposes the PMT at a different PID.
+        r.process(&synth_pat(0x1001), &mut out);
+        assert!(
+            force_idr.load(Ordering::Relaxed),
+            "PMT PID change must force an IDR on the next encoded frame"
+        );
+    }
+
+    /// Same codec, same PID → no reset. Guards against a regression
+    /// where every PMT packet (many per second) would flip force_idr
+    /// and turn every frame into an IDR.
+    #[test]
+    fn repeated_unchanged_pmt_does_not_raise_force_idr() {
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        let force_idr = r.force_idr_handle();
+
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        r.process(&synth_pmt(0x1000, 0x0100, 0x1B), &mut out);
+        r.process(&synth_pmt(0x1000, 0x0100, 0x1B), &mut out);
+        r.process(&synth_pmt(0x1000, 0x0100, 0x1B), &mut out);
+        assert!(
+            !force_idr.load(Ordering::Relaxed),
+            "unchanged PMT must not trigger IDR requests"
+        );
     }
 
     #[test]

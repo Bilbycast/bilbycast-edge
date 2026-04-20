@@ -2466,6 +2466,24 @@ pub struct AudioEncodeConfig {
     /// audio channel count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channels: Option<u8>,
+    /// If true, inject a continuous zero-filled (silent) PCM track into
+    /// the encoder whenever the upstream source has no audio PID, or
+    /// stops delivering audio mid-stream (watchdog, see
+    /// `engine::audio_silence`). Default false preserves legacy behaviour
+    /// (no audio → no encoder, no audio tags emitted).
+    ///
+    /// Silent fallback guarantees the container always carries a valid,
+    /// continuous audio track. This is required by ingest services like
+    /// Twitch / YouTube that gate their live-preview thumbnailer on the
+    /// presence of audio, and by low-latency distribution formats
+    /// (WebRTC / CMAF-LL) whose segmenters expect monotonic audio
+    /// timestamps per segment.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub silent_fallback: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// SMPTE 2022-1 FEC parameters

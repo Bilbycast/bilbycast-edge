@@ -1447,6 +1447,7 @@ mod tests {
             bitrate_kbps: None,
             sample_rate: None,
             channels: None,
+            silent_fallback: false,
         }
     }
 

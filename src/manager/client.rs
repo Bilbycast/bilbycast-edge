@@ -1240,7 +1240,7 @@ async fn execute_command(
         }
         "update_input" => {
             let input_id = action["input_id"].as_str().ok_or("Missing input_id")?;
-            let input: InputDefinition = serde_json::from_value(action["input"].clone())
+            let mut input: InputDefinition = serde_json::from_value(action["input"].clone())
                 .map_err(|e| format!("Invalid input config: {e}"))?;
             validate_input_definition(&input).map_err(|e| format!("Invalid input: {e}"))?;
             tracing::info!("Manager command: update input '{input_id}'");
@@ -1248,37 +1248,19 @@ async fn execute_command(
             let idx = cfg.inputs.iter().position(|i| i.id == input_id)
                 .ok_or_else(|| format!("Input '{input_id}' not found"))?;
             let old = cfg.inputs[idx].clone();
+            // Activation is owned by the `activate_input` command. Edits to
+            // an input's config must never change its active state.
+            input.active = old.active;
             let config_or_meta_changed =
                 old.config != input.config || old.name != input.name || old.group != input.group;
-            let becoming_active = input.active && !old.active;
             cfg.inputs[idx] = input.clone();
-            // Cascade: if this input is becoming active, passivate siblings.
-            if becoming_active {
-                if let Some(flow) = cfg.flow_using_input(input_id).cloned() {
-                    let member_ids: Vec<String> = flow.input_ids.clone();
-                    for def in cfg.inputs.iter_mut() {
-                        if def.id != input_id && member_ids.contains(&def.id) && def.active {
-                            def.active = false;
-                        }
-                    }
-                }
-            }
             if let Some(flow) = cfg.flow_using_input(input_id).cloned() {
-                if flow.enabled && flow_manager.is_running(&flow.id) {
-                    if config_or_meta_changed {
-                        // Full restart when the input's protocol config
-                        // changed — cheap active-flip path only applies to
-                        // pure active-state toggles.
-                        let _ = flow_manager.destroy_flow(&flow.id).await;
-                        if let Ok(resolved) = cfg.resolve_flow(&flow) {
-                            match flow_manager.create_flow(resolved).await {
-                                Ok(_) => tracing::info!("Restarted flow '{}' after input update", flow.id),
-                                Err(e) => tracing::error!("Failed to restart flow '{}': {e}", flow.id),
-                            }
-                        }
-                    } else if becoming_active {
-                        if let Err(e) = flow_manager.switch_active_input(&flow.id, input_id).await {
-                            tracing::warn!("switch_active_input failed for '{}': {e}", flow.id);
+                if flow.enabled && flow_manager.is_running(&flow.id) && config_or_meta_changed {
+                    let _ = flow_manager.destroy_flow(&flow.id).await;
+                    if let Ok(resolved) = cfg.resolve_flow(&flow) {
+                        match flow_manager.create_flow(resolved).await {
+                            Ok(_) => tracing::info!("Restarted flow '{}' after input update", flow.id),
+                            Err(e) => tracing::error!("Failed to restart flow '{}': {e}", flow.id),
                         }
                     }
                 }

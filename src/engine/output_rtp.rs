@@ -229,7 +229,7 @@ async fn rtp_output_loop(
 
     // Optional video ES replacement.
     let mut video_replacer = match config.video_encode.as_ref() {
-        Some(enc) => match TsVideoReplacer::new(enc) {
+        Some(enc) => match TsVideoReplacer::new(enc, None) {
             Ok(r) => {
                 let backend = match enc.codec.as_str() {
                     "x264" | "x265" => enc.codec.clone(),

@@ -63,6 +63,26 @@ pub struct FlowStats {
     /// ST 2110 flow group. Reserved for the flow-group runtime in step 5/6.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub essence_flows: Option<Vec<EssenceFlowStats>>,
+    /// Per-input liveness snapshot. One entry per input configured on the
+    /// flow — lets the manager UI render per-input "NO SIGNAL" / feed-present
+    /// state for every input, including passive / non-switched inputs. Absent
+    /// on flows without registered inputs so old manager builds see an
+    /// unchanged JSON shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs_live: Option<Vec<PerInputLive>>,
+}
+
+/// Liveness snapshot for a single input leg within a flow. Shipped inside
+/// `FlowStats.inputs_live`; carries just enough state for the manager UI to
+/// decide between NO SIGNAL, IDLE, and RECEIVING for every configured input.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PerInputLive {
+    pub input_id: String,
+    pub input_type: String,
+    pub state: String,
+    pub packets_received: u64,
+    pub bytes_received: u64,
+    pub bitrate_bps: u64,
 }
 
 /// PTP state snapshot reported up to the manager.

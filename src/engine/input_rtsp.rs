@@ -36,6 +36,7 @@ pub fn spawn_rtsp_input(
     event_sender: EventSender,
     flow_id: String,
     input_id: String,
+    force_idr: Arc<std::sync::atomic::AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         tracing::info!("RTSP input started, connecting to {}", config.rtsp_url);
@@ -43,6 +44,7 @@ pub fn spawn_rtsp_input(
             config.audio_encode.as_ref(),
             config.transcode.as_ref(),
             config.video_encode.as_ref(),
+            Some(force_idr.clone()),
         ) {
             Ok(t) => {
                 if let Some(ref t) = t {

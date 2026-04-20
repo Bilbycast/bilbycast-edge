@@ -184,6 +184,27 @@ pub fn sample_rate_from_index(idx: u8) -> Option<u32> {
     SAMPLE_RATE_TABLE.get(idx as usize).copied()
 }
 
+/// Inverse of [`sample_rate_from_index`]: map an ADTS-known sample rate
+/// (Hz) back to its 4-bit index. Returns `None` for non-standard rates.
+pub fn sr_index_from_hz(hz: u32) -> Option<u8> {
+    Some(match hz {
+        96_000 => 0,
+        88_200 => 1,
+        64_000 => 2,
+        48_000 => 3,
+        44_100 => 4,
+        32_000 => 5,
+        24_000 => 6,
+        22_050 => 7,
+        16_000 => 8,
+        12_000 => 9,
+        11_025 => 10,
+        8_000 => 11,
+        7_350 => 12,
+        _ => return None,
+    })
+}
+
 /// Returns `true` if the given input type is one that can carry MPEG-TS
 /// (and therefore potentially AAC audio that we need to decode for PCM
 /// outputs).

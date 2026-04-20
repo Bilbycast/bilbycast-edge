@@ -2346,10 +2346,16 @@ mod tests {
             bytes
         });
 
-        // Writer: 1 second of stereo s32 PCM (a 1kHz tone), paced at real
-        // time so ffmpeg's encoder sees a normal data rate. The encoder's
-        // internal output buffer is flushed when it has enough material;
-        // a real-time pace avoids confusing it with a 10 ms burst.
+        // Writer: up to 1 second of stereo s32 PCM (a 1kHz tone), paced
+        // at real time so ffmpeg's encoder sees a normal data rate.
+        //
+        // Once the reader has collected enough ADTS bytes (64+) it
+        // breaks out early and stops draining ffmpeg's stdout. With
+        // stdout backpressured, ffmpeg eventually exits — at which
+        // point writes to stdin return `BrokenPipe`. That's a **normal
+        // end condition** for this test (we've already proven ADTS
+        // comes out); treat any write error as a graceful stop rather
+        // than a panic.
         for i in 0..50 {
             let mut chunk = Vec::with_capacity(1024 * 2 * 4);
             for n in 0..1024 {
@@ -2358,8 +2364,12 @@ mod tests {
                 chunk.extend_from_slice(&v.to_le_bytes());
                 chunk.extend_from_slice(&v.to_le_bytes());
             }
-            stdin.write_all(&chunk).await.unwrap();
-            stdin.flush().await.unwrap();
+            if stdin.write_all(&chunk).await.is_err() {
+                break;
+            }
+            if stdin.flush().await.is_err() {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         // Drop stdin so ffmpeg can flush its encoder buffer and exit. The

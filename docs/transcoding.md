@@ -105,6 +105,40 @@ returns `PcmInputError::AudioEncodeNotYetImplemented` — the input task
 logs a clear warning and falls back to passthrough so the flow still
 runs.
 
+### Force-IDR on input switch (multi-input flows)
+
+When a multi-input flow switches to an input that has `video_encode`
+(ingress transcoding), the switch forwarder sets a one-shot
+`Arc<AtomicBool>` that the target input's `TsVideoReplacer` consumes
+before its next `VideoEncoder::encode_frame` call. The replacer then
+sets `AVFrame.pict_type = AV_PICTURE_TYPE_I`, which libx264 / libx265 /
+NVENC all honour by emitting an IDR for that frame.
+
+Without this hook, downstream decoders had to wait for the next natural
+keyframe from the ingress re-encoder, which at the default
+`gop_size = 2 × fps` cadence is up to 2 s at 30 fps. With the hook,
+the first post-switch frame is always an IDR, and visible switch
+latency at the receiver is one to two frames — indistinguishable from
+a passthrough input.
+
+Inputs with no `video_encode` (passthrough) have no encoder to signal;
+their keyframe cadence is whatever the upstream source chose, and the
+existing CC-jump + PSI-injection mechanisms handle those switches.
+Rapid back-and-forth switching collapses into at most one IDR per
+switch event — the flag is consumed on the next encoded frame and
+cleared, so repeated sets over a single frame interval don't cause a
+bitrate spike.
+
+Wiring:
+
+- `video-engine::VideoEncoder::force_next_keyframe()` — arms the flag
+  on the encoder; consumed inside `encode_frame`.
+- `engine::ts_video_replace::TsVideoReplacer::new(cfg, force_idr)` —
+  optionally accepts an externally-owned `Arc<AtomicBool>` so the
+  forwarder and the replacer share the same trigger.
+- `engine::flow::spawn_input_forwarder` — sets the flag on the
+  passive → active edge in the watch-channel observer loop.
+
 ---
 
 ## `audio_encode` — compressed-audio re-encoding
@@ -119,11 +153,43 @@ video and other PIDs pass through unchanged.
 ```jsonc
 "audio_encode": {
   "codec": "aac_lc" | "he_aac_v1" | "he_aac_v2" | "opus" | "mp2" | "ac3",
-  "bitrate_kbps": 128,   // optional; per-codec default
-  "sample_rate":  48000, // optional; defaults to source
-  "channels":     2      // optional; defaults to source
+  "bitrate_kbps": 128,       // optional; per-codec default
+  "sample_rate":  48000,     // optional; defaults to source
+  "channels":     2,         // optional; defaults to source
+  "silent_fallback": false   // optional; RTMP / WebRTC / CMAF only
 }
 ```
+
+### `silent_fallback`
+
+When `true`, the edge injects a zero-filled (silent) PCM track into the
+encoder whenever the upstream source has no audio PID, or stops
+delivering audio mid-stream (500 ms grace window). Guarantees the
+output container always carries a valid, continuous audio track.
+
+Required whenever:
+
+- Pushing a **video-only source** (IP cameras, drones, slide feeds) to
+  Twitch / YouTube / Facebook RTMP — their live-preview thumbnailer
+  gates on audio presence and will show "LIVE" without ever rendering
+  a picture on silent streams.
+- Distributing via **WebRTC** (WHIP / WHEP) — browsers emit muted-track
+  warnings and may disable the audio decoder when the track fails to
+  produce samples.
+- Packaging **low-latency CMAF / CMAF-LL** — the segmenter expects
+  monotonic audio timestamps per segment; gaps cause player stalls.
+
+Wired for RTMP, WebRTC (both WHIP client and WHEP server paths), and
+CMAF (HLS + DASH output) in this release. HLS (standalone HLS output,
+not the CMAF-HLS manifest) is tracked for a follow-up because its
+per-segment batch remuxer is architecturally different from the
+streaming encoder the other three share. On SRT / UDP / RTP / RIST the
+field is parsed for round-trip fidelity but has no effect today.
+
+Implementation: `src/engine/audio_silence.rs` + the
+`build_encoder_state_eager_for_silent_fallback` helper in each output
+(RTMP `src/engine/output_rtmp.rs`, WebRTC `src/engine/output_webrtc.rs`,
+CMAF `src/engine/cmaf/encode.rs` via `AudioReencoder`).
 
 ### Allowed codecs per output
 
@@ -345,11 +411,18 @@ commit message or release note and delete the bullet.
 
 ### MVP-era limits for `video_encode`
 
-1. **No resolution scaling.** If `video_encode.width` or `.height` is
-   set and differs from the source, the replacer logs a warning and
-   uses the source resolution anyway. Plumbing `VideoScaler` into
-   `TsVideoReplacer` (and extending it to output YUV420P, not only
-   YUVJ420P) is pending.
+1. **Resolution scaling (done).** `video_encode.width` / `.height` are
+   now honoured on every decode→encode path: SRT / UDP / RTP / RIST
+   (via `TsVideoReplacer`), RTMP (`output_rtmp::VideoActive`), WebRTC
+   (`output_webrtc::WebrtcVideoActive`), CMAF (`cmaf::VideoReencoder`),
+   and ST 2110-20 / -23 input (`st2110_video_io::encode_worker`). All
+   five share the `ScaledVideoEncoder` pipeline in
+   `video_encode_util.rs`, which lazy-opens a `VideoScaler` (Lanczos)
+   between decoder/raw-planes and encoder when the target dimensions
+   differ from the source. Supported target chroma / bit-depth for
+   scaling: 4:2:0 8-bit, 4:2:2 8-bit, 4:2:2 10-bit. Unsupported
+   (4:2:0 10-bit, 4:4:4): the pipeline logs a warning and falls back
+   to no-scale encode.
 2. **No frame-rate auto-detection.** The encoder must know fps at
    `open` time; we default to 30/1 when the config omits it. The right
    answer is to read the source SPS / VPS and pass the detected fps
@@ -395,11 +468,10 @@ plugs in via those paths rather than the TS-stream replacer.
   `global_header = false` so SPS / PPS travel in-band on every IDR;
   `engine::webrtc::rtp_h264::H264Packetizer` forwards them as ordinary
   NAL units. HEVC source streams are decoded and re-encoded to H.264
-  automatically. MVP limitations: no output scaling (requested
-  width/height are logged and the source resolution is used), and
-  PLI / FIR from the receiver is still logged-and-ignored — the
-  encoder's configured GOP (default 2× fps) drives keyframe cadence.
-  Force-IDR on PLI is tracked under a follow-up.
+  automatically. Remaining MVP limitation: PLI / FIR from the receiver
+  is still logged-and-ignored — the encoder's configured GOP
+  (default 2× fps) drives keyframe cadence. Force-IDR on PLI is tracked
+  under a follow-up.
 
 ### Deferred items (still to implement)
 

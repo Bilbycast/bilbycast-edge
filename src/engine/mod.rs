@@ -96,6 +96,13 @@ pub mod audio_decode;
 /// Supports AAC-LC, HE-AAC v1/v2, Opus, MP2, AC-3.
 pub mod audio_encode;
 
+/// Silent-audio generator + audio-drop watchdog used by
+/// `audio_encode.silent_fallback` on RTMP, WebRTC and CMAF outputs.
+/// Emits zero-filled planar PCM chunks at the encoder's native cadence
+/// whenever the upstream source has no audio PID, or stops delivering
+/// audio mid-stream.
+pub mod audio_silence;
+
 /// SMPTE 302M-2007 LPCM audio packetizer / depacketizer. Bit-packs 48 kHz
 /// 16/20/24-bit audio into private MPEG-TS PES payloads tagged with the
 /// `BSSD` registration descriptor. Pairs with [`audio_transcode`] (which
