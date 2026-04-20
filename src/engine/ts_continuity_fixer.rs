@@ -9,10 +9,15 @@
 //!
 //! 1. **Before first switch**: zero overhead — packets pass through unchanged.
 //! 2. **On switch**: clears output-side CC state and injects the new input's
-//!    cached PAT/PMTs for fast receiver re-acquisition. The CC state reset
-//!    produces a natural CC jump on all PIDs, which receivers (VLC, ffplay,
-//!    hardware decoders) detect as "packet loss" and handle via their
-//!    standard recovery path (flush PES buffers, resync on next PUSI).
+//!    cached PAT/PMTs for fast receiver re-acquisition, with their
+//!    `version_number` rewritten from a per-fixer **monotonic counter**
+//!    that advances on every switch (see [`TsContinuityFixer::on_switch`]
+//!    for the motivation — the alternative `cached_version + 1` stamping
+//!    was empirically broken for the `A → B → A` round-trip case). The
+//!    CC state reset produces a natural CC jump on all PIDs, which
+//!    receivers (VLC, ffplay, hardware decoders) detect as "packet loss"
+//!    and handle via their standard recovery path (flush PES buffers,
+//!    resync on next PUSI).
 //! 3. **After switch**: rewrites CC values within the new input's packet
 //!    sequence so that subsequent packets maintain continuity.
 //!
@@ -25,6 +30,10 @@
 //! The fixer is shared (via `Arc<Mutex<..>>`) across all per-input forwarders
 //! within a single flow. Only the active forwarder calls [`process_packet`];
 //! passive forwarders call [`observe_passive`] to pre-warm the PSI cache.
+//! Dead-input periods — when the operator has switched to an input whose
+//! source isn't currently transmitting — are handled at the forwarder
+//! level (see `spawn_input_forwarder` in `flow.rs`), which emits 250 ms-
+//! interval NULL-PID padding so downstream UDP sockets don't time out.
 
 use std::collections::{HashMap, HashSet};
 

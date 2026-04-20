@@ -184,12 +184,22 @@ broadcast IRDs) do not lose lock during a switch:
    first data packet, so receivers can re-acquire the stream structure without
    waiting for the next natural PAT/PMT cycle (~200 ms).
 
-3. **PSI version bump** — Injected PAT/PMT packets have their `version_number`
-   field incremented (with CRC32 recalculated). This forces receivers to
-   re-parse the tables even when both inputs happen to use the same PSI
-   version number (e.g., two independent ffmpeg sources both start at version
-   0). Without this, receivers skip the new PMT, don't detect codec changes
-   (e.g., H.264 → H.265), and freeze.
+3. **PSI version bump — monotonic, per-fixer.** Injected PAT/PMT packets have
+   their `version_number` rewritten in place (with CRC32 recalculated) to a
+   value drawn from a **per-fixer monotonic counter** advanced on every
+   switch, not from `cached_version + 1`. This is the critical detail: every
+   independently-generated stream (ffmpeg, srt-live-transmit, most camera
+   SDKs) carries natural `version_number = 0`, so a naive `+1` produced two
+   phantoms with identical `version = 1` for every input in a flow. After
+   `A → B → A` the second phantom looked identical to the first and ffplay
+   treated it as "already seen, don't re-parse" — keeping its audio decoder
+   pointed at B's format and silently dropping every audio PES from the
+   returning stream. The monotonic counter guarantees consecutive switches
+   always produce a strictly-different version stamp, forcing re-parse every
+   time. It also advances unconditionally on a switch to a dead input (one
+   with no cached PSI and no phantom emitted), so the next real switch still
+   gets a fresh stamp. Wraps at 32; each consecutive switch is still
+   different from the previous.
 
 4. **Immediate forwarding** — All packets (video, audio, data) are forwarded
    immediately after a switch. The CC jump signals receivers to flush and
@@ -212,7 +222,21 @@ broadcast IRDs) do not lose lock during a switch:
    `video_encode`) have no encoder to signal and are unaffected — their
    IDR cadence is whatever the upstream source chose.
 
-With mechanisms 1–5 combined, the visible switch latency at the receiver is
+6. **NULL-PID keepalive on the active forwarder.** When the active input
+   has no packets to forward for 250 ms (typical when the operator has
+   switched to an input whose source isn't currently transmitting — an
+   RTP bind with nothing on the wire, an SRT caller to an unreachable
+   host), the forwarder emits a single 1316-byte UDP datagram of seven
+   NULL-PID (0x1FFF) TS packets. Sized to exactly one
+   `TS_PACKETS_PER_DATAGRAM` batch so the UDP output's 7-packet aligner
+   flushes it immediately rather than letting it sit in the buffer.
+   Receivers are required by spec to drop NULL packets; the keepalive
+   exists purely to keep sockets and decoder state alive during dead-
+   input periods. Without it, a 3 s+ silence on the output triggers
+   time-out / EOF behaviour in several downstream receivers that cannot
+   be recovered by later data resuming.
+
+With mechanisms 1–6 combined, the visible switch latency at the receiver is
 one to two frames regardless of whether the target input is passthrough or
 ingress-transcoded. The pre-fix behaviour (switching *to* an ingress-
 transcoded input used to stall for up to one full GOP) is gone.
