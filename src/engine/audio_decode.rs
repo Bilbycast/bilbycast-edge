@@ -643,4 +643,191 @@ mod tests {
         // panic. Most malformed inputs will return Err.
         let _ = result;
     }
+
+    /// ADTS sample-rate index <-> Hz round-trip: every known rate must map to
+    /// a unique index that maps back to the same rate.
+    #[test]
+    fn sr_index_from_hz_round_trips() {
+        for idx in 0u8..=12 {
+            let hz = sample_rate_from_index(idx).expect("known index");
+            let back = sr_index_from_hz(hz).expect("known rate");
+            assert_eq!(back, idx, "round-trip failed at idx {idx} ({hz} Hz)");
+        }
+        // Non-standard rates must return None.
+        assert_eq!(sr_index_from_hz(42_000), None);
+        assert_eq!(sr_index_from_hz(0), None);
+    }
+
+    // ── End-to-end encode → decode roundtrips (fdk-aac backend only) ──────
+    //
+    // The existing tests exercise constructor paths and the "garbage input
+    // shouldn't panic" case, but never verify that decoding a valid AAC
+    // frame produces correct PCM. A bug that emitted silence or the wrong
+    // shape would pass every other test. These roundtrips close that gap
+    // using the in-tree fdk-aac encoder.
+
+    /// Strip the ADTS header from an encoded AAC frame so our decoder —
+    /// which uses `open_raw` with an explicit ASC — can consume it.
+    #[cfg(feature = "fdk-aac")]
+    fn strip_adts_header(adts: &[u8]) -> &[u8] {
+        assert!(adts.len() >= 7, "ADTS frame too short: {}", adts.len());
+        assert_eq!(adts[0], 0xFF, "missing ADTS sync byte 0");
+        assert_eq!(adts[1] & 0xF0, 0xF0, "missing ADTS sync byte 1 high nibble");
+        // Bit 0 of byte 1 is `protection_absent`; when 0 the header carries
+        // a 2-byte CRC after the standard 7 bytes.
+        let protection_absent = (adts[1] & 0x01) != 0;
+        let header_len = if protection_absent { 7 } else { 9 };
+        &adts[header_len..]
+    }
+
+    /// Encode one frame of exact silence and verify the decoder emits PCM of
+    /// the correct planar shape (2 channels × 1024 samples for AAC-LC) with
+    /// every sample in range. Silent input → low-amplitude output catches
+    /// "decoder returns garbage" without depending on SBR/priming quirks.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn fdk_decode_silence_roundtrip_produces_correct_shape() {
+        use aac_codec::{AacProfile, EncoderConfig, SbrSignaling, TransportType};
+
+        let config = EncoderConfig {
+            profile: AacProfile::AacLc,
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate: 128_000,
+            afterburner: true,
+            sbr_signaling: SbrSignaling::default(),
+            transport: TransportType::Adts,
+        };
+        let mut encoder = aac_audio::AacEncoder::open(&config).expect("open encoder");
+        let frame_size = encoder.frame_size() as usize;
+        let silence: Vec<Vec<f32>> = vec![vec![0.0_f32; frame_size]; 2];
+        let encoded = encoder.encode_frame(&silence).expect("encode silence");
+        assert!(
+            !encoded.bytes.is_empty(),
+            "encoder emitted no bytes for silence — prime frame expected"
+        );
+
+        let raw = strip_adts_header(&encoded.bytes);
+        let mut decoder =
+            AacDecoder::from_adts_config(1, 3, 2).expect("construct AAC-LC 48k stereo decoder");
+        let planar = decoder.decode_frame(raw).expect("decode a valid frame");
+
+        // Shape contract: planar[channel][sample], 2 channels, frame_size samples.
+        assert_eq!(planar.len(), 2, "expected 2 channels, got {}", planar.len());
+        assert_eq!(
+            planar[0].len(),
+            frame_size,
+            "channel 0 sample count: got {}, want {frame_size}",
+            planar[0].len()
+        );
+        assert_eq!(
+            planar[0].len(),
+            planar[1].len(),
+            "channel counts desynced: {} vs {}",
+            planar[0].len(),
+            planar[1].len()
+        );
+        for (ch, samples) in planar.iter().enumerate() {
+            for (i, s) in samples.iter().enumerate() {
+                assert!(
+                    s.abs() <= 1.0 && s.is_finite(),
+                    "channel {ch} sample {i} = {s} out of range"
+                );
+            }
+        }
+        // After stream_info updates we should have the concrete codec name.
+        assert_eq!(decoder.codec_name(), "AAC-LC");
+    }
+
+    /// Encode a 1 kHz sine over many frames, decode every frame, and verify
+    /// the aggregate RMS matches the input. AAC-LC is lossy but a 1 kHz tone
+    /// at -6 dBFS survives encode/decode within ~20 % RMS. A bug that returned
+    /// zeros (decoder stall) or clipped to full-scale would fail this.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn fdk_decode_sine_roundtrip_preserves_rms() {
+        use aac_codec::{AacProfile, EncoderConfig, SbrSignaling, TransportType};
+
+        let config = EncoderConfig {
+            profile: AacProfile::AacLc,
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate: 128_000,
+            afterburner: true,
+            sbr_signaling: SbrSignaling::default(),
+            transport: TransportType::Adts,
+        };
+        let mut encoder = aac_audio::AacEncoder::open(&config).expect("open encoder");
+        let frame_size = encoder.frame_size() as usize;
+        let mut decoder = AacDecoder::from_adts_config(1, 3, 2).expect("decoder");
+
+        // 20 frames * 1024 = 20480 samples ≈ 427 ms — enough to get past
+        // AAC-LC's ~1024-sample encoder/decoder priming delay and measure a
+        // stable RMS on the tail.
+        const N_FRAMES: usize = 20;
+        const FREQ: f32 = 1_000.0;
+        const AMP: f32 = 0.5;
+
+        let mut decoded_tail: Vec<f32> = Vec::new();
+        let mut sample_idx: usize = 0;
+        for _ in 0..N_FRAMES {
+            let mut l = Vec::with_capacity(frame_size);
+            let mut r = Vec::with_capacity(frame_size);
+            for _ in 0..frame_size {
+                let t = sample_idx as f32 / 48_000.0;
+                let s = AMP * (2.0 * std::f32::consts::PI * FREQ * t).sin();
+                l.push(s);
+                r.push(s);
+                sample_idx += 1;
+            }
+            let encoded = encoder.encode_frame(&vec![l, r]).expect("encode");
+            if encoded.bytes.is_empty() {
+                // Encoder still priming; skip.
+                continue;
+            }
+            let raw = strip_adts_header(&encoded.bytes);
+            let planar = decoder.decode_frame(raw).expect("decode");
+            assert_eq!(planar.len(), 2);
+            decoded_tail.extend_from_slice(&planar[0]);
+        }
+
+        // Skip the first 2048 decoded samples (encoder + decoder priming) and
+        // measure RMS on the remainder.
+        let skip = 2048.min(decoded_tail.len() / 2);
+        let body = &decoded_tail[skip..];
+        assert!(
+            body.len() > 4_000,
+            "not enough decoded samples after priming: {}",
+            body.len()
+        );
+        let sum_sq: f64 = body.iter().map(|s| (*s as f64).powi(2)).sum();
+        let rms = (sum_sq / body.len() as f64).sqrt();
+        let expected = (AMP as f64) / std::f64::consts::SQRT_2; // 0.3536
+        // AAC-LC at 128 kbps preserves a single-tone RMS within ~20 %.
+        // Silence-bug (rms ≈ 0) and full-scale-bug (rms ≈ 0.707) both fail.
+        let lo = expected * 0.8;
+        let hi = expected * 1.2;
+        assert!(
+            rms >= lo && rms <= hi,
+            "decoded 1kHz sine RMS {rms:.4} outside [{lo:.4}, {hi:.4}] — \
+             encode/decode roundtrip broken"
+        );
+    }
+
+    /// `DecodeStats` is a public hot-path counter struct. Trivial but
+    /// previously untested — a regression to non-atomic ordering would not
+    /// be caught by existing tests.
+    #[test]
+    fn decode_stats_counters_increment_independently() {
+        let stats = DecodeStats::new();
+        stats.inc_input();
+        stats.inc_input();
+        stats.inc_output();
+        stats.inc_error();
+        stats.inc_dropped_uninit();
+        assert_eq!(stats.input_frames.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.output_blocks.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.decode_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.dropped_uninit.load(Ordering::Relaxed), 1);
+    }
 }

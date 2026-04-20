@@ -2302,4 +2302,249 @@ mod tests {
         let m = ChannelMatrix(vec![vec![(0, 1.0), (1, 0.5)]]);
         assert!(!m.is_identity());
     }
+
+    // ── Additional coverage (gaps identified by test audit) ─────────────────
+
+    /// L20 samples live in the upper 20 bits of the L24 wire slot with the
+    /// bottom 4 bits zeroed. A round-trip through f32 must preserve the
+    /// payload within ±1 LSB of the 20-bit range (i.e. ±16 in L24 units).
+    #[test]
+    fn bit_depth_round_trip_l20() {
+        let mut planar = vec![Vec::<f32>::new(); 2];
+        let mut payload = BytesMut::new();
+        // Emit values that fit in 20 bits (range ±524288) with bottom 4 bits zero.
+        for i in 0..32i32 {
+            let l = ((i * 1000) - 16000) << 4; // already 20-bit << 4 = L24 slot
+            let r = -(((i * 1000) - 16000) << 4);
+            for v in [l, r] {
+                let v24 = v & 0x00FF_FFFF;
+                payload.extend_from_slice(&[
+                    ((v24 >> 16) & 0xFF) as u8,
+                    ((v24 >> 8) & 0xFF) as u8,
+                    (v24 & 0xFF) as u8,
+                ]);
+            }
+        }
+        let n = decode_pcm_be(&payload, BitDepth::L20, 2, &mut planar).unwrap();
+        assert_eq!(n, 32);
+        let mut out = BytesMut::new();
+        let mut rng = TpdfRng::new(3);
+        encode_pcm_be(&planar, BitDepth::L20, Dither::None, &mut out, &mut rng);
+        assert_eq!(out.len(), payload.len());
+        // L20 precision is 16x coarser than L24, so compare as 24-bit values
+        // and allow one L20 LSB of drift from the f32 round-trip.
+        for frame in 0..(payload.len() / 3) {
+            let off = frame * 3;
+            let a = (((payload[off] as i32) << 16)
+                | ((payload[off + 1] as i32) << 8)
+                | payload[off + 2] as i32) as i32;
+            let b = (((out[off] as i32) << 16)
+                | ((out[off + 1] as i32) << 8)
+                | out[off + 2] as i32) as i32;
+            let a_s = if a & 0x0080_0000 != 0 { a | !0x00FF_FFFF } else { a };
+            let b_s = if b & 0x0080_0000 != 0 { b | !0x00FF_FFFF } else { b };
+            let diff = (a_s - b_s).abs();
+            assert!(diff <= 16, "L20 round-trip diff {diff} > 16 (one L20 LSB)");
+        }
+    }
+
+    /// **Audit gap**: the existing SRC test only checks packet count, so a bug
+    /// that emitted all-zero samples would still pass. Drive a 1 kHz sine
+    /// through `PlanarAudioTranscoder` at 48 kHz → 44.1 kHz and verify the
+    /// output RMS matches the input RMS (~0.3536 for amplitude 0.5). A
+    /// silence bug drops RMS to ~0; a scale bug moves it outside tolerance.
+    #[test]
+    fn planar_transcoder_src_preserves_sine_rms() {
+        const N_IN: usize = 4800; // 100 ms at 48 kHz
+        const FREQ: f32 = 1000.0;
+        const AMP: f32 = 0.5;
+        let mut ch_l = Vec::with_capacity(N_IN);
+        let mut ch_r = Vec::with_capacity(N_IN);
+        for i in 0..N_IN {
+            let t = i as f32 / 48_000.0;
+            let s = AMP * (2.0 * std::f32::consts::PI * FREQ * t).sin();
+            ch_l.push(s);
+            ch_r.push(s);
+        }
+        let planar_in: Vec<Vec<f32>> = vec![ch_l, ch_r];
+
+        let tj = TranscodeJson {
+            sample_rate: Some(44_100),
+            ..TranscodeJson::default()
+        };
+        let mut tc = PlanarAudioTranscoder::new(48_000, 2, &tj).unwrap();
+        assert!(!tc.is_passthrough());
+        assert_eq!(tc.out_sample_rate(), 44_100);
+        let out = tc.process(&planar_in).unwrap();
+        assert_eq!(out.len(), 2);
+
+        // Expected output length ≈ 4800 * 44100/48000 = 4410. rubato's FixedAsync::Input
+        // mode processes the full input chunk; the first-call output size is close to
+        // that. Allow ±10% for filter warmup.
+        let out_len = out[0].len();
+        assert!(
+            (3900..=4500).contains(&out_len),
+            "output sample count {out_len} outside expected range ~4410"
+        );
+        assert_eq!(out[0].len(), out[1].len(), "channels desynced");
+
+        // Compute RMS, skipping the leading filter-warmup transient (first 10 ms).
+        let skip = (44_100 * 10 / 1000) as usize;
+        assert!(out_len > skip + 100, "output too short to measure");
+        let body = &out[0][skip..];
+        let sum_sq: f64 = body.iter().map(|s| (*s as f64).powi(2)).sum();
+        let rms = (sum_sq / body.len() as f64).sqrt();
+        let expected = (AMP as f64) / std::f64::consts::SQRT_2; // 0.3536
+        // Accept ±10% of expected RMS. A silence bug gives ~0; a 2x scale bug
+        // gives ~0.707 — both fail this check.
+        let lo = expected * 0.9;
+        let hi = expected * 1.1;
+        assert!(
+            rms >= lo && rms <= hi,
+            "SRC output RMS {rms:.4} outside [{lo:.4}, {hi:.4}] — signal not preserved"
+        );
+    }
+
+    /// `channel_map_with_gain` is an entirely separate code path from
+    /// `channel_map` and presets and has zero coverage. Build an L/R swap
+    /// with -6 dB (0.5 linear) on the swapped right channel and verify the
+    /// gain is applied to each sample.
+    #[test]
+    fn planar_transcoder_channel_map_with_gain_attenuates() {
+        let planar_in: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.5, -0.25],
+            vec![-1.0, -0.5, 0.25],
+        ];
+        let tj = TranscodeJson {
+            channels: Some(2),
+            // Row 0: out_L = in_R at unity. Row 1: out_R = in_L at 0.5 (-6 dB).
+            channel_map_with_gain: Some(vec![
+                vec![[1.0, 1.0]],
+                vec![[0.0, 0.5]],
+            ]),
+            ..TranscodeJson::default()
+        };
+        let mut tc = PlanarAudioTranscoder::new(48_000, 2, &tj).unwrap();
+        assert!(!tc.is_passthrough());
+        let out = tc.process(&planar_in).unwrap();
+        assert_eq!(out.len(), 2);
+        // Left output = original right, unchanged.
+        assert_eq!(out[0], planar_in[1]);
+        // Right output = original left * 0.5.
+        for i in 0..planar_in[0].len() {
+            let expected = planar_in[0][i] * 0.5;
+            assert!(
+                (out[1][i] - expected).abs() < 1e-6,
+                "sample {i}: got {}, want {expected}",
+                out[1][i]
+            );
+        }
+    }
+
+    /// Per the docstring on `channel_map_with_gain`, negative gains are
+    /// clamped to 0 (silent) so an operator typo cannot invert a channel.
+    #[test]
+    fn resolve_transcode_clamps_negative_gain() {
+        let json = TranscodeJson {
+            channels: Some(1),
+            channel_map_with_gain: Some(vec![vec![[0.0, -1.5]]]),
+            ..TranscodeJson::default()
+        };
+        let cfg = resolve_transcode(
+            &json,
+            InputFormat {
+                sample_rate: 48_000,
+                bit_depth: BitDepth::L24,
+                channels: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.channel_matrix.0.len(), 1);
+        assert_eq!(cfg.channel_matrix.0[0].len(), 1);
+        let (_ch, gain) = cfg.channel_matrix.0[0][0];
+        assert_eq!(gain, 0.0, "negative gain must clamp to 0.0, got {gain}");
+    }
+
+    /// Combined path: matrix downmix AND sample-rate conversion in the same
+    /// `process()` call. 6ch@48k → 2ch@44.1k via the 5.1→stereo BS.775 preset.
+    /// A DC-like input (constant positive value on L/C/Ls, zero elsewhere)
+    /// must produce a non-zero stereo output at the downsampled rate, with
+    /// the left output dominant (L + -3dB·C + -3dB·Ls).
+    #[test]
+    fn planar_transcoder_5_1_downmix_with_src() {
+        const N_IN: usize = 4800;
+        // 5.1 channel order: L, R, C, LFE, Ls, Rs.
+        // Feed L, C, and Ls constant +0.5; leave R, LFE, Rs at 0.
+        let planar_in: Vec<Vec<f32>> = vec![
+            vec![0.5; N_IN], // L
+            vec![0.0; N_IN], // R
+            vec![0.5; N_IN], // C
+            vec![0.0; N_IN], // LFE
+            vec![0.5; N_IN], // Ls
+            vec![0.0; N_IN], // Rs
+        ];
+        let tj = TranscodeJson {
+            sample_rate: Some(44_100),
+            channels: Some(2),
+            channel_map_preset: Some("5_1_to_stereo_bs775".to_string()),
+            ..TranscodeJson::default()
+        };
+        let mut tc = PlanarAudioTranscoder::new(48_000, 6, &tj).unwrap();
+        assert_eq!(tc.out_channels(), 2);
+        assert_eq!(tc.out_sample_rate(), 44_100);
+        let out = tc.process(&planar_in).unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out[0].len() > 3900 && out[0].len() < 4500);
+        assert_eq!(out[0].len(), out[1].len());
+
+        // BS.775: Lt = L + (-3 dB)·C + (-3 dB)·Ls = 0.5 + 0.707·0.5 + 0.707·0.5 ≈ 1.207
+        //         Rt = R + (-3 dB)·C + (-3 dB)·Rs = 0 + 0.707·0.5 + 0 = 0.354
+        // Check the steady-state mean after the filter warmup (skip 10 ms).
+        let skip = 441;
+        let body_l = &out[0][skip..];
+        let body_r = &out[1][skip..];
+        let mean_l: f64 = body_l.iter().map(|s| *s as f64).sum::<f64>() / body_l.len() as f64;
+        let mean_r: f64 = body_r.iter().map(|s| *s as f64).sum::<f64>() / body_r.len() as f64;
+        assert!(
+            (mean_l - 1.207).abs() < 0.05,
+            "Lt mean {mean_l:.4} not near 1.207 (downmix broken)"
+        );
+        assert!(
+            (mean_r - 0.354).abs() < 0.05,
+            "Rt mean {mean_r:.4} not near 0.354 (downmix broken)"
+        );
+        // Left must dominate — a channel-swap bug would fail this.
+        assert!(mean_l > mean_r * 2.0, "expected Lt >> Rt for asymmetric input");
+    }
+
+    /// f32 samples outside `[-1.0, 1.0]` must clamp to the integer range,
+    /// not wrap (which would flip sign at full scale). Regression guard for
+    /// loud peak handling through `encode_pcm_be`.
+    #[test]
+    fn encode_pcm_be_clips_at_fullscale_without_wrap() {
+        let planar: Vec<Vec<f32>> = vec![vec![2.0, -2.0, 1.5, -1.5]];
+        let mut out = BytesMut::new();
+        let mut rng = TpdfRng::new(7);
+        encode_pcm_be(&planar, BitDepth::L16, Dither::None, &mut out, &mut rng);
+        assert_eq!(out.len(), 4 * 2);
+        let s0 = i16::from_be_bytes([out[0], out[1]]);
+        let s1 = i16::from_be_bytes([out[2], out[3]]);
+        let s2 = i16::from_be_bytes([out[4], out[5]]);
+        let s3 = i16::from_be_bytes([out[6], out[7]]);
+        assert_eq!(s0, i16::MAX, "positive clip must saturate to i16::MAX");
+        assert_eq!(s1, i16::MIN, "negative clip must saturate to i16::MIN");
+        assert_eq!(s2, i16::MAX, "1.5 must clamp to i16::MAX, not wrap");
+        assert_eq!(s3, i16::MIN, "-1.5 must clamp to i16::MIN, not wrap");
+    }
+
+    /// Payload length not a multiple of `channels * wire_bytes` is a corrupt
+    /// RTP packet and must fail cleanly rather than silently truncating.
+    #[test]
+    fn decode_pcm_be_rejects_unaligned_payload() {
+        // 2 channels × L24 = 6 bytes per frame; 7 bytes is unaligned.
+        let payload = vec![0u8; 7];
+        let mut planar = vec![Vec::<f32>::new(); 2];
+        let err = decode_pcm_be(&payload, BitDepth::L24, 2, &mut planar).unwrap_err();
+        assert!(err.contains("not aligned"), "wrong error message: {err}");
+    }
 }
