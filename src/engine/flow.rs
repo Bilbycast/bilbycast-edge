@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
+use bytes::Bytes;
 use tokio::sync::{broadcast, watch};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -1540,6 +1541,50 @@ fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::Inpu
 /// re-encoder in this input's pipeline emits an IDR on its next frame —
 /// otherwise downstream decoders have to wait up to a full GOP for the next
 /// natural keyframe before they can display the switched feed.
+/// Idle-keepalive period. When the active input's forwarder has gone
+/// this long without receiving a natural packet, it injects a single
+/// NULL-PID (0x1FFF) TS packet into the output so downstream receivers
+/// (ffplay, VLC, hardware decoders) see a live stream instead of socket
+/// silence. Without this, a 3 s+ gap on the output — which happens
+/// whenever the operator switches to an input that has no source feeding
+/// it — drives ffplay into a terminal state where audio stops queuing
+/// even after the source returns, needing an ffplay restart to recover.
+///
+/// 250 ms is below MPEG-TS PSI repetition intervals (100-500 ms typical)
+/// and well under socket read timeouts on every common receiver.
+const KEEPALIVE_INTERVAL_MS: u64 = 250;
+
+/// Build a keepalive payload: 7 back-to-back 188-byte NULL TS packets
+/// (PID 0x1FFF, payload-only, CC=0). Sized to exactly one 1316-byte UDP
+/// datagram so the UDP output's 7-packet-per-datagram aligner flushes
+/// it immediately — a single 188-byte null packet would sit in the
+/// aligner's buffer until a real datagram's worth of bytes accumulated,
+/// which defeats the whole point of a keepalive. Receivers drop NULL
+/// packets per spec; all the keepalive does is keep UDP datagrams
+/// flowing so sockets / decoders don't time out.
+fn null_ts_packet() -> RtpPacket {
+    const PACKETS: usize = 7;
+    const ONE: [u8; 188] = {
+        let mut pkt = [0xFFu8; 188];
+        pkt[0] = 0x47; // sync
+        pkt[1] = 0x1F; // PUSI=0, TP=0, PID hi = 0x1F
+        pkt[2] = 0xFF; // PID lo = 0xFF → full PID 0x1FFF (NULL_PID)
+        pkt[3] = 0x10; // scrambling=00, adaptation=01 (payload only), CC=0
+        pkt
+    };
+    let mut buf = Vec::with_capacity(PACKETS * 188);
+    for _ in 0..PACKETS {
+        buf.extend_from_slice(&ONE);
+    }
+    RtpPacket {
+        data: Bytes::from(buf),
+        sequence_number: 0,
+        rtp_timestamp: 0,
+        recv_time_us: 0,
+        is_raw_ts: true,
+    }
+}
+
 fn spawn_input_forwarder(
     input_id: String,
     mut rx: broadcast::Receiver<RtpPacket>,
@@ -1552,6 +1597,12 @@ fn spawn_input_forwarder(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut was_active = *active_input_rx.borrow() == input_id;
+        // Keepalive tick: only emits NULL packets while this input is
+        // active and no natural packet has arrived for the tick window.
+        let mut keepalive = tokio::time::interval(std::time::Duration::from_millis(
+            KEEPALIVE_INTERVAL_MS,
+        ));
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 biased;
@@ -1607,6 +1658,9 @@ fn spawn_input_forwarder(
                                     let _ = out_tx.send(pkt);
                                 }
                             }
+                            // A real packet just went out — push the next
+                            // keepalive tick out one full interval.
+                            keepalive.reset();
                         } else {
                             // Passive — observe PSI for cache pre-warming so
                             // PAT/PMT is ready for injection on switch.
@@ -1619,6 +1673,18 @@ fn spawn_input_forwarder(
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
+                },
+                _ = keepalive.tick() => {
+                    // Only emit keepalive when *this* input is the active
+                    // one. Otherwise every passive forwarder would spam
+                    // null packets into the broadcast channel.
+                    if *active_input_rx.borrow() == input_id {
+                        // Emit a 7-packet null payload so downstream UDP
+                        // sockets see steady datagrams during a dead-
+                        // input period (prevents socket timeouts on
+                        // receivers that treat silence as EOF).
+                        let _ = out_tx.send(null_ts_packet());
+                    }
                 }
             }
         }

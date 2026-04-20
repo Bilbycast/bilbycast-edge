@@ -110,6 +110,18 @@ pub struct TsContinuityFixer {
     input_psi: HashMap<String, InputPsiCache>,
     /// Zero-cost gate: skip all processing until the first switch occurs.
     ever_switched: bool,
+    /// Monotonic 5-bit PSI version counter used to stamp every phantom
+    /// PAT/PMT emitted by [`on_switch`]. Each switch bumps this once so
+    /// the version we hand to the receiver is **strictly different** from
+    /// the one it saw last time — regardless of what version the cached
+    /// packet originally carried. This fixes a bug where two different
+    /// inputs' cached PSI (both with natural version=0) both bumped to
+    /// version=1, so after `golf → reolink → golf` the second `version=1`
+    /// phantom looked identical to the first and ffplay silently stopped
+    /// re-parsing the PMT — leaving the audio decoder pointed at the
+    /// previous input's format. Wrapping at 32 is safe because every
+    /// consecutive switch still produces a *different* value (N vs N+1).
+    next_psi_version: u8,
 }
 
 impl TsContinuityFixer {
@@ -118,7 +130,62 @@ impl TsContinuityFixer {
             pid_state: HashMap::new(),
             input_psi: HashMap::new(),
             ever_switched: false,
+            // Start at 0; the first `on_switch` bumps this to 1 before
+            // stamping, matching the long-standing "bumped from cached
+            // version 0 to 1" behaviour on the first switch.
+            next_psi_version: 0,
         }
+    }
+
+    /// Return cached PAT + PMT packets suitable for a keepalive tick when
+    /// the active input has no live data flowing. Preference order:
+    ///
+    /// 1. the active input's own cache (if it has one — typical when
+    ///    the input has been live and just paused briefly);
+    /// 2. any other input's cache (fallback when the active input is a
+    ///    dead source — e.g. an RTP bind with nothing feeding it after
+    ///    an operator flipped the switch to it).
+    ///
+    /// Stamped with the **current** monotonic version (not advanced), so
+    /// the keepalive PSI doesn't force receivers to re-parse on every
+    /// tick — it just reiterates the last-known-good structure so the
+    /// decoder doesn't decide the stream has lost its PMT. The caller is
+    /// expected to send these periodically when no natural packet has
+    /// arrived recently.
+    #[allow(dead_code)]
+    pub fn keepalive_psi(&self, active_input_id: &str) -> Vec<RtpPacket> {
+        let mut out = Vec::new();
+        // First try the active input, then any other cached input.
+        let source = self
+            .input_psi
+            .get(active_input_id)
+            .filter(|c| c.cached_pat.is_some())
+            .or_else(|| self.input_psi.values().find(|c| c.cached_pat.is_some()));
+        let Some(cache) = source else {
+            return out;
+        };
+        let stamp = self.next_psi_version;
+        if let Some(mut pat) = cache.cached_pat {
+            set_psi_version(&mut pat, stamp);
+            out.push(RtpPacket {
+                data: Bytes::copy_from_slice(&pat),
+                sequence_number: 0,
+                rtp_timestamp: 0,
+                recv_time_us: 0,
+                is_raw_ts: true,
+            });
+        }
+        for mut pmt in cache.cached_pmts.values().copied() {
+            set_psi_version(&mut pmt, stamp);
+            out.push(RtpPacket {
+                data: Bytes::copy_from_slice(&pmt),
+                sequence_number: 0,
+                rtp_timestamp: 0,
+                recv_time_us: 0,
+                is_raw_ts: true,
+            });
+        }
+        out
     }
 
     /// Observe a packet from a passive (non-active) input to pre-warm the
@@ -151,12 +218,22 @@ impl TsContinuityFixer {
     /// returns cached PSI packets (PAT + PMTs) from the *new* input for
     /// fast receiver re-acquisition.
     ///
-    /// The CC jump is the key signal: receivers (VLC, ffplay, hardware
-    /// decoders) detect it as "packet loss," flush PES buffers, and resync
-    /// on the next PES start (PUSI=1). This is more reliable than trying
-    /// to maintain CC continuity with DI flags — many receivers handle CC
-    /// jumps more robustly than mid-stream DI on data packets, and DI
-    /// insertion on payload-only packets would corrupt ES/PES data.
+    /// Every phantom PAT/PMT packet returned here is stamped with a
+    /// **monotonically advancing** `version_number` taken from
+    /// `next_psi_version` — not simply `cached_version + 1`. This is
+    /// essential for the common case of switching back and forth between
+    /// two inputs whose cached PSI both carry `version_number = 0`: with
+    /// `+1`, both switches produce `version = 1` and ffplay treats the
+    /// second phantom as "already seen, nothing to re-parse" — keeping its
+    /// audio decoder pointed at the previous input's format and silently
+    /// dropping audio from the returning input.
+    ///
+    /// The CC jump from clearing `pid_state` is the other half of the
+    /// switch signal: receivers (VLC, ffplay, hardware decoders) detect it
+    /// as "packet loss," flush PES buffers, and resync on the next PES
+    /// start (PUSI=1). Many decoders handle CC jumps more robustly than
+    /// mid-stream DI flags, and DI insertion on payload-only packets
+    /// would corrupt ES/PES data.
     pub fn on_switch(&mut self, new_input_id: &str) -> Vec<RtpPacket> {
         self.ever_switched = true;
 
@@ -167,6 +244,15 @@ impl TsContinuityFixer {
         // loss recovery path (flush PES, wait for PUSI).
         let old_pid_count = self.pid_state.len();
         self.pid_state.clear();
+
+        // Advance the monotonic counter unconditionally — even if we end
+        // up emitting nothing this switch. Otherwise switching through a
+        // dead input (no PSI cache) would freeze the counter, and the
+        // next "real" switch would reuse the previous stamp, triggering
+        // the same "phantoms look identical" bug we're fixing for the
+        // directly-consecutive case.
+        self.next_psi_version = (self.next_psi_version + 1) & 0x1F;
+        let stamp = self.next_psi_version;
 
         let mut injected = Vec::new();
 
@@ -179,26 +265,24 @@ impl TsContinuityFixer {
             None => {
                 tracing::warn!(
                     "TsContinuityFixer::on_switch('{new_input_id}'): no PSI cached for this input — \
-                     PAT/PMT will not be injected (receiver must wait for stream PSI)"
+                     PAT/PMT will not be injected (receiver must wait for stream PSI); \
+                     monotonic counter advanced to {stamp} so the next switch produces a distinct version"
                 );
                 return injected;
             }
         };
 
         tracing::info!(
-            "TsContinuityFixer::on_switch('{new_input_id}'): injecting PAT={}, PMTs={}, cleared {old_pid_count} tracked PIDs",
+            "TsContinuityFixer::on_switch('{new_input_id}'): injecting PAT={}, PMTs={}, \
+             version={stamp} (monotonic), cleared {old_pid_count} tracked PIDs",
             if cached_pat.is_some() { "yes" } else { "no" },
             cached_pmts.len(),
         );
 
-        // Inject PAT from the new input's cache. Bump the PSI version
-        // so receivers (VLC, ffplay) are forced to re-parse the table
-        // even if the new input has the same version number as the old.
-        // This is critical when inputs have different codecs (e.g. H.264
-        // vs H.265) — without a version bump the receiver skips the new
-        // PMT and keeps using the old decoder, causing a freeze.
+        // Inject PAT from the new input's cache with the monotonic
+        // version stamp.
         if let Some(mut pat) = cached_pat {
-            bump_psi_version(&mut pat);
+            set_psi_version(&mut pat, stamp);
             injected.push(RtpPacket {
                 data: Bytes::copy_from_slice(&pat),
                 sequence_number: 0,
@@ -208,9 +292,9 @@ impl TsContinuityFixer {
             });
         }
 
-        // Inject PMTs from the new input's cache (version-bumped).
+        // Inject PMTs from the new input's cache with the same stamp.
         for mut pmt in cached_pmts {
-            bump_psi_version(&mut pmt);
+            set_psi_version(&mut pmt, stamp);
             injected.push(RtpPacket {
                 data: Bytes::copy_from_slice(&pmt),
                 sequence_number: 0,
@@ -345,11 +429,12 @@ impl TsContinuityFixer {
     }
 }
 
-/// Bump the `version_number` field in a PSI section (PAT or PMT) carried
-/// in a single 188-byte TS packet with PUSI=1. This forces receivers that
-/// cache tables by version to re-parse the section, which is essential
-/// when switching between inputs that use the same version number but
-/// have different content (e.g., different codecs in the PMT).
+/// Overwrite the `version_number` field in a PSI section (PAT or PMT)
+/// carried in a single 188-byte TS packet with PUSI=1, then recompute
+/// the CRC32. Forces receivers that cache tables by version to re-parse
+/// the section — essential when switching between inputs that use the
+/// same version number but have different content (e.g. different codecs
+/// in the PMT).
 ///
 /// Layout (for PUSI=1, pointer_field=0):
 ///   byte 4:  pointer_field (0x00)
@@ -360,8 +445,9 @@ impl TsContinuityFixer {
 ///   ...
 ///   last 4 bytes of section: CRC32
 ///
-/// After bumping the version, the CRC32 is recalculated.
-fn bump_psi_version(pkt: &mut [u8; TS_PACKET_SIZE]) {
+/// `version` is masked to 5 bits and written in place; `current_next`
+/// and the two reserved bits are preserved.
+fn set_psi_version(pkt: &mut [u8; TS_PACKET_SIZE], version: u8) {
     // Verify this is a PUSI packet.
     if !ts_pusi(pkt) {
         return;
@@ -385,11 +471,10 @@ fn bump_psi_version(pkt: &mut [u8; TS_PACKET_SIZE]) {
         return; // Malformed or too short for version + CRC
     }
 
-    // Bump version_number (5 bits at offset +5 from section_start, bits [5:1]).
+    // Write version_number (5 bits at offset +5 from section_start, bits [5:1]).
     let version_byte = &mut pkt[section_start + 5];
-    let old_version = (*version_byte >> 1) & 0x1F;
-    let new_version = (old_version + 1) & 0x1F;
-    *version_byte = (*version_byte & 0xC1) | (new_version << 1);
+    let v = version & 0x1F;
+    *version_byte = (*version_byte & 0xC1) | (v << 1);
 
     // Recalculate CRC32 over the section body (excluding the CRC itself).
     let crc_offset = section_end - 4;
@@ -398,6 +483,30 @@ fn bump_psi_version(pkt: &mut [u8; TS_PACKET_SIZE]) {
     pkt[crc_offset + 1] = (crc >> 16) as u8;
     pkt[crc_offset + 2] = (crc >> 8) as u8;
     pkt[crc_offset + 3] = crc as u8;
+}
+
+/// Back-compat wrapper: bump the `version_number` by 1 modulo 32 and fix
+/// the CRC. Retained for any callers / tests that want the historical
+/// "increment-from-current" behaviour. New production code on the switch
+/// path uses [`set_psi_version`] with the monotonic counter instead.
+#[cfg(test)]
+fn bump_psi_version(pkt: &mut [u8; TS_PACKET_SIZE]) {
+    if !ts_pusi(pkt) {
+        return;
+    }
+    let pointer_field = pkt[4] as usize;
+    let section_start = 5 + pointer_field;
+    if section_start + 12 > TS_PACKET_SIZE {
+        return;
+    }
+    let section_length =
+        (((pkt[section_start + 1] & 0x0F) as usize) << 8) | (pkt[section_start + 2] as usize);
+    let section_end = section_start + 3 + section_length;
+    if section_end > TS_PACKET_SIZE || section_length < 9 {
+        return;
+    }
+    let old_version = (pkt[section_start + 5] >> 1) & 0x1F;
+    set_psi_version(pkt, (old_version + 1) & 0x1F);
 }
 
 #[cfg(test)]
@@ -878,5 +987,138 @@ mod tests {
         bump_psi_version(&mut pat);
         let new_version = (pat[10] >> 1) & 0x1F;
         assert_eq!(new_version, 0, "version should wrap from 31 to 0");
+    }
+
+    /// Regression: two different inputs' cached PSI that both carry the
+    /// same natural `version_number` (both 0, which is the case for every
+    /// ffmpeg/srt-live-transmit-generated stream we test against) used to
+    /// both bump to `version = 1`. After a `A → B → A` round-trip, the
+    /// second phantom looked identical to the first and ffplay silently
+    /// kept using B's PMT for A's stream — losing audio permanently.
+    ///
+    /// With the monotonic counter, consecutive switches always produce
+    /// distinct version numbers even when the cached starting values
+    /// collide.
+    #[test]
+    fn monotonic_version_differs_across_consecutive_switches() {
+        let mut fixer = TsContinuityFixer::new();
+
+        // Both inputs observe a PAT with natural version=0.
+        let pat = build_pat(&[(1, 0x1000)], 0);
+        let pmt = build_pmt(0x1000, &[(0x1B, 0x100)], 0);
+        let mut psi_data = Vec::new();
+        psi_data.extend_from_slice(&pat);
+        psi_data.extend_from_slice(&pmt);
+        fixer.observe_passive("a", &make_rtp_packet(&psi_data));
+        fixer.observe_passive("b", &make_rtp_packet(&psi_data));
+
+        // Drive a packet so ever_switched can be set later.
+        fixer.process_packet("a", &make_rtp_packet(&build_ts_packet(0x100, 0)));
+
+        // First switch: a → b. Phantom PAT should carry version=1.
+        let injected = fixer.on_switch("b");
+        assert!(!injected.is_empty(), "first switch should inject PSI");
+        let v1 = (injected[0].data[10] >> 1) & 0x1F;
+        assert_eq!(v1, 1, "first phantom PAT version");
+
+        // Second switch: b → a. Under the old +1 scheme both phantoms
+        // would be version=1 — receivers ignored the second one. With the
+        // monotonic counter, the second switch must produce a DIFFERENT
+        // version so receivers always re-parse.
+        let injected = fixer.on_switch("a");
+        assert!(!injected.is_empty(), "second switch should inject PSI");
+        let v2 = (injected[0].data[10] >> 1) & 0x1F;
+        assert_ne!(
+            v2, v1,
+            "consecutive-switch phantom PATs must carry different version_numbers"
+        );
+        assert_eq!(v2, 2, "monotonic counter advances by 1 per switch");
+
+        // Third switch back to b. Still distinct from the prior two.
+        let injected = fixer.on_switch("b");
+        let v3 = (injected[0].data[10] >> 1) & 0x1F;
+        assert_ne!(v3, v2);
+        assert_ne!(v3, v1);
+        assert_eq!(v3, 3);
+
+        // Every PMT emitted in a given switch shares the same monotonic
+        // stamp as the PAT — one coherent version per switch event.
+        assert_eq!(
+            (injected[1].data[10] >> 1) & 0x1F,
+            v3,
+            "PMT must carry the same monotonic version as the PAT from the same switch",
+        );
+    }
+
+    /// Switching through an input that has no cached PSI (a "dead"
+    /// source with nothing feeding it) must still advance the monotonic
+    /// counter. Otherwise `live → dead → live` would emit two phantoms
+    /// with the same version stamp — exactly the collision this fix
+    /// exists to prevent.
+    #[test]
+    fn dead_input_still_advances_monotonic_counter() {
+        let mut fixer = TsContinuityFixer::new();
+
+        // Only input "a" ever observes PSI. Inputs "dead1" and "dead2"
+        // are never cached.
+        let pat = build_pat(&[(1, 0x1000)], 0);
+        let pmt = build_pmt(0x1000, &[(0x1B, 0x100)], 0);
+        let mut psi_data = Vec::new();
+        psi_data.extend_from_slice(&pat);
+        psi_data.extend_from_slice(&pmt);
+        fixer.observe_passive("a", &make_rtp_packet(&psi_data));
+
+        // Trigger first switch.
+        fixer.process_packet("a", &make_rtp_packet(&build_ts_packet(0x100, 0)));
+
+        // a → dead1: no phantom (no cache) but counter should bump.
+        let injected = fixer.on_switch("dead1");
+        assert!(injected.is_empty(), "no cached PSI → no phantom");
+
+        // dead1 → a: phantom stamped with the NEXT version, not a stale
+        // reuse of the previous "a" session's stamp.
+        let injected = fixer.on_switch("a");
+        assert!(!injected.is_empty());
+        let v1 = (injected[0].data[10] >> 1) & 0x1F;
+        assert_eq!(v1, 2, "counter advanced twice: once for dead1, once for a");
+
+        // a → dead2: again, counter bumps even with empty phantom.
+        let injected = fixer.on_switch("dead2");
+        assert!(injected.is_empty());
+
+        // dead2 → a: fourth bump, distinct from v1.
+        let injected = fixer.on_switch("a");
+        let v2 = (injected[0].data[10] >> 1) & 0x1F;
+        assert_ne!(v2, v1, "returning to 'a' after a dead detour must use a fresh version");
+        assert_eq!(v2, 4);
+    }
+
+    /// The monotonic counter wraps at 32 without going stale: after 32
+    /// bumps we're back at 0 but the next switch still produces a value
+    /// different from the *immediately previous* switch, which is what
+    /// receivers care about.
+    #[test]
+    fn monotonic_version_wraps_cleanly_and_stays_distinct() {
+        let mut fixer = TsContinuityFixer::new();
+        let pat = build_pat(&[(1, 0x1000)], 0);
+        let pmt = build_pmt(0x1000, &[(0x1B, 0x100)], 0);
+        let mut psi_data = Vec::new();
+        psi_data.extend_from_slice(&pat);
+        psi_data.extend_from_slice(&pmt);
+        fixer.observe_passive("x", &make_rtp_packet(&psi_data));
+
+        let mut prev: Option<u8> = None;
+        for i in 1..=33u32 {
+            let injected = fixer.on_switch("x");
+            assert!(!injected.is_empty());
+            let v = (injected[0].data[10] >> 1) & 0x1F;
+            if let Some(p) = prev {
+                assert_ne!(v, p, "switch #{i}: version must differ from previous");
+            }
+            prev = Some(v);
+        }
+        // After 33 switches the counter has wrapped (started at 0, bumped
+        // to 1..=32 mod 32 = 0 on the 32nd bump, then to 1 on the 33rd).
+        assert_eq!(prev, Some(1));
     }
 }
