@@ -741,6 +741,46 @@ fn validate_input(input: &InputConfig) -> Result<()> {
         InputConfig::St2110_23(c) => validate_st2110_23_input(c)?,
         InputConfig::RtpAudio(c) => validate_rtp_audio_input(c)?,
         InputConfig::Bonded(c) => validate_bonded_input(c)?,
+        InputConfig::TestPattern(c) => validate_test_pattern_input(c)?,
+    }
+    Ok(())
+}
+
+/// Validate a synthetic test-pattern input. All fields have sensible
+/// defaults; this is the sanity-bound check.
+fn validate_test_pattern_input(c: &crate::config::models::TestPatternInputConfig) -> Result<()> {
+    if c.width < 64 || c.width > 7680 || c.width % 2 != 0 {
+        return Err(anyhow::anyhow!(
+            "test-pattern: width must be an even number in 64..=7680 (got {})", c.width
+        ));
+    }
+    if c.height < 64 || c.height > 4320 || c.height % 2 != 0 {
+        return Err(anyhow::anyhow!(
+            "test-pattern: height must be an even number in 64..=4320 (got {})", c.height
+        ));
+    }
+    if c.fps < 1 || c.fps > 60 {
+        return Err(anyhow::anyhow!(
+            "test-pattern: fps must be in 1..=60 (got {})", c.fps
+        ));
+    }
+    if c.video_bitrate_kbps < 100 || c.video_bitrate_kbps > 200_000 {
+        return Err(anyhow::anyhow!(
+            "test-pattern: video_bitrate_kbps must be in 100..=200000 (got {})",
+            c.video_bitrate_kbps
+        ));
+    }
+    if c.audio_enabled {
+        if c.tone_hz < 50.0 || c.tone_hz > 8000.0 {
+            return Err(anyhow::anyhow!(
+                "test-pattern: tone_hz must be in 50..=8000 (got {})", c.tone_hz
+            ));
+        }
+        if c.tone_dbfs < -60.0 || c.tone_dbfs > 0.0 {
+            return Err(anyhow::anyhow!(
+                "test-pattern: tone_dbfs must be in -60..=0 (got {})", c.tone_dbfs
+            ));
+        }
     }
     Ok(())
 }
@@ -3599,7 +3639,7 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
 
     // ── Inputs ──
     for input in &config.inputs {
-        let label_prefix = format!("Input '{}'", input.name);
+        let label_prefix = format!("Input '{}' [{}]", input.name, input.id);
         match &input.config {
             InputConfig::Rtp(cfg) => {
                 register(&cfg.bind_addr, Proto::Udp, format!("{label_prefix} (RTP)"))?;
@@ -3741,36 +3781,134 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
                     }
                 }
             }
+            // Synthetic input doesn't bind a socket.
+            InputConfig::TestPattern(_) => {}
         }
     }
 
     // ── Outputs (only those that bind specific local ports) ──
+    //
+    // Outputs that don't accept a `bind_addr` (push-style: RTMP/HLS/CMAF/WebRTC)
+    // and outputs whose bind is left ephemeral (`bind_addr` unset, defaulting to
+    // `0.0.0.0:0`) are skipped — they cannot collide because the OS picks a
+    // free port. When the operator pins `bind_addr` to a specific port we DO
+    // register it so a collision with another input/output/server is caught.
     for output in &config.outputs {
-        let label_prefix = format!("Output '{}'", output.name());
+        let label_prefix = format!("Output '{}' [{}]", output.name(), output.id());
         match output {
             OutputConfig::Srt(cfg) => {
-                // Listener/rendezvous outputs bind local_addr.
-                if cfg.mode != SrtMode::Caller {
-                    if let Some(ref addr) = cfg.local_addr {
-                        register(addr, Proto::Udp, format!("{label_prefix} (SRT listener)"))?;
+                if cfg.mode != SrtMode::Caller
+                    && let Some(ref addr) = cfg.local_addr
+                {
+                    register(addr, Proto::Udp, format!("{label_prefix} (SRT listener)"))?;
+                }
+                if let Some(ref red) = cfg.redundancy
+                    && red.mode != SrtMode::Caller
+                    && let Some(ref addr) = red.local_addr
+                {
+                    register(
+                        addr,
+                        Proto::Udp,
+                        format!("{label_prefix} (SRT redundancy leg 2)"),
+                    )?;
+                }
+            }
+            OutputConfig::Rtp(cfg) => {
+                if let Some(ref addr) = cfg.bind_addr {
+                    register(addr, Proto::Udp, format!("{label_prefix} (RTP source bind)"))?;
+                }
+                if let Some(ref red) = cfg.redundancy
+                    && let Some(ref addr) = red.bind_addr
+                {
+                    register(
+                        addr,
+                        Proto::Udp,
+                        format!("{label_prefix} (RTP source bind, redundancy leg 2)"),
+                    )?;
+                }
+            }
+            OutputConfig::Udp(cfg) => {
+                if let Some(ref addr) = cfg.bind_addr {
+                    register(addr, Proto::Udp, format!("{label_prefix} (UDP source bind)"))?;
+                }
+            }
+            OutputConfig::Rist(cfg) => {
+                // RIST sender binds RTP on even port P, RTCP on P+1. When the
+                // operator pins `local_addr`, both sockets matter for collision
+                // detection.
+                if let Some(ref addr) = cfg.local_addr {
+                    register(addr, Proto::Udp, format!("{label_prefix} (RIST RTP source bind)"))?;
+                    if let Ok(sa) = addr.parse::<SocketAddr>() {
+                        let rtcp = SocketAddr::new(sa.ip(), sa.port().wrapping_add(1));
+                        register(
+                            &rtcp.to_string(),
+                            Proto::Udp,
+                            format!("{label_prefix} (RIST RTCP source bind)"),
+                        )?;
                     }
                 }
-                if let Some(ref red) = cfg.redundancy {
-                    if red.mode != SrtMode::Caller {
-                        if let Some(ref addr) = red.local_addr {
-                            register(
-                                addr,
-                                Proto::Udp,
-                                format!("{label_prefix} (SRT redundancy leg 2)"),
-                            )?;
-                        }
+                if let Some(ref red) = cfg.redundancy
+                    && let Some(ref addr) = red.local_addr
+                {
+                    register(
+                        addr,
+                        Proto::Udp,
+                        format!("{label_prefix} (RIST RTP source bind, leg 2)"),
+                    )?;
+                    if let Ok(sa) = addr.parse::<SocketAddr>() {
+                        let rtcp = SocketAddr::new(sa.ip(), sa.port().wrapping_add(1));
+                        register(
+                            &rtcp.to_string(),
+                            Proto::Udp,
+                            format!("{label_prefix} (RIST RTCP source bind, leg 2)"),
+                        )?;
                     }
                 }
             }
-            // RTP/UDP/ST2110/RtpAudio output bind_addr is optional and defaults
-            // to "0.0.0.0:0" (ephemeral), so only register if explicitly set
-            // and non-zero.
-            _ => {}
+            OutputConfig::St2110_30(cfg) | OutputConfig::St2110_31(cfg) => {
+                if let Some(ref addr) = cfg.bind_addr {
+                    register(addr, Proto::Udp, format!("{label_prefix} (ST 2110 audio source bind)"))?;
+                }
+            }
+            OutputConfig::St2110_40(cfg) => {
+                if let Some(ref addr) = cfg.bind_addr {
+                    register(addr, Proto::Udp, format!("{label_prefix} (ST 2110-40 source bind)"))?;
+                }
+            }
+            OutputConfig::St2110_20(cfg) => {
+                if let Some(ref addr) = cfg.bind_addr {
+                    register(addr, Proto::Udp, format!("{label_prefix} (ST 2110-20 source bind)"))?;
+                }
+            }
+            OutputConfig::St2110_23(cfg) => {
+                for (i, s) in cfg.sub_streams.iter().enumerate() {
+                    if let Some(ref addr) = s.bind_addr {
+                        register(
+                            addr,
+                            Proto::Udp,
+                            format!("{label_prefix} (ST 2110-23 sub_streams[{i}] source bind)"),
+                        )?;
+                    }
+                }
+            }
+            OutputConfig::RtpAudio(cfg) => {
+                if let Some(ref addr) = cfg.bind_addr {
+                    register(addr, Proto::Udp, format!("{label_prefix} (RTP audio source bind)"))?;
+                }
+            }
+            OutputConfig::Bonded(cfg) => {
+                for (i, p) in cfg.paths.iter().enumerate() {
+                    if let Some(bind) = bond_path_bind_addr(&p.transport) {
+                        register(
+                            &bind,
+                            Proto::Udp,
+                            format!("{label_prefix} (bonded path[{i}] {})", p.name),
+                        )?;
+                    }
+                }
+            }
+            // Push-style outputs (RTMP/HLS/CMAF/WebRTC) don't bind a local port.
+            OutputConfig::Rtmp(_) | OutputConfig::Hls(_) | OutputConfig::Cmaf(_) | OutputConfig::Webrtc(_) => {}
         }
     }
 
@@ -5330,6 +5468,87 @@ mod tests {
         ]);
         let err = validate_config(&config).unwrap_err().to_string();
         assert!(err.contains("Port conflict"), "got: {err}");
+    }
+
+    /// RTP output `bind_addr` (when explicitly pinned) must be checked against
+    /// other listeners. Regression for the gap where `_ => {}` skipped every
+    /// non-SRT output in `validate_port_conflicts`.
+    #[test]
+    fn port_conflict_rtp_output_bind_collides_with_input() {
+        let mut config = make_config_with_rtp("0.0.0.0:5000", "127.0.0.1:5004");
+        if let OutputConfig::Rtp(o) = &mut config.outputs[0] {
+            o.bind_addr = Some("0.0.0.0:5000".to_string());
+        }
+        let err = validate_config(&config).unwrap_err().to_string();
+        assert!(err.contains("Port conflict"), "got: {err}");
+        assert!(err.contains("UDP"), "should mention protocol: {err}");
+        assert!(err.contains("5000"), "should mention port: {err}");
+    }
+
+    /// UDP output with `bind_addr` set to the same port as another input must
+    /// be flagged.
+    #[test]
+    fn port_conflict_udp_output_bind_vs_other_udp_output_bind() {
+        let mut config = make_config_with_rtp("0.0.0.0:5000", "127.0.0.1:5004");
+        config.outputs.push(OutputConfig::Udp(UdpOutputConfig {
+            id: "out-udp-a".into(),
+            name: "Udp A".into(),
+            active: true,
+            group: None,
+            dest_addr: "127.0.0.1:6000".into(),
+            bind_addr: Some("0.0.0.0:7777".into()),
+            interface_addr: None,
+            dscp: 46,
+            program_number: None,
+            transport_mode: None,
+            delay: None,
+            audio_encode: None,
+            transcode: None,
+            video_encode: None,
+        }));
+        config.outputs.push(OutputConfig::Udp(UdpOutputConfig {
+            id: "out-udp-b".into(),
+            name: "Udp B".into(),
+            active: true,
+            group: None,
+            dest_addr: "127.0.0.1:6001".into(),
+            bind_addr: Some("0.0.0.0:7777".into()),
+            interface_addr: None,
+            dscp: 46,
+            program_number: None,
+            transport_mode: None,
+            delay: None,
+            audio_encode: None,
+            transcode: None,
+            video_encode: None,
+        }));
+        let err = validate_config(&config).unwrap_err().to_string();
+        assert!(err.contains("Port conflict"), "got: {err}");
+        assert!(err.contains("7777"), "got: {err}");
+    }
+
+    /// Ephemeral RTP output bind (defaulting `bind_addr = None` or port 0)
+    /// must NOT collide with anything — confirms the early-return on port 0.
+    #[test]
+    fn no_port_conflict_for_ephemeral_output_bind() {
+        let mut config = make_config_with_rtp("0.0.0.0:5000", "127.0.0.1:5004");
+        if let OutputConfig::Rtp(o) = &mut config.outputs[0] {
+            o.bind_addr = Some("0.0.0.0:0".to_string());
+        }
+        validate_config(&config).expect("ephemeral output bind must not conflict");
+    }
+
+    /// Error message must include the entity ID so the manager UI can
+    /// attribute the conflict to a specific input/output.
+    #[test]
+    fn port_conflict_message_includes_entity_id() {
+        let mut config = make_config_with_rtp("0.0.0.0:5000", "127.0.0.1:5004");
+        if let OutputConfig::Rtp(o) = &mut config.outputs[0] {
+            o.bind_addr = Some("0.0.0.0:5000".to_string());
+        }
+        let err = validate_config(&config).unwrap_err().to_string();
+        assert!(err.contains("[in-1]"), "should include input id: {err}");
+        assert!(err.contains("[out-1]"), "should include output id: {err}");
     }
 
     // ── Dual-relay validation tests ──

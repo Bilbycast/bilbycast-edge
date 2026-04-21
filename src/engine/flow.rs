@@ -30,6 +30,7 @@ use super::output_webrtc::spawn_webrtc_output;
 use super::packet::{BROADCAST_CHANNEL_CAPACITY, RtpPacket};
 use super::ts_continuity_fixer::{ProcessResult, TsContinuityFixer};
 use super::bandwidth_monitor::spawn_bandwidth_monitor;
+use super::degradation_monitor::spawn_degradation_monitor;
 use super::media_analysis::spawn_media_analyzer;
 use super::thumbnail::spawn_thumbnail_generator;
 use super::tr101290::spawn_tr101290_analyzer;
@@ -110,6 +111,10 @@ pub struct FlowRuntime {
     /// Held for ownership — shutdown is driven by CancellationToken.
     #[allow(dead_code)]
     pub bandwidth_monitor_handle: Option<JoinHandle<()>>,
+    /// Continuous-degradation monitor handle (input-stall + FEC-rate
+    /// warnings). Always spawned; shutdown driven by CancellationToken.
+    #[allow(dead_code)]
+    pub degradation_monitor_handle: JoinHandle<()>,
     /// WHIP input session channel sender (only set for WebRTC/WHIP input flows).
     /// Must be registered with the WebrtcSessionRegistry after flow creation.
     #[cfg(feature = "webrtc")]
@@ -486,6 +491,15 @@ impl FlowRuntime {
                     config.config.id.clone(),
                     input_id.clone(),
                 ),
+                InputConfig::TestPattern(c) => super::input_test_pattern::spawn_test_pattern_input(
+                    c.clone(),
+                    per_input_tx.clone(),
+                    flow_stats.clone(),
+                    input_cancel.clone(),
+                    event_sender.clone(),
+                    config.config.id.clone(),
+                    input_id.clone(),
+                ),
             };
 
             // Spawn the forwarder: drains the per-input channel and forwards
@@ -507,7 +521,9 @@ impl FlowRuntime {
             // own broadcast channel so it captures this source's video even
             // when the input is passive / not currently active).
             let thumbnail_handle = if config.config.thumbnail && ffmpeg_available {
-                let thumb_acc = Arc::new(ThumbnailAccumulator::new());
+                let thumb_acc = Arc::new(ThumbnailAccumulator::new_with_update_notify(
+                    global_stats.thumbnail_update_notify.clone(),
+                ));
                 flow_stats.per_input_thumbnails.insert(input_id.clone(), thumb_acc.clone());
                 Some(spawn_thumbnail_generator(
                     &per_input_tx,
@@ -699,6 +715,14 @@ impl FlowRuntime {
                             },
                         )
                     }
+                    InputConfig::TestPattern(_) => (
+                        "test_pattern".to_string(),
+                        "h264_aac_ts".to_string(),
+                        false,
+                        None,
+                        false,
+                        None,
+                    ),
                 };
             let media_acc = Arc::new(MediaAnalysisAccumulator::new(
                 protocol,
@@ -725,7 +749,9 @@ impl FlowRuntime {
         // Start thumbnail generator (if enabled, ffmpeg available, and an
         // active input is present)
         let thumbnail_handle = if config.config.thumbnail && ffmpeg_available && active_input_cfg.is_some() {
-            let thumb_acc = Arc::new(ThumbnailAccumulator::new());
+            let thumb_acc = Arc::new(ThumbnailAccumulator::new_with_update_notify(
+                global_stats.thumbnail_update_notify.clone(),
+            ));
             flow_stats.thumbnail.set(thumb_acc.clone()).ok();
             Some(spawn_thumbnail_generator(
                 &broadcast_tx,
@@ -750,6 +776,15 @@ impl FlowRuntime {
         } else {
             None
         };
+
+        // Start continuous-degradation monitor (input-stall, FEC-rate).
+        // Always on — the thresholds are set so quiet links don't alarm.
+        let degradation_monitor_handle = spawn_degradation_monitor(
+            config.config.id.clone(),
+            flow_stats.clone(),
+            event_sender.clone(),
+            cancel_token.child_token(),
+        );
 
         // Start output tasks
         #[cfg(feature = "webrtc")]
@@ -823,6 +858,7 @@ impl FlowRuntime {
             media_analysis_handle,
             thumbnail_handle,
             bandwidth_monitor_handle,
+            degradation_monitor_handle,
             #[cfg(feature = "webrtc")]
             whip_session_tx: whip_session_info,
             #[cfg(feature = "webrtc")]
@@ -1450,6 +1486,7 @@ fn input_type_str(input: &InputConfig) -> &'static str {
         InputConfig::St2110_23(_) => "st2110_23",
         InputConfig::RtpAudio(_) => "rtp_audio",
         InputConfig::Bonded(_) => "bonded",
+        InputConfig::TestPattern(_) => "test_pattern",
     }
 }
 
@@ -1530,6 +1567,15 @@ fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::Inpu
             // Use the first path's identifier as a topology hint;
             // the full picture comes from bond stats, not this meta.
             mode: Some(format!("bonded ({} paths)", c.paths.len())),
+            local_addr: None,
+            remote_addr: None,
+            listen_addr: None,
+            bind_addr: None,
+            rtsp_url: None,
+            whep_url: None,
+        },
+        InputConfig::TestPattern(c) => InputConfigMeta {
+            mode: Some(format!("test-pattern {}x{}@{}", c.width, c.height, c.fps)),
             local_addr: None,
             remote_addr: None,
             listen_addr: None,

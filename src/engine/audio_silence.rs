@@ -60,7 +60,6 @@ pub const DEFAULT_GRACE: Duration = Duration::from_millis(500);
 /// See the module-level doc for the intended usage pattern.
 pub struct SilenceGenerator {
     sample_rate: u32,
-    channels: u8,
     samples_per_chunk: usize,
     zero_planar: Vec<Vec<f32>>,
     /// Running 90 kHz PTS for the next silent chunk we'll emit.
@@ -110,7 +109,6 @@ impl SilenceGenerator {
             .collect();
         Self {
             sample_rate,
-            channels,
             samples_per_chunk,
             zero_planar,
             pts_90k: initial_pts_90k,
@@ -128,12 +126,19 @@ impl SilenceGenerator {
         )
     }
 
-    pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
+    /// Channel count of the silent fill (length of the planar zero buffer).
+    /// Test-only — production code holds the configured channel count
+    /// directly on the encoder/segmenter that built this generator.
+    #[cfg(test)]
+    pub fn channels(&self) -> u8 {
+        self.zero_planar.len() as u8
     }
 
-    pub fn channels(&self) -> u8 {
-        self.channels
+    /// Configured sample rate. Test-only for the same reason as
+    /// [`channels`]; runtime callers consult their own encoder config.
+    #[cfg(test)]
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 
     /// Reset the watchdog after a real audio frame arrived. `pts_90k`

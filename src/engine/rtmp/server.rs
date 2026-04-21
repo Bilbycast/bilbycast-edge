@@ -62,9 +62,9 @@ pub async fn run_rtmp_server(
     is_publishing: Arc<AtomicBool>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let listener = TcpListener::bind(&config.listen_addr)
-        .await
-        .with_context(|| format!("RTMP server: failed to bind {}", config.listen_addr))?;
+    let listener = TcpListener::bind(&config.listen_addr).await.map_err(|e| {
+        crate::util::port_error::annotate_bind_error(e, &config.listen_addr, "RTMP server")
+    })?;
 
     tracing::info!("RTMP server listening on {}", config.listen_addr);
 

@@ -101,6 +101,7 @@ impl FlowSummary {
             // redundancy from the topology view). Flag as redundant when
             // more than one path is configured.
             Some(InputConfig::Bonded(c)) => ("bonded", c.paths.len() > 1),
+            Some(InputConfig::TestPattern(_)) => ("test_pattern", false),
             None => ("none", false),
         };
 

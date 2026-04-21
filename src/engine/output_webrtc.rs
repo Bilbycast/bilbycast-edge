@@ -617,11 +617,14 @@ async fn whep_server_loop(
         };
 
         let session_id = uuid::Uuid::new_v4().to_string();
-        let _ = msg.reply.send(Ok((answer, session_id.clone())));
+        // Per-viewer cancel token, rooted at the output task's parent. The
+        // API layer holds a clone so DELETE /whep/<session_id> tears down
+        // exactly this viewer without affecting other concurrent viewers.
+        let viewer_cancel = cancel.child_token();
+        let _ = msg.reply.send(Ok((answer, session_id.clone(), viewer_cancel.clone())));
 
         // Spawn a per-viewer send task
         let viewer_rx = broadcast_tx.subscribe();
-        let viewer_cancel = cancel.child_token();
         let viewer_stats = stats.clone();
         let output_id = config.id.clone();
         let video_only = config.video_only;
@@ -826,9 +829,22 @@ async fn whep_viewer_loop(
                                     ).await;
                                 }
                                 super::webrtc::ts_demux::DemuxedFrame::Opus => {
-                                    // TODO: handle native Opus passthrough
-                                    // (rare — would require an OBS source
-                                    // already publishing Opus-in-TS).
+                                    // Native Opus passthrough (input already
+                                    // publishing Opus-in-TS) is not yet wired
+                                    // through the str0m audio path. The frame
+                                    // is dropped — a rate-limited warning is
+                                    // emitted once per output so operators see
+                                    // the loss instead of silent degradation.
+                                    static OPUS_PASSTHROUGH_WARN: std::sync::atomic::AtomicBool =
+                                        std::sync::atomic::AtomicBool::new(false);
+                                    if !OPUS_PASSTHROUGH_WARN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                        events.emit_flow(
+                                            EventSeverity::Warning,
+                                            category::WEBRTC,
+                                            "Opus-in-TS passthrough is not yet wired on WHEP output — dropping audio frames",
+                                            flow_id,
+                                        );
+                                    }
                                 }
                                 super::webrtc::ts_demux::DemuxedFrame::Aac { data, pts } => {
                                     if matches!(encoder_state, WebrtcEncoderState::Lazy) {

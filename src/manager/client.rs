@@ -495,9 +495,15 @@ async fn try_connect(
     let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
     stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Thumbnail polling: check for new thumbnails every 5 seconds
-    let mut thumbnail_interval = tokio::time::interval(Duration::from_secs(5));
-    thumbnail_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Event-driven thumbnail delivery: the thumbnail generators notify this
+    // shared handle on every successful capture (input switch, freeze,
+    // signal change, steady-state tick). The fallback tick is a long-period
+    // safety net that also covers the cold-start case after a manager
+    // reconnect, where the generation counters may already be at their
+    // latest value with no pending notification.
+    let thumbnail_notify = flow_manager.stats().thumbnail_update_notify.clone();
+    let mut thumbnail_fallback = tokio::time::interval(Duration::from_secs(15));
+    thumbnail_fallback.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Track last-sent generation per flow to avoid re-sending unchanged thumbnails
     let mut thumbnail_generations: HashMap<String, u64> = HashMap::new();
 
@@ -620,78 +626,20 @@ async fn try_connect(
                 }
             }
 
-            // Send new thumbnails to manager (flow-level + per-input)
-            _ = thumbnail_interval.tick() => {
-                use base64::Engine;
-                let stats = flow_manager.stats();
-                for entry in stats.flow_stats.iter() {
-                    let flow_id = entry.key().clone();
-                    let acc = entry.value();
+            // Thumbnail push — fires when any ThumbnailAccumulator stores a
+            // new JPEG (input switch / freeze detection / steady-state tick).
+            _ = thumbnail_notify.notified() => {
+                if send_pending_thumbnails(flow_manager, &mut thumbnail_generations, &mut ws_write).await.is_err() {
+                    break;
+                }
+            }
 
-                    // Flow-level thumbnail (what outputs are sending)
-                    if let Some(thumb_acc) = acc.thumbnail.get() {
-                        let thumb_gen = thumb_acc.generation.load(std::sync::atomic::Ordering::Relaxed);
-                        let gen_key = format!("flow:{flow_id}");
-                        let prev = thumbnail_generations.get(&gen_key).copied().unwrap_or(0);
-                        if thumb_gen > prev {
-                            let jpeg_clone = thumb_acc.latest_jpeg.lock().unwrap()
-                                .as_ref()
-                                .map(|(jpeg, _)| jpeg.clone());
-                            if let Some(jpeg) = jpeg_clone {
-                                let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
-                                let envelope = serde_json::json!({
-                                    "type": "thumbnail",
-                                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                                    "payload": {
-                                        "flow_id": flow_id,
-                                        "data": b64,
-                                        "width": 320,
-                                        "height": 180
-                                    }
-                                });
-                                if let Ok(json) = serde_json::to_string(&envelope) {
-                                    if ws_write.send(Message::Text(json.into())).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                thumbnail_generations.insert(gen_key, thumb_gen);
-                            }
-                        }
-                    }
-
-                    // Per-input thumbnails (what each source is receiving)
-                    for per_input in acc.per_input_thumbnails.iter() {
-                        let input_id = per_input.key().clone();
-                        let thumb_acc = per_input.value();
-                        let thumb_gen = thumb_acc.generation.load(std::sync::atomic::Ordering::Relaxed);
-                        let gen_key = format!("input:{flow_id}:{input_id}");
-                        let prev = thumbnail_generations.get(&gen_key).copied().unwrap_or(0);
-                        if thumb_gen > prev {
-                            let jpeg_clone = thumb_acc.latest_jpeg.lock().unwrap()
-                                .as_ref()
-                                .map(|(jpeg, _)| jpeg.clone());
-                            if let Some(jpeg) = jpeg_clone {
-                                let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
-                                let envelope = serde_json::json!({
-                                    "type": "thumbnail",
-                                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                                    "payload": {
-                                        "flow_id": flow_id,
-                                        "input_id": input_id,
-                                        "data": b64,
-                                        "width": 320,
-                                        "height": 180
-                                    }
-                                });
-                                if let Ok(json) = serde_json::to_string(&envelope) {
-                                    if ws_write.send(Message::Text(json.into())).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                thumbnail_generations.insert(gen_key, thumb_gen);
-                            }
-                        }
-                    }
+            // Safety-net fallback. Covers the cold-start case after reconnect
+            // (the notifier may have no permit waiting) and shields against
+            // any missed notification.
+            _ = thumbnail_fallback.tick() => {
+                if send_pending_thumbnails(flow_manager, &mut thumbnail_generations, &mut ws_write).await.is_err() {
+                    break;
                 }
             }
 
@@ -878,6 +826,93 @@ async fn persist_credentials(
     }
 }
 
+/// Scan every flow's thumbnail accumulators (flow-level + per-input) and
+/// push any JPEG whose generation counter has advanced since the last send.
+/// Returns `Err(())` if a WebSocket send fails so the caller can terminate
+/// the session loop — matches the behavior of the stats / health / event
+/// send sites.
+async fn send_pending_thumbnails<S>(
+    flow_manager: &Arc<FlowManager>,
+    thumbnail_generations: &mut HashMap<String, u64>,
+    ws_write: &mut futures_util::stream::SplitSink<S, Message>,
+) -> Result<(), ()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    use base64::Engine;
+    let stats = flow_manager.stats();
+    for entry in stats.flow_stats.iter() {
+        let flow_id = entry.key().clone();
+        let acc = entry.value();
+
+        // Flow-level thumbnail (what outputs are sending).
+        if let Some(thumb_acc) = acc.thumbnail.get() {
+            let thumb_gen = thumb_acc.generation.load(std::sync::atomic::Ordering::Relaxed);
+            let gen_key = format!("flow:{flow_id}");
+            let prev = thumbnail_generations.get(&gen_key).copied().unwrap_or(0);
+            if thumb_gen > prev {
+                let jpeg_clone = thumb_acc.latest_jpeg.lock().unwrap()
+                    .as_ref()
+                    .map(|(jpeg, _)| jpeg.clone());
+                if let Some(jpeg) = jpeg_clone {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
+                    let envelope = serde_json::json!({
+                        "type": "thumbnail",
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                        "payload": {
+                            "flow_id": flow_id,
+                            "data": b64,
+                            "width": 320,
+                            "height": 180
+                        }
+                    });
+                    if let Ok(json) = serde_json::to_string(&envelope) {
+                        if ws_write.send(Message::Text(json.into())).await.is_err() {
+                            return Err(());
+                        }
+                    }
+                    thumbnail_generations.insert(gen_key, thumb_gen);
+                }
+            }
+        }
+
+        // Per-input thumbnails (what each source is receiving).
+        for per_input in acc.per_input_thumbnails.iter() {
+            let input_id = per_input.key().clone();
+            let thumb_acc = per_input.value();
+            let thumb_gen = thumb_acc.generation.load(std::sync::atomic::Ordering::Relaxed);
+            let gen_key = format!("input:{flow_id}:{input_id}");
+            let prev = thumbnail_generations.get(&gen_key).copied().unwrap_or(0);
+            if thumb_gen > prev {
+                let jpeg_clone = thumb_acc.latest_jpeg.lock().unwrap()
+                    .as_ref()
+                    .map(|(jpeg, _)| jpeg.clone());
+                if let Some(jpeg) = jpeg_clone {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
+                    let envelope = serde_json::json!({
+                        "type": "thumbnail",
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                        "payload": {
+                            "flow_id": flow_id,
+                            "input_id": input_id,
+                            "data": b64,
+                            "width": 320,
+                            "height": 180
+                        }
+                    });
+                    if let Ok(json) = serde_json::to_string(&envelope) {
+                        if ws_write.send(Message::Text(json.into())).await.is_err() {
+                            return Err(());
+                        }
+                    }
+                    thumbnail_generations.insert(gen_key, thumb_gen);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Handle a message from the manager.
 async fn handle_manager_message<S>(
     text: &str,
@@ -951,7 +986,12 @@ async fn handle_manager_message<S>(
             });
             match &result {
                 Ok(Some(data)) => { payload["data"] = data.clone(); }
-                Err(e) => { payload["error"] = serde_json::Value::String(e.clone()); }
+                Err(e) => {
+                    payload["error"] = serde_json::Value::String(e.message.clone());
+                    if let Some(code) = &e.code {
+                        payload["error_code"] = serde_json::Value::String(code.clone());
+                    }
+                }
                 _ => {}
             }
             let ack = serde_json::json!({
@@ -973,6 +1013,88 @@ async fn handle_manager_message<S>(
     }
 }
 
+/// Maximum window we wait after a flow spawn for the runtime input/output
+/// bind to either succeed (no event) or surface a Critical event with a
+/// known `error_code`. 600ms is enough for a UDP/TCP bind to complete on a
+/// healthy host but short enough that the manager doesn't perceive the
+/// command as hanging when no failure occurs.
+const FIRST_BIND_WAIT: Duration = Duration::from_millis(600);
+/// Polling interval inside the wait window. 60ms gives ~10 polls per window.
+const FIRST_BIND_POLL: Duration = Duration::from_millis(60);
+
+/// Poll the in-process recent-event tracker for a Critical port_conflict /
+/// bind_failed event scoped to `flow_id` that occurred at or after
+/// `spawn_started_at`. Returns the corresponding [`CommandError`] if one is
+/// found within [`FIRST_BIND_WAIT`].
+async fn wait_for_first_bind_failure(
+    events: &super::events::EventSender,
+    flow_id: &str,
+    spawn_started_at: std::time::Instant,
+) -> Option<CommandError> {
+    let deadline = spawn_started_at + FIRST_BIND_WAIT;
+    loop {
+        if let Some(critical) = events.take_recent_critical_for_flow(flow_id, spawn_started_at) {
+            let code = critical.error_code.unwrap_or_else(|| "bind_failed".to_string());
+            // Only surface bind-related critical events on the ack — other
+            // critical events (codec init failure, etc.) ride through the
+            // generic flow error path.
+            if code == "port_conflict" || code == "bind_failed" {
+                return Some(CommandError::with_code(critical.event.message.clone(), code));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(FIRST_BIND_POLL).await;
+    }
+}
+
+/// Structured failure returned to the manager via `command_ack`. Old managers
+/// ignore the optional `code`; new managers (>=0.25.x) read it as a stable
+/// machine identifier (`"port_conflict"`, `"validation_error"`, etc.) so the
+/// UI can render targeted error messages.
+#[derive(Debug, Clone)]
+pub(crate) struct CommandError {
+    pub message: String,
+    pub code: Option<String>,
+}
+
+impl CommandError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self { message: message.into(), code: None }
+    }
+    pub fn with_code(message: impl Into<String>, code: impl Into<String>) -> Self {
+        Self { message: message.into(), code: Some(code.into()) }
+    }
+
+    /// Inspect a configuration validation error and pick the right code.
+    /// Validation messages with the prefix "Port conflict:" come from
+    /// `validate_port_conflicts` and map to the `port_conflict` code so the
+    /// manager UI can highlight the offending field. Everything else falls
+    /// back to `validation_error`.
+    pub fn from_validation(prefix: &str, e: impl std::fmt::Display) -> Self {
+        let inner = format!("{e}");
+        let code = if inner.starts_with("Port conflict:") {
+            "port_conflict"
+        } else {
+            "validation_error"
+        };
+        Self::with_code(format!("{prefix}: {inner}"), code)
+    }
+}
+
+impl From<String> for CommandError {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<&str> for CommandError {
+    fn from(message: &str) -> Self {
+        Self::new(message.to_string())
+    }
+}
+
 async fn execute_command(
     action_type: &str,
     action: &serde_json::Value,
@@ -982,17 +1104,17 @@ async fn execute_command(
     config_path: &PathBuf,
     secrets_path: &PathBuf,
     _webrtc_sessions: &WebrtcRegistry,
-) -> Result<Option<serde_json::Value>, String> {
+) -> Result<Option<serde_json::Value>, CommandError> {
     match action_type {
         "create_flow" => {
             let flow: FlowConfig = serde_json::from_value(action["flow"].clone())
                 .map_err(|e| format!("Invalid flow config: {e}"))?;
-            validate_flow(&flow).map_err(|e| format!("Invalid flow config: {e}"))?;
+            validate_flow(&flow).map_err(|e| CommandError::from_validation("Invalid flow config", e))?;
             // Check for duplicate flow ID
             {
                 let cfg = app_config.read().await;
                 if cfg.flows.iter().any(|f| f.id == flow.id) {
-                    return Err(format!("Duplicate flow ID '{}'", flow.id));
+                    return Err(CommandError::new(format!("Duplicate flow ID '{}'", flow.id)));
                 }
             }
             tracing::info!("Manager command: create flow '{}'", flow.id);
@@ -1000,6 +1122,7 @@ async fn execute_command(
                 let cfg = app_config.read().await;
                 cfg.resolve_flow(&flow).map_err(|e| e.to_string())?
             };
+            let spawn_started_at = std::time::Instant::now();
             let _runtime = flow_manager
                 .create_flow(resolved)
                 .await
@@ -1008,6 +1131,15 @@ async fn execute_command(
             register_whip_if_needed(_webrtc_sessions, &_runtime);
             #[cfg(feature = "webrtc")]
             register_whep_if_needed(_webrtc_sessions, &_runtime);
+            // Wait briefly for the runtime spawn to bind. If a port conflict
+            // or bind failure is reported within the window, surface it on
+            // the command_ack with `error_code` so the manager UI can
+            // attribute the failure to the just-submitted change instead of
+            // racing the events page.
+            if let Some(err) = wait_for_first_bind_failure(flow_manager.event_sender(), &flow.id, spawn_started_at).await {
+                let _ = flow_manager.destroy_flow(&flow.id).await;
+                return Err(err);
+            }
             // Persist to config
             let mut cfg = app_config.write().await;
             cfg.flows.push(flow);
@@ -1017,7 +1149,7 @@ async fn execute_command(
         "update_flow" => {
             let new_flow: FlowConfig = serde_json::from_value(action["flow"].clone())
                 .map_err(|e| format!("Invalid flow config: {e}"))?;
-            validate_flow(&new_flow).map_err(|e| format!("Invalid flow config: {e}"))?;
+            validate_flow(&new_flow).map_err(|e| CommandError::from_validation("Invalid flow config", e))?;
             let flow_id = action["flow_id"]
                 .as_str()
                 .unwrap_or(&new_flow.id);
@@ -1033,21 +1165,35 @@ async fn execute_command(
 
             if let Some(old_flow) = old_flow {
                 if was_running && new_flow.enabled {
-                    // Flow exists and should keep running — diff it
+                    // Flow exists and should keep running — diff it.
+                    //
+                    // Only fields that actively affect the running task graph
+                    // force a restart. `name` is cosmetic; `thumbnail` and
+                    // `media_analysis` are subscriber-task toggles whose
+                    // current runtime binding is baked in at flow spawn —
+                    // the new flag is persisted for the *next* start-up, but
+                    // toggling mid-flight is not yet wired through the
+                    // FlowManager, so we avoid the disruptive restart here.
                     let input_changed = old_flow.input_ids != new_flow.input_ids;
-                    let meta_changed = old_flow.name != new_flow.name
+                    let restart_required = old_flow.bandwidth_limit != new_flow.bandwidth_limit;
+                    let persist_only_meta_changed = old_flow.name != new_flow.name
                         || old_flow.media_analysis != new_flow.media_analysis
-                        || old_flow.thumbnail != new_flow.thumbnail
-                        || old_flow.bandwidth_limit != new_flow.bandwidth_limit;
+                        || old_flow.thumbnail != new_flow.thumbnail;
+                    if persist_only_meta_changed && !(input_changed || restart_required) {
+                        tracing::info!(
+                            "Update flow '{flow_id}': metadata-only change (name/thumbnail/media_analysis) — persisting without restart; new thumbnail/media_analysis flag takes effect at next flow restart"
+                        );
+                    }
 
-                    if input_changed || meta_changed {
-                        // Input or metadata changed — must restart entire flow
-                        tracing::info!("Update flow '{flow_id}': restarting (input changed={input_changed}, meta changed={meta_changed})");
+                    if input_changed || restart_required {
+                        // Input or rate-limit changed — must restart entire flow
+                        tracing::info!("Update flow '{flow_id}': restarting (input changed={input_changed}, bandwidth_limit changed={restart_required})");
                         let _ = flow_manager.destroy_flow(flow_id).await;
                         let resolved = {
                             let cfg = app_config.read().await;
                             cfg.resolve_flow(&new_flow).map_err(|e| e.to_string())?
                         };
+                        let spawn_started_at = std::time::Instant::now();
                         let _runtime = flow_manager
                             .create_flow(resolved)
                             .await
@@ -1056,6 +1202,10 @@ async fn execute_command(
                         register_whip_if_needed(_webrtc_sessions, &_runtime);
                         #[cfg(feature = "webrtc")]
                         register_whep_if_needed(_webrtc_sessions, &_runtime);
+                        if let Some(err) = wait_for_first_bind_failure(flow_manager.event_sender(), flow_id, spawn_started_at).await {
+                            let _ = flow_manager.destroy_flow(flow_id).await;
+                            return Err(err);
+                        }
                     } else {
                         // Only outputs changed — diff surgically against the runtime.
                         // `old_flow.output_ids` is intentionally unused here; see
@@ -1079,6 +1229,7 @@ async fn execute_command(
                         let cfg = app_config.read().await;
                         cfg.resolve_flow(&new_flow).map_err(|e| e.to_string())?
                     };
+                    let spawn_started_at = std::time::Instant::now();
                     let _runtime = flow_manager
                         .create_flow(resolved)
                         .await
@@ -1087,6 +1238,10 @@ async fn execute_command(
                     register_whip_if_needed(_webrtc_sessions, &_runtime);
                     #[cfg(feature = "webrtc")]
                     register_whep_if_needed(_webrtc_sessions, &_runtime);
+                    if let Some(err) = wait_for_first_bind_failure(flow_manager.event_sender(), flow_id, spawn_started_at).await {
+                        let _ = flow_manager.destroy_flow(flow_id).await;
+                        return Err(err);
+                    }
                 }
             } else {
                 // No old flow — create new
@@ -1096,6 +1251,7 @@ async fn execute_command(
                     let cfg = app_config.read().await;
                     cfg.resolve_flow(&new_flow).map_err(|e| e.to_string())?
                 };
+                let spawn_started_at = std::time::Instant::now();
                 let _runtime = flow_manager
                     .create_flow(resolved)
                     .await
@@ -1104,6 +1260,10 @@ async fn execute_command(
                 register_whip_if_needed(_webrtc_sessions, &_runtime);
                 #[cfg(feature = "webrtc")]
                 register_whep_if_needed(_webrtc_sessions, &_runtime);
+                if let Some(err) = wait_for_first_bind_failure(flow_manager.event_sender(), flow_id, spawn_started_at).await {
+                    let _ = flow_manager.destroy_flow(flow_id).await;
+                    return Err(err);
+                }
             }
 
             // Update config
@@ -1181,7 +1341,7 @@ async fn execute_command(
             let output: OutputConfig =
                 serde_json::from_value(action["output"].clone())
                     .map_err(|e| format!("Invalid output config: {e}"))?;
-            validate_output(&output).map_err(|e| format!("Invalid output config: {e}"))?;
+            validate_output(&output).map_err(|e| CommandError::from_validation("Invalid output config", e))?;
             tracing::info!("Manager command: add output to flow '{flow_id}'");
             flow_manager
                 .add_output(flow_id, output.clone())
@@ -1228,11 +1388,11 @@ async fn execute_command(
         "create_input" => {
             let input: InputDefinition = serde_json::from_value(action["input"].clone())
                 .map_err(|e| format!("Invalid input config: {e}"))?;
-            validate_input_definition(&input).map_err(|e| format!("Invalid input: {e}"))?;
+            validate_input_definition(&input).map_err(|e| CommandError::from_validation("Invalid input", e))?;
             tracing::info!("Manager command: create input '{}' ({})", input.id, input.config.type_name());
             let mut cfg = app_config.write().await;
             if cfg.inputs.iter().any(|i| i.id == input.id) {
-                return Err(format!("Input '{}' already exists", input.id));
+                return Err(CommandError::new(format!("Input '{}' already exists", input.id)));
             }
             let id = input.id.clone();
             cfg.inputs.push(input);
@@ -1247,7 +1407,7 @@ async fn execute_command(
             let input_id = action["input_id"].as_str().ok_or("Missing input_id")?;
             let mut input: InputDefinition = serde_json::from_value(action["input"].clone())
                 .map_err(|e| format!("Invalid input config: {e}"))?;
-            validate_input_definition(&input).map_err(|e| format!("Invalid input: {e}"))?;
+            validate_input_definition(&input).map_err(|e| CommandError::from_validation("Invalid input", e))?;
             tracing::info!("Manager command: update input '{input_id}'");
             let mut cfg = app_config.write().await;
             let idx = cfg.inputs.iter().position(|i| i.id == input_id)
@@ -1288,9 +1448,9 @@ async fn execute_command(
                 .position(|f| f.id == flow_id)
                 .ok_or_else(|| format!("Flow '{flow_id}' not found"))?;
             if !cfg.flows[flow_idx].input_ids.iter().any(|id| id == &input_id) {
-                return Err(format!(
+                return Err(CommandError::new(format!(
                     "Input '{input_id}' is not a member of flow '{flow_id}'"
-                ));
+                )));
             }
             let member_ids: Vec<String> = cfg.flows[flow_idx].input_ids.clone();
             for def in cfg.inputs.iter_mut() {
@@ -1336,12 +1496,12 @@ async fn execute_command(
             tracing::info!("Manager command: delete input '{input_id}'");
             let mut cfg = app_config.write().await;
             if cfg.flow_using_input(input_id).is_some() {
-                return Err(format!("Input '{input_id}' is assigned to a flow — unassign first"));
+                return Err(CommandError::new(format!("Input '{input_id}' is assigned to a flow — unassign first")));
             }
             let before = cfg.inputs.len();
             cfg.inputs.retain(|i| i.id != input_id);
             if cfg.inputs.len() == before {
-                return Err(format!("Input '{input_id}' not found"));
+                return Err(CommandError::new(format!("Input '{input_id}' not found")));
             }
             persist_config(&cfg, config_path, secrets_path).await;
             flow_manager.event_sender().emit_input(
@@ -1354,11 +1514,11 @@ async fn execute_command(
         "create_output" => {
             let output: OutputConfig = serde_json::from_value(action["output"].clone())
                 .map_err(|e| format!("Invalid output config: {e}"))?;
-            validate_output(&output).map_err(|e| format!("Invalid output: {e}"))?;
+            validate_output(&output).map_err(|e| CommandError::from_validation("Invalid output", e))?;
             tracing::info!("Manager command: create output '{}' ({})", output.id(), output.type_name());
             let mut cfg = app_config.write().await;
             if cfg.outputs.iter().any(|o| o.id() == output.id()) {
-                return Err(format!("Output '{}' already exists", output.id()));
+                return Err(CommandError::new(format!("Output '{}' already exists", output.id())));
             }
             let id = output.id().to_string();
             cfg.outputs.push(output);
@@ -1373,7 +1533,7 @@ async fn execute_command(
             let output_id = action["output_id"].as_str().ok_or("Missing output_id")?;
             let output: OutputConfig = serde_json::from_value(action["output"].clone())
                 .map_err(|e| format!("Invalid output config: {e}"))?;
-            validate_output(&output).map_err(|e| format!("Invalid output: {e}"))?;
+            validate_output(&output).map_err(|e| CommandError::from_validation("Invalid output", e))?;
             tracing::info!("Manager command: update output '{output_id}'");
             let mut cfg = app_config.write().await;
             let idx = cfg.outputs.iter().position(|o| o.id() == output_id)
@@ -1399,12 +1559,12 @@ async fn execute_command(
             tracing::info!("Manager command: delete output '{output_id}'");
             let mut cfg = app_config.write().await;
             if cfg.flow_using_output(output_id).is_some() {
-                return Err(format!("Output '{output_id}' is assigned to a flow — unassign first"));
+                return Err(CommandError::new(format!("Output '{output_id}' is assigned to a flow — unassign first")));
             }
             let before = cfg.outputs.len();
             cfg.outputs.retain(|o| o.id() != output_id);
             if cfg.outputs.len() == before {
-                return Err(format!("Output '{output_id}' not found"));
+                return Err(CommandError::new(format!("Output '{output_id}' not found")));
             }
             persist_config(&cfg, config_path, secrets_path).await;
             flow_manager.event_sender().emit_output(
@@ -1417,7 +1577,7 @@ async fn execute_command(
             let mut tunnel: TunnelConfig = serde_json::from_value(action["tunnel"].clone())
                 .map_err(|e| format!("Invalid tunnel config: {e}"))?;
             tunnel.normalize_relay_addrs();
-            validate_tunnel(&tunnel).map_err(|e| format!("Invalid tunnel config: {e}"))?;
+            validate_tunnel(&tunnel).map_err(|e| CommandError::from_validation("Invalid tunnel config", e))?;
             tracing::info!("Manager command: create tunnel '{}'", tunnel.id);
             tunnel_manager
                 .create_tunnel(tunnel.clone())
@@ -1463,7 +1623,7 @@ async fn execute_command(
             let existing_secrets = SecretsConfig::extract_from(&old_config);
             existing_secrets.merge_into(&mut new_config);
 
-            validate_config(&new_config).map_err(|e| format!("Invalid config: {e}"))?;
+            validate_config(&new_config).map_err(|e| CommandError::from_validation("Invalid config", e))?;
             tracing::info!("Manager command: update_config (diff-based)");
 
             tracing::info!("Config diff: old={} flows/{} tunnels, new={} flows/{} tunnels",
@@ -1530,16 +1690,26 @@ async fn execute_command(
                                 Err(e) => tracing::warn!("Failed to resolve flow '{id}': {e}"),
                             }
                         } else if was_running && should_run {
-                            // Both running — check what changed
+                            // Both running — check what changed. Only fields
+                            // bound into the running task graph force a
+                            // restart; rename and thumbnail/media_analysis
+                            // toggles just persist (they take effect at next
+                            // start-up, since mid-flight subscriber toggle
+                            // is not yet wired through FlowManager).
                             let input_changed = old_flow.input_ids != new_flow.input_ids;
-                            let meta_changed = old_flow.name != new_flow.name
+                            let restart_required = old_flow.bandwidth_limit != new_flow.bandwidth_limit;
+                            let persist_only_meta_changed = old_flow.name != new_flow.name
                                 || old_flow.media_analysis != new_flow.media_analysis
-                                || old_flow.thumbnail != new_flow.thumbnail
-                                || old_flow.bandwidth_limit != new_flow.bandwidth_limit;
+                                || old_flow.thumbnail != new_flow.thumbnail;
+                            if persist_only_meta_changed && !(input_changed || restart_required) {
+                                tracing::info!(
+                                    "Config diff: flow '{id}' metadata-only change — persisting without restart; thumbnail/media_analysis toggles apply at next flow restart"
+                                );
+                            }
 
-                            if input_changed || meta_changed {
-                                // Input or flow metadata changed → must restart entire flow
-                                tracing::info!("Config diff: restarting flow '{id}' (input changed={input_changed}, meta changed={meta_changed})");
+                            if input_changed || restart_required {
+                                // Input or rate-limit changed → must restart entire flow
+                                tracing::info!("Config diff: restarting flow '{id}' (input changed={input_changed}, bandwidth_limit changed={restart_required})");
                                 let _ = flow_manager.destroy_flow(id).await;
                                 match new_config.resolve_flow(new_flow) {
                                     Ok(resolved) => match flow_manager.create_flow(resolved).await {
@@ -1616,6 +1786,8 @@ async fn execute_command(
                 cfg.server = new_config.server.clone();
                 cfg.monitor = new_config.monitor.clone();
                 cfg.flow_groups = new_config.flow_groups.clone();
+                cfg.device_name = new_config.device_name.clone();
+                cfg.resource_limits = new_config.resource_limits.clone();
                 if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), cfg.clone()).await {
                     tracing::warn!("Failed to persist config after manager command: {e}");
                     tunnel_manager.event_sender().emit(
@@ -1634,21 +1806,40 @@ async fn execute_command(
 
             Ok(None)
         }
-        // ── SMPTE ST 2110 (Phase 1) read commands ──
+        // ── SMPTE ST 2110 read commands ──
         //
-        // These are thin wrappers around state already exposed via the
-        // IS-04/IS-05/IS-08 REST endpoints. The manager UI's "Refresh" buttons
-        // can hit either the REST endpoints directly or these WS commands.
-        // For now we ack them; full result-payload wiring is a separate task.
+        // Edges connect outbound to the manager over WS, typically behind
+        // NAT, so the manager can't call the edge's REST `/x-nmos/`
+        // endpoints directly. These WS commands are the data path the
+        // manager uses instead. For each, we read the live state from the
+        // globally-registered handle (set at startup) and return it as
+        // `data` on the command ack. Unknown/unregistered state returns an
+        // empty object rather than failing — the UI handles "no data".
+        "get_audio_channel_map" => {
+            let data = match crate::engine::audio_transcode::subscribe_global_is08() {
+                Some(rx) => {
+                    let snapshot = rx.borrow().clone();
+                    serde_json::to_value(&*snapshot).unwrap_or_else(|_| serde_json::json!({}))
+                }
+                None => serde_json::json!({}),
+            };
+            Ok(Some(data))
+        }
         "get_nmos_state"
         | "get_ptp_state"
         | "get_sdp_document"
-        | "get_audio_channel_map"
         | "set_audio_channel_map" => {
-            tracing::info!(
-                "Manager command: {action_type} (Phase 1 stub — acked, NMOS state served via REST)"
-            );
-            Ok(None)
+            // Remaining ST 2110 read commands still use their canonical
+            // endpoints: `/ptp` is served from the manager's own
+            // `ptp_state_cache` (populated from stats ingestion), the
+            // others are typically consumed by external NMOS controllers
+            // talking to the edge's `/x-nmos/` REST API directly. Return
+            // an explicit "use REST endpoint" marker so any WS caller
+            // sees a diagnostic rather than silent empty success.
+            Ok(Some(serde_json::json!({
+                "status": "use_rest_endpoint",
+                "hint": "This command is intentionally unpopulated on the WS path. Use the edge's /x-nmos/ REST endpoints or, for PTP, the manager's /api/v1/nodes/{id}/ptp cache."
+            })))
         }
         // ── SMPTE ST 2110 flow group mutation commands ──
         //
@@ -1950,6 +2141,16 @@ async fn execute_command(
             }
 
             tracing::info!("Node secret rotated and persisted to secrets.json");
+            // Surface a manager-visible confirmation so the UI can show the
+            // rotation actually landed on disk. Without this, the manager
+            // has only its own DB update to go on; if the edge reboots
+            // before the new secret is persisted the next reconnect auth
+            // fails silently.
+            flow_manager.event_sender().emit(
+                crate::manager::events::EventSeverity::Info,
+                crate::manager::events::category::MANAGER,
+                "Node authentication secret rotated and persisted",
+            );
             Ok(None)
         }
         "test_input" => {
@@ -1965,10 +2166,10 @@ async fn execute_command(
             // Reject if assigned to a running flow (port conflict)
             if let Some(flow) = cfg.flows.iter().find(|f| f.input_ids.iter().any(|id| id == input_id)) {
                 if flow_manager.is_running(&flow.id) {
-                    return Err(format!(
+                    return Err(CommandError::new(format!(
                         "Input '{input_id}' is in use by running flow '{}'",
                         flow.id
-                    ));
+                    )));
                 }
             }
             let input_config = input_def.config.clone();
@@ -1991,10 +2192,10 @@ async fn execute_command(
             // Reject if assigned to a running flow (port conflict)
             if let Some(flow) = cfg.flows.iter().find(|f| f.output_ids.iter().any(|oid| oid == output_id)) {
                 if flow_manager.is_running(&flow.id) {
-                    return Err(format!(
+                    return Err(CommandError::new(format!(
                         "Output '{output_id}' is in use by running flow '{}'",
                         flow.id
-                    ));
+                    )));
                 }
             }
             let output_config = output.clone();
@@ -2004,7 +2205,7 @@ async fn execute_command(
             let result = crate::engine::test_connection::test_output(&output_config).await;
             Ok(Some(serde_json::to_value(result).unwrap()))
         }
-        _ => Err(format!("Unknown command: {action_type}")),
+        _ => Err(CommandError::with_code(format!("Unknown command: {action_type}"), "unknown_action")),
     }
 }
 

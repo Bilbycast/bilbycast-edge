@@ -50,6 +50,27 @@ pub struct Event {
     pub output_id: Option<String>,
 }
 
+/// Snapshot of a recent critical event captured by the in-process recent-event
+/// tracker. Used by command handlers (`create_flow`, `update_flow`,
+/// `update_input`, `update_output`) to surface a runtime port-conflict or
+/// bind-failure that happened just after the spawn returned `Ok` — so the
+/// `command_ack` reflects the real outcome.
+#[derive(Debug, Clone)]
+pub struct RecentCritical {
+    pub event: Event,
+    pub error_code: Option<String>,
+    pub captured_at: Instant,
+}
+
+/// Per-scope ring of the most recent critical event keyed by flow id.
+/// Old entries are evicted lazily when a fresher one is pushed for the same
+/// flow — there is no background sweeper, since the only consumer (command
+/// handler post-spawn polling) clears its own scope on read.
+#[derive(Debug, Default)]
+struct RecentCriticalTracker {
+    by_flow: std::sync::RwLock<HashMap<String, RecentCritical>>,
+}
+
 /// Clonable handle for sending events from any component.
 ///
 /// Sending never blocks or fails — if the receiver is dropped (manager client
@@ -57,13 +78,51 @@ pub struct Event {
 #[derive(Debug, Clone)]
 pub struct EventSender {
     tx: mpsc::UnboundedSender<Event>,
+    recent: std::sync::Arc<RecentCriticalTracker>,
 }
 
 impl EventSender {
-    /// Send an event to the manager.
+    /// Send an event to the manager. Critical events are also stashed in the
+    /// in-process recent-event tracker so command handlers can poll for the
+    /// outcome of a freshly spawned input/output.
     pub fn send(&self, event: Event) {
+        // Stash flow-scoped Critical events so the WS command handler can
+        // poll for a runtime bind failure that happened just after spawn.
+        // We only track the flow scope today — the input/output scope would
+        // need an eviction policy and isn't read by anything yet.
+        if event.severity == EventSeverity::Critical
+            && let Some(fid) = &event.flow_id
+        {
+            let code = event
+                .details
+                .as_ref()
+                .and_then(|d| d.get("error_code").and_then(|v| v.as_str()).map(String::from));
+            let entry = RecentCritical {
+                event: event.clone(),
+                error_code: code,
+                captured_at: Instant::now(),
+            };
+            if let Ok(mut g) = self.recent.by_flow.write() {
+                g.insert(fid.clone(), entry);
+            }
+        }
         let _ = self.tx.send(event);
     }
+
+    /// Consume and return the most recent critical event for `flow_id` whose
+    /// `captured_at >= since`. Used by command handlers to wait for the result
+    /// of a spawn that races the runtime bind path.
+    pub fn take_recent_critical_for_flow(&self, flow_id: &str, since: Instant) -> Option<RecentCritical> {
+        let mut g = self.recent.by_flow.write().ok()?;
+        if let Some(entry) = g.get(flow_id).cloned()
+            && entry.captured_at >= since
+        {
+            g.remove(flow_id);
+            return Some(entry);
+        }
+        None
+    }
+
 
     /// Convenience: send an event with just severity, category, and message.
     pub fn emit(&self, severity: EventSeverity, category: &str, message: impl Into<String>) {
@@ -211,6 +270,137 @@ impl EventSender {
             output_id: None,
         });
     }
+
+    /// Emit a Critical `port_conflict` event (OS-level "address already in use"
+    /// at runtime, or an internal collision detected at bind time). Carries a
+    /// stable `error_code = "port_conflict"` in `details` so the manager UI
+    /// can attribute and highlight the offending field.
+    pub fn emit_port_conflict(
+        &self,
+        component: &str,
+        addr: impl std::fmt::Display,
+        proto: BindProto,
+        scope: BindScope<'_>,
+        error: impl std::fmt::Display,
+    ) {
+        let addr = addr.to_string();
+        let message = format!(
+            "Port conflict: {component} could not bind to {proto} {addr} — address already in use"
+        );
+        let details = serde_json::json!({
+            "error_code": "port_conflict",
+            "component": component,
+            "addr": addr,
+            "protocol": proto.as_str(),
+            "error": error.to_string(),
+        });
+        self.send(scope.into_event(
+            EventSeverity::Critical,
+            category::PORT_CONFLICT,
+            message,
+            details,
+        ));
+    }
+
+    /// Emit a Critical `bind_failed` event for any bind error other than
+    /// EADDRINUSE (e.g. permission denied, no such device, multicast group
+    /// rejected). For EADDRINUSE use [`emit_port_conflict`] instead.
+    pub fn emit_bind_failed(
+        &self,
+        component: &str,
+        addr: impl std::fmt::Display,
+        proto: BindProto,
+        scope: BindScope<'_>,
+        error: impl std::fmt::Display,
+    ) {
+        let addr = addr.to_string();
+        let error_str = error.to_string();
+        let message = format!("{component} failed to bind to {proto} {addr}: {error_str}");
+        let details = serde_json::json!({
+            "error_code": "bind_failed",
+            "component": component,
+            "addr": addr,
+            "protocol": proto.as_str(),
+            "error": error_str,
+        });
+        self.send(scope.into_event(
+            EventSeverity::Critical,
+            category::BIND_FAILED,
+            message,
+            details,
+        ));
+    }
+}
+
+/// Protocol label attached to bind-failure events so operators can tell a UDP
+/// listener collision from a TCP one. Matches the same enum the config-load
+/// validator uses for cross-entity port-conflict detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindProto {
+    Udp,
+    Tcp,
+}
+
+impl BindProto {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BindProto::Udp => "UDP",
+            BindProto::Tcp => "TCP",
+        }
+    }
+}
+
+impl std::fmt::Display for BindProto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Scope of a bind failure: which entity does it belong to. Used by the
+/// `emit_port_conflict` / `emit_bind_failed` helpers so callers can specify
+/// any combination of flow/input/output without juggling four overloads.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BindScope<'a> {
+    pub flow_id: Option<&'a str>,
+    pub input_id: Option<&'a str>,
+    pub output_id: Option<&'a str>,
+}
+
+impl<'a> BindScope<'a> {
+    pub fn input(input_id: &'a str) -> Self {
+        Self { input_id: Some(input_id), ..Self::default() }
+    }
+    pub fn flow(flow_id: &'a str) -> Self {
+        Self { flow_id: Some(flow_id), ..Self::default() }
+    }
+    /// Test-only convenience used by `emit_port_conflict_event_shape` to
+    /// pin both flow and input ids — the rest of the code paths populate
+    /// the struct directly.
+    #[cfg(test)]
+    pub fn flow_input(flow_id: &'a str, input_id: &'a str) -> Self {
+        Self { flow_id: Some(flow_id), input_id: Some(input_id), output_id: None }
+    }
+    /// Test-only: empty scope, used to verify scopeless bind-failure events.
+    #[cfg(test)]
+    pub fn none() -> Self { Self::default() }
+
+    fn into_event(
+        self,
+        severity: EventSeverity,
+        category: &str,
+        message: String,
+        details: serde_json::Value,
+    ) -> Event {
+        Event {
+            severity,
+            category: category.to_string(),
+            message,
+            details: Some(details),
+            flow_id: self.flow_id.map(|s| s.to_string()),
+            input_id: self.input_id.map(|s| s.to_string()),
+            output_id: self.output_id.map(|s| s.to_string()),
+        }
+    }
 }
 
 /// Event category strings used by the edge.
@@ -276,8 +466,14 @@ pub mod category {
     pub const REDUNDANCY: &str = "redundancy";
     /// Standby SRT listener port management.
     pub const STANDBY: &str = "standby";
-    /// Tunnel port conflict events.
+    /// Port conflict events — internal collision between two configured
+    /// entities or an OS-level "address already in use" at runtime.
+    /// Always paired with `details.error_code = "port_conflict"`.
     pub const PORT_CONFLICT: &str = "port_conflict";
+    /// Generic bind failure (permission denied, no such device, multicast
+    /// group rejected, etc.). For EADDRINUSE prefer `PORT_CONFLICT`.
+    /// Always paired with `details.error_code = "bind_failed"`.
+    pub const BIND_FAILED: &str = "bind_failed";
 }
 
 /// Scope label passed to [`run_bond_event_forwarder`] so generated
@@ -489,12 +685,62 @@ fn path_dead_reason_tag(reason: &PathDeadReason) -> &'static str {
 /// manager WebSocket client loop.
 pub fn event_channel() -> (EventSender, mpsc::UnboundedReceiver<Event>) {
     let (tx, rx) = mpsc::unbounded_channel();
-    (EventSender { tx }, rx)
+    (EventSender { tx, recent: std::sync::Arc::new(RecentCriticalTracker::default()) }, rx)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `emit_port_conflict` produces a Critical event on the
+    /// `port_conflict` category with `details.error_code = "port_conflict"`.
+    /// Manager UI parsers depend on this exact shape to highlight the
+    /// offending field.
+    #[test]
+    fn emit_port_conflict_event_shape() {
+        let (sender, mut rx) = event_channel();
+        sender.emit_port_conflict(
+            "SRT input listener",
+            "0.0.0.0:9527",
+            BindProto::Udp,
+            BindScope::flow_input("flow-1", "in-1"),
+            "address already in use",
+        );
+        let ev = rx.try_recv().expect("event delivered");
+        assert_eq!(ev.severity, EventSeverity::Critical);
+        assert_eq!(ev.category, category::PORT_CONFLICT);
+        assert_eq!(ev.flow_id.as_deref(), Some("flow-1"));
+        assert_eq!(ev.input_id.as_deref(), Some("in-1"));
+        assert!(ev.message.contains("Port conflict"));
+        assert!(ev.message.contains("UDP"));
+        assert!(ev.message.contains("0.0.0.0:9527"));
+        let details = ev.details.expect("details present");
+        assert_eq!(details["error_code"], "port_conflict");
+        assert_eq!(details["component"], "SRT input listener");
+        assert_eq!(details["addr"], "0.0.0.0:9527");
+        assert_eq!(details["protocol"], "UDP");
+    }
+
+    /// `emit_bind_failed` is the non-EADDRINUSE counterpart — same shape but
+    /// `bind_failed` category and error_code.
+    #[test]
+    fn emit_bind_failed_event_shape() {
+        let (sender, mut rx) = event_channel();
+        sender.emit_bind_failed(
+            "Edge API server",
+            "0.0.0.0:80",
+            BindProto::Tcp,
+            BindScope::none(),
+            "permission denied",
+        );
+        let ev = rx.try_recv().expect("event delivered");
+        assert_eq!(ev.severity, EventSeverity::Critical);
+        assert_eq!(ev.category, category::BIND_FAILED);
+        assert_eq!(ev.flow_id, None);
+        let details = ev.details.expect("details present");
+        assert_eq!(details["error_code"], "bind_failed");
+        assert_eq!(details["protocol"], "TCP");
+    }
 
     fn make_event(path_id: PathId, kind: PathEventKind) -> PathEvent {
         PathEvent {

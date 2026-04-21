@@ -179,8 +179,13 @@ pub mod registry {
     pub struct NewSessionMsg {
         /// The SDP offer from the remote peer.
         pub offer_sdp: String,
-        /// Channel to send back the SDP answer + session ID.
-        pub reply: tokio::sync::oneshot::Sender<Result<(String, String)>>,
+        /// Channel to send back the SDP answer, session ID, and a
+        /// per-session `CancellationToken` the session task listens to.
+        /// The API layer holds that token and cancels it from
+        /// [`WebrtcSessionRegistry::remove_session`] so DELETE /whip/... or
+        /// DELETE /whep/... tears down the exact session rather than
+        /// orphaning it.
+        pub reply: tokio::sync::oneshot::Sender<Result<(String, String, CancellationToken)>>,
     }
 
     /// Registry of active WebRTC sessions, keyed by (flow_id, session_id).
@@ -265,13 +270,15 @@ pub mod registry {
                 reply: reply_tx,
             }).await.map_err(|_| anyhow::anyhow!("WHIP input task not responding"))?;
 
-            let (answer, session_id) = reply_rx.await
+            let (answer, session_id, session_cancel) = reply_rx.await
                 .map_err(|_| anyhow::anyhow!("WHIP input task dropped reply"))??;
 
-            // Track session
+            // Track session. `session_cancel` is the token the engine session
+            // task is listening on, so cancelling it from remove_session()
+            // actually terminates the RTCPeerConnection instead of leaking it.
             let key = format!("{}/{}", flow_id, session_id);
             self.sessions.insert(key, WebrtcSessionHandle {
-                cancel: CancellationToken::new(), // TODO: wire to actual session cancel
+                cancel: session_cancel,
                 session_type: "whip",
             });
 
@@ -290,12 +297,12 @@ pub mod registry {
                 reply: reply_tx,
             }).await.map_err(|_| anyhow::anyhow!("WHEP output task not responding"))?;
 
-            let (answer, session_id) = reply_rx.await
+            let (answer, session_id, session_cancel) = reply_rx.await
                 .map_err(|_| anyhow::anyhow!("WHEP output task dropped reply"))??;
 
             let key = format!("{}/{}", flow_id, session_id);
             self.sessions.insert(key, WebrtcSessionHandle {
-                cancel: CancellationToken::new(),
+                cancel: session_cancel,
                 session_type: "whep",
             });
 

@@ -148,12 +148,22 @@ async fn whip_input_loop(
         };
 
         let session_id = uuid::Uuid::new_v4().to_string();
-        let _ = msg.reply.send(Ok((answer, session_id.clone())));
-
-        // Create TS muxer for converting H.264 NALUs to MPEG-TS
-        let mut ts_muxer = crate::engine::rtmp::ts_mux::TsMuxer::new();
-        let mut seq_num: u16 = 0;
+        // Per-session cancel token, rooted at the input task's parent. The
+        // API layer holds a clone so DELETE /whip/... tears down exactly
+        // this session without affecting the rest of the input task or
+        // other concurrent sessions.
         let child_cancel = cancel.child_token();
+        let _ = msg.reply.send(Ok((answer, session_id.clone(), child_cancel.clone())));
+
+        // Create TS muxer for converting H.264 NALUs and Opus audio to
+        // MPEG-TS. WebRTC audio is always Opus; we carry it per the
+        // FFmpeg-compatible Opus-in-MPEG-TS convention (stream_type 0x06
+        // + "Opus" registration descriptor in the PMT, per-AU control
+        // header in the private PES).
+        let mut ts_muxer = crate::engine::rtmp::ts_mux::TsMuxer::new();
+        ts_muxer.set_audio_stream(0x06, Some(*b"Opus"));
+        let mut seq_num: u16 = 0;
+        let mut last_audio_pts_90khz: u64 = 0;
 
         // Receive media from the WebRTC session
         loop {
@@ -163,9 +173,43 @@ async fn whip_input_loop(
                 SessionEvent::MediaData { mid, data, rtp_time, .. } => {
                     // Determine if this is video or audio
                     let is_video = session.video_mid == Some(mid);
-                    let _is_audio = session.audio_mid == Some(mid);
+                    let is_audio_stream = session.audio_mid == Some(mid);
 
-                    if is_video {
+                    if is_audio_stream {
+                        // Opus-over-WHIP audio: convert the RTP timestamp
+                        // from the Opus clock (48 kHz, carried in
+                        // MediaTime.denom) to the TS 90 kHz clock, then
+                        // mux via the FFmpeg-compatible Opus-in-TS path.
+                        let numer = rtp_time.numer() as u128;
+                        let denom = rtp_time.denom() as u128;
+                        let pts_90khz = if denom == 0 {
+                            last_audio_pts_90khz
+                        } else {
+                            (numer.saturating_mul(90_000) / denom) as u64
+                        };
+                        last_audio_pts_90khz = pts_90khz;
+                        let ts_chunks = ts_muxer.mux_audio_opus(&data, pts_90khz);
+                        for ts_data in ts_chunks {
+                            let pkt = RtpPacket {
+                                data: ts_data,
+                                sequence_number: seq_num,
+                                rtp_timestamp: pts_90khz as u32,
+                                recv_time_us: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_micros() as u64,
+                                is_raw_ts: true,
+                            };
+                            seq_num = seq_num.wrapping_add(1);
+                            stats.input_packets.fetch_add(1, Ordering::Relaxed);
+                            stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
+                            if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
+                                publish_input_packet(transcoder, &broadcast_tx, pkt);
+                            } else {
+                                stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    } else if is_video {
                         // H.264 data from str0m is already depayloaded (complete NALUs)
                         // Convert to Annex B and mux into TS
                         let pts_90khz = rtp_time.numer() as u64;
@@ -199,7 +243,6 @@ async fn whip_input_loop(
                             }
                         }
                     }
-                    // TODO: Handle Opus audio — mux into TS with stream_type 0x06
                 }
                 SessionEvent::Connected => {
                     tracing::info!("WHIP publisher connected on flow '{}'", flow_id);

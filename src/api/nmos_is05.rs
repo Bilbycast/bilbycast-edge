@@ -21,6 +21,121 @@ use super::server::AppState;
 use crate::config::models::{InputConfig, OutputConfig};
 use crate::manager::events::{EventSeverity, category};
 
+/// Apply a staged `TransportParamSet` to an `OutputConfig` in-place.
+///
+/// Operates through `serde_json::Value` rather than per-variant match: for
+/// each address field produced by `active_sender_params`, we rewrite the
+/// corresponding `"ip:port"` string shape (or split `remote_addr` for SRT)
+/// by re-serialising the output, mutating, and deserialising back.
+///
+/// Returns `Ok(Some(new_output))` if the mutation changed anything, `Ok(None)`
+/// if the patch was a no-op. Only the primary leg is mutated — 2022-7
+/// leg 2 activation is deferred.
+fn apply_sender_params_to_output(
+    output: &OutputConfig,
+    params: &TransportParamSet,
+) -> Result<Option<OutputConfig>, String> {
+    let mut v = serde_json::to_value(output).map_err(|e| format!("serialise output: {e}"))?;
+    let obj = v.as_object_mut().ok_or("output is not a JSON object")?;
+
+    let new_dest_ip = params.destination_ip.as_deref();
+    let new_dest_port = params.destination_port;
+    let new_src_ip = params.source_ip.as_deref();
+    let new_src_port = params.source_port;
+
+    let mut changed = false;
+
+    // dest_addr = "ip:port" — used by RTP / UDP / ST 2110-* outputs.
+    if let Some(dest) = obj.get("dest_addr").and_then(|d| d.as_str()) {
+        let (host, port) = split_addr(dest);
+        let host = new_dest_ip.unwrap_or(host);
+        let port = new_dest_port.unwrap_or(port);
+        let combined = format!("{host}:{port}");
+        if combined != dest {
+            obj.insert("dest_addr".into(), serde_json::Value::String(combined));
+            changed = true;
+        }
+    }
+    // remote_addr = "ip:port" — used by SRT outputs (caller / rendezvous).
+    if let Some(rem) = obj.get("remote_addr").and_then(|d| d.as_str()).map(|s| s.to_owned()) {
+        let (host, port) = split_addr(&rem);
+        let host = new_dest_ip.unwrap_or(host);
+        let port = new_dest_port.unwrap_or(port);
+        let combined = format!("{host}:{port}");
+        if combined != rem {
+            obj.insert("remote_addr".into(), serde_json::Value::String(combined));
+            changed = true;
+        }
+    }
+    // bind_addr / local_addr = "ip:port" — source side (used by SRT listener, RTP bind).
+    for key in ["bind_addr", "local_addr"] {
+        if let Some(existing) = obj.get(key).and_then(|d| d.as_str()).map(|s| s.to_owned()) {
+            let (host, port) = split_addr(&existing);
+            let host = new_src_ip.unwrap_or(host);
+            let port = new_src_port.unwrap_or(port);
+            let combined = format!("{host}:{port}");
+            if combined != existing {
+                obj.insert(key.into(), serde_json::Value::String(combined));
+                changed = true;
+            }
+        }
+    }
+
+    if !changed { return Ok(None); }
+
+    let new_output: OutputConfig = serde_json::from_value(v)
+        .map_err(|e| format!("deserialise patched output: {e}"))?;
+    Ok(Some(new_output))
+}
+
+fn apply_receiver_params_to_input(
+    input: &InputConfig,
+    params: &TransportParamSet,
+) -> Result<Option<InputConfig>, String> {
+    let mut v = serde_json::to_value(input).map_err(|e| format!("serialise input: {e}"))?;
+    let obj = v.as_object_mut().ok_or("input is not a JSON object")?;
+
+    let new_iface = params.interface_ip.as_deref();
+    let new_port = params.source_port;
+
+    let mut changed = false;
+    // For receivers, IS-05 surfaces `interface_ip` + `source_port` (the
+    // multicast/unicast bind host + port). bind_addr / local_addr follow the
+    // same "ip:port" shape as senders.
+    for key in ["bind_addr", "local_addr"] {
+        if let Some(existing) = obj.get(key).and_then(|d| d.as_str()).map(|s| s.to_owned()) {
+            let (host, port) = split_addr(&existing);
+            let host = new_iface.unwrap_or(host);
+            let port = new_port.unwrap_or(port);
+            let combined = format!("{host}:{port}");
+            if combined != existing {
+                obj.insert(key.into(), serde_json::Value::String(combined));
+                changed = true;
+            }
+        }
+    }
+    if let Some(iface) = new_iface {
+        if obj.get("interface_addr").and_then(|d| d.as_str()) != Some(iface) {
+            obj.insert("interface_addr".into(), serde_json::Value::String(iface.to_owned()));
+            changed = true;
+        }
+    }
+
+    if !changed { return Ok(None); }
+    let new_input: InputConfig = serde_json::from_value(v)
+        .map_err(|e| format!("deserialise patched input: {e}"))?;
+    Ok(Some(new_input))
+}
+
+fn split_addr(s: &str) -> (&str, u16) {
+    if let Some((h, p)) = s.rsplit_once(':') {
+        let port = p.parse::<u16>().unwrap_or(0);
+        (h, port)
+    } else {
+        (s, 0)
+    }
+}
+
 /// In-memory staged transport parameters for IS-05.
 pub struct Is05State {
     pub staged_senders: DashMap<Uuid, TransportParams>,
@@ -179,12 +294,12 @@ async fn patch_sender_staged(
 ) -> Result<Json<TransportParams>, StatusCode> {
     let uuid = Uuid::parse_str(&id).map_err(|_| StatusCode::NOT_FOUND)?;
 
-    // Verify this sender exists; capture flow_id for event scoping.
-    let sender_flow_id = {
+    // Verify this sender exists; capture flow_id + current output for apply.
+    let (sender_flow_id, existing_output) = {
         let config = state.config.read().await;
         let nid = nmos::node_uuid_from_config(&config);
-        let (fid, _) = find_sender(&config, &nid, &uuid)?;
-        fid
+        let (fid, output) = find_sender(&config, &nid, &uuid)?;
+        (fid, output)
     };
 
     // Check for immediate activation
@@ -196,7 +311,6 @@ async fn patch_sender_staged(
         .unwrap_or(false);
 
     if should_activate {
-        // For immediate activation, store staged and return with activation_time
         let mut result = patch.clone();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -206,22 +320,100 @@ async fn patch_sender_staged(
             act.activation_time = Some(activation_time);
         }
         state.is05_state.staged_senders.insert(uuid, result.clone());
-        // TODO: Apply transport parameter changes to the running flow
-        // This would involve reverse-looking up the flow_id/output_id and calling
-        // flow_manager.remove_output() + flow_manager.add_output() with new params
-        if let Some(ref tx) = state.event_sender {
+
+        // Apply transport params onto the running flow. Only the primary
+        // leg is mutated — 2022-7 leg 2 activation is deferred. If the
+        // patch didn't change any address fields (master_enable-only, etc.)
+        // we skip the restart and just emit an info event.
+        let primary = patch
+            .transport_params
+            .get(0)
+            .cloned()
+            .unwrap_or_default();
+        let output_id = existing_output.id().to_string();
+        let apply_result = apply_sender_params_to_output(&existing_output, &primary)
+            .map_err(|e| {
+                tracing::warn!("IS-05 apply: failed to patch output {output_id}: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        if let Some(new_output) = apply_result {
+            // Hot-swap: remove then add the patched output. If the remove
+            // succeeds but add fails the flow ends up with one fewer
+            // output; we surface that to the NMOS client as a 500 so it
+            // can retry.
+            let _ = state.flow_manager.remove_output(&sender_flow_id, &output_id).await;
+            if let Err(e) = state.flow_manager.add_output(&sender_flow_id, new_output.clone()).await {
+                if let Some(ref tx) = state.event_sender {
+                    tx.emit_flow_with_details(
+                        EventSeverity::Critical,
+                        category::NMOS,
+                        format!("IS-05 activation failed to re-add output '{output_id}': {e}"),
+                        &sender_flow_id,
+                        serde_json::json!({
+                            "subsystem": "is-05",
+                            "action": "sender_activation_failed",
+                            "sender_id": uuid.to_string(),
+                            "output_id": output_id,
+                            "error": e.to_string(),
+                        }),
+                    );
+                }
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+
+            // Persist the mutated output back to config so the change
+            // survives a restart. Write the atomically-updated AppConfig
+            // through the persistence helper which owns the encrypt +
+            // atomic-rename dance for `secrets.json`.
+            {
+                let mut cfg = state.config.write().await;
+                if let Some(existing) = cfg.outputs.iter_mut().find(|o| o.id() == output_id) {
+                    *existing = new_output;
+                }
+                let cfg_snapshot = cfg.clone();
+                let cfg_path = state.config_path.clone();
+                let secrets_path = state.secrets_path.clone();
+                drop(cfg);
+                tokio::spawn(async move {
+                    if let Err(e) = crate::config::persistence::save_config_split_async(
+                        cfg_path,
+                        secrets_path,
+                        cfg_snapshot,
+                    ).await {
+                        tracing::warn!("IS-05 apply: failed to persist config: {e}");
+                    }
+                });
+            }
+
+            if let Some(ref tx) = state.event_sender {
+                tx.emit_flow_with_details(
+                    EventSeverity::Info,
+                    category::NMOS,
+                    format!("IS-05 sender {uuid} activated and applied to live flow"),
+                    &sender_flow_id,
+                    serde_json::json!({
+                        "subsystem": "is-05",
+                        "action": "sender_activated",
+                        "sender_id": uuid.to_string(),
+                        "output_id": output_id,
+                    }),
+                );
+            }
+        } else if let Some(ref tx) = state.event_sender {
             tx.emit_flow_with_details(
                 EventSeverity::Info,
                 category::NMOS,
-                format!("IS-05 sender {uuid} activated"),
+                format!("IS-05 sender {uuid} activated (no address change — no-op on live flow)"),
                 &sender_flow_id,
                 serde_json::json!({
                     "subsystem": "is-05",
-                    "action": "sender_activated",
+                    "action": "sender_activated_noop",
                     "sender_id": uuid.to_string(),
                 }),
             );
         }
+
         return Ok(Json(result));
     }
 
@@ -319,12 +511,12 @@ async fn patch_receiver_staged(
 ) -> Result<Json<TransportParams>, StatusCode> {
     let uuid = Uuid::parse_str(&id).map_err(|_| StatusCode::NOT_FOUND)?;
 
-    // Verify this receiver exists; capture flow_id for event scoping.
-    let receiver_flow_id = {
+    // Verify this receiver exists; capture flow_id + current input for apply.
+    let (receiver_flow_id, existing_input) = {
         let config = state.config.read().await;
         let nid = nmos::node_uuid_from_config(&config);
-        let (flow_id, _) = find_receiver(&config, &nid, &uuid)?;
-        flow_id
+        let (flow_id, input) = find_receiver(&config, &nid, &uuid)?;
+        (flow_id, input)
     };
 
     let should_activate = patch
@@ -344,22 +536,120 @@ async fn patch_receiver_staged(
             act.activation_time = Some(activation_time);
         }
         state.is05_state.staged_receivers.insert(uuid, result.clone());
-        // TODO: Apply transport parameter changes to the running flow
-        // This would involve reverse-looking up the flow_id and calling
-        // flow_manager.destroy_flow() + flow_manager.create_flow() with updated InputConfig
-        if let Some(ref tx) = state.event_sender {
+
+        // Apply transport params onto the running receiver by mutating the
+        // matching input in the config, destroying and recreating the flow
+        // with the new input config. Only the primary leg is handled.
+        let primary = patch.transport_params.get(0).cloned().unwrap_or_default();
+
+        // If the receiver has no resolved active input (multi-input flow
+        // with no active set) or the patch is a no-op, fall back to the
+        // previous "staged only" behaviour with an info event.
+        let patched_input = match existing_input {
+            Some(ref input) => apply_receiver_params_to_input(input, &primary)
+                .map_err(|e| {
+                    tracing::warn!("IS-05 apply: failed to patch receiver input: {e}");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?,
+            None => None,
+        };
+
+        if let Some(new_input) = patched_input {
+            // Find which input definition this receiver's active input
+            // corresponds to. Receivers in NMOS map 1:1 to flows; the
+            // flow's `active_input_id` (or its only input if single) is
+            // the one whose transport params we just mutated.
+            let active_input_id = {
+                let cfg = state.config.read().await;
+                let flow = cfg.flows.iter().find(|f| f.id == receiver_flow_id);
+                flow.and_then(|f| {
+                    // Find the input marked active; fall back to the first
+                    // input if none flagged.
+                    for iid in &f.input_ids {
+                        if let Some(def) = cfg.inputs.iter().find(|i| &i.id == iid) {
+                            if def.active { return Some(def.id.clone()); }
+                        }
+                    }
+                    f.input_ids.first().cloned()
+                })
+            };
+
+            // Update config.inputs[...], destroy+recreate the flow with the
+            // resolved new input set, persist.
+            {
+                let mut cfg = state.config.write().await;
+                if let Some(ref id) = active_input_id {
+                    if let Some(existing) = cfg.inputs.iter_mut().find(|i| &i.id == id) {
+                        existing.config = new_input.clone();
+                    }
+                }
+                // Resolve+restart the flow under the write lock's snapshot.
+                let flow_cfg = cfg.flows.iter().find(|f| f.id == receiver_flow_id).cloned();
+                let resolved = flow_cfg
+                    .and_then(|f| cfg.resolve_flow(&f).ok());
+                drop(cfg);
+
+                let _ = state.flow_manager.destroy_flow(&receiver_flow_id).await;
+                if let Some(r) = resolved {
+                    if let Err(e) = state.flow_manager.create_flow(r).await {
+                        if let Some(ref tx) = state.event_sender {
+                            tx.emit_flow_with_details(
+                                EventSeverity::Critical,
+                                category::NMOS,
+                                format!("IS-05 receiver activation failed to restart flow: {e}"),
+                                &receiver_flow_id,
+                                serde_json::json!({
+                                    "subsystem": "is-05",
+                                    "action": "receiver_activation_failed",
+                                    "receiver_id": uuid.to_string(),
+                                    "error": e.to_string(),
+                                }),
+                            );
+                        }
+                        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                    }
+                }
+                let cfg_snapshot = state.config.read().await.clone();
+                let cfg_path = state.config_path.clone();
+                let secrets_path = state.secrets_path.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::config::persistence::save_config_split_async(
+                        cfg_path,
+                        secrets_path,
+                        cfg_snapshot,
+                    ).await {
+                        tracing::warn!("IS-05 apply: failed to persist config: {e}");
+                    }
+                });
+            }
+
+            if let Some(ref tx) = state.event_sender {
+                tx.emit_flow_with_details(
+                    EventSeverity::Info,
+                    category::NMOS,
+                    format!("IS-05 receiver {uuid} activated and applied to live flow"),
+                    &receiver_flow_id,
+                    serde_json::json!({
+                        "subsystem": "is-05",
+                        "action": "receiver_activated",
+                        "receiver_id": uuid.to_string(),
+                    }),
+                );
+            }
+        } else if let Some(ref tx) = state.event_sender {
             tx.emit_flow_with_details(
                 EventSeverity::Info,
                 category::NMOS,
-                format!("IS-05 receiver {uuid} activated"),
+                format!("IS-05 receiver {uuid} activated (no address change — no-op on live flow)"),
                 &receiver_flow_id,
                 serde_json::json!({
                     "subsystem": "is-05",
-                    "action": "receiver_activated",
+                    "action": "receiver_activated_noop",
                     "receiver_id": uuid.to_string(),
                 }),
             );
         }
+
         return Ok(Json(result));
     }
 
@@ -572,6 +862,8 @@ fn active_receiver_params(
         // see the input exists. A future NMOS extension could
         // surface per-path endpoints.
         InputConfig::Bonded(_) => TransportParamSet::default(),
+        // Synthetic input — no transport parameters to report.
+        InputConfig::TestPattern(_) => TransportParamSet::default(),
     };
     Ok(TransportParams {
         transport_params: vec![param_set],

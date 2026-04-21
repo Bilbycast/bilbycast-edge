@@ -157,13 +157,13 @@ async fn rtp_input_loop(
             s
         }
         Err(e) => {
-            events.emit_flow_with_details(
-                EventSeverity::Critical,
-                category::RTP,
-                format!("RTP input bind failed on {}: {e}", config.bind_addr),
-                flow_id,
-                serde_json::json!({"bind_addr": config.bind_addr, "error": e.to_string()}),
-            );
+            use crate::manager::events::{BindProto, BindScope};
+            let scope = BindScope::flow(flow_id);
+            if crate::util::port_error::anyhow_is_addr_in_use(&e) {
+                events.emit_port_conflict("RTP input", &config.bind_addr, BindProto::Udp, scope, &e);
+            } else {
+                events.emit_bind_failed("RTP input", &config.bind_addr, BindProto::Udp, scope, &e);
+            }
             return Err(e);
         }
     };
@@ -340,13 +340,13 @@ async fn rtp_input_redundant_loop(
             s
         }
         Err(e) => {
-            events.emit_flow_with_details(
-                EventSeverity::Critical,
-                category::RTP,
-                format!("RTP input leg 1 bind failed on {}: {e}", config.bind_addr),
-                flow_id,
-                serde_json::json!({"bind_addr": config.bind_addr, "leg": 1, "error": e.to_string()}),
-            );
+            use crate::manager::events::{BindProto, BindScope};
+            let scope = BindScope::flow(flow_id);
+            if crate::util::port_error::anyhow_is_addr_in_use(&e) {
+                events.emit_port_conflict("RTP input leg 1", &config.bind_addr, BindProto::Udp, scope, &e);
+            } else {
+                events.emit_bind_failed("RTP input leg 1", &config.bind_addr, BindProto::Udp, scope, &e);
+            }
             return Err(e);
         }
     };
@@ -362,13 +362,13 @@ async fn rtp_input_redundant_loop(
             s
         }
         Err(e) => {
-            events.emit_flow_with_details(
-                EventSeverity::Critical,
-                category::RTP,
-                format!("RTP input leg 2 bind failed on {}: {e}", redundancy.bind_addr),
-                flow_id,
-                serde_json::json!({"bind_addr": redundancy.bind_addr, "leg": 2, "error": e.to_string()}),
-            );
+            use crate::manager::events::{BindProto, BindScope};
+            let scope = BindScope::flow(flow_id);
+            if crate::util::port_error::anyhow_is_addr_in_use(&e) {
+                events.emit_port_conflict("RTP input leg 2", &redundancy.bind_addr, BindProto::Udp, scope, &e);
+            } else {
+                events.emit_bind_failed("RTP input leg 2", &redundancy.bind_addr, BindProto::Udp, scope, &e);
+            }
             return Err(e);
         }
     };

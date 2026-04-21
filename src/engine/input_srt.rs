@@ -182,7 +182,20 @@ async fn srt_input_listener_loop(
     flow_id: &str,
     transcoder: &mut Option<InputTranscoder>,
 ) -> anyhow::Result<()> {
-    let mut listener = bind_srt_listener_for_input(&config).await?;
+    let mut listener = match bind_srt_listener_for_input(&config).await {
+        Ok(l) => l,
+        Err(e) => {
+            use crate::manager::events::{BindProto, BindScope};
+            let addr = config.local_addr.as_deref().unwrap_or("auto");
+            let scope = BindScope::flow(flow_id);
+            if crate::util::port_error::anyhow_is_addr_in_use(&e) {
+                events.emit_port_conflict("SRT input listener", addr, BindProto::Udp, scope, &e);
+            } else {
+                events.emit_bind_failed("SRT input listener", addr, BindProto::Udp, scope, &e);
+            }
+            return Err(e);
+        }
+    };
     let mut format = SrtPayloadFormat::Unknown;
     let mut last_seq: Option<u16> = None;
     let mut raw_ts_seq_counter: u16 = 0;
@@ -488,12 +501,38 @@ async fn srt_input_redundant_loop(
     // Bind persistent listeners for any legs in listener mode.
     // Both stay bound across outer reconnect cycles.
     let mut listener_leg1 = if config.mode == SrtMode::Listener {
-        Some(bind_srt_listener_for_input(&config).await?)
+        match bind_srt_listener_for_input(&config).await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                use crate::manager::events::{BindProto, BindScope};
+                let addr = config.local_addr.as_deref().unwrap_or("auto");
+                let scope = BindScope::flow(flow_id);
+                if crate::util::port_error::anyhow_is_addr_in_use(&e) {
+                    events.emit_port_conflict("SRT input listener leg 1", addr, BindProto::Udp, scope, &e);
+                } else {
+                    events.emit_bind_failed("SRT input listener leg 1", addr, BindProto::Udp, scope, &e);
+                }
+                return Err(e);
+            }
+        }
     } else {
         None
     };
     let mut listener_leg2 = if redundancy.mode == SrtMode::Listener {
-        Some(bind_srt_listener_for_redundancy(redundancy).await?)
+        match bind_srt_listener_for_redundancy(redundancy).await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                use crate::manager::events::{BindProto, BindScope};
+                let addr = redundancy.local_addr.as_deref().unwrap_or("auto");
+                let scope = BindScope::flow(flow_id);
+                if crate::util::port_error::anyhow_is_addr_in_use(&e) {
+                    events.emit_port_conflict("SRT input listener leg 2", addr, BindProto::Udp, scope, &e);
+                } else {
+                    events.emit_bind_failed("SRT input listener leg 2", addr, BindProto::Udp, scope, &e);
+                }
+                return Err(e);
+            }
+        }
     } else {
         None
     };

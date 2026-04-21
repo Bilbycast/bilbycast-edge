@@ -357,7 +357,12 @@ impl TunnelManager {
                                 category::PORT_CONFLICT,
                                 format!("Tunnel '{}' stopped: {e}", config_name),
                                 &config_id,
-                                serde_json::json!({ "tunnel_name": config_name }),
+                                serde_json::json!({
+                                    "error_code": "port_conflict",
+                                    "component": format!("Tunnel '{}'", config_name),
+                                    "tunnel_name": config_name,
+                                    "error": e.to_string(),
+                                }),
                             );
                             tunnels.remove(&config_id);
                             return;
@@ -610,7 +615,12 @@ async fn run_relay_tunnel(
                         category::PORT_CONFLICT,
                         format!("Tunnel '{}' stopped: {e}", tunnel_name),
                         &tunnel_id_str,
-                        serde_json::json!({ "tunnel_name": tunnel_name }),
+                        serde_json::json!({
+                            "error_code": "port_conflict",
+                            "component": format!("Tunnel '{}'", tunnel_name),
+                            "tunnel_name": tunnel_name,
+                            "error": e.to_string(),
+                        }),
                     );
                     return Err(anyhow::anyhow!("{e}"));
                 }

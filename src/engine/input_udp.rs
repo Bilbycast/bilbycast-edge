@@ -91,13 +91,13 @@ async fn udp_input_loop(
             s
         }
         Err(e) => {
-            events.emit_flow_with_details(
-                EventSeverity::Critical,
-                category::UDP,
-                format!("UDP input bind failed on {}: {e}", config.bind_addr),
-                flow_id,
-                serde_json::json!({"bind_addr": config.bind_addr, "error": e.to_string()}),
-            );
+            use crate::manager::events::{BindProto, BindScope};
+            let scope = BindScope::flow(flow_id);
+            if crate::util::port_error::anyhow_is_addr_in_use(&e) {
+                events.emit_port_conflict("UDP input", &config.bind_addr, BindProto::Udp, scope, &e);
+            } else {
+                events.emit_bind_failed("UDP input", &config.bind_addr, BindProto::Udp, scope, &e);
+            }
             return Err(e);
         }
     };

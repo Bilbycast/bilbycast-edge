@@ -325,6 +325,8 @@ impl SecretsConfig {
             // and the cert / key files are read lazily at path
             // construction. Nothing to merge at this layer.
             InputConfig::Bonded(_) => {}
+            // Synthetic input has no secrets.
+            InputConfig::TestPattern(_) => {}
         }
     }
 

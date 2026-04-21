@@ -20,6 +20,8 @@
 //! - **Redundancy duplicate** on SRT output (SMPTE 2022-7 dual-leg send)
 
 pub mod bandwidth_monitor;
+pub mod degradation_monitor;
+pub mod input_test_pattern;
 pub mod bonded_scheduler;
 pub mod delay_buffer;
 pub mod flow;

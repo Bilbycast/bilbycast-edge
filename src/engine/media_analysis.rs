@@ -147,6 +147,10 @@ fn populate_transport_info(input: &InputConfig, state: &mut MediaAnalysisState) 
             state.protocol = "bonded".to_string();
             state.payload_format = "raw_ts".to_string();
         }
+        InputConfig::TestPattern(_) => {
+            state.protocol = "test_pattern".to_string();
+            state.payload_format = "h264_aac_ts".to_string();
+        }
     }
 }
 

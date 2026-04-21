@@ -126,6 +126,11 @@ pub async fn test_input(config: &InputConfig) -> TestResult {
                     )
                 }
             }
+            InputConfig::TestPattern(c) => TestResult::ok(
+                "configured",
+                format!("test-pattern {}x{}@{}", c.width, c.height, c.fps),
+                start.elapsed(),
+            ),
         }
     })
     .await;

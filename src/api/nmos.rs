@@ -125,6 +125,9 @@ fn input_transport(input: &InputConfig) -> &'static str {
         // flow at all. A future NMOS extension could register a
         // bonding-specific URN.
         InputConfig::Bonded(_) => "urn:x-nmos:transport:rtp",
+        // Synthetic input — advertise as generic RTP so NMOS controllers
+        // see the flow; there is no real network transport.
+        InputConfig::TestPattern(_) => "urn:x-nmos:transport:rtp",
     }
 }
 
@@ -287,6 +290,7 @@ fn input_type_str(input: &InputConfig) -> &'static str {
         InputConfig::St2110_23(_) => "st2110_23",
         InputConfig::RtpAudio(_) => "rtp_audio",
         InputConfig::Bonded(_) => "bonded",
+        InputConfig::TestPattern(_) => "test_pattern",
     }
 }
 

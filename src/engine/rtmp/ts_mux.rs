@@ -275,6 +275,52 @@ impl TsMuxer {
         packets
     }
 
+    /// Mux a raw Opus packet (single access unit, no framing) into TS
+    /// packets using the FFmpeg-compatible Opus-in-MPEG-TS carriage.
+    ///
+    /// Wire format of each Opus AU inside the private PES:
+    /// - Control header prefix (11 bits, all 1s) + 1 bit start_trim_flag +
+    ///   1 bit end_trim_flag + 1 bit control_extension_flag + 2 reserved
+    ///   bits. With all flags clear this packs into the two bytes
+    ///   `0xFF 0xE0`.
+    /// - `au_size` encoded byte-by-byte: each `0xFF` byte contributes 255
+    ///   to the length and signals "continue"; one final non-0xFF byte
+    ///   (0x00..=0xFE) supplies the remaining length. For a 150-byte
+    ///   packet the encoding is a single `0x96`; for a 400-byte packet
+    ///   it is `0xFF 0x91` (255 + 145).
+    /// - The Opus packet bytes themselves.
+    ///
+    /// Callers must have previously configured the muxer via
+    /// `set_audio_stream(0x06, Some(*b"Opus"))` so the PMT advertises
+    /// stream_type 0x06 with the mandatory "Opus" registration
+    /// descriptor. `stream_id = 0xBD` (private_stream_1) per the carriage
+    /// spec.
+    pub fn mux_audio_opus(&mut self, opus_packet: &[u8], pts_90khz: u64) -> Vec<Bytes> {
+        let pts_90khz = self.clamp_audio_pts(pts_90khz);
+        let mut packets = self.maybe_emit_pat_pmt(false);
+
+        // Control header: 11 bits '1'*11 + start_trim(1)=0 + end_trim(1)=0 + ctrl_ext(1)=0 + reserved(2)=00
+        // Bits:    1111_1111 1110_0000
+        // Bytes:       0xFF    0xE0
+        let mut au = Vec::with_capacity(4 + opus_packet.len());
+        au.push(0xFF);
+        au.push(0xE0);
+
+        // au_size: chained 0xFF bytes + final non-0xFF remainder.
+        let mut remaining = opus_packet.len();
+        while remaining >= 255 {
+            au.push(0xFF);
+            remaining -= 255;
+        }
+        au.push(remaining as u8);
+        au.extend_from_slice(opus_packet);
+
+        // stream_id 0xBD (private_stream_1) is required for stream_type 0x06.
+        let pes = build_pes_packet(0xBD, &au, pts_90khz, None);
+        packets.extend(self.packetize(AUDIO_PID, &pes, true, false, None));
+        packets
+    }
+
     /// Split a PES payload into 188-byte TS packets.
     fn packetize(&mut self, pid: u16, pes_data: &[u8], payload_start: bool, write_pcr: bool, pcr_90khz: Option<u64>) -> Vec<Bytes> {
         let mut packets = Vec::new();

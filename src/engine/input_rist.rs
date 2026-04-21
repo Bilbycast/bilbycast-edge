@@ -124,12 +124,16 @@ async fn rist_input_loop(
     let sc = socket_config_for(&config, bind);
 
     let mut socket = RistSocket::receiver(sc).await.map_err(|e| {
-        events.emit_flow(
-            EventSeverity::Critical,
-            category::RIST,
-            format!("RIST input bind failed: {e}"),
-            flow_id,
-        );
+        use crate::manager::events::{BindProto, BindScope};
+        let scope = BindScope::flow(flow_id);
+        let component = "RIST input";
+        let addr = config.bind_addr.clone();
+        let err_str = format!("{e}");
+        if err_str.to_lowercase().contains("address") && err_str.to_lowercase().contains("use") {
+            events.emit_port_conflict(component, &addr, BindProto::Udp, scope, &err_str);
+        } else {
+            events.emit_bind_failed(component, &addr, BindProto::Udp, scope, &err_str);
+        }
         anyhow::anyhow!("RIST receiver bind failed: {e}")
     })?;
 
@@ -227,10 +231,30 @@ async fn rist_input_redundant_loop(
 
     let mut socket_leg1 = RistSocket::receiver(socket_config_for(&config, leg1_addr))
         .await
-        .map_err(|e| anyhow::anyhow!("RIST input leg 1 bind failed: {e}"))?;
+        .map_err(|e| {
+            use crate::manager::events::{BindProto, BindScope};
+            let scope = BindScope::flow(flow_id);
+            let err_str = format!("{e}");
+            if err_str.to_lowercase().contains("address") && err_str.to_lowercase().contains("use") {
+                events.emit_port_conflict("RIST input leg 1", &config.bind_addr, BindProto::Udp, scope, &err_str);
+            } else {
+                events.emit_bind_failed("RIST input leg 1", &config.bind_addr, BindProto::Udp, scope, &err_str);
+            }
+            anyhow::anyhow!("RIST input leg 1 bind failed: {e}")
+        })?;
     let mut socket_leg2 = RistSocket::receiver(socket_config_for(&config, leg2_addr))
         .await
-        .map_err(|e| anyhow::anyhow!("RIST input leg 2 bind failed: {e}"))?;
+        .map_err(|e| {
+            use crate::manager::events::{BindProto, BindScope};
+            let scope = BindScope::flow(flow_id);
+            let err_str = format!("{e}");
+            if err_str.to_lowercase().contains("address") && err_str.to_lowercase().contains("use") {
+                events.emit_port_conflict("RIST input leg 2", &redundancy.bind_addr, BindProto::Udp, scope, &err_str);
+            } else {
+                events.emit_bind_failed("RIST input leg 2", &redundancy.bind_addr, BindProto::Udp, scope, &err_str);
+            }
+            anyhow::anyhow!("RIST input leg 2 bind failed: {e}")
+        })?;
 
     stats.set_input_rist_stats(socket_leg1.stats());
     stats.set_input_rist_leg2_stats(socket_leg2.stats());

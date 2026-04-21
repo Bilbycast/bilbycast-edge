@@ -452,7 +452,54 @@ pub enum InputConfig {
     /// ethernet links like a Peplink SpeedFusion tunnel, but media-aware.
     #[serde(rename = "bonded")]
     Bonded(BondedInputConfig),
+    /// Synthetic test-pattern input: generates SMPTE 75% colour bars +
+    /// optional 1 kHz tone in-process, encodes to H.264 + AAC, and
+    /// publishes as MPEG-TS onto the flow broadcast channel. Useful for
+    /// pre-live validation (confirm the pipeline works before the real
+    /// source is patched in), downstream troubleshooting (isolate whether
+    /// the problem is upstream of the edge), and idle fill.
+    #[serde(rename = "test_pattern")]
+    TestPattern(TestPatternInputConfig),
 }
+
+/// Configuration for an in-process synthetic test-pattern input.
+///
+/// Requires the edge binary to be built with `video-encoder-x264` (H.264
+/// encoding of the bars frame) and `fdk-aac` (AAC encoding of the tone)
+/// features. If either is missing the input fails to start with a clear
+/// event rather than silently degrading.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestPatternInputConfig {
+    /// Video width in pixels. Default 1280. Must be divisible by 2.
+    #[serde(default = "default_tp_width")]
+    pub width: u16,
+    /// Video height in pixels. Default 720. Must be divisible by 2.
+    #[serde(default = "default_tp_height")]
+    pub height: u16,
+    /// Frame rate in frames per second. Default 25. Range 1..=60.
+    #[serde(default = "default_tp_fps")]
+    pub fps: u16,
+    /// Target video bitrate in kbit/s. Default 2000.
+    #[serde(default = "default_tp_video_bitrate")]
+    pub video_bitrate_kbps: u32,
+    /// When true, generate and encode a 1 kHz sine tone. When false,
+    /// emit a video-only TS stream.
+    #[serde(default = "default_true")]
+    pub audio_enabled: bool,
+    /// Audio tone frequency in Hz. Default 1000. Range 50..=8000.
+    #[serde(default = "default_tp_tone_hz")]
+    pub tone_hz: f32,
+    /// Audio level in dBFS (negative). Default -20 dBFS (broadcast reference).
+    #[serde(default = "default_tp_tone_dbfs")]
+    pub tone_dbfs: f32,
+}
+
+fn default_tp_width() -> u16 { 1280 }
+fn default_tp_height() -> u16 { 720 }
+fn default_tp_fps() -> u16 { 25 }
+fn default_tp_video_bitrate() -> u32 { 2000 }
+fn default_tp_tone_hz() -> f32 { 1000.0 }
+fn default_tp_tone_dbfs() -> f32 { -20.0 }
 
 impl InputConfig {
     /// Returns the type name string (e.g. "srt", "rtp", "udp").
@@ -473,6 +520,7 @@ impl InputConfig {
             InputConfig::St2110_23(_) => "st2110_23",
             InputConfig::RtpAudio(_) => "rtp_audio",
             InputConfig::Bonded(_) => "bonded",
+            InputConfig::TestPattern(_) => "test_pattern",
         }
     }
 
@@ -503,7 +551,9 @@ impl InputConfig {
             // common broadcast case that's MPEG-TS, so treat as a TS
             // carrier. Downstream analysers can still be turned off via
             // `media_analysis: false` on the flow.
-            | InputConfig::Bonded(_) => true,
+            | InputConfig::Bonded(_)
+            // Test pattern publishes encoded H.264 + AAC in MPEG-TS.
+            | InputConfig::TestPattern(_) => true,
             // PCM-only inputs become TS carriers when `audio_encode` is set —
             // the input task muxes the encoded audio into an audio-only TS.
             InputConfig::St2110_30(c) => c.audio_encode.is_some(),

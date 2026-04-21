@@ -25,8 +25,10 @@
 //! After each JPEG capture the module performs two lightweight checks:
 //!
 //! 1. **Freeze detection** — the JPEG bytes are hashed and compared with
-//!    the previous capture. Three consecutive identical hashes (~30 s at
-//!    the default 10 s interval) raise a `"frozen"` alarm.
+//!    the previous capture. Six consecutive identical hashes (~30 s at
+//!    the default 5 s interval) raise a `"frozen"` alarm. The alarm is
+//!    reset when the input ring runs dry or a capture errors so it does
+//!    not stick across quiet periods.
 //!
 //! 2. **Black-screen detection** — when in-process, the average luminance
 //!    is computed from the decoded Y plane (no second subprocess). When
@@ -58,6 +60,14 @@ const THUMBNAIL_INTERVAL: Duration = Duration::from_secs(5);
 /// Minimum gap between out-of-cycle captures driven by the external refresh
 /// trigger. Prevents a flood of switch events from stacking decode work.
 const TRIGGER_MIN_GAP: Duration = Duration::from_millis(500);
+
+/// Minimum elapsed time between two captures before their JPEG hashes are
+/// eligible for freeze comparison. Back-to-back captures (e.g. a trigger
+/// firing right after a periodic tick, or a catch-up tick after a stall) run
+/// on nearly-identical TS buffers and reliably produce matching hashes — so
+/// we feed `reset_freeze()` in that case rather than letting six such
+/// samples trip the alarm.
+const FREEZE_MIN_GAP: Duration = Duration::from_millis(4_500);
 
 /// Maximum TS data to buffer (~3 seconds at 10 Mbps ≈ 3.75 MB).
 const MAX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
@@ -143,6 +153,10 @@ async fn thumbnail_loop(
     }
 
     let mut interval = tokio::time::interval(THUMBNAIL_INTERVAL);
+    // Skip-don't-burst: if the runtime stalls and several ticks accumulate,
+    // we don't want to fire them back-to-back on the same buffered TS — that
+    // yields identical JPEG hashes and false-positive "frozen" alarms.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval.tick().await; // consume first immediate tick
 
     // External refresh trigger — switch_active_input calls notify_one() on
@@ -189,7 +203,15 @@ async fn thumbnail_loop(
                     Ok(thumbnail_result) => {
                         stats.store(thumbnail_result.jpeg.clone());
                         let jpeg_hash = hash_jpeg(&thumbnail_result.jpeg);
-                        let is_frozen = stats.check_freeze(jpeg_hash);
+                        let back_to_back = last_capture
+                            .map(|t| t.elapsed() < FREEZE_MIN_GAP)
+                            .unwrap_or(false);
+                        let is_frozen = if back_to_back {
+                            stats.reset_freeze();
+                            false
+                        } else {
+                            stats.check_freeze(jpeg_hash)
+                        };
                         let is_black = thumbnail_result.luminance < BLACK_LUMINANCE_THRESHOLD;
                         if is_black {
                             stats.set_alarm(Some("black".to_string()));
@@ -206,56 +228,79 @@ async fn thumbnail_loop(
                     Err(e) => {
                         tracing::debug!("Thumbnail trigger capture failed: {e}");
                         stats.record_error();
+                        stats.reset_freeze();
                     }
                 }
             }
 
             _ = interval.tick() => {
-                if buffer_bytes > 0 {
-                    // Collect buffered TS data and generate thumbnail.
-                    // When a program filter is set, run the buffer through
-                    // it first so the decoder only sees the selected program.
-                    let raw_ts = collect_buffer(&ts_buffer);
-                    let ts_data: Bytes = if let Some(ref mut filter) = program_filter {
-                        filter_scratch.clear();
-                        filter.filter_into(&raw_ts, &mut filter_scratch);
-                        if filter_scratch.is_empty() {
-                            // Selected program isn't in this buffer window —
-                            // wait for the next tick.
-                            continue;
-                        }
-                        Bytes::copy_from_slice(&filter_scratch)
-                    } else {
-                        raw_ts
-                    };
+                if buffer_bytes == 0 {
+                    // No TS in the ring — the input is idle or has stopped
+                    // publishing. Clear the freeze tracker (the next
+                    // captured frame must start a fresh sequence rather
+                    // than colliding with a stale hash) and raise the
+                    // `"no_signal"` alarm so the manager UI can distinguish
+                    // "signal absent" from a stale lingering JPEG. The 1s
+                    // stats push propagates this within a second.
+                    stats.reset_freeze();
+                    stats.set_alarm(Some("no_signal".to_string()));
+                    continue;
+                }
+                // Collect buffered TS data and generate thumbnail.
+                // When a program filter is set, run the buffer through
+                // it first so the decoder only sees the selected program.
+                let raw_ts = collect_buffer(&ts_buffer);
+                let ts_data: Bytes = if let Some(ref mut filter) = program_filter {
+                    filter_scratch.clear();
+                    filter.filter_into(&raw_ts, &mut filter_scratch);
+                    if filter_scratch.is_empty() {
+                        // Selected program isn't in this buffer window —
+                        // wait for the next tick.
+                        continue;
+                    }
+                    Bytes::copy_from_slice(&filter_scratch)
+                } else {
+                    raw_ts
+                };
 
-                    match generate_thumbnail_dispatch(&ts_data).await {
-                        Ok(thumbnail_result) => {
-                            tracing::debug!(
-                                "Thumbnail captured: {} bytes JPEG from {} bytes TS",
-                                thumbnail_result.jpeg.len(),
-                                ts_data.len()
-                            );
-                            stats.store(thumbnail_result.jpeg.clone());
+                match generate_thumbnail_dispatch(&ts_data).await {
+                    Ok(thumbnail_result) => {
+                        tracing::debug!(
+                            "Thumbnail captured: {} bytes JPEG from {} bytes TS",
+                            thumbnail_result.jpeg.len(),
+                            ts_data.len()
+                        );
+                        stats.store(thumbnail_result.jpeg.clone());
 
-                            // ── Freeze / black detection ──
-                            let jpeg_hash = hash_jpeg(&thumbnail_result.jpeg);
-                            let is_frozen = stats.check_freeze(jpeg_hash);
-                            let is_black = thumbnail_result.luminance < BLACK_LUMINANCE_THRESHOLD;
+                        // ── Freeze / black detection ──
+                        let jpeg_hash = hash_jpeg(&thumbnail_result.jpeg);
+                        let back_to_back = last_capture
+                            .map(|t| t.elapsed() < FREEZE_MIN_GAP)
+                            .unwrap_or(false);
+                        let is_frozen = if back_to_back {
+                            stats.reset_freeze();
+                            false
+                        } else {
+                            stats.check_freeze(jpeg_hash)
+                        };
+                        let is_black = thumbnail_result.luminance < BLACK_LUMINANCE_THRESHOLD;
 
-                            if is_black {
-                                stats.set_alarm(Some("black".to_string()));
-                            } else if is_frozen {
-                                stats.set_alarm(Some("frozen".to_string()));
-                            } else {
-                                stats.set_alarm(None);
-                            }
-                            last_capture = Some(std::time::Instant::now());
+                        if is_black {
+                            stats.set_alarm(Some("black".to_string()));
+                        } else if is_frozen {
+                            stats.set_alarm(Some("frozen".to_string()));
+                        } else {
+                            stats.set_alarm(None);
                         }
-                        Err(e) => {
-                            tracing::debug!("Thumbnail capture failed: {e}");
-                            stats.record_error();
-                        }
+                        last_capture = Some(std::time::Instant::now());
+                    }
+                    Err(e) => {
+                        tracing::debug!("Thumbnail capture failed: {e}");
+                        stats.record_error();
+                        // Capture failed — we have no ground truth this
+                        // tick, so clear the alarm rather than leaving
+                        // a stale "frozen" / "black" flag on screen.
+                        stats.reset_freeze();
                     }
                 }
             }

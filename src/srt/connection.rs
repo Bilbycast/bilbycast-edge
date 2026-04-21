@@ -524,11 +524,14 @@ pub async fn bind_srt_listener(p: &SrtConnectionParams<'_>) -> Result<SrtListene
                 || err_str.contains("address already in use")
                 || err_str.contains("EADDRINUSE")
             {
-                anyhow::anyhow!(
+                // Inject a `PortInUse` marker so `anyhow_is_addr_in_use()`
+                // detects this from string-based FFI errors. The user-facing
+                // top-line message is unchanged.
+                anyhow::Error::new(crate::util::port_error::PortInUse).context(format!(
                     "Port conflict: SRT listener could not bind to {local_addr_str} \
                      — address already in use. \
                      Check whether another service or edge component is using this port."
-                )
+                ))
             } else {
                 anyhow::anyhow!("SRT listener bind on {local_addr_str} failed: {e}")
             }

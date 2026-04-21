@@ -408,3 +408,42 @@ mapping:
 | critical | 22 | Service-impacting: flow/tunnel failures, auth rejection, both legs lost, bandwidth block, audio/video encoder failures, bind failures (RTP/UDP/RIST) |
 | warning | 22 | Degradation: disconnects, stale connections, upload failures, reconnects, bandwidth exceeded, audio_encode restart, resource gating, tunnel retry |
 | info | 40 | State changes: connections established, flows started, config updated, bandwidth recovery, encoder started, input/output CRUD, bind success (RTP/UDP) |
+
+## Unified bind-failure events (`port_conflict` / `bind_failed`)
+
+Every runtime bind site (SRT listener, RTP/UDP/RIST/RTMP inputs,
+standby UDP/TCP listeners, tunnel egress) emits a Critical event under
+one of two reserved categories:
+
+| Category | When | `details.error_code` |
+|----------|------|----------------------|
+| `port_conflict` | OS reports `EADDRINUSE` or the config-load validator detected an internal collision between two configured entities | `port_conflict` |
+| `bind_failed` | Any other bind error (permission denied, no such device, multicast group rejected, etc.) | `bind_failed` |
+
+Standard `details` shape:
+
+```json
+{
+  "error_code": "port_conflict",
+  "component": "SRT input listener leg 2",
+  "addr": "0.0.0.0:9527",
+  "protocol": "UDP",
+  "error": "<original error message>"
+}
+```
+
+The manager UI keys off `error_code` to highlight the offending field
+in the input/output modal, surfaces the event on the per-node banner
+when an unresolved one occurred in the last hour, and exposes
+quick-filter chips for both categories on `/events`. The same shape
+appears on `command_ack` payloads via the new optional `error_code`
+field on `CommandAckPayload`, so manager-initiated Create/Update
+commands can rely on `error_code === "port_conflict"` without parsing
+the `error` string.
+
+Producers should use `EventSender::emit_port_conflict()` and
+`emit_bind_failed()` (defined in `src/manager/events.rs`) rather than
+emitting raw `Event` instances — the helpers populate `details` with
+the canonical shape and the recent-event tracker that lets the
+WS command handler return runtime bind failures synchronously on the
+`command_ack` for `create_flow` / `update_flow`.

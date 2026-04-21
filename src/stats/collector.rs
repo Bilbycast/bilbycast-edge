@@ -880,7 +880,8 @@ impl MediaAnalysisAccumulator {
 // ── Thumbnail Accumulator ─────────────────────────────────────────────────
 
 /// Number of consecutive identical thumbnail captures before raising a
-/// "frozen" alarm. At 5 s per capture this corresponds to ~30 s.
+/// "frozen" alarm. At 5 s per capture this corresponds to ~30 s — tuned
+/// for fast operator feedback on flow changes.
 const FREEZE_THRESHOLD: u64 = 6;
 
 /// Thumbnail generation accumulator. The thumbnail task writes the latest
@@ -907,6 +908,12 @@ pub struct ThumbnailAccumulator {
     /// capture rather than waiting up to a full interval. The loop enforces
     /// its own cooldown so floods are harmless.
     pub refresh_trigger: Arc<tokio::sync::Notify>,
+    /// Shared notifier fired from `store()`. Cloned from the collector-wide
+    /// `thumbnail_update_notify` at construction time so the manager WS
+    /// client wakes and forwards the new JPEG immediately — without this
+    /// hook the WS send loop polls and can sit up to 5s on a stale frame
+    /// after an input switch or signal-state change.
+    update_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl ThumbnailAccumulator {
@@ -920,7 +927,16 @@ impl ThumbnailAccumulator {
             freeze_count: AtomicU64::new(0),
             alarm: Mutex::new(None),
             refresh_trigger: Arc::new(tokio::sync::Notify::new()),
+            update_notify: None,
         }
+    }
+
+    /// Same as `new()` but wires a collector-wide update notifier so every
+    /// `store()` wakes the manager WS client for an out-of-cycle push.
+    pub fn new_with_update_notify(notify: Arc<tokio::sync::Notify>) -> Self {
+        let mut acc = Self::new();
+        acc.update_notify = Some(notify);
+        acc
     }
 
     /// Ask the thumbnail loop to capture a fresh frame at its next opportunity,
@@ -936,6 +952,9 @@ impl ThumbnailAccumulator {
         *self.latest_jpeg.lock().unwrap() = Some((jpeg_data, Instant::now()));
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.total_captured.fetch_add(1, Ordering::Relaxed);
+        if let Some(n) = &self.update_notify {
+            n.notify_one();
+        }
     }
 
     /// Record a capture error.
@@ -962,6 +981,24 @@ impl ThumbnailAccumulator {
     /// Set or clear the current thumbnail alarm.
     pub fn set_alarm(&self, value: Option<String>) {
         *self.alarm.lock().unwrap() = value;
+    }
+
+    /// Reset the freeze-detection state (cleared alarm + zero counter +
+    /// forgotten previous hash). Called when the capture path can no longer
+    /// observe the stream — e.g. the input went idle and the TS ring is
+    /// empty, or the decoder errored out. Without this the alarm remains
+    /// "sticky frozen" indefinitely after a capture gap, and the next
+    /// successful capture would immediately re-flag frozen if it happened
+    /// to hash to the last stored value.
+    pub fn reset_freeze(&self) {
+        *self.alarm.lock().unwrap() = None;
+        *self.prev_jpeg_hash.lock().unwrap() = None;
+        self.freeze_count.store(0, Ordering::Relaxed);
+    }
+
+    /// Read the current thumbnail alarm state (cloned `Option<String>`).
+    pub fn current_alarm(&self) -> Option<String> {
+        self.alarm.lock().unwrap().clone()
     }
 
     /// Take a point-in-time snapshot for JSON serialisation.
@@ -2089,6 +2126,12 @@ fn derive_flow_health(
 /// [`Self::flow_snapshot`] without blocking the data plane.
 pub struct StatsCollector {
     pub flow_stats: DashMap<String, Arc<FlowStatsAccumulator>>,
+    /// Shared notifier fired whenever any `ThumbnailAccumulator::store()`
+    /// writes a fresh JPEG (flow-level or per-input). The manager WS client
+    /// awaits this so thumbnails forward within milliseconds of capture
+    /// instead of waiting for a 5s poll tick. Safe to notify from any task;
+    /// permits latch even if no consumer is waiting.
+    pub thumbnail_update_notify: Arc<tokio::sync::Notify>,
 }
 
 impl StatsCollector {
@@ -2096,6 +2139,7 @@ impl StatsCollector {
     pub fn new() -> Self {
         Self {
             flow_stats: DashMap::new(),
+            thumbnail_update_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 

@@ -201,6 +201,8 @@ fn is_passive_listener(config: &InputConfig) -> bool {
         // isn't meaningful for a heterogeneous bond — the full bond
         // socket must be up for traffic to flow, so skip it here.
         InputConfig::Bonded(_) => false,
+        // Synthetic input — never listens on a socket.
+        InputConfig::TestPattern(_) => false,
     }
 }
 
@@ -213,43 +215,47 @@ async fn run_standby_listener(
     event_sender: EventSender,
     input_id: String,
 ) {
+    let component = format!("Standby listener for input '{input_id}'");
     match config {
         InputConfig::Rtp(ref rtp) => {
-            run_udp_standby(&rtp.bind_addr, &status, &cancel).await;
+            run_udp_standby(&rtp.bind_addr, &status, &cancel, &event_sender, &input_id, &component).await;
         }
         InputConfig::Udp(ref udp) => {
-            run_udp_standby(&udp.bind_addr, &status, &cancel).await;
+            run_udp_standby(&udp.bind_addr, &status, &cancel, &event_sender, &input_id, &component).await;
         }
         InputConfig::St2110_30(ref st) | InputConfig::St2110_31(ref st) => {
-            run_udp_standby(&st.bind_addr, &status, &cancel).await;
+            run_udp_standby(&st.bind_addr, &status, &cancel, &event_sender, &input_id, &component).await;
         }
         InputConfig::St2110_40(ref anc) => {
-            run_udp_standby(&anc.bind_addr, &status, &cancel).await;
+            run_udp_standby(&anc.bind_addr, &status, &cancel, &event_sender, &input_id, &component).await;
         }
         InputConfig::St2110_20(ref v) => {
-            run_udp_standby(&v.bind_addr, &status, &cancel).await;
+            run_udp_standby(&v.bind_addr, &status, &cancel, &event_sender, &input_id, &component).await;
         }
         InputConfig::RtpAudio(ref rtp_audio) => {
-            run_udp_standby(&rtp_audio.bind_addr, &status, &cancel).await;
+            run_udp_standby(&rtp_audio.bind_addr, &status, &cancel, &event_sender, &input_id, &component).await;
         }
         InputConfig::Rtmp(ref rtmp) => {
-            run_tcp_standby(&rtmp.listen_addr, &status, &cancel).await;
+            run_tcp_standby(&rtmp.listen_addr, &status, &cancel, &event_sender, &input_id, &component).await;
         }
         InputConfig::Srt(ref srt) if srt.mode == SrtMode::Listener => {
             let addr = srt.local_addr.as_deref().unwrap_or("0.0.0.0:0");
-            run_udp_standby(addr, &status, &cancel).await;
+            run_udp_standby(addr, &status, &cancel, &event_sender, &input_id, &component).await;
         }
         InputConfig::Rist(ref rist) => {
-            run_udp_standby(&rist.bind_addr, &status, &cancel).await;
+            run_udp_standby(&rist.bind_addr, &status, &cancel, &event_sender, &input_id, &component).await;
         }
         _ => {
             *status.state.write().unwrap() = "unsupported".to_string();
         }
     }
 
-    // Emit event if the standby listener ended with an error
+    // Belt-and-braces secondary signal for non-bind errors (e.g. recv failure
+    // after the socket was bound). Bind-time port conflicts are already
+    // emitted as Critical `port_conflict` events from the inner bind helpers
+    // — this STANDBY warning catches the post-bind failure modes only.
     let final_state = status.state.read().unwrap().clone();
-    if final_state == "bind_failed" || final_state == "error" {
+    if final_state == "error" {
         let err_msg = status.error.read().unwrap().clone().unwrap_or_default();
         event_sender.emit_input(
             crate::manager::events::EventSeverity::Warning,
@@ -265,12 +271,24 @@ async fn run_udp_standby(
     bind_addr: &str,
     status: &Arc<StandbyStatus>,
     cancel: &CancellationToken,
+    event_sender: &EventSender,
+    input_id: &str,
+    component: &str,
 ) {
+    use crate::manager::events::{BindProto, BindScope};
+
     let addr: SocketAddr = match bind_addr.parse() {
         Ok(a) => a,
         Err(e) => {
             *status.state.write().unwrap() = "bind_failed".to_string();
             *status.error.write().unwrap() = Some(format!("Invalid address: {e}"));
+            event_sender.emit_bind_failed(
+                component,
+                bind_addr,
+                BindProto::Udp,
+                BindScope::input(input_id),
+                format!("Invalid address: {e}"),
+            );
             return;
         }
     };
@@ -283,16 +301,32 @@ async fn run_udp_standby(
             s
         }
         Err(e) => {
-            let msg = if crate::util::port_error::is_addr_in_use(&e) {
-                format!(
+            if crate::util::port_error::is_addr_in_use(&e) {
+                let msg = format!(
                     "Port conflict: could not bind to {bind_addr} \
                      — address already in use"
-                )
+                );
+                *status.state.write().unwrap() = "bind_failed".to_string();
+                *status.error.write().unwrap() = Some(msg);
+                event_sender.emit_port_conflict(
+                    component,
+                    bind_addr,
+                    BindProto::Udp,
+                    BindScope::input(input_id),
+                    e,
+                );
             } else {
-                format!("{e}")
-            };
-            *status.state.write().unwrap() = "bind_failed".to_string();
-            *status.error.write().unwrap() = Some(msg);
+                let msg = format!("{e}");
+                *status.state.write().unwrap() = "bind_failed".to_string();
+                *status.error.write().unwrap() = Some(msg);
+                event_sender.emit_bind_failed(
+                    component,
+                    bind_addr,
+                    BindProto::Udp,
+                    BindScope::input(input_id),
+                    e,
+                );
+            }
             return;
         }
     };
@@ -324,12 +358,24 @@ async fn run_tcp_standby(
     listen_addr: &str,
     status: &Arc<StandbyStatus>,
     cancel: &CancellationToken,
+    event_sender: &EventSender,
+    input_id: &str,
+    component: &str,
 ) {
+    use crate::manager::events::{BindProto, BindScope};
+
     let addr: SocketAddr = match listen_addr.parse() {
         Ok(a) => a,
         Err(e) => {
             *status.state.write().unwrap() = "bind_failed".to_string();
             *status.error.write().unwrap() = Some(format!("Invalid address: {e}"));
+            event_sender.emit_bind_failed(
+                component,
+                listen_addr,
+                BindProto::Tcp,
+                BindScope::input(input_id),
+                format!("Invalid address: {e}"),
+            );
             return;
         }
     };
@@ -342,16 +388,32 @@ async fn run_tcp_standby(
             l
         }
         Err(e) => {
-            let msg = if crate::util::port_error::is_addr_in_use(&e) {
-                format!(
+            if crate::util::port_error::is_addr_in_use(&e) {
+                let msg = format!(
                     "Port conflict: could not bind to {listen_addr} \
                      — address already in use"
-                )
+                );
+                *status.state.write().unwrap() = "bind_failed".to_string();
+                *status.error.write().unwrap() = Some(msg);
+                event_sender.emit_port_conflict(
+                    component,
+                    listen_addr,
+                    BindProto::Tcp,
+                    BindScope::input(input_id),
+                    e,
+                );
             } else {
-                format!("{e}")
-            };
-            *status.state.write().unwrap() = "bind_failed".to_string();
-            *status.error.write().unwrap() = Some(msg);
+                let msg = format!("{e}");
+                *status.state.write().unwrap() = "bind_failed".to_string();
+                *status.error.write().unwrap() = Some(msg);
+                event_sender.emit_bind_failed(
+                    component,
+                    listen_addr,
+                    BindProto::Tcp,
+                    BindScope::input(input_id),
+                    e,
+                );
+            }
             return;
         }
     };
