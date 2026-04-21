@@ -231,6 +231,20 @@ impl FlowManager {
         }
     }
 
+    /// Return the IDs of every output currently running on a flow, or `None`
+    /// if the flow itself is not running.
+    ///
+    /// Reads from `FlowRuntime.output_handles` — this reflects **live runtime
+    /// state**, not the config. `update_flow` / `update_config` reconciliation
+    /// uses this as the authoritative "what's currently attached" set so
+    /// orphan outputs (tasks that survived a previous teardown but are no
+    /// longer referenced by the config) get torn down on the next update.
+    pub async fn running_output_ids(&self, flow_id: &str) -> Option<Vec<String>> {
+        let runtime = self.flows.get(flow_id)?;
+        let handles = runtime.output_handles.read().await;
+        Some(handles.keys().cloned().collect())
+    }
+
     /// Remove a single output from a running flow without affecting other outputs.
     ///
     /// Cancels the output's child cancellation token, which causes its task

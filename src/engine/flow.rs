@@ -1366,12 +1366,26 @@ impl FlowRuntime {
         if let Some(output_rt) = output_rt {
             output_rt.cancel_token.cancel();
             // Wait for the output task to finish cleanup (close SRT listener/socket,
-            // release UDP port) before returning. This ensures the port is free for
-            // reuse when a new output is created on the same address.
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                output_rt.handle,
-            ).await;
+            // release UDP port) before returning. If the task doesn't respond to
+            // cancel within 5s, abort — a naive `timeout(..., handle)` moves the
+            // JoinHandle into the timeout future and silently detaches the task on
+            // elapse, leaving it running forever as an orphan (still sending
+            // packets, no longer tracked) — e.g. an RTMP task stuck in a TLS
+            // handshake or reconnect wait would stay alive after remove_output
+            // returned.
+            let mut handle = output_rt.handle;
+            tokio::select! {
+                _ = &mut handle => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    tracing::warn!(
+                        "Output '{}' in flow '{}' did not exit within 5s of cancel — aborting",
+                        output_id,
+                        self.config.config.id,
+                    );
+                    handle.abort();
+                    let _ = handle.await;
+                }
+            }
             self.stats.unregister_output(output_id);
             tracing::info!("Removed output '{}' from flow '{}'", output_id, self.config.config.id);
             Ok(())

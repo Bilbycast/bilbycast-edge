@@ -1057,11 +1057,16 @@ async fn execute_command(
                         #[cfg(feature = "webrtc")]
                         register_whep_if_needed(_webrtc_sessions, &_runtime);
                     } else {
-                        // Only outputs changed — diff surgically
-                        tracing::info!("Update flow '{flow_id}': input unchanged, diffing outputs ({} old → {} new)",
-                            old_flow.output_ids.len(), new_flow.output_ids.len());
+                        // Only outputs changed — diff surgically against the runtime.
+                        // `old_flow.output_ids` is intentionally unused here; see
+                        // `diff_outputs_inner` for why runtime state is authoritative.
+                        tracing::info!(
+                            "Update flow '{flow_id}': input unchanged, reconciling outputs (config old→new: {} → {})",
+                            old_flow.output_ids.len(),
+                            new_flow.output_ids.len(),
+                        );
                         let cfg = app_config.read().await;
-                        diff_outputs(flow_manager, flow_id, &old_flow.output_ids, &new_flow.output_ids, &cfg).await;
+                        diff_outputs(flow_manager, flow_id, &new_flow.output_ids, &cfg).await;
                     }
                 } else if was_running && !new_flow.enabled {
                     // Disable
@@ -1549,10 +1554,13 @@ async fn execute_command(
                                     Err(e) => tracing::warn!("Failed to resolve flow '{id}': {e}"),
                                 }
                             } else {
-                                // Input unchanged — diff outputs surgically
-                                tracing::info!("Config diff: flow '{id}' unchanged, diffing outputs ({} old → {} new)",
-                                    old_flow.output_ids.len(), new_flow.output_ids.len());
-                                diff_outputs_with_configs(flow_manager, id, &old_flow.output_ids, &new_flow.output_ids, &old_config, &new_config).await;
+                                // Input unchanged — reconcile outputs against the runtime
+                                tracing::info!(
+                                    "Config diff: flow '{id}' unchanged, reconciling outputs (config old→new: {} → {})",
+                                    old_flow.output_ids.len(),
+                                    new_flow.output_ids.len(),
+                                );
+                                diff_outputs_with_configs(flow_manager, id, &new_flow.output_ids, &old_config, &new_config).await;
                             }
                         }
                         // else: !was_running && !should_run → no-op
@@ -2002,54 +2010,67 @@ async fn execute_command(
 
 /// Diff outputs between old and new config, applying surgical hot-add/remove.
 ///
-/// Compares old and new output ID lists. When IDs change, removes dropped outputs
-/// and adds new ones. When an ID is present in both lists, resolves the actual
-/// `OutputConfig` from both the old and new `AppConfig` and compares to detect
-/// config changes (e.g., address/port edits). Only outputs that actually changed
-/// are touched; unchanged outputs keep running without interruption.
+/// Reconcile a running flow's outputs against the new config.
 ///
-/// For the `update_flow` command, `old_config` and `new_config` may be the same
-/// `AppConfig` reference (since output definitions live at the top level and the
-/// command only changes the flow). For `update_config`, they are the old and new
-/// configs respectively.
+/// The "currently attached" set is read from **runtime state** (the keys of
+/// `FlowRuntime.output_handles`), not from the old config. This is the whole
+/// point — diffing config-vs-config misses orphans, i.e. outputs that stayed
+/// running after a previous update where teardown didn't complete (e.g. an
+/// output task that didn't respond to cancel in time and got detached). Once
+/// the config's `output_ids` drifts away from what's actually running, a pure
+/// config-vs-config diff sees "no change" and can never recover. Diffing
+/// runtime-vs-new-config always tears down every orphan on the next update.
+///
+/// For `update_flow`, `old_config` and `new_config` are the same reference
+/// (outputs live at the top level and the command only mutates the flow).
+/// For `update_config` they are the old and new configs respectively — the
+/// old config is only consulted to detect when an output definition changed
+/// under an ID that is present in both (so we can replace it).
 async fn diff_outputs(
     flow_manager: &FlowManager,
     flow_id: &str,
-    old_output_ids: &[String],
     new_output_ids: &[String],
     new_config: &AppConfig,
 ) {
-    diff_outputs_inner(flow_manager, flow_id, old_output_ids, new_output_ids, new_config, new_config).await;
+    diff_outputs_inner(flow_manager, flow_id, new_output_ids, new_config, new_config).await;
 }
 
-/// Inner implementation that accepts separate old/new configs for output resolution.
 async fn diff_outputs_with_configs(
     flow_manager: &FlowManager,
     flow_id: &str,
-    old_output_ids: &[String],
     new_output_ids: &[String],
     old_config: &AppConfig,
     new_config: &AppConfig,
 ) {
-    diff_outputs_inner(flow_manager, flow_id, old_output_ids, new_output_ids, old_config, new_config).await;
+    diff_outputs_inner(flow_manager, flow_id, new_output_ids, old_config, new_config).await;
 }
 
 async fn diff_outputs_inner(
     flow_manager: &FlowManager,
     flow_id: &str,
-    old_output_ids: &[String],
     new_output_ids: &[String],
     old_config: &AppConfig,
     new_config: &AppConfig,
 ) {
     use std::collections::HashSet;
-    let old_set: HashSet<&str> = old_output_ids.iter().map(|s| s.as_str()).collect();
+
+    let running_ids: Vec<String> = flow_manager
+        .running_output_ids(flow_id)
+        .await
+        .unwrap_or_default();
+    let running_set: HashSet<&str> = running_ids.iter().map(|s| s.as_str()).collect();
     let new_set: HashSet<&str> = new_output_ids.iter().map(|s| s.as_str()).collect();
 
-    // Remove outputs that are no longer referenced
-    for &id in &old_set {
+    tracing::info!(
+        "Flow '{flow_id}' output reconcile: running={:?} -> new={:?}",
+        running_ids,
+        new_output_ids,
+    );
+
+    // Remove outputs that are currently running but no longer referenced
+    for id in running_set.iter().copied() {
         if !new_set.contains(id) {
-            tracing::info!("Config diff: removing output '{id}' from flow '{flow_id}'");
+            tracing::info!("Config diff: removing output '{id}' from flow '{flow_id}' (running, not in new config)");
             if let Err(e) = flow_manager.remove_output(flow_id, id).await {
                 tracing::warn!("Failed to remove output '{id}' from flow '{flow_id}': {e}");
             }
@@ -2066,14 +2087,14 @@ async fn diff_outputs_inner(
             }
         };
 
-        if !old_set.contains(id) {
-            // Brand-new output reference
+        if !running_set.contains(id) {
+            // Not currently running — spawn it
             tracing::info!("Config diff: adding output '{id}' to flow '{flow_id}'");
             if let Err(e) = flow_manager.add_output(flow_id, new_output.clone()).await {
                 tracing::warn!("Failed to add output '{id}' to flow '{flow_id}': {e}");
             }
         } else {
-            // Output exists in both old and new — check if the actual config changed
+            // Running — check whether the config actually changed and replace if so
             let old_output = old_config.outputs.iter().find(|o| o.id() == id);
 
             match old_output {
@@ -2092,8 +2113,12 @@ async fn diff_outputs_inner(
                     tracing::info!("Config diff: output '{id}' unchanged, keeping alive");
                 }
                 None => {
-                    // Old config doesn't have this output definition — treat as new
-                    tracing::info!("Config diff: output '{id}' not found in old config, adding to flow '{flow_id}'");
+                    // Running but absent from old config — treat as replacement so the
+                    // runtime task is swapped for one matching the new definition.
+                    tracing::warn!("Config diff: output '{id}' is running but missing from old config — replacing");
+                    if let Err(e) = flow_manager.remove_output(flow_id, id).await {
+                        tracing::warn!("Failed to remove output '{id}' for replacement: {e}");
+                    }
                     if let Err(e) = flow_manager.add_output(flow_id, new_output.clone()).await {
                         tracing::warn!("Failed to add output '{id}' to flow '{flow_id}': {e}");
                     }
