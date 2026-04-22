@@ -34,6 +34,8 @@ use super::degradation_monitor::spawn_degradation_monitor;
 use super::media_analysis::spawn_media_analyzer;
 use super::thumbnail::spawn_thumbnail_generator;
 use super::tr101290::spawn_tr101290_analyzer;
+use super::ts_assembler::{spawn_spts_assembler, SptsPlan, SptsSlot};
+use super::ts_es_bus::{FlowEsBus, TsEsDemuxer};
 use crate::stats::collector::{MediaAnalysisAccumulator, ThumbnailAccumulator, Tr101290Accumulator};
 
 /// Runtime state for a single media flow (one or more inputs, N outputs).
@@ -131,6 +133,12 @@ pub struct FlowRuntime {
     /// with `TargetFrames` delay mode can subscribe to frame rate updates
     /// instead of falling back to `fallback_ms`.
     pub frame_rate_rx: Option<watch::Receiver<Option<f64>>>,
+    /// PID-bus SPTS assembler task handle. `Some` only when the flow has
+    /// `assembly.kind = spts`; in that case the assembler is the sole
+    /// publisher into `broadcast_tx`. Held for ownership; shutdown is
+    /// driven by the parent `CancellationToken`.
+    #[allow(dead_code)]
+    pub pid_bus_assembler_handle: Option<JoinHandle<()>>,
 }
 
 /// Runtime state for a single input within a flow.
@@ -209,18 +217,30 @@ impl FlowRuntime {
     /// bind failure). The input task is spawned first and errors there are
     /// reported asynchronously via the task's log output.
     pub async fn start(config: ResolvedFlow, global_stats: &crate::stats::collector::StatsCollector, ffmpeg_available: bool, event_sender: EventSender) -> Result<Self> {
-        // PID-bus assembly is accepted at config-validation time but the
-        // runtime that consumes it lands in phases 4–5. Refuse to start
-        // a flow carrying one (rather than silently falling back to
-        // passthrough) so operators see an unambiguous failure.
-        if let Some(ref assembly) = config.config.assembly {
-            use crate::config::models::AssemblyKind;
-            if !matches!(assembly.kind, AssemblyKind::Passthrough) {
+        // PID-bus assembly is accepted at config-validation time. Phase 5
+        // lifts the runtime for `kind = spts`; `kind = mpts` still bails
+        // loudly (Phase 5+ scope decision), and `kind = passthrough`
+        // means "no assembler — behave like a legacy flow".
+        //
+        // Slot resolution to a concrete `SptsPlan` happens inside
+        // `build_spts_plan`, which also enforces the Phase 5 scope
+        // guards (TS-carrier inputs only, UDP-only outputs, concrete
+        // `Pid` slots only). Each guard emits a Critical event with a
+        // distinct `error_code` so the manager UI can surface the
+        // offending field on the assembly editor.
+        let spts_plan: Option<SptsPlan> = match config.config.assembly.as_ref() {
+            None => None,
+            Some(a) if matches!(a.kind, AssemblyKind::Passthrough) => None,
+            Some(a) if matches!(a.kind, AssemblyKind::Spts) => {
+                Some(build_spts_plan(a, &config, &event_sender)?)
+            }
+            Some(a) => {
                 let msg = format!(
                     "flow '{}': assembly.kind = {:?} is accepted by validation but \
-                     the PID-bus runtime is not yet implemented (Phase 4/5). \
-                     Remove the `assembly` block or use kind = passthrough.",
-                    config.config.id, assembly.kind,
+                     the PID-bus runtime only supports `spts` in Phase 5. \
+                     Remove the `assembly` block, use kind = spts, or use \
+                     kind = passthrough.",
+                    config.config.id, a.kind,
                 );
                 event_sender.emit_flow_with_details(
                     EventSeverity::Critical,
@@ -228,13 +248,20 @@ impl FlowRuntime {
                     msg.clone(),
                     &config.config.id,
                     serde_json::json!({
-                        "error_code": "pid_bus_not_implemented",
-                        "kind": format!("{:?}", assembly.kind).to_lowercase(),
+                        "error_code": "pid_bus_mpts_not_implemented",
+                        "kind": format!("{:?}", a.kind).to_lowercase(),
                     }),
                 );
                 anyhow::bail!(msg);
             }
-        }
+        };
+        // Shared ES bus for the SPTS runtime. Constructed only when a
+        // plan is present; non-assembly flows pay zero cost (no Arc, no
+        // DashMap). The bus lives as long as the flow, shared by every
+        // per-input TS demuxer and the single assembler task.
+        let es_bus: Option<Arc<FlowEsBus>> = spts_plan
+            .as_ref()
+            .map(|_| Arc::new(FlowEsBus::new()));
         let cancel_token = CancellationToken::new();
         // The broadcast channel is bounded to BROADCAST_CHANNEL_CAPACITY slots.
         // When a slow output (receiver) cannot keep up, it will *not* block the
@@ -546,16 +573,33 @@ impl FlowRuntime {
                 );
             }
 
-            let forwarder_handle = spawn_input_forwarder(
-                input_id.clone(),
-                per_input_tx.subscribe(),
-                broadcast_tx.clone(),
-                active_input_watch_rx.clone(),
-                input_cancel.clone(),
-                continuity_fixer.clone(),
-                force_idr.clone(),
-                per_input_counters,
-            );
+            // In SPTS assembly mode, the per-input forwarder is replaced
+            // by a TS-ES demuxer consumer that publishes elementary
+            // streams onto the shared [`FlowEsBus`]. The assembler (one
+            // per flow, spawned below) pulls ES from the bus, rewrites
+            // PIDs, synthesises PAT/PMT, and is the sole publisher onto
+            // `broadcast_tx`. The active-input watch is unused in this
+            // mode — every input contributes ES simultaneously.
+            let forwarder_handle = if let Some(ref bus) = es_bus {
+                spawn_ts_es_demuxer_consumer(
+                    input_id.clone(),
+                    per_input_tx.subscribe(),
+                    bus.clone(),
+                    input_cancel.clone(),
+                    per_input_counters,
+                )
+            } else {
+                spawn_input_forwarder(
+                    input_id.clone(),
+                    per_input_tx.subscribe(),
+                    broadcast_tx.clone(),
+                    active_input_watch_rx.clone(),
+                    input_cancel.clone(),
+                    continuity_fixer.clone(),
+                    force_idr.clone(),
+                    per_input_counters,
+                )
+            };
 
             // Spawn per-input thumbnail generator (subscribes to the input's
             // own broadcast channel so it captures this source's video even
@@ -601,6 +645,30 @@ impl FlowRuntime {
                 config.config.id
             );
         }
+
+        // Spawn the SPTS assembler *after* every per-input demuxer is wired
+        // up: the assembler subscribes eagerly to each slot's bus channel
+        // at startup, which is safe because `FlowEsBus::subscribe` creates
+        // channels lazily — subscribing before any publisher has emitted
+        // still returns a live `broadcast::Receiver`.
+        let pid_bus_assembler_handle: Option<JoinHandle<()>> = match (&spts_plan, &es_bus) {
+            (Some(plan), Some(bus)) => {
+                tracing::info!(
+                    "Flow '{}': starting SPTS assembler (program_number = {}, pmt_pid = 0x{:04X}, {} slot(s))",
+                    config.config.id,
+                    plan.program_number,
+                    plan.pmt_pid,
+                    plan.slots.len(),
+                );
+                Some(spawn_spts_assembler(
+                    plan.clone(),
+                    bus.clone(),
+                    broadcast_tx.clone(),
+                    cancel_token.child_token(),
+                ))
+            }
+            _ => None,
+        };
 
         // Start TR-101290 analyzer (independent broadcast subscriber).
         //
@@ -905,6 +973,7 @@ impl FlowRuntime {
             whep_session_tx: whep_session_info,
             event_sender,
             frame_rate_rx,
+            pid_bus_assembler_handle,
         })
     }
 
@@ -1785,6 +1854,232 @@ fn spawn_input_forwarder(
                         // receivers that treat silence as EOF).
                         let _ = out_tx.send(null_ts_packet());
                     }
+                }
+            }
+        }
+    })
+}
+
+/// Resolve a [`FlowAssembly`] with `kind = spts` into a concrete [`SptsPlan`],
+/// enforcing the Phase 5 scope guards:
+///
+/// - every output on the flow must be `OutputConfig::Udp`
+///   (`error_code: pid_bus_spts_non_udp_output`)
+/// - every input on the flow must produce MPEG-TS via `is_ts_carrier()`
+///   (`error_code: pid_bus_spts_non_ts_input`)
+/// - every slot source must be `SlotSource::Pid` — `Essence` and `Hitless`
+///   are deferred to Phase 6 / 7 and rejected loudly
+///   (`error_codes: pid_bus_spts_essence_not_implemented`,
+///   `pid_bus_spts_hitless_not_implemented`)
+/// - `pcr_source` must resolve to exactly one of the assembled slots
+///   (`error_code: pid_bus_pcr_source_unresolved`) — the validator
+///   already enforces this at config-load time for concrete Pid slots,
+///   but runtime revalidates so a fix-up elsewhere can never bypass it.
+///
+/// Every failure path emits a Critical event *before* bailing so the
+/// manager UI can highlight the offending assembly field without having
+/// to parse the error string.
+fn build_spts_plan(
+    assembly: &FlowAssembly,
+    flow: &ResolvedFlow,
+    event_sender: &EventSender,
+) -> Result<SptsPlan> {
+    let flow_id = &flow.config.id;
+    let emit = |error_code: &str, msg: &str, extra: serde_json::Value| {
+        let mut details = serde_json::json!({ "error_code": error_code });
+        if let (Some(d), Some(e)) = (details.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                d.insert(k.clone(), v.clone());
+            }
+        }
+        event_sender.emit_flow_with_details(
+            EventSeverity::Critical,
+            category::FLOW,
+            msg.to_string(),
+            flow_id,
+            details,
+        );
+    };
+
+    // Output scope: UDP only in Phase 5.
+    for out in &flow.outputs {
+        if !matches!(out, OutputConfig::Udp(_)) {
+            let msg = format!(
+                "flow '{}': assembly.kind = spts only supports UDP outputs in Phase 5; \
+                 output '{}' is type '{}'. Remove it or change the output to UDP.",
+                flow_id,
+                out.id(),
+                out.type_name(),
+            );
+            emit(
+                "pid_bus_spts_non_udp_output",
+                &msg,
+                serde_json::json!({
+                    "output_id": out.id(),
+                    "output_type": out.type_name(),
+                }),
+            );
+            bail!(msg);
+        }
+    }
+
+    // Input scope: TS-carrier inputs only (Phase 6 lifts this for
+    // non-TS inputs via auto-PID + a decoded-ES cache).
+    for input in &flow.inputs {
+        if !input.config.is_ts_carrier() {
+            let msg = format!(
+                "flow '{}': assembly.kind = spts requires every input to carry MPEG-TS \
+                 in Phase 5 (Phase 6 adds auto-PID for non-TS inputs). \
+                 Input '{}' is type '{}'.",
+                flow_id,
+                input.id,
+                input_type_str(&input.config),
+            );
+            emit(
+                "pid_bus_spts_non_ts_input",
+                &msg,
+                serde_json::json!({
+                    "input_id": input.id,
+                    "input_type": input_type_str(&input.config),
+                }),
+            );
+            bail!(msg);
+        }
+    }
+
+    // Exactly one program in Spts — validation already enforces this,
+    // but treat it as an invariant here so the `.first()` below is
+    // defensible without an unwrap.
+    let program = assembly.programs.first().ok_or_else(|| {
+        let msg = format!("flow '{flow_id}': spts assembly has no program");
+        emit("pid_bus_spts_no_program", &msg, serde_json::json!({}));
+        anyhow::anyhow!(msg)
+    })?;
+
+    // Resolve every slot into a concrete `(input_id, source_pid)` →
+    // rejecting Essence / Hitless until their phases land.
+    let mut slots: Vec<SptsSlot> = Vec::with_capacity(program.streams.len());
+    for stream in &program.streams {
+        let (input_id, source_pid) = match &stream.source {
+            SlotSource::Pid { input_id, source_pid } => (input_id.clone(), *source_pid),
+            SlotSource::Essence { input_id, kind } => {
+                let msg = format!(
+                    "flow '{}': SlotSource::Essence on input '{}' (kind = {:?}) is not yet \
+                     implemented — use SlotSource::Pid with an explicit source_pid until \
+                     Phase 6 lands auto-PID resolution.",
+                    flow_id, input_id, kind
+                );
+                emit(
+                    "pid_bus_spts_essence_not_implemented",
+                    &msg,
+                    serde_json::json!({
+                        "input_id": input_id,
+                        "kind": format!("{:?}", kind).to_lowercase(),
+                        "out_pid": stream.out_pid,
+                    }),
+                );
+                bail!(msg);
+            }
+            SlotSource::Hitless { .. } => {
+                let msg = format!(
+                    "flow '{}': SlotSource::Hitless is not yet implemented — \
+                     use a single SlotSource::Pid until Phase 7 lands runtime switching.",
+                    flow_id
+                );
+                emit(
+                    "pid_bus_spts_hitless_not_implemented",
+                    &msg,
+                    serde_json::json!({ "out_pid": stream.out_pid }),
+                );
+                bail!(msg);
+            }
+        };
+        slots.push(SptsSlot {
+            source: (input_id, source_pid),
+            out_pid: stream.out_pid,
+            stream_type: stream.stream_type,
+        });
+    }
+
+    // `pcr_source` must hit exactly one slot — validated at config-load
+    // time for concrete Pid slots, re-checked here so runtime is
+    // authoritative. (If Phase 6 later adds deferred Essence resolution,
+    // the check moves to the post-resolution step.)
+    let pcr = assembly
+        .pcr_source
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("flow '{flow_id}': spts assembly has no pcr_source"))?;
+    let pcr_key = (pcr.input_id.clone(), pcr.pid);
+    if !slots.iter().any(|s| s.source == pcr_key) {
+        let msg = format!(
+            "flow '{}': pcr_source ({}, 0x{:04X}) does not match any assembled slot source — \
+             unable to map PCR_PID in the synthesised PMT.",
+            flow_id, pcr.input_id, pcr.pid
+        );
+        emit(
+            "pid_bus_pcr_source_unresolved",
+            &msg,
+            serde_json::json!({
+                "input_id": pcr.input_id,
+                "pid": pcr.pid,
+            }),
+        );
+        bail!(msg);
+    }
+
+    Ok(SptsPlan {
+        program_number: program.program_number,
+        pmt_pid: program.pmt_pid,
+        pcr_source: pcr_key,
+        slots,
+    })
+}
+
+/// Drain a per-input `broadcast::Receiver<RtpPacket>` into a
+/// [`TsEsDemuxer`], publishing elementary-stream packets onto the flow's
+/// shared [`FlowEsBus`]. Replaces [`spawn_input_forwarder`] for flows
+/// running under the SPTS assembler — there's no active-input gate and
+/// no continuity fixer in this path because the assembler synthesises
+/// its own CC + PSI downstream.
+///
+/// Per-input liveness counters (`bytes`, `packets`) are still updated so
+/// the manager UI's "feed present" indicator works identically to
+/// passthrough mode.
+fn spawn_ts_es_demuxer_consumer(
+    input_id: String,
+    mut rx: broadcast::Receiver<RtpPacket>,
+    bus: Arc<FlowEsBus>,
+    cancel: CancellationToken,
+    per_input_counters: Arc<crate::stats::collector::PerInputCounters>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut demuxer = TsEsDemuxer::new(input_id.clone(), bus);
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                r = rx.recv() => match r {
+                    Ok(pkt) => {
+                        per_input_counters
+                            .bytes
+                            .fetch_add(pkt.data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        per_input_counters
+                            .packets
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        demuxer.process(&pkt);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // Slow consumer — drop on the floor. PID-bus
+                        // subscribers are independent per-PID channels
+                        // with their own Lagged handling; no correlation
+                        // state to reset at the demuxer level.
+                        tracing::debug!(
+                            "ts_es_demuxer_consumer '{}': lagged {} packets",
+                            input_id, n
+                        );
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
         }

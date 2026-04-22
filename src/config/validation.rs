@@ -1922,6 +1922,13 @@ fn validate_flow_assembly(
     // Collect program-level uniqueness + recurse into slots.
     let mut seen_pn = std::collections::HashSet::new();
     let mut seen_pmt = std::collections::HashSet::new();
+    // For pcr_source resolution: concrete (input_id, source_pid) pairs
+    // from Pid / Hitless-Pid slots, plus input_ids carrying Essence
+    // slots (resolved at runtime against the input's PSI catalogue).
+    let mut slot_pids: std::collections::HashSet<(&str, u16)> =
+        std::collections::HashSet::new();
+    let mut slot_essence_inputs: std::collections::HashSet<&str> =
+        std::collections::HashSet::new();
     for prog in &assembly.programs {
         if prog.program_number == 0 {
             bail!(
@@ -1974,10 +1981,48 @@ fn validate_flow_assembly(
                 }
             }
             validate_slot_source(&stream.source, &check_input, &check_pid, context, false)?;
+            collect_slot_ref(&stream.source, &mut slot_pids, &mut slot_essence_inputs);
         }
     }
 
+    // Cross-check pcr_source resolves into an ES slot the assembler will
+    // emit. Exact (input_id, pid) against Pid/Hitless-Pid slots, or a
+    // looser input_id match when the target slot is an Essence selector
+    // (PID is resolved at runtime via the input's PSI catalogue).
+    // Runtime re-verifies the loose case and fails with
+    // `pid_bus_pcr_source_unresolved` if the Essence lookup doesn't land
+    // on the named PID.
+    let concrete_hit = slot_pids.contains(&(pcr.input_id.as_str(), pcr.pid));
+    let essence_hit = slot_essence_inputs.contains(pcr.input_id.as_str());
+    if !concrete_hit && !essence_hit {
+        bail!(
+            "{context}: pcr_source ({}, 0x{:04X}) does not resolve to any slot's source in the assembly",
+            pcr.input_id,
+            pcr.pid
+        );
+    }
+
     Ok(())
+}
+
+fn collect_slot_ref<'a>(
+    src: &'a crate::config::models::SlotSource,
+    pids: &mut std::collections::HashSet<(&'a str, u16)>,
+    essence_inputs: &mut std::collections::HashSet<&'a str>,
+) {
+    use crate::config::models::SlotSource;
+    match src {
+        SlotSource::Pid { input_id, source_pid } => {
+            pids.insert((input_id.as_str(), *source_pid));
+        }
+        SlotSource::Essence { input_id, .. } => {
+            essence_inputs.insert(input_id.as_str());
+        }
+        SlotSource::Hitless { primary, backup } => {
+            collect_slot_ref(primary, pids, essence_inputs);
+            collect_slot_ref(backup, pids, essence_inputs);
+        }
+    }
 }
 
 fn validate_slot_source<F, G>(
@@ -4278,6 +4323,39 @@ mod tests {
     fn assembly_valid_spts_passes() {
         let a = spts_assembly("in-a");
         validate_flow_assembly(&a, &["in-a".into()], "test").expect("valid");
+    }
+
+    #[test]
+    fn assembly_rejects_pcr_source_not_on_any_slot() {
+        let mut a = spts_assembly("in-a");
+        // Keep the one slot on PID 0x100, but point PCR at a different PID
+        // on the same input — no slot carries it, so resolution must fail.
+        a.pcr_source = Some(PcrSource {
+            input_id: "in-a".into(),
+            pid: 0x200,
+        });
+        let err = validate_flow_assembly(&a, &["in-a".into()], "test")
+            .expect_err("must reject unresolved pcr_source");
+        let msg = err.to_string();
+        assert!(msg.contains("pcr_source"), "message was: {msg}");
+        assert!(msg.contains("does not resolve"), "message was: {msg}");
+    }
+
+    #[test]
+    fn assembly_accepts_pcr_source_on_essence_slot() {
+        // PCR points at a specific PID, but the slot is Essence — resolution
+        // is deferred to runtime, so validation must accept it.
+        let mut a = spts_assembly("in-a");
+        a.programs[0].streams[0].source = SlotSource::Essence {
+            input_id: "in-a".into(),
+            kind: EssenceKind::Video,
+        };
+        a.pcr_source = Some(PcrSource {
+            input_id: "in-a".into(),
+            pid: 0x321,
+        });
+        validate_flow_assembly(&a, &["in-a".into()], "test")
+            .expect("essence slot defers pcr resolution to runtime");
     }
 
     /// Helper: build a minimal valid AppConfig with one flow referencing one
