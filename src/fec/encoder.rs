@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 
 use super::matrix::FecMatrix;
+use super::{FEC_HEADER_LEN, FEC_MAGIC};
 
 /// FEC Encoder that generates FEC packets from a stream of media packets.
 pub struct FecEncoder {
@@ -111,45 +112,36 @@ impl FecEncoder {
     }
 }
 
-/// Build a minimal SMPTE 2022-1 FEC header (10 bytes).
+/// Build the bilbycast FEC framing (4-byte magic + 10-byte header).
 ///
-/// Fields:
+/// Fields in the 10-byte header (bytes 4..14 of the emitted packet):
 ///   - SNBase (2 bytes): base sequence number of protected packets
 ///   - Length Recovery (2 bytes): set to 0 (simplified)
 ///   - E (1 bit) + PT recovery (7 bits): set to 0
 ///   - Mask (3 bytes): set to 0 (we use offset/NA addressing)
 ///   - TS Recovery (4 bytes): set to 0
-///   - N (1 bit): 0
-///   - D (1 bit): 1 for column, 0 for row
-///   - Type (3 bits): 0 = XOR
-///   - Index (3 bits): column or row index
-///   - Offset (8 bits): L for column FEC, 1 for row FEC
-///   - NA (8 bits): D for column FEC, L for row FEC
+///   - Flags (byte 8): D bit (0x40) for column, Type (bits 5-3), Index (bits 2-0)
+///   - Offset (byte 9): L for column FEC, 1 for row FEC
 ///
-/// This is a simplified header for our internal use. Real SMPTE 2022-1
-/// has a 16-byte header that overlays an RTP header.
+/// Prepended with the [`FEC_MAGIC`] four-byte marker so receivers can
+/// distinguish FEC datagrams from RTP media on the same UDP port.
 fn build_fec_header(
     sn_base: u16,
     index: u8,
     offset: u8,
     is_column: bool,
 ) -> Vec<u8> {
-    let mut hdr = vec![0u8; 10];
+    let mut hdr = Vec::with_capacity(FEC_MAGIC.len() + FEC_HEADER_LEN);
+    hdr.extend_from_slice(&FEC_MAGIC);
+    hdr.resize(FEC_MAGIC.len() + FEC_HEADER_LEN, 0);
 
-    // SNBase (bytes 0-1)
-    hdr[0] = (sn_base >> 8) as u8;
-    hdr[1] = sn_base as u8;
+    let body = &mut hdr[FEC_MAGIC.len()..];
+    body[0] = (sn_base >> 8) as u8;
+    body[1] = sn_base as u8;
 
-    // Length Recovery (bytes 2-3): 0
-    // E + PT recovery (byte 4): 0
-    // Mask (bytes 5-7): 0
-
-    // Byte 8: D bit (bit 6) + type (bits 5-3) + index (bits 2-0)
     let d_bit = if is_column { 0x40 } else { 0x00 };
-    hdr[8] = d_bit | (index & 0x07);
-
-    // Byte 9: offset
-    hdr[9] = offset;
+    body[8] = d_bit | (index & 0x07);
+    body[9] = offset;
 
     hdr
 }
@@ -188,6 +180,22 @@ mod tests {
 
         // Total FEC packets: 1 + 3 = 4
         assert_eq!(stats.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn fec_packets_carry_bcfe_magic() {
+        let stats = Arc::new(AtomicU64::new(0));
+        let mut encoder = FecEncoder::new(2, 2, stats.clone());
+
+        encoder.process(100, &[0x01]);
+        encoder.process(101, &[0x02]);
+        let fec = encoder.process(102, &[0x04]);
+        assert_eq!(fec.len(), 1);
+        let pkt = &fec[0];
+        assert!(pkt.len() >= FEC_MAGIC.len() + FEC_HEADER_LEN);
+        assert_eq!(&pkt[..FEC_MAGIC.len()], &FEC_MAGIC);
+        // First post-magic byte is SNBase high; cannot collide with RTP V=2 prefix.
+        assert_ne!(pkt[0] & 0xC0, 0x80);
     }
 
     #[test]

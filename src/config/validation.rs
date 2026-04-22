@@ -3355,6 +3355,20 @@ fn validate_srt_common(
                 "{context}: SRT packet_filter (FEC) is not supported in rendezvous mode — libsrt rejects the handshake. Use listener/caller pair instead."
             );
         }
+
+        // FEC layered on top of encryption has a known ordering bug in the
+        // pure-Rust SRT backend: parity is computed in a different order
+        // than libsrt 1.5.5 expects, so C++ peers fail to recover. The
+        // libsrt-rs backend routes through the vendored C library and is
+        // interop-safe. Reject the combination only on the pure-Rust
+        // backend so existing libsrt deployments are unaffected.
+        if passphrase.is_some() && srt_transport::BACKEND_NAME == "pure-rust" {
+            bail!(
+                "{context}: SRT packet_filter (FEC) combined with passphrase (encryption) is not interop-safe on the pure-Rust SRT backend. \
+                 Either remove the passphrase, remove the packet_filter, or switch to the libsrt backend (see bilbycast-edge/Cargo.toml `── SRT backend ──`)."
+            );
+        }
+
         match srt_protocol::fec::FecConfig::parse(pf) {
             Ok(fec_cfg) => {
                 if fec_cfg.cols == 0 || fec_cfg.cols > 256 {

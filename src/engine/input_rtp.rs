@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::RtpInputConfig;
-use crate::fec::decoder::FecDecoder;
+use crate::fec::decoder::{is_fec_packet, FecDecoder};
 use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::redundancy::merger::{ActiveLeg, HitlessMerger};
 use crate::stats::collector::FlowStatsAccumulator;
@@ -224,6 +224,21 @@ async fn rtp_input_loop(
                                 stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
+                        }
+
+                        // ── FEC repair packet (SMPTE 2022-1, bilbycast framing) ──
+                        // Route to the decoder before the RTP-shape check so the
+                        // repair datagram isn't silently dropped. Emits any
+                        // reconstructed media packets directly to broadcast.
+                        if is_fec_packet(data) {
+                            if let Some(ref mut decoder) = fec_decoder {
+                                let recovered = decoder.process_fec(data);
+                                for pkt in recovered {
+                                    stats.fec_recovered.fetch_add(1, Ordering::Relaxed);
+                                    publish_input_packet(transcoder, &broadcast_tx, pkt);
+                                }
+                            }
+                            continue;
                         }
 
                         if !is_likely_rtp(data) {
@@ -479,6 +494,31 @@ fn process_redundant_rtp_packet(
             stats.input_filtered.fetch_add(1, Ordering::Relaxed);
             return;
         }
+    }
+
+    // FEC repair packet on this leg. Recovery feeds straight through the
+    // merger like any other media packet so 2022-7 dedup still applies.
+    if is_fec_packet(data) {
+        if let Some(decoder) = fec_decoder {
+            let recovered = decoder.process_fec(data);
+            for pkt in recovered {
+                if let Some(chosen_leg) = merger.try_merge(pkt.sequence_number, leg) {
+                    if *prev_active_leg != ActiveLeg::None && chosen_leg != *prev_active_leg {
+                        stats.redundancy_switches.fetch_add(1, Ordering::Relaxed);
+                    }
+                    *prev_active_leg = chosen_leg;
+                    stats.input_packets.fetch_add(1, Ordering::Relaxed);
+                    stats.fec_recovered.fetch_add(1, Ordering::Relaxed);
+                    stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
+                    if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
+                        publish_input_packet(transcoder, broadcast_tx, pkt);
+                    } else {
+                        stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        return;
     }
 
     if !is_likely_rtp(data) {

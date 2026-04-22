@@ -140,6 +140,37 @@ impl FecMatrix {
         }
     }
 
+    /// Current count of received media packets in a column. Callers use this
+    /// to decide whether a column FEC packet can recover exactly one missing
+    /// cell (`count == rows - 1`).
+    pub fn col_count(&self, col_idx: u8) -> u8 {
+        self.col_count[col_idx as usize]
+    }
+
+    /// Current count of received media packets in a row.
+    pub fn row_count(&self, row_idx: u8) -> u8 {
+        self.row_count[row_idx as usize]
+    }
+
+    /// Borrow the current column parity (XOR of all received payloads in
+    /// that column). Used by the decoder during recovery.
+    pub fn col_parity(&self, col_idx: u8) -> &[u8] {
+        &self.col_parity[col_idx as usize]
+    }
+
+    /// Borrow the current row parity (XOR of all received payloads in that row).
+    pub fn row_parity(&self, row_idx: u8) -> &[u8] {
+        &self.row_parity[row_idx as usize]
+    }
+
+    /// Borrow a cell payload if present.
+    #[allow(dead_code)]
+    pub fn cell(&self, position: usize) -> Option<&[u8]> {
+        self.cells
+            .get(position)
+            .and_then(|c| c.as_ref().map(|v| v.as_slice()))
+    }
+
     /// XOR `source` into `target`, extending target if needed.
     fn xor_accumulate(target: &mut Vec<u8>, source: &[u8]) {
         if target.len() < source.len() {

@@ -314,10 +314,29 @@ impl FlowRuntime {
             );
         }
 
-        // Shared TS continuity fixer for seamless input switching. Ensures
-        // CC counters are continuous and discontinuity_indicator is set when
-        // switching between inputs, preventing external decoders from losing lock.
-        let continuity_fixer = Arc::new(std::sync::Mutex::new(TsContinuityFixer::new()));
+        // TS continuity fixer for seamless input switching. Ensures CC
+        // counters are continuous and discontinuity_indicator is set when
+        // switching between inputs, preventing external decoders from
+        // losing lock.
+        //
+        // The fixer is owned by a single dedicated task (`ts_fixer_task`)
+        // so the per-input forwarders can hand off work via a bounded mpsc
+        // without ever locking shared state on the packet hot path.
+        // Channel capacity matches the per-flow `BROADCAST_CHANNEL_CAPACITY`
+        // so drop-on-full semantics line up with the upstream broadcast
+        // drop-on-lag behaviour.
+        let (fixer_tx, fixer_rx) = tokio::sync::mpsc::channel::<FixerCommand>(
+            BROADCAST_CHANNEL_CAPACITY,
+        );
+        let fixer_task_cancel = cancel_token.child_token();
+        // Handle is intentionally dropped — the task lives for the flow's
+        // lifetime and exits on `fixer_task_cancel`, which inherits from
+        // the flow's root cancel token. No join is needed on shutdown.
+        let _ = tokio::spawn(ts_fixer_task(
+            fixer_rx,
+            broadcast_tx.clone(),
+            fixer_task_cancel,
+        ));
 
         // Spawn every input task (warm passive). Each input publishes to its
         // own per-input broadcast channel; a forwarder task drains it and
@@ -350,215 +369,16 @@ impl FlowRuntime {
                 build_input_config_meta(&input_def.config),
             );
 
-            #[cfg(feature = "webrtc")]
-            let mut this_whip_info: Option<(tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>, Option<String>)> = None;
-
-            let input_handle = match &input_def.config {
-                InputConfig::Rtp(rtp_config) => {
-                    spawn_rtp_input(
-                        rtp_config.clone(),
-                        per_input_tx.clone(),
-                        flow_stats.clone(),
-                        input_cancel.clone(),
-                        event_sender.clone(),
-                        config.config.id.clone(),
-                        input_id.clone(),
-                        force_idr.clone(),
-                    )
-                }
-                InputConfig::Udp(udp_config) => {
-                    spawn_udp_input(
-                        udp_config.clone(),
-                        per_input_tx.clone(),
-                        flow_stats.clone(),
-                        input_cancel.clone(),
-                        event_sender.clone(),
-                        config.config.id.clone(),
-                        input_id.clone(),
-                        force_idr.clone(),
-                    )
-                }
-                InputConfig::Srt(srt_config) => {
-                    spawn_srt_input(
-                        srt_config.clone(),
-                        per_input_tx.clone(),
-                        flow_stats.clone(),
-                        input_cancel.clone(),
-                        event_sender.clone(),
-                        config.config.id.clone(),
-                        input_id.clone(),
-                        force_idr.clone(),
-                    )
-                }
-                InputConfig::Rist(rist_config) => {
-                    spawn_rist_input(
-                        rist_config.clone(),
-                        per_input_tx.clone(),
-                        flow_stats.clone(),
-                        input_cancel.clone(),
-                        event_sender.clone(),
-                        config.config.id.clone(),
-                        input_id.clone(),
-                        force_idr.clone(),
-                    )
-                }
-                InputConfig::Rtmp(rtmp_config) => {
-                    spawn_rtmp_input(
-                        rtmp_config.clone(),
-                        per_input_tx.clone(),
-                        flow_stats.clone(),
-                        input_cancel.clone(),
-                        event_sender.clone(),
-                        config.config.id.clone(),
-                        input_id.clone(),
-                        force_idr.clone(),
-                    )
-                }
-                InputConfig::Rtsp(rtsp_config) => {
-                    super::input_rtsp::spawn_rtsp_input(
-                        rtsp_config.clone(),
-                        per_input_tx.clone(),
-                        flow_stats.clone(),
-                        input_cancel.clone(),
-                        event_sender.clone(),
-                        config.config.id.clone(),
-                        input_id.clone(),
-                        force_idr.clone(),
-                    )
-                }
-                #[cfg(feature = "webrtc")]
-                InputConfig::Webrtc(webrtc_config) => {
-                    let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
-                    this_whip_info = Some((session_tx, webrtc_config.bearer_token.clone()));
-                    super::input_webrtc::spawn_whip_input(
-                        webrtc_config.clone(),
-                        config.config.id.clone(),
-                        input_id.clone(),
-                        per_input_tx.clone(),
-                        flow_stats.clone(),
-                        input_cancel.clone(),
-                        session_rx,
-                        event_sender.clone(),
-                        force_idr.clone(),
-                    )
-                }
-                #[cfg(not(feature = "webrtc"))]
-                InputConfig::Webrtc(_) => {
-                    let cancel = input_cancel.clone();
-                    tokio::spawn(async move {
-                        tracing::warn!("WebRTC/WHIP input requires the `webrtc` cargo feature");
-                        cancel.cancelled().await;
-                    })
-                }
-                #[cfg(feature = "webrtc")]
-                InputConfig::Whep(whep_config) => {
-                    super::input_webrtc::spawn_whep_input(
-                        whep_config.clone(),
-                        per_input_tx.clone(),
-                        flow_stats.clone(),
-                        input_cancel.clone(),
-                        event_sender.clone(),
-                        config.config.id.clone(),
-                        input_id.clone(),
-                        force_idr.clone(),
-                    )
-                }
-                #[cfg(not(feature = "webrtc"))]
-                InputConfig::Whep(_) => {
-                    let cancel = input_cancel.clone();
-                    tokio::spawn(async move {
-                        tracing::warn!("WHEP input requires the `webrtc` cargo feature");
-                        cancel.cancelled().await;
-                    })
-                }
-                // The PTP clock_domain may be set on the flow itself or on the
-                // per-essence input config. The cloned local inherits the
-                // flow-level value when the essence does not override it.
-                InputConfig::St2110_30(c) => {
-                    let mut c = c.clone();
-                    c.clock_domain = c.clock_domain.or(config.config.clock_domain);
-                    super::input_st2110_30::spawn_st2110_30_input(
-                        c,
-                        per_input_tx.clone(),
-                        flow_stats.clone(),
-                        input_cancel.clone(),
-                        event_sender.clone(),
-                        config.config.id.clone(),
-                    )
-                }
-                InputConfig::St2110_31(c) => {
-                    let mut c = c.clone();
-                    c.clock_domain = c.clock_domain.or(config.config.clock_domain);
-                    super::input_st2110_31::spawn_st2110_31_input(
-                        c,
-                        per_input_tx.clone(),
-                        flow_stats.clone(),
-                        input_cancel.clone(),
-                        event_sender.clone(),
-                        config.config.id.clone(),
-                    )
-                }
-                InputConfig::St2110_40(c) => {
-                    let mut c = c.clone();
-                    c.clock_domain = c.clock_domain.or(config.config.clock_domain);
-                    super::input_st2110_40::spawn_st2110_40_input(
-                        c,
-                        per_input_tx.clone(),
-                        flow_stats.clone(),
-                        input_cancel.clone(),
-                        event_sender.clone(),
-                        config.config.id.clone(),
-                    )
-                }
-                InputConfig::RtpAudio(c) => super::input_rtp_audio::spawn_rtp_audio_input(
-                    c.clone(),
-                    per_input_tx.clone(),
-                    flow_stats.clone(),
-                    input_cancel.clone(),
-                    Some(event_sender.clone()),
-                    Some(config.config.id.clone()),
-                ),
-                InputConfig::St2110_20(c) => {
-                    let mut c = c.clone();
-                    c.clock_domain = c.clock_domain.or(config.config.clock_domain);
-                    super::input_st2110_20::spawn_st2110_20_input(
-                        c,
-                        input_id.clone(),
-                        per_input_tx.clone(),
-                        flow_stats.clone(),
-                        input_cancel.clone(),
-                    )
-                }
-                InputConfig::St2110_23(c) => {
-                    let mut c = c.clone();
-                    c.clock_domain = c.clock_domain.or(config.config.clock_domain);
-                    super::input_st2110_23::spawn_st2110_23_input(
-                        c,
-                        input_id.clone(),
-                        per_input_tx.clone(),
-                        flow_stats.clone(),
-                        input_cancel.clone(),
-                    )
-                }
-                InputConfig::Bonded(c) => super::input_bonded::spawn_bonded_input(
-                    c.clone(),
-                    per_input_tx.clone(),
-                    flow_stats.clone(),
-                    input_cancel.clone(),
-                    event_sender.clone(),
-                    config.config.id.clone(),
-                    input_id.clone(),
-                ),
-                InputConfig::TestPattern(c) => super::input_test_pattern::spawn_test_pattern_input(
-                    c.clone(),
-                    per_input_tx.clone(),
-                    flow_stats.clone(),
-                    input_cancel.clone(),
-                    event_sender.clone(),
-                    config.config.id.clone(),
-                    input_id.clone(),
-                ),
-            };
+            let (input_handle, this_whip_info) = spawn_single_input(
+                input_def,
+                &config.config.id,
+                &per_input_tx,
+                &flow_stats,
+                &input_cancel,
+                &event_sender,
+                &force_idr,
+                config.config.clock_domain,
+            );
 
             // Spawn the forwarder: drains the per-input channel and forwards
             // onto the main broadcast channel iff this input's ID matches the
@@ -597,10 +417,9 @@ impl FlowRuntime {
                 spawn_input_forwarder(
                     input_id.clone(),
                     per_input_tx.subscribe(),
-                    broadcast_tx.clone(),
                     active_input_watch_rx.clone(),
                     input_cancel.clone(),
-                    continuity_fixer.clone(),
+                    fixer_tx.clone(),
                     force_idr.clone(),
                     per_input_counters,
                 )
@@ -630,6 +449,8 @@ impl FlowRuntime {
                     whip_session_info = this_whip_info;
                 }
             }
+            #[cfg(not(feature = "webrtc"))]
+            let _ = this_whip_info;
 
             input_handles.insert(
                 input_id,
@@ -658,172 +479,22 @@ impl FlowRuntime {
         // TS-producing input's per-input broadcast channel, so PAT/PMT
         // arriving even a few hundred ms after input spawn lands before
         // the resolver's 3 s deadline.
-        let pid_bus_assembler_handle: Option<crate::engine::ts_assembler::AssemblerHandle> = match (spts_build, &es_bus) {
-            (Some(mut build), Some(bus)) => {
-                if !build.pending_essence.is_empty() {
-                    // Collect PSI catalogue handles keyed by input_id —
-                    // one Arc clone per unique input referenced by a
-                    // pending slot.
-                    let mut catalogues: std::collections::HashMap<
-                        String,
-                        Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>,
-                    > = std::collections::HashMap::new();
-                    for p in &build.pending_essence {
-                        if !catalogues.contains_key(&p.input_id) {
-                            if let Some(c) = flow_stats.per_input_counters.get(&p.input_id) {
-                                catalogues.insert(p.input_id.clone(), c.psi_catalog.clone());
-                            }
-                        }
-                    }
-                    tracing::info!(
-                        "Flow '{}': resolving {} essence slot(s) against per-input PSI catalogues (timeout = {} ms)",
-                        config.config.id,
-                        build.pending_essence.len(),
-                        ESSENCE_RESOLVE_TIMEOUT.as_millis(),
-                    );
-                    match resolve_essence_slots(
-                        build.pending_essence.clone(),
-                        catalogues,
-                        ESSENCE_RESOLVE_TIMEOUT,
+        let pid_bus_assembler_handle: Option<crate::engine::ts_assembler::AssemblerHandle> =
+            match (spts_build, &es_bus) {
+                (Some(build), Some(bus)) => Some(
+                    finalize_spts_assembler(
+                        build,
+                        bus,
+                        &broadcast_tx,
+                        &flow_stats,
+                        &cancel_token,
+                        &event_sender,
+                        &config.config.id,
                     )
-                    .await
-                    {
-                        Ok(pairs) => {
-                            for ((program_idx, slot_idx), pid) in pairs {
-                                if let Some(prog) = build.plan.programs.get_mut(program_idx) {
-                                    if let Some(slot) = prog.slots.get_mut(slot_idx) {
-                                        slot.source.1 = pid;
-                                    }
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            let (code, msg) = essence_error_to_event(&config.config.id, &err);
-                            event_sender.emit_flow_with_details(
-                                EventSeverity::Critical,
-                                category::FLOW,
-                                msg.clone(),
-                                &config.config.id,
-                                serde_json::json!({
-                                    "error_code": code,
-                                    "detail": format!("{err:?}"),
-                                }),
-                            );
-                            bail!(msg);
-                        }
-                    }
-                }
-
-                // Post-resolution per-program PCR fixup. Each
-                // program's `pcr_source` must match one of its own
-                // slots. If an operator specified a `pid` that ended up
-                // replaced by an Essence-resolved PID, auto-remap to
-                // the first slot on the same input_id within that
-                // program — operator-intent reading. If no such slot
-                // exists, bail with the Phase 5 error code.
-                for prog in build.plan.programs.iter_mut() {
-                    if prog.slots.iter().any(|s| s.source == prog.pcr_source) {
-                        continue;
-                    }
-                    let pcr_input = prog.pcr_source.0.clone();
-                    if let Some(remap) = prog
-                        .slots
-                        .iter()
-                        .find(|s| s.source.0 == pcr_input)
-                        .map(|s| s.source.clone())
-                    {
-                        tracing::info!(
-                            "Flow '{}': program {} pcr_source auto-remapped from 0x{:04X} to 0x{:04X} (essence-resolved slot on input '{}')",
-                            config.config.id,
-                            prog.program_number,
-                            prog.pcr_source.1,
-                            remap.1,
-                            pcr_input,
-                        );
-                        prog.pcr_source = remap;
-                    } else {
-                        let msg = format!(
-                            "flow '{}': program {} pcr_source input '{}' has no slot after essence resolution",
-                            config.config.id, prog.program_number, pcr_input,
-                        );
-                        event_sender.emit_flow_with_details(
-                            EventSeverity::Critical,
-                            category::FLOW,
-                            msg.clone(),
-                            &config.config.id,
-                            serde_json::json!({
-                                "error_code": "pid_bus_pcr_source_unresolved",
-                                "program_number": prog.program_number,
-                                "input_id": pcr_input,
-                            }),
-                        );
-                        bail!(msg);
-                    }
-                }
-
-                // Spawn pre-bus Hitless mergers (Phase 7). One task per
-                // expanded `SlotSource::Hitless` slot — the assembler
-                // reads from the synthetic `(hitless:{uid}, 0)` bus key
-                // each merger publishes to. Mergers inherit the flow's
-                // cancellation token so shutdown is automatic.
-                if !build.pending_hitless.is_empty() {
-                    tracing::info!(
-                        "Flow '{}': spawning {} Hitless merger task(s) (primary-preference, stall {} ms)",
-                        config.config.id,
-                        build.pending_hitless.len(),
-                        build.pending_hitless.first().map(|h| h.stall_ms).unwrap_or(0),
-                    );
-                }
-                for hl in &build.pending_hitless {
-                    let _ = crate::engine::ts_es_hitless::spawn_hitless_es_merger(
-                        hl.uid.clone(),
-                        hl.primary.clone(),
-                        hl.backup.clone(),
-                        bus.clone(),
-                        std::time::Duration::from_millis(hl.stall_ms),
-                        cancel_token.child_token(),
-                    );
-                }
-
-                let total_slots: usize = build.plan.programs.iter().map(|p| p.slots.len()).sum();
-                tracing::info!(
-                    "Flow '{}': starting TS assembler — {} program(s), {} slot(s) total",
-                    config.config.id,
-                    build.plan.programs.len(),
-                    total_slots,
-                );
-
-                // Phase 8: spawn one per-ES analyzer per slot, keyed by
-                // (input_id, source_pid). Also snapshot the (input_id,
-                // source_pid) → out_pid routing onto the flow stats so
-                // per-ES snapshots can annotate `out_pid`. Snapshot is
-                // refreshed on every runtime swap inside
-                // `FlowRuntime::replace_assembly`.
-                let mut routing: std::collections::HashMap<(String, u16), u16> =
-                    std::collections::HashMap::new();
-                for prog in &build.plan.programs {
-                    for slot in &prog.slots {
-                        routing.insert(slot.source.clone(), slot.out_pid);
-                        let _ = crate::engine::ts_es_analysis::spawn_per_es_analyzer(
-                            slot.source.0.clone(),
-                            slot.source.1,
-                            bus.clone(),
-                            flow_stats.clone(),
-                            cancel_token.child_token(),
-                        );
-                    }
-                }
-                flow_stats.set_pid_routing(routing);
-
-                Some(spawn_spts_assembler(
-                    build.plan,
-                    bus.clone(),
-                    broadcast_tx.clone(),
-                    cancel_token.child_token(),
-                ))
-            }
-            _ => None,
-        };
+                    .await?,
+                ),
+                _ => None,
+            };
 
         // Start TR-101290 analyzer (independent broadcast subscriber).
         //
@@ -867,133 +538,14 @@ impl FlowRuntime {
         // passive inputs don't reach the broadcast channel, so the analyzer
         // would only see silence from them.
         let media_analysis_handle = if config.config.media_analysis && active_input_cfg.is_some() {
-            let (protocol, payload_format, fec_enabled, fec_type, redundancy_enabled, redundancy_type) =
-                match active_input_cfg.unwrap() {
-                    InputConfig::Rtp(rtp) => {
-                        let (fec_en, fec_ty) = if let Some(fec) = &rtp.fec_decode {
-                            (true, Some(format!("SMPTE 2022-1 (L={}, D={})", fec.columns, fec.rows)))
-                        } else {
-                            (false, None)
-                        };
-                        let (red_en, red_ty) = if rtp.redundancy.is_some() {
-                            (true, Some("SMPTE 2022-7".to_string()))
-                        } else {
-                            (false, None)
-                        };
-                        ("rtp".to_string(), "rtp_ts".to_string(), fec_en, fec_ty, red_en, red_ty)
-                    }
-                    InputConfig::Udp(_) => {
-                        ("udp".to_string(), "raw_ts".to_string(), false, None, false, None)
-                    }
-                    InputConfig::Srt(srt) => {
-                        let (red_en, red_ty) = if srt.redundancy.is_some() {
-                            (true, Some("SMPTE 2022-7".to_string()))
-                        } else {
-                            (false, None)
-                        };
-                        ("srt".to_string(), "unknown".to_string(), false, None, red_en, red_ty)
-                    }
-                    InputConfig::Rist(rist) => {
-                        let (red_en, red_ty) = if rist.redundancy.is_some() {
-                            (true, Some("SMPTE 2022-7".to_string()))
-                        } else {
-                            (false, None)
-                        };
-                        ("rist".to_string(), "raw_ts".to_string(), false, None, red_en, red_ty)
-                    }
-                    InputConfig::Rtmp(_) => {
-                        ("rtmp".to_string(), "raw_ts".to_string(), false, None, false, None)
-                    }
-                    InputConfig::Rtsp(_) => {
-                        ("rtsp".to_string(), "raw_ts".to_string(), false, None, false, None)
-                    }
-                    InputConfig::Webrtc(_) => {
-                        ("webrtc".to_string(), "rtp_h264".to_string(), false, None, false, None)
-                    }
-                    InputConfig::Whep(_) => {
-                        ("whep".to_string(), "rtp_h264".to_string(), false, None, false, None)
-                    }
-                    InputConfig::St2110_30(c) => {
-                        let (red_en, red_ty) = if c.redundancy.is_some() {
-                            (true, Some("SMPTE 2022-7".to_string()))
-                        } else {
-                            (false, None)
-                        };
-                        ("st2110_30".to_string(), "pcm_l24".to_string(), false, None, red_en, red_ty)
-                    }
-                    InputConfig::St2110_31(c) => {
-                        let (red_en, red_ty) = if c.redundancy.is_some() {
-                            (true, Some("SMPTE 2022-7".to_string()))
-                        } else {
-                            (false, None)
-                        };
-                        ("st2110_31".to_string(), "aes3".to_string(), false, None, red_en, red_ty)
-                    }
-                    InputConfig::St2110_40(c) => {
-                        let (red_en, red_ty) = if c.redundancy.is_some() {
-                            (true, Some("SMPTE 2022-7".to_string()))
-                        } else {
-                            (false, None)
-                        };
-                        ("st2110_40".to_string(), "anc".to_string(), false, None, red_en, red_ty)
-                    }
-                    InputConfig::St2110_20(c) => {
-                        let (red_en, red_ty) = if c.redundancy.is_some() {
-                            (true, Some("SMPTE 2022-7".to_string()))
-                        } else {
-                            (false, None)
-                        };
-                        ("st2110_20".to_string(), "rfc4175_ycbcr422".to_string(), false, None, red_en, red_ty)
-                    }
-                    InputConfig::St2110_23(_c) => {
-                        ("st2110_23".to_string(), "rfc4175_ycbcr422_multi".to_string(), false, None, true, Some("SMPTE 2110-23 multi-stream".to_string()))
-                    }
-                    InputConfig::RtpAudio(c) => {
-                        let (red_en, red_ty) = if c.redundancy.is_some() {
-                            (true, Some("SMPTE 2022-7".to_string()))
-                        } else {
-                            (false, None)
-                        };
-                        let payload_fmt = match c.bit_depth {
-                            16 => "pcm_l16".to_string(),
-                            _ => "pcm_l24".to_string(),
-                        };
-                        ("rtp_audio".to_string(), payload_fmt, false, None, red_en, red_ty)
-                    }
-                    InputConfig::Bonded(c) => {
-                        // Bonded inputs aggregate N paths — surface the
-                        // path count as the "redundancy" signal the UI
-                        // uses for multi-path flows.
-                        let multi = c.paths.len() > 1;
-                        (
-                            "bonded".to_string(),
-                            "raw_ts".to_string(),
-                            false,
-                            None,
-                            multi,
-                            if multi {
-                                Some(format!("bonded ({} paths)", c.paths.len()))
-                            } else {
-                                None
-                            },
-                        )
-                    }
-                    InputConfig::TestPattern(_) => (
-                        "test_pattern".to_string(),
-                        "h264_aac_ts".to_string(),
-                        false,
-                        None,
-                        false,
-                        None,
-                    ),
-                };
+            let m = media_analysis_metadata(active_input_cfg.expect("checked by is_some() guard"));
             let media_acc = Arc::new(MediaAnalysisAccumulator::new(
-                protocol,
-                payload_format,
-                fec_enabled,
-                fec_type,
-                redundancy_enabled,
-                redundancy_type,
+                m.protocol,
+                m.payload_format,
+                m.fec_enabled,
+                m.fec_type,
+                m.redundancy_enabled,
+                m.redundancy_type,
             ));
             flow_stats.media_analysis.set(media_acc.clone()).ok();
             Some(spawn_media_analyzer(
@@ -1889,6 +1441,315 @@ impl FlowRuntime {
     }
 }
 
+/// Optional WHIP session channel + bearer token surfaced by WebRTC inputs
+/// so the HTTP signaling layer can register the flow's receive endpoint.
+#[cfg(feature = "webrtc")]
+type WhipSessionInfo = (
+    tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>,
+    Option<String>,
+);
+
+/// Compile-away placeholder when the webrtc feature is disabled. Keeps
+/// `spawn_single_input`'s return shape stable across feature flags.
+#[cfg(not(feature = "webrtc"))]
+type WhipSessionInfo = ();
+
+/// Dispatch an [`InputConfig`] variant onto its protocol-specific spawner.
+///
+/// Extracted out of `FlowRuntime::start` so the startup pipeline can line up
+/// the per-input setup as a single `spawn_single_input` call rather than a
+/// 200-line match arm. Returns the input task handle plus, for WHIP inputs,
+/// the session channel + bearer token the HTTP signaling layer needs.
+#[allow(clippy::too_many_arguments)]
+fn spawn_single_input(
+    input_def: &InputDefinition,
+    flow_id: &str,
+    per_input_tx: &broadcast::Sender<RtpPacket>,
+    flow_stats: &Arc<FlowStatsAccumulator>,
+    input_cancel: &CancellationToken,
+    event_sender: &EventSender,
+    force_idr: &Arc<std::sync::atomic::AtomicBool>,
+    flow_clock_domain: Option<u8>,
+) -> (JoinHandle<()>, Option<WhipSessionInfo>) {
+    let input_id = input_def.id.clone();
+    let mut whip_info: Option<WhipSessionInfo> = None;
+
+    let handle = match &input_def.config {
+        InputConfig::Rtp(rtp_config) => spawn_rtp_input(
+            rtp_config.clone(), per_input_tx.clone(), flow_stats.clone(),
+            input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
+            input_id.clone(), force_idr.clone(),
+        ),
+        InputConfig::Udp(udp_config) => spawn_udp_input(
+            udp_config.clone(), per_input_tx.clone(), flow_stats.clone(),
+            input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
+            input_id.clone(), force_idr.clone(),
+        ),
+        InputConfig::Srt(srt_config) => spawn_srt_input(
+            srt_config.clone(), per_input_tx.clone(), flow_stats.clone(),
+            input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
+            input_id.clone(), force_idr.clone(),
+        ),
+        InputConfig::Rist(rist_config) => spawn_rist_input(
+            rist_config.clone(), per_input_tx.clone(), flow_stats.clone(),
+            input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
+            input_id.clone(), force_idr.clone(),
+        ),
+        InputConfig::Rtmp(rtmp_config) => spawn_rtmp_input(
+            rtmp_config.clone(), per_input_tx.clone(), flow_stats.clone(),
+            input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
+            input_id.clone(), force_idr.clone(),
+        ),
+        InputConfig::Rtsp(rtsp_config) => super::input_rtsp::spawn_rtsp_input(
+            rtsp_config.clone(), per_input_tx.clone(), flow_stats.clone(),
+            input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
+            input_id.clone(), force_idr.clone(),
+        ),
+        #[cfg(feature = "webrtc")]
+        InputConfig::Webrtc(webrtc_config) => {
+            let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
+            whip_info = Some((session_tx, webrtc_config.bearer_token.clone()));
+            super::input_webrtc::spawn_whip_input(
+                webrtc_config.clone(), flow_id.to_string(), input_id.clone(),
+                per_input_tx.clone(), flow_stats.clone(), input_cancel.clone(),
+                session_rx, event_sender.clone(), force_idr.clone(),
+            )
+        }
+        #[cfg(not(feature = "webrtc"))]
+        InputConfig::Webrtc(_) => {
+            let cancel = input_cancel.clone();
+            tokio::spawn(async move {
+                tracing::warn!("WebRTC/WHIP input requires the `webrtc` cargo feature");
+                cancel.cancelled().await;
+            })
+        }
+        #[cfg(feature = "webrtc")]
+        InputConfig::Whep(whep_config) => super::input_webrtc::spawn_whep_input(
+            whep_config.clone(), per_input_tx.clone(), flow_stats.clone(),
+            input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
+            input_id.clone(), force_idr.clone(),
+        ),
+        #[cfg(not(feature = "webrtc"))]
+        InputConfig::Whep(_) => {
+            let cancel = input_cancel.clone();
+            tokio::spawn(async move {
+                tracing::warn!("WHEP input requires the `webrtc` cargo feature");
+                cancel.cancelled().await;
+            })
+        }
+        // PTP clock_domain may be set on the flow itself or on the
+        // per-essence input config. The cloned local inherits the
+        // flow-level value when the essence does not override it.
+        InputConfig::St2110_30(c) => {
+            let mut c = c.clone();
+            c.clock_domain = c.clock_domain.or(flow_clock_domain);
+            super::input_st2110_30::spawn_st2110_30_input(
+                c, per_input_tx.clone(), flow_stats.clone(),
+                input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
+            )
+        }
+        InputConfig::St2110_31(c) => {
+            let mut c = c.clone();
+            c.clock_domain = c.clock_domain.or(flow_clock_domain);
+            super::input_st2110_31::spawn_st2110_31_input(
+                c, per_input_tx.clone(), flow_stats.clone(),
+                input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
+            )
+        }
+        InputConfig::St2110_40(c) => {
+            let mut c = c.clone();
+            c.clock_domain = c.clock_domain.or(flow_clock_domain);
+            super::input_st2110_40::spawn_st2110_40_input(
+                c, per_input_tx.clone(), flow_stats.clone(),
+                input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
+            )
+        }
+        InputConfig::RtpAudio(c) => super::input_rtp_audio::spawn_rtp_audio_input(
+            c.clone(), per_input_tx.clone(), flow_stats.clone(),
+            input_cancel.clone(), Some(event_sender.clone()),
+            Some(flow_id.to_string()),
+        ),
+        InputConfig::St2110_20(c) => {
+            let mut c = c.clone();
+            c.clock_domain = c.clock_domain.or(flow_clock_domain);
+            super::input_st2110_20::spawn_st2110_20_input(
+                c, input_id.clone(), per_input_tx.clone(),
+                flow_stats.clone(), input_cancel.clone(),
+            )
+        }
+        InputConfig::St2110_23(c) => {
+            let mut c = c.clone();
+            c.clock_domain = c.clock_domain.or(flow_clock_domain);
+            super::input_st2110_23::spawn_st2110_23_input(
+                c, input_id.clone(), per_input_tx.clone(),
+                flow_stats.clone(), input_cancel.clone(),
+            )
+        }
+        InputConfig::Bonded(c) => super::input_bonded::spawn_bonded_input(
+            c.clone(), per_input_tx.clone(), flow_stats.clone(),
+            input_cancel.clone(), event_sender.clone(),
+            flow_id.to_string(), input_id.clone(),
+        ),
+        InputConfig::TestPattern(c) => super::input_test_pattern::spawn_test_pattern_input(
+            c.clone(), per_input_tx.clone(), flow_stats.clone(),
+            input_cancel.clone(), event_sender.clone(),
+            flow_id.to_string(), input_id.clone(),
+        ),
+    };
+
+    (handle, whip_info)
+}
+
+/// Metadata describing how the active input feeds the media analyzer.
+///
+/// Extracted out of `FlowRuntime::start` so the main startup pipeline
+/// reads as an orchestration of named steps rather than a 120-line
+/// match arm. Returned by [`media_analysis_metadata`].
+struct MediaAnalysisMeta {
+    protocol: String,
+    payload_format: String,
+    fec_enabled: bool,
+    fec_type: Option<String>,
+    redundancy_enabled: bool,
+    redundancy_type: Option<String>,
+}
+
+/// Classify an input for media-analysis accumulator construction.
+fn media_analysis_metadata(input: &InputConfig) -> MediaAnalysisMeta {
+    match input {
+        InputConfig::Rtp(rtp) => {
+            let (fec_enabled, fec_type) = rtp
+                .fec_decode
+                .as_ref()
+                .map(|f| (true, Some(format!("SMPTE 2022-1 (L={}, D={})", f.columns, f.rows))))
+                .unwrap_or((false, None));
+            let (redundancy_enabled, redundancy_type) = rtp
+                .redundancy
+                .as_ref()
+                .map(|_| (true, Some("SMPTE 2022-7".to_string())))
+                .unwrap_or((false, None));
+            MediaAnalysisMeta {
+                protocol: "rtp".into(),
+                payload_format: "rtp_ts".into(),
+                fec_enabled, fec_type, redundancy_enabled, redundancy_type,
+            }
+        }
+        InputConfig::Udp(_) => MediaAnalysisMeta {
+            protocol: "udp".into(), payload_format: "raw_ts".into(),
+            fec_enabled: false, fec_type: None,
+            redundancy_enabled: false, redundancy_type: None,
+        },
+        InputConfig::Srt(srt) => {
+            let (redundancy_enabled, redundancy_type) = srt
+                .redundancy
+                .as_ref()
+                .map(|_| (true, Some("SMPTE 2022-7".to_string())))
+                .unwrap_or((false, None));
+            MediaAnalysisMeta {
+                protocol: "srt".into(), payload_format: "unknown".into(),
+                fec_enabled: false, fec_type: None,
+                redundancy_enabled, redundancy_type,
+            }
+        }
+        InputConfig::Rist(rist) => {
+            let (redundancy_enabled, redundancy_type) = rist
+                .redundancy
+                .as_ref()
+                .map(|_| (true, Some("SMPTE 2022-7".to_string())))
+                .unwrap_or((false, None));
+            MediaAnalysisMeta {
+                protocol: "rist".into(), payload_format: "raw_ts".into(),
+                fec_enabled: false, fec_type: None,
+                redundancy_enabled, redundancy_type,
+            }
+        }
+        InputConfig::Rtmp(_) => MediaAnalysisMeta {
+            protocol: "rtmp".into(), payload_format: "raw_ts".into(),
+            fec_enabled: false, fec_type: None,
+            redundancy_enabled: false, redundancy_type: None,
+        },
+        InputConfig::Rtsp(_) => MediaAnalysisMeta {
+            protocol: "rtsp".into(), payload_format: "raw_ts".into(),
+            fec_enabled: false, fec_type: None,
+            redundancy_enabled: false, redundancy_type: None,
+        },
+        InputConfig::Webrtc(_) => MediaAnalysisMeta {
+            protocol: "webrtc".into(), payload_format: "rtp_h264".into(),
+            fec_enabled: false, fec_type: None,
+            redundancy_enabled: false, redundancy_type: None,
+        },
+        InputConfig::Whep(_) => MediaAnalysisMeta {
+            protocol: "whep".into(), payload_format: "rtp_h264".into(),
+            fec_enabled: false, fec_type: None,
+            redundancy_enabled: false, redundancy_type: None,
+        },
+        InputConfig::St2110_30(c) => {
+            let (re, rt) = c.redundancy.as_ref().map(|_| (true, Some("SMPTE 2022-7".to_string()))).unwrap_or((false, None));
+            MediaAnalysisMeta {
+                protocol: "st2110_30".into(), payload_format: "pcm_l24".into(),
+                fec_enabled: false, fec_type: None, redundancy_enabled: re, redundancy_type: rt,
+            }
+        }
+        InputConfig::St2110_31(c) => {
+            let (re, rt) = c.redundancy.as_ref().map(|_| (true, Some("SMPTE 2022-7".to_string()))).unwrap_or((false, None));
+            MediaAnalysisMeta {
+                protocol: "st2110_31".into(), payload_format: "aes3".into(),
+                fec_enabled: false, fec_type: None, redundancy_enabled: re, redundancy_type: rt,
+            }
+        }
+        InputConfig::St2110_40(c) => {
+            let (re, rt) = c.redundancy.as_ref().map(|_| (true, Some("SMPTE 2022-7".to_string()))).unwrap_or((false, None));
+            MediaAnalysisMeta {
+                protocol: "st2110_40".into(), payload_format: "anc".into(),
+                fec_enabled: false, fec_type: None, redundancy_enabled: re, redundancy_type: rt,
+            }
+        }
+        InputConfig::St2110_20(c) => {
+            let (re, rt) = c.redundancy.as_ref().map(|_| (true, Some("SMPTE 2022-7".to_string()))).unwrap_or((false, None));
+            MediaAnalysisMeta {
+                protocol: "st2110_20".into(), payload_format: "rfc4175_ycbcr422".into(),
+                fec_enabled: false, fec_type: None, redundancy_enabled: re, redundancy_type: rt,
+            }
+        }
+        InputConfig::St2110_23(_) => MediaAnalysisMeta {
+            protocol: "st2110_23".into(),
+            payload_format: "rfc4175_ycbcr422_multi".into(),
+            fec_enabled: false, fec_type: None,
+            redundancy_enabled: true,
+            redundancy_type: Some("SMPTE 2110-23 multi-stream".into()),
+        },
+        InputConfig::RtpAudio(c) => {
+            let (re, rt) = c.redundancy.as_ref().map(|_| (true, Some("SMPTE 2022-7".to_string()))).unwrap_or((false, None));
+            let payload_format = match c.bit_depth {
+                16 => "pcm_l16".to_string(),
+                _ => "pcm_l24".to_string(),
+            };
+            MediaAnalysisMeta {
+                protocol: "rtp_audio".into(), payload_format,
+                fec_enabled: false, fec_type: None, redundancy_enabled: re, redundancy_type: rt,
+            }
+        }
+        InputConfig::Bonded(c) => {
+            let multi = c.paths.len() > 1;
+            MediaAnalysisMeta {
+                protocol: "bonded".into(), payload_format: "raw_ts".into(),
+                fec_enabled: false, fec_type: None,
+                redundancy_enabled: multi,
+                redundancy_type: if multi {
+                    Some(format!("bonded ({} paths)", c.paths.len()))
+                } else {
+                    None
+                },
+            }
+        }
+        InputConfig::TestPattern(_) => MediaAnalysisMeta {
+            protocol: "test_pattern".into(), payload_format: "h264_aac_ts".into(),
+            fec_enabled: false, fec_type: None,
+            redundancy_enabled: false, redundancy_type: None,
+        },
+    }
+}
+
 /// Build a topology-display [`InputConfigMeta`] from a concrete
 /// [`InputConfig`]. Used by `FlowRuntime::start` and by runtime updates that
 /// swap the active input without restarting the flow.
@@ -2018,9 +1879,11 @@ fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::Inpu
 /// input's ID. Passive inputs' packets are silently dropped — the per-input
 /// task keeps running so its stats continue to advance.
 ///
-/// The shared `continuity_fixer` ensures seamless TS continuity counter
-/// progression when switching between inputs, and injects cached PAT/PMT
-/// packets at the switch boundary so external decoders can re-acquire quickly.
+/// Fixer commands are dispatched to a dedicated [`ts_fixer_task`] via
+/// `fixer_tx`. That task owns the [`TsContinuityFixer`] single-threaded —
+/// no locks on the packet hot path — and is responsible for seamless
+/// continuity counter progression and cached PAT/PMT injection at the
+/// switch boundary so external decoders re-acquire quickly.
 ///
 /// `force_idr` is this input's one-shot IDR request flag. The forwarder sets
 /// it to `true` on a passive → active transition so that any ingress video
@@ -2071,13 +1934,87 @@ fn null_ts_packet() -> RtpPacket {
     }
 }
 
+/// Command queued to the per-flow [`ts_fixer_task`] by an input forwarder.
+///
+/// Forwarders never touch the `TsContinuityFixer` directly — they enqueue
+/// one of these variants and let the fixer task own the state uncontended.
+enum FixerCommand {
+    /// The active input just produced a media packet. The fixer must apply
+    /// CC rewriting and forward it to the flow's broadcast channel.
+    ActivePacket { input_id: String, pkt: RtpPacket },
+    /// A passive input produced a packet. The fixer uses it to pre-warm its
+    /// per-input PSI cache so the next switch can inject a fresh PAT/PMT.
+    PassivePacket { input_id: String, pkt: RtpPacket },
+    /// The active input changed. The fixer emits any cached PSI packets for
+    /// the newly-active input and resets its CC state appropriately.
+    Switch { input_id: String },
+    /// Emit a keepalive NULL datagram to keep downstream sockets alive
+    /// during a silent active input.
+    Keepalive,
+}
+
+/// Dedicated fixer task that owns the [`TsContinuityFixer`] for one flow.
+///
+/// Serialising all fixer access onto a single task eliminates the former
+/// `std::sync::Mutex` that per-input forwarders used to share. The channel
+/// is bounded and producers use `try_send`, so a slow fixer drops commands
+/// rather than back-pressuring the forwarders — matching the broadcast
+/// drop-on-lag semantic everywhere else in the data path.
+async fn ts_fixer_task(
+    mut rx: tokio::sync::mpsc::Receiver<FixerCommand>,
+    out_tx: broadcast::Sender<RtpPacket>,
+    cancel: CancellationToken,
+) {
+    let mut fixer = TsContinuityFixer::new();
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            cmd = rx.recv() => match cmd {
+                Some(FixerCommand::ActivePacket { input_id, pkt }) => {
+                    match fixer.process_packet(&input_id, &pkt) {
+                        ProcessResult::Rewritten(fixed_data) => {
+                            let _ = out_tx.send(RtpPacket {
+                                data: fixed_data,
+                                sequence_number: pkt.sequence_number,
+                                rtp_timestamp: pkt.rtp_timestamp,
+                                recv_time_us: pkt.recv_time_us,
+                                is_raw_ts: pkt.is_raw_ts,
+                            });
+                        }
+                        ProcessResult::Unchanged => {
+                            let _ = out_tx.send(pkt);
+                        }
+                    }
+                }
+                Some(FixerCommand::PassivePacket { input_id, pkt }) => {
+                    fixer.observe_passive(&input_id, &pkt);
+                }
+                Some(FixerCommand::Switch { input_id }) => {
+                    let injected = fixer.on_switch(&input_id);
+                    tracing::info!(
+                        "TS fixer: switch to '{}', injecting {} PSI packets",
+                        input_id, injected.len()
+                    );
+                    for inj_pkt in injected {
+                        let _ = out_tx.send(inj_pkt);
+                    }
+                }
+                Some(FixerCommand::Keepalive) => {
+                    let _ = out_tx.send(null_ts_packet());
+                }
+                None => return,
+            }
+        }
+    }
+}
+
 fn spawn_input_forwarder(
     input_id: String,
     mut rx: broadcast::Receiver<RtpPacket>,
-    out_tx: broadcast::Sender<RtpPacket>,
     active_input_rx: watch::Receiver<String>,
     cancel: CancellationToken,
-    continuity_fixer: Arc<std::sync::Mutex<TsContinuityFixer>>,
+    fixer_tx: tokio::sync::mpsc::Sender<FixerCommand>,
     force_idr: Arc<std::sync::atomic::AtomicBool>,
     per_input_counters: Arc<crate::stats::collector::PerInputCounters>,
 ) -> JoinHandle<()> {
@@ -2108,16 +2045,9 @@ fn spawn_input_forwarder(
                         let is_active = *active_input_rx.borrow() == input_id;
 
                         if is_active && !was_active {
-                            // This input just became active — trigger switch
-                            // to fix CC counters and inject cached PSI.
-                            let injected = continuity_fixer.lock().unwrap().on_switch(&input_id);
-                            tracing::info!(
-                                "Input forwarder '{}': switch detected, injecting {} PSI packets",
-                                input_id, injected.len()
-                            );
-                            for inj_pkt in injected {
-                                let _ = out_tx.send(inj_pkt);
-                            }
+                            // This input just became active — ask the fixer
+                            // task to switch and inject cached PSI.
+                            let _ = fixer_tx.try_send(FixerCommand::Switch { input_id: input_id.clone() });
                             // Ask any ingress video re-encoder on this input
                             // to emit an IDR on its next frame. Passthrough
                             // inputs ignore the flag (no encoder to signal).
@@ -2126,31 +2056,17 @@ fn spawn_input_forwarder(
                         was_active = is_active;
 
                         if is_active {
-                            let mut fixer = continuity_fixer.lock().unwrap();
-                            match fixer.process_packet(&input_id, &pkt) {
-                                ProcessResult::Rewritten(fixed_data) => {
-                                    drop(fixer);
-                                    let _ = out_tx.send(RtpPacket {
-                                        data: fixed_data,
-                                        sequence_number: pkt.sequence_number,
-                                        rtp_timestamp: pkt.rtp_timestamp,
-                                        recv_time_us: pkt.recv_time_us,
-                                        is_raw_ts: pkt.is_raw_ts,
-                                    });
-                                }
-                                ProcessResult::Unchanged => {
-                                    // Hot path: no rewrite needed, forward unchanged.
-                                    drop(fixer);
-                                    let _ = out_tx.send(pkt);
-                                }
-                            }
-                            // A real packet just went out — push the next
-                            // keepalive tick out one full interval.
+                            // Drop on full — matches broadcast channel drop-on-lag.
+                            let _ = fixer_tx.try_send(FixerCommand::ActivePacket {
+                                input_id: input_id.clone(),
+                                pkt,
+                            });
                             keepalive.reset();
                         } else {
-                            // Passive — observe PSI for cache pre-warming so
-                            // PAT/PMT is ready for injection on switch.
-                            continuity_fixer.lock().unwrap().observe_passive(&input_id, &pkt);
+                            let _ = fixer_tx.try_send(FixerCommand::PassivePacket {
+                                input_id: input_id.clone(),
+                                pkt,
+                            });
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -2165,11 +2081,7 @@ fn spawn_input_forwarder(
                     // one. Otherwise every passive forwarder would spam
                     // null packets into the broadcast channel.
                     if *active_input_rx.borrow() == input_id {
-                        // Emit a 7-packet null payload so downstream UDP
-                        // sockets see steady datagrams during a dead-
-                        // input period (prevents socket timeouts on
-                        // receivers that treat silence as EOF).
-                        let _ = out_tx.send(null_ts_packet());
+                        let _ = fixer_tx.try_send(FixerCommand::Keepalive);
                     }
                 }
             }
@@ -2215,6 +2127,179 @@ fn essence_error_to_event(flow_id: &str, err: &EssenceResolveError) -> (&'static
             ),
         ),
     }
+}
+
+/// Finish bringing up the PID-bus SPTS runtime for a flow.
+///
+/// Extracted from `FlowRuntime::start` so the startup pipeline can call
+/// a single step rather than inline ~160 lines of Essence resolution,
+/// PCR fixup, Hitless merger spawn, per-ES analyzer spawn, and final
+/// assembler spawn. All of these must run in this order:
+///
+/// 1. Resolve any pending `Essence` slots against the per-input PSI
+///    catalogues (bail loudly on timeout / no-match).
+/// 2. Fix up each program's `pcr_source` so it still references one of
+///    its own slots after resolution.
+/// 3. Spawn one pre-bus Hitless merger per expanded redundant slot.
+/// 4. Snapshot the `(input_id, source_pid) → out_pid` routing onto the
+///    flow stats and spawn a per-ES analyzer for each slot.
+/// 5. Spawn the single assembler task that publishes onto
+///    `broadcast_tx`.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_spts_assembler(
+    mut build: SptsBuildResult,
+    bus: &Arc<FlowEsBus>,
+    broadcast_tx: &broadcast::Sender<RtpPacket>,
+    flow_stats: &Arc<FlowStatsAccumulator>,
+    cancel_token: &CancellationToken,
+    event_sender: &EventSender,
+    flow_id: &str,
+) -> Result<crate::engine::ts_assembler::AssemblerHandle> {
+    // 1. Essence resolution.
+    if !build.pending_essence.is_empty() {
+        let mut catalogues: std::collections::HashMap<
+            String,
+            Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>,
+        > = std::collections::HashMap::new();
+        for p in &build.pending_essence {
+            if !catalogues.contains_key(&p.input_id) {
+                if let Some(c) = flow_stats.per_input_counters.get(&p.input_id) {
+                    catalogues.insert(p.input_id.clone(), c.psi_catalog.clone());
+                }
+            }
+        }
+        tracing::info!(
+            "Flow '{}': resolving {} essence slot(s) against per-input PSI catalogues (timeout = {} ms)",
+            flow_id,
+            build.pending_essence.len(),
+            ESSENCE_RESOLVE_TIMEOUT.as_millis(),
+        );
+        match resolve_essence_slots(
+            build.pending_essence.clone(),
+            catalogues,
+            ESSENCE_RESOLVE_TIMEOUT,
+        )
+        .await
+        {
+            Ok(pairs) => {
+                for ((program_idx, slot_idx), pid) in pairs {
+                    if let Some(prog) = build.plan.programs.get_mut(program_idx) {
+                        if let Some(slot) = prog.slots.get_mut(slot_idx) {
+                            slot.source.1 = pid;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                let (code, msg) = essence_error_to_event(flow_id, &err);
+                event_sender.emit_flow_with_details(
+                    EventSeverity::Critical,
+                    category::FLOW,
+                    msg.clone(),
+                    flow_id,
+                    serde_json::json!({
+                        "error_code": code,
+                        "detail": format!("{err:?}"),
+                    }),
+                );
+                bail!(msg);
+            }
+        }
+    }
+
+    // 2. Post-resolution PCR source fixup.
+    for prog in build.plan.programs.iter_mut() {
+        if prog.slots.iter().any(|s| s.source == prog.pcr_source) {
+            continue;
+        }
+        let pcr_input = prog.pcr_source.0.clone();
+        if let Some(remap) = prog
+            .slots
+            .iter()
+            .find(|s| s.source.0 == pcr_input)
+            .map(|s| s.source.clone())
+        {
+            tracing::info!(
+                "Flow '{}': program {} pcr_source auto-remapped from 0x{:04X} to 0x{:04X} (essence-resolved slot on input '{}')",
+                flow_id,
+                prog.program_number,
+                prog.pcr_source.1,
+                remap.1,
+                pcr_input,
+            );
+            prog.pcr_source = remap;
+        } else {
+            let msg = format!(
+                "flow '{}': program {} pcr_source input '{}' has no slot after essence resolution",
+                flow_id, prog.program_number, pcr_input,
+            );
+            event_sender.emit_flow_with_details(
+                EventSeverity::Critical,
+                category::FLOW,
+                msg.clone(),
+                flow_id,
+                serde_json::json!({
+                    "error_code": "pid_bus_pcr_source_unresolved",
+                    "program_number": prog.program_number,
+                    "input_id": pcr_input,
+                }),
+            );
+            bail!(msg);
+        }
+    }
+
+    // 3. Pre-bus Hitless mergers.
+    if !build.pending_hitless.is_empty() {
+        tracing::info!(
+            "Flow '{}': spawning {} Hitless merger task(s) (primary-preference, stall {} ms)",
+            flow_id,
+            build.pending_hitless.len(),
+            build.pending_hitless.first().map(|h| h.stall_ms).unwrap_or(0),
+        );
+    }
+    for hl in &build.pending_hitless {
+        let _ = crate::engine::ts_es_hitless::spawn_hitless_es_merger(
+            hl.uid.clone(),
+            hl.primary.clone(),
+            hl.backup.clone(),
+            bus.clone(),
+            std::time::Duration::from_millis(hl.stall_ms),
+            cancel_token.child_token(),
+        );
+    }
+
+    let total_slots: usize = build.plan.programs.iter().map(|p| p.slots.len()).sum();
+    tracing::info!(
+        "Flow '{}': starting TS assembler — {} program(s), {} slot(s) total",
+        flow_id,
+        build.plan.programs.len(),
+        total_slots,
+    );
+
+    // 4. Per-ES analyzers + routing snapshot.
+    let mut routing: std::collections::HashMap<(String, u16), u16> =
+        std::collections::HashMap::new();
+    for prog in &build.plan.programs {
+        for slot in &prog.slots {
+            routing.insert(slot.source.clone(), slot.out_pid);
+            let _ = crate::engine::ts_es_analysis::spawn_per_es_analyzer(
+                slot.source.0.clone(),
+                slot.source.1,
+                bus.clone(),
+                flow_stats.clone(),
+                cancel_token.child_token(),
+            );
+        }
+    }
+    flow_stats.set_pid_routing(routing);
+
+    // 5. The assembler itself — single publisher onto broadcast_tx.
+    Ok(spawn_spts_assembler(
+        build.plan,
+        bus.clone(),
+        broadcast_tx.clone(),
+        cancel_token.child_token(),
+    ))
 }
 
 /// Classify an [`InputConfig`] against Phase 5/6/6.5 compatibility rules.

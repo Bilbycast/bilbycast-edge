@@ -331,6 +331,11 @@ async fn rtp_output_loop(
     let delay_sleep = tokio::time::sleep(Duration::from_secs(86400));
     tokio::pin!(delay_sleep);
 
+    // Reused per-iteration send scratch. Hoisted out of the loop so the
+    // per-packet hot path does not allocate a fresh Vec on every select
+    // branch (at 50 Mbps that would be ~3k allocs/sec per output).
+    let mut packets_to_send: Vec<RtpPacket> = Vec::with_capacity(4);
+
     loop {
         // Reset the delay timer to fire when the oldest buffered packet
         // is due for release. Only meaningful when delay is active.
@@ -342,9 +347,7 @@ async fn rtp_output_loop(
             }
         }
 
-        // Collect packets to send after the select (avoids duplicating
-        // the send logic between the recv and delay-drain branches).
-        let mut packets_to_send: Vec<RtpPacket> = Vec::new();
+        packets_to_send.clear();
 
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -724,6 +727,9 @@ async fn rtp_output_redundant_loop(
     let delay_sleep = tokio::time::sleep(Duration::from_secs(86400));
     tokio::pin!(delay_sleep);
 
+    // Reused per-iteration send scratch — see rtp_output_loop for rationale.
+    let mut packets_to_send: Vec<RtpPacket> = Vec::with_capacity(4);
+
     loop {
         if let Some(ref db) = delay_buf {
             if let Some(release_us) = db.next_release_time() {
@@ -733,7 +739,7 @@ async fn rtp_output_redundant_loop(
             }
         }
 
-        let mut packets_to_send: Vec<RtpPacket> = Vec::new();
+        packets_to_send.clear();
 
         tokio::select! {
             _ = cancel.cancelled() => {
