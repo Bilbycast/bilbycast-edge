@@ -200,7 +200,19 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
                 }
             }
         }
-        if active_input_count > 1 {
+        // The "at most one active input" invariant belongs to the
+        // passthrough active-input switching model — only one input's
+        // bytes reach `broadcast_tx` at any moment. PID-bus assembly
+        // flows (`kind = spts` / `mpts`) break that model deliberately:
+        // every input's `TsEsDemuxer` publishes onto the shared
+        // [`FlowEsBus`] concurrently, and the assembler pulls ES from
+        // whichever slots are configured. The `active` flag is unused
+        // on the assembly path, so skip the count check there.
+        let assembly_mode = flow
+            .assembly
+            .as_ref()
+            .is_some_and(|a| !matches!(a.kind, crate::config::models::AssemblyKind::Passthrough));
+        if !assembly_mode && active_input_count > 1 {
             bail!(
                 "Flow '{}': at most one input may be active at a time, found {}",
                 flow.id, active_input_count

@@ -146,6 +146,14 @@ async fn run_spts_assembler(
     // Version counter is stable for Phase 5 (plan is immutable over the
     // flow's lifetime). Phase 7's per-PID switching will bump this.
     let psi_version: u8 = 0;
+    // Synthesised RTP metadata: the assembler is a new RTP-shaped
+    // source as far as downstream outputs are concerned. A monotonic
+    // u16 sequence counter per bundle lets output-side SMPTE 2022-1
+    // FEC compute parity over consecutive emissions; RTP outputs use
+    // the same counter for the wire RTP header. Real per-bundle
+    // emission timestamps ride through as `recv_time_us`, so the
+    // outputs (and tr101290's jitter math) see a sensible clock.
+    let mut bundle_seq: u16 = 0;
 
     let mut psi_tick = interval(PSI_INTERVAL);
     psi_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -162,13 +170,14 @@ async fn run_spts_assembler(
         &mut pat_cc,
         &mut pmt_cc,
         &broadcast_tx,
+        &mut bundle_seq,
     );
 
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                flush(&mut buf, &broadcast_tx);
+                flush(&mut buf, &broadcast_tx, &mut bundle_seq);
                 break;
             }
             Some((slot_idx, es)) = fanin_rx.recv() => {
@@ -182,7 +191,7 @@ async fn run_spts_assembler(
                 let rewritten = rewrite_es_packet(&es.payload, slot.out_pid, &mut cc);
                 buf.extend_from_slice(&rewritten);
                 if buf.len() >= BUNDLE_BYTES {
-                    flush(&mut buf, &broadcast_tx);
+                    flush(&mut buf, &broadcast_tx, &mut bundle_seq);
                 }
             }
             _ = psi_tick.tick() => {
@@ -194,10 +203,11 @@ async fn run_spts_assembler(
                     &mut pat_cc,
                     &mut pmt_cc,
                     &broadcast_tx,
+                    &mut bundle_seq,
                 );
             }
             _ = flush_tick.tick() => {
-                flush(&mut buf, &broadcast_tx);
+                flush(&mut buf, &broadcast_tx, &mut bundle_seq);
             }
         }
     }
@@ -277,10 +287,11 @@ fn push_psi(
     pat_cc: &mut u8,
     pmt_cc: &mut u8,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
+    bundle_seq: &mut u16,
 ) {
     let pat = build_pat(plan.program_number, plan.pmt_pid, version, *pat_cc);
     *pat_cc = pat_cc.wrapping_add(1) & 0x0F;
-    append_ts(buf, &pat, broadcast_tx);
+    append_ts(buf, &pat, broadcast_tx, bundle_seq);
 
     let pmt = build_pmt(
         plan.program_number,
@@ -291,7 +302,7 @@ fn push_psi(
         *pmt_cc,
     );
     *pmt_cc = pmt_cc.wrapping_add(1) & 0x0F;
-    append_ts(buf, &pmt, broadcast_tx);
+    append_ts(buf, &pmt, broadcast_tx, bundle_seq);
 }
 
 /// Append one 188-byte TS packet to the bundle buffer, flushing when the
@@ -300,26 +311,39 @@ fn append_ts(
     buf: &mut BytesMut,
     pkt: &[u8; TS_PACKET_SIZE],
     broadcast_tx: &broadcast::Sender<RtpPacket>,
+    bundle_seq: &mut u16,
 ) {
     buf.extend_from_slice(pkt);
     if buf.len() >= BUNDLE_BYTES {
-        flush(buf, broadcast_tx);
+        flush(buf, broadcast_tx, bundle_seq);
     }
 }
 
 /// Emit whatever is in `buf` as one `RtpPacket` (raw TS) onto the
-/// broadcast channel and reset the buffer. No-op when `buf` is empty.
-fn flush(buf: &mut BytesMut, broadcast_tx: &broadcast::Sender<RtpPacket>) {
+/// broadcast channel and reset the buffer. Stamps a monotonic u16
+/// sequence number and derives a 90 kHz RTP timestamp from the current
+/// wall clock so downstream RTP / SRT / FEC outputs can treat the
+/// assembler as a first-class RTP source. No-op when `buf` is empty.
+fn flush(
+    buf: &mut BytesMut,
+    broadcast_tx: &broadcast::Sender<RtpPacket>,
+    bundle_seq: &mut u16,
+) {
     if buf.is_empty() {
         return;
     }
     let replaced = std::mem::replace(buf, BytesMut::with_capacity(BUNDLE_BYTES));
     let bundle: Bytes = replaced.freeze();
+    let recv_time_us = crate::util::time::now_us();
+    // Scale µs → 90 kHz ticks and truncate to u32 (standard RTP math).
+    let rtp_ts = ((recv_time_us.wrapping_mul(9)).wrapping_div(100)) as u32;
+    let seq = *bundle_seq;
+    *bundle_seq = bundle_seq.wrapping_add(1);
     let pkt = RtpPacket {
         data: bundle,
-        sequence_number: 0,
-        rtp_timestamp: 0,
-        recv_time_us: crate::util::time::now_us(),
+        sequence_number: seq,
+        rtp_timestamp: rtp_ts,
+        recv_time_us,
         is_raw_ts: true,
     };
     // `send` returns Err when there are no subscribers (e.g. flow still

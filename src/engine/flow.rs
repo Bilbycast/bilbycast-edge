@@ -2092,27 +2092,12 @@ fn build_spts_plan(
         );
     };
 
-    // Output scope: UDP only in Phase 5.
-    for out in &flow.outputs {
-        if !matches!(out, OutputConfig::Udp(_)) {
-            let msg = format!(
-                "flow '{}': assembly.kind = spts only supports UDP outputs in Phase 5; \
-                 output '{}' is type '{}'. Remove it or change the output to UDP.",
-                flow_id,
-                out.id(),
-                out.type_name(),
-            );
-            emit(
-                "pid_bus_spts_non_udp_output",
-                &msg,
-                serde_json::json!({
-                    "output_id": out.id(),
-                    "output_type": out.type_name(),
-                }),
-            );
-            bail!(msg);
-        }
-    }
+    // Output scope: the assembler stamps synthesised RTP metadata
+    // (monotonic u16 sequence + 90 kHz timestamp derived from the
+    // emission clock) so every existing output — UDP, RTP (with or
+    // without 2022-1 FEC), SRT, RIST, HLS, CMAF, RTMP, WebRTC —
+    // treats the assembled SPTS as a first-class TS-bearing source.
+    // No output-type gate on assembly flows.
 
     // Input scope: every input must produce MPEG-TS. Phase 6 sharpens
     // the error for inputs that have an input-level encoder escape
