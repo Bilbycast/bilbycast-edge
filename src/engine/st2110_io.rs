@@ -189,30 +189,48 @@ pub async fn run_st2110_audio_input(
         PcmDepacketizer::new(pcm_format_for_depth(config.bit_depth), config.payload_type, config.channels);
 
     // Build the optional ingress processor (`transcode` / `audio_encode`).
-    // Validation rejects these fields for AES3 (-31) so in practice this is
-    // only active for -30. `audio_encode` currently returns an error and we
-    // fall back to passthrough with a clear log.
-    let mut processor: Option<PcmInputProcessor> = match PcmInputProcessor::new(
-        config.sample_rate,
-        config.bit_depth,
-        config.channels,
-        config.transcode.as_ref(),
-        config.audio_encode.as_ref(),
-        /* ssrc */ 0,
-        /* initial_seq */ 0,
-        /* initial_timestamp */ 0,
-    ) {
-        Ok(p) => {
-            if p.is_some() {
-                tracing::info!("{label} input: ingress PCM processor active");
+    // Phase 6.5 enables PCM → audio-only MPEG-TS synthesis via
+    // `audio_encode` (aac_lc / he_aac_v1 / he_aac_v2 / s302m). Validation
+    // restricts -31 to `audio_encode.codec = s302m` only.
+    //
+    // Failure policy: if `audio_encode` was requested but construction
+    // failed (e.g. fdk-aac missing, unsupported codec on the runtime),
+    // we return Err so the flow fails loudly. The assembler-side
+    // classifier also filters unsupported codecs up-front via
+    // `pid_bus_audio_encode_codec_not_supported_on_input`, but this is
+    // the backstop for the transcode-only-failure cases which should
+    // still be loud rather than silently passthrough.
+    let audio_encode_requested = config.audio_encode.is_some();
+    let mut processor: Option<PcmInputProcessor> =
+        match PcmInputProcessor::new_with_labels(
+            config.sample_rate,
+            config.bit_depth,
+            config.channels,
+            config.transcode.as_ref(),
+            config.audio_encode.as_ref(),
+            /* ssrc */ 0,
+            /* initial_seq */ 0,
+            /* initial_timestamp */ 0,
+            flow_id.as_deref().unwrap_or("flow"),
+            label,
+        ) {
+            Ok(p) => {
+                if p.is_some() {
+                    tracing::info!("{label} input: ingress PCM processor active");
+                }
+                p
             }
-            p
-        }
-        Err(e) => {
-            tracing::warn!("{label} input: PCM processor disabled, passthrough: {e}");
-            None
-        }
-    };
+            Err(e) if audio_encode_requested => {
+                // audio_encode was asked for and we could not honour it.
+                // Do not fall back — that would silently produce PCM when
+                // the operator (and the downstream flow) expected TS.
+                anyhow::bail!("{label} input: audio_encode init failed: {e}");
+            }
+            Err(e) => {
+                tracing::warn!("{label} input: PCM processor disabled, passthrough: {e}");
+                None
+            }
+        };
 
     // The recv loop in RedBluePair owns the sockets, so we cannot easily reach
     // out for source-IP filtering at this layer (it ignores src). Apply source

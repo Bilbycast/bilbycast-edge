@@ -784,6 +784,28 @@ impl S302mOutputPipeline {
         }
     }
 
+    /// Drain every complete 188-byte MPEG-TS packet currently buffered,
+    /// returning one `Bytes` per packet. Used by the PID-bus PCM→TS
+    /// synthesiser (`engine::input_pcm_encode`) which needs per-packet
+    /// granularity so the downstream `TsEsDemuxer` can learn PAT/PMT
+    /// before the first audio PES arrives. `pending_ts` is only ever
+    /// extended with whole 188-byte TS packets so this drain never cuts
+    /// a packet in half.
+    pub fn take_ready_ts_packets(&mut self) -> Vec<bytes::Bytes> {
+        let n_full = self.pending_ts.len() / 188;
+        if n_full == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(n_full);
+        for i in 0..n_full {
+            out.push(bytes::Bytes::copy_from_slice(
+                &self.pending_ts[i * 188..(i + 1) * 188],
+            ));
+        }
+        self.pending_ts.drain(..n_full * 188);
+        out
+    }
+
     /// Drain ready 1316-byte SRT datagrams. Returns whatever is currently
     /// buffered, leaving any partial datagram for the next call.
     pub fn take_ready_datagrams(&mut self) -> Vec<bytes::Bytes> {

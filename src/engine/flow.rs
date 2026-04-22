@@ -1988,19 +1988,40 @@ fn essence_error_to_event(flow_id: &str, err: &EssenceResolveError) -> (&'static
     }
 }
 
-/// Classify an [`InputConfig`] against Phase 5/6 compatibility rules.
-/// Returns `None` when the input is TS-producing (any `is_ts_carrier()`
-/// input qualifies); otherwise returns a short `error_code` pointing at
-/// the right remediation for the operator:
+/// Classify an [`InputConfig`] against Phase 5/6/6.5 compatibility rules.
+/// Returns `None` when the input can feed the SPTS assembler; otherwise
+/// returns a short `error_code` pointing at the right remediation for
+/// the operator:
 ///
 /// - `pid_bus_spts_input_needs_audio_encode` — the input *could*
 ///   produce TS via the existing `audio_encode` input-level encoder
-///   (ST 2110-30, `rtp_audio`) but hasn't been configured to.
+///   (ST 2110-30, ST 2110-31, `rtp_audio`) but hasn't been configured to.
+/// - `pid_bus_audio_encode_codec_not_supported_on_input` — `audio_encode`
+///   is set but the chosen codec has no Phase 6.5 runtime path
+///   (today: `mp2`, `ac3`). Validation accepts them so the manager UI
+///   can surface them; bring-up rejects them loudly.
 /// - `pid_bus_spts_non_ts_input` — the input can't produce TS at all
-///   within the Phase 5/6 runtime (ST 2110-31 AES3 transparent,
-///   ST 2110-40 ANC). Deferred to Phase 6.5's decoded-ES cache.
+///   within the Phase 5/6/6.5 runtime (ST 2110-40 ANC). Deferred to a
+///   follow-up phase.
 fn non_ts_spts_error_code(input: &InputConfig) -> Option<&'static str> {
+    // Inputs that produce TS today — either natively or via a PCM→TS
+    // synthesiser (`audio_encode` first-light codec set).
     if input.is_ts_carrier() {
+        // Refine: for PCM/-31 inputs with `audio_encode`, double-check
+        // that the chosen codec is actually supported at runtime. If not,
+        // surface a distinct loud error instead of letting the input
+        // task blow up at bring-up.
+        let ae_codec: Option<&str> = match input {
+            InputConfig::St2110_30(c) => c.audio_encode.as_ref().map(|a| a.codec.as_str()),
+            InputConfig::RtpAudio(c) => c.audio_encode.as_ref().map(|a| a.codec.as_str()),
+            InputConfig::St2110_31(c) => c.audio_encode.as_ref().map(|a| a.codec.as_str()),
+            _ => None,
+        };
+        if let Some(codec) = ae_codec {
+            if !super::input_pcm_encode::codec_supported_first_light(codec) {
+                return Some("pid_bus_audio_encode_codec_not_supported_on_input");
+            }
+        }
         return None;
     }
     match input {
@@ -2010,8 +2031,31 @@ fn non_ts_spts_error_code(input: &InputConfig) -> Option<&'static str> {
         InputConfig::RtpAudio(c) if c.audio_encode.is_none() => {
             Some("pid_bus_spts_input_needs_audio_encode")
         }
+        InputConfig::St2110_31(c) if c.audio_encode.is_none() => {
+            Some("pid_bus_spts_input_needs_audio_encode")
+        }
         _ => Some("pid_bus_spts_non_ts_input"),
     }
+}
+
+/// Look up the PMT `stream_type` a Phase 6.5 synthesised audio ES will
+/// publish on — derived from the `audio_encode.codec` on the named
+/// input. Returns `None` when the input is not a PCM / AES3 input, or
+/// has no `audio_encode`, or the codec is outside the first-light set.
+/// Used by the SPTS plan builder to reject slot/codec mismatches before
+/// any traffic flows.
+fn expected_stream_type_for_synthesised_input(
+    inputs: &[crate::config::models::InputDefinition],
+    input_id: &str,
+) -> Option<u8> {
+    let def = inputs.iter().find(|d| d.id == input_id)?;
+    let codec = match &def.config {
+        InputConfig::St2110_30(c) => c.audio_encode.as_ref().map(|a| a.codec.as_str())?,
+        InputConfig::RtpAudio(c) => c.audio_encode.as_ref().map(|a| a.codec.as_str())?,
+        InputConfig::St2110_31(c) => c.audio_encode.as_ref().map(|a| a.codec.as_str())?,
+        _ => return None,
+    };
+    super::input_pcm_encode::stream_type_for_codec(codec)
 }
 
 /// Map the config-layer [`EssenceKind`] to the assembler's internal
@@ -2079,25 +2123,52 @@ fn build_assembly_plan(
 
     // Input scope: every input must produce MPEG-TS. Phase 6 sharpens
     // the error for inputs that have an input-level encoder escape
-    // hatch (ST 2110-30 / RtpAudio via `audio_encode`) so operators
-    // know the fix without chasing the error text. Pure-raw non-TS
-    // inputs (ST 2110-31 / -40) stay on the generic code until Phase
-    // 6.5's decoded-ES cache lands.
+    // hatch (ST 2110-30 / -31 / RtpAudio via `audio_encode`) so
+    // operators know the fix without chasing the error text. Phase 6.5
+    // enables that path at runtime for AAC family + s302m. ST 2110-40
+    // (ANC) still has no path to TS and stays on the generic code.
     for input in &flow.inputs {
         if let Some(code) = non_ts_spts_error_code(&input.config) {
             let msg = match code {
-                "pid_bus_spts_input_needs_audio_encode" => format!(
-                    "flow '{}': assembly.kind = spts requires TS on the broadcast channel; \
-                     input '{}' is type '{}' and can produce TS via input-level `audio_encode`. \
-                     Set `audio_encode` on the input config and the input will publish TS into the assembly.",
-                    flow_id,
-                    input.id,
-                    input_type_str(&input.config),
-                ),
+                "pid_bus_spts_input_needs_audio_encode" => {
+                    let hint = match &input.config {
+                        InputConfig::St2110_31(_) => {
+                            " Set `audio_encode = { codec: \"s302m\" }` — AES3 sub-frames \
+                             ride through the 302M wrap bit-for-bit."
+                        }
+                        _ => {
+                            " Set `audio_encode = { codec: \"aac_lc\" }` (or any supported \
+                             codec) and the input will publish audio-only TS into the assembly."
+                        }
+                    };
+                    format!(
+                        "flow '{}': assembly.kind = spts requires TS on the broadcast channel; \
+                         input '{}' is type '{}' and can produce TS via input-level `audio_encode`.{hint}",
+                        flow_id,
+                        input.id,
+                        input_type_str(&input.config),
+                    )
+                }
+                "pid_bus_audio_encode_codec_not_supported_on_input" => {
+                    let codec = match &input.config {
+                        InputConfig::St2110_30(c) => c.audio_encode.as_ref().map(|a| a.codec.clone()),
+                        InputConfig::RtpAudio(c) => c.audio_encode.as_ref().map(|a| a.codec.clone()),
+                        InputConfig::St2110_31(c) => c.audio_encode.as_ref().map(|a| a.codec.clone()),
+                        _ => None,
+                    }
+                    .unwrap_or_default();
+                    format!(
+                        "flow '{}': input '{}' has `audio_encode.codec = \"{}\"` which \
+                         is accepted at config time but has no Phase 6.5 runtime path. \
+                         First-light supports aac_lc, he_aac_v1, he_aac_v2, s302m. \
+                         mp2/ac3 are deferred to a follow-up.",
+                        flow_id, input.id, codec
+                    )
+                }
                 _ => format!(
                     "flow '{}': assembly.kind = spts requires every input to produce MPEG-TS. \
-                     Input '{}' is type '{}' and has no path to TS in the Phase 5/6 runtime \
-                     (Phase 6.5 adds a decoded-ES cache for pure-raw inputs).",
+                     Input '{}' is type '{}' and has no path to TS in the current runtime \
+                     (ST 2110-40 ANC-in-TS wrapping is deferred).",
                     flow_id,
                     input.id,
                     input_type_str(&input.config),
@@ -2162,6 +2233,44 @@ fn build_assembly_plan(
                     bail!(msg);
                 }
             };
+            // Phase 6.5 cross-check: when the slot's input is a PCM /
+            // AES3 input with `audio_encode` set, the codec determines
+            // the stream_type the input will actually publish. Fail
+            // loudly if the operator declared a different stream_type
+            // on the slot — otherwise the assembler would advertise one
+            // thing in the synthesised PMT and the input would emit
+            // PES bytes that don't match it.
+            if let Some(expected_st) =
+                expected_stream_type_for_synthesised_input(&flow.inputs, &input_id)
+            {
+                if stream.stream_type != expected_st {
+                    let msg = format!(
+                        "flow '{}': program {} out_pid {}: slot declares stream_type = 0x{:02X} \
+                         but input '{}' has `audio_encode` that publishes stream_type = 0x{:02X}. \
+                         Either match the slot to the input's codec or drop `stream_type` from \
+                         the slot.",
+                        flow_id,
+                        program.program_number,
+                        stream.out_pid,
+                        stream.stream_type,
+                        input_id,
+                        expected_st,
+                    );
+                    emit(
+                        "pid_bus_spts_stream_type_mismatch",
+                        &msg,
+                        serde_json::json!({
+                            "program_number": program.program_number,
+                            "out_pid": stream.out_pid,
+                            "input_id": input_id,
+                            "declared_stream_type": stream.stream_type,
+                            "expected_stream_type": expected_st,
+                        }),
+                    );
+                    bail!(msg);
+                }
+            }
+
             slots.push(AssemblySlot {
                 source: (input_id, source_pid),
                 out_pid: stream.out_pid,

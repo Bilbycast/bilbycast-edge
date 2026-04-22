@@ -701,9 +701,13 @@ impl InputConfig {
             | InputConfig::TestPattern(_) => true,
             // PCM-only inputs become TS carriers when `audio_encode` is set —
             // the input task muxes the encoded audio into an audio-only TS.
+            // ST 2110-31 (AES3 transparent) becomes a TS carrier only via
+            // `audio_encode.codec = "s302m"` — validation already rejects
+            // any other codec, so checking `is_some()` is sufficient.
             InputConfig::St2110_30(c) => c.audio_encode.is_some(),
             InputConfig::RtpAudio(c) => c.audio_encode.is_some(),
-            InputConfig::St2110_31(_) | InputConfig::St2110_40(_) => false,
+            InputConfig::St2110_31(c) => c.audio_encode.is_some(),
+            InputConfig::St2110_40(_) => false,
         }
     }
 

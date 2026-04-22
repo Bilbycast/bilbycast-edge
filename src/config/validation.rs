@@ -1070,12 +1070,15 @@ fn validate_st2110_audio_input(c: &St2110AudioInputConfig, profile: St2110Profil
                      would corrupt",
                 );
             }
-            if c.audio_encode.is_some() {
-                bail!(
-                    "{label} input: audio_encode is not supported on AES3-transparent inputs \
-                     — the payload cannot be decoded to linear PCM without an AES3/337M \
-                     parser (not currently implemented)",
-                );
+            // ST 2110-31 only accepts `audio_encode.codec = "s302m"`, which
+            // re-packetises AES3 bytes into a SMPTE 302M private PES with
+            // no decode step (bit-for-bit preservation of 337M sub-frames).
+            if let Some(ref ae) = c.audio_encode {
+                validate_audio_encode(
+                    ae,
+                    AES3_INPUT_AUDIO_CODECS,
+                    &format!("{label} input"),
+                )?;
             }
         }
         St2110Profile::Pcm => {
@@ -1091,20 +1094,9 @@ fn validate_st2110_audio_input(c: &St2110AudioInputConfig, profile: St2110Profil
             if let Some(ref ae) = c.audio_encode {
                 validate_audio_encode(
                     ae,
-                    TS_INPUT_AUDIO_CODECS,
+                    PCM_INPUT_AUDIO_CODECS,
                     &format!("{label} input"),
                 )?;
-                // The runtime PCM-to-compressed-TS muxer is not yet wired —
-                // see `engine::input_pcm_encode::PcmInputError::\
-                // AudioEncodeNotYetImplemented`. Reject here so operators
-                // get a clear error instead of silently falling back to
-                // PCM passthrough at flow start.
-                bail!(
-                    "{label} input: audio_encode on a PCM-only input is not yet supported at \
-                     runtime (the PCM→compressed-TS muxer is pending). This will be enabled \
-                     in a follow-up release; for now, drop audio_encode or use a compressed \
-                     audio input type (SRT/UDP/RTP/RTMP with AAC) instead",
-                );
             }
         }
     }
@@ -1583,15 +1575,7 @@ fn validate_rtp_audio_input(c: &RtpAudioInputConfig) -> Result<()> {
         )?;
     }
     if let Some(ref ae) = c.audio_encode {
-        validate_audio_encode(ae, TS_INPUT_AUDIO_CODECS, "rtp_audio input")?;
-        // Same reason as ST 2110-30 — the PCM→compressed-TS muxer for
-        // PCM-only inputs is not yet wired. Reject up-front rather than
-        // letting the runtime silently fall back to PCM passthrough.
-        bail!(
-            "rtp_audio input: audio_encode on a PCM-only input is not yet supported at \
-             runtime (the PCM→compressed-TS muxer is pending). Drop audio_encode or use \
-             a compressed audio input (SRT/UDP/RTP/RTMP with AAC) instead",
-        );
+        validate_audio_encode(ae, PCM_INPUT_AUDIO_CODECS, "rtp_audio input")?;
     }
     Ok(())
 }
@@ -2444,6 +2428,34 @@ fn validate_audio_encode(
             allowed_codecs
         );
     }
+
+    // SMPTE 302M is a lossless wrap, not an encoder — it has a different
+    // field set than the compressed codecs and must be checked apart.
+    if enc.codec == "s302m" {
+        if enc.bitrate_kbps.is_some() {
+            bail!(
+                "{context}: audio_encode.bitrate_kbps is not applicable to s302m \
+                 (302M is a lossless PCM wrap, not a compressed codec)"
+            );
+        }
+        if let Some(sr) = enc.sample_rate {
+            if sr != 48_000 {
+                bail!(
+                    "{context}: audio_encode.sample_rate must be 48000 for s302m, got {sr}"
+                );
+            }
+        }
+        if let Some(ch) = enc.channels {
+            if !matches!(ch, 2 | 4 | 6 | 8) {
+                bail!(
+                    "{context}: audio_encode.channels must be 2, 4, 6, or 8 for s302m \
+                     (SMPTE 302M-2007), got {ch}"
+                );
+            }
+        }
+        return Ok(());
+    }
+
     if let Some(br) = enc.bitrate_kbps {
         if !(16..=512).contains(&br) {
             bail!(
@@ -2483,6 +2495,21 @@ fn validate_audio_encode(
 /// TS-carrying inputs accept the same audio codec set as TS outputs — Opus
 /// has no standard MPEG-TS mapping, so it is excluded.
 const TS_INPUT_AUDIO_CODECS: &[&str] = &["aac_lc", "he_aac_v1", "he_aac_v2", "mp2", "ac3"];
+
+/// Codecs a PCM-only input (ST 2110-30, `rtp_audio`) may set on
+/// `audio_encode` to convert its PCM-RTP into MPEG-TS. Same set as
+/// [`TS_INPUT_AUDIO_CODECS`] plus `s302m` — SMPTE 302M-in-TS is a
+/// lossless PCM-preserving wrap, not really an "encoder", but it shares
+/// the same `audio_encode` config slot because the semantics (PCM in →
+/// TS out) are identical from the operator's point of view.
+const PCM_INPUT_AUDIO_CODECS: &[&str] =
+    &["aac_lc", "he_aac_v1", "he_aac_v2", "mp2", "ac3", "s302m"];
+
+/// ST 2110-31 (AES3 transparent) carries SMPTE 337M sub-frames that cannot
+/// be decoded to linear PCM without a 337M parser. The only valid
+/// `audio_encode` on -31 is `s302m`, which wraps the AES3 bytes in a
+/// SMPTE 302M private PES bit-for-bit — no decode, no re-encode.
+const AES3_INPUT_AUDIO_CODECS: &[&str] = &["s302m"];
 
 /// Apply the standard Group-A (TS-carrying input) transcoding validation:
 /// video_encode + audio_encode + transcode. All three are optional; any
