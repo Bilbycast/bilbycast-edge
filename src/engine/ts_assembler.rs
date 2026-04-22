@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! SPTS assembler for the PID-bus runtime (Phase 5).
+//! SPTS assembler for the PID-bus runtime (Phase 5 + Phase 6).
 //!
 //! Subscribes to a set of elementary-stream channels on [`FlowEsBus`],
 //! rewrites each `EsPacket`'s TS header PID → the configured `out_pid`,
@@ -11,11 +11,14 @@
 //! 100 ms cadence; PCR rides on one slot's ES bytes-for-bytes (the
 //! PMT's `PCR_PID` points at that slot's `out_pid`).
 //!
-//! Scope (Phase 5):
+//! Scope (Phase 5 + Phase 6):
 //! - Single-program TS (`AssemblyKind::Spts`) only.
-//! - Concrete `SlotSource::Pid` slots only. `Essence` / `Hitless`
-//!   resolution is rejected at bring-up with distinct error codes.
-//! - TS-carrier inputs only (enforced by `FlowRuntime::start`).
+//! - Concrete `SlotSource::Pid` slots (Phase 5).
+//! - `SlotSource::Essence { input_id, kind }` slots resolved against
+//!   the input's Phase 2 PSI catalogue (Phase 6). `Hitless` still
+//!   rejected at bring-up with a distinct error code.
+//! - TS-producing inputs only (every `is_ts_carrier()` input qualifies;
+//!   enforced by `FlowRuntime::start`).
 //!
 //! Performance contract (data-path rules):
 //! - Each slot subscribes to a `broadcast::Receiver<EsPacket>` and funnels
@@ -423,6 +426,165 @@ fn build_pmt(
 const _: u16 = NULL_PID;
 const _: u16 = PAT_PID;
 
+// ---------------------------------------------------------------------
+// Phase 6: Essence → PID resolver
+// ---------------------------------------------------------------------
+//
+// `SlotSource::Essence { input_id, kind }` needs an `(input_id,
+// source_pid)` pair before the assembler can start. We resolve it
+// against the per-input PSI catalogue populated by Phase 2's observer:
+// poll every 100 ms, pick the first matching stream, bail loudly on
+// timeout with a dedicated error_code.
+//
+// Kept in this module (rather than a standalone `ts_essence_resolver`)
+// because it's purely plan-building — it never touches the data path
+// and its inputs/outputs mirror the assembler's `SptsPlan` shape.
+
+/// Broad elementary-stream kind, independent of the config crate so the
+/// resolver can be unit-tested in isolation. Mirrors
+/// [`crate::config::models::EssenceKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EsKind {
+    Video,
+    Audio,
+    Subtitle,
+    Data,
+}
+
+/// One unresolved slot. Produced by the plan builder; the resolver
+/// returns one `(slot_idx, pid)` per entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingEssenceSlot {
+    /// Index into `SptsPlan.slots` so the runtime can patch the
+    /// resolved `source_pid` in place.
+    pub slot_idx: usize,
+    pub input_id: String,
+    pub kind: EsKind,
+}
+
+/// Output of `build_spts_plan` (defined on the runtime side): the
+/// assembler plan plus any `Essence` slots still awaiting a concrete
+/// `source_pid`. Slots in `plan` corresponding to entries in
+/// `pending_essence` have a sentinel `source_pid = 0` — the runtime
+/// patches them in place after the resolver returns.
+#[derive(Debug, Clone)]
+pub struct SptsBuildResult {
+    pub plan: SptsPlan,
+    pub pending_essence: Vec<PendingEssenceSlot>,
+}
+
+/// Failure modes for essence resolution. The runtime maps each variant
+/// to a distinct `error_code` on the emitted Critical event so the
+/// manager UI can highlight the offending assembly slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EssenceResolveError {
+    /// Input's catalogue has entries but none match the requested kind
+    /// — e.g. `{ kind: Video }` against an audio-only contribution feed.
+    NoMatch {
+        input_id: String,
+        kind: EsKind,
+    },
+    /// Input has not produced any PAT/PMT within the timeout — either
+    /// the input is idle, or it isn't actually publishing TS.
+    NoCatalogue { input_id: String },
+    /// Phase 6 resolver only handles Video + Audio. Subtitle / Data
+    /// reach here only if the runtime doesn't pre-filter them.
+    KindNotImplemented { kind: EsKind },
+}
+
+/// Pick the first PID matching `kind` in the catalogue. Lowest
+/// `program_number` first (matches the MPTS → SPTS default in Phase 1),
+/// then PMT declaration order within that program.
+fn pick_pid_for_kind(
+    catalogue: &crate::engine::ts_psi_catalog::PsiCatalog,
+    kind: EsKind,
+) -> Option<u16> {
+    use crate::engine::ts_psi_catalog::CatalogStreamKind;
+    let target = match kind {
+        EsKind::Video => CatalogStreamKind::Video,
+        EsKind::Audio => CatalogStreamKind::Audio,
+        // Subtitle / Data handled by the caller (KindNotImplemented).
+        _ => return None,
+    };
+    let mut programs: Vec<&crate::engine::ts_psi_catalog::CatalogProgram> =
+        catalogue.programs.iter().collect();
+    programs.sort_by_key(|p| p.program_number);
+    for prog in programs {
+        for stream in &prog.streams {
+            if stream.kind == target {
+                return Some(stream.pid);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve every pending Essence slot to a concrete `source_pid`.
+///
+/// Polls each input's catalogue every 100 ms up to `timeout`. Returns
+/// one `(slot_idx, resolved_pid)` per pending slot on success. On
+/// timeout, surfaces the first still-unresolved slot as either
+/// `NoMatch` (catalogue exists but no matching kind) or `NoCatalogue`
+/// (catalogue empty — typically "input hasn't bound / received yet").
+///
+/// Subtitle / Data are rejected up-front with `KindNotImplemented`.
+pub async fn resolve_essence_slots(
+    pending: Vec<PendingEssenceSlot>,
+    catalogues: std::collections::HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
+    timeout: Duration,
+) -> Result<Vec<(usize, u16)>, EssenceResolveError> {
+    // Pre-filter unsupported kinds so the poll loop only deals with
+    // Video / Audio.
+    for p in &pending {
+        if !matches!(p.kind, EsKind::Video | EsKind::Audio) {
+            return Err(EssenceResolveError::KindNotImplemented { kind: p.kind });
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut resolved: Vec<(usize, u16)> = Vec::with_capacity(pending.len());
+    let mut remaining: Vec<PendingEssenceSlot> = pending;
+
+    loop {
+        remaining.retain(|p| {
+            let Some(store) = catalogues.get(&p.input_id) else {
+                return true;
+            };
+            let Some(cat) = store.load() else {
+                return true;
+            };
+            match pick_pid_for_kind(&cat, p.kind) {
+                Some(pid) => {
+                    resolved.push((p.slot_idx, pid));
+                    false // resolved — drop from remaining
+                }
+                None => true, // catalogue present but no matching kind yet
+            }
+        });
+        if remaining.is_empty() {
+            return Ok(resolved);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let first = &remaining[0];
+            let has_catalogue = catalogues
+                .get(&first.input_id)
+                .and_then(|s| s.load())
+                .is_some();
+            return Err(if has_catalogue {
+                EssenceResolveError::NoMatch {
+                    input_id: first.input_id.clone(),
+                    kind: first.kind,
+                }
+            } else {
+                EssenceResolveError::NoCatalogue {
+                    input_id: first.input_id.clone(),
+                }
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,5 +823,216 @@ mod tests {
             .await
             .expect("assembler must exit within 500 ms of cancel")
             .unwrap();
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 6: essence resolver tests
+    // ---------------------------------------------------------------
+
+    use crate::engine::ts_psi_catalog::{
+        CatalogProgram, CatalogStream, CatalogStreamKind, PsiCatalog, PsiCatalogStore,
+    };
+
+    fn stream(pid: u16, stream_type: u8, kind: CatalogStreamKind) -> CatalogStream {
+        CatalogStream {
+            pid,
+            stream_type,
+            codec: "test".to_string(),
+            kind,
+        }
+    }
+
+    fn catalogue_with(programs: Vec<CatalogProgram>) -> Arc<PsiCatalogStore> {
+        let store = Arc::new(PsiCatalogStore::new());
+        // We can't call the private `store()` method from outside the
+        // module; reach through the same `inner` field used internally.
+        // But `store()` is private — instead, drive the public writer
+        // by spawning the observer… too heavyweight for a unit test.
+        // Use a freshly-built store whose inner RwLock we write via the
+        // module's own test helper (added below).
+        let cat = PsiCatalog {
+            programs,
+            last_updated_us: 1,
+        };
+        crate::engine::ts_psi_catalog::PsiCatalogStore::seed_for_test(&store, cat);
+        store
+    }
+
+    #[tokio::test]
+    async fn essence_resolver_picks_first_video_pid() {
+        let store = catalogue_with(vec![CatalogProgram {
+            program_number: 1,
+            pmt_pid: 0x1000,
+            pcr_pid: Some(0x100),
+            streams: vec![
+                stream(0x100, 0x1B, CatalogStreamKind::Video),
+                stream(0x101, 0x0F, CatalogStreamKind::Audio),
+            ],
+        }]);
+        let mut cats = std::collections::HashMap::new();
+        cats.insert("in-a".to_string(), store);
+        let pending = vec![PendingEssenceSlot {
+            slot_idx: 0,
+            input_id: "in-a".into(),
+            kind: EsKind::Video,
+        }];
+        let r = resolve_essence_slots(pending, cats, Duration::from_millis(500))
+            .await
+            .expect("must resolve");
+        assert_eq!(r, vec![(0, 0x100)]);
+    }
+
+    #[tokio::test]
+    async fn essence_resolver_picks_first_audio_pid() {
+        let store = catalogue_with(vec![CatalogProgram {
+            program_number: 1,
+            pmt_pid: 0x1000,
+            pcr_pid: Some(0x100),
+            streams: vec![
+                stream(0x100, 0x1B, CatalogStreamKind::Video),
+                stream(0x200, 0x0F, CatalogStreamKind::Audio),
+                stream(0x201, 0x81, CatalogStreamKind::Audio),
+            ],
+        }]);
+        let mut cats = std::collections::HashMap::new();
+        cats.insert("in-a".to_string(), store);
+        let pending = vec![PendingEssenceSlot {
+            slot_idx: 3,
+            input_id: "in-a".into(),
+            kind: EsKind::Audio,
+        }];
+        let r = resolve_essence_slots(pending, cats, Duration::from_millis(500))
+            .await
+            .unwrap();
+        assert_eq!(r, vec![(3, 0x200)], "first audio wins, not second AC-3");
+    }
+
+    #[tokio::test]
+    async fn essence_resolver_prefers_lowest_program_number_on_mpts() {
+        // Program 2 with video on 0x200, program 1 with video on 0x100.
+        // Iteration order is "lowest program_number first", so 0x100 wins.
+        let store = catalogue_with(vec![
+            CatalogProgram {
+                program_number: 2,
+                pmt_pid: 0x2000,
+                pcr_pid: Some(0x200),
+                streams: vec![stream(0x200, 0x1B, CatalogStreamKind::Video)],
+            },
+            CatalogProgram {
+                program_number: 1,
+                pmt_pid: 0x1000,
+                pcr_pid: Some(0x100),
+                streams: vec![stream(0x100, 0x1B, CatalogStreamKind::Video)],
+            },
+        ]);
+        let mut cats = std::collections::HashMap::new();
+        cats.insert("in-a".to_string(), store);
+        let pending = vec![PendingEssenceSlot {
+            slot_idx: 0,
+            input_id: "in-a".into(),
+            kind: EsKind::Video,
+        }];
+        let r = resolve_essence_slots(pending, cats, Duration::from_millis(500))
+            .await
+            .unwrap();
+        assert_eq!(r, vec![(0, 0x100)]);
+    }
+
+    #[tokio::test]
+    async fn essence_resolver_returns_nomatch_when_catalogue_has_no_video() {
+        let store = catalogue_with(vec![CatalogProgram {
+            program_number: 1,
+            pmt_pid: 0x1000,
+            pcr_pid: Some(0x200),
+            streams: vec![stream(0x200, 0x0F, CatalogStreamKind::Audio)],
+        }]);
+        let mut cats = std::collections::HashMap::new();
+        cats.insert("audio-only".to_string(), store);
+        let pending = vec![PendingEssenceSlot {
+            slot_idx: 0,
+            input_id: "audio-only".into(),
+            kind: EsKind::Video,
+        }];
+        let err = resolve_essence_slots(pending, cats, Duration::from_millis(250))
+            .await
+            .expect_err("must fail with NoMatch");
+        match err {
+            EssenceResolveError::NoMatch { input_id, kind } => {
+                assert_eq!(input_id, "audio-only");
+                assert_eq!(kind, EsKind::Video);
+            }
+            other => panic!("expected NoMatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn essence_resolver_returns_nocatalogue_when_input_is_silent() {
+        // Catalogue store exists but `load()` returns None until first PSI.
+        let store = Arc::new(PsiCatalogStore::new());
+        let mut cats = std::collections::HashMap::new();
+        cats.insert("silent".to_string(), store);
+        let pending = vec![PendingEssenceSlot {
+            slot_idx: 0,
+            input_id: "silent".into(),
+            kind: EsKind::Video,
+        }];
+        let err = resolve_essence_slots(pending, cats, Duration::from_millis(200))
+            .await
+            .expect_err("must fail with NoCatalogue");
+        assert!(matches!(err, EssenceResolveError::NoCatalogue { .. }));
+    }
+
+    #[tokio::test]
+    async fn essence_resolver_rejects_subtitle_and_data_kinds() {
+        let store = catalogue_with(vec![]);
+        let mut cats = std::collections::HashMap::new();
+        cats.insert("in-a".to_string(), store);
+        let pending = vec![PendingEssenceSlot {
+            slot_idx: 0,
+            input_id: "in-a".into(),
+            kind: EsKind::Subtitle,
+        }];
+        let err = resolve_essence_slots(pending, cats, Duration::from_millis(100))
+            .await
+            .expect_err("subtitle unimplemented");
+        assert!(matches!(
+            err,
+            EssenceResolveError::KindNotImplemented { kind: EsKind::Subtitle }
+        ));
+    }
+
+    #[tokio::test]
+    async fn essence_resolver_completes_when_catalogue_populates_mid_poll() {
+        // Start with an empty store; 100 ms after resolver starts, seed
+        // it. Resolver must pick up the entry on its next poll tick.
+        let store = Arc::new(PsiCatalogStore::new());
+        let store_for_writer = store.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let cat = PsiCatalog {
+                programs: vec![CatalogProgram {
+                    program_number: 1,
+                    pmt_pid: 0x1000,
+                    pcr_pid: Some(0x100),
+                    streams: vec![stream(0x100, 0x1B, CatalogStreamKind::Video)],
+                }],
+                last_updated_us: 1,
+            };
+            crate::engine::ts_psi_catalog::PsiCatalogStore::seed_for_test(
+                &store_for_writer,
+                cat,
+            );
+        });
+        let mut cats = std::collections::HashMap::new();
+        cats.insert("late".to_string(), store);
+        let pending = vec![PendingEssenceSlot {
+            slot_idx: 0,
+            input_id: "late".into(),
+            kind: EsKind::Video,
+        }];
+        let r = resolve_essence_slots(pending, cats, Duration::from_millis(1000))
+            .await
+            .expect("must pick up late catalogue within timeout");
+        assert_eq!(r, vec![(0, 0x100)]);
     }
 }

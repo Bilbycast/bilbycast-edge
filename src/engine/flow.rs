@@ -34,7 +34,10 @@ use super::degradation_monitor::spawn_degradation_monitor;
 use super::media_analysis::spawn_media_analyzer;
 use super::thumbnail::spawn_thumbnail_generator;
 use super::tr101290::spawn_tr101290_analyzer;
-use super::ts_assembler::{spawn_spts_assembler, SptsPlan, SptsSlot};
+use super::ts_assembler::{
+    resolve_essence_slots, spawn_spts_assembler, EsKind, EssenceResolveError,
+    PendingEssenceSlot, SptsBuildResult, SptsPlan, SptsSlot,
+};
 use super::ts_es_bus::{FlowEsBus, TsEsDemuxer};
 use crate::stats::collector::{MediaAnalysisAccumulator, ThumbnailAccumulator, Tr101290Accumulator};
 
@@ -217,18 +220,22 @@ impl FlowRuntime {
     /// bind failure). The input task is spawned first and errors there are
     /// reported asynchronously via the task's log output.
     pub async fn start(config: ResolvedFlow, global_stats: &crate::stats::collector::StatsCollector, ffmpeg_available: bool, event_sender: EventSender) -> Result<Self> {
-        // PID-bus assembly is accepted at config-validation time. Phase 5
-        // lifts the runtime for `kind = spts`; `kind = mpts` still bails
-        // loudly (Phase 5+ scope decision), and `kind = passthrough`
-        // means "no assembler — behave like a legacy flow".
+        // PID-bus assembly is accepted at config-validation time. Phases
+        // 5 + 6 together lift the runtime for `kind = spts`; `kind =
+        // mpts` still bails loudly, and `kind = passthrough` means "no
+        // assembler — behave like a legacy flow".
         //
-        // Slot resolution to a concrete `SptsPlan` happens inside
-        // `build_spts_plan`, which also enforces the Phase 5 scope
-        // guards (TS-carrier inputs only, UDP-only outputs, concrete
-        // `Pid` slots only). Each guard emits a Critical event with a
-        // distinct `error_code` so the manager UI can surface the
-        // offending field on the assembly editor.
-        let spts_plan: Option<SptsPlan> = match config.config.assembly.as_ref() {
+        // Slot resolution is a two-phase process:
+        //   1. `build_spts_plan` produces an `SptsBuildResult` with the
+        //      concrete plan (scope guards enforced) plus any `Essence`
+        //      slots still pending a `(input_id, source_pid)` lookup
+        //      against the per-input PSI catalogue. Every scope failure
+        //      emits a Critical event with a distinct `error_code`.
+        //   2. After the per-input demuxers are running, the runtime
+        //      polls each catalogue until every `Essence` slot resolves
+        //      (up to `ESSENCE_RESOLVE_TIMEOUT`). On success, the plan
+        //      is patched in place and the assembler is spawned.
+        let spts_build: Option<SptsBuildResult> = match config.config.assembly.as_ref() {
             None => None,
             Some(a) if matches!(a.kind, AssemblyKind::Passthrough) => None,
             Some(a) if matches!(a.kind, AssemblyKind::Spts) => {
@@ -259,7 +266,7 @@ impl FlowRuntime {
         // plan is present; non-assembly flows pay zero cost (no Arc, no
         // DashMap). The bus lives as long as the flow, shared by every
         // per-input TS demuxer and the single assembler task.
-        let es_bus: Option<Arc<FlowEsBus>> = spts_plan
+        let es_bus: Option<Arc<FlowEsBus>> = spts_build
             .as_ref()
             .map(|_| Arc::new(FlowEsBus::new()));
         let cancel_token = CancellationToken::new();
@@ -646,22 +653,126 @@ impl FlowRuntime {
             );
         }
 
-        // Spawn the SPTS assembler *after* every per-input demuxer is wired
-        // up: the assembler subscribes eagerly to each slot's bus channel
-        // at startup, which is safe because `FlowEsBus::subscribe` creates
-        // channels lazily — subscribing before any publisher has emitted
-        // still returns a live `broadcast::Receiver`.
-        let pid_bus_assembler_handle: Option<JoinHandle<()>> = match (&spts_plan, &es_bus) {
-            (Some(plan), Some(bus)) => {
+        // Spawn the SPTS assembler *after* every per-input demuxer is
+        // wired up. For Phase 6, if the plan carries any `Essence` slots,
+        // run the resolver first against each input's PSI catalogue:
+        // the catalogue is populated by the Phase 2 observer on every
+        // TS-producing input's per-input broadcast channel, so PAT/PMT
+        // arriving even a few hundred ms after input spawn lands before
+        // the resolver's 3 s deadline.
+        let pid_bus_assembler_handle: Option<JoinHandle<()>> = match (spts_build, &es_bus) {
+            (Some(mut build), Some(bus)) => {
+                if !build.pending_essence.is_empty() {
+                    // Collect PSI catalogue handles keyed by input_id —
+                    // one Arc clone per unique input referenced by a
+                    // pending slot.
+                    let mut catalogues: std::collections::HashMap<
+                        String,
+                        Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>,
+                    > = std::collections::HashMap::new();
+                    for p in &build.pending_essence {
+                        if !catalogues.contains_key(&p.input_id) {
+                            if let Some(c) = flow_stats.per_input_counters.get(&p.input_id) {
+                                catalogues.insert(p.input_id.clone(), c.psi_catalog.clone());
+                            }
+                        }
+                    }
+                    tracing::info!(
+                        "Flow '{}': resolving {} essence slot(s) against per-input PSI catalogues (timeout = {} ms)",
+                        config.config.id,
+                        build.pending_essence.len(),
+                        ESSENCE_RESOLVE_TIMEOUT.as_millis(),
+                    );
+                    match resolve_essence_slots(
+                        build.pending_essence.clone(),
+                        catalogues,
+                        ESSENCE_RESOLVE_TIMEOUT,
+                    )
+                    .await
+                    {
+                        Ok(pairs) => {
+                            for (slot_idx, pid) in pairs {
+                                if let Some(slot) = build.plan.slots.get_mut(slot_idx) {
+                                    slot.source.1 = pid;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            let (code, msg) = essence_error_to_event(&config.config.id, &err);
+                            event_sender.emit_flow_with_details(
+                                EventSeverity::Critical,
+                                category::FLOW,
+                                msg.clone(),
+                                &config.config.id,
+                                serde_json::json!({
+                                    "error_code": code,
+                                    "detail": format!("{err:?}"),
+                                }),
+                            );
+                            bail!(msg);
+                        }
+                    }
+
+                    // Post-resolution: pcr_source may no longer match a
+                    // slot if its `pid` was written against an explicit
+                    // `Pid` slot that's now replaced by an `Essence`
+                    // slot (or if the user picked an arbitrary pid for
+                    // an all-essence assembly, not knowing what the
+                    // resolver would choose). Auto-remap to the first
+                    // slot on the same input_id — that's the
+                    // operator-intent reading. If no such slot exists,
+                    // bail with the Phase 5 error code.
+                    if !build
+                        .plan
+                        .slots
+                        .iter()
+                        .any(|s| s.source == build.plan.pcr_source)
+                    {
+                        let pcr_input = build.plan.pcr_source.0.clone();
+                        if let Some(remap) = build
+                            .plan
+                            .slots
+                            .iter()
+                            .find(|s| s.source.0 == pcr_input)
+                            .map(|s| s.source.clone())
+                        {
+                            tracing::info!(
+                                "Flow '{}': pcr_source auto-remapped from 0x{:04X} to 0x{:04X} (essence-resolved slot on input '{}')",
+                                config.config.id,
+                                build.plan.pcr_source.1,
+                                remap.1,
+                                pcr_input,
+                            );
+                            build.plan.pcr_source = remap;
+                        } else {
+                            let msg = format!(
+                                "flow '{}': pcr_source input '{}' has no slot after essence resolution",
+                                config.config.id, pcr_input,
+                            );
+                            event_sender.emit_flow_with_details(
+                                EventSeverity::Critical,
+                                category::FLOW,
+                                msg.clone(),
+                                &config.config.id,
+                                serde_json::json!({
+                                    "error_code": "pid_bus_pcr_source_unresolved",
+                                    "input_id": pcr_input,
+                                }),
+                            );
+                            bail!(msg);
+                        }
+                    }
+                }
+
                 tracing::info!(
                     "Flow '{}': starting SPTS assembler (program_number = {}, pmt_pid = 0x{:04X}, {} slot(s))",
                     config.config.id,
-                    plan.program_number,
-                    plan.pmt_pid,
-                    plan.slots.len(),
+                    build.plan.program_number,
+                    build.plan.pmt_pid,
+                    build.plan.slots.len(),
                 );
                 Some(spawn_spts_assembler(
-                    plan.clone(),
+                    build.plan,
                     bus.clone(),
                     broadcast_tx.clone(),
                     cancel_token.child_token(),
@@ -1860,21 +1971,101 @@ fn spawn_input_forwarder(
     })
 }
 
-/// Resolve a [`FlowAssembly`] with `kind = spts` into a concrete [`SptsPlan`],
-/// enforcing the Phase 5 scope guards:
+/// How long `FlowRuntime::start` waits for every pending `Essence`
+/// slot to resolve against its input's PSI catalogue before bailing
+/// with `pid_bus_essence_no_match` / `pid_bus_essence_no_catalogue`.
+/// Typical PAT/PMT cadence is 100–400 ms from input bind; 3 s gives
+/// generous headroom for startup races on RTMP/WebRTC inputs whose
+/// first frame may lag socket bind by a second or two.
+const ESSENCE_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Map the resolver's error variant to the `error_code` + message the
+/// runtime surfaces on the emitted Critical event. Centralised here so
+/// the mapping stays consistent if the resolver grows new failure modes.
+fn essence_error_to_event(flow_id: &str, err: &EssenceResolveError) -> (&'static str, String) {
+    match err {
+        EssenceResolveError::KindNotImplemented { kind } => (
+            "pid_bus_essence_kind_not_implemented",
+            format!(
+                "flow '{flow_id}': essence kind {kind:?} is not yet implemented — \
+                 Phase 6 resolves Video + Audio only. Use SlotSource::Pid with \
+                 an explicit source_pid for Subtitle / Data slots."
+            ),
+        ),
+        EssenceResolveError::NoCatalogue { input_id } => (
+            "pid_bus_essence_no_catalogue",
+            format!(
+                "flow '{flow_id}': input '{input_id}' produced no PAT/PMT within \
+                 the essence-resolution window — check that the input is actually \
+                 receiving MPEG-TS."
+            ),
+        ),
+        EssenceResolveError::NoMatch { input_id, kind } => (
+            "pid_bus_essence_no_match",
+            format!(
+                "flow '{flow_id}': input '{input_id}' has a PSI catalogue but no \
+                 stream of kind {kind:?} — pick a different input or a different \
+                 essence kind."
+            ),
+        ),
+    }
+}
+
+/// Classify an [`InputConfig`] against Phase 5/6 compatibility rules.
+/// Returns `None` when the input is TS-producing (any `is_ts_carrier()`
+/// input qualifies); otherwise returns a short `error_code` pointing at
+/// the right remediation for the operator:
+///
+/// - `pid_bus_spts_input_needs_audio_encode` — the input *could*
+///   produce TS via the existing `audio_encode` input-level encoder
+///   (ST 2110-30, `rtp_audio`) but hasn't been configured to.
+/// - `pid_bus_spts_non_ts_input` — the input can't produce TS at all
+///   within the Phase 5/6 runtime (ST 2110-31 AES3 transparent,
+///   ST 2110-40 ANC). Deferred to Phase 6.5's decoded-ES cache.
+fn non_ts_spts_error_code(input: &InputConfig) -> Option<&'static str> {
+    if input.is_ts_carrier() {
+        return None;
+    }
+    match input {
+        InputConfig::St2110_30(c) if c.audio_encode.is_none() => {
+            Some("pid_bus_spts_input_needs_audio_encode")
+        }
+        InputConfig::RtpAudio(c) if c.audio_encode.is_none() => {
+            Some("pid_bus_spts_input_needs_audio_encode")
+        }
+        _ => Some("pid_bus_spts_non_ts_input"),
+    }
+}
+
+/// Map the config-layer [`EssenceKind`] to the assembler's internal
+/// [`EsKind`] so the resolver stays decoupled from the config crate.
+fn es_kind_from_config(k: EssenceKind) -> EsKind {
+    match k {
+        EssenceKind::Video => EsKind::Video,
+        EssenceKind::Audio => EsKind::Audio,
+        EssenceKind::Subtitle => EsKind::Subtitle,
+        EssenceKind::Data => EsKind::Data,
+    }
+}
+
+/// Resolve a [`FlowAssembly`] with `kind = spts` into an
+/// [`SptsBuildResult`], enforcing Phase 5 + Phase 6 scope guards:
 ///
 /// - every output on the flow must be `OutputConfig::Udp`
 ///   (`error_code: pid_bus_spts_non_udp_output`)
-/// - every input on the flow must produce MPEG-TS via `is_ts_carrier()`
-///   (`error_code: pid_bus_spts_non_ts_input`)
-/// - every slot source must be `SlotSource::Pid` — `Essence` and `Hitless`
-///   are deferred to Phase 6 / 7 and rejected loudly
-///   (`error_codes: pid_bus_spts_essence_not_implemented`,
-///   `pid_bus_spts_hitless_not_implemented`)
-/// - `pcr_source` must resolve to exactly one of the assembled slots
-///   (`error_code: pid_bus_pcr_source_unresolved`) — the validator
-///   already enforces this at config-load time for concrete Pid slots,
-///   but runtime revalidates so a fix-up elsewhere can never bypass it.
+/// - every input on the flow must produce MPEG-TS (`is_ts_carrier()`),
+///   with a sharpened error code when the input *could* produce TS via
+///   the input-level `audio_encode` encoder but isn't configured to
+///   (`error_codes: pid_bus_spts_input_needs_audio_encode`,
+///   `pid_bus_spts_non_ts_input`)
+/// - slot sources may be `SlotSource::Pid` (resolved here) or
+///   `SlotSource::Essence` (deferred to the Phase 6 resolver).
+///   `SlotSource::Hitless` is still rejected loudly
+///   (`error_code: pid_bus_spts_hitless_not_implemented`)
+/// - `pcr_source` existence is validated here; the match against a
+///   concrete slot is deferred until after essence resolution and
+///   surfaced as `pid_bus_pcr_source_unresolved` if it still doesn't
+///   hit.
 ///
 /// Every failure path emits a Critical event *before* bailing so the
 /// manager UI can highlight the offending assembly field without having
@@ -1883,7 +2074,7 @@ fn build_spts_plan(
     assembly: &FlowAssembly,
     flow: &ResolvedFlow,
     event_sender: &EventSender,
-) -> Result<SptsPlan> {
+) -> Result<SptsBuildResult> {
     let flow_id = &flow.config.id;
     let emit = |error_code: &str, msg: &str, extra: serde_json::Value| {
         let mut details = serde_json::json!({ "error_code": error_code });
@@ -1923,20 +2114,34 @@ fn build_spts_plan(
         }
     }
 
-    // Input scope: TS-carrier inputs only (Phase 6 lifts this for
-    // non-TS inputs via auto-PID + a decoded-ES cache).
+    // Input scope: every input must produce MPEG-TS. Phase 6 sharpens
+    // the error for inputs that have an input-level encoder escape
+    // hatch (ST 2110-30 / RtpAudio via `audio_encode`) so operators
+    // know the fix without chasing the error text. Pure-raw non-TS
+    // inputs (ST 2110-31 / -40) stay on the generic code until Phase
+    // 6.5's decoded-ES cache lands.
     for input in &flow.inputs {
-        if !input.config.is_ts_carrier() {
-            let msg = format!(
-                "flow '{}': assembly.kind = spts requires every input to carry MPEG-TS \
-                 in Phase 5 (Phase 6 adds auto-PID for non-TS inputs). \
-                 Input '{}' is type '{}'.",
-                flow_id,
-                input.id,
-                input_type_str(&input.config),
-            );
+        if let Some(code) = non_ts_spts_error_code(&input.config) {
+            let msg = match code {
+                "pid_bus_spts_input_needs_audio_encode" => format!(
+                    "flow '{}': assembly.kind = spts requires TS on the broadcast channel; \
+                     input '{}' is type '{}' and can produce TS via input-level `audio_encode`. \
+                     Set `audio_encode` on the input config and the input will publish TS into the assembly.",
+                    flow_id,
+                    input.id,
+                    input_type_str(&input.config),
+                ),
+                _ => format!(
+                    "flow '{}': assembly.kind = spts requires every input to produce MPEG-TS. \
+                     Input '{}' is type '{}' and has no path to TS in the Phase 5/6 runtime \
+                     (Phase 6.5 adds a decoded-ES cache for pure-raw inputs).",
+                    flow_id,
+                    input.id,
+                    input_type_str(&input.config),
+                ),
+            };
             emit(
-                "pid_bus_spts_non_ts_input",
+                code,
                 &msg,
                 serde_json::json!({
                     "input_id": input.id,
@@ -1956,34 +2161,30 @@ fn build_spts_plan(
         anyhow::anyhow!(msg)
     })?;
 
-    // Resolve every slot into a concrete `(input_id, source_pid)` →
-    // rejecting Essence / Hitless until their phases land.
+    // Resolve every slot. `Pid` slots map directly to a concrete
+    // `(input_id, source_pid)`. `Essence` slots get a sentinel
+    // `source_pid = 0` and an entry in `pending_essence` so the runtime
+    // can patch the slot in place after the resolver returns.
+    // `Hitless` stays rejected loudly (Phase 7 scope).
     let mut slots: Vec<SptsSlot> = Vec::with_capacity(program.streams.len());
+    let mut pending_essence: Vec<PendingEssenceSlot> = Vec::new();
     for stream in &program.streams {
         let (input_id, source_pid) = match &stream.source {
             SlotSource::Pid { input_id, source_pid } => (input_id.clone(), *source_pid),
             SlotSource::Essence { input_id, kind } => {
-                let msg = format!(
-                    "flow '{}': SlotSource::Essence on input '{}' (kind = {:?}) is not yet \
-                     implemented — use SlotSource::Pid with an explicit source_pid until \
-                     Phase 6 lands auto-PID resolution.",
-                    flow_id, input_id, kind
-                );
-                emit(
-                    "pid_bus_spts_essence_not_implemented",
-                    &msg,
-                    serde_json::json!({
-                        "input_id": input_id,
-                        "kind": format!("{:?}", kind).to_lowercase(),
-                        "out_pid": stream.out_pid,
-                    }),
-                );
-                bail!(msg);
+                let slot_idx = slots.len();
+                pending_essence.push(PendingEssenceSlot {
+                    slot_idx,
+                    input_id: input_id.clone(),
+                    kind: es_kind_from_config(*kind),
+                });
+                (input_id.clone(), 0_u16) // sentinel, patched after resolution
             }
             SlotSource::Hitless { .. } => {
                 let msg = format!(
                     "flow '{}': SlotSource::Hitless is not yet implemented — \
-                     use a single SlotSource::Pid until Phase 7 lands runtime switching.",
+                     use a single SlotSource::Pid or SlotSource::Essence until \
+                     Phase 7 lands runtime switching.",
                     flow_id
                 );
                 emit(
@@ -2001,37 +2202,26 @@ fn build_spts_plan(
         });
     }
 
-    // `pcr_source` must hit exactly one slot — validated at config-load
-    // time for concrete Pid slots, re-checked here so runtime is
-    // authoritative. (If Phase 6 later adds deferred Essence resolution,
-    // the check moves to the post-resolution step.)
+    // `pcr_source` presence is validated here. The match against a
+    // concrete slot is deferred to the runtime post-resolution step —
+    // Essence slots don't know their `source_pid` until the resolver
+    // runs, and an `pcr_source.pid` against an Essence-driven slot is
+    // auto-remapped to the resolver's pick. See the assembler-spawn
+    // block in `FlowRuntime::start`.
     let pcr = assembly
         .pcr_source
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("flow '{flow_id}': spts assembly has no pcr_source"))?;
     let pcr_key = (pcr.input_id.clone(), pcr.pid);
-    if !slots.iter().any(|s| s.source == pcr_key) {
-        let msg = format!(
-            "flow '{}': pcr_source ({}, 0x{:04X}) does not match any assembled slot source — \
-             unable to map PCR_PID in the synthesised PMT.",
-            flow_id, pcr.input_id, pcr.pid
-        );
-        emit(
-            "pid_bus_pcr_source_unresolved",
-            &msg,
-            serde_json::json!({
-                "input_id": pcr.input_id,
-                "pid": pcr.pid,
-            }),
-        );
-        bail!(msg);
-    }
 
-    Ok(SptsPlan {
-        program_number: program.program_number,
-        pmt_pid: program.pmt_pid,
-        pcr_source: pcr_key,
-        slots,
+    Ok(SptsBuildResult {
+        plan: SptsPlan {
+            program_number: program.program_number,
+            pmt_pid: program.pmt_pid,
+            pcr_source: pcr_key,
+            slots,
+        },
+        pending_essence,
     })
 }
 

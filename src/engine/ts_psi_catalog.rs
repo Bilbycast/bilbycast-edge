@@ -154,6 +154,13 @@ impl PsiCatalogStore {
     pub fn tick(&self) -> u64 {
         self.update_counter.load(Ordering::Relaxed)
     }
+
+    /// Test-only: seed the store with a catalogue without going through
+    /// the observer. Used by Phase 6 resolver tests.
+    #[cfg(test)]
+    pub fn seed_for_test(store: &Self, cat: PsiCatalog) {
+        store.store(cat);
+    }
 }
 
 /// Spawn the per-input observer. Subscribes to the input's broadcast
