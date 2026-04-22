@@ -15,4 +15,5 @@
 
 pub mod collector;
 pub mod models;
+pub mod pcr_trust;
 pub mod throughput;

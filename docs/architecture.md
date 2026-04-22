@@ -497,6 +497,84 @@ pub fn spawn_xxx_output(
 ) -> JoinHandle<()>
 ```
 
+## PID bus (Flow Assembly — SPTS / MPTS synthesis)
+
+When a flow's `FlowConfig.assembly` selects `spts` or `mpts`, the flow no longer forwards the active input's bytes. Instead, a parallel ES-level data plane builds a fresh MPEG-TS from elementary streams pulled off **any of the flow's inputs** and publishes it onto the same broadcast channel every existing output subscribes to — so UDP, RTP (with / without 2022-1 FEC, 2022-7), SRT (incl. bonded / 2022-7), RIST (incl. ARQ), RTMP, HLS, CMAF, WebRTC all consume the assembled TS unchanged.
+
+```
+  Input A (TS)                                  FlowEsBus (keyed by (input_id, source_pid))
+    ├── forwarder → broadcast_tx                 ┌──────────────────────────────────────────┐
+    └── TsEsDemuxer ──────────publishes──────────►  (A, 0x100) → broadcast<EsPacket>          │
+                                                │  (A, 0x101) → broadcast<EsPacket>          │
+                                                │  ...                                       │
+  Input B (TS)                                  │                                            │
+    ├── forwarder → broadcast_tx ─► SUPPRESSED  │                                            │
+    └── TsEsDemuxer ──────────publishes──────────►  (B, 0x100) → broadcast<EsPacket>          │
+                                                │  (B, 0x101) → broadcast<EsPacket>          │
+                                                └──────────────────────────────────────────┘
+  Input C (ST 2110-30 + audio_encode=aac_lc)                │
+    └── input_pcm_encode (decoded-ES cache) ────────────────┘
+                                                            │
+                                                            ▼
+                                          ┌──────────────────────────────────┐
+                                          │ ts_assembler (spawn_spts_assembler)
+                                          │ ─────────────────────────────────
+                                          │ fan-in per slot via broadcast::Receiver
+                                          │ rewrite PID → out_pid (+ CC stamp)
+                                          │ bundle 7 × 188 B = 1316 B RTP packet
+                                          │ synthesise PAT + PMT(s) @ 100 ms
+                                          │ per-program PCR byte-for-byte
+                                          │ PAT/PMT version_number bumps (mod 32)
+                                          └──────────────────────────────────┘
+                                                            │
+                                                            ▼
+                                                 broadcast::Sender<RtpPacket>
+                                                            │
+                            ┌───────────────────────────────┼───────────────────────────────┐
+                            ▼                               ▼                               ▼
+                         UDP output                      SRT output                      RTMP output
+                      (passthrough TS)                 (passthrough TS)            (re-mux via TsDemuxer)
+```
+
+The runtime never forwards the inputs' original TS bytes directly onto `broadcast_tx` when the flow is assembled — it publishes each input's ES onto the bus and lets the assembler drive the flow broadcast channel.
+
+### Per-ES bus primitives (`engine/ts_es_bus.rs`)
+
+- **`EsPacket`** — one 188-byte TS packet (source bytes untouched) + `source_pid`, PMT `stream_type`, PUSI flag, `has_pcr`, extracted 27 MHz PCR value (when present), and the upstream `recv_time_us`. The source CC stays in-band for the assembler to rewrite.
+- **`FlowEsBus`** — per-flow `DashMap<(input_id, source_pid), broadcast::Sender<EsPacket>>`. Lazily creates the channel on first observation of a PID; channel capacity is 2048 TS packets per PID. Slow consumers see `RecvError::Lagged(n)` and drop — no cascade backpressure. PAT / PMT / NULL-PID packets are not published.
+- **`TsEsDemuxer`** — the per-input bridge. Parses the input's TS, maintains a per-input PSI catalogue via `ts_psi_catalog` (Phase 2), and publishes every ES packet onto its bus key. One demuxer per input; active whenever the flow is assembled.
+
+### Decoded-ES cache for non-TS audio (`engine/input_pcm_encode.rs`)
+
+PCM / AES3-transparent inputs (ST 2110-30, ST 2110-31, `rtp_audio`) become TS carriers when the operator sets `audio_encode` on the input. The input task runs AAC-LC / HE-AAC v1/v2 (fdk-aac) or SMPTE 302M wrapping over the PCM samples, wraps the encoded audio into a synthetic audio-only TS via the shared `TsMuxer`, and publishes onto the bus like any native-TS input. First-light runtime codecs: `aac_lc`, `he_aac_v1`, `he_aac_v2`, `s302m`. ST 2110-31 is valid only with `s302m` — its 337M sub-frames ride bit-for-bit.
+
+### Pre-bus Hitless merger (`engine/ts_es_hitless.rs`)
+
+A `SlotSource::Hitless { primary, backup }` spawns a merger task that subscribes to both legs on the bus and republishes onto a synthetic `hitless:<uid>` bus key the assembler's slot then points at. Strategy: **primary-preference with a 200 ms stall timer** (not sequence-aware 2022-7 dedup — `EsPacket` carries no upstream RTP sequence number today). Primary packets forward verbatim; no primary for 200 ms → flip to backup; primary traffic resumes → switch back after a short hold-off. Either leg must itself be `Pid` or `Essence`; nested Hitless is rejected at config-save time.
+
+### Assembler (`engine/ts_assembler.rs`)
+
+- **Subscribe**: one fan-in task per slot, each draining a `broadcast::Receiver<EsPacket>` and forwarding into a single `mpsc::Sender<(slot_idx, EsPacket)>`. Slow fan-in loses packets at the bus edge, not in mpsc backpressure — keeps the no-cascade invariant.
+- **Egress**: one `select!` loop rewrites each 188-byte packet's PID to the configured `out_pid`, stamps a per-out-PID monotonic CC, and batches seven packets into a 1316-byte RTP bundle that gets published to `broadcast_tx`. One `BytesMut::with_capacity(1316)` allocation per bundle; zero per-TS-packet allocations.
+- **PSI synthesis**: PAT + one PMT per program on a 100 ms cadence, with `mpeg2_crc32` for the CRC32 trailer. A 10 ms safety-net flush keeps partially-filled bundles shipping during sparse audio-only / keyframe-gap periods.
+- **Versioning**: `PAT.version_number` bumps (mod 32, monotonic) when the program set changes; each program's `PMT.version_number` bumps when its slot composition or `pcr_source` changes. Same monotonic-counter pattern as `TsContinuityFixer` — avoids the phantom-version collision the passthrough switcher already had to solve.
+- **Hot-swap**: `PlanCommand::ReplacePlan { plan }` via an mpsc channel. The handler diffs old vs new, re-spawns fan-ins for added / changed slots, cancels fan-ins for removed slots, bumps PMT versions accordingly, and emits a fresh PSI burst immediately so receivers never see ES bytes on an unknown PID.
+
+### Per-ES analyser (`engine/ts_es_analysis.rs`)
+
+One lightweight task per bus key maintains a `PerEsAccumulator` on `FlowStatsAccumulator.per_es_stats`. Tracks packets, bytes, rolling 1 Hz bitrate, CC errors, PCR discontinuities (100 ms threshold matching flow-level TR-101290), and last-seen `stream_type`. Snapshot path annotates each entry with its current `out_pid` from `FlowStatsAccumulator.pid_routing` (refreshed on every plan change) so operators can pivot off the egress PID. Shipped on `FlowStats.per_es[]`.
+
+### Output-side PCR accuracy sampler (`stats/pcr_trust.rs`)
+
+Fixed-size rotating reservoir (4096 samples) on every TS-bearing output's send path. On each successful `socket.send_to` of a datagram containing a PCR-bearing TS packet, the sampler records `|ΔPCR_µs − Δwall_µs|` — then exposes exact percentiles (p50 / p95 / p99 / max) on snapshot. Sample-skip rule: Δ > 500 ms on either side discards and resets state (filters startup jitter, keyframe gaps, restarts, 33-bit wrap). Wired from `engine/output_udp.rs` (MPTS UDP) and `engine/output_rtp.rs` (raw-TS + RTP-wrapped TS). Flow-level rollup on `FlowStats.pcr_trust_flow` aggregates across outputs.
+
+### Runtime plumbing (`engine/flow.rs`)
+
+- `FlowRuntime::start` builds the initial `AssemblyPlan` via `build_assembly_plan()` — enforces input-side TS-eligibility, resolves `Essence` slots against each input's PSI catalogue, wires Hitless mergers, cross-checks PCR sources against program slots, and fails the flow bring-up with a specific `pid_bus_*` error code (shipped as a Critical event with structured `details`) when anything is unresolvable.
+- `FlowRuntime::replace_assembly` handles the `UpdateFlowAssembly` WS command (and the `PUT /api/v1/flows/{id}/assembly` REST mirror). Re-runs the validator + essence resolver on the incoming plan, re-spawns Hitless mergers for any new synthetic keys, sends `PlanCommand::ReplacePlan` to the assembler, and persists the new assembly to `config.json` only after the swap succeeds. Transitions across the passthrough boundary (passthrough ↔ assembled) are rejected — those need a full `UpdateFlow` because the plumbing on the flow changes (bus + assembler spawn vs. direct broadcast).
+
+**Production-safety invariant.** Flows without an `assembly` block — or with `assembly.kind = passthrough` — run exactly as before. Assembled flows fail loudly with a Critical `pid_bus_*` event on any unresolvable state; no silent misbehaviour.
+
 ## MPTS → SPTS program filtering
 
 When an input carries an MPTS (Multi-Program Transport Stream) and an output wants only a single program, a per-output **program filter** runs between the broadcast receiver and the output's send path. Two implementations share the heavy lifting:

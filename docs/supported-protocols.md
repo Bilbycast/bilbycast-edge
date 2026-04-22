@@ -355,6 +355,13 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
 - **Per-output scope:** one flow can fan an MPTS out to multiple outputs, each locked onto a different program, while a sibling output forwards the full MPTS unchanged.
 - See [configuration-guide.md — MPTS → SPTS filtering](configuration-guide.md#mpts--spts-filtering) for the full behaviour matrix.
 
+### Flow Assembly (PID bus — build fresh SPTS / MPTS from N inputs)
+
+A flow can optionally carry an `assembly` block (`kind = spts | mpts | passthrough`) that builds a fresh MPEG-TS from elementary streams pulled off any of the flow's inputs. Every output type consumes the assembled TS unchanged — there is **no output-type gate** (any of UDP / RTP / SRT / RIST / RTMP / HLS / CMAF / CMAF-LL / WebRTC works). Slot sources are `pid` (explicit `(input_id, source_pid)`), `essence` (first video/audio/subtitle/data off a named input), or `hitless` (primary-preference failover merger; not 2022-7 seq-aware dedup today). PCM / AES3 inputs (ST 2110-30, ST 2110-31, `rtp_audio`) become TS carriers for the bus when their input-level `audio_encode` is set (`aac_lc` / `he_aac_v1` / `he_aac_v2` / `s302m`). Runtime hot-swap via `UpdateFlowAssembly` (PMT version bumps mod 32, PAT only when the program set changes). See [configuration-guide.md — Flow Assembly (PID bus)](configuration-guide.md#flow-assembly-pid-bus--spts--mpts-from-n-inputs) for the full schema and rules.
+
+### TS output PID remap (`pid_map`)
+- TS-carrying outputs (`udp`, `rtp`, `srt`, `rist`, `hls`, `bonded`) accept an optional `pid_map: { src: tgt }` that rewrites PIDs on egress (PAT / PMT CRCs recomputed). ≤ 256 entries, PIDs in `0x0010..=0x1FFE`, bijective (no source or target collides with another), source ≠ target. Use for downstream systems with hard-coded PID expectations that don't match the upstream (or assembly's `out_pid`) layout.
+
 ## Monitoring and Analysis
 
 ### TR-101290 Transport Stream Analysis

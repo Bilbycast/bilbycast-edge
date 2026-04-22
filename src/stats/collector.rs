@@ -83,6 +83,13 @@ pub struct OutputStatsAccumulator {
     latency_max_us: AtomicU64,
     latency_sum_us: AtomicU64,
     latency_count: AtomicU64,
+
+    // ── PID-bus Phase 8: per-output PCR accuracy trust metric ────────
+    // Fed inline by the output's send task whenever it forwards a
+    // PCR-bearing TS packet. Cheap — one Mutex + VecDeque push per PCR
+    // (~25/sec typical). Lifetime-cumulative percentiles across a
+    // rotating reservoir (last 4096 samples).
+    pcr_trust: crate::stats::pcr_trust::PcrTrustSampler,
 }
 
 /// Registered handle to a per-output decode stage's counters plus the
@@ -167,7 +174,28 @@ impl OutputStatsAccumulator {
             latency_max_us: AtomicU64::new(0),
             latency_sum_us: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
+            pcr_trust: crate::stats::pcr_trust::PcrTrustSampler::new(),
         }
+    }
+
+    /// Record one PCR observation at egress. Called inline by the output's
+    /// send task for every PCR-bearing TS packet it forwards. `pcr_27mhz`
+    /// is reconstructed from the adaptation field; `now_us` is the
+    /// monotonic wall clock at forward time.
+    ///
+    /// PID-bus Phase 8: this is the sampling point for the per-output
+    /// PCR accuracy trust metric. See `stats::pcr_trust` for the
+    /// reservoir design.
+    #[inline]
+    pub fn record_pcr_egress(&self, pcr_27mhz: u64, now_us: u64) {
+        self.pcr_trust.record(pcr_27mhz, now_us);
+    }
+
+    /// Borrow the PCR trust sampler — used by the flow-level snapshot
+    /// path to compute `FlowStats.pcr_trust_flow` as a roll-up across
+    /// all outputs.
+    pub fn pcr_trust_sampler(&self) -> &crate::stats::pcr_trust::PcrTrustSampler {
+        &self.pcr_trust
     }
 
     /// Register the per-output transcoder stats handle. Called once at
@@ -437,6 +465,7 @@ impl OutputStatsAccumulator {
             // stats. Leaving as None here keeps the per-output snapshot
             // self-contained.
             egress_summary: None,
+            pcr_trust: self.pcr_trust.snapshot(),
         }
     }
 }
@@ -1028,22 +1057,61 @@ pub struct PerInputCounters {
     pub bytes: AtomicU64,
     pub packets: AtomicU64,
     pub throughput: ThroughputEstimator,
+    /// Per-input topology/address metadata, captured at registration so
+    /// the snapshot path can fill `PerInputLive.{mode, local_addr, ...}`
+    /// for every configured input — not only the single active one.
+    /// Immutable for the life of the input; a config-driven input edit
+    /// rebuilds the flow and re-registers counters.
+    pub meta: InputConfigMeta,
     /// Lightweight PAT/PMT catalogue for this input, maintained by
     /// [`crate::engine::ts_psi_catalog`]. `None` on non-TS inputs
     /// (RTMP / WebRTC / RTP-ES / ST 2110-30/-40) where there is no
     /// PSI to parse; the observer is not spawned for those.
     pub psi_catalog: Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>,
+    /// Deep-clone cache for the catalogue, keyed by the store's update
+    /// tick. `(0, None)` until the observer publishes its first PAT+PMT.
+    /// The snapshot path refreshes this only when `PsiCatalogStore::tick`
+    /// advances — steady-state PSI is stable, so the expensive deep clone
+    /// happens once per PAT/PMT update instead of once per snapshot.
+    psi_catalog_cache: std::sync::Mutex<(u64, Option<crate::engine::ts_psi_catalog::PsiCatalog>)>,
 }
 
 impl PerInputCounters {
-    pub fn new(input_type: String) -> Self {
+    pub fn new(input_type: String, meta: InputConfigMeta) -> Self {
         Self {
             input_type,
             bytes: AtomicU64::new(0),
             packets: AtomicU64::new(0),
             throughput: ThroughputEstimator::new(),
+            meta,
             psi_catalog: Arc::new(crate::engine::ts_psi_catalog::PsiCatalogStore::new()),
+            psi_catalog_cache: std::sync::Mutex::new((0, None)),
         }
+    }
+
+    /// Snapshot the catalogue with tick-based drop-equal caching. Returns
+    /// `(catalog_clone, tick)` where the clone is reused from the cache
+    /// whenever the store's tick hasn't advanced since the last snapshot.
+    /// `tick == 0` means no PSI has ever been observed.
+    pub fn psi_catalog_snapshot(
+        &self,
+    ) -> (
+        Option<crate::engine::ts_psi_catalog::PsiCatalog>,
+        u64,
+    ) {
+        let tick = self.psi_catalog.tick();
+        if tick == 0 {
+            return (None, 0);
+        }
+        let mut cache = match self.psi_catalog_cache.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if cache.0 != tick {
+            let fresh = self.psi_catalog.load().map(|arc| (*arc).clone());
+            *cache = (tick, fresh);
+        }
+        (cache.1.clone(), tick)
     }
 }
 
@@ -1159,6 +1227,74 @@ pub struct FlowStatsAccumulator {
     /// Per-input-id map of static ingress-summary descriptors. The dynamic
     /// codec/format fields are merged in at `FlowStatsAccumulator::snapshot()`.
     ingress_static: DashMap<String, EgressMediaSummaryStatic>,
+    /// PID-bus Phase 8: per-elementary-stream counters keyed by
+    /// `(input_id, source_pid)`. Populated incrementally by the
+    /// per-ES analyzer task (see `engine::ts_es_analysis`) that
+    /// subscribes to each `FlowEsBus` channel. Surfaced via
+    /// `FlowStats.per_es` on assembled flows; absent on passthrough
+    /// flows (which have no `FlowEsBus` to read from).
+    pub per_es_stats: DashMap<(String, u16), Arc<PerEsAccumulator>>,
+    /// Snapshot of the running assembler's `(input_id, source_pid) → out_pid`
+    /// routing. Updated by `FlowRuntime::replace_assembly` after every
+    /// runtime swap. Used by `snapshot()` to annotate `PerEsStats.out_pid`
+    /// so operators can pivot their trust signals off egress PID. Empty
+    /// on passthrough flows.
+    pub pid_routing: std::sync::RwLock<std::collections::HashMap<(String, u16), u16>>,
+}
+
+/// Per-elementary-stream accumulator. One instance per `(input_id, source_pid)`
+/// channel on the flow's `FlowEsBus`. Atomic counters — updated inline by
+/// the per-ES analyzer subscriber, read at 1 Hz by the snapshot path.
+pub struct PerEsAccumulator {
+    pub input_id: String,
+    pub source_pid: u16,
+    /// Most recently observed PMT `stream_type`. `AtomicU8`-equivalent via
+    /// the same `AtomicU64` we use for every other counter. Written each
+    /// time an ES packet arrives (the bus stamps stream_type per packet).
+    pub stream_type: AtomicU64,
+    pub packets: AtomicU64,
+    pub bytes: AtomicU64,
+    pub cc_errors: AtomicU64,
+    pub pcr_discontinuity_errors: AtomicU64,
+    /// Last continuity-counter value (0..=15), packed in the low nibble.
+    /// Mutated by a single owner (the per-ES analyzer task) via Relaxed.
+    /// 0x100 sentinel = "no CC observed yet".
+    pub last_cc: AtomicU64,
+    /// Last observed PCR in 27 MHz ticks; `u64::MAX` sentinel = none yet.
+    pub last_pcr_27mhz: AtomicU64,
+    pub throughput: ThroughputEstimator,
+}
+
+impl PerEsAccumulator {
+    pub fn new(input_id: String, source_pid: u16) -> Self {
+        Self {
+            input_id,
+            source_pid,
+            stream_type: AtomicU64::new(0),
+            packets: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            cc_errors: AtomicU64::new(0),
+            pcr_discontinuity_errors: AtomicU64::new(0),
+            last_cc: AtomicU64::new(0x100),
+            last_pcr_27mhz: AtomicU64::new(u64::MAX),
+            throughput: ThroughputEstimator::new(),
+        }
+    }
+
+    /// Derive a human-readable essence kind from the observed `stream_type`.
+    /// Mirrors the mapping `ts_psi_catalog` uses, kept here to avoid a
+    /// cross-module borrow in the snapshot path.
+    pub fn kind_for_stream_type(st: u8) -> &'static str {
+        match st {
+            0x01 | 0x02 | 0x10 | 0x1B | 0x20 | 0x24 | 0x27 | 0x42 | 0xD1 | 0xEA => "video",
+            0x03 | 0x04 | 0x0F | 0x11 | 0x80 | 0x81 | 0x82 | 0x83 | 0x84 | 0x85 | 0x86
+            | 0x87 | 0x88 | 0x89 | 0x8A | 0x8B | 0x8C | 0x8D | 0x8E | 0x8F | 0xA1 | 0xC1
+            | 0xC2 => "audio",
+            0x06 => "subtitle",
+            0x05 | 0x0B | 0x0C | 0x0D | 0x15 | 0x16 => "data",
+            _ => "",
+        }
+    }
 }
 
 /// Lightweight input config metadata for topology display.
@@ -1230,7 +1366,38 @@ impl FlowStatsAccumulator {
             input_audio_encode_stats: DashMap::new(),
             input_video_encode_stats: DashMap::new(),
             ingress_static: DashMap::new(),
+            per_es_stats: DashMap::new(),
+            pid_routing: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Update the `(input_id, source_pid) → out_pid` routing snapshot. Called
+    /// by `FlowRuntime` after every assembler plan swap so the per-ES
+    /// snapshot path can annotate each entry with its egress PID.
+    ///
+    /// The map is replaced wholesale — entries that were in the old plan
+    /// but not the new one no longer carry an `out_pid` in the wire shape,
+    /// matching the reality that the assembler no longer forwards them.
+    pub fn set_pid_routing(&self, routing: std::collections::HashMap<(String, u16), u16>) {
+        if let Ok(mut w) = self.pid_routing.write() {
+            *w = routing;
+        }
+    }
+
+    /// Resolve (or create) a per-ES accumulator for a given
+    /// `(input_id, source_pid)`. Called by the per-ES analyzer as new
+    /// bus channels appear — subsequent calls return the existing entry.
+    pub fn per_es_acc(&self, input_id: &str, source_pid: u16) -> Arc<PerEsAccumulator> {
+        let key = (input_id.to_string(), source_pid);
+        if let Some(existing) = self.per_es_stats.get(&key) {
+            return existing.value().clone();
+        }
+        let new_acc = Arc::new(PerEsAccumulator::new(input_id.to_string(), source_pid));
+        self.per_es_stats
+            .entry(key)
+            .or_insert_with(|| new_acc.clone())
+            .value()
+            .clone()
     }
 
     /// Register an input-side PCM transcoder's stats handle for a specific
@@ -1377,8 +1544,13 @@ impl FlowStatsAccumulator {
     /// reference. Called once per input at flow start so the per-input
     /// forwarder can increment bytes/packets for every packet flowing on that
     /// input's dedicated broadcast channel, regardless of active/passive.
-    pub fn register_input_counters(&self, input_id: &str, input_type: &str) -> Arc<PerInputCounters> {
-        let c = Arc::new(PerInputCounters::new(input_type.to_string()));
+    pub fn register_input_counters(
+        &self,
+        input_id: &str,
+        input_type: &str,
+        meta: InputConfigMeta,
+    ) -> Arc<PerInputCounters> {
+        let c = Arc::new(PerInputCounters::new(input_type.to_string(), meta));
         self.per_input_counters.insert(input_id.to_string(), c.clone());
         c
     }
@@ -1540,7 +1712,7 @@ impl FlowStatsAccumulator {
                 let bytes = c.bytes.load(Ordering::Relaxed);
                 let packets = c.packets.load(Ordering::Relaxed);
                 let bitrate = c.throughput.sample(bytes);
-                let psi_catalog = c.psi_catalog.load().map(|arc| (*arc).clone());
+                let (psi_catalog, psi_tick) = c.psi_catalog_snapshot();
                 PerInputLive {
                     input_id,
                     input_type: c.input_type.clone(),
@@ -1548,11 +1720,73 @@ impl FlowStatsAccumulator {
                     packets_received: packets,
                     bytes_received: bytes,
                     bitrate_bps: bitrate,
+                    mode: c.meta.mode.clone(),
+                    local_addr: c.meta.local_addr.clone(),
+                    remote_addr: c.meta.remote_addr.clone(),
+                    listen_addr: c.meta.listen_addr.clone(),
+                    bind_addr: c.meta.bind_addr.clone(),
+                    rtsp_url: c.meta.rtsp_url.clone(),
+                    whep_url: c.meta.whep_url.clone(),
                     psi_catalog,
+                    psi_catalog_tick: if psi_tick == 0 { None } else { Some(psi_tick) },
                 }
             })
             .collect();
         let inputs_live = if inputs_live.is_empty() { None } else { Some(inputs_live) };
+
+        // Per-ES snapshot. Read the routing map once so every entry gets a
+        // consistent `out_pid`.
+        let routing = self.pid_routing.read().ok().map(|g| g.clone()).unwrap_or_default();
+        let per_es_vec: Vec<crate::stats::models::PerEsStats> = self
+            .per_es_stats
+            .iter()
+            .map(|entry| {
+                let acc = entry.value();
+                let bytes = acc.bytes.load(Ordering::Relaxed);
+                let bitrate = acc.throughput.sample(bytes);
+                let st = acc.stream_type.load(Ordering::Relaxed) as u8;
+                let key = (acc.input_id.clone(), acc.source_pid);
+                crate::stats::models::PerEsStats {
+                    input_id: acc.input_id.clone(),
+                    source_pid: acc.source_pid,
+                    out_pid: routing.get(&key).copied(),
+                    stream_type: st,
+                    kind: PerEsAccumulator::kind_for_stream_type(st).to_string(),
+                    packets: acc.packets.load(Ordering::Relaxed),
+                    bytes,
+                    bitrate_bps: bitrate,
+                    cc_errors: acc.cc_errors.load(Ordering::Relaxed),
+                    pcr_discontinuity_errors: acc
+                        .pcr_discontinuity_errors
+                        .load(Ordering::Relaxed),
+                }
+            })
+            .collect();
+        let per_es = if per_es_vec.is_empty() { None } else { Some(per_es_vec) };
+
+        // Flow-level PCR trust rollup. Aggregate every output's sampler
+        // snapshot into one. We report the max p50/p95/p99/max across
+        // outputs rather than a re-percentile of the union — simpler to
+        // reason about ("no output is worse than this") and computable
+        // from already-computed per-output snapshots.
+        let pcr_trust_flow = {
+            let mut acc: Option<crate::stats::models::PcrTrustStats> = None;
+            for out_entry in self.output_stats.iter() {
+                if let Some(snap) = out_entry.value().pcr_trust_sampler().snapshot() {
+                    let agg = acc.get_or_insert_with(Default::default);
+                    agg.samples = agg.samples.max(snap.samples);
+                    agg.cumulative_samples = agg.cumulative_samples + snap.cumulative_samples;
+                    agg.avg_us = agg.avg_us.max(snap.avg_us);
+                    agg.p50_us = agg.p50_us.max(snap.p50_us);
+                    agg.p95_us = agg.p95_us.max(snap.p95_us);
+                    agg.p99_us = agg.p99_us.max(snap.p99_us);
+                    agg.max_us = agg.max_us.max(snap.max_us);
+                    agg.window_samples = agg.window_samples.max(snap.window_samples);
+                    agg.window_p95_us = agg.window_p95_us.max(snap.window_p95_us);
+                }
+            }
+            acc
+        };
 
         FlowStats {
             flow_id: self.flow_id.clone(),
@@ -1694,6 +1928,8 @@ impl FlowStatsAccumulator {
                 .map(|s| red_blue_to_stats(&s.snapshot())),
             essence_flows: None,
             inputs_live,
+            per_es,
+            pcr_trust_flow,
         }
     }
 }

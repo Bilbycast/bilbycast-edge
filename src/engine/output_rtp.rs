@@ -526,6 +526,9 @@ async fn rtp_output_loop(
                 if ts_sync_found {
                     while ts_realign_buf.len() >= ts_datagram_size {
                         let datagram = ts_realign_buf.split_to(ts_datagram_size);
+                        // PID-bus Phase 8: per-output PCR trust sampler.
+                        let pcr_sample =
+                            crate::engine::ts_parse::first_pcr_in_ts_buffer(&datagram);
                         let header = rtp_wrap.build_header(packet.rtp_timestamp);
                         rtp_send_buf.clear();
                         rtp_send_buf.extend_from_slice(&header);
@@ -535,6 +538,12 @@ async fn rtp_output_loop(
                                 stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                                 stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
                                 stats.record_latency(packet.recv_time_us);
+                                if let Some(pcr) = pcr_sample {
+                                    stats.record_pcr_egress(
+                                        pcr,
+                                        crate::util::time::now_us(),
+                                    );
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!("RTP output '{}' send error: {e}", config.id);
@@ -543,12 +552,23 @@ async fn rtp_output_loop(
                     }
                 }
             } else {
-                // RTP-wrapped data: send as-is (already properly framed)
+                // RTP-wrapped data: send as-is (already properly framed).
+                // Sample PCR from the payload (skip the 12-byte RTP header).
+                let pcr_sample = if packet.data.len() > crate::engine::ts_parse::RTP_HEADER_MIN_SIZE {
+                    crate::engine::ts_parse::first_pcr_in_ts_buffer(
+                        &packet.data[crate::engine::ts_parse::RTP_HEADER_MIN_SIZE..],
+                    )
+                } else {
+                    None
+                };
                 match socket.send_to(&packet.data, dest).await {
                     Ok(sent) => {
                         stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                         stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
                         stats.record_latency(packet.recv_time_us);
+                        if let Some(pcr) = pcr_sample {
+                            stats.record_pcr_egress(pcr, crate::util::time::now_us());
+                        }
                     }
                     Err(e) => {
                         tracing::warn!("RTP output '{}' send error: {e}", config.id);

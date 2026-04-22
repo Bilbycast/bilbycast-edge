@@ -60,6 +60,12 @@ pub mod ts_program_filter;
 pub mod ts_pid_remapper;
 pub mod ts_psi_catalog;
 pub mod ts_es_bus;
+/// Phase 8 PID-bus per-ES analyzer: one lightweight task per
+/// `(input_id, source_pid)` bus key tracking packets, bytes, CC errors,
+/// PCR discontinuity, and last-seen stream_type. Surfaced via
+/// `FlowStats.per_es` alongside the existing flow-level TR-101290
+/// analyzer (which keeps the heavy PES-level work).
+pub mod ts_es_analysis;
 /// Phase 7 PID-bus Hitless merger: pre-bus dedup task that turns one
 /// `SlotSource::Hitless { primary, backup }` slot into a single
 /// synthetic [`ts_es_bus::FlowEsBus`] key the assembler consumes.

@@ -277,10 +277,7 @@ fn publish_chunks(
         data: combined.freeze(),
         sequence_number: *seq_num,
         rtp_timestamp: pts_90khz as u32,
-        recv_time_us: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64,
+        recv_time_us: crate::util::time::now_us(),
         is_raw_ts: true,
     };
     *seq_num = seq_num.wrapping_add(1);

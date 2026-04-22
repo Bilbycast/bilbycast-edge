@@ -1811,8 +1811,8 @@ mod tests {
         let input = vec![vec![1.0_f32], vec![1.0_f32]];
         let mut out = vec![Vec::new(); 1];
         apply_channel_matrix(&input, &m, &mut out).unwrap();
-        // -3 dB sum: 1.0 * 0.7071 + 1.0 * 0.7071 ≈ 1.4142
-        assert!((out[0][0] - 1.414_213_5).abs() < 1e-4);
+        // -3 dB sum: 1.0 * 0.7071 + 1.0 * 0.7071 = sqrt(2)
+        assert!((out[0][0] - std::f32::consts::SQRT_2).abs() < 1e-4);
     }
 
     #[test]

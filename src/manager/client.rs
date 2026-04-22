@@ -1310,11 +1310,25 @@ async fn execute_command(
 
             // Hot-swap the running plan. `replace_assembly` validates,
             // resolves essence, spawns Hitless mergers, and dispatches
-            // PlanCommand::ReplacePlan to the running assembler.
-            runtime
-                .replace_assembly(new_assembly.clone())
-                .await
-                .map_err(|e| e.to_string())?;
+            // PlanCommand::ReplacePlan to the running assembler. On
+            // failure it emits a Critical event carrying the structured
+            // `pid_bus_*` `error_code` before bubbling the anyhow error
+            // (see `build_assembly_plan` + `essence_error_to_event` in
+            // `engine/flow.rs`). Recover that code from the in-process
+            // recent-critical tracker so the manager UI can map it onto
+            // a specific assembly-editor field. Without this, the UI
+            // banner says the right thing but no field gets highlighted.
+            let swap_start = std::time::Instant::now();
+            if let Err(e) = runtime.replace_assembly(new_assembly.clone()).await {
+                let code = runtime
+                    .event_sender
+                    .take_recent_critical_for_flow(flow_id, swap_start)
+                    .and_then(|c| c.error_code);
+                return Err(match code {
+                    Some(c) => CommandError::with_code(e.to_string(), c),
+                    None => CommandError::new(e.to_string()),
+                });
+            }
 
             // Persist to config.json so the change survives restart.
             let mut cfg = app_config.write().await;

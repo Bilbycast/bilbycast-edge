@@ -99,13 +99,6 @@ pub struct AssemblySlot {
     pub stream_type: u8,
 }
 
-// Legacy alias — kept only as a documentation breadcrumb for the
-// Phase 5 vocabulary. Not actually used in-tree after MPTS; prefer
-// [`AssemblyPlan`] everywhere new.
-#[deprecated(note = "use AssemblyPlan + programs vec")]
-#[allow(dead_code)]
-pub type SptsPlan = AssemblyPlan;
-
 /// Runtime commands the assembler accepts via its `mpsc` channel.
 ///
 /// Phase 7 adds `ReplacePlan` — used by `update_flow_assembly` to swap
@@ -129,6 +122,10 @@ pub enum PlanCommand {
 /// mutation call-sites can target the same flow.
 #[derive(Debug)]
 pub struct AssemblerHandle {
+    /// Task handle. Production shuts the assembler down via
+    /// `CancellationToken`, so this handle is read only in tests that
+    /// assert clean shutdown with `join.await`.
+    #[allow(dead_code)]
     pub join: JoinHandle<()>,
     pub plan_tx: mpsc::Sender<PlanCommand>,
 }
@@ -801,7 +798,7 @@ const _: u16 = PAT_PID;
 //
 // Kept in this module (rather than a standalone `ts_essence_resolver`)
 // because it's purely plan-building — it never touches the data path
-// and its inputs/outputs mirror the assembler's `SptsPlan` shape.
+// and its inputs/outputs mirror the assembler's `AssemblyPlan` shape.
 
 /// Broad elementary-stream kind, independent of the config crate so the
 /// resolver can be unit-tested in isolation. Mirrors
@@ -864,7 +861,7 @@ pub struct PendingHitlessSlot {
 /// as a normal `(hitless:{uid}, 0)` source.
 #[derive(Debug, Clone)]
 pub struct SptsBuildResult {
-    pub plan: SptsPlan,
+    pub plan: AssemblyPlan,
     pub pending_essence: Vec<PendingEssenceSlot>,
     pub pending_hitless: Vec<PendingHitlessSlot>,
 }

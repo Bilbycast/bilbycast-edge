@@ -340,9 +340,15 @@ impl FlowRuntime {
             // Register per-input liveness counters. The forwarder increments
             // these on every packet arriving from this input's broadcast
             // channel so the manager UI can surface NO SIGNAL / feed-present
-            // state for passive inputs too.
-            let per_input_counters = flow_stats
-                .register_input_counters(&input_id, input_type_str(&input_def.config));
+            // state for passive inputs too. The `InputConfigMeta` attached
+            // here is what the snapshot path lifts into `PerInputLive` so
+            // the manager topology view can draw upstream links for every
+            // input of an assembled flow — not only the single active one.
+            let per_input_counters = flow_stats.register_input_counters(
+                &input_id,
+                input_type_str(&input_def.config),
+                build_input_config_meta(&input_def.config),
+            );
 
             #[cfg(feature = "webrtc")]
             let mut this_whip_info: Option<(tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>, Option<String>)> = None;
@@ -786,6 +792,29 @@ impl FlowRuntime {
                     build.plan.programs.len(),
                     total_slots,
                 );
+
+                // Phase 8: spawn one per-ES analyzer per slot, keyed by
+                // (input_id, source_pid). Also snapshot the (input_id,
+                // source_pid) → out_pid routing onto the flow stats so
+                // per-ES snapshots can annotate `out_pid`. Snapshot is
+                // refreshed on every runtime swap inside
+                // `FlowRuntime::replace_assembly`.
+                let mut routing: std::collections::HashMap<(String, u16), u16> =
+                    std::collections::HashMap::new();
+                for prog in &build.plan.programs {
+                    for slot in &prog.slots {
+                        routing.insert(slot.source.clone(), slot.out_pid);
+                        let _ = crate::engine::ts_es_analysis::spawn_per_es_analyzer(
+                            slot.source.0.clone(),
+                            slot.source.1,
+                            bus.clone(),
+                            flow_stats.clone(),
+                            cancel_token.child_token(),
+                        );
+                    }
+                }
+                flow_stats.set_pid_routing(routing);
+
                 Some(spawn_spts_assembler(
                     build.plan,
                     bus.clone(),
@@ -1218,6 +1247,33 @@ impl FlowRuntime {
                 self.cancel_token.child_token(),
             );
         }
+
+        // Phase 8: refresh the per-ES routing snapshot (so snapshots
+        // pick up renumbered out_pids) and spawn analyzers for any
+        // newly-referenced `(input_id, source_pid)` keys. Analyzers for
+        // PIDs that leave the plan keep running until flow teardown —
+        // their counters are still valid for retrospective inspection
+        // even when the assembler no longer forwards them.
+        let mut routing: std::collections::HashMap<(String, u16), u16> =
+            std::collections::HashMap::new();
+        for prog in &build.plan.programs {
+            for slot in &prog.slots {
+                routing.insert(slot.source.clone(), slot.out_pid);
+                // per_es_acc is idempotent — first call creates, subsequent
+                // calls return the same Arc. Safe to call every swap.
+                let already_spawned = self.stats.per_es_stats.contains_key(&slot.source);
+                if !already_spawned {
+                    let _ = crate::engine::ts_es_analysis::spawn_per_es_analyzer(
+                        slot.source.0.clone(),
+                        slot.source.1,
+                        bus.clone(),
+                        self.stats.clone(),
+                        self.cancel_token.child_token(),
+                    );
+                }
+            }
+        }
+        self.stats.set_pid_routing(routing);
 
         handle
             .plan_tx
@@ -2243,24 +2299,31 @@ fn es_kind_from_config(k: EssenceKind) -> EsKind {
 }
 
 /// Resolve a [`FlowAssembly`] with `kind = spts` or `kind = mpts` into
-/// an [`SptsBuildResult`], enforcing Phase 5 + Phase 6 + MPTS scope
-/// guards:
+/// an [`SptsBuildResult`]. Scope guards enforced here:
 ///
-/// - every output on the flow must be `OutputConfig::Udp`
-///   (`error_code: pid_bus_spts_non_udp_output`)
-/// - every input on the flow must produce MPEG-TS (`is_ts_carrier()`),
+/// - Every input on the flow must produce MPEG-TS (`is_ts_carrier()`),
 ///   with a sharpened error code when the input *could* produce TS via
-///   the input-level `audio_encode` encoder but isn't configured to
+///   the input-level `audio_encode` encoder but isn't configured to —
 ///   (`error_codes: pid_bus_spts_input_needs_audio_encode`,
-///   `pid_bus_spts_non_ts_input`)
-/// - slot sources may be `SlotSource::Pid` (resolved here) or
-///   `SlotSource::Essence` (deferred to the Phase 6 resolver).
-///   `SlotSource::Hitless` is still rejected loudly
-///   (`error_code: pid_bus_spts_hitless_not_implemented`)
+///   `pid_bus_audio_encode_codec_not_supported_on_input`,
+///   `pid_bus_spts_non_ts_input`).
+/// - There is **no output-type gate**. The assembler stamps synthesised
+///   RTP metadata (monotonic u16 sequence + 90 kHz timestamp derived
+///   from the emission clock) so every existing output — UDP, RTP (with
+///   or without 2022-1 FEC / 2022-7), SRT, RIST, HLS, CMAF, RTMP,
+///   WebRTC — treats the assembled SPTS/MPTS as a first-class TS-
+///   bearing source.
+/// - Slot sources may be `SlotSource::Pid` (resolved here),
+///   `SlotSource::Essence` (resolved against the input's PSI catalogue —
+///   `pid_bus_essence_{kind_not_implemented,no_catalogue,no_match}`), or
+///   `SlotSource::Hitless` (pre-bus merger spawned in
+///   `FlowRuntime::start`; each leg must itself be `Pid` or `Essence` —
+///   `pid_bus_hitless_leg_not_pid`).
 /// - `pcr_source` existence is validated here; the match against a
 ///   concrete slot is deferred until after essence resolution and
 ///   surfaced as `pid_bus_pcr_source_unresolved` if it still doesn't
-///   hit.
+///   hit. MPTS programs without an effective PCR produce
+///   `pid_bus_mpts_pcr_source_required`.
 ///
 /// Every failure path emits a Critical event *before* bailing so the
 /// manager UI can highlight the offending assembly field without having

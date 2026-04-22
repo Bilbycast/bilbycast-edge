@@ -60,6 +60,7 @@ pub struct EsPacket {
     /// Original PID on the source stream. Useful for debugging and for
     /// PSI-version cross-checks; the assembler rewrites this to the
     /// configured `out_pid` before emission.
+    #[allow(dead_code)]
     pub source_pid: u16,
     /// PMT-declared `stream_type` at the time this packet was published.
     /// Lets the assembler cross-check against its configured plan and
@@ -69,6 +70,7 @@ pub struct EsPacket {
     pub payload: Bytes,
     /// Payload-Unit-Start Indicator — true when this TS packet begins a
     /// new PES.
+    #[allow(dead_code)]
     pub is_pusi: bool,
     /// True when this packet carries a PCR in its adaptation field.
     pub has_pcr: bool,
@@ -77,6 +79,7 @@ pub struct EsPacket {
     pub pcr: Option<u64>,
     /// `recv_time_us` carried through from the upstream `RtpPacket`
     /// — lets downstream PCR-accuracy monitors measure jitter.
+    #[allow(dead_code)]
     pub recv_time_us: u64,
 }
 
@@ -122,6 +125,7 @@ impl FlowEsBus {
 
     /// Snapshot the currently-registered `(input_id, source_pid)` keys.
     /// Useful for debug logging / stats.
+    #[allow(dead_code)]
     pub fn keys(&self) -> Vec<(String, u16)> {
         self.channels.iter().map(|e| e.key().clone()).collect()
     }

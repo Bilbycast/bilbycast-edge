@@ -242,6 +242,28 @@ encoder supervisor (`engine::audio_encode::supervisor_loop`).
 
 ---
 
+### PID bus / Flow Assembly (`flow`)
+
+Critical events emitted by `build_assembly_plan()` at flow bring-up and by `FlowRuntime::replace_assembly()` on runtime hot-swap when an `assembly` block fails to resolve. Every event carries a structured `details` block — at minimum `{ "error_code": "..." }`, usually plus `input_id`, `input_type`, `program_number`, etc. The manager UI matches on `error_code` to highlight the offending form field without parsing the error string.
+
+| `error_code` | When | Typical `details` | Notes |
+|---|---|---|---|
+| `pid_bus_spts_input_needs_audio_encode` | Flow bring-up: a referenced input could produce TS via input-level `audio_encode` but isn't configured. | `{ input_id, input_type }` | Set `audio_encode.codec = "aac_lc"` (or HE-AAC / s302m) on the input. ST 2110-31 must use `s302m`. |
+| `pid_bus_audio_encode_codec_not_supported_on_input` | Flow bring-up: `audio_encode.codec` validates but has no Phase 6.5 runtime path (today: `mp2`, `ac3`). | `{ input_id, input_type }` | First-light codecs: `aac_lc`, `he_aac_v1`, `he_aac_v2`, `s302m`. `mp2` / `ac3` deferred. |
+| `pid_bus_spts_non_ts_input` | Flow bring-up: referenced input has no current path to TS (ST 2110-40 ANC, or a non-TS input without an `audio_encode` escape hatch). | `{ input_id, input_type }` | ST 2110-40 ANC-to-TS wrapping is deferred. |
+| `pid_bus_no_program` | Flow bring-up: `assembly.kind = spts/mpts` but `programs` is empty. | `{}` | Should not normally reach runtime — config validation catches this earlier. |
+| `pid_bus_essence_kind_not_implemented` | Flow bring-up: `SlotSource::Essence` with a `kind` the resolver can't yet satisfy. | `{ input_id, kind }` | First-light supports `video` and `audio`; `subtitle` / `data` under development. |
+| `pid_bus_essence_no_catalogue` | Flow bring-up: Essence slot but the named input has no PSI catalogue yet (non-TS input or ingress not warm). | `{ input_id }` | Switch to a `SlotSource::Pid` slot, or wait for PSI; re-try with `UpdateFlowAssembly`. |
+| `pid_bus_essence_no_match` | Flow bring-up: Essence slot of kind X, but no matching ES found in the input's PMT. | `{ input_id, kind }` | Check the input's live PSI catalogue in the manager UI. |
+| `pid_bus_spts_stream_type_mismatch` | Warning logged when a slot's configured `stream_type` doesn't match the source PMT's declared `stream_type`. | `{ input_id, source_pid, configured, observed }` | Non-fatal — the slot still forwards bytes. Fix the `stream_type` on the slot to match the upstream PMT. |
+| `pid_bus_hitless_leg_not_pid` | Flow bring-up: a `SlotSource::Hitless` leg is neither `Pid` nor `Essence`. | `{ program_number, leg: "primary"/"backup" }` | Nested Hitless is rejected at config-save time; this fires only if a follow-up variant slips past validation. |
+| `pid_bus_mpts_pcr_source_required` | Flow bring-up: MPTS program has no effective PCR (neither program-level `pcr_source` nor flow-level fallback). | `{ program_number }` | Config validation also catches this — runtime check is a belt-and-braces guard. |
+| `pid_bus_pcr_source_unresolved` | Flow bring-up: configured `pcr_source` `(input_id, pid)` doesn't hit any slot in its program (or in an Essence-slot's input). | `{ input_id, pid, program_number }` | Make sure the PCR PID is one of the PIDs you're carrying into the program. |
+
+**Source:** `src/engine/flow.rs` (`build_assembly_plan`, `non_ts_spts_error_code`, `resolve_essence_slots`), `src/engine/ts_assembler.rs`. The edge manager-WS client also lifts these codes onto `command_ack.error_code` for `UpdateFlowAssembly` so the manager UI can highlight the offending field without needing the event stream.
+
+---
+
 ### Video Encoder (`video_encode`)
 
 In-process video transcoding lifecycle for TS outputs (SRT, RIST, RTP, UDP).

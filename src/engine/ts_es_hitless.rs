@@ -40,7 +40,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, Instant};
 use tokio_util::sync::CancellationToken;
 
-use super::ts_es_bus::{EsPacket, FlowEsBus};
+use super::ts_es_bus::FlowEsBus;
 
 /// Default stall timer: if no primary packet arrives within this
 /// window the merger flips to backup. Tight enough that standby cuts
@@ -138,6 +138,7 @@ pub fn spawn_hitless_es_merger(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::ts_es_bus::EsPacket;
     use bytes::Bytes;
 
     fn es(pid: u16, byte: u8) -> EsPacket {

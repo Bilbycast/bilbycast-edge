@@ -486,11 +486,25 @@ async fn udp_output_loop(
             if ts_sync_found {
                 while ts_buf.len() >= ts_datagram_size {
                     let datagram = ts_buf.split_to(ts_datagram_size);
+                    // Sample the first PCR-bearing TS packet in this
+                    // datagram for the Phase 8 per-output PCR trust
+                    // metric. `first_pcr_in_ts_buffer` is cheap
+                    // (O(n_packets) with 1 AF-flag check per packet) and
+                    // bails on the first hit. Run *before* the blocking
+                    // send so the wall clock we sample corresponds to
+                    // the actual egress moment as closely as possible.
+                    let pcr_sample = crate::engine::ts_parse::first_pcr_in_ts_buffer(&datagram);
                     match socket.send_to(&datagram, dest).await {
                         Ok(sent) => {
                             stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                             stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
                             stats.record_latency(packet.recv_time_us);
+                            if let Some(pcr) = pcr_sample {
+                                stats.record_pcr_egress(
+                                    pcr,
+                                    crate::util::time::now_us(),
+                                );
+                            }
                         }
                         Err(e) => {
                             tracing::warn!("UDP output '{}' send error: {e}", config.id);

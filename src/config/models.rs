@@ -3359,6 +3359,43 @@ mod tests {
         assert_eq!(parsed.assembly, reparsed.assembly);
     }
 
+    /// The PID-bus manager UI (`node_config.html` + `assembly_editor.js`)
+    /// writes `FlowAssembly` JSON in exactly the shape emitted by the edge
+    /// here. This test pins that contract by deserialising every
+    /// testbed probe config through `AppConfig`, then re-serialising and
+    /// re-parsing. Any drift (field rename, new non-optional field,
+    /// tag change on `SlotSource`) breaks the UI round-trip and this
+    /// catches it loudly.
+    #[test]
+    fn pid_bus_testbed_configs_roundtrip_exactly() {
+        // Five configs, one per probe harness: Phase 5 explicit-Pid,
+        // Phase 6 Essence, MPTS, Phase 6.5 decoded-ES, Phase 7
+        // runtime-swap target. Each exercises a different SPTS/MPTS +
+        // SlotSource combination the UI must round-trip.
+        let paths = [
+            "../testbed/pid-bus-spts/config.json",
+            "../testbed/pid-bus-spts/config-essence.json",
+            "../testbed/pid-bus-spts/config-mpts.json",
+            "../testbed/pid-bus-spts/config-decoded-es.json",
+            "../testbed/pid-bus-spts/config-switch.json",
+        ];
+        for p in paths {
+            let text = match std::fs::read_to_string(p) {
+                Ok(t) => t,
+                Err(_) => continue, // testbed may be absent in CI
+            };
+            let parsed: AppConfig = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("parse {p}: {e}"));
+            let reser = serde_json::to_string(&parsed).unwrap();
+            let reparsed: AppConfig = serde_json::from_str(&reser)
+                .unwrap_or_else(|e| panic!("reparse {p}: {e}"));
+            // Assembly blocks must survive round-trip byte-identically.
+            for (a, b) in parsed.flows.iter().zip(reparsed.flows.iter()) {
+                assert_eq!(a.assembly, b.assembly, "assembly drift in {p}");
+            }
+        }
+    }
+
     /// Absent `assembly` must not appear in the JSON and must still
     /// parse back as `None` — keeps legacy flows byte-clean on the wire.
     #[test]

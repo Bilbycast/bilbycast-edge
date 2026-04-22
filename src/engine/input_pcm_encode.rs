@@ -60,6 +60,7 @@ use crate::stats::collector::OutputStatsAccumulator;
 /// shared [`TsMuxer`] already bakes in. The `TsEsDemuxer` on the receive
 /// side learns this PID from the synthesised PMT — the value here is
 /// documentation only, the wire bytes are authoritative.
+#[allow(dead_code)]
 pub const SYNTH_AUDIO_PID: u16 = 0x0101;
 
 /// Errors raised when constructing a [`PcmInputProcessor`] or driving it.
@@ -211,6 +212,7 @@ impl PcmInputProcessor {
     /// * `flow_id`, `input_id` are tracing labels passed down to the encoder.
     ///
     /// Returns `Ok(None)` when neither block is set.
+    #[cfg(test)]
     pub fn new(
         in_sample_rate: u32,
         in_bit_depth: u8,

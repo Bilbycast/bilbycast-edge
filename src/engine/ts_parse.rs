@@ -67,6 +67,33 @@ pub fn ts_discontinuity_indicator(pkt: &[u8]) -> bool {
     (pkt[5] & 0x80) != 0
 }
 
+/// Scan a raw TS buffer (one or more aligned 188-byte packets) and return
+/// the PCR carried by the **first** PCR-bearing packet, in 27 MHz ticks.
+///
+/// Used by output send paths to feed the per-output PCR trust sampler
+/// (`OutputStatsAccumulator::record_pcr_egress`). Returns `None` when the
+/// buffer carries no PCR — e.g. audio-only frames, or PAT/PMT-only
+/// bundles. Reports only the first to keep the hot path O(frame_size) at
+/// one branch per packet.
+///
+/// The buffer is assumed to start on a TS packet boundary (`0x47` sync).
+/// Callers that hand us an RTP-wrapped buffer must strip the RTP header
+/// first; cheap because every caller already distinguishes raw-TS vs
+/// RTP-wrapped paths via `RtpPacket.is_raw_ts`.
+pub fn first_pcr_in_ts_buffer(data: &[u8]) -> Option<u64> {
+    let mut i = 0;
+    while i + TS_PACKET_SIZE <= data.len() {
+        let pkt = &data[i..i + TS_PACKET_SIZE];
+        if pkt[0] == TS_SYNC_BYTE {
+            if let Some(pcr) = extract_pcr(pkt) {
+                return Some(pcr);
+            }
+        }
+        i += TS_PACKET_SIZE;
+    }
+    None
+}
+
 /// Extract the 42-bit PCR base and 9-bit extension from the adaptation field,
 /// returning the full PCR value in 27 MHz ticks.
 pub fn extract_pcr(pkt: &[u8]) -> Option<u64> {

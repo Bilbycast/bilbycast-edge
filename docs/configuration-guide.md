@@ -475,6 +475,7 @@ At startup (or on create/update), `AppConfig::resolve_flow()` dereferences the I
 | `bandwidth_limit` | object | No | `null` | Per-flow bandwidth monitoring (RP 2129). See [Bandwidth Limit](#bandwidth-limit). |
 | `input_ids` | array of strings | No | `[]` | IDs of inputs from the top-level `inputs` array. Each referenced input must exist and must not already be assigned to another flow. At most one input may be active at a time. Can be empty (output-only flow). |
 | `output_ids` | array of strings | No | `[]` | IDs of outputs from the top-level `outputs` array. Each referenced output must exist and must not already be assigned to another flow. Can be empty (input-only flow). |
+| `assembly` | object | No | `null` | Optional PID-bus assembly block. `null` (or `"kind": "passthrough"`) = legacy passthrough. Set `"kind": "spts"` / `"mpts"` to build a fresh TS from elementary streams pulled off any of the flow's inputs. See [Flow Assembly (PID bus)](#flow-assembly-pid-bus--spts--mpts-from-n-inputs). |
 
 ### Multi-Input Flows and Seamless Switching
 
@@ -1111,6 +1112,164 @@ fails fast on the first frame and emits the failure event.
 
 ---
 
+## Flow Assembly (PID bus — SPTS / MPTS from N inputs)
+
+A flow can optionally carry an `assembly` block that tells the runtime to stop forwarding one input verbatim and instead **build a fresh MPEG-TS from elementary streams pulled off any of the flow's inputs**. The same broadcast channel that a passthrough flow uses then carries the assembled TS, so every existing output type consumes it unchanged — UDP, RTP (with or without 2022-1 FEC / 2022-7), SRT (incl. bonded / 2022-7), RIST (incl. ARQ), RTMP/RTMPS, HLS, CMAF / CMAF-LL (incl. ClearKey CENC), WebRTC WHIP/WHEP. RTMP and WebRTC demux one program out by default (lowest `program_number` in the PAT, or the output-level `program_number` override).
+
+Flows without an `assembly` block — or with `assembly.kind = passthrough` — run exactly as before. Existing configs are unaffected.
+
+### `assembly.kind`
+
+| Kind | What it builds | Program count | PCR requirement |
+|------|----------------|---------------|-----------------|
+| `passthrough` | No assembly. Forwards the active input's bytes. Runtime-equivalent to `"assembly": null`. | must be empty (`programs = []`) | must be absent |
+| `spts` | Single-program TS synthesised from selected ES slots. | exactly one program | flow-level *or* program-level `pcr_source` required (program-level wins) |
+| `mpts` | Multi-program TS with fresh PAT listing every program and one synthesised PMT per program. | one or more programs, unique `program_number` per program | every program needs an effective `pcr_source` (its own, or the flow-level fallback) |
+
+### Minimal SPTS example — mixing video from input A with audio from input B
+
+```json
+{
+  "id": "mixed-feed",
+  "name": "Mixed Feed",
+  "input_ids": ["cam-a", "mic-b"],
+  "output_ids": ["udp-out", "srt-out"],
+  "assembly": {
+    "kind": "spts",
+    "pcr_source": { "input_id": "cam-a", "pid": 256 },
+    "programs": [
+      {
+        "program_number": 1,
+        "service_name": "Mixed",
+        "pmt_pid": 4096,
+        "streams": [
+          { "source": { "type": "pid", "input_id": "cam-a", "source_pid": 256 }, "out_pid": 256, "stream_type": 27,  "label": "Video (cam A)" },
+          { "source": { "type": "pid", "input_id": "mic-b", "source_pid": 257 }, "out_pid": 257, "stream_type": 15,  "label": "Audio (mic B)" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### Minimal MPTS example — two programs from three inputs
+
+```json
+"assembly": {
+  "kind": "mpts",
+  "pcr_source": { "input_id": "cam-a", "pid": 256 },
+  "programs": [
+    {
+      "program_number": 1,
+      "service_name": "Studio 1",
+      "pmt_pid": 4096,
+      "pcr_source": { "input_id": "cam-a", "pid": 256 },
+      "streams": [
+        { "source": { "type": "pid", "input_id": "cam-a", "source_pid": 256 }, "out_pid": 256, "stream_type": 27 },
+        { "source": { "type": "essence", "input_id": "mic-a", "kind": "audio" }, "out_pid": 257, "stream_type": 15 }
+      ]
+    },
+    {
+      "program_number": 2,
+      "service_name": "Studio 2",
+      "pmt_pid": 4112,
+      "pcr_source": { "input_id": "cam-b", "pid": 256 },
+      "streams": [
+        { "source": { "type": "pid", "input_id": "cam-b", "source_pid": 256 }, "out_pid": 272, "stream_type": 36 },
+        { "source": { "type": "pid", "input_id": "cam-b", "source_pid": 257 }, "out_pid": 273, "stream_type": 15 }
+      ]
+    }
+  ]
+}
+```
+
+### Slot `source` — where the bytes come from
+
+Every slot in a program's `streams[]` has a `source` picked from three variants:
+
+- **`"pid"`** — explicit PID off a named input: `{ "type": "pid", "input_id": "...", "source_pid": 256 }`. Use when the operator knows the exact upstream PID (picked from the input's live PSI catalogue, or published in a written spec).
+- **`"essence"`** — first ES of a given kind off a named input: `{ "type": "essence", "input_id": "...", "kind": "video" | "audio" | "subtitle" | "data" }`. Useful when the upstream input is single-program and the operator just wants "its video" / "its audio" without binding to a specific PID. Resolves at flow start against the input's PSI catalogue (Phase 2); re-resolves on `UpdateFlowAssembly`.
+- **`"hitless"`** — primary-preference pre-bus merger: `{ "type": "hitless", "primary": { <slot source> }, "backup": { <slot source> } }`. Both legs publish onto the bus independently; a merger task forwards primary verbatim and flips to backup if no primary packet arrives for 200 ms. Primary traffic resumption brings the merger back after a short hold-off. **Not SMPTE 2022-7 sequence-aware dedup** — the bus today doesn't carry upstream RTP sequence numbers. Either nested leg must itself be `pid` or `essence`; a Hitless nested inside another Hitless is rejected.
+
+### PCR rules
+
+- **SPTS** — needs exactly one PCR reference. Either set `FlowAssembly.pcr_source` at the top of the assembly, or set `pcr_source` on the one program. If both are set, the program-level wins. The referenced `(input_id, pid)` must resolve to a concrete slot (or an Essence slot's input) in the program, otherwise flow bring-up emits `pid_bus_pcr_source_unresolved` and the flow fails to start.
+- **MPTS** — every program needs an effective PCR — its own `pcr_source`, or the flow-level fallback. Validation emits an error at config-save time if any program has neither. Per-program PCR enforces the H.222.0 rule that a program's `PCR_PID` must be one of its own ES PIDs.
+- The chosen PCR rides byte-for-byte onto the assembled TS; the synthesised PMT's `PCR_PID` field points at that slot's `out_pid`.
+
+### Input requirements — what can feed the bus
+
+Every input referenced by any slot must either already produce MPEG-TS on the broadcast channel, or be configured so the runtime can wrap it into TS before publishing to the bus.
+
+**Inputs that produce TS natively (always eligible):**
+SRT, UDP, RTP (with `is_raw_ts: true`), RIST, RTMP (after the built-in FLV→TS muxer), RTSP, WebRTC WHIP/WHEP, ST 2110-20, ST 2110-23, Bonded, TestPattern.
+
+**PCM / AES3 inputs that become TS when `audio_encode` is set on the input:**
+- ST 2110-30 (L16/L24 PCM) — set `audio_encode.codec` to `aac_lc` / `he_aac_v1` / `he_aac_v2` or `s302m`.
+- `rtp_audio` — same codecs as ST 2110-30.
+- ST 2110-31 (AES3 transparent) — **only** `s302m` is valid (validator enforces; the 337M sub-frames ride through the 302M wrap bit-for-bit).
+
+Without `audio_encode` set, an assembly referencing one of these inputs fails bring-up with `pid_bus_spts_input_needs_audio_encode`.
+
+**Inputs that have no current path to TS:**
+- ST 2110-40 (ancillary data) — wrapping ANC into TS is deferred; referencing one emits `pid_bus_spts_non_ts_input`.
+
+**Codec support on the decoded-ES cache** (what `audio_encode.codec` actually does at runtime): `aac_lc`, `he_aac_v1`, `he_aac_v2`, `s302m`. `mp2` and `ac3` parse and validate successfully but fail loudly at flow bring-up with `pid_bus_audio_encode_codec_not_supported_on_input` until the matching TsMuxer wrappers land.
+
+### Validation rules (config-save + WS command time)
+
+All rejected at `AppConfig::validate()` → `validate_flow_assembly()` with a clear `context:` error. None of these conditions can slip past to runtime:
+
+- **Passthrough** must have empty `programs` and no `pcr_source`.
+- **SPTS** must have exactly one program.
+- **MPTS** must have at least one program, all with unique `program_number` and unique `pmt_pid`.
+- Every referenced `input_id` must be in `flow.input_ids`.
+- `program_number` must be `> 0` (0 is reserved for the NIT).
+- `pmt_pid` and `out_pid` must be in `0x0010..=0x1FFE` (reserved PIDs and the NULL PID are refused).
+- Within a program, every `out_pid` must be unique and must not equal that program's `pmt_pid`.
+- `service_name` ≤ 128 chars; slot `label` ≤ 256 chars.
+- SPTS: flow-level `pcr_source` or the one program's `pcr_source` must be set.
+- MPTS: every program's effective `pcr_source` (own or flow-level fallback) must be set.
+- When `pcr_source` resolves concretely, it must hit one of that program's slots (Pid match) or one of its Essence-slot inputs.
+- **Hitless** nested inside a Hitless is rejected.
+- Non-TS inputs without `audio_encode` (or with a non-runtime `audio_encode.codec`) are rejected at flow bring-up with a specific `pid_bus_*` error code (see Event reference).
+
+### Runtime behaviour
+
+- The assembler subscribes to the per-ES bus (`(input_id, source_pid) → EsPacket`), rewrites each 188-byte TS packet's PID to the configured `out_pid`, stamps a per-out-PID monotonic continuity counter, bundles 7 TS packets into MTU-safe 1316-byte RTP packets, and publishes them onto the flow's existing broadcast channel — exactly where a passthrough forwarder would.
+- PAT and PMT are **synthesised** on a 100 ms cadence. When the PAT set changes, `PAT.version_number` bumps mod 32. When a program's slot composition or `pcr_source` changes, that program's `PMT.version_number` bumps mod 32 — both counters advance monotonically across swaps to avoid the phantom-version collision bug `TsContinuityFixer` already handles for passthrough switching.
+- PCR rides onto the TS byte-for-byte from the referenced slot's source packets.
+- A 10 ms safety-net flush keeps partially-filled bundles shipping during sparse periods (audio-only idle, keyframe gaps, etc.) so downstream sockets never see multi-second silence.
+- Backpressure: slot fan-ins are `broadcast::Receiver<EsPacket>`. Slow consumers get `RecvError::Lagged(n)` and drop — the demuxer side never blocks.
+
+### Runtime swaps (`UpdateFlowAssembly`)
+
+The assembly plan is **hot-swappable**. A manager `UpdateFlowAssembly` WS command, or a direct `PUT /api/v1/flows/{flow_id}/assembly` REST call on the edge, replaces the running plan without tearing the flow down:
+
+- Slots that are unchanged keep their existing bus fan-in tasks — no packet gap.
+- Slots whose source, `out_pid`, `stream_type`, or `label` changed have their fan-ins re-spawned; fan-ins for removed slots are cancelled.
+- Per-program `PMT.version_number` bumps for any program whose composition or PCR source changed.
+- `PAT.version_number` bumps only when the set of programs changed (added / removed / renumbered).
+- PSI is re-emitted immediately on swap so receivers see the new PMT before any packet lands on a new `out_pid` — prevents ffprobe from briefly seeing TS bytes on an unknown PID.
+- Persists to `config.json` only after the swap succeeds. A no-op swap (new assembly deserialises byte-equal to current) is a silent short-circuit.
+- Transitions across the passthrough boundary (passthrough ↔ spts/mpts) are **not hot-swappable** — those require a full `UpdateFlow` round-trip because the plumbing on the flow changes (bus + assembler spawn vs. direct broadcast).
+
+### Interaction with output-level PID remap (`pid_map`)
+
+Assembly owns the PID layout of the TS it produces (`out_pid` per slot, `pmt_pid` per program, whatever the PCR slot got assigned). An output's `pid_map` (see [TS output PID remapping](#ts-output-pid-remapping)) applies **after** the assembly on the way out, so you can publish one assembled PID layout and then re-label it per output if an external downstream has hard-coded PID expectations. Not recommended as the default path — pick `out_pid` values that already match downstream expectations in the assembly.
+
+### Monitoring
+
+Once running, an assembled flow exposes:
+
+- **Flow-card badge** — `SPTS ASSEMBLED` / `MPTS ASSEMBLED` (cyan) in the manager UI.
+- **Assembled Output section** on the flow card — one sub-table per program listing each slot's `out_pid`, `stream_type`, resolved `kind`, source label (or Hitless(A/B)), live bitrate, packets, CC errors, PCR discontinuity counters from `FlowStats.per_es[]`.
+- **Per-output PCR trust** — `p50 / p99` columns on the Outputs table, fed by `OutputStats.pcr_trust`.
+- **Flow-rollup PCR trust** — `FlowStats.pcr_trust_flow` (Samples, p50 / p95 / p99 / Max / Window p95) rendered at the bottom of the flow card.
+- **Events** — every `pid_bus_*` error code (see [Event reference](events-and-alarms.md)) rides as a Critical event with structured `details` (`error_code`, `input_id`, `input_type`, `program_number`, ...) so the manager UI can highlight the offending form field on Create/Update modals without parsing the error string.
+
+---
+
 ## MPTS → SPTS filtering
 
 All outputs — and the thumbnail generator — accept an optional `program_number` selector for down-selecting an MPTS (Multi-Program Transport Stream) input to a single program. Whether the filter rewrites TS bytes or just picks which elementary streams to extract depends on the output type.
@@ -1172,6 +1331,31 @@ The archive receives the full MPTS. The `prog1-viewer` UDP output sends only pro
 
 ---
 
+## TS output PID remapping (`pid_map`)
+
+Every TS-carrying output (`udp`, `rtp`, `srt`, `rist`, `hls`, `bonded`) accepts an optional `pid_map` that rewrites PIDs on the way out. Each entry is `source → target`; the PAT / PMT CRCs are recomputed so downstream decoders see a consistent stream. Use when a downstream system has hard-coded PID expectations that don't match the upstream layout (or the assembly's `out_pid` values).
+
+```json
+{
+  "id": "srt-to-legacy",
+  "type": "srt",
+  "mode": "caller",
+  "remote_addr": "203.0.113.10:9000",
+  "pid_map": { "256": 2064, "257": 2068, "4096": 1001 }
+}
+```
+
+### Rules (validated at config load and on WS command)
+
+- Maximum 256 entries.
+- Source and target PIDs must be in `0x0010..=0x1FFE` (reserved PIDs 0x0000–0x000F, PAT/CAT, and the NULL PID 0x1FFF are refused).
+- A source PID cannot map to itself (no-ops are rejected to keep intent explicit).
+- Source PIDs must be unique; target PIDs must be unique — so two different sources can never collide on the wire.
+- Applies to the whole TS stream on that output, including PSI PIDs. If you remap a PMT PID, set the `pmt_pid` on the corresponding assembly program to the *source* value — the `pid_map` rewrites it on egress.
+- Works equally on passthrough flows (rewrites upstream PIDs) and assembled flows (rewrites the assembly's `out_pid` values). For assembled flows, prefer picking the right `out_pid` in the assembly — `pid_map` is an escape hatch for downstream constraints you can't change.
+
+---
+
 ## SMPTE 2022-1 FEC Configuration
 
 Forward Error Correction parameters used by `fec_decode` (on RTP inputs) and `fec_encode` (on RTP outputs).
@@ -1229,6 +1413,18 @@ For output: packets are duplicated and sent on both legs simultaneously.
 | `crypto_mode` | string | No | `null` | Cipher mode for leg 2: `"aes-ctr"` or `"aes-gcm"`. |
 
 Legs can use different SRT modes, different ports, different latency values, and even different encryption settings (though using the same settings is recommended for simplicity).
+
+### Sender pacing (`max_bw`) under 2022-7
+
+When the edge is the **SRT sender** on a 2022-7 pair, both legs share the same process, the same `srt-io` I/O thread, and the same upstream packet stream — so any sender-side drop correlates across legs and the hitless merger has no other copy to recover from. libsrt's live-mode *send pacer* (enabled when `max_bw = 0`) uses an internal input-bandwidth estimator that is conservative during the first ~1 second of a new session. A bursty upstream (`ffmpeg -re` file read, a camera emptying a kernel buffer on session start, an RTSP source after reconnection) can outrun that estimator and cause libsrt to drop packets from its own send buffer past `send_drop_delay` — the receiver never sees them, logs `RCV-DROPPED N packet(s). Packet seqno %X delayed for ~700 ms`, and with FEC on top the gap can exceed the FEC matrix and trip libsrt's `SRT.pf: FEC: IPE` internal program error on the receiver.
+
+Current bilbycast-edge defaults `max_bw = -1` (unlimited send pacing) in the libsrt wrapper (`bilbycast-libsrt-rs`). This is the right setting for a forwarding gateway, where the upstream already paces correctly and libsrt adding its own pacing on top only creates warm-up drops. If you are operating on a shared WAN link and need an explicit per-link bitrate cap, set `max_bw` on the SRT endpoint config (both legs individually). Do **not** leave legs on the old libsrt default of `0` under 2022-7 — it is the single most common cause of correlated startup loss on a dual-leg bonded/redundant SRT pair.
+
+### Raw TS 2022-7: dedup is ordinal, not content-based
+
+When the upstream payload is **raw MPEG-TS** (no RTP header), the 2022-7 merger cannot key on an RTP sequence number and falls back to a per-leg synthetic counter. This is fine in the common case — both SRT legs deliver packets to the Tokio side in the same order (TSBPD enforces that), so the two counters stay aligned and dedup works. The counters only drift if **one leg permanently loses a packet** (past `latency + send_drop_delay`) that the other leg delivers. From that point on, the two legs' Nth-packet-ever are different content, so dedup fails and duplicate TS packets reach the downstream muxer (visible as `non monotonically increasing dts` in a downstream ffmpeg and macroblock decode errors with zero upstream loss).
+
+Under FEC this is usually a non-issue — FEC recovers single-packet losses on each leg before TSBPD, so legs don't diverge. Under heavy asymmetric per-link loss that exceeds the FEC matrix on one leg only, the counter drift can surface. If you are running raw-TS 2022-7 over lossy asymmetric links and want deterministic dedup, wrap the upstream in RTP/TS so the merger can key on the real RTP sequence number.
 
 ---
 

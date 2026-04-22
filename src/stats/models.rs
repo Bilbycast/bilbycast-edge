@@ -70,6 +70,65 @@ pub struct FlowStats {
     /// unchanged JSON shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs_live: Option<Vec<PerInputLive>>,
+    /// Per-elementary-stream counters from the PID bus. Populated only for
+    /// flows with an active assembly (passthrough flows rely on
+    /// `media_analysis.program_bitrates` instead). One entry per
+    /// `(input_id, source_pid)` pair observed on the bus; when an assembler
+    /// is running, each entry additionally carries `out_pid` so operators
+    /// can pivot their trust signals off the egress PID. PID-bus Phase 8
+    /// addition; old manager builds ignore unknown fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_es: Option<Vec<PerEsStats>>,
+    /// Flow-wide PCR accuracy rollup — percentiles computed over the union
+    /// of every output's PCR trust reservoir. Gives dashboards a single
+    /// summary number even when the flow has multiple outputs. Absent when
+    /// no output has yet collected enough samples. PID-bus Phase 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcr_trust_flow: Option<PcrTrustStats>,
+}
+
+/// Per-elementary-stream counters collected on the PID bus. One entry per
+/// `(input_id, source_pid)` channel the flow's `FlowEsBus` currently
+/// tracks. The assembler annotates entries it is actively forwarding with
+/// `out_pid`; unreferenced bus keys (e.g. PIDs present on an input but not
+/// used by the current plan) show up with `out_pid = None` so operators
+/// can still inspect them.
+///
+/// Counters are lifetime totals; bitrate is the rolling 1 Hz estimate
+/// from the same `ThroughputEstimator` used for the flow-level counters.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PerEsStats {
+    /// Flow-local input ID the ES is pulled from.
+    pub input_id: String,
+    /// Source-side PID on that input.
+    pub source_pid: u16,
+    /// Egress PID after the assembler's PID-remap, when an assembler is
+    /// running and this bus key is referenced by the current plan.
+    /// `None` when the flow is passthrough or the PID is observed but
+    /// not routed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_pid: Option<u16>,
+    /// PMT `stream_type` most recently seen for this PID. `0` when the
+    /// bus has not yet observed a PMT mapping (packets published before
+    /// the first PAT/PMT round-trip).
+    pub stream_type: u8,
+    /// High-level essence kind derived from `stream_type` when known
+    /// (`"video"`, `"audio"`, `"subtitle"`, `"data"`). Empty string when
+    /// the stream_type is not yet resolved.
+    pub kind: String,
+    /// Total TS packets observed on this PID.
+    pub packets: u64,
+    /// Total bytes observed on this PID (always 188 × packets — included
+    /// for downstream ease).
+    pub bytes: u64,
+    /// Rolling 1 Hz bitrate estimate in bits-per-second.
+    pub bitrate_bps: u64,
+    /// Cumulative continuity-counter errors detected on this PID.
+    pub cc_errors: u64,
+    /// Cumulative PCR discontinuity events (PCR jumped backwards or
+    /// advanced more than the configured max interval). Only populated
+    /// for PIDs that carry PCR.
+    pub pcr_discontinuity_errors: u64,
 }
 
 /// Liveness snapshot for a single input leg within a flow. Shipped inside
@@ -83,6 +142,23 @@ pub struct PerInputLive {
     pub packets_received: u64,
     pub bytes_received: u64,
     pub bitrate_bps: u64,
+    /// SRT mode: `"caller"`, `"listener"`, `"rendezvous"`. Mirrors
+    /// `InputStats.mode` for topology display of assembled flows where
+    /// every input is concurrently active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtsp_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whep_url: Option<String>,
     /// Lightweight PAT/PMT catalogue observed on this input. `None` on
     /// non-TS inputs (RTMP / WebRTC / RTP-ES / ST 2110-30/-40) or when
     /// no PSI has arrived yet. Drives the manager UI's per-input "Programs
@@ -90,6 +166,13 @@ pub struct PerInputLive {
     /// landing in Phase 4.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub psi_catalog: Option<crate::engine::ts_psi_catalog::PsiCatalog>,
+    /// Monotonic update counter from the per-input PSI catalogue store.
+    /// Advances every time the observer accepts a fresh PAT or PMT;
+    /// consumers (manager UI, WS clients) can diff this against the last
+    /// value they saw to skip re-rendering unchanged `psi_catalog`
+    /// payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psi_catalog_tick: Option<u64>,
 }
 
 /// PTP state snapshot reported up to the manager.
@@ -390,6 +473,50 @@ pub struct OutputStats {
     /// `MediaAnalysis`. Backward-compatible addition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_summary: Option<EgressMediaSummary>,
+    /// Per-output PCR accuracy trust metric. Present only when the output
+    /// has forwarded ≥ 2 PCR-bearing TS packets in the flow's lifetime —
+    /// audio-only, non-TS, and freshly-started outputs omit this field.
+    /// PID-bus Phase 8 addition; old managers ignore unknown fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcr_trust: Option<PcrTrustStats>,
+}
+
+/// PCR accuracy trust metric — percentiles of `|observed_Δ − expected_Δ|`
+/// for consecutive PCR-bearing TS packets. Measured at egress so it
+/// captures scheduling jitter introduced by the assembler + the output
+/// transport (SRT backpressure, UDP socket scheduling, hitless dedup
+/// stalls). Units are microseconds.
+///
+/// A healthy assembler doing byte-for-byte PCR forwarding should see
+/// p95 well under 1 ms and p99 under a few ms on a CPU-idle host. The
+/// testbed probe asserts p95 < 5 ms and p99 < 20 ms — generous bounds
+/// that still catch real scheduling pathologies.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PcrTrustStats {
+    /// Number of drift samples currently held in the rotating reservoir.
+    /// Caps at the reservoir size (currently 4096). Use this + the sample
+    /// rate to estimate how far back the reported percentiles look.
+    pub samples: u64,
+    /// Cumulative PCR pairs observed over the flow's lifetime (can exceed
+    /// `samples` once the reservoir has rolled over).
+    pub cumulative_samples: u64,
+    /// Average absolute drift over the cumulative lifetime, in µs.
+    pub avg_us: u64,
+    /// 50th-percentile absolute drift across the reservoir, in µs.
+    pub p50_us: u64,
+    /// 95th-percentile absolute drift across the reservoir, in µs.
+    pub p95_us: u64,
+    /// 99th-percentile absolute drift across the reservoir, in µs.
+    pub p99_us: u64,
+    /// Largest absolute drift observed in the reservoir, in µs.
+    pub max_us: u64,
+    /// Number of samples in the short "recent" window (≤ 256). Gives the
+    /// UI a signal for "is this spike current or baseline".
+    pub window_samples: u64,
+    /// 95th-percentile drift across the recent window, in µs. Compare
+    /// against `p95_us` to see whether recent behaviour diverges from
+    /// the longer-window baseline.
+    pub window_p95_us: u64,
 }
 
 /// Per-output end-to-end latency statistics for the last reporting window.

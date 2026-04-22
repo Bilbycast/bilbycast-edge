@@ -127,6 +127,49 @@ One counter family per TR-101290 Priority 1 / Priority 2 error class.
 | `bilbycast_edge_tr101290_pmt_errors_total` | counter | `flow_id` | PMT-related errors. |
 | `bilbycast_edge_tr101290_pcr_errors_total` | counter | `flow_id` | PCR repetition / discontinuity errors. |
 
+## PID-bus per-ES counters
+
+Populated only when the flow has an active `assembly` (passthrough flows report per-program bitrate via `media_analysis.program_bitrates` instead). One entry per `(input_id, source_pid)` currently tracked on the flow's `FlowEsBus`. Entries for PIDs the current plan is actively routing also carry `out_pid` so operators can pivot off the egress PID.
+
+Shipped on the WS `stats` message as `FlowStats.per_es: Vec<PerEsStats>` — not currently exposed through Prometheus (manager UI consumes the WS snapshot directly). Schema:
+
+| Field | Description |
+|-------|-------------|
+| `input_id` | Flow-local input ID the ES is pulled from. |
+| `source_pid` | Source-side PID on that input. |
+| `out_pid` | Egress PID after the assembler's PID remap. `null` on passthrough or when the bus key is observed but not routed. |
+| `stream_type` | PMT `stream_type` last observed for this PID (0 before the first PAT/PMT round-trip). |
+| `kind` | High-level kind derived from `stream_type` (`video` / `audio` / `subtitle` / `data`; empty until resolved). |
+| `packets` | Lifetime TS packets observed on this PID (always 188 × packets = bytes). |
+| `bytes` | Lifetime bytes observed. |
+| `bitrate_bps` | Rolling 1 Hz bitrate estimate from the shared `ThroughputEstimator`. |
+| `cc_errors` | Continuity-counter discontinuities seen on this PID. |
+| `pcr_discontinuity_errors` | PCR discontinuities (100 ms threshold matching flow-level TR-101290) — populated only for PCR-bearing PIDs. |
+
+**Source:** `src/engine/ts_es_analysis.rs`, `src/stats/collector.rs`. One lightweight task per bus key — no blocking, no per-packet allocations.
+
+## PCR accuracy trust (`pcr_trust`)
+
+Per-output and flow-rollup PCR accuracy metric. Measures `|ΔPCR_µs − Δwall_µs|` on every successful `socket.send_to` of a PCR-bearing TS packet, fed into a fixed-size rotating reservoir (4096 samples) with exact percentiles computed on snapshot. Catches muxer clock drift, kernel scheduling stalls that slip packets past their PCR cadence, and upstream feeds whose PCRs don't match wall-clock reality.
+
+Reported in microseconds. Exposed per-output on `OutputStats.pcr_trust` (MPTS UDP + raw-TS-over-RTP + RTP-wrapped TS paths only; 302M / RTP-ES / non-PCR outputs carry no samples). Flow rollup on `FlowStats.pcr_trust_flow` aggregates every output's reservoir — max p50 / p95 / p99 / max across outputs.
+
+| Field | Description |
+|-------|-------------|
+| `samples` | Samples currently in the rotating reservoir (caps at 4096). |
+| `cumulative_samples` | Lifetime sample count since output start. |
+| `avg_us` | Mean drift across the reservoir. |
+| `p50_us` | Median drift. |
+| `p95_us` | 95th percentile. |
+| `p99_us` | 99th percentile. |
+| `max_us` | Worst sample in the reservoir. |
+| `window_samples` | Samples in the last ~1 s rolling window. |
+| `window_p95_us` | p95 on that window — faster-reacting signal for live dashboards. |
+
+**Sample-skip rules** (important for clean percentiles): the sampler discards and resets state when Δ exceeds 500 ms in either direction. This filters startup jitter, keyframe PCR gaps, stream restarts, and 33-bit PCR wrap. The metric is meaningful only for adjacent PCR-bearing packets within a normal PCR cadence (≤ 100 ms per broadcast standard).
+
+**Source:** `src/stats/pcr_trust.rs`, wired into `OutputStatsAccumulator.pcr_trust`. Recorded from `src/engine/output_udp.rs` (MPTS path) and `src/engine/output_rtp.rs` (raw-TS-over-RTP + RTP-wrapped TS passthrough path).
+
 ## Tunnel metrics
 
 Emitted for every active QUIC tunnel.
