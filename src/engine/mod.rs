@@ -59,6 +59,7 @@ pub mod ts_continuity_fixer;
 pub mod ts_program_filter;
 pub mod ts_pid_remapper;
 pub mod ts_psi_catalog;
+pub mod ts_es_bus;
 pub mod ts_audio_replace;
 pub mod ts_video_replace;
 pub mod video_encode_util;
