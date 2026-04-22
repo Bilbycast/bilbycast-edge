@@ -1028,6 +1028,11 @@ pub struct PerInputCounters {
     pub bytes: AtomicU64,
     pub packets: AtomicU64,
     pub throughput: ThroughputEstimator,
+    /// Lightweight PAT/PMT catalogue for this input, maintained by
+    /// [`crate::engine::ts_psi_catalog`]. `None` on non-TS inputs
+    /// (RTMP / WebRTC / RTP-ES / ST 2110-30/-40) where there is no
+    /// PSI to parse; the observer is not spawned for those.
+    pub psi_catalog: Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>,
 }
 
 impl PerInputCounters {
@@ -1037,6 +1042,7 @@ impl PerInputCounters {
             bytes: AtomicU64::new(0),
             packets: AtomicU64::new(0),
             throughput: ThroughputEstimator::new(),
+            psi_catalog: Arc::new(crate::engine::ts_psi_catalog::PsiCatalogStore::new()),
         }
     }
 }
@@ -1534,6 +1540,7 @@ impl FlowStatsAccumulator {
                 let bytes = c.bytes.load(Ordering::Relaxed);
                 let packets = c.packets.load(Ordering::Relaxed);
                 let bitrate = c.throughput.sample(bytes);
+                let psi_catalog = c.psi_catalog.load().map(|arc| (*arc).clone());
                 PerInputLive {
                     input_id,
                     input_type: c.input_type.clone(),
@@ -1541,6 +1548,7 @@ impl FlowStatsAccumulator {
                     packets_received: packets,
                     bytes_received: bytes,
                     bitrate_bps: bitrate,
+                    psi_catalog,
                 }
             })
             .collect();

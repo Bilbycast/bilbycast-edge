@@ -506,6 +506,20 @@ impl FlowRuntime {
             // onto the main broadcast channel iff this input's ID matches the
             // current value in the active-input watch. The shared continuity
             // fixer ensures CC counters are seamless across input switches.
+            // Spawn per-input PSI catalogue observer for TS-bearing inputs.
+            // Runs independently of flow activation so passive inputs still
+            // surface their programs and PIDs to the manager / UI. Must happen
+            // *before* the forwarder consumes `per_input_counters`.
+            if input_def.config.is_ts_carrier() {
+                let _ = super::ts_psi_catalog::spawn_psi_catalog_observer(
+                    input_id.clone(),
+                    config.config.id.clone(),
+                    per_input_tx.clone(),
+                    per_input_counters.psi_catalog.clone(),
+                    input_cancel.child_token(),
+                );
+            }
+
             let forwarder_handle = spawn_input_forwarder(
                 input_id.clone(),
                 per_input_tx.subscribe(),

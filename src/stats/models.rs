@@ -83,6 +83,13 @@ pub struct PerInputLive {
     pub packets_received: u64,
     pub bytes_received: u64,
     pub bitrate_bps: u64,
+    /// Lightweight PAT/PMT catalogue observed on this input. `None` on
+    /// non-TS inputs (RTMP / WebRTC / RTP-ES / ST 2110-30/-40) or when
+    /// no PSI has arrived yet. Drives the manager UI's per-input "Programs
+    /// & PIDs" panel and is the metadata source for the PID-bus assembler
+    /// landing in Phase 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psi_catalog: Option<crate::engine::ts_psi_catalog::PsiCatalog>,
 }
 
 /// PTP state snapshot reported up to the manager.
