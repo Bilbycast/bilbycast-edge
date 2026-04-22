@@ -35,8 +35,8 @@ use super::media_analysis::spawn_media_analyzer;
 use super::thumbnail::spawn_thumbnail_generator;
 use super::tr101290::spawn_tr101290_analyzer;
 use super::ts_assembler::{
-    resolve_essence_slots, spawn_spts_assembler, EsKind, EssenceResolveError,
-    PendingEssenceSlot, SptsBuildResult, SptsPlan, SptsSlot,
+    resolve_essence_slots, spawn_spts_assembler, AssemblyPlan, AssemblySlot, EsKind,
+    EssenceResolveError, PendingEssenceSlot, ProgramPlan, SptsBuildResult,
 };
 use super::ts_es_bus::{FlowEsBus, TsEsDemuxer};
 use crate::stats::collector::{MediaAnalysisAccumulator, ThumbnailAccumulator, Tr101290Accumulator};
@@ -238,29 +238,7 @@ impl FlowRuntime {
         let spts_build: Option<SptsBuildResult> = match config.config.assembly.as_ref() {
             None => None,
             Some(a) if matches!(a.kind, AssemblyKind::Passthrough) => None,
-            Some(a) if matches!(a.kind, AssemblyKind::Spts) => {
-                Some(build_spts_plan(a, &config, &event_sender)?)
-            }
-            Some(a) => {
-                let msg = format!(
-                    "flow '{}': assembly.kind = {:?} is accepted by validation but \
-                     the PID-bus runtime only supports `spts` in Phase 5. \
-                     Remove the `assembly` block, use kind = spts, or use \
-                     kind = passthrough.",
-                    config.config.id, a.kind,
-                );
-                event_sender.emit_flow_with_details(
-                    EventSeverity::Critical,
-                    category::FLOW,
-                    msg.clone(),
-                    &config.config.id,
-                    serde_json::json!({
-                        "error_code": "pid_bus_mpts_not_implemented",
-                        "kind": format!("{:?}", a.kind).to_lowercase(),
-                    }),
-                );
-                anyhow::bail!(msg);
-            }
+            Some(a) => Some(build_assembly_plan(a, &config, &event_sender)?),
         };
         // Shared ES bus for the SPTS runtime. Constructed only when a
         // plan is present; non-assembly flows pay zero cost (no Arc, no
@@ -691,9 +669,11 @@ impl FlowRuntime {
                     .await
                     {
                         Ok(pairs) => {
-                            for (slot_idx, pid) in pairs {
-                                if let Some(slot) = build.plan.slots.get_mut(slot_idx) {
-                                    slot.source.1 = pid;
+                            for ((program_idx, slot_idx), pid) in pairs {
+                                if let Some(prog) = build.plan.programs.get_mut(program_idx) {
+                                    if let Some(slot) = prog.slots.get_mut(slot_idx) {
+                                        slot.source.1 = pid;
+                                    }
                                 }
                             }
                         }
@@ -712,64 +692,61 @@ impl FlowRuntime {
                             bail!(msg);
                         }
                     }
+                }
 
-                    // Post-resolution: pcr_source may no longer match a
-                    // slot if its `pid` was written against an explicit
-                    // `Pid` slot that's now replaced by an `Essence`
-                    // slot (or if the user picked an arbitrary pid for
-                    // an all-essence assembly, not knowing what the
-                    // resolver would choose). Auto-remap to the first
-                    // slot on the same input_id — that's the
-                    // operator-intent reading. If no such slot exists,
-                    // bail with the Phase 5 error code.
-                    if !build
-                        .plan
+                // Post-resolution per-program PCR fixup. Each
+                // program's `pcr_source` must match one of its own
+                // slots. If an operator specified a `pid` that ended up
+                // replaced by an Essence-resolved PID, auto-remap to
+                // the first slot on the same input_id within that
+                // program — operator-intent reading. If no such slot
+                // exists, bail with the Phase 5 error code.
+                for prog in build.plan.programs.iter_mut() {
+                    if prog.slots.iter().any(|s| s.source == prog.pcr_source) {
+                        continue;
+                    }
+                    let pcr_input = prog.pcr_source.0.clone();
+                    if let Some(remap) = prog
                         .slots
                         .iter()
-                        .any(|s| s.source == build.plan.pcr_source)
+                        .find(|s| s.source.0 == pcr_input)
+                        .map(|s| s.source.clone())
                     {
-                        let pcr_input = build.plan.pcr_source.0.clone();
-                        if let Some(remap) = build
-                            .plan
-                            .slots
-                            .iter()
-                            .find(|s| s.source.0 == pcr_input)
-                            .map(|s| s.source.clone())
-                        {
-                            tracing::info!(
-                                "Flow '{}': pcr_source auto-remapped from 0x{:04X} to 0x{:04X} (essence-resolved slot on input '{}')",
-                                config.config.id,
-                                build.plan.pcr_source.1,
-                                remap.1,
-                                pcr_input,
-                            );
-                            build.plan.pcr_source = remap;
-                        } else {
-                            let msg = format!(
-                                "flow '{}': pcr_source input '{}' has no slot after essence resolution",
-                                config.config.id, pcr_input,
-                            );
-                            event_sender.emit_flow_with_details(
-                                EventSeverity::Critical,
-                                category::FLOW,
-                                msg.clone(),
-                                &config.config.id,
-                                serde_json::json!({
-                                    "error_code": "pid_bus_pcr_source_unresolved",
-                                    "input_id": pcr_input,
-                                }),
-                            );
-                            bail!(msg);
-                        }
+                        tracing::info!(
+                            "Flow '{}': program {} pcr_source auto-remapped from 0x{:04X} to 0x{:04X} (essence-resolved slot on input '{}')",
+                            config.config.id,
+                            prog.program_number,
+                            prog.pcr_source.1,
+                            remap.1,
+                            pcr_input,
+                        );
+                        prog.pcr_source = remap;
+                    } else {
+                        let msg = format!(
+                            "flow '{}': program {} pcr_source input '{}' has no slot after essence resolution",
+                            config.config.id, prog.program_number, pcr_input,
+                        );
+                        event_sender.emit_flow_with_details(
+                            EventSeverity::Critical,
+                            category::FLOW,
+                            msg.clone(),
+                            &config.config.id,
+                            serde_json::json!({
+                                "error_code": "pid_bus_pcr_source_unresolved",
+                                "program_number": prog.program_number,
+                                "input_id": pcr_input,
+                            }),
+                        );
+                        bail!(msg);
                     }
                 }
 
+                let total_slots: usize = build.plan.programs.iter().map(|p| p.slots.len()).sum();
                 tracing::info!(
-                    "Flow '{}': starting SPTS assembler (program_number = {}, pmt_pid = 0x{:04X}, {} slot(s))",
+                    "Flow '{}': starting TS assembler — {} program(s), {} slot(s) total",
                     config.config.id,
-                    build.plan.program_number,
-                    build.plan.pmt_pid,
-                    build.plan.slots.len(),
+                    build.plan.programs.len(),
+                    total_slots,
                 );
                 Some(spawn_spts_assembler(
                     build.plan,
@@ -2048,8 +2025,9 @@ fn es_kind_from_config(k: EssenceKind) -> EsKind {
     }
 }
 
-/// Resolve a [`FlowAssembly`] with `kind = spts` into an
-/// [`SptsBuildResult`], enforcing Phase 5 + Phase 6 scope guards:
+/// Resolve a [`FlowAssembly`] with `kind = spts` or `kind = mpts` into
+/// an [`SptsBuildResult`], enforcing Phase 5 + Phase 6 + MPTS scope
+/// guards:
 ///
 /// - every output on the flow must be `OutputConfig::Udp`
 ///   (`error_code: pid_bus_spts_non_udp_output`)
@@ -2070,7 +2048,7 @@ fn es_kind_from_config(k: EssenceKind) -> EsKind {
 /// Every failure path emits a Critical event *before* bailing so the
 /// manager UI can highlight the offending assembly field without having
 /// to parse the error string.
-fn build_spts_plan(
+fn build_assembly_plan(
     assembly: &FlowAssembly,
     flow: &ResolvedFlow,
     event_sender: &EventSender,
@@ -2137,75 +2115,92 @@ fn build_spts_plan(
         }
     }
 
-    // Exactly one program in Spts — validation already enforces this,
-    // but treat it as an invariant here so the `.first()` below is
-    // defensible without an unwrap.
-    let program = assembly.programs.first().ok_or_else(|| {
-        let msg = format!("flow '{flow_id}': spts assembly has no program");
-        emit("pid_bus_spts_no_program", &msg, serde_json::json!({}));
-        anyhow::anyhow!(msg)
-    })?;
-
-    // Resolve every slot. `Pid` slots map directly to a concrete
-    // `(input_id, source_pid)`. `Essence` slots get a sentinel
-    // `source_pid = 0` and an entry in `pending_essence` so the runtime
-    // can patch the slot in place after the resolver returns.
-    // `Hitless` stays rejected loudly (Phase 7 scope).
-    let mut slots: Vec<SptsSlot> = Vec::with_capacity(program.streams.len());
-    let mut pending_essence: Vec<PendingEssenceSlot> = Vec::new();
-    for stream in &program.streams {
-        let (input_id, source_pid) = match &stream.source {
-            SlotSource::Pid { input_id, source_pid } => (input_id.clone(), *source_pid),
-            SlotSource::Essence { input_id, kind } => {
-                let slot_idx = slots.len();
-                pending_essence.push(PendingEssenceSlot {
-                    slot_idx,
-                    input_id: input_id.clone(),
-                    kind: es_kind_from_config(*kind),
-                });
-                (input_id.clone(), 0_u16) // sentinel, patched after resolution
-            }
-            SlotSource::Hitless { .. } => {
-                let msg = format!(
-                    "flow '{}': SlotSource::Hitless is not yet implemented — \
-                     use a single SlotSource::Pid or SlotSource::Essence until \
-                     Phase 7 lands runtime switching.",
-                    flow_id
-                );
-                emit(
-                    "pid_bus_spts_hitless_not_implemented",
-                    &msg,
-                    serde_json::json!({ "out_pid": stream.out_pid }),
-                );
-                bail!(msg);
-            }
-        };
-        slots.push(SptsSlot {
-            source: (input_id, source_pid),
-            out_pid: stream.out_pid,
-            stream_type: stream.stream_type,
-        });
+    if assembly.programs.is_empty() {
+        let msg = format!("flow '{flow_id}': assembly has no program");
+        emit("pid_bus_no_program", &msg, serde_json::json!({}));
+        bail!(msg);
     }
 
-    // `pcr_source` presence is validated here. The match against a
-    // concrete slot is deferred to the runtime post-resolution step —
-    // Essence slots don't know their `source_pid` until the resolver
-    // runs, and an `pcr_source.pid` against an Essence-driven slot is
-    // auto-remapped to the resolver's pick. See the assembler-spawn
-    // block in `FlowRuntime::start`.
-    let pcr = assembly
-        .pcr_source
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("flow '{flow_id}': spts assembly has no pcr_source"))?;
-    let pcr_key = (pcr.input_id.clone(), pcr.pid);
+    let mut programs: Vec<ProgramPlan> = Vec::with_capacity(assembly.programs.len());
+    let mut pending_essence: Vec<PendingEssenceSlot> = Vec::new();
 
-    Ok(SptsBuildResult {
-        plan: SptsPlan {
+    for (program_idx, program) in assembly.programs.iter().enumerate() {
+        // Resolve every slot. `Pid` slots map directly to a concrete
+        // `(input_id, source_pid)`. `Essence` slots get a sentinel
+        // `source_pid = 0` and an entry in `pending_essence` so the
+        // runtime can patch the slot in place after the resolver
+        // returns. `Hitless` stays rejected loudly (Phase 7 scope).
+        let mut slots: Vec<AssemblySlot> = Vec::with_capacity(program.streams.len());
+        for stream in &program.streams {
+            let (input_id, source_pid) = match &stream.source {
+                SlotSource::Pid { input_id, source_pid } => (input_id.clone(), *source_pid),
+                SlotSource::Essence { input_id, kind } => {
+                    let slot_idx = slots.len();
+                    pending_essence.push(PendingEssenceSlot {
+                        program_idx,
+                        slot_idx,
+                        input_id: input_id.clone(),
+                        kind: es_kind_from_config(*kind),
+                    });
+                    (input_id.clone(), 0_u16) // sentinel, patched after resolution
+                }
+                SlotSource::Hitless { .. } => {
+                    let msg = format!(
+                        "flow '{}': SlotSource::Hitless is not yet implemented — \
+                         use a single SlotSource::Pid or SlotSource::Essence until \
+                         Phase 7 lands runtime switching.",
+                        flow_id
+                    );
+                    emit(
+                        "pid_bus_spts_hitless_not_implemented",
+                        &msg,
+                        serde_json::json!({
+                            "program_number": program.program_number,
+                            "out_pid": stream.out_pid,
+                        }),
+                    );
+                    bail!(msg);
+                }
+            };
+            slots.push(AssemblySlot {
+                source: (input_id, source_pid),
+                out_pid: stream.out_pid,
+                stream_type: stream.stream_type,
+            });
+        }
+
+        // Effective per-program PCR: program-level override beats
+        // flow-level fallback. Validator already enforces that one of
+        // them is present for each program; re-assert here so the
+        // runtime is authoritative.
+        let pcr = program
+            .pcr_source
+            .as_ref()
+            .or(assembly.pcr_source.as_ref())
+            .ok_or_else(|| {
+                let msg = format!(
+                    "flow '{flow_id}': program {} has no effective pcr_source",
+                    program.program_number
+                );
+                emit(
+                    "pid_bus_mpts_pcr_source_required",
+                    &msg,
+                    serde_json::json!({ "program_number": program.program_number }),
+                );
+                anyhow::anyhow!(msg)
+            })?;
+        let pcr_key = (pcr.input_id.clone(), pcr.pid);
+
+        programs.push(ProgramPlan {
             program_number: program.program_number,
             pmt_pid: program.pmt_pid,
             pcr_source: pcr_key,
             slots,
-        },
+        });
+    }
+
+    Ok(SptsBuildResult {
+        plan: AssemblyPlan { programs },
         pending_essence,
     })
 }

@@ -315,9 +315,11 @@ pub struct FlowConfig {
 pub struct FlowAssembly {
     /// Shape of the egress TS.
     pub kind: AssemblyKind,
-    /// PCR reference. Required for `Spts` / `Mpts` modes; must name a PID
-    /// that also appears in one of the programs' streams or is sourced
-    /// from one of the flow's input PSI catalogues. Ignored for
+    /// PCR reference. For `Spts`, this is the authoritative (or sole)
+    /// reference — required unless the single program carries its own
+    /// `pcr_source`. For `Mpts`, this is a **convenience default**
+    /// applied to any program that doesn't set
+    /// [`AssembledProgram::pcr_source`] itself. Ignored for
     /// `Passthrough` (PCR is carried through from the input).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pcr_source: Option<PcrSource>,
@@ -363,6 +365,14 @@ pub struct AssembledProgram {
     /// PMT PID for this program on the egress side. Must be unique
     /// across programs within the assembly (PAT/PMT constraint).
     pub pmt_pid: u16,
+    /// Optional per-program PCR reference. Required for `Mpts`
+    /// assemblies (each program's PMT must name a `PCR_PID` within
+    /// its own ES set per H.222.0). For `Spts`, when unset, the
+    /// flow-level [`FlowAssembly::pcr_source`] is the fallback. The
+    /// referenced `(input_id, pid)` must resolve to one of this
+    /// program's slots post-essence-resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcr_source: Option<PcrSource>,
     /// Elementary streams composing the program. Each slot is
     /// independently switchable at runtime (Phase 7).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

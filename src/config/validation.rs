@@ -1923,25 +1923,65 @@ fn validate_flow_assembly(
         }
     }
 
-    // PCR required for Spts / Mpts.
-    let pcr = assembly
-        .pcr_source
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("{context}: pcr_source is required for spts/mpts assembly"))?;
-    check_input(&pcr.input_id)?;
-    check_pid(pcr.pid, "pcr_source")?;
+    // PCR rules differ between SPTS and MPTS:
+    //   - SPTS: exactly one program. The flow-level `pcr_source`
+    //     *or* the single program's `pcr_source` must be set. If both,
+    //     per-program wins. The cross-check that the chosen
+    //     `(input_id, pid)` hits a slot is deferred to the later loop.
+    //   - MPTS: every program must have an effective `pcr_source`,
+    //     taken from its own field when set, otherwise from the
+    //     flow-level fallback. Any program without either is rejected
+    //     here with `pid_bus_mpts_pcr_source_required`.
+    // The flow-level `pcr_source` is validated shape-wise when set; it
+    // is no longer mandatory at the assembly level.
+    if let Some(pcr) = assembly.pcr_source.as_ref() {
+        check_input(&pcr.input_id)?;
+        check_pid(pcr.pid, "pcr_source")?;
+    }
+    match assembly.kind {
+        AssemblyKind::Spts => {
+            let has_flow_pcr = assembly.pcr_source.is_some();
+            let has_prog_pcr = assembly
+                .programs
+                .first()
+                .and_then(|p| p.pcr_source.as_ref())
+                .is_some();
+            if !has_flow_pcr && !has_prog_pcr {
+                bail!(
+                    "{context}: pcr_source is required for spts assembly (set either \
+                     FlowAssembly.pcr_source or AssembledProgram.pcr_source)"
+                );
+            }
+        }
+        AssemblyKind::Mpts => {
+            for prog in &assembly.programs {
+                let effective = prog.pcr_source.as_ref().or(assembly.pcr_source.as_ref());
+                if effective.is_none() {
+                    bail!(
+                        "{context}: mpts program {} has no pcr_source and no flow-level \
+                         fallback — every MPTS program must name a PCR_PID within its \
+                         own ES set",
+                        prog.program_number
+                    );
+                }
+            }
+        }
+        AssemblyKind::Passthrough => {}
+    }
 
-    // Collect program-level uniqueness + recurse into slots.
+    // Collect program-level uniqueness + recurse into slots. Slot
+    // resolution tables are built **per-program** so the per-program
+    // pcr_source cross-check respects the H.222.0 rule that a
+    // program's PCR_PID must reside in that program's own ES set.
     let mut seen_pn = std::collections::HashSet::new();
     let mut seen_pmt = std::collections::HashSet::new();
-    // For pcr_source resolution: concrete (input_id, source_pid) pairs
-    // from Pid / Hitless-Pid slots, plus input_ids carrying Essence
-    // slots (resolved at runtime against the input's PSI catalogue).
-    let mut slot_pids: std::collections::HashSet<(&str, u16)> =
-        std::collections::HashSet::new();
-    let mut slot_essence_inputs: std::collections::HashSet<&str> =
-        std::collections::HashSet::new();
     for prog in &assembly.programs {
+        // Per-program slot-source tables (concrete + essence-input)
+        // for the post-loop pcr_source cross-check.
+        let mut prog_slot_pids: std::collections::HashSet<(&str, u16)> =
+            std::collections::HashSet::new();
+        let mut prog_slot_essence_inputs: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
         if prog.program_number == 0 {
             bail!(
                 "{context}: program_number must be > 0 (0 is reserved for the NIT)"
@@ -1993,25 +2033,33 @@ fn validate_flow_assembly(
                 }
             }
             validate_slot_source(&stream.source, &check_input, &check_pid, context, false)?;
-            collect_slot_ref(&stream.source, &mut slot_pids, &mut slot_essence_inputs);
+            collect_slot_ref(
+                &stream.source,
+                &mut prog_slot_pids,
+                &mut prog_slot_essence_inputs,
+            );
         }
-    }
 
-    // Cross-check pcr_source resolves into an ES slot the assembler will
-    // emit. Exact (input_id, pid) against Pid/Hitless-Pid slots, or a
-    // looser input_id match when the target slot is an Essence selector
-    // (PID is resolved at runtime via the input's PSI catalogue).
-    // Runtime re-verifies the loose case and fails with
-    // `pid_bus_pcr_source_unresolved` if the Essence lookup doesn't land
-    // on the named PID.
-    let concrete_hit = slot_pids.contains(&(pcr.input_id.as_str(), pcr.pid));
-    let essence_hit = slot_essence_inputs.contains(pcr.input_id.as_str());
-    if !concrete_hit && !essence_hit {
-        bail!(
-            "{context}: pcr_source ({}, 0x{:04X}) does not resolve to any slot's source in the assembly",
-            pcr.input_id,
-            pcr.pid
-        );
+        // Per-program pcr_source cross-check. Effective PCR =
+        // program-level override or flow-level fallback. For SPTS or
+        // Passthrough without a configured PCR this is a no-op.
+        let effective_pcr = prog.pcr_source.as_ref().or(assembly.pcr_source.as_ref());
+        if let Some(pcr) = effective_pcr {
+            // `pcr` may have been validated shape-wise already (flow-
+            // level) but the program-level field also needs validation.
+            check_input(&pcr.input_id)?;
+            check_pid(pcr.pid, "pcr_source")?;
+            let concrete_hit = prog_slot_pids.contains(&(pcr.input_id.as_str(), pcr.pid));
+            let essence_hit = prog_slot_essence_inputs.contains(pcr.input_id.as_str());
+            if !concrete_hit && !essence_hit {
+                bail!(
+                    "{context}: pcr_source ({}, 0x{:04X}) does not resolve to any slot in program {}",
+                    pcr.input_id,
+                    pcr.pid,
+                    prog.program_number,
+                );
+            }
+        }
     }
 
     Ok(())
@@ -4240,6 +4288,7 @@ mod tests {
                 program_number: 1,
                 service_name: None,
                 pmt_pid: 0x1000,
+                pcr_source: None,
                 streams: vec![AssembledStream {
                     source: SlotSource::Pid {
                         input_id: input_id.to_string(),
@@ -4351,6 +4400,49 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("pcr_source"), "message was: {msg}");
         assert!(msg.contains("does not resolve"), "message was: {msg}");
+    }
+
+    #[test]
+    fn assembly_mpts_rejects_program_without_pcr_source() {
+        // Two programs; no flow-level pcr, no per-program pcr on program 2.
+        let mut a = spts_assembly("in-a");
+        a.kind = AssemblyKind::Mpts;
+        a.pcr_source = None;
+        a.programs[0].pcr_source = Some(PcrSource { input_id: "in-a".into(), pid: 0x100 });
+        let mut p2 = a.programs[0].clone();
+        p2.program_number = 2;
+        p2.pmt_pid = 0x1001;
+        p2.pcr_source = None; // missing — no flow-level fallback either
+        a.programs.push(p2);
+        let err = validate_flow_assembly(&a, &["in-a".into()], "test")
+            .expect_err("must reject MPTS program without pcr_source");
+        assert!(err.to_string().contains("mpts program 2"));
+    }
+
+    #[test]
+    fn assembly_mpts_flow_level_pcr_applies_as_fallback() {
+        let mut a = spts_assembly("in-a");
+        a.kind = AssemblyKind::Mpts;
+        // Flow-level pcr already set by spts_assembly(). Program 2 has no
+        // per-program override and must inherit from the flow level.
+        let mut p2 = a.programs[0].clone();
+        p2.program_number = 2;
+        p2.pmt_pid = 0x1001;
+        p2.pcr_source = None;
+        a.programs.push(p2);
+        validate_flow_assembly(&a, &["in-a".into()], "test")
+            .expect("MPTS with flow-level pcr fallback must pass");
+    }
+
+    #[test]
+    fn assembly_spts_accepts_per_program_pcr_only() {
+        // Per-program pcr_source is enough for SPTS — flow-level not
+        // required when the single program carries its own.
+        let mut a = spts_assembly("in-a");
+        a.pcr_source = None;
+        a.programs[0].pcr_source = Some(PcrSource { input_id: "in-a".into(), pid: 0x100 });
+        validate_flow_assembly(&a, &["in-a".into()], "test")
+            .expect("SPTS with program-level pcr must pass");
     }
 
     #[test]

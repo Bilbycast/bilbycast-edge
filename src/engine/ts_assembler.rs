@@ -1,18 +1,21 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! SPTS assembler for the PID-bus runtime (Phase 5 + Phase 6).
+//! TS assembler for the PID-bus runtime (Phases 5 + 6 + MPTS).
 //!
 //! Subscribes to a set of elementary-stream channels on [`FlowEsBus`],
 //! rewrites each `EsPacket`'s TS header PID → the configured `out_pid`,
 //! stamps a per-out-PID monotonic continuity counter, and emits bundles
 //! of 7 TS packets (1316 bytes, MTU-safe) as synthesised `RtpPacket`s
-//! into the flow's broadcast channel. Synthesises PAT + PMT on a
-//! 100 ms cadence; PCR rides on one slot's ES bytes-for-bytes (the
-//! PMT's `PCR_PID` points at that slot's `out_pid`).
+//! into the flow's broadcast channel. Synthesises PAT + PMT(s) on a
+//! 100 ms cadence; each program's PCR rides on one of its own slots'
+//! ES bytes-for-bytes (the PMT's `PCR_PID` points at that slot's
+//! `out_pid`).
 //!
-//! Scope (Phase 5 + Phase 6):
-//! - Single-program TS (`AssemblyKind::Spts`) only.
+//! Scope:
+//! - Single-program (`AssemblyKind::Spts`) and multi-program
+//!   (`AssemblyKind::Mpts`) via a single code path — `AssemblyPlan`
+//!   carries `programs: Vec<ProgramPlan>` with `len == 1` for SPTS.
 //! - Concrete `SlotSource::Pid` slots (Phase 5).
 //! - `SlotSource::Essence { input_id, kind }` slots resolved against
 //!   the input's Phase 2 PSI catalogue (Phase 6). `Hitless` still
@@ -60,30 +63,48 @@ const PSI_INTERVAL: Duration = Duration::from_millis(100);
 /// downstream sockets see regular traffic. 10 ms keeps latency tight.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Pre-resolved plan the assembler executes. The runtime is responsible
-/// for expanding [`crate::config::models::FlowAssembly`] into this shape
-/// (resolving Essence → PID via the input's PSI catalogue, rejecting
-/// Hitless, validating that `pcr_source` hits one of the slots) before
-/// handing it off. Keeping this type narrow makes the assembler
-/// testable without dragging in the full config model.
+/// Pre-resolved plan the assembler executes. The runtime expands
+/// [`crate::config::models::FlowAssembly`] into this shape (resolving
+/// Essence → PID via the input's PSI catalogue, rejecting Hitless,
+/// validating that each program's `pcr_source` hits one of its own
+/// slots) before handing it off. Keeping this type narrow makes the
+/// assembler testable without dragging in the full config model.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SptsPlan {
-    pub program_number: u16,
-    pub pmt_pid: u16,
-    /// `(input_id, source_pid)` of the PCR reference — must match exactly
-    /// one slot in `slots` (the assembler uses that slot's `out_pid` as
-    /// the PMT's `PCR_PID`).
-    pub pcr_source: (String, u16),
-    pub slots: Vec<SptsSlot>,
+pub struct AssemblyPlan {
+    /// One entry for SPTS, two or more for MPTS. PAT synthesis emits
+    /// one entry per program; PMT synthesis emits one packet per
+    /// program on the same 100 ms cadence.
+    pub programs: Vec<ProgramPlan>,
 }
 
+/// One program within the assembled TS.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SptsSlot {
+pub struct ProgramPlan {
+    pub program_number: u16,
+    pub pmt_pid: u16,
+    /// `(input_id, source_pid)` of this program's PCR reference. Must
+    /// match exactly one of `slots` — the assembler uses that slot's
+    /// `out_pid` as the PMT's `PCR_PID` and forwards PCR packets
+    /// byte-for-byte.
+    pub pcr_source: (String, u16),
+    pub slots: Vec<AssemblySlot>,
+}
+
+/// One elementary-stream slot within a program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssemblySlot {
     /// Concrete `(input_id, source_pid)` on the bus.
     pub source: (String, u16),
     pub out_pid: u16,
     pub stream_type: u8,
 }
+
+// Legacy alias — kept only as a documentation breadcrumb for the
+// Phase 5 vocabulary. Not actually used in-tree after MPTS; prefer
+// [`AssemblyPlan`] everywhere new.
+#[deprecated(note = "use AssemblyPlan + programs vec")]
+#[allow(dead_code)]
+pub type SptsPlan = AssemblyPlan;
 
 /// Spawn the assembler task. Returns a `JoinHandle` the caller stores on
 /// the `FlowRuntime` so the task lives as long as the flow.
@@ -93,44 +114,76 @@ pub struct SptsSlot {
 /// input forwarder would in passthrough mode, so every existing output
 /// subscriber (UDP, tr101290, thumbnailer) works unchanged.
 pub fn spawn_spts_assembler(
-    plan: SptsPlan,
+    plan: AssemblyPlan,
     bus: Arc<FlowEsBus>,
     broadcast_tx: broadcast::Sender<RtpPacket>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        run_spts_assembler(plan, bus, broadcast_tx, cancel).await;
+        run_assembler(plan, bus, broadcast_tx, cancel).await;
     })
 }
 
-async fn run_spts_assembler(
-    plan: SptsPlan,
+/// Flattened slot view used internally by the assembler. One entry per
+/// slot across all programs. `program_idx` is reserved for Phase 7's
+/// per-PID switching, which needs to route fan-in traffic to the right
+/// program's PMT without re-searching.
+#[derive(Debug, Clone)]
+struct FlatSlot {
+    #[allow(dead_code)] // reserved for Phase 7
+    program_idx: usize,
+    source: (String, u16),
+    out_pid: u16,
+}
+
+async fn run_assembler(
+    plan: AssemblyPlan,
     bus: Arc<FlowEsBus>,
     broadcast_tx: broadcast::Sender<RtpPacket>,
     cancel: CancellationToken,
 ) {
-    // PCR slot index within plan.slots. Validated by the runtime, but
-    // double-check here for safety — fall back to slot 0 if somehow
-    // missing (a degenerate but non-fatal case).
-    let pcr_slot_idx = plan
-        .slots
+    // Flatten programs → one fan-in task per slot regardless of
+    // program. Two slots sharing the same `(input_id, source_pid)`
+    // (e.g. simulcasting one video into two programs on different
+    // out_pids) each get their own broadcast subscriber — that's
+    // exactly what broadcast semantics deliver.
+    let flat: Vec<FlatSlot> = plan
+        .programs
         .iter()
-        .position(|s| s.source == plan.pcr_source)
-        .unwrap_or(0);
-    let pcr_out_pid = plan
-        .slots
-        .get(pcr_slot_idx)
-        .map(|s| s.out_pid)
-        .unwrap_or(plan.pmt_pid);
+        .enumerate()
+        .flat_map(|(pidx, prog)| {
+            prog.slots.iter().map(move |s| FlatSlot {
+                program_idx: pidx,
+                source: s.source.clone(),
+                out_pid: s.out_pid,
+            })
+        })
+        .collect();
 
-    // Fan-in: one task per slot drains the bus broadcast receiver and
-    // forwards into a single mpsc. Channel capacity is deliberately small
-    // (same capacity as bus / 8) — if the assembler lags, broadcasts will
-    // `Lagged` earlier and dropping happens at the bus edge, not in mpsc
-    // backpressure. This keeps the no-cascade-backpressure invariant.
+    // Per-program PCR resolution — the out_pid of whichever slot on
+    // that program matches `pcr_source`. Validated by the runtime;
+    // fall back to the PMT PID on mismatch (degenerate but non-fatal).
+    let pcr_out_pid_by_program: Vec<u16> = plan
+        .programs
+        .iter()
+        .map(|prog| {
+            prog.slots
+                .iter()
+                .find(|s| s.source == prog.pcr_source)
+                .map(|s| s.out_pid)
+                .unwrap_or(prog.pmt_pid)
+        })
+        .collect();
+
+    // Fan-in: one task per flat slot drains the bus broadcast receiver
+    // and forwards into a single mpsc. Channel capacity is deliberately
+    // small (same as bus / 8) — if the assembler lags, broadcasts will
+    // `Lagged` earlier and dropping happens at the bus edge, not in
+    // mpsc backpressure. This keeps the no-cascade-backpressure
+    // invariant.
     let (fanin_tx, mut fanin_rx) = mpsc::channel::<(usize, EsPacket)>(256);
-    let mut slot_tasks: Vec<JoinHandle<()>> = Vec::with_capacity(plan.slots.len());
-    for (idx, slot) in plan.slots.iter().enumerate() {
+    let mut slot_tasks: Vec<JoinHandle<()>> = Vec::with_capacity(flat.len());
+    for (idx, slot) in flat.iter().enumerate() {
         let rx = bus.subscribe(&slot.source.0, slot.source.1);
         let tx = fanin_tx.clone();
         let slot_cancel = cancel.clone();
@@ -142,7 +195,9 @@ async fn run_spts_assembler(
     let mut buf = BytesMut::with_capacity(BUNDLE_BYTES);
     let mut cc: std::collections::HashMap<u16, u8> = std::collections::HashMap::new();
     let mut pat_cc: u8 = 0;
-    let mut pmt_cc: u8 = 0;
+    // One CC counter per PMT PID so multiple programs each maintain
+    // independent PMT continuity.
+    let mut pmt_cc: std::collections::HashMap<u16, u8> = std::collections::HashMap::new();
     // Version counter is stable for Phase 5 (plan is immutable over the
     // flow's lifetime). Phase 7's per-PID switching will bump this.
     let psi_version: u8 = 0;
@@ -165,7 +220,7 @@ async fn run_spts_assembler(
     push_psi(
         &mut buf,
         &plan,
-        pcr_out_pid,
+        &pcr_out_pid_by_program,
         psi_version,
         &mut pat_cc,
         &mut pmt_cc,
@@ -181,7 +236,7 @@ async fn run_spts_assembler(
                 break;
             }
             Some((slot_idx, es)) = fanin_rx.recv() => {
-                let slot = match plan.slots.get(slot_idx) {
+                let slot = match flat.get(slot_idx) {
                     Some(s) => s,
                     None => continue,
                 };
@@ -198,7 +253,7 @@ async fn run_spts_assembler(
                 push_psi(
                     &mut buf,
                     &plan,
-                    pcr_out_pid,
+                    &pcr_out_pid_by_program,
                     psi_version,
                     &mut pat_cc,
                     &mut pmt_cc,
@@ -276,33 +331,48 @@ fn rewrite_es_packet(src: &[u8], out_pid: u16, cc_table: &mut std::collections::
     pkt
 }
 
-/// Build one PAT TS packet + one PMT TS packet and append them to `buf`,
-/// flushing intermediate bundles as needed so a PSI tick never overflows
-/// past a bundle boundary.
+/// Build one PAT TS packet + one PMT TS packet per program and append
+/// them to `buf`, flushing intermediate bundles as needed so a PSI tick
+/// never overflows past a bundle boundary.
 fn push_psi(
     buf: &mut BytesMut,
-    plan: &SptsPlan,
-    pcr_out_pid: u16,
+    plan: &AssemblyPlan,
+    pcr_out_pid_by_program: &[u16],
     version: u8,
     pat_cc: &mut u8,
-    pmt_cc: &mut u8,
+    pmt_cc: &mut std::collections::HashMap<u16, u8>,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     bundle_seq: &mut u16,
 ) {
-    let pat = build_pat(plan.program_number, plan.pmt_pid, version, *pat_cc);
+    // PAT: one entry per program. PAT lives on PID 0x0000 with its own
+    // continuity counter across the whole flow (there's only one PAT).
+    let entries: Vec<(u16, u16)> = plan
+        .programs
+        .iter()
+        .map(|p| (p.program_number, p.pmt_pid))
+        .collect();
+    let pat = build_pat(&entries, version, *pat_cc);
     *pat_cc = pat_cc.wrapping_add(1) & 0x0F;
     append_ts(buf, &pat, broadcast_tx, bundle_seq);
 
-    let pmt = build_pmt(
-        plan.program_number,
-        plan.pmt_pid,
-        pcr_out_pid,
-        &plan.slots,
-        version,
-        *pmt_cc,
-    );
-    *pmt_cc = pmt_cc.wrapping_add(1) & 0x0F;
-    append_ts(buf, &pmt, broadcast_tx, bundle_seq);
+    // One PMT per program on its own `pmt_pid` with its own CC counter.
+    for (pidx, prog) in plan.programs.iter().enumerate() {
+        let cc_entry = pmt_cc.entry(prog.pmt_pid).or_insert(0);
+        let pcr_out_pid = pcr_out_pid_by_program
+            .get(pidx)
+            .copied()
+            .unwrap_or(prog.pmt_pid);
+        let pmt = build_pmt(
+            prog.program_number,
+            prog.pmt_pid,
+            pcr_out_pid,
+            &prog.slots,
+            version,
+            *cc_entry,
+        );
+        *cc_entry = cc_entry.wrapping_add(1) & 0x0F;
+        append_ts(buf, &pmt, broadcast_tx, bundle_seq);
+    }
 }
 
 /// Append one 188-byte TS packet to the bundle buffer, flushing when the
@@ -356,8 +426,7 @@ fn flush(
 // ---------------------------------------------------------------------
 
 fn build_pat(
-    program_number: u16,
-    pmt_pid: u16,
+    programs: &[(u16, u16)],
     version: u8,
     cc: u8,
 ) -> [u8; TS_PACKET_SIZE] {
@@ -369,10 +438,9 @@ fn build_pat(
     pkt[3] = 0x10 | (cc & 0x0F);
     pkt[4] = 0x00; // pointer_field
     // Section: table_id + section_length + ts_id + version/cni + section_no
-    //        + last_section + (program_number + reserved+pmt_pid) + CRC
-    // section_length = from after length field to end of CRC
-    //                = 5 (ts_id..last_section) + 4 (program entry) + 4 (CRC) = 13
-    let section_length: u16 = 13;
+    //        + last_section + N × (program_number + reserved+pmt_pid) + CRC
+    // section_length = 5 (ts_id..last_section) + 4*N (program entries) + 4 (CRC)
+    let section_length: u16 = 5 + 4 * programs.len() as u16 + 4;
     pkt[5] = 0x00; // table_id PAT
     pkt[6] = 0xB0 | (((section_length >> 8) & 0x0F) as u8);
     pkt[7] = (section_length & 0xFF) as u8;
@@ -381,17 +449,20 @@ fn build_pat(
     pkt[10] = 0xC1 | ((version & 0x1F) << 1); // reserved + version + current_next
     pkt[11] = 0x00; // section_number
     pkt[12] = 0x00; // last_section_number
-    // One program entry:
-    pkt[13] = (program_number >> 8) as u8;
-    pkt[14] = (program_number & 0xFF) as u8;
-    pkt[15] = 0xE0 | (((pmt_pid >> 8) as u8) & 0x1F);
-    pkt[16] = (pmt_pid & 0xFF) as u8;
-    // CRC over table_id..end of entries (bytes 5..17).
-    let crc = mpeg2_crc32(&pkt[5..17]);
-    pkt[17] = (crc >> 24) as u8;
-    pkt[18] = (crc >> 16) as u8;
-    pkt[19] = (crc >> 8) as u8;
-    pkt[20] = crc as u8;
+    let mut pos = 13;
+    for (program_number, pmt_pid) in programs {
+        pkt[pos] = (program_number >> 8) as u8;
+        pkt[pos + 1] = (program_number & 0xFF) as u8;
+        pkt[pos + 2] = 0xE0 | (((pmt_pid >> 8) as u8) & 0x1F);
+        pkt[pos + 3] = (pmt_pid & 0xFF) as u8;
+        pos += 4;
+    }
+    // CRC over table_id..end of entries (bytes 5..pos).
+    let crc = mpeg2_crc32(&pkt[5..pos]);
+    pkt[pos] = (crc >> 24) as u8;
+    pkt[pos + 1] = (crc >> 16) as u8;
+    pkt[pos + 2] = (crc >> 8) as u8;
+    pkt[pos + 3] = crc as u8;
     pkt
 }
 
@@ -399,7 +470,7 @@ fn build_pmt(
     program_number: u16,
     pmt_pid: u16,
     pcr_pid: u16,
-    slots: &[SptsSlot],
+    slots: &[AssemblySlot],
     version: u8,
     cc: u8,
 ) -> [u8; TS_PACKET_SIZE] {
@@ -476,11 +547,15 @@ pub enum EsKind {
 }
 
 /// One unresolved slot. Produced by the plan builder; the resolver
-/// returns one `(slot_idx, pid)` per entry.
+/// returns one `((program_idx, slot_idx), pid)` per entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingEssenceSlot {
-    /// Index into `SptsPlan.slots` so the runtime can patch the
-    /// resolved `source_pid` in place.
+    /// `(program_idx, slot_idx)` — program_idx is an index into
+    /// `AssemblyPlan.programs`; slot_idx is an index into that
+    /// program's `ProgramPlan.slots`. The runtime patches
+    /// `plan.programs[program_idx].slots[slot_idx].source.1` in place
+    /// once the resolver returns.
+    pub program_idx: usize,
     pub slot_idx: usize,
     pub input_id: String,
     pub kind: EsKind,
@@ -546,17 +621,18 @@ fn pick_pid_for_kind(
 /// Resolve every pending Essence slot to a concrete `source_pid`.
 ///
 /// Polls each input's catalogue every 100 ms up to `timeout`. Returns
-/// one `(slot_idx, resolved_pid)` per pending slot on success. On
-/// timeout, surfaces the first still-unresolved slot as either
-/// `NoMatch` (catalogue exists but no matching kind) or `NoCatalogue`
-/// (catalogue empty — typically "input hasn't bound / received yet").
+/// one `((program_idx, slot_idx), resolved_pid)` per pending slot on
+/// success. On timeout, surfaces the first still-unresolved slot as
+/// either `NoMatch` (catalogue exists but no matching kind) or
+/// `NoCatalogue` (catalogue empty — typically "input hasn't bound or
+/// received PSI yet").
 ///
 /// Subtitle / Data are rejected up-front with `KindNotImplemented`.
 pub async fn resolve_essence_slots(
     pending: Vec<PendingEssenceSlot>,
     catalogues: std::collections::HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
     timeout: Duration,
-) -> Result<Vec<(usize, u16)>, EssenceResolveError> {
+) -> Result<Vec<((usize, usize), u16)>, EssenceResolveError> {
     // Pre-filter unsupported kinds so the poll loop only deals with
     // Video / Audio.
     for p in &pending {
@@ -566,7 +642,7 @@ pub async fn resolve_essence_slots(
     }
 
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut resolved: Vec<(usize, u16)> = Vec::with_capacity(pending.len());
+    let mut resolved: Vec<((usize, usize), u16)> = Vec::with_capacity(pending.len());
     let mut remaining: Vec<PendingEssenceSlot> = pending;
 
     loop {
@@ -579,7 +655,7 @@ pub async fn resolve_essence_slots(
             };
             match pick_pid_for_kind(&cat, p.kind) {
                 Some(pid) => {
-                    resolved.push((p.slot_idx, pid));
+                    resolved.push(((p.program_idx, p.slot_idx), pid));
                     false // resolved — drop from remaining
                 }
                 None => true, // catalogue present but no matching kind yet
@@ -614,22 +690,43 @@ mod tests {
     use super::*;
     use crate::engine::ts_parse::{parse_pat_programs, ts_cc, ts_pid, ts_pusi};
 
-    fn slot(input: &str, src_pid: u16, out_pid: u16, stream_type: u8) -> SptsSlot {
-        SptsSlot {
+    fn slot(input: &str, src_pid: u16, out_pid: u16, stream_type: u8) -> AssemblySlot {
+        AssemblySlot {
             source: (input.to_string(), src_pid),
             out_pid,
             stream_type,
         }
     }
 
-    fn make_plan() -> SptsPlan {
-        SptsPlan {
-            program_number: 1,
-            pmt_pid: 0x1000,
-            pcr_source: ("in-a".to_string(), 0x100),
-            slots: vec![
-                slot("in-a", 0x100, 0x200, 0x1B), // H.264 video
-                slot("in-b", 0x200, 0x201, 0x0F), // AAC-LC audio
+    fn make_plan() -> AssemblyPlan {
+        AssemblyPlan {
+            programs: vec![ProgramPlan {
+                program_number: 1,
+                pmt_pid: 0x1000,
+                pcr_source: ("in-a".to_string(), 0x100),
+                slots: vec![
+                    slot("in-a", 0x100, 0x200, 0x1B), // H.264 video
+                    slot("in-b", 0x200, 0x201, 0x0F), // AAC-LC audio
+                ],
+            }],
+        }
+    }
+
+    fn make_mpts_plan() -> AssemblyPlan {
+        AssemblyPlan {
+            programs: vec![
+                ProgramPlan {
+                    program_number: 1,
+                    pmt_pid: 0x1000,
+                    pcr_source: ("in-a".to_string(), 0x100),
+                    slots: vec![slot("in-a", 0x100, 0x200, 0x1B)],
+                },
+                ProgramPlan {
+                    program_number: 2,
+                    pmt_pid: 0x1100,
+                    pcr_source: ("in-b".to_string(), 0x200),
+                    slots: vec![slot("in-b", 0x200, 0x300, 0x1B)],
+                },
             ],
         }
     }
@@ -650,7 +747,7 @@ mod tests {
 
     #[test]
     fn pat_has_valid_crc_and_one_program() {
-        let pat = build_pat(42, 0x1000, 0, 0);
+        let pat = build_pat(&[(42, 0x1000)], 0, 0);
         assert_eq!(pat[0], TS_SYNC_BYTE);
         assert_eq!(ts_pid(&pat), 0x0000);
         assert!(ts_pusi(&pat));
@@ -663,6 +760,20 @@ mod tests {
         // Parse it back using the shared PAT parser.
         let progs = parse_pat_programs(&pat);
         assert_eq!(progs, vec![(42, 0x1000)]);
+    }
+
+    #[test]
+    fn pat_mpts_has_valid_crc_and_two_programs() {
+        let pat = build_pat(&[(1, 0x1000), (2, 0x1100)], 0, 0);
+        assert_eq!(ts_pid(&pat), 0x0000);
+        assert!(ts_pusi(&pat));
+        let section_length = (((pat[6] & 0x0F) as usize) << 8) | pat[7] as usize;
+        let section_end = 5 + 3 + section_length;
+        // section_length must grow by 4 bytes per extra program.
+        assert_eq!(section_length, 5 + 4 * 2 + 4);
+        assert_eq!(mpeg2_crc32(&pat[5..section_end]), 0);
+        let progs = parse_pat_programs(&pat);
+        assert_eq!(progs, vec![(1, 0x1000), (2, 0x1100)]);
     }
 
     #[test]
@@ -836,6 +947,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assembler_mpts_emits_pat_with_two_programs_and_two_pmts() {
+        let bus = Arc::new(FlowEsBus::new());
+        let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
+        let cancel = CancellationToken::new();
+        let handle = spawn_spts_assembler(make_mpts_plan(), bus.clone(), tx.clone(), cancel.clone());
+
+        // Collect bundles for ~250 ms — long enough to see the startup
+        // PSI emission plus at least one tick of the 100 ms PSI cadence.
+        let mut saw_two_program_pat = false;
+        let mut saw_pmt_1000 = false;
+        let mut saw_pmt_1100 = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Ok(bundle)) =
+                tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+            {
+                for chunk in bundle.data.chunks_exact(TS_PACKET_SIZE) {
+                    match ts_pid(chunk) {
+                        0x0000 => {
+                            let progs = parse_pat_programs(chunk);
+                            if progs.len() == 2 {
+                                saw_two_program_pat = true;
+                            }
+                        }
+                        0x1000 => saw_pmt_1000 = true,
+                        0x1100 => saw_pmt_1100 = true,
+                        _ => {}
+                    }
+                }
+            }
+            if saw_two_program_pat && saw_pmt_1000 && saw_pmt_1100 {
+                break;
+            }
+        }
+        cancel.cancel();
+        handle.await.unwrap();
+
+        assert!(saw_two_program_pat, "MPTS PAT must list both programs");
+        assert!(saw_pmt_1000, "program-1 PMT must be emitted on pmt_pid 0x1000");
+        assert!(saw_pmt_1100, "program-2 PMT must be emitted on pmt_pid 0x1100");
+    }
+
+    #[tokio::test]
     async fn assembler_shutsdown_cleanly_with_no_es_traffic() {
         let bus = Arc::new(FlowEsBus::new());
         let (tx, _rx) = broadcast::channel::<RtpPacket>(4);
@@ -896,6 +1050,7 @@ mod tests {
         let mut cats = std::collections::HashMap::new();
         cats.insert("in-a".to_string(), store);
         let pending = vec![PendingEssenceSlot {
+            program_idx: 0,
             slot_idx: 0,
             input_id: "in-a".into(),
             kind: EsKind::Video,
@@ -903,7 +1058,7 @@ mod tests {
         let r = resolve_essence_slots(pending, cats, Duration::from_millis(500))
             .await
             .expect("must resolve");
-        assert_eq!(r, vec![(0, 0x100)]);
+        assert_eq!(r, vec![((0, 0), 0x100)]);
     }
 
     #[tokio::test]
@@ -921,6 +1076,7 @@ mod tests {
         let mut cats = std::collections::HashMap::new();
         cats.insert("in-a".to_string(), store);
         let pending = vec![PendingEssenceSlot {
+            program_idx: 0,
             slot_idx: 3,
             input_id: "in-a".into(),
             kind: EsKind::Audio,
@@ -928,7 +1084,7 @@ mod tests {
         let r = resolve_essence_slots(pending, cats, Duration::from_millis(500))
             .await
             .unwrap();
-        assert_eq!(r, vec![(3, 0x200)], "first audio wins, not second AC-3");
+        assert_eq!(r, vec![((0, 3), 0x200)], "first audio wins, not second AC-3");
     }
 
     #[tokio::test]
@@ -952,6 +1108,7 @@ mod tests {
         let mut cats = std::collections::HashMap::new();
         cats.insert("in-a".to_string(), store);
         let pending = vec![PendingEssenceSlot {
+            program_idx: 0,
             slot_idx: 0,
             input_id: "in-a".into(),
             kind: EsKind::Video,
@@ -959,7 +1116,7 @@ mod tests {
         let r = resolve_essence_slots(pending, cats, Duration::from_millis(500))
             .await
             .unwrap();
-        assert_eq!(r, vec![(0, 0x100)]);
+        assert_eq!(r, vec![((0, 0), 0x100)]);
     }
 
     #[tokio::test]
@@ -973,6 +1130,7 @@ mod tests {
         let mut cats = std::collections::HashMap::new();
         cats.insert("audio-only".to_string(), store);
         let pending = vec![PendingEssenceSlot {
+            program_idx: 0,
             slot_idx: 0,
             input_id: "audio-only".into(),
             kind: EsKind::Video,
@@ -996,6 +1154,7 @@ mod tests {
         let mut cats = std::collections::HashMap::new();
         cats.insert("silent".to_string(), store);
         let pending = vec![PendingEssenceSlot {
+            program_idx: 0,
             slot_idx: 0,
             input_id: "silent".into(),
             kind: EsKind::Video,
@@ -1012,6 +1171,7 @@ mod tests {
         let mut cats = std::collections::HashMap::new();
         cats.insert("in-a".to_string(), store);
         let pending = vec![PendingEssenceSlot {
+            program_idx: 0,
             slot_idx: 0,
             input_id: "in-a".into(),
             kind: EsKind::Subtitle,
@@ -1050,6 +1210,7 @@ mod tests {
         let mut cats = std::collections::HashMap::new();
         cats.insert("late".to_string(), store);
         let pending = vec![PendingEssenceSlot {
+            program_idx: 0,
             slot_idx: 0,
             input_id: "late".into(),
             kind: EsKind::Video,
@@ -1057,6 +1218,6 @@ mod tests {
         let r = resolve_essence_slots(pending, cats, Duration::from_millis(1000))
             .await
             .expect("must pick up late catalogue within timeout");
-        assert_eq!(r, vec![(0, 0x100)]);
+        assert_eq!(r, vec![((0, 0), 0x100)]);
     }
 }
