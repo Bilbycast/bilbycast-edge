@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::*;
-use crate::manager::events::EventSender;
+use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::{FlowStatsAccumulator, OutputConfigMeta, OutputStatsAccumulator};
 
 use super::input_rist::spawn_rist_input;
@@ -209,6 +209,32 @@ impl FlowRuntime {
     /// bind failure). The input task is spawned first and errors there are
     /// reported asynchronously via the task's log output.
     pub async fn start(config: ResolvedFlow, global_stats: &crate::stats::collector::StatsCollector, ffmpeg_available: bool, event_sender: EventSender) -> Result<Self> {
+        // PID-bus assembly is accepted at config-validation time but the
+        // runtime that consumes it lands in phases 4–5. Refuse to start
+        // a flow carrying one (rather than silently falling back to
+        // passthrough) so operators see an unambiguous failure.
+        if let Some(ref assembly) = config.config.assembly {
+            use crate::config::models::AssemblyKind;
+            if !matches!(assembly.kind, AssemblyKind::Passthrough) {
+                let msg = format!(
+                    "flow '{}': assembly.kind = {:?} is accepted by validation but \
+                     the PID-bus runtime is not yet implemented (Phase 4/5). \
+                     Remove the `assembly` block or use kind = passthrough.",
+                    config.config.id, assembly.kind,
+                );
+                event_sender.emit_flow_with_details(
+                    EventSeverity::Critical,
+                    category::FLOW,
+                    msg.clone(),
+                    &config.config.id,
+                    serde_json::json!({
+                        "error_code": "pid_bus_not_implemented",
+                        "kind": format!("{:?}", assembly.kind).to_lowercase(),
+                    }),
+                );
+                anyhow::bail!(msg);
+            }
+        }
         let cancel_token = CancellationToken::new();
         // The broadcast channel is bounded to BROADCAST_CHANNEL_CAPACITY slots.
         // When a slow output (receiver) cannot keep up, it will *not* block the

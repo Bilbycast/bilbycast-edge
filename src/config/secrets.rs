@@ -566,6 +566,7 @@ mod tests {
                 clock_domain: None,
                 input_ids: vec!["srt-in".to_string()],
                 output_ids: vec![],
+                assembly: None,
             }],
             tunnels: vec![TunnelConfig {
                 id: "tunnel-1".to_string(),
@@ -682,6 +683,7 @@ mod tests {
                 clock_domain: None,
                 input_ids: vec!["srt-in".to_string()],
                 output_ids: vec![],
+                assembly: None,
             }],
             ..Default::default()
         };
@@ -737,6 +739,7 @@ mod tests {
                 clock_domain: None,
                 input_ids: vec!["rtp-in".to_string()],
                 output_ids: vec!["rtmp-out".to_string()],
+                assembly: None,
             }],
             ..Default::default()
         };
@@ -786,6 +789,7 @@ mod tests {
                 clock_domain: None,
                 input_ids: vec!["srt-in".to_string()],
                 output_ids: vec![],
+                assembly: None,
             }],
             ..Default::default()
         };

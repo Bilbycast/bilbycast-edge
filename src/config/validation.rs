@@ -374,6 +374,13 @@ pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
         &format!("Flow '{}' thumbnail", flow.id),
     )?;
 
+    // Validate optional PID-bus assembly plan (schema-only — runtime is
+    // not yet implemented and `FlowRuntime::start` refuses to bring up
+    // flows carrying one until Phase 4/5 lands).
+    if let Some(ref assembly) = flow.assembly {
+        validate_flow_assembly(assembly, &flow.input_ids, &format!("Flow '{}'", flow.id))?;
+    }
+
     // Validate optional flow group membership and clock domain
     if let Some(ref gid) = flow.flow_group_id {
         if gid.is_empty() {
@@ -1822,6 +1829,186 @@ fn validate_name(name: &str, context: &str) -> Result<()> {
     }
     if name.len() > 256 {
         bail!("{context} name must be at most 256 characters");
+    }
+    Ok(())
+}
+
+/// Validate the optional per-flow `assembly` block. The schema captures
+/// the PID-bus plan; the runtime that consumes it lands in later phases.
+/// Rules enforced here:
+///
+/// - `kind = Spts`: exactly one program.
+/// - `kind = Mpts`: one or more programs with distinct `program_number`s
+///   and distinct `pmt_pid`s.
+/// - `kind = Passthrough`: `programs` must be empty and `pcr_source` must
+///   be absent — passthrough is a runtime hint, not a muxer plan.
+/// - Every referenced `input_id` must appear in `flow.input_ids`.
+/// - PIDs (`pmt_pid`, `out_pid`) must be in 0x0010..=0x1FFE.
+/// - Within each program, `out_pid`s are unique and none equal the
+///   program's `pmt_pid`.
+/// - `program_number > 0` (NIT is reserved).
+/// - `service_name` length capped at 128 chars (DVB 64-byte limit
+///   leaves headroom for UTF-8).
+/// - `SlotSource::Hitless` cannot nest another `Hitless`.
+/// - When `kind != Passthrough`, `pcr_source` is required and its
+///   `input_id` must also be on the flow.
+fn validate_flow_assembly(
+    assembly: &crate::config::models::FlowAssembly,
+    flow_input_ids: &[String],
+    context: &str,
+) -> Result<()> {
+    use crate::config::models::AssemblyKind;
+
+    let input_ids: std::collections::HashSet<&str> =
+        flow_input_ids.iter().map(|s| s.as_str()).collect();
+
+    let check_input = |iid: &str| -> Result<()> {
+        if !input_ids.contains(iid) {
+            bail!(
+                "{context}: assembly references input_id '{iid}' not present in flow.input_ids"
+            );
+        }
+        Ok(())
+    };
+
+    let check_pid = |pid: u16, what: &str| -> Result<()> {
+        if !(0x0010..=0x1FFE).contains(&pid) {
+            bail!(
+                "{context}: {what} PID 0x{pid:04X} out of range; must be 0x0010..=0x1FFE"
+            );
+        }
+        Ok(())
+    };
+
+    match assembly.kind {
+        AssemblyKind::Passthrough => {
+            if !assembly.programs.is_empty() {
+                bail!(
+                    "{context}: assembly.kind = passthrough must have empty programs"
+                );
+            }
+            if assembly.pcr_source.is_some() {
+                bail!(
+                    "{context}: assembly.kind = passthrough must not carry pcr_source"
+                );
+            }
+            return Ok(());
+        }
+        AssemblyKind::Spts => {
+            if assembly.programs.len() != 1 {
+                bail!(
+                    "{context}: assembly.kind = spts requires exactly one program (got {})",
+                    assembly.programs.len()
+                );
+            }
+        }
+        AssemblyKind::Mpts => {
+            if assembly.programs.is_empty() {
+                bail!(
+                    "{context}: assembly.kind = mpts requires at least one program"
+                );
+            }
+        }
+    }
+
+    // PCR required for Spts / Mpts.
+    let pcr = assembly
+        .pcr_source
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("{context}: pcr_source is required for spts/mpts assembly"))?;
+    check_input(&pcr.input_id)?;
+    check_pid(pcr.pid, "pcr_source")?;
+
+    // Collect program-level uniqueness + recurse into slots.
+    let mut seen_pn = std::collections::HashSet::new();
+    let mut seen_pmt = std::collections::HashSet::new();
+    for prog in &assembly.programs {
+        if prog.program_number == 0 {
+            bail!(
+                "{context}: program_number must be > 0 (0 is reserved for the NIT)"
+            );
+        }
+        if !seen_pn.insert(prog.program_number) {
+            bail!(
+                "{context}: duplicate program_number {} in assembly",
+                prog.program_number
+            );
+        }
+        check_pid(prog.pmt_pid, "pmt_pid")?;
+        if !seen_pmt.insert(prog.pmt_pid) {
+            bail!(
+                "{context}: duplicate pmt_pid 0x{:04X} across programs",
+                prog.pmt_pid
+            );
+        }
+        if let Some(ref name) = prog.service_name {
+            if name.len() > 128 {
+                bail!(
+                    "{context}: program {} service_name exceeds 128 chars",
+                    prog.program_number
+                );
+            }
+        }
+
+        let mut seen_out = std::collections::HashSet::new();
+        for stream in &prog.streams {
+            check_pid(stream.out_pid, "stream.out_pid")?;
+            if stream.out_pid == prog.pmt_pid {
+                bail!(
+                    "{context}: stream.out_pid 0x{:04X} collides with pmt_pid of its own program",
+                    stream.out_pid
+                );
+            }
+            if !seen_out.insert(stream.out_pid) {
+                bail!(
+                    "{context}: duplicate stream.out_pid 0x{:04X} within program {}",
+                    stream.out_pid,
+                    prog.program_number
+                );
+            }
+            if let Some(ref label) = stream.label {
+                if label.len() > 256 {
+                    bail!(
+                        "{context}: stream label exceeds 256 chars"
+                    );
+                }
+            }
+            validate_slot_source(&stream.source, &check_input, &check_pid, context, false)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_slot_source<F, G>(
+    src: &crate::config::models::SlotSource,
+    check_input: &F,
+    check_pid: &G,
+    context: &str,
+    inside_hitless: bool,
+) -> Result<()>
+where
+    F: Fn(&str) -> Result<()>,
+    G: Fn(u16, &str) -> Result<()>,
+{
+    use crate::config::models::SlotSource;
+    match src {
+        SlotSource::Pid { input_id, source_pid } => {
+            check_input(input_id)?;
+            check_pid(*source_pid, "slot.source_pid")?;
+        }
+        SlotSource::Essence { input_id, kind: _ } => {
+            check_input(input_id)?;
+        }
+        SlotSource::Hitless { primary, backup } => {
+            if inside_hitless {
+                bail!(
+                    "{context}: hitless slot source cannot nest another hitless"
+                );
+            }
+            validate_slot_source(primary, check_input, check_pid, context, true)?;
+            validate_slot_source(backup, check_input, check_pid, context, true)?;
+        }
     }
     Ok(())
 }
@@ -3980,6 +4167,118 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::models::{
+        AssembledProgram, AssembledStream, AssemblyKind, EssenceKind, FlowAssembly, PcrSource,
+        SlotSource,
+    };
+
+    fn spts_assembly(input_id: &str) -> FlowAssembly {
+        FlowAssembly {
+            kind: AssemblyKind::Spts,
+            pcr_source: Some(PcrSource {
+                input_id: input_id.to_string(),
+                pid: 0x100,
+            }),
+            programs: vec![AssembledProgram {
+                program_number: 1,
+                service_name: None,
+                pmt_pid: 0x1000,
+                streams: vec![AssembledStream {
+                    source: SlotSource::Pid {
+                        input_id: input_id.to_string(),
+                        source_pid: 0x100,
+                    },
+                    out_pid: 0x100,
+                    stream_type: 0x1B,
+                    label: None,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn assembly_passthrough_rejects_non_empty_programs() {
+        let mut a = spts_assembly("in-a");
+        a.kind = AssemblyKind::Passthrough;
+        let err = validate_flow_assembly(&a, &["in-a".into()], "test")
+            .expect_err("must reject passthrough with programs");
+        assert!(err.to_string().contains("passthrough"));
+    }
+
+    #[test]
+    fn assembly_spts_requires_pcr_source() {
+        let mut a = spts_assembly("in-a");
+        a.pcr_source = None;
+        let err = validate_flow_assembly(&a, &["in-a".into()], "test")
+            .expect_err("must reject without pcr_source");
+        assert!(err.to_string().contains("pcr_source"));
+    }
+
+    #[test]
+    fn assembly_rejects_duplicate_program_numbers() {
+        let mut a = spts_assembly("in-a");
+        a.kind = AssemblyKind::Mpts;
+        a.programs.push(a.programs[0].clone()); // same program_number
+        a.programs[1].pmt_pid = 0x1001;
+        let err = validate_flow_assembly(&a, &["in-a".into()], "test").unwrap_err();
+        assert!(err.to_string().contains("duplicate program_number"));
+    }
+
+    #[test]
+    fn assembly_rejects_duplicate_pmt_pid() {
+        let mut a = spts_assembly("in-a");
+        a.kind = AssemblyKind::Mpts;
+        let mut p2 = a.programs[0].clone();
+        p2.program_number = 2;
+        a.programs.push(p2); // same pmt_pid
+        let err = validate_flow_assembly(&a, &["in-a".into()], "test").unwrap_err();
+        assert!(err.to_string().contains("duplicate pmt_pid"));
+    }
+
+    #[test]
+    fn assembly_rejects_unknown_input_id() {
+        let a = spts_assembly("in-unknown");
+        let err = validate_flow_assembly(&a, &["in-a".into()], "test").unwrap_err();
+        assert!(err.to_string().contains("in-unknown"));
+    }
+
+    #[test]
+    fn assembly_rejects_out_pid_colliding_with_pmt_pid() {
+        let mut a = spts_assembly("in-a");
+        a.programs[0].streams[0].out_pid = 0x1000;
+        let err = validate_flow_assembly(&a, &["in-a".into()], "test").unwrap_err();
+        assert!(err.to_string().contains("collides with pmt_pid"));
+    }
+
+    #[test]
+    fn assembly_rejects_nested_hitless() {
+        let inner = SlotSource::Hitless {
+            primary: Box::new(SlotSource::Pid {
+                input_id: "in-a".into(),
+                source_pid: 0x100,
+            }),
+            backup: Box::new(SlotSource::Essence {
+                input_id: "in-a".into(),
+                kind: EssenceKind::Video,
+            }),
+        };
+        let mut a = spts_assembly("in-a");
+        a.programs[0].streams[0].source = SlotSource::Hitless {
+            primary: Box::new(inner),
+            backup: Box::new(SlotSource::Pid {
+                input_id: "in-a".into(),
+                source_pid: 0x101,
+            }),
+        };
+        let err = validate_flow_assembly(&a, &["in-a".into()], "test").unwrap_err();
+        assert!(err.to_string().contains("nest"));
+    }
+
+    #[test]
+    fn assembly_valid_spts_passes() {
+        let a = spts_assembly("in-a");
+        validate_flow_assembly(&a, &["in-a".into()], "test").expect("valid");
+    }
 
     /// Helper: build a minimal valid AppConfig with one flow referencing one
     /// top-level input and one top-level output.
@@ -4037,6 +4336,7 @@ mod tests {
             clock_domain: None,
             input_ids: vec!["in-1".to_string()],
             output_ids: vec!["out-1".to_string()],
+            assembly: None,
         });
         config
     }
@@ -4063,6 +4363,7 @@ mod tests {
             clock_domain: None,
             input_ids: vec!["in-1".to_string()],
             output_ids: vec![],
+            assembly: None,
         });
         config
     }
@@ -4216,6 +4517,7 @@ mod tests {
             clock_domain: None,
             input_ids: vec!["in-1".to_string()],
             output_ids: vec![],
+            assembly: None,
         });
         config.flows.push(FlowConfig {
             id: "same-id".to_string(),
@@ -4229,6 +4531,7 @@ mod tests {
             clock_domain: None,
             input_ids: vec!["in-2".to_string()],
             output_ids: vec![],
+            assembly: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -4325,6 +4628,7 @@ mod tests {
             clock_domain: None,
             input_ids: vec!["in-1".to_string()],
             output_ids: vec!["out-1".to_string()],
+            assembly: None,
         });
         assert!(validate_config(&config).is_ok());
     }
@@ -4381,6 +4685,7 @@ mod tests {
             clock_domain: None,
             input_ids: vec!["in-1".to_string()],
             output_ids: vec!["out-1".to_string()],
+            assembly: None,
         });
         assert!(validate_config(&config).is_ok());
     }
@@ -4457,6 +4762,7 @@ mod tests {
             clock_domain: None,
             input_ids: vec!["in-1".to_string()],
             output_ids: vec!["out-1".to_string()],
+            assembly: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -4513,6 +4819,7 @@ mod tests {
             clock_domain: None,
             input_ids: vec!["in-1".to_string()],
             output_ids: vec!["out-1".to_string()],
+            assembly: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -4569,6 +4876,7 @@ mod tests {
             clock_domain: None,
             input_ids: vec!["in-1".to_string()],
             output_ids: vec!["out-1".to_string()],
+            assembly: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -4766,6 +5074,7 @@ mod tests {
             clock_domain: Some(0),
             input_ids: vec!["in-audio".to_string()],
             output_ids: vec!["out-1".to_string()],
+            assembly: None,
         });
         config.flow_groups.push(FlowGroupConfig {
             id: "group-1".to_string(),
@@ -4818,6 +5127,7 @@ mod tests {
             clock_domain: Some(0),
             input_ids: vec!["in-1".to_string()],
             output_ids: vec![],
+            assembly: None,
         });
         config.flow_groups.push(FlowGroupConfig {
             id: "group-1".to_string(),
@@ -4837,6 +5147,7 @@ mod tests {
             clock_domain: None,
             input_ids: vec!["in-2".to_string()],
             output_ids: vec![],
+            assembly: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -4863,6 +5174,7 @@ mod tests {
             clock_domain: Some(0),
             input_ids: vec!["in-1".to_string()],
             output_ids: vec![],
+            assembly: None,
         });
         config.flow_groups.push(FlowGroupConfig {
             id: "group-1".to_string(),

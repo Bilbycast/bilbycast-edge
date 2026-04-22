@@ -290,6 +290,139 @@ pub struct FlowConfig {
     /// References to top-level output definitions by ID.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_ids: Vec<String>,
+    /// Optional per-output PID-bus assembly plan (Phase 3+ schema).
+    /// When set, every TS output on the flow emits an MPTS/SPTS assembled
+    /// from elementary streams pulled off any of the flow's inputs, rather
+    /// than forwarding the active input's stream as a whole. Absent on
+    /// legacy flows, which fall through to today's passthrough runtime.
+    ///
+    /// The runtime that consumes this field lands in phases 4–5; until
+    /// then a flow carrying a non-`None` assembly is refused at start
+    /// time with a Critical event (no silent misbehaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assembly: Option<FlowAssembly>,
+}
+
+/// Per-flow assembly plan. Describes how each of the flow's TS outputs
+/// should build its egress TS from elementary streams pulled off any of
+/// the flow's inputs. Non-TS outputs (RTMP/WebRTC/CMAF) ignore this
+/// block and continue to pull ES by codec family from the bus.
+///
+/// `kind = Passthrough` is the simple case and exists so the "just take
+/// input A and forward it" flow doesn't need any assembly structure at
+/// all — the runtime treats it identically to a legacy flow.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FlowAssembly {
+    /// Shape of the egress TS.
+    pub kind: AssemblyKind,
+    /// PCR reference. Required for `Spts` / `Mpts` modes; must name a PID
+    /// that also appears in one of the programs' streams or is sourced
+    /// from one of the flow's input PSI catalogues. Ignored for
+    /// `Passthrough` (PCR is carried through from the input).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcr_source: Option<PcrSource>,
+    /// Programs to synthesise. For `Spts`/`Passthrough` this must contain
+    /// exactly one program; for `Mpts` one or more. Program numbers must
+    /// be unique within the flow.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub programs: Vec<AssembledProgram>,
+}
+
+/// Egress TS shape selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssemblyKind {
+    /// Single-program TS. Exactly one program in `programs`.
+    Spts,
+    /// Multi-program TS. One or more programs in `programs`.
+    Mpts,
+    /// Legacy mode — no assembly, the flow's outputs forward the active
+    /// input's bytes. Runtime-equivalent to `assembly = None`.
+    Passthrough,
+}
+
+/// PCR reference input. The runtime forwards this PID's PCR packets
+/// from the named input, remapped onto the output PMT's PCR_PID.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PcrSource {
+    /// Flow-local input ID (must be in `FlowConfig.input_ids`).
+    pub input_id: String,
+    /// Source PID carrying PCR on that input.
+    pub pid: u16,
+}
+
+/// One program in the assembled egress TS.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssembledProgram {
+    /// MPEG-TS program_number (1..=65535; 0 is reserved for the NIT).
+    pub program_number: u16,
+    /// Optional SDT `service_name` — shipped as a short label in the
+    /// manager UI and (in a later phase) synthesised into an SDT table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+    /// PMT PID for this program on the egress side. Must be unique
+    /// across programs within the assembly (PAT/PMT constraint).
+    pub pmt_pid: u16,
+    /// Elementary streams composing the program. Each slot is
+    /// independently switchable at runtime (Phase 7).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streams: Vec<AssembledStream>,
+}
+
+/// One elementary-stream slot within an assembled program.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssembledStream {
+    /// Where to pull bytes from.
+    pub source: SlotSource,
+    /// Output PID for this ES on the egress side. Must be unique within
+    /// the program. Use 0x0010..=0x1FFE.
+    pub out_pid: u16,
+    /// Output PMT `stream_type`. When sourced from a PID explicitly, the
+    /// assembler will cross-check against the source PMT and log a
+    /// warning on mismatch; when sourced by essence kind, the assembler
+    /// picks the stream_type from the source PMT.
+    pub stream_type: u8,
+    /// Optional human label surfaced in UI + events (e.g. `"English"`,
+    /// `"Isolated Camera 2"`). Round-tripped only; runtime doesn't use it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Where the bytes for a slot come from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SlotSource {
+    /// Explicit PID on a named input. Used when the operator has picked
+    /// a concrete PID from that input's PSI catalogue.
+    Pid {
+        input_id: String,
+        source_pid: u16,
+    },
+    /// Broad essence selector — the assembler picks the first stream of
+    /// the given kind from the named input's PMT. Useful when the input
+    /// is single-program and the operator just wants "its video".
+    Essence {
+        input_id: String,
+        kind: EssenceKind,
+    },
+    /// Hitless SMPTE 2022-7-style pair. Both legs carry the same ES;
+    /// the merger downstream dedupes by RTP sequence. Either nested
+    /// source may itself be another `Pid` or `Essence` — nested
+    /// `Hitless` is rejected at validation time.
+    Hitless {
+        primary: Box<SlotSource>,
+        backup: Box<SlotSource>,
+    },
+}
+
+/// Broad kind of essence on the bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EssenceKind {
+    Video,
+    Audio,
+    Subtitle,
+    Data,
 }
 
 /// Bandwidth limit configuration for per-flow trust boundary enforcement.
@@ -3160,6 +3293,69 @@ fn default_st2110_anc_pt() -> u8 {
 mod tests {
     use super::*;
 
+    /// The flow-level `assembly` block must round-trip through JSON
+    /// without dropping any slot kind — including nested `hitless` pairs
+    /// around an explicit-PID primary and essence-kind backup. Exercises
+    /// the internally-tagged `SlotSource` enum which is sensitive to
+    /// `serde_json`'s `Content` intermediate.
+    #[test]
+    fn flow_assembly_roundtrips_full_shape() {
+        let json = r#"{
+            "id": "f",
+            "name": "F",
+            "input_ids": ["in-a", "in-b"],
+            "output_ids": ["out-1"],
+            "assembly": {
+                "kind": "mpts",
+                "pcr_source": { "input_id": "in-a", "pid": 256 },
+                "programs": [
+                    {
+                        "program_number": 1,
+                        "service_name": "Channel 1",
+                        "pmt_pid": 4096,
+                        "streams": [
+                            {
+                                "source": { "type": "pid", "input_id": "in-a", "source_pid": 256 },
+                                "out_pid": 257,
+                                "stream_type": 27,
+                                "label": "Main video"
+                            },
+                            {
+                                "source": {
+                                    "type": "hitless",
+                                    "primary": { "type": "pid", "input_id": "in-a", "source_pid": 258 },
+                                    "backup":  { "type": "essence", "input_id": "in-b", "kind": "audio" }
+                                },
+                                "out_pid": 259,
+                                "stream_type": 15
+                            }
+                        ]
+                    }
+                ]
+            }
+        }"#;
+        let parsed: FlowConfig = serde_json::from_str(json).expect("parse");
+        let a = parsed.assembly.as_ref().expect("assembly present");
+        assert!(matches!(a.kind, AssemblyKind::Mpts));
+        assert_eq!(a.programs.len(), 1);
+        assert_eq!(a.programs[0].streams.len(), 2);
+        assert!(matches!(&a.programs[0].streams[1].source, SlotSource::Hitless { .. }));
+        let reser = serde_json::to_string(&parsed).unwrap();
+        let reparsed: FlowConfig = serde_json::from_str(&reser).unwrap();
+        assert_eq!(parsed.assembly, reparsed.assembly);
+    }
+
+    /// Absent `assembly` must not appear in the JSON and must still
+    /// parse back as `None` — keeps legacy flows byte-clean on the wire.
+    #[test]
+    fn flow_assembly_skipped_when_unset() {
+        let json = r#"{"id":"f","name":"F","input_ids":["a"],"output_ids":["o"]}"#;
+        let parsed: FlowConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.assembly.is_none());
+        let reser = serde_json::to_string(&parsed).unwrap();
+        assert!(!reser.contains("assembly"), "assembly leaked into JSON: {reser}");
+    }
+
     /// pid_map must round-trip through the JSON wire format on every
     /// TS-native output. Serde's default path for `BTreeMap<u16, u16>`
     /// breaks inside `#[serde(tag = "type")]` enums (`serde_json`'s
@@ -3293,6 +3489,7 @@ mod tests {
                 clock_domain: None,
                 input_ids: vec!["rtp-in-1".to_string()],
                 output_ids: vec!["rtp-out-1".to_string()],
+                assembly: None,
             }],
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
@@ -3351,6 +3548,7 @@ mod tests {
                 clock_domain: None,
                 input_ids: vec!["in-1".to_string()],
                 output_ids: vec!["out-1".to_string()],
+                assembly: None,
             }],
             ..Default::default()
         };
@@ -3377,6 +3575,7 @@ mod tests {
                 clock_domain: None,
                 input_ids: vec!["nonexistent".to_string()],
                 output_ids: vec![],
+                assembly: None,
             }],
             ..Default::default()
         };
@@ -3451,6 +3650,7 @@ mod tests {
                 clock_domain: None,
                 input_ids: vec!["in-1".to_string()],
                 output_ids: vec!["out-1".to_string(), "out-2".to_string()],
+                assembly: None,
             }],
             ..Default::default()
         };
