@@ -21,6 +21,7 @@ use crate::util::time::now_us;
 use super::delay_buffer::resolve_output_delay;
 use super::packet::RtpPacket;
 use super::ts_audio_replace::TsAudioReplacer;
+use super::ts_pid_remapper::TsPidRemapper;
 use super::ts_program_filter::TsProgramFilter;
 use super::ts_video_replace::TsVideoReplacer;
 
@@ -187,6 +188,23 @@ async fn rtp_output_loop(
         TsProgramFilter::new(n)
     });
     let mut filter_scratch: Vec<u8> = Vec::new();
+
+    // Optional PID remapper. Runs on every packet after the program filter
+    // and preserves the RTP header for wrapped packets (zero-copy passthrough).
+    let mut pid_remapper = config.pid_map.as_ref().and_then(|m| {
+        let r = TsPidRemapper::new(m);
+        if r.is_active() {
+            tracing::info!(
+                "RTP output '{}': pid_map active ({} entries)",
+                config.id,
+                m.len()
+            );
+            Some(r)
+        } else {
+            None
+        }
+    });
+    let mut remap_scratch: Vec<u8> = Vec::new();
 
     // Optional audio ES replacement. When set, all outgoing packets are
     // forced through the raw-TS path (the original RTP framing is
@@ -355,6 +373,21 @@ async fn rtp_output_loop(
                             match filter.filter_packet(&packet, &mut filter_scratch) {
                                 Some(filtered) => RtpPacket {
                                     data: filtered,
+                                    sequence_number: packet.sequence_number,
+                                    rtp_timestamp: packet.rtp_timestamp,
+                                    recv_time_us: packet.recv_time_us,
+                                    is_raw_ts: packet.is_raw_ts,
+                                },
+                                None => continue,
+                            }
+                        } else {
+                            packet
+                        };
+
+                        let packet = if let Some(ref mut remapper) = pid_remapper {
+                            match remapper.process_packet(&packet, &mut remap_scratch) {
+                                Some(remapped) => RtpPacket {
+                                    data: remapped,
                                     sequence_number: packet.sequence_number,
                                     rtp_timestamp: packet.rtp_timestamp,
                                     recv_time_us: packet.recv_time_us,
@@ -634,6 +667,23 @@ async fn rtp_output_redundant_loop(
     });
     let mut filter_scratch: Vec<u8> = Vec::new();
 
+    // Optional PID remapper (shared by both legs — both legs MUST emit
+    // identical payloads so the receiver merger can dedupe by seq).
+    let mut pid_remapper = config.pid_map.as_ref().and_then(|m| {
+        let r = TsPidRemapper::new(m);
+        if r.is_active() {
+            tracing::info!(
+                "RTP output '{}' (2022-7): pid_map active ({} entries)",
+                config.id,
+                m.len()
+            );
+            Some(r)
+        } else {
+            None
+        }
+    });
+    let mut remap_scratch: Vec<u8> = Vec::new();
+
     // RTP wrap state shared by both legs — both legs MUST emit identical
     // sequence numbers and SSRC so the receiver-side hitless merger can
     // dedupe by sequence number per SMPTE 2022-7.
@@ -677,6 +727,21 @@ async fn rtp_output_redundant_loop(
                             match filter.filter_packet(&packet, &mut filter_scratch) {
                                 Some(filtered) => RtpPacket {
                                     data: filtered,
+                                    sequence_number: packet.sequence_number,
+                                    rtp_timestamp: packet.rtp_timestamp,
+                                    recv_time_us: packet.recv_time_us,
+                                    is_raw_ts: packet.is_raw_ts,
+                                },
+                                None => continue,
+                            }
+                        } else {
+                            packet
+                        };
+
+                        let packet = if let Some(ref mut remapper) = pid_remapper {
+                            match remapper.process_packet(&packet, &mut remap_scratch) {
+                                Some(remapped) => RtpPacket {
+                                    data: remapped,
                                     sequence_number: packet.sequence_number,
                                     rtp_timestamp: packet.rtp_timestamp,
                                     recv_time_us: packet.recv_time_us,

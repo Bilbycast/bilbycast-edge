@@ -25,6 +25,7 @@ use super::audio_encode::AudioCodec;
 #[cfg(not(feature = "video-thumbnail"))]
 use super::audio_encode::check_ffmpeg_available;
 use super::packet::RtpPacket;
+use super::ts_pid_remapper::TsPidRemapper;
 use super::ts_program_filter::TsProgramFilter;
 
 /// Maximum time we'll wait for ffmpeg to re-mux a single segment.
@@ -161,6 +162,21 @@ async fn hls_output_loop(
     });
     let mut filter_scratch: Vec<u8> = Vec::new();
 
+    let mut pid_remapper = config.pid_map.as_ref().and_then(|m| {
+        let r = TsPidRemapper::new(m);
+        if r.is_active() {
+            tracing::info!(
+                "HLS output '{}': pid_map active ({} entries)",
+                config.id,
+                m.len()
+            );
+            Some(r)
+        } else {
+            None
+        }
+    });
+    let mut remap_scratch: Vec<u8> = Vec::new();
+
     // Rolling playlist: (sequence_number, duration_secs)
     let mut playlist_entries: VecDeque<(u64, f64)> = VecDeque::new();
 
@@ -190,15 +206,23 @@ async fn hls_output_loop(
                         // Apply program filter if configured: feed only the
                         // selected program's TS bytes into the segment buffer.
                         // Skip the packet entirely when the filter eats it.
-                        if let Some(ref mut filter) = program_filter {
+                        let filtered: &[u8] = if let Some(ref mut filter) = program_filter {
                             filter_scratch.clear();
                             filter.filter_into(payload, &mut filter_scratch);
                             if filter_scratch.is_empty() {
                                 continue;
                             }
-                            segment_buf.extend_from_slice(&filter_scratch);
+                            &filter_scratch
                         } else {
-                            segment_buf.extend_from_slice(payload);
+                            payload
+                        };
+
+                        if let Some(ref mut remapper) = pid_remapper {
+                            remap_scratch.clear();
+                            remapper.process(filtered, &mut remap_scratch);
+                            segment_buf.extend_from_slice(&remap_scratch);
+                        } else {
+                            segment_buf.extend_from_slice(filtered);
                         }
 
                         // Check if we should cut a segment.

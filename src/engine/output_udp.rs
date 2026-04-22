@@ -22,6 +22,7 @@ use super::audio_transcode::InputFormat;
 use super::delay_buffer::resolve_output_delay;
 use super::packet::RtpPacket;
 use super::ts_audio_replace::TsAudioReplacer;
+use super::ts_pid_remapper::TsPidRemapper;
 use super::ts_program_filter::TsProgramFilter;
 use super::ts_video_replace::TsVideoReplacer;
 
@@ -204,6 +205,23 @@ async fn udp_output_loop(
         TsProgramFilter::new(n)
     });
     let mut filter_scratch: Vec<u8> = Vec::new();
+
+    // Optional PID remapper (runs last in the TS transform chain, just before
+    // the datagram assembler picks up bytes).
+    let mut pid_remapper = config.pid_map.as_ref().and_then(|m| {
+        let r = TsPidRemapper::new(m);
+        if r.is_active() {
+            tracing::info!(
+                "UDP output '{}': pid_map active ({} entries)",
+                config.id,
+                m.len()
+            );
+            Some(r)
+        } else {
+            None
+        }
+    });
+    let mut remap_scratch: Vec<u8> = Vec::new();
 
     // Optional audio ES replacement (decode + re-encode audio in the TS).
     let mut audio_replacer = match config.audio_encode.as_ref() {
@@ -403,14 +421,25 @@ async fn udp_output_loop(
 
             // Apply video ES replacement if configured. Runs after audio
             // so both transforms stack cleanly on the same TS stream.
-            if let Some(ref mut vreplacer) = video_replacer {
+            let after_video: &[u8] = if let Some(ref mut vreplacer) = video_replacer {
                 video_replace_scratch.clear();
                 tokio::task::block_in_place(|| {
                     vreplacer.process(after_audio, &mut video_replace_scratch);
                 });
-                ts_buf.extend_from_slice(&video_replace_scratch);
+                &video_replace_scratch
             } else {
-                ts_buf.extend_from_slice(after_audio);
+                after_audio
+            };
+
+            // Apply PID remapping last, so audio/video replacers see original
+            // PIDs in the PMT (they identify streams by stream_type, but this
+            // keeps debugging + stats consistent with the source stream).
+            if let Some(ref mut remapper) = pid_remapper {
+                remap_scratch.clear();
+                remapper.process(after_video, &mut remap_scratch);
+                ts_buf.extend_from_slice(&remap_scratch);
+            } else {
+                ts_buf.extend_from_slice(after_video);
             }
 
             // Find TS sync boundary on first data

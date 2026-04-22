@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Root configuration, persisted to config.json
@@ -1190,6 +1192,17 @@ pub struct RtpOutputConfig {
     /// Must be > 0; program_number 0 is reserved for the NIT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_number: Option<u16>,
+    /// Optional PID remapping applied after `program_number` filtering and
+    /// any audio/video re-encode. Keys are source PIDs, values are target
+    /// PIDs (both 0x0010..=0x1FFE). PAT `program_map_PID` and PMT
+    /// `PCR_PID` + elementary-PID fields are rewritten automatically;
+    /// section CRCs are recomputed. See [`ts_pid_remapper`](crate::engine::ts_pid_remapper).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_map_serde"
+    )]
+    pub pid_map: Option<BTreeMap<u16, u16>>,
     /// Optional output delay for stream synchronization.
     /// See [`OutputDelay`] for the available modes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1302,6 +1315,15 @@ pub struct UdpOutputConfig {
     /// Must be > 0; program_number 0 is reserved for the NIT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_number: Option<u16>,
+    /// Optional PID remapping. See [`RtpOutputConfig::pid_map`] for semantics.
+    /// Incompatible with `transport_mode = "audio_302m"` (the 302M path
+    /// synthesizes its own TS and owns the PID assignments).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_map_serde"
+    )]
+    pub pid_map: Option<BTreeMap<u16, u16>>,
     /// Transport mode for this UDP output. `"ts"` (default) sends raw
     /// MPEG-TS as the existing path does. `"audio_302m"` runs the per-output
     /// transcode + 302M-in-MPEG-TS pipeline and sends the resulting
@@ -1457,6 +1479,14 @@ pub struct SrtOutputConfig {
     /// Must be > 0; program_number 0 is reserved for the NIT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_number: Option<u16>,
+    /// Optional PID remapping. See [`RtpOutputConfig::pid_map`] for semantics.
+    /// Incompatible with `transport_mode = "audio_302m"`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_map_serde"
+    )]
+    pub pid_map: Option<BTreeMap<u16, u16>>,
     /// Transport mode for this SRT output. `"ts"` (default) sends whatever
     /// the upstream broadcast channel produces (RTP-wrapped or raw TS).
     /// `"audio_302m"` runs the per-output transcode + 302M packetizer
@@ -1778,6 +1808,13 @@ pub struct RistOutputConfig {
     /// program. Must be > 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_number: Option<u16>,
+    /// Optional PID remapping. See [`RtpOutputConfig::pid_map`] for semantics.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_map_serde"
+    )]
+    pub pid_map: Option<BTreeMap<u16, u16>>,
     /// Optional output delay for stream synchronization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay: Option<OutputDelay>,
@@ -1879,6 +1916,14 @@ pub struct BondedOutputConfig {
     /// other TS-native outputs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_number: Option<u16>,
+    /// Optional PID remapping applied after `program_number` filtering and
+    /// before bonding. See [`RtpOutputConfig::pid_map`] for semantics.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_map_serde"
+    )]
+    pub pid_map: Option<BTreeMap<u16, u16>>,
 }
 
 /// A single bond leg definition.
@@ -2106,6 +2151,16 @@ pub struct HlsOutputConfig {
     /// for the NIT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_number: Option<u16>,
+    /// Optional PID remapping applied to the TS bytes before segmentation.
+    /// See [`RtpOutputConfig::pid_map`] for semantics. Applied only on the
+    /// passthrough/codec-preserving path; the audio-reencode fast path
+    /// still honours the map because PIDs are rewritten after re-encode.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_map_serde"
+    )]
+    pub pid_map: Option<BTreeMap<u16, u16>>,
     /// Optional audio encode block. When set, this output stops being a
     /// pure TS-passthrough segmenter: it demuxes video + audio, re-encodes
     /// audio via the ffmpeg sidecar encoder, and re-muxes a fresh TS for
@@ -3105,6 +3160,38 @@ fn default_st2110_anc_pt() -> u8 {
 mod tests {
     use super::*;
 
+    /// pid_map must round-trip through the JSON wire format on every
+    /// TS-native output. Serde's default path for `BTreeMap<u16, u16>`
+    /// breaks inside `#[serde(tag = "type")]` enums (`serde_json`'s
+    /// `Content` intermediate drops the key coercion), so each field
+    /// uses the shared `pid_map_serde` helper. This test pins that.
+    #[test]
+    fn pid_map_roundtrips_on_every_ts_native_output() {
+        let cases = [
+            r#"{"type":"udp","id":"u","name":"u","dest_addr":"239.0.0.1:5004","pid_map":{"256":768,"257":769}}"#,
+            r#"{"type":"rtp","id":"r","name":"r","dest_addr":"239.0.0.1:5004","pid_map":{"256":768}}"#,
+            r#"{"type":"srt","id":"s","name":"s","mode":"caller","remote_addr":"1.2.3.4:6000","pid_map":{"256":768}}"#,
+            r#"{"type":"rist","id":"ri","name":"ri","remote_addr":"1.2.3.4:6000","pid_map":{"256":768}}"#,
+            r#"{"type":"hls","id":"h","name":"h","ingest_url":"https://x/y","pid_map":{"256":768}}"#,
+        ];
+        for json in cases {
+            let parsed: OutputConfig = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("parse failed for {json}: {e}"));
+            let reser = serde_json::to_string(&parsed).unwrap();
+            assert!(reser.contains("\"pid_map\""), "pid_map stripped on reserialise: {reser}");
+            let reparsed: OutputConfig = serde_json::from_str(&reser).unwrap();
+            let map: BTreeMap<u16, u16> = match reparsed {
+                OutputConfig::Udp(u) => u.pid_map.unwrap(),
+                OutputConfig::Rtp(r) => r.pid_map.unwrap(),
+                OutputConfig::Srt(s) => s.pid_map.unwrap(),
+                OutputConfig::Rist(r) => r.pid_map.unwrap(),
+                OutputConfig::Hls(h) => h.pid_map.unwrap(),
+                _ => panic!("unexpected variant for {json}"),
+            };
+            assert_eq!(map.get(&256), Some(&768));
+        }
+    }
+
     /// Regression for Bug C (2026-04-09): the TR-101290 analyzer must only
     /// run on inputs that actually carry MPEG-TS bytes. Audio-only inputs
     /// (ST 2110-30/-31, `rtp_audio`) and ANC inputs (ST 2110-40) carry PCM
@@ -3188,6 +3275,7 @@ mod tests {
                 dscp: default_dscp(),
                 redundancy: None,
                 program_number: None,
+                pid_map: None,
                 delay: None,
                 audio_encode: None,
                 transcode: None,
@@ -3245,6 +3333,7 @@ mod tests {
                 dscp: default_dscp(),
                 redundancy: None,
                 program_number: None,
+                pid_map: None,
                 delay: None,
                 audio_encode: None,
                 transcode: None,

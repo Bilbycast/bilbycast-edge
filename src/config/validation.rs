@@ -1837,6 +1837,50 @@ fn validate_program_number(prog: Option<u16>, context: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate an optional MPEG-TS PID remap table. Keys and values must be
+/// real user-range PIDs (0x0010–0x1FFE — reserved slots 0x0000..=0x000F,
+/// PAT/CAT, and the NULL PID 0x1FFF are refused). No two source PIDs may
+/// map to the same target. Target PIDs must be unique across the map too,
+/// which together with the uniqueness-of-source property guarantees that
+/// two different sources can never collide on the wire. A source mapping
+/// to itself is refused as a pointless no-op that obscures intent.
+fn validate_pid_map(
+    map: Option<&std::collections::BTreeMap<u16, u16>>,
+    context: &str,
+) -> Result<()> {
+    let Some(map) = map else {
+        return Ok(());
+    };
+    if map.len() > 256 {
+        bail!("{context}: pid_map has {} entries; at most 256 allowed", map.len());
+    }
+    let mut seen_targets: std::collections::HashSet<u16> =
+        std::collections::HashSet::with_capacity(map.len());
+    for (src, dst) in map {
+        if *src < 0x0010 || *src > 0x1FFE {
+            bail!(
+                "{context}: pid_map source PID 0x{src:04X} out of range; must be in 0x0010..=0x1FFE"
+            );
+        }
+        if *dst < 0x0010 || *dst > 0x1FFE {
+            bail!(
+                "{context}: pid_map target PID 0x{dst:04X} out of range; must be in 0x0010..=0x1FFE"
+            );
+        }
+        if *src == *dst {
+            bail!(
+                "{context}: pid_map entry 0x{src:04X} -> 0x{dst:04X} is a no-op (source equals target)"
+            );
+        }
+        if !seen_targets.insert(*dst) {
+            bail!(
+                "{context}: pid_map target PID 0x{dst:04X} used more than once (targets must be unique)"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Validate a `video_encode` block. The backend allowlist is
 /// output-specific (future work — for now every TS-transport output
 /// accepts the same set: x264/x265/nvenc variants). Validation here
@@ -2218,6 +2262,7 @@ pub fn validate_output_with_input(
             validate_id(&rtp.id, "RTP output")?;
             validate_name(&rtp.name, "RTP output")?;
             validate_program_number(rtp.program_number, &format!("RTP output '{}'", rtp.id))?;
+            validate_pid_map(rtp.pid_map.as_ref(), &format!("RTP output '{}'", rtp.id))?;
             validate_socket_addr(&rtp.dest_addr, "RTP output dest_addr")?;
             if let Some(ref bind) = rtp.bind_addr {
                 validate_socket_addr(bind, "RTP output bind_addr")?;
@@ -2306,6 +2351,13 @@ pub fn validate_output_with_input(
             validate_id(&udp.id, "UDP output")?;
             validate_name(&udp.name, "UDP output")?;
             validate_program_number(udp.program_number, &format!("UDP output '{}'", udp.id))?;
+            validate_pid_map(udp.pid_map.as_ref(), &format!("UDP output '{}'", udp.id))?;
+            if udp.pid_map.is_some() && udp.transport_mode.as_deref() == Some("audio_302m") {
+                bail!(
+                    "UDP output '{}': pid_map is incompatible with transport_mode 'audio_302m'",
+                    udp.id
+                );
+            }
             validate_socket_addr(&udp.dest_addr, "UDP output dest_addr")?;
             if let Some(ref bind) = udp.bind_addr {
                 validate_socket_addr(bind, "UDP output bind_addr")?;
@@ -2370,6 +2422,13 @@ pub fn validate_output_with_input(
             validate_id(&srt.id, "SRT output")?;
             validate_name(&srt.name, "SRT output")?;
             validate_program_number(srt.program_number, &format!("SRT output '{}'", srt.id))?;
+            validate_pid_map(srt.pid_map.as_ref(), &format!("SRT output '{}'", srt.id))?;
+            if srt.pid_map.is_some() && srt.transport_mode.as_deref() == Some("audio_302m") {
+                bail!(
+                    "SRT output '{}': pid_map is incompatible with transport_mode 'audio_302m'",
+                    srt.id
+                );
+            }
             match srt.mode {
                 SrtMode::Listener | SrtMode::Rendezvous => {
                     let addr = srt.local_addr.as_deref()
@@ -2542,6 +2601,7 @@ pub fn validate_output_with_input(
             validate_id(&hls.id, "HLS output")?;
             validate_name(&hls.name, "HLS output")?;
             validate_program_number(hls.program_number, &format!("HLS output '{}'", hls.id))?;
+            validate_pid_map(hls.pid_map.as_ref(), &format!("HLS output '{}'", hls.id))?;
             if !hls.ingest_url.starts_with("http://") && !hls.ingest_url.starts_with("https://") {
                 bail!("HLS output '{}': ingest_url must start with http:// or https://", hls.id);
             }
@@ -2884,6 +2944,7 @@ fn validate_bonded_output(c: &crate::config::models::BondedOutputConfig) -> Resu
             ));
         }
     }
+    validate_pid_map(c.pid_map.as_ref(), &format!("bonded output '{}'", c.id))?;
     Ok(())
 }
 
@@ -3212,6 +3273,7 @@ fn validate_rist_output(rist: &RistOutputConfig) -> Result<()> {
     validate_name(&rist.name, "RIST output")?;
     validate_output_group(rist.group.as_deref(), &rist.id)?;
     validate_program_number(rist.program_number, &format!("RIST output '{}'", rist.id))?;
+    validate_pid_map(rist.pid_map.as_ref(), &format!("RIST output '{}'", rist.id))?;
     validate_rist_addr(&rist.remote_addr, &format!("RIST output '{}' remote_addr", rist.id))?;
     if let Some(ref local) = rist.local_addr {
         validate_rist_addr(local, &format!("RIST output '{}' local_addr", rist.id))?;
@@ -3957,6 +4019,7 @@ mod tests {
             dscp: 46,
             redundancy: None,
             program_number: None,
+            pid_map: None,
             delay: None,
             audio_encode: None,
             transcode: None,
@@ -4244,6 +4307,7 @@ mod tests {
             dscp: 46,
             redundancy: None,
             program_number: None,
+            pid_map: None,
             delay: None,
             audio_encode: None,
             transcode: None,
@@ -4299,6 +4363,7 @@ mod tests {
             dscp: 46,
             redundancy: None,
             program_number: None,
+            pid_map: None,
             delay: None,
             audio_encode: None,
             transcode: None,
@@ -4374,6 +4439,7 @@ mod tests {
             dscp: 46,
             redundancy: None,
             program_number: None,
+            pid_map: None,
             delay: None,
             audio_encode: None,
             transcode: None,
@@ -4429,6 +4495,7 @@ mod tests {
             dscp: 46,
             redundancy: None,
             program_number: None,
+            pid_map: None,
             delay: None,
             audio_encode: None,
             transcode: None,
@@ -4484,6 +4551,7 @@ mod tests {
             dscp: 46,
             redundancy: None,
             program_number: None,
+            pid_map: None,
             delay: None,
             audio_encode: None,
             transcode: None,
@@ -5069,6 +5137,7 @@ mod tests {
             auth_token: None,
             max_segments: 5,
             program_number: None,
+            pid_map: None,
             audio_encode: Some(AudioEncodeConfig {
                 codec: codec.into(),
                 bitrate_kbps: None,
@@ -5097,6 +5166,7 @@ mod tests {
             auth_token: None,
             max_segments: 5,
             program_number: None,
+            pid_map: None,
             audio_encode: None,
             transcode: None,
         });
@@ -5126,6 +5196,7 @@ mod tests {
             auth_token: Some(token.into()),
             max_segments: 5,
             program_number: None,
+            pid_map: None,
             audio_encode: None,
             transcode: None,
         });
@@ -5500,6 +5571,7 @@ mod tests {
             interface_addr: None,
             dscp: 46,
             program_number: None,
+            pid_map: None,
             transport_mode: None,
             delay: None,
             audio_encode: None,
@@ -5516,6 +5588,7 @@ mod tests {
             interface_addr: None,
             dscp: 46,
             program_number: None,
+            pid_map: None,
             transport_mode: None,
             delay: None,
             audio_encode: None,

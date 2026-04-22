@@ -14,5 +14,6 @@
 pub mod crypto;
 pub mod models;
 pub mod persistence;
+pub mod pid_map_serde;
 pub mod secrets;
 pub mod validation;

@@ -35,6 +35,7 @@ use crate::util::time::now_us;
 use super::delay_buffer::resolve_output_delay;
 use super::packet::RtpPacket;
 use super::ts_audio_replace::TsAudioReplacer;
+use super::ts_pid_remapper::TsPidRemapper;
 use super::ts_program_filter::TsProgramFilter;
 use super::ts_video_replace::TsVideoReplacer;
 
@@ -209,6 +210,21 @@ async fn rist_output_loop(
 
     let mut program_filter = config.program_number.map(TsProgramFilter::new);
     let mut filter_scratch: Vec<u8> = Vec::new();
+
+    let mut pid_remapper = config.pid_map.as_ref().and_then(|m| {
+        let r = TsPidRemapper::new(m);
+        if r.is_active() {
+            tracing::info!(
+                "RIST output '{}': pid_map active ({} entries)",
+                config.id,
+                m.len()
+            );
+            Some(r)
+        } else {
+            None
+        }
+    });
+    let mut remap_scratch: Vec<u8> = Vec::new();
 
     let mut audio_replacer = match config.audio_encode.as_ref() {
         Some(enc) => match TsAudioReplacer::new(enc, config.transcode.clone()) {
@@ -398,14 +414,22 @@ async fn rist_output_loop(
                 filtered_bytes
             };
 
-            if let Some(ref mut vreplacer) = video_replacer {
+            let after_video: &[u8] = if let Some(ref mut vreplacer) = video_replacer {
                 video_replace_scratch.clear();
                 tokio::task::block_in_place(|| {
                     vreplacer.process(after_audio, &mut video_replace_scratch);
                 });
-                ts_buf.extend_from_slice(&video_replace_scratch);
+                &video_replace_scratch
             } else {
-                ts_buf.extend_from_slice(after_audio);
+                after_audio
+            };
+
+            if let Some(ref mut remapper) = pid_remapper {
+                remap_scratch.clear();
+                remapper.process(after_video, &mut remap_scratch);
+                ts_buf.extend_from_slice(&remap_scratch);
+            } else {
+                ts_buf.extend_from_slice(after_video);
             }
 
             if !ts_sync_found {

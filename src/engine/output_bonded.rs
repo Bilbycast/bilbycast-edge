@@ -40,6 +40,7 @@ use crate::stats::collector::OutputStatsAccumulator;
 
 use super::input_bonded::{parse_sockaddr, translate_tls};
 use super::packet::RtpPacket;
+use super::ts_pid_remapper::TsPidRemapper;
 use super::ts_program_filter::TsProgramFilter;
 
 const RTP_HEADER_MIN_SIZE: usize = 12;
@@ -172,6 +173,21 @@ async fn bonded_output_loop(
     let mut program_filter = config.program_number.map(TsProgramFilter::new);
     let mut filter_scratch: Vec<u8> = Vec::new();
 
+    let mut pid_remapper = config.pid_map.as_ref().and_then(|m| {
+        let r = TsPidRemapper::new(m);
+        if r.is_active() {
+            tracing::info!(
+                "bonded output '{}': pid_map active ({} entries)",
+                config.id,
+                m.len()
+            );
+            Some(r)
+        } else {
+            None
+        }
+    });
+    let mut remap_scratch: Vec<u8> = Vec::new();
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -200,10 +216,18 @@ async fn bonded_output_loop(
                         ts_bytes
                     };
 
+                    let remapped: &[u8] = if let Some(ref mut remapper) = pid_remapper {
+                        remap_scratch.clear();
+                        remapper.process(filtered, &mut remap_scratch);
+                        &remap_scratch
+                    } else {
+                        filtered
+                    };
+
                     // Decide priority / marker from media-aware
                     // scheduler (or fall back to defaults).
                     let hints = match media_sched.as_mut() {
-                        Some(s) => s.hints_for(filtered),
+                        Some(s) => s.hints_for(remapped),
                         None => PacketHints::default(),
                     };
 
@@ -211,14 +235,14 @@ async fn bonded_output_loop(
                     // so the bond layer owns its own refcount; if the
                     // caller holds `packet` elsewhere the copy is
                     // amortised with the scheduler's own send.
-                    let payload = bytes::Bytes::copy_from_slice(filtered);
+                    let payload = bytes::Bytes::copy_from_slice(remapped);
                     if let Err(e) = socket.send(payload, hints).await {
                         tracing::warn!("bonded output '{}' send error: {e}", config.id);
                     } else {
                         stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                         stats
                             .bytes_sent
-                            .fetch_add(filtered.len() as u64, Ordering::Relaxed);
+                            .fetch_add(remapped.len() as u64, Ordering::Relaxed);
                         stats.record_latency(packet.recv_time_us);
                     }
                 }

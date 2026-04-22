@@ -29,6 +29,7 @@ use super::audio_transcode::InputFormat;
 use super::delay_buffer::resolve_output_delay;
 use super::packet::RtpPacket;
 use super::ts_audio_replace::TsAudioReplacer;
+use super::ts_pid_remapper::TsPidRemapper;
 use super::ts_program_filter::TsProgramFilter;
 use super::ts_video_replace::TsVideoReplacer;
 
@@ -236,6 +237,7 @@ async fn srt_output_listener_loop(
         );
         TsProgramFilter::new(n)
     });
+    let mut pid_remapper = build_pid_remapper(config);
     let mut audio_replacer = build_audio_replacer(config, events);
     let mut video_replacer = build_video_replacer(config, &stats, events);
 
@@ -342,7 +344,7 @@ async fn srt_output_listener_loop(
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
 
         let sink = SrtSendSink::Socket(socket.clone());
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut audio_replacer, &mut video_replacer, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut audio_replacer, &mut video_replacer, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -393,6 +395,7 @@ async fn srt_output_caller_loop(
         );
         TsProgramFilter::new(n)
     });
+    let mut pid_remapper = build_pid_remapper(config);
     let mut audio_replacer = build_audio_replacer(config, events);
     let mut video_replacer = build_video_replacer(config, &stats, events);
     loop {
@@ -445,7 +448,7 @@ async fn srt_output_caller_loop(
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
 
         let sink = SrtSendSink::Socket(socket.clone());
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut audio_replacer, &mut video_replacer, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut audio_replacer, &mut video_replacer, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -485,6 +488,23 @@ async fn srt_output_caller_loop(
 ///
 /// `program_filter` is owned by the caller so its PAT/PMT state survives
 /// reconnects.
+/// Build a [`TsPidRemapper`] from `config.pid_map`. Returns `None` when
+/// the map is absent or empty (no-op).
+fn build_pid_remapper(config: &SrtOutputConfig) -> Option<TsPidRemapper> {
+    let map = config.pid_map.as_ref()?;
+    let r = TsPidRemapper::new(map);
+    if r.is_active() {
+        tracing::info!(
+            "SRT output '{}': pid_map active ({} entries)",
+            config.id,
+            map.len()
+        );
+        Some(r)
+    } else {
+        None
+    }
+}
+
 /// Resolve an `audio_encode` config into a [`TsAudioReplacer`]. Logs and
 /// returns `None` when the codec isn't supported by this build.
 fn build_audio_replacer(config: &SrtOutputConfig, events: &EventSender) -> Option<TsAudioReplacer> {
@@ -597,6 +617,7 @@ async fn srt_output_forward_loop(
     cancel: &CancellationToken,
     sink: &SrtSendSink,
     program_filter: &mut Option<TsProgramFilter>,
+    pid_remapper: &mut Option<TsPidRemapper>,
     audio_replacer: &mut Option<TsAudioReplacer>,
     video_replacer: &mut Option<TsVideoReplacer>,
     input_format: Option<InputFormat>,
@@ -718,6 +739,7 @@ async fn srt_output_forward_loop(
     let mut decode_stats_302m_registered = false;
 
     let mut filter_scratch: Vec<u8> = Vec::new();
+    let mut remap_scratch: Vec<u8> = Vec::new();
 
     // Optional output delay buffer for stream synchronization.
     // Only active for the normal TS path (not 302M, which is blocked
@@ -886,6 +908,25 @@ async fn srt_output_forward_loop(
                             payload
                         };
 
+                        // Apply PID remap last so audio/video replacers saw the
+                        // original PIDs in the source PMT. need_strip implies
+                        // the bytes are now raw TS (RTP header was discarded).
+                        let payload = if let Some(remapper) = pid_remapper.as_mut() {
+                            let temp = RtpPacket {
+                                data: payload,
+                                sequence_number: packet.sequence_number,
+                                rtp_timestamp: packet.rtp_timestamp,
+                                recv_time_us: packet.recv_time_us,
+                                is_raw_ts: packet.is_raw_ts || need_strip,
+                            };
+                            match remapper.process_packet(&temp, &mut remap_scratch) {
+                                Some(b) => b,
+                                None => continue,
+                            }
+                        } else {
+                            payload
+                        };
+
                         if let Some(ref mut db) = delay_buf {
                             // Re-wrap as RtpPacket for the delay buffer (using
                             // the filtered payload but preserving timing metadata).
@@ -1005,6 +1046,12 @@ async fn srt_output_redundant_loop(
         TsProgramFilter::new(n)
     });
     let mut filter_scratch: Vec<u8> = Vec::new();
+
+    // Optional PID remapper. Both legs must emit identical payloads for the
+    // receiver merger to dedupe by seq; a single remapper fed by both legs
+    // guarantees that.
+    let mut pid_remapper = build_pid_remapper(config);
+    let mut remap_scratch: Vec<u8> = Vec::new();
 
     // Outer reconnection loop — restarts both legs on total connection loss
     loop {
@@ -1247,6 +1294,23 @@ async fn srt_output_redundant_loop(
                                 }
                             } else {
                                 packet.data
+                            };
+
+                            // Apply PID remap so both legs carry the remapped bytes.
+                            let payload = if let Some(ref mut remapper) = pid_remapper {
+                                let temp = RtpPacket {
+                                    data: payload,
+                                    sequence_number: packet.sequence_number,
+                                    rtp_timestamp: packet.rtp_timestamp,
+                                    recv_time_us: packet.recv_time_us,
+                                    is_raw_ts: packet.is_raw_ts,
+                                };
+                                match remapper.process_packet(&temp, &mut remap_scratch) {
+                                    Some(b) => b,
+                                    None => continue,
+                                }
+                            } else {
+                                payload
                             };
 
                             if let Some(ref mut db) = delay_buf {
@@ -1528,6 +1592,7 @@ async fn srt_output_bonded_loop(
         );
         TsProgramFilter::new(n)
     });
+    let mut pid_remapper = build_pid_remapper(config);
     let mut audio_replacer = build_audio_replacer(config, events);
     let mut video_replacer = build_video_replacer(config, &stats, events);
 
@@ -1580,7 +1645,7 @@ async fn srt_output_bonded_loop(
                 let sink = SrtSendSink::Socket(socket.clone());
                 let disconnected = srt_output_forward_loop(
                     config, &mut rx, &stats, &cancel, &sink,
-                    &mut program_filter, &mut audio_replacer, &mut video_replacer,
+                    &mut program_filter, &mut pid_remapper, &mut audio_replacer, &mut video_replacer,
                     input_format, compressed_audio_input, frame_rate_rx.clone(),
                 )
                 .await?;
@@ -1653,7 +1718,7 @@ async fn srt_output_bonded_loop(
                 let sink = SrtSendSink::Group(group.clone());
                 let disconnected = srt_output_forward_loop(
                     config, &mut rx, &stats, &cancel, &sink,
-                    &mut program_filter, &mut audio_replacer, &mut video_replacer,
+                    &mut program_filter, &mut pid_remapper, &mut audio_replacer, &mut video_replacer,
                     input_format, compressed_audio_input, frame_rate_rx.clone(),
                 )
                 .await?;
