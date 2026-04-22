@@ -137,6 +137,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/flows/{flow_id}",
             put(flows::update_flow).delete(flows::delete_flow),
         )
+        .route(
+            "/api/v1/flows/{flow_id}/assembly",
+            put(flows::update_flow_assembly),
+        )
         .route("/api/v1/flows/{flow_id}/start", post(flows::start_flow))
         .route("/api/v1/flows/{flow_id}/stop", post(flows::stop_flow))
         .route("/api/v1/flows/{flow_id}/restart", post(flows::restart_flow))

@@ -106,8 +106,36 @@ pub struct AssemblySlot {
 #[allow(dead_code)]
 pub type SptsPlan = AssemblyPlan;
 
-/// Spawn the assembler task. Returns a `JoinHandle` the caller stores on
-/// the `FlowRuntime` so the task lives as long as the flow.
+/// Runtime commands the assembler accepts via its `mpsc` channel.
+///
+/// Phase 7 adds `ReplacePlan` — used by `update_flow_assembly` to swap
+/// the whole `AssemblyPlan` without tearing down the flow. More granular
+/// deltas (e.g. `SwitchSlot`) can land as additive variants; string-
+/// dispatch on the handler side keeps old edges forwards-compatible via
+/// the same mechanism the WS protocol already uses.
+#[derive(Debug)]
+pub enum PlanCommand {
+    /// Swap the running plan. The assembler diffs old vs new, re-spawns
+    /// fan-ins for added/changed slots, cancels fan-ins for removed
+    /// slots, bumps per-program PMT versions where composition changed,
+    /// and bumps PAT version when the set of programs itself changed.
+    ReplacePlan { plan: AssemblyPlan },
+}
+
+/// Handle returned to the flow runtime after spawning the assembler.
+/// Carries the task JoinHandle plus the mpsc sender for runtime mutation.
+/// Dropping the sender does *not* stop the assembler — the assembler
+/// listens on `cancel` for shutdown. The sender is cloneable so multiple
+/// mutation call-sites can target the same flow.
+#[derive(Debug)]
+pub struct AssemblerHandle {
+    pub join: JoinHandle<()>,
+    pub plan_tx: mpsc::Sender<PlanCommand>,
+}
+
+/// Spawn the assembler task. Returns an [`AssemblerHandle`] the caller
+/// stores on the `FlowRuntime` so the task lives as long as the flow
+/// and runtime mutation (`UpdateFlowAssembly`) has a target.
 ///
 /// `broadcast_tx` is the flow's existing fan-out sender — the assembler
 /// publishes synthesised `RtpPacket` bundles onto it exactly where the
@@ -118,110 +146,97 @@ pub fn spawn_spts_assembler(
     bus: Arc<FlowEsBus>,
     broadcast_tx: broadcast::Sender<RtpPacket>,
     cancel: CancellationToken,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        run_assembler(plan, bus, broadcast_tx, cancel).await;
-    })
+) -> AssemblerHandle {
+    // Channel depth 16: plan updates are rare (operator-triggered), so a
+    // small bounded buffer is plenty and keeps back-pressure observable
+    // if a pathological caller floods.
+    let (plan_tx, plan_rx) = mpsc::channel::<PlanCommand>(16);
+    let join = tokio::spawn(async move {
+        run_assembler(plan, bus, broadcast_tx, cancel, plan_rx).await;
+    });
+    AssemblerHandle { join, plan_tx }
 }
 
 /// Flattened slot view used internally by the assembler. One entry per
-/// slot across all programs. `program_idx` is reserved for Phase 7's
-/// per-PID switching, which needs to route fan-in traffic to the right
-/// program's PMT without re-searching.
+/// slot across all programs. `program_idx` is retained for Phase 7's
+/// per-PID switching so fan-in traffic routes to the right program's
+/// PMT without re-searching.
 #[derive(Debug, Clone)]
 struct FlatSlot {
-    #[allow(dead_code)] // reserved for Phase 7
     program_idx: usize,
     source: (String, u16),
     out_pid: u16,
 }
 
 async fn run_assembler(
-    plan: AssemblyPlan,
+    mut plan: AssemblyPlan,
     bus: Arc<FlowEsBus>,
     broadcast_tx: broadcast::Sender<RtpPacket>,
     cancel: CancellationToken,
+    mut plan_rx: mpsc::Receiver<PlanCommand>,
 ) {
-    // Flatten programs → one fan-in task per slot regardless of
-    // program. Two slots sharing the same `(input_id, source_pid)`
-    // (e.g. simulcasting one video into two programs on different
-    // out_pids) each get their own broadcast subscriber — that's
-    // exactly what broadcast semantics deliver.
-    let flat: Vec<FlatSlot> = plan
-        .programs
-        .iter()
-        .enumerate()
-        .flat_map(|(pidx, prog)| {
-            prog.slots.iter().map(move |s| FlatSlot {
-                program_idx: pidx,
-                source: s.source.clone(),
-                out_pid: s.out_pid,
-            })
-        })
-        .collect();
-
-    // Per-program PCR resolution — the out_pid of whichever slot on
-    // that program matches `pcr_source`. Validated by the runtime;
-    // fall back to the PMT PID on mismatch (degenerate but non-fatal).
-    let pcr_out_pid_by_program: Vec<u16> = plan
-        .programs
-        .iter()
-        .map(|prog| {
-            prog.slots
-                .iter()
-                .find(|s| s.source == prog.pcr_source)
-                .map(|s| s.out_pid)
-                .unwrap_or(prog.pmt_pid)
-        })
-        .collect();
-
     // Fan-in: one task per flat slot drains the bus broadcast receiver
     // and forwards into a single mpsc. Channel capacity is deliberately
-    // small (same as bus / 8) — if the assembler lags, broadcasts will
-    // `Lagged` earlier and dropping happens at the bus edge, not in
-    // mpsc backpressure. This keeps the no-cascade-backpressure
-    // invariant.
+    // small — if the assembler lags, broadcasts `Lagged` earlier and
+    // dropping happens at the bus edge, not in mpsc backpressure. This
+    // keeps the no-cascade-backpressure invariant.
     let (fanin_tx, mut fanin_rx) = mpsc::channel::<(usize, EsPacket)>(256);
-    let mut slot_tasks: Vec<JoinHandle<()>> = Vec::with_capacity(flat.len());
-    for (idx, slot) in flat.iter().enumerate() {
-        let rx = bus.subscribe(&slot.source.0, slot.source.1);
-        let tx = fanin_tx.clone();
-        let slot_cancel = cancel.clone();
-        slot_tasks.push(tokio::spawn(slot_fanin(idx, rx, tx, slot_cancel)));
-    }
-    drop(fanin_tx); // close when all slot tasks finish
 
-    // Egress bundle buffer + per-out-PID CC counter + PAT/PMT version/CC.
+    // Flat slot view rebuilt on every plan change. Slot indices in this
+    // vec are the keys under which fan-in tasks send their packets; they
+    // must stay stable for already-spawned fan-ins, so on a plan swap
+    // we append new slots to the end rather than recompact.
+    let mut flat: Vec<FlatSlot> = Vec::new();
+    let mut slot_cancels: Vec<CancellationToken> = Vec::new();
+    let mut slot_tasks: Vec<JoinHandle<()>> = Vec::new();
+
+    // Per-program PCR resolution — the out_pid of whichever slot on
+    // that program matches `pcr_source`. Recomputed on every plan swap.
+    let mut pcr_out_pid_by_program: Vec<u16> = Vec::new();
+
+    // PSI state.
+    //
+    // `pat_version` bumps when the *set of programs* changes (add/remove).
+    // Per-program `pmt_versions[i]` bumps when `programs[i].slots` or
+    // `pcr_source` changes. Both wrap mod 32 (5-bit PMT spec field) and
+    // advance monotonically across switches, including A→B→A, to avoid
+    // phantom-version collisions the `TsContinuityFixer` already wrestled
+    // with (see project_ffplay_stuck_state memory).
+    let mut pat_version: u8 = 0;
+    let mut pmt_versions: Vec<u8> = vec![0; plan.programs.len()];
+
+    // Egress bundle buffer + per-out-PID CC counter + PAT/PMT CC.
     let mut buf = BytesMut::with_capacity(BUNDLE_BYTES);
     let mut cc: std::collections::HashMap<u16, u8> = std::collections::HashMap::new();
     let mut pat_cc: u8 = 0;
-    // One CC counter per PMT PID so multiple programs each maintain
-    // independent PMT continuity.
     let mut pmt_cc: std::collections::HashMap<u16, u8> = std::collections::HashMap::new();
-    // Version counter is stable for Phase 5 (plan is immutable over the
-    // flow's lifetime). Phase 7's per-PID switching will bump this.
-    let psi_version: u8 = 0;
-    // Synthesised RTP metadata: the assembler is a new RTP-shaped
-    // source as far as downstream outputs are concerned. A monotonic
-    // u16 sequence counter per bundle lets output-side SMPTE 2022-1
-    // FEC compute parity over consecutive emissions; RTP outputs use
-    // the same counter for the wire RTP header. Real per-bundle
-    // emission timestamps ride through as `recv_time_us`, so the
-    // outputs (and tr101290's jitter math) see a sensible clock.
     let mut bundle_seq: u16 = 0;
+
+    // Prime fan-ins + PCR + snapshot for the initial plan.
+    install_plan(
+        &plan,
+        &bus,
+        &fanin_tx,
+        &cancel,
+        &mut flat,
+        &mut slot_cancels,
+        &mut slot_tasks,
+        &mut pcr_out_pid_by_program,
+    );
 
     let mut psi_tick = interval(PSI_INTERVAL);
     psi_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut flush_tick = interval(FLUSH_INTERVAL);
     flush_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    // First tick of `interval` fires immediately — emit PSI on startup so
-    // receivers lock on before the first ES arrives.
+    // First tick fires immediately — emit PSI on startup so receivers
+    // lock on before the first ES arrives.
     psi_tick.tick().await;
     push_psi(
         &mut buf,
         &plan,
         &pcr_out_pid_by_program,
-        psi_version,
+        pat_version,
+        &pmt_versions,
         &mut pat_cc,
         &mut pmt_cc,
         &broadcast_tx,
@@ -234,6 +249,41 @@ async fn run_assembler(
             _ = cancel.cancelled() => {
                 flush(&mut buf, &broadcast_tx, &mut bundle_seq);
                 break;
+            }
+            Some(cmd) = plan_rx.recv() => {
+                match cmd {
+                    PlanCommand::ReplacePlan { plan: new_plan } => {
+                        apply_plan_replacement(
+                            &mut plan,
+                            new_plan,
+                            &bus,
+                            &fanin_tx,
+                            &cancel,
+                            &mut flat,
+                            &mut slot_cancels,
+                            &mut slot_tasks,
+                            &mut pcr_out_pid_by_program,
+                            &mut pat_version,
+                            &mut pmt_versions,
+                        );
+                        // Emit fresh PSI immediately on switch so
+                        // downstream receivers see the new PMT before
+                        // the first rewritten ES packet lands on a new
+                        // out_pid — without this, ffprobe can see TS
+                        // bytes on an unknown PID for ~100 ms.
+                        push_psi(
+                            &mut buf,
+                            &plan,
+                            &pcr_out_pid_by_program,
+                            pat_version,
+                            &pmt_versions,
+                            &mut pat_cc,
+                            &mut pmt_cc,
+                            &broadcast_tx,
+                            &mut bundle_seq,
+                        );
+                    }
+                }
             }
             Some((slot_idx, es)) = fanin_rx.recv() => {
                 let slot = match flat.get(slot_idx) {
@@ -254,7 +304,8 @@ async fn run_assembler(
                     &mut buf,
                     &plan,
                     &pcr_out_pid_by_program,
-                    psi_version,
+                    pat_version,
+                    &pmt_versions,
                     &mut pat_cc,
                     &mut pmt_cc,
                     &broadcast_tx,
@@ -267,9 +318,219 @@ async fn run_assembler(
         }
     }
 
+    for c in &slot_cancels {
+        c.cancel();
+    }
     for h in slot_tasks {
         h.abort();
     }
+}
+
+/// (Re-)flatten the program×slot matrix into `flat`, spawn fan-ins for
+/// any slot that isn't already represented by a live task, and recompute
+/// `pcr_out_pid_by_program`. Call once at startup; subsequent plan
+/// changes go through [`apply_plan_replacement`] which handles diff +
+/// fan-in reuse.
+#[allow(clippy::too_many_arguments)]
+fn install_plan(
+    plan: &AssemblyPlan,
+    bus: &Arc<FlowEsBus>,
+    fanin_tx: &mpsc::Sender<(usize, EsPacket)>,
+    cancel: &CancellationToken,
+    flat: &mut Vec<FlatSlot>,
+    slot_cancels: &mut Vec<CancellationToken>,
+    slot_tasks: &mut Vec<JoinHandle<()>>,
+    pcr_out_pid_by_program: &mut Vec<u16>,
+) {
+    for (pidx, prog) in plan.programs.iter().enumerate() {
+        for s in prog.slots.iter() {
+            let slot = FlatSlot {
+                program_idx: pidx,
+                source: s.source.clone(),
+                out_pid: s.out_pid,
+            };
+            let idx = flat.len();
+            flat.push(slot.clone());
+            let slot_cancel = cancel.child_token();
+            let rx = bus.subscribe(&slot.source.0, slot.source.1);
+            let tx = fanin_tx.clone();
+            slot_cancels.push(slot_cancel.clone());
+            slot_tasks.push(tokio::spawn(slot_fanin(idx, rx, tx, slot_cancel)));
+        }
+    }
+    *pcr_out_pid_by_program = plan
+        .programs
+        .iter()
+        .map(|prog| {
+            prog.slots
+                .iter()
+                .find(|s| s.source == prog.pcr_source)
+                .map(|s| s.out_pid)
+                .unwrap_or(prog.pmt_pid)
+        })
+        .collect();
+}
+
+/// Apply a `ReplacePlan` delta.
+///
+/// Strategy: walk the new plan and for each `(program_idx, new_slot_idx)`
+/// find a fan-in in the current `flat` that (a) hasn't already been
+/// re-used in this call and (b) subscribes to the same `(input_id,
+/// source_pid)`. If found, update its `out_pid`/`program_idx` in place
+/// — no re-subscribe needed. If not found, spawn a fresh fan-in. Any
+/// old fan-in not re-used is cancelled.
+///
+/// Version bumps:
+/// - PMT version for a program bumps iff its `slots` vec or `pcr_source`
+///   differs from before.
+/// - PAT version bumps iff the set of `(program_number, pmt_pid)` pairs
+///   differs from before.
+///
+/// Monotonic mod 32 — same discipline as `TsContinuityFixer` so A→B→A
+/// never lands on a receiver-locked phantom version.
+#[allow(clippy::too_many_arguments)]
+fn apply_plan_replacement(
+    plan: &mut AssemblyPlan,
+    new_plan: AssemblyPlan,
+    bus: &Arc<FlowEsBus>,
+    fanin_tx: &mpsc::Sender<(usize, EsPacket)>,
+    cancel: &CancellationToken,
+    flat: &mut Vec<FlatSlot>,
+    slot_cancels: &mut Vec<CancellationToken>,
+    slot_tasks: &mut Vec<JoinHandle<()>>,
+    pcr_out_pid_by_program: &mut Vec<u16>,
+    pat_version: &mut u8,
+    pmt_versions: &mut Vec<u8>,
+) {
+    // Program set: (program_number, pmt_pid) pairs, order-preserving.
+    let old_pat: Vec<(u16, u16)> = plan
+        .programs
+        .iter()
+        .map(|p| (p.program_number, p.pmt_pid))
+        .collect();
+    let new_pat: Vec<(u16, u16)> = new_plan
+        .programs
+        .iter()
+        .map(|p| (p.program_number, p.pmt_pid))
+        .collect();
+    if new_pat != old_pat {
+        *pat_version = pat_version.wrapping_add(1) & 0x1F;
+    }
+
+    // Per-program PMT version: composition = (slots, pcr_source).
+    let mut new_pmt_versions: Vec<u8> = Vec::with_capacity(new_plan.programs.len());
+    for (pidx, new_prog) in new_plan.programs.iter().enumerate() {
+        // Find the matching old program by `program_number` so adding a
+        // program doesn't spuriously bump siblings.
+        let old_prog = plan
+            .programs
+            .iter()
+            .find(|p| p.program_number == new_prog.program_number);
+        let changed = match old_prog {
+            Some(op) => op.slots != new_prog.slots || op.pcr_source != new_prog.pcr_source,
+            None => true, // new program → version starts fresh but advances first tick
+        };
+        let prev_v = pmt_versions.get(pidx).copied().unwrap_or(0);
+        let v = if changed {
+            prev_v.wrapping_add(1) & 0x1F
+        } else {
+            prev_v
+        };
+        new_pmt_versions.push(v);
+    }
+
+    // Fan-in reuse: we match by `(source, out_pid)` in the current flat
+    // list; anything not matched gets cancelled. For unmatched new slots
+    // we append fresh fan-ins (slot indices grow monotonically — old
+    // fan-ins that were cancelled never send again, so stale `slot_idx`
+    // in fanin_rx is defensively filtered by the main loop's
+    // `flat.get(idx)`).
+    let mut reused: Vec<bool> = vec![false; flat.len()];
+    let mut new_flat: Vec<FlatSlot> = Vec::new();
+    let mut carry_tasks: Vec<JoinHandle<()>> = Vec::new();
+    let mut carry_cancels: Vec<CancellationToken> = Vec::new();
+
+    // Also carry a parallel "flat_idx in the new ordering → original
+    // flat_idx" map so the send key stays stable. Because we append-only
+    // on reuse, we re-map: each reused fan-in keeps its *original* index
+    // (fanin sends use that), and we insert a synthetic entry at that
+    // index into `flat_new_by_orig` then rebuild `flat` at the end.
+    //
+    // Simpler: keep the `flat` vec append-only across the assembler's
+    // lifetime — reused slots stay at their original index, new slots
+    // are pushed at the end, and cancelled slots leave a hole that the
+    // main loop's `flat.get(idx)` naturally tolerates. This avoids the
+    // whole re-indexing headache.
+
+    for new_prog in new_plan.programs.iter().enumerate().map(|(pidx, p)| (pidx, p)) {
+        let (pidx, prog) = new_prog;
+        for s in prog.slots.iter() {
+            // Look for a reusable fan-in in the current flat list.
+            let match_idx = flat.iter().enumerate().find_map(|(i, f)| {
+                if !reused[i] && f.source == s.source {
+                    Some(i)
+                } else {
+                    None
+                }
+            });
+            match match_idx {
+                Some(i) => {
+                    reused[i] = true;
+                    // Update in place — the already-running fan-in keeps
+                    // sending on slot_idx = i; we only change the
+                    // metadata the main loop reads.
+                    flat[i].out_pid = s.out_pid;
+                    flat[i].program_idx = pidx;
+                }
+                None => {
+                    // Spawn a new fan-in for this (source, out_pid).
+                    let slot = FlatSlot {
+                        program_idx: pidx,
+                        source: s.source.clone(),
+                        out_pid: s.out_pid,
+                    };
+                    let idx = flat.len();
+                    flat.push(slot.clone());
+                    // Track reuse vec alongside flat.
+                    reused.push(true);
+                    let slot_cancel = cancel.child_token();
+                    let rx = bus.subscribe(&slot.source.0, slot.source.1);
+                    let tx = fanin_tx.clone();
+                    slot_cancels.push(slot_cancel.clone());
+                    slot_tasks.push(tokio::spawn(slot_fanin(idx, rx, tx, slot_cancel)));
+                }
+            }
+        }
+    }
+
+    // Cancel any fan-in that wasn't reused. Leave its entry in `flat`
+    // as a tombstone — the main loop's `flat.get(idx)` still returns
+    // the old metadata, but since the fan-in is cancelled no further
+    // packets arrive under that index.
+    for (i, was_reused) in reused.iter().enumerate().take(slot_cancels.len()) {
+        if !was_reused {
+            slot_cancels[i].cancel();
+        }
+    }
+
+    // Recompute PCR resolution for each program.
+    *pcr_out_pid_by_program = new_plan
+        .programs
+        .iter()
+        .map(|prog| {
+            prog.slots
+                .iter()
+                .find(|s| s.source == prog.pcr_source)
+                .map(|s| s.out_pid)
+                .unwrap_or(prog.pmt_pid)
+        })
+        .collect();
+
+    *plan = new_plan;
+    *pmt_versions = new_pmt_versions;
+
+    // Silence unused-var warnings from the earlier parallel-map stubs.
+    let _ = (&mut new_flat, &mut carry_tasks, &mut carry_cancels);
 }
 
 async fn slot_fanin(
@@ -334,11 +595,17 @@ fn rewrite_es_packet(src: &[u8], out_pid: u16, cc_table: &mut std::collections::
 /// Build one PAT TS packet + one PMT TS packet per program and append
 /// them to `buf`, flushing intermediate bundles as needed so a PSI tick
 /// never overflows past a bundle boundary.
+///
+/// `pat_version` and `pmt_versions` are bumped on plan change by
+/// [`apply_plan_replacement`]; `push_psi` only stamps them onto the
+/// section bytes.
+#[allow(clippy::too_many_arguments)]
 fn push_psi(
     buf: &mut BytesMut,
     plan: &AssemblyPlan,
     pcr_out_pid_by_program: &[u16],
-    version: u8,
+    pat_version: u8,
+    pmt_versions: &[u8],
     pat_cc: &mut u8,
     pmt_cc: &mut std::collections::HashMap<u16, u8>,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
@@ -351,7 +618,7 @@ fn push_psi(
         .iter()
         .map(|p| (p.program_number, p.pmt_pid))
         .collect();
-    let pat = build_pat(&entries, version, *pat_cc);
+    let pat = build_pat(&entries, pat_version, *pat_cc);
     *pat_cc = pat_cc.wrapping_add(1) & 0x0F;
     append_ts(buf, &pat, broadcast_tx, bundle_seq);
 
@@ -362,12 +629,13 @@ fn push_psi(
             .get(pidx)
             .copied()
             .unwrap_or(prog.pmt_pid);
+        let pmt_version = pmt_versions.get(pidx).copied().unwrap_or(0);
         let pmt = build_pmt(
             prog.program_number,
             prog.pmt_pid,
             pcr_out_pid,
             &prog.slots,
-            version,
+            pmt_version,
             *cc_entry,
         );
         *cc_entry = cc_entry.wrapping_add(1) & 0x0F;
@@ -561,15 +829,44 @@ pub struct PendingEssenceSlot {
     pub kind: EsKind,
 }
 
+/// One pending Hitless merger task. Produced by `build_assembly_plan`
+/// when it expands a [`crate::config::models::SlotSource::Hitless`]
+/// slot into a synthetic bus key. The runtime walks `pending_hitless`
+/// after essence resolution and spawns one
+/// [`crate::engine::ts_es_hitless::spawn_hitless_es_merger`] per entry
+/// before bringing the assembler up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingHitlessSlot {
+    /// Stable identifier — `"slot_{program_idx}_{slot_idx}"` is the
+    /// convention so two Hitless slots on the same flow never collide.
+    /// Doubles as the synthetic bus key suffix
+    /// (`hitless:{uid}` is the bus input_id).
+    pub uid: String,
+    /// Concrete `(input_id, source_pid)` for the primary leg.
+    pub primary: (String, u16),
+    /// Concrete `(input_id, source_pid)` for the backup leg.
+    pub backup: (String, u16),
+    /// Stall window in milliseconds before the merger flips primary →
+    /// backup. Defaults to
+    /// [`crate::engine::ts_es_hitless::DEFAULT_STALL_MS`] when the
+    /// operator hasn't set it.
+    pub stall_ms: u64,
+}
+
 /// Output of `build_spts_plan` (defined on the runtime side): the
 /// assembler plan plus any `Essence` slots still awaiting a concrete
-/// `source_pid`. Slots in `plan` corresponding to entries in
-/// `pending_essence` have a sentinel `source_pid = 0` — the runtime
-/// patches them in place after the resolver returns.
+/// `source_pid`, plus any `Hitless` slots that need a merger task spawned
+/// before the assembler starts. Slots in `plan` corresponding to entries
+/// in `pending_essence` have a sentinel `source_pid = 0` — the runtime
+/// patches them in place after the resolver returns. Slots in `plan`
+/// corresponding to entries in `pending_hitless` have already been
+/// pointed at the synthetic merger output, so the assembler treats them
+/// as a normal `(hitless:{uid}, 0)` source.
 #[derive(Debug, Clone)]
 pub struct SptsBuildResult {
     pub plan: SptsPlan,
     pub pending_essence: Vec<PendingEssenceSlot>,
+    pub pending_hitless: Vec<PendingHitlessSlot>,
 }
 
 /// Failure modes for essence resolution. The runtime maps each variant
@@ -861,7 +1158,7 @@ mod tests {
         let bus = Arc::new(FlowEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(16);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone());
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone()).join;
 
         // Drain one bundle — startup path emits PAT + PMT immediately.
         let bundle = tokio::time::timeout(Duration::from_millis(500), rx.recv())
@@ -883,7 +1180,7 @@ mod tests {
         let bus = Arc::new(FlowEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone());
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone()).join;
 
         // Wait for startup PSI, then publish enough ES packets on each
         // slot to fill a full bundle.
@@ -951,7 +1248,7 @@ mod tests {
         let bus = Arc::new(FlowEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_mpts_plan(), bus.clone(), tx.clone(), cancel.clone());
+        let handle = spawn_spts_assembler(make_mpts_plan(), bus.clone(), tx.clone(), cancel.clone()).join;
 
         // Collect bundles for ~250 ms — long enough to see the startup
         // PSI emission plus at least one tick of the 100 ms PSI cadence.
@@ -994,13 +1291,177 @@ mod tests {
         let bus = Arc::new(FlowEsBus::new());
         let (tx, _rx) = broadcast::channel::<RtpPacket>(4);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone());
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone()).join;
         tokio::time::sleep(Duration::from_millis(30)).await;
         cancel.cancel();
         tokio::time::timeout(Duration::from_millis(500), handle)
             .await
             .expect("assembler must exit within 500 ms of cancel")
             .unwrap();
+    }
+
+    /// Helper: read the 5-bit version_number from a PMT TS packet.
+    fn pmt_version(pkt: &[u8]) -> u8 {
+        // Byte 10 = reserved(2) + version(5) + current_next(1)
+        (pkt[10] >> 1) & 0x1F
+    }
+
+    #[tokio::test]
+    async fn replace_plan_swaps_slot_and_bumps_pmt_version() {
+        let bus = Arc::new(FlowEsBus::new());
+        let (tx, mut rx) = broadcast::channel::<RtpPacket>(64);
+        let cancel = CancellationToken::new();
+
+        // Initial plan: in-a → out 0x200, in-b → out 0x201.
+        let initial = make_plan();
+        let handle = spawn_spts_assembler(initial, bus.clone(), tx.clone(), cancel.clone());
+
+        // Capture startup PMT version (should be 0).
+        let mut v0: Option<u8> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        while tokio::time::Instant::now() < deadline && v0.is_none() {
+            if let Ok(Ok(bundle)) =
+                tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+            {
+                for chunk in bundle.data.chunks_exact(TS_PACKET_SIZE) {
+                    if ts_pid(chunk) == 0x1000 {
+                        v0 = Some(pmt_version(chunk));
+                        break;
+                    }
+                }
+            }
+        }
+        let v0 = v0.expect("startup PMT emitted");
+        assert_eq!(v0, 0, "startup PMT version starts at 0");
+
+        // Swap plan: redirect the video slot from in-a → in-c.
+        let new_plan = AssemblyPlan {
+            programs: vec![ProgramPlan {
+                program_number: 1,
+                pmt_pid: 0x1000,
+                pcr_source: ("in-c".to_string(), 0x100),
+                slots: vec![
+                    slot("in-c", 0x100, 0x200, 0x1B),
+                    slot("in-b", 0x200, 0x201, 0x0F),
+                ],
+            }],
+        };
+        handle
+            .plan_tx
+            .send(PlanCommand::ReplacePlan { plan: new_plan })
+            .await
+            .expect("plan_tx send");
+
+        // Capture the post-swap PMT version (must be strictly different).
+        let mut v1: Option<u8> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while tokio::time::Instant::now() < deadline && v1.is_none() {
+            if let Ok(Ok(bundle)) =
+                tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+            {
+                for chunk in bundle.data.chunks_exact(TS_PACKET_SIZE) {
+                    if ts_pid(chunk) == 0x1000 {
+                        let v = pmt_version(chunk);
+                        if v != v0 {
+                            v1 = Some(v);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let v1 = v1.expect("post-swap PMT emitted with new version");
+        assert_eq!(
+            v1,
+            (v0 + 1) & 0x1F,
+            "PMT version must advance monotonically on slot change"
+        );
+
+        // Publish an ES packet on the new source; it must appear on the
+        // new out_pid (still 0x200). Fan-in reuse means `in-c:0x100` got
+        // a fresh fan-in task but the original one for `in-a:0x100` was
+        // cancelled.
+        let video_tx = bus.sender_for("in-c", 0x100);
+        video_tx
+            .send(EsPacket {
+                source_pid: 0x100,
+                stream_type: 0x1B,
+                payload: ts_es(0x100, true, 0, 0xAB),
+                is_pusi: true,
+                has_pcr: false,
+                pcr: None,
+                recv_time_us: 0,
+            })
+            .unwrap();
+
+        let mut saw_200 = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        while tokio::time::Instant::now() < deadline && !saw_200 {
+            if let Ok(Ok(bundle)) =
+                tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+            {
+                for chunk in bundle.data.chunks_exact(TS_PACKET_SIZE) {
+                    if ts_pid(chunk) == 0x200 {
+                        saw_200 = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(saw_200, "post-swap ES must flow onto the reassigned out_pid");
+
+        cancel.cancel();
+        handle.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replace_plan_no_change_does_not_bump_version() {
+        let bus = Arc::new(FlowEsBus::new());
+        let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
+        let cancel = CancellationToken::new();
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone());
+
+        // Drain startup PMT.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let mut startup_v: Option<u8> = None;
+        while tokio::time::Instant::now() < deadline && startup_v.is_none() {
+            if let Ok(Ok(bundle)) =
+                tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+            {
+                for chunk in bundle.data.chunks_exact(TS_PACKET_SIZE) {
+                    if ts_pid(chunk) == 0x1000 {
+                        startup_v = Some(pmt_version(chunk));
+                    }
+                }
+            }
+        }
+        let v0 = startup_v.expect("startup PMT");
+
+        // Replace with a structurally identical plan.
+        handle
+            .plan_tx
+            .send(PlanCommand::ReplacePlan { plan: make_plan() })
+            .await
+            .expect("plan_tx send");
+
+        // Observe several PMTs post-swap; none should have a different version.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let mut saw_bump = false;
+        for _ in 0..6 {
+            if let Ok(Ok(bundle)) =
+                tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+            {
+                for chunk in bundle.data.chunks_exact(TS_PACKET_SIZE) {
+                    if ts_pid(chunk) == 0x1000 && pmt_version(chunk) != v0 {
+                        saw_bump = true;
+                    }
+                }
+            }
+        }
+
+        cancel.cancel();
+        handle.join.await.unwrap();
+        assert!(!saw_bump, "no-op plan replace must not bump PMT version");
     }
 
     // ---------------------------------------------------------------

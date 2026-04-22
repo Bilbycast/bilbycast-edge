@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::events::{Event, EventSeverity, build_event_envelope, category};
 
-use crate::config::models::{AppConfig, FlowConfig, FlowGroupConfig, InputDefinition, OutputConfig, ResolvedFlow};
+use crate::config::models::{AppConfig, FlowAssembly, FlowConfig, FlowGroupConfig, InputDefinition, OutputConfig, ResolvedFlow};
 use crate::config::persistence::save_config_split_async;
 use crate::config::secrets::SecretsConfig;
 use crate::config::validation::{validate_config, validate_flow, validate_input_definition, validate_output, validate_tunnel};
@@ -1272,6 +1272,54 @@ async fn execute_command(
                 cfg.flows[pos] = new_flow;
             } else {
                 cfg.flows.push(new_flow);
+            }
+            persist_config(&cfg, config_path, secrets_path).await;
+            Ok(None)
+        }
+        "update_flow_assembly" => {
+            let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?;
+            let new_assembly: FlowAssembly = serde_json::from_value(action["assembly"].clone())
+                .map_err(|e| format!("Invalid assembly: {e}"))?;
+            tracing::info!(
+                "Manager command: update_flow_assembly '{flow_id}' (kind={:?}, programs={})",
+                new_assembly.kind,
+                new_assembly.programs.len(),
+            );
+
+            // Look up the running flow.
+            let runtime = match flow_manager.get_runtime(flow_id) {
+                Some(r) => r,
+                None => {
+                    return Err(CommandError::with_code(
+                        format!("Flow '{flow_id}' is not running"),
+                        "flow_not_running",
+                    ));
+                }
+            };
+
+            // No-op short-circuit — preserves CC/PSI continuity by not
+            // taking the merger/assembler through a transient state.
+            if let Some(cur) = runtime.current_assembly().await {
+                if cur == new_assembly {
+                    tracing::info!(
+                        "update_flow_assembly '{flow_id}': no-op (assembly unchanged)"
+                    );
+                    return Ok(None);
+                }
+            }
+
+            // Hot-swap the running plan. `replace_assembly` validates,
+            // resolves essence, spawns Hitless mergers, and dispatches
+            // PlanCommand::ReplacePlan to the running assembler.
+            runtime
+                .replace_assembly(new_assembly.clone())
+                .await
+                .map_err(|e| e.to_string())?;
+
+            // Persist to config.json so the change survives restart.
+            let mut cfg = app_config.write().await;
+            if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
+                flow.assembly = Some(new_assembly);
             }
             persist_config(&cfg, config_path, secrets_path).await;
             Ok(None)

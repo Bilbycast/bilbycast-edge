@@ -137,11 +137,25 @@ pub struct FlowRuntime {
     /// instead of falling back to `fallback_ms`.
     pub frame_rate_rx: Option<watch::Receiver<Option<f64>>>,
     /// PID-bus SPTS assembler task handle. `Some` only when the flow has
-    /// `assembly.kind = spts`; in that case the assembler is the sole
-    /// publisher into `broadcast_tx`. Held for ownership; shutdown is
-    /// driven by the parent `CancellationToken`.
+    /// `assembly.kind != passthrough`; in that case the assembler is the
+    /// sole publisher into `broadcast_tx`. Held for ownership; shutdown
+    /// is driven by the parent `CancellationToken`. Phase 7 added
+    /// `plan_tx` alongside the JoinHandle so `update_flow_assembly` can
+    /// swap the running plan without restarting the flow.
     #[allow(dead_code)]
-    pub pid_bus_assembler_handle: Option<JoinHandle<()>>,
+    pub pid_bus_assembler_handle: Option<crate::engine::ts_assembler::AssemblerHandle>,
+    /// PID-bus elementary-stream bus. `Some` whenever the assembler is
+    /// running. Kept on the runtime so `replace_assembly` (Phase 7) can
+    /// spawn fresh Hitless mergers when the new plan adds Hitless slots.
+    #[allow(dead_code)]
+    pub es_bus: Option<Arc<FlowEsBus>>,
+    /// Live mutable copy of the flow's `assembly` block. Used by
+    /// `replace_assembly` to diff old → new and decide whether to
+    /// hot-swap or fall back to a full restart. Persisted form lives
+    /// in `config.config.assembly` and is also updated by the handler
+    /// after a successful in-place swap.
+    #[allow(dead_code)]
+    pub current_assembly: tokio::sync::Mutex<Option<crate::config::models::FlowAssembly>>,
 }
 
 /// Runtime state for a single input within a flow.
@@ -638,7 +652,7 @@ impl FlowRuntime {
         // TS-producing input's per-input broadcast channel, so PAT/PMT
         // arriving even a few hundred ms after input spawn lands before
         // the resolver's 3 s deadline.
-        let pid_bus_assembler_handle: Option<JoinHandle<()>> = match (spts_build, &es_bus) {
+        let pid_bus_assembler_handle: Option<crate::engine::ts_assembler::AssemblerHandle> = match (spts_build, &es_bus) {
             (Some(mut build), Some(bus)) => {
                 if !build.pending_essence.is_empty() {
                     // Collect PSI catalogue handles keyed by input_id —
@@ -739,6 +753,30 @@ impl FlowRuntime {
                         );
                         bail!(msg);
                     }
+                }
+
+                // Spawn pre-bus Hitless mergers (Phase 7). One task per
+                // expanded `SlotSource::Hitless` slot — the assembler
+                // reads from the synthetic `(hitless:{uid}, 0)` bus key
+                // each merger publishes to. Mergers inherit the flow's
+                // cancellation token so shutdown is automatic.
+                if !build.pending_hitless.is_empty() {
+                    tracing::info!(
+                        "Flow '{}': spawning {} Hitless merger task(s) (primary-preference, stall {} ms)",
+                        config.config.id,
+                        build.pending_hitless.len(),
+                        build.pending_hitless.first().map(|h| h.stall_ms).unwrap_or(0),
+                    );
+                }
+                for hl in &build.pending_hitless {
+                    let _ = crate::engine::ts_es_hitless::spawn_hitless_es_merger(
+                        hl.uid.clone(),
+                        hl.primary.clone(),
+                        hl.backup.clone(),
+                        bus.clone(),
+                        std::time::Duration::from_millis(hl.stall_ms),
+                        cancel_token.child_token(),
+                    );
                 }
 
                 let total_slots: usize = build.plan.programs.iter().map(|p| p.slots.len()).sum();
@@ -1042,6 +1080,7 @@ impl FlowRuntime {
             output_handles.len()
         );
 
+        let current_assembly = tokio::sync::Mutex::new(config.config.assembly.clone());
         Ok(Self {
             config,
             broadcast_tx,
@@ -1062,7 +1101,141 @@ impl FlowRuntime {
             event_sender,
             frame_rate_rx,
             pid_bus_assembler_handle,
+            es_bus,
+            current_assembly,
         })
+    }
+
+    /// Phase 7: replace this flow's PID-bus assembly plan in place.
+    ///
+    /// The caller has already validated `new_assembly` (shape + field
+    /// limits via `validate_flow`). This method:
+    ///
+    /// 1. Rejects the call if the flow has no running assembler (i.e.
+    ///    `assembly.kind == passthrough` or absent — a switch is
+    ///    meaningless).
+    /// 2. Builds a new [`SptsBuildResult`] via the same machinery as
+    ///    flow start-up (loud `pid_bus_*` errors via the `event_sender`).
+    /// 3. Resolves any `Essence` slots against the per-input PSI
+    ///    catalogues currently held on the flow's stats.
+    /// 4. Spawns Hitless merger tasks for any new `SlotSource::Hitless`
+    ///    slots in the new plan. Mergers added by previous calls remain
+    ///    running — they keep publishing onto their synthetic bus key
+    ///    until the parent flow's `cancel_token` fires. (Mergers
+    ///    orphaned by removal of a Hitless slot stop being subscribed
+    ///    to by the assembler so their packets just go to /dev/null.)
+    /// 5. Sends [`crate::engine::ts_assembler::PlanCommand::ReplacePlan`]
+    ///    to the running assembler.
+    ///
+    /// On success the runtime's `current_assembly` is updated; the
+    /// caller is responsible for persisting `config.json`.
+    pub async fn replace_assembly(
+        &self,
+        new_assembly: crate::config::models::FlowAssembly,
+    ) -> Result<()> {
+        let flow_id = &self.config.config.id;
+        let handle = self
+            .pid_bus_assembler_handle
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!(
+                "flow '{}' has no running assembler — `update_flow_assembly` is only \
+                 valid when the flow's existing `assembly.kind != passthrough`. Use \
+                 `update_flow` to switch a passthrough flow into assembly mode.",
+                flow_id
+            ))?;
+        let bus = self
+            .es_bus
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!(
+                "flow '{}' assembler is running but has no FlowEsBus — internal invariant violated",
+                flow_id
+            ))?
+            .clone();
+
+        // Build the new plan against the current `ResolvedFlow.inputs`.
+        // `build_assembly_plan` emits Critical events on every failure
+        // path (`pid_bus_spts_*`, `pid_bus_audio_encode_codec_*`, etc.)
+        // so the manager UI has its field-level signals.
+        let mut build = build_assembly_plan(&new_assembly, &self.config, &self.event_sender)?;
+
+        // Essence resolution against the flow's live PSI catalogues.
+        // 3-second window matches start-up.
+        if !build.pending_essence.is_empty() {
+            let mut catalogues: std::collections::HashMap<
+                String,
+                Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>,
+            > = std::collections::HashMap::new();
+            for p in &build.pending_essence {
+                if !catalogues.contains_key(&p.input_id) {
+                    if let Some(c) = self.stats.per_input_counters.get(&p.input_id) {
+                        catalogues.insert(p.input_id.clone(), c.psi_catalog.clone());
+                    }
+                }
+            }
+            match resolve_essence_slots(
+                build.pending_essence.clone(),
+                catalogues,
+                ESSENCE_RESOLVE_TIMEOUT,
+            )
+            .await
+            {
+                Ok(pairs) => {
+                    for ((program_idx, slot_idx), pid) in pairs {
+                        if let Some(prog) = build.plan.programs.get_mut(program_idx) {
+                            if let Some(slot) = prog.slots.get_mut(slot_idx) {
+                                slot.source.1 = pid;
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    let (code, msg) = essence_error_to_event(flow_id, &err);
+                    self.event_sender.emit_flow_with_details(
+                        EventSeverity::Critical,
+                        category::FLOW,
+                        msg.clone(),
+                        flow_id,
+                        serde_json::json!({
+                            "error_code": code,
+                            "detail": format!("{err:?}"),
+                        }),
+                    );
+                    bail!(msg);
+                }
+            }
+        }
+
+        // Spawn any Hitless mergers the new plan introduced. The
+        // assembler picks up the synthetic bus key as soon as its
+        // `ReplacePlan` lands.
+        for hl in &build.pending_hitless {
+            let _ = crate::engine::ts_es_hitless::spawn_hitless_es_merger(
+                hl.uid.clone(),
+                hl.primary.clone(),
+                hl.backup.clone(),
+                bus.clone(),
+                std::time::Duration::from_millis(hl.stall_ms),
+                self.cancel_token.child_token(),
+            );
+        }
+
+        handle
+            .plan_tx
+            .send(crate::engine::ts_assembler::PlanCommand::ReplacePlan {
+                plan: build.plan,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("flow '{}' assembler receiver closed", flow_id))?;
+
+        let mut current = self.current_assembly.lock().await;
+        *current = Some(new_assembly);
+        Ok(())
+    }
+
+    /// Snapshot the currently-running assembly. Used by the
+    /// `update_flow_assembly` handler to short-circuit no-op updates.
+    pub async fn current_assembly(&self) -> Option<crate::config::models::FlowAssembly> {
+        self.current_assembly.lock().await.clone()
     }
 
     /// Switch the currently active input of a running flow.
@@ -2194,13 +2367,17 @@ fn build_assembly_plan(
 
     let mut programs: Vec<ProgramPlan> = Vec::with_capacity(assembly.programs.len());
     let mut pending_essence: Vec<PendingEssenceSlot> = Vec::new();
+    let mut pending_hitless: Vec<crate::engine::ts_assembler::PendingHitlessSlot> = Vec::new();
 
     for (program_idx, program) in assembly.programs.iter().enumerate() {
         // Resolve every slot. `Pid` slots map directly to a concrete
         // `(input_id, source_pid)`. `Essence` slots get a sentinel
         // `source_pid = 0` and an entry in `pending_essence` so the
         // runtime can patch the slot in place after the resolver
-        // returns. `Hitless` stays rejected loudly (Phase 7 scope).
+        // returns. `Hitless` slots expand into a synthetic bus key
+        // (`hitless:slot_{P}_{S}`) and a `PendingHitlessSlot` entry
+        // that the runtime turns into a merger task before the
+        // assembler starts.
         let mut slots: Vec<AssemblySlot> = Vec::with_capacity(program.streams.len());
         for stream in &program.streams {
             let (input_id, source_pid) = match &stream.source {
@@ -2215,22 +2392,71 @@ fn build_assembly_plan(
                     });
                     (input_id.clone(), 0_u16) // sentinel, patched after resolution
                 }
-                SlotSource::Hitless { .. } => {
-                    let msg = format!(
-                        "flow '{}': SlotSource::Hitless is not yet implemented — \
-                         use a single SlotSource::Pid or SlotSource::Essence until \
-                         Phase 7 lands runtime switching.",
-                        flow_id
-                    );
-                    emit(
-                        "pid_bus_spts_hitless_not_implemented",
-                        &msg,
-                        serde_json::json!({
-                            "program_number": program.program_number,
-                            "out_pid": stream.out_pid,
-                        }),
-                    );
-                    bail!(msg);
+                SlotSource::Hitless { primary, backup } => {
+                    let slot_idx = slots.len();
+                    let uid = format!("slot_{}_{}", program_idx, slot_idx);
+                    // Resolve primary + backup. For first-light both
+                    // legs must be `SlotSource::Pid` — Essence-inside-
+                    // Hitless and nested Hitless both fail loudly so
+                    // the operator sees the limitation up-front.
+                    let primary_pair = match primary.as_ref() {
+                        SlotSource::Pid { input_id, source_pid } => {
+                            (input_id.clone(), *source_pid)
+                        }
+                        _ => {
+                            let msg = format!(
+                                "flow '{flow_id}': program {} out_pid {}: SlotSource::Hitless \
+                                 first-light only supports SlotSource::Pid legs (got {:?}). \
+                                 Resolve nested Essence to a concrete PID, or wait for the \
+                                 follow-up that adds Essence-inside-Hitless.",
+                                program.program_number, stream.out_pid, primary,
+                            );
+                            emit(
+                                "pid_bus_hitless_leg_not_pid",
+                                &msg,
+                                serde_json::json!({
+                                    "program_number": program.program_number,
+                                    "out_pid": stream.out_pid,
+                                    "leg": "primary",
+                                }),
+                            );
+                            bail!(msg);
+                        }
+                    };
+                    let backup_pair = match backup.as_ref() {
+                        SlotSource::Pid { input_id, source_pid } => {
+                            (input_id.clone(), *source_pid)
+                        }
+                        _ => {
+                            let msg = format!(
+                                "flow '{flow_id}': program {} out_pid {}: SlotSource::Hitless \
+                                 first-light only supports SlotSource::Pid legs (got {:?}). \
+                                 Resolve nested Essence to a concrete PID, or wait for the \
+                                 follow-up that adds Essence-inside-Hitless.",
+                                program.program_number, stream.out_pid, backup,
+                            );
+                            emit(
+                                "pid_bus_hitless_leg_not_pid",
+                                &msg,
+                                serde_json::json!({
+                                    "program_number": program.program_number,
+                                    "out_pid": stream.out_pid,
+                                    "leg": "backup",
+                                }),
+                            );
+                            bail!(msg);
+                        }
+                    };
+                    pending_hitless.push(crate::engine::ts_assembler::PendingHitlessSlot {
+                        uid: uid.clone(),
+                        primary: primary_pair,
+                        backup: backup_pair,
+                        stall_ms: crate::engine::ts_es_hitless::DEFAULT_STALL_MS,
+                    });
+                    // The assembler reads from the synthetic merger
+                    // output. The pre-bus merger task is responsible
+                    // for keeping that key supplied.
+                    crate::engine::ts_es_hitless::hitless_bus_key(&uid)
                 }
             };
             // Phase 6.5 cross-check: when the slot's input is a PCM /
@@ -2311,6 +2537,7 @@ fn build_assembly_plan(
     Ok(SptsBuildResult {
         plan: AssemblyPlan { programs },
         pending_essence,
+        pending_hitless,
     })
 }
 

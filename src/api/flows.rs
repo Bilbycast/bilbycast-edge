@@ -338,6 +338,75 @@ pub async fn stop_flow(
     Ok(Json(ApiResponse::ok(())))
 }
 
+/// `PUT /api/v1/flows/{flow_id}/assembly` -- Hot-swap a flow's
+/// PID-bus assembly plan without restarting the flow (Phase 7).
+///
+/// Body: a `FlowAssembly` JSON object — same schema as the `assembly`
+/// field on `FlowConfig`. The handler:
+///
+/// 1. Looks up the running flow.
+/// 2. No-op if the new assembly is structurally identical to the
+///    current one.
+/// 3. Calls [`crate::engine::flow::FlowRuntime::replace_assembly`]
+///    which validates, resolves any `Essence` slots, spawns Hitless
+///    mergers, and dispatches `PlanCommand::ReplacePlan` to the
+///    running assembler. PMT version bumps automatically per program.
+/// 4. Persists the new `assembly` block to `config.json`.
+///
+/// Mirrors the WS `update_flow_assembly` command — same helper, same
+/// validation, same error codes. Used by the testbed probe so it can
+/// drive the runtime switch without standing up a manager.
+///
+/// # Errors
+///
+/// - [`ApiError::NotFound`] (404) when the flow isn't running.
+/// - [`ApiError::BadRequest`] (400) when the assembly body fails
+///   validation, when essence resolution can't find a matching ES, or
+///   when the input shape forbids the requested switch.
+pub async fn update_flow_assembly(
+    _admin: RequireAdmin,
+    State(state): State<AppState>,
+    Path(flow_id): Path<String>,
+    Json(new_assembly): Json<crate::config::models::FlowAssembly>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let runtime = state
+        .flow_manager
+        .get_runtime(&flow_id)
+        .ok_or_else(|| ApiError::NotFound(format!("Flow '{flow_id}' is not running")))?;
+
+    if let Some(cur) = runtime.current_assembly().await {
+        if cur == new_assembly {
+            tracing::info!("update_flow_assembly '{flow_id}': no-op (unchanged)");
+            return Ok(Json(ApiResponse::ok(())));
+        }
+    }
+
+    runtime
+        .replace_assembly(new_assembly.clone())
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    let cfg_clone = {
+        let mut cfg = state.config.write().await;
+        if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
+            flow.assembly = Some(new_assembly);
+        }
+        cfg.clone()
+    };
+    if let Err(e) = save_config_split_async(
+        state.config_path.clone(),
+        state.secrets_path.clone(),
+        cfg_clone,
+    )
+    .await
+    {
+        tracing::warn!("update_flow_assembly '{flow_id}': persist failed: {e}");
+    }
+
+    tracing::info!("update_flow_assembly '{flow_id}': hot-swap complete");
+    Ok(Json(ApiResponse::ok(())))
+}
+
 /// `POST /api/v1/flows/{flow_id}/restart` -- Restart a flow (stop + start).
 ///
 /// Looks up the flow by `flow_id`, destroys the running instance (if any), and

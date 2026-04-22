@@ -60,6 +60,10 @@ pub mod ts_program_filter;
 pub mod ts_pid_remapper;
 pub mod ts_psi_catalog;
 pub mod ts_es_bus;
+/// Phase 7 PID-bus Hitless merger: pre-bus dedup task that turns one
+/// `SlotSource::Hitless { primary, backup }` slot into a single
+/// synthetic [`ts_es_bus::FlowEsBus`] key the assembler consumes.
+pub mod ts_es_hitless;
 /// Phase 5 PID-bus SPTS assembler: subscribes to elementary streams on
 /// [`ts_es_bus::FlowEsBus`], rewrites PIDs, stamps per-out-PID continuity,
 /// synthesises PAT/PMT, and emits bundled TS `RtpPacket`s onto the flow's

@@ -98,6 +98,16 @@ impl FlowManager {
         self.flows.contains_key(flow_id)
     }
 
+    /// Look up a running flow's [`FlowRuntime`] by id.
+    ///
+    /// Returns `None` if the flow isn't currently active. Callers get
+    /// an `Arc<FlowRuntime>` clone so they can read runtime handles
+    /// (e.g. the PID-bus assembler's `plan_tx` for `update_flow_assembly`)
+    /// without holding the DashMap shard lock.
+    pub fn get_runtime(&self, flow_id: &str) -> Option<Arc<FlowRuntime>> {
+        self.flows.get(flow_id).map(|r| r.value().clone())
+    }
+
     /// Create and start a new media flow from the given configuration.
     ///
     /// This performs the full bring-up sequence:
