@@ -26,7 +26,7 @@ To obtain a commercial licence, or to discuss whether your use
 case needs one, please contact:
 
     Softside Tech Pty Ltd
-    commercial@softsidetech.com
+    contact@bilbycast.com
 
 If you're unsure which licence fits your use case, email us — we're
 happy to help you work it out before you invest engineering time.
@@ -60,4 +60,4 @@ FFmpeg (libavcodec / libavutil / libswscale), libopus, and Fraunhofer
 FDK AAC have their own licences — see NOTICE / NOTICE.full for the
 full bundled-library manifest. If you are unsure whether a specific
 build configuration is compatible with your intended distribution
-model, email commercial@softsidetech.com before shipping.
+model, email contact@bilbycast.com before shipping.

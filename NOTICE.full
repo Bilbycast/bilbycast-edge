@@ -14,7 +14,7 @@ choice:
  2. A commercial licence from Softside Tech Pty Ltd — for OEMs,
     hardware integrators, SaaS providers, and other commercial
     users who need to embed or operate bilbycast without AGPL's
-    copyleft. Contact commercial@softsidetech.com for terms. See
+    copyleft. Contact contact@bilbycast.com for terms. See
     LICENSE.commercial.
 
 The combination with libx264 and libx265 (both GPL-2.0-or-later) is
@@ -80,7 +80,7 @@ across the bilbycast repositories on GitHub at the matching tag:
 
 Per AGPL-3.0 § 6, a written offer valid for three years to provide
 the source on physical media is available on request at
-reza@softsidetech.com.
+contact@bilbycast.com.
 
 If you modify bilbycast and operate it as a network service,
 AGPL § 13 requires you to make the complete corresponding source

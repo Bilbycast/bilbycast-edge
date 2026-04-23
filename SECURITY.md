@@ -6,7 +6,7 @@
 
 If you believe you have found a security vulnerability in any bilbycast project, please report it privately using one of the following channels:
 
-- **Email:** admin@softsidetech.com
+- **Email:** contact@bilbycast.com
 - **GitHub:** Use [Private vulnerability reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability) via the repository's **Security** tab.
 
 Please include:

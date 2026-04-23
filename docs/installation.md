@@ -196,7 +196,7 @@ bundled-library manifest.
 - Source code: [AGPL-3.0-or-later](../LICENSE).
 - Commercial licence for OEMs / SaaS integrators: see
   [LICENSE.commercial](../LICENSE.commercial) — contact
-  `commercial@softsidetech.com`.
+  `contact@bilbycast.com`.
 - **Commercial licence scope**: the Softside commercial licence
   covers the bilbycast source code only. It does not relicense
   libx264 / libx265, which remain GPL-2.0-or-later inside the

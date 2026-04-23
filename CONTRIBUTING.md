@@ -46,4 +46,4 @@ Or sign off a whole branch:
 
 Open an issue before starting non-trivial work so we can align on
 scope and approach. For licensing questions, email
-`commercial@softsidetech.com`.
+`contact@bilbycast.com`.

@@ -281,7 +281,7 @@ Options:
 bilbycast-edge is **dual-licensed**:
 
 - **AGPL-3.0-or-later** for open-source users — free for review, private use, small-scale deployment, and any use where you are comfortable releasing the source of your modifications and any network service built on top of bilbycast under AGPL terms. See [LICENSE](LICENSE).
-- **Commercial licence** from Softside Tech Pty Ltd for OEMs, hardware integrators, SaaS providers, and commercial customers who need to ship bilbycast inside a closed-source product or operate it as a network service without AGPL § 13's source-release obligation. Contact **commercial@softsidetech.com** for terms. See [LICENSE.commercial](LICENSE.commercial).
+- **Commercial licence** from Softside Tech Pty Ltd for OEMs, hardware integrators, SaaS providers, and commercial customers who need to ship bilbycast inside a closed-source product or operate it as a network service without AGPL § 13's source-release obligation. Contact **contact@bilbycast.com** for terms. See [LICENSE.commercial](LICENSE.commercial).
 
 AGPL's network-copyleft (§ 13) means that if you modify bilbycast and run it as a service accessed by users over a network, those users must be able to obtain the complete corresponding source of your modified version. The commercial licence removes that obligation.
 
