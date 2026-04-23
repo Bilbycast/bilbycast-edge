@@ -65,9 +65,14 @@ button:disabled{background:#21262d;color:#484f58;cursor:not-allowed}
 
     <div class="section">
       <div class="section-title">Manager Connection</div>
-      <label for="manager_url">Manager URL</label>
-      <div class="hint">WebSocket URL of the bilbycast-manager (must start with wss://)</div>
-      <input type="text" id="manager_url" placeholder="wss://manager.example.com:8443/ws/node" maxlength="2048" required>
+      <label for="manager_urls">Manager URLs (one per line)</label>
+      <div class="hint">
+        One or more WebSocket URLs of bilbycast-manager instances
+        (each must start with wss://). The edge tries them in order
+        and rotates on connection close — use 2–4 entries for an
+        active/active cluster, a single entry for a solo manager.
+      </div>
+      <textarea id="manager_urls" rows="4" placeholder="wss://manager-a.example.com:8443/ws/node&#10;wss://manager-b.example.com:8443/ws/node" required style="width:100%;box-sizing:border-box;font-family:inherit;color:inherit;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px"></textarea>
 
       <label for="registration_token" style="margin-top:12px">Registration Token</label>
       <div class="hint">One-time token for registering with the manager (optional)</div>
@@ -99,7 +104,9 @@ button:disabled{background:#21262d;color:#484f58;cursor:not-allowed}
       form.style.display = 'block';
       if (data.listen_addr) document.getElementById('listen_addr').value = data.listen_addr;
       if (data.listen_port) document.getElementById('listen_port').value = data.listen_port;
-      if (data.manager_url) document.getElementById('manager_url').value = data.manager_url;
+      if (data.manager_urls && data.manager_urls.length > 0) {
+        document.getElementById('manager_urls').value = data.manager_urls.join('\n');
+      }
       if (data.accept_self_signed_cert) document.getElementById('accept_self_signed_cert').checked = true;
       if (data.registration_token) document.getElementById('registration_token').value = data.registration_token;
       if (data.device_name) document.getElementById('device_name').value = data.device_name;
@@ -121,7 +128,10 @@ function submitForm(e) {
   var payload = {
     listen_addr: document.getElementById('listen_addr').value.trim(),
     listen_port: parseInt(document.getElementById('listen_port').value, 10),
-    manager_url: document.getElementById('manager_url').value.trim(),
+    manager_urls: document.getElementById('manager_urls').value
+      .split(/\r?\n|,/)
+      .map(function(s) { return s.trim(); })
+      .filter(function(s) { return s.length > 0; }),
     accept_self_signed_cert: document.getElementById('accept_self_signed_cert').checked,
     registration_token: document.getElementById('registration_token').value.trim() || null,
     device_name: document.getElementById('device_name').value.trim() || null

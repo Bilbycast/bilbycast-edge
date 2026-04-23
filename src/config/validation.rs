@@ -122,14 +122,36 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
     // Validate manager config if present
     if let Some(ref mgr) = config.manager {
         if mgr.enabled {
-            if mgr.url.is_empty() {
-                bail!("Manager URL cannot be empty when manager is enabled");
+            if mgr.urls.is_empty() {
+                bail!(
+                    "Manager urls[] cannot be empty when manager is enabled. \
+                     Single-URL deployments should still use a one-element array."
+                );
             }
-            if !mgr.url.starts_with("wss://") {
-                bail!("Manager URL must start with wss:// (TLS required)");
+            if mgr.urls.len() > 16 {
+                bail!(
+                    "Manager urls[] must contain at most 16 entries ({} given). \
+                     Large fleets should front their cluster with a load balancer \
+                     rather than enumerate every instance here.",
+                    mgr.urls.len()
+                );
             }
-            if mgr.url.len() > 2048 {
-                bail!("Manager URL must be at most 2048 characters");
+            let mut seen: HashSet<&str> = HashSet::new();
+            for (i, url) in mgr.urls.iter().enumerate() {
+                if url.is_empty() {
+                    bail!("Manager urls[{i}] is empty");
+                }
+                if !url.starts_with("wss://") {
+                    bail!(
+                        "Manager urls[{i}] = {url:?} must start with wss:// (TLS required)"
+                    );
+                }
+                if url.len() > 2048 {
+                    bail!("Manager urls[{i}] must be at most 2048 characters");
+                }
+                if !seen.insert(url.as_str()) {
+                    bail!("Manager urls[{i}] = {url:?} is a duplicate");
+                }
             }
             if let Some(ref token) = mgr.registration_token {
                 if token.len() > 4096 {

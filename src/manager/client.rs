@@ -238,13 +238,28 @@ async fn manager_client_loop(
         tunnel_manager.set_manager_node_id(node_id.clone());
     }
 
-    let mut backoff_secs = 1u64;
-    let max_backoff = 60u64;
+    // Multi-URL failover (scale-out): 1..16 URLs in config.urls. We
+    // rotate on every close/failure with a fixed 5 s backoff that
+    // resets on successful auth. The cursor advances regardless of
+    // outcome so a flapping primary does not starve the standbys.
+    let fixed_backoff = Duration::from_secs(5);
+    let mut cursor: usize = 0;
 
     loop {
-        tracing::info!("Connecting to manager at {}", config.url);
+        if config.urls.is_empty() {
+            tracing::error!("Manager client started with no URLs — config.urls is empty");
+            tokio::time::sleep(fixed_backoff).await;
+            continue;
+        }
+        let current_url = config.urls[cursor % config.urls.len()].clone();
+        tracing::info!(
+            "Connecting to manager at {current_url} (url {} of {})",
+            (cursor % config.urls.len()) + 1,
+            config.urls.len(),
+        );
 
         match try_connect(
+            &current_url,
             &config,
             &flow_manager,
             &tunnel_manager,
@@ -262,8 +277,7 @@ async fn manager_client_loop(
         .await
         {
             Ok(ConnectResult::Closed) => {
-                tracing::info!("Manager connection closed normally");
-                backoff_secs = 1;
+                tracing::info!("Manager connection to {current_url} closed normally");
             }
             Ok(ConnectResult::Registered {
                 node_id,
@@ -276,24 +290,26 @@ async fn manager_client_loop(
                 config.node_id = Some(node_id.clone());
                 config.node_secret = Some(node_secret.clone());
                 tunnel_manager.set_manager_node_id(node_id.clone());
-                backoff_secs = 1;
 
                 // Persist to config + secrets files
                 persist_credentials(&app_config, &config_path, &secrets_path, &node_id, &node_secret).await;
             }
             Err(e) => {
-                tracing::warn!("Manager connection failed: {e}");
+                tracing::warn!("Manager connection to {current_url} failed: {e}");
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Warning,
                     category::MANAGER,
-                    "Manager connection lost, reconnecting",
+                    "Manager connection lost, rotating to next URL",
                 );
             }
         }
 
-        tracing::info!("Reconnecting to manager in {backoff_secs}s...");
-        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-        backoff_secs = (backoff_secs * 2).min(max_backoff);
+        cursor = cursor.wrapping_add(1);
+        tracing::info!(
+            "Reconnecting to next manager URL in {}s...",
+            fixed_backoff.as_secs()
+        );
+        tokio::time::sleep(fixed_backoff).await;
     }
 }
 
@@ -306,6 +322,7 @@ enum ConnectResult {
 }
 
 async fn try_connect(
+    current_url: &str,
     config: &ManagerConfig,
     flow_manager: &Arc<FlowManager>,
     tunnel_manager: &Arc<TunnelManager>,
@@ -321,7 +338,7 @@ async fn try_connect(
     standby_listeners: &Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
 ) -> Result<ConnectResult, String> {
     // Enforce TLS — only wss:// connections are allowed
-    if !config.url.starts_with("wss://") {
+    if !current_url.starts_with("wss://") {
         return Err(
             "Manager URL must use wss:// (TLS). Plaintext ws:// connections are not allowed."
                 .into(),
@@ -352,7 +369,7 @@ async fn try_connect(
             .with_no_client_auth();
         let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config));
         tokio_tungstenite::connect_async_tls_with_config(
-            &config.url,
+            current_url,
             None,
             false,
             Some(connector),
@@ -378,7 +395,7 @@ async fn try_connect(
             .with_no_client_auth();
         let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
         tokio_tungstenite::connect_async_tls_with_config(
-            &config.url,
+            current_url,
             None,
             false,
             Some(connector),
@@ -386,7 +403,7 @@ async fn try_connect(
         .await
         .map_err(|e| format!("WebSocket connect failed: {e}"))?
     } else {
-        tokio_tungstenite::connect_async(&config.url)
+        tokio_tungstenite::connect_async(current_url)
             .await
             .map_err(|e| format!("WebSocket connect failed: {e}"))?
     };

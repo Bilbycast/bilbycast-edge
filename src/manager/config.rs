@@ -3,14 +3,26 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Configuration for connecting to a bilbycast-manager instance.
+/// Configuration for connecting to a bilbycast-manager cluster.
+///
+/// Multi-URL client-side failover: the edge tries `urls[0]` first. On
+/// any WebSocket close or auth failure it rotates to `urls[1]`, then
+/// `[2]`, wrapping at the end of the list, with a 5-second backoff
+/// between attempts that resets to 5s on the first successful auth
+/// against whichever URL succeeded. 1-16 entries, each must start
+/// with `wss://` (plaintext `ws://` is rejected at load time).
+///
+/// Operators who just want a single-URL deployment put one entry in
+/// the list — no separate single-URL shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagerConfig {
     /// Enable manager connection.
     #[serde(default)]
     pub enabled: bool,
-    /// Manager WebSocket URL, e.g. "wss://manager-host:8443/ws/node"
-    pub url: String,
+    /// Ordered list of manager WebSocket URLs. First entry is the
+    /// preferred target; later entries are failover peers the client
+    /// rotates through as connections close.
+    pub urls: Vec<String>,
     /// Accept self-signed TLS certificates from the manager.
     /// Only enable this for development/testing. Default: false.
     /// Requires `BILBYCAST_ALLOW_INSECURE=1` env var as a safety guard.

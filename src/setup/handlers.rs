@@ -15,11 +15,16 @@ use crate::manager::ManagerConfig;
 use super::wizard::{SETUP_DISABLED_HTML, SETUP_HTML};
 
 /// Request body for POST /setup.
+///
+/// `manager_urls` carries the full ordered list the wizard collected
+/// from the operator — one to sixteen entries. Single-instance
+/// deployments still send a one-element array; the schema does not
+/// accept a scalar `manager_url` any more.
 #[derive(Debug, Deserialize)]
 pub struct SetupPayload {
     pub listen_addr: Option<String>,
     pub listen_port: Option<u16>,
-    pub manager_url: String,
+    pub manager_urls: Vec<String>,
     pub accept_self_signed_cert: Option<bool>,
     pub registration_token: Option<String>,
     pub device_name: Option<String>,
@@ -40,7 +45,7 @@ pub struct SetupResponse {
 pub struct SetupStatus {
     pub listen_addr: String,
     pub listen_port: u16,
-    pub manager_url: Option<String>,
+    pub manager_urls: Vec<String>,
     pub accept_self_signed_cert: bool,
     pub registration_token: Option<String>,
     pub device_name: Option<String>,
@@ -59,17 +64,14 @@ pub async fn setup_page(State(state): State<AppState>) -> impl IntoResponse {
 /// GET /setup/status — returns current setup-relevant config as JSON.
 pub async fn setup_status(State(state): State<AppState>) -> Json<SetupStatus> {
     let config = state.config.read().await;
-    let (manager_url, accept_self_signed) = match &config.manager {
-        Some(m) => (
-            Some(m.url.clone()),
-            m.accept_self_signed_cert,
-        ),
-        None => (None, false),
+    let (manager_urls, accept_self_signed) = match &config.manager {
+        Some(m) => (m.urls.clone(), m.accept_self_signed_cert),
+        None => (Vec::new(), false),
     };
     Json(SetupStatus {
         listen_addr: config.server.listen_addr.clone(),
         listen_port: config.server.listen_port,
-        manager_url,
+        manager_urls,
         accept_self_signed_cert: accept_self_signed,
         // Never expose the registration token — it's a secret
         registration_token: None,
@@ -98,37 +100,58 @@ pub async fn apply_setup(
         }
     }
 
-    // Validate manager URL
-    let manager_url = payload.manager_url.trim().to_string();
-    if manager_url.is_empty() {
+    // Validate manager URL list (1..16, wss://, ≤2048 chars, unique).
+    let manager_urls: Vec<String> = payload
+        .manager_urls
+        .iter()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .collect();
+    if manager_urls.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(SetupResponse {
                 success: false,
                 message: None,
-                error: Some("Manager URL is required".to_string()),
+                error: Some(
+                    "At least one manager URL is required (single-instance deploys still use a 1-entry list)".to_string(),
+                ),
             }),
         );
     }
-    if !manager_url.starts_with("wss://") {
+    if manager_urls.len() > 16 {
         return (
             StatusCode::BAD_REQUEST,
             Json(SetupResponse {
                 success: false,
                 message: None,
-                error: Some("Manager URL must start with wss:// (TLS required)".to_string()),
+                error: Some(
+                    "At most 16 manager URLs are permitted; front a larger cluster with a load balancer.".to_string(),
+                ),
             }),
         );
     }
-    if manager_url.len() > 2048 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(SetupResponse {
-                success: false,
-                message: None,
-                error: Some("Manager URL must be at most 2048 characters".to_string()),
-            }),
-        );
+    for url in &manager_urls {
+        if !url.starts_with("wss://") {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SetupResponse {
+                    success: false,
+                    message: None,
+                    error: Some(format!("Manager URL {url:?} must start with wss:// (TLS required)")),
+                }),
+            );
+        }
+        if url.len() > 2048 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SetupResponse {
+                    success: false,
+                    message: None,
+                    error: Some(format!("Manager URL {url:?} must be at most 2048 characters")),
+                }),
+            );
+        }
     }
 
     // Validate registration token length
@@ -194,7 +217,7 @@ pub async fn apply_setup(
 
     config.manager = Some(ManagerConfig {
         enabled: true,
-        url: manager_url,
+        urls: manager_urls,
         accept_self_signed_cert: payload.accept_self_signed_cert.unwrap_or(false),
         cert_fingerprint: config.manager.as_ref().and_then(|m| m.cert_fingerprint.clone()),
         registration_token,

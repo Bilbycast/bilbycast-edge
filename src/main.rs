@@ -344,7 +344,11 @@ async fn main() -> anyhow::Result<()> {
     // Optionally start manager client
     if let Some(ref mgr_config) = app_config.manager {
         if mgr_config.enabled {
-            tracing::info!("Manager client enabled, connecting to {}", mgr_config.url);
+            tracing::info!(
+                "Manager client enabled, connecting to {} URL(s): {}",
+                mgr_config.urls.len(),
+                mgr_config.urls.join(", "),
+            );
             let local_ip = resolve_local_ip();
             let api_port = app_config.server.listen_port;
             let mgr_api_addr = format!("{}:{}", local_ip, api_port);

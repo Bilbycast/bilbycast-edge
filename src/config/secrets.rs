@@ -539,7 +539,7 @@ mod tests {
             monitor: None,
             manager: Some(ManagerConfig {
                 enabled: true,
-                url: "wss://manager:8443/ws/node".to_string(),
+                urls: vec!["wss://manager:8443/ws/node".to_string()],
                 accept_self_signed_cert: false,
                 cert_fingerprint: None,
                 registration_token: Some("reg-token".to_string()),
@@ -649,7 +649,7 @@ mod tests {
         let mut config = AppConfig::default();
         config.manager = Some(ManagerConfig {
             enabled: true,
-            url: "wss://manager:8443/ws/node".to_string(),
+            urls: vec!["wss://manager:8443/ws/node".to_string()],
             accept_self_signed_cert: false,
             cert_fingerprint: None,
             registration_token: None,
