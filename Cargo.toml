@@ -7,11 +7,11 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.52.0", features = ["full"] }
+tokio = { version = "1.51", features = ["full"] }
 tokio-util = "0.7.18"
 # Bridges `tokio::sync::mpsc::Receiver<T>` to `futures::Stream<Item=T>`,
 # which reqwest::Body::wrap_stream expects (used by CMAF-LL chunked PUT).
-tokio-stream = "0.1.17"
+tokio-stream = "0.1.18"
 
 # HTTP framework
 axum = { version = "0.8.9", features = ["ws"] }

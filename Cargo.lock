@@ -377,7 +377,7 @@ dependencies = [
  "mdns-sd",
  "quinn",
  "rand 0.10.1",
- "rcgen 0.14.7",
+ "rcgen",
  "reqwest",
  "retina",
  "ring",
@@ -499,7 +499,7 @@ dependencies = [
  "libc",
  "log",
  "quinn",
- "rcgen 0.13.2",
+ "rcgen",
  "rist-transport",
  "rustls",
  "rustls-pemfile",
@@ -2426,19 +2426,6 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rcgen"
-version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
-dependencies = [
- "pem",
- "ring",
- "rustls-pki-types",
- "time",
- "yasna",
-]
-
-[[package]]
-name = "rcgen"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10b99e0098aa4082912d4c649628623db6aba77335e4f4569ff5083a6448b32e"
@@ -2593,7 +2580,7 @@ version = "0.3.0"
 dependencies = [
  "bytes",
  "log",
- "rand 0.9.4",
+ "rand 0.10.1",
  "thiserror 2.0.18",
 ]
 
@@ -2604,7 +2591,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "log",
- "rand 0.9.4",
+ "rand 0.10.1",
  "rist-protocol",
  "socket2",
  "thiserror 2.0.18",
