@@ -69,8 +69,14 @@ const TRIGGER_MIN_GAP: Duration = Duration::from_millis(500);
 /// samples trip the alarm.
 const FREEZE_MIN_GAP: Duration = Duration::from_millis(4_500);
 
-/// Maximum TS data to buffer (~3 seconds at 10 Mbps ≈ 3.75 MB).
-const MAX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum TS data to buffer. Sized so a single typical-GOP keyframe is
+/// always somewhere in the window — broadcast-grade GOPs run 1–2 s, but
+/// pre-encoded MP4 sources (e.g. media-player input) routinely ship with
+/// 10 s GOPs. 32 MB ≈ 12 s at 21 Mbps, ≈ 25 s at 10 Mbps. Each per-input
+/// generator carries its own ring; subscribers that lag past the budget
+/// drop oldest packets first, so the cost is one allocation per flow,
+/// not per packet.
+const MAX_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 
 /// Thumbnail output dimensions.
 const THUMBNAIL_WIDTH: u32 = 320;
@@ -84,6 +90,13 @@ const TS_PACKET_SIZE: usize = 188;
 
 /// Average luminance (0–255) below which a frame is considered black.
 const BLACK_LUMINANCE_THRESHOLD: f64 = 16.0;
+
+/// How long the broadcast channel may stay silent before we declare the
+/// input "gone" (`no_signal`). Picked so a working stream's normal
+/// inter-packet jitter never trips it, while a stopped stream is flagged
+/// before the freeze counter could reach the 30 s frozen threshold and
+/// raise the wrong alarm.
+const NO_SIGNAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── Subprocess fallback constants (used when video-thumbnail is disabled) ──
 
@@ -171,6 +184,11 @@ async fn thumbnail_loop(
     let mut program_filter = program_number.map(TsProgramFilter::new);
     let mut filter_scratch: Vec<u8> = Vec::new();
 
+    // Wall-clock of the most recent broadcast packet. Distinguishes
+    // "stream stopped" (silent channel → `no_signal`) from "stream is
+    // genuinely frozen" (still receiving packets → freeze detector).
+    let mut last_packet_at: Option<std::time::Instant> = None;
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -234,14 +252,16 @@ async fn thumbnail_loop(
             }
 
             _ = interval.tick() => {
-                if buffer_bytes == 0 {
-                    // No TS in the ring — the input is idle or has stopped
-                    // publishing. Clear the freeze tracker (the next
-                    // captured frame must start a fresh sequence rather
-                    // than colliding with a stale hash) and raise the
-                    // `"no_signal"` alarm so the manager UI can distinguish
-                    // "signal absent" from a stale lingering JPEG. The 1s
-                    // stats push propagates this within a second.
+                // Detect "gone" before "frozen": if the broadcast channel
+                // has been silent for `NO_SIGNAL_TIMEOUT`, the input has
+                // stopped — re-decoding the stale buffer would produce
+                // identical JPEGs and trip the freeze alarm with the
+                // wrong cause. Resetting the freeze counter here also
+                // gives a clean slate for when the stream resumes.
+                let stream_silent = last_packet_at
+                    .map(|t| t.elapsed() >= NO_SIGNAL_TIMEOUT)
+                    .unwrap_or(true);
+                if stream_silent || buffer_bytes == 0 {
                     stats.reset_freeze();
                     stats.set_alarm(Some("no_signal".to_string()));
                     continue;
@@ -308,6 +328,11 @@ async fn thumbnail_loop(
             result = rx.recv() => {
                 match result {
                     Ok(packet) => {
+                        // Touch the freshness timestamp on every packet,
+                        // even ones we ultimately discard — the channel is
+                        // alive and the loop should not declare `no_signal`.
+                        last_packet_at = Some(std::time::Instant::now());
+
                         let ts_payload = strip_rtp_header(&packet);
                         if ts_payload.is_empty() {
                             continue;
@@ -477,13 +502,21 @@ fn extract_video_from_ts(ts_data: &[u8]) -> Option<ExtractedVideo> {
         _ => return None,
     };
 
-    // ── Pass 3: Reassemble PES payloads for video PID ──
-    // Collect raw elementary stream data (PES payload = Annex B NAL units).
+    // ── Pass 3: Find the *most recent* keyframe-bearing video PES ──
+    // The buffer holds many seconds of TS so a long-GOP source (e.g. an MP4
+    // with one IDR per 10 s) keeps the same keyframe in the window across
+    // multiple thumbnail ticks. Decoding the first keyframe each tick
+    // produces identical JPEGs and trips the freeze alarm. Walking
+    // backwards over video PUSIs and starting ES collection at the latest
+    // keyframe means a fresh IDR shifts the JPEG immediately, while a feed
+    // that genuinely repeats the same picture still produces matching
+    // hashes and trips the alarm correctly.
+    let start_offset = find_latest_keyframe_offset(ts_data, video_pid, codec).unwrap_or(0);
+
     let mut es_data = Vec::with_capacity(256 * 1024);
     let mut pes_started = false;
-    let mut found_keyframe_pes = false;
 
-    offset = 0;
+    offset = start_offset;
     while offset + TS_PACKET_SIZE <= ts_data.len() {
         let pkt = &ts_data[offset..offset + TS_PACKET_SIZE];
         offset += TS_PACKET_SIZE;
@@ -500,13 +533,10 @@ fn extract_video_from_ts(ts_data: &[u8]) -> Option<ExtractedVideo> {
         let payload = &pkt[payload_start..];
 
         if pusi {
-            // New PES packet starting. If we already collected a keyframe,
-            // we have enough data — stop here.
-            if found_keyframe_pes && !es_data.is_empty() {
+            if pes_started && !es_data.is_empty() {
                 break;
             }
 
-            // Strip PES header to get to elementary stream data
             if payload.len() >= 9
                 && payload[0] == 0x00
                 && payload[1] == 0x00
@@ -515,24 +545,12 @@ fn extract_video_from_ts(ts_data: &[u8]) -> Option<ExtractedVideo> {
                 let header_data_len = payload[8] as usize;
                 let es_start = 9 + header_data_len;
                 if es_start < payload.len() {
-                    let es_payload = &payload[es_start..];
-                    es_data.extend_from_slice(es_payload);
-
-                    // Check if this PES contains a keyframe
-                    if contains_keyframe(es_payload, codec) {
-                        found_keyframe_pes = true;
-                    }
+                    es_data.extend_from_slice(&payload[es_start..]);
                 }
             }
             pes_started = true;
         } else if pes_started {
-            // Continuation of current PES
             es_data.extend_from_slice(payload);
-
-            // Check continuation data for keyframe markers too
-            if !found_keyframe_pes && contains_keyframe(payload, codec) {
-                found_keyframe_pes = true;
-            }
         }
     }
 
@@ -544,6 +562,52 @@ fn extract_video_from_ts(ts_data: &[u8]) -> Option<ExtractedVideo> {
         annex_b_data: es_data,
         codec,
     })
+}
+
+/// Walk the buffer backwards looking for the latest video PUSI whose PES
+/// payload begins with a keyframe NAL. Returns the byte offset of that TS
+/// packet, or `None` when the buffer holds no detectable keyframe.
+#[cfg(feature = "video-thumbnail")]
+fn find_latest_keyframe_offset(
+    ts_data: &[u8],
+    video_pid: u16,
+    codec: video_codec::VideoCodec,
+) -> Option<usize> {
+    use super::ts_parse::{ts_has_payload, ts_payload_offset, ts_pid, ts_pusi};
+
+    let mut offset = (ts_data.len() / TS_PACKET_SIZE).saturating_mul(TS_PACKET_SIZE);
+    while offset >= TS_PACKET_SIZE {
+        offset -= TS_PACKET_SIZE;
+        let pkt = &ts_data[offset..offset + TS_PACKET_SIZE];
+        if pkt[0] != TS_SYNC_BYTE
+            || ts_pid(pkt) != video_pid
+            || !ts_pusi(pkt)
+            || !ts_has_payload(pkt)
+        {
+            continue;
+        }
+        let payload_start = ts_payload_offset(pkt);
+        if payload_start >= TS_PACKET_SIZE {
+            continue;
+        }
+        let payload = &pkt[payload_start..];
+        if payload.len() < 9
+            || payload[0] != 0x00
+            || payload[1] != 0x00
+            || payload[2] != 0x01
+        {
+            continue;
+        }
+        let header_data_len = payload[8] as usize;
+        let es_start = 9 + header_data_len;
+        if es_start >= payload.len() {
+            continue;
+        }
+        if contains_keyframe(&payload[es_start..], codec) {
+            return Some(offset);
+        }
+    }
+    None
 }
 
 /// Parse a PMT packet to find the first video elementary stream.

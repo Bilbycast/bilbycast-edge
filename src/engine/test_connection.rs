@@ -131,6 +131,17 @@ pub async fn test_input(config: &InputConfig) -> TestResult {
                 format!("test-pattern {}x{}@{}", c.width, c.height, c.fps),
                 start.elapsed(),
             ),
+            InputConfig::MediaPlayer(c) => {
+                if c.sources.is_empty() {
+                    TestResult::err("media-player input has zero sources", start.elapsed())
+                } else {
+                    TestResult::ok(
+                        "configured",
+                        format!("media-player ({} source(s))", c.sources.len()),
+                        start.elapsed(),
+                    )
+                }
+            }
         }
     })
     .await;

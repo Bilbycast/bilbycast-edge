@@ -1,13 +1,13 @@
 [package]
 name = "bilbycast-edge"
-version = "0.30.0"
+version = "0.31.0"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.51", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 tokio-util = "0.7.18"
 # Bridges `tokio::sync::mpsc::Receiver<T>` to `futures::Stream<Item=T>`,
 # which reqwest::Body::wrap_stream expects (used by CMAF-LL chunked PUT).
@@ -26,7 +26,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # CLI
-clap = { version = "4.6.0", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive"] }
 
 # Time
 chrono = "0.4.44"
@@ -43,7 +43,7 @@ strum_macros = "0.28.0"
 
 # Socket config
 socket2 = "0.6.3"
-libc = "0.2.184"
+libc = "0.2.186"
 
 # Random
 rand = "0.10.1"
@@ -94,16 +94,16 @@ aes-gcm = "0.11.0-rc.3"
 # Pure-Rust CENC ciphers for CMAF output (Common Encryption ISO/IEC 23001-7):
 #   cenc scheme → AES-128-CTR, cbcs scheme → AES-128-CBC with 1:9 block
 #   pattern. RustCrypto audited crates, MIT/Apache-2.0. Tiny binary cost.
-aes = "0.8"
-ctr = "0.9"
-cbc = "0.1"
+aes = "0.9"
+ctr = "0.10"
+cbc = "0.2"
 
 # UUID for flow IDs
-uuid = { version = "1.23.0", features = ["v4", "v5", "serde"] }
+uuid = { version = "1.23.1", features = ["v4", "v5", "serde"] }
 
 # WebSocket client for manager connection
 tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
-webpki-roots = "1.0.6"
+webpki-roots = "1.0.7"
 futures-util = "0.3.32"
 url = "2.5.8"
 
@@ -149,11 +149,27 @@ bonding-protocol = { path = "../bilbycast-bonding/bonding-protocol" }
 # QUIC transport for IP tunneling (relay and direct modes)
 quinn = "0.11.9"
 # rustls and rustls-pemfile are always needed (tunnel subsystem uses QUIC/TLS)
-rustls = { version = "0.23.37", features = ["ring"] }
+rustls = { version = "0.23.39", features = ["ring"] }
 # AEAD encryption for end-to-end tunnel encryption (ChaCha20-Poly1305)
 ring = "0.17.14"
 rustls-pemfile = "2.2.0"
 rcgen = "0.14.7"
+
+# EBU R128 loudness + true-peak measurement for the Audio Full
+# content-analysis tier. Pure-Rust (Sebastian Dröge's port of libebur128);
+# no external C dependency.
+ebur128 = "0.1"
+
+# MP4 / MOV / MKV demuxer for the file-backed media-player input. Pure
+# Rust, ISO-BMFF parser only (no encode / no decode); we feed the
+# extracted ES through the existing TsMuxer. Used only when a flow has a
+# `MediaPlayerSource::Mp4` source attached.
+mp4 = "0.14"
+
+# JPEG / PNG / WebP / GIF decoder for the still-image media-player
+# source ("slate"). Pure Rust, default features off — we only need the
+# common still formats and the YUV420P conversion lands inline.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif"] }
 
 [features]
 default = ["tls", "webrtc", "fdk-aac", "video-thumbnail"]
@@ -212,7 +228,7 @@ features = ["tls-rustls"]
 optional = true
 
 [dependencies.str0m]
-version = "0.18.0"
+version = "0.18.1"
 optional = true
 # Use OpenSSL DTLS backend instead of the default aws-lc-rs + dimpl. The
 # pure-Rust dimpl DTLS implementation stalls when the active side (WHEP
@@ -241,7 +257,7 @@ version = "0.4.19"
 # (`_nmos-node._tcp`). Best-effort: registration is gated at runtime so
 # environments without multicast on the chosen interface degrade cleanly.
 [dependencies.mdns-sd]
-version = "0.19.0"
+version = "0.19.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"

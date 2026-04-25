@@ -165,8 +165,11 @@ async fn run_inner(
     };
 
     let mut ts_muxer = crate::engine::rtmp::ts_mux::TsMuxer::new();
-    // Audio registration descriptors aren't needed for AAC (stream_type
-    // 0x0F). Audio stream stays default.
+    // Without this the PMT never advertises the audio PID and downstream
+    // decoders silently drop the muxed AAC PES packets.
+    if audio_ctx.is_some() {
+        ts_muxer.set_has_audio(true);
+    }
     let mut seq_num: u16 = 0;
     let start = Instant::now();
     let mut ticker = interval_at(start, frame_duration);

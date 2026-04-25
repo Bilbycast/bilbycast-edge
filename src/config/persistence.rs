@@ -271,6 +271,7 @@ mod tests {
                 input_ids: vec!["in-1".to_string()],
                 output_ids: vec![],
                 assembly: None,
+                content_analysis: None,
             }],
         };
 

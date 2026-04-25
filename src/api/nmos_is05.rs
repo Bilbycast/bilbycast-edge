@@ -864,6 +864,8 @@ fn active_receiver_params(
         InputConfig::Bonded(_) => TransportParamSet::default(),
         // Synthetic input — no transport parameters to report.
         InputConfig::TestPattern(_) => TransportParamSet::default(),
+        // Media player reads from local disk — no network transport.
+        InputConfig::MediaPlayer(_) => TransportParamSet::default(),
     };
     Ok(TransportParams {
         transport_params: vec![param_set],

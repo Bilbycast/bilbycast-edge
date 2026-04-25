@@ -23,6 +23,7 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
   - [RTSP Input](#rtsp-input)
   - [WebRTC/WHIP Input](#webrtcwhip-input)
   - [WHEP Input](#whep-input)
+  - [Media Player Input](#media-player-input)
 - [Output Types](#output-types)
   - [RTP Output](#rtp-output)
   - [SRT Output](#srt-output)
@@ -730,6 +731,82 @@ Pulls media from an external WHEP server. The edge acts as a WHEP client. The `w
 | `whep_url` | string | Yes | - | WHEP endpoint URL to pull from. |
 | `bearer_token` | string | No | `null` | Bearer token for WHEP authentication. |
 | `video_only` | boolean | No | `false` | Receive only video (ignore audio). |
+
+### Media Player Input
+
+Replays one or more local files (MPEG-TS, MP4 / MOV / MKV, or still images)
+as a paced fresh MPEG-TS feed. The synthesized TS publishes onto the flow's
+broadcast channel exactly like any other TS-bearing input, so every output
+type works unchanged. The marquee use case is a **slate / standby
+fallback** on a PID-bus Hitless leg of an Assembled flow — the live primary
+takes precedence; if it stalls past the 200 ms hitless threshold, playback
+of the local file kicks in transparently.
+
+```json
+{
+  "type": "media_player",
+  "id": "slate-1",
+  "name": "Standby slate",
+  "sources": [
+    { "kind": "ts",    "name": "loop.ts" },
+    { "kind": "mp4",   "name": "promo.mp4" },
+    { "kind": "image", "name": "slate.png", "fps": 5, "bitrate_kbps": 250, "audio_silence": true }
+  ],
+  "loop_playback": true,
+  "shuffle": false,
+  "paced_bitrate_bps": null
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `type` | string | Yes | - | Must be `"media_player"`. |
+| `sources` | array | Yes | - | 1–256 entries. Each entry is a `MediaPlayerSource` (see below). Files are referenced by name within the edge's media library; upload them via the manager UI before starting the flow. |
+| `loop_playback` | boolean | No | `true` | Restart at the head of the playlist when the last source ends. Leave on for fallback duty. |
+| `shuffle` | boolean | No | `false` | Randomise source order each time the playlist starts. |
+| `paced_bitrate_bps` | integer | No | `null` | TS-only override for the egress pacer when the source has no usable PCR. Range 100 000 – 200 000 000 (100 kbps – 200 Mbps). Leave `null` to pace from PCR (default for any healthy TS asset). |
+
+**Source variants** (tagged by `kind`):
+
+| Field | Type | Required | Default | Applies to | Description |
+|-------|------|----------|---------|------------|-------------|
+| `kind` | string | Yes | - | all | `"ts"`, `"mp4"`, or `"image"`. |
+| `name` | string | Yes | - | all | Filename within the media library. ASCII alphanumeric plus `._- ` only, 1–255 chars, no leading dot, no path separators. |
+| `fps` | integer | No | `5` | `image` | Frames per second to render. Range 1–60. |
+| `bitrate_kbps` | integer | No | `250` | `image` | Encoded video bitrate. Range 50–50 000 (50 kbps – 50 Mbps). |
+| `audio_silence` | boolean | No | `true` | `image` | Pair the rendered video with silent stereo AAC so downstream demuxers don't complain about a missing audio PID. |
+
+**Media library directory** — the on-disk location where uploaded files
+are stored on the edge. Resolution order:
+
+1. `BILBYCAST_MEDIA_DIR` env var (recommended for production — pin a specific directory).
+2. `$XDG_DATA_HOME/bilbycast/media/`.
+3. `$HOME/.bilbycast/media/`.
+4. `./media/` (cwd fallback).
+
+Files are written `0644`. Per-asset cap: **4 GiB** (`MAX_FILE_BYTES`).
+Library cap: **16 GiB** total (`MAX_TOTAL_BYTES`). Partial uploads stage
+under `<media_dir>/.tmp/<name>.<session_id>` and are reaped after 1 hour
+of inactivity.
+
+**Uploading files** — the manager UI's input modal exposes a *Manage Files
+(this node)* panel that hosts the chosen file, splits it into 1 MiB
+chunks, and POSTs each chunk to
+`POST /api/v1/nodes/{id}/media/upload`. The manager forwards each chunk
+to the edge as the `upload_media_chunk` WebSocket command; the edge
+streams chunks into a staging file and atomically renames on the final
+chunk (which also `fsync`s for durability). The manager allows up to 60 s
+per chunk ACK (longer than the default 10 s command budget) so that the
+final-chunk fsync doesn't trip on slow disks. List and delete are also
+exposed as `GET /api/v1/nodes/{id}/media` and
+`DELETE /api/v1/nodes/{id}/media/{name}` (idempotent — `{deleted: false}`
+when the file was already absent).
+
+**Behaviour when a referenced file is missing** — the engine emits a
+Critical `flow`-category event with the open error, sleeps 2 seconds,
+and advances to the next source. There is no automatic in-input
+fallback; pair the media player with a live primary on a PID-bus
+Hitless leg if you need automatic cutover.
 
 ---
 
@@ -2385,3 +2462,105 @@ is just a normal flow definition — no special configuration needed.
 Receivers on the far side rebuild the multicast group from the RTP
 stream.
 
+
+## Content Analysis (in-depth)
+
+Per-flow opt-in to richer transport / audio / video analysis on top
+of the always-on TR-101290 + media_analysis + thumbnails layer. Three
+independent tiers:
+
+- **Lite** — compressed-domain only (<1 % CPU / core). GOP cadence
+  (IDR count + interval), full SPS/VUI signalling decode (aspect
+  ratio with SAR→DAR math, colour primaries / transfer / matrix /
+  range, HDR family, MaxFALL / MaxCLL, AFD), SMPTE timecode via
+  `pic_timing` SEI, CEA-608 / 708 caption presence, SCTE-35 cue
+  decode (splice_insert + time_signal PTS), Media Delivery Index
+  (RFC 4445 — NDF from IAT spread, MLR from TS CC discontinuities).
+- **Audio Full** — decoded-audio EBU R128 loudness (M / S / I +
+  LRA), true peak (dBTP), hard-mute, clipping, silence per PID
+  (~5–10 % CPU / core). Three ingress paths:
+  - **MPEG-TS / AAC** (`stream_type = 0x0F` / `0x11`): ADTS framing
+    + fdk-aac decode → R128.
+  - **PCM-RTP** (ST 2110-30 PM/AM L16/L24, generic RtpAudio):
+    direct interleaved-sample unpack → R128. No decoder needed; the
+    cleanest signal path because the wire is already linear PCM.
+  - **AES3 over RTP** (ST 2110-31): 32-bit subframe extraction
+    (24-bit audio bits 27..4) → R128.
+
+  All three paths share the same per-flow state machine + event
+  emission and produce the same wire shape (`audio_pids[]`). The
+  snapshot's top-level `ingress` field reports `"ts"` / `"pcm"` /
+  `"aes3"` so the manager UI can label the ingest mode. MP2 / AC-3 /
+  E-AC-3 PIDs *inside MPEG-TS* are tracked (bitrate / presence /
+  silence-proxy) but their R128 decode stays deferred with a
+  `codec_decoded: false` + `decode_note` in the snapshot until the
+  libavcodec audio bridge lands.
+- **Video Full** — YUV pixel-domain metrics on decoded frames
+  (~10–25 % CPU / core): YUV-SAD freeze against the previous frame,
+  3×3 Laplacian-variance blur, 8×8 boundary-gradient blockiness
+  (Wang / Sheikh style), letterbox / pillarbox row / column
+  detection, SMPTE-bars column-uniformity heuristic, and a
+  freeze + mid-brightness slate flag. Decode runs under
+  `tokio::task::block_in_place` via
+  [`video_engine::VideoDecoder`] (H.264 / H.265 only).
+
+All tiers are broadcast subscribers — **they cannot add jitter or
+backpressure to the data path.** Dropping a tier off mid-flight
+cancels its task within one packet.
+
+### Schema
+
+```json
+{
+  "flows": [
+    {
+      "id": "remote-monitor-1",
+      "name": "Remote monitor flow",
+      "input_ids": ["srt-ingest"],
+      "output_ids": [],
+      "content_analysis": {
+        "lite": true,
+        "audio_full": false,
+        "video_full": false,
+        "video_full_hz": null
+      }
+    }
+  ]
+}
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `lite` | `true` | Cheap compressed-domain checks. TS-input only — no-op on PCM / ANC / WebRTC inputs. |
+| `audio_full` | `false` | Opt-in, moderate CPU. PMT-announced audio PIDs only. |
+| `video_full` | `false` | Opt-in, heavy CPU. PMT-announced video PIDs only. |
+| `video_full_hz` | `null` (= 1.0) | Override the Video Full sample rate. Clamped to `(0.0, 30.0]`. Values above 5 Hz scale CPU proportionally. |
+
+Omitting `content_analysis` is equivalent to `{ "lite": true,
+"audio_full": false, "video_full": false }` — legacy flows get Lite
+analysis automatically when the active input is TS-carrying.
+
+### Monitor-only / triage deployment
+
+A flow with `input_ids: [...]`, `output_ids: []`, and the
+content-analysis tiers you care about on is a **monitor-only flow**
+— the edge ingests, runs TR-101290 + content analysis, publishes
+stats / events / thumbnails to the manager, and produces zero egress
+traffic. This is the recommended shape when deploying a remote-site
+edge purely for broadcast-engineer triage.
+
+### Events
+
+See [`events-and-alarms.md`](events-and-alarms.md#content-analysis-events)
+for the full list of categories (`content_analysis_scte35_pid`,
+`content_analysis_scte35_cue`, `content_analysis_caption_lost`,
+`content_analysis_mdi_above_threshold`,
+`content_analysis_audio_silent`, `content_analysis_video_freeze`).
+Each event carries a structured `details.error_code` matching its
+category.
+
+### Metrics / wire shape
+
+See [`metrics.md`](metrics.md#content-analysis-metrics-phase-1-3)
+for the full `FlowStats.content_analysis` JSON shape the manager
+dashboards consume.

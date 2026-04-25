@@ -22,6 +22,11 @@
 pub mod bandwidth_monitor;
 pub mod degradation_monitor;
 pub mod input_test_pattern;
+/// File-backed media-player input — TS / MP4 / image fallback source.
+/// See [`crate::config::models::MediaPlayerInputConfig`] for the config
+/// surface and `docs/configuration-guide.md` for the operator-facing
+/// reference.
+pub mod input_media_player;
 pub mod bonded_scheduler;
 pub mod delay_buffer;
 pub mod flow;
@@ -53,6 +58,12 @@ pub mod packet;
 pub mod rtmp;
 pub mod thumbnail;
 pub mod tr101290;
+/// In-depth content-analysis subsystem. Three tiers (Lite, Audio Full,
+/// Video Full) gated per-flow on `FlowConfig.content_analysis`. Each
+/// tier is a dedicated broadcast subscriber and cannot add jitter or
+/// backpressure to the data path. See [`content_analysis`] for the full
+/// rationale and tier cost breakdown.
+pub mod content_analysis;
 pub mod ts_demux;
 pub mod ts_parse;
 pub mod ts_continuity_fixer;

@@ -301,6 +301,83 @@ pub struct FlowConfig {
     /// time with a Critical event (no silent misbehaviour).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assembly: Option<FlowAssembly>,
+    /// Optional in-depth content analysis tiers. Three independent toggles:
+    /// Lite (compressed-domain, GOP / signalling / captions / SCTE-35 / MDI),
+    /// Audio Full (R128 / true-peak / silence), and Video Full (blockiness /
+    /// blur / letterbox / colour-bar / freeze). When the field is absent the
+    /// effective tier is `Lite=on, AudioFull=off, VideoFull=off` — see
+    /// [`ContentAnalysisConfig::default`]. Present on every flow type; tiers
+    /// gracefully no-op on inputs that can't supply the relevant essence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_analysis: Option<ContentAnalysisConfig>,
+}
+
+impl FlowConfig {
+    /// Resolved content-analysis configuration with defaults filled in.
+    ///
+    /// Calling code never has to special-case `content_analysis = None` —
+    /// this returns the same defaulted struct every time so `if cfg.lite { … }`
+    /// works on legacy flows out of the box.
+    pub fn effective_content_analysis(&self) -> ContentAnalysisConfig {
+        self.content_analysis.clone().unwrap_or_default()
+    }
+}
+
+/// Per-flow content-analysis tier selection.
+///
+/// Each tier toggles one independent analyser task that subscribes to the
+/// flow's broadcast channel. Tiers are ordered by increasing CPU cost:
+///
+/// - **Lite** (`<1%` per core, no decode): TR-101290 extension —
+///   GOP structure, HDR / aspect-ratio / colour-space / range / AFD,
+///   SMPTE timecode, SEI caption presence, SCTE-35 cue presence,
+///   Media Delivery Index (NDF / MLR per RFC 4445). Applies to TS-carrying
+///   inputs; gracefully no-ops on PCM / ANC inputs.
+///
+/// - **Audio Full** (`~5–10%` per core): EBU R128 momentary / short-term /
+///   integrated loudness, true peak (dBTP), silence / hard-mute / clipping
+///   per audio PID. Decodes audio inline (AAC via fdk-aac-rs, MP2 / AC-3 /
+///   E-AC-3 via ffmpeg-video-rs / libavcodec, raw PCM passthrough for
+///   ST 2110-30 / -31 / `rtp_audio`).
+///
+/// - **Video Full** (`~10–25%` per core): blockiness, blur, letterbox /
+///   pillarbox, colour-bar / test-pattern, slate, frozen-frame via YUV-SAD
+///   (replaces the JPEG-hash heuristic in `engine::thumbnail`). Reuses the
+///   existing FFmpeg decode pipeline; runs at `video_full_hz` (default 1 Hz).
+///
+/// All tiers are non-blocking — each runs in its own task, drops on
+/// `broadcast::Lagged`, and never feeds back into the data path. Toggling
+/// a tier off cancels its task within one packet.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContentAnalysisConfig {
+    /// Lite (compressed-domain) tier. **Default on** — cheap and broadly
+    /// useful for remote-site triage.
+    #[serde(default = "default_true")]
+    pub lite: bool,
+    /// Audio Full tier (R128 / true-peak / silence / mute / clipping).
+    /// Default off; opt-in.
+    #[serde(default)]
+    pub audio_full: bool,
+    /// Video Full tier (blockiness / blur / letterbox / colour-bar / slate /
+    /// freeze). Default off; opt-in.
+    #[serde(default)]
+    pub video_full: bool,
+    /// Override the Video Full sample rate in Hz. `None` = 1.0 Hz default.
+    /// Bounded to `(0.0, 30.0]` by validation; values above 5 Hz cost CPU
+    /// proportional to decode cadence and are mostly useful for benchmarks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_full_hz: Option<f32>,
+}
+
+impl Default for ContentAnalysisConfig {
+    fn default() -> Self {
+        Self {
+            lite: true,
+            audio_full: false,
+            video_full: false,
+            video_full_hz: None,
+        }
+    }
 }
 
 /// Per-flow assembly plan. Describes how each of the flow's TS outputs
@@ -605,6 +682,15 @@ pub enum InputConfig {
     /// the problem is upstream of the edge), and idle fill.
     #[serde(rename = "test_pattern")]
     TestPattern(TestPatternInputConfig),
+    /// File-based media player: replays a local `.ts` / `.mp4` / `.mov` /
+    /// `.mkv` / image asset (single file or sequential playlist) as a
+    /// fresh MPEG-TS feed onto the flow broadcast channel. Used as a
+    /// fallback source under PID-bus Hitless when the live primary stalls,
+    /// or as a manual idle fill. Files live under the edge's media
+    /// library directory and are uploaded from the manager — see
+    /// [`MediaPlayerInputConfig`] for source kinds.
+    #[serde(rename = "media_player")]
+    MediaPlayer(MediaPlayerInputConfig),
 }
 
 /// Configuration for an in-process synthetic test-pattern input.
@@ -646,6 +732,85 @@ fn default_tp_video_bitrate() -> u32 { 2000 }
 fn default_tp_tone_hz() -> f32 { 1000.0 }
 fn default_tp_tone_dbfs() -> f32 { -20.0 }
 
+/// One asset inside a [`MediaPlayerInputConfig`]. The edge's media library
+/// stores files by sanitised `name` under the configured media directory
+/// (default `~/.bilbycast/media/`). The `kind` selects how the file is
+/// turned into MPEG-TS at runtime:
+///
+/// * `ts`  — pre-encoded MPEG-TS file. Read raw, paced from PCR (or the
+///   optional `paced_bitrate_bps` override), no decoder. Lowest CPU.
+/// * `mp4` — MP4 / MOV / MKV container. Demuxed with the `mp4` crate,
+///   H.264 NAL units converted from AVCC to Annex-B, AAC samples wrapped
+///   in ADTS, all re-muxed via the shared [`crate::engine::rtmp::ts_mux::TsMuxer`].
+/// * `image` — single still image (JPEG / PNG). Decoded once, fed to the
+///   in-process H.264 encoder at low frame-rate, optionally paired with
+///   silence — the standard "slate" pattern. Requires the same
+///   `video-thumbnail` + `fdk-aac` features that [`TestPatternInputConfig`]
+///   needs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MediaPlayerSource {
+    /// Pre-encoded MPEG-TS file in the edge's media library.
+    Ts {
+        /// Filename inside the media library directory (no path components).
+        name: String,
+    },
+    /// MP4 / MOV / MKV container in the edge's media library.
+    Mp4 {
+        /// Filename inside the media library directory (no path components).
+        name: String,
+    },
+    /// Still image (JPEG / PNG) in the edge's media library.
+    Image {
+        /// Filename inside the media library directory (no path components).
+        name: String,
+        /// Encoder frame rate for the still — keeps decoder TS state warm
+        /// without burning CPU. Default 5.
+        #[serde(default = "default_image_fps")]
+        fps: u8,
+        /// Encoder target bitrate in kbps. A still image compresses to
+        /// nothing; default 250.
+        #[serde(default = "default_image_bitrate_kbps")]
+        bitrate_kbps: u32,
+        /// When true, also encode silent AAC stereo (matches every other
+        /// MediaPlayer source which carries audio). Default true.
+        #[serde(default = "default_true")]
+        audio_silence: bool,
+    },
+}
+
+/// File-backed media player input. Plays one or more local assets as a
+/// looping fresh MPEG-TS feed onto the flow's broadcast channel.
+///
+/// Combine with PID-bus Hitless (`FlowConfig.assembly.kind = spts | mpts`,
+/// slot `source = hitless { primary, backup }`) for automatic failover when
+/// the live primary stalls — the assembler's 200 ms stall threshold cuts
+/// over to the media player without operator intervention.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MediaPlayerInputConfig {
+    /// Ordered list of assets. A single entry is a single-file player;
+    /// multiple entries form a sequential playlist. Empty = invalid.
+    pub sources: Vec<MediaPlayerSource>,
+    /// When true, restart at the head of `sources` after the last asset
+    /// finishes. Default true (the common "fill while live is missing"
+    /// shape).
+    #[serde(default = "default_true")]
+    pub loop_playback: bool,
+    /// When true and `sources.len() > 1`, randomise the playback order
+    /// each time the playlist starts. Default false.
+    #[serde(default)]
+    pub shuffle: bool,
+    /// Override the natural pacing for `ts`-kind sources. When unset, the
+    /// reader paces from embedded PCRs (the common case). When set, packets
+    /// are paced at this fixed rate — useful for files that lack PCRs.
+    /// Range 100 kbps … 200 Mbps; ignored for `mp4` and `image` kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paced_bitrate_bps: Option<u64>,
+}
+
+fn default_image_fps() -> u8 { 5 }
+fn default_image_bitrate_kbps() -> u32 { 250 }
+
 impl InputConfig {
     /// Returns the type name string (e.g. "srt", "rtp", "udp").
     pub fn type_name(&self) -> &'static str {
@@ -666,6 +831,7 @@ impl InputConfig {
             InputConfig::RtpAudio(_) => "rtp_audio",
             InputConfig::Bonded(_) => "bonded",
             InputConfig::TestPattern(_) => "test_pattern",
+            InputConfig::MediaPlayer(_) => "media_player",
         }
     }
 
@@ -698,7 +864,11 @@ impl InputConfig {
             // `media_analysis: false` on the flow.
             | InputConfig::Bonded(_)
             // Test pattern publishes encoded H.264 + AAC in MPEG-TS.
-            | InputConfig::TestPattern(_) => true,
+            | InputConfig::TestPattern(_)
+            // Media player synthesises fresh MPEG-TS from local files
+            // (raw TS pass-through, MP4 demux + remux, or image + slate
+            // encode).
+            | InputConfig::MediaPlayer(_) => true,
             // PCM-only inputs become TS carriers when `audio_encode` is set —
             // the input task muxes the encoded audio into an audio-only TS.
             // ST 2110-31 (AES3 transparent) becomes a TS carrier only via
@@ -3541,6 +3711,7 @@ mod tests {
                 input_ids: vec!["rtp-in-1".to_string()],
                 output_ids: vec!["rtp-out-1".to_string()],
                 assembly: None,
+                content_analysis: None,
             }],
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
@@ -3600,6 +3771,7 @@ mod tests {
                 input_ids: vec!["in-1".to_string()],
                 output_ids: vec!["out-1".to_string()],
                 assembly: None,
+                content_analysis: None,
             }],
             ..Default::default()
         };
@@ -3627,6 +3799,7 @@ mod tests {
                 input_ids: vec!["nonexistent".to_string()],
                 output_ids: vec![],
                 assembly: None,
+                content_analysis: None,
             }],
             ..Default::default()
         };
@@ -3702,6 +3875,7 @@ mod tests {
                 input_ids: vec!["in-1".to_string()],
                 output_ids: vec!["out-1".to_string(), "out-2".to_string()],
                 assembly: None,
+                content_analysis: None,
             }],
             ..Default::default()
         };

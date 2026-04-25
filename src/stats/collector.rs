@@ -1115,6 +1115,88 @@ impl PerInputCounters {
     }
 }
 
+// ── Content Analysis Accumulator ───────────────────────────────────────────
+
+/// Per-flow accumulator for the in-depth content-analysis subsystem.
+///
+/// Each tier (Lite / Audio Full / Video Full) is updated by a single task
+/// that subscribes to the flow's broadcast channel as an independent
+/// consumer. The task owns all running state; only the wire-shaped
+/// snapshot crosses the lock boundary, so the snapshot path is a cheap
+/// `Mutex.lock().clone()` once per second.
+///
+/// **Hot path is never touched.** Tier tasks are subscribers — they cannot
+/// add jitter or block the producer. If a task lags behind, it receives
+/// `RecvError::Lagged(n)` and bumps the matching `*_drops` counter.
+pub struct ContentAnalysisAccumulator {
+    /// Lifetime broadcast-lag drops for the Lite analyser.
+    pub lite_drops: AtomicU64,
+    /// Lifetime broadcast-lag drops for the Audio Full analyser
+    /// (Phase 2 — kept here so the wire shape stays stable).
+    #[allow(dead_code)]
+    pub audio_full_drops: AtomicU64,
+    /// Lifetime broadcast-lag drops for the Video Full analyser
+    /// (Phase 3 — kept here so the wire shape stays stable).
+    #[allow(dead_code)]
+    pub video_full_drops: AtomicU64,
+    /// Most recent Lite-tier wire snapshot. The analyser task replaces
+    /// this on every sample interval (~250 ms). `None` until the first
+    /// sample interval completes, so the manager UI can render an
+    /// "analysing…" state distinguishable from "tier off".
+    pub lite: Mutex<Option<crate::stats::models::ContentAnalysisLiteStats>>,
+    /// Phase 2 placeholder.
+    pub audio_full: Mutex<Option<serde_json::Value>>,
+    /// Phase 3 placeholder.
+    pub video_full: Mutex<Option<serde_json::Value>>,
+}
+
+impl ContentAnalysisAccumulator {
+    pub fn new() -> Self {
+        Self {
+            lite_drops: AtomicU64::new(0),
+            audio_full_drops: AtomicU64::new(0),
+            video_full_drops: AtomicU64::new(0),
+            lite: Mutex::new(None),
+            audio_full: Mutex::new(None),
+            video_full: Mutex::new(None),
+        }
+    }
+
+    /// Build a snapshot for [`crate::stats::models::FlowStats::content_analysis`].
+    ///
+    /// Returns `None` only when no tier has produced any data yet AND no
+    /// drops have been recorded — otherwise the accumulator's mere presence
+    /// means at least one tier is enabled, and we want the UI to render
+    /// the "analysing…" state.
+    pub fn snapshot(&self) -> crate::stats::models::ContentAnalysisStats {
+        let mut lite = self.lite.lock().unwrap().clone();
+        if let Some(ref mut l) = lite {
+            l.analyser_drops = self.lite_drops.load(Ordering::Relaxed);
+        }
+        crate::stats::models::ContentAnalysisStats {
+            lite,
+            audio_full: self.audio_full.lock().unwrap().clone(),
+            video_full: self.video_full.lock().unwrap().clone(),
+        }
+    }
+
+    /// Replace the Lite-tier snapshot. Called from the lite analyser task
+    /// at the end of each sample interval. The analyser owns the running
+    /// state and rebuilds the wire-shaped struct to publish here.
+    pub fn publish_lite(
+        &self,
+        snap: crate::stats::models::ContentAnalysisLiteStats,
+    ) {
+        *self.lite.lock().unwrap() = Some(snap);
+    }
+}
+
+impl Default for ContentAnalysisAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Per-flow Accumulator ───────────────────────────────────────────────────
 
 /// Per-flow atomic counters for a single media flow (one input, N outputs).
@@ -1148,6 +1230,9 @@ pub struct FlowStatsAccumulator {
     pub media_analysis: OnceLock<Arc<MediaAnalysisAccumulator>>,
     /// Thumbnail generation stats, set once when the flow starts (if enabled and ffmpeg available).
     pub thumbnail: OnceLock<Arc<ThumbnailAccumulator>>,
+    /// In-depth content-analysis (Lite / Audio Full / Video Full) stats,
+    /// set once when the flow starts if any tier is enabled.
+    pub content_analysis: OnceLock<Arc<ContentAnalysisAccumulator>>,
     /// Per-input thumbnail accumulators, keyed by input ID. Each input in
     /// a multi-input flow gets its own thumbnail generator subscribing to
     /// the input's dedicated broadcast channel (not the flow's main channel).
@@ -1345,6 +1430,7 @@ impl FlowStatsAccumulator {
             tr101290: OnceLock::new(),
             media_analysis: OnceLock::new(),
             thumbnail: OnceLock::new(),
+            content_analysis: OnceLock::new(),
             per_input_thumbnails: DashMap::new(),
             per_input_counters: DashMap::new(),
             input_config_meta: std::sync::RwLock::new(None),
@@ -1930,6 +2016,7 @@ impl FlowStatsAccumulator {
             inputs_live,
             per_es,
             pcr_trust_flow,
+            content_analysis: self.content_analysis.get().map(|acc| acc.snapshot()),
         }
     }
 }

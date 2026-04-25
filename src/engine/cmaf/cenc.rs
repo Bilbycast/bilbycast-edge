@@ -258,21 +258,20 @@ impl CipherState {
             }
             CipherState::Cbcs { cipher, iv } => {
                 // 1:9 pattern: encrypt block 0, pass through blocks 1..=9.
-                use aes::cipher::BlockEncrypt;
-                use aes::cipher::generic_array::GenericArray;
+                use aes::cipher::BlockCipherEncrypt;
                 let mut i = 0usize;
                 let mut cbc_iv = *iv;
                 while i + 16 <= bytes.len() {
                     // Every 10th position (0, 10, 20, ...) is encrypted.
                     if (i / 16) % 10 == 0 {
                         // One AES-CBC block: XOR IV, encrypt, result becomes next IV.
-                        let block = &mut bytes[i..i + 16];
+                        let block: &mut [u8; 16] = (&mut bytes[i..i + 16])
+                            .try_into()
+                            .expect("16-byte slice");
                         for (b, k) in block.iter_mut().zip(cbc_iv.iter()) {
                             *b ^= *k;
                         }
-                        let mut ga = GenericArray::clone_from_slice(block);
-                        cipher.encrypt_block(&mut ga);
-                        block.copy_from_slice(&ga);
+                        cipher.encrypt_block(block.into());
                         cbc_iv.copy_from_slice(block);
                     }
                     i += 16;

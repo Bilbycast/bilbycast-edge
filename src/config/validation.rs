@@ -446,6 +446,18 @@ pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
         }
     }
 
+    // Validate optional content-analysis configuration.
+    if let Some(ref ca) = flow.content_analysis {
+        if let Some(hz) = ca.video_full_hz {
+            if !(hz.is_finite() && hz > 0.0 && hz <= 30.0) {
+                bail!(
+                    "Flow '{}': content_analysis.video_full_hz must be in (0.0, 30.0], got {}",
+                    flow.id, hz
+                );
+            }
+        }
+    }
+
     // Validate bandwidth limit if configured
     if let Some(ref bw) = flow.bandwidth_limit {
         if bw.max_bitrate_mbps <= 0.0 {
@@ -783,6 +795,7 @@ fn validate_input(input: &InputConfig) -> Result<()> {
         InputConfig::RtpAudio(c) => validate_rtp_audio_input(c)?,
         InputConfig::Bonded(c) => validate_bonded_input(c)?,
         InputConfig::TestPattern(c) => validate_test_pattern_input(c)?,
+        InputConfig::MediaPlayer(c) => validate_media_player_input(c)?,
     }
     Ok(())
 }
@@ -821,6 +834,91 @@ fn validate_test_pattern_input(c: &crate::config::models::TestPatternInputConfig
             return Err(anyhow::anyhow!(
                 "test-pattern: tone_dbfs must be in -60..=0 (got {})", c.tone_dbfs
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a media-player input. Each source's `name` must be a valid
+/// media-library filename (no path components, no traversal, length cap),
+/// and the kind-specific bounds are sanity-checked. The actual file
+/// existence check is deferred to input start so the runtime can emit a
+/// clear error the manager surfaces, rather than blocking config save.
+fn validate_media_player_input(c: &crate::config::models::MediaPlayerInputConfig) -> Result<()> {
+    use crate::config::models::MediaPlayerSource;
+    if c.sources.is_empty() {
+        bail!("media-player input: at least one source is required");
+    }
+    if c.sources.len() > 256 {
+        bail!(
+            "media-player input: at most 256 sources per playlist (got {})",
+            c.sources.len()
+        );
+    }
+    for (i, src) in c.sources.iter().enumerate() {
+        match src {
+            MediaPlayerSource::Ts { name }
+            | MediaPlayerSource::Mp4 { name }
+            | MediaPlayerSource::Image { name, .. } => {
+                validate_media_filename(name, &format!("media-player input sources[{i}].name"))?;
+            }
+        }
+        if let MediaPlayerSource::Image { fps, bitrate_kbps, .. } = src {
+            if *fps == 0 || *fps > 60 {
+                bail!(
+                    "media-player input sources[{i}]: image fps must be in 1..=60 (got {})",
+                    fps
+                );
+            }
+            if *bitrate_kbps < 50 || *bitrate_kbps > 50_000 {
+                bail!(
+                    "media-player input sources[{i}]: image bitrate_kbps must be in 50..=50000 (got {})",
+                    bitrate_kbps
+                );
+            }
+        }
+    }
+    if let Some(bps) = c.paced_bitrate_bps {
+        if !(100_000..=200_000_000).contains(&bps) {
+            bail!(
+                "media-player input: paced_bitrate_bps must be in 100000..=200000000 (got {bps})"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Strict filename validator for media-library entries. Rejects path
+/// separators, parent-directory traversal, leading dots, control chars,
+/// and over-length names. The character set is intentionally narrow —
+/// alphanumeric plus `._- ` — so cross-platform pickers and shells never
+/// have to escape anything.
+pub(crate) fn validate_media_filename(name: &str, label: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("{label}: filename must not be empty");
+    }
+    if name.len() > 255 {
+        bail!("{label}: filename must be at most 255 characters (got {})", name.len());
+    }
+    if name.starts_with('.') {
+        bail!("{label}: filename must not start with '.'");
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        bail!("{label}: filename must not contain path separators");
+    }
+    if name == "." || name == ".." || name.contains("..") {
+        bail!("{label}: filename must not contain '..'");
+    }
+    for ch in name.chars() {
+        let ok = ch.is_ascii_alphanumeric()
+            || ch == '.'
+            || ch == '_'
+            || ch == '-'
+            || ch == ' ';
+        if !ok {
+            bail!(
+                "{label}: filename may only contain ASCII alphanumerics and '._- ' (got '{ch}')"
+            );
         }
     }
     Ok(())
@@ -4200,6 +4298,8 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
             }
             // Synthetic input doesn't bind a socket.
             InputConfig::TestPattern(_) => {}
+            // Media player reads from local disk — no socket bind.
+            InputConfig::MediaPlayer(_) => {}
         }
     }
 
@@ -4582,6 +4682,7 @@ mod tests {
             input_ids: vec!["in-1".to_string()],
             output_ids: vec!["out-1".to_string()],
             assembly: None,
+            content_analysis: None,
         });
         config
     }
@@ -4609,6 +4710,7 @@ mod tests {
             input_ids: vec!["in-1".to_string()],
             output_ids: vec![],
             assembly: None,
+            content_analysis: None,
         });
         config
     }
@@ -4763,6 +4865,7 @@ mod tests {
             input_ids: vec!["in-1".to_string()],
             output_ids: vec![],
             assembly: None,
+            content_analysis: None,
         });
         config.flows.push(FlowConfig {
             id: "same-id".to_string(),
@@ -4777,6 +4880,7 @@ mod tests {
             input_ids: vec!["in-2".to_string()],
             output_ids: vec![],
             assembly: None,
+            content_analysis: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -4874,6 +4978,7 @@ mod tests {
             input_ids: vec!["in-1".to_string()],
             output_ids: vec!["out-1".to_string()],
             assembly: None,
+            content_analysis: None,
         });
         assert!(validate_config(&config).is_ok());
     }
@@ -4931,6 +5036,7 @@ mod tests {
             input_ids: vec!["in-1".to_string()],
             output_ids: vec!["out-1".to_string()],
             assembly: None,
+            content_analysis: None,
         });
         assert!(validate_config(&config).is_ok());
     }
@@ -5008,6 +5114,7 @@ mod tests {
             input_ids: vec!["in-1".to_string()],
             output_ids: vec!["out-1".to_string()],
             assembly: None,
+            content_analysis: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -5065,6 +5172,7 @@ mod tests {
             input_ids: vec!["in-1".to_string()],
             output_ids: vec!["out-1".to_string()],
             assembly: None,
+            content_analysis: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -5122,6 +5230,7 @@ mod tests {
             input_ids: vec!["in-1".to_string()],
             output_ids: vec!["out-1".to_string()],
             assembly: None,
+            content_analysis: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -5320,6 +5429,7 @@ mod tests {
             input_ids: vec!["in-audio".to_string()],
             output_ids: vec!["out-1".to_string()],
             assembly: None,
+            content_analysis: None,
         });
         config.flow_groups.push(FlowGroupConfig {
             id: "group-1".to_string(),
@@ -5373,6 +5483,7 @@ mod tests {
             input_ids: vec!["in-1".to_string()],
             output_ids: vec![],
             assembly: None,
+            content_analysis: None,
         });
         config.flow_groups.push(FlowGroupConfig {
             id: "group-1".to_string(),
@@ -5393,6 +5504,7 @@ mod tests {
             input_ids: vec!["in-2".to_string()],
             output_ids: vec![],
             assembly: None,
+            content_analysis: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -5420,6 +5532,7 @@ mod tests {
             input_ids: vec!["in-1".to_string()],
             output_ids: vec![],
             assembly: None,
+            content_analysis: None,
         });
         config.flow_groups.push(FlowGroupConfig {
             id: "group-1".to_string(),

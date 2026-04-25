@@ -26,6 +26,7 @@ Supports NMOS IS-04 (Discovery & Registration), IS-05 (Connection Management), I
 | **SMPTE ST 2110-20** | Yes | Yes | Uncompressed video (RFC 4175 YCbCr-4:2:2 at 8/10-bit); 2022-7 Red/Blue dual-network. Inputs re-encode to H.264/HEVC via `video_encode` (requires a compiled-in software/NVENC encoder); outputs decode and scale to 4:2:2 planar for RFC 4175 packetization |
 | **SMPTE ST 2110-23** | Yes | Yes | Multi-stream single-essence video — 2SI and sample-row partition modes; otherwise same pipeline as -20 |
 | **`rtp_audio`** | Yes | Yes | Generic RFC 3551 PCM-over-RTP — wire-identical to ST 2110-30 but **no PTP requirement**, sample rates 32 / 44.1 / 48 / 88.2 / 96 kHz. For radio contribution, talkback, ffmpeg / OBS interop. Same `transcode` block as ST 2110-30. Output supports `transport_mode: "audio_302m"` (RTP/MP2T encapsulation per RFC 2250) |
+| **Media Player** | Yes | No | File-backed input — replays MPEG-TS / MP4 / MOV / MKV / still images from the edge's media library as a paced fresh MPEG-TS feed. Playlist with `loop_playback` + `shuffle`. 4 GiB per file, 16 GiB library cap, library path resolved via `BILBYCAST_MEDIA_DIR`. Files are uploaded over the manager's chunked REST endpoint (`POST /api/v1/nodes/{id}/media/upload`). Designed to drop onto a PID-bus Hitless leg as an automatic fallback to a live primary |
 
 **Compressed-audio bridge (Phase A + Phase B):** AAC contribution audio
 carried in MPEG-TS over RTMP / RTSP / SRT / UDP / RTP can be decoded

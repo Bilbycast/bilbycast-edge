@@ -303,6 +303,26 @@ For redundant RTP inputs, each leg emits its own bind event with a `leg` field i
 
 ---
 
+### Media Player Input (`flow`)
+
+The media-player input emits its lifecycle events on the shared `flow`
+category (rather than its own category) so they thread into the same
+flow-level event stream as start/stop/fail. Each event carries
+`flow_id` and `input_id` in `details`.
+
+| Severity | Message | Trigger | Details |
+|----------|---------|---------|---------|
+| info | Media player input started | Input task came up; reports source count and `loop_playback` / `shuffle` flags | `{ flow_id, input_id, source_count, loop_playback, shuffle }` |
+| critical | Media player source failed: {error} | A source failed to open, parse, or render (missing file, corrupt container, unsupported codec). Engine sleeps 2 s and advances to the next source. | `{ flow_id, input_id, source_name, source_kind, error }` |
+| info | Media player playlist exhausted | Final source finished and `loop_playback = false`. The input task exits cleanly — restart the flow to replay. | `{ flow_id, input_id }` |
+
+**Source**: `src/engine/input_media_player.rs`
+
+The bind-failure unification (`port_conflict` / `bind_failed`) does not
+apply — the media player is file-backed and binds no sockets.
+
+---
+
 ### Tunnel (`tunnel`)
 
 | Severity | Message | Trigger | Details |
@@ -383,7 +403,7 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 
 | Category | Count | Description |
 |----------|-------|-------------|
-| `flow` | 13 | Flow lifecycle (start/stop/fail, output add/remove, input/output CRUD including update) |
+| `flow` | 16 | Flow lifecycle (start/stop/fail, output add/remove, input/output CRUD including update, media-player start/source-failed/playlist-exhausted) |
 | `bandwidth` | 4 | Per-flow bandwidth monitoring (alarm, block, recovery) |
 | `srt` | 9 | SRT input and output connection state (now with structured details) |
 | `redundancy` | 3 | SMPTE 2022-7 dual-leg status |
@@ -405,7 +425,7 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `network_leg` | — | SMPTE 2022-7 Red/Blue per-leg loss / recovery (Phase 1) |
 | `nmos` | — | NMOS IS-04 / IS-05 / IS-08 controller activity (Phase 1) |
 | `scte104` | — | SCTE-104 splice events parsed from ST 2110-40 ANC (Phase 1) |
-| **Total** | **84** | |
+| **Total** | **87** | |
 
 ### Phase 1 ST 2110 categories
 
@@ -427,9 +447,9 @@ mapping:
 
 | Severity | Count | Description |
 |----------|-------|-------------|
-| critical | 22 | Service-impacting: flow/tunnel failures, auth rejection, both legs lost, bandwidth block, audio/video encoder failures, bind failures (RTP/UDP/RIST) |
+| critical | 23 | Service-impacting: flow/tunnel failures, auth rejection, both legs lost, bandwidth block, audio/video encoder failures, bind failures (RTP/UDP/RIST), media-player source failed |
 | warning | 22 | Degradation: disconnects, stale connections, upload failures, reconnects, bandwidth exceeded, audio_encode restart, resource gating, tunnel retry |
-| info | 40 | State changes: connections established, flows started, config updated, bandwidth recovery, encoder started, input/output CRUD, bind success (RTP/UDP) |
+| info | 42 | State changes: connections established, flows started, config updated, bandwidth recovery, encoder started, input/output CRUD, bind success (RTP/UDP), media-player started/playlist-exhausted |
 
 ## Unified bind-failure events (`port_conflict` / `bind_failed`)
 
@@ -469,3 +489,34 @@ emitting raw `Event` instances — the helpers populate `details` with
 the canonical shape and the recent-event tracker that lets the
 WS command handler return runtime bind failures synchronously on the
 `command_ack` for `create_flow` / `update_flow`.
+
+## Content Analysis events
+
+In-depth content-analysis tiers (Lite, Audio Full, Video Full —
+gated by `FlowConfig.content_analysis`, module:
+[`src/engine/content_analysis/`](../src/engine/content_analysis/))
+emit flow-scoped events when their heuristics cross a threshold.
+Every event sets `details.error_code` to the category name so the
+manager UI can route / filter without string parsing.
+
+| Category | Severity | When it fires | Tier |
+|---|---|---|---|
+| `content_analysis_scte35_pid` | Info | A new PID carrying `stream_type = 0x86` (SCTE-35) appears in the PMT | Lite |
+| `content_analysis_scte35_cue` | Info | A `splice_info_section` is decoded on any SCTE-35 PID (debounced to one event per unique cue) | Lite |
+| `content_analysis_caption_lost` | Warning | Captions (SEI `user_data_registered_itu_t_t35` with ATSC `GA94`) were present, then disappear for ≥ 5 s. 30 s event-ratelimit. | Lite |
+| `content_analysis_mdi_above_threshold` | Warning | RFC 4445 Delay Factor exceeds 50 ms in a 1 s window. 30 s event-ratelimit. | Lite |
+| `content_analysis_audio_silent` | Warning | Decoded AAC audio's EBU R128 momentary loudness drops to ≤ −60 LUFS for ≥ 2 s (on codecs we can't yet decode — MP2 / AC-3 / E-AC-3 — the analyser falls back to the PES-bitrate-below-1 kbps proxy). 30 s event-ratelimit. | Audio Full |
+| `content_analysis_video_freeze` | Warning | YUV sum-of-absolute-differences between two consecutive decoded video frames drops below 0.75 on a 0–255 mean-absolute-difference scale for ≥ 3 s. Runs on decoded Y planes from the in-process FFmpeg decoder (`video_engine::VideoDecoder`). 30 s event-ratelimit. | Video Full |
+
+All tiers are opt-in via the `content_analysis` block on the flow
+(Lite defaults ON for TS-carrying inputs; Audio/Video Full default
+OFF). The tiers attach as independent broadcast subscribers — they
+cannot add jitter or block the data path. Lag on the broadcast
+channel increments a `lite_drops` / `audio_full_drops` /
+`video_full_drops` counter on `ContentAnalysisAccumulator`.
+
+## Configuration-guide pointer
+
+Content-analysis configuration schema and examples live in
+[`docs/configuration-guide.md`](configuration-guide.md) under
+"Content Analysis (in-depth)".

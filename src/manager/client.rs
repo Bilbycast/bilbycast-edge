@@ -512,6 +512,16 @@ async fn try_connect(
     let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
     stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Outbound queue: spawned per-command handler tasks send their
+    // command_ack / config_response / pong frames via this channel rather
+    // than touching `ws_write` directly. The main loop is the sole writer
+    // to the socket, draining `out_rx` alongside its own stats / health
+    // / thumbnail / event paths. Buffer is generous (256) because every
+    // command produces exactly one outbound frame and command_acks are
+    // small, but a sustained burst from the manager (cluster reconcile,
+    // boot-time fan-out) can pile up briefly.
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
+
     // Event-driven thumbnail delivery: the thumbnail generators notify this
     // shared handle on every successful capture (input switch, freeze,
     // signal change, steady-state tick). The fallback tick is a long-period
@@ -611,13 +621,37 @@ async fn try_connect(
                 }
             }
 
+            // Drain queued outbound frames produced by spawned per-command
+            // handler tasks. Keeping the socket writer single-owner here
+            // avoids interleaving partial Text frames from concurrent
+            // tasks.
+            Some(json) = out_rx.recv() => {
+                if ws_write.send(Message::Text(json.into())).await.is_err() {
+                    break;
+                }
+            }
+
             msg = ws_read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_manager_message(
-                            &text, flow_manager, tunnel_manager, app_config, config_path,
-                            secrets_path, &webrtc_sessions, &mut ws_write,
-                        ).await;
+                        // Spawn per-message so a long-running command
+                        // (media upload chunk, update_config, etc.) can
+                        // never park the WS receive loop. Each handler
+                        // emits its reply via `out_tx` which the loop
+                        // drains alongside stats / health / thumbnails.
+                        let flow_manager = flow_manager.clone();
+                        let tunnel_manager = tunnel_manager.clone();
+                        let app_config = app_config.clone();
+                        let config_path = config_path.clone();
+                        let secrets_path = secrets_path.clone();
+                        let webrtc_sessions = webrtc_sessions.clone();
+                        let out_tx = out_tx.clone();
+                        tokio::spawn(async move {
+                            handle_manager_message(
+                                &text, &flow_manager, &tunnel_manager, &app_config,
+                                &config_path, &secrets_path, &webrtc_sessions, &out_tx,
+                            ).await;
+                        });
                     }
                     Some(Ok(Message::Ping(data))) => {
                         let _ = ws_write.send(Message::Pong(data)).await;
@@ -931,7 +965,13 @@ where
 }
 
 /// Handle a message from the manager.
-async fn handle_manager_message<S>(
+///
+/// Replies are queued onto `out_tx` rather than written to the socket
+/// directly so this function can run on a `tokio::spawn`ed task — keeping
+/// long-running commands (media-chunk upload, update_config, transcoder
+/// bring-up) off the WS receive loop. The main loop drains `out_tx` and
+/// is the single owner of the underlying socket writer.
+async fn handle_manager_message(
     text: &str,
     flow_manager: &Arc<FlowManager>,
     tunnel_manager: &Arc<TunnelManager>,
@@ -939,11 +979,8 @@ async fn handle_manager_message<S>(
     config_path: &PathBuf,
     secrets_path: &PathBuf,
     webrtc_sessions: &WebrtcRegistry,
-    ws_write: &mut futures_util::stream::SplitSink<S, Message>,
-) where
-    S: futures_util::Sink<Message> + Unpin,
-    <S as futures_util::Sink<Message>>::Error: std::fmt::Display,
-{
+    out_tx: &mpsc::Sender<String>,
+) {
     let envelope: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
@@ -963,7 +1000,7 @@ async fn handle_manager_message<S>(
                 "payload": null
             });
             if let Ok(json) = serde_json::to_string(&pong) {
-                let _ = ws_write.send(Message::Text(json.into())).await;
+                let _ = out_tx.send(json).await;
             }
         }
         "command" => {
@@ -986,7 +1023,7 @@ async fn handle_manager_message<S>(
                     "payload": config_json
                 });
                 if let Ok(json) = serde_json::to_string(&response) {
-                    let _ = ws_write.send(Message::Text(json.into())).await;
+                    let _ = out_tx.send(json).await;
                 }
                 return;
             }
@@ -1017,7 +1054,7 @@ async fn handle_manager_message<S>(
                 "payload": payload
             });
             if let Ok(json) = serde_json::to_string(&ack) {
-                let _ = ws_write.send(Message::Text(json.into())).await;
+                let _ = out_tx.send(json).await;
             }
         }
         "register_ack" => {
@@ -1192,7 +1229,15 @@ async fn execute_command(
                     // toggling mid-flight is not yet wired through the
                     // FlowManager, so we avoid the disruptive restart here.
                     let input_changed = old_flow.input_ids != new_flow.input_ids;
-                    let restart_required = old_flow.bandwidth_limit != new_flow.bandwidth_limit;
+                    // `content_analysis` tier toggles are baked in at
+                    // `FlowRuntime::start` (the analyser tasks are spawned
+                    // there). Toggling them mid-flight requires a flow
+                    // restart so the new tier tasks actually start running
+                    // — without this, the operator flips the switch in the
+                    // manager UI and nothing visible happens.
+                    let content_analysis_changed = old_flow.content_analysis != new_flow.content_analysis;
+                    let restart_required = old_flow.bandwidth_limit != new_flow.bandwidth_limit
+                        || content_analysis_changed;
                     let persist_only_meta_changed = old_flow.name != new_flow.name
                         || old_flow.media_analysis != new_flow.media_analysis
                         || old_flow.thumbnail != new_flow.thumbnail;
@@ -1203,8 +1248,11 @@ async fn execute_command(
                     }
 
                     if input_changed || restart_required {
-                        // Input or rate-limit changed — must restart entire flow
-                        tracing::info!("Update flow '{flow_id}': restarting (input changed={input_changed}, bandwidth_limit changed={restart_required})");
+                        // Input, rate-limit, or content-analysis tier
+                        // toggles changed — must restart entire flow.
+                        tracing::info!(
+                            "Update flow '{flow_id}': restarting (input changed={input_changed}, bandwidth_limit/content_analysis changed={restart_required}, content_analysis_changed={content_analysis_changed})"
+                        );
                         let _ = flow_manager.destroy_flow(flow_id).await;
                         let resolved = {
                             let cfg = app_config.read().await;
@@ -1903,6 +1951,47 @@ async fn execute_command(
                 None => serde_json::json!({}),
             };
             Ok(Some(data))
+        }
+        // ── Media library commands (file-backed media-player input) ──
+        "list_media" => {
+            let files = crate::media::MediaLibrary::list()
+                .await
+                .map_err(|e| format!("list_media failed: {e}"))?;
+            Ok(Some(serde_json::json!({ "files": files })))
+        }
+        "upload_media_chunk" => {
+            let name = action["name"]
+                .as_str()
+                .ok_or("upload_media_chunk: missing 'name'")?
+                .to_string();
+            let chunk_index = action["chunk_index"]
+                .as_u64()
+                .ok_or("upload_media_chunk: missing or invalid 'chunk_index'")?
+                as u32;
+            let total_chunks = action["total_chunks"]
+                .as_u64()
+                .ok_or("upload_media_chunk: missing or invalid 'total_chunks'")?
+                as u32;
+            let total_bytes = action["total_bytes"]
+                .as_u64()
+                .ok_or("upload_media_chunk: missing or invalid 'total_bytes'")?;
+            let data_b64 = action["data_b64"]
+                .as_str()
+                .ok_or("upload_media_chunk: missing 'data_b64'")?;
+            let progress = crate::media::global()
+                .apply_chunk(&name, chunk_index, total_chunks, total_bytes, data_b64)
+                .await
+                .map_err(|e| format!("upload_media_chunk failed: {e}"))?;
+            Ok(Some(serde_json::to_value(&progress).unwrap_or_default()))
+        }
+        "delete_media" => {
+            let name = action["name"]
+                .as_str()
+                .ok_or("delete_media: missing 'name'")?;
+            let removed = crate::media::MediaLibrary::delete(name)
+                .await
+                .map_err(|e| format!("delete_media failed: {e}"))?;
+            Ok(Some(serde_json::json!({ "deleted": removed })))
         }
         "get_nmos_state"
         | "get_ptp_state"

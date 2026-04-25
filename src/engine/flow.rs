@@ -112,6 +112,17 @@ pub struct FlowRuntime {
     /// Shutdown is driven by CancellationToken, not by aborting the handle.
     #[allow(dead_code)]
     pub thumbnail_handle: Option<JoinHandle<()>>,
+    /// Content-analysis Lite-tier task handle (if Lite enabled and the
+    /// active input carries MPEG-TS). Held for ownership; shutdown driven
+    /// by the parent CancellationToken.
+    #[allow(dead_code)]
+    pub content_analysis_handle: Option<JoinHandle<()>>,
+    /// Content-analysis Audio Full tier task handle.
+    #[allow(dead_code)]
+    pub content_analysis_audio_handle: Option<JoinHandle<()>>,
+    /// Content-analysis Video Full tier task handle.
+    #[allow(dead_code)]
+    pub content_analysis_video_handle: Option<JoinHandle<()>>,
     /// Bandwidth monitor task handle (if bandwidth_limit is configured).
     /// Held for ownership — shutdown is driven by CancellationToken.
     #[allow(dead_code)]
@@ -578,6 +589,80 @@ impl FlowRuntime {
             None
         };
 
+        // Start in-depth content-analysis subsystem. Each tier is a
+        // dedicated broadcast subscriber — drop-on-lag, no feedback into
+        // the data path. Per-tier gating:
+        //   - Lite      : TS-carrying input (PSI / GOP / SCTE-35 / MDI)
+        //   - Audio Full: TS-carrying input  OR  PCM-RTP audio input
+        //                 (ST 2110-30 / -31 / RtpAudio) — PCM path skips
+        //                 demux+decode and feeds samples straight to R128
+        //   - Video Full: TS-carrying input (ST 2110-20/-23 inputs encode
+        //                 to TS at ingress so this still applies)
+        //
+        // The accumulator is created up-front if *any* tier-eligible spawn
+        // will happen so the wire shape carries the tier-drop counters +
+        // UI can render "analysing…" even before the first sample lands.
+        let content_cfg = config.config.effective_content_analysis();
+        let ts_carrier = active_input_cfg.map_or(false, |i| i.is_ts_carrier());
+        let audio_full_mode = active_input_cfg.and_then(|i| derive_audio_full_mode(i, ts_carrier));
+        let lite_eligible = content_cfg.lite && ts_carrier;
+        let audio_full_eligible = content_cfg.audio_full && audio_full_mode.is_some();
+        let video_full_eligible = content_cfg.video_full && ts_carrier;
+        let any_tier_eligible =
+            lite_eligible || audio_full_eligible || video_full_eligible;
+
+        let ca_acc_shared = if any_tier_eligible {
+            let acc = Arc::new(crate::stats::collector::ContentAnalysisAccumulator::new());
+            flow_stats.content_analysis.set(acc.clone()).ok();
+            Some(acc)
+        } else {
+            None
+        };
+        let content_analysis_handle = if let Some(ref acc) = ca_acc_shared {
+            if lite_eligible {
+                Some(crate::engine::content_analysis::spawn_content_analysis_lite(
+                    &broadcast_tx,
+                    acc.clone(),
+                    event_sender.clone(),
+                    config.config.id.clone(),
+                    cancel_token.child_token(),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let content_analysis_audio_handle = match (&ca_acc_shared, audio_full_mode) {
+            (Some(acc), Some(mode)) if content_cfg.audio_full => {
+                Some(crate::engine::content_analysis::spawn_content_analysis_audio_full(
+                    &broadcast_tx,
+                    acc.clone(),
+                    event_sender.clone(),
+                    config.config.id.clone(),
+                    mode,
+                    cancel_token.child_token(),
+                ))
+            }
+            _ => None,
+        };
+        let content_analysis_video_handle = if let Some(ref acc) = ca_acc_shared {
+            if video_full_eligible {
+                Some(crate::engine::content_analysis::spawn_content_analysis_video_full(
+                    &broadcast_tx,
+                    acc.clone(),
+                    event_sender.clone(),
+                    config.config.id.clone(),
+                    content_cfg.video_full_hz,
+                    cancel_token.child_token(),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Start bandwidth monitor (if configured)
         let bandwidth_monitor_handle = if let Some(ref bw_limit) = config.config.bandwidth_limit {
             flow_stats.bandwidth_limit_mbps.set(bw_limit.max_bitrate_mbps).ok();
@@ -673,6 +758,9 @@ impl FlowRuntime {
             analyzer_handle,
             media_analysis_handle,
             thumbnail_handle,
+            content_analysis_handle,
+            content_analysis_audio_handle,
+            content_analysis_video_handle,
             bandwidth_monitor_handle,
             degradation_monitor_handle,
             #[cfg(feature = "webrtc")]
@@ -1595,6 +1683,11 @@ fn spawn_single_input(
             input_cancel.clone(), event_sender.clone(),
             flow_id.to_string(), input_id.clone(),
         ),
+        InputConfig::MediaPlayer(c) => super::input_media_player::spawn_media_player_input(
+            c.clone(), per_input_tx.clone(), flow_stats.clone(),
+            input_cancel.clone(), event_sender.clone(),
+            flow_id.to_string(), input_id.clone(),
+        ),
     };
 
     (handle, whip_info)
@@ -1747,6 +1840,11 @@ fn media_analysis_metadata(input: &InputConfig) -> MediaAnalysisMeta {
             fec_enabled: false, fec_type: None,
             redundancy_enabled: false, redundancy_type: None,
         },
+        InputConfig::MediaPlayer(_) => MediaAnalysisMeta {
+            protocol: "media_player".into(), payload_format: "raw_ts".into(),
+            fec_enabled: false, fec_type: None,
+            redundancy_enabled: false, redundancy_type: None,
+        },
     }
 }
 
@@ -1774,6 +1872,54 @@ fn input_type_str(input: &InputConfig) -> &'static str {
         InputConfig::RtpAudio(_) => "rtp_audio",
         InputConfig::Bonded(_) => "bonded",
         InputConfig::TestPattern(_) => "test_pattern",
+        InputConfig::MediaPlayer(_) => "media_player",
+    }
+}
+
+/// Pick the right [`AudioFullMode`] for the active input. Returns `None`
+/// for input types we cannot run R128 against — uncompressed video,
+/// ANC-only flows, WebRTC (the broadcast carries TS-wrapped H.264 which
+/// goes through the [`AudioFullMode::Ts`] path), bonded transports
+/// (delegated to the underlying transport once attached), test pattern.
+fn derive_audio_full_mode(
+    input: &InputConfig,
+    ts_carrier: bool,
+) -> Option<crate::engine::content_analysis::audio_full::AudioFullMode> {
+    use crate::engine::content_analysis::audio_full::AudioFullMode;
+    match input {
+        InputConfig::St2110_31(c) => Some(AudioFullMode::Aes3 {
+            sample_rate: c.sample_rate,
+            channels: c.channels,
+        }),
+        InputConfig::St2110_30(c) => {
+            if c.bit_depth == 16 {
+                Some(AudioFullMode::Pcm {
+                    codec: "pcm_l16",
+                    sample_rate: c.sample_rate,
+                    channels: c.channels,
+                    bytes_per_sample: 2,
+                })
+            } else {
+                Some(AudioFullMode::Pcm {
+                    codec: "pcm_l24",
+                    sample_rate: c.sample_rate,
+                    channels: c.channels,
+                    bytes_per_sample: 3,
+                })
+            }
+        }
+        InputConfig::RtpAudio(c) => {
+            let bps = if c.bit_depth == 16 { 2 } else { 3 };
+            let codec = if c.bit_depth == 16 { "pcm_l16" } else { "pcm_l24" };
+            Some(AudioFullMode::Pcm {
+                codec,
+                sample_rate: c.sample_rate,
+                channels: c.channels,
+                bytes_per_sample: bps,
+            })
+        }
+        _ if ts_carrier => Some(AudioFullMode::Ts),
+        _ => None,
     }
 }
 
@@ -1863,6 +2009,15 @@ fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::Inpu
         },
         InputConfig::TestPattern(c) => InputConfigMeta {
             mode: Some(format!("test-pattern {}x{}@{}", c.width, c.height, c.fps)),
+            local_addr: None,
+            remote_addr: None,
+            listen_addr: None,
+            bind_addr: None,
+            rtsp_url: None,
+            whep_url: None,
+        },
+        InputConfig::MediaPlayer(c) => InputConfigMeta {
+            mode: Some(format!("media-player ({} source(s))", c.sources.len())),
             local_addr: None,
             remote_addr: None,
             listen_addr: None,

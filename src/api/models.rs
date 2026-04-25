@@ -102,6 +102,7 @@ impl FlowSummary {
             // more than one path is configured.
             Some(InputConfig::Bonded(c)) => ("bonded", c.paths.len() > 1),
             Some(InputConfig::TestPattern(_)) => ("test_pattern", false),
+            Some(InputConfig::MediaPlayer(_)) => ("media_player", false),
             None => ("none", false),
         };
 

@@ -23,6 +23,7 @@ mod config;
 mod engine;
 mod fec;
 mod manager;
+mod media;
 mod monitor;
 mod redundancy;
 mod setup;

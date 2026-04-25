@@ -85,6 +85,198 @@ pub struct FlowStats {
     /// no output has yet collected enough samples. PID-bus Phase 8.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pcr_trust_flow: Option<PcrTrustStats>,
+    /// In-depth content-analysis snapshot. Populated when the flow has
+    /// `content_analysis.lite | audio_full | video_full` enabled. Each
+    /// sub-field is independently optional so a partial selection (e.g.
+    /// Lite-only) round-trips with a minimal JSON payload. Backward-
+    /// compatible addition; old manager builds ignore unknown fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_analysis: Option<ContentAnalysisStats>,
+}
+
+/// In-depth content-analysis snapshot. Mirrors the tier shape of
+/// [`crate::config::models::ContentAnalysisConfig`] — each sub-block is
+/// only present when the corresponding tier is enabled and has produced
+/// at least one sample.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ContentAnalysisStats {
+    /// Lite (compressed-domain) results. Always present when `lite=true`,
+    /// even before the first PSI table arrives, so the manager UI can
+    /// render an "analysing…" state distinguishable from "tier off".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lite: Option<ContentAnalysisLiteStats>,
+    /// Audio Full results — Phase 2 placeholder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_full: Option<serde_json::Value>,
+    /// Video Full results — Phase 3 placeholder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_full: Option<serde_json::Value>,
+}
+
+/// Lite content-analysis results. Compressed-domain only — no decode.
+///
+/// Every sub-field is independently `Option`-typed so an input that doesn't
+/// supply a particular signal (e.g. captions on a feed without SEI user-data)
+/// produces `None` rather than a zeroed-out struct that suggests the absence
+/// is itself the measurement.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ContentAnalysisLiteStats {
+    /// GOP / frame-type cadence detected from the active input's video PES.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gop: Option<GopStats>,
+    /// Container / codec signalling pulled out of SPS / VUI / SEI / TS
+    /// user-data. AR, colour primaries, transfer characteristics, range,
+    /// HDR static metadata (MaxFALL / MaxCLL / mastering display), and AFD.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signalling: Option<SignallingStats>,
+    /// SMPTE 12M-1 / -2 timecode observed on the active video PID
+    /// (H.264 / H.265 `pic_timing` SEI).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timecode: Option<TimecodeStats>,
+    /// Closed-caption presence (CEA-608 / 708 in `user_data_registered_itu_t_t35`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub captions: Option<CaptionsStats>,
+    /// SCTE-35 splice-information presence on any PMT-listed PID with
+    /// stream_type 0x86.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scte35: Option<Scte35Stats>,
+    /// Media Delivery Index (RFC 4445) computed from input-side packet
+    /// timing — measured per-input on every transport, including the
+    /// post-recovered TS stream out of SRT / RIST.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mdi: Option<MdiStats>,
+    /// Whether the analyser is currently keeping up with the broadcast
+    /// channel. Increments on `RecvError::Lagged` from the flow broadcast
+    /// channel and is informational only — alarms are not raised because
+    /// the data path is unaffected.
+    pub analyser_drops: u64,
+}
+
+/// GOP structure observed from the video PES. Counters are lifetime totals;
+/// the cadence fields are smoothed over the most recent window.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct GopStats {
+    /// PID of the analysed video stream. `None` until a PMT has been seen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_pid: Option<u16>,
+    /// Codec family (`"h264"`, `"h265"`, `"mpeg2"`, `"other"`).
+    pub codec: String,
+    /// Frame count by NAL/slice type since flow start.
+    pub idr_count: u64,
+    pub i_count: u64,
+    pub p_count: u64,
+    pub b_count: u64,
+    /// Mean distance (in frames) between successive IDR / I-frames.
+    /// `None` until at least two IDR / I-frames have been observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idr_interval_frames: Option<f32>,
+    /// Whether the most recently completed GOP was closed
+    /// (no B-frame references across the IDR boundary). H.264-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_gop: Option<bool>,
+}
+
+/// Container / codec signalling pulled from SPS / VUI / SEI / TS user-data.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SignallingStats {
+    /// Display aspect ratio derived from `sample_aspect_ratio_idc` (or
+    /// extended SAR) and decoded width / height.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aspect_ratio: Option<String>,
+    /// Colour primaries (`"bt709"`, `"bt2020"`, `"bt601"`, `"bt470bg"`,
+    /// `"smpte240m"`, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub colour_primaries: Option<String>,
+    /// Transfer characteristics (`"bt709"`, `"smpte2084"`, `"arib-std-b67"`,
+    /// `"linear"`, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer_characteristics: Option<String>,
+    /// Matrix coefficients (`"bt709"`, `"bt2020-ncl"`, `"bt2020-cl"`, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matrix_coefficients: Option<String>,
+    /// Pixel range — `"limited"` (TV) / `"full"` (PC).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_range: Option<String>,
+    /// HDR transfer family (`"sdr"`, `"hdr10"`, `"hlg"`, `"unknown"`).
+    pub hdr: String,
+    /// Maximum content light level in cd/m² (HDR10 SEI 144).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_cll: Option<u32>,
+    /// Maximum frame-average light level in cd/m² (HDR10 SEI 144).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_fall: Option<u32>,
+    /// Active Format Description (CEA-708 / SMPTE 2016-1) most recently
+    /// observed in TS user-data PES. `None` when no AFD descriptor has
+    /// arrived.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub afd: Option<u8>,
+}
+
+/// SMPTE 12M timecode observed on the video PES.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct TimecodeStats {
+    /// Whether timecode has been observed at any point since flow start.
+    pub seen: bool,
+    /// Most recent timecode in `HH:MM:SS:FF` (or `;FF` when drop-frame).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last: Option<String>,
+    /// Whether the cadence has been monotonic since the first sample
+    /// (no skip-backwards). Resets to `true` on any non-monotonic step
+    /// to avoid a single bad sample latching the alarm forever.
+    pub monotonic: bool,
+    /// Number of non-monotonic timecode steps observed since flow start.
+    pub non_monotonic_count: u64,
+}
+
+/// CEA-608 / 708 closed caption presence detection.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct CaptionsStats {
+    /// `true` if at least one caption packet has been observed in the
+    /// last 5 seconds. Drives the `content_analysis_caption_lost` event
+    /// when it transitions from true → false on a flow that previously
+    /// had captions.
+    pub present: bool,
+    /// Lifetime count of caption packets carried in SEI user-data.
+    pub packet_count: u64,
+    /// Service variants seen so far (`"cea-608"`, `"cea-708"`).
+    pub services: Vec<String>,
+}
+
+/// SCTE-35 splice-information presence detection.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct Scte35Stats {
+    /// PIDs carrying stream_type 0x86 (SCTE-35) per the most recent PMT.
+    pub pids: Vec<u16>,
+    /// Cumulative count of `splice_info_section`s observed.
+    pub cue_count: u64,
+    /// Most recent splice command type (`"splice_null"`, `"splice_insert"`,
+    /// `"time_signal"`, `"bandwidth_reservation"`, `"private_command"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_command: Option<String>,
+    /// Most recent cue's PTS, when present (`splice_insert` /
+    /// `time_signal`). 90 kHz ticks; convert to seconds with `/ 90000`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_pts: Option<u64>,
+}
+
+/// Media Delivery Index per RFC 4445. Computed continuously over a sliding
+/// 1-second window; reported values are the most recent windowed sample.
+///
+/// `delay_factor_ms` (NDF) — peak deviation from the nominal media rate
+/// expressed in milliseconds of buffering required to absorb network
+/// jitter. `loss_rate_pps` (MLR) — packets-lost-per-second (sliding 1 s).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct MdiStats {
+    /// `MDI = NDF:MLR`, formatted for display (`"4.2:0"`).
+    pub mdi: String,
+    /// NDF in ms (peak deviation in the most recent 1 s window).
+    pub delay_factor_ms: f32,
+    /// MLR in packets/s (sliding 1 s window).
+    pub loss_rate_pps: f32,
+    /// Number of windows where `delay_factor_ms` exceeded the configured
+    /// alarm threshold (50 ms by default — the boundary between `OK` and
+    /// `Warning` in most Bridge / Tek probes).
+    pub windows_above_threshold: u64,
 }
 
 /// Per-elementary-stream counters collected on the PID bus. One entry per

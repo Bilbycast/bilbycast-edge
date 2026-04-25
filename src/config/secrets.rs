@@ -327,6 +327,9 @@ impl SecretsConfig {
             InputConfig::Bonded(_) => {}
             // Synthetic input has no secrets.
             InputConfig::TestPattern(_) => {}
+            // Media player reads files off local disk; the filenames
+            // are operational config, not secrets.
+            InputConfig::MediaPlayer(_) => {}
         }
     }
 
@@ -567,6 +570,7 @@ mod tests {
                 input_ids: vec!["srt-in".to_string()],
                 output_ids: vec![],
                 assembly: None,
+                content_analysis: None,
             }],
             tunnels: vec![TunnelConfig {
                 id: "tunnel-1".to_string(),
@@ -684,6 +688,7 @@ mod tests {
                 input_ids: vec!["srt-in".to_string()],
                 output_ids: vec![],
                 assembly: None,
+                content_analysis: None,
             }],
             ..Default::default()
         };
@@ -740,6 +745,7 @@ mod tests {
                 input_ids: vec!["rtp-in".to_string()],
                 output_ids: vec!["rtmp-out".to_string()],
                 assembly: None,
+                content_analysis: None,
             }],
             ..Default::default()
         };
@@ -790,6 +796,7 @@ mod tests {
                 input_ids: vec!["srt-in".to_string()],
                 output_ids: vec![],
                 assembly: None,
+                content_analysis: None,
             }],
             ..Default::default()
         };

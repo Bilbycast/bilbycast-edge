@@ -28,6 +28,10 @@ pub mod config;
 pub mod engine;
 pub mod fec;
 pub mod manager;
+/// Media-library storage for the file-backed media-player input.
+/// Owns the on-disk directory, list / upload-chunk / delete primitives, and
+/// the WS command handlers the manager forwards into.
+pub mod media;
 pub mod redundancy;
 pub mod setup;
 pub mod srt;
