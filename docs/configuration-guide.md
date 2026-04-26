@@ -561,6 +561,7 @@ Receives RTP-wrapped MPEG-TS packets (SMPTE ST 2022-2). Requires valid RTP v2 he
   "type": "rtp",
   "bind_addr": "239.1.1.1:5000",
   "interface_addr": "192.168.1.100",
+  "source_addr": "10.0.0.5",
   "fec_decode": {
     "columns": 10,
     "rows": 10
@@ -577,6 +578,7 @@ Receives RTP-wrapped MPEG-TS packets (SMPTE ST 2022-2). Requires valid RTP v2 he
 | `type` | string | Yes | - | Must be `"rtp"`. |
 | `bind_addr` | string | Yes | - | Local socket address to bind (`ip:port`). For multicast, use the group address (e.g., `"239.1.1.1:5000"`). For unicast, use `"0.0.0.0:5000"`. IPv6: `"[::]:5000"` or `"[ff7e::1]:5000"`. |
 | `interface_addr` | string | No | `null` | Network interface IP for multicast group join. Required for multicast on multi-homed hosts. Must be the same address family as `bind_addr`. |
+| `source_addr` | string | No | `null` | Source-specific multicast (SSM, RFC 3678) source address. When set, the kernel uses an `(S,G)` join instead of an `(*,G)` join — only packets from this exact source reach the socket. See [SSM vs ASM](#source-specific-multicast-ssm-vs-any-source-multicast-asm) below. |
 | `fec_decode` | object | No | `null` | SMPTE 2022-1 FEC decode parameters. See [FEC Configuration](#smpte-2022-1-fec-configuration). |
 | `tr07_mode` | boolean | No | `null` | Enable VSF TR-07 mode to detect and report JPEG XS streams in the transport stream. |
 | `allowed_sources` | array of strings | No | `null` | Source IP allow-list (RP 2129 C5). Only RTP packets from these source IPs are accepted. Each entry must be a valid IP address. When `null`, all sources are allowed. |
@@ -586,6 +588,7 @@ Receives RTP-wrapped MPEG-TS packets (SMPTE ST 2022-2). Requires valid RTP v2 he
 **Validation rules:**
 - `bind_addr` must be a valid `ip:port` socket address.
 - `interface_addr` must be a valid IP address (no port) in the same address family as `bind_addr`.
+- `source_addr` is only valid when `bind_addr` is multicast, must be a unicast IP, and must share the address family of `bind_addr`.
 - `allowed_payload_types` values must be 0-127.
 - `max_bitrate_mbps` must be positive.
 
@@ -597,7 +600,8 @@ Receives raw UDP datagrams without requiring RTP headers. Suitable for raw MPEG-
 {
   "type": "udp",
   "bind_addr": "0.0.0.0:5000",
-  "interface_addr": "192.168.1.100"
+  "interface_addr": "192.168.1.100",
+  "source_addr": "10.0.0.5"
 }
 ```
 
@@ -606,10 +610,26 @@ Receives raw UDP datagrams without requiring RTP headers. Suitable for raw MPEG-
 | `type` | string | Yes | - | Must be `"udp"`. |
 | `bind_addr` | string | Yes | - | Local socket address to bind (`ip:port`). For multicast, use the group address. |
 | `interface_addr` | string | No | `null` | Network interface IP for multicast group join. Must be the same address family as `bind_addr`. |
+| `source_addr` | string | No | `null` | SSM source address — see [RTP Input](#rtp-input) above. |
 
 **Validation rules:**
 - `bind_addr` must be a valid `ip:port` socket address.
 - `interface_addr` must be a valid IP address in the same address family as `bind_addr`.
+- `source_addr` rules: see [RTP Input](#rtp-input) above.
+
+### Source-Specific Multicast (SSM) vs Any-Source Multicast (ASM)
+
+Multicast inputs default to **ASM** (`(*,G)`) — the kernel joins the group and accepts traffic from any source on that group address. This requires PIM-RP (Rendezvous Point) routing infrastructure and offers no per-source filtering.
+
+Setting `source_addr` switches the join to **SSM** (`(S,G)`, RFC 3678). Benefits:
+
+- **Skips PIM-RP** — SSM joins flow directly toward the source via PIM-SSM (no rendezvous tree).
+- **Per-source filtering at the kernel** — packets from any other source on the same group are dropped before reaching userspace.
+- **Required by many ST 2110 / ST 2059 broadcast plants** — production routers commonly require `(S,G)` joins for guaranteed traffic isolation.
+
+SSM works on any multicast group; the kernel doesn't enforce the IANA SSM ranges (232.0.0.0/8 for IPv4, ff3x::/32 for IPv6). The IPv6 SSM join uses `MCAST_JOIN_SOURCE_GROUP` (Linux + macOS only — other targets fail with a clear error).
+
+For SMPTE 2022-7 dual-leg inputs, each leg has its own `source_addr` field — real Red/Blue plants typically have different source IPs per network. Set `source_addr` on the parent input for the primary (Red) leg, and `redundancy.source_addr` for the secondary (Blue) leg.
 
 ### SRT Input
 
@@ -1081,7 +1101,7 @@ When `encryption` is set, the edge:
 
 - Output only. Standard-mode segment-based transport adds 1-4 s latency; LL-CMAF with 500 ms chunks targets <3 s glass-to-glass.
 - Source must emit an IDR at least every `segment_duration_secs` unless `video_encode` is set.
-- `video_encode` requires the `video-thumbnail` feature plus a matching `video-encoder-x264` / `-x265` / `-nvenc` backend compiled in.
+- `video_encode` requires the `video-thumbnail` feature plus a matching `video-encoder-x264` / `-x265` / `-nvenc` / `-qsv` backend compiled in.
 - Whip-style signaling is not needed — CMAF is stateless HTTP push.
 
 See [`docs/cmaf.md`](cmaf.md) for the full reference, ingest compatibility notes, and performance tuning.
@@ -2003,7 +2023,7 @@ uncompressed-video subsets of SMPTE ST 2110:
 - **Phase 2** (uncompressed video):
   - **ST 2110-20** — RFC 4175 uncompressed video. Inputs decode from
     the wire and encode into H.264/HEVC MPEG-TS via an in-process
-    encoder (`x264`/`x265`/`h264_nvenc`/`hevc_nvenc`); outputs decode
+    encoder (`x264`/`x265`/`h264_nvenc`/`hevc_nvenc`/`h264_qsv`/`hevc_qsv`); outputs decode
     the flow's source TS and RFC 4175-packetize onto the wire. Pixel
     formats: **YCbCr-4:2:2 at 8-bit and 10-bit** (other formats are
     rejected by validation). Requires a `video-encoder-*` feature at

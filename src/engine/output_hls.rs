@@ -381,38 +381,6 @@ fn generate_m3u8(
 
 // ── Minimal async HTTP PUT client ──────────────────────────────────────────
 
-/// Parse a URL into (host, port, path) components.
-/// Supports http:// and https:// (https falls back to port 443 but no TLS --
-/// for production HTTPS a proper TLS library would be needed).
-fn parse_url(url: &str) -> anyhow::Result<(String, u16, String)> {
-    // Strip scheme
-    let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
-        ("https", rest)
-    } else if let Some(rest) = url.strip_prefix("http://") {
-        ("http", rest)
-    } else {
-        anyhow::bail!("unsupported URL scheme in: {url}");
-    };
-
-    let default_port: u16 = if scheme == "https" { 443 } else { 80 };
-
-    // Split host+port from path
-    let (host_port, path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, "/"),
-    };
-
-    let (host, port) = if let Some(colon) = host_port.rfind(':') {
-        let h = &host_port[..colon];
-        let p: u16 = host_port[colon + 1..].parse().unwrap_or(default_port);
-        (h.to_string(), p)
-    } else {
-        (host_port.to_string(), default_port)
-    };
-
-    Ok((host, port, path.to_string()))
-}
-
 /// Perform an HTTP PUT request using a raw TCP stream.
 ///
 /// This is a minimal implementation that avoids heavy HTTP client dependencies.
@@ -425,22 +393,28 @@ async fn http_put(
     content_type: &str,
     auth_token: Option<&str>,
 ) -> anyhow::Result<()> {
-    let (host, port, path) = parse_url(url)?;
+    let target = crate::util::url_parse::parse_http_target(url)?;
 
-    // Defence in depth: even if validation is bypassed, refuse to inline CRLF
-    // into the raw HTTP request line or headers.
     let has_crlf = |s: &str| s.bytes().any(|b| b == b'\r' || b == b'\n');
-    if has_crlf(&host) || has_crlf(&path) || has_crlf(content_type)
+    if has_crlf(&target.host) || has_crlf(&target.path_and_query) || has_crlf(content_type)
         || auth_token.map_or(false, has_crlf)
     {
         anyhow::bail!("HTTP PUT refused: header injection attempt in URL or headers");
     }
 
-    let addr = format!("{host}:{port}");
-    let mut stream = TcpStream::connect(&addr).await
-        .map_err(|e| anyhow::anyhow!("connect to {addr}: {e}"))?;
+    let mut stream = TcpStream::connect(&target.connect_target).await
+        .map_err(|e| anyhow::anyhow!("connect to {}: {e}", target.connect_target))?;
 
-    // Build HTTP/1.1 PUT request
+    let host_header = if target.host.contains(':') {
+        format!("[{}]:{}", target.host, target.port)
+    } else if (target.scheme == "http" && target.port == 80)
+        || (target.scheme == "https" && target.port == 443)
+    {
+        target.host.clone()
+    } else {
+        format!("{}:{}", target.host, target.port)
+    };
+
     let mut request = format!(
         "PUT {path} HTTP/1.1\r\n\
          Host: {host}\r\n\
@@ -448,6 +422,8 @@ async fn http_put(
          Content-Length: {}\r\n\
          Connection: close\r\n",
         body.len(),
+        path = target.path_and_query,
+        host = host_header,
     );
 
     if let Some(token) = auth_token {

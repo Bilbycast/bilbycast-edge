@@ -145,7 +145,13 @@ async fn rtp_input_loop(
     flow_id: &str,
     transcoder: &mut Option<InputTranscoder>,
 ) -> anyhow::Result<()> {
-    let socket = match bind_udp_input(&config.bind_addr, config.interface_addr.as_deref()).await {
+    let socket = match bind_udp_input(
+        &config.bind_addr,
+        config.interface_addr.as_deref(),
+        config.source_addr.as_deref(),
+    )
+    .await
+    {
         Ok(s) => {
             events.emit_flow_with_details(
                 EventSeverity::Info,
@@ -343,7 +349,13 @@ async fn rtp_input_redundant_loop(
         .as_ref()
         .expect("redundancy config must be present");
 
-    let socket1 = match bind_udp_input(&config.bind_addr, config.interface_addr.as_deref()).await {
+    let socket1 = match bind_udp_input(
+        &config.bind_addr,
+        config.interface_addr.as_deref(),
+        config.source_addr.as_deref(),
+    )
+    .await
+    {
         Ok(s) => {
             events.emit_flow_with_details(
                 EventSeverity::Info,
@@ -365,7 +377,13 @@ async fn rtp_input_redundant_loop(
             return Err(e);
         }
     };
-    let socket2 = match bind_udp_input(&redundancy.bind_addr, redundancy.interface_addr.as_deref()).await {
+    let socket2 = match bind_udp_input(
+        &redundancy.bind_addr,
+        redundancy.interface_addr.as_deref(),
+        redundancy.source_addr.as_deref(),
+    )
+    .await
+    {
         Ok(s) => {
             events.emit_flow_with_details(
                 EventSeverity::Info,

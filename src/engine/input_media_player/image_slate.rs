@@ -268,6 +268,15 @@ fn select_video_backend() -> Option<video_codec::VideoEncoderCodec> {
     {
         return Some(VideoEncoderCodec::H264Nvenc);
     }
+    #[cfg(all(
+        feature = "video-encoder-qsv",
+        not(feature = "video-encoder-x264"),
+        not(feature = "video-encoder-x265"),
+        not(feature = "video-encoder-nvenc")
+    ))]
+    {
+        return Some(VideoEncoderCodec::H264Qsv);
+    }
     None
 }
 
@@ -278,6 +287,8 @@ fn backend_codec_string(codec: video_codec::VideoEncoderCodec) -> &'static str {
         VideoEncoderCodec::X265 => "x265",
         VideoEncoderCodec::H264Nvenc => "h264_nvenc",
         VideoEncoderCodec::HevcNvenc => "hevc_nvenc",
+        VideoEncoderCodec::H264Qsv => "h264_qsv",
+        VideoEncoderCodec::HevcQsv => "hevc_qsv",
     }
 }
 

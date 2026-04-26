@@ -124,6 +124,7 @@ fn resolve_webrtc_video_backend(
     match codec {
         "x264" => Some(video_codec::VideoEncoderCodec::X264),
         "h264_nvenc" => Some(video_codec::VideoEncoderCodec::H264Nvenc),
+        "h264_qsv" => Some(video_codec::VideoEncoderCodec::H264Qsv),
         other => {
             let msg = format!(
                 "WebRTC output '{}': video_encode codec '{other}' not supported — WebRTC browsers only decode H.264",
@@ -200,6 +201,7 @@ fn open_webrtc_video_active(
     let backend_tag = match backend {
         video_codec::VideoEncoderCodec::X264 => "x264",
         video_codec::VideoEncoderCodec::H264Nvenc => "nvenc",
+        video_codec::VideoEncoderCodec::H264Qsv => "qsv",
         _ => "unknown",
     };
     output_stats.set_video_encode_stats(
@@ -276,36 +278,40 @@ fn encode_one_video_frame_webrtc(
         _ => return Vec::new(),
     };
     let annex_b = nalus_to_annex_b_webrtc(nalus);
-    let block_result: Result<Vec<Vec<u8>>, String> = tokio::task::block_in_place(|| -> Result<Vec<Vec<u8>>, String> {
-        active.stats.input_frames.fetch_add(1, Ordering::Relaxed);
-        if let Err(e) = active.decoder.send_packet(&annex_b) {
-            tracing::debug!("WebRTC output '{}': decoder send_packet: {e:?}", output_id);
-        }
-        let mut out = Vec::new();
-        loop {
-            let frame = match active.decoder.receive_frame() {
-                Ok(f) => f,
-                Err(_) => break,
-            };
-            let encoded_frames = match active.pipeline.encode(&frame, Some(active.out_frame_count)) {
-                Ok(frames) => frames,
-                Err(e) => {
-                    if !active.pipeline.is_open() {
-                        return Err(format!("encoder open failed: {e}"));
-                    }
-                    tracing::debug!("WebRTC output '{}': encode error: {e}", output_id);
-                    active.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-            };
-            active.out_frame_count += 1;
-            for ef in encoded_frames {
-                out.push(ef.data);
-                active.stats.output_frames.fetch_add(1, Ordering::Relaxed);
+    let block_result: Result<Vec<Vec<u8>>, String> = crate::timed_block_in_place!(
+        "output_webrtc.video_encoder",
+        crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
+        {
+            active.stats.input_frames.fetch_add(1, Ordering::Relaxed);
+            if let Err(e) = active.decoder.send_packet(&annex_b) {
+                tracing::debug!("WebRTC output '{}': decoder send_packet: {e:?}", output_id);
             }
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            loop {
+                let frame = match active.decoder.receive_frame() {
+                    Ok(f) => f,
+                    Err(_) => break,
+                };
+                let encoded_frames = match active.pipeline.encode(&frame, Some(active.out_frame_count)) {
+                    Ok(frames) => frames,
+                    Err(e) => {
+                        if !active.pipeline.is_open() {
+                            return Err(format!("encoder open failed: {e}"));
+                        }
+                        tracing::debug!("WebRTC output '{}': encode error: {e}", output_id);
+                        active.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+                active.out_frame_count += 1;
+                for ef in encoded_frames {
+                    out.push(ef.data);
+                    active.stats.output_frames.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Ok::<_, String>(out)
         }
-        Ok(out)
-    });
+    );
 
     // Only encoder *open* failure flips us to Failed. Decoder priming
     // (no frames produced yet on the first few input access units)

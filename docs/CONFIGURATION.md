@@ -563,7 +563,7 @@ Outputs are discriminated by the `"type"` field. All output types share `id` and
 | `delay`            | `OutputDelay?`          | `null`  | Output delay for stream synchronization. Three modes: `{"mode":"fixed","ms":N}` adds a constant delay; `{"mode":"target_ms","ms":N}` sets a target end-to-end latency (dynamically adjusts); `{"mode":"target_frames","frames":N,"fallback_ms":M}` sets target in video frames (auto-detected fps, optional ms fallback). Incompatible with `transport_mode: "audio_302m"`. |
 | `audio_encode`     | `AudioEncodeConfig?`    | `null`  | Optional audio re-encode (Phase B). `codec` ∈ {`aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`}. Rewrites the TS audio ES in place via `TsAudioReplacer`. Incompatible with `transport_mode: "audio_302m"`, 2022-7 redundancy, and SRT FEC (`packet_filter`). See `AudioEncodeConfig` block below. |
 | `transcode`        | `TranscodeJson?`        | `null`  | Optional channel shuffle / sample-rate conversion applied to decoded PCM **before** `audio_encode` re-encodes. Ignored when `audio_encode` is unset. See [`transcoding.md`](transcoding.md#transcode--channel-shuffle--sample-rate-conversion) for full schema and resolution rules. |
-| `video_encode`     | `VideoEncodeConfig?`    | `null`  | Optional video re-encode (Phase 4, feature-gated — x264 / x265 / NVENC). See [`transcoding.md`](transcoding.md). |
+| `video_encode`     | `VideoEncodeConfig?`    | `null`  | Optional video re-encode (feature-gated — `video-encoder-x264` / `-x265` / `-nvenc` / `-qsv`). See [`transcoding.md`](transcoding.md). |
 
 ### RTP Output (`"type": "rtp"`)
 
@@ -584,7 +584,7 @@ Sends RTP-wrapped MPEG-TS packets with RTP headers. Supports SMPTE 2022-1 FEC en
 | `delay`          | `OutputDelay?`                | `null`  | Output delay for stream synchronization. Three modes: `fixed` (constant delay), `target_ms` (target end-to-end latency), `target_frames` (target latency in video frames). See SRT Output for format details. |
 | `audio_encode`   | `AudioEncodeConfig?`          | `null`  | Optional audio re-encode (Phase B). `codec` ∈ {`aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`}. Rewrites the TS audio ES in place via `TsAudioReplacer`. Incompatible with 2022-7 redundancy and SMPTE 2022-1 FEC encode. See `AudioEncodeConfig` block below. |
 | `transcode`      | `TranscodeJson?`              | `null`  | Optional channel shuffle / sample-rate conversion applied to decoded PCM **before** `audio_encode` re-encodes. Ignored when `audio_encode` is unset. See [`transcoding.md`](transcoding.md#transcode--channel-shuffle--sample-rate-conversion). |
-| `video_encode`   | `VideoEncodeConfig?`          | `null`  | Optional video re-encode (Phase 4, feature-gated). See [`transcoding.md`](transcoding.md). |
+| `video_encode`   | `VideoEncodeConfig?`          | `null`  | Optional video re-encode (feature-gated — `video-encoder-x264` / `-x265` / `-nvenc` / `-qsv`). See [`transcoding.md`](transcoding.md). |
 
 ### UDP Output (`"type": "udp"`)
 
@@ -604,7 +604,7 @@ Sends raw MPEG-TS over UDP without RTP headers. Datagrams are TS-aligned (7×188
 | `delay`          | `OutputDelay?` | `null` | Output delay for stream synchronization. Three modes: `fixed` (constant delay), `target_ms` (target end-to-end latency), `target_frames` (target latency in video frames). Incompatible with `transport_mode: "audio_302m"`. See SRT Output for format details. |
 | `audio_encode`   | `AudioEncodeConfig?` | `null` | Optional audio re-encode (Phase B). `codec` ∈ {`aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`}. Rewrites the TS audio ES in place via `TsAudioReplacer`. Incompatible with `transport_mode: "audio_302m"`. See `AudioEncodeConfig` block below. |
 | `transcode`      | `TranscodeJson?` | `null` | Optional channel shuffle / sample-rate conversion applied to decoded PCM **before** `audio_encode` re-encodes. Ignored when `audio_encode` is unset. See [`transcoding.md`](transcoding.md#transcode--channel-shuffle--sample-rate-conversion). |
-| `video_encode`   | `VideoEncodeConfig?` | `null` | Optional video re-encode (Phase 4, feature-gated). See [`transcoding.md`](transcoding.md). |
+| `video_encode`   | `VideoEncodeConfig?` | `null` | Optional video re-encode (feature-gated — `video-encoder-x264` / `-x265` / `-nvenc` / `-qsv`). See [`transcoding.md`](transcoding.md). |
 
 ### RTMP Output (`"type": "rtmp"`)
 

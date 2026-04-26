@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-edge"
-version = "0.31.0"
+version = "0.32.0"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 license = "AGPL-3.0-or-later"
@@ -193,16 +193,27 @@ video-encoder-x265 = ["video-thumbnail", "video-engine/video-encoder-x265"]
 # layer; requires an NVIDIA driver at runtime and nv-codec-headers at
 # build time. Off by default.
 video-encoder-nvenc = ["video-thumbnail", "video-engine/video-encoder-nvenc"]
-# Bundle all three video encoders (x264 + x265 + NVENC). Used by the
-# GitHub Actions release matrix to produce the `*-full` artefact. At
-# runtime, operators pick the per-flow codec; NVENC activates only on
-# hosts with NVIDIA driver + hardware, otherwise x264/x265 run on CPU.
-# Inherits libx264's + libx265's GPL v2+ terms — the resulting binary
-# is an AGPL-3.0-or-later combined work (see NOTICE.full).
+# Enable Intel QuickSync hardware H.264/HEVC encoding via Intel oneVPL.
+# Royalty-free at the API layer (libvpl headers + dispatcher are
+# MIT/Apache); x86_64 only in practice. Requires `libvpl-dev` at build
+# time and the Intel media driver + libvpl runtime on the host. Off by
+# default.
+video-encoder-qsv = ["video-thumbnail", "video-engine/video-encoder-qsv"]
+# Bundle every video encoder backend (x264 + x265 + NVENC + QSV). Used
+# by the GitHub Actions release matrix to produce the `*-full` artefact
+# on x86_64. At runtime, operators pick the per-flow codec; NVENC
+# activates only on hosts with NVIDIA driver + hardware, QSV only on
+# hosts with an Intel iGPU + media driver, otherwise x264/x265 run on
+# CPU. Inherits libx264's + libx265's GPL v2+ terms — the resulting
+# binary is an AGPL-3.0-or-later combined work (see NOTICE.full).
+# `aarch64` builds intentionally drop the QSV bundle (Intel iGPU is
+# x86_64-only) and list the remaining three features explicitly in the
+# release workflow.
 video-encoders-full = [
     "video-encoder-x264",
     "video-encoder-x265",
     "video-encoder-nvenc",
+    "video-encoder-qsv",
 ]
 # Enable TLS (HTTPS on API + RTMPS) support via rustls/tokio-rustls/axum-server.
 tls = ["dep:tokio-rustls", "dep:axum-server"]

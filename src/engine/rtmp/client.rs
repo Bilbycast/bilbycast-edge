@@ -247,29 +247,35 @@ impl RtmpClient {
 
 /// Parse an RTMP URL into (host, port, app, tcUrl).
 ///
-/// Supports: `rtmp://host[:port]/app[/extra]`
-/// The stream key is NOT extracted from the URL here — it's a separate parameter.
+/// Supports: `rtmp://host[:port]/app[/extra]`. IPv6 hosts must be bracketed
+/// per RFC 3986 (`rtmp://[::1]:1935/live`). The stream key is NOT extracted
+/// from the URL here — it's a separate parameter.
 fn parse_rtmp_url(url: &str) -> Result<(String, u16, String, String)> {
-    let stripped = url.strip_prefix("rtmp://")
-        .or_else(|| url.strip_prefix("rtmps://"))
-        .ok_or_else(|| anyhow::anyhow!("RTMP URL must start with rtmp:// or rtmps://"))?;
-
-    // Split host:port from path
-    let (host_port, path) = stripped.split_once('/')
-        .ok_or_else(|| anyhow::anyhow!("RTMP URL must contain an app path"))?;
-
-    let (host, port) = if let Some((h, p)) = host_port.split_once(':') {
-        (h.to_string(), p.parse::<u16>().context("invalid port in RTMP URL")?)
-    } else {
-        (host_port.to_string(), 1935)
+    if !url.starts_with("rtmp://") && !url.starts_with("rtmps://") {
+        anyhow::bail!("RTMP URL must start with rtmp:// or rtmps://");
+    }
+    let parsed = ::url::Url::parse(url).context("invalid RTMP URL")?;
+    let (host, is_ipv6) = match parsed
+        .host()
+        .ok_or_else(|| anyhow::anyhow!("RTMP URL has no host"))?
+    {
+        ::url::Host::Domain(d) => (d.to_string(), false),
+        ::url::Host::Ipv4(ip) => (ip.to_string(), false),
+        ::url::Host::Ipv6(ip) => (ip.to_string(), true),
     };
-
-    // App is the first path segment; anything after is part of the stream key
-    // But for tcUrl we use everything up to and including the app
-    let app = path.split('/').next().unwrap_or(path).to_string();
-
-    // tcUrl is the URL up to and including the app name
-    let tc_url = format!("rtmp://{}:{}/{}", host, port, app);
+    let port = parsed.port().unwrap_or(1935);
+    let app = parsed
+        .path_segments()
+        .and_then(|mut segs| segs.next())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("RTMP URL must contain an app path"))?
+        .to_string();
+    let host_in_url = if is_ipv6 {
+        format!("[{host}]")
+    } else {
+        host.clone()
+    };
+    let tc_url = format!("{}://{}:{}/{}", parsed.scheme(), host_in_url, port, app);
 
     Ok((host, port, app, tc_url))
 }
@@ -340,5 +346,29 @@ mod tests {
         assert_eq!(port, 1935);
         assert_eq!(app, "app");
         assert_eq!(tc_url, "rtmp://syd.contribute.live-video.net:1935/app");
+    }
+
+    #[test]
+    fn test_parse_rtmp_url_ipv6_loopback() {
+        let (host, port, app, tc_url) = parse_rtmp_url("rtmp://[::1]:1935/live/stream").unwrap();
+        assert_eq!(host, "::1");
+        assert_eq!(port, 1935);
+        assert_eq!(app, "live");
+        assert_eq!(tc_url, "rtmp://[::1]:1935/live");
+    }
+
+    #[test]
+    fn test_parse_rtmp_url_ipv6_global_default_port() {
+        let (host, port, app, tc_url) = parse_rtmp_url("rtmp://[2001:db8::1]/live").unwrap();
+        assert_eq!(host, "2001:db8::1");
+        assert_eq!(port, 1935);
+        assert_eq!(app, "live");
+        assert_eq!(tc_url, "rtmp://[2001:db8::1]:1935/live");
+    }
+
+    #[test]
+    fn test_parse_rtmp_url_rejects_malformed() {
+        assert!(parse_rtmp_url("rtmp://[::1/live").is_err());
+        assert!(parse_rtmp_url("http://example.com/live").is_err());
     }
 }

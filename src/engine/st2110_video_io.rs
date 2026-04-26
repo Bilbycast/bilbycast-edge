@@ -106,6 +106,8 @@ fn build_encoder_config(
         "x265" => VideoEncoderCodec::X265,
         "h264_nvenc" => VideoEncoderCodec::H264Nvenc,
         "hevc_nvenc" => VideoEncoderCodec::HevcNvenc,
+        "h264_qsv" => VideoEncoderCodec::H264Qsv,
+        "hevc_qsv" => VideoEncoderCodec::HevcQsv,
         other => return Err(anyhow!("unknown encoder codec '{other}'")),
     };
     Ok(crate::engine::video_encode_util::build_encoder_config(
@@ -178,6 +180,7 @@ pub async fn run_st2110_20_input(
     let pair = RedBluePair::bind_input(
         &config.bind_addr,
         config.interface_addr.as_deref(),
+        config.source_addr.as_deref(),
         config.redundancy.as_ref(),
     )
     .await?;
@@ -869,6 +872,7 @@ pub async fn run_st2110_23_input(
         let pair = RedBluePair::bind_input(
             &sub.bind_addr,
             sub.interface_addr.as_deref(),
+            sub.source_addr.as_deref(),
             sub.redundancy.as_ref(),
         )
         .await?;

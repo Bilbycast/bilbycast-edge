@@ -327,7 +327,7 @@ leave the PMT untouched.
 
 ```jsonc
 "video_encode": {
-  "codec":       "x264" | "x265" | "h264_nvenc" | "hevc_nvenc",
+  "codec":       "x264" | "x265" | "h264_nvenc" | "hevc_nvenc" | "h264_qsv" | "hevc_qsv",
   "width":       1920,       // optional — see "Limitations"
   "height":      1080,       // optional — see "Limitations"
   "fps_num":     30,         // recommended — operator-supplied, no auto-detect yet
@@ -350,15 +350,19 @@ See the licensing notes in the main `bilbycast-edge/CLAUDE.md`:
 | `x265`        | `video-encoder-x265`      | `apt install libx265-dev`    | **GPL v2+** — same implications as x264. |
 | `h264_nvenc`  | `video-encoder-nvenc`     | `nv-codec-headers` + NVIDIA driver (runtime) | Royalty-free; API-layer LGPL-compatible. No GPL bundle. |
 | `hevc_nvenc`  | `video-encoder-nvenc`     | same                         | same                      |
+| `h264_qsv`    | `video-encoder-qsv`       | `apt install libvpl-dev` (build) + `libvpl2` + `intel-media-va-driver-non-free` (runtime); x86_64 only; Intel iGPU (Broadwell / 5th gen+) or Arc dGPU | Royalty-free; libvpl headers MIT, dispatcher Apache 2.0. No GPL bundle. No `--enable-nonfree` needed. |
+| `hevc_qsv`    | `video-encoder-qsv`       | same; HEVC requires Kaby Lake (7th gen) or newer | same |
 
 Default release build has no software video encoders (AGPL-only
-binary). The composite `video-encoders-full` feature bundles all
-three encoders and is used by the GitHub Actions release workflow
-to produce the `*-linux-full` variant — see
-[`docs/installation.md`](installation.md) for the two-channel
-release model. Runtime error `video encoder disabled: rebuild with
-…` surfaces when a config targets a codec whose feature flag was
-not enabled at build.
+binary). The composite `video-encoders-full` feature bundles every
+encoder backend (x264 + x265 + NVENC + QSV) and is used by the
+GitHub Actions release workflow to produce the `*-linux-full`
+variant — see [`docs/installation.md`](installation.md) for the
+two-channel release model. The `*-aarch64-linux-full` artefact
+intentionally drops QSV (Intel iGPU is x86_64-only) and lists the
+remaining three features explicitly. Runtime error `video encoder
+disabled: rebuild with …` surfaces when a config targets a codec
+whose feature flag was not enabled at build.
 
 **Commercial licensing + GPL**: bilbycast-edge source is dual-licensed
 (AGPL-3.0-or-later / commercial from Softside Tech). The Softside
@@ -376,15 +380,55 @@ bundled `NOTICE.full` for the full scope statement.
 # Linux — default build (no video encoders, matches *-linux release):
 cargo build --release
 
-# Linux — full build (bundles x264 + x265 + NVENC, matches *-linux-full release):
-sudo apt install libx264-dev libx265-dev nv-codec-headers
+# Linux x86_64 — full build (bundles x264 + x265 + NVENC + QSV, matches
+# *-x86_64-linux-full release):
+sudo apt install libx264-dev libx265-dev nv-codec-headers libvpl-dev
 cargo build --release --features video-encoders-full
+
+# Linux aarch64 — full build minus QSV (Intel iGPU is x86_64-only):
+sudo apt install libx264-dev libx265-dev nv-codec-headers
+cargo build --release --features "video-encoder-x264 video-encoder-x265 video-encoder-nvenc"
 
 # Linux — individual opt-ins (à la carte):
 cargo build --release --features video-encoder-x264
 cargo build --release --features video-encoder-x265
 cargo build --release --features video-encoder-nvenc
+cargo build --release --features video-encoder-qsv      # x86_64 only
 ```
+
+### QSV (Intel QuickSync) at runtime
+
+Once you've built with `video-encoder-qsv`, the host needs three things
+to actually exercise the encoder:
+
+1. **Hardware**: a 5th-gen (Broadwell) or newer Intel Core CPU with an
+   integrated GPU, or an Intel Arc / Battlemage discrete GPU. HEVC
+   encoding requires 7th-gen (Kaby Lake) or newer.
+2. **Runtime libraries** (Ubuntu 24.04+):
+   ```bash
+   sudo apt install libvpl2 intel-media-va-driver-non-free
+   # (intel-media-driver if you prefer the open-source upstream variant)
+   ```
+3. **Device access**: the running user must be in the `render` group so
+   it can open `/dev/dri/renderD*`:
+   ```bash
+   sudo usermod -aG render "$USER"
+   # log out + back in for the group change to take effect
+   ```
+
+If any of those are missing, `avcodec_find_encoder_by_name("h264_qsv")`
+returns null and the edge surfaces a Critical event under category
+`video_encode` for the affected output, then passthroughs the source
+video unchanged. The CPU encoders (x264, x265) still work in the same
+binary as a fallback.
+
+**QSV constraints** enforced at config validation time:
+
+- `h264_qsv` is 8-bit only — for 10-bit pick `hevc_qsv` (on Kaby Lake+).
+- Neither QSV variant supports `chroma=yuv444p`. Use `yuv420p` or
+  `yuv422p` (the latter only on supported codec / hardware combinations).
+- `hevc_qsv` is rejected on WebRTC outputs (browsers don't decode HEVC);
+  `h264_qsv` is allowed.
 
 ### Rejected combinations
 
@@ -580,6 +624,7 @@ options the current binary cannot satisfy.
 | `video-encoder-x264`        | Built with `--features video-encoder-x264`.                    |
 | `video-encoder-x265`        | Built with `--features video-encoder-x265`.                    |
 | `video-encoder-nvenc`       | Built with `--features video-encoder-nvenc`.                   |
+| `video-encoder-qsv`         | Built with `--features video-encoder-qsv` (x86_64 only).       |
 
 A follow-up will add an `st2110-video` capability flag so the manager
 UI can offer the ST 2110-20 / -23 pixel-format / partition-mode
@@ -590,7 +635,8 @@ A manager UI that wants to offer `video_encode` should check
 `video-encode` first (to decide whether to render the block at all)
 and then enable only the codec options whose backend flag is also
 present. `h264_nvenc` and `hevc_nvenc` both gate on
-`video-encoder-nvenc`.
+`video-encoder-nvenc`; `h264_qsv` and `hevc_qsv` both gate on
+`video-encoder-qsv`.
 
 See `bilbycast-edge/src/manager/client.rs::edge_capabilities` for the
 source of truth.

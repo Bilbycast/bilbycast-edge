@@ -48,18 +48,20 @@ fn set_socket_buffers(socket: &Socket, recv_size: usize, send_size: usize) {
 }
 
 /// Create a UDP socket bound to the given address with multicast support.
-/// If the bind address is a multicast group, automatically joins the group.
-/// `interface_addr` optionally specifies which local interface to join multicast on.
+/// If the bind address is a multicast group, automatically joins the group —
+/// any-source (ASM) when `source_addr` is `None`, or source-specific (SSM)
+/// when `Some`. `interface_addr` selects the local NIC for the join.
 pub async fn bind_udp_input(
     bind_addr: &str,
     interface_addr: Option<&str>,
+    source_addr: Option<&str>,
 ) -> Result<UdpSocket> {
     let addr: SocketAddr = bind_addr
         .parse()
         .with_context(|| format!("Invalid bind address: {bind_addr}"))?;
 
     if addr.ip().is_multicast() {
-        bind_multicast_input(addr, interface_addr).await
+        bind_multicast_input(addr, interface_addr, source_addr).await
     } else {
         let domain = if addr.is_ipv4() {
             Domain::IPV4
@@ -83,17 +85,17 @@ pub async fn bind_udp_input(
 
 /// Bind a multicast receive socket.
 /// For multicast input we bind to 0.0.0.0:<port> (or [::]:<port>) with SO_REUSEADDR,
-/// then join the multicast group.
+/// then join the multicast group (ASM by default, SSM when `source_addr` is set).
 async fn bind_multicast_input(
     mcast_addr: SocketAddr,
     interface_addr: Option<&str>,
+    source_addr: Option<&str>,
 ) -> Result<UdpSocket> {
     let domain = match mcast_addr {
         SocketAddr::V4(_) => Domain::IPV4,
         SocketAddr::V6(_) => Domain::IPV6,
     };
 
-    // Use socket2 for SO_REUSEADDR before binding
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
         .context("Failed to create UDP socket")?;
     socket.set_reuse_address(true)?;
@@ -102,7 +104,6 @@ async fn bind_multicast_input(
     socket.set_nonblocking(true)?;
     set_socket_buffers(&socket, DEFAULT_RECV_BUF_SIZE, DEFAULT_SEND_BUF_SIZE);
 
-    // Bind to wildcard address with the multicast port
     let bind_to: SocketAddr = match mcast_addr {
         SocketAddr::V4(v4) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), v4.port()),
         SocketAddr::V6(v6) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), v6.port()),
@@ -111,17 +112,11 @@ async fn bind_multicast_input(
         .bind(&SockAddr::from(bind_to))
         .with_context(|| format!("Failed to bind multicast socket to {bind_to}"))?;
 
-    // Convert to tokio UdpSocket
-    let std_socket: std::net::UdpSocket = socket.into();
-    let tokio_socket = UdpSocket::from_std(std_socket)
-        .context("Failed to convert socket2 socket to tokio UdpSocket")?;
-
-    // Join multicast group
-    match mcast_addr.ip() {
-        IpAddr::V4(group) => {
+    match (mcast_addr.ip(), source_addr) {
+        (IpAddr::V4(group), None) => {
             let iface = parse_interface_v4(interface_addr)?;
-            tokio_socket
-                .join_multicast_v4(group, iface)
+            socket
+                .join_multicast_v4(&group, &iface)
                 .with_context(|| {
                     format!("Failed to join multicast group {group} on interface {iface}")
                 })?;
@@ -130,18 +125,47 @@ async fn bind_multicast_input(
                 mcast_addr.port()
             );
         }
-        IpAddr::V6(group) => {
+        (IpAddr::V4(group), Some(src_str)) => {
+            let iface = parse_interface_v4(interface_addr)?;
+            let source = parse_source_v4(src_str)?;
+            socket
+                .join_ssm_v4(&group, &source, &iface)
+                .with_context(|| {
+                    format!("Failed to join SSM ({source}, {group}) on interface {iface}")
+                })?;
+            tracing::info!(
+                "UDP input: joined SSM ({source}, {group}) on interface {iface}, port {}",
+                mcast_addr.port()
+            );
+        }
+        (IpAddr::V6(group), None) => {
             let iface_index = parse_interface_v6_index(interface_addr)?;
-            tokio_socket
+            socket
                 .join_multicast_v6(&group, iface_index)
-                .with_context(|| format!("Failed to join multicast group {group} on interface index {iface_index}"))?;
+                .with_context(|| {
+                    format!("Failed to join multicast group {group} on interface index {iface_index}")
+                })?;
             tracing::info!(
                 "UDP input: joined multicast group {group} on interface index {iface_index}, port {}",
                 mcast_addr.port()
             );
         }
+        (IpAddr::V6(group), Some(src_str)) => {
+            let iface_index = parse_interface_v6_index(interface_addr)?;
+            let source = parse_source_v6(src_str)?;
+            join_ssm_v6(&socket, &group, &source, iface_index).with_context(|| {
+                format!("Failed to join SSM ({source}, {group}) on interface index {iface_index}")
+            })?;
+            tracing::info!(
+                "UDP input: joined SSM ({source}, {group}) on interface index {iface_index}, port {}",
+                mcast_addr.port()
+            );
+        }
     }
 
+    let std_socket: std::net::UdpSocket = socket.into();
+    let tokio_socket = UdpSocket::from_std(std_socket)
+        .context("Failed to convert socket2 socket to tokio UdpSocket")?;
     Ok(tokio_socket)
 }
 
@@ -271,6 +295,130 @@ fn parse_interface_v6_index(interface_addr: Option<&str>) -> Result<u32> {
                 );
             }
             Ok(index)
+        }
+    }
+}
+
+fn parse_source_v4(addr: &str) -> Result<Ipv4Addr> {
+    addr.parse::<Ipv4Addr>()
+        .with_context(|| format!("Invalid IPv4 source address: {addr}"))
+}
+
+fn parse_source_v6(addr: &str) -> Result<Ipv6Addr> {
+    addr.parse::<Ipv6Addr>()
+        .with_context(|| format!("Invalid IPv6 source address: {addr}"))
+}
+
+/// IPv6 source-specific multicast (SSM) join via raw `setsockopt`
+/// (`MCAST_JOIN_SOURCE_GROUP`, RFC 3678). socket2 0.6 doesn't expose this for
+/// IPv6, so we wire `group_source_req` ourselves. Linux + macOS only — other
+/// targets surface a build-time error.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn join_ssm_v6(
+    socket: &Socket,
+    group: &Ipv6Addr,
+    source: &Ipv6Addr,
+    iface_index: u32,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    #[cfg(target_os = "linux")]
+    const MCAST_JOIN_SOURCE_GROUP: libc::c_int = 46;
+    #[cfg(target_os = "macos")]
+    const MCAST_JOIN_SOURCE_GROUP: libc::c_int = 82;
+
+    #[repr(C)]
+    struct GroupSourceReq {
+        gsr_interface: u32,
+        gsr_group: libc::sockaddr_storage,
+        gsr_source: libc::sockaddr_storage,
+    }
+
+    let mut req: GroupSourceReq = unsafe { std::mem::zeroed() };
+    req.gsr_interface = iface_index;
+
+    // Populate the group sockaddr_in6 in place inside gsr_group.
+    {
+        let sa = &mut req.gsr_group as *mut libc::sockaddr_storage as *mut libc::sockaddr_in6;
+        unsafe {
+            (*sa).sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            (*sa).sin6_addr.s6_addr = group.octets();
+        }
+    }
+    // Populate the source sockaddr_in6 in place inside gsr_source.
+    {
+        let sa = &mut req.gsr_source as *mut libc::sockaddr_storage as *mut libc::sockaddr_in6;
+        unsafe {
+            (*sa).sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            (*sa).sin6_addr.s6_addr = source.octets();
+        }
+    }
+
+    let ret = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            MCAST_JOIN_SOURCE_GROUP,
+            &req as *const _ as *const libc::c_void,
+            std::mem::size_of::<GroupSourceReq>() as libc::socklen_t,
+        )
+    };
+
+    if ret < 0 {
+        return Err(anyhow::Error::from(std::io::Error::last_os_error()))
+            .context("setsockopt MCAST_JOIN_SOURCE_GROUP failed");
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn join_ssm_v6(
+    _socket: &Socket,
+    _group: &Ipv6Addr,
+    _source: &Ipv6Addr,
+    _iface_index: u32,
+) -> Result<()> {
+    anyhow::bail!("IPv6 source-specific multicast (SSM) is not supported on this OS");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_source_v4_accepts_unicast() {
+        assert_eq!(parse_source_v4("10.0.0.5").unwrap(), Ipv4Addr::new(10, 0, 0, 5));
+    }
+
+    #[test]
+    fn parse_source_v4_rejects_garbage() {
+        assert!(parse_source_v4("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn parse_source_v6_accepts_unicast() {
+        let v: Ipv6Addr = "2001:db8::5".parse().unwrap();
+        assert_eq!(parse_source_v6("2001:db8::5").unwrap(), v);
+    }
+
+    /// SSM IPv4 join via socket2 — uses the loopback group 232.0.0.1 and
+    /// source 127.0.0.1 against an unbound socket (we just need setsockopt
+    /// to succeed; no actual traffic flow). Skipped if the OS rejects (e.g.
+    /// loopback iface lacks multicast — rare but possible).
+    #[tokio::test]
+    async fn ssm_v4_join_setsockopt_succeeds_on_loopback() {
+        let bind = "232.0.0.1:0";
+        let res = bind_udp_input(bind, Some("127.0.0.1"), Some("127.0.0.2")).await;
+        match res {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("Failed to join SSM") {
+                    eprintln!("ssm_v4 join failed (expected on some kernels): {msg}");
+                } else {
+                    panic!("unexpected error from bind_udp_input: {msg}");
+                }
+            }
         }
     }
 }

@@ -34,7 +34,7 @@ See the root `CLAUDE.md` for the full backend comparison and switching instructi
 
 ## Feature Flags
 
-See the root `CLAUDE.md` feature flag table for the canonical list, defaults, and build prerequisites. Default `cargo build` produces an AGPL-only binary with no software video encoders; `video-encoder-x264` / `-x265` / `-nvenc` are opt-in (GPL or vendor-specific) and bundled by the `video-encoders-full` composite. The GitHub Actions release workflow ships two binary variants per architecture — a default (AGPL-only) and a full (AGPL + GPL bundle) — see `docs/installation.md` for the release channel reference and `docs/transcoding.md` for the full transcoding reference.
+See the root `CLAUDE.md` feature flag table for the canonical list, defaults, and build prerequisites. Default `cargo build` produces an AGPL-only binary with no software video encoders; `video-encoder-x264` / `-x265` / `-nvenc` / `-qsv` are opt-in (GPL or vendor-specific) and bundled by the `video-encoders-full` composite. The GitHub Actions release workflow ships two binary variants per architecture — a default (AGPL-only) and a full (AGPL + GPL bundle) — and the `*-x86_64-linux-full` variant additionally bundles QSV (Intel oneVPL); the `*-aarch64-linux-full` variant omits QSV because Intel iGPU is x86_64-only. See `docs/installation.md` for the release channel reference and `docs/transcoding.md` for the full transcoding reference.
 
 ## Architecture Overview
 

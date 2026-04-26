@@ -416,7 +416,11 @@ async fn run(
             }
             _ = silence_tick => {
                 if let Some(reenc) = state.audio_reencoder.as_mut() {
-                    match tokio::task::block_in_place(|| reenc.encode_silence_if_needed()) {
+                    match crate::timed_block_in_place!(
+                        "cmaf.audio_silence_encode",
+                        crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
+                        { reenc.encode_silence_if_needed() }
+                    ) {
                         Ok(frames) if !frames.is_empty() => {
                             if let Some(seg) = state.audio_seg.as_mut() {
                                 for (data, pts) in frames {
@@ -606,9 +610,11 @@ async fn handle_video(
     let pushed_nalus: Vec<Vec<u8>>;
     let pushed_is_keyframe: bool;
     if let Some(reenc) = state.video_reencoder.as_mut() {
-        let recoded = tokio::task::block_in_place(|| {
-            reenc.encode_frame(&nalus, pts, is_keyframe, codec)
-        });
+        let recoded = crate::timed_block_in_place!(
+            "cmaf.video_reencoder",
+            crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
+            { reenc.encode_frame(&nalus, pts, is_keyframe, codec) }
+        );
         match recoded {
             Ok(Some(out)) => {
                 pushed_nalus = out.nalus;
@@ -888,7 +894,11 @@ fn handle_audio_frame(
         if let Some((profile, sr_idx, ch_cfg)) = demuxer.cached_aac_config() {
             reenc.set_adts_config(profile, sr_idx, ch_cfg);
         }
-        match tokio::task::block_in_place(|| reenc.encode_aac_frame(data, pts)) {
+        match crate::timed_block_in_place!(
+            "cmaf.audio_reencoder",
+            crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
+            { reenc.encode_aac_frame(data, pts) }
+        ) {
             Ok(out) => out,
             Err(e) => {
                 tracing::warn!("CMAF output '{}': audio re-encode failed: {e}", config.id);

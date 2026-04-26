@@ -881,9 +881,13 @@ async fn srt_output_forward_loop(
                             let mut a_out: Vec<u8> = Vec::new();
                             let after_audio: &[u8] =
                                 if let Some(replacer) = audio_replacer.as_mut() {
-                                    tokio::task::block_in_place(|| {
-                                        replacer.process(ts_in, &mut a_out);
-                                    });
+                                    crate::timed_block_in_place!(
+                                        "output_srt.audio_replacer",
+                                        crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
+                                        {
+                                            replacer.process(ts_in, &mut a_out);
+                                        }
+                                    );
                                     &a_out
                                 } else {
                                     ts_in
@@ -892,9 +896,13 @@ async fn srt_output_forward_loop(
                             let mut v_out: Vec<u8> = Vec::new();
                             let final_bytes: &[u8] =
                                 if let Some(vreplacer) = video_replacer.as_mut() {
-                                    tokio::task::block_in_place(|| {
-                                        vreplacer.process(after_audio, &mut v_out);
-                                    });
+                                    crate::timed_block_in_place!(
+                                        "output_srt.video_replacer",
+                                        crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
+                                        {
+                                            vreplacer.process(after_audio, &mut v_out);
+                                        }
+                                    );
                                     &v_out
                                 } else {
                                     after_audio

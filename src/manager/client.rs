@@ -204,7 +204,7 @@ pub fn start_manager_client(
     api_addr: String,
     monitor_addr: Option<String>,
     webrtc_sessions: WebrtcRegistry,
-    event_rx: mpsc::UnboundedReceiver<Event>,
+    event_rx: mpsc::Receiver<Event>,
     resource_state: Arc<SystemResourceState>,
     standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -228,7 +228,7 @@ async fn manager_client_loop(
     api_addr: String,
     monitor_addr: Option<String>,
     webrtc_sessions: WebrtcRegistry,
-    mut event_rx: mpsc::UnboundedReceiver<Event>,
+    mut event_rx: mpsc::Receiver<Event>,
     resource_state: Arc<SystemResourceState>,
     standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
 ) {
@@ -333,7 +333,7 @@ async fn try_connect(
     api_addr: &str,
     monitor_addr: Option<&str>,
     webrtc_sessions: &WebrtcRegistry,
-    event_rx: &mut mpsc::UnboundedReceiver<Event>,
+    event_rx: &mut mpsc::Receiver<Event>,
     resource_state: &Arc<SystemResourceState>,
     standby_listeners: &Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
 ) -> Result<ConnectResult, String> {
@@ -822,7 +822,8 @@ fn edge_capabilities() -> Vec<&'static str> {
     if cfg!(any(
         feature = "video-encoder-x264",
         feature = "video-encoder-x265",
-        feature = "video-encoder-nvenc"
+        feature = "video-encoder-nvenc",
+        feature = "video-encoder-qsv"
     )) {
         caps.push("video-encode");
     }
@@ -834,6 +835,9 @@ fn edge_capabilities() -> Vec<&'static str> {
     }
     if cfg!(feature = "video-encoder-nvenc") {
         caps.push("video-encoder-nvenc");
+    }
+    if cfg!(feature = "video-encoder-qsv") {
+        caps.push("video-encoder-qsv");
     }
     if cfg!(feature = "fdk-aac") {
         caps.push("fdk-aac");

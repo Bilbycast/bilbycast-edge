@@ -5,20 +5,29 @@
 //!
 //! Components throughout the edge (flow engine, SRT, tunnels, etc.) hold an
 //! `EventSender` clone and call its helper methods to report state changes.
-//! Events are queued in an unbounded mpsc channel and drained by the manager
+//! Events are queued in a bounded mpsc channel and drained by the manager
 //! WebSocket client loop.
 //!
-//! When not connected to the manager, events accumulate in the channel and are
-//! sent once the connection is (re-)established. The channel is unbounded because
-//! events are infrequent relative to stats — this avoids backpressure on callers.
+//! When not connected to the manager, events accumulate up to
+//! [`EVENT_CHANNEL_CAPACITY`] and then start dropping with tail-drop semantics
+//! (oldest events stay; newest are discarded). A sampled `tracing::warn!` is
+//! emitted at most once per second carrying the running drop count, so a
+//! sustained event storm does not spam the log. Sending never blocks.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use bonding_transport::{PathDeadReason, PathEvent, PathEventKind, PathId};
+
+/// Capacity of the manager event channel. Events are infrequent relative to
+/// stats; this size lets a manager outage of several minutes pass without
+/// drops at typical event rates, while bounding worst-case memory under a
+/// pathological error storm + sustained manager disconnect.
+pub const EVENT_CHANNEL_CAPACITY: usize = 4096;
 
 /// Event severity levels matching the manager's `EventSeverity` enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,12 +82,27 @@ struct RecentCriticalTracker {
 
 /// Clonable handle for sending events from any component.
 ///
-/// Sending never blocks or fails — if the receiver is dropped (manager client
-/// not running), events are silently discarded.
+/// Sending never blocks. If the receiver is dropped (manager client not
+/// running) or the bounded channel is full, events are silently discarded —
+/// channel-full events bump a sampled drop counter that emits one
+/// `tracing::warn!` per second so a storm is visible without log spam.
 #[derive(Debug, Clone)]
 pub struct EventSender {
-    tx: mpsc::UnboundedSender<Event>,
+    tx: mpsc::Sender<Event>,
     recent: std::sync::Arc<RecentCriticalTracker>,
+    drop_state: std::sync::Arc<EventDropState>,
+}
+
+/// Sampled drop accounting for the bounded event channel.
+#[derive(Debug, Default)]
+struct EventDropState {
+    /// Total events dropped because the channel was full.
+    total_dropped: AtomicU64,
+    /// Drops accumulated since the last warning was logged.
+    pending_dropped: AtomicU64,
+    /// Microsecond timestamp of the last warning, used to rate-limit logs to
+    /// at most one per second.
+    last_warn_us: AtomicU64,
 }
 
 impl EventSender {
@@ -106,7 +130,9 @@ impl EventSender {
                 g.insert(fid.clone(), entry);
             }
         }
-        let _ = self.tx.send(event);
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(event) {
+            self.drop_state.note_dropped();
+        }
     }
 
     /// Consume and return the most recent critical event for `flow_id` whose
@@ -679,13 +705,48 @@ fn path_dead_reason_tag(reason: &PathDeadReason) -> &'static str {
     }
 }
 
+impl EventDropState {
+    fn note_dropped(&self) {
+        self.total_dropped.fetch_add(1, Ordering::Relaxed);
+        self.pending_dropped.fetch_add(1, Ordering::Relaxed);
+        let now_us = crate::util::time::now_us();
+        let last = self.last_warn_us.load(Ordering::Relaxed);
+        if now_us.saturating_sub(last) < 1_000_000 {
+            return;
+        }
+        if self
+            .last_warn_us
+            .compare_exchange(last, now_us, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let pending = self.pending_dropped.swap(0, Ordering::Relaxed);
+        let total = self.total_dropped.load(Ordering::Relaxed);
+        tracing::warn!(
+            dropped = pending,
+            total_dropped = total,
+            capacity = EVENT_CHANNEL_CAPACITY,
+            "manager event channel full — dropping newest events",
+        );
+    }
+}
+
 /// Create an event sender/receiver pair.
 ///
 /// The sender is cloned into components; the receiver is consumed by the
-/// manager WebSocket client loop.
-pub fn event_channel() -> (EventSender, mpsc::UnboundedReceiver<Event>) {
-    let (tx, rx) = mpsc::unbounded_channel();
-    (EventSender { tx, recent: std::sync::Arc::new(RecentCriticalTracker::default()) }, rx)
+/// manager WebSocket client loop. The channel is bounded — see
+/// [`EVENT_CHANNEL_CAPACITY`].
+pub fn event_channel() -> (EventSender, mpsc::Receiver<Event>) {
+    let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    (
+        EventSender {
+            tx,
+            recent: std::sync::Arc::new(RecentCriticalTracker::default()),
+            drop_state: std::sync::Arc::new(EventDropState::default()),
+        },
+        rx,
+    )
 }
 
 #[cfg(test)]

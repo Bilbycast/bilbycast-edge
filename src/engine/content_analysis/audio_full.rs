@@ -53,11 +53,39 @@ const SILENCE_DEBOUNCE: Duration = Duration::from_secs(2);
 /// 0.9975 maps to the standard -0.02 dBFS clipping convention used by
 /// broadcast R128 meters.
 const CLIP_MAGNITUDE: f32 = 0.9975;
-/// Consecutive all-zero samples that count as hard-mute. At 48 kHz this is
-/// ≈ 41.7 ms — short enough to catch a real hard-mute, long enough to
-/// ignore a single bad packet or silence-padding transient.
-const HARD_MUTE_RUN: u64 = 2_000;
+/// Hard-mute requires at least this many milliseconds of all-zero samples.
+/// Translated to a sample count at compare time via
+/// [`hard_mute_threshold_samples`] so the duration stays fixed across
+/// 44.1 / 48 / 88.2 / 96 / 192 kHz inputs (the previous fixed
+/// `2_000`-sample constant only matched ~41.7 ms at 48 kHz and dropped to
+/// ~20.8 ms at 96 kHz, which silently shortened the trigger window).
+const HARD_MUTE_DURATION_MS: u64 = 40;
 const EVENT_RATELIMIT: Duration = Duration::from_secs(30);
+
+/// Convert the configured hard-mute duration into a sample count for the
+/// given audio sample rate. Falls back to the 48 kHz equivalent when the
+/// rate is unknown (zero) so a state object that hasn't yet seen its first
+/// frame still has a sane threshold.
+fn hard_mute_threshold_samples(sample_rate: u32) -> u64 {
+    let rate = if sample_rate == 0 { 48_000 } else { sample_rate } as u64;
+    rate * HARD_MUTE_DURATION_MS / 1_000
+}
+
+/// Query `EbuR128::prev_true_peak` (the BS.1770 polyphase-oversampled
+/// true-peak estimate from the most recent `add_frames` call) on every
+/// channel and bump `window` if any channel's dBTP exceeds it. Returns
+/// silently when the R128 instance was constructed without `TRUE_PEAK`
+/// mode, which keeps callers branch-free.
+fn update_window_true_peak(r128: &EbuR128, channels: u32, window: &mut Option<f64>) {
+    for ch in 0..channels {
+        if let Ok(linear) = r128.prev_true_peak(ch) {
+            if linear > 0.0 {
+                let dbtp = 20.0 * linear.log10();
+                *window = Some(window.map_or(dbtp, |prev| prev.max(dbtp)));
+            }
+        }
+    }
+}
 
 /// Selects how the Audio Full analyser parses incoming broadcast packets.
 #[derive(Debug, Clone, Copy)]
@@ -175,13 +203,20 @@ struct AudioPidState {
     clip_rate_pps: f64,
 
     /// Hard-mute detection: track consecutive all-zero samples across
-    /// channels. Resets on any non-zero.
+    /// channels. Resets on any non-zero. The threshold is sample-rate
+    /// normalised at compare time via `hard_mute_threshold_samples()` so
+    /// the underlying duration stays fixed regardless of sample rate.
     zero_sample_run: u64,
     hard_mute_active: bool,
 
-    /// True-peak in linear scale (max |sample| observed this publish window).
-    true_peak_linear: f32,
-    /// Last-published true-peak in dBTP.
+    /// Per-publish-window max BS.1770 true-peak (dBTP) across all channels.
+    /// Sourced from `EbuR128::prev_true_peak` after every `add_frames` call,
+    /// which already applies the spec-defined 4× polyphase oversampling
+    /// (drops to 2× at 96 kHz, no oversample at 192 kHz). Reset to `None`
+    /// on every `tick()` after the snapshot is published, so the published
+    /// value reflects only the most recent ~500 ms of audio.
+    window_true_peak_dbtp: Option<f64>,
+    /// Last-published true-peak in dBTP (snapshot exposed on the wire).
     last_true_peak_dbtp: Option<f32>,
 
     /// Silence state + event debounce.
@@ -221,7 +256,7 @@ impl AudioPidState {
             clip_rate_pps: 0.0,
             zero_sample_run: 0,
             hard_mute_active: false,
-            true_peak_linear: 0.0,
+            window_true_peak_dbtp: None,
             last_true_peak_dbtp: None,
             silent_since: None,
             likely_silent: false,
@@ -355,16 +390,14 @@ impl AudioPidState {
         }
         let channels = planar.len();
         let frames = planar[0].len();
-        // Track mute / clip / true-peak on interleaved samples without
-        // actually re-interleaving — walk by frame index.
+        // Mute + clip detection on raw samples. True peak is sourced from
+        // ebur128's polyphase oversampler below — sample magnitude misses
+        // inter-sample peaks (the difference broadcast meters care about).
         for i in 0..frames {
             let mut all_zero = true;
             for ch in 0..channels {
                 let s = planar[ch].get(i).copied().unwrap_or(0.0);
                 let mag = s.abs();
-                if mag > self.true_peak_linear {
-                    self.true_peak_linear = mag;
-                }
                 if mag >= CLIP_MAGNITUDE {
                     self.clip_samples_this_second += 1;
                 }
@@ -378,11 +411,8 @@ impl AudioPidState {
                 self.zero_sample_run = 0;
             }
         }
-        if self.zero_sample_run >= HARD_MUTE_RUN {
-            self.hard_mute_active = true;
-        } else {
-            self.hard_mute_active = false;
-        }
+        let mute_threshold = hard_mute_threshold_samples(self.r128_sample_rate);
+        self.hard_mute_active = self.zero_sample_run >= mute_threshold;
 
         // Feed R128 — it wants interleaved f32. Build a scratch buffer
         // sized to this PCM block only (no long-lived allocation).
@@ -393,7 +423,9 @@ impl AudioPidState {
                     interleaved.push(planar[ch].get(i).copied().unwrap_or(0.0));
                 }
             }
-            let _ = r128.add_frames_f32(&interleaved);
+            if r128.add_frames_f32(&interleaved).is_ok() {
+                update_window_true_peak(r128, self.r128_channels, &mut self.window_true_peak_dbtp);
+            }
         }
 
         // Update clip rolling rate every second.
@@ -412,12 +444,12 @@ impl AudioPidState {
             self.last_lufs_i = r128.loudness_global().ok();
             self.last_lra = r128.loudness_range().ok();
         }
-        if self.true_peak_linear > 0.0 {
-            self.last_true_peak_dbtp = Some(20.0 * self.true_peak_linear.log10());
+        if let Some(dbtp) = self.window_true_peak_dbtp {
+            self.last_true_peak_dbtp = Some(dbtp as f32);
         }
-        // Reset true-peak window after snapshotting so it reflects recent
-        // peak, not historical.
-        self.true_peak_linear = 0.0;
+        // Reset true-peak window after snapshotting so it reflects the next
+        // window, not historical maxima.
+        self.window_true_peak_dbtp = None;
 
         // Silence detection — prefer PCM-level (momentary dBFS); fall back
         // to bitrate collapse if we have no decoder.
@@ -719,7 +751,9 @@ struct PcmAudioState {
     clip_rate_pps: f64,
     zero_sample_run: u64,
     hard_mute_active: bool,
-    true_peak_linear: f32,
+    /// Per-publish-window max BS.1770 true-peak (dBTP) across all channels —
+    /// queried from `EbuR128::prev_true_peak` after every `add_frames` call.
+    window_true_peak_dbtp: Option<f64>,
     last_true_peak_dbtp: Option<f32>,
 
     silent_since: Option<Instant>,
@@ -771,7 +805,7 @@ impl PcmAudioState {
             clip_rate_pps: 0.0,
             zero_sample_run: 0,
             hard_mute_active: false,
-            true_peak_linear: 0.0,
+            window_true_peak_dbtp: None,
             last_true_peak_dbtp: None,
             silent_since: None,
             likely_silent: false,
@@ -844,16 +878,15 @@ impl PcmAudioState {
             AudioFullMode::Ts => return,
         }
 
-        // Per-sample mute / clip / true-peak tracking.
+        // Mute + clip on raw samples. True peak comes from ebur128's
+        // polyphase oversampler below — sample magnitude misses inter-sample
+        // peaks (the difference broadcast meters care about).
         let frames = self.interleaved_scratch.len() / channels;
         for i in 0..frames {
             let mut all_zero = true;
             for ch in 0..channels {
                 let s = self.interleaved_scratch[i * channels + ch];
                 let mag = s.abs();
-                if mag > self.true_peak_linear {
-                    self.true_peak_linear = mag;
-                }
                 if mag >= CLIP_MAGNITUDE {
                     self.clip_samples_this_second += 1;
                 }
@@ -867,11 +900,18 @@ impl PcmAudioState {
                 self.zero_sample_run = 0;
             }
         }
-        self.hard_mute_active = self.zero_sample_run >= HARD_MUTE_RUN;
+        let mute_threshold = hard_mute_threshold_samples(self.sample_rate);
+        self.hard_mute_active = self.zero_sample_run >= mute_threshold;
 
         // Feed R128 with the interleaved buffer (ebur128 wants interleaved).
         if let Some(ref mut r128) = self.r128 {
-            let _ = r128.add_frames_f32(&self.interleaved_scratch);
+            if r128.add_frames_f32(&self.interleaved_scratch).is_ok() {
+                update_window_true_peak(
+                    r128,
+                    self.channels as u32,
+                    &mut self.window_true_peak_dbtp,
+                );
+            }
         }
 
         if self.clip_run_sec_start.elapsed() >= Duration::from_secs(1) {
@@ -888,10 +928,10 @@ impl PcmAudioState {
             self.last_lufs_i = r128.loudness_global().ok();
             self.last_lra = r128.loudness_range().ok();
         }
-        if self.true_peak_linear > 0.0 {
-            self.last_true_peak_dbtp = Some(20.0 * self.true_peak_linear.log10());
+        if let Some(dbtp) = self.window_true_peak_dbtp {
+            self.last_true_peak_dbtp = Some(dbtp as f32);
         }
-        self.true_peak_linear = 0.0;
+        self.window_true_peak_dbtp = None;
 
         let now = Instant::now();
         let pcm_loudness = self.last_lufs_m;

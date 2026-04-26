@@ -707,6 +707,7 @@ mod tests {
                 config: InputConfig::Rtp(RtpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
                     interface_addr: None,
+                    source_addr: None,
                     fec_decode: None,
                     allowed_sources: None,
                     allowed_payload_types: None,

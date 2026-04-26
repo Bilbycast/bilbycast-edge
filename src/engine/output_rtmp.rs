@@ -889,6 +889,8 @@ fn resolve_backend(
         "x265" => Some(video_codec::VideoEncoderCodec::X265),
         "h264_nvenc" => Some(video_codec::VideoEncoderCodec::H264Nvenc),
         "hevc_nvenc" => Some(video_codec::VideoEncoderCodec::HevcNvenc),
+        "h264_qsv" => Some(video_codec::VideoEncoderCodec::H264Qsv),
+        "hevc_qsv" => Some(video_codec::VideoEncoderCodec::HevcQsv),
         other => {
             let msg = format!(
                 "RTMP output '{}': video_encode unknown codec '{other}'",
@@ -1172,6 +1174,9 @@ fn open_video_active(
         video_codec::VideoEncoderCodec::H264Nvenc | video_codec::VideoEncoderCodec::HevcNvenc => {
             "nvenc"
         }
+        video_codec::VideoEncoderCodec::H264Qsv | video_codec::VideoEncoderCodec::HevcQsv => {
+            "qsv"
+        }
     };
     let target_codec = match target_family {
         video_codec::VideoCodec::H264 => "h264",
@@ -1258,8 +1263,10 @@ async fn encode_one_frame(
     // tokio reactor isn't held while we spend single-digit milliseconds
     // per frame.
     let annex_b = nalus_to_annex_b(src.nalus());
-    let block_result: Result<Vec<(Vec<u8>, bool, i64)>, String> =
-        tokio::task::block_in_place(|| -> Result<Vec<(Vec<u8>, bool, i64)>, String> {
+    let block_result: Result<Vec<(Vec<u8>, bool, i64)>, String> = crate::timed_block_in_place!(
+        "output_rtmp.video_encoder",
+        crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
+        {
             active.stats.input_frames.fetch_add(1, Ordering::Relaxed);
             if let Err(e) = active.decoder.send_packet(&annex_b) {
                 tracing::debug!("RTMP output '{}': decoder send_packet: {e:?}", config.id);
@@ -1305,7 +1312,8 @@ async fn encode_one_frame(
                 }
             }
             Ok(out)
-        });
+        }
+    );
 
     // Only encoder *open* failure flips us to Failed. Decoder priming —
     // when the H.264/HEVC decoder needs several access units before it

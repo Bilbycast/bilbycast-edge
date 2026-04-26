@@ -94,8 +94,40 @@ To use NVENC in a flow config, set `codec: "h264_nvenc"` or
 ```
 
 On a host without an NVIDIA driver, select `codec: "x264"` or
-`"x265"` instead. The same binary supports all three encoders; the
-choice is per-flow.
+`"x265"` instead. The same binary supports every compiled-in
+encoder; the choice is per-flow.
+
+### Running on an Intel host (QuickSync / QSV)
+
+The `*-x86_64-linux-full` binary also includes Intel QuickSync
+(QSV) via Intel oneVPL. The `*-aarch64-linux-full` binary does not
+— Intel iGPUs are x86_64-only.
+
+Install the runtime libraries and grant device access:
+
+```bash
+sudo apt install libvpl2 intel-media-va-driver-non-free
+# (or `intel-media-driver` for the open-source upstream variant)
+sudo usermod -aG render "$USER"
+# log out + back in for the group change to take effect
+```
+
+To use QSV in a flow config, set `codec: "h264_qsv"` or
+`"hevc_qsv"` on the `video_encode` block:
+
+```json
+"video_encode": {
+  "codec": "h264_qsv",
+  "bitrate_kbps": 4000,
+  "preset": "medium"
+}
+```
+
+QSV requires a 5th-gen (Broadwell) or newer Intel Core CPU for
+H.264; HEVC requires 7th-gen (Kaby Lake) or newer. On a host
+without an Intel iGPU + media driver, select `codec: "x264"` /
+`"x265"` (or `"h264_nvenc"` / `"hevc_nvenc"` if NVIDIA is also
+present) instead.
 
 ---
 
@@ -122,7 +154,10 @@ For the full variant, also install the video encoder development
 packages:
 
 ```bash
+# All architectures: x264, x265, NVENC headers
 sudo apt install libx264-dev libx265-dev nv-codec-headers
+# x86_64 only: Intel oneVPL (QSV)
+sudo apt install libvpl-dev
 ```
 
 Clone the repositories (bilbycast-edge plus its path-dependency
@@ -203,11 +238,12 @@ bundled-library manifest.
   `*-full` variant regardless of what commercial licence you hold
   for bilbycast. Commercial deployments that need to avoid GPL
   copyleft entirely should use the default (`*-linux`) variant or
-  build with `--features video-encoder-nvenc` (NVENC's API layer is
-  LGPL-compatible; NVIDIA covers the H.264/H.265 patent pools at
-  the hardware/driver layer).
+  build with `--features video-encoder-nvenc` and/or `--features
+  video-encoder-qsv` only (NVENC's and QSV's API layers are both
+  LGPL-compatible; NVIDIA / Intel cover the H.264 / H.265 patent
+  pools at the hardware / driver layer).
 - H.264 / H.265 patent licensing (MPEG-LA, Access Advance, Velos
   Media) is **your responsibility** in commercial deployments,
   regardless of which variant you choose. NVENC on NVIDIA hardware
-  is often the lowest-friction path because NVIDIA pays the pools
-  at the hardware layer.
+  and QSV on Intel hardware are often the lowest-friction paths
+  because NVIDIA / Intel pay the pools at the hardware layer.

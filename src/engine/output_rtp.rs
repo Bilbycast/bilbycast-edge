@@ -466,18 +466,26 @@ async fn rtp_output_loop(
                 // Chain: ts_input → audio_replacer → video_replacer → ts_realign_buf.
                 let after_audio: &[u8] = if let Some(ref mut replacer) = audio_replacer {
                     replace_scratch.clear();
-                    tokio::task::block_in_place(|| {
-                        replacer.process(ts_input, &mut replace_scratch);
-                    });
+                    crate::timed_block_in_place!(
+                        "output_rtp.audio_replacer",
+                        crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
+                        {
+                            replacer.process(ts_input, &mut replace_scratch);
+                        }
+                    );
                     &replace_scratch
                 } else {
                     ts_input
                 };
                 if let Some(ref mut vreplacer) = video_replacer {
                     video_replace_scratch.clear();
-                    tokio::task::block_in_place(|| {
-                        vreplacer.process(after_audio, &mut video_replace_scratch);
-                    });
+                    crate::timed_block_in_place!(
+                        "output_rtp.video_replacer",
+                        crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
+                        {
+                            vreplacer.process(after_audio, &mut video_replace_scratch);
+                        }
+                    );
                     ts_realign_buf.extend_from_slice(&video_replace_scratch);
                 } else {
                     ts_realign_buf.extend_from_slice(after_audio);

@@ -899,6 +899,13 @@ pub struct RtpInputConfig {
     /// Network interface IP for multicast join (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interface_addr: Option<String>,
+    /// Optional source address for source-specific multicast (SSM, RFC 3678).
+    /// When set on a multicast `bind_addr`, the kernel filters to only this
+    /// source — skips PIM-RP, gives per-source filtering. Required by many
+    /// ST 2110 / ST 2059 broadcast plants. Must be unicast and the same
+    /// address family as `bind_addr`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_addr: Option<String>,
     /// Optional: decode incoming SMPTE 2022-1 FEC before forwarding
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fec_decode: Option<FecConfig>,
@@ -953,6 +960,9 @@ pub struct UdpInputConfig {
     /// Network interface IP for multicast join (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interface_addr: Option<String>,
+    /// Source-specific multicast (SSM) source — see `RtpInputConfig::source_addr`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_addr: Option<String>,
     /// Optional ingress audio re-encode. See [`RtpInputConfig::audio_encode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_encode: Option<AudioEncodeConfig>,
@@ -1546,7 +1556,8 @@ pub struct RtpOutputConfig {
     /// re-scales, re-encodes via the configured backend, and muxes the
     /// resulting bitstream back into the output TS. Availability of each
     /// backend depends on the Cargo features enabled at build time
-    /// (`video-encoder-x264`, `video-encoder-x265`, `video-encoder-nvenc`).
+    /// (`video-encoder-x264`, `video-encoder-x265`, `video-encoder-nvenc`,
+    /// `video-encoder-qsv`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
 }
@@ -2030,6 +2041,11 @@ pub struct RtpRedundancyConfig {
     /// Network interface IP for multicast join on leg 2 (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interface_addr: Option<String>,
+    /// Source-specific multicast (SSM) source for leg 2. Real Red/Blue plants
+    /// often have different source IPs per network — see
+    /// `RtpInputConfig::source_addr`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_addr: Option<String>,
 }
 
 /// SMPTE 2022-7 redundancy config for an RTP output (leg 2).
@@ -2758,14 +2774,17 @@ pub struct WebrtcOutputConfig {
 /// build time:
 /// - `video-encoder-x264` → `x264` (GPL v2+).
 /// - `video-encoder-x265` → `x265` (GPL v2+).
-/// - `video-encoder-nvenc` → `h264_nvenc` / `hevc_nvenc`.
+/// - `video-encoder-nvenc` → `h264_nvenc` / `hevc_nvenc` (NVIDIA iGPU/dGPU).
+/// - `video-encoder-qsv` → `h264_qsv` / `hevc_qsv` (Intel iGPU/Arc dGPU,
+///   x86_64 only, via Intel oneVPL).
 ///
 /// Validation in `config::validation` enforces field bounds at config
 /// load time. Unavailable backends are surfaced as a runtime error when
 /// the output starts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VideoEncodeConfig {
-    /// Encoder backend. One of: `x264`, `x265`, `h264_nvenc`, `hevc_nvenc`.
+    /// Encoder backend. One of: `x264`, `x265`, `h264_nvenc`, `hevc_nvenc`,
+    /// `h264_qsv`, `hevc_qsv`.
     pub codec: String,
     /// Output width in pixels. When unset, the encoder uses the source
     /// resolution. Range: 64–7680.
@@ -2942,6 +2961,11 @@ pub struct RedBlueBindConfig {
     /// Network interface IP for multicast on leg 2 (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_addr: Option<String>,
+    /// Source-specific multicast (SSM) source for this leg. Real Red/Blue
+    /// plants often have different source IPs per network — see
+    /// `RtpInputConfig::source_addr`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_addr: Option<String>,
 }
 
 /// SMPTE ST 2110-30 / -31 audio input configuration.
@@ -2956,6 +2980,10 @@ pub struct St2110AudioInputConfig {
     /// Network interface IP for multicast join on the primary leg (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_addr: Option<String>,
+    /// Source-specific multicast (SSM) source for the primary leg — see
+    /// `RtpInputConfig::source_addr`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_addr: Option<String>,
     /// Optional SMPTE 2022-7 second leg (Blue network).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<RedBlueBindConfig>,
@@ -3100,6 +3128,9 @@ pub struct RtpAudioInputConfig {
     /// Multicast NIC IP for joining (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_addr: Option<String>,
+    /// Source-specific multicast (SSM) source — see `RtpInputConfig::source_addr`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_addr: Option<String>,
     /// Optional SMPTE 2022-7 second leg.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<RedBlueBindConfig>,
@@ -3185,6 +3216,10 @@ pub struct St2110AncillaryInputConfig {
     /// Network interface IP for multicast join on the primary leg (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_addr: Option<String>,
+    /// Source-specific multicast (SSM) source for the primary leg — see
+    /// `RtpInputConfig::source_addr`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_addr: Option<String>,
     /// Optional SMPTE 2022-7 second leg (Blue network).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<RedBlueBindConfig>,
@@ -3288,6 +3323,10 @@ pub struct St2110VideoInputConfig {
     pub bind_addr: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_addr: Option<String>,
+    /// Source-specific multicast (SSM) source for the primary leg — see
+    /// `RtpInputConfig::source_addr`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_addr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<RedBlueBindConfig>,
     pub width: u32,
@@ -3357,6 +3396,10 @@ pub struct St2110_23SubStreamBind {
     pub bind_addr: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_addr: Option<String>,
+    /// Source-specific multicast (SSM) source for this sub-stream's primary
+    /// leg — see `RtpInputConfig::source_addr`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_addr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<RedBlueBindConfig>,
     #[serde(default = "default_st2110_video_pt")]
@@ -3669,6 +3712,7 @@ mod tests {
                 config: InputConfig::Rtp(RtpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
                     interface_addr: None,
+                    source_addr: None,
                     fec_decode: None,
                     allowed_sources: None,
                     allowed_payload_types: None,
@@ -3735,6 +3779,7 @@ mod tests {
                 config: InputConfig::Udp(UdpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
                     interface_addr: None,
+                    source_addr: None,
                     audio_encode: None,
                     transcode: None,
                     video_encode: None,

@@ -158,6 +158,7 @@ pub async fn run_st2110_audio_input(
     let mut pair = RedBluePair::bind_input(
         &config.bind_addr,
         config.interface_addr.as_deref(),
+        config.source_addr.as_deref(),
         config.redundancy.as_ref(),
     )
     .await?;
@@ -278,7 +279,12 @@ async fn run_audio_input_single_with_filter(
     cancel: CancellationToken,
     mut processor: Option<PcmInputProcessor>,
 ) -> Result<()> {
-    let socket = bind_udp_input(&config.bind_addr, config.interface_addr.as_deref()).await?;
+    let socket = bind_udp_input(
+        &config.bind_addr,
+        config.interface_addr.as_deref(),
+        config.source_addr.as_deref(),
+    )
+    .await?;
     let mut buf = vec![0u8; MAX_DGRAM];
     loop {
         tokio::select! {
@@ -597,6 +603,7 @@ pub async fn run_st2110_anc_input(
     let mut pair = RedBluePair::bind_input(
         &config.bind_addr,
         config.interface_addr.as_deref(),
+        config.source_addr.as_deref(),
         config.redundancy.as_ref(),
     )
     .await?;
@@ -656,7 +663,12 @@ async fn run_anc_input_single_with_filter(
     event_sender: Option<EventSender>,
     flow_id: Option<String>,
 ) -> Result<()> {
-    let socket = bind_udp_input(&config.bind_addr, config.interface_addr.as_deref()).await?;
+    let socket = bind_udp_input(
+        &config.bind_addr,
+        config.interface_addr.as_deref(),
+        config.source_addr.as_deref(),
+    )
+    .await?;
     let mut buf = vec![0u8; MAX_DGRAM];
     let pt = config.payload_type;
     loop {
@@ -1130,6 +1142,7 @@ mod tests {
         let input_config = St2110AudioInputConfig {
             bind_addr: in_addr.to_string(),
             interface_addr: None,
+            source_addr: None,
             redundancy: None,
             sample_rate: 48_000,
             bit_depth: 24,
@@ -1245,6 +1258,7 @@ mod tests {
         let input_config = St2110AudioInputConfig {
             bind_addr: in_addr.to_string(),
             interface_addr: None,
+            source_addr: None,
             redundancy: None,
             sample_rate: 48_000,
             bit_depth: 24,
@@ -1395,6 +1409,7 @@ mod tests {
         let input_config = St2110AncillaryInputConfig {
             bind_addr: in_addr.to_string(),
             interface_addr: None,
+            source_addr: None,
             redundancy: None,
             payload_type: 100,
             clock_domain: None,
@@ -1493,9 +1508,11 @@ mod tests {
         let cfg = St2110AudioInputConfig {
             bind_addr: red_addr.to_string(),
             interface_addr: None,
+            source_addr: None,
             redundancy: Some(RedBlueBindConfig {
                 addr: blue_addr.to_string(),
                 interface_addr: None,
+                source_addr: None,
             }),
             sample_rate: 48_000,
             bit_depth: 24,

@@ -581,6 +581,8 @@ mod inner {
             "x265" => Ok(VideoEncoderCodec::X265),
             "h264_nvenc" => Ok(VideoEncoderCodec::H264Nvenc),
             "hevc_nvenc" => Ok(VideoEncoderCodec::HevcNvenc),
+            "h264_qsv" => Ok(VideoEncoderCodec::H264Qsv),
+            "hevc_qsv" => Ok(VideoEncoderCodec::HevcQsv),
             other => Err(TsVideoReplaceError::UnknownCodec(other.to_string())),
         }
     }

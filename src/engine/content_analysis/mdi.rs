@@ -185,6 +185,7 @@ impl MdiSampler {
         }
         Some(MdiStats {
             mdi: format!("{:.1}:{:.1}", self.delay_factor_ms, self.loss_rate_pps),
+            model: "approx-iat-spread",
             delay_factor_ms: self.delay_factor_ms,
             loss_rate_pps: self.loss_rate_pps,
             windows_above_threshold: self.windows_above_threshold,

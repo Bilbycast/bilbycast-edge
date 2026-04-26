@@ -55,6 +55,7 @@ pub mod output_rtp;
 pub mod output_srt;
 pub mod output_webrtc;
 pub mod packet;
+pub mod perf;
 pub mod rtmp;
 pub mod thumbnail;
 pub mod tr101290;

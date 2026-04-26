@@ -406,9 +406,13 @@ async fn rist_output_loop(
 
             let after_audio: &[u8] = if let Some(ref mut replacer) = audio_replacer {
                 replace_scratch.clear();
-                tokio::task::block_in_place(|| {
-                    replacer.process(filtered_bytes, &mut replace_scratch);
-                });
+                crate::timed_block_in_place!(
+                    "output_rist.audio_replacer",
+                    crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
+                    {
+                        replacer.process(filtered_bytes, &mut replace_scratch);
+                    }
+                );
                 &replace_scratch
             } else {
                 filtered_bytes
@@ -416,9 +420,13 @@ async fn rist_output_loop(
 
             let after_video: &[u8] = if let Some(ref mut vreplacer) = video_replacer {
                 video_replace_scratch.clear();
-                tokio::task::block_in_place(|| {
-                    vreplacer.process(after_audio, &mut video_replace_scratch);
-                });
+                crate::timed_block_in_place!(
+                    "output_rist.video_replacer",
+                    crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
+                    {
+                        vreplacer.process(after_audio, &mut video_replace_scratch);
+                    }
+                );
                 &video_replace_scratch
             } else {
                 after_audio

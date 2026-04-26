@@ -44,6 +44,7 @@ pub fn spawn_rtp_audio_input(
     let synthesized = St2110AudioInputConfig {
         bind_addr: config.bind_addr.clone(),
         interface_addr: config.interface_addr.clone(),
+        source_addr: config.source_addr.clone(),
         redundancy: config.redundancy.clone(),
         sample_rate: config.sample_rate,
         bit_depth: config.bit_depth,

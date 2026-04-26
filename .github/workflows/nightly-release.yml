@@ -65,6 +65,9 @@ jobs:
             variant: default
             cargo_features: ""
           # ─── full variant: libx264 + libx265 + NVENC (AGPL + GPL bundle) ───
+          # x86_64 also bundles QSV (Intel oneVPL); aarch64 drops it because
+          # Intel iGPU is x86_64-only — listing the three cross-arch features
+          # explicitly instead of the `video-encoders-full` composite.
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact_suffix: x86_64-linux-full
@@ -74,7 +77,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact_suffix: aarch64-linux-full
             variant: full
-            cargo_features: "video-encoders-full"
+            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-nvenc"
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout bilbycast-libsrt-rs (path dependency)
@@ -138,6 +141,15 @@ jobs:
             https://github.com/FFmpeg/nv-codec-headers.git /tmp/nv-codec-headers
           sudo make -C /tmp/nv-codec-headers PREFIX=/usr/local install
 
+      - name: Install QSV build dependencies (x86_64-full only)
+        if: matrix.variant == 'full' && matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          # libvpl-dev ships the Intel oneVPL headers + the `vpl` pkg-config
+          # module. Available in Ubuntu 24.04 (noble) main. Intel QuickSync
+          # is x86_64-only in practice — the aarch64 build skips this step
+          # and uses the explicit cross-arch feature list above.
+          sudo apt-get install -y libvpl-dev
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -177,6 +189,19 @@ jobs:
               exit 1
             fi
             echo "OK: full variant links libx264 and libx265"
+            if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+              if ! ldd "${BINARY}" | grep -qE 'libvpl'; then
+                echo "ERROR: x86_64-full binary is missing libvpl (QSV) linkage"
+                exit 1
+              fi
+              echo "OK: x86_64-full variant links libvpl (QSV)"
+            else
+              if ldd "${BINARY}" | grep -qE 'libvpl'; then
+                echo "ERROR: aarch64-full binary unexpectedly links libvpl"
+                exit 1
+              fi
+              echo "OK: aarch64-full variant has no libvpl linkage (QSV is x86_64-only)"
+            fi
           else
             if ldd "${BINARY}" | grep -qE 'libx264|libx265'; then
               echo "ERROR: default variant binary unexpectedly links libx264/libx265"
@@ -269,11 +294,11 @@ jobs:
           - \`bilbycast-edge-${VERSION}-aarch64-linux.tar.gz\` — Linux ARM64 (aarch64)
 
           ### \`*-linux-full\` (full variant)
-          Includes libx264 + libx265 + NVENC. NVENC activates automatically on hosts with an NVIDIA driver; x264 / x265 handle everything else. This binary is an **AGPL-3.0-or-later combined work** that bundles GPL-2.0-or-later code — see \`NOTICE\` inside the tarball.
-          - \`bilbycast-edge-${VERSION}-x86_64-linux-full.tar.gz\` — Linux x86_64 (amd64)
-          - \`bilbycast-edge-${VERSION}-aarch64-linux-full.tar.gz\` — Linux ARM64 (aarch64)
+          Includes libx264 + libx265 + NVENC; the **x86_64** build also bundles **QSV** (Intel oneVPL). NVENC activates automatically on hosts with an NVIDIA driver, QSV on hosts with an Intel iGPU + media driver; x264 / x265 handle everything else. The aarch64 build omits QSV (Intel iGPU is x86_64-only). This binary is an **AGPL-3.0-or-later combined work** that bundles GPL-2.0-or-later code — see \`NOTICE\` inside the tarball.
+          - \`bilbycast-edge-${VERSION}-x86_64-linux-full.tar.gz\` — Linux x86_64 (amd64) — x264 + x265 + NVENC + QSV
+          - \`bilbycast-edge-${VERSION}-aarch64-linux-full.tar.gz\` — Linux ARM64 (aarch64) — x264 + x265 + NVENC
 
-          Install \`libx264\` and \`libx265\` runtime packages before running the \`-full\` binary: \`sudo apt install libx264-dev libx265-dev\`. No extra packages needed for NVENC beyond the NVIDIA driver.
+          Install \`libx264\` and \`libx265\` runtime packages before running the \`-full\` binary: \`sudo apt install libx264-dev libx265-dev\`. No extra packages needed for NVENC beyond the NVIDIA driver. **For QSV (x86_64 only)**: \`sudo apt install libvpl2 intel-media-va-driver-non-free\` (or \`intel-media-driver\`), then add the running user to the \`render\` group so the edge can open \`/dev/dri/renderD*\`.
 
           ## Verify checksums
           \`\`\`

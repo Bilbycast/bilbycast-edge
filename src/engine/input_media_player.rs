@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::broadcast;
@@ -161,13 +161,23 @@ async fn run(
             };
             let result = play_source(source, &config, &mut session).await;
             if let Err(e) = result {
-                events.emit_flow(
+                let error_code = classify_playback_error(&e);
+                events.emit_flow_with_details(
                     EventSeverity::Critical,
                     category::FLOW,
                     format!(
                         "Media-player input '{input_id}': source[{idx}] failed: {e}"
                     ),
                     &flow_id,
+                    serde_json::json!({
+                        "error_code": error_code,
+                        "flow_id": flow_id,
+                        "input_id": input_id,
+                        "source_index": idx,
+                        "source_kind": source_kind_str(source),
+                        "source_name": source_name_str(source),
+                        "error": e.to_string(),
+                    }),
                 );
                 // Don't tight-loop on a bad file — sleep before moving on.
                 tokio::select! {
@@ -200,6 +210,56 @@ pub(super) struct PlayerSession<'a> {
     pub(super) per_input_tx: &'a broadcast::Sender<RtpPacket>,
     pub(super) stats: &'a Arc<FlowStatsAccumulator>,
     pub(super) cancel: &'a CancellationToken,
+}
+
+/// Map a playback failure onto a stable `error_code` string carried in the
+/// `Media-player source failed` Critical event's `details`. The manager UI
+/// keys off these codes (rather than the free-form message) to attribute
+/// failures and decide whether to highlight the file in the library picker.
+///
+/// Walks `anyhow`'s error chain looking for an `io::Error` first (file
+/// open / read failures preserve `io::Error` via `.with_context`), then
+/// falls back to message-pattern matching for parse-level errors that
+/// originate as plain `anyhow!` macros.
+pub(super) fn classify_playback_error(err: &anyhow::Error) -> &'static str {
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            return match io_err.kind() {
+                std::io::ErrorKind::NotFound => "media_player_source_missing",
+                std::io::ErrorKind::PermissionDenied => "media_player_source_missing",
+                std::io::ErrorKind::InvalidData => "media_player_source_unsupported",
+                _ => "media_player_source_render_failed",
+            };
+        }
+    }
+    let msg = err.to_string();
+    let msg_lc = msg.to_lowercase();
+    if msg_lc.contains("no sync byte")
+        || msg_lc.contains("not mpeg-ts")
+        || msg_lc.contains("severely corrupt")
+    {
+        return "media_player_source_unsupported";
+    }
+    if msg_lc.contains("requires the 'video-thumbnail'") {
+        return "media_player_source_codec_unsupported";
+    }
+    "media_player_source_failed"
+}
+
+fn source_kind_str(source: &MediaPlayerSource) -> &'static str {
+    match source {
+        MediaPlayerSource::Ts { .. } => "ts",
+        MediaPlayerSource::Mp4 { .. } => "mp4",
+        MediaPlayerSource::Image { .. } => "image",
+    }
+}
+
+fn source_name_str(source: &MediaPlayerSource) -> &str {
+    match source {
+        MediaPlayerSource::Ts { name } => name,
+        MediaPlayerSource::Mp4 { name } => name,
+        MediaPlayerSource::Image { name, .. } => name,
+    }
 }
 
 async fn play_source(
@@ -241,7 +301,7 @@ async fn play_ts_file(
 ) -> Result<()> {
     let file = tokio::fs::File::open(path)
         .await
-        .map_err(|e| anyhow!("open {}: {e}", path.display()))?;
+        .with_context(|| format!("open {}", path.display()))?;
     let mut reader = BufReader::new(file);
 
     let mut bundle = BytesMut::with_capacity(BUNDLE_SIZE);
@@ -259,7 +319,10 @@ async fn play_ts_file(
         match reader.read_exact(&mut packet).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(anyhow!("read {}: {e}", path.display())),
+            Err(e) => {
+                return Err(anyhow::Error::from(e)
+                    .context(format!("read {}", path.display())));
+            }
         }
 
         if packet[0] != SYNC_BYTE {
@@ -333,14 +396,14 @@ async fn resync_to_sync_byte<R: AsyncReadExt + Unpin>(
         match reader.read_exact(&mut byte).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
-            Err(e) => return Err(anyhow!("resync read: {e}")),
+            Err(e) => return Err(anyhow::Error::from(e).context("resync read")),
         }
         if byte[0] == SYNC_BYTE {
             packet[0] = SYNC_BYTE;
             reader
                 .read_exact(&mut packet[1..])
                 .await
-                .map_err(|e| anyhow!("resync follow-on read: {e}"))?;
+                .map_err(|e| anyhow::Error::from(e).context("resync follow-on read"))?;
             return Ok(true);
         }
     }
@@ -516,5 +579,58 @@ mod tests {
         assert!(resolve_media_path("foo/bar").is_err());
         assert!(resolve_media_path("foo\\bar").is_err());
         assert!(resolve_media_path("good-name.ts").is_ok());
+    }
+
+    #[test]
+    fn classify_io_not_found_is_missing() {
+        let io = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let err = anyhow::Error::from(io).context("open /tmp/nope.ts");
+        assert_eq!(classify_playback_error(&err), "media_player_source_missing");
+    }
+
+    #[test]
+    fn classify_io_permission_denied_is_missing() {
+        let io = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let err = anyhow::Error::from(io).context("open /root/locked.ts");
+        assert_eq!(classify_playback_error(&err), "media_player_source_missing");
+    }
+
+    #[test]
+    fn classify_io_invalid_data_is_unsupported() {
+        let io = std::io::Error::from(std::io::ErrorKind::InvalidData);
+        let err = anyhow::Error::from(io).context("read foo.mp4");
+        assert_eq!(classify_playback_error(&err), "media_player_source_unsupported");
+    }
+
+    #[test]
+    fn classify_other_io_is_render_failed() {
+        let io = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        let err = anyhow::Error::from(io).context("read foo.ts");
+        assert_eq!(classify_playback_error(&err), "media_player_source_render_failed");
+    }
+
+    #[test]
+    fn classify_no_sync_byte_is_unsupported() {
+        let err = anyhow!(
+            "TS file has no sync byte in 1 MiB of slop — file is not MPEG-TS or is severely corrupt"
+        );
+        assert_eq!(classify_playback_error(&err), "media_player_source_unsupported");
+    }
+
+    #[test]
+    fn classify_feature_gate_is_codec_unsupported() {
+        let err = anyhow!(
+            "media-player MP4 source requires the 'video-thumbnail' and 'fdk-aac' features — rebuild the edge with those enabled, or use a pre-encoded .ts file instead"
+        );
+        assert_eq!(
+            classify_playback_error(&err),
+            "media_player_source_codec_unsupported"
+        );
+    }
+
+    #[test]
+    fn classify_unrecognised_falls_back_to_generic() {
+        let err = anyhow!("something we did not anticipate");
+        assert_eq!(classify_playback_error(&err), "media_player_source_failed");
     }
 }

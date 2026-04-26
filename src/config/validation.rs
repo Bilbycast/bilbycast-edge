@@ -570,6 +570,7 @@ fn validate_input(input: &InputConfig) -> Result<()> {
             }
             // Validate address family consistency
             validate_rtp_input_addr_family(rtp)?;
+            validate_ssm_source(&rtp.bind_addr, rtp.source_addr.as_deref(), "RTP input")?;
             // Validate source IP allow-list
             if let Some(ref sources) = rtp.allowed_sources {
                 for src in sources {
@@ -611,6 +612,11 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                         bail!("RTP input redundancy: bind_addr and interface_addr must use the same address family");
                     }
                 }
+                validate_ssm_source(
+                    &red.bind_addr,
+                    red.source_addr.as_deref(),
+                    "RTP input redundancy",
+                )?;
             }
             validate_input_transcode_group_a(
                 rtp.audio_encode.as_ref(),
@@ -635,6 +641,7 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                     );
                 }
             }
+            validate_ssm_source(&udp.bind_addr, udp.source_addr.as_deref(), "UDP input")?;
             validate_input_transcode_group_a(
                 udp.audio_encode.as_ref(),
                 udp.transcode.as_ref(),
@@ -1149,6 +1156,7 @@ fn validate_st2110_audio_input(c: &St2110AudioInputConfig, profile: St2110Profil
     if let Some(ref iface) = c.interface_addr {
         validate_ip_addr(iface, &format!("{label} input interface_addr"))?;
     }
+    validate_ssm_source(&c.bind_addr, c.source_addr.as_deref(), &format!("{label} input"))?;
     validate_st2110_audio_params(profile, c.sample_rate, c.bit_depth, c.channels, c.packet_time_us, &format!("{label} input"))?;
     validate_rtp_payload_type(c.payload_type, &format!("{label} input"))?;
     validate_clock_domain(c.clock_domain, &format!("{label} input"))?;
@@ -1503,6 +1511,7 @@ fn validate_st2110_ancillary_input(c: &St2110AncillaryInputConfig) -> Result<()>
     if let Some(ref iface) = c.interface_addr {
         validate_ip_addr(iface, "ST 2110-40 input interface_addr")?;
     }
+    validate_ssm_source(&c.bind_addr, c.source_addr.as_deref(), "ST 2110-40 input")?;
     validate_rtp_payload_type(c.payload_type, "ST 2110-40 input")?;
     validate_clock_domain(c.clock_domain, "ST 2110-40 input")?;
     if let Some(ref sources) = c.allowed_sources {
@@ -1567,6 +1576,7 @@ fn validate_st2110_video_input(c: &St2110VideoInputConfig) -> Result<()> {
     if let Some(ref iface) = c.interface_addr {
         validate_ip_addr(iface, &format!("{LABEL} interface_addr"))?;
     }
+    validate_ssm_source(&c.bind_addr, c.source_addr.as_deref(), LABEL)?;
     validate_video_dims(c.width, c.height, c.frame_rate_num, c.frame_rate_den, LABEL)?;
     validate_rtp_payload_type(c.payload_type, LABEL)?;
     validate_clock_domain(c.clock_domain, LABEL)?;
@@ -1621,6 +1631,11 @@ fn validate_st2110_23_input(c: &St2110_23InputConfig) -> Result<()> {
         if let Some(ref iface) = s.interface_addr {
             validate_ip_addr(iface, &format!("{LABEL} sub_streams[{i}] interface_addr"))?;
         }
+        validate_ssm_source(
+            &s.bind_addr,
+            s.source_addr.as_deref(),
+            &format!("{LABEL} sub_streams[{i}]"),
+        )?;
         validate_rtp_payload_type(s.payload_type, &format!("{LABEL} sub_streams[{i}]"))?;
         if let Some(ref red) = s.redundancy {
             validate_red_blue_bind(red, &s.bind_addr, &format!("{LABEL} sub_streams[{i}] redundancy"))?;
@@ -1669,6 +1684,7 @@ fn validate_rtp_audio_input(c: &RtpAudioInputConfig) -> Result<()> {
     if let Some(ref iface) = c.interface_addr {
         validate_ip_addr(iface, "rtp_audio input interface_addr")?;
     }
+    validate_ssm_source(&c.bind_addr, c.source_addr.as_deref(), "rtp_audio input")?;
     validate_rtp_audio_params(
         c.sample_rate,
         c.bit_depth,
@@ -1826,6 +1842,7 @@ fn validate_red_blue_bind(red: &RedBlueBindConfig, primary_addr: &str, context: 
             bail!("{context}: leg 2 addr and interface_addr must use the same address family");
         }
     }
+    validate_ssm_source(&red.addr, red.source_addr.as_deref(), context)?;
     // Both legs unicast and bound to the same IP defeats the purpose of 2022-7.
     let leg1_ip = leg1.ip();
     let leg2_ip = leg2.ip();
@@ -2289,10 +2306,10 @@ fn validate_video_encode(
     context: &str,
 ) -> anyhow::Result<()> {
     match enc.codec.as_str() {
-        "x264" | "x265" | "h264_nvenc" | "hevc_nvenc" => {}
+        "x264" | "x265" | "h264_nvenc" | "hevc_nvenc" | "h264_qsv" | "hevc_qsv" => {}
         other => bail!(
             "{context}: video_encode.codec '{other}' is not recognised; \
-             expected one of x264, x265, h264_nvenc, hevc_nvenc"
+             expected one of x264, x265, h264_nvenc, hevc_nvenc, h264_qsv, hevc_qsv"
         ),
     }
     // Reject codecs whose backend wasn't compiled into this build. Runtime
@@ -2309,6 +2326,9 @@ fn validate_video_encode(
         }
         "h264_nvenc" | "hevc_nvenc" => {
             if cfg!(feature = "video-encoder-nvenc") { None } else { Some("video-encoder-nvenc") }
+        }
+        "h264_qsv" | "hevc_qsv" => {
+            if cfg!(feature = "video-encoder-qsv") { None } else { Some("video-encoder-qsv") }
         }
         _ => None,
     };
@@ -2405,6 +2425,20 @@ fn validate_video_encode(
         ),
         ("h264_nvenc" | "hevc_nvenc", Some("yuv444p"), _) => bail!(
             "{context}: NVENC backends do not support chroma=yuv444p; \
+             use x264 or x265 instead"
+        ),
+        _ => {}
+    }
+    // QSV backend restrictions — same shape as NVENC. h264_qsv is 8-bit
+    // only (use hevc_qsv for 10-bit on supported Intel hardware), and
+    // neither QSV variant supports 4:4:4 chroma in oneVPL today.
+    match (enc.codec.as_str(), chroma_str, enc.bit_depth) {
+        ("h264_qsv", _, Some(10)) => bail!(
+            "{context}: h264_qsv does not support 10-bit encoding; \
+             use hevc_qsv, x264, or x265 instead"
+        ),
+        ("h264_qsv" | "hevc_qsv", Some("yuv444p"), _) => bail!(
+            "{context}: QSV backends do not support chroma=yuv444p; \
              use x264 or x265 instead"
         ),
         _ => {}
@@ -3004,6 +3038,9 @@ pub fn validate_output_with_input(
             if rtmp.dest_url.len() > 2048 {
                 bail!("RTMP output '{}': dest_url must be at most 2048 characters", rtmp.id);
             }
+            ::url::Url::parse(&rtmp.dest_url).map_err(|e| {
+                anyhow::anyhow!("RTMP output '{}': dest_url is malformed: {e}", rtmp.id)
+            })?;
             if rtmp.stream_key.is_empty() {
                 bail!("RTMP output '{}': stream_key cannot be empty", rtmp.id);
             }
@@ -3056,6 +3093,9 @@ pub fn validate_output_with_input(
                     hls.id
                 );
             }
+            ::url::Url::parse(&hls.ingest_url).map_err(|e| {
+                anyhow::anyhow!("HLS output '{}': ingest_url is malformed: {e}", hls.id)
+            })?;
             if let Some(ref token) = hls.auth_token {
                 if token.len() > 4096 {
                     bail!("HLS output '{}': auth_token must be at most 4096 characters", hls.id);
@@ -3321,8 +3361,8 @@ pub fn validate_output_with_input(
                 // suggestion — WebRTC browsers can't decode HEVC at all,
                 // so rebuilding wouldn't help.
                 match ve.codec.as_str() {
-                    "x265" | "hevc_nvenc" => bail!(
-                        "WebRTC output '{}': video_encode.codec '{}' is not supported — WebRTC browsers only decode H.264 (use 'x264' or 'h264_nvenc')",
+                    "x265" | "hevc_nvenc" | "hevc_qsv" => bail!(
+                        "WebRTC output '{}': video_encode.codec '{}' is not supported — WebRTC browsers only decode H.264 (use 'x264', 'h264_nvenc', or 'h264_qsv')",
                         webrtc.id, ve.codec,
                     ),
                     _ => {}
@@ -3820,6 +3860,39 @@ fn validate_rtp_input_addr_family(rtp: &RtpInputConfig) -> Result<()> {
                 rtp.bind_addr, iface
             );
         }
+    }
+    Ok(())
+}
+
+/// Validates a source-specific multicast (SSM, RFC 3678) source address.
+///
+/// `source_addr` is a no-op when `None`. When `Some`, the bind address must be
+/// multicast, the source must parse as an IP, must be unicast (not multicast),
+/// and must share the address family of the bind. We deliberately don't enforce
+/// the IANA SSM ranges (232.0.0.0/8 / ff3x::/32) — many real broadcast plants
+/// run SSM joins on legacy ASM groups and the kernel accepts it.
+fn validate_ssm_source(
+    bind_addr: &str,
+    source_addr: Option<&str>,
+    context: &str,
+) -> Result<()> {
+    let Some(src) = source_addr else { return Ok(()) };
+    let bind: SocketAddr = bind_addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("{context}: bind_addr '{bind_addr}' is not parseable: {e}"))?;
+    let src_ip: std::net::IpAddr = src
+        .parse()
+        .map_err(|e| anyhow::anyhow!("{context}: source_addr '{src}' is not parseable: {e}"))?;
+    if !bind.ip().is_multicast() {
+        bail!("{context}: source_addr is only valid when bind_addr is multicast (got bind_addr '{bind_addr}')");
+    }
+    if src_ip.is_multicast() {
+        bail!("{context}: source_addr must be a unicast address (got multicast '{src}')");
+    }
+    if bind.is_ipv4() != matches!(src_ip, std::net::IpAddr::V4(_)) {
+        bail!(
+            "{context}: source_addr '{src}' must be the same address family as bind_addr '{bind_addr}'"
+        );
     }
     Ok(())
 }
@@ -4640,6 +4713,7 @@ mod tests {
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: input_bind.to_string(),
                 interface_addr: None,
+                source_addr: None,
                 fec_decode: None,
                 allowed_sources: None,
                 allowed_payload_types: None,
@@ -4726,6 +4800,7 @@ mod tests {
         let config = make_config_input_only(InputConfig::Rtp(RtpInputConfig {
             bind_addr: "not-an-address".to_string(),
             interface_addr: None,
+            source_addr: None,
             fec_decode: None,
             allowed_sources: None,
             allowed_payload_types: None,
@@ -4822,6 +4897,7 @@ mod tests {
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,
+                source_addr: None,
                 fec_decode: None,
                 allowed_sources: None,
                 allowed_payload_types: None,
@@ -4841,6 +4917,7 @@ mod tests {
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5001".to_string(),
                 interface_addr: None,
+                source_addr: None,
                 fec_decode: None,
                 allowed_sources: None,
                 allowed_payload_types: None,
@@ -4936,6 +5013,7 @@ mod tests {
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "239.1.1.1:5000".to_string(),
                 interface_addr: Some("192.168.1.100".to_string()),
+                source_addr: None,
                 fec_decode: None,
                 allowed_sources: None,
                 allowed_payload_types: None,
@@ -4994,6 +5072,7 @@ mod tests {
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "[ff7e::1]:5000".to_string(),
                 interface_addr: Some("::1".to_string()),
+                source_addr: None,
                 fec_decode: None,
                 allowed_sources: None,
                 allowed_payload_types: None,
@@ -5048,6 +5127,7 @@ mod tests {
         let config = make_config_input_only(InputConfig::Rtp(RtpInputConfig {
             bind_addr: "239.1.1.1:5000".to_string(),         // IPv4
             interface_addr: Some("::1".to_string()),          // IPv6 - mismatch!
+            source_addr: None,
             fec_decode: None,
             allowed_sources: None,
             allowed_payload_types: None,
@@ -5072,6 +5152,7 @@ mod tests {
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "[::]:5000".to_string(),
                 interface_addr: None,
+                source_addr: None,
                 fec_decode: None,
                 allowed_sources: None,
                 allowed_payload_types: None,
@@ -5130,6 +5211,7 @@ mod tests {
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,
+                source_addr: None,
                 fec_decode: None,
                 allowed_sources: None,
                 allowed_payload_types: None,
@@ -5188,6 +5270,7 @@ mod tests {
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
                 interface_addr: None,
+                source_addr: None,
                 fec_decode: None,
                 allowed_sources: None,
                 allowed_payload_types: None,
@@ -5241,6 +5324,7 @@ mod tests {
         St2110AudioInputConfig {
             bind_addr: addr.to_string(),
             interface_addr: None,
+            source_addr: None,
             redundancy: None,
             sample_rate: 48_000,
             bit_depth: 24,
@@ -5339,6 +5423,7 @@ mod tests {
         cfg.redundancy = Some(RedBlueBindConfig {
             addr: "10.0.0.5:5006".to_string(),
             interface_addr: None,
+            source_addr: None,
         });
         assert!(validate_st2110_audio_input(&cfg, St2110Profile::Pcm).is_err());
     }
@@ -5349,6 +5434,7 @@ mod tests {
         cfg.redundancy = Some(RedBlueBindConfig {
             addr: "[::1]:5006".to_string(),
             interface_addr: None,
+            source_addr: None,
         });
         assert!(validate_st2110_audio_input(&cfg, St2110Profile::Pcm).is_err());
     }
@@ -5359,6 +5445,7 @@ mod tests {
         cfg.redundancy = Some(RedBlueBindConfig {
             addr: "10.0.1.5:5006".to_string(),
             interface_addr: None,
+            source_addr: None,
         });
         validate_st2110_audio_input(&cfg, St2110Profile::Pcm).expect("distinct legs");
     }
@@ -5381,6 +5468,7 @@ mod tests {
         let anc = St2110AncillaryInputConfig {
             bind_addr: "239.10.10.10:5006".to_string(),
             interface_addr: None,
+            source_addr: None,
             redundancy: None,
             payload_type: 100,
             clock_domain: Some(0),
@@ -5394,6 +5482,7 @@ mod tests {
         let anc = St2110AncillaryInputConfig {
             bind_addr: "239.10.10.10:5006".to_string(),
             interface_addr: None,
+            source_addr: None,
             redundancy: None,
             payload_type: 50,
             clock_domain: Some(0),
@@ -5854,6 +5943,72 @@ mod tests {
     }
 
     #[test]
+    fn validate_output_hls_accepts_ipv6_ingest_url() {
+        use crate::config::models::{HlsOutputConfig, OutputConfig};
+        let make = |url: &str| OutputConfig::Hls(HlsOutputConfig {
+            active: true,
+            group: None,
+            id: "hls1".into(),
+            name: "hls 1".into(),
+            ingest_url: url.into(),
+            segment_duration_secs: 2.0,
+            auth_token: None,
+            max_segments: 5,
+            program_number: None,
+            pid_map: None,
+            audio_encode: None,
+            transcode: None,
+        });
+        assert!(validate_output(&make("http://[::1]:8080/hls")).is_ok());
+        assert!(validate_output(&make("https://[2001:db8::1]/hls")).is_ok());
+        assert!(validate_output(&make("https://[2001:db8::1]:8443/hls/seg.ts?token=abc")).is_ok());
+    }
+
+    #[test]
+    fn validate_output_hls_rejects_malformed_url() {
+        use crate::config::models::{HlsOutputConfig, OutputConfig};
+        let make = |url: &str| OutputConfig::Hls(HlsOutputConfig {
+            active: true,
+            group: None,
+            id: "hls1".into(),
+            name: "hls 1".into(),
+            ingest_url: url.into(),
+            segment_duration_secs: 2.0,
+            auth_token: None,
+            max_segments: 5,
+            program_number: None,
+            pid_map: None,
+            audio_encode: None,
+            transcode: None,
+        });
+        let err = validate_output(&make("http://[::1/hls")).unwrap_err().to_string();
+        assert!(err.contains("malformed"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_output_rtmp_accepts_ipv6_dest_url() {
+        use crate::config::models::{OutputConfig, RtmpOutputConfig};
+        let make = |url: &str| OutputConfig::Rtmp(RtmpOutputConfig {
+            active: true,
+            group: None,
+            id: "rtmp1".into(),
+            name: "rtmp 1".into(),
+            dest_url: url.into(),
+            stream_key: "abc".into(),
+            reconnect_delay_secs: 5,
+            max_reconnect_attempts: None,
+            program_number: None,
+            audio_encode: None,
+            transcode: None,
+            video_encode: None,
+        });
+        assert!(validate_output(&make("rtmp://[::1]:1935/live")).is_ok());
+        assert!(validate_output(&make("rtmps://[2001:db8::1]/app")).is_ok());
+        let err = validate_output(&make("rtmp://[::1/live")).unwrap_err().to_string();
+        assert!(err.contains("malformed"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn validate_output_hls_rejects_crlf_in_auth_token() {
         use crate::config::models::{HlsOutputConfig, OutputConfig};
         let make = |token: &str| OutputConfig::Hls(HlsOutputConfig {
@@ -5981,6 +6136,85 @@ mod tests {
             err.contains("WebRTC browsers only decode H.264"),
             "expected HEVC rejection, got: {err}"
         );
+        let err = validate_output(&make("hevc_qsv")).unwrap_err().to_string();
+        assert!(
+            err.contains("WebRTC browsers only decode H.264"),
+            "expected HEVC rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_video_encode_qsv_recognised() {
+        // The codec parser must accept `h264_qsv` and `hevc_qsv` as valid
+        // names. The exact error path depends on the build:
+        //   - feature off (default) → feature-gate error mentioning
+        //     `video-encoder-qsv`
+        //   - feature on → either accept or surface a QSV-specific
+        //     restriction (10-bit on h264_qsv, yuv444p on either)
+        // What must NEVER happen is the codec being treated as unknown.
+        use crate::config::models::VideoEncodeConfig;
+        let make = |codec: &str, bit_depth: Option<u8>, chroma: Option<&str>| VideoEncodeConfig {
+            codec: codec.into(),
+            width: None,
+            height: None,
+            fps_num: None,
+            fps_den: None,
+            bitrate_kbps: Some(4000),
+            gop_size: None,
+            preset: None,
+            profile: None,
+            chroma: chroma.map(str::to_string),
+            bit_depth,
+            rate_control: None,
+            crf: None,
+            max_bitrate_kbps: None,
+            bframes: None,
+            refs: None,
+            level: None,
+            tune: None,
+            color_primaries: None,
+            color_transfer: None,
+            color_matrix: None,
+            color_range: None,
+        };
+        let assert_recognised = |result: Result<(), anyhow::Error>, label: &str| match result {
+            Ok(_) => {} // feature on, params OK — fine
+            Err(e) => {
+                let s = e.to_string();
+                assert!(
+                    !s.contains("is not recognised"),
+                    "{label}: codec must be a recognised name, got: {s}"
+                );
+            }
+        };
+        assert_recognised(
+            validate_video_encode(&make("h264_qsv", Some(8), Some("yuv420p")), "ctx"),
+            "h264_qsv 8-bit yuv420p",
+        );
+        assert_recognised(
+            validate_video_encode(&make("hevc_qsv", Some(8), Some("yuv420p")), "ctx"),
+            "hevc_qsv 8-bit yuv420p",
+        );
+        // When the QSV feature is on, the QSV-specific restrictions
+        // should fire on bad params. Skip this branch in the default
+        // (feature-off) build because the feature-gate fires first.
+        #[cfg(feature = "video-encoder-qsv")]
+        {
+            let err = validate_video_encode(&make("h264_qsv", Some(10), None), "ctx")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("h264_qsv does not support 10-bit"),
+                "expected QSV 10-bit rejection, got: {err}"
+            );
+            let err = validate_video_encode(&make("hevc_qsv", None, Some("yuv444p")), "ctx")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("QSV backends do not support chroma=yuv444p"),
+                "expected QSV chroma rejection, got: {err}"
+            );
+        }
     }
 
     // ── Port conflict tests ──────────────────────────────────────────
@@ -6139,6 +6373,7 @@ mod tests {
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "239.1.1.1:5000".to_string(),
                 interface_addr: None,
+                source_addr: None,
                 fec_decode: None,
                 allowed_sources: None,
                 allowed_payload_types: None,
@@ -6158,6 +6393,7 @@ mod tests {
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "239.1.1.1:5000".to_string(),
                 interface_addr: None,
+                source_addr: None,
                 fec_decode: None,
                 allowed_sources: None,
                 allowed_payload_types: None,
@@ -6383,5 +6619,48 @@ mod tests {
         t.relay_addr = Some("127.0.0.1:4433".to_string());
         t.tunnel_encryption_key = Some("a".repeat(64));
         validate_tunnel(&t).unwrap();
+    }
+
+    // --- SSM (RFC 3678) source-specific multicast helper tests ---
+
+    #[test]
+    fn ssm_source_none_is_always_ok() {
+        assert!(validate_ssm_source("239.1.1.1:5000", None, "test").is_ok());
+        assert!(validate_ssm_source("0.0.0.0:5000", None, "test").is_ok());
+        assert!(validate_ssm_source("[ff7e::1]:5000", None, "test").is_ok());
+    }
+
+    #[test]
+    fn ssm_v4_unicast_source_accepted() {
+        validate_ssm_source("232.1.2.3:5000", Some("10.0.0.5"), "v4-ssm").unwrap();
+    }
+
+    #[test]
+    fn ssm_v6_unicast_source_accepted() {
+        validate_ssm_source("[ff3e::1]:5000", Some("2001:db8::5"), "v6-ssm").unwrap();
+    }
+
+    #[test]
+    fn ssm_source_rejected_on_unicast_bind() {
+        let err = validate_ssm_source("0.0.0.0:5000", Some("10.0.0.5"), "ctx")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only valid when bind_addr is multicast"), "got: {err}");
+    }
+
+    #[test]
+    fn ssm_multicast_source_rejected() {
+        let err = validate_ssm_source("232.1.2.3:5000", Some("232.1.2.4"), "ctx")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be a unicast address"), "got: {err}");
+    }
+
+    #[test]
+    fn ssm_family_mismatch_rejected() {
+        let err = validate_ssm_source("232.1.2.3:5000", Some("2001:db8::5"), "ctx")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("same address family"), "got: {err}");
     }
 }

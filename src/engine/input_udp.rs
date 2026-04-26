@@ -79,7 +79,13 @@ async fn udp_input_loop(
     flow_id: &str,
     transcoder: &mut Option<InputTranscoder>,
 ) -> anyhow::Result<()> {
-    let socket = match bind_udp_input(&config.bind_addr, config.interface_addr.as_deref()).await {
+    let socket = match bind_udp_input(
+        &config.bind_addr,
+        config.interface_addr.as_deref(),
+        config.source_addr.as_deref(),
+    )
+    .await
+    {
         Ok(s) => {
             events.emit_flow_with_details(
                 EventSeverity::Info,

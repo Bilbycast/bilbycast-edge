@@ -313,8 +313,20 @@ flow-level event stream as start/stop/fail. Each event carries
 | Severity | Message | Trigger | Details |
 |----------|---------|---------|---------|
 | info | Media player input started | Input task came up; reports source count and `loop_playback` / `shuffle` flags | `{ flow_id, input_id, source_count, loop_playback, shuffle }` |
-| critical | Media player source failed: {error} | A source failed to open, parse, or render (missing file, corrupt container, unsupported codec). Engine sleeps 2 s and advances to the next source. | `{ flow_id, input_id, source_name, source_kind, error }` |
+| critical | Media player source failed: {error} | A source failed to open, parse, or render (missing file, corrupt container, unsupported codec). Engine sleeps 2 s and advances to the next source. | `{ error_code, flow_id, input_id, source_index, source_kind, source_name, error }` |
 | info | Media player playlist exhausted | Final source finished and `loop_playback = false`. The input task exits cleanly — restart the flow to replay. | `{ flow_id, input_id }` |
+
+The Critical "source failed" event carries a stable `error_code` in
+`details` so the manager UI can attribute and highlight the offending file
+in the library picker without parsing the free-form message:
+
+| `error_code` | Trigger |
+|---|---|
+| `media_player_source_missing` | File not found on disk (`io::Error::NotFound`) or unreadable (`PermissionDenied`). |
+| `media_player_source_unsupported` | Container parse failed — no MPEG-TS sync byte in the first 1 MiB, or `io::Error::InvalidData` from a downstream demuxer. |
+| `media_player_source_codec_unsupported` | The active feature set cannot decode this source kind — e.g. an MP4 / image source in a build that lacks `video-thumbnail` + `fdk-aac`. |
+| `media_player_source_render_failed` | Read or render error after the source opened — transient I/O, decoder crash, or other runtime fault. |
+| `media_player_source_failed` | Generic fallback when no specific cause was identified. |
 
 **Source**: `src/engine/input_media_player.rs`
 

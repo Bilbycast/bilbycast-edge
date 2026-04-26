@@ -259,19 +259,35 @@ pub struct Scte35Stats {
     pub last_pts: Option<u64>,
 }
 
-/// Media Delivery Index per RFC 4445. Computed continuously over a sliding
-/// 1-second window; reported values are the most recent windowed sample.
+/// Media Delivery Index, approximated. Inspired by RFC 4445 but **not** a
+/// strict implementation — see the `model` discriminator and the module
+/// docs in `engine::content_analysis::mdi` for the exact algorithm.
 ///
-/// `delay_factor_ms` (NDF) — peak deviation from the nominal media rate
-/// expressed in milliseconds of buffering required to absorb network
-/// jitter. `loss_rate_pps` (MLR) — packets-lost-per-second (sliding 1 s).
+/// `delay_factor_ms` is computed as `peak_iat − mean_iat` over the current
+/// window (a buffer-depth proxy), not the per-RFC-4445 VB-overflow model.
+/// `loss_rate_pps` is derived from MPEG-TS continuity-counter
+/// discontinuities per second on the post-recovered stream — one CC gap
+/// can hide N missing packets, and the field under-reports loss that
+/// ARQ/FEC silently recovered upstream.
+///
+/// Suitable for **trending and alarming**; do **not** report these values
+/// against a strict RFC 4445 spec-conformance bar — IneoQuest IVMS,
+/// Telestream Inspector, and Bridge Technologies VB will report different
+/// numbers for the same stream.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct MdiStats {
     /// `MDI = NDF:MLR`, formatted for display (`"4.2:0"`).
     pub mdi: String,
-    /// NDF in ms (peak deviation in the most recent 1 s window).
+    /// Algorithm discriminator. Currently always `"approx-iat-spread"` to
+    /// signal that this is **not** the RFC 4445 VB-overflow model.
+    /// Consumers comparing against another MDI probe should treat the
+    /// numbers as approximate unless this field changes.
+    pub model: &'static str,
+    /// NDF in ms — `peak_iat − mean_iat` over the most recent window.
     pub delay_factor_ms: f32,
-    /// MLR in packets/s (sliding 1 s window).
+    /// MLR in events/s — TS continuity-counter discontinuities per second
+    /// on the post-recovered stream. This is **not** packets-lost-per-second
+    /// in the RFC 4445 sense (one CC gap can represent N packets).
     pub loss_rate_pps: f32,
     /// Number of windows where `delay_factor_ms` exceeded the configured
     /// alarm threshold (50 ms by default — the boundary between `OK` and
