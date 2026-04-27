@@ -15,4 +15,5 @@ pub mod port_error;
 pub mod rtp_parse;
 pub mod socket;
 pub mod time;
+pub mod tls;
 pub mod url_parse;

@@ -787,6 +787,10 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                     bail!("WHEP input: bearer_token must be at most 4096 characters");
                 }
             }
+            if let Some(ref fp) = whep.cert_fingerprint {
+                crate::util::tls::canonicalise_fingerprint(fp)
+                    .map_err(|e| anyhow::anyhow!("WHEP input: cert_fingerprint: {}", e))?;
+            }
             validate_input_transcode_group_a(
                 whep.audio_encode.as_ref(),
                 whep.transcode.as_ref(),
@@ -3324,6 +3328,11 @@ pub fn validate_output_with_input(
                 if token.len() > 4096 {
                     bail!("WebRTC output '{}': bearer_token must be at most 4096 characters", webrtc.id);
                 }
+            }
+            if let Some(ref fp) = webrtc.cert_fingerprint {
+                crate::util::tls::canonicalise_fingerprint(fp).map_err(|e| {
+                    anyhow::anyhow!("WebRTC output '{}': cert_fingerprint: {}", webrtc.id, e)
+                })?;
             }
             if let Some(ref ip) = webrtc.public_ip {
                 if ip.parse::<std::net::IpAddr>().is_err() {
@@ -6050,6 +6059,8 @@ mod tests {
             mode: WebrtcOutputMode::WhepServer,
             whip_url: None,
             bearer_token: None,
+            accept_self_signed_cert: None,
+            cert_fingerprint: None,
             max_viewers: Some(10),
             public_ip: None,
             video_only,
@@ -6089,6 +6100,8 @@ mod tests {
             mode: WebrtcOutputMode::WhepServer,
             whip_url: None,
             bearer_token: None,
+            accept_self_signed_cert: None,
+            cert_fingerprint: None,
             max_viewers: Some(10),
             public_ip: None,
             video_only: false,
@@ -6141,6 +6154,43 @@ mod tests {
             err.contains("WebRTC browsers only decode H.264"),
             "expected HEVC rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn validate_output_webrtc_cert_fingerprint_format() {
+        use crate::config::models::{OutputConfig, WebrtcOutputConfig, WebrtcOutputMode};
+        let make = |fp: Option<String>| OutputConfig::Webrtc(WebrtcOutputConfig {
+            active: true,
+            group: None,
+            id: "wrtc1".into(),
+            name: "wrtc 1".into(),
+            mode: WebrtcOutputMode::WhipClient,
+            whip_url: Some("https://example.com/whip".into()),
+            bearer_token: None,
+            accept_self_signed_cert: Some(false),
+            cert_fingerprint: fp,
+            max_viewers: None,
+            public_ip: None,
+            video_only: true,
+            program_number: None,
+            audio_encode: None,
+            transcode: None,
+            video_encode: None,
+        });
+        // Valid colon-separated 32-byte hex.
+        let valid_fp = "ab:cd:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab".to_string();
+        assert!(validate_output(&make(Some(valid_fp))).is_ok());
+        // Bare hex form should also be accepted.
+        let valid_bare = "abcd012345678 9abcdef0123456789abcdef0123456789abcdef0123456789ab".to_string();
+        assert!(validate_output(&make(Some(valid_bare))).is_ok());
+        // Wrong length → reject.
+        assert!(validate_output(&make(Some("ab:cd:ef".into()))).is_err());
+        // Non-hex → reject.
+        assert!(
+            validate_output(&make(Some("zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz:zz".into()))).is_err()
+        );
+        // None → OK (field is optional).
+        assert!(validate_output(&make(None)).is_ok());
     }
 
     #[test]

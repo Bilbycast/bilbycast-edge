@@ -63,11 +63,38 @@ struct Cli {
     /// Log level (trace, debug, info, warn, error)
     #[arg(short, long, default_value = "info")]
     log_level: String,
+
+    /// Print the one-shot setup-wizard bearer token from the loaded secrets
+    /// file and exit. Useful when the first-boot stdout banner was missed.
+    #[arg(long)]
+    print_setup_token: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // --print-setup-token: load the secrets file, print the token (or a clear
+    // "already registered" message), and exit. Runs before tracing init so the
+    // output stream stays clean for shell pipelines.
+    if cli.print_setup_token {
+        let secrets_path = cli.config.with_file_name("secrets.json");
+        let app_config = load_config_split(&cli.config, &secrets_path)?;
+        match app_config.setup_token.as_deref() {
+            Some(t) => {
+                println!("{t}");
+                return Ok(());
+            }
+            None => {
+                eprintln!(
+                    "no setup token configured — node already registered \
+                     (setup_enabled={}, setup_token=None)",
+                    app_config.setup_enabled,
+                );
+                return Ok(());
+            }
+        }
+    }
 
     // Initialize tracing
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -122,6 +149,38 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref mut mon) = app_config.monitor {
             mon.listen_port = mp;
         }
+    }
+
+    // First-boot setup-token bootstrap. Auto-generates a 256-bit one-shot
+    // bearer token if the wizard is still open and no token has been
+    // generated yet. The token is persisted (encrypted) to secrets.json
+    // and printed to stdout exactly once. Required by /setup for any
+    // non-loopback caller; cleared by the manager-client on first
+    // successful registration. Runs after CLI overrides so the banner
+    // reflects the actual listen port.
+    if app_config.setup_enabled && app_config.setup_token.is_none() {
+        use rand::RngExt;
+        let mut bytes = [0u8; 32];
+        rand::rng().fill(&mut bytes);
+        let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        app_config.setup_token = Some(token.clone());
+        save_config_split(&cli.config, &secrets_path, &app_config).map_err(|e| {
+            anyhow::anyhow!("Failed to persist auto-generated setup token: {e}")
+        })?;
+        println!(
+            "\n=== bilbycast-edge first-boot setup token ===\n\
+             {0}\n\
+             Use it to authenticate the wizard from a non-loopback caller:\n  \
+             curl -H 'Authorization: Bearer {0}' https://<node>:{1}/setup …\n\
+             Loopback (localhost / 127.0.0.1 / ::1) bypasses the check.\n\
+             The token is one-shot and is cleared automatically on the first\n\
+             successful manager registration. Re-print it any time with:\n  \
+             bilbycast-edge --config {2} --print-setup-token\n\
+             =================================================",
+            token,
+            app_config.server.listen_port,
+            cli.config.display(),
+        );
     }
 
     let listen_addr = format!(

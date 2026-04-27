@@ -1,11 +1,14 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::net::SocketAddr;
+
 use axum::Json;
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use crate::api::server::AppState;
 use crate::config::persistence::save_config_split_async;
@@ -81,11 +84,20 @@ pub async fn setup_status(State(state): State<AppState>) -> Json<SetupStatus> {
 }
 
 /// POST /setup — validates and saves setup configuration.
+///
+/// Auth model: requests originating from a loopback address (127.0.0.0/8 or ::1)
+/// bypass the bearer-token check — an operator who is already on the box has
+/// authenticated by other means (SSH, local console). Non-loopback callers must
+/// supply `Authorization: Bearer <setup_token>`, where `setup_token` is the
+/// one-shot token auto-generated on first boot and printed to stdout.
 pub async fn apply_setup(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(payload): Json<SetupPayload>,
 ) -> impl IntoResponse {
-    // Check if setup is enabled
+    // Check if setup is enabled, and (for non-loopback callers) verify the
+    // one-shot bearer token in constant time.
     {
         let config = state.config.read().await;
         if !config.setup_enabled {
@@ -97,6 +109,31 @@ pub async fn apply_setup(
                     error: Some("Setup wizard is disabled on this node".to_string()),
                 }),
             );
+        }
+        if !peer.ip().is_loopback() {
+            let expected = config.setup_token.as_deref().unwrap_or("");
+            let provided = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .unwrap_or("");
+            if expected.is_empty()
+                || !bool::from(provided.as_bytes().ct_eq(expected.as_bytes()))
+            {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(SetupResponse {
+                        success: false,
+                        message: None,
+                        error: Some(
+                            "setup token required: supply `Authorization: Bearer <token>`. \
+                             Run `bilbycast-edge --print-setup-token` on the node, or check the \
+                             first-boot stdout banner. Loopback callers bypass this check."
+                                .to_string(),
+                        ),
+                    }),
+                );
+            }
         }
     }
 

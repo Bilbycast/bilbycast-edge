@@ -353,10 +353,15 @@ async fn whep_input_loop(
         };
 
         // POST to WHEP endpoint
+        let tls = crate::util::tls::TlsTrust {
+            accept_self_signed: config.accept_self_signed_cert.unwrap_or(true),
+            fingerprint: config.cert_fingerprint.clone(),
+        };
         let (answer_sdp, _resource_url) = match crate::engine::webrtc::signaling::whep_post(
             &config.whep_url,
             &offer_sdp,
             config.bearer_token.as_deref(),
+            &tls,
         ).await {
             Ok(r) => r,
             Err(e) => {

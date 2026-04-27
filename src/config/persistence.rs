@@ -232,6 +232,7 @@ mod tests {
             node_id: None,
             device_name: None,
             setup_enabled: true,
+            setup_token: None,
             server: ServerConfig::default(),
             monitor: None,
             manager: None,

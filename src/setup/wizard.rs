@@ -15,8 +15,8 @@ h1{font-size:20px;font-weight:600;color:#f0f6fc;margin-bottom:4px}
 .subtitle{font-size:13px;color:#8b949e;margin-bottom:24px}
 label{display:block;font-size:13px;color:#c9d1d9;margin-bottom:4px;font-weight:500}
 .hint{font-size:11px;color:#8b949e;margin-bottom:12px}
-input[type="text"],input[type="number"]{width:100%;padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#f0f6fc;font-size:14px;font-family:inherit;margin-bottom:4px}
-input[type="text"]:focus,input[type="number"]:focus{outline:none;border-color:#58a6ff}
+input[type="text"],input[type="number"],input[type="password"]{width:100%;padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#f0f6fc;font-size:14px;font-family:inherit;margin-bottom:4px}
+input[type="text"]:focus,input[type="number"]:focus,input[type="password"]:focus{outline:none;border-color:#58a6ff}
 .checkbox-row{display:flex;align-items:center;gap:8px;margin-bottom:4px}
 .checkbox-row input[type="checkbox"]{accent-color:#58a6ff}
 .row{display:flex;gap:12px;margin-bottom:0}
@@ -40,6 +40,18 @@ button:disabled{background:#21262d;color:#484f58;cursor:not-allowed}
   <div id="loading" class="loading">Loading current configuration...</div>
 
   <form id="form" style="display:none" onsubmit="return submitForm(event)">
+    <div class="section">
+      <div class="section-title">Authentication</div>
+      <label for="setup_token">Setup Token</label>
+      <div class="hint">
+        Required from the LAN or internet. Loopback callers
+        (localhost / 127.0.0.1 / ::1) bypass this. Get the token from
+        the node's first-boot stdout banner, or run
+        <code>bilbycast-edge --print-setup-token</code> on the node.
+      </div>
+      <input type="password" id="setup_token" maxlength="128" placeholder="Required from LAN/internet">
+    </div>
+
     <div class="section">
       <div class="section-title">Device</div>
       <label for="device_name">Device Name</label>
@@ -137,9 +149,13 @@ function submitForm(e) {
     device_name: document.getElementById('device_name').value.trim() || null
   };
 
+  var token = document.getElementById('setup_token').value.trim();
+  var fetchHeaders = {'Content-Type': 'application/json'};
+  if (token) fetchHeaders['Authorization'] = 'Bearer ' + token;
+
   fetch('/setup', {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
+    headers: fetchHeaders,
     body: JSON.stringify(payload)
   })
   .then(function(r) { return r.json().then(function(d) { return {ok: r.ok, data: d}; }); })

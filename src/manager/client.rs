@@ -872,7 +872,13 @@ async fn persist_credentials(
     // accepting reconfiguration. Idempotent on reconnect.
     if cfg.setup_enabled {
         cfg.setup_enabled = false;
-        tracing::info!("Setup wizard disabled after successful manager registration");
+        // Clear the one-shot setup-wizard bearer token: the secret should not
+        // outlive its purpose. /setup is already gated on setup_enabled, so
+        // this is forensic hygiene rather than additional access control.
+        cfg.setup_token = None;
+        tracing::info!(
+            "Setup wizard disabled and one-shot token cleared after successful manager registration"
+        );
     }
     if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), cfg.clone()).await {
         tracing::warn!("Failed to persist manager credentials: {e}");

@@ -25,6 +25,13 @@ pub struct AppConfig {
     /// Set to false to disable the setup wizard after provisioning.
     #[serde(default = "default_true")]
     pub setup_enabled: bool,
+    /// One-shot bearer token gating the `/setup` wizard against non-loopback
+    /// callers. Auto-generated on first boot when `setup_enabled` is true and
+    /// no token exists in `secrets.json`; cleared on first successful manager
+    /// registration. Persisted in `secrets.json` (encrypted), never in
+    /// `config.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_token: Option<String>,
     /// Optional manager connection for centralized monitoring
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager: Option<crate::manager::ManagerConfig>,
@@ -63,6 +70,7 @@ impl Default for AppConfig {
             node_id: None,
             device_name: None,
             setup_enabled: true,
+            setup_token: None,
             server: ServerConfig::default(),
             monitor: None,
             manager: None,
@@ -548,6 +556,10 @@ fn default_grace_period() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_true_opt() -> Option<bool> {
+    Some(true)
 }
 
 /// System resource monitoring and threshold configuration.
@@ -1266,6 +1278,21 @@ pub struct WhepInputConfig {
     /// When true, only video is received (audio tracks ignored).
     #[serde(default)]
     pub video_only: bool,
+    /// Accept self-signed TLS certificates on the WHEP endpoint
+    /// (useful for testing against self-signed origin servers).
+    /// Defaults to `true` to preserve historical behaviour. Set to
+    /// `false` for production deployments that must validate the
+    /// CA chain. When `cert_fingerprint` is set, that takes
+    /// precedence and the CA chain IS validated regardless of this
+    /// flag — only the leaf-cert fingerprint check overlays it.
+    #[serde(default = "default_true_opt", skip_serializing_if = "Option::is_none")]
+    pub accept_self_signed_cert: Option<bool>,
+    /// SHA-256 fingerprint of the expected WHEP server certificate
+    /// (colon-separated hex, e.g. `"ab:cd:..."`). When set, full
+    /// CA-chain validation runs **and** the leaf-cert fingerprint
+    /// must match. Defends against compromised CAs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_fingerprint: Option<String>,
     /// Optional ingress audio re-encode. See [`RtpInputConfig::audio_encode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_encode: Option<AudioEncodeConfig>,
@@ -2718,6 +2745,21 @@ pub struct WebrtcOutputConfig {
     /// Optional Bearer token for WHIP/WHEP authentication.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearer_token: Option<String>,
+    /// Accept self-signed TLS certificates on the WHIP endpoint
+    /// (`whip_client` mode only — `whep_server` is the receiving
+    /// side and does not dial TLS). Defaults to `true` to preserve
+    /// historical behaviour for customer testing setups. Set to
+    /// `false` for production deployments that must validate the
+    /// CA chain. When `cert_fingerprint` is set, that takes
+    /// precedence and the CA chain IS validated regardless.
+    #[serde(default = "default_true_opt", skip_serializing_if = "Option::is_none")]
+    pub accept_self_signed_cert: Option<bool>,
+    /// SHA-256 fingerprint of the expected WHIP server certificate
+    /// (colon-separated hex). When set, full CA-chain validation
+    /// runs **and** the leaf-cert fingerprint must match. Defends
+    /// against compromised CAs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_fingerprint: Option<String>,
     /// Maximum concurrent viewers (WHEP server mode only, default: 10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_viewers: Option<u32>,
@@ -3698,6 +3740,7 @@ mod tests {
             node_id: None,
             device_name: None,
             setup_enabled: true,
+            setup_token: None,
             server: ServerConfig::default(),
             monitor: None,
             manager: None,

@@ -50,6 +50,12 @@ pub struct SecretsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_auth: Option<AuthConfig>,
 
+    /// One-shot bearer token that gates the `/setup` wizard against non-loopback
+    /// callers. Auto-generated on first boot when `setup_enabled` is true and
+    /// no token exists yet; cleared on the first successful manager registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_token: Option<String>,
+
     // -- Per-tunnel secrets, keyed by tunnel ID --
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tunnels: HashMap<String, TunnelSecrets>,
@@ -154,6 +160,7 @@ impl SecretsConfig {
             && self.manager_registration_token.is_none()
             && self.server_tls.is_none()
             && self.server_auth.is_none()
+            && self.setup_token.is_none()
             && self.tunnels.is_empty()
             && self.flows.is_empty()
     }
@@ -180,6 +187,9 @@ impl SecretsConfig {
 
         // Server auth
         secrets.server_auth = config.server.auth.clone();
+
+        // Setup wizard token
+        secrets.setup_token = config.setup_token.clone();
 
         // Tunnel secrets
         for tunnel in &config.tunnels {
@@ -225,6 +235,11 @@ impl SecretsConfig {
         // Server auth
         if self.server_auth.is_some() && config.server.auth.is_none() {
             config.server.auth = self.server_auth.clone();
+        }
+
+        // Setup wizard token
+        if self.setup_token.is_some() && config.setup_token.is_none() {
+            config.setup_token = self.setup_token.clone();
         }
 
         // Tunnel secrets
@@ -402,6 +417,9 @@ impl AppConfig {
         self.server.tls = None;
         self.server.auth = None;
 
+        // Setup wizard token — manager has no business seeing this
+        self.setup_token = None;
+
         // Tunnel secrets
         for tunnel in &mut self.tunnels {
             tunnel.tunnel_encryption_key = None;
@@ -434,6 +452,9 @@ impl AppConfig {
         self.server.tls = None;
         self.server.auth = None;
 
+        // Setup wizard token — internal
+        self.setup_token = None;
+
         // Tunnel secrets — internal
         for tunnel in &mut self.tunnels {
             tunnel.tunnel_encryption_key = None;
@@ -463,6 +484,11 @@ pub fn has_secrets(config: &AppConfig) -> bool {
 
     // Server TLS/auth
     if config.server.tls.is_some() || config.server.auth.is_some() {
+        return true;
+    }
+
+    // Setup wizard token
+    if config.setup_token.is_some() {
         return true;
     }
 
@@ -538,6 +564,7 @@ mod tests {
             node_id: Some("test-node".to_string()),
             device_name: Some("Test".to_string()),
             setup_enabled: true,
+            setup_token: None,
             server: ServerConfig::default(),
             monitor: None,
             manager: Some(ManagerConfig {

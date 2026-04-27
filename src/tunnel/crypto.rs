@@ -14,6 +14,27 @@
 //!
 //! Overhead: 28 bytes per operation (12 nonce + 16 tag).
 //! For a 1316-byte SRT packet, this is ~2% overhead.
+//!
+//! ## Nonce strategy and key-rotation guidance
+//!
+//! ChaCha20-Poly1305 takes a 96-bit nonce. We generate it from a CSPRNG
+//! per-message, which gives a birthday-paradox collision boundary at
+//! ~2^48 messages per key. At broadcast bitrates this is decades for a
+//! single tunnel, but operators running many tunnels under one key (or
+//! running the same key across edge restarts) should rotate the
+//! `tunnel_encryption_key` periodically.
+//!
+//! **Recommended rotation cadence**: the manager's `rotate_secret`
+//! mechanism should re-key any tunnel that has carried more than
+//! ~2^32 messages (≈ a day of 1 Gbps traffic at 1316-byte payloads),
+//! or every 30 days of operation, whichever comes first. The manager
+//! already has the rotation primitive — see
+//! `bilbycast-manager/CLAUDE.md` "Node secret rotation".
+//!
+//! A future protocol revision will move to XChaCha20-Poly1305 (192-bit
+//! nonce) which eliminates the rotation requirement entirely; that's a
+//! wire-format change and is gated on the next bump of
+//! `TUNNEL_PROTOCOL_VERSION`.
 
 use anyhow::{Context, Result};
 use ring::aead;

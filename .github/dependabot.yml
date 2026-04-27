@@ -1,26 +1,12 @@
 version: 2
 updates:
-  - package-ecosystem: "cargo"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-      time: "06:00"
-      timezone: "Australia/Sydney"
-    open-pull-requests-limit: 10
-    labels:
-      - "dependencies"
-      - "rust"
-    commit-message:
-      prefix: "deps"
-      include: "scope"
-    groups:
-      patch-updates:
-        update-types:
-          - "patch"
-      minor-updates:
-        update-types:
-          - "minor"
+  # cargo ecosystem intentionally omitted: bilbycast-edge has path dependencies
+  # into sibling repos (../bilbycast-fdk-aac-rs, ../bilbycast-ffmpeg-video-rs,
+  # ../bilbycast-libsrt-rs, ../bilbycast-rist, ../bilbycast-bonding) that
+  # Dependabot cannot resolve when cloning this repo alone, so the updater
+  # aborts before checking any registry deps. Registry CVEs are covered by the
+  # weekly cargo-audit run in security-audit.yml; routine version bumps are
+  # done manually with `cargo update`.
 
   - package-ecosystem: "github-actions"
     directory: "/"

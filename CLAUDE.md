@@ -125,7 +125,7 @@ All data flows through a single type: `RtpPacket { data: Bytes, sequence_number:
 | `tunnel/` | `manager.rs`, `relay_client.rs`, `udp_forwarder.rs`, `tcp_forwarder.rs`, `crypto.rs`, `auth.rs` | QUIC-based IP tunnels (relay/direct), end-to-end encryption, HMAC-SHA256 bind authentication. `protocol.rs` defines `TUNNEL_PROTOCOL_VERSION`, `ParsedMessage<T>` + `read_message_resilient()` for graceful handling of unknown message types, and `Hello`/`HelloAck` handshake for version detection |
 | `manager/` | `client.rs`, `config.rs`, `events.rs` | WebSocket client to bilbycast-manager. Sends stats (1s), health (15s), thumbnails (10s), operational events. Auth payload carries `protocol_version` + `software_version`. Handles get_config, flow CRUD + start/stop, input/output CRUD, add/remove output, tunnel CRUD, `update_flow` / `update_config` (both diff-based — `PartialEq` old vs new, flows only restart when input/metadata changes; output-only changes apply via hot-add/remove without disrupting other outputs or SRT connections). **Key behaviours:** `GetConfig` runs `strip_secrets()` so the manager never receives `node_secret`, tunnel keys, or SRT passphrases; `UpdateConfig` merges the incoming (secret-less) config with existing local secrets before applying. Event reference: [`docs/events-and-alarms.md`](docs/events-and-alarms.md). |
 | `monitor/` | `server.rs`, `dashboard.rs` | Embedded HTML/JS dashboard on separate port |
-| `setup/` | `handlers.rs`, `wizard.rs` | Browser-based setup wizard for initial provisioning (inline HTML, gated by `setup_enabled` config flag). `setup_enabled` auto-flips to `false` (persisted via `persist_credentials` in `manager/client.rs`) on the first successful manager registration so `/setup` stops accepting reconfiguration post-provisioning |
+| `setup/` | `handlers.rs`, `wizard.rs` | Browser-based setup wizard for initial provisioning (inline HTML, gated by `setup_enabled` config flag). `setup_enabled` auto-flips to `false` (persisted via `persist_credentials` in `manager/client.rs`) on the first successful manager registration so `/setup` stops accepting reconfiguration post-provisioning. **Auth gate:** `POST /setup` from a non-loopback address requires `Authorization: Bearer <setup_token>`. The token is auto-generated on first boot (256-bit OS RNG, hex-encoded), persisted encrypted in `secrets.json`, printed once to stdout, and cleared alongside `setup_enabled` on first manager registration. Loopback callers (`127.0.0.0/8`, `::1`) bypass the check (operator on the box has authenticated by other means). Re-print via `bilbycast-edge --print-setup-token` |
 | `srt/` | `connection.rs` | SRT socket config via `SrtConnectionParams` struct, stats polling (45+ fields including FEC, ACK/NAK, flow control, buffer state), `convert_srt_stats()` |
 | `util/` | `rtp_parse.rs`, `socket.rs`, `time.rs` | RTP header parsing, UDP/multicast, monotonic clock |
 
@@ -163,7 +163,7 @@ SRT uses AES-128/192/256 encryption + passphrase auth with selectable cipher mod
 
 ### API Structure (`src/api/server.rs`)
 
-- Public: `/health`, `/oauth/token`, `/metrics`, `/setup` (gated by `setup_enabled`)
+- Public: `/health`, `/oauth/token`, `/metrics`, `/setup` (gated by `setup_enabled` + a one-shot `setup_token` bearer check on non-loopback callers)
 - Read-only (JWT or auth-disabled): `GET /api/v1/*`
 - Admin (requires `admin` role): `POST/PUT/DELETE /api/v1/*`
 - **Inputs**: `GET /api/v1/inputs` (list), `POST /api/v1/inputs` (create), `GET /api/v1/inputs/{id}`, `PUT /api/v1/inputs/{id}`, `DELETE /api/v1/inputs/{id}`

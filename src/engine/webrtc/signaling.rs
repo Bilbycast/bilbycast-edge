@@ -6,8 +6,14 @@
 //! Implements the HTTP-based SDP exchange for WHIP (RFC 9725) and WHEP
 //! (draft-ietf-wish-whep). Used when bilbycast-edge acts as a WHIP client
 //! (output push) or WHEP client (input pull).
+//!
+//! TLS-trust policy is supplied by the caller via [`TlsTrust`]:
+//! standard CA validation, self-signed acceptance (for testing), or
+//! cert pinning (for production with a known leaf cert).
 
 use anyhow::{Result, bail};
+
+use crate::util::tls::{build_reqwest_client, TlsTrust};
 
 /// Perform WHIP client signaling: POST SDP offer, receive SDP answer.
 ///
@@ -22,10 +28,9 @@ pub async fn whip_post(
     url: &str,
     offer_sdp: &str,
     bearer_token: Option<&str>,
+    tls: &TlsTrust,
 ) -> Result<(String, String)> {
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true) // Allow self-signed for dev
-        .build()?;
+    let client = build_reqwest_client(tls).map_err(|e| anyhow::anyhow!(e))?;
 
     let mut request = client
         .post(url)
@@ -66,9 +71,10 @@ pub async fn whep_post(
     url: &str,
     offer_sdp: &str,
     bearer_token: Option<&str>,
+    tls: &TlsTrust,
 ) -> Result<(String, String)> {
     // WHEP uses the same POST SDP offer → 201 SDP answer pattern as WHIP
-    whip_post(url, offer_sdp, bearer_token).await
+    whip_post(url, offer_sdp, bearer_token, tls).await
 }
 
 /// Delete a WHIP/WHEP session resource.
@@ -76,10 +82,12 @@ pub async fn whep_post(
 /// Per RFC 9725, sending DELETE to the resource URL tears down the session.
 /// Retained: spec-correct session teardown per RFC 9725, to be wired into session lifecycle.
 #[allow(dead_code)]
-pub async fn delete_session(resource_url: &str, bearer_token: Option<&str>) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()?;
+pub async fn delete_session(
+    resource_url: &str,
+    bearer_token: Option<&str>,
+    tls: &TlsTrust,
+) -> Result<()> {
+    let client = build_reqwest_client(tls).map_err(|e| anyhow::anyhow!(e))?;
 
     let mut request = client.delete(resource_url);
 

@@ -131,6 +131,58 @@ present) instead.
 
 ---
 
+## Securing the setup wizard
+
+A fresh edge defaults to `setup_enabled: true` and exposes
+`POST /setup` until the first successful manager registration
+(after which the flag flips to `false` and the wizard returns
+the disabled-page).
+
+On first boot the node auto-generates a one-shot bearer token,
+persists it (encrypted) into `secrets.json`, and prints it once
+to **stdout** — look for the banner:
+
+```
+=== bilbycast-edge first-boot setup token ===
+<64-hex-character token>
+...
+=================================================
+```
+
+The token is required for any `POST /setup` arriving from a
+**non-loopback** address (LAN or internet). Loopback callers
+(`http://localhost:<port>/setup`, `127.0.0.1`, `[::1]`) bypass
+the check — an operator who is already on the box has
+authenticated by other means (SSH, local console).
+
+Re-print the token any time before registration:
+
+```bash
+bilbycast-edge --config /etc/bilbycast/edge.json --print-setup-token
+```
+
+Use it from a remote browser by pasting it into the wizard's
+**Setup Token** field. From the command line:
+
+```bash
+curl -k -X POST https://<node>:8443/setup \
+     -H "Authorization: Bearer <printed-token>" \
+     -H "Content-Type: application/json" \
+     -d '{ "manager_urls": ["wss://manager.example.com:8443/ws/node"], … }'
+```
+
+The token is cleared automatically once the node successfully
+registers with the manager; `/setup` itself starts returning
+the disabled-wizard page from that point on.
+
+**Known limitation:** the bypass classifies the request by its
+TCP source IP. Reverse proxies / iptables NAT rules that rewrite
+remote requests so they arrive on `127.0.0.1` will defeat the
+gate. Avoid such setups in front of `/setup` on internet-facing
+nodes.
+
+---
+
 ## Building from source
 
 ### Linux (Ubuntu / Debian)
