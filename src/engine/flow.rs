@@ -776,6 +776,7 @@ impl FlowRuntime {
         #[cfg(feature = "replay")]
         let recording_handle: Option<Arc<crate::replay::writer::RecordingHandle>> =
             if let Some(rec_cfg) = config.config.recording.as_ref().filter(|r| r.enabled).cloned() {
+                let pre_buffer_seconds = rec_cfg.pre_buffer_seconds;
                 match crate::replay::writer::spawn_writer(
                     config.config.id.clone(),
                     rec_cfg,
@@ -790,16 +791,40 @@ impl FlowRuntime {
                         // a per-flow status round-trip.
                         let _ = flow_stats.recording_stats.set(h.stats.clone());
                         let _ = flow_stats.recording_id.set(h.recording_id.clone());
-                        event_sender.emit_with_details(
-                            crate::manager::events::EventSeverity::Info,
-                            crate::manager::events::category::REPLAY,
-                            format!("Recording started for flow '{}'", config.config.id),
-                            Some(&config.config.id),
-                            serde_json::json!({
-                                "replay_event": "recording_started",
-                                "recording_id": h.recording_id,
-                            }),
-                        );
+                        // Phase 2.2 — emit a different event depending on
+                        // whether the writer auto-armed (legacy: no pre-
+                        // buffer, recording session begins at flow start)
+                        // or is sitting in pre-buffer mode (always-on ring
+                        // buffer, recording session begins on operator
+                        // Start). Both events ride category `replay`.
+                        if let Some(pb) = pre_buffer_seconds {
+                            event_sender.emit_with_details(
+                                crate::manager::events::EventSeverity::Info,
+                                crate::manager::events::category::REPLAY,
+                                format!(
+                                    "Pre-buffer ({pb} s) active for flow '{}' — \
+                                     recording will begin on Start",
+                                    config.config.id
+                                ),
+                                Some(&config.config.id),
+                                serde_json::json!({
+                                    "replay_event": "recording_pre_buffer_started",
+                                    "recording_id": h.recording_id,
+                                    "pre_buffer_seconds": pb,
+                                }),
+                            );
+                        } else {
+                            event_sender.emit_with_details(
+                                crate::manager::events::EventSeverity::Info,
+                                crate::manager::events::category::REPLAY,
+                                format!("Recording started for flow '{}'", config.config.id),
+                                Some(&config.config.id),
+                                serde_json::json!({
+                                    "replay_event": "recording_started",
+                                    "recording_id": h.recording_id,
+                                }),
+                            );
+                        }
                         Some(Arc::new(h))
                     }
                     Err(e) => {

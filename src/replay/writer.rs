@@ -25,9 +25,9 @@
 //! Mirrors the slow-consumer pattern in `engine::output_udp` — slow disk
 //! never propagates back to the broadcast channel.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -50,6 +50,23 @@ use super::{MarkInAck, RecordingCommand};
 
 /// 188-byte MPEG-TS packet size.
 const TS_PACKET: usize = 188;
+/// `RecordingStats.mode` discriminants. Match the [`WriterMode`] variants
+/// plus the post-Stop "no pre-buffer" branch that reports as `MODE_IDLE`.
+pub const MODE_IDLE: u8 = 0;
+pub const MODE_PRE_BUFFER: u8 = 1;
+pub const MODE_ARMED: u8 = 2;
+
+/// Map a [`RecordingStats::mode`] discriminant to the canonical wire
+/// string used by `RecordingSnapshot.mode` and the `recording_status` WS
+/// response. Unknown discriminants resolve to `"idle"` to keep the
+/// wire-shape forward-compatible if a future variant is added.
+pub fn mode_to_wire_str(mode: u8) -> &'static str {
+    match mode {
+        MODE_PRE_BUFFER => "pre_buffer",
+        MODE_ARMED => "armed",
+        _ => "idle",
+    }
+}
 /// MPEG-TS sync byte.
 const SYNC_BYTE: u8 = 0x47;
 /// Bounded queue between the subscriber and the writer task. Sized so a
@@ -71,8 +88,22 @@ pub struct RecordingStats {
     pub packets_dropped: AtomicU64,
     pub index_entries: AtomicU64,
     pub current_pts_90khz: AtomicU64,
+    /// Wall-clock Unix milliseconds of the most recent successful TS
+    /// append. The manager uses this as a freshness signal — if `armed`
+    /// is true but this value stops advancing while the WS connection
+    /// is healthy, the recorder has stalled. `0` until the first write.
+    pub last_write_unix_ms: AtomicU64,
     /// Set to true on first sample, false after `stop_recording`.
     pub armed: AtomicBool,
+    /// Externally-visible writer state. Mirrors the writer's internal
+    /// [`WriterMode`] plus the post-Stop "no pre-buffer" branch which
+    /// reports as `MODE_IDLE`. Drives the manager UI's tri-state badge
+    /// (`Recording` / `Pre-roll` / `Idle`) and the flow-card
+    /// `● PRE-ROLL` chip — operators on a pre-buffered flow need to see
+    /// that the recorder is rolling pre-roll TS even though `armed` is
+    /// `false`. `0` = idle, `1` = pre-buffer, `2` = armed; legacy
+    /// readers that don't know the field can ignore it without loss.
+    pub mode: AtomicU8,
 }
 
 /// `recording.json` shape — small, append-only metadata sidecar.
@@ -130,11 +161,29 @@ pub async fn spawn_writer(
     tokio::fs::create_dir_all(&staging).await
         .with_context(|| format!("create recording staging {}", staging.display()))?;
 
+    // Crash-recovery scan. If the edge was SIGKILL'd mid-segment, three
+    // forms of leftover state can survive into the next start:
+    //   * Orphan `.tmp/<NNNNNN>.ts` partial segments — never atomically
+    //     renamed onto the main directory, so they're not part of the
+    //     recording but still consume disk.
+    //   * A `recording.json` whose `current_segment_id` is stale or the
+    //     file is truncated/corrupt — would cause segment-id reuse and
+    //     overwrite finalized segments on the next roll.
+    //   * An `index.bin` truncated mid-entry — handled inside
+    //     `IndexWriter::open` / `InMemoryIndex::load`, not here.
+    // Scan the directory once: unlink `.tmp/*.ts` orphans and derive the
+    // largest finalized segment id so the next roll picks `max + 1`
+    // regardless of what the meta file says. This is also the recovery
+    // path when `recording.json` deserialise fails.
+    let recovered_orphans = recover_tmp_orphans(&staging).await;
+    let max_finalized_id = scan_max_segment_id(&dir).await;
+
     // Write or update recording.json. Existing recording = resume.
     let meta_path = dir.join("recording.json");
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let existing_meta = if tokio::fs::try_exists(&meta_path).await.unwrap_or(false) {
+    let meta_existed = tokio::fs::try_exists(&meta_path).await.unwrap_or(false);
+    let existing_meta: Option<RecordingMeta> = if meta_existed {
         match tokio::fs::read(&meta_path).await {
             Ok(b) => serde_json::from_slice::<RecordingMeta>(&b).ok(),
             Err(_) => None,
@@ -142,7 +191,42 @@ pub async fn spawn_writer(
     } else {
         None
     };
-    let starting_segment = existing_meta.as_ref().map(|m| m.current_segment_id).unwrap_or(0);
+    let meta_corrupt = meta_existed && existing_meta.is_none();
+    // Pick the next segment id by walking the directory: trust whatever
+    // is on disk over what `recording.json` claims, because the meta
+    // write is best-effort on the roll path. `meta.current_segment_id`
+    // is the *just-finalized* id, so the resume id is `max(disk, meta) + 1`
+    // — except on a fresh recording where both are 0 and we start at 0.
+    let meta_seg = existing_meta.as_ref().map(|m| m.current_segment_id);
+    let starting_segment = match (max_finalized_id, meta_seg) {
+        (Some(disk), Some(meta)) => disk.max(meta).saturating_add(1),
+        (Some(disk), None) => disk.saturating_add(1),
+        (None, Some(meta)) if existing_meta.is_some() => meta,
+        _ => 0,
+    };
+    if recovered_orphans > 0 || meta_corrupt
+        || max_finalized_id.zip(meta_seg).map(|(d, m)| d > m).unwrap_or(false)
+    {
+        events.emit_with_details(
+            EventSeverity::Warning,
+            category::REPLAY,
+            format!(
+                "Recording '{recording_id}' recovered after restart: {recovered_orphans} \
+                 .tmp orphan(s) cleaned, resuming at segment {starting_segment}\
+                 {}",
+                if meta_corrupt { ", recording.json was corrupt" } else { "" }
+            ),
+            None,
+            serde_json::json!({
+                "error_code": "replay_recovery_alert",
+                "replay_event": "recovery_alert",
+                "recording_id": recording_id,
+                "tmp_orphans_removed": recovered_orphans,
+                "meta_corrupt": meta_corrupt,
+                "next_segment_id": starting_segment,
+            }),
+        );
+    }
     let meta = RecordingMeta {
         schema_version: 1,
         recording_id: recording_id.clone(),
@@ -152,8 +236,28 @@ pub async fn spawn_writer(
     };
     write_meta_atomic(&meta_path, &meta).await?;
 
+    // Phase 2.2 — derive initial mode from the config. With
+    // `pre_buffer_seconds` set, the writer auto-arms in `PreBuffer`
+    // mode (operator hasn't pressed Start yet); otherwise the writer
+    // starts in `Armed` mode (Phase 1 behaviour: the writer being
+    // spawned at all means the recording session is live). `armed` on
+    // the stats snapshot tracks the recording-session boolean only —
+    // pre-buffer is intentionally not "armed" so the manager UI and
+    // stall detector can distinguish the two states.
+    let initial_mode = if config.pre_buffer_seconds.is_some() {
+        WriterMode::PreBuffer
+    } else {
+        WriterMode::Armed
+    };
     let stats = Arc::new(RecordingStats::default());
-    stats.armed.store(true, Ordering::Relaxed);
+    stats.armed.store(matches!(initial_mode, WriterMode::Armed), Ordering::Relaxed);
+    stats.mode.store(
+        match initial_mode {
+            WriterMode::PreBuffer => MODE_PRE_BUFFER,
+            WriterMode::Armed => MODE_ARMED,
+        },
+        Ordering::Relaxed,
+    );
 
     let cancel = parent_cancel.child_token();
     let (writer_tx, writer_rx) = mpsc::channel::<Bytes>(WRITER_QUEUE_CAP);
@@ -193,8 +297,10 @@ pub async fn spawn_writer(
         disk_pressure_emitted: false,
         accumulated_pts: 0,
         last_pcr: None,
+        pending_pcr_discontinuity: false,
         timecode: TimecodeTracker::new(),
         in_point: Arc::new(Mutex::new(None)),
+        mode: initial_mode,
     };
 
     let join = tokio::spawn(async move {
@@ -255,6 +361,26 @@ async fn subscriber_loop(
     }
 }
 
+/// Writer arming state. Phase 2.2 split.
+///
+/// * `Stopped` — no pre-buffer configured and the operator hasn't
+///   started a recording session. The writer task isn't even spawned
+///   in this mode (the FlowRuntime skips `spawn_writer`).
+/// * `PreBuffer` — pre-buffer is configured (`recording.pre_buffer_seconds.is_some()`)
+///   and the operator hasn't pressed Start. Segments roll to disk with
+///   retention pinned at `pre_buffer_seconds`. `RecordingStats.armed`
+///   stays false so the manager UI distinguishes pre-roll from a
+///   recording session, and the manager's stall detector doesn't
+///   trigger (it gates on `armed`).
+/// * `Armed` — recording session active. Retention bumps to the full
+///   `recording.retention_seconds`. Existing pre-buffer segments
+///   become the head of the recording. `armed` flips true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterMode {
+    PreBuffer,
+    Armed,
+}
+
 struct WriterState {
     recording_id: String,
     dir: PathBuf,
@@ -273,8 +399,17 @@ struct WriterState {
     disk_pressure_emitted: bool,
     accumulated_pts: u64,
     last_pcr: Option<u64>,
+    /// Sticky bit set when an unusually large PCR step is observed.
+    /// Cleared by the next IDR after stamping `flag::PCR_DISCONTINUITY`
+    /// onto its index entry — readers use this to avoid wallclock-pacing
+    /// across a stream-source change.
+    pending_pcr_discontinuity: bool,
     timecode: TimecodeTracker,
     in_point: Arc<Mutex<Option<u64>>>,
+    /// Current arming state. Drives retention selection in
+    /// [`WriterState::effective_retention_seconds`] and the meaning of
+    /// the Start / Stop commands. See [`WriterMode`].
+    mode: WriterMode,
 }
 
 struct OpenSegment {
@@ -297,6 +432,7 @@ async fn writer_loop(
             _ = cancel.cancelled() => {
                 state.flush_and_close().await;
                 state.stats.armed.store(false, Ordering::Relaxed);
+                state.stats.mode.store(MODE_IDLE, Ordering::Relaxed);
                 return;
             }
             cmd = cmd_rx.recv() => match cmd {
@@ -304,6 +440,7 @@ async fn writer_loop(
                 None => {
                     state.flush_and_close().await;
                     state.stats.armed.store(false, Ordering::Relaxed);
+                    state.stats.mode.store(MODE_IDLE, Ordering::Relaxed);
                     return;
                 }
             },
@@ -326,13 +463,24 @@ async fn writer_loop(
                         // so subsequent commands surface a meaningful state
                         // rather than a generic "send to closed channel" — but
                         // future packets are silently dropped until the
-                        // operator stops/restarts.
-                        state.current_segment = None;
+                        // operator stops/restarts. Best-effort close the
+                        // partial segment so we don't leave a half-finished
+                        // .tmp/<id>.ts on disk; on ENOSPC the close itself
+                        // will likely fail too, so unlink the staging path
+                        // as a fallback. Either way the file handle is
+                        // released here, not when the writer task exits.
+                        if let Some(seg) = state.current_segment.take() {
+                            let staging = seg.staging_path.clone();
+                            if close_segment(seg).await.is_err() {
+                                let _ = tokio::fs::remove_file(&staging).await;
+                            }
+                        }
                     }
                 }
                 None => {
                     state.flush_and_close().await;
                     state.stats.armed.store(false, Ordering::Relaxed);
+                    state.stats.mode.store(MODE_IDLE, Ordering::Relaxed);
                     return;
                 }
             }
@@ -377,6 +525,11 @@ impl WriterState {
                 .with_context(|| format!("write to segment {} of {}", seg.id, self.recording_id))?;
             seg.bytes_written += ts.len() as u64;
             self.stats.bytes_written.fetch_add(ts.len() as u64, Ordering::Relaxed);
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            self.stats.last_write_unix_ms.store(now_ms, Ordering::Relaxed);
         }
         // Best-effort index append — failure here is a soft error (the
         // index is rebuildable from segments alone), so we log and
@@ -426,17 +579,26 @@ impl WriterState {
         }
         // Update accumulated PTS from PCR. Wraps every ~26 hours at 33-bit
         // base; accumulate into a 64-bit pseudo-PTS so the index stays
-        // monotonic across the wrap.
+        // monotonic across the wrap. If the per-step delta is suspiciously
+        // large (> 5 min of 90 kHz ticks) we treat it as a stream
+        // discontinuity rather than a real elapsed gap — could be an
+        // explicit PCR reset (live → file transition, encoder restart) or
+        // a corrupted PCR field. The next IDR's index entry gets the
+        // `PCR_DISCONTINUITY` flag so playback can avoid wallclock-pacing
+        // across the boundary.
+        const PCR_DISCONTINUITY_THRESHOLD_90KHZ: u64 = 90_000 * 60 * 5; // 5 minutes
         if let Some(new_pcr) = pcr_field {
             let wrap_modulus: u64 = 1u64 << 33;
             let delta = match self.last_pcr {
                 None => 0u64,
-                Some(prev) => {
-                    let raw = new_pcr.wrapping_sub(prev) & (wrap_modulus - 1);
-                    raw
-                }
+                Some(prev) => new_pcr.wrapping_sub(prev) & (wrap_modulus - 1),
             };
-            self.accumulated_pts = self.accumulated_pts.wrapping_add(delta);
+            if delta > PCR_DISCONTINUITY_THRESHOLD_90KHZ {
+                self.pending_pcr_discontinuity = true;
+                self.accumulated_pts = self.accumulated_pts.wrapping_add(1);
+            } else {
+                self.accumulated_pts = self.accumulated_pts.wrapping_add(delta);
+            }
             self.last_pcr = Some(new_pcr);
             self.stats.current_pts_90khz.store(self.accumulated_pts, Ordering::Relaxed);
         }
@@ -457,13 +619,15 @@ impl WriterState {
         if random_access {
             let snap = self.timecode.snapshot();
             let tc_packed = smpte_tc_packed(snap.as_ref());
+            let pcr_disc = std::mem::replace(&mut self.pending_pcr_discontinuity, false);
             let entry = IndexEntry {
                 pts_90khz: self.accumulated_pts,
                 smpte_tc: tc_packed.unwrap_or(0xFFFFFFFF),
                 segment_id: self.current_segment.as_ref().map(|s| s.id).unwrap_or(0),
                 byte_offset: byte_offset_in_seg,
                 flags: flag::IS_IDR
-                    | if tc_packed.is_some() { flag::SMPTE_TC_VALID } else { 0 },
+                    | if tc_packed.is_some() { flag::SMPTE_TC_VALID } else { 0 }
+                    | if pcr_disc { flag::PCR_DISCONTINUITY } else { 0 },
             };
             return Some(entry);
         }
@@ -480,7 +644,30 @@ impl WriterState {
             self.run_retention().await;
             // Update meta with next segment id.
             self.meta.current_segment_id = self.meta.current_segment_id.wrapping_add(1);
-            let _ = write_meta_atomic(&self.meta_path, &self.meta).await;
+            // Surface meta-write failures to the operator. On restart the
+            // recovery scan in `WriterState::new` will derive the next
+            // segment id from the directory listing, so a stale meta
+            // doesn't cause segment-id reuse — but the operator should
+            // still see the warning so they can investigate (typically
+            // ENOSPC on the same volume that holds the segments).
+            if let Err(e) = write_meta_atomic(&self.meta_path, &self.meta).await {
+                tracing::warn!(target: "replay", "meta write failed: {e:#}");
+                self.events.emit_with_details(
+                    EventSeverity::Warning,
+                    category::REPLAY,
+                    format!(
+                        "Recording '{}' metadata write failed: {e} (recovery scan will resume from directory listing)",
+                        self.recording_id
+                    ),
+                    None,
+                    serde_json::json!({
+                        "error_code": "replay_metadata_stale",
+                        "replay_event": "metadata_stale",
+                        "recording_id": self.recording_id,
+                        "current_segment_id": self.meta.current_segment_id,
+                    }),
+                );
+            }
         }
         // Open the new segment.
         let id = self.meta.current_segment_id;
@@ -537,18 +724,57 @@ impl WriterState {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let mut total: u64 = entries.iter().map(|(_, _, s)| s).sum();
+        let retention = self.effective_retention_seconds();
+        // The just-finalized segment id (`run_retention` is called after
+        // `current_segment.take()` and *before* the id bump in
+        // `roll_segment`, so `meta.current_segment_id` here is the id of
+        // the segment we just closed). Never prune it — losing the most
+        // recent segment would tear out clips that touch the live edge,
+        // and on a fresh-after-stop_recording call the next start would
+        // reuse the id and overwrite the very segment we just kept on
+        // disk for the retention window.
+        let protected_id = self.meta.current_segment_id;
+        let mut max_bytes_unmet = false;
         for (id, mtime, size) in entries {
-            let too_old = self.config.retention_seconds > 0
-                && now_unix.saturating_sub(mtime) > self.config.retention_seconds;
+            let too_old = retention > 0
+                && now_unix.saturating_sub(mtime) > retention;
             let too_big = self.config.max_bytes > 0 && total > self.config.max_bytes;
             if !too_old && !too_big {
                 break;
+            }
+            if id == protected_id {
+                // Can't satisfy `max_bytes` without deleting the live edge —
+                // remember it and surface a Warning at the end so the
+                // operator sees their cap is smaller than one segment.
+                if too_big {
+                    max_bytes_unmet = true;
+                }
+                continue;
             }
             let path = self.dir.join(format!("{:06}.ts", id));
             if tokio::fs::remove_file(&path).await.is_ok() {
                 total = total.saturating_sub(size);
                 self.stats.segments_pruned.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        if max_bytes_unmet {
+            self.events.emit_with_details(
+                EventSeverity::Warning,
+                category::REPLAY,
+                format!(
+                    "Recording '{}' max_bytes ({}) is smaller than one segment — \
+                     retention cannot keep usage under the cap without deleting the live edge",
+                    self.recording_id, self.config.max_bytes
+                ),
+                None,
+                serde_json::json!({
+                    "error_code": "replay_max_bytes_below_segment",
+                    "replay_event": "max_bytes_below_segment",
+                    "recording_id": self.recording_id,
+                    "max_bytes": self.config.max_bytes,
+                    "segment_seconds": self.config.segment_seconds,
+                }),
+            );
         }
         // Disk-pressure signal — emit once at 80 % of either the
         // configured per-recording cap or the filesystem free space.
@@ -604,15 +830,75 @@ impl WriterState {
         let _ = self.index_writer.flush_and_sync().await;
     }
 
+    /// Retention window currently in force. In `Armed` mode this is the
+    /// configured `recording.retention_seconds`; in `PreBuffer` mode it
+    /// snaps to `recording.pre_buffer_seconds` so the on-disk window
+    /// stays bounded to "the last N seconds" while the operator hasn't
+    /// pressed Start. `0` always means unlimited (subject to
+    /// `max_bytes` and free disk).
+    fn effective_retention_seconds(&self) -> u64 {
+        match self.mode {
+            WriterMode::Armed => self.config.retention_seconds,
+            WriterMode::PreBuffer => self
+                .config
+                .pre_buffer_seconds
+                .map(|s| s as u64)
+                .unwrap_or(self.config.retention_seconds),
+        }
+    }
+
     async fn handle_command(&mut self, cmd: RecordingCommand) {
         match cmd {
             RecordingCommand::Start { reply } => {
+                let was_pre_buffer = self.mode == WriterMode::PreBuffer;
+                let pre_buffered_secs = if was_pre_buffer {
+                    self.config.pre_buffer_seconds.unwrap_or(0)
+                } else {
+                    0
+                };
+                self.mode = WriterMode::Armed;
                 self.stats.armed.store(true, Ordering::Relaxed);
+                self.stats.mode.store(MODE_ARMED, Ordering::Relaxed);
+                if was_pre_buffer {
+                    // Inform the manager that the recording session
+                    // started with N seconds of pre-buffered TS already
+                    // on disk — the UI uses this to render the
+                    // recording's "true zero" earlier than `now()`.
+                    self.events.emit_with_details(
+                        EventSeverity::Info,
+                        category::REPLAY,
+                        format!(
+                            "Recording '{}' armed (pre-buffer rolled in: {pre_buffered_secs} s)",
+                            self.recording_id
+                        ),
+                        None,
+                        serde_json::json!({
+                            "replay_event": "recording_started",
+                            "recording_id": self.recording_id,
+                            "pre_buffered_seconds": pre_buffered_secs,
+                        }),
+                    );
+                }
                 let _ = reply.send(Ok(self.recording_id.clone()));
             }
             RecordingCommand::Stop { reply } => {
+                let has_pre_buffer = self.config.pre_buffer_seconds.is_some();
                 self.stats.armed.store(false, Ordering::Relaxed);
-                self.flush_and_close().await;
+                if has_pre_buffer {
+                    // Drop back into pre-buffer mode — keep writing,
+                    // retention shrinks to `pre_buffer_seconds`.
+                    // Older segments prune naturally on the next roll
+                    // via the now-tighter `effective_retention_seconds`.
+                    self.mode = WriterMode::PreBuffer;
+                    self.stats.mode.store(MODE_PRE_BUFFER, Ordering::Relaxed);
+                } else {
+                    // No pre-buffer: classic stop, flush and close the
+                    // current segment. The writer task stays alive until
+                    // the cancel signal so subsequent commands can still
+                    // get a meaningful ack.
+                    self.flush_and_close().await;
+                    self.stats.mode.store(MODE_IDLE, Ordering::Relaxed);
+                }
                 let _ = reply.send(Ok(()));
             }
             RecordingCommand::MarkIn { explicit_pts, reply } => {
@@ -646,6 +932,7 @@ impl WriterState {
                 let res = self.clips.create(
                     &self.recording_id, in_pts, out_pts,
                     smpte_in, smpte_out, name, description, created_by,
+                    Vec::new(),
                 ).await;
                 if let Ok(ref clip) = res {
                     self.events.emit_with_details(
@@ -665,6 +952,51 @@ impl WriterState {
             }
         }
     }
+}
+
+/// Walk `<recording_dir>/.tmp/` and unlink any `<NNNNNN>.ts` files
+/// left behind by a crash mid-segment. The atomic rename onto the
+/// final segment path is the commit point — anything still in `.tmp/`
+/// at startup is partial data the writer never published.
+async fn recover_tmp_orphans(staging: &Path) -> u64 {
+    let mut count = 0u64;
+    let mut dir = match tokio::fs::read_dir(staging).await {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+    while let Ok(Some(e)) = dir.next_entry().await {
+        let name = e.file_name();
+        let Some(name_str) = name.to_str() else { continue };
+        let Some(stem) = name_str.strip_suffix(".ts") else { continue };
+        if stem.parse::<u32>().is_err() {
+            continue;
+        }
+        if tokio::fs::remove_file(e.path()).await.is_ok() {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Largest `<NNNNNN>.ts` segment id present in the main recording
+/// directory, or `None` on a fresh recording. Used as the source of
+/// truth for resume-after-crash because `recording.json` is best-effort
+/// on the roll path.
+async fn scan_max_segment_id(dir: &Path) -> Option<u32> {
+    let mut max_id: Option<u32> = None;
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(d) => d,
+        Err(_) => return None,
+    };
+    while let Ok(Some(e)) = entries.next_entry().await {
+        let name = e.file_name();
+        let Some(name_str) = name.to_str() else { continue };
+        let Some(stem) = name_str.strip_suffix(".ts") else { continue };
+        if let Ok(id) = stem.parse::<u32>() {
+            max_id = Some(max_id.map_or(id, |cur| cur.max(id)));
+        }
+    }
+    max_id
 }
 
 /// Strip the 12-byte RTP header if the buffer looks like RTP-wrapped TS

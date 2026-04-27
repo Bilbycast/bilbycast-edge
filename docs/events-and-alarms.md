@@ -555,10 +555,13 @@ also set `details.error_code` for `command_ack` correlation.
 | `writer_lagged` | Critical | The recording writer's bounded internal channel filled — packets dropped to keep the broadcast channel non-blocking. Rate-limited to one event per 5 s under sustained lag. | `replay_writer_lagged` |
 | `disk_pressure` | Warning | Recording disk usage crossed 80 % of the configured `max_bytes` cap (or of the replay-root filesystem when `max_bytes = 0`). Sticky until usage falls back below 70 % so the events feed isn't spammed. `details.pct` carries the snapshot percentage. Emit early so operators can free disk before the recorder hits ENOSPC. | `replay_disk_pressure` |
 | `disk_full` | Critical | The writer hit a disk-write error (typically EOSPC). Recording stops; the flow remains up. | `replay_disk_full` |
+| `recovery_alert` | Warning | Edge restarted after a crash; `.tmp/` orphan segments were unlinked and / or `recording.json` was corrupt. Resume continues from the largest segment id on disk + 1. `details.tmp_orphans_removed`, `details.meta_corrupt`, `details.next_segment_id`. | `replay_recovery_alert` |
+| `metadata_stale` | Warning | `recording.json` write failed on segment roll. Recovery scan on next start derives the resume id from the directory listing. | `replay_metadata_stale` |
+| `max_bytes_below_segment` | Warning | Retention can't satisfy `max_bytes` without unlinking the live edge — the operator's cap is smaller than one segment. | `replay_max_bytes_below_segment` |
 
 Stable `command_ack.error_code` values surfaced by the replay-server WS
 actions (`start_recording`, `mark_in`, `mark_out`, `cue_clip`,
-`play_clip`, `scrub_playback`, `delete_clip`, …):
+`play_clip`, `scrub_playback`, `delete_clip`, `get_clip`, …):
 
 | `error_code` | Meaning |
 |---|---|
@@ -570,6 +573,13 @@ actions (`start_recording`, `mark_in`, `mark_out`, `cue_clip`,
 | `replay_disk_full` | The recording writer could not write a segment — typically EOSPC |
 | `replay_index_corrupt` | `index.bin` failed CRC / size validation on startup; the writer surfaces this as a Warning + rebuild |
 | `replay_invalid_segment_seconds` / `replay_invalid_recording_id` / `replay_storage_id_invalid` | Validation rejection at config save / `update_flow` time |
+| `replay_invalid_field` | `mark_out` / `rename_clip` / `update_clip` `name` exceeded 256 chars / contained control characters, or `description` exceeded 4096 chars |
+| `replay_invalid_range` | `play_clip` / `scrub_playback` was given a `to_pts_90khz` < `from_pts_90khz` (or below the clip's `in_pts`); `update_clip` was given a prospective `in_pts_90khz` / `out_pts_90khz` that would invert the clip range |
+| `replay_invalid_tag` | Phase 2 / 1.5 — `update_clip` (or any tag-bearing path) carried a tag that failed `[A-Z0-9_-]{1,32}`, or > 16 tags per clip |
+| `replay_clip_update_failed` | `update_clip` produced no result (clip vanished mid-update or persistence failed for an unclassified reason) |
+| `replay_recovery_alert` | Crash-recovery scan ran on writer init — see matching Warning event |
+| `replay_metadata_stale` | `recording.json` write failed; resume id is derived from disk on restart |
+| `replay_max_bytes_below_segment` | `max_bytes` smaller than one segment — retention can't keep usage under the cap without deleting the live edge |
 
 Producers should use `EventSender::emit_with_details(EventSeverity::*,
 category::REPLAY, message, flow_id, details)` (defined in

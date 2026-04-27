@@ -127,6 +127,14 @@ pub struct ClipInfo {
     /// can decide how to attribute).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
+    /// Phase 2 — operator-supplied short labels (e.g., `GOAL`, `FOUL`,
+    /// `OFFSIDE`, `VAR-CHECK`) used by the manager UI's quick-tag bar
+    /// and tag-pill clip-list filter. Bounds are validated at the WS
+    /// dispatcher (`replay_invalid_tag`) — each tag matches
+    /// `^[A-Z0-9_-]{1,32}$`, max 16 tags per clip. Empty by default
+    /// for legacy clips loaded from disk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 impl ClipInfo {
@@ -208,10 +216,20 @@ pub enum ReplayCommand {
     /// Start playback. With `clip_id` set, plays that clip's range.
     /// With `from_pts`/`to_pts`, plays the explicit range. Both unset =
     /// play from current cued position (or beginning of recording).
+    ///
+    /// Phase 2.4 — `speed` clamps to `(0.0, 1.0]`; the pacer rewrites
+    /// PCR + PES PTS/DTS so the downstream decoder's clock advances at
+    /// wall-clock rate even at sub-1.0× speed. `None` = 1.0× (unchanged
+    /// from Phase 1). Phase 2.5 — `start_at_unix_ms` is a future
+    /// wall-clock anchor; the input task sleeps until that instant
+    /// before flipping to playing, used by the multi-cam sync group to
+    /// align N members within ~1 frame.
     Play {
         clip_id: Option<String>,
         from_pts_90khz: Option<u64>,
         to_pts_90khz: Option<u64>,
+        speed: Option<f32>,
+        start_at_unix_ms: Option<u64>,
         reply: oneshot::Sender<Result<()>>,
     },
     /// Stop playback. The replay input goes idle (NULL-PID padding).
@@ -223,4 +241,27 @@ pub enum ReplayCommand {
         pts_90khz: u64,
         reply: oneshot::Sender<Result<ScrubAck>>,
     },
+    /// Phase 2.4 — change playback speed live. `speed ∈ (0.0, 1.0]`.
+    /// Re-anchors the pacer (`pcr_in/out` snap to the most recent
+    /// observed PCR) so the output clock stays continuous across the
+    /// speed change.
+    SetSpeed {
+        speed: f32,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Phase 2.4 — frame step. `direction = Forward` pumps exactly
+    /// one PES access unit on the video PID and pauses; `Backward`
+    /// snaps to the previous IDR via the in-memory index (coarse —
+    /// frame-accurate backward step is Phase 3).
+    StepFrame {
+        direction: StepDirection,
+        reply: oneshot::Sender<Result<ScrubAck>>,
+    },
+}
+
+/// Frame-step direction for [`ReplayCommand::StepFrame`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepDirection {
+    Forward,
+    Backward,
 }

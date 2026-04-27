@@ -2047,6 +2047,13 @@ impl FlowStatsAccumulator {
                     segments_pruned: s.segments_pruned.load(Ordering::Relaxed),
                     packets_dropped: s.packets_dropped.load(Ordering::Relaxed),
                     index_entries: s.index_entries.load(Ordering::Relaxed),
+                    last_write_unix_ms: s.last_write_unix_ms.load(Ordering::Relaxed),
+                    mode: Some(
+                        crate::replay::writer::mode_to_wire_str(
+                            s.mode.load(Ordering::Relaxed),
+                        )
+                        .to_string(),
+                    ),
                 }
             }),
             #[cfg(not(feature = "replay"))]

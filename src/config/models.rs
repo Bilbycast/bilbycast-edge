@@ -358,6 +358,17 @@ pub struct RecordingConfig {
     /// `replay_disk_full` and stops on actual exhaustion).
     #[serde(default = "default_recording_max_bytes")]
     pub max_bytes: u64,
+    /// Pre-buffer (ring buffer) duration in seconds. When set, the
+    /// writer auto-arms in `PreBuffer` mode at flow start and keeps
+    /// the last N seconds of TS on disk even before the operator hits
+    /// Start. On `start_recording` the existing pre-buffer becomes the
+    /// head of the recording session (retention bumps to
+    /// `retention_seconds`); on `stop_recording` the writer drops back
+    /// to `PreBuffer` and segments older than N s prune naturally on
+    /// the next roll. Range [1, 300] s. `None` = pre-buffer disabled
+    /// (Phase 1 behaviour: writer only runs while explicitly armed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_buffer_seconds: Option<u32>,
 }
 
 impl Default for RecordingConfig {
@@ -368,6 +379,7 @@ impl Default for RecordingConfig {
             segment_seconds: default_recording_segment_seconds(),
             retention_seconds: default_recording_retention_seconds(),
             max_bytes: default_recording_max_bytes(),
+            pre_buffer_seconds: None,
         }
     }
 }

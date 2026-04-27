@@ -823,6 +823,13 @@ fn edge_capabilities() -> Vec<&'static str> {
         // Replay-server: continuous flow recording + clip-based playback.
         // The manager UI gates the Replay tab on the presence of this string.
         caps.push("replay");
+        // Phase 2 — Replay v2 surface: pre-buffer / ring-buffer recording,
+        // variable-speed playback (0.1×–1.0×) with PCR/PTS rewrite, frame
+        // step, multi-cam sync (start_at_unix_ms anchor), per-flow stall
+        // alarms. Manager UI checks for `replay-v2` before exposing the
+        // speed slider / step buttons / pre-buffer field / sync-group tab,
+        // so a Phase 1 edge keeps the Phase 1 surface unchanged.
+        caps.push("replay-v2");
     }
     if cfg!(any(
         feature = "video-encoder-x264",
@@ -2459,6 +2466,8 @@ async fn execute_command(
                 .ok_or("mark_out: missing 'flow_id'")?;
             let name = action["name"].as_str().map(|s| s.to_string());
             let description = action["description"].as_str().map(|s| s.to_string());
+            crate::replay::clips::validate_clip_strings(name.as_deref(), description.as_deref())
+                .map_err(|e| CommandError::with_code(e.to_string(), "replay_invalid_field"))?;
             let explicit_out_pts = action["pts_90khz"].as_u64();
             let created_by = action["created_by"].as_str().map(|s| s.to_string());
             let runtime = flow_manager.get_runtime(flow_id)
@@ -2504,6 +2513,44 @@ async fn execute_command(
             Ok(Some(serde_json::json!({ "clips": clips })))
         }
         #[cfg(feature = "replay")]
+        "get_clip" => {
+            // Single-clip metadata lookup. Walks `replay_root` to find
+            // the recording that owns the clip — same pattern as
+            // `rename_clip` / `delete_clip`. Lighter than `list_clips`
+            // when the manager already knows the clip id (deep-links,
+            // routine fire-time validation, post-rename refresh).
+            let clip_id = action["clip_id"].as_str()
+                .ok_or("get_clip: missing 'clip_id'")?;
+            let root = crate::replay::replay_root();
+            let mut found: Option<crate::replay::ClipInfo> = None;
+            if let Ok(mut dir) = tokio::fs::read_dir(&root).await {
+                while let Ok(Some(entry)) = dir.next_entry().await {
+                    if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                        continue;
+                    }
+                    let rid = match entry.file_name().to_str() {
+                        Some(s) => s.to_string(),
+                        None => continue,
+                    };
+                    let store = match crate::replay::clips::ClipStore::open(&rid, &entry.path()).await {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    if let Some(info) = store.get(clip_id).await {
+                        found = Some(info);
+                        break;
+                    }
+                }
+            }
+            match found {
+                Some(info) => Ok(Some(serde_json::to_value(info).unwrap_or_default())),
+                None => Err(CommandError::with_code(
+                    format!("Clip '{clip_id}' not found"),
+                    "replay_clip_not_found",
+                )),
+            }
+        }
+        #[cfg(feature = "replay")]
         "rename_clip" => {
             let clip_id = action["clip_id"].as_str()
                 .ok_or("rename_clip: missing 'clip_id'")?;
@@ -2512,6 +2559,10 @@ async fn execute_command(
             if new_name.is_none() && new_description.is_none() {
                 return Err(CommandError::new("rename_clip: provide name and/or description".to_string()));
             }
+            crate::replay::clips::validate_clip_strings(
+                new_name.as_deref(),
+                new_description.as_deref(),
+            ).map_err(|e| CommandError::with_code(e.to_string(), "replay_invalid_field"))?;
             // Find which recording owns this clip, then rename in place.
             let root = crate::replay::replay_root();
             let mut renamed: Option<crate::replay::ClipInfo> = None;
@@ -2546,6 +2597,113 @@ async fn execute_command(
                 )),
             }
         }
+        // Phase 2 — `update_clip` is the general-purpose clip-mutation
+        // command: name / description / tags (Sub-PR B quick-tag bar) /
+        // in-out PTS (Sub-PR B `[` / `]` trim hotkeys). `rename_clip`
+        // stays working unchanged for legacy manager builds; new
+        // surfaces should target `update_clip` instead.
+        #[cfg(feature = "replay")]
+        "update_clip" => {
+            let clip_id = action["clip_id"].as_str()
+                .ok_or("update_clip: missing 'clip_id'")?;
+            let new_name = action["name"].as_str().map(|s| s.to_string());
+            let new_description = action["description"].as_str().map(|s| s.to_string());
+            let new_tags: Option<Vec<String>> = action["tags"].as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            });
+            let new_in_pts = action["in_pts_90khz"].as_u64();
+            let new_out_pts = action["out_pts_90khz"].as_u64();
+            if new_name.is_none()
+                && new_description.is_none()
+                && new_tags.is_none()
+                && new_in_pts.is_none()
+                && new_out_pts.is_none()
+            {
+                return Err(CommandError::new(
+                    "update_clip: at least one of name / description / tags / in_pts_90khz \
+                     / out_pts_90khz must be set"
+                        .to_string(),
+                ));
+            }
+            crate::replay::clips::validate_clip_strings(
+                new_name.as_deref(),
+                new_description.as_deref(),
+            )
+            .map_err(|e| CommandError::with_code(e.to_string(), "replay_invalid_field"))?;
+            if let Some(tags) = new_tags.as_ref() {
+                crate::replay::clips::validate_and_normalise_tags(tags)
+                    .map_err(|e| CommandError::with_code(e.to_string(), "replay_invalid_tag"))?;
+            }
+            // Find which recording owns this clip and update in place.
+            let root = crate::replay::replay_root();
+            let mut updated: Option<crate::replay::ClipInfo> = None;
+            let mut found_clip = false;
+            if let Ok(mut dir) = tokio::fs::read_dir(&root).await {
+                while let Ok(Some(entry)) = dir.next_entry().await {
+                    if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                        continue;
+                    }
+                    let rid = match entry.file_name().to_str() {
+                        Some(s) => s.to_string(),
+                        None => continue,
+                    };
+                    let store =
+                        match crate::replay::clips::ClipStore::open(&rid, &entry.path()).await {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+                    if store.get(clip_id).await.is_some() {
+                        found_clip = true;
+                        match store
+                            .update(
+                                clip_id,
+                                new_name.clone(),
+                                new_description.clone(),
+                                new_tags.clone(),
+                                new_in_pts,
+                                new_out_pts,
+                            )
+                            .await
+                        {
+                            Ok(Some(info)) => {
+                                updated = Some(info);
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                let msg = e.to_string();
+                                let code = if msg.contains("replay_invalid_range") {
+                                    "replay_invalid_range"
+                                } else if msg.contains("replay_invalid_tag") {
+                                    "replay_invalid_tag"
+                                } else if msg.contains("replay_invalid_field") {
+                                    "replay_invalid_field"
+                                } else {
+                                    "replay_clip_update_failed"
+                                };
+                                return Err(CommandError::with_code(
+                                    format!("update_clip failed: {e}"),
+                                    code,
+                                ));
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            match updated {
+                Some(info) => Ok(Some(serde_json::to_value(info).unwrap_or_default())),
+                None if found_clip => Err(CommandError::with_code(
+                    format!("Clip '{clip_id}' update produced no result"),
+                    "replay_clip_update_failed",
+                )),
+                None => Err(CommandError::with_code(
+                    format!("Clip '{clip_id}' not found"),
+                    "replay_clip_not_found",
+                )),
+            }
+        }
         #[cfg(feature = "replay")]
         "recording_status" => {
             let flow_id = action["flow_id"].as_str()
@@ -2566,6 +2724,9 @@ async fn execute_command(
                     let s = &h.stats;
                     Ok(Some(serde_json::json!({
                         "armed": s.armed.load(Ordering::Relaxed),
+                        "mode": crate::replay::writer::mode_to_wire_str(
+                            s.mode.load(Ordering::Relaxed),
+                        ),
                         "recording_id": h.recording_id,
                         "current_pts_90khz": s.current_pts_90khz.load(Ordering::Relaxed),
                         "segments_written": s.segments_written.load(Ordering::Relaxed),
@@ -2580,6 +2741,7 @@ async fn execute_command(
                 }
                 None => Ok(Some(serde_json::json!({
                     "armed": false,
+                    "mode": "idle",
                     "recording_id": null,
                     "current_pts_90khz": 0,
                     "segments_written": 0,
@@ -2691,8 +2853,14 @@ async fn dispatch_replay_input_command(
             let clip_id = action["clip_id"].as_str().map(|s| s.to_string());
             let from_pts_90khz = action["from_pts_90khz"].as_u64();
             let to_pts_90khz = action["to_pts_90khz"].as_u64();
+            let speed = action["speed"].as_f64().map(|v| v as f32);
+            let start_at_unix_ms = action["start_at_unix_ms"].as_u64();
             let (tx, rx) = tokio::sync::oneshot::channel();
-            cmd_tx.send(ReplayCommand::Play { clip_id, from_pts_90khz, to_pts_90khz, reply: tx }).await
+            cmd_tx.send(ReplayCommand::Play {
+                clip_id, from_pts_90khz, to_pts_90khz,
+                speed, start_at_unix_ms,
+                reply: tx,
+            }).await
                 .map_err(|_| CommandError::new("replay input is gone".to_string()))?;
             rx.await
                 .map_err(|_| CommandError::new("replay input dropped reply".to_string()))?
@@ -2707,6 +2875,37 @@ async fn dispatch_replay_input_command(
                 .map_err(|_| CommandError::new("replay input dropped reply".to_string()))?
                 .map_err(|e| CommandError::new(e.to_string()))?;
             Ok(Some(serde_json::json!({})))
+        }
+        "set_speed" => {
+            let speed = action["speed"].as_f64()
+                .ok_or("set_speed: missing 'speed'")?
+                as f32;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            cmd_tx.send(ReplayCommand::SetSpeed { speed, reply: tx }).await
+                .map_err(|_| CommandError::new("replay input is gone".to_string()))?;
+            rx.await
+                .map_err(|_| CommandError::new("replay input dropped reply".to_string()))?
+                .map_err(|e| CommandError::with_code(e.to_string(), "replay_invalid_speed"))?;
+            Ok(Some(serde_json::json!({})))
+        }
+        "step_frame" => {
+            let dir_str = action["direction"].as_str().unwrap_or("forward");
+            let direction = match dir_str {
+                "backward" | "back" | "rev" | "reverse" =>
+                    crate::replay::StepDirection::Backward,
+                _ => crate::replay::StepDirection::Forward,
+            };
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            cmd_tx.send(ReplayCommand::StepFrame { direction, reply: tx }).await
+                .map_err(|_| CommandError::new("replay input is gone".to_string()))?;
+            let ack = rx.await
+                .map_err(|_| CommandError::new("replay input dropped reply".to_string()))?
+                .map_err(|e| CommandError::new(e.to_string()))?;
+            Ok(Some(serde_json::json!({
+                "pts_90khz": ack.pts_90khz,
+                "segment_id": ack.segment_id,
+                "byte_offset": ack.byte_offset,
+            })))
         }
         "scrub_playback" => {
             let pts_90khz = action["pts_90khz"].as_u64()

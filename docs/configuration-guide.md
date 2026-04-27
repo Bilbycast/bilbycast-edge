@@ -2628,7 +2628,8 @@ clips.json       ← named (in_pts, out_pts) ranges
     "storage_id": "record-flow",
     "segment_seconds": 10,
     "retention_seconds": 86400,
-    "max_bytes": 53687091200
+    "max_bytes": 53687091200,
+    "pre_buffer_seconds": null
   }
 }]
 ```
@@ -2640,6 +2641,7 @@ clips.json       ← named (in_pts, out_pts) ranges
 | `segment_seconds` | `10` | Wall-clock segment roll cadence. Range `[2, 60]` |
 | `retention_seconds` | `86400` (24h) | Oldest-first prune by mtime. `0` = unlimited |
 | `max_bytes` | `53687091200` (50 GiB) | Oldest-first prune by total size. `0` = unlimited (still subject to disk) |
+| `pre_buffer_seconds` | `null` | When set, the writer auto-arms in `PreBuffer` mode and rolls segments to disk with retention pinned at this value, so an operator pressing Start later picks up the last `N` seconds of pre-roll. `null` = no pre-buffer (writer starts in `Armed` mode the moment it spawns). Range `[1, 300]` when set. `RecordingStats.armed` stays `false` while in pre-buffer so the manager UI distinguishes pre-roll from a live recording session |
 
 The writer is a sibling subscriber on the flow's broadcast channel —
 drop-on-lag with a Critical `replay_writer_lagged` event mirrors the
@@ -2680,11 +2682,42 @@ See [`events-and-alarms.md`](events-and-alarms.md#replay-server-events)
 for the full list of `replay_event` values and `command_ack.error_code`
 codes (`replay_recording_not_active`, `replay_no_playback_input`,
 `replay_clip_not_found`, `replay_writer_lagged`, `replay_disk_full`,
-`replay_index_corrupt`).
+`replay_index_corrupt`, `replay_invalid_field`, `replay_invalid_range`,
+`replay_invalid_tag`).
+
+### `recording_status` response shape
+
+```jsonc
+{
+  "armed": false,
+  "mode": "pre_buffer",         // Phase 2 / 1.5 — "armed" / "pre_buffer" / "idle"
+  "recording_id": "record-flow",
+  "current_pts_90khz": 8100000,
+  "segments_written": 3,
+  "bytes_written": 31457280,
+  "segments_pruned": 0,
+  "packets_dropped": 0,
+  "index_entries": 6,
+  "max_bytes": 53687091200,
+  "replay_root_free_bytes": 102400000000,
+  "replay_root_total_bytes": 256000000000
+}
+```
+
+The `mode` field is additive — older edges omit it and the manager
+falls back to `armed`-derived `Recording / Idle` state.
+
+### Clip mutation: `update_clip` (Phase 2 / 1.5)
+
+`update_clip` is the unified clip-mutation command — superset of the
+legacy `rename_clip`, with `tags` and `in_pts_90khz` / `out_pts_90khz`
+added. See [`replay.md`](replay.md#phase-2--15--clip-tags--update_clip)
+for the wire shape and SMPTE-on-trim semantics.
 
 ### Metrics
 
 Per-recording counters surfaced on the WS stats path:
 `segments_written`, `bytes_written`, `segments_pruned`,
-`packets_dropped`, `index_entries`, `current_pts_90khz`. See
+`packets_dropped`, `index_entries`, `current_pts_90khz`, `armed`,
+`mode` (Phase 2 / 1.5). See
 [`metrics.md`](metrics.md#replay-server-metrics).

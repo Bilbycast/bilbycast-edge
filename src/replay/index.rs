@@ -8,9 +8,14 @@
 //! side. The fixed size keeps the on-disk math trivial and lets us
 //! mmap-and-scan without a deserialiser.
 //!
-//! The index is rebuildable from segments alone — if `index.bin` is
-//! truncated or fails CRC, the writer scans the segments and rewrites
-//! the index in the background.
+//! Truncation tolerance: if the file length is not a 24-byte multiple
+//! (a SIGKILL between `append` and `flush_and_sync` can leave a partial
+//! entry on disk), `IndexWriter::open` and `InMemoryIndex::load` align
+//! down to the last valid boundary. The trailing partial entry is
+//! discarded — callers see a slightly shorter but coherent index, not
+//! an open-error. A full segment-walk-and-rebuild would yield more
+//! entries but isn't necessary for correctness in Phase 1; the lost
+//! IDR is at most one IDR away from the previous one in the index.
 //!
 //! # Format
 //!
@@ -39,7 +44,6 @@ pub const ENTRY_SIZE: usize = 24;
 
 pub mod flag {
     pub const IS_IDR: u32 = 1 << 0;
-    #[allow(dead_code)]
     pub const PCR_DISCONTINUITY: u32 = 1 << 1;
     pub const SMPTE_TC_VALID: u32 = 1 << 2;
 }
@@ -96,8 +100,22 @@ pub struct IndexWriter {
 }
 
 impl IndexWriter {
-    /// Open or create the index file for append.
+    /// Open or create the index file for append. If the existing file
+    /// is truncated mid-entry (length not a multiple of `ENTRY_SIZE` —
+    /// happens after a SIGKILL between `append` and the next
+    /// `flush_and_sync`), truncate it down to the last valid 24-byte
+    /// boundary so subsequent appends produce a coherent index instead
+    /// of corrupting the partial entry. The reader uses the same rule.
     pub async fn open(path: &Path) -> Result<Self> {
+        if let Ok(meta) = tokio::fs::metadata(path).await {
+            let len = meta.len();
+            let aligned = len - (len % ENTRY_SIZE as u64);
+            if aligned != len {
+                let f = OpenOptions::new().write(true).open(path).await?;
+                f.set_len(aligned).await?;
+                drop(f);
+            }
+        }
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -129,8 +147,12 @@ pub struct InMemoryIndex {
 
 impl InMemoryIndex {
     /// Load the entire index. Returns an empty index if the file
-    /// doesn't exist; returns an error if the file exists but is
-    /// truncated mid-entry (the recovery path is to delete + rebuild).
+    /// doesn't exist. If the file is truncated mid-entry (length not a
+    /// multiple of `ENTRY_SIZE`) we read the largest 24-byte-aligned
+    /// prefix and ignore the trailing partial entry — same rule
+    /// `IndexWriter::open` applies on the writer side, so a SIGKILL
+    /// between `append` and `flush_and_sync` is recoverable without
+    /// operator intervention.
     pub async fn load(path: &Path) -> Result<Self> {
         if !tokio::fs::try_exists(path).await.unwrap_or(false) {
             return Ok(Self::default());
@@ -140,14 +162,12 @@ impl InMemoryIndex {
         if len == 0 {
             return Ok(Self::default());
         }
-        if len % ENTRY_SIZE as u64 != 0 {
-            return Err(anyhow!(
-                "index file length {} is not a multiple of entry size {}",
-                len, ENTRY_SIZE
-            ));
+        let aligned_len = len - (len % ENTRY_SIZE as u64);
+        if aligned_len == 0 {
+            return Ok(Self::default());
         }
-        let count = (len as usize) / ENTRY_SIZE;
-        let mut buf = vec![0u8; len as usize];
+        let count = (aligned_len as usize) / ENTRY_SIZE;
+        let mut buf = vec![0u8; aligned_len as usize];
         file.seek(SeekFrom::Start(0)).await?;
         file.read_exact(&mut buf).await?;
         let mut entries = Vec::with_capacity(count);
@@ -253,13 +273,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_tail_is_an_error() {
-        // Truncated to half an entry → load fails, recovery path is
-        // delete + rebuild (handled by the writer module on startup).
+    async fn truncated_tail_is_recovered() {
+        // Truncated mid-entry → load drops the partial entry and
+        // returns the aligned prefix. Symmetric with `IndexWriter::open`
+        // which `set_len`s the file to the same boundary on next start.
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("index.bin");
         tokio::fs::write(&path, vec![0u8; ENTRY_SIZE * 3 + 5]).await.unwrap();
-        let err = InMemoryIndex::load(&path).await.unwrap_err();
-        assert!(format!("{err}").contains("not a multiple"));
+        let idx = InMemoryIndex::load(&path).await.unwrap();
+        assert_eq!(idx.entries.len(), 3);
+
+        // Empty file should also load as empty.
+        let empty = tmp.path().join("empty.bin");
+        tokio::fs::write(&empty, vec![0u8; 7]).await.unwrap();
+        let idx = InMemoryIndex::load(&empty).await.unwrap();
+        assert_eq!(idx.entries.len(), 0);
+
+        // IndexWriter::open should align an existing partial file in place.
+        let path2 = tmp.path().join("partial.bin");
+        tokio::fs::write(&path2, vec![1u8; ENTRY_SIZE * 2 + 9]).await.unwrap();
+        let _w = IndexWriter::open(&path2).await.unwrap();
+        let len = tokio::fs::metadata(&path2).await.unwrap().len();
+        assert_eq!(len, (ENTRY_SIZE * 2) as u64);
     }
 }

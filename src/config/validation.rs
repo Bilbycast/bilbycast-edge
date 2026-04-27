@@ -868,6 +868,26 @@ fn validate_recording_config(
     if let Some(ref sid) = c.storage_id {
         validate_replay_id(sid, &format!("Flow '{flow_id}' recording.storage_id"))?;
     }
+    if let Some(pb) = c.pre_buffer_seconds {
+        if !(1..=300).contains(&pb) {
+            bail!(
+                "Flow '{flow_id}': recording.pre_buffer_seconds must be in 1..=300 (got {pb})"
+            );
+        }
+        // Pre-buffer is the *floor* of retention while disarmed — a
+        // pre-buffer larger than the configured retention is incoherent
+        // (the writer would prune segments inside the pre-buffer window
+        // on every roll). Skip the comparison when retention is
+        // unlimited (0) — pre-buffer is bounded only by max_bytes /
+        // free disk in that mode.
+        if c.retention_seconds != 0 && pb as u64 > c.retention_seconds {
+            bail!(
+                "Flow '{flow_id}': recording.pre_buffer_seconds ({pb}) cannot exceed \
+                 recording.retention_seconds ({})",
+                c.retention_seconds
+            );
+        }
+    }
     Ok(())
 }
 

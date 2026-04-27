@@ -72,7 +72,7 @@ slow-motion, multi-track timeline, or render-to-file export.
 | `src/replay/paced_replayer.rs` | PCR-paced bundle yield for the replay input |
 | `src/engine/input_replay.rs` | Replay input task; per-input command channel; lifecycle events |
 | `src/engine/flow.rs` | `FlowRuntime.recording_handle` lifecycle; spawn/teardown |
-| `src/manager/client.rs` (lines 2391–2750) | WS command dispatch (all `#[cfg(feature = "replay")]`-gated) |
+| `src/manager/client.rs` (`start_recording` arm at line 2400, `scrub_playback` arm at line 2910) | WS command dispatch — all 14 replay arms `#[cfg(feature = "replay")]`-gated |
 
 ## Storage layout
 
@@ -137,6 +137,38 @@ to append (a non-fatal recovery path).
 5. On stop (`stop_recording`) or fatal I/O error: subscriber
    detaches, current segment closes + fsyncs, `RecordingStats.armed
    = false`, `recording_stopped` Info event.
+6. Retention will **never** unlink the just-finalized segment id
+   (`meta.current_segment_id`) — losing the live edge would tear out
+   clips that touch the most recent few seconds. A `max_bytes` cap
+   smaller than one segment fires the Warning
+   `replay_max_bytes_below_segment` instead.
+
+### Crash recovery (writer init scan)
+
+Whenever `spawn_writer` runs (cold start, edge restart after SIGKILL,
+operator-driven re-arm), it scans the recording directory before
+opening a new segment:
+
+1. **`.tmp/` orphan cleanup.** Any `<NNNNNN>.ts` left in `.tmp/` is a
+   partial segment the writer never atomically renamed onto the
+   recording — unlinked unconditionally.
+2. **Resume id derivation.** The next segment id is
+   `max(<NNNNNN>.ts on disk) + 1`, never just `recording.json`'s
+   `current_segment_id`. The meta file is best-effort on the roll
+   path (and may be corrupt after a SIGKILL); trusting it would
+   cause segment-id reuse and overwrite finalized data.
+3. **`index.bin` alignment.** If the file length isn't a 24-byte
+   multiple (a SIGKILL between `append` and `flush_and_sync` can
+   leave a partial entry), `IndexWriter::open` aligns down to the
+   last valid boundary in place. `InMemoryIndex::load` applies the
+   same rule on the reader side. The trailing partial IDR is
+   discarded; the next IDR re-establishes the index head.
+4. **Recovery alert.** If any of the above fired (orphans removed,
+   meta corrupt, or disk-derived id outranked the meta), the writer
+   emits the Warning event `replay_recovery_alert` with structured
+   `details.tmp_orphans_removed`, `details.meta_corrupt`,
+   `details.next_segment_id`. Recovery is non-fatal; the recording
+   continues from the next id without operator intervention.
 
 ### Clip create
 
@@ -155,6 +187,14 @@ to append (a non-fatal recovery path).
    `mark_out { name }`. This is the bread-and-butter sports workflow.
 
 ### Playback
+
+The `replay` input config carries `start_paused: bool` (default `true`)
+— when true, the input idles on flow start with NULL-PID padding until
+an explicit `play_clip` / `cue_clip` arrives. This is the safe default
+for live workflows where a flow start should not immediately push
+recorded content to downstream outputs. Set `start_paused: false` for
+auto-play scenarios (e.g., a routine that brings up a flow already
+pointed at a known clip).
 
 1. Operator selects a clip in the UI sidebar. `cue_clip { clip_id }`
    pre-loads the clip without rolling.
@@ -188,6 +228,23 @@ field on a Create/Update modal without parsing strings.
 | `replay_invalid_segment_seconds` | Error | `RecordingConfig.segment_seconds` outside `[2, 60]` | Use a value in range |
 | `replay_invalid_recording_id` | Error | `start_recording` references a flow with no `recording` config | Add `RecordingConfig` to the flow first |
 | `replay_storage_id_invalid` | Error | `RecordingConfig.storage_id` fails the alphanumeric + `._-` ≤ 64 char rule | Use a valid id |
+| `replay_invalid_field` | Error | `mark_out` / `rename_clip` / `update_clip` `name` > 256 chars or contains control chars; `description` > 4096 chars | Trim to limits |
+| `replay_invalid_range` | Error | `play_clip` / `scrub_playback` with `to_pts_90khz < from_pts_90khz` (or below the clip's `in_pts`); `update_clip` with the prospective `in_pts_90khz / out_pts_90khz` inverted | Pass a forward range |
+| `replay_invalid_tag` | Error | `update_clip` (or any tag-bearing path) with a tag that fails `[A-Z0-9_-]{1,32}`, more than 16 tags per clip | Use the v1 fixed set (`GOAL`/`FOUL`/`OFFSIDE`/`SAVE`/`YELLOW`/`VAR-CHECK`) or shorten / re-case |
+| `replay_max_bytes_below_segment` | Warning | Retention can't satisfy `max_bytes` without deleting the live edge — operator's cap is smaller than one segment | Raise `max_bytes` to at least `segment_seconds × bitrate × 2` |
+| `replay_metadata_stale` | Warning | `recording.json` write failed on segment roll; recovery scan will derive next segment id from the directory listing on restart | Investigate the disk (typically ENOSPC on the replay volume) |
+| `replay_recovery_alert` | Warning | Edge restarted after a crash; orphan `.tmp/` segments cleaned and / or `recording.json` was corrupt | Informational — verify `details.tmp_orphans_removed` and `details.next_segment_id` match expectations |
+
+### Orphan-recovery list_clips
+
+`list_clips` accepts either `flow_id` (the normal manager UI path —
+resolves the flow's recording via `FlowRuntime`) or `recording_id`
+(direct lookup against the on-disk recording, even if no flow
+references it any more). The latter is the recovery path when a
+flow has been deleted but its segments + clips persisted on disk
+under the same `<recording_id>` — the operator points a fresh flow
+at it via a `replay` input and uses `recording_id` to enumerate the
+clips. When both fields are present, `flow_id` wins.
 
 Disk-pressure monitoring runs alongside the reactive ENOSPC handling.
 On every segment roll the writer computes a usage percentage —
@@ -208,7 +265,8 @@ render a coloured disk meter as soon as the recorder is armed.
 
 | Field | Meaning |
 |---|---|
-| `armed` | `true` while a writer task is running for the flow |
+| `armed` | `true` while a recording session is active. Pre-buffer mode keeps `armed = false` so the manager UI can distinguish pre-roll from a recording session and the stall detector doesn't fire on pre-buffered flows. |
+| `mode` | Phase 2 / 1.5 — wire-string mirror of [`WriterMode`]: `"armed"` when a session is live, `"pre_buffer"` when the writer is rolling pre-roll TS but the operator hasn't pressed Start, `"idle"` when the writer is stopped (post-Stop with no pre-buffer, or post-cancel). Drives the `/replay` page's tri-state `Recording / Pre-roll / Idle` badge and the flow-card `● PRE-ROLL` chip. Older edges omit the field; the manager falls back to `armed`-derived state. |
 | `segments_written` | Completed, rolled, fsynced segments |
 | `bytes_written` | Total bytes appended (across all segments, including pruned) |
 | `segments_pruned` | Segments evicted by retention (mtime / size) |
@@ -230,17 +288,67 @@ flow-form recording fields, the dedicated `/replay` page link, the
 to a non-replay edge fall through to the generic `unknown_action` ack
 path, so old edges don't trip on new commands.
 
-## Phase 1 limitations
+## Phase 2 / 1.5 — clip tags + `update_clip`
+
+Clips carry an optional `tags: Vec<String>` for sports / VAR
+workflows. Bounds:
+
+- Each tag matches `^[A-Z0-9_-]{1,32}$` (operator-friendly enum
+  shorthand — `GOAL`, `FOUL`, `VAR-CHECK`, etc.).
+- ≤ 16 tags per clip. Server-side dedup'd in input order.
+- Hard-coded set in the manager UI's quick-tag bar for v1 (`GOAL`,
+  `FOUL`, `OFFSIDE`, `SAVE`, `YELLOW`, `VAR-CHECK`); the edge stores
+  whatever the manager sends so per-group customisation later doesn't
+  need an edge release.
+
+### `update_clip` (the unified clip-mutation command)
+
+```jsonc
+{
+  "type": "update_clip",
+  "clip_id": "clp_…",
+  "name": "Goal — Smith 24'",        // optional
+  "description": "Header into top corner", // optional
+  "tags": ["GOAL"],                   // optional, replaces the existing list
+  "in_pts_90khz":  91000,             // optional (Phase 2 / 1.5 trim)
+  "out_pts_90khz": 360000             // optional (Phase 2 / 1.5 trim)
+}
+```
+
+At least one of `name` / `description` / `tags` / `in_pts_90khz` /
+`out_pts_90khz` must be set. Returns the updated `ClipInfo`.
+
+**SMPTE TC handling on trim.** The IDR index doesn't carry SMPTE
+strings (just PTS / segment / offset / flags), so the edge can't
+cheaply re-derive a fresh `HH:MM:SS:FF` for a new in/out PTS. When
+`in_pts_90khz` is set, `smpte_in` is cleared on the clip (and likewise
+for the out side); the manager UI renders `—` until the operator
+re-marks. Persisting a stale SMPTE that no longer matches the PTS
+would mislead operators worse than the blank.
+
+`rename_clip` continues to work unchanged — the manager's PATCH proxy
+auto-routes to `rename_clip` when only `name` / `description` are
+present, and to `update_clip` when any tag / PTS field is set, so old
+edges keep accepting the legacy shape.
+
+## Current limitations (Phase 1 + 1.5)
 
 - **Forward 1.0× playback only.** No reverse, slow-motion, or
-  variable-speed.
-- **Seeks snap to the nearest IDR ≤ target.** Frame-accurate scrubbing
-  is a Phase 2 item.
+  variable-speed yet — the `paced_replayer` reverse-scrub mode and
+  the audio-on-scrub toggle are Phase 2 follow-ups.
+- **Seeks snap to the nearest IDR ≤ target.** Frame-accurate
+  scrubbing is a Phase 2 item.
 - **No index rebuild on corruption.** `replay_index_corrupt` is a
-  Warning today; the writer keeps appending. Phase 2 will rebuild from
-  segments at open time.
-- **Clip IDs are edge-side generated.** Cross-edge collision handling
-  isn't in scope — clip IDs are scoped to a recording.
+  Warning today; the writer keeps appending. Phase 2 will rebuild
+  from segments at open time.
+- **Clip IDs are edge-side generated.** Cross-edge collision
+  handling isn't in scope — clip IDs are scoped to a recording.
+- **SMPTE TC cleared on trim.** When `update_clip` changes
+  `in_pts_90khz` / `out_pts_90khz`, the corresponding `smpte_in` /
+  `smpte_out` is cleared (the IDR index doesn't carry SMPTE strings,
+  so the edge can't cheaply re-derive a fresh `HH:MM:SS:FF`). The
+  manager UI shows `—` until the operator re-marks. A Phase 3 index
+  schema bump could carry SMPTE alongside PTS to remove this gap.
 
 ## Cross-references
 

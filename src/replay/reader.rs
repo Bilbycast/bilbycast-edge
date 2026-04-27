@@ -108,11 +108,6 @@ impl Reader {
         Ok(entry)
     }
 
-    /// Snapshot of all clips in this recording.
-    pub async fn list_clips(&self) -> Vec<ClipInfo> {
-        self.clips.list().await
-    }
-
     /// Read the next bundle of `chunks * 188` bytes from the current
     /// segment, advancing across segment boundaries. Returns `None` on
     /// end-of-range or end-of-recording.
@@ -131,7 +126,9 @@ impl Reader {
         let mut buf = vec![0u8; want];
         let mut filled = 0;
         while filled < want {
-            let n = self.current_file.as_mut().unwrap().read(&mut buf[filled..]).await?;
+            let file = self.current_file.as_mut()
+                .ok_or_else(|| anyhow!("reader: current_file unset after open path"))?;
+            let n = file.read(&mut buf[filled..]).await?;
             if n == 0 {
                 // Segment EOF — advance to next.
                 if !self.advance_segment().await? {

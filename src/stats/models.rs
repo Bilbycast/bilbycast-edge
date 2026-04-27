@@ -117,6 +117,21 @@ pub struct RecordingSnapshot {
     pub segments_pruned: u64,
     pub packets_dropped: u64,
     pub index_entries: u64,
+    /// Wall-clock Unix milliseconds of the most recent successful TS
+    /// append on this writer. Manager-side stall detection compares
+    /// this against `now()` to flag a `recording_stalled` Critical when
+    /// `armed` is true but writes have stopped advancing while the WS
+    /// connection is healthy. `0` until the first byte lands.
+    #[serde(default)]
+    pub last_write_unix_ms: u64,
+    /// Phase 2 — writer-state discriminator: `"idle"`, `"pre_buffer"`,
+    /// or `"armed"`. `armed` alone can't distinguish pre-roll from a
+    /// stopped recorder, so the manager UI keys its `Pre-roll` /
+    /// `● PRE-ROLL` chips off this field. Forward-compatible: legacy
+    /// edge builds omit it, and the manager falls back to
+    /// `armed`-derived state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 /// In-depth content-analysis snapshot. Mirrors the tier shape of

@@ -185,29 +185,6 @@ pub struct TlsTrust {
     pub fingerprint: Option<String>,
 }
 
-impl TlsTrust {
-    pub fn standard() -> Self {
-        Self {
-            accept_self_signed: false,
-            fingerprint: None,
-        }
-    }
-
-    pub fn pinned(fingerprint: String) -> Self {
-        Self {
-            accept_self_signed: false,
-            fingerprint: Some(fingerprint),
-        }
-    }
-
-    pub fn insecure() -> Self {
-        Self {
-            accept_self_signed: true,
-            fingerprint: None,
-        }
-    }
-}
-
 /// Build a `rustls::ClientConfig` honoring the trust policy. Returns
 /// `None` for the "standard" path (caller should use the default
 /// reqwest client).

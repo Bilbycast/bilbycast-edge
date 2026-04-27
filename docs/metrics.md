@@ -399,7 +399,8 @@ attribute.
 | `packets_dropped` | Packets dropped by the broadcast subscriber when the writer's bounded mpsc was full — paired with `replay_writer_lagged` Critical events |
 | `index_entries` | Number of entries appended to `index.bin` (one per IDR) |
 | `current_pts_90khz` | Most recent PCR-derived PTS observed by the writer; `0` when no PCR seen yet |
-| `armed` | `true` while the writer is actively recording; `false` after `stop_recording` or fatal error |
+| `armed` (bool) | `true` while the writer is actively recording. `false` after `stop_recording`, on a fatal error, **and** while in `PreBuffer` mode (writer is rolling segments to disk but the operator hasn't pressed Start yet) — the manager UI uses this distinction to render "Pre-roll" vs "Recording" labels, and the stall detector gates on `armed = true` |
+| `mode` (string, Phase 2 / 1.5) | Wire-string mirror of [`WriterMode`]: `"armed"` when a session is live, `"pre_buffer"` when rolling pre-roll TS, `"idle"` when the writer is stopped. `armed` is a strict subset of `mode == "armed"`; the field exists so the manager UI's tri-state badge and the flow-card `● PRE-ROLL` chip can render without back-deriving state from `armed` plus the flow's `recording.pre_buffer_seconds` config. Older edges omit the field; the manager falls back to `armed`-derived labels |
 
 The writer's `replay_writer_lagged` Critical event is emitted
 rate-limited (one per 5 s under sustained lag) so the events feed
