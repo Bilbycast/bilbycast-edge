@@ -32,6 +32,11 @@ pub mod manager;
 /// Owns the on-disk directory, list / upload-chunk / delete primitives, and
 /// the WS command handlers the manager forwards into.
 pub mod media;
+/// Replay store: continuous flow recording to rolling MPEG-TS segments
+/// with a side-car timecode → byte-offset index, plus playback reader.
+/// Lives behind the `replay` Cargo feature.
+#[cfg(feature = "replay")]
+pub mod replay;
 pub mod redundancy;
 pub mod setup;
 pub mod srt;

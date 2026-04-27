@@ -500,6 +500,11 @@ pub mod category {
     /// group rejected, etc.). For EADDRINUSE prefer `PORT_CONFLICT`.
     /// Always paired with `details.error_code = "bind_failed"`.
     pub const BIND_FAILED: &str = "bind_failed";
+    /// Replay-server lifecycle (recording started/stopped, clip created/
+    /// deleted, playback started/stopped/EOF, writer lagged, disk full,
+    /// index corrupt). Always paired with `details.replay_event = ...` and,
+    /// for failure events, `details.error_code = ...`.
+    pub const REPLAY: &str = "replay";
 }
 
 /// Scope label passed to [`run_bond_event_forwarder`] so generated

@@ -172,7 +172,11 @@ mp4 = "0.14"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif"] }
 
 [features]
-default = ["tls", "webrtc", "fdk-aac", "video-thumbnail"]
+default = ["tls", "webrtc", "fdk-aac", "video-thumbnail", "replay"]
+# Replay server: continuous flow recording to disk + playback as a fresh
+# input. Adds the `recording` flow attribute and the `replay` input type.
+# Pure-Rust, no new C deps. See `src/replay/` and `docs/replay.md`.
+replay = []
 # Enable in-process AAC decode/encode via Fraunhofer FDK AAC (C library).
 # Replaces symphonia (decode) and ffmpeg subprocess (AAC encode).
 fdk-aac = ["dep:aac-audio", "dep:aac-codec"]

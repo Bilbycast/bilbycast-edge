@@ -532,3 +532,46 @@ channel increments a `lite_drops` / `audio_full_drops` /
 Content-analysis configuration schema and examples live in
 [`docs/configuration-guide.md`](configuration-guide.md) under
 "Content Analysis (in-depth)".
+
+
+## Replay-server events
+
+The replay server (Phase 1, gated by the `replay` Cargo feature)
+emits events under category `replay` for both recording-side and
+playback-side state changes. Every event sets
+`details.replay_event` to a stable string identifier; failure events
+also set `details.error_code` for `command_ack` correlation.
+
+| `replay_event` | Severity | When it fires | Stable `error_code` |
+|---|---|---|---|
+| `recording_started` | Info | A flow with `recording.enabled = true` brought up its writer | — |
+| `recording_stopped` | Info | A `stop_recording` command was acked | — |
+| `recording_start_failed` | Critical | The writer task failed to start (storage unavailable, permission denied) | `replay_disk_full` |
+| `clip_created` | Info | A `mark_out` materialised a new clip into `clips.json` (with fsync). `details.clip` carries the full `ClipInfo`. | — |
+| `clip_deleted` | Info | A `delete_clip` succeeded | — |
+| `playback_started` | Info | A replay input transitioned to playing | — |
+| `playback_stopped` | Info | A replay input was stopped by command | — |
+| `playback_eof` | Info | A replay input reached the end of its range and `loop_playback = false` | — |
+| `writer_lagged` | Critical | The recording writer's bounded internal channel filled — packets dropped to keep the broadcast channel non-blocking. Rate-limited to one event per 5 s under sustained lag. | `replay_writer_lagged` |
+| `disk_pressure` | Warning | Recording disk usage crossed 80 % of the configured `max_bytes` cap (or of the replay-root filesystem when `max_bytes = 0`). Sticky until usage falls back below 70 % so the events feed isn't spammed. `details.pct` carries the snapshot percentage. Emit early so operators can free disk before the recorder hits ENOSPC. | `replay_disk_pressure` |
+| `disk_full` | Critical | The writer hit a disk-write error (typically EOSPC). Recording stops; the flow remains up. | `replay_disk_full` |
+
+Stable `command_ack.error_code` values surfaced by the replay-server WS
+actions (`start_recording`, `mark_in`, `mark_out`, `cue_clip`,
+`play_clip`, `scrub_playback`, `delete_clip`, …):
+
+| `error_code` | Meaning |
+|---|---|
+| `replay_recording_not_active` | Flow has no `recording` block, or `mark_in/mark_out` came before the recorder was armed |
+| `replay_no_playback_input` | `cue_clip` / `play_clip` / `stop_playback` / `scrub_playback` was sent to a flow whose active input is not a `replay` variant |
+| `replay_clip_not_found` | The requested `clip_id` does not exist on this edge |
+| `replay_writer_lagged` | The recording writer dropped packets — see the matching Critical event |
+| `replay_disk_pressure` | Recording disk usage at 80 %+ — see the matching Warning event. Operators should free disk before the recorder trips ENOSPC |
+| `replay_disk_full` | The recording writer could not write a segment — typically EOSPC |
+| `replay_index_corrupt` | `index.bin` failed CRC / size validation on startup; the writer surfaces this as a Warning + rebuild |
+| `replay_invalid_segment_seconds` / `replay_invalid_recording_id` / `replay_storage_id_invalid` | Validation rejection at config save / `update_flow` time |
+
+Producers should use `EventSender::emit_with_details(EventSeverity::*,
+category::REPLAY, message, flow_id, details)` (defined in
+`src/manager/events.rs`) — `category::REPLAY` is the canonical
+constant.

@@ -1233,6 +1233,20 @@ pub struct FlowStatsAccumulator {
     /// In-depth content-analysis (Lite / Audio Full / Video Full) stats,
     /// set once when the flow starts if any tier is enabled.
     pub content_analysis: OnceLock<Arc<ContentAnalysisAccumulator>>,
+    /// Replay-server recording stats handle, set once when the flow
+    /// starts and the `replay` feature is compiled in. The
+    /// FlowRuntime calls `set_recording_stats` after it spawns the
+    /// writer; the snapshot path reads atomic counters off it without
+    /// taking a lock. Behind a feature flag so non-replay builds pay
+    /// no struct overhead.
+    #[cfg(feature = "replay")]
+    pub recording_stats: OnceLock<Arc<crate::replay::writer::RecordingStats>>,
+    /// Recording id (mirrors [`crate::replay::writer::RecordingHandle::recording_id`])
+    /// — exposed on the snapshot so the manager UI can render the
+    /// recording id alongside the live counters without a separate
+    /// round-trip.
+    #[cfg(feature = "replay")]
+    pub recording_id: OnceLock<String>,
     /// Per-input thumbnail accumulators, keyed by input ID. Each input in
     /// a multi-input flow gets its own thumbnail generator subscribing to
     /// the input's dedicated broadcast channel (not the flow's main channel).
@@ -1431,6 +1445,10 @@ impl FlowStatsAccumulator {
             media_analysis: OnceLock::new(),
             thumbnail: OnceLock::new(),
             content_analysis: OnceLock::new(),
+            #[cfg(feature = "replay")]
+            recording_stats: OnceLock::new(),
+            #[cfg(feature = "replay")]
+            recording_id: OnceLock::new(),
             per_input_thumbnails: DashMap::new(),
             per_input_counters: DashMap::new(),
             input_config_meta: std::sync::RwLock::new(None),
@@ -2017,6 +2035,22 @@ impl FlowStatsAccumulator {
             per_es,
             pcr_trust_flow,
             content_analysis: self.content_analysis.get().map(|acc| acc.snapshot()),
+            #[cfg(feature = "replay")]
+            recording: self.recording_stats.get().map(|s| {
+                use std::sync::atomic::Ordering;
+                crate::stats::models::RecordingSnapshot {
+                    armed: s.armed.load(Ordering::Relaxed),
+                    recording_id: self.recording_id.get().cloned(),
+                    current_pts_90khz: s.current_pts_90khz.load(Ordering::Relaxed),
+                    segments_written: s.segments_written.load(Ordering::Relaxed),
+                    bytes_written: s.bytes_written.load(Ordering::Relaxed),
+                    segments_pruned: s.segments_pruned.load(Ordering::Relaxed),
+                    packets_dropped: s.packets_dropped.load(Ordering::Relaxed),
+                    index_entries: s.index_entries.load(Ordering::Relaxed),
+                }
+            }),
+            #[cfg(not(feature = "replay"))]
+            recording: None,
         }
     }
 }

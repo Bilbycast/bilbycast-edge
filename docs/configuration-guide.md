@@ -2584,3 +2584,107 @@ category.
 See [`metrics.md`](metrics.md#content-analysis-metrics-phase-1-3)
 for the full `FlowStats.content_analysis` JSON shape the manager
 dashboards consume.
+
+
+## Replay (recording + playback)
+
+Phase 1 of the in-edge replay server. Gated by the `replay` Cargo
+feature (default on). Two surfaces: a `recording` flow attribute that
+captures the flow's broadcast channel to disk continuously, and a
+`replay` input type that pumps a previously-recorded clip back onto a
+flow's broadcast channel paced by PCR.
+
+### Storage root
+
+Resolved at runtime, in order:
+
+1. `BILBYCAST_REPLAY_DIR` env var (operator override)
+2. `$XDG_DATA_HOME/bilbycast/replay/`
+3. `$HOME/.bilbycast/replay/`
+4. `./replay/`
+
+Each recording lives at `<replay_root>/<recording_id>/` (defaults to
+the flow id; override via `RecordingConfig.storage_id`):
+
+```
+000000.ts  000001.ts  ...  NNNNNN.ts
+recording.json   ← created_at, segment_seconds, schema_version
+index.bin        ← timecode → byte-offset (24 B / IDR)
+clips.json       ← named (in_pts, out_pts) ranges
+.tmp/            ← in-flight segment writes; atomic rename on roll
+```
+
+### Recording (flow attribute)
+
+```json
+"flows": [{
+  "id": "record-flow",
+  "name": "Record live SRT to disk",
+  "enabled": true,
+  "input_ids": ["live-srt-in"],
+  "output_ids": [],
+  "recording": {
+    "enabled": true,
+    "storage_id": "record-flow",
+    "segment_seconds": 10,
+    "retention_seconds": 86400,
+    "max_bytes": 53687091200
+  }
+}]
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `enabled` | `true` | When `false`, the writer is built but doesn't subscribe — useful for cron-armed recording via routines |
+| `storage_id` | `null` (= flow id) | Subdirectory under the replay root. Same character set as media filenames (alphanumeric + `._-`, ≤ 64 chars) |
+| `segment_seconds` | `10` | Wall-clock segment roll cadence. Range `[2, 60]` |
+| `retention_seconds` | `86400` (24h) | Oldest-first prune by mtime. `0` = unlimited |
+| `max_bytes` | `53687091200` (50 GiB) | Oldest-first prune by total size. `0` = unlimited (still subject to disk) |
+
+The writer is a sibling subscriber on the flow's broadcast channel —
+drop-on-lag with a Critical `replay_writer_lagged` event mirrors the
+slow-consumer pattern in `engine::output_udp`. Disk I/O lives behind
+a bounded mpsc to a dedicated writer task; the broadcast subscriber
+never blocks on `write_all`.
+
+### Replay (input type)
+
+```json
+"inputs": [{
+  "id": "replay-in",
+  "name": "Replay (clip playback)",
+  "type": "replay",
+  "recording_id": "record-flow",
+  "clip_id": null,
+  "start_paused": true,
+  "loop_playback": false
+}]
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `recording_id` | (required) | The on-disk recording to read from |
+| `clip_id` | `null` | Optional — when set, only that clip's `[in_pts, out_pts]` range plays. Otherwise the whole recording is available |
+| `start_paused` | `true` | When `true`, the input idles on flow start until a `play_clip` / `cue_clip` command activates playback |
+| `loop_playback` | `false` | When `true`, restart at the beginning on EOF |
+
+Phase 1 supports 1.0× forward playback only — no reverse, no
+slow-mo. Mark / cue / play / scrub / stop commands flow via the WS
+`mark_in` / `mark_out` / `cue_clip` / `play_clip` / `scrub_playback`
+/ `stop_playback` actions and route through the per-flow replay
+command channel.
+
+### Events
+
+See [`events-and-alarms.md`](events-and-alarms.md#replay-server-events)
+for the full list of `replay_event` values and `command_ack.error_code`
+codes (`replay_recording_not_active`, `replay_no_playback_input`,
+`replay_clip_not_found`, `replay_writer_lagged`, `replay_disk_full`,
+`replay_index_corrupt`).
+
+### Metrics
+
+Per-recording counters surfaced on the WS stats path:
+`segments_written`, `bytes_written`, `segments_pruned`,
+`packets_dropped`, `index_entries`, `current_pts_90khz`. See
+[`metrics.md`](metrics.md#replay-server-metrics).

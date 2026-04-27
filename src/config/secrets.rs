@@ -345,6 +345,9 @@ impl SecretsConfig {
             // Media player reads files off local disk; the filenames
             // are operational config, not secrets.
             InputConfig::MediaPlayer(_) => {}
+            // Replay reads previously-recorded TS off the local replay
+            // store; recording / clip IDs aren't secrets.
+            InputConfig::Replay(_) => {}
         }
     }
 
@@ -598,6 +601,7 @@ mod tests {
                 output_ids: vec![],
                 assembly: None,
                 content_analysis: None,
+                recording: None,
             }],
             tunnels: vec![TunnelConfig {
                 id: "tunnel-1".to_string(),
@@ -716,6 +720,7 @@ mod tests {
                 output_ids: vec![],
                 assembly: None,
                 content_analysis: None,
+                recording: None,
             }],
             ..Default::default()
         };
@@ -774,6 +779,7 @@ mod tests {
                 output_ids: vec!["rtmp-out".to_string()],
                 assembly: None,
                 content_analysis: None,
+                recording: None,
             }],
             ..Default::default()
         };
@@ -825,6 +831,7 @@ mod tests {
                 output_ids: vec![],
                 assembly: None,
                 content_analysis: None,
+                recording: None,
             }],
             ..Default::default()
         };

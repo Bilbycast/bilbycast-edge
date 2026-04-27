@@ -274,6 +274,7 @@ mod tests {
                 output_ids: vec![],
                 assembly: None,
                 content_analysis: None,
+                recording: None,
             }],
         };
 

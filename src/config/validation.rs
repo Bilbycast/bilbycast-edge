@@ -458,6 +458,11 @@ pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
         }
     }
 
+    // Validate optional recording attributes (replay server, Phase 1).
+    if let Some(ref rec) = flow.recording {
+        validate_recording_config(rec, &flow.id)?;
+    }
+
     // Validate bandwidth limit if configured
     if let Some(ref bw) = flow.bandwidth_limit {
         if bw.max_bitrate_mbps <= 0.0 {
@@ -807,6 +812,61 @@ fn validate_input(input: &InputConfig) -> Result<()> {
         InputConfig::Bonded(c) => validate_bonded_input(c)?,
         InputConfig::TestPattern(c) => validate_test_pattern_input(c)?,
         InputConfig::MediaPlayer(c) => validate_media_player_input(c)?,
+        InputConfig::Replay(c) => validate_replay_input(c)?,
+    }
+    Ok(())
+}
+
+/// Validate a [`crate::config::models::ReplayInputConfig`]. Checks that
+/// `recording_id` and optional `clip_id` are sane identifiers; the actual
+/// existence of the recording on disk is checked at input start so the
+/// runtime can emit a clear `replay_clip_not_found` event the manager
+/// surfaces, rather than blocking config save.
+fn validate_replay_input(c: &crate::config::models::ReplayInputConfig) -> Result<()> {
+    validate_replay_id(&c.recording_id, "replay input recording_id")?;
+    if let Some(ref clip_id) = c.clip_id {
+        validate_replay_id(clip_id, "replay input clip_id")?;
+    }
+    Ok(())
+}
+
+/// Strict identifier validator for replay recording / clip IDs. 1–64
+/// chars, ASCII alphanumerics + `_-`. Mirrors the media-filename
+/// character set minus path-friendly punctuation; replay IDs are
+/// internal and don't need to round-trip through file pickers.
+pub(crate) fn validate_replay_id(id: &str, label: &str) -> Result<()> {
+    if id.is_empty() {
+        bail!("{label}: must not be empty");
+    }
+    if id.len() > 64 {
+        bail!("{label}: must be at most 64 characters (got {})", id.len());
+    }
+    for ch in id.chars() {
+        let ok = ch.is_ascii_alphanumeric() || ch == '_' || ch == '-';
+        if !ok {
+            bail!(
+                "{label}: may only contain ASCII alphanumerics and '_-' (got '{ch}')"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Validate a [`crate::config::models::RecordingConfig`]. Bounds-check the
+/// segment cadence, sanity-check the optional storage_id, and accept the
+/// retention / size caps as advisory (the writer enforces them at runtime).
+fn validate_recording_config(
+    c: &crate::config::models::RecordingConfig,
+    flow_id: &str,
+) -> Result<()> {
+    if c.segment_seconds < 2 || c.segment_seconds > 60 {
+        bail!(
+            "Flow '{flow_id}': recording.segment_seconds must be in 2..=60 (got {})",
+            c.segment_seconds
+        );
+    }
+    if let Some(ref sid) = c.storage_id {
+        validate_replay_id(sid, &format!("Flow '{flow_id}' recording.storage_id"))?;
     }
     Ok(())
 }
@@ -4382,6 +4442,8 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
             InputConfig::TestPattern(_) => {}
             // Media player reads from local disk — no socket bind.
             InputConfig::MediaPlayer(_) => {}
+            // Replay reads from the local replay store — no socket bind.
+            InputConfig::Replay(_) => {}
         }
     }
 
@@ -4766,6 +4828,7 @@ mod tests {
             output_ids: vec!["out-1".to_string()],
             assembly: None,
             content_analysis: None,
+                recording: None,
         });
         config
     }
@@ -4794,6 +4857,7 @@ mod tests {
             output_ids: vec![],
             assembly: None,
             content_analysis: None,
+                recording: None,
         });
         config
     }
@@ -4952,6 +5016,7 @@ mod tests {
             output_ids: vec![],
             assembly: None,
             content_analysis: None,
+                recording: None,
         });
         config.flows.push(FlowConfig {
             id: "same-id".to_string(),
@@ -4967,6 +5032,7 @@ mod tests {
             output_ids: vec![],
             assembly: None,
             content_analysis: None,
+                recording: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -5066,6 +5132,7 @@ mod tests {
             output_ids: vec!["out-1".to_string()],
             assembly: None,
             content_analysis: None,
+                recording: None,
         });
         assert!(validate_config(&config).is_ok());
     }
@@ -5125,6 +5192,7 @@ mod tests {
             output_ids: vec!["out-1".to_string()],
             assembly: None,
             content_analysis: None,
+                recording: None,
         });
         assert!(validate_config(&config).is_ok());
     }
@@ -5205,6 +5273,7 @@ mod tests {
             output_ids: vec!["out-1".to_string()],
             assembly: None,
             content_analysis: None,
+                recording: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -5264,6 +5333,7 @@ mod tests {
             output_ids: vec!["out-1".to_string()],
             assembly: None,
             content_analysis: None,
+                recording: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -5323,6 +5393,7 @@ mod tests {
             output_ids: vec!["out-1".to_string()],
             assembly: None,
             content_analysis: None,
+                recording: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -5528,6 +5599,7 @@ mod tests {
             output_ids: vec!["out-1".to_string()],
             assembly: None,
             content_analysis: None,
+                recording: None,
         });
         config.flow_groups.push(FlowGroupConfig {
             id: "group-1".to_string(),
@@ -5582,6 +5654,7 @@ mod tests {
             output_ids: vec![],
             assembly: None,
             content_analysis: None,
+                recording: None,
         });
         config.flow_groups.push(FlowGroupConfig {
             id: "group-1".to_string(),
@@ -5603,6 +5676,7 @@ mod tests {
             output_ids: vec![],
             assembly: None,
             content_analysis: None,
+                recording: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -5631,6 +5705,7 @@ mod tests {
             output_ids: vec![],
             assembly: None,
             content_analysis: None,
+                recording: None,
         });
         config.flow_groups.push(FlowGroupConfig {
             id: "group-1".to_string(),

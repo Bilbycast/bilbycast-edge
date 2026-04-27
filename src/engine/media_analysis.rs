@@ -155,6 +155,10 @@ fn populate_transport_info(input: &InputConfig, state: &mut MediaAnalysisState) 
             state.protocol = "media_player".to_string();
             state.payload_format = "raw_ts".to_string();
         }
+        InputConfig::Replay(_) => {
+            state.protocol = "replay".to_string();
+            state.payload_format = "raw_ts".to_string();
+        }
     }
 }
 

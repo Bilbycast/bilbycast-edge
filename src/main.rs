@@ -25,6 +25,8 @@ mod fec;
 mod manager;
 mod media;
 mod monitor;
+#[cfg(feature = "replay")]
+mod replay;
 mod redundancy;
 mod setup;
 mod srt;

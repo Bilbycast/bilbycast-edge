@@ -103,6 +103,7 @@ impl FlowSummary {
             Some(InputConfig::Bonded(c)) => ("bonded", c.paths.len() > 1),
             Some(InputConfig::TestPattern(_)) => ("test_pattern", false),
             Some(InputConfig::MediaPlayer(_)) => ("media_player", false),
+            Some(InputConfig::Replay(_)) => ("replay", false),
             None => ("none", false),
         };
 

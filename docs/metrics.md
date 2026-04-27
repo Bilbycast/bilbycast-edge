@@ -381,3 +381,27 @@ default) — with it disabled the task still runs but never decodes.
 on `broadcast::RecvError::Lagged`. A value > 0 means the analyser
 task couldn't keep up with the hot path — an informational signal
 only; the data path is unaffected.
+
+
+## Replay-server metrics
+
+Phase 1 of the in-edge replay server exposes per-recording counters
+under `RecordingStats` (in [`src/replay/writer.rs`](../src/replay/writer.rs)).
+Each is a `std::sync::atomic::AtomicU64`, surfaced on the
+`FlowStats.recording` snapshot when the flow has a `recording`
+attribute.
+
+| Counter | Meaning |
+|---|---|
+| `segments_written` | Number of completed (rolled + atomically-renamed + fsynced) segment files |
+| `bytes_written` | Total bytes appended to segment files since flow start |
+| `segments_pruned` | Segments removed by retention (oldest-first by mtime) |
+| `packets_dropped` | Packets dropped by the broadcast subscriber when the writer's bounded mpsc was full — paired with `replay_writer_lagged` Critical events |
+| `index_entries` | Number of entries appended to `index.bin` (one per IDR) |
+| `current_pts_90khz` | Most recent PCR-derived PTS observed by the writer; `0` when no PCR seen yet |
+| `armed` | `true` while the writer is actively recording; `false` after `stop_recording` or fatal error |
+
+The writer's `replay_writer_lagged` Critical event is emitted
+rate-limited (one per 5 s under sustained lag) so the events feed
+isn't drowned during a disk hiccup. `packets_dropped` continues to
+increment on every drop so dashboards can chart the real impact.

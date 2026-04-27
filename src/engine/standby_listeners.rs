@@ -205,6 +205,8 @@ fn is_passive_listener(config: &InputConfig) -> bool {
         InputConfig::TestPattern(_) => false,
         // Media player reads from local disk — no socket.
         InputConfig::MediaPlayer(_) => false,
+        // Replay reads from the local replay store — no socket.
+        InputConfig::Replay(_) => false,
     }
 }
 

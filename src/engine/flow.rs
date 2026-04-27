@@ -167,6 +167,20 @@ pub struct FlowRuntime {
     /// after a successful in-place swap.
     #[allow(dead_code)]
     pub current_assembly: tokio::sync::Mutex<Option<crate::config::models::FlowAssembly>>,
+    /// Replay-server recording handle. `Some` when the flow's config
+    /// carries a [`crate::config::models::RecordingConfig`] block and
+    /// the `replay` Cargo feature is compiled in. Lifetime tied to the
+    /// flow — cancelled when the flow stops.
+    #[cfg(feature = "replay")]
+    pub recording_handle: Option<Arc<crate::replay::writer::RecordingHandle>>,
+    /// Per-input replay command channels for [`crate::replay::ReplayCommand`].
+    /// Populated when the per-input dispatch in
+    /// [`spawn_single_input`] sees an `InputConfig::Replay` variant.
+    /// The WS dispatcher resolves the active input id, looks up the
+    /// sender here, and forwards the command. Lock-free DashMap keyed
+    /// by input_id.
+    #[cfg(feature = "replay")]
+    pub replay_command_txs: dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::replay::ReplayCommand>>,
 }
 
 /// Runtime state for a single input within a flow.
@@ -361,6 +375,11 @@ impl FlowRuntime {
         #[cfg(feature = "webrtc")]
         let mut whip_session_info: Option<(tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>, Option<String>)> = None;
         let mut input_handles: HashMap<String, InputRuntime> = HashMap::new();
+        // Per-flow registry of replay command channels (one per Replay
+        // input). Populated by `spawn_single_input`; the manager-WS
+        // dispatcher reads it to route mark/cue/play/scrub commands.
+        #[cfg(feature = "replay")]
+        let replay_command_txs: dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::replay::ReplayCommand>> = dashmap::DashMap::new();
         for input_def in &config.inputs {
             let input_id = input_def.id.clone();
             let input_cancel = cancel_token.child_token();
@@ -389,6 +408,8 @@ impl FlowRuntime {
                 &event_sender,
                 &force_idr,
                 config.config.clock_domain,
+                #[cfg(feature = "replay")]
+                &replay_command_txs,
             );
 
             // Spawn the forwarder: drains the per-input channel and forwards
@@ -747,6 +768,59 @@ impl FlowRuntime {
         );
 
         let current_assembly = tokio::sync::Mutex::new(config.config.assembly.clone());
+
+        // Spawn the recording writer if the flow has `recording` configured
+        // and the `replay` feature is on. Built after outputs so a
+        // late-spawn failure doesn't leave the flow half-started — the
+        // writer is a sibling subscriber and adding it last is safe.
+        #[cfg(feature = "replay")]
+        let recording_handle: Option<Arc<crate::replay::writer::RecordingHandle>> =
+            if let Some(rec_cfg) = config.config.recording.as_ref().filter(|r| r.enabled).cloned() {
+                match crate::replay::writer::spawn_writer(
+                    config.config.id.clone(),
+                    rec_cfg,
+                    broadcast_tx.clone(),
+                    event_sender.clone(),
+                    cancel_token.clone(),
+                ).await {
+                    Ok(h) => {
+                        // Surface the live writer counters on the flow's
+                        // stats snapshot so the manager UI can render the
+                        // ● REC + DROPS badges on the flow card without
+                        // a per-flow status round-trip.
+                        let _ = flow_stats.recording_stats.set(h.stats.clone());
+                        let _ = flow_stats.recording_id.set(h.recording_id.clone());
+                        event_sender.emit_with_details(
+                            crate::manager::events::EventSeverity::Info,
+                            crate::manager::events::category::REPLAY,
+                            format!("Recording started for flow '{}'", config.config.id),
+                            Some(&config.config.id),
+                            serde_json::json!({
+                                "replay_event": "recording_started",
+                                "recording_id": h.recording_id,
+                            }),
+                        );
+                        Some(Arc::new(h))
+                    }
+                    Err(e) => {
+                        event_sender.emit_with_details(
+                            crate::manager::events::EventSeverity::Critical,
+                            crate::manager::events::category::REPLAY,
+                            format!("Recording failed to start for flow '{}': {e}", config.config.id),
+                            Some(&config.config.id),
+                            serde_json::json!({
+                                "replay_event": "recording_start_failed",
+                                "error_code": "replay_disk_full",
+                                "error": e.to_string(),
+                            }),
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
         Ok(Self {
             config,
             broadcast_tx,
@@ -772,6 +846,10 @@ impl FlowRuntime {
             pid_bus_assembler_handle,
             es_bus,
             current_assembly,
+            #[cfg(feature = "replay")]
+            recording_handle,
+            #[cfg(feature = "replay")]
+            replay_command_txs,
         })
     }
 
@@ -1558,6 +1636,8 @@ fn spawn_single_input(
     event_sender: &EventSender,
     force_idr: &Arc<std::sync::atomic::AtomicBool>,
     flow_clock_domain: Option<u8>,
+    #[cfg(feature = "replay")]
+    replay_command_txs: &dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::replay::ReplayCommand>>,
 ) -> (JoinHandle<()>, Option<WhipSessionInfo>) {
     let input_id = input_def.id.clone();
     let mut whip_info: Option<WhipSessionInfo> = None;
@@ -1688,6 +1768,32 @@ fn spawn_single_input(
             input_cancel.clone(), event_sender.clone(),
             flow_id.to_string(), input_id.clone(),
         ),
+        #[cfg(feature = "replay")]
+        InputConfig::Replay(c) => {
+            let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<crate::replay::ReplayCommand>(32);
+            // Register the per-input command channel so the manager-WS
+            // dispatcher can route mark/cue/play/scrub commands to this
+            // input by id.
+            replay_command_txs.insert(input_id.clone(), cmd_tx);
+            super::input_replay::spawn_replay_input(
+                c.clone(), per_input_tx.clone(), flow_stats.clone(),
+                input_cancel.clone(), event_sender.clone(),
+                flow_id.to_string(), input_id.clone(), cmd_rx,
+            )
+        }
+        #[cfg(not(feature = "replay"))]
+        InputConfig::Replay(_) => {
+            let cancel = input_cancel.clone();
+            let event_sender = event_sender.clone();
+            tokio::spawn(async move {
+                event_sender.emit(
+                    crate::manager::events::EventSeverity::Critical,
+                    crate::manager::events::category::FLOW,
+                    "Replay input requires the `replay` Cargo feature",
+                );
+                cancel.cancelled().await;
+            })
+        }
     };
 
     (handle, whip_info)
@@ -1845,6 +1951,11 @@ fn media_analysis_metadata(input: &InputConfig) -> MediaAnalysisMeta {
             fec_enabled: false, fec_type: None,
             redundancy_enabled: false, redundancy_type: None,
         },
+        InputConfig::Replay(_) => MediaAnalysisMeta {
+            protocol: "replay".into(), payload_format: "raw_ts".into(),
+            fec_enabled: false, fec_type: None,
+            redundancy_enabled: false, redundancy_type: None,
+        },
     }
 }
 
@@ -1873,6 +1984,7 @@ fn input_type_str(input: &InputConfig) -> &'static str {
         InputConfig::Bonded(_) => "bonded",
         InputConfig::TestPattern(_) => "test_pattern",
         InputConfig::MediaPlayer(_) => "media_player",
+        InputConfig::Replay(_) => "replay",
     }
 }
 
@@ -2018,6 +2130,18 @@ fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::Inpu
         },
         InputConfig::MediaPlayer(c) => InputConfigMeta {
             mode: Some(format!("media-player ({} source(s))", c.sources.len())),
+            local_addr: None,
+            remote_addr: None,
+            listen_addr: None,
+            bind_addr: None,
+            rtsp_url: None,
+            whep_url: None,
+        },
+        InputConfig::Replay(c) => InputConfigMeta {
+            mode: Some(match &c.clip_id {
+                Some(clip) => format!("replay clip {clip} of {}", c.recording_id),
+                None => format!("replay recording {}", c.recording_id),
+            }),
             local_addr: None,
             remote_addr: None,
             listen_addr: None,

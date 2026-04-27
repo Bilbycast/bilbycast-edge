@@ -131,6 +131,9 @@ fn input_transport(input: &InputConfig) -> &'static str {
         // Media player synthesises MPEG-TS from local files; advertise
         // as generic RTP for NMOS surface compatibility.
         InputConfig::MediaPlayer(_) => "urn:x-nmos:transport:rtp",
+        // Replay pumps recorded MPEG-TS back onto the broadcast channel;
+        // advertise as generic RTP for NMOS surface compatibility.
+        InputConfig::Replay(_) => "urn:x-nmos:transport:rtp",
     }
 }
 
@@ -295,6 +298,7 @@ fn input_type_str(input: &InputConfig) -> &'static str {
         InputConfig::Bonded(_) => "bonded",
         InputConfig::TestPattern(_) => "test_pattern",
         InputConfig::MediaPlayer(_) => "media_player",
+        InputConfig::Replay(_) => "replay",
     }
 }
 

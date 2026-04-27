@@ -819,6 +819,11 @@ fn edge_capabilities() -> Vec<&'static str> {
     if cfg!(feature = "ptp-internal") {
         caps.push("ptp-internal");
     }
+    if cfg!(feature = "replay") {
+        // Replay-server: continuous flow recording + clip-based playback.
+        // The manager UI gates the Replay tab on the presence of this string.
+        caps.push("replay");
+    }
     if cfg!(any(
         feature = "video-encoder-x264",
         feature = "video-encoder-x265",
@@ -2383,7 +2388,341 @@ async fn execute_command(
             let result = crate::engine::test_connection::test_output(&output_config).await;
             Ok(Some(serde_json::to_value(result).unwrap()))
         }
+        // ── Replay-server commands (recording + playback) ──
+        #[cfg(feature = "replay")]
+        "start_recording" => {
+            let flow_id = action["flow_id"].as_str()
+                .ok_or("start_recording: missing 'flow_id'")?;
+            let runtime = flow_manager.get_runtime(flow_id)
+                .ok_or_else(|| CommandError::with_code(
+                    format!("Unknown flow '{flow_id}'"),
+                    "replay_recording_not_active",
+                ))?;
+            let handle = runtime.recording_handle.as_ref()
+                .ok_or_else(|| CommandError::with_code(
+                    format!("Flow '{flow_id}' has no recording configured"),
+                    "replay_recording_not_active",
+                ))?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            handle.command_tx.send(crate::replay::RecordingCommand::Start { reply: tx })
+                .await
+                .map_err(|_| CommandError::new("recording writer task is gone".to_string()))?;
+            let recording_id = rx.await
+                .map_err(|_| CommandError::new("recording writer dropped reply".to_string()))?
+                .map_err(|e| CommandError::with_code(e.to_string(), "replay_recording_not_active"))?;
+            Ok(Some(serde_json::json!({ "recording_id": recording_id })))
+        }
+        #[cfg(feature = "replay")]
+        "stop_recording" => {
+            let flow_id = action["flow_id"].as_str()
+                .ok_or("stop_recording: missing 'flow_id'")?;
+            let runtime = flow_manager.get_runtime(flow_id)
+                .ok_or_else(|| CommandError::new(format!("Unknown flow '{flow_id}'")))?;
+            let handle = runtime.recording_handle.as_ref()
+                .ok_or_else(|| CommandError::with_code(
+                    format!("Flow '{flow_id}' has no recording configured"),
+                    "replay_recording_not_active",
+                ))?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            handle.command_tx.send(crate::replay::RecordingCommand::Stop { reply: tx })
+                .await
+                .map_err(|_| CommandError::new("recording writer task is gone".to_string()))?;
+            rx.await
+                .map_err(|_| CommandError::new("recording writer dropped reply".to_string()))?
+                .map_err(|e| CommandError::new(e.to_string()))?;
+            Ok(Some(serde_json::json!({})))
+        }
+        #[cfg(feature = "replay")]
+        "mark_in" => {
+            let flow_id = action["flow_id"].as_str()
+                .ok_or("mark_in: missing 'flow_id'")?;
+            let explicit_pts = action["pts_90khz"].as_u64();
+            let runtime = flow_manager.get_runtime(flow_id)
+                .ok_or_else(|| CommandError::new(format!("Unknown flow '{flow_id}'")))?;
+            let handle = runtime.recording_handle.as_ref()
+                .ok_or_else(|| CommandError::with_code(
+                    format!("Flow '{flow_id}' has no recording configured"),
+                    "replay_recording_not_active",
+                ))?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            handle.command_tx.send(crate::replay::RecordingCommand::MarkIn { explicit_pts, reply: tx })
+                .await
+                .map_err(|_| CommandError::new("recording writer task is gone".to_string()))?;
+            let ack = rx.await
+                .map_err(|_| CommandError::new("recording writer dropped reply".to_string()))?
+                .map_err(|e| CommandError::with_code(e.to_string(), "replay_recording_not_active"))?;
+            Ok(Some(serde_json::to_value(ack).unwrap_or_default()))
+        }
+        #[cfg(feature = "replay")]
+        "mark_out" => {
+            let flow_id = action["flow_id"].as_str()
+                .ok_or("mark_out: missing 'flow_id'")?;
+            let name = action["name"].as_str().map(|s| s.to_string());
+            let description = action["description"].as_str().map(|s| s.to_string());
+            let explicit_out_pts = action["pts_90khz"].as_u64();
+            let created_by = action["created_by"].as_str().map(|s| s.to_string());
+            let runtime = flow_manager.get_runtime(flow_id)
+                .ok_or_else(|| CommandError::new(format!("Unknown flow '{flow_id}'")))?;
+            let handle = runtime.recording_handle.as_ref()
+                .ok_or_else(|| CommandError::with_code(
+                    format!("Flow '{flow_id}' has no recording configured"),
+                    "replay_recording_not_active",
+                ))?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            handle.command_tx.send(crate::replay::RecordingCommand::MarkOut {
+                name, description, explicit_out_pts, created_by, reply: tx,
+            }).await
+                .map_err(|_| CommandError::new("recording writer task is gone".to_string()))?;
+            let clip = rx.await
+                .map_err(|_| CommandError::new("recording writer dropped reply".to_string()))?
+                .map_err(|e| CommandError::with_code(e.to_string(), "replay_recording_not_active"))?;
+            Ok(Some(serde_json::to_value(clip).unwrap_or_default()))
+        }
+        #[cfg(feature = "replay")]
+        "list_clips" => {
+            // Two query shapes: by flow_id (resolves to the flow's
+            // recording_id via FlowRuntime) or by recording_id directly
+            // (lets the manager re-sync against an orphan recording).
+            let recording_id = if let Some(rid) = action["recording_id"].as_str() {
+                rid.to_string()
+            } else if let Some(flow_id) = action["flow_id"].as_str() {
+                let runtime = flow_manager.get_runtime(flow_id)
+                    .ok_or_else(|| CommandError::new(format!("Unknown flow '{flow_id}'")))?;
+                runtime.recording_handle.as_ref()
+                    .map(|h| h.recording_id.clone())
+                    .ok_or_else(|| CommandError::with_code(
+                        format!("Flow '{flow_id}' has no recording configured"),
+                        "replay_recording_not_active",
+                    ))?
+            } else {
+                return Err(CommandError::new("list_clips: provide flow_id or recording_id".to_string()));
+            };
+            let dir = crate::replay::recording_dir(&recording_id);
+            let store = crate::replay::clips::ClipStore::open(&recording_id, &dir).await
+                .map_err(|e| CommandError::with_code(e.to_string(), "replay_clip_not_found"))?;
+            let clips = store.list().await;
+            Ok(Some(serde_json::json!({ "clips": clips })))
+        }
+        #[cfg(feature = "replay")]
+        "rename_clip" => {
+            let clip_id = action["clip_id"].as_str()
+                .ok_or("rename_clip: missing 'clip_id'")?;
+            let new_name = action["name"].as_str().map(|s| s.to_string());
+            let new_description = action["description"].as_str().map(|s| s.to_string());
+            if new_name.is_none() && new_description.is_none() {
+                return Err(CommandError::new("rename_clip: provide name and/or description".to_string()));
+            }
+            // Find which recording owns this clip, then rename in place.
+            let root = crate::replay::replay_root();
+            let mut renamed: Option<crate::replay::ClipInfo> = None;
+            if let Ok(mut dir) = tokio::fs::read_dir(&root).await {
+                while let Ok(Some(entry)) = dir.next_entry().await {
+                    if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                        continue;
+                    }
+                    let rid = match entry.file_name().to_str() {
+                        Some(s) => s.to_string(),
+                        None => continue,
+                    };
+                    let store = match crate::replay::clips::ClipStore::open(&rid, &entry.path()).await {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    if store.get(clip_id).await.is_some() {
+                        match store.rename(clip_id, new_name.clone(), new_description.clone()).await {
+                            Ok(Some(info)) => { renamed = Some(info); }
+                            Ok(None) => {}
+                            Err(e) => return Err(CommandError::new(format!("rename_clip failed: {e}"))),
+                        }
+                        break;
+                    }
+                }
+            }
+            match renamed {
+                Some(info) => Ok(Some(serde_json::to_value(info).unwrap_or_default())),
+                None => Err(CommandError::with_code(
+                    format!("Clip '{clip_id}' not found"),
+                    "replay_clip_not_found",
+                )),
+            }
+        }
+        #[cfg(feature = "replay")]
+        "recording_status" => {
+            let flow_id = action["flow_id"].as_str()
+                .ok_or("recording_status: missing 'flow_id'")?;
+            let runtime = flow_manager.get_runtime(flow_id)
+                .ok_or_else(|| CommandError::new(format!("Unknown flow '{flow_id}'")))?;
+            // Filesystem-level free / total bytes for the replay root.
+            // Lets the manager UI render a disk meter even when no
+            // per-recording `max_bytes` cap is set.
+            let (free, total) = crate::replay::replay_disk_usage().unwrap_or((0, 0));
+            // Per-recording cap from the flow's `RecordingConfig`. The
+            // UI prefers this over the filesystem signal when present.
+            let max_bytes = runtime.config.config.recording.as_ref()
+                .map(|r| r.max_bytes).unwrap_or(0);
+            match runtime.recording_handle.as_ref() {
+                Some(h) => {
+                    use std::sync::atomic::Ordering;
+                    let s = &h.stats;
+                    Ok(Some(serde_json::json!({
+                        "armed": s.armed.load(Ordering::Relaxed),
+                        "recording_id": h.recording_id,
+                        "current_pts_90khz": s.current_pts_90khz.load(Ordering::Relaxed),
+                        "segments_written": s.segments_written.load(Ordering::Relaxed),
+                        "bytes_written": s.bytes_written.load(Ordering::Relaxed),
+                        "segments_pruned": s.segments_pruned.load(Ordering::Relaxed),
+                        "packets_dropped": s.packets_dropped.load(Ordering::Relaxed),
+                        "index_entries": s.index_entries.load(Ordering::Relaxed),
+                        "max_bytes": max_bytes,
+                        "replay_root_free_bytes": free,
+                        "replay_root_total_bytes": total,
+                    })))
+                }
+                None => Ok(Some(serde_json::json!({
+                    "armed": false,
+                    "recording_id": null,
+                    "current_pts_90khz": 0,
+                    "segments_written": 0,
+                    "bytes_written": 0,
+                    "segments_pruned": 0,
+                    "packets_dropped": 0,
+                    "index_entries": 0,
+                    "max_bytes": max_bytes,
+                    "replay_root_free_bytes": free,
+                    "replay_root_total_bytes": total,
+                }))),
+            }
+        }
+        #[cfg(feature = "replay")]
+        "delete_clip" => {
+            let clip_id = action["clip_id"].as_str()
+                .ok_or("delete_clip: missing 'clip_id'")?;
+            // Search across recording dirs for the clip — clips.json
+            // lookup is cheap (a few hundred bytes per recording).
+            let root = crate::replay::replay_root();
+            let mut deleted = false;
+            let mut owning_recording: Option<String> = None;
+            if let Ok(mut dir) = tokio::fs::read_dir(&root).await {
+                while let Ok(Some(entry)) = dir.next_entry().await {
+                    if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                        continue;
+                    }
+                    let rid = match entry.file_name().to_str() {
+                        Some(s) => s.to_string(),
+                        None => continue,
+                    };
+                    let store = match crate::replay::clips::ClipStore::open(&rid, &entry.path()).await {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    if store.get(clip_id).await.is_some() {
+                        if store.delete(clip_id).await.unwrap_or(false) {
+                            deleted = true;
+                            owning_recording = Some(rid);
+                            break;
+                        }
+                    }
+                }
+            }
+            if deleted {
+                if let Some(rid) = owning_recording.as_ref() {
+                    flow_manager.event_sender().emit_with_details(
+                        crate::manager::events::EventSeverity::Info,
+                        crate::manager::events::category::REPLAY,
+                        format!("Clip '{clip_id}' deleted"),
+                        None,
+                        serde_json::json!({
+                            "replay_event": "clip_deleted",
+                            "clip_id": clip_id,
+                            "recording_id": rid,
+                        }),
+                    );
+                }
+                Ok(Some(serde_json::json!({ "deleted": true })))
+            } else {
+                Err(CommandError::with_code(
+                    format!("Clip '{clip_id}' not found"),
+                    "replay_clip_not_found",
+                ))
+            }
+        }
+        #[cfg(feature = "replay")]
+        "cue_clip" | "play_clip" | "stop_playback" | "scrub_playback" => {
+            let flow_id = action["flow_id"].as_str()
+                .ok_or_else(|| CommandError::new(format!(
+                    "{action_type}: missing 'flow_id'"
+                )))?;
+            let runtime = flow_manager.get_runtime(flow_id)
+                .ok_or_else(|| CommandError::new(format!("Unknown flow '{flow_id}'")))?;
+            let active_input_id = runtime.active_input_tx.borrow().clone();
+            let cmd_tx = runtime.replay_command_txs.get(&active_input_id)
+                .map(|r| r.clone())
+                .ok_or_else(|| CommandError::with_code(
+                    format!("Flow '{flow_id}' has no active replay input"),
+                    "replay_no_playback_input",
+                ))?;
+            dispatch_replay_input_command(action_type, action, cmd_tx).await
+        }
         _ => Err(CommandError::with_code(format!("Unknown command: {action_type}"), "unknown_action")),
+    }
+}
+
+#[cfg(feature = "replay")]
+async fn dispatch_replay_input_command(
+    action_type: &str,
+    action: &serde_json::Value,
+    cmd_tx: tokio::sync::mpsc::Sender<crate::replay::ReplayCommand>,
+) -> Result<Option<serde_json::Value>, CommandError> {
+    use crate::replay::ReplayCommand;
+    match action_type {
+        "cue_clip" => {
+            let clip_id = action["clip_id"].as_str()
+                .ok_or("cue_clip: missing 'clip_id'")?
+                .to_string();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            cmd_tx.send(ReplayCommand::Cue { clip_id, reply: tx }).await
+                .map_err(|_| CommandError::new("replay input is gone".to_string()))?;
+            rx.await
+                .map_err(|_| CommandError::new("replay input dropped reply".to_string()))?
+                .map_err(|e| CommandError::with_code(e.to_string(), "replay_clip_not_found"))?;
+            Ok(Some(serde_json::json!({})))
+        }
+        "play_clip" => {
+            let clip_id = action["clip_id"].as_str().map(|s| s.to_string());
+            let from_pts_90khz = action["from_pts_90khz"].as_u64();
+            let to_pts_90khz = action["to_pts_90khz"].as_u64();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            cmd_tx.send(ReplayCommand::Play { clip_id, from_pts_90khz, to_pts_90khz, reply: tx }).await
+                .map_err(|_| CommandError::new("replay input is gone".to_string()))?;
+            rx.await
+                .map_err(|_| CommandError::new("replay input dropped reply".to_string()))?
+                .map_err(|e| CommandError::with_code(e.to_string(), "replay_clip_not_found"))?;
+            Ok(Some(serde_json::json!({})))
+        }
+        "stop_playback" => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            cmd_tx.send(ReplayCommand::Stop { reply: tx }).await
+                .map_err(|_| CommandError::new("replay input is gone".to_string()))?;
+            rx.await
+                .map_err(|_| CommandError::new("replay input dropped reply".to_string()))?
+                .map_err(|e| CommandError::new(e.to_string()))?;
+            Ok(Some(serde_json::json!({})))
+        }
+        "scrub_playback" => {
+            let pts_90khz = action["pts_90khz"].as_u64()
+                .ok_or("scrub_playback: missing 'pts_90khz'")?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            cmd_tx.send(ReplayCommand::Scrub { pts_90khz, reply: tx }).await
+                .map_err(|_| CommandError::new("replay input is gone".to_string()))?;
+            let ack = rx.await
+                .map_err(|_| CommandError::new("replay input dropped reply".to_string()))?
+                .map_err(|e| CommandError::with_code(e.to_string(), "replay_clip_not_found"))?;
+            Ok(Some(serde_json::to_value(ack).unwrap_or_default()))
+        }
+        _ => Err(CommandError::with_code(
+            format!("Unknown replay input command: {action_type}"),
+            "unknown_action",
+        )),
     }
 }
 

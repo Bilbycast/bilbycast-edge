@@ -27,6 +27,11 @@ pub mod input_test_pattern;
 /// surface and `docs/configuration-guide.md` for the operator-facing
 /// reference.
 pub mod input_media_player;
+/// Replay input — pumps recorded TS segments back onto the broadcast
+/// channel. See [`crate::config::models::ReplayInputConfig`] for the
+/// config surface, [`crate::replay`] for the on-disk store.
+#[cfg(feature = "replay")]
+pub mod input_replay;
 pub mod bonded_scheduler;
 pub mod delay_buffer;
 pub mod flow;

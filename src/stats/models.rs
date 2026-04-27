@@ -92,6 +92,31 @@ pub struct FlowStats {
     /// compatible addition; old manager builds ignore unknown fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_analysis: Option<ContentAnalysisStats>,
+    /// Replay-server recording snapshot. Populated only when the flow
+    /// has a `recording` block configured and the `replay` Cargo
+    /// feature is compiled in. Surfaces the live counters
+    /// ([`RecordingSnapshot`] = `armed`, `current_pts_90khz`,
+    /// `segments_written`, `bytes_written`, `packets_dropped`,
+    /// `segments_pruned`, `index_entries`) so the manager UI can show
+    /// a "● REC" / "DROPS" badge on the flow card without polling a
+    /// separate endpoint. Backward-compatible addition; old manager
+    /// builds ignore unknown fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<RecordingSnapshot>,
+}
+
+/// Live atomic-counter snapshot of a flow's recording writer.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct RecordingSnapshot {
+    pub armed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_id: Option<String>,
+    pub current_pts_90khz: u64,
+    pub segments_written: u64,
+    pub bytes_written: u64,
+    pub segments_pruned: u64,
+    pub packets_dropped: u64,
+    pub index_entries: u64,
 }
 
 /// In-depth content-analysis snapshot. Mirrors the tier shape of

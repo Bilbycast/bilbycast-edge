@@ -142,6 +142,13 @@ pub async fn test_input(config: &InputConfig) -> TestResult {
                     )
                 }
             }
+            InputConfig::Replay(c) => {
+                let label = match &c.clip_id {
+                    Some(clip) => format!("replay clip {clip} of recording {}", c.recording_id),
+                    None => format!("replay recording {}", c.recording_id),
+                };
+                TestResult::ok("configured", label, start.elapsed())
+            }
         }
     })
     .await;

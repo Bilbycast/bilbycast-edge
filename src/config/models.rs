@@ -318,7 +318,63 @@ pub struct FlowConfig {
     /// gracefully no-op on inputs that can't supply the relevant essence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_analysis: Option<ContentAnalysisConfig>,
+    /// Optional per-flow continuous recording to disk. When set, a sibling
+    /// subscriber drains the flow's broadcast channel and writes rolling
+    /// MPEG-TS segments to the local replay store (see [`RecordingConfig`]).
+    /// Composes with passthrough + assembled flows — the bytes recorded are
+    /// always the bytes the outputs see. Drop-on-lag, never blocks the data
+    /// path. Requires the `replay` Cargo feature; on binaries without it,
+    /// configs carrying this field still load but the runtime emits a
+    /// Critical event and refuses to bring up the recorder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<RecordingConfig>,
 }
+
+/// Per-flow continuous-recording attributes. When attached to a
+/// [`FlowConfig`], a dedicated subscriber on the flow's broadcast channel
+/// writes rolling 188-byte-aligned MPEG-TS segments under
+/// `<replay_root>/<storage_id or flow_id>/` and maintains a side-car
+/// timecode → byte-offset index for fast scrub. Retention enforces both
+/// `retention_seconds` and `max_bytes`, evicting oldest first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordingConfig {
+    /// Whether the recorder is currently armed. Default true (start with
+    /// the flow). Setting false leaves the configuration in place but
+    /// stops the writer task — useful for gating recording on a routine.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Storage subdirectory under the replay root. Defaults to flow_id.
+    /// Subject to the same character set as media-library filenames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_id: Option<String>,
+    /// Rolling segment duration in seconds. Default 10. Range [2, 60].
+    #[serde(default = "default_recording_segment_seconds")]
+    pub segment_seconds: u32,
+    /// Maximum recording age in seconds. Default 86_400 (24h). 0 = unlimited.
+    #[serde(default = "default_recording_retention_seconds")]
+    pub retention_seconds: u64,
+    /// Maximum total bytes per recording. Default 50 GiB. 0 = unlimited
+    /// (still subject to free disk space; writer emits Critical
+    /// `replay_disk_full` and stops on actual exhaustion).
+    #[serde(default = "default_recording_max_bytes")]
+    pub max_bytes: u64,
+}
+
+impl Default for RecordingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            storage_id: None,
+            segment_seconds: default_recording_segment_seconds(),
+            retention_seconds: default_recording_retention_seconds(),
+            max_bytes: default_recording_max_bytes(),
+        }
+    }
+}
+
+fn default_recording_segment_seconds() -> u32 { 10 }
+fn default_recording_retention_seconds() -> u64 { 86_400 }
+fn default_recording_max_bytes() -> u64 { 50 * 1024 * 1024 * 1024 }
 
 impl FlowConfig {
     /// Resolved content-analysis configuration with defaults filled in.
@@ -703,6 +759,44 @@ pub enum InputConfig {
     /// [`MediaPlayerInputConfig`] for source kinds.
     #[serde(rename = "media_player")]
     MediaPlayer(MediaPlayerInputConfig),
+    /// Replay input: pump a previously-recorded flow's TS segments back
+    /// onto the broadcast channel, PTS-paced. Designed for tier-2 sports
+    /// instant-replay workflows — switch a flow's active input to this
+    /// variant via the existing gap-free `activate_input` and the egress
+    /// outputs (UDP/RTP/SRT/RIST/HLS/CMAF/WebRTC/RTMP) consume the
+    /// playback unchanged. Mark / cue / play / scrub commands route to
+    /// this input via the per-flow replay command channel — see the
+    /// `replay` Cargo feature and `engine::input_replay` for runtime
+    /// behaviour. Field schema in [`ReplayInputConfig`].
+    #[serde(rename = "replay")]
+    Replay(ReplayInputConfig),
+}
+
+/// File-backed replay input. Reads MPEG-TS segments from a local
+/// recording (built by a flow with [`RecordingConfig`] attached) and
+/// publishes paced packets onto the flow's broadcast channel. Mark /
+/// cue / play / stop / scrub state lives in the input task — the WS
+/// dispatcher routes commands via the per-flow replay command channel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplayInputConfig {
+    /// ID of the recording on this edge's replay store. Required.
+    /// Resolves against `<replay_root>/<recording_id>/`.
+    pub recording_id: String,
+    /// Optional clip ID. When set, only the clip's `[in_pts, out_pts]`
+    /// range plays. Unset = whole recording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_id: Option<String>,
+    /// When true, restart at the beginning on EOF. Default false (idle on
+    /// last frame, NULL-PID padding to keep downstream sockets alive).
+    #[serde(default)]
+    pub loop_playback: bool,
+    /// Initial state on flow start. When true (default), the input
+    /// publishes NULL-PID padding until a `play_clip` / `cue_clip`
+    /// command activates playback. When false, playback begins immediately
+    /// at the configured `clip_id` start (or the beginning of the
+    /// recording).
+    #[serde(default = "default_true")]
+    pub start_paused: bool,
 }
 
 /// Configuration for an in-process synthetic test-pattern input.
@@ -844,6 +938,7 @@ impl InputConfig {
             InputConfig::Bonded(_) => "bonded",
             InputConfig::TestPattern(_) => "test_pattern",
             InputConfig::MediaPlayer(_) => "media_player",
+            InputConfig::Replay(_) => "replay",
         }
     }
 
@@ -880,7 +975,10 @@ impl InputConfig {
             // Media player synthesises fresh MPEG-TS from local files
             // (raw TS pass-through, MP4 demux + remux, or image + slate
             // encode).
-            | InputConfig::MediaPlayer(_) => true,
+            | InputConfig::MediaPlayer(_)
+            // Replay reads MPEG-TS segments off the replay store and
+            // pumps them onto the broadcast channel verbatim.
+            | InputConfig::Replay(_) => true,
             // PCM-only inputs become TS carriers when `audio_encode` is set —
             // the input task muxes the encoded audio into an audio-only TS.
             // ST 2110-31 (AES3 transparent) becomes a TS carrier only via
@@ -3799,6 +3897,7 @@ mod tests {
                 output_ids: vec!["rtp-out-1".to_string()],
                 assembly: None,
                 content_analysis: None,
+                recording: None,
             }],
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
@@ -3860,6 +3959,7 @@ mod tests {
                 output_ids: vec!["out-1".to_string()],
                 assembly: None,
                 content_analysis: None,
+                recording: None,
             }],
             ..Default::default()
         };
@@ -3888,6 +3988,7 @@ mod tests {
                 output_ids: vec![],
                 assembly: None,
                 content_analysis: None,
+                recording: None,
             }],
             ..Default::default()
         };
@@ -3964,6 +4065,7 @@ mod tests {
                 output_ids: vec!["out-1".to_string(), "out-2".to_string()],
                 assembly: None,
                 content_analysis: None,
+                recording: None,
             }],
             ..Default::default()
         };
