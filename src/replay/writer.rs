@@ -255,6 +255,10 @@ pub async fn spawn_writer(
         match initial_mode {
             WriterMode::PreBuffer => MODE_PRE_BUFFER,
             WriterMode::Armed => MODE_ARMED,
+            // Unreachable — `initial_mode` is selected above as PreBuffer
+            // (when `pre_buffer_seconds` is set) or Armed (otherwise).
+            // Kept exhaustive to satisfy the compiler.
+            WriterMode::Idle => MODE_IDLE,
         },
         Ordering::Relaxed,
     );
@@ -361,22 +365,25 @@ async fn subscriber_loop(
     }
 }
 
-/// Writer arming state. Phase 2.2 split.
+/// Writer arming state.
 ///
-/// * `Stopped` — no pre-buffer configured and the operator hasn't
-///   started a recording session. The writer task isn't even spawned
-///   in this mode (the FlowRuntime skips `spawn_writer`).
+/// * `Idle` — operator pressed Stop. The writer task is still alive
+///   (so subsequent commands ack cleanly) but `write_chunk` returns
+///   early without touching disk and no new segments roll. Re-enter
+///   `Armed` via `Start`.
 /// * `PreBuffer` — pre-buffer is configured (`recording.pre_buffer_seconds.is_some()`)
-///   and the operator hasn't pressed Start. Segments roll to disk with
-///   retention pinned at `pre_buffer_seconds`. `RecordingStats.armed`
-///   stays false so the manager UI distinguishes pre-roll from a
-///   recording session, and the manager's stall detector doesn't
-///   trigger (it gates on `armed`).
+///   and the operator hasn't pressed Start *yet*. Initial state at
+///   flow startup only — Stop now goes to `Idle`, not back to
+///   `PreBuffer`. Segments roll to disk with retention pinned at
+///   `pre_buffer_seconds`. `RecordingStats.armed` stays false so the
+///   manager UI distinguishes pre-roll from a recording session, and
+///   the manager's stall detector doesn't trigger (it gates on `armed`).
 /// * `Armed` — recording session active. Retention bumps to the full
 ///   `recording.retention_seconds`. Existing pre-buffer segments
 ///   become the head of the recording. `armed` flips true.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriterMode {
+    Idle,
     PreBuffer,
     Armed,
 }
@@ -496,6 +503,12 @@ impl WriterState {
     /// (assembled and passthrough flows produce raw TS); the RTP-wrap
     /// case is handled by skipping the 12-byte RTP header.
     async fn write_chunk(&mut self, buf: &Bytes) -> Result<()> {
+        // Idle: operator pressed Stop. Drain the broadcast subscriber
+        // (so it doesn't lag) but no bytes hit disk and no segments
+        // roll. A later Start flips back to Armed and writes resume.
+        if self.mode == WriterMode::Idle {
+            return Ok(());
+        }
         let ts = strip_rtp_if_present(buf);
         if ts.is_empty() || ts.len() % TS_PACKET != 0 {
             // Mis-sized or non-TS payload — don't poison the segment.
@@ -834,8 +847,10 @@ impl WriterState {
     /// configured `recording.retention_seconds`; in `PreBuffer` mode it
     /// snaps to `recording.pre_buffer_seconds` so the on-disk window
     /// stays bounded to "the last N seconds" while the operator hasn't
-    /// pressed Start. `0` always means unlimited (subject to
-    /// `max_bytes` and free disk).
+    /// pressed Start. In `Idle` mode the value is irrelevant — no new
+    /// data is being written and `run_retention` is only called from the
+    /// segment-roll path, which is itself gated on writes happening.
+    /// `0` always means unlimited (subject to `max_bytes` and free disk).
     fn effective_retention_seconds(&self) -> u64 {
         match self.mode {
             WriterMode::Armed => self.config.retention_seconds,
@@ -844,6 +859,7 @@ impl WriterState {
                 .pre_buffer_seconds
                 .map(|s| s as u64)
                 .unwrap_or(self.config.retention_seconds),
+            WriterMode::Idle => self.config.retention_seconds,
         }
     }
 
@@ -882,23 +898,17 @@ impl WriterState {
                 let _ = reply.send(Ok(self.recording_id.clone()));
             }
             RecordingCommand::Stop { reply } => {
-                let has_pre_buffer = self.config.pre_buffer_seconds.is_some();
+                // Transition to Idle and fully halt disk writes. The
+                // writer task stays alive (so subsequent commands ack
+                // cleanly) but `write_chunk` returns early in Idle, no
+                // new segments roll. Reset `current_segment_started`
+                // so a later Start doesn't see a stale elapsed timer
+                // and roll a phantom segment on the first chunk.
+                self.mode = WriterMode::Idle;
                 self.stats.armed.store(false, Ordering::Relaxed);
-                if has_pre_buffer {
-                    // Drop back into pre-buffer mode — keep writing,
-                    // retention shrinks to `pre_buffer_seconds`.
-                    // Older segments prune naturally on the next roll
-                    // via the now-tighter `effective_retention_seconds`.
-                    self.mode = WriterMode::PreBuffer;
-                    self.stats.mode.store(MODE_PRE_BUFFER, Ordering::Relaxed);
-                } else {
-                    // No pre-buffer: classic stop, flush and close the
-                    // current segment. The writer task stays alive until
-                    // the cancel signal so subsequent commands can still
-                    // get a meaningful ack.
-                    self.flush_and_close().await;
-                    self.stats.mode.store(MODE_IDLE, Ordering::Relaxed);
-                }
+                self.stats.mode.store(MODE_IDLE, Ordering::Relaxed);
+                self.flush_and_close().await;
+                self.current_segment_started = None;
                 let _ = reply.send(Ok(()));
             }
             RecordingCommand::MarkIn { explicit_pts, reply } => {
