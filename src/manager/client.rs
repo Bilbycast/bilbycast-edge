@@ -1258,8 +1258,19 @@ async fn execute_command(
                     // — without this, the operator flips the switch in the
                     // manager UI and nothing visible happens.
                     let content_analysis_changed = old_flow.content_analysis != new_flow.content_analysis;
+                    // Recording-config changes (enabled flip, segment_seconds,
+                    // retention, max_bytes, pre_buffer_seconds) are baked in
+                    // at `FlowRuntime::start` — `spawn_writer` runs there and
+                    // owns the recording_handle for the flow's lifetime.
+                    // Mid-flight diff doesn't tear that handle down, so
+                    // unchecking `recording.enabled` in the flow form would
+                    // silently leave the writer rolling pre-roll TS to disk.
+                    // Restart the flow on any recording-config change so the
+                    // edit takes effect immediately.
+                    let recording_changed = old_flow.recording != new_flow.recording;
                     let restart_required = old_flow.bandwidth_limit != new_flow.bandwidth_limit
-                        || content_analysis_changed;
+                        || content_analysis_changed
+                        || recording_changed;
                     let persist_only_meta_changed = old_flow.name != new_flow.name
                         || old_flow.media_analysis != new_flow.media_analysis
                         || old_flow.thumbnail != new_flow.thumbnail;
@@ -1273,7 +1284,7 @@ async fn execute_command(
                         // Input, rate-limit, or content-analysis tier
                         // toggles changed — must restart entire flow.
                         tracing::info!(
-                            "Update flow '{flow_id}': restarting (input changed={input_changed}, bandwidth_limit/content_analysis changed={restart_required}, content_analysis_changed={content_analysis_changed})"
+                            "Update flow '{flow_id}': restarting (input changed={input_changed}, bandwidth_limit/content_analysis/recording changed={restart_required}, content_analysis_changed={content_analysis_changed}, recording_changed={recording_changed})"
                         );
                         let _ = flow_manager.destroy_flow(flow_id).await;
                         let resolved = {
