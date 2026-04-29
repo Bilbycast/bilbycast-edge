@@ -93,6 +93,15 @@ impl FlowManager {
         self.flows.len()
     }
 
+    /// Sum the per-flow `cost_units` budget consumption across every
+    /// running flow. Each `FlowRuntime` carries the units it pays at
+    /// start time (computed via `engine::hardware_probe::compute_flow_cost_units`).
+    /// Surfaced on `HealthPayload.resource_budget.units_used` so the
+    /// manager UI can render `units_used / units_total` percentage.
+    pub fn total_cost_units(&self) -> u32 {
+        self.flows.iter().map(|r| r.value().cost_units()).sum()
+    }
+
     /// Check if a flow is currently running
     pub fn is_running(&self, flow_id: &str) -> bool {
         self.flows.contains_key(flow_id)

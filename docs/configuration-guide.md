@@ -191,6 +191,7 @@ If neither file exists at startup, an empty default configuration is used. Both 
 | `outputs` | array | No | `[]` | Top-level output definitions. Each is an `OutputConfig` with `id`, `name`, and protocol-specific fields (enum-tagged by `type`). See [Output Types](#output-types). Outputs exist independently and are referenced by flows via `output_ids`. |
 | `flows` | array | No | `[]` | List of flow configurations. Each flow references one or more inputs (one active at a time) and zero or more outputs by ID. See [Flow Configuration](#flow-configuration). |
 | `tunnels` | array | No | `[]` | List of IP tunnel configurations. See [Tunnel Configuration](#tunnel-configuration). |
+| `nmos_registration` | object | No | `null` | Optional NMOS IS-04 registration-client configuration. When enabled, the edge POSTs its IS-04 resources to an external NMOS registry. See [NMOS Registration Configuration](#nmos-registration-configuration). |
 
 ---
 
@@ -302,6 +303,46 @@ Optional top-level object. When present, bilbycast-edge starts a second HTTP ser
 | `listen_port` | integer | Yes | TCP port for the dashboard. Must differ from `server.listen_port` if the same `listen_addr` is used. |
 
 **Validation:** The monitor address must differ from the API server address (same IP + same port is rejected).
+
+---
+
+## NMOS Registration Configuration
+
+Optional top-level object. When `enabled`, the edge spawns a background task
+that POSTs its IS-04 resources (node + device + sources + flows + senders +
+receivers) to an external NMOS registry and heartbeats the node so
+registry-driven controllers (Celebrum, Riedel MediorNet Control, Lawo VSM,
+EVS Cerebrum, …) discover the edge automatically. Full behavioural reference:
+[`docs/nmos.md`](nmos.md) ("Registration Client").
+
+```json
+{
+  "nmos_registration": {
+    "enabled": true,
+    "registry_url": "https://registry.example.com:8235",
+    "api_version": "v1.3",
+    "heartbeat_interval_secs": 5,
+    "request_timeout_secs": 10,
+    "bearer_token": "optional-static-bearer-token"
+  }
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `enabled` | boolean | No | `false` | Set to `true` to spawn the registration client. |
+| `registry_url` | string | Yes (if enabled) | - | Base URL of the NMOS registry. **Do not** include `/x-nmos/...` — the path is appended internally. `http://` and `https://` are both accepted; max 2048 chars. |
+| `api_version` | string | No | `"v1.3"` | IS-04 registration API version. Only `v1.3` is supported. |
+| `heartbeat_interval_secs` | integer | No | `5` | 1–60 s. AMWA recommends 5 s; the registry treats nodes as expired after roughly 12 s of missed heartbeats. |
+| `request_timeout_secs` | integer | No | `10` | 1–30 s. Request timeout for registration / heartbeat / delete. |
+| `bearer_token` | string | No | `null` | Optional static `Authorization: Bearer …` value attached to every registry request. **Stored in `secrets.json`** (envelope-encrypted) and stripped before sending the config to the manager. Max 4096 chars. |
+
+**Validation rules:** `registry_url` must start with `http://` or `https://`
+and must not contain `/x-nmos`; `api_version` must equal `"v1.3"`;
+`heartbeat_interval_secs` ∈ `[1, 60]`; `request_timeout_secs` ∈ `[1, 30]`.
+
+**Disabled blocks are still validated**, so re-enabling at runtime via the
+manager UI does not surface a deferred error.
 
 ---
 
@@ -2721,3 +2762,83 @@ Per-recording counters surfaced on the WS stats path:
 `packets_dropped`, `index_entries`, `current_pts_90khz`, `armed`,
 `mode` (Phase 2 / 1.5). See
 [`metrics.md`](metrics.md#replay-server-metrics).
+
+## Capacity & resource budget
+
+Every edge probes its hardware once at startup and advertises a
+`resource_budget` block on `HealthPayload` so the manager UI can
+render a per-node Resources card and a per-flow "Resource impact"
+preview. The numbers are a deterministic *planning* score —
+operators read live `system_resources.cpu_percent` for ground truth.
+
+### What gets probed
+
+- **Hardware encoders / decoders** — for each of `h264_nvenc`,
+  `hevc_nvenc`, `h264_qsv`, `hevc_qsv`, `h264_videotoolbox`,
+  `hevc_videotoolbox`, `h264_amf`, `hevc_amf` (and the corresponding
+  hardware decoders), the edge calls FFmpeg's
+  `avcodec_find_encoder_by_name` / `avcodec_find_decoder_by_name`. A
+  non-NULL pointer means the codec was compiled into the vendored
+  FFmpeg build. **It does NOT prove a session opens** — driver /
+  hardware / runtime dependencies are still resolved at
+  `avcodec_open2` time. Treat the result as "advertised, not
+  guaranteed."
+- **CPU info** — brand string + physical / logical core count from
+  the existing `sysinfo` dependency, AVX class via
+  `std::is_x86_feature_detected!` (`avx512f` → `avx2` → `sse4.2` →
+  `none`; aarch64 reports `other`).
+- **Software capacity estimate** — a rough mapping of `(physical
+  cores, AVX class) → 720p30 x264 streams at broadcast crf28`.
+  Conservative: `cores / 2 × avx_mult` where AVX-512 = ×1.3,
+  AVX2 / Other = ×1.0, SSE4.2 = ×0.6, None = ×0.4. HEVC (x265) is
+  half. AAC encode is ~200 streams per core (effectively unbounded).
+  ±50 % accuracy.
+
+### Live NVIDIA utilisation
+
+Builds with the `hardware-monitor-nvml` Cargo feature additionally
+poll NVIDIA NVML every 5 s for live NVENC engine %, NVDEC engine %,
+and active session count on device 0. The dep is target-conditional
+on Linux + Windows; macOS / BSD builds skip it cleanly. NVML init
+failure (no driver / no GPU) is silent — the manager UI just hides
+the live block.
+
+There is no equivalent for QSV / VideoToolbox / AMF in the v1
+surface. Static presence still reports correctly for those backends.
+
+### Per-flow cost units
+
+Each running flow contributes a deterministic unit count to the
+node's budget. Numbers are anchored to the documented content_analysis
+and transcode cost notes in this file and the root `CLAUDE.md`:
+
+| Flow shape                              | Units |
+|---|---|
+| Passthrough flow (base)                 | 1     |
+| Each `video_encode` output (HW backend) | 100   |
+| Each `video_encode` output (SW)         | 500   |
+| Each `audio_encode` output              | 5     |
+| `content_analysis = lite`               | 2     |
+| `content_analysis = audio_full`         | 20    |
+| `content_analysis = video_full`         | 50    |
+| `recording` (replay) enabled            | 5     |
+
+ST 2110-20 / -23 outputs always incur the SW video-encode cost — the
+RFC 4175 packetiser feeds an internal x264 / x265 pass.
+
+### Total budget capacity
+
+`units_total = 1000 + 200 × physical_cores`. A 4-core box gets 1800
+units; a 32-core EPYC gets 7400. The manager UI surfaces a
+percentage utilisation against this total, amber at 80 %, red at
+100 %. **No hard gate** — saving a flow that would push the node
+over budget is a warning, not a refusal. Operators read the live
+CPU% / NVML utilisation when the warning matters.
+
+### Capability gate
+
+The edge advertises `"resources"` in `HealthPayload.capabilities`
+when the budget block is populated. The manager UI keys both the
+per-node Resources card and the flow create/edit modal's
+"Resource impact" tile off this string — older edges or builds
+without the probe see no UI at all.

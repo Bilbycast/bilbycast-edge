@@ -228,7 +228,7 @@ impl TsMuxer {
 
         // Split PES into TS packets. Always write PCR (not just on
         // keyframes) for TR-101290 P2 compliance.
-        let ts_pkts = self.packetize(VIDEO_PID, &pes, true, true, Some(dts_90khz));
+        let ts_pkts = self.packetize(VIDEO_PID, &pes, true, true, Some(dts_90khz), is_keyframe);
         packets.extend(ts_pkts);
 
         packets
@@ -246,7 +246,7 @@ impl TsMuxer {
         // Wrap in ADTS header
         let adts_frame = build_adts_frame(raw_aac, sample_rate_idx, channels);
         let pes = build_pes_packet(0xC0, &adts_frame, pts_90khz, None);
-        packets.extend(self.packetize(AUDIO_PID, &pes, true, false, None));
+        packets.extend(self.packetize(AUDIO_PID, &pes, true, false, None, false));
 
         packets
     }
@@ -271,7 +271,7 @@ impl TsMuxer {
         let pts_90khz = self.clamp_audio_pts(pts_90khz);
         let mut packets = self.maybe_emit_pat_pmt(false);
         let pes = build_pes_packet(0xC0, adts_frame, pts_90khz, None);
-        packets.extend(self.packetize(AUDIO_PID, &pes, true, false, None));
+        packets.extend(self.packetize(AUDIO_PID, &pes, true, false, None, false));
         packets
     }
 
@@ -317,12 +317,18 @@ impl TsMuxer {
 
         // stream_id 0xBD (private_stream_1) is required for stream_type 0x06.
         let pes = build_pes_packet(0xBD, &au, pts_90khz, None);
-        packets.extend(self.packetize(AUDIO_PID, &pes, true, false, None));
+        packets.extend(self.packetize(AUDIO_PID, &pes, true, false, None, false));
         packets
     }
 
     /// Split a PES payload into 188-byte TS packets.
-    fn packetize(&mut self, pid: u16, pes_data: &[u8], payload_start: bool, write_pcr: bool, pcr_90khz: Option<u64>) -> Vec<Bytes> {
+    ///
+    /// When `is_random_access_point` is true, the first emitted TS packet
+    /// gets `random_access_indicator` set in its adaptation-field flags
+    /// (bit 0x40) so downstream consumers — notably the replay writer's
+    /// IDR index — can find seek points without parsing the elementary
+    /// stream. Set this on video keyframes; audio/data must pass `false`.
+    fn packetize(&mut self, pid: u16, pes_data: &[u8], payload_start: bool, write_pcr: bool, pcr_90khz: Option<u64>, is_random_access_point: bool) -> Vec<Bytes> {
         let mut packets = Vec::new();
         let mut offset = 0;
         let mut is_first = true;
@@ -356,7 +362,11 @@ impl TsMuxer {
                 let af_start = pos;
                 pkt[pos] = 0; // adaptation_field_length (fill later)
                 pos += 1;
-                pkt[pos] = 0x10; // flags: PCR present
+                let mut af_flags = 0x10u8; // PCR present
+                if is_first && is_random_access_point {
+                    af_flags |= 0x40; // random_access_indicator
+                }
+                pkt[pos] = af_flags;
                 pos += 1;
                 // PCR (6 bytes)
                 let pcr = pcr_90khz.unwrap();
@@ -561,7 +571,7 @@ impl TsMuxer {
         let mut packets = self.maybe_emit_pat_pmt(false);
         let pes = build_pes_packet(0xBD, pes_payload, pts_90khz, None);
         // Audio-only TS: PCR rides the audio PID.
-        packets.extend(self.packetize(AUDIO_PID, &pes, true, !self.has_video, Some(pts_90khz)));
+        packets.extend(self.packetize(AUDIO_PID, &pes, true, !self.has_video, Some(pts_90khz), false));
         packets
     }
 }

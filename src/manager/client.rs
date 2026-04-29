@@ -206,13 +206,15 @@ pub fn start_manager_client(
     webrtc_sessions: WebrtcRegistry,
     event_rx: mpsc::Receiver<Event>,
     resource_state: Arc<SystemResourceState>,
+    static_caps: Arc<crate::engine::hardware_probe::StaticCapabilities>,
+    live_gpu: Arc<crate::engine::hardware_probe::LiveUtilizationState>,
     standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         manager_client_loop(
             config, flow_manager, tunnel_manager, ws_stats_rx, app_config, config_path,
             secrets_path, api_addr, monitor_addr, webrtc_sessions, event_rx, resource_state,
-            standby_listeners,
+            static_caps, live_gpu, standby_listeners,
         ).await;
     })
 }
@@ -230,6 +232,8 @@ async fn manager_client_loop(
     webrtc_sessions: WebrtcRegistry,
     mut event_rx: mpsc::Receiver<Event>,
     resource_state: Arc<SystemResourceState>,
+    static_caps: Arc<crate::engine::hardware_probe::StaticCapabilities>,
+    live_gpu: Arc<crate::engine::hardware_probe::LiveUtilizationState>,
     standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
 ) {
     // If we already have a node_id from config, set it on the tunnel manager
@@ -272,6 +276,8 @@ async fn manager_client_loop(
             &webrtc_sessions,
             &mut event_rx,
             &resource_state,
+            &static_caps,
+            &live_gpu,
             &standby_listeners,
         )
         .await
@@ -335,6 +341,8 @@ async fn try_connect(
     webrtc_sessions: &WebrtcRegistry,
     event_rx: &mut mpsc::Receiver<Event>,
     resource_state: &Arc<SystemResourceState>,
+    static_caps: &Arc<crate::engine::hardware_probe::StaticCapabilities>,
+    live_gpu: &Arc<crate::engine::hardware_probe::LiveUtilizationState>,
     standby_listeners: &Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
 ) -> Result<ConnectResult, String> {
     // Enforce TLS — only wss:// connections are allowed
@@ -500,7 +508,14 @@ async fn try_connect(
     let mut stats_rx = ws_stats_tx.subscribe();
 
     // Send initial health
-    let health = build_health_message(flow_manager, api_addr, monitor_addr, resource_state);
+    let health = build_health_message(
+        flow_manager,
+        api_addr,
+        monitor_addr,
+        resource_state,
+        static_caps,
+        live_gpu,
+    );
     if let Ok(json) = serde_json::to_string(&health) {
         let _ = ws_write.send(Message::Text(json.into())).await;
     }
@@ -668,7 +683,14 @@ async fn try_connect(
                 let pong = serde_json::json!({
                     "type": "health",
                     "timestamp": chrono::Utc::now().to_rfc3339(),
-                    "payload": build_health_payload(flow_manager, api_addr, monitor_addr, resource_state)
+                    "payload": build_health_payload(
+                        flow_manager,
+                        api_addr,
+                        monitor_addr,
+                        resource_state,
+                        static_caps,
+                        live_gpu,
+                    )
                 });
                 if let Ok(json) = serde_json::to_string(&pong) {
                     if ws_write.send(Message::Text(json.into())).await.is_err() {
@@ -749,15 +771,29 @@ fn build_auth_message(config: &ManagerConfig) -> serde_json::Value {
     }
 }
 
-fn build_health_message(flow_manager: &FlowManager, api_addr: &str, monitor_addr: Option<&str>, resource_state: &SystemResourceState) -> serde_json::Value {
+fn build_health_message(
+    flow_manager: &FlowManager,
+    api_addr: &str,
+    monitor_addr: Option<&str>,
+    resource_state: &SystemResourceState,
+    static_caps: &crate::engine::hardware_probe::StaticCapabilities,
+    live_gpu: &crate::engine::hardware_probe::LiveUtilizationState,
+) -> serde_json::Value {
     serde_json::json!({
         "type": "health",
         "timestamp": chrono::Utc::now().to_rfc3339(),
-        "payload": build_health_payload(flow_manager, api_addr, monitor_addr, resource_state)
+        "payload": build_health_payload(flow_manager, api_addr, monitor_addr, resource_state, static_caps, live_gpu)
     })
 }
 
-fn build_health_payload(flow_manager: &FlowManager, api_addr: &str, monitor_addr: Option<&str>, resource_state: &SystemResourceState) -> serde_json::Value {
+fn build_health_payload(
+    flow_manager: &FlowManager,
+    api_addr: &str,
+    monitor_addr: Option<&str>,
+    resource_state: &SystemResourceState,
+    static_caps: &crate::engine::hardware_probe::StaticCapabilities,
+    live_gpu: &crate::engine::hardware_probe::LiveUtilizationState,
+) -> serde_json::Value {
     serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
@@ -773,7 +809,11 @@ fn build_health_payload(flow_manager: &FlowManager, api_addr: &str, monitor_addr
         // the manager — the field is `Option` with `serde(default)` on
         // the manager side.
         "capabilities": edge_capabilities(),
-        "system_resources": build_system_resources_payload(resource_state)
+        "system_resources": build_system_resources_payload(resource_state),
+        // Static + live HW / SW resource budget. Manager UI keys off the
+        // `"resources"` capability string to render the Resources card
+        // and the per-flow Resource-impact widget.
+        "resource_budget": build_resource_budget_payload(flow_manager, static_caps, live_gpu),
     })
 }
 
@@ -783,6 +823,25 @@ fn build_system_resources_payload(state: &SystemResourceState) -> serde_json::Va
         "ram_percent": state.ram_percent_f64(),
         "ram_used_mb": state.ram_used_mb.load(std::sync::atomic::Ordering::Relaxed),
         "ram_total_mb": state.ram_total_mb.load(std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+fn build_resource_budget_payload(
+    flow_manager: &FlowManager,
+    static_caps: &crate::engine::hardware_probe::StaticCapabilities,
+    live_gpu: &crate::engine::hardware_probe::LiveUtilizationState,
+) -> serde_json::Value {
+    let units_total = crate::engine::hardware_probe::compute_units_total(&static_caps.cpu);
+    let units_used = flow_manager.total_cost_units();
+    let live = live_gpu.snapshot();
+    serde_json::json!({
+        "hw_encoders": static_caps.hw_encoders,
+        "hw_decoders": static_caps.hw_decoders,
+        "cpu": static_caps.cpu,
+        "sw_capacity": static_caps.sw_capacity,
+        "units_total": units_total,
+        "units_used": units_used,
+        "live": live,
     })
 }
 
@@ -815,6 +874,10 @@ fn edge_capabilities() -> Vec<&'static str> {
         // This edge supports flows with no input — standalone output
         // definitions whose input is connected at runtime by the manager.
         "optional-input",
+        // Resource budget: HW encoder/decoder probe + SW capacity
+        // estimate + live unit-utilization. Manager UI keys the
+        // Resources card + per-flow Resource-impact widget off this.
+        "resources",
     ];
     if cfg!(feature = "ptp-internal") {
         caps.push("ptp-internal");
@@ -830,6 +893,11 @@ fn edge_capabilities() -> Vec<&'static str> {
         // speed slider / step buttons / pre-buffer field / sync-group tab,
         // so a Phase 1 edge keeps the Phase 1 surface unchanged.
         caps.push("replay-v2");
+        // Stage 2 of the replay UX plan — filmstrip thumbnails on disk
+        // for the manager `/replay` scrubber strip. UI checks for this
+        // before showing the filmstrip-cadence field on the flow form
+        // and before fetching `…/replay/filmstrip` on the timeline.
+        caps.push("replay-filmstrip");
     }
     if cfg!(any(
         feature = "video-encoder-x264",
@@ -2522,6 +2590,98 @@ async fn execute_command(
                 .map_err(|e| CommandError::with_code(e.to_string(), "replay_clip_not_found"))?;
             let clips = store.list().await;
             Ok(Some(serde_json::json!({ "clips": clips })))
+        }
+        #[cfg(feature = "replay")]
+        "list_filmstrip" => {
+            // Returns a windowed batch of filmstrip frame metadata for
+            // the manager UI's scrubber strip. Inline base64 JPEG is
+            // intentionally NOT returned here — even at 200 frames ×
+            // 5 KB the response would be ~1 MB, more than the manager
+            // wants to forward in a single WS round-trip. The UI fetches
+            // each JPEG via the companion `get_filmstrip_frame` command
+            // (proxied through the manager REST layer with strong cache
+            // headers, since `<pts>.jpg` is content-addressed and never
+            // changes once written).
+            //
+            // Resolution: same flow_id-or-recording_id fallback as
+            // `list_clips`, plus optional `from_pts_90khz` /
+            // `to_pts_90khz` window and a `max_count` evenly-spaced
+            // downsample (default 60, max 200) so a 1-hour recording
+            // doesn't return 720 entries on every scrub render.
+            let recording_id = if let Some(rid) = action["recording_id"].as_str() {
+                rid.to_string()
+            } else if let Some(flow_id) = action["flow_id"].as_str() {
+                let runtime = flow_manager.get_runtime(flow_id)
+                    .ok_or_else(|| CommandError::new(format!("Unknown flow '{flow_id}'")))?;
+                runtime.recording_handle.as_ref()
+                    .map(|h| h.recording_id.clone())
+                    .ok_or_else(|| CommandError::with_code(
+                        format!("Flow '{flow_id}' has no recording configured"),
+                        "replay_recording_not_active",
+                    ))?
+            } else {
+                return Err(CommandError::new("list_filmstrip: provide flow_id or recording_id".to_string()));
+            };
+            let from_pts = action["from_pts_90khz"].as_u64();
+            let to_pts = action["to_pts_90khz"].as_u64();
+            let max_count = action["max_count"].as_u64().unwrap_or(60).clamp(1, 200) as usize;
+            let dir = crate::replay::recording_dir(&recording_id);
+            let frames = crate::replay::filmstrip::list_frames(&dir, from_pts, to_pts).await
+                .map_err(|e| CommandError::new(format!("list_filmstrip failed: {e}")))?;
+            // Evenly-spaced downsample. We always include the first and
+            // last entries when `frames.len() > max_count` so the scrub
+            // strip's edges line up with the requested window.
+            let downsampled: Vec<&(u64, u64)> = if frames.len() <= max_count {
+                frames.iter().collect()
+            } else {
+                let n = frames.len();
+                (0..max_count)
+                    .map(|i| &frames[i * (n - 1) / (max_count - 1)])
+                    .collect()
+            };
+            let frames_json: Vec<serde_json::Value> = downsampled
+                .iter()
+                .map(|(pts, size)| serde_json::json!({
+                    "pts_90khz": pts,
+                    "size_bytes": size,
+                }))
+                .collect();
+            Ok(Some(serde_json::json!({
+                "recording_id": recording_id,
+                "frames": frames_json,
+                "total_count": frames.len(),
+            })))
+        }
+        #[cfg(feature = "replay")]
+        "get_filmstrip_frame" => {
+            // Returns one filmstrip JPEG by exact PTS as base64 — the
+            // companion to `list_filmstrip`. PTS values are content-
+            // addressed (never re-written once flushed), so the manager
+            // forwards with `Cache-Control: public, max-age=86400` and
+            // strong ETag.
+            let recording_id = action["recording_id"].as_str()
+                .ok_or("get_filmstrip_frame: missing 'recording_id'")?
+                .to_string();
+            let pts_90khz = action["pts_90khz"].as_u64()
+                .ok_or("get_filmstrip_frame: missing or invalid 'pts_90khz'")?;
+            let dir = crate::replay::recording_dir(&recording_id);
+            let bytes = crate::replay::filmstrip::read_frame(&dir, pts_90khz).await
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::NotFound => CommandError::with_code(
+                        format!("filmstrip frame {pts_90khz} not found"),
+                        "replay_filmstrip_frame_not_found",
+                    ),
+                    _ => CommandError::new(format!("get_filmstrip_frame failed: {e}")),
+                })?;
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            Ok(Some(serde_json::json!({
+                "recording_id": recording_id,
+                "pts_90khz": pts_90khz,
+                "data": b64,
+                "width": 160,
+                "height": 90,
+            })))
         }
         #[cfg(feature = "replay")]
         "get_clip" => {

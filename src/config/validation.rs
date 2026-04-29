@@ -119,6 +119,11 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
         }
     }
 
+    // Validate NMOS registration-client config if present
+    if let Some(ref nr) = config.nmos_registration {
+        validate_nmos_registration(nr)?;
+    }
+
     // Validate manager config if present
     if let Some(ref mgr) = config.manager {
         if mgr.enabled {
@@ -885,6 +890,13 @@ fn validate_recording_config(
                 "Flow '{flow_id}': recording.pre_buffer_seconds ({pb}) cannot exceed \
                  recording.retention_seconds ({})",
                 c.retention_seconds
+            );
+        }
+    }
+    if let Some(fs) = c.filmstrip_seconds {
+        if !(1..=30).contains(&fs) {
+            bail!(
+                "Flow '{flow_id}': recording.filmstrip_seconds must be in 1..=30 (got {fs})"
             );
         }
     }
@@ -4023,6 +4035,65 @@ fn validate_fec(fec: &FecConfig) -> Result<()> {
     }
     if fec.rows < 4 || fec.rows > 20 {
         bail!("FEC rows must be 4-20, got {}", fec.rows);
+    }
+    Ok(())
+}
+
+/// Validates an [`NmosRegistrationConfig`] block.
+///
+/// Length-bounded URL + token, parseable scheme, supported API version, and
+/// sensible heartbeat / timeout ranges. Disabled blocks are still validated so
+/// re-enabling at runtime does not surface a fresh error.
+pub fn validate_nmos_registration(c: &crate::config::models::NmosRegistrationConfig) -> Result<()> {
+    if c.registry_url.is_empty() {
+        bail!("nmos_registration.registry_url cannot be empty");
+    }
+    if c.registry_url.len() > 2048 {
+        bail!("nmos_registration.registry_url must be at most 2048 characters");
+    }
+    if !(c.registry_url.starts_with("http://") || c.registry_url.starts_with("https://")) {
+        bail!(
+            "nmos_registration.registry_url must start with http:// or https:// (got {:?})",
+            c.registry_url
+        );
+    }
+    // Reject trailing slashes / explicit path components — the client owns the
+    // `/x-nmos/registration/<api_version>/...` suffix.
+    if c.registry_url.trim_end_matches('/').contains("/x-nmos") {
+        bail!(
+            "nmos_registration.registry_url should be the registry's base URL (scheme://host[:port]); \
+             do not include /x-nmos/... — got {:?}",
+            c.registry_url
+        );
+    }
+    match c.api_version.as_str() {
+        "v1.3" => {}
+        other => bail!(
+            "nmos_registration.api_version: only 'v1.3' is supported in this release (got {:?})",
+            other
+        ),
+    }
+    if !(1..=60).contains(&c.heartbeat_interval_secs) {
+        bail!(
+            "nmos_registration.heartbeat_interval_secs must be between 1 and 60 (got {})",
+            c.heartbeat_interval_secs
+        );
+    }
+    if !(1..=30).contains(&c.request_timeout_secs) {
+        bail!(
+            "nmos_registration.request_timeout_secs must be between 1 and 30 (got {})",
+            c.request_timeout_secs
+        );
+    }
+    if let Some(ref t) = c.bearer_token {
+        if t.len() > 4096 {
+            bail!("nmos_registration.bearer_token must be at most 4096 characters");
+        }
+        if t.is_empty() {
+            bail!(
+                "nmos_registration.bearer_token must be omitted (or null) when not in use, not empty"
+            );
+        }
     }
     Ok(())
 }

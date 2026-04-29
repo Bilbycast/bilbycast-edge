@@ -6,6 +6,7 @@ uncompressed-video subsets of the AMWA NMOS specifications:
 | Spec | Endpoint | Status |
 |------|----------|--------|
 | IS-04 v1.3 | `/x-nmos/node/v1.3/` | self, devices, sources, flows, senders, receivers |
+| IS-04 v1.3 registration client | (outbound to a registry's `/x-nmos/registration/v1.3/`) | optional, opt-in via `nmos_registration` config block — see below |
 | IS-05 v1.1 | `/x-nmos/connection/v1.1/` | single sender/receiver staged + active + transporttype + constraints |
 | IS-08 v1.0 | `/x-nmos/channelmapping/v1.0/` | io, map/active, map/staged, map/activate (active map persists to disk) |
 | BCP-004 | embedded in IS-04 receiver caps | constraint_sets for ST 2110 audio, data, and video inputs |
@@ -68,6 +69,94 @@ On startup the edge calls
 selected interface, or `mdns-sd` daemon errors) are logged once and
 swallowed; flow startup is never blocked. The handle is dropped on
 process exit, which unregisters the service cleanly.
+
+## Registration client (push to an NMOS registry)
+
+mDNS-SD covers LAN-only deployments; registry-driven controllers
+(Celebrum, Riedel MediorNet Control, Lawo VSM, EVS Cerebrum, …) usually
+discover nodes through an NMOS **registry** instead. When
+`nmos_registration.enabled: true`, the edge spawns a background task
+that POSTs its IS-04 resources (node + device + sources + flows +
+senders + receivers) to a configured registry and heartbeats the node
+so the registry's query API surfaces the edge to controllers.
+
+Configuration (in `config.json`):
+
+```json
+{
+  "nmos_registration": {
+    "enabled": true,
+    "registry_url": "https://registry.example.com:8235",
+    "api_version": "v1.3",
+    "heartbeat_interval_secs": 5,
+    "request_timeout_secs": 10,
+    "bearer_token": "optional-static-bearer-token"
+  }
+}
+```
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `enabled` | `false` | Set to `true` to spawn the task. |
+| `registry_url` | — | Base URL of the registry. **Do not** include `/x-nmos/...` — the path is appended internally. `http://` and `https://` are both accepted; `https://` is recommended for any non-loopback registry. |
+| `api_version` | `"v1.3"` | Only `v1.3` is supported in this release. Older registries that speak only v1.2 / v1.1 are out of scope. |
+| `heartbeat_interval_secs` | `5` | 1–60 s. AMWA recommends 5 s; the registry treats nodes as expired after roughly 12 s of missed heartbeats. |
+| `request_timeout_secs` | `10` | 1–30 s. |
+| `bearer_token` | `null` | Optional static `Authorization: Bearer …` header attached to every registry request. Persisted in `secrets.json` (envelope-encrypted) and stripped before sending the config to the manager. IS-10 OAuth2 client-credentials against the registry is **not** included in this release — operators that need it can bridge via a static token from a long-lived OAuth2 client. |
+
+### Behaviour
+
+- **Resource UUIDs are deterministic** — UUID v5 values rooted at the
+  persisted `node_id`. Re-POSTing the same set updates the registry
+  record in place; restarts do not orphan resources.
+- **Change detection** — the task hashes the (versionless) resource set
+  on every heartbeat tick. When the hash differs from the
+  last-registered hash, every resource is re-POSTed with a fresh
+  `version` stamp; otherwise only the heartbeat is sent. A typical
+  busy edge re-POSTs only when an operator adds / removes / edits a
+  flow.
+- **Heartbeat** — POSTs to
+  `<registry>/x-nmos/registration/v1.3/health/nodes/{node_id}` every
+  `heartbeat_interval_secs`. A non-2xx response (typically `404`
+  because the registry expired the node) drops the client back to the
+  registration phase, which re-POSTs the whole set.
+- **Backoff** — on network or 5xx errors the task retries with
+  exponential backoff capped at 30 s. The IS-04 GET endpoints on this
+  node continue to serve normally regardless.
+- **Shutdown** — on `CTRL+C` / SIGTERM the task issues a single
+  `DELETE /resource/nodes/{id}` (1 s timeout) so the registry stops
+  listing the node immediately. Best-effort: a registry that is also
+  going down is silently tolerated.
+
+### Events
+
+The task surfaces lifecycle on the manager's event feed under category
+`nmos_registry` (see [`docs/events-and-alarms.md`](events-and-alarms.md)):
+
+| Severity | error_code | Meaning |
+|----------|-----------|---------|
+| Info | `nmos_registered` | First successful POST of the node resource. |
+| Warning | `nmos_heartbeat_lost` | Heartbeat returned non-2xx; client falls back to re-registering. |
+| Critical | `nmos_registration_failed` | A registration POST returned 4xx/5xx. Client retries with backoff. |
+| Warning | `nmos_registry_unreachable` | Network / DNS / TLS error reaching the registry. Client retries with backoff. |
+
+### Compatibility with mDNS-SD
+
+The registration client is purely additive — it does not turn off the
+existing `_nmos-node._tcp` mDNS-SD advertisement. Operators on a
+mixed network (some controllers using mDNS, some using a registry)
+get both at no extra cost.
+
+### What's not included
+
+- mDNS-SD browsing of `_nmos-register._tcp` for **registry
+  autodiscovery** (operators supply the URL manually for now).
+- **Registry failover / multi-registry priority** — only a single
+  registry URL is supported. Most production deployments front an HA
+  registry behind a load balancer or VRRP and point the edge at the
+  load-balancer URL.
+- **IS-10 OAuth2 client-credentials grant** against the registry — the
+  static bearer token covers most lab and private deployments.
 
 ## Authentication
 

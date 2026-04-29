@@ -211,6 +211,23 @@ async fn main() -> anyhow::Result<()> {
 
     // System resource monitoring (CPU, RAM)
     let resource_state = Arc::new(engine::resource_monitor::SystemResourceState::new());
+    // Static hardware capabilities — probed once at startup.
+    let static_capabilities =
+        Arc::new(engine::hardware_probe::probe_static_capabilities());
+    tracing::info!(
+        "hardware probe: cpu={} ({}/{} cores, avx={:?}); hw_encoders any={}; sw x264/x265={}/{}",
+        static_capabilities.cpu.brand,
+        static_capabilities.cpu.physical_cores,
+        static_capabilities.cpu.logical_cores,
+        static_capabilities.cpu.avx_class,
+        static_capabilities.hw_encoders.any(),
+        static_capabilities.sw_capacity.x264_720p30_streams,
+        static_capabilities.sw_capacity.x265_720p30_streams,
+    );
+    // Live NVIDIA NVENC / NVDEC utilisation. Atomics stay zeroed and
+    // `available` stays false on non-NVIDIA hosts and on builds without
+    // the `hardware-monitor-nvml` feature.
+    let live_gpu_state = Arc::new(engine::hardware_probe::LiveUtilizationState::new());
     let resource_action = app_config.resource_limits.as_ref().map(|rl| rl.critical_action.clone());
     let flow_manager = Arc::new(FlowManager::new(
         global_stats.clone(),
@@ -371,10 +388,11 @@ async fn main() -> anyhow::Result<()> {
     // Shared shutdown token for coordinated graceful shutdown
     let shutdown_token = CancellationToken::new();
 
-    // Spawn system resource monitor (CPU, RAM)
+    // Spawn system resource monitor (CPU, RAM, optional NVIDIA GPU util)
     let _resource_monitor_handle = engine::resource_monitor::spawn_resource_monitor(
         app_config.resource_limits.clone(),
         resource_state.clone(),
+        Some(live_gpu_state.clone()),
         event_sender.clone(),
         shutdown_token.clone(),
     );
@@ -433,9 +451,41 @@ async fn main() -> anyhow::Result<()> {
                 (),
                 event_rx,
                 resource_state.clone(),
+                static_capabilities.clone(),
+                live_gpu_state.clone(),
                 Some(standby_listeners.clone()),
             );
         }
+    }
+
+    // Optionally start the AMWA IS-04 registration client. When enabled, it
+    // POSTs the node + IS-04 resources to the configured registry and
+    // heartbeats the node so registry-driven NMOS controllers (Celebrum,
+    // Riedel, Lawo, EVS, etc.) discover the edge automatically.
+    if let Some(reg_cfg) = app_config
+        .nmos_registration
+        .as_ref()
+        .filter(|c| c.enabled)
+        .cloned()
+    {
+        let cfg_handle = state.config.clone();
+        let events = event_sender.clone();
+        let cancel = shutdown_token.clone();
+        let listen_host = resolve_local_ip();
+        let listen_port = app_config.server.listen_port;
+        let https = app_config.server.tls.is_some();
+        tokio::spawn(async move {
+            api::nmos_registration::run(
+                cfg_handle,
+                reg_cfg,
+                listen_host,
+                listen_port,
+                https,
+                events,
+                cancel,
+            )
+            .await;
+        });
     }
 
     // Spawn shutdown signal handler

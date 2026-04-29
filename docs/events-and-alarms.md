@@ -365,6 +365,21 @@ apply — the media player is file-backed and binds no sockets.
 
 ---
 
+### NMOS Registry Client (`nmos_registry`)
+
+Surfaced by the IS-04 registration client (`src/api/nmos_registration.rs`) when
+the edge is configured to push to an external NMOS registry — see
+[`docs/nmos.md`](nmos.md) ("Registration Client"). All four events carry
+`details.error_code` so the manager UI can colour-code the rows and operators
+can grep on a stable string.
+
+| Severity | Message | Trigger | `details.error_code` |
+|----------|---------|---------|----------------------|
+| info | `Registered with NMOS registry <url>` | First successful POST of the node resource on (re-)registration. | `nmos_registered` |
+| warning | `NMOS heartbeat to <url> returned HTTP <status> — re-registering` | Heartbeat returned non-2xx (typically `404` because the registry expired the node). The client falls back to the registration phase on the next tick. | `nmos_heartbeat_lost` |
+| critical | `NMOS registration of <type> at <url> failed: HTTP <status> <error>` | A registration POST returned 4xx/5xx. The client retries with exponential backoff. | `nmos_registration_failed` |
+| warning | `NMOS registry <url> unreachable: <error>` | Network / DNS / TLS error reaching the registry. The client retries with exponential backoff. | `nmos_registry_unreachable` |
+
 ### Configuration (`config`)
 
 | Severity | Message | Trigger |
@@ -436,6 +451,7 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `ptp` | — | SMPTE ST 2110 PTP slave clock state changes (Phase 1) |
 | `network_leg` | — | SMPTE 2022-7 Red/Blue per-leg loss / recovery (Phase 1) |
 | `nmos` | — | NMOS IS-04 / IS-05 / IS-08 controller activity (Phase 1) |
+| `nmos_registry` | 4 | IS-04 registration client lifecycle (registered, heartbeat lost, registration failed, registry unreachable) |
 | `scte104` | — | SCTE-104 splice events parsed from ST 2110-40 ANC (Phase 1) |
 | **Total** | **87** | |
 

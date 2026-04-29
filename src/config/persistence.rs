@@ -237,6 +237,7 @@ mod tests {
             monitor: None,
             manager: None,
             resource_limits: None,
+            nmos_registration: None,
             inputs: vec![InputDefinition {
                 active: true,
                 group: None,

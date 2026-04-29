@@ -435,11 +435,11 @@ async fn generate_thumbnail_inprocess(ts_data: &[u8]) -> Result<InternalThumbnai
 
 /// Video data extracted from an MPEG-TS buffer.
 #[cfg(feature = "video-thumbnail")]
-struct ExtractedVideo {
+pub(crate) struct ExtractedVideo {
     /// Annex B encoded NAL units (with 0x00000001 start codes).
-    annex_b_data: Vec<u8>,
+    pub(crate) annex_b_data: Vec<u8>,
     /// Detected video codec.
-    codec: video_codec::VideoCodec,
+    pub(crate) codec: video_codec::VideoCodec,
 }
 
 /// Extract video elementary stream data from raw MPEG-TS bytes.
@@ -449,9 +449,11 @@ struct ExtractedVideo {
 /// elementary stream data (Annex B NAL units with start codes).
 ///
 /// This is a lightweight, self-contained extraction that reuses the
-/// `ts_parse` helpers without depending on `TsDemuxer`.
+/// `ts_parse` helpers without depending on `TsDemuxer`. Made
+/// `pub(crate)` so the replay-server filmstrip writer can reuse the
+/// same proven extraction path without a parallel implementation.
 #[cfg(feature = "video-thumbnail")]
-fn extract_video_from_ts(ts_data: &[u8]) -> Option<ExtractedVideo> {
+pub(crate) fn extract_video_from_ts(ts_data: &[u8]) -> Option<ExtractedVideo> {
     use super::ts_parse::{ts_pid, ts_pusi, ts_has_payload,
                           ts_payload_offset, parse_pat_programs, PAT_PID};
     use video_codec::VideoCodec;

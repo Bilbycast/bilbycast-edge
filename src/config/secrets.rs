@@ -56,6 +56,12 @@ pub struct SecretsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_token: Option<String>,
 
+    /// Bearer token sent on every NMOS-registration request. Operators who
+    /// front their NMOS registry with auth set this so the manager never
+    /// receives the token — it travels through `secrets.json` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nmos_registration_bearer_token: Option<String>,
+
     // -- Per-tunnel secrets, keyed by tunnel ID --
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tunnels: HashMap<String, TunnelSecrets>,
@@ -161,6 +167,7 @@ impl SecretsConfig {
             && self.server_tls.is_none()
             && self.server_auth.is_none()
             && self.setup_token.is_none()
+            && self.nmos_registration_bearer_token.is_none()
             && self.tunnels.is_empty()
             && self.flows.is_empty()
     }
@@ -190,6 +197,11 @@ impl SecretsConfig {
 
         // Setup wizard token
         secrets.setup_token = config.setup_token.clone();
+
+        // NMOS registration bearer token
+        if let Some(ref nr) = config.nmos_registration {
+            secrets.nmos_registration_bearer_token = nr.bearer_token.clone();
+        }
 
         // Tunnel secrets
         for tunnel in &config.tunnels {
@@ -240,6 +252,15 @@ impl SecretsConfig {
         // Setup wizard token
         if self.setup_token.is_some() && config.setup_token.is_none() {
             config.setup_token = self.setup_token.clone();
+        }
+
+        // NMOS registration bearer token: merged when the registration block
+        // exists in config and currently lacks a token.
+        if let Some(ref tok) = self.nmos_registration_bearer_token
+            && let Some(ref mut nr) = config.nmos_registration
+            && nr.bearer_token.is_none()
+        {
+            nr.bearer_token = Some(tok.clone());
         }
 
         // Tunnel secrets
@@ -423,6 +444,11 @@ impl AppConfig {
         // Setup wizard token — manager has no business seeing this
         self.setup_token = None;
 
+        // NMOS registration bearer token — local secret only
+        if let Some(ref mut nr) = self.nmos_registration {
+            nr.bearer_token = None;
+        }
+
         // Tunnel secrets
         for tunnel in &mut self.tunnels {
             tunnel.tunnel_encryption_key = None;
@@ -457,6 +483,11 @@ impl AppConfig {
 
         // Setup wizard token — internal
         self.setup_token = None;
+
+        // NMOS registration bearer token — internal
+        if let Some(ref mut nr) = self.nmos_registration {
+            nr.bearer_token = None;
+        }
 
         // Tunnel secrets — internal
         for tunnel in &mut self.tunnels {
@@ -493,6 +524,13 @@ pub fn has_secrets(config: &AppConfig) -> bool {
     // Setup wizard token
     if config.setup_token.is_some() {
         return true;
+    }
+
+    // NMOS registration bearer token
+    if let Some(ref nr) = config.nmos_registration {
+        if nr.bearer_token.is_some() {
+            return true;
+        }
     }
 
     // Tunnel secrets
@@ -624,6 +662,7 @@ mod tests {
             }],
             resource_limits: None,
             flow_groups: vec![],
+            nmos_registration: None,
         };
 
         // Extract secrets — only infrastructure secrets, not flow params

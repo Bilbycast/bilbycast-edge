@@ -24,7 +24,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -73,15 +73,21 @@ const EVENT_RATELIMIT: Duration = Duration::from_secs(30);
 /// SCTE-35 / MDI-threshold events back to the owning flow. `cancel`
 /// lives below the flow's runtime token — a flow stop or a tier toggle
 /// off aborts the task within one broadcast packet.
+///
+/// `frame_rate_rx` is the flow's frame-rate watch channel (published by
+/// the `MediaAnalyzer`). Forwarded into the SMPTE timecode tracker so
+/// it can strictly bound the `pic_timing` SEI `n_frames` field
+/// (`FF < fps`). `None` keeps the validator on its loose fallback.
 pub fn spawn_content_analysis_lite(
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     stats: Arc<ContentAnalysisAccumulator>,
     event_sender: EventSender,
     flow_id: String,
     cancel: CancellationToken,
+    frame_rate_rx: Option<watch::Receiver<Option<f64>>>,
 ) -> JoinHandle<()> {
     let rx = broadcast_tx.subscribe();
-    tokio::spawn(lite_loop(rx, stats, event_sender, flow_id, cancel))
+    tokio::spawn(lite_loop(rx, stats, event_sender, flow_id, cancel, frame_rate_rx))
 }
 
 // ── Task Loop ──────────────────────────────────────────────────────────────
@@ -92,6 +98,7 @@ async fn lite_loop(
     events: EventSender,
     flow_id: String,
     cancel: CancellationToken,
+    frame_rate_rx: Option<watch::Receiver<Option<f64>>>,
 ) {
     tracing::info!(flow_id = %flow_id, "content-analysis Lite analyser started");
 
@@ -108,6 +115,12 @@ async fn lite_loop(
             }
 
             _ = publish_interval.tick() => {
+                // Refresh the SMPTE timecode validator's fps from the
+                // MediaAnalyzer watch channel. 250 ms cadence is plenty
+                // fresh — fps changes once per encoder restart at most.
+                if let Some(rx) = &frame_rate_rx {
+                    state.timecode.set_frame_rate(*rx.borrow());
+                }
                 state.tick(start.elapsed(), &flow_id, &events);
                 let snap = state.snapshot();
                 stats.publish_lite(snap);

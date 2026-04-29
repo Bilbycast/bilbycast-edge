@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 pub mod clips;
+pub mod filmstrip;
 pub mod index;
 pub mod paced_replayer;
 pub mod reader;

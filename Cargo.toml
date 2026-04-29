@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-edge"
-version = "0.34.0"
+version = "0.35.0"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 license = "AGPL-3.0-or-later"
@@ -223,6 +223,11 @@ video-encoders-full = [
 tls = ["dep:tokio-rustls", "dep:axum-server"]
 # Enable WebRTC WHIP/WHEP input and output via str0m (pure Rust, sans-I/O).
 webrtc = ["dep:str0m"]
+# Enable live NVIDIA NVENC / NVDEC utilization sampling via nvml-wrapper
+# for the manager's resource-budget UI. Linux + Windows only (the dep is
+# target-conditional). Off by default so a generic `cargo build` stays
+# portable; enable on release builds for those platforms.
+hardware-monitor-nvml = ["dep:nvml-wrapper"]
 # (SMPTE ST 2110 — Phase 1) Optional in-process PTP slave clock via the
 # pure-Rust `statime` crate. The default deployment runs `ptp4l` (linuxptp)
 # externally and bilbycast reads its management socket; this feature exists
@@ -276,6 +281,14 @@ version = "0.19.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# NVIDIA NVML — live NVENC / NVDEC utilization for the resource-budget
+# block on the manager UI. Optional; gated on the `hardware-monitor-nvml`
+# feature. Linux + Windows targets only — the dep doesn't compile on
+# macOS / BSD because it links libnvidia-ml at runtime. Enable explicitly
+# on release builds for those targets; the rest stays cleanly opt-out.
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+nvml-wrapper = { version = "0.10", optional = true }
 
 # ---------------------------------------------------------------------------
 # BILBYCAST PATCH: vendored `is` 0.8.0 with the strict-PRIORITY check on ICE

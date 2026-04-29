@@ -356,6 +356,81 @@ impl EventSender {
             details,
         ));
     }
+
+    /// Info: the IS-04 registration client successfully posted the node
+    /// resource to the registry. Fires once per (re-)registration.
+    pub fn emit_nmos_registered(&self, registry_url: &str, node_id: &str) {
+        self.emit_with_details(
+            EventSeverity::Info,
+            category::NMOS_REGISTRY,
+            format!("Registered with NMOS registry {registry_url}"),
+            None,
+            serde_json::json!({
+                "error_code": "nmos_registered",
+                "registry_url": registry_url,
+                "node_id": node_id,
+            }),
+        );
+    }
+
+    /// Warning: the registry returned non-2xx for a heartbeat (typically a
+    /// 404 because the registry expired the node). The client falls back to
+    /// re-registering.
+    pub fn emit_nmos_heartbeat_lost(&self, registry_url: &str, http_status: u16) {
+        self.emit_with_details(
+            EventSeverity::Warning,
+            category::NMOS_REGISTRY,
+            format!("NMOS heartbeat to {registry_url} returned HTTP {http_status} — re-registering"),
+            None,
+            serde_json::json!({
+                "error_code": "nmos_heartbeat_lost",
+                "registry_url": registry_url,
+                "http_status": http_status,
+            }),
+        );
+    }
+
+    /// Critical: a registration POST returned an error status (4xx/5xx). The
+    /// client retries with backoff.
+    pub fn emit_nmos_registration_failed(
+        &self,
+        registry_url: &str,
+        resource_type: &str,
+        http_status: u16,
+        error: &str,
+    ) {
+        self.emit_with_details(
+            EventSeverity::Critical,
+            category::NMOS_REGISTRY,
+            format!(
+                "NMOS registration of {resource_type} at {registry_url} failed: HTTP {http_status} {error}"
+            ),
+            None,
+            serde_json::json!({
+                "error_code": "nmos_registration_failed",
+                "registry_url": registry_url,
+                "resource_type": resource_type,
+                "http_status": http_status,
+                "error": error,
+            }),
+        );
+    }
+
+    /// Warning: the registry was unreachable (network / DNS / TLS error).
+    /// The client retries with backoff.
+    pub fn emit_nmos_registry_unreachable(&self, registry_url: &str, error: &str) {
+        self.emit_with_details(
+            EventSeverity::Warning,
+            category::NMOS_REGISTRY,
+            format!("NMOS registry {registry_url} unreachable: {error}"),
+            None,
+            serde_json::json!({
+                "error_code": "nmos_registry_unreachable",
+                "registry_url": registry_url,
+                "error": error,
+            }),
+        );
+    }
 }
 
 /// Protocol label attached to bind-failure events so operators can tell a UDP
@@ -505,6 +580,10 @@ pub mod category {
     /// index corrupt). Always paired with `details.replay_event = ...` and,
     /// for failure events, `details.error_code = ...`.
     pub const REPLAY: &str = "replay";
+    /// AMWA IS-04 registration-client lifecycle (registered with registry,
+    /// heartbeat lost, registration failed, registry unreachable). Always
+    /// paired with `details.error_code` for failure events.
+    pub const NMOS_REGISTRY: &str = "nmos_registry";
 }
 
 /// Scope label passed to [`run_bond_event_forwarder`] so generated

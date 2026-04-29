@@ -27,9 +27,20 @@ pub struct TimecodeTracker {
     /// Peek buffer — enough to cover the SEI NAL near the start of the PES.
     pes_peek: Vec<u8>,
     capturing_pes: bool,
+    /// Source frame rate, fed in by the lite analyser from the
+    /// `MediaAnalyzer` watch channel. When known, used to strictly bound
+    /// the SEI `n_frames` field (FF must be `< fps`); when unknown, a
+    /// permissive bound (`< 60`) catches obviously-bogus values like the
+    /// 236 a Reolink IP cam emits.
+    frame_rate: Option<f64>,
 }
 
 const PEEK_CAP: usize = 2048;
+
+/// Loose upper bound on the SMPTE FF field when the source frame rate is
+/// not yet known. Covers every real broadcast frame rate (24, 25, 29.97,
+/// 30, 50, 59.94, 60) with a small margin.
+const MAX_FRAMES_FALLBACK: u32 = 60;
 
 impl TimecodeTracker {
     pub fn new() -> Self {
@@ -41,7 +52,16 @@ impl TimecodeTracker {
             non_monotonic_count: 0,
             pes_peek: Vec::with_capacity(PEEK_CAP),
             capturing_pes: false,
+            frame_rate: None,
         }
+    }
+
+    /// Update the cached source frame rate. Called from the lite
+    /// analyser whenever the `MediaAnalyzer` watch channel advances.
+    /// `None` means fps is not yet known (or media_analysis is off);
+    /// the validator falls back to [`MAX_FRAMES_FALLBACK`].
+    pub fn set_frame_rate(&mut self, fps: Option<f64>) {
+        self.frame_rate = fps;
     }
 
     pub fn observe_ts(&mut self, pusi: bool, payload: &[u8]) {
@@ -186,6 +206,20 @@ impl TimecodeTracker {
                 Some(v) => v,
                 None => return,
             };
+            // Reject `n_frames` that can't possibly be valid for the
+            // source. With known fps we bound strictly (`FF < fps`); with
+            // unknown fps we use a loose broadcast-wide bound. Either
+            // way the SEI is dropped — `self.last` keeps its prior value
+            // (None on always-bad sources, or the last good TC for an
+            // intermittent bad SEI). This is a structural decode reject,
+            // not a step regression — don't bump `non_monotonic_count`.
+            let max_frames = self
+                .frame_rate
+                .map(|f| f.ceil() as u32)
+                .unwrap_or(MAX_FRAMES_FALLBACK);
+            if n_frames as u32 >= max_frames {
+                return;
+            }
             let (mut seconds_value, mut minutes_value, mut hours_value) = (0u32, 0u32, 0u32);
             if full_timestamp_flag == 1 {
                 seconds_value = br.read_bits(6).unwrap_or(0);
@@ -214,10 +248,11 @@ impl TimecodeTracker {
                 "{:02}:{:02}:{:02}:{:02}",
                 hours_value, minutes_value, seconds_value, frames
             );
+            let fps_for_total = self.frame_rate.map(|f| f.round() as u64).unwrap_or(30);
             let total_frames = ((hours_value as u64) * 3600
                 + (minutes_value as u64) * 60
                 + (seconds_value as u64))
-                * 30
+                * fps_for_total
                 + frames as u64;
 
             // Monotonic check: allow equal (same-frame duplication) and
@@ -227,7 +262,7 @@ impl TimecodeTracker {
                     // large backward step — either wraparound at
                     // 24h or a genuine glitch. Count as non-monotonic
                     // only if it's not a ~24h wrap.
-                    let wrap_24h = 24u64 * 3600 * 30;
+                    let wrap_24h = 24u64 * 3600 * fps_for_total;
                     if prev < wrap_24h - 10 || total_frames > 10 {
                         self.monotonic = false;
                         self.non_monotonic_count += 1;
@@ -268,4 +303,69 @@ fn find_next_start_code(bytes: &[u8], from: usize) -> usize {
         i += 1;
     }
     bytes.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal `pic_timing` SEI payload with `pic_struct=0`
+    /// (frame), `full_timestamp_flag=1`, and the supplied `n_frames`.
+    /// Hours / minutes / seconds are all zero. Bit layout per H.264 §D.2.2:
+    ///
+    /// ```text
+    /// pic_struct(4)=0   clock_ts_flag(1)=1   ct_type(2)=0  nuit(1)=0
+    /// counting_type(5)=0   full_ts(1)=1   disc(1)=0   cnt_dropped(1)=0
+    /// n_frames(8)   seconds(6)=0   minutes(6)=0   hours(5)=0
+    /// ```
+    fn pic_timing_payload(n_frames: u8) -> Vec<u8> {
+        vec![0x08, 0x04, n_frames, 0x00, 0x00, 0x00]
+    }
+
+    #[test]
+    fn valid_n_frames_produces_formatted_tc() {
+        let mut t = TimecodeTracker::new();
+        t.decode_pic_timing(&pic_timing_payload(12));
+        let snap = t.snapshot().expect("seen");
+        assert_eq!(snap.last.as_deref(), Some("00:00:00:12"));
+    }
+
+    #[test]
+    fn rejects_n_frames_above_fallback_when_fps_unknown() {
+        // No frame_rate set; FF=236 exceeds the loose broadcast bound.
+        // Snapshot returns None because `seen` was never flipped.
+        let mut t = TimecodeTracker::new();
+        t.decode_pic_timing(&pic_timing_payload(236));
+        assert!(t.snapshot().is_none());
+    }
+
+    #[test]
+    fn rejects_n_frames_above_strict_fps_bound() {
+        // 25 fps source — FF=27 is invalid.
+        let mut t = TimecodeTracker::new();
+        t.set_frame_rate(Some(25.0));
+        t.decode_pic_timing(&pic_timing_payload(27));
+        assert!(t.snapshot().is_none());
+    }
+
+    #[test]
+    fn accepts_n_frames_at_strict_fps_boundary() {
+        // 25 fps source — FF=24 is the largest valid value.
+        let mut t = TimecodeTracker::new();
+        t.set_frame_rate(Some(25.0));
+        t.decode_pic_timing(&pic_timing_payload(24));
+        let snap = t.snapshot().expect("seen");
+        assert_eq!(snap.last.as_deref(), Some("00:00:00:24"));
+    }
+
+    #[test]
+    fn invalid_sei_does_not_overwrite_prior_good_value() {
+        // First a valid SEI lands. Then the source emits a malformed one
+        // (n_frames=236) — `last` must not regress to None.
+        let mut t = TimecodeTracker::new();
+        t.decode_pic_timing(&pic_timing_payload(12));
+        t.decode_pic_timing(&pic_timing_payload(236));
+        let snap = t.snapshot().expect("seen");
+        assert_eq!(snap.last.as_deref(), Some("00:00:00:12"));
+    }
 }

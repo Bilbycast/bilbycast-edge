@@ -20,6 +20,7 @@ use tokio::time::{Duration, interval};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::ResourceLimitConfig;
+use crate::engine::hardware_probe::{LiveUtilizationState, NvmlPoller};
 use crate::manager::events::{EventSender, EventSeverity, category};
 
 /// Lock-free shared state for system resource metrics.
@@ -67,15 +68,19 @@ impl SystemResourceState {
 ///
 /// Returns a `JoinHandle` that runs until the cancellation token is cancelled.
 /// If `config` is `None`, the task still samples metrics (for stats/Prometheus)
-/// but does not evaluate thresholds or fire events.
+/// but does not evaluate thresholds or fire events. When `live_gpu` is
+/// provided, the same 5 s loop additionally samples NVIDIA NVENC / NVDEC
+/// utilization via NVML — silently skipped on non-NVIDIA hosts and on
+/// builds without the `hardware-monitor-nvml` feature.
 pub fn spawn_resource_monitor(
     config: Option<ResourceLimitConfig>,
     state: Arc<SystemResourceState>,
+    live_gpu: Option<Arc<LiveUtilizationState>>,
     event_sender: EventSender,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        resource_monitor_loop(config, state, event_sender, cancel).await;
+        resource_monitor_loop(config, state, live_gpu, event_sender, cancel).await;
     })
 }
 
@@ -90,6 +95,7 @@ enum ThresholdState {
 async fn resource_monitor_loop(
     config: Option<ResourceLimitConfig>,
     state: Arc<SystemResourceState>,
+    live_gpu: Option<Arc<LiveUtilizationState>>,
     event_sender: EventSender,
     cancel: CancellationToken,
 ) {
@@ -104,6 +110,14 @@ async fn resource_monitor_loop(
     let mut ram_over_count: u32 = 0;
 
     let grace = config.as_ref().map(|c| c.grace_period_secs).unwrap_or(10);
+
+    // NVML init is a one-shot. Failure means no NVIDIA GPU / no driver —
+    // a normal state on most edges. We log at debug level and move on.
+    let nvml = if live_gpu.is_some() {
+        NvmlPoller::try_init()
+    } else {
+        None
+    };
 
     tracing::info!(
         "System resource monitor started{}",
@@ -134,6 +148,13 @@ async fn resource_monitor_loop(
         state.ram_percent.store((ram_pct * 100.0) as u32, Ordering::Relaxed);
         state.ram_used_mb.store(used_mem / (1024 * 1024), Ordering::Relaxed);
         state.ram_total_mb.store(total_mem / (1024 * 1024), Ordering::Relaxed);
+
+        // Live GPU poll (NVIDIA only). NVML failures during steady-state
+        // (device gone, driver reset) are absorbed inside `poll`; we just
+        // skip the sample silently.
+        if let (Some(poller), Some(gpu_state)) = (&nvml, live_gpu.as_ref()) {
+            poller.poll(gpu_state);
+        }
 
         // Evaluate thresholds if configured
         if let Some(ref cfg) = config {

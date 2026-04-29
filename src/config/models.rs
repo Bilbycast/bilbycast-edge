@@ -61,6 +61,13 @@ pub struct AppConfig {
     /// `FlowConfig` by ID. Existing single-flow configs do not need to use flow groups.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flow_groups: Vec<FlowGroupConfig>,
+    /// Optional AMWA IS-04 registration-client configuration. When `enabled`,
+    /// the edge POSTs its node + device + sources + flows + senders + receivers
+    /// to an external NMOS registry (e.g. Celebrum, Riedel MediorNet Control,
+    /// Lawo VSM, EVS Cerebrum) and heartbeats the node so the registry's query
+    /// API surfaces the edge to registry-driven NMOS controllers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nmos_registration: Option<NmosRegistrationConfig>,
 }
 
 impl Default for AppConfig {
@@ -80,6 +87,7 @@ impl Default for AppConfig {
             flows: Vec::new(),
             tunnels: Vec::new(),
             flow_groups: Vec::new(),
+            nmos_registration: None,
         }
     }
 }
@@ -244,6 +252,73 @@ pub struct MonitorConfig {
     pub listen_port: u16,
 }
 
+/// AMWA IS-04 registration-client configuration.
+///
+/// When `enabled`, a background task POSTs this node's IS-04 resource set
+/// (node + device + sources + flows + senders + receivers) to the configured
+/// registry's `/x-nmos/registration/<api_version>/resource` endpoint, and
+/// heartbeats the node every `heartbeat_interval_secs` against the registry's
+/// `/health/nodes/{id}` endpoint. On shutdown the node resource is DELETEd
+/// best-effort so the registry stops advertising it.
+///
+/// Resource UUIDs are deterministic UUID v5 values derived from `node_id` so
+/// they are stable across restarts — re-POSTing the same resource set updates
+/// the registry record in place.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NmosRegistrationConfig {
+    /// Whether registration is active. When false the task is not spawned and
+    /// the rest of this struct is ignored.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URL of the NMOS registry, e.g. `https://registry.example.com:8235`
+    /// or `http://localhost:8235`. Path components are appended internally —
+    /// do not include `/x-nmos/...` in this URL.
+    pub registry_url: String,
+    /// IS-04 registration API version. Currently the only supported value is
+    /// `v1.3`; older registries that only speak v1.2/v1.1 are out of scope
+    /// for this release.
+    #[serde(default = "default_nmos_api_version")]
+    pub api_version: String,
+    /// How often to POST a `health/nodes/{id}` heartbeat to the registry.
+    /// AMWA recommends 5 s; the registry treats nodes as expired after roughly
+    /// 12 s of missed heartbeats.
+    #[serde(default = "default_nmos_heartbeat_secs")]
+    pub heartbeat_interval_secs: u32,
+    /// HTTP request timeout for registration / heartbeat / delete requests.
+    #[serde(default = "default_nmos_timeout_secs")]
+    pub request_timeout_secs: u32,
+    /// Optional Bearer token to include on every registry request. Mirrors the
+    /// node-secret pattern: persisted in `secrets.json` (envelope-encrypted),
+    /// stripped before sending the config to the manager.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<String>,
+}
+
+fn default_nmos_api_version() -> String {
+    "v1.3".to_string()
+}
+
+fn default_nmos_heartbeat_secs() -> u32 {
+    5
+}
+
+fn default_nmos_timeout_secs() -> u32 {
+    10
+}
+
+impl Default for NmosRegistrationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            registry_url: String::new(),
+            api_version: default_nmos_api_version(),
+            heartbeat_interval_secs: default_nmos_heartbeat_secs(),
+            request_timeout_secs: default_nmos_timeout_secs(),
+            bearer_token: None,
+        }
+    }
+}
+
 /// A Flow connects one or more inputs to one or more outputs by reference.
 ///
 /// Flows contain only references (`input_ids`, `output_ids`) plus flow-level
@@ -369,6 +444,17 @@ pub struct RecordingConfig {
     /// (Phase 1 behaviour: writer only runs while explicitly armed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_buffer_seconds: Option<u32>,
+    /// Filmstrip thumbnail cadence in seconds. When set, a sibling
+    /// subscriber generates a small JPEG (160×90) every N seconds into
+    /// `<recording_dir>/thumbs/<pts_90khz>.jpg`, used by the manager
+    /// `/replay` page to render a visual scrubber strip behind the
+    /// timeline canvas. Range [1, 30] s. `None` = filmstrip disabled
+    /// (a recording-only flow keeps its existing CPU + disk shape).
+    /// Independent from the live `FlowConfig.thumbnail` boolean — the
+    /// live thumbnail goes to the manager via WS, the filmstrip goes to
+    /// disk for later scrub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filmstrip_seconds: Option<u32>,
 }
 
 impl Default for RecordingConfig {
@@ -380,6 +466,7 @@ impl Default for RecordingConfig {
             retention_seconds: default_recording_retention_seconds(),
             max_bytes: default_recording_max_bytes(),
             pre_buffer_seconds: None,
+            filmstrip_seconds: None,
         }
     }
 }
@@ -3857,6 +3944,7 @@ mod tests {
             resource_limits: None,
             tunnels: Vec::new(),
             flow_groups: Vec::new(),
+            nmos_registration: None,
             inputs: vec![InputDefinition {
                 active: true,
                 group: None,

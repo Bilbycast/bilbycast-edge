@@ -20,6 +20,7 @@ pub mod nmos;
 pub mod nmos_is05;
 pub mod nmos_is08;
 pub mod nmos_mdns;
+pub mod nmos_registration;
 pub mod server;
 pub mod stats;
 pub mod tunnels;

@@ -45,7 +45,8 @@ use crate::engine::packet::RtpPacket;
 use crate::manager::events::{EventSender, EventSeverity, category};
 
 use super::clips::ClipStore;
-use super::index::{IndexEntry, IndexWriter, flag};
+use super::filmstrip::{FilmstripStats, spawn_filmstrip_writer};
+use super::index::{flag, InMemoryIndex, IndexEntry, IndexWriter};
 use super::{MarkInAck, RecordingCommand};
 
 /// 188-byte MPEG-TS packet size.
@@ -130,6 +131,11 @@ pub struct RecordingHandle {
     /// (wired via FlowRuntime). Held for refcount.
     #[allow(dead_code)]
     pub stats: Arc<RecordingStats>,
+    /// Filmstrip writer counters when the flow opted into
+    /// `recording.filmstrip_seconds`. `None` when filmstrip is
+    /// disabled — the manager UI gracefully skips the strip render.
+    #[allow(dead_code)]
+    pub filmstrip_stats: Option<Arc<FilmstripStats>>,
     pub command_tx: mpsc::Sender<RecordingCommand>,
     /// Per-recording cancel token. Cancelling the parent flow token
     /// cascades to this child, so explicit cancel is rarely needed.
@@ -139,6 +145,10 @@ pub struct RecordingHandle {
     /// [`Self::cancel`] (or its parent), not by aborting the handle.
     #[allow(dead_code)]
     pub join: JoinHandle<()>,
+    /// Filmstrip writer task handle, when spawned. Same lifecycle as
+    /// `join` — shutdown via `cancel`, not abort.
+    #[allow(dead_code)]
+    pub filmstrip_join: Option<JoinHandle<()>>,
 }
 
 /// Spawn the subscriber + writer task pair for a recording. Returns
@@ -282,9 +292,35 @@ pub async fn spawn_writer(
         });
     }
 
+    // Filmstrip subscriber — opt-in via `recording.filmstrip_seconds`.
+    // Sibling broadcast subscriber, drop-on-Lagged, never blocks the
+    // data path. Stats are surfaced on the FlowStats recording snapshot
+    // so the manager UI can render a "frames written" counter alongside
+    // the segment counters.
+    let (filmstrip_stats, filmstrip_join) = if let Some(secs) = config.filmstrip_seconds {
+        let fstats = Arc::new(FilmstripStats::default());
+        let join = spawn_filmstrip_writer(
+            recording_id.clone(),
+            super::recording_dir(&recording_id),
+            &broadcast_tx,
+            secs,
+            fstats.clone(),
+            events.clone(),
+            cancel.clone(),
+        );
+        (Some(fstats), Some(join))
+    } else {
+        (None, None)
+    };
+
     let clips = ClipStore::open(&recording_id, &dir).await?;
     let index_path = dir.join("index.bin");
     let index_writer = IndexWriter::open(&index_path).await?;
+    // Pre-populate the lookup mirror from the on-disk index so post-crash
+    // mark-in / mark-out for a PTS in an existing segment still resolves
+    // its SMPTE TC. New IDR appends in `write_chunk` push into this same
+    // mirror.
+    let index_mirror = InMemoryIndex::load(&index_path).await.unwrap_or_default();
 
     let writer_state = WriterState {
         recording_id: recording_id.clone(),
@@ -303,7 +339,8 @@ pub async fn spawn_writer(
         last_pcr: None,
         pending_pcr_discontinuity: false,
         timecode: TimecodeTracker::new(),
-        in_point: Arc::new(Mutex::new(None)),
+        index_mirror,
+        pending_mark_in: Arc::new(Mutex::new(None)),
         mode: initial_mode,
     };
 
@@ -314,9 +351,11 @@ pub async fn spawn_writer(
     Ok(RecordingHandle {
         recording_id,
         stats,
+        filmstrip_stats,
         command_tx: cmd_tx,
         cancel: parent_cancel.child_token(),
         join,
+        filmstrip_join,
     })
 }
 
@@ -388,6 +427,16 @@ enum WriterMode {
     Armed,
 }
 
+/// State captured by `MarkIn` and consumed by `MarkOut`. Carries both the
+/// in-PTS and the SMPTE timecode that was live at mark-in time, so the
+/// resulting clip's `smpte_in` reflects the moment the operator marked
+/// rather than the moment they marked the out-point.
+#[derive(Debug, Clone)]
+struct PendingMarkIn {
+    pts_90khz: u64,
+    smpte_tc: Option<String>,
+}
+
 struct WriterState {
     recording_id: String,
     dir: PathBuf,
@@ -412,7 +461,15 @@ struct WriterState {
     /// across a stream-source change.
     pending_pcr_discontinuity: bool,
     timecode: TimecodeTracker,
-    in_point: Arc<Mutex<Option<u64>>>,
+    /// In-memory mirror of the on-disk `index.bin`. Loaded once at writer
+    /// startup, then appended in lock-step with `index_writer`. Lets
+    /// `mark_in` / `mark_out` resolve the SMPTE TC at a target PTS via
+    /// `find_floor` instead of using the live snapshot, so a clip's
+    /// `smpte_in` and `smpte_out` reflect the actual frames the operator
+    /// marked rather than whatever TC happened to be live at mark-out
+    /// time.
+    index_mirror: InMemoryIndex,
+    pending_mark_in: Arc<Mutex<Option<PendingMarkIn>>>,
     /// Current arming state. Drives retention selection in
     /// [`WriterState::effective_retention_seconds`] and the meaning of
     /// the Start / Stop commands. See [`WriterMode`].
@@ -550,6 +607,9 @@ impl WriterState {
         for entry in new_entries {
             if self.index_writer.append(entry).await.is_ok() {
                 self.stats.index_entries.fetch_add(1, Ordering::Relaxed);
+                // Mirror in memory so mark-in / mark-out can resolve
+                // SMPTE TC by PTS without re-reading index.bin.
+                self.index_mirror.entries.push(entry);
             }
         }
         Ok(())
@@ -863,6 +923,17 @@ impl WriterState {
         }
     }
 
+    /// Resolve the SMPTE TC at a given recording PTS via the in-memory
+    /// index mirror. Returns the TC stamped on the IDR at-or-before
+    /// `target_pts` (i.e. the SMPTE TC the source video carried for the
+    /// frame the operator marked). Returns `None` when the index is
+    /// empty (mark before the first IDR), when the closest IDR carried
+    /// no decodable SMPTE (`SMPTE_TC_VALID = 0`), or when SMPTE was
+    /// rejected by the timecode tracker's validator.
+    fn lookup_smpte_at_pts(&self, target_pts: u64) -> Option<String> {
+        lookup_smpte_in_index(&self.index_mirror, target_pts)
+    }
+
     async fn handle_command(&mut self, cmd: RecordingCommand) {
         match cmd {
             RecordingCommand::Start { reply } => {
@@ -917,19 +988,27 @@ impl WriterState {
                     let _ = reply.send(Err(anyhow!("replay_recording_not_active")));
                     return;
                 }
-                *self.in_point.lock().await = Some(pts);
-                let smpte_tc = self.timecode.snapshot().and_then(|t| t.last);
+                // Resolve TC at the marked PTS via the index, not from the
+                // live snapshot — for `explicit_pts` in the past that's
+                // the only source-of-truth, and for "now" it's still
+                // correct (last IDR ≈ now).
+                let smpte_tc = self.lookup_smpte_at_pts(pts);
+                *self.pending_mark_in.lock().await = Some(PendingMarkIn {
+                    pts_90khz: pts,
+                    smpte_tc: smpte_tc.clone(),
+                });
                 let _ = reply.send(Ok(MarkInAck { pts_90khz: pts, smpte_tc }));
             }
             RecordingCommand::MarkOut { name, description, explicit_out_pts, created_by, reply } => {
-                let in_pts_opt = *self.in_point.lock().await;
-                let in_pts = match in_pts_opt {
+                let pending = self.pending_mark_in.lock().await.clone();
+                let pending = match pending {
                     Some(p) => p,
                     None => {
                         let _ = reply.send(Err(anyhow!("replay_recording_not_active")));
                         return;
                     }
                 };
+                let in_pts = pending.pts_90khz;
                 let out_pts = explicit_out_pts.unwrap_or(self.accumulated_pts);
                 if out_pts <= in_pts {
                     let _ = reply.send(Err(anyhow!(
@@ -937,8 +1016,11 @@ impl WriterState {
                     )));
                     return;
                 }
-                let smpte_in = self.timecode.snapshot().and_then(|t| t.last);
-                let smpte_out = smpte_in.clone();
+                let smpte_in = pending.smpte_tc;
+                // Independent index lookup at out_pts — distinct from the
+                // mark-in lookup above, so `smpte_out` reflects the frame
+                // at the out-point rather than cloning `smpte_in`.
+                let smpte_out = self.lookup_smpte_at_pts(out_pts);
                 let res = self.clips.create(
                     &self.recording_id, in_pts, out_pts,
                     smpte_in, smpte_out, name, description, created_by,
@@ -956,7 +1038,7 @@ impl WriterState {
                             "clip": clip,
                         }),
                     );
-                    *self.in_point.lock().await = None;
+                    *self.pending_mark_in.lock().await = None;
                 }
                 let _ = reply.send(res);
             }
@@ -1025,6 +1107,31 @@ fn strip_rtp_if_present(buf: &Bytes) -> &[u8] {
     buf.as_ref()
 }
 
+/// Resolve the SMPTE TC at `target_pts` against an in-memory index,
+/// returning `None` when the index has no entry at-or-before
+/// `target_pts` or the closest IDR carried no decodable SMPTE. Pulled
+/// out of `WriterState::lookup_smpte_at_pts` so unit tests can exercise
+/// the lookup-and-unpack logic without spinning up a writer task.
+fn lookup_smpte_in_index(index: &InMemoryIndex, target_pts: u64) -> Option<String> {
+    let entry = index.find_floor(target_pts)?;
+    if !entry.smpte_tc_valid() {
+        return None;
+    }
+    Some(unpack_smpte_tc(entry.smpte_tc))
+}
+
+/// Inverse of [`smpte_tc_packed`] — turns the 32-bit-packed `IndexEntry`
+/// representation back into the human-readable `HH:MM:SS:FF` string the
+/// clip metadata stores. Drop-frame is not distinguished (matches the
+/// pack side).
+fn unpack_smpte_tc(packed: u32) -> String {
+    let h = (packed >> 24) & 0xFF;
+    let m = (packed >> 16) & 0xFF;
+    let s = (packed >> 8) & 0xFF;
+    let f = packed & 0xFF;
+    format!("{:02}:{:02}:{:02}:{:02}", h, m, s, f)
+}
+
 /// Pack a SMPTE TimecodeStats snapshot into a u32 bit-packed
 /// HH:MM:SS:FF representation. Returns `None` if no timecode is known.
 /// Format: `(HH << 24) | (MM << 16) | (SS << 8) | FF` — drop frame is
@@ -1064,4 +1171,71 @@ async fn write_meta_atomic(path: &PathBuf, meta: &RecordingMeta) -> Result<()> {
     }
     tokio::fs::rename(&tmp, path).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(pts: u64, packed: u32, valid: bool) -> IndexEntry {
+        IndexEntry {
+            pts_90khz: pts,
+            smpte_tc: packed,
+            segment_id: 0,
+            byte_offset: 0,
+            flags: flag::IS_IDR | if valid { flag::SMPTE_TC_VALID } else { 0 },
+        }
+    }
+
+    #[test]
+    fn unpack_roundtrips_pack() {
+        // 01:23:45:12 → packed → unpacked
+        let packed: u32 = (1 << 24) | (23 << 16) | (45 << 8) | 12;
+        assert_eq!(unpack_smpte_tc(packed), "01:23:45:12");
+    }
+
+    #[test]
+    fn lookup_returns_floor_entry_smpte() {
+        // Two IDRs: PTS=100 → 00:00:01:00, PTS=200 → 00:00:02:00
+        let mut idx = InMemoryIndex::default();
+        idx.entries.push(entry(100, (0 << 24) | (0 << 16) | (1 << 8) | 0, true));
+        idx.entries.push(entry(200, (0 << 24) | (0 << 16) | (2 << 8) | 0, true));
+
+        // PTS in [100, 200) → first entry; PTS ≥ 200 → second entry.
+        assert_eq!(lookup_smpte_in_index(&idx, 100).as_deref(), Some("00:00:01:00"));
+        assert_eq!(lookup_smpte_in_index(&idx, 150).as_deref(), Some("00:00:01:00"));
+        assert_eq!(lookup_smpte_in_index(&idx, 200).as_deref(), Some("00:00:02:00"));
+        assert_eq!(lookup_smpte_in_index(&idx, 999).as_deref(), Some("00:00:02:00"));
+    }
+
+    #[test]
+    fn lookup_returns_distinct_smpte_for_distinct_pts() {
+        // The Bug A guarantee: an in-PTS and an out-PTS that fall on
+        // different IDRs must resolve to different SMPTE strings.
+        let mut idx = InMemoryIndex::default();
+        idx.entries.push(entry(1_000_000, (5 << 24) | (40 << 16) | (22 << 8) | 0, true));
+        idx.entries.push(entry(2_000_000, (5 << 24) | (40 << 16) | (27 << 8) | 0, true));
+
+        let smpte_in = lookup_smpte_in_index(&idx, 1_500_000);
+        let smpte_out = lookup_smpte_in_index(&idx, 2_500_000);
+        assert_eq!(smpte_in.as_deref(), Some("05:40:22:00"));
+        assert_eq!(smpte_out.as_deref(), Some("05:40:27:00"));
+        assert_ne!(smpte_in, smpte_out);
+    }
+
+    #[test]
+    fn lookup_returns_none_when_index_empty() {
+        // Mark before any IDR has been observed.
+        let idx = InMemoryIndex::default();
+        assert!(lookup_smpte_in_index(&idx, 12345).is_none());
+    }
+
+    #[test]
+    fn lookup_returns_none_when_floor_entry_has_invalid_smpte() {
+        // IDR was indexed but the source had no SMPTE (or it was
+        // rejected by the validator) — entry stored with SMPTE_TC_VALID=0.
+        let mut idx = InMemoryIndex::default();
+        idx.entries.push(entry(100, 0xFFFFFFFF, false));
+        assert!(lookup_smpte_in_index(&idx, 150).is_none());
+    }
 }

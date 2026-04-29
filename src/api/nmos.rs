@@ -67,6 +67,14 @@ pub fn input_transport_of(input: &InputConfig) -> &'static str {
     input_transport(input)
 }
 
+/// A fresh NMOS resource `version` string (`<unix_secs>:<nanos>`). Per AMWA
+/// IS-04 §4.1.2 every PUT/POST to the registry must bump this so the registry
+/// recognises the update; the registration client picks one value per snapshot
+/// and applies it across all resources in that snapshot.
+pub fn fresh_version() -> String {
+    nmos_version()
+}
+
 fn node_uuid(config: &crate::config::models::AppConfig) -> Uuid {
     config
         .node_id
@@ -773,6 +781,236 @@ async fn list_receivers(State(state): State<AppState>) -> Json<Vec<NmosReceiver>
         })
         .collect();
     Json(receivers)
+}
+
+// ── Pub resource builders for the IS-04 registration client ──
+//
+// These mirror the JSON the IS-04 GET handlers above produce, but are
+// callable from a non-Axum context (e.g. the registration task) by taking a
+// `&AppConfig` and an explicit `version` string. The registration client uses
+// one `version` per change-detected snapshot so all resources in a single
+// re-registration carry the same stamp.
+
+/// Build the IS-04 `/self` node resource as a JSON value. `listen_host` /
+/// `listen_port` / `https` come from the live server config so the registry
+/// publishes the URL controllers should connect to.
+pub fn build_node_value(
+    config: &crate::config::models::AppConfig,
+    version: &str,
+    listen_host: &str,
+    listen_port: u16,
+    https: bool,
+) -> serde_json::Value {
+    let nid = node_uuid(config);
+    let hostname = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("HOST"))
+        .unwrap_or_else(|_| "bilbycast-edge".into());
+    let proto = if https { "https" } else { "http" };
+    let listen = format!("{listen_host}:{listen_port}");
+
+    let mut clocks: Vec<serde_json::Value> = Vec::new();
+    let mut seen_domains: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    for flow in &config.flows {
+        if let Some(d) = flow.clock_domain {
+            if seen_domains.insert(d) {
+                clocks.push(serde_json::json!({
+                    "name": "clk0",
+                    "ref_type": "ptp",
+                    "traceable": true,
+                    "version": "IEEE1588-2008",
+                    "gmid": "00-00-00-00-00-00-00-00",
+                    "locked": false
+                }));
+            }
+        }
+    }
+
+    serde_json::json!({
+        "id": nid.to_string(),
+        "version": version,
+        "label": hostname,
+        "description": format!("bilbycast-edge v{}", env!("CARGO_PKG_VERSION")),
+        "tags": {},
+        "href": format!("{proto}://{listen}/x-nmos/node/v1.3/"),
+        "hostname": hostname,
+        "caps": {},
+        "api": {
+            "versions": ["v1.3"],
+            "endpoints": [{
+                "host": listen_host,
+                "port": listen_port,
+                "protocol": proto,
+            }]
+        },
+        "services": [],
+        "clocks": clocks,
+        "interfaces": [],
+    })
+}
+
+/// Build the IS-04 device resource as a JSON value. The bilbycast-edge node
+/// exposes a single generic device that owns every sender/receiver — matching
+/// what `/x-nmos/node/v1.3/devices` returns.
+pub fn build_device_value(
+    config: &crate::config::models::AppConfig,
+    version: &str,
+) -> serde_json::Value {
+    let nid = node_uuid(config);
+    let did = device_uuid(&nid);
+    let mut senders = Vec::new();
+    let mut receivers = Vec::new();
+    for flow in &config.flows {
+        if !flow.input_ids.is_empty() {
+            receivers.push(receiver_uuid(&nid, &flow.id).to_string());
+        }
+        if let Ok(resolved) = config.resolve_flow(flow) {
+            for output in &resolved.outputs {
+                senders.push(sender_uuid(&nid, &flow.id, output_id(output)).to_string());
+            }
+        }
+    }
+    serde_json::json!({
+        "id": did.to_string(),
+        "version": version,
+        "label": "bilbycast-edge",
+        "description": "bilbycast-edge media transport gateway",
+        "tags": {},
+        "type": "urn:x-nmos:device:generic",
+        "node_id": nid.to_string(),
+        "senders": senders,
+        "receivers": receivers,
+        "controls": [],
+    })
+}
+
+/// Build IS-04 source resources for every flow that has at least one resolvable
+/// active input.
+pub fn build_source_values(
+    config: &crate::config::models::AppConfig,
+    version: &str,
+) -> Vec<serde_json::Value> {
+    let nid = node_uuid(config);
+    let did = device_uuid(&nid);
+    config
+        .flows
+        .iter()
+        .filter_map(|f| {
+            let resolved = config.resolve_flow(f).ok()?;
+            let input = &resolved.active_input()?.config;
+            Some(serde_json::json!({
+                "id": source_uuid(&nid, &f.id).to_string(),
+                "version": version,
+                "label": f.name,
+                "description": format!("{} input ({})", f.name, input_type_str(input)),
+                "tags": {},
+                "format": input_format(input),
+                "caps": source_caps(input),
+                "device_id": did.to_string(),
+                "parents": [],
+                "clock_name": f
+                    .clock_domain
+                    .map(|_| serde_json::Value::String("clk0".into()))
+                    .unwrap_or(serde_json::Value::Null),
+            }))
+        })
+        .collect()
+}
+
+/// Build IS-04 flow resources for every flow.
+pub fn build_flow_values(
+    config: &crate::config::models::AppConfig,
+    version: &str,
+) -> Vec<serde_json::Value> {
+    let nid = node_uuid(config);
+    let did = device_uuid(&nid);
+    config
+        .flows
+        .iter()
+        .map(|f| {
+            let resolved_input = config
+                .resolve_flow(f)
+                .ok()
+                .and_then(|r| r.active_input().map(|d| d.config.clone()));
+            let format = resolved_input
+                .as_ref()
+                .map(|i| input_format(i))
+                .unwrap_or("urn:x-nmos:format:mux");
+            serde_json::json!({
+                "id": flow_uuid(&nid, &f.id).to_string(),
+                "version": version,
+                "label": f.name,
+                "description": format!("Flow: {}", f.name),
+                "tags": {},
+                "format": format,
+                "source_id": source_uuid(&nid, &f.id).to_string(),
+                "device_id": did.to_string(),
+                "parents": [],
+            })
+        })
+        .collect()
+}
+
+/// Build IS-04 sender resources, one per resolvable output of every flow.
+pub fn build_sender_values(
+    config: &crate::config::models::AppConfig,
+    version: &str,
+) -> Vec<serde_json::Value> {
+    let nid = node_uuid(config);
+    let did = device_uuid(&nid);
+    let mut senders = Vec::new();
+    for f in &config.flows {
+        let fid = flow_uuid(&nid, &f.id);
+        let resolved = match config.resolve_flow(f) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for output in &resolved.outputs {
+            senders.push(serde_json::json!({
+                "id": sender_uuid(&nid, &f.id, output_id(output)).to_string(),
+                "version": version,
+                "label": output_name(output),
+                "description": format!("Output {} of flow {}", output_name(output), f.name),
+                "tags": {},
+                "flow_id": fid.to_string(),
+                "transport": output_transport(output),
+                "device_id": did.to_string(),
+                "manifest_href": "",
+                "interface_bindings": [],
+                "subscription": {"receiver_id": null, "active": true},
+            }));
+        }
+    }
+    senders
+}
+
+/// Build IS-04 receiver resources, one per flow with a resolvable active input.
+pub fn build_receiver_values(
+    config: &crate::config::models::AppConfig,
+    version: &str,
+) -> Vec<serde_json::Value> {
+    let nid = node_uuid(config);
+    let did = device_uuid(&nid);
+    config
+        .flows
+        .iter()
+        .filter_map(|f| {
+            let resolved = config.resolve_flow(f).ok()?;
+            let input = resolved.active_input()?.config.clone();
+            Some(serde_json::json!({
+                "id": receiver_uuid(&nid, &f.id).to_string(),
+                "version": version,
+                "label": f.name,
+                "description": format!("{} receiver ({})", f.name, input_type_str(&input)),
+                "tags": {},
+                "format": input_format(&input),
+                "caps": receiver_caps(&input),
+                "device_id": did.to_string(),
+                "transport": input_transport(&input),
+                "interface_bindings": [],
+                "subscription": {"sender_id": null, "active": true},
+            }))
+        })
+        .collect()
 }
 
 async fn get_receiver(

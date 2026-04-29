@@ -181,6 +181,12 @@ pub struct FlowRuntime {
     /// by input_id.
     #[cfg(feature = "replay")]
     pub replay_command_txs: dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::replay::ReplayCommand>>,
+    /// Resource-budget unit cost of this flow (computed at start time
+    /// from `derive_cost_plan` + `compute_flow_cost_units`). Surfaced
+    /// on `FlowStats.cost_units` and rolled up into the node-level
+    /// `HealthPayload.resource_budget.units_used` so the manager UI
+    /// can render utilisation against `units_total`.
+    pub cost_units: u32,
 }
 
 /// Runtime state for a single input within a flow.
@@ -647,6 +653,7 @@ impl FlowRuntime {
                     event_sender.clone(),
                     config.config.id.clone(),
                     cancel_token.child_token(),
+                    frame_rate_rx.clone(),
                 ))
             } else {
                 None
@@ -846,6 +853,9 @@ impl FlowRuntime {
                 None
             };
 
+        let cost_plan = derive_cost_plan(&config);
+        let cost_units = crate::engine::hardware_probe::compute_flow_cost_units(&cost_plan);
+
         Ok(Self {
             config,
             broadcast_tx,
@@ -875,7 +885,14 @@ impl FlowRuntime {
             recording_handle,
             #[cfg(feature = "replay")]
             replay_command_txs,
+            cost_units,
         })
+    }
+
+    /// Resource-budget cost of this flow, in units. Set once at start
+    /// from the flow's resolved configuration.
+    pub fn cost_units(&self) -> u32 {
+        self.cost_units
     }
 
     /// Phase 7: replace this flow's PID-bus assembly plan in place.
@@ -3138,5 +3155,104 @@ fn build_output_config_meta(config: &OutputConfig) -> OutputConfigMeta {
             whip_url: None,
             program_number: c.program_number,
         },
+    }
+}
+
+/// Walk a resolved flow's outputs + flow-level config and produce the
+/// `FlowCostPlan` consumed by `engine::hardware_probe::compute_flow_cost_units`.
+/// HW vs SW classification is purely string-driven on the encoder name —
+/// a codec containing `nvenc`, `qsv`, `videotoolbox`, or `amf` is
+/// considered hardware; anything else (including `x264` / `x265` / unknown)
+/// is software. Outputs that don't carry encode blocks (ST 2110 audio,
+/// bonded, etc.) contribute zero on top of the base passthrough cost.
+fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowCostPlan {
+    use crate::config::models::OutputConfig;
+
+    let mut plan = crate::engine::hardware_probe::FlowCostPlan::default();
+
+    for out in &flow.outputs {
+        let (audio, video) = output_encode_blocks(out);
+        if audio.is_some() {
+            plan.audio_encode_outputs = plan.audio_encode_outputs.saturating_add(1);
+        }
+        if let Some(codec) = video {
+            if is_hw_video_codec(codec) {
+                plan.hw_video_encode_outputs = plan.hw_video_encode_outputs.saturating_add(1);
+            } else {
+                plan.sw_video_encode_outputs = plan.sw_video_encode_outputs.saturating_add(1);
+            }
+        }
+        // ST 2110-20/-23 outputs always run a video encoder pipeline
+        // (RFC 4175 packetization is fed by an internal x264/x265 pass)
+        // — count them as one SW video encode each.
+        if matches!(out, OutputConfig::St2110_20(_) | OutputConfig::St2110_23(_)) {
+            plan.sw_video_encode_outputs = plan.sw_video_encode_outputs.saturating_add(1);
+        }
+    }
+
+    let content = flow.config.effective_content_analysis();
+    plan.content_analysis_lite = content.lite;
+    plan.content_analysis_audio_full = content.audio_full;
+    plan.content_analysis_video_full = content.video_full;
+    plan.recording_enabled = flow
+        .config
+        .recording
+        .as_ref()
+        .map(|r| r.enabled)
+        .unwrap_or(false);
+
+    plan
+}
+
+fn is_hw_video_codec(codec: &str) -> bool {
+    let c = codec.to_lowercase();
+    c.contains("nvenc") || c.contains("qsv") || c.contains("videotoolbox") || c.contains("amf")
+}
+
+/// Pull the `(audio_encode, video_encode_codec)` pair out of an
+/// [`OutputConfig`] variant, returning `(None, None)` for outputs
+/// that don't carry encode blocks (ST 2110 audio, bonded, etc.).
+/// The video-encode side reports just the codec string (HW vs SW
+/// classification is delegated to `is_hw_video_codec`).
+fn output_encode_blocks(
+    output: &crate::config::models::OutputConfig,
+) -> (Option<&crate::config::models::AudioEncodeConfig>, Option<&str>) {
+    use crate::config::models::OutputConfig::*;
+    match output {
+        Rtp(c) => (
+            c.audio_encode.as_ref(),
+            c.video_encode.as_ref().map(|v| v.codec.as_str()),
+        ),
+        Udp(c) => (
+            c.audio_encode.as_ref(),
+            c.video_encode.as_ref().map(|v| v.codec.as_str()),
+        ),
+        Srt(c) => (
+            c.audio_encode.as_ref(),
+            c.video_encode.as_ref().map(|v| v.codec.as_str()),
+        ),
+        Rist(c) => (
+            c.audio_encode.as_ref(),
+            c.video_encode.as_ref().map(|v| v.codec.as_str()),
+        ),
+        Rtmp(c) => (
+            c.audio_encode.as_ref(),
+            c.video_encode.as_ref().map(|v| v.codec.as_str()),
+        ),
+        // HLS video_encode is deferred — only audio_encode counts today.
+        Hls(c) => (c.audio_encode.as_ref(), None),
+        Cmaf(c) => (
+            c.audio_encode.as_ref(),
+            c.video_encode.as_ref().map(|v| v.codec.as_str()),
+        ),
+        Webrtc(c) => (
+            c.audio_encode.as_ref(),
+            c.video_encode.as_ref().map(|v| v.codec.as_str()),
+        ),
+        // Outputs without encode blocks: ST 2110 audio / ancillary,
+        // RtpAudio (PCM passthrough), Bonded (passes the broadcast
+        // channel directly). ST 2110-20/-23 are caught above by the
+        // dedicated SW-encoder match in `derive_cost_plan`.
+        _ => (None, None),
     }
 }
