@@ -763,6 +763,11 @@ fn validate_input(input: &InputConfig) -> Result<()> {
             )?;
         }
         InputConfig::Webrtc(webrtc) => {
+            if let Some(ref bind) = webrtc.bind_addr {
+                if bind.parse::<std::net::SocketAddr>().is_err() {
+                    bail!("WebRTC input: invalid bind_addr '{}'", bind);
+                }
+            }
             if let Some(ref token) = webrtc.bearer_token {
                 if token.len() > 4096 {
                     bail!("WebRTC input: bearer_token must be at most 4096 characters");

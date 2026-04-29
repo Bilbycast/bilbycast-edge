@@ -1437,6 +1437,13 @@ fn default_rtsp_reconnect() -> u64 {
 /// Publishers POST an SDP offer and receive an SDP answer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WebrtcInputConfig {
+    /// Optional bind address for the WHIP UDP listener (e.g.
+    /// `0.0.0.0:8000`). When unset the edge auto-binds to a random
+    /// port (`0.0.0.0:0`, or `<public_ip>:0` when `public_ip` is set).
+    /// Pin this when the publisher must reach a fixed port through a
+    /// firewall / NAT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_addr: Option<String>,
     /// Optional Bearer token required from WHIP publishers for authentication.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearer_token: Option<String>,

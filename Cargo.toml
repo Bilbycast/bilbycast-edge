@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-edge"
-version = "0.35.0"
+version = "0.35.1"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 license = "AGPL-3.0-or-later"
