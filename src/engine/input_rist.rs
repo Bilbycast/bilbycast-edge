@@ -207,6 +207,8 @@ fn publish(
         rtp_timestamp: *ts_counter,
         recv_time_us: now_us(),
         is_raw_ts: true,
+        upstream_seq: None,
+        upstream_leg_id: None,
     };
 
     publish_input_packet(transcoder, broadcast_tx, packet);
@@ -347,6 +349,8 @@ fn handle_redundant_leg(
         rtp_timestamp: *ts_counter,
         recv_time_us: now_us(),
         is_raw_ts: true,
+        upstream_seq: None,
+        upstream_leg_id: None,
     };
 
     publish_input_packet(transcoder, broadcast_tx, packet);

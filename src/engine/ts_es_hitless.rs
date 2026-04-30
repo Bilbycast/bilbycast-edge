@@ -75,65 +75,272 @@ pub fn spawn_hitless_es_merger(
     stall: Duration,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
+    spawn_hitless_es_merger_modal(uid, primary, backup, bus, stall, /* seq_aware */ false, cancel)
+}
+
+/// Spawn a Hitless merger task with explicit mode selection.
+///
+/// `seq_aware = false` (default) keeps the legacy primary-preference
+/// stall-timer path. `seq_aware = true` runs the SMPTE 2022-7 merger
+/// from `redundancy::merger::HitlessMerger` over `EsPacket.upstream_seq`,
+/// which dedupes both legs continuously and gap-fills sub-frame on
+/// failover.
+pub fn spawn_hitless_es_merger_modal(
+    uid: String,
+    primary: (String, u16),
+    backup: (String, u16),
+    bus: Arc<FlowEsBus>,
+    stall: Duration,
+    seq_aware: bool,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    spawn_hitless_es_merger_full(
+        uid,
+        primary,
+        backup,
+        bus,
+        stall,
+        seq_aware,
+        /* path_differential_ms */ None,
+        cancel,
+    )
+}
+
+/// Spawn a Hitless merger task. The seq-aware mode now supports a
+/// path-differential buffer for true SMPTE 2022-7 compliance — set
+/// `path_differential_ms` to `Some(ms)` to enable.
+///
+/// * `seq_aware = false`        → primary-preference stall timer (legacy)
+/// * `seq_aware = true, pd None`  → bare dedup (faster, no asym-path protection)
+/// * `seq_aware = true, pd Some(ms)` → buffered SMPTE 2022-7 (recommended)
+pub fn spawn_hitless_es_merger_full(
+    uid: String,
+    primary: (String, u16),
+    backup: (String, u16),
+    bus: Arc<FlowEsBus>,
+    stall: Duration,
+    seq_aware: bool,
+    path_differential_ms: Option<u32>,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
     let mut primary_rx = bus.subscribe(&primary.0, primary.1);
     let mut backup_rx = bus.subscribe(&backup.0, backup.1);
     let (out_input, out_pid) = hitless_bus_key(&uid);
     let out_tx = bus.sender_for(&out_input, out_pid);
 
     tokio::spawn(async move {
-        let mut using_primary = true;
-        let mut last_primary_at = Instant::now();
-
-        loop {
-            // Sleep until either stall fires (if currently preferring
-            // primary) or never (if we're on backup — we only switch
-            // back when a primary packet arrives, which the select
-            // arm handles directly).
-            let stall_deadline = last_primary_at + stall;
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return,
-                res = primary_rx.recv() => match res {
-                    Ok(es) => {
-                        last_primary_at = Instant::now();
-                        if !using_primary {
-                            tracing::info!(
-                                uid = %uid,
-                                "pid_bus hitless: primary resumed — switching from backup"
-                            );
-                            using_primary = true;
-                        }
-                        let _ = out_tx.send(es);
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return,
-                },
-                res = backup_rx.recv() => match res {
-                    Ok(es) => {
-                        if !using_primary {
-                            let _ = out_tx.send(es);
-                        } else {
-                            // Drop backup while primary is live — that's
-                            // the whole point of primary-preference.
-                            // Intentionally no `else` counter yet; add
-                            // when we wire stats.
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return,
-                },
-                _ = sleep_until(stall_deadline), if using_primary => {
-                    tracing::warn!(
-                        uid = %uid,
-                        "pid_bus hitless: primary stalled {:?} — switching to backup",
-                        stall
-                    );
-                    using_primary = false;
-                }
+        match (seq_aware, path_differential_ms) {
+            (true, Some(ms)) => {
+                run_buffered(
+                    uid,
+                    primary_rx,
+                    backup_rx,
+                    out_tx,
+                    Duration::from_millis(ms as u64),
+                    cancel,
+                )
+                .await;
+            }
+            (true, None) => {
+                run_seq_aware(uid, primary_rx, backup_rx, out_tx, cancel).await;
+            }
+            (false, _) => {
+                run_primary_preference(
+                    uid,
+                    &mut primary_rx,
+                    &mut backup_rx,
+                    out_tx,
+                    stall,
+                    cancel,
+                )
+                .await;
             }
         }
     })
 }
+
+async fn run_buffered(
+    uid: String,
+    mut primary_rx: broadcast::Receiver<EsPacketAlias>,
+    mut backup_rx: broadcast::Receiver<EsPacketAlias>,
+    out_tx: broadcast::Sender<EsPacketAlias>,
+    max_path_diff: Duration,
+    cancel: CancellationToken,
+) {
+    use crate::redundancy::merger::{ActiveLeg, BufferedHitlessMerger};
+    let mut merger: BufferedHitlessMerger<EsPacketAlias> =
+        BufferedHitlessMerger::new(max_path_diff);
+    // Far-future placeholder used when the buffer is empty so the
+    // tokio::select! `sleep_until` arm doesn't fire spuriously.
+    let far_future = std::time::Instant::now() + Duration::from_secs(86_400);
+
+    loop {
+        let drain_at = merger.next_deadline().unwrap_or(far_future);
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            _ = sleep_until(tokio::time::Instant::from_std(drain_at)) => {
+                for (_, es) in merger.drain_expired(std::time::Instant::now()) {
+                    let _ = out_tx.send(es);
+                }
+            }
+            res = primary_rx.recv() => match res {
+                Ok(es) => {
+                    let seq = match es.upstream_seq {
+                        Some(s) => s,
+                        None => {
+                            tracing::warn!(
+                                uid = %uid,
+                                "pid_bus hitless buffered: primary leg has no upstream_seq — \
+                                 forwarding without buffer (bypass path)"
+                            );
+                            let _ = out_tx.send(es);
+                            continue;
+                        }
+                    };
+                    let now = std::time::Instant::now();
+                    for (_, es) in merger.ingest(seq, ActiveLeg::Leg1, es, now) {
+                        let _ = out_tx.send(es);
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
+            res = backup_rx.recv() => match res {
+                Ok(es) => {
+                    let seq = match es.upstream_seq {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let now = std::time::Instant::now();
+                    for (_, es) in merger.ingest(seq, ActiveLeg::Leg2, es, now) {
+                        let _ = out_tx.send(es);
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
+        }
+    }
+}
+
+async fn run_primary_preference(
+    uid: String,
+    primary_rx: &mut broadcast::Receiver<EsPacketAlias>,
+    backup_rx: &mut broadcast::Receiver<EsPacketAlias>,
+    out_tx: broadcast::Sender<EsPacketAlias>,
+    stall: Duration,
+    cancel: CancellationToken,
+) {
+    let mut using_primary = true;
+    let mut last_primary_at = Instant::now();
+
+    loop {
+        let stall_deadline = last_primary_at + stall;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            res = primary_rx.recv() => match res {
+                Ok(es) => {
+                    last_primary_at = Instant::now();
+                    if !using_primary {
+                        tracing::info!(
+                            uid = %uid,
+                            "pid_bus hitless: primary resumed — switching from backup"
+                        );
+                        using_primary = true;
+                    }
+                    let _ = out_tx.send(es);
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
+            res = backup_rx.recv() => match res {
+                Ok(es) => {
+                    if !using_primary {
+                        let _ = out_tx.send(es);
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
+            _ = sleep_until(stall_deadline), if using_primary => {
+                tracing::warn!(
+                    uid = %uid,
+                    "pid_bus hitless: primary stalled {:?} — switching to backup",
+                    stall
+                );
+                using_primary = false;
+            }
+        }
+    }
+}
+
+async fn run_seq_aware(
+    uid: String,
+    mut primary_rx: broadcast::Receiver<EsPacketAlias>,
+    mut backup_rx: broadcast::Receiver<EsPacketAlias>,
+    out_tx: broadcast::Sender<EsPacketAlias>,
+    cancel: CancellationToken,
+) {
+    use crate::redundancy::merger::{ActiveLeg, HitlessMerger};
+    let mut merger = HitlessMerger::new();
+    let mut current_leg: Option<ActiveLeg> = None;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            res = primary_rx.recv() => match res {
+                Ok(es) => {
+                    let seq = match es.upstream_seq {
+                        Some(s) => s,
+                        None => {
+                            tracing::warn!(
+                                uid = %uid,
+                                "pid_bus hitless seq_aware: primary leg has no upstream_seq — \
+                                 falling back to forward (this should be rejected at config validation)"
+                            );
+                            let _ = out_tx.send(es);
+                            continue;
+                        }
+                    };
+                    if let Some(chosen) = merger.try_merge(seq, ActiveLeg::Leg1) {
+                        if Some(chosen) != current_leg {
+                            tracing::info!(uid = %uid, "pid_bus hitless seq_aware: leg = {:?}", chosen);
+                            current_leg = Some(chosen);
+                        }
+                        let _ = out_tx.send(es);
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
+            res = backup_rx.recv() => match res {
+                Ok(es) => {
+                    let seq = match es.upstream_seq {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    if let Some(chosen) = merger.try_merge(seq, ActiveLeg::Leg2) {
+                        if Some(chosen) != current_leg {
+                            tracing::info!(uid = %uid, "pid_bus hitless seq_aware: leg = {:?}", chosen);
+                            current_leg = Some(chosen);
+                        }
+                        let _ = out_tx.send(es);
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
+        }
+    }
+}
+
+// Type alias used in helpers above to keep the function signatures
+// readable without a large lifetime ceremony — `EsPacket` is `Clone` so
+// the broadcast channel of it is fine to pass through by value.
+type EsPacketAlias = crate::engine::ts_es_bus::EsPacket;
 
 #[cfg(test)]
 mod tests {
@@ -158,6 +365,8 @@ mod tests {
             has_pcr: false,
             pcr: None,
             recv_time_us: 0,
+            upstream_seq: None,
+            upstream_leg_id: None,
         }
     }
 

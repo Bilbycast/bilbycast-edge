@@ -1963,6 +1963,8 @@ mod tests {
             rtp_timestamp: 0,
             recv_time_us: current_micros(),
             is_raw_ts: false,
+            upstream_seq: None,
+            upstream_leg_id: None,
         };
 
         let out = stage.process(&pkt);
@@ -2011,6 +2013,8 @@ mod tests {
                 rtp_timestamp: (i * 48) as u32,
                 recv_time_us: current_micros(),
                 is_raw_ts: false,
+                upstream_seq: None,
+                upstream_leg_id: None,
             };
             total_out += stage.process(&pkt).len();
         }
@@ -2041,6 +2045,8 @@ mod tests {
             rtp_timestamp: 0,
             recv_time_us: 0,
             is_raw_ts: false,
+            upstream_seq: None,
+            upstream_leg_id: None,
         };
         let out = stage.process(&pkt);
         assert!(out.is_empty());

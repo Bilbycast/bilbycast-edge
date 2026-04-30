@@ -242,6 +242,8 @@ async fn process_media(
                                         rtp_timestamp: dts_90khz as u32,
                                         recv_time_us: recv_time,
                                         is_raw_ts: true,
+                                        upstream_seq: None,
+                                        upstream_leg_id: None,
                                     };
                                     seq_num = seq_num.wrapping_add(1);
                                     stats.input_packets.fetch_add(1, Ordering::Relaxed);
@@ -316,6 +318,8 @@ async fn process_media(
                                         rtp_timestamp: pts_90khz as u32,
                                         recv_time_us: recv_time,
                                         is_raw_ts: true,
+                                        upstream_seq: None,
+                                        upstream_leg_id: None,
                                     };
                                     seq_num = seq_num.wrapping_add(1);
                                     stats.input_packets.fetch_add(1, Ordering::Relaxed);

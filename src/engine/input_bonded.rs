@@ -191,6 +191,8 @@ fn publish(
         rtp_timestamp: *ts_counter,
         recv_time_us: now_us(),
         is_raw_ts: true,
+        upstream_seq: None,
+        upstream_leg_id: None,
     };
     let _ = broadcast_tx.send(packet);
 }

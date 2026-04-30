@@ -662,6 +662,7 @@ mod tests {
                 tls_key_pem: None,
             }],
             resource_limits: None,
+            logging: None,
             flow_groups: vec![],
             nmos_registration: None,
         };

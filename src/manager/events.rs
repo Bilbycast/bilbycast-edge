@@ -86,11 +86,18 @@ struct RecentCriticalTracker {
 /// running) or the bounded channel is full, events are silently discarded —
 /// channel-full events bump a sampled drop counter that emits one
 /// `tracing::warn!` per second so a storm is visible without log spam.
+///
+/// When the structured-JSON `log_shipper` is configured, every event also
+/// fans out to it so SIEM / NMS pickup is independent of manager
+/// connectivity. The shipper is set once at startup before the first
+/// clone; clones inherit the same `Option<JsonLogShipper>` value (the
+/// shipper itself is cheaply clonable internally).
 #[derive(Debug, Clone)]
 pub struct EventSender {
     tx: mpsc::Sender<Event>,
     recent: std::sync::Arc<RecentCriticalTracker>,
     drop_state: std::sync::Arc<EventDropState>,
+    log_shipper: Option<crate::observability::JsonLogShipper>,
 }
 
 /// Sampled drop accounting for the bounded event channel.
@@ -106,6 +113,14 @@ struct EventDropState {
 }
 
 impl EventSender {
+    /// Install the structured-JSON log shipper. Must be called once at
+    /// startup *before* any clone of the original sender is handed out —
+    /// later clones inherit the value, but earlier clones do not (each
+    /// clone holds its own `Option<JsonLogShipper>` field).
+    pub fn set_log_shipper(&mut self, shipper: crate::observability::JsonLogShipper) {
+        self.log_shipper = Some(shipper);
+    }
+
     /// Send an event to the manager. Critical events are also stashed in the
     /// in-process recent-event tracker so command handlers can poll for the
     /// outcome of a freshly spawned input/output.
@@ -129,6 +144,12 @@ impl EventSender {
             if let Ok(mut g) = self.recent.by_flow.write() {
                 g.insert(fid.clone(), entry);
             }
+        }
+        // Fan out to the structured-JSON log shipper before the manager
+        // mpsc try_send. Done first so the SIEM / NMS pickup captures the
+        // event even when the manager event channel is full and dropping.
+        if let Some(ref shipper) = self.log_shipper {
+            shipper.ship_event(&event);
         }
         if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(event) {
             self.drop_state.note_dropped();
@@ -828,6 +849,7 @@ pub fn event_channel() -> (EventSender, mpsc::Receiver<Event>) {
             tx,
             recent: std::sync::Arc::new(RecentCriticalTracker::default()),
             drop_state: std::sync::Arc::new(EventDropState::default()),
+            log_shipper: None,
         },
         rx,
     )

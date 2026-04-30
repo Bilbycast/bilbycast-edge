@@ -54,6 +54,11 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
         }
     }
 
+    // Validate logging shipper if present
+    if let Some(ref logging) = config.logging {
+        validate_logging_config(logging)?;
+    }
+
     // Validate TLS config if present
     if let Some(ref tls) = config.server.tls {
         if tls.cert_path.is_empty() {
@@ -630,6 +635,14 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                     red.source_addr.as_deref(),
                     "RTP input redundancy",
                 )?;
+                if let Some(ms) = red.path_differential_ms {
+                    if !(5..=2000).contains(&ms) {
+                        bail!(
+                            "RTP input redundancy: path_differential_ms must be in 5..=2000 \
+                             (got {ms})"
+                        );
+                    }
+                }
             }
             validate_input_transcode_group_a(
                 rtp.audio_encode.as_ref(),
@@ -2318,7 +2331,7 @@ fn collect_slot_ref<'a>(
         SlotSource::Essence { input_id, .. } => {
             essence_inputs.insert(input_id.as_str());
         }
-        SlotSource::Hitless { primary, backup } => {
+        SlotSource::Hitless { primary, backup, .. } => {
             collect_slot_ref(primary, pids, essence_inputs);
             collect_slot_ref(backup, pids, essence_inputs);
         }
@@ -2345,11 +2358,40 @@ where
         SlotSource::Essence { input_id, kind: _ } => {
             check_input(input_id)?;
         }
-        SlotSource::Hitless { primary, backup } => {
+        SlotSource::Hitless {
+            primary,
+            backup,
+            mode: _,
+            stall_ms,
+            reorder_window,
+            path_differential_ms,
+        } => {
             if inside_hitless {
                 bail!(
                     "{context}: hitless slot source cannot nest another hitless"
                 );
+            }
+            if let Some(ms) = stall_ms {
+                if !(20..=5000).contains(ms) {
+                    bail!(
+                        "{context}: hitless stall_ms must be in 20..=5000 (got {ms})"
+                    );
+                }
+            }
+            if let Some(w) = reorder_window {
+                if !(64..=4096).contains(w) || w % 64 != 0 {
+                    bail!(
+                        "{context}: hitless reorder_window must be a multiple of 64 in \
+                         64..=4096 (got {w})"
+                    );
+                }
+            }
+            if let Some(ms) = path_differential_ms {
+                if !(5..=2000).contains(ms) {
+                    bail!(
+                        "{context}: hitless path_differential_ms must be in 5..=2000 (got {ms})"
+                    );
+                }
             }
             validate_slot_source(primary, check_input, check_pid, context, true)?;
             validate_slot_source(backup, check_input, check_pid, context, true)?;
@@ -4147,6 +4189,54 @@ fn validate_socket_addr(addr: &str, context: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate the structured-JSON log shipper configuration.
+///
+/// Per-target rules:
+/// * `file` — `path` non-empty, ≤ 4096 chars, no NUL bytes; `max_size_mb`
+///   must be in `1..=4096`; `max_backups` must be ≤ 100.
+/// * `syslog` — `addr` must parse as a `host:port` socket address.
+/// * `stdout` — no extra checks.
+pub fn validate_logging_config(logging: &LoggingConfig) -> Result<()> {
+    let Some(ref target) = logging.json_target else {
+        return Ok(());
+    };
+    match target {
+        JsonLogTarget::Stdout { .. } => Ok(()),
+        JsonLogTarget::File {
+            path,
+            max_size_mb,
+            max_backups,
+            ..
+        } => {
+            if path.is_empty() {
+                bail!("logging.json_target file: path cannot be empty");
+            }
+            if path.len() > 4096 {
+                bail!("logging.json_target file: path too long (max 4096 chars)");
+            }
+            if path.contains('\0') {
+                bail!("logging.json_target file: path must not contain NUL bytes");
+            }
+            if !(1..=4096).contains(max_size_mb) {
+                bail!(
+                    "logging.json_target file: max_size_mb must be in 1..=4096 (got {})",
+                    max_size_mb
+                );
+            }
+            if *max_backups > 100 {
+                bail!(
+                    "logging.json_target file: max_backups must be ≤ 100 (got {})",
+                    max_backups
+                );
+            }
+            Ok(())
+        }
+        JsonLogTarget::Syslog { addr, .. } => {
+            validate_socket_addr(addr, "logging.json_target syslog addr")
+        }
+    }
+}
+
 /// Validates that `addr` is a parseable IP address (without port).
 ///
 /// Uses [`std::net::IpAddr`] parsing, which accepts both IPv4 and IPv6 formats.
@@ -4803,6 +4893,10 @@ mod tests {
                 input_id: "in-a".into(),
                 kind: EssenceKind::Video,
             }),
+            mode: Default::default(),
+            stall_ms: None,
+            reorder_window: None,
+            path_differential_ms: None,
         };
         let mut a = spts_assembly("in-a");
         a.programs[0].streams[0].source = SlotSource::Hitless {
@@ -4811,6 +4905,10 @@ mod tests {
                 input_id: "in-a".into(),
                 source_pid: 0x101,
             }),
+            mode: Default::default(),
+            stall_ms: None,
+            reorder_window: None,
+            path_differential_ms: None,
         };
         let err = validate_flow_assembly(&a, &["in-a".into()], "test").unwrap_err();
         assert!(err.to_string().contains("nest"));

@@ -878,6 +878,17 @@ fn edge_capabilities() -> Vec<&'static str> {
         // estimate + live unit-utilization. Manager UI keys the
         // Resources card + per-flow Resource-impact widget off this.
         "resources",
+        // ETSI TR 101 290 priorities 1, 2, and 3 (P2-extended PTS / CAT
+        // / PCR-repetition split + P3 NIT / SDT / EIT / TDT / RST /
+        // Unreferenced_PID counters). The manager UI gates the new
+        // sub-panel on this — older edges still expose the P1-only
+        // surface they always have.
+        "tr101290_full",
+        // SMPTE 2022-7 seq-aware hitless on the PID-bus pre-bus path —
+        // EsPacket now carries upstream_seq + upstream_leg_id, and the
+        // assembly Hitless variant accepts a `mode = seq_aware` selector.
+        // Manager UI gates the SeqAware option on this capability.
+        "hitless_2022_7",
     ];
     if cfg!(feature = "ptp-internal") {
         caps.push("ptp-internal");

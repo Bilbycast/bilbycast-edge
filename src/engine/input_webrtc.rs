@@ -205,6 +205,8 @@ async fn whip_input_loop(
                                     .unwrap_or_default()
                                     .as_micros() as u64,
                                 is_raw_ts: true,
+                                upstream_seq: None,
+                                upstream_leg_id: None,
                             };
                             seq_num = seq_num.wrapping_add(1);
                             stats.input_packets.fetch_add(1, Ordering::Relaxed);
@@ -238,6 +240,8 @@ async fn whip_input_loop(
                                     .unwrap_or_default()
                                     .as_micros() as u64,
                                 is_raw_ts: true,
+                                upstream_seq: None,
+                                upstream_leg_id: None,
                             };
                             seq_num = seq_num.wrapping_add(1);
                             stats.input_packets.fetch_add(1, Ordering::Relaxed);
@@ -446,6 +450,8 @@ async fn whep_input_loop(
                                     .unwrap_or_default()
                                     .as_micros() as u64,
                                 is_raw_ts: true,
+                                upstream_seq: None,
+                                upstream_leg_id: None,
                             };
                             seq_num = seq_num.wrapping_add(1);
                             stats.input_packets.fetch_add(1, Ordering::Relaxed);

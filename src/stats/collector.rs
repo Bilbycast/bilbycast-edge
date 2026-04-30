@@ -521,6 +521,36 @@ pub struct Tr101290State {
     pub jpeg_xs_detected: bool,
     /// PID of the JPEG XS elementary stream, if detected.
     pub jpeg_xs_pid: Option<u16>,
+    // ── TR 101 290 P2-extended / P3 SI-table tracking ──
+    // The "ever observed" trick mirrors `pat_seen` so a contribution feed
+    // missing optional SI tables doesn't paint the dashboard amber. Once
+    // the table is seen, repetition timeouts start counting.
+    pub cat_seen: bool,
+    pub last_cat_time: Option<Instant>,
+    pub sdt_seen: bool,
+    pub last_sdt_time: Option<Instant>,
+    pub nit_seen: bool,
+    pub last_nit_time: Option<Instant>,
+    pub eit_seen: bool,
+    pub last_eit_time: Option<Instant>,
+    pub tdt_seen: bool,
+    pub last_tdt_time: Option<Instant>,
+    pub rst_seen: bool,
+    pub last_rst_time: Option<Instant>,
+    /// PIDs that were seen on the wire but do not appear in any PMT, the
+    /// PAT, the NIT slot, or the reserved 0x1FFF null. Population is
+    /// lazy — once a PID is observed and not classified, it lands here.
+    pub unreferenced_pids: HashMap<u16, ()>,
+    /// Last PTS observed per PES PID and the wallclock at observation.
+    /// Used for `pts_error` (no PTS within 700 ms when video/audio carry
+    /// PES with a PTS field).
+    pub pts_tracker: HashMap<u16, (u64, Instant)>,
+    /// Last PCR observation wallclock per PCR-bearing PID. Splitting
+    /// repetition (no PCR within 100 ms) from discontinuity (PCR jump
+    /// > 100 ms or backwards) — both used to live in
+    /// `pcr_discontinuity_errors`. Repetition reads via this map; the
+    /// existing `pcr_tracker` keeps the value-vs-wall comparison.
+    pub pcr_repetition_tracker: HashMap<u16, Instant>,
 }
 
 impl Default for Tr101290State {
@@ -544,6 +574,21 @@ impl Default for Tr101290State {
             iat_count: 0,
             jpeg_xs_detected: false,
             jpeg_xs_pid: None,
+            cat_seen: false,
+            last_cat_time: None,
+            sdt_seen: false,
+            last_sdt_time: None,
+            nit_seen: false,
+            last_nit_time: None,
+            eit_seen: false,
+            last_eit_time: None,
+            tdt_seen: false,
+            last_tdt_time: None,
+            rst_seen: false,
+            last_rst_time: None,
+            unreferenced_pids: HashMap::new(),
+            pts_tracker: HashMap::new(),
+            pcr_repetition_tracker: HashMap::new(),
         }
     }
 }
@@ -571,6 +616,18 @@ pub struct Tr101290Accumulator {
     pub crc_errors: AtomicU64,
     pub pcr_discontinuity_errors: AtomicU64,
     pub pcr_accuracy_errors: AtomicU64,
+    // Priority 2 extended (TR 101 290 §5.2 — PTS / CAT / PCR repetition split)
+    pub pts_errors: AtomicU64,
+    pub cat_errors: AtomicU64,
+    pub pcr_repetition_errors: AtomicU64,
+    // Priority 3 (TR 101 290 §5.3 — application-specific)
+    pub nit_errors: AtomicU64,
+    pub si_repetition_errors: AtomicU64,
+    pub unreferenced_pid_errors: AtomicU64,
+    pub sdt_errors: AtomicU64,
+    pub eit_errors: AtomicU64,
+    pub rst_errors: AtomicU64,
+    pub tdt_errors: AtomicU64,
 
     // ── Windowed counters (reset each snapshot, "errors since last report") ──
     pub window_cc_errors: AtomicU64,
@@ -581,6 +638,16 @@ pub struct Tr101290Accumulator {
     pub window_crc_errors: AtomicU64,
     pub window_pcr_discontinuity_errors: AtomicU64,
     pub window_pcr_accuracy_errors: AtomicU64,
+    pub window_pts_errors: AtomicU64,
+    pub window_cat_errors: AtomicU64,
+    pub window_pcr_repetition_errors: AtomicU64,
+    pub window_nit_errors: AtomicU64,
+    pub window_si_repetition_errors: AtomicU64,
+    pub window_unreferenced_pid_errors: AtomicU64,
+    pub window_sdt_errors: AtomicU64,
+    pub window_eit_errors: AtomicU64,
+    pub window_rst_errors: AtomicU64,
+    pub window_tdt_errors: AtomicU64,
 
     // Internal state
     pub state: Mutex<Tr101290State>,
@@ -602,6 +669,16 @@ impl Tr101290Accumulator {
             crc_errors: AtomicU64::new(0),
             pcr_discontinuity_errors: AtomicU64::new(0),
             pcr_accuracy_errors: AtomicU64::new(0),
+            pts_errors: AtomicU64::new(0),
+            cat_errors: AtomicU64::new(0),
+            pcr_repetition_errors: AtomicU64::new(0),
+            nit_errors: AtomicU64::new(0),
+            si_repetition_errors: AtomicU64::new(0),
+            unreferenced_pid_errors: AtomicU64::new(0),
+            sdt_errors: AtomicU64::new(0),
+            eit_errors: AtomicU64::new(0),
+            rst_errors: AtomicU64::new(0),
+            tdt_errors: AtomicU64::new(0),
             window_cc_errors: AtomicU64::new(0),
             window_pat_errors: AtomicU64::new(0),
             window_pmt_errors: AtomicU64::new(0),
@@ -610,6 +687,16 @@ impl Tr101290Accumulator {
             window_crc_errors: AtomicU64::new(0),
             window_pcr_discontinuity_errors: AtomicU64::new(0),
             window_pcr_accuracy_errors: AtomicU64::new(0),
+            window_pts_errors: AtomicU64::new(0),
+            window_cat_errors: AtomicU64::new(0),
+            window_pcr_repetition_errors: AtomicU64::new(0),
+            window_nit_errors: AtomicU64::new(0),
+            window_si_repetition_errors: AtomicU64::new(0),
+            window_unreferenced_pid_errors: AtomicU64::new(0),
+            window_sdt_errors: AtomicU64::new(0),
+            window_eit_errors: AtomicU64::new(0),
+            window_rst_errors: AtomicU64::new(0),
+            window_tdt_errors: AtomicU64::new(0),
             state: Mutex::new(Tr101290State::default()),
         }
     }
@@ -634,6 +721,18 @@ impl Tr101290Accumulator {
         let pcr_disc = self.pcr_discontinuity_errors.load(Ordering::Relaxed);
         let pcr_acc = self.pcr_accuracy_errors.load(Ordering::Relaxed);
 
+        // P2-extended + P3 cumulative
+        let pts = self.pts_errors.load(Ordering::Relaxed);
+        let cat = self.cat_errors.load(Ordering::Relaxed);
+        let pcr_rep = self.pcr_repetition_errors.load(Ordering::Relaxed);
+        let nit = self.nit_errors.load(Ordering::Relaxed);
+        let si_rep = self.si_repetition_errors.load(Ordering::Relaxed);
+        let unref_pid = self.unreferenced_pid_errors.load(Ordering::Relaxed);
+        let sdt = self.sdt_errors.load(Ordering::Relaxed);
+        let eit = self.eit_errors.load(Ordering::Relaxed);
+        let rst = self.rst_errors.load(Ordering::Relaxed);
+        let tdt = self.tdt_errors.load(Ordering::Relaxed);
+
         // Windowed counters — swap to zero atomically
         let w_cc = self.window_cc_errors.swap(0, Ordering::Relaxed);
         let w_pat = self.window_pat_errors.swap(0, Ordering::Relaxed);
@@ -643,11 +742,36 @@ impl Tr101290Accumulator {
         let w_crc = self.window_crc_errors.swap(0, Ordering::Relaxed);
         let w_pcr_disc = self.window_pcr_discontinuity_errors.swap(0, Ordering::Relaxed);
         let w_pcr_acc = self.window_pcr_accuracy_errors.swap(0, Ordering::Relaxed);
+        let w_pts = self.window_pts_errors.swap(0, Ordering::Relaxed);
+        let w_cat = self.window_cat_errors.swap(0, Ordering::Relaxed);
+        let w_pcr_rep = self.window_pcr_repetition_errors.swap(0, Ordering::Relaxed);
+        let w_nit = self.window_nit_errors.swap(0, Ordering::Relaxed);
+        let w_si_rep = self.window_si_repetition_errors.swap(0, Ordering::Relaxed);
+        let w_unref = self.window_unreferenced_pid_errors.swap(0, Ordering::Relaxed);
+        let w_sdt = self.window_sdt_errors.swap(0, Ordering::Relaxed);
+        let w_eit = self.window_eit_errors.swap(0, Ordering::Relaxed);
+        let w_rst = self.window_rst_errors.swap(0, Ordering::Relaxed);
+        let w_tdt = self.window_tdt_errors.swap(0, Ordering::Relaxed);
 
         // Priority flags based on windowed counters (current health, not historical)
         let in_sync = { self.state.lock().unwrap().in_sync };
         let priority1_ok = in_sync && w_cc == 0 && w_pat == 0 && w_pmt == 0 && w_pid == 0;
-        let priority2_ok = w_tei == 0 && w_crc == 0 && w_pcr_disc == 0 && w_pcr_acc == 0;
+        let priority2_ok = w_tei == 0
+            && w_crc == 0
+            && w_pcr_disc == 0
+            && w_pcr_acc == 0
+            && w_pts == 0
+            && w_cat == 0
+            && w_pcr_rep == 0;
+        let priority3_ok = Some(
+            w_nit == 0
+                && w_si_rep == 0
+                && w_unref == 0
+                && w_sdt == 0
+                && w_eit == 0
+                && w_rst == 0
+                && w_tdt == 0,
+        );
 
         // Read TR-07 state from the state mutex
         let (jpeg_xs_detected, jpeg_xs_pid) = {
@@ -679,6 +803,27 @@ impl Tr101290Accumulator {
             window_pcr_accuracy_errors: w_pcr_acc,
             priority1_ok,
             priority2_ok,
+            priority3_ok,
+            pts_errors: pts,
+            cat_errors: cat,
+            pcr_repetition_errors: pcr_rep,
+            nit_errors: nit,
+            si_repetition_errors: si_rep,
+            unreferenced_pid_errors: unref_pid,
+            sdt_errors: sdt,
+            eit_errors: eit,
+            rst_errors: rst,
+            tdt_errors: tdt,
+            window_pts_errors: w_pts,
+            window_cat_errors: w_cat,
+            window_pcr_repetition_errors: w_pcr_rep,
+            window_nit_errors: w_nit,
+            window_si_repetition_errors: w_si_rep,
+            window_unreferenced_pid_errors: w_unref,
+            window_sdt_errors: w_sdt,
+            window_eit_errors: w_eit,
+            window_rst_errors: w_rst,
+            window_tdt_errors: w_tdt,
             tr07_compliant: jpeg_xs_detected,
             jpeg_xs_pid,
         }
@@ -1221,6 +1366,12 @@ pub struct FlowStatsAccumulator {
     pub input_filtered: AtomicU64,
     pub fec_recovered: AtomicU64,
     pub redundancy_switches: AtomicU64,
+    /// Latest snapshot of the buffered SMPTE 2022-7 merger, when the
+    /// input runs in industry-standard buffered mode. The redundant
+    /// RTP listener publishes to this from the data-path task at the
+    /// natural drain cadence; the snapshot path just clones it.
+    pub buffered_hitless_snapshot:
+        std::sync::RwLock<Option<crate::stats::models::BufferedHitlessSnapshot>>,
     // Per-output stats
     pub output_stats: DashMap<String, Arc<OutputStatsAccumulator>>,
     pub input_throughput: ThroughputEstimator,
@@ -1439,6 +1590,7 @@ impl FlowStatsAccumulator {
             input_filtered: AtomicU64::new(0),
             fec_recovered: AtomicU64::new(0),
             redundancy_switches: AtomicU64::new(0),
+            buffered_hitless_snapshot: std::sync::RwLock::new(None),
             output_stats: DashMap::new(),
             input_throughput: ThroughputEstimator::new(),
             tr101290: OnceLock::new(),
@@ -2003,6 +2155,11 @@ impl FlowStatsAccumulator {
                         .get()
                         .map(bond_handle_to_leg_stats),
                     redundancy_switches: self.redundancy_switches.load(Ordering::Relaxed),
+                    buffered_hitless: self
+                        .buffered_hitless_snapshot
+                        .read()
+                        .ok()
+                        .and_then(|g| g.clone()),
                     transcode_stats: in_transcode,
                     audio_decode_stats: in_audio_decode,
                     audio_encode_stats: in_audio_encode,

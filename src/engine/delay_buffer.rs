@@ -270,6 +270,8 @@ mod tests {
             rtp_timestamp: 0,
             recv_time_us,
             is_raw_ts: true,
+            upstream_seq: None,
+            upstream_leg_id: None,
         }
     }
 

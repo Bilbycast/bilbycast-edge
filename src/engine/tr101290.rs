@@ -37,6 +37,38 @@ const PCR_JITTER_THRESHOLD_NS: u64 = 500;
 /// PAT / PMT must appear at least every 500 ms per TR-101290.
 const PAT_PMT_TIMEOUT: Duration = Duration::from_millis(500);
 
+// ── TR 101 290 P2-extended / P3 fixed PIDs (per ETSI EN 300 468) ──
+const CAT_PID: u16 = 0x0001;
+const NIT_PID_DEFAULT: u16 = 0x0010; // de-facto NIT PID; MIB lookup happens via PAT prog 0
+const SDT_BAT_PID: u16 = 0x0011;
+const EIT_PID: u16 = 0x0012;
+const RST_PID: u16 = 0x0013;
+const TDT_TOT_PID: u16 = 0x0014;
+
+/// PCR-repetition timeout per TR 101 290 §5.2.2 (PCR_repetition_error):
+/// PCR must arrive at least every 100 ms on a PCR-bearing PID.
+const PCR_REPETITION_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// PTS-repetition timeout per TR 101 290 §5.2.1 (PTS_error): every PES PID
+/// carrying a PTS field must produce one within 700 ms (the spec's safety
+/// margin for low-frame-rate streams).
+const PTS_TIMEOUT: Duration = Duration::from_millis(700);
+
+/// CAT timeout (TR 101 290 §5.2.4 — CAT_error). Once a CAT has been seen
+/// and CA descriptors have been advertised, the CAT must repeat within
+/// 500 ms — same window as PAT/PMT.
+const CAT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// SI-table timeouts. The TR 101 290 P3 thresholds use repetition rates
+/// per ETSI TR 101 211. For our purposes a single timeout = signal lost
+/// + emit one error per window suffices; the manager UI's per-counter
+/// rendering already shows trends.
+const SDT_TIMEOUT: Duration = Duration::from_millis(2_000);
+const NIT_TIMEOUT: Duration = Duration::from_millis(10_000);
+const EIT_TIMEOUT: Duration = Duration::from_millis(2_000);
+const TDT_TIMEOUT: Duration = Duration::from_millis(30_000);
+const RST_TIMEOUT: Duration = Duration::from_millis(60_000);
+
 // ── Analyzer Task ──────────────────────────────────────────────────────────
 
 /// Spawn the TR-101290 analyzer as an independent broadcast subscriber.
@@ -338,7 +370,131 @@ fn process_ts_packet(
                 last_pcr_wall_time: now,
             },
         );
+        // PCR repetition (P2 — split from `pcr_discontinuity_errors`).
+        // Repetition counts the *absence* of a PCR within 100 ms, while
+        // discontinuity counts unexpected jumps when one is present.
+        // Both used to live under `pcr_discontinuity_errors`; they're now
+        // distinct fields so the manager UI can highlight a stalled PCR
+        // source separately from a PCR jump.
+        state.pcr_repetition_tracker.insert(pid, now);
     }
+
+    // ── 7. PSI / SI table tracking (P2-extended + P3) ──
+    match pid {
+        CAT_PID => {
+            state.cat_seen = true;
+            state.last_cat_time = Some(now);
+            if ts_pusi(pkt) {
+                if let Some(section_start) = psi_section_start(pkt) {
+                    if !verify_psi_crc(pkt, section_start) {
+                        stats.crc_errors.fetch_add(1, Ordering::Relaxed);
+                        stats.window_crc_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        SDT_BAT_PID => {
+            state.sdt_seen = true;
+            state.last_sdt_time = Some(now);
+        }
+        EIT_PID => {
+            state.eit_seen = true;
+            state.last_eit_time = Some(now);
+        }
+        TDT_TOT_PID => {
+            state.tdt_seen = true;
+            state.last_tdt_time = Some(now);
+        }
+        RST_PID => {
+            state.rst_seen = true;
+            state.last_rst_time = Some(now);
+        }
+        NIT_PID_DEFAULT => {
+            // Best-effort — the canonical NIT PID is announced in PAT
+            // program 0 but the de-facto-default 0x0010 catches every
+            // EBU-DVB stream we see. Treat it as a cue without false
+            // positives.
+            state.nit_seen = true;
+            state.last_nit_time = Some(now);
+        }
+        _ => {}
+    }
+
+    // ── 8. Unreferenced PID tracking (P3 §5.3.4) ──
+    // A PID is unreferenced if it carries traffic but does not appear in
+    // PAT, any PMT, the CAT, NIT/SDT/EIT/TDT/RST slots, or the reserved
+    // 0x1FFF null. Stamp the first observation; the snapshot path counts
+    // distinct unreferenced PIDs as the error rate.
+    if pid != NULL_PID
+        && pid != PAT_PID
+        && pid != CAT_PID
+        && pid != NIT_PID_DEFAULT
+        && pid != SDT_BAT_PID
+        && pid != EIT_PID
+        && pid != RST_PID
+        && pid != TDT_TOT_PID
+        && !state.pmt_pids.contains_key(&pid)
+        && !state.es_pids.contains_key(&pid)
+        && !state.unreferenced_pids.contains_key(&pid)
+    {
+        state.unreferenced_pids.insert(pid, ());
+        stats.unreferenced_pid_errors.fetch_add(1, Ordering::Relaxed);
+        stats
+            .window_unreferenced_pid_errors
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ── 9. PTS tracking (P2 §5.2.1) ──
+    // Cheap PTS extraction: PUSI-marked packets on ES PIDs may carry a
+    // PES header with a PTS field. We don't reassemble full PES — we
+    // only need the wall-clock of the most recent PTS to detect a
+    // 700 ms gap. The PES PTS_DTS_flags live at byte 7 of the PES
+    // header; bit 7 (0x80) signals "PTS present".
+    if ts_pusi(pkt) && state.es_pids.contains_key(&pid) && ts_has_payload(pkt) {
+        if let Some(pts_value) = extract_pes_pts(pkt) {
+            state.pts_tracker.insert(pid, (pts_value, now));
+        }
+    }
+}
+
+/// Extract a PTS value from a PUSI-marked TS packet that begins a PES
+/// payload. Returns `None` when the payload is not a PES, the
+/// PTS_DTS_flags don't indicate PTS present, or the packet is too short
+/// to carry the 5-byte PTS field.
+fn extract_pes_pts(pkt: &[u8]) -> Option<u64> {
+    // Adaptation field length, computed inline rather than pulling in
+    // another helper. Bits 4-5 of byte 3 of the TS packet are the
+    // adaptation_field_control: 0b01 = payload only, 0b10 = af only,
+    // 0b11 = af + payload, 0b00 = reserved.
+    let afc = (pkt[3] >> 4) & 0x03;
+    let payload_offset: usize = match afc {
+        0b01 => 4,
+        0b11 => {
+            let af_len = pkt.get(4).copied()? as usize;
+            5 + af_len
+        }
+        _ => return None,
+    };
+    if pkt.len() < payload_offset + 14 {
+        return None;
+    }
+    let payload = &pkt[payload_offset..];
+    // PES start code = 0x000001
+    if payload[0] != 0x00 || payload[1] != 0x00 || payload[2] != 0x01 {
+        return None;
+    }
+    let pts_dts_flags = (payload[7] >> 6) & 0x03;
+    // 0b10 = PTS only, 0b11 = PTS + DTS. Both have PTS at bytes 9-13.
+    if pts_dts_flags != 0b10 && pts_dts_flags != 0b11 {
+        return None;
+    }
+    let p = &payload[9..14];
+    let pts: u64 = (((p[0] >> 1) & 0x07) as u64) << 30
+        | (p[1] as u64) << 22
+        | (((p[2] >> 1) & 0x7F) as u64) << 15
+        | (p[3] as u64) << 7
+        | ((p[4] >> 1) as u64);
+    Some(pts)
 }
 
 /// Get the section start offset within a TS packet containing a PSI section
@@ -523,6 +679,84 @@ fn check_pat_pmt_timeouts(stats: &Tr101290Accumulator) {
                 stats.window_pid_errors.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
+        }
+    }
+
+    // ── P2-extended timeouts ──
+    // PCR repetition (§5.2.2): a PCR-bearing PID must emit a PCR within
+    // 100 ms of the previous one. Splitting from `pcr_discontinuity_errors`
+    // so the manager UI can distinguish "PCR stalled" from "PCR jumped".
+    for (_, last_pcr_wall) in &state.pcr_repetition_tracker {
+        if now.duration_since(*last_pcr_wall) > PCR_REPETITION_TIMEOUT {
+            stats.pcr_repetition_errors.fetch_add(1, Ordering::Relaxed);
+            stats
+                .window_pcr_repetition_errors
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // PTS error (§5.2.1): every PES PID that has produced a PTS once
+    // must keep producing one within 700 ms.
+    for (_, (_pts, last_seen)) in &state.pts_tracker {
+        if now.duration_since(*last_seen) > PTS_TIMEOUT {
+            stats.pts_errors.fetch_add(1, Ordering::Relaxed);
+            stats.window_pts_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // CAT error (§5.2.4): once observed, must repeat within 500 ms.
+    if state.cat_seen {
+        if let Some(last) = state.last_cat_time {
+            if now.duration_since(last) > CAT_TIMEOUT {
+                stats.cat_errors.fetch_add(1, Ordering::Relaxed);
+                stats.window_cat_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    // ── P3 timeouts (only count once observed, mirror `pat_seen`) ──
+    if state.sdt_seen {
+        if let Some(last) = state.last_sdt_time {
+            if now.duration_since(last) > SDT_TIMEOUT {
+                stats.sdt_errors.fetch_add(1, Ordering::Relaxed);
+                stats.window_sdt_errors.fetch_add(1, Ordering::Relaxed);
+                stats.si_repetition_errors.fetch_add(1, Ordering::Relaxed);
+                stats
+                    .window_si_repetition_errors
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    if state.nit_seen {
+        if let Some(last) = state.last_nit_time {
+            if now.duration_since(last) > NIT_TIMEOUT {
+                stats.nit_errors.fetch_add(1, Ordering::Relaxed);
+                stats.window_nit_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    if state.eit_seen {
+        if let Some(last) = state.last_eit_time {
+            if now.duration_since(last) > EIT_TIMEOUT {
+                stats.eit_errors.fetch_add(1, Ordering::Relaxed);
+                stats.window_eit_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    if state.tdt_seen {
+        if let Some(last) = state.last_tdt_time {
+            if now.duration_since(last) > TDT_TIMEOUT {
+                stats.tdt_errors.fetch_add(1, Ordering::Relaxed);
+                stats.window_tdt_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    if state.rst_seen {
+        if let Some(last) = state.last_rst_time {
+            if now.duration_since(last) > RST_TIMEOUT {
+                stats.rst_errors.fetch_add(1, Ordering::Relaxed);
+                stats.window_rst_errors.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }

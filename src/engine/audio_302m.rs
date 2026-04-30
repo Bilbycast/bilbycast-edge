@@ -1001,6 +1001,8 @@ mod tests {
                 rtp_timestamp: ts,
                 recv_time_us: 0,
                 is_raw_ts: false,
+                upstream_seq: None,
+                upstream_leg_id: None,
             }
         }
 

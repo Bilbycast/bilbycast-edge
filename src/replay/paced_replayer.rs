@@ -125,6 +125,8 @@ pub async fn pump(
             rtp_timestamp,
             recv_time_us: now_micros(),
             is_raw_ts: true,
+            upstream_seq: None,
+            upstream_leg_id: None,
         };
         let _ = per_input_tx.send(pkt);
         flow_stats.input_bytes.fetch_add(bundle_len as u64, Ordering::Relaxed);

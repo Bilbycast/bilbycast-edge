@@ -282,6 +282,8 @@ fn publish_chunks(
         rtp_timestamp: pts_90khz as u32,
         recv_time_us: crate::util::time::now_us(),
         is_raw_ts: true,
+        upstream_seq: None,
+        upstream_leg_id: None,
     };
     *seq_num = seq_num.wrapping_add(1);
     stats.input_packets.fetch_add(1, Ordering::Relaxed);

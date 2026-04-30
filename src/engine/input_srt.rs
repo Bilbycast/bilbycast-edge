@@ -456,6 +456,8 @@ async fn srt_input_recv_loop(
                             rtp_timestamp: ts,
                             recv_time_us: now_us(),
                             is_raw_ts: is_raw,
+                            upstream_seq: None,
+                            upstream_leg_id: None,
                         };
 
                         publish_input_packet(transcoder, broadcast_tx, packet);
@@ -885,6 +887,8 @@ fn process_redundant_packet(
             rtp_timestamp: ts,
             recv_time_us: now_us(),
             is_raw_ts: is_raw,
+            upstream_seq: None,
+            upstream_leg_id: None,
         };
 
         publish_input_packet(transcoder, broadcast_tx, packet);
@@ -1199,6 +1203,8 @@ async fn srt_bonded_group_recv_loop(
                             rtp_timestamp: ts,
                             recv_time_us: now_us(),
                             is_raw_ts: is_raw,
+                            upstream_seq: None,
+                            upstream_leg_id: None,
                         };
                         publish_input_packet(transcoder, broadcast_tx, packet);
                     }

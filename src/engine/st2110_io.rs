@@ -351,6 +351,8 @@ fn forward_audio_packet(
         rtp_timestamp: ts,
         recv_time_us: now_us(),
         is_raw_ts: false,
+        upstream_seq: None,
+        upstream_leg_id: None,
     };
 
     // Route through the optional PCM processor. When absent, passthrough.
@@ -367,6 +369,8 @@ fn forward_audio_packet(
                     rtp_timestamp: packet.rtp_timestamp,
                     recv_time_us: packet.recv_time_us,
                     is_raw_ts: shape_change,
+                    upstream_seq: None,
+                    upstream_leg_id: None,
                 };
                 let _ = tx.send(out_pkt);
             }
@@ -765,6 +769,8 @@ fn forward_anc_packet(
         rtp_timestamp: ts,
         recv_time_us: now_us(),
         is_raw_ts: false,
+        upstream_seq: None,
+        upstream_leg_id: None,
     };
     let _ = tx.send(packet);
 }

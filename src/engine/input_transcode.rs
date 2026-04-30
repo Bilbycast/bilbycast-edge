@@ -369,6 +369,8 @@ pub fn publish_input_packet(
         recv_time_us: packet.recv_time_us,
         // After the input transcode stage the flow always carries raw TS.
         is_raw_ts: true,
+        upstream_seq: None,
+        upstream_leg_id: None,
     };
     broadcast_tx.send(new_packet).is_ok()
 }

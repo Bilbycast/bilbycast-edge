@@ -81,6 +81,17 @@ pub struct EsPacket {
     /// — lets downstream PCR-accuracy monitors measure jitter.
     #[allow(dead_code)]
     pub recv_time_us: u64,
+    /// Upstream RTP / SRT sequence number when known. `None` for inputs
+    /// that don't carry a wire-level seq (raw TS over UDP, RIST raw TS).
+    /// Stamped by `input_rtp` / `input_srt` so the pre-bus 2022-7
+    /// seq-aware Hitless merger can dedup + gap-fill against the same
+    /// algorithm used at the transport layer in `redundancy/merger.rs`.
+    pub upstream_seq: Option<u16>,
+    /// Identifies which leg of a 2022-7 dual-leg group produced this
+    /// packet (0 = primary, 1 = backup). `None` for single-leg inputs
+    /// or non-2022-7 sources. Used by the seq-aware merger to attribute
+    /// failover events.
+    pub upstream_leg_id: Option<u8>,
 }
 
 /// Per-flow elementary-stream bus. Read-shared across every consumer
@@ -223,6 +234,8 @@ impl TsEsDemuxer {
                 has_pcr: pcr.is_some(),
                 pcr,
                 recv_time_us: pkt.recv_time_us,
+                upstream_seq: pkt.upstream_seq,
+                upstream_leg_id: pkt.upstream_leg_id,
             };
             let tx = self.bus.sender_for(&self.input_id, pid);
             // `send` returns `Err` only when there are no active
@@ -384,6 +397,8 @@ mod tests {
             sequence_number: 0,
             rtp_timestamp: 0,
             recv_time_us: 12345,
+            upstream_seq: None,
+            upstream_leg_id: None,
             is_raw_ts: true,
         }
     }
@@ -501,6 +516,8 @@ mod tests {
             sequence_number: 1,
             rtp_timestamp: 1,
             recv_time_us: 1,
+            upstream_seq: None,
+            upstream_leg_id: None,
             is_raw_ts: false,
         };
         demux.process(&pkt);
@@ -524,6 +541,8 @@ mod tests {
             has_pcr: false,
             pcr: None,
             recv_time_us: 0,
+            upstream_seq: None,
+            upstream_leg_id: None,
         };
         tx.send(dummy.clone()).unwrap();
         let got = rx.try_recv().unwrap();

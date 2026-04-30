@@ -167,6 +167,8 @@ impl FecDecoder {
             rtp_timestamp: ts,
             recv_time_us: now_us(),
             is_raw_ts: false,
+            upstream_seq: None,
+            upstream_leg_id: None,
         });
 
         self.attempt_recovery(&mut result);
@@ -397,6 +399,8 @@ impl FecDecoder {
             rtp_timestamp: self.last_rtp_timestamp,
             recv_time_us: now_us(),
             is_raw_ts: false,
+            upstream_seq: None,
+            upstream_leg_id: None,
         }
     }
 

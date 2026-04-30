@@ -51,6 +51,14 @@ pub struct AppConfig {
     /// when thresholds are exceeded. See [`ResourceLimitConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<ResourceLimitConfig>,
+    /// Optional structured-JSON log shipper for SIEM / NMS / observability
+    /// pickup (Splunk, Skyline DataMiner, generic JSON-line ingesters). When
+    /// configured, every operational event the edge emits is also written as
+    /// a single JSON line to the chosen sink (file / syslog / stdout) in
+    /// addition to the existing Prometheus metrics and manager WS push.
+    /// See [`LoggingConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logging: Option<LoggingConfig>,
     /// Optional IP tunnels (relay or direct QUIC tunnels between edge nodes)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tunnels: Vec<crate::tunnel::TunnelConfig>,
@@ -84,6 +92,7 @@ impl Default for AppConfig {
             inputs: Vec::new(),
             outputs: Vec::new(),
             resource_limits: None,
+            logging: None,
             flows: Vec::new(),
             tunnels: Vec::new(),
             flow_groups: Vec::new(),
@@ -250,6 +259,82 @@ pub struct MonitorConfig {
     pub listen_addr: String,
     /// Dashboard listen port, e.g. 9090
     pub listen_port: u16,
+}
+
+/// Structured-JSON log shipper configuration.
+///
+/// When `json_target` is set, every operational `Event` the edge emits (the
+/// same stream that flows over the manager WS `event` channel) is also
+/// written as a single-line JSON record to the configured sink. This lets
+/// Splunk / Skyline DataMiner / Loki / generic syslog stacks pick up the
+/// edge's events without polling the manager.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LoggingConfig {
+    /// JSON event sink. `None` disables the shipper (default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_target: Option<JsonLogTarget>,
+}
+
+/// JSON log sink — exactly one of `file`, `syslog`, or `stdout`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum JsonLogTarget {
+    /// Write JSON lines to stdout. Useful in container environments where
+    /// the runtime captures stdout and forwards it to the log aggregator.
+    Stdout {
+        #[serde(default)]
+        format: LogFormat,
+    },
+    /// Append JSON lines to a file with simple size-based rotation.
+    /// Filename rotation: `<path>.1` is the most recent backup, `<path>.2`
+    /// is older, etc. The oldest backup beyond `max_backups` is dropped.
+    File {
+        /// Absolute path to the active log file. Parent directory must exist.
+        path: String,
+        #[serde(default)]
+        format: LogFormat,
+        /// Rotate when the active file exceeds this size in megabytes.
+        /// Default: 64. Range: 1..=4096.
+        #[serde(default = "default_max_size_mb")]
+        max_size_mb: u32,
+        /// Maximum number of rotated backup files to retain. Default: 5.
+        /// Range: 0..=100. Set to 0 to truncate on rotate (no backups).
+        #[serde(default = "default_max_backups")]
+        max_backups: u32,
+    },
+    /// UDP syslog (RFC 5424) target. The shipper is fire-and-forget — a
+    /// black-holed endpoint never blocks the edge.
+    Syslog {
+        /// Syslog destination, e.g. `127.0.0.1:514` or `siem.internal:6514`.
+        addr: String,
+        #[serde(default)]
+        format: LogFormat,
+    },
+}
+
+/// JSON envelope shape. Different SIEMs prefer slightly different field
+/// names; the shipper renders the same event with the chosen layout.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    /// Generic single-line JSON envelope (default).
+    #[default]
+    Raw,
+    /// Splunk HEC-friendly: wraps the envelope inside a top-level
+    /// `{"event": ...}` object so a Splunk HTTP Event Collector forwarder
+    /// can ingest the same line.
+    Splunk,
+    /// Skyline DataMiner-friendly field renames (`error_code` →
+    /// `parameter_id`).
+    Dataminer,
+}
+
+fn default_max_size_mb() -> u32 {
+    64
+}
+
+fn default_max_backups() -> u32 {
+    5
 }
 
 /// AMWA IS-04 registration-client configuration.
@@ -662,7 +747,56 @@ pub enum SlotSource {
     Hitless {
         primary: Box<SlotSource>,
         backup: Box<SlotSource>,
+        /// Failover algorithm. Defaults to `PrimaryPreference` so
+        /// existing configs keep their stall-timer-based failover. Set
+        /// to `SeqAware` for true SMPTE 2022-7 hitless: the merger
+        /// dedups + gap-fills against the upstream RTP / SRT sequence
+        /// number on each leg, switching legs sub-frame instead of
+        /// after a 200 ms stall.
+        #[serde(default, skip_serializing_if = "HitlessMode::is_default")]
+        mode: HitlessMode,
+        /// Override for the stall timer (`PrimaryPreference` mode
+        /// only — `SeqAware` ignores this). Range: 20..=5000 ms.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stall_ms: Option<u64>,
+        /// Reorder window for the seq-aware merger (`SeqAware` mode
+        /// only). Multiple of 64 in 64..=4096; default 1024 (≈ 0.4 s
+        /// at 2400 packets/s).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reorder_window: Option<u16>,
+        /// Path-differential / skew-accommodation buffer in milliseconds
+        /// (`SeqAware` mode only). When set, the merger holds every
+        /// packet for this many ms after first arrival before releasing
+        /// it in seq order — gives the slower leg the full window to
+        /// deliver and lets a single-leg loss within the window be
+        /// hitlessly filled. Range: 5..=2000 ms. Default: 50 ms.
+        /// `None` falls back to a dedup-only path (lower latency, no
+        /// asymmetric-path protection).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path_differential_ms: Option<u32>,
     },
+}
+
+/// Hitless failover algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HitlessMode {
+    /// Primary-preference with a stall timer. Forwards primary verbatim
+    /// and flips to backup if no primary packet arrives within
+    /// `stall_ms`. Backwards-compatible default.
+    #[default]
+    PrimaryPreference,
+    /// True SMPTE 2022-7 seq-aware hitless. Both legs are observed
+    /// continuously; the merger dedups + gap-fills against the
+    /// upstream wire-level sequence number. Requires both legs'
+    /// inputs to carry an `upstream_seq` (RTP / SRT — not raw TS).
+    SeqAware,
+}
+
+impl HitlessMode {
+    pub fn is_default(&self) -> bool {
+        matches!(self, HitlessMode::PrimaryPreference)
+    }
 }
 
 /// Broad kind of essence on the bus.
@@ -2304,6 +2438,16 @@ pub struct RtpRedundancyConfig {
     /// `RtpInputConfig::source_addr`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_addr: Option<String>,
+    /// Path-differential / skew-accommodation buffer in milliseconds.
+    /// `None` keeps the legacy stateless dedup-only path (lower
+    /// latency but no protection against asymmetric path delay). When
+    /// set, the merger holds every packet for this many ms after first
+    /// arrival before releasing it in seq order — the slower leg has
+    /// the full window to deliver, and a single-leg loss within the
+    /// window is filled hitlessly. Range: 5..=2000 ms. Industry
+    /// typical: 30–80 ms terrestrial WAN, 200–500 ms satellite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_differential_ms: Option<u32>,
 }
 
 /// SMPTE 2022-7 redundancy config for an RTP output (leg 2).
@@ -3986,6 +4130,7 @@ mod tests {
             monitor: None,
             manager: None,
             resource_limits: None,
+            logging: None,
             tunnels: Vec::new(),
             flow_groups: Vec::new(),
             nmos_registration: None,

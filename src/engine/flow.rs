@@ -998,12 +998,14 @@ impl FlowRuntime {
         // assembler picks up the synthetic bus key as soon as its
         // `ReplacePlan` lands.
         for hl in &build.pending_hitless {
-            let _ = crate::engine::ts_es_hitless::spawn_hitless_es_merger(
+            let _ = crate::engine::ts_es_hitless::spawn_hitless_es_merger_full(
                 hl.uid.clone(),
                 hl.primary.clone(),
                 hl.backup.clone(),
                 bus.clone(),
                 std::time::Duration::from_millis(hl.stall_ms),
+                hl.seq_aware,
+                hl.path_differential_ms,
                 self.cancel_token.child_token(),
             );
         }
@@ -2252,6 +2254,8 @@ fn null_ts_packet() -> RtpPacket {
         rtp_timestamp: 0,
         recv_time_us: 0,
         is_raw_ts: true,
+        upstream_seq: None,
+        upstream_leg_id: None,
     }
 }
 
@@ -2301,6 +2305,8 @@ async fn ts_fixer_task(
                                 rtp_timestamp: pkt.rtp_timestamp,
                                 recv_time_us: pkt.recv_time_us,
                                 is_raw_ts: pkt.is_raw_ts,
+                                upstream_seq: None,
+                                upstream_leg_id: None,
                             });
                         }
                         ProcessResult::Unchanged => {
@@ -2579,12 +2585,14 @@ async fn finalize_spts_assembler(
         );
     }
     for hl in &build.pending_hitless {
-        let _ = crate::engine::ts_es_hitless::spawn_hitless_es_merger(
+        let _ = crate::engine::ts_es_hitless::spawn_hitless_es_merger_full(
             hl.uid.clone(),
             hl.primary.clone(),
             hl.backup.clone(),
             bus.clone(),
             std::time::Duration::from_millis(hl.stall_ms),
+            hl.seq_aware,
+            hl.path_differential_ms,
             cancel_token.child_token(),
         );
     }
@@ -2861,7 +2869,14 @@ fn build_assembly_plan(
                     });
                     (input_id.clone(), 0_u16) // sentinel, patched after resolution
                 }
-                SlotSource::Hitless { primary, backup } => {
+                SlotSource::Hitless {
+                    primary,
+                    backup,
+                    mode,
+                    stall_ms,
+                    reorder_window,
+                    path_differential_ms,
+                } => {
                     let slot_idx = slots.len();
                     let uid = format!("slot_{}_{}", program_idx, slot_idx);
                     // Resolve primary + backup. For first-light both
@@ -2916,11 +2931,20 @@ fn build_assembly_plan(
                             bail!(msg);
                         }
                     };
+                    let seq_aware = matches!(
+                        mode,
+                        crate::config::models::HitlessMode::SeqAware
+                    );
                     pending_hitless.push(crate::engine::ts_assembler::PendingHitlessSlot {
                         uid: uid.clone(),
                         primary: primary_pair,
                         backup: backup_pair,
-                        stall_ms: crate::engine::ts_es_hitless::DEFAULT_STALL_MS,
+                        stall_ms: stall_ms.unwrap_or(
+                            crate::engine::ts_es_hitless::DEFAULT_STALL_MS,
+                        ),
+                        seq_aware,
+                        reorder_window: reorder_window.unwrap_or(1024),
+                        path_differential_ms: *path_differential_ms,
                     });
                     // The assembler reads from the synthetic merger
                     // output. The pre-bus merger task is responsible

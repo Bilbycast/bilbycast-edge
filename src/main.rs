@@ -25,6 +25,7 @@ mod fec;
 mod manager;
 mod media;
 mod monitor;
+mod observability;
 #[cfg(feature = "replay")]
 mod replay;
 mod redundancy;
@@ -206,7 +207,32 @@ async fn main() -> anyhow::Result<()> {
 
     // Create shared state
     let (ws_stats_tx, _) = broadcast::channel::<String>(64);
-    let (event_sender, event_rx) = manager::event_channel();
+    let (mut event_sender, event_rx) = manager::event_channel();
+
+    // Optional structured-JSON log shipper. Installed once before any
+    // clone of the original sender is handed out — later clones inherit
+    // the same `Option<JsonLogShipper>` value.
+    if let Some(ref logging_cfg) = app_config.logging {
+        let edge_id = app_config
+            .node_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        match observability::JsonLogShipper::from_config(
+            logging_cfg,
+            edge_id,
+            env!("CARGO_PKG_VERSION"),
+        ) {
+            Ok(Some(shipper)) => {
+                tracing::info!("structured-JSON log shipper enabled");
+                event_sender.set_log_shipper(shipper);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("failed to start structured-JSON log shipper: {e:#}");
+            }
+        }
+    }
+
     let global_stats = Arc::new(StatsCollector::new());
 
     // System resource monitoring (CPU, RAM)

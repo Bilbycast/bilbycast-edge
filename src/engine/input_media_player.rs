@@ -505,6 +505,8 @@ pub(super) fn emit_bundle(
         rtp_timestamp: rtp_ts,
         recv_time_us: crate::util::time::now_us(),
         is_raw_ts: true,
+        upstream_seq: None,
+        upstream_leg_id: None,
     };
     *session.seq_num = session.seq_num.wrapping_add(1);
     session

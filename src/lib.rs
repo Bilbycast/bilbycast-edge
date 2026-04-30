@@ -32,6 +32,9 @@ pub mod manager;
 /// Owns the on-disk directory, list / upload-chunk / delete primitives, and
 /// the WS command handlers the manager forwards into.
 pub mod media;
+/// Edge-side observability outputs (structured-JSON log shipper for SIEM /
+/// NMS pickup) that complement the manager WS event stream and Prometheus.
+pub mod observability;
 /// Replay store: continuous flow recording to rolling MPEG-TS segments
 /// with a side-car timecode → byte-offset index, plus playback reader.
 /// Lives behind the `replay` Cargo feature.

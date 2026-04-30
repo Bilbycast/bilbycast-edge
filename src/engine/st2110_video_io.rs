@@ -501,6 +501,8 @@ fn encode_worker(
                     rtp_timestamp: ef.pts as u32,
                     recv_time_us: crate::util::time::now_us(),
                     is_raw_ts: true,
+                    upstream_seq: None,
+                    upstream_leg_id: None,
                 };
                 stats.input_packets.fetch_add(1, Ordering::Relaxed);
                 stats.input_bytes.fetch_add(ts_len, Ordering::Relaxed);

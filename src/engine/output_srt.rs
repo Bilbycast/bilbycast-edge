@@ -926,6 +926,8 @@ async fn srt_output_forward_loop(
                                 rtp_timestamp: packet.rtp_timestamp,
                                 recv_time_us: packet.recv_time_us,
                                 is_raw_ts: packet.is_raw_ts || need_strip,
+                                upstream_seq: None,
+                                upstream_leg_id: None,
                             };
                             match remapper.process_packet(&temp, &mut remap_scratch) {
                                 Some(b) => b,
@@ -944,6 +946,8 @@ async fn srt_output_forward_loop(
                                 rtp_timestamp: packet.rtp_timestamp,
                                 recv_time_us: packet.recv_time_us,
                                 is_raw_ts: packet.is_raw_ts,
+                                upstream_seq: None,
+                                upstream_leg_id: None,
                             });
                         } else {
                             payloads_to_send.push((payload, packet.recv_time_us));
@@ -1312,6 +1316,8 @@ async fn srt_output_redundant_loop(
                                     rtp_timestamp: packet.rtp_timestamp,
                                     recv_time_us: packet.recv_time_us,
                                     is_raw_ts: packet.is_raw_ts,
+                                    upstream_seq: None,
+                                    upstream_leg_id: None,
                                 };
                                 match remapper.process_packet(&temp, &mut remap_scratch) {
                                     Some(b) => b,
@@ -1328,6 +1334,8 @@ async fn srt_output_redundant_loop(
                                     rtp_timestamp: packet.rtp_timestamp,
                                     recv_time_us: packet.recv_time_us,
                                     is_raw_ts: packet.is_raw_ts,
+                                    upstream_seq: None,
+                                    upstream_leg_id: None,
                                 });
                             } else {
                                 payloads_to_send.push((payload, recv_time_us));

@@ -380,6 +380,8 @@ async fn rtp_output_loop(
                                     rtp_timestamp: packet.rtp_timestamp,
                                     recv_time_us: packet.recv_time_us,
                                     is_raw_ts: packet.is_raw_ts,
+                                    upstream_seq: None,
+                                    upstream_leg_id: None,
                                 },
                                 None => continue,
                             }
@@ -395,6 +397,8 @@ async fn rtp_output_loop(
                                     rtp_timestamp: packet.rtp_timestamp,
                                     recv_time_us: packet.recv_time_us,
                                     is_raw_ts: packet.is_raw_ts,
+                                    upstream_seq: None,
+                                    upstream_leg_id: None,
                                 },
                                 None => continue,
                             }
@@ -765,6 +769,8 @@ async fn rtp_output_redundant_loop(
                                     rtp_timestamp: packet.rtp_timestamp,
                                     recv_time_us: packet.recv_time_us,
                                     is_raw_ts: packet.is_raw_ts,
+                                    upstream_seq: None,
+                                    upstream_leg_id: None,
                                 },
                                 None => continue,
                             }
@@ -780,6 +786,8 @@ async fn rtp_output_redundant_loop(
                                     rtp_timestamp: packet.rtp_timestamp,
                                     recv_time_us: packet.recv_time_us,
                                     is_raw_ts: packet.is_raw_ts,
+                                    upstream_seq: None,
+                                    upstream_leg_id: None,
                                 },
                                 None => continue,
                             }

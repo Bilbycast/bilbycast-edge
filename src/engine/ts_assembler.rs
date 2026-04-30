@@ -680,6 +680,8 @@ fn flush(
         rtp_timestamp: rtp_ts,
         recv_time_us,
         is_raw_ts: true,
+        upstream_seq: None,
+        upstream_leg_id: None,
     };
     // `send` returns Err when there are no subscribers (e.g. flow still
     // warming). That's fine — we don't buffer, by design.
@@ -846,8 +848,21 @@ pub struct PendingHitlessSlot {
     /// Stall window in milliseconds before the merger flips primary →
     /// backup. Defaults to
     /// [`crate::engine::ts_es_hitless::DEFAULT_STALL_MS`] when the
-    /// operator hasn't set it.
+    /// operator hasn't set it. Ignored when `seq_aware` is `true`.
     pub stall_ms: u64,
+    /// When `true`, the merger uses true SMPTE 2022-7 seq-aware
+    /// dedup + gap-fill (driven by `EsPacket.upstream_seq`) instead of
+    /// stall-timer-based primary preference.
+    pub seq_aware: bool,
+    /// Reorder window for the seq-aware merger (multiple of 64 in
+    /// 64..=4096). Ignored when `seq_aware` is `false`.
+    pub reorder_window: u16,
+    /// Path-differential / skew-accommodation buffer in milliseconds.
+    /// `Some(ms)` enables the buffered SMPTE 2022-7 merger (industry
+    /// standard — emits at constant `ms` latency, hitlessly fills loss
+    /// within the window). `None` falls back to the stateless dedup-
+    /// only path.
+    pub path_differential_ms: Option<u32>,
 }
 
 /// Output of `build_spts_plan` (defined on the runtime side): the
@@ -1196,6 +1211,8 @@ mod tests {
                     has_pcr: false,
                     pcr: None,
                     recv_time_us: 0,
+                    upstream_seq: None,
+                    upstream_leg_id: None,
                 })
                 .unwrap();
         }
@@ -1209,6 +1226,8 @@ mod tests {
                     has_pcr: false,
                     pcr: None,
                     recv_time_us: 0,
+                    upstream_seq: None,
+                    upstream_leg_id: None,
                 })
                 .unwrap();
         }
@@ -1388,6 +1407,8 @@ mod tests {
                 has_pcr: false,
                 pcr: None,
                 recv_time_us: 0,
+                upstream_seq: None,
+                upstream_leg_id: None,
             })
             .unwrap();
 

@@ -588,6 +588,12 @@ pub struct InputStats {
     pub srt_bonding_stats: Option<SrtBondingStats>,
     /// Number of times the active input leg switched between leg 1 and leg 2.
     pub redundancy_switches: u64,
+    /// True SMPTE 2022-7 buffered-merger stats. Present only when the
+    /// input was started with `path_differential_ms` set on the
+    /// redundancy config (industry-standard buffered mode). Absent on
+    /// the legacy stateless dedup path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffered_hitless: Option<BufferedHitlessSnapshot>,
     /// Per-input PCM transcode stage statistics. Present only when the input
     /// runs an `engine::audio_transcode::TranscodeStage` (i.e. the input config
     /// has a `transcode` block). Absent on passthrough inputs.
@@ -1018,6 +1024,62 @@ pub struct Tr101290Stats {
     pub priority1_ok: bool,
     /// `true` when all Priority 2 error counters are zero.
     pub priority2_ok: bool,
+    /// `true` when all Priority 3 error counters (P2-extended + P3) are
+    /// zero. `None` on edges that don't ship the `tr101290_full`
+    /// capability so the manager UI can fall back to today's rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority3_ok: Option<bool>,
+
+    // ── Priority 2 extended (PTS / CAT / PCR repetition split) ──
+    /// PES PIDs that stopped emitting PTS within 700 ms (TR 101 290 §5.2.1).
+    #[serde(default)]
+    pub pts_errors: u64,
+    /// CAT (PID 0x0001) referenced or observed, then absent for > 500 ms.
+    #[serde(default)]
+    pub cat_errors: u64,
+    /// PCR repetition: a PCR-bearing PID stopped emitting PCR within
+    /// 100 ms (split from the legacy `pcr_discontinuity_errors`, which
+    /// now strictly counts unrecoverable PCR jumps).
+    #[serde(default)]
+    pub pcr_repetition_errors: u64,
+
+    // ── Priority 3 (application-specific) ──
+    #[serde(default)]
+    pub nit_errors: u64,
+    #[serde(default)]
+    pub si_repetition_errors: u64,
+    #[serde(default)]
+    pub unreferenced_pid_errors: u64,
+    #[serde(default)]
+    pub sdt_errors: u64,
+    #[serde(default)]
+    pub eit_errors: u64,
+    #[serde(default)]
+    pub rst_errors: u64,
+    #[serde(default)]
+    pub tdt_errors: u64,
+
+    // ── Windowed P2-extended / P3 ──
+    #[serde(default)]
+    pub window_pts_errors: u64,
+    #[serde(default)]
+    pub window_cat_errors: u64,
+    #[serde(default)]
+    pub window_pcr_repetition_errors: u64,
+    #[serde(default)]
+    pub window_nit_errors: u64,
+    #[serde(default)]
+    pub window_si_repetition_errors: u64,
+    #[serde(default)]
+    pub window_unreferenced_pid_errors: u64,
+    #[serde(default)]
+    pub window_sdt_errors: u64,
+    #[serde(default)]
+    pub window_eit_errors: u64,
+    #[serde(default)]
+    pub window_rst_errors: u64,
+    #[serde(default)]
+    pub window_tdt_errors: u64,
 
     // ── VSF TR-07 (JPEG XS over MPEG-2 TS per SMPTE ST 2022-2) ──
 
@@ -1390,6 +1452,62 @@ pub struct FecInfo {
     pub columns: u8,
     /// Row count (D parameter).
     pub rows: u8,
+}
+
+/// True SMPTE 2022-7 buffered-merger snapshot. Surfaces the
+/// path-differential measurement, per-leg health, and the loss
+/// breakdown the manager UI uses to render asymmetric-path metrics.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct BufferedHitlessSnapshot {
+    /// Configured skew-accommodation buffer in ms (the constant
+    /// emission latency).
+    pub max_path_diff_ms: u32,
+    /// Currently-observed path differential between the two legs in
+    /// microseconds (last sample). Useful as a live debug widget.
+    pub current_path_diff_us: u64,
+    /// Largest path differential observed since flow start. Operators
+    /// use this to size `path_differential_ms` — set it ≥ this value
+    /// with headroom.
+    pub max_observed_path_diff_us: u64,
+    /// Total packets emitted by the merger.
+    pub packets_emitted: u64,
+    /// Packets where both legs delivered (the canonical 2022-7
+    /// happy path — every emitted packet had hitless coverage).
+    pub packets_via_both_legs: u64,
+    /// Packets emitted where only leg 1 delivered. Loss on leg 2.
+    pub packets_via_leg1_only: u64,
+    /// Packets emitted where only leg 2 delivered. Loss on leg 1.
+    pub packets_via_leg2_only: u64,
+    /// Duplicate packets the merger correctly dropped.
+    pub dups_dropped: u64,
+    /// Sequence-number gaps where neither leg ever delivered.
+    pub gap_lost: u64,
+    /// Packets that arrived after their hold window had expired (the
+    /// path differential was misconfigured or the leg latency
+    /// momentarily spiked beyond `max_path_diff`).
+    pub late_dropped: u64,
+    /// Packets dropped because the buffer reached its overflow cap.
+    /// Sustained non-zero values indicate a misconfigured
+    /// `path_differential_ms` (set too high).
+    pub buffer_overflow_dropped: u64,
+    /// Number of times the merger reset its bitmap on a cross-window
+    /// forward jump (publisher restart / new ISN).
+    pub stream_resets: u64,
+    /// Failovers between legs at emission time.
+    pub failovers: u64,
+    /// Live buffer depth (packets in flight).
+    pub current_buffer_depth: u64,
+    /// SSRC mismatch counter — increments when the two legs report
+    /// different RTP SSRCs (a misconfiguration; 2022-7 mandates
+    /// byte-identical streams including SSRC).
+    pub ssrc_mismatch: u64,
+    /// Per-leg packet receive counts.
+    pub leg1_packets_received: u64,
+    pub leg2_packets_received: u64,
+    /// Per-leg health flag.
+    /// 0 = unknown, 1 = up, 2 = degraded, 3 = down.
+    pub leg1_health: u8,
+    pub leg2_health: u8,
 }
 
 /// Redundancy configuration information.
