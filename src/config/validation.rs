@@ -572,6 +572,9 @@ fn validate_input(input: &InputConfig) -> Result<()> {
     match input {
         InputConfig::Rtp(rtp) => {
             validate_socket_addr(&rtp.bind_addr, "RTP input bind_addr")?;
+            if let Some(ref ext) = rtp.external_address {
+                validate_socket_addr(ext, "RTP input external_address")?;
+            }
             if let Some(ref iface) = rtp.interface_addr {
                 validate_ip_addr(iface, "RTP input interface_addr")?;
             }
@@ -637,6 +640,9 @@ fn validate_input(input: &InputConfig) -> Result<()> {
         }
         InputConfig::Udp(udp) => {
             validate_socket_addr(&udp.bind_addr, "UDP input bind_addr")?;
+            if let Some(ref ext) = udp.external_address {
+                validate_socket_addr(ext, "UDP input external_address")?;
+            }
             if let Some(ref iface) = udp.interface_addr {
                 validate_ip_addr(iface, "UDP input interface_addr")?;
                 // Validate address family consistency
@@ -671,6 +677,15 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                         validate_socket_addr(addr, "SRT input local_addr")?;
                     }
                 }
+            }
+            if let Some(ref ext) = srt.external_address {
+                if !matches!(srt.mode, SrtMode::Listener) {
+                    bail!(
+                        "SRT input: external_address is only meaningful in listener mode, got {:?}",
+                        srt.mode
+                    );
+                }
+                validate_socket_addr(ext, "SRT input external_address")?;
             }
             validate_srt_common(
                 &srt.mode, &srt.remote_addr,
@@ -720,6 +735,9 @@ fn validate_input(input: &InputConfig) -> Result<()> {
         }
         InputConfig::Rtmp(rtmp) => {
             validate_socket_addr(&rtmp.listen_addr, "RTMP input listen_addr")?;
+            if let Some(ref ext) = rtmp.external_address {
+                validate_socket_addr(ext, "RTMP input external_address")?;
+            }
             if rtmp.app.is_empty() {
                 bail!("RTMP input app name must not be empty");
             }
@@ -3015,6 +3033,15 @@ pub fn validate_output_with_input(
                     }
                 }
             }
+            if let Some(ref ext) = srt.external_address {
+                if !matches!(srt.mode, SrtMode::Listener) {
+                    bail!(
+                        "SRT output '{}': external_address is only meaningful in listener mode, got {:?}",
+                        srt.id, srt.mode
+                    );
+                }
+                validate_socket_addr(ext, &format!("SRT output '{}' external_address", srt.id))?;
+            }
             validate_srt_common(
                 &srt.mode, &srt.remote_addr,
                 srt.passphrase.as_deref(), srt.aes_key_len, srt.crypto_mode.as_deref(),
@@ -3846,6 +3873,9 @@ fn validate_rist_common_knobs(
 
 fn validate_rist_input(rist: &RistInputConfig) -> Result<()> {
     validate_rist_addr(&rist.bind_addr, "RIST input bind_addr")?;
+    if let Some(ref ext) = rist.external_address {
+        validate_rist_addr(ext, "RIST input external_address")?;
+    }
     validate_rist_common_knobs(
         rist.buffer_ms,
         rist.max_nack_retries,
@@ -3855,6 +3885,9 @@ fn validate_rist_input(rist: &RistInputConfig) -> Result<()> {
     )?;
     if let Some(ref red) = rist.redundancy {
         validate_rist_addr(&red.bind_addr, "RIST input redundancy bind_addr")?;
+        if let Some(ref ext) = red.external_address {
+            validate_rist_addr(ext, "RIST input redundancy external_address")?;
+        }
         if red.bind_addr == rist.bind_addr {
             bail!("RIST input redundancy: leg 2 bind_addr must differ from leg 1");
         }
@@ -4879,6 +4912,7 @@ mod tests {
             name: "Input 1".to_string(),
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: input_bind.to_string(),
+                external_address: None,
                 interface_addr: None,
                 source_addr: None,
                 fec_decode: None,
@@ -4968,6 +5002,7 @@ mod tests {
     fn test_invalid_bind_addr() {
         let config = make_config_input_only(InputConfig::Rtp(RtpInputConfig {
             bind_addr: "not-an-address".to_string(),
+            external_address: None,
             interface_addr: None,
             source_addr: None,
             fec_decode: None,
@@ -4988,6 +5023,7 @@ mod tests {
         let config = make_config_input_only(InputConfig::Srt(SrtInputConfig {
             mode: SrtMode::Caller,
             local_addr: Some("0.0.0.0:9000".to_string()),
+            external_address: None,
             remote_addr: None,
             latency_ms: 120,
             peer_idle_timeout_secs: 30,
@@ -5023,6 +5059,7 @@ mod tests {
         let config = make_config_input_only(InputConfig::Srt(SrtInputConfig {
             mode: SrtMode::Rendezvous,
             local_addr: Some("127.0.0.1:9000".to_string()),
+            external_address: None,
             remote_addr: Some("127.0.0.1:9001".to_string()),
             latency_ms: 300,
             peer_idle_timeout_secs: 30,
@@ -5065,6 +5102,7 @@ mod tests {
             name: "Input 1".to_string(),
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
+                external_address: None,
                 interface_addr: None,
                 source_addr: None,
                 fec_decode: None,
@@ -5085,6 +5123,7 @@ mod tests {
             name: "Input 2".to_string(),
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5001".to_string(),
+                external_address: None,
                 interface_addr: None,
                 source_addr: None,
                 fec_decode: None,
@@ -5138,6 +5177,7 @@ mod tests {
         let config = make_config_input_only(InputConfig::Srt(SrtInputConfig {
             mode: SrtMode::Listener,
             local_addr: Some("0.0.0.0:9000".to_string()),
+            external_address: None,
             remote_addr: None,
             latency_ms: 120,
             peer_idle_timeout_secs: 30,
@@ -5183,6 +5223,7 @@ mod tests {
             name: "Input 1".to_string(),
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "239.1.1.1:5000".to_string(),
+                external_address: None,
                 interface_addr: Some("192.168.1.100".to_string()),
                 source_addr: None,
                 fec_decode: None,
@@ -5243,6 +5284,7 @@ mod tests {
             name: "Input 1".to_string(),
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "[ff7e::1]:5000".to_string(),
+                external_address: None,
                 interface_addr: Some("::1".to_string()),
                 source_addr: None,
                 fec_decode: None,
@@ -5299,6 +5341,7 @@ mod tests {
     fn test_rtp_input_mismatched_addr_family() {
         let config = make_config_input_only(InputConfig::Rtp(RtpInputConfig {
             bind_addr: "239.1.1.1:5000".to_string(),         // IPv4
+            external_address: None,
             interface_addr: Some("::1".to_string()),          // IPv6 - mismatch!
             source_addr: None,
             fec_decode: None,
@@ -5324,6 +5367,7 @@ mod tests {
             name: "Input 1".to_string(),
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "[::]:5000".to_string(),
+                external_address: None,
                 interface_addr: None,
                 source_addr: None,
                 fec_decode: None,
@@ -5384,6 +5428,7 @@ mod tests {
             name: "Input 1".to_string(),
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
+                external_address: None,
                 interface_addr: None,
                 source_addr: None,
                 fec_decode: None,
@@ -5444,6 +5489,7 @@ mod tests {
             name: "Input 1".to_string(),
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "0.0.0.0:5000".to_string(),
+                external_address: None,
                 interface_addr: None,
                 source_addr: None,
                 fec_decode: None,
@@ -6521,6 +6567,7 @@ mod tests {
             config: InputConfig::Srt(SrtInputConfig {
                 mode: SrtMode::Listener,
                 local_addr: Some("0.0.0.0:9000".to_string()),
+                external_address: None,
                 remote_addr: None,
                 latency_ms: 200,
                 recv_latency_ms: None,
@@ -6593,6 +6640,7 @@ mod tests {
             name: "Mcast 1".to_string(),
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "239.1.1.1:5000".to_string(),
+                external_address: None,
                 interface_addr: None,
                 source_addr: None,
                 fec_decode: None,
@@ -6613,6 +6661,7 @@ mod tests {
             name: "Mcast 2".to_string(),
             config: InputConfig::Rtp(RtpInputConfig {
                 bind_addr: "239.1.1.1:5000".to_string(),
+                external_address: None,
                 interface_addr: None,
                 source_addr: None,
                 fec_decode: None,

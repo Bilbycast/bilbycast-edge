@@ -560,6 +560,7 @@ mod tests {
         SrtInputConfig {
             mode: SrtMode::Listener,
             local_addr: Some("0.0.0.0:9000".to_string()),
+            external_address: None,
             remote_addr: None,
             latency_ms: 120,
             recv_latency_ms: None,
@@ -777,6 +778,7 @@ mod tests {
                 name: "RTP Input".to_string(),
                 config: InputConfig::Rtp(RtpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
+                    external_address: None,
                     interface_addr: None,
                     source_addr: None,
                     fec_decode: None,

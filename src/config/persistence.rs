@@ -245,6 +245,7 @@ mod tests {
                 name: "Input 1".to_string(),
                 config: InputConfig::Rtp(RtpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
+                    external_address: None,
                     interface_addr: None,
                     source_addr: None,
                     fec_decode: None,

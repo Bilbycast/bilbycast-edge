@@ -149,7 +149,7 @@ bonding-protocol = { path = "../bilbycast-bonding/bonding-protocol" }
 # QUIC transport for IP tunneling (relay and direct modes)
 quinn = "0.11.9"
 # rustls and rustls-pemfile are always needed (tunnel subsystem uses QUIC/TLS)
-rustls = { version = "0.23.39", features = ["ring"] }
+rustls = { version = "0.23.40", features = ["ring"] }
 # AEAD encryption for end-to-end tunnel encryption (ChaCha20-Poly1305)
 ring = "0.17.14"
 rustls-pemfile = "2.2.0"
@@ -261,7 +261,7 @@ default-features = false
 features = ["openssl"]
 
 [dependencies.reqwest]
-version = "0.13.2"
+version = "0.13.3"
 default-features = false
 # Used by:
 #  - WebRTC WHIP client signaling (feature-gated imports inside engine::webrtc)
@@ -288,7 +288,7 @@ tempfile = "3.27.0"
 # macOS / BSD because it links libnvidia-ml at runtime. Enable explicitly
 # on release builds for those targets; the rest stays cleanly opt-out.
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-nvml-wrapper = { version = "0.10", optional = true }
+nvml-wrapper = { version = "0.12", optional = true }
 
 # ---------------------------------------------------------------------------
 # BILBYCAST PATCH: vendored `is` 0.8.0 with the strict-PRIORITY check on ICE

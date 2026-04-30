@@ -1507,10 +1507,12 @@ async fn execute_command(
         "delete_flow" => {
             let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?;
             tracing::info!("Manager command: delete flow '{flow_id}'");
-            flow_manager
-                .destroy_flow(flow_id)
-                .await
-                .map_err(|e| e.to_string())?;
+            if flow_manager.is_running(flow_id) {
+                flow_manager
+                    .destroy_flow(flow_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
             // Remove from config
             let mut cfg = app_config.write().await;
             cfg.flows.retain(|f| f.id != flow_id);

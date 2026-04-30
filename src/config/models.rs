@@ -1105,6 +1105,13 @@ impl InputConfig {
 pub struct RtpInputConfig {
     /// Local address to bind, e.g. "0.0.0.0:5000" or "239.1.1.1:5000" for multicast
     pub bind_addr: String,
+    /// Optional public `host:port` reachable from outside this node's network
+    /// (e.g. a port-forward on the firewall in front of this edge). Hint to
+    /// the manager UI only — the edge itself binds `bind_addr` and ignores
+    /// this field semantically. The manager's topology link matcher treats
+    /// this as an alternate match candidate so cross-NAT lines draw correctly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_address: Option<String>,
     /// Network interface IP for multicast join (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interface_addr: Option<String>,
@@ -1166,6 +1173,10 @@ pub struct RtpInputConfig {
 pub struct UdpInputConfig {
     /// Local address to bind, e.g. "0.0.0.0:5000" or "239.1.1.1:5000" for multicast
     pub bind_addr: String,
+    /// Optional public `host:port` reachable from outside this node's network.
+    /// See [`RtpInputConfig::external_address`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_address: Option<String>,
     /// Network interface IP for multicast join (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interface_addr: Option<String>,
@@ -1191,6 +1202,14 @@ pub struct SrtInputConfig {
     /// Required for listener/rendezvous. Optional for caller (defaults to "0.0.0.0:0").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_addr: Option<String>,
+    /// Optional public `host:port` reachable from outside this node's network
+    /// (e.g. a port-forward on the firewall in front of this edge). Only
+    /// meaningful when `mode = listener`. Hint to the manager UI only — the
+    /// edge itself binds `local_addr` and ignores this field semantically.
+    /// The manager's topology link matcher treats this as an alternate match
+    /// candidate so cross-NAT lines draw correctly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_address: Option<String>,
     /// Remote address (required for caller and rendezvous modes)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_addr: Option<String>,
@@ -1344,6 +1363,10 @@ pub struct SrtInputConfig {
 pub struct RtmpInputConfig {
     /// RTMP listen address, e.g. "0.0.0.0:1935"
     pub listen_addr: String,
+    /// Optional public `host:port` reachable from outside this node's network.
+    /// See [`RtpInputConfig::external_address`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_address: Option<String>,
     /// RTMP application name. The publisher must use this in the URL path.
     /// e.g. "live" → publisher connects to `rtmp://host:port/live/stream_key`
     #[serde(default = "default_rtmp_app")]
@@ -1932,6 +1955,10 @@ pub struct SrtOutputConfig {
     /// Required for listener/rendezvous. Optional for caller (defaults to "0.0.0.0:0").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_addr: Option<String>,
+    /// Optional public `host:port` reachable from outside this node's network.
+    /// Only meaningful when `mode = listener`. See [`SrtInputConfig::external_address`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_address: Option<String>,
     /// Remote address (required for caller and rendezvous)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_addr: Option<String>,
@@ -2304,6 +2331,12 @@ pub struct RistInputConfig {
     /// Local bind address, e.g. "0.0.0.0:6000". The port **must be even** —
     /// RIST binds RTCP on port+1.
     pub bind_addr: String,
+    /// Optional public `host:port` reachable from outside this node's network.
+    /// See [`RtpInputConfig::external_address`]. Port must be even (RIST binds
+    /// RTCP on port+1) but this is the operator's responsibility — the edge
+    /// does not consume the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_address: Option<String>,
     /// Receiver jitter / retransmit buffer depth in milliseconds.
     /// Default 1000 ms, range 50–30000 ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2403,6 +2436,10 @@ pub struct RistOutputConfig {
 pub struct RistInputRedundancyConfig {
     /// Bind address for leg 2. Port must be even.
     pub bind_addr: String,
+    /// Optional public `host:port` reachable from outside this node's network
+    /// for leg 2. See [`RistInputConfig::external_address`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_address: Option<String>,
 }
 
 /// SMPTE 2022-7 redundancy config for a RIST output (leg 2).
@@ -3959,6 +3996,7 @@ mod tests {
                 name: "RTP Input".to_string(),
                 config: InputConfig::Rtp(RtpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
+                    external_address: None,
                     interface_addr: None,
                     source_addr: None,
                     fec_decode: None,
@@ -4027,6 +4065,7 @@ mod tests {
                 name: "Input 1".to_string(),
                 config: InputConfig::Udp(UdpInputConfig {
                     bind_addr: "0.0.0.0:5000".to_string(),
+                    external_address: None,
                     interface_addr: None,
                     source_addr: None,
                     audio_encode: None,
