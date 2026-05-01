@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::sync::Arc;
+
 use axum::Json;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -16,13 +18,25 @@ use crate::api::models::AllStatsResponse;
 use crate::api::server::AppState;
 use crate::api::stats::gather_all_stats;
 use crate::config::models::MonitorConfig;
+use crate::engine::hardware_probe::{LiveUtilizationState, StaticCapabilities};
 
 use super::dashboard::DASHBOARD_HTML;
 
-fn build_monitor_router(state: AppState) -> Router {
+/// Combined router state for the monitor dashboard. Wraps the main
+/// [`AppState`] plus the hardware-probe handles the `/api/health`
+/// handler needs to mirror the JSON the manager receives.
+#[derive(Clone)]
+pub struct MonitorState {
+    pub app: AppState,
+    pub static_caps: Arc<StaticCapabilities>,
+    pub live_gpu: Arc<LiveUtilizationState>,
+}
+
+fn build_monitor_router(state: MonitorState) -> Router {
     Router::new()
         .route("/", get(dashboard_page))
         .route("/api/stats", get(monitor_stats))
+        .route("/api/health", get(monitor_health))
         .route("/api/thumbnail/{flow_id}", get(monitor_thumbnail))
         .route("/api/thumbnail/{flow_id}/input/{input_id}", get(monitor_input_thumbnail))
         .route("/api/tunnels", get(monitor_tunnels))
@@ -34,15 +48,51 @@ async fn dashboard_page() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
 }
 
-async fn monitor_stats(State(state): State<AppState>) -> Json<AllStatsResponse> {
-    Json(gather_all_stats(&state).await)
+async fn monitor_stats(State(state): State<MonitorState>) -> Json<AllStatsResponse> {
+    Json(gather_all_stats(&state.app).await)
+}
+
+/// Rich health payload that mirrors what the edge sends to the manager
+/// over WS — capabilities, resource budget, live NVML utilisation, and
+/// (when the `display` Cargo feature is on) the local-display
+/// enumeration. The edge's own dashboard SPA renders the Resources card
+/// and capability list off this endpoint.
+async fn monitor_health(State(state): State<MonitorState>) -> Json<serde_json::Value> {
+    let (api_addr, monitor_addr) = {
+        let cfg = state.app.config.read().await;
+        (
+            format!("{}:{}", cfg.server.listen_addr, cfg.server.listen_port),
+            cfg.monitor
+                .as_ref()
+                .map(|m| format!("{}:{}", m.listen_addr, m.listen_port)),
+        )
+    };
+    let mut payload = crate::manager::client::build_health_payload(
+        &state.app.flow_manager,
+        &api_addr,
+        monitor_addr.as_deref(),
+        &state.app.resource_state,
+        &state.static_caps,
+        &state.live_gpu,
+    );
+    // Stamp uptime from the application's start_time so the SPA can
+    // render the system bar without a separate /api/v1/stats call.
+    if let Some(obj) = payload.as_object_mut() {
+        let uptime = state.app.start_time.elapsed().as_secs();
+        obj.insert("uptime_secs".into(), serde_json::json!(uptime));
+        obj.insert(
+            "active_flows".into(),
+            serde_json::json!(state.app.flow_manager.active_flow_count()),
+        );
+    }
+    Json(payload)
 }
 
 async fn monitor_thumbnail(
-    State(state): State<AppState>,
+    State(state): State<MonitorState>,
     Path(flow_id): Path<String>,
 ) -> impl IntoResponse {
-    let stats = state.flow_manager.stats();
+    let stats = state.app.flow_manager.stats();
     let Some(acc) = stats.flow_stats.get(&flow_id) else {
         return Err(StatusCode::NOT_FOUND);
     };
@@ -66,10 +116,10 @@ async fn monitor_thumbnail(
 }
 
 async fn monitor_input_thumbnail(
-    State(state): State<AppState>,
+    State(state): State<MonitorState>,
     Path((flow_id, input_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let stats = state.flow_manager.stats();
+    let stats = state.app.flow_manager.stats();
     let Some(acc) = stats.flow_stats.get(&flow_id) else {
         return Err(StatusCode::NOT_FOUND);
     };
@@ -92,20 +142,20 @@ async fn monitor_input_thumbnail(
     Ok((headers, data))
 }
 
-async fn monitor_tunnels(State(state): State<AppState>) -> impl IntoResponse {
-    let tunnels = state.tunnel_manager.list_tunnels();
+async fn monitor_tunnels(State(state): State<MonitorState>) -> impl IntoResponse {
+    let tunnels = state.app.tunnel_manager.list_tunnels();
     Json(tunnels)
 }
 
 async fn monitor_ws(
     ws: WebSocketUpgrade,
-    State(state): State<AppState>,
+    State(state): State<MonitorState>,
 ) -> impl IntoResponse {
     ws.on_upgrade(|socket| monitor_ws_connection(socket, state))
 }
 
-async fn monitor_ws_connection(mut socket: WebSocket, state: AppState) {
-    let mut rx = state.ws_stats_tx.subscribe();
+async fn monitor_ws_connection(mut socket: WebSocket, state: MonitorState) {
+    let mut rx = state.app.ws_stats_tx.subscribe();
 
     loop {
         tokio::select! {
@@ -134,6 +184,8 @@ async fn monitor_ws_connection(mut socket: WebSocket, state: AppState) {
 pub async fn start_monitor_server(
     state: AppState,
     config: &MonitorConfig,
+    static_caps: Arc<StaticCapabilities>,
+    live_gpu: Arc<LiveUtilizationState>,
     shutdown_token: CancellationToken,
 ) -> anyhow::Result<JoinHandle<()>> {
     let addr = format!("{}:{}", config.listen_addr, config.listen_port);
@@ -142,7 +194,12 @@ pub async fn start_monitor_server(
     })?;
     tracing::info!("Monitor dashboard listening on {addr}");
 
-    let router = build_monitor_router(state);
+    let monitor_state = MonitorState {
+        app: state,
+        static_caps,
+        live_gpu,
+    };
+    let router = build_monitor_router(monitor_state);
 
     let handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, router)

@@ -440,6 +440,8 @@ async fn main() -> anyhow::Result<()> {
             monitor::server::start_monitor_server(
                 state.clone(),
                 monitor_config,
+                static_capabilities.clone(),
+                live_gpu_state.clone(),
                 shutdown_token.clone(),
             )
             .await?,

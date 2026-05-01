@@ -1,0 +1,1084 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BilbyCast Edge Monitor</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0d1117;--bg-card:#161b22;--bg-sub:#0d1117;--border:#30363d;--border-soft:#21262d;
+  --fg:#c9d1d9;--fg-strong:#f0f6fc;--fg-mute:#8b949e;
+  --blue:#58a6ff;--blue-dim:#0d419d;--green:#3fb950;--green-dim:#033a16;
+  --amber:#d29922;--amber-dim:#4d2d00;--red:#f85149;--red-dim:#5c1a1a;
+  --slate:#272c33;
+}
+html,body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;min-height:100vh}
+a{color:var(--blue);text-decoration:none}
+header{background:var(--bg-card);border-bottom:1px solid var(--border);padding:12px 24px;display:flex;align-items:center;justify-content:space-between}
+header h1{font-size:18px;font-weight:600;color:var(--fg-strong)}
+header .meta{font-size:13px;color:var(--fg-mute);display:flex;gap:12px;align-items:center}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}
+.dot-green{background:var(--green)}.dot-amber{background:var(--amber)}.dot-red{background:var(--red)}.dot-slate{background:var(--fg-mute)}
+.system-bar{display:flex;gap:24px;padding:16px 24px;background:var(--bg-card);border-bottom:1px solid var(--border);flex-wrap:wrap}
+.stat-box{display:flex;flex-direction:column;gap:2px;min-width:80px}
+.stat-box .label{font-size:11px;color:var(--fg-mute);text-transform:uppercase;letter-spacing:0.5px}
+.stat-box .value{font-size:20px;font-weight:600;color:var(--fg-strong)}
+.cap-row{padding:8px 24px;background:var(--bg-card);border-bottom:1px solid var(--border);display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.cap-row .cap-label{font-size:11px;color:var(--fg-mute);text-transform:uppercase;letter-spacing:0.5px;margin-right:8px}
+.cap{font-size:11px;background:var(--slate);color:var(--fg);padding:2px 8px;border-radius:10px;font-family:monospace}
+section.panel{padding:0 24px 16px}
+section.panel h2{font-size:11px;color:var(--fg-mute);text-transform:uppercase;letter-spacing:0.5px;margin:16px 0 8px}
+.grid{display:grid;gap:12px}
+.grid-resources{grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}
+.grid-tunnel{grid-template-columns:repeat(auto-fill,minmax(320px,1fr))}
+.grid-inv{grid-template-columns:repeat(auto-fill,minmax(340px,1fr))}
+.grid-flow{grid-template-columns:repeat(auto-fill,minmax(540px,1fr))}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.card-pad{padding:12px 16px}
+.card-head{padding:12px 16px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border-soft);gap:12px;flex-wrap:wrap}
+.card-name{font-size:15px;font-weight:600;color:var(--fg-strong)}
+.card-sub{font-size:11px;color:var(--fg-mute);text-transform:uppercase;letter-spacing:0.5px}
+.badge{padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600;text-transform:uppercase;white-space:nowrap}
+.badge-running{background:var(--blue-dim);color:var(--blue)}
+.badge-idle,.badge-stopped{background:var(--slate);color:var(--fg-mute)}
+.badge-starting{background:var(--amber-dim);color:var(--amber)}
+.badge-error,.badge-critical{background:var(--red-dim);color:var(--red)}
+.badge-healthy{background:var(--green-dim);color:var(--green)}
+.badge-warning{background:var(--amber-dim);color:var(--amber)}
+.badge-rec{background:var(--red-dim);color:var(--red);animation:pulse 2s ease-in-out infinite}
+.badge-prebuf{background:var(--amber-dim);color:var(--amber)}
+.badge-feature{background:rgba(88,166,255,0.12);color:var(--blue);font-family:monospace;font-weight:500;text-transform:none}
+@keyframes pulse{50%{opacity:0.6}}
+.section{padding:12px 16px;border-top:1px solid var(--border-soft)}
+.section:first-of-type{border-top:none}
+.section-title{font-size:11px;color:var(--fg-mute);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px}
+.stat{display:flex;flex-direction:column;min-width:0}
+.stat .k{font-size:11px;color:var(--fg-mute);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stat .v{font-size:14px;color:var(--fg);font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stat .v.warn{color:var(--amber)}
+.stat .v.bad{color:var(--red)}
+.stat .v.good{color:var(--green)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;color:var(--fg-mute);font-weight:500;padding:4px 8px;font-size:11px;text-transform:uppercase}
+td{padding:6px 8px;color:var(--fg);border-top:1px solid var(--border-soft);vertical-align:top}
+.no-flows{text-align:center;padding:48px 24px;color:var(--fg-mute);font-size:15px}
+.error-banner{background:var(--red-dim);color:var(--red);padding:8px 24px;font-size:13px;text-align:center;display:none}
+.error-banner.visible{display:block}
+.thumb-wrap{position:relative;width:160px;height:90px;flex-shrink:0;background:var(--bg-sub);border-radius:4px;overflow:hidden}
+.thumb-wrap img{width:100%;height:100%;object-fit:cover;display:block}
+.thumb-wrap img.hidden{display:none}
+.thumb-overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;pointer-events:none}
+.thumb-overlay[data-alarm="no-signal"]{background:rgba(100,116,139,0.75);color:#e2e8f0}
+.thumb-overlay[data-alarm="frozen"]{background:rgba(59,130,246,0.55);color:#fff}
+.thumb-overlay[data-alarm="black"]{background:rgba(0,0,0,0.70);color:#94a3b8}
+.thumb-overlay[data-alarm="stopped"]{background:rgba(100,116,139,0.80);color:#cbd5e1}
+.flex{display:flex}.flex-row{display:flex;flex-direction:row;gap:12px;align-items:flex-start}
+.flex-col{display:flex;flex-direction:column;gap:4px}
+.gap-12{gap:12px}.gap-8{gap:8px}.gap-4{gap:4px}
+.right{margin-left:auto}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,monospace;font-size:12px}
+.muted{color:var(--fg-mute)}
+.sub-card{background:var(--bg-sub);border:1px solid var(--border-soft);border-radius:6px;padding:8px 12px;font-size:12px}
+.sub-card .row{display:flex;flex-wrap:wrap;gap:12px;color:var(--fg-mute)}
+.sub-card .row b{color:var(--fg);font-weight:500}
+.tag{display:inline-block;font-size:10px;padding:1px 6px;border-radius:8px;background:var(--slate);color:var(--fg);font-family:monospace}
+.tag-warn{background:var(--amber-dim);color:var(--amber)}
+.tag-bad{background:var(--red-dim);color:var(--red)}
+.tag-good{background:var(--green-dim);color:var(--green)}
+.bar{height:6px;background:var(--slate);border-radius:3px;overflow:hidden;margin-top:4px}
+.bar-fill{height:100%;background:var(--blue);transition:width 0.3s}
+.bar-fill.warn{background:var(--amber)}
+.bar-fill.bad{background:var(--red)}
+details{margin-top:8px}
+summary{cursor:pointer;color:var(--fg-mute);font-size:11px;text-transform:uppercase;letter-spacing:0.5px;list-style:none;padding:4px 0}
+summary::-webkit-details-marker{display:none}
+summary::before{content:"▸ ";color:var(--fg-mute)}
+details[open] summary::before{content:"▾ "}
+.pipeline{display:flex;flex-wrap:wrap;gap:4px;font-family:monospace;font-size:11px}
+.pipe-stage{background:var(--slate);padding:1px 6px;border-radius:8px;color:var(--fg)}
+</style>
+</head>
+<body>
+<header>
+  <h1>BilbyCast Edge Monitor</h1>
+  <div class="meta">
+    <span id="conn-state"><span class="dot dot-slate"></span>connecting…</span>
+    <span id="version" class="mono"></span>
+  </div>
+</header>
+<div class="error-banner" id="error-banner"></div>
+<div class="system-bar" id="system-bar"></div>
+<div class="cap-row" id="cap-row" style="display:none"><span class="cap-label">Capabilities</span><span id="cap-list"></span></div>
+
+<section class="panel" id="resource-panel" style="display:none">
+  <h2>Resource Budget</h2>
+  <div class="grid grid-resources" id="resource-grid"></div>
+</section>
+
+<section class="panel" id="tunnel-panel" style="display:none">
+  <h2>IP Tunnels</h2>
+  <div class="grid grid-tunnel" id="tunnel-grid"></div>
+</section>
+
+<section class="panel" id="inputs-panel" style="display:none">
+  <h2>Inputs</h2>
+  <div class="grid grid-inv" id="inputs-grid"></div>
+</section>
+
+<section class="panel" id="outputs-panel" style="display:none">
+  <h2>Outputs</h2>
+  <div class="grid grid-inv" id="outputs-grid"></div>
+</section>
+
+<section class="panel">
+  <h2>Flows</h2>
+  <div class="grid grid-flow" id="flows"></div>
+</section>
+
+<script>
+'use strict';
+
+// ────────────────────── formatters ──────────────────────
+const fmtBitrate = (bps) => {
+  if (!Number.isFinite(bps) || bps <= 0) return '0 bps';
+  if (bps >= 1e9) return (bps / 1e9).toFixed(2) + ' Gbps';
+  if (bps >= 1e6) return (bps / 1e6).toFixed(2) + ' Mbps';
+  if (bps >= 1e3) return (bps / 1e3).toFixed(1) + ' kbps';
+  return Math.round(bps) + ' bps';
+};
+const fmtBytes = (n) => {
+  if (!Number.isFinite(n) || n <= 0) return '0 B';
+  if (n >= 1024**4) return (n / 1024**4).toFixed(2) + ' TiB';
+  if (n >= 1024**3) return (n / 1024**3).toFixed(2) + ' GiB';
+  if (n >= 1024**2) return (n / 1024**2).toFixed(1) + ' MiB';
+  if (n >= 1024) return (n / 1024).toFixed(1) + ' KiB';
+  return n + ' B';
+};
+const fmtUptime = (s) => {
+  s = Math.max(0, Math.floor(s || 0));
+  const d = Math.floor(s / 86400); s -= d * 86400;
+  const h = Math.floor(s / 3600); s -= h * 3600;
+  const m = Math.floor(s / 60); s -= m * 60;
+  if (d) return `${d}d ${h}h ${m}m`;
+  if (h) return `${h}h ${m}m ${s}s`;
+  if (m) return `${m}m ${s}s`;
+  return `${s}s`;
+};
+const fmtUs = (us) => {
+  if (us == null || !Number.isFinite(us)) return '—';
+  if (us >= 1e6) return (us / 1e6).toFixed(2) + ' s';
+  if (us >= 1e3) return (us / 1e3).toFixed(1) + ' ms';
+  return Math.round(us) + ' µs';
+};
+const fmtNum = (n) => Number.isFinite(n) ? n.toLocaleString() : '0';
+const fmtPct = (n) => Number.isFinite(n) ? n.toFixed(1) + '%' : '—';
+const fmtPts = (pts90) => {
+  if (pts90 == null) return '—';
+  const s = Number(pts90) / 90000;
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = (s % 60).toFixed(2);
+  return `${h.toString().padStart(2,'0')}:${m.toString().padStart(2,'0')}:${sec.padStart(5,'0')}`;
+};
+const escapeHtml = (s) => String(s == null ? '' : s)
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+// ────────────────────── state ──────────────────────
+const state = {
+  stats: null,           // AllStatsResponse: { flows, system, inputs, outputs }
+  health: null,          // /api/health: { capabilities, resource_budget, system_resources, display_devices }
+  tunnels: [],
+  ws: null,
+  wsConnected: false,
+  lastWsMsgAt: 0,
+  pollTimer: null,
+};
+
+// ────────────────────── network ──────────────────────
+async function fetchJson(url) {
+  const r = await fetch(url, { headers: { 'cache-control': 'no-cache' } });
+  if (!r.ok) throw new Error(`${url} → ${r.status}`);
+  return r.json();
+}
+
+async function refreshStats() {
+  try {
+    const s = await fetchJson('/api/stats');
+    state.stats = s;
+    setConn('ok');
+    render();
+  } catch (e) {
+    setConn('err', String(e));
+  }
+}
+async function refreshHealth() {
+  try {
+    state.health = await fetchJson('/api/health');
+    renderSystemBar();
+    renderCapabilities();
+    renderResources();
+  } catch (e) {
+    /* /api/health is optional on older edges; keep going */
+  }
+}
+async function refreshTunnels() {
+  try {
+    state.tunnels = await fetchJson('/api/tunnels');
+    renderTunnels();
+  } catch (e) { /* tunnels endpoint may 404 in minimal builds */ }
+}
+
+function openWs() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = `${proto}//${location.host}/api/ws`;
+  let ws;
+  try { ws = new WebSocket(url); } catch (e) { scheduleWsRetry(); return; }
+  state.ws = ws;
+  ws.onopen = () => { state.wsConnected = true; setConn('ok'); };
+  ws.onclose = () => { state.wsConnected = false; setConn('reconn'); scheduleWsRetry(); };
+  ws.onerror = () => { /* close handler will reconnect */ };
+  ws.onmessage = (ev) => {
+    state.lastWsMsgAt = Date.now();
+    try {
+      const msg = JSON.parse(ev.data);
+      // ws_stats_tx publishes a bare `Vec<FlowStats>` (the manager-bound
+      // wire format). Patch it into the cached AllStatsResponse so the
+      // system / inputs / outputs sections — which only refresh on poll —
+      // stay consistent.
+      if (Array.isArray(msg)) {
+        if (state.stats) state.stats.flows = msg;
+        else state.stats = { flows: msg, system: null, inputs: [], outputs: [] };
+        render();
+      } else if (msg && Array.isArray(msg.flows)) {
+        state.stats = msg;
+        render();
+      }
+    } catch (_) { /* ignore non-JSON */ }
+  };
+}
+function scheduleWsRetry() {
+  setTimeout(() => { if (!state.wsConnected) openWs(); }, 2000);
+}
+
+function setConn(kind, detail) {
+  const el = document.getElementById('conn-state');
+  const banner = document.getElementById('error-banner');
+  if (kind === 'ok') {
+    el.innerHTML = '<span class="dot dot-green"></span>live';
+    banner.classList.remove('visible');
+  } else if (kind === 'reconn') {
+    el.innerHTML = '<span class="dot dot-amber"></span>reconnecting…';
+  } else {
+    el.innerHTML = '<span class="dot dot-red"></span>error';
+    if (detail) {
+      banner.textContent = `Connection: ${detail}`;
+      banner.classList.add('visible');
+    }
+  }
+}
+
+// ────────────────────── rendering: top sections ──────────────────────
+function renderSystemBar() {
+  const sys = state.stats?.system;
+  const sr = state.health?.system_resources;
+  const bar = document.getElementById('system-bar');
+  const ver = document.getElementById('version');
+  if (!sys) return;
+  ver.textContent = `v${sys.version}`;
+  const items = [
+    { l: 'Uptime', v: fmtUptime(sys.uptime_secs) },
+    { l: 'Flows', v: `${sys.active_flows} / ${sys.total_flows}` },
+    { l: 'Tunnels', v: state.tunnels?.length || 0 },
+  ];
+  if (sr) {
+    items.push({ l: 'CPU', v: fmtPct(sr.cpu_percent) });
+    items.push({ l: 'RAM', v: `${fmtPct(sr.ram_percent)} (${Math.round(sr.ram_used_mb||0)} / ${Math.round(sr.ram_total_mb||0)} MB)` });
+  }
+  bar.innerHTML = items.map(i =>
+    `<div class="stat-box"><div class="label">${escapeHtml(i.l)}</div><div class="value">${escapeHtml(i.v)}</div></div>`
+  ).join('');
+}
+
+function renderCapabilities() {
+  const caps = state.health?.capabilities;
+  const row = document.getElementById('cap-row');
+  const list = document.getElementById('cap-list');
+  if (!Array.isArray(caps) || caps.length === 0) { row.style.display = 'none'; return; }
+  row.style.display = 'flex';
+  list.innerHTML = caps.map(c => `<span class="cap">${escapeHtml(c)}</span>`).join('');
+}
+
+function renderResources() {
+  const rb = state.health?.resource_budget;
+  const panel = document.getElementById('resource-panel');
+  const grid = document.getElementById('resource-grid');
+  if (!rb) { panel.style.display = 'none'; return; }
+  panel.style.display = 'block';
+
+  const cpu = rb.cpu || {};
+  const used = rb.units_used || 0;
+  const total = rb.units_total || 0;
+  const usedPct = total > 0 ? (used / total) * 100 : 0;
+  const usedClass = usedPct >= 100 ? 'bad' : (usedPct >= 80 ? 'warn' : '');
+
+  const enc = rb.hw_encoders || {};
+  const dec = rb.hw_decoders || {};
+  const swc = rb.sw_capacity || {};
+  const live = rb.live || {};
+
+  const yesNo = (b) => b
+    ? '<span class="tag tag-good">yes</span>'
+    : '<span class="tag muted">no</span>';
+
+  const cards = [];
+
+  // Cost units
+  cards.push(`
+    <div class="card card-pad">
+      <div class="card-sub">Cost units</div>
+      <div style="font-size:24px;font-weight:600;color:var(--fg-strong);margin-top:4px">${fmtNum(used)} <span class="muted" style="font-size:14px">/ ${fmtNum(total)}</span></div>
+      <div class="bar"><div class="bar-fill ${usedClass}" style="width:${Math.min(100, usedPct).toFixed(1)}%"></div></div>
+      <div class="muted mono" style="margin-top:6px">${usedPct.toFixed(1)}% used</div>
+    </div>
+  `);
+
+  // CPU
+  cards.push(`
+    <div class="card card-pad">
+      <div class="card-sub">CPU</div>
+      <div style="margin-top:4px;color:var(--fg-strong);font-weight:500">${escapeHtml(cpu.brand || 'unknown')}</div>
+      <div class="muted mono" style="margin-top:4px">${cpu.physical_cores ?? '?'} phys / ${cpu.logical_cores ?? '?'} logical · AVX ${escapeHtml(cpu.avx_class || 'none')}</div>
+      <div class="muted mono">x264@720p30: ${swc.x264_720p30_streams ?? '?'} · x265@720p30: ${swc.x265_720p30_streams ?? '?'}</div>
+    </div>
+  `);
+
+  // Encoders
+  cards.push(`
+    <div class="card card-pad">
+      <div class="card-sub">HW encoders</div>
+      <div class="stats-grid" style="margin-top:6px">
+        <div class="stat"><span class="k">NVENC h264</span><span class="v">${yesNo(enc.nvenc_h264)}</span></div>
+        <div class="stat"><span class="k">NVENC hevc</span><span class="v">${yesNo(enc.nvenc_hevc)}</span></div>
+        <div class="stat"><span class="k">QSV h264</span><span class="v">${yesNo(enc.qsv_h264)}</span></div>
+        <div class="stat"><span class="k">QSV hevc</span><span class="v">${yesNo(enc.qsv_hevc)}</span></div>
+        <div class="stat"><span class="k">VT h264</span><span class="v">${yesNo(enc.vt_h264)}</span></div>
+        <div class="stat"><span class="k">VT hevc</span><span class="v">${yesNo(enc.vt_hevc)}</span></div>
+        <div class="stat"><span class="k">AMF h264</span><span class="v">${yesNo(enc.amf_h264)}</span></div>
+        <div class="stat"><span class="k">AMF hevc</span><span class="v">${yesNo(enc.amf_hevc)}</span></div>
+      </div>
+    </div>
+  `);
+
+  // Decoders
+  cards.push(`
+    <div class="card card-pad">
+      <div class="card-sub">HW decoders</div>
+      <div class="stats-grid" style="margin-top:6px">
+        <div class="stat"><span class="k">NVDEC h264</span><span class="v">${yesNo(dec.nvdec_h264)}</span></div>
+        <div class="stat"><span class="k">NVDEC hevc</span><span class="v">${yesNo(dec.nvdec_hevc)}</span></div>
+        <div class="stat"><span class="k">QSV h264</span><span class="v">${yesNo(dec.qsv_h264)}</span></div>
+        <div class="stat"><span class="k">QSV hevc</span><span class="v">${yesNo(dec.qsv_hevc)}</span></div>
+        <div class="stat"><span class="k">VT h264</span><span class="v">${yesNo(dec.vt_h264)}</span></div>
+        <div class="stat"><span class="k">VT hevc</span><span class="v">${yesNo(dec.vt_hevc)}</span></div>
+      </div>
+    </div>
+  `);
+
+  // Live GPU (NVML)
+  if (live && live.available) {
+    cards.push(`
+      <div class="card card-pad">
+        <div class="card-sub">NVIDIA live (NVML)</div>
+        <div class="stats-grid" style="margin-top:6px">
+          <div class="stat"><span class="k">NVENC %</span><span class="v">${fmtPct(live.nvenc_percent)}</span></div>
+          <div class="stat"><span class="k">NVDEC %</span><span class="v">${fmtPct(live.nvdec_percent)}</span></div>
+          <div class="stat"><span class="k">Sessions</span><span class="v">${fmtNum(live.encoder_sessions || 0)}</span></div>
+          <div class="stat"><span class="k">SM %</span><span class="v">${fmtPct(live.sm_percent)}</span></div>
+        </div>
+      </div>
+    `);
+  }
+
+  // Display devices
+  const dd = state.health?.display_devices;
+  if (Array.isArray(dd) && dd.length) {
+    cards.push(`
+      <div class="card card-pad">
+        <div class="card-sub">Display connectors</div>
+        <div style="margin-top:6px">${dd.map(d => `
+          <div class="mono" style="font-size:12px">
+            <b style="color:var(--fg-strong);font-weight:500">${escapeHtml(d.name || d.connector || '?')}</b>
+            <span class="muted">${escapeHtml(d.status || '')} ${d.preferred_mode ? `· ${escapeHtml(d.preferred_mode)}` : ''}</span>
+          </div>`).join('')}
+        </div>
+      </div>
+    `);
+  }
+
+  grid.innerHTML = cards.join('');
+}
+
+// ────────────────────── tunnels + inventory ──────────────────────
+function renderTunnels() {
+  const panel = document.getElementById('tunnel-panel');
+  const grid = document.getElementById('tunnel-grid');
+  const list = state.tunnels || [];
+  if (!list.length) { panel.style.display = 'none'; return; }
+  panel.style.display = 'block';
+  grid.innerHTML = list.map(t => {
+    const stats = t.stats || {};
+    return `
+      <div class="card card-pad">
+        <div class="flex" style="justify-content:space-between;align-items:center">
+          <div class="card-name" style="font-size:14px">${escapeHtml(t.name || t.tunnel_id || '?')}</div>
+          <div class="badge badge-feature">${escapeHtml(t.mode || '')}</div>
+        </div>
+        <div class="muted mono" style="margin-top:4px">${escapeHtml(t.state || '')} · ${escapeHtml(t.protocol || '')}</div>
+        <div class="stats-grid" style="margin-top:8px">
+          <div class="stat"><span class="k">Pkts in</span><span class="v">${fmtNum(stats.packets_received || stats.packets_in || 0)}</span></div>
+          <div class="stat"><span class="k">Pkts out</span><span class="v">${fmtNum(stats.packets_sent || stats.packets_out || 0)}</span></div>
+          <div class="stat"><span class="k">Bytes in</span><span class="v">${fmtBytes(stats.bytes_received || stats.bytes_in || 0)}</span></div>
+          <div class="stat"><span class="k">Bytes out</span><span class="v">${fmtBytes(stats.bytes_sent || stats.bytes_out || 0)}</span></div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function renderInventory() {
+  const inputs = state.stats?.inputs || [];
+  const outputs = state.stats?.outputs || [];
+  const ip = document.getElementById('inputs-panel');
+  const op = document.getElementById('outputs-panel');
+  const ig = document.getElementById('inputs-grid');
+  const og = document.getElementById('outputs-grid');
+
+  if (inputs.length === 0) { ip.style.display = 'none'; }
+  else {
+    ip.style.display = 'block';
+    ig.innerHTML = inputs.map(i => invCard(i, 'input')).join('');
+  }
+  if (outputs.length === 0) { op.style.display = 'none'; }
+  else {
+    op.style.display = 'block';
+    og.innerHTML = outputs.map(o => invCard(o, 'output')).join('');
+  }
+}
+function invCard(e, kind) {
+  const assigned = e.assigned_flow_id;
+  const id = kind === 'input' ? e.input_id : e.output_id;
+  const name = kind === 'input' ? e.input_name : e.output_name;
+  const type = kind === 'input' ? e.input_type : e.output_type;
+  const pkts = kind === 'input' ? (e.packets_received||0) : (e.packets_sent||0);
+  const bytes = kind === 'input' ? (e.bytes_received||0) : (e.bytes_sent||0);
+  return `
+    <div class="card card-pad">
+      <div class="flex" style="justify-content:space-between;align-items:center;gap:8px">
+        <div class="card-name" style="font-size:14px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(name||id)}</div>
+        <div class="badge badge-feature">${escapeHtml(type||'')}</div>
+      </div>
+      <div class="muted mono" style="margin-top:4px;font-size:11px">${escapeHtml(id)}</div>
+      <div style="margin-top:8px">
+        ${assigned
+          ? `<span class="tag tag-good">→ ${escapeHtml(e.assigned_flow_name||assigned)}</span>`
+          : '<span class="tag muted">unassigned</span>'}
+        <span class="tag" style="margin-left:4px">${escapeHtml(e.state||'')}</span>
+      </div>
+      <div class="stats-grid" style="margin-top:8px">
+        <div class="stat"><span class="k">Bitrate</span><span class="v">${fmtBitrate(e.bitrate_bps||0)}</span></div>
+        <div class="stat"><span class="k">Pkts</span><span class="v">${fmtNum(pkts)}</span></div>
+        <div class="stat"><span class="k">Bytes</span><span class="v">${fmtBytes(bytes)}</span></div>
+        ${kind === 'input'
+          ? `<div class="stat"><span class="k">Lost</span><span class="v ${e.packets_lost?'warn':''}">${fmtNum(e.packets_lost||0)}</span></div>`
+          : `<div class="stat"><span class="k">Dropped</span><span class="v ${e.packets_dropped?'bad':''}">${fmtNum(e.packets_dropped||0)}</span></div>`}
+      </div>
+    </div>
+  `;
+}
+
+// ────────────────────── flow cards ──────────────────────
+function renderFlows() {
+  const flows = state.stats?.flows || [];
+  const root = document.getElementById('flows');
+  if (!flows.length) {
+    root.innerHTML = '<div class="no-flows">No flows configured.</div>';
+    return;
+  }
+  flows.sort((a, b) => (a.flow_name||'').localeCompare(b.flow_name||''));
+  root.innerHTML = flows.map(renderFlowCard).join('');
+}
+
+function flowStateBadge(f) {
+  const s = (f.state || 'idle').toLowerCase();
+  const cls = s === 'running' ? 'badge-running'
+            : s === 'starting' ? 'badge-starting'
+            : s === 'error' ? 'badge-error'
+            : 'badge-idle';
+  return `<span class="badge ${cls}">${escapeHtml(s)}</span>`;
+}
+function flowHealthBadge(f) {
+  const h = (f.health || 'Healthy');
+  const k = h.toLowerCase();
+  return `<span class="badge badge-${k}">${escapeHtml(h)}</span>`;
+}
+function recordingBadge(rec) {
+  if (!rec) return '';
+  const mode = rec.mode || (rec.armed ? 'armed' : 'idle');
+  if (mode === 'armed') return '<span class="badge badge-rec">● REC</span>';
+  if (mode === 'pre_buffer') return '<span class="badge badge-prebuf">● PRE-ROLL</span>';
+  return '';
+}
+
+function renderFlowCard(f) {
+  const sections = [];
+
+  // Thumbnail + identity
+  const thumbUrl = `/api/thumbnail/${encodeURIComponent(f.flow_id)}?_=${state.lastWsMsgAt || Date.now()}`;
+  sections.push(`
+    <div class="section">
+      <div class="flex-row gap-12">
+        <div class="thumb-wrap">
+          <img src="${thumbUrl}" onerror="this.classList.add('hidden')" alt="">
+          ${f.state !== 'Running' ? '<div class="thumb-overlay" data-alarm="stopped">stopped</div>' : ''}
+        </div>
+        <div class="flex-col" style="flex:1;min-width:0">
+          ${renderInputSection(f)}
+        </div>
+      </div>
+    </div>
+  `);
+
+  // Hitless / red-blue
+  if (f.network_legs) sections.push(renderNetworkLegs(f.network_legs));
+
+  // PTP
+  if (f.ptp_state) sections.push(renderPtp(f.ptp_state));
+
+  // TR-101290
+  if (f.tr101290) sections.push(renderTr101290(f.tr101290));
+
+  // Media analysis
+  if (f.media_analysis) sections.push(renderMediaAnalysis(f.media_analysis));
+
+  // Per-ES (PID bus)
+  if (f.per_es && f.per_es.length) sections.push(renderPerEs(f.per_es));
+
+  // PCR trust (flow-wide)
+  if (f.pcr_trust_flow) sections.push(renderPcrTrustFlow(f.pcr_trust_flow));
+
+  // Content analysis
+  if (f.content_analysis) sections.push(renderContentAnalysis(f.content_analysis));
+
+  // Recording
+  if (f.recording) sections.push(renderRecording(f.recording));
+
+  // Outputs table
+  if (f.outputs && f.outputs.length) sections.push(renderOutputs(f.outputs));
+
+  // SMPTE trust
+  if (f.iat || f.pdv_jitter_us != null) sections.push(renderSmpteTrust(f));
+
+  return `
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <div class="card-name">${escapeHtml(f.flow_name||f.flow_id||'?')}</div>
+          <div class="muted mono" style="font-size:11px">${escapeHtml(f.flow_id||'')}</div>
+        </div>
+        <div class="flex gap-4">
+          ${recordingBadge(f.recording)}
+          ${flowHealthBadge(f)}
+          ${flowStateBadge(f)}
+        </div>
+      </div>
+      ${sections.join('')}
+    </div>
+  `;
+}
+
+function renderInputSection(f) {
+  const i = f.input || {};
+  const stats = [
+    ['State', escapeHtml(i.state || '—')],
+    ['Type', escapeHtml(i.input_type || '—')],
+    ['Bitrate', fmtBitrate(i.bitrate_bps||0)],
+    ['Pkts', fmtNum(i.packets_received||0)],
+    ['Lost', `<span class="${i.packets_lost?'warn':''}">${fmtNum(i.packets_lost||0)}</span>`],
+    ['FEC rec.', fmtNum(i.packets_recovered_fec||0)],
+    ['Filtered', fmtNum(i.packets_filtered||0)],
+    ['Switches', fmtNum(i.redundancy_switches||0)],
+  ];
+  const summary = i.ingress_summary ? renderEgressSummary(i.ingress_summary, 'ingress') : '';
+
+  // Per-input liveness (multi-input flows / passive legs)
+  let liveBlock = '';
+  if (f.inputs_live && f.inputs_live.length > 1) {
+    liveBlock = `
+      <details>
+        <summary>All inputs (${f.inputs_live.length})</summary>
+        <table><thead><tr><th>ID</th><th>Type</th><th>State</th><th>Pkts</th><th>Bitrate</th></tr></thead><tbody>
+          ${f.inputs_live.map(li => `
+            <tr>
+              <td class="mono">${escapeHtml(li.input_id)}${li.input_id === f.active_input_id ? ' <span class="tag tag-good">active</span>' : ''}</td>
+              <td>${escapeHtml(li.input_type||'')}</td>
+              <td>${escapeHtml(li.state||'')}</td>
+              <td>${fmtNum(li.packets_received||0)}</td>
+              <td>${fmtBitrate(li.bitrate_bps||0)}</td>
+            </tr>`).join('')}
+        </tbody></table>
+      </details>`;
+  }
+
+  // SRT / RIST / Bonding leg detail
+  let legBlock = '';
+  const legs = [];
+  if (i.srt_stats) legs.push(renderLegSrt('SRT leg 1', i.srt_stats));
+  if (i.srt_leg2_stats) legs.push(renderLegSrt('SRT leg 2', i.srt_leg2_stats));
+  if (i.rist_stats) legs.push(renderLegRist('RIST leg 1', i.rist_stats));
+  if (i.rist_leg2_stats) legs.push(renderLegRist('RIST leg 2', i.rist_leg2_stats));
+  if (i.bond_stats) legs.push(renderBond(i.bond_stats));
+  if (i.srt_bonding_stats) legs.push(renderSrtBonding(i.srt_bonding_stats));
+  if (i.buffered_hitless) legs.push(renderBufferedHitless(i.buffered_hitless));
+  if (legs.length) legBlock = `<details><summary>Transport detail</summary>${legs.join('')}</details>`;
+
+  // Bandwidth limit
+  let bwNote = '';
+  if (f.bandwidth_limit_mbps != null) {
+    const cls = f.bandwidth_blocked ? 'bad' : (f.bandwidth_exceeded ? 'warn' : '');
+    bwNote = `<div class="muted mono" style="margin-top:4px">BW limit ${f.bandwidth_limit_mbps} Mbps ${f.bandwidth_blocked?'<span class="tag tag-bad">BLOCKED</span>':(f.bandwidth_exceeded?'<span class="tag tag-warn">EXCEEDED</span>':'')}</div>`;
+  }
+
+  return `
+    <div class="section-title">Input ${i.mode?`<span class="muted">· ${escapeHtml(i.mode)}</span>`:''}</div>
+    <div class="stats-grid">${stats.map(([k,v]) => `<div class="stat"><span class="k">${k}</span><span class="v">${v}</span></div>`).join('')}</div>
+    ${summary}
+    ${bwNote}
+    ${liveBlock}
+    ${legBlock}
+  `;
+}
+
+function renderEgressSummary(s, label) {
+  if (!s) return '';
+  const v = [];
+  if (s.video_codec) v.push(`<b>${escapeHtml(s.video_codec)}</b> ${s.video_resolution?escapeHtml(s.video_resolution):''} ${s.video_fps?`@${s.video_fps.toFixed(2)}`:''}${s.video_bitrate_kbps?` ${s.video_bitrate_kbps}kbps`:''}`);
+  if (s.audio_codec) v.push(`<b>${escapeHtml(s.audio_codec)}</b> ${s.audio_sample_rate_hz?`${s.audio_sample_rate_hz}Hz`:''} ${s.audio_channels?`${s.audio_channels}ch`:''}${s.audio_bitrate_kbps?` ${s.audio_bitrate_kbps}kbps`:''}`);
+  if (s.transport_mode) v.push(`<span class="muted">${escapeHtml(s.transport_mode)}</span>`);
+  if (s.program_number != null) v.push(`<span class="muted">prog ${s.program_number}</span>`);
+  const pipe = (s.pipeline||[]).length
+    ? `<div class="pipeline" style="margin-top:4px">${s.pipeline.map(p=>`<span class="pipe-stage">${escapeHtml(p)}</span>`).join('')}</div>`
+    : '';
+  if (!v.length && !pipe) return '';
+  return `<div class="sub-card" style="margin-top:8px"><div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">${label}</div><div class="row">${v.join(' · ')}</div>${pipe}</div>`;
+}
+
+function renderLegSrt(label, s) {
+  return `
+    <div class="sub-card" style="margin-top:6px">
+      <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">${label}</div>
+      <div class="row">
+        <span><b>RTT</b> ${(s.rtt_ms??0).toFixed(1)} ms</span>
+        <span><b>Latency</b> ${s.latency_ms??0} ms</span>
+        <span><b>Loss</b> ${fmtNum(s.pkt_loss||0)}</span>
+        <span><b>Recv</b> ${fmtNum(s.pkt_recv||0)}</span>
+        <span><b>Retrans</b> ${fmtNum(s.pkt_retrans||0)}</span>
+        <span><b>Drop</b> ${fmtNum(s.pkt_drop||0)}</span>
+        ${s.fec_packets_sent?`<span><b>FEC</b> ${fmtNum(s.fec_packets_sent)}</span>`:''}
+      </div>
+    </div>`;
+}
+function renderLegRist(label, s) {
+  return `
+    <div class="sub-card" style="margin-top:6px">
+      <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">${label}</div>
+      <div class="row">
+        <span><b>RTT</b> ${(s.rtt_ms??0).toFixed(1)} ms</span>
+        <span><b>Recv</b> ${fmtNum(s.packets_received||0)}</span>
+        <span><b>Retrans rx</b> ${fmtNum(s.packets_recovered||0)}</span>
+        <span><b>NAKs sent</b> ${fmtNum(s.naks_sent||0)}</span>
+      </div>
+    </div>`;
+}
+function renderBond(s) {
+  const paths = (s.paths||[]).map(p => `
+    <tr><td class="mono">${escapeHtml(p.id||'')}</td><td>${escapeHtml(p.state||'')}</td>
+    <td>${fmtNum(p.packets||0)}</td><td>${fmtBitrate(p.bitrate_bps||0)}</td>
+    <td>${(p.rtt_ms??0).toFixed(1)} ms</td></tr>`).join('');
+  return `
+    <div class="sub-card" style="margin-top:6px">
+      <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Bonding paths</div>
+      <table><thead><tr><th>Path</th><th>State</th><th>Pkts</th><th>Bitrate</th><th>RTT</th></tr></thead><tbody>${paths}</tbody></table>
+    </div>`;
+}
+function renderSrtBonding(s) {
+  const m = (s.members||[]).map(p => `
+    <tr><td class="mono">${escapeHtml(p.id||'')}</td><td>${escapeHtml(p.state||'')}</td>
+    <td>${fmtNum(p.pkt_recv||p.pkt_sent||0)}</td><td>${(p.rtt_ms??0).toFixed(1)} ms</td></tr>`).join('');
+  return `
+    <div class="sub-card" style="margin-top:6px">
+      <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">SRT bonding (group ${escapeHtml(s.mode||'')})</div>
+      <table><thead><tr><th>Member</th><th>State</th><th>Pkts</th><th>RTT</th></tr></thead><tbody>${m}</tbody></table>
+    </div>`;
+}
+function renderBufferedHitless(s) {
+  return `
+    <div class="sub-card" style="margin-top:6px">
+      <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Buffered hitless</div>
+      <div class="row">
+        <span><b>Buffer</b> ${s.buffer_ms||0} ms</span>
+        <span><b>Forwarded</b> ${fmtNum(s.packets_forwarded||0)}</span>
+        <span><b>Dup dropped</b> ${fmtNum(s.packets_dropped_duplicate||0)}</span>
+      </div>
+    </div>`;
+}
+
+function renderNetworkLegs(nl) {
+  return `
+    <div class="section">
+      <div class="section-title">2022-7 Red / Blue</div>
+      <table>
+        <thead><tr><th></th><th>Recv</th><th>Forwarded</th><th>Duplicate</th><th>Bytes</th></tr></thead>
+        <tbody>
+          <tr><td><span class="tag" style="background:#5c1a1a;color:#f85149">RED</span></td>
+            <td>${fmtNum(nl.red?.packets_received||0)}</td>
+            <td>${fmtNum(nl.red?.packets_forwarded||0)}</td>
+            <td>${fmtNum(nl.red?.packets_duplicate||0)}</td>
+            <td>${fmtBytes(nl.red?.bytes_received||0)}</td></tr>
+          <tr><td><span class="tag" style="background:#0d419d;color:#58a6ff">BLUE</span></td>
+            <td>${fmtNum(nl.blue?.packets_received||0)}</td>
+            <td>${fmtNum(nl.blue?.packets_forwarded||0)}</td>
+            <td>${fmtNum(nl.blue?.packets_duplicate||0)}</td>
+            <td>${fmtBytes(nl.blue?.bytes_received||0)}</td></tr>
+        </tbody>
+      </table>
+      <div class="muted mono" style="margin-top:6px">Leg switches: ${fmtNum(nl.leg_switches||0)}</div>
+    </div>`;
+}
+
+function renderPtp(p) {
+  const cls = p.lock_state === 'locked' ? 'good' : (p.lock_state === 'holdover' ? 'warn' : 'bad');
+  return `
+    <div class="section">
+      <div class="section-title">PTP</div>
+      <div class="stats-grid">
+        <div class="stat"><span class="k">Lock</span><span class="v ${cls}">${escapeHtml(p.lock_state||'—')}</span></div>
+        <div class="stat"><span class="k">Domain</span><span class="v">${p.domain ?? '—'}</span></div>
+        <div class="stat"><span class="k">Offset</span><span class="v">${p.offset_ns!=null?`${p.offset_ns} ns`:'—'}</span></div>
+        <div class="stat"><span class="k">Path delay</span><span class="v">${p.mean_path_delay_ns!=null?`${p.mean_path_delay_ns} ns`:'—'}</span></div>
+        <div class="stat"><span class="k">Steps</span><span class="v">${p.steps_removed ?? '—'}</span></div>
+        <div class="stat"><span class="k">GM</span><span class="v mono" style="font-size:11px">${escapeHtml(p.grandmaster_id||'—')}</span></div>
+      </div>
+    </div>`;
+}
+
+function renderTr101290(t) {
+  const p1 = (t.sync_loss_count||0) + (t.sync_byte_errors||0) + (t.cc_errors||0)
+           + (t.pat_errors||0) + (t.pmt_errors||0) + (t.pid_errors||0);
+  const p2 = (t.tei_errors||0) + (t.crc_errors||0) + (t.pcr_discontinuity_errors||0) + (t.pcr_accuracy_errors||0);
+  const p1cls = p1 ? 'badge-error' : 'badge-healthy';
+  const p2cls = p2 ? 'badge-warning' : 'badge-healthy';
+  return `
+    <div class="section">
+      <div class="section-title">
+        TR-101290
+        <span><span class="badge ${p1cls}">P1 ${p1?'FAIL':'OK'}</span> <span class="badge ${p2cls}">P2 ${p2?'WARN':'OK'}</span></span>
+      </div>
+      <div class="stats-grid">
+        <div class="stat"><span class="k">TS pkts</span><span class="v">${fmtNum(t.ts_packets_analyzed||0)}</span></div>
+        <div class="stat"><span class="k">PAT</span><span class="v">${fmtNum(t.pat_count||0)}</span></div>
+        <div class="stat"><span class="k">PMT</span><span class="v">${fmtNum(t.pmt_count||0)}</span></div>
+        <div class="stat"><span class="k">Sync loss</span><span class="v ${t.sync_loss_count?'bad':''}">${fmtNum(t.sync_loss_count||0)}</span></div>
+        <div class="stat"><span class="k">CC err</span><span class="v ${t.cc_errors?'warn':''}">${fmtNum(t.cc_errors||0)}</span></div>
+        <div class="stat"><span class="k">PAT err</span><span class="v ${t.pat_errors?'bad':''}">${fmtNum(t.pat_errors||0)}</span></div>
+        <div class="stat"><span class="k">PMT err</span><span class="v ${t.pmt_errors?'bad':''}">${fmtNum(t.pmt_errors||0)}</span></div>
+        <div class="stat"><span class="k">PID err</span><span class="v ${t.pid_errors?'bad':''}">${fmtNum(t.pid_errors||0)}</span></div>
+        <div class="stat"><span class="k">TEI</span><span class="v ${t.tei_errors?'warn':''}">${fmtNum(t.tei_errors||0)}</span></div>
+        <div class="stat"><span class="k">CRC</span><span class="v ${t.crc_errors?'warn':''}">${fmtNum(t.crc_errors||0)}</span></div>
+        <div class="stat"><span class="k">PCR disc.</span><span class="v ${t.pcr_discontinuity_errors?'warn':''}">${fmtNum(t.pcr_discontinuity_errors||0)}</span></div>
+        <div class="stat"><span class="k">PCR acc.</span><span class="v ${t.pcr_accuracy_errors?'warn':''}">${fmtNum(t.pcr_accuracy_errors||0)}</span></div>
+      </div>
+    </div>`;
+}
+
+function renderMediaAnalysis(m) {
+  const vrows = (m.video_streams||[]).map(s => `
+    <tr><td class="mono">${s.pid}</td><td>${escapeHtml(s.codec||'')}</td>
+    <td>${s.width||'?'}×${s.height||'?'}</td>
+    <td>${s.framerate?s.framerate.toFixed(2):'—'}</td>
+    <td>${escapeHtml(s.profile||'—')}/${escapeHtml(s.level||'—')}</td>
+    <td>${fmtBitrate(s.bitrate_bps||0)}</td></tr>`).join('');
+  const arows = (m.audio_streams||[]).map(s => `
+    <tr><td class="mono">${s.pid}</td><td>${escapeHtml(s.codec||'')}</td>
+    <td>${s.sample_rate_hz?`${s.sample_rate_hz} Hz`:'—'}</td>
+    <td>${s.channels||'—'}</td>
+    <td>${escapeHtml(s.language||'—')}</td>
+    <td>${fmtBitrate(s.bitrate_bps||0)}</td></tr>`).join('');
+  const head = `${escapeHtml(m.protocol||'')} ${m.payload_format?`· ${escapeHtml(m.payload_format)}`:''} ${m.fec_standard?`· FEC ${escapeHtml(m.fec_standard)}`:''} ${m.redundancy_standard?`· ${escapeHtml(m.redundancy_standard)}`:''}`;
+  return `
+    <div class="section">
+      <div class="section-title">Media analysis <span class="muted mono" style="text-transform:none;font-size:11px">${head}</span></div>
+      ${m.programs?`<div class="muted mono" style="margin-bottom:6px">programs=${m.programs} · TS bitrate ${fmtBitrate(m.ts_bitrate_bps||0)}</div>`:''}
+      ${vrows?`<div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-top:6px">Video</div>
+        <table><thead><tr><th>PID</th><th>Codec</th><th>Res</th><th>FPS</th><th>P/L</th><th>Bitrate</th></tr></thead><tbody>${vrows}</tbody></table>`:''}
+      ${arows?`<div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-top:8px">Audio</div>
+        <table><thead><tr><th>PID</th><th>Codec</th><th>SR</th><th>Ch</th><th>Lang</th><th>Bitrate</th></tr></thead><tbody>${arows}</tbody></table>`:''}
+    </div>`;
+}
+
+function renderPerEs(rows) {
+  const trs = rows.map(r => `
+    <tr>
+      <td class="mono">${escapeHtml(r.input_id)}</td>
+      <td class="mono">0x${(r.source_pid||0).toString(16).padStart(4,'0')}</td>
+      <td class="mono">${r.out_pid!=null?'0x'+r.out_pid.toString(16).padStart(4,'0'):'—'}</td>
+      <td>${escapeHtml(r.kind||'')}<span class="muted mono" style="font-size:10px"> ${r.stream_type?'0x'+r.stream_type.toString(16).padStart(2,'0'):''}</span></td>
+      <td>${fmtNum(r.packets||0)}</td>
+      <td>${fmtBitrate(r.bitrate_bps||0)}</td>
+      <td>${fmtNum(r.cc_errors||0)}</td>
+      <td>${fmtNum(r.pcr_discontinuity_errors||0)}</td>
+    </tr>`).join('');
+  return `
+    <div class="section">
+      <div class="section-title">PID bus / per-ES</div>
+      <table>
+        <thead><tr><th>Input</th><th>Src PID</th><th>Out PID</th><th>Kind</th><th>Pkts</th><th>Bitrate</th><th>CC err</th><th>PCR disc.</th></tr></thead>
+        <tbody>${trs}</tbody>
+      </table>
+    </div>`;
+}
+
+function renderPcrTrustFlow(p) {
+  const cls = (us) => us > 20000 ? 'bad' : (us > 5000 ? 'warn' : 'good');
+  return `
+    <div class="section">
+      <div class="section-title">PCR trust (flow-wide)</div>
+      <div class="stats-grid">
+        <div class="stat"><span class="k">p50</span><span class="v ${cls(p.p50_us||0)}">${fmtUs(p.p50_us||0)}</span></div>
+        <div class="stat"><span class="k">p95</span><span class="v ${cls(p.p95_us||0)}">${fmtUs(p.p95_us||0)}</span></div>
+        <div class="stat"><span class="k">p99</span><span class="v ${cls(p.p99_us||0)}">${fmtUs(p.p99_us||0)}</span></div>
+        <div class="stat"><span class="k">max</span><span class="v ${cls(p.max_us||0)}">${fmtUs(p.max_us||0)}</span></div>
+        <div class="stat"><span class="k">avg</span><span class="v">${fmtUs(p.avg_us||0)}</span></div>
+        <div class="stat"><span class="k">samples</span><span class="v">${fmtNum(p.samples||0)}</span></div>
+        <div class="stat"><span class="k">recent p95</span><span class="v">${fmtUs(p.window_p95_us||0)}</span></div>
+      </div>
+    </div>`;
+}
+
+function renderContentAnalysis(ca) {
+  const out = [];
+
+  // Lite
+  if (ca.lite) {
+    const l = ca.lite;
+    const blocks = [];
+
+    if (l.gop) blocks.push(`<div class="sub-card">
+      <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">GOP</div>
+      <div class="row">
+        <span><b>codec</b> ${escapeHtml(l.gop.codec||'?')}</span>
+        ${l.gop.video_pid!=null?`<span><b>PID</b> 0x${l.gop.video_pid.toString(16)}</span>`:''}
+        <span><b>IDR</b> ${fmtNum(l.gop.idr_count||0)}</span>
+        <span><b>I/P/B</b> ${fmtNum(l.gop.i_count||0)}/${fmtNum(l.gop.p_count||0)}/${fmtNum(l.gop.b_count||0)}</span>
+        ${l.gop.idr_interval_frames!=null?`<span><b>IDR int.</b> ${l.gop.idr_interval_frames.toFixed(1)} f</span>`:''}
+        ${l.gop.closed_gop!=null?`<span class="tag ${l.gop.closed_gop?'tag-good':'tag-warn'}">${l.gop.closed_gop?'closed':'open'} GOP</span>`:''}
+      </div></div>`);
+
+    if (l.signalling) {
+      const s = l.signalling;
+      blocks.push(`<div class="sub-card">
+        <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Signalling</div>
+        <div class="row">
+          ${s.aspect_ratio?`<span><b>AR</b> ${escapeHtml(s.aspect_ratio)}</span>`:''}
+          ${s.hdr?`<span class="tag ${s.hdr==='sdr'?'':'tag-good'}">${escapeHtml(s.hdr.toUpperCase())}</span>`:''}
+          ${s.colour_primaries?`<span><b>colour</b> ${escapeHtml(s.colour_primaries)}</span>`:''}
+          ${s.transfer_characteristics?`<span><b>transfer</b> ${escapeHtml(s.transfer_characteristics)}</span>`:''}
+          ${s.matrix_coefficients?`<span><b>matrix</b> ${escapeHtml(s.matrix_coefficients)}</span>`:''}
+          ${s.video_range?`<span><b>range</b> ${escapeHtml(s.video_range)}</span>`:''}
+          ${s.max_cll!=null?`<span><b>MaxCLL</b> ${s.max_cll}</span>`:''}
+          ${s.max_fall!=null?`<span><b>MaxFALL</b> ${s.max_fall}</span>`:''}
+          ${s.afd!=null?`<span><b>AFD</b> ${s.afd}</span>`:''}
+        </div></div>`);
+    }
+
+    if (l.timecode) {
+      const t = l.timecode;
+      blocks.push(`<div class="sub-card">
+        <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Timecode</div>
+        <div class="row">
+          <span class="tag ${t.seen?'tag-good':''}">${t.seen?'seen':'absent'}</span>
+          ${t.last?`<span class="mono"><b>${escapeHtml(t.last)}</b></span>`:''}
+          ${t.monotonic?'':'<span class="tag tag-warn">non-monotonic</span>'}
+          ${t.non_monotonic_count?`<span><b>jumps</b> ${fmtNum(t.non_monotonic_count)}</span>`:''}
+        </div></div>`);
+    }
+
+    if (l.captions) {
+      const c = l.captions;
+      blocks.push(`<div class="sub-card">
+        <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Captions</div>
+        <div class="row">
+          <span class="tag ${c.present?'tag-good':''}">${c.present?'present':'absent'}</span>
+          <span><b>pkts</b> ${fmtNum(c.packet_count||0)}</span>
+          ${(c.services||[]).map(s=>`<span class="tag">${escapeHtml(s)}</span>`).join('')}
+        </div></div>`);
+    }
+
+    if (l.scte35) {
+      const s = l.scte35;
+      blocks.push(`<div class="sub-card">
+        <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">SCTE-35</div>
+        <div class="row">
+          ${(s.pids||[]).map(p=>`<span class="tag mono">0x${p.toString(16)}</span>`).join('')}
+          <span><b>cues</b> ${fmtNum(s.cue_count||0)}</span>
+          ${s.last_command?`<span><b>last</b> ${escapeHtml(s.last_command)}</span>`:''}
+          ${s.last_pts!=null?`<span class="mono">${fmtPts(s.last_pts)}</span>`:''}
+        </div></div>`);
+    }
+
+    if (l.mdi) {
+      const m = l.mdi;
+      const cls = (m.delay_factor_ms||0) > 50 ? 'tag-warn' : '';
+      blocks.push(`<div class="sub-card">
+        <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">MDI <span class="muted mono" style="text-transform:none">${escapeHtml(m.model||'')}</span></div>
+        <div class="row">
+          <span class="tag ${cls}"><b>${escapeHtml(m.mdi||'')}</b></span>
+          <span><b>NDF</b> ${(m.delay_factor_ms||0).toFixed(1)} ms</span>
+          <span><b>MLR</b> ${(m.loss_rate_pps||0).toFixed(2)} /s</span>
+          ${m.windows_above_threshold?`<span class="tag tag-warn">windows&gt;th: ${fmtNum(m.windows_above_threshold)}</span>`:''}
+        </div></div>`);
+    }
+
+    if (blocks.length) out.push(`
+      <div class="section">
+        <div class="section-title">Content analysis · Lite ${l.analyser_drops?`<span class="tag tag-warn">drops ${fmtNum(l.analyser_drops)}</span>`:''}</div>
+        <div style="display:flex;flex-direction:column;gap:6px">${blocks.join('')}</div>
+      </div>`);
+  }
+
+  // Audio Full
+  if (ca.audio_full) out.push(`
+    <div class="section">
+      <div class="section-title">Content analysis · Audio Full</div>
+      <pre class="mono sub-card" style="white-space:pre-wrap;font-size:11px;max-height:240px;overflow:auto">${escapeHtml(JSON.stringify(ca.audio_full, null, 2))}</pre>
+    </div>`);
+
+  // Video Full
+  if (ca.video_full) out.push(`
+    <div class="section">
+      <div class="section-title">Content analysis · Video Full</div>
+      <pre class="mono sub-card" style="white-space:pre-wrap;font-size:11px;max-height:240px;overflow:auto">${escapeHtml(JSON.stringify(ca.video_full, null, 2))}</pre>
+    </div>`);
+
+  return out.join('');
+}
+
+function renderRecording(r) {
+  const mode = r.mode || (r.armed ? 'armed' : 'idle');
+  const cls = mode === 'armed' ? 'badge-rec' : (mode === 'pre_buffer' ? 'badge-prebuf' : 'badge-idle');
+  return `
+    <div class="section">
+      <div class="section-title">Replay recording <span class="badge ${cls}">${escapeHtml(mode.replace('_','-'))}</span></div>
+      <div class="stats-grid">
+        ${r.recording_id?`<div class="stat"><span class="k">ID</span><span class="v mono" style="font-size:11px">${escapeHtml(r.recording_id)}</span></div>`:''}
+        <div class="stat"><span class="k">PTS now</span><span class="v mono">${fmtPts(r.current_pts_90khz||0)}</span></div>
+        <div class="stat"><span class="k">Segments</span><span class="v">${fmtNum(r.segments_written||0)}</span></div>
+        <div class="stat"><span class="k">Pruned</span><span class="v">${fmtNum(r.segments_pruned||0)}</span></div>
+        <div class="stat"><span class="k">Bytes</span><span class="v">${fmtBytes(r.bytes_written||0)}</span></div>
+        <div class="stat"><span class="k">IDR idx</span><span class="v">${fmtNum(r.index_entries||0)}</span></div>
+        <div class="stat"><span class="k">Dropped</span><span class="v ${r.packets_dropped?'bad':''}">${fmtNum(r.packets_dropped||0)}</span></div>
+      </div>
+    </div>`;
+}
+
+function renderOutputs(outs) {
+  const rows = outs.map(o => {
+    const lat = o.latency || {};
+    const pcr = o.pcr_trust;
+    const eg = o.egress_summary;
+    let detail = '';
+    if (eg || pcr || o.display_stats) {
+      const subs = [];
+      if (eg) subs.push(renderEgressSummary(eg, 'egress'));
+      if (pcr) subs.push(`<div class="sub-card" style="margin-top:6px"><div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">PCR trust</div><div class="row"><span><b>p50</b> ${fmtUs(pcr.p50_us)}</span><span><b>p95</b> ${fmtUs(pcr.p95_us)}</span><span><b>p99</b> ${fmtUs(pcr.p99_us)}</span><span><b>max</b> ${fmtUs(pcr.max_us)}</span><span><b>n</b> ${fmtNum(pcr.samples)}</span></div></div>`);
+      if (o.display_stats) {
+        const d = o.display_stats;
+        subs.push(`<div class="sub-card" style="margin-top:6px"><div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Display</div><div class="row"><span><b>${escapeHtml(d.current_resolution||'')}</b> @${d.current_refresh_hz||0}Hz</span><span><b>shown</b> ${fmtNum(d.frames_displayed||0)}</span><span><b>late</b> ${fmtNum(d.frames_dropped_late||0)}</span><span><b>repeat</b> ${fmtNum(d.frames_repeated||0)}</span><span><b>xrun</b> ${fmtNum(d.audio_underruns||0)}</span><span><b>A/V</b> ${d.av_sync_offset_ms||0} ms</span></div></div>`);
+      }
+      detail = `<details><summary>Detail</summary>${subs.join('')}</details>`;
+    }
+    return `
+      <tr>
+        <td>
+          <div style="font-weight:500">${escapeHtml(o.output_name||o.output_id||'')}</div>
+          <div class="muted mono" style="font-size:10px">${escapeHtml(o.output_id||'')}</div>
+          ${detail}
+        </td>
+        <td>${escapeHtml(o.output_type||'')}${o.program_number!=null?`<div class="muted mono" style="font-size:10px">prog ${o.program_number}</div>`:''}</td>
+        <td>${escapeHtml(o.state||'')}</td>
+        <td>${fmtNum(o.packets_sent||0)}</td>
+        <td>${fmtBitrate(o.bitrate_bps||0)}</td>
+        <td class="${o.packets_dropped?'bad':''}">${fmtNum(o.packets_dropped||0)}</td>
+        <td>${fmtNum(o.fec_packets_sent||0)}</td>
+        <td>${lat.avg_us!=null?fmtUs(lat.avg_us):'—'}${lat.latency_frames!=null?` <span class="muted">(${lat.latency_frames.toFixed(1)} f)</span>`:''}</td>
+      </tr>`;
+  }).join('');
+  return `
+    <div class="section">
+      <div class="section-title">Outputs (${outs.length})</div>
+      <table>
+        <thead><tr><th>Name</th><th>Type</th><th>State</th><th>Pkts</th><th>Bitrate</th><th>Dropped</th><th>FEC</th><th>Latency</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+}
+
+function renderSmpteTrust(f) {
+  const i = f.iat;
+  return `
+    <div class="section">
+      <div class="section-title">SMPTE trust boundary</div>
+      <div class="stats-grid">
+        ${i?`<div class="stat"><span class="k">IAT min</span><span class="v">${fmtUs(i.min_us)}</span></div>
+            <div class="stat"><span class="k">IAT avg</span><span class="v">${fmtUs(i.avg_us)}</span></div>
+            <div class="stat"><span class="k">IAT max</span><span class="v">${fmtUs(i.max_us)}</span></div>`:''}
+        ${f.pdv_jitter_us!=null?`<div class="stat"><span class="k">PDV / jitter</span><span class="v">${fmtUs(f.pdv_jitter_us)}</span></div>`:''}
+      </div>
+    </div>`;
+}
+
+// ────────────────────── orchestration ──────────────────────
+function render() {
+  renderSystemBar();
+  renderInventory();
+  renderFlows();
+  renderTunnels();
+}
+
+async function tickSlow() {
+  // Things that don't ride on the WS broadcast: health + tunnels +
+  // a fresh AllStatsResponse so system bar + inputs/outputs inventory
+  // stay current (WS only carries the flows array).
+  await Promise.all([refreshStats(), refreshHealth(), refreshTunnels()]);
+}
+
+async function main() {
+  // Initial paint so the page isn't blank if /api/ws is slow to greet us.
+  await Promise.all([refreshStats(), refreshHealth(), refreshTunnels()]);
+  openWs();
+
+  // Slow tick: capabilities + resource budget + tunnels (every 5 s).
+  setInterval(tickSlow, 5000);
+
+  // Fallback: if WS hasn't delivered a message in 4 s, poll /api/stats once.
+  setInterval(() => {
+    if (!state.wsConnected || (Date.now() - state.lastWsMsgAt > 4000)) {
+      refreshStats();
+    }
+  }, 1500);
+}
+main().catch(e => setConn('err', String(e)));
+</script>
+</body>
+</html>

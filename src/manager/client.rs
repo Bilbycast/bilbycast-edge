@@ -786,7 +786,7 @@ fn build_health_message(
     })
 }
 
-fn build_health_payload(
+pub(crate) fn build_health_payload(
     flow_manager: &FlowManager,
     api_addr: &str,
     monitor_addr: Option<&str>,
