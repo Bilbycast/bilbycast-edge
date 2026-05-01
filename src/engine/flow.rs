@@ -1518,6 +1518,54 @@ impl FlowRuntime {
                     stats: output_stats,
                 })
             }
+            OutputConfig::Display(c) => {
+                // Display output is Linux-only and gated by the `display`
+                // Cargo feature. The schema is always present so configs
+                // round-trip cleanly across platforms; on non-feature /
+                // non-Linux builds the schema parses fine but the spawner
+                // refuses with `display_device_invalid` so the manager UI
+                // can highlight the offending field.
+                let output_stats = flow_stats.register_output(
+                    c.id.clone(),
+                    c.name.clone(),
+                    "display".to_string(),
+                );
+                output_stats.set_egress_static(
+                    crate::stats::collector::EgressMediaSummaryStatic {
+                        transport_mode: Some("display".into()),
+                        video_passthrough: false,
+                        audio_passthrough: false,
+                        audio_only: false,
+                    },
+                );
+
+                #[cfg(all(feature = "display", target_os = "linux"))]
+                {
+                    let handle = super::output_display::spawn_display_output(
+                        c.clone(),
+                        broadcast_tx,
+                        output_stats.clone(),
+                        output_cancel.clone(),
+                        event_sender.clone(),
+                        flow_id.to_string(),
+                    );
+                    Ok(OutputRuntime {
+                        handle,
+                        cancel_token: output_cancel,
+                        stats: output_stats,
+                    })
+                }
+                #[cfg(not(all(feature = "display", target_os = "linux")))]
+                {
+                    let _ = (broadcast_tx, output_stats, output_cancel, event_sender, flow_id);
+                    anyhow::bail!(
+                        "display output '{}' not supported: this build was compiled without \
+                         the 'display' Cargo feature, or for a non-Linux target \
+                         (error_code: display_device_invalid)",
+                        c.id
+                    )
+                }
+            }
         }
     }
 
@@ -3179,6 +3227,29 @@ fn build_output_config_meta(config: &OutputConfig) -> OutputConfigMeta {
             whip_url: None,
             program_number: c.program_number,
         },
+        OutputConfig::Display(c) => OutputConfigMeta {
+            mode: Some(format!(
+                "display ({}{}{})",
+                c.device,
+                c.audio_device
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|a| format!(" → {}", a))
+                    .unwrap_or_default(),
+                c.resolution
+                    .as_deref()
+                    .filter(|s| !s.is_empty() && *s != "auto")
+                    .map(|r| format!(" @ {}", r))
+                    .unwrap_or_default(),
+            )),
+            remote_addr: None,
+            local_addr: None,
+            dest_addr: Some(c.device.clone()),
+            dest_url: None,
+            ingest_url: None,
+            whip_url: None,
+            program_number: c.program_number,
+        },
     }
 }
 
@@ -3211,6 +3282,13 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
         // — count them as one SW video encode each.
         if matches!(out, OutputConfig::St2110_20(_) | OutputConfig::St2110_23(_)) {
             plan.sw_video_encode_outputs = plan.sw_video_encode_outputs.saturating_add(1);
+        }
+        // Local-display outputs run a SW video decode + ALSA write
+        // pipeline (Linux-only, gated on the `display` Cargo feature).
+        // Counted separately from sw/hw video *encode* outputs because
+        // the cost weight differs.
+        if matches!(out, OutputConfig::Display(_)) {
+            plan.display_outputs = plan.display_outputs.saturating_add(1);
         }
     }
 

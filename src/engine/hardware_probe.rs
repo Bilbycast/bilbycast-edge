@@ -409,6 +409,13 @@ pub fn compute_flow_cost_units(plan: &FlowCostPlan) -> u32 {
     units = units.saturating_add(100u32.saturating_mul(plan.hw_video_encode_outputs));
     units = units.saturating_add(500u32.saturating_mul(plan.sw_video_encode_outputs));
     units = units.saturating_add(5u32.saturating_mul(plan.audio_encode_outputs));
+    // Local-display outputs run a SW video decode + ALSA write per
+    // active flow. The weight roughly mirrors a SW video encode at
+    // 1080p30 (250) — we charge 275 units (250 video + 5 audio +
+    // 20 KMS render) so a 4K60 display output approaches the cost of
+    // a 4K60 transcode. Operators on hosts with `display-vaapi` /
+    // `display-nvdec` will see this drop to 100 in v2.
+    units = units.saturating_add(275u32.saturating_mul(plan.display_outputs));
     if plan.content_analysis_lite {
         units = units.saturating_add(2);
     }
@@ -433,6 +440,10 @@ pub struct FlowCostPlan {
     pub hw_video_encode_outputs: u32,
     pub sw_video_encode_outputs: u32,
     pub audio_encode_outputs: u32,
+    /// Number of `display` outputs on the flow. Linux-only; on
+    /// non-Linux / non-feature builds this stays 0 because the
+    /// schema-only Display variant is rejected at `start_output`.
+    pub display_outputs: u32,
     pub content_analysis_lite: bool,
     pub content_analysis_audio_full: bool,
     pub content_analysis_video_full: bool,

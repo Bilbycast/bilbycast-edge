@@ -1248,6 +1248,104 @@ for the full event reference.
 `libfdk_aac`. If the host's ffmpeg doesn't have it, the encoder
 fails fast on the first frame and emits the failure event.
 
+### Display Output (HDMI / DisplayPort + ALSA)
+
+Decode the flow's video + audio and render to a **physical Linux
+display connector** (HDMI / DisplayPort) plus an ALSA audio device.
+Useful for stadium / OB-truck / MCR / gallery confidence monitors that
+the operator wants the manager to control alongside every other
+output.
+
+```json
+{
+  "type": "display",
+  "id": "disp-1",
+  "name": "Green-room HDMI",
+  "device": "HDMI-A-1",
+  "audio_device": "hw:0,3",
+  "program_number": null,
+  "audio_track_index": 0,
+  "audio_channel_pair": [0, 1],
+  "resolution": "1920x1080",
+  "refresh_hz": 60,
+  "sync_mode": "vsync_to_display"
+}
+```
+
+- **`device`** (required) — KMS connector name from
+  [`HealthPayload.display_devices`](events-and-alarms.md#display-events).
+  Validated against the canonical KMS pattern `^[A-Z][A-Z0-9-]{0,63}$`
+  (e.g. `HDMI-A-1`, `DP-2`, `DVI-D-1`).
+- **`audio_device`** — ALSA device id (`hw:N,M` / `plughw:N,M` /
+  `default` / `sysdefault` / `pulse`). `null` mutes audio playback —
+  the output renders video only. The manager UI populates this from
+  the connector's enumerated `alsa_device` field; operators can
+  override.
+- **`program_number`** — MPTS program filter (1-based). `null` selects
+  the lowest program in the active input's PAT.
+- **`audio_track_index`** — 0-based index into the program's audio
+  elementary streams (`0..=15`). Lets the operator pick `EN` over `ES`
+  on dual-language broadcasts.
+- **`audio_channel_pair`** — which two channels of the decoded
+  multichannel audio drive the stereo ALSA sink. Default `[0, 1]` =
+  L/R. Both indices must be `< 8` and not equal.
+- **`resolution`** — `"auto"` (use the connector's preferred mode) or
+  `"WIDTHxHEIGHT"` (e.g. `"1920x1080"`, `"3840x2160"`). `null` ≡ auto.
+- **`refresh_hz`** — `1..=240`. `null` uses the connector's preferred
+  refresh.
+- **`sync_mode`** — only `"vsync_to_display"` in v1: the renderer
+  paces to monitor vsync and dup/drops video to track the audio
+  master clock. PTP-genlocked / PCR-master modes land in v2.
+
+**Build prerequisites.** `display` is Linux-only and gated on the
+`display` Cargo feature (off by default). Schema is unconditional —
+configs round-trip on every platform. On non-Linux / non-feature
+builds the spawner refuses with `display_device_invalid` so the
+manager UI can highlight the offending field. Install:
+
+```sh
+sudo apt install libdrm-dev libasound2-dev libudev-dev
+cargo build --release --features display
+```
+
+**Codec coverage.** Video: H.264 + HEVC (software decode via
+libavcodec — same backend as content-analysis). Audio: AAC family
+(in-process via fdk-aac), MP2 / AC-3 / E-AC-3 (in-process via the new
+`video-engine::AudioDecoder` libavcodec wrapper) — every common
+broadcast audio codec works out of the box.
+
+**A/V sync = audio is master.** The audio child task's blocking ALSA
+write *is* the wall clock; the display task reads a lock-free
+`AudioClock` per-frame and dup/drops video to keep the offset within
+±1 frame period. ALSA xrun (`EPIPE`) → `prepare()` and continue
+without nudging the anchor (clock pauses for the recovery window —
+psychoacoustically less harmful than a fast-forward).
+
+**Capacity.** Each running display output consumes 275 resource-budget
+units (1080p30 baseline — 250 for the SW video decode, 5 for ALSA, 20
+for the KMS render). 4K60 outputs scale to ≈1025 — comparable to a
+4K60 SW transcode. See [Capacity & resource budget](#capacity--resource-budget).
+
+**Limitations (v1, called out explicitly):**
+
+- Software video decode only. Hardware decode (VAAPI / NVDEC) is
+  scheduled for v2 behind the `display-vaapi` / `display-nvdec`
+  Cargo features (placeholders today).
+- HDMI hotplug rediscovery is startup-only. New connectors require
+  an edge restart to appear in `display_devices`.
+- Multichannel passthrough (5.1/7.1 LPCM over HDMI) is downmixed to
+  the configured stereo `audio_channel_pair`. Full passthrough is
+  v2.
+- No HDR / colour-management / SCTE-104 / closed-caption rendering.
+- One display output per connector at a time — cross-output
+  uniqueness is enforced (`display_device_busy`).
+
+See [`docs/events-and-alarms.md`](events-and-alarms.md#display-events)
+for the full event catalogue, including `display_device_unavailable`,
+`display_mode_set_failed`, `display_audio_open_failed`,
+`display_decoder_overload`, `display_av_drift`,
+`display_subscriber_lagged`.
+
 ---
 
 ## Flow Assembly (PID bus — SPTS / MPTS from N inputs)

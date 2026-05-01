@@ -212,6 +212,24 @@ pub async fn test_output(config: &OutputConfig) -> TestResult {
                     )
                 }
             }
+            OutputConfig::Display(d) => {
+                // Connectivity tests don't apply — display outputs render to
+                // a local KMS connector + ALSA device. The runtime spawner is
+                // the only place that can confirm both exist.
+                TestResult::ok(
+                    "configured",
+                    format!(
+                        "display output configured for connector '{}'{}",
+                        d.device,
+                        d.audio_device
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .map(|a| format!(" + audio '{}'", a))
+                            .unwrap_or_default(),
+                    ),
+                    start.elapsed(),
+                )
+            }
         }
     })
     .await;

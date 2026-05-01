@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-edge"
-version = "0.35.1"
+version = "0.36.0"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 license = "AGPL-3.0-or-later"
@@ -172,7 +172,16 @@ mp4 = "0.14"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif"] }
 
 [features]
-default = ["tls", "webrtc", "fdk-aac", "video-thumbnail", "replay"]
+# `display` is in the default feature set: every Linux release variant
+# (default + full) ships the local-display output. The optional `drm` /
+# `alsa` / `udev` deps are themselves target-gated to `cfg(target_os =
+# "linux")`, so a default `cargo build` on macOS still compiles cleanly
+# (the optional deps simply aren't selected, and the runtime spawner
+# refuses with `display_device_invalid`). On a headless Linux host the
+# feature stays dormant — `enumerate_displays()` returns empty, the
+# `"display"` capability isn't advertised, and the manager UI hides the
+# option per-node.
+default = ["tls", "webrtc", "fdk-aac", "video-thumbnail", "replay", "display"]
 # Replay server: continuous flow recording to disk + playback as a fresh
 # input. Adds the `recording` flow attribute and the `replay` input type.
 # Pure-Rust, no new C deps. See `src/replay/` and `docs/replay.md`.
@@ -219,6 +228,31 @@ video-encoders-full = [
     "video-encoder-nvenc",
     "video-encoder-qsv",
 ]
+# Local-display output — decode the flow's video + audio and render to a
+# Linux KMS connector (HDMI / DisplayPort) plus an ALSA audio device.
+# Linux-only (the optional `drm` / `alsa` / `libudev` deps are
+# target-gated below). Pulls in libdrm + libasound2 + libudev at link
+# time; `apt install libdrm-dev libasound2-dev libudev-dev` (Debian /
+# Ubuntu) or the equivalent RPM. Off by default so generic builds stay
+# portable. Audio decode of MP2 / AC-3 / E-AC-3 / Opus rides through the
+# `video-thumbnail` `AudioDecoder` (libavcodec). See
+# `docs/configuration-guide.md` "Display output (HDMI / DisplayPort)".
+display = [
+    "dep:drm",
+    "dep:alsa",
+    "dep:udev",
+    "video-thumbnail",
+    "fdk-aac",
+]
+# v2 placeholder: hardware-decoded video on the display output via VAAPI
+# (`video-engine` `decode-vaapi` feature). Listed here so the manager UI
+# can advertise it on `HealthPayload.capabilities` once it lands; today
+# the build fails fast with a `compile_error!` so we don't ship a
+# half-finished path.
+display-vaapi = ["display"]
+# v2 placeholder: hardware-decoded video on the display output via NVDEC.
+# Same shape as `display-vaapi`.
+display-nvdec = ["display"]
 # Enable TLS (HTTPS on API + RTMPS) support via rustls/tokio-rustls/axum-server.
 tls = ["dep:tokio-rustls", "dep:axum-server"]
 # Enable WebRTC WHIP/WHEP input and output via str0m (pure Rust, sans-I/O).
@@ -289,6 +323,17 @@ tempfile = "3.27.0"
 # on release builds for those targets; the rest stays cleanly opt-out.
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 nvml-wrapper = { version = "0.12", optional = true }
+
+# Local-display output — Linux-only (`drm` is libdrm/KMS, `alsa` is
+# libasound2, `udev` is libudev for hotplug enumeration). All three are
+# `optional = true` and gated by the `display` Cargo feature; non-Linux
+# builds short-circuit `enumerate_displays()` to `Vec::new()` and never
+# advertise the capability. Install: `apt install libdrm-dev
+# libasound2-dev libudev-dev` on Debian / Ubuntu.
+[target.'cfg(target_os = "linux")'.dependencies]
+drm = { version = "0.14", optional = true }
+alsa = { version = "0.9", optional = true }
+udev = { version = "0.9", optional = true }
 
 # ---------------------------------------------------------------------------
 # BILBYCAST PATCH: vendored `is` 0.8.0 with the strict-PRIORITY check on ICE

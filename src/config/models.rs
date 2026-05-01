@@ -1736,6 +1736,12 @@ pub enum OutputConfig {
     /// best paths. Pair with a `bonded` input at the far end.
     #[serde(rename = "bonded")]
     Bonded(BondedOutputConfig),
+    /// Decode the flow's video + audio and render to a local Linux display
+    /// connector (HDMI / DisplayPort) plus an ALSA audio device.
+    /// Linux-only at runtime (gated by Cargo feature `display`); the schema
+    /// is always present so configs round-trip cleanly across platforms.
+    #[serde(rename = "display")]
+    Display(DisplayOutputConfig),
 }
 
 impl OutputConfig {
@@ -1757,6 +1763,7 @@ impl OutputConfig {
             OutputConfig::St2110_23(c) => &c.id,
             OutputConfig::RtpAudio(c) => &c.id,
             OutputConfig::Bonded(c) => &c.id,
+            OutputConfig::Display(c) => &c.id,
         }
     }
 
@@ -1778,6 +1785,7 @@ impl OutputConfig {
             OutputConfig::St2110_23(c) => &c.name,
             OutputConfig::RtpAudio(c) => &c.name,
             OutputConfig::Bonded(c) => &c.name,
+            OutputConfig::Display(c) => &c.name,
         }
     }
 
@@ -1799,6 +1807,7 @@ impl OutputConfig {
             OutputConfig::St2110_23(_) => "st2110_23",
             OutputConfig::RtpAudio(_) => "rtp_audio",
             OutputConfig::Bonded(_) => "bonded",
+            OutputConfig::Display(_) => "display",
         }
     }
 
@@ -1821,6 +1830,7 @@ impl OutputConfig {
             OutputConfig::St2110_23(c) => c.active,
             OutputConfig::RtpAudio(c) => c.active,
             OutputConfig::Bonded(c) => c.active,
+            OutputConfig::Display(c) => c.active,
         }
     }
 
@@ -1844,6 +1854,7 @@ impl OutputConfig {
             OutputConfig::St2110_23(c) => c.active = active,
             OutputConfig::RtpAudio(c) => c.active = active,
             OutputConfig::Bonded(c) => c.active = active,
+            OutputConfig::Display(c) => c.active = active,
         }
     }
 
@@ -1865,6 +1876,7 @@ impl OutputConfig {
             OutputConfig::St2110_23(c) => c.group.as_deref(),
             OutputConfig::RtpAudio(c) => c.group.as_deref(),
             OutputConfig::Bonded(c) => c.group.as_deref(),
+            OutputConfig::Display(c) => c.group.as_deref(),
         }
     }
 }
@@ -3941,6 +3953,87 @@ fn default_st2110_audio_pt() -> u8 {
 
 fn default_st2110_anc_pt() -> u8 {
     100
+}
+
+/// Local-display output: decode the flow's video + audio and render to a
+/// physical Linux HDMI/DisplayPort connector + an ALSA audio device.
+///
+/// `device` is a KMS connector name (e.g. `"HDMI-A-1"`, `"DP-2"`) drawn from
+/// `HealthPayload.display_devices` enumerated at edge startup. `audio_device`
+/// is an ALSA device id (`"hw:0,3"`, `"plughw:0,3"`, `"default"`); `None`
+/// disables audio playback. The remaining fields select which TS program,
+/// audio elementary stream, and stereo channel pair drive the output.
+///
+/// At runtime this output is only spawnable on Linux builds compiled with
+/// the `display` Cargo feature. Configs with `display` outputs round-trip
+/// cleanly on every platform — non-Linux/feature-off builds reject the
+/// output at `start_output()` with `display_device_invalid`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DisplayOutputConfig {
+    /// Unique output ID within this flow.
+    pub id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Whether this output is currently active. Passive outputs stay in
+    /// config but the engine does not spawn a task for them.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Optional free-form group tag (max 64 chars) for UI grouping and
+    /// the Phase 2 switchboard feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+
+    /// KMS connector name from the edge's display enumeration, e.g.
+    /// `"HDMI-A-1"`, `"DP-2"`, `"DVI-D-1"`. Validated against the
+    /// canonical KMS naming pattern `^[A-Z][A-Z0-9-]{0,63}$`.
+    pub device: String,
+
+    /// ALSA device id (`"hw:0,3"`, `"plughw:0,3"`, `"default"`,
+    /// `"sysdefault"`, `"pulse"`). `None` or empty mutes audio playback —
+    /// the display output is video-only in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_device: Option<String>,
+
+    /// MPEG-TS program filter (1-based; `program_number = 0` is reserved
+    /// for the NIT and rejected). `None` selects the lowest program in
+    /// the active input's PAT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
+
+    /// Audio elementary-stream index within the chosen program. `None`
+    /// selects the first audio track. Must be < 16.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_track_index: Option<u8>,
+
+    /// Stereo channel pair to render from the decoded multichannel audio.
+    /// Both indices must be < 8 and not equal. Defaults to `[0, 1]` (L/R).
+    #[serde(default = "default_audio_channel_pair")]
+    pub audio_channel_pair: [u8; 2],
+
+    /// Display resolution: either `"auto"` (use the connector's preferred
+    /// mode) or a `"WIDTHxHEIGHT"` string (e.g. `"1920x1080"`). `None`
+    /// is treated as `"auto"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+
+    /// Refresh rate in Hz (typical: 50, 59, 60). `None` uses the
+    /// connector's preferred mode. Range 1..=240.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_hz: Option<u32>,
+
+    /// A/V sync mode. v1 only accepts `"vsync_to_display"` — the renderer
+    /// paces to the monitor's vsync and dup/drops video to track the audio
+    /// clock. PTP-genlocked / PCR-master modes land in v2.
+    #[serde(default = "default_sync_mode")]
+    pub sync_mode: String,
+}
+
+fn default_audio_channel_pair() -> [u8; 2] {
+    [0, 1]
+}
+
+fn default_sync_mode() -> String {
+    "vsync_to_display".to_string()
 }
 
 #[cfg(test)]

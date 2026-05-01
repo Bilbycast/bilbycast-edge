@@ -419,6 +419,9 @@ impl SecretsConfig {
             // Bonded outputs: see note on the input side — TLS
             // material references paths, not inline secrets.
             OutputConfig::Bonded(_) => {}
+            // Display outputs render to local hardware; no infrastructure
+            // or content secrets travel with the config.
+            OutputConfig::Display(_) => {}
         }
     }
 }

@@ -832,7 +832,7 @@ pub struct PendingEssenceSlot {
 /// when it expands a [`crate::config::models::SlotSource::Hitless`]
 /// slot into a synthetic bus key. The runtime walks `pending_hitless`
 /// after essence resolution and spawns one
-/// [`crate::engine::ts_es_hitless::spawn_hitless_es_merger`] per entry
+/// [`crate::engine::ts_es_hitless::spawn_hitless_es_merger_full`] per entry
 /// before bringing the assembler up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingHitlessSlot {
@@ -1212,7 +1212,6 @@ mod tests {
                     pcr: None,
                     recv_time_us: 0,
                     upstream_seq: None,
-                    upstream_leg_id: None,
                 })
                 .unwrap();
         }
@@ -1227,7 +1226,6 @@ mod tests {
                     pcr: None,
                     recv_time_us: 0,
                     upstream_seq: None,
-                    upstream_leg_id: None,
                 })
                 .unwrap();
         }
@@ -1408,7 +1406,6 @@ mod tests {
                 pcr: None,
                 recv_time_us: 0,
                 upstream_seq: None,
-                upstream_leg_id: None,
             })
             .unwrap();
 

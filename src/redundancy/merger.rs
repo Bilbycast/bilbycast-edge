@@ -494,7 +494,7 @@ struct LegState {
     last_arrival: Option<Instant>,
     /// Observed RTP SSRC (when the input layer fills it). 0 = unset.
     ssrc: u32,
-    /// State machine — Up → Degraded → Down.
+    /// State machine — Up → Down.
     health: LegHealth,
 }
 
@@ -503,7 +503,6 @@ pub enum LegHealth {
     #[default]
     Unknown,
     Up,
-    Degraded,
     Down,
 }
 
@@ -538,7 +537,7 @@ pub struct BufferedHitlessStats {
     pub leg2_packets_received: AtomicU64,
     pub leg1_last_arrival_unix_us: AtomicU64,
     pub leg2_last_arrival_unix_us: AtomicU64,
-    /// Tri-state per leg: 0 unknown, 1 up, 2 degraded, 3 down.
+    /// Tri-state per leg: 0 unknown, 1 up, 3 down.
     pub leg1_health: AtomicU64,
     pub leg2_health: AtomicU64,
     /// Set when the two legs are observed with mismatched SSRCs.
@@ -548,10 +547,6 @@ pub struct BufferedHitlessStats {
 /// Hard threshold on max_path_diff. Beyond this the constant emission
 /// latency would be larger than typical broadcast end-to-end budgets.
 pub const MAX_PATH_DIFF_BOUND: Duration = Duration::from_millis(2000);
-
-/// Default skew-accommodation window if none configured. 50 ms is the
-/// industry-typical mid-point for terrestrial WAN.
-pub const DEFAULT_PATH_DIFF: Duration = Duration::from_millis(50);
 
 /// Conservative upper bound on the seq buffer. At 2400 pkt/s this is
 /// ≈ 5 s of pending packets — far above any realistic path
@@ -901,7 +896,6 @@ fn health_code(h: LegHealth) -> u64 {
     match h {
         LegHealth::Unknown => 0,
         LegHealth::Up => 1,
-        LegHealth::Degraded => 2,
         LegHealth::Down => 3,
     }
 }

@@ -150,6 +150,7 @@ pub async fn create_flow(
             Ok(_runtime) => {
                 #[cfg(feature = "webrtc")]
                 register_whip_if_needed(&state, &_runtime);
+                #[cfg(feature = "webrtc")]
                 register_whep_if_needed(&state, &_runtime);
             }
             Err(e) => tracing::warn!("Flow '{}' persisted but failed to start: {e}", flow.id),
@@ -209,6 +210,7 @@ pub async fn update_flow(
             Ok(_runtime) => {
                 #[cfg(feature = "webrtc")]
                 register_whip_if_needed(&state, &_runtime);
+                #[cfg(feature = "webrtc")]
                 register_whep_if_needed(&state, &_runtime);
             }
             Err(e) => tracing::warn!("Flow '{}' updated but failed to restart: {e}", flow_id),
@@ -292,6 +294,7 @@ pub async fn start_flow(
 
     #[cfg(feature = "webrtc")]
     register_whip_if_needed(&state, &runtime);
+    #[cfg(feature = "webrtc")]
     register_whep_if_needed(&state, &runtime);
     let _ = runtime; // suppress unused warning when webrtc feature is off
 
@@ -447,6 +450,7 @@ pub async fn restart_flow(
 
     #[cfg(feature = "webrtc")]
     register_whip_if_needed(&state, &runtime);
+    #[cfg(feature = "webrtc")]
     register_whep_if_needed(&state, &runtime);
     let _ = runtime;
 

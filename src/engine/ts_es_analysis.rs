@@ -155,7 +155,6 @@ mod tests {
             pcr: None,
             recv_time_us: 0,
             upstream_seq: None,
-            upstream_leg_id: None,
         }
     }
 

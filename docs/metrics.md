@@ -406,3 +406,40 @@ The writer's `replay_writer_lagged` Critical event is emitted
 rate-limited (one per 5 s under sustained lag) so the events feed
 isn't drowned during a disk hiccup. `packets_dropped` continues to
 increment on every drop so dashboards can chart the real impact.
+
+## Display-output metrics (`OutputStats.display_stats`)
+
+Local-display outputs (Linux-only, `display` Cargo feature) populate
+the `display_stats` sub-block on `OutputStats`. Absent on every
+network-egress output, so old managers / non-display outputs see no
+field. All counters are lock-free atomic loads sampled at the regular
+1-second snapshot cadence.
+
+| Field | Meaning |
+|---|---|
+| `frames_displayed` | Total frames page-flipped to the connector since the output started |
+| `frames_dropped_late` | Frames the display task dropped because they fell more than one frame-period behind the audio master clock |
+| `frames_repeated` | Frames the display task held for an extra vsync because the next decoded frame's PTS was too far ahead of the audio clock |
+| `audio_underruns` | ALSA `EPIPE` (xrun) recoveries observed by the audio task |
+| `av_sync_offset_ms` | Signed EMA of the video-vs-audio offset in milliseconds (positive = video late). Read every 1-second snapshot |
+| `current_resolution` | Negotiated KMS mode resolution (e.g. `"1920x1080"`) — fixed at modeset, surfaced for the manager UI's flow-card subtitle |
+| `current_refresh_hz` | Negotiated refresh rate in Hz |
+| `pixel_format` | Pixel format on the wire to the connector. v1 always `"XRGB8888"`; v2 introduces DMA-BUF zero-copy variants |
+| `decoder_kind` | Decoder backend: `"sw"` (v1) / `"vaapi"` / `"nvdec"` (v2) |
+| `video_codec` | Source video codec (`"h264"` / `"hevc"`) |
+| `audio_codec` | Source audio codec (`"aac"` / `"mp2"` / `"ac3"` / `"eac3"` / `"opus"` / `"none"` when audio is muted) |
+
+Manager UI wiring:
+
+- `static/js/detail/flows.js` reads `display_stats` to render the
+  resolution annotation in the per-output table type cell
+  (`display (1920x1080@60Hz)`) and the green `DISPLAY` badge in the
+  name column.
+- The `Displays` Resources sub-card on `/nodes/{id}` reads the
+  separate `HealthPayload.display_devices` enumeration (not
+  `display_stats`) — that field is the static enumeration of every
+  connector the box has, regardless of whether any output is using
+  it.
+- The flow-card resource impact tile keys off
+  `FlowCostPlan.display_outputs` × 275 units (1080p30 baseline) so
+  the operator sees the cost before saving the flow.

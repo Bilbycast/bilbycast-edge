@@ -20,6 +20,8 @@ use tokio_util::sync::CancellationToken;
 
 mod api;
 mod config;
+#[cfg(all(feature = "display", target_os = "linux"))]
+mod display;
 mod engine;
 mod fec;
 mod manager;
@@ -240,6 +242,15 @@ async fn main() -> anyhow::Result<()> {
     // Static hardware capabilities — probed once at startup.
     let static_capabilities =
         Arc::new(engine::hardware_probe::probe_static_capabilities());
+    // Local-display enumeration. Linux-only; the cache is consulted by
+    // both the capability advertisement and the HealthPayload
+    // `display_devices` field. Empty when the box has no DRI nodes —
+    // the `"display"` capability simply isn't advertised in that case.
+    #[cfg(all(feature = "display", target_os = "linux"))]
+    {
+        let displays = display::init_displays();
+        tracing::info!("display: enumerated {} connector(s)", displays.len());
+    }
     tracing::info!(
         "hardware probe: cpu={} ({}/{} cores, avx={:?}); hw_encoders any={}; sw x264/x265={}/{}",
         static_capabilities.cpu.brand,

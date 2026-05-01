@@ -601,3 +601,41 @@ Producers should use `EventSender::emit_with_details(EventSeverity::*,
 category::REPLAY, message, flow_id, details)` (defined in
 `src/manager/events.rs`) — `category::REPLAY` is the canonical
 constant.
+
+## Display-output events (`display`)
+
+The local-display output (Linux-only, gated on the `display` Cargo
+feature) emits events under category `display`. Every failure event
+sets `details.error_code` for `command_ack` correlation, plus
+`details.output_id` so the manager UI can attribute the failure to
+the offending output row on a multi-output flow.
+
+| Event | Severity | Trigger | Notes |
+|---|---|---|---|
+| `display_started` | Info | Modeset succeeded, ALSA opened (or muted), first frame queued | `details = { error_code: "ok", output_id, … }` |
+| `display_stopped` | Info | Cancellation token fired; CRTC + framebuffers + ALSA released | Includes lifetime `frames_displayed` / `late_drops` / `audio_underruns` |
+| `display_device_unavailable` | Critical | KMS connector vanished mid-flow (cable unplug observed via udev or `drmModeGetConnector` `connection != connected`) | Surfaces `error_code: display_device_unavailable` |
+| `display_mode_set_failed` | Critical | `drmModeSetCrtc` returned `EINVAL` / `ENOSPC` for the chosen resolution / refresh | `error_code: display_resolution_unsupported` or `display_mode_set_failed` |
+| `display_audio_open_failed` | Critical | `snd_pcm_open` returned non-zero, or ALSA `writei` returned `ENODEV` mid-stream | `error_code: display_audio_device_invalid` / `display_audio_open_failed` |
+| `display_decoder_overload` | Warning | `frames_dropped_late` > 5 % over a 5-s rolling window | Indicates the SW video decoder can't keep up — recommend HW decode (v2) or a smaller resolution |
+| `display_av_drift` | Warning | `|av_sync_offset_ms|` > 100 ms sustained ≥ 3 s | Audio-vs-video drift exceeded the dup/drop window |
+| `display_subscriber_lagged` | Warning | broadcast `Lagged(n)`; rate-limited to one event / second | The video + audio decoders are flushed and resync on the next IDR |
+
+Operator-driven `command_ack.error_code` values (lifted from
+`add_output` / `update_config` failures):
+
+| `error_code` | Meaning |
+|---|---|
+| `display_device_invalid` | `device` regex failed at config-load OR connector not present in `enumerate_displays()` at runtime OR build was compiled without the `display` Cargo feature / for a non-Linux target |
+| `display_audio_device_invalid` | `audio_device` regex failed OR ALSA refused to open it |
+| `display_resolution_unsupported` | Configured `resolution` / `refresh_hz` does not match any mode the connector advertises |
+| `display_program_not_found` | After 5 s, the demuxer hasn't seen the configured `program_number` in the PAT |
+| `display_audio_track_not_found` | Configured `audio_track_index` exceeds the PMT's audio-stream count |
+| `display_device_busy` | Another active output already claimed this `(device, audio_device)` pair (cross-output uniqueness reject) |
+| `display_decoder_overload_predicted` | Validation-time warning when 4K60 is requested without HW decode — does NOT block save; surfaced as a hint in the manager UI |
+
+Configuration schema and operator-visible knobs live in
+[`docs/configuration-guide.md`](configuration-guide.md) under
+"Display Output (HDMI / DisplayPort + ALSA)". Producers should use
+`EventSender::emit_with_details(EventSeverity::*, "display", message,
+flow_id, details)` (defined in `src/manager/events.rs`).

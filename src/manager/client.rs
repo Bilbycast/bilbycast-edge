@@ -794,7 +794,7 @@ fn build_health_payload(
     static_caps: &crate::engine::hardware_probe::StaticCapabilities,
     live_gpu: &crate::engine::hardware_probe::LiveUtilizationState,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let payload = serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": 0,
@@ -814,7 +814,22 @@ fn build_health_payload(
         // `"resources"` capability string to render the Resources card
         // and the per-flow Resource-impact widget.
         "resource_budget": build_resource_budget_payload(flow_manager, static_caps, live_gpu),
-    })
+    });
+    // Local-display enumeration. Linux-only and gated on the `display`
+    // Cargo feature; absent on every other build so older managers /
+    // non-display edges remain wire-compatible.
+    #[cfg(all(feature = "display", target_os = "linux"))]
+    {
+        let devs = crate::display::cached_displays();
+        if !devs.is_empty() {
+            if let Ok(json) = serde_json::to_value(devs) {
+                payload
+                    .as_object_mut()
+                    .map(|o| o.insert("display_devices".into(), json));
+            }
+        }
+    }
+    payload
 }
 
 fn build_system_resources_payload(state: &SystemResourceState) -> serde_json::Value {
@@ -941,6 +956,16 @@ fn edge_capabilities() -> Vec<&'static str> {
     }
     if cfg!(feature = "tls") {
         caps.push("tls");
+    }
+    // Local-display output. Advertised only when (a) the `display`
+    // Cargo feature is on, AND (b) the host actually has at least one
+    // KMS connector enumerated (so headless build servers don't see
+    // the option in the manager UI).
+    #[cfg(all(feature = "display", target_os = "linux"))]
+    {
+        if !crate::display::cached_displays().is_empty() {
+            caps.push("display");
+        }
     }
     caps
 }

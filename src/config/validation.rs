@@ -380,6 +380,9 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
     // Cross-component port conflict detection
     validate_port_conflicts(config)?;
 
+    // Cross-component display-device uniqueness (KMS exclusivity).
+    validate_display_uniqueness(config)?;
+
     Ok(())
 }
 
@@ -3559,6 +3562,7 @@ pub fn validate_output_with_input(
         OutputConfig::St2110_23(c) => validate_st2110_23_output(c)?,
         OutputConfig::RtpAudio(c) => validate_rtp_audio_output(c, upstream_audio)?,
         OutputConfig::Bonded(c) => validate_bonded_output(c)?,
+        OutputConfig::Display(c) => validate_display_output(c)?,
     }
     Ok(())
 }
@@ -3599,6 +3603,193 @@ fn validate_bonded_output(c: &crate::config::models::BondedOutputConfig) -> Resu
         }
     }
     validate_pid_map(c.pid_map.as_ref(), &format!("bonded output '{}'", c.id))?;
+    Ok(())
+}
+
+/// Validate a single `DisplayOutputConfig`.
+///
+/// Schema-level checks only — the edge does not know at config-load time
+/// whether a particular `device` or `audio_device` actually exists on the
+/// host. The runtime spawner rejects with `display_device_invalid` /
+/// `display_audio_device_invalid` if enumeration disagrees.
+fn validate_display_output(c: &crate::config::models::DisplayOutputConfig) -> Result<()> {
+    if c.id.is_empty() || c.id.len() > 64 {
+        return Err(anyhow::anyhow!(
+            "display output id length must be in [1, 64]"
+        ));
+    }
+    if c.name.len() > 256 {
+        return Err(anyhow::anyhow!("display output '{}' name too long (>256 chars)", c.id));
+    }
+    validate_output_group(c.group.as_deref(), &c.id)?;
+
+    // Connector regex — KMS canonical names: HDMI-A-1, DP-2, DVI-D-1, VGA-1.
+    // Accepts a leading uppercase letter, then up to 63 [A-Z0-9-] chars.
+    if c.device.is_empty() || c.device.len() > 64 {
+        return Err(anyhow::anyhow!(
+            "display output '{}': device must be 1..=64 chars",
+            c.id
+        ));
+    }
+    let dev_bytes = c.device.as_bytes();
+    if !dev_bytes[0].is_ascii_uppercase()
+        || !dev_bytes
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'-')
+    {
+        return Err(anyhow::anyhow!(
+            "display output '{}': device '{}' must match the KMS connector pattern \
+             ^[A-Z][A-Z0-9-]{{0,63}}$ (e.g. HDMI-A-1, DP-2, DVI-D-1)",
+            c.id,
+            c.device
+        ));
+    }
+
+    // ALSA device pattern (optional). Empty == None == mute.
+    if let Some(aud) = c.audio_device.as_deref() {
+        if !aud.is_empty() {
+            if aud.len() > 64 {
+                return Err(anyhow::anyhow!(
+                    "display output '{}': audio_device too long (>64 chars)",
+                    c.id
+                ));
+            }
+            if !is_valid_alsa_device(aud) {
+                return Err(anyhow::anyhow!(
+                    "display output '{}': audio_device '{}' is not a recognised ALSA name \
+                     (expected one of hw:N[,M], plughw:N[,M], default, sysdefault, pulse)",
+                    c.id,
+                    aud
+                ));
+            }
+        }
+    }
+
+    if c.audio_channel_pair[0] >= 8 || c.audio_channel_pair[1] >= 8 {
+        return Err(anyhow::anyhow!(
+            "display output '{}': audio_channel_pair indices must be < 8",
+            c.id
+        ));
+    }
+    if c.audio_channel_pair[0] == c.audio_channel_pair[1] {
+        return Err(anyhow::anyhow!(
+            "display output '{}': audio_channel_pair indices must differ",
+            c.id
+        ));
+    }
+
+    if let Some(p) = c.program_number {
+        if p == 0 {
+            return Err(anyhow::anyhow!(
+                "display output '{}' program_number must be > 0 (0 is reserved for the NIT)",
+                c.id
+            ));
+        }
+    }
+    if let Some(t) = c.audio_track_index {
+        if t >= 16 {
+            return Err(anyhow::anyhow!(
+                "display output '{}' audio_track_index must be < 16",
+                c.id
+            ));
+        }
+    }
+
+    if let Some(ref res) = c.resolution {
+        if res != "auto" && parse_wxh_resolution(res).is_none() {
+            return Err(anyhow::anyhow!(
+                "display output '{}': resolution '{}' must be 'auto' or 'WIDTHxHEIGHT'",
+                c.id,
+                res
+            ));
+        }
+    }
+
+    if let Some(hz) = c.refresh_hz {
+        if !(1..=240).contains(&hz) {
+            return Err(anyhow::anyhow!(
+                "display output '{}': refresh_hz {} must be in 1..=240",
+                c.id,
+                hz
+            ));
+        }
+    }
+
+    if c.sync_mode != "vsync_to_display" {
+        return Err(anyhow::anyhow!(
+            "display output '{}': sync_mode '{}' is not supported in v1 \
+             (only 'vsync_to_display' is accepted)",
+            c.id,
+            c.sync_mode
+        ));
+    }
+
+    Ok(())
+}
+
+fn is_valid_alsa_device(s: &str) -> bool {
+    // ^(hw|plughw|default|sysdefault|pulse)(?::\d+(?:,\d+)?)?$
+    let (head, rest) = match s.split_once(':') {
+        Some((h, t)) => (h, Some(t)),
+        None => (s, None),
+    };
+    let head_ok = matches!(head, "hw" | "plughw" | "default" | "sysdefault" | "pulse");
+    if !head_ok {
+        return false;
+    }
+    let Some(tail) = rest else {
+        return true;
+    };
+    if tail.is_empty() {
+        return false;
+    }
+    let parts: Vec<&str> = tail.split(',').collect();
+    if !(1..=2).contains(&parts.len()) {
+        return false;
+    }
+    parts
+        .iter()
+        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn parse_wxh_resolution(s: &str) -> Option<(u32, u32)> {
+    let (w, h) = s.split_once('x')?;
+    if w.is_empty() || h.is_empty() || w.len() > 8 || h.len() > 8 {
+        return None;
+    }
+    let wn: u32 = w.parse().ok()?;
+    let hn: u32 = h.parse().ok()?;
+    if wn == 0 || hn == 0 {
+        return None;
+    }
+    Some((wn, hn))
+}
+
+/// Cross-output uniqueness for `display` outputs: two display outputs in the
+/// same `AppConfig` cannot claim the same `(device, audio_device)` pair —
+/// KMS only lets one master lease the connector at a time, and ALSA only
+/// lets one writer hold the PCM device.
+pub(crate) fn validate_display_uniqueness(config: &AppConfig) -> Result<()> {
+    use std::collections::HashMap;
+    let mut claimed: HashMap<(String, String), String> = HashMap::new();
+    for o in &config.outputs {
+        if let OutputConfig::Display(d) = o {
+            let key = (
+                d.device.clone(),
+                d.audio_device.clone().unwrap_or_default(),
+            );
+            if let Some(prev_id) = claimed.insert(key.clone(), d.id.clone()) {
+                return Err(anyhow::anyhow!(
+                    "display output '{}' conflicts with '{}': both target connector '{}' \
+                     and audio device '{}' (only one display output may claim a given pair)",
+                    d.id,
+                    prev_id,
+                    key.0,
+                    if key.1.is_empty() { "<mute>" } else { key.1.as_str() },
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -4787,8 +4978,13 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
                     }
                 }
             }
-            // Push-style outputs (RTMP/HLS/CMAF/WebRTC) don't bind a local port.
-            OutputConfig::Rtmp(_) | OutputConfig::Hls(_) | OutputConfig::Cmaf(_) | OutputConfig::Webrtc(_) => {}
+            // Push-style and physical-sink outputs don't bind a local port:
+            // RTMP / HLS / CMAF / WebRTC are HTTP-push, Display is a local KMS sink.
+            OutputConfig::Rtmp(_)
+            | OutputConfig::Hls(_)
+            | OutputConfig::Cmaf(_)
+            | OutputConfig::Webrtc(_)
+            | OutputConfig::Display(_) => {}
         }
     }
 

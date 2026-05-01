@@ -51,6 +51,10 @@ pub mod input_rtp;
 pub mod input_srt;
 pub mod input_udp;
 pub mod output_bonded;
+/// Local-display output (HDMI / DisplayPort + ALSA). Linux-only,
+/// gated on the `display` Cargo feature.
+#[cfg(all(feature = "display", target_os = "linux"))]
+pub mod output_display;
 pub mod output_rist;
 pub mod output_udp;
 pub mod manager;
@@ -99,6 +103,7 @@ pub mod ts_es_hitless;
 pub mod ts_assembler;
 pub mod ts_audio_replace;
 pub mod ts_video_replace;
+#[cfg(feature = "video-thumbnail")]
 pub mod video_encode_util;
 
 /// Ingress-side audio + video transcoding composer for TS-carrying inputs.

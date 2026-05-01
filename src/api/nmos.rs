@@ -162,6 +162,10 @@ fn output_transport(output: &OutputConfig) -> &'static str {
         | OutputConfig::St2110_23(_) => "urn:x-nmos:transport:rtp",
         OutputConfig::RtpAudio(_) => "urn:x-nmos:transport:rtp",
         OutputConfig::Bonded(_) => "urn:x-nmos:transport:rtp",
+        // Local display output is a physical sink, not a network sender.
+        // NMOS has no native concept for this; the placeholder transport
+        // keeps `output_transport` exhaustive without crashing.
+        OutputConfig::Display(_) => "urn:x-nmos:transport:rtp",
     }
 }
 
@@ -327,6 +331,7 @@ fn output_id(output: &OutputConfig) -> &str {
         OutputConfig::St2110_23(c) => &c.id,
         OutputConfig::RtpAudio(c) => &c.id,
         OutputConfig::Bonded(c) => &c.id,
+        OutputConfig::Display(c) => &c.id,
     }
 }
 
@@ -347,6 +352,7 @@ fn output_name(output: &OutputConfig) -> &str {
         OutputConfig::St2110_23(c) => &c.name,
         OutputConfig::RtpAudio(c) => &c.name,
         OutputConfig::Bonded(c) => &c.name,
+        OutputConfig::Display(c) => &c.name,
     }
 }
 

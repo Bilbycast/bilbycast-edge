@@ -62,50 +62,6 @@ pub fn hitless_bus_key(uid: &str) -> (String, u16) {
     (format!("{HITLESS_INPUT_PREFIX}{uid}"), 0)
 }
 
-/// Spawn a Hitless merger task for one slot.
-///
-/// Subscribes to `(primary_input, primary_pid)` and `(backup_input,
-/// backup_pid)` on the bus, deduplicates via primary-preference with a
-/// `stall` timer, and republishes onto [`hitless_bus_key`] for `uid`.
-pub fn spawn_hitless_es_merger(
-    uid: String,
-    primary: (String, u16),
-    backup: (String, u16),
-    bus: Arc<FlowEsBus>,
-    stall: Duration,
-    cancel: CancellationToken,
-) -> JoinHandle<()> {
-    spawn_hitless_es_merger_modal(uid, primary, backup, bus, stall, /* seq_aware */ false, cancel)
-}
-
-/// Spawn a Hitless merger task with explicit mode selection.
-///
-/// `seq_aware = false` (default) keeps the legacy primary-preference
-/// stall-timer path. `seq_aware = true` runs the SMPTE 2022-7 merger
-/// from `redundancy::merger::HitlessMerger` over `EsPacket.upstream_seq`,
-/// which dedupes both legs continuously and gap-fills sub-frame on
-/// failover.
-pub fn spawn_hitless_es_merger_modal(
-    uid: String,
-    primary: (String, u16),
-    backup: (String, u16),
-    bus: Arc<FlowEsBus>,
-    stall: Duration,
-    seq_aware: bool,
-    cancel: CancellationToken,
-) -> JoinHandle<()> {
-    spawn_hitless_es_merger_full(
-        uid,
-        primary,
-        backup,
-        bus,
-        stall,
-        seq_aware,
-        /* path_differential_ms */ None,
-        cancel,
-    )
-}
-
 /// Spawn a Hitless merger task. The seq-aware mode now supports a
 /// path-differential buffer for true SMPTE 2022-7 compliance — set
 /// `path_differential_ms` to `Some(ms)` to enable.
@@ -366,7 +322,6 @@ mod tests {
             pcr: None,
             recv_time_us: 0,
             upstream_seq: None,
-            upstream_leg_id: None,
         }
     }
 
@@ -374,12 +329,14 @@ mod tests {
     async fn primary_preference_when_primary_live() {
         let bus = Arc::new(FlowEsBus::new());
         let cancel = CancellationToken::new();
-        let _handle = spawn_hitless_es_merger(
+        let _handle = spawn_hitless_es_merger_full(
             "slot_0_0".to_string(),
             ("in-a".to_string(), 0x100),
             ("in-b".to_string(), 0x200),
             bus.clone(),
             Duration::from_millis(500),
+            /* seq_aware */ false,
+            /* path_differential_ms */ None,
             cancel.clone(),
         );
 
@@ -410,12 +367,14 @@ mod tests {
     async fn failover_to_backup_on_stall() {
         let bus = Arc::new(FlowEsBus::new());
         let cancel = CancellationToken::new();
-        let _handle = spawn_hitless_es_merger(
+        let _handle = spawn_hitless_es_merger_full(
             "slot_0_0".to_string(),
             ("in-a".to_string(), 0x100),
             ("in-b".to_string(), 0x200),
             bus.clone(),
             Duration::from_millis(50),
+            /* seq_aware */ false,
+            /* path_differential_ms */ None,
             cancel.clone(),
         );
 
@@ -444,12 +403,14 @@ mod tests {
     async fn switches_back_to_primary_on_resume() {
         let bus = Arc::new(FlowEsBus::new());
         let cancel = CancellationToken::new();
-        let _handle = spawn_hitless_es_merger(
+        let _handle = spawn_hitless_es_merger_full(
             "slot_0_0".to_string(),
             ("in-a".to_string(), 0x100),
             ("in-b".to_string(), 0x200),
             bus.clone(),
             Duration::from_millis(50),
+            /* seq_aware */ false,
+            /* path_differential_ms */ None,
             cancel.clone(),
         );
 

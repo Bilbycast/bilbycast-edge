@@ -733,6 +733,47 @@ pub struct OutputStats {
     /// PID-bus Phase 8 addition; old managers ignore unknown fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pcr_trust: Option<PcrTrustStats>,
+    /// Per-output local-display stats. Populated only when the output
+    /// type is `display`; absent on every network-egress output.
+    /// Backward-compatible additive field — old managers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_stats: Option<DisplayStats>,
+}
+
+/// Per-output statistics for the local-display (`display`) output type.
+/// Populated by `engine::output_display` and read by the manager UI's
+/// flow-card "Display" sub-panel. All fields are best-effort snapshots —
+/// the lock-free atomic counters under the hood are sampled per stats
+/// cycle.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DisplayStats {
+    /// Frames page-flipped to the connector since the output started.
+    pub frames_displayed: u64,
+    /// Frames the display task dropped because they arrived more than
+    /// one frame-period behind the audio clock.
+    pub frames_dropped_late: u64,
+    /// Frames the display task held for an extra vsync because the
+    /// next decoded frame's PTS was too far ahead of the audio clock.
+    pub frames_repeated: u64,
+    /// ALSA xrun (`EPIPE`) count over the output's lifetime.
+    pub audio_underruns: u64,
+    /// EMA of the signed video-vs-audio offset (positive = video late
+    /// relative to the audio master clock), in milliseconds.
+    pub av_sync_offset_ms: i32,
+    /// Negotiated KMS mode resolution, e.g. `"1920x1080"`.
+    pub current_resolution: String,
+    /// Negotiated KMS refresh rate in Hz.
+    pub current_refresh_hz: u32,
+    /// Current pixel format on the wire to the connector
+    /// (v1 always `"XRGB8888"`).
+    pub pixel_format: String,
+    /// Decoder backend, `"sw"` in v1; `"vaapi"` / `"nvdec"` in v2.
+    pub decoder_kind: String,
+    /// Source video codec (`"h264"` / `"hevc"`).
+    pub video_codec: String,
+    /// Source audio codec (`"aac"` / `"mp2"` / `"ac3"` / `"eac3"` /
+    /// `"opus"` / `"none"` when audio is muted).
+    pub audio_codec: String,
 }
 
 /// PCR accuracy trust metric — percentiles of `|observed_Δ − expected_Δ|`

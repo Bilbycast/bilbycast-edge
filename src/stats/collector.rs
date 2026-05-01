@@ -71,6 +71,11 @@ pub struct OutputStatsAccumulator {
     /// startup by outputs that build an
     /// `engine::ts_video_replace::TsVideoReplacer`.
     video_encode_stats: OnceLock<VideoEncodeStatsHandle>,
+    /// Optional handle to the per-output local-display task's counters +
+    /// chosen-mode descriptors. Set once at output startup by
+    /// `engine::output_display`. Read by the snapshot path to populate
+    /// [`crate::stats::models::DisplayStats`].
+    display_stats: OnceLock<DisplayStatsHandle>,
     /// Optional snapshot-time descriptors used to build
     /// [`crate::stats::models::EgressMediaSummary`]. Set once at output
     /// startup with everything that doesn't change at runtime — the dynamic
@@ -127,6 +132,53 @@ pub struct VideoEncodeStatsHandle {
     pub encoder_backend: String,
 }
 
+/// Lock-free counters that back [`crate::stats::models::DisplayStats`].
+/// Owned by `engine::output_display`; the accumulator stores an `Arc`
+/// to it so the snapshot path can sample without locking.
+///
+/// The constructors are only called under
+/// `cfg(all(feature = "display", target_os = "linux"))`; allow dead
+/// code so a feature-off `cargo build` on macOS stays clean.
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub struct DisplayStatsCounters {
+    pub frames_displayed: AtomicU64,
+    pub frames_dropped_late: AtomicU64,
+    pub frames_repeated: AtomicU64,
+    pub audio_underruns: AtomicU64,
+    /// `i32` stored in an `AtomicI32`-shaped `AtomicU64` cast — the
+    /// snapshot path round-trips it via `to_be_bytes` to preserve the
+    /// sign without needing AtomicI32 (which `Arc<...>` can't always
+    /// give us across stable Rust versions cleanly). The display task
+    /// writes via `store_av_offset_ms`; readers use `load_av_offset_ms`.
+    pub av_offset_ms_packed: AtomicU64,
+}
+
+#[allow(dead_code)]
+impl DisplayStatsCounters {
+    pub fn store_av_offset_ms(&self, ms: i32) {
+        self.av_offset_ms_packed
+            .store(ms as i64 as u64, Ordering::Relaxed);
+    }
+    pub fn load_av_offset_ms(&self) -> i32 {
+        self.av_offset_ms_packed.load(Ordering::Relaxed) as i64 as i32
+    }
+}
+
+/// Registered handle to a per-output local-display task's counters plus
+/// the steady-state descriptors (chosen mode, codec families) the
+/// snapshot path needs to populate
+/// [`crate::stats::models::DisplayStats`]. Set once at output startup.
+pub struct DisplayStatsHandle {
+    pub counters: Arc<DisplayStatsCounters>,
+    pub current_resolution: String,
+    pub current_refresh_hz: u32,
+    pub pixel_format: String,
+    pub decoder_kind: String,
+    pub video_codec: String,
+    pub audio_codec: String,
+}
+
 /// Static (set-once-at-output-startup) descriptors used to build the egress
 /// media summary in the per-flow snapshot path. Anything that depends on live
 /// stats (encode bitrate, decode codec, etc.) is layered in by the snapshot
@@ -169,6 +221,7 @@ impl OutputStatsAccumulator {
             audio_decode_stats: OnceLock::new(),
             audio_encode_stats: OnceLock::new(),
             video_encode_stats: OnceLock::new(),
+            display_stats: OnceLock::new(),
             egress_static: OnceLock::new(),
             latency_min_us: AtomicU64::new(u64::MAX),
             latency_max_us: AtomicU64::new(0),
@@ -292,6 +345,38 @@ impl OutputStatsAccumulator {
         });
     }
 
+    /// Register the per-output local-display counters + mode descriptors.
+    /// Called once at startup by `engine::output_display::run` after
+    /// modeset succeeds. Subsequent calls are no-ops (first wins).
+    #[allow(clippy::too_many_arguments, dead_code)]
+    pub fn set_display_stats(
+        &self,
+        counters: Arc<DisplayStatsCounters>,
+        current_resolution: impl Into<String>,
+        current_refresh_hz: u32,
+        pixel_format: impl Into<String>,
+        decoder_kind: impl Into<String>,
+        video_codec: impl Into<String>,
+        audio_codec: impl Into<String>,
+    ) {
+        let _ = self.display_stats.set(DisplayStatsHandle {
+            counters,
+            current_resolution: current_resolution.into(),
+            current_refresh_hz,
+            pixel_format: pixel_format.into(),
+            decoder_kind: decoder_kind.into(),
+            video_codec: video_codec.into(),
+            audio_codec: audio_codec.into(),
+        });
+    }
+
+    /// Borrow the registered display-stats handle (used by the snapshot
+    /// path to populate `OutputStats.display_stats`).
+    #[allow(dead_code)]
+    pub fn display_stats_handle(&self) -> Option<&DisplayStatsHandle> {
+        self.display_stats.get()
+    }
+
     /// Register the static portion of this output's egress media summary.
     /// Called once at output startup with values that don't change at
     /// runtime; the dynamic codec/format fields are merged in at snapshot
@@ -400,6 +485,19 @@ impl OutputStatsAccumulator {
                 supervisor_restarts: h.stats.supervisor_restarts.load(Ordering::Relaxed),
             }
         });
+        let display_stats = self.display_stats.get().map(|h| crate::stats::models::DisplayStats {
+            frames_displayed: h.counters.frames_displayed.load(Ordering::Relaxed),
+            frames_dropped_late: h.counters.frames_dropped_late.load(Ordering::Relaxed),
+            frames_repeated: h.counters.frames_repeated.load(Ordering::Relaxed),
+            audio_underruns: h.counters.audio_underruns.load(Ordering::Relaxed),
+            av_sync_offset_ms: h.counters.load_av_offset_ms(),
+            current_resolution: h.current_resolution.clone(),
+            current_refresh_hz: h.current_refresh_hz,
+            pixel_format: h.pixel_format.clone(),
+            decoder_kind: h.decoder_kind.clone(),
+            video_codec: h.video_codec.clone(),
+            audio_codec: h.audio_codec.clone(),
+        });
 
         // Swap latency window and compute min/avg/max.
         let lat_count = self.latency_count.swap(0, Ordering::Relaxed);
@@ -466,6 +564,7 @@ impl OutputStatsAccumulator {
             // self-contained.
             egress_summary: None,
             pcr_trust: self.pcr_trust.snapshot(),
+            display_stats,
         }
     }
 }

@@ -14,6 +14,112 @@ picture.
 
 ---
 
+## Linux system prerequisites
+
+What to install on a Linux host before running or building bilbycast-edge,
+broken down by release variant and architecture. Tested on Ubuntu 24.04 LTS
+(glibc 2.39+); equivalent packages exist on Debian 12+.
+
+### Default variant (`*-linux`) — runtime
+
+The default binary statically bundles SRT, AAC (fdk-aac), and the FFmpeg
+video decoder used for thumbnails. It also includes the **local-display
+output** (`display` Cargo feature, HDMI / DisplayPort + ALSA confidence
+monitor playout), which dynamically links libdrm + libasound2 + libudev
+at runtime:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libdrm2 libasound2 libudev1
+```
+
+These three libraries are part of every modern Linux base install and
+already present on Ubuntu / Debian / Fedora / Arch by default. On a
+strictly headless server with no `/dev/dri/cardN` they cause no runtime
+side-effects — `enumerate_displays()` returns empty, the `"display"`
+capability isn't advertised on the WS heartbeat, and the manager UI
+hides the option per-node. To run a confidence monitor, plug an HDMI /
+DisplayPort cable into the box and configure a `display` output via
+the manager.
+
+### Full variant (`*-linux-full`) — runtime
+
+The full binary dynamically links libx264 + libx265. NVENC (NVIDIA) and QSV
+(Intel) use `dlopen()` so they don't add build-link dependencies, but they
+do require driver / runtime packages on the host.
+
+**All architectures (x86_64 + aarch64) — software encoders:**
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libx264-dev libx265-dev libnuma1
+```
+
+> The `*-dev` metapackages depend on the matching runtime `.so` packages,
+> so they cover both build and runtime use. If you want runtime-only
+> packages, replace them with the versioned names on your release
+> (`apt-cache search libx264` — e.g. `libx264-164`, `libx265-199` on
+> Ubuntu 24.04).
+
+**x86_64 only — Intel QuickSync (QSV):**
+
+```bash
+sudo apt-get install -y libvpl2 intel-media-va-driver-non-free
+# (or `intel-media-driver` for the open-source upstream variant)
+sudo usermod -aG render "$USER"
+# log out + back in for the group change to take effect
+```
+
+QSV needs a 5th-gen (Broadwell) Intel Core CPU or newer for H.264; HEVC
+needs 7th-gen (Kaby Lake) or newer.
+
+**Both architectures — NVIDIA NVENC:**
+
+No apt packages required. The binary `dlopen`s `libnvidia-encode.so.1`,
+which ships with the proprietary NVIDIA driver. Install the driver via
+your distribution's standard mechanism (e.g. `nvidia-driver-550` on
+Ubuntu) and reboot once.
+
+### Building from source — additional prerequisites
+
+In addition to whichever runtime set above matches your variant, building
+from source needs the base toolchain plus Rust. The default build also
+needs the local-display dev headers (`libdrm-dev` / `libasound2-dev` /
+`libudev-dev`) since the `display` feature is on by default in every
+release variant:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential cmake make clang \
+                        libclang-dev pkg-config libssl-dev g++ \
+                        libdrm-dev libasound2-dev libudev-dev
+
+# Rust toolchain
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+```
+
+The full variant additionally needs the encoder development headers:
+
+```bash
+# All architectures: x264 + x265 + libnuma (x265's link-time dep)
+sudo apt-get install -y libx264-dev libx265-dev libnuma-dev
+
+# x86_64 only: Intel oneVPL (QSV)
+sudo apt-get install -y libvpl-dev
+
+# NVENC headers — Ubuntu 24.04 doesn't package nv-codec-headers, so
+# install from source pinned to the FFmpeg 7.1.x-compatible tag:
+git clone --depth 1 --branch n12.2.72.0 \
+  https://github.com/FFmpeg/nv-codec-headers.git /tmp/nv-codec-headers
+sudo make -C /tmp/nv-codec-headers PREFIX=/usr/local install
+```
+
+This matches the package set the GitHub Actions release workflow uses to
+build `*-linux` and `*-linux-full` artefacts.
+
+---
+
 ## Running a pre-built binary
 
 ### Ubuntu 22.04+ / Debian 12+ (x86_64 or aarch64)
@@ -206,10 +312,16 @@ For the full variant, also install the video encoder development
 packages:
 
 ```bash
-# All architectures: x264, x265, NVENC headers
-sudo apt install libx264-dev libx265-dev nv-codec-headers
+# All architectures: x264, x265, libnuma (x265's link-time dep)
+sudo apt install libx264-dev libx265-dev libnuma-dev
 # x86_64 only: Intel oneVPL (QSV)
 sudo apt install libvpl-dev
+
+# NVENC headers — Ubuntu 24.04 doesn't ship nv-codec-headers as a package;
+# install from source, pinned to the FFmpeg 7.1.x-compatible tag:
+git clone --depth 1 --branch n12.2.72.0 \
+  https://github.com/FFmpeg/nv-codec-headers.git /tmp/nv-codec-headers
+sudo make -C /tmp/nv-codec-headers PREFIX=/usr/local install
 ```
 
 Clone the repositories (bilbycast-edge plus its path-dependency
@@ -257,6 +369,44 @@ not yet wired — tracked as a future work item in
 Pre-built libx264 / libx265 via MSYS2 + `pacman -S
 mingw-w64-x86_64-x264 mingw-w64-x86_64-x265`, or use vcpkg. Detailed
 Windows build documentation is out of scope for this release.
+
+### Local-display output (`display` feature, Linux only)
+
+The `display` feature lets a flow render its decoded video + audio to
+a physical Linux KMS connector (HDMI / DisplayPort) plus an ALSA
+audio device — a confidence monitor at the stadium / OB truck / MCR
+without an external decoder appliance.
+
+**Included by default in every Linux release variant** (`*-linux` and
+`*-linux-full`, both x86_64 and aarch64). The runtime libraries
+(`libdrm2`, `libasound2`, `libudev1`) ship with every modern Linux
+base install. On a headless host the feature stays dormant —
+`enumerate_displays()` returns empty, the `"display"` capability
+isn't advertised, and the manager UI hides the option per-node. So
+one binary works for both confidence-monitor and headless
+deployments.
+
+Build from source (Debian / Ubuntu):
+
+```sh
+sudo apt install libdrm-dev libasound2-dev libudev-dev
+cargo build --release           # display is on by default in release
+```
+
+The schema is unconditional on every host (configs round-trip
+cleanly), but the runtime spawner is `cfg(all(feature = "display",
+target_os = "linux"))`. macOS dev builds reject `display` outputs at
+`start_output()` with `display_device_invalid`, so the manager UI
+surfaces the offending field clearly.
+
+`display-vaapi` / `display-nvdec` are placeholders for v2 hardware
+decode and currently fail at compile time (so the manager UI can
+advertise the future feature without us shipping unfinished code).
+
+Configuration reference:
+[`docs/configuration-guide.md`](configuration-guide.md#display-output-hdmi--displayport--alsa).
+Event catalogue:
+[`docs/events-and-alarms.md`](events-and-alarms.md#display-output-events-display).
 
 ---
 
