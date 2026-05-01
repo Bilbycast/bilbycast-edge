@@ -57,13 +57,14 @@ jobs:
           # The local-display output (`display` Cargo feature) ships in
           # every Linux variant. `drm-rs` is a pure-Rust ioctl crate —
           # it talks to `/dev/dri/cardN` directly and does NOT link
-          # libdrm. ALSA (libasound2) and udev (libudev) DO link at
-          # build time; both are LGPL-clean, no GPL implications.
-          # Operators who don't need a confidence monitor on the box
-          # simply don't configure a `display` output; the runtime cost
-          # when unused is one cold KMS probe at startup (returns empty
-          # on headless builders, no `"display"` capability advertised,
-          # manager UI hides the option per-node).
+          # libdrm. ALSA (libasound2) DOES link at build time; LGPL-
+          # clean, no GPL implications. Connector enumeration walks
+          # `/sys/class/drm` via std::fs, so libudev is not in the
+          # link graph. Operators who don't need a confidence monitor
+          # on the box simply don't configure a `display` output; the
+          # runtime cost when unused is one cold KMS probe at startup
+          # (returns empty on headless builders, no `"display"`
+          # capability advertised, manager UI hides the option per-node).
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact_suffix: x86_64-linux
@@ -133,12 +134,14 @@ jobs:
 
       - name: Install common build dependencies
         run: |
-          # `display` Cargo feature link-time deps: libasound2-dev (alsa-sys
-          # `links = "alsa"`) + libudev-dev (libudev-sys `links = "libudev"`).
-          # `drm-rs` is pure-Rust ioctls over /dev/dri — no libdrm-dev needed.
+          # `display` Cargo feature link-time dep: libasound2-dev
+          # (alsa-sys `links = "alsa"`). `drm-rs` is pure-Rust ioctls
+          # over /dev/dri — no libdrm-dev needed. Connector enumeration
+          # walks `/sys/class/drm` via std::fs, so libudev-dev isn't
+          # in the link graph either.
           sudo apt-get update
           sudo apt-get install -y cmake make clang libclang-dev pkg-config libssl-dev g++ \
-            libasound2-dev libudev-dev
+            libasound2-dev
 
       - name: Install video-encoder build dependencies (full variant only)
         if: matrix.variant == 'full'
@@ -224,21 +227,21 @@ jobs:
             fi
             echo "OK: default variant has no libx264/libx265 linkage"
           fi
-          echo "=== Checking for display-output linkage (libasound2 + libudev) ==="
+          echo "=== Checking for display-output linkage (libasound2) ==="
           # `display` is in every Linux variant — confirm libasound.so.2
-          # and libudev.so.1 are linked. `drm-rs` is pure-Rust ioctls
-          # over /dev/dri/cardN, so libdrm.so.2 is intentionally NOT
-          # linked. Runtime behaviour on a headless host is to enumerate
-          # empty and not advertise the `"display"` capability — the
-          # linkage stays regardless so a single binary works across
-          # both wall-mount and headless deployments.
-          for sym in libasound libudev; do
-            if ! ldd "${BINARY}" | grep -qE "${sym}\\."; then
-              echo "ERROR: Linux binary is missing ${sym} linkage (display feature)"
-              exit 1
-            fi
-          done
-          echo "OK: display feature linked (libasound + libudev)"
+          # is linked. `drm-rs` is pure-Rust ioctls over /dev/dri/cardN,
+          # so libdrm.so.2 is intentionally NOT linked. Connector
+          # enumeration walks `/sys/class/drm` via std::fs, so libudev
+          # is not in the link graph either. Runtime behaviour on a
+          # headless host is to enumerate empty and not advertise the
+          # `"display"` capability — the linkage stays regardless so
+          # a single binary works across both wall-mount and headless
+          # deployments.
+          if ! ldd "${BINARY}" | grep -qE 'libasound\.'; then
+            echo "ERROR: Linux binary is missing libasound linkage (display feature)"
+            exit 1
+          fi
+          echo "OK: display feature linked (libasound)"
 
       - name: Package tarball
         run: |

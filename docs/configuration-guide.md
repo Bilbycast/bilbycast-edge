@@ -1304,7 +1304,7 @@ builds the spawner refuses with `display_device_invalid` so the
 manager UI can highlight the offending field. Install:
 
 ```sh
-sudo apt install libdrm-dev libasound2-dev libudev-dev
+sudo apt install libasound2-dev
 cargo build --release --features display
 ```
 

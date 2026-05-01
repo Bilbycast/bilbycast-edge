@@ -25,17 +25,19 @@ broken down by release variant and architecture. Tested on Ubuntu 24.04 LTS
 The default binary statically bundles SRT, AAC (fdk-aac), and the FFmpeg
 video decoder used for thumbnails. It also includes the **local-display
 output** (`display` Cargo feature, HDMI / DisplayPort + ALSA confidence
-monitor playout), which dynamically links libdrm + libasound2 + libudev
-at runtime:
+monitor playout), which dynamically links libasound2 at runtime
+(`drm-rs` is pure-Rust ioctls over `/dev/dri/cardN`, and connector
+enumeration walks `/sys/class/drm` via std::fs — neither libdrm nor
+libudev are in the link graph):
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y libdrm2 libasound2 libudev1
+sudo apt-get install -y libasound2
 ```
 
-These three libraries are part of every modern Linux base install and
-already present on Ubuntu / Debian / Fedora / Arch by default. On a
-strictly headless server with no `/dev/dri/cardN` they cause no runtime
+This library is part of every modern Linux base install and already
+present on Ubuntu / Debian / Fedora / Arch by default. On a strictly
+headless server with no `/dev/dri/cardN` it causes no runtime
 side-effects — `enumerate_displays()` returns empty, the `"display"`
 capability isn't advertised on the WS heartbeat, and the manager UI
 hides the option per-node. To run a confidence monitor, plug an HDMI /
@@ -84,15 +86,14 @@ Ubuntu) and reboot once.
 
 In addition to whichever runtime set above matches your variant, building
 from source needs the base toolchain plus Rust. The default build also
-needs the local-display dev headers (`libdrm-dev` / `libasound2-dev` /
-`libudev-dev`) since the `display` feature is on by default in every
-release variant:
+needs the local-display dev header (`libasound2-dev`) since the
+`display` feature is on by default in every release variant:
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential cmake make clang \
                         libclang-dev pkg-config libssl-dev g++ \
-                        libdrm-dev libasound2-dev libudev-dev
+                        libasound2-dev
 
 # Rust toolchain
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -378,18 +379,19 @@ audio device — a confidence monitor at the stadium / OB truck / MCR
 without an external decoder appliance.
 
 **Included by default in every Linux release variant** (`*-linux` and
-`*-linux-full`, both x86_64 and aarch64). The runtime libraries
-(`libdrm2`, `libasound2`, `libudev1`) ship with every modern Linux
-base install. On a headless host the feature stays dormant —
-`enumerate_displays()` returns empty, the `"display"` capability
-isn't advertised, and the manager UI hides the option per-node. So
-one binary works for both confidence-monitor and headless
-deployments.
+`*-linux-full`, both x86_64 and aarch64). The runtime library
+(`libasound2`) ships with every modern Linux base install (`drm-rs`
+is pure-Rust ioctls and connector enumeration uses `/sys/class/drm`
+directly, so neither libdrm nor libudev are in the link graph). On
+a headless host the feature stays dormant — `enumerate_displays()`
+returns empty, the `"display"` capability isn't advertised, and the
+manager UI hides the option per-node. So one binary works for both
+confidence-monitor and headless deployments.
 
 Build from source (Debian / Ubuntu):
 
 ```sh
-sudo apt install libdrm-dev libasound2-dev libudev-dev
+sudo apt install libasound2-dev
 cargo build --release           # display is on by default in release
 ```
 

@@ -174,7 +174,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 [features]
 # `display` is in the default feature set: every Linux release variant
 # (default + full) ships the local-display output. The optional `drm` /
-# `alsa` / `udev` deps are themselves target-gated to `cfg(target_os =
+# `alsa` deps are themselves target-gated to `cfg(target_os =
 # "linux")`, so a default `cargo build` on macOS still compiles cleanly
 # (the optional deps simply aren't selected, and the runtime spawner
 # refuses with `display_device_invalid`). On a headless Linux host the
@@ -230,18 +230,17 @@ video-encoders-full = [
 ]
 # Local-display output — decode the flow's video + audio and render to a
 # Linux KMS connector (HDMI / DisplayPort) plus an ALSA audio device.
-# Linux-only (the optional `drm` / `alsa` / `udev` deps are
-# target-gated below). `drm-rs` is pure-Rust ioctls over /dev/dri (no
-# libdrm at link time); `alsa` and `udev` link libasound2 + libudev,
-# so `apt install libasound2-dev libudev-dev` (Debian / Ubuntu) or the
-# equivalent RPM is required for the build. Off by default so generic
-# builds stay portable. Audio decode of MP2 / AC-3 / E-AC-3 / Opus
-# rides through the `video-thumbnail` `AudioDecoder` (libavcodec). See
-# `docs/configuration-guide.md` "Display output (HDMI / DisplayPort)".
+# Linux-only (the optional `drm` / `alsa` deps are target-gated below).
+# `drm-rs` is pure-Rust ioctls over /dev/dri (no libdrm at link time);
+# `alsa` links libasound2, so `apt install libasound2-dev` (Debian /
+# Ubuntu) or the equivalent RPM is required for the build. Off by
+# default so generic builds stay portable. Audio decode of MP2 / AC-3 /
+# E-AC-3 / Opus rides through the `video-thumbnail` `AudioDecoder`
+# (libavcodec). See `docs/configuration-guide.md` "Display output
+# (HDMI / DisplayPort)".
 display = [
     "dep:drm",
     "dep:alsa",
-    "dep:udev",
     "video-thumbnail",
     "fdk-aac",
 ]
@@ -327,16 +326,16 @@ nvml-wrapper = { version = "0.12", optional = true }
 
 # Local-display output — Linux-only. `drm` is the pure-Rust drm-rs
 # crate (ioctl-based KMS, /dev/dri/cardN, no libdrm linkage), `alsa`
-# wraps libasound2, `udev` wraps libudev for hotplug enumeration.
-# All three are `optional = true` and gated by the `display` Cargo
-# feature; non-Linux builds short-circuit `enumerate_displays()` to
-# `Vec::new()` and never advertise the capability. Build prereqs:
-# `apt install libasound2-dev libudev-dev` on Debian / Ubuntu (no
-# libdrm-dev needed — drm-rs goes straight to ioctls).
+# wraps libasound2. Both are `optional = true` and gated by the
+# `display` Cargo feature; non-Linux builds short-circuit
+# `enumerate_displays()` to `Vec::new()` and never advertise the
+# capability. Build prereqs: `apt install libasound2-dev` on Debian /
+# Ubuntu (no libdrm-dev needed — drm-rs goes straight to ioctls).
+# Connector enumeration walks `/sys/class/drm` directly via std::fs,
+# so libudev is not in the link graph.
 [target.'cfg(target_os = "linux")'.dependencies]
 drm = { version = "0.14", optional = true }
 alsa = { version = "0.9", optional = true }
-udev = { version = "0.9", optional = true }
 
 # ---------------------------------------------------------------------------
 # BILBYCAST PATCH: vendored `is` 0.8.0 with the strict-PRIORITY check on ICE
