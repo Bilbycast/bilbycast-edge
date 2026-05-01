@@ -16,8 +16,9 @@
 *.swo
 *~
 
-# Claude Code
-.claude/
+# Claude Code — share settings.json, keep per-host launch.json + project state local
+.claude/*
+!.claude/settings.json
 
 # Environment & secrets
 .env

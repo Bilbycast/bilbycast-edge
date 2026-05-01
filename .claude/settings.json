@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Read(*)",
+      "Write(*)",
+      "Edit(*)",
+      "WebSearch",
+      "WebFetch(*)",
+      "mcp__Claude_Preview__preview_start"
+    ],
+    "deny": [
+      "Bash(brew install *)",
+      "Bash(brew reinstall *)",
+      "Bash(brew upgrade *)",
+      "Bash(brew tap *)",
+      "Bash(sudo *)",
+      "Bash(wget *)",
+      "Bash(pip install *)",
+      "Bash(pip3 install *)",
+      "Bash(npm install *)",
+      "Bash(npm i *)",
+      "Bash(npx *)",
+      "Bash(cargo install *)",
+      "Bash(gem install *)",
+      "Bash(apt install *)",
+      "Bash(apt-get install *)"
+    ]
+  }
+}
