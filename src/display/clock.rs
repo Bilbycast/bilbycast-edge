@@ -54,24 +54,12 @@ impl AudioClock {
         self.armed.store(true, Ordering::Release);
     }
 
-    /// Returns `true` once `set_anchor` has fired.
-    pub fn armed(&self) -> bool {
-        self.armed.load(Ordering::Acquire)
-    }
-
     /// Advance the clock by `samples` samples-per-channel of audio that
     /// just landed in the ALSA buffer. The audio task calls this after
     /// each successful blocking write.
     pub fn advance(&self, samples: u64) {
         self.samples_since_anchor
             .fetch_add(samples, Ordering::Relaxed);
-    }
-
-    /// Reset the sample-rate (mid-stream SR change). Re-anchor with
-    /// `set_anchor` afterwards.
-    pub fn reset(&self) {
-        self.armed.store(false, Ordering::Release);
-        self.samples_since_anchor.store(0, Ordering::Relaxed);
     }
 
     /// Read the current "audio now" PTS in 90 kHz units. `None` until
@@ -92,11 +80,6 @@ impl AudioClock {
         let delta_pts = (samples as u128).saturating_mul(90_000) / (sr as u128);
         Some(anchor_pts.wrapping_add(delta_pts as u64))
     }
-
-    /// Snapshot of the audio sample rate. `0` until `set_anchor`.
-    pub fn sample_rate(&self) -> u32 {
-        self.sample_rate.load(Ordering::Relaxed)
-    }
 }
 
 #[cfg(test)]
@@ -109,7 +92,6 @@ mod tests {
     #[test]
     fn unarmed_clock_returns_none() {
         let c = AudioClock::new();
-        assert!(!c.armed());
         assert!(c.current_pts_90k().is_none());
     }
 

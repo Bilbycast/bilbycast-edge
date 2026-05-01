@@ -127,7 +127,7 @@ impl AudioBackend {
         // once on EPIPE if the recover path didn't.
         let written = match io.writei(&interleaved) {
             Ok(n) => n,
-            Err(e) if e.errno() == nix::errno::Errno::EPIPE => {
+            Err(e) if e.errno() == libc::EPIPE => {
                 let _ = pcm.prepare();
                 io.writei(&interleaved).context("alsa writei after prepare")?
             }
@@ -205,7 +205,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 0);
-        assert!(!clock.armed());
+        assert!(clock.current_pts_90k().is_none());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-edge"
-version = "0.36.0"
+version = "0.36.1"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 license = "AGPL-3.0-or-later"
@@ -230,12 +230,13 @@ video-encoders-full = [
 ]
 # Local-display output — decode the flow's video + audio and render to a
 # Linux KMS connector (HDMI / DisplayPort) plus an ALSA audio device.
-# Linux-only (the optional `drm` / `alsa` / `libudev` deps are
-# target-gated below). Pulls in libdrm + libasound2 + libudev at link
-# time; `apt install libdrm-dev libasound2-dev libudev-dev` (Debian /
-# Ubuntu) or the equivalent RPM. Off by default so generic builds stay
-# portable. Audio decode of MP2 / AC-3 / E-AC-3 / Opus rides through the
-# `video-thumbnail` `AudioDecoder` (libavcodec). See
+# Linux-only (the optional `drm` / `alsa` / `udev` deps are
+# target-gated below). `drm-rs` is pure-Rust ioctls over /dev/dri (no
+# libdrm at link time); `alsa` and `udev` link libasound2 + libudev,
+# so `apt install libasound2-dev libudev-dev` (Debian / Ubuntu) or the
+# equivalent RPM is required for the build. Off by default so generic
+# builds stay portable. Audio decode of MP2 / AC-3 / E-AC-3 / Opus
+# rides through the `video-thumbnail` `AudioDecoder` (libavcodec). See
 # `docs/configuration-guide.md` "Display output (HDMI / DisplayPort)".
 display = [
     "dep:drm",
@@ -324,12 +325,14 @@ tempfile = "3.27.0"
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 nvml-wrapper = { version = "0.12", optional = true }
 
-# Local-display output — Linux-only (`drm` is libdrm/KMS, `alsa` is
-# libasound2, `udev` is libudev for hotplug enumeration). All three are
-# `optional = true` and gated by the `display` Cargo feature; non-Linux
-# builds short-circuit `enumerate_displays()` to `Vec::new()` and never
-# advertise the capability. Install: `apt install libdrm-dev
-# libasound2-dev libudev-dev` on Debian / Ubuntu.
+# Local-display output — Linux-only. `drm` is the pure-Rust drm-rs
+# crate (ioctl-based KMS, /dev/dri/cardN, no libdrm linkage), `alsa`
+# wraps libasound2, `udev` wraps libudev for hotplug enumeration.
+# All three are `optional = true` and gated by the `display` Cargo
+# feature; non-Linux builds short-circuit `enumerate_displays()` to
+# `Vec::new()` and never advertise the capability. Build prereqs:
+# `apt install libasound2-dev libudev-dev` on Debian / Ubuntu (no
+# libdrm-dev needed — drm-rs goes straight to ioctls).
 [target.'cfg(target_os = "linux")'.dependencies]
 drm = { version = "0.14", optional = true }
 alsa = { version = "0.9", optional = true }

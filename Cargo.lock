@@ -370,7 +370,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bilbycast-edge"
-version = "0.36.0"
+version = "0.36.1"
 dependencies = [
  "aac-audio",
  "aac-codec",
@@ -2049,7 +2049,7 @@ dependencies = [
 
 [[package]]
 name = "libffmpeg-video-sys"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bindgen",
  "cmake",
@@ -4105,7 +4105,7 @@ dependencies = [
 
 [[package]]
 name = "video-engine"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "bytes",
  "libffmpeg-video-sys",

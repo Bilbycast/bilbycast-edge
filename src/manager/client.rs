@@ -794,7 +794,8 @@ fn build_health_payload(
     static_caps: &crate::engine::hardware_probe::StaticCapabilities,
     live_gpu: &crate::engine::hardware_probe::LiveUtilizationState,
 ) -> serde_json::Value {
-    let payload = serde_json::json!({
+    #[allow(unused_mut)]
+    let mut payload = serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": 0,

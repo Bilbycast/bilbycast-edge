@@ -25,6 +25,8 @@
 
 pub mod api;
 pub mod config;
+#[cfg(all(feature = "display", target_os = "linux"))]
+pub mod display;
 pub mod engine;
 pub mod fec;
 pub mod manager;

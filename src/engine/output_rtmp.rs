@@ -979,8 +979,15 @@ async fn passthrough_video(
 
     match src {
         VideoFrameSource::H264 { .. } => {
-            // Send sequence header on first keyframe
-            if is_keyframe && !*sent_video_header {
+            // Send sequence header on the first frame where SPS/PPS are
+            // cached. Real-world broadcast streams often use open-GOP /
+            // recovery-point SEI signalling instead of true IDR (NAL
+            // type 5), so waiting for `is_keyframe` would never fire
+            // and video would never start. Receivers gracefully handle
+            // the first NALU tag being non-IDR — they treat it as
+            // "wait for next IDR" but the sequence header is what
+            // they actually need to initialise the decoder.
+            if !*sent_video_header {
                 if let (Some(sps), Some(pps)) = (demuxer.cached_sps(), demuxer.cached_pps()) {
                     let header = build_avc_sequence_header(sps, pps);
                     client.send_video(&header, ts_ms).await?;
@@ -1007,8 +1014,10 @@ async fn passthrough_video(
         }
         VideoFrameSource::H265 { .. } => {
             // HEVC passthrough over Enhanced RTMP. Build hvcC from cached
-            // VPS / SPS / PPS on first keyframe.
-            if is_keyframe && !*sent_video_header {
+            // VPS / SPS / PPS on the first frame where they're available.
+            // Same rationale as the H.264 path: open-GOP broadcast streams
+            // may not surface a true IDR (`is_keyframe`) for many seconds.
+            if !*sent_video_header {
                 if let Some(hvcc) = build_hvcc_from_cached(demuxer) {
                     let header = build_hevc_sequence_header_from_hvcc(&hvcc);
                     client.send_video(&header, ts_ms).await?;

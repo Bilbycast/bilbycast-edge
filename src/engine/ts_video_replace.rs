@@ -431,7 +431,12 @@ mod inner {
                     };
                     for ef in frames {
                         let pes = build_video_pes(&ef.data, self.pts_90k);
-                        let pkts = packetize_ts(vpid, &pes, &mut self.out_video_cc);
+                        let pkts = packetize_ts(
+                            vpid,
+                            &pes,
+                            &mut self.out_video_cc,
+                            Some(self.pts_90k.wrapping_mul(300)),
+                        );
                         for p in &pkts {
                             output.extend_from_slice(p);
                         }
@@ -560,7 +565,12 @@ mod inner {
                 let vpid = self.video_pid.unwrap();
                 for ef in encoded {
                     let pes = build_video_pes(&ef.data, self.pts_90k);
-                    let pkts = packetize_ts(vpid, &pes, &mut self.out_video_cc);
+                    let pkts = packetize_ts(
+                        vpid,
+                        &pes,
+                        &mut self.out_video_cc,
+                        Some(self.pts_90k.wrapping_mul(300)),
+                    );
                     for p in &pkts {
                         output.extend_from_slice(p);
                     }
@@ -746,7 +756,35 @@ fn build_video_pes(video_data: &[u8], pts: u64) -> Vec<u8> {
 /// Shared with `ts_audio_replace::packetize_ts`, duplicated here to
 /// avoid coupling the two modules.
 #[cfg(feature = "video-thumbnail")]
-fn packetize_ts(pid: u16, pes: &[u8], cc: &mut u8) -> Vec<[u8; 188]> {
+/// Encode a 6-byte PCR field per ISO/IEC 13818-1 §2.4.3.5.
+///
+/// The 42-bit PCR splits into a 33-bit base @ 90 kHz and a 9-bit extension
+/// @ 27 MHz: `pcr_27mhz = base * 300 + ext`. Bytes 0..3 carry the high 32
+/// bits of base; byte 4 packs the LSB of base + 6 reserved 1-bits + the top
+/// bit of ext; byte 5 carries the low 8 bits of ext.
+fn write_pcr_field(buf: &mut [u8; 6], pcr_27mhz: u64) {
+    let base = (pcr_27mhz / 300) & 0x1_FFFF_FFFF; // 33-bit
+    let ext = (pcr_27mhz % 300) as u32; // 9-bit
+    buf[0] = ((base >> 25) & 0xFF) as u8;
+    buf[1] = ((base >> 17) & 0xFF) as u8;
+    buf[2] = ((base >> 9) & 0xFF) as u8;
+    buf[3] = ((base >> 1) & 0xFF) as u8;
+    buf[4] = (((base & 1) << 7) as u8) | 0x7E | (((ext >> 8) & 0x01) as u8);
+    buf[5] = (ext & 0xFF) as u8;
+}
+
+/// Pack a PES into 188-byte TS packets on `pid`. When `pcr_27mhz` is `Some`,
+/// the PUSI start packet carries an adaptation field with `PCR_flag = 1` —
+/// this is what makes the rebuilt video PID a valid PCR carrier so the
+/// downstream stream complies with TR 101 290 P1.5 / P1.7. (Without it,
+/// software re-mux paths emit a stream with PMT-declared PCR_PID = video
+/// PID but no PCR fields anywhere, which professional decoders reject.)
+fn packetize_ts(
+    pid: u16,
+    pes: &[u8],
+    cc: &mut u8,
+    pcr_27mhz: Option<u64>,
+) -> Vec<[u8; 188]> {
     let mut packets = Vec::new();
     let mut offset = 0;
     let mut is_first = true;
@@ -762,32 +800,79 @@ fn packetize_ts(pid: u16, pes: &[u8], cc: &mut u8) -> Vec<[u8; 188]> {
         pkt[2] = pid as u8;
 
         let remaining = pes.len() - offset;
-        let payload_capacity = TS_PACKET_SIZE - 4;
 
-        if remaining >= payload_capacity {
-            pkt[3] = 0x10 | current_cc;
-            pkt[4..TS_PACKET_SIZE]
-                .copy_from_slice(&pes[offset..offset + payload_capacity]);
-            offset += payload_capacity;
-        } else {
-            let stuff_len = payload_capacity - remaining;
-            if stuff_len == 1 {
-                pkt[3] = 0x30 | current_cc;
-                pkt[4] = 0;
-                pkt[5..5 + remaining].copy_from_slice(&pes[offset..]);
-            } else {
-                pkt[3] = 0x30 | current_cc;
-                pkt[4] = (stuff_len - 1) as u8;
-                if stuff_len > 1 {
-                    pkt[5] = 0x00;
-                    for i in 6..4 + stuff_len {
-                        pkt[i] = 0xFF;
-                    }
+        // PCR-carrying PUSI start: build adaptation field (8 bytes:
+        // 1 length + 1 flags + 6 PCR), then payload fills the rest.
+        // af_length = 7 (excludes the length byte itself).
+        if is_first && pcr_27mhz.is_some() {
+            const AF_BYTES_AFTER_LEN: usize = 7; // flags(1) + PCR(6)
+            const AF_TOTAL: usize = AF_BYTES_AFTER_LEN + 1; // + length byte
+            let payload_capacity = TS_PACKET_SIZE - 4 - AF_TOTAL;
+            pkt[3] = 0x30 | current_cc; // AFC = both
+            pkt[4] = AF_BYTES_AFTER_LEN as u8;
+            pkt[5] = 0x10; // PCR_flag only
+            let mut pcr_buf = [0u8; 6];
+            write_pcr_field(&mut pcr_buf, pcr_27mhz.unwrap());
+            pkt[6..12].copy_from_slice(&pcr_buf);
+            let take = remaining.min(payload_capacity);
+            pkt[4 + AF_TOTAL..4 + AF_TOTAL + take]
+                .copy_from_slice(&pes[offset..offset + take]);
+            // If the PES is short enough to fit entirely in this PCR-carrying
+            // packet, pad the trailing bytes back into the adaptation field.
+            // We do this by extending af_length and stuffing 0xFF, so the
+            // payload still ends at byte 187. This case is rare for video
+            // PES (frames are kilobytes) — handled here only to avoid
+            // truncation if a tiny frame ever shows up.
+            if take < payload_capacity {
+                let stuff = payload_capacity - take;
+                let new_af_len = AF_BYTES_AFTER_LEN + stuff;
+                pkt[4] = new_af_len as u8;
+                // Move the (small) payload to the end of the packet.
+                let payload_start_old = 4 + AF_TOTAL;
+                let payload_start_new = TS_PACKET_SIZE - take;
+                if take > 0 {
+                    pkt.copy_within(
+                        payload_start_old..payload_start_old + take,
+                        payload_start_new,
+                    );
                 }
-                pkt[4 + stuff_len..4 + stuff_len + remaining]
-                    .copy_from_slice(&pes[offset..]);
+                // Fill the new stuffing bytes with 0xFF.
+                for b in pkt
+                    .iter_mut()
+                    .take(payload_start_new)
+                    .skip(4 + AF_TOTAL)
+                {
+                    *b = 0xFF;
+                }
             }
-            offset += remaining;
+            offset += take;
+        } else {
+            let payload_capacity = TS_PACKET_SIZE - 4;
+            if remaining >= payload_capacity {
+                pkt[3] = 0x10 | current_cc;
+                pkt[4..TS_PACKET_SIZE]
+                    .copy_from_slice(&pes[offset..offset + payload_capacity]);
+                offset += payload_capacity;
+            } else {
+                let stuff_len = payload_capacity - remaining;
+                if stuff_len == 1 {
+                    pkt[3] = 0x30 | current_cc;
+                    pkt[4] = 0;
+                    pkt[5..5 + remaining].copy_from_slice(&pes[offset..]);
+                } else {
+                    pkt[3] = 0x30 | current_cc;
+                    pkt[4] = (stuff_len - 1) as u8;
+                    if stuff_len > 1 {
+                        pkt[5] = 0x00;
+                        for i in 6..4 + stuff_len {
+                            pkt[i] = 0xFF;
+                        }
+                    }
+                    pkt[4 + stuff_len..4 + stuff_len + remaining]
+                        .copy_from_slice(&pes[offset..]);
+                }
+                offset += remaining;
+            }
         }
         is_first = false;
         packets.push(pkt);

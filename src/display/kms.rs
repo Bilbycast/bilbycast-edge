@@ -17,7 +17,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use drm::buffer::DrmFourcc;
+use drm::buffer::{Buffer, DrmFourcc};
 use drm::control::{
     connector::State as ConnectorState, framebuffer, AtomicCommitFlags, Device as ControlDevice,
 };

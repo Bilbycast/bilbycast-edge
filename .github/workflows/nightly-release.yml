@@ -55,13 +55,15 @@ jobs:
         include:
           # ─── default variant: no video encoders (AGPL-3.0-or-later only) ───
           # The local-display output (`display` Cargo feature) ships in
-          # every Linux variant — it pulls in libdrm + libasound2 + libudev
-          # at link time, all LGPL-clean, no GPL implications. Operators
-          # who don't need a confidence monitor on the box simply don't
-          # configure a `display` output; the runtime cost when unused is
-          # one cold KMS probe at startup (returns empty on headless
-          # builders, no `"display"` capability advertised, manager UI
-          # hides the option per-node).
+          # every Linux variant. `drm-rs` is a pure-Rust ioctl crate —
+          # it talks to `/dev/dri/cardN` directly and does NOT link
+          # libdrm. ALSA (libasound2) and udev (libudev) DO link at
+          # build time; both are LGPL-clean, no GPL implications.
+          # Operators who don't need a confidence monitor on the box
+          # simply don't configure a `display` output; the runtime cost
+          # when unused is one cold KMS probe at startup (returns empty
+          # on headless builders, no `"display"` capability advertised,
+          # manager UI hides the option per-node).
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact_suffix: x86_64-linux
@@ -131,9 +133,12 @@ jobs:
 
       - name: Install common build dependencies
         run: |
+          # `display` Cargo feature link-time deps: libasound2-dev (alsa-sys
+          # `links = "alsa"`) + libudev-dev (libudev-sys `links = "libudev"`).
+          # `drm-rs` is pure-Rust ioctls over /dev/dri — no libdrm-dev needed.
           sudo apt-get update
           sudo apt-get install -y cmake make clang libclang-dev pkg-config libssl-dev g++ \
-            libdrm-dev libasound2-dev libudev-dev
+            libasound2-dev libudev-dev
 
       - name: Install video-encoder build dependencies (full variant only)
         if: matrix.variant == 'full'
@@ -219,20 +224,21 @@ jobs:
             fi
             echo "OK: default variant has no libx264/libx265 linkage"
           fi
-          echo "=== Checking for display-output linkage (libdrm + libasound2 + libudev) ==="
-          # `display` is in every Linux variant — confirm libdrm.so.2,
-          # libasound.so.2 and libudev.so.1 are linked. The runtime
-          # behaviour on a headless host is to enumerate empty and not
-          # advertise the `"display"` capability — the linkage stays
-          # regardless so a single binary works across both wall-mount
-          # and headless deployments.
-          for sym in libdrm libasound libudev; do
+          echo "=== Checking for display-output linkage (libasound2 + libudev) ==="
+          # `display` is in every Linux variant — confirm libasound.so.2
+          # and libudev.so.1 are linked. `drm-rs` is pure-Rust ioctls
+          # over /dev/dri/cardN, so libdrm.so.2 is intentionally NOT
+          # linked. Runtime behaviour on a headless host is to enumerate
+          # empty and not advertise the `"display"` capability — the
+          # linkage stays regardless so a single binary works across
+          # both wall-mount and headless deployments.
+          for sym in libasound libudev; do
             if ! ldd "${BINARY}" | grep -qE "${sym}\\."; then
               echo "ERROR: Linux binary is missing ${sym} linkage (display feature)"
               exit 1
             fi
           done
-          echo "OK: display feature linked (libdrm + libasound + libudev)"
+          echo "OK: display feature linked (libasound + libudev)"
 
       - name: Package tarball
         run: |
