@@ -21,7 +21,7 @@ jobs:
       should_release: ${{ steps.check_release.outputs.should_release }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Get version from Cargo.toml
         id: get_version
@@ -93,21 +93,21 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout bilbycast-libsrt-rs (path dependency)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           repository: Bilbycast/bilbycast-libsrt-rs
           path: bilbycast-libsrt-rs
           submodules: recursive
 
       - name: Checkout bilbycast-fdk-aac-rs (path dependency)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           repository: Bilbycast/bilbycast-fdk-aac-rs
           path: bilbycast-fdk-aac-rs
           submodules: recursive
 
       - name: Checkout bilbycast-ffmpeg-video-rs (path dependency)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           repository: Bilbycast/bilbycast-ffmpeg-video-rs
           path: bilbycast-ffmpeg-video-rs
@@ -115,20 +115,20 @@ jobs:
           fetch-depth: 0
 
       - name: Checkout bilbycast-rist (path dependency)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           repository: Bilbycast/bilbycast-rist
           path: bilbycast-rist
           submodules: recursive
 
       - name: Checkout bilbycast-bonding (path dependency)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           repository: Bilbycast/bilbycast-bonding
           path: bilbycast-bonding
 
       - name: Checkout bilbycast-edge
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           path: bilbycast-edge
 
@@ -300,7 +300,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Download all artifacts
         uses: actions/download-artifact@v7
