@@ -24,6 +24,8 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 
 pub mod audio;
+pub mod audio_bars;
+pub mod audio_meter;
 pub mod clock;
 pub mod kms;
 

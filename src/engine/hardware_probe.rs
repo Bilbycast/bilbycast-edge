@@ -416,6 +416,11 @@ pub fn compute_flow_cost_units(plan: &FlowCostPlan) -> u32 {
     // a 4K60 transcode. Operators on hosts with `display-vaapi` /
     // `display-nvdec` will see this drop to 100 in v2.
     units = units.saturating_add(275u32.saturating_mul(plan.display_outputs));
+    // Audio-bars overlay on a `display` output runs an independent
+    // multi-PID audio decoder + per-frame BGRA rasterise. ~15 units per
+    // enabled output (matches `audio_encode` at 5 plus a small bump for
+    // the ~3 PIDs typical on a broadcast multi-language feed).
+    units = units.saturating_add(15u32.saturating_mul(plan.display_audio_bars_outputs));
     if plan.content_analysis_lite {
         units = units.saturating_add(2);
     }
@@ -444,6 +449,10 @@ pub struct FlowCostPlan {
     /// non-Linux / non-feature builds this stays 0 because the
     /// schema-only Display variant is rejected at `start_output`.
     pub display_outputs: u32,
+    /// Number of `display` outputs that have `show_audio_bars: true`.
+    /// Counts the extra audio-decoder pool the meter spawns, not the
+    /// rasterisation cost (negligible).
+    pub display_audio_bars_outputs: u32,
     pub content_analysis_lite: bool,
     pub content_analysis_audio_full: bool,
     pub content_analysis_video_full: bool,

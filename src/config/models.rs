@@ -4026,6 +4026,15 @@ pub struct DisplayOutputConfig {
     /// clock. PTP-genlocked / PCR-master modes land in v2.
     #[serde(default = "default_sync_mode")]
     pub sync_mode: String,
+
+    /// Render a per-PID, per-channel audio level meter strip across the
+    /// bottom of the picture. Independent of `audio_track_index` — every
+    /// audio PID in the active program is decoded and metered, even ones
+    /// not routed to ALSA. Defaults `false`. See
+    /// `bilbycast-edge/docs/configuration-guide.md` ("Audio bars overlay")
+    /// for the layout and meter-style reference.
+    #[serde(default)]
+    pub show_audio_bars: bool,
 }
 
 fn default_audio_channel_pair() -> [u8; 2] {

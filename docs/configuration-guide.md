@@ -1383,7 +1383,8 @@ output.
   "audio_channel_pair": [0, 1],
   "resolution": "1920x1080",
   "refresh_hz": 60,
-  "sync_mode": "vsync_to_display"
+  "sync_mode": "vsync_to_display",
+  "show_audio_bars": true
 }
 ```
 
@@ -1411,6 +1412,14 @@ output.
 - **`sync_mode`** — only `"vsync_to_display"` in v1: the renderer
   paces to monitor vsync and dup/drops video to track the audio
   master clock. PTP-genlocked / PCR-master modes land in v2.
+- **`show_audio_bars`** — `true` to render a per-PID, per-channel
+  audio level meter strip across the bottom 12 % of the picture (peak
+  + RMS bar with a 1.5 s peak-hold tick; green ≤ -18 dBFS, yellow
+  -18 → -3 dBFS, red > -3 dBFS). Independent of `audio_track_index` —
+  every audio PID in the active program is decoded and metered, even
+  ones not routed to ALSA. Adds an independent multi-PID audio
+  decoder pool (~15 resource-budget units per output, ~1-2 % CPU per
+  PID at typical broadcast bitrates). Defaults `false`.
 
 **Build prerequisites.** `display` is Linux-only and gated on the
 `display` Cargo feature (off by default). Schema is unconditional —

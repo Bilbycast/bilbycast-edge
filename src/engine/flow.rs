@@ -3287,8 +3287,12 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
         // pipeline (Linux-only, gated on the `display` Cargo feature).
         // Counted separately from sw/hw video *encode* outputs because
         // the cost weight differs.
-        if matches!(out, OutputConfig::Display(_)) {
+        if let OutputConfig::Display(d) = out {
             plan.display_outputs = plan.display_outputs.saturating_add(1);
+            if d.show_audio_bars {
+                plan.display_audio_bars_outputs =
+                    plan.display_audio_bars_outputs.saturating_add(1);
+            }
         }
     }
 

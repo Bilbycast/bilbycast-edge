@@ -42,9 +42,13 @@ use tokio_util::sync::CancellationToken;
 
 use aac_audio::AacDecoder;
 use video_codec::AudioDecoderCodec;
-use video_engine::{AudioDecoder as FfAudioDecoder, VideoCodec, VideoDecoder};
+use video_engine::{
+    AudioDecoder as FfAudioDecoder, ScalerDstFormat, VideoCodec, VideoDecoder, VideoScaler,
+};
 
 use crate::config::models::DisplayOutputConfig;
+use crate::display::audio_bars::{new_shared_meter, MeterSnapshot, SharedMeter};
+use crate::display::audio_meter::spawn_audio_meter;
 use crate::display::{audio::AudioBackend, clock::AudioClock, kms::KmsDisplay};
 use crate::engine::packet::RtpPacket;
 use crate::engine::ts_demux::{DemuxedFrame, TsDemuxer};
@@ -169,6 +173,22 @@ async fn run_display_output(
     let (vtx, vrx) = mpsc::channel::<VideoFrame>(MPSC_VIDEO_DEPTH);
     let (atx, arx) = mpsc::channel::<AudioBlock>(MPSC_AUDIO_DEPTH);
 
+    // Optional metering child — independent multi-PID audio decoder
+    // that updates a shared `MeterSnapshot` consumed by `display_loop`.
+    let meter_snapshot: Option<SharedMeter> = if config.show_audio_bars {
+        Some(new_shared_meter())
+    } else {
+        None
+    };
+    let meter_handle = meter_snapshot.as_ref().map(|snap| {
+        spawn_audio_meter(
+            rx.resubscribe(),
+            config.program_number,
+            Arc::clone(snap),
+            cancel.child_token(),
+        )
+    });
+
     // Demux + decode child — owns the broadcast subscriber.
     let demux_cancel = cancel.child_token();
     let demux_counters = Arc::clone(&counters);
@@ -201,6 +221,7 @@ async fn run_display_output(
     let display_event_sender = event_sender.clone();
     let display_flow_id = flow_id.clone();
     let display_output_id = config.id.clone();
+    let display_meter = meter_snapshot.as_ref().map(Arc::clone);
     let display_handle = tokio::task::spawn_blocking(move || {
         display_loop(
             kms,
@@ -214,6 +235,7 @@ async fn run_display_output(
             display_event_sender,
             display_flow_id,
             display_output_id,
+            display_meter,
         );
     });
 
@@ -241,8 +263,12 @@ async fn run_display_output(
         );
     });
 
-    // Wait for all three to drain (cancellation cascade).
+    // Wait for all children to drain (cancellation cascade). The audio
+    // meter is optional; await it only when it was spawned.
     let _ = tokio::join!(demux_handle, display_handle, audio_handle);
+    if let Some(handle) = meter_handle {
+        let _ = handle.await;
+    }
 
     emit_event(
         &event_sender,
@@ -263,8 +289,10 @@ async fn run_display_output(
 // ── Frame channels ────────────────────────────────────────────────
 
 struct VideoFrame {
-    /// Raw YUV planes in source format. The display task does the
-    /// `YUV → XRGB8888` conversion inline.
+    /// Raw YUV planes in source format. The display task hands these to
+    /// libswscale (via `VideoScaler::scale_raw_planes_into_packed`) for
+    /// the YUV → BGRA conversion + scale, writing straight into the KMS
+    /// dumb buffer.
     y: Vec<u8>,
     u: Vec<u8>,
     v: Vec<u8>,
@@ -273,6 +301,17 @@ struct VideoFrame {
     v_stride: usize,
     width: u32,
     height: u32,
+    /// FFmpeg `AVPixelFormat` integer (e.g. `AV_PIX_FMT_YUV420P`). Threads
+    /// through to the scaler so libswscale knows the source planes' chroma
+    /// subsampling and bit depth.
+    pixel_format: i32,
+    /// FFmpeg `AVColorSpace` (`AVCOL_SPC_*`). Drives the YUV→RGB matrix
+    /// libswscale uses — BT.709 for HD, BT.601 for SD, BT.2020 for UHD.
+    /// `AVCOL_SPC_UNSPECIFIED` (2) means the bitstream didn't tell us;
+    /// the display loop falls back to BT.709 for ≥720p sources, BT.601
+    /// otherwise.
+    colorspace: i32,
+    full_range: bool,
     pts_90k: u64,
 }
 
@@ -464,6 +503,9 @@ fn drain_video_frames(
             v_stride: vs,
             width: frame.width(),
             height: frame.height(),
+            pixel_format: frame.pixel_format(),
+            colorspace: frame.colorspace(),
+            full_range: frame.is_full_range(),
             pts_90k,
         };
         if vtx.try_send(frame).is_err() {
@@ -487,10 +529,12 @@ fn display_loop(
     event_sender: EventSender,
     flow_id: String,
     output_id: String,
+    meter: Option<SharedMeter>,
 ) {
     let frame_period_ms_at_60hz: i64 = 16;
     let mut last_frame: Option<VideoFrame> = None;
     let mut stats_registered = false;
+    let mut scaler: Option<CachedScaler> = None;
 
     while !cancel.is_cancelled() {
         let next = match vrx.blocking_recv() {
@@ -563,64 +607,162 @@ fn display_loop(
             }
             if drift_ms > frame_period_ms_at_60hz {
                 if let Some(prev) = last_frame.as_ref() {
-                    if blit_and_present(&mut kms, prev).is_ok() {
+                    if blit_and_present(&mut kms, prev, &mut scaler, meter.as_ref()).is_ok() {
                         counters.frames_repeated.fetch_add(1, Ordering::Relaxed);
                     }
                     continue;
                 }
             }
         }
-        if blit_and_present(&mut kms, &next).is_ok() {
+        if blit_and_present(&mut kms, &next, &mut scaler, meter.as_ref()).is_ok() {
             counters.frames_displayed.fetch_add(1, Ordering::Relaxed);
         }
         last_frame = Some(next);
     }
 }
 
-fn blit_and_present(kms: &mut KmsDisplay, frame: &VideoFrame) -> Result<()> {
+/// Cached libswscale context. Held across frames and rebuilt only when
+/// the source shape changes — every parameter change costs a fresh
+/// `sws_getContext` (heavy) and a fresh `sws_setColorspaceDetails` to
+/// reapply the YUV→RGB matrix.
+struct CachedScaler {
+    inner: VideoScaler,
+    src_w: u32,
+    src_h: u32,
+    src_pix_fmt: i32,
+    dst_w: u32,
+    dst_h: u32,
+    src_colorspace: i32,
+    src_full_range: bool,
+}
+
+/// FFmpeg `AVCOL_SPC_*` integers we care about. Repeated here as plain
+/// constants so this file doesn't have to depend on libffmpeg-video-sys
+/// directly — `VideoScaler::set_yuv_to_rgb_colorspace` accepts any
+/// integer libswscale recognises.
+const AVCOL_SPC_BT709: i32 = 1;
+const AVCOL_SPC_UNSPECIFIED: i32 = 2;
+const AVCOL_SPC_SMPTE170M: i32 = 6;
+
+fn effective_colorspace(signalled: i32, src_h: u32) -> i32 {
+    // BT.709 for HD and above, BT.601 (SMPTE 170M) for SD when the
+    // bitstream didn't tell us. This matches what every modern decoder
+    // assumes when VUI is missing.
+    if signalled == AVCOL_SPC_UNSPECIFIED {
+        if src_h >= 720 {
+            AVCOL_SPC_BT709
+        } else {
+            AVCOL_SPC_SMPTE170M
+        }
+    } else {
+        signalled
+    }
+}
+
+fn ensure_scaler(
+    cache: &mut Option<CachedScaler>,
+    src_w: u32,
+    src_h: u32,
+    src_pix_fmt: i32,
+    dst_w: u32,
+    dst_h: u32,
+    src_colorspace: i32,
+    src_full_range: bool,
+) -> Result<&mut CachedScaler> {
+    let needs_rebuild = match cache.as_ref() {
+        Some(c) => {
+            c.src_w != src_w
+                || c.src_h != src_h
+                || c.src_pix_fmt != src_pix_fmt
+                || c.dst_w != dst_w
+                || c.dst_h != dst_h
+                || c.src_colorspace != src_colorspace
+                || c.src_full_range != src_full_range
+        }
+        None => true,
+    };
+    if needs_rebuild {
+        let inner = VideoScaler::new_with_dst_format(
+            src_w,
+            src_h,
+            src_pix_fmt,
+            dst_w,
+            dst_h,
+            ScalerDstFormat::Bgra8,
+        )
+        .map_err(|e| anyhow::anyhow!("display scaler init failed: {e}"))?;
+        inner.set_yuv_to_rgb_colorspace(src_colorspace, src_full_range);
+        *cache = Some(CachedScaler {
+            inner,
+            src_w,
+            src_h,
+            src_pix_fmt,
+            dst_w,
+            dst_h,
+            src_colorspace,
+            src_full_range,
+        });
+    }
+    Ok(cache.as_mut().expect("scaler just inserted"))
+}
+
+fn blit_and_present(
+    kms: &mut KmsDisplay,
+    frame: &VideoFrame,
+    scaler: &mut Option<CachedScaler>,
+    meter: Option<&SharedMeter>,
+) -> Result<()> {
     let mut map = kms.back_buffer()?;
     let pitch = map.pitch() as usize;
-    let dst_w = map.width() as usize;
-    let dst_h = map.height() as usize;
+    let dst_w = map.width();
+    let dst_h = map.height();
     let dst = map.as_mut();
 
-    // Fast YUV420 → XRGB8888 nearest-neighbour blit. Good enough for
-    // a 1080p confidence monitor; v2 routes through libswscale or a
-    // hardware overlay plane for true broadcast quality.
-    let src_w = frame.width as usize;
-    let src_h = frame.height as usize;
-    if src_w == 0 || src_h == 0 {
+    let src_w = frame.width;
+    let src_h = frame.height;
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
         return Ok(());
     }
-    let scale_x = (src_w as f32) / (dst_w as f32).max(1.0);
-    let scale_y = (src_h as f32) / (dst_h as f32).max(1.0);
-    for y in 0..dst_h {
-        let sy = ((y as f32) * scale_y) as usize;
-        let sy = sy.min(src_h - 1);
-        let row_base = y * pitch;
-        for x in 0..dst_w {
-            let sx = ((x as f32) * scale_x) as usize;
-            let sx = sx.min(src_w - 1);
-            let yval = frame.y[sy * frame.y_stride + sx] as i32;
-            let uy = sy / 2;
-            let ux = sx / 2;
-            let uval = frame.u[uy * frame.u_stride + ux] as i32 - 128;
-            let vval = frame.v[uy * frame.v_stride + ux] as i32 - 128;
-            // BT.601 conversion (good enough for the v1 confidence
-            // monitor; v2 picks the right matrix from VUI).
-            let c = yval - 16;
-            let r = ((298 * c + 409 * vval + 128) >> 8).clamp(0, 255) as u8;
-            let g = ((298 * c - 100 * uval - 208 * vval + 128) >> 8).clamp(0, 255) as u8;
-            let b = ((298 * c + 516 * uval + 128) >> 8).clamp(0, 255) as u8;
-            let off = row_base + x * 4;
-            if off + 4 <= dst.len() {
-                dst[off] = b;
-                dst[off + 1] = g;
-                dst[off + 2] = r;
-                dst[off + 3] = 0xFF;
-            }
-        }
+
+    let colorspace = effective_colorspace(frame.colorspace, src_h);
+    let cached = ensure_scaler(
+        scaler,
+        src_w,
+        src_h,
+        frame.pixel_format,
+        dst_w,
+        dst_h,
+        colorspace,
+        frame.full_range,
+    )?;
+    cached
+        .inner
+        .scale_raw_planes_into_packed(
+            src_w,
+            src_h,
+            frame.pixel_format,
+            &frame.y,
+            frame.y_stride,
+            &frame.u,
+            frame.u_stride,
+            &frame.v,
+            frame.v_stride,
+            dst,
+            pitch,
+        )
+        .map_err(|e| anyhow::anyhow!("display scale failed: {e}"))?;
+
+    if let Some(snapshot) = meter {
+        // Snapshot is small (≤ ~16 PIDs × 8 channels × 16 B); clone the
+        // current snapshot and rasterise without holding the mutex
+        // across the per-pixel writes.
+        let snap: MeterSnapshot = snapshot
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        crate::display::audio_bars::rasterise(&snap, dst, pitch, dst_w, dst_h);
     }
+
     drop(map);
     kms.present()?;
     Ok(())

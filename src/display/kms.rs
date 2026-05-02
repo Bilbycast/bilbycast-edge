@@ -9,10 +9,11 @@
 //   output's chosen mode. Constructed by `output_display` once the
 //   feature is enabled and the operator has picked a connector.
 //
-// All KMS work is sw-only in v1 (dumb buffer + CPU XRGB8888 blit). The
-// v2 hardware-decode path (DMA-BUF-zerocopy via VAAPI/NVDEC) lands as
-// an additive backend behind the `display-vaapi` / `display-nvdec`
-// Cargo features documented in `Cargo.toml`.
+// All KMS work is sw-only today (dumb buffer + libswscale-driven
+// YUV→BGRA scale into the mapped framebuffer). The hardware-decode
+// path (DMA-BUF-zerocopy via VAAPI/NVDEC) lands as an additive backend
+// behind the `display-vaapi` / `display-nvdec` Cargo features
+// documented in `Cargo.toml`.
 
 use std::path::PathBuf;
 
