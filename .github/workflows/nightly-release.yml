@@ -247,6 +247,8 @@ jobs:
         run: |
           VERSION="${{ needs.check-version.outputs.version }}"
           BINARY="bilbycast-edge/target/${{ matrix.target }}/release/bilbycast-edge"
+          # Staging directory keeps the version so the unpacked folder is
+          # self-identifying (`bilbycast-edge-0.36.1-x86_64-linux-full/`).
           STAGE="bilbycast-edge-${VERSION}-${{ matrix.artifact_suffix }}"
           mkdir -p "${STAGE}"
           cp "${BINARY}" "${STAGE}/bilbycast-edge"
@@ -274,7 +276,10 @@ jobs:
             cp -r bilbycast-edge/config_examples "${STAGE}/config_examples"
           fi
 
-          TARBALL="${STAGE}.tar.gz"
+          # Tarball name is *versionless* so /releases/latest/download/<asset>
+          # always resolves to the most recent release — matches the manager
+          # and relay workflows.
+          TARBALL="bilbycast-edge-${{ matrix.artifact_suffix }}.tar.gz"
           tar czf "${TARBALL}" "${STAGE}"
           sha256sum "${TARBALL}" > "${TARBALL}.sha256"
           echo "Packaged ${TARBALL} ($(du -h ${TARBALL} | cut -f1))"
@@ -285,8 +290,8 @@ jobs:
         with:
           name: bilbycast-edge-${{ matrix.artifact_suffix }}
           path: |
-            bilbycast-edge-${{ needs.check-version.outputs.version }}-${{ matrix.artifact_suffix }}.tar.gz
-            bilbycast-edge-${{ needs.check-version.outputs.version }}-${{ matrix.artifact_suffix }}.tar.gz.sha256
+            bilbycast-edge-${{ matrix.artifact_suffix }}.tar.gz
+            bilbycast-edge-${{ matrix.artifact_suffix }}.tar.gz.sha256
           retention-days: 1
 
   release:
@@ -321,15 +326,17 @@ jobs:
 
           Two variants per architecture — pick one based on your transcoding needs:
 
+          Asset filenames are versionless so \`https://github.com/Bilbycast/bilbycast-edge/releases/latest/download/<asset>\` always resolves to this release. The unpacked directory keeps the version (\`bilbycast-edge-${VERSION}-<arch>-linux[-full]/\`).
+
           ### \`*-linux\` (default variant)
           No H.264 / H.265 software encoders bundled. AGPL-3.0-or-later binary.
-          - \`bilbycast-edge-${VERSION}-x86_64-linux.tar.gz\` — Linux x86_64 (amd64)
-          - \`bilbycast-edge-${VERSION}-aarch64-linux.tar.gz\` — Linux ARM64 (aarch64)
+          - \`bilbycast-edge-x86_64-linux.tar.gz\` — Linux x86_64 (amd64)
+          - \`bilbycast-edge-aarch64-linux.tar.gz\` — Linux ARM64 (aarch64)
 
           ### \`*-linux-full\` (full variant)
           Includes libx264 + libx265 + NVENC; the **x86_64** build also bundles **QSV** (Intel oneVPL). NVENC activates automatically on hosts with an NVIDIA driver, QSV on hosts with an Intel iGPU + media driver; x264 / x265 handle everything else. The aarch64 build omits QSV (Intel iGPU is x86_64-only). This binary is an **AGPL-3.0-or-later combined work** that bundles GPL-2.0-or-later code — see \`NOTICE\` inside the tarball.
-          - \`bilbycast-edge-${VERSION}-x86_64-linux-full.tar.gz\` — Linux x86_64 (amd64) — x264 + x265 + NVENC + QSV
-          - \`bilbycast-edge-${VERSION}-aarch64-linux-full.tar.gz\` — Linux ARM64 (aarch64) — x264 + x265 + NVENC
+          - \`bilbycast-edge-x86_64-linux-full.tar.gz\` — Linux x86_64 (amd64) — x264 + x265 + NVENC + QSV
+          - \`bilbycast-edge-aarch64-linux-full.tar.gz\` — Linux ARM64 (aarch64) — x264 + x265 + NVENC
 
           Install \`libx264\` and \`libx265\` runtime packages before running the \`-full\` binary: \`sudo apt install libx264-dev libx265-dev\`. No extra packages needed for NVENC beyond the NVIDIA driver. **For QSV (x86_64 only)**: \`sudo apt install libvpl2 intel-media-va-driver-non-free\` (or \`intel-media-driver\`), then add the running user to the \`render\` group so the edge can open \`/dev/dri/renderD*\`.
 
@@ -344,11 +351,11 @@ jobs:
           **Commercial-licence customers using \`-full\`**: the Softside commercial licence covers bilbycast source only — it does not relicense libx264 / libx265, which remain GPL-2.0-or-later inside the \`-full\` binary. To avoid GPL copyleft entirely, use the default variant or build from source with \`video-encoder-nvenc\` only. See \`LICENSE.commercial\` for the scope statement.
 
           **Patent notice**: H.264 / H.265 patent licensing (MPEG-LA, Access Advance, Velos Media) is separate from software copyright and is the operator's responsibility in commercial deployments. See \`NOTICE\` in the \`-full\` tarball." \
-            artifacts/bilbycast-edge-${VERSION}-x86_64-linux.tar.gz \
-            artifacts/bilbycast-edge-${VERSION}-x86_64-linux.tar.gz.sha256 \
-            artifacts/bilbycast-edge-${VERSION}-aarch64-linux.tar.gz \
-            artifacts/bilbycast-edge-${VERSION}-aarch64-linux.tar.gz.sha256 \
-            artifacts/bilbycast-edge-${VERSION}-x86_64-linux-full.tar.gz \
-            artifacts/bilbycast-edge-${VERSION}-x86_64-linux-full.tar.gz.sha256 \
-            artifacts/bilbycast-edge-${VERSION}-aarch64-linux-full.tar.gz \
-            artifacts/bilbycast-edge-${VERSION}-aarch64-linux-full.tar.gz.sha256
+            artifacts/bilbycast-edge-x86_64-linux.tar.gz \
+            artifacts/bilbycast-edge-x86_64-linux.tar.gz.sha256 \
+            artifacts/bilbycast-edge-aarch64-linux.tar.gz \
+            artifacts/bilbycast-edge-aarch64-linux.tar.gz.sha256 \
+            artifacts/bilbycast-edge-x86_64-linux-full.tar.gz \
+            artifacts/bilbycast-edge-x86_64-linux-full.tar.gz.sha256 \
+            artifacts/bilbycast-edge-aarch64-linux-full.tar.gz \
+            artifacts/bilbycast-edge-aarch64-linux-full.tar.gz.sha256

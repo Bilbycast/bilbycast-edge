@@ -32,7 +32,10 @@ libudev are in the link graph):
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y libasound2
+# Ubuntu 24.04+: the package was renamed to libasound2t64 (time_t
+# transition). On Ubuntu 22.04 / Debian 12 / older the name is plain
+# libasound2.
+sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2
 ```
 
 This library is part of every modern Linux base install and already
