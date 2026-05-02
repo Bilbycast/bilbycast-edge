@@ -56,22 +56,35 @@ fn open_card(path: &PathBuf) -> Result<CardFile> {
     Ok(CardFile(file))
 }
 
-/// Walk `/dev/dri/card0`..`/dev/dri/card9` and merge enumerated
-/// connectors into one `DisplayDevice` list. Stops on the first
-/// missing card.
+/// Return all `/dev/dri/cardN` paths sorted by `N`. Modern kernels can
+/// start the card numbering at non-zero (mixed iGPU+dGPU systems, hot-add
+/// ordering, container passthrough), so we scan the directory rather than
+/// walking a contiguous index from 0. Returns an empty vec on access-denied
+/// or missing-DRI hosts.
+fn enumerate_card_paths() -> Vec<PathBuf> {
+    let dir = match std::fs::read_dir("/dev/dri") {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let mut cards: Vec<(u32, PathBuf)> = Vec::new();
+    for entry in dir.flatten() {
+        let fname = entry.file_name();
+        let name = fname.to_string_lossy();
+        if let Some(rest) = name.strip_prefix("card") {
+            if let Ok(n) = rest.parse::<u32>() {
+                cards.push((n, entry.path()));
+            }
+        }
+    }
+    cards.sort_by_key(|(n, _)| *n);
+    cards.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Read `/dev/dri/` and merge the connectors of every `cardN` node
+/// into one `DisplayDevice` list.
 pub fn enumerate_displays_kms() -> Vec<DisplayDevice> {
     let mut out = Vec::new();
-    for n in 0..10u32 {
-        let path = PathBuf::from(format!("/dev/dri/card{n}"));
-        if !path.exists() {
-            // Stop at the first gap. KMS cards are numbered contiguously
-            // starting at 0; if `card0` is missing the host has no DRI
-            // and we shouldn't keep probing.
-            if n == 0 {
-                return out;
-            }
-            break;
-        }
+    for path in enumerate_card_paths() {
         match enumerate_card(&path) {
             Ok(devs) => out.extend(devs),
             Err(e) => {
@@ -316,6 +329,67 @@ impl KmsDisplay {
         self.mode.vrefresh() as u32
     }
 
+    /// Re-program the connector to the smallest available mode whose
+    /// dimensions are at least `(src_w, src_h)`. Used by the `auto`
+    /// resolution path once the first decoded frame reveals the source
+    /// flow's true size — picking the monitor's preferred mode on a 4K
+    /// panel for a 1080p source is what produced the jitter the user
+    /// reported. Drops + re-allocates the dumb-buffer pair if the new
+    /// mode size differs. No-op when the new mode is identical to the
+    /// current one.
+    pub fn match_source_resolution(&mut self, src_w: u32, src_h: u32) -> Result<()> {
+        let info = self
+            .card
+            .get_connector(self.connector, true)
+            .context("get_connector for auto-match")?;
+        let new_mode = pick_mode_for_source(&info, src_w, src_h)?;
+        let (new_w_i16, new_h_i16) = new_mode.size();
+        let new_w = new_w_i16 as u32;
+        let new_h = new_h_i16 as u32;
+        let same_size = new_w == self.width && new_h == self.height;
+        let same_rate = new_mode.vrefresh() as u32 == self.mode.vrefresh() as u32;
+        if same_size && same_rate {
+            return Ok(());
+        }
+
+        if same_size {
+            // Refresh-only change: re-program existing buffers.
+            self.card
+                .set_crtc(
+                    self.crtc,
+                    Some(self.bufs[self.front_idx].fb),
+                    (0, 0),
+                    &[self.connector],
+                    Some(new_mode),
+                )
+                .context("display_mode_set_failed: auto-match refresh re-modeset")?;
+            self.mode = new_mode;
+            return Ok(());
+        }
+
+        let new_a = alloc_dumb_buffer(&self.card, new_w, new_h)?;
+        let new_b = alloc_dumb_buffer(&self.card, new_w, new_h)?;
+        self.card
+            .set_crtc(
+                self.crtc,
+                Some(new_a.fb),
+                (0, 0),
+                &[self.connector],
+                Some(new_mode),
+            )
+            .context("display_mode_set_failed: auto-match re-modeset")?;
+        let old_bufs = std::mem::replace(&mut self.bufs, [new_a, new_b]);
+        for old in old_bufs {
+            let _ = self.card.destroy_framebuffer(old.fb);
+            let _ = self.card.destroy_dumb_buffer(old.handle);
+        }
+        self.mode = new_mode;
+        self.width = new_w;
+        self.height = new_h;
+        self.front_idx = 0;
+        Ok(())
+    }
+
     /// Map the back buffer for direct CPU writes. The caller writes a
     /// W×H XRGB8888 pixel block into the returned slice (stride is
     /// the buffer's pitch in bytes — usually `W*4`, but `pitch()` is
@@ -430,12 +504,58 @@ fn pick_mode(
     Ok(modes[0])
 }
 
+/// Pick the best mode for an `auto`-resolution display output once the
+/// first decoded frame reveals the source's `(src_w, src_h)`.
+///
+/// Strategy:
+/// 1. Exact match on `(src_w, src_h)` — pick the highest-refresh option.
+/// 2. Otherwise, the smallest mode whose dimensions are both ≥ source —
+///    avoids a CPU upscale to the monitor's native (4K) preferred mode
+///    when the flow is 1080p, which is the jitter case the user hit.
+/// 3. If every mode is smaller than the source, the largest available.
+fn pick_mode_for_source(
+    info: &drm::control::connector::Info,
+    src_w: u32,
+    src_h: u32,
+) -> Result<drm::control::Mode> {
+    let modes = info.modes();
+    if modes.is_empty() {
+        anyhow::bail!("display_resolution_unsupported: connector has no modes");
+    }
+    let exact: Vec<&drm::control::Mode> = modes
+        .iter()
+        .filter(|m| m.size().0 as u32 == src_w && m.size().1 as u32 == src_h)
+        .collect();
+    if !exact.is_empty() {
+        let mut em = exact;
+        em.sort_by_key(|m| std::cmp::Reverse(m.vrefresh()));
+        return Ok(*em[0]);
+    }
+    let mut at_or_above: Vec<&drm::control::Mode> = modes
+        .iter()
+        .filter(|m| m.size().0 as u32 >= src_w && m.size().1 as u32 >= src_h)
+        .collect();
+    if !at_or_above.is_empty() {
+        at_or_above.sort_by_key(|m| {
+            (
+                (m.size().0 as u64) * (m.size().1 as u64),
+                std::cmp::Reverse(m.vrefresh() as u64),
+            )
+        });
+        return Ok(*at_or_above[0]);
+    }
+    let mut all: Vec<&drm::control::Mode> = modes.iter().collect();
+    all.sort_by_key(|m| {
+        (
+            std::cmp::Reverse((m.size().0 as u64) * (m.size().1 as u64)),
+            std::cmp::Reverse(m.vrefresh() as u64),
+        )
+    });
+    Ok(*all[0])
+}
+
 fn locate_connector(name: &str) -> Result<(PathBuf, drm::control::connector::Handle)> {
-    for n in 0..10u32 {
-        let path = PathBuf::from(format!("/dev/dri/card{n}"));
-        if !path.exists() {
-            break;
-        }
+    for path in enumerate_card_paths() {
         let card = match open_card(&path) {
             Ok(c) => c,
             Err(_) => continue,
@@ -458,7 +578,7 @@ fn locate_connector(name: &str) -> Result<(PathBuf, drm::control::connector::Han
         }
     }
     anyhow::bail!(
-        "display_device_invalid: connector '{}' not found in /dev/dri/card[0..9]",
+        "display_device_invalid: connector '{}' not found under /dev/dri/",
         name
     )
 }

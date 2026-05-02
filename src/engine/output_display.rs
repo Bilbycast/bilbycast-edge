@@ -98,7 +98,7 @@ async fn run_display_output(
     // 1. Open KMS first so we fail fast with `display_device_invalid` /
     //    `display_resolution_unsupported` / `display_mode_set_failed`
     //    before doing any other work.
-    let (req_w, req_h) = parse_resolution(config.resolution.as_deref());
+    let (req_w, req_h, is_auto_resolution) = parse_resolution(config.resolution.as_deref());
     let kms = match tokio::task::spawn_blocking({
         let device = config.device.clone();
         let refresh = config.refresh_hz;
@@ -126,22 +126,17 @@ async fn run_display_output(
     let chosen_resolution = format!("{}x{}", kms.width(), kms.height());
     let chosen_refresh = kms.refresh_hz();
 
-    // 2. Build the lock-free counters + register the stats handle so
-    //    the snapshot path picks up `OutputStats.display_stats`.
+    // 2. Build the lock-free counters. Stats-handle registration is
+    //    deferred to the display child so an `auto`-resolution output
+    //    publishes the post-auto-match resolution rather than the
+    //    placeholder we opened KMS with.
     let counters = Arc::new(DisplayStatsCounters::default());
-    output_stats.set_display_stats(
-        Arc::clone(&counters),
-        chosen_resolution.clone(),
-        chosen_refresh,
-        "XRGB8888",
-        "sw",
-        "unknown", // updated lazily on first decoded video frame
-        if config.audio_device.as_deref().unwrap_or("").is_empty() {
-            "none"
-        } else {
-            "unknown"
-        },
-    );
+    let audio_codec_label: &'static str = if config.audio_device.as_deref().unwrap_or("").is_empty()
+    {
+        "none"
+    } else {
+        "unknown"
+    };
 
     emit_event(
         &event_sender,
@@ -150,10 +145,15 @@ async fn run_display_output(
         &flow_id,
         &config.id,
         &format!(
-            "display started on {} ({}@{}Hz){}",
+            "display started on {} ({}@{}Hz{}){}",
             config.device,
             chosen_resolution,
             chosen_refresh,
+            if is_auto_resolution {
+                ", auto-match pending first frame"
+            } else {
+                ""
+            },
             config
                 .audio_device
                 .as_deref()
@@ -197,8 +197,24 @@ async fn run_display_output(
     let display_cancel = cancel.child_token();
     let display_counters = Arc::clone(&counters);
     let display_clock = Arc::clone(&clock);
+    let display_output_stats = Arc::clone(&output_stats);
+    let display_event_sender = event_sender.clone();
+    let display_flow_id = flow_id.clone();
+    let display_output_id = config.id.clone();
     let display_handle = tokio::task::spawn_blocking(move || {
-        display_loop(kms, vrx, display_clock, display_counters, display_cancel);
+        display_loop(
+            kms,
+            vrx,
+            display_clock,
+            display_counters,
+            display_cancel,
+            is_auto_resolution,
+            display_output_stats,
+            audio_codec_label,
+            display_event_sender,
+            display_flow_id,
+            display_output_id,
+        );
     });
 
     // Audio child — owns the ALSA PCM. Skipped entirely when muted.
@@ -458,21 +474,81 @@ fn drain_video_frames(
 
 // ── Display child ─────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn display_loop(
     mut kms: KmsDisplay,
     mut vrx: mpsc::Receiver<VideoFrame>,
     clock: Arc<AudioClock>,
     counters: Arc<DisplayStatsCounters>,
     cancel: CancellationToken,
+    is_auto_resolution: bool,
+    output_stats: Arc<OutputStatsAccumulator>,
+    audio_codec_label: &'static str,
+    event_sender: EventSender,
+    flow_id: String,
+    output_id: String,
 ) {
     let frame_period_ms_at_60hz: i64 = 16;
     let mut last_frame: Option<VideoFrame> = None;
+    let mut stats_registered = false;
 
     while !cancel.is_cancelled() {
         let next = match vrx.blocking_recv() {
             Some(f) => f,
             None => break,
         };
+
+        // First decoded frame: if the operator picked `auto`, re-modeset
+        // to the smallest mode whose dimensions cover the source. This
+        // is the fix for the 4K-on-1080p-source CPU-blit jitter — the
+        // monitor's preferred mode is no longer the default.
+        if !stats_registered {
+            if is_auto_resolution {
+                match kms.match_source_resolution(next.width, next.height) {
+                    Ok(()) => {
+                        emit_event(
+                            &event_sender,
+                            EventSeverity::Info,
+                            "display_auto_matched",
+                            &flow_id,
+                            &output_id,
+                            &format!(
+                                "display auto-matched to source {}x{} → {}x{}@{}Hz",
+                                next.width,
+                                next.height,
+                                kms.width(),
+                                kms.height(),
+                                kms.refresh_hz(),
+                            ),
+                        );
+                        // Buffer dimensions changed — drop any cached
+                        // previous frame so we don't blit from a stale
+                        // size into the new framebuffers.
+                        last_frame = None;
+                    }
+                    Err(e) => {
+                        emit_event(
+                            &event_sender,
+                            EventSeverity::Warning,
+                            "display_auto_match_failed",
+                            &flow_id,
+                            &output_id,
+                            &format!("display auto-match fell back to startup mode: {e}"),
+                        );
+                    }
+                }
+            }
+            output_stats.set_display_stats(
+                Arc::clone(&counters),
+                format!("{}x{}", kms.width(), kms.height()),
+                kms.refresh_hz(),
+                "XRGB8888",
+                "sw",
+                "unknown",
+                audio_codec_label,
+            );
+            stats_registered = true;
+        }
         // Compute drift against the audio clock, dropping frames that
         // fell behind by more than ±half a frame period.
         if let Some(audio_pts) = clock.current_pts_90k() {
@@ -620,15 +696,20 @@ fn audio_loop(
 
 // ── Helpers ───────────────────────────────────────────────────────
 
-fn parse_resolution(res: Option<&str>) -> (Option<u32>, Option<u32>) {
-    let Some(r) = res else { return (None, None) };
+/// Returns `(width, height, is_auto)`. `is_auto` is true when the
+/// operator left resolution unset or picked "auto" — in that case
+/// `(None, None)` opens KMS at the connector's preferred mode and the
+/// display loop re-modesets to the source flow's dimensions on first
+/// decoded frame (avoiding the 4K-on-a-1080p-source CPU-blit jitter).
+fn parse_resolution(res: Option<&str>) -> (Option<u32>, Option<u32>, bool) {
+    let Some(r) = res else { return (None, None, true) };
     if r.is_empty() || r == "auto" {
-        return (None, None);
+        return (None, None, true);
     }
     let Some((w, h)) = r.split_once('x') else {
-        return (None, None);
+        return (None, None, true);
     };
-    (w.parse().ok(), h.parse().ok())
+    (w.parse().ok(), h.parse().ok(), false)
 }
 
 fn classify_kms_error(msg: &str) -> &'static str {

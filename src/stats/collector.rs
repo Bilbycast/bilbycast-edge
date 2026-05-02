@@ -524,7 +524,12 @@ impl OutputStatsAccumulator {
             output_id: self.output_id.clone(),
             output_name: self.output_name.clone(),
             output_type: self.output_type.clone(),
-            state: derive_output_state(bitrate_bps, packets_sent, packets_dropped),
+            state: derive_output_state(
+                bitrate_bps,
+                packets_sent,
+                packets_dropped,
+                display_stats.as_ref().map(|d| d.frames_displayed).unwrap_or(0),
+            ),
             mode: None,
             remote_addr: None,
             dest_addr: None,
@@ -2680,8 +2685,18 @@ fn derive_input_state(bitrate_bps: u64, packets_received: u64) -> String {
 
 /// Derive output connection state from counters.
 /// Called during the 1/sec snapshot — zero hot-path impact.
-fn derive_output_state(bitrate_bps: u64, packets_sent: u64, packets_dropped: u64) -> String {
-    if bitrate_bps > 0 {
+///
+/// `display_frames_displayed` lets display outputs (which never increment
+/// `packets_sent` because they render locally rather than send over a
+/// network) report `active` once the renderer has put a frame on the
+/// connector. Pass `0` for non-display outputs.
+fn derive_output_state(
+    bitrate_bps: u64,
+    packets_sent: u64,
+    packets_dropped: u64,
+    display_frames_displayed: u64,
+) -> String {
+    if bitrate_bps > 0 || display_frames_displayed > 0 {
         "active"
     } else if packets_sent > 0 {
         "idle"
