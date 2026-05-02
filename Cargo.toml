@@ -370,3 +370,10 @@ alsa = { version = "0.9", optional = true }
 # ---------------------------------------------------------------------------
 [patch.crates-io]
 is = { path = "vendor/is" }
+
+# Keep line-number debug info in release builds so the SIGSEGV / SIGABRT
+# handler in main.rs prints actionable backtraces. Lightweight: line
+# tables only, no full debug info — small binary-size impact, no
+# perf impact.
+[profile.release]
+debug = "line-tables-only"

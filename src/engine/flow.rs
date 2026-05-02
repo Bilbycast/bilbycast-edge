@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Result, bail};
 use bytes::Bytes;
@@ -10,6 +11,51 @@ use tokio::sync::{broadcast, watch};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+// ─── Diagnostic drop counters (Step 1 of pixelation root-cause hunt) ─────────
+// Process-global atomics that record packet loss at every silent-drop site
+// in the input → fixer → broadcast → output pipeline. A reporter task logs
+// non-zero deltas every 5 s. Remove once root cause is identified.
+static FWD_LAGGED: AtomicU64 = AtomicU64::new(0);
+static FIXER_TS_ACTIVE_FULL: AtomicU64 = AtomicU64::new(0);
+static FIXER_TS_PASSIVE_FULL: AtomicU64 = AtomicU64::new(0);
+static FIXER_TS_SWITCH_FULL: AtomicU64 = AtomicU64::new(0);
+static FIXER_TS_KEEPALIVE_FULL: AtomicU64 = AtomicU64::new(0);
+static FIXER_OUT_NO_RECEIVERS: AtomicU64 = AtomicU64::new(0);
+
+fn spawn_drop_diag_reporter() {
+    use std::sync::atomic::AtomicBool;
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut prev = [0u64; 6];
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let cur = [
+                FWD_LAGGED.load(Ordering::Relaxed),
+                FIXER_TS_ACTIVE_FULL.load(Ordering::Relaxed),
+                FIXER_TS_PASSIVE_FULL.load(Ordering::Relaxed),
+                FIXER_TS_SWITCH_FULL.load(Ordering::Relaxed),
+                FIXER_TS_KEEPALIVE_FULL.load(Ordering::Relaxed),
+                FIXER_OUT_NO_RECEIVERS.load(Ordering::Relaxed),
+            ];
+            let delta: [u64; 6] = std::array::from_fn(|i| cur[i] - prev[i]);
+            if delta.iter().any(|d| *d > 0) {
+                tracing::warn!(
+                    target: "drop_diag",
+                    "drop diag (last 30s / cumulative): forwarder_lagged={}/{} fixer_ts_active={}/{} fixer_ts_passive={}/{} fixer_ts_switch={}/{} fixer_ts_keepalive={}/{} fixer_out_no_receivers={}/{}",
+                    delta[0], cur[0], delta[1], cur[1], delta[2], cur[2],
+                    delta[3], cur[3], delta[4], cur[4], delta[5], cur[5],
+                );
+            }
+            prev = cur;
+        }
+    });
+}
 
 use crate::config::models::*;
 use crate::manager::events::{EventSender, EventSeverity, category};
@@ -368,6 +414,7 @@ impl FlowRuntime {
             broadcast_tx.clone(),
             fixer_task_cancel,
         ));
+        spawn_drop_diag_reporter();
 
         // Spawn every input task (warm passive). Each input publishes to its
         // own per-input broadcast channel; a forwarder task drains it and
@@ -2347,7 +2394,7 @@ async fn ts_fixer_task(
                 Some(FixerCommand::ActivePacket { input_id, pkt }) => {
                     match fixer.process_packet(&input_id, &pkt) {
                         ProcessResult::Rewritten(fixed_data) => {
-                            let _ = out_tx.send(RtpPacket {
+                            if out_tx.send(RtpPacket {
                                 data: fixed_data,
                                 sequence_number: pkt.sequence_number,
                                 rtp_timestamp: pkt.rtp_timestamp,
@@ -2355,10 +2402,14 @@ async fn ts_fixer_task(
                                 is_raw_ts: pkt.is_raw_ts,
                                 upstream_seq: None,
                                 upstream_leg_id: None,
-                            });
+                            }).is_err() {
+                                FIXER_OUT_NO_RECEIVERS.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         ProcessResult::Unchanged => {
-                            let _ = out_tx.send(pkt);
+                            if out_tx.send(pkt).is_err() {
+                                FIXER_OUT_NO_RECEIVERS.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
@@ -2372,11 +2423,15 @@ async fn ts_fixer_task(
                         input_id, injected.len()
                     );
                     for inj_pkt in injected {
-                        let _ = out_tx.send(inj_pkt);
+                        if out_tx.send(inj_pkt).is_err() {
+                            FIXER_OUT_NO_RECEIVERS.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
                 Some(FixerCommand::Keepalive) => {
-                    let _ = out_tx.send(null_ts_packet());
+                    if out_tx.send(null_ts_packet()).is_err() {
+                        FIXER_OUT_NO_RECEIVERS.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 None => return,
             }
@@ -2422,7 +2477,9 @@ fn spawn_input_forwarder(
                         if is_active && !was_active {
                             // This input just became active — ask the fixer
                             // task to switch and inject cached PSI.
-                            let _ = fixer_tx.try_send(FixerCommand::Switch { input_id: input_id.clone() });
+                            if fixer_tx.try_send(FixerCommand::Switch { input_id: input_id.clone() }).is_err() {
+                                FIXER_TS_SWITCH_FULL.fetch_add(1, Ordering::Relaxed);
+                            }
                             // Ask any ingress video re-encoder on this input
                             // to emit an IDR on its next frame. Passthrough
                             // inputs ignore the flag (no encoder to signal).
@@ -2432,21 +2489,26 @@ fn spawn_input_forwarder(
 
                         if is_active {
                             // Drop on full — matches broadcast channel drop-on-lag.
-                            let _ = fixer_tx.try_send(FixerCommand::ActivePacket {
+                            if fixer_tx.try_send(FixerCommand::ActivePacket {
                                 input_id: input_id.clone(),
                                 pkt,
-                            });
+                            }).is_err() {
+                                FIXER_TS_ACTIVE_FULL.fetch_add(1, Ordering::Relaxed);
+                            }
                             keepalive.reset();
                         } else {
-                            let _ = fixer_tx.try_send(FixerCommand::PassivePacket {
+                            if fixer_tx.try_send(FixerCommand::PassivePacket {
                                 input_id: input_id.clone(),
                                 pkt,
-                            });
+                            }).is_err() {
+                                FIXER_TS_PASSIVE_FULL.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
                         // Forwarder falling behind its per-input channel —
                         // skip missed packets but keep the task alive.
+                        FWD_LAGGED.fetch_add(n, Ordering::Relaxed);
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
@@ -2456,7 +2518,9 @@ fn spawn_input_forwarder(
                     // one. Otherwise every passive forwarder would spam
                     // null packets into the broadcast channel.
                     if *active_input_rx.borrow() == input_id {
-                        let _ = fixer_tx.try_send(FixerCommand::Keepalive);
+                        if fixer_tx.try_send(FixerCommand::Keepalive).is_err() {
+                            FIXER_TS_KEEPALIVE_FULL.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }

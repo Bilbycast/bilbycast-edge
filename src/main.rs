@@ -75,8 +75,47 @@ struct Cli {
     print_setup_token: bool,
 }
 
+/// SIGSEGV / SIGBUS / SIGABRT handler — diagnostic only. Captures a
+/// Rust backtrace and writes it to stderr (which the testbed tees to
+/// /tmp/bilbycast-edge-*.log). Keeps the default action afterwards by
+/// re-raising the signal with the default disposition so the kernel
+/// still core-dumps + the process exits with the expected code.
+extern "C" fn diag_fatal_handler(sig: libc::c_int) {
+    // Async-signal-safety caveat: std::backtrace + eprintln! are NOT
+    // strictly signal-safe (heap allocs, locks). For a one-shot
+    // diagnostic on an already-fatal signal this is acceptable —
+    // worst case we deadlock and apport collects the core anyway.
+    let bt = std::backtrace::Backtrace::force_capture();
+    let sig_name = match sig {
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGILL => "SIGILL",
+        libc::SIGFPE => "SIGFPE",
+        _ => "FATAL",
+    };
+    eprintln!("\n=== bilbycast-edge fatal signal: {sig_name} ({sig}) ===");
+    eprintln!("{bt}");
+    eprintln!("=== end backtrace ===\n");
+    // Restore default and re-raise so apport / shells see the right
+    // exit code (139 for SEGV, etc.).
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+fn install_diag_signal_handlers() {
+    unsafe {
+        for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGABRT, libc::SIGILL, libc::SIGFPE] {
+            libc::signal(sig, diag_fatal_handler as *const () as libc::sighandler_t);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    install_diag_signal_handlers();
     let cli = Cli::parse();
 
     // --print-setup-token: load the secrets file, print the token (or a clear
