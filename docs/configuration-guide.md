@@ -14,6 +14,7 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
 - [Auth Configuration](#auth-configuration)
 - [Monitor Configuration](#monitor-configuration)
 - [Manager Configuration](#manager-configuration)
+- [Resource Limits](#resource-limits)
 - [Tunnel Configuration](#tunnel-configuration)
 - [Flow Configuration](#flow-configuration)
 - [Input Types](#input-types)
@@ -24,12 +25,15 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
   - [WebRTC/WHIP Input](#webrtcwhip-input)
   - [WHEP Input](#whep-input)
   - [Media Player Input](#media-player-input)
+  - [TestPattern Input](#testpattern-input)
+  - [Bonded Input](#bonded-input)
 - [Output Types](#output-types)
   - [RTP Output](#rtp-output)
   - [SRT Output](#srt-output)
   - [RTMP Output](#rtmp-output)
   - [HLS Output](#hls-output)
   - [WebRTC Output](#webrtc-output)
+  - [Bonded Output](#bonded-output)
 - **SMPTE ST 2110 audio + ANC** — see the dedicated section near the
   end of this guide and the deep-dive in
   [`audio-gateway.md`](audio-gateway.md). Covers ST 2110-30/-31 audio,
@@ -386,6 +390,57 @@ Optional connection to a bilbycast-manager instance for centralized monitoring a
 - `url` max 2048 characters.
 - `registration_token` max 4096 characters.
 - `accept_self_signed_cert: true` is rejected unless `BILBYCAST_ALLOW_INSECURE=1` is set.
+
+---
+
+## Resource Limits
+
+Optional top-level `resource_limits` block. When set, the edge
+samples CPU and RAM usage on a periodic tick and emits Warning /
+Critical events under category `system_resources` when thresholds
+are exceeded. Optionally gates new flow creation when resources
+are critical.
+
+```json
+{
+  "version": 2,
+  "resource_limits": {
+    "cpu_warning_percent": 80,
+    "cpu_critical_percent": 95,
+    "ram_warning_percent": 80,
+    "ram_critical_percent": 95,
+    "critical_action": "alarm",
+    "grace_period_secs": 10
+  },
+  "inputs": [],
+  "outputs": [],
+  "flows": []
+}
+```
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `cpu_warning_percent` | `80` | CPU usage warning threshold. Range `[0, 100]`. |
+| `cpu_critical_percent` | `95` | CPU usage critical threshold. |
+| `ram_warning_percent` | `80` | RAM usage warning threshold. Range `[0, 100]`. |
+| `ram_critical_percent` | `95` | RAM usage critical threshold. |
+| `critical_action` | `"alarm"` | Behaviour on critical state. `"alarm"` — events only, flows continue. `"gate_flows"` — additionally reject new flow creation while any metric is critical. |
+| `grace_period_secs` | `10` | Seconds the metric must continuously exceed the threshold before the event fires (debounce). |
+
+Omit the block to disable system-resource alarms entirely. The
+edge's resource-budget probe (advertised on
+`HealthPayload.resource_budget`) is independent — that's a
+one-shot hardware-capability snapshot at startup, not a runtime
+metric. Both surfaces feed the manager UI's per-node Resources
+card; this block is the operator-tunable side, the budget probe
+is the static side.
+
+Events emitted (category `system_resources`):
+`system_resources_cpu_warning`, `system_resources_cpu_critical`,
+`system_resources_ram_warning`, `system_resources_ram_critical`,
+`system_resources_recovered`. With `critical_action: "gate_flows"`,
+new-flow rejections additionally surface as a save-time error on
+the manager UI.
 
 ---
 
@@ -869,6 +924,66 @@ and advances to the next source. There is no automatic in-input
 fallback; pair the media player with a live primary on a PID-bus
 Hitless leg if you need automatic cutover.
 
+### TestPattern Input
+
+Generates a synthetic colour-bars-and-tone test pattern as an
+MPEG-TS stream with H.264 video and AAC audio. Useful for
+end-to-end pipeline tests, smoke-testing newly-deployed flows, and
+exercising downstream gear without a real source.
+
+```json
+{
+  "type": "test_pattern",
+  "id": "in-test",
+  "name": "Test pattern",
+  "width": 1280,
+  "height": 720,
+  "fps": 25,
+  "video_bitrate_kbps": 2000,
+  "audio_enabled": true,
+  "tone_hz": 1000.0,
+  "tone_dbfs": -20.0
+}
+```
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `type` | string | — | Always `"test_pattern"`. |
+| `width` | u16 | `1280` | Video width in pixels. Must be divisible by 2. |
+| `height` | u16 | `720` | Video height in pixels. Must be divisible by 2. |
+| `fps` | u16 | `25` | Frame rate. Range `[1, 60]`. |
+| `video_bitrate_kbps` | u32 | `2000` | Target video bitrate. |
+| `audio_enabled` | bool | `true` | When `false`, emits a video-only TS. |
+| `tone_hz` | f32 | `1000.0` | Audio tone frequency. Range `[50, 8000]`. |
+| `tone_dbfs` | f32 | `-20.0` | Audio level in dBFS. `-20 dBFS` is the broadcast reference level. |
+
+Requires the edge build to include the `video-thumbnail` and
+`fdk-aac` features (both on by default). Software-encoded — counts
+against the resource budget like any other transcoding flow.
+
+### Bonded Input
+
+Receives a media flow over the bilbycast multi-path bonding stack
+— the Rust replacement for appliances like Peplink/SpeedFusion in
+broadcast contribution paths. Multiple network paths are aggregated
+for throughput and failover; the bonded receiver reorders into a
+single ordered TS stream.
+
+```json
+{
+  "type": "bonded",
+  "id": "in-bonded",
+  "name": "Bonded receive",
+  "local_addr": "0.0.0.0:5500",
+  "psk": "<32-byte hex>"
+}
+```
+
+The full Bonded protocol — path adapters, link selection, latency
+budget, FEC — is covered in [`bilbycast-bonding/CLAUDE.md`](../../bilbycast-bonding/CLAUDE.md)
+and [`docs/bonding.md`](bonding.md). The bonded sender at the
+other end uses the matching [Bonded Output](#bonded-output).
+
 ---
 
 ## Output Types
@@ -1345,6 +1460,28 @@ for the full event catalogue, including `display_device_unavailable`,
 `display_mode_set_failed`, `display_audio_open_failed`,
 `display_decoder_overload`, `display_av_drift`,
 `display_subscriber_lagged`.
+
+### Bonded Output
+
+Sends a media flow over the bilbycast multi-path bonding stack —
+the Rust replacement for appliances like Peplink/SpeedFusion in
+broadcast contribution paths. Multiple network paths are
+aggregated for throughput and failover.
+
+```json
+{
+  "type": "bonded",
+  "id": "out-bonded",
+  "name": "Bonded send",
+  "remote_addr": "203.0.113.10:5500",
+  "psk": "<32-byte hex>"
+}
+```
+
+The full Bonded protocol — path adapters, link selection, latency
+budget, FEC — is covered in [`bilbycast-bonding/CLAUDE.md`](../../bilbycast-bonding/CLAUDE.md)
+and [`docs/bonding.md`](bonding.md). The bonded receiver at the
+other end uses the matching [Bonded Input](#bonded-input).
 
 ---
 
