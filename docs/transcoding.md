@@ -143,10 +143,19 @@ Wiring:
 
 ## `audio_encode` — compressed-audio re-encoding
 
-Decodes the source audio ES (AAC-LC ADTS in MPEG-TS), rescales sample
-rate / channel count via the PCM pipeline, and re-encodes into the
-target codec. The source AAC stream is replaced in the output TS;
-video and other PIDs pass through unchanged.
+Decodes the source audio ES, rescales sample rate / channel count via
+the PCM pipeline, and re-encodes into the target codec. The source
+audio stream is replaced in the output TS; video and other PIDs pass
+through unchanged.
+
+**Source codecs accepted on every output (TS-out + re-mux):** AAC-LC /
+HE-AAC ADTS (MPEG-TS `stream_type` 0x0F), MP2 / MPEG-1 / MPEG-2 audio
+(0x03 / 0x04), AC-3 (0x80 / 0x81 / 0xC1), and E-AC-3 / Dolby Digital
+Plus (0x87 / 0xC2). AAC decodes via the in-process FDK-AAC bridge
+(`fdk-aac` feature, default on); MP2 / AC-3 / E-AC-3 decode via the
+in-process FFmpeg bridge (`video-thumbnail` feature, default on). Both
+share the same downstream PCM → encoder pipeline, so every target
+codec listed in the matrix below works regardless of source codec.
 
 ### Schema
 

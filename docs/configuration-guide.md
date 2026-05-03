@@ -2796,10 +2796,10 @@ independent tiers:
   emission and produce the same wire shape (`audio_pids[]`). The
   snapshot's top-level `ingress` field reports `"ts"` / `"pcm"` /
   `"aes3"` so the manager UI can label the ingest mode. MP2 / AC-3 /
-  E-AC-3 PIDs *inside MPEG-TS* are tracked (bitrate / presence /
-  silence-proxy) but their R128 decode stays deferred with a
-  `codec_decoded: false` + `decode_note` in the snapshot until the
-  libavcodec audio bridge lands.
+  E-AC-3 PIDs inside MPEG-TS now decode in-process via the FFmpeg
+  audio bridge (`video-thumbnail` feature, default on) and run the
+  full R128 / true-peak / mute / clip pipeline alongside AAC; their
+  snapshot reports `codec_decoded: true`.
 - **Video Full** — YUV pixel-domain metrics on decoded frames
   (~10–25 % CPU / core): YUV-SAD freeze against the previous frame,
   3×3 Laplacian-variance blur, 8×8 boundary-gradient blockiness

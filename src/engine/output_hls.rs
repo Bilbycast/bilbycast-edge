@@ -878,83 +878,124 @@ struct RemuxEncodedFrame {
     pts: u64,
 }
 
-/// Decode audio PES list to PCM frames.
+/// Decode audio PES list to PCM frames. Handles AAC (stream_type 0x0F)
+/// via fdk-aac and MP2 / AC-3 / E-AC-3 (0x03/0x04, 0x80/0x81/0xC1,
+/// 0x87/0xC2) via the FFmpeg-backed audio decoder.
 #[cfg(feature = "video-thumbnail")]
 fn decode_audio_pes(
     pes_list: &[(Vec<u8>, u64)],
     audio_stream_type: u8,
 ) -> Result<Vec<PcmFrame>, String> {
-    // Currently only AAC (0x0F) input is supported for decoding
-    if audio_stream_type != 0x0F {
-        return Err(format!(
-            "unsupported input audio stream type 0x{audio_stream_type:02X} for re-encoding \
-             (only AAC/ADTS 0x0F is supported as input)"
-        ));
+    if audio_stream_type == 0x0F {
+        return decode_audio_pes_aac(pes_list);
+    }
+    if let Some(codec) = crate::engine::audio_decode::ff_codec_for_stream_type(
+        audio_stream_type,
+    ) {
+        return decode_audio_pes_ffmpeg(pes_list, codec);
+    }
+    Err(format!(
+        "unsupported input audio stream type 0x{audio_stream_type:02X} for re-encoding"
+    ))
+}
+
+#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+fn decode_audio_pes_aac(pes_list: &[(Vec<u8>, u64)]) -> Result<Vec<PcmFrame>, String> {
+    let mut decoder = aac_audio::AacDecoder::open_adts()
+        .map_err(|e| format!("AAC decoder init failed: {e}"))?;
+
+    let mut pcm_frames = Vec::new();
+
+    for (es_data, pts) in pes_list {
+        // es_data may contain multiple concatenated ADTS frames
+        let mut pos = 0;
+        let mut frame_pts = *pts;
+
+        while pos + 7 <= es_data.len() {
+            // Check ADTS sync word
+            if es_data[pos] != 0xFF || (es_data[pos + 1] & 0xF0) != 0xF0 {
+                break;
+            }
+
+            let protection_absent = (es_data[pos + 1] & 0x01) != 0;
+            let header_len = if protection_absent { 7 } else { 9 };
+            if pos + header_len > es_data.len() { break; }
+
+            // Frame length from ADTS header
+            let frame_len = (((es_data[pos + 3] & 0x03) as usize) << 11)
+                | ((es_data[pos + 4] as usize) << 3)
+                | ((es_data[pos + 5] as usize) >> 5);
+
+            if frame_len < header_len || pos + frame_len > es_data.len() {
+                break;
+            }
+
+            let adts_frame = &es_data[pos..pos + frame_len];
+            match decoder.decode_frame(adts_frame) {
+                Ok(decoded) => {
+                    let sr = decoder.sample_rate().unwrap_or(48000);
+                    let ch = decoder.channels().unwrap_or(2);
+                    pcm_frames.push(PcmFrame {
+                        planar: decoded.planar,
+                        pts: frame_pts,
+                        sample_rate: sr,
+                        channels: ch,
+                    });
+                    // Advance PTS
+                    if sr > 0 {
+                        frame_pts += (decoded.frame_size as u64) * 90_000 / sr as u64;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("AAC decode error in HLS remux: {e}");
+                }
+            }
+
+            pos += frame_len;
+        }
     }
 
-    #[cfg(feature = "fdk-aac")]
-    {
-        let mut decoder = aac_audio::AacDecoder::open_adts()
-            .map_err(|e| format!("AAC decoder init failed: {e}"))?;
+    Ok(pcm_frames)
+}
 
-        let mut pcm_frames = Vec::new();
+#[cfg(all(feature = "video-thumbnail", not(feature = "fdk-aac")))]
+fn decode_audio_pes_aac(_pes_list: &[(Vec<u8>, u64)]) -> Result<Vec<PcmFrame>, String> {
+    Err("AAC decoding requires the fdk-aac feature".into())
+}
 
-        for (es_data, pts) in pes_list {
-            // es_data may contain multiple concatenated ADTS frames
-            let mut pos = 0;
-            let mut frame_pts = *pts;
+#[cfg(feature = "video-thumbnail")]
+fn decode_audio_pes_ffmpeg(
+    pes_list: &[(Vec<u8>, u64)],
+    codec: video_codec::AudioDecoderCodec,
+) -> Result<Vec<PcmFrame>, String> {
+    let mut decoder = video_engine::AudioDecoder::open(codec)
+        .map_err(|e| format!("FFmpeg audio decoder init failed: {e}"))?;
+    let mut pcm_frames = Vec::new();
 
-            while pos + 7 <= es_data.len() {
-                // Check ADTS sync word
-                if es_data[pos] != 0xFF || (es_data[pos + 1] & 0xF0) != 0xF0 {
-                    break;
+    for (es_data, pts) in pes_list {
+        let mut frame_pts = *pts;
+        for au in crate::engine::audio_decode::split_audio_codec_frames(es_data, codec) {
+            if decoder.send_packet(au, frame_pts as i64).is_err() {
+                continue;
+            }
+            while let Ok(frame) = decoder.receive_frame() {
+                let sr = frame.sample_rate;
+                let ch = frame.channels;
+                let n_samples = frame.planar.first().map(|p| p.len()).unwrap_or(0);
+                pcm_frames.push(PcmFrame {
+                    planar: frame.planar,
+                    pts: frame_pts,
+                    sample_rate: sr,
+                    channels: ch,
+                });
+                if sr > 0 {
+                    frame_pts += (n_samples as u64) * 90_000 / sr as u64;
                 }
-
-                let protection_absent = (es_data[pos + 1] & 0x01) != 0;
-                let header_len = if protection_absent { 7 } else { 9 };
-                if pos + header_len > es_data.len() { break; }
-
-                // Frame length from ADTS header
-                let frame_len = (((es_data[pos + 3] & 0x03) as usize) << 11)
-                    | ((es_data[pos + 4] as usize) << 3)
-                    | ((es_data[pos + 5] as usize) >> 5);
-
-                if frame_len < header_len || pos + frame_len > es_data.len() {
-                    break;
-                }
-
-                let adts_frame = &es_data[pos..pos + frame_len];
-                match decoder.decode_frame(adts_frame) {
-                    Ok(decoded) => {
-                        let sr = decoder.sample_rate().unwrap_or(48000);
-                        let ch = decoder.channels().unwrap_or(2);
-                        pcm_frames.push(PcmFrame {
-                            planar: decoded.planar,
-                            pts: frame_pts,
-                            sample_rate: sr,
-                            channels: ch,
-                        });
-                        // Advance PTS
-                        if sr > 0 {
-                            frame_pts += (decoded.frame_size as u64) * 90_000 / sr as u64;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("AAC decode error in HLS remux: {e}");
-                    }
-                }
-
-                pos += frame_len;
             }
         }
-
-        Ok(pcm_frames)
     }
 
-    #[cfg(not(feature = "fdk-aac"))]
-    {
-        Err("AAC decoding requires the fdk-aac feature".into())
-    }
+    Ok(pcm_frames)
 }
 
 /// Re-encode PCM frames to the target codec.

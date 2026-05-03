@@ -762,6 +762,13 @@ async fn whep_viewer_loop(
         } else {
             None
         };
+    // Lazy FFmpeg-backed decoder for non-AAC sources (MP2 / AC-3 /
+    // E-AC-3). Mirrors `decoder` inside `WebrtcEncoderState::Active`
+    // for the AAC path.
+    #[cfg(feature = "video-thumbnail")]
+    let mut ff_audio_decoder: Option<video_engine::AudioDecoder> = None;
+    #[cfg(feature = "video-thumbnail")]
+    let mut ff_audio_codec: Option<video_codec::AudioDecoderCodec> = None;
     let mut video_encoder_state: WebrtcVideoEncoderState =
         init_webrtc_video_encoder_state(video_encode.as_ref());
 
@@ -947,10 +954,87 @@ async fn whep_viewer_loop(
                                         }
                                     }
                                 }
-                                super::webrtc::ts_demux::DemuxedFrame::OtherAudio { .. } => {
-                                    // WebRTC carries Opus / AAC audio. MP2 / AC-3 / E-AC-3
-                                    // sources need `audio_encode: opus` on the output.
+                                #[cfg(feature = "video-thumbnail")]
+                                super::webrtc::ts_demux::DemuxedFrame::OtherAudio {
+                                    stream_type, data, pts,
+                                } => {
+                                    if matches!(encoder_state, WebrtcEncoderState::Lazy) {
+                                        encoder_state = build_webrtc_encoder_state(
+                                            audio_encode.as_ref(),
+                                            transcode.as_ref(),
+                                            &demuxer,
+                                            compressed_audio_input,
+                                            &cancel,
+                                            &stats,
+                                            flow_id,
+                                            output_id,
+                                            events,
+                                        );
+                                    }
+                                    let (
+                                        WebrtcEncoderState::Active {
+                                            encoder, silence, ..
+                                        },
+                                        Some(audio_mid),
+                                        Some(audio_pt),
+                                    ) = (&mut encoder_state, audio_mid, audio_pt)
+                                    else {
+                                        continue;
+                                    };
+                                    let Some(codec) =
+                                        crate::engine::audio_decode::ff_codec_for_stream_type(
+                                            stream_type,
+                                        )
+                                    else {
+                                        continue;
+                                    };
+                                    if ff_audio_codec != Some(codec) {
+                                        ff_audio_decoder = video_engine::AudioDecoder::open(codec).ok();
+                                        ff_audio_codec = Some(codec);
+                                    }
+                                    let Some(dec) = ff_audio_decoder.as_mut() else {
+                                        continue;
+                                    };
+                                    if let Some(sg) = silence.as_mut() {
+                                        sg.mark_real_audio(pts);
+                                    }
+                                    for au in
+                                        crate::engine::audio_decode::split_audio_codec_frames(
+                                            &data, codec,
+                                        )
+                                    {
+                                        if dec.send_packet(au, pts as i64).is_err() {
+                                            continue;
+                                        }
+                                        while let Ok(frame) = dec.receive_frame() {
+                                            encoder.submit_planar(&frame.planar, pts);
+                                        }
+                                    }
+                                    for frame in encoder.drain() {
+                                        let media_time = MediaTime::new(
+                                            frame.pts * 48_000 / 90_000,
+                                            str0m::media::Frequency::FORTY_EIGHT_KHZ,
+                                        );
+                                        if let Err(e) = session.write_media(
+                                            audio_mid,
+                                            audio_pt,
+                                            Instant::now(),
+                                            media_time,
+                                            &frame.data,
+                                        ) {
+                                            tracing::debug!(
+                                                "WHEP viewer '{}' audio write error: {}",
+                                                session_id, e
+                                            );
+                                        }
+                                        session.drain_outputs().await;
+                                        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                        stats.bytes_sent.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
+                                        stats.record_latency(recv_time_us);
+                                    }
                                 }
+                                #[cfg(not(feature = "video-thumbnail"))]
+                                super::webrtc::ts_demux::DemuxedFrame::OtherAudio { .. } => {}
                             }
                         }
 
@@ -1143,6 +1227,12 @@ async fn whip_client_loop(
             Some(_) if audio_mid.is_some() && audio_pt.is_some() => WebrtcEncoderState::Lazy,
             _ => WebrtcEncoderState::Disabled,
         };
+        // Lazy FFmpeg-backed decoder for non-AAC sources on the WHIP
+        // path. Sibling to `decoder` inside `WebrtcEncoderState::Active`.
+        #[cfg(feature = "video-thumbnail")]
+        let mut ff_audio_decoder: Option<video_engine::AudioDecoder> = None;
+        #[cfg(feature = "video-thumbnail")]
+        let mut ff_audio_codec: Option<video_codec::AudioDecoderCodec> = None;
         let mut silence_interval: Option<tokio::time::Interval> =
             if let WebrtcEncoderState::Active { silence: Some(sg), .. } = &encoder_state {
                 let mut iv = tokio::time::interval(sg.chunk_duration());
@@ -1322,10 +1412,86 @@ async fn whip_client_loop(
                                             }
                                         }
                                     }
-                                    super::webrtc::ts_demux::DemuxedFrame::OtherAudio { .. } => {
-                                        // WebRTC carries Opus / AAC audio. MP2 / AC-3 / E-AC-3
-                                        // sources need `audio_encode: opus` on the output.
+                                    #[cfg(feature = "video-thumbnail")]
+                                    super::webrtc::ts_demux::DemuxedFrame::OtherAudio {
+                                        stream_type, data, pts,
+                                    } => {
+                                        if matches!(encoder_state, WebrtcEncoderState::Lazy) {
+                                            encoder_state = build_webrtc_encoder_state(
+                                                audio_encode.as_ref(),
+                                                transcode.as_ref(),
+                                                &demuxer,
+                                                compressed_audio_input,
+                                                &cancel,
+                                                &stats,
+                                                flow_id,
+                                                &config.id,
+                                                events,
+                                            );
+                                        }
+                                        let (
+                                            WebrtcEncoderState::Active {
+                                                encoder, silence, ..
+                                            },
+                                            Some(audio_mid),
+                                            Some(audio_pt),
+                                        ) = (&mut encoder_state, audio_mid, audio_pt)
+                                        else {
+                                            continue;
+                                        };
+                                        let Some(codec) =
+                                            crate::engine::audio_decode::ff_codec_for_stream_type(
+                                                stream_type,
+                                            )
+                                        else {
+                                            continue;
+                                        };
+                                        if ff_audio_codec != Some(codec) {
+                                            ff_audio_decoder = video_engine::AudioDecoder::open(codec).ok();
+                                            ff_audio_codec = Some(codec);
+                                        }
+                                        let Some(dec) = ff_audio_decoder.as_mut() else {
+                                            continue;
+                                        };
+                                        if let Some(sg) = silence.as_mut() {
+                                            sg.mark_real_audio(pts);
+                                        }
+                                        for au in
+                                            crate::engine::audio_decode::split_audio_codec_frames(
+                                                &data, codec,
+                                            )
+                                        {
+                                            if dec.send_packet(au, pts as i64).is_err() {
+                                                continue;
+                                            }
+                                            while let Ok(frame) = dec.receive_frame() {
+                                                encoder.submit_planar(&frame.planar, pts);
+                                            }
+                                        }
+                                        for frame in encoder.drain() {
+                                            let media_time = MediaTime::new(
+                                                frame.pts * 48_000 / 90_000,
+                                                str0m::media::Frequency::FORTY_EIGHT_KHZ,
+                                            );
+                                            if let Err(e) = session.write_media(
+                                                audio_mid,
+                                                audio_pt,
+                                                Instant::now(),
+                                                media_time,
+                                                &frame.data,
+                                            ) {
+                                                tracing::debug!(
+                                                    "WHIP '{}' audio write error: {}",
+                                                    config.id, e
+                                                );
+                                            }
+                                            stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                            stats.bytes_sent.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
+                                            stats.record_latency(recv_time_us);
+                                        }
                                     }
+                                    #[cfg(not(feature = "video-thumbnail"))]
+                                    super::webrtc::ts_demux::DemuxedFrame::OtherAudio { .. } => {}
                                 }
                             }
 

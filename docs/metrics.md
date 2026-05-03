@@ -320,13 +320,13 @@ the manager UI doesn't need separate renderers.
   codecs the analyser can't decode it falls back to the
   bitrate-below-1 kbps proxy.
 
-**Deferred — MP2 / AC-3 / E-AC-3** (stream_types `0x03`, `0x04`,
-`0x80` / `0x81`, `0x87` / `0xC2`): these codecs appear in
-`audio_pids` with `codec_decoded: false` and a human-readable
-`decode_note`. Bitrate, PID counters, and the silence-proxy
-fallback still work; R128 values stay `null` until the libavcodec
-audio-decode bridge is wired (tracked separately from the
-content-analysis subsystem).
+**MP2 / AC-3 / E-AC-3** (stream_types `0x03`, `0x04`, `0x80` /
+`0x81` / `0xC1`, `0x87` / `0xC2`): decode in-process via the FFmpeg
+audio bridge (`video-thumbnail` feature, default on) and run the
+full R128 / true-peak / mute / clip pipeline. `codec_decoded: true`
+on the snapshot, `decode_note: null`. The silence-proxy fallback
+remains as a backstop on builds without the `video-thumbnail`
+feature.
 
 ### Video Full tier (`content_analysis.video_full`, default **off**)
 

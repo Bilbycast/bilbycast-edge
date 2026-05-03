@@ -194,6 +194,10 @@ struct CmafState {
     /// samples get encrypted in place before muxing into the
     /// segment, and the init segment carries `tenc`/`pssh`.
     cenc: Option<CencRuntime>,
+    /// Lazy FFmpeg-backed audio decoder for non-AAC sources
+    /// (MP2 / AC-3 / E-AC-3). Opened on first `OtherAudio`.
+    #[cfg(feature = "video-thumbnail")]
+    ff_audio_decoder: Option<video_engine::AudioDecoder>,
 }
 
 struct CencRuntime {
@@ -232,6 +236,8 @@ impl CmafState {
             video_reencoder: None,
             ll_current: None,
             cenc: None,
+            #[cfg(feature = "video-thumbnail")]
+            ff_audio_decoder: None,
         }
     }
 }
@@ -569,11 +575,140 @@ async fn handle_frame(
             handle_audio_frame(state, demuxer, config, &data, pts, event_sender, flow_id);
         }
         DemuxedFrame::Opus => {}
-        // CMAF doesn't transmux MP2 / AC-3 / E-AC-3 today — operators
-        // wanting one of those on a CMAF egress configure
-        // `audio_encode` to AAC / Opus on the output.
-        DemuxedFrame::OtherAudio { .. } => {}
+        DemuxedFrame::OtherAudio { stream_type, data, pts } => {
+            handle_other_audio_frame(
+                state, config, stream_type, &data, pts, event_sender, flow_id,
+            );
+        }
     }
+}
+
+/// Decode a non-AAC source audio PES (MP2 / AC-3 / E-AC-3) via FFmpeg
+/// and feed the resulting PCM to the AAC re-encoder, replicating the
+/// back half of [`handle_audio_frame`]. CMAF egress requires AAC, so
+/// without an `audio_encode` block we drop the frame.
+#[cfg(feature = "video-thumbnail")]
+fn handle_other_audio_frame(
+    state: &mut CmafState,
+    config: &CmafOutputConfig,
+    stream_type: u8,
+    data: &[u8],
+    pts: u64,
+    event_sender: &EventSender,
+    flow_id: &str,
+) {
+    let Some(codec) =
+        crate::engine::audio_decode::ff_codec_for_stream_type(stream_type)
+    else {
+        return;
+    };
+    if state.ff_audio_decoder.is_none() {
+        match video_engine::AudioDecoder::open(codec) {
+            Ok(d) => state.ff_audio_decoder = Some(d),
+            Err(_) => return,
+        }
+    }
+    let dec = state.ff_audio_decoder.as_mut().unwrap();
+
+    let mut decoded: Vec<(Vec<Vec<f32>>, u32, u8)> = Vec::new();
+    for au in crate::engine::audio_decode::split_audio_codec_frames(data, codec) {
+        if dec.send_packet(au, pts as i64).is_err() {
+            continue;
+        }
+        while let Ok(frame) = dec.receive_frame() {
+            decoded.push((frame.planar, frame.sample_rate, frame.channels));
+        }
+    }
+    if decoded.is_empty() {
+        return;
+    }
+
+    // Lazy-build the audio track from the first decoded frame's params,
+    // resolved against any operator-supplied target on `audio_encode`.
+    if state.audio_seg.is_none() {
+        let (_, src_sr, src_ch) = decoded[0].clone();
+        let target_sr = config
+            .audio_encode
+            .as_ref()
+            .and_then(|e| e.sample_rate)
+            .unwrap_or(src_sr);
+        let target_ch = config
+            .audio_encode
+            .as_ref()
+            .and_then(|e| e.channels)
+            .unwrap_or(src_ch);
+        // AAC ASC: AOT=2 (LC), then sample-rate index + channel-config —
+        // mirrors `aac_audio_specific_config`'s layout.
+        let sr_idx = crate::engine::audio_decode::sr_index_from_hz(target_sr).unwrap_or(3);
+        let asc = aac_audio_specific_config(1, sr_idx, target_ch);
+        let track = AudioTrack {
+            audio_specific_config: asc,
+            sample_rate: target_sr,
+            channels: target_ch as u16,
+            avg_bitrate: config
+                .audio_encode
+                .as_ref()
+                .and_then(|e| e.bitrate_kbps)
+                .map(|k| k * 1000)
+                .unwrap_or(128_000),
+        };
+        state.audio_seg = Some(AudioSegmenter::new(track, config.segment_duration_secs));
+        state.audio_ready = true;
+        tracing::info!(
+            "CMAF output '{}': audio track detected (re-encoded from \
+             stream_type 0x{:02X}) sr={} ch={}",
+            config.id, stream_type, target_sr, target_ch,
+        );
+    }
+
+    // CMAF wants AAC on the wire — without `audio_encode` we have no
+    // way to transmux a non-AAC source.
+    let Some(reenc) = state.audio_reencoder.as_mut() else {
+        return;
+    };
+    reenc.mark_real_audio(pts);
+
+    let mut frames_to_buffer: Vec<Vec<u8>> = Vec::new();
+    for (planar, sr, ch) in decoded {
+        match crate::timed_block_in_place!(
+            "cmaf.audio_reencoder",
+            crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
+            { reenc.encode_planar(&planar, pts, sr, ch) }
+        ) {
+            Ok(out) => frames_to_buffer.extend(out),
+            Err(e) => {
+                tracing::warn!(
+                    "CMAF output '{}': non-AAC audio re-encode failed: {e}",
+                    config.id,
+                );
+                event_sender.emit_flow(
+                    EventSeverity::Warning,
+                    category::AUDIO_ENCODE,
+                    format!("CMAF output '{}': audio_encode error: {e}", config.id),
+                    flow_id,
+                );
+            }
+        }
+    }
+    if let Some(seg) = state.audio_seg.as_mut() {
+        for f in frames_to_buffer {
+            seg.push(&f, pts);
+        }
+    }
+}
+
+#[cfg(not(feature = "video-thumbnail"))]
+fn handle_other_audio_frame(
+    _state: &mut CmafState,
+    _config: &CmafOutputConfig,
+    _stream_type: u8,
+    _data: &[u8],
+    _pts: u64,
+    _event_sender: &EventSender,
+    _flow_id: &str,
+) {
+    // No libavcodec bridge in this build; non-AAC sources cannot be
+    // decoded → CMAF audio drops cleanly.
 }
 
 #[allow(clippy::too_many_arguments)]

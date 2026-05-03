@@ -220,6 +220,78 @@ pub fn input_can_carry_ts_audio(input: &crate::config::models::InputConfig) -> b
     )
 }
 
+// ── Non-AAC PES helpers (MP2 / AC-3 / E-AC-3) ───────────────────────────────
+//
+// MP2 (stream_type 0x03/0x04), AC-3 (0x80/0x81/0xC1), and E-AC-3 (0x87/0xC2)
+// PES payloads are concatenated codec frames with no in-band length field
+// you can trust across every variant. The decode path is: walk the PES,
+// slice at every sync word, and call `avcodec_send_packet` once per frame.
+// Feeding the whole PES at once silently drops everything past the first
+// access unit (`avcodec_send_packet` decodes one AU per call).
+
+/// Map an MPEG-TS `stream_type` to the FFmpeg-backed audio decoder enum,
+/// or `None` for codecs that aren't routed through libavcodec (AAC has
+/// its own fdk-aac path, Opus is private-section-only).
+#[cfg(feature = "video-thumbnail")]
+pub fn ff_codec_for_stream_type(stream_type: u8) -> Option<video_codec::AudioDecoderCodec> {
+    use video_codec::AudioDecoderCodec;
+    match stream_type {
+        0x03 | 0x04 => Some(AudioDecoderCodec::Mp2),
+        0x80 | 0x81 | 0xC1 => Some(AudioDecoderCodec::Ac3),
+        0x87 | 0xC2 => Some(AudioDecoderCodec::Eac3),
+        _ => None,
+    }
+}
+
+/// Split a concatenated codec-frame buffer on its sync word so each
+/// `avcodec_send_packet` sees exactly one access unit.
+///
+/// AC-3 / E-AC-3 sync = `0x0B 0x77`. MP2 sync = an 11-bit `0xFFE` prefix
+/// (the same MPEG-1 audio sync used by every player). We don't trust the
+/// frame-size header to be exact across all variants — we scan for the
+/// *next* sync word and take the byte range as one frame. A trailing
+/// partial frame is included as the last slice; the next PES will resync
+/// on its own.
+///
+/// `Opus` is unreachable here (Opus PES carry one frame per PES already
+/// and have a different framing); the match arm is present so the
+/// codec enum remains exhaustive.
+#[cfg(feature = "video-thumbnail")]
+pub fn split_audio_codec_frames(
+    buf: &[u8],
+    codec: video_codec::AudioDecoderCodec,
+) -> Vec<&[u8]> {
+    use video_codec::AudioDecoderCodec;
+    if buf.is_empty() {
+        return Vec::new();
+    }
+    let mut starts: Vec<usize> = Vec::with_capacity(8);
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        let matched = match codec {
+            AudioDecoderCodec::Ac3 | AudioDecoderCodec::Eac3 => {
+                buf[i] == 0x0B && buf[i + 1] == 0x77
+            }
+            AudioDecoderCodec::Mp2 => buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0,
+            AudioDecoderCodec::Opus => false,
+        };
+        if matched {
+            starts.push(i);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    let mut out = Vec::with_capacity(starts.len());
+    for w in starts.windows(2) {
+        out.push(&buf[w[0]..w[1]]);
+    }
+    if let Some(&last) = starts.last() {
+        out.push(&buf[last..]);
+    }
+    out
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // fdk-aac backend (default)
 // ══════════════════════════════════════════════════════════════════════════════

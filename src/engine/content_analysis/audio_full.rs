@@ -13,12 +13,10 @@
 //! **Codec coverage**: AAC-LC / HE-AAC (ADTS in MPEG-TS, `stream_type =
 //! 0x0F`) decodes to PCM inline via the existing
 //! [`crate::engine::audio_decode::AacDecoder`] (Fraunhofer FDK-AAC).
-//! MP2 / AC-3 / E-AC-3 PIDs are detected and tracked but R128 decode
-//! requires the libavcodec bridge that also powers the output-side
-//! audio encoder; that decode path is intentionally kept out of the
-//! content-analysis hot loop. Those PIDs publish `r128: null` +
-//! `codec_decoded: false` with a structured reason so the manager UI
-//! can render the pending state distinct from "analyser off".
+//! MP2 (0x03/0x04), AC-3 (0x80/0x81/0xC1), and E-AC-3 (0x87/0xC2)
+//! decode via the FFmpeg-backed [`video_engine::AudioDecoder`] under
+//! `tokio::task::block_in_place` so libavcodec calls never run on the
+//! reactor.
 //!
 //! Non-blocking rules: drop-on-lag, per-PID PES buffers pre-sized, R128
 //! state re-used across the life of the PID.
@@ -182,9 +180,13 @@ struct AudioPidState {
     last_bitrate_bps: f64,
 
     /// AAC decoder, lazily constructed once we've seen the first ADTS
-    /// frame. `None` for non-AAC codecs (MP2 / AC-3 / E-AC-3) where the
-    /// decode path is not wired in today's build.
+    /// frame. Mutually exclusive with `ff_decoder`.
     aac_decoder: Option<AacDecoder>,
+    /// FFmpeg-backed decoder for MP2 / AC-3 / E-AC-3 PIDs, lazily
+    /// constructed on the first PES flush. Mutually exclusive with
+    /// `aac_decoder`.
+    #[cfg(feature = "video-thumbnail")]
+    ff_decoder: Option<video_engine::AudioDecoder>,
     /// PES reassembly buffer keyed by PUSI. Sized for 1 s of 320 kbps —
     /// comfortably larger than the largest realistic audio PES.
     pes_buf: Vec<u8>,
@@ -246,6 +248,8 @@ impl AudioPidState {
             window_bytes: 0,
             last_bitrate_bps: 0.0,
             aac_decoder: None,
+            #[cfg(feature = "video-thumbnail")]
+            ff_decoder: None,
             pes_buf: Vec::with_capacity(16_384),
             capturing_pes: false,
             r128: None,
@@ -265,13 +269,7 @@ impl AudioPidState {
             last_lufs_s: None,
             last_lufs_i: None,
             last_lra: None,
-            decode_note: match stream_type {
-                0x03 => Some("mpeg-1 audio decode deferred (libavcodec wire-up)"),
-                0x04 => Some("mpeg-2 audio decode deferred (libavcodec wire-up)"),
-                0x81 | 0x80 | 0xC1 => Some("ac-3 decode deferred (libavcodec wire-up)"),
-                0x87 | 0xC2 => Some("e-ac-3 decode deferred (libavcodec wire-up)"),
-                _ => None,
-            },
+            decode_note: None,
         }
     }
 
@@ -287,14 +285,23 @@ impl AudioPidState {
             self.window_bytes = 0;
         }
 
-        // Only AAC streams feed the PES buffer today — MP2 / AC-3 PES
-        // bytes are counted toward bitrate but not buffered (we don't
-        // decode them), saving ~40 KB of per-PID heap.
-        if self.stream_type != 0x0F && self.stream_type != 0x11 {
+        // Skip PES buffering for non-decodable codec families (e.g.
+        // SMPTE 302M `0x06` LPCM — counted in bitrate, no R128 yet).
+        let is_aac = self.stream_type == 0x0F || self.stream_type == 0x11;
+        let is_ff_codec = ff_codec_for_stream_type_local(self.stream_type).is_some();
+        if !is_aac && !is_ff_codec {
             return;
         }
 
         if pusi {
+            // Drain whatever the previous PES gave us before resetting.
+            if self.capturing_pes && !self.pes_buf.is_empty() {
+                if is_aac {
+                    self.drain_adts_frames();
+                } else {
+                    self.drain_ff_frames();
+                }
+            }
             // Skip PES header before appending.
             let start = pes_payload_offset(ts_payload);
             self.pes_buf.clear();
@@ -306,8 +313,74 @@ impl AudioPidState {
             self.pes_buf.extend_from_slice(ts_payload);
         }
 
-        // Extract every complete ADTS frame currently buffered and decode it.
-        self.drain_adts_frames();
+        if is_aac {
+            self.drain_adts_frames();
+        }
+        // Non-AAC PES are drained on the next PUSI (above) — codec sync
+        // words appear mid-PES, and feeding partial AUs to libavcodec
+        // would force re-syncs every TS packet.
+    }
+
+    /// Decode one whole non-AAC PES through the FFmpeg-backed decoder,
+    /// running R128 + mute / clip / silence on every emitted PCM block.
+    /// Lazy-builds the decoder + ebur128 state from the first frame's
+    /// reported sample rate / channels.
+    #[cfg(feature = "video-thumbnail")]
+    fn drain_ff_frames(&mut self) {
+        let Some(codec) = ff_codec_for_stream_type_local(self.stream_type) else {
+            self.pes_buf.clear();
+            return;
+        };
+        if self.ff_decoder.is_none() {
+            match video_engine::AudioDecoder::open(codec) {
+                Ok(d) => self.ff_decoder = Some(d),
+                Err(_) => {
+                    self.pes_buf.clear();
+                    return;
+                }
+            }
+        }
+        // Take ownership of the buffer so the immutable reborrows for
+        // `split_audio_codec_frames` don't fight the `&mut self` calls
+        // for `feed_pcm`.
+        let pes_data = std::mem::take(&mut self.pes_buf);
+        for au in
+            crate::engine::audio_decode::split_audio_codec_frames(&pes_data, codec)
+        {
+            let dec = self.ff_decoder.as_mut().unwrap();
+            if dec.send_packet(au, 0).is_err() {
+                continue;
+            }
+            let mut emitted: Vec<(Vec<Vec<f32>>, u32, u32)> = Vec::new();
+            while let Ok(frame) = dec.receive_frame() {
+                emitted.push((frame.planar, frame.sample_rate, frame.channels as u32));
+            }
+            for (planar, sr, ch) in emitted {
+                if self.r128.is_none() && sr > 0 && ch > 0 {
+                    self.r128_sample_rate = sr;
+                    self.r128_channels = ch;
+                    if let Ok(r128) = EbuR128::new(
+                        ch,
+                        sr,
+                        R128Mode::I
+                            | R128Mode::M
+                            | R128Mode::S
+                            | R128Mode::LRA
+                            | R128Mode::TRUE_PEAK,
+                    ) {
+                        self.r128 = Some(r128);
+                    }
+                }
+                self.feed_pcm(&planar);
+            }
+        }
+        self.pes_buf.clear();
+    }
+
+    #[cfg(not(feature = "video-thumbnail"))]
+    fn drain_ff_frames(&mut self) {
+        // No libavcodec in this build → drop the buffered bytes.
+        self.pes_buf.clear();
     }
 
     fn drain_adts_frames(&mut self) {
@@ -1082,6 +1155,18 @@ fn pes_payload_offset(payload: &[u8]) -> usize {
         return payload.len();
     }
     es_start
+}
+
+/// Local indirection over the public `ff_codec_for_stream_type` helper
+/// so the rest of this file can call it on every build, returning
+/// `None` when the `video-thumbnail` feature is off.
+#[cfg(feature = "video-thumbnail")]
+fn ff_codec_for_stream_type_local(st: u8) -> Option<video_codec::AudioDecoderCodec> {
+    crate::engine::audio_decode::ff_codec_for_stream_type(st)
+}
+#[cfg(not(feature = "video-thumbnail"))]
+fn ff_codec_for_stream_type_local(_st: u8) -> Option<()> {
+    None
 }
 
 fn is_audio_stream_type(st: u8) -> bool {

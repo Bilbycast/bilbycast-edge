@@ -113,6 +113,13 @@ pub struct TsAudioReplacer {
     #[cfg(feature = "fdk-aac")]
     aac_decoder: Option<aac_audio::AacDecoder>,
 
+    /// Lazily constructed FFmpeg-backed decoder for non-AAC sources
+    /// (MP2 / AC-3 / E-AC-3). Opened on the first PES flush once we
+    /// know the source codec from the PMT. Mirrors the AAC slot above —
+    /// only one is populated at a time per replacer instance.
+    #[cfg(feature = "video-thumbnail")]
+    ff_decoder: Option<video_engine::AudioDecoder>,
+
     /// Lazily constructed AAC encoder (for AAC-family targets). Opened on
     /// the first encode call, once we know the input sample-rate/channels
     /// after the first successful decode.
@@ -133,10 +140,6 @@ pub struct TsAudioReplacer {
     resolved_sample_rate: u32,
     /// True after codecs are initialised (decoder + encoder both open).
     codecs_ready: bool,
-
-    /// One-shot guard so we only log the "source codec not replaceable"
-    /// warning once per replacer instance, not per PMT.
-    source_replaceable_logged: bool,
 
     /// Optional channel-shuffle / sample-rate transcode block. Applied in
     /// planar PCM form between the AAC decoder and the target encoder.
@@ -196,6 +199,8 @@ impl TsAudioReplacer {
             out_pts_anchored: false,
             #[cfg(feature = "fdk-aac")]
             aac_decoder: None,
+            #[cfg(feature = "video-thumbnail")]
+            ff_decoder: None,
             #[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
             aac_encoder: None,
             #[cfg(feature = "video-thumbnail")]
@@ -204,7 +209,6 @@ impl TsAudioReplacer {
             resolved_channels: 0,
             resolved_sample_rate: 0,
             codecs_ready: false,
-            source_replaceable_logged: false,
             transcode_cfg: transcode,
             transcoder: None,
         })
@@ -288,34 +292,13 @@ impl TsAudioReplacer {
                         }
                         self.audio_pid = Some(apid);
                         self.source_stream_type = ast;
-                        // The replacer can only decode AAC-LC ADTS today
-                        // (stream_type 0x0F). For any other recognised
-                        // audio stream_type — AC-3 (0x81), MPEG-1/2
-                        // (0x03/0x04), private (0x06) — the decoder bridge
-                        // is not wired in yet, and naively buffering PES
-                        // bytes while `consume_pes` returns Err silently
-                        // drops every audio TS packet from the output. Log
-                        // it loudly the first time and bypass replacement
-                        // so the operator gets working passthrough audio
-                        // until decode support lands.
-                        if !self.source_replaceable_logged && ast != 0x0F {
-                            tracing::warn!(
-                                "ts_audio_replace: source stream_type {:#04x} is not AAC-LC; \
-                                 audio_encode {} can't decode this codec yet — passing audio \
-                                 through unchanged. (Decode support for AC-3 / MPEG / private \
-                                 streams is on the roadmap; until then, drop the `audio_encode` \
-                                 block on this output to encode-passthrough cleanly.)",
-                                ast,
-                                self.codec.as_str(),
-                            );
-                            self.source_replaceable_logged = true;
-                        }
                     }
-                    // Only rewrite the PMT stream_type when we'll actually
-                    // replace the audio bytes downstream. Otherwise the
-                    // PMT would lie about the codec a downstream decoder
-                    // is about to see.
-                    let can_replace = self.source_stream_type == 0x0F;
+                    // Rewrite the PMT stream_type whenever the source codec
+                    // is one we can replace (AAC family via fdk-aac, or
+                    // MP2/AC-3/E-AC-3 via the FFmpeg-backed audio decoder).
+                    // Anything else falls through to passthrough, with the
+                    // PMT preserved so downstream decoders see the truth.
+                    let can_replace = source_replaceable(self.source_stream_type);
                     if can_replace {
                         let mut rewritten = pkt.to_vec();
                         if let Some(apid) = self.audio_pid {
@@ -333,7 +316,7 @@ impl TsAudioReplacer {
             // source codec is one we can actually decode. Anything else
             // falls through to the passthrough branch below — losing the
             // re-encode is preferable to dropping audio entirely.
-            if Some(pid) == self.audio_pid && self.source_stream_type == 0x0F {
+            if Some(pid) == self.audio_pid && source_replaceable(self.source_stream_type) {
                 self.feed_audio_packet(pkt, output);
                 continue;
             }
@@ -416,6 +399,10 @@ impl TsAudioReplacer {
         {
             self.aac_decoder = None;
         }
+        #[cfg(feature = "video-thumbnail")]
+        {
+            self.ff_decoder = None;
+        }
         // Encoder and transcoder are both keyed off the input sample
         // rate / channels (resolved from the first decode). The new
         // input may have a different format, so tear them down and
@@ -433,10 +420,6 @@ impl TsAudioReplacer {
         self.resolved_channels = 0;
         self.resolved_sample_rate = 0;
         self.codecs_ready = false;
-        // Re-arm the source-not-replaceable warning so an input switch
-        // from AAC → AC-3 surfaces the same message that fired on the
-        // original AC-3 startup.
-        self.source_replaceable_logged = false;
     }
 
     /// Route one audio TS packet into the PES accumulator, flushing the
@@ -480,62 +463,101 @@ impl TsAudioReplacer {
             self.out_pts_anchored = true;
         }
 
-        // Decode. Currently the only supported input codec is AAC-LC ADTS
-        // (source_stream_type 0x0F).
+        // ── Phase 1: decode every codec frame in this PES ──
+        //
+        // AAC (stream_type 0x0F) is decoded in-process via fdk-aac. The
+        // ADTS framing lives inside `es_data` itself.
+        //
+        // MP2 / AC-3 / E-AC-3 (0x03/0x04, 0x80/0x81/0xC1, 0x87/0xC2) are
+        // decoded via libavcodec — `engine::audio_decode::split_audio_codec_frames`
+        // walks the PES on the codec's sync word, then each access unit
+        // is fed to the FFmpeg decoder one at a time
+        // (`avcodec_send_packet` decodes only one AU per call).
+        struct Decoded {
+            planar: Vec<Vec<f32>>,
+            sample_rate: u32,
+            channels: u8,
+        }
+        let mut decoded_frames: Vec<Decoded> = Vec::new();
+
         #[cfg(feature = "fdk-aac")]
-        {
-            if self.source_stream_type != 0x0F {
-                return Err(());
+        if self.source_stream_type == 0x0F {
+            if self.aac_decoder.is_none() {
+                self.aac_decoder = Some(
+                    aac_audio::AacDecoder::open_adts().map_err(|_| ())?,
+                );
             }
+            let decoder = self.aac_decoder.as_mut().unwrap();
 
-            // ── Phase 1: decode all ADTS frames in this PES ──
-            struct Decoded {
-                planar: Vec<Vec<f32>>,
-                sample_rate: u32,
-                channels: u8,
+            let mut pos = 0;
+            while pos + 7 <= es_data.len() {
+                if es_data[pos] != 0xFF || (es_data[pos + 1] & 0xF0) != 0xF0 {
+                    break;
+                }
+                let protection_absent = (es_data[pos + 1] & 0x01) != 0;
+                let header_len = if protection_absent { 7 } else { 9 };
+                if pos + header_len > es_data.len() {
+                    break;
+                }
+                let frame_len = (((es_data[pos + 3] & 0x03) as usize) << 11)
+                    | ((es_data[pos + 4] as usize) << 3)
+                    | ((es_data[pos + 5] as usize) >> 5);
+                if frame_len < header_len || pos + frame_len > es_data.len() {
+                    break;
+                }
+                let adts = &es_data[pos..pos + frame_len];
+                pos += frame_len;
+
+                match decoder.decode_frame(adts) {
+                    Ok(d) => {
+                        decoded_frames.push(Decoded {
+                            planar: d.planar,
+                            sample_rate: decoder.sample_rate().unwrap_or(48_000),
+                            channels: decoder.channels().unwrap_or(2),
+                        });
+                    }
+                    Err(_) => continue,
+                }
             }
-            let mut decoded_frames: Vec<Decoded> = Vec::new();
+        }
+
+        #[cfg(feature = "video-thumbnail")]
+        if let Some(ff_codec) = crate::engine::audio_decode::ff_codec_for_stream_type(
+            self.source_stream_type,
+        ) {
+            if self.ff_decoder.is_none() {
+                self.ff_decoder = Some(
+                    video_engine::AudioDecoder::open(ff_codec).map_err(|_| ())?,
+                );
+            }
+            let decoder = self.ff_decoder.as_mut().unwrap();
+            for au in
+                crate::engine::audio_decode::split_audio_codec_frames(&es_data, ff_codec)
             {
-                if self.aac_decoder.is_none() {
-                    self.aac_decoder = Some(
-                        aac_audio::AacDecoder::open_adts().map_err(|_| ())?,
-                    );
+                if decoder.send_packet(au, pts as i64).is_err() {
+                    continue;
                 }
-                let decoder = self.aac_decoder.as_mut().unwrap();
-
-                let mut pos = 0;
-                while pos + 7 <= es_data.len() {
-                    if es_data[pos] != 0xFF || (es_data[pos + 1] & 0xF0) != 0xF0 {
-                        break;
-                    }
-                    let protection_absent = (es_data[pos + 1] & 0x01) != 0;
-                    let header_len = if protection_absent { 7 } else { 9 };
-                    if pos + header_len > es_data.len() {
-                        break;
-                    }
-                    let frame_len = (((es_data[pos + 3] & 0x03) as usize) << 11)
-                        | ((es_data[pos + 4] as usize) << 3)
-                        | ((es_data[pos + 5] as usize) >> 5);
-                    if frame_len < header_len || pos + frame_len > es_data.len() {
-                        break;
-                    }
-                    let adts = &es_data[pos..pos + frame_len];
-                    pos += frame_len;
-
-                    match decoder.decode_frame(adts) {
-                        Ok(d) => {
-                            decoded_frames.push(Decoded {
-                                planar: d.planar,
-                                sample_rate: decoder.sample_rate().unwrap_or(48_000),
-                                channels: decoder.channels().unwrap_or(2),
-                            });
-                        }
-                        Err(_) => continue,
-                    }
+                while let Ok(frame) = decoder.receive_frame() {
+                    decoded_frames.push(Decoded {
+                        planar: frame.planar,
+                        sample_rate: frame.sample_rate,
+                        channels: frame.channels,
+                    });
                 }
             }
+        }
 
-            // ── Phase 2: feed PCM into encoder ──
+        if decoded_frames.is_empty()
+            && self.source_stream_type != 0
+            && !source_replaceable(self.source_stream_type)
+        {
+            // Source codec is something other than the four we decode
+            // (e.g. SMPTE 302M `0x06` LPCM). Nothing to re-encode.
+            return Err(());
+        }
+
+        // ── Phase 2: feed PCM into encoder ──
+        {
             for d in decoded_frames {
                 if !self.codecs_ready {
                     // Resolve the encoder target. When a transcode block is
@@ -611,13 +633,7 @@ impl TsAudioReplacer {
             }
         }
 
-        #[cfg(not(feature = "fdk-aac"))]
-        {
-            let _ = es_data;
-            let _ = pts;
-            return Err(());
-        }
-
+        let _ = pts;
         Ok(())
     }
 
@@ -774,6 +790,17 @@ impl TsAudioReplacer {
 }
 
 // ────────────────────────── TS / PES helpers ──────────────────────────
+
+/// True when the source `stream_type` is one we know how to decode and
+/// re-encode: AAC ADTS (0x0F) via fdk-aac, or MP2 / AC-3 / E-AC-3 via
+/// the FFmpeg-backed audio decoder. Anything else falls through to
+/// passthrough (no PMT rewrite, audio bytes preserved).
+fn source_replaceable(stream_type: u8) -> bool {
+    matches!(
+        stream_type,
+        0x0F | 0x03 | 0x04 | 0x80 | 0x81 | 0x87 | 0xC1 | 0xC2,
+    )
+}
 
 /// Parse the PMT for the first audio stream. Returns `(audio_pid,
 /// stream_type)`. Mirrors `parse_pmt_av_pids` in output_hls.rs but drops

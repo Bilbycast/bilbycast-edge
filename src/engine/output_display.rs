@@ -478,18 +478,19 @@ fn demux_decode_loop(
                     let _ = (&mut ff_audio_decoder, &mut current_ff_codec);
                 }
                 DemuxedFrame::OtherAudio { stream_type, data, pts } => {
-                    let codec = match stream_type {
-                        0x03 | 0x04 => AudioDecoderCodec::Mp2,
-                        0x80 | 0x81 | 0xC1 => AudioDecoderCodec::Ac3,
-                        0x87 | 0xC2 => AudioDecoderCodec::Eac3,
-                        _ => continue,
+                    let Some(codec) = crate::engine::audio_decode::ff_codec_for_stream_type(
+                        stream_type,
+                    ) else {
+                        continue;
                     };
                     if current_ff_codec != Some(codec) {
                         ff_audio_decoder = FfAudioDecoder::open(codec).ok();
                         current_ff_codec = Some(codec);
                     }
                     if let Some(decoder) = ff_audio_decoder.as_mut() {
-                        for frame_bytes in split_codec_frames(&data, codec) {
+                        for frame_bytes in
+                            crate::engine::audio_decode::split_audio_codec_frames(&data, codec)
+                        {
                             if decoder.send_packet(frame_bytes, pts as i64).is_ok() {
                                 while let Ok(decoded) = decoder.receive_frame() {
                                     let _ = atx.try_send(AudioBlock {
@@ -506,41 +507,6 @@ fn demux_decode_loop(
             }
         }
     }
-}
-
-/// Split a concatenated codec-frame buffer on its sync word so each
-/// `avcodec_send_packet` sees exactly one access unit. ffmpeg decodes
-/// only the first AU per packet — feeding the whole PES blob silently
-/// drops every frame past the first.
-fn split_codec_frames(buf: &[u8], codec: AudioDecoderCodec) -> Vec<&[u8]> {
-    if buf.is_empty() {
-        return Vec::new();
-    }
-    let mut starts: Vec<usize> = Vec::with_capacity(8);
-    let mut i = 0;
-    while i + 1 < buf.len() {
-        let matched = match codec {
-            AudioDecoderCodec::Ac3 | AudioDecoderCodec::Eac3 => {
-                buf[i] == 0x0B && buf[i + 1] == 0x77
-            }
-            AudioDecoderCodec::Mp2 => buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0,
-            AudioDecoderCodec::Opus => false,
-        };
-        if matched {
-            starts.push(i);
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    let mut out = Vec::with_capacity(starts.len());
-    for w in starts.windows(2) {
-        out.push(&buf[w[0]..w[1]]);
-    }
-    if let Some(&last) = starts.last() {
-        out.push(&buf[last..]);
-    }
-    out
 }
 
 fn aac_decoder_from_adts_config(

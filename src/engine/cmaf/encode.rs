@@ -260,6 +260,52 @@ impl AudioReencoder {
     pub fn set_adts_config(&mut self, profile: u8, sr_idx: u8, ch_cfg: u8) {
         self.lazy_init_params.adts_config = Some((profile, sr_idx, ch_cfg));
     }
+
+    /// Encode a planar f32 PCM frame that the caller has already decoded
+    /// out-of-band (e.g. an FFmpeg-backed decode of a non-AAC source like
+    /// MP2 / AC-3 / E-AC-3). Lazy-builds the AAC encoder against the
+    /// supplied source sample-rate / channel count on first call, then
+    /// hands the planar frame straight to the encoder. Mirrors the back
+    /// half of [`Self::encode_aac_frame`] without touching the AAC
+    /// decoder slot.
+    pub fn encode_planar(
+        &mut self,
+        planar: &[Vec<f32>],
+        pts: u64,
+        source_sr: u32,
+        source_ch: u8,
+    ) -> Result<Vec<Vec<u8>>> {
+        if planar.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.encoder.is_none() {
+            let params = EncoderParams {
+                codec: self.target_codec,
+                sample_rate: source_sr,
+                channels: source_ch,
+                target_bitrate_kbps: self.target_bitrate_kbps,
+                target_sample_rate: self.target_sample_rate.unwrap_or(source_sr),
+                target_channels: self.target_channels.unwrap_or(source_ch),
+            };
+            let enc = AudioEncoder::spawn(
+                params,
+                self.cancel.clone(),
+                self.flow_id.clone(),
+                self.output_id.clone(),
+                self.out_stats.clone(),
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!("AudioEncoder spawn failed: {e}"))?;
+            self.encoder = Some(enc);
+        }
+        let enc = self.encoder.as_mut().unwrap();
+        enc.submit_planar(planar, pts);
+        let mut out = Vec::new();
+        while let Some(frame) = enc.try_recv() {
+            out.push(frame.data.to_vec());
+        }
+        Ok(out)
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────

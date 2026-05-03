@@ -246,6 +246,14 @@ async fn publish_loop(
     let mut sent_video_header = false;
     let mut sent_audio_header = false;
     let mut base_pts: Option<u64> = None;
+    // Lazy FFmpeg-backed audio decoder for non-AAC sources
+    // (MP2 / AC-3 / E-AC-3). Opened on the first `OtherAudio` frame.
+    // Mirrors the AAC decoder slot inside `EncoderState::Active` —
+    // only one decoder is in flight per publish loop at a time.
+    #[cfg(feature = "video-thumbnail")]
+    let mut ff_audio_decoder: Option<video_engine::AudioDecoder> = None;
+    #[cfg(feature = "video-thumbnail")]
+    let mut ff_audio_codec: Option<video_codec::AudioDecoderCodec> = None;
     // Lazy encoder: built on first AAC frame so we can read the demuxer's
     // cached AAC config and decide between Transparent / Active / Failed.
     let mut encoder_state: EncoderState = match &config.audio_encode {
@@ -543,9 +551,91 @@ async fn publish_loop(
                 DemuxedFrame::Opus => {
                     // RTMP doesn't support Opus — skip
                 }
+                #[cfg(feature = "video-thumbnail")]
+                DemuxedFrame::OtherAudio { stream_type, data, pts } => {
+                    let ts_ms = pts_to_ms(pts, &mut base_pts);
+
+                    // Re-encoding to AAC requires the encoder to be wired
+                    // up (`audio_encode: aac_lc/he_aac_v1/he_aac_v2`). On
+                    // a passthrough output, RTMP wants AAC bytes — MP2 /
+                    // AC-3 / E-AC-3 sources need `audio_encode` to land.
+                    if matches!(encoder_state, EncoderState::Lazy) {
+                        encoder_state = build_encoder_state(
+                            config,
+                            &demuxer,
+                            compressed_audio_input,
+                            cancel,
+                            stats,
+                            flow_id,
+                            event_sender,
+                        );
+                    }
+                    let EncoderState::Active {
+                        encoder, silence, ..
+                    } = &mut encoder_state
+                    else {
+                        continue;
+                    };
+
+                    let Some(codec) = crate::engine::audio_decode::ff_codec_for_stream_type(
+                        stream_type,
+                    ) else {
+                        continue;
+                    };
+                    if ff_audio_codec != Some(codec) {
+                        ff_audio_decoder = video_engine::AudioDecoder::open(codec).ok();
+                        ff_audio_codec = Some(codec);
+                    }
+                    let Some(dec) = ff_audio_decoder.as_mut() else {
+                        continue;
+                    };
+                    if let Some(sg) = silence.as_mut() {
+                        sg.mark_real_audio(pts);
+                    }
+
+                    // Send the FLV AAC sequence header on first frame —
+                    // for OtherAudio sources we can't read ADTS config off
+                    // the demuxer, so derive the ASC straight from the
+                    // encoder's target params (which is what every RTMP
+                    // server actually expects to see).
+                    if !sent_audio_header {
+                        let p = encoder.params();
+                        if let Some(sr_idx) = sr_index_from_hz(p.target_sample_rate) {
+                            let header =
+                                build_aac_sequence_header(1, sr_idx, p.target_channels);
+                            client.send_audio(&header, ts_ms).await?;
+                            sent_audio_header = true;
+                        }
+                    }
+                    if !sent_audio_header {
+                        continue;
+                    }
+
+                    for au in
+                        crate::engine::audio_decode::split_audio_codec_frames(&data, codec)
+                    {
+                        if dec.send_packet(au, pts as i64).is_err() {
+                            continue;
+                        }
+                        while let Ok(frame) = dec.receive_frame() {
+                            encoder.submit_planar(&frame.planar, pts);
+                        }
+                    }
+                    let drained = encoder.drain();
+                    for frame in drained {
+                        let tag = build_aac_raw_tag(&frame.data);
+                        let tag_len = tag.len();
+                        let frame_ts_ms = (frame.pts / 90) as u32;
+                        client.send_audio(&tag, frame_ts_ms).await?;
+                        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                        stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
+                        stats.record_latency(recv_time_us);
+                    }
+                }
+                #[cfg(not(feature = "video-thumbnail"))]
                 DemuxedFrame::OtherAudio { .. } => {
-                    // RTMP audio = AAC; MP2 / AC-3 / E-AC-3 sources need
-                    // `audio_encode: aac_lc` on the output.
+                    // Build without `video-thumbnail` lacks the libavcodec
+                    // bridge needed to decode MP2 / AC-3 / E-AC-3 — drop.
                 }
             }
         }

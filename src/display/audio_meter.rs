@@ -22,7 +22,6 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use video_codec::AudioDecoderCodec;
 use video_engine::AudioDecoder as FfAudioDecoder;
 
 use crate::engine::audio_decode::AacDecoder;
@@ -351,11 +350,10 @@ impl MeterPidState {
 
     fn drain_ff(&mut self, snapshot: &SharedMeter) {
         // Lazily open the FFmpeg-backed decoder.
-        let codec = match self.stream_type {
-            0x03 | 0x04 => AudioDecoderCodec::Mp2,
-            0x80 | 0x81 | 0xC1 => AudioDecoderCodec::Ac3,
-            0x87 | 0xC2 => AudioDecoderCodec::Eac3,
-            _ => return,
+        let Some(codec) =
+            crate::engine::audio_decode::ff_codec_for_stream_type(self.stream_type)
+        else {
+            return;
         };
         if self.ff_decoder.is_none() {
             match FfAudioDecoder::open(codec) {
@@ -374,9 +372,9 @@ impl MeterPidState {
         // `avcodec_send_packet` decodes only one access unit per call —
         // feeding the whole blob silently throws away every frame past
         // the first, so the audio-bars overlay never sees recent levels.
-        // Walk the PES, slice on the codec's sync word, and feed each
-        // frame individually.
-        for frame_slice in split_audio_frames(&self.pes_buf, codec) {
+        for frame_slice in
+            crate::engine::audio_decode::split_audio_codec_frames(&self.pes_buf, codec)
+        {
             if dec.send_packet(frame_slice, 0).is_ok() {
                 while let Ok(frame) = dec.receive_frame() {
                     update_levels(&frame.planar, self.pid, self.codec_label, snapshot);
@@ -387,44 +385,6 @@ impl MeterPidState {
         self.pes_buf.clear();
         self.capturing_pes = false;
     }
-}
-
-/// Walk `buf` and return each detected audio access unit as a sub-slice.
-/// AC-3 / E-AC-3 sync = `0x0B 0x77`; MP2 sync = an 11-bit `0xFFE` prefix
-/// (the same MPEG-1 audio sync used by every player). We cannot trust
-/// the frame-size header to be exact across all variants — instead we
-/// scan for the *next* sync word and take the byte range as one frame.
-/// Anything from a partial trailing frame is discarded; the next PES
-/// will resync on its own.
-fn split_audio_frames(buf: &[u8], codec: AudioDecoderCodec) -> Vec<&[u8]> {
-    if buf.is_empty() {
-        return Vec::new();
-    }
-    let mut starts: Vec<usize> = Vec::with_capacity(8);
-    let mut i = 0;
-    while i + 1 < buf.len() {
-        let matched = match codec {
-            AudioDecoderCodec::Ac3 | AudioDecoderCodec::Eac3 => {
-                buf[i] == 0x0B && buf[i + 1] == 0x77
-            }
-            AudioDecoderCodec::Mp2 => buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0,
-            AudioDecoderCodec::Opus => false,
-        };
-        if matched {
-            starts.push(i);
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    let mut out = Vec::with_capacity(starts.len());
-    for w in starts.windows(2) {
-        out.push(&buf[w[0]..w[1]]);
-    }
-    if let Some(&last) = starts.last() {
-        out.push(&buf[last..]);
-    }
-    out
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
