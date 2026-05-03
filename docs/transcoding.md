@@ -348,9 +348,9 @@ See the licensing notes in the main `bilbycast-edge/CLAUDE.md`:
 |---------------|---------------------------|------------------------------|---------------------------|
 | `x264`        | `video-encoder-x264`      | `apt install libx264-dev`    | **GPL v2+** — binary becomes AGPL-3.0-or-later combined work (see `NOTICE.full`). |
 | `x265`        | `video-encoder-x265`      | `apt install libx265-dev`    | **GPL v2+** — same implications as x264. |
-| `h264_nvenc`  | `video-encoder-nvenc`     | `nv-codec-headers` + NVIDIA driver (runtime) | Royalty-free; API-layer LGPL-compatible. No GPL bundle. |
+| `h264_nvenc`  | `video-encoder-nvenc`     | Build: `nv-codec-headers`. Runtime: NVIDIA proprietary driver (provides `libnvidia-encode.so.1` + `libcuda.so.1`). Nouveau is **not** sufficient. | Royalty-free; API-layer LGPL-compatible. No GPL bundle. |
 | `hevc_nvenc`  | `video-encoder-nvenc`     | same                         | same                      |
-| `h264_qsv`    | `video-encoder-qsv`       | `apt install libvpl-dev` (build) + `libvpl2` + `intel-media-va-driver-non-free` (runtime); x86_64 only; Intel iGPU (Broadwell / 5th gen+) or Arc dGPU | Royalty-free; libvpl headers MIT, dispatcher Apache 2.0. No GPL bundle. No `--enable-nonfree` needed. |
+| `h264_qsv`    | `video-encoder-qsv`       | Build: `libvpl-dev` (x86_64). Runtime: **`libvpl2`** + **`libmfx-gen1.2`** (the GPU runtime — most-commonly-missed) + **`intel-media-va-driver-non-free`** (or `intel-media-va-driver`). Intel iGPU (Broadwell / 5th gen+) or Arc dGPU. | Royalty-free; libvpl headers MIT, dispatcher Apache 2.0. No GPL bundle. No `--enable-nonfree` needed. |
 | `hevc_qsv`    | `video-encoder-qsv`       | same; HEVC requires Kaby Lake (7th gen) or newer | same |
 
 Default release build has no software video encoders (AGPL-only
@@ -398,29 +398,60 @@ cargo build --release --features video-encoder-qsv      # x86_64 only
 
 ### QSV (Intel QuickSync) at runtime
 
-Once you've built with `video-encoder-qsv`, the host needs three things
+Once you've built with `video-encoder-qsv`, the host needs four things
 to actually exercise the encoder:
 
 1. **Hardware**: a 5th-gen (Broadwell) or newer Intel Core CPU with an
    integrated GPU, or an Intel Arc / Battlemage discrete GPU. HEVC
    encoding requires 7th-gen (Kaby Lake) or newer.
-2. **Runtime libraries** (Ubuntu 24.04+):
-   ```bash
-   sudo apt install libvpl2 intel-media-va-driver-non-free
-   # (intel-media-driver if you prefer the open-source upstream variant)
-   ```
-3. **Device access**: the running user must be in the `render` group so
-   it can open `/dev/dri/renderD*`:
-   ```bash
-   sudo usermod -aG render "$USER"
-   # log out + back in for the group change to take effect
-   ```
+2. **oneVPL dispatcher** — `libvpl2`. Implements `MFXLoad`. The bilbycast
+   binary links to it dynamically.
+3. **oneVPL GPU runtime** — `libmfx-gen1.2`. **This is the package most
+   commonly missed.** The dispatcher itself contains zero encoding code;
+   it `dlopen`s `libmfx-gen.so.1.2` at session create. Without this
+   package installed, `MFXLoad` returns `MFX_ERR_NOT_FOUND` (-9) and
+   `avcodec_open2` fails with EINVAL — the same symptom an "incorrect
+   parameters" message in the FFmpeg log produces.
+4. **Intel media VAAPI driver** — `intel-media-va-driver-non-free` (or
+   `intel-media-va-driver` for the upstream open-source variant). Provides
+   `iHD_drv_video.so` for the VAAPI fallback path that `libmfx-gen` uses
+   for some pixel-format conversions and zero-copy frame paths.
+5. **Device access**: the running user must be in the `render` group so
+   it can open `/dev/dri/renderD*`.
+
+```bash
+sudo apt install libvpl2 libmfx-gen1.2 intel-media-va-driver-non-free
+sudo usermod -aG render "$USER"
+# log out + back in for the group change to take effect
+```
+
+Verify all three runtime files are present before starting the edge:
+
+```bash
+ls /usr/lib/x86_64-linux-gnu/libvpl.so.2          # dispatcher
+ls /usr/lib/x86_64-linux-gnu/libmfx-gen.so.1.2    # GPU runtime — the critical one
+ls /usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so # VAAPI driver
+ls /dev/dri/                                      # card* + renderD* device nodes
+```
 
 If any of those are missing, `avcodec_find_encoder_by_name("h264_qsv")`
-returns null and the edge surfaces a Critical event under category
-`video_encode` for the affected output, then passthroughs the source
-video unchanged. The CPU encoders (x264, x265) still work in the same
-binary as a fallback.
+returns null OR `avcodec_open2` returns -22; either way the edge surfaces
+a Critical event under category `video_encode` for the affected output,
+then passthroughs the source video unchanged. The CPU encoders
+(`x264`, `x265`) still work in the same binary as a fallback.
+
+#### Why `libmfx-gen1.2` is mandatory and cannot be statically linked
+
+Intel's oneVPL is intentionally split into a thin **dispatcher**
+(`libvpl.so.2`, what we link against at compile time) and an **Intel-shipped
+GPU runtime backend** (`libmfx-gen.so.1.2`, what does the actual encoding).
+The same model applies to NVENC (`libnvidia-encode.so.1`), to VAAPI
+(`iHD_drv_video.so`), and to OpenCL (vendor ICDs). bilbycast cannot
+statically link the GPU runtime in — it is a GPU-architecture-specific
+binary that Intel distributes as part of their driver stack, the same
+way the NVIDIA driver ships NVENC. Every QSV-using application — bare
+ffmpeg, OBS, GStreamer, HandBrake — has the same runtime-package
+requirement.
 
 **QSV constraints** enforced at config validation time:
 

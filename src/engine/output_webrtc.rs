@@ -947,6 +947,10 @@ async fn whep_viewer_loop(
                                         }
                                     }
                                 }
+                                super::webrtc::ts_demux::DemuxedFrame::OtherAudio { .. } => {
+                                    // WebRTC carries Opus / AAC audio. MP2 / AC-3 / E-AC-3
+                                    // sources need `audio_encode: opus` on the output.
+                                }
                             }
                         }
 
@@ -1317,6 +1321,10 @@ async fn whip_client_loop(
                                                 stats.record_latency(recv_time_us);
                                             }
                                         }
+                                    }
+                                    super::webrtc::ts_demux::DemuxedFrame::OtherAudio { .. } => {
+                                        // WebRTC carries Opus / AAC audio. MP2 / AC-3 / E-AC-3
+                                        // sources need `audio_encode: opus` on the output.
                                     }
                                 }
                             }

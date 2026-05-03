@@ -47,6 +47,22 @@ pub enum DemuxedFrame {
         /// Presentation timestamp in 90 kHz clock ticks.
         pts: u64,
     },
+    /// Non-AAC compressed audio frame (MP2 / AC-3 / E-AC-3) — payload is
+    /// the elementary stream the FFmpeg audio decoder consumes
+    /// (concatenated frames pre-PES). Only emitted when the audio PID's
+    /// stream type is one we can decode but not via the AAC fast path.
+    /// Consumers that don't handle this codec should ignore it.
+    OtherAudio {
+        /// MPEG-TS stream_type from the PMT (0x03/0x04 = MP2,
+        /// 0x80/0x81/0xC1 = AC-3, 0x87/0xC2 = E-AC-3).
+        stream_type: u8,
+        /// Concatenated codec frames extracted from the PES payload.
+        /// The receiver can split on codec sync words (0x0B 0x77 for
+        /// AC-3 / E-AC-3, MPEG-1 sync for MP2).
+        data: Vec<u8>,
+        /// Presentation timestamp in 90 kHz clock ticks.
+        pts: u64,
+    },
 }
 
 /// Per-PID PES reassembly state.
@@ -312,7 +328,15 @@ impl TsDemuxer {
 
             match stream_type {
                 STREAM_TYPE_H264 | STREAM_TYPE_H265 => {
-                    if self.video_pid != Some(es_pid) {
+                    // PID change OR codec change on the same PID — both
+                    // happen on operator input switching (HEVC source ↔
+                    // H.264 source often share PID 0x100). The PES
+                    // assembler caches the codec, so a stale stream_type
+                    // routes the new bitstream through the wrong NALU
+                    // parser and decoded frames stop flowing.
+                    let pid_changed = self.video_pid != Some(es_pid);
+                    let codec_changed = self.video_stream_type != stream_type;
+                    if pid_changed || codec_changed {
                         tracing::info!(
                             "TS demux: video PID 0x{:04X} (stream_type=0x{:02X})",
                             es_pid,
@@ -328,12 +352,26 @@ impl TsDemuxer {
                                 stream_type,
                             },
                         );
+                        // The codec parameter sets we cached for the
+                        // previous stream are obsolete. Drop them so the
+                        // next IDR's SPS/PPS/VPS becomes the new anchor.
+                        self.cached_sps = None;
+                        self.cached_pps = None;
+                        self.cached_h265_vps = None;
+                        self.cached_h265_sps = None;
+                        self.cached_h265_pps = None;
                     }
                 }
                 STREAM_TYPE_PRIVATE if is_opus => {
                     audio_tracks.push((es_pid, stream_type));
                 }
                 STREAM_TYPE_AAC_ADTS => {
+                    audio_tracks.push((es_pid, stream_type));
+                }
+                // MP2 (0x03/0x04), AC-3 (0x80/0x81/0xC1), E-AC-3 (0x87/0xC2)
+                // — surface so the local-display ALSA path can decode
+                // via libavcodec.
+                0x03 | 0x04 | 0x80 | 0x81 | 0x87 | 0xC1 | 0xC2 => {
                     audio_tracks.push((es_pid, stream_type));
                 }
                 _ => {}
@@ -350,10 +388,22 @@ impl TsDemuxer {
                 .unwrap_or(0);
             let (selected_pid, selected_type) = audio_tracks[idx];
 
-            if self.audio_pid != Some(selected_pid) {
+            // Same PID-or-codec change story as video — switching from an
+            // AC-3 source to an AAC source on the same audio PID would
+            // otherwise keep the AC-3 PES assembler and route AAC bytes
+            // through the wrong path.
+            let audio_pid_changed = self.audio_pid != Some(selected_pid);
+            let audio_codec_changed = self
+                .audio_pid
+                .and_then(|pid| self.pes_assemblers.get(&pid))
+                .map_or(true, |a| a.stream_type != selected_type);
+            if audio_pid_changed || audio_codec_changed {
                 let codec_name = match selected_type {
                     STREAM_TYPE_AAC_ADTS => "AAC",
                     STREAM_TYPE_PRIVATE => "Opus",
+                    0x03 | 0x04 => "MP2",
+                    0x80 | 0x81 | 0xC1 => "AC-3",
+                    0x87 | 0xC2 => "E-AC-3",
                     _ => "unknown",
                 };
                 tracing::info!(
@@ -375,6 +425,10 @@ impl TsDemuxer {
                         stream_type: selected_type,
                     },
                 );
+                // ADTS-config + Opus-state caches are codec-specific; drop
+                // them so the next sync re-anchors on whatever the new
+                // stream sends first.
+                self.cached_aac_config = None;
             }
         }
     }
@@ -508,6 +562,17 @@ impl TsDemuxer {
             STREAM_TYPE_AAC_ADTS if Some(pid) == self.audio_pid => {
                 // A single PES may contain multiple ADTS frames concatenated.
                 self.extract_aac_frames(es_data, pts.unwrap_or(0))
+            }
+            // MP2 (0x03/0x04), AC-3 (0x80/0x81/0xC1), E-AC-3 (0x87/0xC2)
+            // — surface the PES payload so consumers that handle these
+            // codecs (the local-display ALSA path) can decode them via
+            // libavcodec. Other consumers ignore the variant.
+            0x03 | 0x04 | 0x80 | 0x81 | 0x87 | 0xC1 | 0xC2 if Some(pid) == self.audio_pid => {
+                vec![DemuxedFrame::OtherAudio {
+                    stream_type,
+                    data: es_data.to_vec(),
+                    pts: pts.unwrap_or(0),
+                }]
             }
             _ => Vec::new(),
         }

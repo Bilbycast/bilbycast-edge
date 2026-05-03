@@ -185,12 +185,42 @@ older distributions (CentOS 7/8, Ubuntu 20.04), build from source
 Pre-built binaries are not yet provided for these platforms. Build
 from source.
 
-### Running on an NVIDIA host
+### Running on an NVIDIA host (NVENC)
 
-The `*-full` binary includes NVENC support. At runtime, it
-`dlopen`s `libnvidia-encode.so.1`, which ships with the NVIDIA
-proprietary driver — you don't need to install anything beyond the
-driver.
+The `*-full` binary compiles in the FFmpeg → NVENC bridge. At runtime
+it `dlopen`s **`libnvidia-encode.so.1`** and **`libcuda.so.1`**, both
+of which ship inside the NVIDIA proprietary driver — there is **no
+separate package** for the encoder itself.
+
+#### What you need installed
+
+| Component | Package | Why |
+|---|---|---|
+| NVIDIA proprietary driver | `nvidia-driver-XXX` (Ubuntu) or `nvidia-driver` (Debian non-free) | Ships `libnvidia-encode.so.1`, `libcuda.so.1`, the GPU kernel module |
+| User device access | membership in the `video` group (auto-handled by the driver) | `/dev/nvidia*` permissions |
+
+The Nouveau open-source driver does **not** support NVENC — only the
+proprietary driver exposes the NVENC engine.
+
+```bash
+# Ubuntu 22.04 / 24.04 — install the recommended driver branch
+sudo ubuntu-drivers autoinstall
+# or pin a specific branch:
+sudo apt install nvidia-driver-580        # desktop / workstation
+sudo apt install nvidia-driver-580-server # headless servers
+sudo reboot                                # required after first install
+
+# Debian 12+ — non-free repo must be enabled
+sudo apt install nvidia-driver
+sudo reboot
+```
+
+Verify the install reached userspace:
+
+```bash
+nvidia-smi                                          # should list the GPU
+ldconfig -p | grep -E 'libnvidia-encode|libcuda\.'  # both should appear
+```
 
 To use NVENC in a flow config, set `codec: "h264_nvenc"` or
 `"hevc_nvenc"` on the `video_encode` block:
@@ -209,17 +239,38 @@ encoder; the choice is per-flow.
 
 ### Running on an Intel host (QuickSync / QSV)
 
-The `*-x86_64-linux-full` binary also includes Intel QuickSync
-(QSV) via Intel oneVPL. The `*-aarch64-linux-full` binary does not
-— Intel iGPUs are x86_64-only.
+The `*-x86_64-linux-full` binary also compiles in the FFmpeg →
+oneVPL bridge for Intel QuickSync. The `*-aarch64-linux-full`
+binary does **not** include QSV — Intel iGPUs are x86_64-only.
 
-Install the runtime libraries and grant device access:
+#### What you need installed
+
+oneVPL is a thin **dispatcher** library — it contains zero GPU
+encoding code. It `dlopen`s an Intel-shipped *backend* runtime at
+session create. Without a backend installed, the dispatcher returns
+`MFX_ERR_NOT_FOUND` (-9) and the encoder fails to open. You need
+**all three** of the following on the host:
+
+| Component | Package | Why |
+|---|---|---|
+| oneVPL dispatcher | `libvpl2` | Implements `MFXLoad`. Linked dynamically by the binary. |
+| Intel VPL GPU runtime | **`libmfx-gen1.2`** | The actual hardware encoder backend (`libmfx-gen.so.1.2`). Without this, MFX has nothing to dispatch to. **This is the most-commonly-missed package.** |
+| Intel media VAAPI driver | `intel-media-va-driver-non-free` (or `intel-media-va-driver` for the open-source build) | Provides `iHD_drv_video.so` for the VAAPI fallback path that `libmfx-gen` falls back on for some pixel-format conversions and zero-copy paths. |
 
 ```bash
-sudo apt install libvpl2 intel-media-va-driver-non-free
-# (or `intel-media-driver` for the open-source upstream variant)
+sudo apt update
+sudo apt install libvpl2 libmfx-gen1.2 intel-media-va-driver-non-free
 sudo usermod -aG render "$USER"
 # log out + back in for the group change to take effect
+```
+
+Verify:
+
+```bash
+ls /usr/lib/x86_64-linux-gnu/libmfx-gen.so.1.2   # must exist
+ls /usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so # must exist
+ls /dev/dri/                                      # should list card* + renderD*
+vainfo 2>/dev/null | head -20                     # optional: confirms VAAPI sees the iGPU
 ```
 
 To use QSV in a flow config, set `codec: "h264_qsv"` or
@@ -238,6 +289,21 @@ H.264; HEVC requires 7th-gen (Kaby Lake) or newer. On a host
 without an Intel iGPU + media driver, select `codec: "x264"` /
 `"x265"` (or `"h264_nvenc"` / `"hevc_nvenc"` if NVIDIA is also
 present) instead.
+
+#### Why the runtime libraries are mandatory
+
+Both NVENC and QSV are **dispatcher architectures**: the encoder
+implementation that actually programs the GPU lives in vendor-shipped
+runtime libraries (`libnvidia-encode.so.1` for NVENC,
+`libmfx-gen.so.1.2` for QSV). bilbycast cannot statically link them
+in — they are GPU-architecture-specific binaries that Intel and
+NVIDIA distribute as part of their driver stacks. This is the same
+model OBS, GStreamer, FFmpeg, and every other QSV/NVENC consumer
+follows.
+
+If you skip the runtime install, hardware encoding fails at session
+creation; CPU encoding (`x264` / `x265`) continues to work because
+those libraries are statically linked into the `*-full` binary.
 
 ---
 

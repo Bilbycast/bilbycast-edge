@@ -136,8 +136,23 @@ impl AudioBackend {
             }
         };
 
-        // Anchor the AudioClock on the very first successful write.
-        if self.pending_anchor {
+        // Anchor the AudioClock on the very first successful write, or
+        // re-anchor on a large PTS discontinuity (e.g. operator switched
+        // the flow's active input — the new stream has an unrelated PTS
+        // base, so the clock's drift comparison would otherwise flag every
+        // new video frame as multi-second-late and drop them all).
+        let needs_re_anchor = if self.pending_anchor {
+            true
+        } else if let Some(now_pts) = clock.current_pts_90k() {
+            // 90 kHz × 0.5 s = 45 000. A real continuous stream tracks the
+            // ALSA clock to within a few hundred PTS units; anything past
+            // half a second is a stream change.
+            let diff = pts_90k.wrapping_sub(now_pts) as i64;
+            diff.unsigned_abs() > 45_000
+        } else {
+            false
+        };
+        if needs_re_anchor {
             clock.set_anchor(program_start, pts_90k, sample_rate);
             self.pending_anchor = false;
         }

@@ -543,6 +543,10 @@ async fn publish_loop(
                 DemuxedFrame::Opus => {
                     // RTMP doesn't support Opus — skip
                 }
+                DemuxedFrame::OtherAudio { .. } => {
+                    // RTMP audio = AAC; MP2 / AC-3 / E-AC-3 sources need
+                    // `audio_encode: aac_lc` on the output.
+                }
             }
         }
 

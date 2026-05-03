@@ -346,6 +346,12 @@ fn demux_decode_loop(
     let mut last_lag_log = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(2))
         .unwrap_or_else(std::time::Instant::now);
+    // Track the previous video PTS so a large discontinuity (operator
+    // input switch — new stream has an unrelated PTS base) flushes the
+    // persistent video decoder. Without this, the decoder keeps
+    // referencing the old stream's reference frames and either emits
+    // glitched output or stalls until its internal IDR-anchor recycles.
+    let mut last_video_pts: Option<u64> = None;
 
     loop {
         if cancel.is_cancelled() {
@@ -397,6 +403,18 @@ fn demux_decode_loop(
         for frame in frames {
             match frame {
                 DemuxedFrame::H264 { nalus, pts, .. } => {
+                    if pts_jump(last_video_pts, pts) {
+                        if let Some(d) = video_decoder.as_mut() {
+                            d.flush();
+                        }
+                        if let Some(d) = aac_decoder.as_mut() {
+                            d.reset();
+                        }
+                        if let Some(d) = ff_audio_decoder.as_mut() {
+                            d.flush();
+                        }
+                    }
+                    last_video_pts = Some(pts);
                     ensure_video_decoder(
                         &mut video_decoder,
                         &mut current_video_codec,
@@ -408,6 +426,18 @@ fn demux_decode_loop(
                     }
                 }
                 DemuxedFrame::H265 { nalus, pts, .. } => {
+                    if pts_jump(last_video_pts, pts) {
+                        if let Some(d) = video_decoder.as_mut() {
+                            d.flush();
+                        }
+                        if let Some(d) = aac_decoder.as_mut() {
+                            d.reset();
+                        }
+                        if let Some(d) = ff_audio_decoder.as_mut() {
+                            d.flush();
+                        }
+                    }
+                    last_video_pts = Some(pts);
                     ensure_video_decoder(
                         &mut video_decoder,
                         &mut current_video_codec,
@@ -447,9 +477,70 @@ fn demux_decode_loop(
                     // `ff_audio_decoder` configured for Opus.
                     let _ = (&mut ff_audio_decoder, &mut current_ff_codec);
                 }
+                DemuxedFrame::OtherAudio { stream_type, data, pts } => {
+                    let codec = match stream_type {
+                        0x03 | 0x04 => AudioDecoderCodec::Mp2,
+                        0x80 | 0x81 | 0xC1 => AudioDecoderCodec::Ac3,
+                        0x87 | 0xC2 => AudioDecoderCodec::Eac3,
+                        _ => continue,
+                    };
+                    if current_ff_codec != Some(codec) {
+                        ff_audio_decoder = FfAudioDecoder::open(codec).ok();
+                        current_ff_codec = Some(codec);
+                    }
+                    if let Some(decoder) = ff_audio_decoder.as_mut() {
+                        for frame_bytes in split_codec_frames(&data, codec) {
+                            if decoder.send_packet(frame_bytes, pts as i64).is_ok() {
+                                while let Ok(decoded) = decoder.receive_frame() {
+                                    let _ = atx.try_send(AudioBlock {
+                                        planar: decoded.planar,
+                                        pts_90k: pts,
+                                        sample_rate: decoded.sample_rate,
+                                        channels: decoded.channels,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
+}
+
+/// Split a concatenated codec-frame buffer on its sync word so each
+/// `avcodec_send_packet` sees exactly one access unit. ffmpeg decodes
+/// only the first AU per packet — feeding the whole PES blob silently
+/// drops every frame past the first.
+fn split_codec_frames(buf: &[u8], codec: AudioDecoderCodec) -> Vec<&[u8]> {
+    if buf.is_empty() {
+        return Vec::new();
+    }
+    let mut starts: Vec<usize> = Vec::with_capacity(8);
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        let matched = match codec {
+            AudioDecoderCodec::Ac3 | AudioDecoderCodec::Eac3 => {
+                buf[i] == 0x0B && buf[i + 1] == 0x77
+            }
+            AudioDecoderCodec::Mp2 => buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0,
+            AudioDecoderCodec::Opus => false,
+        };
+        if matched {
+            starts.push(i);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    let mut out = Vec::with_capacity(starts.len());
+    for w in starts.windows(2) {
+        out.push(&buf[w[0]..w[1]]);
+    }
+    if let Some(&last) = starts.last() {
+        out.push(&buf[last..]);
+    }
+    out
 }
 
 fn aac_decoder_from_adts_config(
@@ -469,6 +560,21 @@ fn ensure_video_decoder(
     }
     *current = Some(desired);
     *slot = VideoDecoder::open(desired).ok();
+}
+
+/// True when `pts` is far enough from `prev` that the upstream stream
+/// almost certainly changed (operator input switch). 90 kHz × 1 s =
+/// 90 000 — a real continuous stream's frame-to-frame delta is well
+/// under that. We also wrap-around-tolerate by computing the minimum of
+/// forward and backward distance, since 33-bit PTS roll-over is a real
+/// stream event we don't want to mistake for a switch.
+fn pts_jump(prev: Option<u64>, pts: u64) -> bool {
+    let Some(p) = prev else {
+        return false;
+    };
+    let forward = pts.wrapping_sub(p);
+    let backward = p.wrapping_sub(pts);
+    forward.min(backward) > 90_000
 }
 
 fn feed_video_decoder(decoder: &mut VideoDecoder, nalus: &[Vec<u8>]) {
@@ -531,7 +637,13 @@ fn display_loop(
     output_id: String,
     meter: Option<SharedMeter>,
 ) {
-    let frame_period_ms_at_60hz: i64 = 16;
+    // Drift threshold = half the source frame period, derived from the
+    // observed PTS deltas. Default to 30 fps until we've seen enough
+    // frames to estimate. The hardcoded 16 ms used to drop ~2 % of 25 fps
+    // frames as "late" because at 25 fps a single frame is 40 ms — well
+    // outside the +/-16 ms window typical PCR-paced sources sit in.
+    let mut frame_period_ms: i64 = 33;
+    let mut last_pts: Option<u64> = None;
     let mut last_frame: Option<VideoFrame> = None;
     let mut stats_registered = false;
     let mut scaler: Option<CachedScaler> = None;
@@ -593,6 +705,28 @@ fn display_loop(
             );
             stats_registered = true;
         }
+        // Track the running source frame period so the drift threshold
+        // adapts to 25 / 30 / 50 / 60 fps content. Frame-to-frame deltas
+        // outside [10, 200] ms are treated as outliers (B-frame reorder,
+        // input-switch boundary, decoder hiccup) and skipped. A delta
+        // beyond 1 s is treated as a stream change — drop the cached
+        // previous frame so the next blit doesn't repeat from the old
+        // source's resolution.
+        if let Some(prev) = last_pts {
+            let forward = next.pts_90k.wrapping_sub(prev) as i64;
+            let backward = (prev.wrapping_sub(next.pts_90k)) as i64;
+            let dms = forward / 90;
+            if forward.unsigned_abs() > 90_000 && backward.unsigned_abs() > 90_000 {
+                last_frame = None;
+                frame_period_ms = 33;
+            } else if (10..=200).contains(&dms) {
+                // Light EMA so a one-off long frame doesn't move the
+                // window. α = 1/8 is plenty for ≤ 60 fps content.
+                frame_period_ms = (frame_period_ms * 7 + dms) / 8;
+            }
+        }
+        last_pts = Some(next.pts_90k);
+
         // Compute drift against the audio clock, dropping frames that
         // fell behind by more than ±half a frame period.
         if let Some(audio_pts) = clock.current_pts_90k() {
@@ -601,11 +735,15 @@ fn display_loop(
             let drift_ms = drift_pts / 90;
             counters.store_av_offset_ms(drift_ms.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
 
-            if drift_ms < -frame_period_ms_at_60hz {
+            // Allow ±one full frame period of drift before dup/dropping
+            // — the PTS-to-audio anchor itself jitters by a sample-quanta
+            // per ALSA period, so half-frame is too aggressive.
+            let drop_threshold = frame_period_ms;
+            if drift_ms < -drop_threshold {
                 counters.frames_dropped_late.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            if drift_ms > frame_period_ms_at_60hz {
+            if drift_ms > drop_threshold {
                 if let Some(prev) = last_frame.as_ref() {
                     if blit_and_present(&mut kms, prev, &mut scaler, meter.as_ref()).is_ok() {
                         counters.frames_repeated.fetch_add(1, Ordering::Relaxed);

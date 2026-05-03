@@ -219,6 +219,21 @@ impl ScaledVideoEncoder {
         self.encoder.is_some()
     }
 
+    /// Update the fps the encoder will be opened with. Only effective
+    /// before the encoder has lazy-opened — once the first frame has
+    /// been encoded, libavcodec's time-base is locked in and changing
+    /// it would invalidate downstream decoders. Callers use this to
+    /// substitute a measured source fps for the placeholder fps the
+    /// pipeline was constructed with.
+    pub fn set_fps_if_unopened(&mut self, fps_num: u32, fps_den: u32) -> bool {
+        if self.encoder.is_some() || fps_num == 0 || fps_den == 0 {
+            return false;
+        }
+        self.fps_num = fps_num;
+        self.fps_den = fps_den;
+        true
+    }
+
     /// Resolved output dimensions. Zero until [`Self::encode`] has been
     /// called at least once.
     pub fn dst_dimensions(&self) -> (u32, u32) {

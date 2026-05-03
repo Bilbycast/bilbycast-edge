@@ -243,6 +243,21 @@ mod inner {
         pts_anchored: bool,
         pts_step_90k: u64,
 
+        /// Last input PES DTS, used to derive the natural source
+        /// inter-frame delta in decode order. DTS stays monotonic
+        /// across the input PES stream even when the source has
+        /// B-frames (PTS reorders, DTS does not), so the delta is
+        /// the source frame rate.
+        last_input_dts: Option<u64>,
+        /// True once we've measured the source fps and pushed it into
+        /// the encoder pipeline (a no-op once the encoder has opened).
+        source_fps_locked: bool,
+        /// PES frames consumed without yet locking the source rate.
+        /// After a hard cap we accept the placeholder rate so a
+        /// pathological source (no DTS, all-zero PTS) can't stall the
+        /// encoder forever.
+        unlocked_pes_count: u32,
+
         description: String,
         stats: Arc<VideoEncodeStats>,
         force_idr: Arc<AtomicBool>,
@@ -299,6 +314,9 @@ mod inner {
                 pts_90k: 0,
                 pts_anchored: false,
                 pts_step_90k: 3000, // 30 fps default until we learn otherwise
+                last_input_dts: None,
+                source_fps_locked: cfg.fps_num.is_some() && cfg.fps_den.is_some(),
+                unlocked_pes_count: 0,
                 description,
                 stats,
                 force_idr,
@@ -326,6 +344,9 @@ mod inner {
             // A/V stays in sync with the audio replacer (which will also
             // re-anchor on the audio-PID codec swap).
             self.pts_anchored = false;
+            self.last_input_dts = None;
+            self.source_fps_locked = self.fps_num.is_some() && self.fps_den.is_some();
+            self.unlocked_pes_count = 0;
             // First post-switch encoded frame must be an IDR so receivers
             // get a clean entry point right at the switch boundary.
             self.force_idr.store(true, Ordering::Relaxed);
@@ -471,7 +492,7 @@ mod inner {
         }
 
         fn consume_pes(&mut self, pes: &[u8], output: &mut Vec<u8>) -> Result<(), ()> {
-            let (es_data, pts) = match extract_pes_video(pes) {
+            let (es_data, pts, pes_dts) = match extract_pes_video(pes) {
                 Some(x) => {
                     self.stats.input_frames.fetch_add(1, Ordering::Relaxed);
                     x
@@ -481,12 +502,51 @@ mod inner {
                     return Err(());
                 }
             };
+            // When source has no DTS (PTS_DTS_flags = 0b10), PTS itself
+            // is monotonic — no B-frame reorder — so use it for the rate
+            // measurement.
+            let pes_dts = pes_dts.or(Some(pts));
             self.pending_pts = Some(pts);
             let pes_arrived_us = crate::util::time::now_us();
 
             if !self.pts_anchored {
                 self.pts_90k = pts;
                 self.pts_anchored = true;
+            }
+
+            // Measure the natural source frame interval from DTS deltas.
+            // DTS is monotonic in the input PES stream even when the
+            // source has B-frames (PTS reorders, DTS does not), so the
+            // first valid delta = the source frame rate. Lock that into
+            // the encoder's fps before it lazy-opens — libavcodec's
+            // time-base is immutable post-open — so the encoded output's
+            // CFR spacing matches the source. Without this, the encoder
+            // ran at a 30 fps default for any source whose rate the
+            // operator didn't pin in `video_encode.fps_num`, which is
+            // what produced the user-visible jitter and frame skipping
+            // on 25 fps and 50 fps DVB feeds.
+            if let Some(dts) = pes_dts {
+                if let Some(prev_dts) = self.last_input_dts {
+                    let delta = dts.wrapping_sub(prev_dts);
+                    if delta >= 90 && delta <= 90_000 {
+                        self.pts_step_90k = delta;
+                        if !self.source_fps_locked {
+                            let fps_num = 90_000u32;
+                            let fps_den = delta as u32;
+                            let locked = self.pipeline.set_fps_if_unopened(fps_num, fps_den);
+                            tracing::info!(
+                                "ts_video_replace: source fps measured {}/{} ({:.3} fps) from DTS delta {} — encoder lock {}",
+                                fps_num,
+                                fps_den,
+                                fps_num as f64 / fps_den as f64,
+                                delta,
+                                if locked { "ACQUIRED" } else { "MISSED (encoder already opened)" },
+                            );
+                            self.source_fps_locked = true;
+                        }
+                    }
+                }
+                self.last_input_dts = Some(dts);
             }
 
             if self.decoder.is_none() {
@@ -514,17 +574,49 @@ mod inner {
                 }
             }
 
-            // Drain every frame the decoder can produce right now.
-            // Refresh the 90 kHz PTS step on every loop iteration — the
-            // pipeline's lazy-open caches the fps it was constructed
-            // with, but we re-derive the step here once we know we're
-            // about to emit output.
-            let (fps_num, fps_den) = match (self.fps_num, self.fps_den) {
-                (Some(n), Some(d)) => (n, d),
-                _ => (30, 1),
-            };
-            self.pts_step_90k = (90_000u64 * fps_den as u64) / fps_num.max(1) as u64;
+            // If the operator pinned an fps in the config, that wins
+            // over the measured delta — keep the step in lock-step
+            // with whatever rate the encoder was opened at. (When the
+            // operator left fps_num/fps_den unset, `pts_step_90k` was
+            // already updated above from the observed source delta.)
+            if let (Some(n), Some(d)) = (self.fps_num, self.fps_den) {
+                self.pts_step_90k = (90_000u64 * d as u64) / (n.max(1) as u64);
+            }
 
+            // Defer the encoder drain until we have either an operator
+            // override or two source DTS samples — the second sample is
+            // what lets us lock libavcodec's time-base before the
+            // encoder lazy-opens (post-open, the time-base is immutable
+            // and we'd be stuck at the 30 fps placeholder forever).
+            // We still pull frames out of the decoder so its DPB doesn't
+            // back up — discarding the first frame or two is fine, the
+            // encoder force-IDR flag (already raised on construction +
+            // every input switch) ensures the first encoded frame at
+            // post-lock time is a clean entry point.
+            if !self.source_fps_locked {
+                self.unlocked_pes_count = self.unlocked_pes_count.saturating_add(1);
+                // Hard fallback: a pathological source with no DTS and
+                // bogus PTS would keep us from ever locking. After 60
+                // PES (~2 s of typical broadcast video) accept the
+                // 30 fps placeholder so the encoder finally opens and
+                // the operator gets visible output instead of silent
+                // black. Logged loudly so the symptom — "30 fps output
+                // for an N fps source" — is searchable in the field.
+                if self.unlocked_pes_count >= 60 {
+                    tracing::warn!(
+                        "ts_video_replace: source rate not measurable from {} input PES (no usable DTS / PTS deltas) — falling back to 30 fps placeholder; output cadence will not track source",
+                        self.unlocked_pes_count,
+                    );
+                    self.source_fps_locked = true;
+                } else {
+                    if let Some(dec) = self.decoder.as_mut() {
+                        while dec.receive_frame().is_ok() {}
+                    }
+                    return Ok(());
+                }
+            }
+
+            // Drain every frame the decoder can produce right now.
             loop {
                 let frame = match self.decoder.as_mut().unwrap().receive_frame() {
                     Ok(f) => f,
@@ -695,7 +787,7 @@ fn rewrite_pmt_video_stream_type(pkt: &mut [u8], video_pid: u16, new_stream_type
 
 /// Extract the ES payload and PTS from a complete PES packet.
 #[cfg(feature = "video-thumbnail")]
-fn extract_pes_video(pes: &[u8]) -> Option<(Vec<u8>, u64)> {
+fn extract_pes_video(pes: &[u8]) -> Option<(Vec<u8>, u64, Option<u64>)> {
     if pes.len() < 9 || pes[0] != 0x00 || pes[1] != 0x00 || pes[2] != 0x01 {
         return None;
     }
@@ -710,7 +802,16 @@ fn extract_pes_video(pes: &[u8]) -> Option<(Vec<u8>, u64)> {
     } else {
         0
     };
-    Some((pes[es_start..].to_vec(), pts))
+    // PTS_DTS_flags == 0b11 means PTS+DTS both present; DTS sits at
+    // bytes 14..19. Otherwise DTS == PTS (monotonic, no B-frames in
+    // source) — return None so the caller doesn't double-count the
+    // single timestamp as both PTS and DTS samples.
+    let dts = if pts_dts_flags == 0b11 && pes.len() >= 19 {
+        Some(parse_pts(&pes[14..19]))
+    } else {
+        None
+    };
+    Some((pes[es_start..].to_vec(), pts, dts))
 }
 
 /// Decode the 5-byte PTS in a PES optional header.

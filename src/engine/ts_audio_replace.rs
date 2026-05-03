@@ -134,6 +134,10 @@ pub struct TsAudioReplacer {
     /// True after codecs are initialised (decoder + encoder both open).
     codecs_ready: bool,
 
+    /// One-shot guard so we only log the "source codec not replaceable"
+    /// warning once per replacer instance, not per PMT.
+    source_replaceable_logged: bool,
+
     /// Optional channel-shuffle / sample-rate transcode block. Applied in
     /// planar PCM form between the AAC decoder and the target encoder.
     /// `None` preserves the pre-transcode behaviour exactly.
@@ -200,6 +204,7 @@ impl TsAudioReplacer {
             resolved_channels: 0,
             resolved_sample_rate: 0,
             codecs_ready: false,
+            source_replaceable_logged: false,
             transcode_cfg: transcode,
             transcoder: None,
         })
@@ -283,21 +288,52 @@ impl TsAudioReplacer {
                         }
                         self.audio_pid = Some(apid);
                         self.source_stream_type = ast;
+                        // The replacer can only decode AAC-LC ADTS today
+                        // (stream_type 0x0F). For any other recognised
+                        // audio stream_type — AC-3 (0x81), MPEG-1/2
+                        // (0x03/0x04), private (0x06) — the decoder bridge
+                        // is not wired in yet, and naively buffering PES
+                        // bytes while `consume_pes` returns Err silently
+                        // drops every audio TS packet from the output. Log
+                        // it loudly the first time and bypass replacement
+                        // so the operator gets working passthrough audio
+                        // until decode support lands.
+                        if !self.source_replaceable_logged && ast != 0x0F {
+                            tracing::warn!(
+                                "ts_audio_replace: source stream_type {:#04x} is not AAC-LC; \
+                                 audio_encode {} can't decode this codec yet — passing audio \
+                                 through unchanged. (Decode support for AC-3 / MPEG / private \
+                                 streams is on the roadmap; until then, drop the `audio_encode` \
+                                 block on this output to encode-passthrough cleanly.)",
+                                ast,
+                                self.codec.as_str(),
+                            );
+                            self.source_replaceable_logged = true;
+                        }
                     }
-                    // Rewrite the stream_type for the audio PID and
-                    // recompute the section CRC. If no audio PID is
-                    // known yet this is a no-op.
-                    let mut rewritten = pkt.to_vec();
-                    if let Some(apid) = self.audio_pid {
-                        rewrite_pmt_audio_stream_type(&mut rewritten, apid, self.target_stream_type);
+                    // Only rewrite the PMT stream_type when we'll actually
+                    // replace the audio bytes downstream. Otherwise the
+                    // PMT would lie about the codec a downstream decoder
+                    // is about to see.
+                    let can_replace = self.source_stream_type == 0x0F;
+                    if can_replace {
+                        let mut rewritten = pkt.to_vec();
+                        if let Some(apid) = self.audio_pid {
+                            rewrite_pmt_audio_stream_type(&mut rewritten, apid, self.target_stream_type);
+                        }
+                        output.extend_from_slice(&rewritten);
+                    } else {
+                        output.extend_from_slice(pkt);
                     }
-                    output.extend_from_slice(&rewritten);
                     continue;
                 }
             }
 
-            // Audio packets: route to the PES accumulator. Do NOT emit.
-            if Some(pid) == self.audio_pid {
+            // Audio packets: route to the PES accumulator only when the
+            // source codec is one we can actually decode. Anything else
+            // falls through to the passthrough branch below — losing the
+            // re-encode is preferable to dropping audio entirely.
+            if Some(pid) == self.audio_pid && self.source_stream_type == 0x0F {
                 self.feed_audio_packet(pkt, output);
                 continue;
             }
@@ -397,6 +433,10 @@ impl TsAudioReplacer {
         self.resolved_channels = 0;
         self.resolved_sample_rate = 0;
         self.codecs_ready = false;
+        // Re-arm the source-not-replaceable warning so an input switch
+        // from AAC → AC-3 surfaces the same message that fired on the
+        // original AC-3 startup.
+        self.source_replaceable_logged = false;
     }
 
     /// Route one audio TS packet into the PES accumulator, flushing the

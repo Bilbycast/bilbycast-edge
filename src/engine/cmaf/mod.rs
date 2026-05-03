@@ -569,6 +569,10 @@ async fn handle_frame(
             handle_audio_frame(state, demuxer, config, &data, pts, event_sender, flow_id);
         }
         DemuxedFrame::Opus => {}
+        // CMAF doesn't transmux MP2 / AC-3 / E-AC-3 today — operators
+        // wanting one of those on a CMAF egress configure
+        // `audio_encode` to AAC / Opus on the output.
+        DemuxedFrame::OtherAudio { .. } => {}
     }
 }
 
