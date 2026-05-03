@@ -4010,14 +4010,26 @@ pub struct DisplayOutputConfig {
     #[serde(default = "default_audio_channel_pair")]
     pub audio_channel_pair: [u8; 2],
 
-    /// Display resolution: either `"auto"` (use the connector's preferred
-    /// mode) or a `"WIDTHxHEIGHT"` string (e.g. `"1920x1080"`). `None`
-    /// is treated as `"auto"`.
+    /// How the display task chooses the connector's KMS mode.
+    /// Default `MatchSource` re-modesets to the smallest mode that
+    /// covers the source's `(width, height)` on every source-shape
+    /// change — best A/V sync, no scaling. `MonitorNative` picks the
+    /// connector's preferred (panel-native) mode once at task startup
+    /// and holds it; libswscale upscales the source to fill it. Pick
+    /// `MonitorNative` for fixed-mode panels (HDCP-locked, signage)
+    /// and most desktop monitors that handle their native mode best.
+    #[serde(default)]
+    pub scaling_mode: DisplayScalingMode,
+
+    /// **Deprecated, ignored at runtime.** Replaced by `scaling_mode`.
+    /// Accepted by the deserializer for backward-compat round-trip on
+    /// existing configs; a load-time `tracing::warn` fires when set.
+    /// Will be removed at the next major bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution: Option<String>,
 
-    /// Refresh rate in Hz (typical: 50, 59, 60). `None` uses the
-    /// connector's preferred mode. Range 1..=240.
+    /// **Deprecated, ignored at runtime.** Same rationale as
+    /// `resolution`. Replaced by `scaling_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_hz: Option<u32>,
 
@@ -4045,9 +4057,92 @@ fn default_sync_mode() -> String {
     "vsync_to_display".to_string()
 }
 
+/// How the display output picks the connector's KMS mode.
+///
+/// `MatchSource` (default) — autodetect on the first decoded frame and
+/// re-modeset whenever the source's `(width, height)` changes; pick the
+/// smallest connector mode that covers the source dims. Tightest A/V
+/// timing, no scaling cost on the renderer.
+///
+/// `MonitorNative` — set the connector's preferred (panel-native) mode
+/// once at task startup and hold it. Source frames are scaled up to fill
+/// the panel via libswscale. Right choice for fixed-mode panels (HDCP,
+/// signage) and most desktop monitors that handle non-native modes
+/// poorly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayScalingMode {
+    #[default]
+    MatchSource,
+    MonitorNative,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `DisplayScalingMode` defaults to `MatchSource` (today's runtime
+    /// behaviour) and serializes snake_case so the JSON wire shape
+    /// matches the manager's validation regex (`match_source` /
+    /// `monitor_native`).
+    #[test]
+    fn display_scaling_mode_default_and_serde_shape() {
+        assert_eq!(DisplayScalingMode::default(), DisplayScalingMode::MatchSource);
+        let s = serde_json::to_string(&DisplayScalingMode::MatchSource).unwrap();
+        assert_eq!(s, "\"match_source\"");
+        let s = serde_json::to_string(&DisplayScalingMode::MonitorNative).unwrap();
+        assert_eq!(s, "\"monitor_native\"");
+        let m: DisplayScalingMode = serde_json::from_str("\"monitor_native\"").unwrap();
+        assert_eq!(m, DisplayScalingMode::MonitorNative);
+    }
+
+    /// A `DisplayOutputConfig` saved by an old edge (with `resolution` +
+    /// `refresh_hz`, no `scaling_mode`) must still deserialize without
+    /// error. The deprecated fields are accepted on the wire and the
+    /// runtime defaults to `MatchSource`. Re-serialization preserves
+    /// them so the round-trip is lossless on old configs (the manager
+    /// UI re-saves them out the next time the operator edits).
+    #[test]
+    fn display_output_config_legacy_fields_round_trip() {
+        let json = r#"{
+            "id": "disp-1",
+            "name": "Green Room HDMI",
+            "active": true,
+            "device": "HDMI-A-1",
+            "audio_device": "hw:0,3",
+            "audio_channel_pair": [0, 1],
+            "resolution": "1920x1080",
+            "refresh_hz": 60,
+            "sync_mode": "vsync_to_display"
+        }"#;
+        let parsed: DisplayOutputConfig = serde_json::from_str(json).expect("parse legacy");
+        assert_eq!(parsed.scaling_mode, DisplayScalingMode::MatchSource);
+        assert_eq!(parsed.resolution.as_deref(), Some("1920x1080"));
+        assert_eq!(parsed.refresh_hz, Some(60));
+        let reser = serde_json::to_string(&parsed).unwrap();
+        assert!(reser.contains("\"scaling_mode\":\"match_source\""));
+        assert!(reser.contains("\"resolution\":\"1920x1080\""));
+    }
+
+    /// New configs that set `scaling_mode` directly round-trip cleanly
+    /// without dragging the deprecated fields along.
+    #[test]
+    fn display_output_config_monitor_native_round_trip() {
+        let json = r#"{
+            "id": "disp-2",
+            "name": "Studio Monitor",
+            "device": "DP-1",
+            "scaling_mode": "monitor_native"
+        }"#;
+        let parsed: DisplayOutputConfig = serde_json::from_str(json).expect("parse monitor-native");
+        assert_eq!(parsed.scaling_mode, DisplayScalingMode::MonitorNative);
+        assert!(parsed.resolution.is_none());
+        assert!(parsed.refresh_hz.is_none());
+        let reser = serde_json::to_string(&parsed).unwrap();
+        assert!(reser.contains("\"scaling_mode\":\"monitor_native\""));
+        assert!(!reser.contains("\"resolution\""));
+        assert!(!reser.contains("\"refresh_hz\""));
+    }
 
     /// The flow-level `assembly` block must round-trip through JSON
     /// without dropping any slot kind — including nested `hitless` pairs

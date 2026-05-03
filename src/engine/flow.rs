@@ -233,6 +233,14 @@ pub struct FlowRuntime {
     /// `HealthPayload.resource_budget.units_used` so the manager UI
     /// can render utilisation against `units_total`.
     pub cost_units: u32,
+    /// Per-family hardware encoder session counts attributable to
+    /// this flow's outputs (one per HW `video_encode` block, summed
+    /// across H.264 + HEVC since they share the engine on every
+    /// supported backend). Snapshotted at start time from the same
+    /// cost plan that produced `cost_units`.
+    /// `FlowManager::total_hw_sessions()` rolls these up into the
+    /// node-level `HealthPayload.resource_budget.hw_session_usage`.
+    pub hw_session_usage: crate::engine::hardware_probe::HwSessionUsage,
 }
 
 /// Runtime state for a single input within a flow.
@@ -902,6 +910,12 @@ impl FlowRuntime {
 
         let cost_plan = derive_cost_plan(&config);
         let cost_units = crate::engine::hardware_probe::compute_flow_cost_units(&cost_plan);
+        let hw_session_usage = crate::engine::hardware_probe::HwSessionUsage {
+            nvenc_in_use: cost_plan.nvenc_sessions,
+            qsv_in_use: cost_plan.qsv_sessions,
+            videotoolbox_in_use: cost_plan.videotoolbox_sessions,
+            amf_in_use: cost_plan.amf_sessions,
+        };
 
         Ok(Self {
             config,
@@ -933,6 +947,7 @@ impl FlowRuntime {
             #[cfg(feature = "replay")]
             replay_command_txs,
             cost_units,
+            hw_session_usage,
         })
     }
 
@@ -940,6 +955,13 @@ impl FlowRuntime {
     /// from the flow's resolved configuration.
     pub fn cost_units(&self) -> u32 {
         self.cost_units
+    }
+
+    /// Per-family hardware encoder session counts contributed by this
+    /// flow. Aggregated across the node by
+    /// [`FlowManager::total_hw_sessions`].
+    pub fn hw_session_usage(&self) -> &crate::engine::hardware_probe::HwSessionUsage {
+        &self.hw_session_usage
     }
 
     /// Phase 7: replace this flow's PID-bus assembly plan in place.
@@ -3335,10 +3357,26 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
             plan.audio_encode_outputs = plan.audio_encode_outputs.saturating_add(1);
         }
         if let Some(codec) = video {
-            if is_hw_video_codec(codec) {
-                plan.hw_video_encode_outputs = plan.hw_video_encode_outputs.saturating_add(1);
-            } else {
-                plan.sw_video_encode_outputs = plan.sw_video_encode_outputs.saturating_add(1);
+            match crate::engine::hardware_probe::HwEncoderFamily::classify(codec) {
+                Some(crate::engine::hardware_probe::HwEncoderFamily::Nvenc) => {
+                    plan.hw_video_encode_outputs = plan.hw_video_encode_outputs.saturating_add(1);
+                    plan.nvenc_sessions = plan.nvenc_sessions.saturating_add(1);
+                }
+                Some(crate::engine::hardware_probe::HwEncoderFamily::Qsv) => {
+                    plan.hw_video_encode_outputs = plan.hw_video_encode_outputs.saturating_add(1);
+                    plan.qsv_sessions = plan.qsv_sessions.saturating_add(1);
+                }
+                Some(crate::engine::hardware_probe::HwEncoderFamily::VideoToolbox) => {
+                    plan.hw_video_encode_outputs = plan.hw_video_encode_outputs.saturating_add(1);
+                    plan.videotoolbox_sessions = plan.videotoolbox_sessions.saturating_add(1);
+                }
+                Some(crate::engine::hardware_probe::HwEncoderFamily::Amf) => {
+                    plan.hw_video_encode_outputs = plan.hw_video_encode_outputs.saturating_add(1);
+                    plan.amf_sessions = plan.amf_sessions.saturating_add(1);
+                }
+                None => {
+                    plan.sw_video_encode_outputs = plan.sw_video_encode_outputs.saturating_add(1);
+                }
             }
         }
         // ST 2110-20/-23 outputs always run a video encoder pipeline
@@ -3372,11 +3410,6 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
         .unwrap_or(false);
 
     plan
-}
-
-fn is_hw_video_codec(codec: &str) -> bool {
-    let c = codec.to_lowercase();
-    c.contains("nvenc") || c.contains("qsv") || c.contains("videotoolbox") || c.contains("amf")
 }
 
 /// Pull the `(audio_encode, video_encode_codec)` pair out of an

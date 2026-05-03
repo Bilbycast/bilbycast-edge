@@ -13,10 +13,16 @@
 //   │                       <video>                           │
 //   │                                                         │
 //   │                                                         │
-//   ├─[PID 0x100  AAC 5.1 ]─[PID 0x101  AC3 5.1]──────────────┤  ← strip
-//   │ █▌▌▌▌▌  green base, yellow >-18dBFS, red >-3dBFS, white │
-//   │ █▌▌▌▌▌  peak-hold tick; one column per audio channel    │
+//   ├──────────[0x100 AAC 2.0]─[0x101 AC3 5.1]────────────────┤  ← strip
+//   │           ▌▌            ▌▌▌▌▌▌  green base, yellow      │
+//   │           ▌▌            ▌▌▌▌▌▌  >-18 dBFS, red >-3,     │
+//   │                                 white peak-hold tick    │
 //   └─────────────────────────────────────────────────────────┘
+//
+// Each PID becomes a fixed-width "block" (capped at BLOCK_MAX_W) and
+// the row of blocks is centred — a single-PID stream lands as a
+// compact strip in the middle of the screen rather than sprawling
+// across the full frame width.
 //
 // All work is CPU. At 1080p the strip is ~130 px tall × 1920 px wide ×
 // 4 B = ~1 MB per present. Negligible on any host that already runs
@@ -174,12 +180,15 @@ fn amp_to_dbfs(amp: f32) -> f32 {
 // ── Rasteriser ────────────────────────────────────────────────────
 
 const BAR_GAP_PX: u32 = 2;
-const BLOCK_GAP_PX: u32 = 8;
+const BAR_MAX_W: u32 = 28;
+const BLOCK_GAP_PX: u32 = 12;
+const BLOCK_MIN_W: u32 = 48;
+const BLOCK_MAX_W: u32 = 240;
 const SIDE_MARGIN_PX: u32 = 12;
 const LABEL_HEIGHT_PX: u32 = 12; // 5×7 font scaled 1.5×
-const STRIP_PCT: u32 = 12;
-const STRIP_MIN_PX: u32 = 96;
-const STRIP_MAX_PX: u32 = 200;
+const STRIP_PCT: u32 = 9;
+const STRIP_MIN_PX: u32 = 80;
+const STRIP_MAX_PX: u32 = 140;
 
 /// Rasterise the meter strip onto the bottom of a packed BGRA buffer.
 /// `dst_pitch` is bytes per row (≥ `dst_w * 4`). Writes nothing when the
@@ -195,17 +204,24 @@ pub fn rasterise(snapshot: &MeterSnapshot, dst: &mut [u8], dst_pitch: usize, dst
     // 1. Translucent black background under the strip (alpha-blend ~50 %).
     blend_strip_background(dst, dst_pitch, dst_w, strip_top, strip_h);
 
-    // 2. Per-PID block layout.
+    // 2. Per-PID block layout. Each block is sized just wide enough for
+    //    its label + bars (capped at BLOCK_MAX_W so a single-PID stream
+    //    doesn't sprawl across the whole screen). The row of blocks is
+    //    centred horizontally so the strip looks like a confidence
+    //    meter rather than a left-aligned monolith.
     let pid_count = snapshot.per_pid.len() as u32;
     let usable_w = dst_w.saturating_sub(SIDE_MARGIN_PX * 2);
     let total_gaps = BLOCK_GAP_PX * pid_count.saturating_sub(1);
     if usable_w <= total_gaps {
         return;
     }
-    let block_w = (usable_w - total_gaps) / pid_count;
-    if block_w < 24 {
+    let auto_block_w = (usable_w - total_gaps) / pid_count;
+    let block_w = auto_block_w.clamp(BLOCK_MIN_W, BLOCK_MAX_W);
+    if block_w < BLOCK_MIN_W {
         return;
     }
+    let total_used = block_w * pid_count + total_gaps;
+    let strip_left = SIDE_MARGIN_PX + usable_w.saturating_sub(total_used) / 2;
     let bars_top = strip_top + LABEL_HEIGHT_PX + 2;
     let bars_h = strip_h.saturating_sub(LABEL_HEIGHT_PX + 4);
     if bars_h < 16 {
@@ -214,11 +230,14 @@ pub fn rasterise(snapshot: &MeterSnapshot, dst: &mut [u8], dst_pitch: usize, dst
 
     let now = Instant::now();
     for (i, pid) in snapshot.per_pid.iter().enumerate() {
-        let block_x = SIDE_MARGIN_PX + (block_w + BLOCK_GAP_PX) * (i as u32);
+        let block_x = strip_left + (block_w + BLOCK_GAP_PX) * (i as u32);
 
-        // Label row: "PID 0xNNN  CODEC  X.Y"
+        // Label row: "0xNNN CODEC X.Y" — short enough to fit the
+        // capped block width even at scale-2 of the 5×7 font.
         let label = format_pid_label(pid);
-        draw_text(dst, dst_pitch, dst_w, dst_h, block_x + 2, strip_top + 2, &label, 0xE0, 0xE0, 0xE0);
+        let label_px = label_pixel_width(&label);
+        let label_x = block_x + block_w.saturating_sub(label_px) / 2;
+        draw_text(dst, dst_pitch, dst_w, dst_h, label_x, strip_top + 2, &label, 0xE0, 0xE0, 0xE0);
 
         // Channels.
         let ch_count = pid.channels.len() as u32;
@@ -230,12 +249,17 @@ pub fn rasterise(snapshot: &MeterSnapshot, dst: &mut [u8], dst_pitch: usize, dst
         if inner_w <= ch_total_gaps {
             continue;
         }
-        let bar_w = (inner_w - ch_total_gaps) / ch_count;
+        let auto_bar_w = (inner_w - ch_total_gaps) / ch_count;
+        let bar_w = auto_bar_w.min(BAR_MAX_W);
         if bar_w == 0 {
             continue;
         }
+        // Centre the bars horizontally inside the block so the unused
+        // slack (when bar_w is capped) sits evenly on either side.
+        let bars_total_w = bar_w * ch_count + ch_total_gaps;
+        let bars_x_start = block_x + block_w.saturating_sub(bars_total_w) / 2;
         for (ch_idx, ch) in pid.channels.iter().enumerate() {
-            let bar_x = block_x + 2 + (bar_w + BAR_GAP_PX) * (ch_idx as u32);
+            let bar_x = bars_x_start + (bar_w + BAR_GAP_PX) * (ch_idx as u32);
             draw_channel_bar(
                 dst, dst_pitch, dst_w, dst_h, bar_x, bars_top, bar_w, bars_h, ch, now,
             );
@@ -243,15 +267,29 @@ pub fn rasterise(snapshot: &MeterSnapshot, dst: &mut [u8], dst_pitch: usize, dst
     }
 }
 
+/// Pixel width of `text` rendered by [`draw_text`], at the same 5×7-
+/// font scale and inter-glyph padding the rasteriser uses. Each glyph
+/// occupies `5 * scale` pixels and is followed by `scale` pixels of
+/// padding; the trailing padding is included so a label that exactly
+/// fills the block doesn't have its rightmost glyph clipped.
+fn label_pixel_width(text: &str) -> u32 {
+    const SCALE: u32 = 2;
+    const GLYPH_W: u32 = 5 * SCALE;
+    let n = text.chars().count() as u32;
+    n * (GLYPH_W + SCALE)
+}
+
 fn format_pid_label(pid: &PidMeter) -> String {
     let ch_label = match pid.channels.len() {
-        1 => "MONO".to_string(),
-        2 => "STEREO".to_string(),
+        1 => "1.0".to_string(),
+        2 => "2.0".to_string(),
         6 => "5.1".to_string(),
         8 => "7.1".to_string(),
         n => format!("{n}CH"),
     };
-    format!("PID 0x{:X}  {}  {}", pid.pid, pid.codec_label, ch_label)
+    // Compact "0xNNN CODEC X.Y" — fits the capped block width
+    // (BLOCK_MAX_W = 240 px) at the rasteriser's 5×7 font scale.
+    format!("0x{:X} {} {}", pid.pid, pid.codec_label, ch_label)
 }
 
 fn draw_channel_bar(

@@ -410,6 +410,16 @@ can grep on a stable string.
 
 Requires `resource_limits` config block. When `critical_action` is `"gate_flows"`, new flow creation is rejected while any metric is in the critical state. Events fire on state transitions with a configurable grace period (default 10 seconds) to avoid flapping.
 
+#### HW encoder oversubscription
+
+| Severity | Message | Trigger |
+|----------|---------|---------|
+| warning | Flow '{id}' caused {family} encoder oversubscription: {in_use} sessions in use, {max} probed at startup. Reduce HW transcodes or restart on a host with more capacity. | A new flow's HW `video_encode` outputs push the per-family in-use count above the startup-probed `max_sessions`. Soft warning only — the flow still starts. |
+
+**Details**: `{ error_code: "hw_encoder_oversubscribed", family: "nvenc"|"qsv"|"amf", role: "encoder", in_use: u32, max_sessions: u32, flow_id }`
+
+**Source**: `src/engine/manager.rs::create_flow` → `emit_hw_oversubscribe_warnings`. The probed-max-sessions number comes from `engine::hardware_probe::probe_encoder_session_limits` at startup (capped at 8; see [`docs/configuration-guide.md`](configuration-guide.md#capacity--resource-budget) and the `BILBYCAST_PROBE_SESSION_LIMITS=0` opt-out). Soft warning matches the existing modal `updateResourceImpact` 80/100 % units pattern — the alarm tells the operator to fix it without blocking flow creation.
+
 ---
 
 ## Manager-Generated Events
@@ -614,6 +624,10 @@ the offending output row on a multi-output flow.
 |---|---|---|---|
 | `display_started` | Info | Modeset succeeded, ALSA opened (or muted), first frame queued | `details = { error_code: "ok", output_id, … }` |
 | `display_stopped` | Info | Cancellation token fired; CRTC + framebuffers + ALSA released | Includes lifetime `frames_displayed` / `late_drops` / `audio_underruns` |
+| `display_auto_matched` | Info | `scaling_mode: match_source` modeset to the source-covering mode succeeded | Fires on first decoded frame and again on every source-shape change |
+| `display_auto_match_failed` | Warning | `scaling_mode: match_source` modeset rejected by KMS — output keeps running at the startup mode | Lifts whatever `display_*` error string KMS returned |
+| `display_monitor_native_set` | Info | `scaling_mode: monitor_native` modeset to the connector-preferred (panel-native) mode succeeded | Fires once per output start; usually a no-op since KMS opened at preferred |
+| `display_monitor_native_set_failed` | Warning | `scaling_mode: monitor_native` modeset rejected by KMS — output keeps running at the startup mode | Same shape as `display_auto_match_failed` |
 | `display_device_unavailable` | Critical | KMS connector vanished mid-flow (cable unplug observed via udev or `drmModeGetConnector` `connection != connected`) | Surfaces `error_code: display_device_unavailable` |
 | `display_mode_set_failed` | Critical | `drmModeSetCrtc` returned `EINVAL` / `ENOSPC` for the chosen resolution / refresh | `error_code: display_resolution_unsupported` or `display_mode_set_failed` |
 | `display_audio_open_failed` | Critical | `snd_pcm_open` returned non-zero, or ALSA `writei` returned `ENODEV` mid-stream | `error_code: display_audio_device_invalid` / `display_audio_open_failed` |

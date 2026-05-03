@@ -311,6 +311,7 @@ async fn main() -> anyhow::Result<()> {
         event_sender.clone(),
         resource_state.clone(),
         resource_action,
+        Some(static_capabilities.clone()),
     ));
     let tunnel_manager = Arc::new(TunnelManager::new(event_sender.clone()));
     let standby_listeners = Arc::new(

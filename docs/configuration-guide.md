@@ -1381,8 +1381,7 @@ output.
   "program_number": null,
   "audio_track_index": 0,
   "audio_channel_pair": [0, 1],
-  "resolution": "1920x1080",
-  "refresh_hz": 60,
+  "scaling_mode": "match_source",
   "sync_mode": "vsync_to_display",
   "show_audio_bars": true
 }
@@ -1396,7 +1395,12 @@ output.
   `default` / `sysdefault` / `pulse`). `null` mutes audio playback —
   the output renders video only. The manager UI populates this from
   the connector's enumerated `alsa_device` field; operators can
-  override.
+  override. Audio sample rate and channel count adapt per-frame to
+  whatever the source decoder reports — AAC / MP2 / AC-3 / E-AC-3 at
+  any rate the device's plug layer supports works without further
+  configuration. Use `plughw:N,M` (not raw `hw:`) when your sink only
+  speaks 48 kHz but the source might carry 44.1 / 32 / 96 kHz audio
+  so ALSA's automatic resampler engages.
 - **`program_number`** — MPTS program filter (1-based). `null` selects
   the lowest program in the active input's PAT.
 - **`audio_track_index`** — 0-based index into the program's audio
@@ -1405,10 +1409,14 @@ output.
 - **`audio_channel_pair`** — which two channels of the decoded
   multichannel audio drive the stereo ALSA sink. Default `[0, 1]` =
   L/R. Both indices must be `< 8` and not equal.
-- **`resolution`** — `"auto"` (use the connector's preferred mode) or
-  `"WIDTHxHEIGHT"` (e.g. `"1920x1080"`, `"3840x2160"`). `null` ≡ auto.
-- **`refresh_hz`** — `1..=240`. `null` uses the connector's preferred
-  refresh.
+- **`scaling_mode`** — `"match_source"` (default) or `"monitor_native"`.
+  `match_source` re-modesets the panel to the smallest connector mode
+  that covers the source's `(width, height)` on the first decoded frame
+  (and again on any source-shape change) — no scaling cost, tightest
+  A/V timing. `monitor_native` holds the panel at its EDID-preferred
+  mode and upscales the source via libswscale — the right pick for
+  fixed-mode panels (HDCP-locked displays, signage) and most desktop
+  monitors that handle their native mode best.
 - **`sync_mode`** — only `"vsync_to_display"` in v1: the renderer
   paces to monitor vsync and dup/drops video to track the audio
   master clock. PTP-genlocked / PCR-master modes land in v2.
@@ -1431,6 +1439,33 @@ manager UI can highlight the offending field. Install:
 sudo apt install libasound2-dev
 cargo build --release --features display
 ```
+
+**Mode selection.** Driven by `scaling_mode`:
+
+- **`match_source`** (default). The display task opens the connector
+  at its preferred mode, then re-modesets to the smallest connector
+  mode whose dimensions are both ≥ source on the first decoded frame.
+  A 1080p source on a 4K panel lands at 1080p (no CPU upscale spike),
+  a 720p source lands at 720p. Refresh rate stays at the panel's
+  preferred / native rate — desktop monitors that advertise low-rate
+  EDID modes (24 / 25 / 30 Hz) typically can't drive them without
+  flicker or sync loss, so we don't switch into them. The audio-master
+  dup/drop logic in the display loop handles the source-fps-vs-panel-
+  refresh cadence (every consumer media player on a 60 Hz monitor does
+  it the same way). Mid-stream resolution changes and operator input
+  switches re-arm the autodetect.
+- **`monitor_native`**. The display task opens the connector at its
+  preferred (panel-native) mode and **holds it** for the lifetime of
+  the output. Source frames are upscaled to fill the panel via
+  libswscale. Pick this on fixed-mode panels (HDCP-locked, signage)
+  and most desktop monitors — modern panels handle their native mode
+  significantly better than non-native ones (no scaler ghosting, no
+  EDID-mode flicker). Cost: one libswscale upscale per frame in the
+  display task; negligible at typical 1080p → 4K ratios.
+
+The deprecated config fields `resolution` / `refresh_hz` are accepted
+by the deserializer for backward-compat round-trip but ignored at
+runtime — re-save the output via the manager UI to drop them.
 
 **Codec coverage.** Video: H.264 + HEVC (software decode via
 libavcodec — same backend as content-analysis). Audio: AAC family

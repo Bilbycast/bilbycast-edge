@@ -47,6 +47,11 @@ pub struct FlowManager {
     resource_state: Arc<SystemResourceState>,
     /// Action to take when resources are critical. `None` or `Alarm` = no gating.
     resource_action: Option<ResourceLimitAction>,
+    /// Static hardware capabilities — read for HW-encoder oversubscription
+    /// checks at flow start. `None` on builds where the probe didn't run
+    /// (legacy startup paths / tests). Soft warning only, never blocks
+    /// flow creation.
+    static_caps: Option<Arc<crate::engine::hardware_probe::StaticCapabilities>>,
 }
 
 impl FlowManager {
@@ -61,6 +66,7 @@ impl FlowManager {
         event_sender: EventSender,
         resource_state: Arc<SystemResourceState>,
         resource_action: Option<ResourceLimitAction>,
+        static_caps: Option<Arc<crate::engine::hardware_probe::StaticCapabilities>>,
     ) -> Self {
         Self {
             flows: DashMap::new(),
@@ -69,6 +75,7 @@ impl FlowManager {
             event_sender,
             resource_state,
             resource_action,
+            static_caps,
         }
     }
 
@@ -100,6 +107,26 @@ impl FlowManager {
     /// manager UI can render `units_used / units_total` percentage.
     pub fn total_cost_units(&self) -> u32 {
         self.flows.iter().map(|r| r.value().cost_units()).sum()
+    }
+
+    /// Sum the per-flow hardware-encoder session usage across every
+    /// running flow, returning the per-family `HwSessionUsage` block
+    /// the manager attaches to `HealthPayload.resource_budget`.
+    /// Pairs with the static `hw_session_limits` probe so the manager
+    /// UI can render `nvenc_in_use / nvenc_max_sessions` chips and
+    /// alarm when usage exceeds capacity.
+    pub fn total_hw_sessions(&self) -> crate::engine::hardware_probe::HwSessionUsage {
+        let mut acc = crate::engine::hardware_probe::HwSessionUsage::default();
+        for entry in self.flows.iter() {
+            let f = entry.value().hw_session_usage();
+            acc.nvenc_in_use = acc.nvenc_in_use.saturating_add(f.nvenc_in_use);
+            acc.qsv_in_use = acc.qsv_in_use.saturating_add(f.qsv_in_use);
+            acc.videotoolbox_in_use = acc
+                .videotoolbox_in_use
+                .saturating_add(f.videotoolbox_in_use);
+            acc.amf_in_use = acc.amf_in_use.saturating_add(f.amf_in_use);
+        }
+        acc
     }
 
     /// Check if a flow is currently running
@@ -163,6 +190,12 @@ impl FlowManager {
                     format!("Flow '{}' started", flow_id),
                     &flow_id,
                 );
+                // HW-encoder oversubscribe check — soft warning only.
+                // Runs after the flow joins `self.flows` so
+                // `total_hw_sessions()` includes its contribution. We
+                // never block the create on this; the alarm just
+                // tells the operator to re-plan their HW assignments.
+                self.emit_hw_oversubscribe_warnings(&flow_id);
                 Ok(runtime)
             }
             Err(e) => {
@@ -173,6 +206,59 @@ impl FlowManager {
                     &flow_id,
                 );
                 Err(e)
+            }
+        }
+    }
+
+    /// Compare the live per-family HW encoder session usage against the
+    /// startup-probed limits, emitting one Warning event per family
+    /// that exceeds capacity. Each event carries
+    /// `error_code: hw_encoder_oversubscribed` plus structured
+    /// `details` (family / in_use / max_sessions) so the manager UI
+    /// can highlight the right family without parsing free-text.
+    /// No-op when no static capabilities snapshot was attached or when
+    /// no family was probed.
+    fn emit_hw_oversubscribe_warnings(&self, flow_id: &str) {
+        let Some(caps) = self.static_caps.as_ref() else {
+            return;
+        };
+        let limits = &caps.hw_encoder_session_limits;
+        if limits.is_empty() {
+            return;
+        }
+        let usage = self.total_hw_sessions();
+        let checks: [(
+            Option<u32>,
+            u32,
+            &'static str,
+        ); 3] = [
+            (limits.nvenc_max_sessions, usage.nvenc_in_use, "nvenc"),
+            (limits.qsv_max_sessions, usage.qsv_in_use, "qsv"),
+            (limits.amf_max_sessions, usage.amf_in_use, "amf"),
+        ];
+        for (max, in_use, family) in checks {
+            if let Some(max) = max {
+                if in_use > max {
+                    let msg = format!(
+                        "Flow '{flow_id}' caused {family} encoder oversubscription: \
+                        {in_use} sessions in use, {max} probed at startup. \
+                        Reduce HW transcodes or restart on a host with more capacity."
+                    );
+                    self.event_sender.emit_flow_with_details(
+                        EventSeverity::Warning,
+                        category::SYSTEM_RESOURCES,
+                        msg,
+                        flow_id,
+                        serde_json::json!({
+                            "error_code": "hw_encoder_oversubscribed",
+                            "family": family,
+                            "role": "encoder",
+                            "in_use": in_use,
+                            "max_sessions": max,
+                            "flow_id": flow_id,
+                        }),
+                    );
+                }
             }
         }
     }

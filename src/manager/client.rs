@@ -849,16 +849,44 @@ fn build_resource_budget_payload(
 ) -> serde_json::Value {
     let units_total = crate::engine::hardware_probe::compute_units_total(&static_caps.cpu);
     let units_used = flow_manager.total_cost_units();
+    let hw_session_usage = flow_manager.total_hw_sessions();
     let live = live_gpu.snapshot();
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "hw_encoders": static_caps.hw_encoders,
         "hw_decoders": static_caps.hw_decoders,
         "cpu": static_caps.cpu,
         "sw_capacity": static_caps.sw_capacity,
         "units_total": units_total,
         "units_used": units_used,
+        "hw_session_usage": hw_session_usage,
         "live": live,
-    })
+    });
+    // Per-family session limits — additive on the wire; older managers
+    // ignore unknown fields. Only emit when at least one family was
+    // probed so we don't waste 18 bytes of `{}` per health tick on
+    // hosts that have no HW accelerators or where probing was disabled.
+    if !static_caps.hw_encoder_session_limits.is_empty() {
+        if let Ok(v) = serde_json::to_value(&static_caps.hw_encoder_session_limits) {
+            payload
+                .as_object_mut()
+                .map(|o| o.insert("hw_encoder_session_limits".into(), v));
+        }
+    }
+    if !static_caps.hw_decoder_session_limits.is_empty() {
+        if let Ok(v) = serde_json::to_value(&static_caps.hw_decoder_session_limits) {
+            payload
+                .as_object_mut()
+                .map(|o| o.insert("hw_decoder_session_limits".into(), v));
+        }
+    }
+    if !static_caps.hw_encoder_chroma.is_empty() {
+        if let Ok(v) = serde_json::to_value(&static_caps.hw_encoder_chroma) {
+            payload
+                .as_object_mut()
+                .map(|o| o.insert("hw_encoder_chroma".into(), v));
+        }
+    }
+    payload
 }
 
 /// Return the list of capability strings advertised by this build.

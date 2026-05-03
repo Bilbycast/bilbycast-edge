@@ -277,6 +277,16 @@ impl MeterPidState {
 
     fn observe_ts(&mut self, pusi: bool, ts_payload: &[u8], snapshot: &SharedMeter) {
         if pusi {
+            // The next PES is starting — drain whatever the previous PES
+            // accumulated. MP2 / AC-3 / E-AC-3 frames routinely span
+            // multiple TS packets, so per-packet draining (the old
+            // behaviour) would feed the FFmpeg decoder a 178-byte
+            // fragment and silently throw away every continuation
+            // packet. Draining on the PUSI boundary guarantees the
+            // decoder sees complete frames.
+            if self.capturing_pes && !self.pes_buf.is_empty() {
+                self.drain(snapshot);
+            }
             let start = pes_payload_offset(ts_payload);
             self.pes_buf.clear();
             self.capturing_pes = true;
@@ -289,9 +299,11 @@ impl MeterPidState {
                 // Runaway buffer: drop and resync on next PUSI.
                 self.pes_buf.clear();
                 self.capturing_pes = false;
-                return;
             }
         }
+    }
+
+    fn drain(&mut self, snapshot: &SharedMeter) {
         match self.stream_type {
             0x0F | 0x11 => self.drain_aac(snapshot),
             0x03 | 0x04 | 0x80 | 0x81 | 0x82 | 0x83 | 0x84 | 0x85 | 0x87 | 0x88 | 0x8A
@@ -358,11 +370,7 @@ impl MeterPidState {
         if self.ff_decoder.is_none() {
             match FfAudioDecoder::open(codec) {
                 Ok(d) => self.ff_decoder = Some(d),
-                Err(_) => {
-                    self.pes_buf.clear();
-                    self.capturing_pes = false;
-                    return;
-                }
+                Err(_) => return,
             }
         }
         let Some(ref mut dec) = self.ff_decoder else {
@@ -381,9 +389,9 @@ impl MeterPidState {
                 }
             }
         }
-        // Whether the send succeeded or not, this PES is consumed.
-        self.pes_buf.clear();
-        self.capturing_pes = false;
+        // pes_buf is cleared by the caller (`observe_ts` on the next
+        // PUSI). Don't reset state here — it would discard continuation
+        // packets and starve the decoder.
     }
 }
 

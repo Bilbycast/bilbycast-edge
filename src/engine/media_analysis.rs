@@ -1016,10 +1016,10 @@ fn parse_h264_sps(data: &[u8]) -> Option<SpsInfo> {
         let seq_scaling_matrix_present = reader.read_bits(1)?;
         if seq_scaling_matrix_present == 1 {
             let count = if chroma_format_idc != 3 { 8 } else { 12 };
-            for _ in 0..count {
+            for i in 0..count {
                 let present = reader.read_bits(1)?;
                 if present == 1 {
-                    skip_scaling_list(&mut reader, if count <= 6 { 16 } else { 64 })?;
+                    skip_scaling_list(&mut reader, if i < 6 { 16 } else { 64 })?;
                 }
             }
         }

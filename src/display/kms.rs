@@ -330,20 +330,29 @@ impl KmsDisplay {
         self.mode.vrefresh() as u32
     }
 
-    /// Re-program the connector to the smallest available mode whose
-    /// dimensions are at least `(src_w, src_h)`. Used by the `auto`
-    /// resolution path once the first decoded frame reveals the source
-    /// flow's true size — picking the monitor's preferred mode on a 4K
-    /// panel for a 1080p source is what produced the jitter the user
-    /// reported. Drops + re-allocates the dumb-buffer pair if the new
-    /// mode size differs. No-op when the new mode is identical to the
-    /// current one.
+    /// Re-program the connector to the best mode covering source dims
+    /// `(src_w, src_h)`. Refresh rate is **not** part of the match —
+    /// most desktop panels list low-refresh EDID modes (24 / 25 / 30 Hz)
+    /// for compatibility but actually drive them with backlight flicker
+    /// or sync loss. The audio-master dup/drop logic in the display
+    /// loop handles the source-fps-vs-panel-refresh cadence cleanly,
+    /// the way every consumer media player does on a 60 Hz monitor.
+    ///
+    /// Strategy:
+    /// 1. Smallest mode whose dims are both ≥ source — avoids the 4K
+    ///    upscale CPU spike when a 1080p source lands on a 4K panel.
+    /// 2. Tie-break on highest refresh (the panel's preferred / native
+    ///    rate is what works without flicker on real hardware).
+    /// 3. If every mode is smaller than the source, pick the largest.
+    ///
+    /// Drops + re-allocates the dumb-buffer pair if the new mode size
+    /// differs. No-op when the new mode is identical to the current one.
     pub fn match_source_resolution(&mut self, src_w: u32, src_h: u32) -> Result<()> {
         let info = self
             .card
             .get_connector(self.connector, true)
             .context("get_connector for auto-match")?;
-        let new_mode = pick_mode_for_source(&info, src_w, src_h)?;
+        let new_mode = pick_mode_for_source_dims_only(&info, src_w, src_h)?;
         let (new_w_i16, new_h_i16) = new_mode.size();
         let new_w = new_w_i16 as u32;
         let new_h = new_h_i16 as u32;
@@ -379,6 +388,67 @@ impl KmsDisplay {
                 Some(new_mode),
             )
             .context("display_mode_set_failed: auto-match re-modeset")?;
+        let old_bufs = std::mem::replace(&mut self.bufs, [new_a, new_b]);
+        for old in old_bufs {
+            let _ = self.card.destroy_framebuffer(old.fb);
+            let _ = self.card.destroy_dumb_buffer(old.handle);
+        }
+        self.mode = new_mode;
+        self.width = new_w;
+        self.height = new_h;
+        self.front_idx = 0;
+        Ok(())
+    }
+
+    /// Re-program the connector to its preferred (panel-native) mode.
+    /// Used by the `MonitorNative` scaling mode at display-task startup
+    /// to hold the panel at its EDID-preferred resolution / refresh and
+    /// rely on libswscale to upscale source frames into the dumb buffer.
+    ///
+    /// Falls back to the first listed mode when EDID has no PREFERRED
+    /// flag — pure-OSS amdgpu / nouveau builds and some captured EDIDs
+    /// in the wild leave it unset.
+    ///
+    /// Drops + re-allocates the dumb-buffer pair if the new mode size
+    /// differs from the current one. No-op when identical.
+    pub fn set_monitor_native_mode(&mut self) -> Result<()> {
+        let info = self
+            .card
+            .get_connector(self.connector, true)
+            .context("get_connector for monitor-native")?;
+        let new_mode = pick_preferred_mode(&info);
+        let (new_w_i16, new_h_i16) = new_mode.size();
+        let new_w = new_w_i16 as u32;
+        let new_h = new_h_i16 as u32;
+        let same_size = new_w == self.width && new_h == self.height;
+        let same_rate = new_mode.vrefresh() as u32 == self.mode.vrefresh() as u32;
+        if same_size && same_rate {
+            return Ok(());
+        }
+        if same_size {
+            self.card
+                .set_crtc(
+                    self.crtc,
+                    Some(self.bufs[self.front_idx].fb),
+                    (0, 0),
+                    &[self.connector],
+                    Some(new_mode),
+                )
+                .context("display_mode_set_failed: monitor-native refresh re-modeset")?;
+            self.mode = new_mode;
+            return Ok(());
+        }
+        let new_a = alloc_dumb_buffer(&self.card, new_w, new_h)?;
+        let new_b = alloc_dumb_buffer(&self.card, new_w, new_h)?;
+        self.card
+            .set_crtc(
+                self.crtc,
+                Some(new_a.fb),
+                (0, 0),
+                &[self.connector],
+                Some(new_mode),
+            )
+            .context("display_mode_set_failed: monitor-native re-modeset")?;
         let old_bufs = std::mem::replace(&mut self.bufs, [new_a, new_b]);
         for old in old_bufs {
             let _ = self.card.destroy_framebuffer(old.fb);
@@ -494,27 +564,33 @@ fn pick_mode(
             return Ok(**m);
         }
     }
-    // 3. Connector-preferred mode.
+    // 3. Connector-preferred (panel-native) mode, then first-listed.
+    Ok(pick_preferred_mode(info))
+}
+
+/// Return the connector's preferred (panel-native) mode if EDID flagged
+/// one, otherwise the first mode the connector reports. Both branches are
+/// safe to call only after the caller has already verified `info.modes()`
+/// is non-empty (see `pick_mode` / `pick_mode_for_source_dims_only`).
+fn pick_preferred_mode(info: &drm::control::connector::Info) -> drm::control::Mode {
+    let modes = info.modes();
     if let Some(m) = modes.iter().find(|m| {
         (m.mode_type() & drm::control::ModeTypeFlags::PREFERRED)
             == drm::control::ModeTypeFlags::PREFERRED
     }) {
-        return Ok(*m);
+        return *m;
     }
-    // 4. Fall back to the first listed mode.
-    Ok(modes[0])
+    modes[0]
 }
 
-/// Pick the best mode for an `auto`-resolution display output once the
-/// first decoded frame reveals the source's `(src_w, src_h)`.
+/// Pick the smallest connector mode whose dims are both ≥ source
+/// `(src_w, src_h)`. Tie-break on highest refresh (panel-native is
+/// what works without flicker). Falls back to the largest available
+/// mode when every mode is smaller than the source.
 ///
-/// Strategy:
-/// 1. Exact match on `(src_w, src_h)` — pick the highest-refresh option.
-/// 2. Otherwise, the smallest mode whose dimensions are both ≥ source —
-///    avoids a CPU upscale to the monitor's native (4K) preferred mode
-///    when the flow is 1080p, which is the jitter case the user hit.
-/// 3. If every mode is smaller than the source, the largest available.
-fn pick_mode_for_source(
+/// We deliberately do **not** match refresh against source fps —
+/// see `KmsDisplay::match_source_resolution` for the rationale.
+fn pick_mode_for_source_dims_only(
     info: &drm::control::connector::Info,
     src_w: u32,
     src_h: u32,
@@ -591,3 +667,4 @@ fn locate_connector(name: &str) -> Result<(PathBuf, drm::control::connector::Han
 fn _atomic_flags_check() -> AtomicCommitFlags {
     AtomicCommitFlags::ALLOW_MODESET
 }
+

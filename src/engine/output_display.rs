@@ -46,7 +46,7 @@ use video_engine::{
     AudioDecoder as FfAudioDecoder, ScalerDstFormat, VideoCodec, VideoDecoder, VideoScaler,
 };
 
-use crate::config::models::DisplayOutputConfig;
+use crate::config::models::{DisplayOutputConfig, DisplayScalingMode};
 use crate::display::audio_bars::{new_shared_meter, MeterSnapshot, SharedMeter};
 use crate::display::audio_meter::spawn_audio_meter;
 use crate::display::{audio::AudioBackend, clock::AudioClock, kms::KmsDisplay};
@@ -99,14 +99,20 @@ async fn run_display_output(
     event_sender: EventSender,
     flow_id: String,
 ) -> Result<()> {
-    // 1. Open KMS first so we fail fast with `display_device_invalid` /
-    //    `display_resolution_unsupported` / `display_mode_set_failed`
-    //    before doing any other work.
-    let (req_w, req_h, is_auto_resolution) = parse_resolution(config.resolution.as_deref());
+    // 1. Open KMS at the connector's preferred mode. The actual mode the
+    //    panel runs at is decided by `config.scaling_mode`:
+    //    - `MatchSource` (default): the display loop re-modesets to the
+    //      smallest mode covering the source on the first decoded frame
+    //      (and again whenever the source dims change).
+    //    - `MonitorNative`: the display loop holds the panel at the
+    //      preferred mode opened here and lets libswscale upscale the
+    //      source.
+    //    The deprecated `config.resolution` / `config.refresh_hz` are
+    //    accepted by the deserializer for backward-compat round-trip but
+    //    no longer drive the mode-set.
     let kms = match tokio::task::spawn_blocking({
         let device = config.device.clone();
-        let refresh = config.refresh_hz;
-        move || KmsDisplay::open(&device, req_w, req_h, refresh)
+        move || KmsDisplay::open(&device, None, None, None)
     })
     .await
     .map_err(|e| anyhow::anyhow!("kms join: {e}"))?
@@ -142,6 +148,10 @@ async fn run_display_output(
         "unknown"
     };
 
+    let scaling_label = match config.scaling_mode {
+        DisplayScalingMode::MatchSource => "auto-match pending first frames",
+        DisplayScalingMode::MonitorNative => "monitor-native, source scaled to panel",
+    };
     emit_event(
         &event_sender,
         EventSeverity::Info,
@@ -149,15 +159,11 @@ async fn run_display_output(
         &flow_id,
         &config.id,
         &format!(
-            "display started on {} ({}@{}Hz{}){}",
+            "display started on {} ({}@{}Hz, {}){}",
             config.device,
             chosen_resolution,
             chosen_refresh,
-            if is_auto_resolution {
-                ", auto-match pending first frame"
-            } else {
-                ""
-            },
+            scaling_label,
             config
                 .audio_device
                 .as_deref()
@@ -222,6 +228,7 @@ async fn run_display_output(
     let display_flow_id = flow_id.clone();
     let display_output_id = config.id.clone();
     let display_meter = meter_snapshot.as_ref().map(Arc::clone);
+    let display_scaling_mode = config.scaling_mode;
     let display_handle = tokio::task::spawn_blocking(move || {
         display_loop(
             kms,
@@ -229,13 +236,13 @@ async fn run_display_output(
             display_clock,
             display_counters,
             display_cancel,
-            is_auto_resolution,
             display_output_stats,
             audio_codec_label,
             display_event_sender,
             display_flow_id,
             display_output_id,
             display_meter,
+            display_scaling_mode,
         );
     });
 
@@ -421,7 +428,7 @@ fn demux_decode_loop(
                         VideoCodec::H264,
                     );
                     if let Some(decoder) = video_decoder.as_mut() {
-                        feed_video_decoder(decoder, &nalus);
+                        feed_video_decoder(decoder, &nalus, pts);
                         drain_video_frames(decoder, pts, &vtx, &counters);
                     }
                 }
@@ -444,7 +451,7 @@ fn demux_decode_loop(
                         VideoCodec::Hevc,
                     );
                     if let Some(decoder) = video_decoder.as_mut() {
-                        feed_video_decoder(decoder, &nalus);
+                        feed_video_decoder(decoder, &nalus, pts);
                         drain_video_frames(decoder, pts, &vtx, &counters);
                     }
                 }
@@ -543,22 +550,24 @@ fn pts_jump(prev: Option<u64>, pts: u64) -> bool {
     forward.min(backward) > 90_000
 }
 
-fn feed_video_decoder(decoder: &mut VideoDecoder, nalus: &[Vec<u8>]) {
+fn feed_video_decoder(decoder: &mut VideoDecoder, nalus: &[Vec<u8>], pts_90k: u64) {
     // Concatenate NAL units back into Annex-B form (start codes between
     // each NALU). The demuxer already strips ADTS / start codes, so we
-    // re-add the standard `0x00 0x00 0x00 0x01` prefix.
+    // re-add the standard `0x00 0x00 0x00 0x01` prefix. PTS is attached
+    // to the input packet so FFmpeg's reorder queue can hand the
+    // matching display-order PTS back on `receive_frame`.
     let total = nalus.iter().map(|n| n.len() + 4).sum::<usize>();
     let mut buf = Vec::with_capacity(total);
     for n in nalus {
         buf.extend_from_slice(&[0, 0, 0, 1]);
         buf.extend_from_slice(n);
     }
-    let _ = decoder.send_packet(&buf);
+    let _ = decoder.send_packet_with_pts(&buf, pts_90k as i64);
 }
 
 fn drain_video_frames(
     decoder: &mut VideoDecoder,
-    pts_90k: u64,
+    fallback_pts_90k: u64,
     vtx: &mpsc::Sender<VideoFrame>,
     counters: &DisplayStatsCounters,
 ) {
@@ -566,6 +575,15 @@ fn drain_video_frames(
         let Some((y, ys, u, us, v, vs)) = frame.yuv_planes() else {
             continue;
         };
+        // Prefer the decoder-propagated display-order PTS. With
+        // B-frame H.264 / HEVC, the input-feed PTS we held in the
+        // outer loop matches the *most recent fed* access unit, not
+        // this particular decoded frame — using it would place every
+        // frame in a GOP at the same audio-clock offset and the
+        // dup/drop logic would misfire on every B-frame. Falling back
+        // to the input PTS is fine for I-only streams where the
+        // decoder has no chance to reorder.
+        let pts_90k = frame.pts().map(|p| p as u64).unwrap_or(fallback_pts_90k);
         let frame = VideoFrame {
             y: y.to_vec(),
             u: u.to_vec(),
@@ -595,24 +613,28 @@ fn display_loop(
     clock: Arc<AudioClock>,
     counters: Arc<DisplayStatsCounters>,
     cancel: CancellationToken,
-    is_auto_resolution: bool,
     output_stats: Arc<OutputStatsAccumulator>,
     audio_codec_label: &'static str,
     event_sender: EventSender,
     flow_id: String,
     output_id: String,
     meter: Option<SharedMeter>,
+    scaling_mode: DisplayScalingMode,
 ) {
-    // Drift threshold = half the source frame period, derived from the
-    // observed PTS deltas. Default to 30 fps until we've seen enough
-    // frames to estimate. The hardcoded 16 ms used to drop ~2 % of 25 fps
-    // frames as "late" because at 25 fps a single frame is 40 ms — well
-    // outside the +/-16 ms window typical PCR-paced sources sit in.
+    // Drift threshold = full source frame period, derived from the
+    // observed PTS deltas. 33 ms (30 fps) until we've seen enough
+    // frames to estimate. The previous half-frame threshold dropped
+    // ~2 % of 25 fps frames because typical PCR-paced sources jitter
+    // beyond it.
     let mut frame_period_ms: i64 = 33;
     let mut last_pts: Option<u64> = None;
     let mut last_frame: Option<VideoFrame> = None;
-    let mut stats_registered = false;
     let mut scaler: Option<CachedScaler> = None;
+
+    // Resolution autodetect state. Re-armed on PTS jump (input switch)
+    // or on any mid-stream source resolution change.
+    let mut matched_dims: Option<(u32, u32)> = None;
+    let mut stats_registered = false;
 
     while !cancel.is_cancelled() {
         let next = match vrx.blocking_recv() {
@@ -620,46 +642,73 @@ fn display_loop(
             None => break,
         };
 
-        // First decoded frame: if the operator picked `auto`, re-modeset
-        // to the smallest mode whose dimensions cover the source. This
-        // is the fix for the 4K-on-1080p-source CPU-blit jitter — the
-        // monitor's preferred mode is no longer the default.
-        if !stats_registered {
-            if is_auto_resolution {
-                match kms.match_source_resolution(next.width, next.height) {
-                    Ok(()) => {
-                        emit_event(
-                            &event_sender,
-                            EventSeverity::Info,
-                            "display_auto_matched",
-                            &flow_id,
-                            &output_id,
-                            &format!(
-                                "display auto-matched to source {}x{} → {}x{}@{}Hz",
-                                next.width,
-                                next.height,
-                                kms.width(),
-                                kms.height(),
-                                kms.refresh_hz(),
-                            ),
-                        );
-                        // Buffer dimensions changed — drop any cached
-                        // previous frame so we don't blit from a stale
-                        // size into the new framebuffers.
-                        last_frame = None;
-                    }
-                    Err(e) => {
-                        emit_event(
-                            &event_sender,
-                            EventSeverity::Warning,
-                            "display_auto_match_failed",
-                            &flow_id,
-                            &output_id,
-                            &format!("display auto-match fell back to startup mode: {e}"),
-                        );
-                    }
-                }
+        // Re-arm autodetect if the source resolution shifted (operator
+        // switched from 1080p to 720p, etc).
+        if let Some((mw, mh)) = matched_dims {
+            if mw != next.width || mh != next.height {
+                matched_dims = None;
+                last_frame = None;
             }
+        }
+
+        // First frame after open or after re-arm: pick the panel mode
+        // according to `scaling_mode`.
+        // - `MatchSource`: re-modeset to the smallest mode whose dims
+        //   cover the source. Refresh stays at the panel's preferred
+        //   rate — desktop monitors that advertise low-refresh modes
+        //   (24 / 25 / 30 Hz) typically can't drive them without
+        //   flicker, and the audio-master dup/drop logic already
+        //   handles source-fps-vs-panel-Hz cadence cleanly.
+        // - `MonitorNative`: hold the panel at the connector's
+        //   preferred mode (already set at open) and let libswscale
+        //   upscale the source. The `set_monitor_native_mode` call is
+        //   defensive — KMS opened at the preferred mode already, so
+        //   it's a no-op on the steady-state path.
+        if matched_dims.is_none() {
+            let (modeset, ok_code, err_code, ok_verb, err_verb) = match scaling_mode {
+                DisplayScalingMode::MatchSource => (
+                    kms.match_source_resolution(next.width, next.height),
+                    "display_auto_matched",
+                    "display_auto_match_failed",
+                    "auto-matched to source",
+                    "auto-match fell back to startup mode",
+                ),
+                DisplayScalingMode::MonitorNative => (
+                    kms.set_monitor_native_mode(),
+                    "display_monitor_native_set",
+                    "display_monitor_native_set_failed",
+                    "set to monitor-native (panel-preferred mode)",
+                    "monitor-native modeset fell back to startup mode",
+                ),
+            };
+            match modeset {
+                Ok(()) => emit_event(
+                    &event_sender,
+                    EventSeverity::Info,
+                    ok_code,
+                    &flow_id,
+                    &output_id,
+                    &format!(
+                        "display {} for source {}x{} → {}x{}@{}Hz",
+                        ok_verb,
+                        next.width,
+                        next.height,
+                        kms.width(),
+                        kms.height(),
+                        kms.refresh_hz(),
+                    ),
+                ),
+                Err(e) => emit_event(
+                    &event_sender,
+                    EventSeverity::Warning,
+                    err_code,
+                    &flow_id,
+                    &output_id,
+                    &format!("display {err_verb}: {e}"),
+                ),
+            }
+            // Register / refresh the stats handle with the post-modeset
+            // resolution so the manager UI shows the active mode.
             output_stats.set_display_stats(
                 Arc::clone(&counters),
                 format!("{}x{}", kms.width(), kms.height()),
@@ -670,14 +719,14 @@ fn display_loop(
                 audio_codec_label,
             );
             stats_registered = true;
+            matched_dims = Some((next.width, next.height));
         }
+
         // Track the running source frame period so the drift threshold
-        // adapts to 25 / 30 / 50 / 60 fps content. Frame-to-frame deltas
-        // outside [10, 200] ms are treated as outliers (B-frame reorder,
-        // input-switch boundary, decoder hiccup) and skipped. A delta
-        // beyond 1 s is treated as a stream change — drop the cached
-        // previous frame so the next blit doesn't repeat from the old
-        // source's resolution.
+        // adapts to 25 / 30 / 50 / 60 fps content. A frame-to-frame
+        // delta beyond ±1 s is treated as a stream change — drop the
+        // cached previous frame and re-arm the resolution match for
+        // the new source.
         if let Some(prev) = last_pts {
             let forward = next.pts_90k.wrapping_sub(prev) as i64;
             let backward = (prev.wrapping_sub(next.pts_90k)) as i64;
@@ -685,6 +734,7 @@ fn display_loop(
             if forward.unsigned_abs() > 90_000 && backward.unsigned_abs() > 90_000 {
                 last_frame = None;
                 frame_period_ms = 33;
+                matched_dims = None;
             } else if (10..=200).contains(&dms) {
                 // Light EMA so a one-off long frame doesn't move the
                 // window. α = 1/8 is plenty for ≤ 60 fps content.
@@ -692,24 +742,30 @@ fn display_loop(
             }
         }
         last_pts = Some(next.pts_90k);
+        let _ = stats_registered;
 
         // Compute drift against the audio clock, dropping frames that
-        // fell behind by more than ±half a frame period.
+        // fell behind / repeating frames that ran too far ahead. The
+        // threshold is **1.5×** source frame period — at 25 fps that
+        // is 60 ms, well clear of typical ALSA per-period jitter
+        // (~10-20 ms) so a single sample-quanta wobble doesn't trip
+        // a false repeat every few hundred ms (the visible "skipping"
+        // the user saw on 1080p25 confidence playback). We never
+        // **drop** unless behind by more than 2× period — losing
+        // a frame is more visible than a single-frame stale repeat.
         if let Some(audio_pts) = clock.current_pts_90k() {
             let drift_pts: i64 = next.pts_90k as i64 - audio_pts as i64;
             // 90 PTS units = 1 ms.
             let drift_ms = drift_pts / 90;
             counters.store_av_offset_ms(drift_ms.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
 
-            // Allow ±one full frame period of drift before dup/dropping
-            // — the PTS-to-audio anchor itself jitters by a sample-quanta
-            // per ALSA period, so half-frame is too aggressive.
-            let drop_threshold = frame_period_ms;
+            let repeat_threshold = (frame_period_ms * 3) / 2;
+            let drop_threshold = frame_period_ms * 2;
             if drift_ms < -drop_threshold {
                 counters.frames_dropped_late.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            if drift_ms > drop_threshold {
+            if drift_ms > repeat_threshold {
                 if let Some(prev) = last_frame.as_ref() {
                     if blit_and_present(&mut kms, prev, &mut scaler, meter.as_ref()).is_ok() {
                         counters.frames_repeated.fetch_add(1, Ordering::Relaxed);
@@ -941,22 +997,6 @@ fn audio_loop(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────
-
-/// Returns `(width, height, is_auto)`. `is_auto` is true when the
-/// operator left resolution unset or picked "auto" — in that case
-/// `(None, None)` opens KMS at the connector's preferred mode and the
-/// display loop re-modesets to the source flow's dimensions on first
-/// decoded frame (avoiding the 4K-on-a-1080p-source CPU-blit jitter).
-fn parse_resolution(res: Option<&str>) -> (Option<u32>, Option<u32>, bool) {
-    let Some(r) = res else { return (None, None, true) };
-    if r.is_empty() || r == "auto" {
-        return (None, None, true);
-    }
-    let Some((w, h)) = r.split_once('x') else {
-        return (None, None, true);
-    };
-    (w.parse().ok(), h.parse().ok(), false)
-}
 
 fn classify_kms_error(msg: &str) -> &'static str {
     if msg.contains("display_resolution_unsupported") {

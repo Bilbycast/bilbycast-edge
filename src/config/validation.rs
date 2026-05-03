@@ -3695,24 +3695,21 @@ fn validate_display_output(c: &crate::config::models::DisplayOutputConfig) -> Re
         }
     }
 
-    if let Some(ref res) = c.resolution {
-        if res != "auto" && parse_wxh_resolution(res).is_none() {
-            return Err(anyhow::anyhow!(
-                "display output '{}': resolution '{}' must be 'auto' or 'WIDTHxHEIGHT'",
-                c.id,
-                res
-            ));
-        }
-    }
-
-    if let Some(hz) = c.refresh_hz {
-        if !(1..=240).contains(&hz) {
-            return Err(anyhow::anyhow!(
-                "display output '{}': refresh_hz {} must be in 1..=240",
-                c.id,
-                hz
-            ));
-        }
+    // `resolution` / `refresh_hz` are deprecated and ignored at runtime —
+    // replaced by `scaling_mode`. We still accept them on the wire so old
+    // saved configs round-trip without erroring out, but we warn so the
+    // operator knows to re-save the output and drops the legacy fields.
+    if c.resolution.is_some() || c.refresh_hz.is_some() {
+        tracing::warn!(
+            output_id = %c.id,
+            resolution = ?c.resolution,
+            refresh_hz = ?c.refresh_hz,
+            "display output '{}' carries deprecated `resolution` / `refresh_hz` \
+             fields — these are ignored at runtime; use `scaling_mode` \
+             (`match_source` or `monitor_native`) instead. Re-save the \
+             output via the manager UI to drop these fields.",
+            c.id
+        );
     }
 
     if c.sync_mode != "vsync_to_display" {
@@ -3750,19 +3747,6 @@ fn is_valid_alsa_device(s: &str) -> bool {
     parts
         .iter()
         .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-}
-
-fn parse_wxh_resolution(s: &str) -> Option<(u32, u32)> {
-    let (w, h) = s.split_once('x')?;
-    if w.is_empty() || h.is_empty() || w.len() > 8 || h.len() > 8 {
-        return None;
-    }
-    let wn: u32 = w.parse().ok()?;
-    let hn: u32 = h.parse().ok()?;
-    if wn == 0 || hn == 0 {
-        return None;
-    }
-    Some((wn, hn))
 }
 
 /// Cross-output uniqueness for `display` outputs: two display outputs in the
