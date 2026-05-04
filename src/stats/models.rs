@@ -839,6 +839,33 @@ pub struct DisplayStats {
     /// rate.
     #[serde(default)]
     pub subscriber_lag_events: u64,
+    /// Frames the demux+scale child dropped because the bounded mpsc
+    /// to the display task was full. Distinguishes "blit/present is
+    /// the bottleneck" from `frames_dropped_late` (frame arrived too
+    /// late to show) and `subscriber_lag_events` (decode is slow).
+    #[serde(default)]
+    pub frames_dropped_mpsc_full: u64,
+    /// Largest single `blit_and_present` duration since startup, in µs.
+    /// `kms.present()` blocks one vblank (~16 700 µs at 60 Hz) so this
+    /// is one-vblank-floored; values past ~33 000 µs mean the per-frame
+    /// work is missing vblank slots.
+    #[serde(default)]
+    pub blit_us_max: u64,
+    /// Average `blit_and_present` duration since startup, in µs.
+    /// Computed on the fly by the snapshot path from the running sum
+    /// + count atomics on the counter struct.
+    #[serde(default)]
+    pub blit_us_avg: u64,
+    /// Largest single decode-AU duration since startup, in µs. Wraps
+    /// the synchronous libavcodec `send_packet` + reorder-buffer
+    /// drain + plane-copy out of the decoder's lifetime. Values past
+    /// the source frame period (40 ms at 25 fps) on motion-heavy
+    /// segments explain why audio momentarily outruns video.
+    #[serde(default)]
+    pub decode_us_max: u64,
+    /// Average decode-AU duration since startup, in µs.
+    #[serde(default)]
+    pub decode_us_avg: u64,
 }
 
 /// PCR accuracy trust metric — percentiles of `|observed_Δ − expected_Δ|`

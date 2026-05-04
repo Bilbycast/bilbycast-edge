@@ -21,12 +21,16 @@
 //
 // Drop semantics: broadcast `Lagged(n)` increments `packets_dropped`
 // and flushes both decoders so the next IDR / sync frame is the new
-// anchor. Display task drops video frames whose PTS is more than one
-// frame-period behind the audio clock (`frames_dropped_late++`) and
-// holds the previous frame for one more vsync when the next decoded
-// frame is too far ahead (`frames_repeated++`). Audio xrun → ALSA
-// `prepare()` and continue (`audio_underruns++`). The flow input is
-// **never** blocked.
+// anchor. The display task paces each decoded frame to its
+// audio-clock display time — sleeping when the frame arrived early
+// (the previous frame stays scanned-out by the panel, no flip needed),
+// dropping when it arrived more than 2× period late
+// (`frames_dropped_late++`). Audio xrun → ALSA `prepare()` and
+// continue (`audio_underruns++`) without nudging the anchor. The flow
+// input is **never** blocked. The legacy `frames_repeated` counter
+// stays on `DisplayStatsCounters` for dashboard back-compat but no
+// longer increments — sleep-pacing makes the previous frame stay
+// scanned-out naturally between flips.
 
 #![cfg(all(feature = "display", target_os = "linux"))]
 
@@ -56,7 +60,17 @@ use crate::engine::ts_demux::{DemuxedFrame, TsDemuxer};
 use crate::manager::events::{EventSender, EventSeverity};
 use crate::stats::collector::{DisplayStatsCounters, OutputStatsAccumulator};
 
-const MPSC_VIDEO_DEPTH: usize = 8;
+// Display feeder depth. 8 was too tight on 1080p H.264 CPU decode —
+// a single heavy frame whose blit+present overran the source frame
+// period (e.g. a busy P/B-frame at 25 fps where the 40 ms budget got
+// consumed by libswscale + audio-bars overlay + vblank wait) left no
+// slack for the next frame, so the demux child saw `try_send` fail
+// and dropped a perfectly good decoded frame. 24 slots = ~1 second
+// of pre-decoded video on a 25 fps source — long enough to ride out
+// the worst per-frame spike we measured without ballooning latency
+// (the display task still paces against the audio clock, so a deep
+// queue doesn't translate into visible lag).
+const MPSC_VIDEO_DEPTH: usize = 24;
 const MPSC_AUDIO_DEPTH: usize = 64;
 
 // ── Public spawner ────────────────────────────────────────────────
@@ -1016,6 +1030,15 @@ fn handle_video_au(
     let Some(decoder) = video_decoder.as_mut() else {
         return;
     };
+    // Time the full per-AU decode pipeline: synchronous `send_packet`
+    // into libavcodec, plus the drain loop that pulls every reorder-
+    // buffer frame the AU made available, plus the per-plane `to_vec`
+    // copies that move pixels out of the decoder's lifetime. Sustained
+    // values past one source frame period on motion-heavy segments are
+    // the signature of "decode is slower than real-time on this
+    // content" — the failure mode that produces stutter even when
+    // blit + queue depth are healthy.
+    let decode_start = Instant::now();
     feed_video_decoder(
         decoder,
         nalus,
@@ -1038,6 +1061,14 @@ fn handle_video_au(
         last_unsupported_pixfmt_at,
         hw_open_state,
     );
+    let decode_us = decode_start.elapsed().as_micros() as u64;
+    counters.decode_count.fetch_add(1, Ordering::Relaxed);
+    counters
+        .decode_us_total
+        .fetch_add(decode_us, Ordering::Relaxed);
+    counters
+        .decode_us_max
+        .fetch_max(decode_us, Ordering::Relaxed);
 
     // Section 1: sustained send_packet errors → demote.
     if hw_open_state.consecutive_send_errors >= RUNTIME_FAIL_DEMOTE_THRESHOLD
@@ -1380,7 +1411,15 @@ fn drain_video_frames(
             pts_90k,
         };
         if vtx.try_send(out_frame).is_err() {
-            counters.frames_dropped_late.fetch_add(1, Ordering::Relaxed);
+            // Distinct from the display-thread `frames_dropped_late` —
+            // this is the demux→display mpsc backing up because per-frame
+            // blit/present is taking longer than one source frame period
+            // on average. The diagnostic split lets the manager UI show
+            // operators "blit is too slow" vs "decode is too slow" vs
+            // "frame arrived too late" as three separate signals.
+            counters
+                .frames_dropped_mpsc_full
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -1403,20 +1442,49 @@ fn display_loop(
     meter: Option<SharedMeter>,
     scaling_mode: DisplayScalingMode,
 ) {
-    // Drift threshold = full source frame period, derived from the
-    // observed PTS deltas. 33 ms (30 fps) until we've seen enough
-    // frames to estimate. The previous half-frame threshold dropped
-    // ~2 % of 25 fps frames because typical PCR-paced sources jitter
-    // beyond it.
+    // Frame period derived from the observed PTS deltas — used to size
+    // the late-drop threshold. 33 ms (30 fps) until we've seen enough
+    // frames to estimate.
     let mut frame_period_ms: i64 = 33;
     let mut last_pts: Option<u64> = None;
-    let mut last_frame: Option<VideoFrame> = None;
     let mut scaler: Option<CachedScaler> = None;
 
     // Resolution autodetect state. Re-armed on PTS jump (input switch)
     // or on any mid-stream source resolution change.
     let mut matched_dims: Option<(u32, u32)> = None;
     let mut stats_registered = false;
+
+    // Wall-clock pacer used when audio is muted (no `AudioClock` to
+    // pace against). Anchors on the first frame's PTS + the wall-clock
+    // at that moment, then sleeps each subsequent frame until its
+    // wall-clock-equivalent display time. Without this, a muted output
+    // would consume decoded frames at decoder rate (often a burst
+    // followed by idle) and present at the panel's vblank cadence —
+    // exactly the "blast then pause" stutter the audio path used to
+    // suffer from before the dup/drop logic was replaced. Reset on a
+    // resolution change or large PTS jump so a stream switch starts
+    // fresh.
+    let mut wall_anchor: Option<(u64, Instant)> = None;
+
+    // Audio↔video PTS offset captured on the first video frame after
+    // the audio clock arms. The audio task anchors on its very first
+    // ALSA `writei`, which fires before the video decoder has produced
+    // its first frame — for H.264 with B-frames + IDR-wait latency
+    // that's typically 80–150 ms. Without compensation, the very first
+    // drift reading is `-decoder_warmup_ms`, and every subsequent
+    // frame measures the same baseline drift forever. With our drop
+    // threshold at 4× source period (160 ms at 25 fps), even modest
+    // motion-jitter pushed past the drop edge — the operator saw
+    // stutter at the same spots in the file every loop because that's
+    // where the encoder happened to place its heaviest frames relative
+    // to the constant offset.
+    //
+    // We capture the offset once (audio_pts − video_pts at the first
+    // recv where audio is armed) and subtract it from drift forever
+    // after, zeroing the steady-state baseline. Reset on resolution
+    // change / PTS jump (input switch) so the offset re-captures for
+    // the new stream.
+    let mut av_offset_pts: Option<i64> = None;
 
     while !cancel.is_cancelled() {
         let next = match vrx.blocking_recv() {
@@ -1429,7 +1497,8 @@ fn display_loop(
         if let Some((mw, mh)) = matched_dims {
             if mw != next.width || mh != next.height {
                 matched_dims = None;
-                last_frame = None;
+                wall_anchor = None;
+                av_offset_pts = None;
             }
         }
 
@@ -1514,9 +1583,10 @@ fn display_loop(
             let backward = (prev.wrapping_sub(next.pts_90k)) as i64;
             let dms = forward / 90;
             if forward.unsigned_abs() > 90_000 && backward.unsigned_abs() > 90_000 {
-                last_frame = None;
                 frame_period_ms = 33;
                 matched_dims = None;
+                wall_anchor = None;
+                av_offset_pts = None;
             } else if (10..=200).contains(&dms) {
                 // Light EMA so a one-off long frame doesn't move the
                 // window. α = 1/8 is plenty for ≤ 60 fps content.
@@ -1526,40 +1596,107 @@ fn display_loop(
         last_pts = Some(next.pts_90k);
         let _ = stats_registered;
 
-        // Compute drift against the audio clock, dropping frames that
-        // fell behind / repeating frames that ran too far ahead. The
-        // threshold is **1.5×** source frame period — at 25 fps that
-        // is 60 ms, well clear of typical ALSA per-period jitter
-        // (~10-20 ms) so a single sample-quanta wobble doesn't trip
-        // a false repeat every few hundred ms (the visible "skipping"
-        // the user saw on 1080p25 confidence playback). We never
-        // **drop** unless behind by more than 2× period — losing
-        // a frame is more visible than a single-frame stale repeat.
-        if let Some(audio_pts) = clock.current_pts_90k() {
-            let drift_pts: i64 = next.pts_90k as i64 - audio_pts as i64;
-            // 90 PTS units = 1 ms.
-            let drift_ms = drift_pts / 90;
-            counters.store_av_offset_ms(drift_ms.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+        // Pace this frame against the audio master clock (or against a
+        // wall-clock seeded by the first frame's PTS when audio is
+        // muted). The previous revision used a dup/drop scheme on the
+        // raw stepped audio clock (which only ticks once per ALSA
+        // period, ~20 ms in our config): when a frame was "ahead" we
+        // re-presented the previous frame **and dropped the new one**
+        // via `continue`, then the next decoded frame measured even
+        // further ahead and was dropped the same way. Decoders emit
+        // frames in bursts (B-frame reorder buffers, post-Lagged
+        // recovery, post-IDR catch-up), so the loop drained the burst
+        // at vblank cadence (~16 ms each), drift accumulated past the
+        // 1.5× threshold, and the operator saw motion stutter — short
+        // spurts of motion separated by held-frame pauses — across
+        // every codec / decode backend / source resolution.
+        //
+        // The new model: never throw a decoded frame away because it
+        // arrived early — sleep until its display time and present it.
+        // The smoothed clock reader ([`AudioClock::current_pts_90k_smoothed`])
+        // interpolates the audio PTS forward by wall-clock between
+        // ALSA writes so the per-frame drift estimate is steady to
+        // sub-ms instead of swinging ±20 ms across each period
+        // boundary. Frames so far behind they can't catch up are
+        // still dropped at 2× period — that case still shows up on a
+        // genuinely overloaded host or after a long Lagged event and
+        // displaying a stale frame is more visible than dropping it.
+        // Drop only frames so far behind the audio clock that catching
+        // up by re-pacing isn't realistic. 4× source period (160 ms at
+        // 25 fps, 100 ms at 60 fps) — slightly more lipsync slack than
+        // the lossless target, but the previous 2× threshold tripped
+        // on motion-heavy segments where the CPU decoder briefly fell
+        // behind real-time and audio (paced on wall-clock) momentarily
+        // outran video PTS. Each visible drop reads to the operator as
+        // motion stutter, which is more disruptive on a confidence
+        // monitor than a few frames of lipsync drift the decoder
+        // catches up on naturally.
+        let drop_threshold_ms: i64 = (frame_period_ms * 4).max(160);
+        let drift_ms_opt: Option<i64> = if let Some(audio_pts) =
+            clock.current_pts_90k_smoothed()
+        {
+            wall_anchor = None;
+            // Capture the audio-vs-video baseline once on first frame
+            // after audio is armed (and after every reset above). The
+            // offset accounts for the decoder's first-frame warmup
+            // latency that has no business showing up as a sustained
+            // negative drift. After capture, drift = 0 in steady
+            // state; only real motion-jitter perturbs it.
+            let offset = *av_offset_pts.get_or_insert(
+                audio_pts as i64 - next.pts_90k as i64,
+            );
+            Some(((next.pts_90k as i64 + offset) - audio_pts as i64) / 90)
+        } else {
+            // Audio muted — pace on wall-clock seeded by the first
+            // post-anchor frame.
+            let now = Instant::now();
+            let (anchor_pts, anchor_at) =
+                wall_anchor.get_or_insert_with(|| (next.pts_90k, now));
+            let pts_delta_ms = (next.pts_90k.wrapping_sub(*anchor_pts) as i64) / 90;
+            let wall_delta_ms = now.duration_since(*anchor_at).as_millis() as i64;
+            Some(pts_delta_ms - wall_delta_ms)
+        };
 
-            let repeat_threshold = (frame_period_ms * 3) / 2;
-            let drop_threshold = frame_period_ms * 2;
-            if drift_ms < -drop_threshold {
+        if let Some(drift_ms) = drift_ms_opt {
+            counters.store_av_offset_ms(
+                drift_ms.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+            );
+            if drift_ms < -drop_threshold_ms {
                 counters.frames_dropped_late.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            if drift_ms > repeat_threshold {
-                if let Some(prev) = last_frame.as_ref() {
-                    if blit_and_present(&mut kms, prev, &mut scaler, meter.as_ref()).is_ok() {
-                        counters.frames_repeated.fetch_add(1, Ordering::Relaxed);
-                    }
-                    continue;
-                }
+            // Subtract a small margin so we hand the buffer to KMS a hair
+            // before its target vblank — the page-flip itself blocks for
+            // up to one vblank inside `kms.present()`, so over-sleeping
+            // by even a millisecond pushes the actual scan-out a full
+            // frame late at 60 Hz.
+            const PRESENT_MARGIN_MS: i64 = 2;
+            if drift_ms > PRESENT_MARGIN_MS {
+                let cap_ms = drop_threshold_ms;
+                let sleep_ms = (drift_ms - PRESENT_MARGIN_MS).min(cap_ms) as u64;
+                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
             }
         }
-        if blit_and_present(&mut kms, &next, &mut scaler, meter.as_ref()).is_ok() {
+
+        // Time the blit + page-flip so operators can see at a glance
+        // whether display work is keeping up with the source frame
+        // period. Includes libswscale colour-convert, the optional HDR
+        // tonemap LUT, the audio-bars overlay, and the kernel's vblank
+        // wait inside `kms.present()`. On a 60 Hz panel one vblank is
+        // ~16.7 ms, so values above ~33 ms mean we missed a vblank
+        // slot and the next iteration's pacing has already slipped a
+        // frame.
+        let blit_start = Instant::now();
+        let blit_ok = blit_and_present(&mut kms, &next, &mut scaler, meter.as_ref()).is_ok();
+        let blit_us = blit_start.elapsed().as_micros() as u64;
+        counters.blit_count.fetch_add(1, Ordering::Relaxed);
+        counters.blit_us_total.fetch_add(blit_us, Ordering::Relaxed);
+        counters
+            .blit_us_max
+            .fetch_max(blit_us, Ordering::Relaxed);
+        if blit_ok {
             counters.frames_displayed.fetch_add(1, Ordering::Relaxed);
         }
-        last_frame = Some(next);
     }
 }
 

@@ -203,6 +203,47 @@ pub struct DisplayStatsCounters {
     /// rate (heavy decode, slow scaler, etc.) and the broadcast bus's
     /// 2048-deep ring is overflowing.
     pub subscriber_lag_events: AtomicU64,
+
+    /// Frames the demux+scale child dropped because the bounded
+    /// `vtx` mpsc (display-feeder channel, currently 16 slots) was
+    /// full when `try_send` ran. **This is the dominant signal that
+    /// per-frame blit/present is too slow** — the demux side decoded
+    /// the frame fine, the display side just didn't drain it in time.
+    /// Distinguishes "decode is slow" (`subscriber_lag_events`) from
+    /// "blit is slow" (this counter) from "frame arrived too late to
+    /// show" (`frames_dropped_late`).
+    pub frames_dropped_mpsc_full: AtomicU64,
+
+    /// Largest single `blit_and_present` duration since startup (µs).
+    /// Includes libswscale colour-convert, optional HDR LUT, the
+    /// audio-bars overlay, and the `kms.present()` vblank wait. On a
+    /// 60 Hz panel a one-vblank flip is ~16 700 µs, so values north of
+    /// ~33 000 µs mean we've missed a vblank slot at least once and
+    /// are deferring the next iteration's pacing.
+    pub blit_us_max: AtomicU64,
+    /// Sum of `blit_and_present` durations since startup (µs). Read
+    /// against `blit_count` for an average; the manager UI doesn't
+    /// reset these mid-run.
+    pub blit_us_total: AtomicU64,
+    /// Count of `blit_and_present` invocations whose timing fed
+    /// `blit_us_total`.
+    pub blit_count: AtomicU64,
+
+    /// Largest single decode-AU duration since startup, in µs. Wraps
+    /// `send_packet_with_pts` + `drain_video_frames` (the synchronous
+    /// libavcodec call plus the loop that pulls every reorder-buffer
+    /// frame the AU made available, plus the YUV plane copies that
+    /// move data out of the decoder's lifetime). Sustained values
+    /// above the source frame period (40 ms at 25 fps) are the
+    /// signature of "decode is slower than real-time on this content"
+    /// — the failure mode that produces motion-heavy stutter even
+    /// when blit and queue depth are healthy.
+    pub decode_us_max: AtomicU64,
+    /// Sum of decode-AU durations since startup (µs).
+    pub decode_us_total: AtomicU64,
+    /// Count of decode-AU invocations whose timing fed
+    /// `decode_us_total`.
+    pub decode_count: AtomicU64,
 }
 
 #[allow(dead_code)]
@@ -561,6 +602,22 @@ impl OutputStatsAccumulator {
                 .frames_dropped_unsupported_pixfmt
                 .load(Ordering::Relaxed),
             subscriber_lag_events: h.counters.subscriber_lag_events.load(Ordering::Relaxed),
+            frames_dropped_mpsc_full: h
+                .counters
+                .frames_dropped_mpsc_full
+                .load(Ordering::Relaxed),
+            blit_us_max: h.counters.blit_us_max.load(Ordering::Relaxed),
+            blit_us_avg: {
+                let total = h.counters.blit_us_total.load(Ordering::Relaxed);
+                let count = h.counters.blit_count.load(Ordering::Relaxed);
+                if count == 0 { 0 } else { total / count }
+            },
+            decode_us_max: h.counters.decode_us_max.load(Ordering::Relaxed),
+            decode_us_avg: {
+                let total = h.counters.decode_us_total.load(Ordering::Relaxed);
+                let count = h.counters.decode_count.load(Ordering::Relaxed);
+                if count == 0 { 0 } else { total / count }
+            },
         });
 
         // Swap latency window and compute min/avg/max.
