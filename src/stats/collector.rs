@@ -152,6 +152,57 @@ pub struct DisplayStatsCounters {
     /// give us across stable Rust versions cleanly). The display task
     /// writes via `store_av_offset_ms`; readers use `load_av_offset_ms`.
     pub av_offset_ms_packed: AtomicU64,
+
+    // ── HW-decode lifecycle (Section 1 of the display playback fix) ──
+    /// Cumulative count of `VideoDecoder::send_packet_with_pts` calls
+    /// that returned `Err`. Bumped from `feed_video_decoder` for every
+    /// rejected access unit. Stays low on a healthy stream — sustained
+    /// growth signals the decoder is unhappy with the bitstream or the
+    /// HW backend can't actually decode (e.g. QSV opens but every send
+    /// returns EINVAL on a brand-new iGPU with stale driver). Drives
+    /// the runtime HW→CPU demotion in `force_cpu_fallback`.
+    pub send_packet_errors: AtomicU64,
+    /// Number of times this display run flipped the active decoder from
+    /// a HW backend to CPU mid-flight (open-time fallback in
+    /// `open_video_decoder_with_retry`, runtime fallback after
+    /// `consecutive_send_errors` cap, or watchdog-triggered fallback in
+    /// `display_loop`). Single per-flow open + immediate switch counts
+    /// once. Manager UI flags `>0` as "HW degraded to CPU on this output".
+    pub decoder_demotions: AtomicU64,
+    /// Decoded frames pulled out of the active decoder since it was
+    /// last opened. Reset to 0 by `force_cpu_fallback`. Watchdog reads
+    /// this — `0` after `first_send_after_open` + 2.5 s while still on
+    /// a HW backend means the decoder accepted packets but never
+    /// produced a picture, so we demote.
+    pub frames_received_since_open: AtomicU64,
+
+    // ── Reolink + S4 4K diagnostics (Section 5) ──
+    /// Times the demux loop detected a > 1 s PTS step and flushed the
+    /// decoder. Bumped from the `pts_jump` arms in `demux_decode_loop`.
+    /// Steady non-zero growth on Reolink (RTSP camera over SRT-FEC) is
+    /// the canonical signal that FEC repair is producing out-of-order
+    /// PTS that trip our flush heuristic — the targeted fix is a
+    /// hysteresis on the jump detection.
+    pub pts_jumps_observed: AtomicU64,
+    /// Decoded frames whose `frame.pts()` was `None` (decoder didn't
+    /// emit a display-order PTS), so the display loop fell back to the
+    /// most recent input PTS. Bumped from `drain_video_frames`. Should
+    /// stay near zero on B-frame-free sources; growth + degraded
+    /// picture points at the B-frame display-PTS commit interacting
+    /// badly with the source.
+    pub frame_pts_fallbacks: AtomicU64,
+    /// Decoded frames dropped because the decoder produced a pixel
+    /// format the display path can't blit. Bumped per dropped frame in
+    /// `drain_video_frames`. The 1-shot warning event still fires once
+    /// (re-armed every 60 s by the periodic gate) but this counter
+    /// gives the manager UI a per-second signal.
+    pub frames_dropped_unsupported_pixfmt: AtomicU64,
+    /// Times the broadcast subscriber returned `Lagged(n)` — bumped
+    /// once per Lagged event, not per dropped packet. Sustained growth
+    /// indicates the demux+decode child can't keep up with the input
+    /// rate (heavy decode, slow scaler, etc.) and the broadcast bus's
+    /// 2048-deep ring is overflowing.
+    pub subscriber_lag_events: AtomicU64,
 }
 
 #[allow(dead_code)]
@@ -497,6 +548,19 @@ impl OutputStatsAccumulator {
             decoder_kind: h.decoder_kind.clone(),
             video_codec: h.video_codec.clone(),
             audio_codec: h.audio_codec.clone(),
+            send_packet_errors: h.counters.send_packet_errors.load(Ordering::Relaxed),
+            decoder_demotions: h.counters.decoder_demotions.load(Ordering::Relaxed),
+            frames_received_since_open: h
+                .counters
+                .frames_received_since_open
+                .load(Ordering::Relaxed),
+            pts_jumps_observed: h.counters.pts_jumps_observed.load(Ordering::Relaxed),
+            frame_pts_fallbacks: h.counters.frame_pts_fallbacks.load(Ordering::Relaxed),
+            frames_dropped_unsupported_pixfmt: h
+                .counters
+                .frames_dropped_unsupported_pixfmt
+                .load(Ordering::Relaxed),
+            subscriber_lag_events: h.counters.subscriber_lag_events.load(Ordering::Relaxed),
         });
 
         // Swap latency window and compute min/avg/max.
@@ -1174,6 +1238,13 @@ pub struct ThumbnailAccumulator {
     pub total_captured: AtomicU64,
     /// Total capture errors (ffmpeg failures, timeouts).
     pub capture_errors: AtomicU64,
+    /// Most recent capture-failure reason. Replaced (not accumulated) on
+    /// every error so the snapshot always reflects the *latest* failure
+    /// mode. Cleared on the next successful capture so a transient failure
+    /// doesn't linger across recovery. Surfaced on `ThumbnailStats` so
+    /// operators can tell "no buffered frames" from "decoder rejected the
+    /// AU" without enabling debug logging.
+    last_error: Mutex<Option<String>>,
     /// Hash of the previously captured JPEG for freeze-frame comparison.
     prev_jpeg_hash: Mutex<Option<u64>>,
     /// How many consecutive captures produced an identical JPEG hash.
@@ -1201,6 +1272,7 @@ impl ThumbnailAccumulator {
             generation: AtomicU64::new(0),
             total_captured: AtomicU64::new(0),
             capture_errors: AtomicU64::new(0),
+            last_error: Mutex::new(None),
             prev_jpeg_hash: Mutex::new(None),
             freeze_count: AtomicU64::new(0),
             alarm: Mutex::new(None),
@@ -1228,6 +1300,10 @@ impl ThumbnailAccumulator {
     /// Store a newly captured thumbnail.
     pub fn store(&self, jpeg_data: bytes::Bytes) {
         *self.latest_jpeg.lock().unwrap() = Some((jpeg_data, Instant::now()));
+        // A successful capture clears any lingering error reason so the
+        // snapshot doesn't show "no video frames buffered" forever after
+        // a transient warm-up gap.
+        *self.last_error.lock().unwrap() = None;
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.total_captured.fetch_add(1, Ordering::Relaxed);
         if let Some(n) = &self.update_notify {
@@ -1235,9 +1311,10 @@ impl ThumbnailAccumulator {
         }
     }
 
-    /// Record a capture error.
-    pub fn record_error(&self) {
+    /// Record a capture error and replace the last-error reason.
+    pub fn record_error(&self, reason: impl Into<String>) {
         self.capture_errors.fetch_add(1, Ordering::Relaxed);
+        *self.last_error.lock().unwrap() = Some(reason.into());
     }
 
     /// Check whether the current JPEG hash matches the previous one and
@@ -1283,12 +1360,14 @@ impl ThumbnailAccumulator {
     pub fn snapshot(&self) -> ThumbnailStats {
         let has_thumbnail = self.latest_jpeg.lock().unwrap().is_some();
         let alarm = self.alarm.lock().unwrap().clone();
+        let last_error = self.last_error.lock().unwrap().clone();
         ThumbnailStats {
             enabled: true,
             total_captured: self.total_captured.load(Ordering::Relaxed),
             capture_errors: self.capture_errors.load(Ordering::Relaxed),
             has_thumbnail,
             alarm,
+            last_error,
         }
     }
 }
@@ -2073,10 +2152,15 @@ impl FlowStatsAccumulator {
                 let packets = c.packets.load(Ordering::Relaxed);
                 let bitrate = c.throughput.sample(bytes);
                 let (psi_catalog, psi_tick) = c.psi_catalog_snapshot();
-                let thumbnail_alarm = self
+                // Resolve the per-input thumbnail accumulator once and read
+                // both the alarm (legacy field, preserved for older managers)
+                // and the full snapshot (new diagnostic field) from the same
+                // entry — avoids two DashMap lookups per input.
+                let (thumbnail_alarm, thumbnail) = self
                     .per_input_thumbnails
                     .get(&input_id)
-                    .and_then(|t| t.current_alarm());
+                    .map(|t| (t.current_alarm(), Some(t.snapshot())))
+                    .unwrap_or((None, None));
                 PerInputLive {
                     input_id,
                     input_type: c.input_type.clone(),
@@ -2094,6 +2178,7 @@ impl FlowStatsAccumulator {
                     psi_catalog,
                     psi_catalog_tick: if psi_tick == 0 { None } else { Some(psi_tick) },
                     thumbnail_alarm,
+                    thumbnail,
                 }
             })
             .collect();

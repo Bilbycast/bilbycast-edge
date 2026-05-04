@@ -1280,6 +1280,9 @@ fn open_video_active(
         video_codec::VideoEncoderCodec::H264Qsv | video_codec::VideoEncoderCodec::HevcQsv => {
             "qsv"
         }
+        video_codec::VideoEncoderCodec::H264Vaapi | video_codec::VideoEncoderCodec::HevcVaapi => {
+            "vaapi"
+        }
     };
     let target_codec = match target_family {
         video_codec::VideoCodec::H264 => "h264",

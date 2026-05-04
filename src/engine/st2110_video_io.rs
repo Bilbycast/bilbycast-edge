@@ -108,6 +108,8 @@ fn build_encoder_config(
         "hevc_nvenc" => VideoEncoderCodec::HevcNvenc,
         "h264_qsv" => VideoEncoderCodec::H264Qsv,
         "hevc_qsv" => VideoEncoderCodec::HevcQsv,
+        "h264_vaapi" => VideoEncoderCodec::H264Vaapi,
+        "hevc_vaapi" => VideoEncoderCodec::HevcVaapi,
         other => return Err(anyhow!("unknown encoder codec '{other}'")),
     };
     Ok(crate::engine::video_encode_util::build_encoder_config(

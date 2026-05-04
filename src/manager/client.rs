@@ -1081,7 +1081,13 @@ where
             let thumb_gen = thumb_acc.generation.load(std::sync::atomic::Ordering::Relaxed);
             let gen_key = format!("flow:{flow_id}");
             let prev = thumbnail_generations.get(&gen_key).copied().unwrap_or(0);
-            if thumb_gen > prev {
+            // `!=` not `>` — on flow stop+start the accumulator is rebuilt
+            // with `generation = 0`, so a freshly-captured `gen = 1` is
+            // *less than* the stale `prev` from the previous flow lifetime.
+            // Using `>` silently gated every push until the new generation
+            // overtook the old (~7 min for a flow that ran ~7 min). `!=`
+            // catches both forward progress and the reset-to-zero case.
+            if thumb_gen != prev && thumb_gen != 0 {
                 let jpeg_clone = thumb_acc.latest_jpeg.lock().unwrap()
                     .as_ref()
                     .map(|(jpeg, _)| jpeg.clone());
@@ -1114,7 +1120,8 @@ where
             let thumb_gen = thumb_acc.generation.load(std::sync::atomic::Ordering::Relaxed);
             let gen_key = format!("input:{flow_id}:{input_id}");
             let prev = thumbnail_generations.get(&gen_key).copied().unwrap_or(0);
-            if thumb_gen > prev {
+            // See the flow-level note above — same reset-on-restart trap.
+            if thumb_gen != prev && thumb_gen != 0 {
                 let jpeg_clone = thumb_acc.latest_jpeg.lock().unwrap()
                     .as_ref()
                     .map(|(jpeg, _)| jpeg.clone());

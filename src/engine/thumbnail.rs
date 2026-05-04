@@ -287,7 +287,7 @@ async fn thumbnail_loop(
                     }
                     Err(e) => {
                         tracing::debug!("Thumbnail trigger capture failed: {e}");
-                        stats.record_error();
+                        stats.record_error(e);
                         stats.reset_freeze();
                     }
                 }
@@ -341,7 +341,7 @@ async fn thumbnail_loop(
                     }
                     Err(e) => {
                         tracing::debug!("Thumbnail capture failed: {e}");
-                        stats.record_error();
+                        stats.record_error(e);
                         // Capture failed — we have no ground truth this
                         // tick, so clear the alarm rather than leaving
                         // a stale "frozen" / "black" flag on screen.

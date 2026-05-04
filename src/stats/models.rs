@@ -432,6 +432,17 @@ pub struct PerInputLive {
     /// thumbnail disabled) so older manager builds see an unchanged shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail_alarm: Option<String>,
+    /// Full per-input thumbnail counters (`total_captured`, `capture_errors`,
+    /// `has_thumbnail`, `last_error`). Lets operators see *whether each
+    /// per-input generator is actually capturing* — a passive leg that
+    /// stops decoding produces a stale frame and a flat `total_captured`,
+    /// which the alarm field alone cannot distinguish from a healthy
+    /// silent-but-decoded source. Absent on flows that don't generate
+    /// per-input thumbnails so older manager builds see an unchanged
+    /// shape (the existing `thumbnail_alarm` field remains for backwards
+    /// compatibility).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<ThumbnailStats>,
 }
 
 /// PTP state snapshot reported up to the manager.
@@ -785,6 +796,49 @@ pub struct DisplayStats {
     /// Source audio codec (`"aac"` / `"mp2"` / `"ac3"` / `"eac3"` /
     /// `"opus"` / `"none"` when audio is muted).
     pub audio_codec: String,
+
+    // ── HW-decode lifecycle (Section 1) ──
+    /// Cumulative `send_packet` failures into the active video decoder.
+    /// Sustained growth on a HW backend triggers the
+    /// `display_hw_decode_runtime_failed` Warning + a HW→CPU demotion.
+    /// Additive field — older managers ignore it via `serde(default)`.
+    #[serde(default)]
+    pub send_packet_errors: u64,
+    /// Number of HW→CPU demotions on this output. `0` is the
+    /// steady-state happy path; `1+` means the operator's chosen HW
+    /// backend stopped working and we silently fell back. Manager UI
+    /// renders e.g. "qsv (1 demotion)" so the operator knows to switch
+    /// the dropdown to `cpu` permanently or wait for a driver fix.
+    #[serde(default)]
+    pub decoder_demotions: u64,
+    /// Decoded frames produced since the active decoder was last
+    /// opened. Resets on every HW→CPU demotion and on every codec
+    /// switch. Used by the manager UI to badge "warming up" until the
+    /// first frame lands.
+    #[serde(default)]
+    pub frames_received_since_open: u64,
+
+    // ── Reolink + S4 4K diagnostics (Section 5) ──
+    /// PTS jumps detected by the demux loop's `pts_jump` heuristic.
+    /// Spikes on Reolink point at SRT-FEC repair producing out-of-order
+    /// PTS that trip the 1 s flush threshold.
+    #[serde(default)]
+    pub pts_jumps_observed: u64,
+    /// Decoded frames whose `frame.pts()` was `None`, forcing the
+    /// display loop to fall back to the most recent input PTS. Growth
+    /// implicates the B-frame display-PTS plumbing.
+    #[serde(default)]
+    pub frame_pts_fallbacks: u64,
+    /// Frames the display path dropped because the decoder produced a
+    /// pixel format we have no `*_planes` accessor for.
+    #[serde(default)]
+    pub frames_dropped_unsupported_pixfmt: u64,
+    /// Times the broadcast subscriber returned `Lagged(n)`. One per
+    /// Lagged event, regardless of `n`. Sustained growth means the
+    /// demux + decode + display pipeline can't keep up with the input
+    /// rate.
+    #[serde(default)]
+    pub subscriber_lag_events: u64,
 }
 
 /// PCR accuracy trust metric — percentiles of `|observed_Δ − expected_Δ|`
@@ -1634,4 +1688,13 @@ pub struct ThumbnailStats {
     /// intervals (30 s+). Absent when no alarm is active.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alarm: Option<String>,
+    /// Most recent capture-failure reason — verbatim error string from
+    /// the decode path (`"no video frames buffered"`, `"in-process
+    /// thumbnail decode failed: ..."`, `"thumbnail task panicked: ..."`).
+    /// Replaced on every error and cleared on the next successful capture
+    /// so the snapshot reflects the *current* failure state, not the
+    /// historical one. Lets operators distinguish "decoder rejecting the
+    /// AU" from "no buffered AUs to decode" without enabling debug logs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }

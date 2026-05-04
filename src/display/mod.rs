@@ -27,6 +27,7 @@ pub mod audio;
 pub mod audio_bars;
 pub mod audio_meter;
 pub mod clock;
+pub mod hdr_tonemap;
 pub mod kms;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -53,6 +53,14 @@ pub struct HwCodecCapability {
     pub hevc_videotoolbox: bool,
     pub h264_amf: bool,
     pub hevc_amf: bool,
+    /// VAAPI (Linux): AMD Mesa radeonsi or Intel iHD via libva. Both
+    /// encoder and decoder share the same field shape — older
+    /// managers ignore the unknown field, newer managers light up the
+    /// VAAPI rows on the Resources card.
+    #[serde(default)]
+    pub h264_vaapi: bool,
+    #[serde(default)]
+    pub hevc_vaapi: bool,
 }
 
 impl HwCodecCapability {
@@ -67,6 +75,8 @@ impl HwCodecCapability {
             || self.hevc_videotoolbox
             || self.h264_amf
             || self.hevc_amf
+            || self.h264_vaapi
+            || self.hevc_vaapi
     }
 }
 
@@ -122,6 +132,12 @@ pub struct HwSessionLimits {
     pub qsv_max_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub amf_max_sessions: Option<u32>,
+    /// VAAPI encoder session ceiling — Mesa radeonsi (AMD) typically
+    /// caps low (one or two concurrent encode sessions per VCN
+    /// engine), Intel iHD scales higher. Probed in a 1..=8 loop the
+    /// same way every other family is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vaapi_max_sessions: Option<u32>,
 }
 
 impl HwSessionLimits {
@@ -132,6 +148,7 @@ impl HwSessionLimits {
         self.nvenc_max_sessions.is_none()
             && self.qsv_max_sessions.is_none()
             && self.amf_max_sessions.is_none()
+            && self.vaapi_max_sessions.is_none()
     }
 }
 
@@ -147,11 +164,19 @@ pub struct HwDecoderSessionLimits {
     pub nvdec_max_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qsv_max_sessions: Option<u32>,
+    /// VAAPI decoder session ceiling. Same probe shape as the
+    /// encoder twin. Note: AMD's previous "no FFmpeg HW decoder name"
+    /// gap is filled by VAAPI on Linux — `h264_vaapi` /
+    /// `hevc_vaapi` are real decoder names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vaapi_max_sessions: Option<u32>,
 }
 
 impl HwDecoderSessionLimits {
     pub fn is_empty(&self) -> bool {
-        self.nvdec_max_sessions.is_none() && self.qsv_max_sessions.is_none()
+        self.nvdec_max_sessions.is_none()
+            && self.qsv_max_sessions.is_none()
+            && self.vaapi_max_sessions.is_none()
     }
 }
 
@@ -486,6 +511,14 @@ fn probe_encoder_session_limits(hw: &HwCodecCapability) -> HwSessionLimits {
             out.amf_max_sessions = Some(n);
         }
     }
+    if hw.h264_vaapi || hw.hevc_vaapi {
+        let probe_codec = if hw.h264_vaapi { "h264_vaapi" } else { "hevc_vaapi" };
+        let n = video_engine::count_max_encoder_sessions(probe_codec, SESSION_PROBE_UPPER_BOUND);
+        if n > 0 {
+            tracing::info!("vaapi encoder session capacity probed: {n}");
+            out.vaapi_max_sessions = Some(n);
+        }
+    }
     out
 }
 
@@ -520,6 +553,14 @@ fn probe_decoder_session_limits(hw: &HwCodecCapability) -> HwDecoderSessionLimit
             out.qsv_max_sessions = Some(n);
         }
     }
+    if hw.h264_vaapi || hw.hevc_vaapi {
+        let probe_codec = if hw.h264_vaapi { "h264_vaapi" } else { "hevc_vaapi" };
+        let n = video_engine::count_max_decoder_sessions(probe_codec, SESSION_PROBE_UPPER_BOUND);
+        if n > 0 {
+            tracing::info!("vaapi decoder session capacity probed: {n}");
+            out.vaapi_max_sessions = Some(n);
+        }
+    }
     out
 }
 
@@ -538,6 +579,13 @@ fn probe_hw_encoders() -> HwCodecCapability {
         hevc_videotoolbox: probe_videotoolbox_encoder("hevc_videotoolbox"),
         h264_amf: probe_runtime_encoder("h264_amf"),
         hevc_amf: probe_runtime_encoder("hevc_amf"),
+        // VAAPI: today the codepath in `video-engine::VideoEncoder::open`
+        // returns "not yet implemented" before reaching `avcodec_open2`,
+        // so the runtime probe always reports `false` even when libva
+        // is installed. The follow-up that adds `AVHWDeviceContext`
+        // wiring will flip this on automatically.
+        h264_vaapi: probe_runtime_encoder("h264_vaapi"),
+        hevc_vaapi: probe_runtime_encoder("hevc_vaapi"),
     }
 }
 
@@ -549,11 +597,18 @@ fn probe_hw_decoders() -> HwCodecCapability {
         hevc_qsv: probe_runtime_decoder("hevc_qsv"),
         h264_videotoolbox: probe_videotoolbox_decoder("h264_videotoolbox"),
         hevc_videotoolbox: probe_videotoolbox_decoder("hevc_videotoolbox"),
-        // AMD has no first-party FFmpeg HW decoder name today; AMF is
-        // encode-only at the FFmpeg layer (decode goes through VAAPI on
-        // Linux, D3D11VA on Windows). Keep the slot for symmetry.
+        // AMD has no first-party FFmpeg HW decoder name *outside* VAAPI;
+        // AMF is encode-only at the FFmpeg layer (decode rides VAAPI on
+        // Linux, D3D11VA on Windows). The VAAPI fields below cover AMD
+        // decode now.
         h264_amf: false,
         hevc_amf: false,
+        // VAAPI decode — same caveat as encode: avcodec_open2 fails
+        // until the device-context plumbing lands. Today the probe
+        // reports `false` everywhere; the wire shape is in place for a
+        // future enable.
+        h264_vaapi: probe_runtime_decoder("h264_vaapi"),
+        hevc_vaapi: probe_runtime_decoder("hevc_vaapi"),
     }
 }
 
@@ -976,6 +1031,10 @@ pub struct FlowCostPlan {
     pub qsv_sessions: u32,
     pub videotoolbox_sessions: u32,
     pub amf_sessions: u32,
+    /// VAAPI encoder sessions on this flow (libva on Linux — AMD or
+    /// Intel). Tracked alongside the other families so the manager
+    /// can render `vaapi_in_use / vaapi_max` chips.
+    pub vaapi_sessions: u32,
     /// Per-family decoder session counts charged by HW-decoded
     /// `display` outputs on this flow. NVDEC and QSV-decode are
     /// tracked separately even though QSV-decode shares an iGPU with
@@ -983,6 +1042,9 @@ pub struct FlowCostPlan {
     /// independently from encoder pressure when planning capacity.
     pub nvdec_sessions: u32,
     pub qsv_decode_sessions: u32,
+    /// VAAPI decoder sessions charged by HW-decoded `display` outputs
+    /// resolved to VAAPI (Linux; AMD or Intel via libva).
+    pub vaapi_decode_sessions: u32,
 }
 
 /// Per-family hardware encoder session counts in active use across
@@ -996,14 +1058,20 @@ pub struct HwSessionUsage {
     pub qsv_in_use: u32,
     pub videotoolbox_in_use: u32,
     pub amf_in_use: u32,
+    /// VAAPI encoder sessions in use across every flow (Linux; AMD
+    /// Mesa radeonsi or Intel iHD via libva).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub vaapi_in_use: u32,
     /// Active hardware-decoder sessions. Charged today only by
     /// HW-decoded `display` outputs (`hw_decode` resolved to NVDEC /
-    /// QSV). When future input-side HW decode lands the same
+    /// QSV / VAAPI). When future input-side HW decode lands the same
     /// counters absorb that contribution.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub nvdec_in_use: u32,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub qsv_decode_in_use: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub vaapi_decode_in_use: u32,
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -1018,6 +1086,7 @@ pub enum HwEncoderFamily {
     Qsv,
     VideoToolbox,
     Amf,
+    Vaapi,
 }
 
 impl HwEncoderFamily {
@@ -1035,6 +1104,8 @@ impl HwEncoderFamily {
             Some(HwEncoderFamily::VideoToolbox)
         } else if c.contains("amf") {
             Some(HwEncoderFamily::Amf)
+        } else if c.contains("vaapi") {
+            Some(HwEncoderFamily::Vaapi)
         } else {
             None
         }
@@ -1051,6 +1122,7 @@ impl HwEncoderFamily {
 pub enum HwDecoderFamily {
     Nvdec,
     Qsv,
+    Vaapi,
 }
 
 impl HwDecoderFamily {
@@ -1075,6 +1147,7 @@ impl HwDecoderFamily {
             HwDecodePreference::Auto | HwDecodePreference::Cpu => None,
             HwDecodePreference::Nvdec => Some(HwDecoderFamily::Nvdec),
             HwDecodePreference::Qsv => Some(HwDecoderFamily::Qsv),
+            HwDecodePreference::Vaapi => Some(HwDecoderFamily::Vaapi),
         }
     }
 }
@@ -1139,6 +1212,7 @@ pub enum ResolvedDisplayDecoder {
     Cpu,
     Nvdec,
     Qsv,
+    Vaapi,
 }
 
 impl ResolvedDisplayDecoder {
@@ -1155,6 +1229,7 @@ impl ResolvedDisplayDecoder {
             ResolvedDisplayDecoder::Cpu => None,
             ResolvedDisplayDecoder::Nvdec => Some(HwDecoderFamily::Nvdec),
             ResolvedDisplayDecoder::Qsv => Some(HwDecoderFamily::Qsv),
+            ResolvedDisplayDecoder::Vaapi => Some(HwDecoderFamily::Vaapi),
         }
     }
 
@@ -1166,6 +1241,7 @@ impl ResolvedDisplayDecoder {
             ResolvedDisplayDecoder::Cpu => video_engine::DecoderBackend::Cpu,
             ResolvedDisplayDecoder::Nvdec => video_engine::DecoderBackend::Nvdec,
             ResolvedDisplayDecoder::Qsv => video_engine::DecoderBackend::Qsv,
+            ResolvedDisplayDecoder::Vaapi => video_engine::DecoderBackend::Vaapi,
         }
     }
 }
@@ -1186,18 +1262,28 @@ pub fn resolve_display_decoder(
 
     let nvdec_compiled = cfg!(feature = "display-nvdec");
     let qsv_compiled = cfg!(feature = "display-qsv");
+    let vaapi_compiled = cfg!(feature = "display-vaapi");
     let nvdec_ok = nvdec_compiled
         && caps.is_some_and(|c| c.hw_decoders.h264_nvenc || c.hw_decoders.hevc_nvenc);
     let qsv_ok = qsv_compiled
         && caps.is_some_and(|c| c.hw_decoders.h264_qsv || c.hw_decoders.hevc_qsv);
+    let vaapi_ok = vaapi_compiled
+        && caps.is_some_and(|c| c.hw_decoders.h264_vaapi || c.hw_decoders.hevc_vaapi);
 
     match pref {
         HwDecodePreference::Cpu => Ok(ResolvedDisplayDecoder::Cpu),
         HwDecodePreference::Auto => {
+            // Auto priority: NVDEC ≻ QSV ≻ VAAPI ≻ CPU. NVDEC and QSV
+            // expose more rate-control / format detail per their vendor
+            // APIs than the libva path on the same silicon, so prefer
+            // them when present. VAAPI is the AMD-on-Linux path and the
+            // fallback for hosts without the vendor-specific stacks.
             if nvdec_ok {
                 Ok(ResolvedDisplayDecoder::Nvdec)
             } else if qsv_ok {
                 Ok(ResolvedDisplayDecoder::Qsv)
+            } else if vaapi_ok {
+                Ok(ResolvedDisplayDecoder::Vaapi)
             } else {
                 Ok(ResolvedDisplayDecoder::Cpu)
             }
@@ -1222,6 +1308,17 @@ pub fn resolve_display_decoder(
                 Err(DecoderResolutionError::DriverMissing)
             } else {
                 Ok(ResolvedDisplayDecoder::Qsv)
+            }
+        }
+        HwDecodePreference::Vaapi => {
+            if !vaapi_compiled {
+                Err(DecoderResolutionError::FeatureDisabled)
+            } else if caps.is_none() {
+                Err(DecoderResolutionError::ProbeUnavailable)
+            } else if !vaapi_ok {
+                Err(DecoderResolutionError::DriverMissing)
+            } else {
+                Ok(ResolvedDisplayDecoder::Vaapi)
             }
         }
     }
@@ -1511,6 +1608,14 @@ mod tests {
         assert_eq!(
             HwEncoderFamily::classify("h264_amf"),
             Some(HwEncoderFamily::Amf)
+        );
+        assert_eq!(
+            HwEncoderFamily::classify("h264_vaapi"),
+            Some(HwEncoderFamily::Vaapi)
+        );
+        assert_eq!(
+            HwEncoderFamily::classify("HEVC_VAAPI"),
+            Some(HwEncoderFamily::Vaapi)
         );
         assert_eq!(HwEncoderFamily::classify("libx264"), None);
         assert_eq!(HwEncoderFamily::classify("libx265"), None);

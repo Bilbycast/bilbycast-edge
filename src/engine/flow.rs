@@ -933,8 +933,10 @@ impl FlowRuntime {
                 qsv_in_use: cost_plan.qsv_sessions,
                 videotoolbox_in_use: cost_plan.videotoolbox_sessions,
                 amf_in_use: cost_plan.amf_sessions,
+                vaapi_in_use: cost_plan.vaapi_sessions,
                 nvdec_in_use: cost_plan.nvdec_sessions,
                 qsv_decode_in_use: cost_plan.qsv_decode_sessions,
+                vaapi_decode_in_use: cost_plan.vaapi_decode_sessions,
             },
         );
         let cost_units = std::sync::atomic::AtomicU32::new(cost_units);
@@ -3467,6 +3469,10 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
                     plan.hw_video_encode_outputs = plan.hw_video_encode_outputs.saturating_add(1);
                     plan.amf_sessions = plan.amf_sessions.saturating_add(1);
                 }
+                Some(crate::engine::hardware_probe::HwEncoderFamily::Vaapi) => {
+                    plan.hw_video_encode_outputs = plan.hw_video_encode_outputs.saturating_add(1);
+                    plan.vaapi_sessions = plan.vaapi_sessions.saturating_add(1);
+                }
                 None => {
                     plan.sw_video_encode_outputs = plan.sw_video_encode_outputs.saturating_add(1);
                 }
@@ -3488,9 +3494,10 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
         // runtime always agree on what backend each output ended up
         // on. A forced-but-missing backend (e.g. `nvdec` on a host
         // without an NVIDIA card) is treated as CPU here — the
-        // spawner is the authoritative gate that emits
-        // `display_hw_decode_unavailable` and refuses the start, so
-        // the flow never actually pays the cost.
+        // spawner soft-falls-back to CPU + emits
+        // `display_hw_decode_unavailable_falling_back` so the picture
+        // stays on screen, and the flow ends up paying the CPU cost
+        // we charge here.
         if let OutputConfig::Display(d) = out {
             let pref = d.hw_decode.unwrap_or_default();
             let resolved = crate::engine::hardware_probe::resolve_display_decoder(
@@ -3509,6 +3516,10 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
                     Some(crate::engine::hardware_probe::HwDecoderFamily::Qsv) => {
                         plan.qsv_decode_sessions =
                             plan.qsv_decode_sessions.saturating_add(1);
+                    }
+                    Some(crate::engine::hardware_probe::HwDecoderFamily::Vaapi) => {
+                        plan.vaapi_decode_sessions =
+                            plan.vaapi_decode_sessions.saturating_add(1);
                     }
                     None => {}
                 }
@@ -3575,6 +3586,10 @@ fn output_resource_contribution(
                 units = units.saturating_add(100);
                 usage.amf_in_use = usage.amf_in_use.saturating_add(1);
             }
+            Some(crate::engine::hardware_probe::HwEncoderFamily::Vaapi) => {
+                units = units.saturating_add(100);
+                usage.vaapi_in_use = usage.vaapi_in_use.saturating_add(1);
+            }
             None => {
                 units = units.saturating_add(500);
             }
@@ -3601,6 +3616,9 @@ fn output_resource_contribution(
                 }
                 Some(crate::engine::hardware_probe::HwDecoderFamily::Qsv) => {
                     usage.qsv_decode_in_use = usage.qsv_decode_in_use.saturating_add(1);
+                }
+                Some(crate::engine::hardware_probe::HwDecoderFamily::Vaapi) => {
+                    usage.vaapi_decode_in_use = usage.vaapi_decode_in_use.saturating_add(1);
                 }
                 None => {}
             }

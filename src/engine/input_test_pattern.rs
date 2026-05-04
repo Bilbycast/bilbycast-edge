@@ -332,6 +332,8 @@ fn backend_codec_string(codec: video_codec::VideoEncoderCodec) -> &'static str {
         VideoEncoderCodec::HevcNvenc => "hevc_nvenc",
         VideoEncoderCodec::H264Qsv => "h264_qsv",
         VideoEncoderCodec::HevcQsv => "hevc_qsv",
+        VideoEncoderCodec::H264Vaapi => "h264_vaapi",
+        VideoEncoderCodec::HevcVaapi => "hevc_vaapi",
     }
 }
 

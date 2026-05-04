@@ -2470,10 +2470,12 @@ fn validate_video_encode(
     context: &str,
 ) -> anyhow::Result<()> {
     match enc.codec.as_str() {
-        "x264" | "x265" | "h264_nvenc" | "hevc_nvenc" | "h264_qsv" | "hevc_qsv" => {}
+        "x264" | "x265" | "h264_nvenc" | "hevc_nvenc" | "h264_qsv" | "hevc_qsv"
+        | "h264_vaapi" | "hevc_vaapi" => {}
         other => bail!(
             "{context}: video_encode.codec '{other}' is not recognised; \
-             expected one of x264, x265, h264_nvenc, hevc_nvenc, h264_qsv, hevc_qsv"
+             expected one of x264, x265, h264_nvenc, hevc_nvenc, h264_qsv, hevc_qsv, \
+             h264_vaapi, hevc_vaapi"
         ),
     }
     // Reject codecs whose backend wasn't compiled into this build. Runtime
@@ -2493,6 +2495,9 @@ fn validate_video_encode(
         }
         "h264_qsv" | "hevc_qsv" => {
             if cfg!(feature = "video-encoder-qsv") { None } else { Some("video-encoder-qsv") }
+        }
+        "h264_vaapi" | "hevc_vaapi" => {
+            if cfg!(feature = "video-encoder-vaapi") { None } else { Some("video-encoder-vaapi") }
         }
         _ => None,
     };
@@ -2603,6 +2608,21 @@ fn validate_video_encode(
         ),
         ("h264_qsv" | "hevc_qsv", Some("yuv444p"), _) => bail!(
             "{context}: QSV backends do not support chroma=yuv444p; \
+             use x264 or x265 instead"
+        ),
+        _ => {}
+    }
+    // VAAPI backend restrictions — h264_vaapi is 8-bit only (HEVC Main10
+    // is the path to 10-bit, and only on Intel iHD; AMD's H.264 encoder
+    // is 4:2:0 8-bit only across every VCN generation). Neither VAAPI
+    // variant exposes 4:4:4 chroma through libva today.
+    match (enc.codec.as_str(), chroma_str, enc.bit_depth) {
+        ("h264_vaapi", _, Some(10)) => bail!(
+            "{context}: h264_vaapi does not support 10-bit encoding; \
+             use hevc_vaapi, x264, or x265 instead"
+        ),
+        ("h264_vaapi" | "hevc_vaapi", Some("yuv444p"), _) => bail!(
+            "{context}: VAAPI backends do not support chroma=yuv444p; \
              use x264 or x265 instead"
         ),
         _ => {}
@@ -3539,8 +3559,8 @@ pub fn validate_output_with_input(
                 // suggestion — WebRTC browsers can't decode HEVC at all,
                 // so rebuilding wouldn't help.
                 match ve.codec.as_str() {
-                    "x265" | "hevc_nvenc" | "hevc_qsv" => bail!(
-                        "WebRTC output '{}': video_encode.codec '{}' is not supported — WebRTC browsers only decode H.264 (use 'x264', 'h264_nvenc', or 'h264_qsv')",
+                    "x265" | "hevc_nvenc" | "hevc_qsv" | "hevc_vaapi" => bail!(
+                        "WebRTC output '{}': video_encode.codec '{}' is not supported — WebRTC browsers only decode H.264 (use 'x264', 'h264_nvenc', 'h264_qsv', or 'h264_vaapi')",
                         webrtc.id, ve.codec,
                     ),
                     _ => {}
@@ -6758,6 +6778,34 @@ mod tests {
             assert!(
                 err.contains("QSV backends do not support chroma=yuv444p"),
                 "expected QSV chroma rejection, got: {err}"
+            );
+        }
+        // VAAPI mirrors the QSV shape: codec names must be recognised at
+        // all build configurations; backend-specific restrictions only
+        // fire when the feature is on.
+        assert_recognised(
+            validate_video_encode(&make("h264_vaapi", Some(8), Some("yuv420p")), "ctx"),
+            "h264_vaapi 8-bit yuv420p",
+        );
+        assert_recognised(
+            validate_video_encode(&make("hevc_vaapi", Some(8), Some("yuv420p")), "ctx"),
+            "hevc_vaapi 8-bit yuv420p",
+        );
+        #[cfg(feature = "video-encoder-vaapi")]
+        {
+            let err = validate_video_encode(&make("h264_vaapi", Some(10), None), "ctx")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("h264_vaapi does not support 10-bit"),
+                "expected VAAPI 10-bit rejection, got: {err}"
+            );
+            let err = validate_video_encode(&make("hevc_vaapi", None, Some("yuv444p")), "ctx")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("VAAPI backends do not support chroma=yuv444p"),
+                "expected VAAPI chroma rejection, got: {err}"
             );
         }
     }

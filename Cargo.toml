@@ -213,29 +213,44 @@ video-encoder-nvenc = ["video-thumbnail", "video-engine/video-encoder-nvenc"]
 # time and the Intel media driver + libvpl runtime on the host. Off by
 # default.
 video-encoder-qsv = ["video-thumbnail", "video-engine/video-encoder-qsv"]
+# Enable VAAPI hardware H.264/HEVC encoding (Linux). Royalty-free at
+# every layer (libva is MIT, FFmpeg's VAAPI wrapper is LGPL). Primary
+# motivation: AMD-on-Linux encode (the only real path on AMD) and
+# future zero-copy display rendering. Requires `libva-dev` at build
+# time and a working VAAPI driver at runtime — Mesa radeonsi for AMD,
+# iHD for Intel. Off by default. NB: today the feature is build-system
+# wired only — actually opening a VAAPI encoder still returns a
+# "not yet implemented" error pending the `AVHWDeviceContext` plumbing
+# in `video-engine`.
+video-encoder-vaapi = ["video-thumbnail", "video-engine/video-encoder-vaapi"]
 # Bundle every video codec backend the edge knows about — encoders
-# (x264 + x265 + NVENC + QSV) AND HW decoders for the display output
-# (NVDEC + QSV-decode). Used by the GitHub Actions release matrix to
-# produce the `*-full` artefact on x86_64. At runtime, operators pick
-# the per-flow codec; NVENC / NVDEC activate only on hosts with NVIDIA
-# driver + hardware, QSV (encode + decode) only on hosts with an
-# Intel iGPU + media driver, otherwise x264 / x265 run on CPU and the
-# display output falls back to libavcodec software decode. The runtime
-# probe in `engine::hardware_probe` auto-detects which backends the
-# host can actually open and only those land on `HealthPayload.capabilities`.
+# (x264 + x265 + NVENC + QSV + VAAPI) AND HW decoders for the display
+# output (NVDEC + QSV-decode + VAAPI-decode). Used by the GitHub
+# Actions release matrix to produce the `*-full` artefact on x86_64.
+# At runtime, operators pick the per-flow codec; NVENC / NVDEC
+# activate only on hosts with NVIDIA driver + hardware, QSV
+# (encode + decode) only on hosts with an Intel iGPU + media driver,
+# VAAPI activates on AMD (Mesa radeonsi) or Intel (iHD) hosts,
+# otherwise x264 / x265 run on CPU and the display output falls back
+# to libavcodec software decode. The runtime probe in
+# `engine::hardware_probe` auto-detects which backends the host can
+# actually open and only those land on `HealthPayload.capabilities`.
 # Inherits libx264's + libx265's GPL v2+ terms — the resulting binary
 # is an AGPL-3.0-or-later combined work (see NOTICE.full). Build
-# prereqs: `nv-codec-headers` (NVENC + NVDEC share it) and `libvpl-dev`
-# (QSV encode + decode share it). `aarch64` builds intentionally drop
-# the QSV bundle (Intel iGPU is x86_64-only) and list the remaining
-# features explicitly in the release workflow.
+# prereqs: `nv-codec-headers` (NVENC + NVDEC share it), `libvpl-dev`
+# (QSV encode + decode share it), and `libva-dev` (VAAPI encode +
+# decode share it). `aarch64` builds intentionally drop the QSV bundle
+# (Intel iGPU is x86_64-only) and list the remaining features
+# explicitly in the release workflow.
 video-encoders-full = [
     "video-encoder-x264",
     "video-encoder-x265",
     "video-encoder-nvenc",
     "video-encoder-qsv",
+    "video-encoder-vaapi",
     "display-nvdec",
     "display-qsv",
+    "display-vaapi",
 ]
 # Local-display output — decode the flow's video + audio and render to a
 # Linux KMS connector (HDMI / DisplayPort) plus an ALSA audio device.
@@ -262,11 +277,16 @@ display = [
 # (`display-nvdec` / `display-qsv`).
 display-nvdec = ["display", "video-engine/video-decoder-nvdec"]
 display-qsv = ["display", "video-engine/video-decoder-qsv"]
-# VAAPI is reserved as a v2 placeholder — VAAPI decode requires a full
-# `AVHWDeviceContext` + `get_format` callback path that hasn't been
-# wrapped in `video-engine` yet. The feature exists today so the
-# manager UI's capability schema stays stable when the v2 wiring lands.
-display-vaapi = ["display"]
+# VAAPI display-output decode (Linux). Pulls in the matching
+# `video-engine/video-decoder-vaapi` feature, which flips
+# `--enable-vaapi --enable-decoder=h264_vaapi --enable-decoder=hevc_vaapi`
+# in the vendored FFmpeg build and links libva + libva-drm. NB: the
+# build is wired through; actually opening a VAAPI decoder still
+# returns a "not yet implemented" error pending the
+# `AVHWDeviceContext` plumbing in `video-engine` — the display
+# resolver must continue to fall back to NVDEC / QSV / Cpu until
+# that work lands.
+display-vaapi = ["display", "video-engine/video-decoder-vaapi"]
 # Enable TLS (HTTPS on API + RTMPS) support via rustls/tokio-rustls/axum-server.
 tls = ["dep:tokio-rustls", "dep:axum-server"]
 # Enable WebRTC WHIP/WHEP input and output via str0m (pure Rust, sans-I/O).

@@ -4075,8 +4075,8 @@ fn default_sync_mode() -> String {
 /// they want to dedicate to this confidence-monitor playout (or `Cpu`
 /// to keep GPU resources free for a heavy transcode flow elsewhere).
 ///
-/// String wire shape: `"auto"`, `"cpu"`, `"nvdec"`, `"qsv"`. Default is
-/// `Auto`. The deserialiser accepts the legacy short forms only;
+/// String wire shape: `"auto"`, `"cpu"`, `"nvdec"`, `"qsv"`, `"vaapi"`.
+/// Default is `Auto`. The deserialiser accepts the short forms only;
 /// unknown strings fail validation with `display_hw_decode_invalid`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -4086,6 +4086,7 @@ pub enum HwDecodePreference {
     Cpu,
     Nvdec,
     Qsv,
+    Vaapi,
 }
 
 /// How the display output picks the connector's KMS mode.

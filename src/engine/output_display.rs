@@ -101,43 +101,54 @@ async fn run_display_output(
     flow_id: String,
 ) -> Result<()> {
     // 0. Resolve the operator's hardware-decode preference against the
-    //    edge's startup-probed capabilities. `Auto` falls back to CPU
-    //    when no HW backend is available; explicit `Nvdec` / `Qsv`
-    //    that the host can't satisfy aborts the start with the
-    //    `display_hw_decode_unavailable` event so the manager UI can
-    //    flag it on the flow modal. The cost-plan resolver in
-    //    `derive_cost_plan` runs the same function over the same
-    //    snapshot, so the post-resolve cost charged at flow create
-    //    matches what we actually run here.
+    //    edge's startup-probed capabilities. **Broadcast invariant**:
+    //    the display output never goes dark for HW-availability
+    //    reasons. `Auto` picks the best HW backend the host can do and
+    //    falls back to CPU; an explicit `Nvdec` / `Qsv` / `Vaapi` that
+    //    the host can't satisfy emits a Warning
+    //    (`display_hw_decode_unavailable_falling_back`) and silently
+    //    runs CPU instead so the picture stays on screen — the
+    //    operator sees the alarm in the UI and can choose to leave
+    //    the dropdown alone or switch it to `cpu` permanently. The
+    //    cost-plan resolver in `derive_cost_plan` already does the
+    //    same `.unwrap_or(Cpu)` so cost accounting matches what we
+    //    actually run here. The Critical
+    //    `display_hw_decode_unavailable` code is reserved for a future
+    //    "neither HW nor CPU works" path (e.g. CPU decode disabled at
+    //    build); not reachable today.
     let pref = config.hw_decode.unwrap_or_default();
-    let resolved = match crate::engine::hardware_probe::resolve_display_decoder(
-        &pref,
-        crate::engine::hardware_probe::static_capabilities()
-            .as_deref(),
-    ) {
-        Ok(r) => r,
-        Err(reason) => {
-            let msg = format!(
-                "display output '{}': hw_decode '{:?}' not available on this host ({})",
-                config.id,
-                pref,
-                reason.as_reason(),
-            );
-            event_sender.emit_flow_with_details(
-                EventSeverity::Critical,
-                crate::manager::events::category::SYSTEM_RESOURCES,
-                msg.clone(),
-                &flow_id,
-                serde_json::json!({
-                    "error_code": "display_hw_decode_unavailable",
-                    "output_id": config.id,
-                    "preference": format!("{:?}", pref).to_lowercase(),
-                    "reason": reason.as_reason(),
-                }),
-            );
-            return Err(anyhow::anyhow!(msg));
-        }
-    };
+    let (resolved, hw_unavailable_reason) =
+        match crate::engine::hardware_probe::resolve_display_decoder(
+            &pref,
+            crate::engine::hardware_probe::static_capabilities().as_deref(),
+        ) {
+            Ok(r) => (r, None),
+            Err(reason) => {
+                let reason_tag = reason.as_reason();
+                let msg = format!(
+                    "display output '{}': hw_decode '{:?}' unavailable on this host ({}); \
+                     falling back to CPU decode",
+                    config.id, pref, reason_tag,
+                );
+                event_sender.emit_flow_with_details(
+                    EventSeverity::Warning,
+                    crate::manager::events::category::SYSTEM_RESOURCES,
+                    msg,
+                    &flow_id,
+                    serde_json::json!({
+                        "error_code": "display_hw_decode_unavailable_falling_back",
+                        "output_id": config.id,
+                        "preference": format!("{:?}", pref).to_lowercase(),
+                        "reason": reason_tag,
+                        "fell_back_to": "cpu",
+                    }),
+                );
+                (
+                    crate::engine::hardware_probe::ResolvedDisplayDecoder::Cpu,
+                    Some(reason_tag),
+                )
+            }
+        };
     let backend = resolved.as_backend();
 
     // 1. Open KMS at the connector's preferred mode. The actual mode the
@@ -246,6 +257,21 @@ async fn run_display_output(
     let demux_program = config.program_number;
     let demux_track = config.audio_track_index;
     let demux_backend = backend;
+    // True when the open-time soft-fallback (Section 2 above) already
+    // emitted its Warning event — keeps the runtime fallback machinery
+    // from double-warning since `state.backend` is already `Cpu` and
+    // the operator's preference can't be honoured anyway.
+    let demux_hw_already_unavailable = hw_unavailable_reason.is_some();
+    // Snapshot the operator's original preference (before soft-fallback
+    // forced it to Cpu) so the runtime fallback events name the right
+    // backend in the manager UI.
+    let demux_requested_backend = match pref {
+        crate::config::models::HwDecodePreference::Auto
+        | crate::config::models::HwDecodePreference::Cpu => backend,
+        crate::config::models::HwDecodePreference::Nvdec => DecoderBackend::Nvdec,
+        crate::config::models::HwDecodePreference::Qsv => DecoderBackend::Qsv,
+        crate::config::models::HwDecodePreference::Vaapi => DecoderBackend::Vaapi,
+    };
     let demux_handle = tokio::task::spawn_blocking(move || {
         demux_decode_loop(
             &mut demux_rx,
@@ -259,6 +285,8 @@ async fn run_display_output(
             demux_flow_id,
             demux_output_id,
             demux_backend,
+            demux_requested_backend,
+            demux_hw_already_unavailable,
         );
     });
 
@@ -276,10 +304,18 @@ async fn run_display_output(
     // so the manager UI's flow card and Resources card can render the
     // active mode (e.g. "display (1920x1080@60Hz · NVDEC)"). Static
     // strings — the resolver runs once per output.
-    let decoder_kind_label: &'static str = match resolved {
-        crate::engine::hardware_probe::ResolvedDisplayDecoder::Cpu => "cpu",
-        crate::engine::hardware_probe::ResolvedDisplayDecoder::Nvdec => "nvdec",
-        crate::engine::hardware_probe::ResolvedDisplayDecoder::Qsv => "qsv",
+    let decoder_kind_label: &'static str = match (resolved, hw_unavailable_reason) {
+        // Soft-fallback path: operator asked for HW but the host can't
+        // do it. We're running CPU but the UI must reflect *why* — so
+        // the flow card reads "cpu (hw unavailable)" rather than just
+        // "cpu", which would make the dropdown choice look correct.
+        (crate::engine::hardware_probe::ResolvedDisplayDecoder::Cpu, Some(_)) => {
+            "cpu (hw unavailable)"
+        }
+        (crate::engine::hardware_probe::ResolvedDisplayDecoder::Cpu, None) => "cpu",
+        (crate::engine::hardware_probe::ResolvedDisplayDecoder::Nvdec, _) => "nvdec",
+        (crate::engine::hardware_probe::ResolvedDisplayDecoder::Qsv, _) => "qsv",
+        (crate::engine::hardware_probe::ResolvedDisplayDecoder::Vaapi, _) => "vaapi",
     };
     let display_handle = tokio::task::spawn_blocking(move || {
         display_loop(
@@ -348,22 +384,45 @@ async fn run_display_output(
 
 // ── Frame channels ────────────────────────────────────────────────
 
+/// Chroma layout carried alongside the Y plane through the demux →
+/// display mpsc. CPU planar YUV (`yuv420p` / `yuv422p` / `yuv444p` and
+/// the 10/12-bit LE planar siblings) lands in the `Planar` arm; HW
+/// decoder output (NV12 / NV16 / P010LE / P016LE / P210LE / P216LE)
+/// lands in the `SemiPlanar` arm. The display loop dispatches on the
+/// arm at blit time — libswscale handles the format conversion +
+/// matrix + scale natively for both, so no per-pixel reformat runs on
+/// the demux thread (an earlier revision shifted P0xx high-bit data
+/// down to YUV420P10LE in pure Rust and couldn't sustain 4K 50 fps —
+/// the broadcast subscriber kept lagging and the decoder flushed on
+/// every `RecvError::Lagged`, leaving the operator looking at one
+/// frame every few seconds).
+enum VideoFrameChroma {
+    Planar {
+        u: Vec<u8>,
+        u_stride: usize,
+        v: Vec<u8>,
+        v_stride: usize,
+    },
+    SemiPlanar {
+        uv: Vec<u8>,
+        uv_stride: usize,
+    },
+}
+
 struct VideoFrame {
-    /// Raw YUV planes in source format. The display task hands these to
-    /// libswscale (via `VideoScaler::scale_raw_planes_into_packed`) for
-    /// the YUV → BGRA conversion + scale, writing straight into the KMS
-    /// dumb buffer.
+    /// Y plane (luma) — raw bytes from the decoder, owned so we can
+    /// move them across the mpsc out of the decoder's lifetime.
     y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
     y_stride: usize,
-    u_stride: usize,
-    v_stride: usize,
+    /// Chroma — planar (3 planes) or semi-planar (interleaved UV).
+    /// See [`VideoFrameChroma`].
+    chroma: VideoFrameChroma,
     width: u32,
     height: u32,
-    /// FFmpeg `AVPixelFormat` integer (e.g. `AV_PIX_FMT_YUV420P`). Threads
-    /// through to the scaler so libswscale knows the source planes' chroma
-    /// subsampling and bit depth.
+    /// FFmpeg `AVPixelFormat` integer of the source layout — what
+    /// the decoder actually produced. The display scaler is keyed on
+    /// this, so libswscale picks up the correct semi-planar / planar
+    /// reader (and bit-depth) without us reformatting first.
     pixel_format: i32,
     /// FFmpeg `AVColorSpace` (`AVCOL_SPC_*`). Drives the YUV→RGB matrix
     /// libswscale uses — BT.709 for HD, BT.601 for SD, BT.2020 for UHD.
@@ -371,6 +430,14 @@ struct VideoFrame {
     /// the display loop falls back to BT.709 for ≥720p sources, BT.601
     /// otherwise.
     colorspace: i32,
+    /// FFmpeg `AVColorTransferCharacteristic` (`AVCOL_TRC_*`). Drives
+    /// the EOTF — `BT709` (1) for SDR HD, `SMPTE2084` (16) for PQ
+    /// HDR, `ARIB_STD_B67` (18) for HLG HDR. The display loop reads
+    /// this to decide whether to apply an HDR-to-SDR tonemap LUT
+    /// after libswscale produces 8-bit BGRA, so a UHD HDR contribution
+    /// feed shows recognisable colours on a Rec.709 confidence panel
+    /// instead of a dim, washed-out frame.
+    color_transfer: i32,
     full_range: bool,
     pts_90k: u64,
 }
@@ -397,22 +464,50 @@ fn demux_decode_loop(
     flow_id: String,
     output_id: String,
     backend: DecoderBackend,
+    requested_backend: DecoderBackend,
+    hw_already_unavailable: bool,
 ) {
     let mut demuxer = TsDemuxer::with_audio_track(program_number, audio_track_index);
     let mut video_decoder: Option<VideoDecoder> = None;
     let mut current_video_codec: Option<VideoCodec> = None;
+    // HW-decoder open lifecycle. Fresh per flow run, so each flow
+    // restart re-attempts the operator's chosen HW backend before
+    // falling back to CPU. See `open_video_decoder_with_retry` for
+    // the retry budget + event semantics. When the open-time
+    // soft-fallback (Section 2 in `run_display_output`) already fired,
+    // we start with `fell_back_to_cpu = true` so the runtime fallback
+    // machinery doesn't double-warn.
+    let mut hw_open_state = HwOpenState {
+        backend,
+        requested_backend,
+        fell_back_to_cpu: hw_already_unavailable,
+        fallback_event_emitted: hw_already_unavailable,
+        consecutive_send_errors: 0,
+        last_send_error_log_at: None,
+        first_send_after_open: None,
+    };
     let mut aac_decoder: Option<AacDecoder> = None;
     let mut ff_audio_decoder: Option<FfAudioDecoder> = None;
     let mut current_ff_codec: Option<AudioDecoderCodec> = None;
     let mut last_lag_log = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(2))
         .unwrap_or_else(std::time::Instant::now);
+    let mut last_lagged_at: Option<Instant> = None;
     // Track the previous video PTS so a large discontinuity (operator
     // input switch — new stream has an unrelated PTS base) flushes the
     // persistent video decoder. Without this, the decoder keeps
     // referencing the old stream's reference frames and either emits
     // glitched output or stalls until its internal IDR-anchor recycles.
     let mut last_video_pts: Option<u64> = None;
+    // Re-arming guard: the display path supports planar YUV 4:2:0/4:2:2/
+    // 4:4:4 (8/10/12-bit) and semi-planar NV12 / NV16 / P010LE / P016LE
+    // / P210LE / P216LE. Any other pixel format from the decoder is
+    // silently dropped. Emit a Warning-level event when we first see
+    // an unsupported format and then again every
+    // `UNSUPPORTED_PIXFMT_RE_EMIT_S` seconds — the per-frame counter
+    // (`frames_dropped_unsupported_pixfmt`) gives the manager UI the
+    // continuous-rate signal between event emissions.
+    let mut last_unsupported_pixfmt_at: Option<Instant> = None;
 
     loop {
         if cancel.is_cancelled() {
@@ -426,6 +521,7 @@ fn demux_decode_loop(
                 // new anchor. Reuse the demuxer's cached PSI.
                 if let Some(d) = video_decoder.as_mut() {
                     d.flush();
+                    reset_decoder_open_window(&mut hw_open_state, &counters);
                 }
                 if let Some(d) = aac_decoder.as_mut() {
                     d.reset();
@@ -434,6 +530,15 @@ fn demux_decode_loop(
                     d.flush();
                 }
                 let now = std::time::Instant::now();
+                counters.subscriber_lag_events.fetch_add(1, Ordering::Relaxed);
+                let elapsed_since_prev = last_lagged_at.map(|t| now.duration_since(t));
+                last_lagged_at = Some(now);
+                tracing::debug!(
+                    output_id = %output_id,
+                    dropped = n,
+                    since_prev_ms = elapsed_since_prev.map(|d| d.as_millis() as u64).unwrap_or(0),
+                    "display broadcast subscriber lagged",
+                );
                 if now.duration_since(last_lag_log).as_secs_f32() > 1.0 {
                     last_lag_log = now;
                     emit_event(
@@ -464,52 +569,42 @@ fn demux_decode_loop(
         for frame in frames {
             match frame {
                 DemuxedFrame::H264 { nalus, pts, .. } => {
-                    if pts_jump(last_video_pts, pts) {
-                        if let Some(d) = video_decoder.as_mut() {
-                            d.flush();
-                        }
-                        if let Some(d) = aac_decoder.as_mut() {
-                            d.reset();
-                        }
-                        if let Some(d) = ff_audio_decoder.as_mut() {
-                            d.flush();
-                        }
-                    }
-                    last_video_pts = Some(pts);
-                    ensure_video_decoder(
+                    handle_video_au(
+                        &nalus,
+                        pts,
+                        VideoCodec::H264,
+                        &mut last_video_pts,
                         &mut video_decoder,
                         &mut current_video_codec,
-                        VideoCodec::H264,
-                        backend,
+                        &mut aac_decoder,
+                        &mut ff_audio_decoder,
+                        &mut hw_open_state,
+                        &mut last_unsupported_pixfmt_at,
+                        &counters,
+                        &vtx,
+                        &event_sender,
+                        &flow_id,
+                        &output_id,
                     );
-                    if let Some(decoder) = video_decoder.as_mut() {
-                        feed_video_decoder(decoder, &nalus, pts);
-                        drain_video_frames(decoder, pts, &vtx, &counters);
-                    }
                 }
                 DemuxedFrame::H265 { nalus, pts, .. } => {
-                    if pts_jump(last_video_pts, pts) {
-                        if let Some(d) = video_decoder.as_mut() {
-                            d.flush();
-                        }
-                        if let Some(d) = aac_decoder.as_mut() {
-                            d.reset();
-                        }
-                        if let Some(d) = ff_audio_decoder.as_mut() {
-                            d.flush();
-                        }
-                    }
-                    last_video_pts = Some(pts);
-                    ensure_video_decoder(
+                    handle_video_au(
+                        &nalus,
+                        pts,
+                        VideoCodec::Hevc,
+                        &mut last_video_pts,
                         &mut video_decoder,
                         &mut current_video_codec,
-                        VideoCodec::Hevc,
-                        backend,
+                        &mut aac_decoder,
+                        &mut ff_audio_decoder,
+                        &mut hw_open_state,
+                        &mut last_unsupported_pixfmt_at,
+                        &counters,
+                        &vtx,
+                        &event_sender,
+                        &flow_id,
+                        &output_id,
                     );
-                    if let Some(decoder) = video_decoder.as_mut() {
-                        feed_video_decoder(decoder, &nalus, pts);
-                        drain_video_frames(decoder, pts, &vtx, &counters);
-                    }
                 }
                 DemuxedFrame::Aac { data, pts } => {
                     if let Some(asc) = demuxer.cached_aac_config() {
@@ -579,42 +674,434 @@ fn aac_decoder_from_adts_config(
     AacDecoder::open_raw(&asc)
 }
 
+/// HW-decode lifecycle state for one demux loop run. Tracks the active
+/// backend (mutates on fallback), a one-shot "we already warned about
+/// the fallback" gate, and the operator's original requested backend
+/// for the diagnostic event detail. Constructed once at the top of
+/// `demux_decode_loop`; a fresh struct on the next flow restart gives
+/// HW another chance, matching the "toggle recording off → picture
+/// returns" recovery path operators already rely on.
+struct HwOpenState {
+    /// Backend currently used for `open_with_backend`. Demotes from a
+    /// HW backend to `Cpu` once the retry budget is exhausted.
+    backend: DecoderBackend,
+    /// Snapshot of the operator's chosen backend at task bring-up.
+    /// Stable across the loop's lifetime — only used for the warning
+    /// event detail so the operator knows which HW path was attempted.
+    requested_backend: DecoderBackend,
+    /// `true` once we've degraded to CPU on this run. Set by either
+    /// the open-time soft-fallback (Section 2 of the display fix), the
+    /// open-retry exhaustion path in `open_video_decoder_with_retry`,
+    /// or the runtime fallback (`force_cpu_fallback`).
+    fell_back_to_cpu: bool,
+    /// One-shot gate so the warning event fires exactly once per
+    /// fallback, never per access unit.
+    fallback_event_emitted: bool,
+    /// Sustained `send_packet_with_pts` failure counter. Bumped from
+    /// `feed_video_decoder` on every `Err`; reset to 0 from
+    /// `drain_video_frames` on the first frame after a failure run
+    /// (proves the decode path recovered). Crossing
+    /// `RUNTIME_FAIL_DEMOTE_THRESHOLD` while still on a HW backend
+    /// triggers `force_cpu_fallback` — catches the "QSV opens but
+    /// every send_packet returns EINVAL on Arrow Lake / fresh iHD"
+    /// pattern that today's silent `let _ = ...` swallowing hides.
+    consecutive_send_errors: u32,
+    /// Last wall-clock at which `feed_video_decoder` emitted a
+    /// `tracing::warn!` for a send_packet error. One-per-second
+    /// throttle so a hard-broken HW backend doesn't flood the log
+    /// before the demotion threshold trips.
+    last_send_error_log_at: Option<Instant>,
+    /// Wall-clock of the first **successful** `send_packet_with_pts`
+    /// after the current decoder was opened. `None` means we haven't
+    /// fed the decoder a real packet yet (warm-up window). Section 3
+    /// watchdog reads this — once it's set + 2500 ms have passed +
+    /// `frames_received_since_open == 0` while still on a HW backend,
+    /// we emit `display_hw_decode_no_frames` and demote to CPU.
+    first_send_after_open: Option<Instant>,
+}
+
+/// Sustained run of `send_packet_with_pts` errors after which the
+/// runtime path treats the active HW backend as broken and demotes to
+/// CPU. ≈ 1 s at 25–30 fps; long enough to ride out legitimate
+/// broadcast packet errors (SRT-FEC repair, momentary stream
+/// corruption) without flapping back to CPU on every transient. The
+/// reset in `drain_video_frames` is what makes that work — a single
+/// good frame proves the decode path is live.
+const RUNTIME_FAIL_DEMOTE_THRESHOLD: u32 = 30;
+
+/// Watchdog deadline for "decoder accepted packets but never produced
+/// a frame". Picked so that legitimate first-frame latency on QSV /
+/// VAAPI on Arrow Lake (vendor docs: 100–300 ms) sits comfortably
+/// inside the gate, while a hard-broken HW backend trips it within
+/// the operator's reaction time. `first_send_after_open` only sets
+/// after a successful `send_packet`, so we're already past the
+/// "waiting for SPS/PPS / first IDR" gate when the timer arms.
+const WATCHDOG_NO_FRAMES_MS: u64 = 2_500;
+
+/// Re-arm period for the unsupported-pix-fmt warning event in
+/// `drain_video_frames`. The original 1-shot gate hid sustained drops
+/// after the first warning; re-emitting once a minute keeps the
+/// operator's event feed legible without flooding it. The accompanying
+/// `frames_dropped_unsupported_pixfmt` counter tracks the per-frame
+/// rate independently.
+const UNSUPPORTED_PIXFMT_RE_EMIT_S: u64 = 60;
+
+/// Open a `VideoDecoder` with bounded HW retry + CPU fallback.
+///
+/// On a flow restart that overlaps the previous flow's HW context
+/// (typical when the operator toggles `recording.enabled`, since that
+/// triggers a `destroy_flow` → `create_flow` round-trip), the GPU
+/// driver may return "no free session" / "device busy" for a brief
+/// window. We retry up to 3 times at 50 / 100 / 200 ms before giving
+/// up on HW and switching this run to CPU decode — broadcast outputs
+/// must come back to picture, even at the cost of operator-chosen HW.
+///
+/// On the CPU branch (operator-chosen or post-fallback) we open once
+/// with no sleep; CPU decoder open is cheap and never contends.
+fn open_video_decoder_with_retry(
+    codec: VideoCodec,
+    state: &mut HwOpenState,
+    counters: &DisplayStatsCounters,
+    event_sender: &EventSender,
+    flow_id: &str,
+    output_id: &str,
+) -> Option<VideoDecoder> {
+    if matches!(state.backend, DecoderBackend::Cpu) {
+        return VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu).ok();
+    }
+
+    const ATTEMPT_DELAYS_MS: [u64; 3] = [50, 100, 200];
+    let mut last_err: Option<String> = None;
+    for (attempt_idx, delay_ms) in
+        std::iter::once(0u64).chain(ATTEMPT_DELAYS_MS.iter().copied()).enumerate()
+    {
+        if delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        match VideoDecoder::open_with_backend(codec, state.backend) {
+            Ok(d) => {
+                if attempt_idx > 0 {
+                    tracing::info!(
+                        "display HW decoder opened on attempt {} (flow='{flow_id}', output='{output_id}')",
+                        attempt_idx + 1,
+                    );
+                }
+                return Some(d);
+            }
+            Err(e) => {
+                last_err = Some(e.to_string());
+            }
+        }
+    }
+
+    // Retry budget exhausted. Demote to CPU for the rest of this run.
+    state.backend = DecoderBackend::Cpu;
+    state.fell_back_to_cpu = true;
+    counters.decoder_demotions.fetch_add(1, Ordering::Relaxed);
+    if !state.fallback_event_emitted {
+        state.fallback_event_emitted = true;
+        let requested = backend_name(state.requested_backend);
+        let last_error = last_err.clone().unwrap_or_else(|| "unknown".to_string());
+        event_sender.emit_flow_with_details(
+            EventSeverity::Warning,
+            crate::manager::events::category::SYSTEM_RESOURCES,
+            format!(
+                "Display HW decode unavailable on flow '{flow_id}' — fell back to CPU after 3 attempts"
+            ),
+            flow_id,
+            serde_json::json!({
+                "error_code": "display_hw_decode_unavailable",
+                "output_id": output_id,
+                "requested_backend": requested,
+                "fell_back_to": "cpu",
+                "attempts": ATTEMPT_DELAYS_MS.len() + 1,
+                "last_error": last_error,
+            }),
+        );
+    }
+    VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu).ok()
+}
+
 fn ensure_video_decoder(
     slot: &mut Option<VideoDecoder>,
     current: &mut Option<VideoCodec>,
     desired: VideoCodec,
-    backend: DecoderBackend,
+    state: &mut HwOpenState,
+    counters: &DisplayStatsCounters,
+    event_sender: &EventSender,
+    flow_id: &str,
+    output_id: &str,
 ) {
     if *current == Some(desired) && slot.is_some() {
         return;
     }
     *current = Some(desired);
-    // The backend was resolved against `static_capabilities()` at task
-    // bring-up — by here it's guaranteed to be a backend the host can
-    // open. A failed `open_with_backend` after a successful resolution
-    // means the codec context allocation itself failed (out-of-memory)
-    // or the GPU went away mid-process; both surface as `None` and
-    // the demux loop will retry on the next frame after `flush()` —
-    // matching the existing behaviour for spurious decoder failures.
-    *slot = VideoDecoder::open_with_backend(desired, backend).ok();
+    *slot = open_video_decoder_with_retry(desired, state, counters, event_sender, flow_id, output_id);
+    if slot.is_some() {
+        // Fresh decoder — re-arm the watchdog/error window. The watchdog
+        // gates on `first_send_after_open` being set, so leaving it None
+        // here is correct — the next successful send_packet will arm it.
+        reset_decoder_open_window(state, counters);
+    }
+}
+
+/// Stable short name for an HW backend, used in event details and log
+/// fields. Mirrors the JSON wire shape that the manager UI's flow card
+/// matches against.
+fn backend_name(backend: DecoderBackend) -> &'static str {
+    match backend {
+        DecoderBackend::Cpu => "cpu",
+        DecoderBackend::Nvdec => "nvdec",
+        DecoderBackend::Qsv => "qsv",
+        DecoderBackend::Vaapi => "vaapi",
+    }
+}
+
+/// Reset the per-open accounting on `HwOpenState` + `DisplayStatsCounters`.
+/// Called on every fresh decoder open and on every decoder flush
+/// (`pts_jump`, broadcast `Lagged`) — both are conceptually a re-open
+/// from the watchdog's POV.
+fn reset_decoder_open_window(state: &mut HwOpenState, counters: &DisplayStatsCounters) {
+    state.consecutive_send_errors = 0;
+    state.first_send_after_open = None;
+    counters
+        .frames_received_since_open
+        .store(0, Ordering::Relaxed);
+}
+
+/// Switch the active decoder from a HW backend to CPU mid-flight.
+/// Called by both the runtime send-error threshold (Section 1) and the
+/// watchdog (Section 3). Idempotent on repeat calls — subsequent calls
+/// are no-ops because `state.backend` is already `Cpu`. Emits one
+/// Warning event with the supplied `trigger` so the manager UI can
+/// distinguish "send_packet kept failing" from "decoder accepted
+/// packets but never produced a frame". Single-shot via
+/// `state.fallback_event_emitted`.
+#[allow(clippy::too_many_arguments)]
+fn force_cpu_fallback(
+    slot: &mut Option<VideoDecoder>,
+    current: &mut Option<VideoCodec>,
+    state: &mut HwOpenState,
+    counters: &DisplayStatsCounters,
+    event_sender: &EventSender,
+    flow_id: &str,
+    output_id: &str,
+    trigger: &'static str,
+    last_error: Option<String>,
+) {
+    if matches!(state.backend, DecoderBackend::Cpu) {
+        // Already on CPU — nothing to demote. This branch is hit by
+        // the watchdog when a previous fallback already moved us off
+        // HW, plus by the send-error threshold path on a re-entry.
+        return;
+    }
+    state.backend = DecoderBackend::Cpu;
+    state.fell_back_to_cpu = true;
+    *slot = None;
+    *current = None;
+    reset_decoder_open_window(state, counters);
+    counters.decoder_demotions.fetch_add(1, Ordering::Relaxed);
+    if !state.fallback_event_emitted {
+        state.fallback_event_emitted = true;
+        let requested = backend_name(state.requested_backend);
+        event_sender.emit_flow_with_details(
+            EventSeverity::Warning,
+            crate::manager::events::category::SYSTEM_RESOURCES,
+            format!(
+                "display output '{output_id}': HW decode failed at runtime ({trigger}); \
+                 fell back to CPU"
+            ),
+            flow_id,
+            serde_json::json!({
+                "error_code": "display_hw_decode_runtime_failed",
+                "output_id": output_id,
+                "requested_backend": requested,
+                "fell_back_to": "cpu",
+                "trigger": trigger,
+                "last_error": last_error.unwrap_or_else(|| "unknown".to_string()),
+            }),
+        );
+    }
+}
+
+/// One iteration of the demux → decode → drain → watchdog pipeline for
+/// a single H.264 / HEVC access unit. Centralised here so the H264 and
+/// H265 arms in `demux_decode_loop` stay one-line dispatches and every
+/// piece of book-keeping (pts_jump flush, decoder ensure, send,
+/// drain, watchdog) lives in lock-step in one place.
+#[allow(clippy::too_many_arguments)]
+fn handle_video_au(
+    nalus: &[Vec<u8>],
+    pts: u64,
+    codec: VideoCodec,
+    last_video_pts: &mut Option<u64>,
+    video_decoder: &mut Option<VideoDecoder>,
+    current_video_codec: &mut Option<VideoCodec>,
+    aac_decoder: &mut Option<AacDecoder>,
+    ff_audio_decoder: &mut Option<FfAudioDecoder>,
+    hw_open_state: &mut HwOpenState,
+    last_unsupported_pixfmt_at: &mut Option<Instant>,
+    counters: &DisplayStatsCounters,
+    vtx: &mpsc::Sender<VideoFrame>,
+    event_sender: &EventSender,
+    flow_id: &str,
+    output_id: &str,
+) {
+    if pts_jump(*last_video_pts, pts) {
+        // Section 5: count + log every PTS jump so the operator can
+        // tell whether the Reolink "degraded picture" is the
+        // SRT-FEC-repair-out-of-order-PTS hypothesis.
+        let prev = (*last_video_pts).unwrap_or(0);
+        let forward = pts.wrapping_sub(prev);
+        let backward = prev.wrapping_sub(pts);
+        counters.pts_jumps_observed.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            output_id = %output_id,
+            prev_pts = prev,
+            new_pts = pts,
+            delta_forward = forward,
+            delta_backward = backward,
+            "display pts_jump → decoder flush",
+        );
+        if let Some(d) = video_decoder.as_mut() {
+            d.flush();
+            reset_decoder_open_window(hw_open_state, counters);
+        }
+        if let Some(d) = aac_decoder.as_mut() {
+            d.reset();
+        }
+        if let Some(d) = ff_audio_decoder.as_mut() {
+            d.flush();
+        }
+    }
+    *last_video_pts = Some(pts);
+    ensure_video_decoder(
+        video_decoder,
+        current_video_codec,
+        codec,
+        hw_open_state,
+        counters,
+        event_sender,
+        flow_id,
+        output_id,
+    );
+    let Some(decoder) = video_decoder.as_mut() else {
+        return;
+    };
+    feed_video_decoder(
+        decoder,
+        nalus,
+        pts,
+        hw_open_state,
+        counters,
+        flow_id,
+        output_id,
+    );
+    drain_video_frames(
+        decoder,
+        pts,
+        vtx,
+        counters,
+        event_sender,
+        flow_id,
+        output_id,
+        hw_open_state.backend,
+        last_unsupported_pixfmt_at,
+        hw_open_state,
+    );
+
+    // Section 1: sustained send_packet errors → demote.
+    if hw_open_state.consecutive_send_errors >= RUNTIME_FAIL_DEMOTE_THRESHOLD
+        && !matches!(hw_open_state.backend, DecoderBackend::Cpu)
+    {
+        force_cpu_fallback(
+            video_decoder,
+            current_video_codec,
+            hw_open_state,
+            counters,
+            event_sender,
+            flow_id,
+            output_id,
+            "send_packet_errors",
+            None,
+        );
+        return;
+    }
+
+    // Section 3: watchdog for "decoder opened, no frames".
+    if !matches!(hw_open_state.backend, DecoderBackend::Cpu)
+        && !hw_open_state.fell_back_to_cpu
+        && counters.frames_received_since_open.load(Ordering::Relaxed) == 0
+    {
+        if let Some(first_send) = hw_open_state.first_send_after_open {
+            let elapsed = first_send.elapsed();
+            if elapsed >= std::time::Duration::from_millis(WATCHDOG_NO_FRAMES_MS) {
+                let backend = backend_name(hw_open_state.backend);
+                event_sender.emit_flow_with_details(
+                    EventSeverity::Warning,
+                    crate::manager::events::category::SYSTEM_RESOURCES,
+                    format!(
+                        "display output '{output_id}': HW decoder ({backend}) accepted \
+                         packets but produced no frame in {} ms — falling back to CPU",
+                        elapsed.as_millis(),
+                    ),
+                    flow_id,
+                    serde_json::json!({
+                        "error_code": "display_hw_decode_no_frames",
+                        "output_id": output_id,
+                        "backend": backend,
+                        "ms_since_first_send": elapsed.as_millis() as u64,
+                    }),
+                );
+                force_cpu_fallback(
+                    video_decoder,
+                    current_video_codec,
+                    hw_open_state,
+                    counters,
+                    event_sender,
+                    flow_id,
+                    output_id,
+                    "watchdog_no_frames",
+                    None,
+                );
+            }
+        }
+    }
 }
 
 /// True when `pts` is far enough from `prev` that the upstream stream
-/// almost certainly changed (operator input switch). 90 kHz × 1 s =
-/// 90 000 — a real continuous stream's frame-to-frame delta is well
-/// under that. We also wrap-around-tolerate by computing the minimum of
-/// forward and backward distance, since 33-bit PTS roll-over is a real
-/// stream event we don't want to mistake for a switch.
+/// almost certainly changed (operator input switch). 90 kHz × 5 s =
+/// 450 000 — a real continuous stream's frame-to-frame delta is well
+/// under that even after SRT-FEC heals a multi-second loss; **operator
+/// input switches** drop in a brand-new TS stream with an unrelated
+/// PCR/PTS base (the delta is essentially random, almost always far
+/// past 5 s). The earlier 1-second threshold tripped on every Reolink
+/// 4K HEVC source after an FEC repair, flushing the decoder mid-GOP
+/// and resetting the watchdog before it could ever fire — that's what
+/// caused the "Reolink picture is no good" symptom under both CPU and
+/// QSV decode. We also wrap-around-tolerate by computing the minimum
+/// of forward and backward distance, since 33-bit PTS roll-over is a
+/// real stream event we don't want to mistake for a switch.
+const PTS_JUMP_THRESHOLD_90K: u64 = 450_000;
+
 fn pts_jump(prev: Option<u64>, pts: u64) -> bool {
     let Some(p) = prev else {
         return false;
     };
     let forward = pts.wrapping_sub(p);
     let backward = p.wrapping_sub(pts);
-    forward.min(backward) > 90_000
+    forward.min(backward) > PTS_JUMP_THRESHOLD_90K
 }
 
-fn feed_video_decoder(decoder: &mut VideoDecoder, nalus: &[Vec<u8>], pts_90k: u64) {
+fn feed_video_decoder(
+    decoder: &mut VideoDecoder,
+    nalus: &[Vec<u8>],
+    pts_90k: u64,
+    state: &mut HwOpenState,
+    counters: &DisplayStatsCounters,
+    flow_id: &str,
+    output_id: &str,
+) {
     // Concatenate NAL units back into Annex-B form (start codes between
     // each NALU). The demuxer already strips ADTS / start codes, so we
     // re-add the standard `0x00 0x00 0x00 0x01` prefix. PTS is attached
@@ -626,16 +1113,64 @@ fn feed_video_decoder(decoder: &mut VideoDecoder, nalus: &[Vec<u8>], pts_90k: u6
         buf.extend_from_slice(&[0, 0, 0, 1]);
         buf.extend_from_slice(n);
     }
-    let _ = decoder.send_packet_with_pts(&buf, pts_90k as i64);
+    match decoder.send_packet_with_pts(&buf, pts_90k as i64) {
+        Ok(()) => {
+            if state.first_send_after_open.is_none() {
+                // Watchdog arms only after the FIRST successful send,
+                // so legitimate startup latency (waiting for SPS/PPS,
+                // first IDR) doesn't trip it.
+                state.first_send_after_open = Some(Instant::now());
+            }
+        }
+        Err(e) => {
+            counters.send_packet_errors.fetch_add(1, Ordering::Relaxed);
+            state.consecutive_send_errors = state.consecutive_send_errors.saturating_add(1);
+            // Throttle log lines to once per second so a hard-broken
+            // backend doesn't flood the log before the demotion
+            // threshold trips. Counter still increments per call.
+            let now = Instant::now();
+            let log_due = state
+                .last_send_error_log_at
+                .map(|t| now.duration_since(t) >= std::time::Duration::from_secs(1))
+                .unwrap_or(true);
+            if log_due {
+                state.last_send_error_log_at = Some(now);
+                tracing::warn!(
+                    flow_id = %flow_id,
+                    output_id = %output_id,
+                    backend = backend_name(state.backend),
+                    consecutive_errors = state.consecutive_send_errors,
+                    "display decoder send_packet failed: {e}",
+                );
+            }
+        }
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_video_frames(
     decoder: &mut VideoDecoder,
     fallback_pts_90k: u64,
     vtx: &mpsc::Sender<VideoFrame>,
     counters: &DisplayStatsCounters,
+    event_sender: &EventSender,
+    flow_id: &str,
+    output_id: &str,
+    backend: DecoderBackend,
+    last_unsupported_pixfmt_at: &mut Option<Instant>,
+    state: &mut HwOpenState,
 ) {
     while let Ok(frame) = decoder.receive_frame() {
+        // A successful frame proves the decode path is live — reset
+        // the per-error window so the runtime fallback only triggers
+        // on *sustained* failure, not the legit packet errors a
+        // broadcast stream produces.
+        state.consecutive_send_errors = 0;
+        // Bump the watchdog counter (must happen before the decode
+        // continues — the watchdog reads it on every AU iteration).
+        counters
+            .frames_received_since_open
+            .fetch_add(1, Ordering::Relaxed);
         // Prefer the decoder-propagated display-order PTS. With
         // B-frame H.264 / HEVC, the input-feed PTS we held in the
         // outer loop matches the *most recent fed* access unit, not
@@ -644,77 +1179,152 @@ fn drain_video_frames(
         // dup/drop logic would misfire on every B-frame. Falling back
         // to the input PTS is fine for I-only streams where the
         // decoder has no chance to reorder.
-        let pts_90k = frame.pts().map(|p| p as u64).unwrap_or(fallback_pts_90k);
+        let pts_90k = match frame.pts() {
+            Some(p) => p as u64,
+            None => {
+                // Section 5: count + log — sustained growth points at
+                // the B-frame display-PTS commit interacting badly
+                // with the source.
+                counters.frame_pts_fallbacks.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    output_id = %output_id,
+                    fallback_pts = fallback_pts_90k,
+                    "display decoder produced frame with no PTS — falling back to input PTS",
+                );
+                fallback_pts_90k
+            }
+        };
         let width = frame.width();
         let height = frame.height();
         let colorspace = frame.colorspace();
+        let color_transfer = frame.color_transfer();
         let full_range = frame.is_full_range();
         let pixel_format = frame.pixel_format();
 
-        // Two layouts: planar YUV (CPU decode path) and NV12 (cuvid /
-        // QSV HW decode auto-downloaded to system memory). Convert
-        // NV12 to YUV420P inline by deinterleaving UV — keeps the
-        // downstream `VideoFrame` shape and the `VideoScaler` colour
-        // path uniform across backends. The deinterleave is a single
-        // pass over the chroma plane (≤ 25 % of frame bytes) and runs
-        // on the demux thread, not the data path.
-        let yuv = if let Some((y, ys, u, us, v, vs)) = frame.yuv_planes() {
-            Some((
-                y.to_vec(),
-                ys,
-                u.to_vec(),
-                us,
-                v.to_vec(),
-                vs,
-                pixel_format,
-            ))
-        } else if let Some((y, ys, uv, uvs)) = frame.nv12_planes() {
-            let chroma_rows = (height as usize + 1) / 2;
-            let chroma_cols = (width as usize + 1) / 2;
-            let mut u_plane = vec![0u8; chroma_cols * chroma_rows];
-            let mut v_plane = vec![0u8; chroma_cols * chroma_rows];
-            for row in 0..chroma_rows {
-                let src = &uv[row * uvs..row * uvs + chroma_cols * 2];
-                let u_dst = &mut u_plane[row * chroma_cols..(row + 1) * chroma_cols];
-                let v_dst = &mut v_plane[row * chroma_cols..(row + 1) * chroma_cols];
-                for col in 0..chroma_cols {
-                    u_dst[col] = src[col * 2];
-                    v_dst[col] = src[col * 2 + 1];
+        // Two arms — each just copies the planes out of the decoder's
+        // lifetime and stamps the **decoder's own** pixel format on
+        // the outgoing frame. libswscale handles every conversion
+        // (NV12 → BGRA, P010LE → BGRA, etc.) natively in its SIMD
+        // paths, so no per-pixel reformat runs on the demux thread.
+        //
+        //   1. CPU decode produces planar YUV (`yuv420p` / `yuv422p`
+        //      / `yuv444p` and the 10/12-bit LE planar siblings) —
+        //      `yuv_planes()` returns Some, we copy three planes.
+        //   2. HW decode produces a semi-planar layout (NV12 / NV16 /
+        //      P010LE / P016LE / P210LE / P216LE) — the four
+        //      semi-planar accessors are tried in order; the first
+        //      `Some` decides the pixel format we stamp.
+        let prepared: Option<(Vec<u8>, usize, VideoFrameChroma, i32)> =
+            if let Some((y, ys, u, us, v, vs)) = frame.yuv_planes() {
+                Some((
+                    y.to_vec(),
+                    ys,
+                    VideoFrameChroma::Planar {
+                        u: u.to_vec(),
+                        u_stride: us,
+                        v: v.to_vec(),
+                        v_stride: vs,
+                    },
+                    pixel_format,
+                ))
+            } else if let Some((y, ys, uv, uvs)) = frame.nv12_planes() {
+                Some((
+                    y.to_vec(),
+                    ys,
+                    VideoFrameChroma::SemiPlanar {
+                        uv: uv.to_vec(),
+                        uv_stride: uvs,
+                    },
+                    AVPixelFormat_AV_PIX_FMT_NV12_VAL,
+                ))
+            } else if let Some((y, ys, uv, uvs)) = frame.nv16_planes() {
+                Some((
+                    y.to_vec(),
+                    ys,
+                    VideoFrameChroma::SemiPlanar {
+                        uv: uv.to_vec(),
+                        uv_stride: uvs,
+                    },
+                    AVPixelFormat_AV_PIX_FMT_NV16_VAL,
+                ))
+            } else if let Some((y, ys, uv, uvs, _planar_pix_fmt)) = frame.p01x_planes() {
+                // The accessor's `_planar_pix_fmt` hint is unused — we
+                // hand the semi-planar P010LE / P016LE straight to
+                // libswscale, no planar conversion on our side. Pick
+                // the source format off the original `pixel_format`.
+                Some((
+                    y.to_vec(),
+                    ys,
+                    VideoFrameChroma::SemiPlanar {
+                        uv: uv.to_vec(),
+                        uv_stride: uvs,
+                    },
+                    pixel_format,
+                ))
+            } else if let Some((y, ys, uv, uvs, _planar_pix_fmt)) = frame.p21x_planes() {
+                Some((
+                    y.to_vec(),
+                    ys,
+                    VideoFrameChroma::SemiPlanar {
+                        uv: uv.to_vec(),
+                        uv_stride: uvs,
+                    },
+                    pixel_format,
+                ))
+            } else {
+                // Section 5: per-frame counter feeds the manager UI's
+                // continuous rate; the event below fires on first
+                // sighting and re-arms every UNSUPPORTED_PIXFMT_RE_EMIT_S
+                // seconds so a sustained rate stays visible without
+                // flooding the event feed.
+                counters
+                    .frames_dropped_unsupported_pixfmt
+                    .fetch_add(1, Ordering::Relaxed);
+                let now = Instant::now();
+                let due = last_unsupported_pixfmt_at
+                    .map(|t| {
+                        now.duration_since(t)
+                            >= std::time::Duration::from_secs(UNSUPPORTED_PIXFMT_RE_EMIT_S)
+                    })
+                    .unwrap_or(true);
+                if due {
+                    *last_unsupported_pixfmt_at = Some(now);
+                    let decoder_kind = backend_name(backend);
+                    event_sender.emit_flow_with_details(
+                        EventSeverity::Warning,
+                        crate::manager::events::category::SYSTEM_RESOURCES,
+                        format!(
+                            "display output '{output_id}': unsupported decoded pixel format \
+                             {pixel_format} from {decoder_kind} decoder ({width}x{height}) — \
+                             frames will be dropped"
+                        ),
+                        flow_id,
+                        serde_json::json!({
+                            "error_code": "display_unsupported_pixfmt",
+                            "output_id": output_id,
+                            "pixel_format": pixel_format,
+                            "decoder_kind": decoder_kind,
+                            "width": width,
+                            "height": height,
+                        }),
+                    );
                 }
-            }
-            // Hand the rest of the pipeline planar 4:2:0 — pretend the
-            // frame was YUV420P from the start. `pixel_format` on the
-            // outgoing `VideoFrame` is the libavcodec enum value the
-            // scaler reads; libavcodec's YUV420P enum is 0.
-            let yuv420p_pix_fmt: i32 = 0;
-            Some((
-                y.to_vec(),
-                ys,
-                u_plane,
-                chroma_cols,
-                v_plane,
-                chroma_cols,
-                yuv420p_pix_fmt,
-            ))
-        } else {
-            None
-        };
+                None
+            };
 
-        let Some((y, ys, u, us, v, vs, out_pix_fmt)) = yuv else {
+        let Some((y, y_stride, chroma, out_pix_fmt)) = prepared else {
             continue;
         };
 
         let out_frame = VideoFrame {
             y,
-            u,
-            v,
-            y_stride: ys,
-            u_stride: us,
-            v_stride: vs,
+            y_stride,
+            chroma,
             width,
             height,
             pixel_format: out_pix_fmt,
             colorspace,
+            color_transfer,
             full_range,
             pts_90k,
         };
@@ -906,6 +1516,11 @@ fn display_loop(
 /// the source shape changes — every parameter change costs a fresh
 /// `sws_getContext` (heavy) and a fresh `sws_setColorspaceDetails` to
 /// reapply the YUV→RGB matrix.
+///
+/// Also caches the post-libswscale HDR-to-SDR tonemap LUT (PQ or HLG
+/// → Rec.709 sRGB), built lazily when the source carries an HDR
+/// transfer characteristic. The LUT is 256 bytes — held in L1 across
+/// every per-pixel lookup in `apply_bgra`.
 struct CachedScaler {
     inner: VideoScaler,
     src_w: u32,
@@ -915,6 +1530,11 @@ struct CachedScaler {
     dst_h: u32,
     src_colorspace: i32,
     src_full_range: bool,
+    src_color_transfer: i32,
+    /// `Some(lut)` when `src_color_transfer` is PQ (16) or HLG (18).
+    /// `None` for SDR transfers (BT.709, BT.601, unspecified) — no
+    /// per-pixel work runs in that path.
+    hdr_tonemap: Option<crate::display::hdr_tonemap::HdrTonemap>,
 }
 
 /// FFmpeg `AVCOL_SPC_*` integers we care about. Repeated here as plain
@@ -924,6 +1544,27 @@ struct CachedScaler {
 const AVCOL_SPC_BT709: i32 = 1;
 const AVCOL_SPC_UNSPECIFIED: i32 = 2;
 const AVCOL_SPC_SMPTE170M: i32 = 6;
+
+/// `AV_PIX_FMT_*` integers mirrored as plain consts so the dispatch
+/// branches in `drain_video_frames` don't have to depend on
+/// `libffmpeg-video-sys` directly. Values match the bindgen output
+/// for the FFmpeg n7.x line we vendor (`AVPixelFormat_AV_PIX_FMT_*`
+/// in the bindings — stable across n7.0 / n7.1). Naming preserves
+/// the bindgen original so it's grep-able against the bindings.
+#[allow(non_upper_case_globals)]
+const AVPixelFormat_AV_PIX_FMT_NV12_VAL: i32 = 23;
+#[allow(non_upper_case_globals)]
+const AVPixelFormat_AV_PIX_FMT_NV16_VAL: i32 = 101;
+
+/// `AVColorTransferCharacteristic` integer for SMPTE 2084 (PQ / HDR10)
+/// — the only transfer that engages the HDR-to-SDR tonemap LUT.
+/// Anything else (BT.709, BT.601, `UNSPECIFIED`, ARIB STD-B67 / HLG)
+/// bypasses the LUT and presents libswscale's BGRA output unchanged.
+/// HLG is omitted on purpose: ARIB STD-B67 was designed to produce a
+/// sensible picture on a vanilla sRGB display without any tonemap
+/// (the panel's own EOTF approximately inverts the HLG OETF), so
+/// applying a LUT to it would only darken midtones.
+const AVCOL_TRC_SMPTE2084: i32 = 16;
 
 fn effective_colorspace(signalled: i32, src_h: u32) -> i32 {
     // BT.709 for HD and above, BT.601 (SMPTE 170M) for SD when the
@@ -940,6 +1581,7 @@ fn effective_colorspace(signalled: i32, src_h: u32) -> i32 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ensure_scaler(
     cache: &mut Option<CachedScaler>,
     src_w: u32,
@@ -949,6 +1591,7 @@ fn ensure_scaler(
     dst_h: u32,
     src_colorspace: i32,
     src_full_range: bool,
+    src_color_transfer: i32,
 ) -> Result<&mut CachedScaler> {
     let needs_rebuild = match cache.as_ref() {
         Some(c) => {
@@ -959,6 +1602,7 @@ fn ensure_scaler(
                 || c.dst_h != dst_h
                 || c.src_colorspace != src_colorspace
                 || c.src_full_range != src_full_range
+                || c.src_color_transfer != src_color_transfer
         }
         None => true,
     };
@@ -973,6 +1617,20 @@ fn ensure_scaler(
         )
         .map_err(|e| anyhow::anyhow!("display scaler init failed: {e}"))?;
         inner.set_yuv_to_rgb_colorspace(src_colorspace, src_full_range);
+        // Build the HDR → SDR tonemap LUT once per source-shape change
+        // when the bitstream signals PQ. HLG (`ARIB_STD_B67`) is
+        // backward-compatible with sRGB display by design — the panel's
+        // sRGB EOTF approximately inverts the HLG OETF without any
+        // per-pixel intervention from us. SDR sources (BT.709 / BT.601
+        // / unspecified) and HLG both fall through to `None` here, so
+        // `blit_and_present` does no per-pixel work beyond what
+        // libswscale already produced.
+        let hdr_tonemap = match src_color_transfer {
+            AVCOL_TRC_SMPTE2084 => Some(crate::display::hdr_tonemap::HdrTonemap::for_pq()),
+            // ARIB STD-B67 (HLG) and everything else: pass through
+            // libswscale's BGRA unchanged.
+            _ => None,
+        };
         *cache = Some(CachedScaler {
             inner,
             src_w,
@@ -982,6 +1640,8 @@ fn ensure_scaler(
             dst_h,
             src_colorspace,
             src_full_range,
+            src_color_transfer,
+            hdr_tonemap,
         });
     }
     Ok(cache.as_mut().expect("scaler just inserted"))
@@ -1015,23 +1675,56 @@ fn blit_and_present(
         dst_h,
         colorspace,
         frame.full_range,
+        frame.color_transfer,
     )?;
-    cached
-        .inner
-        .scale_raw_planes_into_packed(
-            src_w,
-            src_h,
-            frame.pixel_format,
-            &frame.y,
-            frame.y_stride,
-            &frame.u,
-            frame.u_stride,
-            &frame.v,
-            frame.v_stride,
-            dst,
-            pitch,
-        )
-        .map_err(|e| anyhow::anyhow!("display scale failed: {e}"))?;
+    match &frame.chroma {
+        VideoFrameChroma::Planar {
+            u,
+            u_stride,
+            v,
+            v_stride,
+        } => cached
+            .inner
+            .scale_raw_planes_into_packed(
+                src_w,
+                src_h,
+                frame.pixel_format,
+                &frame.y,
+                frame.y_stride,
+                u,
+                *u_stride,
+                v,
+                *v_stride,
+                dst,
+                pitch,
+            )
+            .map_err(|e| anyhow::anyhow!("display scale failed: {e}"))?,
+        VideoFrameChroma::SemiPlanar { uv, uv_stride } => cached
+            .inner
+            .scale_semi_planar_into_packed(
+                src_w,
+                src_h,
+                &frame.y,
+                frame.y_stride,
+                uv,
+                *uv_stride,
+                dst,
+                pitch,
+            )
+            .map_err(|e| anyhow::anyhow!("display scale failed: {e}"))?,
+    }
+
+    // HDR → SDR tonemap. libswscale's YUV→RGB matrix gives BGRA values
+    // that are still PQ- or HLG-encoded; without this LUT a UHD HDR
+    // contribution feed displays as a dim, low-contrast frame on a
+    // Rec.709 confidence panel. SDR sources skip the loop body
+    // entirely — `hdr_tonemap` is `None` for `BT709` /
+    // `UNSPECIFIED` / `SMPTE170M` transfers. **Apply before** audio
+    // bars so the operator's overlay stays at fixed sRGB-correct
+    // brightness instead of getting flattened into the tonemap.
+    if let Some(tonemap) = cached.hdr_tonemap.as_ref() {
+        tonemap.apply_bgra(dst, pitch, dst_w as usize, dst_h as usize);
+    }
 
     if let Some(snapshot) = meter {
         // Lock-free read: `ArcSwap::load` is one atomic acquire +
@@ -1142,4 +1835,62 @@ fn emit_event(
     });
     sender.emit_with_details(severity, "display", message, Some(flow_id), details);
     let _ = Bytes::new(); // suppress unused-import warning
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoke test for the chroma discriminator. The display blit
+    /// matches on `VideoFrameChroma`, so the enum must keep its two
+    /// arms intact and round-trip through a `VideoFrame` literal.
+    /// Real format-conversion correctness is covered downstream by
+    /// `video-engine`'s `scale_semi_planar_nv12_to_bgra_writes_pixels`
+    /// scaler test — there's no per-pixel logic in this file to
+    /// unit-test now that the bit-shift / deinterleave helpers are
+    /// gone.
+    #[test]
+    fn video_frame_chroma_arms_round_trip() {
+        let planar = VideoFrame {
+            y: vec![0; 16],
+            y_stride: 4,
+            chroma: VideoFrameChroma::Planar {
+                u: vec![0; 4],
+                u_stride: 2,
+                v: vec![0; 4],
+                v_stride: 2,
+            },
+            width: 4,
+            height: 4,
+            pixel_format: 0, // YUV420P
+            colorspace: AVCOL_SPC_BT709,
+            color_transfer: 0,
+            full_range: false,
+            pts_90k: 0,
+        };
+        match planar.chroma {
+            VideoFrameChroma::Planar { .. } => {}
+            VideoFrameChroma::SemiPlanar { .. } => panic!("expected Planar arm"),
+        }
+
+        let semi = VideoFrame {
+            y: vec![0; 16],
+            y_stride: 4,
+            chroma: VideoFrameChroma::SemiPlanar {
+                uv: vec![0; 8],
+                uv_stride: 4,
+            },
+            width: 4,
+            height: 4,
+            pixel_format: AVPixelFormat_AV_PIX_FMT_NV12_VAL,
+            colorspace: AVCOL_SPC_BT709,
+            color_transfer: 0,
+            full_range: false,
+            pts_90k: 0,
+        };
+        match semi.chroma {
+            VideoFrameChroma::SemiPlanar { .. } => {}
+            VideoFrameChroma::Planar { .. } => panic!("expected SemiPlanar arm"),
+        }
+    }
 }

@@ -76,12 +76,14 @@ jobs:
             variant: default
             cargo_features: "display"
           # ─── full variant: every video codec backend (AGPL + GPL bundle) ───
-          # libx264 + libx265 + NVENC + NVDEC encoders/decoders — plus QSV
-          # (encode + decode) on x86_64. aarch64 drops QSV because Intel
-          # iGPU is x86_64-only, so it lists the cross-arch features
-          # explicitly instead of the `video-encoders-full` composite.
-          # `display` is included on top of the codec bundle so the
-          # local-display output spawner is compiled in.
+          # libx264 + libx265 + NVENC + NVDEC + VAAPI encoders/decoders —
+          # plus QSV (encode + decode) on x86_64. aarch64 drops QSV
+          # because Intel iGPU is x86_64-only, so it lists the cross-arch
+          # features explicitly instead of the `video-encoders-full`
+          # composite. VAAPI ships on both arches (Linux only; activates
+          # at runtime on AMD Mesa radeonsi or Intel iHD hosts). `display`
+          # is included on top of the codec bundle so the local-display
+          # output spawner is compiled in.
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact_suffix: x86_64-linux-full
@@ -91,7 +93,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact_suffix: aarch64-linux-full
             variant: full
-            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-nvenc display-nvdec display"
+            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-nvenc video-encoder-vaapi display-nvdec display-vaapi display"
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout bilbycast-libsrt-rs (path dependency)
@@ -170,6 +172,16 @@ jobs:
           # and uses the explicit cross-arch feature list above.
           sudo apt-get install -y libvpl-dev
 
+      - name: Install VAAPI build dependencies (full variant only)
+        if: matrix.variant == 'full'
+        run: |
+          # libva-dev ships libva + libva-drm pkg-config modules and
+          # headers. Available on both x86_64 and aarch64 in Ubuntu
+          # 24.04 main. Royalty-free at every layer (libva is MIT).
+          # Runtime driver (Mesa radeonsi for AMD, iHD for Intel) is
+          # provided by the host, not bundled.
+          sudo apt-get install -y libva-dev
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -222,12 +234,28 @@ jobs:
               fi
               echo "OK: aarch64-full variant has no libvpl linkage (QSV is x86_64-only)"
             fi
+            # VAAPI ships on both arches in -full. libva.so.2 + libva-drm.so.2
+            # are runtime-link-required by FFmpeg's VAAPI codec wrappers.
+            if ! ldd "${BINARY}" | grep -qE 'libva\.'; then
+              echo "ERROR: full variant binary is missing libva linkage (VAAPI)"
+              exit 1
+            fi
+            if ! ldd "${BINARY}" | grep -qE 'libva-drm\.'; then
+              echo "ERROR: full variant binary is missing libva-drm linkage (VAAPI render-node backend)"
+              exit 1
+            fi
+            echo "OK: full variant links libva and libva-drm (VAAPI)"
           else
             if ldd "${BINARY}" | grep -qE 'libx264|libx265'; then
               echo "ERROR: default variant binary unexpectedly links libx264/libx265"
               exit 1
             fi
             echo "OK: default variant has no libx264/libx265 linkage"
+            if ldd "${BINARY}" | grep -qE 'libva\.|libva-drm\.'; then
+              echo "ERROR: default variant binary unexpectedly links libva (VAAPI is full-only)"
+              exit 1
+            fi
+            echo "OK: default variant has no libva linkage"
           fi
           echo "=== Checking for display-output linkage (libasound2) ==="
           # `display` is in every Linux variant — confirm libasound.so.2
@@ -336,11 +364,11 @@ jobs:
           - \`bilbycast-edge-aarch64-linux.tar.gz\` — Linux ARM64 (aarch64)
 
           ### \`*-linux-full\` (full variant)
-          Bundles every video codec backend the edge knows about — encoders **and** the new HW decoders for the local-display output. **Encoders**: libx264 + libx265 + NVENC, plus QSV (Intel oneVPL) on x86_64. **Display HW decode**: NVDEC, plus QSV-decode on x86_64. NVENC + NVDEC activate automatically on hosts with an NVIDIA driver; QSV (encode + decode) on hosts with an Intel iGPU + media driver; x264 / x265 + libavcodec software decode handle everything else. The aarch64 build omits QSV (Intel iGPU is x86_64-only). This binary is an **AGPL-3.0-or-later combined work** that bundles GPL-2.0-or-later code — see \`NOTICE\` inside the tarball.
-          - \`bilbycast-edge-x86_64-linux-full.tar.gz\` — Linux x86_64 (amd64) — encoders: x264 + x265 + NVENC + QSV; display HW decode: NVDEC + QSV
-          - \`bilbycast-edge-aarch64-linux-full.tar.gz\` — Linux ARM64 (aarch64) — encoders: x264 + x265 + NVENC; display HW decode: NVDEC
+          Bundles every video codec backend the edge knows about — encoders **and** the new HW decoders for the local-display output. **Encoders**: libx264 + libx265 + NVENC + VAAPI, plus QSV (Intel oneVPL) on x86_64. **Display HW decode**: NVDEC + VAAPI-decode, plus QSV-decode on x86_64. NVENC + NVDEC activate automatically on hosts with an NVIDIA driver; QSV (encode + decode) on hosts with an Intel iGPU + media driver; VAAPI on hosts with a working VAAPI driver (Mesa radeonsi for AMD, iHD for Intel); x264 / x265 + libavcodec software decode handle everything else. The aarch64 build omits QSV (Intel iGPU is x86_64-only). This binary is an **AGPL-3.0-or-later combined work** that bundles GPL-2.0-or-later code — see \`NOTICE\` inside the tarball.
+          - \`bilbycast-edge-x86_64-linux-full.tar.gz\` — Linux x86_64 (amd64) — encoders: x264 + x265 + NVENC + QSV + VAAPI; display HW decode: NVDEC + QSV + VAAPI
+          - \`bilbycast-edge-aarch64-linux-full.tar.gz\` — Linux ARM64 (aarch64) — encoders: x264 + x265 + NVENC + VAAPI; display HW decode: NVDEC + VAAPI
 
-          Install \`libx264\` and \`libx265\` runtime packages before running the \`-full\` binary: \`sudo apt install libx264-dev libx265-dev\`. No extra packages needed for NVENC beyond the NVIDIA driver. **For QSV (x86_64 only)**: \`sudo apt install libvpl2 intel-media-va-driver-non-free\` (or \`intel-media-driver\`), then add the running user to the \`render\` group so the edge can open \`/dev/dri/renderD*\`.
+          Install \`libx264\`, \`libx265\`, and \`libva\` runtime packages before running the \`-full\` binary: \`sudo apt install libx264-dev libx265-dev libva2 libva-drm2\`. No extra packages needed for NVENC beyond the NVIDIA driver. **For QSV (x86_64 only)**: \`sudo apt install libvpl2 intel-media-va-driver-non-free\` (or \`intel-media-driver\`). **For VAAPI**: install a vendor driver — \`mesa-va-drivers\` for AMD or \`intel-media-va-driver-non-free\` for Intel — then add the running user to the \`render\` group so the edge can open \`/dev/dri/renderD*\`.
 
           ## Verify checksums
           \`\`\`

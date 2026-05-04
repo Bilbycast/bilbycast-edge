@@ -202,6 +202,7 @@ fn open_webrtc_video_active(
         video_codec::VideoEncoderCodec::X264 => "x264",
         video_codec::VideoEncoderCodec::H264Nvenc => "nvenc",
         video_codec::VideoEncoderCodec::H264Qsv => "qsv",
+        video_codec::VideoEncoderCodec::H264Vaapi => "vaapi",
         _ => "unknown",
     };
     output_stats.set_video_encode_stats(

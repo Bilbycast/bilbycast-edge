@@ -125,8 +125,12 @@ impl FlowManager {
                 .videotoolbox_in_use
                 .saturating_add(f.videotoolbox_in_use);
             acc.amf_in_use = acc.amf_in_use.saturating_add(f.amf_in_use);
+            acc.vaapi_in_use = acc.vaapi_in_use.saturating_add(f.vaapi_in_use);
             acc.nvdec_in_use = acc.nvdec_in_use.saturating_add(f.nvdec_in_use);
             acc.qsv_decode_in_use = acc.qsv_decode_in_use.saturating_add(f.qsv_decode_in_use);
+            acc.vaapi_decode_in_use = acc
+                .vaapi_decode_in_use
+                .saturating_add(f.vaapi_decode_in_use);
         }
         acc
     }
@@ -230,10 +234,11 @@ impl FlowManager {
         // shape as before; `error_code: hw_encoder_oversubscribed`.
         let enc = &caps.hw_encoder_session_limits;
         if !enc.is_empty() {
-            let checks: [(Option<u32>, u32, &'static str); 3] = [
+            let checks: [(Option<u32>, u32, &'static str); 4] = [
                 (enc.nvenc_max_sessions, usage.nvenc_in_use, "nvenc"),
                 (enc.qsv_max_sessions, usage.qsv_in_use, "qsv"),
                 (enc.amf_max_sessions, usage.amf_in_use, "amf"),
+                (enc.vaapi_max_sessions, usage.vaapi_in_use, "vaapi"),
             ];
             for (max, in_use, family) in checks {
                 if let Some(max) = max {
@@ -268,9 +273,10 @@ impl FlowManager {
         // discriminators.
         let dec = &caps.hw_decoder_session_limits;
         if !dec.is_empty() {
-            let dec_checks: [(Option<u32>, u32, &'static str); 2] = [
+            let dec_checks: [(Option<u32>, u32, &'static str); 3] = [
                 (dec.nvdec_max_sessions, usage.nvdec_in_use, "nvdec"),
                 (dec.qsv_max_sessions, usage.qsv_decode_in_use, "qsv"),
+                (dec.vaapi_max_sessions, usage.vaapi_decode_in_use, "vaapi"),
             ];
             for (max, in_use, family) in dec_checks {
                 if let Some(max) = max {
