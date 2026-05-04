@@ -4,21 +4,38 @@
 //! Thumbnail generation module.
 //!
 //! Subscribes to a flow's broadcast channel as an independent consumer,
-//! buffers recent MPEG-TS packets, and periodically generates a small JPEG
-//! thumbnail. Like the media analyzer, this module **cannot** block the hot
-//! path — if it falls behind, it receives `Lagged(n)` and silently skips
-//! packets.
+//! buffers recent video access units, and periodically generates a small
+//! JPEG thumbnail. Like the media analyzer, this module **cannot** block
+//! the hot path — if it falls behind, it receives `Lagged(n)` and silently
+//! skips packets.
 //!
 //! ## Backend selection
 //!
 //! When the `video-thumbnail` feature is enabled (default), thumbnails are
 //! generated **in-process** via `video-engine` (FFmpeg libavcodec/libswscale).
-//! Video NAL units are extracted from the buffered MPEG-TS, decoded to a raw
-//! frame, scaled, and encoded as JPEG — all without spawning a subprocess.
+//! A long-lived [`TsDemuxer`] owned by the loop turns the inbound
+//! MPEG-TS stream into demuxed access units (one per PES), each tagged with
+//! its presentation timestamp. On every cadence tick the loop walks the
+//! retained AUs, prepends the demuxer's cached parameter sets (SPS/PPS for
+//! H.264, VPS+SPS+PPS for HEVC), and feeds the decoder one packet per AU
+//! via [`video_engine::decode_thumbnail_packets`]. This per-AU framing is
+//! what the mpegts demuxer inside ffmpeg provides — without it, open-GOP
+//! broadcast streams that signal random access through `recovery_point`
+//! SEIs (rather than IDR NAL units) never decode a frame.
 //!
-//! When the feature is disabled, the module falls back to piping the buffered
-//! TS data to an external **ffmpeg subprocess** (the legacy path), which
-//! requires ffmpeg to be installed on the device.
+//! When the feature is disabled, the module falls back to piping the
+//! buffered TS data to an external **ffmpeg subprocess** (the legacy
+//! path), which carries its own mpegts demuxer.
+//!
+//! ## Independence from content analysis
+//!
+//! Thumbnail generation is unconditionally on whenever `FlowConfig.thumbnail`
+//! is true and the in-process backend (or external ffmpeg) is available.
+//! Toggling any of the `content_analysis` tiers (lite / audio_full /
+//! video_full) **never** affects thumbnail capture — they are separate
+//! broadcast subscribers with independent lifecycles. The owning loop
+//! holds its own `TsDemuxer`, so the analysers can be off entirely and
+//! thumbnails still render.
 //!
 //! ## Freeze-frame and black-screen detection
 //!
@@ -43,7 +60,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
+#[cfg(not(feature = "video-thumbnail"))]
+use bytes::BytesMut;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -52,7 +71,8 @@ use crate::stats::collector::ThumbnailAccumulator;
 
 use super::packet::RtpPacket;
 use super::ts_parse::strip_rtp_header;
-use super::ts_program_filter::TsProgramFilter;
+#[cfg(feature = "video-thumbnail")]
+use super::ts_demux::{DemuxedFrame, TsDemuxer};
 
 /// How often to generate a thumbnail (seconds).
 const THUMBNAIL_INTERVAL: Duration = Duration::from_secs(5);
@@ -64,18 +84,42 @@ const TRIGGER_MIN_GAP: Duration = Duration::from_millis(500);
 /// Minimum elapsed time between two captures before their JPEG hashes are
 /// eligible for freeze comparison. Back-to-back captures (e.g. a trigger
 /// firing right after a periodic tick, or a catch-up tick after a stall) run
-/// on nearly-identical TS buffers and reliably produce matching hashes — so
+/// on nearly-identical buffers and reliably produce matching hashes — so
 /// we feed `reset_freeze()` in that case rather than letting six such
 /// samples trip the alarm.
 const FREEZE_MIN_GAP: Duration = Duration::from_millis(4_500);
 
-/// Maximum TS data to buffer. Sized so a single typical-GOP keyframe is
-/// always somewhere in the window — broadcast-grade GOPs run 1–2 s, but
-/// pre-encoded MP4 sources (e.g. media-player input) routinely ship with
-/// 10 s GOPs. 32 MB ≈ 12 s at 21 Mbps, ≈ 25 s at 10 Mbps. Each per-input
-/// generator carries its own ring; subscribers that lag past the budget
-/// drop oldest packets first, so the cost is one allocation per flow,
-/// not per packet.
+/// Maximum demuxed video bytes to retain in the in-process ring. Sized so
+/// a typical-GOP keyframe is always in scope — broadcast GOPs run 1–2 s,
+/// pre-encoded MP4 sources with 10 s GOPs are still covered: at 21 Mbps,
+/// 8 MB is ~3 s; at 2 Mbps it's ~32 s. The byte budget is a *retention*
+/// cap, not a per-tick decode budget — see [`MAX_DECODE_FRAMES`].
+#[cfg(feature = "video-thumbnail")]
+const MAX_AU_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maximum number of access units to feed the decoder per tick. Bounds
+/// per-tick CPU regardless of source pattern:
+/// - Short-GOP broadcast streams: anchor lands at the latest keyframe a
+///   few frames before the end of the ring, well under this cap.
+/// - Open-GOP H.264 with `recovery_point` SEIs (DVB-T 1080i25, etc.):
+///   the no-keyframe fallback feeds the most recent `MAX_DECODE_FRAMES`
+///   AUs so libavcodec has a couple of GOP boundaries' worth of context.
+/// - Long-GOP MP4 (10 s GOP at 25 fps = 250 frames between IDRs): the
+///   anchor is clamped forward so we decode at most this many frames —
+///   the resulting thumbnail trails by ~ MAX_DECODE_FRAMES / fps but
+///   never burns multi-second decodes per tick.
+///
+/// 50 ≈ 2 s at 25 fps / 1 s at 50 fps / 0.83 s at 60 fps — enough for an
+/// SBS-style open-GOP stream (SPS/I-slice every ~2.5 s) to lock on
+/// reliably, and small enough that 6 concurrent thumbnail loops decoding
+/// at ~15 ms / frame stay under ~25 % CPU steady-state.
+#[cfg(feature = "video-thumbnail")]
+const MAX_DECODE_FRAMES: usize = 50;
+
+/// Subprocess-fallback raw TS budget. Larger than the AU budget because
+/// the legacy ffmpeg-pipe path needs PAT/PMT + a keyframe in the same
+/// chunk it streams to ffmpeg's mpegts demuxer.
+#[cfg(not(feature = "video-thumbnail"))]
 const MAX_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 
 /// Thumbnail output dimensions.
@@ -113,8 +157,10 @@ const BLACK_DETECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Spawn the thumbnail generator as an independent broadcast subscriber.
 ///
 /// `program_number` selects which MPEG-TS program to render when the input
-/// is an MPTS. `None` keeps the default (first program); `Some(N)` filters
-/// the buffered TS to only show program N.
+/// is an MPTS. `None` keeps the default (lowest program_number in the PAT);
+/// `Some(N)` filters the buffered TS to only show program N. The selection
+/// is delegated to the loop's owned [`TsDemuxer`] — there is no separate
+/// program-filter pass.
 pub fn spawn_thumbnail_generator(
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     stats: Arc<ThumbnailAccumulator>,
@@ -167,8 +213,8 @@ async fn thumbnail_loop(
 
     let mut interval = tokio::time::interval(THUMBNAIL_INTERVAL);
     // Skip-don't-burst: if the runtime stalls and several ticks accumulate,
-    // we don't want to fire them back-to-back on the same buffered TS — that
-    // yields identical JPEG hashes and false-positive "frozen" alarms.
+    // we don't want to fire them back-to-back on the same buffered data —
+    // that yields identical JPEG hashes and false-positive "frozen" alarms.
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval.tick().await; // consume first immediate tick
 
@@ -178,16 +224,23 @@ async fn thumbnail_loop(
     let refresh_trigger = stats.refresh_trigger.clone();
     let mut last_capture: Option<std::time::Instant> = None;
 
-    // Ring buffer of recent TS packet data
-    let mut ts_buffer: VecDeque<Bytes> = VecDeque::new();
-    let mut buffer_bytes: usize = 0;
-    let mut program_filter = program_number.map(TsProgramFilter::new);
-    let mut filter_scratch: Vec<u8> = Vec::new();
+    // Buffer state. The in-process path keeps a ring of demuxed access
+    // units; the subprocess fallback keeps a ring of raw TS chunks because
+    // it pipes them straight into ffmpeg's mpegts demuxer.
+    #[cfg(feature = "video-thumbnail")]
+    let mut state = LiveState::new(program_number);
+    #[cfg(not(feature = "video-thumbnail"))]
+    let mut state = SubprocessState::new();
 
-    // Wall-clock of the most recent broadcast packet. Distinguishes
-    // "stream stopped" (silent channel → `no_signal`) from "stream is
-    // genuinely frozen" (still receiving packets → freeze detector).
-    let mut last_packet_at: Option<std::time::Instant> = None;
+    // Wall-clock of the most recent *useful* broadcast packet — i.e. one
+    // that contains at least one non-NULL TS payload. The post-fixer flow
+    // channel emits NULL-PID (0x1FFF) keepalive padding every 250 ms while
+    // the active input is silent (so downstream UDP sockets stay alive); a
+    // naive "any packet recently?" timer would never trip `no_signal` in
+    // that case and the freeze counter would latch FROZEN on stale buffer
+    // data instead. Tracking only useful packets makes the broadcast look
+    // genuinely silent from the thumbnail generator's point of view.
+    let mut last_useful_packet_at: Option<std::time::Instant> = None;
 
     loop {
         tokio::select! {
@@ -203,21 +256,10 @@ async fn thumbnail_loop(
                 let cooldown_ok = last_capture
                     .map(|t| t.elapsed() >= TRIGGER_MIN_GAP)
                     .unwrap_or(true);
-                if !cooldown_ok || buffer_bytes == 0 {
+                if !cooldown_ok || !state.has_data() {
                     continue;
                 }
-                let raw_ts = collect_buffer(&ts_buffer);
-                let ts_data: Bytes = if let Some(ref mut filter) = program_filter {
-                    filter_scratch.clear();
-                    filter.filter_into(&raw_ts, &mut filter_scratch);
-                    if filter_scratch.is_empty() {
-                        continue;
-                    }
-                    Bytes::copy_from_slice(&filter_scratch)
-                } else {
-                    raw_ts
-                };
-                match generate_thumbnail_dispatch(&ts_data).await {
+                match state.capture().await {
                     Ok(thumbnail_result) => {
                         stats.store(thumbnail_result.jpeg.clone());
                         let jpeg_hash = hash_jpeg(&thumbnail_result.jpeg);
@@ -258,37 +300,20 @@ async fn thumbnail_loop(
                 // identical JPEGs and trip the freeze alarm with the
                 // wrong cause. Resetting the freeze counter here also
                 // gives a clean slate for when the stream resumes.
-                let stream_silent = last_packet_at
+                let stream_silent = last_useful_packet_at
                     .map(|t| t.elapsed() >= NO_SIGNAL_TIMEOUT)
                     .unwrap_or(true);
-                if stream_silent || buffer_bytes == 0 {
+                if stream_silent || !state.has_data() {
                     stats.reset_freeze();
                     stats.set_alarm(Some("no_signal".to_string()));
                     continue;
                 }
-                // Collect buffered TS data and generate thumbnail.
-                // When a program filter is set, run the buffer through
-                // it first so the decoder only sees the selected program.
-                let raw_ts = collect_buffer(&ts_buffer);
-                let ts_data: Bytes = if let Some(ref mut filter) = program_filter {
-                    filter_scratch.clear();
-                    filter.filter_into(&raw_ts, &mut filter_scratch);
-                    if filter_scratch.is_empty() {
-                        // Selected program isn't in this buffer window —
-                        // wait for the next tick.
-                        continue;
-                    }
-                    Bytes::copy_from_slice(&filter_scratch)
-                } else {
-                    raw_ts
-                };
 
-                match generate_thumbnail_dispatch(&ts_data).await {
+                match state.capture().await {
                     Ok(thumbnail_result) => {
                         tracing::debug!(
-                            "Thumbnail captured: {} bytes JPEG from {} bytes TS",
-                            thumbnail_result.jpeg.len(),
-                            ts_data.len()
+                            "Thumbnail captured: {} bytes JPEG",
+                            thumbnail_result.jpeg.len()
                         );
                         stats.store(thumbnail_result.jpeg.clone());
 
@@ -328,35 +353,31 @@ async fn thumbnail_loop(
             result = rx.recv() => {
                 match result {
                     Ok(packet) => {
-                        // Touch the freshness timestamp on every packet,
-                        // even ones we ultimately discard — the channel is
-                        // alive and the loop should not declare `no_signal`.
-                        last_packet_at = Some(std::time::Instant::now());
-
                         let ts_payload = strip_rtp_header(&packet);
                         if ts_payload.is_empty() {
                             continue;
                         }
 
-                        // Only buffer data that looks like valid MPEG-TS
+                        // Only consume data that looks like valid MPEG-TS.
                         if ts_payload.len() >= TS_PACKET_SIZE && ts_payload[0] == TS_SYNC_BYTE {
-                            let chunk = Bytes::copy_from_slice(ts_payload);
-                            let chunk_len = chunk.len();
-                            ts_buffer.push_back(chunk);
-                            buffer_bytes += chunk_len;
-
-                            // Evict old data to stay within budget
-                            while buffer_bytes > MAX_BUFFER_BYTES {
-                                if let Some(old) = ts_buffer.pop_front() {
-                                    buffer_bytes -= old.len();
-                                } else {
-                                    break;
-                                }
+                            // Walk the 188-byte packets in this chunk and
+                            // count any that carry a non-NULL PID. A chunk
+                            // that contains nothing but 0x1FFF padding is
+                            // the input forwarder's keepalive — it keeps
+                            // downstream sockets warm but contributes no
+                            // decodable video, so it must not reset the
+                            // no-signal timer.
+                            if has_useful_pid(ts_payload) {
+                                last_useful_packet_at = Some(std::time::Instant::now());
                             }
+
+                            state.ingest(ts_payload);
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::debug!("Thumbnail generator lagged, skipped {n} packets");
+                        // The demuxer's PES assemblers self-resync on the
+                        // next PUSI, so no explicit reset is required.
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         tracing::info!("Thumbnail generator: broadcast channel closed");
@@ -368,14 +389,21 @@ async fn thumbnail_loop(
     }
 }
 
-/// Concatenate the ring buffer into a single contiguous byte slice.
-fn collect_buffer(buffer: &VecDeque<Bytes>) -> Bytes {
-    let total: usize = buffer.iter().map(|b| b.len()).sum();
-    let mut out = BytesMut::with_capacity(total);
-    for chunk in buffer {
-        out.extend_from_slice(chunk);
+/// Return true if any 188-byte TS packet in this chunk carries a non-NULL
+/// PID. Used to distinguish keepalive padding (all 0x1FFF) from real data.
+fn has_useful_pid(ts_payload: &[u8]) -> bool {
+    let mut off = 0;
+    while off + TS_PACKET_SIZE <= ts_payload.len() {
+        if ts_payload[off] != TS_SYNC_BYTE {
+            break;
+        }
+        let pid = (((ts_payload[off + 1] & 0x1F) as u16) << 8) | ts_payload[off + 2] as u16;
+        if pid != 0x1FFF {
+            return true;
+        }
+        off += TS_PACKET_SIZE;
     }
-    out.freeze()
+    false
 }
 
 // ── Unified thumbnail result ────────────────────────────────────────────
@@ -387,329 +415,312 @@ struct InternalThumbnailResult {
     luminance: f64,
 }
 
-/// Dispatch to the appropriate thumbnail backend.
-async fn generate_thumbnail_dispatch(ts_data: &[u8]) -> Result<InternalThumbnailResult, String> {
-    #[cfg(feature = "video-thumbnail")]
-    {
-        generate_thumbnail_inprocess(ts_data).await
-    }
-    #[cfg(not(feature = "video-thumbnail"))]
-    {
-        generate_thumbnail_subprocess(ts_data).await
-    }
-}
-
 // ════════════════════════════════════════════════════════════════════════
 // In-process thumbnail backend (video-thumbnail feature)
 // ════════════════════════════════════════════════════════════════════════
 
 #[cfg(feature = "video-thumbnail")]
-async fn generate_thumbnail_inprocess(ts_data: &[u8]) -> Result<InternalThumbnailResult, String> {
-    use video_codec::ThumbnailConfig;
+struct ThumbnailFrame {
+    /// Concatenated Annex B NALs (one access unit) ready to feed the decoder.
+    annex_b: Vec<u8>,
+    /// Presentation timestamp from the source PES (90 kHz ticks).
+    pts: i64,
+    /// True for AUs the decoder can use as an anchor: codec-defined IDR
+    /// (H.264 NAL 5, HEVC NAL 19/20/21) **or** parameter-set carriers
+    /// (H.264 SPS, HEVC VPS/SPS/PPS) — broadcast streams that never emit
+    /// IDR rely on these to mark random-access points (open-GOP DVB-T,
+    /// SMPTE recovery_point pattern).
+    is_anchor: bool,
+}
 
-    // Extract video NAL units from TS on a blocking thread
-    let ts_owned = ts_data.to_vec();
-    let result = tokio::task::spawn_blocking(move || {
-        // 1. Extract video NAL data from MPEG-TS
-        let extracted = extract_video_from_ts(&ts_owned)
-            .ok_or_else(|| "no video stream found in TS data".to_string())?;
+/// Live-thumbnail loop state for the in-process backend.
+///
+/// Owns its own `TsDemuxer` so thumbnail generation stays independent of
+/// any other subscriber on the broadcast channel — toggling `content_analysis`
+/// (or any future broadcast-tap feature) cannot affect this path.
+#[cfg(feature = "video-thumbnail")]
+struct LiveState {
+    demuxer: TsDemuxer,
+    /// Demuxed access units in arrival order (oldest at front).
+    frames: VecDeque<ThumbnailFrame>,
+    /// Sum of `annex_b.len()` across `frames` for the byte-budget eviction.
+    frames_bytes: usize,
+    /// Cached video codec resolved from the demuxer's PMT scan.
+    codec: Option<video_codec::VideoCodec>,
+}
 
-        // 2. Decode, scale, and encode as JPEG
-        let config = ThumbnailConfig {
+#[cfg(feature = "video-thumbnail")]
+impl LiveState {
+    fn new(program_number: Option<u16>) -> Self {
+        Self {
+            demuxer: TsDemuxer::new(program_number),
+            frames: VecDeque::new(),
+            frames_bytes: 0,
+            codec: None,
+        }
+    }
+
+    fn has_data(&self) -> bool {
+        !self.frames.is_empty()
+    }
+
+    fn ingest(&mut self, ts_payload: &[u8]) {
+        let demuxed = self.demuxer.demux(ts_payload);
+        for frame in demuxed {
+            match frame {
+                DemuxedFrame::H264 {
+                    nalus,
+                    pts,
+                    is_keyframe,
+                } => {
+                    self.codec = Some(video_codec::VideoCodec::H264);
+                    // SPS (NAL 7) marks a random-access point even when the
+                    // AU doesn't carry an IDR — open-GOP broadcast streams
+                    // (e.g. DVB-T 1080i25) rely on this convention. Without
+                    // it, my snapshot would never anchor on those streams
+                    // and the fallback window would have to cover a full
+                    // GOP every tick.
+                    let has_sps = nalus.iter().any(|n| h264_nal_type(n) == 7);
+                    let is_anchor = is_keyframe || has_sps;
+                    let annex_b = build_annex_b(&nalus);
+                    self.push_frame(annex_b, pts, is_anchor);
+                }
+                DemuxedFrame::H265 {
+                    nalus,
+                    pts,
+                    is_keyframe,
+                } => {
+                    self.codec = Some(video_codec::VideoCodec::Hevc);
+                    // VPS (32), SPS (33), PPS (34) at GOP boundary — same
+                    // logic as H.264 above. Some HEVC encoders emit
+                    // recovery via these alone without IDR/CRA.
+                    let has_param_set =
+                        nalus.iter().any(|n| matches!(h265_nal_type(n), 32 | 33 | 34));
+                    let is_anchor = is_keyframe || has_param_set;
+                    let annex_b = build_annex_b(&nalus);
+                    self.push_frame(annex_b, pts, is_anchor);
+                }
+                // Audio variants are not consumed for thumbnails — drop them.
+                DemuxedFrame::Opus
+                | DemuxedFrame::Aac { .. }
+                | DemuxedFrame::OtherAudio { .. } => {}
+            }
+        }
+    }
+
+    fn push_frame(&mut self, annex_b: Vec<u8>, pts: u64, is_anchor: bool) {
+        if annex_b.is_empty() {
+            return;
+        }
+        let bytes = annex_b.len();
+        // PTS in the source is unsigned 33-bit; cast to i64 is lossless.
+        let pts_i64 = pts as i64;
+        self.frames.push_back(ThumbnailFrame {
+            annex_b,
+            pts: pts_i64,
+            is_anchor,
+        });
+        self.frames_bytes += bytes;
+        while self.frames_bytes > MAX_AU_BUFFER_BYTES {
+            match self.frames.pop_front() {
+                Some(old) => self.frames_bytes -= old.annex_b.len(),
+                None => break,
+            }
+        }
+    }
+
+    /// Snapshot the ring into a `(headers, packets, codec)` tuple ready
+    /// for `decode_thumbnail_packets`. Anchor + send-count strategy:
+    ///
+    /// - **Anchor**: latest random-access AU (`is_anchor = true`). For
+    ///   IDR-bearing streams this lands a few frames before the end of
+    ///   the ring; for open-GOP broadcast streams that mark random
+    ///   access via SPS+I-slice (DVB-T 1080i25), it lands at the most
+    ///   recent SPS-bearing AU — typically one full GOP back. If no
+    ///   anchor was ever seen (warm-up, non-standard stream) we fall
+    ///   back to `len - MAX_DECODE_FRAMES`.
+    /// - **Send count**: at most [`MAX_DECODE_FRAMES`] AUs from the
+    ///   anchor forward. Bounds per-tick decoder work regardless of
+    ///   GOP length, so a long-GOP MP4 source doesn't decode 250
+    ///   frames each tick. The thumbnail trails the live edge by at
+    ///   most `MAX_DECODE_FRAMES / fps` seconds in this case.
+    fn snapshot_for_decode(&self) -> Option<(Vec<u8>, Vec<(Vec<u8>, i64)>, video_codec::VideoCodec)> {
+        let codec = self.codec?;
+        if self.frames.is_empty() {
+            return None;
+        }
+        let len = self.frames.len();
+        let anchor = match self.frames.iter().rposition(|f| f.is_anchor) {
+            Some(idx) => idx,
+            None => len.saturating_sub(MAX_DECODE_FRAMES),
+        };
+
+        let packets: Vec<(Vec<u8>, i64)> = self
+            .frames
+            .iter()
+            .skip(anchor)
+            .take(MAX_DECODE_FRAMES)
+            .map(|f| (f.annex_b.clone(), f.pts))
+            .collect();
+
+        let headers = build_headers(&self.demuxer, codec);
+        Some((headers, packets, codec))
+    }
+
+    async fn capture(&self) -> Result<InternalThumbnailResult, String> {
+        let (headers, packets, codec) = self
+            .snapshot_for_decode()
+            .ok_or_else(|| "no video frames buffered".to_string())?;
+
+        let cfg = video_codec::ThumbnailConfig {
             width: THUMBNAIL_WIDTH,
             height: THUMBNAIL_HEIGHT,
             quality: 5,
         };
 
-        video_engine::decode_thumbnail(&extracted.annex_b_data, extracted.codec, &config)
-            .map_err(|e| format!("in-process thumbnail decode failed: {e}"))
-    })
-    .await
-    .map_err(|e| format!("thumbnail task panicked: {e}"))??;
+        let result = tokio::task::spawn_blocking(move || {
+            video_engine::decode_thumbnail_packets(&headers, &packets, codec, &cfg)
+                .map_err(|e| format!("in-process thumbnail decode failed: {e}"))
+        })
+        .await
+        .map_err(|e| format!("thumbnail task panicked: {e}"))??;
 
-    Ok(InternalThumbnailResult {
-        jpeg: result.jpeg,
-        luminance: result.luminance,
-    })
+        Ok(InternalThumbnailResult {
+            jpeg: result.jpeg,
+            luminance: result.luminance,
+        })
+    }
 }
 
-/// Video data extracted from an MPEG-TS buffer.
+/// H.264 NAL unit type from the 1-byte header. Returns 0xFF for empty
+/// NALUs so caller checks (e.g. `== 7`) never accidentally match.
 #[cfg(feature = "video-thumbnail")]
-pub(crate) struct ExtractedVideo {
-    /// Annex B encoded NAL units (with 0x00000001 start codes).
-    pub(crate) annex_b_data: Vec<u8>,
-    /// Detected video codec.
-    pub(crate) codec: video_codec::VideoCodec,
+#[inline]
+fn h264_nal_type(nalu: &[u8]) -> u8 {
+    if nalu.is_empty() {
+        0xFF
+    } else {
+        nalu[0] & 0x1F
+    }
 }
 
-/// Extract video elementary stream data from raw MPEG-TS bytes.
-///
-/// Parses PAT → PMT to discover the video PID and codec type, then
-/// reassembles PES packets for the video PID and returns the raw
-/// elementary stream data (Annex B NAL units with start codes).
-///
-/// This is a lightweight, self-contained extraction that reuses the
-/// `ts_parse` helpers without depending on `TsDemuxer`. Made
-/// `pub(crate)` so the replay-server filmstrip writer can reuse the
-/// same proven extraction path without a parallel implementation.
+/// HEVC NAL unit type from the 1-byte header. Returns 0xFF on empty.
 #[cfg(feature = "video-thumbnail")]
-pub(crate) fn extract_video_from_ts(ts_data: &[u8]) -> Option<ExtractedVideo> {
-    use super::ts_parse::{ts_pid, ts_pusi, ts_has_payload,
-                          ts_payload_offset, parse_pat_programs, PAT_PID};
-    use video_codec::VideoCodec;
+#[inline]
+fn h265_nal_type(nalu: &[u8]) -> u8 {
+    if nalu.is_empty() {
+        0xFF
+    } else {
+        (nalu[0] >> 1) & 0x3F
+    }
+}
 
-    const STREAM_TYPE_H264: u8 = 0x1B;
-    const STREAM_TYPE_H265: u8 = 0x24;
+/// Concatenate split NAL units (no start codes) into Annex B form by
+/// prepending a 4-byte `00 00 00 01` start code in front of each NAL.
+#[cfg(feature = "video-thumbnail")]
+fn build_annex_b(nalus: &[Vec<u8>]) -> Vec<u8> {
+    let total: usize = nalus.iter().map(|n| n.len() + 4).sum();
+    let mut out = Vec::with_capacity(total);
+    for nal in nalus {
+        if nal.is_empty() {
+            continue;
+        }
+        out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        out.extend_from_slice(nal);
+    }
+    out
+}
 
-    // ── Pass 1: Find PMT PID from PAT ──
-    let mut pmt_pid: Option<u16> = None;
-
-    let mut offset = 0;
-    while offset + TS_PACKET_SIZE <= ts_data.len() {
-        let pkt = &ts_data[offset..offset + TS_PACKET_SIZE];
-        if pkt[0] == TS_SYNC_BYTE && ts_pid(pkt) == PAT_PID && ts_pusi(pkt) {
-            let mut programs = parse_pat_programs(pkt);
-            if !programs.is_empty() {
-                programs.sort_by_key(|(num, _)| *num);
-                pmt_pid = Some(programs[0].1);
-                break;
+/// Build the parameter-set blob the decoder needs before any VCL slice.
+/// For H.264: SPS+PPS in Annex B; for HEVC: VPS+SPS+PPS. Returns an empty
+/// Vec when the demuxer hasn't seen the corresponding NALUs yet — the
+/// decoder will pick them up off the first AU that carries them inline.
+#[cfg(feature = "video-thumbnail")]
+fn build_headers(demuxer: &TsDemuxer, codec: video_codec::VideoCodec) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
+    let push = |out: &mut Vec<u8>, nalu: Option<&[u8]>| {
+        if let Some(n) = nalu {
+            if !n.is_empty() {
+                out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                out.extend_from_slice(n);
             }
         }
-        offset += TS_PACKET_SIZE;
-    }
-    let pmt_pid = pmt_pid?;
-
-    // ── Pass 2: Find video PID and stream type from PMT ──
-    let mut video_pid: Option<u16> = None;
-    let mut video_stream_type: u8 = 0;
-
-    offset = 0;
-    while offset + TS_PACKET_SIZE <= ts_data.len() {
-        let pkt = &ts_data[offset..offset + TS_PACKET_SIZE];
-        if pkt[0] == TS_SYNC_BYTE && ts_pid(pkt) == pmt_pid && ts_pusi(pkt) {
-            // Parse PMT to find video ES
-            if let Some((pid, st)) = parse_pmt_video_pid(pkt) {
-                video_pid = Some(pid);
-                video_stream_type = st;
-                break;
-            }
-        }
-        offset += TS_PACKET_SIZE;
-    }
-    let video_pid = video_pid?;
-
-    let codec = match video_stream_type {
-        STREAM_TYPE_H264 => VideoCodec::H264,
-        STREAM_TYPE_H265 => VideoCodec::Hevc,
-        _ => return None,
     };
-
-    // ── Pass 3: Find the *most recent* keyframe-bearing video PES ──
-    // The buffer holds many seconds of TS so a long-GOP source (e.g. an MP4
-    // with one IDR per 10 s) keeps the same keyframe in the window across
-    // multiple thumbnail ticks. Decoding the first keyframe each tick
-    // produces identical JPEGs and trips the freeze alarm. Walking
-    // backwards over video PUSIs and starting ES collection at the latest
-    // keyframe means a fresh IDR shifts the JPEG immediately, while a feed
-    // that genuinely repeats the same picture still produces matching
-    // hashes and trips the alarm correctly.
-    let start_offset = find_latest_keyframe_offset(ts_data, video_pid, codec).unwrap_or(0);
-
-    let mut es_data = Vec::with_capacity(256 * 1024);
-    let mut pes_started = false;
-
-    offset = start_offset;
-    while offset + TS_PACKET_SIZE <= ts_data.len() {
-        let pkt = &ts_data[offset..offset + TS_PACKET_SIZE];
-        offset += TS_PACKET_SIZE;
-
-        if pkt[0] != TS_SYNC_BYTE || ts_pid(pkt) != video_pid || !ts_has_payload(pkt) {
-            continue;
+    match codec {
+        video_codec::VideoCodec::H264 => {
+            push(&mut out, demuxer.cached_sps());
+            push(&mut out, demuxer.cached_pps());
         }
-
-        let pusi = ts_pusi(pkt);
-        let payload_start = ts_payload_offset(pkt);
-        if payload_start >= TS_PACKET_SIZE {
-            continue;
-        }
-        let payload = &pkt[payload_start..];
-
-        if pusi {
-            if pes_started && !es_data.is_empty() {
-                break;
-            }
-
-            if payload.len() >= 9
-                && payload[0] == 0x00
-                && payload[1] == 0x00
-                && payload[2] == 0x01
-            {
-                let header_data_len = payload[8] as usize;
-                let es_start = 9 + header_data_len;
-                if es_start < payload.len() {
-                    es_data.extend_from_slice(&payload[es_start..]);
-                }
-            }
-            pes_started = true;
-        } else if pes_started {
-            es_data.extend_from_slice(payload);
+        video_codec::VideoCodec::Hevc => {
+            push(&mut out, demuxer.cached_h265_vps());
+            push(&mut out, demuxer.cached_h265_sps());
+            push(&mut out, demuxer.cached_h265_pps());
         }
     }
-
-    if es_data.is_empty() {
-        return None;
-    }
-
-    Some(ExtractedVideo {
-        annex_b_data: es_data,
-        codec,
-    })
+    out
 }
 
-/// Walk the buffer backwards looking for the latest video PUSI whose PES
-/// payload begins with a keyframe NAL. Returns the byte offset of that TS
-/// packet, or `None` when the buffer holds no detectable keyframe.
+/// One-shot helper for callers that have a buffer of TS bytes (e.g. the
+/// replay filmstrip writer). Spins up a fresh `TsDemuxer`, walks the
+/// buffer, and returns a snapshot suitable for `decode_thumbnail_packets`
+/// — same primitive as the live thumbnail loop, just without the long-
+/// lived ring.
 #[cfg(feature = "video-thumbnail")]
-fn find_latest_keyframe_offset(
+pub(crate) fn demux_snapshot_for_decode(
     ts_data: &[u8],
-    video_pid: u16,
-    codec: video_codec::VideoCodec,
-) -> Option<usize> {
-    use super::ts_parse::{ts_has_payload, ts_payload_offset, ts_pid, ts_pusi};
-
-    let mut offset = (ts_data.len() / TS_PACKET_SIZE).saturating_mul(TS_PACKET_SIZE);
-    while offset >= TS_PACKET_SIZE {
-        offset -= TS_PACKET_SIZE;
-        let pkt = &ts_data[offset..offset + TS_PACKET_SIZE];
-        if pkt[0] != TS_SYNC_BYTE
-            || ts_pid(pkt) != video_pid
-            || !ts_pusi(pkt)
-            || !ts_has_payload(pkt)
-        {
-            continue;
-        }
-        let payload_start = ts_payload_offset(pkt);
-        if payload_start >= TS_PACKET_SIZE {
-            continue;
-        }
-        let payload = &pkt[payload_start..];
-        if payload.len() < 9
-            || payload[0] != 0x00
-            || payload[1] != 0x00
-            || payload[2] != 0x01
-        {
-            continue;
-        }
-        let header_data_len = payload[8] as usize;
-        let es_start = 9 + header_data_len;
-        if es_start >= payload.len() {
-            continue;
-        }
-        if contains_keyframe(&payload[es_start..], codec) {
-            return Some(offset);
-        }
-    }
-    None
-}
-
-/// Parse a PMT packet to find the first video elementary stream.
-/// Returns `(es_pid, stream_type)` or `None`.
-#[cfg(feature = "video-thumbnail")]
-fn parse_pmt_video_pid(pkt: &[u8]) -> Option<(u16, u8)> {
-    use super::ts_parse::ts_has_adaptation;
-
-    let mut offset = 4;
-    if ts_has_adaptation(pkt) {
-        let af_len = pkt[4] as usize;
-        offset = 5 + af_len;
-    }
-    if offset >= TS_PACKET_SIZE {
-        return None;
-    }
-
-    let pointer = pkt[offset] as usize;
-    offset += 1 + pointer;
-
-    if offset + 12 > TS_PACKET_SIZE || pkt[offset] != 0x02 {
-        return None; // Not PMT
-    }
-
-    let section_length =
-        (((pkt[offset + 1] & 0x0F) as usize) << 8) | (pkt[offset + 2] as usize);
-    let program_info_length =
-        (((pkt[offset + 10] & 0x0F) as usize) << 8) | (pkt[offset + 11] as usize);
-
-    let data_start = offset + 12 + program_info_length;
-    let data_end = (offset + 3 + section_length)
-        .min(TS_PACKET_SIZE)
-        .saturating_sub(4);
-
-    let mut pos = data_start;
-    while pos + 5 <= data_end {
-        let stream_type = pkt[pos];
-        let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
-        let es_info_length =
-            (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
-
-        if stream_type == 0x1B || stream_type == 0x24 {
-            return Some((es_pid, stream_type));
-        }
-
-        pos += 5 + es_info_length;
-    }
-
-    None
-}
-
-/// Check if Annex B data contains a keyframe NAL unit.
-#[cfg(feature = "video-thumbnail")]
-fn contains_keyframe(data: &[u8], codec: video_codec::VideoCodec) -> bool {
-    // Scan for start codes and check NAL types
-    let mut i = 0;
-    while i + 4 < data.len() {
-        // Look for 0x000001 or 0x00000001
-        if data[i] == 0x00 && data[i + 1] == 0x00 {
-            let (nalu_start, found) = if i + 3 < data.len()
-                && data[i + 2] == 0x00
-                && data[i + 3] == 0x01
-            {
-                (i + 4, true)
-            } else if data[i + 2] == 0x01 {
-                (i + 3, true)
-            } else {
-                (0, false)
-            };
-
-            if found && nalu_start < data.len() {
-                let nalu_header = data[nalu_start];
-                match codec {
-                    video_codec::VideoCodec::H264 => {
-                        let nalu_type = nalu_header & 0x1F;
-                        // IDR = 5, SPS = 7
-                        if nalu_type == 5 || nalu_type == 7 {
-                            return true;
-                        }
-                    }
-                    video_codec::VideoCodec::Hevc => {
-                        let nalu_type = (nalu_header >> 1) & 0x3F;
-                        // IDR_W_RADL = 19, IDR_N_LP = 20, CRA = 21, VPS = 32, SPS = 33
-                        if matches!(nalu_type, 19 | 20 | 21 | 32 | 33) {
-                            return true;
-                        }
-                    }
-                }
-                i = nalu_start + 1;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    false
+    program_number: Option<u16>,
+) -> Option<(Vec<u8>, Vec<(Vec<u8>, i64)>, video_codec::VideoCodec)> {
+    let mut state = LiveState::new(program_number);
+    state.ingest(ts_data);
+    state.snapshot_for_decode()
 }
 
 // ════════════════════════════════════════════════════════════════════════
 // ffmpeg subprocess fallback (when video-thumbnail feature is disabled)
 // ════════════════════════════════════════════════════════════════════════
+
+#[cfg(not(feature = "video-thumbnail"))]
+struct SubprocessState {
+    buffer: VecDeque<Bytes>,
+    buffer_bytes: usize,
+}
+
+#[cfg(not(feature = "video-thumbnail"))]
+impl SubprocessState {
+    fn new() -> Self {
+        Self {
+            buffer: VecDeque::new(),
+            buffer_bytes: 0,
+        }
+    }
+
+    fn has_data(&self) -> bool {
+        self.buffer_bytes > 0
+    }
+
+    fn ingest(&mut self, ts_payload: &[u8]) {
+        let chunk = Bytes::copy_from_slice(ts_payload);
+        let chunk_len = chunk.len();
+        self.buffer.push_back(chunk);
+        self.buffer_bytes += chunk_len;
+        while self.buffer_bytes > MAX_BUFFER_BYTES {
+            match self.buffer.pop_front() {
+                Some(old) => self.buffer_bytes -= old.len(),
+                None => break,
+            }
+        }
+    }
+
+    async fn capture(&self) -> Result<InternalThumbnailResult, String> {
+        let total: usize = self.buffer.iter().map(|b| b.len()).sum();
+        let mut out = BytesMut::with_capacity(total);
+        for chunk in &self.buffer {
+            out.extend_from_slice(chunk);
+        }
+        let ts_data = out.freeze();
+        generate_thumbnail_subprocess(&ts_data).await
+    }
+}
 
 #[cfg(not(feature = "video-thumbnail"))]
 fn check_ffmpeg_subprocess_available() -> bool {
@@ -840,4 +851,170 @@ fn hash_jpeg(data: &[u8]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     data.hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(all(test, feature = "video-thumbnail"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_annex_b_prepends_start_codes() {
+        let nalus = vec![vec![0x67, 0x42, 0x00], vec![0x68, 0xCE], vec![0x65, 0x88]];
+        let out = build_annex_b(&nalus);
+        // Expect 0x00000001 prefix in front of each NAL.
+        assert_eq!(&out[0..4], &[0x00, 0x00, 0x00, 0x01]);
+        assert_eq!(&out[4..7], &[0x67, 0x42, 0x00]);
+        assert_eq!(&out[7..11], &[0x00, 0x00, 0x00, 0x01]);
+        assert_eq!(&out[11..13], &[0x68, 0xCE]);
+        assert_eq!(&out[13..17], &[0x00, 0x00, 0x00, 0x01]);
+        assert_eq!(&out[17..19], &[0x65, 0x88]);
+    }
+
+    #[test]
+    fn build_annex_b_skips_empty_nalus() {
+        let nalus: Vec<Vec<u8>> = vec![Vec::new(), vec![0x67, 0x42], Vec::new()];
+        let out = build_annex_b(&nalus);
+        // One NAL emitted: 4-byte start code + 2-byte body.
+        assert_eq!(out.len(), 6);
+        assert_eq!(&out[0..4], &[0x00, 0x00, 0x00, 0x01]);
+        assert_eq!(&out[4..6], &[0x67, 0x42]);
+    }
+
+    #[test]
+    fn snapshot_anchors_at_latest_keyframe_when_recent() {
+        let mut state = LiveState::new(None);
+        state.codec = Some(video_codec::VideoCodec::H264);
+        // Four frames: kf, non-kf, kf, non-kf — latest keyframe is well
+        // within the recent-window cap so the anchor lands on it.
+        for (i, kf) in [(1, true), (2, false), (3, true), (4, false)] {
+            state.frames.push_back(ThumbnailFrame {
+                annex_b: vec![i as u8],
+                pts: i,
+                is_anchor: kf,
+            });
+            state.frames_bytes += 1;
+        }
+        let (_headers, packets, _codec) = state.snapshot_for_decode().unwrap();
+        // Anchor at the second keyframe (index 2) → 2 packets remain.
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].1, 3);
+        assert_eq!(packets[1].1, 4);
+    }
+
+    #[test]
+    fn snapshot_keeps_anchor_but_bounds_send_count_for_long_gop() {
+        // Long-GOP source (e.g. MP4 with 10 s GOP): keyframe is at
+        // index 0 of a much longer ring. Anchor stays at the keyframe
+        // so the decoder has a real random-access point, but the send
+        // count is capped at MAX_DECODE_FRAMES so we don't decode the
+        // whole GOP. Resulting thumbnail trails the live edge by
+        // ~MAX_DECODE_FRAMES / fps seconds — acceptable for long-GOP.
+        let mut state = LiveState::new(None);
+        state.codec = Some(video_codec::VideoCodec::H264);
+        let total = MAX_DECODE_FRAMES + 50;
+        for i in 1..=total {
+            state.frames.push_back(ThumbnailFrame {
+                annex_b: vec![(i & 0xFF) as u8],
+                pts: i as i64,
+                is_anchor: i == 1, // only the very first frame is an anchor
+            });
+            state.frames_bytes += 1;
+        }
+        let (_headers, packets, _codec) = state.snapshot_for_decode().unwrap();
+        assert_eq!(packets.len(), MAX_DECODE_FRAMES);
+        assert_eq!(packets[0].1, 1);
+        assert_eq!(packets.last().unwrap().1, MAX_DECODE_FRAMES as i64);
+    }
+
+    #[test]
+    fn snapshot_anchors_at_old_sps_for_open_gop_then_caps_packets() {
+        // Open-GOP broadcast pattern (SBS-style DVB-T): no IDR ever, but
+        // SPS+I-slice every ~62 frames. The anchor lands on the latest
+        // SPS-bearing AU even when it's older than MAX_DECODE_FRAMES from
+        // the end of the ring — that's the only random-access point the
+        // decoder can lock onto. We then send up to MAX_DECODE_FRAMES from
+        // there forward.
+        let mut state = LiveState::new(None);
+        state.codec = Some(video_codec::VideoCodec::H264);
+        // 100 frames; SPS at idx=20 (60 frames back from end > MAX_DECODE_FRAMES).
+        let total = 100;
+        let sps_idx = 20;
+        for i in 0..total {
+            state.frames.push_back(ThumbnailFrame {
+                annex_b: vec![(i & 0xFF) as u8],
+                pts: i as i64,
+                is_anchor: i == sps_idx,
+            });
+            state.frames_bytes += 1;
+        }
+        let (_headers, packets, _codec) = state.snapshot_for_decode().unwrap();
+        // Anchor at SPS, send up to MAX_DECODE_FRAMES forward.
+        assert_eq!(packets.len(), MAX_DECODE_FRAMES);
+        assert_eq!(packets[0].1, sps_idx as i64);
+        assert_eq!(packets.last().unwrap().1, (sps_idx + MAX_DECODE_FRAMES - 1) as i64);
+    }
+
+    #[test]
+    fn snapshot_anchors_at_oldest_when_no_keyframe_within_cap() {
+        // Open-GOP stream: no NALU type 5 ever surfaced. With fewer
+        // frames in the ring than `MAX_DECODE_FRAMES`, the fallback
+        // anchor is the oldest AU (full retained window).
+        let mut state = LiveState::new(None);
+        state.codec = Some(video_codec::VideoCodec::H264);
+        for i in 1..=3 {
+            state.frames.push_back(ThumbnailFrame {
+                annex_b: vec![i as u8],
+                pts: i as i64,
+                is_anchor: false,
+            });
+            state.frames_bytes += 1;
+        }
+        let (_headers, packets, _codec) = state.snapshot_for_decode().unwrap();
+        assert_eq!(packets.len(), 3);
+        assert_eq!(packets[0].1, 1);
+    }
+
+    #[test]
+    fn snapshot_caps_fallback_to_recent_window() {
+        // Open-GOP stream with a long retention: only the last
+        // `MAX_DECODE_FRAMES` AUs are sent — enough context for a
+        // recovery_point SEI to anchor without saturating CPU.
+        let mut state = LiveState::new(None);
+        state.codec = Some(video_codec::VideoCodec::H264);
+        let total = MAX_DECODE_FRAMES + 50;
+        for i in 1..=total {
+            state.frames.push_back(ThumbnailFrame {
+                annex_b: vec![(i & 0xFF) as u8],
+                pts: i as i64,
+                is_anchor: false,
+            });
+            state.frames_bytes += 1;
+        }
+        let (_headers, packets, _codec) = state.snapshot_for_decode().unwrap();
+        assert_eq!(packets.len(), MAX_DECODE_FRAMES);
+        assert_eq!(packets[0].1, (total - MAX_DECODE_FRAMES + 1) as i64);
+        assert_eq!(packets.last().unwrap().1, total as i64);
+    }
+
+    #[test]
+    fn snapshot_returns_none_when_codec_unknown() {
+        let state = LiveState::new(None);
+        assert!(state.snapshot_for_decode().is_none());
+    }
+
+    #[test]
+    fn ring_evicts_oldest_when_byte_budget_exceeded() {
+        let mut state = LiveState::new(None);
+        state.codec = Some(video_codec::VideoCodec::H264);
+        // Push frames totalling > MAX_AU_BUFFER_BYTES via a single
+        // oversized synthetic AU — easier than spinning up real ones.
+        let big = vec![0u8; MAX_AU_BUFFER_BYTES / 2 + 1];
+        state.push_frame(big.clone(), 1, false);
+        state.push_frame(big.clone(), 2, false);
+        state.push_frame(big, 3, false);
+        // Oldest two should have been evicted; only the last remains.
+        assert_eq!(state.frames.len(), 1);
+        assert_eq!(state.frames[0].pts, 3);
+        assert!(state.frames_bytes <= MAX_AU_BUFFER_BYTES);
+    }
 }

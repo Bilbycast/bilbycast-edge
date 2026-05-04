@@ -47,7 +47,7 @@ use video_engine::{
 };
 
 use crate::config::models::{DisplayOutputConfig, DisplayScalingMode};
-use crate::display::audio_bars::{new_shared_meter, MeterSnapshot, SharedMeter};
+use crate::display::audio_bars::{new_shared_meter, SharedMeter};
 use crate::display::audio_meter::spawn_audio_meter;
 use crate::display::{audio::AudioBackend, clock::AudioClock, kms::KmsDisplay};
 use crate::engine::packet::RtpPacket;
@@ -913,13 +913,10 @@ fn blit_and_present(
         .map_err(|e| anyhow::anyhow!("display scale failed: {e}"))?;
 
     if let Some(snapshot) = meter {
-        // Snapshot is small (≤ ~16 PIDs × 8 channels × 16 B); clone the
-        // current snapshot and rasterise without holding the mutex
-        // across the per-pixel writes.
-        let snap: MeterSnapshot = snapshot
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
+        // Lock-free read: `ArcSwap::load` is one atomic acquire +
+        // refcount bump. The display loop never blocks the meter task
+        // and never allocates on the hot path.
+        let snap = snapshot.load();
         crate::display::audio_bars::rasterise(&snap, dst, pitch, dst_w, dst_h);
     }
 

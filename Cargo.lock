@@ -378,6 +378,7 @@ dependencies = [
  "aes-gcm",
  "alsa",
  "anyhow",
+ "arc-swap",
  "axum",
  "axum-server",
  "base64",

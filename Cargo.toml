@@ -33,6 +33,7 @@ chrono = "0.4.44"
 
 # Concurrency
 dashmap = "7.0.0-rc2"
+arc-swap = "1.9"
 
 # Byte buffers
 bytes = "1.11.1"

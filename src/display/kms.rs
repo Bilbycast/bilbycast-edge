@@ -20,7 +20,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use drm::buffer::{Buffer, DrmFourcc};
 use drm::control::{
-    connector::State as ConnectorState, framebuffer, AtomicCommitFlags, Device as ControlDevice,
+    connector::State as ConnectorState, dumbbuffer::DumbMapping, framebuffer, AtomicCommitFlags,
+    Device as ControlDevice, Event, PageFlipFlags,
 };
 use drm::Device;
 
@@ -252,6 +253,20 @@ pub struct KmsDisplay {
 }
 
 struct DumbBuffer {
+    // Field declaration order = drop order. `mapping` drops first
+    // (munmaps the persistent CPU mapping); `handle` and `fb` are
+    // released by the kernel when the DRM fd closes (CardFile drops at
+    // KmsDisplay::Drop) or by explicit `destroy_*` calls in the
+    // mode-change paths below.
+    //
+    // The drm-rs `DumbMapping<'a>` lifetime parameter is purely phantom
+    // (`PhantomData<&'a ()>` — verified in drm-0.14/src/control/dumbbuffer.rs):
+    // the inner `&'a mut [u8]` borrows the mmap'd kernel slice, not the
+    // `DumbBuffer` struct, so extending the lifetime to `'static` here
+    // is sound as long as `mapping` is dropped before any
+    // `destroy_dumb_buffer(handle)` call (enforced by field order
+    // and the explicit destructure pattern in the cleanup loops).
+    mapping: DumbMapping<'static>,
     handle: drm::control::dumbbuffer::DumbBuffer,
     fb: framebuffer::Handle,
 }
@@ -390,8 +405,14 @@ impl KmsDisplay {
             .context("display_mode_set_failed: auto-match re-modeset")?;
         let old_bufs = std::mem::replace(&mut self.bufs, [new_a, new_b]);
         for old in old_bufs {
-            let _ = self.card.destroy_framebuffer(old.fb);
-            let _ = self.card.destroy_dumb_buffer(old.handle);
+            // Drop the persistent mapping (munmap) before destroying the
+            // kernel-side dumb buffer. Destructure with `..` is fine —
+            // `DumbBuffer` has no `Drop` impl, so partial moves are
+            // permitted.
+            let DumbBuffer { mapping, fb, handle } = old;
+            drop(mapping);
+            let _ = self.card.destroy_framebuffer(fb);
+            let _ = self.card.destroy_dumb_buffer(handle);
         }
         self.mode = new_mode;
         self.width = new_w;
@@ -451,8 +472,10 @@ impl KmsDisplay {
             .context("display_mode_set_failed: monitor-native re-modeset")?;
         let old_bufs = std::mem::replace(&mut self.bufs, [new_a, new_b]);
         for old in old_bufs {
-            let _ = self.card.destroy_framebuffer(old.fb);
-            let _ = self.card.destroy_dumb_buffer(old.handle);
+            let DumbBuffer { mapping, fb, handle } = old;
+            drop(mapping);
+            let _ = self.card.destroy_framebuffer(fb);
+            let _ = self.card.destroy_dumb_buffer(handle);
         }
         self.mode = new_mode;
         self.width = new_w;
@@ -461,50 +484,73 @@ impl KmsDisplay {
         Ok(())
     }
 
-    /// Map the back buffer for direct CPU writes. The caller writes a
-    /// W×H XRGB8888 pixel block into the returned slice (stride is
-    /// the buffer's pitch in bytes — usually `W*4`, but `pitch()` is
-    /// authoritative). The slice is unmapped on drop.
+    /// Hand the back buffer's CPU mapping to the caller for direct
+    /// pixel writes. The caller writes a W×H XRGB8888 block into the
+    /// returned slice (stride = buffer pitch). The mapping is **persistent**
+    /// — it was mmap'd once at alloc time and lives as long as the
+    /// `DumbBuffer`. The returned `DumbBufferMap` only borrows the slice;
+    /// dropping it just releases the borrow (no syscall).
     pub fn back_buffer(&mut self) -> Result<DumbBufferMap<'_>> {
         let back_idx = 1 - self.front_idx;
+        let width = self.width;
+        let height = self.height;
         let pitch = self.bufs[back_idx].handle.pitch();
-        let mapping = self
-            .card
-            .map_dumb_buffer(&mut self.bufs[back_idx].handle)
-            .context("map_dumb_buffer")?;
         Ok(DumbBufferMap {
-            mapping,
+            slice: self.bufs[back_idx].mapping.as_mut(),
             pitch,
-            width: self.width,
-            height: self.height,
+            width,
+            height,
         })
     }
 
-    /// Page-flip to the back buffer, swap front/back. Blocks until the
-    /// next vsync via `set_crtc` (lighter than the async page-flip
-    /// event path; v2 will move to atomic page flips for jitter
-    /// reduction).
+    /// Queue a vblank-synchronous page flip and block until the kernel
+    /// posts `DRM_EVENT_FLIP_COMPLETE` for our CRTC. This is the proper
+    /// per-frame primitive: the kernel atomically swaps the scanout source
+    /// at the next vblank without reprogramming the CRTC. Cost is
+    /// microseconds, not the 10–30 ms of `drmModeSetCrtc`.
+    ///
+    /// The DRM fd is opened in blocking mode (no `O_NONBLOCK`), so the
+    /// `read()` inside `receive_events()` blocks until events arrive.
+    /// The loop guards against unrelated events (e.g. a vblank request
+    /// from another consumer) being drained ahead of our flip event.
     pub fn present(&mut self) -> Result<()> {
         let back_idx = 1 - self.front_idx;
         self.card
-            .set_crtc(
+            .page_flip(
                 self.crtc,
-                Some(self.bufs[back_idx].fb),
-                (0, 0),
-                &[self.connector],
-                Some(self.mode),
+                self.bufs[back_idx].fb,
+                PageFlipFlags::EVENT,
+                None,
             )
-            .context("display_mode_set_failed: page-flip set_crtc")?;
+            .context("display_page_flip_failed: page_flip queue")?;
+        loop {
+            let events = self
+                .card
+                .receive_events()
+                .context("display_page_flip_failed: receive_events")?;
+            let mut flipped = false;
+            for ev in events {
+                if let Event::PageFlip(p) = ev {
+                    if p.crtc == self.crtc {
+                        flipped = true;
+                    }
+                }
+            }
+            if flipped {
+                break;
+            }
+        }
         self.front_idx = back_idx;
         Ok(())
     }
 }
 
-/// Borrowed view into a mapped dumb buffer. Drop unmaps. Same shape as
-/// what the `drm` crate's `DumbMapping` returns; we re-export the
-/// pitch + width + height for easy blits.
+/// Borrowed view into a dumb buffer's persistent CPU mapping. Dropping
+/// just releases the `&mut` borrow on the underlying `DumbBuffer` — no
+/// syscall, no munmap. The mapping itself is created once at
+/// `alloc_dumb_buffer` time and lives for the buffer's lifetime.
 pub struct DumbBufferMap<'a> {
-    mapping: drm::control::dumbbuffer::DumbMapping<'a>,
+    slice: &'a mut [u8],
     pitch: u32,
     width: u32,
     height: u32,
@@ -521,18 +567,28 @@ impl<'a> DumbBufferMap<'a> {
         self.height
     }
     pub fn as_mut(&mut self) -> &mut [u8] {
-        self.mapping.as_mut()
+        self.slice
     }
 }
 
 fn alloc_dumb_buffer(card: &CardFile, w: u32, h: u32) -> Result<DumbBuffer> {
-    let handle = card
+    let mut handle = card
         .create_dumb_buffer((w, h), DrmFourcc::Xrgb8888, 32)
         .context("create_dumb_buffer")?;
     let fb = card
         .add_framebuffer(&handle, 24, 32)
         .context("add_framebuffer")?;
-    Ok(DumbBuffer { handle, fb })
+    let mapping = card
+        .map_dumb_buffer(&mut handle)
+        .context("map_dumb_buffer")?;
+    // SAFETY: lifetime extension. `DumbMapping<'a>` carries an mmap'd
+    // kernel slice independent of `handle`'s Rust-side struct (the `'a`
+    // is `PhantomData`). We bind `mapping` and `handle` together inside
+    // the same `DumbBuffer` and the field declaration order ensures
+    // `mapping` is dropped (munmapped) before `handle` is consumed by
+    // `destroy_dumb_buffer` in the cleanup paths.
+    let mapping: DumbMapping<'static> = unsafe { std::mem::transmute(mapping) };
+    Ok(DumbBuffer { mapping, handle, fb })
 }
 
 fn pick_mode(

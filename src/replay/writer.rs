@@ -373,7 +373,7 @@ async fn subscriber_loop(
             _ = cancel.cancelled() => break,
             recv = rx.recv() => match recv {
                 Ok(pkt) => {
-                    if writer_tx.try_send(pkt.data.clone()).is_err() {
+                    if writer_tx.try_send(pkt.data).is_err() {
                         stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                         let now = Instant::now();
                         let should_emit = last_lag_event.map(|t| now.duration_since(t) > LAG_EVENT_INTERVAL).unwrap_or(true);

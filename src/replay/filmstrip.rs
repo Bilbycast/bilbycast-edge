@@ -283,17 +283,25 @@ async fn try_capture_frame(ts_data: &Bytes) -> Result<Option<(u64, Vec<u8>)>, St
         let bytes = ts_data.to_vec();
         let jpeg = tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>, String> {
             use video_codec::ThumbnailConfig;
-            let extracted = match crate::engine::thumbnail::extract_video_from_ts(&bytes) {
-                Some(v) => v,
+            // One-shot demux of the snapshot — same primitive the live
+            // thumbnail loop uses, so open-GOP broadcast streams (non-IDR
+            // I-slices with `recovery_point` SEI) decode here too. The
+            // helper returns `None` when no video PID surfaces — audio-only
+            // or warm-up.
+            let snapshot = match crate::engine::thumbnail::demux_snapshot_for_decode(&bytes, None)
+            {
+                Some(s) => s,
                 None => return Ok(None),
             };
+            let (headers, packets, codec) = snapshot;
             let cfg = ThumbnailConfig {
                 width: FRAME_WIDTH,
                 height: FRAME_HEIGHT,
                 quality: FRAME_QUALITY,
             };
-            let result = video_engine::decode_thumbnail(&extracted.annex_b_data, extracted.codec, &cfg)
-                .map_err(|e| format!("decode_thumbnail: {e}"))?;
+            let result =
+                video_engine::decode_thumbnail_packets(&headers, &packets, codec, &cfg)
+                    .map_err(|e| format!("decode_thumbnail_packets: {e}"))?;
             Ok(Some(result.jpeg.to_vec()))
         })
         .await

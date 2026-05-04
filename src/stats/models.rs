@@ -421,6 +421,17 @@ pub struct PerInputLive {
     /// payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub psi_catalog_tick: Option<u64>,
+    /// Active alarm on this input's *own* thumbnail accumulator: `"black"`,
+    /// `"frozen"`, `"no_signal"`, or `None`. Each input gets a dedicated
+    /// thumbnail generator subscribed to its pre-fixer broadcast channel,
+    /// so the alarm reflects what *this* source is actually delivering —
+    /// independent of which input is currently switched onto the flow's
+    /// program bus. Lets the manager UI badge per-input cards correctly
+    /// instead of painting the flow-level alarm onto every sibling card.
+    /// Absent on flows that don't generate per-input thumbnails (e.g.
+    /// thumbnail disabled) so older manager builds see an unchanged shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_alarm: Option<String>,
 }
 
 /// PTP state snapshot reported up to the manager.

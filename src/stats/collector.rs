@@ -2073,6 +2073,10 @@ impl FlowStatsAccumulator {
                 let packets = c.packets.load(Ordering::Relaxed);
                 let bitrate = c.throughput.sample(bytes);
                 let (psi_catalog, psi_tick) = c.psi_catalog_snapshot();
+                let thumbnail_alarm = self
+                    .per_input_thumbnails
+                    .get(&input_id)
+                    .and_then(|t| t.current_alarm());
                 PerInputLive {
                     input_id,
                     input_type: c.input_type.clone(),
@@ -2089,6 +2093,7 @@ impl FlowStatsAccumulator {
                     whep_url: c.meta.whep_url.clone(),
                     psi_catalog,
                     psi_catalog_tick: if psi_tick == 0 { None } else { Some(psi_tick) },
+                    thumbnail_alarm,
                 }
             })
             .collect();

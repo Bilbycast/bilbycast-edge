@@ -348,9 +348,11 @@ fn decode_and_metrics(
 }
 
 /// Pull recent video NAL data out of the TS buffer and return the codec.
-/// A very-trimmed cousin of [`crate::engine::thumbnail::extract_video_from_ts`]
-/// — kept local so follow-up edits to the thumbnail pipeline don't perturb
-/// the analyser.
+/// A trimmed PES reassembler — kept local so follow-up edits to the
+/// thumbnail pipeline don't perturb the analyser, and so video_full keeps
+/// its established "feed everything, let libavcodec catch up" decode
+/// pattern (the live thumbnail loop uses a per-AU pattern via TsDemuxer
+/// for open-GOP broadcast streams; both paths are independent).
 #[cfg(feature = "video-thumbnail")]
 fn extract_video(ts: &[u8]) -> Option<(Vec<u8>, video_codec::VideoCodec)> {
     use crate::engine::ts_parse::{

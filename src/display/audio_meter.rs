@@ -31,7 +31,7 @@ use crate::engine::ts_parse::{
     TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
 
-use super::audio_bars::{new_shared_meter, prune_stale, update_levels, SharedMeter};
+use super::audio_bars::{new_shared_meter, prune_stale, update_levels, MeterSnapshot, SharedMeter};
 
 const PES_BUF_CAP: usize = 256 * 1024;
 const STALE_PID_AFTER: Duration = Duration::from_secs(5);
@@ -65,10 +65,15 @@ pub fn new_meter() -> SharedMeter {
 async fn run_meter(
     rx: &mut broadcast::Receiver<RtpPacket>,
     program_number: Option<u16>,
-    snapshot: SharedMeter,
+    shared: SharedMeter,
     cancel: CancellationToken,
 ) -> Result<()> {
     let mut state = MeterState::new(program_number);
+    // Local snapshot owned exclusively by this task. `update_levels` /
+    // `prune_stale` mutate it and publish a fresh `Arc<MeterSnapshot>`
+    // through `shared` (ArcSwap) — the display task observes only the
+    // published Arc, lock-free.
+    let mut local = MeterSnapshot::default();
     let mut prune_interval = tokio::time::interval(PRUNE_INTERVAL);
     prune_interval.tick().await;
 
@@ -76,11 +81,11 @@ async fn run_meter(
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = prune_interval.tick() => {
-                prune_stale(&snapshot, STALE_PID_AFTER);
+                prune_stale(&mut local, &shared, STALE_PID_AFTER);
             }
             result = rx.recv() => {
                 match result {
-                    Ok(packet) => state.process_packet(&packet, &snapshot),
+                    Ok(packet) => state.process_packet(&packet, &mut local, &shared),
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         state.reset_assemblers();
                     }
@@ -120,19 +125,29 @@ impl MeterState {
         }
     }
 
-    fn process_packet(&mut self, packet: &RtpPacket, snapshot: &SharedMeter) {
+    fn process_packet(
+        &mut self,
+        packet: &RtpPacket,
+        local: &mut MeterSnapshot,
+        shared: &SharedMeter,
+    ) {
         let payload = strip_rtp_header(packet);
         let mut offset = 0;
         while offset + TS_PACKET_SIZE <= payload.len() {
             let pkt = &payload[offset..offset + TS_PACKET_SIZE];
             if pkt[0] == TS_SYNC_BYTE {
-                self.process_ts_packet(pkt, snapshot);
+                self.process_ts_packet(pkt, local, shared);
             }
             offset += TS_PACKET_SIZE;
         }
     }
 
-    fn process_ts_packet(&mut self, pkt: &[u8], snapshot: &SharedMeter) {
+    fn process_ts_packet(
+        &mut self,
+        pkt: &[u8],
+        local: &mut MeterSnapshot,
+        shared: &SharedMeter,
+    ) {
         let pid = ts_pid(pkt);
         let pusi = ts_pusi(pkt);
         let adaptation = ts_adaptation_field_control(pkt);
@@ -159,7 +174,7 @@ impl MeterState {
             return;
         }
         if let Some(pid_state) = self.audio_pids.get_mut(&pid) {
-            pid_state.observe_ts(pusi, payload, snapshot);
+            pid_state.observe_ts(pusi, payload, local, shared);
         }
     }
 
@@ -275,7 +290,13 @@ impl MeterPidState {
         }
     }
 
-    fn observe_ts(&mut self, pusi: bool, ts_payload: &[u8], snapshot: &SharedMeter) {
+    fn observe_ts(
+        &mut self,
+        pusi: bool,
+        ts_payload: &[u8],
+        local: &mut MeterSnapshot,
+        shared: &SharedMeter,
+    ) {
         if pusi {
             // The next PES is starting — drain whatever the previous PES
             // accumulated. MP2 / AC-3 / E-AC-3 frames routinely span
@@ -285,7 +306,7 @@ impl MeterPidState {
             // packet. Draining on the PUSI boundary guarantees the
             // decoder sees complete frames.
             if self.capturing_pes && !self.pes_buf.is_empty() {
-                self.drain(snapshot);
+                self.drain(local, shared);
             }
             let start = pes_payload_offset(ts_payload);
             self.pes_buf.clear();
@@ -303,16 +324,16 @@ impl MeterPidState {
         }
     }
 
-    fn drain(&mut self, snapshot: &SharedMeter) {
+    fn drain(&mut self, local: &mut MeterSnapshot, shared: &SharedMeter) {
         match self.stream_type {
-            0x0F | 0x11 => self.drain_aac(snapshot),
+            0x0F | 0x11 => self.drain_aac(local, shared),
             0x03 | 0x04 | 0x80 | 0x81 | 0x82 | 0x83 | 0x84 | 0x85 | 0x87 | 0x88 | 0x8A
-            | 0xC1 | 0xC2 => self.drain_ff(snapshot),
+            | 0xC1 | 0xC2 => self.drain_ff(local, shared),
             _ => {}
         }
     }
 
-    fn drain_aac(&mut self, snapshot: &SharedMeter) {
+    fn drain_aac(&mut self, local: &mut MeterSnapshot, shared: &SharedMeter) {
         let mut consume = 0;
         loop {
             let buf = &self.pes_buf[consume..];
@@ -351,7 +372,7 @@ impl MeterPidState {
             if let Some(ref mut dec) = self.aac_decoder
                 && let Ok(planar) = dec.decode_frame(frame)
             {
-                update_levels(&planar, self.pid, self.codec_label, snapshot);
+                update_levels(&planar, self.pid, self.codec_label, local, shared);
             }
             consume += frame_len;
         }
@@ -360,7 +381,7 @@ impl MeterPidState {
         }
     }
 
-    fn drain_ff(&mut self, snapshot: &SharedMeter) {
+    fn drain_ff(&mut self, local: &mut MeterSnapshot, shared: &SharedMeter) {
         // Lazily open the FFmpeg-backed decoder.
         let Some(codec) =
             crate::engine::audio_decode::ff_codec_for_stream_type(self.stream_type)
@@ -385,7 +406,7 @@ impl MeterPidState {
         {
             if dec.send_packet(frame_slice, 0).is_ok() {
                 while let Ok(frame) = dec.receive_frame() {
-                    update_levels(&frame.planar, self.pid, self.codec_label, snapshot);
+                    update_levels(&frame.planar, self.pid, self.codec_label, local, shared);
                 }
             }
         }
