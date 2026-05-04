@@ -4047,6 +4047,19 @@ pub struct DisplayOutputConfig {
     /// for the layout and meter-style reference.
     #[serde(default)]
     pub show_audio_bars: bool,
+
+    /// Operator's hardware-decode preference for this display output.
+    ///
+    /// `None` (or `"auto"`) — pick the best HW backend the edge has
+    /// compiled in and probed at startup, fall back to CPU if none are
+    /// available. `"cpu"` forces software libavcodec, leaving HW
+    /// resources free for transcode flows elsewhere on the node.
+    /// `"nvdec"` / `"qsv"` force a specific HW backend; the edge
+    /// rejects the output at start with `display_hw_decode_unavailable`
+    /// when the host can't satisfy the choice (feature missing, driver
+    /// missing, or session capacity exhausted at probe time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hw_decode: Option<HwDecodePreference>,
 }
 
 fn default_audio_channel_pair() -> [u8; 2] {
@@ -4055,6 +4068,24 @@ fn default_audio_channel_pair() -> [u8; 2] {
 
 fn default_sync_mode() -> String {
     "vsync_to_display".to_string()
+}
+
+/// Per-display-output hardware-decode preference. Mirrors the encoder
+/// codec selection on transcoding outputs — operators pick the backend
+/// they want to dedicate to this confidence-monitor playout (or `Cpu`
+/// to keep GPU resources free for a heavy transcode flow elsewhere).
+///
+/// String wire shape: `"auto"`, `"cpu"`, `"nvdec"`, `"qsv"`. Default is
+/// `Auto`. The deserialiser accepts the legacy short forms only;
+/// unknown strings fail validation with `display_hw_decode_invalid`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HwDecodePreference {
+    #[default]
+    Auto,
+    Cpu,
+    Nvdec,
+    Qsv,
 }
 
 /// How the display output picks the connector's KMS mode.

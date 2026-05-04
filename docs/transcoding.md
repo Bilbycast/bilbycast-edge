@@ -364,14 +364,19 @@ See the licensing notes in the main `bilbycast-edge/CLAUDE.md`:
 
 Default release build has no software video encoders (AGPL-only
 binary). The composite `video-encoders-full` feature bundles every
-encoder backend (x264 + x265 + NVENC + QSV) and is used by the
-GitHub Actions release workflow to produce the `*-linux-full`
-variant — see [`docs/installation.md`](installation.md) for the
-two-channel release model. The `*-aarch64-linux-full` artefact
-intentionally drops QSV (Intel iGPU is x86_64-only) and lists the
-remaining three features explicitly. Runtime error `video encoder
-disabled: rebuild with …` surfaces when a config targets a codec
-whose feature flag was not enabled at build.
+video codec backend the edge knows about — encoders (x264 + x265 +
+NVENC + QSV) **and** HW decoders for the local-display output
+(NVDEC + QSV-decode) — and is used by the GitHub Actions release
+workflow to produce the `*-linux-full` variant. See
+[`docs/installation.md`](installation.md) for the two-channel
+release model. The `*-aarch64-linux-full` artefact intentionally
+drops QSV (encode + decode; Intel iGPU is x86_64-only) and lists
+the remaining features explicitly: x264 + x265 + NVENC + NVDEC.
+Runtime error `video encoder disabled: rebuild with …` surfaces
+when a config targets a codec whose feature flag was not enabled at
+build; the display output's `hw_decode: "nvdec" / "qsv"` choice
+similarly emits `display_hw_decode_unavailable` when the matching
+HW decode feature isn't compiled in.
 
 **Commercial licensing + GPL**: bilbycast-edge source is dual-licensed
 (AGPL-3.0-or-later / commercial from Softside Tech). The Softside
@@ -389,14 +394,16 @@ bundled `NOTICE.full` for the full scope statement.
 # Linux — default build (no video encoders, matches *-linux release):
 cargo build --release
 
-# Linux x86_64 — full build (bundles x264 + x265 + NVENC + QSV, matches
+# Linux x86_64 — full build (bundles x264 + x265 + NVENC + QSV
+# encoders, plus NVDEC + QSV-decode for the display output; matches
 # *-x86_64-linux-full release):
 sudo apt install libx264-dev libx265-dev nv-codec-headers libvpl-dev
 cargo build --release --features video-encoders-full
 
-# Linux aarch64 — full build minus QSV (Intel iGPU is x86_64-only):
+# Linux aarch64 — full build minus QSV encode + decode (Intel iGPU is
+# x86_64-only):
 sudo apt install libx264-dev libx265-dev nv-codec-headers
-cargo build --release --features "video-encoder-x264 video-encoder-x265 video-encoder-nvenc"
+cargo build --release --features "video-encoder-x264 video-encoder-x265 video-encoder-nvenc display-nvdec"
 
 # Linux — individual opt-ins (à la carte):
 cargo build --release --features video-encoder-x264

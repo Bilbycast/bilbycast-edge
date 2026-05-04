@@ -43,7 +43,8 @@ use tokio_util::sync::CancellationToken;
 use aac_audio::AacDecoder;
 use video_codec::AudioDecoderCodec;
 use video_engine::{
-    AudioDecoder as FfAudioDecoder, ScalerDstFormat, VideoCodec, VideoDecoder, VideoScaler,
+    AudioDecoder as FfAudioDecoder, DecoderBackend, ScalerDstFormat, VideoCodec, VideoDecoder,
+    VideoScaler,
 };
 
 use crate::config::models::{DisplayOutputConfig, DisplayScalingMode};
@@ -99,6 +100,46 @@ async fn run_display_output(
     event_sender: EventSender,
     flow_id: String,
 ) -> Result<()> {
+    // 0. Resolve the operator's hardware-decode preference against the
+    //    edge's startup-probed capabilities. `Auto` falls back to CPU
+    //    when no HW backend is available; explicit `Nvdec` / `Qsv`
+    //    that the host can't satisfy aborts the start with the
+    //    `display_hw_decode_unavailable` event so the manager UI can
+    //    flag it on the flow modal. The cost-plan resolver in
+    //    `derive_cost_plan` runs the same function over the same
+    //    snapshot, so the post-resolve cost charged at flow create
+    //    matches what we actually run here.
+    let pref = config.hw_decode.unwrap_or_default();
+    let resolved = match crate::engine::hardware_probe::resolve_display_decoder(
+        &pref,
+        crate::engine::hardware_probe::static_capabilities()
+            .as_deref(),
+    ) {
+        Ok(r) => r,
+        Err(reason) => {
+            let msg = format!(
+                "display output '{}': hw_decode '{:?}' not available on this host ({})",
+                config.id,
+                pref,
+                reason.as_reason(),
+            );
+            event_sender.emit_flow_with_details(
+                EventSeverity::Critical,
+                crate::manager::events::category::SYSTEM_RESOURCES,
+                msg.clone(),
+                &flow_id,
+                serde_json::json!({
+                    "error_code": "display_hw_decode_unavailable",
+                    "output_id": config.id,
+                    "preference": format!("{:?}", pref).to_lowercase(),
+                    "reason": reason.as_reason(),
+                }),
+            );
+            return Err(anyhow::anyhow!(msg));
+        }
+    };
+    let backend = resolved.as_backend();
+
     // 1. Open KMS at the connector's preferred mode. The actual mode the
     //    panel runs at is decided by `config.scaling_mode`:
     //    - `MatchSource` (default): the display loop re-modesets to the
@@ -204,6 +245,7 @@ async fn run_display_output(
     let mut demux_rx = rx.resubscribe();
     let demux_program = config.program_number;
     let demux_track = config.audio_track_index;
+    let demux_backend = backend;
     let demux_handle = tokio::task::spawn_blocking(move || {
         demux_decode_loop(
             &mut demux_rx,
@@ -216,6 +258,7 @@ async fn run_display_output(
             demux_event_sender,
             demux_flow_id,
             demux_output_id,
+            demux_backend,
         );
     });
 
@@ -229,6 +272,15 @@ async fn run_display_output(
     let display_output_id = config.id.clone();
     let display_meter = meter_snapshot.as_ref().map(Arc::clone);
     let display_scaling_mode = config.scaling_mode;
+    // Surface the resolved decoder backend on `DisplayStats.decoder_kind`
+    // so the manager UI's flow card and Resources card can render the
+    // active mode (e.g. "display (1920x1080@60Hz · NVDEC)"). Static
+    // strings — the resolver runs once per output.
+    let decoder_kind_label: &'static str = match resolved {
+        crate::engine::hardware_probe::ResolvedDisplayDecoder::Cpu => "cpu",
+        crate::engine::hardware_probe::ResolvedDisplayDecoder::Nvdec => "nvdec",
+        crate::engine::hardware_probe::ResolvedDisplayDecoder::Qsv => "qsv",
+    };
     let display_handle = tokio::task::spawn_blocking(move || {
         display_loop(
             kms,
@@ -238,6 +290,7 @@ async fn run_display_output(
             display_cancel,
             display_output_stats,
             audio_codec_label,
+            decoder_kind_label,
             display_event_sender,
             display_flow_id,
             display_output_id,
@@ -343,6 +396,7 @@ fn demux_decode_loop(
     event_sender: EventSender,
     flow_id: String,
     output_id: String,
+    backend: DecoderBackend,
 ) {
     let mut demuxer = TsDemuxer::with_audio_track(program_number, audio_track_index);
     let mut video_decoder: Option<VideoDecoder> = None;
@@ -426,6 +480,7 @@ fn demux_decode_loop(
                         &mut video_decoder,
                         &mut current_video_codec,
                         VideoCodec::H264,
+                        backend,
                     );
                     if let Some(decoder) = video_decoder.as_mut() {
                         feed_video_decoder(decoder, &nalus, pts);
@@ -449,6 +504,7 @@ fn demux_decode_loop(
                         &mut video_decoder,
                         &mut current_video_codec,
                         VideoCodec::Hevc,
+                        backend,
                     );
                     if let Some(decoder) = video_decoder.as_mut() {
                         feed_video_decoder(decoder, &nalus, pts);
@@ -527,12 +583,20 @@ fn ensure_video_decoder(
     slot: &mut Option<VideoDecoder>,
     current: &mut Option<VideoCodec>,
     desired: VideoCodec,
+    backend: DecoderBackend,
 ) {
     if *current == Some(desired) && slot.is_some() {
         return;
     }
     *current = Some(desired);
-    *slot = VideoDecoder::open(desired).ok();
+    // The backend was resolved against `static_capabilities()` at task
+    // bring-up — by here it's guaranteed to be a backend the host can
+    // open. A failed `open_with_backend` after a successful resolution
+    // means the codec context allocation itself failed (out-of-memory)
+    // or the GPU went away mid-process; both surface as `None` and
+    // the demux loop will retry on the next frame after `flush()` —
+    // matching the existing behaviour for spurious decoder failures.
+    *slot = VideoDecoder::open_with_backend(desired, backend).ok();
 }
 
 /// True when `pts` is far enough from `prev` that the upstream stream
@@ -572,9 +636,6 @@ fn drain_video_frames(
     counters: &DisplayStatsCounters,
 ) {
     while let Ok(frame) = decoder.receive_frame() {
-        let Some((y, ys, u, us, v, vs)) = frame.yuv_planes() else {
-            continue;
-        };
         // Prefer the decoder-propagated display-order PTS. With
         // B-frame H.264 / HEVC, the input-feed PTS we held in the
         // outer loop matches the *most recent fed* access unit, not
@@ -584,21 +645,80 @@ fn drain_video_frames(
         // to the input PTS is fine for I-only streams where the
         // decoder has no chance to reorder.
         let pts_90k = frame.pts().map(|p| p as u64).unwrap_or(fallback_pts_90k);
-        let frame = VideoFrame {
-            y: y.to_vec(),
-            u: u.to_vec(),
-            v: v.to_vec(),
+        let width = frame.width();
+        let height = frame.height();
+        let colorspace = frame.colorspace();
+        let full_range = frame.is_full_range();
+        let pixel_format = frame.pixel_format();
+
+        // Two layouts: planar YUV (CPU decode path) and NV12 (cuvid /
+        // QSV HW decode auto-downloaded to system memory). Convert
+        // NV12 to YUV420P inline by deinterleaving UV — keeps the
+        // downstream `VideoFrame` shape and the `VideoScaler` colour
+        // path uniform across backends. The deinterleave is a single
+        // pass over the chroma plane (≤ 25 % of frame bytes) and runs
+        // on the demux thread, not the data path.
+        let yuv = if let Some((y, ys, u, us, v, vs)) = frame.yuv_planes() {
+            Some((
+                y.to_vec(),
+                ys,
+                u.to_vec(),
+                us,
+                v.to_vec(),
+                vs,
+                pixel_format,
+            ))
+        } else if let Some((y, ys, uv, uvs)) = frame.nv12_planes() {
+            let chroma_rows = (height as usize + 1) / 2;
+            let chroma_cols = (width as usize + 1) / 2;
+            let mut u_plane = vec![0u8; chroma_cols * chroma_rows];
+            let mut v_plane = vec![0u8; chroma_cols * chroma_rows];
+            for row in 0..chroma_rows {
+                let src = &uv[row * uvs..row * uvs + chroma_cols * 2];
+                let u_dst = &mut u_plane[row * chroma_cols..(row + 1) * chroma_cols];
+                let v_dst = &mut v_plane[row * chroma_cols..(row + 1) * chroma_cols];
+                for col in 0..chroma_cols {
+                    u_dst[col] = src[col * 2];
+                    v_dst[col] = src[col * 2 + 1];
+                }
+            }
+            // Hand the rest of the pipeline planar 4:2:0 — pretend the
+            // frame was YUV420P from the start. `pixel_format` on the
+            // outgoing `VideoFrame` is the libavcodec enum value the
+            // scaler reads; libavcodec's YUV420P enum is 0.
+            let yuv420p_pix_fmt: i32 = 0;
+            Some((
+                y.to_vec(),
+                ys,
+                u_plane,
+                chroma_cols,
+                v_plane,
+                chroma_cols,
+                yuv420p_pix_fmt,
+            ))
+        } else {
+            None
+        };
+
+        let Some((y, ys, u, us, v, vs, out_pix_fmt)) = yuv else {
+            continue;
+        };
+
+        let out_frame = VideoFrame {
+            y,
+            u,
+            v,
             y_stride: ys,
             u_stride: us,
             v_stride: vs,
-            width: frame.width(),
-            height: frame.height(),
-            pixel_format: frame.pixel_format(),
-            colorspace: frame.colorspace(),
-            full_range: frame.is_full_range(),
+            width,
+            height,
+            pixel_format: out_pix_fmt,
+            colorspace,
+            full_range,
             pts_90k,
         };
-        if vtx.try_send(frame).is_err() {
+        if vtx.try_send(out_frame).is_err() {
             counters.frames_dropped_late.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -615,6 +735,7 @@ fn display_loop(
     cancel: CancellationToken,
     output_stats: Arc<OutputStatsAccumulator>,
     audio_codec_label: &'static str,
+    decoder_kind_label: &'static str,
     event_sender: EventSender,
     flow_id: String,
     output_id: String,
@@ -714,7 +835,7 @@ fn display_loop(
                 format!("{}x{}", kms.width(), kms.height()),
                 kms.refresh_hz(),
                 "XRGB8888",
-                "sw",
+                decoder_kind_label,
                 "unknown",
                 audio_codec_label,
             );

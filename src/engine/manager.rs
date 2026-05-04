@@ -125,6 +125,8 @@ impl FlowManager {
                 .videotoolbox_in_use
                 .saturating_add(f.videotoolbox_in_use);
             acc.amf_in_use = acc.amf_in_use.saturating_add(f.amf_in_use);
+            acc.nvdec_in_use = acc.nvdec_in_use.saturating_add(f.nvdec_in_use);
+            acc.qsv_decode_in_use = acc.qsv_decode_in_use.saturating_add(f.qsv_decode_in_use);
         }
         acc
     }
@@ -222,42 +224,77 @@ impl FlowManager {
         let Some(caps) = self.static_caps.as_ref() else {
             return;
         };
-        let limits = &caps.hw_encoder_session_limits;
-        if limits.is_empty() {
-            return;
-        }
         let usage = self.total_hw_sessions();
-        let checks: [(
-            Option<u32>,
-            u32,
-            &'static str,
-        ); 3] = [
-            (limits.nvenc_max_sessions, usage.nvenc_in_use, "nvenc"),
-            (limits.qsv_max_sessions, usage.qsv_in_use, "qsv"),
-            (limits.amf_max_sessions, usage.amf_in_use, "amf"),
-        ];
-        for (max, in_use, family) in checks {
-            if let Some(max) = max {
-                if in_use > max {
-                    let msg = format!(
-                        "Flow '{flow_id}' caused {family} encoder oversubscription: \
-                        {in_use} sessions in use, {max} probed at startup. \
-                        Reduce HW transcodes or restart on a host with more capacity."
-                    );
-                    self.event_sender.emit_flow_with_details(
-                        EventSeverity::Warning,
-                        category::SYSTEM_RESOURCES,
-                        msg,
-                        flow_id,
-                        serde_json::json!({
-                            "error_code": "hw_encoder_oversubscribed",
-                            "family": family,
-                            "role": "encoder",
-                            "in_use": in_use,
-                            "max_sessions": max,
-                            "flow_id": flow_id,
-                        }),
-                    );
+
+        // Encoder side — H.264 / HEVC transcodes on flow outputs. Same
+        // shape as before; `error_code: hw_encoder_oversubscribed`.
+        let enc = &caps.hw_encoder_session_limits;
+        if !enc.is_empty() {
+            let checks: [(Option<u32>, u32, &'static str); 3] = [
+                (enc.nvenc_max_sessions, usage.nvenc_in_use, "nvenc"),
+                (enc.qsv_max_sessions, usage.qsv_in_use, "qsv"),
+                (enc.amf_max_sessions, usage.amf_in_use, "amf"),
+            ];
+            for (max, in_use, family) in checks {
+                if let Some(max) = max {
+                    if in_use > max {
+                        let msg = format!(
+                            "Flow '{flow_id}' caused {family} encoder oversubscription: \
+                            {in_use} sessions in use, {max} probed at startup. \
+                            Reduce HW transcodes or restart on a host with more capacity."
+                        );
+                        self.event_sender.emit_flow_with_details(
+                            EventSeverity::Warning,
+                            category::SYSTEM_RESOURCES,
+                            msg,
+                            flow_id,
+                            serde_json::json!({
+                                "error_code": "hw_encoder_oversubscribed",
+                                "family": family,
+                                "role": "encoder",
+                                "in_use": in_use,
+                                "max_sessions": max,
+                                "flow_id": flow_id,
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Decoder side — currently only HW-decoded `display` outputs
+        // pay against these limits. Same Warning-level surface so the
+        // manager can render a single chip with `family + role`
+        // discriminators.
+        let dec = &caps.hw_decoder_session_limits;
+        if !dec.is_empty() {
+            let dec_checks: [(Option<u32>, u32, &'static str); 2] = [
+                (dec.nvdec_max_sessions, usage.nvdec_in_use, "nvdec"),
+                (dec.qsv_max_sessions, usage.qsv_decode_in_use, "qsv"),
+            ];
+            for (max, in_use, family) in dec_checks {
+                if let Some(max) = max {
+                    if in_use > max {
+                        let msg = format!(
+                            "Flow '{flow_id}' caused {family} decoder oversubscription: \
+                            {in_use} sessions in use, {max} probed at startup. \
+                            Drop a HW-decoded display output or restart on a host with more capacity."
+                        );
+                        self.event_sender.emit_flow_with_details(
+                            EventSeverity::Warning,
+                            category::SYSTEM_RESOURCES,
+                            msg,
+                            flow_id,
+                            serde_json::json!({
+                                "error_code": "hw_decoder_oversubscribed",
+                                "family": family,
+                                "role": "decoder",
+                                "in_use": in_use,
+                                "max_sessions": max,
+                                "flow_id": flow_id,
+                            }),
+                        );
+                    }
                 }
             }
         }

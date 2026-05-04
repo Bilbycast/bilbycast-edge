@@ -75,11 +75,13 @@ jobs:
             artifact_suffix: aarch64-linux
             variant: default
             cargo_features: "display"
-          # ─── full variant: libx264 + libx265 + NVENC (AGPL + GPL bundle) ───
-          # x86_64 also bundles QSV (Intel oneVPL); aarch64 drops it because
-          # Intel iGPU is x86_64-only — listing the three cross-arch features
+          # ─── full variant: every video codec backend (AGPL + GPL bundle) ───
+          # libx264 + libx265 + NVENC + NVDEC encoders/decoders — plus QSV
+          # (encode + decode) on x86_64. aarch64 drops QSV because Intel
+          # iGPU is x86_64-only, so it lists the cross-arch features
           # explicitly instead of the `video-encoders-full` composite.
-          # `display` is included on top of the encoder bundle.
+          # `display` is included on top of the codec bundle so the
+          # local-display output spawner is compiled in.
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact_suffix: x86_64-linux-full
@@ -89,7 +91,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact_suffix: aarch64-linux-full
             variant: full
-            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-nvenc display"
+            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-nvenc display-nvdec display"
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout bilbycast-libsrt-rs (path dependency)
@@ -334,9 +336,9 @@ jobs:
           - \`bilbycast-edge-aarch64-linux.tar.gz\` — Linux ARM64 (aarch64)
 
           ### \`*-linux-full\` (full variant)
-          Includes libx264 + libx265 + NVENC; the **x86_64** build also bundles **QSV** (Intel oneVPL). NVENC activates automatically on hosts with an NVIDIA driver, QSV on hosts with an Intel iGPU + media driver; x264 / x265 handle everything else. The aarch64 build omits QSV (Intel iGPU is x86_64-only). This binary is an **AGPL-3.0-or-later combined work** that bundles GPL-2.0-or-later code — see \`NOTICE\` inside the tarball.
-          - \`bilbycast-edge-x86_64-linux-full.tar.gz\` — Linux x86_64 (amd64) — x264 + x265 + NVENC + QSV
-          - \`bilbycast-edge-aarch64-linux-full.tar.gz\` — Linux ARM64 (aarch64) — x264 + x265 + NVENC
+          Bundles every video codec backend the edge knows about — encoders **and** the new HW decoders for the local-display output. **Encoders**: libx264 + libx265 + NVENC, plus QSV (Intel oneVPL) on x86_64. **Display HW decode**: NVDEC, plus QSV-decode on x86_64. NVENC + NVDEC activate automatically on hosts with an NVIDIA driver; QSV (encode + decode) on hosts with an Intel iGPU + media driver; x264 / x265 + libavcodec software decode handle everything else. The aarch64 build omits QSV (Intel iGPU is x86_64-only). This binary is an **AGPL-3.0-or-later combined work** that bundles GPL-2.0-or-later code — see \`NOTICE\` inside the tarball.
+          - \`bilbycast-edge-x86_64-linux-full.tar.gz\` — Linux x86_64 (amd64) — encoders: x264 + x265 + NVENC + QSV; display HW decode: NVDEC + QSV
+          - \`bilbycast-edge-aarch64-linux-full.tar.gz\` — Linux ARM64 (aarch64) — encoders: x264 + x265 + NVENC; display HW decode: NVDEC
 
           Install \`libx264\` and \`libx265\` runtime packages before running the \`-full\` binary: \`sudo apt install libx264-dev libx265-dev\`. No extra packages needed for NVENC beyond the NVIDIA driver. **For QSV (x86_64 only)**: \`sudo apt install libvpl2 intel-media-va-driver-non-free\` (or \`intel-media-driver\`), then add the running user to the \`render\` group so the edge can open \`/dev/dri/renderD*\`.
 

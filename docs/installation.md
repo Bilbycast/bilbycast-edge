@@ -240,8 +240,11 @@ encoder; the choice is per-flow.
 ### Running on an Intel host (QuickSync / QSV)
 
 The `*-x86_64-linux-full` binary also compiles in the FFmpeg →
-oneVPL bridge for Intel QuickSync. The `*-aarch64-linux-full`
-binary does **not** include QSV — Intel iGPUs are x86_64-only.
+oneVPL bridge for Intel QuickSync — covering both the QSV **encoder**
+(per-flow `codec: "h264_qsv"` / `"hevc_qsv"`) and the QSV
+**decoder** (the local-display output's `hw_decode: "qsv"` path).
+The `*-aarch64-linux-full` binary does **not** include QSV — Intel
+iGPUs are x86_64-only.
 
 #### What you need installed
 
@@ -408,7 +411,11 @@ cd bilbycast-edge
 # Default build (no software video encoders) — matches the `*-linux` release:
 cargo build --release
 
-# Full build — matches the `*-linux-full` release:
+# Full build — matches the `*-linux-full` release. Bundles every
+# video codec backend the edge knows about: encoders (x264 + x265 +
+# NVENC + QSV) and HW decoders for the display output (NVDEC +
+# QSV-decode). The runtime probe activates only the backends the host
+# can actually open.
 cargo build --release --features video-encoders-full
 ```
 

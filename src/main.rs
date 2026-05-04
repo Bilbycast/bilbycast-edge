@@ -281,6 +281,11 @@ async fn main() -> anyhow::Result<()> {
     // Static hardware capabilities — probed once at startup.
     let static_capabilities =
         Arc::new(engine::hardware_probe::probe_static_capabilities());
+    // Make the snapshot reachable from any module that resolves an
+    // operator's HW preference at flow-bring-up time (e.g. the display
+    // output's `hw_decode` field). Idempotent — only the first call
+    // wins for the lifetime of the process.
+    engine::hardware_probe::install_static_capabilities(static_capabilities.clone());
     // Local-display enumeration. Linux-only; the cache is consulted by
     // both the capability advertisement and the HealthPayload
     // `display_devices` field. Empty when the box has no DRI nodes —

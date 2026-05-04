@@ -853,10 +853,6 @@ fn build_video_pes(video_data: &[u8], pts: u64) -> Vec<u8> {
     pes
 }
 
-/// Packetize a PES payload into one or more 188-byte TS packets.
-/// Shared with `ts_audio_replace::packetize_ts`, duplicated here to
-/// avoid coupling the two modules.
-#[cfg(feature = "video-thumbnail")]
 /// Encode a 6-byte PCR field per ISO/IEC 13818-1 §2.4.3.5.
 ///
 /// The 42-bit PCR splits into a 33-bit base @ 90 kHz and a 9-bit extension

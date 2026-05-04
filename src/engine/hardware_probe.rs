@@ -903,13 +903,16 @@ pub fn compute_flow_cost_units(plan: &FlowCostPlan) -> u32 {
     units = units.saturating_add(100u32.saturating_mul(plan.hw_video_encode_outputs));
     units = units.saturating_add(500u32.saturating_mul(plan.sw_video_encode_outputs));
     units = units.saturating_add(5u32.saturating_mul(plan.audio_encode_outputs));
-    // Local-display outputs run a SW video decode + ALSA write per
-    // active flow. The weight roughly mirrors a SW video encode at
-    // 1080p30 (250) — we charge 275 units (250 video + 5 audio +
-    // 20 KMS render) so a 4K60 display output approaches the cost of
-    // a 4K60 transcode. Operators on hosts with `display-vaapi` /
-    // `display-nvdec` will see this drop to 100 in v2.
+    // Local-display outputs split into two cost tiers based on whether
+    // the resolved decoder backend lands on CPU or HW. CPU-decoded
+    // display outputs run a libavcodec SW decode + libswscale colour
+    // convert + ALSA write per active flow — 275 units (mirrors a SW
+    // video encode at 1080p30 plus the KMS render + audio path). HW-
+    // decoded display outputs offload the decode to NVDEC / QSV, so
+    // the host CPU only pays libswscale + the KMS blit + audio — 100
+    // units, matching the v2 roadmap note in the architecture doc.
     units = units.saturating_add(275u32.saturating_mul(plan.display_outputs));
+    units = units.saturating_add(100u32.saturating_mul(plan.display_hw_decoded_outputs));
     // Audio-bars overlay on a `display` output runs an independent
     // multi-PID audio decoder + per-frame BGRA rasterise. ~15 units per
     // enabled output (matches `audio_encode` at 5 plus a small bump for
@@ -939,10 +942,21 @@ pub struct FlowCostPlan {
     pub hw_video_encode_outputs: u32,
     pub sw_video_encode_outputs: u32,
     pub audio_encode_outputs: u32,
-    /// Number of `display` outputs on the flow. Linux-only; on
-    /// non-Linux / non-feature builds this stays 0 because the
-    /// schema-only Display variant is rejected at `start_output`.
+    /// Number of `display` outputs on the flow that decode video on
+    /// the CPU (libavcodec). Counted separately from
+    /// `display_hw_decoded_outputs` because the cost weight differs
+    /// (CPU decode dominates a 4K display output's CPU budget).
+    /// Linux-only; on non-Linux / non-feature builds this stays 0
+    /// because the schema-only Display variant is rejected at
+    /// `start_output`.
     pub display_outputs: u32,
+    /// Number of `display` outputs whose resolved decoder backend is
+    /// hardware (NVDEC / QSV) — the `hw_decode` preference resolved
+    /// against the host's probed capabilities at flow-bring-up time.
+    /// Each one charges roughly a third of the CPU-decoded display
+    /// cost (libswscale colour-convert + KMS blit only) plus one
+    /// session against the matching family limit.
+    pub display_hw_decoded_outputs: u32,
     /// Number of `display` outputs that have `show_audio_bars: true`.
     /// Counts the extra audio-decoder pool the meter spawns, not the
     /// rasterisation cost (negligible).
@@ -962,6 +976,13 @@ pub struct FlowCostPlan {
     pub qsv_sessions: u32,
     pub videotoolbox_sessions: u32,
     pub amf_sessions: u32,
+    /// Per-family decoder session counts charged by HW-decoded
+    /// `display` outputs on this flow. NVDEC and QSV-decode are
+    /// tracked separately even though QSV-decode shares an iGPU with
+    /// QSV-encode — operators want to see decoder pressure
+    /// independently from encoder pressure when planning capacity.
+    pub nvdec_sessions: u32,
+    pub qsv_decode_sessions: u32,
 }
 
 /// Per-family hardware encoder session counts in active use across
@@ -975,6 +996,18 @@ pub struct HwSessionUsage {
     pub qsv_in_use: u32,
     pub videotoolbox_in_use: u32,
     pub amf_in_use: u32,
+    /// Active hardware-decoder sessions. Charged today only by
+    /// HW-decoded `display` outputs (`hw_decode` resolved to NVDEC /
+    /// QSV). When future input-side HW decode lands the same
+    /// counters absorb that contribution.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub nvdec_in_use: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub qsv_decode_in_use: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// HW encoder family — used both to classify codec names from config and
@@ -1008,12 +1041,203 @@ impl HwEncoderFamily {
     }
 }
 
+/// HW decoder family — used to attribute display-output decoder session
+/// usage onto the corresponding limit slot in
+/// [`HwDecoderSessionLimits`]. VideoToolbox / AMF are deliberately
+/// omitted: macOS manages decoder sessions system-wide so there's no
+/// per-process limit to track, and AMD has no first-party FFmpeg HW
+/// decoder name (decode rides VAAPI on Linux, D3D11VA on Windows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HwDecoderFamily {
+    Nvdec,
+    Qsv,
+}
+
+impl HwDecoderFamily {
+    /// Map an operator's `hw_decode` preference to a family. Returns
+    /// `None` for `Auto` / `Cpu` (neither charges a HW decoder
+    /// session) — the auto-resolver downstream may still pick a HW
+    /// family, but that decision is recorded separately on the
+    /// resolved [`video_engine::DecoderBackend`].
+    ///
+    /// Public symmetric helper alongside [`HwEncoderFamily::classify`]
+    /// — currently exercised by tests; runtime callers go through
+    /// [`ResolvedDisplayDecoder::family`] which already keys off the
+    /// resolution result. Kept on the API surface so future input-side
+    /// HW decode (RTSP cameras, ST 2110 ingress) can charge sessions
+    /// without re-deriving the mapping.
+    #[allow(dead_code)]
+    pub fn from_preference(
+        pref: &crate::config::models::HwDecodePreference,
+    ) -> Option<Self> {
+        use crate::config::models::HwDecodePreference;
+        match pref {
+            HwDecodePreference::Auto | HwDecodePreference::Cpu => None,
+            HwDecodePreference::Nvdec => Some(HwDecoderFamily::Nvdec),
+            HwDecodePreference::Qsv => Some(HwDecoderFamily::Qsv),
+        }
+    }
+}
+
 /// Total budget capacity in units. Conservative, machine-independent:
 /// `1000 + 200 × physical_cores`. A 4-core box gets 1800 units; a
 /// 32-core EPYC gets 7400. Values intentionally imply a soft ceiling —
 /// the manager UI surfaces percentage utilisation, not a hard cap.
 pub fn compute_units_total(cpu: &CpuInfo) -> u32 {
     1000u32.saturating_add(200u32.saturating_mul(cpu.physical_cores.max(1)))
+}
+
+// ── Static caps singleton ──────────────────────────────────────────
+//
+// `probe_static_capabilities()` runs once at startup in `main.rs`. We
+// also stash the result here so any module that needs to consult the
+// host's HW decoder availability (e.g. `output_display::start_output`
+// resolving an operator's `hw_decode` preference, or `derive_cost_plan`
+// charging the right per-display cost) can read it without threading
+// the snapshot through every function call.
+
+static STATIC_CAPS: std::sync::OnceLock<std::sync::Arc<StaticCapabilities>> =
+    std::sync::OnceLock::new();
+
+/// Install the one-shot static-capabilities snapshot. Called from
+/// `main.rs` after `probe_static_capabilities()` returns. Subsequent
+/// calls are silently ignored — the probe runs once per process.
+pub fn install_static_capabilities(caps: std::sync::Arc<StaticCapabilities>) {
+    let _ = STATIC_CAPS.set(caps);
+}
+
+/// Read the installed snapshot. Returns `None` until
+/// [`install_static_capabilities`] runs (early-startup paths and unit
+/// tests that don't initialise the probe).
+pub fn static_capabilities() -> Option<std::sync::Arc<StaticCapabilities>> {
+    STATIC_CAPS.get().cloned()
+}
+
+// ── Display-output decoder resolution ──────────────────────────────
+
+/// Reason the operator's `hw_decode` preference couldn't be honoured.
+/// Surfaced on the `display_hw_decode_unavailable` event's `details`
+/// block so the manager UI can render an actionable message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecoderResolutionError {
+    /// Forced backend isn't compiled into this build.
+    FeatureDisabled,
+    /// Build has the feature but the runtime probe failed (no driver,
+    /// no hardware, or `/dev/dri` permissions).
+    DriverMissing,
+    /// `static_capabilities()` returned `None` — probe didn't run.
+    /// Treated like FeatureDisabled by the spawner.
+    ProbeUnavailable,
+}
+
+/// Resolved family choice from `resolve_display_decoder` — the
+/// HW-aware variant. Decoupled from `video_engine::DecoderBackend`
+/// (which only exists when `video-thumbnail` is on) so cost-plan code
+/// can call into the resolver from non-display builds too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedDisplayDecoder {
+    Cpu,
+    Nvdec,
+    Qsv,
+}
+
+impl ResolvedDisplayDecoder {
+    /// `true` when this resolution actually uses a hardware decoder
+    /// (cost-plan path keys the per-output cost on this).
+    pub fn is_hardware(&self) -> bool {
+        !matches!(self, ResolvedDisplayDecoder::Cpu)
+    }
+
+    /// Map onto the family limit slot in
+    /// [`HwDecoderSessionLimits`]. `None` for `Cpu`.
+    pub fn family(&self) -> Option<HwDecoderFamily> {
+        match self {
+            ResolvedDisplayDecoder::Cpu => None,
+            ResolvedDisplayDecoder::Nvdec => Some(HwDecoderFamily::Nvdec),
+            ResolvedDisplayDecoder::Qsv => Some(HwDecoderFamily::Qsv),
+        }
+    }
+
+    /// Translate to the video-engine backend handle. Only callable
+    /// when `video-thumbnail` is on (display path always has it).
+    #[cfg(feature = "video-thumbnail")]
+    pub fn as_backend(&self) -> video_engine::DecoderBackend {
+        match self {
+            ResolvedDisplayDecoder::Cpu => video_engine::DecoderBackend::Cpu,
+            ResolvedDisplayDecoder::Nvdec => video_engine::DecoderBackend::Nvdec,
+            ResolvedDisplayDecoder::Qsv => video_engine::DecoderBackend::Qsv,
+        }
+    }
+}
+
+/// Resolve an operator's display-output decode preference into a
+/// concrete backend. Auto picks the best HW family the host can do
+/// (NVDEC ≻ QSV) and falls back to CPU. Forced choices error out when
+/// the host can't satisfy them — the spawner emits
+/// `display_hw_decode_unavailable` and refuses to start the output.
+///
+/// Pure function over `(pref, capabilities)` — call from cost-plan
+/// derivation and from `start_output()` and they always agree.
+pub fn resolve_display_decoder(
+    pref: &crate::config::models::HwDecodePreference,
+    caps: Option<&StaticCapabilities>,
+) -> Result<ResolvedDisplayDecoder, DecoderResolutionError> {
+    use crate::config::models::HwDecodePreference;
+
+    let nvdec_compiled = cfg!(feature = "display-nvdec");
+    let qsv_compiled = cfg!(feature = "display-qsv");
+    let nvdec_ok = nvdec_compiled
+        && caps.is_some_and(|c| c.hw_decoders.h264_nvenc || c.hw_decoders.hevc_nvenc);
+    let qsv_ok = qsv_compiled
+        && caps.is_some_and(|c| c.hw_decoders.h264_qsv || c.hw_decoders.hevc_qsv);
+
+    match pref {
+        HwDecodePreference::Cpu => Ok(ResolvedDisplayDecoder::Cpu),
+        HwDecodePreference::Auto => {
+            if nvdec_ok {
+                Ok(ResolvedDisplayDecoder::Nvdec)
+            } else if qsv_ok {
+                Ok(ResolvedDisplayDecoder::Qsv)
+            } else {
+                Ok(ResolvedDisplayDecoder::Cpu)
+            }
+        }
+        HwDecodePreference::Nvdec => {
+            if !nvdec_compiled {
+                Err(DecoderResolutionError::FeatureDisabled)
+            } else if caps.is_none() {
+                Err(DecoderResolutionError::ProbeUnavailable)
+            } else if !nvdec_ok {
+                Err(DecoderResolutionError::DriverMissing)
+            } else {
+                Ok(ResolvedDisplayDecoder::Nvdec)
+            }
+        }
+        HwDecodePreference::Qsv => {
+            if !qsv_compiled {
+                Err(DecoderResolutionError::FeatureDisabled)
+            } else if caps.is_none() {
+                Err(DecoderResolutionError::ProbeUnavailable)
+            } else if !qsv_ok {
+                Err(DecoderResolutionError::DriverMissing)
+            } else {
+                Ok(ResolvedDisplayDecoder::Qsv)
+            }
+        }
+    }
+}
+
+impl DecoderResolutionError {
+    /// Short tag for the `details.error_code` companion field. The
+    /// outer `error_code` stays `display_hw_decode_unavailable` so
+    /// existing manager-side dispatch keeps working.
+    pub fn as_reason(&self) -> &'static str {
+        match self {
+            DecoderResolutionError::FeatureDisabled => "feature_disabled",
+            DecoderResolutionError::DriverMissing => "driver_missing",
+            DecoderResolutionError::ProbeUnavailable => "probe_unavailable",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1024,6 +1248,119 @@ mod tests {
     fn cost_passthrough_is_one() {
         let plan = FlowCostPlan::default();
         assert_eq!(compute_flow_cost_units(&plan), 1);
+    }
+
+    /// HW-decoded display output charges 100 units; CPU-decoded
+    /// display output charges 275. Two outputs of each kind gives a
+    /// flow whose cost matches `1 + 275*2 + 100*2 = 751`. The drop
+    /// from 275 → 100 is the v2-roadmap saving promised in
+    /// `compute_flow_cost_units`.
+    #[test]
+    fn cost_hw_decoded_display_is_cheaper_than_cpu() {
+        let cpu = FlowCostPlan {
+            display_outputs: 1,
+            ..Default::default()
+        };
+        let hw = FlowCostPlan {
+            display_hw_decoded_outputs: 1,
+            ..Default::default()
+        };
+        assert!(compute_flow_cost_units(&hw) < compute_flow_cost_units(&cpu));
+        assert_eq!(compute_flow_cost_units(&cpu), 1 + 275);
+        assert_eq!(compute_flow_cost_units(&hw), 1 + 100);
+    }
+
+    #[test]
+    fn hw_decoder_family_from_preference_maps_correctly() {
+        use crate::config::models::HwDecodePreference;
+        assert_eq!(
+            HwDecoderFamily::from_preference(&HwDecodePreference::Nvdec),
+            Some(HwDecoderFamily::Nvdec),
+        );
+        assert_eq!(
+            HwDecoderFamily::from_preference(&HwDecodePreference::Qsv),
+            Some(HwDecoderFamily::Qsv),
+        );
+        assert_eq!(
+            HwDecoderFamily::from_preference(&HwDecodePreference::Auto),
+            None,
+        );
+        assert_eq!(
+            HwDecoderFamily::from_preference(&HwDecodePreference::Cpu),
+            None,
+        );
+    }
+
+    /// Cpu always resolves to Cpu — no host capability lookup needed.
+    /// Auto on a host with no probed HW falls through to Cpu (the
+    /// safe default that lets every config round-trip on a
+    /// software-only edge). Forced HW choices on a missing-feature /
+    /// missing-driver host error out with the right reason tag —
+    /// `start_output()` keys the `display_hw_decode_unavailable` event
+    /// off this.
+    #[test]
+    fn resolve_display_decoder_handles_cpu_and_auto_without_caps() {
+        use crate::config::models::HwDecodePreference;
+        assert_eq!(
+            resolve_display_decoder(&HwDecodePreference::Cpu, None),
+            Ok(ResolvedDisplayDecoder::Cpu),
+        );
+        assert_eq!(
+            resolve_display_decoder(&HwDecodePreference::Auto, None),
+            Ok(ResolvedDisplayDecoder::Cpu),
+        );
+    }
+
+    #[test]
+    fn resolve_display_decoder_rejects_forced_when_feature_off() {
+        use crate::config::models::HwDecodePreference;
+        // The bilbycast-edge build under `cargo test` here does not
+        // enable `display-nvdec` or `display-qsv` by default — the
+        // feature gates short-circuit before we even look at caps.
+        if !cfg!(feature = "display-nvdec") {
+            assert_eq!(
+                resolve_display_decoder(&HwDecodePreference::Nvdec, None),
+                Err(DecoderResolutionError::FeatureDisabled),
+            );
+        }
+        if !cfg!(feature = "display-qsv") {
+            assert_eq!(
+                resolve_display_decoder(&HwDecodePreference::Qsv, None),
+                Err(DecoderResolutionError::FeatureDisabled),
+            );
+        }
+    }
+
+    #[test]
+    fn resolution_error_tags_are_stable() {
+        assert_eq!(
+            DecoderResolutionError::FeatureDisabled.as_reason(),
+            "feature_disabled"
+        );
+        assert_eq!(
+            DecoderResolutionError::DriverMissing.as_reason(),
+            "driver_missing"
+        );
+        assert_eq!(
+            DecoderResolutionError::ProbeUnavailable.as_reason(),
+            "probe_unavailable"
+        );
+    }
+
+    #[test]
+    fn resolved_display_decoder_is_hardware_classifier() {
+        assert!(!ResolvedDisplayDecoder::Cpu.is_hardware());
+        assert!(ResolvedDisplayDecoder::Nvdec.is_hardware());
+        assert!(ResolvedDisplayDecoder::Qsv.is_hardware());
+        assert_eq!(ResolvedDisplayDecoder::Cpu.family(), None);
+        assert_eq!(
+            ResolvedDisplayDecoder::Nvdec.family(),
+            Some(HwDecoderFamily::Nvdec)
+        );
+        assert_eq!(
+            ResolvedDisplayDecoder::Qsv.family(),
+            Some(HwDecoderFamily::Qsv)
+        );
     }
 
     #[test]

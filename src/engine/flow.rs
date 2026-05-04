@@ -227,20 +227,37 @@ pub struct FlowRuntime {
     /// by input_id.
     #[cfg(feature = "replay")]
     pub replay_command_txs: dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::replay::ReplayCommand>>,
+    /// Per-output resource contributions, keyed by output_id. Stored
+    /// at spawn time (start_output / add_output) and subtracted on
+    /// remove_output so a runtime change to a display output's
+    /// `hw_decode` (or an output's `video_encode` codec) — which the
+    /// edge handles via remove + add of the same id — leaves the
+    /// running totals in sync with the live output set. Tuple is
+    /// `(cost_units, session_usage)`.
+    pub output_contributions: std::sync::RwLock<
+        HashMap<String, (u32, crate::engine::hardware_probe::HwSessionUsage)>,
+    >,
     /// Resource-budget unit cost of this flow (computed at start time
     /// from `derive_cost_plan` + `compute_flow_cost_units`). Surfaced
     /// on `FlowStats.cost_units` and rolled up into the node-level
     /// `HealthPayload.resource_budget.units_used` so the manager UI
-    /// can render utilisation against `units_total`.
-    pub cost_units: u32,
-    /// Per-family hardware encoder session counts attributable to
-    /// this flow's outputs (one per HW `video_encode` block, summed
-    /// across H.264 + HEVC since they share the engine on every
-    /// supported backend). Snapshotted at start time from the same
-    /// cost plan that produced `cost_units`.
-    /// `FlowManager::total_hw_sessions()` rolls these up into the
-    /// node-level `HealthPayload.resource_budget.hw_session_usage`.
-    pub hw_session_usage: crate::engine::hardware_probe::HwSessionUsage,
+    /// can render utilisation against `units_total`. Interior-mutable
+    /// so `add_output` / `remove_output` can apply per-output cost
+    /// deltas without restarting the flow — operators changing a
+    /// display output's `hw_decode` or an output's `video_encode`
+    /// codec see the Resources card update on the next health tick.
+    pub cost_units: std::sync::atomic::AtomicU32,
+    /// Per-family hardware encoder + decoder session counts
+    /// attributable to this flow's outputs. Each HW `video_encode`
+    /// output adds one session against its family's slot
+    /// (`nvenc_in_use` / `qsv_in_use` / `videotoolbox_in_use` /
+    /// `amf_in_use`); each HW-decoded `display` output adds one
+    /// against `nvdec_in_use` or `qsv_decode_in_use`. Interior-
+    /// mutable so hot-add / hot-remove of outputs adjust the count.
+    /// `FlowManager::total_hw_sessions()` reads this value and rolls
+    /// it up into the node-level
+    /// `HealthPayload.resource_budget.hw_session_usage`.
+    pub hw_session_usage: std::sync::RwLock<crate::engine::hardware_probe::HwSessionUsage>,
 }
 
 /// Runtime state for a single input within a flow.
@@ -910,12 +927,27 @@ impl FlowRuntime {
 
         let cost_plan = derive_cost_plan(&config);
         let cost_units = crate::engine::hardware_probe::compute_flow_cost_units(&cost_plan);
-        let hw_session_usage = crate::engine::hardware_probe::HwSessionUsage {
-            nvenc_in_use: cost_plan.nvenc_sessions,
-            qsv_in_use: cost_plan.qsv_sessions,
-            videotoolbox_in_use: cost_plan.videotoolbox_sessions,
-            amf_in_use: cost_plan.amf_sessions,
-        };
+        let hw_session_usage = std::sync::RwLock::new(
+            crate::engine::hardware_probe::HwSessionUsage {
+                nvenc_in_use: cost_plan.nvenc_sessions,
+                qsv_in_use: cost_plan.qsv_sessions,
+                videotoolbox_in_use: cost_plan.videotoolbox_sessions,
+                amf_in_use: cost_plan.amf_sessions,
+                nvdec_in_use: cost_plan.nvdec_sessions,
+                qsv_decode_in_use: cost_plan.qsv_decode_sessions,
+            },
+        );
+        let cost_units = std::sync::atomic::AtomicU32::new(cost_units);
+        // Snapshot per-output contributions so hot-remove can subtract
+        // exactly what each output added at spawn time. Hot-add inserts
+        // into this map alongside the resource-totals delta; hot-edit
+        // (remove + add of the same id) overwrites the entry on add.
+        let mut output_contributions_map = HashMap::new();
+        for out in &config.outputs {
+            output_contributions_map
+                .insert(out.id().to_string(), output_resource_contribution(out));
+        }
+        let output_contributions = std::sync::RwLock::new(output_contributions_map);
 
         Ok(Self {
             config,
@@ -948,20 +980,28 @@ impl FlowRuntime {
             replay_command_txs,
             cost_units,
             hw_session_usage,
+            output_contributions,
         })
     }
 
-    /// Resource-budget cost of this flow, in units. Set once at start
-    /// from the flow's resolved configuration.
+    /// Resource-budget cost of this flow, in units. Set at start time
+    /// and adjusted by hot-add / hot-remove of outputs so a runtime
+    /// change to a display output's `hw_decode` (or an output's
+    /// `video_encode`) reflects on the next manager health tick.
     pub fn cost_units(&self) -> u32 {
         self.cost_units
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Per-family hardware encoder session counts contributed by this
-    /// flow. Aggregated across the node by
-    /// [`FlowManager::total_hw_sessions`].
-    pub fn hw_session_usage(&self) -> &crate::engine::hardware_probe::HwSessionUsage {
-        &self.hw_session_usage
+    /// Per-family hardware encoder + decoder session counts contributed
+    /// by this flow. Aggregated across the node by
+    /// [`FlowManager::total_hw_sessions`]. Returns a snapshot so
+    /// callers don't hold the runtime's read guard across awaits.
+    pub fn hw_session_usage(&self) -> crate::engine::hardware_probe::HwSessionUsage {
+        self.hw_session_usage
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     /// Phase 7: replace this flow's PID-bus assembly plan in place.
@@ -1686,6 +1726,32 @@ impl FlowRuntime {
         let mut handles = self.output_handles.write().await;
         handles.insert(output_id.clone(), output_rt);
 
+        // Apply this output's resource-budget contribution onto the
+        // running cost + session totals so the manager UI's Resources
+        // card reflects hot-add / hot-remove without a flow restart.
+        // The same helper also covers the hot-edit case (output config
+        // changed) — `update_flow` issues remove + add of the same id,
+        // so the old contribution leaves on remove and the new one
+        // lands here.
+        let (delta_units, delta_usage) = output_resource_contribution(&output_config);
+        self.cost_units
+            .fetch_add(delta_units, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut g) = self.hw_session_usage.write() {
+            g.nvenc_in_use = g.nvenc_in_use.saturating_add(delta_usage.nvenc_in_use);
+            g.qsv_in_use = g.qsv_in_use.saturating_add(delta_usage.qsv_in_use);
+            g.videotoolbox_in_use = g
+                .videotoolbox_in_use
+                .saturating_add(delta_usage.videotoolbox_in_use);
+            g.amf_in_use = g.amf_in_use.saturating_add(delta_usage.amf_in_use);
+            g.nvdec_in_use = g.nvdec_in_use.saturating_add(delta_usage.nvdec_in_use);
+            g.qsv_decode_in_use = g
+                .qsv_decode_in_use
+                .saturating_add(delta_usage.qsv_decode_in_use);
+        }
+        if let Ok(mut m) = self.output_contributions.write() {
+            m.insert(output_id.clone(), (delta_units, delta_usage));
+        }
+
         tracing::info!("Hot-added output '{}' to flow '{}'", output_id, self.config.config.id);
         Ok(())
     }
@@ -1728,6 +1794,33 @@ impl FlowRuntime {
                 }
             }
             self.stats.unregister_output(output_id);
+            // Subtract this output's resource contribution from the
+            // running totals. Lookup is by output_id against the map
+            // populated at start_output / add_output time so the
+            // delta matches exactly what was added — even if the
+            // output config has since been mutated in the parent
+            // ResolvedFlow snapshot.
+            let removed = self
+                .output_contributions
+                .write()
+                .ok()
+                .and_then(|mut m| m.remove(output_id));
+            if let Some((units, usage)) = removed {
+                self.cost_units
+                    .fetch_sub(units, std::sync::atomic::Ordering::Relaxed);
+                if let Ok(mut g) = self.hw_session_usage.write() {
+                    g.nvenc_in_use = g.nvenc_in_use.saturating_sub(usage.nvenc_in_use);
+                    g.qsv_in_use = g.qsv_in_use.saturating_sub(usage.qsv_in_use);
+                    g.videotoolbox_in_use = g
+                        .videotoolbox_in_use
+                        .saturating_sub(usage.videotoolbox_in_use);
+                    g.amf_in_use = g.amf_in_use.saturating_sub(usage.amf_in_use);
+                    g.nvdec_in_use = g.nvdec_in_use.saturating_sub(usage.nvdec_in_use);
+                    g.qsv_decode_in_use = g
+                        .qsv_decode_in_use
+                        .saturating_sub(usage.qsv_decode_in_use);
+                }
+            }
             tracing::info!("Removed output '{}' from flow '{}'", output_id, self.config.config.id);
             Ok(())
         } else {
@@ -3385,12 +3478,43 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
         if matches!(out, OutputConfig::St2110_20(_) | OutputConfig::St2110_23(_)) {
             plan.sw_video_encode_outputs = plan.sw_video_encode_outputs.saturating_add(1);
         }
-        // Local-display outputs run a SW video decode + ALSA write
-        // pipeline (Linux-only, gated on the `display` Cargo feature).
-        // Counted separately from sw/hw video *encode* outputs because
-        // the cost weight differs.
+        // Local-display outputs (Linux-only, `display` Cargo feature).
+        // Resolve the operator's `hw_decode` preference against the
+        // host's probed capabilities: a CPU-decoded display output
+        // contributes to `display_outputs`; a HW-decoded one (NVDEC
+        // / QSV) contributes to `display_hw_decoded_outputs` and one
+        // session to the matching family limit. The resolver matches
+        // the one `start_output()` calls, so the cost-plan and the
+        // runtime always agree on what backend each output ended up
+        // on. A forced-but-missing backend (e.g. `nvdec` on a host
+        // without an NVIDIA card) is treated as CPU here — the
+        // spawner is the authoritative gate that emits
+        // `display_hw_decode_unavailable` and refuses the start, so
+        // the flow never actually pays the cost.
         if let OutputConfig::Display(d) = out {
-            plan.display_outputs = plan.display_outputs.saturating_add(1);
+            let pref = d.hw_decode.unwrap_or_default();
+            let resolved = crate::engine::hardware_probe::resolve_display_decoder(
+                &pref,
+                crate::engine::hardware_probe::static_capabilities()
+                    .as_deref(),
+            )
+            .unwrap_or(crate::engine::hardware_probe::ResolvedDisplayDecoder::Cpu);
+            if resolved.is_hardware() {
+                plan.display_hw_decoded_outputs =
+                    plan.display_hw_decoded_outputs.saturating_add(1);
+                match resolved.family() {
+                    Some(crate::engine::hardware_probe::HwDecoderFamily::Nvdec) => {
+                        plan.nvdec_sessions = plan.nvdec_sessions.saturating_add(1);
+                    }
+                    Some(crate::engine::hardware_probe::HwDecoderFamily::Qsv) => {
+                        plan.qsv_decode_sessions =
+                            plan.qsv_decode_sessions.saturating_add(1);
+                    }
+                    None => {}
+                }
+            } else {
+                plan.display_outputs = plan.display_outputs.saturating_add(1);
+            }
             if d.show_audio_bars {
                 plan.display_audio_bars_outputs =
                     plan.display_audio_bars_outputs.saturating_add(1);
@@ -3410,6 +3534,84 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
         .unwrap_or(false);
 
     plan
+}
+
+/// Compute the resource-budget contribution of a single output —
+/// `(cost_units, session_usage)` — keying off the same shape rules
+/// `derive_cost_plan` applies to a fresh flow. Used by hot-add /
+/// hot-remove to keep `FlowRuntime.cost_units` and
+/// `FlowRuntime.hw_session_usage` in sync with the live output set
+/// without re-running the full plan.
+///
+/// The base passthrough cost (1 unit), content-analysis tiers, and
+/// recording cost are flow-level (not per-output) and stay constant
+/// across hot-add / hot-remove — they're not folded in here.
+fn output_resource_contribution(
+    output: &crate::config::models::OutputConfig,
+) -> (u32, crate::engine::hardware_probe::HwSessionUsage) {
+    use crate::config::models::OutputConfig;
+    let mut units: u32 = 0;
+    let mut usage = crate::engine::hardware_probe::HwSessionUsage::default();
+
+    let (audio, video) = output_encode_blocks(output);
+    if audio.is_some() {
+        units = units.saturating_add(5);
+    }
+    if let Some(codec) = video {
+        match crate::engine::hardware_probe::HwEncoderFamily::classify(codec) {
+            Some(crate::engine::hardware_probe::HwEncoderFamily::Nvenc) => {
+                units = units.saturating_add(100);
+                usage.nvenc_in_use = usage.nvenc_in_use.saturating_add(1);
+            }
+            Some(crate::engine::hardware_probe::HwEncoderFamily::Qsv) => {
+                units = units.saturating_add(100);
+                usage.qsv_in_use = usage.qsv_in_use.saturating_add(1);
+            }
+            Some(crate::engine::hardware_probe::HwEncoderFamily::VideoToolbox) => {
+                units = units.saturating_add(100);
+                usage.videotoolbox_in_use = usage.videotoolbox_in_use.saturating_add(1);
+            }
+            Some(crate::engine::hardware_probe::HwEncoderFamily::Amf) => {
+                units = units.saturating_add(100);
+                usage.amf_in_use = usage.amf_in_use.saturating_add(1);
+            }
+            None => {
+                units = units.saturating_add(500);
+            }
+        }
+    }
+    if matches!(
+        output,
+        OutputConfig::St2110_20(_) | OutputConfig::St2110_23(_)
+    ) {
+        units = units.saturating_add(500);
+    }
+    if let OutputConfig::Display(d) = output {
+        let pref = d.hw_decode.unwrap_or_default();
+        let resolved = crate::engine::hardware_probe::resolve_display_decoder(
+            &pref,
+            crate::engine::hardware_probe::static_capabilities().as_deref(),
+        )
+        .unwrap_or(crate::engine::hardware_probe::ResolvedDisplayDecoder::Cpu);
+        if resolved.is_hardware() {
+            units = units.saturating_add(100);
+            match resolved.family() {
+                Some(crate::engine::hardware_probe::HwDecoderFamily::Nvdec) => {
+                    usage.nvdec_in_use = usage.nvdec_in_use.saturating_add(1);
+                }
+                Some(crate::engine::hardware_probe::HwDecoderFamily::Qsv) => {
+                    usage.qsv_decode_in_use = usage.qsv_decode_in_use.saturating_add(1);
+                }
+                None => {}
+            }
+        } else {
+            units = units.saturating_add(275);
+        }
+        if d.show_audio_bars {
+            units = units.saturating_add(15);
+        }
+    }
+    (units, usage)
 }
 
 /// Pull the `(audio_encode, video_encode_codec)` pair out of an
