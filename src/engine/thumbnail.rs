@@ -500,6 +500,19 @@ impl LiveState {
                     let annex_b = build_annex_b(&nalus);
                     self.push_frame(annex_b, pts, is_anchor);
                 }
+                DemuxedFrame::Mpeg2 {
+                    es,
+                    pts,
+                    is_keyframe,
+                } => {
+                    self.codec = Some(video_codec::VideoCodec::Mpeg2);
+                    // For MPEG-2, an AU that opens with a sequence_header
+                    // (0x000001B3) is also a clean random-access anchor
+                    // — pre-roll for the I-picture inside the same AU.
+                    let has_seq = mpeg2_starts_with_sequence_header(&es);
+                    let is_anchor = is_keyframe || has_seq;
+                    self.push_frame(es, pts, is_anchor);
+                }
                 // Audio variants are not consumed for thumbnails — drop them.
                 DemuxedFrame::Opus
                 | DemuxedFrame::Aac { .. }
@@ -615,6 +628,29 @@ fn h265_nal_type(nalu: &[u8]) -> u8 {
     }
 }
 
+/// Whether an MPEG-2 access unit starts with `sequence_header`
+/// (`0x000001B3`). MPEG-2 broadcasts emit the sequence header at every
+/// GoP boundary so any AU carrying one is a safe random-access anchor
+/// even before we look for the I-picture.
+#[cfg(feature = "video-thumbnail")]
+#[inline]
+fn mpeg2_starts_with_sequence_header(es: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 4 <= es.len() {
+        if es[i] == 0x00 && es[i + 1] == 0x00 && es[i + 2] == 0x01 {
+            return es[i + 3] == 0xB3;
+        }
+        i += 1;
+        if i > 32 {
+            // Sequence header should land within the first few bytes of
+            // an anchor AU; bail past that to avoid scanning a whole
+            // payload looking for one that isn't there.
+            break;
+        }
+    }
+    false
+}
+
 /// Concatenate split NAL units (no start codes) into Annex B form by
 /// prepending a 4-byte `00 00 00 01` start code in front of each NAL.
 #[cfg(feature = "video-thumbnail")]
@@ -655,6 +691,11 @@ fn build_headers(demuxer: &TsDemuxer, codec: video_codec::VideoCodec) -> Vec<u8>
             push(&mut out, demuxer.cached_h265_vps());
             push(&mut out, demuxer.cached_h265_sps());
             push(&mut out, demuxer.cached_h265_pps());
+        }
+        video_codec::VideoCodec::Mpeg2 => {
+            // MPEG-2 carries its sequence_header / sequence_extension
+            // inline in the bitstream at every GoP boundary; there are
+            // no out-of-band parameter sets the demuxer needs to inject.
         }
     }
     out

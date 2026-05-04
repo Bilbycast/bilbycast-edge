@@ -360,6 +360,8 @@ fn extract_video(ts: &[u8]) -> Option<(Vec<u8>, video_codec::VideoCodec)> {
     };
     use video_codec::VideoCodec;
 
+    const STREAM_MPEG1: u8 = 0x01;
+    const STREAM_MPEG2: u8 = 0x02;
     const STREAM_H264: u8 = 0x1B;
     const STREAM_H265: u8 = 0x24;
 
@@ -394,6 +396,7 @@ fn extract_video(ts: &[u8]) -> Option<(Vec<u8>, video_codec::VideoCodec)> {
                     codec = Some(match st {
                         STREAM_H264 => VideoCodec::H264,
                         STREAM_H265 => VideoCodec::Hevc,
+                        STREAM_MPEG1 | STREAM_MPEG2 => VideoCodec::Mpeg2,
                         _ => return None,
                     });
                     break;
@@ -465,7 +468,7 @@ fn parse_pmt_first_video(payload: &[u8]) -> Option<(u16, u8)> {
         let stream_type = section[i];
         let es_pid = (((section[i + 1] as u16) & 0x1F) << 8) | section[i + 2] as u16;
         let es_info_length = (((section[i + 3] as usize) & 0x0F) << 8) | section[i + 4] as usize;
-        if matches!(stream_type, 0x1B | 0x24) {
+        if matches!(stream_type, 0x01 | 0x02 | 0x1B | 0x24) {
             return Some((es_pid, stream_type));
         }
         i += 5 + es_info_length;

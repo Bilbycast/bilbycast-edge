@@ -1036,6 +1036,10 @@ async fn whep_viewer_loop(
                                 }
                                 #[cfg(not(feature = "video-thumbnail"))]
                                 super::webrtc::ts_demux::DemuxedFrame::OtherAudio { .. } => {}
+                                // MPEG-2 video on a WebRTC output requires a
+                                // transcode hop we don't have today (WebRTC is
+                                // H.264 only). Drop the AU.
+                                super::webrtc::ts_demux::DemuxedFrame::Mpeg2 { .. } => {}
                             }
                         }
 
@@ -1493,6 +1497,10 @@ async fn whip_client_loop(
                                     }
                                     #[cfg(not(feature = "video-thumbnail"))]
                                     super::webrtc::ts_demux::DemuxedFrame::OtherAudio { .. } => {}
+                                    // MPEG-2 video on a WebRTC output requires
+                                    // a transcode hop we don't have today
+                                    // (WebRTC is H.264 only). Drop the AU.
+                                    super::webrtc::ts_demux::DemuxedFrame::Mpeg2 { .. } => {}
                                 }
                             }
 

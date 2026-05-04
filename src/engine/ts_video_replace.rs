@@ -696,8 +696,8 @@ mod inner {
 // ─────────────────────────── Shared helpers ───────────────────────────
 
 /// Parse the PMT for the first video stream. Returns `(video_pid,
-/// stream_type)` or `None` if no video ES is present. Accepts H.264
-/// (0x1B) and HEVC (0x24).
+/// stream_type)` or `None` if no video ES is present. Accepts MPEG-1
+/// (0x01), MPEG-2 (0x02), H.264 (0x1B) and HEVC (0x24).
 #[cfg(feature = "video-thumbnail")]
 fn parse_pmt_video(pkt: &[u8]) -> Option<(u16, u8)> {
     let mut offset = 4;
@@ -730,7 +730,7 @@ fn parse_pmt_video(pkt: &[u8]) -> Option<(u16, u8)> {
         let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
         let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
 
-        if matches!(st, 0x1B | 0x24) {
+        if matches!(st, 0x01 | 0x02 | 0x1B | 0x24) {
             return Some((es_pid, st));
         }
         pos += 5 + es_info_len;
@@ -1136,6 +1136,10 @@ mod tests {
         assert_eq!(parse_pmt_video(&pkt), Some((0x0100, 0x1B)));
         let pkt2 = synth_pmt(0x1000, 0x0100, 0x24);
         assert_eq!(parse_pmt_video(&pkt2), Some((0x0100, 0x24)));
+        let pkt3 = synth_pmt(0x1000, 0x0100, 0x02);
+        assert_eq!(parse_pmt_video(&pkt3), Some((0x0100, 0x02)));
+        let pkt4 = synth_pmt(0x1000, 0x0100, 0x01);
+        assert_eq!(parse_pmt_video(&pkt4), Some((0x0100, 0x01)));
     }
 
     /// Confirms that our PAT synthesizer produces a packet

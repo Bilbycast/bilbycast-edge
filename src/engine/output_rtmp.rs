@@ -637,6 +637,9 @@ async fn publish_loop(
                     // Build without `video-thumbnail` lacks the libavcodec
                     // bridge needed to decode MP2 / AC-3 / E-AC-3 — drop.
                 }
+                // RTMP carries H.264 / HEVC + AAC — MPEG-2 video would
+                // need a transcode hop we don't have on this output yet.
+                DemuxedFrame::Mpeg2 { .. } => {}
             }
         }
 
@@ -1287,6 +1290,11 @@ fn open_video_active(
     let target_codec = match target_family {
         video_codec::VideoCodec::H264 => "h264",
         video_codec::VideoCodec::Hevc => "hevc",
+        // MPEG-2 isn't a valid RTMP `video_encode` target — `target_family`
+        // only ever lands on the encoder family the operator picked, and
+        // the validator already refuses Mpeg2 here. Treat it as h264 so
+        // the stats label stays a string we expect.
+        video_codec::VideoCodec::Mpeg2 => "h264",
     };
     stats.set_video_encode_stats(
         stats_handle.clone(),
@@ -1408,6 +1416,13 @@ async fn encode_one_frame(
                             video_codec::VideoCodec::Hevc => {
                                 build_hevc_sequence_header_from_hvcc(&ed)
                             }
+                            // Unreachable — `target_family` is the encoder
+                            // output, validation rejects Mpeg2 here. Treat
+                            // it as h264 so we don't panic on a phantom
+                            // bitstream.
+                            video_codec::VideoCodec::Mpeg2 => {
+                                build_avc_sequence_header_from_avcc(&ed)
+                            }
                         });
                     }
                 }
@@ -1476,6 +1491,10 @@ async fn encode_one_frame(
         let tag = match active.target_family {
             video_codec::VideoCodec::H264 => build_avc_nalu_tag_raw(&avcc, keyframe),
             video_codec::VideoCodec::Hevc => build_hevc_coded_frames_tag(&avcc, keyframe),
+            // Unreachable — RTMP encode targets are H.264 / HEVC. Treat
+            // any phantom Mpeg2 family as h264 framing rather than
+            // panicking.
+            video_codec::VideoCodec::Mpeg2 => build_avc_nalu_tag_raw(&avcc, keyframe),
         };
         let tag_len = tag.len();
         client.send_video(&tag, frame_ts_ms).await?;

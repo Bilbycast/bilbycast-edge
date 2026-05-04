@@ -534,7 +534,7 @@ fn parse_pmt_streams(pkt: &[u8], program: &mut ProgramState) {
                     frame_rate: None,
                     profile: None,
                     level: None,
-                    sps_detected: true, // Not parsing sequence headers for legacy codecs
+                    sps_detected: false,
                     last_pts: None,
                     pts_frame_count: 0,
                     pts_interval_sum: 0,
@@ -549,7 +549,7 @@ fn parse_pmt_streams(pkt: &[u8], program: &mut ProgramState) {
                     sample_rate_hz: None,
                     channels: None,
                     language,
-                    header_detected: true,
+                    header_detected: false,
                 });
             }
             0x0F => {
@@ -571,7 +571,7 @@ fn parse_pmt_streams(pkt: &[u8], program: &mut ProgramState) {
                     sample_rate_hz: None,
                     channels: None,
                     language,
-                    header_detected: true, // LATM parsing not implemented
+                    header_detected: false,
                 });
             }
             0x81 => {
@@ -742,6 +742,37 @@ fn try_parse_video_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
     // SPS-based detection (codec, resolution, profile, level, and optionally frame rate from VUI)
     if !sps_detected {
         match stream_type {
+            0x01 | 0x02 => {
+                // MPEG-1 / MPEG-2 — look for sequence_header (start code 0x000001B3)
+                // and optionally sequence_extension (0x000001B5) for HD sizes.
+                if let Some(seq_info) = find_and_parse_mpeg2_sequence(es_data) {
+                    tracing::info!(
+                        "Media analysis: MPEG-{} PID 0x{:04X}: {}x{}{}, profile={}, level={}",
+                        if stream_type == 0x01 { 1 } else { 2 },
+                        pid,
+                        seq_info.width,
+                        seq_info.height,
+                        seq_info
+                            .frame_rate
+                            .map(|f| format!(", {:.2} fps", f))
+                            .unwrap_or_default(),
+                        seq_info.profile,
+                        seq_info.level,
+                    );
+                    if let Some(v) = state
+                        .programs
+                        .iter_mut()
+                        .find_map(|p| p.video_streams.iter_mut().find(|v| v.pid == pid))
+                    {
+                        v.width = Some(seq_info.width);
+                        v.height = Some(seq_info.height);
+                        v.frame_rate = seq_info.frame_rate;
+                        v.profile = Some(seq_info.profile);
+                        v.level = Some(seq_info.level);
+                        v.sps_detected = true;
+                    }
+                }
+            }
             0x1B => {
                 // H.264/AVC — look for SPS NAL unit (type 7)
                 if let Some(sps_info) = find_and_parse_h264_sps(es_data) {
@@ -907,30 +938,90 @@ fn try_parse_audio_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
 
     let pes_header_data_len = payload[8] as usize;
     let es_start = 9 + pes_header_data_len;
-    if es_start + 7 > payload.len() {
+    if es_start + 4 > payload.len() {
         return;
     }
     let es_data = &payload[es_start..];
 
-    // Try ADTS header detection (AAC)
-    if es_data.len() >= 7 && es_data[0] == 0xFF && (es_data[1] & 0xF0) == 0xF0 {
-        if let Some(adts) = parse_adts_header(es_data) {
-            if let Some(a) = state
-                .programs
-                .iter_mut()
-                .find_map(|p| p.audio_streams.iter_mut().find(|a| a.pid == pid))
-            {
-                a.sample_rate_hz = Some(adts.sample_rate);
-                a.channels = Some(adts.channels);
-                a.codec = adts.profile_name;
-                a.header_detected = true;
-                tracing::info!(
-                    "Media analysis: AAC PID 0x{:04X}: {} Hz, {} ch, {}",
-                    pid,
-                    adts.sample_rate,
-                    adts.channels,
-                    a.codec,
-                );
+    // Look up the stream's PMT-declared type so we know which framing to expect.
+    let stream_type = state
+        .programs
+        .iter()
+        .flat_map(|p| p.audio_streams.iter())
+        .find(|a| a.pid == pid)
+        .map(|a| a.stream_type);
+
+    match stream_type {
+        // MPEG-1 / MPEG-2 audio (Layer I/II/III) — 4-byte header beginning 0xFFE_.
+        Some(0x03) | Some(0x04) => {
+            if es_data.len() >= 4 {
+                if let Some(mp) = parse_mpeg_audio_header(es_data) {
+                    if let Some(a) = state
+                        .programs
+                        .iter_mut()
+                        .find_map(|p| p.audio_streams.iter_mut().find(|a| a.pid == pid))
+                    {
+                        a.sample_rate_hz = Some(mp.sample_rate);
+                        a.channels = Some(mp.channels);
+                        a.codec = mp.codec_name;
+                        a.header_detected = true;
+                        tracing::info!(
+                            "Media analysis: MPEG audio PID 0x{:04X}: {} Hz, {} ch, {}",
+                            pid,
+                            mp.sample_rate,
+                            mp.channels,
+                            a.codec,
+                        );
+                    }
+                }
+            }
+        }
+        // AAC-LATM (LOAS) — sync 0x2B7 in the top 11 bits.
+        Some(0x11) => {
+            if es_data.len() >= 3 && es_data[0] == 0x56 && (es_data[1] & 0xE0) == 0xE0 {
+                if let Some(asc) = parse_loas_audio_specific_config(es_data) {
+                    if let Some(a) = state
+                        .programs
+                        .iter_mut()
+                        .find_map(|p| p.audio_streams.iter_mut().find(|a| a.pid == pid))
+                    {
+                        a.sample_rate_hz = Some(asc.sample_rate);
+                        a.channels = Some(asc.channels);
+                        a.codec = asc.profile_name;
+                        a.header_detected = true;
+                        tracing::info!(
+                            "Media analysis: AAC-LATM PID 0x{:04X}: {} Hz, {} ch, {}",
+                            pid,
+                            asc.sample_rate,
+                            asc.channels,
+                            a.codec,
+                        );
+                    }
+                }
+            }
+        }
+        // AAC-ADTS (stream_type 0x0F) — sync 0xFFF.
+        _ => {
+            if es_data.len() >= 7 && es_data[0] == 0xFF && (es_data[1] & 0xF0) == 0xF0 {
+                if let Some(adts) = parse_adts_header(es_data) {
+                    if let Some(a) = state
+                        .programs
+                        .iter_mut()
+                        .find_map(|p| p.audio_streams.iter_mut().find(|a| a.pid == pid))
+                    {
+                        a.sample_rate_hz = Some(adts.sample_rate);
+                        a.channels = Some(adts.channels);
+                        a.codec = adts.profile_name;
+                        a.header_detected = true;
+                        tracing::info!(
+                            "Media analysis: AAC PID 0x{:04X}: {} Hz, {} ch, {}",
+                            pid,
+                            adts.sample_rate,
+                            adts.channels,
+                            a.codec,
+                        );
+                    }
+                }
             }
         }
     }
@@ -1563,6 +1654,293 @@ fn parse_h265_short_term_ref_pic_set(
         }
         Some(num_negative_pics + num_positive_pics)
     }
+}
+
+// ── MPEG-1 / MPEG-2 Sequence Header Parser ──────────────────────────────
+
+/// Frame rate codes from MPEG-2 13818-2 Table 6-4.
+const MPEG2_FRAME_RATES: [Option<f64>; 9] = [
+    None,
+    Some(24000.0 / 1001.0),
+    Some(24.0),
+    Some(25.0),
+    Some(30000.0 / 1001.0),
+    Some(30.0),
+    Some(50.0),
+    Some(60000.0 / 1001.0),
+    Some(60.0),
+];
+
+/// Locate `sequence_header` (start code `0x000001B3`) in an elementary stream
+/// buffer and parse it. If a `sequence_extension` (`0x000001B5`) follows we
+/// fold its 2-bit horizontal/vertical extensions in to lift the size to the
+/// 14-bit HD range.
+fn find_and_parse_mpeg2_sequence(data: &[u8]) -> Option<SpsInfo> {
+    let mut i = 0;
+    while i + 4 <= data.len() {
+        if data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01 && data[i + 3] == 0xB3 {
+            let body = &data[i + 4..];
+            if body.len() < 8 {
+                return None;
+            }
+            // 12 bits horizontal_size, 12 bits vertical_size, 4 bits aspect_ratio,
+            // 4 bits frame_rate_code.
+            let mut w = ((body[0] as u32) << 4) | ((body[1] >> 4) as u32);
+            let mut h = (((body[1] & 0x0F) as u32) << 8) | (body[2] as u32);
+            let frame_rate_code = (body[3] & 0x0F) as usize;
+            let frame_rate = MPEG2_FRAME_RATES
+                .get(frame_rate_code)
+                .copied()
+                .flatten();
+
+            // Default to MPEG-1 / MPEG-2 Main@Main if no extension is found.
+            let mut profile = "Main".to_string();
+            let mut level = "Main".to_string();
+
+            // Look for sequence_extension immediately after this header — skip
+            // forward past optional load_intra_quantiser_matrix /
+            // load_non_intra_quantiser_matrix to find the next start code.
+            if let Some(ext) = find_next_start_code(body, 8) {
+                if ext.code == 0xB5 && ext.body.len() >= 6 {
+                    let id = (ext.body[0] >> 4) & 0x0F;
+                    if id == 1 {
+                        // sequence_extension layout (8 bits skipped above for id+1 nibble):
+                        // profile_and_level_indication 8 bits
+                        // progressive_sequence          1
+                        // chroma_format                 2
+                        // horizontal_size_extension     2
+                        // vertical_size_extension       2
+                        let pli = ((ext.body[0] & 0x0F) << 4) | ((ext.body[1] >> 4) & 0x0F);
+                        // bits 6..4 of the 8-bit pli are profile, bits 3..0 are level.
+                        let profile_code = (pli >> 4) & 0x07;
+                        let level_code = pli & 0x0F;
+                        profile = match profile_code {
+                            1 => "High".to_string(),
+                            2 => "Spatially Scalable".to_string(),
+                            3 => "SNR Scalable".to_string(),
+                            4 => "Main".to_string(),
+                            5 => "Simple".to_string(),
+                            _ => format!("Profile {}", profile_code),
+                        };
+                        level = match level_code {
+                            4 => "High".to_string(),
+                            6 => "High-1440".to_string(),
+                            8 => "Main".to_string(),
+                            10 => "Low".to_string(),
+                            _ => format!("Level {}", level_code),
+                        };
+                        // horizontal_size_extension (2 bits) = bits 1..0 of byte ext.body[2]>>5..,
+                        // vertical_size_extension (2 bits) = next 2 bits.
+                        // Layout:
+                        // ext.body[1] low nibble: progressive(1) chroma(2) hsize_ext(top1)
+                        // ext.body[2] high bits: hsize_ext(low1) vsize_ext(2) bitrate_ext_top(...)
+                        let hsize_ext =
+                            (((ext.body[1] & 0x01) as u32) << 1) | ((ext.body[2] >> 7) as u32);
+                        let vsize_ext = ((ext.body[2] >> 5) & 0x03) as u32;
+                        w |= hsize_ext << 12;
+                        h |= vsize_ext << 12;
+                    }
+                }
+            }
+
+            if w == 0 || h == 0 {
+                return None;
+            }
+            return Some(SpsInfo {
+                width: w as u16,
+                height: h as u16,
+                frame_rate,
+                profile,
+                level,
+            });
+        }
+        i += 1;
+    }
+    None
+}
+
+struct StartCodeRef<'a> {
+    code: u8,
+    body: &'a [u8],
+}
+
+/// Walk a buffer searching for the next MPEG-2 start code (`0x000001XX`).
+fn find_next_start_code(data: &[u8], from: usize) -> Option<StartCodeRef<'_>> {
+    let mut i = from;
+    while i + 4 <= data.len() {
+        if data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01 {
+            return Some(StartCodeRef {
+                code: data[i + 3],
+                body: &data[i + 4..],
+            });
+        }
+        i += 1;
+    }
+    None
+}
+
+// ── MPEG Audio (Layer I/II/III) Header Parser ───────────────────────────
+
+struct MpegAudioInfo {
+    sample_rate: u32,
+    channels: u8,
+    codec_name: String,
+}
+
+/// Parse a 4-byte MPEG-1/MPEG-2/MPEG-2.5 audio frame header. Only the fields
+/// needed for analytics — sample rate, channel count, codec label — are
+/// extracted; the bit-rate index is intentionally ignored.
+fn parse_mpeg_audio_header(data: &[u8]) -> Option<MpegAudioInfo> {
+    if data.len() < 4 {
+        return None;
+    }
+    // Sync: 11 bits set.
+    if data[0] != 0xFF || (data[1] & 0xE0) != 0xE0 {
+        return None;
+    }
+    let version = (data[1] >> 3) & 0x03; // 00=MPEG2.5, 10=MPEG2, 11=MPEG1, 01=reserved
+    let layer = (data[1] >> 1) & 0x03; // 11=I, 10=II, 01=III, 00=reserved
+    if version == 0b01 || layer == 0b00 {
+        return None;
+    }
+    let sr_idx = ((data[2] >> 2) & 0x03) as usize;
+    if sr_idx >= 3 {
+        return None;
+    }
+    // Sample-rate matrix: rows = sr_idx, cols = version bits
+    // (MPEG1 / MPEG2 / MPEG2.5).
+    let sample_rate: u32 = match (version, sr_idx) {
+        (0b11, 0) => 44100, // MPEG-1
+        (0b11, 1) => 48000,
+        (0b11, 2) => 32000,
+        (0b10, 0) => 22050, // MPEG-2
+        (0b10, 1) => 24000,
+        (0b10, 2) => 16000,
+        (0b00, 0) => 11025, // MPEG-2.5
+        (0b00, 1) => 12000,
+        (0b00, 2) => 8000,
+        _ => return None,
+    };
+    let mode = (data[3] >> 6) & 0x03; // 00=stereo, 01=jstereo, 10=dual, 11=mono
+    let channels: u8 = if mode == 0b11 { 1 } else { 2 };
+    let layer_name = match layer {
+        0b11 => "Layer I",
+        0b10 => "Layer II",
+        0b01 => "Layer III",
+        _ => "Layer ?",
+    };
+    let version_name = match version {
+        0b11 => "MPEG-1",
+        0b10 => "MPEG-2",
+        0b00 => "MPEG-2.5",
+        _ => "MPEG",
+    };
+    Some(MpegAudioInfo {
+        sample_rate,
+        channels,
+        codec_name: format!("{} {}", version_name, layer_name),
+    })
+}
+
+// ── AAC LOAS / LATM AudioSpecificConfig Parser ──────────────────────────
+
+struct LatmInfo {
+    sample_rate: u32,
+    channels: u8,
+    profile_name: String,
+}
+
+/// Parse a single LOAS frame and walk into the StreamMuxConfig to extract the
+/// AudioSpecificConfig fields we surface in the UI. Only the shape commonly
+/// seen on broadcast (audioMuxVersion=0, allStreamsSameTimeFraming=1,
+/// numProgram=0, numLayer=0) is fully decoded; richer mux topologies bail
+/// out and leave the stream marked undetected so we try again on the next
+/// PES packet.
+fn parse_loas_audio_specific_config(data: &[u8]) -> Option<LatmInfo> {
+    if data.len() < 3 {
+        return None;
+    }
+    // syncword 11 bits = 0x2B7. First two bytes encode bits 10..0 in the
+    // top-11 of byte0 + top-3 of byte1 — top byte must be 0x56, byte1 top
+    // 3 bits must be 111.
+    if data[0] != 0x56 || (data[1] & 0xE0) != 0xE0 {
+        return None;
+    }
+    // 13-bit audioMuxLengthBytes — we don't need its value, just to skip past it.
+    let mut reader = BitReader::new(&data[2..]);
+    reader.read_bits(5)?; // remainder of audioMuxLengthBytes high bits
+    reader.read_bits(8)?; // low byte
+
+    // audioMuxElement(muxConfigPresent=1) — useSameStreamMux flag.
+    let use_same_mux = reader.read_bits(1)?;
+    if use_same_mux == 1 {
+        // Without the StreamMuxConfig from a prior frame we can't parse
+        // ASC; let the caller try again on a future PES.
+        return None;
+    }
+    // StreamMuxConfig
+    let audio_mux_version = reader.read_bits(1)?;
+    let _audio_mux_version_a = if audio_mux_version == 1 {
+        reader.read_bits(1)?
+    } else {
+        0
+    };
+    if audio_mux_version != 0 {
+        return None; // Higher mux versions not handled.
+    }
+    let _all_streams_same_time_framing = reader.read_bits(1)?;
+    let _num_sub_frames = reader.read_bits(6)?;
+    let num_program = reader.read_bits(4)?;
+    if num_program != 0 {
+        return None; // Multi-program LATM uncommon on broadcast.
+    }
+    let num_layer = reader.read_bits(3)?;
+    if num_layer != 0 {
+        return None;
+    }
+
+    // AudioSpecificConfig
+    let mut aot = reader.read_bits(5)? as u8;
+    if aot == 31 {
+        let ext = reader.read_bits(6)? as u8;
+        aot = 32 + ext;
+    }
+    let sf_idx = reader.read_bits(4)? as usize;
+    let sample_rate = if sf_idx == 0xF {
+        reader.read_bits(24)?
+    } else if sf_idx < AAC_SAMPLE_RATES.len() {
+        AAC_SAMPLE_RATES[sf_idx]
+    } else {
+        return None;
+    };
+    let channel_config = reader.read_bits(4)? as u8;
+
+    // Many broadcasts use HE-AAC v1/v2 signalled via SBR / PS extension —
+    // the explicit signalling sits inside the rest of ASC. We don't need
+    // to fully decode it; the audio object type tells us enough.
+    let profile_name = match aot {
+        1 => "AAC-Main",
+        2 => "AAC-LC",
+        3 => "AAC-SSR",
+        4 => "AAC-LTP",
+        5 => "HE-AAC",
+        29 => "HE-AAC v2",
+        _ => "AAC-LATM",
+    }
+    .to_string();
+
+    let channels: u8 = match channel_config {
+        0 => 2, // PCE — assume stereo for display
+        1..=6 => channel_config,
+        7 => 8,
+        _ => 2,
+    };
+
+    Some(LatmInfo {
+        sample_rate,
+        channels,
+        profile_name,
+    })
 }
 
 // ── AAC ADTS Parser ─────────────────────────────────────────────────────

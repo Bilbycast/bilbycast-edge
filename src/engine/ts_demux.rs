@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use crate::engine::ts_parse::*;
 
 /// Stream type constants from ISO/IEC 13818-1.
+const STREAM_TYPE_MPEG1_VIDEO: u8 = 0x01;
+const STREAM_TYPE_MPEG2_VIDEO: u8 = 0x02;
 const STREAM_TYPE_H264: u8 = 0x1B;
 const STREAM_TYPE_H265: u8 = 0x24;
 const STREAM_TYPE_PRIVATE: u8 = 0x06;
@@ -36,6 +38,23 @@ pub enum DemuxedFrame {
         /// Presentation timestamp in 90 kHz clock ticks.
         pts: u64,
         /// Whether this is a keyframe (IDR_W_RADL, IDR_N_LP, or CRA_NUT).
+        is_keyframe: bool,
+    },
+    /// Complete MPEG-1 / MPEG-2 video access unit. The bitstream is fed
+    /// to the libavcodec `mpeg2video` decoder verbatim — there are no
+    /// parameter-set NALUs in this codec; instead each GoP starts with
+    /// a `sequence_header` (`0x000001B3`) optionally followed by a
+    /// `sequence_extension` (`0x000001B5`) and the first I-picture, and
+    /// the decoder picks them off the input bytestream itself.
+    Mpeg2 {
+        /// Raw elementary stream bytes — the payload after the PES
+        /// header, with no further framing.
+        es: Vec<u8>,
+        /// Presentation timestamp in 90 kHz clock ticks.
+        pts: u64,
+        /// `true` when this AU contains an I-picture
+        /// (`picture_coding_type == 1` in the picture header). Drives
+        /// thumbnail-anchor and replay-IDR-index selection.
         is_keyframe: bool,
     },
     /// Opus audio frame (not yet supported for output — placeholder variant).
@@ -327,6 +346,35 @@ impl TsDemuxer {
             let is_opus = self.check_opus_descriptor(&pkt[desc_start..desc_end]);
 
             match stream_type {
+                STREAM_TYPE_MPEG1_VIDEO | STREAM_TYPE_MPEG2_VIDEO => {
+                    let pid_changed = self.video_pid != Some(es_pid);
+                    let codec_changed = self.video_stream_type != stream_type;
+                    if pid_changed || codec_changed {
+                        tracing::info!(
+                            "TS demux: video PID 0x{:04X} (stream_type=0x{:02X}, MPEG-2)",
+                            es_pid,
+                            stream_type
+                        );
+                        self.video_pid = Some(es_pid);
+                        self.video_stream_type = stream_type;
+                        self.pes_assemblers.insert(
+                            es_pid,
+                            PesAssembler {
+                                buffer: Vec::with_capacity(256 * 1024),
+                                started: false,
+                                stream_type,
+                            },
+                        );
+                        // No SPS/PPS to drop for MPEG-2, but the H.264 /
+                        // H.265 caches must clear so a previous-stream
+                        // anchor doesn't bleed into the new bitstream.
+                        self.cached_sps = None;
+                        self.cached_pps = None;
+                        self.cached_h265_vps = None;
+                        self.cached_h265_sps = None;
+                        self.cached_h265_pps = None;
+                    }
+                }
                 STREAM_TYPE_H264 | STREAM_TYPE_H265 => {
                     // PID change OR codec change on the same PID — both
                     // happen on operator input switching (HEVC source ↔
@@ -524,6 +572,19 @@ impl TsDemuxer {
         let es_data = &pes[es_start..];
 
         match stream_type {
+            STREAM_TYPE_MPEG1_VIDEO | STREAM_TYPE_MPEG2_VIDEO => {
+                if es_data.is_empty() {
+                    return Vec::new();
+                }
+                // MPEG-2 picture_coding_type lives at bits 13..15 of the
+                // 4-byte header that follows `0x00000100`. Type 1 = I-frame.
+                let is_keyframe = mpeg2_au_is_keyframe(es_data);
+                vec![DemuxedFrame::Mpeg2 {
+                    es: es_data.to_vec(),
+                    pts: pts.unwrap_or(0),
+                    is_keyframe,
+                }]
+            }
             STREAM_TYPE_H264 => {
                 let nalus = self.extract_h264_nalus(es_data);
                 if nalus.is_empty() {
@@ -674,6 +735,35 @@ impl TsDemuxer {
 
         frames
     }
+}
+
+/// Locate the first `picture_start_code` (`0x00000100`) in an MPEG-2
+/// access unit and read `picture_coding_type` from the 6-bit field at
+/// bits 13..15 of the 4-byte payload that follows. Type 1 = I-picture
+/// (random-access point); 2 = P, 3 = B. Returns `false` when no picture
+/// header is found in the AU (parameter-only AUs, partial reassembly).
+pub(crate) fn mpeg2_au_is_keyframe(es: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 6 <= es.len() {
+        if es[i] == 0x00
+            && es[i + 1] == 0x00
+            && es[i + 2] == 0x01
+            && es[i + 3] == 0x00
+        {
+            // picture header layout (after the 4-byte start code):
+            // bits 0..9   temporal_reference (10 bits)
+            // bits 10..12 picture_coding_type (3 bits)
+            // ...
+            // The 3-bit coding type spans the low bit of byte[i+4] and
+            // top 2 bits of byte[i+5].
+            let b4 = es[i + 4];
+            let b5 = es[i + 5];
+            let coding_type = ((b4 & 0x01) << 2) | ((b5 >> 6) & 0x03);
+            return coding_type == 1;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Split an Annex-B byte stream into individual NAL units. Start codes

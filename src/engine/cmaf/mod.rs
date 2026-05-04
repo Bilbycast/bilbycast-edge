@@ -580,6 +580,10 @@ async fn handle_frame(
                 state, config, stream_type, &data, pts, event_sender, flow_id,
             );
         }
+        // CMAF egress requires H.264 / HEVC. MPEG-2 input would need a
+        // transcode hop we don't have today; drop the AU so the audio
+        // path keeps working.
+        DemuxedFrame::Mpeg2 { .. } => {}
     }
 }
 

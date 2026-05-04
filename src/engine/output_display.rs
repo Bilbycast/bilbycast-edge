@@ -606,6 +606,34 @@ fn demux_decode_loop(
                         &output_id,
                     );
                 }
+                DemuxedFrame::Mpeg2 { es, pts, .. } => {
+                    // MPEG-2 has no NAL framing — wrap the ES in a single
+                    // synthetic "NALU" so we reuse the existing
+                    // PTS-jump / decoder-ensure / drain pipeline. The
+                    // Annex-B prefix the helper prepends is harmless to
+                    // the libavcodec mpeg2video decoder — it scans for
+                    // its own start codes (`0x000001B3` etc.) inside the
+                    // payload and ignores leading bytes that don't
+                    // match.
+                    let synthetic = vec![es];
+                    handle_video_au(
+                        &synthetic,
+                        pts,
+                        VideoCodec::Mpeg2,
+                        &mut last_video_pts,
+                        &mut video_decoder,
+                        &mut current_video_codec,
+                        &mut aac_decoder,
+                        &mut ff_audio_decoder,
+                        &mut hw_open_state,
+                        &mut last_unsupported_pixfmt_at,
+                        &counters,
+                        &vtx,
+                        &event_sender,
+                        &flow_id,
+                        &output_id,
+                    );
+                }
                 DemuxedFrame::Aac { data, pts } => {
                     if let Some(asc) = demuxer.cached_aac_config() {
                         if aac_decoder.is_none() {
@@ -992,6 +1020,7 @@ fn handle_video_au(
         decoder,
         nalus,
         pts,
+        codec,
         hw_open_state,
         counters,
         flow_id,
@@ -1097,22 +1126,44 @@ fn feed_video_decoder(
     decoder: &mut VideoDecoder,
     nalus: &[Vec<u8>],
     pts_90k: u64,
+    codec: VideoCodec,
     state: &mut HwOpenState,
     counters: &DisplayStatsCounters,
     flow_id: &str,
     output_id: &str,
 ) {
-    // Concatenate NAL units back into Annex-B form (start codes between
-    // each NALU). The demuxer already strips ADTS / start codes, so we
-    // re-add the standard `0x00 0x00 0x00 0x01` prefix. PTS is attached
-    // to the input packet so FFmpeg's reorder queue can hand the
-    // matching display-order PTS back on `receive_frame`.
-    let total = nalus.iter().map(|n| n.len() + 4).sum::<usize>();
-    let mut buf = Vec::with_capacity(total);
-    for n in nalus {
-        buf.extend_from_slice(&[0, 0, 0, 1]);
-        buf.extend_from_slice(n);
-    }
+    // H.264 / HEVC: concatenate NAL units back into Annex-B form
+    // (start codes between each NALU). The demuxer already strips
+    // start codes, so we re-add the standard `0x00 0x00 0x00 0x01`
+    // prefix.
+    //
+    // MPEG-2: the demuxer surfaces the elementary stream verbatim
+    // already framed by `0x000001XX` start codes — feeding it through
+    // the Annex-B prefix would inject a synthetic empty slice
+    // (`0x000001 + 0x01 = slice_start_code 0x01`) which the libavcodec
+    // mpeg2video decoder mis-parses. Pass the bytes through unchanged.
+    //
+    // PTS is attached to the input packet so FFmpeg's reorder queue
+    // can hand the matching display-order PTS back on `receive_frame`.
+    let buf = match codec {
+        VideoCodec::Mpeg2 => {
+            let total = nalus.iter().map(|n| n.len()).sum::<usize>();
+            let mut buf = Vec::with_capacity(total);
+            for n in nalus {
+                buf.extend_from_slice(n);
+            }
+            buf
+        }
+        VideoCodec::H264 | VideoCodec::Hevc => {
+            let total = nalus.iter().map(|n| n.len() + 4).sum::<usize>();
+            let mut buf = Vec::with_capacity(total);
+            for n in nalus {
+                buf.extend_from_slice(&[0, 0, 0, 1]);
+                buf.extend_from_slice(n);
+            }
+            buf
+        }
+    };
     match decoder.send_packet_with_pts(&buf, pts_90k as i64) {
         Ok(()) => {
             if state.first_send_after_open.is_none() {
