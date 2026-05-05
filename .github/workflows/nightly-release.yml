@@ -389,3 +389,15 @@ jobs:
             artifacts/bilbycast-edge-x86_64-linux-full.tar.gz.sha256 \
             artifacts/bilbycast-edge-aarch64-linux-full.tar.gz \
             artifacts/bilbycast-edge-aarch64-linux-full.tar.gz.sha256
+
+      - name: Prune old releases (keep latest 3)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 100 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[3:] | .[].tagName' \
+            | while read -r OLD_TAG; do
+                [ -z "$OLD_TAG" ] && continue
+                echo "Deleting old release ${OLD_TAG}"
+                gh release delete "${OLD_TAG}" --cleanup-tag --yes
+              done
