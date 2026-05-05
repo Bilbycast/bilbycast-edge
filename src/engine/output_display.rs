@@ -370,12 +370,18 @@ async fn run_display_output(
     //    publishes the post-auto-match resolution rather than the
     //    placeholder we opened KMS with.
     let counters = Arc::new(DisplayStatsCounters::default());
-    let audio_codec_label: &'static str = if config.audio_device.as_deref().unwrap_or("").is_empty()
-    {
-        "none"
-    } else {
-        "unknown"
-    };
+    // Seed the audio codec label: `none` for outputs without an
+    // `audio_device` (so the manager UI shows "no audio configured"
+    // rather than "decoder hasn't latched yet"), `unknown` otherwise.
+    // The demux task overwrites this with the real codec discriminant
+    // on the first audio frame.
+    counters.set_audio_codec_label(
+        if config.audio_device.as_deref().unwrap_or("").is_empty() {
+            crate::stats::collector::DisplayCodecLabel::None
+        } else {
+            crate::stats::collector::DisplayCodecLabel::Unknown
+        },
+    );
 
     let scaling_label = match config.scaling_mode {
         DisplayScalingMode::MatchSource => "auto-match pending first frames",
@@ -513,7 +519,6 @@ async fn run_display_output(
             display_counters,
             display_cancel,
             display_output_stats,
-            audio_codec_label,
             decoder_kind_label,
             display_event_sender,
             display_flow_id,
@@ -639,6 +644,11 @@ struct VideoFrame {
     /// microseconds instead of bleeding the previous stream's last
     /// second of decoded video onto the panel after a switch.
     frame_gen: u64,
+    /// Source video codec the demuxer locked onto for this AU. Used by
+    /// the display loop to populate `DisplayStats.video_codec` so the
+    /// manager UI shows the active codec rather than the literal
+    /// `"unknown"` string.
+    codec: VideoCodec,
 }
 
 struct AudioBlock {
@@ -858,6 +868,9 @@ fn demux_decode_loop(
                     );
                 }
                 DemuxedFrame::Aac { data, pts } => {
+                    counters.set_audio_codec_label(
+                        crate::stats::collector::DisplayCodecLabel::Aac,
+                    );
                     if let Some(asc) = demuxer.cached_aac_config() {
                         if aac_decoder.is_none() {
                             if let Ok(d) = aac_decoder_from_adts_config(asc) {
@@ -879,13 +892,39 @@ fn demux_decode_loop(
                         }
                     }
                 }
-                DemuxedFrame::Opus => {
-                    // The demuxer surfaces Opus discovery without a
-                    // payload accessor in v1; once Opus packetization
-                    // lands (planned alongside the v2 hardware-decode
-                    // path) the same `try_send` pattern feeds
-                    // `ff_audio_decoder` configured for Opus.
-                    let _ = (&mut ff_audio_decoder, &mut current_ff_codec);
+                DemuxedFrame::Opus { data, pts } => {
+                    counters.set_audio_codec_label(
+                        crate::stats::collector::DisplayCodecLabel::Opus,
+                    );
+                    // Opus rides on `stream_type = 0x06` (private_data) +
+                    // an Opus registration descriptor. The PES payload is
+                    // a sequence of Opus access units, each prefixed by
+                    // the Opus-in-MPEG-TS control header (an 11-bit
+                    // sync, flags, and the `au_size` length); strip the
+                    // headers and feed each Opus packet to libopus via
+                    // `FfAudioDecoder` so the ALSA path renders audio
+                    // exactly the way it does for AAC / AC-3 / MP2.
+                    if current_ff_codec != Some(AudioDecoderCodec::Opus) {
+                        ff_audio_decoder = FfAudioDecoder::open(AudioDecoderCodec::Opus).ok();
+                        current_ff_codec = Some(AudioDecoderCodec::Opus);
+                    }
+                    if let Some(decoder) = ff_audio_decoder.as_mut() {
+                        for frame_bytes in
+                            crate::engine::audio_decode::split_opus_frames(&data)
+                        {
+                            if decoder.send_packet(frame_bytes, pts as i64).is_ok() {
+                                while let Ok(decoded) = decoder.receive_frame() {
+                                    let _ = atx.try_send(AudioBlock {
+                                        planar: decoded.planar,
+                                        pts_90k: pts,
+                                        sample_rate: decoded.sample_rate,
+                                        channels: decoded.channels,
+                                        frame_gen: frame_gen.load(Ordering::Relaxed),
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
                 DemuxedFrame::Discontinuity => {
                     // Operator switched the active input. The fixer's
@@ -927,6 +966,13 @@ fn demux_decode_loop(
                     ) else {
                         continue;
                     };
+                    counters.set_audio_codec_label(match codec {
+                        AudioDecoderCodec::Mp2 => crate::stats::collector::DisplayCodecLabel::Mp2,
+                        AudioDecoderCodec::Ac3 => crate::stats::collector::DisplayCodecLabel::Ac3,
+                        AudioDecoderCodec::Eac3 => crate::stats::collector::DisplayCodecLabel::Eac3,
+                        AudioDecoderCodec::Opus => crate::stats::collector::DisplayCodecLabel::Opus,
+                        AudioDecoderCodec::AacLatm => crate::stats::collector::DisplayCodecLabel::Aac,
+                    });
                     if current_ff_codec != Some(codec) {
                         ff_audio_decoder = FfAudioDecoder::open(codec).ok();
                         current_ff_codec = Some(codec);
@@ -1398,6 +1444,7 @@ fn handle_video_au(
         last_unsupported_pixfmt_at,
         hw_open_state,
         frame_gen,
+        codec,
     );
     let decode_us = decode_start.elapsed().as_micros() as u64;
     counters.decode_count.fetch_add(1, Ordering::Relaxed);
@@ -1580,6 +1627,7 @@ fn drain_video_frames(
     last_unsupported_pixfmt_at: &mut Option<Instant>,
     state: &mut HwOpenState,
     frame_gen: &AtomicU64,
+    codec: VideoCodec,
 ) {
     while let Ok(frame) = decoder.receive_frame() {
         // A successful frame proves the decode path is live — reset
@@ -1749,6 +1797,7 @@ fn drain_video_frames(
             full_range,
             pts_90k,
             frame_gen: frame_gen.load(Ordering::Relaxed),
+            codec,
         };
         if vtx.try_send(out_frame).is_err() {
             // Distinct from the display-thread `frames_dropped_late` —
@@ -1774,7 +1823,6 @@ fn display_loop(
     counters: Arc<DisplayStatsCounters>,
     cancel: CancellationToken,
     output_stats: Arc<OutputStatsAccumulator>,
-    audio_codec_label: &'static str,
     decoder_kind_label: &'static str,
     event_sender: EventSender,
     flow_id: String,
@@ -1789,11 +1837,26 @@ fn display_loop(
     let mut frame_period_ms: i64 = 33;
     let mut last_pts: Option<u64> = None;
     let mut scaler: Option<CachedScaler> = None;
+    // Track the most-recent video codec discriminant we wrote to the
+    // shared `counters.video_codec_label` atomic. Used to skip the
+    // store on every frame when the codec didn't change.
+    let mut last_video_codec_label_disc: u8 =
+        crate::stats::collector::DisplayCodecLabel::Unknown as u8;
 
     // Resolution autodetect state. Re-armed on PTS jump (input switch)
     // or on any mid-stream source resolution change.
     let mut matched_dims: Option<(u32, u32)> = None;
     let mut stats_registered = false;
+    // Tracks whether the panel mode currently in force was picked with
+    // a stabilised source-fps hint. The first frame fires a modeset
+    // with `frame_period_ms = 33` (default) — fine for picking the
+    // smallest dims-covering mode but not yet able to choose between
+    // 50 Hz / 60 Hz / 100 Hz panel-refresh candidates. After ~5 source
+    // frames the EMA-smoothed period reflects the real fps, and we
+    // re-fire the auto-match once so the panel locks to a refresh
+    // that's an integer multiple of the source. Stays `true` from then
+    // on until the resolution / input switch path resets it.
+    let mut fps_locked: bool = false;
 
     // Wall-clock pacer used when audio is muted (no `AudioClock` to
     // pace against). Anchors on the first frame's PTS + the wall-clock
@@ -1807,25 +1870,42 @@ fn display_loop(
     // fresh.
     let mut wall_anchor: Option<(u64, Instant)> = None;
 
-    // Audio↔video PTS offset captured on the first video frame after
-    // the audio clock arms. The audio task anchors on its very first
-    // ALSA `writei`, which fires before the video decoder has produced
-    // its first frame — for H.264 with B-frames + IDR-wait latency
-    // that's typically 80–150 ms. Without compensation, the very first
-    // drift reading is `-decoder_warmup_ms`, and every subsequent
-    // frame measures the same baseline drift forever. With our drop
-    // threshold at 4× source period (160 ms at 25 fps), even modest
-    // motion-jitter pushed past the drop edge — the operator saw
-    // stutter at the same spots in the file every loop because that's
-    // where the encoder happened to place its heaviest frames relative
-    // to the constant offset.
+    // Audio↔video PTS offset, EMA-smoothed across the run.
     //
-    // We capture the offset once (audio_pts − video_pts at the first
-    // recv where audio is armed) and subtract it from drift forever
-    // after, zeroing the steady-state baseline. Reset on resolution
-    // change / PTS jump (input switch) so the offset re-captures for
-    // the new stream.
-    let mut av_offset_pts: Option<i64> = None;
+    // The single-shot capture this used to do was fragile: the very
+    // first frame after `clock` arms could land mid-startup-burst (the
+    // audio task fills the 80 ms ALSA buffer in <5 ms wall, so smoothed
+    // audio_pts spikes forward), or mid-decoder-priming (libavcodec MP2 /
+    // MPEG-2 audio under-counts the first 1-2 frames' samples), or just
+    // happened to fall on a heavy B-frame's display PTS. Whatever
+    // value got captured became a permanent constant — and on the
+    // sources that captured a small offset but had a real long-term
+    // V-A drift in the source stream itself (PCR/PTS encoder jitter),
+    // every steady-state frame sat 100-300 ms past the drop threshold.
+    //
+    // EMA-smoothed offset (α = 1/64 ≈ 2.5 s @ 25 fps) tracks both the
+    // initial baseline and slow source drift. **Filtered drift** (raw
+    // drift − smoothed offset) gates dropping; real transient
+    // excursions still trip the threshold while the steady-state
+    // baseline is absorbed. The **raw drift** is what operators see on
+    // `DisplayStats.av_sync_offset_ms` so a mis-anchored stream is
+    // visible in the manager UI.
+    //
+    // Sustained-drop hysteresis: a single filtered-drift sample past
+    // `-drop_threshold_ms` is treated as transient noise (mpeg-2 audio
+    // streams produce these on per-frame PTS jitter); we only drop
+    // after `LATE_HYSTERESIS_FRAMES` consecutive samples agree the
+    // video is genuinely late.
+    //
+    // Reset on resolution change / PTS jump (input switch) so the EMA
+    // re-converges on the new stream.
+    let mut av_offset_pts_smoothed: Option<i64> = None;
+    let mut consecutive_late_frames: u32 = 0;
+    // 6 frames ≈ 240 ms at 25 fps, 120 ms at 50 fps. Long enough to
+    // ride through one-off PES PTS jitter (DVB encoder side) and the
+    // slow-α EMA's catchup window; short enough that a real audio
+    // glitch (xrun, codec stall) still drops within ~quarter-second.
+    const LATE_HYSTERESIS_FRAMES: u32 = 6;
 
     while !cancel.is_cancelled() {
         let next = match vrx.blocking_recv() {
@@ -1851,14 +1931,72 @@ fn display_loop(
             continue;
         }
 
+        let cur_video_label = match next.codec {
+            VideoCodec::H264 => crate::stats::collector::DisplayCodecLabel::H264,
+            VideoCodec::Hevc => crate::stats::collector::DisplayCodecLabel::Hevc,
+            VideoCodec::Mpeg2 => crate::stats::collector::DisplayCodecLabel::Mpeg2Video,
+        };
+        if cur_video_label as u8 != last_video_codec_label_disc {
+            counters.set_video_codec_label(cur_video_label);
+            last_video_codec_label_disc = cur_video_label as u8;
+        }
+
+        // Refuse sources above 1080p until the zero-copy display-vaapi
+        // path lands. Today every decoded frame walks libswscale on the
+        // CPU to convert YUV → BGRA into a write-combining KMS dumb
+        // buffer — at 3840×2160 that's a ~33 MB write per frame and the
+        // observed blit time is ≈ 7 s, producing 0.14 fps. A black panel
+        // with a Critical event in the manager UI is honest; silent
+        // 0.14 fps playout is not. Tracked in
+        // `bilbycast-edge/CLAUDE.md` under the staged display-vaapi
+        // VAAPI surface → DMA-BUF → KMS PRIME plane work.
+        const SW_BLIT_MAX_W: u32 = 1920;
+        const SW_BLIT_MAX_H: u32 = 1080;
+        if (next.width > SW_BLIT_MAX_W || next.height > SW_BLIT_MAX_H)
+            && matched_dims.is_none()
+        {
+            event_sender.emit_flow_with_details(
+                EventSeverity::Critical,
+                "display",
+                format!(
+                    "display output '{output_id}': source resolution {}x{} exceeds the \
+                     CPU-blit ceiling of {SW_BLIT_MAX_W}x{SW_BLIT_MAX_H}; the display \
+                     output will stop until display-vaapi zero-copy lands or the \
+                     source is reduced to ≤ 1080p",
+                    next.width, next.height,
+                ),
+                &flow_id,
+                serde_json::json!({
+                    "error_code": "display_resolution_unsupported_for_sw_blit",
+                    "output_id": output_id,
+                    "source_width": next.width,
+                    "source_height": next.height,
+                    "max_supported_width": SW_BLIT_MAX_W,
+                    "max_supported_height": SW_BLIT_MAX_H,
+                }),
+            );
+            break;
+        }
+
         // Re-arm autodetect if the source resolution shifted (operator
         // switched from 1080p to 720p, etc).
         if let Some((mw, mh)) = matched_dims {
             if mw != next.width || mh != next.height {
                 matched_dims = None;
                 wall_anchor = None;
-                av_offset_pts = None;
+                av_offset_pts_smoothed = None;
+                consecutive_late_frames = 0;
+                fps_locked = false;
             }
+        }
+        // Re-fire the auto-match exactly once after the source fps has
+        // stabilised. Without this, a 25 fps source on a panel that
+        // offers both 50 Hz and 60 Hz at the source resolution stays
+        // on the 60 Hz mode KMS picked at first-frame time (when our
+        // `frame_period_ms` was still the 33 ms default), and the
+        // operator sees 2:3 pulldown judder for the rest of the run.
+        if matched_dims.is_some() && !fps_locked && frame_period_ms != 33 {
+            matched_dims = None;
         }
 
         // First frame after open or after re-arm: pick the panel mode
@@ -1875,9 +2013,23 @@ fn display_loop(
         //   defensive — KMS opened at the preferred mode already, so
         //   it's a no-op on the steady-state path.
         if matched_dims.is_none() {
+            // Convert the demuxer's running frame-period estimate into
+            // an fps hint. Until we've seen ≥ 2 frames `frame_period_ms`
+            // is the 33 ms (30 fps) default, which would push the
+            // mode-picker toward 60 Hz; once a few frames have arrived
+            // and the EMA settles, the real source fps drives a clean
+            // panel-refresh choice (50 Hz for 25/50 fps, 60 Hz for
+            // 30/60 fps). Pass `None` while the period is still at the
+            // default so the picker falls back to highest-refresh and
+            // the auto-match re-fires once the period has stabilised.
+            let src_fps_hint = if frame_period_ms > 0 && frame_period_ms != 33 {
+                Some(1000.0_f32 / frame_period_ms as f32)
+            } else {
+                None
+            };
             let (modeset, ok_code, err_code, ok_verb, err_verb) = match scaling_mode {
                 DisplayScalingMode::MatchSource => (
-                    kms.match_source_resolution(next.width, next.height),
+                    kms.match_source_resolution(next.width, next.height, src_fps_hint),
                     "display_auto_matched",
                     "display_auto_match_failed",
                     "auto-matched to source",
@@ -1925,11 +2077,16 @@ fn display_loop(
                 kms.refresh_hz(),
                 "XRGB8888",
                 decoder_kind_label,
-                "unknown",
-                audio_codec_label,
             );
             stats_registered = true;
             matched_dims = Some((next.width, next.height));
+            // The hint we passed was real iff frame_period_ms had
+            // already moved off its default. If it had, the picker has
+            // committed to an fps-aligned panel mode and we don't need
+            // to fire again.
+            if src_fps_hint.is_some() {
+                fps_locked = true;
+            }
         }
 
         // Track the running source frame period so the drift threshold
@@ -1945,7 +2102,8 @@ fn display_loop(
                 frame_period_ms = 33;
                 matched_dims = None;
                 wall_anchor = None;
-                av_offset_pts = None;
+                av_offset_pts_smoothed = None;
+                consecutive_late_frames = 0;
             } else if (10..=200).contains(&dms) {
                 // Light EMA so a one-off long frame doesn't move the
                 // window. α = 1/8 is plenty for ≤ 60 fps content.
@@ -1982,29 +2140,15 @@ fn display_loop(
         // displaying a stale frame is more visible than dropping it.
         // Drop only frames so far behind the audio clock that catching
         // up by re-pacing isn't realistic. 4× source period (160 ms at
-        // 25 fps, 100 ms at 60 fps) — slightly more lipsync slack than
-        // the lossless target, but the previous 2× threshold tripped
-        // on motion-heavy segments where the CPU decoder briefly fell
-        // behind real-time and audio (paced on wall-clock) momentarily
-        // outran video PTS. Each visible drop reads to the operator as
-        // motion stutter, which is more disruptive on a confidence
-        // monitor than a few frames of lipsync drift the decoder
-        // catches up on naturally.
+        // 25 fps, 100 ms at 60 fps).
         let drop_threshold_ms: i64 = (frame_period_ms * 4).max(160);
-        let drift_ms_opt: Option<i64> = if let Some(audio_pts) =
+        // Compute raw drift (V-A in ms). Returned `None` while the
+        // wall-clock fallback is still seeding (≤ 1 frame).
+        let raw_drift_ms_opt: Option<i64> = if let Some(audio_pts) =
             clock.current_pts_90k_smoothed()
         {
             wall_anchor = None;
-            // Capture the audio-vs-video baseline once on first frame
-            // after audio is armed (and after every reset above). The
-            // offset accounts for the decoder's first-frame warmup
-            // latency that has no business showing up as a sustained
-            // negative drift. After capture, drift = 0 in steady
-            // state; only real motion-jitter perturbs it.
-            let offset = *av_offset_pts.get_or_insert(
-                audio_pts as i64 - next.pts_90k as i64,
-            );
-            Some(((next.pts_90k as i64 + offset) - audio_pts as i64) / 90)
+            Some((next.pts_90k as i64 - audio_pts as i64) / 90)
         } else {
             // Audio muted — pace on wall-clock seeded by the first
             // post-anchor frame.
@@ -2016,13 +2160,47 @@ fn display_loop(
             Some(pts_delta_ms - wall_delta_ms)
         };
 
-        if let Some(drift_ms) = drift_ms_opt {
+        if let Some(raw_drift_ms) = raw_drift_ms_opt {
+            // EMA-smoothed offset of (V-A) in ms. α = 1/64 ≈ 2.5 s
+            // half-life at 25 fps — fast enough to track real source
+            // drift (DVB encoder PCR jitter typically evolves on a
+            // 5–30 s timescale), slow enough that one bad frame doesn't
+            // re-set the baseline.
+            let new_smoothed = match av_offset_pts_smoothed {
+                None => raw_drift_ms,
+                Some(prev) => (prev * 63 + raw_drift_ms) / 64,
+            };
+            av_offset_pts_smoothed = Some(new_smoothed);
+            let drift_ms = raw_drift_ms - new_smoothed;
+            // Surface the **raw** A-V offset to the operator so a
+            // mis-anchored stream is visible in the manager UI; the
+            // filtered drift is internal to the late-drop / sleep logic.
             counters.store_av_offset_ms(
-                drift_ms.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                raw_drift_ms.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
             );
             if drift_ms < -drop_threshold_ms {
-                counters.frames_dropped_late.fetch_add(1, Ordering::Relaxed);
-                continue;
+                consecutive_late_frames = consecutive_late_frames.saturating_add(1);
+                if consecutive_late_frames >= LATE_HYSTERESIS_FRAMES {
+                    // After 2× hysteresis of consecutive late frames,
+                    // assume the source has shifted to a new sustained
+                    // baseline (audio decoder slowly racing wall —
+                    // mpeg-2-audio combos do this) and snap the EMA
+                    // forward to the current raw drift. Prevents a
+                    // permanent cascade of drops once the slow EMA
+                    // falls behind a real long-term drift.
+                    if consecutive_late_frames >= LATE_HYSTERESIS_FRAMES * 2 {
+                        av_offset_pts_smoothed = Some(raw_drift_ms);
+                        consecutive_late_frames = 0;
+                        // Don't drop this frame — we just re-anchored.
+                    } else {
+                        counters.frames_dropped_late.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                }
+                // Below threshold but not yet sustained — still present
+                // this frame; the EMA will catch up on the next sample.
+            } else {
+                consecutive_late_frames = 0;
             }
             // Subtract a small margin so we hand the buffer to KMS a hair
             // before its target vblank — the page-flip itself blocks for
@@ -2429,6 +2607,7 @@ mod tests {
             full_range: false,
             pts_90k: 0,
             frame_gen: 0,
+            codec: VideoCodec::H264,
         };
         match planar.chroma {
             VideoFrameChroma::Planar { .. } => {}
@@ -2450,6 +2629,7 @@ mod tests {
             full_range: false,
             pts_90k: 0,
             frame_gen: 0,
+            codec: VideoCodec::Hevc,
         };
         match semi.chroma {
             VideoFrameChroma::SemiPlanar { .. } => {}

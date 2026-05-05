@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -132,6 +132,62 @@ pub struct VideoEncodeStatsHandle {
     pub encoder_backend: String,
 }
 
+/// Discriminant table for the lock-free `video_codec_label` /
+/// `audio_codec_label` atomics on [`DisplayStatsCounters`]. Stored as
+/// `u8` so the demux + display tasks (separate threads) can update the
+/// label without any locking, and the snapshot path can map it back to
+/// the `&'static str` the manager expects without allocation.
+#[allow(dead_code)]
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum DisplayCodecLabel {
+    Unknown = 0,
+    /// Audio-only sentinel: output has no `audio_device`, so audio is
+    /// permanently silent by configuration (not a missing-codec bug).
+    None = 1,
+    H264 = 2,
+    Hevc = 3,
+    Mpeg2Video = 4,
+    Aac = 5,
+    Mp2 = 6,
+    Ac3 = 7,
+    Eac3 = 8,
+    Opus = 9,
+}
+
+#[allow(dead_code)]
+impl DisplayCodecLabel {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::None,
+            2 => Self::H264,
+            3 => Self::Hevc,
+            4 => Self::Mpeg2Video,
+            5 => Self::Aac,
+            6 => Self::Mp2,
+            7 => Self::Ac3,
+            8 => Self::Eac3,
+            9 => Self::Opus,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::None => "none",
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
+            Self::Mpeg2Video => "mpeg2",
+            Self::Aac => "aac",
+            Self::Mp2 => "mp2",
+            Self::Ac3 => "ac3",
+            Self::Eac3 => "eac3",
+            Self::Opus => "opus",
+        }
+    }
+}
+
 /// Lock-free counters that back [`crate::stats::models::DisplayStats`].
 /// Owned by `engine::output_display`; the accumulator stores an `Arc`
 /// to it so the snapshot path can sample without locking.
@@ -259,6 +315,17 @@ pub struct DisplayStatsCounters {
     /// Count of decode-AU invocations whose timing fed
     /// `decode_us_total`.
     pub decode_count: AtomicU64,
+
+    /// Latest video codec the demuxer surfaced on this output, encoded
+    /// as a `DisplayCodecLabel` discriminant. Updated on every received
+    /// video frame so a mid-stream input switch (H.264 → HEVC) refreshes
+    /// the manager-visible label without re-creating the stats handle.
+    /// `0` (Unknown) until the first frame lands.
+    pub video_codec_label: AtomicU8,
+    /// Latest audio codec the demuxer surfaced on this output (or
+    /// `None` when the output has no audio device configured). Same
+    /// shape as `video_codec_label`.
+    pub audio_codec_label: AtomicU8,
 }
 
 #[allow(dead_code)]
@@ -270,20 +337,31 @@ impl DisplayStatsCounters {
     pub fn load_av_offset_ms(&self) -> i32 {
         self.av_offset_ms_packed.load(Ordering::Relaxed) as i64 as i32
     }
+    pub fn set_video_codec_label(&self, label: DisplayCodecLabel) {
+        self.video_codec_label.store(label as u8, Ordering::Relaxed);
+    }
+    pub fn set_audio_codec_label(&self, label: DisplayCodecLabel) {
+        self.audio_codec_label.store(label as u8, Ordering::Relaxed);
+    }
+    pub fn load_video_codec_label(&self) -> DisplayCodecLabel {
+        DisplayCodecLabel::from_u8(self.video_codec_label.load(Ordering::Relaxed))
+    }
+    pub fn load_audio_codec_label(&self) -> DisplayCodecLabel {
+        DisplayCodecLabel::from_u8(self.audio_codec_label.load(Ordering::Relaxed))
+    }
 }
 
 /// Registered handle to a per-output local-display task's counters plus
-/// the steady-state descriptors (chosen mode, codec families) the
-/// snapshot path needs to populate
-/// [`crate::stats::models::DisplayStats`]. Set once at output startup.
+/// the steady-state descriptors (chosen mode) the snapshot path needs
+/// to populate [`crate::stats::models::DisplayStats`]. Set once at
+/// output startup. Codec labels live on `counters` so they can be
+/// updated at runtime without re-creating the handle.
 pub struct DisplayStatsHandle {
     pub counters: Arc<DisplayStatsCounters>,
     pub current_resolution: String,
     pub current_refresh_hz: u32,
     pub pixel_format: String,
     pub decoder_kind: String,
-    pub video_codec: String,
-    pub audio_codec: String,
 }
 
 /// Static (set-once-at-output-startup) descriptors used to build the egress
@@ -455,7 +533,10 @@ impl OutputStatsAccumulator {
     /// Register the per-output local-display counters + mode descriptors.
     /// Called once at startup by `engine::output_display::run` after
     /// modeset succeeds. Subsequent calls are no-ops (first wins).
-    #[allow(clippy::too_many_arguments, dead_code)]
+    /// Codec labels are read live off `counters` (see
+    /// `DisplayStatsCounters::set_{video,audio}_codec_label`) — they are
+    /// not snapshotted into the handle.
+    #[allow(dead_code)]
     pub fn set_display_stats(
         &self,
         counters: Arc<DisplayStatsCounters>,
@@ -463,8 +544,6 @@ impl OutputStatsAccumulator {
         current_refresh_hz: u32,
         pixel_format: impl Into<String>,
         decoder_kind: impl Into<String>,
-        video_codec: impl Into<String>,
-        audio_codec: impl Into<String>,
     ) {
         let _ = self.display_stats.set(DisplayStatsHandle {
             counters,
@@ -472,8 +551,6 @@ impl OutputStatsAccumulator {
             current_refresh_hz,
             pixel_format: pixel_format.into(),
             decoder_kind: decoder_kind.into(),
-            video_codec: video_codec.into(),
-            audio_codec: audio_codec.into(),
         });
     }
 
@@ -602,8 +679,8 @@ impl OutputStatsAccumulator {
             current_refresh_hz: h.current_refresh_hz,
             pixel_format: h.pixel_format.clone(),
             decoder_kind: h.decoder_kind.clone(),
-            video_codec: h.video_codec.clone(),
-            audio_codec: h.audio_codec.clone(),
+            video_codec: h.counters.load_video_codec_label().as_str().to_string(),
+            audio_codec: h.counters.load_audio_codec_label().as_str().to_string(),
             send_packet_errors: h.counters.send_packet_errors.load(Ordering::Relaxed),
             decoder_demotions: h.counters.decoder_demotions.load(Ordering::Relaxed),
             frames_received_since_open: h
@@ -722,6 +799,15 @@ pub struct PcrState {
     pub last_pcr_value: u64,
     /// Wall-clock time when the last PCR was received.
     pub last_pcr_wall_time: Instant,
+    /// Sliding window of (pcr_27mhz, wall_us_since_anchor) samples for the
+    /// regression-based PCR accuracy check. The first sample's wall time is
+    /// the anchor (stored as the first element with wall_us_since_anchor=0).
+    /// Capped at PCR_HISTORY_LEN entries; oldest sample is dropped on insert.
+    pub history: std::collections::VecDeque<(u64, u64)>,
+    /// Anchor wall-time for the regression window. All wall_us values in
+    /// `history` are deltas relative to this anchor (avoids u64 overflow on
+    /// long-running streams when squaring wall_us during regression).
+    pub history_anchor: Instant,
 }
 
 /// Internal mutable state for stateful TR-101290 checks.
@@ -795,6 +881,23 @@ pub struct Tr101290State {
     /// `pcr_discontinuity_errors`. Repetition reads via this map; the
     /// existing `pcr_tracker` keeps the value-vs-wall comparison.
     pub pcr_repetition_tracker: HashMap<u16, Instant>,
+    /// Latch of PMT PIDs that have already been counted as timed-out so the
+    /// 500 ms sweep doesn't re-fire one error per PID per tick forever
+    /// (legacy bug — `pmt_errors` accumulated ~2 errors/sec/orphan).
+    /// Cleared when the PID is seen on the wire again or removed from PAT.
+    pub pmt_errored: std::collections::HashSet<u16>,
+    /// Same latch but for ES PIDs. See `pmt_errored`.
+    pub es_errored: std::collections::HashSet<u16>,
+    /// Latch for `pcr_repetition_errors` — same one-fire-per-stall semantic.
+    pub pcr_repetition_errored: std::collections::HashSet<u16>,
+    /// Latch for `pts_errors` — same one-fire-per-stall semantic.
+    pub pts_errored: std::collections::HashSet<u16>,
+    /// First time the PAT was observed. Used as the anchor for the
+    /// startup-grace window: PMT/ES `None`-state entries don't count as
+    /// errors until at least PAT_PMT_TIMEOUT × 2 has elapsed since the
+    /// PAT first arrived, so a freshly-discovered PMT entry isn't tagged
+    /// just because it hasn't shown up yet.
+    pub first_pat_time: Option<Instant>,
 }
 
 impl Default for Tr101290State {
@@ -833,6 +936,11 @@ impl Default for Tr101290State {
             unreferenced_pids: HashMap::new(),
             pts_tracker: HashMap::new(),
             pcr_repetition_tracker: HashMap::new(),
+            pmt_errored: std::collections::HashSet::new(),
+            es_errored: std::collections::HashSet::new(),
+            pcr_repetition_errored: std::collections::HashSet::new(),
+            pts_errored: std::collections::HashSet::new(),
+            first_pat_time: None,
         }
     }
 }
@@ -2108,6 +2216,12 @@ impl FlowStatsAccumulator {
             })
             .collect();
 
+        // Flow-level "input" stats are the SUM across every running input
+        // (active + passive) by design — the manager UI surfaces this on
+        // the flow card as "total bandwidth across all configured inputs"
+        // so an operator can see passive inputs are warm and ready to
+        // take over. Per-input rates are still available via
+        // `inputs_live[]` for the per-input drill-down view.
         let input_bytes = self.input_bytes.load(Ordering::Relaxed);
         let input_bitrate = self.input_throughput.sample(input_bytes);
 
@@ -2399,9 +2513,10 @@ impl FlowStatsAccumulator {
                     in_video_encode.as_ref(),
                 );
 
+                let total_input_packets = self.input_packets.load(Ordering::Relaxed);
                 InputStats {
                     input_type,
-                    state: derive_input_state(input_bitrate, self.input_packets.load(Ordering::Relaxed)),
+                    state: derive_input_state(input_bitrate, total_input_packets),
                     mode: meta.and_then(|m| m.mode.clone()),
                     local_addr: meta.and_then(|m| m.local_addr.clone()),
                     remote_addr: meta.and_then(|m| m.remote_addr.clone()),
@@ -2409,7 +2524,7 @@ impl FlowStatsAccumulator {
                     bind_addr: meta.and_then(|m| m.bind_addr.clone()),
                     rtsp_url: meta.and_then(|m| m.rtsp_url.clone()),
                     whep_url: meta.and_then(|m| m.whep_url.clone()),
-                    packets_received: self.input_packets.load(Ordering::Relaxed),
+                    packets_received: total_input_packets,
                     bytes_received: input_bytes,
                     bitrate_bps: input_bitrate,
                     packets_lost,

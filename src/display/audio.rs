@@ -155,8 +155,45 @@ impl AudioBackend {
         if needs_re_anchor {
             clock.set_anchor(program_start, pts_90k, sample_rate);
             self.pending_anchor = false;
+            clock.advance(written as u64);
+        } else {
+            // Steady-state clock advance. Naively `advance(written)` only
+            // counts samples we actually pushed to ALSA — which is wrong
+            // when a *significant* run of audio frames fails to decode
+            // (mid-stream codec hiccup, splitter resync) or get skipped
+            // at the decoder. Each missed frame leaves a hole the clock
+            // never sees, the display task reads `audio_pts` as N ms
+            // behind reality, computes drift = +N ms (video looks
+            // ahead), and back-pressures the bounded video mpsc.
+            //
+            // We don't want to chase every PES PTS micro-jitter — DVB
+            // encoders routinely emit per-frame PTS values that drift
+            // 1–2 ms vs the actual sample count, and aggressively
+            // tracking that bias makes the audio clock outrun wall by
+            // ≈ 10 ms/s on some streams (the `*_mpeg2audio` matrix
+            // combos), throwing video into sustained late-drops the
+            // wrong way. Instead: only catch up when the PES PTS jump
+            // exceeds 2 frame periods ahead of where the clock would
+            // be after a normal `advance(written)`. Anything smaller is
+            // treated as encoder jitter and ignored — the clock just
+            // advances by `written` like before.
+            let now_pts = clock.current_pts_90k().unwrap_or(pts_90k);
+            let written_pts = ((written as u128) * 90_000 / (sample_rate as u128)) as u64;
+            let expected_clock_after_write = now_pts.wrapping_add(written_pts);
+            let target_clock = pts_90k.wrapping_add(written_pts);
+            let gap_pts = target_clock.wrapping_sub(expected_clock_after_write) as i64;
+            // Two AAC frames = ~43 ms; two AC-3 frames = 64 ms; two MP2
+            // frames = 48 ms. 50 ms covers all three with margin —
+            // smaller jumps stay treated as benign jitter.
+            const PTS_GAP_CATCHUP_MS: i64 = 50;
+            let advance_samples = if gap_pts > PTS_GAP_CATCHUP_MS * 90 {
+                let gap_samples = ((gap_pts as u128) * (sample_rate as u128) / 90_000) as u64;
+                (written as u64).saturating_add(gap_samples)
+            } else {
+                written as u64
+            };
+            clock.advance(advance_samples);
         }
-        clock.advance(written as u64);
         Ok(written)
     }
 

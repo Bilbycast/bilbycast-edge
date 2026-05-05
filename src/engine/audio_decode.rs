@@ -231,7 +231,15 @@ pub fn input_can_carry_ts_audio(input: &crate::config::models::InputConfig) -> b
 
 /// Map an MPEG-TS `stream_type` to the FFmpeg-backed audio decoder enum,
 /// or `None` for codecs that aren't routed through libavcodec (AAC has
-/// its own fdk-aac path, Opus is private-section-only).
+/// its own fdk-aac path).
+///
+/// Opus rides on `stream_type = 0x06` (`STREAM_TYPE_PRIVATE`) but only
+/// after the demuxer has confirmed the registration descriptor. The
+/// caller knows whether the PID is Opus (it routes Opus-bearing PES via
+/// `DemuxedFrame::Opus`, AC-3-bearing PES via `DemuxedFrame::OtherAudio`),
+/// so the `0x06` arm here only fires on the Opus path — AC-3 carried on
+/// `0x06 + 0x6A descriptor` is synthesised as `0x81` upstream so it
+/// matches the AC-3 arm below.
 #[cfg(feature = "video-thumbnail")]
 pub fn ff_codec_for_stream_type(stream_type: u8) -> Option<video_codec::AudioDecoderCodec> {
     use video_codec::AudioDecoderCodec;
@@ -239,23 +247,34 @@ pub fn ff_codec_for_stream_type(stream_type: u8) -> Option<video_codec::AudioDec
         0x03 | 0x04 => Some(AudioDecoderCodec::Mp2),
         0x80 | 0x81 | 0xC1 => Some(AudioDecoderCodec::Ac3),
         0x87 | 0xC2 => Some(AudioDecoderCodec::Eac3),
+        0x06 => Some(AudioDecoderCodec::Opus),
+        0x11 => Some(AudioDecoderCodec::AacLatm),
         _ => None,
     }
 }
 
-/// Split a concatenated codec-frame buffer on its sync word so each
-/// `avcodec_send_packet` sees exactly one access unit.
+/// Split a concatenated codec-frame buffer so each `avcodec_send_packet`
+/// sees exactly one access unit.
 ///
-/// AC-3 / E-AC-3 sync = `0x0B 0x77`. MP2 sync = an 11-bit `0xFFE` prefix
-/// (the same MPEG-1 audio sync used by every player). We don't trust the
-/// frame-size header to be exact across all variants — we scan for the
-/// *next* sync word and take the byte range as one frame. A trailing
-/// partial frame is included as the last slice; the next PES will resync
-/// on its own.
+/// **MP2 / MPEG-1 layer audio.** Sync is the 12-bit pattern `0xFFF` (byte0
+/// = `0xFF`, top 4 bits of byte1 = `0xF`). The legacy 11-bit `0xFFE` prefix
+/// is *part of* the MP2 sync word but also matches MPEG-2.5 (a reserved
+/// PES context here) and — critically — collides with `0xFF` bytes inside
+/// the body of an MP2 frame, which is what the
+/// `bilbycast/testbed/quality/display-tests` matrix surfaced as 5–10 % of
+/// MP2 frames being rejected by libavcodec with `Header missing`. Slice
+/// each frame using the exact `frame_size` derived from the bitrate +
+/// sample-rate fields — only frames the parser can compute the size for
+/// are emitted, so libavcodec gets sync-aligned access units every time.
 ///
-/// `Opus` is unreachable here (Opus PES carry one frame per PES already
-/// and have a different framing); the match arm is present so the
-/// codec enum remains exhaustive.
+/// **AC-3 / E-AC-3.** Sync is `0x0B 0x77`. AC-3 + E-AC-3 frames don't
+/// embed a payload-length we can trust as cheaply as MP2 does, so we keep
+/// the "scan to next sync word" splitter — libavcodec's AC-3 decoder is
+/// tolerant of the trailing-byte ambiguity.
+///
+/// **Opus** is unreachable from MPEG-TS PES carriage today (it has its own
+/// `control_header_prefix` framing handled by the demuxer's Opus path);
+/// the match arm is present so the codec enum stays exhaustive.
 #[cfg(feature = "video-thumbnail")]
 pub fn split_audio_codec_frames(
     buf: &[u8],
@@ -265,17 +284,235 @@ pub fn split_audio_codec_frames(
     if buf.is_empty() {
         return Vec::new();
     }
+    match codec {
+        AudioDecoderCodec::Mp2 => split_mp2_frames(buf),
+        AudioDecoderCodec::Ac3 | AudioDecoderCodec::Eac3 => split_ac3_frames(buf),
+        AudioDecoderCodec::Opus => Vec::new(),
+        AudioDecoderCodec::AacLatm => split_loas_frames(buf),
+    }
+}
+
+/// LOAS / LATM frame splitter for AAC carried with `stream_type=0x11`.
+///
+/// LOAS (ISO/IEC 14496-3 § 1.7.3 — "audioSyncStream") prefixes each
+/// LATM `AudioMuxElement` with:
+///
+/// ```text
+///   syncword           : 11 bits = 0x2B7
+///   audioMuxLengthBytes: 13 bits  ← number of bytes that follow
+///   payload            : audioMuxLengthBytes bytes (LATM AudioMuxElement)
+/// ```
+///
+/// Each emitted slice is **header + payload** (i.e. a complete 3-byte
+/// LOAS frame followed by the LATM payload) — that's the byte
+/// sequence libavcodec's `AAC_LATM` decoder consumes. Malformed
+/// frames trigger a single-byte resync to the next valid `0x2B7` sync.
+#[cfg(feature = "video-thumbnail")]
+pub fn split_loas_frames(buf: &[u8]) -> Vec<&[u8]> {
+    let mut out: Vec<&[u8]> = Vec::with_capacity(8);
+    let mut i = 0;
+    while i + 3 <= buf.len() {
+        // 11-bit sync word `0x2B7`:
+        //   byte[i]      = 0x56  (`0b0101 0110`)  ← top 8 bits of sync
+        //   byte[i+1]>>5 = 0b111                  ← remaining 3 bits
+        if buf[i] != 0x56 || (buf[i + 1] & 0xE0) != 0xE0 {
+            i += 1;
+            continue;
+        }
+        // 13-bit length: bottom 5 bits of byte[i+1] | byte[i+2].
+        let frame_payload_len =
+            (((buf[i + 1] & 0x1F) as usize) << 8) | (buf[i + 2] as usize);
+        let total_len = 3 + frame_payload_len;
+        if frame_payload_len == 0 || i + total_len > buf.len() {
+            // Truncated tail or empty length — leave the slice for the
+            // next PES rather than emitting a partial frame to libavcodec.
+            break;
+        }
+        out.push(&buf[i..i + total_len]);
+        i += total_len;
+    }
+    out
+}
+
+/// MPEG-1 layer 2 / 1 frame splitter that honours the `frame_size`
+/// computed from the header instead of scanning for the next sync — the
+/// scanning approach trips on `0xFF` bytes inside the audio payload and
+/// produces misaligned slices.
+#[cfg(feature = "video-thumbnail")]
+fn split_mp2_frames(buf: &[u8]) -> Vec<&[u8]> {
+    /// MPEG-1 layer II bitrate index (kbps) — ISO/IEC 11172-3 § 2.4.2.3,
+    /// table B.211. Index 0 = "free format", index 15 = "bad". We treat
+    /// both as unparseable and resync on the next valid header.
+    const MP1_L2_BITRATES: [u32; 15] = [
+        0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384,
+    ];
+    /// MPEG-1 layer I bitrate index (kbps).
+    const MP1_L1_BITRATES: [u32; 15] = [
+        0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448,
+    ];
+    /// MPEG-1 sample-rate index (Hz).
+    const MP1_SAMPLE_RATES: [u32; 3] = [44_100, 48_000, 32_000];
+
+    let mut out: Vec<&[u8]> = Vec::with_capacity(8);
+    let mut i = 0;
+    while i + 4 <= buf.len() {
+        // 12-bit sync `0xFFF` — byte 0 == 0xFF and bits [7:4] of byte 1
+        // are all 1. The full MPEG-1 header is 32 bits; we need byte 2
+        // for bitrate + sample-rate.
+        if buf[i] != 0xFF || (buf[i + 1] & 0xF0) != 0xF0 {
+            i += 1;
+            continue;
+        }
+        let header2 = buf[i + 1];
+        let header3 = buf[i + 2];
+        // MPEG version: bits [4:3] of byte 1. `11` = MPEG-1 (the only
+        // version DVB / ATSC carry as MP2). Anything else: skip and
+        // resync — MPEG-2 layer II uses a different bitrate table and we
+        // don't see it on broadcast.
+        let version_id = (header2 >> 3) & 0x03;
+        if version_id != 0b11 {
+            i += 1;
+            continue;
+        }
+        // Layer: bits [2:1] of byte 1. `10` = layer II, `11` = layer I.
+        let layer = (header2 >> 1) & 0x03;
+        let bitrate_idx = ((header3 >> 4) & 0x0F) as usize;
+        let sr_idx = ((header3 >> 2) & 0x03) as usize;
+        let padding = ((header3 >> 1) & 0x01) as u32;
+        if bitrate_idx == 0 || bitrate_idx == 15 || sr_idx == 3 {
+            i += 1;
+            continue;
+        }
+        let sr = MP1_SAMPLE_RATES[sr_idx];
+        // frame_size = floor(samples_per_frame * bitrate / sample_rate) + padding
+        // Layer I: 384 samples, slot = 4 bytes, so frame = (12 * br / sr + pad) * 4.
+        // Layer II: 1152 samples, slot = 1 byte, so frame = 144 * br / sr + pad.
+        let frame_size = match layer {
+            0b10 => {
+                // Layer II
+                let br = MP1_L2_BITRATES[bitrate_idx] * 1000;
+                144 * br / sr + padding
+            }
+            0b11 => {
+                // Layer I
+                let br = MP1_L1_BITRATES[bitrate_idx] * 1000;
+                (12 * br / sr + padding) * 4
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        } as usize;
+        if frame_size < 4 || i + frame_size > buf.len() {
+            // Truncated tail — leave it for the next PES to resync. We
+            // deliberately *do not* emit a partial frame to libavcodec;
+            // that's what was producing `Header missing` on the matrix.
+            break;
+        }
+        out.push(&buf[i..i + frame_size]);
+        i += frame_size;
+    }
+    out
+}
+
+/// Walk an Opus-in-MPEG-TS PES payload and emit one slice per Opus
+/// access unit. Opus carriage in MPEG-TS prepends every Opus frame with
+/// a control header (`control_header_prefix = 0x3FF`, 11 bits of `1`,
+/// followed by `start_trim_flag` / `end_trim_flag` /
+/// `control_extension_flag`, an extensible `au_size` length field, and
+/// the optional control fields gated by the flags). The libopus decoder
+/// expects raw Opus packets, so the splitter strips the control header
+/// and yields the `au_size` bytes that follow.
+///
+/// Best-effort — malformed AUs cause a resync on the next valid prefix
+/// rather than aborting the PES.
+#[cfg(feature = "video-thumbnail")]
+pub fn split_opus_frames(buf: &[u8]) -> Vec<&[u8]> {
+    let mut out: Vec<&[u8]> = Vec::with_capacity(2);
+    let mut i = 0;
+    while i + 2 <= buf.len() {
+        // 11-bit control_header_prefix = 0x3FF (= 11 bits all 1):
+        //   byte[i]       = 0xFF
+        //   byte[i+1]>>5  = 0b111
+        if buf[i] != 0xFF || (buf[i + 1] & 0xE0) != 0xE0 {
+            i += 1;
+            continue;
+        }
+        let flags = buf[i + 1] & 0x1F;
+        let start_trim_flag = (flags & 0x10) != 0;
+        let end_trim_flag = (flags & 0x08) != 0;
+        let control_extension_flag = (flags & 0x04) != 0;
+
+        // au_size: variable-length unsigned. Each 0xFF byte adds 255 and
+        // continues; the first non-0xFF byte adds its raw value and ends
+        // the field.
+        let mut size_pos = i + 2;
+        let mut au_size: usize = 0;
+        loop {
+            if size_pos >= buf.len() {
+                return out;
+            }
+            let b = buf[size_pos];
+            size_pos += 1;
+            au_size = au_size.saturating_add(b as usize);
+            if b != 0xFF {
+                break;
+            }
+        }
+
+        // Optional fields (gated by flags) live *inside* `au_size`. Skip
+        // them so the slice we emit is the Opus packet itself.
+        let mut payload_start = size_pos;
+        let mut consumed_optional: usize = 0;
+        if start_trim_flag {
+            if payload_start + 2 > buf.len() {
+                return out;
+            }
+            payload_start += 2;
+            consumed_optional += 2;
+        }
+        if end_trim_flag {
+            if payload_start + 2 > buf.len() {
+                return out;
+            }
+            payload_start += 2;
+            consumed_optional += 2;
+        }
+        if control_extension_flag {
+            if payload_start >= buf.len() {
+                return out;
+            }
+            let ext_len = buf[payload_start] as usize;
+            payload_start += 1;
+            consumed_optional += 1;
+            if payload_start + ext_len > buf.len() {
+                return out;
+            }
+            payload_start += ext_len;
+            consumed_optional += ext_len;
+        }
+
+        let opus_packet_size = au_size.saturating_sub(consumed_optional);
+        let payload_end = payload_start + opus_packet_size;
+        if opus_packet_size == 0 || payload_end > buf.len() {
+            return out;
+        }
+        out.push(&buf[payload_start..payload_end]);
+        i = payload_end;
+    }
+    out
+}
+
+/// AC-3 / E-AC-3 syncword splitter. The decoder tolerates the trailing-
+/// bytes ambiguity at the end of the buffer because each AU has its own
+/// embedded `frmsiz`; we just need to align the start of each
+/// `send_packet` call on a `0x0B 0x77` boundary.
+#[cfg(feature = "video-thumbnail")]
+fn split_ac3_frames(buf: &[u8]) -> Vec<&[u8]> {
     let mut starts: Vec<usize> = Vec::with_capacity(8);
     let mut i = 0;
     while i + 1 < buf.len() {
-        let matched = match codec {
-            AudioDecoderCodec::Ac3 | AudioDecoderCodec::Eac3 => {
-                buf[i] == 0x0B && buf[i + 1] == 0x77
-            }
-            AudioDecoderCodec::Mp2 => buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0,
-            AudioDecoderCodec::Opus => false,
-        };
-        if matched {
+        if buf[i] == 0x0B && buf[i + 1] == 0x77 {
             starts.push(i);
             i += 2;
         } else {
@@ -884,6 +1121,125 @@ mod tests {
             "decoded 1kHz sine RMS {rms:.4} outside [{lo:.4}, {hi:.4}] — \
              encode/decode roundtrip broken"
         );
+    }
+
+    // ── Frame splitter tests (Bug B in DISPLAY_QUALITY_REPORT.md) ──────
+
+    /// Build a minimum-valid MPEG-1 Layer II frame header given a bitrate
+    /// and sample rate. Returns the full frame bytes (header + zero
+    /// payload). The header table here is the audio path's source of
+    /// truth — picks the indices straight out of ISO/IEC 11172-3 § 2.4.
+    #[cfg(feature = "video-thumbnail")]
+    fn make_mp2_frame(bitrate_kbps: u32, sample_rate_hz: u32, padding: bool) -> Vec<u8> {
+        let bitrate_idx = match bitrate_kbps {
+            32 => 1, 48 => 2, 56 => 3, 64 => 4, 80 => 5, 96 => 6,
+            112 => 7, 128 => 8, 160 => 9, 192 => 10, 224 => 11,
+            256 => 12, 320 => 13, 384 => 14,
+            _ => panic!("unsupported MP2 bitrate: {bitrate_kbps}"),
+        };
+        let sr_idx = match sample_rate_hz {
+            44_100 => 0, 48_000 => 1, 32_000 => 2,
+            _ => panic!("unsupported MP2 sample rate: {sample_rate_hz}"),
+        };
+        // Frame size = 144 * bitrate / sample_rate + padding (Layer II).
+        let pad_bit = if padding { 1u32 } else { 0 };
+        let frame_size = (144 * bitrate_kbps * 1000 / sample_rate_hz + pad_bit) as usize;
+        let mut buf = vec![0u8; frame_size];
+        // Header byte 0: 0xFF (sync top 8 bits)
+        buf[0] = 0xFF;
+        // Byte 1: top 4 bits sync = 1, version (11 = MPEG-1), layer (10 = II),
+        // protection (1 = no CRC) → 1111 1101 = 0xFD.
+        buf[1] = 0xFD;
+        // Byte 2: bitrate (4 bits) | sample_rate (2 bits) | padding (1 bit) | private (1 bit).
+        buf[2] = ((bitrate_idx as u8) << 4) | ((sr_idx as u8) << 2) | (pad_bit as u8) << 1;
+        // Byte 3: channel_mode (00 stereo) + the rest left as 0.
+        buf[3] = 0x00;
+        buf
+    }
+
+    /// Two concatenated MP2 frames must split exactly on the bitrate-
+    /// table-derived frame_size, even when the audio payload contains
+    /// `0xFF` bytes that look like a sync prefix to the legacy
+    /// scan-to-next-sync splitter.
+    #[cfg(feature = "video-thumbnail")]
+    #[test]
+    fn mp2_splitter_honours_frame_size_and_skips_payload_0xff() {
+        use video_codec::AudioDecoderCodec;
+        let mut a = make_mp2_frame(192, 48_000, false);
+        let mut b = make_mp2_frame(192, 48_000, false);
+        // Plant a 0xFF byte that the legacy 11-bit splitter would have
+        // wrongly treated as the start of a fresh frame inside frame A.
+        a[10] = 0xFF;
+        a[11] = 0xE0;
+        b[5] = 0xFF;
+        b[6] = 0xF0; // looks like sync without our 12-bit gate
+        let mut concat = a.clone();
+        concat.extend_from_slice(&b);
+        let frames = split_audio_codec_frames(&concat, AudioDecoderCodec::Mp2);
+        assert_eq!(
+            frames.len(),
+            2,
+            "expected exactly 2 MP2 frames, got {} (likely tripped on payload 0xFF bytes)",
+            frames.len(),
+        );
+        assert_eq!(frames[0].len(), a.len(), "frame 0 size must match header-derived frame_size");
+        assert_eq!(frames[1].len(), b.len(), "frame 1 size must match header-derived frame_size");
+    }
+
+    /// A truncated trailing MP2 frame is left behind for the next PES to
+    /// resync on. The legacy splitter yielded the truncated bytes as a
+    /// final slice and libavcodec rejected them with `Header missing`.
+    #[cfg(feature = "video-thumbnail")]
+    #[test]
+    fn mp2_splitter_drops_truncated_trailing_frame() {
+        use video_codec::AudioDecoderCodec;
+        let a = make_mp2_frame(128, 48_000, false);
+        let mut b = make_mp2_frame(128, 48_000, false);
+        b.truncate(20); // partial — header but body cut short
+        let mut concat = a.clone();
+        concat.extend_from_slice(&b);
+        let frames = split_audio_codec_frames(&concat, AudioDecoderCodec::Mp2);
+        assert_eq!(frames.len(), 1, "truncated frame must not be emitted");
+        assert_eq!(frames[0].len(), a.len());
+    }
+
+    /// AC-3 syncword splitter still aligns on `0x0B 0x77` boundaries.
+    #[cfg(feature = "video-thumbnail")]
+    #[test]
+    fn ac3_splitter_aligns_on_syncword() {
+        use video_codec::AudioDecoderCodec;
+        let buf = vec![0x0B, 0x77, 0x01, 0x02, 0x03, 0x0B, 0x77, 0x04, 0x05];
+        let frames = split_audio_codec_frames(&buf, AudioDecoderCodec::Ac3);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0], &[0x0B, 0x77, 0x01, 0x02, 0x03]);
+        assert_eq!(frames[1], &[0x0B, 0x77, 0x04, 0x05]);
+    }
+
+    /// Opus-in-MPEG-TS access unit: control_header_prefix `0xFFE0` (top
+    /// 11 bits all 1), no flags, au_size = 7, then 7 bytes of Opus
+    /// payload. The splitter must skip the 3-byte header and emit the
+    /// 7-byte Opus packet.
+    #[cfg(feature = "video-thumbnail")]
+    #[test]
+    fn opus_splitter_strips_control_header() {
+        let mut buf = vec![0xFF, 0xE0, 0x07];
+        buf.extend_from_slice(&[0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70]);
+        let frames = split_opus_frames(&buf);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], &[0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70]);
+    }
+
+    /// `au_size` is variable-length: each `0xFF` byte adds 255 and
+    /// continues. A 260-byte AU encodes as `[0xFF, 0x05]`.
+    #[cfg(feature = "video-thumbnail")]
+    #[test]
+    fn opus_splitter_decodes_variable_length_au_size() {
+        let mut buf = vec![0xFF, 0xE0, 0xFF, 0x05];
+        buf.extend(vec![0xAA; 260]);
+        let frames = split_opus_frames(&buf);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].len(), 260);
+        assert!(frames[0].iter().all(|b| *b == 0xAA));
     }
 
     /// `DecodeStats` is a public hot-path counter struct. Trivial but

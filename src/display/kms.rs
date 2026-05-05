@@ -346,28 +346,40 @@ impl KmsDisplay {
     }
 
     /// Re-program the connector to the best mode covering source dims
-    /// `(src_w, src_h)`. Refresh rate is **not** part of the match —
-    /// most desktop panels list low-refresh EDID modes (24 / 25 / 30 Hz)
-    /// for compatibility but actually drive them with backlight flicker
-    /// or sync loss. The audio-master dup/drop logic in the display
-    /// loop handles the source-fps-vs-panel-refresh cadence cleanly,
-    /// the way every consumer media player does on a 60 Hz monitor.
+    /// `(src_w, src_h)`. When `src_fps_hint` is `Some`, the picker
+    /// prefers refresh rates that are integer multiples of the source
+    /// fps so each source frame holds for a whole number of vblanks —
+    /// **this eliminates the 2:3 / 1:2 pulldown judder a 25 fps source
+    /// produces on a 60 Hz panel and a 50 fps source produces on a 60 Hz
+    /// panel**, which on real broadcast content reads to the operator
+    /// as "the picture is just slightly stuttery". When `src_fps_hint`
+    /// is `None` (the source's frame period hasn't stabilised yet) the
+    /// picker falls back to highest-refresh-rate to drive the panel at
+    /// its native cadence.
     ///
     /// Strategy:
     /// 1. Smallest mode whose dims are both ≥ source — avoids the 4K
     ///    upscale CPU spike when a 1080p source lands on a 4K panel.
-    /// 2. Tie-break on highest refresh (the panel's preferred / native
-    ///    rate is what works without flicker on real hardware).
+    /// 2. Among same-dim candidates: cleanly-divisible refresh wins
+    ///    (a 50 Hz mode for 25/50 fps content, 60 Hz for 30/60 fps,
+    ///    100 Hz for 25/50 fps if the panel offers it). Tie-break on
+    ///    highest refresh (panel's preferred / native is least likely
+    ///    to flicker).
     /// 3. If every mode is smaller than the source, pick the largest.
     ///
     /// Drops + re-allocates the dumb-buffer pair if the new mode size
     /// differs. No-op when the new mode is identical to the current one.
-    pub fn match_source_resolution(&mut self, src_w: u32, src_h: u32) -> Result<()> {
+    pub fn match_source_resolution(
+        &mut self,
+        src_w: u32,
+        src_h: u32,
+        src_fps_hint: Option<f32>,
+    ) -> Result<()> {
         let info = self
             .card
             .get_connector(self.connector, true)
             .context("get_connector for auto-match")?;
-        let new_mode = pick_mode_for_source_dims_only(&info, src_w, src_h)?;
+        let new_mode = pick_mode_for_source_dims_only(&info, src_w, src_h, src_fps_hint)?;
         let (new_w_i16, new_h_i16) = new_mode.size();
         let new_w = new_w_i16 as u32;
         let new_h = new_h_i16 as u32;
@@ -644,24 +656,49 @@ fn pick_preferred_mode(info: &drm::control::connector::Info) -> drm::control::Mo
 /// what works without flicker). Falls back to the largest available
 /// mode when every mode is smaller than the source.
 ///
-/// We deliberately do **not** match refresh against source fps —
-/// see `KmsDisplay::match_source_resolution` for the rationale.
+/// When `src_fps_hint` is supplied, candidate modes whose refresh rate
+/// is an integer multiple of the source fps (within ±0.5 Hz tolerance)
+/// rank ahead of others — eliminates the 2:3 / 1:2 pulldown judder a
+/// 25 fps source produces on a 60 Hz panel.
 fn pick_mode_for_source_dims_only(
     info: &drm::control::connector::Info,
     src_w: u32,
     src_h: u32,
+    src_fps_hint: Option<f32>,
 ) -> Result<drm::control::Mode> {
     let modes = info.modes();
     if modes.is_empty() {
         anyhow::bail!("display_resolution_unsupported: connector has no modes");
     }
+    // Returns `0` if the mode's refresh is a clean integer multiple of
+    // the source fps (rank A — lowest sort key wins), else `1` (rank B).
+    // No fps hint → all modes rank A so we fall through to plain
+    // highest-refresh ordering.
+    let cadence_rank = |refresh_hz: u32| -> u8 {
+        let Some(fps) = src_fps_hint else { return 0 };
+        if fps <= 0.0 {
+            return 0;
+        }
+        let ratio = refresh_hz as f32 / fps;
+        let rounded = ratio.round();
+        if rounded >= 1.0 && (ratio - rounded).abs() < 0.05 {
+            0
+        } else {
+            1
+        }
+    };
     let exact: Vec<&drm::control::Mode> = modes
         .iter()
         .filter(|m| m.size().0 as u32 == src_w && m.size().1 as u32 == src_h)
         .collect();
     if !exact.is_empty() {
         let mut em = exact;
-        em.sort_by_key(|m| std::cmp::Reverse(m.vrefresh()));
+        em.sort_by_key(|m| {
+            (
+                cadence_rank(m.vrefresh() as u32),
+                std::cmp::Reverse(m.vrefresh()),
+            )
+        });
         return Ok(*em[0]);
     }
     let mut at_or_above: Vec<&drm::control::Mode> = modes
@@ -672,6 +709,7 @@ fn pick_mode_for_source_dims_only(
         at_or_above.sort_by_key(|m| {
             (
                 (m.size().0 as u64) * (m.size().1 as u64),
+                cadence_rank(m.vrefresh() as u32) as u64,
                 std::cmp::Reverse(m.vrefresh() as u64),
             )
         });
@@ -681,6 +719,7 @@ fn pick_mode_for_source_dims_only(
     all.sort_by_key(|m| {
         (
             std::cmp::Reverse((m.size().0 as u64) * (m.size().1 as u64)),
+            cadence_rank(m.vrefresh() as u32) as u64,
             std::cmp::Reverse(m.vrefresh() as u64),
         )
     });

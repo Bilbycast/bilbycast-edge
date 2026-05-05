@@ -18,6 +18,26 @@ const STREAM_TYPE_H264: u8 = 0x1B;
 const STREAM_TYPE_H265: u8 = 0x24;
 const STREAM_TYPE_PRIVATE: u8 = 0x06;
 const STREAM_TYPE_AAC_ADTS: u8 = 0x0F;
+/// MPEG-TS `stream_type` for AAC carried over LATM/LOAS — the framing
+/// every Australian / Asian DVB-T AAC service uses (e.g. Seven AU
+/// program 1334) and a common HE-AAC contribution carriage. Each PES
+/// is a sequence of LOAS audio-sync-stream frames: 11-bit sync `0x2B7`
+/// + 13-bit length + LATM `AudioMuxElement`. Decoded via libavcodec's
+/// `AAC_LATM` codec (see `bilbycast-ffmpeg-video-rs`); fdk-aac stays on
+/// ADTS.
+const STREAM_TYPE_AAC_LATM: u8 = 0x11;
+
+/// Audio codec carried on `stream_type = 0x06` (PES private data),
+/// disambiguated by a DVB / Opus descriptor in the PMT ES-info loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateAudioKind {
+    /// DVB AC-3 — ETSI TS 101 154 § 5.3, descriptor tag `0x6A`.
+    Ac3,
+    /// DVB E-AC-3 — ETSI TS 101 154 § 5.3, descriptor tag `0x7A`.
+    Eac3,
+    /// Opus — registration descriptor `0x05` with `Opus` identifier.
+    Opus,
+}
 
 /// Extracted media frame from the TS demuxer.
 pub enum DemuxedFrame {
@@ -69,8 +89,20 @@ pub enum DemuxedFrame {
         /// thumbnail-anchor and replay-IDR-index selection.
         is_keyframe: bool,
     },
-    /// Opus audio frame (not yet supported for output — placeholder variant).
-    Opus,
+    /// Opus audio access unit, payload-bearing. Carries one or more
+    /// Opus-in-MPEG-TS packetised frames (per the Opus-in-MPEG-TS spec —
+    /// 11-bit `control_header_prefix = 0x3FF` sentinel, followed by
+    /// flag-driven optional fields, followed by a self-delimited Opus
+    /// frame). Consumers walk the PES payload, strip control headers,
+    /// and feed each Opus frame to libopus / libavcodec one at a time.
+    Opus {
+        /// PES payload bytes (post-PES-header). The ETSI / ISO opus-in-TS
+        /// control headers ride in front of each Opus frame inside this
+        /// buffer.
+        data: Vec<u8>,
+        /// Presentation timestamp in 90 kHz clock ticks.
+        pts: u64,
+    },
     /// AAC audio frame (raw, ADTS header stripped).
     Aac {
         /// Raw AAC frame data (without ADTS header).
@@ -413,10 +445,32 @@ impl TsDemuxer {
             let es_info_length =
                 (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
 
-            // Check descriptors for Opus registration
+            // Walk ES-info descriptors. DVB carries AC-3 / E-AC-3 / Opus on
+            // `stream_type = 0x06` (PES private data) plus a codec-specific
+            // descriptor — that's how every non-ATSC broadcaster (UK Sky,
+            // European DTT, AU DVB-S/T) signals these. ATSC additionally
+            // uses 0x80/0x81/0x87/etc. directly. Detect the descriptor and
+            // synthesise the matching ATSC-style stream_type so the rest
+            // of the pipeline (assembler keying, parse_pes routing,
+            // libavcodec selection) handles both signalling styles
+            // uniformly. Tags per ETSI TS 101 154 § 5.3 (AC-3 0x6A,
+            // E-AC-3 0x7A) and the Opus-in-MPEG-TS spec (registration
+            // descriptor with `Opus` identifier).
             let desc_start = pos + 5;
             let desc_end = (desc_start + es_info_length).min(data_end);
-            let is_opus = self.check_opus_descriptor(&pkt[desc_start..desc_end]);
+            let descriptors = &pkt[desc_start..desc_end];
+            let dvb_audio_kind = if stream_type == STREAM_TYPE_PRIVATE {
+                self.detect_private_audio_descriptor(descriptors)
+            } else {
+                None
+            };
+            // Effective stream_type used for routing / assembler keying.
+            let effective_type = match dvb_audio_kind {
+                Some(PrivateAudioKind::Ac3) => 0x81,
+                Some(PrivateAudioKind::Eac3) => 0x87,
+                Some(PrivateAudioKind::Opus) => STREAM_TYPE_PRIVATE,
+                None => stream_type,
+            };
 
             match stream_type {
                 STREAM_TYPE_MPEG1_VIDEO | STREAM_TYPE_MPEG2_VIDEO => {
@@ -483,10 +537,13 @@ impl TsDemuxer {
                         self.cached_h265_pps = None;
                     }
                 }
-                STREAM_TYPE_PRIVATE if is_opus => {
-                    audio_tracks.push((es_pid, stream_type));
+                STREAM_TYPE_PRIVATE if dvb_audio_kind.is_some() => {
+                    // Use the synthesised ATSC-style marker for AC-3 /
+                    // E-AC-3; Opus stays on 0x06 (its parse_pes arm gates
+                    // on `STREAM_TYPE_PRIVATE if Some(pid) == audio_pid`).
+                    audio_tracks.push((es_pid, effective_type));
                 }
-                STREAM_TYPE_AAC_ADTS => {
+                STREAM_TYPE_AAC_ADTS | STREAM_TYPE_AAC_LATM => {
                     audio_tracks.push((es_pid, stream_type));
                 }
                 // MP2 (0x03/0x04), AC-3 (0x80/0x81/0xC1), E-AC-3 (0x87/0xC2)
@@ -521,6 +578,7 @@ impl TsDemuxer {
             if audio_pid_changed || audio_codec_changed {
                 let codec_name = match selected_type {
                     STREAM_TYPE_AAC_ADTS => "AAC",
+                    STREAM_TYPE_AAC_LATM => "AAC-LATM",
                     STREAM_TYPE_PRIVATE => "Opus",
                     0x03 | 0x04 => "MP2",
                     0x80 | 0x81 | 0xC1 => "AC-3",
@@ -554,8 +612,16 @@ impl TsDemuxer {
         }
     }
 
-    /// Check ES descriptors for Opus registration descriptor.
-    fn check_opus_descriptor(&self, descriptors: &[u8]) -> bool {
+    /// Inspect the ES-info descriptor loop for an audio codec carried on
+    /// `stream_type = 0x06` (private_data). Recognised:
+    ///
+    /// - DVB AC-3 descriptor (tag `0x6A`, ETSI TS 101 154 § 5.3)
+    /// - DVB E-AC-3 descriptor (tag `0x7A`, ETSI TS 101 154 § 5.3)
+    /// - Opus registration descriptor (tag `0x05` with `Opus` ident)
+    ///
+    /// Returns `None` for any other private stream — those PIDs are not
+    /// surfaced to the audio path.
+    fn detect_private_audio_descriptor(&self, descriptors: &[u8]) -> Option<PrivateAudioKind> {
         let mut pos = 0;
         while pos + 2 <= descriptors.len() {
             let tag = descriptors[pos];
@@ -563,13 +629,17 @@ impl TsDemuxer {
             if pos + 2 + len > descriptors.len() {
                 break;
             }
-            // Registration descriptor (tag 0x05) with "Opus" identifier
-            if tag == 0x05 && len >= 4 && &descriptors[pos + 2..pos + 6] == b"Opus" {
-                return true;
+            match tag {
+                0x6A => return Some(PrivateAudioKind::Ac3),
+                0x7A => return Some(PrivateAudioKind::Eac3),
+                0x05 if len >= 4 && &descriptors[pos + 2..pos + 6] == b"Opus" => {
+                    return Some(PrivateAudioKind::Opus);
+                }
+                _ => {}
             }
             pos += 2 + len;
         }
-        false
+        None
     }
 
     /// Process a TS packet belonging to a known ES PID (video or audio).
@@ -691,17 +761,22 @@ impl TsDemuxer {
                 }]
             }
             STREAM_TYPE_PRIVATE if Some(pid) == self.audio_pid => {
-                vec![DemuxedFrame::Opus]
+                vec![DemuxedFrame::Opus {
+                    data: es_data.to_vec(),
+                    pts: pts.unwrap_or(0),
+                }]
             }
             STREAM_TYPE_AAC_ADTS if Some(pid) == self.audio_pid => {
                 // A single PES may contain multiple ADTS frames concatenated.
                 self.extract_aac_frames(es_data, pts.unwrap_or(0))
             }
-            // MP2 (0x03/0x04), AC-3 (0x80/0x81/0xC1), E-AC-3 (0x87/0xC2)
-            // — surface the PES payload so consumers that handle these
-            // codecs (the local-display ALSA path) can decode them via
-            // libavcodec. Other consumers ignore the variant.
-            0x03 | 0x04 | 0x80 | 0x81 | 0x87 | 0xC1 | 0xC2 if Some(pid) == self.audio_pid => {
+            // MP2 (0x03/0x04), AC-3 (0x80/0x81/0xC1), E-AC-3 (0x87/0xC2),
+            // AAC-LATM (0x11) — surface the PES payload so consumers that
+            // handle these codecs (the local-display ALSA path) can decode
+            // them via libavcodec. Other consumers ignore the variant.
+            0x03 | 0x04 | 0x80 | 0x81 | 0x87 | 0xC1 | 0xC2 | STREAM_TYPE_AAC_LATM
+                if Some(pid) == self.audio_pid =>
+            {
                 vec![DemuxedFrame::OtherAudio {
                     stream_type,
                     data: es_data.to_vec(),
@@ -1128,6 +1203,134 @@ mod tests {
             frames.len(),
             1,
             "only the Discontinuity should appear; no ES frames yet",
+        );
+    }
+
+    /// Build a 188-byte PMT TS packet declaring one H.264 video PID and
+    /// one private-data audio PID with a single ES descriptor of `tag` /
+    /// `payload`. Used to exercise the DVB AC-3 / E-AC-3 / Opus routing
+    /// in `parse_pmt`.
+    fn build_pmt_private_audio(
+        pmt_pid: u16,
+        video_pid: u16,
+        audio_pid: u16,
+        desc_tag: u8,
+        desc_payload: &[u8],
+    ) -> [u8; TS_PACKET_SIZE] {
+        let mut pkt = [0xFFu8; TS_PACKET_SIZE];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = 0x40 | (((pmt_pid >> 8) as u8) & 0x1F);
+        pkt[2] = (pmt_pid & 0xFF) as u8;
+        pkt[3] = 0x10;
+        pkt[4] = 0x00;
+        let desc_total = 2 + desc_payload.len();
+        // header(9) + program_info_len(2) + video ES(5) + audio ES(5 + desc) + CRC(4)
+        let section_length = 9 + 5 + (5 + desc_total) + 4;
+        pkt[5] = 0x02;
+        pkt[6] = 0xB0 | (((section_length >> 8) as u8) & 0x0F);
+        pkt[7] = (section_length & 0xFF) as u8;
+        pkt[8] = 0x00;
+        pkt[9] = 0x01;
+        pkt[10] = 0xC1;
+        pkt[11] = 0x00;
+        pkt[12] = 0x00;
+        pkt[13] = 0xE0 | (((video_pid >> 8) as u8) & 0x1F);
+        pkt[14] = (video_pid & 0xFF) as u8;
+        pkt[15] = 0xF0;
+        pkt[16] = 0x00;
+        // Video ES — H.264.
+        pkt[17] = 0x1B;
+        pkt[18] = 0xE0 | (((video_pid >> 8) as u8) & 0x1F);
+        pkt[19] = (video_pid & 0xFF) as u8;
+        pkt[20] = 0xF0;
+        pkt[21] = 0x00;
+        // Audio ES — stream_type 0x06 (private_data) + descriptor.
+        pkt[22] = STREAM_TYPE_PRIVATE;
+        pkt[23] = 0xE0 | (((audio_pid >> 8) as u8) & 0x1F);
+        pkt[24] = (audio_pid & 0xFF) as u8;
+        pkt[25] = 0xF0 | (((desc_total >> 8) as u8) & 0x0F);
+        pkt[26] = (desc_total & 0xFF) as u8;
+        pkt[27] = desc_tag;
+        pkt[28] = desc_payload.len() as u8;
+        for (i, b) in desc_payload.iter().enumerate() {
+            pkt[29 + i] = *b;
+        }
+        let crc_end = 27 + desc_total;
+        let crc = mpeg2_crc32(&pkt[5..crc_end]);
+        pkt[crc_end] = (crc >> 24) as u8;
+        pkt[crc_end + 1] = (crc >> 16) as u8;
+        pkt[crc_end + 2] = (crc >> 8) as u8;
+        pkt[crc_end + 3] = crc as u8;
+        pkt
+    }
+
+    /// DVB AC-3 sources signal `stream_type = 0x06` plus an AC-3 descriptor
+    /// (tag `0x6A`). The demuxer must recognise the descriptor, route the
+    /// PID into `audio_pid`, and synthesise the ATSC `0x81` marker on the
+    /// PES assembler so `parse_pes` lands the PES on the OtherAudio path
+    /// (where libavcodec decodes AC-3). Reproduces Bug A from
+    /// `testbed/quality/display-tests/DISPLAY_QUALITY_REPORT.md`.
+    #[test]
+    fn dvb_ac3_descriptor_routes_audio_pid() {
+        let mut demux = TsDemuxer::new(None);
+        let _ = demux.demux(&build_pat(0x100));
+        // AC-3 descriptor body is opaque to routing — any 1-byte payload
+        // satisfies the `length >= 0` requirement.
+        let pmt = build_pmt_private_audio(0x100, 0x200, 0x300, 0x6A, &[0x40]);
+        let _ = demux.demux(&pmt);
+        assert_eq!(demux.audio_pid, Some(0x300), "DVB AC-3 PID must be locked");
+        let assembler = demux
+            .pes_assemblers
+            .get(&0x300)
+            .expect("PES assembler must exist for DVB AC-3 PID");
+        assert_eq!(
+            assembler.stream_type, 0x81,
+            "DVB AC-3 must surface to parse_pes as ATSC-style 0x81 stream_type",
+        );
+    }
+
+    /// E-AC-3 carriage uses descriptor tag `0x7A`. Symmetric to the AC-3
+    /// case: the demuxer must synthesise `0x87` so `parse_pes` lands the
+    /// PES on the existing E-AC-3 OtherAudio arm.
+    #[test]
+    fn dvb_eac3_descriptor_routes_audio_pid() {
+        let mut demux = TsDemuxer::new(None);
+        let _ = demux.demux(&build_pat(0x100));
+        let pmt = build_pmt_private_audio(0x100, 0x200, 0x300, 0x7A, &[0x00]);
+        let _ = demux.demux(&pmt);
+        assert_eq!(demux.audio_pid, Some(0x300));
+        let assembler = demux.pes_assemblers.get(&0x300).expect("E-AC-3 PID");
+        assert_eq!(assembler.stream_type, 0x87);
+    }
+
+    /// Opus reg descriptor (tag `0x05` with `Opus` identifier) keeps the
+    /// `stream_type = 0x06` marker — its parse_pes arm gates on
+    /// `STREAM_TYPE_PRIVATE if Some(pid) == self.audio_pid`.
+    #[test]
+    fn opus_registration_descriptor_routes_audio_pid() {
+        let mut demux = TsDemuxer::new(None);
+        let _ = demux.demux(&build_pat(0x100));
+        let pmt = build_pmt_private_audio(0x100, 0x200, 0x300, 0x05, b"Opus");
+        let _ = demux.demux(&pmt);
+        assert_eq!(demux.audio_pid, Some(0x300));
+        let assembler = demux.pes_assemblers.get(&0x300).expect("Opus PID");
+        assert_eq!(assembler.stream_type, STREAM_TYPE_PRIVATE);
+    }
+
+    /// Private streams without a recognised audio descriptor must NOT be
+    /// surfaced to the audio path — that's where the legacy demuxer's
+    /// "AC-3 silent on display" symptom came from when an unknown
+    /// private-data stream sat next to an AAC PID.
+    #[test]
+    fn private_stream_without_audio_descriptor_is_ignored() {
+        let mut demux = TsDemuxer::new(None);
+        let _ = demux.demux(&build_pat(0x100));
+        // Unknown descriptor tag — nothing on the audio path should fire.
+        let pmt = build_pmt_private_audio(0x100, 0x200, 0x300, 0x52, &[0x00]);
+        let _ = demux.demux(&pmt);
+        assert_eq!(
+            demux.audio_pid, None,
+            "private stream without AC-3/E-AC-3/Opus descriptor must not be routed",
         );
     }
 
