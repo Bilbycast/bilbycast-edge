@@ -170,7 +170,11 @@ pub struct TsDemuxer {
     cached_h265_sps: Option<Vec<u8>>,
     /// Cached HEVC PPS NALU.
     cached_h265_pps: Option<Vec<u8>>,
-    /// Cached AAC config: (profile, sample_rate_index, channel_config) from first ADTS header.
+    /// Cached AAC config: (profile, sample_rate_index, channel_config). Refreshed
+    /// from each ADTS header so it always reflects the most recent AAC parameters
+    /// and is preserved across PMT codec changes (an export window that crosses
+    /// an input switch from AAC → AC-3 still has the AAC config available for
+    /// the AAC samples it captured before the switch).
     cached_aac_config: Option<(u8, u8, u8)>,
     /// Last PMT `version_number` (5 bits) seen for the locked program. A change
     /// trips `pending_discontinuity`, which surfaces a single
@@ -604,10 +608,10 @@ impl TsDemuxer {
                         stream_type: selected_type,
                     },
                 );
-                // ADTS-config + Opus-state caches are codec-specific; drop
-                // them so the next sync re-anchors on whatever the new
-                // stream sends first.
-                self.cached_aac_config = None;
+                // `cached_aac_config` is intentionally kept across codec
+                // changes — every ADTS header refreshes it, and the export
+                // path needs the AAC config to remain available for the
+                // frames it captured before the switch.
             }
         }
     }
@@ -824,8 +828,8 @@ impl TsDemuxer {
     }
 
     /// Extract all AAC frames from ADTS-wrapped data.
-    /// Strips ADTS headers and caches the audio config on first call.
-    /// A single PES may contain multiple concatenated ADTS frames.
+    /// Strips ADTS headers and refreshes the cached audio config from every
+    /// ADTS header. A single PES may contain multiple concatenated ADTS frames.
     fn extract_aac_frames(&mut self, data: &[u8], base_pts: u64) -> Vec<DemuxedFrame> {
         let mut frames = Vec::new();
         let mut offset = 0;
@@ -844,16 +848,21 @@ impl TsDemuxer {
                 break;
             }
 
-            // Cache AAC config from first ADTS header
-            if self.cached_aac_config.is_none() {
-                let profile = (data[offset + 2] >> 6) & 0x03;
-                let sample_rate_idx = (data[offset + 2] >> 2) & 0x0F;
-                let channel_config = ((data[offset + 2] & 0x01) << 2) | ((data[offset + 3] >> 6) & 0x03);
-                self.cached_aac_config = Some((profile, sample_rate_idx, channel_config));
+            // Refresh the AAC config from this header. Every ADTS frame
+            // carries the full parameter set, so always-overwrite is the
+            // simplest way to track parameter changes (e.g. sample-rate
+            // shifts on input switches) without separate state-machine
+            // logic.
+            let profile = (data[offset + 2] >> 6) & 0x03;
+            let sample_rate_idx = (data[offset + 2] >> 2) & 0x0F;
+            let channel_config = ((data[offset + 2] & 0x01) << 2) | ((data[offset + 3] >> 6) & 0x03);
+            let new_cfg = (profile, sample_rate_idx, channel_config);
+            if self.cached_aac_config != Some(new_cfg) {
                 tracing::debug!(
                     "AAC config: profile={}, sample_rate_idx={}, channels={}",
                     profile + 1, sample_rate_idx, channel_config,
                 );
+                self.cached_aac_config = Some(new_cfg);
             }
 
             // ADTS frame length (13 bits): includes header + raw frame
