@@ -587,6 +587,7 @@ async fn srt_input_redundant_loop(
         );
 
         let mut merger = HitlessMerger::new();
+        let mut failover = RawTsFailover::new();
         let mut prev_active_leg = ActiveLeg::None;
         let mut leg1_alive = true;
         let mut socket_leg2: Option<Arc<srt_transport::SrtSocket>> = None;
@@ -720,7 +721,7 @@ async fn srt_input_redundant_loop(
                         Ok(data) => {
                             if format == SrtPayloadFormat::Unknown {
                                 format = detect_format(&data);
-                                log_detected_format(format);
+                                log_detected_format_redundant(format, &events, flow_id);
                             }
                             process_redundant_packet(
                                 data,
@@ -729,6 +730,7 @@ async fn srt_input_redundant_loop(
                                 &mut raw_ts_seq_leg1,
                                 &mut raw_ts_timestamp,
                                 &mut merger,
+                                &mut failover,
                                 &mut prev_active_leg,
                                 &stats,
                                 &broadcast_tx,
@@ -752,7 +754,7 @@ async fn srt_input_redundant_loop(
                         Ok(data) => {
                             if format == SrtPayloadFormat::Unknown {
                                 format = detect_format(&data);
-                                log_detected_format(format);
+                                log_detected_format_redundant(format, &events, flow_id);
                             }
                             process_redundant_packet(
                                 data,
@@ -761,6 +763,7 @@ async fn srt_input_redundant_loop(
                                 &mut raw_ts_seq_leg2,
                                 &mut raw_ts_timestamp,
                                 &mut merger,
+                                &mut failover,
                                 &mut prev_active_leg,
                                 &stats,
                                 &broadcast_tx,
@@ -815,11 +818,120 @@ fn log_detected_format(format: SrtPayloadFormat) {
     }
 }
 
-/// Process a single packet from a redundancy leg through the hitless merger.
+/// Variant of `log_detected_format` for the redundant-input loop. When raw
+/// TS lands on a 2022-7-configured input, real hitless dedup is impossible
+/// (no shared transport-layer seq across legs) — the runtime falls back to
+/// active-leg protection-switching. Emit a Warning event so operators
+/// understand what mode they're actually getting.
+fn log_detected_format_redundant(
+    format: SrtPayloadFormat,
+    events: &EventSender,
+    flow_id: &str,
+) {
+    log_detected_format(format);
+    if matches!(format, SrtPayloadFormat::RawTs | SrtPayloadFormat::Unknown) {
+        tracing::warn!(
+            "SRT redundant input: raw TS has no shared cross-leg seq — running active-leg failover, NOT hitless dedup. \
+             Configure the publisher to send RTP/TS (SMPTE ST 2022-2) for true 2022-7 hitless behaviour."
+        );
+        events.emit_flow_with_details(
+            EventSeverity::Warning,
+            category::REDUNDANCY,
+            "SRT redundancy on raw TS: running active-leg failover, not hitless dedup",
+            flow_id,
+            serde_json::json!({
+                "error_code": "redundancy_failover_mode",
+                "format": "raw_ts",
+                "fix_hint": "Configure the publisher to send RTP/TS for true SMPTE 2022-7 hitless behaviour",
+            }),
+        );
+    }
+}
+
+/// Stall threshold for the raw-TS active-leg failover path. If the active
+/// output leg is silent for longer than this, the next packet from the
+/// standby leg promotes it. Sized large enough to absorb normal jitter
+/// (well above the SRT TSBPD release cadence) while still failing over
+/// inside an operator-noticeable window.
+const RAW_TS_FAILOVER_STALL: Duration = Duration::from_millis(50);
+
+/// State for the raw-TS-over-SRT redundancy active-leg failover path.
 ///
-/// Handles both RTP/TS and raw TS formats. For RTP/TS, the RTP sequence
-/// number is used for 2022-7 merge. For raw TS, a per-leg synthetic
-/// sequence counter is used.
+/// Raw TS over SRT does not carry a transport-layer sequence number that
+/// is shared across legs (each SRT connection numbers its packets
+/// independently from its own ISN, and the TS payload itself only has a
+/// 4-bit per-PID continuity counter). The synthetic per-leg counters that
+/// the legacy code fed into `HitlessMerger` violated the merger's
+/// precondition (shared seq across legs) and produced random dedup
+/// collisions plus continuous active-leg flapping. The merger is the
+/// right primitive when the legs share a real seq (RTP/TS); for raw TS
+/// the honest answer is protection-switching, not hitless dedup.
+///
+/// Behaviour: forward packets only from `active`; switch to the other leg
+/// when `active`'s last arrival is older than [`RAW_TS_FAILOVER_STALL`].
+/// First packet ever seen sets `active`. The unused leg's bytes are
+/// silently dropped — they would be near-duplicates of the active leg's
+/// bytes (the camera/encoder pushes the same TS to both ports), and we
+/// have no transport-layer key to dedup them.
+struct RawTsFailover {
+    active: ActiveLeg,
+    last_leg1: Option<std::time::Instant>,
+    last_leg2: Option<std::time::Instant>,
+}
+
+impl RawTsFailover {
+    fn new() -> Self {
+        Self {
+            active: ActiveLeg::None,
+            last_leg1: None,
+            last_leg2: None,
+        }
+    }
+
+    /// Returns `true` if this packet should be forwarded; updates state.
+    fn admit(&mut self, leg: ActiveLeg) -> bool {
+        let now = std::time::Instant::now();
+        match leg {
+            ActiveLeg::Leg1 => self.last_leg1 = Some(now),
+            ActiveLeg::Leg2 => self.last_leg2 = Some(now),
+            ActiveLeg::None => return false,
+        }
+
+        if self.active == ActiveLeg::None {
+            self.active = leg;
+            return true;
+        }
+
+        if self.active == leg {
+            return true;
+        }
+
+        // Standby-leg packet — only promote on stall of the active leg.
+        let active_last = match self.active {
+            ActiveLeg::Leg1 => self.last_leg1,
+            ActiveLeg::Leg2 => self.last_leg2,
+            ActiveLeg::None => None,
+        };
+        let stalled = active_last
+            .map(|t| now.duration_since(t) > RAW_TS_FAILOVER_STALL)
+            .unwrap_or(true);
+        if stalled {
+            self.active = leg;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Process a single packet from a redundancy leg.
+///
+/// Dispatches by detected payload format:
+/// - **RTP/TS**: feeds the real RTP sequence number through
+///   [`HitlessMerger`] for true SMPTE 2022-7 dedup + gap-fill.
+/// - **Raw TS / Unknown**: routes through [`RawTsFailover`] for
+///   active-leg protection-switching. Real dedup is impossible without a
+///   shared seq across legs.
 fn process_redundant_packet(
     data: Bytes,
     leg: ActiveLeg,
@@ -827,72 +939,74 @@ fn process_redundant_packet(
     raw_ts_seq: &mut u16,
     raw_ts_timestamp: &mut u32,
     merger: &mut HitlessMerger,
+    failover: &mut RawTsFailover,
     prev_active_leg: &mut ActiveLeg,
     stats: &Arc<FlowStatsAccumulator>,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     transcoder: &mut Option<InputTranscoder>,
 ) {
-    let (seq, ts, is_raw) = match format {
+    let (seq, ts, is_raw, accepted_leg) = match format {
         SrtPayloadFormat::RtpTs => {
             if !is_likely_rtp(&data) {
                 return;
             }
             let seq = parse_rtp_sequence_number(&data).unwrap_or(0);
             let ts = parse_rtp_timestamp(&data).unwrap_or(0);
-            (seq, ts, false)
+            match merger.try_merge(seq, leg) {
+                Some(chosen_leg) => (seq, ts, false, chosen_leg),
+                None => return,
+            }
         }
         SrtPayloadFormat::RawTs | SrtPayloadFormat::Unknown => {
+            if !failover.admit(leg) {
+                return;
+            }
+            // Synthetic seq advances independently per leg; useful only as a
+            // monotonic stamp on the published `RtpPacket` for downstream
+            // bookkeeping. It is no longer used for dedup.
             let seq = *raw_ts_seq;
             *raw_ts_seq = raw_ts_seq.wrapping_add(1);
             let ts_pkts = (data.len() / TS_PACKET_SIZE) as u32;
             *raw_ts_timestamp = raw_ts_timestamp.wrapping_add(ts_pkts * 188 * 8);
-            (seq, *raw_ts_timestamp, true)
+            (seq, *raw_ts_timestamp, true, leg)
         }
     };
 
-    // For RTP/TS, 2022-7 merge uses the real RTP sequence number.
-    // For raw TS with redundancy, we still attempt merge using the synthetic
-    // sequence — this provides basic protection switching (if one leg drops,
-    // the other takes over) but cannot deduplicate identical packets since
-    // each leg generates independent synthetic sequences.
-    if let Some(chosen_leg) = merger.try_merge(seq, leg) {
-        // Track redundancy switches
-        if *prev_active_leg != ActiveLeg::None && chosen_leg != *prev_active_leg {
-            stats
-                .redundancy_switches
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
-                "SRT input redundancy switch: {:?} -> {:?} at seq {}",
-                prev_active_leg,
-                chosen_leg,
-                seq
-            );
-        }
-        *prev_active_leg = chosen_leg;
-
-        stats.input_packets.fetch_add(1, Ordering::Relaxed);
+    if *prev_active_leg != ActiveLeg::None && accepted_leg != *prev_active_leg {
         stats
-            .input_bytes
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
-
-        // Bandwidth limit enforcement: drop packet if flow is blocked
-        if stats.bandwidth_blocked.load(Ordering::Relaxed) {
-            stats.input_filtered.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-
-        let packet = RtpPacket {
-            data,
-            sequence_number: seq,
-            rtp_timestamp: ts,
-            recv_time_us: now_us(),
-            is_raw_ts: is_raw,
-            upstream_seq: None,
-            upstream_leg_id: None,
-        };
-
-        publish_input_packet(transcoder, broadcast_tx, packet);
+            .redundancy_switches
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            "SRT input redundancy switch: {:?} -> {:?} at seq {}",
+            prev_active_leg,
+            accepted_leg,
+            seq
+        );
     }
+    *prev_active_leg = accepted_leg;
+
+    stats.input_packets.fetch_add(1, Ordering::Relaxed);
+    stats
+        .input_bytes
+        .fetch_add(data.len() as u64, Ordering::Relaxed);
+
+    // Bandwidth limit enforcement: drop packet if flow is blocked
+    if stats.bandwidth_blocked.load(Ordering::Relaxed) {
+        stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    let packet = RtpPacket {
+        data,
+        sequence_number: seq,
+        rtp_timestamp: ts,
+        recv_time_us: now_us(),
+        is_raw_ts: is_raw,
+        upstream_seq: None,
+        upstream_leg_id: None,
+    };
+
+    publish_input_packet(transcoder, broadcast_tx, packet);
 }
 
 // ---------------------------------------------------------------------------
@@ -1214,6 +1328,54 @@ async fn srt_bonded_group_recv_loop(
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failover_first_packet_sets_active() {
+        let mut f = RawTsFailover::new();
+        assert!(f.admit(ActiveLeg::Leg1));
+        assert_eq!(f.active, ActiveLeg::Leg1);
+    }
+
+    #[test]
+    fn failover_active_leg_admitted_standby_dropped() {
+        let mut f = RawTsFailover::new();
+        f.admit(ActiveLeg::Leg1);
+        // Active leg keeps flowing.
+        assert!(f.admit(ActiveLeg::Leg1));
+        // Standby leg dropped while active is healthy.
+        assert!(!f.admit(ActiveLeg::Leg2));
+        // Active stays leg1.
+        assert_eq!(f.active, ActiveLeg::Leg1);
+    }
+
+    #[test]
+    fn failover_promotes_standby_after_stall() {
+        let mut f = RawTsFailover::new();
+        f.admit(ActiveLeg::Leg1);
+        // Backdate leg1's last arrival past the stall threshold.
+        f.last_leg1 = Some(
+            std::time::Instant::now() - (RAW_TS_FAILOVER_STALL + Duration::from_millis(10)),
+        );
+        assert!(f.admit(ActiveLeg::Leg2));
+        assert_eq!(f.active, ActiveLeg::Leg2);
+    }
+
+    #[test]
+    fn failover_does_not_dedup_within_active_leg() {
+        // Even a "duplicate" stream from the active leg passes — the
+        // primitive is failover, not dedup. If the publisher itself
+        // double-sends, that's not the failover's problem.
+        let mut f = RawTsFailover::new();
+        f.admit(ActiveLeg::Leg1);
+        for _ in 0..1000 {
+            assert!(f.admit(ActiveLeg::Leg1));
         }
     }
 }

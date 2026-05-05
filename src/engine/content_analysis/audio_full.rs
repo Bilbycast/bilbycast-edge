@@ -733,9 +733,22 @@ impl AudioFullState {
             i += 5 + es_info_length;
         }
         for (pid, stype) in discovered.iter() {
-            self.audio_pids
-                .entry(*pid)
-                .or_insert_with(|| AudioPidState::new(*pid, *stype));
+            // If the entry already exists but the PMT now reports a
+            // different stream_type for the same PID (typical after an
+            // input switch where the new active stream uses the same audio
+            // PID number but a different codec — e.g. AAC-LC on PID 257
+            // → E-AC-3 on PID 257), drop the stale state and rebuild.
+            // Without this the old codec, decoder, and last R128 reading
+            // stick around forever, producing a confidently-wrong
+            // codec/loudness report on the live snapshot.
+            match self.audio_pids.get(pid) {
+                Some(existing) if existing.stream_type == *stype => {
+                    // Same PID, same codec — reuse existing state.
+                }
+                _ => {
+                    self.audio_pids.insert(*pid, AudioPidState::new(*pid, *stype));
+                }
+            }
         }
         self.audio_pids.retain(|pid, _| discovered.contains_key(pid));
     }

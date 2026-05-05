@@ -548,7 +548,7 @@ async fn publish_loop(
                         }
                     }
                 }
-                DemuxedFrame::Opus => {
+                DemuxedFrame::Opus { .. } => {
                     // RTMP doesn't support Opus — skip
                 }
                 #[cfg(feature = "video-thumbnail")]

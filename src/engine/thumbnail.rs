@@ -514,7 +514,7 @@ impl LiveState {
                     self.push_frame(es, pts, is_anchor);
                 }
                 // Audio variants are not consumed for thumbnails — drop them.
-                DemuxedFrame::Opus
+                DemuxedFrame::Opus { .. }
                 | DemuxedFrame::Aac { .. }
                 | DemuxedFrame::OtherAudio { .. } => {}
                 // Stream discontinuity is metadata for stateful consumers

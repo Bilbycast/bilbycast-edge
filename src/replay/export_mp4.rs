@@ -258,9 +258,10 @@ async fn build_recording_mp4(
                 // MPEG-2 sources should download TS.
                 bail!("replay_export_format_unsupported");
             }
-            DemuxedFrame::Opus => {
-                // Opus PES extraction is not yet wired in the demuxer
-                // (placeholder variant). Tracked separately.
+            DemuxedFrame::Opus { .. } => {
+                // Opus → MP4 carriage (`Opus`-in-`fmp4` boxes) is not
+                // wired today. Display playback decodes Opus through
+                // libopus directly; export-to-MP4 is the missing path.
                 bail!("replay_export_format_unsupported");
             }
             // Stream discontinuity is metadata for stateful decoders; the

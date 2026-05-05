@@ -574,7 +574,7 @@ async fn handle_frame(
         DemuxedFrame::Aac { data, pts } => {
             handle_audio_frame(state, demuxer, config, &data, pts, event_sender, flow_id);
         }
-        DemuxedFrame::Opus => {}
+        DemuxedFrame::Opus { .. } => {}
         DemuxedFrame::OtherAudio { stream_type, data, pts } => {
             handle_other_audio_frame(
                 state, config, stream_type, &data, pts, event_sender, flow_id,

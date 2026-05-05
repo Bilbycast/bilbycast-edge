@@ -637,6 +637,7 @@ impl FlowRuntime {
                 &broadcast_tx,
                 tr101290_acc,
                 cancel_token.child_token(),
+                Some(active_input_watch_rx.clone()),
             )
         } else {
             // Spawn an immediately-completing no-op task so the

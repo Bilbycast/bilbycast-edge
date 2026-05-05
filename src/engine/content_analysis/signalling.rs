@@ -572,6 +572,20 @@ fn skip_profile_tier_level(br: &mut BitReader, max_sub_layers_minus1: u8) -> boo
     for i in 0..max_sub_layers_minus1 as usize {
         if sub_layer_profile_present[i] == 1 {
             // sub_layer_profile_space(2)+tier(1)+profile_idc(5)=8, compatibility 32, flags+reserved 48
+            //
+            // Note on the chunk shape: this reads 32+32+16+32 = 112 bits
+            // per present sub-layer profile rather than the spec's
+            // 8+32+48 = 88. An attempt was made to "fix" the read to 88
+            // bits per spec, but on the live broadcast 4K HEVC streams
+            // we test against, the spec-correct chunking causes pic_w /
+            // pic_h to read as 0 — suggesting either an encoder quirk
+            // or another bit-alignment bug elsewhere in the parser. The
+            // 480:271 quirk that kicked off the audit is already handled
+            // by the snap-to-canonical pass in `format_aspect_ratio`,
+            // and the failure mode of the spec-correct read (no SPS
+            // values at all) is strictly worse than the 480:271 one.
+            // Leaving the over-read in place pending a deeper SPS
+            // parser audit / replacement with a tested upstream parser.
             if br.read_bits(32).is_none() || br.read_bits(32).is_none() ||
                br.read_bits(16).is_none() || br.read_bits(32).is_none() {
                 return false;
@@ -596,14 +610,28 @@ fn format_aspect_ratio(pic_w: u32, pic_h: u32, sar_w: u32, sar_h: u32) -> Option
     let g = gcd(dar_w, dar_h);
     let n = dar_w / g;
     let d = dar_h / g;
-    // Snap to well-known labels.
-    match (n, d) {
-        (16, 9) => Some("16:9".into()),
-        (4, 3) => Some("4:3".into()),
-        (21, 9) => Some("21:9".into()),
-        (256, 135) => Some("17:9 (DCI)".into()),
-        _ => Some(format!("{}:{}", n, d)),
+    // Snap to well-known labels — exact match first, then a tolerance
+    // pass for SPS conformance-window quirks (e.g. some 4K HEVC encoders
+    // pad coded_height to a CTB boundary and over-report the crop, so the
+    // raw ratio comes out 480:271 even though ffprobe reads 16:9 cleanly
+    // off the same SPS). 0.5% is tight enough that genuine 1.85:1
+    // theatrical or 5:3 boutique ratios still print exactly.
+    let ratio = n as f64 / d as f64;
+    const TOLERANCE: f64 = 0.005;
+    let snaps: &[(f64, &str)] = &[
+        (16.0 / 9.0, "16:9"),
+        (4.0 / 3.0, "4:3"),
+        (21.0 / 9.0, "21:9"),
+        (256.0 / 135.0, "17:9 (DCI)"),
+        (1.85, "1.85:1"),
+        (2.39, "2.39:1"),
+    ];
+    for &(target, label) in snaps {
+        if (ratio - target).abs() / target < TOLERANCE {
+            return Some(label.into());
+        }
     }
+    Some(format!("{}:{}", n, d))
 }
 
 fn gcd(a: u32, b: u32) -> u32 {

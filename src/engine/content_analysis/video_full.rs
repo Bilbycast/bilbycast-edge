@@ -42,6 +42,14 @@ use crate::engine::ts_parse::{strip_rtp_header, TS_PACKET_SIZE, TS_SYNC_BYTE};
 const DEFAULT_HZ: f32 = 1.0;
 const MAX_HZ: f32 = 30.0;
 /// Keep ~2 s of TS at 10 Mbps (~2.5 MB). Plenty of runway for one keyframe.
+/// Held at 3 MB — about 1.5 s of 4K HEVC at 15-20 Mbps. A larger ring
+/// was tried and produced strictly worse results because libavcodec's
+/// `send_packet` interface expects one access unit at a time; feeding
+/// many seconds of bitstream in one shot confuses the decoder and
+/// produces zero frames. The proper fix is to slice the ring into
+/// individual AUs (find IDR + accompanying params, feed only that AU's
+/// NAL units), but that's a larger rewrite — tracked as known
+/// limitation.
 const TS_BUFFER_CAP: usize = 3 * 1024 * 1024;
 /// Black-edge detection threshold — row/col is "black" when mean Y ≤ this.
 const BLACK_Y_THRESHOLD: u8 = 20;
@@ -199,7 +207,9 @@ impl VideoFullState {
         // Decode + metrics run on the current thread via block_in_place so
         // the tokio reactor isn't blocked. Keep the critical section small:
         // we only produce `FrameMetrics` + an updated `YPlane`.
-        let (metrics, new_y) = tokio::task::block_in_place(|| decode_and_metrics(&ts_snapshot, prev_y.as_ref()));
+        let (metrics, new_y) = tokio::task::block_in_place(|| {
+            decode_and_metrics(&ts_snapshot, prev_y.as_ref())
+        });
 
         if let Some(y) = new_y {
             self.prev_y = Some(y);
@@ -245,7 +255,17 @@ impl VideoFullState {
                 self.freeze_active = false;
             }
         }
-        self.last_metrics = metrics;
+        // Only overwrite `last_metrics` on a successful decode. Without
+        // this, every failed sample (decoder needs a fresh IDR + SPS/PPS,
+        // which only land every 1-2 GoPs at 1 Hz sample cadence) wipes
+        // the snapshot to all-zeros — width/height/mean_y all read 0 in
+        // the live API even though earlier samples decoded fine. Failed
+        // samples are still counted (`samples_taken` advances) so the
+        // ratio `samples_decoded / samples_taken` still reflects decoder
+        // health.
+        if metrics.is_some() {
+            self.last_metrics = metrics;
+        }
     }
 
     fn snapshot(&self, hz: f64) -> serde_json::Value {

@@ -31,8 +31,34 @@ const SYNC_REGAIN_THRESHOLD: u32 = 5;
 
 /// Maximum allowed PCR discontinuity in 27 MHz ticks (100 ms).
 const PCR_DISCONTINUITY_THRESHOLD: u64 = 27_000_000 / 10; // 2_700_000
-/// Maximum allowed PCR jitter in nanoseconds (500 ns).
-const PCR_JITTER_THRESHOLD_NS: u64 = 500;
+/// PCR_AC residual threshold in nanoseconds. The TR-101290 §5.2.2 PCR_AC
+/// spec is ±500 ns — but that's the encoder's deviation against an
+/// idealised 27 MHz reference clock, measured at the encoder bench. A
+/// downstream receiver doesn't have an idealised reference: it has the
+/// host wall clock plus arbitrary network / SRT-jitter-buffer / scheduler
+/// jitter on packet arrival.
+///
+/// We fit a least-squares line through a sliding window of (PCR, wall)
+/// samples and measure each new sample's residual against it. Slope
+/// absorbs encoder↔host rate skew, intercept absorbs mean network delay.
+/// What's *not* absorbed is per-sample wall-clock jitter — and that's
+/// directly bounded by the upstream jitter (10s of ms on a real SRT
+/// path with TSBPD release patterns). Setting the threshold below that
+/// floor flags every PCR even on a clean stream.
+///
+/// 100 ms catches genuine encoder/PCR-source failures (which produce
+/// residuals ≥ hundreds of ms or PCR leaps) without firing on normal
+/// receive-side jitter. For tightly-controlled local paths a follow-up
+/// could derive an adaptive threshold from the EWMA wall-jitter band
+/// rather than this fixed value.
+const PCR_JITTER_THRESHOLD_NS: u64 = 100_000_000;
+/// Sliding-window length for the PCR regression (per PCR-bearing PID).
+/// At a typical PCR cadence of ~25 Hz, 16 samples is ~640 ms — enough to
+/// average out short bursts without lagging real rate drift.
+pub(crate) const PCR_HISTORY_LEN: usize = 16;
+/// Minimum samples required before the regression residual is meaningful.
+/// Below this the accuracy check is skipped.
+const PCR_HISTORY_MIN: usize = 4;
 
 /// PAT / PMT must appear at least every 500 ms per TR-101290.
 const PAT_PMT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -72,19 +98,27 @@ const RST_TIMEOUT: Duration = Duration::from_millis(60_000);
 // ── Analyzer Task ──────────────────────────────────────────────────────────
 
 /// Spawn the TR-101290 analyzer as an independent broadcast subscriber.
+///
+/// Optionally receives the flow's `active_input_rx` watch — when present,
+/// the analyzer resets its IAT/PDV running stats on every active-input
+/// change so the inter-input silence gap doesn't poison the min/max/EWMA.
+/// (Per-PID PSI/PCR/PTS trackers are managed by `extract_es_pids_from_pmt`
+/// via PMT-driven `.retain` calls, so they don't need a separate reset.)
 pub fn spawn_tr101290_analyzer(
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     stats: Arc<Tr101290Accumulator>,
     cancel: CancellationToken,
+    active_input_rx: Option<tokio::sync::watch::Receiver<String>>,
 ) -> JoinHandle<()> {
     let rx = broadcast_tx.subscribe();
-    tokio::spawn(tr101290_analyzer_loop(rx, stats, cancel))
+    tokio::spawn(tr101290_analyzer_loop(rx, stats, cancel, active_input_rx))
 }
 
 async fn tr101290_analyzer_loop(
     mut rx: broadcast::Receiver<RtpPacket>,
     stats: Arc<Tr101290Accumulator>,
     cancel: CancellationToken,
+    active_input_rx: Option<tokio::sync::watch::Receiver<String>>,
 ) {
     tracing::info!("TR-101290 analyzer started");
 
@@ -93,7 +127,28 @@ async fn tr101290_analyzer_loop(
     // happens after 500 ms of data collection.
     interval.tick().await;
 
+    // The watch is held in an Option but `tokio::select!` needs a concrete
+    // future on every arm. Box-ed dyn future indirection keeps the loop
+    // tidy and the no-watch case (non-TS or test paths) free of overhead.
+    let mut maybe_rx = active_input_rx;
+    if let Some(ref mut r) = maybe_rx {
+        // Mark current value as seen so the first changed() doesn't fire
+        // on startup.
+        r.mark_changed();
+        let _ = r.borrow_and_update();
+    }
+
     loop {
+        let switch_fut = async {
+            match maybe_rx {
+                Some(ref mut r) => match r.changed().await {
+                    Ok(()) => Some(r.borrow_and_update().clone()),
+                    Err(_) => std::future::pending::<Option<String>>().await,
+                },
+                None => std::future::pending::<Option<String>>().await,
+            }
+        };
+
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("TR-101290 analyzer stopping (cancelled)");
@@ -102,6 +157,23 @@ async fn tr101290_analyzer_loop(
 
             _ = interval.tick() => {
                 check_pat_pmt_timeouts(&stats);
+            }
+
+            new_id = switch_fut => {
+                if let Some(id) = new_id {
+                    let mut state = stats.state.lock().unwrap();
+                    state.last_recv_time_us = None;
+                    state.last_rtp_timestamp = None;
+                    state.iat_min_us = f64::MAX;
+                    state.iat_max_us = 0.0;
+                    state.iat_sum_us = 0.0;
+                    state.iat_count = 0;
+                    state.jitter_us = 0.0;
+                    drop(state);
+                    tracing::info!(
+                        "TR-101290 analyzer: reset IAT/PDV running stats for new active input '{id}'"
+                    );
+                }
             }
 
             result = rx.recv() => {
@@ -258,6 +330,9 @@ fn process_ts_packet(
     if pid == PAT_PID {
         state.last_pat_time = Some(now);
         state.pat_seen = true;
+        if state.first_pat_time.is_none() {
+            state.first_pat_time = Some(now);
+        }
 
         if ts_pusi(pkt) {
             stats.pat_count.fetch_add(1, Ordering::Relaxed);
@@ -278,12 +353,15 @@ fn process_ts_packet(
             // Remove PMT PIDs no longer referenced by PAT
             let pmt_set: std::collections::HashSet<u16> = pmt_pids.into_iter().collect();
             state.pmt_pids.retain(|pid, _| pmt_set.contains(pid));
+            state.pmt_errored.retain(|pid| pmt_set.contains(pid));
         }
     }
 
     // ── 5. PMT handling ──
     if state.pmt_pids.contains_key(&pid) {
         state.pmt_pids.insert(pid, Some(now));
+        // PMT PID was just seen on the wire — clear any stale error latch.
+        state.pmt_errored.remove(&pid);
         if ts_pusi(pkt) {
             stats.pmt_count.fetch_add(1, Ordering::Relaxed);
 
@@ -305,71 +383,79 @@ fn process_ts_packet(
     // ── 5b. Track ES PID presence for PID error check (Priority 1) ──
     if state.es_pids.contains_key(&pid) {
         state.es_pids.insert(pid, Some(now));
+        state.es_errored.remove(&pid);
     }
 
     // ── 6. PCR checks ──
     if let Some(pcr_value) = extract_pcr(pkt) {
         // When discontinuity_indicator is set, the PCR jump is expected
         // (e.g., stream switch) — skip discontinuity and accuracy checks
-        // but still update the tracker for subsequent packets.
+        // but still reset the tracker for subsequent packets.
         let discontinuity_expected = ts_discontinuity_indicator(pkt);
 
-        if let Some(prev) = state.pcr_tracker.get(&pid) {
-            if !discontinuity_expected {
-                // PCR discontinuity: jump > 100ms or backwards
-                let pcr_delta = if pcr_value >= prev.last_pcr_value {
-                    pcr_value - prev.last_pcr_value
-                } else {
-                    // PCR went backwards
+        if discontinuity_expected {
+            // Restart the regression window; the rate before the
+            // discontinuity is meaningless once the source clock leaps.
+            state.pcr_tracker.remove(&pid);
+        } else if let Some(prev) = state.pcr_tracker.get(&pid) {
+            // ── Discontinuity check (jump > 100 ms or backwards) ──
+            if pcr_value >= prev.last_pcr_value {
+                let pcr_delta = pcr_value - prev.last_pcr_value;
+                if pcr_delta > PCR_DISCONTINUITY_THRESHOLD {
                     stats
                         .pcr_discontinuity_errors
                         .fetch_add(1, Ordering::Relaxed);
                     stats
                         .window_pcr_discontinuity_errors
                         .fetch_add(1, Ordering::Relaxed);
-                    0 // Skip accuracy check for backwards PCR
-                };
+                }
+            } else {
+                stats
+                    .pcr_discontinuity_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                stats
+                    .window_pcr_discontinuity_errors
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
 
-                if pcr_delta > 0 {
-                    if pcr_delta > PCR_DISCONTINUITY_THRESHOLD {
-                        stats
-                            .pcr_discontinuity_errors
-                            .fetch_add(1, Ordering::Relaxed);
-                        stats
-                            .window_pcr_discontinuity_errors
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
+        // ── Accuracy check via least-squares regression on a sliding
+        //    window of (pcr_27mhz, wall_us_since_anchor) samples ──
+        //
+        // Fit pcr ≈ a · wall + b across the window, then measure the
+        // residual of the new sample against the line. The slope `a`
+        // absorbs encoder↔host rate skew, the intercept `b` absorbs the
+        // mean network delay; what's left is the per-sample deviation —
+        // i.e. PCR_AC, modulo the wall-clock's own ~µs jitter.
+        let entry = state.pcr_tracker.entry(pid).or_insert_with(|| PcrState {
+            last_pcr_value: pcr_value,
+            last_pcr_wall_time: now,
+            history: std::collections::VecDeque::with_capacity(PCR_HISTORY_LEN),
+            history_anchor: now,
+        });
 
-                    // PCR accuracy: compare PCR delta to wall-clock delta
-                    let wall_delta = now.duration_since(prev.last_pcr_wall_time);
-                    let wall_delta_27mhz =
-                        wall_delta.as_secs() * 27_000_000 + wall_delta.subsec_nanos() as u64 * 27 / 1000;
-                    let jitter_27mhz = if pcr_delta > wall_delta_27mhz {
-                        pcr_delta - wall_delta_27mhz
-                    } else {
-                        wall_delta_27mhz - pcr_delta
-                    };
-                    // Convert jitter from 27MHz ticks to nanoseconds: ticks * 1000 / 27
-                    let jitter_ns = jitter_27mhz * 1000 / 27;
-                    if jitter_ns > PCR_JITTER_THRESHOLD_NS {
-                        stats
-                            .pcr_accuracy_errors
-                            .fetch_add(1, Ordering::Relaxed);
-                        stats
-                            .window_pcr_accuracy_errors
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
+        let wall_us = now.duration_since(entry.history_anchor).as_micros() as u64;
+        if entry.history.len() >= PCR_HISTORY_MIN && !discontinuity_expected {
+            if let Some(residual_ns) = pcr_residual_ns(&entry.history, pcr_value, wall_us) {
+                if residual_ns > PCR_JITTER_THRESHOLD_NS {
+                    stats
+                        .pcr_accuracy_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    stats
+                        .window_pcr_accuracy_errors
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
 
-        state.pcr_tracker.insert(
-            pid,
-            PcrState {
-                last_pcr_value: pcr_value,
-                last_pcr_wall_time: now,
-            },
-        );
+        // Append the new sample, bounded.
+        if entry.history.len() == PCR_HISTORY_LEN {
+            entry.history.pop_front();
+        }
+        entry.history.push_back((pcr_value, wall_us));
+        entry.last_pcr_value = pcr_value;
+        entry.last_pcr_wall_time = now;
+
         // PCR repetition (P2 — split from `pcr_discontinuity_errors`).
         // Repetition counts the *absence* of a PCR within 100 ms, while
         // discontinuity counts unexpected jumps when one is present.
@@ -377,6 +463,7 @@ fn process_ts_packet(
         // distinct fields so the manager UI can highlight a stalled PCR
         // source separately from a PCR jump.
         state.pcr_repetition_tracker.insert(pid, now);
+        state.pcr_repetition_errored.remove(&pid);
     }
 
     // ── 7. PSI / SI table tracking (P2-extended + P3) ──
@@ -453,8 +540,60 @@ fn process_ts_packet(
     if ts_pusi(pkt) && state.es_pids.contains_key(&pid) && ts_has_payload(pkt) {
         if let Some(pts_value) = extract_pes_pts(pkt) {
             state.pts_tracker.insert(pid, (pts_value, now));
+            state.pts_errored.remove(&pid);
         }
     }
+}
+
+/// Compute |residual_ns| of a new (pcr_27mhz, wall_us) sample against the
+/// least-squares regression fit through `history`. Returns `None` if the
+/// regression is degenerate (all wall samples identical, vanishing slope
+/// variance, or implausible result — e.g. a stream-source change the
+/// regression didn't learn yet).
+///
+/// The math: fit pcr_i ≈ a · wall_i + b across the window using
+/// closed-form OLS, then residual = new_pcr - (a · new_wall + b). All
+/// arithmetic is f64 — the window is small (≤ 16 samples) so precision
+/// is not a concern.
+fn pcr_residual_ns(
+    history: &std::collections::VecDeque<(u64, u64)>,
+    new_pcr: u64,
+    new_wall_us: u64,
+) -> Option<u64> {
+    let n = history.len() as f64;
+    if n < 2.0 {
+        return None;
+    }
+    let mut sum_x = 0.0_f64;
+    let mut sum_y = 0.0_f64;
+    let mut sum_xx = 0.0_f64;
+    let mut sum_xy = 0.0_f64;
+    for &(pcr, wall) in history.iter() {
+        let x = wall as f64;
+        let y = pcr as f64;
+        sum_x += x;
+        sum_y += y;
+        sum_xx += x * x;
+        sum_xy += x * y;
+    }
+    let denom = n * sum_xx - sum_x * sum_x;
+    if denom.abs() < 1e-6 {
+        // All wall samples coincide — can't infer a rate.
+        return None;
+    }
+    let a = (n * sum_xy - sum_x * sum_y) / denom;
+    let b = (sum_y - a * sum_x) / n;
+    let predicted = a * (new_wall_us as f64) + b;
+    let residual_ticks = (new_pcr as f64) - predicted;
+    // Convert from 27 MHz ticks to nanoseconds: 1 tick = 1000/27 ns.
+    let residual_ns = (residual_ticks.abs() * 1000.0 / 27.0).round();
+    // Implausibly large residuals (> 1 s) usually mean the regression
+    // hasn't caught up with a stream-source change — treat as
+    // unmeasurable rather than tagging an error.
+    if residual_ns > 1_000_000_000.0 {
+        return None;
+    }
+    Some(residual_ns as u64)
 }
 
 /// Extract a PTS value from a PUSI-marked TS packet that begins a PES
@@ -564,8 +703,31 @@ fn extract_es_pids_from_pmt(pkt: &[u8], state: &mut crate::stats::collector::Tr1
         state.es_pids.entry(es_pid).or_insert(None);
         pos += 5 + es_info_length;
     }
-    // Remove ES PIDs no longer referenced by this PMT
+    // Remove ES PIDs no longer referenced by this PMT.
     state.es_pids.retain(|pid, _| new_es_pids.contains(pid));
+    // Prune the per-ES-PID stateful trackers in lock-step. Without this, an
+    // input switch (or any PMT update that drops a PID) leaves stale entries
+    // in `pts_tracker` and `pcr_repetition_tracker` that fire timeout errors
+    // forever in the 500 ms sweep, manifesting as a steady ~2 errors/sec/
+    // orphan on `pts_errors` / `pcr_repetition_errors` even when the live
+    // stream is clean. `pcr_tracker` is pruned too so the regression window
+    // resets cleanly if a PCR-bearing PID disappears and later reappears.
+    // `cc_tracker` is intentionally NOT pruned here because it also tracks
+    // PAT/PMT/NIT/SDT continuity, which are not in `new_es_pids`.
+    state.pts_tracker.retain(|pid, _| new_es_pids.contains(pid));
+    state
+        .pcr_repetition_tracker
+        .retain(|pid, _| new_es_pids.contains(pid));
+    state
+        .pcr_tracker
+        .retain(|pid, _| new_es_pids.contains(pid));
+    // Drop error latches for PIDs that are no longer referenced; if they
+    // ever come back, they get a fresh chance to fire one error.
+    state.es_errored.retain(|pid| new_es_pids.contains(pid));
+    state.pts_errored.retain(|pid| new_es_pids.contains(pid));
+    state
+        .pcr_repetition_errored
+        .retain(|pid| new_es_pids.contains(pid));
 }
 
 /// VSF TR-07 detection: scan a PMT section for JPEG XS stream type (0x61).
@@ -631,8 +793,17 @@ fn detect_jpeg_xs_in_pmt(pkt: &[u8], state: &mut crate::stats::collector::Tr1012
 
 /// Periodic check: flag PAT/PMT timeout errors if they haven't arrived
 /// within the required 500 ms interval.
+///
+/// Each per-PID timeout (PMT-PID, ES-PID, PCR-repetition, PTS) latches
+/// after firing once: it does not re-fire on the next sweep until the PID
+/// has been observed again on the wire. Without that latch, every stale
+/// or never-yet-seen entry produces 2 errors/sec/orphan indefinitely —
+/// the dominant source of `pat_errors` / `pmt_errors` / `pid_errors` /
+/// `pts_errors` / `pcr_repetition_errors` over-counting on healthy
+/// streams. A startup grace of 2 × PAT_PMT_TIMEOUT after the first PAT
+/// gives newly-registered PIDs a chance to arrive before they're tagged.
 fn check_pat_pmt_timeouts(stats: &Tr101290Accumulator) {
-    let state = stats.state.lock().unwrap();
+    let mut state = stats.state.lock().unwrap();
     let now = Instant::now();
 
     // Only check timeouts after we've seen at least one PAT (avoid false
@@ -641,67 +812,108 @@ fn check_pat_pmt_timeouts(stats: &Tr101290Accumulator) {
         return;
     }
 
-    // PAT timeout
+    let startup_grace_elapsed = state
+        .first_pat_time
+        .map_or(false, |t| now.duration_since(t) > PAT_PMT_TIMEOUT * 2);
+
+    // PAT timeout — singleton, no per-PID latch needed; just only fire
+    // once per stall window.
     if let Some(last) = state.last_pat_time {
         if now.duration_since(last) > PAT_PMT_TIMEOUT {
+            // Fire once per stall window: re-anchor `last_pat_time` to now
+            // so the next PAT_PMT_TIMEOUT must elapse before we count again.
             stats.pat_errors.fetch_add(1, Ordering::Relaxed);
             stats.window_pat_errors.fetch_add(1, Ordering::Relaxed);
+            state.last_pat_time = Some(now);
         }
     }
 
-    // PMT timeouts
-    for (_, last_time) in &state.pmt_pids {
-        match last_time {
-            Some(t) if now.duration_since(*t) > PAT_PMT_TIMEOUT => {
-                stats.pmt_errors.fetch_add(1, Ordering::Relaxed);
-                stats.window_pmt_errors.fetch_add(1, Ordering::Relaxed);
+    // PMT timeouts — latched.
+    let pmt_stale: Vec<u16> = state
+        .pmt_pids
+        .iter()
+        .filter_map(|(pid, last_time)| {
+            if state.pmt_errored.contains(pid) {
+                return None;
             }
-            None => {
-                // PMT PID discovered in PAT but never seen yet — count as error
-                // only if we've been running long enough (PAT was already seen)
-                stats.pmt_errors.fetch_add(1, Ordering::Relaxed);
-                stats.window_pmt_errors.fetch_add(1, Ordering::Relaxed);
+            match last_time {
+                Some(t) if now.duration_since(*t) > PAT_PMT_TIMEOUT => Some(*pid),
+                None if startup_grace_elapsed => Some(*pid),
+                _ => None,
             }
-            _ => {}
-        }
+        })
+        .collect();
+    for pid in pmt_stale {
+        stats.pmt_errors.fetch_add(1, Ordering::Relaxed);
+        stats.window_pmt_errors.fetch_add(1, Ordering::Relaxed);
+        state.pmt_errored.insert(pid);
     }
 
-    // PID error check (Priority 1): ES PIDs referenced in PMT must appear
-    for (_, last_time) in &state.es_pids {
-        match last_time {
-            Some(t) if now.duration_since(*t) > PAT_PMT_TIMEOUT => {
-                stats.pid_errors.fetch_add(1, Ordering::Relaxed);
-                stats.window_pid_errors.fetch_add(1, Ordering::Relaxed);
+    // PID error check (Priority 1): ES PIDs referenced in PMT must appear.
+    // Latched.
+    let es_stale: Vec<u16> = state
+        .es_pids
+        .iter()
+        .filter_map(|(pid, last_time)| {
+            if state.es_errored.contains(pid) {
+                return None;
             }
-            None => {
-                // ES PID discovered in PMT but never seen yet
-                stats.pid_errors.fetch_add(1, Ordering::Relaxed);
-                stats.window_pid_errors.fetch_add(1, Ordering::Relaxed);
+            match last_time {
+                Some(t) if now.duration_since(*t) > PAT_PMT_TIMEOUT => Some(*pid),
+                None if startup_grace_elapsed => Some(*pid),
+                _ => None,
             }
-            _ => {}
-        }
+        })
+        .collect();
+    for pid in es_stale {
+        stats.pid_errors.fetch_add(1, Ordering::Relaxed);
+        stats.window_pid_errors.fetch_add(1, Ordering::Relaxed);
+        state.es_errored.insert(pid);
     }
 
     // ── P2-extended timeouts ──
     // PCR repetition (§5.2.2): a PCR-bearing PID must emit a PCR within
-    // 100 ms of the previous one. Splitting from `pcr_discontinuity_errors`
-    // so the manager UI can distinguish "PCR stalled" from "PCR jumped".
-    for (_, last_pcr_wall) in &state.pcr_repetition_tracker {
-        if now.duration_since(*last_pcr_wall) > PCR_REPETITION_TIMEOUT {
-            stats.pcr_repetition_errors.fetch_add(1, Ordering::Relaxed);
-            stats
-                .window_pcr_repetition_errors
-                .fetch_add(1, Ordering::Relaxed);
-        }
+    // 100 ms of the previous one. Latched the same way as `pid_errors`.
+    let pcr_rep_stale: Vec<u16> = state
+        .pcr_repetition_tracker
+        .iter()
+        .filter_map(|(pid, last)| {
+            if state.pcr_repetition_errored.contains(pid) {
+                None
+            } else if now.duration_since(*last) > PCR_REPETITION_TIMEOUT {
+                Some(*pid)
+            } else {
+                None
+            }
+        })
+        .collect();
+    for pid in pcr_rep_stale {
+        stats.pcr_repetition_errors.fetch_add(1, Ordering::Relaxed);
+        stats
+            .window_pcr_repetition_errors
+            .fetch_add(1, Ordering::Relaxed);
+        state.pcr_repetition_errored.insert(pid);
     }
 
     // PTS error (§5.2.1): every PES PID that has produced a PTS once
-    // must keep producing one within 700 ms.
-    for (_, (_pts, last_seen)) in &state.pts_tracker {
-        if now.duration_since(*last_seen) > PTS_TIMEOUT {
-            stats.pts_errors.fetch_add(1, Ordering::Relaxed);
-            stats.window_pts_errors.fetch_add(1, Ordering::Relaxed);
-        }
+    // must keep producing one within 700 ms. Latched.
+    let pts_stale: Vec<u16> = state
+        .pts_tracker
+        .iter()
+        .filter_map(|(pid, (_pts, last_seen))| {
+            if state.pts_errored.contains(pid) {
+                None
+            } else if now.duration_since(*last_seen) > PTS_TIMEOUT {
+                Some(*pid)
+            } else {
+                None
+            }
+        })
+        .collect();
+    for pid in pts_stale {
+        stats.pts_errors.fetch_add(1, Ordering::Relaxed);
+        stats.window_pts_errors.fetch_add(1, Ordering::Relaxed);
+        state.pts_errored.insert(pid);
     }
 
     // CAT error (§5.2.4): once observed, must repeat within 500 ms.
@@ -1091,5 +1303,104 @@ mod tests {
         // Sanity: the worst-case acceptable sample is clamped to 1 s.
         let d_clamped = jitter_step_fixed(0, 5_000_000, 0, 0).unwrap();
         assert!(d_clamped <= 1_000_000.0);
+    }
+
+    // ── PCR accuracy regression — ingress side ─────────────────────────
+    //
+    // The old per-pair `pcr_delta_27mhz` vs `wall_delta_27mhz` test fired
+    // on every PCR-bearing packet of any real receive-side stream because
+    // network/scheduler jitter is intrinsically µs–ms while the threshold
+    // was 500 ns. The new check fits a least-squares line through a small
+    // window of (pcr, wall) samples and measures the residual of the
+    // newest sample against the line — slope absorbs encoder↔host rate
+    // skew, intercept absorbs mean network delay.
+
+    #[test]
+    fn pcr_residual_perfect_constant_rate() {
+        // 25 PCRs/sec at exactly 27 MHz wall-rate: residual must be 0.
+        let mut h: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
+        for i in 0..PCR_HISTORY_LEN as u64 {
+            // PCR cadence = 40 ms = 1_080_000 ticks; wall cadence = 40 ms.
+            h.push_back((i * 1_080_000, i * 40_000));
+        }
+        let next_pcr = (PCR_HISTORY_LEN as u64) * 1_080_000;
+        let next_wall = (PCR_HISTORY_LEN as u64) * 40_000;
+        let r = pcr_residual_ns(&h, next_pcr, next_wall).unwrap();
+        assert!(r < 100, "perfect stream should have ~0 ns residual, got {r}");
+    }
+
+    #[test]
+    fn pcr_residual_constant_offset_absorbed() {
+        // Same constant rate as above, but every wall sample is offset
+        // by +50 ms — mimics a long-tail constant-delay network path.
+        // The intercept absorbs it; residual stays small.
+        let mut h: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
+        for i in 0..PCR_HISTORY_LEN as u64 {
+            h.push_back((i * 1_080_000, i * 40_000 + 50_000));
+        }
+        let next_pcr = (PCR_HISTORY_LEN as u64) * 1_080_000;
+        let next_wall = (PCR_HISTORY_LEN as u64) * 40_000 + 50_000;
+        let r = pcr_residual_ns(&h, next_pcr, next_wall).unwrap();
+        assert!(r < 100, "constant delay should be absorbed, got {r}");
+    }
+
+    #[test]
+    fn pcr_residual_constant_rate_skew_absorbed() {
+        // Encoder runs at 27 MHz, host wall runs slow (only ~26.95 MHz
+        // effective). The slope absorbs the skew; residual stays small.
+        let mut h: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
+        for i in 0..PCR_HISTORY_LEN as u64 {
+            // PCR advances 1_080_000 / sample; wall advances 40_080 µs
+            // (0.2% slow) — pure skew, no jitter.
+            h.push_back((i * 1_080_000, i * 40_080));
+        }
+        let next_pcr = (PCR_HISTORY_LEN as u64) * 1_080_000;
+        let next_wall = (PCR_HISTORY_LEN as u64) * 40_080;
+        let r = pcr_residual_ns(&h, next_pcr, next_wall).unwrap();
+        assert!(r < 100, "constant skew should be absorbed, got {r}");
+    }
+
+    #[test]
+    fn pcr_residual_flags_real_jitter() {
+        // Build a clean window, then feed a sample that arrives 200 ms
+        // late — a real PCR_AC violation that should fire even at the
+        // receiver-jitter-tolerant 100 ms threshold.
+        let mut h: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
+        for i in 0..PCR_HISTORY_LEN as u64 {
+            h.push_back((i * 1_080_000, i * 40_000));
+        }
+        let next_pcr = (PCR_HISTORY_LEN as u64) * 1_080_000;
+        let next_wall = (PCR_HISTORY_LEN as u64) * 40_000 + 200_000;
+        let r = pcr_residual_ns(&h, next_pcr, next_wall).unwrap();
+        // 200 ms wall offset on a perfectly-rated stream → residual ≈ 200 ms.
+        assert!(
+            (180_000_000..=220_000_000).contains(&r),
+            "expected ~200 ms residual, got {r}"
+        );
+        assert!(r > PCR_JITTER_THRESHOLD_NS, "200 ms must trip the threshold");
+    }
+
+    #[test]
+    fn pcr_residual_too_few_samples() {
+        let mut h: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
+        h.push_back((0, 0));
+        // Single-sample regression: undefined slope.
+        assert!(pcr_residual_ns(&h, 1_080_000, 40_000).is_none());
+    }
+
+    #[test]
+    fn pcr_residual_implausibly_large_returns_none() {
+        // Stream-source change before the regression has caught up:
+        // huge PCR jump, huge wall delta. The residual can be > 1 s in
+        // 27 MHz tick space; the helper bails so we don't tag a fake
+        // accuracy error during the catch-up window.
+        let mut h: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
+        for i in 0..PCR_HISTORY_LEN as u64 {
+            h.push_back((i * 1_080_000, i * 40_000));
+        }
+        // PCR jumps 100 s ahead with no matching wall jump.
+        let next_pcr = 2_700_000_000_u64;
+        let next_wall = (PCR_HISTORY_LEN as u64) * 40_000;
+        assert_eq!(pcr_residual_ns(&h, next_pcr, next_wall), None);
     }
 }

@@ -278,6 +278,15 @@ async fn media_analyzer_loop(
 }
 
 /// Calculate per-PID bitrates from accumulated byte counters.
+///
+/// Bitrates are EWMA-smoothed across the 1-second sampling cadence so the
+/// snapshot doesn't swing 11 → 19 Mbps tick-to-tick on a real broadcast
+/// stream that's fundamentally constant-rate but bursty at the packet
+/// level (IDR-frame surges, GoP boundaries, SRT jitter-buffer release
+/// patterns). The raw single-tick value is the noisy 1 s window; the
+/// EWMA gives a stable readout that converges to the encoder's true
+/// target rate within ~10 s while still reacting quickly to genuine
+/// step-changes (e.g. operator bumps the encoder bitrate).
 fn calculate_bitrates(stats: &MediaAnalysisAccumulator) {
     let mut state = stats.state.lock().unwrap();
     let now = Instant::now();
@@ -288,15 +297,43 @@ fn calculate_bitrates(stats: &MediaAnalysisAccumulator) {
         return; // Too soon
     }
 
-    // Compute bitrates from byte counters, then reset
+    // Compute bitrates from byte counters, then reset.
     let pid_bytes: Vec<(u16, u64)> = state.pid_bytes.drain().collect();
-    let mut total = 0u64;
+    // Smoothing factor: ≈ 1/8 weight on the freshest sample. At 1 Hz
+    // sampling that's a τ ≈ 8 s — short enough to track real changes,
+    // long enough to flatten the bursty 1 s window.
+    const ALPHA: f64 = 0.125;
+    // PIDs whose count is missing this tick are also EWMA-stepped toward
+    // zero (they may have genuinely stopped). Build the union so a PID
+    // that briefly lags into the next tick doesn't get its EWMA frozen.
+    let mut updated: std::collections::HashSet<u16> = std::collections::HashSet::new();
     for (pid, bytes) in pid_bytes {
-        let bits = (bytes as f64 * 8.0 / elapsed_secs) as u64;
-        state.pid_bitrates.insert(pid, bits);
-        total += bits;
+        let raw = (bytes as f64 * 8.0 / elapsed_secs) as u64;
+        let smoothed = match state.pid_bitrates.get(&pid).copied() {
+            Some(prev) if prev > 0 => {
+                (prev as f64 * (1.0 - ALPHA) + raw as f64 * ALPHA) as u64
+            }
+            _ => raw,
+        };
+        state.pid_bitrates.insert(pid, smoothed);
+        updated.insert(pid);
     }
-    state.total_bitrate_bps = total;
+    // Decay PIDs we tracked previously but didn't see this tick.
+    let known_pids: Vec<u16> = state.pid_bitrates.keys().copied().collect();
+    for pid in known_pids {
+        if !updated.contains(&pid) {
+            if let Some(prev) = state.pid_bitrates.get(&pid).copied() {
+                let decayed = (prev as f64 * (1.0 - ALPHA)) as u64;
+                state.pid_bitrates.insert(pid, decayed);
+            }
+        }
+    }
+    // Total reflects the full smoothed PID set, not only what the lock
+    // observed in the latest tick — the legacy "sum this-tick's drained
+    // bytes" approach swung wildly when the broadcast subscriber lagged
+    // a single PID into the next tick (snapshot would briefly read
+    // ~30 kbps for a 14 Mbps stream).
+    state.total_bitrate_bps = state.pid_bitrates.values().copied().sum();
     state.last_bitrate_calc = now;
 }
 

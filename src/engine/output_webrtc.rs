@@ -842,7 +842,7 @@ async fn whep_viewer_loop(
                                         events,
                                     ).await;
                                 }
-                                super::webrtc::ts_demux::DemuxedFrame::Opus => {
+                                super::webrtc::ts_demux::DemuxedFrame::Opus { .. } => {
                                     // Native Opus passthrough (input already
                                     // publishing Opus-in-TS) is not yet wired
                                     // through the str0m audio path. The frame
@@ -1325,7 +1325,7 @@ async fn whip_client_loop(
                                             events,
                                         ).await;
                                     }
-                                    super::webrtc::ts_demux::DemuxedFrame::Opus => {
+                                    super::webrtc::ts_demux::DemuxedFrame::Opus { .. } => {
                                         // Native Opus passthrough not yet implemented
                                     }
                                     super::webrtc::ts_demux::DemuxedFrame::Aac { data, pts } => {
