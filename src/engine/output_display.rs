@@ -34,7 +34,7 @@
 
 #![cfg(all(feature = "display", target_os = "linux"))]
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -86,6 +86,7 @@ pub fn spawn_display_output(
     cancel: CancellationToken,
     event_sender: EventSender,
     flow_id: String,
+    claim_registry: Arc<crate::display::claim_registry::DisplayClaimRegistry>,
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
     tokio::spawn(async move {
@@ -96,6 +97,7 @@ pub fn spawn_display_output(
             cancel,
             event_sender,
             flow_id,
+            claim_registry,
         )
         .await
         {
@@ -113,8 +115,87 @@ async fn run_display_output(
     cancel: CancellationToken,
     event_sender: EventSender,
     flow_id: String,
+    claim_registry: Arc<crate::display::claim_registry::DisplayClaimRegistry>,
 ) -> Result<()> {
-    // 0. Resolve the operator's hardware-decode preference against the
+    use crate::display::claim_registry::{ClaimKey, ClaimOutcome};
+
+    // 0. Acquire the per-edge runtime claim on this `(device, audio_device)`
+    //    pair. KMS only lets one master lease a connector and ALSA only
+    //    lets one writer hold the PCM device, so two outputs targeting
+    //    the same pair must serialise. The first to start wins; the
+    //    others park here in FCFS order until the holder releases or
+    //    their per-output cancel token fires. The slot is bound BEFORE
+    //    `KmsDisplay::open` so a failed open also releases it for the
+    //    next waiter (`Drop` of the guard hands the slot off atomically
+    //    under the per-key shard lock).
+    let claim_key = ClaimKey::new(config.device.clone(), config.audio_device.clone());
+    let _claim_guard = match claim_registry.try_claim(
+        claim_key.clone(),
+        flow_id.clone(),
+        config.id.clone(),
+        cancel.child_token(),
+    ) {
+        ClaimOutcome::Granted(g) => g,
+        ClaimOutcome::Queued(ticket) => {
+            let info = ticket.info.clone();
+            event_sender.emit_with_details(
+                EventSeverity::Info,
+                "display",
+                format!(
+                    "display output '{}' waiting for {}: held by flow '{}', output '{}' \
+                     (queue position {})",
+                    config.id,
+                    config.device,
+                    info.holder_flow_id.as_deref().unwrap_or("?"),
+                    info.holder_output_id.as_deref().unwrap_or("?"),
+                    info.queue_position,
+                ),
+                Some(&flow_id),
+                serde_json::json!({
+                    "error_code": "display_output_waiting",
+                    "output_id": config.id,
+                    "device": config.device,
+                    "audio_device": config.audio_device.clone().unwrap_or_default(),
+                    "holder_flow_id": info.holder_flow_id,
+                    "holder_output_id": info.holder_output_id,
+                    "queue_position": info.queue_position,
+                }),
+            );
+            match ticket.wait_for_grant().await {
+                Ok(g) => {
+                    event_sender.emit_with_details(
+                        EventSeverity::Info,
+                        "display",
+                        format!(
+                            "display output '{}' acquired {} (was queued behind '{}')",
+                            config.id,
+                            config.device,
+                            info.holder_output_id.as_deref().unwrap_or("?"),
+                        ),
+                        Some(&flow_id),
+                        serde_json::json!({
+                            "error_code": "display_output_acquired",
+                            "output_id": config.id,
+                            "device": config.device,
+                            "audio_device": config.audio_device.clone().unwrap_or_default(),
+                            "previous_holder_flow_id": info.holder_flow_id,
+                            "previous_holder_output_id": info.holder_output_id,
+                        }),
+                    );
+                    g
+                }
+                Err(_) => {
+                    // Cancelled while parked — the per-output cancel token
+                    // fired (flow stop, RemoveOutput, edge shutdown). Clean
+                    // exit; no `display_started` was emitted, so no
+                    // `display_stopped` event is needed either.
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    // 1. Resolve the operator's hardware-decode preference against the
     //    edge's startup-probed capabilities. **Broadcast invariant**:
     //    the display output never goes dark for HW-availability
     //    reasons. `Auto` picks the best HW backend the host can do and
@@ -176,26 +257,108 @@ async fn run_display_output(
     //    The deprecated `config.resolution` / `config.refresh_hz` are
     //    accepted by the deserializer for backward-compat round-trip but
     //    no longer drive the mode-set.
-    let kms = match tokio::task::spawn_blocking({
-        let device = config.device.clone();
-        move || KmsDisplay::open(&device, None, None, None)
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("kms join: {e}"))?
-    {
-        Ok(k) => k,
-        Err(e) => {
-            let msg = e.to_string();
-            let code = classify_kms_error(&msg);
-            emit_event(
-                &event_sender,
-                EventSeverity::Critical,
-                code,
-                &flow_id,
-                &config.id,
-                &format!("display open failed: {msg}"),
-            );
-            return Err(e);
+    //
+    //    **Cross-process serialisation**: the per-edge `DisplayClaimRegistry`
+    //    above only serialises display outputs *within this edge process*.
+    //    Multiple edges on the same host can also contend for the same
+    //    KMS connector — KMS only lets one drm-master hold the CRTC, so
+    //    the second edge's `drmSetMaster` / `drmModeSetCrtc` fails until
+    //    the holder releases. We treat any KMS open failure as a
+    //    transient busy condition and retry with a 500 ms backoff,
+    //    listening on the per-output cancel token. The first attempt
+    //    failure emits `display_output_waiting` with `reason: "kms_busy"`
+    //    so the operator sees the wait through the same UI surface as
+    //    the in-process queue. A successful open after retries emits
+    //    `display_output_acquired`. Cancellation cleanly exits without
+    //    a `display_started`/`display_stopped` pair.
+    let kms = {
+        let mut attempt: u32 = 0;
+        let mut emitted_waiting = false;
+        loop {
+            let device = config.device.clone();
+            let open_res = tokio::task::spawn_blocking(move || {
+                KmsDisplay::open(&device, None, None, None)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("kms join: {e}"))?;
+            match open_res {
+                Ok(k) => {
+                    if emitted_waiting {
+                        event_sender.emit_with_details(
+                            EventSeverity::Info,
+                            "display",
+                            format!(
+                                "display output '{}' acquired {} after {} retry attempt(s)",
+                                config.id, config.device, attempt,
+                            ),
+                            Some(&flow_id),
+                            serde_json::json!({
+                                "error_code": "display_output_acquired",
+                                "output_id": config.id,
+                                "device": config.device,
+                                "audio_device": config.audio_device.clone().unwrap_or_default(),
+                                "reason": "kms_busy_cleared",
+                                "attempts": attempt,
+                            }),
+                        );
+                    }
+                    break k;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let code = classify_kms_error(&msg);
+                    if !emitted_waiting {
+                        // First failure — could be either "busy" (another
+                        // process holds the connector) or a genuine
+                        // configuration problem (wrong connector name,
+                        // unplugged cable). Either way we retry: if the
+                        // operator misconfigured the device they can
+                        // either fix the config (UpdateConfig will
+                        // remove + re-add this output cleanly) or stop
+                        // the flow (cancel arm wins). Emitting a single
+                        // Warning here lets the manager UI flag the
+                        // condition without spamming events on every
+                        // retry tick.
+                        event_sender.emit_with_details(
+                            EventSeverity::Warning,
+                            "display",
+                            format!(
+                                "display output '{}' could not open {}: {} — retrying",
+                                config.id, config.device, msg,
+                            ),
+                            Some(&flow_id),
+                            serde_json::json!({
+                                "error_code": "display_output_waiting",
+                                "output_id": config.id,
+                                "device": config.device,
+                                "audio_device": config.audio_device.clone().unwrap_or_default(),
+                                "reason": "kms_busy",
+                                "kms_error_code": code,
+                                "kms_error_message": msg,
+                            }),
+                        );
+                        emitted_waiting = true;
+                    } else if attempt % 60 == 0 {
+                        // Throttled progress log every ~30 s so an
+                        // operator who left the wait running sees that
+                        // we're still trying, without spamming the event
+                        // log.
+                        tracing::debug!(
+                            "display output '{}' still waiting on {} after {} attempts: {}",
+                            config.id, config.device, attempt, msg,
+                        );
+                    }
+                    attempt = attempt.saturating_add(1);
+                    // Sleep with cancel — exit immediately if the flow
+                    // is being torn down.
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                        _ = cancel.cancelled() => {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
         }
     };
 
@@ -244,6 +407,14 @@ async fn run_display_output(
     let program_start = Instant::now();
     let (vtx, vrx) = mpsc::channel::<VideoFrame>(MPSC_VIDEO_DEPTH);
     let (atx, arx) = mpsc::channel::<AudioBlock>(MPSC_AUDIO_DEPTH);
+    // Shared switch / Lagged / pts_jump generation. Demux is the sole
+    // writer (via `flush_decoders_for_switch`); display + audio loops
+    // read on every recv to drop pre-switch decoded blocks without
+    // paying their wall time. Eliminates the multi-second "frozen on
+    // the previous stream" symptom on hosts where blit + vsync take
+    // longer than one source frame period (e.g. 4K-display + sysmem
+    // readback iGPU paths).
+    let frame_gen = Arc::new(AtomicU64::new(0));
 
     // Optional metering child — independent multi-PID audio decoder
     // that updates a shared `MeterSnapshot` consumed by `display_loop`.
@@ -286,6 +457,7 @@ async fn run_display_output(
         crate::config::models::HwDecodePreference::Qsv => DecoderBackend::Qsv,
         crate::config::models::HwDecodePreference::Vaapi => DecoderBackend::Vaapi,
     };
+    let demux_frame_gen = Arc::clone(&frame_gen);
     let demux_handle = tokio::task::spawn_blocking(move || {
         demux_decode_loop(
             &mut demux_rx,
@@ -301,6 +473,7 @@ async fn run_display_output(
             demux_backend,
             demux_requested_backend,
             demux_hw_already_unavailable,
+            demux_frame_gen,
         );
     });
 
@@ -331,6 +504,7 @@ async fn run_display_output(
         (crate::engine::hardware_probe::ResolvedDisplayDecoder::Qsv, _) => "qsv",
         (crate::engine::hardware_probe::ResolvedDisplayDecoder::Vaapi, _) => "vaapi",
     };
+    let display_frame_gen = Arc::clone(&frame_gen);
     let display_handle = tokio::task::spawn_blocking(move || {
         display_loop(
             kms,
@@ -346,6 +520,7 @@ async fn run_display_output(
             display_output_id,
             display_meter,
             display_scaling_mode,
+            display_frame_gen,
         );
     });
 
@@ -358,6 +533,7 @@ async fn run_display_output(
     let audio_event_sender = event_sender.clone();
     let audio_flow_id = flow_id.clone();
     let audio_output_id = config.id.clone();
+    let audio_frame_gen = Arc::clone(&frame_gen);
     let audio_handle = tokio::task::spawn_blocking(move || {
         audio_loop(
             audio_device,
@@ -370,6 +546,7 @@ async fn run_display_output(
             audio_event_sender,
             audio_flow_id,
             audio_output_id,
+            audio_frame_gen,
         );
     });
 
@@ -454,6 +631,14 @@ struct VideoFrame {
     color_transfer: i32,
     full_range: bool,
     pts_90k: u64,
+    /// Stream generation at production time. Incremented by
+    /// `flush_decoders_for_switch` on every operator switch / Lagged /
+    /// pts_jump. The display loop reads the shared counter on every
+    /// recv; frames whose `frame_gen` is older than the current value
+    /// are dropped without blit so the mpsc backlog clears in
+    /// microseconds instead of bleeding the previous stream's last
+    /// second of decoded video onto the panel after a switch.
+    frame_gen: u64,
 }
 
 struct AudioBlock {
@@ -461,6 +646,10 @@ struct AudioBlock {
     pts_90k: u64,
     sample_rate: u32,
     channels: u8,
+    /// Same semantics as [`VideoFrame::frame_gen`] — lets the audio
+    /// task drop pre-switch decoded blocks without paying the wall
+    /// time of an ALSA `writei`.
+    frame_gen: u64,
 }
 
 // ── Demux + decode child ──────────────────────────────────────────
@@ -480,6 +669,7 @@ fn demux_decode_loop(
     backend: DecoderBackend,
     requested_backend: DecoderBackend,
     hw_already_unavailable: bool,
+    frame_gen: Arc<AtomicU64>,
 ) {
     let mut demuxer = TsDemuxer::with_audio_track(program_number, audio_track_index);
     let mut video_decoder: Option<VideoDecoder> = None;
@@ -513,6 +703,17 @@ fn demux_decode_loop(
     // referencing the old stream's reference frames and either emits
     // glitched output or stalls until its internal IDR-anchor recycles.
     let mut last_video_pts: Option<u64> = None;
+    // Operator-visible "input switch in flight" tracking. Set when the
+    // demuxer emits `DemuxedFrame::Discontinuity` (PMT version_number
+    // changed — the monotonic stamp `TsContinuityFixer::on_switch`
+    // injects on every switch). Cleared on the first decoded video frame
+    // that follows. The elapsed_ms goes into `display_input_switch_acquired`
+    // so operators can tell whether a multi-second freeze was a long-GOP
+    // source (informational) or a genuinely broken pipeline (actionable).
+    let mut acquiring_since: Option<Instant> = None;
+    // One-shot gate so `display_input_switch_slow_gop` fires at most once
+    // per acquiring window — re-armed on the next `Discontinuity` event.
+    let mut slow_gop_emitted = false;
     // Re-arming guard: the display path supports planar YUV 4:2:0/4:2:2/
     // 4:4:4 (8/10/12-bit) and semi-planar NV12 / NV16 / P010LE / P016LE
     // / P210LE / P216LE. Any other pixel format from the decoder is
@@ -533,16 +734,16 @@ fn demux_decode_loop(
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 // Flush both decoders — the next IDR / sync frame is the
                 // new anchor. Reuse the demuxer's cached PSI.
-                if let Some(d) = video_decoder.as_mut() {
-                    d.flush();
-                    reset_decoder_open_window(&mut hw_open_state, &counters);
-                }
-                if let Some(d) = aac_decoder.as_mut() {
-                    d.reset();
-                }
-                if let Some(d) = ff_audio_decoder.as_mut() {
-                    d.flush();
-                }
+                flush_decoders_for_switch(
+                    &mut video_decoder,
+                    &mut aac_decoder,
+                    &mut ff_audio_decoder,
+                    &mut hw_open_state,
+                    &counters,
+                    &mut last_video_pts,
+                    &frame_gen,
+                    "lagged",
+                );
                 let now = std::time::Instant::now();
                 counters.subscriber_lag_events.fetch_add(1, Ordering::Relaxed);
                 let elapsed_since_prev = last_lagged_at.map(|t| now.duration_since(t));
@@ -580,6 +781,11 @@ fn demux_decode_loop(
         };
 
         let frames = demuxer.demux(ts_data);
+        // Snapshot the frame counter before this datagram. After we drain
+        // the demuxed AUs, any increment above this value means the new
+        // stream successfully produced its first decoded frame — which is
+        // what clears `acquiring_since` and fires the `_acquired` event.
+        let frames_before = counters.frames_received_since_open.load(Ordering::Relaxed);
         for frame in frames {
             match frame {
                 DemuxedFrame::H264 { nalus, pts, .. } => {
@@ -599,6 +805,7 @@ fn demux_decode_loop(
                         &event_sender,
                         &flow_id,
                         &output_id,
+                        &frame_gen,
                     );
                 }
                 DemuxedFrame::H265 { nalus, pts, .. } => {
@@ -618,6 +825,7 @@ fn demux_decode_loop(
                         &event_sender,
                         &flow_id,
                         &output_id,
+                        &frame_gen,
                     );
                 }
                 DemuxedFrame::Mpeg2 { es, pts, .. } => {
@@ -646,6 +854,7 @@ fn demux_decode_loop(
                         &event_sender,
                         &flow_id,
                         &output_id,
+                        &frame_gen,
                     );
                 }
                 DemuxedFrame::Aac { data, pts } => {
@@ -664,6 +873,7 @@ fn demux_decode_loop(
                                     pts_90k: pts,
                                     sample_rate: sr,
                                     channels: ch,
+                                    frame_gen: frame_gen.load(Ordering::Relaxed),
                                 });
                             }
                         }
@@ -676,6 +886,40 @@ fn demux_decode_loop(
                     // path) the same `try_send` pattern feeds
                     // `ff_audio_decoder` configured for Opus.
                     let _ = (&mut ff_audio_decoder, &mut current_ff_codec);
+                }
+                DemuxedFrame::Discontinuity => {
+                    // Operator switched the active input. The fixer's
+                    // monotonic PMT version_number bump propagated through
+                    // the broadcast channel and the demuxer surfaced it as
+                    // this frame variant. Flush every decoder so the next
+                    // AU from the new stream becomes the fresh anchor —
+                    // without this the libavcodec context keeps trying to
+                    // reference frames from the previous stream and either
+                    // emits nothing or emits glitched output until its
+                    // internal queue drains, which on a long-GOP source can
+                    // take many seconds.
+                    flush_decoders_for_switch(
+                        &mut video_decoder,
+                        &mut aac_decoder,
+                        &mut ff_audio_decoder,
+                        &mut hw_open_state,
+                        &counters,
+                        &mut last_video_pts,
+                        &frame_gen,
+                        "switch",
+                    );
+                    acquiring_since = Some(std::time::Instant::now());
+                    slow_gop_emitted = false;
+                    event_sender.emit_flow_with_details(
+                        EventSeverity::Info,
+                        crate::manager::events::category::FLOW,
+                        format!("display output '{output_id}': input switch detected — acquiring video"),
+                        &flow_id,
+                        serde_json::json!({
+                            "error_code": "display_input_switch_acquiring",
+                            "output_id": output_id,
+                        }),
+                    );
                 }
                 DemuxedFrame::OtherAudio { stream_type, data, pts } => {
                     let Some(codec) = crate::engine::audio_decode::ff_codec_for_stream_type(
@@ -698,12 +942,59 @@ fn demux_decode_loop(
                                         pts_90k: pts,
                                         sample_rate: decoded.sample_rate,
                                         channels: decoded.channels,
+                                        frame_gen: frame_gen.load(Ordering::Relaxed),
                                     });
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+
+        // Post-datagram visibility for in-flight input switches.
+        if let Some(start) = acquiring_since {
+            let frames_now = counters.frames_received_since_open.load(Ordering::Relaxed);
+            if frames_now > frames_before {
+                // First decoded frame on the new stream landed — switch
+                // is visually acquired.
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                event_sender.emit_flow_with_details(
+                    EventSeverity::Info,
+                    crate::manager::events::category::FLOW,
+                    format!(
+                        "display output '{output_id}': input switch acquired in {elapsed_ms} ms",
+                    ),
+                    &flow_id,
+                    serde_json::json!({
+                        "error_code": "display_input_switch_acquired",
+                        "output_id": output_id,
+                        "elapsed_ms": elapsed_ms,
+                    }),
+                );
+                acquiring_since = None;
+                slow_gop_emitted = false;
+            } else if !slow_gop_emitted
+                && start.elapsed() >= std::time::Duration::from_secs(5)
+            {
+                // Still waiting after 5 s. Source GOP is long, or the
+                // pipeline is genuinely broken — operator's call.
+                slow_gop_emitted = true;
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                event_sender.emit_flow_with_details(
+                    EventSeverity::Warning,
+                    crate::manager::events::category::FLOW,
+                    format!(
+                        "display output '{output_id}': input switch still acquiring after \
+                         {elapsed_ms} ms — long source GOP or pipeline issue",
+                    ),
+                    &flow_id,
+                    serde_json::json!({
+                        "error_code": "display_input_switch_slow_gop",
+                        "output_id": output_id,
+                        "elapsed_ms": elapsed_ms,
+                    }),
+                );
             }
         }
     }
@@ -901,14 +1192,59 @@ fn backend_name(backend: DecoderBackend) -> &'static str {
 
 /// Reset the per-open accounting on `HwOpenState` + `DisplayStatsCounters`.
 /// Called on every fresh decoder open and on every decoder flush
-/// (`pts_jump`, broadcast `Lagged`) — both are conceptually a re-open
-/// from the watchdog's POV.
+/// (`pts_jump`, broadcast `Lagged`, operator switch via
+/// `DemuxedFrame::Discontinuity`) — all are conceptually a re-open from
+/// the watchdog's POV.
 fn reset_decoder_open_window(state: &mut HwOpenState, counters: &DisplayStatsCounters) {
     state.consecutive_send_errors = 0;
     state.first_send_after_open = None;
     counters
         .frames_received_since_open
         .store(0, Ordering::Relaxed);
+}
+
+/// Shared decoder flush. Used by every "the upstream stream just changed"
+/// trigger:
+///   - `RecvError::Lagged` (subscriber fell behind, packets were dropped)
+///   - `pts_jump` (PTS delta past 5 s — heuristic switch detection)
+///   - `DemuxedFrame::Discontinuity` (PMT version_number changed — the
+///     monotonic stamp `TsContinuityFixer::on_switch` injects on every
+///     operator switch, including dead-input switches)
+///
+/// `last_video_pts` is cleared so the *next* PTS becomes the fresh anchor
+/// without the pts_jump path firing a redundant flush on the same event.
+/// `reason` rides into the trace so the field is greppable across log
+/// lines for the three triggers.
+fn flush_decoders_for_switch(
+    video_decoder: &mut Option<VideoDecoder>,
+    aac_decoder: &mut Option<AacDecoder>,
+    ff_audio_decoder: &mut Option<FfAudioDecoder>,
+    state: &mut HwOpenState,
+    counters: &DisplayStatsCounters,
+    last_video_pts: &mut Option<u64>,
+    frame_gen: &AtomicU64,
+    reason: &'static str,
+) {
+    if let Some(d) = video_decoder.as_mut() {
+        d.flush();
+        reset_decoder_open_window(state, counters);
+    }
+    if let Some(d) = aac_decoder.as_mut() {
+        d.reset();
+    }
+    if let Some(d) = ff_audio_decoder.as_mut() {
+        d.flush();
+    }
+    *last_video_pts = None;
+    // Bump the shared generation counter so any decoded frames already
+    // queued in the demux→display + demux→audio mpscs get dropped on
+    // arrival instead of bleeding the previous stream's last second of
+    // video onto the panel after a switch. Order: increment AFTER the
+    // libavcodec flushes so the first new-stream frame stamps the new
+    // gen value (frames decoded from packets fed BEFORE the flush carry
+    // the old gen and get dropped by the display/audio loops).
+    frame_gen.fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(reason = reason, "display decoder flush");
 }
 
 /// Switch the active decoder from a HW backend to CPU mid-flight.
@@ -988,6 +1324,7 @@ fn handle_video_au(
     event_sender: &EventSender,
     flow_id: &str,
     output_id: &str,
+    frame_gen: &AtomicU64,
 ) {
     if pts_jump(*last_video_pts, pts) {
         // Section 5: count + log every PTS jump so the operator can
@@ -1005,16 +1342,16 @@ fn handle_video_au(
             delta_backward = backward,
             "display pts_jump → decoder flush",
         );
-        if let Some(d) = video_decoder.as_mut() {
-            d.flush();
-            reset_decoder_open_window(hw_open_state, counters);
-        }
-        if let Some(d) = aac_decoder.as_mut() {
-            d.reset();
-        }
-        if let Some(d) = ff_audio_decoder.as_mut() {
-            d.flush();
-        }
+        flush_decoders_for_switch(
+            video_decoder,
+            aac_decoder,
+            ff_audio_decoder,
+            hw_open_state,
+            counters,
+            last_video_pts,
+            frame_gen,
+            "pts_jump",
+        );
     }
     *last_video_pts = Some(pts);
     ensure_video_decoder(
@@ -1060,6 +1397,7 @@ fn handle_video_au(
         hw_open_state.backend,
         last_unsupported_pixfmt_at,
         hw_open_state,
+        frame_gen,
     );
     let decode_us = decode_start.elapsed().as_micros() as u64;
     counters.decode_count.fetch_add(1, Ordering::Relaxed);
@@ -1241,6 +1579,7 @@ fn drain_video_frames(
     backend: DecoderBackend,
     last_unsupported_pixfmt_at: &mut Option<Instant>,
     state: &mut HwOpenState,
+    frame_gen: &AtomicU64,
 ) {
     while let Ok(frame) = decoder.receive_frame() {
         // A successful frame proves the decode path is live — reset
@@ -1409,6 +1748,7 @@ fn drain_video_frames(
             color_transfer,
             full_range,
             pts_90k,
+            frame_gen: frame_gen.load(Ordering::Relaxed),
         };
         if vtx.try_send(out_frame).is_err() {
             // Distinct from the display-thread `frames_dropped_late` —
@@ -1441,6 +1781,7 @@ fn display_loop(
     output_id: String,
     meter: Option<SharedMeter>,
     scaling_mode: DisplayScalingMode,
+    frame_gen: Arc<AtomicU64>,
 ) {
     // Frame period derived from the observed PTS deltas — used to size
     // the late-drop threshold. 33 ms (30 fps) until we've seen enough
@@ -1491,6 +1832,24 @@ fn display_loop(
             Some(f) => f,
             None => break,
         };
+
+        // Drop frames decoded before the most recent switch / Lagged /
+        // pts_jump. Without this gate, the up-to-`MPSC_VIDEO_DEPTH`
+        // pre-switch frames already in the queue would each pay full
+        // blit + vsync time before the new stream gets a slot — on a
+        // 4K-display + slow-blit host that bleeds the previous stream's
+        // last second of decoded video onto the panel after every input
+        // switch (the user-visible "frozen on the old picture" symptom).
+        // Drops here are O(µs) per frame — just `continue`, no scaler /
+        // present / page-flip work — so the queue clears almost
+        // instantly and the new stream's first frame renders on the
+        // next iteration.
+        if next.frame_gen < frame_gen.load(Ordering::Relaxed) {
+            counters
+                .frames_dropped_stale_gen
+                .fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
 
         // Re-arm autodetect if the source resolution shifted (operator
         // switched from 1080p to 720p, etc).
@@ -1941,6 +2300,7 @@ fn audio_loop(
     event_sender: EventSender,
     flow_id: String,
     output_id: String,
+    frame_gen: Arc<AtomicU64>,
 ) {
     if device.is_empty() {
         // Audio muted — drain the channel until the demux child closes
@@ -1958,6 +2318,19 @@ fn audio_loop(
             Some(b) => b,
             None => break,
         };
+        // Drop pre-switch audio (see the matching gate in `display_loop`
+        // for the rationale). ALSA `writei` blocks for the full block
+        // duration on the master clock, so without this gate the
+        // queued-but-stale audio after a switch would push the audio
+        // clock that many ms into the previous stream's PTS base — a
+        // sustained negative `av_sync_offset_ms` and a subsequent burst
+        // of `frames_dropped_late` on the video side until the clock
+        // re-anchors. Dropping here keeps the audio clock in lock-step
+        // with the video gate so the post-switch first-frame `av_offset`
+        // capture is meaningful.
+        if block.frame_gen < frame_gen.load(Ordering::Relaxed) {
+            continue;
+        }
         match backend.write(
             &block.planar,
             block.pts_90k,
@@ -2055,6 +2428,7 @@ mod tests {
             color_transfer: 0,
             full_range: false,
             pts_90k: 0,
+            frame_gen: 0,
         };
         match planar.chroma {
             VideoFrameChroma::Planar { .. } => {}
@@ -2075,6 +2449,7 @@ mod tests {
             color_transfer: 0,
             full_range: false,
             pts_90k: 0,
+            frame_gen: 0,
         };
         match semi.chroma {
             VideoFrameChroma::SemiPlanar { .. } => {}

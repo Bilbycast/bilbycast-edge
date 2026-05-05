@@ -845,6 +845,15 @@ pub struct DisplayStats {
     /// late to show) and `subscriber_lag_events` (decode is slow).
     #[serde(default)]
     pub frames_dropped_mpsc_full: u64,
+    /// Decoded frames dropped on display arrival because a switch /
+    /// Lagged / pts_jump bumped the shared `frame_gen` after they were
+    /// produced. Counts the queued pre-switch frames the display loop
+    /// shed in microseconds (vs. paying full blit + vsync time) so the
+    /// new stream's first frame renders within one frame period of the
+    /// switch. Sustained growth in steady state would indicate
+    /// spurious flush triggers and is worth investigating.
+    #[serde(default)]
+    pub frames_dropped_stale_gen: u64,
     /// Largest single `blit_and_present` duration since startup, in µs.
     /// `kms.present()` blocks one vblank (~16 700 µs at 60 Hz) so this
     /// is one-vblank-floored; values past ~33 000 µs mean the per-frame

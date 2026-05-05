@@ -1040,6 +1040,10 @@ async fn whep_viewer_loop(
                                 // transcode hop we don't have today (WebRTC is
                                 // H.264 only). Drop the AU.
                                 super::webrtc::ts_demux::DemuxedFrame::Mpeg2 { .. } => {}
+                                // Stream discontinuity is metadata for stateful
+                                // decoders; the WebRTC packetizer re-anchors on
+                                // the next IDR independently.
+                                super::webrtc::ts_demux::DemuxedFrame::Discontinuity => {}
                             }
                         }
 
@@ -1501,6 +1505,10 @@ async fn whip_client_loop(
                                     // a transcode hop we don't have today
                                     // (WebRTC is H.264 only). Drop the AU.
                                     super::webrtc::ts_demux::DemuxedFrame::Mpeg2 { .. } => {}
+                                    // Stream discontinuity is metadata for
+                                    // stateful decoders; the WebRTC packetizer
+                                    // re-anchors on the next IDR independently.
+                                    super::webrtc::ts_demux::DemuxedFrame::Discontinuity => {}
                                 }
                             }
 

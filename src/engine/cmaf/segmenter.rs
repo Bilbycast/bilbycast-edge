@@ -478,12 +478,7 @@ mod tests {
 
     #[test]
     fn audio_segmenter_cuts_on_target_duration() {
-        let a = AudioTrack {
-            audio_specific_config: [0x11, 0x90],
-            sample_rate: 48000,
-            channels: 2,
-            avg_bitrate: 128_000,
-        };
+        let a = AudioTrack::aac([0x11, 0x90], 48000, 2, 128_000);
         let mut s = AudioSegmenter::new(a, 2.0);
         let data = vec![0xFF; 200];
         let mut seg = None;
@@ -501,12 +496,7 @@ mod tests {
 
     #[test]
     fn audio_take_pending_for_muxing() {
-        let a = AudioTrack {
-            audio_specific_config: [0x11, 0x90],
-            sample_rate: 48000,
-            channels: 2,
-            avg_bitrate: 128_000,
-        };
+        let a = AudioTrack::aac([0x11, 0x90], 48000, 2, 128_000);
         let mut s = AudioSegmenter::new(a, 2.0);
         for i in 0..10 {
             s.push(&vec![0xFF; 100], (i * 1920) as u64);

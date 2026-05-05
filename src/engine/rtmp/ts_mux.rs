@@ -96,6 +96,13 @@ pub struct TsMuxer {
     /// upstream gets the protection without each one re-implementing
     /// the same state.
     last_audio_pts_90khz: Option<u64>,
+    /// PMT `version_number` field (5 bits, `0..=31`). Bumped by the caller
+    /// across a layout-change boundary (e.g. media-player playlist
+    /// transition where the new file's codec/PID layout differs) so
+    /// receivers re-parse the PMT instead of caching the previous one.
+    /// Default `0`. Receivers re-init their decoder pipeline when this
+    /// changes — bump only on a real layout change, not gratuitously.
+    pmt_version: u8,
 }
 
 impl TsMuxer {
@@ -114,7 +121,64 @@ impl TsMuxer {
             pat_pmt_sent: false,
             last_pat_pmt_at: None,
             last_audio_pts_90khz: None,
+            pmt_version: 0,
         }
+    }
+
+    /// Seed the per-PID continuity counters so the next outgoing TS packet
+    /// on each PID picks up immediately after the value supplied. Used by
+    /// the file-backed media-player input across playlist transitions and
+    /// loop boundaries: the previous file's last CCs are read back via
+    /// [`current_cc`], stashed in `SpliceContinuity`, then seeded into the
+    /// fresh `TsMuxer` here so receivers see one continuous CC sequence
+    /// rather than a reset to 0 every loop.
+    ///
+    /// Each argument is the **last CC sent on the wire** for that PID;
+    /// the next emitted packet on each PID will use `(value + 1) & 0x0F`.
+    /// Pass `0xFF` to indicate "no previous value" (the first emitted
+    /// packet then uses CC=0).
+    pub fn seed_cc(&mut self, pat: u8, pmt: u8, video: u8, audio: u8) {
+        // The internal counters store the value to emit *next*. So if the
+        // previous wire value was N, the next-to-emit is (N+1) & 0x0F.
+        // 0xFF (or any value with bit 7 set) means "no previous" — emit 0.
+        let next = |last: u8| -> u8 {
+            if last & 0x80 != 0 {
+                0
+            } else {
+                (last + 1) & 0x0F
+            }
+        };
+        self.cc_pat = next(pat);
+        self.cc_pmt = next(pmt);
+        self.cc_video = next(video);
+        self.cc_audio = next(audio);
+    }
+
+    /// Read back the last CC value sent on the wire for each managed PID.
+    /// Used by the media-player input at file-close to checkpoint state
+    /// into `SpliceContinuity` for the next file. Each value is the most
+    /// recent CC bit-nibble *that has been written into a packet header*
+    /// — so feeding it back into [`seed_cc`] on a fresh muxer continues
+    /// the sequence with no gap and no repeat.
+    pub fn current_cc(&self) -> (u8, u8, u8, u8) {
+        // Internal counters hold the *next* value to emit, so subtract 1 to
+        // recover the last value actually sent (mod 16).
+        let last = |next: u8| -> u8 { (next.wrapping_sub(1)) & 0x0F };
+        (
+            last(self.cc_pat),
+            last(self.cc_pmt),
+            last(self.cc_video),
+            last(self.cc_audio),
+        )
+    }
+
+    /// Set the PMT `version_number` (5 bits, masked to `0..=31`). Bump
+    /// only across a real layout change (codec / PID / audio
+    /// added-or-removed) — receivers re-parse the PMT and reset decoder
+    /// state, which audibly drops audio for a few hundred ms on Apple
+    /// decoders. Caller is responsible for bumping mod 32.
+    pub fn set_pmt_version(&mut self, version: u8) {
+        self.pmt_version = version & 0x1F;
     }
 
     /// Clamp an incoming audio PTS so the audio elementary stream PES
@@ -499,7 +563,9 @@ impl TsMuxer {
         pkt[pmt_start + 2] = section_length as u8;
         pkt[pmt_start + 3] = 0x00; // program_number high
         pkt[pmt_start + 4] = 0x01; // program_number low
-        pkt[pmt_start + 5] = 0xC1; // reserved, version=0, current_next=1
+        // reserved(2)='11' | version_number(5) | current_next_indicator(1)='1'
+        // → 0xC0 | (version << 1) | 0x01
+        pkt[pmt_start + 5] = 0xC1 | ((self.pmt_version & 0x1F) << 1);
         pkt[pmt_start + 6] = 0x00; // section_number
         pkt[pmt_start + 7] = 0x00; // last_section_number
         // PCR PID: use video PID if video is present, otherwise audio PID
@@ -864,6 +930,83 @@ mod tests {
                 w[1]
             );
         }
+    }
+
+    /// `seed_cc` must make the next emitted packet on each PID continue
+    /// from `(seed + 1) & 0x0F`, including across the 4-bit wrap.
+    #[test]
+    fn seed_cc_continues_from_supplied_value_with_wrap() {
+        let mut muxer = TsMuxer::new();
+        muxer.set_has_video(true);
+        muxer.set_has_audio(false);
+        // Seed video CC = 15 → next packet should carry CC = 0.
+        muxer.seed_cc(0xFF, 0xFF, 15, 0xFF);
+        let pes = build_pes_packet(0xE0, &[0x00, 0x00, 0x00, 0x01, 0x65, 0x88], 90_000, Some(90_000));
+        let pkts = muxer.packetize(VIDEO_PID, &pes, true, true, Some(90_000), true);
+        assert!(!pkts.is_empty());
+        let first = &pkts[0];
+        assert_eq!(first.len(), TS_PACKET_SIZE);
+        // CC is the low nibble of byte 3.
+        assert_eq!(first[3] & 0x0F, 0, "wrap from 15 → 0");
+
+        // Subsequent emit on the same PID should advance to 1.
+        let pes2 = build_pes_packet(0xE0, &[0x00, 0x00, 0x00, 0x01, 0x41], 91_000, Some(91_000));
+        let pkts2 = muxer.packetize(VIDEO_PID, &pes2, true, true, Some(91_000), false);
+        assert_eq!(pkts2[0][3] & 0x0F, 1);
+    }
+
+    /// `current_cc` must round-trip with `seed_cc` so a continuity-aware
+    /// caller can checkpoint state across muxer recreation.
+    #[test]
+    fn current_cc_round_trips_through_seed_cc() {
+        let mut a = TsMuxer::new();
+        a.set_has_video(true);
+        a.set_has_audio(true);
+        // Run a few packets through `a` so its CC counters are non-zero.
+        let pes = build_pes_packet(0xE0, &[0u8; 16], 0, Some(0));
+        let _ = a.packetize(VIDEO_PID, &pes, true, true, Some(0), true);
+        let _ = a.packetize(AUDIO_PID, &pes, true, false, None, false);
+        let _ = a.packetize(VIDEO_PID, &pes, true, true, Some(3_000), false);
+        let (pat, pmt, video, audio) = a.current_cc();
+
+        // Now spin up a fresh muxer, seed it, and verify the next packet
+        // on each PID continues the sequence.
+        let mut b = TsMuxer::new();
+        b.set_has_video(true);
+        b.set_has_audio(true);
+        b.seed_cc(pat, pmt, video, audio);
+        let next_video = b.packetize(VIDEO_PID, &pes, true, true, Some(6_000), false);
+        let next_audio = b.packetize(AUDIO_PID, &pes, true, false, None, false);
+        assert_eq!(next_video[0][3] & 0x0F, (video + 1) & 0x0F);
+        assert_eq!(next_audio[0][3] & 0x0F, (audio + 1) & 0x0F);
+    }
+
+    /// `set_pmt_version` must be reflected in the PMT byte that carries
+    /// the `version_number` field. Bit layout per ISO/IEC 13818-1 §2.4.4.9:
+    /// reserved('11') | version_number(5) | current_next_indicator('1').
+    #[test]
+    fn set_pmt_version_is_written_into_pmt_section() {
+        let mut muxer = TsMuxer::new();
+        muxer.set_has_video(true);
+        muxer.set_pmt_version(7);
+        let pmt = muxer.build_pmt();
+        // PMT section starts at byte 5 (sync + 3 + pointer field). The
+        // version_number byte sits 5 bytes later (table_id, section
+        // header (2), program_number (2)).
+        let v_byte = pmt[5 + 5];
+        assert_eq!(v_byte & 0xC1, 0xC1, "reserved + current_next bits intact");
+        let recovered = (v_byte >> 1) & 0x1F;
+        assert_eq!(recovered, 7);
+    }
+
+    /// Version bumps wrap mod 32 (the field is 5 bits).
+    #[test]
+    fn set_pmt_version_wraps_at_5_bits() {
+        let mut muxer = TsMuxer::new();
+        muxer.set_pmt_version(0xFF); // out-of-range — should mask to 0x1F
+        let pmt = muxer.build_pmt();
+        let recovered = (pmt[5 + 5] >> 1) & 0x1F;
+        assert_eq!(recovered, 31);
     }
 
     #[test]

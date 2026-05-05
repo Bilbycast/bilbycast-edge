@@ -350,6 +350,108 @@ edges keep accepting the legacy shape.
   manager UI shows `—` until the operator re-marks. A Phase 3 index
   schema bump could carry SMPTE alongside PTS to remove this gap.
 
+## Recordings library (browse / export / delete after recording stops)
+
+When a flow's `recording.enabled` flips off — or the flow is deleted
+entirely — the on-disk recording under `<replay_root>/<recording_id>/`
+keeps its segments + index + clips. They remain playable via the
+existing `list_clips { recording_id }` orphan-recovery path; the
+**Recordings library** surface exposes them so an operator can
+browse, export, or delete them without re-arming the writer.
+
+### `list_recordings`
+
+Enumerate every recording directory under the replay root.
+
+```jsonc
+// Request
+{ "type": "list_recordings" }
+
+// Response
+{
+  "recordings": [
+    {
+      "recording_id": "show-a",
+      "flow_id": "flow-1",          // null when no flow currently has it armed
+      "armed": true,                // true while the writer is rolling
+      "segment_count": 187,
+      "total_bytes": 1_843_200_000,
+      "first_pts_90khz": 0,
+      "last_pts_90khz": 168_300_000,
+      "created_at_unix": 1714000000,
+      "last_modified_unix": 1714001872,
+      "clip_count": 4
+    }
+  ],
+  "replay_root_free_bytes": 53_500_000_000,
+  "replay_root_total_bytes": 250_000_000_000
+}
+```
+
+`flow_id` is `null` when the recording is an **orphan** — its source
+flow has either disabled recording or been deleted. The manager UI
+renders these with an `(orphan)` chip; they're still playable
+through the JKL surface keyed off `recording_id`.
+
+### `delete_recording`
+
+```jsonc
+// Request
+{ "type": "delete_recording", "recording_id": "show-a" }
+
+// Response
+{ "recording_id": "show-a", "bytes_freed": 1_843_200_000 }
+```
+
+Refuses with `error_code: replay_recording_active` if the writer is
+currently armed against the recording — operator must
+`stop_recording` first. The directory unlink is recursive and
+irreversible; the edge emits a `recording_deleted` Info event with
+`details.bytes_freed` so the action is auditable.
+
+### `export_clip` / `export_recording`
+
+Pull-based chunked TS export. The manager makes repeat calls with
+increasing `byte_offset` until the response carries `eof: true`. The
+edge re-opens the on-disk reader stateless-ly on each call —
+`InMemoryIndex::load` is cheap and the segment files are byte
+aligned, so no per-session bookkeeping is needed.
+
+```jsonc
+// Request
+{
+  "type": "export_clip",
+  "clip_id": "clp_…",
+  "format": "ts",            // optional; "ts" only in Phase 1
+  "byte_offset": 0,          // optional; default 0
+  "chunk_bytes": 1048576     // optional; default 1 MiB, hard cap 3 MiB
+}
+
+// Response
+{
+  "clip_id": "clp_…",
+  "recording_id": "show-a",
+  "format": "ts",
+  "byte_offset": 0,
+  "total_bytes": 12_345_678,
+  "chunk_bytes": 1048576,
+  "data": "<base64>",
+  "eof": false
+}
+```
+
+`export_recording` takes the same shape with `recording_id` instead
+of `clip_id`, plus optional `from_pts_90khz` / `to_pts_90khz` to
+bound the export to a PTS sub-range. Whole-recording exports are
+capped at 4 GiB total — over-cap requests fail with
+`replay_export_too_large` and the operator should mark a clip first.
+
+The exported bytes are **packet-aligned MPEG-TS** — the manager can
+concatenate chunks in order and serve the result as
+`Content-Type: application/mp2t` without resyncing the first byte.
+MP4 packaging is a follow-up; Phase 1 advertises `format: "ts"`
+only and rejects other values with `replay_export_format_unsupported`.
+
 ## Cross-references
 
 - Configuration schema:

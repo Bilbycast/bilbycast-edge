@@ -862,6 +862,58 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
         }
     }
 
+    // Replay-server disk usage (gated on the `replay` Cargo feature).
+    // Operations alarms on orphan creep (`bilbycast_edge_replay_orphan_bytes`
+    // climbing while the broadcast operator isn't actively recording).
+    #[cfg(feature = "replay")]
+    {
+        let root = crate::replay::replay_root();
+        let summaries = crate::replay::recordings::enumerate_lite(&root).await;
+        let armed: std::collections::HashSet<String> = state
+            .flow_manager
+            .flows_with_recording()
+            .into_iter()
+            .map(|(_flow, rec)| rec)
+            .collect();
+        let mut total_count: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        let mut orphan_count: u64 = 0;
+        let mut orphan_bytes: u64 = 0;
+        for s in &summaries {
+            total_count += 1;
+            total_bytes = total_bytes.saturating_add(s.total_bytes);
+            if !armed.contains(&s.recording_id) {
+                orphan_count += 1;
+                orphan_bytes = orphan_bytes.saturating_add(s.total_bytes);
+            }
+        }
+        output.push_str("\n# HELP bilbycast_edge_replay_recordings_count On-disk replay recordings\n");
+        output.push_str("# TYPE bilbycast_edge_replay_recordings_count gauge\n");
+        output.push_str(&format!("bilbycast_edge_replay_recordings_count {total_count}\n"));
+
+        output.push_str("# HELP bilbycast_edge_replay_recordings_bytes Bytes consumed by on-disk replay segments\n");
+        output.push_str("# TYPE bilbycast_edge_replay_recordings_bytes gauge\n");
+        output.push_str(&format!("bilbycast_edge_replay_recordings_bytes {total_bytes}\n"));
+
+        output.push_str("# HELP bilbycast_edge_replay_orphan_recordings_count Recordings with no flow currently armed against them\n");
+        output.push_str("# TYPE bilbycast_edge_replay_orphan_recordings_count gauge\n");
+        output.push_str(&format!("bilbycast_edge_replay_orphan_recordings_count {orphan_count}\n"));
+
+        output.push_str("# HELP bilbycast_edge_replay_orphan_bytes Bytes consumed by orphan recordings (no armed flow)\n");
+        output.push_str("# TYPE bilbycast_edge_replay_orphan_bytes gauge\n");
+        output.push_str(&format!("bilbycast_edge_replay_orphan_bytes {orphan_bytes}\n"));
+
+        if let Some((free, total)) = crate::replay::replay_disk_usage() {
+            output.push_str("# HELP bilbycast_edge_replay_root_free_bytes Free bytes on the replay-root filesystem\n");
+            output.push_str("# TYPE bilbycast_edge_replay_root_free_bytes gauge\n");
+            output.push_str(&format!("bilbycast_edge_replay_root_free_bytes {free}\n"));
+
+            output.push_str("# HELP bilbycast_edge_replay_root_total_bytes Total bytes on the replay-root filesystem\n");
+            output.push_str("# TYPE bilbycast_edge_replay_root_total_bytes gauge\n");
+            output.push_str(&format!("bilbycast_edge_replay_root_total_bytes {total}\n"));
+        }
+    }
+
     (
         StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],

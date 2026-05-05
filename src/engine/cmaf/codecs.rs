@@ -479,6 +479,379 @@ pub fn aac_audio_specific_config(profile: u8, sr_idx: u8, ch_cfg: u8) -> [u8; 2]
     [byte0, byte1]
 }
 
+/// Write an `esds` box for MPEG-1 / MPEG-2 Layer II audio.
+///
+/// Same descriptor chain as [`write_esds`] but with
+/// `objectTypeIndication = 0x69` (MPEG-1 Audio L2 — also the canonical
+/// OTI for MPEG-2 Layer II in MP4) and an empty `DecoderSpecificInfo`.
+/// MP2 frame headers carry every codec parameter the decoder needs, so
+/// no DSI is required.
+pub fn write_esds_mpeg_audio(parent: &mut BoxWriter<'_>, avg_bitrate: u32) {
+    let mut esds = parent.child_full(*b"esds", 0, 0);
+    // ES_Descriptor (tag 0x03)
+    let dcd_body_len = 13 + 2 + 0; // DCD core + empty DSI tag/len
+    let dcd_len = 1 + 1 + dcd_body_len;
+    let sl_len = 1 + 1 + 1;
+    let es_body_len = 3 + dcd_len + sl_len;
+    esds.u8(0x03);
+    esds.u8(es_body_len as u8);
+    esds.u16(0); // ES_ID
+    esds.u8(0); // flags
+    // DecoderConfigDescriptor (tag 0x04)
+    esds.u8(0x04);
+    esds.u8(dcd_body_len as u8);
+    esds.u8(0x69); // objectTypeIndication: MPEG-1 Audio L2
+    esds.u8(0x15); // streamType=AudioStream | reserved=1
+    esds.u24(0);
+    esds.u32(0);
+    esds.u32(avg_bitrate);
+    // Empty DecoderSpecificInfo (tag 0x05)
+    esds.u8(0x05);
+    esds.u8(0);
+    // SLConfigDescriptor (tag 0x06)
+    esds.u8(0x06);
+    esds.u8(1);
+    esds.u8(0x02);
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  AC-3 / E-AC-3 specific config boxes
+// ────────────────────────────────────────────────────────────────────────
+
+/// AC-3 codec parameters parsed from a syncframe header (ETSI TS 102 366
+/// §4.4.1). Used both to build the `dac3` box and to compute the per-frame
+/// duration in 90 kHz ticks for the MP4 trun.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ac3FrameInfo {
+    /// Sample rate code (`fscod`, 2 bits): 0 = 48 kHz, 1 = 44.1 kHz,
+    /// 2 = 32 kHz. Value 3 ("reserved") indicates an E-AC-3 frame
+    /// fed to the AC-3 parser by mistake — caller should retry with
+    /// the E-AC-3 parser.
+    pub fscod: u8,
+    /// Frame size code (`frmsizecod`, 6 bits) — indexes the
+    /// AC-3 frame-size table.
+    pub frmsizecod: u8,
+    /// Bit-stream identification (`bsid`, 5 bits). 8 = standard
+    /// AC-3; ≥ 16 = E-AC-3.
+    pub bsid: u8,
+    /// Bit-stream mode (`bsmod`, 3 bits) — main/dialog/etc.
+    pub bsmod: u8,
+    /// Audio coding mode (`acmod`, 3 bits) — channel layout.
+    pub acmod: u8,
+    /// LFE-on (`lfeon`, 1 bit). Adds 1 to the channel count.
+    pub lfeon: bool,
+    /// Frame size in bytes derived from `frmsizecod` + `fscod`.
+    pub frame_size: usize,
+    /// Sample rate in Hz (decoded from `fscod`).
+    pub sample_rate: u32,
+    /// Channel count (decoded from `acmod` + `lfeon`).
+    pub channels: u16,
+}
+
+/// Decode the first AC-3 syncframe at the head of `data`. Sync word is
+/// `0x0B 0x77`. Returns `None` if the sync word is missing, the header
+/// is truncated, or the frame size table indexes a reserved entry.
+///
+/// AC-3 frame sizes (in 16-bit words) are tabulated in ETSI TS 102 366
+/// Table 4.13. `frmsizecod` × 2 → byte count varies with `fscod`:
+/// at 48 kHz the table is identical to the bit-rate index × 4; we encode
+/// the standard table directly.
+pub fn parse_ac3_syncframe(data: &[u8]) -> Option<Ac3FrameInfo> {
+    if data.len() < 7 || data[0] != 0x0B || data[1] != 0x77 {
+        return None;
+    }
+    let fscod = (data[4] >> 6) & 0x03;
+    let frmsizecod = data[4] & 0x3F;
+    let bsid = (data[5] >> 3) & 0x1F;
+    let bsmod = data[5] & 0x07;
+    let acmod = (data[6] >> 5) & 0x07;
+    // Skip optional cmixlev / surmixlev / dsurmod fields to reach lfeon.
+    // Their presence depends on acmod — see ETSI §4.4.1.4.
+    let mut bit_off = 6 * 8 + 3; // bit position right after acmod
+    if (acmod & 0x01) != 0 && acmod != 0x01 {
+        // cmixlev present (2 bits) when 3 front channels exist
+        bit_off += 2;
+    }
+    if (acmod & 0x04) != 0 {
+        // surmixlev present (2 bits) when surrounds are present
+        bit_off += 2;
+    }
+    if acmod == 0x02 {
+        // dsurmod present (2 bits) for 2/0 mode
+        bit_off += 2;
+    }
+    let byte_idx = bit_off / 8;
+    let bit_idx = 7 - (bit_off % 8);
+    if byte_idx >= data.len() {
+        return None;
+    }
+    let lfeon = ((data[byte_idx] >> bit_idx) & 0x01) != 0;
+
+    let frame_size = ac3_frame_size_bytes(fscod, frmsizecod)?;
+    let sample_rate = match fscod {
+        0 => 48_000,
+        1 => 44_100,
+        2 => 32_000,
+        _ => return None,
+    };
+    let channels = ac3_acmod_channels(acmod) + if lfeon { 1 } else { 0 };
+    Some(Ac3FrameInfo {
+        fscod,
+        frmsizecod,
+        bsid,
+        bsmod,
+        acmod,
+        lfeon,
+        frame_size,
+        sample_rate,
+        channels,
+    })
+}
+
+/// AC-3 syncframe size in bytes (ETSI TS 102 366 Table 4.13). The table
+/// indexes by bitrate (`frmsizecod >> 1`); at 44.1 kHz the LSB of
+/// `frmsizecod` adds an extra padding word due to non-integer rounding.
+/// Returns `None` for reserved bitrate indices or sample-rate codes.
+fn ac3_frame_size_bytes(fscod: u8, frmsizecod: u8) -> Option<usize> {
+    if frmsizecod >= 38 {
+        return None;
+    }
+    let bitrate_idx = (frmsizecod >> 1) as usize;
+    const KBPS: [usize; 19] = [
+        32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 576, 640,
+    ];
+    let kbps = *KBPS.get(bitrate_idx)?;
+    // Frame duration = 1536 samples / SR seconds → bytes = bitrate × 1536 / (SR × 8).
+    let bytes = match fscod {
+        0 => 4 * kbps,                     // 48 kHz: exact integer
+        2 => 6 * kbps,                     // 32 kHz: exact integer
+        1 => {
+            // 44.1 kHz frame size table per ETSI Table 4.13.
+            // Words at 44.1 kHz, then doubled to bytes; LSB of
+            // frmsizecod adds one word of padding.
+            const W441: [usize; 19] = [
+                69, 87, 104, 121, 139, 174, 208, 243, 278, 348, 417, 487, 557, 696, 835, 975,
+                1114, 1253, 1393,
+            ];
+            (W441[bitrate_idx] + (frmsizecod & 1) as usize) * 2
+        }
+        _ => return None,
+    };
+    Some(bytes)
+}
+
+/// `acmod` → decoded channel count (without LFE). ETSI TS 102 366 Table 4.5.
+fn ac3_acmod_channels(acmod: u8) -> u16 {
+    match acmod {
+        0 => 2, // 1+1 (Ch1, Ch2 dual mono)
+        1 => 1, // mono
+        2 => 2, // stereo
+        3 => 3, // 3/0
+        4 => 3, // 2/1
+        5 => 4, // 3/1
+        6 => 4, // 2/2
+        7 => 5, // 3/2
+        _ => 2,
+    }
+}
+
+/// Build the 3-byte `dac3` payload (ETSI TS 102 366 Annex F.4 §F.4) for
+/// a parsed AC-3 frame. Layout (24 bits, big-endian):
+///
+/// ```text
+///   fscod(2) | bsid(5) | bsmod(3) | acmod(3) | lfeon(1) |
+///   bit_rate_code(5) | reserved(5)
+/// ```
+///
+/// `bit_rate_code` here is the high 5 bits of `frmsizecod` (i.e. the
+/// bitrate index) — `frmsizecod >> 1`.
+pub fn build_dac3_payload(info: &Ac3FrameInfo) -> [u8; 3] {
+    let bit_rate_code = info.frmsizecod >> 1;
+    let mut payload = [0u8; 3];
+    // byte 0: fscod(2) | bsid(5) | bsmod[2] (1 bit)
+    payload[0] =
+        ((info.fscod & 0x03) << 6) | ((info.bsid & 0x1F) << 1) | ((info.bsmod >> 2) & 0x01);
+    // byte 1: bsmod[1..0] (2 bits) | acmod(3) | lfeon(1) | bit_rate_code[4..3] (2 bits)
+    payload[1] = ((info.bsmod & 0x03) << 6)
+        | ((info.acmod & 0x07) << 3)
+        | ((if info.lfeon { 1 } else { 0 }) << 2)
+        | ((bit_rate_code >> 3) & 0x03);
+    // byte 2: bit_rate_code[2..0] (3 bits) | reserved(5) = 0
+    payload[2] = (bit_rate_code & 0x07) << 5;
+    payload
+}
+
+/// Write a `dac3` (AC-3 specific) box inside the parent (typically an
+/// `ac-3` sample entry).
+pub fn write_dac3(parent: &mut BoxWriter<'_>, payload: &[u8; 3]) {
+    let mut b = parent.child(*b"dac3");
+    b.bytes(payload);
+}
+
+/// Build an `dec3` payload for a single-substream E-AC-3 frame
+/// (ETSI TS 102 366 Annex F.6 — the common case for broadcast streams).
+///
+/// Layout (16-bit data_rate + 3-bit num_ind_sub + per-substream block):
+///
+/// ```text
+///   data_rate(13) | num_ind_sub(3) |
+///   { fscod(2) bsid(5) bsmod(5) acmod(3) lfeon(1) reserved(3)
+///     num_dep_sub(4) chan_loc(9 if num_dep_sub>0) reserved(1) } × num_ind_sub
+/// ```
+///
+/// `data_rate` is the encoded data rate in kbps / 8 — use 0 when unknown
+/// (decoders ignore it). Single-substream frames encode `num_ind_sub = 0`
+/// (representing 1 substream) and `num_dep_sub = 0`.
+pub fn build_dec3_payload(info: &Ac3FrameInfo) -> Vec<u8> {
+    // Two header bytes followed by one substream descriptor (3 bytes).
+    let data_rate: u16 = 0; // unknown — decoders compute from frame stream
+    let num_ind_sub: u8 = 0; // 0 = 1 independent substream
+    // First 16 bits: data_rate(13) | num_ind_sub(3)
+    let header = ((data_rate & 0x1FFF) << 3) | (num_ind_sub as u16 & 0x07);
+    let mut out = Vec::with_capacity(5);
+    out.push((header >> 8) as u8);
+    out.push((header & 0xFF) as u8);
+    // Substream block (3 bytes):
+    //   byte 0: fscod(2) | bsid(5) | bsmod[4] (1)
+    //   byte 1: bsmod[3..0] (4) | acmod (3) | lfeon[0] (1)  ← acmod is 3 bits, lfeon 1 bit
+    //   byte 2: reserved(3) | num_dep_sub(4) | reserved(1)
+    out.push(((info.fscod & 0x03) << 6) | ((info.bsid & 0x1F) << 1) | ((info.bsmod >> 4) & 0x01));
+    out.push(
+        ((info.bsmod & 0x0F) << 4)
+            | ((info.acmod & 0x07) << 1)
+            | (if info.lfeon { 1 } else { 0 }),
+    );
+    let num_dep_sub: u8 = 0;
+    out.push((num_dep_sub & 0x0F) << 1);
+    out
+}
+
+/// Write a `dec3` (E-AC-3 specific) box inside the parent (typically an
+/// `ec-3` sample entry).
+pub fn write_dec3(parent: &mut BoxWriter<'_>, payload: &[u8]) {
+    let mut b = parent.child(*b"dec3");
+    b.bytes(payload);
+}
+
+/// E-AC-3 syncframe (ETSI TS 102 366 Annex E §E.1.3.1.1). Same sync
+/// word `0x0B 0x77` as AC-3 but the header layout differs — the
+/// 11-bit `frmsiz` field directly encodes the frame size in 16-bit
+/// words (minus 1).
+pub fn parse_eac3_syncframe(data: &[u8]) -> Option<Ac3FrameInfo> {
+    if data.len() < 7 || data[0] != 0x0B || data[1] != 0x77 {
+        return None;
+    }
+    let strmtyp = (data[2] >> 6) & 0x03;
+    if strmtyp == 3 {
+        return None; // reserved
+    }
+    let frmsiz = ((data[2] as u16 & 0x07) << 8) | data[3] as u16;
+    let frame_size = ((frmsiz as usize) + 1) * 2;
+    let fscod = (data[4] >> 6) & 0x03;
+    let fscod2 = (data[4] >> 4) & 0x03;
+    let acmod = (data[4] >> 1) & 0x07;
+    let lfeon = (data[4] & 0x01) != 0;
+    let bsid = (data[5] >> 3) & 0x1F;
+    let bsmod = data[5] & 0x07;
+    let sample_rate = match fscod {
+        0 => 48_000,
+        1 => 44_100,
+        2 => 32_000,
+        3 => match fscod2 {
+            0 => 24_000,
+            1 => 22_050,
+            2 => 16_000,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let channels = ac3_acmod_channels(acmod) + if lfeon { 1 } else { 0 };
+    Some(Ac3FrameInfo {
+        fscod,
+        frmsizecod: 0,
+        bsid,
+        bsmod,
+        acmod,
+        lfeon,
+        frame_size,
+        sample_rate,
+        channels,
+    })
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  MP2 (MPEG-1 / MPEG-2 Layer II) frame parser
+// ────────────────────────────────────────────────────────────────────────
+
+/// MP2 frame metadata parsed from a 4-byte header (ISO/IEC 11172-3 §2.4.2.3).
+#[derive(Debug, Clone, Copy)]
+pub struct Mp2FrameInfo {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub frame_size: usize,
+    pub avg_bitrate: u32,
+}
+
+/// Parse the first MP2 frame at the head of `data`. Sync word: 11 bits
+/// of '1' (`0xFFE` or higher) — `0xFFF` for MPEG-1, `0xFFE` for MPEG-2.
+/// Layer II is `layer = 10`. Returns `None` for any other layer or for
+/// reserved bitrate / sample-rate indices.
+pub fn parse_mp2_frame(data: &[u8]) -> Option<Mp2FrameInfo> {
+    if data.len() < 4 {
+        return None;
+    }
+    if data[0] != 0xFF || (data[1] & 0xE0) != 0xE0 {
+        return None;
+    }
+    let mpeg_id = (data[1] >> 3) & 0x03; // 11 = MPEG-1, 10 = MPEG-2, 00 = MPEG-2.5
+    let layer = (data[1] >> 1) & 0x03; // 10 = Layer II
+    if layer != 0b10 {
+        return None;
+    }
+    let bitrate_idx = (data[2] >> 4) & 0x0F;
+    let sr_idx = (data[2] >> 2) & 0x03;
+    let padding = (data[2] >> 1) & 0x01;
+    let mode = (data[3] >> 6) & 0x03;
+    if bitrate_idx == 0 || bitrate_idx == 0x0F || sr_idx == 0x03 {
+        return None;
+    }
+    // MPEG-1 Layer II bitrate table (kbps).
+    const M1_L2: [u32; 15] = [
+        0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384,
+    ];
+    // MPEG-2 Layer II bitrate table (kbps).
+    const M2_L2: [u32; 15] = [
+        0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160,
+    ];
+    let bitrate_kbps = match mpeg_id {
+        0b11 => M1_L2[bitrate_idx as usize],
+        0b10 | 0b00 => M2_L2[bitrate_idx as usize],
+        _ => return None,
+    };
+    let sample_rate = match (mpeg_id, sr_idx) {
+        (0b11, 0) => 44_100,
+        (0b11, 1) => 48_000,
+        (0b11, 2) => 32_000,
+        (0b10, 0) => 22_050,
+        (0b10, 1) => 24_000,
+        (0b10, 2) => 16_000,
+        (0b00, 0) => 11_025,
+        (0b00, 1) => 12_000,
+        (0b00, 2) => 8_000,
+        _ => return None,
+    };
+    let channels: u16 = if mode == 0b11 { 1 } else { 2 };
+    // Layer II frame size: floor(144 × bitrate / sample_rate) + padding.
+    let frame_size =
+        (144 * bitrate_kbps as usize * 1000 / sample_rate as usize) + padding as usize;
+    Some(Mp2FrameInfo {
+        sample_rate,
+        channels,
+        frame_size,
+        avg_bitrate: bitrate_kbps * 1000,
+    })
+}
+
 /// Sampling frequency table (ISO/IEC 14496-3 Table 1.18). Index 15 means
 /// the rate is explicitly signalled; we never emit that case.
 pub fn sample_rate_from_index(idx: u8) -> u32 {
@@ -550,6 +923,140 @@ mod tests {
 
     fn find_fourcc(buf: &[u8], fc: [u8; 4]) -> Option<usize> {
         buf.windows(4).position(|w| w == fc)
+    }
+
+    #[test]
+    fn ac3_frame_size_48k_640kbps_is_2560_bytes() {
+        // 48 kHz, 640 kbps → 4 × 640 = 2560 bytes.
+        let size = ac3_frame_size_bytes(0, 36).unwrap();
+        assert_eq!(size, 2560);
+    }
+
+    #[test]
+    fn ac3_frame_size_44_1k_192kbps_padding_bit() {
+        // 44.1 kHz, 192 kbps. ETSI Table 4.13 word count for index 10 is
+        // 417 (the rate's non-integer rounding); padding adds 1 word.
+        let unpadded = ac3_frame_size_bytes(1, 20).unwrap();
+        let padded = ac3_frame_size_bytes(1, 21).unwrap();
+        assert_eq!(unpadded, 417 * 2);
+        assert_eq!(padded, 417 * 2 + 2);
+    }
+
+    #[test]
+    fn ac3_frame_size_32k_64kbps() {
+        // 32 kHz, 64 kbps → 6 × 64 = 384 bytes.
+        let size = ac3_frame_size_bytes(2, 8).unwrap();
+        assert_eq!(size, 384);
+    }
+
+    #[test]
+    fn ac3_acmod_channel_count_round_trip() {
+        assert_eq!(ac3_acmod_channels(1), 1); // mono
+        assert_eq!(ac3_acmod_channels(2), 2); // stereo
+        assert_eq!(ac3_acmod_channels(7), 5); // 3/2 surround
+    }
+
+    #[test]
+    fn parse_ac3_syncframe_recognises_synthetic_minimal_frame() {
+        // Build a 5.1 / 48 kHz / 192 kbps minimal header.
+        // fscod=0, frmsizecod=20 (192 kbps), bsid=8, bsmod=0, acmod=7, lfeon=1
+        let mut hdr = [0u8; 16];
+        hdr[0] = 0x0B;
+        hdr[1] = 0x77;
+        hdr[2] = 0; // crc1
+        hdr[3] = 0; // crc1
+        hdr[4] = (0u8 << 6) | 20; // fscod=0, frmsizecod=20
+        hdr[5] = (8 << 3) | 0; // bsid=8, bsmod=0
+        // acmod=7 (top 3), then per ETSI: cmixlev (2 b), surmixlev (2 b), then lfeon
+        hdr[6] = (7 << 5) | 0; // acmod=7
+        // After acmod (3 bits at positions 5..7 of byte 6) we have:
+        //   acmod=7 has 3 front (cmixlev present, 2 bits) and surrounds
+        //   present (surmixlev present, 2 bits). lfeon falls 4 bits later.
+        //   bit position 31 + 3 = 34? Let's just set every following bit
+        //   except the lfeon bit to zero — the parser reads byte 7, bit 5
+        //   (counting from MSB) for acmod=7.
+        // For acmod=7: bit_off after acmod = 51, +2 cmixlev=53, +2 surmixlev=55
+        // → byte 6, bit 0 (the LSB of byte 6 holds lfeon).
+        hdr[6] |= 0x01; // set lfeon = 1
+
+        let info = parse_ac3_syncframe(&hdr).expect("parse");
+        assert_eq!(info.fscod, 0);
+        assert_eq!(info.frmsizecod, 20);
+        assert_eq!(info.bsid, 8);
+        assert_eq!(info.acmod, 7);
+        assert!(info.lfeon);
+        assert_eq!(info.sample_rate, 48_000);
+        assert_eq!(info.channels, 6); // 5 + LFE
+        assert_eq!(info.frame_size, 768); // 4 × 192
+    }
+
+    #[test]
+    fn dac3_payload_round_trips_acmod_lfeon() {
+        let info = Ac3FrameInfo {
+            fscod: 0,
+            frmsizecod: 20,
+            bsid: 8,
+            bsmod: 0,
+            acmod: 7,
+            lfeon: true,
+            frame_size: 768,
+            sample_rate: 48_000,
+            channels: 6,
+        };
+        let p = build_dac3_payload(&info);
+        // Recover acmod from byte 1, bits 5..3.
+        let acmod = (p[1] >> 3) & 0x07;
+        assert_eq!(acmod, 7);
+        let lfeon = (p[1] >> 2) & 0x01;
+        assert_eq!(lfeon, 1);
+        // Recover bsid from byte 0, bits 5..1.
+        let bsid = (p[0] >> 1) & 0x1F;
+        assert_eq!(bsid, 8);
+        // Recover fscod from byte 0, bits 7..6.
+        let fscod = (p[0] >> 6) & 0x03;
+        assert_eq!(fscod, 0);
+    }
+
+    #[test]
+    fn dec3_payload_for_single_substream_is_5_bytes() {
+        let info = Ac3FrameInfo {
+            fscod: 0,
+            frmsizecod: 0,
+            bsid: 16,
+            bsmod: 0,
+            acmod: 7,
+            lfeon: true,
+            frame_size: 1024,
+            sample_rate: 48_000,
+            channels: 6,
+        };
+        let payload = build_dec3_payload(&info);
+        assert_eq!(payload.len(), 5);
+        // Substream descriptor byte 0: fscod(2) | bsid(5) | bsmod[4](1)
+        let fscod = (payload[2] >> 6) & 0x03;
+        assert_eq!(fscod, 0);
+        let bsid = (payload[2] >> 1) & 0x1F;
+        assert_eq!(bsid, 16);
+    }
+
+    #[test]
+    fn parse_mp2_frame_decodes_48k_stereo_192kbps() {
+        // MPEG-1 Layer II, 48 kHz, 192 kbps (bitrate index 10 = 1010),
+        // stereo. byte 2 = 1010 | 01 | 0 | 0 = 0xA4.
+        let hdr = [0xFFu8, 0xFD, 0xA4, 0x00];
+        let info = parse_mp2_frame(&hdr).expect("parse mp2");
+        assert_eq!(info.sample_rate, 48_000);
+        assert_eq!(info.channels, 2);
+        // 144 × 192_000 / 48_000 = 576 bytes.
+        assert_eq!(info.frame_size, 576);
+        assert_eq!(info.avg_bitrate, 192_000);
+    }
+
+    #[test]
+    fn parse_mp2_frame_rejects_layer_3() {
+        // Same header but layer = 01 (Layer III) → MP3, not MP2.
+        let hdr = [0xFFu8, 0xFB, 0xB4, 0x00];
+        assert!(parse_mp2_frame(&hdr).is_none());
     }
 
     #[test]

@@ -180,12 +180,39 @@ async fn encode_loop(
     let mut ts_mux = TsMuxer::new();
     ts_mux.set_has_video(true);
     ts_mux.set_video_stream_type(STREAM_TYPE_H264);
-    if audio_state.is_some() {
+    let has_audio = audio_state.is_some();
+    if has_audio {
         ts_mux.set_has_audio(true);
         ts_mux.set_audio_stream(STREAM_TYPE_AAC, None);
     } else {
         ts_mux.set_has_audio(false);
     }
+
+    // ── Smooth-splice continuity ──────────────────────────────────────
+    // Same pattern as the MP4 path: register the layout (bumps PMT
+    // version on a real change), seed CC counters from the previous
+    // file's last wire values, and apply the per-file PTS offset so
+    // the encoder's frame timeline (which always starts at 0) lands
+    // immediately after the previous file's last PTS on the wire.
+    const VIDEO_PID: u16 = 0x0100;
+    const AUDIO_PID: u16 = 0x0101;
+    const PAT_PID: u16 = 0x0000;
+    const PMT_PID: u16 = 0x1000;
+    let layout = super::StreamLayout {
+        video_pid: Some(VIDEO_PID),
+        video_stream_type: Some(STREAM_TYPE_H264),
+        audio_pid: has_audio.then_some(AUDIO_PID),
+        audio_stream_type: has_audio.then_some(STREAM_TYPE_AAC),
+    };
+    session.cont.update_layout(layout);
+    let cc_pat = session.cont.last_cc.get(&PAT_PID).copied().unwrap_or(0xFF);
+    let cc_pmt = session.cont.last_cc.get(&PMT_PID).copied().unwrap_or(0xFF);
+    let cc_video = session.cont.last_cc.get(&VIDEO_PID).copied().unwrap_or(0xFF);
+    let cc_audio = session.cont.last_cc.get(&AUDIO_PID).copied().unwrap_or(0xFF);
+    ts_mux.seed_cc(cc_pat, cc_pmt, cc_video, cc_audio);
+    ts_mux.set_pmt_version(session.cont.pmt_version);
+    let pts_offset_90k = session.cont.next_target_output_pts_90k;
+    let mut max_emitted_pts_90k: u64 = pts_offset_90k;
 
     let frame_duration = Duration::from_nanos(1_000_000_000 / fps.max(1) as u64);
     let start = Instant::now();
@@ -221,7 +248,16 @@ async fn encode_loop(
         .map_err(|e| anyhow!("image slate encode: {e}"))?;
 
         for ef in encoded {
-            for ts_pkt in ts_mux.mux_video(&ef.data, ef.pts as u64, ef.pts as u64, ef.keyframe) {
+            // Apply the per-file splice offset so the on-wire PTS
+            // continues from the previous file's last PTS instead of
+            // resetting to the encoder's PTS=0. 33-bit wrap.
+            let pts_out =
+                (ef.pts as u64).wrapping_add(pts_offset_90k) & 0x1_FFFF_FFFF;
+            if pts_out > max_emitted_pts_90k {
+                max_emitted_pts_90k = pts_out;
+            }
+            out_rtp_ts = pts_out as u32;
+            for ts_pkt in ts_mux.mux_video(&ef.data, pts_out, pts_out, ef.keyframe) {
                 bundle.extend_from_slice(&ts_pkt);
                 if bundle.len() >= BUNDLE_SIZE {
                     emit_bundle(&mut bundle, session, out_rtp_ts);
@@ -231,7 +267,12 @@ async fn encode_loop(
 
         if let Some(ref mut s) = audio_state {
             for (adts, apts) in s.tick(fps as usize)? {
-                for ts_pkt in ts_mux.mux_audio_pre_adts(&adts, apts) {
+                let apts_out =
+                    apts.wrapping_add(pts_offset_90k) & 0x1_FFFF_FFFF;
+                if apts_out > max_emitted_pts_90k {
+                    max_emitted_pts_90k = apts_out;
+                }
+                for ts_pkt in ts_mux.mux_audio_pre_adts(&adts, apts_out) {
                     bundle.extend_from_slice(&ts_pkt);
                     if bundle.len() >= BUNDLE_SIZE {
                         emit_bundle(&mut bundle, session, out_rtp_ts);
@@ -246,6 +287,17 @@ async fn encode_loop(
     if !bundle.is_empty() {
         emit_bundle(&mut bundle, session, out_rtp_ts);
     }
+
+    // Spill the muxer's final CC values back into continuity, then
+    // publish the high-water-mark PTS.
+    let (cc_pat, cc_pmt, cc_video, cc_audio) = ts_mux.current_cc();
+    session.cont.last_cc.insert(PAT_PID, cc_pat);
+    session.cont.last_cc.insert(PMT_PID, cc_pmt);
+    session.cont.last_cc.insert(VIDEO_PID, cc_video);
+    if has_audio {
+        session.cont.last_cc.insert(AUDIO_PID, cc_audio);
+    }
+    session.cont.close_file(max_emitted_pts_90k);
     Ok(())
 }
 

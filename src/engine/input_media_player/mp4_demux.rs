@@ -245,19 +245,47 @@ fn sr_index_to_u8(sr: SampleFreqIndex) -> u8 {
 }
 
 async fn play_demuxed(d: DemuxResult, session: &mut PlayerSession<'_>) -> Result<()> {
+    let has_video = d.video.is_some();
+    let has_audio = d.audio.is_some();
     let mut ts_mux = TsMuxer::new();
-    if d.video.is_some() {
-        ts_mux.set_has_video(true);
+    ts_mux.set_has_video(has_video);
+    if has_video {
         ts_mux.set_video_stream_type(STREAM_TYPE_H264);
-    } else {
-        ts_mux.set_has_video(false);
     }
-    if d.audio.is_some() {
+    if has_audio {
         ts_mux.set_has_audio(true);
         ts_mux.set_audio_stream(STREAM_TYPE_AAC, None);
     } else {
         ts_mux.set_has_audio(false);
     }
+
+    // ── Smooth-splice continuity ──────────────────────────────────────
+    // Register this file's layout with the playlist-wide continuity. If
+    // the layout differs from the previous file the PMT version_number
+    // bumps; otherwise the receiver sees a stable PMT and skips the
+    // decoder re-init. Then seed the muxer's CC counters from the
+    // previous file's last wire values so the on-wire CC sequence stays
+    // continuous, and apply the per-file PTS offset so the emitted
+    // timeline picks up immediately after the previous file's last PTS.
+    const VIDEO_PID: u16 = 0x0100;
+    const AUDIO_PID: u16 = 0x0101;
+    const PAT_PID: u16 = 0x0000;
+    const PMT_PID: u16 = 0x1000;
+    let layout = super::StreamLayout {
+        video_pid: has_video.then_some(VIDEO_PID),
+        video_stream_type: has_video.then_some(STREAM_TYPE_H264),
+        audio_pid: has_audio.then_some(AUDIO_PID),
+        audio_stream_type: has_audio.then_some(STREAM_TYPE_AAC),
+    };
+    session.cont.update_layout(layout);
+    let cc_pat = session.cont.last_cc.get(&PAT_PID).copied().unwrap_or(0xFF);
+    let cc_pmt = session.cont.last_cc.get(&PMT_PID).copied().unwrap_or(0xFF);
+    let cc_video = session.cont.last_cc.get(&VIDEO_PID).copied().unwrap_or(0xFF);
+    let cc_audio = session.cont.last_cc.get(&AUDIO_PID).copied().unwrap_or(0xFF);
+    ts_mux.seed_cc(cc_pat, cc_pmt, cc_video, cc_audio);
+    ts_mux.set_pmt_version(session.cont.pmt_version);
+    let pts_offset_90k = session.cont.next_target_output_pts_90k;
+    let mut max_emitted_pts_90k: u64 = pts_offset_90k;
 
     // Pre-build SPS / PPS NALs in Annex-B form once — every IDR sample
     // emits with these prepended.
@@ -323,24 +351,37 @@ async fn play_demuxed(d: DemuxResult, session: &mut PlayerSession<'_>) -> Result
         let chunks: Vec<bytes::Bytes> = match it.track {
             Track::Video => {
                 let s = &video_samples.unwrap()[it.index];
-                let pts_90 = ts_to_90khz(
+                let pts_90 = (ts_to_90khz(
                     s.start_time as i64 + s.rendering_offset as i64,
                     video_timescale,
-                );
-                let dts_90 = ts_to_90khz(s.start_time as i64, video_timescale);
+                )
+                .wrapping_add(pts_offset_90k))
+                    & 0x1_FFFF_FFFF;
+                let dts_90 =
+                    (ts_to_90khz(s.start_time as i64, video_timescale)
+                        .wrapping_add(pts_offset_90k))
+                        & 0x1_FFFF_FFFF;
                 let annex_b = avcc_to_annex_b(&s.bytes, &sps_nal, &pps_nal, s.is_sync);
                 out_rtp_ts = pts_90 as u32;
+                if pts_90 > max_emitted_pts_90k {
+                    max_emitted_pts_90k = pts_90;
+                }
                 ts_mux.mux_video(&annex_b, pts_90, dts_90, s.is_sync)
             }
             Track::Audio => {
                 let s = &audio_samples.unwrap()[it.index];
-                let pts_90 = ts_to_90khz(s.start_time as i64, audio_timescale);
+                let pts_90 = (ts_to_90khz(s.start_time as i64, audio_timescale)
+                    .wrapping_add(pts_offset_90k))
+                    & 0x1_FFFF_FFFF;
                 let (profile, sr_idx, ch_cfg) =
                     aac_extra.expect("audio path implies aac_extra");
                 let mut adts =
                     build_adts_header(profile, sr_idx, ch_cfg, s.bytes.len());
                 adts.extend_from_slice(&s.bytes);
                 out_rtp_ts = pts_90 as u32;
+                if pts_90 > max_emitted_pts_90k {
+                    max_emitted_pts_90k = pts_90;
+                }
                 ts_mux.mux_audio_pre_adts(&adts, pts_90)
             }
         };
@@ -356,6 +397,20 @@ async fn play_demuxed(d: DemuxResult, session: &mut PlayerSession<'_>) -> Result
     if !bundle.is_empty() {
         emit_bundle(&mut bundle, session, out_rtp_ts);
     }
+
+    // Spill the muxer's final CC values back into continuity so the next
+    // file picks up the wire CC sequence without a reset, then publish
+    // the high-water-mark PTS so the next file's offset starts from there.
+    let (cc_pat, cc_pmt, cc_video, cc_audio) = ts_mux.current_cc();
+    session.cont.last_cc.insert(PAT_PID, cc_pat);
+    session.cont.last_cc.insert(PMT_PID, cc_pmt);
+    if has_video {
+        session.cont.last_cc.insert(VIDEO_PID, cc_video);
+    }
+    if has_audio {
+        session.cont.last_cc.insert(AUDIO_PID, cc_audio);
+    }
+    session.cont.close_file(max_emitted_pts_90k);
     Ok(())
 }
 

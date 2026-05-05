@@ -640,6 +640,11 @@ async fn publish_loop(
                 // RTMP carries H.264 / HEVC + AAC — MPEG-2 video would
                 // need a transcode hop we don't have on this output yet.
                 DemuxedFrame::Mpeg2 { .. } => {}
+                // Stream discontinuity is metadata for stateful consumers
+                // that own decoder state. RTMP is a forwarding output —
+                // the FLV writer re-anchors on the next IDR / AAC config
+                // change naturally.
+                DemuxedFrame::Discontinuity => {}
             }
         }
 

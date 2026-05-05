@@ -953,6 +953,11 @@ fn edge_capabilities() -> Vec<&'static str> {
         // before showing the filmstrip-cadence field on the flow form
         // and before fetching `…/replay/filmstrip` on the timeline.
         caps.push("replay-filmstrip");
+        // MP4 export — TS→fMP4 remuxer for the Recordings library
+        // download surface. UI uses this to light up the ⬇ MP4 button
+        // alongside ⬇ TS. H.264+AAC only; HEVC / non-AAC streams
+        // surface `replay_export_format_unsupported`.
+        caps.push("replay_export_mp4");
     }
     if cfg!(any(
         feature = "video-encoder-x264",
@@ -3024,6 +3029,233 @@ async fn execute_command(
                     "replay_root_total_bytes": total,
                 }))),
             }
+        }
+        #[cfg(feature = "replay")]
+        "list_recordings" => {
+            // Library-style enumeration of every on-disk recording under
+            // the replay root. Decorates each row with `flow_id` (the
+            // owning flow if one is currently armed against it) and
+            // `armed` (the writer is rolling). Recordings whose flow
+            // either has recording disabled now or whose flow is gone
+            // entirely surface as `flow_id: null, armed: false` so the
+            // manager UI can render them with an `(orphan)` chip.
+            let root = crate::replay::replay_root();
+            let summaries = crate::replay::recordings::enumerate(&root).await;
+            let armed_map: std::collections::HashMap<String, String> = flow_manager
+                .flows_with_recording()
+                .into_iter()
+                .map(|(flow, rec)| (rec, flow))
+                .collect();
+            let (free, total) = crate::replay::replay_disk_usage().unwrap_or((0, 0));
+            let recordings_json: Vec<serde_json::Value> = summaries
+                .into_iter()
+                .map(|s| {
+                    let owning_flow = armed_map.get(&s.recording_id).cloned();
+                    let armed = owning_flow.is_some();
+                    serde_json::json!({
+                        "recording_id": s.recording_id,
+                        "flow_id": owning_flow,
+                        "armed": armed,
+                        "segment_count": s.segment_count,
+                        "total_bytes": s.total_bytes,
+                        "first_pts_90khz": s.first_pts_90khz,
+                        "last_pts_90khz": s.last_pts_90khz,
+                        "created_at_unix": s.created_at_unix,
+                        "last_modified_unix": s.last_modified_unix,
+                        "clip_count": s.clip_count,
+                    })
+                })
+                .collect();
+            Ok(Some(serde_json::json!({
+                "recordings": recordings_json,
+                "replay_root_free_bytes": free,
+                "replay_root_total_bytes": total,
+            })))
+        }
+        #[cfg(feature = "replay")]
+        "delete_recording" => {
+            // Refuse to nuke a recording that the writer is currently
+            // appending to — operator must `stop_recording` first. The
+            // disk-side delete is otherwise irreversible, so we lift
+            // `replay_recording_active` onto `command_ack.error_code`
+            // and let the manager UI surface a precise error toast.
+            let recording_id = action["recording_id"].as_str()
+                .ok_or("delete_recording: missing 'recording_id'")?
+                .to_string();
+            let armed_map: std::collections::HashMap<String, String> = flow_manager
+                .flows_with_recording()
+                .into_iter()
+                .map(|(flow, rec)| (rec, flow))
+                .collect();
+            if let Some(flow_id) = armed_map.get(&recording_id) {
+                return Err(CommandError::with_code(
+                    format!(
+                        "recording '{recording_id}' is currently armed by flow '{flow_id}' — \
+                         stop the recording first"
+                    ),
+                    "replay_recording_active",
+                ));
+            }
+            let root = crate::replay::replay_root();
+            let bytes_freed = crate::replay::recordings::delete_recording(&root, &recording_id)
+                .await
+                .map_err(|e| CommandError::with_code(
+                    e.to_string(),
+                    "replay_storage_id_invalid",
+                ))?;
+            flow_manager.event_sender().emit_with_details(
+                crate::manager::events::EventSeverity::Info,
+                crate::manager::events::category::REPLAY,
+                format!(
+                    "Recording '{recording_id}' deleted ({} bytes freed)",
+                    bytes_freed
+                ),
+                None,
+                serde_json::json!({
+                    "replay_event": "recording_deleted",
+                    "recording_id": recording_id,
+                    "bytes_freed": bytes_freed,
+                }),
+            );
+            Ok(Some(serde_json::json!({
+                "recording_id": recording_id,
+                "bytes_freed": bytes_freed,
+            })))
+        }
+        #[cfg(feature = "replay")]
+        "export_clip" => {
+            // Pull-based chunked TS export. The manager calls repeatedly
+            // with increasing `byte_offset` until the response carries
+            // `eof: true`. `format` is reserved — Phase 1 ships TS only;
+            // requests for other formats short-circuit so the manager
+            // gets a clean error instead of a silent TS download.
+            let clip_id = action["clip_id"].as_str()
+                .ok_or("export_clip: missing 'clip_id'")?
+                .to_string();
+            let format = action["format"].as_str().unwrap_or("ts");
+            if format != "ts" && format != "mp4" {
+                return Err(CommandError::with_code(
+                    format!("export_clip: format '{format}' not supported (ts | mp4)"),
+                    "replay_export_format_unsupported",
+                ));
+            }
+            let byte_offset = action["byte_offset"].as_u64().unwrap_or(0);
+            let max_bytes = action["chunk_bytes"].as_u64()
+                .unwrap_or(crate::replay::export::DEFAULT_CHUNK_BYTES);
+            // Locate the recording that owns the clip — same walk as
+            // the get_clip / rename_clip / delete_clip arms.
+            let root = crate::replay::replay_root();
+            let mut owning_recording: Option<String> = None;
+            if let Ok(mut dir) = tokio::fs::read_dir(&root).await {
+                while let Ok(Some(entry)) = dir.next_entry().await {
+                    if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                        continue;
+                    }
+                    let rid = match entry.file_name().to_str() {
+                        Some(s) => s.to_string(),
+                        None => continue,
+                    };
+                    let store = match crate::replay::clips::ClipStore::open(&rid, &entry.path()).await {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    if store.get(&clip_id).await.is_some() {
+                        owning_recording = Some(rid);
+                        break;
+                    }
+                }
+            }
+            let recording_id = owning_recording.ok_or_else(|| CommandError::with_code(
+                format!("Clip '{clip_id}' not found"),
+                "replay_clip_not_found",
+            ))?;
+            let chunk = if format == "mp4" {
+                crate::replay::export_mp4::export_clip_mp4_chunk(
+                    &recording_id, &clip_id, byte_offset, max_bytes,
+                ).await
+            } else {
+                crate::replay::export::export_clip_chunk(
+                    &recording_id, &clip_id, byte_offset, max_bytes,
+                ).await
+            }.map_err(|e| {
+                let code = match e.to_string().as_str() {
+                    s if s.contains("replay_invalid_range") => "replay_invalid_range",
+                    s if s.contains("replay_clip_not_found") => "replay_clip_not_found",
+                    s if s.contains("replay_no_index") => "replay_no_index",
+                    s if s.contains("replay_export_format_unsupported") => "replay_export_format_unsupported",
+                    s if s.contains("replay_export_too_large") => "replay_export_too_large",
+                    _ => "replay_export_failed",
+                };
+                CommandError::with_code(e.to_string(), code)
+            })?;
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&chunk.data);
+            Ok(Some(serde_json::json!({
+                "clip_id": clip_id,
+                "recording_id": recording_id,
+                "format": format,
+                "byte_offset": chunk.byte_offset,
+                "total_bytes": chunk.total_bytes,
+                "chunk_bytes": chunk.data.len(),
+                "data": b64,
+                "eof": chunk.eof,
+            })))
+        }
+        #[cfg(feature = "replay")]
+        "export_recording" => {
+            // Whole-recording export, optionally bounded by [from_pts, to_pts].
+            // Same pull-based chunked shape as export_clip. The
+            // edge-side cap (replay::export::MAX_EXPORT_TOTAL_BYTES)
+            // lifts `replay_export_too_large` for >4 GiB exports —
+            // operator marks a clip first.
+            let recording_id = action["recording_id"].as_str()
+                .ok_or("export_recording: missing 'recording_id'")?
+                .to_string();
+            let format = action["format"].as_str().unwrap_or("ts");
+            if format != "ts" && format != "mp4" {
+                return Err(CommandError::with_code(
+                    format!("export_recording: format '{format}' not supported (ts | mp4)"),
+                    "replay_export_format_unsupported",
+                ));
+            }
+            let from_pts = action["from_pts_90khz"].as_u64();
+            let to_pts = action["to_pts_90khz"].as_u64();
+            let byte_offset = action["byte_offset"].as_u64().unwrap_or(0);
+            let max_bytes = action["chunk_bytes"].as_u64()
+                .unwrap_or(crate::replay::export::DEFAULT_CHUNK_BYTES);
+            let chunk = if format == "mp4" {
+                crate::replay::export_mp4::export_recording_mp4_chunk(
+                    &recording_id, from_pts, to_pts, byte_offset, max_bytes,
+                ).await
+            } else {
+                crate::replay::export::export_recording_chunk(
+                    &recording_id, from_pts, to_pts, byte_offset, max_bytes,
+                ).await
+            }.map_err(|e| {
+                let code = match e.to_string().as_str() {
+                    s if s.contains("replay_invalid_range") => "replay_invalid_range",
+                    s if s.contains("replay_clip_not_found") => "replay_clip_not_found",
+                    s if s.contains("replay_no_index") => "replay_no_index",
+                    s if s.contains("replay_no_segments") => "replay_no_segments",
+                    s if s.contains("replay_export_too_large") => "replay_export_too_large",
+                    s if s.contains("replay_export_format_unsupported") => "replay_export_format_unsupported",
+                    _ => "replay_export_failed",
+                };
+                CommandError::with_code(e.to_string(), code)
+            })?;
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&chunk.data);
+            Ok(Some(serde_json::json!({
+                "recording_id": recording_id,
+                "format": format,
+                "byte_offset": chunk.byte_offset,
+                "total_bytes": chunk.total_bytes,
+                "chunk_bytes": chunk.data.len(),
+                "data": b64,
+                "eof": chunk.eof,
+                "from_pts_90khz": from_pts,
+                "to_pts_90khz": to_pts,
+            })))
         }
         #[cfg(feature = "replay")]
         "delete_clip" => {

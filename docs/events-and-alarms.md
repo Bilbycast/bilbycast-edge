@@ -575,6 +575,7 @@ also set `details.error_code` for `command_ack` correlation.
 | `recording_start_failed` | Critical | The writer task failed to start (storage unavailable, permission denied) | `replay_disk_full` |
 | `clip_created` | Info | A `mark_out` materialised a new clip into `clips.json` (with fsync). `details.clip` carries the full `ClipInfo`. | — |
 | `clip_deleted` | Info | A `delete_clip` succeeded | — |
+| `recording_deleted` | Info | A `delete_recording` succeeded — the recording's directory under `<replay_root>/<recording_id>/` was unlinked. `details.bytes_freed` carries the byte total reclaimed. | — |
 | `playback_started` | Info | A replay input transitioned to playing | — |
 | `playback_stopped` | Info | A replay input was stopped by command | — |
 | `playback_eof` | Info | A replay input reached the end of its range and `loop_playback = false` | — |
@@ -606,6 +607,12 @@ actions (`start_recording`, `mark_in`, `mark_out`, `cue_clip`,
 | `replay_recovery_alert` | Crash-recovery scan ran on writer init — see matching Warning event |
 | `replay_metadata_stale` | `recording.json` write failed; resume id is derived from disk on restart |
 | `replay_max_bytes_below_segment` | `max_bytes` smaller than one segment — retention can't keep usage under the cap without deleting the live edge |
+| `replay_recording_active` | `delete_recording` was sent for a recording that the writer is currently appending to — operator must `stop_recording` first |
+| `replay_export_format_unsupported` | `export_clip` / `export_recording` was given a `format` other than `"ts"` (Phase 1 ships TS only) |
+| `replay_export_too_large` | `export_recording` resolved to > 4 GiB of bytes — operator should mark a clip first to bound the pull |
+| `replay_export_failed` | `export_clip` / `export_recording` hit an unclassified read error mid-pull (transient I/O, segment removed by retention between calls). Manager retries from the same `byte_offset`. |
+| `replay_no_segments` | `export_recording` ran against a recording with no segments on disk yet |
+| `replay_no_index` | `export_clip` / `export_recording` ran against a recording with an empty `index.bin` (no IDR captured yet) |
 
 Producers should use `EventSender::emit_with_details(EventSeverity::*,
 category::REPLAY, message, flow_id, details)` (defined in
@@ -624,6 +631,8 @@ the offending output row on a multi-output flow.
 |---|---|---|---|
 | `display_started` | Info | Modeset succeeded, ALSA opened (or muted), first frame queued | `details = { error_code: "ok", output_id, … }` |
 | `display_stopped` | Info | Cancellation token fired; CRTC + framebuffers + ALSA released | Includes lifetime `frames_displayed` / `late_drops` / `audio_underruns` |
+| `display_output_waiting` | Info | Another flow's display output already holds the targeted `(device, audio_device)` pair. The output has registered as a FCFS waiter on the per-edge `DisplayClaimRegistry` and parks here until the holder releases or the per-output cancel token fires. `KmsDisplay::open` has not been attempted yet. | `details = { error_code: "display_output_waiting", output_id, device, audio_device, holder_flow_id, holder_output_id, queue_position }` |
+| `display_output_acquired` | Info | The per-edge `DisplayClaimRegistry` promoted this output to be the new holder of the `(device, audio_device)` pair. Always follows a `display_output_waiting` for the same `(flow_id, output_id)`; pairs with the existing `display_started` event a moment later (after the KMS modeset). | `details = { error_code: "display_output_acquired", output_id, device, audio_device, previous_holder_flow_id, previous_holder_output_id }` |
 | `display_auto_matched` | Info | `scaling_mode: match_source` modeset to the source-covering mode succeeded | Fires on first decoded frame and again on every source-shape change |
 | `display_auto_match_failed` | Warning | `scaling_mode: match_source` modeset rejected by KMS — output keeps running at the startup mode | Lifts whatever `display_*` error string KMS returned |
 | `display_monitor_native_set` | Info | `scaling_mode: monitor_native` modeset to the connector-preferred (panel-native) mode succeeded | Fires once per output start; usually a no-op since KMS opened at preferred |
@@ -638,6 +647,9 @@ the offending output row on a multi-output flow.
 | `display_hw_decode_unavailable_falling_back` | Warning | Operator forced a HW backend (`hw_decode = nvdec` / `qsv` / `vaapi`) the host can't satisfy at probe time. The display task falls back to CPU and continues — broadcast invariant is "picture stays on screen". | `details = { error_code, output_id, preference, reason ("feature_disabled"/"driver_missing"/"probe_unavailable"/"no_readable_pixfmt"), fell_back_to: "cpu" }`. Manager UI flags the dropdown as "wrong choice" while the picture still renders via CPU |
 | `display_hw_decode_runtime_failed` | Warning | Either (a) sustained `send_packet` error run on the HW decoder (≥ 30 consecutive errors ≈ 1 s on 25–30 fps), or (b) decoder accepted packets but produced no frame within 2.5 s of first send — both paths converge on `force_cpu_fallback`, which emits this once per HW→CPU demotion | `details = { error_code, output_id, requested_backend, fell_back_to: "cpu", trigger ("send_packet_errors"/"watchdog_no_frames"), last_error }`. The continuous-rate counters `send_packet_errors`, `decoder_demotions`, `frames_received_since_open` on `DisplayStats` complement this single event |
 | `display_hw_decode_no_frames` | Warning | Watchdog: HW decoder opened cleanly + accepted at least one packet, but produced zero frames in 2.5 s. Always followed in the same iteration by `display_hw_decode_runtime_failed` (with `trigger: "watchdog_no_frames"`) — the two events together describe the symptom and the action | `details = { error_code, output_id, backend, ms_since_first_send }` |
+| `display_input_switch_acquiring` | Info | `TsDemuxer` surfaced `DemuxedFrame::Discontinuity` because the upstream PMT `version_number` advanced — the canonical signal `TsContinuityFixer::on_switch` injects on every operator switch (including dead-input switches). The display loop flushes every persistent decoder so the next AU from the new stream becomes the fresh anchor | `details = { error_code, output_id }`. Always paired with a follow-up `display_input_switch_acquired` (success) or `display_input_switch_slow_gop` (warning) — the operator UI uses both to render an "acquiring..." chip with elapsed-ms |
+| `display_input_switch_acquired` | Info | First decoded video frame from the new stream landed; the pre-flush counter (`frames_received_since_open`) advanced past 0 for the current open-window | `details = { error_code, output_id, elapsed_ms }`. Healthy short-GOP sources finish well under one second; long-GOP DVB-style sources finish near `2 × source_GOP_ms` |
+| `display_input_switch_slow_gop` | Warning | Acquisition has been in flight for 5 s without producing a decoded frame. One-shot per acquiring window (re-armed on the next `_acquiring`) — usually a long source GOP or a genuinely broken pipeline | `details = { error_code, output_id, elapsed_ms }`. Distinguishable from `display_hw_decode_no_frames` by category (`flow` vs `system_resources`) and by whether the watchdog also fired in the same window |
 
 Operator-driven `command_ack.error_code` values (lifted from
 `add_output` / `update_config` failures):
@@ -649,7 +661,7 @@ Operator-driven `command_ack.error_code` values (lifted from
 | `display_resolution_unsupported` | Configured `resolution` / `refresh_hz` does not match any mode the connector advertises |
 | `display_program_not_found` | After 5 s, the demuxer hasn't seen the configured `program_number` in the PAT |
 | `display_audio_track_not_found` | Configured `audio_track_index` exceeds the PMT's audio-stream count |
-| `display_device_busy` | Another active output already claimed this `(device, audio_device)` pair (cross-output uniqueness reject) |
+| `display_device_busy` | Reserved for future use. The previous "static-config rejection on duplicate `(device, audio_device)`" semantics no longer apply: the validator now logs a `warn!` and allows duplicates so the runtime `DisplayClaimRegistry` can serialise them via take-over. Runtime contention emits `display_output_waiting` / `display_output_acquired` instead |
 | `display_decoder_overload_predicted` | Validation-time warning when 4K60 is requested without HW decode — does NOT block save; surfaced as a hint in the manager UI |
 
 Configuration schema and operator-visible knobs live in

@@ -126,18 +126,92 @@ fn parse_hevc_sps_resolution(sps: &[u8]) -> Option<(u32, u32)> {
     Some((pic_width_in_luma_samples, pic_height_in_luma_samples))
 }
 
-/// Audio track metadata.
+/// Audio track metadata. The codec-specific configuration lives in the
+/// [`AudioCodec`] enum so the same `AudioTrack` shape carries AAC, MP2,
+/// AC-3, or E-AC-3.
 pub struct AudioTrack {
-    /// 2-byte AudioSpecificConfig from [`super::codecs::aac_audio_specific_config`].
-    pub audio_specific_config: [u8; 2],
-    /// Sampling rate in Hz; used as the track's `mdhd.timescale` and the
-    /// `mp4a` sample entry rate.
+    /// Codec-specific decoder configuration. Selects the sample-entry
+    /// fourcc (`mp4a` / `ac-3` / `ec-3`) and the matching child config
+    /// box (`esds` / `dac3` / `dec3`).
+    pub codec: AudioCodec,
+    /// Sampling rate in Hz; used as the track's `mdhd.timescale` and
+    /// the sample-entry rate. Must match the codec's actual rate
+    /// (AAC: ASC sample-rate index → Hz; AC-3: fscod table → Hz;
+    /// MP2: header sample-rate field → Hz).
     pub sample_rate: u32,
-    /// Channel count (1 = mono, 2 = stereo). AAC-LC with 5.1 uses
-    /// `channel_configuration = 6`.
+    /// Channel count (1 = mono, 2 = stereo). For AC-3 / E-AC-3 this is
+    /// the decoded channel count derived from `acmod + lfeon`; for AAC
+    /// it's the `channel_configuration` value.
     pub channels: u16,
-    /// Average bitrate in bits per second (written into the esds DCD).
-    pub avg_bitrate: u32,
+}
+
+/// Per-codec audio configuration. Each variant is the minimum the
+/// matching MP4 sample entry needs to be playable in compliant
+/// players (Quicktime, ffmpeg, browsers via MSE).
+#[derive(Debug, Clone)]
+pub enum AudioCodec {
+    /// MPEG-4 AAC-LC (ISO/IEC 14496-3). Sample entry `mp4a` + `esds`
+    /// with `objectTypeIndication = 0x40` (MPEG-4 Audio).
+    Aac {
+        /// 2-byte AudioSpecificConfig from
+        /// [`super::codecs::aac_audio_specific_config`].
+        audio_specific_config: [u8; 2],
+        /// Average bitrate in bits per second (written into the esds DCD).
+        avg_bitrate: u32,
+    },
+    /// MPEG-1 / MPEG-2 Layer II audio (ISO/IEC 11172-3). Sample entry
+    /// `mp4a` + `esds` with `objectTypeIndication = 0x69` (MPEG-1 Audio,
+    /// also accepted by all major MP4 parsers for MPEG-2 Layer II since
+    /// the bitstream is wire-identical). Empty DecoderSpecificInfo —
+    /// every parameter is encoded inside the MP2 frame headers.
+    Mp2 {
+        avg_bitrate: u32,
+    },
+    /// AC-3 (Dolby Digital, ETSI TS 102 366 Annex F.4). Sample entry
+    /// `ac-3` + `dac3` config box.
+    Ac3 {
+        /// 3-byte AC3SpecificBox payload — `fscod(2) | bsid(5) |
+        /// bsmod(3) | acmod(3) | lfeon(1) | bit_rate_code(5) |
+        /// reserved(5)`.
+        dac3: [u8; 3],
+    },
+    /// E-AC-3 (Dolby Digital Plus, ETSI TS 102 366 Annex F.6). Sample
+    /// entry `ec-3` + `dec3` config box.
+    EAc3 {
+        /// Variable-length EC3SpecificBox payload built by
+        /// [`super::codecs::build_dec3_payload`].
+        dec3: Vec<u8>,
+    },
+}
+
+impl AudioTrack {
+    /// Build an AAC-LC audio track. Convenience constructor used by every
+    /// AAC ingest path (RTMP / RTSP / WebRTC / TS demux).
+    pub fn aac(
+        audio_specific_config: [u8; 2],
+        sample_rate: u32,
+        channels: u16,
+        avg_bitrate: u32,
+    ) -> Self {
+        Self {
+            codec: AudioCodec::Aac {
+                audio_specific_config,
+                avg_bitrate,
+            },
+            sample_rate,
+            channels,
+        }
+    }
+
+    /// Returns the 2-byte AAC AudioSpecificConfig if this track carries
+    /// AAC, else `None`. Used by manifest builders (DASH MPD, HLS m3u8)
+    /// that quote the ASC bytes when computing the codec string.
+    pub fn aac_asc(&self) -> Option<&[u8; 2]> {
+        match &self.codec {
+            AudioCodec::Aac { audio_specific_config, .. } => Some(audio_specific_config),
+            _ => None,
+        }
+    }
 }
 
 /// Track ID constants. Must be positive and unique within the movie.
@@ -481,21 +555,52 @@ fn write_audio_stbl(
     {
         let mut stsd = stbl.child_full(*b"stsd", 0, 0);
         stsd.u32(1);
-        let original_fourcc = *b"mp4a";
+        // Codec → sample-entry fourcc:
+        //   AAC + MP2 → mp4a (both use esds; MP2 with OTI 0x69)
+        //   AC-3      → ac-3
+        //   E-AC-3    → ec-3
+        // CENC scrambles only AAC/MP2 (`mp4a` ↔ `enca`) today; AC-3 / E-AC-3
+        // CENC variants exist but aren't wired here yet — caller must not
+        // pass `cenc` for those codecs.
+        let original_fourcc: [u8; 4] = match &a.codec {
+            AudioCodec::Aac { .. } | AudioCodec::Mp2 { .. } => *b"mp4a",
+            AudioCodec::Ac3 { .. } => *b"ac-3",
+            AudioCodec::EAc3 { .. } => *b"ec-3",
+        };
         let fourcc = if cenc.is_some() { *b"enca" } else { original_fourcc };
-        let mut mp4a = stsd.child(fourcc);
-        mp4a.zeros(6); // reserved
-        mp4a.u16(1); // data_reference_index
+        let mut entry = stsd.child(fourcc);
+        entry.zeros(6); // reserved
+        entry.u16(1); // data_reference_index
         // AudioSampleEntry (ISO/IEC 14496-12 §12.2)
-        mp4a.zeros(8); // reserved(u32[2])
-        mp4a.u16(a.channels);
-        mp4a.u16(16); // samplesize
-        mp4a.u16(0); // pre_defined
-        mp4a.u16(0); // reserved
+        entry.zeros(8); // reserved(u32[2])
+        entry.u16(a.channels);
+        entry.u16(16); // samplesize
+        entry.u16(0); // pre_defined
+        entry.u16(0); // reserved
         // samplerate: 16.16 fixed. Upper 16 bits carry Hz for rates < 65 536.
-        mp4a.u32(a.sample_rate << 16);
+        entry.u32(a.sample_rate << 16);
 
-        write_esds(&mut mp4a, &a.audio_specific_config, a.avg_bitrate);
+        match &a.codec {
+            AudioCodec::Aac {
+                audio_specific_config,
+                avg_bitrate,
+            } => {
+                write_esds(&mut entry, audio_specific_config, *avg_bitrate);
+            }
+            AudioCodec::Mp2 { avg_bitrate } => {
+                // MP2 uses the same esds shape as AAC but with
+                // objectTypeIndication = 0x69 (MPEG-1 Audio L2) and an
+                // empty DecoderSpecificInfo — the MP2 bitstream
+                // self-describes via its frame headers.
+                super::codecs::write_esds_mpeg_audio(&mut entry, *avg_bitrate);
+            }
+            AudioCodec::Ac3 { dac3 } => {
+                super::codecs::write_dac3(&mut entry, dac3);
+            }
+            AudioCodec::EAc3 { dec3 } => {
+                super::codecs::write_dec3(&mut entry, dec3);
+            }
+        }
 
         if let Some(c) = cenc {
             let per_sample_iv = match c.scheme {
@@ -503,7 +608,7 @@ fn write_audio_stbl(
                 super::cenc::Scheme::Cbcs => 0,
             };
             super::cenc_boxes::write_sinf(
-                &mut mp4a,
+                &mut entry,
                 original_fourcc,
                 c.scheme,
                 c.key_id,
@@ -1002,12 +1107,7 @@ mod tests {
     }
 
     fn synthetic_audio_track() -> AudioTrack {
-        AudioTrack {
-            audio_specific_config: [0x11, 0x90], // 48 kHz stereo AAC-LC
-            sample_rate: 48000,
-            channels: 2,
-            avg_bitrate: 128_000,
-        }
+        AudioTrack::aac([0x11, 0x90], 48000, 2, 128_000)
     }
 
     #[test]
@@ -1044,6 +1144,94 @@ mod tests {
         let init = build_init_segment(&synthetic_video_track(), Some(&synthetic_audio_track()));
         assert!(find_fourcc_pos(&init, *b"mp4a").is_some());
         assert!(find_fourcc_pos(&init, *b"esds").is_some());
+    }
+
+    #[test]
+    fn init_with_ac3_track_emits_ac3_sample_entry_and_dac3_box() {
+        let v = synthetic_video_track();
+        let a = AudioTrack {
+            codec: AudioCodec::Ac3 { dac3: [0x10, 0x40, 0x40] },
+            sample_rate: 48_000,
+            channels: 6,
+        };
+        let init = build_init_segment(&v, Some(&a));
+        assert!(
+            find_fourcc_pos(&init, *b"ac-3").is_some(),
+            "ac-3 sample entry must be present in moov"
+        );
+        assert!(
+            find_fourcc_pos(&init, *b"dac3").is_some(),
+            "dac3 specific box must be present"
+        );
+        assert!(
+            find_fourcc_pos(&init, *b"esds").is_none(),
+            "AC-3 must not write an esds box"
+        );
+    }
+
+    #[test]
+    fn init_with_eac3_track_emits_ec3_sample_entry_and_dec3_box() {
+        let v = synthetic_video_track();
+        let a = AudioTrack {
+            codec: AudioCodec::EAc3 { dec3: vec![0u8; 5] },
+            sample_rate: 48_000,
+            channels: 6,
+        };
+        let init = build_init_segment(&v, Some(&a));
+        assert!(
+            find_fourcc_pos(&init, *b"ec-3").is_some(),
+            "ec-3 sample entry must be present in moov"
+        );
+        assert!(
+            find_fourcc_pos(&init, *b"dec3").is_some(),
+            "dec3 specific box must be present"
+        );
+    }
+
+    #[test]
+    fn init_with_mp2_track_writes_mp4a_with_oti_0x69() {
+        let v = synthetic_video_track();
+        let a = AudioTrack {
+            codec: AudioCodec::Mp2 { avg_bitrate: 192_000 },
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let init = build_init_segment(&v, Some(&a));
+        let mp4a = find_fourcc_pos(&init, *b"mp4a").expect("MP2 still uses mp4a sample entry");
+        let esds = find_fourcc_pos_after(&init, *b"esds", mp4a)
+            .expect("MP2 must produce an esds box");
+        // The DCD descriptor (tag 0x04) carries objectTypeIndication in
+        // its first body byte. Walk past `esds` 4-byte type marker and
+        // the 4-byte FullBox version+flags, then scan for tag 0x04.
+        let dcd_oti = find_dcd_object_type_indication(&init, esds)
+            .expect("DCD with OTI in esds");
+        assert_eq!(
+            dcd_oti, 0x69,
+            "MP2 OTI must be 0x69 (MPEG-1 Audio L2)"
+        );
+    }
+
+    /// Walk the bytes after an `esds` fourcc occurrence looking for the
+    /// MPEG-4 Systems DecoderConfigDescriptor (tag `0x04`) — its first
+    /// body byte is the `objectTypeIndication`.
+    fn find_dcd_object_type_indication(buf: &[u8], esds_pos: usize) -> Option<u8> {
+        // esds box body: 4-byte size + 4-byte type + 4-byte version/flags + descriptors.
+        // We came in at the position of the type bytes, so walk forward
+        // skipping the FullBox prefix to land on the first descriptor tag.
+        let start = esds_pos + 4 + 4; // past type + version+flags
+        // Look for 0x04 (DCD tag), bounded by the next ~64 bytes (esds is small).
+        let end = (start + 64).min(buf.len());
+        let mut i = start;
+        while i < end {
+            if buf[i] == 0x04 {
+                // Skip tag (1 byte) + length-byte (1) → next byte is OTI.
+                if i + 2 < buf.len() {
+                    return Some(buf[i + 2]);
+                }
+            }
+            i += 1;
+        }
+        None
     }
 
     #[test]

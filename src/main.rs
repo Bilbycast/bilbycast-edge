@@ -310,6 +310,8 @@ async fn main() -> anyhow::Result<()> {
     // the `hardware-monitor-nvml` feature.
     let live_gpu_state = Arc::new(engine::hardware_probe::LiveUtilizationState::new());
     let resource_action = app_config.resource_limits.as_ref().map(|rl| rl.critical_action.clone());
+    #[cfg(all(feature = "display", target_os = "linux"))]
+    let display_claim_registry = display::claim_registry::DisplayClaimRegistry::new();
     let flow_manager = Arc::new(FlowManager::new(
         global_stats.clone(),
         ffmpeg_available,
@@ -317,6 +319,8 @@ async fn main() -> anyhow::Result<()> {
         resource_state.clone(),
         resource_action,
         Some(static_capabilities.clone()),
+        #[cfg(all(feature = "display", target_os = "linux"))]
+        Arc::clone(&display_claim_registry),
     ));
     let tunnel_manager = Arc::new(TunnelManager::new(event_sender.clone()));
     let standby_listeners = Arc::new(

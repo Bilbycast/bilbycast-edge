@@ -21,6 +21,18 @@ const STREAM_TYPE_AAC_ADTS: u8 = 0x0F;
 
 /// Extracted media frame from the TS demuxer.
 pub enum DemuxedFrame {
+    /// Stream discontinuity signal — the demuxer detected that the upstream
+    /// source changed (today: PMT `version_number` advanced, which is what
+    /// `TsContinuityFixer::on_switch` guarantees on every operator switch via
+    /// its monotonic counter). Consumers that own decoder state (the local-
+    /// display output) should flush their decoders and reset PTS / clock
+    /// anchors so the new stream starts cleanly without waiting for the next
+    /// natural IDR to time out a stale reference-frame queue. Re-muxing
+    /// consumers (RTMP / WebRTC TS demuxers) can ignore this variant; their
+    /// downstream encoder pipelines re-anchor on the next IDR independently.
+    /// Emitted at most once per discontinuity event, at the head of the
+    /// `demux()` return Vec.
+    Discontinuity,
     /// Complete H.264 access unit (one or more NALUs in Annex B format).
     H264 {
         /// NAL units with 0x00000001 start codes stripped.
@@ -128,6 +140,16 @@ pub struct TsDemuxer {
     cached_h265_pps: Option<Vec<u8>>,
     /// Cached AAC config: (profile, sample_rate_index, channel_config) from first ADTS header.
     cached_aac_config: Option<(u8, u8, u8)>,
+    /// Last PMT `version_number` (5 bits) seen for the locked program. A change
+    /// trips `pending_discontinuity`, which surfaces a single
+    /// [`DemuxedFrame::Discontinuity`] at the head of the next `demux()` return.
+    /// `TsContinuityFixer::on_switch` advances this value monotonically on every
+    /// operator switch, so this is a reliable "input switched" signal.
+    pmt_version: Option<u8>,
+    /// Set when a stream discontinuity has been observed (today: PMT version
+    /// change) and a [`DemuxedFrame::Discontinuity`] is owed at the head of
+    /// the next `demux()` return Vec. Cleared after that emission.
+    pending_discontinuity: bool,
 }
 
 impl TsDemuxer {
@@ -154,6 +176,8 @@ impl TsDemuxer {
             cached_h265_sps: None,
             cached_h265_pps: None,
             cached_aac_config: None,
+            pmt_version: None,
+            pending_discontinuity: false,
         }
     }
 
@@ -181,6 +205,8 @@ impl TsDemuxer {
             cached_h265_sps: None,
             cached_h265_pps: None,
             cached_aac_config: None,
+            pmt_version: None,
+            pending_discontinuity: false,
         }
     }
 
@@ -223,6 +249,12 @@ impl TsDemuxer {
 
     /// Process TS payload bytes (from an RtpPacket, after RTP header stripping).
     /// Returns any completed frames.
+    ///
+    /// If a stream discontinuity was detected during processing (PMT
+    /// `version_number` change — what `TsContinuityFixer::on_switch` produces
+    /// on every operator switch), exactly one [`DemuxedFrame::Discontinuity`]
+    /// is emitted at the head of the returned Vec so consumers can flush
+    /// decoder state before the next frame is fed in.
     pub fn demux(&mut self, ts_data: &[u8]) -> Vec<DemuxedFrame> {
         let mut frames = Vec::new();
         let mut offset = 0;
@@ -231,9 +263,22 @@ impl TsDemuxer {
             let pkt = &ts_data[offset..offset + TS_PACKET_SIZE];
             if pkt[0] == TS_SYNC_BYTE {
                 let mut new_frames = self.process_ts_packet(pkt);
+                if self.pending_discontinuity && !new_frames.is_empty() {
+                    frames.push(DemuxedFrame::Discontinuity);
+                    self.pending_discontinuity = false;
+                }
                 frames.append(&mut new_frames);
             }
             offset += TS_PACKET_SIZE;
+        }
+
+        // If we detected a discontinuity but no completed frames came out of
+        // this datagram (typical: the PMT-only packet that signalled the
+        // switch carries no ES), drain it now so the consumer flushes
+        // before the next frame.
+        if self.pending_discontinuity {
+            frames.insert(0, DemuxedFrame::Discontinuity);
+            self.pending_discontinuity = false;
         }
 
         frames
@@ -268,11 +313,20 @@ impl TsDemuxer {
                         new_pid
                     );
                 }
-                // Reset ES state when the locked PMT PID changes.
+                // PMT PID change after we'd already locked onto a different
+                // one is a stream discontinuity (operator switched program,
+                // or a re-mux re-numbered PIDs). The very first lock-on
+                // (`selected_pmt_pid` was None) is not — there's nothing
+                // for the consumer to flush yet.
+                let was_locked = self.selected_pmt_pid.is_some();
                 self.selected_pmt_pid = new_pmt_pid;
                 self.video_pid = None;
                 self.audio_pid = None;
                 self.pes_assemblers.clear();
+                self.pmt_version = None;
+                if was_locked {
+                    self.pending_discontinuity = true;
+                }
             }
             return Vec::new();
         }
@@ -322,6 +376,25 @@ impl TsDemuxer {
 
         let section_length =
             (((pkt[offset + 1] & 0x0F) as usize) << 8) | (pkt[offset + 2] as usize);
+        // PMT version_number — 5 bits at offset+5, bits [5:1].
+        // `TsContinuityFixer::on_switch` advances this monotonically (mod 32)
+        // on every operator switch, including switches to dead inputs, so any
+        // change is a reliable "input switched" signal. The first PMT we see
+        // is recorded but does NOT trigger a discontinuity (consumers haven't
+        // started decoding yet).
+        let version = (pkt[offset + 5] >> 1) & 0x1F;
+        match self.pmt_version {
+            Some(prev) if prev != version => {
+                tracing::debug!(
+                    prev_version = prev,
+                    new_version = version,
+                    "TS demux: PMT version change → discontinuity",
+                );
+                self.pending_discontinuity = true;
+            }
+            _ => {}
+        }
+        self.pmt_version = Some(version);
         let program_info_length =
             (((pkt[offset + 10] & 0x0F) as usize) << 8) | (pkt[offset + 11] as usize);
 
@@ -874,6 +947,188 @@ mod tests {
         let nalus = demux.extract_h264_nalus(&data);
         assert_eq!(nalus.len(), 1);
         assert_eq!(nalus[0][0] & 0x1F, 5); // IDR
+    }
+
+    /// Build a 188-byte PAT TS packet for one program (program_number=1).
+    fn build_pat(pmt_pid: u16) -> [u8; TS_PACKET_SIZE] {
+        let mut pkt = [0xFFu8; TS_PACKET_SIZE];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = 0x40; // PUSI=1, PID=0
+        pkt[2] = 0x00;
+        pkt[3] = 0x10; // AFC=01 payload-only, CC=0
+        pkt[4] = 0x00; // pointer_field
+        // PAT section: table_id(1) + 2 + ts_id(2) + version/cni(1) + sect#(1)
+        // + last_sect(1) + 1 entry × 4 bytes + CRC(4) = 5 (post-len header) + 4 + 4
+        let section_length = 5 + 4 + 4;
+        pkt[5] = 0x00; // table_id PAT
+        pkt[6] = 0xB0 | (((section_length >> 8) as u8) & 0x0F);
+        pkt[7] = (section_length & 0xFF) as u8;
+        pkt[8] = 0x00;
+        pkt[9] = 0x01;
+        pkt[10] = 0xC1; // reserved + version=0 + current_next=1
+        pkt[11] = 0x00;
+        pkt[12] = 0x00;
+        pkt[13] = 0x00; // program_number=1 high
+        pkt[14] = 0x01; // program_number=1 low
+        pkt[15] = 0xE0 | (((pmt_pid >> 8) as u8) & 0x1F);
+        pkt[16] = (pmt_pid & 0xFF) as u8;
+        // CRC over section body
+        let crc = mpeg2_crc32(&pkt[5..17]);
+        pkt[17] = (crc >> 24) as u8;
+        pkt[18] = (crc >> 16) as u8;
+        pkt[19] = (crc >> 8) as u8;
+        pkt[20] = crc as u8;
+        pkt
+    }
+
+    /// Build a 188-byte PMT TS packet declaring one H.264 video PID and one
+    /// AAC audio PID, with the supplied 5-bit `version_number`.
+    fn build_pmt(pmt_pid: u16, video_pid: u16, audio_pid: u16, version: u8) -> [u8; TS_PACKET_SIZE] {
+        let mut pkt = [0xFFu8; TS_PACKET_SIZE];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = 0x40 | (((pmt_pid >> 8) as u8) & 0x1F); // PUSI=1
+        pkt[2] = (pmt_pid & 0xFF) as u8;
+        pkt[3] = 0x10; // AFC=01 payload-only, CC=0
+        pkt[4] = 0x00; // pointer_field
+        // PMT section: header(9) + program_info_len(2) + 2 ES descriptors @ 5 bytes + CRC(4)
+        let section_length = 9 + 5 * 2 + 4;
+        pkt[5] = 0x02; // table_id PMT
+        pkt[6] = 0xB0 | (((section_length >> 8) as u8) & 0x0F);
+        pkt[7] = (section_length & 0xFF) as u8;
+        pkt[8] = 0x00; // program_number=1
+        pkt[9] = 0x01;
+        pkt[10] = 0xC1 | ((version & 0x1F) << 1); // reserved + version + current_next=1
+        pkt[11] = 0x00;
+        pkt[12] = 0x00;
+        pkt[13] = 0xE0 | (((video_pid >> 8) as u8) & 0x1F); // PCR_PID = video
+        pkt[14] = (video_pid & 0xFF) as u8;
+        pkt[15] = 0xF0; // program_info_length=0
+        pkt[16] = 0x00;
+        // ES loop
+        // Video: stream_type 0x1B (H.264)
+        pkt[17] = 0x1B;
+        pkt[18] = 0xE0 | (((video_pid >> 8) as u8) & 0x1F);
+        pkt[19] = (video_pid & 0xFF) as u8;
+        pkt[20] = 0xF0;
+        pkt[21] = 0x00;
+        // Audio: stream_type 0x0F (AAC ADTS)
+        pkt[22] = 0x0F;
+        pkt[23] = 0xE0 | (((audio_pid >> 8) as u8) & 0x1F);
+        pkt[24] = (audio_pid & 0xFF) as u8;
+        pkt[25] = 0xF0;
+        pkt[26] = 0x00;
+        let crc = mpeg2_crc32(&pkt[5..27]);
+        pkt[27] = (crc >> 24) as u8;
+        pkt[28] = (crc >> 16) as u8;
+        pkt[29] = (crc >> 8) as u8;
+        pkt[30] = crc as u8;
+        pkt
+    }
+
+    fn discontinuity_count(frames: &[DemuxedFrame]) -> usize {
+        frames
+            .iter()
+            .filter(|f| matches!(f, DemuxedFrame::Discontinuity))
+            .count()
+    }
+
+    #[test]
+    fn first_pmt_does_not_trigger_discontinuity() {
+        let mut demux = TsDemuxer::new(None);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&build_pat(0x100));
+        buf.extend_from_slice(&build_pmt(0x100, 0x200, 0x201, 0));
+
+        let frames = demux.demux(&buf);
+        assert_eq!(
+            discontinuity_count(&frames),
+            0,
+            "first PMT seen must not emit Discontinuity (decoder hasn't started)",
+        );
+        assert_eq!(demux.pmt_version, Some(0));
+    }
+
+    #[test]
+    fn pmt_version_change_emits_discontinuity_frame() {
+        let mut demux = TsDemuxer::new(None);
+        let mut buf1 = Vec::new();
+        buf1.extend_from_slice(&build_pat(0x100));
+        buf1.extend_from_slice(&build_pmt(0x100, 0x200, 0x201, 0));
+        let _ = demux.demux(&buf1);
+
+        // Second PMT with bumped version (what TsContinuityFixer::on_switch emits).
+        let frames = demux.demux(&build_pmt(0x100, 0x200, 0x201, 1));
+        assert_eq!(
+            discontinuity_count(&frames),
+            1,
+            "PMT version bump must emit exactly one Discontinuity frame",
+        );
+        assert_eq!(demux.pmt_version, Some(1));
+    }
+
+    #[test]
+    fn discontinuity_emitted_once_per_event_not_per_packet() {
+        let mut demux = TsDemuxer::new(None);
+        let _ = demux.demux(&build_pat(0x100));
+        let _ = demux.demux(&build_pmt(0x100, 0x200, 0x201, 0));
+
+        // Three PMTs in a row at the same new version — only the first
+        // should trigger a Discontinuity.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&build_pmt(0x100, 0x200, 0x201, 1));
+        buf.extend_from_slice(&build_pmt(0x100, 0x200, 0x201, 1));
+        buf.extend_from_slice(&build_pmt(0x100, 0x200, 0x201, 1));
+
+        let frames = demux.demux(&buf);
+        assert_eq!(
+            discontinuity_count(&frames),
+            1,
+            "repeated PMTs at the same version must emit one Discontinuity, not many",
+        );
+
+        // Subsequent demux calls at the same version produce nothing.
+        let frames = demux.demux(&build_pmt(0x100, 0x200, 0x201, 1));
+        assert_eq!(discontinuity_count(&frames), 0);
+    }
+
+    #[test]
+    fn pmt_pid_change_emits_discontinuity_frame() {
+        let mut demux = TsDemuxer::new(None);
+        // Lock onto the first program (PMT PID 0x100).
+        let _ = demux.demux(&build_pat(0x100));
+        let _ = demux.demux(&build_pmt(0x100, 0x200, 0x201, 0));
+
+        // Operator changed program in the upstream — new PAT points at a
+        // different PMT PID. process_ts_packet's PAT branch resets ES state
+        // and trips the discontinuity flag.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&build_pat(0x101));
+        buf.extend_from_slice(&build_pmt(0x101, 0x202, 0x203, 0));
+
+        let frames = demux.demux(&buf);
+        assert_eq!(
+            discontinuity_count(&frames),
+            1,
+            "PMT PID change must emit Discontinuity",
+        );
+    }
+
+    #[test]
+    fn discontinuity_emitted_when_pmt_carries_no_es() {
+        let mut demux = TsDemuxer::new(None);
+        let _ = demux.demux(&build_pat(0x100));
+        let _ = demux.demux(&build_pmt(0x100, 0x200, 0x201, 0));
+
+        // A datagram that carries only a bumped PMT — no ES packets.
+        // The Discontinuity must still surface so the consumer flushes
+        // before the next ES frame arrives in a later datagram.
+        let frames = demux.demux(&build_pmt(0x100, 0x200, 0x201, 1));
+        assert_eq!(discontinuity_count(&frames), 1);
+        assert_eq!(
+            frames.len(),
+            1,
+            "only the Discontinuity should appear; no ES frames yet",
+        );
     }
 
     #[test]

@@ -258,6 +258,13 @@ pub struct FlowRuntime {
     /// it up into the node-level
     /// `HealthPayload.resource_budget.hw_session_usage`.
     pub hw_session_usage: std::sync::RwLock<crate::engine::hardware_probe::HwSessionUsage>,
+    /// Per-edge runtime registry of active local-display claims. Threaded
+    /// in from `FlowManager::create_flow` so display outputs can register
+    /// themselves and park when the targeted `(device, audio_device)` is
+    /// already held by another flow's display output. Built only on
+    /// hosts where the `display` Cargo feature is enabled.
+    #[cfg(all(feature = "display", target_os = "linux"))]
+    pub display_claim_registry: Arc<crate::display::claim_registry::DisplayClaimRegistry>,
 }
 
 /// Runtime state for a single input within a flow.
@@ -335,7 +342,14 @@ impl FlowRuntime {
     /// Returns an error if any output task fails to start (e.g., socket
     /// bind failure). The input task is spawned first and errors there are
     /// reported asynchronously via the task's log output.
-    pub async fn start(config: ResolvedFlow, global_stats: &crate::stats::collector::StatsCollector, ffmpeg_available: bool, event_sender: EventSender) -> Result<Self> {
+    pub async fn start(
+        config: ResolvedFlow,
+        global_stats: &crate::stats::collector::StatsCollector,
+        ffmpeg_available: bool,
+        event_sender: EventSender,
+        #[cfg(all(feature = "display", target_os = "linux"))]
+        display_claim_registry: Arc<crate::display::claim_registry::DisplayClaimRegistry>,
+    ) -> Result<Self> {
         // PID-bus assembly is accepted at config-validation time. Phases
         // 5 + 6 together lift the runtime for `kind = spts`; `kind =
         // mpts` still bails loudly, and `kind = passthrough` means "no
@@ -832,6 +846,8 @@ impl FlowRuntime {
                 #[cfg(feature = "webrtc")]
                 whep_rx,
                 frame_rate_rx.clone(),
+                #[cfg(all(feature = "display", target_os = "linux"))]
+                &display_claim_registry,
             ).await?;
             output_handles.insert(output_config.id().to_string(), output_rt);
         }
@@ -983,6 +999,8 @@ impl FlowRuntime {
             cost_units,
             hw_session_usage,
             output_contributions,
+            #[cfg(all(feature = "display", target_os = "linux"))]
+            display_claim_registry,
         })
     }
 
@@ -1305,6 +1323,8 @@ impl FlowRuntime {
         #[cfg(feature = "webrtc")]
         whep_session_rx: Option<tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>>,
         frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
+        #[cfg(all(feature = "display", target_os = "linux"))]
+        display_claim_registry: &Arc<crate::display::claim_registry::DisplayClaimRegistry>,
     ) -> Result<OutputRuntime> {
         let output_cancel = parent_cancel.child_token();
 
@@ -1659,6 +1679,7 @@ impl FlowRuntime {
                         output_cancel.clone(),
                         event_sender.clone(),
                         flow_id.to_string(),
+                        Arc::clone(display_claim_registry),
                     );
                     Ok(OutputRuntime {
                         handle,
@@ -1717,6 +1738,8 @@ impl FlowRuntime {
             #[cfg(feature = "webrtc")]
             None,
             self.frame_rate_rx.clone(),
+            #[cfg(all(feature = "display", target_os = "linux"))]
+            &self.display_claim_registry,
         ).await?;
 
         // Update output config metadata so stats snapshots reflect the new address/port

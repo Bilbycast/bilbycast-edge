@@ -25,13 +25,13 @@
 mod box_writer;
 mod cenc;
 mod cenc_boxes;
-mod codecs;
+pub(crate) mod codecs;
 mod encode;
 #[allow(dead_code)]
-mod fmp4;
+pub(crate) mod fmp4;
 mod manifest;
 #[allow(dead_code)]
-mod nalu;
+pub(crate) mod nalu;
 mod segmenter;
 mod upload;
 
@@ -310,15 +310,15 @@ async fn run(
                     if let Some((profile, sr_idx, ch_cfg)) = reenc.silent_fallback_track() {
                         let asc = aac_audio_specific_config(profile, sr_idx, ch_cfg);
                         let sample_rate = codecs::sample_rate_from_index(sr_idx);
-                        let track = AudioTrack {
-                            audio_specific_config: asc,
+                        let track = AudioTrack::aac(
+                            asc,
                             sample_rate,
-                            channels: ch_cfg as u16,
-                            avg_bitrate: enc_cfg
+                            ch_cfg as u16,
+                            enc_cfg
                                 .bitrate_kbps
                                 .map(|k| k * 1000)
                                 .unwrap_or(128_000),
-                        };
+                        );
                         state.audio_seg = Some(AudioSegmenter::new(track, config.segment_duration_secs));
                         state.audio_ready = true;
                         tracing::info!(
@@ -584,6 +584,10 @@ async fn handle_frame(
         // transcode hop we don't have today; drop the AU so the audio
         // path keeps working.
         DemuxedFrame::Mpeg2 { .. } => {}
+        // Stream discontinuity is metadata for stateful decoders; the
+        // CMAF segmenter advances on its own GoP cadence and re-issues
+        // an init segment on codec change.
+        DemuxedFrame::Discontinuity => {}
     }
 }
 
@@ -645,17 +649,17 @@ fn handle_other_audio_frame(
         // mirrors `aac_audio_specific_config`'s layout.
         let sr_idx = crate::engine::audio_decode::sr_index_from_hz(target_sr).unwrap_or(3);
         let asc = aac_audio_specific_config(1, sr_idx, target_ch);
-        let track = AudioTrack {
-            audio_specific_config: asc,
-            sample_rate: target_sr,
-            channels: target_ch as u16,
-            avg_bitrate: config
+        let track = AudioTrack::aac(
+            asc,
+            target_sr,
+            target_ch as u16,
+            config
                 .audio_encode
                 .as_ref()
                 .and_then(|e| e.bitrate_kbps)
                 .map(|k| k * 1000)
                 .unwrap_or(128_000),
-        };
+        );
         state.audio_seg = Some(AudioSegmenter::new(track, config.segment_duration_secs));
         state.audio_ready = true;
         tracing::info!(
@@ -1008,17 +1012,17 @@ fn handle_audio_frame(
         };
         let asc = aac_audio_specific_config(profile, sr_idx, ch_cfg);
         let sample_rate = codecs::sample_rate_from_index(sr_idx);
-        let track = AudioTrack {
-            audio_specific_config: asc,
+        let track = AudioTrack::aac(
+            asc,
             sample_rate,
-            channels: ch_cfg as u16,
-            avg_bitrate: config
+            ch_cfg as u16,
+            config
                 .audio_encode
                 .as_ref()
                 .and_then(|e| e.bitrate_kbps)
                 .map(|k| k * 1000)
                 .unwrap_or(128_000),
-        };
+        );
         state.audio_seg = Some(AudioSegmenter::new(track, config.segment_duration_secs));
         state.audio_ready = true;
         tracing::info!(
@@ -1397,12 +1401,16 @@ async fn publish_ll_dash(
         timescale: v.track.timescale,
         bandwidth_bps: state.video_bps_ewma.max(500_000),
     };
-    let audio_rep = state.audio_seg.as_ref().map(|a| DashAudioRep {
-        asc: &a.track.audio_specific_config,
-        sample_rate: a.track.sample_rate,
-        channels: a.track.channels,
-        bandwidth_bps: state.audio_bps_ewma.max(64_000),
-    });
+    let audio_rep = state
+        .audio_seg
+        .as_ref()
+        .and_then(|a| a.track.aac_asc().map(|asc| (a, asc)))
+        .map(|(a, asc)| DashAudioRep {
+            asc,
+            sample_rate: a.track.sample_rate,
+            channels: a.track.channels,
+            bandwidth_bps: state.audio_bps_ewma.max(64_000),
+        });
     let mpd = build_dash_mpd(&DashInput {
         availability_start_unix_secs: state.availability_start_unix,
         target_segment_duration_secs: config.segment_duration_secs,
@@ -1525,12 +1533,16 @@ async fn publish_manifests(
                 timescale: v.track.timescale,
                 bandwidth_bps: state.video_bps_ewma.max(500_000),
             };
-            let audio_rep = state.audio_seg.as_ref().map(|a| DashAudioRep {
-                asc: &a.track.audio_specific_config,
-                sample_rate: a.track.sample_rate,
-                channels: a.track.channels,
-                bandwidth_bps: state.audio_bps_ewma.max(64_000),
-            });
+            let audio_rep = state
+                .audio_seg
+                .as_ref()
+                .and_then(|a| a.track.aac_asc().map(|asc| (a, asc)))
+                .map(|(a, asc)| DashAudioRep {
+                    asc,
+                    sample_rate: a.track.sample_rate,
+                    channels: a.track.channels,
+                    bandwidth_bps: state.audio_bps_ewma.max(64_000),
+                });
             let mpd = build_dash_mpd(&DashInput {
                 availability_start_unix_secs: state.availability_start_unix,
                 target_segment_duration_secs: config.segment_duration_secs,

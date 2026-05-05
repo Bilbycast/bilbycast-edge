@@ -517,6 +517,10 @@ impl LiveState {
                 DemuxedFrame::Opus
                 | DemuxedFrame::Aac { .. }
                 | DemuxedFrame::OtherAudio { .. } => {}
+                // Stream discontinuity is metadata for stateful consumers
+                // (the local-display decoder); the thumbnail generator
+                // re-anchors on the next anchor frame regardless.
+                DemuxedFrame::Discontinuity => {}
             }
         }
     }

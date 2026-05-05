@@ -214,6 +214,21 @@ pub struct DisplayStatsCounters {
     /// show" (`frames_dropped_late`).
     pub frames_dropped_mpsc_full: AtomicU64,
 
+    /// Decoded frames the display loop dropped because they were
+    /// produced by the demux/decode child *before* the most recent
+    /// switch / Lagged / pts_jump (the demux side bumps a shared
+    /// `frame_gen` atomic in `flush_decoders_for_switch`; the display
+    /// loop reads it on every recv). Distinct from
+    /// `frames_dropped_mpsc_full` (queue-back-pressure → drop AT decode
+    /// time) and `frames_dropped_late` (drift past audio clock → drop
+    /// AT present time). Sustained growth around an operator-driven
+    /// switch is healthy — that's the queued pre-switch frames being
+    /// shed in microseconds instead of bleeding the previous stream's
+    /// last second of decoded video onto the panel; sustained growth
+    /// in steady state would indicate spurious flush triggers (audit
+    /// the Lagged / pts_jump signals first).
+    pub frames_dropped_stale_gen: AtomicU64,
+
     /// Largest single `blit_and_present` duration since startup (µs).
     /// Includes libswscale colour-convert, optional HDR LUT, the
     /// audio-bars overlay, and the `kms.present()` vblank wait. On a
@@ -605,6 +620,10 @@ impl OutputStatsAccumulator {
             frames_dropped_mpsc_full: h
                 .counters
                 .frames_dropped_mpsc_full
+                .load(Ordering::Relaxed),
+            frames_dropped_stale_gen: h
+                .counters
+                .frames_dropped_stale_gen
                 .load(Ordering::Relaxed),
             blit_us_max: h.counters.blit_us_max.load(Ordering::Relaxed),
             blit_us_avg: {

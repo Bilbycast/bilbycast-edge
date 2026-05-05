@@ -52,6 +52,13 @@ pub struct FlowManager {
     /// (legacy startup paths / tests). Soft warning only, never blocks
     /// flow creation.
     static_caps: Option<Arc<crate::engine::hardware_probe::StaticCapabilities>>,
+    /// Per-edge runtime registry that tracks which `(device, audio_device)`
+    /// physical display output is currently held. When two flows target
+    /// the same pair, the second parks here until the holder releases.
+    /// Only built into the FlowManager on hosts where the `display`
+    /// feature is enabled (Linux + the `display` Cargo feature).
+    #[cfg(all(feature = "display", target_os = "linux"))]
+    display_claim_registry: Arc<crate::display::claim_registry::DisplayClaimRegistry>,
 }
 
 impl FlowManager {
@@ -67,6 +74,8 @@ impl FlowManager {
         resource_state: Arc<SystemResourceState>,
         resource_action: Option<ResourceLimitAction>,
         static_caps: Option<Arc<crate::engine::hardware_probe::StaticCapabilities>>,
+        #[cfg(all(feature = "display", target_os = "linux"))]
+        display_claim_registry: Arc<crate::display::claim_registry::DisplayClaimRegistry>,
     ) -> Self {
         Self {
             flows: DashMap::new(),
@@ -76,6 +85,8 @@ impl FlowManager {
             resource_state,
             resource_action,
             static_caps,
+            #[cfg(all(feature = "display", target_os = "linux"))]
+            display_claim_registry,
         }
     }
 
@@ -150,6 +161,27 @@ impl FlowManager {
         self.flows.get(flow_id).map(|r| r.value().clone())
     }
 
+    /// Snapshot every running flow's `(flow_id, recording_id)` pair for
+    /// flows that currently hold a [`crate::replay::writer::RecordingHandle`].
+    /// Used by the `list_recordings` dispatcher to decorate orphan-vs-armed
+    /// rows and by `delete_recording` to refuse a delete on an armed
+    /// recording without scanning the manager DB. The DashMap is iterated
+    /// once and the result is materialised before returning, so callers
+    /// don't pin shard locks while walking the disk.
+    #[cfg(feature = "replay")]
+    pub fn flows_with_recording(&self) -> Vec<(String, String)> {
+        self.flows
+            .iter()
+            .filter_map(|r| {
+                let flow_id = r.key().clone();
+                r.value()
+                    .recording_handle
+                    .as_ref()
+                    .map(|h| (flow_id, h.recording_id.clone()))
+            })
+            .collect()
+    }
+
     /// Create and start a new media flow from the given configuration.
     ///
     /// This performs the full bring-up sequence:
@@ -186,7 +218,14 @@ impl FlowManager {
         }
 
         let flow_id = config.config.id.clone();
-        match FlowRuntime::start(config.clone(), &self.stats, self.ffmpeg_available, self.event_sender.clone()).await {
+        match FlowRuntime::start(
+            config.clone(),
+            &self.stats,
+            self.ffmpeg_available,
+            self.event_sender.clone(),
+            #[cfg(all(feature = "display", target_os = "linux"))]
+            Arc::clone(&self.display_claim_registry),
+        ).await {
             Ok(runtime) => {
                 let runtime = Arc::new(runtime);
                 self.flows.insert(flow_id.clone(), runtime.clone());

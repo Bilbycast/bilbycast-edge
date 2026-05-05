@@ -42,10 +42,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 pub mod clips;
+pub mod export;
+pub mod export_mp4;
 pub mod filmstrip;
 pub mod index;
 pub mod paced_replayer;
 pub mod reader;
+pub mod recordings;
 pub mod writer;
 
 /// Resolve the replay storage root. Mirrors [`crate::media::media_dir`]

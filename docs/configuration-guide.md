@@ -1496,8 +1496,22 @@ for the KMS render). 4K60 outputs scale to ≈1025 — comparable to a
   the configured stereo `audio_channel_pair`. Full passthrough is
   v2.
 - No HDR / colour-management / SCTE-104 / closed-caption rendering.
-- One display output per connector at a time — cross-output
-  uniqueness is enforced (`display_device_busy`).
+- One display output renders to a given connector at a time. **Multiple
+  flows may configure outputs that target the same `(device,
+  audio_device)` pair** — KMS / ALSA only let one writer hold the
+  device at a time, so the per-edge `DisplayClaimRegistry` serialises
+  them. **First to start wins** the slot; the others register as FCFS
+  waiters and emit `display_output_waiting` (Info, `details` carry
+  `holder_*` and `queue_position`). When the holder stops (manual
+  stop, output removal, fatal error), the next live waiter is
+  promoted automatically — `display_output_acquired` fires, and the
+  modeset proceeds as a fresh `display_started`. Take-over is a few
+  hundred milliseconds (KMS modeset + ALSA open). Useful for hot
+  primary/backup confidence-monitor swaps where the operator just
+  stops one flow and the next one already configured for the same
+  HDMI takes over without manual reconfiguration. The static-config
+  validator no longer rejects duplicates — it logs a `warn!` and
+  lets the runtime queue handle it.
 
 See [`docs/events-and-alarms.md`](events-and-alarms.md#display-events)
 for the full event catalogue, including `display_device_unavailable`,

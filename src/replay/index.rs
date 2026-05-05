@@ -198,7 +198,6 @@ impl InMemoryIndex {
     }
 
     /// First and last PTS in the index, if any.
-    #[allow(dead_code)]
     pub fn span(&self) -> Option<(u64, u64)> {
         let first = self.entries.first()?;
         let last = self.entries.last()?;

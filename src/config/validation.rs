@@ -3769,10 +3769,23 @@ fn is_valid_alsa_device(s: &str) -> bool {
         .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Cross-output uniqueness for `display` outputs: two display outputs in the
-/// same `AppConfig` cannot claim the same `(device, audio_device)` pair —
-/// KMS only lets one master lease the connector at a time, and ALSA only
-/// lets one writer hold the PCM device.
+/// Cross-output uniqueness for `display` outputs.
+///
+/// KMS only lets one master lease a connector at a time, and ALSA only
+/// lets one writer hold the PCM device — so two display outputs targeting
+/// the same `(device, audio_device)` pair physically cannot run
+/// simultaneously. The runtime [`crate::display::claim_registry::DisplayClaimRegistry`]
+/// (Linux + `display` feature only) handles this serialisation: the
+/// first display output to start wins the slot, and any others park on
+/// the registry until the holder releases. Common configurations that
+/// rely on this — two redundant flows mapped to the same confidence
+/// monitor, with operators flipping which one runs at any given time —
+/// must be allowed in the static config.
+///
+/// We therefore log a `warn!` for the duplicate but do not reject the
+/// config. Operators get a heads-up that the pair is double-booked
+/// without being forced into a delete-A-then-add-B dance every time
+/// they want to swap.
 pub(crate) fn validate_display_uniqueness(config: &AppConfig) -> Result<()> {
     use std::collections::HashMap;
     let mut claimed: HashMap<(String, String), String> = HashMap::new();
@@ -3783,14 +3796,16 @@ pub(crate) fn validate_display_uniqueness(config: &AppConfig) -> Result<()> {
                 d.audio_device.clone().unwrap_or_default(),
             );
             if let Some(prev_id) = claimed.insert(key.clone(), d.id.clone()) {
-                return Err(anyhow::anyhow!(
-                    "display output '{}' conflicts with '{}': both target connector '{}' \
-                     and audio device '{}' (only one display output may claim a given pair)",
+                tracing::warn!(
+                    "display output '{}' shares connector '{}' + audio '{}' with '{}'; \
+                     both will be allowed but only one can hold the device at a time \
+                     (runtime take-over: first to start wins, others park in the \
+                     display claim registry until release)",
                     d.id,
-                    prev_id,
                     key.0,
                     if key.1.is_empty() { "<mute>" } else { key.1.as_str() },
-                ));
+                    prev_id,
+                );
             }
         }
     }

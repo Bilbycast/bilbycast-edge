@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 pub mod audio;
 pub mod audio_bars;
 pub mod audio_meter;
+pub mod claim_registry;
 pub mod clock;
 pub mod hdr_tonemap;
 pub mod kms;
