@@ -2586,10 +2586,25 @@ fn validate_video_encode(
     }
     if let Some(ref pr) = enc.profile {
         match pr.as_str() {
-            "baseline" | "main" | "high" | "high10" | "high422" | "high444" | "main10" => {}
+            // H.264 profile names.
+            "baseline" | "main" | "high" | "high10" | "high422" | "high444"
+            // HEVC profile names. `main10` is HEVC Main 10 (4:2:0 10-bit
+            // distribution); `main422-10` and `main422-10-intra` are
+            // the canonical HEVC broadcast-contribution profiles
+            // (4:2:2 10-bit). Operators copying configs from broadcast
+            // contribution presets routinely use the hyphenated forms,
+            // so accepting both keeps the manager UI ↔ ffmpeg ↔
+            // codec-matrix doc story honest. The chroma/bit-depth
+            // companion check below rejects mismatched combinations
+            // (e.g. `main422-10` + chroma=yuv420p) with a precise
+            // operator-facing message.
+            | "main10"
+            | "main422-10"
+            | "main422-10-intra" => {}
             other => bail!(
                 "{context}: video_encode.profile '{other}' is not recognised; \
-                 expected one of baseline, main, high, high10, high422, high444, main10"
+                 expected one of baseline, main, high, high10, high422, high444, \
+                 main10, main422-10, main422-10-intra"
             ),
         }
     }
@@ -2683,6 +2698,20 @@ fn validate_video_encode(
         ),
         (Some("high444"), "yuv420p", _) | (Some("high444"), "yuv422p", _) => bail!(
             "{context}: video_encode.profile=high444 requires chroma=yuv444p"
+        ),
+        // HEVC broadcast-contribution profile (4:2:2 10-bit). The
+        // hyphenated form is the industry-canonical spelling used by
+        // ffmpeg's libx265 wrapper and by HEVC contribution-grade
+        // presets in the wild; accepting it lets operators copy real
+        // contribution configs without a hand-edit. `chroma=yuv422p`
+        // still carries the 4:2:2 plane layout — the profile string
+        // is the bitstream identifier, not a chroma replacement.
+        (Some("main422-10") | Some("main422-10-intra"), "yuv420p", _)
+        | (Some("main422-10") | Some("main422-10-intra"), "yuv444p", _) => bail!(
+            "{context}: video_encode.profile=main422-10 requires chroma=yuv422p"
+        ),
+        (Some("main422-10") | Some("main422-10-intra"), _, 8) => bail!(
+            "{context}: video_encode.profile=main422-10 requires bit_depth=10"
         ),
         _ => {}
     }

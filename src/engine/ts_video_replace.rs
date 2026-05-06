@@ -284,28 +284,28 @@ mod inner {
             force_idr: Arc<AtomicBool>,
         ) -> Result<Self, TsVideoReplaceError> {
             // Resolve `*_auto` strings AND validate explicit backends
-            // against the host's chroma/bit-depth matrix in a single
-            // pass. The legacy `parse_codec` path is kept so existing
-            // tests that pass concrete strings without a probed-caps
-            // snapshot still work — we only invoke the resolver when
-            // a snapshot is installed (the production path).
-            let backend = match crate::engine::hardware_probe::static_capabilities() {
-                Some(_) => {
-                    match crate::engine::hardware_probe::resolve_for_video_encode_config(cfg) {
-                        Ok(r) => {
-                            // Log Auto resolutions so operators see
-                            // which backend the resolver picked. The
-                            // OutputStatsAccumulator surfaces the same
-                            // string on `resolved_video_encoder` for
-                            // the manager UI badge.
+            // against the host's chroma/bit-depth matrix. We pull the
+            // **full chain** so the lazy-open path can fall through on
+            // `avcodec_open2` failure (Auto only — explicit backends
+            // are a one-element chain). The legacy `parse_codec` path
+            // is kept so existing tests that pass concrete strings
+            // without a probed-caps snapshot still work — we only
+            // invoke the resolver when a snapshot is installed (the
+            // production path).
+            let backend_chain: Vec<VideoEncoderCodec> =
+                match crate::engine::hardware_probe::static_capabilities() {
+                    Some(_) => match crate::engine::hardware_probe::resolve_chain_for_video_encode_config(cfg) {
+                        Ok(chain) => {
                             if cfg.codec.ends_with("_auto") || cfg.codec == "auto" {
+                                let names: Vec<&str> =
+                                    chain.iter().map(|r| r.ffmpeg_name()).collect();
                                 tracing::info!(
-                                    "video_encode auto-resolved '{}' → {}",
+                                    "video_encode auto-resolved '{}' → chain {:?} (head fires first; later entries are fall-through)",
                                     cfg.codec,
-                                    r.ffmpeg_name(),
+                                    names,
                                 );
                             }
-                            r.as_video_encoder_codec()
+                            chain.iter().map(|r| r.as_video_encoder_codec()).collect()
                         }
                         Err(e) => {
                             return Err(TsVideoReplaceError::EncoderUnavailable(
@@ -313,16 +313,22 @@ mod inner {
                                 e.message(),
                             ));
                         }
-                    }
-                }
-                None => parse_codec(&cfg.codec)?,
-            };
-            let target_family = backend.family();
+                    },
+                    None => vec![parse_codec(&cfg.codec)?],
+                };
+            // Every backend in the chain produces the same output codec
+            // family (Auto family is locked; explicit codec is locked).
+            // Pick the head — `target_family` / `target_stream_type` /
+            // description are family-level concerns, not backend-level.
+            let backend_head = *backend_chain
+                .first()
+                .expect("resolver guaranteed at least one candidate");
+            let target_family = backend_head.family();
             let target_stream_type = target_family.stream_type();
 
             let description = format!(
                 "{} @ {} kbps",
-                backend.ffmpeg_name(),
+                backend_head.ffmpeg_name(),
                 cfg.bitrate_kbps.unwrap_or(4000),
             );
 
@@ -334,9 +340,9 @@ mod inner {
                 (Some(n), Some(d)) => (n, d),
                 _ => (30, 1),
             };
-            let pipeline = ScaledVideoEncoder::new(
+            let pipeline = ScaledVideoEncoder::with_backend_chain(
                 cfg.clone(),
-                backend,
+                backend_chain,
                 fps_num,
                 fps_den,
                 false,

@@ -1791,6 +1791,77 @@ pub fn resolve_for_video_encode_config(
     )
 }
 
+/// Resolve a `video_encode` config into the **full Auto fall-through
+/// chain** of encoder backends to try in order on `avcodec_open2`
+/// failure.
+///
+/// * Explicit codec strings (`x264`, `h264_qsv`, …) → single-element
+///   `Vec` (the operator picked a specific backend and a fall-through
+///   would silently mis-behave the way they asked us not to).
+/// * Auto codec strings (`h264_auto` / `hevc_auto` / bare `auto`) →
+///   the priority chain filtered down to backends the host can do per
+///   the runtime probe + the chroma/bit-depth matrix. The first entry
+///   matches `resolve_for_video_encode_config(cfg)`.
+///
+/// Why a chain rather than a single resolved backend: on Intel iGPU
+/// hosts the matrix correctly says QSV is available (the startup probe
+/// opens it cleanly), but a flow opened later — when the GPU is busy /
+/// out of MFX sessions / shimmed by a userspace driver update — can
+/// still fail at `avcodec_open2`. Today that hard-fails the flow even
+/// when VAAPI / libx264 would have worked. Returning the chain lets
+/// `ScaledVideoEncoder::lazy_open` retry the next backend instead of
+/// dropping the operator off a cliff. See codec-matrix bug C3.
+#[cfg(feature = "video-thumbnail")]
+pub fn resolve_video_encoder_chain(
+    codec_string: &str,
+    chroma: Option<&str>,
+    bit_depth: Option<u8>,
+    caps: Option<&StaticCapabilities>,
+) -> Result<Vec<ResolvedVideoEncoder>, EncoderResolutionError> {
+    let chroma_typed = parse_chroma_str(chroma);
+    let bd = bit_depth.unwrap_or(8);
+    let chroma_label = chroma.unwrap_or("yuv420p").to_string();
+
+    if let Some(family) = parse_auto_family(codec_string) {
+        let caps = caps.ok_or(EncoderResolutionError::ProbeUnavailable)?;
+        let chain: Vec<ResolvedVideoEncoder> = auto_priority_chain(family, chroma_typed, bd)
+            .iter()
+            .copied()
+            .filter(|&candidate| host_supports_encoder(candidate, chroma_typed, bd, caps))
+            .collect();
+        if chain.is_empty() {
+            return Err(EncoderResolutionError::AutoNoBackend {
+                family,
+                chroma: chroma_label,
+                bit_depth: bd,
+            });
+        }
+        return Ok(chain);
+    }
+
+    // Explicit backend — single-element chain. Re-uses the existing
+    // single-backend resolver for the feature/driver/chroma checks so
+    // the error semantics stay identical.
+    let resolved = resolve_video_encoder(codec_string, chroma, bit_depth, caps)?;
+    Ok(vec![resolved])
+}
+
+/// Edge-side companion to [`resolve_for_video_encode_config`] returning
+/// the full Auto fall-through chain. See
+/// [`resolve_video_encoder_chain`] for semantics.
+#[cfg(feature = "video-thumbnail")]
+pub fn resolve_chain_for_video_encode_config(
+    cfg: &crate::config::models::VideoEncodeConfig,
+) -> Result<Vec<ResolvedVideoEncoder>, EncoderResolutionError> {
+    let caps = static_capabilities();
+    resolve_video_encoder_chain(
+        &cfg.codec,
+        cfg.chroma.as_deref(),
+        cfg.bit_depth,
+        caps.as_deref(),
+    )
+}
+
 /// Reason `resolve_video_encoder` couldn't satisfy the request.
 /// Surfaced on `video_encoder_unavailable` events with structured
 /// `details` so the manager UI can render an actionable message

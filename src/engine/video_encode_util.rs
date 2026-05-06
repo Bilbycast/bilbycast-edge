@@ -104,6 +104,8 @@ pub fn resolve_profile(s: Option<&str>) -> VideoProfile {
         "high422" => VideoProfile::High422,
         "high444" => VideoProfile::High444,
         "main10" => VideoProfile::Main10,
+        "main422-10" => VideoProfile::Main422_10,
+        "main422-10-intra" => VideoProfile::Main422_10Intra,
         _ => VideoProfile::Auto,
     }
 }
@@ -130,9 +132,9 @@ pub fn resolve_rate_control(s: Option<&str>) -> VideoRateControl {
 /// directly into `VideoEncoder::encode_frame` without an extra repack.
 ///
 /// Returns `None` for target combinations that `VideoScaler` does not
-/// expose today (4:2:0 10-bit, 4:4:4). Callers should fall back to
-/// "no scale, use source resolution" when that happens — cropping is
-/// still wrong, but any behaviour change would be gated on extending
+/// expose today (4:4:4). Callers should fall back to "no scale, use
+/// source resolution" when that happens — cropping is still wrong, but
+/// any behaviour change would be gated on extending
 /// `bilbycast-ffmpeg-video-rs` first.
 #[cfg(feature = "video-thumbnail")]
 pub fn select_scaler_dst_format(
@@ -142,11 +144,13 @@ pub fn select_scaler_dst_format(
     use video_codec::ScalerDstFormat;
     match (chroma, bit_depth) {
         (VideoChroma::Yuv420, 8) => Some(ScalerDstFormat::Yuvj420p),
+        (VideoChroma::Yuv420, 10) => Some(ScalerDstFormat::Yuv420p10le),
         (VideoChroma::Yuv422, 8) => Some(ScalerDstFormat::Yuv422p8),
         (VideoChroma::Yuv422, 10) => Some(ScalerDstFormat::Yuv422p10le),
         _ => None,
     }
 }
+
 
 /// Lazily-opened encoder + optional scaler, shared across every call
 /// site that decodes a frame and re-encodes it.
@@ -170,12 +174,24 @@ pub fn select_scaler_dst_format(
 #[cfg(feature = "video-thumbnail")]
 pub struct ScaledVideoEncoder {
     encode_cfg: VideoEncodeConfig,
-    backend: VideoEncoderCodec,
+    /// Backend chain: try in order on `avcodec_open2` failure. Single
+    /// element for explicit codecs (`x264`, `h264_qsv`, …); the full
+    /// Auto priority list filtered through host capabilities for
+    /// `*_auto`. See `engine::hardware_probe::resolve_video_encoder_chain`.
+    /// Fall-through covers the case where the matrix says a backend is
+    /// available (probe at startup succeeded) but a later runtime open
+    /// fails — typical of HW backends that ran out of sessions or were
+    /// shimmed by a userspace driver update mid-run.
+    backend_chain: Vec<VideoEncoderCodec>,
     fps_num: u32,
     fps_den: u32,
     global_header: bool,
 
     encoder: Option<video_engine::VideoEncoder>,
+    /// Backend the encoder actually opened with — equals the first
+    /// element of `backend_chain` when no fall-through happened, or a
+    /// later one after demote(s).
+    active_backend: Option<VideoEncoderCodec>,
     scaler: Option<video_engine::VideoScaler>,
     // Cached to spot mid-stream resolution / pixel-format changes.
     src_w: u32,
@@ -190,6 +206,12 @@ pub struct ScaledVideoEncoder {
 
 #[cfg(feature = "video-thumbnail")]
 impl ScaledVideoEncoder {
+    /// Create a new pipeline pinned to a single backend. No Auto
+    /// fall-through. Callers that already invoked the resolver and
+    /// only want the resolved single backend (e.g. operator picked
+    /// `x264` explicitly) keep using this. For Auto resolution that
+    /// should fall through to the next candidate on
+    /// `avcodec_open2` failure, use [`Self::with_backend_chain`].
     pub fn new(
         encode_cfg: VideoEncodeConfig,
         backend: VideoEncoderCodec,
@@ -198,13 +220,35 @@ impl ScaledVideoEncoder {
         global_header: bool,
         log_tag: impl Into<String>,
     ) -> Self {
+        Self::with_backend_chain(
+            encode_cfg,
+            vec![backend],
+            fps_num,
+            fps_den,
+            global_header,
+            log_tag,
+        )
+    }
+
+    /// Create a pipeline that tries each backend in `backend_chain`
+    /// until one's `VideoEncoder::open` succeeds. Empty input is
+    /// rejected at lazy-open time with a clear error.
+    pub fn with_backend_chain(
+        encode_cfg: VideoEncodeConfig,
+        backend_chain: Vec<VideoEncoderCodec>,
+        fps_num: u32,
+        fps_den: u32,
+        global_header: bool,
+        log_tag: impl Into<String>,
+    ) -> Self {
         Self {
             encode_cfg,
-            backend,
+            backend_chain,
             fps_num,
             fps_den,
             global_header,
             encoder: None,
+            active_backend: None,
             scaler: None,
             src_w: 0,
             src_h: 0,
@@ -213,6 +257,13 @@ impl ScaledVideoEncoder {
             dst_h: 0,
             log_tag: log_tag.into(),
         }
+    }
+
+    /// Backend the encoder actually opened with after lazy-open. None
+    /// before the first `encode` call. Used by stats accumulators to
+    /// surface the resolved backend on the manager-UI badge.
+    pub fn active_backend(&self) -> Option<VideoEncoderCodec> {
+        self.active_backend
     }
 
     pub fn is_open(&self) -> bool {
@@ -270,6 +321,16 @@ impl ScaledVideoEncoder {
     /// Encode one decoded frame. Lazy-opens the encoder (and, when
     /// needed, the scaler) on the first call.
     ///
+    /// HW-decoded source frames (`AV_PIX_FMT_VAAPI` produced by
+    /// `DecoderBackend::Vaapi`) are downloaded to system memory via
+    /// `download_to_sysmem` before the format check — the resulting
+    /// frame is `NV12` (8-bit 4:2:0) or `P010LE` (10-bit 4:2:0) which
+    /// the scaler converts to the encoder's planar input layout
+    /// (`YUVJ420P` / `YUV420P10LE` / `YUV422P` / `YUV422P10LE`). NVDEC
+    /// and QSV decoders already auto-download to sysmem in
+    /// `DecodedFrame` so they reach this method as `NV12` / `P010LE`
+    /// directly and just need the libswscale conversion.
+    ///
     /// Returns the list of encoded frames libavcodec emitted for this
     /// input — often zero during the encoder's warm-up, otherwise one
     /// frame (may be more if B-frames are enabled, but MVP forces
@@ -279,9 +340,24 @@ impl ScaledVideoEncoder {
         decoded: &video_engine::DecodedFrame,
         pts: Option<i64>,
     ) -> Result<Vec<video_codec::EncodedVideoFrame>, String> {
-        let src_w = decoded.width();
-        let src_h = decoded.height();
-        let src_pix_fmt = decoded.pixel_format();
+        // VAAPI HW frames live on the GPU — `yuv_planes()` returns
+        // `None` and any planar accessor reads garbage. Download to a
+        // sysmem `NV12` / `P010LE` frame so the scaler / SW-encoder
+        // path can read pixels. NVDEC / QSV already produce sysmem
+        // frames; non-VAAPI inputs hit this branch as a no-op.
+        let downloaded;
+        let frame_ref = if decoded.is_vaapi() {
+            downloaded = decoded
+                .download_to_sysmem()
+                .map_err(|e| format!("VAAPI hwframe download failed: {e:?}"))?;
+            &downloaded
+        } else {
+            decoded
+        };
+
+        let src_w = frame_ref.width();
+        let src_h = frame_ref.height();
+        let src_pix_fmt = frame_ref.pixel_format();
 
         if self.encoder.is_none() {
             self.lazy_open(src_w, src_h, src_pix_fmt)?;
@@ -308,7 +384,7 @@ impl ScaledVideoEncoder {
 
         if let Some(scaler) = self.scaler.as_ref() {
             let scaled = scaler
-                .scale(decoded)
+                .scale(frame_ref)
                 .map_err(|e| format!("scaler failed: {e}"))?;
             let (y, y_s) = scaled
                 .plane(0)
@@ -322,7 +398,7 @@ impl ScaledVideoEncoder {
             enc.encode_frame(y, y_s, u, u_s, v, v_s, pts)
                 .map_err(|e| format!("encoder encode_frame failed: {e}"))
         } else {
-            let (y, y_s, u, u_s, v, v_s) = decoded
+            let (y, y_s, u, u_s, v, v_s) = frame_ref
                 .yuv_planes()
                 .ok_or_else(|| "decoded frame has no planar YUV".to_string())?;
             enc.encode_frame(y, y_s, u, u_s, v, v_s, pts)
@@ -396,27 +472,80 @@ impl ScaledVideoEncoder {
     }
 
     fn lazy_open(&mut self, src_w: u32, src_h: u32, src_pix_fmt: i32) -> Result<(), String> {
-        let enc_cfg = build_encoder_config(
-            &self.encode_cfg,
-            self.backend,
-            src_w,
-            src_h,
-            self.fps_num,
-            self.fps_den,
-            self.global_header,
-        );
-        let dst_w = enc_cfg.width;
-        let dst_h = enc_cfg.height;
-        let encoder = video_engine::VideoEncoder::open(&enc_cfg)
-            .map_err(|e| format!("encoder open failed: {e}"))?;
-        self.encoder = Some(encoder);
-        self.src_w = src_w;
-        self.src_h = src_h;
-        self.src_pix_fmt = src_pix_fmt;
-        self.dst_w = dst_w;
-        self.dst_h = dst_h;
-        self.scaler = self.try_build_scaler(src_w, src_h, src_pix_fmt);
-        Ok(())
+        if self.backend_chain.is_empty() {
+            return Err(
+                "encoder open failed: backend chain is empty (no candidates passed by the resolver)"
+                    .into(),
+            );
+        }
+
+        let mut last_err = String::new();
+        let total = self.backend_chain.len();
+        for (idx, &candidate) in self.backend_chain.iter().enumerate() {
+            let enc_cfg = build_encoder_config(
+                &self.encode_cfg,
+                candidate,
+                src_w,
+                src_h,
+                self.fps_num,
+                self.fps_den,
+                self.global_header,
+            );
+            let dst_w = enc_cfg.width;
+            let dst_h = enc_cfg.height;
+            match video_engine::VideoEncoder::open(&enc_cfg) {
+                Ok(encoder) => {
+                    if idx > 0 {
+                        // We fell through at least one backend in the
+                        // Auto chain. Surface the demote loudly so the
+                        // operator can see in the field that QSV /
+                        // NVENC went sideways and we landed on the
+                        // fallback — matches the `display_atomic_unavailable`
+                        // pattern on the display output.
+                        tracing::warn!(
+                            "{}: video_encode resolver demoted to {} after {} failed open(s); reason: {}",
+                            self.log_tag,
+                            candidate.ffmpeg_name(),
+                            idx,
+                            last_err,
+                        );
+                    } else {
+                        tracing::debug!(
+                            "{}: video_encode opened with {}",
+                            self.log_tag,
+                            candidate.ffmpeg_name(),
+                        );
+                    }
+                    self.encoder = Some(encoder);
+                    self.active_backend = Some(candidate);
+                    self.src_w = src_w;
+                    self.src_h = src_h;
+                    self.src_pix_fmt = src_pix_fmt;
+                    self.dst_w = dst_w;
+                    self.dst_h = dst_h;
+                    self.scaler = self.try_build_scaler(src_w, src_h, src_pix_fmt);
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_err = format!("{} open failed: {e}", candidate.ffmpeg_name());
+                    if idx + 1 < total {
+                        // More candidates to try — log at info so the
+                        // demote chain is visible without flooding warn
+                        // when the next one succeeds.
+                        tracing::info!(
+                            "{}: {}; trying next backend in chain",
+                            self.log_tag,
+                            last_err,
+                        );
+                    }
+                }
+            }
+        }
+
+        Err(format!(
+            "encoder open failed: every backend in the resolver chain refused open ({} candidate(s)). Last: {}",
+            total, last_err,
+        ))
     }
 
     fn try_build_scaler(
@@ -425,7 +554,18 @@ impl ScaledVideoEncoder {
         src_h: u32,
         src_pix_fmt: i32,
     ) -> Option<video_engine::VideoScaler> {
-        if src_w == self.dst_w && src_h == self.dst_h {
+        // Two reasons to build a scaler:
+        //   1. dimensions differ (operator asked for resize), or
+        //   2. source pixel format is not the planar YUV layout the
+        //      SW encoder feed path drains via `yuv_planes()` — e.g.
+        //      `NV12` / `P010LE` / `NV16` / `P210LE` from a HW
+        //      decoder, after the VAAPI sysmem download in
+        //      `ScaledVideoEncoder::encode`.
+        // When neither condition applies, source planes go straight to
+        // the encoder.
+        let dims_match = src_w == self.dst_w && src_h == self.dst_h;
+        let format_planar = is_planar_yuv_av_pix_fmt(src_pix_fmt);
+        if dims_match && format_planar {
             return None;
         }
         let chroma = resolve_chroma(self.encode_cfg.chroma.as_deref());
@@ -443,8 +583,8 @@ impl ScaledVideoEncoder {
         ) {
             Ok(s) => {
                 tracing::info!(
-                    "{}: scaling {}x{} -> {}x{} ({:?})",
-                    self.log_tag, src_w, src_h, self.dst_w, self.dst_h, dst_fmt,
+                    "{}: scaling {}x{}(pix_fmt={}) -> {}x{} ({:?})",
+                    self.log_tag, src_w, src_h, src_pix_fmt, self.dst_w, self.dst_h, dst_fmt,
                 );
                 Some(s)
             }
@@ -458,4 +598,19 @@ impl ScaledVideoEncoder {
             }
         }
     }
+}
+
+/// `true` when the FFmpeg `AVPixelFormat` integer is one of the planar
+/// YUV layouts the SW-encoder feed path can drain via
+/// `DecodedFrame::yuv_planes()`. See [`video_engine::DecodedFrame::is_planar_yuv`]
+/// for the matching predicate on a live decoded frame; this variant
+/// takes the raw integer as exposed by [`video_engine::DecodedFrame::pixel_format`]
+/// so the lazy-open path can decide whether to insert a scaler before
+/// the first frame is in hand.
+#[cfg(feature = "video-thumbnail")]
+fn is_planar_yuv_av_pix_fmt(av_pix_fmt: i32) -> bool {
+    // Hand off to a `DecodedFrame::is_planar_yuv` companion through a
+    // thin shim — the constants live in `libffmpeg-video-sys` which
+    // bilbycast-edge does not depend on directly.
+    video_engine::is_planar_yuv_av_pix_fmt(av_pix_fmt)
 }

@@ -1013,28 +1013,39 @@ fn resolve_backend(
     }
 }
 
-/// Resolve a `video_encode` block's codec backend, honouring `*_auto` and
-/// surfacing host-mismatch errors before the encoder is opened. Falls
-/// back to the legacy string parser when no probed-caps snapshot is
+/// Resolve a `video_encode` block's codec backend chain, honouring
+/// `*_auto` and surfacing host-mismatch errors before the encoder is
+/// opened. Returns the **full Auto fall-through chain** so
+/// [`crate::engine::video_encode_util::ScaledVideoEncoder::with_backend_chain`]
+/// can demote across `avcodec_open2` failures. Single-element vec for
+/// explicit codecs; the priority chain (head wins, tail are
+/// fall-throughs) for `*_auto`. Falls back to a single-element chain
+/// drawn from the legacy string parser when no probed-caps snapshot is
 /// installed (in-process tests + early-startup paths).
 #[cfg(feature = "video-thumbnail")]
-fn resolve_backend_for_config(
+fn resolve_backend_chain_for_config(
     cfg: &VideoEncodeConfig,
     output_id: &str,
     event_sender: &EventSender,
-) -> Option<video_codec::VideoEncoderCodec> {
+) -> Option<Vec<video_codec::VideoEncoderCodec>> {
     if crate::engine::hardware_probe::static_capabilities().is_some() {
-        match crate::engine::hardware_probe::resolve_for_video_encode_config(cfg) {
-            Ok(r) => {
+        match crate::engine::hardware_probe::resolve_chain_for_video_encode_config(cfg) {
+            Ok(chain) => {
                 if cfg.codec.ends_with("_auto") || cfg.codec == "auto" {
+                    let names: Vec<&str> = chain.iter().map(|r| r.ffmpeg_name()).collect();
                     tracing::info!(
-                        "RTMP output '{}': video_encode auto-resolved '{}' → {}",
+                        "RTMP output '{}': video_encode auto-resolved '{}' → chain {:?}",
                         output_id,
                         cfg.codec,
-                        r.ffmpeg_name(),
+                        names,
                     );
                 }
-                return Some(r.as_video_encoder_codec());
+                return Some(
+                    chain
+                        .iter()
+                        .map(|r| r.as_video_encoder_codec())
+                        .collect(),
+                );
             }
             Err(e) => {
                 let msg = format!(
@@ -1059,7 +1070,9 @@ fn resolve_backend_for_config(
             }
         }
     }
-    resolve_backend(&cfg.codec, output_id, event_sender)
+    // No probed-caps snapshot — fall back to the legacy single-backend
+    // string parser, wrapped in a single-element chain.
+    resolve_backend(&cfg.codec, output_id, event_sender).map(|b| vec![b])
 }
 
 /// Core per-frame handler: dispatches passthrough vs transcode, sends the
@@ -1302,9 +1315,16 @@ fn open_video_active(
     stats: &Arc<OutputStatsAccumulator>,
     event_sender: &EventSender,
 ) -> VideoEncoderState {
-    let Some(backend) = resolve_backend_for_config(cfg, &config.id, event_sender) else {
+    let Some(backend_chain) = resolve_backend_chain_for_config(cfg, &config.id, event_sender)
+    else {
         return VideoEncoderState::Failed;
     };
+    // Head of the chain drives stats-label / family decisions. Every
+    // candidate produces the same family (Auto family is locked;
+    // explicit codec is locked) so reading the head is correct.
+    let backend = *backend_chain
+        .first()
+        .expect("resolver guaranteed at least one candidate");
     let source_codec = if source_is_h264 {
         video_codec::VideoCodec::H264
     } else {
@@ -1385,9 +1405,9 @@ fn open_video_active(
         (Some(n), Some(d)) => (n, d),
         _ => (30, 1),
     };
-    let pipeline = crate::engine::video_encode_util::ScaledVideoEncoder::new(
+    let pipeline = crate::engine::video_encode_util::ScaledVideoEncoder::with_backend_chain(
         cfg.clone(),
-        backend,
+        backend_chain,
         fps_num,
         fps_den,
         true,
