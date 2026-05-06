@@ -2185,6 +2185,11 @@ fn display_loop(
     // or on any mid-stream source resolution change.
     let mut matched_dims: Option<(u32, u32)> = None;
     let mut stats_registered = false;
+    // Debounce timestamp for the CPU-blit-ceiling Warning event: emit
+    // at most once per 30 s while the condition holds, otherwise the
+    // log floods with one Critical per dropped frame on a 4K stream
+    // running on a CPU-only host.
+    let mut last_sw_ceiling_warn_at: Option<Instant> = None;
     // Tracks whether the panel mode currently in force was picked with
     // a stabilised source-fps hint. The first frame fires a modeset
     // with `frame_period_ms = 33` (default) — fine for picking the
@@ -2321,32 +2326,60 @@ fn display_loop(
         // panel's native cadence.
         const SW_BLIT_MAX_W: u32 = 1920;
         const SW_BLIT_MAX_H: u32 = 1080;
+        const SW_CEILING_WARN_INTERVAL: std::time::Duration =
+            std::time::Duration::from_secs(30);
         let zero_copy = next.prime.is_some();
+        // CPU-blit ceiling: a 4K CPU-decoded frame would walk libswscale
+        // through a ~33 MB BGRA convert + write-combining KMS dumb-buffer
+        // copy — measured at ~7 s per frame on the testbed's iGPU, i.e.
+        // 0.14 fps with a fully-saturated CPU. Refuse to pay that cost.
+        // The condition fires when a non-zero-copy frame arrives with
+        // dims past the ceiling — this is exactly the post-VAAPI-demote
+        // case (decoder fell back to libavcodec CPU on `EAGAIN` /
+        // `INVALIDDATA` bursts and now produces sysmem frames).
+        //
+        // **Drop the frame, don't kill the thread.** The previous
+        // implementation `break`-ed out of `display_loop` here, exiting
+        // the OS thread permanently — when VAAPI later re-engaged
+        // (which the existing runtime promotion machinery does
+        // automatically on a clean `send_packet`), there was no
+        // consumer left for the video mpsc and the display silently
+        // froze with `frames_displayed` stuck at the demote moment
+        // and `frames_dropped_mpsc_full` climbing at decoder rate.
+        // Continuing the loop keeps the thread alive so the *next*
+        // zero-copy frame after re-promote presents normally.
         if !zero_copy
             && (next.width > SW_BLIT_MAX_W || next.height > SW_BLIT_MAX_H)
-            && matched_dims.is_none()
         {
-            event_sender.emit_flow_with_details(
-                EventSeverity::Critical,
-                "display",
-                format!(
-                    "display output '{output_id}': source resolution {}x{} exceeds the \
-                     CPU-blit ceiling of {SW_BLIT_MAX_W}x{SW_BLIT_MAX_H}; the display \
-                     output will stop until display-vaapi zero-copy is engaged or the \
-                     source is reduced to ≤ 1080p",
-                    next.width, next.height,
-                ),
-                &flow_id,
-                serde_json::json!({
-                    "error_code": "display_resolution_unsupported_for_sw_blit",
-                    "output_id": output_id,
-                    "source_width": next.width,
-                    "source_height": next.height,
-                    "max_supported_width": SW_BLIT_MAX_W,
-                    "max_supported_height": SW_BLIT_MAX_H,
-                }),
-            );
-            break;
+            let now = Instant::now();
+            let due = last_sw_ceiling_warn_at
+                .map(|t| now.duration_since(t) >= SW_CEILING_WARN_INTERVAL)
+                .unwrap_or(true);
+            if due {
+                last_sw_ceiling_warn_at = Some(now);
+                event_sender.emit_flow_with_details(
+                    EventSeverity::Warning,
+                    "display",
+                    format!(
+                        "display output '{output_id}': dropping {}x{} CPU-decoded \
+                         frames (over {SW_BLIT_MAX_W}x{SW_BLIT_MAX_H} CPU-blit ceiling); \
+                         display will resume automatically when display-vaapi \
+                         zero-copy frames arrive again",
+                        next.width, next.height,
+                    ),
+                    &flow_id,
+                    serde_json::json!({
+                        "error_code": "display_resolution_unsupported_for_sw_blit",
+                        "output_id": output_id,
+                        "source_width": next.width,
+                        "source_height": next.height,
+                        "max_supported_width": SW_BLIT_MAX_W,
+                        "max_supported_height": SW_BLIT_MAX_H,
+                    }),
+                );
+            }
+            counters.frames_dropped_unsupported_pixfmt.fetch_add(1, Ordering::Relaxed);
+            continue;
         }
 
         // Re-arm autodetect if the source resolution shifted (operator

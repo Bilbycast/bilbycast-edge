@@ -254,8 +254,30 @@ impl MeterState {
             let es_pid = (((section[i + 1] as u16) & 0x1F) << 8) | section[i + 2] as u16;
             let es_info_length =
                 (((section[i + 3] as usize) & 0x0F) << 8) | section[i + 4] as usize;
-            if is_audio_stream_type(stream_type) {
-                discovered.insert(es_pid, stream_type);
+            // For `stream_type = 0x06` (PES private_data) the actual codec
+            // is signalled by an ES-info descriptor — see
+            // `ts_demux::detect_private_audio_descriptor`. Parse the
+            // descriptor loop and remap the stream_type to the
+            // synthetic ATSC-style marker the meter dispatch + decoder
+            // already understand:
+            //   tag 0x6A (DVB AC-3 desc)            → 0x81 (AC-3)
+            //   tag 0x7A (DVB E-AC-3 desc)          → 0x87 (E-AC-3)
+            //   tag 0xAC or reg "AC-4"              → skip (no decoder)
+            //   tag 0x05 reg "Opus"                 → keep 0x06 (drain_ff
+            //                                          dispatches via Opus)
+            // Without this, every DVB-T capture (Ten.ts, BBC, ARD…)
+            // carrying AC-3 on stream_type 0x06 was invisible to the
+            // meter and the audio bars stayed empty.
+            let descriptor_end = (i + 5 + es_info_length).min(body_end);
+            let effective_type = if stream_type == 0x06 {
+                resolve_private_audio_stream_type(&section[i + 5..descriptor_end])
+            } else {
+                Some(stream_type)
+            };
+            if let Some(st) = effective_type {
+                if is_audio_stream_type(st) {
+                    discovered.insert(es_pid, st);
+                }
             }
             i += 5 + es_info_length;
         }
@@ -335,6 +357,11 @@ impl MeterPidState {
             // forever and never publish a level — bars stay empty for
             // every Brazilian / Asian / Australian DVB-T AAC service.
             0x11 => self.drain_ff(publisher),
+            // Opus on `stream_type = 0x06` — `parse_pmt` only routes
+            // 0x06 here when the registration descriptor flagged it as
+            // Opus (DVB AC-3 / E-AC-3 are remapped to 0x81 / 0x87 in
+            // the PMT pass). drain_ff dispatches via Opus.
+            0x06 => self.drain_ff(publisher),
             0x03 | 0x04 | 0x80 | 0x81 | 0x82 | 0x83 | 0x84 | 0x85 | 0x87 | 0x88 | 0x8A
             | 0xC1 | 0xC2 => self.drain_ff(publisher),
             _ => {}
@@ -470,6 +497,7 @@ fn is_audio_stream_type(st: u8) -> bool {
     matches!(
         st,
         0x03 | 0x04
+            | 0x06   // DVB Opus carrier (resolved via descriptor in parse_pmt)
             | 0x0F
             | 0x11
             | 0x80
@@ -486,10 +514,53 @@ fn is_audio_stream_type(st: u8) -> bool {
     )
 }
 
+/// Inspect the ES-info descriptor loop for an audio codec carried on
+/// `stream_type = 0x06` (PES private_data). Returns the synthetic
+/// stream_type the meter's `drain` dispatch + `ff_codec_for_stream_type`
+/// can consume, or `None` for non-audio private streams (e.g. ARIB
+/// caption / DVB subtitling carried on the same private-data marker).
+///
+/// Keeps the same descriptor parser behaviour as
+/// `ts_demux::detect_private_audio_descriptor` so the two TS pipelines
+/// in this binary surface the same audio PIDs.
+fn resolve_private_audio_stream_type(descriptors: &[u8]) -> Option<u8> {
+    let mut pos = 0;
+    while pos + 2 <= descriptors.len() {
+        let tag = descriptors[pos];
+        let len = descriptors[pos + 1] as usize;
+        if pos + 2 + len > descriptors.len() {
+            break;
+        }
+        match tag {
+            // DVB AC-3 descriptor — ETSI TS 101 154 § 5.3.
+            0x6A => return Some(0x81),
+            // DVB E-AC-3 descriptor — ETSI TS 101 154 § 5.3.
+            0x7A => return Some(0x87),
+            // AC-4 descriptor — ETSI TS 101 154 § 5.7. AC-4 has no
+            // open-source decoder; skip from the meter so we don't
+            // open a libavcodec decoder that won't decode anything.
+            0xAC => return None,
+            // Registration descriptor — used for Opus and AC-4.
+            0x05 if len >= 4 => {
+                let id = &descriptors[pos + 2..pos + 6];
+                match id {
+                    b"Opus" => return Some(0x06), // drain_ff routes via Opus
+                    b"AC-4" => return None,        // no decoder
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        pos += 2 + len;
+    }
+    None
+}
+
 fn codec_label(stream_type: u8) -> &'static str {
     match stream_type {
         0x03 => "MP1",
         0x04 => "MP2",
+        0x06 => "OPUS",
         0x0F => "AAC",
         0x11 => "AAC",
         0x80 | 0x81 | 0xC1 => "AC3",
