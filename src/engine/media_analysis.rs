@@ -587,6 +587,7 @@ fn parse_pmt_streams(pkt: &[u8], program: &mut ProgramState) {
                     channels: None,
                     language,
                     header_detected: false,
+                    latm_cached: None,
                 });
             }
             0x0F => {
@@ -598,6 +599,7 @@ fn parse_pmt_streams(pkt: &[u8], program: &mut ProgramState) {
                     channels: None,
                     language,
                     header_detected: false,
+                    latm_cached: None,
                 });
             }
             0x11 => {
@@ -609,6 +611,7 @@ fn parse_pmt_streams(pkt: &[u8], program: &mut ProgramState) {
                     channels: None,
                     language,
                     header_detected: false,
+                    latm_cached: None,
                 });
             }
             0x81 => {
@@ -620,6 +623,7 @@ fn parse_pmt_streams(pkt: &[u8], program: &mut ProgramState) {
                     channels: None,
                     language,
                     header_detected: true,
+                    latm_cached: None,
                 });
             }
             0x87 => {
@@ -631,6 +635,7 @@ fn parse_pmt_streams(pkt: &[u8], program: &mut ProgramState) {
                     channels: None,
                     language,
                     header_detected: true,
+                    latm_cached: None,
                 });
             }
             // Some non-DVB ATSC 3.0 muxers stamp AC-4 directly at
@@ -645,6 +650,7 @@ fn parse_pmt_streams(pkt: &[u8], program: &mut ProgramState) {
                     channels: None,
                     language,
                     header_detected: true,
+                    latm_cached: None,
                 });
             }
             0x06 => {
@@ -659,6 +665,7 @@ fn parse_pmt_streams(pkt: &[u8], program: &mut ProgramState) {
                         channels: None,
                         language,
                         header_detected: true,
+                        latm_cached: None,
                     });
                 }
             }
@@ -1029,27 +1036,65 @@ fn try_parse_audio_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
                 }
             }
         }
-        // AAC-LATM (LOAS) — sync 0x2B7 in the top 11 bits.
+        // AAC-LATM (LOAS) — sync 0x2B7 in the top 11 bits. Real broadcasts
+        // emit the full StreamMuxConfig in the first frame after a
+        // multiplexer reconfiguration and reuse it (`useSameStreamMux=1`)
+        // on every subsequent frame. We cache the parsed config per-PID
+        // on the audio stream state so reused-config frames still latch
+        // sample rate / channels / profile onto the dashboard.
         Some(0x11) => {
-            if es_data.len() >= 3 && es_data[0] == 0x56 && (es_data[1] & 0xE0) == 0xE0 {
-                if let Some(asc) = parse_loas_audio_specific_config(es_data) {
-                    if let Some(a) = state
-                        .programs
-                        .iter_mut()
-                        .find_map(|p| p.audio_streams.iter_mut().find(|a| a.pid == pid))
-                    {
+            if es_data.len() < 3 || es_data[0] != 0x56 || (es_data[1] & 0xE0) != 0xE0 {
+                return;
+            }
+            let parsed = parse_loas_frame(es_data);
+            if let Some(a) = state
+                .programs
+                .iter_mut()
+                .find_map(|p| p.audio_streams.iter_mut().find(|a| a.pid == pid))
+            {
+                match parsed {
+                    LoasParseResult::FullConfig(asc) => {
                         a.sample_rate_hz = Some(asc.sample_rate);
                         a.channels = Some(asc.channels);
-                        a.codec = asc.profile_name;
+                        a.codec = asc.profile_name.clone();
                         a.header_detected = true;
+                        a.latm_cached = Some(crate::stats::collector::LatmCachedConfig {
+                            sample_rate: asc.sample_rate,
+                            channels: asc.channels,
+                            profile_name: asc.profile_name.clone(),
+                        });
                         tracing::info!(
-                            "Media analysis: AAC-LATM PID 0x{:04X}: {} Hz, {} ch, {}",
+                            "Media analysis: AAC-LATM PID 0x{:04X}: {} Hz, {} ch, {} (config frame)",
                             pid,
                             asc.sample_rate,
                             asc.channels,
                             a.codec,
                         );
                     }
+                    LoasParseResult::ReuseSameMux => {
+                        // Frame says "use the same StreamMuxConfig as last
+                        // time". If we have a cached config for this PID
+                        // (latched from an earlier `FullConfig` frame),
+                        // reapply it to the live state — this is the
+                        // dominant case in real broadcasts.
+                        if !a.header_detected {
+                            if let Some(cached) = a.latm_cached.clone() {
+                                a.sample_rate_hz = Some(cached.sample_rate);
+                                a.channels = Some(cached.channels);
+                                a.codec = cached.profile_name;
+                                a.header_detected = true;
+                                tracing::info!(
+                                    "Media analysis: AAC-LATM PID 0x{:04X}: latched from cached \
+                                     StreamMuxConfig ({} Hz, {} ch, {})",
+                                    pid,
+                                    cached.sample_rate,
+                                    cached.channels,
+                                    a.codec,
+                                );
+                            }
+                        }
+                    }
+                    LoasParseResult::Unsupported => {}
                 }
             }
         }
@@ -1909,64 +1954,105 @@ struct LatmInfo {
 /// numProgram=0, numLayer=0) is fully decoded; richer mux topologies bail
 /// out and leave the stream marked undetected so we try again on the next
 /// PES packet.
-fn parse_loas_audio_specific_config(data: &[u8]) -> Option<LatmInfo> {
-    if data.len() < 3 {
-        return None;
-    }
-    // syncword 11 bits = 0x2B7. First two bytes encode bits 10..0 in the
-    // top-11 of byte0 + top-3 of byte1 — top byte must be 0x56, byte1 top
-    // 3 bits must be 111.
-    if data[0] != 0x56 || (data[1] & 0xE0) != 0xE0 {
-        return None;
+/// Result of parsing a LOAS-framed LATM frame.
+enum LoasParseResult {
+    /// Frame carries a full `StreamMuxConfig` — extract and cache.
+    FullConfig(LatmInfo),
+    /// Frame says "reuse the last `StreamMuxConfig`" — caller should
+    /// look up its cached config for this PID.
+    ReuseSameMux,
+    /// Frame is well-formed LOAS but uses a feature we don't decode
+    /// (multi-program / multi-layer / mux version > 0). Caller should
+    /// fall back to whatever it had before.
+    Unsupported,
+}
+
+fn parse_loas_frame(data: &[u8]) -> LoasParseResult {
+    if data.len() < 3 || data[0] != 0x56 || (data[1] & 0xE0) != 0xE0 {
+        return LoasParseResult::Unsupported;
     }
     // 13-bit audioMuxLengthBytes — we don't need its value, just to skip past it.
     let mut reader = BitReader::new(&data[2..]);
-    reader.read_bits(5)?; // remainder of audioMuxLengthBytes high bits
-    reader.read_bits(8)?; // low byte
+    if reader.read_bits(5).is_none() || reader.read_bits(8).is_none() {
+        return LoasParseResult::Unsupported;
+    }
 
     // audioMuxElement(muxConfigPresent=1) — useSameStreamMux flag.
-    let use_same_mux = reader.read_bits(1)?;
+    let Some(use_same_mux) = reader.read_bits(1) else {
+        return LoasParseResult::Unsupported;
+    };
     if use_same_mux == 1 {
-        // Without the StreamMuxConfig from a prior frame we can't parse
-        // ASC; let the caller try again on a future PES.
-        return None;
+        // Caller will look up the cached StreamMuxConfig for this PID.
+        return LoasParseResult::ReuseSameMux;
     }
     // StreamMuxConfig
-    let audio_mux_version = reader.read_bits(1)?;
+    let Some(audio_mux_version) = reader.read_bits(1) else {
+        return LoasParseResult::Unsupported;
+    };
     let _audio_mux_version_a = if audio_mux_version == 1 {
-        reader.read_bits(1)?
+        match reader.read_bits(1) {
+            Some(v) => v,
+            None => return LoasParseResult::Unsupported,
+        }
     } else {
         0
     };
     if audio_mux_version != 0 {
-        return None; // Higher mux versions not handled.
+        return LoasParseResult::Unsupported;
     }
-    let _all_streams_same_time_framing = reader.read_bits(1)?;
-    let _num_sub_frames = reader.read_bits(6)?;
-    let num_program = reader.read_bits(4)?;
+    let _all_streams_same_time_framing = match reader.read_bits(1) {
+        Some(v) => v,
+        None => return LoasParseResult::Unsupported,
+    };
+    let _num_sub_frames = match reader.read_bits(6) {
+        Some(v) => v,
+        None => return LoasParseResult::Unsupported,
+    };
+    let num_program = match reader.read_bits(4) {
+        Some(v) => v,
+        None => return LoasParseResult::Unsupported,
+    };
     if num_program != 0 {
-        return None; // Multi-program LATM uncommon on broadcast.
+        return LoasParseResult::Unsupported;
     }
-    let num_layer = reader.read_bits(3)?;
+    let num_layer = match reader.read_bits(3) {
+        Some(v) => v,
+        None => return LoasParseResult::Unsupported,
+    };
     if num_layer != 0 {
-        return None;
+        return LoasParseResult::Unsupported;
     }
 
     // AudioSpecificConfig
-    let mut aot = reader.read_bits(5)? as u8;
+    let mut aot = match reader.read_bits(5) {
+        Some(v) => v as u8,
+        None => return LoasParseResult::Unsupported,
+    };
     if aot == 31 {
-        let ext = reader.read_bits(6)? as u8;
+        let ext = match reader.read_bits(6) {
+            Some(v) => v as u8,
+            None => return LoasParseResult::Unsupported,
+        };
         aot = 32 + ext;
     }
-    let sf_idx = reader.read_bits(4)? as usize;
+    let sf_idx = match reader.read_bits(4) {
+        Some(v) => v as usize,
+        None => return LoasParseResult::Unsupported,
+    };
     let sample_rate = if sf_idx == 0xF {
-        reader.read_bits(24)?
+        match reader.read_bits(24) {
+            Some(v) => v,
+            None => return LoasParseResult::Unsupported,
+        }
     } else if sf_idx < AAC_SAMPLE_RATES.len() {
         AAC_SAMPLE_RATES[sf_idx]
     } else {
-        return None;
+        return LoasParseResult::Unsupported;
     };
-    let channel_config = reader.read_bits(4)? as u8;
+    let channel_config = match reader.read_bits(4) {
+        Some(v) => v as u8,
+        None => return LoasParseResult::Unsupported,
+    };
 
     // Many broadcasts use HE-AAC v1/v2 signalled via SBR / PS extension —
     // the explicit signalling sits inside the rest of ASC. We don't need
@@ -1989,7 +2075,7 @@ fn parse_loas_audio_specific_config(data: &[u8]) -> Option<LatmInfo> {
         _ => 2,
     };
 
-    Some(LatmInfo {
+    LoasParseResult::FullConfig(LatmInfo {
         sample_rate,
         channels,
         profile_name,
@@ -2200,6 +2286,94 @@ mod tests {
         let data = [0x00, 0x00, 0x03, 0x01, 0x00, 0x00, 0x03, 0x00];
         let result = remove_emulation_prevention(&data);
         assert_eq!(result, vec![0x00, 0x00, 0x01, 0x00, 0x00, 0x00]);
+    }
+
+    /// Build a synthetic LOAS frame with a full StreamMuxConfig + AAC-LC
+    /// AudioSpecificConfig signalling (sf_idx, channel_config). Returns
+    /// the framed bytes ready to feed `parse_loas_frame`.
+    ///
+    /// Bit layout (after the 24-bit syncword + length prefix):
+    ///   useSameStreamMux : 1
+    ///   audioMuxVersion  : 1
+    ///   allStreamsSameTimeFraming : 1
+    ///   numSubFrames     : 6
+    ///   numProgram       : 4
+    ///   numLayer         : 3
+    ///   AOT              : 5
+    ///   sf_idx           : 4
+    ///   channel_config   : 4
+    fn make_loas_full_config(use_same_mux: u8, sf_idx: u8, channel_config: u8) -> Vec<u8> {
+        // Pack the bitstream after the syncword.
+        let mut bits: Vec<u8> = Vec::new();
+        let mut bitpos = 0u8;
+        let mut cur: u8 = 0;
+        let mut push = |bits_out: &mut Vec<u8>, value: u32, n: u8, bitpos: &mut u8, cur: &mut u8| {
+            for i in (0..n).rev() {
+                let bit = ((value >> i) & 1) as u8;
+                *cur |= bit << (7 - *bitpos);
+                *bitpos += 1;
+                if *bitpos == 8 {
+                    bits_out.push(*cur);
+                    *cur = 0;
+                    *bitpos = 0;
+                }
+            }
+        };
+        // 13-bit audioMuxLengthBytes (skip past)
+        push(&mut bits, 0, 13, &mut bitpos, &mut cur);
+        push(&mut bits, use_same_mux as u32, 1, &mut bitpos, &mut cur);
+        if use_same_mux == 0 {
+            push(&mut bits, 0, 1, &mut bitpos, &mut cur); // audioMuxVersion=0
+            push(&mut bits, 1, 1, &mut bitpos, &mut cur); // allStreamsSameTimeFraming
+            push(&mut bits, 0, 6, &mut bitpos, &mut cur); // numSubFrames
+            push(&mut bits, 0, 4, &mut bitpos, &mut cur); // numProgram
+            push(&mut bits, 0, 3, &mut bitpos, &mut cur); // numLayer
+            push(&mut bits, 2, 5, &mut bitpos, &mut cur); // AOT=2 (AAC-LC)
+            push(&mut bits, sf_idx as u32, 4, &mut bitpos, &mut cur);
+            push(&mut bits, channel_config as u32, 4, &mut bitpos, &mut cur);
+        }
+        if bitpos > 0 {
+            bits.push(cur);
+        }
+        // Prepend the 24-bit syncword (top 11 bits = 0x2B7).
+        // 0x2B7 = 0b101 0110 0111 → 0x56, 0xE0 in the leading byte pair.
+        let mut framed = vec![0x56u8, 0xE0u8];
+        // Merge the next 5 bits from `bits` into byte[1] low bits.
+        // Our `push` started writing from bitpos=0 of a fresh byte stream,
+        // so `bits[0]` already has bit 0 of audioMuxLengthBytes at MSB.
+        // Easier: just append everything after the 11 sync bits — the
+        // parser reads after `data[2..]` so bits[0..] are read directly.
+        framed.extend_from_slice(&bits);
+        framed
+    }
+
+    /// First frame carries a full StreamMuxConfig — must populate sample
+    /// rate / channels / profile correctly.
+    #[test]
+    fn loas_full_config_frame_parses() {
+        // sf_idx=3 → 48000 Hz, channel_config=2 → stereo.
+        let frame = make_loas_full_config(0, 3, 2);
+        match parse_loas_frame(&frame) {
+            LoasParseResult::FullConfig(info) => {
+                assert_eq!(info.sample_rate, 48000);
+                assert_eq!(info.channels, 2);
+                assert_eq!(info.profile_name, "AAC-LC");
+            }
+            _ => panic!("expected FullConfig for synthetic ASC frame"),
+        }
+    }
+
+    /// `useSameStreamMux=1` frames must return `ReuseSameMux` (NOT None
+    /// or Unsupported) so the caller can pull from its per-PID cache.
+    /// This is the fix for the "audio sample rate stuck on detecting"
+    /// bug on Brazilian ISDB-Tb captures.
+    #[test]
+    fn loas_reuse_same_mux_returns_reuse_marker() {
+        let frame = make_loas_full_config(1, 0, 0);
+        assert!(matches!(
+            parse_loas_frame(&frame),
+            LoasParseResult::ReuseSameMux
+        ));
     }
 
     #[test]

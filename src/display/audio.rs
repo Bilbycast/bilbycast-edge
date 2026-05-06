@@ -31,6 +31,16 @@ pub struct AudioBackend {
     /// `set_anchor` hasn't fired yet. Used to seed the AudioClock with
     /// the first frame's PTS.
     pending_anchor: bool,
+    /// Running sum of per-write gap-PTS values that fell *below* the
+    /// per-frame `PTS_GAP_CATCHUP_MS` threshold. Catches the slow-drift
+    /// failure mode where many small (~21 ms) silent audio drops in
+    /// the upstream `atx` mpsc never individually trip the catch-up
+    /// but cumulatively pull `audio_pts` seconds behind real time.
+    /// When the running sum crosses `PTS_CUMULATIVE_CATCHUP_MS`, we
+    /// snap the `AudioClock` forward by the cumulative amount and
+    /// reset. Reset on re-anchor too (a stream switch invalidates
+    /// any drift accumulated against the previous source).
+    cumulative_gap_pts: i64,
 }
 
 impl AudioBackend {
@@ -45,6 +55,7 @@ impl AudioBackend {
             sample_rate: 0,
             channels: 0,
             pending_anchor: true,
+            cumulative_gap_pts: 0,
         }
     }
 
@@ -62,6 +73,7 @@ impl AudioBackend {
         self.sample_rate = 0;
         self.channels = 0;
         self.pending_anchor = true;
+        self.cumulative_gap_pts = 0;
     }
 
     /// Write one decoded audio frame's worth of planar f32 samples.
@@ -155,6 +167,7 @@ impl AudioBackend {
         if needs_re_anchor {
             clock.set_anchor(program_start, pts_90k, sample_rate);
             self.pending_anchor = false;
+            self.cumulative_gap_pts = 0;
             clock.advance(written as u64);
         } else {
             // Steady-state clock advance. Naively `advance(written)` only
@@ -166,17 +179,29 @@ impl AudioBackend {
             // behind reality, computes drift = +N ms (video looks
             // ahead), and back-pressures the bounded video mpsc.
             //
-            // We don't want to chase every PES PTS micro-jitter — DVB
-            // encoders routinely emit per-frame PTS values that drift
-            // 1–2 ms vs the actual sample count, and aggressively
-            // tracking that bias makes the audio clock outrun wall by
-            // ≈ 10 ms/s on some streams (the `*_mpeg2audio` matrix
-            // combos), throwing video into sustained late-drops the
-            // wrong way. Instead: only catch up when the PES PTS jump
-            // exceeds 2 frame periods ahead of where the clock would
-            // be after a normal `advance(written)`. Anything smaller is
-            // treated as encoder jitter and ignored — the clock just
-            // advances by `written` like before.
+            // Two-tier catch-up:
+            //
+            // 1. Per-write spike catch-up at PTS_GAP_CATCHUP_MS — fires
+            //    on a *single* PES PTS jump bigger than two frame
+            //    periods (mid-stream codec hiccup, splitter resync).
+            //
+            // 2. Cumulative drift catch-up at PTS_CUMULATIVE_CATCHUP_MS
+            //    — fires when many sub-threshold gaps add up. This
+            //    catches the silent-mpsc-drop failure mode where the
+            //    audio `atx` queue fills during a decode burst and
+            //    drops single ~21 ms AAC frames; each drop is below
+            //    the per-write threshold but the lag accumulates as a
+            //    growing `+av_sync_offset_ms` (video drifting "ahead"
+            //    of audio). Without this tier the clock could lag real
+            //    time by seconds within a few minutes of playout on
+            //    bursty streams.
+            //
+            // We still don't want to chase encoder PTS micro-jitter
+            // (1–2 ms / frame, oscillating around zero, well-known on
+            // DVB MPEG-2 audio streams). Cumulative summation handles
+            // that naturally — symmetric jitter averages out near
+            // zero and never crosses the threshold; one-sided drift
+            // accumulates and trips the catch-up.
             let now_pts = clock.current_pts_90k().unwrap_or(pts_90k);
             let written_pts = ((written as u128) * 90_000 / (sample_rate as u128)) as u64;
             let expected_clock_after_write = now_pts.wrapping_add(written_pts);
@@ -184,14 +209,47 @@ impl AudioBackend {
             let gap_pts = target_clock.wrapping_sub(expected_clock_after_write) as i64;
             // Two AAC frames = ~43 ms; two AC-3 frames = 64 ms; two MP2
             // frames = 48 ms. 50 ms covers all three with margin —
-            // smaller jumps stay treated as benign jitter.
+            // smaller jumps stay treated as benign jitter (handled by
+            // the cumulative tier).
             const PTS_GAP_CATCHUP_MS: i64 = 50;
-            let advance_samples = if gap_pts > PTS_GAP_CATCHUP_MS * 90 {
-                let gap_samples = ((gap_pts as u128) * (sample_rate as u128) / 90_000) as u64;
-                (written as u64).saturating_add(gap_samples)
+            // 100 ms cumulative drift = ~5 silent AAC drops or ~3 AC-3
+            // drops. Big enough that legitimate symmetric encoder
+            // jitter (±1–2 ms) won't trip it within thousands of
+            // frames; small enough that a real one-sided drift fires
+            // catch-up before the operator sees a/v slip on screen.
+            const PTS_CUMULATIVE_CATCHUP_MS: i64 = 100;
+            let mut extra_samples: u64 = 0;
+            if gap_pts > PTS_GAP_CATCHUP_MS * 90 {
+                // Big single-frame jump — snap immediately, reset
+                // cumulative (it's been absorbed).
+                extra_samples =
+                    ((gap_pts as u128) * (sample_rate as u128) / 90_000) as u64;
+                self.cumulative_gap_pts = 0;
             } else {
-                written as u64
-            };
+                // Small per-frame gap — accumulate. May be jitter (±)
+                // or a slow drift (+). Only the latter trips the
+                // cumulative threshold.
+                self.cumulative_gap_pts =
+                    self.cumulative_gap_pts.saturating_add(gap_pts);
+                if self.cumulative_gap_pts > PTS_CUMULATIVE_CATCHUP_MS * 90 {
+                    extra_samples = ((self.cumulative_gap_pts as u128)
+                        * (sample_rate as u128)
+                        / 90_000) as u64;
+                    self.cumulative_gap_pts = 0;
+                } else if self.cumulative_gap_pts < -(PTS_CUMULATIVE_CATCHUP_MS * 90) {
+                    // Mirror case — clock running ahead of source by a
+                    // sustained margin. Pull it back so the display's
+                    // drift estimator doesn't drop video forever.
+                    // Subtracting from `written` would wrap underflow,
+                    // so we just zero the advance for this write and
+                    // reset the running sum; the clock holds on the
+                    // previous frame's position for one period.
+                    self.cumulative_gap_pts = 0;
+                    clock.advance(0);
+                    return Ok(written);
+                }
+            }
+            let advance_samples = (written as u64).saturating_add(extra_samples);
             clock.advance(advance_samples);
         }
         Ok(written)

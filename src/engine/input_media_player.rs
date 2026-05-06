@@ -34,7 +34,7 @@ use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result, anyhow};
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
@@ -54,6 +54,16 @@ mod mp4_demux;
 const TS_PACKET: usize = 188;
 /// MPEG-TS sync byte (every TS packet starts with this).
 const SYNC_BYTE: u8 = 0x47;
+/// Maximum trailer length across supported TS packet-size variants:
+/// 188 (none), 192-byte M2TS / AVCHD / Blu-ray BDAV (4-byte timestamp prefix
+/// — see note in [`detect_ts_packet_size_in_buf`] re: prefix vs. suffix),
+/// 204-byte DVB Reed-Solomon (16-byte parity suffix). 16 bytes covers all
+/// known broadcast variants.
+const MAX_TS_TRAILER: usize = 16;
+/// Probe window for [`detect_ts_packet_size_in_buf`]. 16 KiB is enough for
+/// `MIN_STRIDE_HITS = 5` consecutive sync bytes at the largest stride (204)
+/// with comfortable headroom for a leading non-TS prefix.
+const STRIDE_PROBE_BYTES: usize = 16 * 1024;
 /// Bundle 7 × 188 = 1316 bytes per `RtpPacket` — the standard MPEG-TS-over-RTP
 /// payload framing the rest of the engine already assumes.
 pub(super) const PACKETS_PER_BUNDLE: usize = 7;
@@ -441,10 +451,30 @@ async fn play_ts_file(
     program_number: Option<u16>,
     session: &mut PlayerSession<'_>,
 ) -> Result<()> {
-    let file = tokio::fs::File::open(path)
+    let mut file = tokio::fs::File::open(path)
         .await
         .with_context(|| format!("open {}", path.display()))?;
+
+    // Auto-detect the on-disk TS stride (188 / 192 / 204) from the head.
+    // 188 = canonical MPEG-TS. 192 = M2TS / AVCHD / Blu-ray BDAV (4-byte
+    // timestamp prefix per packet). 204 = DVB Reed-Solomon parity suffix
+    // (broadcast captures from professional DVB tuners). Anything else
+    // falls back to 188 + the existing resync loop.
+    let mut head = vec![0u8; STRIDE_PROBE_BYTES];
+    let head_len = file
+        .read(&mut head)
+        .await
+        .with_context(|| format!("probe head of {}", path.display()))?;
+    head.truncate(head_len);
+    let stride = detect_ts_packet_size_in_buf(&head);
+    drop(head);
+    file.seek(std::io::SeekFrom::Start(0))
+        .await
+        .with_context(|| format!("rewind {} after stride probe", path.display()))?;
     let mut reader = BufReader::new(file);
+
+    let trailer_len = stride - TS_PACKET;
+    let mut trailer_buf = [0u8; MAX_TS_TRAILER];
 
     let mut bundle = BytesMut::with_capacity(BUNDLE_SIZE);
     let mut packet = [0u8; TS_PACKET];
@@ -490,6 +520,24 @@ async fn play_ts_file(
             // malformed file doesn't burn CPU forever.
             if !resync_to_sync_byte(&mut reader, &mut packet).await? {
                 break;
+            }
+        }
+
+        // Discard the per-packet trailer for non-188 strides. 192-byte M2TS
+        // technically prefixes a 4-byte timestamp; for our wire-output use
+        // (we just need the 188-byte TS body and don't propagate the BDAV
+        // arrival timestamp) we treat it as a trailer to avoid an extra
+        // realignment step. 204-byte DVB packets carry 16 bytes of RS
+        // parity which the wire output never reproduces. Both cases just
+        // need to be skipped.
+        if trailer_len > 0 {
+            match reader.read_exact(&mut trailer_buf[..trailer_len]).await {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => {
+                    return Err(anyhow::Error::from(e)
+                        .context(format!("trailer read {}", path.display())));
+                }
             }
         }
 
@@ -595,6 +643,56 @@ async fn play_ts_file(
     // file's first emitted PTS picks up immediately after.
     session.cont.close_file(max_emitted_pts_90k);
     Ok(())
+}
+
+/// Detect the on-disk MPEG-TS packet stride for the given head buffer.
+/// Returns one of `188` (canonical), `192` (M2TS / AVCHD / Blu-ray BDAV —
+/// 4-byte timestamp per packet), or `204` (DVB Reed-Solomon parity-suffixed
+/// broadcast capture). Falls back to `188` for anything inconclusive — the
+/// caller's existing 188-byte resync loop then handles malformed files.
+///
+/// Algorithm: for each candidate stride, scan every byte offset in the
+/// buffer for a sync byte and walk forward in `stride` increments. The
+/// first stride that yields `MIN_STRIDE_HITS` consecutive sync bytes wins.
+/// 188 is tried first so canonical files take the cheapest detection path.
+///
+/// Pure function — unit-tested.
+pub(super) fn detect_ts_packet_size_in_buf(buf: &[u8]) -> usize {
+    /// Minimum consecutive sync hits at the candidate stride. Five gives
+    /// effectively zero false positives — a random byte sequence of length
+    /// `5 × 204` ≈ 1 KiB would hit 0x47 at five exact stride offsets with
+    /// probability `(1/256)^4` ≈ 10⁻¹⁰, and real TS files lock in within
+    /// the first PAT/PMT/PCR cycle (≈ first 1-2 KiB).
+    const MIN_STRIDE_HITS: usize = 5;
+    /// Order matters: 188 is canonical and the cheapest case to confirm,
+    /// so it's tried first to short-circuit the probe on the dominant
+    /// majority of files.
+    const CANDIDATES: [usize; 3] = [TS_PACKET, 192, 204];
+
+    for &stride in &CANDIDATES {
+        let needed = (MIN_STRIDE_HITS - 1).saturating_mul(stride) + 1;
+        if buf.len() < needed {
+            continue;
+        }
+        let max_start = buf.len() - needed;
+        for start in 0..=max_start {
+            if buf[start] != SYNC_BYTE {
+                continue;
+            }
+            let mut hits = 1usize;
+            for i in 1..MIN_STRIDE_HITS {
+                let pos = start + i * stride;
+                if pos >= buf.len() || buf[pos] != SYNC_BYTE {
+                    break;
+                }
+                hits += 1;
+            }
+            if hits >= MIN_STRIDE_HITS {
+                return stride;
+            }
+        }
+    }
+    TS_PACKET
 }
 
 /// Find the next sync byte and align — read one byte at a time, when 0x47
@@ -1263,6 +1361,162 @@ mod tests {
         pkt[0] = SYNC_BYTE;
         pkt[3] = 0x10;
         assert!(!try_set_discontinuity_indicator(&mut pkt));
+    }
+
+    /// `detect_ts_packet_size_in_buf` recognises 188-byte canonical TS,
+    /// 192-byte M2TS (4-byte timestamp prefix), and 204-byte DVB
+    /// (16-byte Reed-Solomon parity suffix). Anything inconclusive
+    /// falls through to 188 so the resync loop handles malformed input
+    /// the same way as before.
+    #[test]
+    fn detect_stride_188() {
+        let mut buf = vec![0xAAu8; 188 * 8];
+        for i in 0..8 {
+            buf[i * 188] = SYNC_BYTE;
+        }
+        assert_eq!(detect_ts_packet_size_in_buf(&buf), 188);
+    }
+
+    #[test]
+    fn detect_stride_192_m2ts() {
+        let mut buf = vec![0xAAu8; 192 * 8];
+        for i in 0..8 {
+            // M2TS layout: 4-byte timestamp, then sync, then 187 body bytes.
+            buf[i * 192 + 4] = SYNC_BYTE;
+        }
+        assert_eq!(detect_ts_packet_size_in_buf(&buf), 192);
+    }
+
+    #[test]
+    fn detect_stride_204_dvb() {
+        let mut buf = vec![0xAAu8; 204 * 8];
+        for i in 0..8 {
+            // DVB layout: sync + 187 body, then 16 parity bytes (suffix).
+            buf[i * 204] = SYNC_BYTE;
+        }
+        assert_eq!(detect_ts_packet_size_in_buf(&buf), 204);
+    }
+
+    #[test]
+    fn detect_stride_falls_back_to_188_on_garbage() {
+        let buf = vec![0xAAu8; 1024];
+        assert_eq!(detect_ts_packet_size_in_buf(&buf), 188);
+    }
+
+    #[test]
+    fn detect_stride_rejects_lone_sync_byte() {
+        // A single 0x47 in random data must not be misclassified as 188.
+        let mut buf = vec![0xAAu8; 1024];
+        buf[10] = SYNC_BYTE;
+        assert_eq!(detect_ts_packet_size_in_buf(&buf), 188);
+    }
+
+    /// End-to-end test for 204-byte (DVB) TS playback. Builds a fixture
+    /// that mirrors a professional DVB capture — every 188-byte TS packet
+    /// is followed by 16 bytes of (synthetic) Reed-Solomon parity — and
+    /// asserts the player drains it without losing packets and CC stays
+    /// continuous (i.e. the trailer skip is correctly aligned, not just
+    /// "every other packet" via the resync fallback).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn play_ts_file_handles_204_byte_dvb_packets() {
+        use crate::engine::rtmp::ts_mux::TsMuxer;
+        use std::collections::HashMap;
+        use std::io::Write;
+
+        // Build a 188-byte TS source first.
+        let mut mux = TsMuxer::new();
+        mux.set_has_video(true);
+        mux.set_video_stream_type(0x1B);
+        let mut ts188: Vec<u8> = Vec::new();
+        for i in 0..30u64 {
+            let pts = (i + 1) * 3_000;
+            let dts = pts;
+            let is_keyframe = i == 0;
+            let nal_type: u8 = if is_keyframe { 0x65 } else { 0x41 };
+            let annex_b = vec![0x00, 0x00, 0x00, 0x01, nal_type, 0xAB, 0xCD];
+            for pkt in mux.mux_video(&annex_b, pts, dts, is_keyframe) {
+                ts188.extend_from_slice(&pkt);
+            }
+        }
+        assert!(ts188.len() % TS_PACKET == 0);
+
+        // Wrap into 204-byte packets: TS188 + 16 bytes of synthetic parity.
+        let mut ts204: Vec<u8> = Vec::with_capacity(ts188.len() / 188 * 204);
+        for chunk in ts188.chunks(TS_PACKET) {
+            ts204.extend_from_slice(chunk);
+            ts204.extend_from_slice(&[0xDEu8; 16]); // any non-0x47 parity
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dvb-fixture.ts");
+        std::fs::File::create(&path).unwrap().write_all(&ts204).unwrap();
+
+        let (tx, mut rx) = broadcast::channel::<RtpPacket>(2048);
+        let stats = std::sync::Arc::new(FlowStatsAccumulator::new(
+            "test-flow".into(),
+            "test-flow-name".into(),
+            "media_player".into(),
+        ));
+        let cancel = CancellationToken::new();
+        let mut seq_num: u16 = 0;
+        let mut cont = SpliceContinuity::default();
+
+        cont.open_file("dvb-fixture.ts");
+        {
+            let mut session = PlayerSession {
+                seq_num: &mut seq_num,
+                per_input_tx: &tx,
+                stats: &stats,
+                cancel: &cancel,
+                cont: &mut cont,
+            };
+            play_ts_file(&path, None, None, &mut session).await.unwrap();
+        }
+
+        drop(tx);
+        let mut bundles: Vec<RtpPacket> = Vec::new();
+        while let Ok(p) = rx.try_recv() {
+            bundles.push(p);
+        }
+        assert!(!bundles.is_empty(), "must emit at least one bundle");
+
+        // Walk the wire and assert CC continuity on every PID. If the
+        // 204→188 stride handling were broken (e.g. losing every other
+        // packet via the resync fallback), CC would skip every other
+        // value and trip the assertion.
+        let mut last_cc: HashMap<u16, u8> = HashMap::new();
+        let mut total_packets = 0usize;
+        for bundle in &bundles {
+            for ts_pkt in bundle.data.chunks(TS_PACKET) {
+                if ts_pkt.len() != TS_PACKET || ts_pkt[0] != SYNC_BYTE {
+                    continue;
+                }
+                total_packets += 1;
+                let pid = (((ts_pkt[1] & 0x1F) as u16) << 8) | ts_pkt[2] as u16;
+                let afc = (ts_pkt[3] >> 4) & 0b11;
+                let has_payload = afc == 0b01 || afc == 0b11;
+                if has_payload && pid != 0x1FFF {
+                    let cc = ts_pkt[3] & 0x0F;
+                    if let Some(&prev) = last_cc.get(&pid) {
+                        let expected = (prev + 1) & 0x0F;
+                        assert_eq!(
+                            cc, expected,
+                            "CC discontinuity on PID 0x{pid:04X} — \
+                             204→188 stride handling lost a packet"
+                        );
+                    }
+                    last_cc.insert(pid, cc);
+                }
+            }
+        }
+        // Every TS packet from the source should reach the wire. Some
+        // bundles may include a partial flush so we expect ≥ source.
+        let source_packet_count = ts188.len() / TS_PACKET;
+        assert!(
+            total_packets >= source_packet_count,
+            "expected ≥ {source_packet_count} packets through the wire, got {total_packets} \
+             — 204-byte stride handling is dropping packets"
+        );
     }
 
     #[test]

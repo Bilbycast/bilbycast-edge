@@ -97,37 +97,59 @@ fn is_false(b: &bool) -> bool { !*b }
 /// Walk a TS-shaped byte buffer and return the first PAT's program
 /// list. Pure function for unit-testability — the async wrapper just
 /// reads the first chunk of bytes and hands them in.
+///
+/// Auto-detects the on-disk packet stride: 188 (canonical MPEG-TS),
+/// 192 (M2TS / AVCHD / Blu-ray BDAV — 4-byte timestamp per packet),
+/// or 204 (DVB Reed-Solomon parity-suffixed broadcast capture). The
+/// PAT body lives inside the leading 188 bytes of every variant, so
+/// once the stride is known the parse path is identical.
 pub fn scan_programs_in_buf(buf: &[u8]) -> MediaScanResult {
     use crate::engine::ts_parse::{TS_PACKET_SIZE, TS_SYNC_BYTE, parse_pat_programs, ts_pid, ts_pusi};
 
-    // Resync to a sync byte first — a file written by ffmpeg with a
-    // leading ID3 tag, for example, would otherwise look non-TS.
-    let mut start = 0usize;
-    let mut found_sync = false;
-    while start + TS_PACKET_SIZE <= buf.len() {
-        if buf[start] == TS_SYNC_BYTE {
-            // Confirm by checking the next packet's sync byte too.
-            if start + 2 * TS_PACKET_SIZE > buf.len()
-                || buf[start + TS_PACKET_SIZE] == TS_SYNC_BYTE
-            {
-                found_sync = true;
-                break;
+    // Try strides 188 → 192 → 204. Each candidate confirms by walking
+    // forward from a sync byte and checking that the next stride boundary
+    // is also a sync byte (one extra hit, rather than the input_media_player
+    // probe's 5 — the scanner only needs to land on one PAT, and the file
+    // tail might not have many packets).
+    const STRIDE_CANDIDATES: [usize; 3] = [TS_PACKET_SIZE, 192, 204];
+    let mut detected: Option<(usize, usize)> = None; // (stride, start_offset)
+    'detect: for &stride in &STRIDE_CANDIDATES {
+        let mut start = 0usize;
+        while start + 2 * stride <= buf.len() {
+            if buf[start] == TS_SYNC_BYTE && buf[start + stride] == TS_SYNC_BYTE {
+                detected = Some((stride, start));
+                break 'detect;
+            }
+            start += 1;
+        }
+        // Tail-of-buffer fallback: a single confirmed sync byte counts if
+        // there isn't room for two strides. Only the canonical 188 case
+        // gets this concession (small files), to keep 192/204 detection
+        // strict.
+        if stride == TS_PACKET_SIZE && buf.len() >= TS_PACKET_SIZE {
+            for s in 0..=buf.len() - TS_PACKET_SIZE {
+                if buf[s] == TS_SYNC_BYTE {
+                    detected = Some((TS_PACKET_SIZE, s));
+                    break 'detect;
+                }
             }
         }
-        start += 1;
     }
-    if !found_sync {
-        return MediaScanResult {
-            is_ts: false,
-            programs: Vec::new(),
-            not_found: false,
-        };
-    }
+    let (stride, start) = match detected {
+        Some(d) => d,
+        None => {
+            return MediaScanResult {
+                is_ts: false,
+                programs: Vec::new(),
+                not_found: false,
+            };
+        }
+    };
 
     let mut offset = start;
     while offset + TS_PACKET_SIZE <= buf.len() {
         let pkt = &buf[offset..offset + TS_PACKET_SIZE];
-        offset += TS_PACKET_SIZE;
+        offset += stride;
         if pkt[0] != TS_SYNC_BYTE {
             continue;
         }
@@ -683,5 +705,58 @@ mod tests {
         assert!(res.is_ts);
         assert_eq!(res.programs.len(), 1);
         assert_eq!(res.programs[0].program_number, 42);
+    }
+
+    /// 204-byte DVB capture: every TS packet is suffixed with 16 bytes
+    /// of Reed-Solomon parity. The scanner must walk the file at the
+    /// 204-byte stride to land on the PAT instead of returning
+    /// `is_ts: false`.
+    #[test]
+    fn scan_in_buf_finds_program_in_204_byte_dvb_capture() {
+        let pat = build_pat_packet(&[(23584, 0x1100)]);
+        let mut buf = Vec::with_capacity(204 * 4);
+        buf.extend_from_slice(&pat);
+        buf.extend_from_slice(&[0xDEu8; 16]); // synthetic RS parity
+
+        let mut null = [0xFFu8; 188];
+        null[0] = 0x47;
+        null[1] = 0x1F;
+        null[2] = 0xFF;
+        null[3] = 0x10;
+        buf.extend_from_slice(&null);
+        buf.extend_from_slice(&[0xDEu8; 16]);
+
+        let res = scan_programs_in_buf(&buf);
+        assert!(res.is_ts);
+        assert_eq!(res.programs.len(), 1);
+        assert_eq!(res.programs[0].program_number, 23584);
+        assert_eq!(res.programs[0].pmt_pid, 0x1100);
+    }
+
+    /// 192-byte M2TS / AVCHD: every TS packet is prefixed with 4 bytes
+    /// of arrival timestamp. The detector finds sync bytes 192 apart,
+    /// and the parser walks the buffer at stride 192 starting at the
+    /// first sync byte (offset 4 from file start).
+    #[test]
+    fn scan_in_buf_finds_program_in_192_byte_m2ts_capture() {
+        let pat = build_pat_packet(&[(7, 0x1007)]);
+        let mut buf = Vec::with_capacity(192 * 4);
+        // 4-byte timestamp prefix on the PAT packet.
+        buf.extend_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        buf.extend_from_slice(&pat);
+
+        let mut null = [0xFFu8; 188];
+        null[0] = 0x47;
+        null[1] = 0x1F;
+        null[2] = 0xFF;
+        null[3] = 0x10;
+        buf.extend_from_slice(&[0x12, 0x34, 0x56, 0x79]);
+        buf.extend_from_slice(&null);
+
+        let res = scan_programs_in_buf(&buf);
+        assert!(res.is_ts);
+        assert_eq!(res.programs.len(), 1);
+        assert_eq!(res.programs[0].program_number, 7);
+        assert_eq!(res.programs[0].pmt_pid, 0x1007);
     }
 }

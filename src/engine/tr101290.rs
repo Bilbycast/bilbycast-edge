@@ -522,6 +522,7 @@ fn process_ts_packet(
         && pid != TDT_TOT_PID
         && !state.pmt_pids.contains_key(&pid)
         && !state.es_pids.contains_key(&pid)
+        && !state.pmt_referenced_data_pids.contains(&pid)
         && !state.unreferenced_pids.contains_key(&pid)
     {
         state.unreferenced_pids.insert(pid, ());
@@ -658,8 +659,30 @@ fn psi_section_start(pkt: &[u8]) -> Option<usize> {
     Some(section_start)
 }
 
+/// MPEG-TS stream_type values that carry **data only** (no A/V essence) and
+/// are emitted on broadcaster-defined intervals far longer than TR-101290's
+/// A/V-oriented timeouts (PAT_PMT_TIMEOUT = 500 ms, PTS_TIMEOUT = 700 ms).
+/// Tracking them as ES PIDs produces a steady stream of false-positive
+/// `pid_errors` / `pts_errors` on real broadcast captures (especially
+/// ISDB-T / ARIB streams with their DSM-CC carousels and private-section
+/// caption tables, and DVB streams with MHP carousels and SI tables in the
+/// PMT). TR 101 290 is fundamentally a service-quality spec for the A/V
+/// path; data PIDs are out of scope for QoS monitoring.
+///
+/// Skipped:
+/// - `0x05` ISO/IEC 13818-1 private_sections
+/// - `0x0B` ISO/IEC 13818-6 DSM-CC U-N messages (object carousel)
+/// - `0x0C` ISO/IEC 13818-6 DSM-CC stream descriptors
+/// - `0x0D` ISO/IEC 13818-6 DSM-CC sections (any type)
+/// - `0x14` ISO/IEC 13818-6 synchronized download protocol
+fn is_data_only_stream_type(stream_type: u8) -> bool {
+    matches!(stream_type, 0x05 | 0x0B | 0x0C | 0x0D | 0x14)
+}
+
 /// Extract elementary stream PIDs from a PMT section and register them
-/// for PID error tracking (TR-101290 Priority 1).
+/// for PID error tracking (TR-101290 Priority 1). Data-only stream types
+/// (DSM-CC carousels, private sections) are filtered out — see
+/// [`is_data_only_stream_type`] for the rationale.
 fn extract_es_pids_from_pmt(pkt: &[u8], state: &mut crate::stats::collector::Tr101290State) {
     if !ts_pusi(pkt) {
         return;
@@ -693,16 +716,32 @@ fn extract_es_pids_from_pmt(pkt: &[u8], state: &mut crate::stats::collector::Tr1
     let data_end = (offset + 3 + section_length).min(TS_PACKET_SIZE).saturating_sub(4);
 
     let mut new_es_pids = std::collections::HashSet::new();
+    let mut new_data_pids = std::collections::HashSet::new();
     let mut pos = data_start;
     while pos + 5 <= data_end {
+        let stream_type = pkt[pos];
         let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
         let es_info_length =
             (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
-        new_es_pids.insert(es_pid);
-        // Register ES PID if not already tracked
-        state.es_pids.entry(es_pid).or_insert(None);
+        if is_data_only_stream_type(stream_type) {
+            // Data-only PIDs (DSM-CC carousels, private sections) — file
+            // them under `pmt_referenced_data_pids` so they don't fire
+            // false-positive pid_errors / pts_errors against the A/V
+            // timeouts, but DO count as "referenced" for the unreferenced-
+            // PID check (they're legitimately in the PMT).
+            new_data_pids.insert(es_pid);
+            state.pmt_referenced_data_pids.insert(es_pid);
+        } else {
+            new_es_pids.insert(es_pid);
+            // Register A/V ES PID if not already tracked
+            state.es_pids.entry(es_pid).or_insert(None);
+        }
         pos += 5 + es_info_length;
     }
+    // Prune data PIDs no longer referenced by this PMT.
+    state
+        .pmt_referenced_data_pids
+        .retain(|pid| new_data_pids.contains(pid));
     // Remove ES PIDs no longer referenced by this PMT.
     state.es_pids.retain(|pid, _| new_es_pids.contains(pid));
     // Prune the per-ES-PID stateful trackers in lock-step. Without this, an
@@ -1402,5 +1441,100 @@ mod tests {
         let next_pcr = 2_700_000_000_u64;
         let next_wall = (PCR_HISTORY_LEN as u64) * 40_000;
         assert_eq!(pcr_residual_ns(&h, next_pcr, next_wall), None);
+    }
+
+    /// Data-only stream types must be classified as such.
+    #[test]
+    fn data_only_stream_types_recognised() {
+        assert!(is_data_only_stream_type(0x05)); // private_sections
+        assert!(is_data_only_stream_type(0x0B)); // DSM-CC U-N
+        assert!(is_data_only_stream_type(0x0C)); // DSM-CC stream descriptors
+        assert!(is_data_only_stream_type(0x0D)); // DSM-CC sections
+        assert!(is_data_only_stream_type(0x14)); // synchronized download
+    }
+
+    /// A/V stream types must NOT be classified as data-only.
+    #[test]
+    fn av_stream_types_not_data_only() {
+        for st in [0x01, 0x02, 0x03, 0x04, 0x06, 0x0F, 0x11, 0x1B, 0x24, 0x81, 0x87, 0xAC] {
+            assert!(
+                !is_data_only_stream_type(st),
+                "stream_type 0x{st:02X} must NOT be data-only"
+            );
+        }
+    }
+
+    /// PMTs that mix A/V and data PIDs must register A/V into `es_pids`
+    /// and data into `pmt_referenced_data_pids` — the regression we're
+    /// guarding against is the ISDB-T case where DSM-CC carousels (0x0B/0x0C)
+    /// and ARIB private sections (0x05) used to fire false-positive
+    /// `pid_errors` against the 500 ms PAT_PMT_TIMEOUT.
+    #[test]
+    fn pmt_isdb_t_carousels_dont_register_as_av_es_pids() {
+        // Build a PMT packet listing 5 ES entries:
+        //   - 0x0111 type 0x1B (H.264) → A/V
+        //   - 0x0112 type 0x11 (LATM)  → A/V
+        //   - 0x01F4 type 0x05 (private sections) → data
+        //   - 0x0384 type 0x0B (DSM-CC U-N) → data
+        //   - 0x05DC type 0x0C (DSM-CC stream desc) → data
+        let entries: [(u8, u16); 5] = [
+            (0x1B, 0x0111),
+            (0x11, 0x0112),
+            (0x05, 0x01F4),
+            (0x0B, 0x0384),
+            (0x0C, 0x05DC),
+        ];
+        let mut pkt = vec![0u8; TS_PACKET_SIZE];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = 0x40; // PUSI=1, PID hi = 0
+        pkt[2] = 0x10; // PID lo = 0x10 (some PMT PID)
+        pkt[3] = 0x10; // afc=01 (payload only), CC=0
+        pkt[4] = 0x00; // pointer_field
+        let mut p = 5;
+        pkt[p] = 0x02; // table_id=PMT
+        let n = entries.len();
+        let section_length = 9 + 5 * n + 4;
+        pkt[p + 1] = 0xB0 | (((section_length as u16) >> 8) & 0x0F) as u8;
+        pkt[p + 2] = (section_length as u16 & 0xFF) as u8;
+        // program_number, version+cni, section_no, last_section_no
+        pkt[p + 3] = 0x5C;
+        pkt[p + 4] = 0x20; // program 0x5C20 = 23584
+        pkt[p + 5] = 0xC1;
+        pkt[p + 6] = 0x00;
+        pkt[p + 7] = 0x00;
+        // PCR_PID
+        pkt[p + 8] = 0xE1;
+        pkt[p + 9] = 0x00;
+        // program_info_length=0
+        pkt[p + 10] = 0xF0;
+        pkt[p + 11] = 0x00;
+        p += 12;
+        for (st, es_pid) in entries.iter() {
+            pkt[p] = *st;
+            pkt[p + 1] = 0xE0 | ((*es_pid >> 8) & 0x1F) as u8;
+            pkt[p + 2] = (*es_pid & 0xFF) as u8;
+            pkt[p + 3] = 0xF0; // ES_info_length=0
+            pkt[p + 4] = 0x00;
+            p += 5;
+        }
+        // Leave CRC bytes as zero — the extractor doesn't verify CRC.
+
+        let stats = Arc::new(Tr101290Accumulator::new());
+        let mut state = stats.state.lock().unwrap();
+        extract_es_pids_from_pmt(&pkt, &mut state);
+
+        // A/V PIDs must be tracked for QoS.
+        assert!(state.es_pids.contains_key(&0x0111));
+        assert!(state.es_pids.contains_key(&0x0112));
+        // Data PIDs must NOT be tracked for QoS — they live in the
+        // separate referenced-but-not-monitored set.
+        assert!(!state.es_pids.contains_key(&0x01F4));
+        assert!(!state.es_pids.contains_key(&0x0384));
+        assert!(!state.es_pids.contains_key(&0x05DC));
+        // Data PIDs ARE counted as PMT-referenced (so they don't fire
+        // unreferenced_pid_errors when packets land for them).
+        assert!(state.pmt_referenced_data_pids.contains(&0x01F4));
+        assert!(state.pmt_referenced_data_pids.contains(&0x0384));
+        assert!(state.pmt_referenced_data_pids.contains(&0x05DC));
     }
 }

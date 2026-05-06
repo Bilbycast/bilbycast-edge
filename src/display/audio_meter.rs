@@ -326,7 +326,15 @@ impl MeterPidState {
 
     fn drain(&mut self, publisher: &mut MeterPublisher) {
         match self.stream_type {
-            0x0F | 0x11 => self.drain_aac(publisher),
+            // ADTS-framed AAC — fdk-aac via the in-house `AacDecoder`.
+            0x0F => self.drain_aac(publisher),
+            // LATM/LOAS-framed AAC — libavcodec's `AAC_LATM` decoder.
+            // ADTS sync `0xFFF` never appears at LATM frame boundaries
+            // (sync is `0x2B7` → bytes `0x56 0xE0…`), so routing 0x11
+            // through `drain_aac` would walk the PES byte-by-byte
+            // forever and never publish a level — bars stay empty for
+            // every Brazilian / Asian / Australian DVB-T AAC service.
+            0x11 => self.drain_ff(publisher),
             0x03 | 0x04 | 0x80 | 0x81 | 0x82 | 0x83 | 0x84 | 0x85 | 0x87 | 0x88 | 0x8A
             | 0xC1 | 0xC2 => self.drain_ff(publisher),
             _ => {}

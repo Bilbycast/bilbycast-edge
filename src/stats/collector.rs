@@ -293,6 +293,22 @@ pub struct DisplayStatsCounters {
     /// the Lagged / pts_jump signals first).
     pub frames_dropped_stale_gen: AtomicU64,
 
+    /// Audio blocks the demux+decode child dropped because the bounded
+    /// `atx` mpsc (audio-task channel, `MPSC_AUDIO_DEPTH` slots) was
+    /// full when `try_send` ran. Audio counterpart to
+    /// `frames_dropped_mpsc_full`. Each silent drop is a hole in the
+    /// audio timeline (~21 ms for AAC at 48 kHz, ~24 ms for MP2,
+    /// ~32 ms for AC-3) that the `AudioClock` would otherwise advance
+    /// over via the per-frame catch-up logic — but the catch-up only
+    /// fires past `PTS_GAP_CATCHUP_MS` (50 ms by default), so single-
+    /// frame drops accumulate as a slow positive `av_sync_offset_ms`
+    /// (video drifting "ahead of" audio because audio_pts lags real
+    /// time without ever crossing the catch-up threshold). Surfaced
+    /// as a discrete signal so operators can distinguish "decode is
+    /// fast and ALSA can't drain" from "audio decode is silently
+    /// failing on some PIDs".
+    pub audio_dropped_mpsc_full: AtomicU64,
+
     /// Largest single `blit_and_present` duration since startup (µs).
     /// Includes libswscale colour-convert, optional HDR LUT, the
     /// audio-bars overlay, and the `kms.present()` vblank wait. On a
@@ -710,6 +726,10 @@ impl OutputStatsAccumulator {
                 .counters
                 .frames_dropped_stale_gen
                 .load(Ordering::Relaxed),
+            audio_dropped_mpsc_full: h
+                .counters
+                .audio_dropped_mpsc_full
+                .load(Ordering::Relaxed),
             blit_us_max: h.counters.blit_us_max.load(Ordering::Relaxed),
             blit_us_avg: {
                 let total = h.counters.blit_us_total.load(Ordering::Relaxed);
@@ -831,9 +851,21 @@ pub struct Tr101290State {
     pub pat_seen: bool,
     /// PMT PIDs discovered from PAT, mapped to their last-seen time.
     pub pmt_pids: HashMap<u16, Option<Instant>>,
-    /// Elementary stream PIDs discovered from PMT, mapped to their last-seen time.
-    /// Used for PID error detection (P1): ES PIDs that stop appearing.
+    /// A/V elementary stream PIDs discovered from PMT, mapped to their
+    /// last-seen time. Used for PID error detection (P1): ES PIDs that
+    /// stop appearing within `PAT_PMT_TIMEOUT`. Data-only stream types
+    /// (DSM-CC carousels, private sections) are excluded — they live in
+    /// `pmt_referenced_data_pids` so they don't fire false-positive
+    /// pid_errors / pts_errors but still count as PMT-referenced for
+    /// the unreferenced-PID check.
     pub es_pids: HashMap<u16, Option<Instant>>,
+    /// Data-only PIDs referenced by a PMT (DSM-CC carousels, private
+    /// sections — see `engine::tr101290::is_data_only_stream_type`).
+    /// Tracked separately from `es_pids` so they don't fire false-positive
+    /// `pid_error` / `pts_error` alarms designed for A/V QoS, but still
+    /// excused from the unreferenced-PID check (they ARE in the PMT;
+    /// TR 101 290 just doesn't apply A/V timeout semantics to them).
+    pub pmt_referenced_data_pids: std::collections::HashSet<u16>,
     /// Per-PID PCR tracking for discontinuity and accuracy checks.
     pub pcr_tracker: HashMap<u16, PcrState>,
     /// Whether the stream is currently in sync.
@@ -916,6 +948,7 @@ impl Default for Tr101290State {
             pat_seen: false,
             pmt_pids: HashMap::new(),
             es_pids: HashMap::new(),
+            pmt_referenced_data_pids: std::collections::HashSet::new(),
             pcr_tracker: HashMap::new(),
             in_sync: true,
             sync_consecutive_good: 0,
@@ -1245,6 +1278,23 @@ pub struct AudioStreamState {
     pub channels: Option<u8>,
     pub language: Option<String>,
     pub header_detected: bool,
+    /// Cached LATM `StreamMuxConfig` for AAC-LATM PIDs (`stream_type 0x11`).
+    /// Latched from the first PES with `useSameStreamMux=0` and reused on
+    /// subsequent frames where `useSameStreamMux=1` (the dominant case in
+    /// real broadcasts — full config is only re-emitted on multiplexer
+    /// reconfiguration). Without this, the detector would keep returning
+    /// "detecting…" because real LATM streams almost never carry the full
+    /// config in every frame.
+    pub latm_cached: Option<LatmCachedConfig>,
+}
+
+/// Cached LATM `StreamMuxConfig` payload — only the fields the dashboard
+/// surfaces are kept (sample_rate / channels / profile_name).
+#[derive(Clone, Debug)]
+pub struct LatmCachedConfig {
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub profile_name: String,
 }
 
 /// Media analysis accumulator. The single analyzer task writes to `state`;

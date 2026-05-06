@@ -969,13 +969,18 @@ fn demux_decode_loop(
                             if let Ok(decoded) = decoder.decode_frame(&data) {
                                 let sr = decoder.sample_rate().unwrap_or(48_000);
                                 let ch = decoder.channels().unwrap_or(2);
-                                let _ = atx.try_send(AudioBlock {
+                                if atx.try_send(AudioBlock {
                                     planar: decoded.planar,
                                     pts_90k: pts,
                                     sample_rate: sr,
                                     channels: ch,
                                     frame_gen: frame_gen.load(Ordering::Relaxed),
-                                });
+                                }).is_err()
+                                {
+                                    counters
+                                        .audio_dropped_mpsc_full
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                     }
@@ -1002,13 +1007,18 @@ fn demux_decode_loop(
                         {
                             if decoder.send_packet(frame_bytes, pts as i64).is_ok() {
                                 while let Ok(decoded) = decoder.receive_frame() {
-                                    let _ = atx.try_send(AudioBlock {
+                                    if atx.try_send(AudioBlock {
                                         planar: decoded.planar,
                                         pts_90k: pts,
                                         sample_rate: decoded.sample_rate,
                                         channels: decoded.channels,
                                         frame_gen: frame_gen.load(Ordering::Relaxed),
-                                    });
+                                    }).is_err()
+                                    {
+                                        counters
+                                            .audio_dropped_mpsc_full
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
                                 }
                             }
                         }
@@ -1101,13 +1111,18 @@ fn demux_decode_loop(
                         {
                             if decoder.send_packet(frame_bytes, pts as i64).is_ok() {
                                 while let Ok(decoded) = decoder.receive_frame() {
-                                    let _ = atx.try_send(AudioBlock {
+                                    if atx.try_send(AudioBlock {
                                         planar: decoded.planar,
                                         pts_90k: pts,
                                         sample_rate: decoded.sample_rate,
                                         channels: decoded.channels,
                                         frame_gen: frame_gen.load(Ordering::Relaxed),
-                                    });
+                                    }).is_err()
+                                    {
+                                        counters
+                                            .audio_dropped_mpsc_full
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
                                 }
                             }
                         }
@@ -2224,6 +2239,20 @@ fn display_loop(
     // re-converges on the new stream.
     let mut av_offset_pts_smoothed: Option<i64> = None;
     let mut consecutive_late_frames: u32 = 0;
+    // Mirror of `consecutive_late_frames` — counts consecutive frames
+    // where `drift_ms > drop_threshold_ms` (video is sustained AHEAD
+    // of the audio clock by more than one drop window). Without this
+    // counter, sustained early drift (e.g. a source whose video PES
+    // PTS leads audio PES PTS by hundreds of ms — common on ISDB-T /
+    // DVB captures with pre-roll video buffer) leaves the display
+    // sleeping at the cap (`drop_threshold_ms`, 160 ms minimum) every
+    // frame forever, dropping the present rate to ~5-10 fps even when
+    // the source is 30 fps. The mirror snaps the EMA forward to the
+    // current raw drift after `LATE_HYSTERESIS_FRAMES * 2` consecutive
+    // sustained-early frames, the same way the late path snaps
+    // backward — recovers the display to source rate within ~12
+    // frames of an offset shift.
+    let mut consecutive_early_frames: u32 = 0;
     // 6 frames ≈ 240 ms at 25 fps, 120 ms at 50 fps. Long enough to
     // ride through one-off PES PTS jitter (DVB encoder side) and the
     // slow-α EMA's catchup window; short enough that a real audio
@@ -2328,6 +2357,7 @@ fn display_loop(
                 wall_anchor = None;
                 av_offset_pts_smoothed = None;
                 consecutive_late_frames = 0;
+                consecutive_early_frames = 0;
                 fps_locked = false;
             }
         }
@@ -2446,6 +2476,7 @@ fn display_loop(
                 wall_anchor = None;
                 av_offset_pts_smoothed = None;
                 consecutive_late_frames = 0;
+                consecutive_early_frames = 0;
             } else if (10..=200).contains(&dms) {
                 // Light EMA so a one-off long frame doesn't move the
                 // window. α = 1/8 is plenty for ≤ 60 fps content.
@@ -2522,6 +2553,7 @@ fn display_loop(
             );
             if drift_ms < -drop_threshold_ms {
                 consecutive_late_frames = consecutive_late_frames.saturating_add(1);
+                consecutive_early_frames = 0;
                 if consecutive_late_frames >= LATE_HYSTERESIS_FRAMES {
                     // After 2× hysteresis of consecutive late frames,
                     // assume the source has shifted to a new sustained
@@ -2541,8 +2573,33 @@ fn display_loop(
                 }
                 // Below threshold but not yet sustained — still present
                 // this frame; the EMA will catch up on the next sample.
+            } else if drift_ms > drop_threshold_ms {
+                // Mirror of the late-frame path: video is sustained
+                // AHEAD of audio by more than one drop window. The
+                // sleep below would block on the cap (`drop_threshold_ms`,
+                // 160 ms minimum) every frame, throttling the display
+                // to ~5-10 fps even when the source itself is 30 fps —
+                // and the EMA's α=1/64 convergence is too slow to dig
+                // out of a +sustained drift without help (a 200 ms
+                // baseline takes ~25 s to reach <10 ms residual).
+                // After `LATE_HYSTERESIS_FRAMES * 2` consecutive early
+                // frames, snap the EMA forward to the current raw
+                // drift so subsequent frames present at source rate
+                // again. The +baseline is preserved for the operator
+                // on `av_sync_offset_ms` (it's still real — the
+                // source has video PES leading audio PES); only the
+                // *filtered* drift the loop uses for sleep is reset.
+                consecutive_early_frames = consecutive_early_frames.saturating_add(1);
+                consecutive_late_frames = 0;
+                if consecutive_early_frames >= LATE_HYSTERESIS_FRAMES * 2 {
+                    av_offset_pts_smoothed = Some(raw_drift_ms);
+                    consecutive_early_frames = 0;
+                    // Fall through and present at full rate — the new
+                    // EMA absorbs the offset, drift_ms ≈ 0, sleep ≈ 0.
+                }
             } else {
                 consecutive_late_frames = 0;
+                consecutive_early_frames = 0;
             }
             // Subtract a small margin so we hand the buffer to KMS a hair
             // before its target vblank — the page-flip itself blocks for

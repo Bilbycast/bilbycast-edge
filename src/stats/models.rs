@@ -854,6 +854,15 @@ pub struct DisplayStats {
     /// spurious flush triggers and is worth investigating.
     #[serde(default)]
     pub frames_dropped_stale_gen: u64,
+    /// Audio blocks the demux+decode child dropped because the bounded
+    /// `atx` mpsc was full when `try_send` ran. Audio counterpart to
+    /// `frames_dropped_mpsc_full`. Steady growth points at the
+    /// "audio mpsc full → silent drop → audio_pts lags real time →
+    /// av_sync_offset_ms drifts positive" failure mode that's invisible
+    /// from `audio_underruns` alone. See `audio_dropped_mpsc_full` on
+    /// `DisplayStatsCounters` for the exact mechanism.
+    #[serde(default)]
+    pub audio_dropped_mpsc_full: u64,
     /// Largest single `blit_and_present` duration since startup, in µs.
     /// `kms.present()` blocks one vblank (~16 700 µs at 60 Hz) so this
     /// is one-vblank-floored; values past ~33 000 µs mean the per-frame
