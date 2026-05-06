@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -47,9 +48,10 @@ pub fn spawn_audio_meter(
     program_number: Option<u16>,
     snapshot: SharedMeter,
     cancel: CancellationToken,
+    counters: std::sync::Arc<crate::stats::collector::DisplayStatsCounters>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run_meter(&mut rx, program_number, snapshot, cancel).await {
+        if let Err(e) = run_meter(&mut rx, program_number, snapshot, cancel, counters).await {
             tracing::warn!("display audio-meter exited with error: {e}");
         }
     })
@@ -67,6 +69,7 @@ async fn run_meter(
     program_number: Option<u16>,
     shared: SharedMeter,
     cancel: CancellationToken,
+    counters: std::sync::Arc<crate::stats::collector::DisplayStatsCounters>,
 ) -> Result<()> {
     let mut state = MeterState::new(program_number);
     // The publisher owns the working `MeterSnapshot` exclusively, plus
@@ -76,7 +79,15 @@ async fn run_meter(
     // / `prune_stale` mutate `publisher.local` and call
     // `publisher.publish()` — the display task observes only the
     // published Arc, lock-free.
+    //
+    // `last_published_publishes` snapshots the publisher's internal
+    // counter so we can bump the operator-facing
+    // `counters.meter_publishes` exactly once per fresh publish, even
+    // when the publisher's reclaim path returns the existing Arc
+    // unchanged (no fresh `publish()` call) — this gives the operator
+    // a real "is the meter alive?" signal.
     let mut publisher = MeterPublisher::new(shared);
+    let mut last_publish_count = publisher.publish_count();
     let mut prune_interval = tokio::time::interval(PRUNE_INTERVAL);
     prune_interval.tick().await;
 
@@ -95,6 +106,13 @@ async fn run_meter(
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
+        }
+        let now_count = publisher.publish_count();
+        if now_count > last_publish_count {
+            counters
+                .meter_publishes
+                .fetch_add(now_count - last_publish_count, Ordering::Relaxed);
+            last_publish_count = now_count;
         }
     }
     Ok(())

@@ -309,6 +309,27 @@ pub struct DisplayStatsCounters {
     /// failing on some PIDs".
     pub audio_dropped_mpsc_full: AtomicU64,
 
+    /// `true` when `KmsDisplay::enable_bars_overlay` succeeded at
+    /// display-task startup. Without it the per-frame bars + header
+    /// rasterise can never reach the panel: the bars + header live on
+    /// a dedicated KMS overlay plane composed at vblank, and a host
+    /// whose driver lacks a suitable plane (no atomic, no Overlay /
+    /// Cursor plane on the CRTC, ARGB8888 unsupported, etc.) silently
+    /// falls through with no overlay. Surfaced so an operator
+    /// debugging "bars / overlay don't show up" can tell apart
+    /// "rasterise produced nothing" from "compositor never saw
+    /// anything to compose".
+    pub bars_overlay_enabled: AtomicBool,
+
+    /// Counts every `audio_meter::MeterPublisher::publish` — each one
+    /// hands a fresh `Arc<MeterSnapshot>` to the display loop. Reads
+    /// at zero mean the meter task is alive but never decoding any
+    /// audio (broadcast Lagged, codec-decoder open failure, source
+    /// stream type misclassified) — sustained zero with audio playing
+    /// through ALSA fingers the meter as the broken side.
+    pub meter_publishes: AtomicU64,
+
+
     /// Largest single `blit_and_present` duration since startup (µs).
     /// Includes libswscale colour-convert, optional HDR LUT, the
     /// audio-bars overlay, and the `kms.present()` vblank wait. On a
@@ -729,6 +750,14 @@ impl OutputStatsAccumulator {
             audio_dropped_mpsc_full: h
                 .counters
                 .audio_dropped_mpsc_full
+                .load(Ordering::Relaxed),
+            bars_overlay_enabled: h
+                .counters
+                .bars_overlay_enabled
+                .load(Ordering::Relaxed),
+            meter_publishes: h
+                .counters
+                .meter_publishes
                 .load(Ordering::Relaxed),
             blit_us_max: h.counters.blit_us_max.load(Ordering::Relaxed),
             blit_us_avg: {

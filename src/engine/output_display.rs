@@ -435,6 +435,7 @@ async fn run_display_output(
             config.program_number,
             Arc::clone(snap),
             cancel.child_token(),
+            Arc::clone(&counters),
         )
     });
 
@@ -2271,12 +2272,22 @@ fn display_loop(
     // didn't engage on hosts whose driver lacks a suitable overlay
     // plane (or atomic). On a healthy modern Linux box this succeeds.
     if meter.is_some() {
-        if let Err(e) = kms.enable_bars_overlay() {
-            tracing::info!(
-                flow_id = %flow_id,
-                output_id = %output_id,
-                "audio-bars overlay plane unavailable — falling back to CPU-blit rasterise: {e:#}"
-            );
+        match kms.enable_bars_overlay() {
+            Ok(()) => {
+                counters
+                    .bars_overlay_enabled
+                    .store(true, Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::info!(
+                    flow_id = %flow_id,
+                    output_id = %output_id,
+                    "audio-bars overlay plane unavailable — falling back to CPU-blit rasterise: {e:#}"
+                );
+                counters
+                    .bars_overlay_enabled
+                    .store(false, Ordering::Relaxed);
+            }
         }
     }
 

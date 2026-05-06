@@ -863,6 +863,19 @@ pub struct DisplayStats {
     /// `DisplayStatsCounters` for the exact mechanism.
     #[serde(default)]
     pub audio_dropped_mpsc_full: u64,
+    /// `true` when the audio-bars + stream-info-header KMS overlay
+    /// plane was successfully enabled at display-task startup. False
+    /// means the per-frame rasterise can't reach the panel — the
+    /// composition layer never gets a plane to draw onto.
+    #[serde(default)]
+    pub bars_overlay_enabled: bool,
+    /// Number of `MeterPublisher::publish` calls — each one hands a
+    /// fresh per-PID levels snapshot to the display loop. Stays at 0
+    /// when the audio-meter task is alive but never decodes audio
+    /// (broadcast lagged, decoder open failed, source stream type
+    /// misclassified). Read against `bars_rasterise_skipped_empty`.
+    #[serde(default)]
+    pub meter_publishes: u64,
     /// Largest single `blit_and_present` duration since startup, in µs.
     /// `kms.present()` blocks one vblank (~16 700 µs at 60 Hz) so this
     /// is one-vblank-floored; values past ~33 000 µs mean the per-frame

@@ -186,6 +186,12 @@ pub struct MeterPublisher {
     spare: Option<Arc<MeterSnapshot>>,
     /// The shared `ArcSwap` the display task reads from.
     pub shared: SharedMeter,
+    /// Monotonic counter incremented on every successful `publish()`.
+    /// Read by the meter task to bump the operator-facing
+    /// `DisplayStatsCounters.meter_publishes` — gives the dashboard a
+    /// "is the meter alive and decoding" signal that doesn't depend
+    /// on whether `per_pid` happens to be non-empty at snapshot time.
+    publish_count: u64,
 }
 
 impl MeterPublisher {
@@ -198,7 +204,15 @@ impl MeterPublisher {
             local: MeterSnapshot::default(),
             spare: None,
             shared,
+            publish_count: 0,
         }
+    }
+
+    /// Monotonic count of successful `publish()` calls. The meter task
+    /// snapshots this each loop iteration to forward deltas into the
+    /// `DisplayStatsCounters.meter_publishes` AtomicU64.
+    pub fn publish_count(&self) -> u64 {
+        self.publish_count
     }
 
     /// Publish the working snapshot. Prefer this over manual
@@ -239,6 +253,7 @@ impl MeterPublisher {
             None => Arc::new(self.local.clone()),
         };
         self.spare = Some(self.shared.swap(new_arc));
+        self.publish_count = self.publish_count.wrapping_add(1);
     }
 }
 
