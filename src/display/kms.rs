@@ -317,6 +317,34 @@ struct BarsOverlay {
     /// plane is ever programmed doesn't leave the kernel scanning out
     /// from a stale FB after a teardown.
     committed: bool,
+    /// Optional `zpos` (Z-position / stacking order) property handle.
+    /// `None` when the driver doesn't expose `zpos` on this plane —
+    /// in that case the kernel uses registration-order zpos and the
+    /// bars composition relies on driver default. Set this property
+    /// to `primary_zpos + 1` so the bars plane is **above** the
+    /// primary plane (the VAAPI prime FB carrying the video) — without
+    /// it, several drivers (notably some AMD `amdgpu` configurations
+    /// and certain Intel `i915` revisions) place an Overlay plane
+    /// **under** the Primary plane in registration order, hiding the
+    /// bars + header strip behind the video frame even though the
+    /// rasterise wrote opaque pixels to the buffer.
+    zpos: Option<property::Handle>,
+    /// Z-position value to drive into `zpos`. Computed at discovery
+    /// time as `primary_zpos.saturating_add(1)` — small, positive,
+    /// always above the primary plane.
+    zpos_value: u64,
+    /// Optional `pixel blend mode` property handle. Defaults vary by
+    /// driver — Intel `i915` defaults to `Pre-multiplied` (correct for
+    /// our straight-alpha ARGB8888 because we write opaque alpha=0xFF
+    /// where pixels are visible), AMD `amdgpu` defaults to `None`
+    /// (which makes alpha-blending do nothing → invisible plane).
+    /// When the property exists we explicitly set `Coverage` (straight
+    /// alpha = honour per-pixel alpha, blend with primary below).
+    pixel_blend_mode: Option<property::Handle>,
+    /// Enum value for `Coverage` on the discovered property. The drm
+    /// API uses enum values whose numeric IDs are driver-assigned,
+    /// not constants; we capture the right one at discovery time.
+    pixel_blend_coverage_value: u64,
 }
 
 /// Holder for the active KMS master + double-buffered framebuffers.
@@ -671,6 +699,9 @@ impl KmsDisplay {
         let (plane_h, plane_props) =
             discover_bars_overlay_plane(&self.card, self.crtc, primary_plane)
                 .context("bars-overlay plane discovery")?;
+        let (zpos, zpos_value, pixel_blend_mode, pixel_blend_coverage_value) =
+            discover_bars_overlay_blend_props(&self.card, plane_h, primary_plane)
+                .context("bars-overlay zpos/blend property discovery")?;
         let dumb = alloc_argb_dumb_buffer(&self.card, self.width, strip_h)
             .context("bars-overlay ARGB8888 dumb buffer")?;
         self.bars_overlay = Some(BarsOverlay {
@@ -680,6 +711,10 @@ impl KmsDisplay {
             width: self.width,
             height: strip_h,
             committed: false,
+            zpos,
+            zpos_value,
+            pixel_blend_mode,
+            pixel_blend_coverage_value,
         });
         Ok(())
     }
@@ -1583,6 +1618,92 @@ fn discover_bars_overlay_plane(
     Ok((plane_h, plane_props))
 }
 
+/// Discover the optional `zpos` / `pixel blend mode` properties on the
+/// bars overlay plane and the primary plane's current zpos so we can
+/// drive the bars plane **above** the primary in atomic commits.
+///
+/// Without this, on drivers where Overlay planes default to registration-
+/// order zpos below Primary (some `amdgpu`, certain `i915` revisions,
+/// older `imx-drm`), the bars rasterise lands on a plane the kernel
+/// composites **under** the VAAPI prime FB — the strip is allocated,
+/// programmed, and updated every frame, but the operator sees only the
+/// video frame because the bars plane is hidden by the primary.
+///
+/// `pixel blend mode` is set to `Coverage` (straight alpha) so the
+/// per-pixel alpha lane drives the blend — `None` means "ignore alpha,
+/// plane is fully opaque" which would make the strip a 100 % opaque
+/// black box at the bottom of the screen wherever rasterise didn't
+/// write. `Pre-multiplied` is also acceptable for our straight ARGB
+/// (we write `(R, G, B, 0xFF)` for visible pixels, `0` everywhere
+/// else, which is the same as pre-multiplied for these alpha values),
+/// but `Coverage` is the simpler and more universally correct choice.
+fn discover_bars_overlay_blend_props(
+    card: &CardFile,
+    bars_plane: plane::Handle,
+    primary_plane: plane::Handle,
+) -> Result<(Option<property::Handle>, u64, Option<property::Handle>, u64)> {
+    let zpos = optional_prop(card, bars_plane, "zpos")?;
+    let primary_zpos = read_property_u64(card, primary_plane, "zpos").unwrap_or(0);
+    let zpos_value = primary_zpos.saturating_add(1);
+    let pixel_blend_mode = optional_prop(card, bars_plane, "pixel blend mode")?;
+    let coverage_value = pixel_blend_mode
+        .map(|_| read_enum_value(card, bars_plane, "pixel blend mode", "Coverage").unwrap_or(0))
+        .unwrap_or(0);
+    Ok((zpos, zpos_value, pixel_blend_mode, coverage_value))
+}
+
+/// Read a u64-valued property by name, returning `None` when the
+/// property is absent on the object. Used to snapshot the primary
+/// plane's `zpos` so the bars plane can be ordered above it.
+fn read_property_u64(
+    card: &CardFile,
+    handle: impl drm::control::ResourceHandle,
+    name: &str,
+) -> Option<u64> {
+    let set = card.get_properties(handle).ok()?;
+    let (ids, vals) = set.as_props_and_values();
+    for (id, val) in ids.iter().zip(vals.iter()) {
+        let info = card.get_property(*id).ok()?;
+        if info.name().to_bytes() == name.as_bytes() {
+            return Some(*val);
+        }
+    }
+    None
+}
+
+/// Resolve an enum value by name on a property. KMS enum values are
+/// driver-assigned numeric IDs that map to symbolic names (e.g. for
+/// `pixel blend mode`: `None` / `Pre-multiplied` / `Coverage`); we
+/// look up the numeric ID by string match.
+fn read_enum_value(
+    card: &CardFile,
+    handle: impl drm::control::ResourceHandle,
+    prop_name: &str,
+    enum_name: &str,
+) -> Option<u64> {
+    let set = card.get_properties(handle).ok()?;
+    let (ids, _vals) = set.as_props_and_values();
+    for id in ids {
+        let info = card.get_property(*id).ok()?;
+        if info.name().to_bytes() != prop_name.as_bytes() {
+            continue;
+        }
+        if let property::ValueType::Enum(enums) = info.value_type() {
+            // `enums.values()` returns a `(values: &[u64], defs: &[EnumValue])`
+            // pair: each `EnumValue` carries `name()` + `value()`. Match
+            // by name and return the numeric ID for atomic-commit use.
+            let (_raw_values, defs) = enums.values();
+            for e in defs.iter() {
+                if e.name().to_bytes() == enum_name.as_bytes() {
+                    return Some(e.value() as u64);
+                }
+            }
+        }
+        return None;
+    }
+    None
+}
+
 /// ARGB8888 sibling of [`alloc_dumb_buffer`]. Allocates a packed
 /// ARGB8888 dumb buffer for the audio-bars overlay strip and creates
 /// a KMS framebuffer for it. `depth = 32` (alpha-bearing) so the
@@ -2106,6 +2227,42 @@ impl KmsDisplay {
                 bp.crtc_h,
                 property::Value::UnsignedRange(bars.height as u64),
             );
+            // Program zpos so the bars plane composes ABOVE the primary
+            // plane carrying the VAAPI prime FB. Without this, drivers
+            // that default to registration-order zpos can place an
+            // Overlay plane below Primary — the rasterised bars are
+            // hidden by the video frame on top, even though every
+            // atomic commit programmed the plane perfectly.
+            if let Some(zpos_prop) = bars.zpos {
+                req.add_property(
+                    bars.plane,
+                    zpos_prop,
+                    property::Value::UnsignedRange(bars.zpos_value),
+                );
+            }
+            // Program pixel blend mode = Coverage so the per-pixel alpha
+            // lane drives the composite. Drivers that default to None
+            // would scan the strip out as a fully-opaque box (whatever
+            // the buffer holds, including the all-transparent regions
+            // outside bars and header text → operator sees a black
+            // rectangle); Coverage honours alpha=0 → primary shows
+            // through, alpha=0xFF → bars/header opaque on top.
+            if let Some(blend_prop) = bars.pixel_blend_mode {
+                // KMS enum properties are wire-encoded as u64; the
+                // typed `property::Value::Enum` variant carries an
+                // `&EnumValue` reference whose lifetime we'd have to
+                // re-fetch every commit. The kernel accepts the raw
+                // value through `UnsignedRange` (which is what the
+                // ioctl serialiser writes for both enum + range
+                // properties — same on-the-wire encoding). This is
+                // also what mesa / weston / hwcomposer-drm-android
+                // use for the same purpose.
+                req.add_property(
+                    bars.plane,
+                    blend_prop,
+                    property::Value::UnsignedRange(bars.pixel_blend_coverage_value),
+                );
+            }
         }
 
         if !self.atomic_modeset_done {

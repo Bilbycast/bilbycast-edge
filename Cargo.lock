@@ -370,7 +370,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bilbycast-edge"
-version = "0.45.2"
+version = "0.45.3"
 dependencies = [
  "aac-audio",
  "aac-codec",
