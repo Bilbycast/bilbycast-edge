@@ -153,6 +153,12 @@ pub enum DisplayCodecLabel {
     Ac3 = 7,
     Eac3 = 8,
     Opus = 9,
+    /// Dolby AC-4. Surfaces on display outputs whose source is AC-4
+    /// (ATSC 3.0 / DVB AC-4) so the manager UI labels the codec
+    /// correctly. AC-4 has no open-source decoder; the display path
+    /// renders video and silences audio (see
+    /// [`crate::engine::ts_demux::SYNTHETIC_STREAM_TYPE_AC4`]).
+    Ac4 = 10,
 }
 
 #[allow(dead_code)]
@@ -168,6 +174,7 @@ impl DisplayCodecLabel {
             7 => Self::Ac3,
             8 => Self::Eac3,
             9 => Self::Opus,
+            10 => Self::Ac4,
             _ => Self::Unknown,
         }
     }
@@ -184,6 +191,7 @@ impl DisplayCodecLabel {
             Self::Ac3 => "ac3",
             Self::Eac3 => "eac3",
             Self::Opus => "opus",
+            Self::Ac4 => "ac4",
         }
     }
 }

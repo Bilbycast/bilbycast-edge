@@ -1093,6 +1093,16 @@ pub enum MediaPlayerSource {
     Ts {
         /// Filename inside the media library directory (no path components).
         name: String,
+        /// Down-select an MPTS file to a single program before publishing
+        /// onto the flow. Unset (the default) → pass the file through
+        /// unchanged: the whole MPTS reaches the flow, or the only program
+        /// in an SPTS reaches the flow. Set to a program number → run each
+        /// packet through `TsProgramFilter` so only the target program's
+        /// PAT (rewritten single-program), PMT, PCR, and ES PIDs reach the
+        /// flow. Must be `> 0` if set (program 0 is reserved for the NIT
+        /// in the MPEG-TS spec).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program_number: Option<u16>,
     },
     /// MP4 / MOV / MKV container in the edge's media library.
     Mp4 {
@@ -3317,6 +3327,18 @@ pub struct VideoEncodeConfig {
     /// Colour range — `tv` (limited, default) or `pc` (full).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_range: Option<String>,
+    /// Hardware-decoder preference for the input decode side of the
+    /// transcode pipeline. `None` (or `Auto`) lets the edge pick the
+    /// best HW backend the host has compiled in and probed. `Cpu`
+    /// forces software libavcodec decode. `Nvdec` / `Qsv` / `Vaapi`
+    /// force a specific HW backend; the edge falls back to CPU and
+    /// emits `video_decoder_unavailable` when the host can't satisfy
+    /// the choice. The HW decoders share the compile gates of the
+    /// display path (`display-nvdec` / `display-qsv` /
+    /// `display-vaapi`), so an edge built for HW display playout also
+    /// gets HW transcode decode "for free".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hw_decode: Option<HwDecodePreference>,
 }
 
 /// Audio encoder configuration block. Used by RTMP, HLS, and WebRTC
@@ -3360,6 +3382,29 @@ pub struct AudioEncodeConfig {
     /// timestamps per segment.
     #[serde(default, skip_serializing_if = "is_false")]
     pub silent_fallback: bool,
+    /// **Opus-specific.** Rate-control mode. `None` (default) uses
+    /// libopus's default (VBR). `"vbr"` is constrained variable bitrate;
+    /// `"cbr"` is constant bitrate. Maps to ffmpeg's `-vbr {on,constrained,off}`
+    /// where `cbr` → `off`, `vbr` → `constrained`, no value → `on`. Ignored
+    /// for non-Opus codecs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opus_vbr_mode: Option<String>,
+    /// **Opus-specific.** Forward Error Correction (in-band redundancy
+    /// for the previous frame). Defaults to off. Ignored for non-Opus.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub opus_fec: bool,
+    /// **Opus-specific.** Discontinuous Transmission — encoder skips
+    /// frames during silence to save bandwidth. Off by default (broadcast
+    /// pipelines typically need a continuous stream so receivers don't
+    /// lose A/V sync). Ignored for non-Opus.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub opus_dtx: bool,
+    /// **Opus-specific.** Frame duration in milliseconds. One of: 5, 10,
+    /// 20 (default), 40, 60. Shorter frames lower latency at the cost of
+    /// efficiency; longer frames are higher quality at low bitrates.
+    /// Ignored for non-Opus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opus_frame_duration_ms: Option<u8>,
 }
 
 fn is_false(b: &bool) -> bool {

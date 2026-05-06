@@ -113,18 +113,73 @@ struct WebrtcVideoActive {
 
 /// Resolve a `video_encode.codec` string into a [`VideoEncoderCodec`] for
 /// WebRTC. Only H.264 backends are allowed; validation rejects HEVC at
-/// config-load, but guard against it at runtime too.
+/// config-load, but guard against it at runtime too. Honours `h264_auto`
+/// → resolver-picked H.264 backend on the host.
 #[cfg(all(feature = "webrtc", feature = "video-thumbnail"))]
 fn resolve_webrtc_video_backend(
-    codec: &str,
+    cfg: &VideoEncodeConfig,
     output_id: &str,
     flow_id: &str,
     event_sender: &EventSender,
 ) -> Option<video_codec::VideoEncoderCodec> {
+    let codec = cfg.codec.as_str();
+    // Auto path: route through the encoder resolver but cap the result
+    // at H.264 — if the resolver picked an HEVC backend (because Auto
+    // got hevc_auto / auto), reject with the same not-supported event
+    // shape. WebRTC browsers only decode H.264.
+    if codec == "h264_auto" || codec == "auto" {
+        if crate::engine::hardware_probe::static_capabilities().is_some() {
+            match crate::engine::hardware_probe::resolve_for_video_encode_config(cfg) {
+                Ok(r) if r.family() == crate::engine::hardware_probe::EncoderFamily::H264 => {
+                    tracing::info!(
+                        "WebRTC output '{}': video_encode auto-resolved '{}' → {}",
+                        output_id,
+                        codec,
+                        r.ffmpeg_name(),
+                    );
+                    return Some(r.as_video_encoder_codec());
+                }
+                Ok(other) => {
+                    let msg = format!(
+                        "WebRTC output '{}': video_encode auto-resolved to {} but WebRTC browsers only decode H.264",
+                        output_id,
+                        other.ffmpeg_name(),
+                    );
+                    tracing::error!("{msg}");
+                    event_sender.emit_flow(
+                        EventSeverity::Critical,
+                        category::VIDEO_ENCODE,
+                        msg,
+                        flow_id,
+                    );
+                    return None;
+                }
+                Err(e) => {
+                    let msg = format!(
+                        "WebRTC output '{}': video_encode unavailable: {}",
+                        output_id,
+                        e.message()
+                    );
+                    tracing::error!("{msg}");
+                    event_sender.emit_flow(
+                        EventSeverity::Critical,
+                        category::VIDEO_ENCODE,
+                        msg,
+                        flow_id,
+                    );
+                    return None;
+                }
+            }
+        }
+        // No probe snapshot → fall through to legacy mapping (which
+        // doesn't recognise auto, so reports unknown_codec). Production
+        // always has caps installed; this is just a test-path fallback.
+    }
     match codec {
         "x264" => Some(video_codec::VideoEncoderCodec::X264),
         "h264_nvenc" => Some(video_codec::VideoEncoderCodec::H264Nvenc),
         "h264_qsv" => Some(video_codec::VideoEncoderCodec::H264Qsv),
+        "h264_vaapi" => Some(video_codec::VideoEncoderCodec::H264Vaapi),
         other => {
             let msg = format!(
                 "WebRTC output '{}': video_encode codec '{other}' not supported — WebRTC browsers only decode H.264",
@@ -171,7 +226,7 @@ fn open_webrtc_video_active(
     output_stats: &Arc<OutputStatsAccumulator>,
     event_sender: &EventSender,
 ) -> WebrtcVideoEncoderState {
-    let Some(backend) = resolve_webrtc_video_backend(&cfg.codec, output_id, flow_id, event_sender)
+    let Some(backend) = resolve_webrtc_video_backend(cfg, output_id, flow_id, event_sender)
     else {
         return WebrtcVideoEncoderState::Failed;
     };
@@ -1670,6 +1725,10 @@ fn build_webrtc_encoder_state(
         // Opus is always 48 kHz on the wire regardless of operator input.
         target_sample_rate: 48_000,
         target_channels: target_ch,
+        opus_vbr_mode: enc_cfg.opus_vbr_mode.clone(),
+        opus_fec: enc_cfg.opus_fec,
+        opus_dtx: enc_cfg.opus_dtx,
+        opus_frame_duration_ms: enc_cfg.opus_frame_duration_ms,
     };
 
     let decoder = match AacDecoder::from_adts_config(profile, sr_idx, ch_cfg) {
@@ -1812,6 +1871,10 @@ fn build_webrtc_encoder_state_eager_for_silent_fallback(
         target_bitrate_kbps: target_br,
         target_sample_rate: target_sr,
         target_channels: target_ch,
+        opus_vbr_mode: enc_cfg.opus_vbr_mode.clone(),
+        opus_fec: enc_cfg.opus_fec,
+        opus_dtx: enc_cfg.opus_dtx,
+        opus_frame_duration_ms: enc_cfg.opus_frame_duration_ms,
     };
 
     let encoder = match AudioEncoder::spawn(

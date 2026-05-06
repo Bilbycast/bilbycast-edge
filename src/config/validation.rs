@@ -999,10 +999,17 @@ fn validate_media_player_input(c: &crate::config::models::MediaPlayerInputConfig
     }
     for (i, src) in c.sources.iter().enumerate() {
         match src {
-            MediaPlayerSource::Ts { name }
+            MediaPlayerSource::Ts { name, .. }
             | MediaPlayerSource::Mp4 { name }
             | MediaPlayerSource::Image { name, .. } => {
                 validate_media_filename(name, &format!("media-player input sources[{i}].name"))?;
+            }
+        }
+        if let MediaPlayerSource::Ts { program_number: Some(n), .. } = src {
+            if *n == 0 {
+                bail!(
+                    "media-player input sources[{i}]: program_number must be > 0 (program 0 is reserved for the NIT)"
+                );
             }
         }
         if let MediaPlayerSource::Image { fps, bitrate_kbps, .. } = src {
@@ -2471,18 +2478,23 @@ fn validate_video_encode(
 ) -> anyhow::Result<()> {
     match enc.codec.as_str() {
         "x264" | "x265" | "h264_nvenc" | "hevc_nvenc" | "h264_qsv" | "hevc_qsv"
-        | "h264_vaapi" | "hevc_vaapi" => {}
+        | "h264_vaapi" | "hevc_vaapi"
+        // Auto strings — resolved per-host at flow start.
+        | "h264_auto" | "hevc_auto" | "auto" => {}
         other => bail!(
             "{context}: video_encode.codec '{other}' is not recognised; \
              expected one of x264, x265, h264_nvenc, hevc_nvenc, h264_qsv, hevc_qsv, \
-             h264_vaapi, hevc_vaapi"
+             h264_vaapi, hevc_vaapi, h264_auto, hevc_auto"
         ),
     }
     // Reject codecs whose backend wasn't compiled into this build. Runtime
     // would surface a Critical event and passthrough the video anyway, but
     // that's confusing UX — catch it here so the manager's command_ack
     // carries a human-readable "rebuild with ..." message straight into
-    // the modal error banner.
+    // the modal error banner. Auto strings are deliberately exempt — they
+    // resolve per-host at flow start, and a build that compiled in *any*
+    // encoder (the typical case) will satisfy at least the SW fallback
+    // libx264 / libx265 tail of the priority chain.
     let backend_feature: Option<&'static str> = match enc.codec.as_str() {
         "x264" => {
             if cfg!(feature = "video-encoder-x264") { None } else { Some("video-encoder-x264") }
@@ -2498,6 +2510,20 @@ fn validate_video_encode(
         }
         "h264_vaapi" | "hevc_vaapi" => {
             if cfg!(feature = "video-encoder-vaapi") { None } else { Some("video-encoder-vaapi") }
+        }
+        "h264_auto" | "hevc_auto" | "auto" => {
+            // Auto needs at least one encoder family in the build to land
+            // somewhere. Reject only when nothing is present.
+            if cfg!(feature = "video-encoder-x264")
+                || cfg!(feature = "video-encoder-x265")
+                || cfg!(feature = "video-encoder-nvenc")
+                || cfg!(feature = "video-encoder-qsv")
+                || cfg!(feature = "video-encoder-vaapi")
+            {
+                None
+            } else {
+                Some("video-encoder-x264 (or x265 / nvenc / qsv / vaapi)")
+            }
         }
         _ => None,
     };
@@ -2586,7 +2612,8 @@ fn validate_video_encode(
         }
     }
     // NVENC backend restrictions — catch at validation time rather than
-    // at encoder-open.
+    // at encoder-open. Mirrors the runtime gates in
+    // `video_engine/src/video_encoder.rs::open()` (lines 235-262).
     match (enc.codec.as_str(), chroma_str, enc.bit_depth) {
         ("h264_nvenc", _, Some(10)) => bail!(
             "{context}: h264_nvenc does not support 10-bit encoding; \
@@ -2596,11 +2623,15 @@ fn validate_video_encode(
             "{context}: NVENC backends do not support chroma=yuv444p; \
              use x264 or x265 instead"
         ),
+        ("h264_nvenc" | "hevc_nvenc", Some("yuv422p"), _) => bail!(
+            "{context}: NVENC backends do not support chroma=yuv422p (NVENC is 4:2:0 / 4:4:4 only); \
+             use hevc_vaapi (Intel iHD), x264, or x265 instead — or pick `hevc_auto` and let the resolver choose"
+        ),
         _ => {}
     }
     // QSV backend restrictions — same shape as NVENC. h264_qsv is 8-bit
     // only (use hevc_qsv for 10-bit on supported Intel hardware), and
-    // neither QSV variant supports 4:4:4 chroma in oneVPL today.
+    // neither QSV variant supports 4:4:4 / 4:2:2 chroma in oneVPL today.
     match (enc.codec.as_str(), chroma_str, enc.bit_depth) {
         ("h264_qsv", _, Some(10)) => bail!(
             "{context}: h264_qsv does not support 10-bit encoding; \
@@ -2609,6 +2640,10 @@ fn validate_video_encode(
         ("h264_qsv" | "hevc_qsv", Some("yuv444p"), _) => bail!(
             "{context}: QSV backends do not support chroma=yuv444p; \
              use x264 or x265 instead"
+        ),
+        ("h264_qsv" | "hevc_qsv", Some("yuv422p"), _) => bail!(
+            "{context}: QSV backends do not support chroma=yuv422p in oneVPL today; \
+             use hevc_vaapi (Intel iHD), x264, or x265 instead — or pick `hevc_auto` and let the resolver choose"
         ),
         _ => {}
     }
@@ -2621,8 +2656,12 @@ fn validate_video_encode(
             "{context}: h264_vaapi does not support 10-bit encoding; \
              use hevc_vaapi, x264, or x265 instead"
         ),
+        ("h264_vaapi", Some("yuv422p"), _) => bail!(
+            "{context}: h264_vaapi is 4:2:0 only on every implementation; \
+             use hevc_vaapi (Intel iHD) or x264/x265 for 4:2:2 — or pick `hevc_auto` and let the resolver choose"
+        ),
         ("h264_vaapi" | "hevc_vaapi", Some("yuv444p"), _) => bail!(
-            "{context}: VAAPI backends do not support chroma=yuv444p; \
+            "{context}: VAAPI backends do not support chroma=yuv444p (NV24 packer staged for follow-up); \
              use x264 or x265 instead"
         ),
         _ => {}
@@ -2824,6 +2863,44 @@ fn validate_audio_encode(
             bail!(
                 "{context}: audio_encode.channels must be 1-{max_ch} for {}, got {}",
                 enc.codec, ch
+            );
+        }
+        // HE-AAC v2 (Parametric Stereo) requires stereo input — libfdk_aac
+        // hard-rejects mono. Catch this at config-load so the operator
+        // sees a precise error in the modal banner instead of a critical
+        // event after flow start.
+        if enc.codec == "he_aac_v2" && ch != 2 {
+            bail!(
+                "{context}: audio_encode.codec=he_aac_v2 requires channels=2 (Parametric Stereo); \
+                 mono / multichannel inputs must use aac_lc or he_aac_v1"
+            );
+        }
+    }
+    // Opus-specific knobs — silently ignored on every other codec, but
+    // explicitly rejected on a non-Opus codec so the operator sees the
+    // setting was wrong instead of running with default Opus behaviour.
+    let opus_set =
+        enc.opus_vbr_mode.is_some()
+            || enc.opus_fec
+            || enc.opus_dtx
+            || enc.opus_frame_duration_ms.is_some();
+    if opus_set && enc.codec != "opus" {
+        bail!(
+            "{context}: audio_encode.opus_* fields only apply to codec=opus, got codec={}",
+            enc.codec
+        );
+    }
+    if let Some(ref m) = enc.opus_vbr_mode {
+        if !matches!(m.as_str(), "vbr" | "cbr") {
+            bail!(
+                "{context}: audio_encode.opus_vbr_mode must be 'vbr' or 'cbr', got '{m}'"
+            );
+        }
+    }
+    if let Some(d) = enc.opus_frame_duration_ms {
+        if !matches!(d, 5 | 10 | 20 | 40 | 60) {
+            bail!(
+                "{context}: audio_encode.opus_frame_duration_ms must be one of 5, 10, 20, 40, 60, got {d}"
             );
         }
     }
@@ -3557,10 +3634,13 @@ pub fn validate_output_with_input(
                 // Reject HEVC encoders *before* the generic validator so
                 // operators don't get a misleading "rebuild with x265"
                 // suggestion — WebRTC browsers can't decode HEVC at all,
-                // so rebuilding wouldn't help.
+                // so rebuilding wouldn't help. `hevc_auto` is also
+                // rejected because it would always resolve to an HEVC
+                // backend; `h264_auto` is allowed (the resolver picks an
+                // H.264 backend per host).
                 match ve.codec.as_str() {
-                    "x265" | "hevc_nvenc" | "hevc_qsv" | "hevc_vaapi" => bail!(
-                        "WebRTC output '{}': video_encode.codec '{}' is not supported — WebRTC browsers only decode H.264 (use 'x264', 'h264_nvenc', 'h264_qsv', or 'h264_vaapi')",
+                    "x265" | "hevc_nvenc" | "hevc_qsv" | "hevc_vaapi" | "hevc_auto" => bail!(
+                        "WebRTC output '{}': video_encode.codec '{}' is not supported — WebRTC browsers only decode H.264 (use 'x264', 'h264_nvenc', 'h264_qsv', 'h264_vaapi', or 'h264_auto')",
                         webrtc.id, ve.codec,
                     ),
                     _ => {}
@@ -6276,6 +6356,10 @@ mod tests {
             sample_rate: None,
             channels: None,
             silent_fallback: false,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
         }
     }
 
@@ -6410,6 +6494,10 @@ mod tests {
                 sample_rate: None,
                 channels: None,
                 silent_fallback: false,
+                opus_vbr_mode: None,
+                opus_fec: false,
+                opus_dtx: false,
+                opus_frame_duration_ms: None,
             }),
             transcode: None,
             video_encode: None,
@@ -6442,6 +6530,10 @@ mod tests {
                 sample_rate: None,
                 channels: None,
                 silent_fallback: false,
+                opus_vbr_mode: None,
+                opus_fec: false,
+                opus_dtx: false,
+                opus_frame_duration_ms: None,
             }),
             transcode: None,
         });
@@ -6601,6 +6693,10 @@ mod tests {
                 sample_rate: None,
                 channels: None,
                 silent_fallback: false,
+                opus_vbr_mode: None,
+                opus_fec: false,
+                opus_dtx: false,
+                opus_frame_duration_ms: None,
             }),
             transcode: None,
             video_encode: None,
@@ -6661,6 +6757,7 @@ mod tests {
                 color_transfer: None,
                 color_matrix: None,
                 color_range: None,
+                hw_decode: None,
             }),
         });
         // H.264 backends are accepted only when the feature is compiled
@@ -6756,6 +6853,7 @@ mod tests {
             color_transfer: None,
             color_matrix: None,
             color_range: None,
+            hw_decode: None,
         };
         let assert_recognised = |result: Result<(), anyhow::Error>, label: &str| match result {
             Ok(_) => {} // feature on, params OK — fine

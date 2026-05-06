@@ -77,6 +77,12 @@ pub enum TsVideoReplaceError {
     /// The dependent `video-thumbnail` feature is disabled, which means
     /// `video-engine` is not compiled in.
     VideoEngineMissing,
+    /// `resolve_video_encoder` rejected the (codec, chroma, bit_depth)
+    /// request — Auto found nothing on this host, or an explicit
+    /// backend can't do the chroma cell, or the runtime probe didn't
+    /// run. Carries the reason tag + rendered message so the spawn
+    /// path can emit a structured event.
+    EncoderUnavailable(String, String),
 }
 
 impl std::fmt::Display for TsVideoReplaceError {
@@ -90,6 +96,7 @@ impl std::fmt::Display for TsVideoReplaceError {
                 f,
                 "video-engine is not compiled in (enable the video-thumbnail feature)"
             ),
+            Self::EncoderUnavailable(_reason, msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -261,6 +268,13 @@ mod inner {
         description: String,
         stats: Arc<VideoEncodeStats>,
         force_idr: Arc<AtomicBool>,
+
+        /// Operator's hardware-decoder preference for the input decode
+        /// side of this transcode. Defaults to `Auto` (VAAPI ≻ NVDEC ≻
+        /// QSV ≻ CPU per host capabilities). Resolved on the first
+        /// decoded frame so the static-capabilities snapshot is
+        /// guaranteed installed.
+        hw_decode_pref: crate::config::models::HwDecodePreference,
     }
 
     impl Inner {
@@ -269,7 +283,40 @@ mod inner {
             stats: Arc<VideoEncodeStats>,
             force_idr: Arc<AtomicBool>,
         ) -> Result<Self, TsVideoReplaceError> {
-            let backend = parse_codec(&cfg.codec)?;
+            // Resolve `*_auto` strings AND validate explicit backends
+            // against the host's chroma/bit-depth matrix in a single
+            // pass. The legacy `parse_codec` path is kept so existing
+            // tests that pass concrete strings without a probed-caps
+            // snapshot still work — we only invoke the resolver when
+            // a snapshot is installed (the production path).
+            let backend = match crate::engine::hardware_probe::static_capabilities() {
+                Some(_) => {
+                    match crate::engine::hardware_probe::resolve_for_video_encode_config(cfg) {
+                        Ok(r) => {
+                            // Log Auto resolutions so operators see
+                            // which backend the resolver picked. The
+                            // OutputStatsAccumulator surfaces the same
+                            // string on `resolved_video_encoder` for
+                            // the manager UI badge.
+                            if cfg.codec.ends_with("_auto") || cfg.codec == "auto" {
+                                tracing::info!(
+                                    "video_encode auto-resolved '{}' → {}",
+                                    cfg.codec,
+                                    r.ffmpeg_name(),
+                                );
+                            }
+                            r.as_video_encoder_codec()
+                        }
+                        Err(e) => {
+                            return Err(TsVideoReplaceError::EncoderUnavailable(
+                                e.as_reason().to_string(),
+                                e.message(),
+                            ));
+                        }
+                    }
+                }
+                None => parse_codec(&cfg.codec)?,
+            };
             let target_family = backend.family();
             let target_stream_type = target_family.stream_type();
 
@@ -320,6 +367,7 @@ mod inner {
                 description,
                 stats,
                 force_idr,
+                hw_decode_pref: cfg.hw_decode.unwrap_or_default(),
             })
         }
 
@@ -557,8 +605,42 @@ mod inner {
                         return Err(());
                     }
                 };
-                match VideoDecoder::open(src_codec) {
-                    Ok(d) => self.decoder = Some(d),
+                // Resolve HW transcode-decoder preference. The static
+                // probe runs at startup; we read it here to pick the
+                // best backend the host has compiled in for this codec
+                // family. Auto picks VAAPI ≻ NVDEC ≻ QSV ≻ CPU per
+                // host capabilities. On any resolution error (forced
+                // backend missing / capabilities not yet probed) we
+                // fall back to CPU rather than fail the flow.
+                let decoder_backend = match crate::engine::hardware_probe::static_capabilities() {
+                    Some(caps) => {
+                        match crate::engine::hardware_probe::resolve_transcode_decoder(
+                            &self.hw_decode_pref,
+                            Some(&caps),
+                        ) {
+                            Ok(r) => r.as_backend(),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "ts_video_replace: hw_decode preference {:?} unavailable ({:?}); falling back to CPU",
+                                    self.hw_decode_pref,
+                                    e,
+                                );
+                                video_engine::DecoderBackend::Cpu
+                            }
+                        }
+                    }
+                    None => video_engine::DecoderBackend::Cpu,
+                };
+                match VideoDecoder::open_with_backend(src_codec, decoder_backend) {
+                    Ok(d) => {
+                        if !matches!(decoder_backend, video_engine::DecoderBackend::Cpu) {
+                            tracing::info!(
+                                "ts_video_replace: opened HW decoder (backend={:?})",
+                                decoder_backend,
+                            );
+                        }
+                        self.decoder = Some(d);
+                    }
                     Err(e) => {
                         tracing::error!("ts_video_replace: failed to open decoder: {e}");
                         self.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
@@ -1009,6 +1091,7 @@ mod tests {
             color_transfer: None,
             color_matrix: None,
             color_range: None,
+            hw_decode: None,
         }
     }
 

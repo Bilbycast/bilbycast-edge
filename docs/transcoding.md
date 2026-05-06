@@ -361,6 +361,73 @@ See the licensing notes in the main `bilbycast-edge/CLAUDE.md`:
 | `hevc_nvenc`  | `video-encoder-nvenc`     | same                         | same                      |
 | `h264_qsv`    | `video-encoder-qsv`       | Build: `libvpl-dev` (x86_64). Runtime: **`libvpl2`** + **`libmfx-gen1.2`** (the GPU runtime — most-commonly-missed) + **`intel-media-va-driver-non-free`** (or `intel-media-va-driver`). Intel iGPU (Broadwell / 5th gen+) or Arc dGPU. | Royalty-free; libvpl headers MIT, dispatcher Apache 2.0. No GPL bundle. No `--enable-nonfree` needed. |
 | `hevc_qsv`    | `video-encoder-qsv`       | same; HEVC requires Kaby Lake (7th gen) or newer | same |
+| `h264_vaapi`  | `video-encoder-vaapi`     | Build: `apt install libva-dev`. Runtime: working VAAPI driver — Mesa **`radeonsi`** for AMD, **`iHD`** for Intel. **4:2:0 8-bit only** on every implementation (no Main10 / 4:2:2 profiles in H.264 VAAPI on any host). | Royalty-free; libva is MIT, FFmpeg's VAAPI wrapper LGPL. No GPL bundle. |
+| `hevc_vaapi`  | `video-encoder-vaapi`     | Same build deps. Supports broadcast contribution matrix end-to-end: 4:2:0 8-bit (NV12), 4:2:0 10-bit (P010LE), 4:2:2 8-bit (NV16), 4:2:2 10-bit (P210LE) — see per-vendor notes below. | same |
+
+#### VAAPI HEVC chroma × bit-depth support per vendor
+
+The 4:2:2 / 10-bit broadcast-contribution cells are wired end-to-end in
+`hevc_vaapi`, but actual support varies by host driver. The startup
+hardware probe (`HwEncoderChromaCapability::hevc_vaapi_*`) tries each
+combination via `VideoEncoder::open()` and the manager UI gates the
+flow modal's chroma/bit-depth dropdown to whatever the host can
+actually open.
+
+| Combination          | Surface | Intel iHD                                  | AMD radeonsi (VCN)                           |
+|----------------------|---------|--------------------------------------------|----------------------------------------------|
+| HEVC 4:2:0 8-bit     | NV12    | Skylake (6th gen) and newer                | All RDNA / RDNA2 / RDNA3                     |
+| HEVC 4:2:0 10-bit    | P010LE  | Kaby Lake (7th gen) and newer (Main 10)    | RDNA2+ (VCN3+); generally works              |
+| HEVC 4:2:2 8-bit     | NV16    | Tiger Lake (11th gen) and newer            | Generally **rejected** — fall back to libx265 |
+| HEVC 4:2:2 10-bit    | P210LE  | Tiger Lake (11th gen) and newer            | Generally **rejected** — fall back to libx265 |
+
+Sports / live-broadcast contribution that needs 4:2:2 on an AMD-on-Linux
+host today should ship the `*-linux-full` artefact and select
+`x265` (libx265 supports the full Main 4:2:2 / Main 4:2:2 10 matrix at
+the cost of GPL-2.0-or-later combined-work licensing — see the
+"Commercial licensing + GPL" note below).
+
+#### Per-vendor backend recommendation
+
+The right choice depends on host vendor:
+
+| Host         | First choice for encode             | Notes                                                         |
+|--------------|-------------------------------------|---------------------------------------------------------------|
+| **NVIDIA**   | `h264_nvenc` / `hevc_nvenc`         | NVENC is mature and well-tuned; pick VAAPI only if NVENC drivers aren't available. |
+| **Intel**    | `h264_qsv` / `hevc_qsv`             | QSV via libvpl exposes more rate-control knobs than VAAPI on iHD. VAAPI works as a fallback when libvpl isn't installed. |
+| **AMD**      | `h264_vaapi` / `hevc_vaapi`         | The only royalty-clean HW encode on AMD-on-Linux. AMD has no NVENC equivalent and no QSV. |
+| **CPU-only** | `x264` / `x265`                     | Highest quality at low broadcast-contribution bitrates; AGPL-3.0-or-later combined work. |
+
+**Quality caveat for AMD VCN.** At low broadcast-contribution bitrates
+(roughly ≤ 6 Mbps 1080p H.264, ≤ 8 Mbps 1080p HEVC), the AMD VCN
+encoder produces noticeably lower quality than libx264 / NVENC at the
+same bitrate — visible on grass / crowd textures. Operators who can
+afford 30–50 % more bitrate offset most of the gap. Above that
+bitrate the difference is negligible. Intel iHD VAAPI quality is
+roughly on par with QSV; the caveat is AMD-specific. If you need
+broadcast-quality H.264 at low bitrate on an AMD-on-Linux host, ship
+the `*-linux-full` artefact and select `x264` instead — the binary is
+GPL-2.0-or-later combined work either way (libx264 contagion).
+
+**Broadcast contribution workflows (4:2:2 / 10-bit).** Sports and
+live-broadcast workflows commonly use 4:2:2 chroma and / or 10-bit
+sample depth — for **both** SDR and HDR contribution. The full
+chroma × bit-depth matrix maps to broadcast formats as:
+
+- **4:2:0 8-bit** — consumer / streaming / OTT distribution.
+- **4:2:0 10-bit** — HDR (PQ / HLG) consumer distribution; also the
+  most-common 10-bit SDR cell for streaming.
+- **4:2:2 8-bit** — SDI baseband contribution (the broadcast
+  "lossless-ish" baseline; still common in sports A/B and remote
+  encoders).
+- **4:2:2 10-bit** — SDI 10-bit broadcast contribution. Standard for
+  high-end sports / live-events workflows whether the show is HDR or
+  SDR — operators pick 10-bit for the additional headroom in the
+  contribution-encode ladder, not for HDR specifically.
+
+`hevc_vaapi` covers the full matrix on Intel iHD (Tiger Lake / 11th gen
+and newer); `h264_vaapi` is locked to 4:2:0 8-bit on every VAAPI
+implementation. AMD VCN encoders generally reject 4:2:2 — broadcast
+contribution shops on AMD-on-Linux land on libx265.
 
 Default release build has no software video encoders (AGPL-only
 binary). The composite `video-encoders-full` feature bundles every

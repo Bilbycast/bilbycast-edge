@@ -16,14 +16,16 @@
 // documented in `Cargo.toml`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use drm::buffer::{Buffer, DrmFourcc};
+use drm::buffer::{Buffer, DrmFourcc, DrmModifier, PlanarBuffer};
 use drm::control::{
-    connector::State as ConnectorState, dumbbuffer::DumbMapping, framebuffer, AtomicCommitFlags,
-    Device as ControlDevice, Event, PageFlipFlags,
+    atomic::AtomicModeReq, connector::State as ConnectorState, dumbbuffer::DumbMapping,
+    framebuffer, plane, property, AtomicCommitFlags, Device as ControlDevice, Event, FbCmd2Flags,
+    PageFlipFlags, PlaneType,
 };
-use drm::Device;
+use drm::{ClientCapability, Device};
 
 use super::{DisplayDevice, DisplayKind, DisplayMode};
 
@@ -237,6 +239,86 @@ fn infer_alsa_pcm_for(connector_name: &str) -> u32 {
 
 // ── Runtime renderer (page-flip + dumb-buffer blit) ────────────────────
 
+/// Cached lookups for the atomic-commit page-flip path. Built lazily on
+/// the first PRIME present — both DRM client capabilities (UniversalPlanes
+/// + Atomic) must succeed and a primary plane attached to our CRTC must
+/// be discoverable via `plane_handles()`. Property IDs are stable for the
+/// lifetime of the DRM fd, so we resolve them once and reuse on every
+/// subsequent flip — the atomic commit path is per-frame allocation-free
+/// modulo the one Vec inside `AtomicModeReq` (which `drm-rs 0.14` allocates
+/// internally on each `add_property` call but reuses no memory across
+/// flips; building four short Vecs of < 16 entries each is below the
+/// noise floor of any media data path).
+struct AtomicSetup {
+    plane: plane::Handle,
+    plane_props: PlanePropIds,
+    crtc_props: CrtcPropIds,
+    connector_props: ConnectorPropIds,
+    /// Property-blob handle for the current `Mode`, kept alive across
+    /// flips so the kernel can reference it in MODE_ID. Allocated
+    /// lazily on the first atomic commit and freed when the mode
+    /// changes (legacy `set_crtc` modeset paths invalidate it via
+    /// `KmsDisplay::invalidate_atomic_modeset`).
+    mode_blob_id: Option<u64>,
+}
+
+struct PlanePropIds {
+    fb_id: property::Handle,
+    crtc_id: property::Handle,
+    src_x: property::Handle,
+    src_y: property::Handle,
+    src_w: property::Handle,
+    src_h: property::Handle,
+    crtc_x: property::Handle,
+    crtc_y: property::Handle,
+    crtc_w: property::Handle,
+    crtc_h: property::Handle,
+}
+
+struct CrtcPropIds {
+    mode_id: property::Handle,
+    active: property::Handle,
+}
+
+struct ConnectorPropIds {
+    crtc_id: property::Handle,
+    /// `HDR_OUTPUT_METADATA` blob property. `None` when the host
+    /// kernel / driver doesn't expose it on this connector — older
+    /// kernels (pre-5.14 amdgpu) and some virtual / non-HDR-aware
+    /// drivers fall here. When set, [`KmsDisplay::set_hdr_output_metadata`]
+    /// allocates an `hdr_output_metadata` blob and the next atomic
+    /// commit programs it onto the connector so the HDMI / DP sink
+    /// transmits the right Dynamic Range and Mastering InfoFrame and
+    /// the panel switches into HDR mode.
+    hdr_output_metadata: Option<property::Handle>,
+}
+
+/// Cached overlay-plane state for the audio-bars confidence strip.
+/// Allocated by [`KmsDisplay::enable_bars_overlay`] when the operator
+/// has set `show_audio_bars: true` on a VAAPI / atomic-commit display
+/// output. Composes onto a second KMS plane via the same atomic commit
+/// that flips the prime FB onto the primary plane — eliminates the
+/// CPU-blit demotion the v1 prime path used to take whenever
+/// `show_audio_bars` was on.
+struct BarsOverlay {
+    plane: plane::Handle,
+    plane_props: PlanePropIds,
+    /// ARGB8888 dumb buffer the display task rasterises bars into. The
+    /// audio-meter snapshot writes propagate to the panel at the next
+    /// atomic commit (so meter cadence ≤ video cadence; the bars never
+    /// pace the present loop).
+    dumb: DumbBuffer,
+    /// Strip width / height in pixels. Width = panel width; height
+    /// matches `audio_bars::compute_strip_height(panel_h)`.
+    width: u32,
+    height: u32,
+    /// Has at least one atomic commit programmed this plane onto our
+    /// CRTC? Kept so a pending modeset that fails before the bars
+    /// plane is ever programmed doesn't leave the kernel scanning out
+    /// from a stale FB after a teardown.
+    committed: bool,
+}
+
 /// Holder for the active KMS master + double-buffered framebuffers.
 /// One per display output. Created by `output_display` after mode-set;
 /// owns the lifetime of the dumb buffers and the CRTC lease.
@@ -250,6 +332,59 @@ pub struct KmsDisplay {
     // Two framebuffers we ping-pong between for tear-free page flips.
     bufs: [DumbBuffer; 2],
     front_idx: usize,
+    /// PRIME scanout state — set when `present_prime` has flipped a
+    /// VAAPI-decoded surface onto the CRTC. `None` while the CPU-blit
+    /// path is active. Holding the previous-frame keepalive here means
+    /// the underlying VAAPI surface stays valid until the *next* flip
+    /// completes, eliminating the green-flash / stuck-frame artefacts
+    /// the VA pool causes when surfaces recycle mid-scanout.
+    prime_state: Option<PrimeState>,
+    /// Atomic-commit page-flip state. `None` until the first PRIME
+    /// present, which discovers the primary plane + caches property
+    /// IDs. `use_atomic` flips to `false` (and stays there) on
+    /// EOPNOTSUPP or a first-commit EINVAL — see `present_prime`.
+    use_atomic: bool,
+    atomic: Option<AtomicSetup>,
+    /// Has the connector seen at least one successful atomic commit
+    /// with `ALLOW_MODESET`? Subsequent flips skip the
+    /// CRTC.ACTIVE / CRTC.MODE_ID / CONNECTOR.CRTC_ID writes (the
+    /// kernel keeps that state). Reset by legacy modeset paths
+    /// (`match_source_resolution` etc.) so the next atomic re-arms.
+    atomic_modeset_done: bool,
+    /// One-shot reason string the caller drains via
+    /// `take_atomic_fallback_reason()` to emit a single
+    /// `display_atomic_unavailable` Warning event. Set when
+    /// `present_prime` falls back from atomic to `set_crtc`.
+    atomic_fallback_reason: Option<String>,
+    /// Audio-bars confidence-strip state. `Some` after a successful
+    /// `enable_bars_overlay()` call; the next `present_prime` adds the
+    /// overlay-plane property writes to the same atomic commit. `None`
+    /// when bars are off, when the host has no overlay plane drivable
+    /// from our CRTC, or when the legacy `set_crtc` fallback is in
+    /// effect (multi-plane composition needs atomic commit).
+    bars_overlay: Option<BarsOverlay>,
+    /// Currently-programmed HDR output metadata. The next atomic
+    /// commit writes this onto the connector's `HDR_OUTPUT_METADATA`
+    /// property. `None` when SDR (the connector is unset by writing
+    /// blob id 0). `Some(HdrState { blob_id, eotf, .. })` when an
+    /// HDR signalling blob has been allocated and is in force.
+    hdr_state: Option<HdrState>,
+    /// Has `hdr_state` changed since the last atomic commit? When
+    /// true the next commit re-programs `HDR_OUTPUT_METADATA` (with
+    /// `ALLOW_MODESET` because EOTF transitions trigger a brief
+    /// HDMI / DP re-train on the panel side). Cleared by
+    /// `atomic_present` after a successful commit.
+    hdr_dirty: bool,
+}
+
+/// Snapshot of the HDR signalling state currently programmed on the
+/// connector. The `blob_id` is the kernel handle returned by
+/// `create_property_blob`; we keep ownership of it across flips and
+/// free it (`destroy_property_blob`) only when transitioning to a
+/// different EOTF or back to SDR.
+struct HdrState {
+    blob_id: u64,
+    eotf: HdrEotf,
 }
 
 struct DumbBuffer {
@@ -292,6 +427,17 @@ impl KmsDisplay {
         // drm-master is required for atomic modeset; on most distributions
         // a regular user gets it via `seat0` automatically.
         let _ = card.acquire_master_lock();
+        // Universal planes + atomic must both be enabled before
+        // `plane_handles()` returns Primary planes and before the
+        // atomic_commit ioctl is willing to accept our requests. Either
+        // failing is non-fatal — we fall back to the legacy `set_crtc`
+        // path on every flip and report `panel_hdr_capable = false`.
+        let atomic_caps_ok = card
+            .set_client_capability(ClientCapability::UniversalPlanes, true)
+            .is_ok()
+            && card
+                .set_client_capability(ClientCapability::Atomic, true)
+                .is_ok();
 
         let info = card
             .get_connector(connector, true)
@@ -323,6 +469,28 @@ impl KmsDisplay {
         // dumb-buffer destructors clean up on `Drop`.
         let _ = (&mut a, &mut b);
 
+        // Eager atomic discovery: walk plane / connector properties
+        // now (rather than lazily on first present_prime) so the
+        // upstream decode task can read `panel_hdr_capable()`
+        // synchronously when deciding whether HDR sources need a
+        // sysmem download for CPU tonemap. Failure isn't fatal —
+        // the lazy retry inside `present_prime` may still succeed
+        // once a real prime FB has been built; in the meantime
+        // `use_atomic` is flipped off.
+        let mut atomic_setup: Option<AtomicSetup> = None;
+        let mut use_atomic = atomic_caps_ok;
+        if use_atomic {
+            match discover_atomic_setup(&card, crtc, connector) {
+                Ok(s) => atomic_setup = Some(s),
+                Err(e) => {
+                    tracing::info!(
+                        "atomic discovery deferred — falling back to legacy set_crtc on first flip: {e:#}"
+                    );
+                    use_atomic = false;
+                }
+            }
+        }
+
         Ok(Self {
             card,
             crtc,
@@ -332,7 +500,292 @@ impl KmsDisplay {
             height: h as u32,
             bufs: [a, b],
             front_idx: 0,
+            prime_state: None,
+            use_atomic,
+            atomic: atomic_setup,
+            atomic_modeset_done: false,
+            atomic_fallback_reason: None,
+            bars_overlay: None,
+            hdr_state: None,
+            hdr_dirty: false,
         })
+    }
+
+    /// `true` when the connector exposes the `HDR_OUTPUT_METADATA`
+    /// atomic property — meaning the kernel + driver can transmit
+    /// the HDR Dynamic Range and Mastering InfoFrame to the panel,
+    /// so HDR sources can scan out as HDR (instead of being
+    /// downloaded to sysmem and CPU-tonemapped to SDR). On modern
+    /// Linux this is true on every i915 / amdgpu / nouveau-driven
+    /// HDMI 2.0a+ or DP 1.4+ connector. Returns `false` on hosts
+    /// that haven't yet probed atomic — the discovery happens
+    /// lazily on first `present_prime`, so a fresh `KmsDisplay`
+    /// reports `false` until the first VAAPI flip.
+    pub fn panel_hdr_capable(&self) -> bool {
+        self.atomic
+            .as_ref()
+            .is_some_and(|a| a.connector_props.hdr_output_metadata.is_some())
+    }
+
+    /// Program the connector's `HDR_OUTPUT_METADATA` so the next
+    /// atomic commit transmits a Dynamic Range and Mastering
+    /// InfoFrame to the panel. `eotf` selects PQ (HDR10 family) or
+    /// HLG. `mastering_max_nits` / `mastering_min_units` /
+    /// `max_cll_nits` / `max_fall_nits` set the static-metadata
+    /// luminance fields (units: nits, except `mastering_min` which
+    /// is the kernel's 1/10 000 nit unit). When `mastering_max_nits`
+    /// is `None` the call falls back to a sensible HDR10 default
+    /// (1000 / 0.005 / 1000 / 400) — sufficient for live broadcast
+    /// HDR sources where the operator hasn't supplied a Mastering
+    /// Display SEI.
+    ///
+    /// Idempotent within an EOTF: a second call with the same EOTF
+    /// reuses the existing blob (no reallocation, no `_dirty` set).
+    /// Transitioning EOTFs (PQ → HLG, or any → SDR via
+    /// [`Self::clear_hdr_output_metadata`]) frees the old blob and
+    /// allocates a fresh one. The next atomic commit carries
+    /// `ALLOW_MODESET` because the HDMI / DP sink re-trains on EOTF
+    /// change.
+    ///
+    /// Returns `Err` when the connector doesn't expose
+    /// `HDR_OUTPUT_METADATA` (call [`Self::panel_hdr_capable`]
+    /// first) or when the kernel rejects the blob allocation. The
+    /// caller falls back to the CPU-blit + sysmem-tonemap path.
+    pub fn set_hdr_output_metadata(
+        &mut self,
+        eotf: HdrEotf,
+        mastering_max_nits: Option<u16>,
+        mastering_min_units: Option<u16>,
+        max_cll_nits: Option<u16>,
+        max_fall_nits: Option<u16>,
+    ) -> Result<()> {
+        if !self.panel_hdr_capable() {
+            anyhow::bail!(
+                "HDR_OUTPUT_METADATA not supported on this connector — panel/driver lacks HDR signalling"
+            );
+        }
+        if let Some(state) = self.hdr_state.as_ref() {
+            if state.eotf == eotf {
+                // Already programmed with this EOTF — keep the
+                // existing blob; static-metadata refinements are
+                // not yet plumbed (would require freeing + re-
+                // allocating). Acceptable for v1: a single source's
+                // mastering metadata is constant.
+                return Ok(());
+            }
+        }
+        let bytes = build_hdr_output_metadata_blob(
+            eotf,
+            bt2020_primaries(),
+            d65_white_point(),
+            mastering_max_nits.unwrap_or(1000),
+            mastering_min_units.unwrap_or(50),
+            max_cll_nits.unwrap_or(1000),
+            max_fall_nits.unwrap_or(400),
+        );
+        let blob = self
+            .card
+            .create_property_blob(&bytes)
+            .context("create_property_blob (HDR_OUTPUT_METADATA)")?;
+        let blob_id = match blob {
+            property::Value::Blob(id) => id,
+            _ => anyhow::bail!("create_property_blob returned non-Blob value"),
+        };
+        if let Some(prev) = self.hdr_state.take() {
+            let _ = self.card.destroy_property_blob(prev.blob_id);
+        }
+        self.hdr_state = Some(HdrState { blob_id, eotf });
+        self.hdr_dirty = true;
+        Ok(())
+    }
+
+    /// Detach the HDR metadata from the connector — the next atomic
+    /// commit writes `HDR_OUTPUT_METADATA = 0`, which the kernel
+    /// translates to "no DRMI InfoFrame", and the panel falls back
+    /// to SDR / Rec.709 signalling. Frees the blob the kernel was
+    /// referencing. Idempotent: returns immediately when no HDR
+    /// state is held. Carries `ALLOW_MODESET` on the next commit
+    /// because the EOTF transition re-trains the link.
+    pub fn clear_hdr_output_metadata(&mut self) {
+        let Some(prev) = self.hdr_state.take() else {
+            return;
+        };
+        let _ = self.card.destroy_property_blob(prev.blob_id);
+        self.hdr_dirty = true;
+    }
+
+    /// Drain a one-shot reason string set when `present_prime` falls
+    /// back from atomic_commit to legacy `set_crtc`. The caller emits
+    /// a single `display_atomic_unavailable` Warning event. Subsequent
+    /// calls return `None` — the disable is sticky.
+    pub fn take_atomic_fallback_reason(&mut self) -> Option<String> {
+        self.atomic_fallback_reason.take()
+    }
+
+    /// Allocate the audio-bars overlay plane. Walks `plane_handles()`
+    /// for an Overlay (or Cursor as fallback) plane drivable from our
+    /// CRTC and advertising `DRM_FORMAT_ARGB8888`, allocates an
+    /// ARGB8888 dumb buffer sized `panel_w × strip_h`, and resolves
+    /// the plane's atomic property IDs. Subsequent `present_prime`
+    /// calls compose the overlay onto the bottom strip of the panel
+    /// via a single atomic commit alongside the prime FB on the
+    /// primary plane.
+    ///
+    /// Pre-conditions: atomic-commit is available (the discovery path
+    /// uses universal-planes + atomic-class properties), and the host
+    /// driver advertises at least one Overlay or Cursor plane drivable
+    /// from this CRTC. Hosts that don't satisfy either fall back to
+    /// the CPU-blit bars-rasterise path inside the dumb buffer (the
+    /// caller checks the return value and routes accordingly).
+    pub fn enable_bars_overlay(&mut self) -> Result<()> {
+        if self.bars_overlay.is_some() {
+            return Ok(());
+        }
+        if !self.use_atomic {
+            anyhow::bail!(
+                "bars-overlay needs atomic_commit for multi-plane composition; legacy set_crtc supports only one plane"
+            );
+        }
+        // The atomic discovery path is shared with `present_prime` —
+        // we trigger it here so the primary-plane setup is ready
+        // before we go looking for a sibling overlay.
+        if self.atomic.is_none() {
+            let setup = discover_atomic_setup(&self.card, self.crtc, self.connector)
+                .context("atomic setup discovery (bars overlay prereq)")?;
+            self.atomic = Some(setup);
+        }
+        let primary_plane = self
+            .atomic
+            .as_ref()
+            .map(|a| a.plane)
+            .expect("atomic just set");
+
+        let strip_h = match super::audio_bars::compute_strip_height(self.height) {
+            Some(h) => h,
+            None => anyhow::bail!(
+                "panel too short ({}px) to host audio-bars overlay strip",
+                self.height
+            ),
+        };
+
+        let (plane_h, plane_props) =
+            discover_bars_overlay_plane(&self.card, self.crtc, primary_plane)
+                .context("bars-overlay plane discovery")?;
+        let dumb = alloc_argb_dumb_buffer(&self.card, self.width, strip_h)
+            .context("bars-overlay ARGB8888 dumb buffer")?;
+        self.bars_overlay = Some(BarsOverlay {
+            plane: plane_h,
+            plane_props,
+            dumb,
+            width: self.width,
+            height: strip_h,
+            committed: false,
+        });
+        Ok(())
+    }
+
+    /// Tear down the audio-bars overlay plane — clear the plane on
+    /// the next atomic commit, destroy the FB, drop the dumb buffer.
+    /// Idempotent. The caller invokes this when the operator clears
+    /// `show_audio_bars` mid-flow or when the display task shuts down.
+    /// Normal shutdown also reclaims the FB through `Drop` on the
+    /// embedded `DumbBuffer` plus the kernel-side reap when the DRM
+    /// fd closes; this method is the explicit-teardown path for
+    /// runtime toggles.
+    #[allow(dead_code)]
+    pub fn disable_bars_overlay(&mut self) {
+        let Some(bars) = self.bars_overlay.take() else {
+            return;
+        };
+        if bars.committed {
+            // Detach the plane from our CRTC: a tiny atomic commit
+            // with FB_ID = 0 + CRTC_ID = 0. Failure is non-fatal —
+            // destroying the FB drops the kernel-side reference.
+            let mut req = AtomicModeReq::new();
+            req.add_property(bars.plane, bars.plane_props.fb_id, property::Value::Framebuffer(None));
+            req.add_property(bars.plane, bars.plane_props.crtc_id, property::Value::CRTC(None));
+            let _ = self
+                .card
+                .atomic_commit(AtomicCommitFlags::empty(), req);
+        }
+        let DumbBuffer { mapping, fb, handle } = bars.dumb;
+        drop(mapping);
+        let _ = self.card.destroy_framebuffer(fb);
+        let _ = self.card.destroy_dumb_buffer(handle);
+    }
+
+    /// Reallocate the bars-overlay dumb buffer to match the panel's
+    /// **current** width and a strip height derived from the current
+    /// panel height. No-op when the overlay isn't enabled or when the
+    /// new dims match the existing buffer. Tears the overlay down when
+    /// the new panel is too short to host a strip at all.
+    ///
+    /// Called from `match_source_resolution` and `set_monitor_native_mode`
+    /// after a panel-size mode change. Without this, the overlay buffer
+    /// stays sized to the previous mode's width — the rasteriser then
+    /// centres bars using the buffer's (old, larger) width while the
+    /// panel only scans out the leftmost panel-width slice, pushing the
+    /// bars off-screen to the right and giving the operator a sliver of
+    /// the leftmost bar(s) instead of the full strip.
+    fn resync_bars_overlay_to_panel(&mut self) -> Result<()> {
+        if self.bars_overlay.is_none() {
+            return Ok(());
+        }
+        let new_strip_h = match super::audio_bars::compute_strip_height(self.height) {
+            Some(h) => h,
+            None => {
+                // Panel shrank below the minimum strip-host height
+                // — tear the overlay down. The next compatible mode
+                // change won't re-enable it (enable_bars_overlay is
+                // a one-shot at task startup); operators on this code
+                // path are already on a tiny panel where the bars
+                // wouldn't be readable anyway.
+                self.disable_bars_overlay();
+                return Ok(());
+            }
+        };
+        let bars = self.bars_overlay.as_mut().expect("just checked Some");
+        if bars.width == self.width && bars.height == new_strip_h {
+            return Ok(());
+        }
+        let new_dumb = alloc_argb_dumb_buffer(&self.card, self.width, new_strip_h)
+            .context("bars-overlay re-allocation after panel mode change")?;
+        let old_dumb = std::mem::replace(&mut bars.dumb, new_dumb);
+        let DumbBuffer { mapping, fb, handle } = old_dumb;
+        drop(mapping);
+        let _ = self.card.destroy_framebuffer(fb);
+        let _ = self.card.destroy_dumb_buffer(handle);
+        bars.width = self.width;
+        bars.height = new_strip_h;
+        // Force the next atomic commit to re-program every plane
+        // property — the kernel's last-seen FB ID + SRC/CRTC rects
+        // referenced the destroyed dumb buffer.
+        bars.committed = false;
+        Ok(())
+    }
+
+    /// Borrow the overlay-plane bars buffer for a fresh rasterise.
+    /// `None` when bars haven't been enabled. The caller writes
+    /// ARGB8888 pixels via [`super::audio_bars::rasterise_overlay`];
+    /// the next `present_prime` call composes the buffer onto the
+    /// strip via atomic commit.
+    pub fn bars_overlay_buffer(&mut self) -> Option<DumbBufferMap<'_>> {
+        let bars = self.bars_overlay.as_mut()?;
+        let pitch = bars.dumb.handle.pitch();
+        Some(DumbBufferMap {
+            slice: bars.dumb.mapping.as_mut(),
+            pitch,
+            width: bars.width,
+            height: bars.height,
+        })
+    }
+
+    /// `(width_px, strip_height_px)` of the audio-bars overlay buffer,
+    /// or `None` when the overlay isn't enabled. The caller passes
+    /// these to [`super::audio_bars::rasterise_overlay`] so layout
+    /// math matches the buffer the kernel will actually scan out.
+    pub fn bars_overlay_dims(&self) -> Option<(u32, u32)> {
+        self.bars_overlay.as_ref().map(|b| (b.width, b.height))
     }
 
     pub fn width(&self) -> u32 {
@@ -401,6 +854,7 @@ impl KmsDisplay {
                 )
                 .context("display_mode_set_failed: auto-match refresh re-modeset")?;
             self.mode = new_mode;
+            self.invalidate_atomic_modeset();
             return Ok(());
         }
 
@@ -430,7 +884,33 @@ impl KmsDisplay {
         self.width = new_w;
         self.height = new_h;
         self.front_idx = 0;
+        self.invalidate_atomic_modeset();
+        if let Err(e) = self.resync_bars_overlay_to_panel() {
+            tracing::warn!(
+                "audio-bars overlay resync after match-source modeset failed: {e:#}"
+            );
+        }
         Ok(())
+    }
+
+    /// A legacy `set_crtc` modeset has just landed. Free the cached
+    /// mode-blob (it's now stale) and clear `atomic_modeset_done` so
+    /// the next atomic flip re-asserts CRTC.ACTIVE / CRTC.MODE_ID /
+    /// CONNECTOR.CRTC_ID with `ALLOW_MODESET`. No-op when the atomic
+    /// path has never been used. Also drops the HDR metadata blob —
+    /// a legacy modeset clears connector signalling state on most
+    /// drivers, so the next HDR-bearing flip re-allocates the blob.
+    fn invalidate_atomic_modeset(&mut self) {
+        self.atomic_modeset_done = false;
+        if let Some(setup) = self.atomic.as_mut() {
+            if let Some(blob) = setup.mode_blob_id.take() {
+                let _ = self.card.destroy_property_blob(blob);
+            }
+        }
+        if let Some(prev) = self.hdr_state.take() {
+            let _ = self.card.destroy_property_blob(prev.blob_id);
+            self.hdr_dirty = true;
+        }
     }
 
     /// Re-program the connector to its preferred (panel-native) mode.
@@ -469,6 +949,7 @@ impl KmsDisplay {
                 )
                 .context("display_mode_set_failed: monitor-native refresh re-modeset")?;
             self.mode = new_mode;
+            self.invalidate_atomic_modeset();
             return Ok(());
         }
         let new_a = alloc_dumb_buffer(&self.card, new_w, new_h)?;
@@ -493,6 +974,12 @@ impl KmsDisplay {
         self.width = new_w;
         self.height = new_h;
         self.front_idx = 0;
+        self.invalidate_atomic_modeset();
+        if let Err(e) = self.resync_bars_overlay_to_panel() {
+            tracing::warn!(
+                "audio-bars overlay resync after monitor-native modeset failed: {e:#}"
+            );
+        }
         Ok(())
     }
 
@@ -755,11 +1242,995 @@ fn locate_connector(name: &str) -> Result<(PathBuf, drm::control::connector::Han
     )
 }
 
-// Suppress the silenced AtomicCommitFlags import in non-atomic mode-set
-// paths above; v2 will use it. Keep the path here so the import stays
-// exercised on a future swap.
-#[allow(dead_code)]
-fn _atomic_flags_check() -> AtomicCommitFlags {
-    AtomicCommitFlags::ALLOW_MODESET
+/// Electro-optical transfer function for HDR output signalling, per the
+/// `hdr_metadata_infoframe.eotf` field of the kernel's
+/// `hdr_output_metadata` blob. Drives the EOTF byte we send to the
+/// panel via the connector's `HDR_OUTPUT_METADATA` property — the
+/// panel reads it (over the HDMI Dynamic Range and Mastering
+/// InfoFrame) and switches into the matching pipeline (typical UHD TV
+/// behaviour: PQ → "HDR" mode, HLG → "HLG HDR" mode, traditional →
+/// SDR / "BT.2020 video" mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HdrEotf {
+    /// Traditional gamma SDR (Rec.709-style EOTF). EOTF byte = 0.
+    /// The default when no HDR metadata is set. Held for symmetry
+    /// with the kernel's `hdr_metadata_infoframe.eotf` enum;
+    /// `clear_hdr_output_metadata` is the operator-facing API for
+    /// returning to SDR rather than passing this variant through
+    /// `set_hdr_output_metadata`.
+    #[allow(dead_code)]
+    SdrGamma,
+    /// SMPTE ST 2084 (PQ) absolute-luminance EOTF, 0–10 000 nits.
+    /// EOTF byte = 2. Standard HDR10 / HDR10+ / Dolby Vision base
+    /// layer source signalling.
+    Pq,
+    /// ARIB STD-B67 / Rec.2100 HLG (Hybrid Log-Gamma), display-
+    /// relative. EOTF byte = 3. Standard for live broadcast HDR
+    /// (BBC, NHK, DVB) — backwards-compatible with SDR Rec.709
+    /// receivers that ignore the metadata.
+    Hlg,
+}
+
+impl HdrEotf {
+    /// EOTF byte exactly as written into the kernel's
+    /// `hdr_metadata_infoframe.eotf` field.
+    fn byte(self) -> u8 {
+        match self {
+            HdrEotf::SdrGamma => 0,
+            HdrEotf::Pq => 2,
+            HdrEotf::Hlg => 3,
+        }
+    }
+}
+
+/// Wire layout of the kernel's `hdr_output_metadata` struct (see
+/// `linux/include/uapi/drm/drm_mode.h`). 30 bytes packed; the kernel
+/// requires a `__packed__` layout. We render the blob into a raw
+/// `[u8; 30]` and pass it to `create_property_blob` rather than rely
+/// on a `#[repr(C, packed)]` struct + bytemuck, both because the
+/// drm-rs `create_property_blob` already takes a `&T` it
+/// reinterprets as bytes via `mem::size_of::<T>()`, and because the
+/// explicit byte layout means a future change to the kernel struct
+/// (e.g. metadata_type variants beyond Type 1) only touches one
+/// place. CTA-861-G primary / white-point quantisation: x = round(x ×
+/// 50 000); luminance is in nits (max) or 1/10 000 nit (min).
+const HDR_METADATA_BLOB_SIZE: usize = 30;
+
+#[allow(clippy::too_many_arguments)]
+fn build_hdr_output_metadata_blob(
+    eotf: HdrEotf,
+    primaries: [(u16, u16); 3],
+    white_point: (u16, u16),
+    max_display_mastering_luminance_nits: u16,
+    min_display_mastering_luminance_units: u16,
+    max_cll_nits: u16,
+    max_fall_nits: u16,
+) -> [u8; HDR_METADATA_BLOB_SIZE] {
+    let mut blob = [0u8; HDR_METADATA_BLOB_SIZE];
+    // u32 metadata_type = 0 (HDMI Type 1) — already zeroed.
+    blob[4] = eotf.byte();
+    blob[5] = 0; // metadata_type (inner) = 0 (HDMI Type 1)
+    let mut o = 6;
+    for (x, y) in primaries.iter() {
+        blob[o..o + 2].copy_from_slice(&x.to_le_bytes());
+        blob[o + 2..o + 4].copy_from_slice(&y.to_le_bytes());
+        o += 4;
+    }
+    blob[o..o + 2].copy_from_slice(&white_point.0.to_le_bytes());
+    blob[o + 2..o + 4].copy_from_slice(&white_point.1.to_le_bytes());
+    o += 4;
+    blob[o..o + 2].copy_from_slice(&max_display_mastering_luminance_nits.to_le_bytes());
+    blob[o + 2..o + 4].copy_from_slice(&min_display_mastering_luminance_units.to_le_bytes());
+    o += 4;
+    blob[o..o + 2].copy_from_slice(&max_cll_nits.to_le_bytes());
+    blob[o + 2..o + 4].copy_from_slice(&max_fall_nits.to_le_bytes());
+    blob
+}
+
+/// BT.2020 / Rec.2100 RGB primaries quantised per CTA-861-G
+/// (`x = round(x × 50000)`). Used as the default mastering
+/// primaries when the source bitstream doesn't carry a Mastering
+/// Display SEI — every UHD panel knows BT.2020, so the metadata
+/// remains semantically correct even with the placeholder values.
+fn bt2020_primaries() -> [(u16, u16); 3] {
+    // Red:   (0.708, 0.292)  → (35400, 14600)
+    // Green: (0.170, 0.797)  → ( 8500, 39850)
+    // Blue:  (0.131, 0.046)  → ( 6550,  2300)
+    [(35400, 14600), (8500, 39850), (6550, 2300)]
+}
+
+/// D65 white point, quantised per CTA-861-G (`x = round(x × 50000)`).
+/// `(0.3127, 0.3290) → (15635, 16450)`.
+fn d65_white_point() -> (u16, u16) {
+    (15635, 16450)
+}
+
+// ── Atomic-commit helpers ─────────────────────────────────────────────
+//
+// The atomic-commit page-flip path (used by `KmsDisplay::present_prime`
+// for VAAPI zero-copy scanout) needs cached property IDs for every
+// kernel object we touch on each flip — plane (FB_ID, CRTC_ID, SRC_*,
+// CRTC_*), CRTC (ACTIVE, MODE_ID), and connector (CRTC_ID). The kernel
+// keeps property IDs stable for the lifetime of the DRM fd, so we look
+// them up once on the first PRIME present and reuse from there.
+//
+// Discovery walks `card.plane_handles()` (universal-planes cap is
+// enabled in `KmsDisplay::open`), inspects each plane's `type` property
+// for the `Primary` enum value, and keeps the first one whose
+// `pos_crtcs` bitmask includes our CRTC's index in `resources.crtcs()`.
+// On the rare host with multiple primary planes per CRTC the kernel's
+// own enumeration order is what compositors rely on — same here.
+
+/// Look up `property::Handle` IDs by name for an object, returning a
+/// missing-name error so the caller can fall back rather than panic.
+fn collect_props(
+    card: &CardFile,
+    handle: impl drm::control::ResourceHandle,
+    names: &[&str],
+) -> Result<Vec<property::Handle>> {
+    let set = card
+        .get_properties(handle)
+        .context("get_properties for atomic discovery")?;
+    let (ids, _vals) = set.as_props_and_values();
+    let mut out: Vec<Option<property::Handle>> = vec![None; names.len()];
+    for &id in ids {
+        let info = card
+            .get_property(id)
+            .context("get_property for atomic discovery")?;
+        let nm = info.name();
+        let nm_bytes = nm.to_bytes();
+        for (i, want) in names.iter().enumerate() {
+            if out[i].is_none() && nm_bytes == want.as_bytes() {
+                out[i] = Some(id);
+            }
+        }
+    }
+    let mut filled = Vec::with_capacity(names.len());
+    for (i, slot) in out.into_iter().enumerate() {
+        let h = slot.with_context(|| {
+            format!(
+                "atomic property '{}' not found on object — kernel too old or driver lacks atomic support",
+                names[i]
+            )
+        })?;
+        filled.push(h);
+    }
+    Ok(filled)
+}
+
+/// Look up a single property by name on an object, returning `None`
+/// (rather than `Err`) when it doesn't exist. Used for atomic
+/// properties that are optional on a given driver / kernel — for
+/// example `HDR_OUTPUT_METADATA`, which only newer kernels (5.14+ for
+/// amdgpu, much earlier on i915) advertise on connectors.
+fn optional_prop(
+    card: &CardFile,
+    handle: impl drm::control::ResourceHandle,
+    name: &str,
+) -> Result<Option<property::Handle>> {
+    let set = card
+        .get_properties(handle)
+        .context("get_properties for optional prop discovery")?;
+    let (ids, _vals) = set.as_props_and_values();
+    for id in ids {
+        let info = card
+            .get_property(*id)
+            .context("get_property for optional prop discovery")?;
+        if info.name().to_bytes() == name.as_bytes() {
+            return Ok(Some(*id));
+        }
+    }
+    Ok(None)
+}
+
+/// Read the `type` enum value off a plane. Returns the raw value
+/// (0 = Overlay, 1 = Primary, 2 = Cursor per `DRM_PLANE_TYPE_*`).
+fn read_plane_type(card: &CardFile, plane_h: plane::Handle) -> Result<u64> {
+    let set = card
+        .get_properties(plane_h)
+        .context("get_properties on plane")?;
+    let (ids, vals) = set.as_props_and_values();
+    for (id, val) in ids.iter().zip(vals.iter()) {
+        let info = card
+            .get_property(*id)
+            .context("get_property on plane.type")?;
+        if info.name().to_bytes() == b"type" {
+            return Ok(*val);
+        }
+    }
+    anyhow::bail!("plane has no 'type' property")
+}
+
+fn discover_atomic_setup(
+    card: &CardFile,
+    crtc: drm::control::crtc::Handle,
+    connector: drm::control::connector::Handle,
+) -> Result<AtomicSetup> {
+    let res = card
+        .resource_handles()
+        .context("resource_handles for atomic discovery")?;
+    if !res.crtcs().iter().any(|c| *c == crtc) {
+        anyhow::bail!("CRTC handle not found in resource enumeration");
+    }
+
+    let planes = card
+        .plane_handles()
+        .context("plane_handles — UniversalPlanes capability rejected?")?;
+    let mut chosen: Option<plane::Handle> = None;
+    for p in planes {
+        let info = card.get_plane(p).context("get_plane")?;
+        // `filter_crtcs` decodes the plane's `pos_crtcs` bitmask
+        // against the resource enumeration order — the only way to
+        // read it without poking at private fields.
+        if !res.filter_crtcs(info.possible_crtcs()).iter().any(|c| *c == crtc) {
+            continue;
+        }
+        let ty = read_plane_type(card, p)?;
+        if ty == PlaneType::Primary as u64 {
+            chosen = Some(p);
+            break;
+        }
+    }
+    let plane_h = chosen
+        .context("no primary plane reported as drivable by our CRTC — atomic setup impossible")?;
+
+    let plane_names = [
+        "FB_ID", "CRTC_ID", "SRC_X", "SRC_Y", "SRC_W", "SRC_H", "CRTC_X", "CRTC_Y", "CRTC_W",
+        "CRTC_H",
+    ];
+    let p = collect_props(card, plane_h, &plane_names)?;
+    let plane_props = PlanePropIds {
+        fb_id: p[0],
+        crtc_id: p[1],
+        src_x: p[2],
+        src_y: p[3],
+        src_w: p[4],
+        src_h: p[5],
+        crtc_x: p[6],
+        crtc_y: p[7],
+        crtc_w: p[8],
+        crtc_h: p[9],
+    };
+
+    let c = collect_props(card, crtc, &["MODE_ID", "ACTIVE"])?;
+    let crtc_props = CrtcPropIds {
+        mode_id: c[0],
+        active: c[1],
+    };
+
+    let cn = collect_props(card, connector, &["CRTC_ID"])?;
+    let hdr_prop = optional_prop(card, connector, "HDR_OUTPUT_METADATA")?;
+    let connector_props = ConnectorPropIds {
+        crtc_id: cn[0],
+        hdr_output_metadata: hdr_prop,
+    };
+
+    Ok(AtomicSetup {
+        plane: plane_h,
+        plane_props,
+        crtc_props,
+        connector_props,
+        mode_blob_id: None,
+    })
+}
+
+/// Find an Overlay-class plane (or a Cursor plane as fallback) drivable
+/// from `crtc`, supporting `DRM_FORMAT_ARGB8888`, distinct from the
+/// primary plane already cached for prime scanout. Returns its handle
+/// and the same property-id table the primary plane uses (FB_ID,
+/// CRTC_ID, SRC_*, CRTC_*) — the audio-bars overlay touches the same
+/// properties on every flip.
+fn discover_bars_overlay_plane(
+    card: &CardFile,
+    crtc: drm::control::crtc::Handle,
+    exclude: plane::Handle,
+) -> Result<(plane::Handle, PlanePropIds)> {
+    let res = card
+        .resource_handles()
+        .context("resource_handles for bars overlay discovery")?;
+    let planes = card
+        .plane_handles()
+        .context("plane_handles for bars overlay discovery")?;
+    // Prefer Overlay over Cursor — overlay planes commonly support
+    // ARGB8888 at the panel's full width without the platform-specific
+    // cursor-size cap (which on AMD is 256×256 and would clip a 4K
+    // strip badly). Cursor is the fallback when the host driver
+    // doesn't expose any Overlay planes (rare; some virtual drivers).
+    let argb = DrmFourcc::Argb8888 as u32;
+    let mut overlay: Option<plane::Handle> = None;
+    let mut cursor: Option<plane::Handle> = None;
+    for p in planes {
+        if p == exclude {
+            continue;
+        }
+        let info = card.get_plane(p).context("get_plane (overlay search)")?;
+        if !res.filter_crtcs(info.possible_crtcs()).iter().any(|c| *c == crtc) {
+            continue;
+        }
+        if !info.formats().iter().any(|f| *f == argb) {
+            continue;
+        }
+        match read_plane_type(card, p)? {
+            t if t == PlaneType::Overlay as u64 => {
+                overlay.get_or_insert(p);
+            }
+            t if t == PlaneType::Cursor as u64 => {
+                cursor.get_or_insert(p);
+            }
+            _ => {}
+        }
+    }
+    let plane_h = overlay.or(cursor).context(
+        "no Overlay or Cursor plane drivable from this CRTC supports ARGB8888 — host driver lacks multi-plane composition",
+    )?;
+    let names = [
+        "FB_ID", "CRTC_ID", "SRC_X", "SRC_Y", "SRC_W", "SRC_H", "CRTC_X", "CRTC_Y", "CRTC_W",
+        "CRTC_H",
+    ];
+    let p = collect_props(card, plane_h, &names)?;
+    let plane_props = PlanePropIds {
+        fb_id: p[0],
+        crtc_id: p[1],
+        src_x: p[2],
+        src_y: p[3],
+        src_w: p[4],
+        src_h: p[5],
+        crtc_x: p[6],
+        crtc_y: p[7],
+        crtc_w: p[8],
+        crtc_h: p[9],
+    };
+    Ok((plane_h, plane_props))
+}
+
+/// ARGB8888 sibling of [`alloc_dumb_buffer`]. Allocates a packed
+/// ARGB8888 dumb buffer for the audio-bars overlay strip and creates
+/// a KMS framebuffer for it. `depth = 32` (alpha-bearing) so the
+/// kernel-side compositor honours the alpha lane during plane blend
+/// — `depth = 24` would tag it XRGB and the alpha would be ignored,
+/// which on most drivers means the strip would composite as fully
+/// opaque black instead of the 50 %-translucent dim the rasteriser
+/// writes.
+fn alloc_argb_dumb_buffer(card: &CardFile, w: u32, h: u32) -> Result<DumbBuffer> {
+    let mut handle = card
+        .create_dumb_buffer((w, h), DrmFourcc::Argb8888, 32)
+        .context("create_dumb_buffer (ARGB8888)")?;
+    let fb = card
+        .add_framebuffer(&handle, 32, 32)
+        .context("add_framebuffer (ARGB8888)")?;
+    let mapping = card
+        .map_dumb_buffer(&mut handle)
+        .context("map_dumb_buffer (ARGB8888)")?;
+    // SAFETY: same lifetime-extension argument as `alloc_dumb_buffer`
+    // above — `DumbMapping<'a>` carries an mmap'd kernel slice
+    // independent of `handle`'s Rust struct, and `DumbBuffer` field
+    // declaration order ensures `mapping` is dropped (munmapped)
+    // before `handle` is consumed by `destroy_dumb_buffer` in the
+    // teardown paths.
+    let mapping: DumbMapping<'static> = unsafe { std::mem::transmute(mapping) };
+    Ok(DumbBuffer { mapping, handle, fb })
+}
+
+// ── VAAPI zero-copy scanout (DRM PRIME framebuffers) ──────────────────
+//
+// Inputs from `video_engine::vaapi::DrmPrimeFrame`: a single DMA-BUF fd
+// for the whole NV12 / P010 / etc. surface, the `DRM_FORMAT_*` fourcc,
+// the `DRM_FORMAT_MOD_*` modifier (Intel iHD often returns Y-tiled or
+// the 4-tile gen12 variants; Mesa radeonsi typically returns
+// `DRM_FORMAT_MOD_LINEAR` or `INVALID`), per-plane offsets/strides, and
+// an Arc keepalive that — when finally dropped — closes the DMA-BUF fd
+// and releases the source VAAPI surface back into the decoder's pool.
+//
+// Pipeline:
+//
+// 1. `prime_fd_to_buffer(fd)` imports the DMA-BUF into our DRM card's
+//    GEM-handle space. The returned `buffer::Handle` is a per-card
+//    name; closing it requires `gem_close` (drm-rs lacks a direct
+//    helper, so we delete the FB and let the kernel garbage-collect
+//    the GEM after the FB destruction unparks the last reference).
+// 2. `add_planar_framebuffer(&PrimeBuffer, FbCmd2Flags::MODIFIERS)`
+//    issues the `DRM_IOCTL_MODE_ADDFB2_WITH_MODIFIERS` ioctl. Failure
+//    here (typical: modifier is one the scanout plane doesn't
+//    advertise — Mesa's KMS plane format list excludes some Y-tiled
+//    layouts) lifts a hard error so `output_display` demotes to the
+//    CPU-blit path on the next frame.
+// 3. `page_flip(crtc, fb_id, EVENT, None)` queues the flip and the
+//    block-on-event loop in `present_prime` waits for
+//    `DRM_EVENT_FLIP_COMPLETE`. The keepalive is held on the stack
+//    across that wait so the source VA surface can't be recycled
+//    mid-scanout.
+// 4. After flip-complete: replace the previous-front FB with the new
+//    one in `prime_state` (and destroy the old FB so the kernel can
+//    drop the previous-frame GEM reference).
+
+/// Carries the bits of a `video_engine::vaapi::DrmPrimeFrame` that the
+/// KMS path actually consumes. Decoupled from `video-engine` types so
+/// the `display` module doesn't need to depend on `video-engine` for
+/// non-VAAPI builds.
+#[derive(Debug, Clone)]
+pub struct DrmPrimeDescriptor {
+    pub width: u32,
+    pub height: u32,
+    /// `DRM_FORMAT_*` fourcc (NV12 = 0x3231564E, P010 = 0x30313050, ...).
+    pub fourcc: u32,
+    /// `DRM_FORMAT_MOD_*` modifier. `0` (`DRM_FORMAT_MOD_LINEAR`) and
+    /// `(1 << 56) - 1` (`DRM_FORMAT_MOD_INVALID`) are both treated as
+    /// "no tiling info"; the importer drops the MODIFIERS flag in that
+    /// case so the kernel doesn't reject the FB on a plane that hasn't
+    /// advertised the modifier.
+    pub modifier: u64,
+    /// Per-plane DMA-BUF view. Currently every VAAPI mapping we've
+    /// observed uses a single shared DMA-BUF — every plane references
+    /// the same `fd` with different offsets — so we expect 1–3 entries
+    /// pointing at the same fd. Multi-fd mappings are rejected at the
+    /// `video-engine` boundary.
+    pub planes: Vec<DrmPrimePlaneDesc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DrmPrimePlaneDesc {
+    pub fd: i32,
+    pub offset: u32,
+    pub pitch: u32,
+}
+
+/// Type-erased keepalive on the source VAAPI surface (typically an
+/// `Arc<video_engine::vaapi::DrmPrimeKeepalive>`). KMS holds it across
+/// the page-flip wait — dropping it earlier hands the surface back to
+/// the VAAPI pool while the kernel is still scanning out from it,
+/// which on Mesa radeonsi reads as a green flash and on Intel iHD as
+/// garbage chroma. `Send + Sync` so the display task can move it
+/// freely between the decode and present halves.
+pub trait PrimeKeepalive: Send + Sync + 'static {}
+impl<T: Send + Sync + 'static + ?Sized> PrimeKeepalive for T {}
+
+/// `PlanarBuffer` adapter for `DrmModeAddFB2WithModifiers`. Wraps a set
+/// of pre-imported GEM `buffer::Handle`s alongside the format /
+/// modifier / size info `add_planar_framebuffer` needs. One per
+/// in-flight DRM PRIME fb — short-lived; created in `present_prime`,
+/// dropped after the FB is destroyed.
+struct PrimePlanarBuffer {
+    width: u32,
+    height: u32,
+    fourcc: DrmFourcc,
+    modifier: Option<DrmModifier>,
+    handles: [Option<drm::buffer::Handle>; 4],
+    pitches: [u32; 4],
+    offsets: [u32; 4],
+}
+
+impl PlanarBuffer for PrimePlanarBuffer {
+    fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+    fn format(&self) -> DrmFourcc {
+        self.fourcc
+    }
+    fn modifier(&self) -> Option<DrmModifier> {
+        self.modifier
+    }
+    fn pitches(&self) -> [u32; 4] {
+        self.pitches
+    }
+    fn handles(&self) -> [Option<drm::buffer::Handle>; 4] {
+        self.handles
+    }
+    fn offsets(&self) -> [u32; 4] {
+        self.offsets
+    }
+}
+
+/// State retained across `present_prime` calls — the previous frame's
+/// KMS framebuffer + its source-frame keepalive. Released only when the
+/// *next* page-flip completes (the kernel keeps the previous FB live
+/// until the new one has been fully scanned out at least once, and
+/// VAAPI surfaces stay valid across exactly that boundary).
+#[derive(Default)]
+struct PrimeState {
+    /// FB-id of the framebuffer the kernel is currently scanning out.
+    /// We never destroy the in-flight FB; instead we destroy the
+    /// **previous** FB after the new flip completes.
+    in_flight_fb: Option<framebuffer::Handle>,
+    /// Keepalive on the in-flight VAAPI surface.
+    in_flight_keepalive: Option<Arc<dyn PrimeKeepalive>>,
+}
+
+/// `DRM_FORMAT_MOD_INVALID` — sentinel returned by VAAPI drivers when
+/// the surface has no defined tiling layout. drm-rs already filters
+/// this in `add_planar_framebuffer` but we double-up so we don't pass
+/// `FbCmd2Flags::MODIFIERS` for it (some KMS planes reject the flag
+/// when the modifier is INVALID).
+const DRM_FORMAT_MOD_INVALID: u64 = (1u64 << 56) - 1;
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+
+/// Outcome of an `atomic_commit` attempt. `Unsupported` triggers the
+/// permanent fallback to legacy `set_crtc` with a one-shot
+/// `display_atomic_unavailable` Warning. `Other` is a transient error
+/// the caller propagates as a normal display-path failure (the FB is
+/// torn down, the keepalive is held briefly, and the next frame
+/// retries the same atomic path).
+enum AtomicCommitError {
+    Unsupported(std::io::Error),
+    Other(String),
+}
+
+#[inline]
+fn libc_einval() -> i32 {
+    22
+}
+#[inline]
+fn libc_enosys() -> i32 {
+    38
+}
+#[inline]
+fn libc_eopnotsupp() -> i32 {
+    // Linux: 95 (EOPNOTSUPP == ENOTSUP). Same numeric value across
+    // every kernel-supported arch we run on.
+    95
+}
+
+#[inline]
+fn io_to_string(e: &std::io::Error) -> String {
+    format!("{e}")
+}
+
+impl KmsDisplay {
+    /// Zero-copy page-flip onto a VAAPI-decoded surface exported as a
+    /// DRM PRIME descriptor. Returns the previous-frame keepalive so
+    /// the caller can drop it after the *next* flip — the kernel
+    /// guarantees the previous scanout source stays referenced until
+    /// the new one has been promoted, but our DMA-BUF / VAAPI pool is
+    /// only safe to recycle after the kernel-side reference goes away.
+    ///
+    /// Returns `Err` when the FB-import path fails — caller demotes to
+    /// the CPU-blit path. Common failures:
+    ///
+    /// * `prime_fd_to_buffer` returns `EINVAL` — DMA-BUF was created
+    ///   on a driver our card can't import (rare on iGPU+iGPU; more
+    ///   common on iGPU+dGPU mixed setups).
+    /// * `add_planar_framebuffer` returns `EINVAL` — the requested
+    ///   modifier isn't in the scanout plane's format list. Some Intel
+    ///   gen12 4-tile modifiers fall here on older kernels.
+    /// * `page_flip` returns `EBUSY` — a previous flip hasn't drained
+    ///   yet (caller is over-driving the pipeline).
+    pub fn present_prime(
+        &mut self,
+        descriptor: &DrmPrimeDescriptor,
+        keepalive: Arc<dyn PrimeKeepalive>,
+    ) -> Result<Option<Arc<dyn PrimeKeepalive>>> {
+        if descriptor.planes.is_empty() {
+            anyhow::bail!("display_prime_invalid: descriptor has no planes");
+        }
+
+        let fourcc = DrmFourcc::try_from(descriptor.fourcc).map_err(|_| {
+            anyhow::anyhow!(
+                "display_prime_invalid: unknown fourcc 0x{:08x}",
+                descriptor.fourcc
+            )
+        })?;
+        let modifier_raw = descriptor.modifier;
+        let modifier = if modifier_raw == DRM_FORMAT_MOD_INVALID
+            || modifier_raw == DRM_FORMAT_MOD_LINEAR
+        {
+            None
+        } else {
+            Some(DrmModifier::from(modifier_raw))
+        };
+
+        // Import every distinct DMA-BUF fd into a per-card GEM handle.
+        // The VAAPI mapping packs every plane into one fd, but we
+        // dedup defensively in case a future driver returns a multi-fd
+        // descriptor (Intel iHD has been known to do this for P010
+        // when the chroma plane lives on a separate object).
+        let mut handles: [Option<drm::buffer::Handle>; 4] = [None; 4];
+        let mut pitches: [u32; 4] = [0; 4];
+        let mut offsets: [u32; 4] = [0; 4];
+
+        for (i, plane) in descriptor.planes.iter().enumerate() {
+            if i >= 4 {
+                anyhow::bail!(
+                    "display_prime_invalid: too many planes ({})",
+                    descriptor.planes.len()
+                );
+            }
+            // SAFETY: descriptor.planes[i].fd is owned by the
+            // `keepalive` Arc; the borrowed FD here lives only across
+            // this call to `prime_fd_to_buffer`, which dups the fd
+            // internally on the kernel side via the PRIME ioctl.
+            let borrowed = unsafe {
+                std::os::fd::BorrowedFd::borrow_raw(plane.fd)
+            };
+            let handle = self
+                .card
+                .prime_fd_to_buffer(borrowed)
+                .with_context(|| {
+                    format!(
+                        "display_prime_addfb_failed: prime_fd_to_buffer for plane {} (fd={})",
+                        i, plane.fd
+                    )
+                })?;
+            handles[i] = Some(handle);
+            pitches[i] = plane.pitch;
+            offsets[i] = plane.offset;
+        }
+
+        let buf = PrimePlanarBuffer {
+            width: descriptor.width,
+            height: descriptor.height,
+            fourcc,
+            modifier,
+            handles,
+            pitches,
+            offsets,
+        };
+
+        let flags = if modifier.is_some() {
+            FbCmd2Flags::MODIFIERS
+        } else {
+            FbCmd2Flags::empty()
+        };
+        let new_fb = self
+            .card
+            .add_planar_framebuffer(&buf, flags)
+            .context("display_prime_addfb_failed: add_planar_framebuffer")?;
+
+        // Promote the new prime FB onto the CRTC.
+        //
+        // Preferred path: `drmModeAtomicCommit` flips at vblank with
+        // `DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK`. Cross-
+        // modifier flips (linear XRGB8888 dumb buffer ↔ tiled NV12/P010,
+        // or one tiled VAAPI surface ↔ the next) are accepted at vblank
+        // with no full-plane reconfigure — microseconds, not the 10–
+        // 30 ms `set_crtc` budget that pinned 1080p sources at ~10 fps
+        // on a 60 Hz panel. The first commit on a fresh `KmsDisplay`
+        // (or after a legacy `set_crtc` modeset) carries
+        // `ALLOW_MODESET` plus the CRTC.ACTIVE / CRTC.MODE_ID /
+        // CONNECTOR.CRTC_ID writes; subsequent commits skip those — the
+        // kernel keeps the modeset state.
+        //
+        // Fallback path: legacy `set_crtc`. Used when:
+        //   - DRM atomic client cap was rejected at `KmsDisplay::open`,
+        //   - `discover_atomic_setup` couldn't find a primary plane
+        //     drivable from our CRTC,
+        //   - the very first `atomic_commit` returns EOPNOTSUPP (very
+        //     old kernel) or EINVAL (driver / plane combo refuses our
+        //     property set).
+        // The first failure flips `use_atomic = false` for the lifetime
+        // of this `KmsDisplay`. One `display_atomic_unavailable`
+        // Warning event is emitted by the caller via
+        // `take_atomic_fallback_reason()` so an operator sees why.
+        if self.use_atomic {
+            if self.atomic.is_none() {
+                match discover_atomic_setup(&self.card, self.crtc, self.connector) {
+                    Ok(setup) => self.atomic = Some(setup),
+                    Err(e) => {
+                        self.use_atomic = false;
+                        self.atomic_fallback_reason
+                            .get_or_insert_with(|| format!("atomic discovery failed: {e:#}"));
+                    }
+                }
+            }
+        }
+
+        if self.use_atomic && self.atomic.is_some() {
+            match self.atomic_present(new_fb, descriptor.width, descriptor.height) {
+                Ok(()) => {
+                    // Wait for the kernel-posted `DRM_EVENT_FLIP_COMPLETE`
+                    // for our CRTC so the next iteration can safely
+                    // destroy the previously-flipped FB. `receive_events`
+                    // blocks until events arrive — same loop the legacy
+                    // `present()` path uses.
+                    if let Err(e) = self.wait_page_flip() {
+                        let _ = self.card.destroy_framebuffer(new_fb);
+                        return Err(e.context("display_prime_page_flip_failed: receive_events"));
+                    }
+                }
+                Err(AtomicCommitError::Unsupported(e)) => {
+                    self.use_atomic = false;
+                    self.atomic_fallback_reason
+                        .get_or_insert_with(|| format!("atomic_commit unsupported: {e}"));
+                    if let Err(e2) = self.set_crtc_prime(new_fb) {
+                        let _ = self.card.destroy_framebuffer(new_fb);
+                        return Err(e2);
+                    }
+                }
+                Err(AtomicCommitError::Other(e)) => {
+                    let _ = self.card.destroy_framebuffer(new_fb);
+                    return Err(anyhow::anyhow!(
+                        "display_prime_page_flip_failed: atomic_commit: {e}"
+                    ));
+                }
+            }
+        } else {
+            if let Err(e) = self.set_crtc_prime(new_fb) {
+                let _ = self.card.destroy_framebuffer(new_fb);
+                return Err(e);
+            }
+        }
+
+        // The kernel has promoted `new_fb` to the active scanout
+        // source. The *previous* FB (whatever was active before this
+        // call) is now safe to destroy — the new flip has retired its
+        // reference. We return its keepalive to the caller; the caller
+        // drops it on a side task to keep the per-frame budget tight
+        // (`av_frame_free` can take ~1 ms on the first call after a
+        // session warmup).
+        let mut state = self.prime_state.take().unwrap_or_default();
+        let prev_keepalive = state.in_flight_keepalive.take();
+        if let Some(prev_fb) = state.in_flight_fb.take() {
+            let _ = self.card.destroy_framebuffer(prev_fb);
+        }
+        state.in_flight_fb = Some(new_fb);
+        state.in_flight_keepalive = Some(keepalive);
+        self.prime_state = Some(state);
+
+        Ok(prev_keepalive)
+    }
+
+    /// Build + submit the atomic-commit page flip onto the cached
+    /// primary plane. Sets the SRC rectangle in 16.16 fixed point (full
+    /// source) and the CRTC rectangle to the current panel size. On the
+    /// first commit (or first commit after a legacy modeset), allocates
+    /// a property blob for `self.mode` and adds the modeset triplet
+    /// (CRTC.ACTIVE / CRTC.MODE_ID / CONNECTOR.CRTC_ID) with
+    /// `ALLOW_MODESET`.
+    fn atomic_present(
+        &mut self,
+        new_fb: framebuffer::Handle,
+        src_w: u32,
+        src_h: u32,
+    ) -> std::result::Result<(), AtomicCommitError> {
+        // Copy out every Copy field we need from `self.atomic` up-
+        // front. This keeps the rest of the function free to take
+        // additional `&mut self.bars_overlay` / `&mut self.hdr_state`
+        // borrows without colliding with a long-lived `&mut self.atomic`.
+        let (plane, plane_props, crtc_props, connector_props, mode_blob_loaded, hdr_prop) = {
+            let setup = self
+                .atomic
+                .as_ref()
+                .expect("atomic_present called without AtomicSetup");
+            (
+                setup.plane,
+                PlanePropIds {
+                    fb_id: setup.plane_props.fb_id,
+                    crtc_id: setup.plane_props.crtc_id,
+                    src_x: setup.plane_props.src_x,
+                    src_y: setup.plane_props.src_y,
+                    src_w: setup.plane_props.src_w,
+                    src_h: setup.plane_props.src_h,
+                    crtc_x: setup.plane_props.crtc_x,
+                    crtc_y: setup.plane_props.crtc_y,
+                    crtc_w: setup.plane_props.crtc_w,
+                    crtc_h: setup.plane_props.crtc_h,
+                },
+                CrtcPropIds {
+                    mode_id: setup.crtc_props.mode_id,
+                    active: setup.crtc_props.active,
+                },
+                ConnectorPropIds {
+                    crtc_id: setup.connector_props.crtc_id,
+                    hdr_output_metadata: setup.connector_props.hdr_output_metadata,
+                },
+                setup.mode_blob_id,
+                setup.connector_props.hdr_output_metadata,
+            )
+        };
+        let pp = &plane_props;
+        let mut req = AtomicModeReq::new();
+        req.add_property(plane, pp.fb_id, property::Value::Framebuffer(Some(new_fb)));
+        req.add_property(plane, pp.crtc_id, property::Value::CRTC(Some(self.crtc)));
+        // SRC rectangle: full source surface in 16.16 fixed-point.
+        req.add_property(plane, pp.src_x, property::Value::UnsignedRange(0));
+        req.add_property(plane, pp.src_y, property::Value::UnsignedRange(0));
+        req.add_property(
+            plane,
+            pp.src_w,
+            property::Value::UnsignedRange((src_w as u64) << 16),
+        );
+        req.add_property(
+            plane,
+            pp.src_h,
+            property::Value::UnsignedRange((src_h as u64) << 16),
+        );
+        // CRTC rectangle: full destination panel.
+        req.add_property(plane, pp.crtc_x, property::Value::SignedRange(0));
+        req.add_property(plane, pp.crtc_y, property::Value::SignedRange(0));
+        req.add_property(
+            plane,
+            pp.crtc_w,
+            property::Value::UnsignedRange(self.width as u64),
+        );
+        req.add_property(
+            plane,
+            pp.crtc_h,
+            property::Value::UnsignedRange(self.height as u64),
+        );
+        let _ = connector_props; // suppress unused warning; kept for symmetry with the other prop tables
+        let _ = mode_blob_loaded;
+
+        let mut flags = AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK;
+
+        // HDR_OUTPUT_METADATA: write the connector's HDR signalling
+        // blob when the source has transitioned in/out of HDR or
+        // changed EOTF. The first commit carrying a metadata change
+        // also takes ALLOW_MODESET because the HDMI / DP sink
+        // re-trains on EOTF change.
+        if self.hdr_dirty {
+            if let Some(hdr_prop_id) = hdr_prop {
+                let blob_id = self.hdr_state.as_ref().map(|s| s.blob_id).unwrap_or(0);
+                req.add_property(self.connector, hdr_prop_id, property::Value::Blob(blob_id));
+                flags |= AtomicCommitFlags::ALLOW_MODESET;
+            }
+        }
+
+        // Audio-bars overlay plane composition. Same atomic commit, no
+        // second flip event — the kernel posts one PageFlip event for
+        // the whole batch. The strip lives at the bottom of the panel.
+        // SRC rectangle covers the full overlay buffer (= panel width
+        // × strip_h); CRTC rectangle places it `panel_h - strip_h`
+        // pixels down the panel.
+        if let Some(bars) = self.bars_overlay.as_mut() {
+            let bp = &bars.plane_props;
+            req.add_property(
+                bars.plane,
+                bp.fb_id,
+                property::Value::Framebuffer(Some(bars.dumb.fb)),
+            );
+            req.add_property(bars.plane, bp.crtc_id, property::Value::CRTC(Some(self.crtc)));
+            req.add_property(bars.plane, bp.src_x, property::Value::UnsignedRange(0));
+            req.add_property(bars.plane, bp.src_y, property::Value::UnsignedRange(0));
+            req.add_property(
+                bars.plane,
+                bp.src_w,
+                property::Value::UnsignedRange((bars.width as u64) << 16),
+            );
+            req.add_property(
+                bars.plane,
+                bp.src_h,
+                property::Value::UnsignedRange((bars.height as u64) << 16),
+            );
+            req.add_property(bars.plane, bp.crtc_x, property::Value::SignedRange(0));
+            let strip_top = self.height.saturating_sub(bars.height) as i64;
+            req.add_property(
+                bars.plane,
+                bp.crtc_y,
+                property::Value::SignedRange(strip_top),
+            );
+            req.add_property(
+                bars.plane,
+                bp.crtc_w,
+                property::Value::UnsignedRange(bars.width as u64),
+            );
+            req.add_property(
+                bars.plane,
+                bp.crtc_h,
+                property::Value::UnsignedRange(bars.height as u64),
+            );
+        }
+
+        if !self.atomic_modeset_done {
+            // First commit (or first after a legacy modeset): re-arm
+            // the modeset triplet and ask the kernel for permission to
+            // do a modeset under this commit.
+            let blob_id = match mode_blob_loaded {
+                Some(id) => id,
+                None => {
+                    let blob = self
+                        .card
+                        .create_property_blob(&self.mode)
+                        .map_err(|e| AtomicCommitError::Other(io_to_string(&e)))?;
+                    let id = match blob {
+                        property::Value::Blob(id) => id,
+                        _ => {
+                            return Err(AtomicCommitError::Other(
+                                "create_property_blob returned non-Blob value".into(),
+                            ))
+                        }
+                    };
+                    if let Some(setup) = self.atomic.as_mut() {
+                        setup.mode_blob_id = Some(id);
+                    }
+                    id
+                }
+            };
+            req.add_property(self.crtc, crtc_props.active, property::Value::Boolean(true));
+            req.add_property(self.crtc, crtc_props.mode_id, property::Value::Blob(blob_id));
+            req.add_property(
+                self.connector,
+                connector_props.crtc_id,
+                property::Value::CRTC(Some(self.crtc)),
+            );
+            flags |= AtomicCommitFlags::ALLOW_MODESET;
+        }
+
+        match self.card.atomic_commit(flags, req) {
+            Ok(()) => {
+                self.atomic_modeset_done = true;
+                self.hdr_dirty = false;
+                if let Some(bars) = self.bars_overlay.as_mut() {
+                    bars.committed = true;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                use std::io::ErrorKind;
+                let raw = e.raw_os_error();
+                let unsupported = matches!(e.kind(), ErrorKind::Unsupported)
+                    || raw == Some(libc_eopnotsupp())
+                    || raw == Some(libc_enosys())
+                    // First-commit EINVAL: driver / plane combo refuses
+                    // our property set. The plain set_crtc path may
+                    // still work (different ioctl).
+                    || (!self.atomic_modeset_done && raw == Some(libc_einval()));
+                if unsupported {
+                    Err(AtomicCommitError::Unsupported(e))
+                } else {
+                    Err(AtomicCommitError::Other(io_to_string(&e)))
+                }
+            }
+        }
+    }
+
+    fn set_crtc_prime(&mut self, new_fb: framebuffer::Handle) -> Result<()> {
+        self.card
+            .set_crtc(
+                self.crtc,
+                Some(new_fb),
+                (0, 0),
+                &[self.connector],
+                Some(self.mode),
+            )
+            .map_err(|e| anyhow::Error::new(e).context("display_prime_page_flip_failed: set_crtc"))
+    }
+
+    fn wait_page_flip(&self) -> Result<()> {
+        loop {
+            let events = self
+                .card
+                .receive_events()
+                .context("display_page_flip_failed: receive_events")?;
+            for ev in events {
+                if let Event::PageFlip(p) = ev {
+                    if p.crtc == self.crtc {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Flush any retained PRIME state — destroy the in-flight FB and
+    /// drop the keepalive. Idempotent: returns immediately when no
+    /// PRIME state is held, so the CPU-blit path can call this once
+    /// per frame without paying for a re-modeset every vblank.
+    ///
+    /// Used on the runtime-demotion path: when sustained PRIME export
+    /// failures push `output_display` from `vaapi-zerocopy` back to
+    /// the CPU blit, the next blit calls this before writing the
+    /// dumb-buffer fb so the scanout source is well-defined when
+    /// `present()` flips onto the dumb-buffer.
+    pub fn release_prime_state(&mut self) {
+        let Some(mut state) = self.prime_state.take() else {
+            return;
+        };
+        if state.in_flight_fb.is_none() && state.in_flight_keepalive.is_none() {
+            // Nothing to do — the slot was empty.
+            return;
+        }
+        if let Some(fb) = state.in_flight_fb.take() {
+            let _ = self.card.destroy_framebuffer(fb);
+        }
+        state.in_flight_keepalive = None;
+        // Re-arm the CRTC against the current dumb-buffer fb so the
+        // scanout source is well-defined again. Best-effort: failure
+        // here means the next `present()` will re-modeset anyway.
+        let _ = self.card.set_crtc(
+            self.crtc,
+            Some(self.bufs[self.front_idx].fb),
+            (0, 0),
+            &[self.connector],
+            Some(self.mode),
+        );
+    }
 }
 

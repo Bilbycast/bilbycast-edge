@@ -633,6 +633,20 @@ fn parse_pmt_streams(pkt: &[u8], program: &mut ProgramState) {
                     header_detected: true,
                 });
             }
+            // Some non-DVB ATSC 3.0 muxers stamp AC-4 directly at
+            // stream_type 0xAC instead of `0x06 + AC-4 descriptor`.
+            // Surface that flavour here too (passthrough — no decoder).
+            0xAC => {
+                program.audio_streams.push(AudioStreamState {
+                    pid: es_pid,
+                    codec: "AC-4".to_string(),
+                    stream_type,
+                    sample_rate_hz: Some(48000),
+                    channels: None,
+                    language,
+                    header_detected: true,
+                });
+            }
             0x06 => {
                 // Private data — check descriptors for AC-3/E-AC-3
                 let codec = detect_private_stream_codec(&pkt[desc_start..desc_end]);
@@ -722,6 +736,7 @@ fn detect_private_stream_codec(descriptors: &[u8]) -> Option<String> {
             0x7A => return Some("E-AC-3".to_string()),     // Enhanced AC-3 descriptor
             0x7B => return Some("DTS".to_string()),        // DTS descriptor
             0x7C => return Some("AAC".to_string()),        // AAC descriptor
+            0xAC => return Some("AC-4".to_string()),       // Dolby AC-4 descriptor
             0x05 => {
                 // Registration descriptor — check format_identifier
                 if len >= 4 {
@@ -729,6 +744,7 @@ fn detect_private_stream_codec(descriptors: &[u8]) -> Option<String> {
                     match id {
                         b"AC-3" => return Some("AC-3".to_string()),
                         b"EAC3" => return Some("E-AC-3".to_string()),
+                        b"AC-4" => return Some("AC-4".to_string()),
                         b"Opus" => return Some("Opus".to_string()),
                         _ => {}
                     }

@@ -404,6 +404,10 @@ fn build_synth(
         target_bitrate_kbps: bitrate_kbps,
         target_sample_rate: target_sr,
         target_channels: target_ch,
+        opus_vbr_mode: ae.opus_vbr_mode.clone(),
+        opus_fec: ae.opus_fec,
+        opus_dtx: ae.opus_dtx,
+        opus_frame_duration_ms: ae.opus_frame_duration_ms,
     };
 
     let cancel = CancellationToken::new();
@@ -549,6 +553,10 @@ mod tests {
             sample_rate: None,
             channels: None,
             silent_fallback: false,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
         };
         let err = match PcmInputProcessor::new(48_000, 24, 2, Some(&tj), Some(&ae), 0, 0, 0) {
             Err(e) => e,
@@ -568,6 +576,10 @@ mod tests {
             sample_rate: None,
             channels: None,
             silent_fallback: false,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
         };
         let err = match PcmInputProcessor::new(48_000, 24, 2, None, Some(&ae), 0, 0, 0) {
             Err(e) => e,
@@ -587,6 +599,10 @@ mod tests {
             sample_rate: None,
             channels: None,
             silent_fallback: false,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
         };
         let p = PcmInputProcessor::new(48_000, 24, 2, None, Some(&ae), 0, 0, 0)
             .expect("construct")
@@ -602,6 +618,10 @@ mod tests {
             sample_rate: Some(44_100),
             channels: None,
             silent_fallback: false,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
         };
         let err = match PcmInputProcessor::new(48_000, 24, 2, None, Some(&ae), 0, 0, 0) {
             Err(e) => e,

@@ -137,6 +137,7 @@ async fn run_inner(
         color_transfer: None,
         color_matrix: None,
         color_range: None,
+        hw_decode: None,
     };
 
     let mut encoder = ScaledVideoEncoder::new(

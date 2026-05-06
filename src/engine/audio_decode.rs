@@ -272,9 +272,14 @@ pub fn ff_codec_for_stream_type(stream_type: u8) -> Option<video_codec::AudioDec
 /// the "scan to next sync word" splitter — libavcodec's AC-3 decoder is
 /// tolerant of the trailing-byte ambiguity.
 ///
-/// **Opus** is unreachable from MPEG-TS PES carriage today (it has its own
-/// `control_header_prefix` framing handled by the demuxer's Opus path);
-/// the match arm is present so the codec enum stays exhaustive.
+/// **Opus** carriage in MPEG-TS prepends each Opus access unit with a
+/// `control_header_prefix` (0x3FF) + flag-gated optional fields + an
+/// extensible `au_size` byte count for the raw Opus packet that follows.
+/// `split_opus_frames` strips the wrapper and yields raw Opus packets the
+/// libavcodec Opus decoder consumes directly. Wired here so any output
+/// with `audio_encode` set on an Opus-in-TS source path can decode →
+/// re-encode end-to-end (previously this returned `Vec::new()` and the
+/// audio silently disappeared).
 #[cfg(feature = "video-thumbnail")]
 pub fn split_audio_codec_frames(
     buf: &[u8],
@@ -287,7 +292,7 @@ pub fn split_audio_codec_frames(
     match codec {
         AudioDecoderCodec::Mp2 => split_mp2_frames(buf),
         AudioDecoderCodec::Ac3 | AudioDecoderCodec::Eac3 => split_ac3_frames(buf),
-        AudioDecoderCodec::Opus => Vec::new(),
+        AudioDecoderCodec::Opus => split_opus_frames(buf),
         AudioDecoderCodec::AacLatm => split_loas_frames(buf),
     }
 }

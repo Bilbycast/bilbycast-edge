@@ -993,6 +993,8 @@ fn resolve_backend(
         "hevc_nvenc" => Some(video_codec::VideoEncoderCodec::HevcNvenc),
         "h264_qsv" => Some(video_codec::VideoEncoderCodec::H264Qsv),
         "hevc_qsv" => Some(video_codec::VideoEncoderCodec::HevcQsv),
+        "h264_vaapi" => Some(video_codec::VideoEncoderCodec::H264Vaapi),
+        "hevc_vaapi" => Some(video_codec::VideoEncoderCodec::HevcVaapi),
         other => {
             let msg = format!(
                 "RTMP output '{}': video_encode unknown codec '{other}'",
@@ -1009,6 +1011,55 @@ fn resolve_backend(
             None
         }
     }
+}
+
+/// Resolve a `video_encode` block's codec backend, honouring `*_auto` and
+/// surfacing host-mismatch errors before the encoder is opened. Falls
+/// back to the legacy string parser when no probed-caps snapshot is
+/// installed (in-process tests + early-startup paths).
+#[cfg(feature = "video-thumbnail")]
+fn resolve_backend_for_config(
+    cfg: &VideoEncodeConfig,
+    output_id: &str,
+    event_sender: &EventSender,
+) -> Option<video_codec::VideoEncoderCodec> {
+    if crate::engine::hardware_probe::static_capabilities().is_some() {
+        match crate::engine::hardware_probe::resolve_for_video_encode_config(cfg) {
+            Ok(r) => {
+                if cfg.codec.ends_with("_auto") || cfg.codec == "auto" {
+                    tracing::info!(
+                        "RTMP output '{}': video_encode auto-resolved '{}' → {}",
+                        output_id,
+                        cfg.codec,
+                        r.ffmpeg_name(),
+                    );
+                }
+                return Some(r.as_video_encoder_codec());
+            }
+            Err(e) => {
+                let msg = format!(
+                    "RTMP output '{}': video_encode unavailable: {}",
+                    output_id,
+                    e.message(),
+                );
+                tracing::error!("{msg}");
+                event_sender.emit_output_with_details(
+                    EventSeverity::Critical,
+                    category::VIDEO_ENCODE,
+                    msg,
+                    output_id,
+                    serde_json::json!({
+                        "codec": cfg.codec,
+                        "chroma": cfg.chroma.clone().unwrap_or_else(|| "yuv420p".to_string()),
+                        "bit_depth": cfg.bit_depth.unwrap_or(8),
+                        "reason": e.as_reason(),
+                    }),
+                );
+                return None;
+            }
+        }
+    }
+    resolve_backend(&cfg.codec, output_id, event_sender)
 }
 
 /// Core per-frame handler: dispatches passthrough vs transcode, sends the
@@ -1251,7 +1302,7 @@ fn open_video_active(
     stats: &Arc<OutputStatsAccumulator>,
     event_sender: &EventSender,
 ) -> VideoEncoderState {
-    let Some(backend) = resolve_backend(&cfg.codec, &config.id, event_sender) else {
+    let Some(backend) = resolve_backend_for_config(cfg, &config.id, event_sender) else {
         return VideoEncoderState::Failed;
     };
     let source_codec = if source_is_h264 {
@@ -1712,6 +1763,10 @@ fn build_encoder_state(
         target_bitrate_kbps: target_br,
         target_sample_rate: target_sr,
         target_channels: target_ch,
+        opus_vbr_mode: enc_cfg.opus_vbr_mode.clone(),
+        opus_fec: enc_cfg.opus_fec,
+        opus_dtx: enc_cfg.opus_dtx,
+        opus_frame_duration_ms: enc_cfg.opus_frame_duration_ms,
     };
 
     let decoder = match AacDecoder::from_adts_config(profile, sr_idx, ch_cfg) {
@@ -1913,6 +1968,10 @@ fn build_encoder_state_eager_for_silent_fallback(
         target_bitrate_kbps: target_br,
         target_sample_rate: target_sr,
         target_channels: target_ch,
+        opus_vbr_mode: enc_cfg.opus_vbr_mode.clone(),
+        opus_fec: enc_cfg.opus_fec,
+        opus_dtx: enc_cfg.opus_dtx,
+        opus_frame_duration_ms: enc_cfg.opus_frame_duration_ms,
     };
 
     let encoder = match AudioEncoder::spawn(

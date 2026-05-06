@@ -54,6 +54,114 @@ pub struct MediaFileInfo {
     pub modified_unix: u64,
 }
 
+/// Maximum bytes read from the head of a media file when scanning for
+/// programs. 512 KiB covers ≥ one full PSI cycle on every common mux rate
+/// up to ~50 Mbps and keeps the WS round-trip under a few ms on typical
+/// disk hardware.
+pub const SCAN_PROBE_BYTES: usize = 512 * 1024;
+
+/// One program inside a media-library MPEG-TS file. Surfaced to the
+/// manager UI so the operator can pick from a real list rather than
+/// guessing program numbers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaProgramInfo {
+    /// Program number from the PAT. Always `> 0` for real programs (0 is
+    /// the NIT, which we filter out).
+    pub program_number: u16,
+    /// PMT PID for this program. Useful diagnostic; the UI displays it
+    /// alongside the program number.
+    pub pmt_pid: u16,
+}
+
+/// Result of [`MediaLibrary::scan_programs`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaScanResult {
+    /// `true` if the probe window contained a PAT (i.e. the file looks
+    /// like MPEG-TS). MP4 / MOV / images and corrupted TS files come
+    /// back `false`.
+    pub is_ts: bool,
+    /// Programs found in the PAT, sorted by program number ascending.
+    /// May be empty (with `is_ts: true`) for TS files whose PAT carries
+    /// only NIT entries — pathological but possible.
+    pub programs: Vec<MediaProgramInfo>,
+    /// `true` if the file does not exist in the library. The manager UI
+    /// handles this gracefully (rather than the WS round-trip 500-ing on
+    /// a stale picker selection).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub not_found: bool,
+}
+
+#[inline]
+fn is_false(b: &bool) -> bool { !*b }
+
+/// Walk a TS-shaped byte buffer and return the first PAT's program
+/// list. Pure function for unit-testability — the async wrapper just
+/// reads the first chunk of bytes and hands them in.
+pub fn scan_programs_in_buf(buf: &[u8]) -> MediaScanResult {
+    use crate::engine::ts_parse::{TS_PACKET_SIZE, TS_SYNC_BYTE, parse_pat_programs, ts_pid, ts_pusi};
+
+    // Resync to a sync byte first — a file written by ffmpeg with a
+    // leading ID3 tag, for example, would otherwise look non-TS.
+    let mut start = 0usize;
+    let mut found_sync = false;
+    while start + TS_PACKET_SIZE <= buf.len() {
+        if buf[start] == TS_SYNC_BYTE {
+            // Confirm by checking the next packet's sync byte too.
+            if start + 2 * TS_PACKET_SIZE > buf.len()
+                || buf[start + TS_PACKET_SIZE] == TS_SYNC_BYTE
+            {
+                found_sync = true;
+                break;
+            }
+        }
+        start += 1;
+    }
+    if !found_sync {
+        return MediaScanResult {
+            is_ts: false,
+            programs: Vec::new(),
+            not_found: false,
+        };
+    }
+
+    let mut offset = start;
+    while offset + TS_PACKET_SIZE <= buf.len() {
+        let pkt = &buf[offset..offset + TS_PACKET_SIZE];
+        offset += TS_PACKET_SIZE;
+        if pkt[0] != TS_SYNC_BYTE {
+            continue;
+        }
+        if ts_pid(pkt) != 0 {
+            continue;
+        }
+        if !ts_pusi(pkt) {
+            continue;
+        }
+        let entries = parse_pat_programs(pkt);
+        // PAT entries with program_number == 0 are the NIT — drop them
+        // so the operator only sees real programs.
+        let mut programs: Vec<MediaProgramInfo> = entries
+            .into_iter()
+            .filter(|(num, _)| *num != 0)
+            .map(|(num, pid)| MediaProgramInfo {
+                program_number: num,
+                pmt_pid: pid,
+            })
+            .collect();
+        programs.sort_by_key(|p| p.program_number);
+        return MediaScanResult {
+            is_ts: true,
+            programs,
+            not_found: false,
+        };
+    }
+    MediaScanResult {
+        is_ts: true,
+        programs: Vec::new(),
+        not_found: false,
+    }
+}
+
 /// Resolve the configured media directory. Mirrors
 /// [`crate::engine::input_media_player::media_dir`] but lives here too so
 /// the upload / list / delete API layer doesn't depend on the engine
@@ -168,6 +276,44 @@ impl MediaLibrary {
     pub async fn total_bytes() -> Result<u64> {
         let files = Self::list().await?;
         Ok(files.iter().map(|f| f.size_bytes).sum())
+    }
+
+    /// Probe an MPEG-TS file's PAT and return its programs.
+    ///
+    /// Reads up to [`SCAN_PROBE_BYTES`] from the head of the file (enough for
+    /// any well-formed mux to land its first PAT — typical PSI cadence is
+    /// every 100 ms; 512 KiB at 50 Mbps is ~80 ms of stream so we cover one
+    /// full PSI cycle even on dense-program multiplexes). Files that don't
+    /// look like MPEG-TS (no sync byte, or no PAT in the probe window) come
+    /// back as `is_ts: false` with an empty program list — the manager UI
+    /// uses that to hide the program-picker for non-TS sources (MP4 etc).
+    ///
+    /// Single-program files also come back as `is_ts: true` with a one-entry
+    /// list; the UI can still offer "All programs" (the whole-file passthrough)
+    /// or the single program (which down-selects identically when the file
+    /// has only one).
+    pub async fn scan_programs(name: &str) -> Result<MediaScanResult> {
+        crate::config::validation::validate_media_filename(name, "scan_media")?;
+        let path = media_dir().join(name);
+        let mut file = match tokio::fs::File::open(&path).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(MediaScanResult {
+                    is_ts: false,
+                    programs: Vec::new(),
+                    not_found: true,
+                });
+            }
+            Err(e) => return Err(anyhow!("open {}: {e}", path.display())),
+        };
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; SCAN_PROBE_BYTES];
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| anyhow!("read {}: {e}", path.display()))?;
+        buf.truncate(n);
+        Ok(scan_programs_in_buf(&buf))
     }
 
     /// Hard-delete a file. Filename validation is the caller's responsibility
@@ -432,5 +578,110 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         assert!(json.contains("\"status\":\"complete\""));
         assert!(json.contains("\"bytes_received\":4096"));
+    }
+
+    /// Build a minimal PAT TS packet for the given (program_number, pmt_pid)
+    /// pairs. CRC is left as the buffer fill (`parse_pat_programs` does not
+    /// validate the CRC, so we don't need a valid one here).
+    fn build_pat_packet(programs: &[(u16, u16)]) -> [u8; 188] {
+        let mut pkt = [0xFFu8; 188];
+        pkt[0] = 0x47;
+        pkt[1] = 0x40; // PUSI=1, PID high = 0
+        pkt[2] = 0x00; // PID low = 0 (PAT)
+        pkt[3] = 0x10; // adaptation_field_control=01, CC=0
+        pkt[4] = 0x00; // pointer_field
+        let section_start = 5;
+        pkt[section_start] = 0x00; // table_id
+        let n = programs.len();
+        // section_length covers everything after itself: 5 header bytes
+        // (ts_id, version/cni, section_number, last_section_number) +
+        // 4 × N program entries + 4 bytes CRC.
+        let section_length = 5 + 4 * n + 4;
+        let section_length_bytes = (section_length as u16) | 0xB000; // syntax=1, '0'=0, reserved=11
+        pkt[section_start + 1] = (section_length_bytes >> 8) as u8;
+        pkt[section_start + 2] = section_length_bytes as u8;
+        // transport_stream_id
+        pkt[section_start + 3] = 0x00;
+        pkt[section_start + 4] = 0x01;
+        // reserved/version/current
+        pkt[section_start + 5] = 0xC1;
+        // section_number / last_section_number
+        pkt[section_start + 6] = 0x00;
+        pkt[section_start + 7] = 0x00;
+        // program loop
+        let mut off = section_start + 8;
+        for (num, pid) in programs {
+            pkt[off] = (num >> 8) as u8;
+            pkt[off + 1] = (*num & 0xFF) as u8;
+            pkt[off + 2] = 0xE0 | ((pid >> 8) & 0x1F) as u8;
+            pkt[off + 3] = (*pid & 0xFF) as u8;
+            off += 4;
+        }
+        // CRC bytes (4) — left as 0xFF buffer fill; not validated.
+        pkt
+    }
+
+    #[test]
+    fn scan_in_buf_handles_non_ts_bytes() {
+        let buf = vec![0x00; 4096];
+        let res = scan_programs_in_buf(&buf);
+        assert!(!res.is_ts);
+        assert!(res.programs.is_empty());
+        assert!(!res.not_found);
+    }
+
+    #[test]
+    fn scan_in_buf_finds_spts_program() {
+        let pat = build_pat_packet(&[(101, 0x1000)]);
+        // Pad with another sync byte at +188 so the resync confirmation passes.
+        let mut buf = Vec::with_capacity(188 * 4);
+        buf.extend_from_slice(&pat);
+        // A null packet (PID 0x1FFF) so the second sync byte is at +188.
+        let mut null = [0xFFu8; 188];
+        null[0] = 0x47;
+        null[1] = 0x1F;
+        null[2] = 0xFF;
+        null[3] = 0x10;
+        buf.extend_from_slice(&null);
+        let res = scan_programs_in_buf(&buf);
+        assert!(res.is_ts);
+        assert_eq!(res.programs.len(), 1);
+        assert_eq!(res.programs[0].program_number, 101);
+        assert_eq!(res.programs[0].pmt_pid, 0x1000);
+    }
+
+    #[test]
+    fn scan_in_buf_finds_mpts_programs_sorted_no_nit() {
+        // Program 0 is the NIT — must be filtered out.
+        let pat = build_pat_packet(&[(0, 0x10), (303, 0x1300), (101, 0x1100), (202, 0x1200)]);
+        let mut buf = Vec::with_capacity(188 * 4);
+        buf.extend_from_slice(&pat);
+        let mut null = [0xFFu8; 188];
+        null[0] = 0x47;
+        null[1] = 0x1F;
+        null[2] = 0xFF;
+        null[3] = 0x10;
+        buf.extend_from_slice(&null);
+        let res = scan_programs_in_buf(&buf);
+        assert!(res.is_ts);
+        let nums: Vec<u16> = res.programs.iter().map(|p| p.program_number).collect();
+        assert_eq!(nums, vec![101, 202, 303]);
+    }
+
+    #[test]
+    fn scan_in_buf_resyncs_past_leading_garbage() {
+        let pat = build_pat_packet(&[(42, 0x1042)]);
+        let mut buf = vec![0xCCu8; 137]; // arbitrary non-0x47 prefix
+        buf.extend_from_slice(&pat);
+        let mut null = [0xFFu8; 188];
+        null[0] = 0x47;
+        null[1] = 0x1F;
+        null[2] = 0xFF;
+        null[3] = 0x10;
+        buf.extend_from_slice(&null);
+        let res = scan_programs_in_buf(&buf);
+        assert!(res.is_ts);
+        assert_eq!(res.programs.len(), 1);
+        assert_eq!(res.programs[0].program_number, 42);
     }
 }

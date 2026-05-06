@@ -65,6 +65,13 @@ const MDI_NDF_ALARM_MS: f32 = 50.0;
 /// so a single flapping caption source can't flood the manager.
 const EVENT_RATELIMIT: Duration = Duration::from_secs(30);
 
+/// Minimum interval between two `content_analysis_mdi_above_threshold`
+/// events. MDI runs every tick over a 1 s window, so a sustained jittery
+/// network would otherwise emit one event per `EVENT_RATELIMIT` and flood
+/// the events list. The live NDF/MLR is already on the stats stream — the
+/// event is just a sustained-condition alarm, so 5 min is plenty.
+const MDI_EVENT_RATELIMIT: Duration = Duration::from_secs(300);
+
 // ── Public API ─────────────────────────────────────────────────────────────
 
 /// Spawn the Lite (compressed-domain) content-analysis task.
@@ -443,7 +450,7 @@ impl LiteState {
         if ndf > MDI_NDF_ALARM_MS {
             let fire = self
                 .last_mdi_event_at
-                .map_or(true, |t| t.elapsed() >= EVENT_RATELIMIT);
+                .map_or(true, |t| t.elapsed() >= MDI_EVENT_RATELIMIT);
             if fire {
                 events.send(crate::manager::events::Event {
                     severity: EventSeverity::Warning,

@@ -1014,6 +1014,10 @@ mod tests {
             sample_rate: None,
             channels: None,
             silent_fallback: false,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
         }
     }
 

@@ -46,6 +46,77 @@ jobs:
             echo "should_release=true" >> "$GITHUB_OUTPUT"
           fi
 
+  # Apple Silicon compile-check — validates that the codebase still
+  # builds cleanly on `aarch64-apple-darwin` so dev-box compatibility
+  # doesn't silently drift. Does NOT produce a release artefact (the
+  # full notarisation / signing / .dmg packaging path is a planned
+  # follow-up). Runs in parallel with the Linux release matrix.
+  apple-silicon-check:
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: macos-14
+    steps:
+      - name: Checkout bilbycast-libsrt-rs (path dependency)
+        uses: actions/checkout@v5
+        with:
+          repository: Bilbycast/bilbycast-libsrt-rs
+          path: bilbycast-libsrt-rs
+          submodules: recursive
+      - name: Checkout bilbycast-fdk-aac-rs (path dependency)
+        uses: actions/checkout@v5
+        with:
+          repository: Bilbycast/bilbycast-fdk-aac-rs
+          path: bilbycast-fdk-aac-rs
+          submodules: recursive
+      - name: Checkout bilbycast-ffmpeg-video-rs (path dependency)
+        uses: actions/checkout@v5
+        with:
+          repository: Bilbycast/bilbycast-ffmpeg-video-rs
+          path: bilbycast-ffmpeg-video-rs
+          submodules: recursive
+          fetch-depth: 0
+      - name: Checkout bilbycast-rist (path dependency)
+        uses: actions/checkout@v5
+        with:
+          repository: Bilbycast/bilbycast-rist
+          path: bilbycast-rist
+          submodules: recursive
+      - name: Checkout bilbycast-bonding (path dependency)
+        uses: actions/checkout@v5
+        with:
+          repository: Bilbycast/bilbycast-bonding
+          path: bilbycast-bonding
+      - name: Checkout bilbycast-edge
+        uses: actions/checkout@v5
+        with:
+          path: bilbycast-edge
+      - name: Install build dependencies (Homebrew)
+        run: |
+          # cmake / nasm for the vendored libopus + FFmpeg builds.
+          # Xcode CLT ships clang + make. No GPL deps installed here —
+          # the AGPL-only feature set covers the Apple Silicon
+          # compile-check. The `display` Cargo feature is Linux-only
+          # (drm-rs / alsa) and is excluded.
+          brew install cmake nasm pkg-config
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bilbycast-edge
+      - name: cargo check (AGPL feature set, no display, no GPL encoders)
+        working-directory: bilbycast-edge
+        run: |
+          # No `display` (Linux-only KMS / ALSA), no GPL encoders. The
+          # `video-thumbnail` feature gives us libavcodec + libopus +
+          # MP2 / AC-3 / E-AC-3 + VideoToolbox probe, which is enough
+          # to confirm the codebase compiles on Apple Silicon.
+          cargo check --no-default-features \
+            --features tls,fdk-aac,video-thumbnail,replay,webrtc \
+            --target aarch64-apple-darwin
+
   build:
     needs: check-version
     if: needs.check-version.outputs.should_release == 'true'

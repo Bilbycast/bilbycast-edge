@@ -384,7 +384,7 @@ fn source_kind_str(source: &MediaPlayerSource) -> &'static str {
 
 fn source_name_str(source: &MediaPlayerSource) -> &str {
     match source {
-        MediaPlayerSource::Ts { name } => name,
+        MediaPlayerSource::Ts { name, .. } => name,
         MediaPlayerSource::Mp4 { name } => name,
         MediaPlayerSource::Image { name, .. } => name,
     }
@@ -401,9 +401,9 @@ async fn play_source(
     session.cont.open_file(&source_id);
 
     match source {
-        MediaPlayerSource::Ts { name } => {
+        MediaPlayerSource::Ts { name, program_number } => {
             let path = resolve_media_path(name)?;
-            play_ts_file(&path, cfg.paced_bitrate_bps, session).await
+            play_ts_file(&path, cfg.paced_bitrate_bps, *program_number, session).await
         }
         MediaPlayerSource::Mp4 { name } => {
             let path = resolve_media_path(name)?;
@@ -427,9 +427,18 @@ async fn play_source(
 /// file has no PCR-bearing packets in the first second of reading, falls
 /// back to `paced_bitrate_bps` (or [`DEFAULT_FALLBACK_BITRATE_BPS`] when
 /// the operator left that unset).
+///
+/// When `program_number` is `Some(n)`, every packet is run through a
+/// [`TsProgramFilter`] before the per-packet rewriters and pacing — only
+/// the target program's PAT (rewritten to single-program form), PMT, PCR,
+/// and ES PIDs reach the bundle. Other-program packets are dropped before
+/// pacing so the wire pace tracks the target program's PCR cadence rather
+/// than the cross-program average. When `None`, the file passes through
+/// unchanged (full MPTS or SPTS, identical to legacy behaviour).
 async fn play_ts_file(
     path: &Path,
     paced_bitrate_bps: Option<u64>,
+    program_number: Option<u16>,
     session: &mut PlayerSession<'_>,
 ) -> Result<()> {
     let file = tokio::fs::File::open(path)
@@ -443,6 +452,11 @@ async fn play_ts_file(
     let mut first_wall: Option<Instant> = None;
     let mut bundle_emit_count: u64 = 0;
     let bundle_start_wall = Instant::now();
+    // Optional MPTS → SPTS down-select. Pre-allocated 188-byte scratch so
+    // the per-packet path stays allocation-free (the filter writes 0 or
+    // 188 bytes per input packet).
+    let mut program_filter = program_number.map(super::ts_program_filter::TsProgramFilter::new);
+    let mut filter_scratch: Vec<u8> = Vec::with_capacity(TS_PACKET);
 
     // ── Smooth-splice state ─────────────────────────────────────────────
     // The first PCR we encounter anchors the per-file splice offset:
@@ -477,6 +491,22 @@ async fn play_ts_file(
             if !resync_to_sync_byte(&mut reader, &mut packet).await? {
                 break;
             }
+        }
+
+        // MPTS → SPTS down-select runs first so other-program packets are
+        // dropped before pacing / CC rewriting / PCR rewriting touch them.
+        // The filter emits exactly one of: 0 bytes (drop), 188 bytes (keep
+        // unchanged), or 188 bytes (PAT → synthetic single-program PAT).
+        if let Some(ref mut filter) = program_filter {
+            filter_scratch.clear();
+            filter.filter_into(&packet, &mut filter_scratch);
+            if filter_scratch.is_empty() {
+                continue;
+            }
+            // The filter is byte-level; for a single-input packet it never
+            // emits more than one output packet, so this slice copy stays
+            // bounded at TS_PACKET bytes.
+            packet.copy_from_slice(&filter_scratch[..TS_PACKET]);
         }
 
         // Read the raw PCR (pre-rewrite) for pacing and offset anchoring.
@@ -1368,7 +1398,7 @@ mod tests {
                 cancel: &cancel,
                 cont: &mut cont,
             };
-            play_ts_file(&path, None, &mut session).await.unwrap();
+            play_ts_file(&path, None, None, &mut session).await.unwrap();
         }
 
         // Iteration 2 — same file, simulating a loop.
@@ -1381,7 +1411,7 @@ mod tests {
                 cancel: &cancel,
                 cont: &mut cont,
             };
-            play_ts_file(&path, None, &mut session).await.unwrap();
+            play_ts_file(&path, None, None, &mut session).await.unwrap();
         }
 
         // ── Drain bundles and validate on-wire structure ──────────────

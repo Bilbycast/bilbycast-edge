@@ -592,6 +592,11 @@ pub mod category {
     /// entities or an OS-level "address already in use" at runtime.
     /// Always paired with `details.error_code = "port_conflict"`.
     pub const PORT_CONFLICT: &str = "port_conflict";
+    /// Local-display output (HDMI / DisplayPort + ALSA) lifecycle and
+    /// runtime events: HW-decode resolution failures, atomic-commit
+    /// degradation, HDR-source-on-SDR-panel tonemap fallback, audio
+    /// xruns, etc. Scoped to flows that carry a `display` output.
+    pub const DISPLAY: &str = "display";
     /// Generic bind failure (permission denied, no such device, multicast
     /// group rejected, etc.). For EADDRINUSE prefer `PORT_CONFLICT`.
     /// Always paired with `details.error_code = "bind_failed"`.

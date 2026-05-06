@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-edge"
-version = "0.43.0"
+version = "0.44.0"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 license = "AGPL-3.0-or-later"
@@ -215,13 +215,13 @@ video-encoder-nvenc = ["video-thumbnail", "video-engine/video-encoder-nvenc"]
 video-encoder-qsv = ["video-thumbnail", "video-engine/video-encoder-qsv"]
 # Enable VAAPI hardware H.264/HEVC encoding (Linux). Royalty-free at
 # every layer (libva is MIT, FFmpeg's VAAPI wrapper is LGPL). Primary
-# motivation: AMD-on-Linux encode (the only real path on AMD) and
-# future zero-copy display rendering. Requires `libva-dev` at build
-# time and a working VAAPI driver at runtime — Mesa radeonsi for AMD,
-# iHD for Intel. Off by default. NB: today the feature is build-system
-# wired only — actually opening a VAAPI encoder still returns a
-# "not yet implemented" error pending the `AVHWDeviceContext` plumbing
-# in `video-engine`.
+# motivation: AMD-on-Linux encode (the only royalty-clean path on AMD).
+# Requires `libva-dev` at build time and a working VAAPI driver at
+# runtime — Mesa radeonsi for AMD, iHD for Intel. Off by default. The
+# v1 encoder accepts 8-bit 4:2:0 input (YUV420P → NV12 upload via
+# `av_hwframe_transfer_data`); 10-bit P010 + 4:2:2 / 4:4:4 are valid
+# VAAPI surface layouts but each demands a distinct upload packer that
+# is staged for a follow-up.
 video-encoder-vaapi = ["video-thumbnail", "video-engine/video-encoder-vaapi"]
 # Bundle every video codec backend the edge knows about — encoders
 # (x264 + x265 + NVENC + QSV + VAAPI) AND HW decoders for the display
@@ -248,6 +248,12 @@ video-encoders-full = [
     "video-encoder-nvenc",
     "video-encoder-qsv",
     "video-encoder-vaapi",
+    # HW decoders — used by both the display output and the transcode
+    # input-decode path.
+    "video-decoder-nvdec",
+    "video-decoder-qsv",
+    "video-decoder-vaapi",
+    # Display feature pulls in KMS/ALSA on top of the decoders.
     "display-nvdec",
     "display-qsv",
     "display-vaapi",
@@ -268,25 +274,32 @@ display = [
     "video-thumbnail",
     "fdk-aac",
 ]
-# Hardware-decoded video on the display output, per-output user-selectable.
-# Each feature pulls in the matching `video-engine/video-decoder-*` family.
-# When the feature is on AND the runtime probe confirms the host has the
-# driver / hardware, the manager UI surfaces the matching backend in the
-# display output's "Video Decoder" dropdown and the edge advertises the
-# corresponding string on `HealthPayload.capabilities`
-# (`display-nvdec` / `display-qsv`).
-display-nvdec = ["display", "video-engine/video-decoder-nvdec"]
-display-qsv = ["display", "video-engine/video-decoder-qsv"]
-# VAAPI display-output decode (Linux). Pulls in the matching
-# `video-engine/video-decoder-vaapi` feature, which flips
-# `--enable-vaapi --enable-decoder=h264_vaapi --enable-decoder=hevc_vaapi`
-# in the vendored FFmpeg build and links libva + libva-drm. NB: the
-# build is wired through; actually opening a VAAPI decoder still
-# returns a "not yet implemented" error pending the
-# `AVHWDeviceContext` plumbing in `video-engine` — the display
-# resolver must continue to fall back to NVDEC / QSV / Cpu until
-# that work lands.
-display-vaapi = ["display", "video-engine/video-decoder-vaapi"]
+# Hardware-decoded video, used on both the display output AND the
+# transcode (TS → TS) decode path. Each feature pulls in the matching
+# `video-engine/video-decoder-*` family. When the feature is on AND
+# the runtime probe confirms the host has the driver / hardware, the
+# transcode resolver picks it for the input decode side of a flow's
+# `video_encode` block, and the manager UI surfaces the matching
+# backend in the display output's "Video Decoder" dropdown. The edge
+# advertises the corresponding string on `HealthPayload.capabilities`
+# (`video-decoder-nvdec` / `video-decoder-qsv` / `video-decoder-vaapi`,
+# plus the legacy `display-nvdec` / `display-qsv` / `display-vaapi`
+# strings for older managers).
+video-decoder-nvdec = ["video-engine/video-decoder-nvdec"]
+video-decoder-qsv = ["video-engine/video-decoder-qsv"]
+video-decoder-vaapi = ["video-engine/video-decoder-vaapi"]
+# Display features layer the connector / KMS / ALSA plumbing on top of
+# the corresponding `video-decoder-*` feature. Operators who want HW
+# transcode decode but no display output enable the bare
+# `video-decoder-*` feature; operators who want both enable
+# `display-*` (which pulls in both halves).
+display-nvdec = ["display", "video-decoder-nvdec"]
+display-qsv = ["display", "video-decoder-qsv"]
+# VAAPI display-output decode (Linux). The decoder itself is fully
+# wired with VAAPI device + frames-context plumbing in `video-engine`
+# and surfaces frames either as zero-copy DRM PRIME DMA-BUFs (KMS
+# scanout) or system-memory NV12/P010 (HDR tonemap path).
+display-vaapi = ["display", "video-decoder-vaapi"]
 # Enable TLS (HTTPS on API + RTMPS) support via rustls/tokio-rustls/axum-server.
 tls = ["dep:tokio-rustls", "dep:axum-server"]
 # Enable WebRTC WHIP/WHEP input and output via str0m (pure Rust, sans-I/O).

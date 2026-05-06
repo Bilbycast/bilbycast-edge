@@ -28,7 +28,7 @@ const STREAM_TYPE_AAC_ADTS: u8 = 0x0F;
 const STREAM_TYPE_AAC_LATM: u8 = 0x11;
 
 /// Audio codec carried on `stream_type = 0x06` (PES private data),
-/// disambiguated by a DVB / Opus descriptor in the PMT ES-info loop.
+/// disambiguated by a DVB / Opus / AC-4 descriptor in the PMT ES-info loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrivateAudioKind {
     /// DVB AC-3 — ETSI TS 101 154 § 5.3, descriptor tag `0x6A`.
@@ -37,7 +37,21 @@ enum PrivateAudioKind {
     Eac3,
     /// Opus — registration descriptor `0x05` with `Opus` identifier.
     Opus,
+    /// Dolby AC-4 — ETSI TS 101 154 § 5.7 / ATSC A/342-2, descriptor
+    /// tag `0xAC` (also signalled via registration descriptor `0x05`
+    /// with `AC-4` identifier). Always carried on `stream_type = 0x06`;
+    /// no ATSC private stream-type is assigned. Detect-and-passthrough
+    /// only — bilbycast cannot decode or encode AC-4 (no open-source
+    /// codec exists; FFmpeg ships only an AC-4 raw demuxer/parser).
+    Ac4,
 }
+
+/// Synthetic MPEG-TS stream-type marker we attach to AC-4 PIDs so the
+/// downstream pipeline (PES routing, assembler keying, libavcodec
+/// selection) has a single non-`0x06` value to dispatch on. ISO/IEC
+/// 13818-1 leaves `0xAC` unassigned, and we deliberately reuse the
+/// AC-4 descriptor tag value to make tracing self-documenting.
+pub const SYNTHETIC_STREAM_TYPE_AC4: u8 = 0xAC;
 
 /// Extracted media frame from the TS demuxer.
 pub enum DemuxedFrame {
@@ -110,14 +124,17 @@ pub enum DemuxedFrame {
         /// Presentation timestamp in 90 kHz clock ticks.
         pts: u64,
     },
-    /// Non-AAC compressed audio frame (MP2 / AC-3 / E-AC-3) — payload is
-    /// the elementary stream the FFmpeg audio decoder consumes
+    /// Non-AAC compressed audio frame (MP2 / AC-3 / E-AC-3 / AC-4) —
+    /// payload is the elementary stream the FFmpeg audio decoder consumes
     /// (concatenated frames pre-PES). Only emitted when the audio PID's
-    /// stream type is one we can decode but not via the AAC fast path.
-    /// Consumers that don't handle this codec should ignore it.
+    /// stream type is one we recognise. Consumers that don't handle the
+    /// reported codec should ignore the variant — AC-4 in particular has
+    /// no decoder available and is surfaced solely for passthrough,
+    /// labelling, and per-PID stats.
     OtherAudio {
         /// MPEG-TS stream_type from the PMT (0x03/0x04 = MP2,
-        /// 0x80/0x81/0xC1 = AC-3, 0x87/0xC2 = E-AC-3).
+        /// 0x80/0x81/0xC1 = AC-3, 0x87/0xC2 = E-AC-3,
+        /// 0xAC = AC-4 [synthetic — see [`SYNTHETIC_STREAM_TYPE_AC4`]]).
         stream_type: u8,
         /// Concatenated codec frames extracted from the PES payload.
         /// The receiver can split on codec sync words (0x0B 0x77 for
@@ -275,6 +292,32 @@ impl TsDemuxer {
     #[allow(dead_code)]
     pub fn video_stream_type(&self) -> u8 {
         self.video_stream_type
+    }
+
+    /// Video PID currently locked from the selected program's PMT.
+    /// `None` until the first PMT carrying a video ES is parsed.
+    /// Used by the local-display output to surface the active video PID
+    /// on the confidence overlay for broadcast-pro monitoring.
+    #[allow(dead_code)]
+    pub fn video_pid(&self) -> Option<u16> {
+        self.video_pid
+    }
+
+    /// Audio PID currently locked from the selected program's PMT
+    /// (post-`audio_track_index` selection). `None` until the first PMT
+    /// carrying audio ES (or before track selection lands on an audio
+    /// stream) is parsed. Same display-overlay use case as
+    /// [`Self::video_pid`].
+    #[allow(dead_code)]
+    pub fn audio_pid(&self) -> Option<u16> {
+        self.audio_pid
+    }
+
+    /// Active program number, if the demuxer was constructed with one.
+    /// Returns `None` when defaulting to the lowest program in the PAT.
+    #[allow(dead_code)]
+    pub fn target_program(&self) -> Option<u16> {
+        self.target_program
     }
 
     /// Get the cached AAC config: (profile, sample_rate_index, channel_config).
@@ -473,6 +516,7 @@ impl TsDemuxer {
                 Some(PrivateAudioKind::Ac3) => 0x81,
                 Some(PrivateAudioKind::Eac3) => 0x87,
                 Some(PrivateAudioKind::Opus) => STREAM_TYPE_PRIVATE,
+                Some(PrivateAudioKind::Ac4) => SYNTHETIC_STREAM_TYPE_AC4,
                 None => stream_type,
             };
 
@@ -543,8 +587,12 @@ impl TsDemuxer {
                 }
                 STREAM_TYPE_PRIVATE if dvb_audio_kind.is_some() => {
                     // Use the synthesised ATSC-style marker for AC-3 /
-                    // E-AC-3; Opus stays on 0x06 (its parse_pes arm gates
-                    // on `STREAM_TYPE_PRIVATE if Some(pid) == audio_pid`).
+                    // E-AC-3 / AC-4; Opus stays on 0x06 (its parse_pes
+                    // arm gates on `STREAM_TYPE_PRIVATE if Some(pid) ==
+                    // audio_pid`). AC-4 carries `SYNTHETIC_STREAM_TYPE_AC4`
+                    // (0xAC) so the assembler / parse_pes route AC-4 PES
+                    // through the OtherAudio passthrough path rather than
+                    // mis-handling it as Opus.
                     audio_tracks.push((es_pid, effective_type));
                 }
                 STREAM_TYPE_AAC_ADTS | STREAM_TYPE_AAC_LATM => {
@@ -555,6 +603,13 @@ impl TsDemuxer {
                 // via libavcodec.
                 0x03 | 0x04 | 0x80 | 0x81 | 0x87 | 0xC1 | 0xC2 => {
                     audio_tracks.push((es_pid, stream_type));
+                }
+                // Some non-DVB ATSC 3.0 muxers stamp AC-4 directly at
+                // `stream_type = 0xAC` (the AC-4 descriptor tag value)
+                // instead of `0x06 + descriptor`. Surface that flavour
+                // here too — handled identically downstream.
+                SYNTHETIC_STREAM_TYPE_AC4 => {
+                    audio_tracks.push((es_pid, SYNTHETIC_STREAM_TYPE_AC4));
                 }
                 _ => {}
             }
@@ -587,6 +642,7 @@ impl TsDemuxer {
                     0x03 | 0x04 => "MP2",
                     0x80 | 0x81 | 0xC1 => "AC-3",
                     0x87 | 0xC2 => "E-AC-3",
+                    SYNTHETIC_STREAM_TYPE_AC4 => "AC-4 (passthrough — no decoder)",
                     _ => "unknown",
                 };
                 tracing::info!(
@@ -621,7 +677,10 @@ impl TsDemuxer {
     ///
     /// - DVB AC-3 descriptor (tag `0x6A`, ETSI TS 101 154 § 5.3)
     /// - DVB E-AC-3 descriptor (tag `0x7A`, ETSI TS 101 154 § 5.3)
+    /// - Dolby AC-4 descriptor (tag `0xAC`, ETSI TS 101 154 § 5.7 /
+    ///   ATSC A/342-2 § 6.2)
     /// - Opus registration descriptor (tag `0x05` with `Opus` ident)
+    /// - AC-4 registration descriptor (tag `0x05` with `AC-4` ident)
     ///
     /// Returns `None` for any other private stream — those PIDs are not
     /// surfaced to the audio path.
@@ -636,8 +695,14 @@ impl TsDemuxer {
             match tag {
                 0x6A => return Some(PrivateAudioKind::Ac3),
                 0x7A => return Some(PrivateAudioKind::Eac3),
-                0x05 if len >= 4 && &descriptors[pos + 2..pos + 6] == b"Opus" => {
-                    return Some(PrivateAudioKind::Opus);
+                0xAC => return Some(PrivateAudioKind::Ac4),
+                0x05 if len >= 4 => {
+                    let id = &descriptors[pos + 2..pos + 6];
+                    match id {
+                        b"Opus" => return Some(PrivateAudioKind::Opus),
+                        b"AC-4" => return Some(PrivateAudioKind::Ac4),
+                        _ => {}
+                    }
                 }
                 _ => {}
             }
@@ -775,10 +840,14 @@ impl TsDemuxer {
                 self.extract_aac_frames(es_data, pts.unwrap_or(0))
             }
             // MP2 (0x03/0x04), AC-3 (0x80/0x81/0xC1), E-AC-3 (0x87/0xC2),
-            // AAC-LATM (0x11) — surface the PES payload so consumers that
-            // handle these codecs (the local-display ALSA path) can decode
-            // them via libavcodec. Other consumers ignore the variant.
+            // AAC-LATM (0x11), AC-4 (synthetic 0xAC — passthrough only,
+            // no decoder available) — surface the PES payload so consumers
+            // that handle these codecs (the local-display ALSA path) can
+            // decode them via libavcodec; AC-4 consumers must ignore the
+            // bytes and leave the audio track silent. Other consumers
+            // ignore the variant entirely.
             0x03 | 0x04 | 0x80 | 0x81 | 0x87 | 0xC1 | 0xC2 | STREAM_TYPE_AAC_LATM
+            | SYNTHETIC_STREAM_TYPE_AC4
                 if Some(pid) == self.audio_pid =>
             {
                 vec![DemuxedFrame::OtherAudio {
@@ -1324,6 +1393,41 @@ mod tests {
         assert_eq!(demux.audio_pid, Some(0x300));
         let assembler = demux.pes_assemblers.get(&0x300).expect("Opus PID");
         assert_eq!(assembler.stream_type, STREAM_TYPE_PRIVATE);
+    }
+
+    /// DVB AC-4 carriage uses descriptor tag `0xAC` (ETSI TS 101 154
+    /// § 5.7 / ATSC A/342-2 § 6.2). The demuxer must synthesise the
+    /// internal `SYNTHETIC_STREAM_TYPE_AC4` (0xAC) marker so `parse_pes`
+    /// routes the PES through the OtherAudio passthrough path.
+    #[test]
+    fn dvb_ac4_descriptor_routes_audio_pid() {
+        let mut demux = TsDemuxer::new(None);
+        let _ = demux.demux(&build_pat(0x100));
+        let pmt = build_pmt_private_audio(0x100, 0x200, 0x300, 0xAC, &[0x00, 0x00, 0x00]);
+        let _ = demux.demux(&pmt);
+        assert_eq!(demux.audio_pid, Some(0x300), "DVB AC-4 PID must be locked");
+        let assembler = demux
+            .pes_assemblers
+            .get(&0x300)
+            .expect("PES assembler must exist for DVB AC-4 PID");
+        assert_eq!(
+            assembler.stream_type, SYNTHETIC_STREAM_TYPE_AC4,
+            "DVB AC-4 must surface to parse_pes as synthetic 0xAC stream_type",
+        );
+    }
+
+    /// AC-4 may also be signalled via the registration descriptor
+    /// (tag `0x05`) with `AC-4` as the format_identifier. Same routing
+    /// outcome as the dedicated 0xAC tag.
+    #[test]
+    fn ac4_registration_descriptor_routes_audio_pid() {
+        let mut demux = TsDemuxer::new(None);
+        let _ = demux.demux(&build_pat(0x100));
+        let pmt = build_pmt_private_audio(0x100, 0x200, 0x300, 0x05, b"AC-4");
+        let _ = demux.demux(&pmt);
+        assert_eq!(demux.audio_pid, Some(0x300));
+        let assembler = demux.pes_assemblers.get(&0x300).expect("AC-4 PID");
+        assert_eq!(assembler.stream_type, SYNTHETIC_STREAM_TYPE_AC4);
     }
 
     /// Private streams without a recognised audio descriptor must NOT be

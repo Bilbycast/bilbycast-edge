@@ -3460,15 +3460,38 @@ fn build_output_config_meta(config: &OutputConfig) -> OutputConfigMeta {
 
 /// Walk a resolved flow's outputs + flow-level config and produce the
 /// `FlowCostPlan` consumed by `engine::hardware_probe::compute_flow_cost_units`.
-/// HW vs SW classification is purely string-driven on the encoder name —
-/// a codec containing `nvenc`, `qsv`, `videotoolbox`, or `amf` is
-/// considered hardware; anything else (including `x264` / `x265` / unknown)
-/// is software. Outputs that don't carry encode blocks (ST 2110 audio,
-/// bonded, etc.) contribute zero on top of the base passthrough cost.
+///
+/// Each `video_encode` block is run through
+/// [`engine::hardware_probe::resolve_for_video_encode_config`] so the
+/// cost preview agrees with the backend the runtime will actually pick
+/// — important for `*_auto` codec strings, which would otherwise
+/// classify as software via the string-only `HwEncoderFamily::classify`
+/// fallback. On hosts where the static-capabilities probe hasn't
+/// installed yet (early startup, unit tests) or rejects the operator's
+/// combination, the legacy classify-by-string path runs as a fallback
+/// so the cost plan still has a sensible value.
 fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowCostPlan {
     use crate::config::models::OutputConfig;
 
     let mut plan = crate::engine::hardware_probe::FlowCostPlan::default();
+
+    // Helper to extract the `video_encode` block for the output types
+    // that carry one. Spelled as `fn` (not closure) so the borrow
+    // checker can see the input/output lifetimes are linked.
+    fn video_encode_block(
+        out: &OutputConfig,
+    ) -> Option<&crate::config::models::VideoEncodeConfig> {
+        match out {
+            OutputConfig::Srt(c) => c.video_encode.as_ref(),
+            OutputConfig::Rtp(c) => c.video_encode.as_ref(),
+            OutputConfig::Udp(c) => c.video_encode.as_ref(),
+            OutputConfig::Rist(c) => c.video_encode.as_ref(),
+            OutputConfig::Rtmp(c) => c.video_encode.as_ref(),
+            OutputConfig::Webrtc(c) => c.video_encode.as_ref(),
+            OutputConfig::Cmaf(c) => c.video_encode.as_ref(),
+            _ => None,
+        }
+    }
 
     for out in &flow.outputs {
         let (audio, video) = output_encode_blocks(out);
@@ -3476,37 +3499,68 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
             plan.audio_encode_outputs = plan.audio_encode_outputs.saturating_add(1);
         }
         if let Some(codec) = video {
-            match crate::engine::hardware_probe::HwEncoderFamily::classify(codec) {
-                Some(crate::engine::hardware_probe::HwEncoderFamily::Nvenc) => {
-                    plan.hw_video_encode_outputs = plan.hw_video_encode_outputs.saturating_add(1);
-                    plan.nvenc_sessions = plan.nvenc_sessions.saturating_add(1);
-                }
-                Some(crate::engine::hardware_probe::HwEncoderFamily::Qsv) => {
-                    plan.hw_video_encode_outputs = plan.hw_video_encode_outputs.saturating_add(1);
-                    plan.qsv_sessions = plan.qsv_sessions.saturating_add(1);
-                }
-                Some(crate::engine::hardware_probe::HwEncoderFamily::VideoToolbox) => {
-                    plan.hw_video_encode_outputs = plan.hw_video_encode_outputs.saturating_add(1);
-                    plan.videotoolbox_sessions = plan.videotoolbox_sessions.saturating_add(1);
-                }
-                Some(crate::engine::hardware_probe::HwEncoderFamily::Amf) => {
-                    plan.hw_video_encode_outputs = plan.hw_video_encode_outputs.saturating_add(1);
-                    plan.amf_sessions = plan.amf_sessions.saturating_add(1);
-                }
-                Some(crate::engine::hardware_probe::HwEncoderFamily::Vaapi) => {
-                    plan.hw_video_encode_outputs = plan.hw_video_encode_outputs.saturating_add(1);
-                    plan.vaapi_sessions = plan.vaapi_sessions.saturating_add(1);
-                }
+            let ve = video_encode_block(out);
+            let (w, h, fn_, fd, bd, chroma) = match ve {
+                Some(v) => (v.width, v.height, v.fps_num, v.fps_den, v.bit_depth, v.chroma.clone()),
+                None => (None, None, None, None, None, None),
+            };
+            let chroma_ref = chroma.as_deref();
+
+            // Prefer the resolver result so `*_auto` codecs get the
+            // backend the runtime would actually pick on this node.
+            // Fall back to string classification when the static
+            // capability snapshot isn't available yet.
+            let resolved = ve.and_then(|v| {
+                crate::engine::hardware_probe::resolve_for_video_encode_config(v).ok()
+            });
+
+            let (is_hw, hw_family) = match resolved {
+                Some(r) => (!r.is_software(), r.hw_family()),
                 None => {
-                    plan.sw_video_encode_outputs = plan.sw_video_encode_outputs.saturating_add(1);
+                    let f = crate::engine::hardware_probe::HwEncoderFamily::classify(codec);
+                    (f.is_some(), f)
                 }
+            };
+            let units = crate::engine::hardware_probe::weighted_video_encode_units(
+                is_hw, w, h, fn_, fd, bd, chroma_ref,
+            );
+            if is_hw {
+                plan.hw_video_encode_units = plan.hw_video_encode_units.saturating_add(units);
+                match hw_family {
+                    Some(crate::engine::hardware_probe::HwEncoderFamily::Nvenc) => {
+                        plan.nvenc_sessions = plan.nvenc_sessions.saturating_add(1);
+                    }
+                    Some(crate::engine::hardware_probe::HwEncoderFamily::Qsv) => {
+                        plan.qsv_sessions = plan.qsv_sessions.saturating_add(1);
+                    }
+                    Some(crate::engine::hardware_probe::HwEncoderFamily::VideoToolbox) => {
+                        plan.videotoolbox_sessions =
+                            plan.videotoolbox_sessions.saturating_add(1);
+                    }
+                    Some(crate::engine::hardware_probe::HwEncoderFamily::Amf) => {
+                        plan.amf_sessions = plan.amf_sessions.saturating_add(1);
+                    }
+                    Some(crate::engine::hardware_probe::HwEncoderFamily::Vaapi) => {
+                        plan.vaapi_sessions = plan.vaapi_sessions.saturating_add(1);
+                    }
+                    None => {} // is_hw + no family — defensive, unreachable today
+                }
+            } else {
+                plan.sw_video_encode_units = plan.sw_video_encode_units.saturating_add(units);
             }
         }
         // ST 2110-20/-23 outputs always run a video encoder pipeline
         // (RFC 4175 packetization is fed by an internal x264/x265 pass)
-        // — count them as one SW video encode each.
+        // — count them as one SW video encode each at the SW baseline.
         if matches!(out, OutputConfig::St2110_20(_) | OutputConfig::St2110_23(_)) {
-            plan.sw_video_encode_outputs = plan.sw_video_encode_outputs.saturating_add(1);
+            // ST 2110 video runs uncompressed at 1.5 Gbps for HD, so
+            // pixel-rate-aware costing matters here too. Use the same
+            // helper with no overrides — defaults to 1080p30 4:2:0.
+            let units = crate::engine::hardware_probe::weighted_video_encode_units(
+                false, None, None, None, None, None, None,
+            );
+            plan.sw_video_encode_units =
+                plan.sw_video_encode_units.saturating_add(units);
         }
         // Local-display outputs (Linux-only, `display` Cargo feature).
         // Resolve the operator's `hw_decode` preference against the

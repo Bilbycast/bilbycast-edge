@@ -52,7 +52,7 @@ use video_engine::{
 };
 
 use crate::config::models::{DisplayOutputConfig, DisplayScalingMode};
-use crate::display::audio_bars::{new_shared_meter, SharedMeter};
+use crate::display::audio_bars::{new_shared_meter, SharedMeter, StreamHeader};
 use crate::display::audio_meter::spawn_audio_meter;
 use crate::display::{audio::AudioBackend, clock::AudioClock, kms::KmsDisplay};
 use crate::engine::packet::RtpPacket;
@@ -464,6 +464,13 @@ async fn run_display_output(
         crate::config::models::HwDecodePreference::Vaapi => DecoderBackend::Vaapi,
     };
     let demux_frame_gen = Arc::clone(&frame_gen);
+    // Snapshot the panel's HDR signalling capability now (kms is moved
+    // into the display task below). The decode loop reads this to
+    // decide whether to download HDR-flagged VAAPI surfaces to sysmem
+    // for CPU tonemap (panel can't do HDR) or pass them through as
+    // zero-copy prime frames + let the display task program
+    // `HDR_OUTPUT_METADATA` on the connector (panel does HDR).
+    let demux_panel_hdr_capable = kms.panel_hdr_capable();
     let demux_handle = tokio::task::spawn_blocking(move || {
         demux_decode_loop(
             &mut demux_rx,
@@ -480,6 +487,7 @@ async fn run_display_output(
             demux_requested_backend,
             demux_hw_already_unavailable,
             demux_frame_gen,
+            demux_panel_hdr_capable,
         );
     });
 
@@ -495,8 +503,19 @@ async fn run_display_output(
     let display_scaling_mode = config.scaling_mode;
     // Surface the resolved decoder backend on `DisplayStats.decoder_kind`
     // so the manager UI's flow card and Resources card can render the
-    // active mode (e.g. "display (1920x1080@60Hz · NVDEC)"). Static
-    // strings — the resolver runs once per output.
+    // active mode (e.g. "display (3840x2160@60Hz · vaapi-zerocopy)").
+    // Static strings — the resolver runs once per output.
+    //
+    // VAAPI in this codebase is **always** the zero-copy DMA-BUF +
+    // KMS-PRIME scanout path: the decoder produces VAAPI surfaces, the
+    // demux loop maps each to an `AVDRMFrameDescriptor`, and the
+    // display task atomic-page-flips onto the imported framebuffer
+    // without any libswscale or dumb-buffer copy. There is no
+    // VAAPI-decode-then-sysmem-blit configuration today (that mode
+    // would only be useful if a future driver refused PRIME export
+    // for a particular stream profile; at that point a `vaapi`
+    // (sysmem) label can be added beside `vaapi-zerocopy` and the
+    // runtime can track which engaged).
     let decoder_kind_label: &'static str = match (resolved, hw_unavailable_reason) {
         // Soft-fallback path: operator asked for HW but the host can't
         // do it. We're running CPU but the UI must reflect *why* — so
@@ -508,7 +527,9 @@ async fn run_display_output(
         (crate::engine::hardware_probe::ResolvedDisplayDecoder::Cpu, None) => "cpu",
         (crate::engine::hardware_probe::ResolvedDisplayDecoder::Nvdec, _) => "nvdec",
         (crate::engine::hardware_probe::ResolvedDisplayDecoder::Qsv, _) => "qsv",
-        (crate::engine::hardware_probe::ResolvedDisplayDecoder::Vaapi, _) => "vaapi",
+        (crate::engine::hardware_probe::ResolvedDisplayDecoder::Vaapi, _) => {
+            "vaapi-zerocopy"
+        }
     };
     let display_frame_gen = Arc::clone(&frame_gen);
     let display_handle = tokio::task::spawn_blocking(move || {
@@ -603,16 +624,48 @@ enum VideoFrameChroma {
         uv: Vec<u8>,
         uv_stride: usize,
     },
+    /// No system-memory chroma — `VideoFrame::prime` carries a DMA-BUF
+    /// descriptor instead. The display loop branches on `prime.is_some()`
+    /// before reading any of the planar fields.
+    None,
+}
+
+/// Carries the bits of a VAAPI-decoded surface that the display loop
+/// hands to `KmsDisplay::present_prime`. Owns the AVFrame keepalive so
+/// the source VA surface stays valid until the page-flip event arrives.
+struct PrimePayload {
+    descriptor: crate::display::kms::DrmPrimeDescriptor,
+    keepalive: std::sync::Arc<dyn crate::display::kms::PrimeKeepalive>,
+}
+
+/// Snapshot of the demuxer's currently-locked stream identifiers,
+/// captured at the moment a video AU is handed off for decode.
+/// Carried alongside each [`VideoFrame`] purely so the local-display
+/// confidence overlay can surface them — none of the decode / scale /
+/// blit / present code reads these fields.
+#[derive(Debug, Clone, Copy, Default)]
+struct StreamIds {
+    video_pid: Option<u16>,
+    audio_pid: Option<u16>,
+    program_number: Option<u16>,
 }
 
 struct VideoFrame {
     /// Y plane (luma) — raw bytes from the decoder, owned so we can
     /// move them across the mpsc out of the decoder's lifetime.
+    /// Empty on the VAAPI zero-copy path (where `prime` carries the
+    /// scanout-ready DMA-BUF descriptor instead of system-memory pixel
+    /// data).
     y: Vec<u8>,
     y_stride: usize,
     /// Chroma — planar (3 planes) or semi-planar (interleaved UV).
-    /// See [`VideoFrameChroma`].
+    /// See [`VideoFrameChroma`]. Empty on the VAAPI zero-copy path.
     chroma: VideoFrameChroma,
+    /// VAAPI zero-copy payload — when `Some`, the display loop calls
+    /// `KmsDisplay::present_prime` directly and skips the libswscale
+    /// blit + dumb-buffer page-flip. The keepalive holds the source
+    /// VA surface alive through the kernel's scanout commit.
+    prime: Option<PrimePayload>,
     width: u32,
     height: u32,
     /// FFmpeg `AVPixelFormat` integer of the source layout — what
@@ -649,6 +702,13 @@ struct VideoFrame {
     /// manager UI shows the active codec rather than the literal
     /// `"unknown"` string.
     codec: VideoCodec,
+    /// Video / audio PID currently locked by the demuxer, plus the
+    /// active program number. Carried purely so the local-display
+    /// overlay can surface them on the confidence header — none of the
+    /// blit / scale / present code touches these fields.
+    video_pid: Option<u16>,
+    audio_pid: Option<u16>,
+    program_number: Option<u16>,
 }
 
 struct AudioBlock {
@@ -680,6 +740,7 @@ fn demux_decode_loop(
     requested_backend: DecoderBackend,
     hw_already_unavailable: bool,
     frame_gen: Arc<AtomicU64>,
+    panel_hdr_capable: bool,
 ) {
     let mut demuxer = TsDemuxer::with_audio_track(program_number, audio_track_index);
     let mut video_decoder: Option<VideoDecoder> = None;
@@ -696,6 +757,7 @@ fn demux_decode_loop(
         requested_backend,
         fell_back_to_cpu: hw_already_unavailable,
         fallback_event_emitted: hw_already_unavailable,
+        hdr_on_sdr_event_emitted: false,
         consecutive_send_errors: 0,
         last_send_error_log_at: None,
         first_send_after_open: None,
@@ -733,6 +795,11 @@ fn demux_decode_loop(
     // (`frames_dropped_unsupported_pixfmt`) gives the manager UI the
     // continuous-rate signal between event emissions.
     let mut last_unsupported_pixfmt_at: Option<Instant> = None;
+    // One-shot guard so the operator gets a clear "AC-4 cannot be
+    // decoded" event the first time AC-4 audio is observed on this
+    // output, but the per-frame demux loop doesn't spam the event
+    // ring on every PES packet.
+    let mut ac4_audio_warned = false;
 
     loop {
         if cancel.is_cancelled() {
@@ -799,6 +866,11 @@ fn demux_decode_loop(
         for frame in frames {
             match frame {
                 DemuxedFrame::H264 { nalus, pts, .. } => {
+                    let stream_ids = StreamIds {
+                        video_pid: demuxer.video_pid(),
+                        audio_pid: demuxer.audio_pid(),
+                        program_number: demuxer.target_program(),
+                    };
                     handle_video_au(
                         &nalus,
                         pts,
@@ -816,9 +888,16 @@ fn demux_decode_loop(
                         &flow_id,
                         &output_id,
                         &frame_gen,
+                        panel_hdr_capable,
+                        stream_ids,
                     );
                 }
                 DemuxedFrame::H265 { nalus, pts, .. } => {
+                    let stream_ids = StreamIds {
+                        video_pid: demuxer.video_pid(),
+                        audio_pid: demuxer.audio_pid(),
+                        program_number: demuxer.target_program(),
+                    };
                     handle_video_au(
                         &nalus,
                         pts,
@@ -836,6 +915,8 @@ fn demux_decode_loop(
                         &flow_id,
                         &output_id,
                         &frame_gen,
+                        panel_hdr_capable,
+                        stream_ids,
                     );
                 }
                 DemuxedFrame::Mpeg2 { es, pts, .. } => {
@@ -848,6 +929,11 @@ fn demux_decode_loop(
                     // payload and ignores leading bytes that don't
                     // match.
                     let synthetic = vec![es];
+                    let stream_ids = StreamIds {
+                        video_pid: demuxer.video_pid(),
+                        audio_pid: demuxer.audio_pid(),
+                        program_number: demuxer.target_program(),
+                    };
                     handle_video_au(
                         &synthetic,
                         pts,
@@ -865,6 +951,8 @@ fn demux_decode_loop(
                         &flow_id,
                         &output_id,
                         &frame_gen,
+                        panel_hdr_capable,
+                        stream_ids,
                     );
                 }
                 DemuxedFrame::Aac { data, pts } => {
@@ -961,6 +1049,36 @@ fn demux_decode_loop(
                     );
                 }
                 DemuxedFrame::OtherAudio { stream_type, data, pts } => {
+                    // AC-4 (synthetic stream_type 0xAC) has no
+                    // open-source decoder — surface the codec label so
+                    // the manager UI shows "AC-4", emit a one-shot
+                    // Warning event explaining why audio is silent, and
+                    // drop the PES bytes (video keeps playing).
+                    if stream_type == crate::engine::ts_demux::SYNTHETIC_STREAM_TYPE_AC4 {
+                        counters.set_audio_codec_label(
+                            crate::stats::collector::DisplayCodecLabel::Ac4,
+                        );
+                        if !ac4_audio_warned {
+                            ac4_audio_warned = true;
+                            event_sender.emit_flow_with_details(
+                                EventSeverity::Warning,
+                                crate::manager::events::category::FLOW,
+                                format!(
+                                    "display output '{output_id}': audio is AC-4 — \
+                                     no decoder available, video continues with \
+                                     silenced audio"
+                                ),
+                                &flow_id,
+                                serde_json::json!({
+                                    "error_code": "display_audio_ac4_undecodable",
+                                    "output_id": output_id,
+                                }),
+                            );
+                        }
+                        let _ = data;
+                        let _ = pts;
+                        continue;
+                    }
                     let Some(codec) = crate::engine::audio_decode::ff_codec_for_stream_type(
                         stream_type,
                     ) else {
@@ -1076,6 +1194,13 @@ struct HwOpenState {
     /// One-shot gate so the warning event fires exactly once per
     /// fallback, never per access unit.
     fallback_event_emitted: bool,
+    /// One-shot gate so the HDR-on-SDR-panel tonemap warning fires
+    /// exactly once per output on the first HDR frame that lands on an
+    /// SDR-only connector. Reset whenever the decoder is re-opened
+    /// (back to `false` in `HwOpenState::default`) so a flow that
+    /// switches sources mid-run lights up the warning again on the
+    /// new HDR source.
+    hdr_on_sdr_event_emitted: bool,
     /// Sustained `send_packet_with_pts` failure counter. Bumped from
     /// `feed_video_decoder` on every `Err`; reset to 0 from
     /// `drain_video_frames` on the first frame after a failure run
@@ -1354,6 +1479,7 @@ fn force_cpu_fallback(
 /// piece of book-keeping (pts_jump flush, decoder ensure, send,
 /// drain, watchdog) lives in lock-step in one place.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn handle_video_au(
     nalus: &[Vec<u8>],
     pts: u64,
@@ -1371,6 +1497,8 @@ fn handle_video_au(
     flow_id: &str,
     output_id: &str,
     frame_gen: &AtomicU64,
+    panel_hdr_capable: bool,
+    stream_ids: StreamIds,
 ) {
     if pts_jump(*last_video_pts, pts) {
         // Section 5: count + log every PTS jump so the operator can
@@ -1445,6 +1573,8 @@ fn handle_video_au(
         hw_open_state,
         frame_gen,
         codec,
+        panel_hdr_capable,
+        stream_ids,
     );
     let decode_us = decode_start.elapsed().as_micros() as u64;
     counters.decode_count.fetch_add(1, Ordering::Relaxed);
@@ -1615,6 +1745,7 @@ fn feed_video_decoder(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn drain_video_frames(
     decoder: &mut VideoDecoder,
     fallback_pts_90k: u64,
@@ -1628,6 +1759,8 @@ fn drain_video_frames(
     state: &mut HwOpenState,
     frame_gen: &AtomicU64,
     codec: VideoCodec,
+    panel_hdr_capable: bool,
+    stream_ids: StreamIds,
 ) {
     while let Ok(frame) = decoder.receive_frame() {
         // A successful frame proves the decode path is live — reset
@@ -1669,6 +1802,185 @@ fn drain_video_frames(
         let color_transfer = frame.color_transfer();
         let full_range = frame.is_full_range();
         let pixel_format = frame.pixel_format();
+
+        // ── HDR routing for VAAPI sources ───────────────────────────
+        //
+        // Two paths depending on whether the connected panel can
+        // signal HDR (kernel + driver expose `HDR_OUTPUT_METADATA`
+        // on the connector — checked at `KmsDisplay::open` and
+        // captured in `panel_hdr_capable`):
+        //
+        // * **HDR panel**: leave the frame as a VAAPI surface and
+        //   let the display task program `HDR_OUTPUT_METADATA` on
+        //   the connector before the next atomic flip. The HDMI / DP
+        //   sink transmits the Dynamic Range and Mastering
+        //   InfoFrame, the panel switches into HDR mode, and the
+        //   panel's own EOTF maps PQ / HLG to its native
+        //   luminance. Zero-copy stays on, no CPU tonemap.
+        //
+        // * **SDR panel**: the only correct option is a CPU
+        //   tonemap. Download the VAAPI surface to sysmem
+        //   (`av_hwframe_transfer_data`) so `is_vaapi()` flips to
+        //   false and the planar / semi-planar codepath below
+        //   builds a sysmem `VideoFrame` — the display task's
+        //   CPU-blit path then runs the PQ/HLG → SDR tonemap LUT
+        //   in `hdr_tonemap::apply_bgra` before scanout. Cost: one
+        //   PCIe transfer per HDR frame on Intel iHD; pointer-
+        //   alias on AMD radeonsi.
+        //
+        // PQ = `AVCOL_TRC_SMPTE2084` (16); HLG = `AVCOL_TRC_ARIB_STD_B67` (18).
+        let source_is_hdr = color_transfer == 16 || color_transfer == 18;
+
+        // One-shot warning the first time an HDR source lands on an
+        // SDR-only connector. The CPU LUT tonemap path that follows is
+        // ~1 PCIe transfer per frame on Intel iHD plus the
+        // `hdr_tonemap::apply_bgra` overhead — ~25-40 % of a core at
+        // 1080p60 — and the operator can't see it from elsewhere in the
+        // UI. Surfacing it here lets them decide whether to swap the
+        // panel for an HDR-capable one or accept the cost.
+        if source_is_hdr && !panel_hdr_capable && !state.hdr_on_sdr_event_emitted {
+            let transfer_label = if color_transfer == 16 { "PQ (HDR10)" } else { "HLG" };
+            event_sender.emit_output_with_details(
+                EventSeverity::Warning,
+                crate::manager::events::category::DISPLAY,
+                format!(
+                    "Display output '{output_id}' received an HDR ({transfer_label}) source on an SDR-only panel — running CPU tonemap on every frame. Swap to an HDR-capable panel to drop CPU back."
+                ),
+                output_id,
+                serde_json::json!({
+                    "error_code": "display_hdr_tonemap_active",
+                    "color_transfer": color_transfer,
+                    "transfer_label": transfer_label,
+                    "panel_hdr_capable": false,
+                }),
+            );
+            state.hdr_on_sdr_event_emitted = true;
+        }
+
+        let frame =
+            if frame.is_vaapi() && source_is_hdr && !panel_hdr_capable {
+                match frame.download_to_sysmem() {
+                    Ok(sysmem) => sysmem,
+                    Err(e) => {
+                        // Download failed (rare — driver / format
+                        // mismatch). Pass the VAAPI frame through
+                        // and let the prime path run untonemapped —
+                        // the panel will see HDR transfer in the
+                        // pixel data without metadata. Sustained
+                        // failures trip the existing zero-copy
+                        // watchdog.
+                        tracing::warn!(
+                            output_id = %output_id,
+                            color_transfer,
+                            "HDR VAAPI → sysmem download failed ({e:?}) — primary plane will receive un-tonemapped HDR"
+                        );
+                        frame
+                    }
+                }
+            } else {
+                frame
+            };
+
+        // ── VAAPI zero-copy fast path ──────────────────────────────
+        //
+        // `is_vaapi()` is true exactly when the decoder was opened on
+        // the VAAPI backend AND the `get_format` callback negotiated
+        // AV_PIX_FMT_VAAPI for the bitstream profile. Map the decoded
+        // surface to a DRM PRIME descriptor and ship it through the
+        // mpsc with the AVFrame keepalive. The display task imports
+        // the DMA-BUF as a KMS framebuffer and atomic-page-flips
+        // straight onto it — eliminating both the libswscale YUV→BGRA
+        // blit and the system-memory copy through the dumb buffer.
+        //
+        // On mapping failure (typical: FFmpeg without CONFIG_LIBDRM,
+        // or driver refused to export this profile) we drop the frame
+        // and bump a counter — the runtime watchdog further upstream
+        // will demote the whole decoder to CPU after a window of
+        // sustained zero-copy failures.
+        if frame.is_vaapi() {
+            match frame.map_drm_prime() {
+                Ok(prime_frame) => {
+                    let descriptor = crate::display::kms::DrmPrimeDescriptor {
+                        width: prime_frame.width,
+                        height: prime_frame.height,
+                        fourcc: prime_frame.fourcc,
+                        modifier: prime_frame.modifier,
+                        planes: prime_frame
+                            .planes
+                            .iter()
+                            .map(|p| crate::display::kms::DrmPrimePlaneDesc {
+                                fd: p.fd,
+                                offset: p.offset,
+                                pitch: p.pitch,
+                            })
+                            .collect(),
+                    };
+                    let keepalive = prime_frame.keepalive();
+                    let out_frame = VideoFrame {
+                        y: Vec::new(),
+                        y_stride: 0,
+                        chroma: VideoFrameChroma::None,
+                        prime: Some(PrimePayload {
+                            descriptor,
+                            keepalive,
+                        }),
+                        width,
+                        height,
+                        pixel_format,
+                        colorspace,
+                        color_transfer,
+                        full_range,
+                        pts_90k,
+                        frame_gen: frame_gen.load(Ordering::Relaxed),
+                        codec,
+                        video_pid: stream_ids.video_pid,
+                        audio_pid: stream_ids.audio_pid,
+                        program_number: stream_ids.program_number,
+                    };
+                    if vtx.try_send(out_frame).is_err() {
+                        counters
+                            .frames_dropped_mpsc_full
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    counters
+                        .frames_dropped_unsupported_pixfmt
+                        .fetch_add(1, Ordering::Relaxed);
+                    let now = Instant::now();
+                    let due = last_unsupported_pixfmt_at
+                        .map(|t| {
+                            now.duration_since(t)
+                                >= std::time::Duration::from_secs(
+                                    UNSUPPORTED_PIXFMT_RE_EMIT_S,
+                                )
+                        })
+                        .unwrap_or(true);
+                    if due {
+                        *last_unsupported_pixfmt_at = Some(now);
+                        event_sender.emit_flow_with_details(
+                            EventSeverity::Warning,
+                            crate::manager::events::category::SYSTEM_RESOURCES,
+                            format!(
+                                "display output '{output_id}': VAAPI DRM PRIME export \
+                                 failed ({e}) — frames dropped, demote pending"
+                            ),
+                            flow_id,
+                            serde_json::json!({
+                                "error_code": "display_vaapi_prime_export_failed",
+                                "output_id": output_id,
+                                "decoder_kind": "vaapi-zerocopy",
+                                "width": width,
+                                "height": height,
+                                "ffmpeg_error": format!("{e}"),
+                            }),
+                        );
+                    }
+                    continue;
+                }
+            }
+        }
 
         // Two arms — each just copies the planes out of the decoder's
         // lifetime and stamps the **decoder's own** pixel format on
@@ -1789,6 +2101,7 @@ fn drain_video_frames(
             y,
             y_stride,
             chroma,
+            prime: None,
             width,
             height,
             pixel_format: out_pix_fmt,
@@ -1798,6 +2111,9 @@ fn drain_video_frames(
             pts_90k,
             frame_gen: frame_gen.load(Ordering::Relaxed),
             codec,
+            video_pid: stream_ids.video_pid,
+            audio_pid: stream_ids.audio_pid,
+            program_number: stream_ids.program_number,
         };
         if vtx.try_send(out_frame).is_err() {
             // Distinct from the display-thread `frames_dropped_late` —
@@ -1837,6 +2153,13 @@ fn display_loop(
     let mut frame_period_ms: i64 = 33;
     let mut last_pts: Option<u64> = None;
     let mut scaler: Option<CachedScaler> = None;
+    // Reusable scratch buffer for the per-frame stream-info header
+    // (codec, dims, fps, HDR signal, video / audio PIDs, program).
+    // Lives across iterations so we never alloc on the per-frame path
+    // — `String::clear` keeps the heap allocation; the formatted line
+    // is short (<64 chars) so the buffer settles to a tiny single
+    // allocation after the first frame.
+    let mut header_buf: String = String::with_capacity(96);
     // Track the most-recent video codec discriminant we wrote to the
     // shared `counters.video_codec_label` atomic. Used to skip the
     // store on every frame when the codec didn't change.
@@ -1907,6 +2230,22 @@ fn display_loop(
     // glitch (xrun, codec stall) still drops within ~quarter-second.
     const LATE_HYSTERESIS_FRAMES: u32 = 6;
 
+    // Pre-allocate the audio-bars overlay plane once at task startup
+    // (when bars are enabled). Failure isn't fatal: the dumb-buffer
+    // rasterise inside the CPU-blit path remains as the fallback. We
+    // emit a single info event so operators see why hardware bars
+    // didn't engage on hosts whose driver lacks a suitable overlay
+    // plane (or atomic). On a healthy modern Linux box this succeeds.
+    if meter.is_some() {
+        if let Err(e) = kms.enable_bars_overlay() {
+            tracing::info!(
+                flow_id = %flow_id,
+                output_id = %output_id,
+                "audio-bars overlay plane unavailable — falling back to CPU-blit rasterise: {e:#}"
+            );
+        }
+    }
+
     while !cancel.is_cancelled() {
         let next = match vrx.blocking_recv() {
             Some(f) => f,
@@ -1941,18 +2280,21 @@ fn display_loop(
             last_video_codec_label_disc = cur_video_label as u8;
         }
 
-        // Refuse sources above 1080p until the zero-copy display-vaapi
-        // path lands. Today every decoded frame walks libswscale on the
-        // CPU to convert YUV → BGRA into a write-combining KMS dumb
-        // buffer — at 3840×2160 that's a ~33 MB write per frame and the
-        // observed blit time is ≈ 7 s, producing 0.14 fps. A black panel
-        // with a Critical event in the manager UI is honest; silent
-        // 0.14 fps playout is not. Tracked in
-        // `bilbycast-edge/CLAUDE.md` under the staged display-vaapi
-        // VAAPI surface → DMA-BUF → KMS PRIME plane work.
+        // CPU-blit ceiling: refuse > 1080p sources unless the zero-copy
+        // VAAPI path is engaged for this frame. Every CPU-decoded frame
+        // walks libswscale to convert YUV → BGRA into a write-combining
+        // KMS dumb buffer — at 3840×2160 that's a ~33 MB write per
+        // frame and the observed blit time is ≈ 7 s, producing 0.14 fps.
+        // A black panel with a Critical event in the manager UI is
+        // honest; silent 0.14 fps playout is not. The ceiling lifts
+        // automatically when `next.prime.is_some()` — the zero-copy
+        // path skips libswscale entirely, so 4K HEVC scans out at the
+        // panel's native cadence.
         const SW_BLIT_MAX_W: u32 = 1920;
         const SW_BLIT_MAX_H: u32 = 1080;
-        if (next.width > SW_BLIT_MAX_W || next.height > SW_BLIT_MAX_H)
+        let zero_copy = next.prime.is_some();
+        if !zero_copy
+            && (next.width > SW_BLIT_MAX_W || next.height > SW_BLIT_MAX_H)
             && matched_dims.is_none()
         {
             event_sender.emit_flow_with_details(
@@ -1961,7 +2303,7 @@ fn display_loop(
                 format!(
                     "display output '{output_id}': source resolution {}x{} exceeds the \
                      CPU-blit ceiling of {SW_BLIT_MAX_W}x{SW_BLIT_MAX_H}; the display \
-                     output will stop until display-vaapi zero-copy lands or the \
+                     output will stop until display-vaapi zero-copy is engaged or the \
                      source is reduced to ≤ 1080p",
                     next.width, next.height,
                 ),
@@ -2223,8 +2565,16 @@ fn display_loop(
         // ~16.7 ms, so values above ~33 ms mean we missed a vblank
         // slot and the next iteration's pacing has already slipped a
         // frame.
+        compose_stream_header(&mut header_buf, &next, frame_period_ms);
         let blit_start = Instant::now();
-        let blit_ok = blit_and_present(&mut kms, &next, &mut scaler, meter.as_ref()).is_ok();
+        let blit_ok = blit_and_present(
+            &mut kms,
+            &next,
+            &mut scaler,
+            meter.as_ref(),
+            &header_buf,
+        )
+        .is_ok();
         let blit_us = blit_start.elapsed().as_micros() as u64;
         counters.blit_count.fetch_add(1, Ordering::Relaxed);
         counters.blit_us_total.fetch_add(blit_us, Ordering::Relaxed);
@@ -2233,6 +2583,25 @@ fn display_loop(
             .fetch_max(blit_us, Ordering::Relaxed);
         if blit_ok {
             counters.frames_displayed.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // One-shot Warning if the atomic-commit page-flip path was
+        // refused by the kernel and we permanently fell back to the
+        // legacy `set_crtc` per-frame plane reconfigure. Operators see
+        // this once per `KmsDisplay` lifetime so they can tell apart
+        // "10 fps because atomic was refused" from "10 fps because the
+        // host can't keep up with the source".
+        if let Some(reason) = kms.take_atomic_fallback_reason() {
+            emit_event(
+                &event_sender,
+                EventSeverity::Warning,
+                "display_atomic_unavailable",
+                &flow_id,
+                &output_id,
+                &format!(
+                    "display atomic commit unavailable — falling back to per-frame set_crtc: {reason}"
+                ),
+            );
         }
     }
 }
@@ -2377,7 +2746,107 @@ fn blit_and_present(
     frame: &VideoFrame,
     scaler: &mut Option<CachedScaler>,
     meter: Option<&SharedMeter>,
+    header_text: &str,
 ) -> Result<()> {
+    let stream_header = StreamHeader { text: header_text };
+    // ── VAAPI zero-copy fast path ──────────────────────────────────
+    //
+    // Decoded straight into a VAAPI surface; the descriptor + Arc
+    // keepalive ride the mpsc instead of system-memory plane copies.
+    // We hand both to `KmsDisplay::present_prime`, which imports the
+    // DMA-BUF as a KMS framebuffer and atomic-page-flips onto it. No
+    // libswscale work, no dumb-buffer write — the prime FB scans out
+    // straight from the VAAPI surface.
+    //
+    // Audio-bars overlay rasterise: when the operator has
+    // `show_audio_bars: true` AND `KmsDisplay::enable_bars_overlay`
+    // succeeded at startup, we paint the meter snapshot into the
+    // dedicated ARGB8888 overlay-plane buffer so the next atomic
+    // commit composes both planes (primary = video, overlay = bars)
+    // at vblank. This keeps the zero-copy path on for `show_audio_bars`
+    // workflows. Hosts where the overlay couldn't be enabled (no
+    // suitable plane / driver lacks atomic) fall through with no bars
+    // — the operator opted into VAAPI-on-no-overlay-host explicitly
+    // (forced `hw_decode: vaapi`), and the legacy `set_crtc` path
+    // can't compose multi-plane.
+    if let Some(prime) = frame.prime.as_ref() {
+        if let (Some(snapshot), Some((dst_w, dst_h))) = (meter, kms.bars_overlay_dims()) {
+            if let Some(mut map) = kms.bars_overlay_buffer() {
+                let snap = snapshot.load();
+                let pitch = map.pitch() as usize;
+                crate::display::audio_bars::rasterise_overlay(
+                    &snap,
+                    map.as_mut(),
+                    pitch,
+                    dst_w,
+                    dst_h,
+                );
+                crate::display::audio_bars::rasterise_header_overlay(
+                    &snap,
+                    &stream_header,
+                    map.as_mut(),
+                    pitch,
+                    dst_w,
+                    dst_h,
+                );
+            }
+        }
+        // HDR signalling on the prime path. When the source carries
+        // PQ / HLG transfer AND the panel can do HDR (the decode
+        // task only routes HDR sources here when both are true), set
+        // the connector's `HDR_OUTPUT_METADATA` so the next atomic
+        // commit transmits the Dynamic Range and Mastering InfoFrame
+        // alongside the FB flip — single vblank, both metadata and
+        // pixels move together. SDR sources (or HDR sources whose
+        // panel can't signal HDR but whose download to sysmem
+        // failed) clear the metadata so the connector reverts to
+        // SDR signalling. Both calls are idempotent when the EOTF
+        // hasn't changed.
+        let eotf = match frame.color_transfer {
+            16 => Some(crate::display::kms::HdrEotf::Pq),
+            18 => Some(crate::display::kms::HdrEotf::Hlg),
+            _ => None,
+        };
+        match eotf {
+            Some(e) if kms.panel_hdr_capable() => {
+                if let Err(err) = kms.set_hdr_output_metadata(e, None, None, None, None) {
+                    tracing::warn!(
+                        "HDR_OUTPUT_METADATA programming failed: {err:#}"
+                    );
+                }
+            }
+            _ => kms.clear_hdr_output_metadata(),
+        }
+        if let Err(e) = kms.present_prime(&prime.descriptor, prime.keepalive.clone()) {
+            // Log the underlying KMS / DRM error so a runtime probe-vs-
+            // present mismatch is debuggable. Without this, the display
+            // task silently drops every frame and `frames_displayed`
+            // sits at zero — the symptom we hit on Intel iHD when
+            // `add_planar_framebuffer` rejected the modifier.
+            tracing::warn!(
+                width = prime.descriptor.width,
+                height = prime.descriptor.height,
+                fourcc = format!("0x{:08x}", prime.descriptor.fourcc),
+                modifier = format!("0x{:016x}", prime.descriptor.modifier),
+                planes = prime.descriptor.planes.len(),
+                "display zero-copy present failed: {e:#}"
+            );
+            return Err(anyhow::anyhow!("display zero-copy present failed: {e}"));
+        }
+        return Ok(());
+    }
+
+    // CPU-blit path. Drop any retained PRIME state from a prior
+    // zero-copy run — if the previous flow was VAAPI and the source
+    // demoted to a SW-decoded codec mid-stream, the kernel still
+    // holds an FB pointing at a VAAPI surface in the scanout slot.
+    // `release_prime_state` is a no-op when no state is held, so the
+    // steady-state CPU path pays nothing. Also drop any HDR
+    // signalling — the CPU-blit + tonemap path produces SDR BGRA, so
+    // the panel must come out of HDR mode before the next flip.
+    kms.release_prime_state();
+    kms.clear_hdr_output_metadata();
+
     let mut map = kms.back_buffer()?;
     let pitch = map.pitch() as usize;
     let dst_w = map.width();
@@ -2437,6 +2906,12 @@ fn blit_and_present(
                 pitch,
             )
             .map_err(|e| anyhow::anyhow!("display scale failed: {e}"))?,
+        VideoFrameChroma::None => {
+            // Should only land here if a VAAPI frame escapes the
+            // zero-copy fast path AND has empty plane data — drop it
+            // rather than silently mis-rendering.
+            return Ok(());
+        }
     }
 
     // HDR → SDR tonemap. libswscale's YUV→RGB matrix gives BGRA values
@@ -2457,11 +2932,74 @@ fn blit_and_present(
         // and never allocates on the hot path.
         let snap = snapshot.load();
         crate::display::audio_bars::rasterise(&snap, dst, pitch, dst_w, dst_h);
+        crate::display::audio_bars::rasterise_header(
+            &snap,
+            &stream_header,
+            dst,
+            pitch,
+            dst_w,
+            dst_h,
+        );
     }
 
     drop(map);
     kms.present()?;
     Ok(())
+}
+
+/// Compose the per-frame stream-info header (codec + dims + fps + HDR
+/// signal + video / audio PIDs + program) into `buf`. Reuses the
+/// caller's `String` allocation (`String::clear` keeps the heap; the
+/// formatted line settles to a single small allocation after the
+/// first frame). Single line — the strip's existing top label row is
+/// the only place left of the audio meter blocks where it can sit
+/// without trampling either the bars or the per-block labels.
+///
+/// The format is tuned for broadcast-pro confidence monitoring:
+/// `"HEVC 1920x1080 50p HDR-PQ V:0x100 A:0x101 PROG 1"`. Fields drop
+/// out cleanly when the demuxer hasn't locked them yet (PID = `None`,
+/// fps still on the 30 fps default before PTS deltas stabilise) so a
+/// freshly-armed flow shows what it knows without `0x0` / `0p`
+/// placeholders.
+fn compose_stream_header(buf: &mut String, frame: &VideoFrame, frame_period_ms: i64) {
+    use std::fmt::Write;
+    buf.clear();
+    let codec_name = match frame.codec {
+        VideoCodec::H264 => "H.264",
+        VideoCodec::Hevc => "HEVC",
+        VideoCodec::Mpeg2 => "MPEG-2",
+    };
+    let _ = write!(buf, "{} {}x{}", codec_name, frame.width, frame.height);
+    // fps from the running frame-period EMA. The 33 ms initial value
+    // is the same default the mode picker uses; suppress it so we
+    // don't show "30p" before the source frame rate has stabilised.
+    if frame_period_ms > 0 && frame_period_ms != 33 {
+        let fps = (1000.0_f32 / frame_period_ms as f32).round() as u32;
+        let _ = write!(buf, " {fps}p");
+    }
+    // HDR transfer (PQ = SMPTE 2084 = 16, HLG = ARIB STD-B67 = 18).
+    // Skip BT.709 (1) / unspecified (0/2) — those are SDR and the
+    // header would just be repeating the implicit default.
+    match frame.color_transfer {
+        16 => { let _ = write!(buf, " HDR-PQ"); }
+        18 => { let _ = write!(buf, " HDR-HLG"); }
+        _ => {}
+    }
+    // Wide gamut signal (BT.2020 NCL = 9, BT.2020 CL = 10). Most
+    // broadcast contribution still rides BT.709 — surfacing only the
+    // exceptions keeps the header short.
+    if matches!(frame.colorspace, 9 | 10) {
+        let _ = write!(buf, " BT.2020");
+    }
+    if let Some(pid) = frame.video_pid {
+        let _ = write!(buf, " V:0x{pid:X}");
+    }
+    if let Some(pid) = frame.audio_pid {
+        let _ = write!(buf, " A:0x{pid:X}");
+    }
+    if let Some(prog) = frame.program_number {
+        let _ = write!(buf, " PROG {prog}");
+    }
 }
 
 // ── Audio child ───────────────────────────────────────────────────
@@ -2599,6 +3137,7 @@ mod tests {
                 v: vec![0; 4],
                 v_stride: 2,
             },
+            prime: None,
             width: 4,
             height: 4,
             pixel_format: 0, // YUV420P
@@ -2608,10 +3147,15 @@ mod tests {
             pts_90k: 0,
             frame_gen: 0,
             codec: VideoCodec::H264,
+            video_pid: None,
+            audio_pid: None,
+            program_number: None,
         };
         match planar.chroma {
             VideoFrameChroma::Planar { .. } => {}
-            VideoFrameChroma::SemiPlanar { .. } => panic!("expected Planar arm"),
+            VideoFrameChroma::SemiPlanar { .. } | VideoFrameChroma::None => {
+                panic!("expected Planar arm")
+            }
         }
 
         let semi = VideoFrame {
@@ -2621,6 +3165,7 @@ mod tests {
                 uv: vec![0; 8],
                 uv_stride: 4,
             },
+            prime: None,
             width: 4,
             height: 4,
             pixel_format: AVPixelFormat_AV_PIX_FMT_NV12_VAL,
@@ -2630,10 +3175,15 @@ mod tests {
             pts_90k: 0,
             frame_gen: 0,
             codec: VideoCodec::Hevc,
+            video_pid: None,
+            audio_pid: None,
+            program_number: None,
         };
         match semi.chroma {
             VideoFrameChroma::SemiPlanar { .. } => {}
-            VideoFrameChroma::Planar { .. } => panic!("expected SemiPlanar arm"),
+            VideoFrameChroma::Planar { .. } | VideoFrameChroma::None => {
+                panic!("expected SemiPlanar arm")
+            }
         }
     }
 }

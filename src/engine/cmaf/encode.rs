@@ -105,6 +105,10 @@ impl AudioReencoder {
                 target_bitrate_kbps,
                 target_sample_rate: sr,
                 target_channels: ch,
+                opus_vbr_mode: cfg.opus_vbr_mode.clone(),
+                opus_fec: cfg.opus_fec,
+                opus_dtx: cfg.opus_dtx,
+                opus_frame_duration_ms: cfg.opus_frame_duration_ms,
             };
             let enc = AudioEncoder::spawn(
                 params,
@@ -234,6 +238,14 @@ impl AudioReencoder {
                 target_bitrate_kbps: self.target_bitrate_kbps,
                 target_sample_rate: self.target_sample_rate.unwrap_or(source_sr),
                 target_channels: self.target_channels.unwrap_or(source_ch),
+                // CMAF rejects Opus at construction (see `Self::new`),
+                // so the Opus knobs are unreachable on this method's
+                // path. Using None / false keeps the field defaults
+                // explicit at the construction site.
+                opus_vbr_mode: None,
+                opus_fec: false,
+                opus_dtx: false,
+                opus_frame_duration_ms: None,
             };
             let enc = AudioEncoder::spawn(
                 params,
@@ -286,6 +298,14 @@ impl AudioReencoder {
                 target_bitrate_kbps: self.target_bitrate_kbps,
                 target_sample_rate: self.target_sample_rate.unwrap_or(source_sr),
                 target_channels: self.target_channels.unwrap_or(source_ch),
+                // CMAF rejects Opus at construction (see `Self::new`),
+                // so the Opus knobs are unreachable on this method's
+                // path. Using None / false keeps the field defaults
+                // explicit at the construction site.
+                opus_vbr_mode: None,
+                opus_fec: false,
+                opus_dtx: false,
+                opus_frame_duration_ms: None,
             };
             let enc = AudioEncoder::spawn(
                 params,
@@ -540,6 +560,10 @@ mod reencoder_tests {
             sample_rate: None,
             channels: None,
             silent_fallback,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
         }
     }
 

@@ -138,6 +138,58 @@ pub struct EncoderParams {
     pub target_sample_rate: u32,
     /// Resolved target channel count. Defaults to `channels`.
     pub target_channels: u8,
+    /// Opus rate-control mode (`"vbr"` / `"cbr"`). `None` keeps the
+    /// libopus default (unconstrained VBR). Ignored for non-Opus codecs.
+    #[allow(dead_code)] // consumed below in build_ffmpeg_args
+    pub opus_vbr_mode: Option<String>,
+    /// Opus FEC enable. Ignored for non-Opus.
+    #[allow(dead_code)]
+    pub opus_fec: bool,
+    /// Opus DTX enable. Ignored for non-Opus.
+    #[allow(dead_code)]
+    pub opus_dtx: bool,
+    /// Opus frame duration in ms (5/10/20/40/60). `None` defaults to 20.
+    #[allow(dead_code)]
+    pub opus_frame_duration_ms: Option<u8>,
+}
+
+impl EncoderParams {
+    /// Construct with sensible defaults — every field that's optional
+    /// (the Opus knobs) starts at `None` / `false`. Required fields
+    /// must be passed by the caller. Use struct-update syntax to
+    /// override Opus knobs from a `VideoEncodeConfig`-style config:
+    ///
+    /// ```ignore
+    /// EncoderParams {
+    ///     opus_vbr_mode: cfg.opus_vbr_mode.clone(),
+    ///     opus_fec: cfg.opus_fec,
+    ///     opus_dtx: cfg.opus_dtx,
+    ///     opus_frame_duration_ms: cfg.opus_frame_duration_ms,
+    ///     ..EncoderParams::core(codec, sample_rate, channels, target_bitrate_kbps,
+    ///                           target_sample_rate, target_channels)
+    /// }
+    /// ```
+    pub fn core(
+        codec: AudioCodec,
+        sample_rate: u32,
+        channels: u8,
+        target_bitrate_kbps: u32,
+        target_sample_rate: u32,
+        target_channels: u8,
+    ) -> Self {
+        Self {
+            codec,
+            sample_rate,
+            channels,
+            target_bitrate_kbps,
+            target_sample_rate,
+            target_channels,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
+        }
+    }
 }
 
 /// Construction / runtime errors from the encoder.
@@ -1051,15 +1103,42 @@ fn build_ffmpeg_args(params: &EncoderParams) -> Vec<String> {
             // Opus mandates 48 kHz on the wire (libopus internal rate).
             // Mux as ogg so each Opus packet lands in a discrete OGG page
             // we can frame on stdout.
+            //
+            // libopus rate-control modes via ffmpeg's `-vbr` flag:
+            //   `on` (default)   — unconstrained VBR
+            //   `constrained`    — VBR with a peak cap (bitrate-aware)
+            //   `off`            — true CBR
+            // Mapping `opus_vbr_mode`:
+            //   None       → keep libopus default (unconstrained VBR)
+            //   "vbr"      → `constrained` (better BWE behaviour over UDP)
+            //   "cbr"      → `off`
+            let vbr_flag = match params.opus_vbr_mode.as_deref() {
+                Some("cbr") => Some("off"),
+                Some("vbr") => Some("constrained"),
+                _ => None,
+            };
+            let frame_dur = params.opus_frame_duration_ms.unwrap_or(20);
             args.extend([
                 "-c:a".into(), "libopus".into(),
                 "-b:a".into(), bitrate,
                 "-application".into(), "audio".into(),
-                "-frame_duration".into(), "20".into(),
+                "-frame_duration".into(), frame_dur.to_string(),
                 "-ar".into(), "48000".into(),
                 "-ac".into(), target_ch,
-                "-f".into(), "ogg".into(),
             ]);
+            if let Some(mode) = vbr_flag {
+                args.extend(["-vbr".into(), mode.into()]);
+            }
+            // FEC + DTX are encoder-level toggles; libopus exposes them
+            // via the AVDictionary on the codec context, which ffmpeg
+            // surfaces as bare `-fec on/off` and `-dtx on/off`.
+            if params.opus_fec {
+                args.extend(["-fec".into(), "on".into()]);
+            }
+            if params.opus_dtx {
+                args.extend(["-dtx".into(), "on".into()]);
+            }
+            args.extend(["-f".into(), "ogg".into()]);
         }
         AudioCodec::Mp2 => {
             args.extend([
@@ -2068,6 +2147,10 @@ mod tests {
             target_bitrate_kbps: 128,
             target_sample_rate: 48_000,
             target_channels: 2,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
         };
         let args = build_ffmpeg_args(&params);
         let joined = args.join(" ");
@@ -2091,6 +2174,10 @@ mod tests {
             target_bitrate_kbps: 96,
             target_sample_rate: 44_100, // ignored — Opus forces 48 kHz
             target_channels: 2,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
         };
         let args = build_ffmpeg_args(&params);
         let joined = args.join(" ");
@@ -2116,6 +2203,10 @@ mod tests {
                 target_bitrate_kbps: 64,
                 target_sample_rate: 48_000,
                 target_channels: 2,
+                opus_vbr_mode: None,
+                opus_fec: false,
+                opus_dtx: false,
+                opus_frame_duration_ms: None,
             };
             let args = build_ffmpeg_args(&params);
             let joined = args.join(" ");
@@ -2421,6 +2512,10 @@ mod tests {
             target_bitrate_kbps: 64,
             target_sample_rate: 48_000,
             target_channels: 2,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
         };
         let cancel = CancellationToken::new();
         let stats = Arc::new(OutputStatsAccumulator::new(
@@ -2495,6 +2590,10 @@ mod tests {
             target_bitrate_kbps: 128,
             target_sample_rate: 48_000,
             target_channels: 2,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
         };
         let cancel = CancellationToken::new();
         let stats = Arc::new(OutputStatsAccumulator::new(
@@ -2523,6 +2622,10 @@ mod tests {
             target_bitrate_kbps: 128,
             target_sample_rate: 48_000,
             target_channels: 2,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
         };
         let cancel = CancellationToken::new();
         let stats = Arc::new(OutputStatsAccumulator::new(
@@ -2572,6 +2675,10 @@ mod tests {
             target_bitrate_kbps: 64,
             target_sample_rate: 44_100,
             target_channels: 2,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
         };
         let cancel = CancellationToken::new();
         let stats = Arc::new(OutputStatsAccumulator::new(

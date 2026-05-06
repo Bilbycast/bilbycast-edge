@@ -229,6 +229,23 @@ pub struct HwEncoderChromaCapability {
     #[serde(default)] pub libx265_yuv420_10bit: bool,
     #[serde(default)] pub libx264_yuv422_10bit: bool,
     #[serde(default)] pub libx265_yuv422_10bit: bool,
+
+    // VAAPI per-(codec, chroma, bit-depth) cells. H.264 VAAPI is
+    // 4:2:0 8-bit only on every implementation, so only the HEVC
+    // VAAPI rows have non-baseline cells. Driver support varies:
+    //   • Intel iHD (Tiger Lake / 11th gen+): HEVC 4:2:2 8/10-bit.
+    //   • AMD VCN (radeonsi): generally 4:2:0 only — broadcast 4:2:2
+    //     contribution on AMD typically falls back to libx265.
+    /// HEVC 4:2:0 10-bit (P010LE) — Intel iHD on Skylake+, AMD VCN
+    /// on RDNA2+. The most-common 10-bit broadcast cell.
+    #[serde(default)] pub hevc_vaapi_yuv420_10bit: bool,
+    /// HEVC 4:2:2 8-bit (NV16) — Intel iHD on Tiger Lake+ HEVC. The
+    /// SDI baseband contribution standard. AMD VCN typically rejects.
+    #[serde(default)] pub hevc_vaapi_yuv422_8bit: bool,
+    /// HEVC 4:2:2 10-bit (P210LE) — Intel iHD on Tiger Lake+ HEVC.
+    /// The 10-bit SDI broadcast contribution standard (used in both
+    /// SDR and HDR workflows). AMD VCN typically rejects.
+    #[serde(default)] pub hevc_vaapi_yuv422_10bit: bool,
 }
 
 impl HwEncoderChromaCapability {
@@ -249,7 +266,37 @@ impl HwEncoderChromaCapability {
             || self.libx264_yuv420_10bit
             || self.libx265_yuv420_10bit
             || self.libx264_yuv422_10bit
-            || self.libx265_yuv422_10bit)
+            || self.libx265_yuv422_10bit
+            || self.hevc_vaapi_yuv420_10bit
+            || self.hevc_vaapi_yuv422_8bit
+            || self.hevc_vaapi_yuv422_10bit)
+    }
+}
+
+/// VAAPI capability tagged by direction. Newer wire shape that
+/// disambiguates the four VAAPI booleans operators commonly want to
+/// distinguish — Mesa radeonsi (AMD) on older RDNA cards has decode
+/// but not all HEVC encode profiles; Intel iHD on Skylake+ generally
+/// has both. The legacy `HwCodecCapability::{h264,hevc}_vaapi` fields
+/// stay populated to mirror these values for older managers.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct VaapiCapability {
+    #[serde(default)]
+    pub h264_encode: bool,
+    #[serde(default)]
+    pub h264_decode: bool,
+    #[serde(default)]
+    pub hevc_encode: bool,
+    #[serde(default)]
+    pub hevc_decode: bool,
+}
+
+impl VaapiCapability {
+    /// `true` when no field is set — the manager UI hides the VAAPI
+    /// row entirely on hosts where libva isn't installed or the user
+    /// doesn't have render-node access.
+    pub fn is_empty(&self) -> bool {
+        !(self.h264_encode || self.h264_decode || self.hevc_encode || self.hevc_decode)
     }
 }
 
@@ -270,6 +317,12 @@ pub struct StaticCapabilities {
     /// the flow modal off this matrix so an operator can't pick a
     /// combination the host's iGPU / GPU genuinely can't do.
     pub hw_encoder_chroma: HwEncoderChromaCapability,
+    /// VAAPI capability split by direction. New managers prefer this
+    /// flat-named view; older managers fall back to the legacy
+    /// `hw_encoders.{h264,hevc}_vaapi` / `hw_decoders.{h264,hevc}_vaapi`
+    /// pair, which is mirrored to the same values.
+    #[serde(default, skip_serializing_if = "VaapiCapability::is_empty")]
+    pub vaapi: VaapiCapability,
     pub cpu: CpuInfo,
     pub sw_capacity: SwCapacityEstimate,
 }
@@ -357,6 +410,16 @@ pub fn probe_static_capabilities() -> StaticCapabilities {
     let hw_encoders = probe_hw_encoders();
     let hw_decoders = probe_hw_decoders();
     let hw_encoder_chroma = probe_encoder_chroma_capability(&hw_encoders);
+    // VAAPI direction-tagged view — assembled from the encoder + decoder
+    // probe results so older managers (reading the legacy
+    // `hw_encoders.h264_vaapi` field) and newer managers (reading
+    // `vaapi.h264_encode`) report the same answer.
+    let vaapi = VaapiCapability {
+        h264_encode: hw_encoders.h264_vaapi,
+        h264_decode: hw_decoders.h264_vaapi,
+        hevc_encode: hw_encoders.hevc_vaapi,
+        hevc_decode: hw_decoders.hevc_vaapi,
+    };
     let session_probe_enabled = session_limit_probe_enabled();
     let hw_encoder_session_limits = if session_probe_enabled {
         probe_encoder_session_limits(&hw_encoders)
@@ -378,6 +441,7 @@ pub fn probe_static_capabilities() -> StaticCapabilities {
         hw_encoder_session_limits,
         hw_decoder_session_limits,
         hw_encoder_chroma,
+        vaapi,
         cpu,
         sw_capacity,
     }
@@ -422,6 +486,18 @@ fn probe_encoder_chroma_capability(hw: &HwCodecCapability) -> HwEncoderChromaCap
         out.hevc_amf_yuv422_8bit  = probe_chroma("hevc_amf", video_engine::ProbeChroma::Yuv422_8bit);
         out.hevc_amf_yuv420_10bit = probe_chroma("hevc_amf", video_engine::ProbeChroma::Yuv420_10bit);
     }
+    // VAAPI per-cell probes via `VideoEncoder::open()` — the generic
+    // `probe_chroma` path doesn't set up the AVHWDeviceContext +
+    // hw_frames_ctx that VAAPI requires. Only HEVC has non-baseline
+    // cells (h264_vaapi is 4:2:0 8-bit only on every implementation).
+    if hw.hevc_vaapi {
+        out.hevc_vaapi_yuv420_10bit =
+            probe_vaapi_chroma("hevc_vaapi", video_engine::ProbeChroma::Yuv420_10bit);
+        out.hevc_vaapi_yuv422_8bit =
+            probe_vaapi_chroma("hevc_vaapi", video_engine::ProbeChroma::Yuv422_8bit);
+        out.hevc_vaapi_yuv422_10bit =
+            probe_vaapi_chroma("hevc_vaapi", video_engine::ProbeChroma::Yuv422_10bit);
+    }
 
     out
 }
@@ -452,6 +528,33 @@ fn probe_chroma(name: &str, chroma: video_engine::ProbeChroma) -> bool {
         }
         Err(e) => {
             tracing::debug!("chroma probe failed: {name} {}: {e}", chroma.label());
+            false
+        }
+    }
+}
+
+/// VAAPI-aware chroma/bit-depth probe. Routes through
+/// `probe_open_vaapi_encoder_chroma` which exercises the full
+/// hwdevice + hw_frames_ctx setup — `probe_chroma` (which uses the
+/// generic encoder probe) returns false for every VAAPI cell because
+/// VAAPI encoders require an `AVHWDeviceContext` set on the codec
+/// context before `avcodec_open2`.
+#[cfg(feature = "video-thumbnail")]
+fn probe_vaapi_chroma(name: &str, chroma: video_engine::ProbeChroma) -> bool {
+    match video_engine::probe_open_vaapi_encoder_chroma(name, chroma) {
+        Ok(()) => {
+            tracing::debug!("vaapi chroma probe ok: {name} {}", chroma.label());
+            true
+        }
+        Err(video_engine::ProbeError::NotCompiled) => {
+            tracing::trace!(
+                "vaapi chroma probe skipped: {name} {} (not supported by encoder)",
+                chroma.label()
+            );
+            false
+        }
+        Err(e) => {
+            tracing::debug!("vaapi chroma probe failed: {name} {}: {e}", chroma.label());
             false
         }
     }
@@ -513,7 +616,14 @@ fn probe_encoder_session_limits(hw: &HwCodecCapability) -> HwSessionLimits {
     }
     if hw.h264_vaapi || hw.hevc_vaapi {
         let probe_codec = if hw.h264_vaapi { "h264_vaapi" } else { "hevc_vaapi" };
-        let n = video_engine::count_max_encoder_sessions(probe_codec, SESSION_PROBE_UPPER_BOUND);
+        // VAAPI session-count probe needs the full `VideoEncoder::open()`
+        // path (hwdevice + frames-context setup), not the generic
+        // `count_max_encoder_sessions` which uses `try_open_encoder_context`
+        // and would return 0 every time on VAAPI.
+        let n = video_engine::count_max_vaapi_encoder_sessions(
+            probe_codec,
+            SESSION_PROBE_UPPER_BOUND,
+        );
         if n > 0 {
             tracing::info!("vaapi encoder session capacity probed: {n}");
             out.vaapi_max_sessions = Some(n);
@@ -579,13 +689,14 @@ fn probe_hw_encoders() -> HwCodecCapability {
         hevc_videotoolbox: probe_videotoolbox_encoder("hevc_videotoolbox"),
         h264_amf: probe_runtime_encoder("h264_amf"),
         hevc_amf: probe_runtime_encoder("hevc_amf"),
-        // VAAPI: today the codepath in `video-engine::VideoEncoder::open`
-        // returns "not yet implemented" before reaching `avcodec_open2`,
-        // so the runtime probe always reports `false` even when libva
-        // is installed. The follow-up that adds `AVHWDeviceContext`
-        // wiring will flip this on automatically.
-        h264_vaapi: probe_runtime_encoder("h264_vaapi"),
-        hevc_vaapi: probe_runtime_encoder("hevc_vaapi"),
+        // VAAPI encoder probe routes through `VideoEncoder::open()` so
+        // it exercises the full hwdevice + frames-context setup —
+        // `probe_open_encoder` (which reuses the generic
+        // `try_open_encoder_context`) doesn't, and would always fail
+        // because VAAPI requires `hw_device_ctx` set on the codec
+        // before `avcodec_open2`.
+        h264_vaapi: probe_runtime_vaapi_encoder("h264_vaapi"),
+        hevc_vaapi: probe_runtime_vaapi_encoder("hevc_vaapi"),
     }
 }
 
@@ -603,13 +714,73 @@ fn probe_hw_decoders() -> HwCodecCapability {
         // decode now.
         h264_amf: false,
         hevc_amf: false,
-        // VAAPI decode — same caveat as encode: avcodec_open2 fails
-        // until the device-context plumbing lands. Today the probe
-        // reports `false` everywhere; the wire shape is in place for a
-        // future enable.
-        h264_vaapi: probe_runtime_decoder("h264_vaapi"),
-        hevc_vaapi: probe_runtime_decoder("hevc_vaapi"),
+        // VAAPI decode — VAAPI is implemented in FFmpeg as a HWACCEL
+        // attached to the standard `h264` / `hevc` SW decoders, NOT a
+        // separately-named decoder entry. So `avcodec_find_decoder_by_name(
+        // "h264_vaapi")` returns NULL even on a working VAAPI host.
+        // The right probe is "can we open an `AV_HWDEVICE_TYPE_VAAPI`
+        // hwdevice on the default render node?" — when that succeeds,
+        // every codec with a `--enable-hwaccel=*_vaapi` flag in the
+        // build (h264 / hevc / mpeg2 today) can use the zero-copy
+        // path. Cache the result so we don't open + tear down the
+        // VAAPI device twice in the probe.
+        h264_vaapi: probe_runtime_vaapi_device(),
+        hevc_vaapi: probe_runtime_vaapi_device(),
     }
+}
+
+/// Probe whether a VAAPI hwdevice can be opened against the default
+/// render node. `true` iff `av_hwdevice_ctx_create(VAAPI, ...)`
+/// succeeds — confirms libva + the kernel driver (i915 / amdgpu /
+/// nouveau) are wired up and the running user has permission on
+/// `/dev/dri/renderD128`. Cheap (~10 ms) and idempotent; called once
+/// per startup-probe pass.
+#[cfg(feature = "video-thumbnail")]
+fn probe_runtime_vaapi_device() -> bool {
+    match video_engine::VaapiDevice::open(None) {
+        Ok(_) => {
+            tracing::debug!("vaapi hwdevice probe ok");
+            true
+        }
+        Err(e) => {
+            tracing::debug!("vaapi hwdevice probe failed: {e}");
+            false
+        }
+    }
+}
+
+#[cfg(not(feature = "video-thumbnail"))]
+fn probe_runtime_vaapi_device() -> bool {
+    false
+}
+
+/// VAAPI encoder probe via the full `VideoEncoder::open()` path.
+/// Confirms hwdevice + frames-context setup + `avcodec_open2` with the
+/// VAAPI codec all succeed for the requested codec at 320×240 8-bit
+/// 4:2:0 — meaningful answer for "can this host encode H.264 / HEVC
+/// via VAAPI right now?". Build prerequisite: `video-encoder-vaapi`
+/// feature on the `video-engine` crate.
+#[cfg(feature = "video-thumbnail")]
+fn probe_runtime_vaapi_encoder(name: &str) -> bool {
+    match video_engine::probe_open_vaapi_encoder(name) {
+        Ok(()) => {
+            tracing::debug!("vaapi encoder probe ok: {name}");
+            true
+        }
+        Err(video_engine::ProbeError::NotCompiled) => {
+            tracing::trace!("vaapi encoder not compiled in: {name}");
+            false
+        }
+        Err(e) => {
+            tracing::debug!("vaapi encoder probe failed: {name}: {e}");
+            false
+        }
+    }
+}
+
+#[cfg(not(feature = "video-thumbnail"))]
+fn probe_runtime_vaapi_encoder(_: &str) -> bool {
+    false
 }
 
 /// Generic runtime encoder probe — try `avcodec_open2`, classify the
@@ -940,23 +1111,33 @@ impl NvmlPoller {
 /// budget. Values are deterministic (no measurement) and anchored to
 /// the cost notes documented in the project root `CLAUDE.md`.
 ///
-/// | Flow shape                              | Units |
+/// | Flow shape                                          | Base units    |
 /// |---|---|
-/// | Passthrough flow (base)                 | 1     |
-/// | Each video_encode output (HW)           | 100   |
-/// | Each video_encode output (SW)           | 500   |
-/// | Each audio_encode output                | 5     |
-/// | content_analysis = lite                 | 2     |
-/// | content_analysis = audio_full           | 20    |
-/// | content_analysis = video_full           | 50    |
-/// | recording (replay) enabled              | 5     |
+/// | Passthrough flow (base)                             | 1             |
+/// | Each video_encode output (HW, 1080p30 4:2:0 8-bit)  | 100 × scale   |
+/// | Each video_encode output (SW, 1080p30 4:2:0 8-bit)  | 500 × scale   |
+/// | Each audio_encode output                            | 5             |
+/// | content_analysis = lite                             | 2             |
+/// | content_analysis = audio_full                       | 20            |
+/// | content_analysis = video_full                       | 50            |
+/// | recording (replay) enabled                          | 5             |
+///
+/// `scale` for video_encode = (width × height × fps) / (1920 × 1080 × 30)
+///   × 1.5 if 10-bit
+///   × 1.33 if 4:2:2 chroma  (× 2.0 if 4:4:4)
+///
+/// `derive_cost_plan` precomputes the scaled units per output (since
+/// the resolution / fps / chroma data lives on the per-output config,
+/// not on the aggregated plan), so [`FlowCostPlan::hw_video_encode_units`]
+/// already carries the pixel-rate-aware value. This function just adds
+/// it onto the base.
 ///
 /// All flows pay the base passthrough cost (1) regardless of shape.
 /// Transcoding / analysis / recording add on top.
 pub fn compute_flow_cost_units(plan: &FlowCostPlan) -> u32 {
     let mut units: u32 = 1; // base
-    units = units.saturating_add(100u32.saturating_mul(plan.hw_video_encode_outputs));
-    units = units.saturating_add(500u32.saturating_mul(plan.sw_video_encode_outputs));
+    units = units.saturating_add(plan.hw_video_encode_units);
+    units = units.saturating_add(plan.sw_video_encode_units);
     units = units.saturating_add(5u32.saturating_mul(plan.audio_encode_outputs));
     // Local-display outputs split into two cost tiers based on whether
     // the resolved decoder backend lands on CPU or HW. CPU-decoded
@@ -992,10 +1173,23 @@ pub fn compute_flow_cost_units(plan: &FlowCostPlan) -> u32 {
 /// from `FlowConfig` so tests can drive the cost model directly and so
 /// the same shape can be derived from either an existing flow's runtime
 /// config or a candidate flow in the manager preflight.
+///
+/// **Units, not counts**: `hw_video_encode_units` and `sw_video_encode_units`
+/// are pre-weighted unit totals (resolution / fps / bit-depth / chroma all
+/// folded in by `derive_cost_plan`'s [`weighted_video_encode_units`]) so a
+/// 4K60 HEVC 4:2:2 10-bit output rolls up at ~10× the cost of a 720p30 H.264
+/// 4:2:0 8-bit output, mirroring the actual GPU / CPU pressure delta.
+/// Per-family session counts (`nvenc_sessions` etc.) stay as plain counts
+/// because the manager uses them against the probed session limits, where
+/// each session is one slot regardless of resolution.
 #[derive(Debug, Clone, Default)]
 pub struct FlowCostPlan {
-    pub hw_video_encode_outputs: u32,
-    pub sw_video_encode_outputs: u32,
+    /// HW video encode units — pre-weighted, 100 = 1080p30 4:2:0 8-bit
+    /// baseline. See `weighted_video_encode_units` for the formula.
+    pub hw_video_encode_units: u32,
+    /// SW (libx264 / libx265) video encode units — pre-weighted, 500 =
+    /// 1080p30 4:2:0 8-bit baseline.
+    pub sw_video_encode_units: u32,
     pub audio_encode_outputs: u32,
     /// Number of `display` outputs on the flow that decode video on
     /// the CPU (libavcodec). Counted separately from
@@ -1160,6 +1354,55 @@ pub fn compute_units_total(cpu: &CpuInfo) -> u32 {
     1000u32.saturating_add(200u32.saturating_mul(cpu.physical_cores.max(1)))
 }
 
+/// Compute pixel-rate-aware cost units for one video_encode output.
+///
+/// Anchored to a 1080p30 SDR 4:2:0 8-bit baseline. Scales linearly with
+/// pixels-per-second, then applies a flat 1.5× for 10-bit and a chroma
+/// multiplier (1.33× for 4:2:2, 2.0× for 4:4:4) to capture the extra
+/// bandwidth and arithmetic the encoder pipeline does at higher
+/// chroma resolutions. Bounded below at the per-output cost weight so a
+/// pathological (or just-unset-yet) resolution doesn't underprice the
+/// flow at flow-start time.
+///
+/// `is_hw` selects the 100-unit (HW) vs 500-unit (SW) baseline. The
+/// `width` / `height` / `fps_num` / `fps_den` / `bit_depth` / `chroma`
+/// arguments come straight from the operator's `VideoEncodeConfig`;
+/// pass `None` to defaults that match the runtime fall-throughs (1080p,
+/// 30 fps, 8-bit, 4:2:0).
+pub fn weighted_video_encode_units(
+    is_hw: bool,
+    width: Option<u32>,
+    height: Option<u32>,
+    fps_num: Option<u32>,
+    fps_den: Option<u32>,
+    bit_depth: Option<u8>,
+    chroma: Option<&str>,
+) -> u32 {
+    let base = if is_hw { 100u32 } else { 500u32 };
+    let baseline_pps = 1920.0_f32 * 1080.0 * 30.0;
+    let w = width.unwrap_or(1920) as f32;
+    let h = height.unwrap_or(1080) as f32;
+    let fps = match (fps_num, fps_den) {
+        (Some(n), Some(d)) if d > 0 => (n as f32) / (d as f32),
+        _ => 30.0,
+    }
+    .max(1.0);
+    let mut factor = (w * h * fps) / baseline_pps;
+    if bit_depth.unwrap_or(8) == 10 {
+        factor *= 1.5;
+    }
+    match chroma.unwrap_or("yuv420p") {
+        "yuv422p" => factor *= 1.33,
+        "yuv444p" => factor *= 2.0,
+        _ => {}
+    }
+    let scaled = (base as f32 * factor).round();
+    // Floor at the baseline so a 240p test flow doesn't accidentally
+    // count as zero units; ceiling at 100 000 so a misconfigured 16K120
+    // doesn't overflow the running total.
+    scaled.clamp(base as f32, 100_000.0) as u32
+}
+
 // ── Static caps singleton ──────────────────────────────────────────
 //
 // `probe_static_capabilities()` runs once at startup in `main.rs`. We
@@ -1273,17 +1516,29 @@ pub fn resolve_display_decoder(
     match pref {
         HwDecodePreference::Cpu => Ok(ResolvedDisplayDecoder::Cpu),
         HwDecodePreference::Auto => {
-            // Auto priority: NVDEC ≻ QSV ≻ VAAPI ≻ CPU. NVDEC and QSV
-            // expose more rate-control / format detail per their vendor
-            // APIs than the libva path on the same silicon, so prefer
-            // them when present. VAAPI is the AMD-on-Linux path and the
-            // fallback for hosts without the vendor-specific stacks.
-            if nvdec_ok {
+            // Auto priority: VAAPI ≻ NVDEC ≻ QSV ≻ CPU. With
+            // `drmModeAtomicCommit` driving the local-display
+            // page-flip (see `display::kms::KmsDisplay::present_prime`),
+            // cross-modifier flips between tiled NV12 / P010 surfaces
+            // and the linear XRGB8888 dumb buffer happen at vblank with
+            // no full-plane reconfigure — microseconds per flip rather
+            // than the 10–30 ms `drmModeSetCrtc` budget that pinned
+            // 1080p sources at ~10 fps on a 60 Hz panel. That removes
+            // the only reason we previously demoted VAAPI behind NVDEC
+            // and QSV. Zero-copy is now strictly cheaper than the
+            // NVDEC/QSV decode-then-blit pipelines on every panel rate
+            // we care about: no DMA-BUF download, no libswscale colour
+            // convert, no dumb-buffer write. NVDEC and QSV remain Auto
+            // fallbacks for hosts where atomic-commit is rejected (the
+            // edge logs `display_atomic_unavailable` once and the
+            // present path stays on legacy `set_crtc`); CPU is the
+            // last-resort fallback.
+            if vaapi_ok {
+                Ok(ResolvedDisplayDecoder::Vaapi)
+            } else if nvdec_ok {
                 Ok(ResolvedDisplayDecoder::Nvdec)
             } else if qsv_ok {
                 Ok(ResolvedDisplayDecoder::Qsv)
-            } else if vaapi_ok {
-                Ok(ResolvedDisplayDecoder::Vaapi)
             } else {
                 Ok(ResolvedDisplayDecoder::Cpu)
             }
@@ -1335,6 +1590,592 @@ impl DecoderResolutionError {
             DecoderResolutionError::ProbeUnavailable => "probe_unavailable",
         }
     }
+}
+
+/// Resolve an operator's `video_encode.hw_decode` preference (on the
+/// transcode input decoder side) into a concrete backend. Mirrors
+/// [`resolve_display_decoder`] but feature-gates on the
+/// `video-decoder-*` Cargo features instead of the `display-*`
+/// composites — operators who want HW transcode decode but no local
+/// display output build with just `video-decoder-nvdec` /
+/// `video-decoder-qsv` / `video-decoder-vaapi`.
+///
+/// Auto picks the same VAAPI ≻ NVDEC ≻ QSV ≻ CPU priority as the
+/// display path (DMA-BUF / zero-copy advantages don't apply here, but
+/// VAAPI's broader broadcast format coverage on Intel iHD does).
+pub fn resolve_transcode_decoder(
+    pref: &crate::config::models::HwDecodePreference,
+    caps: Option<&StaticCapabilities>,
+) -> Result<ResolvedDisplayDecoder, DecoderResolutionError> {
+    use crate::config::models::HwDecodePreference;
+
+    let nvdec_compiled = cfg!(feature = "video-decoder-nvdec");
+    let qsv_compiled = cfg!(feature = "video-decoder-qsv");
+    let vaapi_compiled = cfg!(feature = "video-decoder-vaapi");
+    let nvdec_ok = nvdec_compiled
+        && caps.is_some_and(|c| c.hw_decoders.h264_nvenc || c.hw_decoders.hevc_nvenc);
+    let qsv_ok = qsv_compiled
+        && caps.is_some_and(|c| c.hw_decoders.h264_qsv || c.hw_decoders.hevc_qsv);
+    let vaapi_ok = vaapi_compiled
+        && caps.is_some_and(|c| c.hw_decoders.h264_vaapi || c.hw_decoders.hevc_vaapi);
+
+    match pref {
+        HwDecodePreference::Cpu => Ok(ResolvedDisplayDecoder::Cpu),
+        HwDecodePreference::Auto => {
+            if vaapi_ok {
+                Ok(ResolvedDisplayDecoder::Vaapi)
+            } else if nvdec_ok {
+                Ok(ResolvedDisplayDecoder::Nvdec)
+            } else if qsv_ok {
+                Ok(ResolvedDisplayDecoder::Qsv)
+            } else {
+                Ok(ResolvedDisplayDecoder::Cpu)
+            }
+        }
+        HwDecodePreference::Nvdec => {
+            if !nvdec_compiled {
+                Err(DecoderResolutionError::FeatureDisabled)
+            } else if caps.is_none() {
+                Err(DecoderResolutionError::ProbeUnavailable)
+            } else if !nvdec_ok {
+                Err(DecoderResolutionError::DriverMissing)
+            } else {
+                Ok(ResolvedDisplayDecoder::Nvdec)
+            }
+        }
+        HwDecodePreference::Qsv => {
+            if !qsv_compiled {
+                Err(DecoderResolutionError::FeatureDisabled)
+            } else if caps.is_none() {
+                Err(DecoderResolutionError::ProbeUnavailable)
+            } else if !qsv_ok {
+                Err(DecoderResolutionError::DriverMissing)
+            } else {
+                Ok(ResolvedDisplayDecoder::Qsv)
+            }
+        }
+        HwDecodePreference::Vaapi => {
+            if !vaapi_compiled {
+                Err(DecoderResolutionError::FeatureDisabled)
+            } else if caps.is_none() {
+                Err(DecoderResolutionError::ProbeUnavailable)
+            } else if !vaapi_ok {
+                Err(DecoderResolutionError::DriverMissing)
+            } else {
+                Ok(ResolvedDisplayDecoder::Vaapi)
+            }
+        }
+    }
+}
+
+// ── Video-encoder resolution (Auto + explicit) ─────────────────────
+//
+// Only meaningful when `video-thumbnail` is on (no video encoder exists
+// without it). Wrapping the whole resolver in the feature gate keeps the
+// `video_codec::VideoChroma` reference inside its compile-time scope.
+
+/// Output codec family produced on the wire. The `Auto` codec strings
+/// (`h264_auto` / `hevc_auto`) carry only the family; the resolver
+/// picks the concrete backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderFamily {
+    H264,
+    Hevc,
+}
+
+/// Resolved encoder backend choice. Symmetric to [`ResolvedDisplayDecoder`]
+/// but on the encode side. Drops back into a `video_codec::VideoEncoderCodec`
+/// at call time when the `video-thumbnail` feature is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedVideoEncoder {
+    X264,
+    X265,
+    H264Nvenc,
+    HevcNvenc,
+    H264Qsv,
+    HevcQsv,
+    H264Vaapi,
+    HevcVaapi,
+}
+
+impl ResolvedVideoEncoder {
+    /// FFmpeg / config-string identifier — matches `parse_codec` /
+    /// `resolve_backend` keys in `ts_video_replace.rs` and
+    /// `output_rtmp.rs`.
+    pub fn ffmpeg_name(self) -> &'static str {
+        match self {
+            ResolvedVideoEncoder::X264 => "x264",
+            ResolvedVideoEncoder::X265 => "x265",
+            ResolvedVideoEncoder::H264Nvenc => "h264_nvenc",
+            ResolvedVideoEncoder::HevcNvenc => "hevc_nvenc",
+            ResolvedVideoEncoder::H264Qsv => "h264_qsv",
+            ResolvedVideoEncoder::HevcQsv => "hevc_qsv",
+            ResolvedVideoEncoder::H264Vaapi => "h264_vaapi",
+            ResolvedVideoEncoder::HevcVaapi => "hevc_vaapi",
+        }
+    }
+
+    /// Output codec family — the wire-level codec, ignoring backend.
+    pub fn family(self) -> EncoderFamily {
+        match self {
+            ResolvedVideoEncoder::X264
+            | ResolvedVideoEncoder::H264Nvenc
+            | ResolvedVideoEncoder::H264Qsv
+            | ResolvedVideoEncoder::H264Vaapi => EncoderFamily::H264,
+            ResolvedVideoEncoder::X265
+            | ResolvedVideoEncoder::HevcNvenc
+            | ResolvedVideoEncoder::HevcQsv
+            | ResolvedVideoEncoder::HevcVaapi => EncoderFamily::Hevc,
+        }
+    }
+
+    /// HW family this encoder charges against, or `None` for libx264 /
+    /// libx265 (CPU). Mirrors [`HwEncoderFamily::classify`] but typed.
+    pub fn hw_family(self) -> Option<HwEncoderFamily> {
+        match self {
+            ResolvedVideoEncoder::X264 | ResolvedVideoEncoder::X265 => None,
+            ResolvedVideoEncoder::H264Nvenc | ResolvedVideoEncoder::HevcNvenc => {
+                Some(HwEncoderFamily::Nvenc)
+            }
+            ResolvedVideoEncoder::H264Qsv | ResolvedVideoEncoder::HevcQsv => {
+                Some(HwEncoderFamily::Qsv)
+            }
+            ResolvedVideoEncoder::H264Vaapi | ResolvedVideoEncoder::HevcVaapi => {
+                Some(HwEncoderFamily::Vaapi)
+            }
+        }
+    }
+
+    /// `true` for libx264 / libx265. Used by the cost model to charge
+    /// the SW per-output rate (500) instead of the HW rate (100).
+    pub fn is_software(self) -> bool {
+        matches!(
+            self,
+            ResolvedVideoEncoder::X264 | ResolvedVideoEncoder::X265
+        )
+    }
+
+    /// Translate to the `video_codec::VideoEncoderCodec` handle used by
+    /// `VideoEncoder::open`. Only callable on a build with the
+    /// `video-thumbnail` feature (every encoder spawn path is gated on
+    /// it anyway).
+    #[cfg(feature = "video-thumbnail")]
+    pub fn as_video_encoder_codec(self) -> video_codec::VideoEncoderCodec {
+        use video_codec::VideoEncoderCodec;
+        match self {
+            ResolvedVideoEncoder::X264 => VideoEncoderCodec::X264,
+            ResolvedVideoEncoder::X265 => VideoEncoderCodec::X265,
+            ResolvedVideoEncoder::H264Nvenc => VideoEncoderCodec::H264Nvenc,
+            ResolvedVideoEncoder::HevcNvenc => VideoEncoderCodec::HevcNvenc,
+            ResolvedVideoEncoder::H264Qsv => VideoEncoderCodec::H264Qsv,
+            ResolvedVideoEncoder::HevcQsv => VideoEncoderCodec::HevcQsv,
+            ResolvedVideoEncoder::H264Vaapi => VideoEncoderCodec::H264Vaapi,
+            ResolvedVideoEncoder::HevcVaapi => VideoEncoderCodec::HevcVaapi,
+        }
+    }
+}
+
+/// Convenience wrapper that pulls the static capabilities snapshot and
+/// runs [`resolve_video_encoder`] against it. Each output's encoder spawn
+/// path uses this so they all see the same Auto resolution behaviour.
+#[cfg(feature = "video-thumbnail")]
+pub fn resolve_for_video_encode_config(
+    cfg: &crate::config::models::VideoEncodeConfig,
+) -> Result<ResolvedVideoEncoder, EncoderResolutionError> {
+    let caps = static_capabilities();
+    resolve_video_encoder(
+        &cfg.codec,
+        cfg.chroma.as_deref(),
+        cfg.bit_depth,
+        caps.as_deref(),
+    )
+}
+
+/// Reason `resolve_video_encoder` couldn't satisfy the request.
+/// Surfaced on `video_encoder_unavailable` events with structured
+/// `details` so the manager UI can render an actionable message
+/// instead of just "encode failed".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncoderResolutionError {
+    /// Codec string didn't match any known backend or `*_auto`.
+    UnknownCodec(String),
+    /// Forced backend isn't compiled into this build.
+    FeatureDisabled { backend: &'static str },
+    /// Build has the feature but the runtime probe failed (no driver,
+    /// no hardware, or `/dev/dri/renderD128` permissions).
+    DriverMissing { backend: &'static str },
+    /// Explicit backend was selected but the host's runtime probe
+    /// reports it can't do the requested chroma + bit-depth combo
+    /// (e.g. `h264_nvenc` + 4:2:2 — NVENC has no 4:2:2 path).
+    ChromaUnsupported {
+        backend: &'static str,
+        chroma: String,
+        bit_depth: u8,
+    },
+    /// Auto resolution: nothing on the host satisfies the request.
+    AutoNoBackend {
+        family: EncoderFamily,
+        chroma: String,
+        bit_depth: u8,
+    },
+    /// `static_capabilities()` returned `None` — probe didn't run.
+    /// Treated as a startup-ordering bug; should not happen in
+    /// production.
+    ProbeUnavailable,
+}
+
+impl EncoderResolutionError {
+    /// Short tag for the `details.error_code` companion field. The
+    /// outer event `error_code` stays `video_encoder_unavailable`.
+    pub fn as_reason(&self) -> &'static str {
+        match self {
+            EncoderResolutionError::UnknownCodec(_) => "unknown_codec",
+            EncoderResolutionError::FeatureDisabled { .. } => "feature_disabled",
+            EncoderResolutionError::DriverMissing { .. } => "driver_missing",
+            EncoderResolutionError::ChromaUnsupported { .. } => "chroma_unsupported",
+            EncoderResolutionError::AutoNoBackend { .. } => "auto_no_backend",
+            EncoderResolutionError::ProbeUnavailable => "probe_unavailable",
+        }
+    }
+
+    /// Human-readable rendering for log lines + event messages. Includes
+    /// remediation hints where applicable so the operator doesn't have to
+    /// remember which codec rejects which chroma.
+    pub fn message(&self) -> String {
+        match self {
+            EncoderResolutionError::UnknownCodec(s) => {
+                format!("unknown video encoder '{s}' (expected one of: x264, x265, h264_auto, hevc_auto, h264_nvenc, hevc_nvenc, h264_qsv, hevc_qsv, h264_vaapi, hevc_vaapi)")
+            }
+            EncoderResolutionError::FeatureDisabled { backend } => format!(
+                "video encoder '{backend}' is not compiled into this build — rebuild with the matching `video-encoder-*` feature"
+            ),
+            EncoderResolutionError::DriverMissing { backend } => format!(
+                "video encoder '{backend}' is compiled in but the host has no driver / hardware for it (or render-node permissions are missing)"
+            ),
+            EncoderResolutionError::ChromaUnsupported { backend, chroma, bit_depth } => format!(
+                "video encoder '{backend}' cannot encode {chroma} {bit_depth}-bit on this host (NVENC + QSV have no 4:2:2 path; AMD VAAPI typically rejects 4:2:2 — pick libx265 or hevc_vaapi on Intel iHD instead, or use h264_auto / hevc_auto to let the resolver choose)"
+            ),
+            EncoderResolutionError::AutoNoBackend { family, chroma, bit_depth } => {
+                let family = match family {
+                    EncoderFamily::H264 => "H.264",
+                    EncoderFamily::Hevc => "HEVC",
+                };
+                format!(
+                    "no {family} encoder on this host can produce {chroma} {bit_depth}-bit (rebuild with `video-encoder-x264` / `video-encoder-x265` for the broadcast 4:2:2 fallback)"
+                )
+            }
+            EncoderResolutionError::ProbeUnavailable => {
+                "hardware probe snapshot is not yet available — encoder selection cannot proceed".into()
+            }
+        }
+    }
+}
+
+/// `chroma`-string parser used by both [`resolve_video_encoder`] and the
+/// chroma matrix lookup. Returns `Yuv420` for `None` and unrecognised
+/// values, matching the existing `VideoEncodeConfig` default.
+#[cfg(feature = "video-thumbnail")]
+fn parse_chroma_str(s: Option<&str>) -> video_codec::VideoChroma {
+    use video_codec::VideoChroma;
+    match s {
+        Some("yuv422p") => VideoChroma::Yuv422,
+        Some("yuv444p") => VideoChroma::Yuv444,
+        _ => VideoChroma::Yuv420,
+    }
+}
+
+/// `*_auto` codec-string parser. Returns the requested output family for
+/// `h264_auto` / `hevc_auto`, `None` for explicit backend strings.
+fn parse_auto_family(codec: &str) -> Option<EncoderFamily> {
+    match codec {
+        "h264_auto" | "auto_h264" => Some(EncoderFamily::H264),
+        "hevc_auto" | "auto_hevc" | "h265_auto" | "auto_h265" => Some(EncoderFamily::Hevc),
+        // Bare "auto" defaults to H.264 (more universally consumable).
+        // Explicit family selection is preferred and emitted by the
+        // manager UI; the bare form keeps short-form ad-hoc CLI configs
+        // working without surprising operators.
+        "auto" => Some(EncoderFamily::H264),
+        _ => None,
+    }
+}
+
+/// `true` when the host can actually do the requested combination,
+/// considering compile-time features AND runtime probe results AND
+/// the per-(codec, chroma, bit-depth) chroma matrix.
+#[cfg(feature = "video-thumbnail")]
+fn host_supports_encoder(
+    encoder: ResolvedVideoEncoder,
+    chroma: video_codec::VideoChroma,
+    bit_depth: u8,
+    caps: &StaticCapabilities,
+) -> bool {
+    use video_codec::VideoChroma;
+    match encoder {
+        ResolvedVideoEncoder::X264 => {
+            if !cfg!(feature = "video-encoder-x264") {
+                return false;
+            }
+            // libx264 covers 4:2:0/4:2:2/4:4:4 × 8/10 in the vendored
+            // bilbycast build (High10 / High422 / High444 profiles all
+            // enabled); chroma matrix probes confirm at startup. 4:4:4
+            // baseline is always true when libx264 is in.
+            match (chroma, bit_depth) {
+                (VideoChroma::Yuv420, 8) => true,
+                (VideoChroma::Yuv422, 8) => caps.hw_encoder_chroma.libx264_yuv422_8bit,
+                (VideoChroma::Yuv420, 10) => caps.hw_encoder_chroma.libx264_yuv420_10bit,
+                (VideoChroma::Yuv422, 10) => caps.hw_encoder_chroma.libx264_yuv422_10bit,
+                (VideoChroma::Yuv444, _) => true,
+                _ => false,
+            }
+        }
+        ResolvedVideoEncoder::X265 => {
+            if !cfg!(feature = "video-encoder-x265") {
+                return false;
+            }
+            match (chroma, bit_depth) {
+                (VideoChroma::Yuv420, 8) => true,
+                (VideoChroma::Yuv422, 8) => caps.hw_encoder_chroma.libx265_yuv422_8bit,
+                (VideoChroma::Yuv420, 10) => caps.hw_encoder_chroma.libx265_yuv420_10bit,
+                (VideoChroma::Yuv422, 10) => caps.hw_encoder_chroma.libx265_yuv422_10bit,
+                (VideoChroma::Yuv444, _) => true,
+                _ => false,
+            }
+        }
+        ResolvedVideoEncoder::H264Nvenc => {
+            if !cfg!(feature = "video-encoder-nvenc") {
+                return false;
+            }
+            // H.264 NVENC is 4:2:0 8-bit only (no 4:2:2, no Main10).
+            caps.hw_encoders.h264_nvenc
+                && chroma == VideoChroma::Yuv420
+                && bit_depth == 8
+        }
+        ResolvedVideoEncoder::HevcNvenc => {
+            if !cfg!(feature = "video-encoder-nvenc") {
+                return false;
+            }
+            if !caps.hw_encoders.hevc_nvenc {
+                return false;
+            }
+            match (chroma, bit_depth) {
+                (VideoChroma::Yuv420, 8) => true,
+                (VideoChroma::Yuv420, 10) => caps.hw_encoder_chroma.hevc_nvenc_yuv420_10bit,
+                _ => false,
+            }
+        }
+        ResolvedVideoEncoder::H264Qsv => {
+            if !cfg!(feature = "video-encoder-qsv") {
+                return false;
+            }
+            caps.hw_encoders.h264_qsv
+                && chroma == VideoChroma::Yuv420
+                && bit_depth == 8
+        }
+        ResolvedVideoEncoder::HevcQsv => {
+            if !cfg!(feature = "video-encoder-qsv") {
+                return false;
+            }
+            if !caps.hw_encoders.hevc_qsv {
+                return false;
+            }
+            match (chroma, bit_depth) {
+                (VideoChroma::Yuv420, 8) => true,
+                (VideoChroma::Yuv420, 10) => caps.hw_encoder_chroma.hevc_qsv_yuv420_10bit,
+                (VideoChroma::Yuv422, 8) => caps.hw_encoder_chroma.hevc_qsv_yuv422_8bit,
+                (VideoChroma::Yuv422, 10) => caps.hw_encoder_chroma.hevc_qsv_yuv422_10bit,
+                _ => false,
+            }
+        }
+        ResolvedVideoEncoder::H264Vaapi => {
+            if !cfg!(feature = "video-encoder-vaapi") {
+                return false;
+            }
+            // h264_vaapi is 4:2:0 8-bit only on every implementation
+            // (no Main10 / High422 in any libva driver).
+            caps.hw_encoders.h264_vaapi
+                && chroma == VideoChroma::Yuv420
+                && bit_depth == 8
+        }
+        ResolvedVideoEncoder::HevcVaapi => {
+            if !cfg!(feature = "video-encoder-vaapi") {
+                return false;
+            }
+            if !caps.hw_encoders.hevc_vaapi {
+                return false;
+            }
+            match (chroma, bit_depth) {
+                (VideoChroma::Yuv420, 8) => true,
+                (VideoChroma::Yuv420, 10) => caps.hw_encoder_chroma.hevc_vaapi_yuv420_10bit,
+                (VideoChroma::Yuv422, 8) => caps.hw_encoder_chroma.hevc_vaapi_yuv422_8bit,
+                (VideoChroma::Yuv422, 10) => caps.hw_encoder_chroma.hevc_vaapi_yuv422_10bit,
+                _ => false, // 4:4:4 (NV24 packer) deferred
+            }
+        }
+    }
+}
+
+/// Auto-resolution priority chain per `(family, chroma, bit_depth)`.
+/// Heads of each list are the cheapest hosts that handle the request;
+/// tails are the safe SW fallback.
+#[cfg(feature = "video-thumbnail")]
+fn auto_priority_chain(
+    family: EncoderFamily,
+    chroma: video_codec::VideoChroma,
+    bit_depth: u8,
+) -> &'static [ResolvedVideoEncoder] {
+    use video_codec::VideoChroma;
+    use ResolvedVideoEncoder::*;
+    match (family, chroma, bit_depth) {
+        // ── H.264 ──
+        // 4:2:0 8-bit (the dominant distribution path): NVENC ≻ QSV ≻
+        // VAAPI ≻ libx264. NVENC has the lowest CPU cost; QSV is a
+        // close second on Intel iGPU; VAAPI is the AMD/iHD path; x264
+        // is the fallback that always works.
+        (EncoderFamily::H264, VideoChroma::Yuv420, 8) => {
+            &[H264Nvenc, H264Qsv, H264Vaapi, X264]
+        }
+        // H.264 + anything else → libx264 (no HW H.264 encoder
+        // supports 4:2:2, 10-bit, or 4:4:4).
+        (EncoderFamily::H264, _, _) => &[X264],
+
+        // ── HEVC ──
+        // 4:2:0 8-bit: NVENC ≻ QSV ≻ VAAPI ≻ libx265. Same shape as
+        // H.264 baseline distribution.
+        (EncoderFamily::Hevc, VideoChroma::Yuv420, 8) => {
+            &[HevcNvenc, HevcQsv, HevcVaapi, X265]
+        }
+        // 4:2:0 10-bit: NVENC ≻ VAAPI ≻ QSV ≻ libx265. NVENC Main10
+        // is mature on Pascal+; VAAPI Main10 works on Intel iHD
+        // Skylake+ and AMD VCN RDNA2+; QSV Main10 covers Kaby Lake+.
+        // QSV demoted to last HW because broadcast 10-bit deployments
+        // tend to be on AMD or NVIDIA in our user base.
+        (EncoderFamily::Hevc, VideoChroma::Yuv420, 10) => {
+            &[HevcNvenc, HevcVaapi, HevcQsv, X265]
+        }
+        // 4:2:2 (8 + 10-bit): VAAPI on Intel iHD ≻ libx265. NVENC and
+        // QSV are silently skipped because they reject 4:2:2 at
+        // `avcodec_open2` — putting them in the chain would just
+        // waste the operator's flow-startup time.
+        (EncoderFamily::Hevc, VideoChroma::Yuv422, _) => {
+            &[HevcVaapi, X265]
+        }
+        // HEVC + 4:4:4: libx265 only (HW backends reject NV24 today).
+        (EncoderFamily::Hevc, VideoChroma::Yuv444, _) => &[X265],
+
+        // Catch-all: libx264 always works for H.264, libx265 for HEVC.
+        // (The exhaustive matches above mean this arm is technically
+        // unreachable, but match-coverage keeps Clippy happy.)
+        #[allow(unreachable_patterns)]
+        (EncoderFamily::H264, _, _) => &[X264],
+        #[allow(unreachable_patterns)]
+        (EncoderFamily::Hevc, _, _) => &[X265],
+    }
+}
+
+/// Resolve a `video_encode.codec` string into a concrete encoder backend,
+/// considering the host's probed capabilities and the requested chroma +
+/// bit-depth.
+///
+/// Three classes of input:
+/// * `"h264_auto"` / `"hevc_auto"` (and `"auto"` as a shorthand) — Auto
+///   resolution. Walks the per-(family, chroma, bit-depth) priority
+///   chain and returns the first backend the host can actually do.
+/// * Explicit backend names (`"x264"`, `"h264_nvenc"`, …) — Validated
+///   end-to-end. Returns `FeatureDisabled` / `DriverMissing` /
+///   `ChromaUnsupported` so the manager UI can render an actionable
+///   error before the flow even starts.
+/// * Anything else — `UnknownCodec`.
+///
+/// Pure function over `(codec, chroma, bit_depth, capabilities)`. The
+/// flow start path uses the resolved `ffmpeg_name()` to drive the existing
+/// `parse_codec` / `resolve_backend` helpers in `ts_video_replace.rs` /
+/// `output_rtmp.rs`.
+#[cfg(feature = "video-thumbnail")]
+pub fn resolve_video_encoder(
+    codec_string: &str,
+    chroma: Option<&str>,
+    bit_depth: Option<u8>,
+    caps: Option<&StaticCapabilities>,
+) -> Result<ResolvedVideoEncoder, EncoderResolutionError> {
+    let chroma_typed = parse_chroma_str(chroma);
+    let bd = bit_depth.unwrap_or(8);
+    let chroma_label = chroma.unwrap_or("yuv420p").to_string();
+
+    // Auto family path
+    if let Some(family) = parse_auto_family(codec_string) {
+        let caps = caps.ok_or(EncoderResolutionError::ProbeUnavailable)?;
+        for &candidate in auto_priority_chain(family, chroma_typed, bd) {
+            if host_supports_encoder(candidate, chroma_typed, bd, caps) {
+                return Ok(candidate);
+            }
+        }
+        return Err(EncoderResolutionError::AutoNoBackend {
+            family,
+            chroma: chroma_label,
+            bit_depth: bd,
+        });
+    }
+
+    // Explicit backend
+    let resolved = match codec_string {
+        "x264" => ResolvedVideoEncoder::X264,
+        "x265" => ResolvedVideoEncoder::X265,
+        "h264_nvenc" => ResolvedVideoEncoder::H264Nvenc,
+        "hevc_nvenc" => ResolvedVideoEncoder::HevcNvenc,
+        "h264_qsv" => ResolvedVideoEncoder::H264Qsv,
+        "hevc_qsv" => ResolvedVideoEncoder::HevcQsv,
+        "h264_vaapi" => ResolvedVideoEncoder::H264Vaapi,
+        "hevc_vaapi" => ResolvedVideoEncoder::HevcVaapi,
+        other => return Err(EncoderResolutionError::UnknownCodec(other.to_string())),
+    };
+
+    // Compile-time feature gate
+    let feature_ok = match resolved {
+        ResolvedVideoEncoder::X264 => cfg!(feature = "video-encoder-x264"),
+        ResolvedVideoEncoder::X265 => cfg!(feature = "video-encoder-x265"),
+        ResolvedVideoEncoder::H264Nvenc | ResolvedVideoEncoder::HevcNvenc => {
+            cfg!(feature = "video-encoder-nvenc")
+        }
+        ResolvedVideoEncoder::H264Qsv | ResolvedVideoEncoder::HevcQsv => {
+            cfg!(feature = "video-encoder-qsv")
+        }
+        ResolvedVideoEncoder::H264Vaapi | ResolvedVideoEncoder::HevcVaapi => {
+            cfg!(feature = "video-encoder-vaapi")
+        }
+    };
+    if !feature_ok {
+        return Err(EncoderResolutionError::FeatureDisabled {
+            backend: resolved.ffmpeg_name(),
+        });
+    }
+
+    // Runtime baseline check (does the host actually have the driver / GPU?)
+    let caps = caps.ok_or(EncoderResolutionError::ProbeUnavailable)?;
+    let baseline_available = match resolved {
+        ResolvedVideoEncoder::X264 | ResolvedVideoEncoder::X265 => true, // SW always
+        ResolvedVideoEncoder::H264Nvenc => caps.hw_encoders.h264_nvenc,
+        ResolvedVideoEncoder::HevcNvenc => caps.hw_encoders.hevc_nvenc,
+        ResolvedVideoEncoder::H264Qsv => caps.hw_encoders.h264_qsv,
+        ResolvedVideoEncoder::HevcQsv => caps.hw_encoders.hevc_qsv,
+        ResolvedVideoEncoder::H264Vaapi => caps.hw_encoders.h264_vaapi,
+        ResolvedVideoEncoder::HevcVaapi => caps.hw_encoders.hevc_vaapi,
+    };
+    if !baseline_available {
+        return Err(EncoderResolutionError::DriverMissing {
+            backend: resolved.ffmpeg_name(),
+        });
+    }
+
+    // Chroma + bit-depth matrix check
+    if !host_supports_encoder(resolved, chroma_typed, bd, caps) {
+        return Err(EncoderResolutionError::ChromaUnsupported {
+            backend: resolved.ffmpeg_name(),
+            chroma: chroma_label,
+            bit_depth: bd,
+        });
+    }
+
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -1462,8 +2303,10 @@ mod tests {
 
     #[test]
     fn cost_sw_video_encode_dominates() {
+        // Pre-weighted: 1080p30 4:2:0 8-bit SW = 500 units (the
+        // baseline for the SW per-output anchor).
         let plan = FlowCostPlan {
-            sw_video_encode_outputs: 1,
+            sw_video_encode_units: 500,
             ..Default::default()
         };
         assert_eq!(compute_flow_cost_units(&plan), 1 + 500);
@@ -1472,14 +2315,57 @@ mod tests {
     #[test]
     fn cost_hw_cheaper_than_sw() {
         let hw = FlowCostPlan {
-            hw_video_encode_outputs: 1,
+            hw_video_encode_units: 100,
             ..Default::default()
         };
         let sw = FlowCostPlan {
-            sw_video_encode_outputs: 1,
+            sw_video_encode_units: 500,
             ..Default::default()
         };
         assert!(compute_flow_cost_units(&hw) < compute_flow_cost_units(&sw));
+    }
+
+    #[test]
+    fn weighted_units_scale_with_resolution_and_fps() {
+        // 1080p30 4:2:0 8-bit baseline for SW.
+        let baseline = weighted_video_encode_units(false, None, None, None, None, None, None);
+        assert_eq!(baseline, 500);
+        // 4K30 4:2:0 8-bit ≈ 4× baseline (3840 × 2160 = 4× pixels of 1920×1080).
+        let four_k = weighted_video_encode_units(
+            false, Some(3840), Some(2160), Some(30), Some(1), None, None,
+        );
+        assert_eq!(four_k, 2000);
+        // 1080p30 4:2:0 10-bit ≈ 1.5× baseline.
+        let ten_bit = weighted_video_encode_units(
+            false, Some(1920), Some(1080), Some(30), Some(1), Some(10), Some("yuv420p"),
+        );
+        assert_eq!(ten_bit, 750);
+        // 1080p30 4:2:2 8-bit ≈ 1.33× baseline.
+        let four_two_two = weighted_video_encode_units(
+            false, Some(1920), Some(1080), Some(30), Some(1), Some(8), Some("yuv422p"),
+        );
+        assert_eq!(four_two_two, 665);
+        // 4K60 HEVC 4:2:2 10-bit on libx265 — broadcast contribution
+        // worst case. Scale = 8 (4× pixels × 2× fps) × 1.5 (10-bit) ×
+        // 1.33 (4:2:2) = 15.96, so ~7980 units. The flow's cost goes
+        // from "fits in a 4-core box" (1800 units) to "needs an 8+
+        // core box" (7400 units on 32-core), which is the right
+        // signal — matches what operators eyeball as a "this can't run
+        // on the smallest edge" config.
+        let four_k_60_422_10 = weighted_video_encode_units(
+            false, Some(3840), Some(2160), Some(60), Some(1), Some(10), Some("yuv422p"),
+        );
+        assert!(four_k_60_422_10 > 7000 && four_k_60_422_10 < 9000);
+        // HW NVENC 1080p30 4:2:0 8-bit baseline = 100.
+        let hw_baseline =
+            weighted_video_encode_units(true, None, None, None, None, None, None);
+        assert_eq!(hw_baseline, 100);
+        // Floor: 240p test pattern shouldn't drop below the per-output
+        // baseline (a 100-unit HW output).
+        let tiny = weighted_video_encode_units(
+            true, Some(320), Some(240), Some(15), Some(1), None, None,
+        );
+        assert_eq!(tiny, 100);
     }
 
     #[test]
@@ -1504,7 +2390,7 @@ mod tests {
     fn cost_combo_realistic() {
         // Realistic transcode flow: SW H.264 + AAC encode + lite analysis + recording.
         let plan = FlowCostPlan {
-            sw_video_encode_outputs: 1,
+            sw_video_encode_units: 500,
             audio_encode_outputs: 1,
             content_analysis_lite: true,
             recording_enabled: true,
@@ -1641,5 +2527,210 @@ mod tests {
     fn hw_decoder_session_limits_is_empty_default() {
         let limits = HwDecoderSessionLimits::default();
         assert!(limits.is_empty());
+    }
+
+    // ── Video-encoder resolution tests ─────────────────────────────
+
+    #[cfg(feature = "video-thumbnail")]
+    fn make_caps(hw_encoders: HwCodecCapability) -> StaticCapabilities {
+        StaticCapabilities {
+            hw_encoders,
+            hw_decoders: HwCodecCapability::default(),
+            hw_encoder_session_limits: HwSessionLimits::default(),
+            hw_decoder_session_limits: HwDecoderSessionLimits::default(),
+            hw_encoder_chroma: HwEncoderChromaCapability {
+                // Vendored bilbycast FFmpeg has the High10 / High422 /
+                // Main10 / Main422 profiles compiled in, so the SW
+                // encoders advertise the broadcast 4:2:2 / 10-bit
+                // matrix as supported.
+                libx264_yuv422_8bit: true,
+                libx264_yuv420_10bit: true,
+                libx264_yuv422_10bit: true,
+                libx265_yuv422_8bit: true,
+                libx265_yuv420_10bit: true,
+                libx265_yuv422_10bit: true,
+                ..Default::default()
+            },
+            vaapi: VaapiCapability::default(),
+            cpu: CpuInfo {
+                brand: "Test CPU".into(),
+                physical_cores: 4,
+                logical_cores: 8,
+                avx_class: AvxClass::Avx2,
+            },
+            sw_capacity: SwCapacityEstimate::default(),
+        }
+    }
+
+    #[cfg(feature = "video-thumbnail")]
+    #[test]
+    fn auto_h264_4_2_0_8bit_picks_nvenc_when_available() {
+        // NVIDIA host + h264_auto + 4:2:0 8-bit → h264_nvenc (top of chain).
+        let caps = make_caps(HwCodecCapability {
+            h264_nvenc: true,
+            hevc_nvenc: true,
+            ..Default::default()
+        });
+        let resolved =
+            resolve_video_encoder("h264_auto", Some("yuv420p"), Some(8), Some(&caps));
+        if cfg!(feature = "video-encoder-nvenc") {
+            assert_eq!(resolved.unwrap(), ResolvedVideoEncoder::H264Nvenc);
+        } else {
+            // No NVENC compiled — Auto falls through to whichever SW
+            // encoder is in the build, or returns AutoNoBackend on a
+            // build with neither x264 nor x265 (rare).
+            match resolved {
+                Ok(ResolvedVideoEncoder::X264) => {}
+                Err(EncoderResolutionError::AutoNoBackend { .. }) => {}
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(feature = "video-thumbnail")]
+    #[test]
+    fn auto_hevc_4_2_2_10bit_skips_nvenc_qsv_picks_vaapi_or_x265() {
+        // Intel iHD host + hevc_auto + 4:2:2 10-bit → hevc_vaapi (the
+        // only HW backend that does 4:2:2). NVENC + QSV stay in the
+        // chain but `host_supports_encoder` returns false for them.
+        let caps = make_caps(HwCodecCapability {
+            h264_nvenc: true, // present but irrelevant for 4:2:2
+            hevc_nvenc: true,
+            h264_qsv: true,
+            hevc_qsv: true,
+            h264_vaapi: true,
+            hevc_vaapi: true,
+            ..Default::default()
+        });
+        // Mark VAAPI 4:2:2 10-bit as supported (Intel iHD Tiger Lake+).
+        let mut caps = caps;
+        caps.hw_encoder_chroma.hevc_vaapi_yuv422_10bit = true;
+        let resolved =
+            resolve_video_encoder("hevc_auto", Some("yuv422p"), Some(10), Some(&caps));
+        if cfg!(feature = "video-encoder-vaapi") {
+            assert_eq!(resolved.unwrap(), ResolvedVideoEncoder::HevcVaapi);
+        } else if cfg!(feature = "video-encoder-x265") {
+            assert_eq!(resolved.unwrap(), ResolvedVideoEncoder::X265);
+        }
+    }
+
+    #[cfg(feature = "video-thumbnail")]
+    #[test]
+    fn auto_falls_through_to_software_when_no_hw() {
+        // Software-only host. Auto should land on libx264 / libx265.
+        let caps = make_caps(HwCodecCapability::default());
+        let resolved =
+            resolve_video_encoder("h264_auto", Some("yuv420p"), Some(8), Some(&caps));
+        match resolved {
+            Ok(ResolvedVideoEncoder::X264) => {
+                assert!(cfg!(feature = "video-encoder-x264"));
+            }
+            Err(EncoderResolutionError::AutoNoBackend { .. }) => {
+                assert!(!cfg!(feature = "video-encoder-x264"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "video-thumbnail")]
+    #[test]
+    fn explicit_h264_nvenc_with_4_2_2_returns_chroma_unsupported() {
+        let caps = make_caps(HwCodecCapability {
+            h264_nvenc: true,
+            ..Default::default()
+        });
+        if !cfg!(feature = "video-encoder-nvenc") {
+            return; // build doesn't have NVENC — handled by FeatureDisabled path elsewhere
+        }
+        let result =
+            resolve_video_encoder("h264_nvenc", Some("yuv422p"), Some(8), Some(&caps));
+        match result {
+            Err(EncoderResolutionError::ChromaUnsupported {
+                backend, chroma, bit_depth,
+            }) => {
+                assert_eq!(backend, "h264_nvenc");
+                assert_eq!(chroma, "yuv422p");
+                assert_eq!(bit_depth, 8);
+            }
+            other => panic!("expected ChromaUnsupported, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "video-thumbnail")]
+    #[test]
+    fn explicit_unknown_codec_returns_unknown_codec_error() {
+        let result =
+            resolve_video_encoder("totally_made_up", Some("yuv420p"), Some(8), None);
+        match result {
+            Err(EncoderResolutionError::UnknownCodec(s)) => {
+                assert_eq!(s, "totally_made_up");
+            }
+            other => panic!("expected UnknownCodec, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "video-thumbnail")]
+    #[test]
+    fn auto_without_caps_returns_probe_unavailable() {
+        let result = resolve_video_encoder("h264_auto", None, None, None);
+        assert_eq!(result, Err(EncoderResolutionError::ProbeUnavailable));
+    }
+
+    #[cfg(feature = "video-thumbnail")]
+    #[test]
+    fn resolved_video_encoder_metadata() {
+        assert_eq!(ResolvedVideoEncoder::X264.ffmpeg_name(), "x264");
+        assert_eq!(ResolvedVideoEncoder::H264Nvenc.ffmpeg_name(), "h264_nvenc");
+        assert_eq!(ResolvedVideoEncoder::HevcVaapi.ffmpeg_name(), "hevc_vaapi");
+        assert_eq!(ResolvedVideoEncoder::X264.family(), EncoderFamily::H264);
+        assert_eq!(ResolvedVideoEncoder::HevcQsv.family(), EncoderFamily::Hevc);
+        assert!(ResolvedVideoEncoder::X264.is_software());
+        assert!(!ResolvedVideoEncoder::H264Nvenc.is_software());
+        assert_eq!(
+            ResolvedVideoEncoder::H264Nvenc.hw_family(),
+            Some(HwEncoderFamily::Nvenc)
+        );
+        assert_eq!(ResolvedVideoEncoder::X264.hw_family(), None);
+    }
+
+    #[cfg(feature = "video-thumbnail")]
+    #[test]
+    fn encoder_resolution_error_reasons_are_stable() {
+        assert_eq!(
+            EncoderResolutionError::UnknownCodec("x".into()).as_reason(),
+            "unknown_codec"
+        );
+        assert_eq!(
+            EncoderResolutionError::FeatureDisabled { backend: "h264_nvenc" }
+                .as_reason(),
+            "feature_disabled"
+        );
+        assert_eq!(
+            EncoderResolutionError::DriverMissing { backend: "h264_nvenc" }
+                .as_reason(),
+            "driver_missing"
+        );
+        assert_eq!(
+            EncoderResolutionError::ChromaUnsupported {
+                backend: "h264_nvenc",
+                chroma: "yuv422p".into(),
+                bit_depth: 8,
+            }
+            .as_reason(),
+            "chroma_unsupported"
+        );
+        assert_eq!(
+            EncoderResolutionError::AutoNoBackend {
+                family: EncoderFamily::H264,
+                chroma: "yuv422p".into(),
+                bit_depth: 10,
+            }
+            .as_reason(),
+            "auto_no_backend"
+        );
+        assert_eq!(
+            EncoderResolutionError::ProbeUnavailable.as_reason(),
+            "probe_unavailable"
+        );
     }
 }

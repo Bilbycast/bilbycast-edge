@@ -47,7 +47,7 @@ pub const DBFS_FLOOR: f32 = -120.0;
 pub const YELLOW_THRESHOLD_DBFS: f32 = -18.0;
 pub const RED_THRESHOLD_DBFS: f32 = -3.0;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct ChannelLevel {
     pub rms_dbfs: f32,
     pub peak_dbfs: f32,
@@ -66,18 +66,76 @@ impl Default for ChannelLevel {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct PidMeter {
     pub pid: u16,
     pub codec_label: &'static str,
     pub channels: Vec<ChannelLevel>,
     pub last_update: Instant,
+    /// Pre-formatted `"0xNNN CODEC X.Y"` label. Recomputed only when
+    /// the PID is created or `channels.len()` changes — the rasterise
+    /// path reads `&pid.cached_label` instead of `format!()`-ing per
+    /// frame, so a 60 fps display doing 3 PIDs no longer churns ~180
+    /// short-lived `String`s/sec.
+    pub cached_label: String,
 }
 
-#[derive(Clone, Debug, Default)]
+impl Clone for PidMeter {
+    fn clone(&self) -> Self {
+        Self {
+            pid: self.pid,
+            codec_label: self.codec_label,
+            channels: self.channels.clone(),
+            last_update: self.last_update,
+            cached_label: self.cached_label.clone(),
+        }
+    }
+
+    /// Allocation-reusing `clone_from`. The default `Clone::clone_from`
+    /// is `*self = source.clone()`, which drops `self`'s heap and
+    /// allocates fresh — defeating the whole point of the
+    /// [`MeterPublisher`] reclaim path. Implementing this manually
+    /// lets `Vec<PidMeter>::clone_from` (called by
+    /// `MeterSnapshot::clone_from` on the reclaim path) keep the
+    /// inner `channels: Vec<ChannelLevel>` and `cached_label: String`
+    /// heap allocations: `Vec::clone_from` for the now-`Copy`
+    /// [`ChannelLevel`] is one memcpy that reuses the existing buffer
+    /// when capacity permits, and `String::clone_from` likewise
+    /// reuses its heap for same-length labels.
+    fn clone_from(&mut self, source: &Self) {
+        self.pid = source.pid;
+        self.codec_label = source.codec_label;
+        self.channels.clone_from(&source.channels);
+        self.last_update = source.last_update;
+        self.cached_label.clone_from(&source.cached_label);
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct MeterSnapshot {
     pub per_pid: Vec<PidMeter>,
     pub generation: u64,
+}
+
+impl Clone for MeterSnapshot {
+    fn clone(&self) -> Self {
+        Self {
+            per_pid: self.per_pid.clone(),
+            generation: self.generation,
+        }
+    }
+
+    /// Allocation-reusing `clone_from` — delegates to
+    /// `Vec<PidMeter>::clone_from`, which reuses the outer Vec's
+    /// allocation when capacity permits and calls
+    /// [`PidMeter::clone_from`] per matching element to reuse each
+    /// PidMeter's inner heap allocations. Steady-state (PMT stable)
+    /// publishes do **zero** `Vec`/`String` allocations beyond the
+    /// `Arc::new` header itself.
+    fn clone_from(&mut self, source: &Self) {
+        self.per_pid.clone_from(&source.per_pid);
+        self.generation = source.generation;
+    }
 }
 
 /// Lock-free hand-off of the meter snapshot from the meter task to the
@@ -91,10 +149,104 @@ pub fn new_shared_meter() -> SharedMeter {
     Arc::new(ArcSwap::from_pointee(MeterSnapshot::default()))
 }
 
-/// Mutate `snapshot` in place with new dBFS levels for `pid`, then
-/// publish the fresh state via `shared`. The meter task owns
-/// `snapshot` exclusively (no lock); the display task observes only
-/// the published `Arc<MeterSnapshot>` via `ArcSwap::load`.
+/// Wraps the meter task's working `MeterSnapshot` together with the
+/// `SharedMeter` it publishes onto, plus a single-slot Arc reclaim
+/// buffer so consecutive publishes don't allocate a fresh
+/// `Arc<MeterSnapshot>` every block.
+///
+/// Steady-state behaviour: `publish()` calls `ArcSwap::swap` on each
+/// publish to atomically take back the previous Arc, then attempts
+/// `Arc::try_unwrap` on it. When the display task has already dropped
+/// its read guard (the common case at 50 Hz publish vs 60 fps display
+/// — roughly half of the publishes hit a window where the display
+/// just ran), `try_unwrap` succeeds and we copy the working state
+/// into the reclaimed allocation in place via `Vec::clone_from`. The
+/// outer `Vec<PidMeter>` allocation + the `Arc` header allocation are
+/// reused, so the per-publish heap activity drops from
+/// `(Arc::new + Vec::with_capacity + N × Vec::clone)` to just
+/// `(N × Vec::clone)` for the inner `Vec<ChannelLevel>` per PID.
+///
+/// On `try_unwrap` failure (display task currently holds the guard —
+/// the small window between `ArcSwap::load` and the rasteriser
+/// finishing) we fall back to `Arc::new(local.clone())` and stash the
+/// still-held Arc as the next round's spare. The next publish retries
+/// `try_unwrap` on it; the display task always drops the guard within
+/// one frame, so the spare is always reclaimable on the next attempt.
+///
+/// **Lock-free**: `ArcSwap::swap` is a single atomic; `try_unwrap`
+/// reads + CAS-decrements the refcount; no blocking, no spinning.
+pub struct MeterPublisher {
+    /// Working snapshot — mutated in place by [`update_levels`] /
+    /// [`prune_stale`]. Public so test code can inspect it after a
+    /// publish without going through the published Arc.
+    pub local: MeterSnapshot,
+    /// Single-slot reclaim buffer. `None` on first publish; `Some` on
+    /// every subsequent publish, holding the Arc most-recently swapped
+    /// out of `shared`.
+    spare: Option<Arc<MeterSnapshot>>,
+    /// The shared `ArcSwap` the display task reads from.
+    pub shared: SharedMeter,
+}
+
+impl MeterPublisher {
+    /// Construct with an empty working snapshot. Pair with an existing
+    /// `SharedMeter` so the display task can already be reading even
+    /// before the first publish (it observes the default-empty
+    /// `MeterSnapshot` until the first `publish()` lands).
+    pub fn new(shared: SharedMeter) -> Self {
+        Self {
+            local: MeterSnapshot::default(),
+            spare: None,
+            shared,
+        }
+    }
+
+    /// Publish the working snapshot. Prefer this over manual
+    /// `ArcSwap::store` calls — it does the `try_unwrap` reclaim that
+    /// makes the per-block allocation footprint roughly an order of
+    /// magnitude smaller in steady state.
+    pub fn publish(&mut self) {
+        let new_arc = match self.spare.take() {
+            Some(arc) => match Arc::try_unwrap(arc) {
+                Ok(mut reclaimed) => {
+                    // Heap reuse: `MeterSnapshot::clone_from` (manual
+                    // impl above) delegates to
+                    // `Vec<PidMeter>::clone_from`, which reuses the
+                    // outer Vec's allocation and per-PidMeter calls
+                    // `PidMeter::clone_from` (manual impl above) so
+                    // each PidMeter's inner `channels` Vec and
+                    // `cached_label` String reuse their heap too.
+                    // Steady-state allocation footprint per publish
+                    // is just `Arc::new` (header + payload size); no
+                    // inner Vec / String allocations on a stable PMT.
+                    reclaimed.clone_from(&self.local);
+                    Arc::new(reclaimed)
+                }
+                Err(_still_held) => {
+                    // Display task still holds the guard. Drop the
+                    // unreclaimable Arc — display will release it
+                    // shortly, but we have only one `spare` slot and
+                    // the freshly-swapped Arc (assigned below) is a
+                    // strictly better candidate: it just left
+                    // `shared` so any reader still hanging on to it
+                    // is racing with a frame from before this
+                    // publish, which by the time of the next publish
+                    // (one audio block ≈ 21 ms later) is overwhelmingly
+                    // likely to have been dropped.
+                    Arc::new(self.local.clone())
+                }
+            },
+            None => Arc::new(self.local.clone()),
+        };
+        self.spare = Some(self.shared.swap(new_arc));
+    }
+}
+
+/// Mutate the working snapshot in place with new dBFS levels for
+/// `pid`, then publish the fresh state via [`MeterPublisher::publish`].
+/// The meter task owns the working snapshot exclusively (no lock); the
+/// display task observes only the published `Arc<MeterSnapshot>` via
+/// `ArcSwap::load`.
 ///
 /// `planar` is one slice per channel. All samples are expected to be in
 /// `[-1.0, 1.0]` — anything beyond is clipped at `RED_THRESHOLD_DBFS`.
@@ -102,29 +254,42 @@ pub fn update_levels(
     planar: &[Vec<f32>],
     pid: u16,
     codec_label: &'static str,
-    snapshot: &mut MeterSnapshot,
-    shared: &SharedMeter,
+    publisher: &mut MeterPublisher,
 ) {
     if planar.is_empty() {
         return;
     }
+    let snapshot = &mut publisher.local;
     let now = Instant::now();
     snapshot.generation = snapshot.generation.wrapping_add(1);
     let entry_idx = snapshot.per_pid.iter().position(|p| p.pid == pid);
     let pid_meter = match entry_idx {
         Some(idx) => {
             let p = &mut snapshot.per_pid[idx];
+            let codec_changed = p.codec_label != codec_label;
+            let prev_ch_count = p.channels.len();
             p.codec_label = codec_label;
             p.channels.resize_with(planar.len(), ChannelLevel::default);
+            // Recompute the cached label only when something visible
+            // in it actually changed — channel count drives the
+            // "1.0/2.0/5.1/7.1/NCH" suffix and the codec label is
+            // baked in too. Steady-state (channel count stable) skips
+            // the format! and string allocation entirely.
+            if prev_ch_count != planar.len() || codec_changed {
+                compose_pid_label_into(&mut p.cached_label, pid, codec_label, planar.len());
+            }
             p.last_update = now;
             p
         }
         None => {
+            let mut cached_label = String::new();
+            compose_pid_label_into(&mut cached_label, pid, codec_label, planar.len());
             snapshot.per_pid.push(PidMeter {
                 pid,
                 codec_label,
                 channels: vec![ChannelLevel::default(); planar.len()],
                 last_update: now,
+                cached_label,
             });
             snapshot.per_pid.sort_by_key(|p| p.pid);
             snapshot
@@ -157,21 +322,40 @@ pub fn update_levels(
             ch.peak_hold_until = now + PEAK_HOLD_DURATION;
         }
     }
-    shared.store(Arc::new(snapshot.clone()));
+    publisher.publish();
 }
 
 /// Drop PIDs whose decoder hasn't produced a block in `stale_after`.
 /// Called periodically by the meter task so the overlay reflects the
 /// current PMT (e.g. an audio PID that vanished from the program list).
-pub fn prune_stale(snapshot: &mut MeterSnapshot, shared: &SharedMeter, stale_after: Duration) {
+pub fn prune_stale(publisher: &mut MeterPublisher, stale_after: Duration) {
     let now = Instant::now();
-    let before = snapshot.per_pid.len();
-    snapshot
+    let before = publisher.local.per_pid.len();
+    publisher
+        .local
         .per_pid
         .retain(|p| now.duration_since(p.last_update) < stale_after);
-    if snapshot.per_pid.len() != before {
-        shared.store(Arc::new(snapshot.clone()));
+    if publisher.local.per_pid.len() != before {
+        publisher.publish();
     }
+}
+
+/// Format the cached `"0xNNN CODEC X.Y"` label into `dst` without
+/// allocating a fresh `String`. Reuses `dst`'s heap allocation when
+/// capacity permits — `String::clear()` keeps the buffer; `write!`
+/// extends it. Used by [`update_levels`] when it (re)builds the
+/// per-PID cached label, and by tests that pre-format expected
+/// values.
+fn compose_pid_label_into(dst: &mut String, pid: u16, codec_label: &str, channels_len: usize) {
+    use std::fmt::Write;
+    dst.clear();
+    let _ = match channels_len {
+        1 => write!(dst, "0x{pid:X} {codec_label} 1.0"),
+        2 => write!(dst, "0x{pid:X} {codec_label} 2.0"),
+        6 => write!(dst, "0x{pid:X} {codec_label} 5.1"),
+        8 => write!(dst, "0x{pid:X} {codec_label} 7.1"),
+        n => write!(dst, "0x{pid:X} {codec_label} {n}CH"),
+    };
 }
 
 fn amp_to_dbfs(amp: f32) -> f32 {
@@ -190,13 +374,23 @@ fn amp_to_dbfs(amp: f32) -> f32 {
 
 // ── Rasteriser ────────────────────────────────────────────────────
 
-const BAR_GAP_PX: u32 = 2;
-const BAR_MAX_W: u32 = 28;
-const BLOCK_GAP_PX: u32 = 12;
-const BLOCK_MIN_W: u32 = 48;
-const BLOCK_MAX_W: u32 = 240;
-const SIDE_MARGIN_PX: u32 = 12;
-const LABEL_HEIGHT_PX: u32 = 12; // 5×7 font scaled 1.5×
+const BAR_GAP_PX: u32 = 3;
+const BAR_MAX_W: u32 = 36;
+const BLOCK_GAP_PX: u32 = 16;
+const BLOCK_MIN_W: u32 = 80;
+const BLOCK_MAX_W: u32 = 200;
+const SIDE_MARGIN_PX: u32 = 16;
+/// Vertical pixels reserved for the per-block label row. The 5×7
+/// glyph is rendered at scale=2, which produces a 14-px-tall bitmap
+/// (`5 rows × 2 + (7-1) row-pixels worth of vertical extent` — see
+/// `draw_text`). Earlier value of 12 px under-counted by 2, leaving
+/// the label and bars touching with no breathing room.
+const LABEL_HEIGHT_PX: u32 = 14;
+/// Padding above the label, between label and bars, and below the
+/// bars — separated so adjustments stay coherent.
+const LABEL_TOP_PADDING_PX: u32 = 4;
+const LABEL_BARS_GAP_PX: u32 = 2;
+const BARS_BOTTOM_PADDING_PX: u32 = 4;
 const STRIP_PCT: u32 = 9;
 const STRIP_MIN_PX: u32 = 80;
 const STRIP_MAX_PX: u32 = 140;
@@ -233,8 +427,10 @@ pub fn rasterise(snapshot: &MeterSnapshot, dst: &mut [u8], dst_pitch: usize, dst
     }
     let total_used = block_w * pid_count + total_gaps;
     let strip_left = SIDE_MARGIN_PX + usable_w.saturating_sub(total_used) / 2;
-    let bars_top = strip_top + LABEL_HEIGHT_PX + 2;
-    let bars_h = strip_h.saturating_sub(LABEL_HEIGHT_PX + 4);
+    let label_y = strip_top + LABEL_TOP_PADDING_PX;
+    let bars_top = label_y + LABEL_HEIGHT_PX + LABEL_BARS_GAP_PX;
+    let bars_h = strip_h
+        .saturating_sub(LABEL_TOP_PADDING_PX + LABEL_HEIGHT_PX + LABEL_BARS_GAP_PX + BARS_BOTTOM_PADDING_PX);
     if bars_h < 16 {
         return;
     }
@@ -246,9 +442,9 @@ pub fn rasterise(snapshot: &MeterSnapshot, dst: &mut [u8], dst_pitch: usize, dst
         // Label row: "0xNNN CODEC X.Y" — short enough to fit the
         // capped block width even at scale-2 of the 5×7 font.
         let label = format_pid_label(pid);
-        let label_px = label_pixel_width(&label);
+        let label_px = label_pixel_width(label);
         let label_x = block_x + block_w.saturating_sub(label_px) / 2;
-        draw_text(dst, dst_pitch, dst_w, dst_h, label_x, strip_top + 2, &label, 0xE0, 0xE0, 0xE0);
+        draw_text(dst, dst_pitch, dst_w, dst_h, label_x, label_y, label, 0xE0, 0xE0, 0xE0);
 
         // Channels.
         let ch_count = pid.channels.len() as u32;
@@ -278,6 +474,297 @@ pub fn rasterise(snapshot: &MeterSnapshot, dst: &mut [u8], dst_pitch: usize, dst
     }
 }
 
+/// Strip height (px) for an overlay-plane bars buffer on a panel of the
+/// given vertical resolution. Mirrors the math in [`rasterise`] —
+/// 9 % of the panel height clamped to `[80, 140]` px — so the existing
+/// layout proportions hold whether the bars compose via CPU-blit (the
+/// dumb-buffer path) or via a dedicated KMS overlay plane (the VAAPI
+/// zero-copy path). Returns `None` when the panel is too small to
+/// usefully host bars at all (the rasterisers no-op below 96 px tall).
+pub fn compute_strip_height(panel_h: u32) -> Option<u32> {
+    if panel_h < 96 {
+        return None;
+    }
+    Some(((panel_h * STRIP_PCT) / 100).clamp(STRIP_MIN_PX, STRIP_MAX_PX))
+}
+
+/// Rasterise the meter strip onto a **dedicated overlay buffer** sized
+/// exactly to the strip — `dst_w × dst_h` packed ARGB8888, where
+/// `dst_h` is the full strip height (use [`compute_strip_height`] to
+/// pick the right value relative to the panel). Fills the buffer with
+/// a translucent black background (alpha = 0x80) so the underlying
+/// primary plane (video) shows through ~50 %, then draws labels + bars
+/// at strip-relative coordinates with alpha = 0xFF (fully opaque).
+///
+/// Drives the KMS overlay-plane composition path on the VAAPI
+/// zero-copy display output: the bars compose at vblank in hardware
+/// — no CPU blit onto the dumb buffer, no zero-copy demotion when
+/// `show_audio_bars` is on. `dst_pitch` is bytes per row (≥
+/// `dst_w * 4`). Writes nothing (leaves the buffer alone) when the
+/// snapshot is empty so a freshly-armed flow shows the bare picture
+/// while audio decoders warm up.
+pub fn rasterise_overlay(
+    snapshot: &MeterSnapshot,
+    dst: &mut [u8],
+    dst_pitch: usize,
+    dst_w: u32,
+    dst_h: u32,
+) {
+    if snapshot.per_pid.is_empty() || dst_w < 64 || dst_h < 80 {
+        return;
+    }
+    // Translucent black background. Alpha = 0x80 is the same effective
+    // dim as the legacy `blend_strip_background` path achieves by
+    // halving every BGR lane in place — but here the kernel does the
+    // alpha-blend against the primary plane at scanout, so the dim is
+    // applied only to the strip area and only against the live video.
+    fill_rect_argb(dst, dst_pitch, dst_w, dst_h, 0, 0, dst_w, dst_h, 0, 0, 0, 0x80);
+
+    let strip_top: u32 = 0;
+    let strip_h = dst_h;
+    let pid_count = snapshot.per_pid.len() as u32;
+    let usable_w = dst_w.saturating_sub(SIDE_MARGIN_PX * 2);
+    let total_gaps = BLOCK_GAP_PX * pid_count.saturating_sub(1);
+    if usable_w <= total_gaps {
+        return;
+    }
+    let auto_block_w = (usable_w - total_gaps) / pid_count;
+    let block_w = auto_block_w.clamp(BLOCK_MIN_W, BLOCK_MAX_W);
+    if block_w < BLOCK_MIN_W {
+        return;
+    }
+    let total_used = block_w * pid_count + total_gaps;
+    let strip_left = SIDE_MARGIN_PX + usable_w.saturating_sub(total_used) / 2;
+    let label_y = strip_top + LABEL_TOP_PADDING_PX;
+    let bars_top = label_y + LABEL_HEIGHT_PX + LABEL_BARS_GAP_PX;
+    let bars_h = strip_h
+        .saturating_sub(LABEL_TOP_PADDING_PX + LABEL_HEIGHT_PX + LABEL_BARS_GAP_PX + BARS_BOTTOM_PADDING_PX);
+    if bars_h < 16 {
+        return;
+    }
+
+    let now = Instant::now();
+    for (i, pid) in snapshot.per_pid.iter().enumerate() {
+        let block_x = strip_left + (block_w + BLOCK_GAP_PX) * (i as u32);
+        let label = format_pid_label(pid);
+        let label_px = label_pixel_width(label);
+        let label_x = block_x + block_w.saturating_sub(label_px) / 2;
+        draw_text(dst, dst_pitch, dst_w, dst_h, label_x, label_y, label, 0xE0, 0xE0, 0xE0);
+        let ch_count = pid.channels.len() as u32;
+        if ch_count == 0 {
+            continue;
+        }
+        let ch_total_gaps = BAR_GAP_PX * ch_count.saturating_sub(1);
+        let inner_w = block_w.saturating_sub(4);
+        if inner_w <= ch_total_gaps {
+            continue;
+        }
+        let auto_bar_w = (inner_w - ch_total_gaps) / ch_count;
+        let bar_w = auto_bar_w.min(BAR_MAX_W);
+        if bar_w == 0 {
+            continue;
+        }
+        let bars_total_w = bar_w * ch_count + ch_total_gaps;
+        let bars_x_start = block_x + block_w.saturating_sub(bars_total_w) / 2;
+        for (ch_idx, ch) in pid.channels.iter().enumerate() {
+            let bar_x = bars_x_start + (bar_w + BAR_GAP_PX) * (ch_idx as u32);
+            draw_channel_bar(
+                dst, dst_pitch, dst_w, dst_h, bar_x, bars_top, bar_w, bars_h, ch, now,
+            );
+        }
+    }
+}
+
+// ── Stream-info header (broadcast-pro confidence overlay) ─────────
+//
+// Renders a left-aligned, single-line stream descriptor in the same
+// top label row the per-PID audio block labels live in. Lives on the
+// strip's left side so the centred audio meter blocks (which are the
+// primary information surface) take precedence visually — the header
+// auto-truncates to fit the gap before the leftmost block. Drawn in a
+// distinct cyan-tinted colour so a glance separates "what is this
+// stream" (header) from "how loud is each PID" (block labels +
+// bars).
+
+/// Pre-formatted per-frame stream descriptor. The caller composes a
+/// single line of "what is this stream" — codec, dims, fps, HDR
+/// signal, video / audio PIDs, program — into `text` so the
+/// rasteriser does no allocation, parsing, or branching beyond the
+/// bitmap-font glyph lookups. Empty `text` renders nothing. The
+/// header lives on the strip's left side and auto-truncates to fit
+/// the gap before the leftmost audio meter block.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StreamHeader<'a> {
+    pub text: &'a str,
+}
+
+/// Strip-relative left-edge X (in pixels) at which the centred audio
+/// block region begins, given the snapshot's PID count and the
+/// overlay-buffer width. Returns `dst_w` when no audio blocks would
+/// be drawn (no PIDs, or PID count too high to fit) — the header
+/// then gets the whole strip width to itself.
+fn strip_audio_left_edge(snapshot: &MeterSnapshot, dst_w: u32) -> u32 {
+    let pid_count = snapshot.per_pid.len() as u32;
+    if pid_count == 0 {
+        return dst_w;
+    }
+    let usable_w = dst_w.saturating_sub(SIDE_MARGIN_PX * 2);
+    let total_gaps = BLOCK_GAP_PX * pid_count.saturating_sub(1);
+    if usable_w <= total_gaps {
+        return dst_w;
+    }
+    let auto_block_w = (usable_w - total_gaps) / pid_count;
+    let block_w = auto_block_w.clamp(BLOCK_MIN_W, BLOCK_MAX_W);
+    if block_w < BLOCK_MIN_W {
+        return dst_w;
+    }
+    let total_used = block_w * pid_count + total_gaps;
+    SIDE_MARGIN_PX + usable_w.saturating_sub(total_used) / 2
+}
+
+/// Truncate `text` so its rendered pixel width fits within
+/// `avail_px`. Char-aligned (no mid-glyph clip), no ellipsis (would
+/// need to budget its own width — keeps the routine alloc-free and
+/// branch-light).
+fn truncate_to_pixel_width(text: &str, avail_px: u32) -> &str {
+    const SCALE: u32 = 2;
+    const PER_CHAR_PX: u32 = 5 * SCALE + SCALE; // 12 px (incl. trailing pad)
+    if PER_CHAR_PX == 0 {
+        return text;
+    }
+    let max_chars = (avail_px / PER_CHAR_PX) as usize;
+    if max_chars == 0 {
+        return "";
+    }
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    match text.char_indices().nth(max_chars) {
+        Some((idx, _)) => &text[..idx],
+        None => text,
+    }
+}
+
+const HEADER_AUDIO_GAP_PX: u32 = 12; // breathing room before leftmost block
+
+fn draw_header_at(
+    header: &StreamHeader,
+    dst: &mut [u8],
+    dst_pitch: usize,
+    dst_w: u32,
+    dst_h: u32,
+    strip_top: u32,
+    strip_left: u32,
+) {
+    if header.text.is_empty() {
+        return;
+    }
+    let avail_px = strip_left.saturating_sub(SIDE_MARGIN_PX + HEADER_AUDIO_GAP_PX);
+    // Need room for at least ~6 chars (e.g. "HEVC"). Anything tighter
+    // is unreadable — skip rather than render half a word.
+    if avail_px < 72 {
+        return;
+    }
+    let line_y = strip_top + LABEL_TOP_PADDING_PX;
+    let trimmed = truncate_to_pixel_width(header.text, avail_px);
+    if trimmed.is_empty() {
+        return;
+    }
+    // Warm-amber tint — visually distinct from the white per-block
+    // audio labels (bars sit beneath those, so colour-coding header
+    // vs. labels lets a confidence-monitor operator separate "what
+    // is this stream" from "how loud is each PID" at a glance).
+    draw_text(
+        dst, dst_pitch, dst_w, dst_h,
+        SIDE_MARGIN_PX, line_y, trimmed,
+        0xC0, 0xE0, 0xFF,
+    );
+}
+
+/// Render the stream-info header onto a CPU-blit dumb buffer (the
+/// fallback path used when no overlay plane is available). Computes
+/// the strip top-edge from the panel height the same way `rasterise`
+/// does. Caller invokes this **after** `rasterise` so the centred
+/// per-block audio labels stay on top when the header would otherwise
+/// crowd them.
+pub fn rasterise_header(
+    snapshot: &MeterSnapshot,
+    header: &StreamHeader,
+    dst: &mut [u8],
+    dst_pitch: usize,
+    dst_w: u32,
+    dst_h: u32,
+) {
+    if header.text.is_empty() || dst_w < 64 || dst_h < 96 {
+        return;
+    }
+    let strip_h = ((dst_h * STRIP_PCT) / 100).clamp(STRIP_MIN_PX, STRIP_MAX_PX);
+    let strip_top = dst_h.saturating_sub(strip_h);
+    let strip_left = strip_audio_left_edge(snapshot, dst_w);
+    draw_header_at(header, dst, dst_pitch, dst_w, dst_h, strip_top, strip_left);
+}
+
+/// Render the stream-info header onto the dedicated ARGB8888 overlay
+/// buffer (the zero-copy KMS-overlay path). Strip occupies the entire
+/// buffer (`strip_top = 0`, `strip_h = dst_h`). Caller invokes this
+/// **after** `rasterise_overlay`.
+pub fn rasterise_header_overlay(
+    snapshot: &MeterSnapshot,
+    header: &StreamHeader,
+    dst: &mut [u8],
+    dst_pitch: usize,
+    dst_w: u32,
+    dst_h: u32,
+) {
+    if header.text.is_empty() || dst_w < 64 || dst_h < 80 {
+        return;
+    }
+    let strip_left = strip_audio_left_edge(snapshot, dst_w);
+    draw_header_at(header, dst, dst_pitch, dst_w, dst_h, 0, strip_left);
+}
+
+/// `fill_rect`'s alpha-aware sibling for the ARGB8888 overlay buffer.
+/// `fill_rect` is hard-coded to `0xFF000000 | RGB` because the
+/// legacy XRGB8888 dumb-buffer path ignores the alpha lane — but a
+/// KMS overlay plane uses the lane to alpha-blend against the
+/// primary plane at scanout, so we let the caller pick `a`.
+fn fill_rect_argb(
+    dst: &mut [u8],
+    pitch: usize,
+    dst_w: u32,
+    dst_h: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    b: u8,
+    g: u8,
+    r: u8,
+    a: u8,
+) {
+    if x >= dst_w || y >= dst_h {
+        return;
+    }
+    let x_end = (x + w).min(dst_w);
+    let y_end = (y + h).min(dst_h);
+    let packed: u32 =
+        ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+    let bytes = packed.to_le_bytes();
+    for row in y..y_end {
+        let row_start = (row as usize) * pitch + (x as usize) * 4;
+        let row_end = row_start + ((x_end - x) as usize) * 4;
+        if row_end > dst.len() {
+            break;
+        }
+        let slice = &mut dst[row_start..row_end];
+        let (head, body, tail) = unsafe { slice.align_to_mut::<u32>() };
+        body.fill(packed);
+        for px in head.chunks_exact_mut(4).chain(tail.chunks_exact_mut(4)) {
+            px.copy_from_slice(&bytes);
+        }
+    }
+}
+
 /// Pixel width of `text` rendered by [`draw_text`], at the same 5×7-
 /// font scale and inter-glyph padding the rasteriser uses. Each glyph
 /// occupies `5 * scale` pixels and is followed by `scale` pixels of
@@ -290,17 +777,12 @@ fn label_pixel_width(text: &str) -> u32 {
     n * (GLYPH_W + SCALE)
 }
 
-fn format_pid_label(pid: &PidMeter) -> String {
-    let ch_label = match pid.channels.len() {
-        1 => "1.0".to_string(),
-        2 => "2.0".to_string(),
-        6 => "5.1".to_string(),
-        8 => "7.1".to_string(),
-        n => format!("{n}CH"),
-    };
-    // Compact "0xNNN CODEC X.Y" — fits the capped block width
-    // (BLOCK_MAX_W = 240 px) at the rasteriser's 5×7 font scale.
-    format!("0x{:X} {} {}", pid.pid, pid.codec_label, ch_label)
+/// Borrow the cached `"0xNNN CODEC X.Y"` label. The string itself is
+/// composed by [`compose_pid_label_into`] inside `update_levels`
+/// whenever the channel count or codec label changes — steady-state
+/// reads here are zero-allocation.
+fn format_pid_label(pid: &PidMeter) -> &str {
+    &pid.cached_label
 }
 
 fn draw_channel_bar(
@@ -603,19 +1085,20 @@ mod tests {
         vec![vec![1.0f32; samples]; channels]
     }
 
-    /// Drive `update_levels` against a freshly-created meter pair and
-    /// return the published snapshot. Mirrors the meter task's
-    /// (mut local + shared publish) pattern from `audio_meter::run_meter`.
-    fn drive(planar: &[Vec<f32>], pid: u16, codec: &'static str) -> (MeterSnapshot, SharedMeter) {
-        let shared = new_shared_meter();
-        let mut local = MeterSnapshot::default();
-        update_levels(planar, pid, codec, &mut local, &shared);
-        (local, shared)
+    /// Drive `update_levels` against a freshly-created publisher and
+    /// return it. Mirrors the meter task's pattern from
+    /// `audio_meter::run_meter` (single `MeterPublisher` owning both
+    /// the working snapshot and the SharedMeter).
+    fn drive(planar: &[Vec<f32>], pid: u16, codec: &'static str) -> MeterPublisher {
+        let mut publisher = MeterPublisher::new(new_shared_meter());
+        update_levels(planar, pid, codec, &mut publisher);
+        publisher
     }
 
     #[test]
     fn dbfs_clamp_silence() {
-        let (s, _shared) = drive(&silent_block(2, 1024), 0x100, "AAC");
+        let p = drive(&silent_block(2, 1024), 0x100, "AAC");
+        let s = &p.local;
         assert_eq!(s.per_pid.len(), 1);
         assert_eq!(s.per_pid[0].channels.len(), 2);
         for ch in &s.per_pid[0].channels {
@@ -626,51 +1109,197 @@ mod tests {
 
     #[test]
     fn dbfs_full_scale_reads_zero() {
-        let (s, _shared) = drive(&full_scale_block(1, 256), 0x100, "AAC");
+        let p = drive(&full_scale_block(1, 256), 0x100, "AAC");
+        let s = &p.local;
         assert_eq!(s.per_pid[0].channels[0].peak_dbfs, 0.0);
         assert!(s.per_pid[0].channels[0].rms_dbfs.abs() < 0.01);
     }
 
     #[test]
     fn peak_hold_decay() {
-        let shared = new_shared_meter();
-        let mut local = MeterSnapshot::default();
-        update_levels(&full_scale_block(1, 64), 0x100, "AAC", &mut local, &shared);
-        let hold_until_first = local.per_pid[0].channels[0].peak_hold_until;
-        update_levels(&silent_block(1, 64), 0x100, "AAC", &mut local, &shared);
-        assert_eq!(local.per_pid[0].channels[0].peak_hold_dbfs, 0.0);
-        assert_eq!(local.per_pid[0].channels[0].peak_hold_until, hold_until_first);
+        let mut p = MeterPublisher::new(new_shared_meter());
+        update_levels(&full_scale_block(1, 64), 0x100, "AAC", &mut p);
+        let hold_until_first = p.local.per_pid[0].channels[0].peak_hold_until;
+        update_levels(&silent_block(1, 64), 0x100, "AAC", &mut p);
+        assert_eq!(p.local.per_pid[0].channels[0].peak_hold_dbfs, 0.0);
+        assert_eq!(p.local.per_pid[0].channels[0].peak_hold_until, hold_until_first);
     }
 
     #[test]
     fn multi_pid_sorted() {
-        let shared = new_shared_meter();
-        let mut local = MeterSnapshot::default();
-        update_levels(&silent_block(2, 64), 0x200, "AC3", &mut local, &shared);
-        update_levels(&silent_block(2, 64), 0x100, "AAC", &mut local, &shared);
-        assert_eq!(local.per_pid.len(), 2);
-        assert_eq!(local.per_pid[0].pid, 0x100);
-        assert_eq!(local.per_pid[1].pid, 0x200);
+        let mut p = MeterPublisher::new(new_shared_meter());
+        update_levels(&silent_block(2, 64), 0x200, "AC3", &mut p);
+        update_levels(&silent_block(2, 64), 0x100, "AAC", &mut p);
+        assert_eq!(p.local.per_pid.len(), 2);
+        assert_eq!(p.local.per_pid[0].pid, 0x100);
+        assert_eq!(p.local.per_pid[1].pid, 0x200);
     }
 
     #[test]
     fn prune_stale_drops_old_pids() {
-        let shared = new_shared_meter();
-        let mut local = MeterSnapshot::default();
-        update_levels(&silent_block(2, 64), 0x100, "AAC", &mut local, &shared);
-        local.per_pid[0].last_update = Instant::now() - Duration::from_secs(10);
-        prune_stale(&mut local, &shared, Duration::from_secs(5));
-        assert!(local.per_pid.is_empty());
+        let mut p = MeterPublisher::new(new_shared_meter());
+        update_levels(&silent_block(2, 64), 0x100, "AAC", &mut p);
+        p.local.per_pid[0].last_update = Instant::now() - Duration::from_secs(10);
+        prune_stale(&mut p, Duration::from_secs(5));
+        assert!(p.local.per_pid.is_empty());
     }
 
     #[test]
     fn shared_load_returns_latest_snapshot() {
-        let shared = new_shared_meter();
-        let mut local = MeterSnapshot::default();
-        update_levels(&full_scale_block(2, 32), 0x100, "AAC", &mut local, &shared);
-        let observed = shared.load();
+        let mut p = MeterPublisher::new(new_shared_meter());
+        update_levels(&full_scale_block(2, 32), 0x100, "AAC", &mut p);
+        let observed = p.shared.load();
         assert_eq!(observed.per_pid.len(), 1);
         assert_eq!(observed.per_pid[0].pid, 0x100);
+    }
+
+    /// Cached label is composed once at PID creation and reused on
+    /// subsequent updates while the channel count stays the same. The
+    /// rasterise path reads `&pid.cached_label` so this is the
+    /// allocation that #2 in the audio-bars review eliminated.
+    #[test]
+    fn cached_label_populated_and_reused() {
+        let mut p = MeterPublisher::new(new_shared_meter());
+        update_levels(&silent_block(2, 64), 0x100, "AAC", &mut p);
+        assert_eq!(p.local.per_pid[0].cached_label, "0x100 AAC 2.0");
+        // Same PID, same channel count, same codec — the cached label
+        // should not be recomposed (we can't observe the lack-of-alloc
+        // directly, but we can pin the value: it stays exactly equal).
+        let pre_addr = p.local.per_pid[0].cached_label.as_ptr();
+        let pre_cap = p.local.per_pid[0].cached_label.capacity();
+        update_levels(&silent_block(2, 64), 0x100, "AAC", &mut p);
+        let post_addr = p.local.per_pid[0].cached_label.as_ptr();
+        let post_cap = p.local.per_pid[0].cached_label.capacity();
+        // Same allocation — String wasn't touched.
+        assert_eq!(pre_addr, post_addr);
+        assert_eq!(pre_cap, post_cap);
+        assert_eq!(p.local.per_pid[0].cached_label, "0x100 AAC 2.0");
+    }
+
+    /// When the channel count changes (PMT update mid-stream), the
+    /// cached label is recomposed with the new "X.Y" suffix.
+    #[test]
+    fn cached_label_updates_on_channel_count_change() {
+        let mut p = MeterPublisher::new(new_shared_meter());
+        update_levels(&silent_block(2, 64), 0x100, "AAC", &mut p);
+        assert_eq!(p.local.per_pid[0].cached_label, "0x100 AAC 2.0");
+        update_levels(&silent_block(6, 64), 0x100, "AAC", &mut p);
+        assert_eq!(p.local.per_pid[0].cached_label, "0x100 AAC 5.1");
+    }
+
+    /// Channel counts not in the broadcast preset list (1.0 / 2.0 / 5.1
+    /// / 7.1) fall back to the "NCH" suffix so a 3-channel stream
+    /// still gets a meaningful label.
+    #[test]
+    fn cached_label_handles_uncommon_channel_counts() {
+        let mut p = MeterPublisher::new(new_shared_meter());
+        update_levels(&silent_block(3, 64), 0x100, "AAC", &mut p);
+        assert_eq!(p.local.per_pid[0].cached_label, "0x100 AAC 3CH");
+    }
+
+    /// Allocation-reuse path: when no reader holds a guard, the
+    /// publisher reclaims a previously-published Arc via
+    /// `Arc::try_unwrap` and reuses its **inner** heap allocations
+    /// (the `channels: Vec<ChannelLevel>` and `cached_label: String`
+    /// on each PidMeter) — `Arc::new` itself still allocates the
+    /// header per publish, but the payload Vecs/Strings keep their
+    /// heap.
+    ///
+    /// Verification: take address of the inner `channels` Vec at
+    /// publish 1, do enough additional publishes that the publisher's
+    /// `spare` slot rotates around to hold publish 1's Arc again
+    /// (publish 2 → spare = empty default; publish 3 → spare =
+    /// publish 1's Arc, reclaim fires, channels heap reused).
+    #[test]
+    fn publisher_reuses_inner_heap_when_reader_idle() {
+        let mut p = MeterPublisher::new(new_shared_meter());
+        update_levels(&silent_block(2, 64), 0x100, "AAC", &mut p); // publish 1
+        let publish1_channels_addr = {
+            let arc = p.shared.load_full();
+            let ptr = arc.per_pid[0].channels.as_ptr() as usize;
+            // arc dropped here so the published refcount is 1 again
+            ptr
+        };
+        let publish1_label_addr = {
+            let arc = p.shared.load_full();
+            arc.per_pid[0].cached_label.as_ptr() as usize
+        };
+        // Publish 2: spare was the empty-default Arc, so it gets
+        // reclaimed but `clone_from` has to grow its empty per_pid
+        // Vec — fresh inner allocations on this round.
+        update_levels(&full_scale_block(2, 64), 0x100, "AAC", &mut p);
+        // Publish 3: spare is now publish-1's Arc (refcount 1, no
+        // reader). `try_unwrap` succeeds; `clone_from` does in-place
+        // overwrite on the matching PID, reusing publish-1's inner
+        // heap allocations.
+        update_levels(&silent_block(2, 64), 0x100, "AAC", &mut p);
+        let arc3 = p.shared.load_full();
+        let publish3_channels_addr = arc3.per_pid[0].channels.as_ptr() as usize;
+        let publish3_label_addr = arc3.per_pid[0].cached_label.as_ptr() as usize;
+        assert_eq!(
+            publish1_channels_addr, publish3_channels_addr,
+            "expected channels Vec heap to be reused via try_unwrap reclaim"
+        );
+        assert_eq!(
+            publish1_label_addr, publish3_label_addr,
+            "expected cached_label String heap to be reused via try_unwrap reclaim"
+        );
+    }
+
+    /// Fallback path: if a reader holds a load guard when the
+    /// publisher tries to reclaim, `try_unwrap` fails. The held Arc is
+    /// dropped (the publisher only has one spare slot and the
+    /// freshly-swapped Arc is a better candidate) — but reclaim
+    /// resumes from the next publish onward.
+    #[test]
+    fn publisher_holds_spare_when_reader_blocks_reclaim() {
+        let mut p = MeterPublisher::new(new_shared_meter());
+        update_levels(&silent_block(2, 64), 0x100, "AAC", &mut p); // publish 1
+        // Reader pins publish 1's Arc.
+        let held_guard = p.shared.load_full();
+        let publish1_channels_addr = held_guard.per_pid[0].channels.as_ptr() as usize;
+
+        // Publish 2: spare = empty-default Arc; try_unwrap on it
+        // succeeds (held_guard pins publish 1, not the empty default).
+        // The new Arc inherits the empty-default's outer Vec heap.
+        // After publish 2: spare = publish 1's Arc (held_guard pins
+        // it too).
+        update_levels(&full_scale_block(2, 64), 0x100, "AAC", &mut p);
+        let publish2_channels_addr = {
+            let arc = p.shared.load_full();
+            arc.per_pid[0].channels.as_ptr() as usize
+        };
+
+        // Publish 3: spare = publish 1's Arc, but held_guard still
+        // pins it → try_unwrap fails. The old spare Arc is dropped
+        // (publish 1's heap will be freed once the test drops
+        // held_guard); a fresh Arc is allocated. swap returns
+        // publish 2's Arc (refcount 1, no reader pins it), which
+        // becomes the new spare.
+        update_levels(&silent_block(2, 64), 0x100, "AAC", &mut p);
+        let publish3_channels_addr = {
+            let arc = p.shared.load_full();
+            arc.per_pid[0].channels.as_ptr() as usize
+        };
+        assert_ne!(
+            publish1_channels_addr, publish3_channels_addr,
+            "expected fresh channels heap while reader pins the spare Arc"
+        );
+
+        drop(held_guard);
+
+        // Publish 4: spare = publish 2's Arc, refcount 1. Reclaim
+        // fires; publish 2's inner heap is reused — *not* publish 1's
+        // (that was dropped in the failed reclaim above).
+        update_levels(&silent_block(2, 64), 0x100, "AAC", &mut p);
+        let publish4_channels_addr = {
+            let arc = p.shared.load_full();
+            arc.per_pid[0].channels.as_ptr() as usize
+        };
+        assert_eq!(
+            publish2_channels_addr, publish4_channels_addr,
+            "expected reclaim to fire on the freshly-swapped Arc once the reader dropped"
+        );
     }
 
     #[test]
@@ -680,11 +1309,10 @@ mod tests {
         let h: u32 = 720;
         let pitch = (w as usize) * 4;
         let mut buf = vec![0u8; pitch * (h as usize)];
-        let shared = new_shared_meter();
-        let mut local = MeterSnapshot::default();
-        update_levels(&full_scale_block(2, 64), 0x100, "AAC", &mut local, &shared);
-        update_levels(&silent_block(6, 64), 0x101, "AC3", &mut local, &shared);
-        let s = local.clone();
+        let mut p = MeterPublisher::new(new_shared_meter());
+        update_levels(&full_scale_block(2, 64), 0x100, "AAC", &mut p);
+        update_levels(&silent_block(6, 64), 0x101, "AC3", &mut p);
+        let s = p.local.clone();
         rasterise(&s, &mut buf, pitch, w, h);
         // Some row inside the strip (top 12 % of dst_h is the strip)
         // should have BGRA pixels written by the rasteriser.
@@ -695,6 +1323,75 @@ mod tests {
             .chunks_exact(4)
             .any(|px| px[3] == 0xFF);
         assert!(any_pixel_set, "expected rasterised pixels inside the strip");
+    }
+
+    #[test]
+    fn header_truncation_respects_pixel_width() {
+        // Header is rendered only when there's at least 72 px of room
+        // before the leftmost audio block. Too-tight scenarios skip it
+        // entirely (no half-word render).
+        assert_eq!(truncate_to_pixel_width("HEVC 1920x1080", 72), "HEVC 1");
+        // 12 px per char including trailing pad → 6 chars × 12 = 72.
+        assert_eq!(truncate_to_pixel_width("HEVC 1920x1080", 36), "HEV");
+        // Empty avail → empty result.
+        assert_eq!(truncate_to_pixel_width("HEVC", 0), "");
+        // No truncation when text fits.
+        assert_eq!(truncate_to_pixel_width("OK", 1000), "OK");
+    }
+
+    #[test]
+    fn header_overlay_writes_pixels_with_room() {
+        // Single-PID stereo on a 1920×140 ARGB strip leaves ~720 px on
+        // the left for the header — plenty for a "HEVC 1920x1080 50p"
+        // line.
+        let w: u32 = 1920;
+        let h: u32 = 140;
+        let pitch = (w as usize) * 4;
+        let mut buf = vec![0u8; pitch * (h as usize)];
+        let mut p = MeterPublisher::new(new_shared_meter());
+        update_levels(&silent_block(2, 64), 0x100, "AAC", &mut p);
+        let snap = p.local.clone();
+        rasterise_overlay(&snap, &mut buf, pitch, w, h);
+        let header = StreamHeader { text: "HEVC 1920x1080 50p HDR-PQ V:0x100 A:0x101" };
+        rasterise_header_overlay(&snap, &header, &mut buf, pitch, w, h);
+        // Probe the header label-row (LABEL_TOP_PADDING_PX=4, 14 px tall)
+        // on the LEFT side. Must contain at least one fully-opaque
+        // ARGB pixel — proves header was drawn.
+        let probe_y = (LABEL_TOP_PADDING_PX + 6) as usize;
+        let row_start = probe_y * pitch + (SIDE_MARGIN_PX as usize) * 4;
+        let row_end = row_start + 200 * 4; // first 200 px of the row
+        let any_alpha_full = buf[row_start..row_end]
+            .chunks_exact(4)
+            .any(|px| px[3] == 0xFF);
+        assert!(
+            any_alpha_full,
+            "expected header text alpha pixels in left margin row"
+        );
+    }
+
+    #[test]
+    fn header_overlay_skips_when_no_room() {
+        // Many PIDs leave too little space on the left — header skips
+        // rather than crowd the audio block labels.
+        let w: u32 = 320;
+        let h: u32 = 100;
+        let pitch = (w as usize) * 4;
+        let mut buf = vec![0u8; pitch * (h as usize)];
+        let mut p = MeterPublisher::new(new_shared_meter());
+        // 3 PIDs at 320 px wide → blocks crowd the strip.
+        update_levels(&silent_block(2, 64), 0x100, "AAC", &mut p);
+        update_levels(&silent_block(2, 64), 0x101, "AAC", &mut p);
+        update_levels(&silent_block(6, 64), 0x102, "AC3", &mut p);
+        let snap = p.local.clone();
+        let header = StreamHeader { text: "HEVC 1920x1080 50p" };
+        // Capture the buffer state after only the bars rasterise so we
+        // can compare what the header rasterise added (or didn't).
+        rasterise_overlay(&snap, &mut buf, pitch, w, h);
+        let mut after_bars = buf.clone();
+        rasterise_header_overlay(&snap, &header, &mut buf, pitch, w, h);
+        // Header should be a no-op on this geometry.
+        assert_eq!(after_bars, buf, "header should skip when avail_w too tight");
+        let _ = after_bars;
     }
 
     #[test]

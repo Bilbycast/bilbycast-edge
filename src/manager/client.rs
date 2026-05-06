@@ -886,6 +886,17 @@ fn build_resource_budget_payload(
                 .map(|o| o.insert("hw_encoder_chroma".into(), v));
         }
     }
+    // VAAPI direction-tagged capability (WS_PROTOCOL_VERSION ≥ 2). Older
+    // managers ignore the field; newer ones prefer it over the legacy
+    // `hw_encoders.{h264,hevc}_vaapi` mirror, which we keep populating
+    // for backwards compatibility.
+    if !static_caps.vaapi.is_empty() {
+        if let Ok(v) = serde_json::to_value(&static_caps.vaapi) {
+            payload
+                .as_object_mut()
+                .map(|o| o.insert("vaapi".into(), v));
+        }
+    }
     payload
 }
 
@@ -979,6 +990,37 @@ fn edge_capabilities() -> Vec<&'static str> {
     if cfg!(feature = "video-encoder-qsv") {
         caps.push("video-encoder-qsv");
     }
+    if cfg!(feature = "video-encoder-vaapi") {
+        caps.push("video-encoder-vaapi");
+    }
+    // HW decoder capability strings — used by both the display output
+    // and the transcode input-decode path. Advertised when the matching
+    // `video-decoder-*` Cargo feature is on AND the runtime probe found
+    // at least one decoder in that family usable. The manager UI reads
+    // these to populate the "HW Decoder" dropdown on transcode flow
+    // outputs (separate from the display-output decoder dropdown which
+    // keys off the legacy `display-*` strings emitted below).
+    if cfg!(feature = "video-decoder-nvdec") {
+        if let Some(c) = crate::engine::hardware_probe::static_capabilities() {
+            if c.hw_decoders.h264_nvenc || c.hw_decoders.hevc_nvenc {
+                caps.push("video-decoder-nvdec");
+            }
+        }
+    }
+    if cfg!(feature = "video-decoder-qsv") {
+        if let Some(c) = crate::engine::hardware_probe::static_capabilities() {
+            if c.hw_decoders.h264_qsv || c.hw_decoders.hevc_qsv {
+                caps.push("video-decoder-qsv");
+            }
+        }
+    }
+    if cfg!(feature = "video-decoder-vaapi") {
+        if let Some(c) = crate::engine::hardware_probe::static_capabilities() {
+            if c.hw_decoders.h264_vaapi || c.hw_decoders.hevc_vaapi {
+                caps.push("video-decoder-vaapi");
+            }
+        }
+    }
     if cfg!(feature = "fdk-aac") {
         caps.push("fdk-aac");
     }
@@ -1021,6 +1063,14 @@ fn edge_capabilities() -> Vec<&'static str> {
                 if let Some(c) = crate::engine::hardware_probe::static_capabilities() {
                     if c.hw_decoders.h264_qsv || c.hw_decoders.hevc_qsv {
                         caps.push("display-qsv");
+                    }
+                }
+            }
+            #[cfg(feature = "display-vaapi")]
+            {
+                if let Some(c) = crate::engine::hardware_probe::static_capabilities() {
+                    if c.hw_decoders.h264_vaapi || c.hw_decoders.hevc_vaapi {
+                        caps.push("display-vaapi");
                     }
                 }
             }
@@ -2163,6 +2213,19 @@ async fn execute_command(
                 .await
                 .map_err(|e| format!("list_media failed: {e}"))?;
             Ok(Some(serde_json::json!({ "files": files })))
+        }
+        "scan_media" => {
+            // Probe a media-library file's PAT to enumerate its programs.
+            // Powers the media-player input UI's program-picker dropdown
+            // so an operator never has to guess program numbers when
+            // down-selecting an MPTS to a single program.
+            let name = action["name"]
+                .as_str()
+                .ok_or("scan_media: missing 'name'")?;
+            let result = crate::media::MediaLibrary::scan_programs(name)
+                .await
+                .map_err(|e| format!("scan_media failed: {e}"))?;
+            Ok(Some(serde_json::to_value(&result).unwrap_or_default()))
         }
         "upload_media_chunk" => {
             let name = action["name"]
