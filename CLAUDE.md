@@ -142,6 +142,12 @@ All data flows through a single type: `RtpPacket { data: Bytes, sequence_number:
 - **`CancellationToken`** — hierarchical shutdown: parent flow token → child output tokens
 - **Hot-add/remove** — outputs can be added/removed at runtime without restarting the flow
 
+### Master Clock & A/V Sync
+
+Every flow runs against a per-flow master clock. PCR generation, output emission timing, and lipsync trim all bottom out on the same `MasterClock::now_27mhz()` call. The auto-policy maps active input → kind: SRT/RTP/UDP/RIST/RTMP/RTSP/`media_player`/`replay` → `SourcePcrPll` (software PI-controller PLL recovers source's 27 MHz from ingress PCR samples); ST 2110-* → `Ptp` (slaves to `ptp4l` grandmaster); WebRTC → `Wallclock` with a degraded-clock warning; operator can override per-flow via `master_clock` config. Output PCR is generated as `master.now_27mhz() − PCR_PREROLL_27MHZ` (80 ms pre-roll, T-STD-compliant) — every output of a flow emits an identical PCR sequence regardless of internal pipeline depth, and multiple edges slaved to the same grandmaster produce coherent output for 2022-7 hitless without external genlock. PTS still flows through `src_pts_queue` so A/V offset versus source is preserved.
+
+Modules: `engine::master_clock` (trait + handle + selection policy), `engine::pcr_pll` (PI loop + lock hysteresis), `engine::pcr_ingress_sampler` (broadcast subscriber feeding the PLL), `engine::av_sync_mux::AvSyncPacer` (per-flow pacer threaded into `TsVideoReplacer` / output emit code). Capability `master_clock` advertised on `HealthPayload.capabilities`. WS command `set_master_clock_lipsync` accepts a ±18 000 (±200 ms) trim. Telemetry on `FlowStats.master_clock` (kind / locked / rate_offset_ppm / jitter_us / lipsync_offset_90k). Full reference: [`docs/clocking.md`](docs/clocking.md).
+
 ### Security Architecture
 
 Four security layers, from outermost to innermost:
