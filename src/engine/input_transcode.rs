@@ -127,6 +127,24 @@ impl InputTranscoder {
         }))
     }
 
+    /// Attach the per-flow A/V sync pacer onto the inner video replacer
+    /// (no-op when the transcoder has no video stage). Master-clocked
+    /// PCR generation is the same Phase-4 path as the output-side
+    /// replacers — once attached, ingress-emitted bytes carry the
+    /// flow's master-clock PCR sequence instead of `pts × 300 −
+    /// preroll`. Outputs that consume the broadcast channel (HLS,
+    /// CMAF, RTMP, WebRTC, plus passthrough TS-native outputs) inherit
+    /// the master-clocked PCR cadence.
+    #[allow(dead_code)]
+    pub fn set_av_sync_pacer(
+        &mut self,
+        pacer: Arc<crate::engine::av_sync_mux::AvSyncPacer>,
+    ) {
+        if let Some(v) = self.video.as_mut() {
+            v.set_av_sync_pacer(pacer);
+        }
+    }
+
     /// Pass one chunk of raw 188-byte-aligned TS through the audio stage, then
     /// the video stage. Returns the transformed output as a borrowed slice of
     /// the internal scratch buffer. The slice is valid until the next call to
