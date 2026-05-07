@@ -957,6 +957,13 @@ fn edge_capabilities() -> Vec<&'static str> {
         // for systemd respawn. Manager UI gates the upgrade button on
         // this capability so older edges (no upgrade module) hide it.
         "upgrade",
+        // Per-flow A/V sync mux + master clock (source PCR PLL / PTP /
+        // wallclock fallback). Manager UI gates the master-clock
+        // telemetry card + lipsync trim knob on this. FlowStats carries
+        // master_clock and the WS dispatcher accepts
+        // `set_master_clock_lipsync` commands — older edges return
+        // `unknown_action`.
+        "master_clock",
     ];
     if cfg!(feature = "ptp-internal") {
         caps.push("ptp-internal");
@@ -3457,6 +3464,36 @@ async fn execute_command(
                 "channel": staged.channel,
                 "variant": staged.variant,
                 "arch": staged.arch,
+            })))
+        }
+        "set_master_clock_lipsync" => {
+            let flow_id = action["flow_id"].as_str().ok_or_else(|| {
+                CommandError::with_code(
+                    "set_master_clock_lipsync: missing 'flow_id'",
+                    "missing_field",
+                )
+            })?;
+            let lipsync_offset_90k = action["lipsync_offset_90k"]
+                .as_i64()
+                .ok_or_else(|| {
+                    CommandError::with_code(
+                        "set_master_clock_lipsync: missing 'lipsync_offset_90k'",
+                        "missing_field",
+                    )
+                })?;
+            let runtime = flow_manager.get_runtime(flow_id).ok_or_else(|| {
+                CommandError::with_code(format!("Unknown flow '{flow_id}'"), "unknown_flow")
+            })?;
+            // Bounded ±200 ms. The handle clamps internally; we mirror
+            // the clamp here so the operator's wire value reflects the
+            // accepted value when echoed back via FlowStats.
+            let clamped = lipsync_offset_90k.clamp(-18_000, 18_000);
+            runtime.master_clock().set_lipsync_offset_90k(clamped);
+            // Mirror onto FlowStats so the next snapshot shows the new
+            // trim without waiting for the 1 Hz telemetry tick.
+            runtime.stats.set_master_clock_lipsync(clamped);
+            Ok(Some(serde_json::json!({
+                "lipsync_offset_90k": clamped,
             })))
         }
         _ => Err(CommandError::with_code(format!("Unknown command: {action_type}"), "unknown_action")),
