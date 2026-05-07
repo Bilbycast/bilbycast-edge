@@ -74,6 +74,11 @@ pub mod packet;
 /// trait, kind enum, and selection policy. Sibling modules `pcr_pll` and
 /// `av_sync_mux` (Phases 2 + 4) consume this abstraction.
 pub mod master_clock;
+/// Software PI-controller PLL recovering source's 27 MHz from incoming
+/// PCR samples. Used by [`master_clock::MasterClockKind::SourcePcrPll`].
+/// See [`pcr_pll`] for the PI loop, lock-state hysteresis, and the
+/// pre-sample wallclock fallback.
+pub mod pcr_pll;
 pub mod perf;
 pub mod rtmp;
 pub mod thumbnail;
