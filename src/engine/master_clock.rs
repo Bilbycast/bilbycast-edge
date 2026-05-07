@@ -142,6 +142,80 @@ impl Default for MasterClockTelemetry {
     }
 }
 
+/// Source-PCR-PLL master: wraps [`crate::engine::pcr_pll::PcrPll`] behind
+/// the [`MasterClock`] trait. Ingress samples are fed from the per-flow
+/// PCR ingress sampler (see `flow.rs`'s `spawn_pcr_ingress_sampler`).
+pub struct SourcePcrPllMaster {
+    pll: Arc<crate::engine::pcr_pll::PcrPll>,
+    /// Process-monotonic epoch — both `record_sample` (sampler side) and
+    /// `now_27mhz` (output side) reference this same anchor so the
+    /// `wall_ns` values land on the same clock.
+    epoch: Instant,
+    source_id: String,
+}
+
+impl SourcePcrPllMaster {
+    pub fn new(source_id: impl Into<String>) -> Self {
+        Self {
+            pll: Arc::new(crate::engine::pcr_pll::PcrPll::default()),
+            epoch: Instant::now(),
+            source_id: source_id.into(),
+        }
+    }
+
+    pub fn with_pll(
+        pll: Arc<crate::engine::pcr_pll::PcrPll>,
+        epoch: Instant,
+        source_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            pll,
+            epoch,
+            source_id: source_id.into(),
+        }
+    }
+
+    pub fn pll(&self) -> Arc<crate::engine::pcr_pll::PcrPll> {
+        self.pll.clone()
+    }
+
+    pub fn epoch(&self) -> Instant {
+        self.epoch
+    }
+
+    /// Convenience: feed a PCR sample using the master's process epoch.
+    /// Called by the per-flow ingress sampler.
+    pub fn record_sample(&self, pcr_27mhz: u64) {
+        let wall_ns = self.epoch.elapsed().as_nanos();
+        self.pll.record_sample(pcr_27mhz, wall_ns);
+    }
+}
+
+impl MasterClock for SourcePcrPllMaster {
+    fn now_27mhz(&self) -> u64 {
+        let wall_ns = self.epoch.elapsed().as_nanos();
+        self.pll.now_27mhz(wall_ns)
+    }
+
+    fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    fn is_locked(&self) -> bool {
+        self.pll.is_locked()
+    }
+
+    fn telemetry(&self) -> MasterClockTelemetry {
+        let t = self.pll.telemetry();
+        MasterClockTelemetry {
+            kind: MasterClockKind::SourcePcrPll.as_str().to_string(),
+            locked: t.locked,
+            rate_offset_ppm: t.rate_offset_ppm,
+            jitter_us: t.jitter_us,
+        }
+    }
+}
+
 /// Last-resort master: monotonic wall clock pinned at flow start.
 ///
 /// `now_27mhz()` returns `(Instant::now() − epoch).as_nanos() × 27 / 1000`
@@ -239,6 +313,17 @@ pub struct MasterClockHandle {
 }
 
 impl MasterClockHandle {
+    /// Build a `SourcePcrPll` handle. Returns the handle and the
+    /// underlying `SourcePcrPllMaster` so the caller can wire the
+    /// ingress sampler.
+    pub fn source_pcr_pll(
+        source_id: impl Into<String>,
+    ) -> (Self, Arc<SourcePcrPllMaster>) {
+        let inner = Arc::new(SourcePcrPllMaster::new(source_id));
+        let handle = Self::new(inner.clone(), MasterClockKind::SourcePcrPll);
+        (handle, inner)
+    }
+
     pub fn new(inner: Arc<dyn MasterClock>, kind: MasterClockKind) -> Self {
         Self {
             inner,

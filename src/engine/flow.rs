@@ -984,12 +984,55 @@ impl FlowRuntime {
 
         // ── Master clock selection ────────────────────────────────────
         // Operator override on `FlowConfig.master_clock` beats the auto
-        // policy. `Wallclock` is always available; `SourcePcrPll` and
-        // `Ptp` paths are wired in Phases 3 + 6 — until then they fall
-        // through to a Wallclock impl with the right `kind` tag so the
-        // telemetry surface is correct from day one.
-        let master_clock = build_master_clock(&config.config, active_input_cfg, &event_sender);
+        // policy. `Wallclock` is always available; Phase 3 lit up the
+        // real `SourcePcrPllMaster` backend for SRT/RTP/UDP/RIST/RTMP/
+        // RTSP/`media_player`/`replay` flows. `Ptp` + `AudioMaster` still
+        // fall through to a Wallclock impl with the right `kind` tag
+        // until Phase 6 (PTP) and a future phase land real backends.
+        let (master_clock, pll_master) =
+            build_master_clock(&config.config, active_input_cfg, &event_sender);
         flow_stats.set_master_clock_telemetry(master_clock.telemetry());
+        flow_stats.set_master_clock_lipsync(master_clock.lipsync_offset_90k());
+
+        // Spawn the ingress PCR sampler so the PLL converges on source's
+        // 27 MHz. Only relevant for `SourcePcrPll` flows; absent for
+        // `Wallclock` / `Ptp` / `AudioMaster`.
+        if let Some(pll_master) = pll_master {
+            let sampler_cancel = cancel_token.child_token();
+            // Detached: the sampler is a passive observer. Owned by the
+            // flow's CancellationToken tree so shutdown propagates.
+            let _ = crate::engine::pcr_ingress_sampler::spawn_pcr_ingress_sampler(
+                pll_master,
+                &broadcast_tx,
+                sampler_cancel,
+            );
+        }
+
+        // Mirror master-clock telemetry into the stats accumulator at a
+        // low rate so manager UI sees PLL convergence without each flow
+        // tick paying the lock+clone cost. Same one-shot subscriber
+        // pattern as the analyzer / media-analyzer.
+        {
+            let mc = master_clock.clone();
+            let acc = flow_stats.clone();
+            let cancel = cancel_token.child_token();
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(1));
+                interval.set_missed_tick_behavior(
+                    tokio::time::MissedTickBehavior::Delay,
+                );
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = interval.tick() => {
+                            acc.set_master_clock_telemetry(mc.telemetry());
+                            acc.set_master_clock_lipsync(mc.lipsync_offset_90k());
+                        }
+                    }
+                }
+            });
+        }
 
         Ok(Self {
             config,
@@ -3880,22 +3923,22 @@ fn output_encode_blocks(
 
 // ─── Master clock construction ────────────────────────────────────────
 //
-// Phase 1 wires the abstraction with a Wallclock-backed `MasterClockHandle`
-// regardless of the resolved kind. Phases 3 + 6 swap in the real
-// `SourcePcrPllMaster` and `PtpMasterClock` implementations behind the
-// same handle without touching any caller. The kind tag carried on the
-// handle keeps telemetry honest: even on a Wallclock-backed instance, the
-// flow's manager UI shows `source_pcr_pll` (or `ptp`, etc.) so operators
-// see the eventual target clock, with a `degraded_warned` event firing
-// once if the real backend isn't yet available.
+// Phase 3 wires `SourcePcrPllMaster` for SRT/RTP/UDP/RIST/RTMP/RTSP/
+// `media_player` / `replay` flows; `Ptp` and `AudioMaster` still fall
+// through to the Wallclock impl until Phase 6 lands real backends.
+// Returns the handle and an optional `SourcePcrPllMaster` so the flow
+// runtime can spawn the ingress PCR sampler against the same instance.
 fn build_master_clock(
     cfg: &crate::config::models::FlowConfig,
     active_input: Option<&crate::config::models::InputConfig>,
     event_sender: &EventSender,
-) -> crate::engine::master_clock::MasterClockHandle {
+) -> (
+    crate::engine::master_clock::MasterClockHandle,
+    Option<Arc<crate::engine::master_clock::SourcePcrPllMaster>>,
+) {
     use crate::config::models::MasterClockKindConfig;
     use crate::engine::master_clock::{
-        MasterClockHandle, MasterClockKind, WallclockMaster,
+        MasterClockHandle, MasterClockKind, SourcePcrPllMaster, WallclockMaster,
     };
 
     let kind = match cfg.master_clock.as_ref().map(|m| m.kind) {
@@ -3906,7 +3949,20 @@ fn build_master_clock(
         None => crate::engine::master_clock::select_master_kind_for_input(active_input),
     };
 
-    let handle = MasterClockHandle::new(Arc::new(WallclockMaster::new()), kind);
+    let (handle, pll_master) = match kind {
+        MasterClockKind::SourcePcrPll => {
+            let inner = Arc::new(SourcePcrPllMaster::new(format!("source_pcr:{}", cfg.id)));
+            let h = MasterClockHandle::new(inner.clone(), MasterClockKind::SourcePcrPll);
+            (h, Some(inner))
+        }
+        // Ptp / AudioMaster fall through to Wallclock until their real
+        // backends land in Phase 6 / a future phase. The kind tag is
+        // preserved so manager UI surfaces the intended source.
+        other => (
+            MasterClockHandle::new(Arc::new(WallclockMaster::new()), other),
+            None,
+        ),
+    };
 
     if let Some(mc_cfg) = cfg.master_clock.as_ref() {
         handle.set_lipsync_offset_90k(mc_cfg.lipsync_offset_90k);
@@ -3929,7 +3985,7 @@ fn build_master_clock(
         );
     }
 
-    handle
+    (handle, pll_master)
 }
 
 fn is_webrtc_like_input(input: &crate::config::models::InputConfig) -> bool {

@@ -79,6 +79,10 @@ pub mod master_clock;
 /// See [`pcr_pll`] for the PI loop, lock-state hysteresis, and the
 /// pre-sample wallclock fallback.
 pub mod pcr_pll;
+/// Per-flow ingress PCR sampler — broadcast-channel subscriber that
+/// extracts PCR samples from every TS packet and feeds the source-PCR
+/// PLL. Sibling to `stats::pcr_trust` (egress accuracy).
+pub mod pcr_ingress_sampler;
 pub mod perf;
 pub mod rtmp;
 pub mod thumbnail;

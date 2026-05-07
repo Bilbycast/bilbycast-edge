@@ -325,6 +325,7 @@ impl PcrPll {
     /// Convenience wrapper for callers that want to compute `wall_ns`
     /// from a process-anchored `Instant` rather than passing it
     /// explicitly.
+    #[allow(dead_code)]
     pub fn now_27mhz_with(&self, epoch: Instant) -> u64 {
         let dt_ns = epoch.elapsed().as_nanos();
         self.now_27mhz(dt_ns)
