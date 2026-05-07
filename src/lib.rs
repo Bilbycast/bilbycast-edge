@@ -47,4 +47,8 @@ pub mod setup;
 pub mod srt;
 pub mod stats;
 pub mod tunnel;
+/// Remote binary upgrade pipeline (Sigstore-verified manifest fetch,
+/// streaming SHA-256, atomic symlink swap, boot watchdog). Driven from
+/// the manager `upgrade_binary` WS command. See `docs/upgrade.md`.
+pub mod upgrade;
 pub mod util;

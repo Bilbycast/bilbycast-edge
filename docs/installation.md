@@ -1,5 +1,38 @@
 # Installing bilbycast-edge
 
+## Quick start (curl-pipe-bash)
+
+For a fresh Linux node, the fastest path is the published installer
+script. It downloads the latest signed release, verifies the Sigstore
+signature, lays out `/opt/bilbycast/edge/`, creates the `bilbycast`
+service user, installs the systemd unit, and registers the node with
+your manager:
+
+```bash
+curl -fsSL https://github.com/Bilbycast/bilbycast-edge/releases/latest/download/install-edge.sh | \
+    sudo bash -s -- \
+        --manager wss://manager.example.com:8443 \
+        --registration-token <token-from-manager-ui>
+```
+
+Optional flags: `--channel stable|nightly|beta`, `--variant default|full`,
+`--upgrade-installer` (refresh the script + service unit without touching
+config or installed binaries).
+
+Once registered, the manager UI's per-node **Upgrade** button drives
+future upgrades remotely — see [`docs/upgrade.md`](upgrade.md) for the
+full lifecycle and trust model, and [`docs/security.md`](security.md)
+for the threat model behind the Sigstore-keyless signing the installer
+verifies.
+
+The remainder of this document covers the manual install path
+(air-gapped sites, sites that prefer to manage systemd themselves, and
+operators who want to inspect every step before running it).
+
+---
+
+## Manual install
+
 Two release variants are published on each tag. Pick the one that
 matches your transcoding needs:
 

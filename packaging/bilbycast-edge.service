@@ -1,0 +1,72 @@
+[Unit]
+Description=bilbycast-edge media transport gateway
+Documentation=https://bilbycast.com/docs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bilbycast
+Group=bilbycast
+
+# `current` is a symlink the upgrade pipeline atomically swaps; systemd
+# follows it on every (re)start so a successful staged upgrade lands the
+# moment the old binary exits.
+ExecStart=/opt/bilbycast/edge/current/bilbycast-edge --config /opt/bilbycast/edge/config.json
+
+# Restart on any non-zero exit so the boot watchdog can drive the
+# rollback handshake. 3-second back-off is plenty — typical respawn
+# latency is dominated by systemd's own settling, not the binary.
+Restart=always
+RestartSec=3
+# Limit how often we'll respawn; pairs with the watchdog's
+# `max_boot_attempts` so a crash-loop on a bad upgrade doesn't burn
+# CPU forever before the symlink revert kicks in.
+StartLimitInterval=300
+StartLimitBurst=10
+
+# Send SIGTERM and let the edge drain flows + close sockets cleanly.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# ── Hardening ──
+ProtectSystem=strict
+# Writable paths: the install root (versions/, current symlink,
+# state.json), the data dir (replay segments, media library, etc.),
+# and the runtime tmp dir. Everything else is read-only.
+ReadWritePaths=/opt/bilbycast/edge /var/lib/bilbycast/edge /run/bilbycast
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+# Allow opening DRI render nodes (VAAPI, KMS scanout for `display`)
+# and ALSA devices when those features are compiled in. Operators
+# who don't need the display output can drop these without affecting
+# the rest of the edge.
+DeviceAllow=/dev/dri/card0 rwm
+DeviceAllow=/dev/dri/card1 rwm
+DeviceAllow=/dev/dri/renderD128 rwm
+DeviceAllow=/dev/dri/renderD129 rwm
+DeviceAllow=/dev/snd/* rwm
+SupplementaryGroups=video render audio
+# Capability set: the edge needs no privileged ops itself (port < 1024
+# binding is handled via socket-activation or by configuring the manager
+# in front of a load balancer), so we drop all caps.
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=false  # JIT crates exist (rustls, ring) — leave on default
+SystemCallArchitectures=native
+
+# Resource limits — generous defaults; operators can tune via drop-in
+# /etc/systemd/system/bilbycast-edge.service.d/override.conf
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+# Environment file lets operators set RUST_LOG, BILBYCAST_REPLAY_DIR,
+# etc. without editing the unit. Created blank by install-edge.sh.
+EnvironmentFile=-/etc/bilbycast/edge.env
+
+[Install]
+WantedBy=multi-user.target

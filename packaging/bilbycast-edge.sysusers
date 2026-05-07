@@ -1,0 +1,6 @@
+# systemd-sysusers config for the bilbycast-edge service account.
+# Drop into /etc/sysusers.d/ during install.
+u bilbycast - "bilbycast-edge service account" /var/lib/bilbycast/edge /usr/sbin/nologin
+m bilbycast video
+m bilbycast render
+m bilbycast audio

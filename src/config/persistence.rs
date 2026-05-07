@@ -239,6 +239,7 @@ mod tests {
             resource_limits: None,
             logging: None,
             nmos_registration: None,
+            upgrades: None,
             inputs: vec![InputDefinition {
                 active: true,
                 group: None,

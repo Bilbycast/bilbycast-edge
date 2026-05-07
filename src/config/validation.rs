@@ -129,6 +129,11 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
         validate_nmos_registration(nr)?;
     }
 
+    // Validate upgrade config if present
+    if let Some(ref up) = config.upgrades {
+        validate_upgrade_config(up)?;
+    }
+
     // Validate manager config if present
     if let Some(ref mgr) = config.manager {
         if mgr.enabled {
@@ -4493,6 +4498,88 @@ pub fn validate_nmos_registration(c: &crate::config::models::NmosRegistrationCon
                 "nmos_registration.bearer_token must be omitted (or null) when not in use, not empty"
             );
         }
+    }
+    Ok(())
+}
+
+/// Validate the remote-upgrade configuration block.
+///
+/// Sanity-checks operator-supplied scheduling fields (channel allowlist
+/// contents, version floor parses, install root is absolute, watchdog
+/// windows in sane ranges). Trust roots (Fulcio, Rekor, identity allowlist)
+/// are compiled into the binary — there is nothing to validate at the
+/// config layer for them.
+pub fn validate_upgrade_config(c: &crate::config::models::UpgradeConfig) -> Result<()> {
+    if c.allowed_channels.is_empty() {
+        bail!(
+            "upgrades.allowed_channels cannot be empty when an upgrades block is present. \
+             Use [\"stable\"] for a typical production node."
+        );
+    }
+    if c.allowed_channels.len() > 8 {
+        bail!(
+            "upgrades.allowed_channels has {} entries; cap is 8. Sigstore-allowed release \
+             channels today are stable / nightly / beta — extra entries are ignored.",
+            c.allowed_channels.len()
+        );
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (i, ch) in c.allowed_channels.iter().enumerate() {
+        if ch.is_empty() {
+            bail!("upgrades.allowed_channels[{i}] is empty");
+        }
+        if ch.len() > 32 {
+            bail!("upgrades.allowed_channels[{i}] = {ch:?} must be ≤ 32 chars");
+        }
+        if !ch.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            bail!(
+                "upgrades.allowed_channels[{i}] = {ch:?} must be alphanumeric (with - / _)"
+            );
+        }
+        if !seen.insert(ch.as_str()) {
+            bail!("upgrades.allowed_channels[{i}] = {ch:?} is a duplicate");
+        }
+    }
+    if let Some(ref v) = c.min_version {
+        semver::Version::parse(v).map_err(|e| {
+            anyhow::anyhow!(
+                "upgrades.min_version = {v:?} is not a valid semver: {e}"
+            )
+        })?;
+    }
+    if c.rollback_grace > 100 {
+        bail!(
+            "upgrades.rollback_grace = {} is implausibly large (cap 100). \
+             Typical production value is 1.",
+            c.rollback_grace
+        );
+    }
+    if !c.install_root.is_absolute() {
+        bail!(
+            "upgrades.install_root = {:?} must be an absolute path; the upgrade \
+             machinery rejects relative paths to protect against `cwd`-shifted writes.",
+            c.install_root
+        );
+    }
+    let install_root_str = c.install_root.to_string_lossy();
+    if install_root_str.len() > 4096 {
+        bail!(
+            "upgrades.install_root path must be ≤ 4096 characters (got {})",
+            install_root_str.len()
+        );
+    }
+    if !(10..=86_400).contains(&c.boot_health_window_secs) {
+        bail!(
+            "upgrades.boot_health_window_secs = {} must be between 10 and 86400 \
+             (default 120)",
+            c.boot_health_window_secs
+        );
+    }
+    if !(1..=10).contains(&c.max_boot_attempts) {
+        bail!(
+            "upgrades.max_boot_attempts = {} must be between 1 and 10 (default 3)",
+            c.max_boot_attempts
+        );
     }
     Ok(())
 }

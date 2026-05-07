@@ -668,6 +668,7 @@ mod tests {
             logging: None,
             flow_groups: vec![],
             nmos_registration: None,
+            upgrades: None,
         };
 
         // Extract secrets — only infrastructure secrets, not flow params

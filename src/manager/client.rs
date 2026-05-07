@@ -457,6 +457,13 @@ async fn try_connect(
                         category::MANAGER,
                         "Connected to manager",
                     );
+                    // First successful auth on the new binary post-upgrade —
+                    // tells the boot watchdog that the new version reached
+                    // the network, so it can promote `pending_health → stable`
+                    // once the configured boot_health_window elapses.
+                    if let Some(ref up_cfg) = app_config.read().await.upgrades {
+                        crate::upgrade::watchdog::record_healthy_beat(&up_cfg.install_root);
+                    }
                 }
                 "register_ack" => {
                     let payload = &response["payload"];
@@ -944,6 +951,12 @@ fn edge_capabilities() -> Vec<&'static str> {
         // assembly Hitless variant accepts a `mode = seq_aware` selector.
         // Manager UI gates the SeqAware option on this capability.
         "hitless_2022_7",
+        // Remote binary upgrade: edge accepts `upgrade_binary` WS
+        // commands and stages a Sigstore-verified release tarball,
+        // atomically swaps the `current` symlink, then drains and exits
+        // for systemd respawn. Manager UI gates the upgrade button on
+        // this capability so older edges (no upgrade module) hide it.
+        "upgrade",
     ];
     if cfg!(feature = "ptp-internal") {
         caps.push("ptp-internal");
@@ -3389,6 +3402,62 @@ async fn execute_command(
                     "replay_no_playback_input",
                 ))?;
             dispatch_replay_input_command(action_type, action, cmd_tx).await
+        }
+        "upgrade_binary" => {
+            let coord = crate::upgrade::global_coordinator().ok_or_else(|| {
+                CommandError::with_code(
+                    "upgrades not configured on this node — set upgrades.enabled = true in config.json",
+                    crate::upgrade::error_codes::UPGRADE_DISABLED,
+                )
+            })?;
+            let version = action["version"].as_str().ok_or_else(|| {
+                CommandError::with_code(
+                    "upgrade_binary: missing 'version'",
+                    crate::upgrade::error_codes::UPGRADE_VERSION_INVALID,
+                )
+            })?;
+            let channel = action["channel"].as_str().ok_or_else(|| {
+                CommandError::with_code(
+                    "upgrade_binary: missing 'channel'",
+                    crate::upgrade::error_codes::UPGRADE_CHANNEL_NOT_ALLOWED,
+                )
+            })?;
+            let target_arch = action["target_arch"].as_str();
+            let variant = action["variant"].as_str();
+
+            let staged = coord
+                .stage(version, channel, target_arch, variant)
+                .await
+                .map_err(|e| CommandError::with_code(e.message.clone(), e.code))?;
+
+            // Stage succeeded — drain flows and exit so systemd respawns
+            // into the new binary. The ack we return below races the
+            // exit, but tokio is fast enough that the manager sees the
+            // ack first ~99% of the time. The manager already treats a
+            // missed ack the same way (the new edge re-authenticates
+            // with `software_version = <new>` on its first beat).
+            let from_v_log = staged.from_version.clone();
+            let to_v_log = staged.to_version.clone();
+            let flow_manager_clone = flow_manager.clone();
+            tokio::spawn(async move {
+                tracing::info!(
+                    "upgrade staged ({from_v_log} → {to_v_log}); draining flows for respawn"
+                );
+                // 5 s drain so any in-flight TS packet completes its
+                // hop and outputs flush their socket buffers. systemd
+                // sees a clean exit(0) and respawns into `current/`.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let _ = flow_manager_clone;
+                std::process::exit(0);
+            });
+            Ok(Some(serde_json::json!({
+                "status": "staged",
+                "from_version": staged.from_version,
+                "to_version": staged.to_version,
+                "channel": staged.channel,
+                "variant": staged.variant,
+                "arch": staged.arch,
+            })))
         }
         _ => Err(CommandError::with_code(format!("Unknown command: {action_type}"), "unknown_action")),
     }

@@ -6,6 +6,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.33.0] - unreleased
 
+### Changed
+
+- **Release workflow triggers** — `push.tags: v*` and `workflow_dispatch`
+  added alongside the existing nightly cron. The new monorepo-root
+  `release-all.sh` orchestrator detects Cargo.toml version bumps and pushes
+  matching tags for on-demand releases; the nightly cron stays as a safety
+  net for version bumps that were committed but not manually released
+  (idempotent — `gh release view` short-circuits the build when the tag
+  already exists). Workflow filename is preserved (`nightly-release.yml`)
+  because it is hard-coded into `src/upgrade/trust.rs::ALLOWED_SIGNERS` and
+  the cosign self-verify regex — renaming would invalidate every
+  previously-signed manifest. Manual install URLs
+  (`releases/latest/download/...`) and the manager-driven auto-upgrade
+  pipeline are unchanged.
+
 ### Added
 
 - **Replay server (Phase 1)** — pure-Rust continuous flow recording to disk

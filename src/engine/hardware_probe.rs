@@ -134,10 +134,22 @@ pub struct HwSessionLimits {
     pub amf_max_sessions: Option<u32>,
     /// VAAPI encoder session ceiling — Mesa radeonsi (AMD) typically
     /// caps low (one or two concurrent encode sessions per VCN
-    /// engine), Intel iHD scales higher. Probed in a 1..=8 loop the
-    /// same way every other family is.
+    /// engine), Intel iHD scales higher.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vaapi_max_sessions: Option<u32>,
+    /// Concurrent 4K-grade NVENC encode sessions (probed at
+    /// 3840×2160). Capacity at 4K is materially smaller than at 1080p
+    /// on consumer GPUs (VRAM, engine throughput). `None` when the 4K
+    /// tier was disabled via `BILBYCAST_PROBE_4K=0` or when the family
+    /// is absent / failed to open at 4K.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nvenc_max_sessions_4k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qsv_max_sessions_4k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amf_max_sessions_4k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vaapi_max_sessions_4k: Option<u32>,
 }
 
 impl HwSessionLimits {
@@ -149,6 +161,10 @@ impl HwSessionLimits {
             && self.qsv_max_sessions.is_none()
             && self.amf_max_sessions.is_none()
             && self.vaapi_max_sessions.is_none()
+            && self.nvenc_max_sessions_4k.is_none()
+            && self.qsv_max_sessions_4k.is_none()
+            && self.amf_max_sessions_4k.is_none()
+            && self.vaapi_max_sessions_4k.is_none()
     }
 }
 
@@ -170,6 +186,18 @@ pub struct HwDecoderSessionLimits {
     /// `hevc_vaapi` are real decoder names.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vaapi_max_sessions: Option<u32>,
+    /// Concurrent 4K-grade decode sessions (probed at 3840×2160). HW
+    /// decoders pre-allocate session resources at `avcodec_open2`
+    /// time when given a coded-dimensions hint, so the 4K count
+    /// reflects realistic concurrent workload rather than the raw
+    /// open-context count. `None` when disabled or the family failed
+    /// to open at 4K.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nvdec_max_sessions_4k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qsv_max_sessions_4k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vaapi_max_sessions_4k: Option<u32>,
 }
 
 impl HwDecoderSessionLimits {
@@ -177,6 +205,9 @@ impl HwDecoderSessionLimits {
         self.nvdec_max_sessions.is_none()
             && self.qsv_max_sessions.is_none()
             && self.vaapi_max_sessions.is_none()
+            && self.nvdec_max_sessions_4k.is_none()
+            && self.qsv_max_sessions_4k.is_none()
+            && self.vaapi_max_sessions_4k.is_none()
     }
 }
 
@@ -573,45 +604,126 @@ fn session_limit_probe_enabled() -> bool {
     }
 }
 
-/// Upper bound on session count probing. Cap chosen so probing never
-/// takes more than ~300 ms even on slow open paths — enough to
-/// distinguish 3-session consumer cards from "many" without
-/// committing to an exact number on pro cards. Reported as the count
-/// of successful opens before the first failure (so an 8-capable card
-/// reports `8` and the UI labels it "≥ 8").
-const SESSION_PROBE_UPPER_BOUND: u32 = 8;
+/// Honour `BILBYCAST_PROBE_4K=0` (or `false`) to skip the additional
+/// 4K-tier session-capacity probe. Default on. Operators on
+/// 1080p-only deployments who want a faster startup opt out — the
+/// existing 1080p probe still runs, only the second-tier 4K pass is
+/// skipped. The global `BILBYCAST_PROBE_SESSION_LIMITS=0` switch
+/// disables both tiers.
+fn probe_4k_enabled() -> bool {
+    match std::env::var("BILBYCAST_PROBE_4K") {
+        Ok(v) => {
+            let lower = v.trim().to_ascii_lowercase();
+            !matches!(lower.as_str(), "0" | "false" | "no" | "off")
+        }
+        Err(_) => true,
+    }
+}
+
+/// Upper bound on the 1080p session count probe. Bumped past the
+/// previous `8` so pro-class GPUs with materially higher capacity
+/// (server-class NVENC, Intel Arc QSV, large iGPU pools) report
+/// honest numbers instead of a flat `≥ 8`. The probe still runs at
+/// `avcodec_open2` time only — startup latency scales linearly with
+/// the cap, but each open is cheap (~tens of ms even at 1080p) so
+/// 32 keeps total well under a second per family on real hardware.
+const SESSION_PROBE_UPPER_BOUND: u32 = 32;
+
+/// Upper bound on the 4K-tier session count probe. Held tighter than
+/// the 1080p ceiling because (a) 4K capacity is naturally lower on
+/// every GPU, (b) holding 32 × 4K NV12 surface contexts open at once
+/// would consume ~1.5 GiB of VRAM on the probe path alone, and (c)
+/// startup time scales linearly with the cap.
+const FOUR_K_UPPER_BOUND: u32 = 8;
 
 /// Probe per-family encoder session capacity for every family with at
-/// least one codec confirmed available in [`probe_hw_encoders`].
-/// Probes one codec per family (the H.264 variant — H.264 + HEVC share
-/// the engine on every supported backend) so we don't double the
-/// startup cost. Returns `None` for families where no codec was
-/// available at runtime.
+/// least one codec confirmed available in [`probe_hw_encoders`]. Two
+/// passes: a 1080p baseline (the dominant HD-tier broadcast workload
+/// class — mapped onto the existing `*_max_sessions` wire fields) and
+/// an optional 4K tier (mapped onto the new `*_max_sessions_4k`
+/// fields, gated by `BILBYCAST_PROBE_4K`). Probes one codec per
+/// family (the H.264 variant — H.264 + HEVC share the engine on
+/// every supported backend) so we don't double the startup cost.
+/// Returns `None` for families where no codec was available at
+/// runtime, or where the 1080p baseline returned 0 (no point probing
+/// 4K when the engine can't open at HD).
 #[cfg(feature = "video-thumbnail")]
 fn probe_encoder_session_limits(hw: &HwCodecCapability) -> HwSessionLimits {
     let mut out = HwSessionLimits::default();
+    let probe_4k = probe_4k_enabled();
     if hw.h264_nvenc || hw.hevc_nvenc {
         let probe_codec = if hw.h264_nvenc { "h264_nvenc" } else { "hevc_nvenc" };
-        let n = video_engine::count_max_encoder_sessions(probe_codec, SESSION_PROBE_UPPER_BOUND);
-        if n > 0 {
-            tracing::info!("nvenc encoder session capacity probed: {n}");
-            out.nvenc_max_sessions = Some(n);
+        let n_1080p = video_engine::count_max_encoder_sessions(
+            probe_codec,
+            SESSION_PROBE_UPPER_BOUND,
+            video_engine::PROBE_WIDTH_1080P,
+            video_engine::PROBE_HEIGHT_1080P,
+        );
+        if n_1080p > 0 {
+            tracing::info!("nvenc encoder 1080p session capacity probed: {n_1080p}");
+            out.nvenc_max_sessions = Some(n_1080p);
+            if probe_4k {
+                let n_4k = video_engine::count_max_encoder_sessions(
+                    probe_codec,
+                    FOUR_K_UPPER_BOUND,
+                    video_engine::PROBE_WIDTH_4K,
+                    video_engine::PROBE_HEIGHT_4K,
+                );
+                if n_4k > 0 {
+                    tracing::info!("nvenc encoder 4K session capacity probed: {n_4k}");
+                    out.nvenc_max_sessions_4k = Some(n_4k);
+                }
+            }
         }
     }
     if hw.h264_qsv || hw.hevc_qsv {
         let probe_codec = if hw.h264_qsv { "h264_qsv" } else { "hevc_qsv" };
-        let n = video_engine::count_max_encoder_sessions(probe_codec, SESSION_PROBE_UPPER_BOUND);
-        if n > 0 {
-            tracing::info!("qsv encoder session capacity probed: {n}");
-            out.qsv_max_sessions = Some(n);
+        let n_1080p = video_engine::count_max_encoder_sessions(
+            probe_codec,
+            SESSION_PROBE_UPPER_BOUND,
+            video_engine::PROBE_WIDTH_1080P,
+            video_engine::PROBE_HEIGHT_1080P,
+        );
+        if n_1080p > 0 {
+            tracing::info!("qsv encoder 1080p session capacity probed: {n_1080p}");
+            out.qsv_max_sessions = Some(n_1080p);
+            if probe_4k {
+                let n_4k = video_engine::count_max_encoder_sessions(
+                    probe_codec,
+                    FOUR_K_UPPER_BOUND,
+                    video_engine::PROBE_WIDTH_4K,
+                    video_engine::PROBE_HEIGHT_4K,
+                );
+                if n_4k > 0 {
+                    tracing::info!("qsv encoder 4K session capacity probed: {n_4k}");
+                    out.qsv_max_sessions_4k = Some(n_4k);
+                }
+            }
         }
     }
     if hw.h264_amf || hw.hevc_amf {
         let probe_codec = if hw.h264_amf { "h264_amf" } else { "hevc_amf" };
-        let n = video_engine::count_max_encoder_sessions(probe_codec, SESSION_PROBE_UPPER_BOUND);
-        if n > 0 {
-            tracing::info!("amf encoder session capacity probed: {n}");
-            out.amf_max_sessions = Some(n);
+        let n_1080p = video_engine::count_max_encoder_sessions(
+            probe_codec,
+            SESSION_PROBE_UPPER_BOUND,
+            video_engine::PROBE_WIDTH_1080P,
+            video_engine::PROBE_HEIGHT_1080P,
+        );
+        if n_1080p > 0 {
+            tracing::info!("amf encoder 1080p session capacity probed: {n_1080p}");
+            out.amf_max_sessions = Some(n_1080p);
+            if probe_4k {
+                let n_4k = video_engine::count_max_encoder_sessions(
+                    probe_codec,
+                    FOUR_K_UPPER_BOUND,
+                    video_engine::PROBE_WIDTH_4K,
+                    video_engine::PROBE_HEIGHT_4K,
+                );
+                if n_4k > 0 {
+                    tracing::info!("amf encoder 4K session capacity probed: {n_4k}");
+                    out.amf_max_sessions_4k = Some(n_4k);
+                }
+            }
         }
     }
     if hw.h264_vaapi || hw.hevc_vaapi {
@@ -620,13 +732,27 @@ fn probe_encoder_session_limits(hw: &HwCodecCapability) -> HwSessionLimits {
         // path (hwdevice + frames-context setup), not the generic
         // `count_max_encoder_sessions` which uses `try_open_encoder_context`
         // and would return 0 every time on VAAPI.
-        let n = video_engine::count_max_vaapi_encoder_sessions(
+        let n_1080p = video_engine::count_max_vaapi_encoder_sessions(
             probe_codec,
             SESSION_PROBE_UPPER_BOUND,
+            video_engine::PROBE_WIDTH_1080P as u32,
+            video_engine::PROBE_HEIGHT_1080P as u32,
         );
-        if n > 0 {
-            tracing::info!("vaapi encoder session capacity probed: {n}");
-            out.vaapi_max_sessions = Some(n);
+        if n_1080p > 0 {
+            tracing::info!("vaapi encoder 1080p session capacity probed: {n_1080p}");
+            out.vaapi_max_sessions = Some(n_1080p);
+            if probe_4k {
+                let n_4k = video_engine::count_max_vaapi_encoder_sessions(
+                    probe_codec,
+                    FOUR_K_UPPER_BOUND,
+                    video_engine::PROBE_WIDTH_4K as u32,
+                    video_engine::PROBE_HEIGHT_4K as u32,
+                );
+                if n_4k > 0 {
+                    tracing::info!("vaapi encoder 4K session capacity probed: {n_4k}");
+                    out.vaapi_max_sessions_4k = Some(n_4k);
+                }
+            }
         }
     }
     out
@@ -638,37 +764,92 @@ fn probe_encoder_session_limits(_: &HwCodecCapability) -> HwSessionLimits {
 }
 
 /// Decoder twin of [`probe_encoder_session_limits`]. Probes NVDEC
-/// (`h264_cuvid`) and QSV decode (`h264_qsv`) — AMF has no first-party
-/// FFmpeg HW decoder so it's omitted.
+/// (`h264_cuvid`) and QSV decode (`h264_qsv`) and VAAPI decode — AMF
+/// has no first-party FFmpeg HW decoder so it's omitted. Same 1080p +
+/// 4K tier shape as the encoder twin; HW decoders that pre-allocate
+/// session resources at `avcodec_open2` time when given a coded-
+/// dimensions hint reflect the realistic workload class.
 #[cfg(feature = "video-thumbnail")]
 fn probe_decoder_session_limits(hw: &HwCodecCapability) -> HwDecoderSessionLimits {
     let mut out = HwDecoderSessionLimits::default();
+    let probe_4k = probe_4k_enabled();
     if hw.h264_nvenc || hw.hevc_nvenc {
         // hw_decoders.h264_nvenc actually corresponds to h264_cuvid by
         // wire convention — the field stays `h264_nvenc` for symmetry
         // with the encoder shape, but the underlying probe used the
         // cuvid name.
         let probe_codec = if hw.h264_nvenc { "h264_cuvid" } else { "hevc_cuvid" };
-        let n = video_engine::count_max_decoder_sessions(probe_codec, SESSION_PROBE_UPPER_BOUND);
-        if n > 0 {
-            tracing::info!("nvdec decoder session capacity probed: {n}");
-            out.nvdec_max_sessions = Some(n);
+        let n_1080p = video_engine::count_max_decoder_sessions(
+            probe_codec,
+            SESSION_PROBE_UPPER_BOUND,
+            video_engine::PROBE_WIDTH_1080P,
+            video_engine::PROBE_HEIGHT_1080P,
+        );
+        if n_1080p > 0 {
+            tracing::info!("nvdec decoder 1080p session capacity probed: {n_1080p}");
+            out.nvdec_max_sessions = Some(n_1080p);
+            if probe_4k {
+                let n_4k = video_engine::count_max_decoder_sessions(
+                    probe_codec,
+                    FOUR_K_UPPER_BOUND,
+                    video_engine::PROBE_WIDTH_4K,
+                    video_engine::PROBE_HEIGHT_4K,
+                );
+                if n_4k > 0 {
+                    tracing::info!("nvdec decoder 4K session capacity probed: {n_4k}");
+                    out.nvdec_max_sessions_4k = Some(n_4k);
+                }
+            }
         }
     }
     if hw.h264_qsv || hw.hevc_qsv {
         let probe_codec = if hw.h264_qsv { "h264_qsv" } else { "hevc_qsv" };
-        let n = video_engine::count_max_decoder_sessions(probe_codec, SESSION_PROBE_UPPER_BOUND);
-        if n > 0 {
-            tracing::info!("qsv decoder session capacity probed: {n}");
-            out.qsv_max_sessions = Some(n);
+        let n_1080p = video_engine::count_max_decoder_sessions(
+            probe_codec,
+            SESSION_PROBE_UPPER_BOUND,
+            video_engine::PROBE_WIDTH_1080P,
+            video_engine::PROBE_HEIGHT_1080P,
+        );
+        if n_1080p > 0 {
+            tracing::info!("qsv decoder 1080p session capacity probed: {n_1080p}");
+            out.qsv_max_sessions = Some(n_1080p);
+            if probe_4k {
+                let n_4k = video_engine::count_max_decoder_sessions(
+                    probe_codec,
+                    FOUR_K_UPPER_BOUND,
+                    video_engine::PROBE_WIDTH_4K,
+                    video_engine::PROBE_HEIGHT_4K,
+                );
+                if n_4k > 0 {
+                    tracing::info!("qsv decoder 4K session capacity probed: {n_4k}");
+                    out.qsv_max_sessions_4k = Some(n_4k);
+                }
+            }
         }
     }
     if hw.h264_vaapi || hw.hevc_vaapi {
         let probe_codec = if hw.h264_vaapi { "h264_vaapi" } else { "hevc_vaapi" };
-        let n = video_engine::count_max_decoder_sessions(probe_codec, SESSION_PROBE_UPPER_BOUND);
-        if n > 0 {
-            tracing::info!("vaapi decoder session capacity probed: {n}");
-            out.vaapi_max_sessions = Some(n);
+        let n_1080p = video_engine::count_max_decoder_sessions(
+            probe_codec,
+            SESSION_PROBE_UPPER_BOUND,
+            video_engine::PROBE_WIDTH_1080P,
+            video_engine::PROBE_HEIGHT_1080P,
+        );
+        if n_1080p > 0 {
+            tracing::info!("vaapi decoder 1080p session capacity probed: {n_1080p}");
+            out.vaapi_max_sessions = Some(n_1080p);
+            if probe_4k {
+                let n_4k = video_engine::count_max_decoder_sessions(
+                    probe_codec,
+                    FOUR_K_UPPER_BOUND,
+                    video_engine::PROBE_WIDTH_4K,
+                    video_engine::PROBE_HEIGHT_4K,
+                );
+                if n_4k > 0 {
+                    tracing::info!("vaapi decoder 4K session capacity probed: {n_4k}");
+                    out.vaapi_max_sessions_4k = Some(n_4k);
+                }
+            }
         }
     }
     out

@@ -35,6 +35,7 @@ mod setup;
 mod srt;
 mod stats;
 mod tunnel;
+mod upgrade;
 mod util;
 
 use config::persistence::{load_config_split, save_config_split};
@@ -249,6 +250,47 @@ async fn main() -> anyhow::Result<()> {
     // Create shared state
     let (ws_stats_tx, _) = broadcast::channel::<String>(64);
     let (mut event_sender, event_rx) = manager::event_channel();
+
+    // Boot watchdog for staged upgrades. Runs *before* any flow init so a
+    // crash-loop on the new binary triggers the symlink-revert on the
+    // (max_boot_attempts + 1)th boot. No-op when `upgrades` is unset or
+    // disabled. The Critical event for a roll-back is queued on the
+    // event_sender and flushes on the first manager auth.
+    match upgrade::run_boot_watchdog(app_config.upgrades.as_ref(), &event_sender) {
+        Ok(upgrade::watchdog::WatchdogOutcome::Continue) => {}
+        Ok(upgrade::watchdog::WatchdogOutcome::PendingHealth { attempt }) => {
+            tracing::info!(
+                "Upgrade boot watchdog: this is boot attempt {attempt} on the staged version; \
+                 will be promoted to stable after the configured health window."
+            );
+        }
+        Ok(upgrade::watchdog::WatchdogOutcome::RolledBack { from_version, to_version }) => {
+            tracing::warn!(
+                "Upgrade boot watchdog: rolled back from {from_version} to {to_version} on \
+                 the previous boot — will surface upgrade_rolled_back on next manager auth."
+            );
+        }
+        Err(e) => {
+            tracing::warn!("upgrade boot watchdog error: {e:#}");
+        }
+    }
+
+    // Install the process-wide upgrade coordinator. The manager command
+    // dispatcher reads this via `upgrade::global_coordinator()`. No-op
+    // when `upgrades` is unset.
+    if let Some(ref up_cfg) = app_config.upgrades {
+        let coord = upgrade::UpgradeCoordinator::new(
+            up_cfg.clone(),
+            event_sender.clone(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        );
+        upgrade::install_global_coordinator(coord);
+        tracing::info!(
+            "Upgrade coordinator installed (enabled={}, install_root={})",
+            up_cfg.enabled,
+            up_cfg.install_root.display(),
+        );
+    }
 
     // Optional structured-JSON log shipper. Installed once before any
     // clone of the original sender is handed out — later clones inherit
@@ -506,6 +548,19 @@ async fn main() -> anyhow::Result<()> {
         let stats_config = state.config.clone();
         tokio::spawn(async move {
             stats_publisher_loop(ws_tx, stats_fm, stats_config).await;
+        });
+    }
+
+    // Spawn the upgrade watchdog periodic task that promotes
+    // `pending_health → stable` once the configured boot health window
+    // has elapsed. No-op when `upgrades` is unset.
+    if let Some(ref up_cfg) = app_config.upgrades {
+        let cfg_clone = up_cfg.clone();
+        let install_root = up_cfg.install_root.clone();
+        let events = event_sender.clone();
+        let cancel = shutdown_token.clone();
+        tokio::spawn(async move {
+            upgrade::watchdog::run_watchdog_periodic(install_root, cfg_clone, events, cancel).await;
         });
     }
 

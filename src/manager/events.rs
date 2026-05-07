@@ -610,6 +610,14 @@ pub mod category {
     /// heartbeat lost, registration failed, registry unreachable). Always
     /// paired with `details.error_code` for failure events.
     pub const NMOS_REGISTRY: &str = "nmos_registry";
+    /// Remote binary upgrade lifecycle. Severity follows the lifecycle:
+    /// `info` for `upgrade_started` / `upgrade_downloaded` /
+    /// `upgrade_staged` / `upgrade_completed`, `warning` for benign
+    /// retries, `critical` for `upgrade_rolled_back` and
+    /// `upgrade_failed`. `details.error_code` carries the exact
+    /// machine-readable reason matching the codes documented in
+    /// `src/upgrade/mod.rs::error_codes`.
+    pub const UPGRADE: &str = "upgrade";
 }
 
 /// Scope label passed to [`run_bond_event_forwarder`] so generated

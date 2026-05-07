@@ -76,6 +76,15 @@ pub struct AppConfig {
     /// API surfaces the edge to registry-driven NMOS controllers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nmos_registration: Option<NmosRegistrationConfig>,
+    /// Remote-upgrade configuration. When `enabled`, the edge accepts
+    /// `upgrade_binary` commands from the manager: fetch a Sigstore-signed
+    /// manifest from the hardcoded `github.com/Bilbycast/*` release URL,
+    /// verify the keyless signature against the compiled-in identity
+    /// allowlist, download + extract the tarball, atomically swap the
+    /// `current` symlink, and exit so systemd respawns into the new
+    /// binary. Off by default — operators opt in per node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrades: Option<UpgradeConfig>,
 }
 
 impl Default for AppConfig {
@@ -97,9 +106,85 @@ impl Default for AppConfig {
             tunnels: Vec::new(),
             flow_groups: Vec::new(),
             nmos_registration: None,
+            upgrades: None,
         }
     }
 }
+
+/// Remote-upgrade configuration. See `bilbycast-edge/docs/upgrade.md` for the
+/// operator guide and the trust model.
+///
+/// Trust roots (Fulcio CA root, Rekor public key, identity allowlist) are
+/// **compiled into the binary** — operators never configure them. The fields
+/// here only gate operator-controlled scheduling.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UpgradeConfig {
+    /// Master switch. Default `false` — operators opt in per node. Even when
+    /// the manager schedules an upgrade, an edge with `enabled: false` rejects
+    /// it with `error_code: "upgrade_disabled"` (no download attempted).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Channels this node is allowed to install. Default `["stable"]`.
+    /// `"nightly"` and `"beta"` available for testbed nodes; commands carrying
+    /// any other channel are rejected with `upgrade_channel_not_allowed`.
+    #[serde(default = "default_allowed_channels")]
+    pub allowed_channels: Vec<String>,
+    /// Optional minimum version floor. The edge rejects any upgrade whose
+    /// manifest declares a lower semver. Stored as a string so the wire shape
+    /// is forgiving — parsed lazily at validate-time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_version: Option<String>,
+    /// How many minor versions back from the currently installed version the
+    /// edge is willing to roll *forward* to. Default `1` — anything older
+    /// than `current_minor - 1` is rejected with `upgrade_version_too_old`,
+    /// even if the manager pushes a manifest newer than `min_version`.
+    #[serde(default = "default_rollback_grace")]
+    pub rollback_grace: u32,
+    /// On-disk install root. Default `/opt/bilbycast/edge`. The edge writes
+    /// `versions/<v>/`, `current` symlink, `previous` symlink, and
+    /// `state.json` under this directory.
+    #[serde(default = "default_install_root")]
+    pub install_root: std::path::PathBuf,
+    /// Window after a respawn during which the new binary must produce
+    /// healthy manager beats; if it fails to authenticate within this window,
+    /// the boot watchdog rolls the symlink back to `previous` and emits
+    /// `upgrade_rolled_back`. Default 120 s.
+    #[serde(default = "default_boot_health_window_secs")]
+    pub boot_health_window_secs: u32,
+    /// Maximum boot attempts on the new binary before automatic rollback.
+    /// `state.json.boot_attempts` increments on every respawn into a
+    /// `pending_health` state; on the (max+1)th boot the watchdog reverts.
+    /// Default `3`.
+    #[serde(default = "default_max_boot_attempts")]
+    pub max_boot_attempts: u32,
+    /// When true, the manager can stage an upgrade (download + verify +
+    /// extract under `versions/<new>/`) but the symlink swap waits for a
+    /// local `kill -SIGUSR1 <pid>` so a human operator approves the actual
+    /// switchover. Default `false`.
+    #[serde(default)]
+    pub manual_only: bool,
+}
+
+impl Default for UpgradeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_channels: default_allowed_channels(),
+            min_version: None,
+            rollback_grace: default_rollback_grace(),
+            install_root: default_install_root(),
+            boot_health_window_secs: default_boot_health_window_secs(),
+            max_boot_attempts: default_max_boot_attempts(),
+            manual_only: false,
+        }
+    }
+}
+
+fn default_allowed_channels() -> Vec<String> { vec!["stable".to_string()] }
+fn default_rollback_grace() -> u32 { 1 }
+fn default_install_root() -> std::path::PathBuf { std::path::PathBuf::from("/opt/bilbycast/edge") }
+fn default_boot_health_window_secs() -> u32 { 120 }
+fn default_max_boot_attempts() -> u32 { 3 }
 
 /// A standalone input definition, referenceable by flows.
 ///
@@ -4408,6 +4493,7 @@ mod tests {
             tunnels: Vec::new(),
             flow_groups: Vec::new(),
             nmos_registration: None,
+            upgrades: None,
             inputs: vec![InputDefinition {
                 active: true,
                 group: None,

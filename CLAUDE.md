@@ -241,6 +241,16 @@ At runtime, both files merge into a single `AppConfig` in memory — all existin
 
 **When adding new infrastructure secret fields**: Add the field to the appropriate secrets struct (`TunnelSecrets` or `SecretsConfig`), update `extract_from`/`merge_into`/`strip_secrets`, and update `has_secrets` for migration detection. Flow-level user parameters (passphrases, credentials, keys) should stay in `config.json`, not `secrets.json`.
 
+## Remote upgrade
+
+The edge accepts `upgrade_binary` WS commands from the manager and stages a Sigstore-verified release tarball, atomically swaps the `current` symlink under `/opt/bilbycast/edge/`, then drains and exits for systemd respawn. A boot watchdog guarantees a failed upgrade rolls back automatically.
+
+- **Module**: [`src/upgrade/`](src/upgrade/) — `mod.rs` (`UpgradeCoordinator`, single-flight guard, lifecycle), `manifest.rs` (schema + URL whitelist), `verify.rs` (Sigstore Fulcio + Rekor + identity allowlist), `trust.rs` (compile-time `ALLOWED_SIGNERS` allowlist), `download.rs` (streaming SHA-256), `apply.rs` (tar extract + atomic symlink swap + GC), `state.rs` (`state.json` under `flock(2)`), `watchdog.rs` (boot watchdog).
+- **On-disk layout**: `/opt/bilbycast/edge/{current,previous,versions/<v>/,state.json,config.json,secrets.json}`. The systemd unit's `ExecStart=/opt/bilbycast/edge/current/bilbycast-edge` resolves through the symlink so a successful staged upgrade lands on the next exit.
+- **Capability**: edges advertise `"upgrade"` on `HealthPayload.capabilities`. Manager UI gates the Upgrade button on this. Older edges without the module return `unknown_action` and the UI hides the control.
+- **Trust model + threat-model**: [`docs/security.md`](docs/security.md). Operator runbook + config reference: [`docs/upgrade.md`](docs/upgrade.md). Operator install bundle (curl-pipe-bash + systemd unit): [`packaging/install-edge.sh`](packaging/install-edge.sh) and [`packaging/bilbycast-edge.service`](packaging/bilbycast-edge.service).
+- **Release pipeline**: [`scripts/build-manifest.sh`](scripts/build-manifest.sh) builds canonical `manifest.json`; the GitHub Actions workflow signs it with `cosign sign-blob --bundle` (Sigstore keyless, no long-lived signing key) and publishes both alongside the tarballs. The same workflow re-runs `cosign verify-blob` against the production identity allowlist before publishing — a typo in the allowlist gets caught here, not in production.
+
 ## Key Design Constraints
 
 See the root `CLAUDE.md` "Key Design Constraints (Apply Everywhere)" section for the full list. Edge-specific restatements:

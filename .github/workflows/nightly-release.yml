@@ -1,13 +1,35 @@
-name: Nightly Release
+name: Release
 
+# Three triggers, all converging on the same build + sign + publish job:
+#   - Nightly cron (default — catches version bumps that were committed
+#     but not released by hand)
+#   - `workflow_dispatch` (manual button in the GitHub Actions UI)
+#   - `push.tags: v*` (used by the monorepo-root `release-all.sh`
+#     orchestrator)
+#
+# The `check-version` job's `gh release view "${TAG}"` short-circuits the
+# nightly cron when the version hasn't bumped, so idle days cost one API
+# call.
+#
+# Filename `nightly-release.yml` is preserved on disk because it is
+# hard-coded into the Sigstore identity allowlist
+# (`src/upgrade/trust.rs::ALLOWED_SIGNERS`) and the `cosign verify-blob`
+# regex below — renaming would lock every deployed edge out of accepting
+# future signed manifests.
 on:
   schedule:
-    # 3:00 AM AEST (UTC+10) = 17:00 UTC previous day
+    # 3:00 AM AEST (UTC+10) = 17:00 UTC previous day.
     - cron: "0 17 * * *"
   workflow_dispatch:
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: write
+  # Required for Sigstore keyless signing — Fulcio mints a short-lived
+  # cert against the workflow run's OIDC identity.
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -251,7 +273,11 @@ jobs:
           # 24.04 main. Royalty-free at every layer (libva is MIT).
           # Runtime driver (Mesa radeonsi for AMD, iHD for Intel) is
           # provided by the host, not bundled.
-          sudo apt-get install -y libva-dev
+          # libdrm-dev is also required: libffmpeg-video-sys/build.rs
+          # pkg-config-probes libdrm to wire FFmpeg's `--enable-libdrm`
+          # so the VAAPI hwcontext can export DMA-BUF descriptors for
+          # the edge's zero-copy KMS scanout (`vaapi_map_to_drm`).
+          sudo apt-get install -y libva-dev libdrm-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -377,6 +403,14 @@ jobs:
             cp -r bilbycast-edge/config_examples "${STAGE}/config_examples"
           fi
 
+          # Bundle the operator install bundle inside the tarball so a
+          # node that was bootstrapped from the curl-pipe-bash flow can
+          # locate the systemd unit + scripts without going back to the
+          # internet.
+          if [ -d bilbycast-edge/packaging ]; then
+            cp -r bilbycast-edge/packaging "${STAGE}/packaging"
+          fi
+
           # Tarball name is *versionless* so /releases/latest/download/<asset>
           # always resolves to the most recent release — matches the manager
           # and relay workflows.
@@ -409,6 +443,73 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # ── Build canonical manifest.json for the upgrade pipeline ──
+      # The manifest binds (version, channel, sequence) to the just-built
+      # `(arch, variant) → url + sha256` table. Edges fetch this manifest +
+      # its Sigstore bundle on `upgrade_binary` and verify it before
+      # downloading any tarball. See `bilbycast-edge/src/upgrade/manifest.rs`
+      # for the schema and `scripts/build-manifest.sh` for the canonical-JSON
+      # builder.
+      - name: Build manifest.json
+        env:
+          RELEASE_REPO: ${{ github.repository }}
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          # Sequence: monotonic per device_type. We use the GitHub Actions
+          # `run_number` because it's monotonic across the workflow's
+          # lifetime and re-runs share an attempt counter rather than
+          # bumping the run_number. Edges enforce
+          # `manifest.sequence > state.last_sequence` so a replay attempt
+          # with a stale signed manifest is rejected.
+          SEQUENCE="${{ github.run_number }}"
+          chmod +x bilbycast-edge/scripts/build-manifest.sh
+          bilbycast-edge/scripts/build-manifest.sh \
+              "${VERSION}" "stable" "${SEQUENCE}" "artifacts" "edge" \
+              > artifacts/manifest.json
+          echo "── manifest.json ──"
+          cat artifacts/manifest.json
+          echo
+
+      # Install cosign so we can keyless-sign the manifest. The action
+      # is a thin shim — installs the cosign binary into PATH and pins
+      # the version reproducibly.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: "v2.4.1"
+
+      # Sign the manifest with Sigstore keyless. `cosign sign-blob`
+      # requests a short-lived OIDC token from GitHub Actions, hands it
+      # to Sigstore Fulcio for a 10-minute X.509 cert, generates an
+      # ephemeral keypair, signs the manifest bytes, uploads the
+      # signing event to Rekor, and emits the bundle. Edges verify the
+      # bundle against the compiled-in `ALLOWED_SIGNERS` allowlist.
+      - name: Sign manifest (Sigstore keyless)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cd artifacts
+          cosign sign-blob --yes \
+              --bundle manifest.sig.bundle \
+              manifest.json
+          echo "── manifest.sig.bundle (head) ──"
+          head -c 512 manifest.sig.bundle
+          echo
+
+      - name: Verify cosign signature locally (paranoid check)
+        run: |
+          cd artifacts
+          # Round-trip the signature via cosign verify-blob using the
+          # same identity allowlist the edge enforces. This catches any
+          # mismatch between the workflow path and the allowlist BEFORE
+          # we publish the release artefacts — better here than in
+          # production rollback territory.
+          cosign verify-blob \
+              --bundle manifest.sig.bundle \
+              --certificate-identity-regexp 'https://github\.com/Bilbycast/bilbycast-edge/\.github/workflows/nightly-release\.yml@refs/tags/v.*' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              manifest.json
+
       - name: Create tag and GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -416,8 +517,12 @@ jobs:
           TAG="${{ needs.check-version.outputs.tag }}"
           VERSION="${{ needs.check-version.outputs.version }}"
 
-          git tag "${TAG}"
-          git push origin "${TAG}"
+          # Skip tag creation when the workflow was triggered by a tag
+          # push (the tag already exists in that case).
+          if ! git rev-parse "${TAG}" > /dev/null 2>&1; then
+              git tag "${TAG}"
+              git push origin "${TAG}"
+          fi
 
           gh release create "${TAG}" \
             --title "bilbycast-edge v${VERSION}" \
@@ -451,7 +556,19 @@ jobs:
 
           **Commercial-licence customers using \`-full\`**: the Softside commercial licence covers bilbycast source only — it does not relicense libx264 / libx265, which remain GPL-2.0-or-later inside the \`-full\` binary. To avoid GPL copyleft entirely, use the default variant or build from source with \`video-encoder-nvenc\` only. See \`LICENSE.commercial\` for the scope statement.
 
-          **Patent notice**: H.264 / H.265 patent licensing (MPEG-LA, Access Advance, Velos Media) is separate from software copyright and is the operator's responsibility in commercial deployments. See \`NOTICE\` in the \`-full\` tarball." \
+          **Patent notice**: H.264 / H.265 patent licensing (MPEG-LA, Access Advance, Velos Media) is separate from software copyright and is the operator's responsibility in commercial deployments. See \`NOTICE\` in the \`-full\` tarball.
+
+          ## Remote upgrade
+
+          This release is signed for keyless verification by the edge's auto-upgrade pipeline. Operators using the manager UI's \`Upgrade\` button consume \`manifest.json\` + \`manifest.sig.bundle\` automatically. To verify a release manually:
+          \`\`\`
+          cosign verify-blob \\\\
+              --bundle manifest.sig.bundle \\\\
+              --certificate-identity-regexp 'https://github.com/Bilbycast/bilbycast-edge/.github/workflows/nightly-release.yml@refs/tags/v.*' \\\\
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \\\\
+              manifest.json
+          \`\`\`
+          See \`bilbycast-edge/docs/upgrade.md\` for the full trust model." \
             artifacts/bilbycast-edge-x86_64-linux.tar.gz \
             artifacts/bilbycast-edge-x86_64-linux.tar.gz.sha256 \
             artifacts/bilbycast-edge-aarch64-linux.tar.gz \
@@ -459,7 +576,12 @@ jobs:
             artifacts/bilbycast-edge-x86_64-linux-full.tar.gz \
             artifacts/bilbycast-edge-x86_64-linux-full.tar.gz.sha256 \
             artifacts/bilbycast-edge-aarch64-linux-full.tar.gz \
-            artifacts/bilbycast-edge-aarch64-linux-full.tar.gz.sha256
+            artifacts/bilbycast-edge-aarch64-linux-full.tar.gz.sha256 \
+            artifacts/manifest.json \
+            artifacts/manifest.sig.bundle \
+            bilbycast-edge/packaging/install-edge.sh \
+            bilbycast-edge/packaging/uninstall-edge.sh \
+            bilbycast-edge/packaging/bilbycast-edge.service
 
       - name: Prune old releases (keep latest 3)
         env:

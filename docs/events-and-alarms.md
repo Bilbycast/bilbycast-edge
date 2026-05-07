@@ -420,6 +420,37 @@ Requires `resource_limits` config block. When `critical_action` is `"gate_flows"
 
 **Source**: `src/engine/manager.rs::create_flow` → `emit_hw_oversubscribe_warnings`. The probed-max-sessions number comes from `engine::hardware_probe::probe_encoder_session_limits` at startup (capped at 8; see [`docs/configuration-guide.md`](configuration-guide.md#capacity--resource-budget) and the `BILBYCAST_PROBE_SESSION_LIMITS=0` opt-out). Soft warning matches the existing modal `updateResourceImpact` 80/100 % units pattern — the alarm tells the operator to fix it without blocking flow creation.
 
+### Remote upgrade (`upgrade`)
+
+Surface for the `upgrade_binary` lifecycle. Manager UI gates the per-node "Upgrade" button on the `"upgrade"` capability bit; older edges that predate this surface never see the controls.
+
+| Severity | Error code | Trigger |
+|----------|------------|---------|
+| info | `upgrade_started` | Manager command accepted, staging begins. Carries `from_version`, `to_version`, `channel`, `arch`, `variant`. |
+| info | `upgrade_downloaded` | Manifest verified + tarball downloaded + SHA-256 matched. |
+| info | `upgrade_staged` | Tarball extracted, symlink swapped. Edge is about to drain flows + exit for systemd respawn. |
+| info | `upgrade_completed` | New binary booted + authenticated to manager + healthy for `boot_health_window_secs`. Status flipped to `stable`. |
+| info | `upgrade_staged_manual` | `manual_only = true` — tarball is on disk under `versions/<v>/` but the symlink swap is deferred until a SIGUSR1. |
+| critical | `upgrade_rolled_back` | Boot watchdog reverted the symlink to `previous` after `max_boot_attempts` failed boots, **or** the new binary failed to authenticate within `boot_health_window_secs`. Carries `from_version`, `to_version`. |
+| critical | `upgrade_signature_invalid` | Sigstore bundle signature did not verify against the manifest bytes. |
+| critical | `upgrade_identity_not_allowed` | Bundle was signed but the cert's identity claims (issuer / repo / workflow / ref) do not match the compiled-in `ALLOWED_SIGNERS` allowlist. The actual identity claims are logged for forensic review. |
+| critical | `upgrade_rekor_invalid` | Rekor inclusion proof missing or malformed. |
+| warning | `upgrade_disabled` | Edge received `upgrade_binary` while `upgrades.enabled = false`. The command is rejected; this event is purely audit. |
+| warning | `upgrade_channel_not_allowed` | Edge received `upgrade_binary` for a channel not in `upgrades.allowed_channels`. |
+| warning | `upgrade_version_too_old` | Requested version is below `min_version` or further back than `rollback_grace`. |
+| warning | `upgrade_sequence_too_old` | Manifest's `sequence` is `≤` the last installed sequence — replay defence. |
+| warning | `upgrade_in_progress` | A second `upgrade_binary` arrived while the first was still staging. |
+| warning | `upgrade_url_invalid` | Manifest tarball URL host is not in the upgrade host whitelist (`github.com` / `objects.githubusercontent.com`). |
+| warning | `upgrade_checksum_mismatch` | Downloaded tarball SHA-256 did not match the value in the verified manifest. |
+| warning | `upgrade_extract_failed` | Tarball extracted but the binary couldn't be located, hoisted, or made executable. |
+| warning | `upgrade_disk_full` | `ENOSPC` while extracting. |
+| warning | `upgrade_network_error` | Manifest, bundle, or tarball fetch failed after retries. |
+| warning | `upgrade_arch_mismatch` | Manifest carries no artefact for the host's `(arch, variant)` tuple. |
+
+**Details**: `{ error_code, from_version, to_version, channel, arch, variant, … }` (fields populated according to the lifecycle stage).
+
+**Source**: `src/upgrade/mod.rs::error_codes`, emitted by `src/upgrade/{mod,watchdog,verify,download,apply}.rs`. The full operator-facing trust model and runbook live in [`docs/upgrade.md`](upgrade.md).
+
 ---
 
 ## Manager-Generated Events

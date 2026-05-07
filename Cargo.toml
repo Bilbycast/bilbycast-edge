@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-edge"
-version = "0.46.0"
+version = "0.47.0"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 license = "AGPL-3.0-or-later"
@@ -171,6 +171,21 @@ mp4 = "0.14"
 # source ("slate"). Pure Rust, default features off — we only need the
 # common still formats and the YUV420P conversion lands inline.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif"] }
+
+# ── Remote upgrade plumbing ──────────────────────────────────────────────
+# Tar + gzip extraction for `versions/<v>/<binary>` from the released
+# tarball, semver comparison for `min_version` / `rollback_grace`, file
+# locks for `state.json`, and Sigstore keyless-signature verification
+# (Fulcio cert chain, identity allowlist, Rekor inclusion proof).
+# All pure-Rust crates — `flate2` defaults to its `miniz_oxide` backend so
+# we don't pull zlib at link time; `sigstore` ships the Fulcio CA root +
+# Rekor public key as compiled-in constants.
+tar = "0.4"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+semver = { version = "1.0", features = ["serde"] }
+fs2 = "0.4"
+sigstore = { version = "0.12", default-features = false, features = ["sigstore-trust-root", "cached-client"] }
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 
 [features]
 # `display` is in the default feature set: every Linux release variant
