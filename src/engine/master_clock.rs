@@ -216,6 +216,77 @@ impl MasterClock for SourcePcrPllMaster {
     }
 }
 
+/// PTP master: drives PCR off the local realtime clock (which `ptp4l +
+/// phc2sys` slave to the grandmaster) and gates lock state on the PTP
+/// reporter's `PtpLockState`.
+///
+/// Cross-edge coherence: two edges anchored to the same grandmaster
+/// produce identical `now_27mhz()` values within the PTP servo's
+/// residual offset (typically < 1 µs on a well-tuned plant). Multiple
+/// edges feeding a 2022-7 hitless receiver therefore emit
+/// PCR-equivalent streams without any external genlock.
+pub struct PtpMasterClock {
+    state: Arc<crate::engine::st2110::ptp::PtpStateHandle>,
+    source_id: String,
+}
+
+impl PtpMasterClock {
+    pub fn new(state: Arc<crate::engine::st2110::ptp::PtpStateHandle>) -> Self {
+        let snap = state.snapshot();
+        let source_id = match snap.grandmaster_id {
+            Some(gm) => format!("ptp:domain={}:gm={gm}", snap.domain),
+            None => format!("ptp:domain={}", snap.domain),
+        };
+        Self { state, source_id }
+    }
+}
+
+impl MasterClock for PtpMasterClock {
+    fn now_27mhz(&self) -> u64 {
+        // Local realtime clock — when ptp4l + phc2sys are running, this
+        // is the PTP grandmaster's clock within the servo's offset
+        // tolerance. SystemTime can go backwards across leap seconds /
+        // NTP corrections, but on a PTP-synced host phc2sys keeps the
+        // monotonic relationship intact.
+        let dur = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let ns = dur.as_nanos();
+        let ticks = (ns as u64).saturating_mul(27) / 1000;
+        const PCR_MODULUS: u64 = (1u64 << 33) * 300;
+        ticks % PCR_MODULUS
+    }
+
+    fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    fn is_locked(&self) -> bool {
+        use crate::engine::st2110::ptp::PtpLockState;
+        matches!(
+            self.state.snapshot().lock_state,
+            PtpLockState::Locked
+        )
+    }
+
+    fn telemetry(&self) -> MasterClockTelemetry {
+        let snap = self.state.snapshot();
+        let locked = matches!(
+            snap.lock_state,
+            crate::engine::st2110::ptp::PtpLockState::Locked
+        );
+        MasterClockTelemetry {
+            kind: MasterClockKind::Ptp.as_str().to_string(),
+            locked,
+            rate_offset_ppm: 0.0,
+            jitter_us: snap
+                .offset_ns
+                .map(|o| (o.unsigned_abs() / 1000) as u64)
+                .unwrap_or(0),
+        }
+    }
+}
+
 /// Last-resort master: monotonic wall clock pinned at flow start.
 ///
 /// `now_27mhz()` returns `(Instant::now() − epoch).as_nanos() × 27 / 1000`
@@ -322,6 +393,14 @@ impl MasterClockHandle {
         let inner = Arc::new(SourcePcrPllMaster::new(source_id));
         let handle = Self::new(inner.clone(), MasterClockKind::SourcePcrPll);
         (handle, inner)
+    }
+
+    /// Build a `Ptp` handle wrapping the existing PTP state reporter.
+    /// `state` is the same `PtpStateHandle` ST 2110 inputs / outputs
+    /// already plumb through `engine::st2110_io`.
+    pub fn ptp(state: Arc<crate::engine::st2110::ptp::PtpStateHandle>) -> Self {
+        let inner = Arc::new(PtpMasterClock::new(state));
+        Self::new(inner, MasterClockKind::Ptp)
     }
 
     pub fn new(inner: Arc<dyn MasterClock>, kind: MasterClockKind) -> Self {
@@ -501,6 +580,28 @@ mod tests {
         assert_eq!(s, "\"source_pcr_pll\"");
         let back: MasterClockKind = serde_json::from_str(&s).unwrap();
         assert_eq!(back, MasterClockKind::SourcePcrPll);
+    }
+
+    #[test]
+    fn ptp_master_reports_unavailable_until_locked() {
+        use crate::engine::st2110::ptp::PtpStateHandle;
+        let state = Arc::new(PtpStateHandle::new(0));
+        let m = PtpMasterClock::new(state);
+        assert!(!m.is_locked(), "PTP master without GM should not be locked");
+        assert!(m.source_id().starts_with("ptp:domain=0"));
+        // now_27mhz returns a sensible-sized value driven by SystemTime.
+        let now = m.now_27mhz();
+        assert!(now > 0);
+    }
+
+    #[test]
+    fn ptp_master_telemetry_carries_kind() {
+        use crate::engine::st2110::ptp::PtpStateHandle;
+        let state = Arc::new(PtpStateHandle::new(127));
+        let h = MasterClockHandle::ptp(state);
+        let t = h.telemetry();
+        assert_eq!(t.kind, "ptp");
+        assert!(!t.locked);
     }
 
     #[test]

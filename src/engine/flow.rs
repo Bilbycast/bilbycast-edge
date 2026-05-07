@@ -811,7 +811,7 @@ impl FlowRuntime {
         // ── Master clock selection (must precede output spawn so the
         // pacer is available for replacers built inside each spawn) ──
         let (master_clock, pll_master) =
-            build_master_clock(&config.config, active_input_cfg, &event_sender);
+            build_master_clock(&config.config, active_input_cfg, &event_sender, &cancel_token);
         flow_stats.set_master_clock_telemetry(master_clock.telemetry());
         flow_stats.set_master_clock_lipsync(master_clock.lipsync_offset_90k());
         let av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>> =
@@ -3939,6 +3939,7 @@ fn build_master_clock(
     cfg: &crate::config::models::FlowConfig,
     active_input: Option<&crate::config::models::InputConfig>,
     event_sender: &EventSender,
+    cancel_token: &CancellationToken,
 ) -> (
     crate::engine::master_clock::MasterClockHandle,
     Option<Arc<crate::engine::master_clock::SourcePcrPllMaster>>,
@@ -3962,8 +3963,30 @@ fn build_master_clock(
             let h = MasterClockHandle::new(inner.clone(), MasterClockKind::SourcePcrPll);
             (h, Some(inner))
         }
-        // Ptp / AudioMaster fall through to Wallclock until their real
-        // backends land in Phase 6 / a future phase. The kind tag is
+        MasterClockKind::Ptp => {
+            // Phase 6: spawn a PTP reporter for this flow's clock_domain
+            // (or domain 0 when unset) and wrap its handle as a
+            // PtpMasterClock. The reporter is best-effort — when ptp4l
+            // is missing the wrapper reports `is_locked = false` and
+            // PCR generation falls through to the wallclock-style
+            // SystemTime path. This matches the PTP-as-degraded-source
+            // behaviour today's ST 2110 path already has.
+            let domain = cfg.clock_domain.unwrap_or(0);
+            let state = Arc::new(
+                crate::engine::st2110::ptp::PtpStateReporter::spawn(
+                    crate::engine::st2110::ptp::PtpReporterConfig {
+                        domain,
+                        ..Default::default()
+                    },
+                    cancel_token.child_token(),
+                ),
+            );
+            let inner = Arc::new(crate::engine::master_clock::PtpMasterClock::new(state));
+            let h = MasterClockHandle::new(inner, MasterClockKind::Ptp);
+            (h, None)
+        }
+        // AudioMaster falls through to Wallclock until a future phase
+        // wires the local-display ALSA master clock. The kind tag is
         // preserved so manager UI surfaces the intended source.
         other => (
             MasterClockHandle::new(Arc::new(WallclockMaster::new()), other),
