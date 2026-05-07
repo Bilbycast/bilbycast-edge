@@ -145,6 +145,7 @@ pub fn spawn_srt_output(
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> JoinHandle<()> {
     let broadcast_tx = broadcast_tx.clone();
 
@@ -176,19 +177,11 @@ pub fn spawn_srt_output(
 
     tokio::spawn(async move {
         let result = if config.bonding.is_some() {
-            // Bonded SRT output: libsrt native socket group. Shares the
-            // same forward-loop pipeline as the single-socket path, so
-            // program_number, audio_encode, video_encode, delay, and
-            // transport_mode=audio_302m all work transparently. The only
-            // difference is that outbound packets are sent via an
-            // `SrtGroup::send()` sink instead of a single socket.
-            srt_output_bonded_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, input_format, compressed_audio_input, frame_rate_rx).await
+            srt_output_bonded_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, input_format, compressed_audio_input, frame_rate_rx, av_sync_pacer).await
         } else if config.redundancy.is_some() {
-            // Redundant SRT output does not support 302M mode, so the
-            // compressed-audio bridge is not applicable here.
-            srt_output_redundant_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, frame_rate_rx).await
+            srt_output_redundant_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, frame_rate_rx, av_sync_pacer).await
         } else {
-            srt_output_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, input_format, compressed_audio_input, frame_rate_rx).await
+            srt_output_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, input_format, compressed_audio_input, frame_rate_rx, av_sync_pacer).await
         };
         if let Err(e) = result {
             tracing::error!("SRT output '{}' exited with error: {e}", config.id);
@@ -216,10 +209,11 @@ async fn srt_output_loop(
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> anyhow::Result<()> {
     match config.mode {
-        SrtMode::Listener => srt_output_listener_loop(config, broadcast_tx, stats, cancel, events, flow_id, input_format, compressed_audio_input, frame_rate_rx).await,
-        _ => srt_output_caller_loop(config, broadcast_tx, stats, cancel, events, flow_id, input_format, compressed_audio_input, frame_rate_rx).await,
+        SrtMode::Listener => srt_output_listener_loop(config, broadcast_tx, stats, cancel, events, flow_id, input_format, compressed_audio_input, frame_rate_rx, av_sync_pacer).await,
+        _ => srt_output_caller_loop(config, broadcast_tx, stats, cancel, events, flow_id, input_format, compressed_audio_input, frame_rate_rx, av_sync_pacer).await,
     }
 }
 
@@ -236,6 +230,7 @@ async fn srt_output_listener_loop(
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> anyhow::Result<()> {
     let mut listener = bind_srt_listener_for_output(config).await?;
     let mut program_filter = config.program_number.map(|n| {
@@ -247,7 +242,7 @@ async fn srt_output_listener_loop(
     });
     let mut pid_remapper = build_pid_remapper(config);
     let mut audio_replacer = build_audio_replacer(config, events);
-    let mut video_replacer = build_video_replacer(config, &stats, events);
+    let mut video_replacer = build_video_replacer(config, &stats, events, av_sync_pacer.as_ref());
 
     loop {
         let socket = match accept_srt_connection(&mut listener, &cancel).await {
@@ -395,6 +390,7 @@ async fn srt_output_caller_loop(
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> anyhow::Result<()> {
     let mut program_filter = config.program_number.map(|n| {
         tracing::info!(
@@ -405,7 +401,7 @@ async fn srt_output_caller_loop(
     });
     let mut pid_remapper = build_pid_remapper(config);
     let mut audio_replacer = build_audio_replacer(config, events);
-    let mut video_replacer = build_video_replacer(config, &stats, events);
+    let mut video_replacer = build_video_replacer(config, &stats, events, av_sync_pacer.as_ref());
     loop {
         let socket = match connect_srt_output(config, &cancel).await {
             Ok(s) => s,
@@ -559,10 +555,14 @@ fn build_video_replacer(
     config: &SrtOutputConfig,
     stats: &OutputStatsAccumulator,
     events: &EventSender,
+    av_sync_pacer: Option<&Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> Option<TsVideoReplacer> {
     let enc = config.video_encode.as_ref()?;
     match TsVideoReplacer::new(enc, None) {
-        Ok(r) => {
+        Ok(mut r) => {
+            if let Some(p) = av_sync_pacer {
+                r.set_av_sync_pacer(p.clone());
+            }
             let backend = match enc.codec.as_str() {
                 "x264" | "x265" => enc.codec.clone(),
                 "h264_nvenc" | "hevc_nvenc" => "nvenc".to_string(),
@@ -1038,7 +1038,13 @@ async fn srt_output_redundant_loop(
     events: &EventSender,
     _flow_id: &str,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> anyhow::Result<()> {
+    // 2022-7 dual-leg forwarder doesn't itself transcode video — both
+    // legs ship identical bytes from the broadcast channel — so the
+    // av_sync_pacer is currently unused here. Held to keep the call-
+    // site signature consistent across all SRT loop variants.
+    let _ = av_sync_pacer;
     let redundancy = config
         .redundancy
         .as_ref()
@@ -1600,6 +1606,7 @@ async fn srt_output_bonded_loop(
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> anyhow::Result<()> {
     let bond = config
         .bonding
@@ -1618,7 +1625,7 @@ async fn srt_output_bonded_loop(
     });
     let mut pid_remapper = build_pid_remapper(config);
     let mut audio_replacer = build_audio_replacer(config, events);
-    let mut video_replacer = build_video_replacer(config, &stats, events);
+    let mut video_replacer = build_video_replacer(config, &stats, events, av_sync_pacer.as_ref());
 
     match config.mode {
         SrtMode::Listener => {

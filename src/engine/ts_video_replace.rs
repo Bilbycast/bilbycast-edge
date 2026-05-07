@@ -45,18 +45,13 @@ use super::ts_parse::{
 ///
 /// ISO/IEC 13818-1 Annex L (T-STD model) requires PCR to arrive earlier
 /// than the corresponding frame's PTS by the decoder's transport-buffer
-/// + CPB pre-roll. Without this offset, professional decoders (Appear,
-/// Tektronix) refuse to lock under T-STD verification, and software
-/// decoders (VLC, ffplay) play a few buffered frames at startup and then
-/// stutter once their STC catches up to PTS.
-///
-/// 80 ms matches FFmpeg's mpegts muxer default for VBR contribution
-/// streams. It's the minimum pre-roll a well-behaved STD-compliant
-/// receiver needs to absorb network jitter + the encoder's CPB peak.
-/// Choosing a smaller window also limits the apparent A/V offset on
-/// receivers that don't apply T-STD scheduling to audio (a small set of
-/// software decoders that just play audio as it arrives) — for those,
-/// audio leads video by exactly this pre-roll.
+/// + CPB pre-roll. 80 ms matches FFmpeg's mpegts muxer default for VBR
+/// contribution streams. Phase 4 of the sync-mux work moved actual PCR
+/// generation to consult `engine::av_sync_mux::pcr_for_emit`, which
+/// uses the master clock when a flow-wide pacer is attached and falls
+/// back to `pts × 300 − preroll` otherwise. The constant is retained
+/// for tests that exercise the legacy derivation directly.
+#[allow(dead_code)]
 const PCR_PREROLL_27MHZ: u64 = 2_160_000;
 
 /// Lock-free runtime counters for the streaming TS video replacer.
@@ -146,6 +141,26 @@ pub struct TsVideoReplacer {
     /// only kept so [`Self::force_idr_handle`] can hand it back out.
     #[allow(dead_code)]
     force_idr_on_next_frame: Arc<AtomicBool>,
+}
+
+impl TsVideoReplacer {
+    /// Attach a per-flow A/V sync pacer. Output PCR is then derived from
+    /// the pacer's master clock instead of `pts × 300 − preroll`. Safe
+    /// to call zero or one time before `process()` runs; calling twice
+    /// silently overwrites the existing pacer.
+    pub fn set_av_sync_pacer(
+        &mut self,
+        pacer: Arc<crate::engine::av_sync_mux::AvSyncPacer>,
+    ) {
+        #[cfg(feature = "video-thumbnail")]
+        {
+            self.inner.av_sync_pacer = Some(pacer);
+        }
+        #[cfg(not(feature = "video-thumbnail"))]
+        {
+            let _ = pacer;
+        }
+    }
 }
 
 impl TsVideoReplacer {
@@ -314,6 +329,13 @@ mod inner {
         /// decoded frame so the static-capabilities snapshot is
         /// guaranteed installed.
         hw_decode_pref: crate::config::models::HwDecodePreference,
+
+        /// Optional per-flow A/V sync pacer. When set, output PCR is
+        /// `master.now_27mhz() − PCR_PREROLL_27MHZ` (modular-aware)
+        /// instead of `pts × 300 − preroll`. PTS values still come
+        /// from `src_pts_queue`, so A/V offset versus source is
+        /// preserved. Phase 4 of the sync-mux work.
+        pub av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     }
 
     impl Inner {
@@ -415,6 +437,7 @@ mod inner {
                 stats,
                 force_idr,
                 hw_decode_pref: cfg.hw_decode.unwrap_or_default(),
+                av_sync_pacer: None,
             })
         }
 
@@ -557,9 +580,15 @@ mod inner {
                             .pop_front()
                             .unwrap_or(self.pts_90k);
                         let pes = build_video_pes(&ef.data, pts_for_pes);
-                        let pcr_27mhz = pts_for_pes
-                            .saturating_mul(300)
-                            .saturating_sub(PCR_PREROLL_27MHZ);
+                        // PCR comes from the master clock when a flow-
+                        // wide pacer is attached (broadcast-grade emit);
+                        // otherwise fall back to the legacy pts*300 −
+                        // preroll derivation so unit tests + non-mastered
+                        // call sites keep their existing behaviour.
+                        let pcr_27mhz = crate::engine::av_sync_mux::pcr_for_emit(
+                            self.av_sync_pacer.as_ref(),
+                            pts_for_pes,
+                        );
                         let pkts = packetize_ts(
                             vpid,
                             &pes,
@@ -833,16 +862,18 @@ mod inner {
                         .pop_front()
                         .unwrap_or(self.pts_90k);
                     let pes = build_video_pes(&ef.data, pts_for_pes);
-                    // PCR sits PCR_PREROLL_27MHZ behind PTS so the receiver's
-                    // T-STD buffer model has room. saturating_sub keeps the
-                    // arithmetic well-defined when the source's first PTS
-                    // is smaller than the pre-roll (test patterns starting
-                    // at 0); the decoder briefly sees PCR == PTS during
-                    // those few startup frames, then steady-state PCR <
-                    // PTS once `pts_for_pes` has advanced past the pre-roll.
-                    let pcr_27mhz = pts_for_pes
-                        .saturating_mul(300)
-                        .saturating_sub(PCR_PREROLL_27MHZ);
+                    // PCR sits PCR_PREROLL_27MHZ behind the master clock
+                    // (or PTS-derived clock if no pacer is attached) so
+                    // the receiver's T-STD buffer model has room. With
+                    // a pacer attached, PCR cadence is locked to the
+                    // master clock — every output of the flow emits an
+                    // identical PCR sequence regardless of internal
+                    // pipeline depth, and multi-edge plants on the same
+                    // PTP/source PCR stay coherent.
+                    let pcr_27mhz = crate::engine::av_sync_mux::pcr_for_emit(
+                        self.av_sync_pacer.as_ref(),
+                        pts_for_pes,
+                    );
                     let pkts = packetize_ts(
                         vpid,
                         &pes,

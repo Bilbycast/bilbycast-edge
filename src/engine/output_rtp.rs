@@ -95,6 +95,7 @@ pub fn spawn_rtp_output(
     cancel: CancellationToken,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
     events: EventSender,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
 
@@ -115,9 +116,9 @@ pub fn spawn_rtp_output(
 
     tokio::spawn(async move {
         let result = if config.redundancy.is_some() {
-            rtp_output_redundant_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx).await
+            rtp_output_redundant_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx, av_sync_pacer).await
         } else {
-            rtp_output_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx, &events).await
+            rtp_output_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx, &events, av_sync_pacer).await
         };
         if let Err(e) = result {
             tracing::error!("RTP output '{}' exited with error: {e}", config.id);
@@ -147,6 +148,7 @@ async fn rtp_output_loop(
     cancel: CancellationToken,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
     events: &EventSender,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> anyhow::Result<()> {
     let (socket, dest) =
         create_udp_output(&config.dest_addr, config.bind_addr.as_deref(), config.interface_addr.as_deref(), config.dscp).await?;
@@ -256,7 +258,7 @@ async fn rtp_output_loop(
     // Optional video ES replacement.
     let mut video_replacer = match config.video_encode.as_ref() {
         Some(enc) => match TsVideoReplacer::new(enc, None) {
-            Ok(r) => {
+            Ok(mut r) => {
                 let backend = match enc.codec.as_str() {
                     "x264" | "x265" => enc.codec.clone(),
                     "h264_nvenc" | "hevc_nvenc" => "nvenc".to_string(),
@@ -280,6 +282,9 @@ async fn rtp_output_loop(
                     enc.bitrate_kbps.unwrap_or(0),
                     backend,
                 );
+                if let Some(p) = av_sync_pacer.as_ref() {
+                    r.set_av_sync_pacer(p.clone());
+                }
                 tracing::info!(
                     "RTP output '{}': video_encode active ({})",
                     config.id,
@@ -646,6 +651,7 @@ async fn rtp_output_redundant_loop(
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
+    _av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> anyhow::Result<()> {
     let redundancy = config
         .redundancy

@@ -83,6 +83,12 @@ pub mod pcr_pll;
 /// extracts PCR samples from every TS packet and feeds the source-PCR
 /// PLL. Sibling to `stats::pcr_trust` (egress accuracy).
 pub mod pcr_ingress_sampler;
+/// Per-flow A/V sync mux — master-clock-driven PCR pacing helper
+/// consumed by the TS replacers and per-output emit code. See
+/// [`av_sync_mux`] for the architectural rationale (operator chose
+/// "per-output replacer keeps current shape; mux only governs PCR /
+/// emission timing" over the heavier per-flow producer).
+pub mod av_sync_mux;
 pub mod perf;
 pub mod rtmp;
 pub mod thumbnail;

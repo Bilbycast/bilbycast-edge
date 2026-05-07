@@ -808,6 +808,47 @@ impl FlowRuntime {
             cancel_token.child_token(),
         );
 
+        // ── Master clock selection (must precede output spawn so the
+        // pacer is available for replacers built inside each spawn) ──
+        let (master_clock, pll_master) =
+            build_master_clock(&config.config, active_input_cfg, &event_sender);
+        flow_stats.set_master_clock_telemetry(master_clock.telemetry());
+        flow_stats.set_master_clock_lipsync(master_clock.lipsync_offset_90k());
+        let av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>> =
+            Some(Arc::new(crate::engine::av_sync_mux::AvSyncPacer::new(
+                master_clock.clone(),
+            )));
+
+        if let Some(pll_master) = pll_master {
+            let sampler_cancel = cancel_token.child_token();
+            let _ = crate::engine::pcr_ingress_sampler::spawn_pcr_ingress_sampler(
+                pll_master,
+                &broadcast_tx,
+                sampler_cancel,
+            );
+        }
+        {
+            let mc = master_clock.clone();
+            let acc = flow_stats.clone();
+            let cancel = cancel_token.child_token();
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(1));
+                interval.set_missed_tick_behavior(
+                    tokio::time::MissedTickBehavior::Delay,
+                );
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = interval.tick() => {
+                            acc.set_master_clock_telemetry(mc.telemetry());
+                            acc.set_master_clock_lipsync(mc.lipsync_offset_90k());
+                        }
+                    }
+                }
+            });
+        }
+
         // Start output tasks
         #[cfg(feature = "webrtc")]
         let mut whep_session_info: Option<(tokio::sync::mpsc::Sender<crate::api::webrtc::registry::NewSessionMsg>, Option<String>)> = None;
@@ -856,6 +897,7 @@ impl FlowRuntime {
                 frame_rate_rx.clone(),
                 #[cfg(all(feature = "display", target_os = "linux"))]
                 &display_claim_registry,
+                av_sync_pacer.clone(),
             ).await?;
             output_handles.insert(output_config.id().to_string(), output_rt);
         }
@@ -982,57 +1024,9 @@ impl FlowRuntime {
         }
         let output_contributions = std::sync::RwLock::new(output_contributions_map);
 
-        // ── Master clock selection ────────────────────────────────────
-        // Operator override on `FlowConfig.master_clock` beats the auto
-        // policy. `Wallclock` is always available; Phase 3 lit up the
-        // real `SourcePcrPllMaster` backend for SRT/RTP/UDP/RIST/RTMP/
-        // RTSP/`media_player`/`replay` flows. `Ptp` + `AudioMaster` still
-        // fall through to a Wallclock impl with the right `kind` tag
-        // until Phase 6 (PTP) and a future phase land real backends.
-        let (master_clock, pll_master) =
-            build_master_clock(&config.config, active_input_cfg, &event_sender);
-        flow_stats.set_master_clock_telemetry(master_clock.telemetry());
-        flow_stats.set_master_clock_lipsync(master_clock.lipsync_offset_90k());
-
-        // Spawn the ingress PCR sampler so the PLL converges on source's
-        // 27 MHz. Only relevant for `SourcePcrPll` flows; absent for
-        // `Wallclock` / `Ptp` / `AudioMaster`.
-        if let Some(pll_master) = pll_master {
-            let sampler_cancel = cancel_token.child_token();
-            // Detached: the sampler is a passive observer. Owned by the
-            // flow's CancellationToken tree so shutdown propagates.
-            let _ = crate::engine::pcr_ingress_sampler::spawn_pcr_ingress_sampler(
-                pll_master,
-                &broadcast_tx,
-                sampler_cancel,
-            );
-        }
-
-        // Mirror master-clock telemetry into the stats accumulator at a
-        // low rate so manager UI sees PLL convergence without each flow
-        // tick paying the lock+clone cost. Same one-shot subscriber
-        // pattern as the analyzer / media-analyzer.
-        {
-            let mc = master_clock.clone();
-            let acc = flow_stats.clone();
-            let cancel = cancel_token.child_token();
-            tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(std::time::Duration::from_secs(1));
-                interval.set_missed_tick_behavior(
-                    tokio::time::MissedTickBehavior::Delay,
-                );
-                loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        _ = interval.tick() => {
-                            acc.set_master_clock_telemetry(mc.telemetry());
-                            acc.set_master_clock_lipsync(mc.lipsync_offset_90k());
-                        }
-                    }
-                }
-            });
-        }
+        // master_clock + pacer + ingress sampler + 1 Hz telemetry
+        // mirror were built above, before output spawn, so each output's
+        // replacer could attach to the per-flow pacer.
 
         Ok(Self {
             config,
@@ -1399,6 +1393,11 @@ impl FlowRuntime {
         frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
         #[cfg(all(feature = "display", target_os = "linux"))]
         display_claim_registry: &Arc<crate::display::claim_registry::DisplayClaimRegistry>,
+        // Per-flow A/V sync pacer. Threaded into UDP/RTP/SRT/RIST
+        // outputs that build a TsVideoReplacer so output PCR is
+        // generated from the master clock instead of pts × 300 − preroll.
+        // `None` keeps the legacy PTS-derived behaviour.
+        av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     ) -> Result<OutputRuntime> {
         let output_cancel = parent_cancel.child_token();
 
@@ -1417,6 +1416,7 @@ impl FlowRuntime {
                     output_cancel.clone(),
                     frame_rate_rx,
                     event_sender.clone(),
+                    av_sync_pacer.clone(),
                 );
 
                 Ok(OutputRuntime {
@@ -1440,6 +1440,7 @@ impl FlowRuntime {
                     input_audio_format,
                     frame_rate_rx,
                     event_sender.clone(),
+                    av_sync_pacer.clone(),
                 );
 
                 Ok(OutputRuntime {
@@ -1465,6 +1466,7 @@ impl FlowRuntime {
                     input_audio_format,
                     compressed_audio_input,
                     frame_rate_rx,
+                    av_sync_pacer.clone(),
                 );
 
                 Ok(OutputRuntime {
@@ -1488,6 +1490,7 @@ impl FlowRuntime {
                     frame_rate_rx,
                     event_sender.clone(),
                     flow_id.to_string(),
+                    av_sync_pacer.clone(),
                 );
 
                 Ok(OutputRuntime {
@@ -1801,6 +1804,9 @@ impl FlowRuntime {
             .and_then(crate::engine::audio_transcode::InputFormat::from_input_config);
         let compressed_audio_input = active_input_cfg
             .map_or(false, crate::engine::audio_decode::input_can_carry_ts_audio);
+        let av_sync_pacer = Some(Arc::new(
+            crate::engine::av_sync_mux::AvSyncPacer::new(self.master_clock.clone()),
+        ));
         let output_rt = Self::start_output(
             &output_config,
             &self.broadcast_tx,
@@ -1815,6 +1821,7 @@ impl FlowRuntime {
             self.frame_rate_rx.clone(),
             #[cfg(all(feature = "display", target_os = "linux"))]
             &self.display_claim_registry,
+            av_sync_pacer,
         ).await?;
 
         // Update output config metadata so stats snapshots reflect the new address/port

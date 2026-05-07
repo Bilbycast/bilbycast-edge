@@ -54,6 +54,7 @@ pub fn spawn_rist_output(
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
     event_sender: EventSender,
     flow_id: String,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
 
@@ -81,6 +82,7 @@ pub fn spawn_rist_output(
             frame_rate_rx,
             &event_sender,
             &flow_id,
+            av_sync_pacer,
         )
         .await
         {
@@ -178,6 +180,7 @@ async fn rist_output_loop(
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
     events: &EventSender,
     flow_id: &str,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> anyhow::Result<()> {
     let remote: SocketAddr = config.remote_addr.parse()?;
 
@@ -272,7 +275,10 @@ async fn rist_output_loop(
 
     let mut video_replacer = match config.video_encode.as_ref() {
         Some(enc) => match TsVideoReplacer::new(enc, None) {
-            Ok(r) => {
+            Ok(mut r) => {
+                if let Some(p) = av_sync_pacer.as_ref() {
+                    r.set_av_sync_pacer(p.clone());
+                }
                 let backend = match enc.codec.as_str() {
                     "x264" | "x265" => enc.codec.clone(),
                     "h264_nvenc" | "hevc_nvenc" => "nvenc".to_string(),
