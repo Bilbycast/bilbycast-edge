@@ -279,6 +279,7 @@ mod tests {
                 assembly: None,
                 content_analysis: None,
                 recording: None,
+                master_clock: None,
             }],
         };
 

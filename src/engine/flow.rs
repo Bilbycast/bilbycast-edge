@@ -265,6 +265,13 @@ pub struct FlowRuntime {
     /// hosts where the `display` Cargo feature is enabled.
     #[cfg(all(feature = "display", target_os = "linux"))]
     pub display_claim_registry: Arc<crate::display::claim_registry::DisplayClaimRegistry>,
+    /// Master clock for this flow (PCR pacing, A/V sync, lipsync trim).
+    /// Built at start time from `FlowConfig.master_clock` (operator
+    /// override) or auto-selected from the active input. Cloned into
+    /// every output / replacer that needs a clock reference. See the
+    /// `engine::master_clock` module for the trait, kind enum, and
+    /// selection policy.
+    pub master_clock: crate::engine::master_clock::MasterClockHandle,
 }
 
 /// Runtime state for a single input within a flow.
@@ -975,6 +982,15 @@ impl FlowRuntime {
         }
         let output_contributions = std::sync::RwLock::new(output_contributions_map);
 
+        // ── Master clock selection ────────────────────────────────────
+        // Operator override on `FlowConfig.master_clock` beats the auto
+        // policy. `Wallclock` is always available; `SourcePcrPll` and
+        // `Ptp` paths are wired in Phases 3 + 6 — until then they fall
+        // through to a Wallclock impl with the right `kind` tag so the
+        // telemetry surface is correct from day one.
+        let master_clock = build_master_clock(&config.config, active_input_cfg, &event_sender);
+        flow_stats.set_master_clock_telemetry(master_clock.telemetry());
+
         Ok(Self {
             config,
             broadcast_tx,
@@ -1009,7 +1025,14 @@ impl FlowRuntime {
             output_contributions,
             #[cfg(all(feature = "display", target_os = "linux"))]
             display_claim_registry,
+            master_clock,
         })
+    }
+
+    /// Public master-clock accessor for hot-add and the WS dispatcher.
+    #[allow(dead_code)]
+    pub fn master_clock(&self) -> &crate::engine::master_clock::MasterClockHandle {
+        &self.master_clock
     }
 
     /// Resource-budget cost of this flow, in units. Set at start time
@@ -3854,3 +3877,64 @@ fn output_encode_blocks(
         _ => (None, None),
     }
 }
+
+// ─── Master clock construction ────────────────────────────────────────
+//
+// Phase 1 wires the abstraction with a Wallclock-backed `MasterClockHandle`
+// regardless of the resolved kind. Phases 3 + 6 swap in the real
+// `SourcePcrPllMaster` and `PtpMasterClock` implementations behind the
+// same handle without touching any caller. The kind tag carried on the
+// handle keeps telemetry honest: even on a Wallclock-backed instance, the
+// flow's manager UI shows `source_pcr_pll` (or `ptp`, etc.) so operators
+// see the eventual target clock, with a `degraded_warned` event firing
+// once if the real backend isn't yet available.
+fn build_master_clock(
+    cfg: &crate::config::models::FlowConfig,
+    active_input: Option<&crate::config::models::InputConfig>,
+    event_sender: &EventSender,
+) -> crate::engine::master_clock::MasterClockHandle {
+    use crate::config::models::MasterClockKindConfig;
+    use crate::engine::master_clock::{
+        MasterClockHandle, MasterClockKind, WallclockMaster,
+    };
+
+    let kind = match cfg.master_clock.as_ref().map(|m| m.kind) {
+        Some(MasterClockKindConfig::SourcePcrPll) => MasterClockKind::SourcePcrPll,
+        Some(MasterClockKindConfig::Ptp) => MasterClockKind::Ptp,
+        Some(MasterClockKindConfig::AudioMaster) => MasterClockKind::AudioMaster,
+        Some(MasterClockKindConfig::Wallclock) => MasterClockKind::Wallclock,
+        None => crate::engine::master_clock::select_master_kind_for_input(active_input),
+    };
+
+    let handle = MasterClockHandle::new(Arc::new(WallclockMaster::new()), kind);
+
+    if let Some(mc_cfg) = cfg.master_clock.as_ref() {
+        handle.set_lipsync_offset_90k(mc_cfg.lipsync_offset_90k);
+    }
+
+    if matches!(kind, MasterClockKind::Wallclock)
+        && active_input
+            .map(is_webrtc_like_input)
+            .unwrap_or(false)
+        && handle.mark_degraded_warned()
+    {
+        event_sender.emit_flow(
+            crate::manager::events::EventSeverity::Warning,
+            crate::manager::events::category::FLOW,
+            format!(
+                "Flow {} on WebRTC input runs on wallclock master — A/V sync is best-effort",
+                cfg.id,
+            ),
+            &cfg.id,
+        );
+    }
+
+    handle
+}
+
+fn is_webrtc_like_input(input: &crate::config::models::InputConfig) -> bool {
+    use crate::config::models::InputConfig;
+    matches!(input, InputConfig::Webrtc(_) | InputConfig::Whep(_))
+}
+
+

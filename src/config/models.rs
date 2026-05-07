@@ -573,6 +573,39 @@ pub struct FlowConfig {
     /// Critical event and refuses to bring up the recorder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording: Option<RecordingConfig>,
+    /// Optional per-flow master-clock configuration. Drives PCR
+    /// generation, output emission timing, and lipsync trim. When unset,
+    /// the runtime auto-selects based on the active input (see
+    /// `engine::master_clock::select_master_kind_for_input`). Operators
+    /// override here when they want the same flow on every plant edge to
+    /// share a PTP grandmaster regardless of input type, or when they
+    /// know the source-PCR PLL is the right call even if the auto-policy
+    /// disagrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_clock: Option<MasterClockConfig>,
+}
+
+/// Per-flow master-clock override. Mirrors the
+/// `engine::master_clock::MasterClockKind` enum on the wire so the same
+/// label appears in both config and telemetry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MasterClockConfig {
+    /// Which master-clock backend to use for this flow.
+    pub kind: MasterClockKindConfig,
+    /// Lipsync trim in 90 kHz ticks. Bounded ±18 000 (±200 ms) at
+    /// runtime; values outside that range are clamped, not rejected.
+    /// Default 0.
+    #[serde(default)]
+    pub lipsync_offset_90k: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MasterClockKindConfig {
+    SourcePcrPll,
+    Ptp,
+    AudioMaster,
+    Wallclock,
 }
 
 /// Per-flow continuous-recording attributes. When attached to a
@@ -4548,6 +4581,7 @@ mod tests {
                 assembly: None,
                 content_analysis: None,
                 recording: None,
+                master_clock: None,
             }],
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
@@ -4611,6 +4645,7 @@ mod tests {
                 assembly: None,
                 content_analysis: None,
                 recording: None,
+                master_clock: None,
             }],
             ..Default::default()
         };
@@ -4640,6 +4675,7 @@ mod tests {
                 assembly: None,
                 content_analysis: None,
                 recording: None,
+                master_clock: None,
             }],
             ..Default::default()
         };
@@ -4717,6 +4753,7 @@ mod tests {
                 assembly: None,
                 content_analysis: None,
                 recording: None,
+                master_clock: None,
             }],
             ..Default::default()
         };

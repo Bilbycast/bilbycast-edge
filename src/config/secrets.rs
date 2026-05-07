@@ -644,6 +644,7 @@ mod tests {
                 assembly: None,
                 content_analysis: None,
                 recording: None,
+                master_clock: None,
             }],
             tunnels: vec![TunnelConfig {
                 id: "tunnel-1".to_string(),
@@ -766,6 +767,7 @@ mod tests {
                 assembly: None,
                 content_analysis: None,
                 recording: None,
+                master_clock: None,
             }],
             ..Default::default()
         };
@@ -826,6 +828,7 @@ mod tests {
                 assembly: None,
                 content_analysis: None,
                 recording: None,
+                master_clock: None,
             }],
             ..Default::default()
         };
@@ -878,6 +881,7 @@ mod tests {
                 assembly: None,
                 content_analysis: None,
                 recording: None,
+                master_clock: None,
             }],
             ..Default::default()
         };

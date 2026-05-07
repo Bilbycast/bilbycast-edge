@@ -5468,6 +5468,7 @@ mod tests {
             assembly: None,
             content_analysis: None,
                 recording: None,
+                master_clock: None,
         });
         config
     }
@@ -5497,6 +5498,7 @@ mod tests {
             assembly: None,
             content_analysis: None,
                 recording: None,
+                master_clock: None,
         });
         config
     }
@@ -5661,6 +5663,7 @@ mod tests {
             assembly: None,
             content_analysis: None,
                 recording: None,
+                master_clock: None,
         });
         config.flows.push(FlowConfig {
             id: "same-id".to_string(),
@@ -5677,6 +5680,7 @@ mod tests {
             assembly: None,
             content_analysis: None,
                 recording: None,
+                master_clock: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -5779,6 +5783,7 @@ mod tests {
             assembly: None,
             content_analysis: None,
                 recording: None,
+                master_clock: None,
         });
         assert!(validate_config(&config).is_ok());
     }
@@ -5840,6 +5845,7 @@ mod tests {
             assembly: None,
             content_analysis: None,
                 recording: None,
+                master_clock: None,
         });
         assert!(validate_config(&config).is_ok());
     }
@@ -5923,6 +5929,7 @@ mod tests {
             assembly: None,
             content_analysis: None,
                 recording: None,
+                master_clock: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -5984,6 +5991,7 @@ mod tests {
             assembly: None,
             content_analysis: None,
                 recording: None,
+                master_clock: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -6045,6 +6053,7 @@ mod tests {
             assembly: None,
             content_analysis: None,
                 recording: None,
+                master_clock: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -6251,6 +6260,7 @@ mod tests {
             assembly: None,
             content_analysis: None,
                 recording: None,
+                master_clock: None,
         });
         config.flow_groups.push(FlowGroupConfig {
             id: "group-1".to_string(),
@@ -6306,6 +6316,7 @@ mod tests {
             assembly: None,
             content_analysis: None,
                 recording: None,
+                master_clock: None,
         });
         config.flow_groups.push(FlowGroupConfig {
             id: "group-1".to_string(),
@@ -6328,6 +6339,7 @@ mod tests {
             assembly: None,
             content_analysis: None,
                 recording: None,
+                master_clock: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -6357,6 +6369,7 @@ mod tests {
             assembly: None,
             content_analysis: None,
                 recording: None,
+                master_clock: None,
         });
         config.flow_groups.push(FlowGroupConfig {
             id: "group-1".to_string(),

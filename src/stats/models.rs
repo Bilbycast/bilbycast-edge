@@ -103,6 +103,31 @@ pub struct FlowStats {
     /// builds ignore unknown fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording: Option<RecordingSnapshot>,
+    /// Master-clock telemetry: which clock the flow is paced against,
+    /// whether it is locked, and recovered jitter / rate offset for PLL
+    /// masters. Populated for every running flow (every flow has a master
+    /// clock — Wallclock is the last-resort default). Backward-compatible
+    /// addition; old manager builds ignore unknown fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_clock: Option<MasterClockStats>,
+}
+
+/// Master-clock telemetry surfaced on `FlowStats`. Mirror of
+/// `engine::master_clock::MasterClockTelemetry` placed in the wire model
+/// so the stats crate doesn't have to depend on the engine crate.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct MasterClockStats {
+    /// Tagged kind: "source_pcr_pll" / "ptp" / "audio_master" / "wallclock".
+    pub kind: String,
+    /// True when the clock is converged enough for broadcast-grade emit.
+    pub locked: bool,
+    /// Recovered rate vs. local CPU clock, in ppm. Only meaningful for
+    /// PLL-style masters; `0.0` for Wallclock + Ptp.
+    pub rate_offset_ppm: f64,
+    /// Recent jitter in microseconds (p99 over last 1 s window).
+    pub jitter_us: u64,
+    /// Operator-set lipsync trim in 90 kHz ticks. Bounded ±18 000.
+    pub lipsync_offset_90k: i64,
 }
 
 /// Live atomic-counter snapshot of a flow's recording writer.

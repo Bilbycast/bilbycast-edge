@@ -68,6 +68,12 @@ pub mod output_rtp;
 pub mod output_srt;
 pub mod output_webrtc;
 pub mod packet;
+/// Master-clock abstraction: the per-flow reference every output paces
+/// against. PCR generation, emission timing, and cross-edge coherence all
+/// bottom out on `MasterClock::now_27mhz`. See [`master_clock`] for the
+/// trait, kind enum, and selection policy. Sibling modules `pcr_pll` and
+/// `av_sync_mux` (Phases 2 + 4) consume this abstraction.
+pub mod master_clock;
 pub mod perf;
 pub mod rtmp;
 pub mod thumbnail;

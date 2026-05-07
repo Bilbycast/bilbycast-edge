@@ -2016,6 +2016,12 @@ pub struct FlowStatsAccumulator {
     /// so operators can pivot their trust signals off egress PID. Empty
     /// on passthrough flows.
     pub pid_routing: std::sync::RwLock<std::collections::HashMap<(String, u16), u16>>,
+    /// Per-flow master-clock telemetry. Updated by `FlowRuntime::start`
+    /// at flow bring-up and on every lipsync trim change. Read by the
+    /// snapshot path into `FlowStats.master_clock`. Behind a `RwLock` so
+    /// the (rare) write doesn't add a hot-path atomic.
+    pub master_clock_state:
+        std::sync::RwLock<Option<crate::stats::models::MasterClockStats>>,
 }
 
 /// Per-elementary-stream accumulator. One instance per `(input_id, source_pid)`
@@ -2150,7 +2156,46 @@ impl FlowStatsAccumulator {
             ingress_static: DashMap::new(),
             per_es_stats: DashMap::new(),
             pid_routing: std::sync::RwLock::new(std::collections::HashMap::new()),
+            master_clock_state: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Replace the master-clock telemetry. Called by `FlowRuntime` at
+    /// start-up, on every lipsync trim change, and at every 1 Hz stats
+    /// tick by the master itself (so PLL convergence is visible in the
+    /// manager UI without a re-bring-up).
+    pub fn set_master_clock_telemetry(
+        &self,
+        telemetry: crate::engine::master_clock::MasterClockTelemetry,
+    ) {
+        let lipsync = 0i64; // overwritten by handle in FlowRuntime
+        let stats = crate::stats::models::MasterClockStats {
+            kind: telemetry.kind,
+            locked: telemetry.locked,
+            rate_offset_ppm: telemetry.rate_offset_ppm,
+            jitter_us: telemetry.jitter_us,
+            lipsync_offset_90k: lipsync,
+        };
+        if let Ok(mut g) = self.master_clock_state.write() {
+            *g = Some(stats);
+        }
+    }
+
+    /// Replace just the lipsync trim component of the master-clock
+    /// telemetry. Called by the WS dispatcher when an operator nudges
+    /// the trim knob.
+    #[allow(dead_code)]
+    pub fn set_master_clock_lipsync(&self, lipsync_offset_90k: i64) {
+        if let Ok(mut g) = self.master_clock_state.write() {
+            if let Some(s) = g.as_mut() {
+                s.lipsync_offset_90k = lipsync_offset_90k;
+            }
+        }
+    }
+
+    /// Snapshot accessor used by the snapshot path.
+    pub fn master_clock_snapshot(&self) -> Option<crate::stats::models::MasterClockStats> {
+        self.master_clock_state.read().ok().and_then(|g| g.clone())
     }
 
     /// Update the `(input_id, source_pid) → out_pid` routing snapshot. Called
@@ -2768,6 +2813,7 @@ impl FlowStatsAccumulator {
             }),
             #[cfg(not(feature = "replay"))]
             recording: None,
+            master_clock: self.master_clock_snapshot(),
         }
     }
 }
