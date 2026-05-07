@@ -19,11 +19,74 @@
 //! planes — which libavcodec crops to the top-left quadrant rather than
 //! scaling. (See `docs/transcoding.md`.)
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use crate::config::models::VideoEncodeConfig;
 use video_codec::{
     VideoChroma, VideoEncoderCodec, VideoEncoderConfig, VideoPreset, VideoProfile,
     VideoRateControl,
 };
+
+/// Lock-free cell that publishes the backend a [`ScaledVideoEncoder`]
+/// actually opened with after lazy-open. `0` = unset (encoder not yet
+/// opened); `1..=8` map to the eight [`VideoEncoderCodec`] variants.
+/// Snapshot path maps the value back to the operator-facing label so
+/// the manager-UI badge tracks the resolved backend after Auto-chain
+/// demotion (e.g., NVENC → x264 fallback).
+#[derive(Default, Debug)]
+pub struct ResolvedBackendCell(AtomicU8);
+
+impl ResolvedBackendCell {
+    pub fn store(&self, codec: VideoEncoderCodec) {
+        self.0.store(codec_to_u8(codec), Ordering::Relaxed);
+    }
+
+    /// Returns `Some(label)` once the encoder has lazy-opened, where
+    /// `label` is the same family-collapsed tag the call sites compute
+    /// at output start (`"x264"`, `"x265"`, `"nvenc"`, `"qsv"`,
+    /// `"vaapi"`). `None` means the encoder hasn't opened yet, so the
+    /// caller should keep using the requested-codec label.
+    pub fn label(&self) -> Option<&'static str> {
+        u8_to_codec(self.0.load(Ordering::Relaxed)).map(backend_label)
+    }
+}
+
+fn codec_to_u8(c: VideoEncoderCodec) -> u8 {
+    match c {
+        VideoEncoderCodec::X264 => 1,
+        VideoEncoderCodec::X265 => 2,
+        VideoEncoderCodec::H264Nvenc => 3,
+        VideoEncoderCodec::HevcNvenc => 4,
+        VideoEncoderCodec::H264Qsv => 5,
+        VideoEncoderCodec::HevcQsv => 6,
+        VideoEncoderCodec::H264Vaapi => 7,
+        VideoEncoderCodec::HevcVaapi => 8,
+    }
+}
+
+fn u8_to_codec(v: u8) -> Option<VideoEncoderCodec> {
+    match v {
+        1 => Some(VideoEncoderCodec::X264),
+        2 => Some(VideoEncoderCodec::X265),
+        3 => Some(VideoEncoderCodec::H264Nvenc),
+        4 => Some(VideoEncoderCodec::HevcNvenc),
+        5 => Some(VideoEncoderCodec::H264Qsv),
+        6 => Some(VideoEncoderCodec::HevcQsv),
+        7 => Some(VideoEncoderCodec::H264Vaapi),
+        8 => Some(VideoEncoderCodec::HevcVaapi),
+        _ => None,
+    }
+}
+
+fn backend_label(c: VideoEncoderCodec) -> &'static str {
+    match c {
+        VideoEncoderCodec::X264 => "x264",
+        VideoEncoderCodec::X265 => "x265",
+        VideoEncoderCodec::H264Nvenc | VideoEncoderCodec::HevcNvenc => "nvenc",
+        VideoEncoderCodec::H264Qsv | VideoEncoderCodec::HevcQsv => "qsv",
+        VideoEncoderCodec::H264Vaapi | VideoEncoderCodec::HevcVaapi => "vaapi",
+    }
+}
 
 /// Build a [`VideoEncoderConfig`] from the edge-side [`VideoEncodeConfig`],
 /// runtime-derived source dimensions, and the backend selected by the
@@ -188,10 +251,6 @@ pub struct ScaledVideoEncoder {
     global_header: bool,
 
     encoder: Option<video_engine::VideoEncoder>,
-    /// Backend the encoder actually opened with — equals the first
-    /// element of `backend_chain` when no fall-through happened, or a
-    /// later one after demote(s).
-    active_backend: Option<VideoEncoderCodec>,
     scaler: Option<video_engine::VideoScaler>,
     // Cached to spot mid-stream resolution / pixel-format changes.
     src_w: u32,
@@ -202,6 +261,10 @@ pub struct ScaledVideoEncoder {
     dst_h: u32,
     // Label used in warnings; injected by the caller so logs are readable.
     log_tag: String,
+    // Optional sink that the encoder writes to on lazy-open success so
+    // downstream stats can surface the actually-opened backend after
+    // an Auto-chain demote. `None` means no caller cares.
+    resolved_backend_sink: Option<std::sync::Arc<ResolvedBackendCell>>,
 }
 
 #[cfg(feature = "video-thumbnail")]
@@ -248,7 +311,6 @@ impl ScaledVideoEncoder {
             fps_den,
             global_header,
             encoder: None,
-            active_backend: None,
             scaler: None,
             src_w: 0,
             src_h: 0,
@@ -256,14 +318,17 @@ impl ScaledVideoEncoder {
             dst_w: 0,
             dst_h: 0,
             log_tag: log_tag.into(),
+            resolved_backend_sink: None,
         }
     }
 
-    /// Backend the encoder actually opened with after lazy-open. None
-    /// before the first `encode` call. Used by stats accumulators to
-    /// surface the resolved backend on the manager-UI badge.
-    pub fn active_backend(&self) -> Option<VideoEncoderCodec> {
-        self.active_backend
+    /// Plumb a [`ResolvedBackendCell`] that the encoder writes to on
+    /// successful lazy-open. Call sites that surface a backend label
+    /// in stats use this so the manager-UI badge tracks the actually-
+    /// opened backend rather than the requested one (Auto-chain
+    /// demotion would otherwise show a stale label).
+    pub fn set_resolved_backend_sink(&mut self, sink: std::sync::Arc<ResolvedBackendCell>) {
+        self.resolved_backend_sink = Some(sink);
     }
 
     pub fn is_open(&self) -> bool {
@@ -517,7 +582,9 @@ impl ScaledVideoEncoder {
                         );
                     }
                     self.encoder = Some(encoder);
-                    self.active_backend = Some(candidate);
+                    if let Some(sink) = &self.resolved_backend_sink {
+                        sink.store(candidate);
+                    }
                     self.src_w = src_w;
                     self.src_h = src_h;
                     self.src_pix_fmt = src_pix_fmt;

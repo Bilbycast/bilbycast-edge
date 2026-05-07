@@ -411,18 +411,29 @@ const STRIP_MIN_PX: u32 = 80;
 const STRIP_MAX_PX: u32 = 140;
 
 /// Rasterise the meter strip onto the bottom of a packed BGRA buffer.
-/// `dst_pitch` is bytes per row (≥ `dst_w * 4`). Writes nothing when the
-/// snapshot has no PIDs (so the operator sees the bare picture instead
-/// of a half-empty strip while audio is still warming up).
+/// `dst_pitch` is bytes per row (≥ `dst_w * 4`). The translucent strip
+/// background is always drawn when the buffer is large enough so the
+/// stream-info header (painted separately by [`rasterise_header`])
+/// stays legible against the video; the per-PID labels + bars layer on
+/// top only once at least one audio PID has decoded a block.
 pub fn rasterise(snapshot: &MeterSnapshot, dst: &mut [u8], dst_pitch: usize, dst_w: u32, dst_h: u32) {
-    if snapshot.per_pid.is_empty() || dst_w < 64 || dst_h < 96 {
+    if dst_w < 64 || dst_h < 96 {
         return;
     }
     let strip_h = ((dst_h * STRIP_PCT) / 100).clamp(STRIP_MIN_PX, STRIP_MAX_PX);
     let strip_top = dst_h.saturating_sub(strip_h);
 
     // 1. Translucent black background under the strip (alpha-blend ~50 %).
+    //    Drawn unconditionally so the header (rendered separately on
+    //    top) is legible on video-only feeds with no audio PIDs and on
+    //    the brief warm-up window before the first audio block decodes.
     blend_strip_background(dst, dst_pitch, dst_w, strip_top, strip_h);
+
+    // No audio PIDs locked yet — leave the strip as background only and
+    // skip the divide-by-`pid_count` layout below.
+    if snapshot.per_pid.is_empty() {
+        return;
+    }
 
     // 2. Per-PID block layout. Each block is sized just wide enough for
     //    its label + bars (capped at BLOCK_MAX_W so a single-PID stream
@@ -515,9 +526,12 @@ pub fn compute_strip_height(panel_h: u32) -> Option<u32> {
 /// zero-copy display output: the bars compose at vblank in hardware
 /// — no CPU blit onto the dumb buffer, no zero-copy demotion when
 /// `show_audio_bars` is on. `dst_pitch` is bytes per row (≥
-/// `dst_w * 4`). Writes nothing (leaves the buffer alone) when the
-/// snapshot is empty so a freshly-armed flow shows the bare picture
-/// while audio decoders warm up.
+/// `dst_w * 4`). The translucent background is always painted when
+/// the buffer is large enough so the stream-info header
+/// ([`rasterise_header_overlay`]) stays legible — including on
+/// video-only feeds and during the brief warm-up before the first
+/// audio block decodes; per-PID labels + bars layer on once
+/// at least one PID has reported levels.
 pub fn rasterise_overlay(
     snapshot: &MeterSnapshot,
     dst: &mut [u8],
@@ -525,7 +539,7 @@ pub fn rasterise_overlay(
     dst_w: u32,
     dst_h: u32,
 ) {
-    if snapshot.per_pid.is_empty() || dst_w < 64 || dst_h < 80 {
+    if dst_w < 64 || dst_h < 80 {
         return;
     }
     // Translucent black background. Alpha = 0x80 is the same effective
@@ -534,6 +548,11 @@ pub fn rasterise_overlay(
     // alpha-blend against the primary plane at scanout, so the dim is
     // applied only to the strip area and only against the live video.
     fill_rect_argb(dst, dst_pitch, dst_w, dst_h, 0, 0, dst_w, dst_h, 0, 0, 0, 0x80);
+
+    // No audio PIDs locked yet — leave the buffer at background-only.
+    if snapshot.per_pid.is_empty() {
+        return;
+    }
 
     let strip_top: u32 = 0;
     let strip_h = dst_h;
@@ -1410,13 +1429,47 @@ mod tests {
     }
 
     #[test]
-    fn rasterise_no_op_on_empty_snapshot() {
+    fn rasterise_empty_snapshot_paints_bg_only() {
+        // Empty per_pid: rows above the strip stay untouched, but the
+        // strip area gets the translucent-black background so the
+        // separately-rendered stream header remains legible against
+        // arbitrary video on video-only feeds.
         let w: u32 = 640;
         let h: u32 = 480;
         let pitch = (w as usize) * 4;
         let mut buf = vec![0u8; pitch * (h as usize)];
         let snap = MeterSnapshot::default();
         rasterise(&snap, &mut buf, pitch, w, h);
-        assert!(buf.iter().all(|&b| b == 0));
+
+        let strip_h = ((h * STRIP_PCT) / 100).clamp(STRIP_MIN_PX, STRIP_MAX_PX);
+        let strip_top = (h - strip_h) as usize;
+        // Every row above the strip must remain at the original zero fill.
+        let above = strip_top * pitch;
+        assert!(
+            buf[..above].iter().all(|&b| b == 0),
+            "rows above the strip must remain untouched"
+        );
+        // Inside the strip the background blend re-stamps alpha=0xFF on
+        // every pixel (the BGR halve is a no-op on the zero source).
+        let probe_y = strip_top + 4;
+        let probe_row = &buf[probe_y * pitch..probe_y * pitch + (w as usize) * 4];
+        let alpha_ff = probe_row.chunks_exact(4).all(|px| px[3] == 0xFF);
+        assert!(alpha_ff, "strip background should leave alpha=0xFF");
+    }
+
+    #[test]
+    fn rasterise_overlay_empty_snapshot_paints_bg_only() {
+        // Mirror coverage for the dedicated overlay-plane path: empty
+        // per_pid still fills the ARGB buffer with the translucent
+        // background so header text stays legible.
+        let w: u32 = 1920;
+        let h: u32 = 140;
+        let pitch = (w as usize) * 4;
+        let mut buf = vec![0u8; pitch * (h as usize)];
+        let snap = MeterSnapshot::default();
+        rasterise_overlay(&snap, &mut buf, pitch, w, h);
+        // Probe a pixel inside the strip — alpha lane should be 0x80.
+        let probe = &buf[pitch + 64..pitch + 68];
+        assert_eq!(probe[3], 0x80, "overlay strip bg should set alpha=0x80");
     }
 }

@@ -103,10 +103,21 @@ pub struct TsAudioReplacer {
     out_audio_cc: u8,
 
     /// Running output PTS in 90 kHz ticks. Anchored to the first decoded
-    /// PES PTS; advanced by encoded frame sample counts.
+    /// PES PTS; advanced by encoded frame sample counts. Used as the
+    /// fallback when the source-PTS queue is exhausted (e.g. encoder
+    /// catch-up bursts).
     out_pts_90k: u64,
     /// True until the first decoded PES anchors `out_pts_90k`.
     out_pts_anchored: bool,
+    /// Source PES PTSes pending output, one entry per source decoded
+    /// frame fed into the encoder. Drained in FIFO order on each
+    /// emitted output frame, so output PES PTS values track source's
+    /// monotonic clock instead of `out_pts_90k`'s sample-counted clock.
+    /// This is the path that keeps audio in lock with video when the
+    /// video encoder has its own pipeline delay — the audio replacer
+    /// anchors each output PES to the source PES's intrinsic PTS rather
+    /// than to wall-time accumulation.
+    src_pts_queue: std::collections::VecDeque<u64>,
 
     /// Lazily constructed AAC-LC / ADTS decoder. Opened on the first PES
     /// flush once we know the source is AAC.
@@ -197,6 +208,7 @@ impl TsAudioReplacer {
             out_audio_cc: 0,
             out_pts_90k: 0,
             out_pts_anchored: false,
+            src_pts_queue: std::collections::VecDeque::with_capacity(64),
             #[cfg(feature = "fdk-aac")]
             aac_decoder: None,
             #[cfg(feature = "video-thumbnail")]
@@ -417,6 +429,7 @@ impl TsAudioReplacer {
         }
         self.transcoder = None;
         self.accumulator.clear();
+        self.src_pts_queue.clear();
         self.resolved_channels = 0;
         self.resolved_sample_rate = 0;
         self.codecs_ready = false;
@@ -629,6 +642,19 @@ impl TsAudioReplacer {
                         );
                     }
                 }
+                // Push the source PES PTS once per decoded frame so the
+                // emit path can pop it instead of guessing the PTS from
+                // a sample-count anchor. For 1:1 sample-count mappings
+                // (AC-3 → AC-3, AAC → AAC at the same sample rate) this
+                // collapses any offset between the audio replacer's
+                // internal clock and the source's own clock down to
+                // zero — the output PES carries source's intrinsic PTS
+                // verbatim. For mixed mappings (AAC → AC-3) the queue
+                // is still ahead of advancing-from-anchor: each output
+                // PES's PTS lands within ~1 source-frame-duration of
+                // the correct value (vs. up to encoder-buffer-depth
+                // worth of drift accumulated from a stale anchor).
+                self.src_pts_queue.push_back(pts);
                 self.drain_encoder(output)?;
             }
         }
@@ -726,15 +752,27 @@ impl TsAudioReplacer {
                         .collect();
                     match enc.encode_frame(&frame) {
                         Ok(encoded) => {
-                            let pes = build_audio_pes(&encoded.bytes, self.out_pts_90k);
+                            // Prefer source PES PTS from the queue when
+                            // available; fall back to the sample-counted
+                            // anchor when the queue is exhausted (encoder
+                            // catch-up burst).
+                            let pts_for_pes = self
+                                .src_pts_queue
+                                .pop_front()
+                                .unwrap_or(self.out_pts_90k);
+                            let pes = build_audio_pes(&encoded.bytes, pts_for_pes);
                             let pkts = packetize_ts(audio_pid, &pes, &mut self.out_audio_cc);
                             for p in &pkts {
                                 output.extend_from_slice(p);
                             }
                             let sr = self.resolved_sample_rate as u64;
                             if sr > 0 {
-                                self.out_pts_90k +=
-                                    (encoded.num_samples as u64) * 90_000 / sr;
+                                // Keep the fallback clock in sync from the
+                                // last source PTS we popped, so a later
+                                // queue-exhausted emit can still produce a
+                                // monotonic value.
+                                self.out_pts_90k = pts_for_pes
+                                    .wrapping_add((encoded.num_samples as u64) * 90_000 / sr);
                             }
                         }
                         Err(_) => {
@@ -766,15 +804,21 @@ impl TsAudioReplacer {
                     match enc.encode_frame(&frame) {
                         Ok(frames) => {
                             for ef in frames {
-                                let pes = build_audio_pes(&ef.data, self.out_pts_90k);
+                                let pts_for_pes = self
+                                    .src_pts_queue
+                                    .pop_front()
+                                    .unwrap_or(self.out_pts_90k);
+                                let pes = build_audio_pes(&ef.data, pts_for_pes);
                                 let pkts =
                                     packetize_ts(audio_pid, &pes, &mut self.out_audio_cc);
                                 for p in &pkts {
                                     output.extend_from_slice(p);
                                 }
                                 if enc.sample_rate() > 0 {
-                                    self.out_pts_90k += (ef.num_samples as u64) * 90_000
-                                        / enc.sample_rate() as u64;
+                                    self.out_pts_90k = pts_for_pes.wrapping_add(
+                                        (ef.num_samples as u64) * 90_000
+                                            / enc.sample_rate() as u64,
+                                    );
                                 }
                             }
                         }
@@ -912,7 +956,10 @@ fn extract_pes_audio(pes: &[u8]) -> Option<(Vec<u8>, u64)> {
     Some((pes[es_start..].to_vec(), pts))
 }
 
-/// Decode the 5-byte PTS in a PES optional header.
+/// Decode the 5-byte PTS / DTS in a PES optional header per ISO/IEC
+/// 13818-1 §2.4.3.7. See `ts_video_replace::parse_pts` for the bit-by-
+/// bit layout — this is the same parser kept in the audio module to
+/// avoid a cross-module dependency for one helper.
 fn parse_pts(data: &[u8]) -> u64 {
     let b0 = data[0] as u64;
     let b1 = data[1] as u64;
@@ -921,12 +968,19 @@ fn parse_pts(data: &[u8]) -> u64 {
     let b4 = data[4] as u64;
     ((b0 >> 1) & 0x07) << 30
         | (b1 << 22)
-        | ((b2 >> 1) << 15)
+        | ((b2 >> 1) & 0x7F) << 15
         | (b3 << 7)
-        | (b4 >> 1)
+        | ((b4 >> 1) & 0x7F)
 }
 
 /// Wrap an encoded audio frame in a PES packet with a PTS header.
+///
+/// The five-byte PTS encoding is spec-compliant per ISO/IEC 13818-1
+/// §2.4.3.7 — pts bits 32, 30, and 15 land in the right slots. An
+/// earlier version of this routine had off-by-one shift bugs that
+/// silently dropped pts bits 30 and 15 in the encoded output, which
+/// caused standard receivers (Appear, VLC, ffmpeg) to lose audio PTS
+/// lock once `pts` exceeded 32 768 ticks (~ 364 ms at 90 kHz).
 fn build_audio_pes(audio_data: &[u8], pts: u64) -> Vec<u8> {
     let pes_len = 3 + 5 + audio_data.len();
     let mut pes = Vec::with_capacity(14 + audio_data.len());
@@ -938,11 +992,14 @@ fn build_audio_pes(audio_data: &[u8], pts: u64) -> Vec<u8> {
     pes.push(5);    // PES header data length
 
     let pts = pts & 0x1_FFFF_FFFF;
-    pes.push(0x21 | (((pts >> 30) as u8) & 0x0E));
-    pes.push((pts >> 22) as u8);
-    pes.push(0x01 | (((pts >> 15) as u8) & 0xFE));
-    pes.push((pts >> 7) as u8);
-    pes.push(0x01 | (((pts as u8) & 0x7F) << 1));
+    // 0x20 = '0010' marker for PTS-only timestamp role; OR in the top
+    // 3 bits of pts (pts[32..30] in result bits 3..1) and the trailing
+    // marker bit '1' at bit 0.
+    pes.push(0x20 | (((pts >> 29) as u8) & 0x0E) | 0x01);
+    pes.push(((pts >> 22) & 0xFF) as u8);
+    pes.push((((pts >> 14) as u8) & 0xFE) | 0x01);
+    pes.push(((pts >> 7) & 0xFF) as u8);
+    pes.push((((pts << 1) as u8) & 0xFE) | 0x01);
 
     pes.extend_from_slice(audio_data);
     pes

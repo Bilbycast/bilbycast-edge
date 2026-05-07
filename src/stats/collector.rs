@@ -427,6 +427,69 @@ pub struct EgressMediaSummaryStatic {
     pub audio_passthrough: bool,
     /// `true` when this output produces no video essence (audio-only outputs).
     pub audio_only: bool,
+    /// Configured video-encode target (operator intent, taken from the
+    /// `video_encode` block at startup). Surfaced in the egress summary as a
+    /// fallback for the codec / resolution / bitrate fields when the live
+    /// `VideoEncodeStatsSnapshot` hasn't reported yet — or never reports
+    /// because the encoder failed to open (e.g. NVENC on a host with no
+    /// NVIDIA driver). The companion `Critical` `Video encoder failed`
+    /// event explains the runtime failure mode in that case.
+    pub video_target_codec: Option<String>,
+    pub video_target_width: Option<u32>,
+    pub video_target_height: Option<u32>,
+    pub video_target_fps: Option<f32>,
+    pub video_target_bitrate_kbps: Option<u32>,
+    pub video_target_encoder_backend: Option<String>,
+    /// Configured audio-encode target (operator intent, taken from the
+    /// `audio_encode` block at startup). Same fallback semantics as the
+    /// video target above.
+    pub audio_target_codec: Option<String>,
+    pub audio_target_sample_rate_hz: Option<u32>,
+    pub audio_target_channels: Option<u8>,
+    pub audio_target_bitrate_kbps: Option<u32>,
+}
+
+impl EgressMediaSummaryStatic {
+    /// Populate the `video_target_*` fields from the operator's
+    /// `video_encode` config block. Run at output startup so the egress
+    /// summary always reflects the configured target — even if the encoder
+    /// fails to open at runtime (e.g. NVENC on a host without the NVIDIA
+    /// driver), the operator still sees what the output is *meant to do*.
+    pub fn with_video_encode_target(mut self, enc: &crate::config::models::VideoEncodeConfig) -> Self {
+        let target_codec = match enc.codec.as_str() {
+            "x264" | "h264_nvenc" | "h264_qsv" | "h264_vaapi" => "h264",
+            "x265" | "hevc_nvenc" | "hevc_qsv" | "hevc_vaapi" => "hevc",
+            other => other,
+        };
+        let backend = match enc.codec.as_str() {
+            "x264" | "x265" => enc.codec.clone(),
+            "h264_nvenc" | "hevc_nvenc" => "nvenc".to_string(),
+            "h264_qsv" | "hevc_qsv" => "qsv".to_string(),
+            "h264_vaapi" | "hevc_vaapi" => "vaapi".to_string(),
+            other => other.to_string(),
+        };
+        self.video_target_codec = Some(target_codec.to_string());
+        self.video_target_width = enc.width;
+        self.video_target_height = enc.height;
+        self.video_target_fps = match (enc.fps_num, enc.fps_den) {
+            (Some(n), Some(d)) if d > 0 => Some(n as f32 / d as f32),
+            _ => None,
+        };
+        self.video_target_bitrate_kbps = enc.bitrate_kbps;
+        self.video_target_encoder_backend = Some(backend);
+        self
+    }
+
+    /// Populate the `audio_target_*` fields from the operator's
+    /// `audio_encode` config block. Same intent-vs-runtime contract as the
+    /// video helper above.
+    pub fn with_audio_encode_target(mut self, enc: &crate::config::models::AudioEncodeConfig) -> Self {
+        self.audio_target_codec = Some(enc.codec.clone());
+        self.audio_target_sample_rate_hz = enc.sample_rate;
+        self.audio_target_channels = enc.channels;
+        self.audio_target_bitrate_kbps = enc.bitrate_kbps;
+        self
+    }
 }
 
 impl OutputStatsAccumulator {
@@ -699,6 +762,15 @@ impl OutputStatsAccumulator {
             }
         });
         let video_encode_stats = self.video_encode_stats.get().map(|h| {
+            // Prefer the actually-opened backend (after Auto-chain
+            // demote) over the requested-codec label captured at
+            // output start. `None` until the encoder lazy-opens.
+            let encoder_backend = h
+                .stats
+                .resolved_backend
+                .label()
+                .map(str::to_owned)
+                .unwrap_or_else(|| h.encoder_backend.clone());
             crate::stats::models::VideoEncodeStatsSnapshot {
                 input_frames: h.stats.input_frames.load(Ordering::Relaxed),
                 output_frames: h.stats.output_frames.load(Ordering::Relaxed),
@@ -709,7 +781,7 @@ impl OutputStatsAccumulator {
                 output_height: h.output_height,
                 output_fps: h.output_fps,
                 output_bitrate_kbps: h.output_bitrate_kbps,
-                encoder_backend: h.encoder_backend.clone(),
+                encoder_backend,
                 last_latency_us: h.stats.last_latency_us.load(Ordering::Relaxed),
                 supervisor_restarts: h.stats.supervisor_restarts.load(Ordering::Relaxed),
             }
@@ -2571,6 +2643,15 @@ impl FlowStatsAccumulator {
                     });
                 let in_video_encode =
                     self.input_video_encode_stats.get(active_key).map(|h| {
+                        // Prefer the actually-opened backend (after
+                        // Auto-chain demote) over the requested-codec
+                        // label. `None` until the encoder lazy-opens.
+                        let encoder_backend = h
+                            .stats
+                            .resolved_backend
+                            .label()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| h.encoder_backend.clone());
                         crate::stats::models::VideoEncodeStatsSnapshot {
                             input_frames: h.stats.input_frames.load(Ordering::Relaxed),
                             output_frames: h.stats.output_frames.load(Ordering::Relaxed),
@@ -2581,7 +2662,7 @@ impl FlowStatsAccumulator {
                             output_height: h.output_height,
                             output_fps: h.output_fps,
                             output_bitrate_kbps: h.output_bitrate_kbps,
-                            encoder_backend: h.encoder_backend.clone(),
+                            encoder_backend,
                             last_latency_us: h.stats.last_latency_us.load(Ordering::Relaxed),
                             supervisor_restarts: h.stats.supervisor_restarts.load(Ordering::Relaxed),
                         }
@@ -2940,6 +3021,16 @@ fn build_pipeline_summary(
     };
 
     // ── Pipeline tags (ordered) ───────────────────────────────────────────
+    //
+    // Tags are intent-driven, not stats-driven: as soon as the output is
+    // configured for `audio_encode` / `video_encode`, the badge surfaces
+    // even before the first encode-stats snapshot lands (and stays surfaced
+    // if the encoder fails to spawn — e.g. NVENC on a host without the
+    // NVIDIA driver). This keeps the manager's pipeline indicator
+    // symmetric across output types — passthrough-configured outputs
+    // (UDP/RTP/SRT/RIST without an encode block) show "Passthrough";
+    // transcode-configured outputs show "Audio/Video Transcode" the moment
+    // the config arrives.
     if program_number.is_some() {
         summary.pipeline.push("program_filter".to_string());
     }
@@ -2949,10 +3040,10 @@ fn build_pipeline_summary(
     if transcode.is_some() {
         summary.pipeline.push("audio_transcode_pcm".to_string());
     }
-    if audio_encode.is_some() {
+    if audio_encode.is_some() || (!stat_desc.audio_passthrough && !stat_desc.audio_only) {
         summary.pipeline.push("audio_encode".to_string());
     }
-    if video_encode.is_some() {
+    if video_encode.is_some() || (!stat_desc.video_passthrough && !stat_desc.audio_only) {
         summary.pipeline.push("video_encode".to_string());
     }
     if stat_desc
@@ -2968,6 +3059,20 @@ fn build_pipeline_summary(
     }
 
     // ── Video fields ──────────────────────────────────────────────────────
+    //
+    // Three sources of truth, in priority order:
+    //   1. Live `VideoEncodeStatsSnapshot` — populated once the encoder
+    //      registers its handle (codec, backend, dimensions filled from the
+    //      static config; bitrate/fps may inherit from source until the
+    //      encoder reports its first frame).
+    //   2. `EgressMediaSummaryStatic` target fields — operator intent from
+    //      the `video_encode` block. Used when (1) hasn't reported yet or
+    //      the encoder failed to open at all (e.g. NVENC on a non-NVIDIA
+    //      host). This guarantees the operator always sees what the output
+    //      is *configured to do*, not just what it's currently doing.
+    //   3. `MediaAnalysis.video_streams.first()` — used for passthrough
+    //      outputs (and as a resolution / fps fallback when the target
+    //      target spec doesn't pin a specific output dimension).
     if !stat_desc.audio_only {
         if let Some(ve) = video_encode {
             summary.video_codec = Some(ve.output_codec.clone());
@@ -2985,6 +3090,16 @@ fn build_pipeline_summary(
             if ve.output_bitrate_kbps > 0 {
                 summary.video_bitrate_kbps = Some(ve.output_bitrate_kbps);
             }
+        } else if stat_desc.video_target_codec.is_some() {
+            summary.video_codec = stat_desc.video_target_codec.clone();
+            summary.video_resolution = match (stat_desc.video_target_width, stat_desc.video_target_height) {
+                (Some(w), Some(h)) if w > 0 && h > 0 => Some(format!("{}x{}", w, h)),
+                _ => src_video.and_then(|v| v.resolution.clone()),
+            };
+            summary.video_fps = stat_desc
+                .video_target_fps
+                .or_else(|| src_video.and_then(|v| v.frame_rate.map(|f| f as f32)));
+            summary.video_bitrate_kbps = stat_desc.video_target_bitrate_kbps;
         } else if stat_desc.video_passthrough {
             if let Some(v) = src_video {
                 summary.video_codec = Some(v.codec.clone());
@@ -3009,6 +3124,15 @@ fn build_pipeline_summary(
         if ae.target_bitrate_kbps > 0 {
             summary.audio_bitrate_kbps = Some(ae.target_bitrate_kbps);
         }
+    } else if stat_desc.audio_target_codec.is_some() {
+        summary.audio_codec = stat_desc.audio_target_codec.clone();
+        summary.audio_sample_rate_hz = stat_desc
+            .audio_target_sample_rate_hz
+            .or_else(|| src_audio.and_then(|a| a.sample_rate_hz));
+        summary.audio_channels = stat_desc
+            .audio_target_channels
+            .or_else(|| src_audio.and_then(|a| a.channels));
+        summary.audio_bitrate_kbps = stat_desc.audio_target_bitrate_kbps;
     } else if let Some(ts) = transcode {
         // PCM transcode (no codec change) — describe the PCM output we know
         // about. The transcode block doesn't carry SR/channels, so fall back

@@ -292,6 +292,7 @@ pub fn register_ingress_stats(
             video_passthrough: !has_video_stage,
             audio_passthrough: !has_audio_stage,
             audio_only: false,
+            ..Default::default()
         },
     );
 }

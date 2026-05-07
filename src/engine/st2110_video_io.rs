@@ -165,6 +165,7 @@ fn register_ingress_video_encode_stats(
             video_passthrough: false,
             audio_passthrough: true,
             audio_only: false,
+            ..Default::default()
         },
     );
     handle

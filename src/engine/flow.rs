@@ -951,9 +951,16 @@ impl FlowRuntime {
                 videotoolbox_in_use: cost_plan.videotoolbox_sessions,
                 amf_in_use: cost_plan.amf_sessions,
                 vaapi_in_use: cost_plan.vaapi_sessions,
+                nvenc_in_use_4k: cost_plan.nvenc_sessions_4k,
+                qsv_in_use_4k: cost_plan.qsv_sessions_4k,
+                amf_in_use_4k: cost_plan.amf_sessions_4k,
+                vaapi_in_use_4k: cost_plan.vaapi_sessions_4k,
                 nvdec_in_use: cost_plan.nvdec_sessions,
                 qsv_decode_in_use: cost_plan.qsv_decode_sessions,
                 vaapi_decode_in_use: cost_plan.vaapi_decode_sessions,
+                nvdec_in_use_4k: cost_plan.nvdec_sessions_4k,
+                qsv_decode_in_use_4k: cost_plan.qsv_decode_sessions_4k,
+                vaapi_decode_in_use_4k: cost_plan.vaapi_decode_sessions_4k,
             },
         );
         let cost_units = std::sync::atomic::AtomicU32::new(cost_units);
@@ -1668,6 +1675,7 @@ impl FlowRuntime {
                         video_passthrough: false,
                         audio_passthrough: false,
                         audio_only: false,
+                        ..Default::default()
                     },
                 );
 
@@ -1769,10 +1777,25 @@ impl FlowRuntime {
                 .videotoolbox_in_use
                 .saturating_add(delta_usage.videotoolbox_in_use);
             g.amf_in_use = g.amf_in_use.saturating_add(delta_usage.amf_in_use);
+            g.vaapi_in_use = g.vaapi_in_use.saturating_add(delta_usage.vaapi_in_use);
+            g.nvenc_in_use_4k = g.nvenc_in_use_4k.saturating_add(delta_usage.nvenc_in_use_4k);
+            g.qsv_in_use_4k = g.qsv_in_use_4k.saturating_add(delta_usage.qsv_in_use_4k);
+            g.amf_in_use_4k = g.amf_in_use_4k.saturating_add(delta_usage.amf_in_use_4k);
+            g.vaapi_in_use_4k = g.vaapi_in_use_4k.saturating_add(delta_usage.vaapi_in_use_4k);
             g.nvdec_in_use = g.nvdec_in_use.saturating_add(delta_usage.nvdec_in_use);
             g.qsv_decode_in_use = g
                 .qsv_decode_in_use
                 .saturating_add(delta_usage.qsv_decode_in_use);
+            g.vaapi_decode_in_use = g
+                .vaapi_decode_in_use
+                .saturating_add(delta_usage.vaapi_decode_in_use);
+            g.nvdec_in_use_4k = g.nvdec_in_use_4k.saturating_add(delta_usage.nvdec_in_use_4k);
+            g.qsv_decode_in_use_4k = g
+                .qsv_decode_in_use_4k
+                .saturating_add(delta_usage.qsv_decode_in_use_4k);
+            g.vaapi_decode_in_use_4k = g
+                .vaapi_decode_in_use_4k
+                .saturating_add(delta_usage.vaapi_decode_in_use_4k);
         }
         if let Ok(mut m) = self.output_contributions.write() {
             m.insert(output_id.clone(), (delta_units, delta_usage));
@@ -1841,10 +1864,25 @@ impl FlowRuntime {
                         .videotoolbox_in_use
                         .saturating_sub(usage.videotoolbox_in_use);
                     g.amf_in_use = g.amf_in_use.saturating_sub(usage.amf_in_use);
+                    g.vaapi_in_use = g.vaapi_in_use.saturating_sub(usage.vaapi_in_use);
+                    g.nvenc_in_use_4k = g.nvenc_in_use_4k.saturating_sub(usage.nvenc_in_use_4k);
+                    g.qsv_in_use_4k = g.qsv_in_use_4k.saturating_sub(usage.qsv_in_use_4k);
+                    g.amf_in_use_4k = g.amf_in_use_4k.saturating_sub(usage.amf_in_use_4k);
+                    g.vaapi_in_use_4k = g.vaapi_in_use_4k.saturating_sub(usage.vaapi_in_use_4k);
                     g.nvdec_in_use = g.nvdec_in_use.saturating_sub(usage.nvdec_in_use);
                     g.qsv_decode_in_use = g
                         .qsv_decode_in_use
                         .saturating_sub(usage.qsv_decode_in_use);
+                    g.vaapi_decode_in_use = g
+                        .vaapi_decode_in_use
+                        .saturating_sub(usage.vaapi_decode_in_use);
+                    g.nvdec_in_use_4k = g.nvdec_in_use_4k.saturating_sub(usage.nvdec_in_use_4k);
+                    g.qsv_decode_in_use_4k = g
+                        .qsv_decode_in_use_4k
+                        .saturating_sub(usage.qsv_decode_in_use_4k);
+                    g.vaapi_decode_in_use_4k = g
+                        .vaapi_decode_in_use_4k
+                        .saturating_sub(usage.vaapi_decode_in_use_4k);
                 }
             }
             tracing::info!("Removed output '{}' from flow '{}'", output_id, self.config.config.id);
@@ -3526,12 +3564,25 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
             );
             if is_hw {
                 plan.hw_video_encode_units = plan.hw_video_encode_units.saturating_add(units);
+                // 4K-tier classification — matches the probe's
+                // `video_engine::PROBE_WIDTH_4K` (3840) /
+                // `PROBE_HEIGHT_4K` (2160). Sessions without an
+                // explicit resolution default to 1080p (probe
+                // baseline). VideoToolbox is intentionally excluded
+                // — macOS doesn't expose a 4K probe today.
+                let is_4k = w.map_or(false, |w| w >= 3840) || h.map_or(false, |h| h >= 2160);
                 match hw_family {
                     Some(crate::engine::hardware_probe::HwEncoderFamily::Nvenc) => {
                         plan.nvenc_sessions = plan.nvenc_sessions.saturating_add(1);
+                        if is_4k {
+                            plan.nvenc_sessions_4k = plan.nvenc_sessions_4k.saturating_add(1);
+                        }
                     }
                     Some(crate::engine::hardware_probe::HwEncoderFamily::Qsv) => {
                         plan.qsv_sessions = plan.qsv_sessions.saturating_add(1);
+                        if is_4k {
+                            plan.qsv_sessions_4k = plan.qsv_sessions_4k.saturating_add(1);
+                        }
                     }
                     Some(crate::engine::hardware_probe::HwEncoderFamily::VideoToolbox) => {
                         plan.videotoolbox_sessions =
@@ -3539,9 +3590,15 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
                     }
                     Some(crate::engine::hardware_probe::HwEncoderFamily::Amf) => {
                         plan.amf_sessions = plan.amf_sessions.saturating_add(1);
+                        if is_4k {
+                            plan.amf_sessions_4k = plan.amf_sessions_4k.saturating_add(1);
+                        }
                     }
                     Some(crate::engine::hardware_probe::HwEncoderFamily::Vaapi) => {
                         plan.vaapi_sessions = plan.vaapi_sessions.saturating_add(1);
+                        if is_4k {
+                            plan.vaapi_sessions_4k = plan.vaapi_sessions_4k.saturating_add(1);
+                        }
                     }
                     None => {} // is_hw + no family — defensive, unreachable today
                 }
@@ -3647,14 +3704,25 @@ fn output_resource_contribution(
         units = units.saturating_add(5);
     }
     if let Some(codec) = video {
+        // 4K-tier classification matches the probe's
+        // `video_engine::PROBE_WIDTH_4K` (3840) / `PROBE_HEIGHT_4K`
+        // (2160). Outputs without an explicit resolution stay 1080p.
+        let (w, h) = output_video_encode_dims(output);
+        let is_4k = w.map_or(false, |w| w >= 3840) || h.map_or(false, |h| h >= 2160);
         match crate::engine::hardware_probe::HwEncoderFamily::classify(codec) {
             Some(crate::engine::hardware_probe::HwEncoderFamily::Nvenc) => {
                 units = units.saturating_add(100);
                 usage.nvenc_in_use = usage.nvenc_in_use.saturating_add(1);
+                if is_4k {
+                    usage.nvenc_in_use_4k = usage.nvenc_in_use_4k.saturating_add(1);
+                }
             }
             Some(crate::engine::hardware_probe::HwEncoderFamily::Qsv) => {
                 units = units.saturating_add(100);
                 usage.qsv_in_use = usage.qsv_in_use.saturating_add(1);
+                if is_4k {
+                    usage.qsv_in_use_4k = usage.qsv_in_use_4k.saturating_add(1);
+                }
             }
             Some(crate::engine::hardware_probe::HwEncoderFamily::VideoToolbox) => {
                 units = units.saturating_add(100);
@@ -3663,10 +3731,16 @@ fn output_resource_contribution(
             Some(crate::engine::hardware_probe::HwEncoderFamily::Amf) => {
                 units = units.saturating_add(100);
                 usage.amf_in_use = usage.amf_in_use.saturating_add(1);
+                if is_4k {
+                    usage.amf_in_use_4k = usage.amf_in_use_4k.saturating_add(1);
+                }
             }
             Some(crate::engine::hardware_probe::HwEncoderFamily::Vaapi) => {
                 units = units.saturating_add(100);
                 usage.vaapi_in_use = usage.vaapi_in_use.saturating_add(1);
+                if is_4k {
+                    usage.vaapi_in_use_4k = usage.vaapi_in_use_4k.saturating_add(1);
+                }
             }
             None => {
                 units = units.saturating_add(500);
@@ -3715,6 +3789,29 @@ fn output_resource_contribution(
 /// that don't carry encode blocks (ST 2110 audio, bonded, etc.).
 /// The video-encode side reports just the codec string (HW vs SW
 /// classification is delegated to `is_hw_video_codec`).
+/// Pull the `(width, height)` from an output's `video_encode` block,
+/// when one exists. Used by `output_resource_contribution` to decide
+/// whether a session counts against the 4K tier.
+fn output_video_encode_dims(
+    output: &crate::config::models::OutputConfig,
+) -> (Option<u32>, Option<u32>) {
+    use crate::config::models::OutputConfig::*;
+    let ve = match output {
+        Rtp(c) => c.video_encode.as_ref(),
+        Udp(c) => c.video_encode.as_ref(),
+        Srt(c) => c.video_encode.as_ref(),
+        Rist(c) => c.video_encode.as_ref(),
+        Rtmp(c) => c.video_encode.as_ref(),
+        Cmaf(c) => c.video_encode.as_ref(),
+        Webrtc(c) => c.video_encode.as_ref(),
+        _ => None,
+    };
+    match ve {
+        Some(v) => (v.width, v.height),
+        None => (None, None),
+    }
+}
+
 fn output_encode_blocks(
     output: &crate::config::models::OutputConfig,
 ) -> (Option<&crate::config::models::AudioEncodeConfig>, Option<&str>) {

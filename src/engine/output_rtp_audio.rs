@@ -54,10 +54,11 @@ pub fn spawn_rtp_audio_output(
                 "rtp".to_string()
             },
         ),
-        video_passthrough: false,
+        video_passthrough: true,
         audio_passthrough: config.transcode.is_none()
             && !matches!(config.transport_mode.as_deref(), Some("audio_302m")),
         audio_only: true,
+        ..Default::default()
     });
 
     // Branch on transport_mode. The 302M path runs its own dedicated loop;

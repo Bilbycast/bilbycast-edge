@@ -26,9 +26,10 @@ pub fn spawn_st2110_40_output(
 
     output_stats.set_egress_static(crate::stats::collector::EgressMediaSummaryStatic {
         transport_mode: Some("st2110-40".to_string()),
-        video_passthrough: false,
-        audio_passthrough: false,
+        video_passthrough: true,
+        audio_passthrough: true,
         audio_only: false,
+        ..Default::default()
     });
 
     tokio::spawn(async move {

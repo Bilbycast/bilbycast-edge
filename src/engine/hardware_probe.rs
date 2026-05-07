@@ -1410,6 +1410,17 @@ pub struct FlowCostPlan {
     /// Intel). Tracked alongside the other families so the manager
     /// can render `vaapi_in_use / vaapi_max` chips.
     pub vaapi_sessions: u32,
+    /// 4K-tier subset of `*_sessions`. A flow output whose
+    /// `video_encode.{width,height}` resolves to ≥ 3840×2160 is
+    /// counted in **both** `*_sessions` (the total per family) and
+    /// `*_sessions_4k`. The manager UI treats each 4K session as
+    /// `floor(max_1080p / max_4k)` worth of 1080p capacity so the
+    /// 1080p denominator shrinks dynamically. Sessions without an
+    /// explicit resolution default to the 1080p tier.
+    pub nvenc_sessions_4k: u32,
+    pub qsv_sessions_4k: u32,
+    pub amf_sessions_4k: u32,
+    pub vaapi_sessions_4k: u32,
     /// Per-family decoder session counts charged by HW-decoded
     /// `display` outputs on this flow. NVDEC and QSV-decode are
     /// tracked separately even though QSV-decode shares an iGPU with
@@ -1420,6 +1431,15 @@ pub struct FlowCostPlan {
     /// VAAPI decoder sessions charged by HW-decoded `display` outputs
     /// resolved to VAAPI (Linux; AMD or Intel via libva).
     pub vaapi_decode_sessions: u32,
+    /// 4K-tier subset of decoder sessions. Display outputs don't
+    /// carry an explicit source resolution at plan time, so today
+    /// every HW-decoded display contributes to the 1080p tier and
+    /// these fields stay `0`. Reserved for future input-side HW
+    /// decode (RTSP/RTMP/SRT) where the negotiated resolution is
+    /// known up front.
+    pub nvdec_sessions_4k: u32,
+    pub qsv_decode_sessions_4k: u32,
+    pub vaapi_decode_sessions_4k: u32,
 }
 
 /// Per-family hardware encoder session counts in active use across
@@ -1437,6 +1457,20 @@ pub struct HwSessionUsage {
     /// Mesa radeonsi or Intel iHD via libva).
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub vaapi_in_use: u32,
+    /// 4K-tier subset of `*_in_use`. A 4K-resolution session is
+    /// counted in **both** `*_in_use` (the unconditional total) and
+    /// `*_in_use_4k`. Manager UI subtracts `*_in_use_4k *
+    /// floor(max_1080p / max_4k)` from the 1080p denominator so the
+    /// HD ceiling shrinks as 4K work runs. Older edges omit these
+    /// fields and serde defaults them to `0`.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub nvenc_in_use_4k: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub qsv_in_use_4k: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub amf_in_use_4k: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub vaapi_in_use_4k: u32,
     /// Active hardware-decoder sessions. Charged today only by
     /// HW-decoded `display` outputs (`hw_decode` resolved to NVDEC /
     /// QSV / VAAPI). When future input-side HW decode lands the same
@@ -1447,6 +1481,16 @@ pub struct HwSessionUsage {
     pub qsv_decode_in_use: u32,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub vaapi_decode_in_use: u32,
+    /// 4K-tier subset of decoder usage. Reserved for future
+    /// input-side HW decode that knows the source resolution at plan
+    /// time. Display outputs don't carry source resolution today, so
+    /// these stay `0` until that wiring lands.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub nvdec_in_use_4k: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub qsv_decode_in_use_4k: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub vaapi_decode_in_use_4k: u32,
 }
 
 fn is_zero_u32(v: &u32) -> bool {

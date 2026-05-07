@@ -41,6 +41,24 @@ use super::ts_parse::{
     ts_pusi, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
 
+/// PCR pre-roll behind PTS in 27 MHz ticks (80 ms × 27 000 000 / 1000).
+///
+/// ISO/IEC 13818-1 Annex L (T-STD model) requires PCR to arrive earlier
+/// than the corresponding frame's PTS by the decoder's transport-buffer
+/// + CPB pre-roll. Without this offset, professional decoders (Appear,
+/// Tektronix) refuse to lock under T-STD verification, and software
+/// decoders (VLC, ffplay) play a few buffered frames at startup and then
+/// stutter once their STC catches up to PTS.
+///
+/// 80 ms matches FFmpeg's mpegts muxer default for VBR contribution
+/// streams. It's the minimum pre-roll a well-behaved STD-compliant
+/// receiver needs to absorb network jitter + the encoder's CPB peak.
+/// Choosing a smaller window also limits the apparent A/V offset on
+/// receivers that don't apply T-STD scheduling to audio (a small set of
+/// software decoders that just play audio as it arrives) — for those,
+/// audio leads video by exactly this pre-roll.
+const PCR_PREROLL_27MHZ: u64 = 2_160_000;
+
 /// Lock-free runtime counters for the streaming TS video replacer.
 ///
 /// Each counter is incremented by the replacer hot path and read once per
@@ -60,6 +78,13 @@ pub struct VideoEncodeStats {
     pub last_latency_us: AtomicU64,
     /// Number of times the encoder supervisor restarted the backend.
     pub supervisor_restarts: AtomicU64,
+    /// Backend the encoder actually opened with after lazy-open. The
+    /// snapshot path prefers this over the requested-codec label
+    /// captured on the stats handle, so the manager-UI badge reflects
+    /// Auto-chain demotion (e.g. NVENC → x264 fallback). The encoder
+    /// pipeline is given a clone of this `Arc` via
+    /// [`crate::engine::video_encode_util::ScaledVideoEncoder::set_resolved_backend_sink`].
+    pub resolved_backend: Arc<crate::engine::video_encode_util::ResolvedBackendCell>,
 }
 
 // ─────────────────────────── Public surface ───────────────────────────
@@ -245,10 +270,24 @@ mod inner {
         /// PTS anchor in the encoder time base (1 / fps_num).
         out_frame_count: i64,
         /// 90 kHz PTS for the next emitted PES, anchored to the first
-        /// source PES PTS.
+        /// source PES PTS. Used as a fallback when the source-PTS queue
+        /// is empty (e.g. encoder catch-up bursts).
         pts_90k: u64,
         pts_anchored: bool,
         pts_step_90k: u64,
+        /// Source PES PTSes pending output, one entry per source decoded
+        /// frame fed into the encoder. Drained in FIFO order on each
+        /// emitted output frame, so output PES PTS values track source's
+        /// monotonic clock instead of the encoder's wall-time pipeline
+        /// delay. This is the matching half of the audio replacer's
+        /// `src_pts_queue` — together they keep output A/V in lock with
+        /// source A/V regardless of how lumpy the per-stream encoder
+        /// pipelines are. With `max_b_frames = 0` (default for the in-
+        /// process pipeline) encode order = display order, so a plain
+        /// FIFO queue gives the right pts. Once B-frame encoding is
+        /// wired in, this should become DTS-aware (push/pop by encoded
+        /// frame's `dts`-ordered position).
+        src_pts_queue: std::collections::VecDeque<u64>,
 
         /// Last input PES DTS, used to derive the natural source
         /// inter-frame delta in decode order. DTS stays monotonic
@@ -340,7 +379,7 @@ mod inner {
                 (Some(n), Some(d)) => (n, d),
                 _ => (30, 1),
             };
-            let pipeline = ScaledVideoEncoder::with_backend_chain(
+            let mut pipeline = ScaledVideoEncoder::with_backend_chain(
                 cfg.clone(),
                 backend_chain,
                 fps_num,
@@ -348,6 +387,7 @@ mod inner {
                 false,
                 "ts_video_replace",
             );
+            pipeline.set_resolved_backend_sink(stats.resolved_backend.clone());
 
             Ok(Self {
                 target_family,
@@ -367,6 +407,7 @@ mod inner {
                 pts_90k: 0,
                 pts_anchored: false,
                 pts_step_90k: 3000, // 30 fps default until we learn otherwise
+                src_pts_queue: std::collections::VecDeque::with_capacity(64),
                 last_input_dts: None,
                 source_fps_locked: cfg.fps_num.is_some() && cfg.fps_den.is_some(),
                 unlocked_pes_count: 0,
@@ -398,6 +439,7 @@ mod inner {
             // A/V stays in sync with the audio replacer (which will also
             // re-anchor on the audio-PID codec swap).
             self.pts_anchored = false;
+            self.src_pts_queue.clear();
             self.last_input_dts = None;
             self.source_fps_locked = self.fps_num.is_some() && self.fps_den.is_some();
             self.unlocked_pes_count = 0;
@@ -462,13 +504,18 @@ mod inner {
                             self.video_pid = Some(vpid);
                             self.source_stream_type = vst;
                         }
-                        // Only rewrite the PMT when the target codec family
-                        // differs from the source. Same-family transcodes
-                        // (e.g. H.264 → H.264 bitrate-drop) leave the PMT
-                        // untouched so receivers don't see a CRC flap.
-                        if self.video_pid.is_some()
-                            && self.source_stream_type != self.target_stream_type
-                        {
+                        // Always run the PMT rewrite once we know the video
+                        // PID — the rewrite enforces both the target
+                        // stream_type AND PCR_PID = video_pid. When the
+                        // source PMT already matches both, the byte-level
+                        // edit and CRC recompute produce an output PMT
+                        // identical to the input, so receivers see no
+                        // version flap. When either differs, the rewrite
+                        // is required (e.g. H.264 → HEVC needs the new
+                        // stream_type, and any source whose PMT pointed
+                        // PCR_PID at a separate dedicated PCR PID needs
+                        // PCR_PID re-pointed at the rebuilt video PID).
+                        if self.video_pid.is_some() {
                             let mut rewritten = pkt.to_vec();
                             rewrite_pmt_video_stream_type(
                                 &mut rewritten,
@@ -505,17 +552,24 @@ mod inner {
                         None => return,
                     };
                     for ef in frames {
-                        let pes = build_video_pes(&ef.data, self.pts_90k);
+                        let pts_for_pes = self
+                            .src_pts_queue
+                            .pop_front()
+                            .unwrap_or(self.pts_90k);
+                        let pes = build_video_pes(&ef.data, pts_for_pes);
+                        let pcr_27mhz = pts_for_pes
+                            .saturating_mul(300)
+                            .saturating_sub(PCR_PREROLL_27MHZ);
                         let pkts = packetize_ts(
                             vpid,
                             &pes,
                             &mut self.out_video_cc,
-                            Some(self.pts_90k.wrapping_mul(300)),
+                            Some(pcr_27mhz),
                         );
                         for p in &pkts {
                             output.extend_from_slice(p);
                         }
-                        self.pts_90k = self.pts_90k.wrapping_add(self.pts_step_90k);
+                        self.pts_90k = pts_for_pes.wrapping_add(self.pts_step_90k);
                     }
                 }
             }
@@ -656,7 +710,13 @@ mod inner {
             }
 
             if let Some(dec) = self.decoder.as_mut() {
-                if let Err(e) = dec.send_packet(&es_data) {
+                // Pass the source PES PTS (already in 90 kHz ticks) into
+                // libavcodec's reorder queue so each decoded frame echoes
+                // it back via `frame.pts()`. That lets the encoder-side
+                // queue tag every output PES with the matching source
+                // PTS instead of the sample-counted anchor — see the
+                // src_pts_queue field for the rationale.
+                if let Err(e) = dec.send_packet_with_pts(&es_data, pts as i64) {
                     // Partial/invalid packet — keep going.
                     tracing::debug!("ts_video_replace: send_packet: {e:?}");
                 }
@@ -711,6 +771,20 @@ mod inner {
                     Err(_) => break,
                 };
 
+                // Push the source PTS into the FIFO queue so the emit
+                // path can pop it for each output PES. The decoder
+                // propagates `pkt.pts → frame.pts` through its reorder
+                // window, so for B-frame source streams we get the
+                // display-order PTS automatically. Fall back to the
+                // sample-counted anchor when the decoder didn't have a
+                // PTS to attach (e.g. an early frame whose source PES
+                // had `pts_dts_flags = 0`).
+                let src_pts_for_frame = match frame.pts() {
+                    Some(p) if p >= 0 => p as u64,
+                    _ => self.pts_90k,
+                };
+                self.src_pts_queue.push_back(src_pts_for_frame);
+
                 // One-shot IDR request (forwarder signals on flow switch).
                 // Consume the flag here so the keyframe lands on the very
                 // first post-switch frame, not somewhere later in the GOP.
@@ -737,6 +811,12 @@ mod inner {
                         }
                         tracing::debug!("ts_video_replace: encode error: {e}");
                         self.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                        // Keep the queue balanced: we pushed one entry
+                        // for this decoded frame but the encoder won't
+                        // emit anything for it. Pop the entry now so
+                        // future emits stay in lock-step with the input
+                        // we actually fed through.
+                        let _ = self.src_pts_queue.pop_back();
                         continue;
                     }
                 };
@@ -744,17 +824,38 @@ mod inner {
 
                 let vpid = self.video_pid.unwrap();
                 for ef in encoded {
-                    let pes = build_video_pes(&ef.data, self.pts_90k);
+                    // Prefer source PTS from the queue; fall back to the
+                    // sample-counted anchor when the queue is exhausted
+                    // (encoder catch-up burst emitting more frames than
+                    // we've pushed inputs for since the last drain).
+                    let pts_for_pes = self
+                        .src_pts_queue
+                        .pop_front()
+                        .unwrap_or(self.pts_90k);
+                    let pes = build_video_pes(&ef.data, pts_for_pes);
+                    // PCR sits PCR_PREROLL_27MHZ behind PTS so the receiver's
+                    // T-STD buffer model has room. saturating_sub keeps the
+                    // arithmetic well-defined when the source's first PTS
+                    // is smaller than the pre-roll (test patterns starting
+                    // at 0); the decoder briefly sees PCR == PTS during
+                    // those few startup frames, then steady-state PCR <
+                    // PTS once `pts_for_pes` has advanced past the pre-roll.
+                    let pcr_27mhz = pts_for_pes
+                        .saturating_mul(300)
+                        .saturating_sub(PCR_PREROLL_27MHZ);
                     let pkts = packetize_ts(
                         vpid,
                         &pes,
                         &mut self.out_video_cc,
-                        Some(self.pts_90k.wrapping_mul(300)),
+                        Some(pcr_27mhz),
                     );
                     for p in &pkts {
                         output.extend_from_slice(p);
                     }
-                    self.pts_90k = self.pts_90k.wrapping_add(self.pts_step_90k);
+                    // Keep the fallback anchor monotonic from the latest
+                    // emitted PTS so a later queue-exhausted emit still
+                    // produces a sensible (non-decreasing) value.
+                    self.pts_90k = pts_for_pes.wrapping_add(self.pts_step_90k);
                     self.stats.output_frames.fetch_add(1, Ordering::Relaxed);
                 }
                 let lat = crate::util::time::now_us().saturating_sub(pes_arrived_us);
@@ -826,8 +927,15 @@ fn parse_pmt_video(pkt: &[u8]) -> Option<(u16, u8)> {
     None
 }
 
-/// Rewrite the video stream_type in a PMT TS packet in place and
-/// recompute the section CRC32.
+/// Rewrite the video stream_type in a PMT TS packet in place, force the
+/// PMT's `PCR_PID` to match the rebuilt video PID (where this module
+/// emits PCR fields), and recompute the section CRC32.
+///
+/// The PCR_PID field lives at section_start + 8..=9 (top 3 bits reserved,
+/// bottom 13 bits = PID). Without this rewrite, sources whose PMT pointed
+/// PCR_PID at a separate dedicated PCR PID would leave us emitting PCR
+/// on the video PID while the PMT advertises PCR somewhere else — a
+/// mismatch professional decoders treat as a TR 101 290 P1.6 violation.
 #[cfg(feature = "video-thumbnail")]
 fn rewrite_pmt_video_stream_type(pkt: &mut [u8], video_pid: u16, new_stream_type: u8) {
     let mut offset = 4;
@@ -848,6 +956,12 @@ fn rewrite_pmt_video_stream_type(pkt: &mut [u8], video_pid: u16, new_stream_type
     let section_start = offset;
     let section_length =
         (((pkt[offset + 1] & 0x0F) as usize) << 8) | (pkt[offset + 2] as usize);
+    // Force PCR_PID = video_pid. Top 3 bits remain reserved (set to 1
+    // per ISO 13818-1; the legacy 0xE0 value preserves whatever the
+    // source had in those reserved bits' position).
+    pkt[section_start + 8] =
+        (pkt[section_start + 8] & 0xE0) | (((video_pid >> 8) as u8) & 0x1F);
+    pkt[section_start + 9] = (video_pid & 0xFF) as u8;
     let program_info_length =
         (((pkt[offset + 10] & 0x0F) as usize) << 8) | (pkt[offset + 11] as usize);
     let data_start = offset + 12 + program_info_length;
@@ -904,7 +1018,12 @@ fn extract_pes_video(pes: &[u8]) -> Option<(Vec<u8>, u64, Option<u64>)> {
     Some((pes[es_start..].to_vec(), pts, dts))
 }
 
-/// Decode the 5-byte PTS in a PES optional header.
+/// Decode the 5-byte PTS / DTS in a PES optional header per ISO/IEC
+/// 13818-1 §2.4.3.7. The 33-bit value spans byte 0's bits 3-1
+/// (top 3 bits, bits 32-30), byte 1 (bits 29-22), byte 2 bits 7-1
+/// (bits 21-15), byte 3 (bits 14-7), byte 4 bits 7-1 (bits 6-0). Each
+/// of bytes 0, 2, 4 reserves bit 0 as a marker bit set to '1' on the
+/// wire — this parser ignores those marker bits and shifts past them.
 #[cfg(feature = "video-thumbnail")]
 fn parse_pts(data: &[u8]) -> u64 {
     let b0 = data[0] as u64;
@@ -914,30 +1033,72 @@ fn parse_pts(data: &[u8]) -> u64 {
     let b4 = data[4] as u64;
     ((b0 >> 1) & 0x07) << 30
         | (b1 << 22)
-        | ((b2 >> 1) << 15)
+        | ((b2 >> 1) & 0x7F) << 15
         | (b3 << 7)
-        | (b4 >> 1)
+        | ((b4 >> 1) & 0x7F)
 }
 
-/// Wrap an encoded video frame in a PES packet with a PTS header.
+/// Append a 5-byte PTS or DTS field to the PES being built, per
+/// ISO/IEC 13818-1 §2.4.3.7. `marker_top_nibble` is the top-nibble code
+/// for this timestamp role: `0x20` for "PTS only", `0x30` for "PTS w/
+/// DTS following", `0x10` for "DTS". `value_33bit` is the 33-bit
+/// timestamp at 90 kHz.
+///
+/// This implementation replaces an earlier in-line encoder that had
+/// off-by-one shift bugs in bytes 0 and 2 — pts bit 30 was silently
+/// dropped, pts bit 15 was silently dropped, and pts bits 31-32 / 16-22
+/// were shifted into the slots below them. Standard receivers (Appear,
+/// VLC, ffmpeg) decoded the resulting PES with garbled high-order bits
+/// once `value_33bit` exceeded 32 768 ticks (~ 364 ms at 90 kHz), which
+/// caused decoders to lose PTS lock after the first few frames.
+#[cfg(feature = "video-thumbnail")]
+fn write_pes_timestamp(pes: &mut Vec<u8>, marker_top_nibble: u8, value_33bit: u64) {
+    let v = value_33bit & 0x1_FFFF_FFFF;
+    // Byte 0: marker_top_nibble << 4 already includes bits 7-4. We
+    // OR in (v[32:30] << 1) at result bits 3-1, plus marker_bit at bit 0.
+    pes.push(marker_top_nibble | (((v >> 29) as u8) & 0x0E) | 0x01);
+    // Byte 1: v[29:22].
+    pes.push(((v >> 22) & 0xFF) as u8);
+    // Byte 2: v[21:15] in result bits 7-1, marker_bit at bit 0.
+    pes.push((((v >> 14) as u8) & 0xFE) | 0x01);
+    // Byte 3: v[14:7].
+    pes.push(((v >> 7) & 0xFF) as u8);
+    // Byte 4: v[6:0] in result bits 7-1, marker_bit at bit 0.
+    pes.push((((v << 1) as u8) & 0xFE) | 0x01);
+}
+
+/// Wrap an encoded video frame in a PES packet with PTS + DTS.
+///
 /// Video PES packets use stream_id 0xE0 and unbounded length (the
-/// 16-bit length field is zero for video).
+/// 16-bit length field is zero for video). Both PTS and DTS are emitted
+/// even when they are equal — broadcast hardware decoders (Appear and
+/// similar) strict-check the PTS_DTS_flags field and reject PES that
+/// only carry PTS (`flags = 0b10`) on a video PID. With `max_b_frames =
+/// 0` (the current default for the in-process encoder pipeline) DTS ==
+/// PTS; once B-frame encoding is wired in, the caller should pass the
+/// encoder's `EncodedVideoFrame::dts` here scaled to 90 kHz.
 #[cfg(feature = "video-thumbnail")]
 fn build_video_pes(video_data: &[u8], pts: u64) -> Vec<u8> {
-    let mut pes = Vec::with_capacity(14 + video_data.len());
+    build_video_pes_with_dts(video_data, pts, pts)
+}
+
+/// Same as [`build_video_pes`] but lets the caller pass an explicit DTS
+/// distinct from the PTS. Kept separate so the no-B-frame default path
+/// stays a one-argument call.
+#[cfg(feature = "video-thumbnail")]
+fn build_video_pes_with_dts(video_data: &[u8], pts: u64, dts: u64) -> Vec<u8> {
+    let mut pes = Vec::with_capacity(19 + video_data.len());
     pes.extend_from_slice(&[0x00, 0x00, 0x01]);
     pes.push(0xE0); // video stream_id
     pes.extend_from_slice(&[0, 0]); // unbounded length
     pes.push(0x80); // marker bits
-    pes.push(0x80); // PTS present, no DTS
-    pes.push(5);    // PES header data length
+    pes.push(0xC0); // PTS + DTS both present (PTS_DTS_flags = 0b11)
+    pes.push(10);   // PES header data length: 5 bytes PTS + 5 bytes DTS
 
     let pts = pts & 0x1_FFFF_FFFF;
-    pes.push(0x21 | (((pts >> 30) as u8) & 0x0E));
-    pes.push((pts >> 22) as u8);
-    pes.push(0x01 | (((pts >> 15) as u8) & 0xFE));
-    pes.push((pts >> 7) as u8);
-    pes.push(0x01 | (((pts as u8) & 0x7F) << 1));
+    write_pes_timestamp(&mut pes, 0x30, pts); // 0011 marker (PTS w/ DTS)
+    let dts = dts & 0x1_FFFF_FFFF;
+    write_pes_timestamp(&mut pes, 0x10, dts); // 0001 marker (DTS)
 
     pes.extend_from_slice(video_data);
     pes
@@ -1309,12 +1470,120 @@ mod tests {
     }
 
     #[test]
-    fn build_video_pes_has_stream_id_and_pts() {
+    fn build_video_pes_carries_pts_and_dts() {
+        // Every emitted PES must carry both PTS and DTS so strict
+        // hardware decoders (Appear / Tektronix) accept the stream.
         let pes = build_video_pes(&[0, 0, 0, 1], 0xABCD_EF12);
         assert_eq!(&pes[0..3], &[0x00, 0x00, 0x01]);
         assert_eq!(pes[3], 0xE0); // video stream_id
-        assert_eq!(pes[7], 0x80);
-        assert_eq!(pes[8], 5);
+        assert_eq!(pes[7], 0xC0); // PTS_DTS_flags = 0b11 (PTS + DTS)
+        assert_eq!(pes[8], 10);   // 5 bytes PTS + 5 bytes DTS
+        // PTS marker top nibble = 0011 (PTS w/ DTS following).
+        assert_eq!(pes[9] & 0xF0, 0x30);
+        // DTS marker top nibble = 0001.
+        assert_eq!(pes[14] & 0xF0, 0x10);
+        // Trailing ES bytes preserved verbatim.
         assert_eq!(&pes[pes.len() - 4..], &[0, 0, 0, 1]);
+    }
+
+    /// Round-trip the encoded PTS / DTS through the parser to catch any
+    /// bit-shuffling regressions in the marker bits.
+    #[test]
+    fn build_video_pes_pts_and_dts_round_trip() {
+        let pts: u64 = 0x0_1234_5678;
+        let dts: u64 = 0x0_1111_2222;
+        let pes = build_video_pes_with_dts(&[0xAA], pts, dts);
+        // PES optional header: marker(1) + flags(1) + hdr_len(1) = 3,
+        // then 5 bytes PTS at offset 9, 5 bytes DTS at offset 14.
+        let parsed_pts = parse_pts(&pes[9..14]);
+        let parsed_dts = parse_pts(&pes[14..19]);
+        assert_eq!(parsed_pts, pts);
+        assert_eq!(parsed_dts, dts);
+    }
+
+    /// PCR pre-roll: the PCR field on a PUSI start packet must be
+    /// strictly less than the PES PTS (in 27 MHz units) by
+    /// [`PCR_PREROLL_27MHZ`]. This is the bug that caused VLC and Appear
+    /// hardware decoders to play a few buffered frames at startup and
+    /// then stutter — without the pre-roll, every frame's PTS coincides
+    /// with the receiver's STC and the decoder pipeline has zero time
+    /// to dequeue + decode + render.
+    #[test]
+    fn packetize_ts_pcr_trails_pts_by_preroll() {
+        let pts_90k: u64 = 90_000; // 1 s into the source clock
+        let pcr_27mhz = pts_90k.saturating_mul(300).saturating_sub(PCR_PREROLL_27MHZ);
+        // PCR trails PTS by exactly PCR_PREROLL_27MHZ ticks (80 ms × 27 MHz).
+        assert_eq!(pcr_27mhz, 90_000 * 300 - PCR_PREROLL_27MHZ);
+        assert!(pcr_27mhz < pts_90k * 300);
+        assert_eq!(pts_90k * 300 - pcr_27mhz, PCR_PREROLL_27MHZ);
+
+        // Mux a tiny PES with that PCR and verify the PCR field readback.
+        let pes = build_video_pes(&[0, 0, 0, 1, 0x09, 0x10], pts_90k);
+        let mut cc = 0u8;
+        let pkts = packetize_ts(0x100, &pes, &mut cc, Some(pcr_27mhz));
+        assert!(!pkts.is_empty());
+        let first = &pkts[0];
+        // PUSI bit set on first packet.
+        assert_eq!(first[1] & 0x40, 0x40);
+        // Adaptation+payload (AFC = 0b11).
+        assert_eq!(first[3] & 0x30, 0x30);
+        // af_length >= 7 (1 byte flags + 6 byte PCR).
+        assert!(first[4] >= 7);
+        // PCR_flag bit set.
+        assert_eq!(first[5] & 0x10, 0x10);
+
+        // Decode the 6-byte PCR field and confirm round-trip equality.
+        let base = ((first[6] as u64) << 25)
+            | ((first[7] as u64) << 17)
+            | ((first[8] as u64) << 9)
+            | ((first[9] as u64) << 1)
+            | (((first[10] >> 7) as u64) & 0x01);
+        let ext = (((first[10] as u64) & 0x01) << 8) | (first[11] as u64);
+        let read_pcr_27mhz = base * 300 + ext;
+        assert_eq!(read_pcr_27mhz, pcr_27mhz);
+    }
+
+    /// PMT rewrite must force PCR_PID to the rebuilt video PID — even
+    /// when the source's PMT pointed PCR_PID at a separate dedicated
+    /// PCR PID. Without this the rebuilt stream emits PCR on the video
+    /// PID while the PMT advertises it elsewhere, which professional
+    /// decoders flag as a TR 101 290 P1.6 violation and refuse to lock.
+    #[test]
+    fn pmt_rewrite_forces_pcr_pid_to_video_pid() {
+        // Synth a PMT whose PCR_PID is 0x1234 (some made-up dedicated
+        // PCR PID), with one video ES at PID 0x0100, stream_type 0x1B.
+        let mut pkt = synth_pmt(0x1000, 0x0100, 0x1B);
+        // Override PCR_PID in the synth packet (section_start = 5,
+        // PCR_PID = section_start + 8..=9).
+        pkt[5 + 8] = 0xE0 | ((0x1234u16 >> 8) as u8 & 0x1F);
+        pkt[5 + 9] = 0x1234u16 as u8;
+        // Recompute CRC after the manual edit.
+        let section_length = (((pkt[5 + 1] & 0x0F) as usize) << 8) | (pkt[5 + 2] as usize);
+        let crc_offset = 5 + 3 + section_length - 4;
+        let new_crc = mpeg2_crc32(&pkt[5..crc_offset]);
+        pkt[crc_offset] = (new_crc >> 24) as u8;
+        pkt[crc_offset + 1] = (new_crc >> 16) as u8;
+        pkt[crc_offset + 2] = (new_crc >> 8) as u8;
+        pkt[crc_offset + 3] = new_crc as u8;
+        // Sanity: confirm the synth setup before exercising the rewrite.
+        let pcr_pid_before = ((pkt[5 + 8] as u16 & 0x1F) << 8) | pkt[5 + 9] as u16;
+        assert_eq!(pcr_pid_before, 0x1234);
+
+        // Run the rewrite. Target stream_type matches source (0x1B) so
+        // only the PCR_PID change drives the edit.
+        rewrite_pmt_video_stream_type(&mut pkt, 0x0100, 0x1B);
+
+        let pcr_pid_after = ((pkt[5 + 8] as u16 & 0x1F) << 8) | pkt[5 + 9] as u16;
+        assert_eq!(pcr_pid_after, 0x0100, "PCR_PID must be re-pointed at video PID");
+
+        // CRC must still validate after the rewrite.
+        let new_section_length = (((pkt[5 + 1] & 0x0F) as usize) << 8) | (pkt[5 + 2] as usize);
+        let new_crc_offset = 5 + 3 + new_section_length - 4;
+        let computed = mpeg2_crc32(&pkt[5..new_crc_offset]);
+        let stored = ((pkt[new_crc_offset] as u32) << 24)
+            | ((pkt[new_crc_offset + 1] as u32) << 16)
+            | ((pkt[new_crc_offset + 2] as u32) << 8)
+            | (pkt[new_crc_offset + 3] as u32);
+        assert_eq!(computed, stored, "CRC must validate after rewrite");
     }
 }

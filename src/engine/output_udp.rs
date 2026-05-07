@@ -59,7 +59,7 @@ pub fn spawn_udp_output(
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
 
-    output_stats.set_egress_static(crate::stats::collector::EgressMediaSummaryStatic {
+    let mut egress_static = crate::stats::collector::EgressMediaSummaryStatic {
         transport_mode: Some(
             if matches!(config.transport_mode.as_deref(), Some("audio_302m")) {
                 "audio_302m".to_string()
@@ -71,7 +71,15 @@ pub fn spawn_udp_output(
         audio_passthrough: config.audio_encode.is_none()
             && !matches!(config.transport_mode.as_deref(), Some("audio_302m")),
         audio_only: matches!(config.transport_mode.as_deref(), Some("audio_302m")),
-    });
+        ..Default::default()
+    };
+    if let Some(ve) = config.video_encode.as_ref() {
+        egress_static = egress_static.with_video_encode_target(ve);
+    }
+    if let Some(ae) = config.audio_encode.as_ref() {
+        egress_static = egress_static.with_audio_encode_target(ae);
+    }
+    output_stats.set_egress_static(egress_static);
 
     tokio::spawn(async move {
         if matches!(config.transport_mode.as_deref(), Some("audio_302m")) {

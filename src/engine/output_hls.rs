@@ -57,12 +57,17 @@ pub fn spawn_hls_output(
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
 
-    output_stats.set_egress_static(crate::stats::collector::EgressMediaSummaryStatic {
+    let mut egress_static = crate::stats::collector::EgressMediaSummaryStatic {
         transport_mode: Some("hls".to_string()),
         video_passthrough: true,
         audio_passthrough: config.audio_encode.is_none(),
         audio_only: false,
-    });
+        ..Default::default()
+    };
+    if let Some(ae) = config.audio_encode.as_ref() {
+        egress_static = egress_static.with_audio_encode_target(ae);
+    }
+    output_stats.set_egress_static(egress_static);
 
     tokio::spawn(async move {
         if let Err(e) = hls_output_loop(&config, &mut rx, output_stats, cancel, &event_sender, &flow_id).await {

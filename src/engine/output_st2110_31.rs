@@ -34,6 +34,7 @@ pub fn spawn_st2110_31_output(
         video_passthrough: false,
         audio_passthrough: config.transcode.is_none(),
         audio_only: true,
+        ..Default::default()
     });
 
     tokio::spawn(async move {

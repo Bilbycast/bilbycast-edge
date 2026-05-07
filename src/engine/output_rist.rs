@@ -57,12 +57,20 @@ pub fn spawn_rist_output(
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
 
-    output_stats.set_egress_static(crate::stats::collector::EgressMediaSummaryStatic {
+    let mut egress_static = crate::stats::collector::EgressMediaSummaryStatic {
         transport_mode: Some("ts".to_string()),
         video_passthrough: config.video_encode.is_none(),
         audio_passthrough: config.audio_encode.is_none(),
         audio_only: false,
-    });
+        ..Default::default()
+    };
+    if let Some(ve) = config.video_encode.as_ref() {
+        egress_static = egress_static.with_video_encode_target(ve);
+    }
+    if let Some(ae) = config.audio_encode.as_ref() {
+        egress_static = egress_static.with_audio_encode_target(ae);
+    }
+    output_stats.set_egress_static(egress_static);
 
     tokio::spawn(async move {
         if let Err(e) = rist_output_loop(
