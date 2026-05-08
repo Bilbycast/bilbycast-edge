@@ -29,7 +29,7 @@ jobs:
     name: cargo audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       # Pinned to the post-v2.0.0 commit that migrated from Node.js 20
       # (deprecated, removed from the runner in Sep 2026) to Node.js 24.
       # Upstream hasn't tagged a release since — bump to the next tag
@@ -57,37 +57,37 @@ jobs:
       # then point cargo-deny at ./bilbycast-edge/Cargo.toml so the
       # relative `..` references resolve correctly.
       - name: Checkout bilbycast-libsrt-rs (path dependency)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           repository: Bilbycast/bilbycast-libsrt-rs
           path: bilbycast-libsrt-rs
 
       - name: Checkout bilbycast-fdk-aac-rs (path dependency)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           repository: Bilbycast/bilbycast-fdk-aac-rs
           path: bilbycast-fdk-aac-rs
 
       - name: Checkout bilbycast-ffmpeg-video-rs (path dependency)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           repository: Bilbycast/bilbycast-ffmpeg-video-rs
           path: bilbycast-ffmpeg-video-rs
 
       - name: Checkout bilbycast-rist (path dependency)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           repository: Bilbycast/bilbycast-rist
           path: bilbycast-rist
 
       - name: Checkout bilbycast-bonding (path dependency)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           repository: Bilbycast/bilbycast-bonding
           path: bilbycast-bonding
 
       - name: Checkout bilbycast-edge
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           path: bilbycast-edge
 
