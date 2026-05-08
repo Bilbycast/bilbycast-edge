@@ -336,6 +336,22 @@ mod inner {
         /// from `src_pts_queue`, so A/V offset versus source is
         /// preserved. Phase 4 of the sync-mux work.
         pub av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+
+        /// Encoder's declared output bitrate in bps (== `cfg.bitrate_kbps
+        /// × 1000`, or 0 when the operator left it unset). Drives the
+        /// byte-cadence PCR injector — when non-zero, [`PcrInjector`]
+        /// emits PCR-only TS packets at ~30 ms wallclock intervals so
+        /// receivers see uniform PCR cadence regardless of frame-size
+        /// variance under CBR + VBV. When zero, the legacy PES-tied
+        /// PCR path is used unchanged.
+        declared_bitrate_bps: u64,
+
+        /// Lazy-built byte-cadence PCR injector. Created on the first
+        /// emit after `video_pid` is known. `None` while the replacer
+        /// is in legacy mode (`declared_bitrate_bps == 0`) or after a
+        /// flow switch (re-built on the next emit so the new video PID
+        /// + fresh anchor land cleanly).
+        pcr_injector: Option<PcrInjector>,
     }
 
     impl Inner {
@@ -438,6 +454,11 @@ mod inner {
                 force_idr,
                 hw_decode_pref: cfg.hw_decode.unwrap_or_default(),
                 av_sync_pacer: None,
+                declared_bitrate_bps: cfg
+                    .bitrate_kbps
+                    .map(|k| (k as u64).saturating_mul(1000))
+                    .unwrap_or(0),
+                pcr_injector: None,
             })
         }
 
@@ -466,6 +487,12 @@ mod inner {
             self.last_input_dts = None;
             self.source_fps_locked = self.fps_num.is_some() && self.fps_den.is_some();
             self.unlocked_pes_count = 0;
+            // Drop the byte-cadence PCR injector so the next emit lazy-
+            // builds it against the new video PID + a fresh PTS anchor.
+            // Without this the running PCR clock would carry over a stale
+            // value across the switch — receivers would see a PCR
+            // discontinuity without the discontinuity_indicator flag.
+            self.pcr_injector = None;
             // First post-switch encoded frame must be an IDR so receivers
             // get a clean entry point right at the switch boundary.
             self.force_idr.store(true, Ordering::Relaxed);
@@ -589,15 +616,15 @@ mod inner {
                             self.av_sync_pacer.as_ref(),
                             pts_for_pes,
                         );
-                        let pkts = packetize_ts(
+                        emit_video_pes_with_pcr(
                             vpid,
                             &pes,
+                            pcr_27mhz,
+                            self.declared_bitrate_bps,
                             &mut self.out_video_cc,
-                            Some(pcr_27mhz),
+                            &mut self.pcr_injector,
+                            output,
                         );
-                        for p in &pkts {
-                            output.extend_from_slice(p);
-                        }
                         self.pts_90k = pts_for_pes.wrapping_add(self.pts_step_90k);
                     }
                 }
@@ -874,15 +901,15 @@ mod inner {
                         self.av_sync_pacer.as_ref(),
                         pts_for_pes,
                     );
-                    let pkts = packetize_ts(
+                    emit_video_pes_with_pcr(
                         vpid,
                         &pes,
+                        pcr_27mhz,
+                        self.declared_bitrate_bps,
                         &mut self.out_video_cc,
-                        Some(pcr_27mhz),
+                        &mut self.pcr_injector,
+                        output,
                     );
-                    for p in &pkts {
-                        output.extend_from_slice(p);
-                    }
                     // Keep the fallback anchor monotonic from the latest
                     // emitted PTS so a later queue-exhausted emit still
                     // produces a sensible (non-decreasing) value.
@@ -1150,6 +1177,237 @@ fn write_pcr_field(buf: &mut [u8; 6], pcr_27mhz: u64) {
     buf[3] = ((base >> 1) & 0xFF) as u8;
     buf[4] = (((base & 1) << 7) as u8) | 0x7E | (((ext >> 8) & 0x01) as u8);
     buf[5] = (ext & 0xFF) as u8;
+}
+
+/// 30 ms target cadence — comfortably below the 100 ms ETR 290 P1.5
+/// PCR_max_interval ceiling, and matches FFmpeg's mpegts muxer
+/// `pcr_period_ms` default.
+#[cfg(feature = "video-thumbnail")]
+const PCR_INJECT_PERIOD_MS: u64 = 30;
+
+/// 27 MHz PCR-space modulus (33-bit base × 300).
+#[cfg(feature = "video-thumbnail")]
+const PCR_MODULUS_27MHZ: u64 = (1u64 << 33) * 300;
+
+/// Byte-cadence PCR injector. When the encoder's `bitrate_kbps` is
+/// known, the replacer drops the legacy "PCR on every PUSI" pattern
+/// and instead emits PCR-only TS packets at uniform byte intervals
+/// targeting [`PCR_INJECT_PERIOD_MS`] wallclock cadence at the declared
+/// bitrate.
+///
+/// **Why this matters.** Under CBR + VBV the encoder hands us frames
+/// whose sizes vary 5–15× (I ≈ 60 KB, P ≈ 8 KB, B ≈ 4 KB at 1080p).
+/// The legacy path placed one PCR per PES on the PUSI start packet,
+/// so PCR *value* spacing was uniform (frame interval) but PCR *byte*
+/// spacing was the frame size. At the wire, `Δwall = Δbyte /
+/// declared_bitrate` decouples from `Δpcr_value` — `tsp pcrverify`
+/// fired on every PCR (`0 PCR OK / 197 jitter > 100 µs` on captured
+/// h264_qsv 1080p CBR). Decoupling cadence from frame size fixes the
+/// bitstream — uniform byte-spacing means uniform wall-clock spacing
+/// on a wire paced at `declared_bitrate_bps`.
+///
+/// The injector is anchored on its first emit (to the PTS-derived PCR
+/// of the PES it was first asked to wrap), then free-runs by byte
+/// progression. Drift accumulates only when the actual encoder rate
+/// diverges from `declared_bitrate_bps` — bounded by the receiver's
+/// PLL pull-in range (≤ ±200 ppm) for any sane CBR encoder output.
+#[cfg(feature = "video-thumbnail")]
+pub(crate) struct PcrInjector {
+    pcr_pid: u16,
+    declared_bitrate_bps: u64,
+    target_interval_bytes: u64,
+    bytes_since_last_pcr: u64,
+    pcr_anchor_27mhz: u64,
+    initialized: bool,
+}
+
+#[cfg(feature = "video-thumbnail")]
+impl PcrInjector {
+    pub(crate) fn new(pcr_pid: u16, declared_bitrate_bps: u64) -> Self {
+        // bytes per PCR_INJECT_PERIOD_MS at the declared bitrate.
+        // Floor of 188 — sub-packet intervals make no sense.
+        let target_interval_bytes = ((declared_bitrate_bps
+            .saturating_mul(PCR_INJECT_PERIOD_MS))
+            / 8000)
+            .max(188);
+        Self {
+            pcr_pid,
+            declared_bitrate_bps,
+            target_interval_bytes,
+            bytes_since_last_pcr: 0,
+            pcr_anchor_27mhz: 0,
+            initialized: false,
+        }
+    }
+
+    /// Stream a batch of video-PID TS packets through the injector,
+    /// interleaving PCR-only packets at the target byte cadence.
+    ///
+    /// **CC ownership.** The caller-supplied `cc` is the running counter
+    /// for `pcr_pid`; the injector owns all CC assignment for both the
+    /// pass-through video packets and the PCR-only packets it emits, so
+    /// PCRs interleaved into the middle of a PES still produce a
+    /// strictly-monotonic CC walk on the receiver. Callers must build
+    /// `packets` with a *throwaway* CC (the injector overwrites byte 3's
+    /// low nibble unconditionally).
+    ///
+    /// `anchor_pcr_27mhz` is consulted only on the very first call (to
+    /// seed the running clock). Subsequent calls free-run the PCR anchor
+    /// by byte progression so the wallclock-pacing math matches exactly:
+    /// `Δpcr_value = Δbytes × 8 × 27e6 / declared_bitrate_bps`.
+    pub(crate) fn emit(
+        &mut self,
+        packets: &[[u8; TS_PACKET_SIZE]],
+        cc: &mut u8,
+        anchor_pcr_27mhz: u64,
+        output: &mut Vec<u8>,
+    ) {
+        tracing::trace!(
+            "PcrInjector::emit pkts={} cc_in={:x} init={} bytes_acc={}",
+            packets.len(),
+            *cc,
+            self.initialized,
+            self.bytes_since_last_pcr,
+        );
+        // Helper: emit a PCR-only packet without incrementing the
+        // running CC counter. Per ISO/IEC 13818-1 §2.4.3.3 + ETSI
+        // TR 101 290 P1.4, AFC=10 packets MUST carry the same cc as
+        // the most recent payload packet on this PID — receivers
+        // detect any deviation as a continuity_count_error. We track
+        // `cc` as the *next-pending* cc for payload packets, so the
+        // prior payload packet's cc is `(*cc − 1) & 0x0F`. For the
+        // very first packet of the stream (before any payload has
+        // been emitted) `prior_cc` is 15 — fine because receivers
+        // can't validate the very first cc against a prior packet.
+        let emit_pcr_only =
+            |cc: &u8, pcr_pid: u16, pcr_27mhz: u64, output: &mut Vec<u8>| {
+                let prior_cc = (cc.wrapping_sub(1)) & 0x0F;
+                let pcr_pkt =
+                    build_pcr_only_ts_packet(pcr_pid, prior_cc, pcr_27mhz);
+                output.extend_from_slice(&pcr_pkt);
+            };
+
+        if !self.initialized {
+            self.pcr_anchor_27mhz = anchor_pcr_27mhz % PCR_MODULUS_27MHZ;
+            self.initialized = true;
+            // Emit the anchor PCR immediately — receivers need a clock
+            // seed before any video bytes flow, otherwise VLC / Appear
+            // hang for the full 30 ms gap on a fresh stream / flow
+            // switch. The seed packet carries the PTS-derived anchor
+            // value (no advance applied), so the receiver's STC starts
+            // at the same value the legacy path would have set.
+            emit_pcr_only(cc, self.pcr_pid, self.pcr_anchor_27mhz, output);
+            self.bytes_since_last_pcr = 0;
+        }
+
+        for pkt in packets {
+            if self.bytes_since_last_pcr >= self.target_interval_bytes {
+                let pcr = self.advance_pcr();
+                emit_pcr_only(cc, self.pcr_pid, pcr, output);
+            }
+            // Stamp the running CC into the video packet's byte 3 low
+            // nibble. packetize_ts left a placeholder there because we
+            // call it with a local CC counter — see
+            // `emit_video_pes_with_pcr`. Increment `cc` AFTER stamping
+            // (this is the only place CC actually advances; PCR-only
+            // emits leave it alone).
+            let mut stamped = *pkt;
+            stamped[3] = (stamped[3] & 0xF0) | (*cc & 0x0F);
+            *cc = (*cc + 1) & 0x0F;
+            output.extend_from_slice(&stamped);
+            self.bytes_since_last_pcr = self
+                .bytes_since_last_pcr
+                .saturating_add(TS_PACKET_SIZE as u64);
+        }
+    }
+
+    fn advance_pcr(&mut self) -> u64 {
+        // bytes × 8 × 27_000_000 / bitrate_bps. The intermediate
+        // product can't overflow u64 in practice — at 1 Mbps the
+        // 8 × 27 MHz × bytes term saturates u64 at ~85 GB of input,
+        // far beyond any reasonable injector lifetime.
+        let advance = self
+            .bytes_since_last_pcr
+            .saturating_mul(8 * 27_000_000)
+            / self.declared_bitrate_bps.max(1);
+        self.pcr_anchor_27mhz =
+            (self.pcr_anchor_27mhz + advance) % PCR_MODULUS_27MHZ;
+        self.bytes_since_last_pcr = 0;
+        self.pcr_anchor_27mhz
+    }
+}
+
+/// Build a single 188-byte TS packet carrying only an adaptation field
+/// with a PCR (no PES payload).
+///
+/// Wire layout per ISO/IEC 13818-1 §2.4.3:
+/// - byte 0: sync_byte (0x47)
+/// - byte 1: tei=0, pusi=0, prio=0, pid_high(5)
+/// - byte 2: pid_low(8)
+/// - byte 3: tsc=00, afc=10 (adaptation only), cc(4)
+/// - byte 4: adaptation_field_length = 183
+/// - byte 5: af_flags = 0x10 (PCR_flag set)
+/// - bytes 6..12: 6-byte PCR field
+/// - bytes 12..188: 176 bytes of 0xFF stuffing
+#[cfg(feature = "video-thumbnail")]
+pub(crate) fn build_pcr_only_ts_packet(
+    pid: u16,
+    cc: u8,
+    pcr_27mhz: u64,
+) -> [u8; TS_PACKET_SIZE] {
+    let mut pkt = [0xFFu8; TS_PACKET_SIZE];
+    pkt[0] = TS_SYNC_BYTE;
+    pkt[1] = ((pid >> 8) as u8) & 0x1F;
+    pkt[2] = pid as u8;
+    pkt[3] = 0x20 | (cc & 0x0F);
+    pkt[4] = 183;
+    pkt[5] = 0x10;
+    let mut pcr_buf = [0u8; 6];
+    write_pcr_field(&mut pcr_buf, pcr_27mhz);
+    pkt[6..12].copy_from_slice(&pcr_buf);
+    // bytes 12..188 already 0xFF from the array initializer.
+    pkt
+}
+
+/// Emit one encoded video PES as TS, switching between the legacy
+/// "PCR on PUSI start" path and the byte-cadence injector based on
+/// whether the operator supplied a `bitrate_kbps`.
+///
+/// When `declared_bitrate_bps == 0` (no hint), packetize the PES with
+/// PCR on the PUSI start packet — preserves the old contract for any
+/// caller that doesn't drive a CBR encoder. Otherwise drop the per-PES
+/// PCR and let [`PcrInjector`] interleave PCR-only packets at byte
+/// intervals — uniform PCR cadence at the wire, independent of
+/// frame-size variance.
+#[cfg(feature = "video-thumbnail")]
+pub(crate) fn emit_video_pes_with_pcr(
+    pid: u16,
+    pes: &[u8],
+    pcr_27mhz: u64,
+    declared_bitrate_bps: u64,
+    cc: &mut u8,
+    injector: &mut Option<PcrInjector>,
+    output: &mut Vec<u8>,
+) {
+    if declared_bitrate_bps == 0 {
+        let pkts = packetize_ts(pid, pes, cc, Some(pcr_27mhz));
+        for p in &pkts {
+            output.extend_from_slice(p);
+        }
+        return;
+    }
+    let inj = injector
+        .get_or_insert_with(|| PcrInjector::new(pid, declared_bitrate_bps));
+    // Pack the PES with a *throwaway* CC counter — `PcrInjector::emit`
+    // re-stamps byte 3's low nibble against the running outer counter
+    // so PCR-only packets interleaved mid-PES end up with sequential
+    // CCs in stream order. Without the throwaway, packetize_ts would
+    // consume the outer counter ahead of the injector and the inserted
+    // PCR packets would carry "future" CC values, producing a
+    // TR 101 290 P1.3 fault at the receiver.
+    let mut throwaway_cc = 0u8;
+    let pkts = packetize_ts(pid, pes, &mut throwaway_cc, None);
+    inj.emit(&pkts, cc, pcr_27mhz, output);
 }
 
 /// Pack a PES into 188-byte TS packets on `pid`. When `pcr_27mhz` is `Some`,
@@ -1616,5 +1874,338 @@ mod tests {
             | ((pkt[new_crc_offset + 2] as u32) << 8)
             | (pkt[new_crc_offset + 3] as u32);
         assert_eq!(computed, stored, "CRC must validate after rewrite");
+    }
+
+    // ─── PCR injection (byte-cadence) ───────────────────────────────────
+
+    /// Decode a 6-byte PCR field starting at `buf[0]`, returning the
+    /// 42-bit value in 27 MHz ticks.
+    fn read_pcr_27mhz(buf: &[u8]) -> u64 {
+        let base = ((buf[0] as u64) << 25)
+            | ((buf[1] as u64) << 17)
+            | ((buf[2] as u64) << 9)
+            | ((buf[3] as u64) << 1)
+            | (((buf[4] >> 7) as u64) & 0x01);
+        let ext = (((buf[4] as u64) & 0x01) << 8) | (buf[5] as u64);
+        base * 300 + ext
+    }
+
+    /// Walk an output buffer and return the byte offsets at which a
+    /// PCR-bearing packet on `target_pid` lands, paired with the
+    /// 27 MHz PCR value that packet carries. Used by the cadence test
+    /// to assert byte progression matches PCR progression at the
+    /// declared bitrate.
+    fn collect_pcr_samples(out: &[u8], target_pid: u16) -> Vec<(usize, u64)> {
+        let mut samples = Vec::new();
+        let mut off = 0;
+        while off + TS_PACKET_SIZE <= out.len() {
+            let pkt = &out[off..off + TS_PACKET_SIZE];
+            if pkt[0] != TS_SYNC_BYTE {
+                off += TS_PACKET_SIZE;
+                continue;
+            }
+            let pid = (((pkt[1] as u16) & 0x1F) << 8) | (pkt[2] as u16);
+            let afc = (pkt[3] >> 4) & 0x03;
+            let has_af = afc == 0b10 || afc == 0b11;
+            if pid == target_pid && has_af && pkt[4] >= 7 && (pkt[5] & 0x10) != 0 {
+                let pcr = read_pcr_27mhz(&pkt[6..12]);
+                samples.push((off, pcr));
+            }
+            off += TS_PACKET_SIZE;
+        }
+        samples
+    }
+
+    /// Per-PID continuity counter walk. Returns `(afc, cc)` pairs in
+    /// stream order so the test can apply the ETSI TR 101 290 P1.4
+    /// rule: AFC=01/11 packets must have cc = (prior_cc + 1) % 16;
+    /// AFC=00/10 packets must have cc == prior_cc.
+    fn collect_cc(out: &[u8], target_pid: u16) -> Vec<(u8, u8)> {
+        let mut entries = Vec::new();
+        let mut off = 0;
+        while off + TS_PACKET_SIZE <= out.len() {
+            let pkt = &out[off..off + TS_PACKET_SIZE];
+            if pkt[0] == TS_SYNC_BYTE {
+                let pid = (((pkt[1] as u16) & 0x1F) << 8) | (pkt[2] as u16);
+                if pid == target_pid {
+                    let afc = (pkt[3] >> 4) & 0x03;
+                    entries.push((afc, pkt[3] & 0x0F));
+                }
+            }
+            off += TS_PACKET_SIZE;
+        }
+        entries
+    }
+
+    /// Build a representative PES blob of `frame_bytes` synthetic ES
+    /// data wrapped with PTS (and DTS == PTS). Mirrors the size shape
+    /// of a real CBR + VBV encoder run where I-frames are large and
+    /// B-frames small.
+    fn synth_pes(pts_90k: u64, frame_bytes: usize) -> Vec<u8> {
+        let mut es = Vec::with_capacity(frame_bytes);
+        // NAL-unit-ish prefix so the bytes look plausible to a debugger.
+        es.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x65]);
+        es.resize(frame_bytes, 0xAA);
+        build_video_pes(&es, pts_90k)
+    }
+
+    /// Test 1 — uniform PCR cadence. Feed N PES of varying sizes
+    /// (mimicking I/P/B frame pattern) through `emit_video_pes_with_pcr`
+    /// at a declared 6 Mbps. Every consecutive PCR pair satisfies
+    /// `|Δpcr − Δbyte × 8 × 27e6 / 6e6| < 1 ms`. This is the headline
+    /// fix — under the legacy "PCR on every PUSI" path the same input
+    /// produced PCR jitter > 100 ms because byte spacing tracked frame
+    /// size not wall time.
+    #[test]
+    fn pcr_injector_cadence_matches_declared_bitrate() {
+        const VPID: u16 = 0x100;
+        const BITRATE_BPS: u64 = 6_000_000;
+        let mut cc = 0u8;
+        let mut injector: Option<PcrInjector> = None;
+        let mut out = Vec::new();
+
+        // Mimic 90 frames of CBR + VBV output: I (60 KB), 11×P (8 KB),
+        // 2×B (4 KB) repeating GoP. At 30 fps and 6 Mbps the average
+        // frame is 25 KB, this distribution lands close.
+        let frame_sizes: [usize; 14] = [
+            60_000, // I
+            8_000, 4_000, 4_000, 8_000, 4_000, 4_000, 8_000, 4_000, 4_000, 8_000, 4_000, 4_000, 8_000,
+        ];
+        let mut pts: u64 = 90_000;
+        let pts_step: u64 = 90_000 / 30;
+        for i in 0..90 {
+            let sz = frame_sizes[i % frame_sizes.len()];
+            let pes = synth_pes(pts, sz);
+            // PCR anchor = PTS-derived; only the first call honours it.
+            let pcr_anchor = pts.saturating_mul(300).saturating_sub(PCR_PREROLL_27MHZ);
+            emit_video_pes_with_pcr(
+                VPID,
+                &pes,
+                pcr_anchor,
+                BITRATE_BPS,
+                &mut cc,
+                &mut injector,
+                &mut out,
+            );
+            pts = pts.wrapping_add(pts_step);
+        }
+
+        let samples = collect_pcr_samples(&out, VPID);
+        assert!(
+            samples.len() >= 30,
+            "expected many PCR samples across 90 frames, got {}",
+            samples.len()
+        );
+
+        // Skip the first sample (anchor seed) — the rest are
+        // injector-driven byte-cadence emits.
+        let mut ok = 0usize;
+        let mut tested = 0usize;
+        for w in samples.windows(2) {
+            let (off_a, pcr_a) = w[0];
+            let (off_b, pcr_b) = w[1];
+            let dbyte = (off_b - off_a) as u64;
+            let dpcr = pcr_b.wrapping_sub(pcr_a);
+            // Expected Δpcr in 27 MHz ticks at the declared bitrate.
+            let expected = dbyte * 8 * 27_000_000 / BITRATE_BPS;
+            // 1 ms tolerance = 27_000 ticks.
+            let diff = (dpcr as i64 - expected as i64).abs();
+            tested += 1;
+            if diff < 27_000 {
+                ok += 1;
+            }
+        }
+        assert_eq!(
+            ok, tested,
+            "{}/{} PCR pairs satisfied |Δpcr − expected| < 1 ms",
+            ok, tested
+        );
+    }
+
+    /// Test 2 — CC continuity per ETSI TR 101 290 P1.4 across PES +
+    /// PCR-only mix. AFC=01/11 (payload) packets must have cc =
+    /// (prior_cc + 1) % 16. AFC=10 (PCR-only) packets must DUPLICATE
+    /// the cc of the prior packet — incrementing CC on AFC=10 is the
+    /// bug that produced 536 P1.4 hits on a live h264_qsv 1080p CBR
+    /// capture before the fix. The first packet of the stream is
+    /// exempt (no prior to compare).
+    #[test]
+    fn pcr_injector_obeys_tr101290_cc_rules() {
+        const VPID: u16 = 0x42;
+        const BITRATE_BPS: u64 = 4_000_000;
+        let mut cc = 0u8;
+        let mut injector: Option<PcrInjector> = None;
+        let mut out = Vec::new();
+
+        for i in 0..40 {
+            let pts = 90_000 + i * 3000;
+            let pes = synth_pes(pts, if i % 5 == 0 { 30_000 } else { 5_000 });
+            let pcr = pts.saturating_mul(300).saturating_sub(PCR_PREROLL_27MHZ);
+            emit_video_pes_with_pcr(
+                VPID,
+                &pes,
+                pcr,
+                BITRATE_BPS,
+                &mut cc,
+                &mut injector,
+                &mut out,
+            );
+        }
+
+        let entries = collect_cc(&out, VPID);
+        assert!(entries.len() > 100, "need many video packets to test CC walk");
+        let mut saw_pcr_only = false;
+        for w in entries.windows(2) {
+            let (afc_a, cc_a) = w[0];
+            let (afc_b, cc_b) = w[1];
+            if afc_b == 0b10 {
+                saw_pcr_only = true;
+                assert_eq!(
+                    cc_b, cc_a,
+                    "AFC=10 (PCR-only) packets MUST duplicate the prior packet's CC \
+                     per ISO 13818-1 §2.4.3.3 / TR 101 290 P1.4"
+                );
+            } else {
+                let step = (cc_b.wrapping_sub(cc_a)) & 0x0F;
+                assert_eq!(
+                    step, 1,
+                    "AFC=01/11 (payload) packets must have cc = (prior + 1) % 16"
+                );
+            }
+        }
+        assert!(
+            saw_pcr_only,
+            "test must exercise the AFC=10 path — none observed in the output"
+        );
+    }
+
+    /// Test 3 — PCR-only packet structure validity. AF length = 183,
+    /// AF flags = 0x10, 6 PCR bytes round-trip, AFC = 10 (no payload),
+    /// PUSI clear. A malformed PCR-only packet trips TR 101 290 P1.5
+    /// at the receiver.
+    #[test]
+    fn pcr_only_packet_structure_is_spec_compliant() {
+        const PID: u16 = 0x0500;
+        let pkt = build_pcr_only_ts_packet(PID, 0x0A, 1_234_567_890);
+        assert_eq!(pkt.len(), TS_PACKET_SIZE);
+        assert_eq!(pkt[0], TS_SYNC_BYTE);
+        // PUSI clear, PID hi nibble = (PID >> 8) & 0x1F.
+        assert_eq!(pkt[1] & 0x40, 0);
+        assert_eq!(pkt[1] & 0x1F, ((PID >> 8) as u8) & 0x1F);
+        assert_eq!(pkt[2], (PID & 0xFF) as u8);
+        // AFC = 10 (adaptation only), CC = 0xA.
+        assert_eq!((pkt[3] >> 4) & 0x03, 0b10);
+        assert_eq!(pkt[3] & 0x0F, 0x0A);
+        // AF length 183, AF flags 0x10.
+        assert_eq!(pkt[4], 183);
+        assert_eq!(pkt[5], 0x10);
+        // PCR round-trip.
+        assert_eq!(read_pcr_27mhz(&pkt[6..12]), 1_234_567_890);
+        // Stuffing bytes are 0xFF.
+        for b in &pkt[12..188] {
+            assert_eq!(*b, 0xFF, "PCR-only packet must stuff trailing bytes with 0xFF");
+        }
+    }
+
+    /// Test 4 — discontinuity reset. After dropping the injector
+    /// (`reset_source_state` does this on flow switch), the next emit
+    /// re-anchors to the freshly-supplied PTS-derived PCR. Without
+    /// this the running clock would carry a stale value across the
+    /// boundary and the receiver would see a phantom forward jump.
+    #[test]
+    fn pcr_injector_resets_on_discontinuity() {
+        const VPID: u16 = 0x100;
+        const BITRATE_BPS: u64 = 6_000_000;
+        let mut cc = 0u8;
+        let mut injector: Option<PcrInjector> = None;
+        let mut out = Vec::new();
+
+        // Pre-switch: anchor at pts = 90_000 (1 s). Run a few frames so
+        // the running clock is well past the anchor.
+        for i in 0..10 {
+            let pts = 90_000 + i * 3000;
+            let pes = synth_pes(pts, 30_000);
+            let pcr = pts.saturating_mul(300).saturating_sub(PCR_PREROLL_27MHZ);
+            emit_video_pes_with_pcr(
+                VPID,
+                &pes,
+                pcr,
+                BITRATE_BPS,
+                &mut cc,
+                &mut injector,
+                &mut out,
+            );
+        }
+        let samples_pre = collect_pcr_samples(&out, VPID);
+        let last_pcr_before = samples_pre.last().unwrap().1;
+
+        // Flow switch: drop the injector. Next emit must re-anchor to
+        // the new PTS-derived PCR, NOT continue from `last_pcr_before`.
+        injector = None;
+        let post_pts: u64 = 200_000; // jump >1 s ahead of last anchor
+        let post_pes = synth_pes(post_pts, 8_000);
+        let post_pcr = post_pts.saturating_mul(300).saturating_sub(PCR_PREROLL_27MHZ);
+        let len_before_post = out.len();
+        emit_video_pes_with_pcr(
+            VPID,
+            &post_pes,
+            post_pcr,
+            BITRATE_BPS,
+            &mut cc,
+            &mut injector,
+            &mut out,
+        );
+
+        // The first PCR-only packet emitted after the reset must carry
+        // the new anchor value (mod the 27 MHz space), NOT the running
+        // clock continuation.
+        let post_samples = collect_pcr_samples(&out[len_before_post..], VPID);
+        assert!(!post_samples.is_empty(), "expected an anchor-seed PCR after reset");
+        let first_post = post_samples[0].1;
+        assert_eq!(
+            first_post, post_pcr % PCR_MODULUS_27MHZ,
+            "anchor seed PCR must equal the post-switch PTS-derived value"
+        );
+        // And it must NOT be a small forward step from the pre-switch
+        // running clock (sanity: post_pcr is well above last_pcr_before
+        // so equality check above is sufficient — guard with a
+        // distinct-values assertion to make the intent obvious).
+        assert_ne!(first_post, last_pcr_before);
+    }
+
+    /// Test 5 — no-bitrate fallback. When `declared_bitrate_bps == 0`,
+    /// `emit_video_pes_with_pcr` MUST fall through to the legacy
+    /// `packetize_ts(.., Some(pcr))` path: PCR on PUSI start, no
+    /// PCR-only injection, byte-equivalent to pre-injector behaviour.
+    /// Existing regression tests for the legacy path stay green.
+    #[test]
+    fn no_bitrate_hint_falls_back_to_legacy_packetize() {
+        const VPID: u16 = 0x100;
+        let pts: u64 = 90_000;
+        let pcr = pts.saturating_mul(300).saturating_sub(PCR_PREROLL_27MHZ);
+        let pes = synth_pes(pts, 5_000);
+
+        // Legacy path: packetize_ts directly.
+        let mut cc_a = 0u8;
+        let pkts_legacy = packetize_ts(VPID, &pes, &mut cc_a, Some(pcr));
+        let legacy_bytes: Vec<u8> = pkts_legacy.iter().flatten().copied().collect();
+
+        // Fallback path: emit_video_pes_with_pcr with declared_bitrate_bps = 0.
+        let mut cc_b = 0u8;
+        let mut injector: Option<PcrInjector> = None;
+        let mut fallback_bytes = Vec::new();
+        emit_video_pes_with_pcr(
+            VPID,
+            &pes,
+            pcr,
+            0,
+            &mut cc_b,
+            &mut injector,
+            &mut fallback_bytes,
+        );
+
+        assert_eq!(legacy_bytes, fallback_bytes, "fallback must be byte-equivalent to packetize_ts");
+        assert!(injector.is_none(), "no injector should be created when bitrate hint is absent");
+        assert_eq!(cc_a, cc_b, "CC must end at the same value via either path");
     }
 }

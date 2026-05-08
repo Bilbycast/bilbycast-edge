@@ -1,15 +1,16 @@
 name: Release
 
-# Three triggers, all converging on the same build + sign + publish job:
-#   - Nightly cron (default — catches version bumps that were committed
-#     but not released by hand)
+# Two triggers, both converging on the same build + sign + publish job:
 #   - `workflow_dispatch` (manual button in the GitHub Actions UI)
 #   - `push.tags: v*` (used by the monorepo-root `release-all.sh`
-#     orchestrator)
+#     orchestrator — this is the canonical release path)
 #
-# The `check-version` job's `gh release view "${TAG}"` short-circuits the
-# nightly cron when the version hasn't bumped, so idle days cost one API
-# call.
+# The schedule trigger was removed: cosign-keyless signing requires the
+# Fulcio cert subject to match `refs/tags/v*` (enforced by
+# `src/upgrade/trust.rs::ALLOWED_SIGNERS` on every deployed edge), and a
+# `schedule` run from `main` produces a `refs/heads/main` cert that fails
+# verification. `release-all.sh` pushes the tag and lets the `push.tags`
+# trigger fire the workflow under the correct ref.
 #
 # Filename `nightly-release.yml` is preserved on disk because it is
 # hard-coded into the Sigstore identity allowlist
@@ -17,9 +18,6 @@ name: Release
 # regex below — renaming would lock every deployed edge out of accepting
 # future signed manifests.
 on:
-  schedule:
-    # 3:00 AM AEST (UTC+10) = 17:00 UTC previous day.
-    - cron: "0 17 * * *"
   workflow_dispatch:
   push:
     tags:
@@ -436,6 +434,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          path: bilbycast-edge
 
       - name: Download all artifacts
         uses: actions/download-artifact@v7
@@ -519,12 +519,13 @@ jobs:
 
           # Skip tag creation when the workflow was triggered by a tag
           # push (the tag already exists in that case).
-          if ! git rev-parse "${TAG}" > /dev/null 2>&1; then
-              git tag "${TAG}"
-              git push origin "${TAG}"
+          if ! git -C bilbycast-edge rev-parse "${TAG}" > /dev/null 2>&1; then
+              git -C bilbycast-edge tag "${TAG}"
+              git -C bilbycast-edge push origin "${TAG}"
           fi
 
           gh release create "${TAG}" \
+            --repo "${{ github.repository }}" \
             --title "bilbycast-edge v${VERSION}" \
             --notes "Release of bilbycast-edge version ${VERSION}.
 
@@ -587,10 +588,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release list --limit 100 --json tagName,createdAt \
+          gh release list --repo "${{ github.repository }}" --limit 100 --json tagName,createdAt \
             --jq 'sort_by(.createdAt) | reverse | .[3:] | .[].tagName' \
             | while read -r OLD_TAG; do
                 [ -z "$OLD_TAG" ] && continue
                 echo "Deleting old release ${OLD_TAG}"
-                gh release delete "${OLD_TAG}" --cleanup-tag --yes
+                gh release delete "${OLD_TAG}" --repo "${{ github.repository }}" --cleanup-tag --yes
               done
