@@ -124,6 +124,13 @@ pub mod ts_es_hitless;
 pub mod ts_assembler;
 pub mod ts_audio_replace;
 pub mod ts_video_replace;
+/// Per-output wire emission engine. Dedicated `std::thread` (Linux:
+/// `SCHED_FIFO`) that paces TS datagrams onto the wire via PCR-anchored
+/// `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, ...)`. Decouples wire
+/// timing from the Tokio timer wheel — sub-100 µs precision instead of
+/// the ~1–5 ms ceiling `tokio::time::sleep_until` imposes. See
+/// [`docs/wire-pacing.md`](../../docs/wire-pacing.md).
+pub mod wire_emit;
 #[cfg(feature = "video-thumbnail")]
 pub mod video_encode_util;
 
