@@ -100,6 +100,12 @@ impl AvSyncPacer {
     /// modular-aware. Wraps cleanly on the PCR space without producing
     /// a giant garbage value when `master_now < PCR_PREROLL_27MHZ`
     /// (happens briefly at flow start).
+    ///
+    /// **Not currently called from the data path** — see
+    /// [`pcr_for_emit`]'s doc-comment for why we no longer sample the
+    /// master clock at PES emit time. Retained for tests and any
+    /// future callers whose PTS doesn't track source.
+    #[allow(dead_code)]
     pub fn pcr_27mhz_for_emit(&self) -> u64 {
         const PCR_MODULUS: u64 = (1u64 << 33) * 300;
         let now = self.master.now_27mhz();
@@ -136,16 +142,38 @@ pub fn wallclock_pacer() -> AvSyncPacer {
     AvSyncPacer::new(MasterClockHandle::wallclock())
 }
 
-/// Pacer-aware PCR generation: prefer the master clock when one is
-/// attached, otherwise fall back to the legacy `pts × 300 − preroll`
-/// derivation. Caller passes `pts_for_pes` so the legacy path is
-/// preserved without forcing every replacer to plumb a pacer.
-pub fn pcr_for_emit(pacer: Option<&Arc<AvSyncPacer>>, pts_for_pes_90k: u64) -> u64 {
-    match pacer {
-        Some(p) => p.pcr_27mhz_for_emit(),
-        None => pts_for_pes_90k
-            .saturating_mul(300)
-            .saturating_sub(PCR_PREROLL_27MHZ),
+/// PCR generation for transcoded TS outputs.
+///
+/// Always derives PCR from the source PES PTS:
+/// `(pts × 300 − PCR_PREROLL_27MHZ)` modulo the 27 MHz PCR space.
+///
+/// **Why not sample `master.now_27mhz()` here?** The earlier design used
+/// the master clock at PES emit time so PCR cadence would track a single
+/// per-flow clock. In practice that broke broadcast-grade PCR_AC: the
+/// master-clock value was sampled inside the encoder pipeline (a
+/// `block_in_place` task) but the resulting PCR packet's wire time is
+/// determined by libsrt / UDP / RTP send pacing — variable per-packet
+/// queue delay. The sampled PCR value therefore has no fixed
+/// relationship to the wire arrival time of the PCR packet, and
+/// professional decoders (Appear, Tektronix) flag the result as PCR
+/// jitter (T-STD spec is ≤ 500 ns; we measured stdev 176 ms, max 423
+/// ms on a transcoded UDP loopback feed). The legacy path is
+/// deterministic — every output of a flow that emits the same source
+/// PTS produces the same PCR, so cross-edge coherence (the original
+/// motivation for the master-clock PCR) is preserved without sampling
+/// jitter.
+///
+/// The pacer parameter is retained for API stability and for non-PCR
+/// uses of the master clock (telemetry, lipsync trim, future
+/// audio-decoded paths whose PTS doesn't track source). Currently
+/// ignored at the call site.
+pub fn pcr_for_emit(_pacer: Option<&Arc<AvSyncPacer>>, pts_for_pes_90k: u64) -> u64 {
+    const PCR_MODULUS: u64 = (1u64 << 33) * 300;
+    let pts_27mhz = pts_for_pes_90k.wrapping_mul(300);
+    if pts_27mhz >= PCR_PREROLL_27MHZ {
+        (pts_27mhz - PCR_PREROLL_27MHZ) % PCR_MODULUS
+    } else {
+        (PCR_MODULUS + pts_27mhz) - PCR_PREROLL_27MHZ
     }
 }
 
@@ -181,13 +209,15 @@ mod tests {
     }
 
     #[test]
-    fn pcr_for_emit_uses_master_when_pacer_set() {
+    fn pcr_for_emit_ignores_pacer_and_uses_pts() {
+        // The pacer is intentionally consulted no longer — sampling
+        // `master.now_27mhz()` at the encoder pipeline boundary
+        // produced wire-time-decoupled PCR values that broke PCR_AC
+        // on professional decoders. With the pacer set, we still get
+        // the deterministic pts-derived value.
         let p = Some(Arc::new(wallclock_pacer()));
-        // pts_for_pes is intentionally tiny — if the pacer was ignored
-        // we'd return ~0; with master clock attached we get the
-        // wallclock-derived value, much larger.
-        let pcr = pcr_for_emit(p.as_ref(), 1);
-        assert!(pcr > 1_000_000, "pacer ignored: pcr={pcr}");
+        let pcr = pcr_for_emit(p.as_ref(), 90_000); // 1 s in 90 kHz
+        assert_eq!(pcr, 27_000_000 - PCR_PREROLL_27MHZ);
     }
 
     #[test]
@@ -213,11 +243,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_pcr_path_saturates_under_preroll() {
-        // The legacy path uses saturating_sub which clamps to 0 instead
-        // of wrapping — ensures PCR never goes negative on early
-        // start-up when source PTS hasn't crossed the pre-roll yet.
+    fn pts_below_preroll_wraps_modular() {
+        // PTS values below the pre-roll wrap around the PCR modulus.
+        // Receivers do this maths in the same modular space, so the
+        // wrap is correct under MPEG-TS PCR semantics (the alternative
+        // saturate-to-zero behaviour would emit a non-monotonic step
+        // every time PTS crosses the pre-roll on startup).
+        const PCR_MODULUS: u64 = (1u64 << 33) * 300;
         let pcr = pcr_for_emit(None, 0);
-        assert_eq!(pcr, 0);
+        assert_eq!(pcr, PCR_MODULUS - PCR_PREROLL_27MHZ);
     }
 }

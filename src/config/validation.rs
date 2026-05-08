@@ -876,6 +876,12 @@ fn validate_replay_input(c: &crate::config::models::ReplayInputConfig) -> Result
     if let Some(ref clip_id) = c.clip_id {
         validate_replay_id(clip_id, "replay input clip_id")?;
     }
+    validate_input_transcode_group_a(
+        c.audio_encode.as_ref(),
+        c.transcode.as_ref(),
+        c.video_encode.as_ref(),
+        "Replay input",
+    )?;
     Ok(())
 }
 
@@ -983,6 +989,12 @@ fn validate_test_pattern_input(c: &crate::config::models::TestPatternInputConfig
             ));
         }
     }
+    validate_input_transcode_group_a(
+        c.audio_encode.as_ref(),
+        c.transcode.as_ref(),
+        c.video_encode.as_ref(),
+        "Test-pattern input",
+    )?;
     Ok(())
 }
 
@@ -1032,6 +1044,12 @@ fn validate_media_player_input(c: &crate::config::models::MediaPlayerInputConfig
             }
         }
     }
+    validate_input_transcode_group_a(
+        c.audio_encode.as_ref(),
+        c.transcode.as_ref(),
+        c.video_encode.as_ref(),
+        "Media-player input",
+    )?;
     if let Some(bps) = c.paced_bitrate_bps {
         if !(100_000..=200_000_000).contains(&bps) {
             bail!(

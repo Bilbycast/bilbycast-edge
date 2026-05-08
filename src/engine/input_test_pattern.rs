@@ -104,6 +104,39 @@ async fn run_inner(
     use crate::config::models::VideoEncodeConfig;
     use crate::engine::video_encode_util::ScaledVideoEncoder;
 
+    // Build the ingress transcoder. All three fields None ⇒ passthrough
+    // (no codec state, no scratch buffers). Errors degrade to passthrough
+    // with a Critical event so the operator notices.
+    let mut transcoder = match crate::engine::input_transcode::InputTranscoder::new(
+        config.audio_encode.as_ref(),
+        config.transcode.as_ref(),
+        config.video_encode.as_ref(),
+        None,
+    ) {
+        Ok(t) => {
+            if let Some(ref t) = t {
+                tracing::info!("Test-pattern input: ingress transcode active — {}", t.describe());
+            }
+            t
+        }
+        Err(e) => {
+            events.emit_flow(
+                EventSeverity::Critical,
+                category::FLOW,
+                format!("Test-pattern input transcode disabled: {e}"),
+                flow_id,
+            );
+            None
+        }
+    };
+    crate::engine::input_transcode::register_ingress_stats(
+        stats.as_ref(),
+        input_id,
+        transcoder.as_ref(),
+        config.audio_encode.as_ref(),
+        config.video_encode.as_ref(),
+    );
+
     let width = config.width as u32;
     let height = config.height as u32;
     let fps = config.fps.max(1) as u32;
@@ -226,7 +259,7 @@ async fn run_inner(
             // in-process encoders already emit Annex-B when global_header
             // is false.
             let ts_chunks = ts_muxer.mux_video(&ef.data, ef.pts as u64, ef.pts as u64, ef.keyframe);
-            publish_chunks(ts_chunks, &mut seq_num, stats, per_input_tx, pts_90khz);
+            publish_chunks(ts_chunks, &mut seq_num, stats, per_input_tx, pts_90khz, &mut transcoder);
         }
 
         // ── Audio ── generate + encode ~1 frame-duration's worth of tone.
@@ -247,7 +280,7 @@ async fn run_inner(
             let frames_ready = ctx.encode_pending()?;
             for (adts, apts) in frames_ready {
                 let ts_chunks = ts_muxer.mux_audio_pre_adts(&adts, apts);
-                publish_chunks(ts_chunks, &mut seq_num, stats, per_input_tx, apts);
+                publish_chunks(ts_chunks, &mut seq_num, stats, per_input_tx, apts, &mut transcoder);
             }
         }
 
@@ -262,6 +295,7 @@ fn publish_chunks(
     stats: &Arc<FlowStatsAccumulator>,
     per_input_tx: &broadcast::Sender<RtpPacket>,
     pts_90khz: u64,
+    transcoder: &mut Option<crate::engine::input_transcode::InputTranscoder>,
 ) {
     // Bundle all TS packets from this video/audio frame into a single
     // RtpPacket — one TsMuxer call per frame produces ~dozens of 188 B
@@ -289,9 +323,11 @@ fn publish_chunks(
     *seq_num = seq_num.wrapping_add(1);
     stats.input_packets.fetch_add(1, Ordering::Relaxed);
     stats.input_bytes.fetch_add(total_len as u64, Ordering::Relaxed);
-    // Drop into the broadcast — a lagging subscriber sees RecvError::Lagged,
-    // not our problem.
-    let _ = per_input_tx.send(pkt);
+    // Route through the optional ingress transcoder. None ⇒ passthrough
+    // (single broadcast send, no copy). Some ⇒ block_in_place re-encode
+    // before publish. A lagging subscriber sees RecvError::Lagged inside
+    // the helper — not our problem.
+    crate::engine::input_transcode::publish_input_packet(transcoder, per_input_tx, pkt);
 }
 
 #[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]

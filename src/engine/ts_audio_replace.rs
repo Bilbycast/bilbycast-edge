@@ -314,7 +314,23 @@ impl TsAudioReplacer {
                     if can_replace {
                         let mut rewritten = pkt.to_vec();
                         if let Some(apid) = self.audio_pid {
-                            rewrite_pmt_audio_stream_type(&mut rewritten, apid, self.target_stream_type);
+                            // Neutralise the AAC descriptor (0x7C) when re-encoding
+                            // to an AAC-family target — the source descriptor's
+                            // profile/level may not match the encoder we run, and
+                            // a strict broadcast decoder (e.g. Appear) refuses to
+                            // bring up audio on the mismatch.
+                            let aac_pal = match self.codec {
+                                AudioCodec::AacLc
+                                | AudioCodec::HeAacV1
+                                | AudioCodec::HeAacV2 => Some(0xFE),
+                                _ => None,
+                            };
+                            rewrite_pmt_audio_stream_type(
+                                &mut rewritten,
+                                apid,
+                                self.target_stream_type,
+                                aac_pal,
+                            );
                         }
                         output.extend_from_slice(&rewritten);
                     } else {
@@ -890,7 +906,22 @@ fn parse_pmt_audio(pkt: &[u8]) -> Option<(u16, u8)> {
 
 /// Rewrite the audio stream_type in a PMT TS packet in place and
 /// recompute the section CRC32.
-fn rewrite_pmt_audio_stream_type(pkt: &mut [u8], audio_pid: u16, new_stream_type: u8) {
+///
+/// When `new_aac_profile_and_level` is `Some`, additionally walk the
+/// audio ES descriptor list and rewrite the body of any AAC descriptor
+/// (tag 0x7C, ETSI TS 101 154 Annex G) to that value. The audio
+/// re-encoder targets a fixed codec, but the source PMT's descriptor
+/// is inherited verbatim from the input — when those don't agree (e.g.
+/// source advertises HE-AAC but we re-encode to AAC-LC), strict
+/// broadcast decoders refuse the audio output. Callers pass `0xFE`
+/// ("no audio profile and level defined") to neutralise the descriptor;
+/// decoders then fall back to the ADTS sync header inside the ES.
+fn rewrite_pmt_audio_stream_type(
+    pkt: &mut [u8],
+    audio_pid: u16,
+    new_stream_type: u8,
+    new_aac_profile_and_level: Option<u8>,
+) {
     let mut offset = 4;
     if ts_has_adaptation(pkt) {
         let af_len = pkt[4] as usize;
@@ -922,6 +953,22 @@ fn rewrite_pmt_audio_stream_type(pkt: &mut [u8], audio_pid: u16, new_stream_type
         let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
         if es_pid == audio_pid {
             pkt[pos] = new_stream_type;
+            if let Some(pal) = new_aac_profile_and_level {
+                let desc_start = pos + 5;
+                let desc_end = (desc_start + es_info_len).min(data_end);
+                let mut dpos = desc_start;
+                while dpos + 2 <= desc_end {
+                    let tag = pkt[dpos];
+                    let dlen = pkt[dpos + 1] as usize;
+                    if dpos + 2 + dlen > desc_end {
+                        break;
+                    }
+                    if tag == 0x7C && dlen >= 1 {
+                        pkt[dpos + 2] = pal;
+                    }
+                    dpos += 2 + dlen;
+                }
+            }
         }
         pos += 5 + es_info_len;
     }
@@ -987,7 +1034,11 @@ fn build_audio_pes(audio_data: &[u8], pts: u64) -> Vec<u8> {
     pes.extend_from_slice(&[0x00, 0x00, 0x01]);
     pes.push(0xC0); // audio stream_id
     pes.extend_from_slice(&(pes_len as u16).to_be_bytes());
-    pes.push(0x80); // marker bits + no scramble
+    // Marker bits '10' + data_alignment_indicator=1. Each encoded
+    // audio frame (one ADTS frame for AAC, one MP2/AC-3 frame) is
+    // emitted as its own PES, so the payload starts at an access-unit
+    // boundary. ETSI TS 101 154 §C.4 requires this for broadcast.
+    pes.push(0x84);
     pes.push(0x80); // PTS present, no DTS
     pes.push(5);    // PES header data length
 
@@ -1342,5 +1393,125 @@ mod tests {
         assert_eq!(pes[8], 5);    // PES header data len
         // last 4 bytes should be the ES payload
         assert_eq!(&pes[pes.len() - 4..], &[1, 2, 3, 4]);
+    }
+
+    /// Each encoded audio frame is emitted as its own PES, so the
+    /// payload starts at an access-unit boundary — ETSI TS 101 154
+    /// §C.4 requires `data_alignment_indicator = 1` for broadcast.
+    #[test]
+    fn build_audio_pes_sets_data_alignment_indicator() {
+        let pes = build_audio_pes(&[0u8; 16], 0);
+        // Byte 6 carries the marker + DAI flag. Bit 2 (0x04) is DAI.
+        assert_eq!(pes[6] & 0x04, 0x04, "data_alignment_indicator must be 1");
+    }
+
+    /// Build a PMT TS packet with one audio ES carrying an
+    /// ISO-639 language descriptor + an AAC descriptor (0x7C) with the
+    /// caller-supplied `profile_and_level` body byte. Mirrors the
+    /// real-world DVB shape we see on Sky Sports recordings.
+    fn synth_pmt_audio_with_aac_desc(
+        pmt_pid: u16,
+        audio_pid: u16,
+        stream_type: u8,
+        aac_profile_and_level: u8,
+    ) -> [u8; 188] {
+        let mut pkt = [0xFFu8; 188];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = 0x40 | ((pmt_pid >> 8) as u8 & 0x1F);
+        pkt[2] = pmt_pid as u8;
+        pkt[3] = 0x10;
+        pkt[4] = 0x00;
+        let s = 5;
+        pkt[s] = 0x02; // table_id = PMT
+        // 9 (header) + 5 (ES fixed) + 9 (descriptors: 0x0A len 4 + 0x7C len 1) + 4 (CRC) = 27
+        let section_length: u16 = 27;
+        pkt[s + 1] = 0xB0 | ((section_length >> 8) as u8 & 0x0F);
+        pkt[s + 2] = section_length as u8;
+        pkt[s + 3] = 0x00;
+        pkt[s + 4] = 0x01;
+        pkt[s + 5] = 0xC1;
+        pkt[s + 6] = 0x00;
+        pkt[s + 7] = 0x00;
+        pkt[s + 8] = 0xE0 | ((audio_pid >> 8) as u8 & 0x1F);
+        pkt[s + 9] = audio_pid as u8;
+        pkt[s + 10] = 0xF0;
+        pkt[s + 11] = 0x00;
+        pkt[s + 12] = stream_type;
+        pkt[s + 13] = 0xE0 | ((audio_pid >> 8) as u8 & 0x1F);
+        pkt[s + 14] = audio_pid as u8;
+        // ES_info_length = 9 (4-byte ISO-639 desc + 1-byte AAC desc + 2x 2-byte tag/len)
+        pkt[s + 15] = 0xF0;
+        pkt[s + 16] = 0x09;
+        // ISO-639 language descriptor (0x0A), len 4: "eng" + audio_type 0
+        pkt[s + 17] = 0x0A;
+        pkt[s + 18] = 0x04;
+        pkt[s + 19] = b'e';
+        pkt[s + 20] = b'n';
+        pkt[s + 21] = b'g';
+        pkt[s + 22] = 0x00;
+        // AAC descriptor (0x7C), len 1: profile_and_level
+        pkt[s + 23] = 0x7C;
+        pkt[s + 24] = 0x01;
+        pkt[s + 25] = aac_profile_and_level;
+        let crc = mpeg2_crc32(&pkt[s..s + 26]);
+        pkt[s + 26] = (crc >> 24) as u8;
+        pkt[s + 27] = (crc >> 16) as u8;
+        pkt[s + 28] = (crc >> 8) as u8;
+        pkt[s + 29] = crc as u8;
+        pkt
+    }
+
+    /// Re-encoding to AAC-LC must neutralise the inherited AAC
+    /// descriptor's profile_and_level so a strict broadcast decoder
+    /// doesn't refuse audio output when the source advertised HE-AAC
+    /// but we emit AAC-LC.
+    #[test]
+    fn pmt_aac_descriptor_neutralised_for_aac_target() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        out.clear();
+        // Source advertises HE-AAC L3 (0x51) but the ES (we don't
+        // feed any here) would carry plain AAC-LC after re-encode.
+        let pmt = synth_pmt_audio_with_aac_desc(0x1000, 0x0101, 0x0F, 0x51);
+        r.process(&pmt, &mut out);
+        assert_eq!(out.len(), 188);
+        // ts header (4) + pointer (1) + table_id (1) + section_length (2)
+        //   + program_number (2) + version (1) + section# (2) + PCR_PID (2)
+        //   + program_info_length (2) = 17 → ES entry starts here.
+        // ES: stream_type (1) + es_pid (2) + es_info_length (2) = 5 → desc list at 22.
+        // Desc list: ISO-639 (2 + 4 = 6 bytes) → AAC tag at 28, len at 29, body at 30.
+        assert_eq!(out[5 + 23], 0x7C, "AAC descriptor tag still present");
+        assert_eq!(out[5 + 24], 0x01, "AAC descriptor body length unchanged");
+        assert_eq!(
+            out[5 + 25],
+            0xFE,
+            "AAC profile_and_level neutralised (was 0x51 HE-AAC, now 0xFE = unspecified)"
+        );
+        // Section CRC must be valid after the in-place rewrite.
+        let section_length =
+            (((out[5 + 1] & 0x0F) as usize) << 8) | (out[5 + 2] as usize);
+        let crc_off = 5 + 3 + section_length - 4;
+        let computed = mpeg2_crc32(&out[5..crc_off]);
+        let stored = ((out[crc_off] as u32) << 24)
+            | ((out[crc_off + 1] as u32) << 16)
+            | ((out[crc_off + 2] as u32) << 8)
+            | (out[crc_off + 3] as u32);
+        assert_eq!(computed, stored, "CRC32 must match after descriptor rewrite");
+    }
+
+    /// Re-encoding to a non-AAC target (MP2 / AC-3) must NOT touch the
+    /// AAC descriptor body — the descriptor is irrelevant to a non-AAC
+    /// stream_type but we still preserve the source bytes verbatim.
+    #[test]
+    fn pmt_aac_descriptor_left_alone_for_non_aac_target() {
+        let mut r = TsAudioReplacer::new(&enc("ac3"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        out.clear();
+        let pmt = synth_pmt_audio_with_aac_desc(0x1000, 0x0101, 0x0F, 0x51);
+        r.process(&pmt, &mut out);
+        assert_eq!(out.len(), 188);
+        assert_eq!(out[5 + 25], 0x51, "non-AAC target leaves descriptor body intact");
     }
 }

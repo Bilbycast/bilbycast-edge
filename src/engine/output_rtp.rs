@@ -152,12 +152,61 @@ async fn rtp_output_loop(
 ) -> anyhow::Result<()> {
     let (socket, dest) =
         create_udp_output(&config.dest_addr, config.bind_addr.as_deref(), config.interface_addr.as_deref(), config.dscp).await?;
+    let socket = Arc::new(socket);
 
     tracing::info!(
         "RTP output '{}' started -> {}",
         config.id,
         dest
     );
+
+    // ── Encoder ↔ wire decoupling (see output_udp.rs) ──
+    //
+    // Pure recv → send loop. RTP wrap happens here so the header
+    // sequence/timestamp tracks the actual emit moment.
+    let (wire_tx, mut wire_rx) =
+        tokio::sync::mpsc::channel::<(Vec<u8>, u64, u32)>(256);
+    {
+        let socket = socket.clone();
+        let stats = stats.clone();
+        let cancel = cancel.clone();
+        let id = config.id.clone();
+        tokio::spawn(async move {
+            let mut rtp_wrap = RtpWrapState::new();
+            let mut rtp_send_buf =
+                Vec::<u8>::with_capacity(RTP_HEADER_SIZE + TS_PACKETS_PER_DATAGRAM * TS_PACKET_SIZE);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    recv_result = wire_rx.recv() => {
+                        let (inner_ts, recv_time_us, rtp_ts) = match recv_result {
+                            Some(d) => d,
+                            None => return,
+                        };
+                        let pcr_sample =
+                            crate::engine::ts_parse::first_pcr_in_ts_buffer(&inner_ts);
+                        let header = rtp_wrap.build_header(rtp_ts);
+                        rtp_send_buf.clear();
+                        rtp_send_buf.extend_from_slice(&header);
+                        rtp_send_buf.extend_from_slice(&inner_ts);
+                        match socket.send_to(&rtp_send_buf, dest).await {
+                            Ok(sent) => {
+                                stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                                stats.record_latency(recv_time_us);
+                                if let Some(pcr) = pcr_sample {
+                                    stats.record_pcr_egress(pcr, crate::util::time::now_us());
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("RTP output '{}' send error: {e}", id);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // Optional FEC encoder (SMPTE 2022-1).
     //
@@ -318,14 +367,10 @@ async fn rtp_output_loop(
     };
     let mut video_replace_scratch: Vec<u8> = Vec::new();
 
-    // RTP wrap state for raw-TS payloads. Random SSRC + monotonic seq so this
-    // output emits RFC 2250-compliant RTP/MPEG-TS even when its upstream
-    // input was raw TS (UDP, RTMP, RTSP, etc.). The 90 kHz timestamp is
-    // carried from the inbound packet so the wire reflects the source media
-    // clock.
-    let mut rtp_wrap = RtpWrapState::new();
-    // Reusable scratch buffer for [12-byte RTP header || 1316-byte TS] datagrams.
-    let mut rtp_send_buf = Vec::with_capacity(RTP_HEADER_SIZE + TS_PACKETS_PER_DATAGRAM * TS_PACKET_SIZE);
+    // RTP wrap state lives in the wire task now (it builds RFC 2250
+    // headers at emit time so the timestamp tracks the actual wire
+    // egress moment, and it pads with null packets at CBR before
+    // wrapping each datagram).
 
     // Optional output delay buffer for stream synchronization.
     let resolved = if let Some(ref delay) = config.delay {
@@ -554,53 +599,35 @@ async fn rtp_output_loop(
                 if ts_sync_found {
                     while ts_realign_buf.len() >= ts_datagram_size {
                         let datagram = ts_realign_buf.split_to(ts_datagram_size);
-                        // PID-bus Phase 8: per-output PCR trust sampler.
-                        let pcr_sample =
-                            crate::engine::ts_parse::first_pcr_in_ts_buffer(&datagram);
-                        let header = rtp_wrap.build_header(packet.rtp_timestamp);
-                        rtp_send_buf.clear();
-                        rtp_send_buf.extend_from_slice(&header);
-                        rtp_send_buf.extend_from_slice(&datagram);
-                        match socket.send_to(&rtp_send_buf, dest).await {
-                            Ok(sent) => {
-                                stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                                stats.record_latency(packet.recv_time_us);
-                                if let Some(pcr) = pcr_sample {
-                                    stats.record_pcr_egress(
-                                        pcr,
-                                        crate::util::time::now_us(),
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("RTP output '{}' send error: {e}", config.id);
-                            }
+                        // Wire task does the RTP wrap + null-padding
+                        // and emits at the declared CBR rate. We only
+                        // hand it the inner TS bytes plus the upstream
+                        // 90 kHz timestamp.
+                        if wire_tx
+                            .try_send((datagram.to_vec(), packet.recv_time_us, packet.rtp_timestamp))
+                            .is_err()
+                        {
+                            stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
             } else {
-                // RTP-wrapped data: send as-is (already properly framed).
-                // Sample PCR from the payload (skip the 12-byte RTP header).
-                let pcr_sample = if packet.data.len() > crate::engine::ts_parse::RTP_HEADER_MIN_SIZE {
-                    crate::engine::ts_parse::first_pcr_in_ts_buffer(
-                        &packet.data[crate::engine::ts_parse::RTP_HEADER_MIN_SIZE..],
-                    )
+                // Already-RTP-wrapped data: strip the header, hand the
+                // inner TS to the wire task. The wire's `RtpWrapState`
+                // re-emits a fresh header with our SSRC + monotonic
+                // sequence — necessary because the upstream TS may
+                // come from a non-RTP source whose RTP header is
+                // synthetic.
+                let inner_ts = if packet.data.len() > crate::engine::ts_parse::RTP_HEADER_MIN_SIZE {
+                    packet.data[crate::engine::ts_parse::RTP_HEADER_MIN_SIZE..].to_vec()
                 } else {
-                    None
+                    Vec::new()
                 };
-                match socket.send_to(&packet.data, dest).await {
-                    Ok(sent) => {
-                        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                        stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                        stats.record_latency(packet.recv_time_us);
-                        if let Some(pcr) = pcr_sample {
-                            stats.record_pcr_egress(pcr, crate::util::time::now_us());
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("RTP output '{}' send error: {e}", config.id);
-                    }
+                if wire_tx
+                    .try_send((inner_ts, packet.recv_time_us, packet.rtp_timestamp))
+                    .is_err()
+                {
+                    stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
 
@@ -635,6 +662,8 @@ async fn rtp_output_loop(
 
     Ok(())
 }
+
+
 
 // ---------------------------------------------------------------------------
 // SMPTE 2022-7 dual-leg RTP output

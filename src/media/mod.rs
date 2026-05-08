@@ -32,6 +32,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
+pub mod probe;
+pub use probe::{MediaAudioStreamInfo, MediaVideoStreamInfo};
+
 /// Hard ceiling per individual asset (4 GiB).
 pub const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Soft ceiling for the entire library footprint (16 GiB). The upload
@@ -59,10 +62,16 @@ pub struct MediaFileInfo {
 /// up to ~50 Mbps and keeps the WS round-trip under a few ms on typical
 /// disk hardware.
 pub const SCAN_PROBE_BYTES: usize = 512 * 1024;
+/// Bytes read from the tail of the file to anchor the PCR-delta bitrate
+/// estimate. 64 KiB is plenty to land at least one PCR-bearing packet
+/// even on sparse-PCR audio-only programs.
+pub const TAIL_PROBE_BYTES: usize = 64 * 1024;
+const TS_PACKET_SIZE_U64: u64 = crate::engine::ts_parse::TS_PACKET_SIZE as u64;
 
 /// One program inside a media-library MPEG-TS file. Surfaced to the
 /// manager UI so the operator can pick from a real list rather than
-/// guessing program numbers.
+/// guessing program numbers, and see at a glance what codecs / resolution
+/// each program carries.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MediaProgramInfo {
     /// Program number from the PAT. Always `> 0` for real programs (0 is
@@ -71,6 +80,18 @@ pub struct MediaProgramInfo {
     /// PMT PID for this program. Useful diagnostic; the UI displays it
     /// alongside the program number.
     pub pmt_pid: u16,
+    /// PCR PID from the PMT. `None` when no PMT was found in the probe
+    /// window or the PMT signalled `0x1FFF` (no PCR).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcr_pid: Option<u16>,
+    /// Video elementary streams declared by the PMT, in PMT order. Empty
+    /// when no PMT was found in the probe window or the program is
+    /// audio-only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub video_streams: Vec<MediaVideoStreamInfo>,
+    /// Audio elementary streams declared by the PMT, in PMT order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio_streams: Vec<MediaAudioStreamInfo>,
 }
 
 /// Result of [`MediaLibrary::scan_programs`].
@@ -89,36 +110,37 @@ pub struct MediaScanResult {
     /// a stale picker selection).
     #[serde(default, skip_serializing_if = "is_false")]
     pub not_found: bool,
+    /// File size in bytes, for UI display alongside bitrate / duration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size_bytes: Option<u64>,
+    /// Estimated whole-file average bitrate in bits/sec, derived from the
+    /// PCR delta between the first PCR observed in the head and the last
+    /// PCR observed in the tail. `None` when no PCR was observable in
+    /// either window or the file is too short to span two PCR samples.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate_bps: Option<u64>,
+    /// Estimated playable duration in milliseconds, from the same PCR
+    /// delta. Useful for the picker UI to render a `mm:ss` hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 #[inline]
 fn is_false(b: &bool) -> bool { !*b }
 
-/// Walk a TS-shaped byte buffer and return the first PAT's program
-/// list. Pure function for unit-testability — the async wrapper just
-/// reads the first chunk of bytes and hands them in.
-///
-/// Auto-detects the on-disk packet stride: 188 (canonical MPEG-TS),
-/// 192 (M2TS / AVCHD / Blu-ray BDAV — 4-byte timestamp per packet),
-/// or 204 (DVB Reed-Solomon parity-suffixed broadcast capture). The
-/// PAT body lives inside the leading 188 bytes of every variant, so
-/// once the stride is known the parse path is identical.
-pub fn scan_programs_in_buf(buf: &[u8]) -> MediaScanResult {
-    use crate::engine::ts_parse::{TS_PACKET_SIZE, TS_SYNC_BYTE, parse_pat_programs, ts_pid, ts_pusi};
-
-    // Try strides 188 → 192 → 204. Each candidate confirms by walking
-    // forward from a sync byte and checking that the next stride boundary
-    // is also a sync byte (one extra hit, rather than the input_media_player
-    // probe's 5 — the scanner only needs to land on one PAT, and the file
-    // tail might not have many packets).
+/// Detect the on-disk packet stride of a TS-shaped buffer. Returns
+/// `(stride, start_offset)` if a confirmed sync pattern is found, else
+/// `None`. Auto-detects 188 (canonical MPEG-TS), 192 (M2TS / AVCHD /
+/// Blu-ray BDAV — 4-byte timestamp per packet), or 204 (DVB
+/// Reed-Solomon parity-suffixed broadcast capture).
+pub(crate) fn detect_ts_stride(buf: &[u8]) -> Option<(usize, usize)> {
+    use crate::engine::ts_parse::{TS_PACKET_SIZE, TS_SYNC_BYTE};
     const STRIDE_CANDIDATES: [usize; 3] = [TS_PACKET_SIZE, 192, 204];
-    let mut detected: Option<(usize, usize)> = None; // (stride, start_offset)
-    'detect: for &stride in &STRIDE_CANDIDATES {
+    for &stride in &STRIDE_CANDIDATES {
         let mut start = 0usize;
         while start + 2 * stride <= buf.len() {
             if buf[start] == TS_SYNC_BYTE && buf[start + stride] == TS_SYNC_BYTE {
-                detected = Some((stride, start));
-                break 'detect;
+                return Some((stride, start));
             }
             start += 1;
         }
@@ -129,23 +151,39 @@ pub fn scan_programs_in_buf(buf: &[u8]) -> MediaScanResult {
         if stride == TS_PACKET_SIZE && buf.len() >= TS_PACKET_SIZE {
             for s in 0..=buf.len() - TS_PACKET_SIZE {
                 if buf[s] == TS_SYNC_BYTE {
-                    detected = Some((TS_PACKET_SIZE, s));
-                    break 'detect;
+                    return Some((TS_PACKET_SIZE, s));
                 }
             }
         }
     }
-    let (stride, start) = match detected {
+    None
+}
+
+/// Walk a TS-shaped byte buffer and return the first PAT's program list,
+/// each program enriched with its PMT-derived video / audio stream tables
+/// and (where the SPS / sequence-header lands inside the probe window)
+/// the first video stream's coded dimensions. Pure function for
+/// unit-testability — the async wrapper just reads the first chunk of
+/// bytes and hands them in. Bitrate / duration are filled in by the async
+/// wrapper after a separate tail read.
+pub fn scan_programs_in_buf(buf: &[u8]) -> MediaScanResult {
+    use crate::engine::ts_parse::{TS_PACKET_SIZE, TS_SYNC_BYTE, parse_pat_programs, ts_pid, ts_pusi};
+
+    let (stride, start) = match detect_ts_stride(buf) {
         Some(d) => d,
         None => {
             return MediaScanResult {
                 is_ts: false,
                 programs: Vec::new(),
                 not_found: false,
+                file_size_bytes: None,
+                bitrate_bps: None,
+                duration_ms: None,
             };
         }
     };
 
+    let mut programs_raw: Vec<(u16, u16)> = Vec::new();
     let mut offset = start;
     while offset + TS_PACKET_SIZE <= buf.len() {
         let pkt = &buf[offset..offset + TS_PACKET_SIZE];
@@ -160,27 +198,58 @@ pub fn scan_programs_in_buf(buf: &[u8]) -> MediaScanResult {
             continue;
         }
         let entries = parse_pat_programs(pkt);
-        // PAT entries with program_number == 0 are the NIT — drop them
-        // so the operator only sees real programs.
-        let mut programs: Vec<MediaProgramInfo> = entries
+        programs_raw = entries
             .into_iter()
             .filter(|(num, _)| *num != 0)
-            .map(|(num, pid)| MediaProgramInfo {
-                program_number: num,
-                pmt_pid: pid,
-            })
             .collect();
-        programs.sort_by_key(|p| p.program_number);
+        break;
+    }
+
+    if programs_raw.is_empty() {
         return MediaScanResult {
             is_ts: true,
-            programs,
+            programs: Vec::new(),
             not_found: false,
+            file_size_bytes: None,
+            bitrate_bps: None,
+            duration_ms: None,
         };
     }
+
+    let mut programs: Vec<MediaProgramInfo> = programs_raw
+        .into_iter()
+        .map(|(num, pmt_pid)| {
+            let mut pmt = probe::scan_pmt_in_buf(buf, stride, start, pmt_pid);
+            for v in &mut pmt.video_streams {
+                if let Some((w, h)) = probe::extract_video_dims(
+                    buf,
+                    stride,
+                    start,
+                    v.pid,
+                    v.stream_type,
+                ) {
+                    v.width = Some(w);
+                    v.height = Some(h);
+                }
+            }
+            MediaProgramInfo {
+                program_number: num,
+                pmt_pid,
+                pcr_pid: pmt.pcr_pid,
+                video_streams: pmt.video_streams,
+                audio_streams: pmt.audio_streams,
+            }
+        })
+        .collect();
+    programs.sort_by_key(|p| p.program_number);
+
     MediaScanResult {
         is_ts: true,
-        programs: Vec::new(),
+        programs,
         not_found: false,
+        file_size_bytes: None,
+        bitrate_bps: None,
+        duration_ms: None,
     }
 }
 
@@ -324,18 +393,91 @@ impl MediaLibrary {
                     is_ts: false,
                     programs: Vec::new(),
                     not_found: true,
+                    file_size_bytes: None,
+                    bitrate_bps: None,
+                    duration_ms: None,
                 });
             }
             Err(e) => return Err(anyhow!("open {}: {e}", path.display())),
         };
-        use tokio::io::AsyncReadExt;
-        let mut buf = vec![0u8; SCAN_PROBE_BYTES];
-        let n = file
-            .read(&mut buf)
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+        let file_size = file
+            .metadata()
             .await
-            .map_err(|e| anyhow!("read {}: {e}", path.display()))?;
-        buf.truncate(n);
-        Ok(scan_programs_in_buf(&buf))
+            .map(|m| m.len())
+            .map_err(|e| anyhow!("metadata {}: {e}", path.display()))?;
+
+        let mut head = vec![0u8; SCAN_PROBE_BYTES];
+        let n = file
+            .read(&mut head)
+            .await
+            .map_err(|e| anyhow!("read head {}: {e}", path.display()))?;
+        head.truncate(n);
+
+        let mut result = scan_programs_in_buf(&head);
+        result.file_size_bytes = Some(file_size);
+
+        // Bitrate / duration estimate via PCR delta. Pick the first
+        // program's PCR PID — for an MPTS every program shares the wire
+        // clock, so any one is fine. Skip cleanly when no PCR is
+        // observable in the head window or the file is too short to span
+        // a useful tail probe.
+        let pcr_pid = result
+            .programs
+            .iter()
+            .find_map(|p| p.pcr_pid);
+        if let Some(pcr_pid) = pcr_pid {
+            if let Some((stride, start)) = detect_ts_stride(&head) {
+                let first_pcr = probe::find_first_pcr(&head, stride, start, pcr_pid);
+                if let Some(first_pcr) = first_pcr {
+                    let tail_window = TAIL_PROBE_BYTES.min(file_size as usize) as u64;
+                    if file_size > tail_window && tail_window >= TS_PACKET_SIZE_U64 {
+                        let tail_offset = file_size - tail_window;
+                        if file
+                            .seek(std::io::SeekFrom::Start(tail_offset))
+                            .await
+                            .is_ok()
+                        {
+                            let mut tail = vec![0u8; tail_window as usize];
+                            if let Ok(tn) = file.read(&mut tail).await {
+                                tail.truncate(tn);
+                                if let Some((tail_stride, tail_start)) =
+                                    detect_ts_stride(&tail)
+                                {
+                                    if let Some(last_pcr) = probe::find_last_pcr(
+                                        &tail,
+                                        tail_stride,
+                                        tail_start,
+                                        pcr_pid,
+                                    ) {
+                                        // PCR is 27 MHz. Handle the rare
+                                        // wallclock wrap by ignoring
+                                        // negative deltas.
+                                        if last_pcr > first_pcr {
+                                            let delta_27mhz = last_pcr - first_pcr;
+                                            let duration_secs =
+                                                delta_27mhz as f64 / 27_000_000.0;
+                                            if duration_secs > 0.05 {
+                                                result.duration_ms =
+                                                    Some((duration_secs * 1000.0) as u64);
+                                                result.bitrate_bps = Some(
+                                                    (file_size as f64 * 8.0
+                                                        / duration_secs)
+                                                        as u64,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// Hard-delete a file. Filename validation is the caller's responsibility

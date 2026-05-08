@@ -343,6 +343,74 @@ those libraries are statically linked into the `*-full` binary.
 
 ---
 
+## Tier-1 PCR jitter setup (`SO_TXTIME` + `fq` qdisc)
+
+Outputs that re-encode (audio_encode / video_encode set on a UDP or
+RTP output) hit a Tokio timer-precision floor (~1–5 ms) when the
+wire-side pacing happens entirely in user space. To take pacing down
+to sub-µs the kernel needs to do the scheduling — Linux's `SO_TXTIME`
+with the `fq` qdisc.
+
+The edge already enables `SO_TXTIME` on every UDP egress socket; you
+need to flip the kernel's queue discipline once per host so it
+honours the cmsg.
+
+```bash
+# replace `eno4` with the actual broadcast egress NIC
+sudo tc qdisc replace dev eno4 root fq limit 10000 flow_limit 1000
+
+# only needed for accurate localhost TS measurement
+sudo tc qdisc replace dev lo   root fq limit 10000 flow_limit 1000
+```
+
+Verify:
+
+```bash
+$ tc qdisc show dev eno4
+qdisc fq 8001: root refcnt 5 limit 10000p flow_limit 1000p ...
+```
+
+`flow_limit 1000p` (vs the default `100p`) covers worst-case encoder
+I-frame bursts plus the 50 ms wire preroll. The default gets clipped
+during bursty re-encoded flows and shows up as receiver-side PCR
+jitter.
+
+Persistence across reboot — drop a one-shot systemd unit (or
+NetworkManager dispatcher / systemd-networkd `[QDisc]` block; pick
+whichever matches the host):
+
+```ini
+# /etc/systemd/system/wire-fq.service
+[Unit]
+Description=fq qdisc for SO_TXTIME wire pacing
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/tc qdisc replace dev eno4 root fq limit 10000 flow_limit 1000
+ExecStart=/usr/sbin/tc qdisc replace dev lo   root fq limit 10000 flow_limit 1000
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable --now wire-fq.service
+```
+
+Without `fq`, the kernel ignores `SCM_TXTIME` and the wire pacer
+silently degrades to `tokio::time::sleep_until` precision. The edge
+still ships valid TS — drops and CC remain clean — only PCR-arrival
+jitter is affected. The startup log line `SO_TXTIME enabled
+(configure ETF qdisc on egress interface for sub-µs PCR jitter)` is
+the reminder.
+
+Full architecture, expected jitter numbers, and verification recipes
+live in [`wire-pacing.md`](wire-pacing.md).
+
+---
+
 ## Securing the setup wizard
 
 A fresh edge defaults to `setup_enabled: true` and exposes

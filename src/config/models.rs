@@ -1148,6 +1148,23 @@ pub struct ReplayInputConfig {
     /// recording).
     #[serde(default = "default_true")]
     pub start_paused: bool,
+    /// Optional audio re-encode applied at ingress, before the bytes
+    /// reach the flow broadcast channel. Same semantics as the live TS
+    /// inputs (RTP/SRT/RTMP/...). When set, the recorded ES is decoded,
+    /// optionally reshaped via `transcode`, re-encoded to the configured
+    /// codec, and re-muxed back into the published TS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional planar PCM transcode (channel shuffle / sample-rate /
+    /// bit-depth) applied between decode and `audio_encode`. Ignored
+    /// when `audio_encode` is not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Optional video re-encode applied at ingress. Decodes the recorded
+    /// video ES, re-encodes via the configured backend, and re-muxes the
+    /// output TS. Feature-gated like every other ingress `video_encode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode: Option<VideoEncodeConfig>,
 }
 
 /// Configuration for an in-process synthetic test-pattern input.
@@ -1180,6 +1197,23 @@ pub struct TestPatternInputConfig {
     /// Audio level in dBFS (negative). Default -20 dBFS (broadcast reference).
     #[serde(default = "default_tp_tone_dbfs")]
     pub tone_dbfs: f32,
+    /// Optional ingress audio re-encode applied to the synthesised tone
+    /// before the bytes reach the flow broadcast channel. Useful when a
+    /// downstream consumer needs a different codec / sample-rate than
+    /// the test-pattern's built-in AAC-LC stereo at 48 kHz.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional planar PCM transcode applied between decode and
+    /// `audio_encode`. Ignored when `audio_encode` is not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Optional ingress video re-encode applied to the synthesised
+    /// colour-bars before fan-out. Useful for testing alternative
+    /// encoder backends or codecs against a known-good signal — the
+    /// built-in encoder picked by `select_video_backend()` still produces
+    /// the bars, the replacer then transcodes to the requested target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode: Option<VideoEncodeConfig>,
 }
 
 fn default_tp_width() -> u16 { 1280 }
@@ -1273,6 +1307,22 @@ pub struct MediaPlayerInputConfig {
     /// Range 100 kbps … 200 Mbps; ignored for `mp4` and `image` kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paced_bitrate_bps: Option<u64>,
+    /// Optional audio re-encode applied at ingress, before the playlist
+    /// bytes reach the flow broadcast channel. Same plumbing as the live
+    /// TS inputs — decoded ES, optional `transcode` reshape, re-encode
+    /// to the configured codec, re-mux into the published TS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional planar PCM transcode applied between decode and
+    /// `audio_encode`. Ignored when `audio_encode` is not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Optional ingress video re-encode. Useful for normalising a
+    /// playlist of mixed codecs / resolutions to a single output codec
+    /// before fan-out — feature-gated like every other ingress
+    /// `video_encode` block (`video-encoder-x264` / `-x265` / `-nvenc`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encode: Option<VideoEncodeConfig>,
 }
 
 fn default_image_fps() -> u8 { 5 }

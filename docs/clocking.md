@@ -45,6 +45,8 @@ grandmaster regardless of input type.
 | `engine/pcr_ingress_sampler.rs` | Per-flow ingress PCR sampler. Sibling broadcast subscriber (drop-on-Lagged) that scans every `RtpPacket` for adaptation-field PCRs and feeds the master's PLL. Handles both raw TS and RTP-wrapped TS via best-effort RTP header skip. Passive observer — never blocks the data path. |
 | `engine/av_sync_mux.rs` | `AvSyncPacer` — thin wrapper around `MasterClockHandle` that exposes `pcr_27mhz_for_emit()` (master_now − PCR_PREROLL_27MHZ, modular-aware), `is_locked()`, and the lipsync trim. Plus `pcr_for_emit(pacer, pts)` helper that prefers the pacer when set, falls back to legacy `pts × 300 − preroll` otherwise. |
 | `stats/pcr_trust.rs` | Per-output egress PCR accuracy sampler (4096-sample rotating reservoir, exact percentiles). Sibling consumer of the same PCR sample stream as the ingress PLL, but on the egress side. |
+| `engine/wire_scheduler.rs` | Per-output PCR-anchored wire scheduler. Derives each datagram's wire-egress `Instant` from PCR values inside the stream — universal across CBR / VBR / CRF. Kicks in on the wire side after `pcr_for_emit` has stamped the PCR into the ES bytes. Full doc: [`wire-pacing.md`](wire-pacing.md). |
+| `util/so_txtime.rs` | Linux `SO_TXTIME` setsockopt + `sendmsg` with `SCM_TXTIME` for kernel-scheduled wire egress (sub-µs precision when paired with `fq` qdisc). Falls back to `tokio::time::sleep_until` on non-Linux. The wire scheduler's `Instant` contract is what's handed to the kernel. Setup steps + persistence in [`installation.md`](installation.md#tier-1-pcr-jitter-setup-so_txtime--fq-qdisc). |
 
 ## Data flow
 

@@ -419,18 +419,40 @@ struct InternalThumbnailResult {
 // In-process thumbnail backend (video-thumbnail feature)
 // ════════════════════════════════════════════════════════════════════════
 
+/// Anchor classification for a buffered access unit.
+///
+/// Streams that re-emit SPS/PPS mid-GOP (some broadcast contribution
+/// encoders do this every few seconds for resync robustness) make a
+/// pure `has_sps` heuristic mis-fire — picking a non-IDR SPS-bearing
+/// AU as anchor means the decoder is fed a non-RAP starting point and
+/// produces green / pixelated output until enough P-frames have flowed.
+/// `snapshot_for_decode` therefore prefers `Idr` over `ParamSet` over
+/// `None`, falling through only when the stronger marker is absent.
+#[cfg(feature = "video-thumbnail")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorKind {
+    /// Codec-defined random-access point — H.264 IDR (NAL 5), HEVC
+    /// NAL 19/20/21 (IDR_W_RADL / IDR_N_LP / CRA_NUT), MPEG-2
+    /// I-picture. The decoder can start cold from this AU.
+    Idr,
+    /// Parameter-set-only marker — H.264 SPS (NAL 7), HEVC
+    /// VPS/SPS/PPS (NAL 32/33/34), MPEG-2 sequence_header. Open-GOP
+    /// broadcast streams that never emit IDR rely on these to mark
+    /// recovery points; preferred only when no `Idr` exists in the
+    /// buffer.
+    ParamSet,
+    /// Not an anchor — VCL only, references prior frames.
+    None,
+}
+
 #[cfg(feature = "video-thumbnail")]
 struct ThumbnailFrame {
     /// Concatenated Annex B NALs (one access unit) ready to feed the decoder.
     annex_b: Vec<u8>,
     /// Presentation timestamp from the source PES (90 kHz ticks).
     pts: i64,
-    /// True for AUs the decoder can use as an anchor: codec-defined IDR
-    /// (H.264 NAL 5, HEVC NAL 19/20/21) **or** parameter-set carriers
-    /// (H.264 SPS, HEVC VPS/SPS/PPS) — broadcast streams that never emit
-    /// IDR rely on these to mark random-access points (open-GOP DVB-T,
-    /// SMPTE recovery_point pattern).
-    is_anchor: bool,
+    /// Random-access classification — see [`AnchorKind`].
+    anchor: AnchorKind,
 }
 
 /// Live-thumbnail loop state for the in-process backend.
@@ -474,16 +496,22 @@ impl LiveState {
                     is_keyframe,
                 } => {
                     self.codec = Some(video_codec::VideoCodec::H264);
-                    // SPS (NAL 7) marks a random-access point even when the
-                    // AU doesn't carry an IDR — open-GOP broadcast streams
-                    // (e.g. DVB-T 1080i25) rely on this convention. Without
-                    // it, my snapshot would never anchor on those streams
-                    // and the fallback window would have to cover a full
-                    // GOP every tick.
+                    // Classify two-tiered: codec-defined IDR (NAL 5) is
+                    // a clean random-access point. SPS (NAL 7) is only a
+                    // hint — some broadcast encoders re-emit SPS mid-GOP
+                    // every few seconds, so picking an SPS-only AU as
+                    // anchor mis-decodes the stream. The snapshotter
+                    // prefers IDR; ParamSet is the open-GOP fallback.
                     let has_sps = nalus.iter().any(|n| h264_nal_type(n) == 7);
-                    let is_anchor = is_keyframe || has_sps;
+                    let anchor = if is_keyframe {
+                        AnchorKind::Idr
+                    } else if has_sps {
+                        AnchorKind::ParamSet
+                    } else {
+                        AnchorKind::None
+                    };
                     let annex_b = build_annex_b(&nalus);
-                    self.push_frame(annex_b, pts, is_anchor);
+                    self.push_frame(annex_b, pts, anchor);
                 }
                 DemuxedFrame::H265 {
                     nalus,
@@ -491,14 +519,23 @@ impl LiveState {
                     is_keyframe,
                 } => {
                     self.codec = Some(video_codec::VideoCodec::Hevc);
-                    // VPS (32), SPS (33), PPS (34) at GOP boundary — same
-                    // logic as H.264 above. Some HEVC encoders emit
-                    // recovery via these alone without IDR/CRA.
+                    // VPS (32) / SPS (33) / PPS (34) at GOP boundary —
+                    // same two-tier logic as H.264. Prefer codec-defined
+                    // IDR_W_RADL / IDR_N_LP / CRA_NUT (NAL 19/20/21,
+                    // already folded into `is_keyframe`); fall back to
+                    // a parameter-set-bearing AU only when no IDR has
+                    // been seen.
                     let has_param_set =
                         nalus.iter().any(|n| matches!(h265_nal_type(n), 32 | 33 | 34));
-                    let is_anchor = is_keyframe || has_param_set;
+                    let anchor = if is_keyframe {
+                        AnchorKind::Idr
+                    } else if has_param_set {
+                        AnchorKind::ParamSet
+                    } else {
+                        AnchorKind::None
+                    };
                     let annex_b = build_annex_b(&nalus);
-                    self.push_frame(annex_b, pts, is_anchor);
+                    self.push_frame(annex_b, pts, anchor);
                 }
                 DemuxedFrame::Mpeg2 {
                     es,
@@ -506,12 +543,21 @@ impl LiveState {
                     is_keyframe,
                 } => {
                     self.codec = Some(video_codec::VideoCodec::Mpeg2);
-                    // For MPEG-2, an AU that opens with a sequence_header
-                    // (0x000001B3) is also a clean random-access anchor
-                    // — pre-roll for the I-picture inside the same AU.
+                    // MPEG-2: an AU opening with `sequence_header`
+                    // (0x000001B3) is a random-access point with the
+                    // I-picture inside the same AU. Prefer the codec-
+                    // defined I-picture flag (`is_keyframe`); fall back
+                    // to sequence_header for streams that don't surface
+                    // it through `is_keyframe`.
                     let has_seq = mpeg2_starts_with_sequence_header(&es);
-                    let is_anchor = is_keyframe || has_seq;
-                    self.push_frame(es, pts, is_anchor);
+                    let anchor = if is_keyframe {
+                        AnchorKind::Idr
+                    } else if has_seq {
+                        AnchorKind::ParamSet
+                    } else {
+                        AnchorKind::None
+                    };
+                    self.push_frame(es, pts, anchor);
                 }
                 // Audio variants are not consumed for thumbnails — drop them.
                 DemuxedFrame::Opus { .. }
@@ -525,7 +571,7 @@ impl LiveState {
         }
     }
 
-    fn push_frame(&mut self, annex_b: Vec<u8>, pts: u64, is_anchor: bool) {
+    fn push_frame(&mut self, annex_b: Vec<u8>, pts: u64, anchor: AnchorKind) {
         if annex_b.is_empty() {
             return;
         }
@@ -535,7 +581,7 @@ impl LiveState {
         self.frames.push_back(ThumbnailFrame {
             annex_b,
             pts: pts_i64,
-            is_anchor,
+            anchor,
         });
         self.frames_bytes += bytes;
         while self.frames_bytes > MAX_AU_BUFFER_BYTES {
@@ -549,13 +595,15 @@ impl LiveState {
     /// Snapshot the ring into a `(headers, packets, codec)` tuple ready
     /// for `decode_thumbnail_packets`. Anchor + send-count strategy:
     ///
-    /// - **Anchor**: latest random-access AU (`is_anchor = true`). For
-    ///   IDR-bearing streams this lands a few frames before the end of
-    ///   the ring; for open-GOP broadcast streams that mark random
-    ///   access via SPS+I-slice (DVB-T 1080i25), it lands at the most
-    ///   recent SPS-bearing AU — typically one full GOP back. If no
-    ///   anchor was ever seen (warm-up, non-standard stream) we fall
-    ///   back to `len - MAX_DECODE_FRAMES`.
+    /// - **Anchor**: prefer the **most recent IDR** (`AnchorKind::Idr`)
+    ///   — codec-defined random-access point, decoder starts cold and
+    ///   produces clean output. Some broadcast contribution encoders
+    ///   re-emit SPS mid-GOP every few seconds; mistaking those for
+    ///   random-access points means feeding the decoder a non-RAP and
+    ///   the result is a green / pixelated frame. Only when **no IDR
+    ///   exists in the buffer** (open-GOP DVB-T-style streams) do we
+    ///   fall back to the most recent `AnchorKind::ParamSet`. As a
+    ///   last resort, anchor at `len - MAX_DECODE_FRAMES`.
     /// - **Send count**: at most [`MAX_DECODE_FRAMES`] AUs from the
     ///   anchor forward. Bounds per-tick decoder work regardless of
     ///   GOP length, so a long-GOP MP4 source doesn't decode 250
@@ -567,10 +615,16 @@ impl LiveState {
             return None;
         }
         let len = self.frames.len();
-        let anchor = match self.frames.iter().rposition(|f| f.is_anchor) {
-            Some(idx) => idx,
-            None => len.saturating_sub(MAX_DECODE_FRAMES),
-        };
+        let anchor = self
+            .frames
+            .iter()
+            .rposition(|f| f.anchor == AnchorKind::Idr)
+            .or_else(|| {
+                self.frames
+                    .iter()
+                    .rposition(|f| f.anchor == AnchorKind::ParamSet)
+            })
+            .unwrap_or_else(|| len.saturating_sub(MAX_DECODE_FRAMES));
 
         let packets: Vec<(Vec<u8>, i64)> = self
             .frames
@@ -929,13 +983,18 @@ mod tests {
     fn snapshot_anchors_at_latest_keyframe_when_recent() {
         let mut state = LiveState::new(None);
         state.codec = Some(video_codec::VideoCodec::H264);
-        // Four frames: kf, non-kf, kf, non-kf — latest keyframe is well
+        // Four frames: idr, non-kf, idr, non-kf — latest IDR is well
         // within the recent-window cap so the anchor lands on it.
-        for (i, kf) in [(1, true), (2, false), (3, true), (4, false)] {
+        for (i, kind) in [
+            (1, AnchorKind::Idr),
+            (2, AnchorKind::None),
+            (3, AnchorKind::Idr),
+            (4, AnchorKind::None),
+        ] {
             state.frames.push_back(ThumbnailFrame {
                 annex_b: vec![i as u8],
                 pts: i,
-                is_anchor: kf,
+                anchor: kind,
             });
             state.frames_bytes += 1;
         }
@@ -948,12 +1007,10 @@ mod tests {
 
     #[test]
     fn snapshot_keeps_anchor_but_bounds_send_count_for_long_gop() {
-        // Long-GOP source (e.g. MP4 with 10 s GOP): keyframe is at
-        // index 0 of a much longer ring. Anchor stays at the keyframe
-        // so the decoder has a real random-access point, but the send
-        // count is capped at MAX_DECODE_FRAMES so we don't decode the
-        // whole GOP. Resulting thumbnail trails the live edge by
-        // ~MAX_DECODE_FRAMES / fps seconds — acceptable for long-GOP.
+        // Long-GOP source (e.g. MP4 with 10 s GOP): IDR is at index 0
+        // of a much longer ring. Anchor stays at the IDR so the decoder
+        // has a real random-access point, but the send count is capped
+        // at MAX_DECODE_FRAMES so we don't decode the whole GOP.
         let mut state = LiveState::new(None);
         state.codec = Some(video_codec::VideoCodec::H264);
         let total = MAX_DECODE_FRAMES + 50;
@@ -961,7 +1018,7 @@ mod tests {
             state.frames.push_back(ThumbnailFrame {
                 annex_b: vec![(i & 0xFF) as u8],
                 pts: i as i64,
-                is_anchor: i == 1, // only the very first frame is an anchor
+                anchor: if i == 1 { AnchorKind::Idr } else { AnchorKind::None },
             });
             state.frames_bytes += 1;
         }
@@ -972,45 +1029,71 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_anchors_at_old_sps_for_open_gop_then_caps_packets() {
-        // Open-GOP broadcast pattern (SBS-style DVB-T): no IDR ever, but
-        // SPS+I-slice every ~62 frames. The anchor lands on the latest
-        // SPS-bearing AU even when it's older than MAX_DECODE_FRAMES from
-        // the end of the ring — that's the only random-access point the
-        // decoder can lock onto. We then send up to MAX_DECODE_FRAMES from
-        // there forward.
+    fn snapshot_prefers_idr_over_paramset_when_both_present() {
+        // Broadcast contribution streams that re-emit SPS mid-GOP: the
+        // most recent ParamSet AU is mid-GOP and would mis-decode if
+        // chosen as anchor. Verify the snapshotter walks back to the
+        // most recent IDR instead, even when ParamSet markers exist
+        // closer to the live edge.
         let mut state = LiveState::new(None);
         state.codec = Some(video_codec::VideoCodec::H264);
-        // 100 frames; SPS at idx=20 (60 frames back from end > MAX_DECODE_FRAMES).
-        let total = 100;
-        let sps_idx = 20;
+        // Layout: [IDR, ..., ParamSet, ..., ParamSet, ...] with last
+        // ParamSet at index 18 and last IDR at index 5.
+        let total = 30;
         for i in 0..total {
+            let kind = match i {
+                5 => AnchorKind::Idr,
+                12 | 18 => AnchorKind::ParamSet,
+                _ => AnchorKind::None,
+            };
             state.frames.push_back(ThumbnailFrame {
                 annex_b: vec![(i & 0xFF) as u8],
                 pts: i as i64,
-                is_anchor: i == sps_idx,
+                anchor: kind,
             });
             state.frames_bytes += 1;
         }
         let (_headers, packets, _codec) = state.snapshot_for_decode().unwrap();
-        // Anchor at SPS, send up to MAX_DECODE_FRAMES forward.
+        // Must anchor at index 5 (the IDR), not at 18 (latest ParamSet).
+        assert_eq!(packets[0].1, 5);
+    }
+
+    #[test]
+    fn snapshot_falls_back_to_paramset_when_no_idr() {
+        // Pure open-GOP broadcast (e.g. SBS DVB-T): only ParamSet AUs.
+        // Anchor lands on the most recent ParamSet — the only random-
+        // access marker the decoder can lock onto.
+        let mut state = LiveState::new(None);
+        state.codec = Some(video_codec::VideoCodec::H264);
+        let total = 100;
+        let sps_idx = 20;
+        for i in 0..total {
+            let kind = if i == sps_idx { AnchorKind::ParamSet } else { AnchorKind::None };
+            state.frames.push_back(ThumbnailFrame {
+                annex_b: vec![(i & 0xFF) as u8],
+                pts: i as i64,
+                anchor: kind,
+            });
+            state.frames_bytes += 1;
+        }
+        let (_headers, packets, _codec) = state.snapshot_for_decode().unwrap();
         assert_eq!(packets.len(), MAX_DECODE_FRAMES);
         assert_eq!(packets[0].1, sps_idx as i64);
         assert_eq!(packets.last().unwrap().1, (sps_idx + MAX_DECODE_FRAMES - 1) as i64);
     }
 
     #[test]
-    fn snapshot_anchors_at_oldest_when_no_keyframe_within_cap() {
-        // Open-GOP stream: no NALU type 5 ever surfaced. With fewer
-        // frames in the ring than `MAX_DECODE_FRAMES`, the fallback
-        // anchor is the oldest AU (full retained window).
+    fn snapshot_anchors_at_oldest_when_no_anchor_within_cap() {
+        // Stream with no IDR or ParamSet markers ever surfaced. With
+        // fewer frames in the ring than `MAX_DECODE_FRAMES`, the
+        // fallback anchor is the oldest AU (full retained window).
         let mut state = LiveState::new(None);
         state.codec = Some(video_codec::VideoCodec::H264);
         for i in 1..=3 {
             state.frames.push_back(ThumbnailFrame {
                 annex_b: vec![i as u8],
                 pts: i as i64,
-                is_anchor: false,
+                anchor: AnchorKind::None,
             });
             state.frames_bytes += 1;
         }
@@ -1021,9 +1104,8 @@ mod tests {
 
     #[test]
     fn snapshot_caps_fallback_to_recent_window() {
-        // Open-GOP stream with a long retention: only the last
-        // `MAX_DECODE_FRAMES` AUs are sent — enough context for a
-        // recovery_point SEI to anchor without saturating CPU.
+        // Stream with a long retention but no anchor markers ever
+        // surfaced: only the last `MAX_DECODE_FRAMES` AUs are sent.
         let mut state = LiveState::new(None);
         state.codec = Some(video_codec::VideoCodec::H264);
         let total = MAX_DECODE_FRAMES + 50;
@@ -1031,7 +1113,7 @@ mod tests {
             state.frames.push_back(ThumbnailFrame {
                 annex_b: vec![(i & 0xFF) as u8],
                 pts: i as i64,
-                is_anchor: false,
+                anchor: AnchorKind::None,
             });
             state.frames_bytes += 1;
         }
@@ -1054,9 +1136,9 @@ mod tests {
         // Push frames totalling > MAX_AU_BUFFER_BYTES via a single
         // oversized synthetic AU — easier than spinning up real ones.
         let big = vec![0u8; MAX_AU_BUFFER_BYTES / 2 + 1];
-        state.push_frame(big.clone(), 1, false);
-        state.push_frame(big.clone(), 2, false);
-        state.push_frame(big, 3, false);
+        state.push_frame(big.clone(), 1, AnchorKind::None);
+        state.push_frame(big.clone(), 2, AnchorKind::None);
+        state.push_frame(big, 3, AnchorKind::None);
         // Oldest two should have been evicted; only the last remains.
         assert_eq!(state.frames.len(), 1);
         assert_eq!(state.frames[0].pts, 3);

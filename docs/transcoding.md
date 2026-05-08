@@ -45,6 +45,9 @@ anything documented below for outputs applies to inputs verbatim.
 | **RTMP**   | ✅ | ✅ | ✅ | Applied on the `TsMuxer` output, before broadcast. |
 | **RTSP**   | ✅ | ✅ | ✅ | Same as RTMP. |
 | **WebRTC (WHIP / WHEP)** | ✅ | ✅ | ✅ | Applied after the `ts_demux` re-mux. |
+| **Test pattern** | ✅ | ✅ (requires `audio_encode`) | ✅ | Synthetic SMPTE bars + 1 kHz tone are muxed to TS first, then routed through the standard `InputTranscoder` — useful for codec test rigs that need a known-good signal in a non-default codec / bitrate. |
+| **Media player** | ✅ | ✅ (requires `audio_encode`) | ✅ | All three source kinds (raw TS / MP4 / image slate) emit MPEG-TS, then re-encode through the same `InputTranscoder` plumbing as the live inputs. Useful for normalising a mixed-codec playlist to a single output codec before fan-out. |
+| **Replay** | ✅ | ✅ (requires `audio_encode`) | ✅ | Recorded TS segments are paced from disk and routed through `InputTranscoder` — useful when the destination needs a different codec from the captured bitstream. Speed-shifted playback (`speed != 1.0`) rewrites PCR/PTS first; the transcoder then sees the rewritten timestamps. |
 | **ST 2110-20 / -23** | ❌ | ❌ | ✅ (**required**) | Uncompressed RFC 4175 → H.264/HEVC on ingest — mandatory, was shipped in Phase 2. |
 | **ST 2110-30** | ⏳ (see below) | ✅ (native PCM reshape) | ❌ | `transcode` reshapes linear PCM in place. `audio_encode` changes the broadcast-channel shape to TS (rejects PCM-only outputs on the same flow); runtime muxer lands in a follow-up and currently returns `AudioEncodeNotYetImplemented`, falling back to passthrough with a loud log. |
 | **`rtp_audio`** | ⏳ | ✅ | ❌ | Same story as ST 2110-30. |

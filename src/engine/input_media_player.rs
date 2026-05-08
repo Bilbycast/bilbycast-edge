@@ -151,6 +151,38 @@ async fn run(
         &flow_id,
     );
 
+    // Build the ingress transcoder once for the whole playlist lifetime so
+    // PMT discovery and codec buffers persist across file transitions.
+    let mut transcoder = match crate::engine::input_transcode::InputTranscoder::new(
+        config.audio_encode.as_ref(),
+        config.transcode.as_ref(),
+        config.video_encode.as_ref(),
+        None,
+    ) {
+        Ok(t) => {
+            if let Some(ref t) = t {
+                tracing::info!("Media-player input: ingress transcode active — {}", t.describe());
+            }
+            t
+        }
+        Err(e) => {
+            events.emit_flow(
+                EventSeverity::Critical,
+                category::FLOW,
+                format!("Media-player input transcode disabled: {e}"),
+                &flow_id,
+            );
+            None
+        }
+    };
+    crate::engine::input_transcode::register_ingress_stats(
+        stats.as_ref(),
+        &input_id,
+        transcoder.as_ref(),
+        config.audio_encode.as_ref(),
+        config.video_encode.as_ref(),
+    );
+
     let mut seq_num: u16 = 0;
     // One continuity state for the whole playlist's lifetime — carried
     // across loops and file transitions so the on-wire CC + PTS + PCR
@@ -175,6 +207,7 @@ async fn run(
                 stats: &stats,
                 cancel: &cancel,
                 cont: &mut cont,
+                transcoder: &mut transcoder,
             };
             let result = play_source(source, &config, &mut session).await;
             if let Err(e) = result {
@@ -230,6 +263,9 @@ pub(super) struct PlayerSession<'a> {
     /// Continuity carried across loop and playlist boundaries — see
     /// [`SpliceContinuity`].
     pub(super) cont: &'a mut SpliceContinuity,
+    /// Optional ingress transcoder. None ⇒ passthrough. Borrowed from
+    /// the task-level state so it persists across the playlist.
+    pub(super) transcoder: &'a mut Option<crate::engine::input_transcode::InputTranscoder>,
 }
 
 /// 30 ms gap inserted between the previous file's last emitted PTS and the
@@ -478,10 +514,28 @@ async fn play_ts_file(
 
     let mut bundle = BytesMut::with_capacity(BUNDLE_SIZE);
     let mut packet = [0u8; TS_PACKET];
-    let mut first_pcr_27mhz: Option<u64> = None;
-    let mut first_wall: Option<Instant> = None;
-    let mut bundle_emit_count: u64 = 0;
-    let bundle_start_wall = Instant::now();
+
+    // ── Per-bundle wallclock pacer ─────────────────────────────────────
+    //
+    // Earlier shape was per-PCR sleep: between PCR-bearing packets the
+    // loop ran at memory speed and `emit_bundle` flushed bundles onto
+    // `broadcast_tx` back-to-back, then slept until the next PCR. At
+    // 5 Mbps with PCRs every 40 ms that's ~19 bundles (~25 KB) bursting
+    // out in microseconds — the receiver saw PCR arrival jitter of tens
+    // of ms (47× over the DVB MGuard 5 ms limit), and pro decoders fired
+    // "input jitter" alarms.
+    //
+    // New shape: pace every bundle by a running bitrate estimate
+    // anchored on the most recent PCR. Bitrate is updated by EMA from
+    // the (bytes emitted, PCR delta) pairs of consecutive PCRs, so the
+    // estimate converges to the source's actual rate within a few PCRs.
+    // Re-anchoring on every PCR bounds wallclock drift to one
+    // inter-PCR period (~30–40 ms) regardless of estimate accuracy.
+    let mut bitrate_bps: u64 = paced_bitrate_bps.unwrap_or(DEFAULT_FALLBACK_BITRATE_BPS);
+    let mut paced_anchor_wall: Option<Instant> = None;
+    let mut paced_anchor_bytes: u64 = 0;
+    let mut last_pcr_for_bitrate: Option<(u64, u64)> = None;
+    let mut bytes_emitted: u64 = 0;
     // Optional MPTS → SPTS down-select. Pre-allocated 188-byte scratch so
     // the per-packet path stays allocation-free (the filter writes 0 or
     // 188 bytes per input packet).
@@ -573,27 +627,32 @@ async fn play_ts_file(
         }
 
         if let Some(pcr) = raw_pcr {
-            match (first_pcr_27mhz, first_wall) {
-                (None, _) => {
-                    first_pcr_27mhz = Some(pcr);
-                    first_wall = Some(Instant::now());
-                }
-                (Some(p0), Some(w0)) => {
-                    // Discard implausible jumps so PCR resets / wraps don't
-                    // park us in the future or stall.
-                    let pcr_delta = pcr.wrapping_sub(p0);
-                    let max_plausible_us: u64 = 60 * 60 * 6 * 1_000_000; // 6 hours
-                    let target_offset_us = pcr_delta / 27;
-                    if target_offset_us < max_plausible_us {
-                        let target = w0 + Duration::from_micros(target_offset_us);
-                        tokio::select! {
-                            _ = session.cancel.cancelled() => break,
-                            _ = tokio::time::sleep_until(target) => {}
-                        }
+            // Update the running bitrate estimate from the window since
+            // the previous PCR. Filter out implausible inter-PCR gaps —
+            // PCR resets, file wraps, and seek-induced gaps would
+            // otherwise produce nonsense bitrates that take many windows
+            // to wash out of the EMA.
+            let pcr_byte_pos = bytes_emitted + bundle.len() as u64;
+            if let Some((prev_pcr, prev_bytes)) = last_pcr_for_bitrate {
+                let pcr_delta = pcr.wrapping_sub(prev_pcr);
+                let pcr_us = pcr_delta / 27;
+                if (1_000..=2_000_000).contains(&pcr_us) {
+                    let bytes_delta = pcr_byte_pos.saturating_sub(prev_bytes);
+                    if bytes_delta > 0 {
+                        let observed_bps = bytes_delta
+                            .saturating_mul(8 * 1_000_000)
+                            / pcr_us;
+                        // EMA: 1/4 toward observed → ~10 PCRs to 95 %.
+                        bitrate_bps = (observed_bps + 3 * bitrate_bps) / 4;
                     }
                 }
-                _ => {}
             }
+            last_pcr_for_bitrate = Some((pcr, pcr_byte_pos));
+            // Re-anchor every PCR — bounds residual drift between our
+            // bitrate-paced wallclock and the source's PCR-paced clock
+            // to one inter-PCR period.
+            paced_anchor_wall = Some(Instant::now());
+            paced_anchor_bytes = pcr_byte_pos;
         }
 
         // ── Smooth-splice rewriters (in place, no allocation) ──────────
@@ -617,18 +676,38 @@ async fn play_ts_file(
 
         bundle.extend_from_slice(&packet);
         if bundle.len() >= BUNDLE_SIZE {
-            // Pure-bitrate fallback when no PCR has been seen (rare —
-            // even simple ffmpeg files include PCRs).
-            if first_pcr_27mhz.is_none() {
-                let bitrate = paced_bitrate_bps.unwrap_or(DEFAULT_FALLBACK_BITRATE_BPS);
-                let interval_us = (BUNDLE_SIZE as u64 * 8 * 1_000_000) / bitrate.max(1);
-                bundle_emit_count += 1;
-                let target =
-                    bundle_start_wall + Duration::from_micros(interval_us * bundle_emit_count);
-                tokio::select! {
-                    _ = session.cancel.cancelled() => break,
-                    _ = tokio::time::sleep_until(target) => {}
+            // Per-bundle wallclock sleep. Anchor lazily on first emit so
+            // the (rare) no-PCR-ever-seen path still paces — at the
+            // operator-supplied `paced_bitrate_bps` or default fallback.
+            // Lazy-init advances `paced_anchor_bytes` by `BUNDLE_SIZE`
+            // so the first bundle emits at the anchor (not delayed).
+            let anchor = match paced_anchor_wall {
+                Some(a) => a,
+                None => {
+                    let now = Instant::now();
+                    paced_anchor_wall = Some(now);
+                    paced_anchor_bytes = bytes_emitted + BUNDLE_SIZE as u64;
+                    now
                 }
+            };
+            // Increment FIRST so `bytes_since_anchor` reflects the byte
+            // position at the END of this bundle — matches the wall
+            // moment we want to be on the wire. Using `bytes_emitted`
+            // pre-increment causes a one-bundle-period burst right
+            // after every PCR re-anchor (anchor sits at PCR's mid-bundle
+            // byte position, pre-increment under-counts by `BUNDLE_SIZE`,
+            // saturating_sub clamps the gap to zero, target lands at
+            // `now`, the next bundle then emits ~600 µs later instead of
+            // ~2.1 ms — receiver sees per-PCR mini-bursts).
+            bytes_emitted = bytes_emitted.saturating_add(BUNDLE_SIZE as u64);
+            let bytes_since_anchor = bytes_emitted.saturating_sub(paced_anchor_bytes);
+            let target_us = bytes_since_anchor
+                .saturating_mul(8 * 1_000_000)
+                / bitrate_bps.max(1);
+            let target = anchor + Duration::from_micros(target_us);
+            tokio::select! {
+                _ = session.cancel.cancelled() => break,
+                _ = tokio::time::sleep_until(target) => {}
             }
             emit_bundle(&mut bundle, session, fake_rtp_ts(session));
         }
@@ -1034,7 +1113,13 @@ pub(super) fn emit_bundle(
         .stats
         .input_bytes
         .fetch_add(total_len as u64, Ordering::Relaxed);
-    let _ = session.per_input_tx.send(pkt);
+    // Route through the optional ingress transcoder. None ⇒ passthrough
+    // (single broadcast send). Some ⇒ block_in_place re-encode then send.
+    crate::engine::input_transcode::publish_input_packet(
+        session.transcoder,
+        session.per_input_tx,
+        pkt,
+    );
 }
 
 /// Fabricate an RTP timestamp from wall-clock 90 kHz. The TS file's actual
@@ -1462,6 +1547,7 @@ mod tests {
         let mut cont = SpliceContinuity::default();
 
         cont.open_file("dvb-fixture.ts");
+        let mut transcoder: Option<crate::engine::input_transcode::InputTranscoder> = None;
         {
             let mut session = PlayerSession {
                 seq_num: &mut seq_num,
@@ -1469,6 +1555,7 @@ mod tests {
                 stats: &stats,
                 cancel: &cancel,
                 cont: &mut cont,
+                transcoder: &mut transcoder,
             };
             play_ts_file(&path, None, None, &mut session).await.unwrap();
         }
@@ -1641,6 +1728,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut seq_num: u16 = 0;
         let mut cont = SpliceContinuity::default();
+        let mut transcoder: Option<crate::engine::input_transcode::InputTranscoder> = None;
 
         // Iteration 1 — cold start.
         cont.open_file("loop-fixture.ts");
@@ -1651,6 +1739,7 @@ mod tests {
                 stats: &stats,
                 cancel: &cancel,
                 cont: &mut cont,
+                transcoder: &mut transcoder,
             };
             play_ts_file(&path, None, None, &mut session).await.unwrap();
         }
@@ -1664,6 +1753,7 @@ mod tests {
                 stats: &stats,
                 cancel: &cancel,
                 cont: &mut cont,
+                transcoder: &mut transcoder,
             };
             play_ts_file(&path, None, None, &mut session).await.unwrap();
         }

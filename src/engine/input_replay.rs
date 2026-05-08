@@ -81,6 +81,39 @@ async fn run(
     let mut playing = !config.start_paused && config.clip_id.is_some()
         || (!config.start_paused && config.clip_id.is_none());
     let mut pacing = PacingState::new();
+    // Build the ingress transcoder once for the input task lifetime so
+    // PMT discovery and codec buffers persist across cue / scrub /
+    // play boundaries. None ⇒ passthrough at the cost of a single
+    // function call per bundle.
+    let mut transcoder = match crate::engine::input_transcode::InputTranscoder::new(
+        config.audio_encode.as_ref(),
+        config.transcode.as_ref(),
+        config.video_encode.as_ref(),
+        None,
+    ) {
+        Ok(t) => {
+            if let Some(ref t) = t {
+                tracing::info!(target: "replay", "ingress transcode active — {}", t.describe());
+            }
+            t
+        }
+        Err(e) => {
+            events.emit_flow(
+                EventSeverity::Critical,
+                category::FLOW,
+                format!("Replay input transcode disabled: {e}"),
+                &flow_id,
+            );
+            None
+        }
+    };
+    crate::engine::input_transcode::register_ingress_stats(
+        flow_stats.as_ref(),
+        &input_id,
+        transcoder.as_ref(),
+        config.audio_encode.as_ref(),
+        config.video_encode.as_ref(),
+    );
     if playing {
         emit_play_started(&events, &flow_id, &input_id, &reader);
     }
@@ -101,7 +134,7 @@ async fn run(
             // command channel to interrupt mid-playback (cue / scrub /
             // stop) — embed the loop body inline so each iteration is
             // tokio::select-able.
-            res = pump_one_bundle(&mut reader, &per_input_tx, &flow_stats, &mut pacing), if playing => {
+            res = pump_one_bundle(&mut reader, &per_input_tx, &flow_stats, &mut pacing, &mut transcoder), if playing => {
                 match res {
                     Ok(true) => {} // bundle published, continue
                     Ok(false) => {
@@ -387,6 +420,7 @@ async fn pump_one_bundle(
     per_input_tx: &broadcast::Sender<RtpPacket>,
     flow_stats: &Arc<FlowStatsAccumulator>,
     pacing: &mut PacingState,
+    transcoder: &mut Option<crate::engine::input_transcode::InputTranscoder>,
 ) -> Result<bool> {
     use bytes::Bytes;
     use std::sync::atomic::Ordering;
@@ -450,7 +484,7 @@ async fn pump_one_bundle(
                 upstream_seq: None,
                 upstream_leg_id: None,
             };
-            let _ = per_input_tx.send(pkt);
+            crate::engine::input_transcode::publish_input_packet(transcoder, per_input_tx, pkt);
             flow_stats.input_bytes.fetch_add(bundle_len as u64, Ordering::Relaxed);
             flow_stats.input_packets.fetch_add(1, Ordering::Relaxed);
         }
@@ -517,7 +551,7 @@ async fn pump_one_bundle(
         upstream_seq: None,
         upstream_leg_id: None,
     };
-    let _ = per_input_tx.send(pkt);
+    crate::engine::input_transcode::publish_input_packet(transcoder, per_input_tx, pkt);
     flow_stats.input_bytes.fetch_add(bundle_len as u64, Ordering::Relaxed);
     flow_stats.input_packets.fetch_add(1, Ordering::Relaxed);
     Ok(true)
