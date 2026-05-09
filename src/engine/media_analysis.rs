@@ -2307,7 +2307,7 @@ mod tests {
         let mut bits: Vec<u8> = Vec::new();
         let mut bitpos = 0u8;
         let mut cur: u8 = 0;
-        let mut push = |bits_out: &mut Vec<u8>, value: u32, n: u8, bitpos: &mut u8, cur: &mut u8| {
+        let push = |bits_out: &mut Vec<u8>, value: u32, n: u8, bitpos: &mut u8, cur: &mut u8| {
             for i in (0..n).rev() {
                 let bit = ((value >> i) & 1) as u8;
                 *cur |= bit << (7 - *bitpos);

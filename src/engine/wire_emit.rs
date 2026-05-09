@@ -45,6 +45,18 @@
 //! Same accounting as the previous in-line wire task: `packets_sent`,
 //! `bytes_sent`, `record_latency()`, `record_pcr_egress()`. Encoder-side
 //! `try_send` overflow is counted under `packets_dropped`.
+//!
+//! ## Status — preserved, not yet wired
+//!
+//! Module + 12 unit tests landed; re-integration into `output_udp.rs` /
+//! `output_rtp.rs` is deferred until the upstream PCR-cadence bug in
+//! `ts_video_replace` / `av_sync_mux::pcr_for_emit` is resolved (see
+//! `docs/wire-pacing.md` and the project memory entry on PCR jitter).
+//! Sub-ms PCR jitter at the receiver requires this module — do not
+//! delete. The module-level `#![allow(dead_code)]` below silences the
+//! warnings the deferred integration would otherwise produce.
+
+#![allow(dead_code)]
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;

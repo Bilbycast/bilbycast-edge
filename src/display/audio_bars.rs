@@ -1421,7 +1421,7 @@ mod tests {
         // Capture the buffer state after only the bars rasterise so we
         // can compare what the header rasterise added (or didn't).
         rasterise_overlay(&snap, &mut buf, pitch, w, h);
-        let mut after_bars = buf.clone();
+        let after_bars = buf.clone();
         rasterise_header_overlay(&snap, &header, &mut buf, pitch, w, h);
         // Header should be a no-op on this geometry.
         assert_eq!(after_bars, buf, "header should skip when avail_w too tight");
