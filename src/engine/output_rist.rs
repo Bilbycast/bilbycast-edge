@@ -55,6 +55,7 @@ pub fn spawn_rist_output(
     event_sender: EventSender,
     flow_id: String,
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+    active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
 
@@ -83,6 +84,7 @@ pub fn spawn_rist_output(
             &event_sender,
             &flow_id,
             av_sync_pacer,
+            active_input_rx,
         )
         .await
         {
@@ -181,6 +183,7 @@ async fn rist_output_loop(
     events: &EventSender,
     flow_id: &str,
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+    active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> anyhow::Result<()> {
     let remote: SocketAddr = config.remote_addr.parse()?;
 
@@ -334,6 +337,22 @@ async fn rist_output_loop(
         None => None,
     };
     let mut video_replace_scratch: Vec<u8> = Vec::new();
+
+    // Per-output input-switch watcher. See output_udp.rs for the
+    // detailed rationale.
+    let mut switch_handles: Vec<Arc<std::sync::atomic::AtomicBool>> = Vec::new();
+    if let Some(r) = audio_replacer.as_ref() {
+        switch_handles.push(r.external_reset_handle());
+    }
+    if let Some(r) = video_replacer.as_ref() {
+        switch_handles.push(r.external_reset_handle());
+    }
+    crate::engine::input_switch_watcher::spawn(
+        config.id.clone(),
+        active_input_rx,
+        switch_handles,
+        cancel.clone(),
+    );
 
     let mut ts_buf = BytesMut::new();
     let ts_datagram_size = TS_PACKETS_PER_DATAGRAM * TS_PACKET_SIZE;

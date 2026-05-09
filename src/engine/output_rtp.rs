@@ -98,6 +98,7 @@ pub fn spawn_rtp_output(
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
     events: EventSender,
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+    active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
 
@@ -118,9 +119,9 @@ pub fn spawn_rtp_output(
 
     tokio::spawn(async move {
         let result = if config.redundancy.is_some() {
-            rtp_output_redundant_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx, av_sync_pacer).await
+            rtp_output_redundant_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx, av_sync_pacer, active_input_rx).await
         } else {
-            rtp_output_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx, &events, av_sync_pacer).await
+            rtp_output_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx, &events, av_sync_pacer, active_input_rx).await
         };
         if let Err(e) = result {
             tracing::error!("RTP output '{}' exited with error: {e}", config.id);
@@ -151,6 +152,7 @@ async fn rtp_output_loop(
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
     events: &EventSender,
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+    active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> anyhow::Result<()> {
     let (socket, dest) =
         create_udp_output(&config.dest_addr, config.bind_addr.as_deref(), config.interface_addr.as_deref(), config.dscp).await?;
@@ -344,6 +346,22 @@ async fn rtp_output_loop(
         None => None,
     };
     let mut video_replace_scratch: Vec<u8> = Vec::new();
+
+    // Per-output input-switch watcher. See output_udp.rs for the
+    // detailed rationale.
+    let mut switch_handles: Vec<Arc<std::sync::atomic::AtomicBool>> = Vec::new();
+    if let Some(r) = audio_replacer.as_ref() {
+        switch_handles.push(r.external_reset_handle());
+    }
+    if let Some(r) = video_replacer.as_ref() {
+        switch_handles.push(r.external_reset_handle());
+    }
+    crate::engine::input_switch_watcher::spawn(
+        config.id.clone(),
+        active_input_rx,
+        switch_handles,
+        cancel.clone(),
+    );
 
     // RTP wrap state lives in the wire task now (it builds RFC 2250
     // headers at emit time so the timestamp tracks the actual wire
@@ -666,6 +684,10 @@ async fn rtp_output_redundant_loop(
     cancel: CancellationToken,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
     _av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+    // Redundant 2022-7 path is passthrough-only (no replacers); the
+    // input-switch watcher would have nothing to flip. Accepted for
+    // signature parity with `rtp_output_loop`.
+    _active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> anyhow::Result<()> {
     let redundancy = config
         .redundancy

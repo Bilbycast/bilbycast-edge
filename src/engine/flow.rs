@@ -898,6 +898,7 @@ impl FlowRuntime {
                 #[cfg(all(feature = "display", target_os = "linux"))]
                 &display_claim_registry,
                 av_sync_pacer.clone(),
+                active_input_tx.subscribe(),
             ).await?;
             output_handles.insert(output_config.id().to_string(), output_rt);
         }
@@ -1398,6 +1399,14 @@ impl FlowRuntime {
         // generated from the master clock instead of pts × 300 − preroll.
         // `None` keeps the legacy PTS-derived behaviour.
         av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+        // Subscriber to the flow's `active_input_tx` watch channel.
+        // Output spawn functions that build TsVideoReplacer /
+        // TsAudioReplacer use this to flip the replacers' external
+        // reset flag on every active-input change, preventing the
+        // permanently-stuck-decoder symptom on switcher input swaps
+        // between same-codec / same-PID inputs (where the replacers'
+        // internal codec/PID-change reset path doesn't fire).
+        active_input_rx: watch::Receiver<String>,
     ) -> Result<OutputRuntime> {
         let output_cancel = parent_cancel.child_token();
 
@@ -1417,6 +1426,7 @@ impl FlowRuntime {
                     frame_rate_rx,
                     event_sender.clone(),
                     av_sync_pacer.clone(),
+                    active_input_rx.clone(),
                 );
 
                 Ok(OutputRuntime {
@@ -1441,6 +1451,7 @@ impl FlowRuntime {
                     frame_rate_rx,
                     event_sender.clone(),
                     av_sync_pacer.clone(),
+                    active_input_rx.clone(),
                 );
 
                 Ok(OutputRuntime {
@@ -1467,6 +1478,7 @@ impl FlowRuntime {
                     compressed_audio_input,
                     frame_rate_rx,
                     av_sync_pacer.clone(),
+                    active_input_rx.clone(),
                 );
 
                 Ok(OutputRuntime {
@@ -1491,6 +1503,7 @@ impl FlowRuntime {
                     event_sender.clone(),
                     flow_id.to_string(),
                     av_sync_pacer.clone(),
+                    active_input_rx.clone(),
                 );
 
                 Ok(OutputRuntime {
@@ -1822,6 +1835,7 @@ impl FlowRuntime {
             #[cfg(all(feature = "display", target_os = "linux"))]
             &self.display_claim_registry,
             av_sync_pacer,
+            self.active_input_tx.subscribe(),
         ).await?;
 
         // Update output config metadata so stats snapshots reflect the new address/port

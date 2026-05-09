@@ -59,6 +59,7 @@ pub fn spawn_udp_output(
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
     events: EventSender,
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+    active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
 
@@ -87,14 +88,14 @@ pub fn spawn_udp_output(
     tokio::spawn(async move {
         if matches!(config.transport_mode.as_deref(), Some("audio_302m")) {
             if let Err(e) =
-                udp_output_loop_302m(&config, &mut rx, output_stats, cancel, input_format, &events).await
+                udp_output_loop_302m(&config, &mut rx, output_stats, cancel, input_format, &events, active_input_rx).await
             {
                 tracing::error!(
                     "UDP output '{}' (audio_302m) exited with error: {e}",
                     config.id
                 );
             }
-        } else if let Err(e) = udp_output_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx, &events, av_sync_pacer).await {
+        } else if let Err(e) = udp_output_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx, &events, av_sync_pacer, active_input_rx).await {
             tracing::error!("UDP output '{}' exited with error: {e}", config.id);
         }
     })
@@ -111,6 +112,7 @@ async fn udp_output_loop_302m(
     cancel: CancellationToken,
     input_format: Option<InputFormat>,
     events: &EventSender,
+    active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> anyhow::Result<()> {
     let (socket, dest) = create_udp_output(
         &config.dest_addr,
@@ -128,7 +130,7 @@ async fn udp_output_loop_302m(
                  falling back to passthrough TS",
                 config.id
             );
-            return udp_output_loop(config, rx, stats, cancel, None, events, None).await;
+            return udp_output_loop(config, rx, stats, cancel, None, events, None, active_input_rx).await;
         }
     };
 
@@ -213,6 +215,7 @@ async fn udp_output_loop(
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
     events: &EventSender,
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+    active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> anyhow::Result<()> {
     let (socket, dest) =
         create_udp_output(&config.dest_addr, config.bind_addr.as_deref(), config.interface_addr.as_deref(), config.dscp).await?;
@@ -371,6 +374,26 @@ async fn udp_output_loop(
         None => None,
     };
     let mut video_replace_scratch: Vec<u8> = Vec::new();
+
+    // Wire the per-output input-switch watcher: on every change of the
+    // flow's active input, flip the replacers' external_reset flags so
+    // the next process() call re-anchors PTS and forces an IDR. Without
+    // this, a same-codec same-PID swap leaves stale state and the
+    // receiving decoder gets stuck on PTS values that no longer line
+    // up with the master-clock-paced output PCR.
+    let mut switch_handles: Vec<Arc<std::sync::atomic::AtomicBool>> = Vec::new();
+    if let Some(r) = audio_replacer.as_ref() {
+        switch_handles.push(r.external_reset_handle());
+    }
+    if let Some(r) = video_replacer.as_ref() {
+        switch_handles.push(r.external_reset_handle());
+    }
+    crate::engine::input_switch_watcher::spawn(
+        config.id.clone(),
+        active_input_rx,
+        switch_handles,
+        cancel.clone(),
+    );
 
     // Buffer for re-aligning TS data into 188-byte aligned datagrams.
     let mut ts_buf = BytesMut::new();

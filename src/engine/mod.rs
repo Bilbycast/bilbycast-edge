@@ -35,6 +35,7 @@ pub mod input_replay;
 pub mod bonded_scheduler;
 pub mod delay_buffer;
 pub mod flow;
+pub mod input_switch_watcher;
 /// Hardware probe + CPU class + software-encode capacity estimate. Powers
 /// the `resource_budget` block on the manager `HealthPayload`. One-shot
 /// probe at startup, no async / no I/O. See [`hardware_probe`].

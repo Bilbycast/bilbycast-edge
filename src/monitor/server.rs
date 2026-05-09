@@ -74,6 +74,7 @@ async fn monitor_health(State(state): State<MonitorState>) -> Json<serde_json::V
         &state.app.resource_state,
         &state.static_caps,
         &state.live_gpu,
+        None,
     );
     // Stamp uptime from the application's start_time so the SPA can
     // render the system bar without a separate /api/v1/stats call.

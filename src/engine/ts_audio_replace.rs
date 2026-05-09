@@ -29,6 +29,9 @@
 //! single-digit milliseconds per frame and must not run inline on a
 //! single-threaded runtime.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use crate::config::models::AudioEncodeConfig;
 
 use super::audio_encode::AudioCodec;
@@ -159,6 +162,16 @@ pub struct TsAudioReplacer {
     /// Lazily constructed planar transcoder. Opened on the first decoded
     /// frame, once the input rate + channel count are known.
     transcoder: Option<PlanarAudioTranscoder>,
+
+    /// One-shot "input was switched" request. The flow's per-output
+    /// switch watcher flips this to `true` when the active input
+    /// changes; the replacer consumes it on the next `process()` entry
+    /// and runs the same `reset_source_state()` path that fires on
+    /// codec/PID change. Without this, a same-codec same-PID swap leaves
+    /// stale decoder + PTS-anchor state from the previous input and the
+    /// receiver hears wrong-epoch PTS audio frames against a master-
+    /// clock-paced PCR.
+    external_reset: Arc<AtomicBool>,
 }
 
 impl TsAudioReplacer {
@@ -223,7 +236,21 @@ impl TsAudioReplacer {
             codecs_ready: false,
             transcode_cfg: transcode,
             transcoder: None,
+            external_reset: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Shared handle to the one-shot "input was switched" request flag.
+    /// The flow's per-output switch watcher sets this to `true` when the
+    /// active input changes; the replacer consumes and clears it on
+    /// entry to its next `process()` call and runs the same
+    /// `reset_source_state()` path that fires on codec/PID change. The
+    /// audio counterpart of `TsVideoReplacer::external_reset_handle()`.
+    /// Idempotent under rapid repeated switches — collapses into a
+    /// single reset.
+    #[allow(dead_code)]
+    pub fn external_reset_handle(&self) -> Arc<AtomicBool> {
+        self.external_reset.clone()
     }
 
     /// Human-readable description of the active encoder target.
@@ -243,6 +270,14 @@ impl TsAudioReplacer {
     pub fn process(&mut self, input_ts: &[u8], output: &mut Vec<u8>) {
         if input_ts.is_empty() {
             return;
+        }
+
+        // External "input was switched" trigger — see field doc on
+        // `external_reset`. Same-codec same-PID swaps don't fire the
+        // codec/PID-change reset path, so without this hook stale
+        // decoder + PTS-anchor state leaks across the boundary.
+        if self.external_reset.swap(false, Ordering::Relaxed) {
+            self.reset_source_state("input switched");
         }
 
         // Bail out for non-aligned input: passthrough, do nothing clever.

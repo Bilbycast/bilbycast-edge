@@ -514,6 +514,12 @@ async fn try_connect(
     // Now in the authenticated session — run the main loop
     let mut stats_rx = ws_stats_tx.subscribe();
 
+    // Per-interface bandwidth sampler. State (last byte counters per
+    // iface) lives here so deltas survive across health ticks. The
+    // first sample after auth has no prior counters, so rx_bps / tx_bps
+    // come back as None on tick #1; from tick #2 onwards they're real.
+    let mut network_sampler = crate::util::network_interfaces::NetworkSampler::new();
+
     // Send initial health
     let health = build_health_message(
         flow_manager,
@@ -522,6 +528,7 @@ async fn try_connect(
         resource_state,
         static_caps,
         live_gpu,
+        Some(&mut network_sampler),
     );
     if let Ok(json) = serde_json::to_string(&health) {
         let _ = ws_write.send(Message::Text(json.into())).await;
@@ -697,6 +704,7 @@ async fn try_connect(
                         resource_state,
                         static_caps,
                         live_gpu,
+                        Some(&mut network_sampler),
                     )
                 });
                 if let Ok(json) = serde_json::to_string(&pong) {
@@ -785,11 +793,12 @@ fn build_health_message(
     resource_state: &SystemResourceState,
     static_caps: &crate::engine::hardware_probe::StaticCapabilities,
     live_gpu: &crate::engine::hardware_probe::LiveUtilizationState,
+    network_sampler: Option<&mut crate::util::network_interfaces::NetworkSampler>,
 ) -> serde_json::Value {
     serde_json::json!({
         "type": "health",
         "timestamp": chrono::Utc::now().to_rfc3339(),
-        "payload": build_health_payload(flow_manager, api_addr, monitor_addr, resource_state, static_caps, live_gpu)
+        "payload": build_health_payload(flow_manager, api_addr, monitor_addr, resource_state, static_caps, live_gpu, network_sampler)
     })
 }
 
@@ -800,6 +809,7 @@ pub(crate) fn build_health_payload(
     resource_state: &SystemResourceState,
     static_caps: &crate::engine::hardware_probe::StaticCapabilities,
     live_gpu: &crate::engine::hardware_probe::LiveUtilizationState,
+    network_sampler: Option<&mut crate::util::network_interfaces::NetworkSampler>,
 ) -> serde_json::Value {
     #[allow(unused_mut)]
     let mut payload = serde_json::json!({
@@ -827,7 +837,13 @@ pub(crate) fn build_health_payload(
     // can fail in some containerised environments). Manager UI hides
     // the card unless the `"network-info"` capability is also present.
     {
-        let ifaces = crate::util::network_interfaces::enumerate();
+        // When a long-lived sampler is supplied (manager-client task)
+        // we get rate-derivation across ticks; the monitor /health
+        // endpoint passes None and falls back to static enumeration.
+        let ifaces = match network_sampler {
+            Some(sampler) => sampler.sample(),
+            None => crate::util::network_interfaces::enumerate(),
+        };
         if !ifaces.is_empty() {
             if let Ok(v) = serde_json::to_value(&ifaces) {
                 payload

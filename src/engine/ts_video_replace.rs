@@ -141,6 +141,17 @@ pub struct TsVideoReplacer {
     /// only kept so [`Self::force_idr_handle`] can hand it back out.
     #[allow(dead_code)]
     force_idr_on_next_frame: Arc<AtomicBool>,
+    /// One-shot "input was switched" request. External callers (the
+    /// flow's switch watcher on each transcoding output) flip this to
+    /// `true` when the active input changes; the replacer consumes and
+    /// clears it on entry to `process()` and runs the same
+    /// `reset_source_state()` path that already fires on codec/PID
+    /// change. Without this, a same-codec same-PID input swap leaves
+    /// the replacer's PTS anchor pointing at the old input's epoch and
+    /// the receiver sees PTS values incompatible with the master-clock-
+    /// generated output PCR, which can stick the decoder permanently.
+    #[allow(dead_code)]
+    external_reset_on_switch: Arc<AtomicBool>,
 }
 
 impl TsVideoReplacer {
@@ -179,13 +190,20 @@ impl TsVideoReplacer {
     ) -> Result<Self, TsVideoReplaceError> {
         let stats = Arc::new(VideoEncodeStats::default());
         let force_idr = force_idr.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        let inner = inner::Inner::from_config(cfg, stats.clone(), force_idr.clone())?;
+        let external_reset = Arc::new(AtomicBool::new(false));
+        let inner = inner::Inner::from_config(
+            cfg,
+            stats.clone(),
+            force_idr.clone(),
+            external_reset.clone(),
+        )?;
         let description = inner.target_description();
         Ok(Self {
             inner,
             description,
             stats,
             force_idr_on_next_frame: force_idr,
+            external_reset_on_switch: external_reset,
         })
     }
 
@@ -224,6 +242,19 @@ impl TsVideoReplacer {
         self.force_idr_on_next_frame.clone()
     }
 
+    /// Shared handle to the one-shot "input was switched" request flag.
+    /// The flow's per-output switch watcher sets this to `true` when the
+    /// active input changes (`active_input_rx.changed().await`); the
+    /// replacer consumes and clears it on entry to its next `process()`
+    /// call and runs the same `reset_source_state()` path that fires on
+    /// codec/PID change, so the new input's first frame is encoded as an
+    /// IDR with a fresh PTS anchor. Idempotent under rapid repeated
+    /// switches — collapses into a single reset.
+    #[allow(dead_code)]
+    pub fn external_reset_handle(&self) -> Arc<AtomicBool> {
+        self.external_reset_on_switch.clone()
+    }
+
     /// Feed one chunk of 188-byte-aligned TS into the replacer. Output
     /// TS is appended to `output`. Mis-aligned input is passed through
     /// verbatim (best-effort for boundary recovery in the caller).
@@ -257,6 +288,54 @@ mod inner {
     use crate::engine::video_encode_util::ScaledVideoEncoder;
     use video_codec::{VideoCodec, VideoEncoderCodec};
     use video_engine::VideoDecoder;
+
+    /// PTS modulus (33-bit space, MPEG-TS spec).
+    const PTS_MODULUS_90K: u64 = 1u64 << 33;
+    /// Mask for 33-bit PTS values.
+    const PTS_MASK_33B: u64 = PTS_MODULUS_90K - 1;
+    /// PTS delta above which we treat the gap as an epoch-crossing
+    /// discontinuity and stamp `discontinuity_indicator=1` on the
+    /// PCR-bearing TS packet. 90 000 = 1 second @ 90 kHz. Switching
+    /// between two unrelated source feeds typically produces deltas
+    /// orders of magnitude larger than this; legitimate frame-rate
+    /// hiccups are sub-100 ms.
+    const PTS_JUMP_THRESHOLD_90K: u64 = 90_000;
+
+    /// Two-way modular distance between two 33-bit PTS values, in 90 kHz
+    /// ticks. Returns the smaller of the forward and backward distances
+    /// across the modulus, so a legitimate PTS wrap (which only happens
+    /// every ~26.5 hours) doesn't get misclassified as an input-switch
+    /// epoch jump.
+    fn pts_distance_90k(a: u64, b: u64) -> u64 {
+        let am = a & PTS_MASK_33B;
+        let bm = b & PTS_MASK_33B;
+        let fwd = (am + PTS_MODULUS_90K - bm) % PTS_MODULUS_90K;
+        let bwd = (bm + PTS_MODULUS_90K - am) % PTS_MODULUS_90K;
+        fwd.min(bwd)
+    }
+
+    /// Compute the `discontinuity_indicator` flag for the next emitted
+    /// PCR-bearing packet given the previous emit's PTS and this emit's
+    /// PTS. Updates the previous-emit slot to this emit's PTS as a
+    /// side effect.
+    ///
+    /// Race-immune by construction: the signal is derived from the PTS
+    /// values being emitted, not from a side-channel flag, so it
+    /// doesn't matter whether A's tail residual emits before or after
+    /// the reset, or whether the reset fired before or after B's
+    /// first emit reaches the encoder. Whichever packet actually
+    /// crosses the epoch boundary trips DI.
+    pub(super) fn compute_discontinuity_flag(
+        last_emitted_pts_90k: &mut Option<u64>,
+        cur_pts_90k: u64,
+    ) -> bool {
+        let di = match *last_emitted_pts_90k {
+            Some(prev) => pts_distance_90k(cur_pts_90k, prev) > PTS_JUMP_THRESHOLD_90K,
+            None => false, // first emit ever — no prior anchor to compare against
+        };
+        *last_emitted_pts_90k = Some(cur_pts_90k);
+        di
+    }
 
     pub struct Inner {
         #[allow(dead_code)]
@@ -322,6 +401,22 @@ mod inner {
         description: String,
         stats: Arc<VideoEncodeStats>,
         force_idr: Arc<AtomicBool>,
+        /// Shared with the outer `TsVideoReplacer::external_reset_on_switch`.
+        /// Checked once per `process()` entry; on `true` we run
+        /// `reset_source_state("input switched")` and clear the flag.
+        external_reset: Arc<AtomicBool>,
+        /// PTS (90 kHz) of the previous emitted output frame. Used to
+        /// detect epoch jumps — when the next emit's PTS differs from
+        /// this by more than `PTS_JUMP_THRESHOLD_90K`, the
+        /// adaptation-field `discontinuity_indicator` is stamped on
+        /// that PCR-bearing packet so the receiver re-anchors its STC
+        /// instead of treating the jump as a clock fault.
+        ///
+        /// Survives `reset_source_state()` deliberately — without that,
+        /// race conditions where A's tail frames emit after a reset
+        /// would consume the discontinuity signal before B's first
+        /// frame ever shows up.
+        last_emitted_pts_90k: Option<u64>,
 
         /// Operator's hardware-decoder preference for the input decode
         /// side of this transcode. Defaults to `Auto` (VAAPI ≻ NVDEC ≻
@@ -343,6 +438,7 @@ mod inner {
             cfg: &VideoEncodeConfig,
             stats: Arc<VideoEncodeStats>,
             force_idr: Arc<AtomicBool>,
+            external_reset: Arc<AtomicBool>,
         ) -> Result<Self, TsVideoReplaceError> {
             // Resolve `*_auto` strings AND validate explicit backends
             // against the host's chroma/bit-depth matrix. We pull the
@@ -436,6 +532,8 @@ mod inner {
                 description,
                 stats,
                 force_idr,
+                external_reset,
+                last_emitted_pts_90k: None,
                 hw_decode_pref: cfg.hw_decode.unwrap_or_default(),
                 av_sync_pacer: None,
             })
@@ -458,6 +556,15 @@ mod inner {
             self.pes_started = false;
             self.pending_pts = None;
             self.decoder = None;
+            // NOTE: `last_emitted_pts_90k` is intentionally NOT reset.
+            // Output PCR derives from source PTS, so on a switch the new
+            // input's first emit will land in a different epoch — the
+            // emit-time jump detector compares against the previous
+            // emit's PTS and stamps `discontinuity_indicator=1` on the
+            // packet that crosses, which is what tells the receiver to
+            // re-anchor its STC. Clearing the field here would let A's
+            // tail residual encoded frame fall into the "first emit ever"
+            // branch and skip DI, leaving VLC stuck on the next jump.
             // Re-anchor PTS to the new input's first frame so downstream
             // A/V stays in sync with the audio replacer (which will also
             // re-anchor on the audio-PID codec swap).
@@ -474,6 +581,16 @@ mod inner {
         pub fn process(&mut self, input_ts: &[u8], output: &mut Vec<u8>) {
             if input_ts.is_empty() {
                 return;
+            }
+            // External "input was switched" trigger. Set by the flow's
+            // per-output switch watcher when `active_input_rx` changes.
+            // Same-codec same-PID swaps don't fire the codec/PID-change
+            // reset path below, so without this hook the replacer keeps
+            // its previous PTS anchor and the receiver sees PTS values
+            // that no longer line up with the master-clock-generated
+            // output PCR.
+            if self.external_reset.swap(false, Ordering::Relaxed) {
+                self.reset_source_state("input switched");
             }
             if input_ts.len() % TS_PACKET_SIZE != 0 {
                 output.extend_from_slice(input_ts);
@@ -589,11 +706,16 @@ mod inner {
                             self.av_sync_pacer.as_ref(),
                             pts_for_pes,
                         );
+                        let di = compute_discontinuity_flag(
+                            &mut self.last_emitted_pts_90k,
+                            pts_for_pes,
+                        );
                         let pkts = packetize_ts(
                             vpid,
                             &pes,
                             &mut self.out_video_cc,
                             Some(pcr_27mhz),
+                            di,
                         );
                         for p in &pkts {
                             output.extend_from_slice(p);
@@ -874,11 +996,16 @@ mod inner {
                         self.av_sync_pacer.as_ref(),
                         pts_for_pes,
                     );
+                    let di = compute_discontinuity_flag(
+                        &mut self.last_emitted_pts_90k,
+                        pts_for_pes,
+                    );
                     let pkts = packetize_ts(
                         vpid,
                         &pes,
                         &mut self.out_video_cc,
                         Some(pcr_27mhz),
+                        di,
                     );
                     for p in &pkts {
                         output.extend_from_slice(p);
@@ -1163,6 +1290,7 @@ fn packetize_ts(
     pes: &[u8],
     cc: &mut u8,
     pcr_27mhz: Option<u64>,
+    discontinuity: bool,
 ) -> Vec<[u8; 188]> {
     let mut packets = Vec::new();
     let mut offset = 0;
@@ -1189,7 +1317,14 @@ fn packetize_ts(
             let payload_capacity = TS_PACKET_SIZE - 4 - AF_TOTAL;
             pkt[3] = 0x30 | current_cc; // AFC = both
             pkt[4] = AF_BYTES_AFTER_LEN as u8;
-            pkt[5] = 0x10; // PCR_flag only
+            // PCR_flag (bit 4 = 0x10) plus discontinuity_indicator
+            // (bit 7 = 0x80) when the caller signalled an epoch jump
+            // (see `compute_discontinuity_flag` in the `inner` mod for
+            // how we detect it). DI=1 tells the receiver "the next PCR
+            // is a fresh STC anchor, throw away your old timestamp
+            // tracking" — without it, decoders see the post-switch
+            // PCR jump as a fault and lock up.
+            pkt[5] = if discontinuity { 0x90 } else { 0x10 };
             let mut pcr_buf = [0u8; 6];
             write_pcr_field(&mut pcr_buf, pcr_27mhz.unwrap());
             pkt[6..12].copy_from_slice(&pcr_buf);
@@ -1551,7 +1686,7 @@ mod tests {
         // Mux a tiny PES with that PCR and verify the PCR field readback.
         let pes = build_video_pes(&[0, 0, 0, 1, 0x09, 0x10], pts_90k);
         let mut cc = 0u8;
-        let pkts = packetize_ts(0x100, &pes, &mut cc, Some(pcr_27mhz));
+        let pkts = packetize_ts(0x100, &pes, &mut cc, Some(pcr_27mhz), false);
         assert!(!pkts.is_empty());
         let first = &pkts[0];
         // PUSI bit set on first packet.
@@ -1572,6 +1707,79 @@ mod tests {
         let ext = (((first[10] as u64) & 0x01) << 8) | (first[11] as u64);
         let read_pcr_27mhz = base * 300 + ext;
         assert_eq!(read_pcr_27mhz, pcr_27mhz);
+    }
+
+    /// `discontinuity=true` lights the AF flags `discontinuity_indicator`
+    /// bit (0x80) on the PCR-bearing TS packet. The receiver uses this
+    /// to know "PCR jumped, re-anchor the STC" instead of treating the
+    /// jump as a clock fault. Without this, post-input-switch transcoded
+    /// outputs strand decoders permanently (VLC's "stuck after switch"
+    /// symptom).
+    #[test]
+    fn packetize_ts_discontinuity_indicator_lights_in_pcr_packet() {
+        let pts_90k: u64 = 90_000;
+        let pcr_27mhz = pts_90k * 300 - PCR_PREROLL_27MHZ;
+        let pes = build_video_pes(&[0, 0, 0, 1, 0x09, 0x10], pts_90k);
+        let mut cc = 0u8;
+
+        // discontinuity=false → DI bit clear, PCR_flag set.
+        let pkts0 = packetize_ts(0x100, &pes, &mut cc, Some(pcr_27mhz), false);
+        assert!(!pkts0.is_empty());
+        assert_eq!(pkts0[0][5] & 0x80, 0x00, "DI bit should be clear");
+        assert_eq!(pkts0[0][5] & 0x10, 0x10, "PCR_flag should be set");
+
+        // discontinuity=true → DI bit set AND PCR_flag still set.
+        let mut cc2 = 0u8;
+        let pkts1 = packetize_ts(0x100, &pes, &mut cc2, Some(pcr_27mhz), true);
+        assert!(!pkts1.is_empty());
+        assert_eq!(pkts1[0][5] & 0x80, 0x80, "DI bit should be set");
+        assert_eq!(pkts1[0][5] & 0x10, 0x10, "PCR_flag should still be set");
+    }
+
+    /// `compute_discontinuity_flag` returns `true` when the new PTS is
+    /// further than 1 second from the previous emit's PTS, `false`
+    /// otherwise. The previous-emit slot is updated as a side effect
+    /// regardless. First emit ever (`None` slot) returns `false`.
+    /// Modular distance picks the short way around the 33-bit wrap so
+    /// a legitimate PTS wraparound doesn't get misclassified.
+    #[test]
+    fn pts_jump_detection_lights_di_on_epoch_crossover() {
+        use super::inner::compute_discontinuity_flag;
+
+        // First emit ever: no prior anchor, no DI.
+        let mut last: Option<u64> = None;
+        assert!(!compute_discontinuity_flag(&mut last, 1_000_000));
+        assert_eq!(last, Some(1_000_000));
+
+        // Small forward delta (< 1 s): no DI.
+        assert!(!compute_discontinuity_flag(&mut last, 1_003_000)); // +33 ms
+        assert_eq!(last, Some(1_003_000));
+
+        // Big forward jump (>> 1 s): DI fires.
+        assert!(compute_discontinuity_flag(&mut last, 50_000_000)); // +~9 minutes
+        assert_eq!(last, Some(50_000_000));
+
+        // Big backward jump (a switch back to a stream with smaller
+        // PTSes): DI fires.
+        assert!(compute_discontinuity_flag(&mut last, 1_000_000));
+        assert_eq!(last, Some(1_000_000));
+
+        // Wrap-around: 33-bit modulus = 1<<33 = 8_589_934_592. A jump
+        // of just 100 ticks across the wrap should NOT light DI — the
+        // modular short-way distance is 100, not (modulus - 100).
+        const PTS_MODULUS_90K: u64 = 1u64 << 33;
+        let mut wrap_last: Option<u64> = Some(PTS_MODULUS_90K - 50);
+        assert!(
+            !compute_discontinuity_flag(&mut wrap_last, 50),
+            "wrap should pick the short way (100 ticks), not (modulus - 100)"
+        );
+
+        // 1 second exact: at the threshold, NOT exceeding → no DI.
+        let mut threshold_last: Option<u64> = Some(0);
+        assert!(!compute_discontinuity_flag(&mut threshold_last, 90_000));
+        // 1 s + 1 tick: just over → DI.
+        let mut over_last: Option<u64> = Some(0);
+        assert!(compute_discontinuity_flag(&mut over_last, 90_001));
     }
 
     /// PMT rewrite must force PCR_PID to the rebuilt video PID — even
