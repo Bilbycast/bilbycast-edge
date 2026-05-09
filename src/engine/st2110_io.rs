@@ -46,6 +46,8 @@ use bytes::Bytes;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use crate::engine::wire_emit::{AnchorSource, WireDatagram, spawn_wire_emitter};
+
 use crate::config::models::{
     St2110AncillaryInputConfig, St2110AncillaryOutputConfig, St2110AudioInputConfig,
     St2110AudioOutputConfig,
@@ -423,12 +425,40 @@ pub async fn run_st2110_audio_output(
         config.dscp,
     )
     .await?;
+    let red_std = red_sock
+        .into_std()
+        .map_err(|e| anyhow::anyhow!("{label} output '{}' red into_std: {e}", config.id))?;
+    red_std.set_nonblocking(false).ok();
+    let wire_red = spawn_wire_emitter(
+        format!("{}-red", config.id),
+        red_std,
+        red_dest,
+        AnchorSource::Pcr,
+        stats.clone(),
+        cancel.clone(),
+    );
 
-    let blue = if let Some(b) = &config.redundancy {
+    let wire_blue = if let Some(b) = &config.redundancy {
         let (sock, dest) =
             create_udp_output(&b.addr, config.bind_addr.as_deref(), b.interface_addr.as_deref(), config.dscp)
                 .await?;
-        Some((sock, dest))
+        let blue_std = sock
+            .into_std()
+            .map_err(|e| anyhow::anyhow!("{label} output '{}' blue into_std: {e}", config.id))?;
+        blue_std.set_nonblocking(false).ok();
+        let leg2_stats = std::sync::Arc::new(OutputStatsAccumulator::new(
+            format!("{}-blue", config.id),
+            format!("{}-blue", config.id),
+            "st2110_audio_blue".to_string(),
+        ));
+        Some(spawn_wire_emitter(
+            format!("{}-blue", config.id),
+            blue_std,
+            dest,
+            AnchorSource::Pcr,
+            leg2_stats,
+            cancel.clone(),
+        ))
     } else {
         None
     };
@@ -492,10 +522,10 @@ pub async fn run_st2110_audio_output(
     let mut compressed_decode_stats_registered = false;
 
     tracing::info!(
-        "{label} output '{}' started -> red={} blue={:?} transcode={} compressed_input={}",
+        "{label} output '{}' started -> red={} blue={} transcode={} compressed_input={}",
         config.id,
         red_dest,
-        blue.as_ref().map(|(_, d)| *d),
+        wire_blue.is_some(),
         transcode.is_some(),
         compressed_audio_input,
     );
@@ -549,23 +579,21 @@ pub async fn run_st2110_audio_output(
                             vec![packet.data.clone()]
                         };
                         for buf in &outputs {
-                            match red_sock.send_to(buf, red_dest).await {
-                                Ok(sent) => {
-                                    stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                    stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                                    stats.record_latency(packet.recv_time_us);
-                                }
-                                Err(e) => {
-                                    tracing::warn!("{label} output '{}' red send error: {e}", config.id);
-                                }
+                            let dg_red = WireDatagram {
+                                bytes: buf.clone(),
+                                recv_time_us: packet.recv_time_us,
+                                target_tx_time_ns: None,
+                            };
+                            if wire_red.try_send(dg_red).is_err() {
+                                stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                             }
-                            if let Some((sock, dest)) = &blue {
-                                if let Err(e) = sock.send_to(buf, *dest).await {
-                                    tracing::warn!(
-                                        "{label} output '{}' blue send error: {e}",
-                                        config.id
-                                    );
-                                }
+                            if let Some(blue) = wire_blue.as_ref() {
+                                let dg_blue = WireDatagram {
+                                    bytes: buf.clone(),
+                                    recv_time_us: packet.recv_time_us,
+                                    target_tx_time_ns: None,
+                                };
+                                let _ = blue.try_send(dg_blue);
                             }
                         }
                     }
@@ -830,21 +858,48 @@ pub async fn run_st2110_anc_output(
         config.dscp,
     )
     .await?;
+    let red_std = red_sock
+        .into_std()
+        .map_err(|e| anyhow::anyhow!("ST2110-40 output '{}' red into_std: {e}", config.id))?;
+    red_std.set_nonblocking(false).ok();
+    let wire_red = spawn_wire_emitter(
+        format!("{}-red", config.id),
+        red_std,
+        red_dest,
+        AnchorSource::Pcr,
+        stats.clone(),
+        cancel.clone(),
+    );
 
-    let blue = if let Some(b) = &config.redundancy {
+    let wire_blue = if let Some(b) = &config.redundancy {
         let (sock, dest) =
             create_udp_output(&b.addr, config.bind_addr.as_deref(), b.interface_addr.as_deref(), config.dscp)
                 .await?;
-        Some((sock, dest))
+        let blue_std = sock
+            .into_std()
+            .map_err(|e| anyhow::anyhow!("ST2110-40 output '{}' blue into_std: {e}", config.id))?;
+        blue_std.set_nonblocking(false).ok();
+        let leg2_stats = std::sync::Arc::new(OutputStatsAccumulator::new(
+            format!("{}-blue", config.id),
+            format!("{}-blue", config.id),
+            "st2110_anc_blue".to_string(),
+        ));
+        Some(spawn_wire_emitter(
+            format!("{}-blue", config.id),
+            blue_std,
+            dest,
+            AnchorSource::Pcr,
+            leg2_stats,
+            cancel.clone(),
+        ))
     } else {
         None
     };
 
     tracing::info!(
-        "ST2110-40 output '{}' started -> red={} blue={:?}",
+        "ST2110-40 output '{}' started -> red={}",
         config.id,
         red_dest,
-        blue.as_ref().map(|(_, d)| *d)
     );
 
     loop {
@@ -856,23 +911,21 @@ pub async fn run_st2110_anc_output(
             res = rx.recv() => {
                 match res {
                     Ok(packet) => {
-                        match red_sock.send_to(&packet.data, red_dest).await {
-                            Ok(sent) => {
-                                stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                                stats.record_latency(packet.recv_time_us);
-                            }
-                            Err(e) => {
-                                tracing::warn!("ST2110-40 output '{}' red send error: {e}", config.id);
-                            }
+                        let dg_red = WireDatagram {
+                            bytes: packet.data.clone(),
+                            recv_time_us: packet.recv_time_us,
+                            target_tx_time_ns: None,
+                        };
+                        if wire_red.try_send(dg_red).is_err() {
+                            stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                         }
-                        if let Some((sock, dest)) = &blue {
-                            if let Err(e) = sock.send_to(&packet.data, *dest).await {
-                                tracing::warn!(
-                                    "ST2110-40 output '{}' blue send error: {e}",
-                                    config.id
-                                );
-                            }
+                        if let Some(blue) = wire_blue.as_ref() {
+                            let dg_blue = WireDatagram {
+                                bytes: packet.data.clone(),
+                                recv_time_us: packet.recv_time_us,
+                                target_tx_time_ns: None,
+                            };
+                            let _ = blue.try_send(dg_blue);
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {

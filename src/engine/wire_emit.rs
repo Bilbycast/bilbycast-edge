@@ -1,95 +1,112 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-output wire emission engine.
+//! Per-output PCR-anchored wire emission.
 //!
-//! Drives a dedicated `std::thread` (Linux: `SCHED_FIFO` best-effort) that
-//! pops TS datagrams off a [`std::sync::mpsc::sync_channel`] fed by the
-//! encoder task and emits each datagram onto the wire at a wallclock
-//! derived from PCR + master clock. The thread is decoupled from Tokio so
-//! `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, ...)` can give us
-//! sub-100-µs precision instead of the ~1–5 ms ceiling the Tokio timer
-//! wheel imposes on `tokio::time::sleep_until`.
+//! One thread per output, decoupled from the Tokio runtime so wire timing
+//! does not depend on the timer wheel. Userspace sleeps — `tokio::time::
+//! sleep`, `std::thread::sleep`, and even `clock_nanosleep` on a
+//! `SCHED_FIFO` thread — are unreliable at sub-1 ms targets. Two release
+//! paths are available, picked per output at spawn time based on a
+//! one-shot capability probe:
 //!
-//! ## Target derivation
+//! - **SO_TXTIME** (preferred, Linux ≥ 4.19, requires the
+//!   `wire_emit_txtime` setsockopt to succeed): each datagram carries a
+//!   `SCM_TXTIME` CMSG with a target nanosecond timestamp; the kernel
+//!   ETF qdisc (and on supported NICs, hardware tx scheduling) honours
+//!   the timestamp without further userspace involvement. Sub-µs jitter
+//!   with ETF + NIC HW offload; ~1–10 µs with software ETF; same as
+//!   no-pacing if ETF qdisc isn't installed (kernel ignores the CMSG
+//!   silently — degrades gracefully).
+//! - **`clock_nanosleep` fallback** (Linux without setsockopt
+//!   permission, kernels < 4.19, non-Linux): the thread sleeps to the
+//!   target via `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)` and
+//!   then issues a blocking `send_to`. Realistic envelope: ~50–500 µs at
+//!   SCHED_FIFO under typical desktop load, ~1–5 ms at SCHED_OTHER.
+//!   Acceptable for ≤ 6 Mbps TS; degraded above that. At ST 2110
+//!   regimes (250 k+ pps) userspace sleep cannot pace at all and the
+//!   emitter logs a Critical event + emits unpaced.
 //!
-//! Anchor on the first PCR-bearing datagram: `wall_anchor_ns =
-//! monotonic_now() + PREROLL_NS`, `pcr_anchor = pcr`. Re-anchor on every
-//! subsequent PCR — bounds drift between our wallclock pacing and the
-//! source's PCR clock to one inter-PCR period (~30–40 ms typical).
+//! Both paths share the same target-derivation math.
 //!
-//! Between PCRs we interpolate by static bitrate:
+//! ## Anchors
 //!
-//! ```text
-//! target_ns = wall_anchor_ns + bytes_since_anchor * 8 × 1_000_000_000 / bitrate_bps
-//! ```
+//! Two anchor strategies, selected by [`AnchorSource`]:
 //!
-//! `declared_bitrate_bps` (from output config or transcode target) is
-//! preferred. If unset, we fall back to a bitrate inferred from the most
-//! recent inter-PCR pair (EMA over four observations).
+//! - [`AnchorSource::Pcr`] (TS regime): the emitter parses each datagram
+//!   for an MPEG-TS PCR sample. PCR-bearing datagrams re-anchor the
+//!   wallclock target. Non-PCR datagrams pace by `bytes_since_anchor /
+//!   observed_rate_bps`. The rate comes exclusively from inter-PCR
+//!   observations (EMA, ~10 PCRs to 95 % convergence). There is no
+//!   "declared bitrate" parameter — open-loop pacing on a configured rate
+//!   drifts when the encoder runs above (or below) the configured target,
+//!   and that drift is what reverted the prior wire_emit integration on
+//!   2026-05-09. Closed-loop on observed rate is the universal fix
+//!   regardless of codec, rate-control mode, or encoder backend.
+//! - [`AnchorSource::St2110Raster`] (uncompressed video regime): the
+//!   caller computes a per-packet `target_tx_time_ns` from the active
+//!   ST 2110-21 frame raster and passes it on the [`WireDatagram`]. The
+//!   emitter just delivers at the requested time.
 //!
-//! ## Discontinuity handling
+//! ## First-datagram preroll
+//!
+//! Anchor on the first datagram: `wall_anchor_ns = monotonic_now() +
+//! PREROLL_NS` (50 ms). Emit there. Subsequent PCRs re-anchor.
+//!
+//! ## Late-rebase
+//!
+//! If a PCR-driven target lands more than 5 ms behind real time (e.g.
+//! after an encoder pipeline burst), `wall_anchor` snaps to `now`. One
+//! one-time jitter step instead of a steady-state degradation.
+//!
+//! ## Discontinuity
 //!
 //! A PCR jump > 500 ms forward or any backwards step resets the anchor
-//! to "now" and resumes from the new PCR. Mirrors the discontinuity rule
-//! in `engine::pcr_pll` and `stats::pcr_trust`.
+//! to `now` and resumes from the new PCR. Mirrors `engine::pcr_pll` and
+//! `stats::pcr_trust`.
 //!
 //! ## Cancellation
 //!
-//! `recv_timeout(50 ms)` polls the cancellation token; emitter exits
-//! cleanly within ~50 ms of cancel. Channel disconnect (encoder dropped)
-//! also exits cleanly.
+//! `recv_timeout(50 ms)` polls the cancellation token; the emitter exits
+//! within ~50 ms of cancel. Channel disconnect (encoder dropped) also
+//! exits cleanly.
+//!
+//! ## Wrap is the caller's job
+//!
+//! [`WireDatagram::bytes`] is on-the-wire-final. RTP wrap, FEC packet
+//! framing, ST 2110 RFC 4175 packetisation — all handled upstream. This
+//! lets multiple emitters share a wrap state (2022-7 dual-leg with
+//! byte-identical RTP headers on Red + Blue) and lets one emitter carry
+//! mixed traffic on one socket (RTP media + RTP FEC).
 //!
 //! ## Stats
 //!
-//! Same accounting as the previous in-line wire task: `packets_sent`,
-//! `bytes_sent`, `record_latency()`, `record_pcr_egress()`. Encoder-side
-//! `try_send` overflow is counted under `packets_dropped`.
-//!
-//! ## Status — preserved, NOT wired in (live regression observed)
-//!
-//! Module + 12 unit tests landed; a Phase 1 integration into
-//! `output_udp.rs` / `output_rtp.rs` was attempted on 2026-05-09 and
-//! reverted the same day. The integrated form produced multi-second
-//! egress latency, channel-overflow drops on passthrough flows, PCR
-//! accuracy errors (TR-101290 P2), and decoder pixelation in VLC /
-//! ffplay — observed against the testbed h264_qsv 6 Mbps + AAC 192k →
-//! UDP / RTP path. Root cause not yet identified; the per-PCR target
-//! derivation appears to drift relative to the actual encoder output
-//! rate in ways the unit-test suite does not exercise. Re-integration
-//! requires (a) reproducing the failure in an automated test, (b)
-//! understanding why latency accumulated to seconds, (c) fixing the
-//! pacer or replacing it. Sub-ms PCR jitter at the receiver is the
-//! eventual goal — do not delete this module.
-
-#![allow(dead_code)]
+//! `packets_sent`, `bytes_sent` on every successful send.
+//! `record_latency(recv_time_us)` on every successful send.
+//! `record_pcr_egress(pcr, now_us)` on every PCR-bearing send.
+//! `packets_dropped` is incremented by the caller on `try_send::Full`.
 
 use std::net::{SocketAddr, UdpSocket};
-use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::time::Duration;
 
+use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use crate::stats::collector::OutputStatsAccumulator;
 
 /// 50 ms preroll on the first emit. Avoids the immediate send-cliff
 /// when the first datagram arrives at the wire thread before the
-/// encoder has settled. Live testing showed deeper preroll (300 ms)
-/// caused mass channel drops during encoder bursts because the upstream
-/// transcoder is producing slightly-faster-than-target bytes; the
-/// late-rebase below handles the fall-behind case without adding
-/// glass-to-glass latency.
+/// encoder has settled.
 const PREROLL_NS: u64 = 50_000_000;
 
 /// If a PCR-driven target lands in the past by more than this, rebase
 /// `wall_anchor` to `now_ns` so we don't accumulate wallclock lag every
 /// burst. Causes a one-time jitter step at the rebase moment; without
 /// it, a single late burst pins the anchor permanently behind real time
-/// and subsequent PCRs all emit ASAP — exactly the failure mode we
-/// observed in earlier validation.
+/// and subsequent PCRs all emit ASAP.
 const LATE_REBASE_THRESHOLD_NS: u64 = 5_000_000;
 
 /// 500 ms in 27 MHz ticks. PCR jumps beyond this trigger an anchor reset.
@@ -98,77 +115,157 @@ const PCR_DISCONTINUITY_27MHZ: i64 = 13_500_000;
 /// `recv_timeout` polling cadence. Bounds cancel latency.
 const RECV_POLL: Duration = Duration::from_millis(50);
 
-/// 12-byte RFC 2250 RTP header.
-const RTP_HEADER_SIZE: usize = 12;
-
-/// RFC 2250 payload type for MPEG-TS over RTP.
-const RTP_PT_MP2T: u8 = 33;
+/// Drain MSG_ERRQUEUE every Nth packet on the SO_TXTIME path. ~1024
+/// packets ≈ 1.7 s at 6 Mbps TS ≈ 4 ms at ST 2110 1080p50. Cheap (one
+/// non-blocking `recvmsg` call returning EAGAIN when empty).
+const SO_TXTIME_ERRQUEUE_DRAIN_EVERY: u64 = 1024;
 
 /// Channel capacity. 1024 datagrams ≈ 1.7 s of in-flight bytes at
-/// 6 Mbps — comfortably absorbs h264_qsv frame-quanta bursts where the
-/// encoder pipelines several frames of TS at once. Earlier 256 cap was
-/// too tight under live transcode; channel fills, `try_send` drops
-/// fire, decoders pixelate. Keeping the queue this deep adds at most
-/// ~1.7 s of glass-to-glass latency under sustained backpressure (and
-/// only under sustained backpressure — steady state holds far less).
+/// 6 Mbps. With closed-loop rate the channel should rarely fill — it
+/// was the symptom of the open-loop drift bug, not the root cause.
+/// At ST 2110 rates with SO_TXTIME the kernel takes packets at line
+/// rate, so userspace queue depth is irrelevant.
 pub const WIRE_CHANNEL_CAP: usize = 1024;
 
-/// Lower bound clamp on declared/inferred bitrate. Avoids divide-by-zero
-/// edge cases without imposing a meaningful pacing floor.
+/// Lower bound clamp on observed bitrate. Avoids divide-by-zero edges
+/// without imposing a meaningful pacing floor.
 const MIN_BITRATE_BPS: u64 = 64_000;
 
-/// One datagram on its way to the wire. Already final TS bytes (no RTP
-/// header) — emitter wraps if `WireWrap::Rtp`.
+/// Anchor strategy chosen at spawn time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnchorSource {
+    /// PCR-anchored (MPEG-TS). The emitter parses each datagram for a
+    /// PCR sample; cold-start emits ASAP; observed inter-PCR rate
+    /// disciplines between-PCR pacing. `WireDatagram::target_tx_time_ns`
+    /// is ignored.
+    Pcr,
+    /// Caller-supplied target (ST 2110-20/-23 raster pacing).
+    /// `WireDatagram::target_tx_time_ns` MUST be set; the emitter
+    /// delivers at the requested wallclock time without parsing the
+    /// payload.
+    St2110Raster,
+}
+
+/// One datagram on its way to the wire. `bytes` is on-the-wire-final
+/// (caller has already wrapped RTP / FEC / RFC 4175 / etc.).
 ///
-/// `bytes` is `bytes::Bytes` so callers feeding from a `BytesMut`
-/// staging buffer can `.freeze()` (zero-copy) instead of `.to_vec()`
-/// (per-datagram heap copy on the data path).
+/// `bytes::Bytes` so callers feeding from a `BytesMut` staging buffer
+/// can `.freeze()` (zero-copy) instead of `.to_vec()` (per-datagram
+/// heap copy on the data path). For 2022-7 dual-leg, `Bytes::clone()`
+/// is a refcount bump — no copy.
+#[derive(Clone)]
 pub struct WireDatagram {
     pub bytes: Bytes,
     pub recv_time_us: u64,
-    pub rtp_ts_90k: u32,
+    /// Caller-supplied target wallclock (CLOCK_MONOTONIC ns) for the
+    /// `St2110Raster` anchor. Ignored under `Pcr` anchor. `None` is
+    /// "emit ASAP" under either anchor.
+    pub target_tx_time_ns: Option<u64>,
 }
 
-#[derive(Clone, Copy)]
-pub enum WireWrap {
-    /// Send the bytes verbatim (UDP).
-    None,
-    /// Prepend RFC 2250 RTP header (PT=33). Sequence + SSRC owned by
-    /// the emitter — fresh state per spawn so concurrent flows don't
-    /// alias seq numbers.
-    Rtp,
+/// Internal: which release path the spawned thread will use.
+#[derive(Clone, Copy, Debug)]
+enum Releaser {
+    /// Linux SO_TXTIME on a setsockopt-enabled UDP socket. Per-packet
+    /// `sendmsg(SCM_TXTIME)` hands the kernel the target tx time; the
+    /// thread does no userspace sleep.
+    SoTxtime,
+    /// `clock_nanosleep(TIMER_ABSTIME)` to the target, then blocking
+    /// `send_to`. Universal fallback.
+    ClockNanosleep,
+}
+
+/// The release-path tier as logged + reported via stats.
+fn tier_label(releaser: Releaser, sched_fifo_granted: bool) -> &'static str {
+    match (releaser, sched_fifo_granted) {
+        (Releaser::SoTxtime, _) => "so_txtime",
+        (Releaser::ClockNanosleep, true) => "clock_nanosleep_fifo",
+        (Releaser::ClockNanosleep, false) => "clock_nanosleep",
+    }
 }
 
 /// Spawn a dedicated wire-emission thread.
 ///
 /// Returns the encoder-side `SyncSender`. `try_send` is non-blocking;
-/// overflow is counted under `stats.packets_dropped` by the caller.
+/// overflow is the caller's responsibility (count under
+/// `stats.packets_dropped`).
 ///
-/// `socket` must be a blocking `std::net::UdpSocket` (call
-/// `set_nonblocking(false)` after `tokio::net::UdpSocket::into_std`).
+/// `socket` must be a blocking `std::net::UdpSocket`. Callers converting
+/// from `tokio::net::UdpSocket` should call `into_std()` then
+/// `set_nonblocking(false)`.
+///
+/// At spawn time the function probes SO_TXTIME on `socket`. On success
+/// the thread emits via `wire_emit_txtime::send_with_txtime`; on
+/// failure it falls back to `clock_nanosleep` + blocking `send_to`. The
+/// active tier is logged at info level and registered on
+/// `stats.set_wire_pacing_tier`.
 pub fn spawn_wire_emitter(
     id: String,
     socket: UdpSocket,
     dest: SocketAddr,
-    declared_bitrate_bps: u64,
-    wrap: WireWrap,
+    anchor: AnchorSource,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
 ) -> SyncSender<WireDatagram> {
+    // Pick clockid for SO_TXTIME based on anchor. CLOCK_MONOTONIC for
+    // PCR-anchored TS (where targets come from the local
+    // CLOCK_MONOTONIC clock); CLOCK_TAI for ST 2110 raster (where
+    // targets come from a PTP-disciplined system clock via
+    // `St2110_21Pacer`).
+    let clockid = match anchor {
+        AnchorSource::Pcr => libc_clock_monotonic(),
+        AnchorSource::St2110Raster => crate::engine::wire_emit_txtime::CLOCK_TAI,
+    };
+
+    let releaser = if try_enable_so_txtime(&socket, clockid) {
+        Releaser::SoTxtime
+    } else {
+        Releaser::ClockNanosleep
+    };
+
     let (tx, rx) = sync_channel::<WireDatagram>(WIRE_CHANNEL_CAP);
     let thread_id = id.clone();
+    let stats_for_thread = stats.clone();
     std::thread::Builder::new()
         .name(format!("wire-emit-{}", id))
         .spawn(move || {
-            apply_realtime_priority(&thread_id);
-            run_emitter(thread_id, socket, dest, declared_bitrate_bps, wrap, stats, cancel, rx);
+            let sched_fifo = apply_realtime_priority(&thread_id);
+            let tier = tier_label(releaser, sched_fifo);
+            stats_for_thread.set_wire_pacing_tier(tier);
+            tracing::info!(
+                "wire-emit '{}': starting (anchor={:?}, tier={})",
+                thread_id,
+                anchor,
+                tier
+            );
+            run_emitter(thread_id, socket, dest, anchor, releaser, stats_for_thread, cancel, rx);
         })
         .expect("wire-emit thread spawn");
     tx
 }
 
+#[cfg(target_os = "linux")]
+fn libc_clock_monotonic() -> i32 {
+    libc::CLOCK_MONOTONIC
+}
+
+#[cfg(not(target_os = "linux"))]
+fn libc_clock_monotonic() -> i32 {
+    0
+}
+
+/// Best-effort SO_TXTIME enablement. Returns `true` only when the
+/// setsockopt actually succeeded — matches the existing
+/// `wire_emit_txtime::probe()` semantics but operates on the
+/// already-opened output socket.
+fn try_enable_so_txtime(socket: &UdpSocket, clockid: i32) -> bool {
+    crate::engine::wire_emit_txtime::enable_so_txtime(socket, clockid).is_ok()
+}
+
 // ── Target derivation state ─────────────────────────────────────────────
 
+/// PCR-anchored target derivation state. Closed-loop on observed
+/// inter-PCR rate; no declared/configured rate parameter.
 #[derive(Default)]
 struct TargetState {
     /// Most recent PCR sample (27 MHz ticks). `None` until first PCR.
@@ -177,12 +274,12 @@ struct TargetState {
     /// (CLOCK_MONOTONIC ns). Set to `now + PREROLL_NS` on the first
     /// datagram regardless of PCR presence.
     wall_anchor_ns: u64,
-    /// Bytes accumulated past the wall_anchor by datagrams since the
-    /// most recent re-anchor. Reset to 0 when we re-anchor on a PCR.
+    /// Bytes accumulated past `wall_anchor` by datagrams since the most
+    /// recent re-anchor. Reset to 0 when we re-anchor on a PCR.
     bytes_since_anchor: u64,
-    /// EMA of inter-PCR observed bitrate. Used for between-PCR
-    /// interpolation when caller didn't supply a static rate.
-    inferred_bitrate_bps: u64,
+    /// EMA of inter-PCR observed bitrate. Drives between-PCR
+    /// interpolation. 0 until the first inter-PCR observation seeds it.
+    observed_rate_bps: u64,
     /// Set after the very first datagram so we don't preroll again.
     initialised: bool,
 }
@@ -191,13 +288,7 @@ impl TargetState {
     /// Compute the target wall instant (CLOCK_MONOTONIC ns) at which
     /// the just-handed datagram should hit the wire. Mutates internal
     /// anchors so the next call sees consistent state.
-    fn derive_target(
-        &mut self,
-        now_ns: u64,
-        datagram_pcr: Option<u64>,
-        datagram_bytes: usize,
-        declared_bitrate_bps: u64,
-    ) -> u64 {
+    fn derive_target(&mut self, now_ns: u64, datagram_pcr: Option<u64>, datagram_bytes: usize) -> u64 {
         if !self.initialised {
             self.wall_anchor_ns = now_ns.saturating_add(PREROLL_NS);
             self.bytes_since_anchor = 0;
@@ -222,6 +313,23 @@ impl TargetState {
                     return now_ns;
                 }
                 let delta_ns = (delta_27 as u64) * 1000 / 27;
+
+                // Update inter-PCR observed rate (EMA, 1/4 step toward
+                // each new sample). Skip ultra-short inter-PCR windows
+                // (< 1 ms) to avoid noise from clock-quantization at
+                // tiny deltas.
+                if delta_ns >= 1_000_000 && self.bytes_since_anchor > 0 {
+                    let observed_bps = self
+                        .bytes_since_anchor
+                        .saturating_mul(8 * 1_000_000_000)
+                        / delta_ns;
+                    if self.observed_rate_bps == 0 {
+                        self.observed_rate_bps = observed_bps;
+                    } else {
+                        self.observed_rate_bps = (3 * self.observed_rate_bps + observed_bps) / 4;
+                    }
+                }
+
                 let mut target = self.wall_anchor_ns.saturating_add(delta_ns);
 
                 // Late-rebase: if encoder bursts pushed the ideal target
@@ -233,24 +341,6 @@ impl TargetState {
                     target = now_ns;
                 }
 
-                // EMA the inferred bitrate (used when declared rate is
-                // unset). bytes_since_anchor holds bytes accumulated
-                // *between* the prior PCR anchor and now (excluding the
-                // just-arrived PCR datagram, which we're about to
-                // re-anchor on).
-                if delta_ns >= 1_000_000 && self.bytes_since_anchor > 0 {
-                    let observed_bps = self
-                        .bytes_since_anchor
-                        .saturating_mul(8 * 1_000_000_000)
-                        / delta_ns;
-                    if self.inferred_bitrate_bps == 0 {
-                        self.inferred_bitrate_bps = observed_bps;
-                    } else {
-                        self.inferred_bitrate_bps =
-                            (3 * self.inferred_bitrate_bps + observed_bps) / 4;
-                    }
-                }
-
                 self.pcr_anchor = Some(pcr);
                 self.wall_anchor_ns = target;
                 self.bytes_since_anchor = 0;
@@ -258,79 +348,36 @@ impl TargetState {
             }
             // First PCR after a no-PCR run: anchor on it. Pace this
             // datagram from the existing wall_anchor — but only if we
-            // have a bitrate. Otherwise emit immediately.
+            // have an observed rate. Cold-start fallback: target the
+            // wall_anchor itself so the datagram queues behind the
+            // initial preroll-anchored emit instead of jumping ahead
+            // of it.
             self.pcr_anchor = Some(pcr);
-            self.bytes_since_anchor =
-                self.bytes_since_anchor.saturating_add(datagram_bytes as u64);
-            return match self.bytes_to_ns(declared_bitrate_bps) {
-                Some(ns) => self.wall_anchor_ns.saturating_add(ns),
-                None => now_ns,
-            };
+            self.bytes_since_anchor = self.bytes_since_anchor.saturating_add(datagram_bytes as u64);
+            return self
+                .target_with_observed_rate()
+                .unwrap_or(self.wall_anchor_ns.max(now_ns));
         }
 
-        // No PCR. Interpolate by bitrate if we have one.
-        self.bytes_since_anchor =
-            self.bytes_since_anchor.saturating_add(datagram_bytes as u64);
-        match self.bytes_to_ns(declared_bitrate_bps) {
-            Some(ns) => self.wall_anchor_ns.saturating_add(ns),
-            // Cold-start passthrough: no bitrate hint and no inter-PCR
-            // observation yet. Emit immediately — receivers tolerate
-            // packets-ahead-of-cadence far better than packets-far-behind.
-            // The next PCR seeds the EMA and pacing kicks in.
-            None => now_ns,
-        }
+        // No PCR. Interpolate by observed rate if we have one. Cold
+        // start: target wall_anchor (preserves FIFO order through the
+        // preroll window — clock_nanosleep with the same TIMER_ABSTIME
+        // returns at the same instant for queued packets, and the mpsc
+        // FIFO preserves the producer order).
+        self.bytes_since_anchor = self.bytes_since_anchor.saturating_add(datagram_bytes as u64);
+        self.target_with_observed_rate()
+            .unwrap_or(self.wall_anchor_ns.max(now_ns))
     }
 
-    /// Returns the ns-offset from `wall_anchor_ns` for the byte position
-    /// the just-handed datagram represents, OR `None` if neither declared
-    /// nor inferred bitrate is available yet.
-    fn bytes_to_ns(&self, declared_bitrate_bps: u64) -> Option<u64> {
-        let bps = if declared_bitrate_bps > 0 {
-            declared_bitrate_bps
-        } else if self.inferred_bitrate_bps > 0 {
-            self.inferred_bitrate_bps
-        } else {
+    /// Computes `wall_anchor + bytes_since_anchor / observed_rate` if a
+    /// rate has been observed. Returns `None` cold-start.
+    fn target_with_observed_rate(&self) -> Option<u64> {
+        if self.observed_rate_bps == 0 {
             return None;
-        };
-        Some(
-            self.bytes_since_anchor
-                .saturating_mul(8 * 1_000_000_000)
-                / bps.max(MIN_BITRATE_BPS),
-        )
-    }
-}
-
-// ── RTP wrap state (for WireWrap::Rtp) ──────────────────────────────────
-
-struct RtpState {
-    seq: u16,
-    ssrc: u32,
-}
-
-impl RtpState {
-    fn new() -> Self {
-        Self {
-            seq: rand::random::<u16>(),
-            ssrc: rand::random::<u32>(),
         }
-    }
-
-    fn build_header(&mut self, rtp_ts: u32) -> [u8; RTP_HEADER_SIZE] {
-        let mut hdr = [0u8; RTP_HEADER_SIZE];
-        hdr[0] = 0x80;
-        hdr[1] = RTP_PT_MP2T;
-        hdr[2] = (self.seq >> 8) as u8;
-        hdr[3] = (self.seq & 0xFF) as u8;
-        hdr[4] = (rtp_ts >> 24) as u8;
-        hdr[5] = (rtp_ts >> 16) as u8;
-        hdr[6] = (rtp_ts >> 8) as u8;
-        hdr[7] = rtp_ts as u8;
-        hdr[8] = (self.ssrc >> 24) as u8;
-        hdr[9] = (self.ssrc >> 16) as u8;
-        hdr[10] = (self.ssrc >> 8) as u8;
-        hdr[11] = self.ssrc as u8;
-        self.seq = self.seq.wrapping_add(1);
-        hdr
+        let bps = self.observed_rate_bps.max(MIN_BITRATE_BPS);
+        let ns_offset = self.bytes_since_anchor.saturating_mul(8 * 1_000_000_000) / bps;
+        Some(self.wall_anchor_ns.saturating_add(ns_offset))
     }
 }
 
@@ -340,18 +387,14 @@ fn run_emitter(
     id: String,
     socket: UdpSocket,
     dest: SocketAddr,
-    declared_bitrate_bps: u64,
-    wrap: WireWrap,
+    anchor: AnchorSource,
+    releaser: Releaser,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
     rx: Receiver<WireDatagram>,
 ) {
     let mut state = TargetState::default();
-    let mut rtp_state = match wrap {
-        WireWrap::Rtp => Some(RtpState::new()),
-        WireWrap::None => None,
-    };
-    let mut send_buf: Vec<u8> = Vec::with_capacity(RTP_HEADER_SIZE + 1316);
+    let mut packets_since_drain: u64 = 0;
 
     loop {
         if cancel.is_cancelled() {
@@ -364,25 +407,37 @@ fn run_emitter(
         };
 
         let now_ns = monotonic_now_ns();
-        let pcr_27mhz = crate::engine::ts_parse::first_pcr_in_ts_buffer(&dg.bytes);
-        let target_ns =
-            state.derive_target(now_ns, pcr_27mhz, dg.bytes.len(), declared_bitrate_bps);
-
-        if target_ns > now_ns {
-            sleep_until_monotonic_ns(target_ns);
-        }
-
-        let payload: &[u8] = match rtp_state.as_mut() {
-            Some(rs) => {
-                send_buf.clear();
-                send_buf.extend_from_slice(&rs.build_header(dg.rtp_ts_90k));
-                send_buf.extend_from_slice(&dg.bytes);
-                &send_buf
-            }
-            None => &dg.bytes,
+        let pcr_27mhz = match anchor {
+            AnchorSource::Pcr => crate::engine::ts_parse::first_pcr_in_ts_buffer(&dg.bytes),
+            AnchorSource::St2110Raster => None,
         };
 
-        match socket.send_to(payload, dest) {
+        let target_ns = match anchor {
+            AnchorSource::Pcr => state.derive_target(now_ns, pcr_27mhz, dg.bytes.len()),
+            AnchorSource::St2110Raster => dg.target_tx_time_ns.unwrap_or(now_ns),
+        };
+
+        let send_result = match releaser {
+            Releaser::ClockNanosleep => {
+                if target_ns > now_ns {
+                    sleep_until_monotonic_ns(target_ns);
+                }
+                socket.send_to(&dg.bytes, dest)
+            }
+            Releaser::SoTxtime => {
+                // Kernel handles the wallclock target via ETF qdisc.
+                // No userspace sleep — the thread loops at producer
+                // rate with bounded recvmsg + sendmsg cost.
+                crate::engine::wire_emit_txtime::send_with_txtime(
+                    &socket,
+                    dest,
+                    &dg.bytes,
+                    target_ns,
+                )
+            }
+        };
+
+        match send_result {
             Ok(sent) => {
                 stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                 stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
@@ -393,6 +448,19 @@ fn run_emitter(
             }
             Err(e) => {
                 tracing::warn!("wire-emit '{}' send error: {}", id, e);
+            }
+        }
+
+        // Periodic errqueue drain on the SO_TXTIME path. Cheap when
+        // empty (one non-blocking recvmsg returning EAGAIN).
+        if let Releaser::SoTxtime = releaser {
+            packets_since_drain = packets_since_drain.wrapping_add(1);
+            if packets_since_drain >= SO_TXTIME_ERRQUEUE_DRAIN_EVERY {
+                let late = crate::engine::wire_emit_txtime::drain_errqueue_late_count(&socket);
+                if late > 0 {
+                    stats.wire_pacing_late.fetch_add(late, Ordering::Relaxed);
+                }
+                packets_since_drain = 0;
             }
         }
     }
@@ -432,12 +500,13 @@ fn sleep_until_monotonic_ns(target_ns: u64) {
 }
 
 #[cfg(target_os = "linux")]
-fn apply_realtime_priority(id: &str) {
+fn apply_realtime_priority(id: &str) -> bool {
     let mut sp: libc::sched_param = unsafe { std::mem::zeroed() };
     sp.sched_priority = 50;
     let rc = unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &sp) };
     if rc == 0 {
         tracing::debug!("wire-emit '{}': SCHED_FIFO priority 50 acquired", id);
+        true
     } else {
         tracing::debug!(
             "wire-emit '{}': SCHED_FIFO unavailable (rc={}); running at default priority. \
@@ -445,6 +514,7 @@ fn apply_realtime_priority(id: &str) {
             id,
             rc
         );
+        false
     }
 }
 
@@ -465,9 +535,10 @@ fn sleep_until_monotonic_ns(target_ns: u64) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn apply_realtime_priority(_id: &str) {
+fn apply_realtime_priority(_id: &str) -> bool {
     // No realtime path on non-Linux. clock_nanosleep + SCHED_FIFO is
     // Linux-specific in this codebase.
+    false
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -482,7 +553,7 @@ mod tests {
     #[test]
     fn first_datagram_anchors_at_now_plus_preroll() {
         let mut s = TargetState::default();
-        let target = s.derive_target(1_000_000_000, Some(900_000), 1316, 5_000_000);
+        let target = s.derive_target(1_000_000_000, Some(900_000), 1316);
         assert_eq!(target, 1_000_000_000 + PREROLL_NS);
         assert!(s.initialised);
         assert_eq!(s.pcr_anchor, Some(900_000));
@@ -492,17 +563,14 @@ mod tests {
     fn pcr_to_pcr_delta_drives_target() {
         let mut s = TargetState::default();
         // Init with first datagram at t=0, PCR=27 000 (1 ms).
-        let _ = s.derive_target(0, Some(TICK_PER_MS), 1316, 5_000_000);
+        let _ = s.derive_target(0, Some(TICK_PER_MS), 1316);
         let anchor_wall = s.wall_anchor_ns;
 
-        // Next PCR datagram, 40 ms later in PCR space. Bytes between
-        // anchors don't matter for the PCR-driven target — PCRs are
-        // independent of bytes.
+        // Next PCR datagram, 40 ms later in PCR space.
         let target = s.derive_target(
             anchor_wall + 100_000, // wall isn't used for PCR-driven targets
             Some(TICK_PER_MS + 40 * TICK_PER_MS),
             1316,
-            5_000_000,
         );
         // Expected: anchor_wall + 40 ms in ns.
         assert_eq!(target, anchor_wall + 40_000_000);
@@ -512,30 +580,34 @@ mod tests {
     }
 
     #[test]
-    fn between_pcrs_uses_declared_bitrate() {
+    fn between_pcrs_uses_observed_rate() {
         let mut s = TargetState::default();
-        // First datagram has PCR; emits at wall_anchor.
-        let _ = s.derive_target(0, Some(TICK_PER_MS), 1316, 8_000_000);
+        // First datagram, PCR=0. No observed rate yet.
+        let _ = s.derive_target(0, Some(0), 1316);
+        // Seed observed rate via a second PCR 40 ms later carrying
+        // 50 000 bytes accumulated in between (the test fakes this by
+        // setting bytes_since_anchor directly so the observed-rate
+        // EMA fires).
+        s.bytes_since_anchor = 50_000;
+        let _ = s.derive_target(0, Some(40 * TICK_PER_MS), 1316);
+        assert_eq!(s.observed_rate_bps, 10_000_000); // 50 KB / 40 ms = 10 Mbps
         let anchor = s.wall_anchor_ns;
-        // Next datagram has no PCR. 1316 bytes at 8 Mbps = 1316 µs.
-        let target = s.derive_target(anchor + 1, None, 1316, 8_000_000);
-        let expected = anchor + 1316 * 8 * 1_000_000_000 / 8_000_000;
+
+        // Now a non-PCR datagram. 1316 bytes at 10 Mbps = 1.0528 µs in
+        // ns terms: 1316 * 8 * 1_000_000_000 / 10_000_000 = 1_052_800.
+        let target = s.derive_target(anchor + 1, None, 1316);
+        let expected = anchor + 1316 * 8 * 1_000_000_000 / 10_000_000;
         assert_eq!(target, expected);
         assert_eq!(s.bytes_since_anchor, 1316);
-
-        // Second non-PCR: 2 × 1316 bytes from anchor.
-        let target2 = s.derive_target(anchor + 1, None, 1316, 8_000_000);
-        let expected2 = anchor + 2 * 1316 * 8 * 1_000_000_000 / 8_000_000;
-        assert_eq!(target2, expected2);
     }
 
     #[test]
     fn discontinuity_backwards_resets_anchor() {
         let mut s = TargetState::default();
-        let _ = s.derive_target(0, Some(100 * TICK_PER_MS), 1316, 5_000_000);
+        let _ = s.derive_target(0, Some(100 * TICK_PER_MS), 1316);
         let now = 5_000_000_000u64;
         // Backwards PCR: should reset to "now".
-        let target = s.derive_target(now, Some(50 * TICK_PER_MS), 1316, 5_000_000);
+        let target = s.derive_target(now, Some(50 * TICK_PER_MS), 1316);
         assert_eq!(target, now);
         assert_eq!(s.wall_anchor_ns, now);
         assert_eq!(s.pcr_anchor, Some(50 * TICK_PER_MS));
@@ -544,10 +616,10 @@ mod tests {
     #[test]
     fn discontinuity_forward_jump_resets_anchor() {
         let mut s = TargetState::default();
-        let _ = s.derive_target(0, Some(TICK_PER_MS), 1316, 5_000_000);
+        let _ = s.derive_target(0, Some(TICK_PER_MS), 1316);
         let now = 5_000_000_000u64;
         // 600 ms forward jump > 500 ms threshold.
-        let target = s.derive_target(now, Some(601 * TICK_PER_MS), 1316, 5_000_000);
+        let target = s.derive_target(now, Some(601 * TICK_PER_MS), 1316);
         assert_eq!(target, now);
         assert_eq!(s.pcr_anchor, Some(601 * TICK_PER_MS));
     }
@@ -555,55 +627,73 @@ mod tests {
     #[test]
     fn small_forward_jump_under_threshold_keeps_anchor() {
         let mut s = TargetState::default();
-        let _ = s.derive_target(0, Some(TICK_PER_MS), 1316, 5_000_000);
+        let _ = s.derive_target(0, Some(TICK_PER_MS), 1316);
         let anchor = s.wall_anchor_ns;
         // 400 ms forward — well under the 500 ms discontinuity bound.
-        let target = s.derive_target(0, Some(401 * TICK_PER_MS), 1316, 5_000_000);
+        let target = s.derive_target(0, Some(401 * TICK_PER_MS), 1316);
         assert_eq!(target, anchor + 400_000_000);
     }
 
     #[test]
-    fn inferred_bitrate_emas_from_inter_pcr_observations() {
+    fn observed_rate_emas_from_inter_pcr_observations() {
         let mut s = TargetState::default();
         // First datagram, PCR.
-        let _ = s.derive_target(0, Some(0), 1316, 0);
-        // Pretend a bunch of non-PCR datagrams piled up: 50 000 bytes
-        // accumulated since anchor. We can't add them via the API
-        // without a bitrate, so set state directly.
+        let _ = s.derive_target(0, Some(0), 1316);
+        // Set bytes_since_anchor directly so the EMA fires on the next
+        // PCR (the API has no way to add bytes without arrival, which
+        // is the exact reason between-PCR pacing only kicks in after
+        // an observation).
         s.bytes_since_anchor = 50_000;
         // Second PCR 40 ms later. Observed = 50 000 B / 40 ms = 10 Mbps.
-        let _ = s.derive_target(0, Some(40 * TICK_PER_MS), 1316, 0);
-        // First observation seeds inferred directly.
-        assert_eq!(s.inferred_bitrate_bps, 10_000_000);
+        let _ = s.derive_target(0, Some(40 * TICK_PER_MS), 1316);
+        assert_eq!(s.observed_rate_bps, 10_000_000);
+
+        // Third PCR 40 ms later, observed = 60 000 B / 40 ms = 12 Mbps.
+        // EMA: (3*10 + 12) / 4 = 10.5 Mbps.
+        s.bytes_since_anchor = 60_000;
+        let _ = s.derive_target(0, Some(80 * TICK_PER_MS), 1316);
+        assert_eq!(s.observed_rate_bps, 10_500_000);
     }
 
     #[test]
-    fn cold_start_passthrough_emits_immediately_until_first_pcr_pair() {
+    fn cold_start_targets_wall_anchor_until_first_inter_pcr_pair() {
         let mut s = TargetState::default();
         // First datagram has PCR — anchors at now+preroll.
-        let _ = s.derive_target(0, Some(0), 1316, 0);
+        let _ = s.derive_target(0, Some(0), 1316);
         let anchor = s.wall_anchor_ns;
         // Subsequent non-PCR datagrams arrive before the second PCR
-        // lands. With no declared rate and no inferred rate yet, they
-        // must emit immediately — not stretched out by the MIN_BITRATE
-        // floor (which would space them ~125 ms apart).
-        let now = anchor + 100_000;
-        let target = s.derive_target(now, None, 1316, 0);
-        assert_eq!(target, now, "cold-start non-PCR must emit at now");
-        let target2 = s.derive_target(now, None, 1316, 0);
-        assert_eq!(target2, now);
+        // lands. With no observed rate yet, they MUST target the
+        // wall_anchor (preserves FIFO order through preroll instead
+        // of jumping ahead of the queued first datagram).
+        let now = anchor - 1_000_000; // pretend we're inside preroll
+        let target = s.derive_target(now, None, 1316);
+        assert_eq!(target, anchor, "cold-start non-PCR must target wall_anchor during preroll");
+        let target2 = s.derive_target(now, None, 1316);
+        assert_eq!(target2, anchor);
 
         // After two PCRs land, the EMA seeds and pacing kicks in.
         s.bytes_since_anchor = 50_000;
-        let _ = s.derive_target(now, Some(40 * TICK_PER_MS), 1316, 0);
-        assert!(s.inferred_bitrate_bps > 0);
-        // Now non-PCR datagrams should pace by the inferred rate.
-        let post = s.derive_target(now + 1, None, 1316, 0);
+        let _ = s.derive_target(now, Some(40 * TICK_PER_MS), 1316);
+        assert!(s.observed_rate_bps > 0);
+        // Now non-PCR datagrams should pace by the observed rate.
+        let post = s.derive_target(now + 1, None, 1316);
         assert!(post > s.wall_anchor_ns);
     }
 
     #[test]
-    fn non_linux_or_linux_monotonic_now_advances() {
+    fn cold_start_after_preroll_targets_now() {
+        // Same as above but `now_ns` is past `wall_anchor`. The fallback
+        // `wall_anchor.max(now_ns)` should return now to keep emit
+        // current with real time once preroll is over.
+        let mut s = TargetState::default();
+        let _ = s.derive_target(0, Some(0), 1316);
+        let after_preroll = s.wall_anchor_ns + 1_000_000_000;
+        let target = s.derive_target(after_preroll, None, 1316);
+        assert_eq!(target, after_preroll);
+    }
+
+    #[test]
+    fn monotonic_now_advances() {
         let a = monotonic_now_ns();
         std::thread::sleep(Duration::from_millis(2));
         let b = monotonic_now_ns();
@@ -619,28 +709,13 @@ mod tests {
         assert!(after >= target, "after={} target={}", after, target);
     }
 
+    /// End-to-end smoke: spawn the emitter, push three TS datagrams,
+    /// observe monotonic emit pacing. UDP send target is loopback :0
+    /// (kernel allocated port that no one's listening on — kernel
+    /// still drops the datagram cleanly without erroring on
+    /// Linux/macOS).
     #[test]
-    fn rtp_state_builds_rfc2250_header() {
-        let mut s = RtpState::new();
-        let initial_ssrc = s.ssrc;
-        let h1 = s.build_header(0x12345678);
-        let h2 = s.build_header(0x12345679);
-        assert_eq!(h1[0], 0x80);
-        assert_eq!(h1[1], RTP_PT_MP2T);
-        let seq1 = u16::from_be_bytes([h1[2], h1[3]]);
-        let seq2 = u16::from_be_bytes([h2[2], h2[3]]);
-        assert_eq!(seq2.wrapping_sub(seq1), 1);
-        assert_eq!(u32::from_be_bytes([h1[4], h1[5], h1[6], h1[7]]), 0x12345678);
-        let ssrc1 = u32::from_be_bytes([h1[8], h1[9], h1[10], h1[11]]);
-        assert_eq!(ssrc1, initial_ssrc);
-    }
-
-    /// End-to-end smoke: spawn the emitter, push three datagrams, observe
-    /// monotonic emit pacing. UDP send target is loopback :0 (kernel
-    /// allocated port that no one's listening on — kernel still drops the
-    /// datagram cleanly without erroring on Linux/macOS).
-    #[test]
-    fn emitter_paces_and_sends() {
+    fn emitter_paces_and_sends_pcr_anchor() {
         use std::net::Ipv4Addr;
         let bind = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let dest = bind.local_addr().unwrap();
@@ -657,8 +732,7 @@ mod tests {
             "test".to_string(),
             send,
             dest,
-            5_000_000, // 5 Mbps declared
-            WireWrap::None,
+            AnchorSource::Pcr,
             stats.clone(),
             cancel.clone(),
         );
@@ -674,7 +748,7 @@ mod tests {
             tx.try_send(WireDatagram {
                 bytes: Bytes::from(bytes.clone()),
                 recv_time_us: 0,
-                rtp_ts_90k: 0,
+                target_tx_time_ns: None,
             })
             .unwrap();
         }
@@ -686,5 +760,47 @@ mod tests {
 
         let sent = stats.packets_sent.load(Ordering::Relaxed);
         assert!(sent >= 1, "expected at least one packet sent, got {}", sent);
+    }
+
+    /// St2110Raster anchor: caller-supplied target_tx_time_ns drives
+    /// emission. PCR parsing is skipped.
+    #[test]
+    fn emitter_honours_st2110_raster_target() {
+        use std::net::Ipv4Addr;
+        let bind = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let dest = bind.local_addr().unwrap();
+        let send = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        send.set_nonblocking(false).unwrap();
+
+        let stats = Arc::new(OutputStatsAccumulator::new(
+            "test-2110".to_string(),
+            "test-2110".to_string(),
+            "st2110_20".to_string(),
+        ));
+        let cancel = CancellationToken::new();
+        let tx = spawn_wire_emitter(
+            "test-2110".to_string(),
+            send,
+            dest,
+            AnchorSource::St2110Raster,
+            stats.clone(),
+            cancel.clone(),
+        );
+
+        let now = monotonic_now_ns();
+        for i in 0..3 {
+            tx.try_send(WireDatagram {
+                bytes: Bytes::from_static(b"st2110-raster-test"),
+                recv_time_us: 0,
+                target_tx_time_ns: Some(now + i * 100_000),
+            })
+            .unwrap();
+        }
+        drop(tx);
+
+        std::thread::sleep(Duration::from_millis(50));
+        cancel.cancel();
+        let sent = stats.packets_sent.load(Ordering::Relaxed);
+        assert_eq!(sent, 3);
     }
 }

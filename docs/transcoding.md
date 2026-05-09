@@ -563,6 +563,30 @@ Same set as `audio_encode`:
 - Wiring: `output_udp.rs`, `output_rtp.rs`, `output_srt.rs` chain
   `program_filter → audio_replacer → video_replacer → egress`.
 
+### PCR_AC at the receiver — observed-rate pacing
+
+PCR jitter (PCR_AC in TR-101290) at the receiver is a function of the
+encoder's actual output rate, not its declared bitrate. CRF / capped-VBR
+/ "CBR" with VBV all overshoot transiently — the wire pacer
+(`engine::wire_emit`) closed-loops on the inter-PCR observed rate and
+adapts within ~10 PCRs (~400 ms typical). It does not consult
+`video_encode.bitrate_kbps`. Universal across codec, RC mode, and
+encoder backend (CPU x264/x265, NVENC, QSV, VAAPI).
+
+The receiver-side PCR_AC envelope you should expect:
+
+| Tier | Expected PCR_AC (p99) | Receiver compliance |
+|---|---|---|
+| 1 (SO_TXTIME + ETF + NIC HW) | < 1 µs | Tier-1 broadcast, T-STD ≤ 500 ns met |
+| 2 (SO_TXTIME + software ETF) | < 50 µs | Most professional decoders happy |
+| 3 (SO_TXTIME, no ETF) | Same as no pacing | Status quo for unpaced loopback |
+| 4 (`clock_nanosleep` SCHED_FIFO) | < 1 ms | Decoder-acceptable for ≤ 6 Mbps TS |
+| 5 (no SCHED_FIFO grant) | < 5 ms | Worst-case fallback; visual decode usually still clean |
+
+See [`wire-pacing.md`](wire-pacing.md) for the full architecture and
+[`installation.md`](installation.md#wire-pacing) for the operator-side
+ETF qdisc setup.
+
 ---
 
 ## Known limitations (revisit these)

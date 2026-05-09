@@ -160,3 +160,11 @@ pass with the master-clock work in.
 - **PCR pre-roll** is hard-coded at 80 ms; a future enhancement could
   expose it per-flow for low-latency contribution where 40 ms is
   preferable.
+
+## See also
+
+- [`wire-pacing.md`](wire-pacing.md) — PCR-anchored / PTP-raster-anchored
+  kernel-paced wire emission. Master-clock generates the PCR values
+  inside the bitstream; wire pacing ensures those PCR-bearing packets
+  hit the wire at the matching wallclock instant. Both are required
+  for tier-1 PCR_AC at the receiver.

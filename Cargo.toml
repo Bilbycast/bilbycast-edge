@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-edge"
-version = "0.50.0"
+version = "0.51.0"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 license = "AGPL-3.0-or-later"
@@ -45,6 +45,12 @@ strum_macros = "0.28.0"
 # Socket config
 socket2 = "0.6.3"
 libc = "0.2.186"
+
+# Network interface enumeration (used by util::network_interfaces to populate
+# HealthPayload.network_interfaces — name, IPv4/IPv6, MAC, MTU, loopback).
+# Pure Rust, cross-platform, MIT — no new C deps. Linux-only fields (link
+# speed, operstate) are read directly from /sys/class/net/<iface>/.
+if-addrs = "0.13"
 
 # Random
 rand = "0.10.1"

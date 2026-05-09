@@ -182,11 +182,13 @@ pub fn resolve_chroma(s: Option<&str>) -> VideoChroma {
 }
 
 pub fn resolve_rate_control(s: Option<&str>) -> VideoRateControl {
-    match s.unwrap_or("vbr") {
-        "cbr" => VideoRateControl::Cbr,
+    // Broadcast contribution defaults to CBR — VBR complicates wire pacing
+    // and downstream mux ingest. Operators who want VBR opt in explicitly.
+    match s.unwrap_or("cbr") {
+        "vbr" => VideoRateControl::Vbr,
         "crf" => VideoRateControl::Crf,
         "abr" => VideoRateControl::Abr,
-        _ => VideoRateControl::Vbr,
+        _ => VideoRateControl::Cbr,
     }
 }
 

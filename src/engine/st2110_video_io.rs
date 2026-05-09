@@ -41,7 +41,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -61,7 +60,7 @@ use crate::engine::st2110::video::{
     Rfc4175Depacketizer, Rfc4175MultiStreamReassembler, Rfc4175Packetizer,
     St2110_23PartitionMode, VideoField,
 };
-use crate::engine::wire_emit_txtime;
+use crate::engine::wire_emit::{AnchorSource, WireDatagram, spawn_wire_emitter};
 use crate::engine::ts_demux::{DemuxedFrame, TsDemuxer};
 use crate::stats::collector::{FlowStatsAccumulator, OutputStatsAccumulator};
 use crate::util::socket::{create_udp_output};
@@ -106,36 +105,30 @@ fn build_pacer(config: &St2110VideoOutputConfig, profile: St2110_21ProfileConfig
     St2110_21Pacer::new(frame_period_ns, packets_per_frame, pacer_profile)
 }
 
-/// Blocking-thread sender for ST 2110-20 outputs with `wire_pacing`
-/// opted in. Tries to enable `SO_TXTIME(CLOCK_TAI)` on each socket;
-/// if the kernel rejects (older kernels, containers), falls back to
-/// `send_to` — same observable behavior as the unpaced path. Both
-/// paths increment the same stats counters and run a deterministic
-/// per-packet target derived from the pacer.
+/// Blocking-thread packetiser for ST 2110-20 outputs. Always paced.
+///
+/// Drains `frame_rx`, runs the RFC 4175 packetiser, computes a per-packet
+/// `target_tx_time_ns` against the active raster via [`St2110_21Pacer`],
+/// and dispatches each datagram to the supplied wire-emit channel(s).
+/// Each wire-emit instance owns one std blocking UDP socket and selects
+/// SO_TXTIME or `clock_nanosleep` based on its capability probe.
+///
+/// At ST 2110-20/-23 packet rates (~250k+ pps), only the SO_TXTIME tier
+/// can keep up — the clock_nanosleep fallback is in tree for parity but
+/// will saturate a core well before the frame rate hits 1080p50.
+/// Operators see the active tier in the per-output stats
+/// (`wire_pacing_tier`) and the startup log.
 fn run_paced_sender(
     id: String,
-    red: std::net::UdpSocket,
-    dest_red: SocketAddr,
-    blue: Option<std::net::UdpSocket>,
-    dest_blue: Option<SocketAddr>,
     pacer: Arc<St2110_21Pacer>,
     packetizer: &mut Rfc4175Packetizer,
     mut frame_rx: mpsc::Receiver<RawVideoFrame>,
     cancel: CancellationToken,
+    wire_red: std::sync::mpsc::SyncSender<WireDatagram>,
+    wire_blue: Option<std::sync::mpsc::SyncSender<WireDatagram>>,
     stats: Arc<OutputStatsAccumulator>,
 ) {
-    use crate::engine::wire_emit_txtime::CLOCK_TAI;
-    let red_paced = wire_emit_txtime::enable_so_txtime(&red, CLOCK_TAI).is_ok();
-    let blue_paced = blue
-        .as_ref()
-        .map(|s| wire_emit_txtime::enable_so_txtime(s, CLOCK_TAI).is_ok())
-        .unwrap_or(false);
-    if !red_paced {
-        tracing::warn!(
-            "ST 2110-20 output '{}': SO_TXTIME unavailable on red leg; running unpaced",
-            id
-        );
-    }
+    let _ = id;
     let mut frame_index: u64 = 0;
     while !cancel.is_cancelled() {
         let frame = match frame_rx.blocking_recv() {
@@ -147,41 +140,36 @@ fn run_paced_sender(
         let total_pkts = out_pkts.len() as u64;
         let mut total_bytes = 0u64;
         let pkts_in_frame = pacer.packets_per_frame();
+        let recv_us = crate::util::time::now_us();
         for (idx, pkt) in out_pkts.iter().enumerate() {
             total_bytes += pkt.len() as u64;
-            // Target per-packet tx time. If our packet count exceeds the
-            // pacer's packets_per_frame estimate (e.g. budget rounded
-            // down), clamp at the last slot — the late-rebase / qdisc
-            // handles the edge case naturally.
             let pkt_idx = (idx as u32).min(pkts_in_frame.saturating_sub(1));
             let target_ns = pacer.target_for_packet(frame_index, pkt_idx);
-            if red_paced {
-                let _ = wire_emit_txtime::send_with_txtime(&red, dest_red, pkt, target_ns);
-            } else {
-                let _ = red.send_to(pkt, dest_red);
+            // Both legs receive the same Bytes (refcount bump only).
+            let dg_red = WireDatagram {
+                bytes: pkt.clone(),
+                recv_time_us: recv_us,
+                target_tx_time_ns: Some(target_ns),
+            };
+            if wire_red.try_send(dg_red).is_err() {
+                stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
             }
-            if let (Some(ref b), Some(addr)) = (blue.as_ref(), dest_blue) {
-                if blue_paced {
-                    let _ = wire_emit_txtime::send_with_txtime(b, addr, pkt, target_ns);
-                } else {
-                    let _ = b.send_to(pkt, addr);
-                }
+            if let Some(ref blue) = wire_blue {
+                let dg_blue = WireDatagram {
+                    bytes: pkt.clone(),
+                    recv_time_us: recv_us,
+                    target_tx_time_ns: Some(target_ns),
+                };
+                let _ = blue.try_send(dg_blue);
             }
         }
-        stats.packets_sent.fetch_add(total_pkts, Ordering::Relaxed);
-        stats.bytes_sent.fetch_add(total_bytes, Ordering::Relaxed);
+        // packets_sent / bytes_sent are tracked inside wire_emit on
+        // successful send. We track frame-level totals locally only
+        // for diagnostics — but to avoid double-counting against the
+        // wire_emit's own counters, we DON'T fetch_add stats here.
+        let _ = total_pkts;
+        let _ = total_bytes;
         frame_index = frame_index.wrapping_add(1);
-        // Periodically drain the error queue and surface late-drop
-        // counts. `OutputStatsAccumulator` doesn't have a dedicated
-        // wire_pacing_late counter today; rolled into packets_dropped
-        // for now (this is a low-frequency, opt-in path — adding a
-        // dedicated counter is a follow-up if operators ask).
-        if red_paced {
-            let late = wire_emit_txtime::drain_errqueue_late_count(&red);
-            if late > 0 {
-                stats.packets_dropped.fetch_add(late, Ordering::Relaxed);
-            }
-        }
     }
 }
 
@@ -686,7 +674,7 @@ pub async fn run_st2110_20_output(
         None
     };
 
-    let (frame_tx, mut frame_rx) = mpsc::channel::<RawVideoFrame>(EGRESS_FRAME_QUEUE);
+    let (frame_tx, frame_rx) = mpsc::channel::<RawVideoFrame>(EGRESS_FRAME_QUEUE);
     let (nalu_tx, nalu_rx) = mpsc::channel::<DemuxedFrame>(EGRESS_NALUS_QUEUE);
 
     let width = config.width;
@@ -703,90 +691,90 @@ pub async fn run_st2110_20_output(
     };
     let mut packetizer = Rfc4175Packetizer::new(cfg);
 
-    let ssrc = cfg.ssrc;
-    let _ = ssrc;
+    // ── Wire egress: PCR/raster-paced via wire_emit ──────────────────
+    //
+    // Every ST 2110-20 output is paced unconditionally. The
+    // `St2110_21Pacer` computes `target_tx_time_ns` per RFC 4175
+    // packet against the active video frame raster (anchored on
+    // `CLOCK_TAI` when `ptp4l` is running). `wire_emit` selects
+    // SO_TXTIME on Linux ≥ 4.19 with permitted setsockopt or
+    // `clock_nanosleep` fallback otherwise; tier is logged at
+    // startup and surfaced in `OutputStats.wire_pacing_tier`.
+    //
+    // The deprecated `wire_pacing` config field is ignored at runtime
+    // — kept in the schema for backward compatibility with stored
+    // configs.
+    #[allow(deprecated)]
+    let wire_pacing_was_set = config.wire_pacing.is_some();
+    if wire_pacing_was_set {
+        tracing::warn!(
+            "ST 2110-20 output '{}': wire_pacing config field is deprecated and ignored \
+             (pacing is now automatic — see docs/wire-pacing.md)",
+            config.id
+        );
+    }
+    #[allow(deprecated)]
+    let profile = match config.wire_pacing.as_ref() {
+        Some(WirePacingConfig::TxTime { profile }) => *profile,
+        None => St2110_21ProfileConfig::NarrowLinear,
+    };
+    let pacer = Arc::new(build_pacer(&config, profile));
 
-    // ── Wire egress: paced (SO_TXTIME) or unpaced (tokio async send) ──
-    //
-    // When the operator opts in via `config.wire_pacing`, run the
-    // sender on a `spawn_blocking` thread that uses `SO_TXTIME` +
-    // `sendmmsg` to schedule transmission against the kernel's
-    // `CLOCK_TAI`. The pacer ([`St2110_21Pacer`]) computes
-    // `target_tx_time_ns` per packet against the frame raster.
-    //
-    // If `setsockopt(SO_TXTIME)` fails (kernel < 4.19, container without
-    // permission), the blocking sender falls back to plain
-    // `send_to` — identical to today's unpaced behavior, no regression.
-    // The operator sees a `wire_pacing_unavailable` Warning event.
-    //
-    // Without `wire_pacing` opted in, today's tokio async sender path
-    // runs unchanged.
+    let red_std = red_sock
+        .into_std()
+        .map_err(|e| anyhow!("ST 2110-20 output '{}' red into_std: {e}", config.id))?;
+    red_std.set_nonblocking(false).ok();
+    let wire_red = spawn_wire_emitter(
+        format!("{}-red", config.id),
+        red_std,
+        dest_red,
+        AnchorSource::St2110Raster,
+        stats.clone(),
+        cancel.clone(),
+    );
+    let wire_blue = match (blue_sock, dest_blue) {
+        (Some(s), Some(addr)) => {
+            let blue_std = s
+                .into_std()
+                .map_err(|e| anyhow!("ST 2110-20 output '{}' blue into_std: {e}", config.id))?;
+            blue_std.set_nonblocking(false).ok();
+            // Leg 2 stats are private — never surfaced — to keep the
+            // observable counters single-leg.
+            let leg2_stats = Arc::new(OutputStatsAccumulator::new(
+                format!("{}-blue", config.id),
+                format!("{}-blue", config.id),
+                "st2110_20_blue".to_string(),
+            ));
+            Some(spawn_wire_emitter(
+                format!("{}-blue", config.id),
+                blue_std,
+                addr,
+                AnchorSource::St2110Raster,
+                leg2_stats,
+                cancel.clone(),
+            ))
+        }
+        _ => None,
+    };
+
     let sender_id = config.id.clone();
     let sender_cancel = cancel.clone();
     let sender_stats = stats.clone();
-    let sender_handle = match config.wire_pacing.as_ref() {
-        Some(WirePacingConfig::TxTime { profile }) => {
-            let pacer = Arc::new(build_pacer(&config, *profile));
-            let red_std = red_sock
-                .into_std()
-                .map_err(|e| anyhow!("ST 2110-20 output '{}' red into_std: {e}", config.id))?;
-            red_std.set_nonblocking(false).ok();
-            let blue_std = match blue_sock {
-                Some(s) => Some(
-                    s.into_std()
-                        .map_err(|e| anyhow!("ST 2110-20 output '{}' blue into_std: {e}", config.id))?,
-                ),
-                None => None,
-            };
-            if let Some(ref s) = blue_std {
-                s.set_nonblocking(false).ok();
-            }
-            tokio::task::spawn_blocking(move || {
-                run_paced_sender(
-                    sender_id,
-                    red_std,
-                    dest_red,
-                    blue_std,
-                    dest_blue,
-                    pacer,
-                    &mut packetizer,
-                    frame_rx,
-                    sender_cancel,
-                    sender_stats,
-                );
-            })
-        }
-        None => {
-            let red_arc = Arc::new(red_sock);
-            let blue_arc = blue_sock.map(Arc::new);
-            tokio::spawn(async move {
-                while !sender_cancel.is_cancelled() {
-                    let frame = tokio::select! {
-                        _ = sender_cancel.cancelled() => break,
-                        f = frame_rx.recv() => match f { Some(f) => f, None => break },
-                    };
-                    let mut out_pkts: Vec<Bytes> = Vec::with_capacity(16);
-                    packetizer.packetize(&frame, |pkt| out_pkts.push(pkt));
-                    let mut total_bytes = 0u64;
-                    let total_pkts = out_pkts.len() as u64;
-                    for pkt in out_pkts {
-                        total_bytes += pkt.len() as u64;
-                        let _ = red_arc.send_to(&pkt, dest_red).await;
-                        if let (Some(b), Some(addr)) = (blue_arc.as_ref(), dest_blue) {
-                            let _ = b.send_to(&pkt, addr).await;
-                        }
-                    }
-                    sender_stats.packets_sent.fetch_add(total_pkts, Ordering::Relaxed);
-                    sender_stats.bytes_sent.fetch_add(total_bytes, Ordering::Relaxed);
-                }
-            })
-        }
-    };
+    let sender_handle = tokio::task::spawn_blocking(move || {
+        run_paced_sender(
+            sender_id,
+            pacer,
+            &mut packetizer,
+            frame_rx,
+            sender_cancel,
+            wire_red,
+            wire_blue,
+            sender_stats,
+        );
+    });
 
     // Feeder task: drain broadcast_rx, demux TS, forward H.264/HEVC frames.
     let mut ts_demuxer = TsDemuxer::new(None);
-    let ssrc_used = ssrc;
-    let _ = ssrc_used;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -1088,16 +1076,50 @@ pub async fn run_st2110_23_output(
     let mode = partition_mode_for(config.partition_mode);
     let n = config.sub_streams.len() as u32;
 
-    // Build per-sub-stream packetizers + sockets.
+    #[allow(deprecated)]
+    let wire_pacing_was_set = config.wire_pacing.is_some();
+    if wire_pacing_was_set {
+        tracing::warn!(
+            "ST 2110-23 output '{}': wire_pacing config field is deprecated and ignored \
+             (pacing is now automatic — see docs/wire-pacing.md)",
+            config.id
+        );
+    }
+    #[allow(deprecated)]
+    let profile = match config.wire_pacing.as_ref() {
+        Some(WirePacingConfig::TxTime { profile }) => *profile,
+        None => St2110_21ProfileConfig::NarrowLinear,
+    };
+
+    // Per-sub-stream pacer. Each sub-stream carries 1/N of the packets
+    // of the full frame at the same frame rate; the pacer evenly
+    // spreads its packet budget across the frame period.
+    let pgroup_fmt = pgroup_for(config.pixel_format);
+    let pgroup_bytes = pgroup_fmt.pgroup_bytes() as u64;
+    let pgroup_pixels = pgroup_fmt.pgroup_pixels() as u64;
+    let frame_pixels = (config.width as u64).saturating_mul(config.height as u64);
+    let frame_bytes = frame_pixels.saturating_mul(pgroup_bytes) / pgroup_pixels.max(1);
+    let payload = (config.payload_budget as u64).max(1);
+    let packets_per_frame_total = (frame_bytes.saturating_add(payload - 1) / payload).max(1) as u32;
+    let packets_per_substream = ((packets_per_frame_total as u64 + n as u64 - 1) / n as u64) as u32;
+    let frame_period_ns = 1_000_000_000u64
+        .saturating_mul(config.frame_rate_den as u64)
+        / (config.frame_rate_num as u64).max(1);
+    let pacer_profile = match profile {
+        St2110_21ProfileConfig::Narrow => St2110_21Profile::Narrow,
+        St2110_21ProfileConfig::NarrowLinear => St2110_21Profile::NarrowLinear,
+        St2110_21ProfileConfig::Wide => St2110_21Profile::Wide,
+    };
+    let shared_pacer = Arc::new(St2110_21Pacer::new(frame_period_ns, packets_per_substream, pacer_profile));
+
+    // Build per-sub-stream packetizers + wire-emit pairs.
     struct SubSink {
-        red: Arc<UdpSocket>,
-        red_addr: SocketAddr,
-        blue: Option<Arc<UdpSocket>>,
-        blue_addr: Option<SocketAddr>,
+        wire_red: std::sync::mpsc::SyncSender<WireDatagram>,
+        wire_blue: Option<std::sync::mpsc::SyncSender<WireDatagram>>,
         pkt: Rfc4175Packetizer,
     }
     let mut sinks: Vec<SubSink> = Vec::with_capacity(n as usize);
-    for sub in &config.sub_streams {
+    for (idx, sub) in config.sub_streams.iter().enumerate() {
         let (red_sock, red_addr) = create_udp_output(
             &sub.dest_addr,
             sub.bind_addr.as_deref(),
@@ -1105,34 +1127,62 @@ pub async fn run_st2110_23_output(
             config.dscp,
         )
         .await?;
-        let (blue_sock, blue_addr) = match &sub.redundancy {
+        let red_std = red_sock
+            .into_std()
+            .map_err(|e| anyhow!("ST 2110-23 output '{}' sub {idx} red into_std: {e}", config.id))?;
+        red_std.set_nonblocking(false).ok();
+        let wire_red = spawn_wire_emitter(
+            format!("{}-sub{}-red", config.id, idx),
+            red_std,
+            red_addr,
+            AnchorSource::St2110Raster,
+            stats.clone(),
+            cancel.clone(),
+        );
+
+        let wire_blue = match &sub.redundancy {
             Some(r) => {
-                let (sock, addr) = create_udp_output(
+                let (blue_sock, blue_addr) = create_udp_output(
                     &r.addr,
                     sub.bind_addr.as_deref(),
                     r.interface_addr.as_deref(),
                     config.dscp,
                 )
                 .await?;
-                (Some(Arc::new(sock)), Some(addr))
+                let blue_std = blue_sock.into_std().map_err(|e| {
+                    anyhow!("ST 2110-23 output '{}' sub {idx} blue into_std: {e}", config.id)
+                })?;
+                blue_std.set_nonblocking(false).ok();
+                let leg2_stats = Arc::new(OutputStatsAccumulator::new(
+                    format!("{}-sub{}-blue", config.id, idx),
+                    format!("{}-sub{}-blue", config.id, idx),
+                    "st2110_23_blue".to_string(),
+                ));
+                Some(spawn_wire_emitter(
+                    format!("{}-sub{}-blue", config.id, idx),
+                    blue_std,
+                    blue_addr,
+                    AnchorSource::St2110Raster,
+                    leg2_stats,
+                    cancel.clone(),
+                ))
             }
-            None => (None, None),
+            None => None,
         };
+
         let pkt_cfg = PacketizerConfig {
             payload_budget: config.payload_budget,
             payload_type: sub.payload_type,
             ssrc: sub.ssrc.unwrap_or_else(rand::random),
         };
         sinks.push(SubSink {
-            red: Arc::new(red_sock),
-            red_addr,
-            blue: blue_sock,
-            blue_addr,
+            wire_red,
+            wire_blue,
             pkt: Rfc4175Packetizer::new(pkt_cfg),
         });
     }
 
-    let (frame_tx, mut frame_rx) = mpsc::channel::<RawVideoFrame>(EGRESS_FRAME_QUEUE);
+    let (frame_tx, frame_rx) = mpsc::channel::<RawVideoFrame>(EGRESS_FRAME_QUEUE);
     let (nalu_tx, nalu_rx) = mpsc::channel::<DemuxedFrame>(EGRESS_NALUS_QUEUE);
     let width = config.width;
     let height = config.height;
@@ -1143,38 +1193,43 @@ pub async fn run_st2110_23_output(
 
     let sender_cancel = cancel.clone();
     let sender_stats = stats.clone();
-    let sender_handle = tokio::spawn(async move {
+    let sender_pacer = shared_pacer.clone();
+    let sender_handle = tokio::task::spawn_blocking(move || {
+        let mut frame_rx = frame_rx;
+        let mut frame_index: u64 = 0;
         while !sender_cancel.is_cancelled() {
-            let frame = tokio::select! {
-                _ = sender_cancel.cancelled() => break,
-                f = frame_rx.recv() => match f { Some(f) => f, None => break },
+            let frame = match frame_rx.blocking_recv() {
+                Some(f) => f,
+                None => break,
             };
             let subs = partition_frame(&frame, mode, n);
+            let recv_us = crate::util::time::now_us();
             for (i, sub_frame) in subs.into_iter().enumerate() {
-                let (red, blue, red_addr, blue_addr, out_pkts) = {
-                    let sink = &mut sinks[i];
-                    let mut out_pkts: Vec<Bytes> = Vec::with_capacity(16);
-                    sink.pkt.packetize(&sub_frame, |pkt| out_pkts.push(pkt));
-                    (
-                        sink.red.clone(),
-                        sink.blue.clone(),
-                        sink.red_addr,
-                        sink.blue_addr,
-                        out_pkts,
-                    )
-                };
-                let mut total_bytes = 0u64;
-                let total_pkts = out_pkts.len() as u64;
-                for pkt in out_pkts {
-                    total_bytes += pkt.len() as u64;
-                    let _ = red.send_to(&pkt, red_addr).await;
-                    if let (Some(b), Some(addr)) = (blue.as_ref(), blue_addr) {
-                        let _ = b.send_to(&pkt, addr).await;
+                let mut out_pkts: Vec<Bytes> = Vec::with_capacity(16);
+                sinks[i].pkt.packetize(&sub_frame, |pkt| out_pkts.push(pkt));
+                let pkts_per_frame = sender_pacer.packets_per_frame();
+                for (idx, pkt) in out_pkts.iter().enumerate() {
+                    let pkt_idx = (idx as u32).min(pkts_per_frame.saturating_sub(1));
+                    let target_ns = sender_pacer.target_for_packet(frame_index, pkt_idx);
+                    let dg_red = WireDatagram {
+                        bytes: pkt.clone(),
+                        recv_time_us: recv_us,
+                        target_tx_time_ns: Some(target_ns),
+                    };
+                    if sinks[i].wire_red.try_send(dg_red).is_err() {
+                        sender_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some(ref blue) = sinks[i].wire_blue {
+                        let dg_blue = WireDatagram {
+                            bytes: pkt.clone(),
+                            recv_time_us: recv_us,
+                            target_tx_time_ns: Some(target_ns),
+                        };
+                        let _ = blue.try_send(dg_blue);
                     }
                 }
-                sender_stats.packets_sent.fetch_add(total_pkts, Ordering::Relaxed);
-                sender_stats.bytes_sent.fetch_add(total_bytes, Ordering::Relaxed);
             }
+            frame_index = frame_index.wrapping_add(1);
         }
     });
 

@@ -95,6 +95,19 @@ pub struct OutputStatsAccumulator {
     // (~25/sec typical). Lifetime-cumulative percentiles across a
     // rotating reservoir (last 4096 samples).
     pcr_trust: crate::stats::pcr_trust::PcrTrustSampler,
+
+    // ── Wire pacing: tier + late-drop counter ────────────────────────
+    // The active release-path tier for this output. Set once at output
+    // startup by `engine::wire_emit::spawn_wire_emitter`. One of:
+    //   "so_txtime" — Linux SO_TXTIME, kernel-paced
+    //   "clock_nanosleep_fifo" — userspace SCHED_FIFO + clock_nanosleep
+    //   "clock_nanosleep" — userspace SCHED_OTHER (no rt grant)
+    //   "unpaced" — no pacing (probe-fail at high rates)
+    pub wire_pacing_tier: OnceLock<String>,
+    /// EOVERFLOW count from the SO_TXTIME error queue: kernel rejected
+    /// the datagram because its target tx time landed in the past.
+    /// Incremented from the wire thread on each errqueue drain.
+    pub wire_pacing_late: AtomicU64,
 }
 
 /// Registered handle to a per-output decode stage's counters plus the
@@ -521,7 +534,16 @@ impl OutputStatsAccumulator {
             latency_sum_us: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
             pcr_trust: crate::stats::pcr_trust::PcrTrustSampler::new(),
+            wire_pacing_tier: OnceLock::new(),
+            wire_pacing_late: AtomicU64::new(0),
         }
+    }
+
+    /// Register the active wire-pacing tier for this output. Called
+    /// once at output startup by `engine::wire_emit`. Subsequent calls
+    /// are no-ops (first wins).
+    pub fn set_wire_pacing_tier(&self, tier: &'static str) {
+        let _ = self.wire_pacing_tier.set(tier.to_string());
     }
 
     /// Record one PCR observation at egress. Called inline by the output's
@@ -916,6 +938,8 @@ impl OutputStatsAccumulator {
             egress_summary: None,
             pcr_trust: self.pcr_trust.snapshot(),
             display_stats,
+            wire_pacing_tier: self.wire_pacing_tier.get().cloned(),
+            wire_pacing_late: self.wire_pacing_late.load(Ordering::Relaxed),
         }
     }
 }

@@ -785,6 +785,24 @@ pub struct OutputStats {
     /// Backward-compatible additive field — old managers ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_stats: Option<DisplayStats>,
+    /// The active wire-pacing release tier for this output, set once at
+    /// output startup. One of `so_txtime`, `clock_nanosleep_fifo`,
+    /// `clock_nanosleep`, `unpaced`. Absent on outputs that don't own
+    /// a UDP socket directly (SRT, RIST, RTMP, HLS, CMAF, WebRTC).
+    /// Backward-compatible additive field — old managers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_pacing_tier: Option<String>,
+    /// Number of datagrams the kernel rejected as late (target tx time
+    /// landed in the past) on the SO_TXTIME release path. Always 0 on
+    /// the userspace-sleep release paths. Backward-compatible additive
+    /// field — old managers ignore it.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub wire_pacing_late: u64,
+}
+
+#[inline]
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Per-output statistics for the local-display (`display`) output type.

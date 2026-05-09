@@ -4039,10 +4039,13 @@ pub struct St2110VideoOutputConfig {
     /// header and RFC 4175 triplet headers). Typical 1428 for 1500-byte MTU.
     #[serde(default = "default_st2110_video_payload_budget")]
     pub payload_budget: usize,
-    /// Optional kernel-paced wire emission. See [`WirePacingConfig`].
-    /// Manager UI gates this on `HealthPayload.capabilities` containing
-    /// `wire_pacing_txtime`.
+    /// Deprecated: pacing is now automatic on every ST 2110-20 output
+    /// via `engine::wire_emit`. Field is retained for backward
+    /// compatibility with stored configs and ignored at runtime
+    /// (the edge logs a warning when the field is set). New configs
+    /// should omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[deprecated(note = "Pacing is now automatic — see docs/wire-pacing.md")]
     pub wire_pacing: Option<WirePacingConfig>,
 }
 
@@ -4116,9 +4119,11 @@ pub struct St2110_23OutputConfig {
     pub dscp: u8,
     #[serde(default = "default_st2110_video_payload_budget")]
     pub payload_budget: usize,
-    /// Optional kernel-paced wire emission. Applied to every sub-stream
-    /// of this -23 output. See [`WirePacingConfig`].
+    /// Deprecated: pacing is now automatic on every ST 2110-23
+    /// sub-stream output via `engine::wire_emit`. Field is retained
+    /// for backward compatibility and ignored at runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[deprecated(note = "Pacing is now automatic — see docs/wire-pacing.md")]
     pub wire_pacing: Option<WirePacingConfig>,
 }
 

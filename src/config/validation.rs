@@ -1783,6 +1783,7 @@ fn validate_st2110_video_output(c: &St2110VideoOutputConfig) -> Result<()> {
         validate_red_blue_bind(red, &c.dest_addr, &format!("{label} redundancy"))?;
     }
     validate_payload_budget(c.payload_budget, &label)?;
+    #[allow(deprecated)]
     if let Some(ref wp) = c.wire_pacing {
         validate_wire_pacing(wp, &label)?;
     }
@@ -1859,6 +1860,7 @@ fn validate_st2110_23_output(c: &St2110_23OutputConfig) -> Result<()> {
         bail!("{label}: DSCP must be 0-63, got {}", c.dscp);
     }
     validate_payload_budget(c.payload_budget, &label)?;
+    #[allow(deprecated)]
     if let Some(ref wp) = c.wire_pacing {
         validate_wire_pacing(wp, &label)?;
     }

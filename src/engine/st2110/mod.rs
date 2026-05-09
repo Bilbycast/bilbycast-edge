@@ -1,40 +1,32 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The modules below land in Phase 1 step 2 as foundation infrastructure.
-// They are exercised by their own unit tests and will be wired into the
-// ST 2110 input/output tasks in step 4. Suppress dead-code warnings until
-// then to keep the build clean.
 #![allow(dead_code)]
 
 //! SMPTE ST 2110 support modules.
 //!
-//! This submodule contains the broadcast-essence support code shared by the
-//! ST 2110-30 (PCM audio), ST 2110-31 (AES3 transparent audio), and ST 2110-40
-//! (ancillary data) input/output tasks.
+//! Broadcast-essence support code shared by the ST 2110-20/-23 (uncompressed
+//! video), ST 2110-30 (PCM audio), ST 2110-31 (AES3 transparent audio), and
+//! ST 2110-40 (ancillary data) input/output tasks.
 //!
 //! ## Pure Rust
 //!
-//! All modules in this tree are 100% Rust. PTP synchronization is provided by
+//! All modules in this tree are 100% Rust. PTP synchronisation is provided by
 //! reading the `ptp4l` (linuxptp) management Unix socket externally — bilbycast
-//! does not link a C PTP library. Hardware timestamps are extracted via
-//! `SO_TIMESTAMPING` and `cmsghdr` parsing using `libc` FFI bindings. Optional
-//! `--features ptp-internal` (placeholder for now) will integrate the pure-Rust
-//! `statime` slave clock in a follow-up step.
+//! does not link a C PTP library.
 //!
-//! ## Phase 1 layout
+//! ## Modules
 //!
 //! - [`ptp`]: PTP clock state reporter, ptp4l UDS reader, lock state model.
-//! - [`hwts`]: hardware timestamp helpers (Linux SO_TIMESTAMPING).
+//! - [`pacer`]: ST 2110-21 raster pacer producing `target_tx_time_ns` per
+//!   RFC 4175 packet, anchored on `CLOCK_TAI` when PTP is locked.
 //! - [`redblue`]: SMPTE 2022-7 dual-network ("Red"/"Blue") bind helpers.
-//!
-//! Packetizers (`audio.rs`, `aes3.rs`, `ancillary.rs`, `scte104.rs`,
-//! `timecode.rs`, `captions.rs`) and the SDP module land in steps 3-4.
+//! - Packetisers (`audio`, `ancillary`, `scte104`, `timecode`, `captions`,
+//!   `video`) and the SDP module.
 
 pub mod ancillary;
 pub mod audio;
 pub mod captions;
-pub mod hwts;
 pub mod pacer;
 pub mod ptp;
 pub mod redblue;

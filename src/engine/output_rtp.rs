@@ -5,11 +5,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+use super::wire_emit::{AnchorSource, WireDatagram, spawn_wire_emitter};
 
 use crate::config::models::RtpOutputConfig;
 use crate::fec::encoder::FecEncoder;
@@ -152,7 +154,6 @@ async fn rtp_output_loop(
 ) -> anyhow::Result<()> {
     let (socket, dest) =
         create_udp_output(&config.dest_addr, config.bind_addr.as_deref(), config.interface_addr.as_deref(), config.dscp).await?;
-    let socket = Arc::new(socket);
 
     tracing::info!(
         "RTP output '{}' started -> {}",
@@ -160,53 +161,30 @@ async fn rtp_output_loop(
         dest
     );
 
-    // ── Encoder ↔ wire decoupling (see output_udp.rs) ──
+    // ── PCR-anchored wire pacing (engine::wire_emit) ─────────────────
     //
-    // Pure recv → send loop. RTP wrap happens here so the header
-    // sequence/timestamp tracks the actual emit moment.
-    let (wire_tx, mut wire_rx) =
-        tokio::sync::mpsc::channel::<(Vec<u8>, u64, u32)>(256);
-    {
-        let socket = socket.clone();
-        let stats = stats.clone();
-        let cancel = cancel.clone();
-        let id = config.id.clone();
-        tokio::spawn(async move {
-            let mut rtp_wrap = RtpWrapState::new();
-            let mut rtp_send_buf =
-                Vec::<u8>::with_capacity(RTP_HEADER_SIZE + TS_PACKETS_PER_DATAGRAM * TS_PACKET_SIZE);
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    recv_result = wire_rx.recv() => {
-                        let (inner_ts, recv_time_us, rtp_ts) = match recv_result {
-                            Some(d) => d,
-                            None => return,
-                        };
-                        let pcr_sample =
-                            crate::engine::ts_parse::first_pcr_in_ts_buffer(&inner_ts);
-                        let header = rtp_wrap.build_header(rtp_ts);
-                        rtp_send_buf.clear();
-                        rtp_send_buf.extend_from_slice(&header);
-                        rtp_send_buf.extend_from_slice(&inner_ts);
-                        match socket.send_to(&rtp_send_buf, dest).await {
-                            Ok(sent) => {
-                                stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                                stats.record_latency(recv_time_us);
-                                if let Some(pcr) = pcr_sample {
-                                    stats.record_pcr_egress(pcr, crate::util::time::now_us());
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("RTP output '{}' send error: {e}", id);
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
+    // The encoder task wraps each datagram with an RTP header (using
+    // the local `RtpWrapState` below) and hands the wrapped Bytes to
+    // a dedicated wire-emit thread for paced delivery. Single emitter
+    // owns the std blocking socket — FEC packets and media packets
+    // flow through the same emitter on the same socket.
+    let std_socket = socket
+        .into_std()
+        .map_err(|e| anyhow::anyhow!("convert tokio UdpSocket -> std: {e}"))?;
+    std_socket.set_nonblocking(false)?;
+    let wire_tx = spawn_wire_emitter(
+        config.id.clone(),
+        std_socket,
+        dest,
+        AnchorSource::Pcr,
+        stats.clone(),
+        cancel.clone(),
+    );
+
+    // RTP wrap state lives on the encoder task. Sequence + SSRC are
+    // owned here so FEC packets and media packets can share a coherent
+    // numbering space (FEC carries its own SSRC, separate seq).
+    let mut rtp_wrap = RtpWrapState::new();
 
     // Optional FEC encoder (SMPTE 2022-1).
     //
@@ -599,39 +577,49 @@ async fn rtp_output_loop(
                 if ts_sync_found {
                     while ts_realign_buf.len() >= ts_datagram_size {
                         let datagram = ts_realign_buf.split_to(ts_datagram_size);
-                        // Wire task does the RTP wrap + null-padding
-                        // and emits at the declared CBR rate. We only
-                        // hand it the inner TS bytes plus the upstream
-                        // 90 kHz timestamp.
-                        if wire_tx
-                            .try_send((datagram.to_vec(), packet.recv_time_us, packet.rtp_timestamp))
-                            .is_err()
-                        {
+                        let header = rtp_wrap.build_header(packet.rtp_timestamp);
+                        let mut buf = Vec::with_capacity(RTP_HEADER_SIZE + ts_datagram_size);
+                        buf.extend_from_slice(&header);
+                        buf.extend_from_slice(&datagram);
+                        let dg = WireDatagram {
+                            bytes: Bytes::from(buf),
+                            recv_time_us: packet.recv_time_us,
+                            target_tx_time_ns: None,
+                        };
+                        if wire_tx.try_send(dg).is_err() {
                             stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
             } else {
-                // Already-RTP-wrapped data: strip the header, hand the
-                // inner TS to the wire task. The wire's `RtpWrapState`
-                // re-emits a fresh header with our SSRC + monotonic
-                // sequence — necessary because the upstream TS may
-                // come from a non-RTP source whose RTP header is
-                // synthetic.
+                // Already-RTP-wrapped data: strip the upstream header,
+                // wrap with our local SSRC + seq so receivers see a
+                // coherent stream from us regardless of upstream
+                // synthesis quirks.
                 let inner_ts = if packet.data.len() > crate::engine::ts_parse::RTP_HEADER_MIN_SIZE {
-                    packet.data[crate::engine::ts_parse::RTP_HEADER_MIN_SIZE..].to_vec()
+                    &packet.data[crate::engine::ts_parse::RTP_HEADER_MIN_SIZE..]
                 } else {
-                    Vec::new()
+                    &[][..]
                 };
-                if wire_tx
-                    .try_send((inner_ts, packet.recv_time_us, packet.rtp_timestamp))
-                    .is_err()
-                {
+                let header = rtp_wrap.build_header(packet.rtp_timestamp);
+                let mut buf = Vec::with_capacity(RTP_HEADER_SIZE + inner_ts.len());
+                buf.extend_from_slice(&header);
+                buf.extend_from_slice(inner_ts);
+                let dg = WireDatagram {
+                    bytes: Bytes::from(buf),
+                    recv_time_us: packet.recv_time_us,
+                    target_tx_time_ns: None,
+                };
+                if wire_tx.try_send(dg).is_err() {
                     stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
 
-            // Generate and send FEC packets if enabled.
+            // Generate and send FEC packets if enabled. FEC packets
+            // are RTP-wrapped by the FecEncoder (separate SSRC,
+            // independent seq). Flow them through the same wire-emit
+            // instance — single socket owner, FEC paced as non-PCR
+            // datagrams (no PCR carried in FEC payloads).
             if let Some(ref mut encoder) = fec_encoder {
                 let rtp_header_len = 12;
                 let payload = if packet.data.len() > rtp_header_len {
@@ -642,16 +630,13 @@ async fn rtp_output_loop(
 
                 let fec_packets = encoder.process(packet.sequence_number, payload);
                 for fec_pkt in fec_packets {
-                    match socket.send_to(&fec_pkt, dest).await {
-                        Ok(sent) => {
-                            stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "RTP output '{}' FEC send error: {e}",
-                                config.id
-                            );
-                        }
+                    let dg = WireDatagram {
+                        bytes: Bytes::from(fec_pkt),
+                        recv_time_us: packet.recv_time_us,
+                        target_tx_time_ns: None,
+                    };
+                    if wire_tx.try_send(dg).is_err() {
+                        stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 let sent = fec_sent_counter.load(Ordering::Relaxed);
@@ -713,6 +698,49 @@ async fn rtp_output_redundant_loop(
         dest2
     );
 
+    // ── PCR-anchored wire pacing for both legs ───────────────────────
+    //
+    // Both legs receive byte-identical RTP datagrams (shared
+    // RtpWrapState below) and pace independently. PCR-anchored
+    // closed-loop on observed inter-PCR rate; SO_TXTIME on Linux
+    // ≥ 4.19, clock_nanosleep fallback otherwise. Same input cadence
+    // → same observed rate → same per-packet wallclock target. Sub-µs
+    // cross-leg scheduling skew is well within 2022-7 receiver dedup
+    // tolerance.
+    //
+    // Leg 2's stats are private and never surfaced — keeps the
+    // existing observable semantics (only leg 1 contributes to
+    // packets_sent / bytes_sent).
+    let std_socket1 = socket1
+        .into_std()
+        .map_err(|e| anyhow::anyhow!("convert leg1 tokio UdpSocket -> std: {e}"))?;
+    std_socket1.set_nonblocking(false)?;
+    let std_socket2 = socket2
+        .into_std()
+        .map_err(|e| anyhow::anyhow!("convert leg2 tokio UdpSocket -> std: {e}"))?;
+    std_socket2.set_nonblocking(false)?;
+    let leg2_stats = Arc::new(OutputStatsAccumulator::new(
+        format!("{}-leg2", config.id),
+        format!("{}-leg2", config.id),
+        "rtp_2022_7_leg2".to_string(),
+    ));
+    let wire_tx_leg1 = spawn_wire_emitter(
+        format!("{}-leg1", config.id),
+        std_socket1,
+        dest1,
+        AnchorSource::Pcr,
+        stats.clone(),
+        cancel.clone(),
+    );
+    let wire_tx_leg2 = spawn_wire_emitter(
+        format!("{}-leg2", config.id),
+        std_socket2,
+        dest2,
+        AnchorSource::Pcr,
+        leg2_stats,
+        cancel.clone(),
+    );
+
     // FEC encoder (shared — same repair data sent to both legs)
     let fec_sent_counter = Arc::new(AtomicU64::new(0));
     let mut fec_encoder = config.fec_encode.as_ref().map(|fec_config| {
@@ -766,7 +794,6 @@ async fn rtp_output_redundant_loop(
     // sequence numbers and SSRC so the receiver-side hitless merger can
     // dedupe by sequence number per SMPTE 2022-7.
     let mut rtp_wrap = RtpWrapState::new();
-    let mut rtp_send_buf = Vec::with_capacity(RTP_HEADER_SIZE + TS_PACKETS_PER_DATAGRAM * TS_PACKET_SIZE);
 
     // Optional output delay buffer for stream synchronization.
     let resolved = if let Some(ref delay) = config.delay {
@@ -910,27 +937,48 @@ async fn rtp_output_redundant_loop(
                     while ts_realign_buf.len() >= ts_datagram_size {
                         let datagram = ts_realign_buf.split_to(ts_datagram_size);
                         let header = rtp_wrap.build_header(packet.rtp_timestamp);
-                        rtp_send_buf.clear();
-                        rtp_send_buf.extend_from_slice(&header);
-                        rtp_send_buf.extend_from_slice(&datagram);
-                        if let Ok(sent) = socket1.send_to(&rtp_send_buf, dest1).await {
-                            stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                            stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                            stats.record_latency(packet.recv_time_us);
+                        let mut buf = Vec::with_capacity(RTP_HEADER_SIZE + ts_datagram_size);
+                        buf.extend_from_slice(&header);
+                        buf.extend_from_slice(&datagram);
+                        let bytes = Bytes::from(buf);
+                        // Both legs receive the same Bytes (refcount
+                        // bump only — no copy).
+                        let dg1 = WireDatagram {
+                            bytes: bytes.clone(),
+                            recv_time_us: packet.recv_time_us,
+                            target_tx_time_ns: None,
+                        };
+                        let dg2 = WireDatagram {
+                            bytes,
+                            recv_time_us: packet.recv_time_us,
+                            target_tx_time_ns: None,
+                        };
+                        if wire_tx_leg1.try_send(dg1).is_err() {
+                            stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                         }
-                        let _ = socket2.send_to(&rtp_send_buf, dest2).await;
+                        let _ = wire_tx_leg2.try_send(dg2);
                     }
                 }
             } else {
-                if let Ok(sent) = socket1.send_to(&packet.data, dest1).await {
-                    stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                    stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                    stats.record_latency(packet.recv_time_us);
+                let bytes = Bytes::from(packet.data.to_vec());
+                let dg1 = WireDatagram {
+                    bytes: bytes.clone(),
+                    recv_time_us: packet.recv_time_us,
+                    target_tx_time_ns: None,
+                };
+                let dg2 = WireDatagram {
+                    bytes,
+                    recv_time_us: packet.recv_time_us,
+                    target_tx_time_ns: None,
+                };
+                if wire_tx_leg1.try_send(dg1).is_err() {
+                    stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                 }
-                let _ = socket2.send_to(&packet.data, dest2).await;
+                let _ = wire_tx_leg2.try_send(dg2);
             }
 
-            // FEC: generate and send to both legs
+            // FEC: generate identical FEC packets, dispatch to both
+            // legs through their wire-emit instances.
             if let Some(ref mut encoder) = fec_encoder {
                 let rtp_header_len = 12;
                 let payload = if packet.data.len() > rtp_header_len {
@@ -940,11 +988,20 @@ async fn rtp_output_redundant_loop(
                 };
 
                 let fec_packets = encoder.process(packet.sequence_number, payload);
-                for fec_pkt in &fec_packets {
-                    if let Ok(sent) = socket1.send_to(fec_pkt, dest1).await {
-                        stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                    }
-                    let _ = socket2.send_to(fec_pkt, dest2).await;
+                for fec_pkt in fec_packets {
+                    let bytes = Bytes::from(fec_pkt);
+                    let dg1 = WireDatagram {
+                        bytes: bytes.clone(),
+                        recv_time_us: packet.recv_time_us,
+                        target_tx_time_ns: None,
+                    };
+                    let dg2 = WireDatagram {
+                        bytes,
+                        recv_time_us: packet.recv_time_us,
+                        target_tx_time_ns: None,
+                    };
+                    let _ = wire_tx_leg1.try_send(dg1);
+                    let _ = wire_tx_leg2.try_send(dg2);
                 }
                 let sent = fec_sent_counter.load(Ordering::Relaxed);
                 stats.fec_packets_sent.store(sent, Ordering::Relaxed);

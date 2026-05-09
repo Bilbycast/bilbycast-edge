@@ -823,6 +823,19 @@ pub(crate) fn build_health_payload(
         // and the per-flow Resource-impact widget.
         "resource_budget": build_resource_budget_payload(flow_manager, static_caps, live_gpu),
     });
+    // Per-interface enumeration. Empty Vec → omit (defensive: if_addrs
+    // can fail in some containerised environments). Manager UI hides
+    // the card unless the `"network-info"` capability is also present.
+    {
+        let ifaces = crate::util::network_interfaces::enumerate();
+        if !ifaces.is_empty() {
+            if let Ok(v) = serde_json::to_value(&ifaces) {
+                payload
+                    .as_object_mut()
+                    .map(|o| o.insert("network_interfaces".into(), v));
+            }
+        }
+    }
     // Local-display enumeration. Linux-only and gated on the `display`
     // Cargo feature; absent on every other build so older managers /
     // non-display edges remain wire-compatible.
@@ -964,6 +977,13 @@ fn edge_capabilities() -> Vec<&'static str> {
         // `set_master_clock_lipsync` commands — older edges return
         // `unknown_action`.
         "master_clock",
+        // Per-NIC enumeration on every health tick: name, IPv4/IPv6,
+        // MAC, MTU, link speed (Linux), up/down (Linux). Manager UI
+        // gates the "Network Interfaces" card on this so older edges
+        // hide the surface cleanly. Multi-homed edges expose every
+        // wired/virtual interface — operators no longer have to SSH
+        // in to find which IP is on which port.
+        "network-info",
     ];
     if cfg!(feature = "ptp-internal") {
         caps.push("ptp-internal");

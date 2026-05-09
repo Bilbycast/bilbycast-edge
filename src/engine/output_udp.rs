@@ -5,11 +5,13 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+use super::wire_emit::{AnchorSource, WireDatagram, spawn_wire_emitter};
 
 use crate::config::models::UdpOutputConfig;
 use crate::manager::events::{EventSender, EventSeverity, category};
@@ -156,6 +158,19 @@ async fn udp_output_loop_302m(
         input.channels,
     );
 
+    let std_socket = socket
+        .into_std()
+        .map_err(|e| anyhow::anyhow!("convert tokio UdpSocket -> std: {e}"))?;
+    std_socket.set_nonblocking(false)?;
+    let wire_tx = spawn_wire_emitter(
+        format!("{}-302m", config.id),
+        std_socket,
+        dest,
+        AnchorSource::Pcr,
+        stats.clone(),
+        cancel.clone(),
+    );
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -167,15 +182,13 @@ async fn udp_output_loop_302m(
                     Ok(packet) => {
                         pipeline.process(&packet);
                         for datagram in pipeline.take_ready_datagrams() {
-                            match socket.send_to(&datagram, dest).await {
-                                Ok(sent) => {
-                                    stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                    stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                                    stats.record_latency(packet.recv_time_us);
-                                }
-                                Err(e) => {
-                                    tracing::warn!("UDP output '{}' (302M) send error: {e}", config.id);
-                                }
+                            let dg = WireDatagram {
+                                bytes: Bytes::from(datagram),
+                                recv_time_us: packet.recv_time_us,
+                                target_tx_time_ns: None,
+                            };
+                            if wire_tx.try_send(dg).is_err() {
+                                stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -203,67 +216,34 @@ async fn udp_output_loop(
 ) -> anyhow::Result<()> {
     let (socket, dest) =
         create_udp_output(&config.dest_addr, config.bind_addr.as_deref(), config.interface_addr.as_deref(), config.dscp).await?;
-    let socket = Arc::new(socket);
 
     tracing::info!("UDP output '{}' started -> {}", config.id, dest);
 
-    // ── Encoder ↔ wire decoupling ─────────────────────────────────────
+    // ── PCR-anchored wire pacing (engine::wire_emit) ─────────────────
     //
     // THIS task runs the encoder pipeline (audio + video replacers
     // with `block_in_place`) and feeds completed datagrams to a
-    // sibling wire task via bounded mpsc. The wire task is a pure
-    // recv → send loop, never blocked by encoder work.
+    // dedicated wire-emit thread via std::sync::mpsc. The wire
+    // thread paces emission against PCR (closed-loop on observed
+    // inter-PCR rate), via SO_TXTIME on Linux ≥ 4.19 with permitted
+    // setsockopt or `clock_nanosleep` fallback.
     //
-    // mpsc capacity 256: ~250–500 ms of in-flight bytes at typical
-    // rates, comfortably absorbing worst-case encoder I-frame bursts.
-    // On overflow the newest datagram is dropped (try_send returning
-    // Full) and counted under packets_dropped — same semantic as the
-    // broadcast channel's Lagged drop.
-    //
-    // No userspace pacing on the wire side. PCR-anchored wire pacing
-    // for sub-ms jitter on encoded paths is a separate, larger
-    // architectural change (kernel-scheduled emit via SO_TXTIME or a
-    // dedicated SCHED_FIFO thread with `clock_nanosleep`); not in
-    // this code path today.
-    let (wire_tx, mut wire_rx) =
-        tokio::sync::mpsc::channel::<(BytesMut, u64)>(256);
-    {
-        let socket = socket.clone();
-        let stats = stats.clone();
-        let cancel = cancel.clone();
-        let id = config.id.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        tracing::info!("UDP output '{}' wire task stopping (cancelled)", id);
-                        return;
-                    }
-                    recv_result = wire_rx.recv() => {
-                        let (datagram, recv_time_us) = match recv_result {
-                            Some(d) => d,
-                            None => return,
-                        };
-                        let pcr_sample =
-                            crate::engine::ts_parse::first_pcr_in_ts_buffer(&datagram);
-                        match socket.send_to(&datagram, dest).await {
-                            Ok(sent) => {
-                                stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                                stats.record_latency(recv_time_us);
-                                if let Some(pcr) = pcr_sample {
-                                    stats.record_pcr_egress(pcr, crate::util::time::now_us());
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("UDP output '{}' send error: {e}", id);
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
+    // try_send is non-blocking: if the wire thread is behind
+    // (sync_channel full), drop the datagram and count it. Same drop
+    // semantic as the broadcast channel's Lagged arm — slow wire
+    // never propagates backpressure to the encoder.
+    let std_socket = socket
+        .into_std()
+        .map_err(|e| anyhow::anyhow!("convert tokio UdpSocket -> std: {e}"))?;
+    std_socket.set_nonblocking(false)?;
+    let wire_tx = spawn_wire_emitter(
+        config.id.clone(),
+        std_socket,
+        dest,
+        AnchorSource::Pcr,
+        stats.clone(),
+        cancel.clone(),
+    );
 
     // Optional MPTS → SPTS program filter.
     let mut program_filter = config.program_number.map(|n| {
@@ -567,15 +547,19 @@ async fn udp_output_loop(
                 }
             }
 
-            // Hand complete TS-aligned datagrams to the wire task.
-            // `try_send` is non-blocking: if the wire task is behind
-            // (mpsc full), drop the datagram and count it. Same drop
-            // semantic as the broadcast channel's `Lagged` arm — slow
-            // wire never propagates backpressure to the encoder.
+            // Hand complete TS-aligned datagrams to the wire-emit
+            // thread. `try_send` is non-blocking: if the wire thread
+            // is behind (sync_channel full), drop the datagram and
+            // count it.
             if ts_sync_found {
                 while ts_buf.len() >= ts_datagram_size {
                     let datagram = ts_buf.split_to(ts_datagram_size);
-                    if wire_tx.try_send((datagram, packet.recv_time_us)).is_err() {
+                    let dg = WireDatagram {
+                        bytes: datagram.freeze(),
+                        recv_time_us: packet.recv_time_us,
+                        target_tx_time_ns: None,
+                    };
+                    if wire_tx.try_send(dg).is_err() {
                         stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                     }
                 }
