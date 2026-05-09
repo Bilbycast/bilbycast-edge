@@ -67,6 +67,26 @@ pub fn ts_discontinuity_indicator(pkt: &[u8]) -> bool {
     (pkt[5] & 0x80) != 0
 }
 
+/// Set the `discontinuity_indicator` (bit 7 of the AF flags byte) on a TS
+/// packet that already carries an adaptation field with at least one flags
+/// byte. Returns `true` when the bit was set, `false` when the packet has
+/// no AF / a zero-length AF (so DI insertion would require restructuring
+/// the packet — never done on the live data path because it would shift
+/// payload bytes and corrupt ES/PES). Idempotent: calling on a packet
+/// that already carries DI=1 leaves it set.
+#[inline(always)]
+pub fn set_discontinuity_indicator(pkt: &mut [u8]) -> bool {
+    if !ts_has_adaptation(pkt) {
+        return false;
+    }
+    let af_len = pkt[4] as usize;
+    if af_len == 0 {
+        return false;
+    }
+    pkt[5] |= 0x80;
+    true
+}
+
 /// Scan a raw TS buffer (one or more aligned 188-byte packets) and return
 /// the PCR carried by the **first** PCR-bearing packet, in 27 MHz ticks.
 ///

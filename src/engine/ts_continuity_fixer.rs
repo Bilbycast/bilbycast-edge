@@ -17,7 +17,16 @@
 //!    CC state reset produces a natural CC jump on all PIDs, which
 //!    receivers (VLC, ffplay, hardware decoders) detect as "packet loss"
 //!    and handle via their standard recovery path (flush PES buffers,
-//!    resync on next PUSI).
+//!    resync on next PUSI). The fixer also arms a one-shot
+//!    `pending_di_on_pcr` flag — the next PCR-bearing TS packet from the
+//!    new input has `discontinuity_indicator` (AF flags 0x80) set, so
+//!    receivers see the spec-defined "next PCR is a fresh STC anchor"
+//!    signal instead of treating the post-switch PCR-epoch jump as a
+//!    clock fault. CC alone is empirically not enough for receivers that
+//!    strictly track PCR continuity (broadcast-grade decoders, VLC,
+//!    ffplay) when inputs A and B carry different PTS/PCR epochs — the
+//!    common case for live-camera switching, test-pattern ↔ media-player,
+//!    or any per-input transcoder pipeline.
 //! 3. **After switch**: rewrites CC values within the new input's packet
 //!    sequence so that subsequent packets maintain continuity.
 //!
@@ -131,6 +140,20 @@ pub struct TsContinuityFixer {
     /// previous input's format. Wrapping at 32 is safe because every
     /// consecutive switch still produces a *different* value (N vs N+1).
     next_psi_version: u8,
+    /// One-shot flag: set by [`on_switch`], cleared the next time
+    /// [`process_packet`] sees a PCR-bearing TS packet — at which point
+    /// the `discontinuity_indicator` bit (AF flags 0x80) is OR'd into
+    /// that packet's adaptation field. Tells the receiver "the next PCR
+    /// is a fresh STC anchor, throw away your old timestamp tracking" —
+    /// without it, professional and prosumer decoders (VLC, ffplay,
+    /// Appear-style hardware) treat the post-switch PCR jump (which
+    /// happens whenever inputs A and B have different epochs — the
+    /// common case for live-camera switching, test-pattern ↔ media-
+    /// player, or any per-input transcoder pipeline) as a clock fault
+    /// and lock up. Set on every switch (including dead-input switches)
+    /// so the next real packet picks it up regardless of which input
+    /// finally produces data first.
+    pending_di_on_pcr: bool,
 }
 
 impl TsContinuityFixer {
@@ -143,6 +166,7 @@ impl TsContinuityFixer {
             // stamping, matching the long-standing "bumped from cached
             // version 0 to 1" behaviour on the first switch.
             next_psi_version: 0,
+            pending_di_on_pcr: false,
         }
     }
 
@@ -244,11 +268,22 @@ impl TsContinuityFixer {
     /// The CC jump from clearing `pid_state` is the other half of the
     /// switch signal: receivers (VLC, ffplay, hardware decoders) detect it
     /// as "packet loss," flush PES buffers, and resync on the next PES
-    /// start (PUSI=1). Many decoders handle CC jumps more robustly than
-    /// mid-stream DI flags, and DI insertion on payload-only packets
-    /// would corrupt ES/PES data.
+    /// start (PUSI=1).
+    ///
+    /// On top of the CC jump and the version-bumped phantom PSI, we also
+    /// arm `pending_di_on_pcr` so the **first** PCR-bearing TS packet that
+    /// flows from the new input has its `discontinuity_indicator` bit set.
+    /// CC alone is empirically not enough on the passthrough output path —
+    /// receivers strictly tracking PCR continuity (the broadcast-grade
+    /// case) interpret the post-switch PCR-epoch jump as a clock fault
+    /// rather than a stream change and freeze. DI=1 is the spec-defined
+    /// "next PCR is a fresh anchor" signal and unblocks recovery on every
+    /// receiver we've tested. The flag is set on every switch (including
+    /// dead-source switches) so the next real packet picks it up whenever
+    /// the new input eventually produces data.
     pub fn on_switch(&mut self, new_input_id: &str) -> Vec<RtpPacket> {
         self.ever_switched = true;
+        self.pending_di_on_pcr = true;
 
         // Clear all output-side CC state. When the new input's packets
         // arrive, process_packet() creates fresh entries using the new
@@ -405,10 +440,27 @@ impl TsContinuityFixer {
             // Borrow is scoped so it doesn't conflict with pid_state below.
             self.input_psi.get_mut(input_id).unwrap().observe_psi(pkt);
 
+            // Set DI on the first PCR-bearing packet from the new input
+            // after a switch. PCR may ride either a payload-bearing PUSI
+            // packet or an AF-only packet (common for software encoders
+            // that decouple PCR cadence from ES boundaries) — check both
+            // paths. Only consume the flag when DI is actually applied,
+            // so an AF-only packet without PCR doesn't burn the one-shot.
+            let needs_di = self.pending_di_on_pcr && extract_pcr(pkt).is_some();
+
             if !ts_has_payload(pkt) {
                 // Adaptation-only packets: CC does not increment per spec.
-                // Pass through unchanged.
-                out.extend_from_slice(pkt);
+                // Pass through unchanged unless we need to set DI.
+                if needs_di {
+                    let mut ts_pkt = [0u8; TS_PACKET_SIZE];
+                    ts_pkt.copy_from_slice(pkt);
+                    set_discontinuity_indicator(&mut ts_pkt);
+                    self.pending_di_on_pcr = false;
+                    modified = true;
+                    out.extend_from_slice(&ts_pkt);
+                } else {
+                    out.extend_from_slice(pkt);
+                }
                 continue;
             }
 
@@ -429,6 +481,11 @@ impl TsContinuityFixer {
             ts_pkt[3] = (ts_pkt[3] & 0xF0) | new_cc;
             state.last_out_cc = new_cc;
             modified = true;
+
+            if needs_di {
+                set_discontinuity_indicator(&mut ts_pkt);
+                self.pending_di_on_pcr = false;
+            }
 
             out.extend_from_slice(&ts_pkt);
         }
@@ -1143,5 +1200,164 @@ mod tests {
         // After 33 switches the counter has wrapped (started at 0, bumped
         // to 1..=32 mod 32 = 0 on the 32nd bump, then to 1 on the 33rd).
         assert_eq!(prev, Some(1));
+    }
+
+    // ── DI-on-PCR after switch ────────────────────────────────────────────
+
+    /// Build a payload-bearing PUSI=1 packet on `pid` carrying a PCR field
+    /// in the adaptation field. AF layout: length(1) + flags(1, PCR_flag=1)
+    /// + PCR(6) = 8 bytes. Remaining 176 bytes are payload (0xFF stuffing).
+    fn build_pcr_packet(pid: u16, cc: u8, pcr_27mhz: u64) -> [u8; TS_PACKET_SIZE] {
+        let mut pkt = [0xFFu8; TS_PACKET_SIZE];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = 0x40 | (((pid >> 8) as u8) & 0x1F); // PUSI=1
+        pkt[2] = (pid & 0xFF) as u8;
+        pkt[3] = 0x30 | (cc & 0x0F); // AFC=11 (AF + payload)
+        pkt[4] = 7; // af_length (flags + PCR)
+        pkt[5] = 0x10; // PCR_flag=1, DI=0
+        let base = (pcr_27mhz / 300) & 0x1_FFFF_FFFF;
+        let ext = (pcr_27mhz % 300) as u32;
+        pkt[6] = ((base >> 25) & 0xFF) as u8;
+        pkt[7] = ((base >> 17) & 0xFF) as u8;
+        pkt[8] = ((base >> 9) & 0xFF) as u8;
+        pkt[9] = ((base >> 1) & 0xFF) as u8;
+        pkt[10] = (((base & 1) << 7) as u8) | 0x7E | (((ext >> 8) & 0x01) as u8);
+        pkt[11] = (ext & 0xFF) as u8;
+        pkt
+    }
+
+    /// AF-only PCR packet (no payload) — encoders often emit these to keep
+    /// PCR cadence independent of ES/PES boundaries.
+    fn build_pcr_only_packet(pid: u16, cc: u8, pcr_27mhz: u64) -> [u8; TS_PACKET_SIZE] {
+        let mut pkt = build_pcr_packet(pid, cc, pcr_27mhz);
+        pkt[3] = 0x20 | (cc & 0x0F); // AFC=10 (AF only, no payload)
+        // af_length must cover the rest of the packet (188 - 4 - 1 = 183).
+        pkt[4] = 183;
+        pkt
+    }
+
+    /// On the very first PCR-bearing TS packet after `on_switch`, the
+    /// continuity fixer must light DI=1 in the adaptation field. Without
+    /// this, professional / prosumer receivers see the post-switch PCR
+    /// epoch jump as a clock fault and freeze.
+    #[test]
+    fn first_pcr_after_switch_carries_discontinuity_indicator() {
+        let mut fixer = TsContinuityFixer::new();
+
+        // Pre-switch: input "a" emits a PCR packet. ever_switched=false →
+        // unchanged path, no DI manipulation.
+        let pre = build_pcr_packet(0x100, 0, 27_000_000);
+        let result = fixer.process_packet("a", &make_rtp_packet(&pre));
+        assert!(matches!(result, ProcessResult::Unchanged));
+
+        // Switch to "b". Arms pending_di_on_pcr.
+        let _ = fixer.on_switch("b");
+
+        // Input "b" sends its first PCR packet. DI must be set.
+        let post = build_pcr_packet(0x100, 0, 99_999_999);
+        let bytes = fixer
+            .process_packet("b", &make_rtp_packet(&post))
+            .unwrap_rewritten();
+        assert!(
+            ts_discontinuity_indicator(&bytes[..TS_PACKET_SIZE]),
+            "first PCR-bearing packet from new input must carry DI=1"
+        );
+
+        // Subsequent PCR packets from the same input do NOT keep setting DI
+        // — the flag is one-shot per switch.
+        let next = build_pcr_packet(0x100, 1, 100_009_000);
+        let bytes = fixer
+            .process_packet("b", &make_rtp_packet(&next))
+            .unwrap_rewritten();
+        assert!(
+            !ts_discontinuity_indicator(&bytes[..TS_PACKET_SIZE]),
+            "subsequent PCR packets within the same input must not carry DI"
+        );
+    }
+
+    /// PCR riding an AF-only packet (no payload bit set) is the common case
+    /// for software encoders that decouple PCR cadence from ES boundaries.
+    /// The fixer must still set DI on these.
+    #[test]
+    fn first_pcr_after_switch_handles_af_only_carrier() {
+        let mut fixer = TsContinuityFixer::new();
+
+        fixer.process_packet("a", &make_rtp_packet(&build_ts_packet(0x100, 0)));
+        let _ = fixer.on_switch("b");
+
+        let af_only = build_pcr_only_packet(0x100, 0, 27_000_000);
+        let bytes = fixer
+            .process_packet("b", &make_rtp_packet(&af_only))
+            .unwrap_rewritten();
+        assert!(
+            ts_discontinuity_indicator(&bytes[..TS_PACKET_SIZE]),
+            "DI must be set on AF-only PCR packets too"
+        );
+    }
+
+    /// Non-PCR packets that arrive between the switch and the first PCR
+    /// must NOT consume the one-shot — DI must still land on the next real
+    /// PCR packet. Otherwise an audio PES PUSI arriving before the next
+    /// video PCR would silently absorb the flag (audio PES has no AF, so
+    /// DI can't be set on it anyway, and the first PCR would land without
+    /// DI — exactly the bug we're fixing).
+    #[test]
+    fn non_pcr_packets_after_switch_do_not_consume_flag() {
+        let mut fixer = TsContinuityFixer::new();
+
+        fixer.process_packet("a", &make_rtp_packet(&build_ts_packet(0x100, 0)));
+        let _ = fixer.on_switch("b");
+
+        // Several payload-only packets without PCR.
+        for cc in 0..3u8 {
+            let plain = build_ts_packet(0x101, cc);
+            let _ = fixer.process_packet("b", &make_rtp_packet(&plain));
+        }
+
+        // Then a PCR packet — must still receive DI=1.
+        let pcr = build_pcr_packet(0x100, 0, 27_000_000);
+        let bytes = fixer
+            .process_packet("b", &make_rtp_packet(&pcr))
+            .unwrap_rewritten();
+        assert!(
+            ts_discontinuity_indicator(&bytes[..TS_PACKET_SIZE]),
+            "DI flag survives across non-PCR packets after a switch"
+        );
+    }
+
+    /// Each new switch re-arms the flag, so back-and-forth A↔B always
+    /// flags the first PCR after every switch.
+    #[test]
+    fn each_switch_rearms_di_one_shot() {
+        let mut fixer = TsContinuityFixer::new();
+
+        fixer.process_packet("a", &make_rtp_packet(&build_ts_packet(0x100, 0)));
+
+        for (target, pcr) in [
+            ("b", 1_000_000u64),
+            ("a", 50_000_000u64),
+            ("b", 80_000_000u64),
+            ("a", 120_000_000u64),
+        ] {
+            let _ = fixer.on_switch(target);
+            let pkt = build_pcr_packet(0x100, 0, pcr);
+            let bytes = fixer
+                .process_packet(target, &make_rtp_packet(&pkt))
+                .unwrap_rewritten();
+            assert!(
+                ts_discontinuity_indicator(&bytes[..TS_PACKET_SIZE]),
+                "switch to '{target}' must carry DI on its first PCR"
+            );
+
+            // The very next PCR within the same input must NOT carry DI.
+            let pkt2 = build_pcr_packet(0x100, 1, pcr.wrapping_add(40_000));
+            let bytes2 = fixer
+                .process_packet(target, &make_rtp_packet(&pkt2))
+                .unwrap_rewritten();
+            assert!(
+                !ts_discontinuity_indicator(&bytes2[..TS_PACKET_SIZE]),
+                "subsequent PCR after switch to '{target}' must not carry DI"
+            );
+        }
     }
 }
