@@ -184,9 +184,31 @@ impl SourcePcrPllMaster {
     }
 
     /// Convenience: feed a PCR sample using the master's process epoch.
-    /// Called by the per-flow ingress sampler.
+    /// **Avoid for ingress-sampler use** — `wall_ns` is sampled at the
+    /// time of THIS call, which means broadcast-channel scheduler
+    /// latency / batch draining gets baked into the measured rate.
+    /// The PCR ingress sampler should use [`record_sample_at`]
+    /// instead, passing the original `RtpPacket::recv_time_us`
+    /// captured at UDP recv() return — that's a true kernel-delivery
+    /// timestamp, not a "whenever-the-task-got-around-to-it" one.
     pub fn record_sample(&self, pcr_27mhz: u64) {
         let wall_ns = self.epoch.elapsed().as_nanos();
+        self.pll.record_sample(pcr_27mhz, wall_ns);
+    }
+
+    /// Feed a PCR sample with the wallclock timestamp captured at the
+    /// time the source datagram was received from the kernel
+    /// (`RtpPacket::recv_time_us`). This is the correct ingress
+    /// timestamp for PLL rate tracking — using fresh wall reads at
+    /// PCR-extraction time bakes broadcast-subscriber scheduling
+    /// jitter into `Δwall_ns` and forces the PLL to perceive the
+    /// source as drifting hundreds of ppm even when it's clean.
+    ///
+    /// `recv_time_us` is in `util::time::now_us()` units (process
+    /// monotonic, microseconds). This master converts to ns and feeds
+    /// the PLL directly — the PLL is epoch-agnostic, only Δs matter.
+    pub fn record_sample_at(&self, pcr_27mhz: u64, recv_time_us: u64) {
+        let wall_ns = (recv_time_us as u128) * 1000;
         self.pll.record_sample(pcr_27mhz, wall_ns);
     }
 }

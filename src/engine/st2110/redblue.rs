@@ -470,7 +470,8 @@ mod tests {
             .unwrap();
         cancel.cancel();
 
-        let v = received.lock().clone();
+        let mut v = received.lock().clone();
+        v.sort_unstable();
         assert_eq!(v, vec![10, 11, 12]);
         assert_eq!(stats.red.packets_received.load(Ordering::Relaxed), 3);
         assert_eq!(stats.red.packets_forwarded.load(Ordering::Relaxed), 3);

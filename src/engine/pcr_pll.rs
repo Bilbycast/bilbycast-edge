@@ -61,6 +61,64 @@ pub const EXPECTED_RATE_TICKS_PER_NS: f64 = 27.0 / 1000.0;
 /// gap as a discontinuity. 500 ms matches `pcr_trust.rs`.
 pub const PCR_MAX_SAMPLE_INTERVAL_US: u64 = 500_000;
 
+/// Minimum physical inter-arrival time (ns) between two PCR samples.
+/// Samples whose `Δwall_ns` is below this are treated as a coalesced
+/// arrival burst rather than a real rate observation, and are dropped
+/// at the discontinuity gate. Examples that produce sub-100-µs deltas:
+/// `ffmpeg -stream_loop -re` at the loop boundary (re-pacing restarts
+/// from frame 0, kernel tx may release several TS packets in a single
+/// burst); SRT / RIST recovery replaying a buffered batch; bonded-link
+/// reordering followed by in-order delivery; OS scheduler coalescing
+/// several `recv()` returns into one batch. None of these correspond
+/// to a real source clock observation. Without this gate, a single
+/// such sample lands an `observed_rate` of ~10⁵–10⁸ ticks/ns into the
+/// PI loop and wedges the recovered rate.
+pub const MIN_INTERSAMPLE_WALL_NS: u128 = 100_000;
+
+/// Per-sample observed-rate gate. Catches MASSIVE outliers that would
+/// instantaneously corrupt the integrator (10⁵+ ppm — typical of an
+/// arrival burst the [`MIN_INTERSAMPLE_WALL_NS`] floor missed, or a
+/// PCR encoded against a discontinuous source clock). Set wide
+/// (±10 %) because real-world arrival jitter, even on a healthy LAN,
+/// makes the *instantaneous* observed rate fluctuate by tens of
+/// thousands of ppm per sample — that's a job for the PI integrator
+/// to filter, not for a hard gate to reject. The gate is here only
+/// to keep the controller out of arithmetic-overflow / wedged-state
+/// territory; the steady-state rate clamp ([`RATE_MIN`] / [`RATE_MAX`])
+/// enforces the physical-plausibility window on the *recovered* rate.
+pub const MAX_OBSERVED_RATE_OFFSET_PPM: f64 = 100_000.0;
+
+/// Hard plausibility bound on the recovered rate (`s.rate`) after the
+/// PI update. Real broadcast oscillators sit at ±1 ppm; consumer
+/// crystals ±50 ppm; 500 ppm gives ~10× headroom. If the controller
+/// ever wants to settle outside this window, it's misbehaving and we
+/// refuse — better to free-run at the boundary than diverge into
+/// wedged-master-clock territory.
+pub const MAX_RECOVERED_RATE_OFFSET_PPM: f64 = 500.0;
+
+/// Hard clamp on `s.integral`. Anti-windup: a single outlier sample
+/// (or a transient burst that slipped past the gates) cannot push
+/// the integrator to a value subsequent samples can't unwind. Sized
+/// at 10× the steady-state magnitude needed to track
+/// [`MAX_RECOVERED_RATE_OFFSET_PPM`] of source drift.
+const INTEGRATOR_MAX: f64 = EXPECTED_RATE_TICKS_PER_NS
+    * (MAX_RECOVERED_RATE_OFFSET_PPM / 1.0e6)
+    * 10.0;
+
+/// Recovered-rate clamp window endpoints. See
+/// [`MAX_RECOVERED_RATE_OFFSET_PPM`].
+const RATE_MIN: f64 = EXPECTED_RATE_TICKS_PER_NS
+    * (1.0 - MAX_RECOVERED_RATE_OFFSET_PPM / 1.0e6);
+const RATE_MAX: f64 = EXPECTED_RATE_TICKS_PER_NS
+    * (1.0 + MAX_RECOVERED_RATE_OFFSET_PPM / 1.0e6);
+
+/// Per-sample observed-rate gate endpoints (looser than the recovered
+/// rate clamp on purpose — see [`MAX_OBSERVED_RATE_OFFSET_PPM`]).
+const OBSERVED_RATE_MIN: f64 = EXPECTED_RATE_TICKS_PER_NS
+    * (1.0 - MAX_OBSERVED_RATE_OFFSET_PPM / 1.0e6);
+const OBSERVED_RATE_MAX: f64 = EXPECTED_RATE_TICKS_PER_NS
+    * (1.0 + MAX_OBSERVED_RATE_OFFSET_PPM / 1.0e6);
+
 /// Minimum samples before the PLL reports locked. 5 s × 25 Hz typical
 /// PCR cadence = 125 samples; round to 100 for cushion at 20 Hz.
 pub const MIN_SAMPLES_FOR_LOCK: u64 = 100;
@@ -232,26 +290,68 @@ impl PcrPll {
         let delta_pcr_us = delta_pcr_ticks / 27;
         let delta_wall_us = (delta_wall_ns / 1000) as u64;
 
-        // Discontinuity filter — same threshold as pcr_trust.rs. Reset
-        // the anchor so we don't bake a 33-bit-wrap or stream-restart
-        // gap into the rate estimate.
+        // Discontinuity filter. Reset the anchor and refuse to update
+        // the recovered rate when the sample is implausible:
+        //
+        // - `delta_pcr_us` / `delta_wall_us` > 500 ms: stream restart,
+        //   33-bit wrap, or extended input gap. Same threshold as
+        //   `pcr_trust.rs`.
+        // - `delta_wall_ns < MIN_INTERSAMPLE_WALL_NS`: arrival burst
+        //   (ffmpeg loop boundary, SRT / RIST recovery batch, OS recv
+        //   coalescing). The PCR delta is real, but the wall delta is
+        //   not — the resulting `observed_rate` would be 10⁵–10⁸×
+        //   nominal and wedge the integrator.
+        // ── Hard discontinuity (real gap > 500 ms): reset anchor.
+        // Stream restart, 33-bit PCR wrap, extended ingress gap. Same
+        // threshold as `pcr_trust.rs`. The next sample primes against
+        // the new anchor.
         if delta_pcr_us > PCR_MAX_SAMPLE_INTERVAL_US
             || delta_wall_us > PCR_MAX_SAMPLE_INTERVAL_US
-            || delta_wall_ns == 0
         {
             s.last_pcr_27mhz = Some(pcr_27mhz);
             s.last_wall_ns = Some(wall_ns);
             s.anchor_pcr_27mhz = Some(pcr_27mhz);
             s.anchor_wall_ns = Some(wall_ns);
-            // Lock survives a single discontinuity, but the jitter
-            // window resets to avoid carrying nonsense forward.
             s.jitter_samples.clear();
             return;
         }
 
-        // Instantaneous rate (ticks/ns) — gap-bounded so it can't
-        // explode on a sample 1 ns apart.
+        // ── Transient burst (Δwall < 100 µs): SKIP without resetting
+        // anchor. This is the case where multiple PCR-bearing
+        // datagrams arrive in the same recv() batch (kernel coalesce,
+        // ffmpeg burst, SRT/RIST recovery replay). Resetting the
+        // anchor here would force the next legitimate sample to
+        // compute its observed_rate against this burst's wall time
+        // — which is a few microseconds earlier than the burst's
+        // PCR position dictates — and that biases observed_rate way
+        // outside the outlier gate. Skipping (with the anchor
+        // unchanged) means the next legitimate sample compares
+        // against the last-known-good anchor and produces a clean
+        // observation.
+        if delta_wall_ns < MIN_INTERSAMPLE_WALL_NS {
+            return;
+        }
+
+        // Instantaneous rate (ticks/ns).
         let observed_rate = (delta_pcr_ticks as f64) / (delta_wall_ns as f64);
+
+        // Massive-outlier gate. Catches per-sample observed rates
+        // that are off by more than [`MAX_OBSERVED_RATE_OFFSET_PPM`]
+        // (set wide — ±10 %). The PI loop is responsible for filtering
+        // out the much-smaller per-sample jitter that real-world
+        // arrival timing produces (tens of thousands of ppm on a
+        // healthy LAN); this gate exists only to keep the controller
+        // out of wedged-state territory when something genuinely
+        // pathological slips past the [`MIN_INTERSAMPLE_WALL_NS`]
+        // floor. Anchor is re-aligned so the next legitimate sample
+        // has a clean reference.
+        if !(OBSERVED_RATE_MIN..=OBSERVED_RATE_MAX).contains(&observed_rate) {
+            // Massive-outlier rejection. SKIP without resetting the
+            // anchor — same rationale as the burst-skip branch above.
+            // The next legitimate sample compares against the
+            // last-good anchor and produces a clean observation.
+            return;
+        }
 
         // Phase residual at this instant: how far the PLL's prediction
         // is from the actual incoming PCR.
@@ -263,7 +363,19 @@ impl PcrPll {
         // at this instant; integral builds against systematic bias
         // between source clock and CPU clock.
         s.integral += self.config.ki * (observed_rate - s.rate);
+        // Anti-windup: clamp the integrator before it feeds back into
+        // s.rate. A single outlier that slipped past the gates above
+        // (or a transient ringing while the PLL is warming up) cannot
+        // push the integrator to a value subsequent samples can't
+        // unwind inside the lock window.
+        s.integral = s.integral.clamp(-INTEGRATOR_MAX, INTEGRATOR_MAX);
         s.rate += self.config.kp * (observed_rate - s.rate) + s.integral;
+        // Hard rate clamp. If the controller wants to settle outside
+        // the physical-plausibility window, refuse — better to free-run
+        // at the boundary than diverge into wedged-master-clock
+        // territory where every downstream PCR generator and pacer
+        // produces nonsense.
+        s.rate = s.rate.clamp(RATE_MIN, RATE_MAX);
 
         // Re-anchor against the latest sample so prediction errors
         // never grow unbounded. Anchor is the truth; rate carries the
@@ -528,5 +640,173 @@ mod tests {
         pll.record_sample(next_pcr, 50_000_000);
         let t = pll.telemetry();
         assert_eq!(t.samples, 1, "wrap should not be filtered as a discontinuity");
+    }
+
+    /// A single sample arriving inside the physical inter-arrival
+    /// floor (`MIN_INTERSAMPLE_WALL_NS`) must NOT update the recovered
+    /// rate. This is the ffmpeg-loop-boundary / recv-coalescing case
+    /// that wedged the PLL on the testbed.
+    #[test]
+    fn coalesced_arrival_does_not_wedge_rate() {
+        let pll = PcrPll::default();
+        feed_perfect(&pll, 130, 0, 40_000_000);
+        let rate_before = pll.telemetry().rate_offset_ppm;
+        assert!(pll.telemetry().locked, "PLL should lock on perfect input");
+
+        // Burst arrival: same 40 ms PCR cadence, but the wallclock
+        // delta collapses to 1 µs (kernel released several TS packets
+        // in a single recv() return).
+        let last_wall = 130u128 * 40_000_000;
+        let last_pcr = 130u64 * 40_000 * 27;
+        pll.record_sample(last_pcr + 40_000 * 27, last_wall + 1_000);
+
+        let t = pll.telemetry();
+        let rate_after = t.rate_offset_ppm;
+        assert!(
+            (rate_after - rate_before).abs() < 1.0,
+            "single coalesced-arrival sample should not change rate; \
+             before={} ppm, after={} ppm",
+            rate_before,
+            rate_after
+        );
+    }
+
+    /// Even when `Δwall_ns` clears the floor, an `observed_rate`
+    /// outside ±MAX_RECOVERED_RATE_OFFSET_PPM of nominal is corrupt and must be
+    /// rejected. (Construct the case where Δwall is just above the
+    /// 100 µs floor but Δpcr is still order-of-magnitude too large.)
+    #[test]
+    fn implausible_observed_rate_is_rejected() {
+        let pll = PcrPll::default();
+        feed_perfect(&pll, 130, 0, 40_000_000);
+        let rate_before = pll.telemetry().rate_offset_ppm;
+
+        // Δwall = 200 µs (above the 100 µs floor), Δpcr = 40 ms worth
+        // of ticks (1 080 000). observed_rate = 1 080 000 / 200 000
+        // = 5.4 ticks/ns ≈ 200 000× nominal. Way outside ±500 ppm.
+        let last_wall = 130u128 * 40_000_000;
+        let last_pcr = 130u64 * 40_000 * 27;
+        pll.record_sample(last_pcr + 1_080_000, last_wall + 200_000);
+
+        let rate_after = pll.telemetry().rate_offset_ppm;
+        assert!(
+            (rate_after - rate_before).abs() < 1.0,
+            "implausible observed_rate should be rejected; before={} after={} ppm",
+            rate_before,
+            rate_after
+        );
+    }
+
+    /// Even a stream of corrupt samples (e.g. a misbehaving source or
+    /// a flaky network where every batch coalesces) cannot push
+    /// `s.rate` outside the physical-plausibility window. This is the
+    /// load-bearing safety property that prevents downstream PCR
+    /// generators from producing nonsense PCRs and any future pacer
+    /// from over- or under-driving the wire.
+    #[test]
+    fn rate_never_escapes_plausibility_window() {
+        let pll = PcrPll::default();
+        // 100 normal samples to lock the PLL.
+        feed_perfect(&pll, 100, 0, 40_000_000);
+
+        // Now blast it with 500 corrupt-but-pre-gate-passing-for-some-
+        // reason inputs. We can't construct samples that pass the gates
+        // and still produce wild rates (that's the point of the gates),
+        // so this also exercises that the gates themselves keep firing
+        // without the rate ever drifting. Mix legitimate nominal-rate
+        // samples with implausible bursts.
+        let mut wall: u128 = 100 * 40_000_000;
+        let mut pcr: u64 = 100 * 40_000 * 27;
+        for i in 0..500u64 {
+            // Every 5th sample is a burst.
+            if i % 5 == 0 {
+                wall += 1_000;
+                pcr += 1_080_000;
+            } else {
+                wall += 40_000_000;
+                pcr += 1_080_000;
+            }
+            pll.record_sample(pcr, wall);
+        }
+
+        let t = pll.telemetry();
+        // s.rate must stay inside ±MAX_RECOVERED_RATE_OFFSET_PPM under all
+        // conditions, regardless of whether lock is held.
+        assert!(
+            t.rate_offset_ppm.abs() <= MAX_RECOVERED_RATE_OFFSET_PPM + 1.0,
+            "rate escaped plausibility window: {} ppm (limit ±{})",
+            t.rate_offset_ppm,
+            MAX_RECOVERED_RATE_OFFSET_PPM
+        );
+    }
+
+    /// Recovery from a *pre-existing* wedged state. Simulates the
+    /// production failure mode observed on the testbed: if the PLL is
+    /// somehow in a wedged state (e.g., unwinding from a sequence of
+    /// outliers that pre-dated the fixes), feeding clean input must
+    /// pull `s.rate` back into the plausibility window quickly.
+    #[test]
+    fn recovers_from_wedged_state() {
+        let pll = PcrPll::default();
+        // Force the state into a wedged configuration externally.
+        {
+            let mut s = pll.state.lock().unwrap();
+            s.rate = EXPECTED_RATE_TICKS_PER_NS * 1.0e3; // 1e9 ppm — the
+                                                        //  exact wedge
+                                                        //  observed in
+                                                        //  testbed stats
+            s.integral = 1.0; // also wedged
+            s.last_pcr_27mhz = Some(0);
+            s.last_wall_ns = Some(0);
+            s.anchor_pcr_27mhz = Some(0);
+            s.anchor_wall_ns = Some(0);
+        }
+
+        // Feed clean input. With anti-windup + rate clamp, even the
+        // very first PI update must clamp s.rate back inside the
+        // window.
+        let pcr_per_step: u64 = 40_000 * 27; // 40 ms, exactly nominal
+        for i in 1u64..=10 {
+            let wall = i as u128 * 40_000_000;
+            let pcr = i * pcr_per_step;
+            pll.record_sample(pcr, wall);
+        }
+
+        let t = pll.telemetry();
+        assert!(
+            t.rate_offset_ppm.abs() <= MAX_RECOVERED_RATE_OFFSET_PPM + 1.0,
+            "PLL did not recover from wedged state: {} ppm",
+            t.rate_offset_ppm
+        );
+    }
+
+    /// Anti-windup: integrator never exceeds INTEGRATOR_MAX after the
+    /// PI update step.
+    #[test]
+    fn integrator_is_bounded_under_repeated_outliers() {
+        let pll = PcrPll::default();
+        // Lock the PLL first.
+        feed_perfect(&pll, 130, 0, 40_000_000);
+
+        // Inject samples that push observed_rate to the edge of the
+        // window (just inside +500 ppm) repeatedly. The integrator
+        // would naturally walk up; the clamp must hold.
+        let mut wall: u128 = 130 * 40_000_000;
+        let mut pcr: u64 = 130 * 40_000 * 27;
+        // 499 ppm fast: per 40 ms, ticks = 1080000 + (1080000 × 499e-6)
+        //              = 1080000 + 539.
+        for _ in 0..1000u64 {
+            wall += 40_000_000;
+            pcr += 1_080_000 + 539;
+            pll.record_sample(pcr, wall);
+        }
+
+        let s = pll.state.lock().unwrap();
+        assert!(
+            s.integral.abs() <= INTEGRATOR_MAX + f64::EPSILON,
+            "integrator escaped clamp: {} (limit ±{})",
+            s.integral,
+            INTEGRATOR_MAX
+        );
     }
 }

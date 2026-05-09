@@ -35,6 +35,7 @@ pub mod ancillary;
 pub mod audio;
 pub mod captions;
 pub mod hwts;
+pub mod pacer;
 pub mod ptp;
 pub mod redblue;
 pub mod scte104;

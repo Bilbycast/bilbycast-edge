@@ -131,6 +131,14 @@ pub mod ts_video_replace;
 /// the ~1–5 ms ceiling `tokio::time::sleep_until` imposes. See
 /// [`docs/wire-pacing.md`](../../docs/wire-pacing.md).
 pub mod wire_emit;
+
+/// Phase 2 of the wire-pacing rollout: kernel-paced wire emission via
+/// Linux `SO_TXTIME` + ETF qdisc. Targets ST 2110-20/-22 narrow profile
+/// at 250 k–1 M pps where userspace `clock_nanosleep` cannot meet the
+/// per-packet timing budget. See [`docs/wire-pacing.md`](../../docs/wire-pacing.md)
+/// "Phase 2" section. Linux-only — public surface compiles on other
+/// platforms but every operation returns `Unsupported`.
+pub mod wire_emit_txtime;
 #[cfg(feature = "video-thumbnail")]
 pub mod video_encode_util;
 

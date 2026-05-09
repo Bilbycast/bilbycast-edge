@@ -57,7 +57,15 @@ pub fn spawn_pcr_ingress_sampler(
 
 /// Scan a single `RtpPacket` for PCR samples, feeding the master's PLL
 /// for each one. Pure function — no I/O, no allocations on the hot path.
+///
+/// Crucially: every PCR found in this datagram is recorded against the
+/// datagram's `recv_time_us` (captured at the input task's UDP recv()
+/// return — a true kernel-delivery timestamp). Using the PLL's
+/// internal `epoch.elapsed()` here would bake broadcast-subscriber
+/// scheduling jitter into `Δwall_ns` and prevent lock against
+/// otherwise-clean sources.
 fn sample_packet(master: &SourcePcrPllMaster, pkt: &RtpPacket) {
+    let recv_time_us = pkt.recv_time_us;
     let bytes = pkt.data.as_ref();
     let payload = if pkt.is_raw_ts {
         bytes
@@ -74,10 +82,10 @@ fn sample_packet(master: &SourcePcrPllMaster, pkt: &RtpPacket) {
         None => return,
     };
     while i + TS_PACKET_SIZE <= payload.len() {
-        let pkt = &payload[i..i + TS_PACKET_SIZE];
-        if pkt[0] == TS_SYNC_BYTE {
-            if let Some(pcr_27mhz) = extract_pcr(pkt) {
-                master.record_sample(pcr_27mhz);
+        let ts_pkt = &payload[i..i + TS_PACKET_SIZE];
+        if ts_pkt[0] == TS_SYNC_BYTE {
+            if let Some(pcr_27mhz) = extract_pcr(ts_pkt) {
+                master.record_sample_at(pcr_27mhz, recv_time_us);
             }
             i += TS_PACKET_SIZE;
         } else {
@@ -161,12 +169,26 @@ mod tests {
 
     #[test]
     fn skips_rtp_header_correctly() {
-        let pcr_base = 90_000u64;
-        let mut data = vec![0u8; 12]; // basic 12-byte RTP header
+        // The test asserts that an RTP-wrapped TS packet's PCR is
+        // extracted (the header skip works). Concretely: feeding a
+        // single RTP-wrapped sample through `sample_packet` must
+        // change `pll.now_27mhz()` from its pre-sample wallclock
+        // fallback (small process-monotonic value) to the primed
+        // anchor value (~`pcr_base × 300`). That can only happen if
+        // `extract_pcr` ran on the inner TS packet — exactly what the
+        // RTP header skip is responsible for setting up.
+        //
+        // No second sample / sleep involved: we don't exercise rate
+        // tracking here (covered by pcr_pll unit tests). This keeps
+        // the test deterministic against the PLL's plausibility gates.
+        let master = Arc::new(SourcePcrPllMaster::new("test"));
+        let pre_sample_now = master.pll().now_27mhz(0);
+
+        let pcr_base = 90_000u64; // 90 kHz; ×300 → 27_000_000 27 MHz ticks
+        let mut data = vec![0u8; 12];
         data[0] = 0x80; // V=2, no padding/ext, CC=0
         data[1] = 96; // payload type
         data.extend_from_slice(&build_pcr_packet(pcr_base));
-        let master = Arc::new(SourcePcrPllMaster::new("test"));
         let pkt = RtpPacket {
             data: Bytes::from(data),
             sequence_number: 0,
@@ -177,35 +199,19 @@ mod tests {
             upstream_leg_id: None,
         };
         sample_packet(&master, &pkt);
-        // Prime — no cumulative samples yet.
-        let t = master.pll().telemetry();
-        assert_eq!(t.samples, 0);
-        // Feed one more — Δ should be honoured and bump samples to 1.
-        sample_packet(&master, &pkt);
-        // Same PCR + zero Δwall → discontinuity filter resets, still 0.
-        // Build a different PCR for the second sample.
-        let mut data2 = vec![0u8; 12];
-        data2[0] = 0x80;
-        data2[1] = 96;
-        data2.extend_from_slice(&build_pcr_packet(pcr_base + 3_600));
-        let pkt2 = RtpPacket {
-            data: Bytes::from(data2),
-            sequence_number: 1,
-            rtp_timestamp: 0,
-            recv_time_us: 0,
-            is_raw_ts: false,
-            upstream_seq: None,
-            upstream_leg_id: None,
-        };
-        // Tiny sleep ensures wall_ns differs.
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        sample_packet(&master, &pkt2);
-        let t2 = master.pll().telemetry();
-        // The first call primed the PLL; the second call (same PCR) and
-        // third (advanced PCR) each produce a delta. Just confirm we
-        // saw at least one accepted sample — the RTP header skip is
-        // working if PCRs reach the PLL.
-        assert!(t2.samples >= 1, "ingress sampler did not feed PLL via RTP path");
+
+        // Pre-sample fallback returns process-monotonic ticks (small,
+        // fluctuates per call). Post-prime, `now_27mhz` projects from
+        // the anchor (~27_000_000). They must differ substantially.
+        let post_sample_now = master.pll().now_27mhz(0);
+        let expected_anchor = pcr_base * 300;
+        assert!(
+            (post_sample_now as i64 - expected_anchor as i64).abs() < 1_000_000,
+            "RTP header skip did not feed PCR to PLL: now_27mhz pre={} post={} expected~={}",
+            pre_sample_now,
+            post_sample_now,
+            expected_anchor
+        );
     }
 
     #[test]

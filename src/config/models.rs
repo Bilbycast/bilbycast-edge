@@ -4039,6 +4039,11 @@ pub struct St2110VideoOutputConfig {
     /// header and RFC 4175 triplet headers). Typical 1428 for 1500-byte MTU.
     #[serde(default = "default_st2110_video_payload_budget")]
     pub payload_budget: usize,
+    /// Optional kernel-paced wire emission. See [`WirePacingConfig`].
+    /// Manager UI gates this on `HealthPayload.capabilities` containing
+    /// `wire_pacing_txtime`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_pacing: Option<WirePacingConfig>,
 }
 
 /// Per-sub-stream bind (ST 2110-23 input). Each sub-stream is a valid -20
@@ -4111,6 +4116,10 @@ pub struct St2110_23OutputConfig {
     pub dscp: u8,
     #[serde(default = "default_st2110_video_payload_budget")]
     pub payload_budget: usize,
+    /// Optional kernel-paced wire emission. Applied to every sub-stream
+    /// of this -23 output. See [`WirePacingConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_pacing: Option<WirePacingConfig>,
 }
 
 fn default_st2110_video_pt() -> u8 {
@@ -4119,6 +4128,44 @@ fn default_st2110_video_pt() -> u8 {
 
 fn default_st2110_video_payload_budget() -> usize {
     1428
+}
+
+/// ST 2110-21 sender profile per ST 2110-21 §6.3. Selects the pacer
+/// math; v1 of the pacer treats all variants as `narrow_linear` (even
+/// pacing across frame period). Reserved for the gapped-narrow follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum St2110_21ProfileConfig {
+    Narrow,
+    NarrowLinear,
+    Wide,
+}
+
+impl Default for St2110_21ProfileConfig {
+    fn default() -> Self {
+        St2110_21ProfileConfig::Narrow
+    }
+}
+
+/// Wire-pacing mode for an output. Today only ST 2110-20 / -23 outputs
+/// honour this; compressed-TS outputs (UDP, RTP, SRT) are paced by
+/// `engine::wire_emit` unconditionally and ignore this field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum WirePacingConfig {
+    /// Kernel-paced via `SO_TXTIME` + ETF qdisc. Operator must install
+    /// the ETF qdisc on the egress NIC separately
+    /// (`packaging/setup-etf-qdisc.sh`); the edge process does not
+    /// install qdiscs (deliberately operator-side, needs
+    /// `CAP_NET_ADMIN`). Capability `wire_pacing_txtime` advertised on
+    /// `HealthPayload.capabilities` only when the host's kernel
+    /// accepts `SO_TXTIME`. Without ETF qdisc the kernel still accepts
+    /// the `SCM_TXTIME` CMSG but emits immediately — same observable
+    /// behavior as today's unpaced ST 2110, no regression.
+    TxTime {
+        #[serde(default)]
+        profile: St2110_21ProfileConfig,
+    },
 }
 
 /// SMPTE ST 2110 flow group ("essence bundle") configuration.

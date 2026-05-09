@@ -356,6 +356,14 @@ pub struct StaticCapabilities {
     pub vaapi: VaapiCapability,
     pub cpu: CpuInfo,
     pub sw_capacity: SwCapacityEstimate,
+    /// `true` when the kernel accepts `setsockopt(SO_TXTIME)` on a UDP
+    /// socket. Linux ≥ 4.19 typically yes; older kernels and non-Linux
+    /// hosts no. Drives the `wire_pacing_txtime` capability advertised
+    /// to the manager. See `engine::wire_emit_txtime`. Note: a `true`
+    /// here does NOT imply ETF qdisc is installed — that's an
+    /// operator-side concern surfaced via the runbook.
+    #[serde(default)]
+    pub wire_pacing_txtime: bool,
 }
 
 /// Live (periodically polled) NVIDIA NVENC / NVDEC utilization. Reports
@@ -466,6 +474,14 @@ pub fn probe_static_capabilities() -> StaticCapabilities {
     } else {
         HwDecoderSessionLimits::default()
     };
+    let wire_pacing_txtime = crate::engine::wire_emit_txtime::probe();
+    if wire_pacing_txtime {
+        tracing::info!(
+            "SO_TXTIME accepted by kernel; wire_pacing_txtime capability advertised. \
+             ETF qdisc must still be installed by the operator on the egress NIC \
+             for actual kernel pacing — see packaging/setup-etf-qdisc.sh"
+        );
+    }
     StaticCapabilities {
         hw_encoders,
         hw_decoders,
@@ -475,6 +491,7 @@ pub fn probe_static_capabilities() -> StaticCapabilities {
         vaapi,
         cpu,
         sw_capacity,
+        wire_pacing_txtime,
     }
 }
 
@@ -2855,6 +2872,7 @@ mod tests {
                 avx_class: AvxClass::Avx2,
             },
             sw_capacity: SwCapacityEstimate::default(),
+            wire_pacing_txtime: false,
         }
     }
 

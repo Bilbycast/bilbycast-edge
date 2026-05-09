@@ -343,71 +343,126 @@ those libraries are statically linked into the `*-full` binary.
 
 ---
 
-## Tier-1 PCR jitter setup (`SO_TXTIME` + `fq` qdisc)
+## Wire pacing
 
-Outputs that re-encode (audio_encode / video_encode set on a UDP or
-RTP output) hit a Tokio timer-precision floor (~1–5 ms) when the
-wire-side pacing happens entirely in user space. To take pacing down
-to sub-µs the kernel needs to do the scheduling — Linux's `SO_TXTIME`
-with the `fq` qdisc.
+Two distinct wire-pacing initiatives sit alongside the edge data
+path, at different stages:
 
-The edge already enables `SO_TXTIME` on every UDP egress socket; you
-need to flip the kernel's queue discipline once per host so it
-honours the cmsg.
+| Regime                                          | Mechanism                                | Status                                                                              |
+|-------------------------------------------------|------------------------------------------|-------------------------------------------------------------------------------------|
+| Compressed TS over UDP / RTP / SRT (PCR jitter) | `engine::wire_emit` — SCHED_FIFO thread + `clock_nanosleep` | **Module in tree, NOT wired in.** A 2026-05-09 integration attempt produced multi-second egress latency and was reverted. Receivers see today's baseline 5–50 ms PCR jitter, same as it has been for the codebase's lifetime. Re-integration is on the roadmap; not a tuning change. |
+| Uncompressed ST 2110-20 / -23 (narrow profile)  | `engine::wire_emit_txtime` — `SO_TXTIME` + ETF qdisc | **In tree, opt-in per output.** Sketched and unit-tested; no default config opts in. Operator wires it via `wire_pacing: { mode: "tx_time" }` on a ST 2110-20/-23 output and installs the ETF qdisc via `packaging/setup-etf-qdisc.sh`. |
+
+Full architecture (and the rationale for each) in
+[`wire-pacing.md`](wire-pacing.md).
+
+### Compressed TS — current state
+
+The edge today emits compressed TS via a tokio mpsc(256) → tokio
+async `socket.send_to(...)` path. PCR jitter at the receiver runs in
+the 5–50 ms band. Most production receivers (VLC, ffplay, Appear,
+Cisco TV, EVS) tolerate that without visible artefacts. Strict
+ETSI TR-101290 P1.4 conformance and EBU LIST want sub-ms — that's
+the use case for the future wire_emit re-integration.
+
+**Earlier versions of this document recommended a `tc qdisc replace
+... fq ...` setup for compressed TS — that was for an older
+`SO_TXTIME`-based design that never shipped.** Ignore any persisted
+`wire-fq.service` unit on upgraded hosts; disable it
+(`systemctl disable --now wire-fq.service`).
+
+The shipped `packaging/bilbycast-edge.service` includes
+`RestrictRealtime=false` + `LimitRTPRIO=50`. Those are harmless on
+the current code path (no SCHED_FIFO threads are created today) and
+will be needed when `wire_emit` re-lands. Leave them in.
+
+### Uncompressed ST 2110-20 / -23: narrow profile — opt-in
+
+ST 2110-21 narrow profile compliance at 1080p50 (~250 k pps) and 4K60
+(~1 M pps) requires per-packet timing within microseconds of the
+frame raster. Userspace pacing — even SCHED_FIFO `clock_nanosleep`
+— cannot meet that budget. The kernel-paced alternative is
+`SO_TXTIME` + the Linux ETF qdisc (Earliest TxTime First). With a
+PTP-disciplined NIC supporting hardware tx timestamping (Mellanox
+CX-6/CX-7, Intel E810, Intel i210), the NIC schedules transmission
+against its own PTP-aligned clock — sub-µs jitter, fully decoupled
+from CPU contention.
+
+This is opt-in per output; the edge does not enable it implicitly
+because:
+
+- It only applies to ST 2110-20 / -23 outputs (compressed paths get
+  no benefit).
+- It depends on operator-side `tc qdisc` setup that needs
+  `CAP_NET_ADMIN`, deliberately not granted to the edge process.
+- It depends on `ptp4l` + `phc2sys` running on the host. Without a
+  PTP-disciplined system clock the pacer falls back to monotonic and
+  receivers expecting narrow may flag VRX overflow.
+
+#### Step 1: install the ETF qdisc
 
 ```bash
-# replace `eno4` with the actual broadcast egress NIC
-sudo tc qdisc replace dev eno4 root fq limit 10000 flow_limit 1000
-
-# only needed for accurate localhost TS measurement
-sudo tc qdisc replace dev lo   root fq limit 10000 flow_limit 1000
+sudo bash packaging/setup-etf-qdisc.sh enp1s0   # name your egress NIC
 ```
+
+The script installs `mqprio` at root (3 traffic classes mapped to 3
+hardware tx queues) and `etf clockid CLOCK_TAI delta 200000 offload`
+on the prioritized class. `offload` enables NIC HW pacing on
+supported NICs; falls back to software ETF on unsupported ones (still
+~1–10 µs jitter). Required for boot-time persistence: wrap the same
+`tc` calls in your own systemd unit, NetworkManager dispatch hook, or
+ifupdown post-up snippet.
 
 Verify:
 
 ```bash
-$ tc qdisc show dev eno4
-qdisc fq 8001: root refcnt 5 limit 10000p flow_limit 1000p ...
+tc -s qdisc show dev enp1s0
 ```
 
-`flow_limit 1000p` (vs the default `100p`) covers worst-case encoder
-I-frame bursts plus the 50 ms wire preroll. The default gets clipped
-during bursty re-encoded flows and shows up as receiver-side PCR
-jitter.
+should list `mqprio` and `etf` (not `pfifo_fast`).
 
-Persistence across reboot — drop a one-shot systemd unit (or
-NetworkManager dispatcher / systemd-networkd `[QDisc]` block; pick
-whichever matches the host):
+Removal: `sudo tc qdisc del dev enp1s0 root`.
 
-```ini
-# /etc/systemd/system/wire-fq.service
-[Unit]
-Description=fq qdisc for SO_TXTIME wire pacing
-After=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/sbin/tc qdisc replace dev eno4 root fq limit 10000 flow_limit 1000
-ExecStart=/usr/sbin/tc qdisc replace dev lo   root fq limit 10000 flow_limit 1000
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-```
+#### Step 2: confirm the host advertises the capability
 
 ```bash
-sudo systemctl enable --now wire-fq.service
+curl -k https://<edge>:8080/health | jq .capabilities
 ```
 
-Without `fq`, the kernel ignores `SCM_TXTIME` and the wire pacer
-silently degrades to `tokio::time::sleep_until` precision. The edge
-still ships valid TS — drops and CC remain clean — only PCR-arrival
-jitter is affected. The startup log line `SO_TXTIME enabled
-(configure ETF qdisc on egress interface for sub-µs PCR jitter)` is
-the reminder.
+should include `"wire_pacing_txtime"`. The edge probes `SO_TXTIME` at
+startup; Linux ≥ 4.19 normally accepts. If absent, you're on a too-old
+kernel, a container without the right syscall permission, or a
+non-Linux host.
 
-Full architecture, expected jitter numbers, and verification recipes
-live in [`wire-pacing.md`](wire-pacing.md).
+#### Step 3: opt in per ST 2110-20 / -23 output
+
+```json
+{
+  "type": "st2110_20",
+  "id": "video-out-1",
+  "wire_pacing": {
+    "mode": "tx_time",
+    "profile": "narrow"
+  },
+  ...
+}
+```
+
+`profile` is one of `narrow` (default), `narrow_linear`, `wide`. v1
+of the pacer treats all three as `narrow_linear` (even pacing across
+the active video period). Most ST 2110 narrow-profile receivers
+accept this; classic gapped narrow is a follow-up if a specific
+receiver complains.
+
+Without ETF qdisc, the kernel still accepts the `SCM_TXTIME` CMSG
+but emits immediately — same observable behaviour as today's unpaced
+path, no regression. Without `ptp4l` + `phc2sys`, the pacer's TAI
+anchor is not GM-aligned and the receiver's VRX bound may fail; the
+output still emits cleanly.
+
+For the full reference — failure modes, per-NIC notes, narrow vs
+narrow_linear vs wide — see [`st2110.md`](st2110.md) "ST 2110-21
+narrow profile pacing" and [`wire-pacing.md`](wire-pacing.md) Phase 2.
 
 ---
 

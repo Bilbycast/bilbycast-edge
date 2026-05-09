@@ -1783,7 +1783,28 @@ fn validate_st2110_video_output(c: &St2110VideoOutputConfig) -> Result<()> {
         validate_red_blue_bind(red, &c.dest_addr, &format!("{label} redundancy"))?;
     }
     validate_payload_budget(c.payload_budget, &label)?;
+    if let Some(ref wp) = c.wire_pacing {
+        validate_wire_pacing(wp, &label)?;
+    }
     Ok(())
+}
+
+/// Validate a `WirePacingConfig`. Currently only checks that the
+/// profile is a known variant (serde already enforces this) — kept as a
+/// dedicated function so future fields (e.g. operator-supplied
+/// `qdisc_assumed`, `clock_id_override`) have a single home.
+fn validate_wire_pacing(wp: &WirePacingConfig, label: &str) -> Result<()> {
+    match wp {
+        WirePacingConfig::TxTime { profile: _ } => {
+            // No structural fields to validate at present; the
+            // capability gate (`wire_pacing_txtime` in
+            // `HealthPayload.capabilities`) is what determines whether
+            // the host can actually serve this config. Host probe runs
+            // at startup in `engine::hardware_probe`.
+            let _ = label;
+            Ok(())
+        }
+    }
 }
 
 fn validate_st2110_23_input(c: &St2110_23InputConfig) -> Result<()> {
@@ -1838,6 +1859,9 @@ fn validate_st2110_23_output(c: &St2110_23OutputConfig) -> Result<()> {
         bail!("{label}: DSCP must be 0-63, got {}", c.dscp);
     }
     validate_payload_budget(c.payload_budget, &label)?;
+    if let Some(ref wp) = c.wire_pacing {
+        validate_wire_pacing(wp, &label)?;
+    }
     Ok(())
 }
 

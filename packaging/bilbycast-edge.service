@@ -54,7 +54,16 @@ SupplementaryGroups=video render audio
 CapabilityBoundingSet=
 AmbientCapabilities=
 RestrictNamespaces=true
-RestrictRealtime=true
+# `wire_emit` uses SCHED_FIFO best-effort on its egress thread for
+# sub-100 µs `clock_nanosleep` precision (the alternative is the
+# tokio timer wheel's ~1–5 ms ceiling, which is too coarse for
+# PCR-anchored pacing). RestrictRealtime=true would block this. Pair
+# with `LimitRTPRIO=50` below — the kernel allows unprivileged
+# `sched_setscheduler(SCHED_FIFO)` whenever RTPRIO is non-zero, so
+# we don't need to grant `CAP_SYS_NICE`. Wire_emit logs at debug and
+# falls back to default scheduler if the priority change is denied,
+# so there is no hard failure path.
+RestrictRealtime=false
 LockPersonality=true
 MemoryDenyWriteExecute=false  # JIT crates exist (rustls, ring) — leave on default
 SystemCallArchitectures=native
@@ -63,6 +72,10 @@ SystemCallArchitectures=native
 # /etc/systemd/system/bilbycast-edge.service.d/override.conf
 LimitNOFILE=65536
 LimitMEMLOCK=infinity
+# Allows wire_emit's egress thread to acquire SCHED_FIFO priority 50
+# without `CAP_SYS_NICE`. Default RLIMIT_RTPRIO is 0 on most distros,
+# which would force a silent fallback to default scheduler.
+LimitRTPRIO=50
 
 # Environment file lets operators set RUST_LOG, BILBYCAST_REPLAY_DIR,
 # etc. without editing the unit. Created blank by install-edge.sh.

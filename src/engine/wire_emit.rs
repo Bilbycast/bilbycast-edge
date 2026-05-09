@@ -46,19 +46,26 @@
 //! `bytes_sent`, `record_latency()`, `record_pcr_egress()`. Encoder-side
 //! `try_send` overflow is counted under `packets_dropped`.
 //!
-//! ## Status — preserved, not yet wired
+//! ## Status — preserved, NOT wired in (live regression observed)
 //!
-//! Module + 12 unit tests landed; re-integration into `output_udp.rs` /
-//! `output_rtp.rs` is deferred until the upstream PCR-cadence bug in
-//! `ts_video_replace` / `av_sync_mux::pcr_for_emit` is resolved (see
-//! `docs/wire-pacing.md` and the project memory entry on PCR jitter).
-//! Sub-ms PCR jitter at the receiver requires this module — do not
-//! delete. The module-level `#![allow(dead_code)]` below silences the
-//! warnings the deferred integration would otherwise produce.
+//! Module + 12 unit tests landed; a Phase 1 integration into
+//! `output_udp.rs` / `output_rtp.rs` was attempted on 2026-05-09 and
+//! reverted the same day. The integrated form produced multi-second
+//! egress latency, channel-overflow drops on passthrough flows, PCR
+//! accuracy errors (TR-101290 P2), and decoder pixelation in VLC /
+//! ffplay — observed against the testbed h264_qsv 6 Mbps + AAC 192k →
+//! UDP / RTP path. Root cause not yet identified; the per-PCR target
+//! derivation appears to drift relative to the actual encoder output
+//! rate in ways the unit-test suite does not exercise. Re-integration
+//! requires (a) reproducing the failure in an automated test, (b)
+//! understanding why latency accumulated to seconds, (c) fixing the
+//! pacer or replacing it. Sub-ms PCR jitter at the receiver is the
+//! eventual goal — do not delete this module.
 
 #![allow(dead_code)]
 
 use std::net::{SocketAddr, UdpSocket};
+use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
@@ -112,8 +119,12 @@ const MIN_BITRATE_BPS: u64 = 64_000;
 
 /// One datagram on its way to the wire. Already final TS bytes (no RTP
 /// header) — emitter wraps if `WireWrap::Rtp`.
+///
+/// `bytes` is `bytes::Bytes` so callers feeding from a `BytesMut`
+/// staging buffer can `.freeze()` (zero-copy) instead of `.to_vec()`
+/// (per-datagram heap copy on the data path).
 pub struct WireDatagram {
-    pub bytes: Vec<u8>,
+    pub bytes: Bytes,
     pub recv_time_us: u64,
     pub rtp_ts_90k: u32,
 }
@@ -661,7 +672,7 @@ mod tests {
         // PCR base = 0 → emit at first wall_anchor.
         for _ in 0..3 {
             tx.try_send(WireDatagram {
-                bytes: bytes.clone(),
+                bytes: Bytes::from(bytes.clone()),
                 recv_time_us: 0,
                 rtp_ts_90k: 0,
             })

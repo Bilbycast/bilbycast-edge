@@ -1096,6 +1096,17 @@ fn edge_capabilities() -> Vec<&'static str> {
             }
         }
     }
+    // Kernel-paced wire emission via SO_TXTIME — gates the per-output
+    // `wire_pacing` config knob on ST 2110-20 / -23 outputs in the
+    // manager UI. Linux ≥ 4.19 typically advertises; non-Linux + older
+    // kernels don't. Note: capability says the kernel ACCEPTS SO_TXTIME
+    // — operator-side ETF qdisc setup is still required for actual
+    // pacing (see packaging/setup-etf-qdisc.sh).
+    if let Some(c) = crate::engine::hardware_probe::static_capabilities() {
+        if c.wire_pacing_txtime {
+            caps.push("wire_pacing_txtime");
+        }
+    }
     caps
 }
 
