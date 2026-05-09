@@ -1,0 +1,16 @@
+# cargo-audit configuration. Mirrors the [advisories] ignore list in
+# deny.toml — both checks run side-by-side in the Security audit
+# workflow and need to share an allowlist or the run goes red.
+
+[advisories]
+ignore = [
+    # rustls-pemfile 2.2.0 — crate archived August 2025, code lives on
+    # inside rustls-pki-types via the PemObject trait. Not a CVE.
+    "RUSTSEC-2025-0134",
+    # rsa 0.9.x Marvin Attack timing sidechannel — only exploitable
+    # against private-key decryption operations. The edge runs cosign
+    # verify-blob (signature verification only, no private RSA key on
+    # this side), so the attack model does not apply. Drop this ignore
+    # once a patched rsa ships.
+    "RUSTSEC-2023-0071",
+]
