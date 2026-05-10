@@ -141,19 +141,23 @@ impl RedBluePair {
     /// the primary leg. `red_source` is the optional SSM source for the
     /// primary leg. `blue` is the optional second leg from the parsed config;
     /// the blue leg's SSM source is read from `RedBlueBindConfig::source_addr`.
+    /// `red_binding` pins the red leg to a specific NIC; `blue` carries its
+    /// own `interface_binding` field — the two are independent so 2022-7 plants
+    /// can pin Red and Blue to different NICs.
     pub async fn bind_input(
         red_addr: &str,
         red_iface: Option<&str>,
         red_source: Option<&str>,
         blue: Option<&RedBlueBindConfig>,
+        red_binding: Option<&crate::config::models::InterfaceBinding>,
     ) -> Result<Self> {
-        let red_sock = bind_udp_input(red_addr, red_iface, red_source)
+        let red_sock = bind_udp_input(red_addr, red_iface, red_source, red_binding)
             .await
             .with_context(|| format!("Red leg bind failed for {red_addr}"))?;
 
         let blue_sock = match blue {
             Some(b) => Some(
-                bind_udp_input(&b.addr, b.interface_addr.as_deref(), b.source_addr.as_deref())
+                bind_udp_input(&b.addr, b.interface_addr.as_deref(), b.source_addr.as_deref(), b.interface_binding.as_ref())
                     .await
                     .with_context(|| format!("Blue leg bind failed for {}", b.addr))?,
             ),
@@ -543,7 +547,7 @@ mod tests {
     #[tokio::test]
     async fn test_bind_input_no_blue_returns_pair() {
         // Bind to an ephemeral port via the same helper used by inputs.
-        let pair = RedBluePair::bind_input("127.0.0.1:0", None, None, None)
+        let pair = RedBluePair::bind_input("127.0.0.1:0", None, None, None, None)
             .await
             .expect("bind red only");
         assert!(pair.blue.is_none());
@@ -558,8 +562,9 @@ mod tests {
             addr: format!("127.0.0.1:{blue_port}"),
             interface_addr: None,
             source_addr: None,
+            interface_binding: None,
         };
-        let pair = RedBluePair::bind_input(&red_addr, None, None, Some(&blue))
+        let pair = RedBluePair::bind_input(&red_addr, None, None, Some(&blue), None)
             .await
             .expect("bind red + blue");
         assert!(pair.blue.is_some());

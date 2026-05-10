@@ -569,6 +569,86 @@ pub fn validate_input_definition(def: &InputDefinition) -> Result<()> {
         }
     }
     validate_input(&def.config)?;
+    validate_input_interface_bindings(&def.id, &def.config)?;
+    Ok(())
+}
+
+/// Validate every `interface_binding` field reachable from an `InputConfig`
+/// (primary leg + optional 2022-7 redundancy leg + optional SRT-bonding
+/// endpoints). Walked once per input definition so the per-variant
+/// validators don't need to learn about the new field.
+fn validate_input_interface_bindings(input_id: &str, cfg: &InputConfig) -> Result<()> {
+    match cfg {
+        InputConfig::Rtp(c) => {
+            if let Some(b) = &c.interface_binding {
+                validate_interface_binding(b, &format!("input '{input_id}' (RTP)"))?;
+            }
+            if let Some(red) = &c.redundancy {
+                if let Some(b) = &red.interface_binding {
+                    validate_interface_binding(b, &format!("input '{input_id}' (RTP leg 2)"))?;
+                }
+            }
+        }
+        InputConfig::Udp(c) => {
+            if let Some(b) = &c.interface_binding {
+                validate_interface_binding(b, &format!("input '{input_id}' (UDP)"))?;
+            }
+        }
+        InputConfig::Srt(c) => {
+            if let Some(b) = &c.interface_binding {
+                validate_interface_binding(b, &format!("input '{input_id}' (SRT)"))?;
+            }
+            if let Some(red) = &c.redundancy {
+                if let Some(b) = &red.interface_binding {
+                    validate_interface_binding(b, &format!("input '{input_id}' (SRT leg 2)"))?;
+                }
+            }
+            if let Some(bonding) = &c.bonding {
+                for (i, ep) in bonding.endpoints.iter().enumerate() {
+                    if let Some(b) = &ep.interface_binding {
+                        validate_interface_binding(
+                            b,
+                            &format!("input '{input_id}' (SRT bonding endpoint {i})"),
+                        )?;
+                    }
+                }
+            }
+        }
+        InputConfig::Rist(c) => {
+            if let Some(b) = &c.interface_binding {
+                validate_interface_binding(b, &format!("input '{input_id}' (RIST)"))?;
+            }
+        }
+        InputConfig::St2110_30(c) | InputConfig::St2110_31(c) => {
+            if let Some(b) = &c.interface_binding {
+                validate_interface_binding(b, &format!("input '{input_id}' (ST 2110 audio)"))?;
+            }
+        }
+        InputConfig::St2110_40(c) => {
+            if let Some(b) = &c.interface_binding {
+                validate_interface_binding(b, &format!("input '{input_id}' (ST 2110-40)"))?;
+            }
+        }
+        InputConfig::St2110_20(c) => {
+            if let Some(b) = &c.interface_binding {
+                validate_interface_binding(b, &format!("input '{input_id}' (ST 2110-20)"))?;
+            }
+        }
+        InputConfig::St2110_23(c) => {
+            if let Some(b) = &c.interface_binding {
+                validate_interface_binding(b, &format!("input '{input_id}' (ST 2110-23)"))?;
+            }
+        }
+        InputConfig::RtpAudio(c) => {
+            if let Some(b) = &c.interface_binding {
+                validate_interface_binding(b, &format!("input '{input_id}' (rtp_audio)"))?;
+            }
+        }
+        // Other input types (Rtmp, Rtsp, Webrtc, Whep, MediaPlayer, Replay,
+        // TestPattern, Bonded) are out of Phase 1 scope. interface_binding
+        // is not present on those config structs.
+        _ => {}
+    }
     Ok(())
 }
 
@@ -3042,7 +3122,86 @@ fn validate_input_transcode_group_a(
 ///
 /// Returns an error describing the first validation failure encountered.
 pub fn validate_output(output: &OutputConfig) -> Result<()> {
-    validate_output_with_input(output, None)
+    validate_output_with_input(output, None)?;
+    validate_output_interface_bindings(output)?;
+    Ok(())
+}
+
+/// Validate every `interface_binding` field reachable from an
+/// `OutputConfig`. Walked once per output so the per-variant validators
+/// don't need to learn about the new field. Mirrors
+/// `validate_input_interface_bindings`.
+fn validate_output_interface_bindings(output: &OutputConfig) -> Result<()> {
+    match output {
+        OutputConfig::Rtp(c) => {
+            if let Some(b) = &c.interface_binding {
+                validate_interface_binding(b, &format!("output '{}' (RTP)", c.id))?;
+            }
+            if let Some(red) = &c.redundancy {
+                if let Some(b) = &red.interface_binding {
+                    validate_interface_binding(b, &format!("output '{}' (RTP leg 2)", c.id))?;
+                }
+            }
+        }
+        OutputConfig::Udp(c) => {
+            if let Some(b) = &c.interface_binding {
+                validate_interface_binding(b, &format!("output '{}' (UDP)", c.id))?;
+            }
+        }
+        OutputConfig::Srt(c) => {
+            if let Some(b) = &c.interface_binding {
+                validate_interface_binding(b, &format!("output '{}' (SRT)", c.id))?;
+            }
+            if let Some(red) = &c.redundancy {
+                if let Some(b) = &red.interface_binding {
+                    validate_interface_binding(b, &format!("output '{}' (SRT leg 2)", c.id))?;
+                }
+            }
+            if let Some(bonding) = &c.bonding {
+                for (i, ep) in bonding.endpoints.iter().enumerate() {
+                    if let Some(b) = &ep.interface_binding {
+                        validate_interface_binding(
+                            b,
+                            &format!("output '{}' (SRT bonding endpoint {i})", c.id),
+                        )?;
+                    }
+                }
+            }
+        }
+        OutputConfig::Rist(c) => {
+            if let Some(b) = &c.interface_binding {
+                validate_interface_binding(b, &format!("output '{}' (RIST)", c.id))?;
+            }
+        }
+        OutputConfig::St2110_30(c) | OutputConfig::St2110_31(c) => {
+            if let Some(b) = &c.interface_binding {
+                validate_interface_binding(b, &format!("output '{}' (ST 2110 audio)", c.id))?;
+            }
+        }
+        OutputConfig::St2110_40(c) => {
+            if let Some(b) = &c.interface_binding {
+                validate_interface_binding(b, &format!("output '{}' (ST 2110-40)", c.id))?;
+            }
+        }
+        OutputConfig::St2110_20(c) => {
+            if let Some(b) = &c.interface_binding {
+                validate_interface_binding(b, &format!("output '{}' (ST 2110-20)", c.id))?;
+            }
+        }
+        OutputConfig::St2110_23(c) => {
+            if let Some(b) = &c.interface_binding {
+                validate_interface_binding(b, &format!("output '{}' (ST 2110-23)", c.id))?;
+            }
+        }
+        OutputConfig::RtpAudio(c) => {
+            if let Some(b) = &c.interface_binding {
+                validate_interface_binding(b, &format!("output '{}' (rtp_audio)", c.id))?;
+            }
+        }
+        // RTMP / HLS / CMAF / WebRTC / Display are out of Phase 1 scope.
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Validates the optional `group` tag on an output. Returns an error if the
@@ -4639,6 +4798,32 @@ fn validate_socket_addr(addr: &str, context: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate an `InterfaceBinding`.
+///
+/// `name` must satisfy the Linux `IFNAMSIZ` constraint (1..=15 bytes,
+/// alphanumeric + `._-`). `strict` is checked at bind time against the
+/// runtime `interface-binding-strict` capability — config-load only
+/// rejects names that can never be valid (length / character set).
+pub fn validate_interface_binding(
+    binding: &crate::config::models::InterfaceBinding,
+    context: &str,
+) -> Result<()> {
+    let name = binding.name.as_str();
+    if name.is_empty() || name.len() > 15 {
+        anyhow::bail!(
+            "{context}: interface_binding.name must be 1..=15 bytes (Linux IFNAMSIZ); got {} bytes",
+            name.len()
+        );
+    }
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-') {
+        anyhow::bail!(
+            "{context}: interface_binding.name '{name}' contains invalid characters \
+             (allowed: alphanumeric, '.', '_', '-')"
+        );
+    }
+    Ok(())
+}
+
 /// Validate the structured-JSON log shipper configuration.
 ///
 /// Per-target rules:
@@ -5477,6 +5662,7 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        interface_binding: None,
             }),
         });
         config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
@@ -5496,6 +5682,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                interface_binding: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -5569,6 +5756,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                interface_binding: None,
         }));
         assert!(validate_config(&config).is_err());
     }
@@ -5602,6 +5790,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                interface_binding: None,
         }));
         assert!(validate_config(&config).is_err());
     }
@@ -5638,6 +5827,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                interface_binding: None,
         }));
         let err = validate_config(&config).expect_err("rendezvous+FEC must be rejected");
         let msg = format!("{err:#}");
@@ -5669,6 +5859,7 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        interface_binding: None,
             }),
         });
         config.inputs.push(InputDefinition {
@@ -5690,6 +5881,7 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        interface_binding: None,
             }),
         });
         config.flows.push(FlowConfig {
@@ -5758,6 +5950,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                interface_binding: None,
         }));
         assert!(validate_config(&config).is_err());
     }
@@ -5792,6 +5985,7 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        interface_binding: None,
             }),
         });
         config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
@@ -5811,6 +6005,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                interface_binding: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -5854,6 +6049,7 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        interface_binding: None,
             }),
         });
         config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
@@ -5873,6 +6069,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                interface_binding: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -5912,6 +6109,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                interface_binding: None,
         }));
         assert!(validate_config(&config).is_err());
     }
@@ -5938,6 +6136,7 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        interface_binding: None,
             }),
         });
         config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
@@ -5957,6 +6156,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                interface_binding: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -6000,6 +6200,7 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        interface_binding: None,
             }),
         });
         config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
@@ -6019,6 +6220,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                interface_binding: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -6062,6 +6264,7 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        interface_binding: None,
             }),
         });
         config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
@@ -6081,6 +6284,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                interface_binding: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -6120,6 +6324,7 @@ mod tests {
             max_bitrate_mbps: None,
             audio_encode: None,
             transcode: None,
+            interface_binding: None,
         }
     }
 
@@ -6143,6 +6348,7 @@ mod tests {
             ssrc: None,
             transcode: None,
             audio_track_index: None,
+            interface_binding: None,
         }
     }
 
@@ -6208,6 +6414,7 @@ mod tests {
             addr: "10.0.0.5:5006".to_string(),
             interface_addr: None,
             source_addr: None,
+                interface_binding: None,
         });
         assert!(validate_st2110_audio_input(&cfg, St2110Profile::Pcm).is_err());
     }
@@ -6219,6 +6426,7 @@ mod tests {
             addr: "[::1]:5006".to_string(),
             interface_addr: None,
             source_addr: None,
+                interface_binding: None,
         });
         assert!(validate_st2110_audio_input(&cfg, St2110Profile::Pcm).is_err());
     }
@@ -6230,6 +6438,7 @@ mod tests {
             addr: "10.0.1.5:5006".to_string(),
             interface_addr: None,
             source_addr: None,
+                interface_binding: None,
         });
         validate_st2110_audio_input(&cfg, St2110Profile::Pcm).expect("distinct legs");
     }
@@ -6257,6 +6466,7 @@ mod tests {
             payload_type: 100,
             clock_domain: Some(0),
             allowed_sources: None,
+                interface_binding: None,
         };
         validate_st2110_ancillary_input(&anc).expect("valid -40 input");
     }
@@ -6271,6 +6481,7 @@ mod tests {
             payload_type: 50,
             clock_domain: Some(0),
             allowed_sources: None,
+                interface_binding: None,
         };
         assert!(validate_st2110_ancillary_input(&anc).is_err());
     }
@@ -7215,6 +7426,7 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        interface_binding: None,
             }),
         };
         // Add a UDP tunnel egress on the same port
@@ -7264,6 +7476,7 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        interface_binding: None,
             }),
         });
         config.inputs.push(InputDefinition {
@@ -7285,6 +7498,7 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        interface_binding: None,
             }),
         });
         assert!(validate_config(&config).is_ok());
@@ -7365,6 +7579,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                interface_binding: None,
         }));
         config.outputs.push(OutputConfig::Udp(UdpOutputConfig {
             id: "out-udp-b".into(),
@@ -7382,6 +7597,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                interface_binding: None,
         }));
         let err = validate_config(&config).unwrap_err().to_string();
         assert!(err.contains("Port conflict"), "got: {err}");

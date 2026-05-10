@@ -132,6 +132,37 @@ impl SrtSendSink {
 
 }
 
+/// Resolve `interface_binding` → `local_addr` for the primary leg, the
+/// 2022-7 redundancy leg, and every bonding endpoint. Mutates `config`
+/// in place. Phase 1: loose only — strict requests are returned as Err.
+fn apply_srt_output_interface_bindings(config: &mut SrtOutputConfig) -> anyhow::Result<()> {
+    if let Some(addr) = crate::util::socket::srt_local_addr_from_binding(
+        config.interface_binding.as_ref(),
+        config.local_addr.as_deref(),
+    )? {
+        config.local_addr = Some(addr);
+    }
+    if let Some(red) = config.redundancy.as_mut() {
+        if let Some(addr) = crate::util::socket::srt_local_addr_from_binding(
+            red.interface_binding.as_ref(),
+            red.local_addr.as_deref(),
+        )? {
+            red.local_addr = Some(addr);
+        }
+    }
+    if let Some(bonding) = config.bonding.as_mut() {
+        for ep in bonding.endpoints.iter_mut() {
+            if let Some(addr) = crate::util::socket::srt_local_addr_from_binding(
+                ep.interface_binding.as_ref(),
+                ep.local_addr.as_deref(),
+            )? {
+                ep.local_addr = Some(addr);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Spawn a task that subscribes to the broadcast channel and sends
 /// RTP packets over an SRT connection. If redundancy is configured,
 /// packets are duplicated to both SRT legs via SrtDuplicator.
@@ -149,6 +180,22 @@ pub fn spawn_srt_output(
     active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> JoinHandle<()> {
     let broadcast_tx = broadcast_tx.clone();
+    // Apply interface_binding (loose only on SRT in Phase 1) for the
+    // primary leg, the 2022-7 redundancy leg, and every bonding endpoint.
+    // Strict mode rejected at validation; spawn-time errors fire a
+    // `srt_strict_binding_unsupported` event and abort start.
+    let mut config = config;
+    if let Err(e) = apply_srt_output_interface_bindings(&mut config) {
+        tracing::error!("SRT output '{}': interface_binding failed: {e}", config.id);
+        event_sender.emit_output_with_details(
+            EventSeverity::Critical,
+            crate::manager::events::category::SRT,
+            format!("SRT output '{}': interface_binding rejected: {e}", config.id),
+            &config.id,
+            serde_json::json!({"error_code": "srt_strict_binding_unsupported"}),
+        );
+        return tokio::spawn(async {});
+    }
 
     // Register the static portion of this output's egress media summary so
     // the manager UI can render the pipeline / format badges from the very

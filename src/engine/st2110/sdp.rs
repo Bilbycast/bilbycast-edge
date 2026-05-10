@@ -792,6 +792,7 @@ mod tests {
             ssrc: None,
             transcode: None,
             audio_track_index: None,
+            interface_binding: None,
         }
     }
 
@@ -809,6 +810,7 @@ mod tests {
             clock_domain: Some(0),
             dscp: 46,
             ssrc: None,
+            interface_binding: None,
         }
     }
 

@@ -57,6 +57,49 @@ pub fn spawn_rist_output(
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> JoinHandle<()> {
+    // Apply interface_binding (loose only on RIST in Phase 1) for the
+    // primary leg + 2022-7 redundancy leg. Strict deferred (librist
+    // SRTO_BINDTODEVICE plumbing).
+    let mut config = config;
+    match crate::util::socket::srt_local_addr_from_binding(
+        config.interface_binding.as_ref(),
+        config.local_addr.as_deref(),
+    ) {
+        Ok(Some(addr)) => { config.local_addr = Some(addr); }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::error!("RIST output '{}': interface_binding failed: {e}", config.id);
+            event_sender.emit_output_with_details(
+                EventSeverity::Critical,
+                crate::manager::events::category::RIST,
+                format!("RIST output '{}': interface_binding rejected: {e}", config.id),
+                &config.id,
+                serde_json::json!({"error_code": "srt_strict_binding_unsupported"}),
+            );
+            return tokio::spawn(async {});
+        }
+    }
+    if let Some(red) = config.redundancy.as_mut() {
+        match crate::util::socket::srt_local_addr_from_binding(
+            red.interface_binding.as_ref(),
+            red.local_addr.as_deref(),
+        ) {
+            Ok(Some(addr)) => { red.local_addr = Some(addr); }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("RIST output '{}' leg2: interface_binding failed: {e}", config.id);
+                event_sender.emit_output_with_details(
+                    EventSeverity::Critical,
+                    crate::manager::events::category::RIST,
+                    format!("RIST output '{}' leg2: interface_binding rejected: {e}", config.id),
+                    &config.id,
+                    serde_json::json!({"error_code": "srt_strict_binding_unsupported"}),
+                );
+                return tokio::spawn(async {});
+            }
+        }
+    }
+
     let mut rx = broadcast_tx.subscribe();
 
     let mut egress_static = crate::stats::collector::EgressMediaSummaryStatic {

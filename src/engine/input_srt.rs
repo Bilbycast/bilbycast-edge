@@ -104,6 +104,94 @@ pub fn spawn_srt_input(
     force_idr: Arc<std::sync::atomic::AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // Apply interface_binding (loose only on SRT in Phase 1): when set
+        // and `local_addr` is unset, resolve the NIC name to its primary
+        // IPv4 and inject as the SRT source. Strict mode rejected at
+        // validation time — see `validate_interface_binding`.
+        let mut config = config;
+        match crate::util::socket::srt_local_addr_from_binding(
+            config.interface_binding.as_ref(),
+            config.local_addr.as_deref(),
+        ) {
+            Ok(Some(addr)) => {
+                tracing::info!(
+                    "SRT input '{}': interface_binding {} → local_addr {}",
+                    input_id,
+                    config.interface_binding.as_ref().map(|b| b.name.as_str()).unwrap_or("?"),
+                    addr,
+                );
+                config.local_addr = Some(addr);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("SRT input '{input_id}': interface_binding failed: {e}");
+                event_sender.emit_flow_with_details(
+                    EventSeverity::Critical,
+                    crate::manager::events::category::SRT,
+                    format!("SRT input '{input_id}': interface_binding rejected: {e}"),
+                    &flow_id,
+                    serde_json::json!({"error_code": "srt_strict_binding_unsupported"}),
+                );
+                return;
+            }
+        }
+        // Apply same to the redundancy leg (independent NIC pinning for
+        // 2022-7-style SRT dual-leg).
+        if let Some(red) = config.redundancy.as_mut() {
+            match crate::util::socket::srt_local_addr_from_binding(
+                red.interface_binding.as_ref(),
+                red.local_addr.as_deref(),
+            ) {
+                Ok(Some(addr)) => {
+                    tracing::info!(
+                        "SRT input '{}' leg2: interface_binding {} → local_addr {}",
+                        input_id,
+                        red.interface_binding.as_ref().map(|b| b.name.as_str()).unwrap_or("?"),
+                        addr,
+                    );
+                    red.local_addr = Some(addr);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!("SRT input '{input_id}' leg2: interface_binding failed: {e}");
+                    event_sender.emit_flow_with_details(
+                        EventSeverity::Critical,
+                        crate::manager::events::category::SRT,
+                        format!("SRT input '{input_id}' leg2: interface_binding rejected: {e}"),
+                        &flow_id,
+                        serde_json::json!({"error_code": "srt_strict_binding_unsupported"}),
+                    );
+                    return;
+                }
+            }
+        }
+        // Apply per-endpoint binding for SRT bonding members. Each member
+        // can pin a different NIC — the whole point of bonding for path
+        // diversity.
+        if let Some(bonding) = config.bonding.as_mut() {
+            for ep in bonding.endpoints.iter_mut() {
+                match crate::util::socket::srt_local_addr_from_binding(
+                    ep.interface_binding.as_ref(),
+                    ep.local_addr.as_deref(),
+                ) {
+                    Ok(Some(addr)) => {
+                        ep.local_addr = Some(addr);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::error!("SRT input '{input_id}' bonding endpoint: {e}");
+                        event_sender.emit_flow_with_details(
+                            EventSeverity::Critical,
+                            crate::manager::events::category::SRT,
+                            format!("SRT input '{input_id}' bonding endpoint rejected: {e}"),
+                            &flow_id,
+                            serde_json::json!({"error_code": "srt_strict_binding_unsupported"}),
+                        );
+                        return;
+                    }
+                }
+            }
+        }
         // Build ingress transcoder once per connection cycle so PMT discovery
         // state and codec buffers persist across reconnects within a single
         // configured flow.

@@ -155,7 +155,7 @@ async fn rtp_output_loop(
     active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> anyhow::Result<()> {
     let (socket, dest) =
-        create_udp_output(&config.dest_addr, config.bind_addr.as_deref(), config.interface_addr.as_deref(), config.dscp).await?;
+        create_udp_output(&config.dest_addr, config.bind_addr.as_deref(), config.interface_addr.as_deref(), config.dscp, config.interface_binding.as_ref()).await?;
 
     tracing::info!(
         "RTP output '{}' started -> {}",
@@ -700,6 +700,7 @@ async fn rtp_output_redundant_loop(
         config.bind_addr.as_deref(),
         config.interface_addr.as_deref(),
         config.dscp,
+        config.interface_binding.as_ref(),
     )
     .await?;
 
@@ -710,6 +711,7 @@ async fn rtp_output_redundant_loop(
         redundancy.bind_addr.as_deref(),
         redundancy.interface_addr.as_deref(),
         leg2_dscp,
+        redundancy.interface_binding.as_ref(),
     )
     .await?;
 

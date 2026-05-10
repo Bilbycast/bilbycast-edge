@@ -83,6 +83,7 @@ async fn udp_input_loop(
         &config.bind_addr,
         config.interface_addr.as_deref(),
         config.source_addr.as_deref(),
+        config.interface_binding.as_ref(),
     )
     .await
     {

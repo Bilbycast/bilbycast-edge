@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::net::UdpSocket;
+
+use crate::config::models::InterfaceBinding;
 
 /// Default receive socket buffer size (4 MB).
 ///
@@ -51,17 +54,33 @@ fn set_socket_buffers(socket: &Socket, recv_size: usize, send_size: usize) {
 /// If the bind address is a multicast group, automatically joins the group —
 /// any-source (ASM) when `source_addr` is `None`, or source-specific (SSM)
 /// when `Some`. `interface_addr` selects the local NIC for the join.
+///
+/// `interface_binding`, when set, takes precedence over `interface_addr`:
+/// the binding's NIC name is resolved to its primary IPv4 (loose), and if
+/// `binding.strict` is true, `setsockopt(SO_BINDTODEVICE, name)` is also
+/// applied so the kernel won't deliver packets that arrived on any other
+/// NIC. Strict requires `CAP_NET_RAW`; bind fails with `EPERM` otherwise.
 pub async fn bind_udp_input(
     bind_addr: &str,
     interface_addr: Option<&str>,
     source_addr: Option<&str>,
+    interface_binding: Option<&InterfaceBinding>,
 ) -> Result<UdpSocket> {
     let addr: SocketAddr = bind_addr
         .parse()
         .with_context(|| format!("Invalid bind address: {bind_addr}"))?;
 
+    // Resolve interface_binding once. When set, its loose IP wins over
+    // any operator-supplied interface_addr (we logged-warned at validation).
+    let resolved = resolve_interface_binding(interface_binding)?;
+    let effective_iface_addr_storage: Option<String> = resolved.as_ref()
+        .and_then(|r| r.ipv4_for_loose.map(|ip| ip.to_string()));
+    let effective_iface_addr: Option<&str> = effective_iface_addr_storage
+        .as_deref()
+        .or(interface_addr);
+
     if addr.ip().is_multicast() {
-        bind_multicast_input(addr, interface_addr, source_addr).await
+        bind_multicast_input(addr, effective_iface_addr, source_addr, resolved.as_ref()).await
     } else {
         let domain = if addr.is_ipv4() {
             Domain::IPV4
@@ -72,13 +91,20 @@ pub async fn bind_udp_input(
             .context("Failed to create UDP socket")?;
         socket.set_nonblocking(true)?;
         set_socket_buffers(&socket, DEFAULT_RECV_BUF_SIZE, DEFAULT_SEND_BUF_SIZE);
+        if let Some(r) = resolved.as_ref() {
+            if let Some(name) = r.name_for_strict.as_deref() {
+                apply_strict_binding(&socket, name)?;
+            }
+        }
         socket
             .bind(&SockAddr::from(addr))
             .map_err(|e| crate::util::port_error::annotate_bind_error(e, addr, "UDP/RTP input"))?;
         let std_socket: std::net::UdpSocket = socket.into();
         let sock = UdpSocket::from_std(std_socket)
             .context("Failed to convert socket2 socket to tokio UdpSocket")?;
-        tracing::info!("UDP input socket bound to {addr} (unicast)");
+        let strict_note = resolved.as_ref().and_then(|r| r.name_for_strict.as_deref())
+            .map(|n| format!(" (strict bind to {n})")).unwrap_or_default();
+        tracing::info!("UDP input socket bound to {addr} (unicast){strict_note}");
         Ok(sock)
     }
 }
@@ -90,6 +116,7 @@ async fn bind_multicast_input(
     mcast_addr: SocketAddr,
     interface_addr: Option<&str>,
     source_addr: Option<&str>,
+    binding: Option<&ResolvedBinding>,
 ) -> Result<UdpSocket> {
     let domain = match mcast_addr {
         SocketAddr::V4(_) => Domain::IPV4,
@@ -103,6 +130,11 @@ async fn bind_multicast_input(
     socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;
     set_socket_buffers(&socket, DEFAULT_RECV_BUF_SIZE, DEFAULT_SEND_BUF_SIZE);
+    if let Some(r) = binding {
+        if let Some(name) = r.name_for_strict.as_deref() {
+            apply_strict_binding(&socket, name)?;
+        }
+    }
 
     let bind_to: SocketAddr = match mcast_addr {
         SocketAddr::V4(v4) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), v4.port()),
@@ -171,17 +203,38 @@ async fn bind_multicast_input(
 
 /// Create a UDP socket for sending to a destination address.
 /// If `bind_addr` is provided, bind to that address. Otherwise bind to ephemeral port.
+///
+/// `interface_binding`, when set, takes precedence over `interface_addr`
+/// (loose source-IP) and `bind_addr` (when bind_addr's IP is unspecified):
+/// the binding's NIC name resolves to its primary IPv4 and is used as
+/// the source IP. If `binding.strict` is true, `setsockopt(SO_BINDTODEVICE,
+/// name)` also pins the egress NIC at the kernel level. Strict requires
+/// `CAP_NET_RAW`.
 pub async fn create_udp_output(
     dest_addr: &str,
     bind_addr: Option<&str>,
     interface_addr: Option<&str>,
     dscp: u8,
+    interface_binding: Option<&InterfaceBinding>,
 ) -> Result<(UdpSocket, SocketAddr)> {
     let dest: SocketAddr = dest_addr
         .parse()
         .with_context(|| format!("Invalid destination address: {dest_addr}"))?;
 
-    let bind_to: SocketAddr = match bind_addr {
+    let resolved = resolve_interface_binding(interface_binding)?;
+    // For outputs: if bind_addr is unset (ephemeral port) and the
+    // binding resolves to an IPv4 source, override the bind so the
+    // kernel uses that source. Operator-supplied bind_addr always
+    // wins over the binding-derived source — they explicitly chose
+    // a port.
+    let binding_bind_storage: Option<String> = resolved.as_ref()
+        .and_then(|r| r.ipv4_for_loose)
+        .filter(|_| dest.is_ipv4())
+        .map(|ip| format!("{ip}:0"));
+    let effective_bind_addr: Option<&str> = bind_addr
+        .or(binding_bind_storage.as_deref());
+
+    let bind_to: SocketAddr = match effective_bind_addr {
         Some(addr) => addr
             .parse()
             .with_context(|| format!("Invalid bind address: {addr}"))?,
@@ -205,6 +258,11 @@ pub async fn create_udp_output(
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
     set_socket_buffers(&socket, DEFAULT_RECV_BUF_SIZE, DEFAULT_SEND_BUF_SIZE);
+    if let Some(r) = resolved.as_ref() {
+        if let Some(name) = r.name_for_strict.as_deref() {
+            apply_strict_binding(&socket, name)?;
+        }
+    }
 
     socket
         .bind(&SockAddr::from(bind_to))
@@ -229,18 +287,24 @@ pub async fn create_udp_output(
         tracing::info!("UDP output: DSCP set to {dscp} (TOS/TCLASS byte {tos:#04x})");
     }
 
-    // If destination is multicast, set the outgoing interface and TTL/hop limit
+    // If destination is multicast, set the outgoing interface and TTL/hop limit.
+    // Binding-derived loose interface IP wins over caller's interface_addr.
+    let effective_iface_storage: Option<String> = resolved.as_ref()
+        .and_then(|r| r.ipv4_for_loose.map(|ip| ip.to_string()));
+    let effective_iface_addr: Option<&str> = effective_iface_storage
+        .as_deref()
+        .or(interface_addr);
     if dest.ip().is_multicast() {
         match dest.ip() {
             IpAddr::V4(_) => {
-                let iface = parse_interface_v4(interface_addr)?;
+                let iface = parse_interface_v4(effective_iface_addr)?;
                 socket
                     .set_multicast_if_v4(&iface)
                     .context("Failed to set multicast interface")?;
                 socket.set_multicast_ttl_v4(16)?;
             }
             IpAddr::V6(_) => {
-                let iface_index = parse_interface_v6_index(interface_addr)?;
+                let iface_index = parse_interface_v6_index(effective_iface_addr)?;
                 socket
                     .set_multicast_if_v6(iface_index)
                     .context("Failed to set IPv6 multicast interface")?;
@@ -254,7 +318,9 @@ pub async fn create_udp_output(
         .context("Failed to convert output socket to tokio UdpSocket")?;
 
     let local_addr = tokio_socket.local_addr()?;
-    tracing::info!("UDP output socket bound to {local_addr}, destination {dest}");
+    let strict_note = resolved.as_ref().and_then(|r| r.name_for_strict.as_deref())
+        .map(|n| format!(" (strict bind to {n})")).unwrap_or_default();
+    tracing::info!("UDP output socket bound to {local_addr}, destination {dest}{strict_note}");
 
     Ok((tokio_socket, dest))
 }
@@ -381,6 +447,169 @@ fn join_ssm_v6(
     anyhow::bail!("IPv6 source-specific multicast (SSM) is not supported on this OS");
 }
 
+// ── Per-NIC binding (loose source-IP + strict SO_BINDTODEVICE) ──────────
+
+/// Result of resolving an `InterfaceBinding` against the live host NIC list.
+///
+/// `ipv4_for_loose` carries the interface's primary IPv4 address — used
+/// as the socket source IP whether or not strict mode is enabled (it's
+/// the loose-binding mechanism). `name_for_strict` is `Some` only when
+/// `binding.strict` is true and the host supports SO_BINDTODEVICE; the
+/// caller passes it to `apply_strict_binding` after socket creation but
+/// before `bind()`.
+#[derive(Debug, Clone)]
+pub struct ResolvedBinding {
+    pub ipv4_for_loose: Option<Ipv4Addr>,
+    pub name_for_strict: Option<String>,
+}
+
+/// Resolve an `InterfaceBinding` against the live host NIC list.
+///
+/// Returns `Ok(None)` when the binding is `None` (caller wants the
+/// kernel route table to pick the NIC). Returns `Err` when the binding
+/// names an interface not present on the host — this is a hard failure
+/// at bind time so the operator sees the misconfig immediately. The
+/// validator catches missing interfaces at config-load time too, but
+/// hot-pluggable NICs (USB-eth, container veth) can disappear between
+/// load and bind, hence the runtime check.
+///
+/// IPv6-only interfaces are not currently supported for the loose
+/// source-IP path; the validator rejects those at config time.
+pub fn resolve_interface_binding(
+    binding: Option<&InterfaceBinding>,
+) -> Result<Option<ResolvedBinding>> {
+    let Some(b) = binding else { return Ok(None) };
+
+    let ifaces = crate::util::network_interfaces::enumerate();
+    let info = ifaces
+        .iter()
+        .find(|i| i.name == b.name)
+        .ok_or_else(|| {
+            let available: Vec<&str> = ifaces.iter()
+                .filter(|i| !i.is_loopback)
+                .map(|i| i.name.as_str())
+                .collect();
+            anyhow::anyhow!(
+                "interface_binding: NIC '{}' not found on host. Available: {}",
+                b.name,
+                available.join(", "),
+            )
+        })?;
+
+    // First non-link-local IPv4 wins. Falls through to None when the
+    // interface is IPv6-only, which currently means the binding can't
+    // pin the source — caller should fall back to legacy fields. The
+    // validator warns on IPv6-only NICs at config time.
+    let ipv4_for_loose = info.ipv4.iter()
+        .filter_map(|s| s.parse::<Ipv4Addr>().ok())
+        .find(|ip| !ip.is_link_local() && !ip.is_unspecified());
+
+    let name_for_strict = if b.strict {
+        if !probe_strict_binding_supported() {
+            anyhow::bail!(
+                "interface_binding strict mode requires CAP_NET_RAW. \
+                 Install bilbycast-edge.service.d/strict-binding.conf and \
+                 restart the edge to grant the capability."
+            );
+        }
+        Some(b.name.clone())
+    } else {
+        None
+    };
+
+    Ok(Some(ResolvedBinding { ipv4_for_loose, name_for_strict }))
+}
+
+/// Apply `setsockopt(SO_BINDTODEVICE, name)` on a Linux socket. Must be
+/// called BEFORE `bind()` — Linux validates against the device's address
+/// table at bind time. Returns `EPERM` when the process lacks
+/// `CAP_NET_RAW`; the operator must install the systemd drop-in
+/// `packaging/strict-binding.conf` to grant it.
+#[cfg(target_os = "linux")]
+pub fn apply_strict_binding(socket: &Socket, name: &str) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let cname = std::ffi::CString::new(name)
+        .with_context(|| format!("invalid interface name '{name}' (NUL byte)"))?;
+    let bytes = cname.as_bytes_with_nul();
+    let ret = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            bytes.as_ptr() as *const libc::c_void,
+            bytes.len() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(anyhow::Error::from(err))
+            .with_context(|| format!("setsockopt SO_BINDTODEVICE({name}) failed (need CAP_NET_RAW)"));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn apply_strict_binding(_socket: &Socket, _name: &str) -> Result<()> {
+    anyhow::bail!("interface_binding strict mode is only supported on Linux");
+}
+
+/// SRT/RIST loose binding adapter.
+///
+/// When `interface_binding` is set on an SRT/RIST surface, we resolve the
+/// NIC name to its primary IPv4 and pass it as `local_addr` *iff* the
+/// operator hasn't already set `local_addr`. Strict mode is rejected
+/// here — Phase 2 will plumb `SRTO_BINDTODEVICE` through
+/// `bilbycast-libsrt-rs` and a librist setsockopt path.
+///
+/// Returns `Ok(None)` to mean "no change" (binding unset, or operator's
+/// local_addr already wins). Returns `Ok(Some(addr_str))` to inject the
+/// resolved source. Returns `Err` on strict-rejected or unknown NIC.
+pub fn srt_local_addr_from_binding(
+    binding: Option<&InterfaceBinding>,
+    existing_local_addr: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(b) = binding else { return Ok(None) };
+    if b.strict {
+        anyhow::bail!(
+            "interface_binding strict mode is not supported on SRT/RIST in Phase 1 \
+             (libsrt/librist SRTO_BINDTODEVICE plumbing deferred). Use strict: false \
+             with the desired NIC name; the source IP is still pinned to that NIC's primary IPv4."
+        );
+    }
+    if existing_local_addr.is_some() {
+        return Ok(None);
+    }
+    let Some(resolved) = resolve_interface_binding(Some(b))? else { return Ok(None) };
+    Ok(resolved.ipv4_for_loose.map(|ip| format!("{ip}:0")))
+}
+
+/// Memoised one-shot probe: can this process call
+/// `setsockopt(SO_BINDTODEVICE)` on a UDP socket without `EPERM`? The
+/// answer never changes for the lifetime of the process (capabilities
+/// are immutable post-exec), so we cache it in a `OnceLock`.
+///
+/// The probe opens an ephemeral UDP socket bound to nothing, attempts
+/// the setsockopt with the loopback name, then drops the socket. On
+/// non-Linux returns `false` — `apply_strict_binding` is the canonical
+/// rejection path there.
+pub fn probe_strict_binding_supported() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        {
+            let socket = match Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            apply_strict_binding(&socket, "lo").is_ok()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,6 +630,42 @@ mod tests {
         assert_eq!(parse_source_v6("2001:db8::5").unwrap(), v);
     }
 
+    #[test]
+    fn resolve_interface_binding_none_returns_none() {
+        let r = resolve_interface_binding(None).unwrap();
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn resolve_interface_binding_unknown_nic_errors_with_available_list() {
+        let b = InterfaceBinding { name: "definitely-not-a-nic".into(), strict: false };
+        let err = resolve_interface_binding(Some(&b)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("definitely-not-a-nic"), "msg='{msg}'");
+        // The error message is the only place we tell the operator which
+        // names ARE valid — this is the contract the manager UI relies on
+        // when surfacing the failure.
+        assert!(msg.contains("Available:"), "msg='{msg}'");
+    }
+
+    #[test]
+    fn resolve_loopback_loose_picks_127_0_0_1() {
+        let b = InterfaceBinding { name: "lo".into(), strict: false };
+        let r = resolve_interface_binding(Some(&b)).unwrap().unwrap();
+        // Loopback is special-cased to 127.0.0.1 here; if this ever fails
+        // the loose-binding contract for the canonical NIC is broken.
+        assert_eq!(r.ipv4_for_loose, Some(Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(r.name_for_strict.is_none(), "non-strict must not request SO_BINDTODEVICE");
+    }
+
+    #[test]
+    fn probe_strict_binding_idempotent() {
+        // Memoised — second call must return the same value as the first.
+        let a = probe_strict_binding_supported();
+        let b = probe_strict_binding_supported();
+        assert_eq!(a, b);
+    }
+
     /// SSM IPv4 join via socket2 — uses the loopback group 232.0.0.1 and
     /// source 127.0.0.1 against an unbound socket (we just need setsockopt
     /// to succeed; no actual traffic flow). Skipped if the OS rejects (e.g.
@@ -408,7 +673,7 @@ mod tests {
     #[tokio::test]
     async fn ssm_v4_join_setsockopt_succeeds_on_loopback() {
         let bind = "232.0.0.1:0";
-        let res = bind_udp_input(bind, Some("127.0.0.1"), Some("127.0.0.2")).await;
+        let res = bind_udp_input(bind, Some("127.0.0.1"), Some("127.0.0.2"), None).await;
         match res {
             Ok(_) => {}
             Err(e) => {

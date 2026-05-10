@@ -259,6 +259,7 @@ mod tests {
                     audio_encode: None,
                     transcode: None,
                     video_encode: None,
+                                interface_binding: None,
                 }),
             }],
             outputs: Vec::new(),

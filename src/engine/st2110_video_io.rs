@@ -283,6 +283,7 @@ pub async fn run_st2110_20_input(
         config.interface_addr.as_deref(),
         config.source_addr.as_deref(),
         config.redundancy.as_ref(),
+        config.interface_binding.as_ref(),
     )
     .await?;
 
@@ -659,6 +660,7 @@ pub async fn run_st2110_20_output(
         config.bind_addr.as_deref(),
         config.interface_addr.as_deref(),
         config.dscp,
+        config.interface_binding.as_ref(),
     )
     .await?;
     let blue_sock = if let Some(r) = &config.redundancy {
@@ -667,6 +669,7 @@ pub async fn run_st2110_20_output(
             config.bind_addr.as_deref(),
             r.interface_addr.as_deref(),
             config.dscp,
+            config.interface_binding.as_ref(),
         )
         .await?;
         Some(s)
@@ -1019,12 +1022,14 @@ pub async fn run_st2110_23_input(
 
     // Spawn one receiver task per sub-stream.
     let mut handles = Vec::new();
+    let parent_binding = config.interface_binding.clone();
     for (idx, sub) in config.sub_streams.into_iter().enumerate() {
         let pair = RedBluePair::bind_input(
             &sub.bind_addr,
             sub.interface_addr.as_deref(),
             sub.source_addr.as_deref(),
             sub.redundancy.as_ref(),
+            parent_binding.as_ref(),
         )
         .await?;
         let sub_frame_tx = sub_frame_tx.clone();
@@ -1125,6 +1130,7 @@ pub async fn run_st2110_23_output(
             sub.bind_addr.as_deref(),
             sub.interface_addr.as_deref(),
             config.dscp,
+            config.interface_binding.as_ref(),
         )
         .await?;
         let red_std = red_sock
@@ -1147,6 +1153,7 @@ pub async fn run_st2110_23_output(
                     sub.bind_addr.as_deref(),
                     r.interface_addr.as_deref(),
                     config.dscp,
+                    config.interface_binding.as_ref(),
                 )
                 .await?;
                 let blue_std = blue_sock.into_std().map_err(|e| {

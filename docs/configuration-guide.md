@@ -642,6 +642,77 @@ Optional per-flow bandwidth monitoring for SMPTE RP 2129 trust boundary enforcem
 
 ---
 
+## Per-NIC Interface Binding
+
+Every UDP-based input and output (UDP, RTP, SRT, RIST, ST 2110-20/-23/-30/-31/-40, RTP-audio) — plus the 2022-7 redundancy legs and SRT bonding endpoints — accepts an optional `interface_binding` block that pins the underlying socket to a specific physical NIC.
+
+```json
+"interface_binding": { "name": "eno4", "strict": false }
+```
+
+Two release tiers, picked by `strict`:
+
+| Tier | What it does | When to use | Cap requirement |
+|---|---|---|---|
+| **Loose** (`strict: false`, default) | Resolves `name` to the NIC's primary IPv4 and uses it as the socket source IP — same effect as setting `interface_addr` today, but operator-friendly NIC-name input. The kernel still consults the routing table; if the table says the destination should leave a different NIC, it does. | Most operators. Multi-homed hosts where a stable source IP per stream is enough. | None. |
+| **Strict** (`strict: true`) | Additionally calls `setsockopt(SO_BINDTODEVICE, name)`. The kernel refuses to send the packet on any other NIC, regardless of routing-table preference. Inputs only deliver packets that arrived on the named NIC. | Genuine link-level isolation. 2022-7 over diverse paths. Multi-tenant NIC isolation. Compliance ("this stream MUST egress on the broadcast LAN"). | `CAP_NET_RAW` — opt in via `packaging/strict-binding.conf`. |
+
+`name` must match an interface on the host (validated against `HealthPayload.network_interfaces`; manager UI populates the picker dropdown from the same list). The Linux `IFNAMSIZ` constraint applies: 1–15 bytes, alphanumeric + `._-`.
+
+Coexists with the legacy `interface_addr` / `bind_addr` / `local_addr` fields. Precedence: `interface_binding` wins when both are set; the legacy fields stay for backward compatibility (Validation logs a Warning event `interface_binding_legacy_addr_ignored` when both are set on the same struct).
+
+**Capability advertisement:**
+
+- `interface-binding` — present from this release on. Signals the new field is honoured.
+- `interface-binding-strict` — present only when the startup `SO_BINDTODEVICE` probe succeeds. Edges without `CAP_NET_RAW` reject `strict: true` at bind time with a Critical `interface_binding_strict_denied` event. Manager UI hides the strict toggle until the capability appears.
+
+**Per-leg + per-endpoint:**
+
+```json
+{
+  "type": "rtp",
+  "bind_addr": "239.1.1.1:5000",
+  "interface_binding": { "name": "eno3" },           // Red leg → NIC 1
+  "redundancy": {
+    "bind_addr": "239.2.2.2:5000",
+    "interface_binding": { "name": "eno4" }          // Blue leg → NIC 2
+  }
+}
+```
+
+Same shape on `RtpOutputConfig.redundancy`, `SrtRedundancyConfig`, `RistInputRedundancyConfig`, `RistOutputRedundancyConfig`, and per-`SrtBondingEndpoint`. SRT bonding members can pin different NICs:
+
+```json
+"bonding": {
+  "mode": "broadcast",
+  "endpoints": [
+    { "addr": "203.0.113.10:9000", "interface_binding": { "name": "eno3" } },
+    { "addr": "203.0.113.20:9000", "interface_binding": { "name": "eno4" } }
+  ]
+}
+```
+
+**Phase 1 scope:** UDP-based protocols only. SRT/RIST/SRT-bonding currently support **loose** mode only (the binding's NIC IP is injected as `local_addr` when unset); strict mode on those surfaces is rejected at validation with `srt_strict_binding_unsupported` until `bilbycast-libsrt-rs` and `librist` plumb `SRTO_BINDTODEVICE`. UDP/RTP/ST 2110 outputs and inputs honour both tiers today.
+
+**Granting strict mode:**
+
+```bash
+sudo install -m 0644 /opt/bilbycast/edge/current/packaging/strict-binding.conf \
+    /etc/systemd/system/bilbycast-edge.service.d/strict-binding.conf
+sudo systemctl daemon-reload && sudo systemctl restart bilbycast-edge
+```
+
+`CAP_NET_RAW` also enables raw socket creation and packet forging — see [`docs/security.md`](security.md) for the threat-model rationale. Plants that don't need kernel-enforced NIC pinning should leave the default zero-cap unit alone.
+
+**Failure-mode events:**
+
+| `error_code` | Severity | Trigger |
+|---|---|---|
+| `interface_not_found` | Critical | `name` doesn't match any enumerated NIC at bind time. |
+| `interface_binding_strict_denied` | Critical | `setsockopt(SO_BINDTODEVICE)` returned `EPERM` (cap not granted). |
+| `interface_binding_legacy_addr_ignored` | Warning | Both `interface_binding` and a legacy `interface_addr` set on the same struct. |
+| `srt_strict_binding_unsupported` | Critical | `strict: true` on an SRT/RIST surface (Phase 1 limitation). |
+
 ## Input Types
 
 Each entry in the top-level `inputs` array is an `InputDefinition` with `id`, `name`, and the protocol-specific fields flattened in (enum-tagged by `type`). Inputs are independent top-level entities that exist whether or not they are assigned to a flow. They are managed via REST at `/api/v1/inputs` (CRUD) and via manager WebSocket commands.

@@ -303,6 +303,21 @@ For redundant RTP inputs, each leg emits its own bind event with a `leg` field i
 
 ---
 
+### Per-NIC Interface Binding
+
+Per-input/per-output `interface_binding` field (loose source-IP bind by default; strict `SO_BINDTODEVICE` when `strict: true`). Surface details + capability gating: [`docs/configuration-guide.md`](configuration-guide.md#per-nic-interface-binding).
+
+| Severity | Error code | Trigger | Details |
+|----------|-----------|---------|---------|
+| critical | `interface_not_found` | `name` doesn't match any interface enumerated on the host at bind time. The error message lists available NIC names. | `{ name, available }` |
+| critical | `interface_binding_strict_denied` | `setsockopt(SO_BINDTODEVICE)` returned `EPERM`. Edge process lacks `CAP_NET_RAW` — install `packaging/strict-binding.conf` and restart. | `{ name }` |
+| warning | `interface_binding_legacy_addr_ignored` | Both `interface_binding` and a legacy `interface_addr` are set on the same struct. New field wins; legacy is ignored. Operator should pick one and remove the other. | `{ field }` |
+| critical | `srt_strict_binding_unsupported` | `strict: true` requested on an SRT/RIST surface or SRT bonding endpoint. Phase 1 limitation — pending `SRTO_BINDTODEVICE` plumbing in `bilbycast-libsrt-rs` / librist. Use `strict: false` (loose source-IP binding) or pin via UDP-based protocols. | `{ where }` |
+
+**Source**: `src/util/socket.rs` (`resolve_interface_binding`, `apply_strict_binding`, `srt_local_addr_from_binding`), `src/config/validation.rs` (`validate_interface_binding`).
+
+---
+
 ### Media Player Input (`flow`)
 
 The media-player input emits its lifecycle events on the shared `flow`

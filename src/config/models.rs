@@ -1024,6 +1024,47 @@ fn default_resource_grace() -> u32 {
     10
 }
 
+/// Per-socket physical interface binding.
+///
+/// Pins a UDP-socket-owning input or output to a specific NIC by name.
+/// Two release tiers, picked by `strict`:
+///
+/// * **Loose** (`strict: false`): the edge resolves `name` to the
+///   interface's first non-link-local IPv4 address and uses it as the
+///   socket's source address (same effect as setting `interface_addr`
+///   today). The kernel still consults the routing table — if the table
+///   says the destination should leave a different NIC, it does. This
+///   is advisory binding, no extra permissions required.
+/// * **Strict** (`strict: true`): the edge additionally calls
+///   `setsockopt(SO_BINDTODEVICE, name)` on the socket fd. The kernel
+///   then refuses to send the packet on any other interface, regardless
+///   of routing-table preference. Requires `CAP_NET_RAW` on the edge
+///   process — operators opt in via the systemd drop-in
+///   `packaging/strict-binding.conf`. Edges advertise the
+///   `"interface-binding-strict"` capability only when a startup probe
+///   confirms `setsockopt(SO_BINDTODEVICE)` succeeds.
+///
+/// `name` must match an interface enumerated on the host
+/// (`HealthPayload.network_interfaces`). The same struct rides on every
+/// UDP-based input + output config plus the redundancy / bonding
+/// sub-blocks so 2022-7 dual-leg can pin Red and Blue to different NICs
+/// and SRT bonding can pin each member to its own physical link.
+///
+/// Coexists with the legacy `interface_addr` / `bind_addr` /
+/// `local_addr` fields — `interface_binding` wins when set; the legacy
+/// fields stay for backward compatibility.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InterfaceBinding {
+    /// NIC name as enumerated by the kernel, e.g. `"eno4"`. Must satisfy
+    /// the Linux `IFNAMSIZ` constraint (≤ 15 bytes, alphanumeric + `._-`).
+    pub name: String,
+    /// When true, also call `setsockopt(SO_BINDTODEVICE, name)` so the
+    /// kernel cannot route the socket to any other NIC. Requires
+    /// `CAP_NET_RAW`. Default false (loose source-address binding only).
+    #[serde(default)]
+    pub strict: bool,
+}
+
 /// Input source configuration — RTP, UDP, SRT, RTMP, RTSP, or WebRTC
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -1474,6 +1515,12 @@ pub struct RtpInputConfig {
     /// fails early if the backend is not compiled in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+    /// Pin this leg to a physical NIC (loose source-IP bind by default,
+    /// strict `SO_BINDTODEVICE` when `strict: true`). See
+    /// [`InterfaceBinding`] for semantics. Wins over `interface_addr`
+    /// when both are set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// Raw UDP input — receives datagrams without requiring RTP headers.
@@ -1504,6 +1551,9 @@ pub struct UdpInputConfig {
     /// Optional ingress video re-encode. See [`RtpInputConfig::video_encode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+    /// Pin this input to a physical NIC. See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1653,6 +1703,13 @@ pub struct SrtInputConfig {
     /// Optional ingress video re-encode. See [`RtpInputConfig::video_encode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+    /// Pin this SRT input to a physical NIC. Phase 1: loose only — strict
+    /// mode is rejected (libsrt SRTO_BINDTODEVICE plumbing deferred). When
+    /// set, the resolved interface IP is used as `local_addr` if
+    /// `local_addr` is unset; otherwise the operator's `local_addr` wins.
+    /// See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// RTMP input configuration — runs an RTMP server that accepts publish connections.
@@ -2138,6 +2195,9 @@ pub struct RtpOutputConfig {
     /// `video-encoder-qsv`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+    /// Pin this output to a physical NIC. See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// Configurable output delay for stream synchronization.
@@ -2257,6 +2317,9 @@ pub struct UdpOutputConfig {
     /// for the semantics. Incompatible with `transport_mode = "audio_302m"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+    /// Pin this UDP output to a physical NIC. See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2425,6 +2488,12 @@ pub struct SrtOutputConfig {
     /// for the semantics. Incompatible with `transport_mode = "audio_302m"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+    /// Pin this SRT output to a physical NIC. Phase 1: loose only —
+    /// strict mode is rejected (libsrt SRTO_BINDTODEVICE plumbing
+    /// deferred). When set, the resolved interface IP is used as
+    /// `local_addr` if `local_addr` is unset. See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// SRT connection mode, determining which side initiates the handshake.
@@ -2548,6 +2617,11 @@ pub struct SrtRedundancyConfig {
     /// IP Time To Live for leg 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip_ttl: Option<i32>,
+    /// Pin SRT leg 2 to a physical NIC (Phase 1: loose only). Lets
+    /// 2022-7-style SRT dual-leg pin Red and Blue to different NICs.
+    /// See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// Native libsrt SRT bonding mode (socket-group type).
@@ -2591,6 +2665,11 @@ pub struct SrtBondingEndpoint {
     /// deterministically).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u16>,
+    /// Pin this bonding endpoint to a physical NIC (Phase 1: loose only).
+    /// When set, the resolved interface IP is used as `local_addr` if
+    /// `local_addr` is unset. See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// Native libsrt SRT bonding (socket group) config.
@@ -2638,6 +2717,10 @@ pub struct RtpRedundancyConfig {
     /// typical: 30–80 ms terrestrial WAN, 200–500 ms satellite.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_differential_ms: Option<u32>,
+    /// Pin RTP leg 2 to a physical NIC. Lets 2022-7 hitless plants pin
+    /// Red and Blue to different NICs. See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// SMPTE 2022-7 redundancy config for an RTP output (leg 2).
@@ -2655,6 +2738,9 @@ pub struct RtpOutputRedundancyConfig {
     /// DSCP value for leg 2 (optional, defaults to parent's dscp)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dscp: Option<u8>,
+    /// Pin RTP output leg 2 to a physical NIC. See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// RIST Simple Profile (TR-06-1:2020) input. Binds a dual-port UDP channel
@@ -2697,6 +2783,10 @@ pub struct RistInputConfig {
     /// Optional ingress video re-encode. See [`RtpInputConfig::video_encode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+    /// Pin this RIST input to a physical NIC (Phase 1: loose only —
+    /// strict deferred pending librist plumbing). See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// RIST Simple Profile (TR-06-1:2020) output. Binds a local dual-port UDP
@@ -2762,6 +2852,10 @@ pub struct RistOutputConfig {
     /// Optional video encode block (x264 / x265 / NVENC, feature-gated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+    /// Pin this RIST output to a physical NIC (Phase 1: loose only —
+    /// strict deferred pending librist plumbing). See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// SMPTE 2022-7 redundancy config for a RIST input (leg 2).
@@ -2774,6 +2868,10 @@ pub struct RistInputRedundancyConfig {
     /// for leg 2. See [`RistInputConfig::external_address`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_address: Option<String>,
+    /// Pin RIST leg 2 to a physical NIC (Phase 1: loose only).
+    /// See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// SMPTE 2022-7 redundancy config for a RIST output (leg 2).
@@ -2784,6 +2882,10 @@ pub struct RistOutputRedundancyConfig {
     /// Local bind address for leg 2 (optional). When set, port must be even.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_addr: Option<String>,
+    /// Pin RIST output leg 2 to a physical NIC (Phase 1: loose only).
+    /// See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 // ── Bonded input / output ────────────────────────────────────────────────────
@@ -3618,6 +3720,11 @@ pub struct RedBlueBindConfig {
     /// `RtpInputConfig::source_addr`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_addr: Option<String>,
+    /// Pin this leg to a physical NIC. Independent of the parent's
+    /// binding so 2022-7 plants can put Red and Blue on different
+    /// physical links. See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// SMPTE ST 2110-30 / -31 audio input configuration.
@@ -3684,6 +3791,9 @@ pub struct St2110AudioInputConfig {
     /// rules. **Rejected on ST 2110-31 (AES3)** — see `transcode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_encode: Option<AudioEncodeConfig>,
+    /// Pin this ST 2110 audio input to a physical NIC. See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// SMPTE ST 2110-30 / -31 audio output configuration.
@@ -3757,6 +3867,9 @@ pub struct St2110AudioOutputConfig {
     /// ST 2110-31, rtp_audio).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_track_index: Option<u8>,
+    /// Pin this ST 2110 audio output to a physical NIC. See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// Generic RFC 3551 PCM-over-RTP audio input — no ST 2110 baggage.
@@ -3807,6 +3920,9 @@ pub struct RtpAudioInputConfig {
     /// Optional ingress audio re-encode. See [`St2110AudioInputConfig::audio_encode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_encode: Option<AudioEncodeConfig>,
+    /// Pin this RTP audio input to a physical NIC. See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// Generic RFC 3551 PCM-over-RTP audio output. See [`RtpAudioInputConfig`]
@@ -3855,6 +3971,9 @@ pub struct RtpAudioOutputConfig {
     /// Chunks 5–7.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_mode: Option<String>,
+    /// Pin this RTP audio output to a physical NIC. See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// SMPTE ST 2110-40 ancillary data input configuration.
@@ -3884,6 +4003,9 @@ pub struct St2110AncillaryInputConfig {
     /// Source IP allow-list (RP 2129 C5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_sources: Option<Vec<String>>,
+    /// Pin this ST 2110-40 ancillary input to a physical NIC. See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// SMPTE ST 2110-40 ancillary data output configuration.
@@ -3924,6 +4046,9 @@ pub struct St2110AncillaryOutputConfig {
     /// Optional fixed RTP SSRC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssrc: Option<u32>,
+    /// Pin this ST 2110-40 ancillary output to a physical NIC. See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 // ── ST 2110-20 / -23 video configuration ────────────────────────────────
@@ -4004,6 +4129,9 @@ pub struct St2110VideoInputConfig {
     /// H.264/HEVC bitstream is muxed into MPEG-TS and published on the
     /// broadcast channel.
     pub video_encode: VideoEncodeConfig,
+    /// Pin this ST 2110-20 video input to a physical NIC. See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// ST 2110-20 (uncompressed video) output configuration.
@@ -4047,6 +4175,9 @@ pub struct St2110VideoOutputConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[deprecated(note = "Pacing is now automatic — see docs/wire-pacing.md")]
     pub wire_pacing: Option<WirePacingConfig>,
+    /// Pin this ST 2110-20 video output to a physical NIC. See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// Per-sub-stream bind (ST 2110-23 input). Each sub-stream is a valid -20
@@ -4095,6 +4226,12 @@ pub struct St2110_23InputConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock_domain: Option<u8>,
     pub video_encode: VideoEncodeConfig,
+    /// Pin every ST 2110-23 sub-stream input to a physical NIC. Each
+    /// sub-stream's `St2110_23SubStreamBind` already has its own
+    /// `interface_addr`; this is the parent fallback when the per-bind
+    /// override isn't set. See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 /// ST 2110-23 output: one essence split into N sub-stream -20 senders.
@@ -4125,6 +4262,11 @@ pub struct St2110_23OutputConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[deprecated(note = "Pacing is now automatic — see docs/wire-pacing.md")]
     pub wire_pacing: Option<WirePacingConfig>,
+    /// Pin every ST 2110-23 sub-stream output to a physical NIC. Each
+    /// sub-stream's `St2110_23SubStreamDest` already has its own
+    /// `interface_addr`; this is the parent fallback. See [`InterfaceBinding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_binding: Option<InterfaceBinding>,
 }
 
 fn default_st2110_video_pt() -> u8 {
@@ -4648,6 +4790,7 @@ mod tests {
                     audio_encode: None,
                     transcode: None,
                     video_encode: None,
+                                interface_binding: None,
                 }),
             }],
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
@@ -4667,6 +4810,7 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        interface_binding: None,
             })],
             flows: vec![FlowConfig {
                 id: "test-flow".to_string(),
@@ -4712,6 +4856,7 @@ mod tests {
                     audio_encode: None,
                     transcode: None,
                     video_encode: None,
+                                interface_binding: None,
                 }),
             }],
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
@@ -4731,6 +4876,7 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        interface_binding: None,
             })],
             flows: vec![FlowConfig {
                 id: "flow-1".to_string(),

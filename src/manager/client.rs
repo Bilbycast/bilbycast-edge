@@ -1000,7 +1000,23 @@ fn edge_capabilities() -> Vec<&'static str> {
         // wired/virtual interface — operators no longer have to SSH
         // in to find which IP is on which port.
         "network-info",
+        // Per-input/per-output `interface_binding` field is honoured
+        // (loose source-IP binding via NIC name lookup, plus per-leg
+        // binding inside 2022-7 redundancy and per-endpoint binding
+        // inside SRT bonding). Manager UI keys the picker dropdown off
+        // this. Always present from this release on; the strict
+        // companion below is conditional on CAP_NET_RAW.
+        "interface-binding",
     ];
+    // Strict mode (`SO_BINDTODEVICE`) requires `CAP_NET_RAW`. Probed
+    // once at startup; advertised only when the setsockopt actually
+    // succeeds. Operators grant the cap via the
+    // `packaging/strict-binding.conf` systemd drop-in. Manager UI
+    // gates the strict checkbox on this — no-cap edges still see the
+    // (loose-only) picker, just without the strict toggle.
+    if crate::util::socket::probe_strict_binding_supported() {
+        caps.push("interface-binding-strict");
+    }
     if cfg!(feature = "ptp-internal") {
         caps.push("ptp-internal");
     }

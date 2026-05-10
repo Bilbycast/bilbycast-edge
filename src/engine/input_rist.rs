@@ -53,6 +53,56 @@ pub fn spawn_rist_input(
     force_idr: Arc<std::sync::atomic::AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // Apply interface_binding (loose only on RIST in Phase 1):
+        // rewrite the bind_addr's IP to the resolved NIC's primary IPv4
+        // when bind_addr is currently 0.0.0.0. Strict requires librist
+        // SO_BINDTODEVICE plumbing — Phase 2.
+        let mut config = config;
+        if let Some(b) = config.interface_binding.clone() {
+            if b.strict {
+                tracing::error!(
+                    "RIST input '{input_id}': strict interface_binding not supported in Phase 1"
+                );
+                event_sender.emit_flow_with_details(
+                    EventSeverity::Critical,
+                    crate::manager::events::category::RIST,
+                    format!("RIST input '{input_id}': strict interface_binding rejected (Phase 1)"),
+                    &flow_id,
+                    serde_json::json!({"error_code": "srt_strict_binding_unsupported"}),
+                );
+                return;
+            }
+            match crate::util::socket::resolve_interface_binding(Some(&b)) {
+                Ok(Some(r)) => {
+                    if let Some(ip) = r.ipv4_for_loose {
+                        // Replace the host part of bind_addr if it's
+                        // currently 0.0.0.0. Operator-specified IPs win.
+                        if let Ok(addr) = config.bind_addr.parse::<std::net::SocketAddr>() {
+                            if addr.ip().is_unspecified() {
+                                let new_bind = format!("{ip}:{}", addr.port());
+                                tracing::info!(
+                                    "RIST input '{}': interface_binding {} → bind_addr {}",
+                                    input_id, b.name, new_bind,
+                                );
+                                config.bind_addr = new_bind;
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!("RIST input '{input_id}': interface_binding failed: {e}");
+                    event_sender.emit_flow_with_details(
+                        EventSeverity::Critical,
+                        crate::manager::events::category::RIST,
+                        format!("RIST input '{input_id}': interface_binding rejected: {e}"),
+                        &flow_id,
+                        serde_json::json!({"error_code": "interface_not_found"}),
+                    );
+                    return;
+                }
+            }
+        }
         let mut transcoder = match InputTranscoder::new(
             config.audio_encode.as_ref(),
             config.transcode.as_ref(),

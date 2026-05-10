@@ -162,6 +162,7 @@ pub async fn run_st2110_audio_input(
         config.interface_addr.as_deref(),
         config.source_addr.as_deref(),
         config.redundancy.as_ref(),
+        config.interface_binding.as_ref(),
     )
     .await?;
     if let (Some(tx), Some(fid)) = (event_sender.clone(), flow_id.clone()) {
@@ -285,6 +286,7 @@ async fn run_audio_input_single_with_filter(
         &config.bind_addr,
         config.interface_addr.as_deref(),
         config.source_addr.as_deref(),
+        config.interface_binding.as_ref(),
     )
     .await?;
     let mut buf = vec![0u8; MAX_DGRAM];
@@ -423,6 +425,7 @@ pub async fn run_st2110_audio_output(
         config.bind_addr.as_deref(),
         config.interface_addr.as_deref(),
         config.dscp,
+        config.interface_binding.as_ref(),
     )
     .await?;
     let red_std = red_sock
@@ -439,8 +442,11 @@ pub async fn run_st2110_audio_output(
     );
 
     let wire_blue = if let Some(b) = &config.redundancy {
+        // Per-leg binding lives on the parent `RedBlueBindConfig` in
+        // `b` — fall back to parent output's binding when leg 2 doesn't
+        // override (matches the audio_addr / interface_addr precedence).
         let (sock, dest) =
-            create_udp_output(&b.addr, config.bind_addr.as_deref(), b.interface_addr.as_deref(), config.dscp)
+            create_udp_output(&b.addr, config.bind_addr.as_deref(), b.interface_addr.as_deref(), config.dscp, config.interface_binding.as_ref())
                 .await?;
         let blue_std = sock
             .into_std()
@@ -637,6 +643,7 @@ pub async fn run_st2110_anc_input(
         config.interface_addr.as_deref(),
         config.source_addr.as_deref(),
         config.redundancy.as_ref(),
+        config.interface_binding.as_ref(),
     )
     .await?;
     if let (Some(tx), Some(fid)) = (event_sender.clone(), flow_id.clone()) {
@@ -699,6 +706,7 @@ async fn run_anc_input_single_with_filter(
         &config.bind_addr,
         config.interface_addr.as_deref(),
         config.source_addr.as_deref(),
+        config.interface_binding.as_ref(),
     )
     .await?;
     let mut buf = vec![0u8; MAX_DGRAM];
@@ -856,6 +864,7 @@ pub async fn run_st2110_anc_output(
         config.bind_addr.as_deref(),
         config.interface_addr.as_deref(),
         config.dscp,
+        config.interface_binding.as_ref(),
     )
     .await?;
     let red_std = red_sock
@@ -873,7 +882,7 @@ pub async fn run_st2110_anc_output(
 
     let wire_blue = if let Some(b) = &config.redundancy {
         let (sock, dest) =
-            create_udp_output(&b.addr, config.bind_addr.as_deref(), b.interface_addr.as_deref(), config.dscp)
+            create_udp_output(&b.addr, config.bind_addr.as_deref(), b.interface_addr.as_deref(), config.dscp, config.interface_binding.as_ref())
                 .await?;
         let blue_std = sock
             .into_std()
@@ -1213,6 +1222,7 @@ mod tests {
             max_bitrate_mbps: None,
             audio_encode: None,
             transcode: None,
+                interface_binding: None,
         };
         let (tx, _rx0) = broadcast::channel::<RtpPacket>(64);
         let flow_stats = Arc::new(FlowStatsAccumulator::new(
@@ -1252,6 +1262,7 @@ mod tests {
             ssrc: None,
             transcode: None,
             audio_track_index: None,
+                interface_binding: None,
         };
         let out_stats = Arc::new(OutputStatsAccumulator::new(
             "out1".into(),
@@ -1329,6 +1340,7 @@ mod tests {
             max_bitrate_mbps: None,
             audio_encode: None,
             transcode: None,
+                interface_binding: None,
         };
         let (tx, _rx0) = broadcast::channel::<RtpPacket>(64);
         let flow_stats = Arc::new(FlowStatsAccumulator::new(
@@ -1367,6 +1379,7 @@ mod tests {
             ssrc: Some(0xDEADBEEF),
             transcode: Some(crate::engine::audio_transcode::TranscodeJson::default()),
             audio_track_index: None,
+                interface_binding: None,
         };
         let out_stats = Arc::new(OutputStatsAccumulator::new(
             "tx-out".into(),
@@ -1473,6 +1486,7 @@ mod tests {
             payload_type: 100,
             clock_domain: None,
             allowed_sources: None,
+                interface_binding: None,
         };
         let (tx, _rx0) = broadcast::channel::<RtpPacket>(64);
         let flow_stats = Arc::new(FlowStatsAccumulator::new(
@@ -1505,6 +1519,7 @@ mod tests {
             clock_domain: None,
             dscp: 46,
             ssrc: None,
+                interface_binding: None,
         };
         let out_stats = Arc::new(OutputStatsAccumulator::new(
             "out1".into(),
@@ -1572,6 +1587,7 @@ mod tests {
                 addr: blue_addr.to_string(),
                 interface_addr: None,
                 source_addr: None,
+                        interface_binding: None,
             }),
             sample_rate: 48_000,
             bit_depth: 24,
@@ -1585,6 +1601,7 @@ mod tests {
             max_bitrate_mbps: None,
             audio_encode: None,
             transcode: None,
+                interface_binding: None,
         };
 
         let (tx, _rx0) = broadcast::channel::<RtpPacket>(64);

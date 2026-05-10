@@ -100,6 +100,7 @@ pub fn spawn_rtp_audio_output(
         ssrc: config.ssrc,
         transcode: config.transcode.clone(),
         audio_track_index: config.audio_track_index,
+        interface_binding: config.interface_binding.clone(),
     };
 
     tokio::spawn(async move {
@@ -138,6 +139,7 @@ async fn run_rtp_audio_302m_output(
         config.bind_addr.as_deref(),
         config.interface_addr.as_deref(),
         config.dscp,
+        config.interface_binding.as_ref(),
     )
     .await?;
 

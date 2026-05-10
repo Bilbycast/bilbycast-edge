@@ -348,6 +348,18 @@ fi
 systemctl daemon-reload
 systemctl enable --now bilbycast-edge
 
+# ── Optional: per-interface strict binding ─────────────────────────────
+# Strict mode (`SO_BINDTODEVICE` on each input/output socket) requires
+# `CAP_NET_RAW`. The default unit drops every capability, so strict is
+# opt-in via a documented drop-in. Print the install one-liner so
+# operators discover the toggle without grepping the docs. Loose
+# source-IP binding works on the default install with zero extra caps.
+echo
+echo "Optional — strict per-interface binding (kernel-enforced NIC pinning):"
+echo "  sudo install -m 0644 ${VERSION_DIR}/packaging/strict-binding.conf \\"
+echo "      /etc/systemd/system/bilbycast-edge.service.d/strict-binding.conf"
+echo "  sudo systemctl daemon-reload && sudo systemctl restart bilbycast-edge"
+
 # ── Wait for first manager registration ────────────────────────────────
 echo
 echo "Waiting up to 60 s for bilbycast-edge to come up + register with the manager…"
