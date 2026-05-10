@@ -3635,6 +3635,76 @@ fn build_output_config_meta(config: &OutputConfig) -> OutputConfigMeta {
     }
 }
 
+/// Bump the matching decoder family on a `FlowCostPlan` for an encoder
+/// family — every transcoder decodes the source before re-encoding, so
+/// every HW-encoded video session also charges one HW-decoded session
+/// against the co-located decoder family. NVENC ↔ NVDEC, QSV-encode ↔
+/// QSV-decode, VAAPI-encode ↔ VAAPI-decode. AMF and VideoToolbox have
+/// no separate decoder counter today, so they no-op. Mixed-vendor hosts
+/// (e.g. NVIDIA encode + Intel decode) will mis-attribute under this
+/// pairing — out of scope until transcoding configs grow an explicit
+/// `hw_decode` field.
+fn pair_decoder_sessions_for_encoder(
+    plan: &mut crate::engine::hardware_probe::FlowCostPlan,
+    family: crate::engine::hardware_probe::HwEncoderFamily,
+    is_4k: bool,
+) {
+    use crate::engine::hardware_probe::HwEncoderFamily;
+    match family {
+        HwEncoderFamily::Nvenc => {
+            plan.nvdec_sessions = plan.nvdec_sessions.saturating_add(1);
+            if is_4k {
+                plan.nvdec_sessions_4k = plan.nvdec_sessions_4k.saturating_add(1);
+            }
+        }
+        HwEncoderFamily::Qsv => {
+            plan.qsv_decode_sessions = plan.qsv_decode_sessions.saturating_add(1);
+            if is_4k {
+                plan.qsv_decode_sessions_4k = plan.qsv_decode_sessions_4k.saturating_add(1);
+            }
+        }
+        HwEncoderFamily::Vaapi => {
+            plan.vaapi_decode_sessions = plan.vaapi_decode_sessions.saturating_add(1);
+            if is_4k {
+                plan.vaapi_decode_sessions_4k = plan.vaapi_decode_sessions_4k.saturating_add(1);
+            }
+        }
+        HwEncoderFamily::Amf | HwEncoderFamily::VideoToolbox => {}
+    }
+}
+
+/// Sibling of `pair_decoder_sessions_for_encoder` that operates on the
+/// runtime `HwSessionUsage` (`*_in_use` fields) used by hot-add /
+/// hot-remove of outputs. Same family co-location rule.
+fn pair_decoder_usage_for_encoder(
+    usage: &mut crate::engine::hardware_probe::HwSessionUsage,
+    family: crate::engine::hardware_probe::HwEncoderFamily,
+    is_4k: bool,
+) {
+    use crate::engine::hardware_probe::HwEncoderFamily;
+    match family {
+        HwEncoderFamily::Nvenc => {
+            usage.nvdec_in_use = usage.nvdec_in_use.saturating_add(1);
+            if is_4k {
+                usage.nvdec_in_use_4k = usage.nvdec_in_use_4k.saturating_add(1);
+            }
+        }
+        HwEncoderFamily::Qsv => {
+            usage.qsv_decode_in_use = usage.qsv_decode_in_use.saturating_add(1);
+            if is_4k {
+                usage.qsv_decode_in_use_4k = usage.qsv_decode_in_use_4k.saturating_add(1);
+            }
+        }
+        HwEncoderFamily::Vaapi => {
+            usage.vaapi_decode_in_use = usage.vaapi_decode_in_use.saturating_add(1);
+            if is_4k {
+                usage.vaapi_decode_in_use_4k = usage.vaapi_decode_in_use_4k.saturating_add(1);
+            }
+        }
+        HwEncoderFamily::Amf | HwEncoderFamily::VideoToolbox => {}
+    }
+}
+
 /// Walk a resolved flow's outputs + flow-level config and produce the
 /// `FlowCostPlan` consumed by `engine::hardware_probe::compute_flow_cost_units`.
 ///
@@ -3648,7 +3718,7 @@ fn build_output_config_meta(config: &OutputConfig) -> OutputConfigMeta {
 /// combination, the legacy classify-by-string path runs as a fallback
 /// so the cost plan still has a sensible value.
 fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowCostPlan {
-    use crate::config::models::OutputConfig;
+    use crate::config::models::{InputConfig, OutputConfig};
 
     let mut plan = crate::engine::hardware_probe::FlowCostPlan::default();
 
@@ -3667,6 +3737,36 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
             OutputConfig::Webrtc(c) => c.video_encode.as_ref(),
             OutputConfig::Cmaf(c) => c.video_encode.as_ref(),
             _ => None,
+        }
+    }
+
+    // Sibling of `video_encode_block` for inputs. Used by the input
+    // loop below to charge per-input transcoder sessions onto the same
+    // per-family counters the output loop uses. ST 2110-20/-23 carry a
+    // mandatory (non-Option) `video_encode` and always charge one HW
+    // session pair; every other variant is opt-in.
+    fn input_video_encode_block(
+        inp: &crate::config::models::InputDefinition,
+    ) -> Option<&crate::config::models::VideoEncodeConfig> {
+        match &inp.config {
+            InputConfig::Srt(c) => c.video_encode.as_ref(),
+            InputConfig::Udp(c) => c.video_encode.as_ref(),
+            InputConfig::Rtp(c) => c.video_encode.as_ref(),
+            InputConfig::Rist(c) => c.video_encode.as_ref(),
+            InputConfig::Rtmp(c) => c.video_encode.as_ref(),
+            InputConfig::Rtsp(c) => c.video_encode.as_ref(),
+            InputConfig::Webrtc(c) => c.video_encode.as_ref(),
+            InputConfig::Whep(c) => c.video_encode.as_ref(),
+            InputConfig::MediaPlayer(c) => c.video_encode.as_ref(),
+            InputConfig::Replay(c) => c.video_encode.as_ref(),
+            InputConfig::TestPattern(c) => c.video_encode.as_ref(),
+            InputConfig::St2110_20(c) => Some(&c.video_encode),
+            InputConfig::St2110_23(c) => Some(&c.video_encode),
+            InputConfig::St2110_30(_)
+            | InputConfig::St2110_31(_)
+            | InputConfig::St2110_40(_)
+            | InputConfig::RtpAudio(_)
+            | InputConfig::Bonded(_) => None,
         }
     }
 
@@ -3741,6 +3841,12 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
                     }
                     None => {} // is_hw + no family — defensive, unreachable today
                 }
+                // Pair the decoder slot — every transcoder decodes
+                // before encoding, so the same session pair shows up
+                // on the host's decoder family alongside the encoder.
+                if let Some(family) = hw_family {
+                    pair_decoder_sessions_for_encoder(&mut plan, family, is_4k);
+                }
             } else {
                 plan.sw_video_encode_units = plan.sw_video_encode_units.saturating_add(units);
             }
@@ -3807,6 +3913,93 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
         }
     }
 
+    // Input-side transcoders charge encoder + decoder sessions just
+    // like outputs do. Inputs are switched, not hot-added (see
+    // `switch_active_input`), so this loop only runs at flow start —
+    // there is no input mirror of `output_resource_contribution`.
+    for inp in &flow.inputs {
+        let (audio, video) = input_encode_blocks(inp);
+        if audio.is_some() {
+            plan.audio_encode_inputs = plan.audio_encode_inputs.saturating_add(1);
+        }
+        if let Some(codec) = video {
+            let ve = input_video_encode_block(inp);
+            let (w, h, fn_, fd, bd, chroma) = match ve {
+                Some(v) => (
+                    v.width,
+                    v.height,
+                    v.fps_num,
+                    v.fps_den,
+                    v.bit_depth,
+                    v.chroma.clone(),
+                ),
+                None => (None, None, None, None, None, None),
+            };
+            let chroma_ref = chroma.as_deref();
+
+            let resolved = ve.and_then(|v| {
+                crate::engine::hardware_probe::resolve_for_video_encode_config(v).ok()
+            });
+            let (is_hw, hw_family) = match resolved {
+                Some(r) => (!r.is_software(), r.hw_family()),
+                None => {
+                    let f = crate::engine::hardware_probe::HwEncoderFamily::classify(codec);
+                    (f.is_some(), f)
+                }
+            };
+            let units = crate::engine::hardware_probe::weighted_video_encode_units(
+                is_hw, w, h, fn_, fd, bd, chroma_ref,
+            );
+            if is_hw {
+                plan.hw_video_encode_units =
+                    plan.hw_video_encode_units.saturating_add(units);
+                let is_4k = w.map_or(false, |w| w >= 3840)
+                    || h.map_or(false, |h| h >= 2160);
+                match hw_family {
+                    Some(crate::engine::hardware_probe::HwEncoderFamily::Nvenc) => {
+                        plan.nvenc_sessions = plan.nvenc_sessions.saturating_add(1);
+                        if is_4k {
+                            plan.nvenc_sessions_4k =
+                                plan.nvenc_sessions_4k.saturating_add(1);
+                        }
+                    }
+                    Some(crate::engine::hardware_probe::HwEncoderFamily::Qsv) => {
+                        plan.qsv_sessions = plan.qsv_sessions.saturating_add(1);
+                        if is_4k {
+                            plan.qsv_sessions_4k =
+                                plan.qsv_sessions_4k.saturating_add(1);
+                        }
+                    }
+                    Some(crate::engine::hardware_probe::HwEncoderFamily::VideoToolbox) => {
+                        plan.videotoolbox_sessions =
+                            plan.videotoolbox_sessions.saturating_add(1);
+                    }
+                    Some(crate::engine::hardware_probe::HwEncoderFamily::Amf) => {
+                        plan.amf_sessions = plan.amf_sessions.saturating_add(1);
+                        if is_4k {
+                            plan.amf_sessions_4k =
+                                plan.amf_sessions_4k.saturating_add(1);
+                        }
+                    }
+                    Some(crate::engine::hardware_probe::HwEncoderFamily::Vaapi) => {
+                        plan.vaapi_sessions = plan.vaapi_sessions.saturating_add(1);
+                        if is_4k {
+                            plan.vaapi_sessions_4k =
+                                plan.vaapi_sessions_4k.saturating_add(1);
+                        }
+                    }
+                    None => {} // is_hw + no family — defensive, unreachable today
+                }
+                if let Some(family) = hw_family {
+                    pair_decoder_sessions_for_encoder(&mut plan, family, is_4k);
+                }
+            } else {
+                plan.sw_video_encode_units =
+                    plan.sw_video_encode_units.saturating_add(units);
+            }
+        }
+    }
+
     let content = flow.config.effective_content_analysis();
     plan.content_analysis_lite = content.lite;
     plan.content_analysis_audio_full = content.audio_full;
@@ -3848,7 +4041,8 @@ fn output_resource_contribution(
         // (2160). Outputs without an explicit resolution stay 1080p.
         let (w, h) = output_video_encode_dims(output);
         let is_4k = w.map_or(false, |w| w >= 3840) || h.map_or(false, |h| h >= 2160);
-        match crate::engine::hardware_probe::HwEncoderFamily::classify(codec) {
+        let family = crate::engine::hardware_probe::HwEncoderFamily::classify(codec);
+        match family {
             Some(crate::engine::hardware_probe::HwEncoderFamily::Nvenc) => {
                 units = units.saturating_add(100);
                 usage.nvenc_in_use = usage.nvenc_in_use.saturating_add(1);
@@ -3884,6 +4078,12 @@ fn output_resource_contribution(
             None => {
                 units = units.saturating_add(500);
             }
+        }
+        // Pair the decoder slot — see `pair_decoder_usage_for_encoder`.
+        // Hot-remove of this output runs the same path in reverse, so
+        // the decoder counter stays symmetric with the encoder.
+        if let Some(f) = family {
+            pair_decoder_usage_for_encoder(&mut usage, f, is_4k);
         }
     }
     if matches!(
@@ -3994,6 +4194,78 @@ fn output_encode_blocks(
     }
 }
 
+/// Sibling of [`output_encode_blocks`] for inputs. Returns
+/// `(audio_encode, video_encode_codec)` for the input loop in
+/// `derive_cost_plan`. ST 2110-20/-23 always return a `Some(codec)`
+/// because `video_encode` is mandatory on those variants. ST 2110-30/-31
+/// audio inputs return their optional `audio_encode` only. ST 2110-40
+/// (ancillary), RtpAudio (PCM passthrough), and Bonded carry no encode
+/// blocks.
+fn input_encode_blocks(
+    inp: &crate::config::models::InputDefinition,
+) -> (Option<&crate::config::models::AudioEncodeConfig>, Option<&str>) {
+    use crate::config::models::InputConfig::*;
+    match &inp.config {
+        Srt(c) => (
+            c.audio_encode.as_ref(),
+            c.video_encode.as_ref().map(|v| v.codec.as_str()),
+        ),
+        Udp(c) => (
+            c.audio_encode.as_ref(),
+            c.video_encode.as_ref().map(|v| v.codec.as_str()),
+        ),
+        Rtp(c) => (
+            c.audio_encode.as_ref(),
+            c.video_encode.as_ref().map(|v| v.codec.as_str()),
+        ),
+        Rist(c) => (
+            c.audio_encode.as_ref(),
+            c.video_encode.as_ref().map(|v| v.codec.as_str()),
+        ),
+        Rtmp(c) => (
+            c.audio_encode.as_ref(),
+            c.video_encode.as_ref().map(|v| v.codec.as_str()),
+        ),
+        Rtsp(c) => (
+            c.audio_encode.as_ref(),
+            c.video_encode.as_ref().map(|v| v.codec.as_str()),
+        ),
+        Webrtc(c) => (
+            c.audio_encode.as_ref(),
+            c.video_encode.as_ref().map(|v| v.codec.as_str()),
+        ),
+        Whep(c) => (
+            c.audio_encode.as_ref(),
+            c.video_encode.as_ref().map(|v| v.codec.as_str()),
+        ),
+        MediaPlayer(c) => (
+            c.audio_encode.as_ref(),
+            c.video_encode.as_ref().map(|v| v.codec.as_str()),
+        ),
+        Replay(c) => (
+            c.audio_encode.as_ref(),
+            c.video_encode.as_ref().map(|v| v.codec.as_str()),
+        ),
+        TestPattern(c) => (
+            c.audio_encode.as_ref(),
+            c.video_encode.as_ref().map(|v| v.codec.as_str()),
+        ),
+        // ST 2110-30/-31 audio inputs: optional input-level
+        // `audio_encode` turns the PCM/AES3 ingress into a TS-carrier
+        // (AAC / s302m) for the PID bus. No video.
+        St2110_30(c) => (c.audio_encode.as_ref(), None),
+        St2110_31(c) => (c.audio_encode.as_ref(), None),
+        // ST 2110-20/-23 video inputs: `video_encode` is mandatory on
+        // ingress (RFC 4175 → H.264 / H.265 for the PID bus).
+        St2110_20(c) => (None, Some(c.video_encode.codec.as_str())),
+        St2110_23(c) => (None, Some(c.video_encode.codec.as_str())),
+        // RTP audio: optional `audio_encode` on the RTP-PCM ingress.
+        RtpAudio(c) => (c.audio_encode.as_ref(), None),
+        // No encode blocks on these.
+        St2110_40(_) | Bonded(_) => (None, None),
+    }
+}
+
 // ─── Master clock construction ────────────────────────────────────────
 //
 // Phase 3 wires `SourcePcrPllMaster` for SRT/RTP/UDP/RIST/RTMP/RTSP/
@@ -4087,6 +4359,202 @@ fn build_master_clock(
 fn is_webrtc_like_input(input: &crate::config::models::InputConfig) -> bool {
     use crate::config::models::InputConfig;
     matches!(input, InputConfig::Webrtc(_) | InputConfig::Whep(_))
+}
+
+#[cfg(test)]
+mod cost_plan_tests {
+    //! Tests for `derive_cost_plan` + `output_resource_contribution`,
+    //! focused on the encoder/decoder session pairing the manager
+    //! UI's Resources card surfaces. Configs are built via JSON so
+    //! the tests don't have to track every optional field on
+    //! Rtp/Srt/etc. configs.
+    use super::*;
+    use crate::config::models::{
+        AudioEncodeConfig, FlowConfig, InputConfig, InputDefinition, OutputConfig,
+        ResolvedFlow, VideoEncodeConfig,
+    };
+
+    fn ve(codec: &str) -> VideoEncodeConfig {
+        serde_json::from_value(serde_json::json!({ "codec": codec })).unwrap()
+    }
+
+    fn ve_4k(codec: &str) -> VideoEncodeConfig {
+        serde_json::from_value(serde_json::json!({
+            "codec": codec,
+            "width": 3840,
+            "height": 2160,
+        }))
+        .unwrap()
+    }
+
+    fn ae(codec: &str) -> AudioEncodeConfig {
+        serde_json::from_value(serde_json::json!({ "codec": codec })).unwrap()
+    }
+
+    fn rtp_input(
+        id: &str,
+        video_encode: Option<VideoEncodeConfig>,
+        audio_encode: Option<AudioEncodeConfig>,
+    ) -> InputDefinition {
+        let mut config: InputConfig = serde_json::from_value(serde_json::json!({
+            "type": "rtp",
+            "bind_addr": "0.0.0.0:5000",
+        }))
+        .unwrap();
+        if let InputConfig::Rtp(c) = &mut config {
+            c.video_encode = video_encode;
+            c.audio_encode = audio_encode;
+        }
+        InputDefinition {
+            active: true,
+            group: None,
+            id: id.to_string(),
+            name: id.to_string(),
+            config,
+        }
+    }
+
+    fn rtp_output(id: &str, video_encode: Option<VideoEncodeConfig>) -> OutputConfig {
+        let mut out: OutputConfig = serde_json::from_value(serde_json::json!({
+            "type": "rtp",
+            "id": id,
+            "name": id,
+            "active": true,
+            "dest_addr": "127.0.0.1:5004",
+        }))
+        .unwrap();
+        if let OutputConfig::Rtp(c) = &mut out {
+            c.video_encode = video_encode;
+        }
+        out
+    }
+
+    fn flow(inputs: Vec<InputDefinition>, outputs: Vec<OutputConfig>) -> ResolvedFlow {
+        let input_ids: Vec<String> = inputs.iter().map(|i| i.id.clone()).collect();
+        let output_ids: Vec<String> = outputs
+            .iter()
+            .map(|o| match o {
+                OutputConfig::Rtp(c) => c.id.clone(),
+                OutputConfig::Srt(c) => c.id.clone(),
+                OutputConfig::Udp(c) => c.id.clone(),
+                _ => "x".to_string(),
+            })
+            .collect();
+        let config: FlowConfig = serde_json::from_value(serde_json::json!({
+            "id": "f1",
+            "name": "f1",
+            "enabled": true,
+            "media_analysis": false,
+            "thumbnail": false,
+            "input_ids": input_ids,
+            "output_ids": output_ids,
+        }))
+        .unwrap();
+        ResolvedFlow { config, inputs, outputs }
+    }
+
+    #[test]
+    fn output_transcoder_pairs_decoder_session() {
+        let out = rtp_output("o1", Some(ve("h264_nvenc")));
+        let (_units, usage) = output_resource_contribution(&out);
+        assert_eq!(usage.nvenc_in_use, 1);
+        assert_eq!(usage.nvdec_in_use, 1);
+        assert_eq!(usage.qsv_in_use, 0);
+        assert_eq!(usage.qsv_decode_in_use, 0);
+        assert_eq!(usage.vaapi_decode_in_use, 0);
+    }
+
+    #[test]
+    fn output_transcoder_qsv_pairs_qsv_decode() {
+        let out = rtp_output("o1", Some(ve("h264_qsv")));
+        let (_units, usage) = output_resource_contribution(&out);
+        assert_eq!(usage.qsv_in_use, 1);
+        assert_eq!(usage.qsv_decode_in_use, 1);
+        assert_eq!(usage.nvdec_in_use, 0);
+    }
+
+    #[test]
+    fn output_transcoder_amf_does_not_bump_decoder() {
+        let out = rtp_output("o1", Some(ve("h264_amf")));
+        let (_units, usage) = output_resource_contribution(&out);
+        assert_eq!(usage.amf_in_use, 1);
+        assert_eq!(usage.nvdec_in_use, 0);
+        assert_eq!(usage.qsv_decode_in_use, 0);
+        assert_eq!(usage.vaapi_decode_in_use, 0);
+    }
+
+    #[test]
+    fn output_transcoder_4k_pairs_4k_decoder() {
+        let out = rtp_output("o1", Some(ve_4k("hevc_nvenc")));
+        let (_units, usage) = output_resource_contribution(&out);
+        assert_eq!(usage.nvenc_in_use, 1);
+        assert_eq!(usage.nvenc_in_use_4k, 1);
+        assert_eq!(usage.nvdec_in_use, 1);
+        assert_eq!(usage.nvdec_in_use_4k, 1);
+    }
+
+    #[test]
+    fn input_transcoder_charges_encoder_and_decoder() {
+        let f = flow(
+            vec![rtp_input("i1", Some(ve("h264_qsv")), None)],
+            vec![rtp_output("o1", None)],
+        );
+        let plan = derive_cost_plan(&f);
+        assert_eq!(plan.qsv_sessions, 1);
+        assert_eq!(plan.qsv_decode_sessions, 1);
+        assert_eq!(plan.nvenc_sessions, 0);
+        assert_eq!(plan.nvdec_sessions, 0);
+    }
+
+    #[test]
+    fn input_audio_encode_bumps_audio_inputs_only() {
+        let f = flow(
+            vec![rtp_input("i1", None, Some(ae("aac_lc")))],
+            vec![rtp_output("o1", None)],
+        );
+        let plan = derive_cost_plan(&f);
+        assert_eq!(plan.audio_encode_inputs, 1);
+        assert_eq!(plan.audio_encode_outputs, 0);
+        assert_eq!(plan.qsv_sessions, 0);
+        assert_eq!(plan.qsv_decode_sessions, 0);
+    }
+
+    #[test]
+    fn output_transcoder_in_derive_cost_plan_pairs_decoder() {
+        let f = flow(
+            vec![rtp_input("i1", None, None)],
+            vec![rtp_output("o1", Some(ve("h264_nvenc")))],
+        );
+        let plan = derive_cost_plan(&f);
+        assert_eq!(plan.nvenc_sessions, 1);
+        assert_eq!(plan.nvdec_sessions, 1);
+    }
+
+    #[test]
+    fn input_qsv_plus_output_nvenc_bump_independently() {
+        let f = flow(
+            vec![rtp_input("i1", Some(ve("h264_qsv")), None)],
+            vec![rtp_output("o1", Some(ve("h264_nvenc")))],
+        );
+        let plan = derive_cost_plan(&f);
+        assert_eq!(plan.qsv_sessions, 1);
+        assert_eq!(plan.qsv_decode_sessions, 1);
+        assert_eq!(plan.nvenc_sessions, 1);
+        assert_eq!(plan.nvdec_sessions, 1);
+    }
+
+    #[test]
+    fn input_4k_vaapi_pairs_4k_vaapi_decode() {
+        let f = flow(
+            vec![rtp_input("i1", Some(ve_4k("h264_vaapi")), None)],
+            vec![rtp_output("o1", None)],
+        );
+        let plan = derive_cost_plan(&f);
+        assert_eq!(plan.vaapi_sessions, 1);
+        assert_eq!(plan.vaapi_sessions_4k, 1);
+        assert_eq!(plan.vaapi_decode_sessions, 1);
+        assert_eq!(plan.vaapi_decode_sessions_4k, 1);
+    }
 }
 
 

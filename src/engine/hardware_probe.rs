@@ -1336,7 +1336,11 @@ pub fn compute_flow_cost_units(plan: &FlowCostPlan) -> u32 {
     let mut units: u32 = 1; // base
     units = units.saturating_add(plan.hw_video_encode_units);
     units = units.saturating_add(plan.sw_video_encode_units);
-    units = units.saturating_add(5u32.saturating_mul(plan.audio_encode_outputs));
+    units = units.saturating_add(
+        5u32.saturating_mul(
+            plan.audio_encode_outputs.saturating_add(plan.audio_encode_inputs),
+        ),
+    );
     // Local-display outputs split into two cost tiers based on whether
     // the resolved decoder backend lands on CPU or HW. CPU-decoded
     // display outputs run a libavcodec SW decode + libswscale colour
@@ -1389,6 +1393,12 @@ pub struct FlowCostPlan {
     /// 1080p30 4:2:0 8-bit baseline.
     pub sw_video_encode_units: u32,
     pub audio_encode_outputs: u32,
+    /// Audio-encode count from the input side. Mirrors `audio_encode_outputs`
+    /// for transcoders that live on inputs (e.g. an SRT/RTP/RTMP input with
+    /// `audio_encode` set, or an ST 2110-30/-31 input encoding to AAC into
+    /// the PID bus). Folded into the audio cost-unit total alongside the
+    /// output side — see `compute_flow_cost_units`.
+    pub audio_encode_inputs: u32,
     /// Number of `display` outputs on the flow that decode video on
     /// the CPU (libavcodec). Counted separately from
     /// `display_hw_decoded_outputs` because the cost weight differs
@@ -2710,6 +2720,24 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(compute_flow_cost_units(&plan), 1 + 500 + 5 + 2 + 5);
+    }
+
+    #[test]
+    fn cost_audio_encode_inputs_folds_with_outputs() {
+        // Audio encoders on inputs charge the same per-encoder unit cost
+        // as audio encoders on outputs — both fold into the same pool.
+        let inputs_only = FlowCostPlan {
+            audio_encode_inputs: 2,
+            ..Default::default()
+        };
+        assert_eq!(compute_flow_cost_units(&inputs_only), 1 + 10);
+
+        let mixed = FlowCostPlan {
+            audio_encode_inputs: 1,
+            audio_encode_outputs: 3,
+            ..Default::default()
+        };
+        assert_eq!(compute_flow_cost_units(&mixed), 1 + 20);
     }
 
     #[test]
