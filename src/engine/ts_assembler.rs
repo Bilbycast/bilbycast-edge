@@ -46,7 +46,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::packet::RtpPacket;
 use super::ts_es_bus::{EsPacket, FlowEsBus};
-use super::ts_parse::{mpeg2_crc32, NULL_PID, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE};
+use super::ts_parse::{
+    extract_pcr, mpeg2_crc32, set_discontinuity_indicator, NULL_PID, PAT_PID, TS_PACKET_SIZE,
+    TS_SYNC_BYTE,
+};
 
 /// TS packets per emitted bundle. 7 × 188 = 1316 bytes — fits comfortably
 /// inside a 1500-byte Ethernet MTU with headroom for IP+UDP headers.
@@ -202,6 +205,15 @@ async fn run_assembler(
     let mut pat_version: u8 = 0;
     let mut pmt_versions: Vec<u8> = vec![0; plan.programs.len()];
 
+    // One-shot flag: armed after every `ReplacePlan`, consumed when the
+    // next PCR-bearing TS packet flows through the ES rewrite path. The
+    // assembler then sets `discontinuity_indicator` (AF flags 0x80) on
+    // that packet so receivers (VLC, ffplay, broadcast-grade hardware)
+    // re-anchor STC instead of treating the post-swap PCR-epoch jump
+    // as a clock fault. Mirror of `TsContinuityFixer::pending_di_on_pcr`
+    // for the PID-bus / Flow Assembly path.
+    let mut pending_di_on_pcr: bool = false;
+
     // Egress bundle buffer + per-out-PID CC counter + PAT/PMT CC.
     let mut buf = BytesMut::with_capacity(BUNDLE_BYTES);
     let mut cc: std::collections::HashMap<u16, u8> = std::collections::HashMap::new();
@@ -263,6 +275,13 @@ async fn run_assembler(
                             &mut pat_version,
                             &mut pmt_versions,
                         );
+                        // Arm the one-shot DI flag — the next PCR-bearing
+                        // TS packet emitted after this swap will carry
+                        // `discontinuity_indicator = 1`. Without this,
+                        // receivers see the source-change PCR epoch jump
+                        // as a clock fault and freeze on their last
+                        // decoded frame even though PMT version bumped.
+                        pending_di_on_pcr = true;
                         // Emit fresh PSI immediately on switch so
                         // downstream receivers see the new PMT before
                         // the first rewritten ES packet lands on a new
@@ -290,7 +309,18 @@ async fn run_assembler(
                 if es.payload.len() != TS_PACKET_SIZE {
                     continue;
                 }
-                let rewritten = rewrite_es_packet(&es.payload, slot.out_pid, &mut cc);
+                let mut rewritten = rewrite_es_packet(&es.payload, slot.out_pid, &mut cc);
+                // After a plan swap, the first PCR-bearing TS packet
+                // gets DI=1 stamped into its adaptation field so the
+                // receiver re-anchors STC on the new source's PCR
+                // epoch. PCR can ride either a payload-bearing PUSI
+                // packet or an AF-only packet; `extract_pcr` handles
+                // both. Mirror of `TsContinuityFixer::pending_di_on_pcr`
+                // for the PID-bus / Flow Assembly path.
+                if pending_di_on_pcr && extract_pcr(&rewritten).is_some() {
+                    set_discontinuity_indicator(&mut rewritten);
+                    pending_di_on_pcr = false;
+                }
                 buf.extend_from_slice(&rewritten);
                 if buf.len() >= BUNDLE_BYTES {
                     flush(&mut buf, &broadcast_tx, &mut bundle_seq);
@@ -463,8 +493,16 @@ fn apply_plan_replacement(
         let (pidx, prog) = new_prog;
         for s in prog.slots.iter() {
             // Look for a reusable fan-in in the current flat list.
+            // Skip slots whose cancel token is already cancelled — those
+            // are tombstones from a prior plan-replacement; their fanin
+            // task is dead and reusing the index would resurrect the
+            // metadata without a running task to push packets, silently
+            // breaking the swap (no ES bytes for that slot post-swap).
             let match_idx = flat.iter().enumerate().find_map(|(i, f)| {
-                if !reused[i] && f.source == s.source {
+                if !reused[i]
+                    && f.source == s.source
+                    && slot_cancels.get(i).map_or(true, |c| !c.is_cancelled())
+                {
                     Some(i)
                 } else {
                     None

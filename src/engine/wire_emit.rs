@@ -207,17 +207,30 @@ pub fn spawn_wire_emitter(
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
 ) -> SyncSender<WireDatagram> {
-    // Pick clockid for SO_TXTIME based on anchor. CLOCK_MONOTONIC for
-    // PCR-anchored TS (where targets come from the local
-    // CLOCK_MONOTONIC clock); CLOCK_TAI for ST 2110 raster (where
-    // targets come from a PTP-disciplined system clock via
-    // `St2110_21Pacer`).
-    let clockid = match anchor {
-        AnchorSource::Pcr => libc_clock_monotonic(),
-        AnchorSource::St2110Raster => crate::engine::wire_emit_txtime::CLOCK_TAI,
-    };
+    // Always use CLOCK_TAI for SO_TXTIME's clockid. The kernel etf
+    // qdisc on Intel ice / igc drivers (and most others) only accepts
+    // CLOCK_TAI; setsockopt with CLOCK_MONOTONIC silently degrades to
+    // "kernel ignores the cmsg" — looks like the SO_TXTIME path is
+    // active but in practice every datagram sends ASAP, giving the
+    // same precision as no qdisc at all. ST 2110 raster has always
+    // used CLOCK_TAI (PTP grandmaster reference); for PCR-anchored
+    // we're switching to TAI too — `derive_target`'s math is purely
+    // ns-relative so the absolute clock domain doesn't matter, and
+    // `clock_nanosleep`/`clock_gettime` both accept CLOCK_TAI on
+    // Linux ≥ 4.6. ST 2110 raster targets that arrive in TAI from
+    // upstream `St2110_21Pacer` work unchanged.
+    let clockid = crate::engine::wire_emit_txtime::CLOCK_TAI;
 
-    let releaser = if try_enable_so_txtime(&socket, clockid) {
+    // Operator escape hatch: when `BILBYCAST_FORCE_NANOSLEEP=1` is set, skip
+    // the SO_TXTIME probe entirely and fall back to the clock_nanosleep tier.
+    // Useful for diagnosing SO_TXTIME / ETF qdisc reordering during input
+    // switches (see /home/ms02/.claude/plans/bright-skipping-whisper.md
+    // step 1) and as a workaround on kernels where ETF behaves badly under
+    // PCR-discontinuity load.
+    let force_nanosleep = std::env::var("BILBYCAST_FORCE_NANOSLEEP")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let releaser = if !force_nanosleep && try_enable_so_txtime(&socket, clockid) {
         Releaser::SoTxtime
     } else {
         Releaser::ClockNanosleep
@@ -242,16 +255,6 @@ pub fn spawn_wire_emitter(
         })
         .expect("wire-emit thread spawn");
     tx
-}
-
-#[cfg(target_os = "linux")]
-fn libc_clock_monotonic() -> i32 {
-    libc::CLOCK_MONOTONIC
-}
-
-#[cfg(not(target_os = "linux"))]
-fn libc_clock_monotonic() -> i32 {
-    0
 }
 
 /// Best-effort SO_TXTIME enablement. Returns `true` only when the
@@ -282,13 +285,71 @@ struct TargetState {
     observed_rate_bps: u64,
     /// Set after the very first datagram so we don't preroll again.
     initialised: bool,
+    /// Last `tx-time` value returned by `derive_target` — used to
+    /// guarantee the kernel ETF qdisc never sees a tx-time that goes
+    /// backwards. Without this, an input switch (PCR discontinuity →
+    /// wall_anchor reset to "now") would hand the kernel a packet with
+    /// `target = now` while the qdisc still holds residue from before
+    /// the switch with `target = now + small_delta`. ETF sorts by
+    /// target time and releases earliest-first, so the new packet would
+    /// jump ahead of legitimately-queued residue, breaking HEVC
+    /// reference-frame integrity at the receiver. Guarding the return
+    /// with `>= last_returned_ns + EPSILON` emulates the strict-FIFO
+    /// behaviour of the clock_nanosleep tier on the SO_TXTIME path,
+    /// trading at most one wire-queue's worth of latency on the
+    /// discontinuity packet for spec-compliant ordering.
+    last_returned_ns: u64,
 }
+
+/// Minimum gap (ns) between consecutive `derive_target` returns when
+/// the natural computation would have produced a non-monotonic step.
+/// 1 µs is well below the wire-time of any real datagram (a 1316-byte
+/// datagram at 1 Gbps takes ~10 µs; at 10 Mbps takes ~1 ms), so the
+/// guard is invisible to a healthy stream and only kicks in on
+/// pathological re-anchor steps.
+const MONOTONIC_TARGET_EPSILON_NS: u64 = 1_000;
 
 impl TargetState {
     /// Compute the target wall instant (CLOCK_MONOTONIC ns) at which
     /// the just-handed datagram should hit the wire. Mutates internal
     /// anchors so the next call sees consistent state.
+    ///
+    /// The return is guaranteed monotonically non-decreasing across
+    /// calls (with a `MONOTONIC_TARGET_EPSILON_NS` minimum step) — see
+    /// `last_returned_ns` for why. When the guard kicks in (typically
+    /// only at a PCR discontinuity / re-anchor) `wall_anchor_ns` is
+    /// also advanced so subsequent natural-paced calls compute targets
+    /// from the guarded point — without that follow-through, every
+    /// post-discontinuity datagram would clamp to `last_returned + N·ε`
+    /// and the kernel ETF qdisc would release them as a tight burst at
+    /// `last_returned`. With the follow-through, natural pacing
+    /// resumes seamlessly from the guarded anchor.
     fn derive_target(&mut self, now_ns: u64, datagram_pcr: Option<u64>, datagram_bytes: usize) -> u64 {
+        let raw = self.derive_target_raw(now_ns, datagram_pcr, datagram_bytes);
+        let guarded = if raw < self.last_returned_ns {
+            // Strict backwards step — kernel ETF would reorder. Push
+            // forward to last_returned + epsilon and fast-forward the
+            // pacing anchor so subsequent natural-paced calls compute
+            // from the corrected baseline rather than re-clamping each
+            // packet.
+            let floor = self.last_returned_ns.saturating_add(MONOTONIC_TARGET_EPSILON_NS);
+            self.wall_anchor_ns = floor;
+            floor
+        } else {
+            // raw is monotonic with the previous return (equal is fine —
+            // multiple cold-start preroll datagrams legitimately target
+            // the same wall_anchor and queue FIFO at the kernel).
+            raw
+        };
+        self.last_returned_ns = guarded;
+        guarded
+    }
+
+    /// Inner derivation; may produce non-monotonic targets at PCR
+    /// discontinuities or under late-rebase. The outer `derive_target`
+    /// applies the monotonic guard before handing the value to the
+    /// caller.
+    fn derive_target_raw(&mut self, now_ns: u64, datagram_pcr: Option<u64>, datagram_bytes: usize) -> u64 {
         if !self.initialised {
             self.wall_anchor_ns = now_ns.saturating_add(PREROLL_NS);
             self.bytes_since_anchor = 0;
@@ -468,11 +529,20 @@ fn run_emitter(
 
 // ── Platform: clock_nanosleep + SCHED_FIFO ──────────────────────────────
 
+/// Wire-emit's reference clock. CLOCK_TAI on Linux: PTP-disciplined when
+/// `ptp4l` + `phc2sys` are running (broadcast-grade, sub-µs PCR_AC against
+/// a grandmaster); equivalent to system clock + leap seconds otherwise
+/// (still ms-jittery but at least the kernel etf qdisc accepts it). The
+/// kernel etf qdisc on Intel ice/igc drivers REJECTS CLOCK_MONOTONIC, so
+/// SO_TXTIME with MONOTONIC silently degrades to "kernel ignores cmsg" —
+/// using TAI keeps the path live and gains free PTP-discipline when the
+/// operator wires up ptp4l. Non-Linux falls back to a generic monotonic
+/// clock — production paths are Linux-only.
 #[cfg(target_os = "linux")]
 fn monotonic_now_ns() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe {
-        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+        libc::clock_gettime(libc::CLOCK_TAI, &mut ts);
     }
     (ts.tv_sec as u64).saturating_mul(1_000_000_000) + (ts.tv_nsec as u64)
 }
@@ -487,7 +557,7 @@ fn sleep_until_monotonic_ns(target_ns: u64) {
     loop {
         let rc = unsafe {
             libc::clock_nanosleep(
-                libc::CLOCK_MONOTONIC,
+                libc::CLOCK_TAI,
                 libc::TIMER_ABSTIME,
                 &ts,
                 std::ptr::null_mut(),
@@ -622,6 +692,45 @@ mod tests {
         let target = s.derive_target(now, Some(601 * TICK_PER_MS), 1316);
         assert_eq!(target, now);
         assert_eq!(s.pcr_anchor, Some(601 * TICK_PER_MS));
+    }
+
+    /// A PCR discontinuity that would naïvely return a target in the
+    /// past (e.g. `now < last_returned_ns` because residual packets
+    /// were paced into the future) must produce a forward-only target,
+    /// not let the kernel ETF qdisc reorder it ahead of legitimate
+    /// queued residue. Models the real input-switch case where
+    /// `wall_anchor` is paced ~500 ms into the future at the moment of
+    /// switch and the discontinuity reset would otherwise hand the
+    /// kernel `target = now` — releasing the new packet ahead of all
+    /// the queued residual.
+    #[test]
+    fn discontinuity_does_not_return_target_below_last_emitted() {
+        let mut s = TargetState::default();
+        // Prime the state so `last_returned_ns` is far in the future.
+        // Two PCRs with a 100 ms gap, observed rate gets seeded.
+        let _ = s.derive_target(1_000_000_000, Some(0), 1316);
+        s.bytes_since_anchor = 100_000;
+        let primed = s.derive_target(1_000_000_000, Some(100 * TICK_PER_MS), 1316);
+        assert_eq!(primed, s.last_returned_ns);
+        let last_before = s.last_returned_ns;
+        // Now a discontinuity. now_ns is BEFORE last_returned (residue
+        // queue effect). Without the guard, raw would return now; with
+        // the guard the result must be ≥ last_returned_ns.
+        let now = last_before.saturating_sub(10_000_000); // 10 ms in the past
+        let target = s.derive_target(now, Some(10 * TICK_PER_MS), 1316);
+        assert!(
+            target >= last_before,
+            "guard must prevent backwards target ({target} < {last_before})"
+        );
+        assert!(
+            target <= last_before + MONOTONIC_TARGET_EPSILON_NS,
+            "guard should snap to last_returned + ε, not jump arbitrarily ({target} vs ceiling {})",
+            last_before + MONOTONIC_TARGET_EPSILON_NS,
+        );
+        // wall_anchor must follow so subsequent paced packets compute
+        // from the guarded point — otherwise every post-discontinuity
+        // packet would re-clamp to `target + N·ε` and burst.
+        assert_eq!(s.wall_anchor_ns, target);
     }
 
     #[test]

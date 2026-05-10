@@ -1192,6 +1192,58 @@ impl FlowRuntime {
             }
         }
 
+        // Post-essence PCR-source remap. Mirror of the startup-time fixup
+        // in `build_assembly_plan_with_essence_resolution` (see flow.rs
+        // ~line 2915). Without this, `pcr_source` stays at the
+        // operator-declared output PID; once the assembler's
+        // `apply_plan_replacement` looks up `pcr_source` against the
+        // post-resolution slots (which carry source-side PIDs after
+        // essence resolution), the find fails and the PMT's `PCR_PID`
+        // field falls back to `pmt_pid` itself. Receivers parse the PMT,
+        // look at the declared PCR_PID for clock recovery, find no PCR
+        // there (the actual PCR is on the video out_pid), and STC
+        // recovery breaks — manifests as audio drift / drop on the
+        // first hot-swap of an assembly that uses essence-typed slots.
+        // Pro broadcast-relevant: any operator using `kind: "essence"`
+        // (the auto-PID UI affordance) hits this on every plan change.
+        for prog in build.plan.programs.iter_mut() {
+            if prog.slots.iter().any(|s| s.source == prog.pcr_source) {
+                continue;
+            }
+            let pcr_input = prog.pcr_source.0.clone();
+            if let Some(remap) = prog
+                .slots
+                .iter()
+                .find(|s| s.source.0 == pcr_input)
+                .map(|s| s.source.clone())
+            {
+                tracing::info!(
+                    "Flow '{}': replace_assembly program {} pcr_source auto-remapped \
+                     from 0x{:04X} to 0x{:04X} (essence-resolved slot on input '{}')",
+                    flow_id, prog.program_number, prog.pcr_source.1, remap.1, pcr_input,
+                );
+                prog.pcr_source = remap;
+            } else {
+                let msg = format!(
+                    "flow '{}': replace_assembly program {} pcr_source input '{}' \
+                     has no slot after essence resolution",
+                    flow_id, prog.program_number, pcr_input,
+                );
+                self.event_sender.emit_flow_with_details(
+                    EventSeverity::Critical,
+                    category::FLOW,
+                    msg.clone(),
+                    flow_id,
+                    serde_json::json!({
+                        "error_code": "pid_bus_pcr_source_unresolved",
+                        "program_number": prog.program_number,
+                        "input_id": pcr_input,
+                    }),
+                );
+                bail!(msg);
+            }
+        }
+
         // Spawn any Hitless mergers the new plan introduced. The
         // assembler picks up the synthetic bus key as soon as its
         // `ReplacePlan` lands.
