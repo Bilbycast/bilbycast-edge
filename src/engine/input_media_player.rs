@@ -336,27 +336,47 @@ impl SpliceContinuity {
     /// arms `pending_discontinuity` if the layout (or the source itself)
     /// has changed.
     pub(super) fn open_file(&mut self, source_id: &str) {
-        let is_transition = self
-            .last_source_id
-            .as_deref()
-            .is_some_and(|prev| prev != source_id);
         // First-ever file: never flag — there's no preceding stream to be
-        // discontinuous from. Self-loop (same source_id): no flag — our
-        // CC + PTS rewriting keeps the splice clean. Real transition: flag.
-        if self.has_played_at_least_one_file && is_transition {
+        // discontinuous from. Every other case (self-loop OR cross-source
+        // transition) gets the flag. The 30 ms `SPLICE_GUARD_TICKS_90K`
+        // PCR jump at the boundary IS a PCR discontinuity per ISO/IEC
+        // 13818-1 §2.4.3.5 regardless of whether the source file is the
+        // same — and real broadcast captures end mid-PES, so iter 1's
+        // partial audio PES gets bytes from iter 2's pre-PUSI continuation
+        // packets appended unless the receiver flushes its depacketizer
+        // state. `discontinuity_indicator=1` is the spec-compliant way to
+        // tell the receiver "the PES bytes you've been buffering for this
+        // PID may not complete coherently — flush". Without it, VLC on
+        // macOS sees ~150 ms of garbled MP2 frames every loop ("Header
+        // missing" decode errors), and after several loops the audio
+        // decoder gives up and stays silent.
+        if self.has_played_at_least_one_file {
             self.pending_discontinuity = true;
         }
         self.last_source_id = Some(source_id.to_string());
     }
 
     /// Called by each per-format player at the end of a file to update
-    /// the target PTS for the *next* file's first emit. `last_pts_90k`
-    /// is the maximum 90 kHz PTS value emitted on the wire across both
-    /// audio and video PIDs during this file.
-    pub(super) fn close_file(&mut self, last_pts_90k: u64) {
-        self.last_emitted_output_pts_90k = last_pts_90k;
+    /// the target clock for the *next* file's first emit. `last_clock_90k`
+    /// is the **last emitted PCR** (in 90 kHz units) for `play_ts_file`,
+    /// or the last emitted PTS for the synthesised paths (`play_mp4`,
+    /// `play_image_file`) which mux their own PCR aligned with PTS.
+    ///
+    /// Anchoring on the source's last emitted PCR (not max emitted PTS)
+    /// is what keeps audio continuous across loops on real broadcast
+    /// captures. Files routinely end with the last video PES PTS ~1 s
+    /// past the last PCR (normal mux buffering delta — video PES are
+    /// muxed ahead of decode time so the receiver always has the next
+    /// frame ready). Anchoring next-target on max-PTS made the next
+    /// file's first PCR jump forward by that delta, leaving a ~1 s
+    /// audio gap every loop. After 2-3 loops a Mac VLC audio decoder
+    /// gives up and stays silent. Anchoring on PCR keeps the wire
+    /// PCR sequence continuous to within `SPLICE_GUARD_TICKS_90K` so
+    /// audio + video PESes resume with their natural buffering offset.
+    pub(super) fn close_file(&mut self, last_clock_90k: u64) {
+        self.last_emitted_output_pts_90k = last_clock_90k;
         // 33-bit wrap: PTS is 33 bits, target rolls over with it.
-        self.next_target_output_pts_90k = last_pts_90k
+        self.next_target_output_pts_90k = last_clock_90k
             .wrapping_add(SPLICE_GUARD_TICKS_90K)
             & 0x1_FFFF_FFFF;
         self.has_played_at_least_one_file = true;
@@ -550,9 +570,17 @@ async fn play_ts_file(
     // math still uses the *raw* PCR deltas (wall-clock relative to the
     // file's own PCR baseline) — adding a constant offset preserves
     // those deltas, so pacing and rewriting are independent.
+    //
+    // We track the **last emitted PCR** (post-rewrite, in 90 kHz units)
+    // and hand that to `SpliceContinuity::close_file` so the next file's
+    // splice anchors PCR-to-PCR rather than PCR-to-max-PTS. Real
+    // broadcast TS files routinely have a last video PES PTS that's ~1 s
+    // past the last PCR (mux buffering); anchoring on max-PTS would
+    // shove the next file's first PCR forward by that delta and leave a
+    // ~1 s audio gap every loop — see `close_file`'s doc comment.
     let target_pts_90k = session.cont.next_target_output_pts_90k;
     let mut splice_offset_27m: Option<i64> = None;
-    let mut max_emitted_pts_90k: u64 = target_pts_90k;
+    let mut last_emitted_pcr_90k: u64 = target_pts_90k;
 
     loop {
         if session.cancel.is_cancelled() {
@@ -660,12 +688,13 @@ async fn play_ts_file(
         if let Some(off_27m) = splice_offset_27m {
             rewrite_pcr_in_place(&mut packet, off_27m);
             let off_90k = off_27m / 300;
-            if let Some(new_pts) =
-                rewrite_pes_timestamps_in_place(&mut packet, off_90k)
-            {
-                if new_pts > max_emitted_pts_90k {
-                    max_emitted_pts_90k = new_pts;
-                }
+            rewrite_pes_timestamps_in_place(&mut packet, off_90k);
+            // Track the last emitted PCR (post-rewrite, 90 kHz) so the
+            // next file's splice anchors PCR-to-PCR. Re-extract from the
+            // rewritten packet so the 33-bit wrap is handled identically
+            // to the wire — `rewrite_pcr_in_place` is the canonical wrap.
+            if let Some(post_pcr_27m) = extract_pcr_27mhz(&packet) {
+                last_emitted_pcr_90k = post_pcr_27m / 300;
             }
         }
         if session.cont.pending_discontinuity
@@ -718,9 +747,12 @@ async fn play_ts_file(
         emit_bundle(&mut bundle, session, fake_rtp_ts(session));
     }
 
-    // Hand off the high-water-mark PTS to SpliceContinuity so the next
-    // file's first emitted PTS picks up immediately after.
-    session.cont.close_file(max_emitted_pts_90k);
+    // Hand the last emitted PCR (90 kHz) to SpliceContinuity so the
+    // next file's splice anchors PCR-to-PCR. Files where no PCR ever
+    // appeared keep `last_emitted_pcr_90k == target_pts_90k`, which is
+    // a safe carry-forward — the next file's target advances by the
+    // splice guard regardless.
+    session.cont.close_file(last_emitted_pcr_90k);
     Ok(())
 }
 
@@ -1610,7 +1642,8 @@ mod tests {
     fn open_close_round_trip_advances_target_by_guard() {
         let mut cont = SpliceContinuity::default();
         cont.open_file("a.ts");
-        // Cold start: no flag.
+        // Cold start: no flag — there's no preceding stream to be
+        // discontinuous from.
         assert!(!cont.pending_discontinuity);
 
         cont.close_file(100_000);
@@ -1621,14 +1654,20 @@ mod tests {
         );
         assert!(cont.has_played_at_least_one_file);
 
-        // Self-loop on the same source: no flag (CC + PTS rewriting is
-        // sufficient).
+        // Self-loop on the same source: flag arms, because the splice
+        // guard PCR jump IS a PCR discontinuity per ISO/IEC 13818-1
+        // §2.4.3.5 even when the underlying source file is the same.
+        // Without it, real broadcast captures (which end mid-PES) leak
+        // bytes from iter N+1's pre-PUSI continuations into iter N's
+        // partial PES, garbling MP2/AC-3 frames at every loop boundary.
         cont.open_file("a.ts");
-        assert!(!cont.pending_discontinuity);
+        assert!(cont.pending_discontinuity);
+        // Simulate the flag landing on the wire.
+        cont.pending_discontinuity = false;
 
         cont.close_file(200_000);
 
-        // Real transition: flag must arm.
+        // Real cross-source transition: flag re-arms.
         cont.open_file("b.mp4");
         assert!(cont.pending_discontinuity);
     }
@@ -1846,5 +1885,159 @@ mod tests {
         );
         // The continuity state should have observed both files cleanly.
         assert!(cont.has_played_at_least_one_file);
+    }
+
+    /// Build a 188-byte payload-only TS packet carrying a single PES start
+    /// with the given PTS. No PCR. Used by the trailing-PES regression
+    /// fixture below — simulates the real-broadcast-capture pattern where
+    /// the file ends with a video PES whose PTS is past the last PCR.
+    fn synth_trailing_video_pes(pid: u16, pts_90k: u64, cc: u8) -> [u8; TS_PACKET] {
+        // Stuffing pattern fills tail (decoder ignores after PES).
+        let mut pkt = [0xFFu8; TS_PACKET];
+        pkt[0] = SYNC_BYTE;
+        pkt[1] = 0x40 | ((pid >> 8) as u8 & 0x1F); // PUSI=1
+        pkt[2] = pid as u8;
+        pkt[3] = 0x10 | (cc & 0x0F); // afc=01 (payload only), CC
+        // PES start
+        pkt[4] = 0x00;
+        pkt[5] = 0x00;
+        pkt[6] = 0x01;
+        pkt[7] = 0xE0; // video stream_id
+        pkt[8] = 0x00; // PES_packet_length high (0 = unbounded for video)
+        pkt[9] = 0x00; // low
+        pkt[10] = 0x80; // '10' marker + remaining flags clear
+        pkt[11] = 0x80; // PTS-only flag
+        pkt[12] = 0x05; // PES_header_data_length (5 PTS bytes)
+        // Pre-seed PTS marker prefix '0010' so write_pes_ts_in_place
+        // preserves it (it copies the top nibble of the first PTS byte).
+        pkt[13] = 0x20;
+        write_pes_ts_in_place(&mut pkt[13..18], pts_90k);
+        pkt
+    }
+
+    /// Regression test for the audio-loss-after-loops bug: real broadcast
+    /// captures routinely end with the last video PES PTS ~1 s past the
+    /// last PCR (mux buffering delta). The previous splice anchored on
+    /// max-PTS, which made the next loop's first PCR jump forward by that
+    /// delta — leaving a ~1 s audio gap every loop. After 2-3 loops a Mac
+    /// VLC audio decoder gave up and stayed silent.
+    ///
+    /// Build a synthetic TS that ends with a trailing PES at PTS far past
+    /// the last PCR, drive `play_ts_file` twice with shared continuity,
+    /// and assert that at the loop boundary the wire-PCR gap is bounded
+    /// by `SPLICE_GUARD_TICKS_90K + a small tolerance`. Without the fix
+    /// the gap exceeded 800 ms; with the fix it sits at the splice guard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn play_ts_file_loop_pcr_gap_is_bounded_when_max_pts_outruns_pcr() {
+        use crate::engine::rtmp::ts_mux::TsMuxer;
+        use std::io::Write;
+
+        let mut mux = TsMuxer::new();
+        mux.set_has_video(true);
+        mux.set_video_stream_type(0x1B);
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut last_frame_pts: u64 = 0;
+        for i in 0..30u64 {
+            let pts = (i + 1) * 3_000;
+            last_frame_pts = pts;
+            let dts = pts;
+            let is_keyframe = i == 0;
+            let nal_type: u8 = if is_keyframe { 0x65 } else { 0x41 };
+            let annex_b = vec![0x00, 0x00, 0x00, 0x01, nal_type, 0xAB, 0xCD];
+            for pkt in mux.mux_video(&annex_b, pts, dts, is_keyframe) {
+                bytes.extend_from_slice(&pkt);
+            }
+        }
+        // Append a trailing video PES at PTS = last frame + 1 s. PCR is
+        // not advanced (we don't call mux_video again), so this packet's
+        // PTS sits 1 s past the file's last PCR — the real-broadcast
+        // shape that triggered the original bug.
+        let trailing_pts = last_frame_pts + 90_000; // +1 s in 90 kHz
+        // CC counter on PID 0x0100 after 30 frames is whatever TsMuxer
+        // left it at — the input-media-player rewrites CC on emit anyway,
+        // so the source-side CC value doesn't influence the wire PCR.
+        bytes.extend_from_slice(&synth_trailing_video_pes(0x0100, trailing_pts, 0));
+        assert!(bytes.len() % TS_PACKET == 0, "fixture must be 188-aligned");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trailing-pes.ts");
+        std::fs::File::create(&path).unwrap().write_all(&bytes).unwrap();
+
+        let (tx, mut rx) = broadcast::channel::<RtpPacket>(2048);
+        let stats = std::sync::Arc::new(FlowStatsAccumulator::new(
+            "test-flow".into(),
+            "test-flow-name".into(),
+            "media_player".into(),
+        ));
+        let cancel = CancellationToken::new();
+        let mut seq_num: u16 = 0;
+        let mut cont = SpliceContinuity::default();
+        let mut transcoder: Option<crate::engine::input_transcode::InputTranscoder> = None;
+
+        // Two iterations — same file — to exercise the loop boundary.
+        for _ in 0..2 {
+            cont.open_file("trailing-pes.ts");
+            let mut session = PlayerSession {
+                seq_num: &mut seq_num,
+                per_input_tx: &tx,
+                stats: &stats,
+                cancel: &cancel,
+                cont: &mut cont,
+                transcoder: &mut transcoder,
+            };
+            play_ts_file(&path, None, None, &mut session).await.unwrap();
+        }
+
+        drop(tx);
+        let mut bundles: Vec<RtpPacket> = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(pkt) => bundles.push(pkt),
+                Err(_) => break,
+            }
+        }
+        assert!(!bundles.is_empty());
+
+        // Walk every emitted PCR, find the largest forward gap. With the
+        // fix the largest gap should equal the splice guard (30 ms) ±
+        // tolerance for inter-PCR cadence within a file. Without the fix
+        // it would be ≥ 1 s.
+        let mut prev_pcr_27m: Option<u64> = None;
+        let mut max_gap_27m: u64 = 0;
+        for bundle in &bundles {
+            for ts_pkt in bundle.data.chunks(TS_PACKET) {
+                if ts_pkt.len() != TS_PACKET || ts_pkt[0] != SYNC_BYTE {
+                    continue;
+                }
+                let mut buf = [0u8; TS_PACKET];
+                buf.copy_from_slice(ts_pkt);
+                if let Some(pcr) = extract_pcr_27mhz(&buf) {
+                    if let Some(prev) = prev_pcr_27m {
+                        let gap = pcr.wrapping_sub(prev);
+                        if gap > max_gap_27m && gap < 10_000_000_000 {
+                            max_gap_27m = gap;
+                        }
+                    }
+                    prev_pcr_27m = Some(pcr);
+                }
+            }
+        }
+
+        // Splice guard is 2 700 ticks at 90 kHz = 810 000 at 27 MHz = 30 ms.
+        // Allow up to 100 ms total to absorb the per-file inter-PCR cadence
+        // (TsMuxer emits one PCR per frame ≈ 33 ms at 30 fps with PTS step
+        // of 3 000 ticks, so the largest in-file gap is ~33 ms; the loop
+        // boundary adds ~30 ms on top — comfortably under 100 ms).
+        const HUNDRED_MS_27M: u64 = 100 * 27_000;
+        assert!(
+            max_gap_27m < HUNDRED_MS_27M,
+            "loop-boundary PCR gap exceeded 100 ms (= {} ticks): largest seen = {} ticks ({} ms). \
+             A regression in close_file's anchor (PCR vs max-PTS) makes this gap \
+             grow to ≥ the trailing-PES delta, which causes audible audio dropouts \
+             every loop on real broadcast captures.",
+            HUNDRED_MS_27M,
+            max_gap_27m,
+            max_gap_27m / 27_000
+        );
     }
 }
