@@ -49,6 +49,7 @@ pub fn spawn_whip_input(
     session_rx: tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>,
     event_sender: EventSender,
     force_idr: Arc<std::sync::atomic::AtomicBool>,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         tracing::info!("WHIP input started for flow '{}', waiting for publisher", flow_id);
@@ -69,6 +70,9 @@ pub fn spawn_whip_input(
                 None
             }
         };
+        if let (Some(t), Some(p)) = (transcoder.as_mut(), av_sync_pacer.as_ref()) {
+            t.set_av_sync_pacer(p.clone());
+        }
         super::input_transcode::register_ingress_stats(
             stats.as_ref(),
             &input_id,
@@ -286,6 +290,7 @@ pub fn spawn_whep_input(
     flow_id: String,
     input_id: String,
     force_idr: Arc<std::sync::atomic::AtomicBool>,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         tracing::info!("WHEP input started, connecting to {}", config.whep_url);
@@ -306,6 +311,9 @@ pub fn spawn_whep_input(
                 None
             }
         };
+        if let (Some(t), Some(p)) = (transcoder.as_mut(), av_sync_pacer.as_ref()) {
+            t.set_av_sync_pacer(p.clone());
+        }
         super::input_transcode::register_ingress_stats(
             stats.as_ref(),
             &input_id,

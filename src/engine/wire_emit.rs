@@ -109,6 +109,18 @@ const PREROLL_NS: u64 = 50_000_000;
 /// and subsequent PCRs all emit ASAP.
 const LATE_REBASE_THRESHOLD_NS: u64 = 5_000_000;
 
+/// Hard upper bound on how far into the future a single derive_target
+/// return may sit relative to `now_ns`. The closed-loop pacer can drift
+/// `wall_anchor` ahead of wallclock during catch-up bursts (e.g. SRT
+/// jitter-buffer dump on connect, or input-switch backlog drain) — once
+/// past the bound, the natural-paced math keeps stretching the target
+/// further out, the userspace mpsc fills, and `try_send` from the
+/// producer collapses to drop-on-full at single-digit packet rates.
+/// Capping at 200 ms is harmless on the SO_TXTIME path (the kernel ETF
+/// qdisc has plenty of margin) and breaks the death spiral on the
+/// clock_nanosleep fallback where the userspace queue is the bottleneck.
+const MAX_FUTURE_LOOKAHEAD_NS: u64 = 200_000_000;
+
 /// 500 ms in 27 MHz ticks. PCR jumps beyond this trigger an anchor reset.
 const PCR_DISCONTINUITY_27MHZ: i64 = 13_500_000;
 
@@ -127,9 +139,11 @@ const SO_TXTIME_ERRQUEUE_DRAIN_EVERY: u64 = 1024;
 /// rate, so userspace queue depth is irrelevant.
 pub const WIRE_CHANNEL_CAP: usize = 1024;
 
-/// Lower bound clamp on observed bitrate. Avoids divide-by-zero edges
-/// without imposing a meaningful pacing floor.
-const MIN_BITRATE_BPS: u64 = 64_000;
+// `MIN_BITRATE_BPS` was a clamp on the natural-paced
+// `wall + bytes/observed_rate` interpolation. Removed alongside the
+// natural pacing itself — between PCRs we now emit ASAP, and PCR-to-PCR
+// targets come from the source's PCR clock difference (no rate divisor
+// involved). See `derive_target_raw` for the rationale.
 
 /// Anchor strategy chosen at spawn time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -341,8 +355,30 @@ impl TargetState {
             // the same wall_anchor and queue FIFO at the kernel).
             raw
         };
-        self.last_returned_ns = guarded;
-        guarded
+        // Cap `wall_anchor` at `now + MAX_FUTURE_LOOKAHEAD_NS`. The closed-
+        // loop pacer drifts `wall_anchor` ahead of wallclock during catch-
+        // up bursts (initial SRT jitter-buffer dump, input-switch backlog
+        // drain, encoder-bursts faster than declared rate). Once the
+        // anchor races past wallclock by more than `MAX_FUTURE_LOOKAHEAD`,
+        // the natural-paced math (`wall + bytes/observed_rate`) keeps
+        // pushing subsequent targets further into the future, the wire-
+        // emit mpsc fills (1024 cap), and the producer's try_send
+        // collapses into drop-on-full at single-digit packet rates —
+        // exactly the documented `wire pacer collapses to ~0.5 Mbps after
+        // 4-5 input switches` regression. Snapping back to `now + MAX`
+        // when the lookahead is exceeded breaks the spiral. Reset
+        // `wall_anchor` and `last_returned_ns` to the cap so subsequent
+        // natural-paced calls compute from the bounded baseline rather
+        // than re-clamping each packet.
+        let max_future = now_ns.saturating_add(MAX_FUTURE_LOOKAHEAD_NS);
+        let final_target = if guarded > max_future {
+            self.wall_anchor_ns = max_future;
+            max_future
+        } else {
+            guarded
+        };
+        self.last_returned_ns = final_target;
+        final_target
     }
 
     /// Inner derivation; may produce non-monotonic targets at PCR
@@ -366,11 +402,25 @@ impl TargetState {
             if let Some(prev) = self.pcr_anchor {
                 let delta_27 = pcr.wrapping_sub(prev) as i64;
                 // Discontinuity: backwards by any meaningful amount, or
-                // forward jump > 500 ms. Reset anchor to "now".
+                // forward jump > 500 ms. Reset anchor to "now". Also
+                // reset `last_returned_ns` here so the outer monotonic
+                // guard (`derive_target`) doesn't fast-forward
+                // `wall_anchor` back to the previous in-flight target —
+                // that's the documented `wire-pacer collapse after 4-5
+                // input switches` regression: when the previous source
+                // was paced into the future and a new source's first
+                // PCR comes in, the guard would lift `wall_anchor` from
+                // `now` back to `last_returned + ε` (= future), every
+                // subsequent natural-paced packet would target further
+                // out, and the wire-emit channel would drown in drops.
+                // Resetting both makes the discontinuity reset complete
+                // — pacing genuinely restarts from `now`.
                 if !(0..=PCR_DISCONTINUITY_27MHZ).contains(&delta_27) {
                     self.pcr_anchor = Some(pcr);
                     self.wall_anchor_ns = now_ns;
                     self.bytes_since_anchor = 0;
+                    self.observed_rate_bps = 0;
+                    self.last_returned_ns = now_ns;
                     return now_ns;
                 }
                 let delta_ns = (delta_27 as u64) * 1000 / 27;
@@ -397,9 +447,14 @@ impl TargetState {
                 // into the past, snap forward so subsequent PCRs are
                 // paced from real time. Otherwise wall_anchor stays
                 // behind forever and the burst pattern shows up at the
-                // receiver as PCR-spacing-equivalent jitter.
+                // receiver as PCR-spacing-equivalent jitter. When this
+                // fires, also reset `last_returned_ns` for the same
+                // reason as the discontinuity branch — without it, the
+                // outer monotonic guard would lift the snapped-to-now
+                // target back to the previously-queued future value.
                 if target + LATE_REBASE_THRESHOLD_NS < now_ns {
                     target = now_ns;
+                    self.last_returned_ns = now_ns;
                 }
 
                 self.pcr_anchor = Some(pcr);
@@ -407,39 +462,54 @@ impl TargetState {
                 self.bytes_since_anchor = 0;
                 return target;
             }
-            // First PCR after a no-PCR run: anchor on it. Pace this
-            // datagram from the existing wall_anchor — but only if we
-            // have an observed rate. Cold-start fallback: target the
+            // First PCR after a no-PCR run: anchor on it. Target the
             // wall_anchor itself so the datagram queues behind the
             // initial preroll-anchored emit instead of jumping ahead
             // of it.
             self.pcr_anchor = Some(pcr);
             self.bytes_since_anchor = self.bytes_since_anchor.saturating_add(datagram_bytes as u64);
-            return self
-                .target_with_observed_rate()
-                .unwrap_or(self.wall_anchor_ns.max(now_ns));
+            return self.wall_anchor_ns.max(now_ns);
         }
 
-        // No PCR. Interpolate by observed rate if we have one. Cold
-        // start: target wall_anchor (preserves FIFO order through the
-        // preroll window — clock_nanosleep with the same TIMER_ABSTIME
-        // returns at the same instant for queued packets, and the mpsc
-        // FIFO preserves the producer order).
+        // No PCR between PCRs: emit ASAP (target = max(wall_anchor, now)).
+        //
+        // The previous closed-loop interpolation (`wall + bytes /
+        // observed_rate`) was fragile under upstream packet loss —
+        // observed_rate measures bytes that *reached* wire-emit, so once
+        // the wire_tx mpsc fills and the producer's try_send drops new
+        // datagrams, observed_rate collapses to egress-rate-not-source-
+        // rate, the natural-paced target stretches further out, more
+        // drops, more collapse. Documented as the "wire pacer collapses
+        // to ~0.5 Mbps" regression in
+        // .claude-memory/monorepo/project_wire_pacer_switch_regression.md.
+        //
+        // Inter-PCR cadence is still enforced at PCR boundaries (the
+        // PCR-with-prev branch above advances `wall_anchor` by `delta_ns`
+        // per PCR — that's the only timing constraint receivers care
+        // about for broadcast PCR_AC). Between PCRs, datagrams emit ASAP;
+        // the receiver's jitter buffer absorbs the burst exactly the
+        // same way it would absorb a paced stream. On the SO_TXTIME path,
+        // ETF qdisc still sorts on tx-time and releases at the right
+        // instant — between-PCR datagrams all carry the previous PCR's
+        // wall-anchor as tx-time, so the kernel queues them as a tight
+        // burst at that instant rather than spread over the inter-PCR
+        // window. PCR_AC at the receiver is unchanged because PCR-bearing
+        // packets still hit the wire at `wall_anchor + delta_pcr`.
         self.bytes_since_anchor = self.bytes_since_anchor.saturating_add(datagram_bytes as u64);
-        self.target_with_observed_rate()
-            .unwrap_or(self.wall_anchor_ns.max(now_ns))
+        self.wall_anchor_ns.max(now_ns)
     }
 
-    /// Computes `wall_anchor + bytes_since_anchor / observed_rate` if a
-    /// rate has been observed. Returns `None` cold-start.
-    fn target_with_observed_rate(&self) -> Option<u64> {
-        if self.observed_rate_bps == 0 {
-            return None;
-        }
-        let bps = self.observed_rate_bps.max(MIN_BITRATE_BPS);
-        let ns_offset = self.bytes_since_anchor.saturating_mul(8 * 1_000_000_000) / bps;
-        Some(self.wall_anchor_ns.saturating_add(ns_offset))
-    }
+    // `target_with_observed_rate` was removed — the natural-paced
+    // interpolation between PCRs (`wall + bytes/observed_rate`) collapsed
+    // under upstream packet loss because `observed_rate` measures bytes
+    // that *reached* wire-emit, not bytes the source generated. Once the
+    // wire_tx mpsc fills and producer try_send drops, observed_rate
+    // tracks egress instead of source rate, the natural-paced target
+    // stretches further out, more drops, more collapse. Inter-PCR
+    // cadence is now enforced only at PCR boundaries (PCR-with-prev
+    // branch advances wall_anchor by delta_ns); between PCRs is ASAP.
+    // `observed_rate_bps` is still computed for telemetry but does not
+    // drive pacing.
 }
 
 // ── Emitter main loop ───────────────────────────────────────────────────
@@ -478,6 +548,17 @@ fn run_emitter(
             AnchorSource::St2110Raster => dg.target_tx_time_ns.unwrap_or(now_ns),
         };
 
+        // PCR is left exactly as packetized. An earlier attempt to
+        // re-stamp PCR to `target_ns - preroll` here was reverted —
+        // it broke passthrough because PTS values in the PES headers
+        // come from the source while the rewritten PCR was a
+        // wallclock-derived value, so the PTS-PCR offset that
+        // receivers use to time frame rendering became nonsensical
+        // and decoders dropped every frame as "too late". Wire pacing
+        // accuracy comes from `target_ns` driving SO_TXTIME (sub-µs)
+        // or `clock_nanosleep` (~100 µs); we trust the kernel to
+        // place the packet on the wire at the right instant rather
+        // than rewriting the PCR field.
         let send_result = match releaser {
             Releaser::ClockNanosleep => {
                 if target_ns > now_ns {
@@ -650,9 +731,9 @@ mod tests {
     }
 
     #[test]
-    fn between_pcrs_uses_observed_rate() {
+    fn between_pcrs_emit_asap_after_anchor() {
         let mut s = TargetState::default();
-        // First datagram, PCR=0. No observed rate yet.
+        // First datagram, PCR=0. wall_anchor = preroll into the future.
         let _ = s.derive_target(0, Some(0), 1316);
         // Seed observed rate via a second PCR 40 ms later carrying
         // 50 000 bytes accumulated in between (the test fakes this by
@@ -660,15 +741,23 @@ mod tests {
         // EMA fires).
         s.bytes_since_anchor = 50_000;
         let _ = s.derive_target(0, Some(40 * TICK_PER_MS), 1316);
-        assert_eq!(s.observed_rate_bps, 10_000_000); // 50 KB / 40 ms = 10 Mbps
+        assert_eq!(s.observed_rate_bps, 10_000_000); // 50 KB / 40 ms = 10 Mbps (telemetry only)
         let anchor = s.wall_anchor_ns;
 
-        // Now a non-PCR datagram. 1316 bytes at 10 Mbps = 1.0528 µs in
-        // ns terms: 1316 * 8 * 1_000_000_000 / 10_000_000 = 1_052_800.
+        // Non-PCR datagram between PCRs. Now (anchor + 1) is past the
+        // anchor — emit ASAP from the perspective of receivers (the
+        // anchor is the PCR-bearing pacing instant; between-PCR
+        // datagrams ride the previous anchor and burst out).
         let target = s.derive_target(anchor + 1, None, 1316);
-        let expected = anchor + 1316 * 8 * 1_000_000_000 / 10_000_000;
-        assert_eq!(target, expected);
+        // wall_anchor.max(now). now=anchor+1, so target=anchor+1.
+        assert_eq!(target, anchor + 1);
         assert_eq!(s.bytes_since_anchor, 1316);
+
+        // Second non-PCR datagram, slightly later in wallclock. Target
+        // should still pin to now (since wall_anchor < now).
+        let target2 = s.derive_target(anchor + 100_000, None, 1316);
+        assert_eq!(target2, anchor + 100_000);
+        assert_eq!(s.bytes_since_anchor, 2632);
     }
 
     #[test]
@@ -694,43 +783,35 @@ mod tests {
         assert_eq!(s.pcr_anchor, Some(601 * TICK_PER_MS));
     }
 
-    /// A PCR discontinuity that would naïvely return a target in the
-    /// past (e.g. `now < last_returned_ns` because residual packets
-    /// were paced into the future) must produce a forward-only target,
-    /// not let the kernel ETF qdisc reorder it ahead of legitimate
-    /// queued residue. Models the real input-switch case where
-    /// `wall_anchor` is paced ~500 ms into the future at the moment of
-    /// switch and the discontinuity reset would otherwise hand the
-    /// kernel `target = now` — releasing the new packet ahead of all
-    /// the queued residual.
+    /// A PCR discontinuity must reset pacing to "now" — both the
+    /// `wall_anchor_ns` AND the `last_returned_ns` (the outer monotonic
+    /// guard's reference). The discontinuity branch already sets
+    /// `wall_anchor = now`; if we don't ALSO reset `last_returned`,
+    /// the outer guard fast-forwards the returned target back to
+    /// `last_returned + ε` (= the previously-queued future value),
+    /// which is the documented "wire pacer collapses to ~0.5 Mbps after
+    /// 4-5 input switches" regression — the new input then paces from
+    /// that future anchor, every subsequent natural-paced packet
+    /// targets further out, and the wire-emit channel drowns in drops.
     #[test]
-    fn discontinuity_does_not_return_target_below_last_emitted() {
+    fn discontinuity_resets_pacing_to_now() {
         let mut s = TargetState::default();
         // Prime the state so `last_returned_ns` is far in the future.
-        // Two PCRs with a 100 ms gap, observed rate gets seeded.
         let _ = s.derive_target(1_000_000_000, Some(0), 1316);
         s.bytes_since_anchor = 100_000;
-        let primed = s.derive_target(1_000_000_000, Some(100 * TICK_PER_MS), 1316);
-        assert_eq!(primed, s.last_returned_ns);
+        let _ = s.derive_target(1_000_000_000, Some(100 * TICK_PER_MS), 1316);
         let last_before = s.last_returned_ns;
         // Now a discontinuity. now_ns is BEFORE last_returned (residue
-        // queue effect). Without the guard, raw would return now; with
-        // the guard the result must be ≥ last_returned_ns.
+        // queue effect from the previously paced-ahead state).
         let now = last_before.saturating_sub(10_000_000); // 10 ms in the past
         let target = s.derive_target(now, Some(10 * TICK_PER_MS), 1316);
-        assert!(
-            target >= last_before,
-            "guard must prevent backwards target ({target} < {last_before})"
-        );
-        assert!(
-            target <= last_before + MONOTONIC_TARGET_EPSILON_NS,
-            "guard should snap to last_returned + ε, not jump arbitrarily ({target} vs ceiling {})",
-            last_before + MONOTONIC_TARGET_EPSILON_NS,
-        );
-        // wall_anchor must follow so subsequent paced packets compute
-        // from the guarded point — otherwise every post-discontinuity
-        // packet would re-clamp to `target + N·ε` and burst.
-        assert_eq!(s.wall_anchor_ns, target);
+        // After my fix: discontinuity resets last_returned to now, so
+        // the outer guard's `raw < last_returned` check sees raw=now,
+        // last_returned=now, and uses raw — no fast-forward.
+        assert_eq!(target, now);
+        assert_eq!(s.wall_anchor_ns, now);
+        assert_eq!(s.last_returned_ns, now);
+        assert_eq!(s.observed_rate_bps, 0, "discontinuity must clear stale observed rate");
     }
 
     #[test]
@@ -739,7 +820,13 @@ mod tests {
         let _ = s.derive_target(0, Some(TICK_PER_MS), 1316);
         let anchor = s.wall_anchor_ns;
         // 400 ms forward — well under the 500 ms discontinuity bound.
-        let target = s.derive_target(0, Some(401 * TICK_PER_MS), 1316);
+        // Use a `now_ns` far enough in the future so the 200 ms
+        // lookahead cap doesn't trip (the cap is only meant to catch
+        // pacer-runaway scenarios where `wall_anchor` outraces
+        // wallclock; here we're emulating the real case where
+        // wallclock has caught up to ~PCR time).
+        let now = anchor + 350_000_000; // 350 ms past anchor
+        let target = s.derive_target(now, Some(401 * TICK_PER_MS), 1316);
         assert_eq!(target, anchor + 400_000_000);
     }
 
@@ -780,13 +867,16 @@ mod tests {
         let target2 = s.derive_target(now, None, 1316);
         assert_eq!(target2, anchor);
 
-        // After two PCRs land, the EMA seeds and pacing kicks in.
+        // After two PCRs land, the EMA seeds (telemetry only — the
+        // pacer no longer interpolates between PCRs).
         s.bytes_since_anchor = 50_000;
         let _ = s.derive_target(now, Some(40 * TICK_PER_MS), 1316);
         assert!(s.observed_rate_bps > 0);
-        // Now non-PCR datagrams should pace by the observed rate.
+        // Non-PCR datagrams between PCRs always emit ASAP from
+        // wall_anchor.max(now). No interpolation. The PCR-with-prev
+        // branch has already advanced wall_anchor for the next PCR.
         let post = s.derive_target(now + 1, None, 1316);
-        assert!(post > s.wall_anchor_ns);
+        assert_eq!(post, s.wall_anchor_ns.max(now + 1));
     }
 
     #[test]

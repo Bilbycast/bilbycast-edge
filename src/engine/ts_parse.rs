@@ -254,6 +254,53 @@ pub fn verify_psi_crc(pkt: &[u8], section_start: usize) -> bool {
     mpeg2_crc32(&pkt[section_start..section_end]) == 0
 }
 
+/// Overwrite the `version_number` field in a PSI section (PAT or PMT)
+/// carried in a single 188-byte TS packet with PUSI=1, then recompute
+/// the CRC32. Forces receivers that cache tables by version to re-parse
+/// the section — essential when:
+///   - switching between inputs that use the same version number but
+///     have different content (`TsContinuityFixer::on_switch` path);
+///   - the egress transcoder rewrites a PMT's stream_type so the
+///     codec the PMT advertises no longer matches what receivers have
+///     cached against the source's version.
+///
+/// Layout (for PUSI=1, pointer_field=0):
+///   byte 4:  pointer_field (0x00)
+///   byte 5:  table_id
+///   byte 6-7: section_syntax_indicator + section_length
+///   byte 8-9: transport_stream_id (PAT) or program_number (PMT)
+///   byte 10: reserved(2) + version_number(5) + current_next_indicator(1)
+///   ...
+///   last 4 bytes of section: CRC32
+///
+/// `version` is masked to 5 bits and written in place; `current_next`
+/// and the two reserved bits are preserved. Silently no-ops if the
+/// packet has PUSI=0 or the section is malformed.
+pub fn set_psi_version(pkt: &mut [u8], version: u8) {
+    if pkt.len() != TS_PACKET_SIZE || !ts_pusi(pkt) {
+        return;
+    }
+    let pointer_field = pkt[4] as usize;
+    let section_start = 5 + pointer_field;
+    if section_start + 12 > TS_PACKET_SIZE {
+        return;
+    }
+    let section_length =
+        (((pkt[section_start + 1] & 0x0F) as usize) << 8) | (pkt[section_start + 2] as usize);
+    let section_end = section_start + 3 + section_length;
+    if section_end > TS_PACKET_SIZE || section_length < 9 {
+        return;
+    }
+    let v = version & 0x1F;
+    pkt[section_start + 5] = (pkt[section_start + 5] & 0xC1) | (v << 1);
+    let crc_offset = section_end - 4;
+    let crc = mpeg2_crc32(&pkt[section_start..crc_offset]);
+    pkt[crc_offset] = (crc >> 24) as u8;
+    pkt[crc_offset + 1] = (crc >> 16) as u8;
+    pkt[crc_offset + 2] = (crc >> 8) as u8;
+    pkt[crc_offset + 3] = crc as u8;
+}
+
 // ── RTP Header Stripping ─────────────────────────────────────────────────
 
 /// Strip the RTP header from a packet and return the TS payload slice.
@@ -375,5 +422,62 @@ mod tests {
         let pkt = build_pat_packet(&[(1, 0x1000), (2, 0x1100)], false);
         let pids = parse_pat_pmt_pids(&pkt);
         assert_eq!(pids, vec![0x1000, 0x1100]);
+    }
+
+    /// Build a synthetic PMT TS packet with a known version_number.
+    fn build_pmt_packet(_pmt_pid: u16, version: u8) -> [u8; TS_PACKET_SIZE] {
+        let mut pkt = [0xFFu8; TS_PACKET_SIZE];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = 0x40; // PUSI=1, PID high = 0 (use PAT-like header for layout simplicity)
+        pkt[2] = 0x00;
+        pkt[3] = 0x10; // payload-only
+        pkt[4] = 0x00; // pointer_field
+        // Section content (after section_length field, byte 8 onwards):
+        // program_number(2) + version+cni(1) + section_num(1) + last_section(1)
+        // + pcr_pid(2) + program_info_length(2) + CRC(4) = 13 bytes.
+        let section_length = 13;
+        pkt[5] = 0x02; // table_id = PMT
+        pkt[6] = 0xB0 | (((section_length >> 8) & 0x0F) as u8);
+        pkt[7] = (section_length & 0xFF) as u8;
+        pkt[8] = 0x00; // program_number high
+        pkt[9] = 0x01; // program_number low
+        pkt[10] = 0xC0 | ((version & 0x1F) << 1) | 0x01; // reserved + version + current_next
+        pkt[11] = 0x00; // section_number
+        pkt[12] = 0x00; // last_section_number
+        pkt[13] = 0xE0; // reserved + PCR_PID high
+        pkt[14] = 0xFF; // PCR_PID low
+        pkt[15] = 0xF0; // reserved + program_info_length high
+        pkt[16] = 0x00; // program_info_length low
+        // CRC32 over bytes [5..17): table_id through program_info_length
+        // (the section body excluding the trailing CRC itself).
+        let crc = mpeg2_crc32(&pkt[5..17]);
+        pkt[17] = (crc >> 24) as u8;
+        pkt[18] = (crc >> 16) as u8;
+        pkt[19] = (crc >> 8) as u8;
+        pkt[20] = crc as u8;
+        pkt
+    }
+
+    #[test]
+    fn set_psi_version_writes_version_and_recomputes_crc() {
+        let mut pkt = build_pmt_packet(0x1000, 7);
+        // Verify initial version=7 and CRC valid.
+        assert_eq!((pkt[10] >> 1) & 0x1F, 7);
+        assert!(verify_psi_crc(&pkt, 5));
+        // Bump to version 12.
+        set_psi_version(&mut pkt, 12);
+        assert_eq!((pkt[10] >> 1) & 0x1F, 12);
+        // CRC must still validate after the rewrite.
+        assert!(verify_psi_crc(&pkt, 5), "CRC must be recomputed by set_psi_version");
+    }
+
+    #[test]
+    fn set_psi_version_no_op_on_pusi_zero() {
+        let mut pkt = build_pmt_packet(0x1000, 7);
+        // Clear PUSI.
+        pkt[1] &= !0x40;
+        let before = pkt;
+        set_psi_version(&mut pkt, 12);
+        assert_eq!(pkt, before, "no PUSI → set_psi_version is no-op");
     }
 }

@@ -135,7 +135,6 @@ impl InputTranscoder {
     /// preroll`. Outputs that consume the broadcast channel (HLS,
     /// CMAF, RTMP, WebRTC, plus passthrough TS-native outputs) inherit
     /// the master-clocked PCR cadence.
-    #[allow(dead_code)]
     pub fn set_av_sync_pacer(
         &mut self,
         pacer: Arc<crate::engine::av_sync_mux::AvSyncPacer>,

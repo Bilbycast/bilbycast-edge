@@ -6,6 +6,14 @@
 # linuxptp (ptp4l + phc2sys), ETF qdisc, static ARP for known peers.
 # All persistent (systemd) so it survives reboots.
 #
+# This script is OPTIONAL. It is only needed for:
+#   - Tier 1 / 2 PCR_AC (sub-µs to ~10 µs) — needs ETF qdisc + PTP.
+#   - ST 2110 essence flows — needs PTP grandmaster sync.
+#   - Multi-edge 2022-7 hitless across legs — needs cross-edge PTP.
+# A default `install-edge.sh` install runs at tier 4 (clock_nanosleep
+# on SCHED_FIFO, ~50–500 µs jitter) which is fine for VLC, ffplay,
+# OBS, web players, and most cloud receivers.
+#
 # Does NOT install bilbycast-edge — use packaging/install-edge.sh for
 # the binary, or run this on a host that already has it. Idempotent.
 #
@@ -29,6 +37,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 step() { printf '\n=== %s ===\n' "$1"; }
 
 ip link show "$MEDIA_IFACE" &>/dev/null || { echo "iface $MEDIA_IFACE not found" >&2; exit 1; }
+
+# ─── 0. Prerequisite checks ──────────────────────────────────────────
+step "0. Prerequisite checks"
+
+# Kernel ≥ 4.19 required for SO_TXTIME + ETF qdisc.
+KERNEL_VERSION=$(uname -r | cut -d. -f1,2)
+KERNEL_MAJOR=${KERNEL_VERSION%.*}
+KERNEL_MINOR=${KERNEL_VERSION#*.}
+if (( KERNEL_MAJOR < 4 )) || { (( KERNEL_MAJOR == 4 )) && (( KERNEL_MINOR < 19 )); }; then
+    echo "WARNING: kernel $(uname -r) is older than 4.19 — SO_TXTIME / ETF qdisc unavailable." >&2
+    echo "         The edge will fall back to clock_nanosleep (tier 4)." >&2
+fi
+
+# HW PTP timestamping probe — informational only. Without it, you fall
+# back to software ETF (tier 2) which is still ~1–10 µs jitter.
+if command -v ethtool &>/dev/null; then
+    if ethtool -T "$MEDIA_IFACE" 2>/dev/null | grep -q "PTP Hardware Clock: none"; then
+        echo "WARNING: $MEDIA_IFACE has no PTP hardware clock." >&2
+        echo "         Tier-1 (sub-µs) PCR_AC requires a HW-PTP NIC (Intel I225/I226/E810, Mellanox CX-6/7)." >&2
+        echo "         You will get tier 2 (~1–10 µs) at best on this NIC." >&2
+    fi
+else
+    echo "NOTE: ethtool not found; skipping NIC HW-PTP capability probe." >&2
+fi
 
 # ─── 1. linuxptp ──────────────────────────────────────────────────────
 step "1. Installing linuxptp"
@@ -61,6 +93,19 @@ ExecStart=/usr/sbin/ptp4l -f /etc/linuxptp/ptp4l-${MEDIA_IFACE}.conf -i ${MEDIA_
 EOF
 
 # ─── 3. phc2sys (slave system clock to media-NIC PHC) ────────────────
+#
+# `-s %I`  — source clock is the interface's PHC (already PTP-synced by ptp4l).
+# `-w`     — wait for ptp4l to be in sync, then auto-apply the TAI-UTC offset
+#            advertised in PTP announce TLVs. This is the modern recipe — it
+#            keeps CLOCK_REALTIME on UTC AND the kernel's TAI offset correct,
+#            so CLOCK_TAI = grandmaster TAI (which is what bilbycast's
+#            engine::wire_emit and engine::st2110 read).
+# `-m`     — log to stdout for journald.
+#
+# DO NOT pass `-O 0`: it overrides the auto-detected TAI-UTC offset and either
+# skews CLOCK_REALTIME by 37 s (UTC vs TAI) or leaves CLOCK_TAI 37 s ahead of
+# the grandmaster, depending on phc2sys version. Either way, multi-edge
+# coherence breaks. See: linuxptp `phc2sys(8)`, "AUTOMATIC PTP UTC OFFSET".
 step "3. phc2sys"
 install -m 0644 /dev/stdin "/etc/systemd/system/phc2sys@.service" <<'EOF'
 [Unit]
@@ -70,7 +115,7 @@ Requires=ptp4l@%i.service
 
 [Service]
 Type=simple
-ExecStart=/usr/sbin/phc2sys -s %I -O 0 -w
+ExecStart=/usr/sbin/phc2sys -s %I -w -m
 Restart=on-failure
 
 [Install]

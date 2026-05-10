@@ -2195,6 +2195,10 @@ pub struct RtpOutputConfig {
     /// `video-encoder-qsv`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+    /// Optional CBR padding to a target wire bitrate (kbps). See
+    /// [`UdpOutputConfig::cbr_pad_to_kbps`] for semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cbr_pad_to_kbps: Option<u32>,
     /// Pin this output to a physical NIC. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
@@ -2317,6 +2321,17 @@ pub struct UdpOutputConfig {
     /// for the semantics. Incompatible with `transport_mode = "audio_302m"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+    /// Optional CBR padding to a target wire bitrate (kbps). When set,
+    /// `engine::ts_null_padder` injects PID 0x1FFF NULL packets between
+    /// the transcoder pipeline and `wire_emit` so the wire rate matches
+    /// the target regardless of natural encoder rate. Useful for
+    /// downstream multiplexers / legacy receivers that expect a stable
+    /// CBR feed. Bound by `MIN_TARGET_KBPS = 1000` and
+    /// `MAX_TARGET_KBPS = 1_000_000`. Validation also enforces this is
+    /// at least 5 % above the sum of declared `audio_encode.bitrate_kbps`
+    /// + `video_encode.bitrate_kbps` so there's headroom to pad.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cbr_pad_to_kbps: Option<u32>,
     /// Pin this UDP output to a physical NIC. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
@@ -2488,6 +2503,12 @@ pub struct SrtOutputConfig {
     /// for the semantics. Incompatible with `transport_mode = "audio_302m"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+    /// Optional CBR padding to a target wire bitrate (kbps). See
+    /// [`UdpOutputConfig::cbr_pad_to_kbps`] for semantics. SRT carries
+    /// the padded TS opaquely — receivers measuring CBR rate see the
+    /// inflated stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cbr_pad_to_kbps: Option<u32>,
     /// Pin this SRT output to a physical NIC. Phase 1: loose only —
     /// strict mode is rejected (libsrt SRTO_BINDTODEVICE plumbing
     /// deferred). When set, the resolved interface IP is used as
@@ -4810,6 +4831,7 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        cbr_pad_to_kbps: None,
                         interface_binding: None,
             })],
             flows: vec![FlowConfig {
@@ -4876,6 +4898,7 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        cbr_pad_to_kbps: None,
                         interface_binding: None,
             })],
             flows: vec![FlowConfig {

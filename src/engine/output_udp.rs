@@ -376,6 +376,16 @@ async fn udp_output_loop(
     };
     let mut video_replace_scratch: Vec<u8> = Vec::new();
 
+    // Optional CBR null padder: inflates the natural transcoded rate
+    // up to a target wire bitrate by injecting PID 0x1FFF NULL packets.
+    // Sits between the transcoder pipeline and wire_emit so the wire
+    // pacer's observed inter-PCR rate matches the configured CBR
+    // target. Disabled when `cbr_pad_to_kbps` is unset.
+    let mut null_padder = config
+        .cbr_pad_to_kbps
+        .map(crate::engine::ts_null_padder::TsNullPadder::new);
+    let mut pad_scratch: Vec<u8> = Vec::new();
+
     // Wire the per-output input-switch watcher: on every change of the
     // flow's active input, flip the replacers' external_reset flags so
     // the next process() call re-anchors PTS and forces an IDR. Without
@@ -520,15 +530,25 @@ async fn udp_output_loop(
                 after_audio
             };
 
+            // Apply CBR padding before PID remap so the remapper sees
+            // the inflated stream and keeps NULL-PID continuity through.
+            let after_pad: &[u8] = if let Some(ref mut padder) = null_padder {
+                pad_scratch.clear();
+                padder.process(after_video, &mut pad_scratch);
+                &pad_scratch
+            } else {
+                after_video
+            };
+
             // Apply PID remapping last, so audio/video replacers see original
             // PIDs in the PMT (they identify streams by stream_type, but this
             // keeps debugging + stats consistent with the source stream).
             if let Some(ref mut remapper) = pid_remapper {
                 remap_scratch.clear();
-                remapper.process(after_video, &mut remap_scratch);
+                remapper.process(after_pad, &mut remap_scratch);
                 ts_buf.extend_from_slice(&remap_scratch);
             } else {
-                ts_buf.extend_from_slice(after_video);
+                ts_buf.extend_from_slice(after_pad);
             }
 
             // Find TS sync boundary on first data

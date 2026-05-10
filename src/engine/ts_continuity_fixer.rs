@@ -503,66 +503,11 @@ impl TsContinuityFixer {
     }
 }
 
-/// Overwrite the `version_number` field in a PSI section (PAT or PMT)
-/// carried in a single 188-byte TS packet with PUSI=1, then recompute
-/// the CRC32. Forces receivers that cache tables by version to re-parse
-/// the section — essential when switching between inputs that use the
-/// same version number but have different content (e.g. different codecs
-/// in the PMT).
-///
-/// Layout (for PUSI=1, pointer_field=0):
-///   byte 4:  pointer_field (0x00)
-///   byte 5:  table_id
-///   byte 6-7: section_syntax_indicator + section_length
-///   byte 8-9: transport_stream_id (PAT) or program_number (PMT)
-///   byte 10: reserved(2) + version_number(5) + current_next_indicator(1)
-///   ...
-///   last 4 bytes of section: CRC32
-///
-/// `version` is masked to 5 bits and written in place; `current_next`
-/// and the two reserved bits are preserved.
-fn set_psi_version(pkt: &mut [u8; TS_PACKET_SIZE], version: u8) {
-    // Verify this is a PUSI packet.
-    if !ts_pusi(pkt) {
-        return;
-    }
-
-    let pointer_field = pkt[4] as usize;
-    let section_start = 5 + pointer_field;
-
-    // Need at least: table_id(1) + section_length(2) + header(5) + CRC(4) = 12
-    if section_start + 12 > TS_PACKET_SIZE {
-        return;
-    }
-
-    // Parse section_length (12 bits after section_syntax_indicator).
-    let section_length =
-        (((pkt[section_start + 1] & 0x0F) as usize) << 8) | (pkt[section_start + 2] as usize);
-
-    // Total section bytes = table_id(1) + 2 (indicator+length) + section_length
-    let section_end = section_start + 3 + section_length;
-    if section_end > TS_PACKET_SIZE || section_length < 9 {
-        return; // Malformed or too short for version + CRC
-    }
-
-    // Write version_number (5 bits at offset +5 from section_start, bits [5:1]).
-    let version_byte = &mut pkt[section_start + 5];
-    let v = version & 0x1F;
-    *version_byte = (*version_byte & 0xC1) | (v << 1);
-
-    // Recalculate CRC32 over the section body (excluding the CRC itself).
-    let crc_offset = section_end - 4;
-    let crc = mpeg2_crc32(&pkt[section_start..crc_offset]);
-    pkt[crc_offset] = (crc >> 24) as u8;
-    pkt[crc_offset + 1] = (crc >> 16) as u8;
-    pkt[crc_offset + 2] = (crc >> 8) as u8;
-    pkt[crc_offset + 3] = crc as u8;
-}
-
 /// Back-compat wrapper: bump the `version_number` by 1 modulo 32 and fix
 /// the CRC. Retained for any callers / tests that want the historical
 /// "increment-from-current" behaviour. New production code on the switch
-/// path uses [`set_psi_version`] with the monotonic counter instead.
+/// path uses [`set_psi_version`] (re-exported from `ts_parse`) with the
+/// monotonic counter instead.
 #[cfg(test)]
 fn bump_psi_version(pkt: &mut [u8; TS_PACKET_SIZE]) {
     if !ts_pusi(pkt) {

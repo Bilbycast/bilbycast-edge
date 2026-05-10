@@ -57,10 +57,12 @@ pub fn spawn_replay_input(
     flow_id: String,
     input_id: String,
     cmd_rx: mpsc::Receiver<ReplayCommand>,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = run(
             config, per_input_tx, flow_stats, cancel, events, flow_id, input_id, cmd_rx,
+            av_sync_pacer,
         ).await {
             tracing::error!(target: "replay", "replay input exited: {e:#}");
         }
@@ -76,6 +78,7 @@ async fn run(
     flow_id: String,
     input_id: String,
     mut cmd_rx: mpsc::Receiver<ReplayCommand>,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> Result<()> {
     let mut reader = open_reader(&config).await?;
     let mut playing = !config.start_paused && config.clip_id.is_some()
@@ -107,6 +110,9 @@ async fn run(
             None
         }
     };
+    if let (Some(t), Some(p)) = (transcoder.as_mut(), av_sync_pacer.as_ref()) {
+        t.set_av_sync_pacer(p.clone());
+    }
     crate::engine::input_transcode::register_ingress_stats(
         flow_stats.as_ref(),
         &input_id,

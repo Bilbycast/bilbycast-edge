@@ -105,6 +105,7 @@ pub fn spawn_rtp_input(
     flow_id: String,
     input_id: String,
     force_idr: Arc<std::sync::atomic::AtomicBool>,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut transcoder = match InputTranscoder::new(
@@ -124,6 +125,9 @@ pub fn spawn_rtp_input(
                 None
             }
         };
+        if let (Some(t), Some(p)) = (transcoder.as_mut(), av_sync_pacer.as_ref()) {
+            t.set_av_sync_pacer(p.clone());
+        }
         super::input_transcode::register_ingress_stats(
             stats.as_ref(),
             &input_id,

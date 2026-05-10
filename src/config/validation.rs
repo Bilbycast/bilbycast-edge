@@ -1791,6 +1791,42 @@ fn validate_st2110_ancillary_output(c: &St2110AncillaryOutputConfig) -> Result<(
     Ok(())
 }
 
+/// Validate `cbr_pad_to_kbps` against the declared encoder bitrates. The
+/// padder is meant to inflate the natural transcoded rate up to a stable
+/// CBR target, so the target must:
+///   - sit within the [MIN, MAX] range exposed by `engine::ts_null_padder`;
+///   - exceed the sum of declared `audio_encode.bitrate_kbps` and
+///     `video_encode.bitrate_kbps` by at least 5 % so there's actual
+///     headroom to inject NULLs (a target equal to or below the encoder
+///     budget would never trigger any padding).
+fn validate_cbr_pad_to_kbps(
+    cbr: Option<u32>,
+    audio_kbps: Option<u32>,
+    video_kbps: Option<u32>,
+    ctx: &str,
+) -> Result<()> {
+    let Some(target) = cbr else { return Ok(()) };
+    use crate::engine::ts_null_padder::{MAX_TARGET_KBPS, MIN_TARGET_KBPS};
+    if !(MIN_TARGET_KBPS..=MAX_TARGET_KBPS).contains(&target) {
+        bail!(
+            "{ctx}: cbr_pad_to_kbps must be {MIN_TARGET_KBPS}..={MAX_TARGET_KBPS}, got {target}"
+        );
+    }
+    let declared = audio_kbps.unwrap_or(0).saturating_add(video_kbps.unwrap_or(0));
+    if declared > 0 {
+        // 5 % headroom: target must be ≥ declared × 1.05 (rounded up).
+        let min_target = declared.saturating_add((declared / 20).max(1));
+        if target < min_target {
+            bail!(
+                "{ctx}: cbr_pad_to_kbps={target} is too close to the declared encoder \
+                 budget ({declared} kbps audio+video); needs ≥ {min_target} (5 % headroom) \
+                 to leave room for NULL packets"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_video_dims(width: u32, height: u32, fps_num: u32, fps_den: u32, ctx: &str) -> Result<()> {
     if !(64..=8192).contains(&width) || width % 2 != 0 {
         bail!("{ctx}: width must be 64..=8192 and even, got {width}");
@@ -2668,10 +2704,22 @@ fn validate_video_encode(
         if !(64..=7680).contains(&w) {
             bail!("{context}: video_encode.width must be 64..=7680, got {w}");
         }
+        if w % 2 != 0 {
+            bail!(
+                "{context}: video_encode.width must be even (libx264/x265/HW encoders \
+                 require chroma-aligned dimensions), got {w}"
+            );
+        }
     }
     if let Some(h) = enc.height {
         if !(64..=4320).contains(&h) {
             bail!("{context}: video_encode.height must be 64..=4320, got {h}");
+        }
+        if h % 2 != 0 {
+            bail!(
+                "{context}: video_encode.height must be even (libx264/x265/HW encoders \
+                 require chroma-aligned dimensions), got {h}"
+            );
         }
     }
     match (enc.fps_num, enc.fps_den) {
@@ -3317,6 +3365,12 @@ pub fn validate_output_with_input(
                 }
                 validate_video_encode(enc, &format!("RTP output '{}'", rtp.id))?;
             }
+            validate_cbr_pad_to_kbps(
+                rtp.cbr_pad_to_kbps,
+                rtp.audio_encode.as_ref().and_then(|a| a.bitrate_kbps),
+                rtp.video_encode.as_ref().and_then(|v| v.bitrate_kbps),
+                &format!("RTP output '{}'", rtp.id),
+            )?;
         }
         OutputConfig::Udp(udp) => {
             validate_id(&udp.id, "UDP output")?;
@@ -3388,6 +3442,12 @@ pub fn validate_output_with_input(
                 }
                 validate_video_encode(enc, &format!("UDP output '{}'", udp.id))?;
             }
+            validate_cbr_pad_to_kbps(
+                udp.cbr_pad_to_kbps,
+                udp.audio_encode.as_ref().and_then(|a| a.bitrate_kbps),
+                udp.video_encode.as_ref().and_then(|v| v.bitrate_kbps),
+                &format!("UDP output '{}'", udp.id),
+            )?;
         }
         OutputConfig::Srt(srt) => {
             validate_id(&srt.id, "SRT output")?;
@@ -3531,6 +3591,12 @@ pub fn validate_output_with_input(
                 }
                 validate_video_encode(enc, &format!("SRT output '{}'", srt.id))?;
             }
+            validate_cbr_pad_to_kbps(
+                srt.cbr_pad_to_kbps,
+                srt.audio_encode.as_ref().and_then(|a| a.bitrate_kbps),
+                srt.video_encode.as_ref().and_then(|v| v.bitrate_kbps),
+                &format!("SRT output '{}'", srt.id),
+            )?;
         }
         OutputConfig::Rist(rist) => {
             validate_rist_output(rist)?;
@@ -5682,6 +5748,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                cbr_pad_to_kbps: None,
                 interface_binding: None,
         }));
         config.flows.push(FlowConfig {
@@ -6005,6 +6072,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                cbr_pad_to_kbps: None,
                 interface_binding: None,
         }));
         config.flows.push(FlowConfig {
@@ -6069,6 +6137,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                cbr_pad_to_kbps: None,
                 interface_binding: None,
         }));
         config.flows.push(FlowConfig {
@@ -6156,6 +6225,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                cbr_pad_to_kbps: None,
                 interface_binding: None,
         }));
         config.flows.push(FlowConfig {
@@ -6220,6 +6290,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                cbr_pad_to_kbps: None,
                 interface_binding: None,
         }));
         config.flows.push(FlowConfig {
@@ -6284,6 +6355,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                cbr_pad_to_kbps: None,
                 interface_binding: None,
         }));
         config.flows.push(FlowConfig {
@@ -7205,6 +7277,50 @@ mod tests {
     }
 
     #[test]
+    fn validate_video_encode_rejects_odd_dimensions() {
+        use crate::config::models::VideoEncodeConfig;
+        let make = |w: Option<u32>, h: Option<u32>| VideoEncodeConfig {
+            codec: "x264".into(),
+            width: w,
+            height: h,
+            fps_num: None,
+            fps_den: None,
+            bitrate_kbps: Some(4000),
+            gop_size: None,
+            preset: None,
+            profile: None,
+            chroma: None,
+            bit_depth: None,
+            rate_control: None,
+            crf: None,
+            max_bitrate_kbps: None,
+            bframes: None,
+            refs: None,
+            level: None,
+            tune: None,
+            color_primaries: None,
+            color_transfer: None,
+            color_matrix: None,
+            color_range: None,
+            hw_decode: None,
+        };
+        let err = validate_video_encode(&make(Some(1281), Some(720)), "ctx")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be even"), "expected even-width error, got: {err}");
+        let err = validate_video_encode(&make(Some(1280), Some(721)), "ctx")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be even"), "expected even-height error, got: {err}");
+        #[cfg(feature = "video-encoder-x264")]
+        assert!(validate_video_encode(&make(Some(1280), Some(720)), "ctx").is_ok());
+        let err = validate_video_encode(&make(None, Some(721)), "ctx")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be even"));
+    }
+
+    #[test]
     fn validate_video_encode_qsv_recognised() {
         // The codec parser must accept `h264_qsv` and `hevc_qsv` as valid
         // names. The exact error path depends on the build:
@@ -7579,6 +7695,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                cbr_pad_to_kbps: None,
                 interface_binding: None,
         }));
         config.outputs.push(OutputConfig::Udp(UdpOutputConfig {
@@ -7597,6 +7714,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                cbr_pad_to_kbps: None,
                 interface_binding: None,
         }));
         let err = validate_config(&config).unwrap_err().to_string();

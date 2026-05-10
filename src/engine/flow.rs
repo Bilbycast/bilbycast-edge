@@ -462,6 +462,22 @@ impl FlowRuntime {
         ));
         spawn_drop_diag_reporter();
 
+        // ── Master clock selection (must precede input + output spawn so
+        // the pacer is available for ingress + egress transcoders) ──
+        //
+        // Ingress transcoders (Group A inputs that re-encode video) need
+        // the same per-flow master-clock pacer the egress replacers use,
+        // so that PCR generated inside the encoder pipeline references
+        // the same clock as PCR re-stamped at wire-emit time.
+        let (master_clock, pll_master) =
+            build_master_clock(&config.config, active_input_cfg, &event_sender, &cancel_token);
+        flow_stats.set_master_clock_telemetry(master_clock.telemetry());
+        flow_stats.set_master_clock_lipsync(master_clock.lipsync_offset_90k());
+        let av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>> =
+            Some(Arc::new(crate::engine::av_sync_mux::AvSyncPacer::new(
+                master_clock.clone(),
+            )));
+
         // Spawn every input task (warm passive). Each input publishes to its
         // own per-input broadcast channel; a forwarder task drains it and
         // gates on the active-input watch.
@@ -507,6 +523,7 @@ impl FlowRuntime {
                 &event_sender,
                 &force_idr,
                 config.config.clock_domain,
+                av_sync_pacer.clone(),
                 #[cfg(feature = "replay")]
                 &replay_command_txs,
             );
@@ -808,17 +825,10 @@ impl FlowRuntime {
             cancel_token.child_token(),
         );
 
-        // ── Master clock selection (must precede output spawn so the
-        // pacer is available for replacers built inside each spawn) ──
-        let (master_clock, pll_master) =
-            build_master_clock(&config.config, active_input_cfg, &event_sender, &cancel_token);
-        flow_stats.set_master_clock_telemetry(master_clock.telemetry());
-        flow_stats.set_master_clock_lipsync(master_clock.lipsync_offset_90k());
-        let av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>> =
-            Some(Arc::new(crate::engine::av_sync_mux::AvSyncPacer::new(
-                master_clock.clone(),
-            )));
-
+        // Master clock + pacer were built earlier (above the input loop)
+        // so ingress transcoders could inherit the same per-flow clock.
+        // The PCR ingress sampler + telemetry tick stay here because they
+        // depend on broadcast_tx + flow_stats already being wired.
         if let Some(pll_master) = pll_master {
             let sampler_cancel = cancel_token.child_token();
             let _ = crate::engine::pcr_ingress_sampler::spawn_pcr_ingress_sampler(
@@ -2093,6 +2103,7 @@ fn spawn_single_input(
     event_sender: &EventSender,
     force_idr: &Arc<std::sync::atomic::AtomicBool>,
     flow_clock_domain: Option<u8>,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     #[cfg(feature = "replay")]
     replay_command_txs: &dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::replay::ReplayCommand>>,
 ) -> (JoinHandle<()>, Option<WhipSessionInfo>) {
@@ -2103,32 +2114,32 @@ fn spawn_single_input(
         InputConfig::Rtp(rtp_config) => spawn_rtp_input(
             rtp_config.clone(), per_input_tx.clone(), flow_stats.clone(),
             input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
-            input_id.clone(), force_idr.clone(),
+            input_id.clone(), force_idr.clone(), av_sync_pacer.clone(),
         ),
         InputConfig::Udp(udp_config) => spawn_udp_input(
             udp_config.clone(), per_input_tx.clone(), flow_stats.clone(),
             input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
-            input_id.clone(), force_idr.clone(),
+            input_id.clone(), force_idr.clone(), av_sync_pacer.clone(),
         ),
         InputConfig::Srt(srt_config) => spawn_srt_input(
             srt_config.clone(), per_input_tx.clone(), flow_stats.clone(),
             input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
-            input_id.clone(), force_idr.clone(),
+            input_id.clone(), force_idr.clone(), av_sync_pacer.clone(),
         ),
         InputConfig::Rist(rist_config) => spawn_rist_input(
             rist_config.clone(), per_input_tx.clone(), flow_stats.clone(),
             input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
-            input_id.clone(), force_idr.clone(),
+            input_id.clone(), force_idr.clone(), av_sync_pacer.clone(),
         ),
         InputConfig::Rtmp(rtmp_config) => spawn_rtmp_input(
             rtmp_config.clone(), per_input_tx.clone(), flow_stats.clone(),
             input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
-            input_id.clone(), force_idr.clone(),
+            input_id.clone(), force_idr.clone(), av_sync_pacer.clone(),
         ),
         InputConfig::Rtsp(rtsp_config) => super::input_rtsp::spawn_rtsp_input(
             rtsp_config.clone(), per_input_tx.clone(), flow_stats.clone(),
             input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
-            input_id.clone(), force_idr.clone(),
+            input_id.clone(), force_idr.clone(), av_sync_pacer.clone(),
         ),
         #[cfg(feature = "webrtc")]
         InputConfig::Webrtc(webrtc_config) => {
@@ -2138,6 +2149,7 @@ fn spawn_single_input(
                 webrtc_config.clone(), flow_id.to_string(), input_id.clone(),
                 per_input_tx.clone(), flow_stats.clone(), input_cancel.clone(),
                 session_rx, event_sender.clone(), force_idr.clone(),
+                av_sync_pacer.clone(),
             )
         }
         #[cfg(not(feature = "webrtc"))]
@@ -2152,7 +2164,7 @@ fn spawn_single_input(
         InputConfig::Whep(whep_config) => super::input_webrtc::spawn_whep_input(
             whep_config.clone(), per_input_tx.clone(), flow_stats.clone(),
             input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
-            input_id.clone(), force_idr.clone(),
+            input_id.clone(), force_idr.clone(), av_sync_pacer.clone(),
         ),
         #[cfg(not(feature = "webrtc"))]
         InputConfig::Whep(_) => {
@@ -2236,6 +2248,7 @@ fn spawn_single_input(
                 c.clone(), per_input_tx.clone(), flow_stats.clone(),
                 input_cancel.clone(), event_sender.clone(),
                 flow_id.to_string(), input_id.clone(), cmd_rx,
+                av_sync_pacer.clone(),
             )
         }
         #[cfg(not(feature = "replay"))]

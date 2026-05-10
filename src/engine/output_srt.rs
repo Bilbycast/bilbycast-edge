@@ -293,6 +293,9 @@ async fn srt_output_listener_loop(
     let mut pid_remapper = build_pid_remapper(config);
     let mut audio_replacer = build_audio_replacer(config, events);
     let mut video_replacer = build_video_replacer(config, &stats, events, av_sync_pacer.as_ref());
+    let mut null_padder = config
+        .cbr_pad_to_kbps
+        .map(crate::engine::ts_null_padder::TsNullPadder::new);
     spawn_replacer_switch_watcher(
         &config.id,
         audio_replacer.as_ref(),
@@ -404,7 +407,7 @@ async fn srt_output_listener_loop(
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
 
         let sink = SrtSendSink::Socket(socket.clone());
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut audio_replacer, &mut video_replacer, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut audio_replacer, &mut video_replacer, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -460,6 +463,9 @@ async fn srt_output_caller_loop(
     let mut pid_remapper = build_pid_remapper(config);
     let mut audio_replacer = build_audio_replacer(config, events);
     let mut video_replacer = build_video_replacer(config, &stats, events, av_sync_pacer.as_ref());
+    let mut null_padder = config
+        .cbr_pad_to_kbps
+        .map(crate::engine::ts_null_padder::TsNullPadder::new);
     spawn_replacer_switch_watcher(
         &config.id,
         audio_replacer.as_ref(),
@@ -517,7 +523,7 @@ async fn srt_output_caller_loop(
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
 
         let sink = SrtSendSink::Socket(socket.clone());
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut audio_replacer, &mut video_replacer, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut audio_replacer, &mut video_replacer, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -718,6 +724,7 @@ async fn srt_output_forward_loop(
     pid_remapper: &mut Option<TsPidRemapper>,
     audio_replacer: &mut Option<TsAudioReplacer>,
     video_replacer: &mut Option<TsVideoReplacer>,
+    null_padder: &mut Option<crate::engine::ts_null_padder::TsNullPadder>,
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
@@ -992,7 +999,7 @@ async fn srt_output_forward_loop(
                                 };
 
                             let mut v_out: Vec<u8> = Vec::new();
-                            let final_bytes: &[u8] =
+                            let after_video: &[u8] =
                                 if let Some(vreplacer) = video_replacer.as_mut() {
                                     crate::timed_block_in_place!(
                                         "output_srt.video_replacer",
@@ -1004,6 +1011,16 @@ async fn srt_output_forward_loop(
                                     &v_out
                                 } else {
                                     after_audio
+                                };
+
+                            // Apply CBR null padding if configured.
+                            let mut pad_out: Vec<u8> = Vec::new();
+                            let final_bytes: &[u8] =
+                                if let Some(padder) = null_padder.as_mut() {
+                                    padder.process(after_video, &mut pad_out);
+                                    &pad_out
+                                } else {
+                                    after_video
                                 };
 
                             if final_bytes.is_empty() {
@@ -1720,6 +1737,9 @@ async fn srt_output_bonded_loop(
     let mut pid_remapper = build_pid_remapper(config);
     let mut audio_replacer = build_audio_replacer(config, events);
     let mut video_replacer = build_video_replacer(config, &stats, events, av_sync_pacer.as_ref());
+    let mut null_padder = config
+        .cbr_pad_to_kbps
+        .map(crate::engine::ts_null_padder::TsNullPadder::new);
     spawn_replacer_switch_watcher(
         &config.id,
         audio_replacer.as_ref(),
@@ -1778,6 +1798,7 @@ async fn srt_output_bonded_loop(
                 let disconnected = srt_output_forward_loop(
                     config, &mut rx, &stats, &cancel, &sink,
                     &mut program_filter, &mut pid_remapper, &mut audio_replacer, &mut video_replacer,
+                    &mut null_padder,
                     input_format, compressed_audio_input, frame_rate_rx.clone(),
                 )
                 .await?;
@@ -1851,6 +1872,7 @@ async fn srt_output_bonded_loop(
                 let disconnected = srt_output_forward_loop(
                     config, &mut rx, &stats, &cancel, &sink,
                     &mut program_filter, &mut pid_remapper, &mut audio_replacer, &mut video_replacer,
+                    &mut null_padder,
                     input_format, compressed_audio_input, frame_rate_rx.clone(),
                 )
                 .await?;

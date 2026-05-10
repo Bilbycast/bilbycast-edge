@@ -18,12 +18,18 @@
 //!   and the encoded bitstream is repacketized as fresh TS.
 //! - Every other PID (audio, PAT, null, etc.) is forwarded unchanged.
 //!
-//! # Scope (MVP)
+//! # Scaling
 //!
-//! This first cut deliberately skips resolution scaling — if the
-//! operator sets `video_encode.width` / `height`, the replacer logs and
-//! uses the source resolution instead. Scaling will land in a follow-up
-//! step that plumbs `VideoScaler` into the pipeline.
+//! Resolution scaling is fully wired through
+//! [`crate::engine::video_encode_util::ScaledVideoEncoder`]: when
+//! `video_encode.width` / `.height` are set, the lazy-open path opens
+//! the encoder at the requested dimensions and inserts a
+//! `video_engine::VideoScaler` (libswscale) between the decoder and
+//! encoder. Mid-stream source-resolution changes rebuild the scaler
+//! while keeping the encoder open so downstream decoders don't see a
+//! resolution flip. Operators must request even dimensions; validation
+//! at config load enforces this so libx264 / libx265 / HW backends
+//! never reject the open call.
 //!
 //! # Thread safety
 //!
@@ -431,6 +437,19 @@ mod inner {
         /// from `src_pts_queue`, so A/V offset versus source is
         /// preserved. Phase 4 of the sync-mux work.
         pub av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+
+        /// Monotonic 5-bit PMT version counter for the rewritten PMT.
+        /// Initialized at 1; bumped (mod 32) every time we run
+        /// `reset_source_state()` (codec change, PID change, or external
+        /// input switch). Stamped onto every emitted PMT via
+        /// [`crate::engine::ts_parse::set_psi_version`] so receivers
+        /// always see a different version when the rewrite changes
+        /// stream_type — without it, an `A → B → A` round-trip leaves
+        /// receivers' cached PMT pointing at the wrong codec because
+        /// the source's natural version is identical across the round
+        /// trip. Mirrors the pattern in
+        /// `TsContinuityFixer::next_psi_version`.
+        out_psi_version: u8,
     }
 
     impl Inner {
@@ -536,6 +555,7 @@ mod inner {
                 last_emitted_pts_90k: None,
                 hw_decode_pref: cfg.hw_decode.unwrap_or_default(),
                 av_sync_pacer: None,
+                out_psi_version: 1,
             })
         }
 
@@ -576,6 +596,12 @@ mod inner {
             // First post-switch encoded frame must be an IDR so receivers
             // get a clean entry point right at the switch boundary.
             self.force_idr.store(true, Ordering::Relaxed);
+            // Bump the rewritten-PMT version (mod 32) so receivers see a
+            // distinct version on the next PMT and re-parse — without
+            // this, `A → B → A` round-trips leave the receiver's cached
+            // PMT pointing at B's codec when A was already the cached
+            // version_number. Mirrors `TsContinuityFixer::on_switch`.
+            self.out_psi_version = (self.out_psi_version.wrapping_add(1)) & 0x1F;
         }
 
         pub fn process(&mut self, input_ts: &[u8], output: &mut Vec<u8>) {
@@ -661,6 +687,16 @@ mod inner {
                                 &mut rewritten,
                                 self.video_pid.unwrap(),
                                 self.target_stream_type,
+                            );
+                            // Stamp the per-replacer monotonic version so
+                            // receivers re-parse on every codec change.
+                            // `set_psi_version` is a no-op on PUSI=0, which
+                            // is fine here because we only land in this
+                            // branch on PUSI PMT packets; CRC is recomputed
+                            // by the same call.
+                            crate::engine::ts_parse::set_psi_version(
+                                &mut rewritten,
+                                self.out_psi_version,
                             );
                             output.extend_from_slice(&rewritten);
                         } else {
@@ -996,6 +1032,24 @@ mod inner {
                         self.av_sync_pacer.as_ref(),
                         pts_for_pes,
                     );
+                    // Inter-PCR cadence here is whatever the encoder's
+                    // PUSI cadence gives us — at typical broadcast frame
+                    // rates (≥ 24 fps) this stays well under DVB's 100 ms
+                    // P1.7 ceiling. A previous attempt to inject AF-only
+                    // PCR carriers at a 40 ms wallclock cadence was
+                    // reverted: the carrier carried the same `pcr_27mhz`
+                    // as the immediately-following frame packet, so
+                    // receivers saw two consecutive PCRs ~µs apart with
+                    // identical 27 MHz values — broadcast decoders
+                    // interpreted that as a PCR-frequency-zero signal
+                    // and dropped the stream. Without `wire_emit` re-
+                    // stamping PCR at egress (which itself was reverted
+                    // because PTS-PCR offsets must remain coherent — see
+                    // memory/feedback_no_pcr_restamp.md), there is no
+                    // safe way to inject an AF-only PCR carrier with a
+                    // distinct PCR value. Long-GOP / low-fps streams
+                    // that need sub-100ms PCR cadence should use a
+                    // smaller GOP at the encoder instead.
                     let di = compute_discontinuity_flag(
                         &mut self.last_emitted_pts_90k,
                         pts_for_pes,

@@ -347,6 +347,12 @@ async fn rtp_output_loop(
     };
     let mut video_replace_scratch: Vec<u8> = Vec::new();
 
+    // Optional CBR null padder. See `engine::ts_null_padder`.
+    let mut null_padder = config
+        .cbr_pad_to_kbps
+        .map(crate::engine::ts_null_padder::TsNullPadder::new);
+    let mut pad_scratch: Vec<u8> = Vec::new();
+
     // Per-output input-switch watcher. See output_udp.rs for the
     // detailed rationale.
     let mut switch_handles: Vec<Arc<std::sync::atomic::AtomicBool>> = Vec::new();
@@ -535,7 +541,7 @@ async fn rtp_output_loop(
                 } else {
                     ts_input
                 };
-                if let Some(ref mut vreplacer) = video_replacer {
+                let after_video: &[u8] = if let Some(ref mut vreplacer) = video_replacer {
                     video_replace_scratch.clear();
                     crate::timed_block_in_place!(
                         "output_rtp.video_replacer",
@@ -544,9 +550,19 @@ async fn rtp_output_loop(
                             vreplacer.process(after_audio, &mut video_replace_scratch);
                         }
                     );
-                    ts_realign_buf.extend_from_slice(&video_replace_scratch);
+                    &video_replace_scratch
                 } else {
-                    ts_realign_buf.extend_from_slice(after_audio);
+                    after_audio
+                };
+                // Apply CBR null padding if configured. Inflates the natural
+                // transcoded rate to a stable target wire bitrate by injecting
+                // PID 0x1FFF NULLs.
+                if let Some(ref mut padder) = null_padder {
+                    pad_scratch.clear();
+                    padder.process(after_video, &mut pad_scratch);
+                    ts_realign_buf.extend_from_slice(&pad_scratch);
+                } else {
+                    ts_realign_buf.extend_from_slice(after_video);
                 }
 
                 if !ts_sync_found {

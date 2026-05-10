@@ -124,6 +124,7 @@ pub mod ts_es_hitless;
 /// `assembly.kind = spts`.
 pub mod ts_assembler;
 pub mod ts_audio_replace;
+pub mod ts_null_padder;
 pub mod ts_video_replace;
 /// Per-output wire emission engine. Dedicated `std::thread` (Linux:
 /// `SCHED_FIFO`) that paces TS datagrams onto the wire via PCR-anchored

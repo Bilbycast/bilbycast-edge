@@ -105,6 +105,15 @@ pub struct TsAudioReplacer {
     /// audio TS packet.
     out_audio_cc: u8,
 
+    /// Monotonic 5-bit PMT version counter for the rewritten PMT.
+    /// Initialized at 1; bumped (mod 32) on every `reset_source_state()`.
+    /// Stamped onto every emitted PMT via
+    /// [`crate::engine::ts_parse::set_psi_version`] so receivers always
+    /// see a different version when the rewrite changes audio
+    /// stream_type — without it, an `A → B → A` round-trip leaves
+    /// receivers' cached PMT pointing at the wrong codec.
+    out_psi_version: u8,
+
     /// Running output PTS in 90 kHz ticks. Anchored to the first decoded
     /// PES PTS; advanced by encoded frame sample counts. Used as the
     /// fallback when the source-PTS queue is exhausted (e.g. encoder
@@ -219,6 +228,7 @@ impl TsAudioReplacer {
             pes_buffer: Vec::with_capacity(16 * 1024),
             pes_started: false,
             out_audio_cc: 0,
+            out_psi_version: 1,
             out_pts_90k: 0,
             out_pts_anchored: false,
             src_pts_queue: std::collections::VecDeque::with_capacity(64),
@@ -366,6 +376,12 @@ impl TsAudioReplacer {
                                 self.target_stream_type,
                                 aac_pal,
                             );
+                            // Stamp the per-replacer monotonic version so
+                            // receivers re-parse on every codec change.
+                            crate::engine::ts_parse::set_psi_version(
+                                &mut rewritten,
+                                self.out_psi_version,
+                            );
                         }
                         output.extend_from_slice(&rewritten);
                     } else {
@@ -484,6 +500,12 @@ impl TsAudioReplacer {
         self.resolved_channels = 0;
         self.resolved_sample_rate = 0;
         self.codecs_ready = false;
+        // Bump the rewritten-PMT version (mod 32) so receivers see a
+        // distinct version on the next PMT and re-parse — without this,
+        // `A → B → A` round-trips leave the receiver's cached PMT
+        // pointing at B's audio codec when A was already the cached
+        // version_number.
+        self.out_psi_version = (self.out_psi_version.wrapping_add(1)) & 0x1F;
     }
 
     /// Route one audio TS packet into the PES accumulator, flushing the
