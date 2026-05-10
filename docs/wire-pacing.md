@@ -16,13 +16,24 @@ Kernel-paced delivery via `SO_TXTIME` + ETF qdisc moves the per-packet timing de
 
 | Tier | Mechanism | Inter-packet jitter | Requires |
 |---|---|---|---|
-| 1 | SO_TXTIME + ETF qdisc with `offload` on a PTP-disciplined NIC | Sub-µs | Linux ≥ 4.19, ETF qdisc, NIC with PTP HW tx timestamping (Mellanox CX-6/7, Intel E810/i210, etc.) |
-| 2 | SO_TXTIME + software ETF qdisc | ~1–10 µs | Linux ≥ 4.19, ETF qdisc installed but no NIC offload |
-| 3 | SO_TXTIME accepted, ETF qdisc absent | Same as no pacing — kernel ignores `SCM_TXTIME` | Linux ≥ 4.19 |
-| 4 | `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)` on SCHED_FIFO thread | ~50–500 µs typical, ms-tail under load | Linux + SCHED_FIFO grant (systemd `LimitRTPRIO=50` or `cap_sys_nice`) |
+| 1 | SO_TXTIME + ETF qdisc with `offload` on a PTP-disciplined NIC | Sub-µs | Linux ≥ 4.19, ETF qdisc on `clockid CLOCK_TAI`, NIC with PTP HW tx timestamping (Mellanox CX-6/7, Intel E810/I225/I226, etc.), `ptp4l` + `phc2sys` running |
+| 2 | SO_TXTIME + software ETF qdisc | ~1–10 µs | Linux ≥ 4.19, ETF qdisc installed on `clockid CLOCK_TAI` but no NIC offload |
+| 3 | SO_TXTIME accepted, ETF qdisc absent | Same as no pacing — kernel ignores `SCM_TXTIME` | Linux ≥ 4.19. Probe still succeeds at setsockopt level, but every datagram sends ASAP. **Diagnose with `BILBYCAST_FORCE_NANOSLEEP=1` to compare against tier 4.** |
+| 4 | `clock_nanosleep(CLOCK_TAI, TIMER_ABSTIME)` on SCHED_FIFO thread | ~50–500 µs typical, ms-tail under load | Linux + SCHED_FIFO grant (systemd `LimitRTPRIO=50` or `cap_sys_nice`). Default fallback when SO_TXTIME probe fails. |
 | 5 | `clock_nanosleep` at SCHED_OTHER, or `std::thread::sleep` on non-Linux | ~1–5 ms | None |
 
-For tier-1 broadcast PCR_AC compliance (≤ 500 ns) you need tier 1. Operators install ETF qdisc separately — see `packaging/setup-etf-qdisc.sh`. Without it the edge falls back gracefully and logs the active tier.
+`engine::wire_emit` always uses **`CLOCK_TAI`** for both `SO_TXTIME` setsockopt and `clock_nanosleep` — required by the kernel ETF qdisc on Intel ice/igc drivers (which reject CLOCK_MONOTONIC) and also gives us PTP discipline for free when `ptp4l` + `phc2sys` are running. `derive_target`'s pacing math is purely ns-relative, so the absolute clock domain doesn't matter for the closed-loop rate-following; what matters is that we use the clockid the kernel + the operator's PTP stack agrees on.
+
+For tier-1 broadcast PCR_AC compliance (≤ 500 ns) you need tier 1 in full — ETF qdisc + `ptp4l` + HW-PTP NIC. Without `ptp4l`, CLOCK_TAI is just system clock + leap seconds; you stay at tier 2/4 precision regardless of qdisc. Operators install ETF qdisc + run linuxptp separately — see [`docs/wire-pacing` operator runbook below](#operator-side-etf-qdisc) and the public [Wire-Time Precision page](https://docs.bilbycast.com/edge/wire-pacing/) on the website.
+
+## Operator escape hatch
+
+`BILBYCAST_FORCE_NANOSLEEP=1` skips the SO_TXTIME probe in `spawn_wire_emitter` and forces tier 4 (`clock_nanosleep`) on every output. Diagnostic only:
+
+- **"tier reports `so_txtime` but PCR_AC is bad"** — typical symptom of ETF qdisc misconfigured (wrong clockid, on the wrong interface, or not installed). Setting the env var forces the predictable userspace path; if PCR_AC improves, you have hard evidence the SO_TXTIME path was silently degraded.
+- **Kernel/driver regression workaround** — kernels where SO_TXTIME has a known SO_TXTIME bug under PCR-discontinuity load. Set the env var until upstream fixes land.
+
+Not a production setting. Production runs at tier 1 (SO_TXTIME + ETF + PTP).
 
 ## Architecture
 
