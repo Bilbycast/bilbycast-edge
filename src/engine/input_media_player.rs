@@ -27,7 +27,7 @@
 //! convenience (most slate assets live as MP4 in production media stores
 //! and as PNG / JPEG marketing artwork).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -388,8 +388,23 @@ impl SpliceContinuity {
 
     /// Called by each per-format player at the end of a file to update
     /// the target PTS for the *next* file's first emit. `last_pts_90k`
-    /// is the maximum 90 kHz PTS value emitted on the wire across both
-    /// audio and video PIDs during this file.
+    /// is the high-water-mark 90 kHz PTS the caller wants the next file's
+    /// timeline to continue from.
+    ///
+    /// **TS-passthrough callers should prefer `max_audio_pts` over
+    /// `max_video_pts`.** Real broadcast captures end with the last video
+    /// PES PTS ~1 s past the last audio PES PTS (mux buffering — video is
+    /// muxed ahead of decode time). Anchoring on `max_video_pts` shoves
+    /// the next loop's first PCR forward by that delta, leaving a ~1 s
+    /// audio gap on the wire every loop (receiver buffer underruns →
+    /// audible silence per loop). Anchoring on `max_audio_pts` keeps the
+    /// audio timeline tight: the next loop's first audio PES starts
+    /// `SPLICE_GUARD + audio_mux_delay` after the previous loop's last
+    /// audio sample (~200 ms total) instead of ~1 s.
+    ///
+    /// Synthesised paths (`play_mp4`, `play_image_file`) where audio and
+    /// video are muxed in lockstep have a single max-PTS and pass it
+    /// directly.
     pub(super) fn close_file(&mut self, last_pts_90k: u64) {
         self.last_emitted_output_pts_90k = last_pts_90k;
         // 33-bit wrap: PTS is 33 bits, target rolls over with it.
@@ -588,16 +603,31 @@ async fn play_ts_file(
     // file's own PCR baseline) — adding a constant offset preserves
     // those deltas, so pacing and rewriting are independent.
     //
-    // We track the highest emitted PTS across audio + video PIDs and
-    // hand that to `SpliceContinuity::close_file` as the next file's
-    // splice anchor. This keeps the wire-PCR timeline monotonic
-    // *without* injecting a mid-stream `SPLICE_GUARD`-sized PCR jump
-    // every loop — the per-loop jump introduced by anchoring on
-    // last-PCR caused VLC's audio decoder to accumulate small offsets
-    // and lose lip-sync over 5+ minutes of looped playback.
+    // We track the highest emitted PTS on the **audio** PIDs (preferred)
+    // and fall back to the highest emitted PTS across all PIDs when no
+    // audio PID has been observed yet. Anchoring `close_file` on the
+    // audio high-water-mark keeps the next loop's first audio PES
+    // tightly adjacent to the previous loop's last audio sample —
+    // critical because real broadcast captures end with last video PES
+    // PTS ~1 s past the last audio PES PTS (mux buffering), and
+    // anchoring on the overall max-PTS would shove the next file's
+    // first PCR forward by that ~1 s delta, leaving an audible per-loop
+    // gap on receivers. Anchoring on last-PCR is documented broken on
+    // Sky Witness 1080i25 — see memory
+    // `project_splice_di1_pcr_anchor_known_broken.md`.
     let target_pts_90k = session.cont.next_target_output_pts_90k;
     let mut splice_offset_27m: Option<i64> = None;
     let mut max_emitted_pts_90k: u64 = target_pts_90k;
+    let mut max_emitted_audio_pts_90k: Option<u64> = None;
+
+    // Audio PIDs discovered by parsing the program's PMT during playback.
+    // The PMT lives at `pmt_pid` (extracted from the PAT on its first
+    // PUSI=1 packet). The audio PID set is rebuilt every time a fresh
+    // PMT is seen so PMT-version bumps that add/remove audio tracks are
+    // tracked. Capacity bounded by the number of audio tracks per program
+    // (rare > 4 in broadcast).
+    let mut pat_first_pmt_pid: Option<u16> = None;
+    let mut audio_pids: HashSet<u16> = HashSet::with_capacity(4);
 
     loop {
         if session.cancel.is_cancelled() {
@@ -700,24 +730,44 @@ async fn play_ts_file(
             paced_anchor_bytes = pcr_byte_pos;
         }
 
+        // ── PAT/PMT inspection (audio-PID discovery for splice anchor) ─
+        // PAT lives on PID 0x0000. The first PMT PID it lists is our
+        // single-program target (media-player is SPTS-after-filter).
+        // PMT lives on the discovered PMT PID and lists every ES PID
+        // with its `stream_type` byte — we pick the audio streams.
+        let pkt_pid = ((packet[1] as u16 & 0x1F) << 8) | packet[2] as u16;
+        let pkt_pusi = (packet[1] & 0x40) != 0;
+        if pkt_pid == 0x0000 && pkt_pusi {
+            let programs = crate::engine::ts_parse::parse_pat_programs(&packet);
+            if let Some((_, pmt_pid)) = programs.first() {
+                pat_first_pmt_pid = Some(*pmt_pid);
+            }
+        } else if let Some(pmt_pid) = pat_first_pmt_pid {
+            if pkt_pid == pmt_pid && pkt_pusi {
+                refresh_audio_pids_from_pmt(&packet, &mut audio_pids);
+            }
+        }
+
         // ── Smooth-splice rewriters (in place, no allocation) ──────────
         rewrite_cc(&mut packet, session.cont);
         if let Some(off_27m) = splice_offset_27m {
             rewrite_pcr_in_place(&mut packet, off_27m);
             let off_90k = off_27m / 300;
-            // Track the high-water-mark emitted PTS across both audio
-            // and video PIDs — handed to `SpliceContinuity::close_file`
-            // as the next file's splice anchor. Pre-2189c62 behaviour:
-            // anchoring on max-PTS continues the timeline from where
-            // the file naturally ended (e.g. last video PES PTS ~1 s
-            // past last PCR), so the wire PCR sequence remains
-            // monotonic without inserting a mid-stream `SPLICE_GUARD`-
-            // sized jump per loop iteration.
+            // Track the high-water-mark emitted PTS overall *and* on
+            // audio PIDs separately. `close_file` prefers the audio
+            // high-water mark — see `SpliceContinuity::close_file` doc
+            // comment for the audio-gap-per-loop reasoning.
             if let Some(new_pts) =
                 rewrite_pes_timestamps_in_place(&mut packet, off_90k)
             {
                 if new_pts > max_emitted_pts_90k {
                     max_emitted_pts_90k = new_pts;
+                }
+                if audio_pids.contains(&pkt_pid) {
+                    let cur = max_emitted_audio_pts_90k.unwrap_or(0);
+                    if new_pts > cur {
+                        max_emitted_audio_pts_90k = Some(new_pts);
+                    }
                 }
             }
         }
@@ -771,10 +821,111 @@ async fn play_ts_file(
         emit_bundle(&mut bundle, session, fake_rtp_ts(session));
     }
 
-    // Hand off the high-water-mark PTS to SpliceContinuity so the next
-    // file's first emitted PTS picks up immediately after.
-    session.cont.close_file(max_emitted_pts_90k);
+    // Hand off the splice anchor to `SpliceContinuity`. Prefer the
+    // audio high-water mark — see `close_file` doc. Fall back to the
+    // overall max when no audio PID has been observed (very rare —
+    // requires either a video-only stream or a file too short to carry
+    // a PMT, neither of which is realistic for broadcast captures).
+    let anchor_pts = max_emitted_audio_pts_90k.unwrap_or(max_emitted_pts_90k);
+    session.cont.close_file(anchor_pts);
     Ok(())
+}
+
+/// Walk a PMT TS packet's program-element loop, returning the set of
+/// PIDs carrying an audio elementary stream. Recognised stream_types:
+/// MPEG-1 audio (0x03), MPEG-2 audio (0x04), AAC ADTS (0x0F), AAC LATM
+/// (0x11), AC-3 (0x81), DTS (0x82), DTS-HD (0x88), E-AC-3 (0x87), and
+/// stream_type 0x06 (private) *when* its ES descriptors include the
+/// AC-3 (`0x6A`) / E-AC-3 (`0x7A`) descriptor or a `registration_descriptor`
+/// with format_identifier `"AC-3"` / `"EAC3"` — DVB carries AC-3 via this
+/// path (BSkyB Sky Witness HD captures use it on the 1080i25 testbed file).
+///
+/// `out` is cleared and repopulated each call so PMT-version bumps that
+/// add or remove audio tracks are tracked. No allocations on the steady
+/// state — `HashSet::clear` keeps the existing capacity.
+fn refresh_audio_pids_from_pmt(pkt: &[u8; TS_PACKET], out: &mut HashSet<u16>) {
+    let mut offset = 4usize;
+    if (pkt[3] >> 4) & 0b11 == 0b11 {
+        // adaptation_field present — skip it
+        let af_len = pkt[4] as usize;
+        offset = 5 + af_len;
+    }
+    if offset >= TS_PACKET {
+        return;
+    }
+    // PSI pointer_field
+    let pointer = pkt[offset] as usize;
+    offset += 1 + pointer;
+    if offset + 12 > TS_PACKET {
+        return;
+    }
+    if pkt[offset] != 0x02 {
+        // Not a PMT (table_id 0x02). Could happen if a PMT-version
+        // bump shifts the section across packets and the second packet
+        // arrives first — leave the audio set as-is and re-discover
+        // on the next PUSI=1 PMT.
+        return;
+    }
+    let section_length =
+        (((pkt[offset + 1] & 0x0F) as usize) << 8) | (pkt[offset + 2] as usize);
+    let program_info_length =
+        (((pkt[offset + 10] & 0x0F) as usize) << 8) | (pkt[offset + 11] as usize);
+    let mut pos = offset + 12 + program_info_length;
+    let data_end = (offset + 3 + section_length)
+        .min(TS_PACKET)
+        .saturating_sub(4);
+
+    out.clear();
+    while pos + 5 <= data_end {
+        let stream_type = pkt[pos];
+        let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
+        let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
+        let is_audio = match stream_type {
+            0x03 | 0x04 | 0x0F | 0x11 | 0x81 | 0x82 | 0x87 | 0x88 => true,
+            0x06 => private_es_descriptors_indicate_audio(
+                pkt,
+                pos + 5,
+                (pos + 5 + es_info_len).min(data_end),
+            ),
+            _ => false,
+        };
+        if is_audio {
+            out.insert(es_pid);
+        }
+        pos += 5 + es_info_len;
+    }
+}
+
+/// Inspect a `stream_type=0x06` ES's descriptor loop and decide whether
+/// it carries audio. Returns `true` if any descriptor identifies it as
+/// AC-3 / E-AC-3 (DVB tags `0x6A` / `0x7A`, or a `registration_descriptor`
+/// 0x05 with format_identifier `"AC-3"` / `"EAC3"`). Returns `false` for
+/// teletext / subtitle private streams which also use type 0x06.
+fn private_es_descriptors_indicate_audio(
+    pkt: &[u8; TS_PACKET],
+    start: usize,
+    end: usize,
+) -> bool {
+    let mut p = start;
+    while p + 2 <= end {
+        let tag = pkt[p];
+        let len = pkt[p + 1] as usize;
+        if p + 2 + len > end {
+            return false;
+        }
+        match tag {
+            0x6A | 0x7A => return true,
+            0x05 if len == 4 => {
+                let fmt = &pkt[p + 2..p + 6];
+                if fmt == b"AC-3" || fmt == b"EAC3" {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        p += 2 + len;
+    }
+    false
 }
 
 /// Detect the on-disk MPEG-TS packet stride for the given head buffer.
@@ -1908,6 +2059,101 @@ mod tests {
         );
         // The continuity state should have observed both files cleanly.
         assert!(cont.has_played_at_least_one_file);
+    }
+
+    /// Synthesise a single-packet PMT carrying one video + one audio ES and
+    /// confirm that the audio PID is added to the set.
+    fn synth_pmt(pmt_pid: u16, program_no: u16, entries: &[(u8, u16, &[u8])]) -> [u8; TS_PACKET] {
+        let mut pkt = [0xFFu8; TS_PACKET];
+        pkt[0] = SYNC_BYTE;
+        pkt[1] = 0x40 | ((pmt_pid >> 8) as u8 & 0x1F); // PUSI=1
+        pkt[2] = pmt_pid as u8;
+        pkt[3] = 0x10; // afc=01, CC=0
+        pkt[4] = 0; // pointer_field
+        let body_start = 5;
+        pkt[body_start] = 0x02; // table_id
+        let mut es_loop_bytes = Vec::new();
+        for (st, pid, desc) in entries {
+            es_loop_bytes.push(*st);
+            es_loop_bytes.push(0xE0 | ((pid >> 8) as u8 & 0x1F));
+            es_loop_bytes.push(*pid as u8);
+            let dl = desc.len();
+            es_loop_bytes.push(0xF0 | ((dl >> 8) as u8 & 0x0F));
+            es_loop_bytes.push(dl as u8);
+            es_loop_bytes.extend_from_slice(desc);
+        }
+        let section_len = 9 + es_loop_bytes.len() + 4; // header(9) + es loop + CRC(4)
+        pkt[body_start + 1] = 0xB0 | ((section_len >> 8) as u8 & 0x0F);
+        pkt[body_start + 2] = section_len as u8;
+        pkt[body_start + 3] = (program_no >> 8) as u8;
+        pkt[body_start + 4] = program_no as u8;
+        pkt[body_start + 5] = 0xC1; // version=0, current_next=1
+        pkt[body_start + 6] = 0; // section_number
+        pkt[body_start + 7] = 0; // last_section_number
+        pkt[body_start + 8] = 0xE0; // PCR_PID high (we use video PID)
+        pkt[body_start + 9] = 0x00;
+        pkt[body_start + 10] = 0xF0; // program_info_length = 0
+        pkt[body_start + 11] = 0x00;
+        let es_start = body_start + 12;
+        pkt[es_start..es_start + es_loop_bytes.len()].copy_from_slice(&es_loop_bytes);
+        // Don't bother with real CRC — refresh_audio_pids_from_pmt doesn't
+        // verify it. Fill the 4 CRC bytes with zero.
+        let crc_start = es_start + es_loop_bytes.len();
+        for i in 0..4 {
+            pkt[crc_start + i] = 0;
+        }
+        pkt
+    }
+
+    #[test]
+    fn pmt_audio_pid_discovery_picks_up_mp2_and_ac3() {
+        // BSkyB Sky Witness HD shape: MP2 (0x04) + AC-3 carried as private
+        // (0x06) with AC-3 descriptor 0x6A. Video PID 0x0203 (H.264 0x1B).
+        let entries: &[(u8, u16, &[u8])] = &[
+            (0x1B, 0x0203, &[]),           // H.264 video — not audio
+            (0x04, 0x0283, &[]),           // MPEG-2 audio
+            (0x06, 0x0297, &[0x6A, 0x01, 0x00]), // AC-3 via DVB descriptor
+            (0x06, 0x0241, &[0x56, 0x01, 0x00]), // teletext via DVB 0x56 — not audio
+        ];
+        let pkt = synth_pmt(0x0106, 3928, entries);
+        let mut out: HashSet<u16> = HashSet::new();
+        refresh_audio_pids_from_pmt(&pkt, &mut out);
+        assert!(out.contains(&0x0283), "MP2 PID should be detected as audio");
+        assert!(out.contains(&0x0297), "AC-3-via-0x06+0x6A should be detected as audio");
+        assert!(!out.contains(&0x0203), "video PID must not be flagged as audio");
+        assert!(!out.contains(&0x0241), "teletext PID must not be flagged as audio");
+    }
+
+    #[test]
+    fn pmt_audio_pid_discovery_handles_aac_and_eac3() {
+        // AAC-LATM (0x11) + E-AC-3 via DVB (0x06 + 0x7A descriptor).
+        let entries: &[(u8, u16, &[u8])] = &[
+            (0x11, 0x0100, &[]),
+            (0x06, 0x0101, &[0x7A, 0x01, 0x00]),
+        ];
+        let pkt = synth_pmt(0x1000, 1, entries);
+        let mut out: HashSet<u16> = HashSet::new();
+        refresh_audio_pids_from_pmt(&pkt, &mut out);
+        assert!(out.contains(&0x0100));
+        assert!(out.contains(&0x0101));
+    }
+
+    #[test]
+    fn pmt_audio_pid_discovery_clears_stale_pids_across_calls() {
+        // A second PMT carrying only one of the audio PIDs replaces the
+        // set wholesale — stale audio PIDs from prior PMT versions don't
+        // accumulate.
+        let mut out: HashSet<u16> = HashSet::new();
+
+        let pkt1 = synth_pmt(0x1000, 1, &[(0x04, 0x0100, &[]), (0x81, 0x0101, &[])]);
+        refresh_audio_pids_from_pmt(&pkt1, &mut out);
+        assert!(out.contains(&0x0100));
+        assert!(out.contains(&0x0101));
+
+        let pkt2 = synth_pmt(0x1000, 1, &[(0x04, 0x0100, &[])]);
+        refresh_audio_pids_from_pmt(&pkt2, &mut out);
+        assert!(out.contains(&0x0100));
+        assert!(!out.contains(&0x0101), "removed audio PID must not linger");
     }
 
 }
