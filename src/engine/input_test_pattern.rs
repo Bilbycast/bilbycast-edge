@@ -112,6 +112,7 @@ async fn run_inner(
         config.transcode.as_ref(),
         config.video_encode.as_ref(),
         None,
+            config.pid_overrides.as_ref(),
     ) {
         Ok(t) => {
             if let Some(ref t) = t {
@@ -170,6 +171,7 @@ async fn run_inner(
         color_transfer: None,
         color_matrix: None,
         color_range: None,
+        source_video_pid: None,
         hw_decode: None,
     };
 
@@ -199,6 +201,11 @@ async fn run_inner(
     };
 
     let mut ts_muxer = crate::engine::rtmp::ts_mux::TsMuxer::new();
+    if let Some(po) = config.pid_overrides.as_ref() {
+        if let Some(entry) = po.get(&1) {
+                ts_muxer.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
+            }
+    }
     // Without this the PMT never advertises the audio PID and downstream
     // decoders silently drop the muxed AAC PES packets.
     if audio_ctx.is_some() {

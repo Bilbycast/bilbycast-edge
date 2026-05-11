@@ -24,6 +24,7 @@ use super::audio_transcode::InputFormat;
 use super::delay_buffer::resolve_output_delay;
 use super::packet::RtpPacket;
 use super::ts_audio_replace::TsAudioReplacer;
+use super::ts_pid_overrides_rewriter::TsPidOverridesRewriter;
 use super::ts_pid_remapper::TsPidRemapper;
 use super::ts_program_filter::TsProgramFilter;
 use super::ts_video_replace::TsVideoReplacer;
@@ -141,7 +142,7 @@ async fn udp_output_loop_302m(
         n if n > 8 => 8,
         _ => input.channels + 1,
     };
-    let mut pipeline = match S302mOutputPipeline::new(input, out_channels, 24, 4_000) {
+    let mut pipeline = match S302mOutputPipeline::new(input, out_channels, 24, 4_000, config.pid_overrides.as_ref()) {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(
@@ -276,9 +277,33 @@ async fn udp_output_loop(
     });
     let mut remap_scratch: Vec<u8> = Vec::new();
 
+    // Optional per-program role-keyed PID rewriter for passthrough flows.
+    // Only engages when `pid_overrides` is set without `audio_encode` /
+    // `video_encode` — the transcoded paths handle PID rewriting inside
+    // the replacers, so chaining the rewriter on top would double-rewrite.
+    let no_transcode = config.audio_encode.is_none() && config.video_encode.is_none();
+    let mut pid_overrides_rewriter = if no_transcode {
+        config.pid_overrides.as_ref().and_then(|m| {
+            let r = TsPidOverridesRewriter::new(m);
+            if r.is_active() {
+                tracing::info!(
+                    "UDP output '{}': pid_overrides passthrough rewriter active ({} programs)",
+                    config.id,
+                    m.len()
+                );
+                Some(r)
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    let mut overrides_scratch: Vec<u8> = Vec::new();
+
     // Optional audio ES replacement (decode + re-encode audio in the TS).
     let mut audio_replacer = match config.audio_encode.as_ref() {
-        Some(enc) => match TsAudioReplacer::new(enc, config.transcode.clone()) {
+        Some(enc) => match TsAudioReplacer::new(enc, config.transcode.clone(), config.pid_overrides.as_ref()) {
             Ok(r) => {
                 tracing::info!(
                     "UDP output '{}': audio_encode active ({})",
@@ -315,7 +340,7 @@ async fn udp_output_loop(
 
     // Optional video ES replacement (decode + re-encode video in the TS).
     let mut video_replacer = match config.video_encode.as_ref() {
-        Some(enc) => match TsVideoReplacer::new(enc, None) {
+        Some(enc) => match TsVideoReplacer::new(enc, None, config.pid_overrides.as_ref()) {
             Ok(mut r) => {
                 let backend = match enc.codec.as_str() {
                     "x264" | "x265" => enc.codec.clone(),
@@ -540,15 +565,28 @@ async fn udp_output_loop(
                 after_video
             };
 
+            // Per-program role-keyed PID rewrite for passthrough flows
+            // (gated on no_transcode at construction). Sits before the
+            // mechanical pid_map so the operator can layer both: roles
+            // first (PMT/video/audio/PCR), then any leftover mechanical
+            // remap on top.
+            let after_overrides: &[u8] = if let Some(ref mut rw) = pid_overrides_rewriter {
+                overrides_scratch.clear();
+                rw.process(after_pad, &mut overrides_scratch);
+                &overrides_scratch
+            } else {
+                after_pad
+            };
+
             // Apply PID remapping last, so audio/video replacers see original
             // PIDs in the PMT (they identify streams by stream_type, but this
             // keeps debugging + stats consistent with the source stream).
             if let Some(ref mut remapper) = pid_remapper {
                 remap_scratch.clear();
-                remapper.process(after_pad, &mut remap_scratch);
+                remapper.process(after_overrides, &mut remap_scratch);
                 ts_buf.extend_from_slice(&remap_scratch);
             } else {
-                ts_buf.extend_from_slice(after_pad);
+                ts_buf.extend_from_slice(after_overrides);
             }
 
             // Find TS sync boundary on first data

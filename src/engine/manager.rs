@@ -483,6 +483,21 @@ impl FlowManager {
             .ok_or_else(|| anyhow::anyhow!("Flow '{}' is not running", flow_id))?;
         let previous_input_id = runtime.active_input_tx.borrow().clone();
         runtime.switch_active_input(new_input_id).await?;
+        // PID-bus / Flow Assembly: when the flow has a running assembler,
+        // additionally signal the switch via PlanCommand. The assembler
+        // walks every Switch slot whose leg list contains `new_input_id`,
+        // flips that slot's active-leg pointer, bumps the owning program's
+        // PMT version, and arms DI=1 on the next PCR for the slot's
+        // out_pid. Slots without a matching leg are silently skipped.
+        // Channel try_send is fine here — channel depth 16 is plenty for
+        // operator-paced switches; if full, the operator can re-Take.
+        if let Some(handle) = runtime.pid_bus_assembler_handle.as_ref() {
+            let _ = handle.plan_tx.try_send(
+                crate::engine::ts_assembler::PlanCommand::SwitchActiveInput {
+                    new_input_id: new_input_id.to_string(),
+                },
+            );
+        }
         self.event_sender.send(Event {
             severity: EventSeverity::Info,
             category: category::FLOW.to_string(),

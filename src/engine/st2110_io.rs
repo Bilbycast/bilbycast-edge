@@ -217,6 +217,7 @@ pub async fn run_st2110_audio_input(
             /* initial_timestamp */ 0,
             flow_id.as_deref().unwrap_or("flow"),
             label,
+            config.pid_overrides.as_ref(),
         ) {
             Ok(p) => {
                 if p.is_some() {
@@ -1222,6 +1223,7 @@ mod tests {
             max_bitrate_mbps: None,
             audio_encode: None,
             transcode: None,
+                pid_overrides: None,
                 interface_binding: None,
         };
         let (tx, _rx0) = broadcast::channel::<RtpPacket>(64);
@@ -1340,6 +1342,7 @@ mod tests {
             max_bitrate_mbps: None,
             audio_encode: None,
             transcode: None,
+                pid_overrides: None,
                 interface_binding: None,
         };
         let (tx, _rx0) = broadcast::channel::<RtpPacket>(64);
@@ -1601,6 +1604,7 @@ mod tests {
             max_bitrate_mbps: None,
             audio_encode: None,
             transcode: None,
+                pid_overrides: None,
                 interface_binding: None,
         };
 

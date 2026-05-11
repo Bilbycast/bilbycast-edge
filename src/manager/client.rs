@@ -980,6 +980,15 @@ fn edge_capabilities() -> Vec<&'static str> {
         // assembly Hitless variant accepts a `mode = seq_aware` selector.
         // Manager UI gates the SeqAware option on this capability.
         "hitless_2022_7",
+        // Operator-driven N-input switch slot in Flow Assembly. The
+        // assembly `SlotSource::Switch` variant carries 1..=64 legs and
+        // an `initial_input_id`; `ActivateInput` flips every Switch
+        // slot whose leg list contains the named input, with PMT
+        // version bump + DI=1 + monotonic CC so receivers stay locked
+        // without re-tuning. Manager UI gates the Switch option in
+        // Pick Tracks + Advanced editor on this capability so older
+        // edges hide the source type.
+        "pid_bus_switch_slot",
         // Remote binary upgrade: edge accepts `upgrade_binary` WS
         // commands and stages a Sigstore-verified release tarball,
         // atomically swaps the `current` symlink, then drains and exits

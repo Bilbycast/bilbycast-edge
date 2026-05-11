@@ -160,6 +160,7 @@ async fn encode_loop(
         color_transfer: None,
         color_matrix: None,
         color_range: None,
+        source_video_pid: None,
         hw_decode: None,
     };
 
@@ -179,6 +180,11 @@ async fn encode_loop(
     };
 
     let mut ts_mux = TsMuxer::new();
+    if let Some(po) = session.pid_overrides {
+        if let Some(entry) = po.get(&1) {
+                ts_mux.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
+            }
+    }
     ts_mux.set_has_video(true);
     ts_mux.set_video_stream_type(STREAM_TYPE_H264);
     let has_audio = audio_state.is_some();

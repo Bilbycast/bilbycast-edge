@@ -23,6 +23,7 @@ use crate::util::time::now_us;
 use super::delay_buffer::resolve_output_delay;
 use super::packet::RtpPacket;
 use super::ts_audio_replace::TsAudioReplacer;
+use super::ts_pid_overrides_rewriter::TsPidOverridesRewriter;
 use super::ts_pid_remapper::TsPidRemapper;
 use super::ts_program_filter::TsProgramFilter;
 use super::ts_video_replace::TsVideoReplacer;
@@ -245,11 +246,34 @@ async fn rtp_output_loop(
     });
     let mut remap_scratch: Vec<u8> = Vec::new();
 
+    // Optional per-program role-keyed PID rewriter. Only engages on
+    // passthrough flows (no transcode) — the transcoded paths handle PID
+    // rewriting inside the replacers themselves.
+    let no_transcode_rtp = config.audio_encode.is_none() && config.video_encode.is_none();
+    let mut pid_overrides_rewriter = if no_transcode_rtp {
+        config.pid_overrides.as_ref().and_then(|m| {
+            let r = TsPidOverridesRewriter::new(m);
+            if r.is_active() {
+                tracing::info!(
+                    "RTP output '{}': pid_overrides passthrough rewriter active ({} programs)",
+                    config.id,
+                    m.len()
+                );
+                Some(r)
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    let mut overrides_scratch: Vec<u8> = Vec::new();
+
     // Optional audio ES replacement. When set, all outgoing packets are
     // forced through the raw-TS path (the original RTP framing is
     // discarded and rebuilt) because the replacer rewrites payload bytes.
     let mut audio_replacer = match config.audio_encode.as_ref() {
-        Some(enc) => match TsAudioReplacer::new(enc, config.transcode.clone()) {
+        Some(enc) => match TsAudioReplacer::new(enc, config.transcode.clone(), config.pid_overrides.as_ref()) {
             Ok(r) => {
                 tracing::info!(
                     "RTP output '{}': audio_encode active ({})",
@@ -286,7 +310,7 @@ async fn rtp_output_loop(
 
     // Optional video ES replacement.
     let mut video_replacer = match config.video_encode.as_ref() {
-        Some(enc) => match TsVideoReplacer::new(enc, None) {
+        Some(enc) => match TsVideoReplacer::new(enc, None, config.pid_overrides.as_ref()) {
             Ok(mut r) => {
                 let backend = match enc.codec.as_str() {
                     "x264" | "x265" => enc.codec.clone(),
@@ -436,6 +460,24 @@ async fn rtp_output_loop(
                             match filter.filter_packet(&packet, &mut filter_scratch) {
                                 Some(filtered) => RtpPacket {
                                     data: filtered,
+                                    sequence_number: packet.sequence_number,
+                                    rtp_timestamp: packet.rtp_timestamp,
+                                    recv_time_us: packet.recv_time_us,
+                                    is_raw_ts: packet.is_raw_ts,
+                                    upstream_seq: None,
+                                    upstream_leg_id: None,
+                                },
+                                None => continue,
+                            }
+                        } else {
+                            packet
+                        };
+
+                        // Per-program role-keyed PID rewrite (passthrough only).
+                        let packet = if let Some(ref mut rw) = pid_overrides_rewriter {
+                            match rw.process_packet(&packet, &mut overrides_scratch) {
+                                Some(rewritten) => RtpPacket {
+                                    data: rewritten,
                                     sequence_number: packet.sequence_number,
                                     rtp_timestamp: packet.rtp_timestamp,
                                     recv_time_us: packet.recv_time_us,

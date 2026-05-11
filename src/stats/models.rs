@@ -1102,7 +1102,23 @@ pub struct VideoEncodeStatsSnapshot {
     pub last_latency_us: u64,
     /// Number of times the encoder supervisor restarted the backend.
     pub supervisor_restarts: u64,
+    /// Source video PID the replacer is currently transcoding (PMT-discovered
+    /// or operator-pinned via `video_encode.source_video_pid`). `0` means
+    /// the PMT hasn't been seen yet on this run, so no PID lock yet.
+    /// Surfaces on the manager UI's transcode badge so operators can
+    /// verify which video stream the transcoder picked at a glance.
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub source_pid: u16,
+    /// Source video stream_type byte (e.g. `0x1B` H.264, `0x24` H.265).
+    /// `0` means unknown.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub source_stream_type: u8,
 }
+
+#[allow(dead_code)]
+fn is_zero_u16(v: &u16) -> bool { *v == 0 }
+#[allow(dead_code)]
+fn is_zero_u8(v: &u8) -> bool { *v == 0 }
 
 /// Snapshot-time description of the egress (or ingress) media for a single
 /// output or input. Reused for both legs of a flow — when populated as

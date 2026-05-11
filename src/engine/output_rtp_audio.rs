@@ -165,7 +165,7 @@ async fn run_rtp_audio_302m_output(
             _ => input.channels + 1,
         };
         Some(
-            S302mOutputPipeline::new(input, out_channels, 24, 4_000)
+            S302mOutputPipeline::new(input, out_channels, 24, 4_000, config.pid_overrides.as_ref())
                 .map_err(|e| anyhow::anyhow!("S302mOutputPipeline build failed: {e}"))?,
         )
     } else {
@@ -334,7 +334,7 @@ fn run_compressed_302m_step(
                         channels,
                     };
                     let out_channels = if channels == 1 { 2 } else { channels };
-                    match S302mOutputPipeline::new(input, out_channels, 24, 4_000) {
+                    match S302mOutputPipeline::new(input, out_channels, 24, 4_000, config.pid_overrides.as_ref()) {
                         Ok(p) => {
                             tracing::info!(
                                 "rtp_audio output '{}' (302M) compressed bridge ready: \

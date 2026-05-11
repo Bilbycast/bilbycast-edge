@@ -35,6 +35,7 @@ use crate::util::time::now_us;
 use super::delay_buffer::resolve_output_delay;
 use super::packet::RtpPacket;
 use super::ts_audio_replace::TsAudioReplacer;
+use super::ts_pid_overrides_rewriter::TsPidOverridesRewriter;
 use super::ts_pid_remapper::TsPidRemapper;
 use super::ts_program_filter::TsProgramFilter;
 use super::ts_video_replace::TsVideoReplacer;
@@ -283,8 +284,30 @@ async fn rist_output_loop(
     });
     let mut remap_scratch: Vec<u8> = Vec::new();
 
+    // Per-program PID rewriter (passthrough only — transcoded paths handle
+    // PIDs inside the replacers).
+    let no_transcode_rist = config.audio_encode.is_none() && config.video_encode.is_none();
+    let mut pid_overrides_rewriter = if no_transcode_rist {
+        config.pid_overrides.as_ref().and_then(|m| {
+            let r = TsPidOverridesRewriter::new(m);
+            if r.is_active() {
+                tracing::info!(
+                    "RIST output '{}': pid_overrides passthrough rewriter active ({} programs)",
+                    config.id,
+                    m.len()
+                );
+                Some(r)
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    let mut overrides_scratch: Vec<u8> = Vec::new();
+
     let mut audio_replacer = match config.audio_encode.as_ref() {
-        Some(enc) => match TsAudioReplacer::new(enc, config.transcode.clone()) {
+        Some(enc) => match TsAudioReplacer::new(enc, config.transcode.clone(), config.pid_overrides.as_ref()) {
             Ok(r) => {
                 tracing::info!(
                     "RIST output '{}': audio_encode active ({})",
@@ -320,7 +343,7 @@ async fn rist_output_loop(
     let mut replace_scratch: Vec<u8> = Vec::new();
 
     let mut video_replacer = match config.video_encode.as_ref() {
-        Some(enc) => match TsVideoReplacer::new(enc, None) {
+        Some(enc) => match TsVideoReplacer::new(enc, None, config.pid_overrides.as_ref()) {
             Ok(mut r) => {
                 if let Some(p) = av_sync_pacer.as_ref() {
                     r.set_av_sync_pacer(p.clone());
@@ -508,12 +531,21 @@ async fn rist_output_loop(
                 after_audio
             };
 
+            // Per-program role-keyed PID rewrite for passthrough flows.
+            let after_overrides: &[u8] = if let Some(ref mut rw) = pid_overrides_rewriter {
+                overrides_scratch.clear();
+                rw.process(after_video, &mut overrides_scratch);
+                &overrides_scratch
+            } else {
+                after_video
+            };
+
             if let Some(ref mut remapper) = pid_remapper {
                 remap_scratch.clear();
-                remapper.process(after_video, &mut remap_scratch);
+                remapper.process(after_overrides, &mut remap_scratch);
                 ts_buf.extend_from_slice(&remap_scratch);
             } else {
-                ts_buf.extend_from_slice(after_video);
+                ts_buf.extend_from_slice(after_overrides);
             }
 
             if !ts_sync_found {

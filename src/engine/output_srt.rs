@@ -29,6 +29,7 @@ use super::audio_transcode::InputFormat;
 use super::delay_buffer::resolve_output_delay;
 use super::packet::RtpPacket;
 use super::ts_audio_replace::TsAudioReplacer;
+use super::ts_pid_overrides_rewriter::TsPidOverridesRewriter;
 use super::ts_pid_remapper::TsPidRemapper;
 use super::ts_program_filter::TsProgramFilter;
 use super::ts_video_replace::TsVideoReplacer;
@@ -291,6 +292,7 @@ async fn srt_output_listener_loop(
         TsProgramFilter::new(n)
     });
     let mut pid_remapper = build_pid_remapper(config);
+    let mut pid_overrides_rewriter = build_pid_overrides_rewriter(config);
     let mut audio_replacer = build_audio_replacer(config, events);
     let mut video_replacer = build_video_replacer(config, &stats, events, av_sync_pacer.as_ref());
     let mut null_padder = config
@@ -407,7 +409,7 @@ async fn srt_output_listener_loop(
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
 
         let sink = SrtSendSink::Socket(socket.clone());
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut audio_replacer, &mut video_replacer, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut audio_replacer, &mut video_replacer, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -461,6 +463,7 @@ async fn srt_output_caller_loop(
         TsProgramFilter::new(n)
     });
     let mut pid_remapper = build_pid_remapper(config);
+    let mut pid_overrides_rewriter = build_pid_overrides_rewriter(config);
     let mut audio_replacer = build_audio_replacer(config, events);
     let mut video_replacer = build_video_replacer(config, &stats, events, av_sync_pacer.as_ref());
     let mut null_padder = config
@@ -523,7 +526,7 @@ async fn srt_output_caller_loop(
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
 
         let sink = SrtSendSink::Socket(socket.clone());
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut audio_replacer, &mut video_replacer, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut audio_replacer, &mut video_replacer, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -580,6 +583,28 @@ fn build_pid_remapper(config: &SrtOutputConfig) -> Option<TsPidRemapper> {
     }
 }
 
+/// Build a [`TsPidOverridesRewriter`] from `config.pid_overrides`.
+/// Returns `None` when the map is absent / empty OR when transcode is
+/// active (the replacers handle PID overrides internally on the
+/// transcoded path; chaining the standalone rewriter would double-rewrite).
+fn build_pid_overrides_rewriter(config: &SrtOutputConfig) -> Option<TsPidOverridesRewriter> {
+    if config.audio_encode.is_some() || config.video_encode.is_some() {
+        return None;
+    }
+    let map = config.pid_overrides.as_ref()?;
+    let r = TsPidOverridesRewriter::new(map);
+    if r.is_active() {
+        tracing::info!(
+            "SRT output '{}': pid_overrides passthrough rewriter active ({} programs)",
+            config.id,
+            map.len()
+        );
+        Some(r)
+    } else {
+        None
+    }
+}
+
 /// Spawn the input-switch watcher for this SRT output's replacers. See
 /// `engine::input_switch_watcher` for the rationale. Skips spawning
 /// when neither replacer is present (passthrough output).
@@ -609,7 +634,7 @@ fn spawn_replacer_switch_watcher(
 /// returns `None` when the codec isn't supported by this build.
 fn build_audio_replacer(config: &SrtOutputConfig, events: &EventSender) -> Option<TsAudioReplacer> {
     let enc = config.audio_encode.as_ref()?;
-    match TsAudioReplacer::new(enc, config.transcode.clone()) {
+    match TsAudioReplacer::new(enc, config.transcode.clone(), config.pid_overrides.as_ref()) {
         Ok(r) => {
             tracing::info!(
                 "SRT output '{}': audio_encode active ({})",
@@ -654,7 +679,7 @@ fn build_video_replacer(
     av_sync_pacer: Option<&Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> Option<TsVideoReplacer> {
     let enc = config.video_encode.as_ref()?;
-    match TsVideoReplacer::new(enc, None) {
+    match TsVideoReplacer::new(enc, None, config.pid_overrides.as_ref()) {
         Ok(mut r) => {
             if let Some(p) = av_sync_pacer {
                 r.set_av_sync_pacer(p.clone());
@@ -722,6 +747,7 @@ async fn srt_output_forward_loop(
     sink: &SrtSendSink,
     program_filter: &mut Option<TsProgramFilter>,
     pid_remapper: &mut Option<TsPidRemapper>,
+    pid_overrides_rewriter: &mut Option<TsPidOverridesRewriter>,
     audio_replacer: &mut Option<TsAudioReplacer>,
     video_replacer: &mut Option<TsVideoReplacer>,
     null_padder: &mut Option<crate::engine::ts_null_padder::TsNullPadder>,
@@ -790,7 +816,7 @@ async fn srt_output_forward_loop(
                     n if n > 8 => 8,
                     _ => input.channels + 1,
                 };
-                match S302mOutputPipeline::new(input, out_channels, 24, 4_000) {
+                match S302mOutputPipeline::new(input, out_channels, 24, 4_000, config.pid_overrides.as_ref()) {
                     Ok(p) => {
                         tracing::info!(
                             "SRT output '{}' transport_mode=audio_302m: \
@@ -845,6 +871,7 @@ async fn srt_output_forward_loop(
 
     let mut filter_scratch: Vec<u8> = Vec::new();
     let mut remap_scratch: Vec<u8> = Vec::new();
+    let mut overrides_scratch: Vec<u8> = Vec::new();
 
     // Optional output delay buffer for stream synchronization.
     // Only active for the normal TS path (not 302M, which is blocked
@@ -1031,6 +1058,25 @@ async fn srt_output_forward_loop(
                             payload
                         };
 
+                        // Per-program role-keyed PID rewrite (passthrough only).
+                        let payload = if let Some(rw) = pid_overrides_rewriter.as_mut() {
+                            let temp = RtpPacket {
+                                data: payload,
+                                sequence_number: packet.sequence_number,
+                                rtp_timestamp: packet.rtp_timestamp,
+                                recv_time_us: packet.recv_time_us,
+                                is_raw_ts: packet.is_raw_ts || need_strip,
+                                upstream_seq: None,
+                                upstream_leg_id: None,
+                            };
+                            match rw.process_packet(&temp, &mut overrides_scratch) {
+                                Some(b) => b,
+                                None => continue,
+                            }
+                        } else {
+                            payload
+                        };
+
                         // Apply PID remap last so audio/video replacers saw the
                         // original PIDs in the source PMT. need_strip implies
                         // the bytes are now raw TS (RTP header was discarded).
@@ -1187,7 +1233,9 @@ async fn srt_output_redundant_loop(
     // receiver merger to dedupe by seq; a single remapper fed by both legs
     // guarantees that.
     let mut pid_remapper = build_pid_remapper(config);
+    let mut pid_overrides_rewriter = build_pid_overrides_rewriter(config);
     let mut remap_scratch: Vec<u8> = Vec::new();
+    let mut overrides_scratch: Vec<u8> = Vec::new();
 
     // Outer reconnection loop — restarts both legs on total connection loss
     loop {
@@ -1432,6 +1480,27 @@ async fn srt_output_redundant_loop(
                                 packet.data
                             };
 
+                            // Per-program role-keyed PID rewrite (passthrough
+                            // only — the transcoded path runs through
+                            // replacers earlier).
+                            let payload = if let Some(ref mut rw) = pid_overrides_rewriter {
+                                let temp = RtpPacket {
+                                    data: payload,
+                                    sequence_number: packet.sequence_number,
+                                    rtp_timestamp: packet.rtp_timestamp,
+                                    recv_time_us: packet.recv_time_us,
+                                    is_raw_ts: packet.is_raw_ts,
+                                    upstream_seq: None,
+                                    upstream_leg_id: None,
+                                };
+                                match rw.process_packet(&temp, &mut overrides_scratch) {
+                                    Some(b) => b,
+                                    None => continue,
+                                }
+                            } else {
+                                payload
+                            };
+
                             // Apply PID remap so both legs carry the remapped bytes.
                             let payload = if let Some(ref mut remapper) = pid_remapper {
                                 let temp = RtpPacket {
@@ -1627,7 +1696,7 @@ fn srt_run_compressed_302m_step(
                         channels,
                     };
                     let out_channels = if channels == 1 { 2 } else { channels };
-                    match S302mOutputPipeline::new(input, out_channels, 24, 4_000) {
+                    match S302mOutputPipeline::new(input, out_channels, 24, 4_000, config.pid_overrides.as_ref()) {
                         Ok(p) => {
                             tracing::info!(
                                 "SRT output '{}' (302M) compressed bridge ready: \
@@ -1735,6 +1804,7 @@ async fn srt_output_bonded_loop(
         TsProgramFilter::new(n)
     });
     let mut pid_remapper = build_pid_remapper(config);
+    let mut pid_overrides_rewriter = build_pid_overrides_rewriter(config);
     let mut audio_replacer = build_audio_replacer(config, events);
     let mut video_replacer = build_video_replacer(config, &stats, events, av_sync_pacer.as_ref());
     let mut null_padder = config
@@ -1797,7 +1867,8 @@ async fn srt_output_bonded_loop(
                 let sink = SrtSendSink::Socket(socket.clone());
                 let disconnected = srt_output_forward_loop(
                     config, &mut rx, &stats, &cancel, &sink,
-                    &mut program_filter, &mut pid_remapper, &mut audio_replacer, &mut video_replacer,
+                    &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter,
+                    &mut audio_replacer, &mut video_replacer,
                     &mut null_padder,
                     input_format, compressed_audio_input, frame_rate_rx.clone(),
                 )
@@ -1871,7 +1942,8 @@ async fn srt_output_bonded_loop(
                 let sink = SrtSendSink::Group(group.clone());
                 let disconnected = srt_output_forward_loop(
                     config, &mut rx, &stats, &cancel, &sink,
-                    &mut program_filter, &mut pid_remapper, &mut audio_replacer, &mut video_replacer,
+                    &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter,
+                    &mut audio_replacer, &mut video_replacer,
                     &mut null_padder,
                     input_format, compressed_audio_input, frame_rate_rx.clone(),
                 )

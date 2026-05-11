@@ -599,6 +599,9 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+            program_number: None,
+            pid_map: None,
+            pid_overrides: None,
             interface_binding: None,
         }
     }
@@ -798,6 +801,9 @@ mod tests {
                     audio_encode: None,
                     transcode: None,
                     video_encode: None,
+                                program_number: None,
+                                pid_map: None,
+                                pid_overrides: None,
                                 interface_binding: None,
                 }),
             }],
@@ -814,6 +820,7 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                pid_overrides: None,
             })],
             flows: vec![FlowConfig {
                 id: "rtmp-flow".to_string(),

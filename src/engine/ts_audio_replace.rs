@@ -32,7 +32,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::config::models::AudioEncodeConfig;
+use crate::config::models::{AudioEncodeConfig, TsPidOverridesMap};
 
 use super::audio_encode::AudioCodec;
 use super::audio_transcode::{PlanarAudioTranscoder, TranscodeJson};
@@ -87,8 +87,23 @@ pub struct TsAudioReplacer {
     /// Discovered PMT PID (the PAT's first program's PMT). `None` before
     /// the PAT has been seen.
     pmt_pid: Option<u16>,
-    /// Discovered audio PID. `None` before the PMT has been parsed.
+    /// Discovered audio PID. `None` before the PMT has been parsed. This
+    /// is the *source* PID where the original audio TS packets arrive —
+    /// the replacer drops packets on this PID and emits encoded packets
+    /// on `out_audio_pid_override.unwrap_or(audio_pid)`.
     audio_pid: Option<u16>,
+    /// Optional override for the output audio PID. When set, the encoded
+    /// audio TS packets are written on this PID instead of the source
+    /// `audio_pid`, and the rewritten PMT entry is updated to advertise
+    /// the override. Used by operators who need a fixed wire PID layout
+    /// across multiple inputs feeding a switcher (downstream decoders
+    /// stay locked on the same PID across input swaps).
+    out_audio_pid_override: Option<u16>,
+    /// Optional operator-pinned source audio PID. When set, the replacer
+    /// locks onto this PID specifically (useful on MPTS programs with
+    /// multiple audio tracks). When unset, falls back to first-matching-
+    /// codec discovery. Sourced from `audio_encode.source_audio_pid`.
+    source_audio_pid_pin: Option<u16>,
     /// Source audio stream_type (0x0F = AAC-ADTS, etc.). Used to decide
     /// which decoder to instantiate.
     source_stream_type: u8,
@@ -198,6 +213,7 @@ impl TsAudioReplacer {
     pub fn new(
         cfg: &AudioEncodeConfig,
         transcode: Option<TranscodeJson>,
+        pid_overrides: Option<&TsPidOverridesMap>,
     ) -> Result<Self, TsAudioReplaceError> {
         let codec = AudioCodec::parse(&cfg.codec)
             .ok_or_else(|| TsAudioReplaceError::UnknownCodec(cfg.codec.clone()))?;
@@ -216,6 +232,17 @@ impl TsAudioReplacer {
 
         let bitrate_kbps = cfg.bitrate_kbps.unwrap_or_else(|| codec.default_bitrate_kbps());
 
+        // SPTS-only single-program scaffold today. Per-program N-program
+        // awareness lands in a follow-up step; for now we lock onto the
+        // first program in the PAT (legacy behaviour) and consume the
+        // override entry keyed `1` from the per-program map. When the
+        // map carries entries for other programs they're ignored on this
+        // path — Flow Assembly remains the answer for full multi-program
+        // rewriting until the replacer learns to walk all programs.
+        let out_audio_pid_override = pid_overrides
+            .and_then(|m| m.get(&1))
+            .and_then(|e| e.audio_pid);
+
         Ok(Self {
             codec,
             bitrate_kbps,
@@ -223,6 +250,8 @@ impl TsAudioReplacer {
             channels_override: cfg.channels,
             pmt_pid: None,
             audio_pid: None,
+            out_audio_pid_override,
+            source_audio_pid_pin: cfg.source_audio_pid,
             source_stream_type: 0,
             target_stream_type,
             pes_buffer: Vec::with_capacity(16 * 1024),
@@ -336,7 +365,7 @@ impl TsAudioReplacer {
             // handled seamlessly.
             if let Some(pmt_pid) = self.pmt_pid {
                 if pid == pmt_pid && ts_pusi(pkt) {
-                    if let Some((apid, ast)) = parse_pmt_audio(pkt) {
+                    if let Some((apid, ast)) = parse_pmt_audio(pkt, self.source_audio_pid_pin) {
                         let codec_changed =
                             self.source_stream_type != 0 && self.source_stream_type != ast;
                         let pid_changed =
@@ -373,6 +402,7 @@ impl TsAudioReplacer {
                             rewrite_pmt_audio_stream_type(
                                 &mut rewritten,
                                 apid,
+                                self.out_audio_pid_override,
                                 self.target_stream_type,
                                 aac_pal,
                             );
@@ -433,7 +463,7 @@ impl TsAudioReplacer {
             if let Some(ref mut enc) = self.av_encoder {
                 if let Ok(frames) = enc.flush() {
                     let pid = match self.audio_pid {
-                        Some(p) => p,
+                        Some(p) => self.out_audio_pid_override.unwrap_or(p),
                         None => return,
                     };
                     for ef in frames {
@@ -802,7 +832,9 @@ impl TsAudioReplacer {
     /// current PCM accumulator, re-packetize them as TS, and emit.
     fn drain_encoder(&mut self, output: &mut Vec<u8>) -> Result<(), ()> {
         let audio_pid = match self.audio_pid {
-            Some(p) => p,
+            // Operator-pinned override wins; otherwise the encoded
+            // packets ride the source PID (the historical behaviour).
+            Some(p) => self.out_audio_pid_override.unwrap_or(p),
             None => return Err(()),
         };
 
@@ -919,10 +951,20 @@ fn source_replaceable(stream_type: u8) -> bool {
     )
 }
 
-/// Parse the PMT for the first audio stream. Returns `(audio_pid,
-/// stream_type)`. Mirrors `parse_pmt_av_pids` in output_hls.rs but drops
-/// the video PID (we don't need it here — video is untouched).
-fn parse_pmt_audio(pkt: &[u8]) -> Option<(u16, u8)> {
+/// Parse the PMT for an audio stream. Returns `(audio_pid, stream_type)`.
+///
+/// `pinned_pid`:
+/// - `Some(pid)` — the operator pinned a specific source PID via
+///   `audio_encode.source_audio_pid`. Walk the PMT looking for that PID
+///   and return it (with its real stream_type) only if it carries a
+///   recognised audio codec. If the pinned PID is missing OR carries an
+///   unsupported codec, fall through to the first-match behaviour and
+///   the caller is expected to log a `audio_source_pid_not_found`
+///   warning event.
+/// - `None` — legacy first-match behaviour: lock onto the first audio
+///   ES whose stream_type is one of AAC(0x0F) / MPEG-1(0x03) /
+///   MPEG-2(0x04) / AC-3(0x81) / private(0x06).
+fn parse_pmt_audio(pkt: &[u8], pinned_pid: Option<u16>) -> Option<(u16, u8)> {
     let mut offset = 4;
     if ts_has_adaptation(pkt) {
         let af_len = pkt[4] as usize;
@@ -946,13 +988,28 @@ fn parse_pmt_audio(pkt: &[u8]) -> Option<(u16, u8)> {
         .min(TS_PACKET_SIZE)
         .saturating_sub(4);
 
+    // First pass: when a PID is pinned, look for that exact PID.
+    if let Some(target) = pinned_pid {
+        let mut pos = data_start;
+        while pos + 5 <= data_end {
+            let st = pkt[pos];
+            let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
+            let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
+            if es_pid == target && matches!(st, 0x0F | 0x03 | 0x04 | 0x81 | 0x06) {
+                return Some((es_pid, st));
+            }
+            pos += 5 + es_info_len;
+        }
+        // Pinned PID missing or wrong codec — fall through to first-match
+        // for graceful degradation. Caller emits the warning event.
+    }
+
+    // Default: first audio ES with a recognised stream_type.
     let mut pos = data_start;
     while pos + 5 <= data_end {
         let st = pkt[pos];
         let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
         let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
-
-        // AAC(0x0F), MPEG-1(0x03), MPEG-2(0x04), AC-3(0x81), private(0x06).
         if matches!(st, 0x0F | 0x03 | 0x04 | 0x81 | 0x06) {
             return Some((es_pid, st));
         }
@@ -976,6 +1033,7 @@ fn parse_pmt_audio(pkt: &[u8]) -> Option<(u16, u8)> {
 fn rewrite_pmt_audio_stream_type(
     pkt: &mut [u8],
     audio_pid: u16,
+    out_audio_pid: Option<u16>,
     new_stream_type: u8,
     new_aac_profile_and_level: Option<u8>,
 ) {
@@ -1010,6 +1068,13 @@ fn rewrite_pmt_audio_stream_type(
         let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
         if es_pid == audio_pid {
             pkt[pos] = new_stream_type;
+            // Rewrite the ES PID itself when the operator pinned an
+            // override. Top 3 bits of byte+1 are reserved (set to 1)
+            // followed by the high 5 bits of the 13-bit PID.
+            if let Some(new_pid) = out_audio_pid {
+                pkt[pos + 1] = (pkt[pos + 1] & 0xE0) | (((new_pid >> 8) as u8) & 0x1F);
+                pkt[pos + 2] = (new_pid & 0xFF) as u8;
+            }
             if let Some(pal) = new_aac_profile_and_level {
                 let desc_start = pos + 5;
                 let desc_end = (desc_start + es_info_len).min(data_end);
@@ -1183,13 +1248,14 @@ mod tests {
             opus_fec: false,
             opus_dtx: false,
             opus_frame_duration_ms: None,
+             source_audio_pid: None,
         }
     }
 
     #[test]
     fn rejects_opus_because_no_ts_mapping() {
         assert!(matches!(
-            TsAudioReplacer::new(&enc("opus"), None),
+            TsAudioReplacer::new(&enc("opus"), None, None),
             Err(TsAudioReplaceError::UnsupportedCodec(_))
         ));
     }
@@ -1197,21 +1263,21 @@ mod tests {
     #[test]
     fn rejects_unknown_codec() {
         assert!(matches!(
-            TsAudioReplacer::new(&enc("flac"), None),
+            TsAudioReplacer::new(&enc("flac"), None, None),
             Err(TsAudioReplaceError::UnknownCodec(_))
         ));
     }
 
     #[test]
     fn accepts_aac_lc_and_mp2_and_ac3() {
-        assert!(TsAudioReplacer::new(&enc("aac_lc"), None).is_ok());
-        assert!(TsAudioReplacer::new(&enc("mp2"), None).is_ok());
-        assert!(TsAudioReplacer::new(&enc("ac3"), None).is_ok());
+        assert!(TsAudioReplacer::new(&enc("aac_lc"), None, None).is_ok());
+        assert!(TsAudioReplacer::new(&enc("mp2"), None, None).is_ok());
+        assert!(TsAudioReplacer::new(&enc("ac3"), None, None).is_ok());
     }
 
     #[test]
     fn process_empty_input_is_noop() {
-        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None, None).unwrap();
         let mut out = Vec::new();
         r.process(&[], &mut out);
         assert!(out.is_empty());
@@ -1219,7 +1285,7 @@ mod tests {
 
     #[test]
     fn process_misaligned_input_is_passthrough() {
-        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None, None).unwrap();
         let mut out = Vec::new();
         let input = vec![0x00u8; 100]; // not 188-aligned
         r.process(&input, &mut out);
@@ -1228,7 +1294,7 @@ mod tests {
 
     #[test]
     fn process_unknown_pid_passes_through_verbatim() {
-        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None, None).unwrap();
         let mut pkt = [0xFFu8; 188];
         pkt[0] = TS_SYNC_BYTE;
         // PID 0x1FFF (null) — not the PAT, not a PMT, not audio.
@@ -1328,10 +1394,10 @@ mod tests {
     fn synth_pmt_round_trips_through_parser() {
         // AAC (0x0F)
         let pkt = synth_pmt_audio(0x1000, 0x0101, 0x0F);
-        assert_eq!(parse_pmt_audio(&pkt), Some((0x0101, 0x0F)));
+        assert_eq!(parse_pmt_audio(&pkt, None), Some((0x0101, 0x0F)));
         // AC-3 (0x81)
         let pkt = synth_pmt_audio(0x1000, 0x0101, 0x81);
-        assert_eq!(parse_pmt_audio(&pkt), Some((0x0101, 0x81)));
+        assert_eq!(parse_pmt_audio(&pkt, None), Some((0x0101, 0x81)));
     }
 
     /// Seamless input switching between inputs with different audio
@@ -1340,7 +1406,7 @@ mod tests {
     /// encoder initialised for the old format.
     #[test]
     fn codec_change_on_pmt_update_resets_source_state() {
-        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None, None).unwrap();
         let mut out = Vec::new();
 
         r.process(&synth_pat(0x1000), &mut out);
@@ -1381,7 +1447,7 @@ mod tests {
     /// accumulator belong to a different elementary stream.
     #[test]
     fn audio_pid_change_on_pmt_update_resets_source_state() {
-        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None, None).unwrap();
         let mut out = Vec::new();
 
         r.process(&synth_pat(0x1000), &mut out);
@@ -1402,7 +1468,7 @@ mod tests {
     /// the cost of closing and reopening the decoder + encoder.
     #[test]
     fn repeated_unchanged_pmt_does_not_reset_source_state() {
-        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None, None).unwrap();
         let mut out = Vec::new();
 
         r.process(&synth_pat(0x1000), &mut out);
@@ -1425,7 +1491,7 @@ mod tests {
     /// discontinuity the video replacer handles).
     #[test]
     fn pmt_pid_change_on_pat_update_resets_source_state() {
-        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None, None).unwrap();
         let mut out = Vec::new();
 
         r.process(&synth_pat(0x1000), &mut out);
@@ -1524,7 +1590,7 @@ mod tests {
     /// but we emit AAC-LC.
     #[test]
     fn pmt_aac_descriptor_neutralised_for_aac_target() {
-        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None, None).unwrap();
         let mut out = Vec::new();
         r.process(&synth_pat(0x1000), &mut out);
         out.clear();
@@ -1562,7 +1628,7 @@ mod tests {
     /// stream_type but we still preserve the source bytes verbatim.
     #[test]
     fn pmt_aac_descriptor_left_alone_for_non_aac_target() {
-        let mut r = TsAudioReplacer::new(&enc("ac3"), None).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("ac3"), None, None).unwrap();
         let mut out = Vec::new();
         r.process(&synth_pat(0x1000), &mut out);
         out.clear();

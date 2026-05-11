@@ -248,6 +248,11 @@ async fn play_demuxed(d: DemuxResult, session: &mut PlayerSession<'_>) -> Result
     let has_video = d.video.is_some();
     let has_audio = d.audio.is_some();
     let mut ts_mux = TsMuxer::new();
+    if let Some(po) = session.pid_overrides {
+        if let Some(entry) = po.get(&1) {
+                ts_mux.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
+            }
+    }
     ts_mux.set_has_video(has_video);
     if has_video {
         ts_mux.set_video_stream_type(STREAM_TYPE_H264);

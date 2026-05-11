@@ -97,17 +97,18 @@ impl InputTranscoder {
         transcode: Option<&TranscodeJson>,
         video_encode: Option<&VideoEncodeConfig>,
         force_idr: Option<Arc<std::sync::atomic::AtomicBool>>,
+        pid_overrides: Option<&crate::config::models::TsPidOverridesMap>,
     ) -> Result<Option<Self>, InputTranscoderError> {
         if audio_encode.is_none() && transcode.is_none() && video_encode.is_none() {
             return Ok(None);
         }
 
         let audio = match audio_encode {
-            Some(ae) => Some(TsAudioReplacer::new(ae, transcode.cloned())?),
+            Some(ae) => Some(TsAudioReplacer::new(ae, transcode.cloned(), pid_overrides)?),
             None => None,
         };
         let video = match video_encode {
-            Some(ve) => Some(TsVideoReplacer::new(ve, force_idr)?),
+            Some(ve) => Some(TsVideoReplacer::new(ve, force_idr, pid_overrides)?),
             None => None,
         };
 
@@ -351,10 +352,21 @@ pub fn publish_input_packet(
     broadcast_tx: &tokio::sync::broadcast::Sender<super::packet::RtpPacket>,
     packet: super::packet::RtpPacket,
 ) -> bool {
+    publish_input_packet_with_post(transcoder, &mut None, broadcast_tx, packet)
+}
+
+/// Variant of [`publish_input_packet`] that accepts an optional
+/// [`super::input_post_process::InputPostProcess`] applied after the
+/// transcoder (or as the only stage on passthrough flows). Use this on
+/// inputs that surface `program_number` / `pid_overrides` / `pid_map`
+/// to operators.
+pub fn publish_input_packet_with_post(
+    transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<super::input_post_process::InputPostProcess>,
+    broadcast_tx: &tokio::sync::broadcast::Sender<super::packet::RtpPacket>,
+    packet: super::packet::RtpPacket,
+) -> bool {
     use bytes::Bytes;
-    let Some(t) = transcoder.as_mut() else {
-        return broadcast_tx.send(packet).is_ok();
-    };
 
     // Locate the TS bytes. For `is_raw_ts: true` (or SRT's `Unknown` fallback)
     // the whole payload is TS. For RTP-wrapped TS, strip the RTP header.
@@ -372,11 +384,35 @@ pub fn publish_input_packet(
     };
     let ts_in = &packet.data[ts_offset..];
 
-    // Codec-class work runs on a blocking worker so the reactor is never
-    // stalled. Matches the output-side contract (see output_srt.rs:787,798).
-    let out: Vec<u8> = tokio::task::block_in_place(|| t.process(ts_in).to_vec());
+    // Run the transcoder (if present) then the post-processor (if
+    // present). When both are absent, fall back to broadcasting the
+    // packet verbatim — preserving today's zero-cost passthrough.
+    if transcoder.is_none() && post.is_none() {
+        return broadcast_tx.send(packet).is_ok();
+    }
+
+    let out: Vec<u8> = tokio::task::block_in_place(|| {
+        // Stage 1: optional transcoder.
+        let after_transcode_owned: Option<Vec<u8>> = transcoder.as_mut().map(|t| {
+            t.process(ts_in).to_vec()
+        });
+        let after_transcode: &[u8] = match after_transcode_owned {
+            Some(ref v) => v.as_slice(),
+            None => ts_in,
+        };
+        if after_transcode.is_empty() {
+            return Vec::new();
+        }
+        // Stage 2: optional post-process (program_filter / pid_overrides
+        // / pid_map). Returns &[u8] borrowed from internal scratch — we
+        // copy out so the borrow ends at the closure boundary.
+        match post.as_mut() {
+            Some(p) => p.process(after_transcode).to_vec(),
+            None => after_transcode.to_vec(),
+        }
+    });
     if out.is_empty() {
-        // Replacer buffered the input; nothing to emit this tick.
+        // Stage(s) buffered the input; nothing to emit this tick.
         return false;
     }
 
@@ -385,7 +421,8 @@ pub fn publish_input_packet(
         sequence_number: packet.sequence_number,
         rtp_timestamp: packet.rtp_timestamp,
         recv_time_us: packet.recv_time_us,
-        // After the input transcode stage the flow always carries raw TS.
+        // After the input transcode / post-process stages the flow always
+        // carries raw TS.
         is_raw_ts: true,
         upstream_seq: None,
         upstream_leg_id: None,
@@ -399,7 +436,7 @@ mod tests {
 
     #[test]
     fn empty_config_returns_none() {
-        let t = InputTranscoder::new(None, None, None, None).expect("construct");
+        let t = InputTranscoder::new(None, None, None, None, None).expect("construct");
         assert!(t.is_none(), "all-None config must be idle (no stage)");
     }
 
@@ -412,7 +449,7 @@ mod tests {
             sample_rate: Some(48_000),
             ..Default::default()
         };
-        let t = InputTranscoder::new(None, Some(&tj), None, None).expect("construct");
+        let t = InputTranscoder::new(None, Some(&tj), None, None, None).expect("construct");
         assert!(t.is_none());
     }
 
@@ -428,8 +465,9 @@ mod tests {
             opus_fec: false,
             opus_dtx: false,
             opus_frame_duration_ms: None,
+             source_audio_pid: None,
         };
-        let mut t = InputTranscoder::new(Some(&ae), None, None, None)
+        let mut t = InputTranscoder::new(Some(&ae), None, None, None, None)
             .expect("construct")
             .expect("stage");
         // Non-aligned input is passed through verbatim by TsAudioReplacer.

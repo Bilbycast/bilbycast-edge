@@ -585,6 +585,7 @@ impl S302mOutputPipeline {
         out_channels: u8,
         out_bit_depth: u8,
         out_packet_time_us: u32,
+        pid_overrides: Option<&crate::config::models::TsPidOverridesMap>,
     ) -> Result<Self, String> {
         if !matches!(out_channels, 2 | 4 | 6 | 8) {
             return Err(format!(
@@ -645,6 +646,11 @@ impl S302mOutputPipeline {
         let transcode = TranscodeStage::new(input, cfg, matrix, stats, 0xCAFE_BABE, 0, 0);
         let packetizer = S302mPacketizer::new(out_channels, out_bit_depth)?;
         let mut ts_mux = TsMuxer::new();
+        if let Some(po) = pid_overrides {
+            if let Some(entry) = po.get(&1) {
+                ts_mux.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
+            }
+        }
         ts_mux.set_has_video(false);
         ts_mux.set_has_audio(true);
         ts_mux.set_audio_stream(STREAM_TYPE_S302M, Some(BSSD_FORMAT_ID));
@@ -982,7 +988,7 @@ mod tests {
             bit_depth: BitDepth::L24,
             channels: 2,
         };
-        let mut pipeline = S302mOutputPipeline::new(input, 2, 24, 4_000).unwrap();
+        let mut pipeline = S302mOutputPipeline::new(input, 2, 24, 4_000, None).unwrap();
 
         // Build a 1ms (48-frame) stereo L24 RTP packet using a known ramp.
         fn build_rtp(seq: u16, ts: u32) -> RtpPacket {

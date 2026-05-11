@@ -96,10 +96,22 @@ pub struct ProgramPlan {
 /// One elementary-stream slot within a program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssemblySlot {
-    /// Concrete `(input_id, source_pid)` on the bus.
+    /// Concrete `(input_id, source_pid)` on the bus. For Switch slots
+    /// this carries the **currently-active** leg — it mutates over time
+    /// when the operator drives `ActivateInput`. For Pid / Essence /
+    /// Hitless slots the value is fixed across the slot's lifetime.
     pub source: (String, u16),
     pub out_pid: u16,
     pub stream_type: u8,
+    /// When `Some(legs)`, this slot is a [`SlotSource::Switch`] and the
+    /// assembler subscribes to every leg concurrently (warm). Only the
+    /// leg whose `input_id` matches the flow's currently-active input
+    /// forwards bytes on `out_pid`. On `SwitchActiveInput` the active
+    /// leg pointer flips, the program's PMT version bumps, and DI=1
+    /// is armed on the next PCR for `out_pid` so receivers stay locked
+    /// without re-tuning. `None` for non-switch slots.
+    #[allow(dead_code)] // read by build_assembly_plan / SwitchActiveInput handler
+    pub switch_legs: Option<Vec<(String, u16)>>,
 }
 
 /// Runtime commands the assembler accepts via its `mpsc` channel.
@@ -116,6 +128,17 @@ pub enum PlanCommand {
     /// slots, bumps per-program PMT versions where composition changed,
     /// and bumps PAT version when the set of programs itself changed.
     ReplacePlan { plan: AssemblyPlan },
+    /// Operator-driven switch-slot retarget. Sent by
+    /// `engine::manager::FlowManager::switch_active_input` when an
+    /// `ActivateInput` arrives for a flow running in assembly mode.
+    /// The assembler walks every switch slot whose leg list contains
+    /// `new_input_id`, atomically flips that slot's active-leg pointer,
+    /// bumps the owning program's PMT version (mod 32, monotonic), and
+    /// arms DI=1 on the next PCR for the slot's `out_pid`. Slots whose
+    /// leg list does not include `new_input_id` are left untouched —
+    /// per design, `ActivateInput` is silent for slots that don't
+    /// speak that source.
+    SwitchActiveInput { new_input_id: String },
 }
 
 /// Handle returned to the flow runtime after spawning the assembler.
@@ -158,14 +181,22 @@ pub fn spawn_spts_assembler(
 }
 
 /// Flattened slot view used internally by the assembler. One entry per
-/// slot across all programs. `program_idx` is retained for Phase 7's
-/// per-PID switching so fan-in traffic routes to the right program's
-/// PMT without re-searching.
+/// **bus subscription** — for `Pid` / `Essence` / `Hitless` slots that's
+/// one FlatSlot per AssemblySlot, but for Switch slots it's one
+/// FlatSlot per leg (all sharing the same `out_pid` and `program_idx`).
+/// `program_idx` is retained for per-PID switching so fan-in traffic
+/// routes to the right program's PMT without re-searching.
 #[derive(Debug, Clone)]
 struct FlatSlot {
     program_idx: usize,
     source: (String, u16),
     out_pid: u16,
+    /// `true` iff this FlatSlot is one leg of a [`AssemblySlot::switch_legs`]
+    /// group. The main loop drops fan-in packets whose `source.0`
+    /// (this leg's input_id) doesn't match
+    /// `active_leg_input.get(&(program_idx, out_pid))`. Non-switch slots
+    /// have this `false` and forward unconditionally.
+    is_switch_leg: bool,
 }
 
 async fn run_assembler(
@@ -205,14 +236,27 @@ async fn run_assembler(
     let mut pat_version: u8 = 0;
     let mut pmt_versions: Vec<u8> = vec![0; plan.programs.len()];
 
-    // One-shot flag: armed after every `ReplacePlan`, consumed when the
-    // next PCR-bearing TS packet flows through the ES rewrite path. The
-    // assembler then sets `discontinuity_indicator` (AF flags 0x80) on
-    // that packet so receivers (VLC, ffplay, broadcast-grade hardware)
-    // re-anchor STC instead of treating the post-swap PCR-epoch jump
-    // as a clock fault. Mirror of `TsContinuityFixer::pending_di_on_pcr`
-    // for the PID-bus / Flow Assembly path.
-    let mut pending_di_on_pcr: bool = false;
+    // Per-out_pid one-shot DI arming. After every `ReplacePlan` the
+    // map is populated for every out_pid in the new plan; after every
+    // `SwitchActiveInput` only the affected switch slots' out_pids are
+    // armed. The flag is consumed when the next PCR-bearing TS packet
+    // flows through the ES rewrite path on that out_pid; the assembler
+    // sets `discontinuity_indicator` (AF flags 0x80) so receivers (VLC,
+    // ffplay, broadcast-grade hardware) re-anchor STC instead of treating
+    // the post-swap PCR-epoch jump as a clock fault. Per-out_pid keying
+    // means a switch on slot X doesn't false-trigger DI on a sibling
+    // slot Y. Mirror of `TsContinuityFixer::pending_di_on_pcr` for the
+    // PID-bus / Flow Assembly path.
+    let mut pending_di_for_out_pid: std::collections::HashMap<u16, bool> =
+        std::collections::HashMap::new();
+
+    // Per-switch-slot active-leg pointer, keyed by `(program_idx, out_pid)`.
+    // Populated on `install_plan` and `apply_plan_replacement` from each
+    // switch slot's initial `source.0`; mutated by `SwitchActiveInput`.
+    // Fan-in packets from non-active legs are dropped at the main-loop
+    // edge (cheap string compare, no rewrite).
+    let mut active_leg_input: std::collections::HashMap<(usize, u16), String> =
+        std::collections::HashMap::new();
 
     // Egress bundle buffer + per-out-PID CC counter + PAT/PMT CC.
     let mut buf = BytesMut::with_capacity(BUNDLE_BYTES);
@@ -231,6 +275,7 @@ async fn run_assembler(
         &mut slot_cancels,
         &mut slot_tasks,
         &mut pcr_out_pid_by_program,
+        &mut active_leg_input,
     );
 
     let mut psi_tick = interval(PSI_INTERVAL);
@@ -274,14 +319,20 @@ async fn run_assembler(
                             &mut pcr_out_pid_by_program,
                             &mut pat_version,
                             &mut pmt_versions,
+                            &mut active_leg_input,
                         );
-                        // Arm the one-shot DI flag — the next PCR-bearing
-                        // TS packet emitted after this swap will carry
+                        // Arm DI on every out_pid — the next PCR-bearing
+                        // TS packet on each will carry
                         // `discontinuity_indicator = 1`. Without this,
                         // receivers see the source-change PCR epoch jump
                         // as a clock fault and freeze on their last
                         // decoded frame even though PMT version bumped.
-                        pending_di_on_pcr = true;
+                        pending_di_for_out_pid.clear();
+                        for prog in &plan.programs {
+                            for slot in &prog.slots {
+                                pending_di_for_out_pid.insert(slot.out_pid, true);
+                            }
+                        }
                         // Emit fresh PSI immediately on switch so
                         // downstream receivers see the new PMT before
                         // the first rewritten ES packet lands on a new
@@ -299,6 +350,56 @@ async fn run_assembler(
                             &mut bundle_seq,
                         );
                     }
+                    PlanCommand::SwitchActiveInput { new_input_id } => {
+                        // Walk every switch slot. If its leg list
+                        // contains `new_input_id`, flip the active-leg
+                        // pointer, bump that program's PMT version
+                        // (mod 32, monotonic — same discipline as
+                        // ReplacePlan, avoids A→B→A version-stamp
+                        // collisions), and arm DI=1 on the next PCR
+                        // for that slot's out_pid. Slots without a
+                        // matching leg are silently skipped — that's
+                        // the design: ActivateInput is silent for
+                        // slots that don't speak that source.
+                        let mut any_flipped = false;
+                        for (pidx, prog) in plan.programs.iter().enumerate() {
+                            for slot in &prog.slots {
+                                let Some(legs) = &slot.switch_legs else {
+                                    continue;
+                                };
+                                if !legs.iter().any(|(iid, _)| iid == &new_input_id) {
+                                    continue;
+                                }
+                                let key = (pidx, slot.out_pid);
+                                let prev = active_leg_input.get(&key).cloned();
+                                if prev.as_deref() == Some(new_input_id.as_str()) {
+                                    continue; // already active
+                                }
+                                active_leg_input.insert(key, new_input_id.clone());
+                                if let Some(v) = pmt_versions.get_mut(pidx) {
+                                    *v = v.wrapping_add(1) & 0x1F;
+                                }
+                                pending_di_for_out_pid.insert(slot.out_pid, true);
+                                any_flipped = true;
+                            }
+                        }
+                        if any_flipped {
+                            // Push fresh PSI so receivers see new PMT
+                            // versions before the first post-switch ES
+                            // byte from the new active leg lands.
+                            push_psi(
+                                &mut buf,
+                                &plan,
+                                &pcr_out_pid_by_program,
+                                pat_version,
+                                &pmt_versions,
+                                &mut pat_cc,
+                                &mut pmt_cc,
+                                &broadcast_tx,
+                                &mut bundle_seq,
+                            );
+                        }
+                    }
                 }
             }
             Some((slot_idx, es)) = fanin_rx.recv() => {
@@ -306,20 +407,37 @@ async fn run_assembler(
                     Some(s) => s,
                     None => continue,
                 };
+                // Switch-slot leg gating: drop packets from non-active
+                // legs at the main-loop edge — cheap compare, no rewrite,
+                // no CC advance (CC stays monotonic on out_pid because
+                // only the active leg ever wraps cc_table[out_pid]).
+                if slot.is_switch_leg {
+                    let key = (slot.program_idx, slot.out_pid);
+                    if let Some(active) = active_leg_input.get(&key) {
+                        if active != &slot.source.0 {
+                            continue;
+                        }
+                    }
+                }
                 if es.payload.len() != TS_PACKET_SIZE {
                     continue;
                 }
                 let mut rewritten = rewrite_es_packet(&es.payload, slot.out_pid, &mut cc);
-                // After a plan swap, the first PCR-bearing TS packet
-                // gets DI=1 stamped into its adaptation field so the
-                // receiver re-anchors STC on the new source's PCR
-                // epoch. PCR can ride either a payload-bearing PUSI
-                // packet or an AF-only packet; `extract_pcr` handles
-                // both. Mirror of `TsContinuityFixer::pending_di_on_pcr`
-                // for the PID-bus / Flow Assembly path.
-                if pending_di_on_pcr && extract_pcr(&rewritten).is_some() {
+                // After a plan swap or switch-slot flip, the first
+                // PCR-bearing TS packet on the affected out_pid carries
+                // DI=1 in its adaptation field so the receiver re-anchors
+                // STC on the new source's PCR epoch. PCR can ride either
+                // a payload-bearing PUSI packet or an AF-only packet;
+                // `extract_pcr` handles both. Per-out_pid keying so a
+                // switch on one slot doesn't false-trigger sibling
+                // slots' DI flags. Mirror of
+                // `TsContinuityFixer::pending_di_on_pcr` for the
+                // PID-bus / Flow Assembly path.
+                if pending_di_for_out_pid.get(&slot.out_pid).copied().unwrap_or(false)
+                    && extract_pcr(&rewritten).is_some()
+                {
                     set_discontinuity_indicator(&mut rewritten);
-                    pending_di_on_pcr = false;
+                    pending_di_for_out_pid.insert(slot.out_pid, false);
                 }
                 buf.extend_from_slice(&rewritten);
                 if buf.len() >= BUNDLE_BYTES {
@@ -368,21 +486,41 @@ fn install_plan(
     slot_cancels: &mut Vec<CancellationToken>,
     slot_tasks: &mut Vec<JoinHandle<()>>,
     pcr_out_pid_by_program: &mut Vec<u16>,
+    active_leg_input: &mut std::collections::HashMap<(usize, u16), String>,
 ) {
     for (pidx, prog) in plan.programs.iter().enumerate() {
         for s in prog.slots.iter() {
-            let slot = FlatSlot {
-                program_idx: pidx,
-                source: s.source.clone(),
-                out_pid: s.out_pid,
+            // Spawn one fan-in per bus subscription. Pid / Essence /
+            // Hitless slots produce one. Switch slots produce one per
+            // leg, all sharing `(pidx, out_pid)` so the main loop can
+            // gate on a single (program_idx, out_pid) → active_input
+            // lookup and drop non-active-leg packets at the edge.
+            let leg_pairs: Vec<(String, u16)> = match &s.switch_legs {
+                Some(legs) => legs.clone(),
+                None => vec![s.source.clone()],
             };
-            let idx = flat.len();
-            flat.push(slot.clone());
-            let slot_cancel = cancel.child_token();
-            let rx = bus.subscribe(&slot.source.0, slot.source.1);
-            let tx = fanin_tx.clone();
-            slot_cancels.push(slot_cancel.clone());
-            slot_tasks.push(tokio::spawn(slot_fanin(idx, rx, tx, slot_cancel)));
+            let is_switch = s.switch_legs.is_some();
+            for src in leg_pairs {
+                let slot = FlatSlot {
+                    program_idx: pidx,
+                    source: src.clone(),
+                    out_pid: s.out_pid,
+                    is_switch_leg: is_switch,
+                };
+                let idx = flat.len();
+                flat.push(slot.clone());
+                let slot_cancel = cancel.child_token();
+                let rx = bus.subscribe(&slot.source.0, slot.source.1);
+                let tx = fanin_tx.clone();
+                slot_cancels.push(slot_cancel.clone());
+                slot_tasks.push(tokio::spawn(slot_fanin(idx, rx, tx, slot_cancel)));
+            }
+            if is_switch {
+                // Initial active leg = AssemblySlot.source — populated
+                // by build_assembly_plan from the config's
+                // initial_input_id (or flow.active_input_id on restart).
+                active_leg_input.insert((pidx, s.out_pid), s.source.0.clone());
+            }
         }
     }
     *pcr_out_pid_by_program = plan
@@ -391,7 +529,12 @@ fn install_plan(
         .map(|prog| {
             prog.slots
                 .iter()
-                .find(|s| s.source == prog.pcr_source)
+                .find(|s| {
+                    s.source == prog.pcr_source
+                        || s.switch_legs
+                            .as_ref()
+                            .is_some_and(|legs| legs.iter().any(|p| p == &prog.pcr_source))
+                })
                 .map(|s| s.out_pid)
                 .unwrap_or(prog.pmt_pid)
         })
@@ -428,6 +571,7 @@ fn apply_plan_replacement(
     pcr_out_pid_by_program: &mut Vec<u16>,
     pat_version: &mut u8,
     pmt_versions: &mut Vec<u8>,
+    active_leg_input: &mut std::collections::HashMap<(usize, u16), String>,
 ) {
     // Program set: (program_number, pmt_pid) pairs, order-preserving.
     let old_pat: Vec<(u16, u16)> = plan
@@ -489,54 +633,75 @@ fn apply_plan_replacement(
     // main loop's `flat.get(idx)` naturally tolerates. This avoids the
     // whole re-indexing headache.
 
+    // Refresh active-leg pointers on swap. Drop entries for switch
+    // slots that no longer exist; preserve entries for slots that
+    // survive (the operator's prior switch sticks across hot-swap).
+    let mut new_active_leg_input: std::collections::HashMap<(usize, u16), String> =
+        std::collections::HashMap::new();
+
     for new_prog in new_plan.programs.iter().enumerate().map(|(pidx, p)| (pidx, p)) {
         let (pidx, prog) = new_prog;
         for s in prog.slots.iter() {
-            // Look for a reusable fan-in in the current flat list.
-            // Skip slots whose cancel token is already cancelled — those
-            // are tombstones from a prior plan-replacement; their fanin
-            // task is dead and reusing the index would resurrect the
-            // metadata without a running task to push packets, silently
-            // breaking the swap (no ES bytes for that slot post-swap).
-            let match_idx = flat.iter().enumerate().find_map(|(i, f)| {
-                if !reused[i]
-                    && f.source == s.source
-                    && slot_cancels.get(i).map_or(true, |c| !c.is_cancelled())
-                {
-                    Some(i)
-                } else {
-                    None
+            let leg_pairs: Vec<(String, u16)> = match &s.switch_legs {
+                Some(legs) => legs.clone(),
+                None => vec![s.source.clone()],
+            };
+            let is_switch = s.switch_legs.is_some();
+            for src in &leg_pairs {
+                // Look for a reusable fan-in in the current flat list
+                // for this exact (source, ...) tuple. Skip cancelled
+                // tombstones — see original comment.
+                let match_idx = flat.iter().enumerate().find_map(|(i, f)| {
+                    if !reused[i]
+                        && f.source == *src
+                        && slot_cancels.get(i).map_or(true, |c| !c.is_cancelled())
+                    {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                });
+                match match_idx {
+                    Some(i) => {
+                        reused[i] = true;
+                        flat[i].out_pid = s.out_pid;
+                        flat[i].program_idx = pidx;
+                        flat[i].is_switch_leg = is_switch;
+                    }
+                    None => {
+                        let slot = FlatSlot {
+                            program_idx: pidx,
+                            source: src.clone(),
+                            out_pid: s.out_pid,
+                            is_switch_leg: is_switch,
+                        };
+                        let idx = flat.len();
+                        flat.push(slot.clone());
+                        reused.push(true);
+                        let slot_cancel = cancel.child_token();
+                        let rx = bus.subscribe(&slot.source.0, slot.source.1);
+                        let tx = fanin_tx.clone();
+                        slot_cancels.push(slot_cancel.clone());
+                        slot_tasks.push(tokio::spawn(slot_fanin(idx, rx, tx, slot_cancel)));
+                    }
                 }
-            });
-            match match_idx {
-                Some(i) => {
-                    reused[i] = true;
-                    // Update in place — the already-running fan-in keeps
-                    // sending on slot_idx = i; we only change the
-                    // metadata the main loop reads.
-                    flat[i].out_pid = s.out_pid;
-                    flat[i].program_idx = pidx;
-                }
-                None => {
-                    // Spawn a new fan-in for this (source, out_pid).
-                    let slot = FlatSlot {
-                        program_idx: pidx,
-                        source: s.source.clone(),
-                        out_pid: s.out_pid,
-                    };
-                    let idx = flat.len();
-                    flat.push(slot.clone());
-                    // Track reuse vec alongside flat.
-                    reused.push(true);
-                    let slot_cancel = cancel.child_token();
-                    let rx = bus.subscribe(&slot.source.0, slot.source.1);
-                    let tx = fanin_tx.clone();
-                    slot_cancels.push(slot_cancel.clone());
-                    slot_tasks.push(tokio::spawn(slot_fanin(idx, rx, tx, slot_cancel)));
-                }
+            }
+            if is_switch {
+                // Carry the operator's prior choice if the new slot
+                // still has it as a leg; otherwise fall back to the
+                // new plan's `source.0` (= initial_input_id).
+                let key = (pidx, s.out_pid);
+                let prior = active_leg_input
+                    .get(&key)
+                    .filter(|prev| leg_pairs.iter().any(|(iid, _)| iid == prev.as_str()))
+                    .cloned()
+                    .unwrap_or_else(|| s.source.0.clone());
+                new_active_leg_input.insert(key, prior);
             }
         }
     }
+
+    *active_leg_input = new_active_leg_input;
 
     // Cancel any fan-in that wasn't reused. Leave its entry in `flat`
     // as a tombstone — the main loop's `flat.get(idx)` still returns
@@ -548,14 +713,22 @@ fn apply_plan_replacement(
         }
     }
 
-    // Recompute PCR resolution for each program.
+    // Recompute PCR resolution for each program. Match either the
+    // active-leg `source` (Pid/Essence/Hitless or current Switch) or
+    // any leg in `switch_legs` — switch slots' active leg flips at
+    // runtime but the PCR still rides the slot's fixed out_pid.
     *pcr_out_pid_by_program = new_plan
         .programs
         .iter()
         .map(|prog| {
             prog.slots
                 .iter()
-                .find(|s| s.source == prog.pcr_source)
+                .find(|s| {
+                    s.source == prog.pcr_source
+                        || s.switch_legs
+                            .as_ref()
+                            .is_some_and(|legs| legs.iter().any(|p| p == &prog.pcr_source))
+                })
                 .map(|s| s.out_pid)
                 .unwrap_or(prog.pmt_pid)
         })
@@ -852,18 +1025,29 @@ pub enum EsKind {
 }
 
 /// One unresolved slot. Produced by the plan builder; the resolver
-/// returns one `((program_idx, slot_idx), pid)` per entry.
+/// returns one `((program_idx, slot_idx, leg_idx), pid)` per entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingEssenceSlot {
     /// `(program_idx, slot_idx)` — program_idx is an index into
     /// `AssemblyPlan.programs`; slot_idx is an index into that
-    /// program's `ProgramPlan.slots`. The runtime patches
-    /// `plan.programs[program_idx].slots[slot_idx].source.1` in place
-    /// once the resolver returns.
+    /// program's `ProgramPlan.slots`.
+    ///
+    /// When `leg_idx.is_none()`, this is a top-level
+    /// `SlotSource::Essence` slot — the runtime patches
+    /// `plan.programs[program_idx].slots[slot_idx].source.1` in place.
+    ///
+    /// When `leg_idx.is_some()`, this is one Essence-typed leg of a
+    /// `SlotSource::Switch` slot — the runtime patches
+    /// `plan.programs[program_idx].slots[slot_idx].switch_legs[leg_idx].1`
+    /// and, if this leg is the slot's currently-active source (matched
+    /// on `input_id`), also patches `slots[slot_idx].source.1`.
     pub program_idx: usize,
     pub slot_idx: usize,
     pub input_id: String,
     pub kind: EsKind,
+    /// `Some(leg_idx)` for Switch-leg essence resolution. `None` for
+    /// top-level Essence slots.
+    pub leg_idx: Option<usize>,
 }
 
 /// One pending Hitless merger task. Produced by `build_assembly_plan`
@@ -979,7 +1163,7 @@ pub async fn resolve_essence_slots(
     pending: Vec<PendingEssenceSlot>,
     catalogues: std::collections::HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
     timeout: Duration,
-) -> Result<Vec<((usize, usize), u16)>, EssenceResolveError> {
+) -> Result<Vec<((usize, usize, Option<usize>), u16)>, EssenceResolveError> {
     // Pre-filter unsupported kinds so the poll loop only deals with
     // Video / Audio.
     for p in &pending {
@@ -989,7 +1173,8 @@ pub async fn resolve_essence_slots(
     }
 
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut resolved: Vec<((usize, usize), u16)> = Vec::with_capacity(pending.len());
+    let mut resolved: Vec<((usize, usize, Option<usize>), u16)> =
+        Vec::with_capacity(pending.len());
     let mut remaining: Vec<PendingEssenceSlot> = pending;
 
     loop {
@@ -1002,7 +1187,7 @@ pub async fn resolve_essence_slots(
             };
             match pick_pid_for_kind(&cat, p.kind) {
                 Some(pid) => {
-                    resolved.push(((p.program_idx, p.slot_idx), pid));
+                    resolved.push(((p.program_idx, p.slot_idx, p.leg_idx), pid));
                     false // resolved — drop from remaining
                 }
                 None => true, // catalogue present but no matching kind yet
@@ -1042,6 +1227,7 @@ mod tests {
             source: (input.to_string(), src_pid),
             out_pid,
             stream_type,
+            switch_legs: None,
         }
     }
 
@@ -1568,11 +1754,12 @@ mod tests {
             slot_idx: 0,
             input_id: "in-a".into(),
             kind: EsKind::Video,
+                    leg_idx: None,
         }];
         let r = resolve_essence_slots(pending, cats, Duration::from_millis(500))
             .await
             .expect("must resolve");
-        assert_eq!(r, vec![((0, 0), 0x100)]);
+        assert_eq!(r, vec![((0, 0, None), 0x100)]);
     }
 
     #[tokio::test]
@@ -1594,11 +1781,12 @@ mod tests {
             slot_idx: 3,
             input_id: "in-a".into(),
             kind: EsKind::Audio,
+                    leg_idx: None,
         }];
         let r = resolve_essence_slots(pending, cats, Duration::from_millis(500))
             .await
             .unwrap();
-        assert_eq!(r, vec![((0, 3), 0x200)], "first audio wins, not second AC-3");
+        assert_eq!(r, vec![((0, 3, None), 0x200)], "first audio wins, not second AC-3");
     }
 
     #[tokio::test]
@@ -1626,11 +1814,12 @@ mod tests {
             slot_idx: 0,
             input_id: "in-a".into(),
             kind: EsKind::Video,
+                    leg_idx: None,
         }];
         let r = resolve_essence_slots(pending, cats, Duration::from_millis(500))
             .await
             .unwrap();
-        assert_eq!(r, vec![((0, 0), 0x100)]);
+        assert_eq!(r, vec![((0, 0, None), 0x100)]);
     }
 
     #[tokio::test]
@@ -1648,6 +1837,7 @@ mod tests {
             slot_idx: 0,
             input_id: "audio-only".into(),
             kind: EsKind::Video,
+                    leg_idx: None,
         }];
         let err = resolve_essence_slots(pending, cats, Duration::from_millis(250))
             .await
@@ -1672,6 +1862,7 @@ mod tests {
             slot_idx: 0,
             input_id: "silent".into(),
             kind: EsKind::Video,
+                    leg_idx: None,
         }];
         let err = resolve_essence_slots(pending, cats, Duration::from_millis(200))
             .await
@@ -1689,6 +1880,7 @@ mod tests {
             slot_idx: 0,
             input_id: "in-a".into(),
             kind: EsKind::Subtitle,
+                    leg_idx: None,
         }];
         let err = resolve_essence_slots(pending, cats, Duration::from_millis(100))
             .await
@@ -1728,10 +1920,11 @@ mod tests {
             slot_idx: 0,
             input_id: "late".into(),
             kind: EsKind::Video,
+                    leg_idx: None,
         }];
         let r = resolve_essence_slots(pending, cats, Duration::from_millis(1000))
             .await
             .expect("must pick up late catalogue within timeout");
-        assert_eq!(r, vec![((0, 0), 0x100)]);
+        assert_eq!(r, vec![((0, 0, None), 0x100)]);
     }
 }

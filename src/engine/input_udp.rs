@@ -15,7 +15,8 @@ use crate::stats::collector::FlowStatsAccumulator;
 use crate::util::socket::bind_udp_input;
 use crate::util::time::now_us;
 
-use super::input_transcode::{publish_input_packet, InputTranscoder};
+use super::input_post_process::{InputPostProcess, InputPostProcessConfig};
+use super::input_transcode::{publish_input_packet_with_post, InputTranscoder};
 use super::packet::{MAX_RTP_PACKET_SIZE, RtpPacket};
 
 /// TS packet size used for synthetic timestamp calculation.
@@ -45,6 +46,7 @@ pub fn spawn_udp_input(
             config.transcode.as_ref(),
             config.video_encode.as_ref(),
             Some(force_idr.clone()),
+            config.pid_overrides.as_ref(),
         ) {
             Ok(t) => {
                 if let Some(ref t) = t {
@@ -67,7 +69,21 @@ pub fn spawn_udp_input(
             config.audio_encode.as_ref(),
             config.video_encode.as_ref(),
         );
-        if let Err(e) = udp_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder).await {
+        let mut post = InputPostProcess::from_config(&InputPostProcessConfig {
+            program_number: config.program_number,
+            pid_overrides: config.pid_overrides.as_ref(),
+            pid_map: config.pid_map.as_ref(),
+            has_transcode: config.audio_encode.is_some() || config.video_encode.is_some(),
+        });
+        if let Some(_) = post.as_ref() {
+            tracing::info!(
+                "UDP input '{input_id}': ingress post-process active (program_filter={} pid_overrides={} pid_map={})",
+                config.program_number.is_some(),
+                config.pid_overrides.is_some(),
+                config.pid_map.is_some(),
+            );
+        }
+        if let Err(e) = udp_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await {
             tracing::error!("UDP input task exited with error: {e}");
             event_sender.emit_flow(EventSeverity::Critical, category::FLOW, format!("Flow input lost: {e}"), &flow_id);
         }
@@ -82,6 +98,7 @@ async fn udp_input_loop(
     events: &EventSender,
     flow_id: &str,
     transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
     let socket = match bind_udp_input(
         &config.bind_addr,
@@ -157,7 +174,7 @@ async fn udp_input_loop(
                             upstream_leg_id: None,
                         };
 
-                        publish_input_packet(transcoder, &broadcast_tx, packet);
+                        publish_input_packet_with_post(transcoder, post, &broadcast_tx, packet);
                     }
                     Err(e) => {
                         tracing::warn!("UDP input recv error: {e}");

@@ -1620,6 +1620,18 @@ A flow can optionally carry an `assembly` block that tells the runtime to stop f
 
 Flows without an `assembly` block — or with `assembly.kind = passthrough` — run exactly as before. Existing configs are unaffected.
 
+### Three operating modes (pick one per flow)
+
+Flows can run in one of three modes — all coexist in the same edge build, all use the same outputs:
+
+| Mode | When to pick it | Output PIDs on input switch | Input-switcher (`ActivateInput`) behaviour |
+|---|---|---|---|
+| **Passthrough** (`assembly = null` or `kind = "passthrough"`) | One input is "live" at a time; you want the receiver to see whatever PIDs that input declared, byte-for-byte. | **Change** — receivers see new PMT versions and re-tune. `TsContinuityFixer` cushions CC + PMT version + DI to keep the cutover seamless. | Flips which input's bytes are forwarded to outputs. Classic switcher behaviour. |
+| **Assembly without Switch slots** (`kind = "spts" \| "mpts"`, slots use `pid` / `essence` / `hitless`) | You want a fresh PMT layout — unified output PIDs (e.g. always video on `0x100`) — built from one input or from a 2022-7 redundant pair. Every referenced input runs concurrently and contributes ES simultaneously. | **Stay unified** — every slot's `out_pid` is fixed by the assembly. | No-op for the data path. Every input contributes ES simultaneously regardless of which is "active". |
+| **Assembly with Switch slots** (`kind = "spts" \| "mpts"`, one or more slots use `switch`) | You want operator-driven N-input switching with **unified output PIDs** — receivers stay locked across switches. All N legs subscribe concurrently (warm) so cutover is instant. | **Stay unified** — the slot's `out_pid` is fixed; only the source leg flips. PMT version bumps mod 32 + DI=1 on the next PCR for the affected `out_pid` so receivers re-anchor STC without re-tuning. | Flips the active leg of every Switch slot whose leg list contains the named input. Slots without that input as a leg are silent. |
+
+The three modes can be mixed within an MPTS — one program can run as passthrough-style explicit `pid` slots, another can use `hitless` for redundancy, a third can use `switch` for operator-driven multi-cam. PIDs always behave per the slot source type.
+
 ### `assembly.kind`
 
 | Kind | What it builds | Program count | PCR requirement |
@@ -1687,11 +1699,32 @@ Flows without an `assembly` block — or with `assembly.kind = passthrough` — 
 
 ### Slot `source` — where the bytes come from
 
-Every slot in a program's `streams[]` has a `source` picked from three variants:
+Every slot in a program's `streams[]` has a `source` picked from four variants:
 
 - **`"pid"`** — explicit PID off a named input: `{ "type": "pid", "input_id": "...", "source_pid": 256 }`. Use when the operator knows the exact upstream PID (picked from the input's live PSI catalogue, or published in a written spec).
 - **`"essence"`** — first ES of a given kind off a named input: `{ "type": "essence", "input_id": "...", "kind": "video" | "audio" | "subtitle" | "data" }`. Useful when the upstream input is single-program and the operator just wants "its video" / "its audio" without binding to a specific PID. Resolves at flow start against the input's PSI catalogue (Phase 2); re-resolves on `UpdateFlowAssembly`.
 - **`"hitless"`** — primary-preference pre-bus merger: `{ "type": "hitless", "primary": { <slot source> }, "backup": { <slot source> } }`. Both legs publish onto the bus independently; a merger task forwards primary verbatim and flips to backup if no primary packet arrives for 200 ms. Primary traffic resumption brings the merger back after a short hold-off. **Not SMPTE 2022-7 sequence-aware dedup** — the bus today doesn't carry upstream RTP sequence numbers. Either nested leg must itself be `pid` or `essence`; a Hitless nested inside another Hitless is rejected.
+- **`"switch"`** — operator-driven N-input switch (1..=64 legs): `{ "type": "switch", "legs": [ { "type": "pid"|"essence", "input_id": "...", ... } ], "initial_input_id": "..." }`. All legs subscribe concurrently (warm) so cutover is instant; the assembler forwards bytes only from the leg whose `input_id` matches the flow's currently-active input. The Switcher's `ActivateInput` (PGM/PVW/Take) flips every Switch slot whose leg list contains the named input — slots without that input as a leg are silent. **Output PIDs stay unified across switches** (the slot's fixed `out_pid`); PMT version bumps mod 32 and DI=1 fires on the next PCR for that `out_pid` so receivers stay locked without re-tuning. CC remains monotonic on `out_pid` because only the active leg writes packets through the rewriter. Legs are flat (`{ "type": "pid", ... }` or `{ "type": "essence", ... }`); Switch nested inside Hitless and Switch nested inside another Switch are both type-system rejected. The active leg survives flow restart via `flow.active_input_id`; if the saved active input is no longer in the leg list, the slot silently falls back to `initial_input_id`.
+
+Example Switch slot — three-camera multicam bus on a single video PID:
+
+```json
+{
+  "out_pid": 256,
+  "stream_type": 27,
+  "source": {
+    "type": "switch",
+    "legs": [
+      { "type": "essence", "input_id": "cam-a", "kind": "video" },
+      { "type": "essence", "input_id": "cam-b", "kind": "video" },
+      { "type": "essence", "input_id": "cam-c", "kind": "video" }
+    ],
+    "initial_input_id": "cam-a"
+  }
+}
+```
+
+To drive it: build a Switcher preset for each camera (single `activate_input` action targeting this flow + that camera's input id) and Take. The Switcher integration is unchanged — preset shape `(node_id, flow_id, input_id)` is reused verbatim; only the edge-side semantics widen to flip Switch slot active legs in addition to the legacy passthrough behaviour.
 
 ### PCR rules
 
@@ -1734,6 +1767,13 @@ All rejected at `AppConfig::validate()` → `validate_flow_assembly()` with a cl
 - MPTS: every program's effective `pcr_source` (own or flow-level fallback) must be set.
 - When `pcr_source` resolves concretely, it must hit one of that program's slots (Pid match) or one of its Essence-slot inputs.
 - **Hitless** nested inside a Hitless is rejected.
+- **Switch** slot rules:
+  - `legs` length 1..=64 (`pid_bus_switch_empty_legs` / `pid_bus_switch_too_many_legs`).
+  - Every leg's `input_id` must be in `flow.input_ids`.
+  - No two legs may share the same identity — `(input_id, source_pid)` for `pid` legs, `(input_id, kind)` for `essence` legs (`pid_bus_switch_duplicate_leg`).
+  - `initial_input_id` must equal exactly one leg's `input_id` (`pid_bus_switch_initial_leg_unknown`).
+  - When every leg is `essence`-typed, all `kind` values must agree (`pid_bus_switch_legs_kind_mismatch`).
+  - Switch nested inside Hitless is rejected (`pid_bus_switch_nested_in_hitless`); Switch nested inside Switch is type-system impossible.
 - Non-TS inputs without `audio_encode` (or with a non-runtime `audio_encode.codec`) are rejected at flow bring-up with a specific `pid_bus_*` error code (see Event reference).
 
 ### Runtime behaviour

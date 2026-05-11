@@ -27,9 +27,13 @@ use bytes::{BufMut, BytesMut, Bytes};
 // TS constants
 const TS_PACKET_SIZE: usize = 188;
 const TS_SYNC_BYTE: u8 = 0x47;
-const PMT_PID: u16 = 0x1000;
-const VIDEO_PID: u16 = 0x0100;
-const AUDIO_PID: u16 = 0x0101;
+/// Default PMT PID when no override is supplied. Matches ffmpeg's mpegts
+/// muxer default.
+pub const DEFAULT_PMT_PID: u16 = 0x1000;
+/// Default video PES PID when no override is supplied.
+pub const DEFAULT_VIDEO_PID: u16 = 0x0100;
+/// Default audio PES PID when no override is supplied.
+pub const DEFAULT_AUDIO_PID: u16 = 0x0101;
 
 /// Maximum wall-clock interval between PAT/PMT emissions.
 /// TR-101290 Priority 1 requires PSI tables to repeat at least every
@@ -48,6 +52,19 @@ const STREAM_TYPE_AAC: u8 = 0x0F;
 
 /// MPEG-TS muxer state.
 pub struct TsMuxer {
+    /// PMT PID — `0x1000` by default. Overridable via `set_pids()` so an
+    /// operator can pin every transcoded input to the same wire layout
+    /// for switcher use (downstream decoders never re-tune).
+    pmt_pid: u16,
+    /// Video PES PID — `0x0100` by default. Overridable.
+    video_pid: u16,
+    /// Audio PES PID — `0x0101` by default. Overridable.
+    audio_pid: u16,
+    /// Optional explicit PCR PID. When `None`, PCR is carried on the
+    /// video PID if video is present, otherwise the audio PID — the
+    /// historical behaviour. When `Some`, this PID is advertised in the
+    /// PMT and used in PCR-bearing TS packets.
+    pcr_pid_override: Option<u16>,
     /// Continuity counters per PID.
     cc_pat: u8,
     cc_pmt: u8,
@@ -108,6 +125,10 @@ pub struct TsMuxer {
 impl TsMuxer {
     pub fn new() -> Self {
         Self {
+            pmt_pid: DEFAULT_PMT_PID,
+            video_pid: DEFAULT_VIDEO_PID,
+            audio_pid: DEFAULT_AUDIO_PID,
+            pcr_pid_override: None,
             cc_pat: 0,
             cc_pmt: 0,
             cc_video: 0,
@@ -123,6 +144,24 @@ impl TsMuxer {
             last_audio_pts_90khz: None,
             pmt_version: 0,
         }
+    }
+
+    /// Override one or more output PIDs. Any field left `None` keeps the
+    /// current value (defaults: PMT 0x1000, video 0x0100, audio 0x0101,
+    /// PCR auto-derived). Call before any `mux_*` invocation; call sites
+    /// that change PIDs mid-stream are responsible for bumping the PMT
+    /// version (`set_pmt_version`) so receivers re-parse.
+    pub fn set_pids(
+        &mut self,
+        pmt: Option<u16>,
+        video: Option<u16>,
+        audio: Option<u16>,
+        pcr: Option<u16>,
+    ) {
+        if let Some(p) = pmt { self.pmt_pid = p; }
+        if let Some(p) = video { self.video_pid = p; }
+        if let Some(p) = audio { self.audio_pid = p; }
+        self.pcr_pid_override = pcr;
     }
 
     /// Seed the per-PID continuity counters so the next outgoing TS packet
@@ -292,7 +331,8 @@ impl TsMuxer {
 
         // Split PES into TS packets. Always write PCR (not just on
         // keyframes) for TR-101290 P2 compliance.
-        let ts_pkts = self.packetize(VIDEO_PID, &pes, true, true, Some(dts_90khz), is_keyframe);
+        let video_pid = self.video_pid;
+        let ts_pkts = self.packetize(video_pid, &pes, true, true, Some(dts_90khz), is_keyframe);
         packets.extend(ts_pkts);
 
         packets
@@ -310,7 +350,8 @@ impl TsMuxer {
         // Wrap in ADTS header
         let adts_frame = build_adts_frame(raw_aac, sample_rate_idx, channels);
         let pes = build_pes_packet(0xC0, &adts_frame, pts_90khz, None);
-        packets.extend(self.packetize(AUDIO_PID, &pes, true, false, None, false));
+        let audio_pid = self.audio_pid;
+        packets.extend(self.packetize(audio_pid, &pes, true, false, None, false));
 
         packets
     }
@@ -335,7 +376,8 @@ impl TsMuxer {
         let pts_90khz = self.clamp_audio_pts(pts_90khz);
         let mut packets = self.maybe_emit_pat_pmt(false);
         let pes = build_pes_packet(0xC0, adts_frame, pts_90khz, None);
-        packets.extend(self.packetize(AUDIO_PID, &pes, true, false, None, false));
+        let audio_pid = self.audio_pid;
+        packets.extend(self.packetize(audio_pid, &pes, true, false, None, false));
         packets
     }
 
@@ -381,7 +423,8 @@ impl TsMuxer {
 
         // stream_id 0xBD (private_stream_1) is required for stream_type 0x06.
         let pes = build_pes_packet(0xBD, &au, pts_90khz, None);
-        packets.extend(self.packetize(AUDIO_PID, &pes, true, false, None, false));
+        let audio_pid = self.audio_pid;
+        packets.extend(self.packetize(audio_pid, &pes, true, false, None, false));
         packets
     }
 
@@ -401,10 +444,12 @@ impl TsMuxer {
             let mut pkt = [0xFFu8; TS_PACKET_SIZE];
             let mut pos = 0;
 
-            let cc = match pid {
-                VIDEO_PID => { let c = self.cc_video; self.cc_video = (self.cc_video + 1) & 0x0F; c }
-                AUDIO_PID => { let c = self.cc_audio; self.cc_audio = (self.cc_audio + 1) & 0x0F; c }
-                _ => 0,
+            let cc = if pid == self.video_pid {
+                let c = self.cc_video; self.cc_video = (self.cc_video + 1) & 0x0F; c
+            } else if pid == self.audio_pid {
+                let c = self.cc_audio; self.cc_audio = (self.cc_audio + 1) & 0x0F; c
+            } else {
+                0
             };
 
             let pusi = if is_first && payload_start { 1u8 } else { 0 };
@@ -515,11 +560,11 @@ impl TsMuxer {
         pkt[pat_start + 6] = 0x00; // section_number
         pkt[pat_start + 7] = 0x00; // last_section_number
 
-        // Program 1 -> PMT PID 0x1000
+        // Program 1 -> PMT PID (instance field, default 0x1000)
         pkt[pat_start + 8] = 0x00; // program_number high
         pkt[pat_start + 9] = 0x01; // program_number low
-        pkt[pat_start + 10] = 0xE0 | ((PMT_PID >> 8) as u8 & 0x1F); // reserved + PID high
-        pkt[pat_start + 11] = PMT_PID as u8; // PID low
+        pkt[pat_start + 10] = 0xE0 | ((self.pmt_pid >> 8) as u8 & 0x1F); // reserved + PID high
+        pkt[pat_start + 11] = self.pmt_pid as u8; // PID low
 
         // CRC32
         let crc = crc32_mpeg2(&pkt[pat_start..pat_start + 12]);
@@ -540,8 +585,8 @@ impl TsMuxer {
 
         let mut pkt = vec![0u8; TS_PACKET_SIZE];
         pkt[0] = TS_SYNC_BYTE;
-        pkt[1] = 0x40 | ((PMT_PID >> 8) as u8 & 0x1F); // PUSI=1
-        pkt[2] = PMT_PID as u8;
+        pkt[1] = 0x40 | ((self.pmt_pid >> 8) as u8 & 0x1F); // PUSI=1
+        pkt[2] = self.pmt_pid as u8;
         pkt[3] = 0x10 | cc;
 
         // Pointer field
@@ -568,8 +613,13 @@ impl TsMuxer {
         pkt[pmt_start + 5] = 0xC1 | ((self.pmt_version & 0x1F) << 1);
         pkt[pmt_start + 6] = 0x00; // section_number
         pkt[pmt_start + 7] = 0x00; // last_section_number
-        // PCR PID: use video PID if video is present, otherwise audio PID
-        let pcr_pid = if self.has_video { VIDEO_PID } else { AUDIO_PID };
+        // PCR PID: explicit override wins; otherwise default to video if
+        // present, else audio. The override must point at an ES PID that
+        // actually carries PCR-bearing TS packets — the muxer doesn't
+        // emit PCR on standalone PIDs.
+        let pcr_pid = self.pcr_pid_override.unwrap_or(
+            if self.has_video { self.video_pid } else { self.audio_pid }
+        );
         pkt[pmt_start + 8] = 0xE0 | ((pcr_pid >> 8) as u8 & 0x1F);
         pkt[pmt_start + 9] = pcr_pid as u8;
         pkt[pmt_start + 10] = 0xF0; // reserved + program_info_length high
@@ -580,8 +630,8 @@ impl TsMuxer {
         // Video stream entry (H.264 or H.265)
         if self.has_video {
             pkt[pos] = self.video_stream_type;
-            pkt[pos + 1] = 0xE0 | ((VIDEO_PID >> 8) as u8 & 0x1F);
-            pkt[pos + 2] = VIDEO_PID as u8;
+            pkt[pos + 1] = 0xE0 | ((self.video_pid >> 8) as u8 & 0x1F);
+            pkt[pos + 2] = self.video_pid as u8;
             pkt[pos + 3] = 0xF0; // reserved + ES_info_length high
             pkt[pos + 4] = 0x00; // ES_info_length low = 0
             pos += 5;
@@ -592,8 +642,8 @@ impl TsMuxer {
         // a 6-byte registration descriptor is written into ES_info.
         if self.has_audio {
             pkt[pos] = self.audio_stream_type;
-            pkt[pos + 1] = 0xE0 | ((AUDIO_PID >> 8) as u8 & 0x1F);
-            pkt[pos + 2] = AUDIO_PID as u8;
+            pkt[pos + 1] = 0xE0 | ((self.audio_pid >> 8) as u8 & 0x1F);
+            pkt[pos + 2] = self.audio_pid as u8;
             pkt[pos + 3] = 0xF0 | ((audio_desc_len >> 8) as u8 & 0x0F);
             pkt[pos + 4] = audio_desc_len as u8;
             pos += 5;
@@ -637,7 +687,8 @@ impl TsMuxer {
         let mut packets = self.maybe_emit_pat_pmt(false);
         let pes = build_pes_packet(0xBD, pes_payload, pts_90khz, None);
         // Audio-only TS: PCR rides the audio PID.
-        packets.extend(self.packetize(AUDIO_PID, &pes, true, !self.has_video, Some(pts_90khz), false));
+        let audio_pid = self.audio_pid;
+        packets.extend(self.packetize(audio_pid, &pes, true, !self.has_video, Some(pts_90khz), false));
         packets
     }
 }
@@ -746,6 +797,13 @@ fn crc32_mpeg2(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Tests still reference the short PID names; alias them to the public
+    // defaults so the original test bodies need no churn.
+    #[allow(dead_code)]
+    const PMT_PID: u16 = DEFAULT_PMT_PID;
+    const VIDEO_PID: u16 = DEFAULT_VIDEO_PID;
+    const AUDIO_PID: u16 = DEFAULT_AUDIO_PID;
 
     #[test]
     fn test_pat_packet_size() {
@@ -1024,5 +1082,54 @@ mod tests {
             assert_eq!(pkt.len(), TS_PACKET_SIZE);
             assert_eq!(pkt[0], TS_SYNC_BYTE);
         }
+    }
+
+    /// `set_pids` must propagate through PAT (PMT-PID pointer), the PMT
+    /// header (its own PID), and PMT entries (video / audio / PCR PIDs).
+    /// This is the contract every transcoded input/output relies on for
+    /// switcher use — a downstream decoder pinned to specific PIDs must
+    /// see them advertised consistently across muxer instances.
+    #[test]
+    fn set_pids_overrides_propagate_through_pat_pmt() {
+        let mut muxer = TsMuxer::new();
+        muxer.set_has_video(true);
+        muxer.set_has_audio(true);
+        muxer.set_pids(Some(0x1234), Some(0x0250), Some(0x0260), Some(0x0260));
+
+        // PAT: program 1 → PMT PID 0x1234.
+        let pat = muxer.build_pat();
+        let pmt_pid_pat = (((pat[5 + 10] & 0x1F) as u16) << 8) | pat[5 + 11] as u16;
+        assert_eq!(pmt_pid_pat, 0x1234, "PAT must point at the override PMT PID");
+
+        // PMT TS header: PID byte 1-2.
+        let pmt = muxer.build_pmt();
+        let pmt_pid_hdr = (((pmt[1] & 0x1F) as u16) << 8) | pmt[2] as u16;
+        assert_eq!(pmt_pid_hdr, 0x1234, "PMT TS header must use the override PID");
+
+        // PMT body: PCR PID at section offset +8/+9.
+        let pcr_pid = (((pmt[5 + 8] & 0x1F) as u16) << 8) | pmt[5 + 9] as u16;
+        assert_eq!(pcr_pid, 0x0260, "PCR PID override must appear in PMT");
+
+        // First ES entry (video, since has_video) sits at pmt_start + 12.
+        let v_es = (((pmt[5 + 12 + 1] & 0x1F) as u16) << 8) | pmt[5 + 12 + 2] as u16;
+        assert_eq!(v_es, 0x0250, "video ES PID override must appear in PMT");
+
+        // Second ES entry (audio) sits 5 bytes after the video entry
+        // (no descriptors on default AAC).
+        let a_es = (((pmt[5 + 12 + 5 + 1] & 0x1F) as u16) << 8) | pmt[5 + 12 + 5 + 2] as u16;
+        assert_eq!(a_es, 0x0260, "audio ES PID override must appear in PMT");
+    }
+
+    /// PCR PID auto-falls-back to the video PID when no explicit override
+    /// is supplied (preserves legacy behaviour with a custom video PID).
+    #[test]
+    fn pcr_pid_defaults_to_video_pid_when_unset() {
+        let mut muxer = TsMuxer::new();
+        muxer.set_has_video(true);
+        muxer.set_has_audio(true);
+        muxer.set_pids(None, Some(0x0312), Some(0x0413), None);
+        let pmt = muxer.build_pmt();
+        let pcr_pid = (((pmt[5 + 8] & 0x1F) as u16) << 8) | pmt[5 + 9] as u16;
+        assert_eq!(pcr_pid, 0x0312, "PCR must default to the video PID");
     }
 }

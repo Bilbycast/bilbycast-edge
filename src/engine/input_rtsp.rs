@@ -46,6 +46,7 @@ pub fn spawn_rtsp_input(
             config.transcode.as_ref(),
             config.video_encode.as_ref(),
             Some(force_idr.clone()),
+            config.pid_overrides.as_ref(),
         ) {
             Ok(t) => {
                 if let Some(ref t) = t {
@@ -214,6 +215,11 @@ async fn run_rtsp_session(
     *disconnect_event_pending = true;
 
     let mut ts_muxer = TsMuxer::new();
+    if let Some(po) = config.pid_overrides.as_ref() {
+        if let Some(entry) = po.get(&1) {
+                ts_muxer.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
+            }
+    }
     ts_muxer.set_has_video(has_video);
     ts_muxer.set_has_audio(has_audio);
     if is_h265 {

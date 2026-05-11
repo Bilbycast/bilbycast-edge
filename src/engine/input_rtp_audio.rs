@@ -57,6 +57,7 @@ pub fn spawn_rtp_audio_input(
         max_bitrate_mbps: None,
         transcode: config.transcode.clone(),
         audio_encode: config.audio_encode.clone(),
+        pid_overrides: config.pid_overrides.clone(),
         interface_binding: config.interface_binding.clone(),
     };
 

@@ -661,7 +661,155 @@ fn validate_input_interface_bindings(input_id: &str, cfg: &InputConfig) -> Resul
 /// mode-specific requirements (e.g., `remote_addr` required for caller/rendezvous),
 /// validates passphrase length and AES key length, and validates the optional
 /// redundancy (leg 2) configuration.
+/// Pull the optional `pid_overrides` block off any input config variant
+/// that carries one. Returns `None` for variants where the field doesn't
+/// exist (none today, but the helper is forward-compatible).
+fn input_pid_overrides(input: &InputConfig) -> Option<&crate::config::models::TsPidOverridesMap> {
+    match input {
+        InputConfig::Rtp(c) => c.pid_overrides.as_ref(),
+        InputConfig::Udp(c) => c.pid_overrides.as_ref(),
+        InputConfig::Srt(c) => c.pid_overrides.as_ref(),
+        InputConfig::Rist(c) => c.pid_overrides.as_ref(),
+        InputConfig::Rtmp(c) => c.pid_overrides.as_ref(),
+        InputConfig::Rtsp(c) => c.pid_overrides.as_ref(),
+        InputConfig::Webrtc(c) => c.pid_overrides.as_ref(),
+        InputConfig::Whep(c) => c.pid_overrides.as_ref(),
+        InputConfig::TestPattern(c) => c.pid_overrides.as_ref(),
+        InputConfig::MediaPlayer(c) => c.pid_overrides.as_ref(),
+        InputConfig::Replay(c) => c.pid_overrides.as_ref(),
+        InputConfig::St2110_30(c) => c.pid_overrides.as_ref(),
+        InputConfig::St2110_31(c) => c.pid_overrides.as_ref(),
+        InputConfig::St2110_40(_) => None,
+        InputConfig::St2110_20(c) => c.pid_overrides.as_ref(),
+        InputConfig::St2110_23(c) => c.pid_overrides.as_ref(),
+        InputConfig::RtpAudio(c) => c.pid_overrides.as_ref(),
+        // Bonded reassembles upstream payloads into the broadcast channel
+        // verbatim — TS layout (and PIDs) follow the source. No synthetic
+        // mux to override.
+        InputConfig::Bonded(_) => None,
+    }
+}
+
+/// Pull the optional ingress `program_number` filter off any TS-carrying
+/// input config variant. None for variants without the field.
+fn input_program_number(input: &InputConfig) -> Option<u16> {
+    match input {
+        InputConfig::Rtp(c) => c.program_number,
+        InputConfig::Udp(c) => c.program_number,
+        InputConfig::Srt(c) => c.program_number,
+        InputConfig::Rist(c) => c.program_number,
+        InputConfig::Rtmp(c) => c.program_number,
+        InputConfig::Rtsp(c) => c.program_number,
+        InputConfig::Webrtc(c) => c.program_number,
+        InputConfig::Whep(c) => c.program_number,
+        InputConfig::TestPattern(c) => c.program_number,
+        InputConfig::MediaPlayer(c) => c.program_number,
+        InputConfig::Replay(c) => c.program_number,
+        InputConfig::St2110_30(_)
+        | InputConfig::St2110_31(_)
+        | InputConfig::RtpAudio(_)
+        | InputConfig::St2110_20(_)
+        | InputConfig::St2110_23(_)
+        | InputConfig::St2110_40(_)
+        | InputConfig::Bonded(_) => None,
+    }
+}
+
+/// Pull the optional ingress `pid_map` off any TS-carrying input config
+/// variant. None for variants without the field.
+fn input_pid_map(input: &InputConfig) -> Option<&std::collections::BTreeMap<u16, u16>> {
+    match input {
+        InputConfig::Rtp(c) => c.pid_map.as_ref(),
+        InputConfig::Udp(c) => c.pid_map.as_ref(),
+        InputConfig::Srt(c) => c.pid_map.as_ref(),
+        InputConfig::Rist(c) => c.pid_map.as_ref(),
+        InputConfig::Rtmp(c) => c.pid_map.as_ref(),
+        InputConfig::Rtsp(c) => c.pid_map.as_ref(),
+        InputConfig::Webrtc(c) => c.pid_map.as_ref(),
+        InputConfig::Whep(c) => c.pid_map.as_ref(),
+        InputConfig::TestPattern(c) => c.pid_map.as_ref(),
+        InputConfig::MediaPlayer(c) => c.pid_map.as_ref(),
+        InputConfig::Replay(c) => c.pid_map.as_ref(),
+        InputConfig::St2110_30(_)
+        | InputConfig::St2110_31(_)
+        | InputConfig::RtpAudio(_)
+        | InputConfig::St2110_20(_)
+        | InputConfig::St2110_23(_)
+        | InputConfig::St2110_40(_)
+        | InputConfig::Bonded(_) => None,
+    }
+}
+
+/// True for inputs that always emit a single fixed program (program 1)
+/// via `TsMuxer`. Used by `validate_pid_overrides` to refuse a
+/// per-program map with keys other than 1 on these variants. Inputs that
+/// can ingest external MPTS (RTP/UDP/SRT/RIST/Bonded) or that may play
+/// MPTS files (MediaPlayer/Replay) return `false`.
+fn input_is_synthetic_ts(input: &InputConfig) -> bool {
+    match input {
+        // Wrapped in TsMuxer at ingress — always SPTS, program 1.
+        InputConfig::Rtmp(_)
+        | InputConfig::Rtsp(_)
+        | InputConfig::Webrtc(_)
+        | InputConfig::Whep(_)
+        | InputConfig::TestPattern(_)
+        | InputConfig::St2110_20(_)
+        | InputConfig::St2110_23(_) => true,
+        // PCM inputs become synthetic-TS only when audio_encode is set
+        // (turning them into TS carriers via input_pcm_encode + TsMuxer).
+        InputConfig::St2110_30(c) | InputConfig::St2110_31(c) => c.audio_encode.is_some(),
+        InputConfig::RtpAudio(c) => c.audio_encode.is_some(),
+        // External-TS sources may carry MPTS.
+        InputConfig::Rtp(_)
+        | InputConfig::Udp(_)
+        | InputConfig::Srt(_)
+        | InputConfig::Rist(_)
+        | InputConfig::MediaPlayer(_)
+        | InputConfig::Replay(_)
+        | InputConfig::Bonded(_) => false,
+        // ANC, no MPEG-TS layer at all.
+        InputConfig::St2110_40(_) => false,
+    }
+}
+
+/// Pull the optional `pid_overrides` block off any output config variant
+/// that carries one. HLS / CMAF emit their own segment-level mux (PIDs
+/// are managed inside the segmenter, not exposed); the ST 2110-* outputs
+/// emit raw essence (no MPEG-TS PIDs at all). For those variants this
+/// helper returns `None` and the validator skips the check.
+fn output_pid_overrides(output: &OutputConfig) -> Option<&crate::config::models::TsPidOverridesMap> {
+    match output {
+        OutputConfig::Rtp(c) => c.pid_overrides.as_ref(),
+        OutputConfig::Udp(c) => c.pid_overrides.as_ref(),
+        OutputConfig::Srt(c) => c.pid_overrides.as_ref(),
+        OutputConfig::Rist(c) => c.pid_overrides.as_ref(),
+        OutputConfig::Rtmp(c) => c.pid_overrides.as_ref(),
+        OutputConfig::Hls(_) => None,
+        OutputConfig::Cmaf(_) => None,
+        OutputConfig::Webrtc(c) => c.pid_overrides.as_ref(),
+        OutputConfig::St2110_30(_) => None,
+        OutputConfig::St2110_31(_) => None,
+        OutputConfig::St2110_40(_) => None,
+        OutputConfig::St2110_20(_) => None,
+        OutputConfig::St2110_23(_) => None,
+        OutputConfig::RtpAudio(c) => c.pid_overrides.as_ref(),
+        OutputConfig::Bonded(_) => None,
+        // Local-display playout decodes audio + video into KMS / ALSA —
+        // no MPEG-TS leaves the box, so PID overrides do not apply.
+        OutputConfig::Display(_) => None,
+    }
+}
+
 fn validate_input(input: &InputConfig) -> Result<()> {
+    // Universal: validate any pid_overrides block on the input. Range +
+    // intra-block-collision checks; if unset, no-op.
+    validate_pid_overrides(
+        input_pid_overrides(input),
+        "input pid_overrides",
+        input_is_synthetic_ts(input),
+    )?;
+    validate_program_number(input_program_number(input), "input program_number")?;
+    validate_pid_map(input_pid_map(input), "input pid_map")?;
     match input {
         InputConfig::Rtp(rtp) => {
             validate_socket_addr(&rtp.bind_addr, "RTP input bind_addr")?;
@@ -2498,7 +2646,7 @@ fn collect_slot_ref<'a>(
     pids: &mut std::collections::HashSet<(&'a str, u16)>,
     essence_inputs: &mut std::collections::HashSet<&'a str>,
 ) {
-    use crate::config::models::SlotSource;
+    use crate::config::models::{SlotSource, SwitchLeg};
     match src {
         SlotSource::Pid { input_id, source_pid } => {
             pids.insert((input_id.as_str(), *source_pid));
@@ -2509,6 +2657,18 @@ fn collect_slot_ref<'a>(
         SlotSource::Hitless { primary, backup, .. } => {
             collect_slot_ref(primary, pids, essence_inputs);
             collect_slot_ref(backup, pids, essence_inputs);
+        }
+        SlotSource::Switch { legs, .. } => {
+            for leg in legs {
+                match leg {
+                    SwitchLeg::Pid { input_id, source_pid } => {
+                        pids.insert((input_id.as_str(), *source_pid));
+                    }
+                    SwitchLeg::Essence { input_id, .. } => {
+                        essence_inputs.insert(input_id.as_str());
+                    }
+                }
+            }
         }
     }
 }
@@ -2524,7 +2684,7 @@ where
     F: Fn(&str) -> Result<()>,
     G: Fn(u16, &str) -> Result<()>,
 {
-    use crate::config::models::SlotSource;
+    use crate::config::models::{SlotSource, SwitchLeg};
     match src {
         SlotSource::Pid { input_id, source_pid } => {
             check_input(input_id)?;
@@ -2570,6 +2730,106 @@ where
             }
             validate_slot_source(primary, check_input, check_pid, context, true)?;
             validate_slot_source(backup, check_input, check_pid, context, true)?;
+        }
+        SlotSource::Switch {
+            legs,
+            initial_input_id,
+        } => {
+            if inside_hitless {
+                bail!(
+                    "{context}: switch slot source cannot nest inside hitless \
+                     (pid_bus_switch_nested_in_hitless)"
+                );
+            }
+            if legs.is_empty() {
+                bail!(
+                    "{context}: switch source must have at least one leg \
+                     (pid_bus_switch_empty_legs)"
+                );
+            }
+            if legs.len() > 64 {
+                bail!(
+                    "{context}: switch source has {} legs; max 64 \
+                     (pid_bus_switch_too_many_legs)",
+                    legs.len()
+                );
+            }
+            // Per-leg input + PID validation, and dedup of leg identity.
+            // Identity = (input_id, source_pid) for explicit-PID legs,
+            // (input_id, essence_kind) for essence legs. Two legs with
+            // the same identity would forward the same bus key and the
+            // operator's switch would be ambiguous.
+            let mut seen_pid: std::collections::HashSet<(&str, u16)> =
+                std::collections::HashSet::new();
+            let mut seen_essence: std::collections::HashSet<(&str, &str)> =
+                std::collections::HashSet::new();
+            for leg in legs {
+                match leg {
+                    SwitchLeg::Pid { input_id, source_pid } => {
+                        check_input(input_id)?;
+                        check_pid(*source_pid, "switch_leg.source_pid")?;
+                        if !seen_pid.insert((input_id.as_str(), *source_pid)) {
+                            bail!(
+                                "{context}: switch slot has duplicate leg \
+                                 (input '{input_id}', pid 0x{source_pid:04X}) \
+                                 (pid_bus_switch_duplicate_leg)"
+                            );
+                        }
+                    }
+                    SwitchLeg::Essence { input_id, kind } => {
+                        check_input(input_id)?;
+                        let kind_tag = match kind {
+                            crate::config::models::EssenceKind::Video => "video",
+                            crate::config::models::EssenceKind::Audio => "audio",
+                            crate::config::models::EssenceKind::Subtitle => "subtitle",
+                            crate::config::models::EssenceKind::Data => "data",
+                        };
+                        if !seen_essence.insert((input_id.as_str(), kind_tag)) {
+                            bail!(
+                                "{context}: switch slot has duplicate essence leg \
+                                 (input '{input_id}', kind {kind_tag}) \
+                                 (pid_bus_switch_duplicate_leg)"
+                            );
+                        }
+                    }
+                }
+            }
+            // initial_input_id must match exactly one leg.
+            let matches = legs
+                .iter()
+                .filter(|leg| leg.input_id() == initial_input_id.as_str())
+                .count();
+            if matches == 0 {
+                bail!(
+                    "{context}: switch initial_input_id '{initial_input_id}' is not \
+                     in any leg (pid_bus_switch_initial_leg_unknown)"
+                );
+            }
+            // When all legs are Essence-typed, they must agree on kind —
+            // otherwise the slot can't have a single consistent codec.
+            // Mixed Pid/Essence is deferred to runtime since stream_type
+            // for Pid legs comes from the source PMT.
+            let all_essence = legs
+                .iter()
+                .all(|leg| matches!(leg, SwitchLeg::Essence { .. }));
+            if all_essence {
+                let mut first_kind: Option<crate::config::models::EssenceKind> = None;
+                for leg in legs {
+                    if let SwitchLeg::Essence { kind, .. } = leg {
+                        match first_kind {
+                            None => first_kind = Some(*kind),
+                            Some(k) if k != *kind => {
+                                bail!(
+                                    "{context}: switch slot has legs with mismatched \
+                                     essence kinds — every leg must agree \
+                                     (pid_bus_switch_legs_kind_mismatch)"
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -2625,6 +2885,103 @@ fn validate_pid_map(
             bail!(
                 "{context}: pid_map target PID 0x{dst:04X} used more than once (targets must be unique)"
             );
+        }
+    }
+    Ok(())
+}
+
+/// Validate an optional per-program `pid_overrides` map. Walks every
+/// `program_number → entry` pair, validating each entry's four optional
+/// PID fields against the user-range (`0x0010..=0x1FFE`) and the
+/// per-program collision rules (PMT ≠ video ≠ audio; PCR may alias
+/// video/audio but not PMT). Empty map (no entries) is accepted as a
+/// no-op. Unset/None map is also accepted.
+///
+/// `synthetic_ts_only`: when `true`, the map MUST contain at most one
+/// entry keyed `1` — used for inputs/outputs that emit a single fixed
+/// program via `TsMuxer` (RTMP/RTSP/WebRTC/test-pattern/media-player/
+/// replay/PCM-encode/ST 2110-20/-23). MPTS sources/sinks pass `false`
+/// to allow any subset of program numbers.
+///
+/// Mirrors the per-PID range used by `validate_flow_assembly`'s
+/// `check_pid` helper and the per-PID range in `validate_pid_map`.
+fn validate_pid_overrides(
+    po: Option<&crate::config::models::TsPidOverridesMap>,
+    context: &str,
+    synthetic_ts_only: bool,
+) -> Result<()> {
+    let Some(po) = po else {
+        return Ok(());
+    };
+    if po.is_empty() {
+        return Ok(());
+    }
+    if synthetic_ts_only {
+        for &program in po.keys() {
+            if program != 1 {
+                bail!(
+                    "{context}: pid_overrides program {program} not allowed; this input/output only \
+                     emits program 1 (synthetic-TS path). Use Flow Assembly for multi-program output."
+                );
+            }
+        }
+    }
+    for (&program, entry) in po.iter() {
+        if program == 0 {
+            bail!(
+                "{context}: pid_overrides program 0 is reserved for the NIT, not a real program"
+            );
+        }
+        validate_pid_overrides_entry(entry, &format!("{context}: pid_overrides[program={program}]"))?;
+    }
+    Ok(())
+}
+
+/// Validate one `TsPidOverridesEntry` — range + intra-entry collision
+/// checks. Factored out of `validate_pid_overrides` so both the
+/// per-program walker and any caller working with a single entry (tests,
+/// Flow Assembly cross-checks) share the same logic.
+fn validate_pid_overrides_entry(
+    entry: &crate::config::models::TsPidOverridesEntry,
+    context: &str,
+) -> Result<()> {
+    let check = |pid: u16, what: &str| -> Result<()> {
+        if !(0x0010..=0x1FFE).contains(&pid) {
+            bail!(
+                "{context}: {what} PID 0x{pid:04X} out of range; must be in 0x0010..=0x1FFE (0x0000-0x000F + 0x1FFF reserved)"
+            );
+        }
+        Ok(())
+    };
+    if let Some(p) = entry.pmt_pid { check(p, "pmt_pid")?; }
+    if let Some(p) = entry.video_pid { check(p, "video_pid")?; }
+    if let Some(p) = entry.audio_pid { check(p, "audio_pid")?; }
+    if let Some(p) = entry.pcr_pid { check(p, "pcr_pid")?; }
+
+    // Collision check across the four slots. PCR is allowed to alias
+    // video or audio (the standard pattern — PCR rides whichever ES the
+    // muxer is emitting it on) but NOT PMT (PCR must ride an ES PID).
+    let pmt = entry.pmt_pid;
+    let video = entry.video_pid;
+    let audio = entry.audio_pid;
+    if let (Some(p), Some(v)) = (pmt, video) {
+        if p == v {
+            bail!("{context}: pmt_pid (0x{p:04X}) collides with video_pid");
+        }
+    }
+    if let (Some(p), Some(a)) = (pmt, audio) {
+        if p == a {
+            bail!("{context}: pmt_pid (0x{p:04X}) collides with audio_pid");
+        }
+    }
+    if let (Some(v), Some(a)) = (video, audio) {
+        if v == a {
+            bail!("{context}: video_pid (0x{v:04X}) collides with audio_pid");
+        }
+    }
+    if let Some(pcr) = entry.pcr_pid {
+        if Some(pcr) == pmt {
+            bail!("{context}: pcr_pid (0x{pcr:04X}) collides with pmt_pid; PCR must ride an ES PID, not the PMT PID");
         }
     }
     Ok(())
@@ -2993,6 +3350,13 @@ fn validate_video_encode(
             ),
         }
     }
+    if let Some(pid) = enc.source_video_pid {
+        if !(0x0010..=0x1FFE).contains(&pid) {
+            bail!(
+                "{context}: video_encode.source_video_pid 0x{pid:04X} out of range; must be in 0x0010..=0x1FFE"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -3110,6 +3474,15 @@ fn validate_audio_encode(
             );
         }
     }
+    // Source PID override: must sit in the user-PID range; reserved
+    // system PIDs (0x0000..=0x000F) and the NULL PID (0x1FFF) refused.
+    if let Some(pid) = enc.source_audio_pid {
+        if !(0x0010..=0x1FFE).contains(&pid) {
+            bail!(
+                "{context}: audio_encode.source_audio_pid 0x{pid:04X} out of range; must be in 0x0010..=0x1FFE"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -3172,6 +3545,11 @@ fn validate_input_transcode_group_a(
 pub fn validate_output(output: &OutputConfig) -> Result<()> {
     validate_output_with_input(output, None)?;
     validate_output_interface_bindings(output)?;
+    validate_pid_overrides(
+        output_pid_overrides(output),
+        "output pid_overrides",
+        false, // Outputs that go through TsMuxer (RTMP/HLS/CMAF/WebRTC) don't expose pid_overrides; the TS-native ones (RTP/UDP/SRT/RIST) can carry MPTS.
+    )?;
     Ok(())
 }
 
@@ -5506,8 +5884,127 @@ mod tests {
     use super::*;
     use crate::config::models::{
         AssembledProgram, AssembledStream, AssemblyKind, EssenceKind, FlowAssembly, PcrSource,
-        SlotSource,
+        SlotSource, TsPidOverridesEntry, TsPidOverridesMap,
     };
+
+    /// Helper: build a single-program map for tests.
+    fn one_prog(entry: TsPidOverridesEntry) -> TsPidOverridesMap {
+        let mut m = TsPidOverridesMap::new();
+        m.insert(1, entry);
+        m
+    }
+
+    #[test]
+    fn pid_overrides_accepts_unset_and_in_range_values() {
+        // None — empty map — must validate.
+        assert!(validate_pid_overrides(None, "test", false).is_ok());
+        assert!(validate_pid_overrides(Some(&TsPidOverridesMap::new()), "test", false).is_ok());
+
+        let m = one_prog(TsPidOverridesEntry {
+            pmt_pid: Some(0x1234),
+            video_pid: Some(0x0250),
+            audio_pid: Some(0x0260),
+            pcr_pid: Some(0x0250),
+        });
+        assert!(validate_pid_overrides(Some(&m), "test", false).is_ok());
+    }
+
+    #[test]
+    fn pid_overrides_rejects_reserved_pids() {
+        // 0x0000 (PAT) — reserved.
+        let m = one_prog(TsPidOverridesEntry { pmt_pid: Some(0x0000), ..Default::default() });
+        assert!(validate_pid_overrides(Some(&m), "ctx", false).is_err());
+
+        // 0x0001 in the reserved system block.
+        let m = one_prog(TsPidOverridesEntry { video_pid: Some(0x0001), ..Default::default() });
+        assert!(validate_pid_overrides(Some(&m), "ctx", false).is_err());
+
+        // 0x000F — last reserved system PID.
+        let m = one_prog(TsPidOverridesEntry { audio_pid: Some(0x000F), ..Default::default() });
+        assert!(validate_pid_overrides(Some(&m), "ctx", false).is_err());
+
+        // 0x1FFF — NULL padding.
+        let m = one_prog(TsPidOverridesEntry { pmt_pid: Some(0x1FFF), ..Default::default() });
+        assert!(validate_pid_overrides(Some(&m), "ctx", false).is_err());
+    }
+
+    #[test]
+    fn pid_overrides_rejects_pmt_video_audio_collisions() {
+        let m = one_prog(TsPidOverridesEntry {
+            pmt_pid: Some(0x0100),
+            video_pid: Some(0x0100),
+            audio_pid: None,
+            pcr_pid: None,
+        });
+        assert!(validate_pid_overrides(Some(&m), "ctx", false).is_err());
+
+        let m = one_prog(TsPidOverridesEntry {
+            pmt_pid: None,
+            video_pid: Some(0x0100),
+            audio_pid: Some(0x0100),
+            pcr_pid: None,
+        });
+        assert!(validate_pid_overrides(Some(&m), "ctx", false).is_err());
+
+        // PCR aliasing video / audio is allowed (the standard pattern).
+        let m = one_prog(TsPidOverridesEntry {
+            pmt_pid: Some(0x1000),
+            video_pid: Some(0x0100),
+            audio_pid: Some(0x0101),
+            pcr_pid: Some(0x0100),
+        });
+        assert!(validate_pid_overrides(Some(&m), "ctx", false).is_ok());
+
+        // PCR == PMT is invalid (PCR must ride an ES).
+        let m = one_prog(TsPidOverridesEntry {
+            pmt_pid: Some(0x1000),
+            video_pid: Some(0x0100),
+            audio_pid: None,
+            pcr_pid: Some(0x1000),
+        });
+        assert!(validate_pid_overrides(Some(&m), "ctx", false).is_err());
+    }
+
+    /// Synthetic-TS-only inputs (RTMP/RTSP/WebRTC/test-pattern/...) must
+    /// reject any program key other than 1, since their TsMuxer output
+    /// only ever advertises program 1.
+    #[test]
+    fn pid_overrides_synthetic_ts_only_rejects_non_program_1() {
+        let mut m = TsPidOverridesMap::new();
+        m.insert(2, TsPidOverridesEntry { audio_pid: Some(0x101), ..Default::default() });
+        assert!(validate_pid_overrides(Some(&m), "ctx", true).is_err());
+
+        // The same map is fine on a non-synthetic-TS input.
+        assert!(validate_pid_overrides(Some(&m), "ctx", false).is_ok());
+
+        // Program 1 alone is always allowed.
+        let mut m = TsPidOverridesMap::new();
+        m.insert(1, TsPidOverridesEntry { audio_pid: Some(0x101), ..Default::default() });
+        assert!(validate_pid_overrides(Some(&m), "ctx", true).is_ok());
+    }
+
+    /// Per-program walk: each program's entry is validated independently.
+    /// One bad entry fails the whole map.
+    #[test]
+    fn pid_overrides_per_program_walk() {
+        let mut m = TsPidOverridesMap::new();
+        m.insert(1, TsPidOverridesEntry { audio_pid: Some(0x101), ..Default::default() });
+        m.insert(2, TsPidOverridesEntry { audio_pid: Some(0x0001), ..Default::default() });
+        // program 2's audio PID is in the reserved range — should fail
+        // even though program 1 is fine.
+        let err = validate_pid_overrides(Some(&m), "ctx", false).unwrap_err();
+        assert!(err.to_string().contains("program=2"));
+    }
+
+    /// Program key 0 is the NIT — never a real program, so reject it
+    /// regardless of the synthetic-TS flag.
+    #[test]
+    fn pid_overrides_rejects_program_zero() {
+        let mut m = TsPidOverridesMap::new();
+        m.insert(0, TsPidOverridesEntry { audio_pid: Some(0x101), ..Default::default() });
+        assert!(validate_pid_overrides(Some(&m), "ctx", false).is_err());
+        assert!(validate_pid_overrides(Some(&m), "ctx", true).is_err());
+    }
 
     fn spts_assembly(input_id: &str) -> FlowAssembly {
         FlowAssembly {
@@ -5702,6 +6199,126 @@ mod tests {
             .expect("essence slot defers pcr resolution to runtime");
     }
 
+    #[test]
+    fn assembly_switch_slot_two_pid_legs_passes() {
+        use crate::config::models::SwitchLeg;
+        let mut a = spts_assembly("in-a");
+        a.programs[0].streams[0].source = SlotSource::Switch {
+            legs: vec![
+                SwitchLeg::Pid { input_id: "in-a".into(), source_pid: 0x100 },
+                SwitchLeg::Pid { input_id: "in-b".into(), source_pid: 0x100 },
+            ],
+            initial_input_id: "in-a".into(),
+        };
+        validate_flow_assembly(&a, &["in-a".into(), "in-b".into()], "test")
+            .expect("two Pid legs with valid initial must pass");
+    }
+
+    #[test]
+    fn assembly_switch_slot_initial_not_in_legs_rejected() {
+        use crate::config::models::SwitchLeg;
+        let mut a = spts_assembly("in-a");
+        a.programs[0].streams[0].source = SlotSource::Switch {
+            legs: vec![
+                SwitchLeg::Pid { input_id: "in-a".into(), source_pid: 0x100 },
+                SwitchLeg::Pid { input_id: "in-b".into(), source_pid: 0x100 },
+            ],
+            initial_input_id: "in-c".into(),
+        };
+        let err = validate_flow_assembly(&a, &["in-a".into(), "in-b".into()], "test")
+            .expect_err("initial_input_id not in legs must be rejected");
+        assert!(err.to_string().contains("pid_bus_switch_initial_leg_unknown"));
+    }
+
+    #[test]
+    fn assembly_switch_slot_empty_legs_rejected() {
+        let mut a = spts_assembly("in-a");
+        a.programs[0].streams[0].source = SlotSource::Switch {
+            legs: vec![],
+            initial_input_id: "in-a".into(),
+        };
+        let err = validate_flow_assembly(&a, &["in-a".into()], "test")
+            .expect_err("empty legs must be rejected");
+        assert!(err.to_string().contains("pid_bus_switch_empty_legs"));
+    }
+
+    #[test]
+    fn assembly_switch_slot_duplicate_leg_rejected() {
+        use crate::config::models::SwitchLeg;
+        let mut a = spts_assembly("in-a");
+        a.programs[0].streams[0].source = SlotSource::Switch {
+            legs: vec![
+                SwitchLeg::Pid { input_id: "in-a".into(), source_pid: 0x100 },
+                SwitchLeg::Pid { input_id: "in-a".into(), source_pid: 0x100 },
+            ],
+            initial_input_id: "in-a".into(),
+        };
+        let err = validate_flow_assembly(&a, &["in-a".into()], "test")
+            .expect_err("duplicate (input_id, pid) leg must be rejected");
+        assert!(err.to_string().contains("pid_bus_switch_duplicate_leg"));
+    }
+
+    #[test]
+    fn assembly_switch_slot_essence_kind_mismatch_rejected() {
+        use crate::config::models::SwitchLeg;
+        let mut a = spts_assembly("in-a");
+        a.programs[0].streams[0].source = SlotSource::Switch {
+            legs: vec![
+                SwitchLeg::Essence { input_id: "in-a".into(), kind: EssenceKind::Video },
+                SwitchLeg::Essence { input_id: "in-b".into(), kind: EssenceKind::Audio },
+            ],
+            initial_input_id: "in-a".into(),
+        };
+        let err = validate_flow_assembly(&a, &["in-a".into(), "in-b".into()], "test")
+            .expect_err("mixed essence kinds must be rejected");
+        assert!(err.to_string().contains("pid_bus_switch_legs_kind_mismatch"));
+    }
+
+    #[test]
+    fn assembly_switch_slot_too_many_legs_rejected() {
+        use crate::config::models::SwitchLeg;
+        let mut a = spts_assembly("in-0");
+        a.pcr_source = Some(PcrSource { input_id: "in-0".into(), pid: 0x100 });
+        let legs: Vec<SwitchLeg> = (0..65)
+            .map(|i| SwitchLeg::Pid {
+                input_id: format!("in-{i}"),
+                source_pid: 0x100,
+            })
+            .collect();
+        a.programs[0].streams[0].source = SlotSource::Switch {
+            legs,
+            initial_input_id: "in-0".into(),
+        };
+        let inputs: Vec<String> = (0..65).map(|i| format!("in-{i}")).collect();
+        let err = validate_flow_assembly(&a, &inputs, "test")
+            .expect_err("65 legs must be rejected (cap is 64)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pid_bus_switch_too_many_legs"),
+            "expected too_many_legs, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn assembly_switch_slot_pcr_resolves_via_legs() {
+        // PCR points at one of the switch legs — must resolve.
+        use crate::config::models::SwitchLeg;
+        let mut a = spts_assembly("in-a");
+        a.programs[0].streams[0].source = SlotSource::Switch {
+            legs: vec![
+                SwitchLeg::Pid { input_id: "in-a".into(), source_pid: 0x100 },
+                SwitchLeg::Pid { input_id: "in-b".into(), source_pid: 0x100 },
+            ],
+            initial_input_id: "in-a".into(),
+        };
+        a.pcr_source = Some(PcrSource {
+            input_id: "in-b".into(),
+            pid: 0x100,
+        });
+        validate_flow_assembly(&a, &["in-a".into(), "in-b".into()], "test")
+            .expect("PCR matching a switch leg must resolve");
+    }
+
     /// Helper: build a minimal valid AppConfig with one flow referencing one
     /// top-level input and one top-level output.
     fn make_config_with_rtp(
@@ -5728,6 +6345,9 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        program_number: None,
+                        pid_map: None,
+                        pid_overrides: None,
                         interface_binding: None,
             }),
         });
@@ -5749,6 +6369,7 @@ mod tests {
             transcode: None,
             video_encode: None,
                 cbr_pad_to_kbps: None,
+                pid_overrides: None,
                 interface_binding: None,
         }));
         config.flows.push(FlowConfig {
@@ -5823,6 +6444,9 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                program_number: None,
+                pid_map: None,
+                pid_overrides: None,
                 interface_binding: None,
         }));
         assert!(validate_config(&config).is_err());
@@ -5857,6 +6481,9 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                program_number: None,
+                pid_map: None,
+                pid_overrides: None,
                 interface_binding: None,
         }));
         assert!(validate_config(&config).is_err());
@@ -5894,6 +6521,9 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                program_number: None,
+                pid_map: None,
+                pid_overrides: None,
                 interface_binding: None,
         }));
         let err = validate_config(&config).expect_err("rendezvous+FEC must be rejected");
@@ -5926,6 +6556,9 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        program_number: None,
+                        pid_map: None,
+                        pid_overrides: None,
                         interface_binding: None,
             }),
         });
@@ -5948,6 +6581,9 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        program_number: None,
+                        pid_map: None,
+                        pid_overrides: None,
                         interface_binding: None,
             }),
         });
@@ -6017,6 +6653,9 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                program_number: None,
+                pid_map: None,
+                pid_overrides: None,
                 interface_binding: None,
         }));
         assert!(validate_config(&config).is_err());
@@ -6052,6 +6691,9 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        program_number: None,
+                        pid_map: None,
+                        pid_overrides: None,
                         interface_binding: None,
             }),
         });
@@ -6073,6 +6715,7 @@ mod tests {
             transcode: None,
             video_encode: None,
                 cbr_pad_to_kbps: None,
+                pid_overrides: None,
                 interface_binding: None,
         }));
         config.flows.push(FlowConfig {
@@ -6117,6 +6760,9 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        program_number: None,
+                        pid_map: None,
+                        pid_overrides: None,
                         interface_binding: None,
             }),
         });
@@ -6138,6 +6784,7 @@ mod tests {
             transcode: None,
             video_encode: None,
                 cbr_pad_to_kbps: None,
+                pid_overrides: None,
                 interface_binding: None,
         }));
         config.flows.push(FlowConfig {
@@ -6178,6 +6825,9 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+                program_number: None,
+                pid_map: None,
+                pid_overrides: None,
                 interface_binding: None,
         }));
         assert!(validate_config(&config).is_err());
@@ -6205,6 +6855,9 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        program_number: None,
+                        pid_map: None,
+                        pid_overrides: None,
                         interface_binding: None,
             }),
         });
@@ -6226,6 +6879,7 @@ mod tests {
             transcode: None,
             video_encode: None,
                 cbr_pad_to_kbps: None,
+                pid_overrides: None,
                 interface_binding: None,
         }));
         config.flows.push(FlowConfig {
@@ -6270,6 +6924,9 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        program_number: None,
+                        pid_map: None,
+                        pid_overrides: None,
                         interface_binding: None,
             }),
         });
@@ -6291,6 +6948,7 @@ mod tests {
             transcode: None,
             video_encode: None,
                 cbr_pad_to_kbps: None,
+                pid_overrides: None,
                 interface_binding: None,
         }));
         config.flows.push(FlowConfig {
@@ -6335,6 +6993,9 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        program_number: None,
+                        pid_map: None,
+                        pid_overrides: None,
                         interface_binding: None,
             }),
         });
@@ -6356,6 +7017,7 @@ mod tests {
             transcode: None,
             video_encode: None,
                 cbr_pad_to_kbps: None,
+                pid_overrides: None,
                 interface_binding: None,
         }));
         config.flows.push(FlowConfig {
@@ -6396,6 +7058,7 @@ mod tests {
             max_bitrate_mbps: None,
             audio_encode: None,
             transcode: None,
+            pid_overrides: None,
             interface_binding: None,
         }
     }
@@ -6816,6 +7479,7 @@ mod tests {
             opus_fec: false,
             opus_dtx: false,
             opus_frame_duration_ms: None,
+             source_audio_pid: None,
         }
     }
 
@@ -6954,9 +7618,11 @@ mod tests {
                 opus_fec: false,
                 opus_dtx: false,
                 opus_frame_duration_ms: None,
+                 source_audio_pid: None,
             }),
             transcode: None,
             video_encode: None,
+            pid_overrides: None,
         });
         assert!(validate_output(&make("aac_lc")).is_ok());
         assert!(validate_output(&make("he_aac_v1")).is_ok());
@@ -6990,6 +7656,7 @@ mod tests {
                 opus_fec: false,
                 opus_dtx: false,
                 opus_frame_duration_ms: None,
+                 source_audio_pid: None,
             }),
             transcode: None,
         });
@@ -7088,6 +7755,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+            pid_overrides: None,
         });
         assert!(validate_output(&make("rtmp://[::1]:1935/live")).is_ok());
         assert!(validate_output(&make("rtmps://[2001:db8::1]/app")).is_ok());
@@ -7153,9 +7821,11 @@ mod tests {
                 opus_fec: false,
                 opus_dtx: false,
                 opus_frame_duration_ms: None,
+                 source_audio_pid: None,
             }),
             transcode: None,
             video_encode: None,
+            pid_overrides: None,
         });
         // Opus + audio MID negotiated → OK.
         assert!(validate_output(&make("opus", false)).is_ok());
@@ -7214,7 +7884,9 @@ mod tests {
                 color_matrix: None,
                 color_range: None,
                 hw_decode: None,
+                 source_video_pid: None,
             }),
+            pid_overrides: None,
         });
         // H.264 backends are accepted only when the feature is compiled
         // in; on the default build this still passes through `validate_video_encode`
@@ -7259,6 +7931,7 @@ mod tests {
             audio_encode: None,
             transcode: None,
             video_encode: None,
+            pid_overrides: None,
         });
         // Valid colon-separated 32-byte hex.
         let valid_fp = "ab:cd:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab".to_string();
@@ -7303,6 +7976,7 @@ mod tests {
             color_matrix: None,
             color_range: None,
             hw_decode: None,
+             source_video_pid: None,
         };
         let err = validate_video_encode(&make(Some(1281), Some(720)), "ctx")
             .unwrap_err()
@@ -7354,6 +8028,7 @@ mod tests {
             color_matrix: None,
             color_range: None,
             hw_decode: None,
+             source_video_pid: None,
         };
         let assert_recognised = |result: Result<(), anyhow::Error>, label: &str| match result {
             Ok(_) => {} // feature on, params OK — fine
@@ -7542,6 +8217,9 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        program_number: None,
+                        pid_map: None,
+                        pid_overrides: None,
                         interface_binding: None,
             }),
         };
@@ -7592,6 +8270,9 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        program_number: None,
+                        pid_map: None,
+                        pid_overrides: None,
                         interface_binding: None,
             }),
         });
@@ -7614,6 +8295,9 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
+                        program_number: None,
+                        pid_map: None,
+                        pid_overrides: None,
                         interface_binding: None,
             }),
         });
@@ -7696,6 +8380,7 @@ mod tests {
             transcode: None,
             video_encode: None,
                 cbr_pad_to_kbps: None,
+                pid_overrides: None,
                 interface_binding: None,
         }));
         config.outputs.push(OutputConfig::Udp(UdpOutputConfig {
@@ -7715,6 +8400,7 @@ mod tests {
             transcode: None,
             video_encode: None,
                 cbr_pad_to_kbps: None,
+                pid_overrides: None,
                 interface_binding: None,
         }));
         let err = validate_config(&config).unwrap_err().to_string();

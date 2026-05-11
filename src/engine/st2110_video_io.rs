@@ -304,6 +304,7 @@ pub async fn run_st2110_20_input(
     let tx_for_worker = broadcast_tx.clone();
     let stats_for_worker = stats.clone();
     let worker_cancel = cancel.clone();
+    let pid_overrides = config.pid_overrides.clone();
     let _enc_handle = tokio::task::spawn_blocking(move || {
         encode_worker(
             enc_cfg,
@@ -317,6 +318,7 @@ pub async fn run_st2110_20_input(
             stats_for_worker,
             encode_stats,
             worker_cancel,
+            pid_overrides,
         );
     });
 
@@ -359,6 +361,7 @@ fn encode_worker(
     stats: Arc<FlowStatsAccumulator>,
     encode_stats: Arc<crate::engine::ts_video_replace::VideoEncodeStats>,
     cancel: CancellationToken,
+    pid_overrides: Option<crate::config::models::TsPidOverridesMap>,
 ) {
     // Build an encoder config once up-front — used for chroma/bit-depth
     // decisions below and to spot backend-not-compiled-in errors
@@ -383,6 +386,11 @@ fn encode_worker(
         "ST 2110-20 input".to_string(),
     );
     let mut ts_mux = TsMuxer::new();
+    if let Some(po) = pid_overrides.as_ref() {
+        if let Some(entry) = po.get(&1) {
+                ts_mux.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
+            }
+    }
     let mut pts: i64 = 0;
 
     // Target chroma / bit depth chosen by the operator via video_encode
@@ -627,6 +635,7 @@ fn encode_worker(
     _stats: Arc<FlowStatsAccumulator>,
     _encode_stats: Arc<crate::engine::ts_video_replace::VideoEncodeStats>,
     _cancel: CancellationToken,
+    _pid_overrides: Option<crate::config::models::TsPidOverridesMap>,
 ) {
     tracing::error!(
         "ST 2110-20 input requires the video-thumbnail and a video-encoder-* feature \
@@ -985,6 +994,7 @@ pub async fn run_st2110_23_input(
     let tx_for_worker = broadcast_tx.clone();
     let stats_for_worker = stats.clone();
     let worker_cancel = cancel.clone();
+    let pid_overrides = config.pid_overrides.clone();
     let _enc_handle = tokio::task::spawn_blocking(move || {
         encode_worker(
             enc_cfg,
@@ -998,6 +1008,7 @@ pub async fn run_st2110_23_input(
             stats_for_worker,
             encode_stats,
             worker_cancel,
+            pid_overrides,
         );
     });
 

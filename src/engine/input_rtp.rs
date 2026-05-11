@@ -113,6 +113,7 @@ pub fn spawn_rtp_input(
             config.transcode.as_ref(),
             config.video_encode.as_ref(),
             Some(force_idr.clone()),
+            config.pid_overrides.as_ref(),
         ) {
             Ok(t) => {
                 if let Some(ref t) = t {

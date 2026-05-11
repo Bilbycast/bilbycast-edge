@@ -275,6 +275,14 @@ pub struct EncodeStats {
     pub encoded_frames_out: AtomicU64,
     /// Number of times the supervisor has respawned the ffmpeg subprocess.
     pub supervisor_restarts: AtomicU64,
+    /// Source audio PID the replacer locked onto. Set by `TsAudioReplacer`
+    /// once the PMT is observed. `0` means "not yet known" (no PMT seen
+    /// or no recognised audio codec). Surfaced on stats snapshots so
+    /// operators can see at a glance which source PID is being transcoded.
+    pub source_pid: std::sync::atomic::AtomicU16,
+    /// Source audio stream_type byte (e.g. `0x0F` for AAC). Set alongside
+    /// `source_pid` once the PMT is observed. `0` means unknown.
+    pub source_stream_type: std::sync::atomic::AtomicU8,
 }
 
 impl EncodeStats {

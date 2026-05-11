@@ -105,6 +105,7 @@ pub mod ts_parse;
 pub mod ts_continuity_fixer;
 pub mod ts_program_filter;
 pub mod ts_pid_remapper;
+pub mod ts_pid_overrides_rewriter;
 pub mod ts_psi_catalog;
 pub mod ts_es_bus;
 /// Phase 8 PID-bus per-ES analyzer: one lightweight task per
@@ -151,6 +152,7 @@ pub mod video_encode_util;
 /// its feed once before the flow broadcast channel and amortise codec work
 /// across all attached outputs.
 pub mod input_transcode;
+pub mod input_post_process;
 
 /// Ingress-side PCM-shape processor for raw PCM-RTP inputs (ST 2110-30,
 /// `rtp_audio`). Depacketizes, optionally reshapes via `PlanarAudioTranscoder`

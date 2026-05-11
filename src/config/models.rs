@@ -893,6 +893,49 @@ pub enum SlotSource {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path_differential_ms: Option<u32>,
     },
+    /// Operator-driven N-input switch. The slot subscribes to every
+    /// leg concurrently (warm) but only forwards bytes from the leg
+    /// whose `input_id` equals the flow's current `active_input_id`.
+    /// On `ActivateInput`, the assembler flips the active leg, bumps
+    /// the owning PMT version, and arms DI=1 on the next PCR for the
+    /// slot's `out_pid` so receivers stay locked without re-tuning.
+    Switch {
+        /// 1..=64 legs. Each leg names an input + a source descriptor.
+        /// Nested `Switch` / `Hitless` is rejected at the type level
+        /// because legs are a flat enum.
+        legs: Vec<SwitchLeg>,
+        /// Input ID of the leg that is active at flow bring-up. Must
+        /// equal one of `legs[i].input_id`. At runtime, supersedes
+        /// per `flow.active_input_id`.
+        initial_input_id: String,
+    },
+}
+
+/// One leg of a [`SlotSource::Switch`]. Flat (not `Box<SlotSource>`)
+/// so the type system rejects Switch-in-Switch and Switch-in-Hitless
+/// without runtime checks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SwitchLeg {
+    /// Explicit PID on a named input.
+    Pid {
+        input_id: String,
+        source_pid: u16,
+    },
+    /// Auto-pick the first stream of a given kind from the input's PMT.
+    Essence {
+        input_id: String,
+        kind: EssenceKind,
+    },
+}
+
+impl SwitchLeg {
+    pub fn input_id(&self) -> &str {
+        match self {
+            SwitchLeg::Pid { input_id, .. } => input_id,
+            SwitchLeg::Essence { input_id, .. } => input_id,
+        }
+    }
 }
 
 /// Hitless failover algorithm.
@@ -1206,6 +1249,30 @@ pub struct ReplayInputConfig {
     /// output TS. Feature-gated like every other ingress `video_encode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+
+    /// Optional ingress program filter for MPTS sources. When set, the
+    /// input drops every TS packet that doesn't belong to this program
+    /// before publishing onto the broadcast channel. Other programs in
+    /// the source MPTS are discarded at ingress, freeing broadcast-channel
+    /// bandwidth but preventing other outputs on the same flow from
+    /// accessing the dropped programs. Unset = full MPTS passes through.
+    /// Must be > 0; `program_number` 0 is reserved for the NIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
+    /// Optional mechanical PID remap table applied at ingress (after the
+    /// program filter, before any role-keyed override or transcode).
+    /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
+    /// present pass through. Symmetric with the output-side `pid_map`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
+    /// Optional MPEG-TS PID overrides for the transcoded output. When set,
+    /// the encoded ES is emitted on the override PID and the rewritten PMT
+    /// entry advertises the override; pinning every transcoded source to
+    /// the same wire layout lets a downstream decoder stay locked across
+    /// switcher hops between transcoded inputs/outputs. See
+    /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
 }
 
 /// Configuration for an in-process synthetic test-pattern input.
@@ -1255,6 +1322,30 @@ pub struct TestPatternInputConfig {
     /// the bars, the replacer then transcodes to the requested target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+
+    /// Optional ingress program filter for MPTS sources. When set, the
+    /// input drops every TS packet that doesn't belong to this program
+    /// before publishing onto the broadcast channel. Other programs in
+    /// the source MPTS are discarded at ingress, freeing broadcast-channel
+    /// bandwidth but preventing other outputs on the same flow from
+    /// accessing the dropped programs. Unset = full MPTS passes through.
+    /// Must be > 0; `program_number` 0 is reserved for the NIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
+    /// Optional mechanical PID remap table applied at ingress (after the
+    /// program filter, before any role-keyed override or transcode).
+    /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
+    /// present pass through. Symmetric with the output-side `pid_map`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
+    /// Optional MPEG-TS PID overrides for the transcoded output. When set,
+    /// the encoded ES is emitted on the override PID and the rewritten PMT
+    /// entry advertises the override; pinning every transcoded source to
+    /// the same wire layout lets a downstream decoder stay locked across
+    /// switcher hops between transcoded inputs/outputs. See
+    /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
 }
 
 fn default_tp_width() -> u16 { 1280 }
@@ -1364,6 +1455,30 @@ pub struct MediaPlayerInputConfig {
     /// `video_encode` block (`video-encoder-x264` / `-x265` / `-nvenc`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+
+    /// Optional ingress program filter for MPTS sources. When set, the
+    /// input drops every TS packet that doesn't belong to this program
+    /// before publishing onto the broadcast channel. Other programs in
+    /// the source MPTS are discarded at ingress, freeing broadcast-channel
+    /// bandwidth but preventing other outputs on the same flow from
+    /// accessing the dropped programs. Unset = full MPTS passes through.
+    /// Must be > 0; `program_number` 0 is reserved for the NIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
+    /// Optional mechanical PID remap table applied at ingress (after the
+    /// program filter, before any role-keyed override or transcode).
+    /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
+    /// present pass through. Symmetric with the output-side `pid_map`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
+    /// Optional MPEG-TS PID overrides for the transcoded output. When set,
+    /// the encoded ES is emitted on the override PID and the rewritten PMT
+    /// entry advertises the override; pinning every transcoded source to
+    /// the same wire layout lets a downstream decoder stay locked across
+    /// switcher hops between transcoded inputs/outputs. See
+    /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
 }
 
 fn default_image_fps() -> u8 { 5 }
@@ -1515,6 +1630,30 @@ pub struct RtpInputConfig {
     /// fails early if the backend is not compiled in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+
+    /// Optional ingress program filter for MPTS sources. When set, the
+    /// input drops every TS packet that doesn't belong to this program
+    /// before publishing onto the broadcast channel. Other programs in
+    /// the source MPTS are discarded at ingress, freeing broadcast-channel
+    /// bandwidth but preventing other outputs on the same flow from
+    /// accessing the dropped programs. Unset = full MPTS passes through.
+    /// Must be > 0; `program_number` 0 is reserved for the NIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
+    /// Optional mechanical PID remap table applied at ingress (after the
+    /// program filter, before any role-keyed override or transcode).
+    /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
+    /// present pass through. Symmetric with the output-side `pid_map`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
+    /// Optional MPEG-TS PID overrides for the transcoded output. When set,
+    /// the encoded ES is emitted on the override PID and the rewritten PMT
+    /// entry advertises the override; pinning every transcoded source to
+    /// the same wire layout lets a downstream decoder stay locked across
+    /// switcher hops between transcoded inputs/outputs. See
+    /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin this leg to a physical NIC (loose source-IP bind by default,
     /// strict `SO_BINDTODEVICE` when `strict: true`). See
     /// [`InterfaceBinding`] for semantics. Wins over `interface_addr`
@@ -1551,6 +1690,30 @@ pub struct UdpInputConfig {
     /// Optional ingress video re-encode. See [`RtpInputConfig::video_encode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+
+    /// Optional ingress program filter for MPTS sources. When set, the
+    /// input drops every TS packet that doesn't belong to this program
+    /// before publishing onto the broadcast channel. Other programs in
+    /// the source MPTS are discarded at ingress, freeing broadcast-channel
+    /// bandwidth but preventing other outputs on the same flow from
+    /// accessing the dropped programs. Unset = full MPTS passes through.
+    /// Must be > 0; `program_number` 0 is reserved for the NIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
+    /// Optional mechanical PID remap table applied at ingress (after the
+    /// program filter, before any role-keyed override or transcode).
+    /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
+    /// present pass through. Symmetric with the output-side `pid_map`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
+    /// Optional MPEG-TS PID overrides for the transcoded output. When set,
+    /// the encoded ES is emitted on the override PID and the rewritten PMT
+    /// entry advertises the override; pinning every transcoded source to
+    /// the same wire layout lets a downstream decoder stay locked across
+    /// switcher hops between transcoded inputs/outputs. See
+    /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin this input to a physical NIC. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
@@ -1703,6 +1866,30 @@ pub struct SrtInputConfig {
     /// Optional ingress video re-encode. See [`RtpInputConfig::video_encode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+
+    /// Optional ingress program filter for MPTS sources. When set, the
+    /// input drops every TS packet that doesn't belong to this program
+    /// before publishing onto the broadcast channel. Other programs in
+    /// the source MPTS are discarded at ingress, freeing broadcast-channel
+    /// bandwidth but preventing other outputs on the same flow from
+    /// accessing the dropped programs. Unset = full MPTS passes through.
+    /// Must be > 0; `program_number` 0 is reserved for the NIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
+    /// Optional mechanical PID remap table applied at ingress (after the
+    /// program filter, before any role-keyed override or transcode).
+    /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
+    /// present pass through. Symmetric with the output-side `pid_map`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
+    /// Optional MPEG-TS PID overrides for the transcoded output. When set,
+    /// the encoded ES is emitted on the override PID and the rewritten PMT
+    /// entry advertises the override; pinning every transcoded source to
+    /// the same wire layout lets a downstream decoder stay locked across
+    /// switcher hops between transcoded inputs/outputs. See
+    /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin this SRT input to a physical NIC. Phase 1: loose only — strict
     /// mode is rejected (libsrt SRTO_BINDTODEVICE plumbing deferred). When
     /// set, the resolved interface IP is used as `local_addr` if
@@ -1757,6 +1944,30 @@ pub struct RtmpInputConfig {
     /// Optional ingress video re-encode. See [`RtpInputConfig::video_encode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+
+    /// Optional ingress program filter for MPTS sources. When set, the
+    /// input drops every TS packet that doesn't belong to this program
+    /// before publishing onto the broadcast channel. Other programs in
+    /// the source MPTS are discarded at ingress, freeing broadcast-channel
+    /// bandwidth but preventing other outputs on the same flow from
+    /// accessing the dropped programs. Unset = full MPTS passes through.
+    /// Must be > 0; `program_number` 0 is reserved for the NIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
+    /// Optional mechanical PID remap table applied at ingress (after the
+    /// program filter, before any role-keyed override or transcode).
+    /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
+    /// present pass through. Symmetric with the output-side `pid_map`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
+    /// Optional MPEG-TS PID overrides for the transcoded output. When set,
+    /// the encoded ES is emitted on the override PID and the rewritten PMT
+    /// entry advertises the override; pinning every transcoded source to
+    /// the same wire layout lets a downstream decoder stay locked across
+    /// switcher hops between transcoded inputs/outputs. See
+    /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
 }
 
 fn default_rtmp_app() -> String {
@@ -1812,6 +2023,30 @@ pub struct RtspInputConfig {
     /// Optional ingress video re-encode. See [`RtpInputConfig::video_encode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+
+    /// Optional ingress program filter for MPTS sources. When set, the
+    /// input drops every TS packet that doesn't belong to this program
+    /// before publishing onto the broadcast channel. Other programs in
+    /// the source MPTS are discarded at ingress, freeing broadcast-channel
+    /// bandwidth but preventing other outputs on the same flow from
+    /// accessing the dropped programs. Unset = full MPTS passes through.
+    /// Must be > 0; `program_number` 0 is reserved for the NIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
+    /// Optional mechanical PID remap table applied at ingress (after the
+    /// program filter, before any role-keyed override or transcode).
+    /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
+    /// present pass through. Symmetric with the output-side `pid_map`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
+    /// Optional MPEG-TS PID overrides for the transcoded output. When set,
+    /// the encoded ES is emitted on the override PID and the rewritten PMT
+    /// entry advertises the override; pinning every transcoded source to
+    /// the same wire layout lets a downstream decoder stay locked across
+    /// switcher hops between transcoded inputs/outputs. See
+    /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
 }
 
 fn default_rtsp_timeout() -> u64 {
@@ -1858,6 +2093,30 @@ pub struct WebrtcInputConfig {
     /// Optional ingress video re-encode. See [`RtpInputConfig::video_encode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+
+    /// Optional ingress program filter for MPTS sources. When set, the
+    /// input drops every TS packet that doesn't belong to this program
+    /// before publishing onto the broadcast channel. Other programs in
+    /// the source MPTS are discarded at ingress, freeing broadcast-channel
+    /// bandwidth but preventing other outputs on the same flow from
+    /// accessing the dropped programs. Unset = full MPTS passes through.
+    /// Must be > 0; `program_number` 0 is reserved for the NIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
+    /// Optional mechanical PID remap table applied at ingress (after the
+    /// program filter, before any role-keyed override or transcode).
+    /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
+    /// present pass through. Symmetric with the output-side `pid_map`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
+    /// Optional MPEG-TS PID overrides for the transcoded output. When set,
+    /// the encoded ES is emitted on the override PID and the rewritten PMT
+    /// entry advertises the override; pinning every transcoded source to
+    /// the same wire layout lets a downstream decoder stay locked across
+    /// switcher hops between transcoded inputs/outputs. See
+    /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
 }
 
 /// WebRTC/WHEP input configuration — pulls media from an external WHEP server.
@@ -1898,6 +2157,30 @@ pub struct WhepInputConfig {
     /// Optional ingress video re-encode. See [`RtpInputConfig::video_encode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+
+    /// Optional ingress program filter for MPTS sources. When set, the
+    /// input drops every TS packet that doesn't belong to this program
+    /// before publishing onto the broadcast channel. Other programs in
+    /// the source MPTS are discarded at ingress, freeing broadcast-channel
+    /// bandwidth but preventing other outputs on the same flow from
+    /// accessing the dropped programs. Unset = full MPTS passes through.
+    /// Must be > 0; `program_number` 0 is reserved for the NIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
+    /// Optional mechanical PID remap table applied at ingress (after the
+    /// program filter, before any role-keyed override or transcode).
+    /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
+    /// present pass through. Symmetric with the output-side `pid_map`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
+    /// Optional MPEG-TS PID overrides for the transcoded output. When set,
+    /// the encoded ES is emitted on the override PID and the rewritten PMT
+    /// entry advertises the override; pinning every transcoded source to
+    /// the same wire layout lets a downstream decoder stay locked across
+    /// switcher hops between transcoded inputs/outputs. See
+    /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
 }
 
 fn default_latency() -> u64 {
@@ -2195,6 +2478,15 @@ pub struct RtpOutputConfig {
     /// `video-encoder-qsv`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+
+    /// Optional MPEG-TS PID overrides for the transcoded output. When set,
+    /// the encoded ES is emitted on the override PID and the rewritten PMT
+    /// entry advertises the override; pinning every transcoded source to
+    /// the same wire layout lets a downstream decoder stay locked across
+    /// switcher hops between transcoded inputs/outputs. See
+    /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
     /// Optional CBR padding to a target wire bitrate (kbps). See
     /// [`UdpOutputConfig::cbr_pad_to_kbps`] for semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2321,6 +2613,15 @@ pub struct UdpOutputConfig {
     /// for the semantics. Incompatible with `transport_mode = "audio_302m"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+
+    /// Optional MPEG-TS PID overrides for the transcoded output. When set,
+    /// the encoded ES is emitted on the override PID and the rewritten PMT
+    /// entry advertises the override; pinning every transcoded source to
+    /// the same wire layout lets a downstream decoder stay locked across
+    /// switcher hops between transcoded inputs/outputs. See
+    /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
     /// Optional CBR padding to a target wire bitrate (kbps). When set,
     /// `engine::ts_null_padder` injects PID 0x1FFF NULL packets between
     /// the transcoder pipeline and `wire_emit` so the wire rate matches
@@ -2503,6 +2804,15 @@ pub struct SrtOutputConfig {
     /// for the semantics. Incompatible with `transport_mode = "audio_302m"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+
+    /// Optional MPEG-TS PID overrides for the transcoded output. When set,
+    /// the encoded ES is emitted on the override PID and the rewritten PMT
+    /// entry advertises the override; pinning every transcoded source to
+    /// the same wire layout lets a downstream decoder stay locked across
+    /// switcher hops between transcoded inputs/outputs. See
+    /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
     /// Optional CBR padding to a target wire bitrate (kbps). See
     /// [`UdpOutputConfig::cbr_pad_to_kbps`] for semantics. SRT carries
     /// the padded TS opaquely — receivers measuring CBR rate see the
@@ -2804,6 +3114,30 @@ pub struct RistInputConfig {
     /// Optional ingress video re-encode. See [`RtpInputConfig::video_encode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+
+    /// Optional ingress program filter for MPTS sources. When set, the
+    /// input drops every TS packet that doesn't belong to this program
+    /// before publishing onto the broadcast channel. Other programs in
+    /// the source MPTS are discarded at ingress, freeing broadcast-channel
+    /// bandwidth but preventing other outputs on the same flow from
+    /// accessing the dropped programs. Unset = full MPTS passes through.
+    /// Must be > 0; `program_number` 0 is reserved for the NIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
+    /// Optional mechanical PID remap table applied at ingress (after the
+    /// program filter, before any role-keyed override or transcode).
+    /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
+    /// present pass through. Symmetric with the output-side `pid_map`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
+    /// Optional MPEG-TS PID overrides for the transcoded output. When set,
+    /// the encoded ES is emitted on the override PID and the rewritten PMT
+    /// entry advertises the override; pinning every transcoded source to
+    /// the same wire layout lets a downstream decoder stay locked across
+    /// switcher hops between transcoded inputs/outputs. See
+    /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin this RIST input to a physical NIC (Phase 1: loose only —
     /// strict deferred pending librist plumbing). See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2873,6 +3207,15 @@ pub struct RistOutputConfig {
     /// Optional video encode block (x264 / x265 / NVENC, feature-gated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+
+    /// Optional MPEG-TS PID overrides for the transcoded output. When set,
+    /// the encoded ES is emitted on the override PID and the rewritten PMT
+    /// entry advertises the override; pinning every transcoded source to
+    /// the same wire layout lets a downstream decoder stay locked across
+    /// switcher hops between transcoded inputs/outputs. See
+    /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin this RIST output to a physical NIC (Phase 1: loose only —
     /// strict deferred pending librist plumbing). See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3163,6 +3506,15 @@ pub struct RtmpOutputConfig {
     /// passed through — only H.264 passthrough is supported today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+
+    /// Optional MPEG-TS PID overrides for the transcoded output. When set,
+    /// the encoded ES is emitted on the override PID and the rewritten PMT
+    /// entry advertises the override; pinning every transcoded source to
+    /// the same wire layout lets a downstream decoder stay locked across
+    /// switcher hops between transcoded inputs/outputs. See
+    /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
 }
 
 fn default_reconnect_delay() -> u64 {
@@ -3344,6 +3696,15 @@ pub struct CmafOutputConfig {
     /// (Phase 2+); MPEG-DASH additionally supports hvc1/hev1 signalling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+
+    /// Optional MPEG-TS PID overrides for the transcoded output. When set,
+    /// the encoded ES is emitted on the override PID and the rewritten PMT
+    /// entry advertises the override; pinning every transcoded source to
+    /// the same wire layout lets a downstream decoder stay locked across
+    /// switcher hops between transcoded inputs/outputs. See
+    /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
     /// MPTS program filter. If the source is an MPTS, filter down to this
     /// single program before segmenting. Must be `> 0` (program 0 is the
     /// NIT).
@@ -3500,6 +3861,15 @@ pub struct WebrtcOutputConfig {
     /// bitrate/profile transcoding for H.264 sources.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+
+    /// Optional MPEG-TS PID overrides for the transcoded output. When set,
+    /// the encoded ES is emitted on the override PID and the rewritten PMT
+    /// entry advertises the override; pinning every transcoded source to
+    /// the same wire layout lets a downstream decoder stay locked across
+    /// switcher hops between transcoded inputs/outputs. See
+    /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
 }
 
 /// Video encoder configuration block. Used by SRT, UDP, and RTP outputs
@@ -3526,6 +3896,18 @@ pub struct VideoEncodeConfig {
     /// Encoder backend. One of: `x264`, `x265`, `h264_nvenc`, `hevc_nvenc`,
     /// `h264_qsv`, `hevc_qsv`.
     pub codec: String,
+    /// Optional source video PID to transcode. When unset (default), the
+    /// replacer locks onto the **first** video stream in the active
+    /// program's PMT whose stream_type is one of `0x01` (MPEG-1),
+    /// `0x02` (MPEG-2), `0x1B` (H.264), `0x24` (H.265). When set, the
+    /// replacer locks onto the named PID specifically — useful for MPTS
+    /// programs with multiple video streams or when the operator wants
+    /// to pin to a specific PID across input swaps. PID range
+    /// `0x0010..=0x1FFE`. If the named PID is absent from the live PMT
+    /// the replacer falls back to the first-match behaviour and emits a
+    /// `video_source_pid_not_found` warning event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_video_pid: Option<u16>,
     /// Output width in pixels. When unset, the encoder uses the source
     /// resolution. Range: 64–7680.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3644,6 +4026,18 @@ pub struct AudioEncodeConfig {
     /// Codec name. One of:
     /// `aac_lc`, `he_aac_v1`, `he_aac_v2`, `opus`, `mp2`, `ac3`.
     pub codec: String,
+    /// Optional source audio PID to transcode. When unset (default), the
+    /// replacer locks onto the **first** audio stream in the active
+    /// program's PMT whose stream_type is one of `0x0F` (AAC),
+    /// `0x03`/`0x04` (MPEG-1/2), `0x81` (AC-3), `0x06` (private). When
+    /// set, the replacer locks onto the named PID specifically — useful
+    /// for MPTS programs with multiple audio tracks (e.g. EN/FR/5.1)
+    /// where the operator wants to pin a specific track. PID range
+    /// `0x0010..=0x1FFE`. If the named PID is absent from the live PMT
+    /// the replacer falls back to the first-match behaviour and emits an
+    /// `audio_source_pid_not_found` warning event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_audio_pid: Option<u16>,
     /// Optional bitrate in kbps. Defaults to a per-codec value when
     /// unset (AAC-LC=128, HE-AAC-v1=64, HE-AAC-v2=32, Opus=96,
     /// MP2=192, AC-3=192). Range: 16..=512 kbps.
@@ -3701,6 +4095,63 @@ pub struct AudioEncodeConfig {
 fn is_false(b: &bool) -> bool {
     !*b
 }
+
+/// Per-program MPEG-TS PID override block.
+///
+/// One entry's worth of "set the PMT/video/audio/PCR PID for *one* program"
+/// configuration. Used inside [`TsPidOverridesMap`] keyed by `program_number`.
+///
+/// Two engine paths consume this:
+///
+/// 1. **Synthetic-TS inputs** (RTMP / RTSP / WebRTC / ST 2110-20 / test
+///    pattern / media-player / replay / PCM-encode) build a fresh MPEG-TS
+///    via the shared `TsMuxer`. They always emit a single program — the
+///    map MUST contain exactly one entry, keyed `1`. Defaults: PMT 0x1000,
+///    video 0x0100, audio 0x0101, PCR auto-rides the video PID (or audio
+///    if no video). Every field below overrides the corresponding default.
+///
+/// 2. **TS-source transcoders + MPTS-passthrough rewriters** (`audio_encode` /
+///    `video_encode` on RTP / UDP / SRT / RIST inputs and outputs, plus
+///    standalone `pid_overrides` rewriting on passthrough TS): walk the
+///    incoming PAT and PMTs, apply the entry whose key matches each program's
+///    `program_number`. Programs not in the map pass through unchanged.
+///
+/// Valid PID range for each field: `0x0010..=0x1FFE`. PIDs `0x0000`
+/// (PAT), `0x0001..=0x000F` (system reserved), and `0x1FFF` (NULL
+/// padding) are rejected by validation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TsPidOverridesEntry {
+    /// Override the PMT PID for this program.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pmt_pid: Option<u16>,
+    /// Override the video PES PID for this program.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_pid: Option<u16>,
+    /// Override the audio PES PID for this program.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_pid: Option<u16>,
+    /// Override the PCR PID for this program. When unset, PCR rides the
+    /// video PID (or audio if no video). The override must point at an ES
+    /// PID that actually exists in the PMT — the muxer will not synthesise
+    /// PCR on a standalone PID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcr_pid: Option<u16>,
+}
+
+/// Map from `program_number` → per-program PID overrides.
+///
+/// One entry per program the operator wants to re-PID. Programs not in
+/// the map pass through unchanged. For SPTS / synthetic-TS configs, the
+/// map MUST contain exactly one entry, keyed `1`. For MPTS configs, list
+/// any subset of programs.
+///
+/// Why a map and not a single entry: an operator may want different PIDs
+/// per program of an MPTS (e.g. unify program 1's audio PID across N
+/// inputs while leaving program 2 alone). Modelling this as a map keeps
+/// the schema unambiguous about which program a PID applies to and lets
+/// validation catch synthetic-TS configs that try to override a non-existent
+/// program 2.
+pub type TsPidOverridesMap = std::collections::BTreeMap<u16, TsPidOverridesEntry>;
 
 /// SMPTE 2022-1 FEC parameters
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3812,6 +4263,12 @@ pub struct St2110AudioInputConfig {
     /// rules. **Rejected on ST 2110-31 (AES3)** — see `transcode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional MPEG-TS PID overrides for the synthesised TS that the
+    /// PCM-encode stage emits (only consulted when `audio_encode` is
+    /// set; ignored when the PCM input feeds the broadcast channel as
+    /// raw PCM-RTP). See [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for per-field semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin this ST 2110 audio input to a physical NIC. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
@@ -3941,6 +4398,11 @@ pub struct RtpAudioInputConfig {
     /// Optional ingress audio re-encode. See [`St2110AudioInputConfig::audio_encode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_encode: Option<AudioEncodeConfig>,
+    /// Optional MPEG-TS PID overrides for the synthesised TS that the
+    /// PCM-encode stage emits (only consulted when `audio_encode` is
+    /// set). See [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin this RTP audio input to a physical NIC. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
@@ -3992,6 +4454,11 @@ pub struct RtpAudioOutputConfig {
     /// Chunks 5–7.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_mode: Option<String>,
+    /// Optional MPEG-TS PID overrides for the synthesised TS that the
+    /// `audio_302m` transport mode emits (ignored in plain RTP mode). See
+    /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin this RTP audio output to a physical NIC. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
@@ -4150,6 +4617,10 @@ pub struct St2110VideoInputConfig {
     /// H.264/HEVC bitstream is muxed into MPEG-TS and published on the
     /// broadcast channel.
     pub video_encode: VideoEncodeConfig,
+    /// Optional MPEG-TS PID overrides for the synthesised TS that the
+    /// 2110-20 encode stage emits. See [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin this ST 2110-20 video input to a physical NIC. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
@@ -4247,6 +4718,10 @@ pub struct St2110_23InputConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock_domain: Option<u8>,
     pub video_encode: VideoEncodeConfig,
+    /// Optional MPEG-TS PID overrides for the synthesised TS that the
+    /// 2110-23 encode stage emits. See [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin every ST 2110-23 sub-stream input to a physical NIC. Each
     /// sub-stream's `St2110_23SubStreamBind` already has its own
     /// `interface_addr`; this is the parent fallback when the per-bind
@@ -4811,6 +5286,9 @@ mod tests {
                     audio_encode: None,
                     transcode: None,
                     video_encode: None,
+                                program_number: None,
+                                pid_map: None,
+                                pid_overrides: None,
                                 interface_binding: None,
                 }),
             }],
@@ -4832,6 +5310,7 @@ mod tests {
                 transcode: None,
                 video_encode: None,
                         cbr_pad_to_kbps: None,
+                        pid_overrides: None,
                         interface_binding: None,
             })],
             flows: vec![FlowConfig {
@@ -4878,6 +5357,9 @@ mod tests {
                     audio_encode: None,
                     transcode: None,
                     video_encode: None,
+                                program_number: None,
+                                pid_map: None,
+                                pid_overrides: None,
                                 interface_binding: None,
                 }),
             }],
@@ -4899,6 +5381,7 @@ mod tests {
                 transcode: None,
                 video_encode: None,
                         cbr_pad_to_kbps: None,
+                        pid_overrides: None,
                         interface_binding: None,
             })],
             flows: vec![FlowConfig {

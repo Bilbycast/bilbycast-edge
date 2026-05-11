@@ -1177,10 +1177,10 @@ impl FlowRuntime {
             .await
             {
                 Ok(pairs) => {
-                    for ((program_idx, slot_idx), pid) in pairs {
+                    for ((program_idx, slot_idx, leg_idx), pid) in pairs {
                         if let Some(prog) = build.plan.programs.get_mut(program_idx) {
                             if let Some(slot) = prog.slots.get_mut(slot_idx) {
-                                slot.source.1 = pid;
+                                patch_essence_pid(slot, leg_idx, pid);
                             }
                         }
                     }
@@ -2952,10 +2952,10 @@ async fn finalize_spts_assembler(
         .await
         {
             Ok(pairs) => {
-                for ((program_idx, slot_idx), pid) in pairs {
+                for ((program_idx, slot_idx, leg_idx), pid) in pairs {
                     if let Some(prog) = build.plan.programs.get_mut(program_idx) {
                         if let Some(slot) = prog.slots.get_mut(slot_idx) {
-                            slot.source.1 = pid;
+                            patch_essence_pid(slot, leg_idx, pid);
                         }
                     }
                 }
@@ -3185,6 +3185,30 @@ fn es_kind_from_config(k: EssenceKind) -> EsKind {
 /// Every failure path emits a Critical event *before* bailing so the
 /// manager UI can highlight the offending assembly field without having
 /// to parse the error string.
+/// Patch a resolved Essence PID into either the slot's `source` (top-level
+/// `SlotSource::Essence`) or one of its `switch_legs` (Essence-typed leg
+/// of a `SlotSource::Switch`). For the latter, also refresh `slot.source`
+/// when the patched leg matches the slot's currently-active leg.
+fn patch_essence_pid(slot: &mut AssemblySlot, leg_idx: Option<usize>, pid: u16) {
+    match leg_idx {
+        None => slot.source.1 = pid,
+        Some(li) => {
+            if let Some(legs) = slot.switch_legs.as_mut()
+                && let Some(leg) = legs.get_mut(li)
+            {
+                leg.1 = pid;
+                // If this is the active leg, refresh `source.1` too
+                // — the assembler's install_plan / apply_plan_replacement
+                // reads `source` to seed `active_leg_input` and the
+                // PCR-resolution lookup uses it as well.
+                if leg.0 == slot.source.0 {
+                    slot.source.1 = pid;
+                }
+            }
+        }
+    }
+}
+
 fn build_assembly_plan(
     assembly: &FlowAssembly,
     flow: &ResolvedFlow,
@@ -3299,9 +3323,21 @@ fn build_assembly_plan(
         // that the runtime turns into a merger task before the
         // assembler starts.
         let mut slots: Vec<AssemblySlot> = Vec::with_capacity(program.streams.len());
+        // Active-input override for switch slots: prefer the operator's
+        // last-known choice (round-tripped via `flow.active_input` at
+        // restart) when it matches one of the slot's legs; otherwise
+        // fall back to the slot-config's `initial_input_id`.
+        let restart_active_id: Option<String> =
+            flow.active_input().map(|d| d.id.clone());
         for stream in &program.streams {
-            let (input_id, source_pid) = match &stream.source {
-                SlotSource::Pid { input_id, source_pid } => (input_id.clone(), *source_pid),
+            let (input_id, source_pid, switch_legs): (
+                String,
+                u16,
+                Option<Vec<(String, u16)>>,
+            ) = match &stream.source {
+                SlotSource::Pid { input_id, source_pid } => {
+                    (input_id.clone(), *source_pid, None)
+                }
                 SlotSource::Essence { input_id, kind } => {
                     let slot_idx = slots.len();
                     pending_essence.push(PendingEssenceSlot {
@@ -3309,8 +3345,50 @@ fn build_assembly_plan(
                         slot_idx,
                         input_id: input_id.clone(),
                         kind: es_kind_from_config(*kind),
+                        leg_idx: None,
                     });
-                    (input_id.clone(), 0_u16) // sentinel, patched after resolution
+                    (input_id.clone(), 0_u16, None) // sentinel, patched after resolution
+                }
+                SlotSource::Switch {
+                    legs,
+                    initial_input_id,
+                } => {
+                    use crate::config::models::SwitchLeg;
+                    let slot_idx = slots.len();
+                    let mut leg_pairs: Vec<(String, u16)> = Vec::with_capacity(legs.len());
+                    for (li, leg) in legs.iter().enumerate() {
+                        match leg {
+                            SwitchLeg::Pid { input_id, source_pid } => {
+                                leg_pairs.push((input_id.clone(), *source_pid));
+                            }
+                            SwitchLeg::Essence { input_id, kind } => {
+                                pending_essence.push(PendingEssenceSlot {
+                                    program_idx,
+                                    slot_idx,
+                                    input_id: input_id.clone(),
+                                    kind: es_kind_from_config(*kind),
+                                    leg_idx: Some(li),
+                                });
+                                leg_pairs.push((input_id.clone(), 0_u16));
+                            }
+                        }
+                    }
+                    // Pick the active leg. Restart-persistence: if the
+                    // operator's prior `active_input_id` is one of this
+                    // slot's legs, use it. Otherwise fall back to the
+                    // config's `initial_input_id`. Validation guarantees
+                    // `initial_input_id` matches at least one leg.
+                    let active_id = restart_active_id
+                        .as_ref()
+                        .filter(|aid| leg_pairs.iter().any(|(iid, _)| iid == aid.as_str()))
+                        .cloned()
+                        .unwrap_or_else(|| initial_input_id.clone());
+                    let active_pair = leg_pairs
+                        .iter()
+                        .find(|(iid, _)| iid == &active_id)
+                        .cloned()
+                        .unwrap_or_else(|| leg_pairs[0].clone());
+                    (active_pair.0, active_pair.1, Some(leg_pairs))
                 }
                 SlotSource::Hitless {
                     primary,
@@ -3392,7 +3470,8 @@ fn build_assembly_plan(
                     // The assembler reads from the synthetic merger
                     // output. The pre-bus merger task is responsible
                     // for keeping that key supplied.
-                    crate::engine::ts_es_hitless::hitless_bus_key(&uid)
+                    let (iid, pid) = crate::engine::ts_es_hitless::hitless_bus_key(&uid);
+                    (iid, pid, None)
                 }
             };
             // Phase 6.5 cross-check: when the slot's input is a PCM /
@@ -3401,35 +3480,43 @@ fn build_assembly_plan(
             // loudly if the operator declared a different stream_type
             // on the slot — otherwise the assembler would advertise one
             // thing in the synthesised PMT and the input would emit
-            // PES bytes that don't match it.
-            if let Some(expected_st) =
-                expected_stream_type_for_synthesised_input(&flow.inputs, &input_id)
-            {
-                if stream.stream_type != expected_st {
-                    let msg = format!(
-                        "flow '{}': program {} out_pid {}: slot declares stream_type = 0x{:02X} \
-                         but input '{}' has `audio_encode` that publishes stream_type = 0x{:02X}. \
-                         Either match the slot to the input's codec or drop `stream_type` from \
-                         the slot.",
-                        flow_id,
-                        program.program_number,
-                        stream.out_pid,
-                        stream.stream_type,
-                        input_id,
-                        expected_st,
-                    );
-                    emit(
-                        "pid_bus_spts_stream_type_mismatch",
-                        &msg,
-                        serde_json::json!({
-                            "program_number": program.program_number,
-                            "out_pid": stream.out_pid,
-                            "input_id": input_id,
-                            "declared_stream_type": stream.stream_type,
-                            "expected_stream_type": expected_st,
-                        }),
-                    );
-                    bail!(msg);
+            // PES bytes that don't match it. For Switch slots, run the
+            // check against every leg's input — any leg whose input
+            // would publish a different stream_type is rejected.
+            let inputs_to_check: Vec<&str> = match &switch_legs {
+                Some(legs) => legs.iter().map(|(iid, _)| iid.as_str()).collect(),
+                None => vec![input_id.as_str()],
+            };
+            for iid in inputs_to_check {
+                if let Some(expected_st) =
+                    expected_stream_type_for_synthesised_input(&flow.inputs, iid)
+                {
+                    if stream.stream_type != expected_st {
+                        let msg = format!(
+                            "flow '{}': program {} out_pid {}: slot declares stream_type = 0x{:02X} \
+                             but input '{}' has `audio_encode` that publishes stream_type = 0x{:02X}. \
+                             Either match the slot to the input's codec or drop `stream_type` from \
+                             the slot.",
+                            flow_id,
+                            program.program_number,
+                            stream.out_pid,
+                            stream.stream_type,
+                            iid,
+                            expected_st,
+                        );
+                        emit(
+                            "pid_bus_spts_stream_type_mismatch",
+                            &msg,
+                            serde_json::json!({
+                                "program_number": program.program_number,
+                                "out_pid": stream.out_pid,
+                                "input_id": iid,
+                                "declared_stream_type": stream.stream_type,
+                                "expected_stream_type": expected_st,
+                            }),
+                        );
+                        bail!(msg);
+                    }
                 }
             }
 
@@ -3437,6 +3524,7 @@ fn build_assembly_plan(
                 source: (input_id, source_pid),
                 out_pid: stream.out_pid,
                 stream_type: stream.stream_type,
+                switch_legs,
             });
         }
 

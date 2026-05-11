@@ -234,6 +234,7 @@ impl PcmInputProcessor {
             initial_timestamp,
             "flow",
             "input",
+            None,
         )
     }
 
@@ -252,6 +253,7 @@ impl PcmInputProcessor {
         initial_timestamp: u32,
         flow_id: &str,
         input_id: &str,
+        pid_overrides: Option<&crate::config::models::TsPidOverridesMap>,
     ) -> Result<Option<Self>, PcmInputError> {
         if transcode.is_none() && audio_encode.is_none() {
             return Ok(None);
@@ -279,7 +281,7 @@ impl PcmInputProcessor {
                     codec: ae.codec.clone(),
                 });
             }
-            let synth = build_synth(input_fmt, ae, flow_id, input_id)?;
+            let synth = build_synth(input_fmt, ae, flow_id, input_id, pid_overrides)?;
             return Ok(Some(Self {
                 stage: None,
                 synth: Some(synth),
@@ -344,6 +346,7 @@ fn build_synth(
     ae: &AudioEncodeConfig,
     flow_id: &str,
     input_id: &str,
+    pid_overrides: Option<&crate::config::models::TsPidOverridesMap>,
 ) -> Result<SynthBackend, PcmInputError> {
     if ae.codec == "s302m" {
         // S302mOutputPipeline targets 48 kHz / 2/4/6/8 ch / 16-20-24 bit.
@@ -363,7 +366,7 @@ fn build_synth(
         let out_bit_depth = input_fmt.bit_depth.as_u8();
         let out_packet_time_us: u32 = 4_000; // 4 ms — standard contribution.
         let pipeline =
-            S302mOutputPipeline::new(input_fmt, out_channels, out_bit_depth, out_packet_time_us)
+            S302mOutputPipeline::new(input_fmt, out_channels, out_bit_depth, out_packet_time_us, pid_overrides)
                 .map_err(PcmInputError::Config)?;
         tracing::info!(
             flow_id,
@@ -434,6 +437,11 @@ fn build_synth(
     // Muxer carries audio only, AAC with ADTS stream_type = 0x0F (no
     // registration descriptor).
     let mut ts_mux = TsMuxer::new();
+    if let Some(po) = pid_overrides {
+        if let Some(entry) = po.get(&1) {
+                ts_mux.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
+            }
+    }
     ts_mux.set_has_video(false);
     ts_mux.set_has_audio(true);
     ts_mux.set_audio_stream(0x0F, None);
@@ -557,6 +565,7 @@ mod tests {
             opus_fec: false,
             opus_dtx: false,
             opus_frame_duration_ms: None,
+             source_audio_pid: None,
         };
         let err = match PcmInputProcessor::new(48_000, 24, 2, Some(&tj), Some(&ae), 0, 0, 0) {
             Err(e) => e,
@@ -580,6 +589,7 @@ mod tests {
             opus_fec: false,
             opus_dtx: false,
             opus_frame_duration_ms: None,
+             source_audio_pid: None,
         };
         let err = match PcmInputProcessor::new(48_000, 24, 2, None, Some(&ae), 0, 0, 0) {
             Err(e) => e,
@@ -603,6 +613,7 @@ mod tests {
             opus_fec: false,
             opus_dtx: false,
             opus_frame_duration_ms: None,
+             source_audio_pid: None,
         };
         let p = PcmInputProcessor::new(48_000, 24, 2, None, Some(&ae), 0, 0, 0)
             .expect("construct")
@@ -622,6 +633,7 @@ mod tests {
             opus_fec: false,
             opus_dtx: false,
             opus_frame_duration_ms: None,
+             source_audio_pid: None,
         };
         let err = match PcmInputProcessor::new(48_000, 24, 2, None, Some(&ae), 0, 0, 0) {
             Err(e) => e,

@@ -806,6 +806,8 @@ impl OutputStatsAccumulator {
                 encoder_backend,
                 last_latency_us: h.stats.last_latency_us.load(Ordering::Relaxed),
                 supervisor_restarts: h.stats.supervisor_restarts.load(Ordering::Relaxed),
+                source_pid: h.stats.source_pid.load(Ordering::Relaxed),
+                source_stream_type: h.stats.source_stream_type.load(Ordering::Relaxed),
             }
         });
         let display_stats = self.display_stats.get().map(|h| crate::stats::models::DisplayStats {
@@ -2734,6 +2736,8 @@ impl FlowStatsAccumulator {
                             encoder_backend,
                             last_latency_us: h.stats.last_latency_us.load(Ordering::Relaxed),
                             supervisor_restarts: h.stats.supervisor_restarts.load(Ordering::Relaxed),
+                            source_pid: h.stats.source_pid.load(Ordering::Relaxed),
+                            source_stream_type: h.stats.source_stream_type.load(Ordering::Relaxed),
                         }
                     });
                 let ingress_static_snap = self

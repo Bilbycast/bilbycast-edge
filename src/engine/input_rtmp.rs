@@ -104,6 +104,7 @@ pub fn spawn_rtmp_input(
             config.transcode.as_ref(),
             config.video_encode.as_ref(),
             Some(force_idr.clone()),
+            config.pid_overrides.as_ref(),
         ) {
             Ok(t) => {
                 if let Some(ref t) = t {
@@ -126,7 +127,8 @@ pub fn spawn_rtmp_input(
             config.audio_encode.as_ref(),
             config.video_encode.as_ref(),
         );
-        process_media(media_rx, broadcast_tx, stats, cancel, event_sender, flow_id, &mut transcoder).await;
+        let pid_overrides_for_mux = config.pid_overrides.clone();
+        process_media(media_rx, broadcast_tx, stats, cancel, event_sender, flow_id, &mut transcoder, pid_overrides_for_mux).await;
     })
 }
 
@@ -139,8 +141,14 @@ async fn process_media(
     event_sender: EventSender,
     flow_id: String,
     transcoder: &mut Option<InputTranscoder>,
+    pid_overrides: Option<crate::config::models::TsPidOverridesMap>,
 ) {
     let mut muxer = TsMuxer::new();
+    if let Some(po) = pid_overrides.as_ref() {
+        if let Some(entry) = po.get(&1) {
+                muxer.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
+            }
+    }
     let mut seq_num: u16 = 0;
     let mut has_sent_sps_pps = false;
     let mut sps: Option<Vec<u8>> = None;
