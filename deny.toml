@@ -29,6 +29,11 @@ ignore = [
 
 [licenses]
 confidence-threshold = 0.8
+# Conditional entries (GPL-*, LGPL-*, Unicode-DFS-2016) cover opt-in
+# features that aren't always in the dep graph — silence the false-
+# positive `license-not-encountered` warning when a default `cargo deny`
+# run doesn't pull them in.
+unused-allowed-license = "allow"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -63,18 +68,29 @@ name = "ring"
 expression = "MIT AND ISC AND OpenSSL"
 license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 
+# sigstore-protobuf-specs-derive ships `license-file = "LICENSE"` rather
+# than an SPDX expression in its Cargo.toml. The bundled LICENSE text is
+# Apache-2.0 verbatim (sigstore-org convention) — clarify so cargo-deny
+# doesn't flag it as missing a license field.
+# NOTE: the `hash` is FNV-1a 32-bit of the LICENSE file contents. If the
+# upstream crate ever republishes with a touched LICENSE (newline, header)
+# the hash drifts; cargo-deny then emits an `unmatched-license-file` warning
+# whose body carries the new hash — copy it back here.
+[[licenses.clarify]]
+name = "sigstore-protobuf-specs-derive"
+expression = "Apache-2.0"
+license-files = [{ path = "LICENSE", hash = 0x0e0c7758 }]
+
 [bans]
 multiple-versions = "warn"
 # Intra-workspace path deps (../bilbycast-fdk-aac-rs/aac-audio, etc.)
-# don't declare versions — cargo-deny flags these as wildcards. The
-# built-in `allow-wildcard-paths` escape hatch only activates for crates
-# with `publish = false`, and none of our sibling workspace crates carry
-# that field. These crates are never published to crates.io (path deps
-# would prevent it anyway), so the supply-chain risk that the wildcards
-# rule is meant to catch doesn't apply here. Downgrade to "warn" so
-# wildcard deps from real crates.io sources still surface in logs
-# without failing the build.
+# don't declare versions — cargo-deny flags these as wildcards. All
+# sibling workspace crates AND bilbycast-edge itself carry
+# `publish = false`, so `allow-wildcard-paths` activates and silences
+# the false positive. Real crates.io wildcard deps still surface as
+# warnings.
 wildcards = "warn"
+allow-wildcard-paths = true
 highlight = "all"
 allow = []
 deny = []

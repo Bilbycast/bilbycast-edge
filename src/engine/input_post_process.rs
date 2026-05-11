@@ -108,14 +108,6 @@ impl InputPostProcess {
     ///
     /// Each stage writes into its own dedicated scratch buffer so the
     /// borrow checker stays happy with the chained references.
-    /// True when at least one stage is configured. Lets callers gate
-    /// "should I instantiate this thing?" without inspecting fields.
-    pub fn is_active(&self) -> bool {
-        self.program_filter.is_some()
-            || self.pid_overrides_rewriter.is_some()
-            || self.pid_remapper.is_some()
-    }
-
     pub fn process<'a>(&'a mut self, ts_in: &'a [u8]) -> &'a [u8] {
         // Split the borrow so each stage can hold a &mut to its scratch
         // while the previous stage's scratch is held immutably.

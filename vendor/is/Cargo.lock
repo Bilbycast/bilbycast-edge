@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "is"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "crc",
  "hmac",
@@ -304,9 +304,9 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "str0m-proto"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "222a6a5a946631a167c1b0282846bfa33b0f8098b8dd565237809735656ed63f"
+checksum = "44f74d680ccaae137daee4e348cabbe7f06b60838fe38e9c82807dfc659d5407"
 dependencies = [
  "base64ct",
  "fastrand",

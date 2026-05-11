@@ -185,21 +185,19 @@ impl<'a> StunMessage<'a> {
             if attrs.split_username().is_none() {
                 return Err(StunError::Parse("STUN packet missing username".into()));
             }
-            // BILBYCAST PATCH (2026-04-09): upstream `is` 0.8.0 hard-rejects
-            // every ICE Binding Request that lacks the PRIORITY attribute.
-            // RFC 5245 §7.1.2.1 makes PRIORITY mandatory on connectivity-
-            // check requests, but several production WHIP publishers —
-            // notably ffmpeg's WHIP muxer (as of ffmpeg 7.x) — emit
-            // Binding Requests without PRIORITY. The strict check made
-            // every ffmpeg-WHIP publish fail at the STUN parser, before
-            // str0m even saw the packet, so ICE never completed and the
-            // DTLS handshake timed out at 5 s. Drop the requirement here
-            // and let the higher layers (str0m's pair selection) ignore
-            // the missing priority gracefully. Track upstream fix at
-            // <bilbycast-edge/CLAUDE.md> "WHEN UPGRADING str0m". When
-            // the upstream `is` crate ships a permissive parser this
-            // entire vendor/ tree can be deleted along with the
-            // [patch.crates-io] entry in Cargo.toml.
+            // BILBYCAST PATCH (2026-04-09, re-applied for is 0.9.0 on 2026-05-12):
+            // upstream `is` hard-rejects every ICE Binding Request that lacks the
+            // PRIORITY attribute. RFC 5245 §7.1.2.1 makes PRIORITY mandatory on
+            // connectivity-check requests, but several production WHIP publishers —
+            // notably ffmpeg's WHIP muxer (as of ffmpeg 7.x) — emit Binding Requests
+            // without PRIORITY. The strict check made every ffmpeg-WHIP publish fail
+            // at the STUN parser, before str0m even saw the packet, so ICE never
+            // completed and the DTLS handshake timed out at 5 s. Drop the requirement
+            // here and let the higher layers (str0m's pair selection) ignore the
+            // missing priority gracefully. Track upstream fix at
+            // <bilbycast-edge/CLAUDE.md> "WHEN UPGRADING str0m". When the upstream
+            // `is` crate ships a permissive parser this entire vendor/ tree can be
+            // deleted along with the [patch.crates-io] entry in Cargo.toml.
             //
             // Original (upstream) check, kept here for diff visibility:
             //
@@ -234,11 +232,15 @@ impl<'a> StunMessage<'a> {
     }
 
     /// Whether this STUN message is a _successful_ BINDING response.
-    ///
-    /// STUN binding requests are very simple, they just return the observed address.
-    /// As such, they cannot actually fail which is why we don't have `is_failed_binding_response`.
     pub fn is_successful_binding_response(&self) -> bool {
         self.method == Method::Binding && self.class == Class::Success
+    }
+
+    /// Whether this STUN message is a _failed_ BINDING response.
+    ///
+    /// In ICE, this is used for 487 Role Conflict (RFC 8445 §7.3.1.1).
+    pub fn is_failed_binding_response(&self) -> bool {
+        self.method == Method::Binding && self.class == Class::Failure
     }
 
     /// Whether this STUN message is an ALLOCATE request (TURN).
@@ -393,6 +395,16 @@ impl<'a> StunMessage<'a> {
             .build(trans_id)
     }
 
+    /// Constructs a STUN BINDING error reply with a 487 Role Conflict
+    /// error code (RFC 8445 §7.3.1.1).
+    pub fn binding_role_conflict_reply(trans_id: TransId) -> StunMessage<'a> {
+        StunMessageBuilder::new()
+            .binding()
+            .failure()
+            .error_code(487, "Role Conflict")
+            .build(trans_id)
+    }
+
     /// Verify the integrity of this message against the provided password.
     #[must_use]
     pub fn verify(&self, password: &[u8], sha1_hmac: impl Fn(&[u8], &[&[u8]]) -> [u8; 20]) -> bool {
@@ -451,7 +463,7 @@ impl<'a> StunMessage<'a> {
         }
 
         // Custom attributes
-        self.attrs.to_bytes(&mut buf, &self.trans_id.0)?;
+        self.attrs.to_bytes(&mut buf, &self.trans_id)?;
 
         if include_message_integrity {
             // Message integrity
@@ -493,7 +505,7 @@ impl<'a> StunMessage<'a> {
     }
 }
 
-const MAGIC: &[u8] = &[0x21, 0x12, 0xA4, 0x42];
+const MAGIC: &[u8; 4] = &[0x21, 0x12, 0xA4, 0x42];
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Class {
@@ -786,7 +798,7 @@ impl<'a> Attributes<'a> {
             + error_code
     }
 
-    fn to_bytes(self, out: &mut dyn Write, trans_id: &[u8]) -> io::Result<()> {
+    fn to_bytes(self, out: &mut dyn Write, trans_id: &TransId) -> io::Result<()> {
         if let Some(v) = self.username {
             out.write_all(&Self::USERNAME.to_be_bytes())?;
             encode_str(Self::USERNAME, v, out)?;
@@ -1113,7 +1125,7 @@ fn decode_str(typ: u16, max_bytes: usize, buf: &[u8], len: usize) -> Result<&str
     }
 }
 
-fn encode_xor(addr: SocketAddr, buf: &mut [u8; 20], trans_id: &[u8]) -> usize {
+fn encode_xor(addr: SocketAddr, buf: &mut [u8; 20], trans_id: &TransId) -> usize {
     let port = addr.port() ^ 0x2112;
     buf[2..4].copy_from_slice(&port.to_be_bytes());
     buf[1] = if addr.is_ipv4() { 1 } else { 2 };
@@ -1132,7 +1144,7 @@ fn encode_xor(addr: SocketAddr, buf: &mut [u8; 20], trans_id: &[u8]) -> usize {
                 ip_buf[i] = bytes[i] ^ MAGIC[i];
             }
             for i in 4..16 {
-                ip_buf[i] = bytes[i] ^ trans_id[i - 4];
+                ip_buf[i] = bytes[i] ^ trans_id.0[i - 4];
             }
             20
         }
@@ -1140,17 +1152,23 @@ fn encode_xor(addr: SocketAddr, buf: &mut [u8; 20], trans_id: &[u8]) -> usize {
 }
 
 fn decode_xor(buf: &[u8], trans_id: TransId) -> Result<SocketAddr, StunError> {
-    let port = (((buf[2] as u16) << 8) | (buf[3] as u16)) ^ 0x2112;
+    if buf.len() < 4 {
+        return Err(StunError::Parse(format!(
+            "XOR buffer is too short: {} < 4",
+            buf.len()
+        )));
+    }
+    let port = u16::from_be_bytes([buf[2], buf[3]]) ^ 0x2112;
     let ip_buf = &buf[4..];
     let ip = match buf[1] {
-        1 => {
+        1 if ip_buf.len() >= 4 => {
             let mut bytes = [0_u8; 4];
             for i in 0..4 {
                 bytes[i] = ip_buf[i] ^ MAGIC[i];
             }
             IpAddr::V4(bytes.into())
         }
-        2 => {
+        2 if ip_buf.len() >= 16 => {
             let mut bytes = [0_u8; 16];
             for i in 0..4 {
                 bytes[i] = ip_buf[i] ^ MAGIC[i];
@@ -1160,8 +1178,11 @@ fn decode_xor(buf: &[u8], trans_id: TransId) -> Result<SocketAddr, StunError> {
             }
             IpAddr::V6(bytes.into())
         }
-        e => {
-            return Err(StunError::Parse(format!("Invalid address family: {e:?}")));
+        v => {
+            return Err(StunError::Parse(format!(
+                "Unknown IP version ({v}) or insufficient buffer length for it ({})",
+                ip_buf.len()
+            )));
         }
     };
 
@@ -1454,7 +1475,7 @@ pub struct StunPacket<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
     fn sha1_hmac(key: &[u8], payloads: &[&[u8]]) -> [u8; 20] {
         use hmac::{Hmac, Mac};
@@ -1558,7 +1579,7 @@ network_cost: (10, 10) \
         let mut buf = vec![];
         let trans_id = TransId::new();
         attrs
-            .to_bytes(&mut buf, &trans_id.0)
+            .to_bytes(&mut buf, &trans_id)
             .expect("To serialize attributes");
         assert_eq!(
             buf.len(),
@@ -1931,5 +1952,87 @@ network_cost: (10, 10) \
         assert_eq!(message.class(), Class::Indication);
         assert_eq!(message.trans_id(), trans_id);
         assert_eq!(message.attrs.data, Some(data_payload));
+    }
+
+    #[test]
+    fn decode_xor_buffer_shorter_than_4_is_error() {
+        let trans_id = TransId::new();
+        for buf in [&[][..], &[0x00][..], &[0x00, 0x01, 0x02][..]] {
+            let err = decode_xor(buf, trans_id).expect_err("short buffer must error");
+            assert!(
+                matches!(err, StunError::Parse(_)),
+                "expected Parse error, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_xor_ipv4_family_with_short_ip_buf_is_error() {
+        let trans_id = TransId::new();
+        // Family = IPv4 (0x01), valid port bytes, but fewer than 4 IP octets.
+        for buf in [
+            &[0x00, 0x01, 0x11, 0x22][..],
+            &[0x00, 0x01, 0x11, 0x22, 0xaa][..],
+            &[0x00, 0x01, 0x11, 0x22, 0xaa, 0xbb, 0xcc][..],
+        ] {
+            let err = decode_xor(buf, trans_id).expect_err("short ipv4 payload must error");
+            assert!(
+                matches!(err, StunError::Parse(_)),
+                "expected Parse error, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_xor_ipv6_family_with_short_ip_buf_is_error() {
+        let trans_id = TransId::new();
+        // Family = IPv6 (0x02), valid port bytes, but fewer than 16 IP octets.
+        let mut buf = vec![0x00, 0x02, 0x11, 0x22];
+        buf.extend_from_slice(&[0xaa; 15]);
+        let err = decode_xor(&buf, trans_id).expect_err("short ipv6 payload must error");
+        assert!(
+            matches!(err, StunError::Parse(_)),
+            "expected Parse error, got {err:?}"
+        );
+
+        // Zero IP bytes for IPv6 family is also insufficient.
+        let err = decode_xor(&[0x00, 0x02, 0x11, 0x22], trans_id)
+            .expect_err("empty ipv6 payload must error");
+        assert!(matches!(err, StunError::Parse(_)));
+    }
+
+    #[test]
+    fn decode_xor_unknown_family_is_error() {
+        let trans_id = TransId::new();
+        let buf = [0x00, 0x03, 0x11, 0x22, 0xaa, 0xbb, 0xcc, 0xdd];
+        let err = decode_xor(&buf, trans_id).expect_err("unknown family must error");
+        assert!(matches!(err, StunError::Parse(_)));
+    }
+
+    #[test]
+    fn encode_decode_xor_ipv4_roundtrip() {
+        let trans_id = TransId::new();
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 15), 54321));
+        let mut buf = [0u8; 20];
+        let len = encode_xor(addr, &mut buf, &trans_id);
+        assert_eq!(len, 8);
+        let decoded = decode_xor(&buf[..len], trans_id).expect("ipv4 roundtrip");
+        assert_eq!(decoded, addr);
+    }
+
+    #[test]
+    fn encode_decode_xor_ipv6_roundtrip() {
+        let trans_id = TransId::new();
+        let addr = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x1234),
+            54321,
+            0,
+            0,
+        ));
+        let mut buf = [0u8; 20];
+        let len = encode_xor(addr, &mut buf, &trans_id);
+        assert_eq!(len, 20);
+        let decoded = decode_xor(&buf[..len], trans_id).expect("ipv6 roundtrip");
+        assert_eq!(decoded, addr);
     }
 }

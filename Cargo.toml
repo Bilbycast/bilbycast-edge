@@ -1,9 +1,14 @@
 [package]
 name = "bilbycast-edge"
-version = "0.56.3"
+version = "0.57.0"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 license = "AGPL-3.0-or-later"
+# Binary distribution only — published as signed release artefacts by the
+# GitHub Actions workflow, never as a crates.io library crate. Also flips
+# cargo-deny's `allow-wildcard-paths` rule so the sibling path-deps
+# (../bilbycast-fdk-aac-rs/*, etc.) stop generating wildcard warnings.
+publish = false
 
 [dependencies]
 # Async runtime
@@ -50,7 +55,7 @@ libc = "0.2.186"
 # HealthPayload.network_interfaces — name, IPv4/IPv6, MAC, MTU, loopback).
 # Pure Rust, cross-platform, MIT — no new C deps. Linux-only fields (link
 # speed, operstate) are read directly from /sys/class/net/<iface>/.
-if-addrs = "0.13"
+if-addrs = "0.15"
 
 # Random
 rand = "0.10.1"
@@ -84,7 +89,7 @@ video-engine = { path = "../bilbycast-ffmpeg-video-rs/video-engine", optional = 
 video-codec = { path = "../bilbycast-ffmpeg-video-rs/video-codec", optional = true }
 
 # System resource monitoring (CPU, RAM)
-sysinfo = "0.38.4"
+sysinfo = "0.39.1"
 
 # Error handling
 anyhow = "1.0.102"
@@ -190,7 +195,7 @@ tar = "0.4"
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 semver = { version = "1.0", features = ["serde"] }
 fs2 = "0.4"
-sigstore = { version = "0.12", default-features = false, features = ["sigstore-trust-root", "cached-client"] }
+sigstore = { version = "0.13", default-features = false, features = ["sigstore-trust-root", "cached-client"] }
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 
 [features]
@@ -350,7 +355,7 @@ features = ["tls-rustls"]
 optional = true
 
 [dependencies.str0m]
-version = "0.18.1"
+version = "0.19.0"
 optional = true
 # Use OpenSSL DTLS backend instead of the default aws-lc-rs + dimpl. The
 # pure-Rust dimpl DTLS implementation stalls when the active side (WHEP
@@ -402,17 +407,19 @@ nvml-wrapper = { version = "0.12", optional = true }
 # Connector enumeration walks `/sys/class/drm` directly via std::fs,
 # so libudev is not in the link graph.
 [target.'cfg(target_os = "linux")'.dependencies]
-drm = { version = "0.14", optional = true }
-alsa = { version = "0.9", optional = true }
+drm = { version = "0.15", optional = true }
+alsa = { version = "0.11", optional = true }
 
 # ---------------------------------------------------------------------------
-# BILBYCAST PATCH: vendored `is` 0.8.0 with the strict-PRIORITY check on ICE
-# Binding Requests removed.
+# BILBYCAST PATCH: vendored `is` 0.9.0 with the strict-PRIORITY check on ICE
+# Binding Requests removed. Originally vendored against `is` 0.8.0 (2026-04-09);
+# re-vendored against 0.9.0 (2026-05-12) when str0m bumped to 0.19. Upstream
+# still hard-rejects PRIORITY-less Binding Requests in 0.9.0.
 #
 # Why: ffmpeg's WHIP muxer (and a few other production WHIP publishers)
 # sends ICE connectivity-check Binding Requests without the PRIORITY
 # attribute. RFC 5245 §7.1.2.1 says PRIORITY is mandatory, so it's
-# technically a peer bug, but `is` 0.8.0 hard-rejects the packets at parse
+# technically a peer bug, but `is` hard-rejects the packets at parse
 # time and str0m never even sees them. The result is every ffmpeg-WHIP
 # publish stalls in ICE, DTLS times out at 5 s, and no media flows. See
 # the 2026-04-09 Bug A entry in testbed/QUALITY_REPORT.md.
@@ -423,7 +430,8 @@ alsa = { version = "0.9", optional = true }
 #
 # WHEN UPGRADING str0m:
 #   1. Run `cargo update -p str0m`. If str0m's new version still depends
-#      on `is = "0.8"`, this patch keeps applying — done.
+#      on the same `is` major.minor we have vendored, this patch keeps
+#      applying — done.
 #   2. If `cargo build` emits `warning: Patch ... was not used in the
 #      crate graph`, the patch's version range no longer matches. Either:
 #        a) re-vendor the matching `is` version (copy from
