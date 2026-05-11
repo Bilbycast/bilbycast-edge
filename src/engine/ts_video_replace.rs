@@ -382,6 +382,10 @@ mod inner {
         /// When `Some`, PMT discovery looks for this PID specifically; when
         /// `None`, the legacy first-matching-codec rule applies.
         source_video_pid_pin: Option<u16>,
+        /// De-duplication key for the `video_source_pid_not_found`
+        /// warning — `Some((pinned, actual))` while the pin is unmet,
+        /// cleared when the pin is found again.
+        last_pinned_warn: Option<(u16, u16)>,
         source_stream_type: u8,
         target_stream_type: u8,
 
@@ -567,6 +571,7 @@ mod inner {
                 video_pid: None,
                 out_video_pid_override,
                 source_video_pid_pin,
+                last_pinned_warn: None,
                 source_stream_type: 0,
                 target_stream_type,
                 pes_buffer: Vec::with_capacity(256 * 1024),
@@ -692,6 +697,23 @@ mod inner {
                 if let Some(pmt_pid) = self.pmt_pid {
                     if pid == pmt_pid && ts_pusi(pkt) {
                         if let Some((vpid, vst)) = parse_pmt_video(pkt, self.source_video_pid_pin) {
+                            // Operator-pinned PID not in PMT — warn
+                            // once per distinct (pinned, actual) pair.
+                            // De-duplication clears when the pin reappears.
+                            if let Some(pin) = self.source_video_pid_pin {
+                                if pin != vpid && self.last_pinned_warn != Some((pin, vpid)) {
+                                    tracing::warn!(
+                                        error_code = "video_source_pid_not_found",
+                                        pinned_pid = format!("0x{pin:04X}"),
+                                        actual_pid = format!("0x{vpid:04X}"),
+                                        actual_stream_type = format!("0x{vst:02X}"),
+                                        "video_encode.source_video_pid pin not present in PMT — falling back to first-matching-codec video (pinned 0x{pin:04X} → actual 0x{vpid:04X})"
+                                    );
+                                    self.last_pinned_warn = Some((pin, vpid));
+                                } else if pin == vpid && self.last_pinned_warn.is_some() {
+                                    self.last_pinned_warn = None;
+                                }
+                            }
                             let codec_changed =
                                 self.source_stream_type != 0 && self.source_stream_type != vst;
                             let pid_changed =

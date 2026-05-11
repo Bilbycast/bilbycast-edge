@@ -3905,7 +3905,15 @@ pub struct VideoEncodeConfig {
     /// to pin to a specific PID across input swaps. PID range
     /// `0x0010..=0x1FFE`. If the named PID is absent from the live PMT
     /// the replacer falls back to the first-match behaviour and emits a
-    /// `video_source_pid_not_found` warning event.
+    /// `tracing::warn!` with `error_code = video_source_pid_not_found`.
+    ///
+    /// **Multi-program scope**: the in-place transcoder is single-
+    /// program — only one video PID is transcoded per output. To
+    /// transcode multiple videos from an MPTS, create one output per
+    /// program (each with its own `program_number` filter +
+    /// `source_video_pid` pin). The validator rejects multi-program
+    /// `pid_overrides` + `audio_encode`/`video_encode` on the same
+    /// output with a clear error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_video_pid: Option<u16>,
     /// Output width in pixels. When unset, the encoder uses the source
@@ -4034,8 +4042,17 @@ pub struct AudioEncodeConfig {
     /// for MPTS programs with multiple audio tracks (e.g. EN/FR/5.1)
     /// where the operator wants to pin a specific track. PID range
     /// `0x0010..=0x1FFE`. If the named PID is absent from the live PMT
-    /// the replacer falls back to the first-match behaviour and emits an
-    /// `audio_source_pid_not_found` warning event.
+    /// the replacer falls back to first-match behaviour and emits a
+    /// `tracing::warn!` with `error_code = audio_source_pid_not_found`.
+    ///
+    /// **Multi-program scope**: the in-place transcoder is single-
+    /// program — only one audio PID is transcoded per output. To
+    /// transcode multiple audio tracks from an MPTS (e.g. produce both
+    /// an English-AAC and a French-AAC output), create one output per
+    /// track with its own `program_number` filter + `source_audio_pid`
+    /// pin + `audio_encode`. The validator rejects multi-program
+    /// `pid_overrides` + `audio_encode`/`video_encode` on the same
+    /// output with a clear error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_audio_pid: Option<u16>,
     /// Optional bitrate in kbps. Defaults to a per-codec value when

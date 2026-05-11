@@ -287,6 +287,9 @@ async fn rtp_output_loop(
                     &config.id,
                     serde_json::json!({ "codec": enc.codec }),
                 );
+                // Surface source-PID + stream-type for the manager UI's
+                // audio-transcode `(from PID …)` badge.
+                stats.set_audio_replacer_stats(r.stats_handle());
                 Some(r)
             }
             Err(e) => {

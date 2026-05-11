@@ -26,7 +26,8 @@ use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::FlowStatsAccumulator;
 
 #[cfg(feature = "webrtc")]
-use super::input_transcode::{publish_input_packet, InputTranscoder};
+use super::input_post_process::{InputPostProcess, InputPostProcessConfig};
+use super::input_transcode::{publish_input_packet_with_post, InputTranscoder};
 #[cfg(feature = "webrtc")]
 use super::packet::RtpPacket;
 #[cfg(feature = "webrtc")]
@@ -81,7 +82,18 @@ pub fn spawn_whip_input(
             config.audio_encode.as_ref(),
             config.video_encode.as_ref(),
         );
-        whip_input_loop(config, &flow_id, broadcast_tx, stats, cancel, session_rx, &event_sender, &mut transcoder).await;
+        // Synthetic-TS input — TsMuxer handles pid_overrides; the post-
+        // process only does program_filter (no-op) + pid_map.
+        let mut post = InputPostProcess::from_config(&InputPostProcessConfig {
+            program_number: config.program_number,
+            pid_overrides: None,
+            pid_map: config.pid_map.as_ref(),
+            has_transcode: true,
+        });
+        if let Some(ref _p) = post {
+            tracing::info!("WHIP input: ingress post-process active");
+        }
+        whip_input_loop(config, &flow_id, broadcast_tx, stats, cancel, session_rx, &event_sender, &mut transcoder, &mut post).await;
         tracing::info!("WHIP input stopped for flow '{}'", flow_id);
     })
 }
@@ -96,6 +108,7 @@ async fn whip_input_loop(
     mut session_rx: tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>,
     events: &EventSender,
     transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<InputPostProcess>,
 ) {
     let public_ip: Option<std::net::IpAddr> =
         config.public_ip.as_ref().and_then(|ip| ip.parse().ok());
@@ -222,7 +235,7 @@ async fn whip_input_loop(
                             stats.input_packets.fetch_add(1, Ordering::Relaxed);
                             stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
                             if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                                publish_input_packet(transcoder, &broadcast_tx, pkt);
+                                publish_input_packet_with_post(transcoder, post, &broadcast_tx, pkt);
                             } else {
                                 stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                             }
@@ -257,7 +270,7 @@ async fn whip_input_loop(
                             stats.input_packets.fetch_add(1, Ordering::Relaxed);
                             stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
                             if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                                publish_input_packet(transcoder, &broadcast_tx, pkt);
+                                publish_input_packet_with_post(transcoder, post, &broadcast_tx, pkt);
                             } else {
                                 stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                             }
@@ -328,7 +341,16 @@ pub fn spawn_whep_input(
             config.audio_encode.as_ref(),
             config.video_encode.as_ref(),
         );
-        whep_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder).await;
+        let mut post = InputPostProcess::from_config(&InputPostProcessConfig {
+            program_number: config.program_number,
+            pid_overrides: None,
+            pid_map: config.pid_map.as_ref(),
+            has_transcode: true,
+        });
+        if let Some(ref _p) = post {
+            tracing::info!("WHEP input: ingress post-process active");
+        }
+        whep_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await;
     })
 }
 
@@ -341,6 +363,7 @@ async fn whep_input_loop(
     events: &EventSender,
     flow_id: &str,
     transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<InputPostProcess>,
 ) {
     let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
     // WHEP input is the client side — full ICE (not ICE-Lite).
@@ -477,7 +500,7 @@ async fn whep_input_loop(
                             stats.input_packets.fetch_add(1, Ordering::Relaxed);
                             stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
                             if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                                publish_input_packet(transcoder, &broadcast_tx, pkt);
+                                publish_input_packet_with_post(transcoder, post, &broadcast_tx, pkt);
                             } else {
                                 stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                             }

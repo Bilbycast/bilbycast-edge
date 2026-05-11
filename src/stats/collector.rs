@@ -66,6 +66,13 @@ pub struct OutputStatsAccumulator {
     /// resolved target codec descriptors. Set once at output startup by
     /// outputs that spawn an `engine::audio_encode::AudioEncoder`.
     audio_encode_stats: OnceLock<AudioEncodeStatsHandle>,
+    /// Optional handle to the per-output `TsAudioReplacer` source-PID
+    /// counters. Set once at output startup by outputs that build a
+    /// `TsAudioReplacer`. Surfaces `source_audio_pid` /
+    /// `source_audio_stream_type` on `AudioEncodeStatsSnapshot` so the
+    /// manager UI can show "(from PID 0x0101)" on the audio-transcode
+    /// badge.
+    audio_replacer_stats: OnceLock<Arc<crate::engine::ts_audio_replace::TsAudioReplacerStats>>,
     /// Optional handle to the per-output video encode counters plus the
     /// resolved target codec / geometry descriptors. Set once at output
     /// startup by outputs that build an
@@ -526,6 +533,7 @@ impl OutputStatsAccumulator {
             transcode_stats: OnceLock::new(),
             audio_decode_stats: OnceLock::new(),
             audio_encode_stats: OnceLock::new(),
+            audio_replacer_stats: OnceLock::new(),
             video_encode_stats: OnceLock::new(),
             display_stats: OnceLock::new(),
             egress_static: OnceLock::new(),
@@ -630,6 +638,17 @@ impl OutputStatsAccumulator {
             target_channels,
             target_bitrate_kbps,
         });
+    }
+
+    /// Register the per-output `TsAudioReplacer` source-PID stats
+    /// handle. Surfaces `source_audio_pid` + `source_audio_stream_type`
+    /// on the audio_encode snapshot so the manager UI can show
+    /// "(from PID 0x0101)" on the audio-transcode badge.
+    pub fn set_audio_replacer_stats(
+        &self,
+        stats: Arc<crate::engine::ts_audio_replace::TsAudioReplacerStats>,
+    ) {
+        let _ = self.audio_replacer_stats.set(stats);
     }
 
     /// Register the per-output video encode stats handle. Called once at
@@ -772,6 +791,16 @@ impl OutputStatsAccumulator {
             }
         });
         let audio_encode_stats = self.audio_encode_stats.get().map(|h| {
+            // Source-PID telemetry comes from the TsAudioReplacer handle
+            // when present. Subprocess-AudioEncoder outputs leave these
+            // as 0 (no replacer in their data path); the snapshot's
+            // serde-skip_serializing_if_zero handlers hide them in JSON
+            // so the manager UI just sees `source_pid: undefined`.
+            let (src_pid, src_stream_type) = self
+                .audio_replacer_stats
+                .get()
+                .map(|s| (s.source_pid.load(Ordering::Relaxed), s.source_stream_type.load(Ordering::Relaxed)))
+                .unwrap_or((0, 0));
             crate::stats::models::EncodeStatsSnapshot {
                 pcm_frames_submitted: h.stats.pcm_frames_submitted.load(Ordering::Relaxed),
                 pcm_frames_dropped: h.stats.pcm_frames_dropped.load(Ordering::Relaxed),
@@ -781,6 +810,8 @@ impl OutputStatsAccumulator {
                 target_sample_rate_hz: h.target_sample_rate_hz,
                 target_channels: h.target_channels,
                 target_bitrate_kbps: h.target_bitrate_kbps,
+                source_pid: src_pid,
+                source_stream_type: src_stream_type,
             }
         });
         let video_encode_stats = self.video_encode_stats.get().map(|h| {
@@ -2701,6 +2732,11 @@ impl FlowStatsAccumulator {
                     });
                 let in_audio_encode =
                     self.input_audio_encode_stats.get(active_key).map(|h| {
+                        // Input-side source-PID telemetry isn't wired yet
+                        // (no per-input audio replacer stats handle on
+                        // FlowStatsAccumulator). Surface zeros so the
+                        // snapshot serialises consistently with the
+                        // output-side variant — manager UI sees no badge.
                         crate::stats::models::EncodeStatsSnapshot {
                             pcm_frames_submitted: h.stats.pcm_frames_submitted.load(Ordering::Relaxed),
                             pcm_frames_dropped: h.stats.pcm_frames_dropped.load(Ordering::Relaxed),
@@ -2710,6 +2746,8 @@ impl FlowStatsAccumulator {
                             target_sample_rate_hz: h.target_sample_rate_hz,
                             target_channels: h.target_channels,
                             target_bitrate_kbps: h.target_bitrate_kbps,
+                            source_pid: 0,
+                            source_stream_type: 0,
                         }
                     });
                 let in_video_encode =

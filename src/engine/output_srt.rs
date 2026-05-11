@@ -293,7 +293,7 @@ async fn srt_output_listener_loop(
     });
     let mut pid_remapper = build_pid_remapper(config);
     let mut pid_overrides_rewriter = build_pid_overrides_rewriter(config);
-    let mut audio_replacer = build_audio_replacer(config, events);
+    let mut audio_replacer = build_audio_replacer(config, events, &stats);
     let mut video_replacer = build_video_replacer(config, &stats, events, av_sync_pacer.as_ref());
     let mut null_padder = config
         .cbr_pad_to_kbps
@@ -464,7 +464,7 @@ async fn srt_output_caller_loop(
     });
     let mut pid_remapper = build_pid_remapper(config);
     let mut pid_overrides_rewriter = build_pid_overrides_rewriter(config);
-    let mut audio_replacer = build_audio_replacer(config, events);
+    let mut audio_replacer = build_audio_replacer(config, events, &stats);
     let mut video_replacer = build_video_replacer(config, &stats, events, av_sync_pacer.as_ref());
     let mut null_padder = config
         .cbr_pad_to_kbps
@@ -632,7 +632,11 @@ fn spawn_replacer_switch_watcher(
 
 /// Resolve an `audio_encode` config into a [`TsAudioReplacer`]. Logs and
 /// returns `None` when the codec isn't supported by this build.
-fn build_audio_replacer(config: &SrtOutputConfig, events: &EventSender) -> Option<TsAudioReplacer> {
+fn build_audio_replacer(
+    config: &SrtOutputConfig,
+    events: &EventSender,
+    stats: &OutputStatsAccumulator,
+) -> Option<TsAudioReplacer> {
     let enc = config.audio_encode.as_ref()?;
     match TsAudioReplacer::new(enc, config.transcode.clone(), config.pid_overrides.as_ref()) {
         Ok(r) => {
@@ -648,6 +652,7 @@ fn build_audio_replacer(config: &SrtOutputConfig, events: &EventSender) -> Optio
                 &config.id,
                 serde_json::json!({ "codec": enc.codec }),
             );
+            stats.set_audio_replacer_stats(r.stats_handle());
             Some(r)
         }
         Err(e) => {
@@ -1805,7 +1810,7 @@ async fn srt_output_bonded_loop(
     });
     let mut pid_remapper = build_pid_remapper(config);
     let mut pid_overrides_rewriter = build_pid_overrides_rewriter(config);
-    let mut audio_replacer = build_audio_replacer(config, events);
+    let mut audio_replacer = build_audio_replacer(config, events, &stats);
     let mut video_replacer = build_video_replacer(config, &stats, events, av_sync_pacer.as_ref());
     let mut null_padder = config
         .cbr_pad_to_kbps

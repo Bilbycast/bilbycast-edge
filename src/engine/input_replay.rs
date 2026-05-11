@@ -121,6 +121,18 @@ async fn run(
         config.audio_encode.as_ref(),
         config.video_encode.as_ref(),
     );
+    // Replay reads stored TS files (possibly MPTS) — full post-process chain.
+    let mut post = crate::engine::input_post_process::InputPostProcess::from_config(
+        &crate::engine::input_post_process::InputPostProcessConfig {
+            program_number: config.program_number,
+            pid_overrides: config.pid_overrides.as_ref(),
+            pid_map: config.pid_map.as_ref(),
+            has_transcode: config.audio_encode.is_some() || config.video_encode.is_some(),
+        },
+    );
+    if let Some(ref _p) = post {
+        tracing::info!("Replay input '{input_id}': ingress post-process active");
+    }
     if playing {
         emit_play_started(&events, &flow_id, &input_id, &reader);
     }
@@ -141,7 +153,7 @@ async fn run(
             // command channel to interrupt mid-playback (cue / scrub /
             // stop) — embed the loop body inline so each iteration is
             // tokio::select-able.
-            res = pump_one_bundle(&mut reader, &per_input_tx, &flow_stats, &mut pacing, &mut transcoder), if playing => {
+            res = pump_one_bundle(&mut reader, &per_input_tx, &flow_stats, &mut pacing, &mut transcoder, &mut post), if playing => {
                 match res {
                     Ok(true) => {} // bundle published, continue
                     Ok(false) => {
@@ -428,6 +440,7 @@ async fn pump_one_bundle(
     flow_stats: &Arc<FlowStatsAccumulator>,
     pacing: &mut PacingState,
     transcoder: &mut Option<crate::engine::input_transcode::InputTranscoder>,
+    post: &mut Option<crate::engine::input_post_process::InputPostProcess>,
 ) -> Result<bool> {
     use bytes::Bytes;
     use std::sync::atomic::Ordering;
@@ -491,7 +504,7 @@ async fn pump_one_bundle(
                 upstream_seq: None,
                 upstream_leg_id: None,
             };
-            crate::engine::input_transcode::publish_input_packet(transcoder, per_input_tx, pkt);
+            crate::engine::input_transcode::publish_input_packet_with_post(transcoder, post, per_input_tx, pkt);
             flow_stats.input_bytes.fetch_add(bundle_len as u64, Ordering::Relaxed);
             flow_stats.input_packets.fetch_add(1, Ordering::Relaxed);
         }
@@ -558,7 +571,7 @@ async fn pump_one_bundle(
         upstream_seq: None,
         upstream_leg_id: None,
     };
-    crate::engine::input_transcode::publish_input_packet(transcoder, per_input_tx, pkt);
+    crate::engine::input_transcode::publish_input_packet_with_post(transcoder, post, per_input_tx, pkt);
     flow_stats.input_bytes.fetch_add(bundle_len as u64, Ordering::Relaxed);
     flow_stats.input_packets.fetch_add(1, Ordering::Relaxed);
     Ok(true)

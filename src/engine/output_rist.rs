@@ -321,6 +321,7 @@ async fn rist_output_loop(
                     &config.id,
                     serde_json::json!({ "codec": enc.codec }),
                 );
+                stats.set_audio_replacer_stats(r.stats_handle());
                 Some(r)
             }
             Err(e) => {

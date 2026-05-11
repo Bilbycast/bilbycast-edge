@@ -137,6 +137,18 @@ async fn run_inner(
         config.audio_encode.as_ref(),
         config.video_encode.as_ref(),
     );
+    // Synthetic-TS — TsMuxer handles pid_overrides.
+    let mut post = crate::engine::input_post_process::InputPostProcess::from_config(
+        &crate::engine::input_post_process::InputPostProcessConfig {
+            program_number: config.program_number,
+            pid_overrides: None,
+            pid_map: config.pid_map.as_ref(),
+            has_transcode: true,
+        },
+    );
+    if let Some(ref _p) = post {
+        tracing::info!("Test-pattern input: ingress post-process active");
+    }
 
     let width = config.width as u32;
     let height = config.height as u32;
@@ -266,7 +278,7 @@ async fn run_inner(
             // in-process encoders already emit Annex-B when global_header
             // is false.
             let ts_chunks = ts_muxer.mux_video(&ef.data, ef.pts as u64, ef.pts as u64, ef.keyframe);
-            publish_chunks(ts_chunks, &mut seq_num, stats, per_input_tx, pts_90khz, &mut transcoder);
+            publish_chunks(ts_chunks, &mut seq_num, stats, per_input_tx, pts_90khz, &mut transcoder, &mut post);
         }
 
         // ── Audio ── generate + encode ~1 frame-duration's worth of tone.
@@ -287,7 +299,7 @@ async fn run_inner(
             let frames_ready = ctx.encode_pending()?;
             for (adts, apts) in frames_ready {
                 let ts_chunks = ts_muxer.mux_audio_pre_adts(&adts, apts);
-                publish_chunks(ts_chunks, &mut seq_num, stats, per_input_tx, apts, &mut transcoder);
+                publish_chunks(ts_chunks, &mut seq_num, stats, per_input_tx, apts, &mut transcoder, &mut post);
             }
         }
 
@@ -303,6 +315,7 @@ fn publish_chunks(
     per_input_tx: &broadcast::Sender<RtpPacket>,
     pts_90khz: u64,
     transcoder: &mut Option<crate::engine::input_transcode::InputTranscoder>,
+    post: &mut Option<crate::engine::input_post_process::InputPostProcess>,
 ) {
     // Bundle all TS packets from this video/audio frame into a single
     // RtpPacket — one TsMuxer call per frame produces ~dozens of 188 B
@@ -334,7 +347,7 @@ fn publish_chunks(
     // (single broadcast send, no copy). Some ⇒ block_in_place re-encode
     // before publish. A lagging subscriber sees RecvError::Lagged inside
     // the helper — not our problem.
-    crate::engine::input_transcode::publish_input_packet(transcoder, per_input_tx, pkt);
+    crate::engine::input_transcode::publish_input_packet_with_post(transcoder, post, per_input_tx, pkt);
 }
 
 #[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]

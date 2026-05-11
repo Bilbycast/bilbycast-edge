@@ -36,7 +36,8 @@ use crate::config::models::RtmpInputConfig;
 use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::FlowStatsAccumulator;
 
-use super::input_transcode::{publish_input_packet, InputTranscoder};
+use super::input_post_process::{InputPostProcess, InputPostProcessConfig};
+use super::input_transcode::{publish_input_packet_with_post, InputTranscoder};
 use super::packet::RtpPacket;
 use super::rtmp::server::{RtmpMediaMessage, RtmpServerConfig, run_rtmp_server};
 use super::rtmp::ts_mux::TsMuxer;
@@ -128,7 +129,25 @@ pub fn spawn_rtmp_input(
             config.video_encode.as_ref(),
         );
         let pid_overrides_for_mux = config.pid_overrides.clone();
-        process_media(media_rx, broadcast_tx, stats, cancel, event_sender, flow_id, &mut transcoder, pid_overrides_for_mux).await;
+        // Synthetic-TS input: TsMuxer already applies pid_overrides[1].
+        // Pass `pid_overrides: None` to the post-process so the override
+        // rewriter doesn't double-rewrite. program_filter is a no-op
+        // (TsMuxer always emits program 1) but harmless; pid_map can
+        // still mechanically remap on top.
+        let mut post = InputPostProcess::from_config(&InputPostProcessConfig {
+            program_number: config.program_number,
+            pid_overrides: None,
+            pid_map: config.pid_map.as_ref(),
+            has_transcode: true, // double-belt: pid_overrides handled by TsMuxer
+        });
+        if let Some(ref _p) = post {
+            tracing::info!(
+                "RTMP input: ingress post-process active (program_filter={} pid_map={})",
+                config.program_number.is_some(),
+                config.pid_map.is_some(),
+            );
+        }
+        process_media(media_rx, broadcast_tx, stats, cancel, event_sender, flow_id, &mut transcoder, &mut post, pid_overrides_for_mux).await;
     })
 }
 
@@ -141,6 +160,7 @@ async fn process_media(
     event_sender: EventSender,
     flow_id: String,
     transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<InputPostProcess>,
     pid_overrides: Option<crate::config::models::TsPidOverridesMap>,
 ) {
     let mut muxer = TsMuxer::new();
@@ -261,7 +281,7 @@ async fn process_media(
                                     stats.input_packets.fetch_add(1, Ordering::Relaxed);
                                     stats.input_bytes.fetch_add(total_len as u64, Ordering::Relaxed);
                                     if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                                        publish_input_packet(transcoder, &broadcast_tx, packet);
+                                        publish_input_packet_with_post(transcoder, post, &broadcast_tx, packet);
                                     } else {
                                         stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                                     }
@@ -337,7 +357,7 @@ async fn process_media(
                                     stats.input_packets.fetch_add(1, Ordering::Relaxed);
                                     stats.input_bytes.fetch_add(total_len as u64, Ordering::Relaxed);
                                     if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                                        publish_input_packet(transcoder, &broadcast_tx, packet);
+                                        publish_input_packet_with_post(transcoder, post, &broadcast_tx, packet);
                                     } else {
                                         stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                                     }

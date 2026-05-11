@@ -740,6 +740,137 @@ fn input_pid_map(input: &InputConfig) -> Option<&std::collections::BTreeMap<u16,
     }
 }
 
+/// Pull `audio_encode` from any input that supports it.
+fn input_audio_encode(input: &InputConfig) -> Option<&crate::config::models::AudioEncodeConfig> {
+    match input {
+        InputConfig::Rtp(c) => c.audio_encode.as_ref(),
+        InputConfig::Udp(c) => c.audio_encode.as_ref(),
+        InputConfig::Srt(c) => c.audio_encode.as_ref(),
+        InputConfig::Rist(c) => c.audio_encode.as_ref(),
+        InputConfig::Rtmp(c) => c.audio_encode.as_ref(),
+        InputConfig::Rtsp(c) => c.audio_encode.as_ref(),
+        InputConfig::Webrtc(c) => c.audio_encode.as_ref(),
+        InputConfig::Whep(c) => c.audio_encode.as_ref(),
+        InputConfig::TestPattern(c) => c.audio_encode.as_ref(),
+        InputConfig::MediaPlayer(c) => c.audio_encode.as_ref(),
+        InputConfig::Replay(c) => c.audio_encode.as_ref(),
+        InputConfig::St2110_30(c) | InputConfig::St2110_31(c) => c.audio_encode.as_ref(),
+        InputConfig::RtpAudio(c) => c.audio_encode.as_ref(),
+        InputConfig::St2110_20(_)
+        | InputConfig::St2110_23(_)
+        | InputConfig::St2110_40(_)
+        | InputConfig::Bonded(_) => None,
+    }
+}
+
+/// Pull `video_encode` from any input that supports it.
+fn input_video_encode(input: &InputConfig) -> Option<&crate::config::models::VideoEncodeConfig> {
+    match input {
+        InputConfig::Rtp(c) => c.video_encode.as_ref(),
+        InputConfig::Udp(c) => c.video_encode.as_ref(),
+        InputConfig::Srt(c) => c.video_encode.as_ref(),
+        InputConfig::Rist(c) => c.video_encode.as_ref(),
+        InputConfig::Rtmp(c) => c.video_encode.as_ref(),
+        InputConfig::Rtsp(c) => c.video_encode.as_ref(),
+        InputConfig::Webrtc(c) => c.video_encode.as_ref(),
+        InputConfig::Whep(c) => c.video_encode.as_ref(),
+        InputConfig::TestPattern(c) => c.video_encode.as_ref(),
+        InputConfig::MediaPlayer(c) => c.video_encode.as_ref(),
+        InputConfig::Replay(c) => c.video_encode.as_ref(),
+        InputConfig::St2110_20(c) => Some(&c.video_encode),
+        InputConfig::St2110_23(c) => Some(&c.video_encode),
+        InputConfig::St2110_30(_)
+        | InputConfig::St2110_31(_)
+        | InputConfig::RtpAudio(_)
+        | InputConfig::St2110_40(_)
+        | InputConfig::Bonded(_) => None,
+    }
+}
+
+/// Pull `audio_encode` from any output that supports it.
+fn output_audio_encode(output: &OutputConfig) -> Option<&crate::config::models::AudioEncodeConfig> {
+    match output {
+        OutputConfig::Rtp(c) => c.audio_encode.as_ref(),
+        OutputConfig::Udp(c) => c.audio_encode.as_ref(),
+        OutputConfig::Srt(c) => c.audio_encode.as_ref(),
+        OutputConfig::Rist(c) => c.audio_encode.as_ref(),
+        OutputConfig::Rtmp(c) => c.audio_encode.as_ref(),
+        OutputConfig::Hls(c) => c.audio_encode.as_ref(),
+        OutputConfig::Cmaf(c) => c.audio_encode.as_ref(),
+        OutputConfig::Webrtc(c) => c.audio_encode.as_ref(),
+        OutputConfig::St2110_30(_)
+        | OutputConfig::St2110_31(_)
+        | OutputConfig::St2110_40(_)
+        | OutputConfig::St2110_20(_)
+        | OutputConfig::St2110_23(_)
+        | OutputConfig::RtpAudio(_)
+        | OutputConfig::Bonded(_)
+        | OutputConfig::Display(_) => None,
+    }
+}
+
+/// Pull `video_encode` from any output that supports it.
+fn output_video_encode(output: &OutputConfig) -> Option<&crate::config::models::VideoEncodeConfig> {
+    match output {
+        OutputConfig::Rtp(c) => c.video_encode.as_ref(),
+        OutputConfig::Udp(c) => c.video_encode.as_ref(),
+        OutputConfig::Srt(c) => c.video_encode.as_ref(),
+        OutputConfig::Rist(c) => c.video_encode.as_ref(),
+        OutputConfig::Rtmp(c) => c.video_encode.as_ref(),
+        OutputConfig::Hls(_) => None,
+        OutputConfig::Cmaf(c) => c.video_encode.as_ref(),
+        OutputConfig::Webrtc(c) => c.video_encode.as_ref(),
+        OutputConfig::St2110_30(_)
+        | OutputConfig::St2110_31(_)
+        | OutputConfig::St2110_40(_)
+        | OutputConfig::St2110_20(_)
+        | OutputConfig::St2110_23(_)
+        | OutputConfig::RtpAudio(_)
+        | OutputConfig::Bonded(_)
+        | OutputConfig::Display(_) => None,
+    }
+}
+
+/// Reject the combination of multi-program `pid_overrides` AND
+/// `audio_encode` / `video_encode` on the same input or output.
+///
+/// **Why:** the in-place transcode replacers (`TsAudioReplacer` /
+/// `TsVideoReplacer`) currently maintain a single per-replacer codec /
+/// PES / PTS / CC state and lock onto one program in the PAT. Per-program
+/// codec contexts are a deeper refactor and not yet implemented, so an
+/// operator who supplies overrides for 2+ programs alongside transcoding
+/// would silently get only the first program transcoded (other programs'
+/// override entries would be ignored). Catch this at config time so the
+/// operator gets a clear error and a documented workaround: split into
+/// one output per program, each with its own `program_number` filter +
+/// single-program `pid_overrides` + `audio_encode` / `video_encode`.
+///
+/// The MPTS-passthrough rewriter (no transcode) DOES walk every program
+/// and handles per-program PID overrides correctly — it's only the
+/// transcoded path that's single-program today.
+fn check_multi_program_transcode_combo(
+    pid_overrides: Option<&crate::config::models::TsPidOverridesMap>,
+    audio_encode: Option<&crate::config::models::AudioEncodeConfig>,
+    video_encode: Option<&crate::config::models::VideoEncodeConfig>,
+    context: &str,
+) -> Result<()> {
+    let po = match pid_overrides {
+        Some(m) if !m.is_empty() => m,
+        _ => return Ok(()),
+    };
+    let has_transcode = audio_encode.is_some() || video_encode.is_some();
+    if !has_transcode {
+        return Ok(());
+    }
+    let programs: Vec<u16> = po.keys().copied().collect();
+    if programs.len() > 1 {
+        bail!(
+            "{context}: multi-program pid_overrides (programs={programs:?}) combined with audio_encode / video_encode is not supported today — the transcode replacers handle one program at a time. Workaround: split into one output per program, each with its own program_number filter + single-program pid_overrides + audio_encode/video_encode. Multi-program transcoding in a single output is tracked as a deeper refactor."
+        );
+    }
+    Ok(())
+}
+
 /// True for inputs that always emit a single fixed program (program 1)
 /// via `TsMuxer`. Used by `validate_pid_overrides` to refuse a
 /// per-program map with keys other than 1 on these variants. Inputs that
@@ -810,6 +941,12 @@ fn validate_input(input: &InputConfig) -> Result<()> {
     )?;
     validate_program_number(input_program_number(input), "input program_number")?;
     validate_pid_map(input_pid_map(input), "input pid_map")?;
+    check_multi_program_transcode_combo(
+        input_pid_overrides(input),
+        input_audio_encode(input),
+        input_video_encode(input),
+        "input",
+    )?;
     match input {
         InputConfig::Rtp(rtp) => {
             validate_socket_addr(&rtp.bind_addr, "RTP input bind_addr")?;
@@ -3549,6 +3686,12 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
         output_pid_overrides(output),
         "output pid_overrides",
         false, // Outputs that go through TsMuxer (RTMP/HLS/CMAF/WebRTC) don't expose pid_overrides; the TS-native ones (RTP/UDP/SRT/RIST) can carry MPTS.
+    )?;
+    check_multi_program_transcode_combo(
+        output_pid_overrides(output),
+        output_audio_encode(output),
+        output_video_encode(output),
+        "output",
     )?;
     Ok(())
 }
@@ -7490,6 +7633,26 @@ mod tests {
     }
 
     #[test]
+    fn validate_audio_encode_rejects_source_audio_pid_out_of_range() {
+        // PAT (0x0000) — reserved.
+        let mut enc = make_audio_encode("aac_lc");
+        enc.source_audio_pid = Some(0x0000);
+        assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_err());
+        // System reserved (0x0001..=0x000F).
+        enc.source_audio_pid = Some(0x000F);
+        assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_err());
+        // NULL PID.
+        enc.source_audio_pid = Some(0x1FFF);
+        assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_err());
+        // Valid PID accepted.
+        enc.source_audio_pid = Some(0x0101);
+        assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_ok());
+        // None (unset) accepted.
+        enc.source_audio_pid = None;
+        assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_ok());
+    }
+
+    #[test]
     fn validate_audio_encode_rejects_opus_on_rtmp() {
         let enc = make_audio_encode("opus");
         let err = validate_audio_encode(&enc, &["aac_lc", "he_aac_v1", "he_aac_v2"], "RTMP test")
@@ -7992,6 +8155,60 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("must be even"));
+    }
+
+    #[test]
+    fn check_multi_program_transcode_combo_rejects_multi_program_with_transcode() {
+        use crate::config::models::{TsPidOverridesEntry, TsPidOverridesMap};
+        let mut multi = TsPidOverridesMap::new();
+        multi.insert(1, TsPidOverridesEntry { audio_pid: Some(0x101), ..Default::default() });
+        multi.insert(2, TsPidOverridesEntry { audio_pid: Some(0x201), ..Default::default() });
+        let ae = super::super::models::AudioEncodeConfig {
+            codec: "aac_lc".to_string(),
+            bitrate_kbps: None, sample_rate: None, channels: None,
+            silent_fallback: false,
+            opus_vbr_mode: None, opus_fec: false, opus_dtx: false, opus_frame_duration_ms: None,
+            source_audio_pid: None,
+        };
+        // Multi-program + audio_encode → rejected.
+        assert!(check_multi_program_transcode_combo(Some(&multi), Some(&ae), None, "ctx").is_err());
+        // Multi-program WITHOUT transcode → accepted (passthrough rewriter handles it).
+        assert!(check_multi_program_transcode_combo(Some(&multi), None, None, "ctx").is_ok());
+        // Single-program + transcode → accepted (the supported case).
+        let mut single = TsPidOverridesMap::new();
+        single.insert(1, TsPidOverridesEntry { audio_pid: Some(0x101), ..Default::default() });
+        assert!(check_multi_program_transcode_combo(Some(&single), Some(&ae), None, "ctx").is_ok());
+        // No pid_overrides + transcode → accepted.
+        assert!(check_multi_program_transcode_combo(None, Some(&ae), None, "ctx").is_ok());
+    }
+
+    #[test]
+    fn validate_video_encode_rejects_source_video_pid_out_of_range() {
+        use crate::config::models::VideoEncodeConfig;
+        let make = |pid: Option<u16>| VideoEncodeConfig {
+            codec: "x264".into(),
+            width: None, height: None, fps_num: None, fps_den: None,
+            bitrate_kbps: Some(4000),
+            gop_size: None, preset: None, profile: None,
+            chroma: None, bit_depth: None, rate_control: None, crf: None,
+            max_bitrate_kbps: None, bframes: None, refs: None, level: None,
+            tune: None, color_primaries: None, color_transfer: None,
+            color_matrix: None, color_range: None, hw_decode: None,
+            source_video_pid: pid,
+        };
+        // 0x0000 — PAT.
+        assert!(validate_video_encode(&make(Some(0x0000)), "ctx").is_err());
+        // System reserved.
+        assert!(validate_video_encode(&make(Some(0x000F)), "ctx").is_err());
+        // NULL PID.
+        assert!(validate_video_encode(&make(Some(0x1FFF)), "ctx").is_err());
+        // Valid PID — only check the source_video_pid clause; if x264 isn't
+        // compiled the codec check fails first, which is fine for the
+        // intent of this test (the source-PID clause is unreachable until
+        // earlier checks pass, so we just confirm it doesn't reject a
+        // valid PID outright when the rest is OK).
+        #[cfg(feature = "video-encoder-x264")]
+        assert!(validate_video_encode(&make(Some(0x0100)), "ctx").is_ok());
     }
 
     #[test]

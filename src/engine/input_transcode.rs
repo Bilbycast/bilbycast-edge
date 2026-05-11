@@ -347,6 +347,12 @@ fn rtp_header_length(data: &[u8]) -> Option<usize> {
 ///
 /// Returns `true` when something was sent, `false` when the packet was
 /// swallowed (e.g. the replacer is still bootstrapping its PMT discovery).
+/// Legacy two-arg variant kept for any external caller that hasn't
+/// migrated to `publish_input_packet_with_post`. Internal callers now
+/// all use the `_with_post` form so this is currently unused — left in
+/// place so an out-of-tree caller doesn't break, and so removing it is
+/// a deliberate API change rather than an accidental refactor.
+#[allow(dead_code)]
 pub fn publish_input_packet(
     transcoder: &mut Option<InputTranscoder>,
     broadcast_tx: &tokio::sync::broadcast::Sender<super::packet::RtpPacket>,

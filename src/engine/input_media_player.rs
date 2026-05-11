@@ -183,6 +183,22 @@ async fn run(
         config.audio_encode.as_ref(),
         config.video_encode.as_ref(),
     );
+    // Media-player CAN play MPTS files — full post-process chain wires
+    // up program_filter / pid_overrides_rewriter / pid_map. Synthetic-TS
+    // file types (image / mp4 → TsMuxer) get pid_overrides handled by
+    // the muxer; for TS-passthrough files, the post-process rewriter
+    // can re-PID them. The `has_transcode` flag controls override skip.
+    let mut post = crate::engine::input_post_process::InputPostProcess::from_config(
+        &crate::engine::input_post_process::InputPostProcessConfig {
+            program_number: config.program_number,
+            pid_overrides: config.pid_overrides.as_ref(),
+            pid_map: config.pid_map.as_ref(),
+            has_transcode: config.audio_encode.is_some() || config.video_encode.is_some(),
+        },
+    );
+    if let Some(ref _p) = post {
+        tracing::info!("Media-player input '{input_id}': ingress post-process active");
+    }
 
     let mut seq_num: u16 = 0;
     // One continuity state for the whole playlist's lifetime — carried
@@ -210,6 +226,7 @@ async fn run(
                 cont: &mut cont,
                 transcoder: &mut transcoder,
                 pid_overrides: config.pid_overrides.as_ref(),
+                post: &mut post,
             };
             let result = play_source(source, &config, &mut session).await;
             if let Err(e) = result {
@@ -272,6 +289,10 @@ pub(super) struct PlayerSession<'a> {
     /// image-slate) use these PIDs for PAT/PMT/PCR/video/audio so the
     /// media-player output PID layout aligns with the rest of the flow.
     pub(super) pid_overrides: Option<&'a crate::config::models::TsPidOverridesMap>,
+    /// Optional ingress post-process (program_filter / pid_overrides /
+    /// pid_map) applied to every emitted TS chunk before publishing onto
+    /// the broadcast channel. None ⇒ no post-processing (zero cost).
+    pub(super) post: &'a mut Option<crate::engine::input_post_process::InputPostProcess>,
 }
 
 /// 30 ms gap inserted between the previous file's last emitted PTS and the
@@ -1147,8 +1168,9 @@ pub(super) fn emit_bundle(
         .fetch_add(total_len as u64, Ordering::Relaxed);
     // Route through the optional ingress transcoder. None ⇒ passthrough
     // (single broadcast send). Some ⇒ block_in_place re-encode then send.
-    crate::engine::input_transcode::publish_input_packet(
+    crate::engine::input_transcode::publish_input_packet_with_post(
         session.transcoder,
+        session.post,
         session.per_input_tx,
         pkt,
     );
@@ -1589,6 +1611,7 @@ mod tests {
                 cont: &mut cont,
                 transcoder: &mut transcoder,
                 pid_overrides: None,
+                post: &mut None,
             };
             play_ts_file(&path, None, None, &mut session).await.unwrap();
         }
@@ -1776,6 +1799,7 @@ mod tests {
                 cont: &mut cont,
                 transcoder: &mut transcoder,
                 pid_overrides: None,
+                post: &mut None,
             };
             play_ts_file(&path, None, None, &mut session).await.unwrap();
         }
@@ -1791,6 +1815,7 @@ mod tests {
                 cont: &mut cont,
                 transcoder: &mut transcoder,
                 pid_overrides: None,
+                post: &mut None,
             };
             play_ts_file(&path, None, None, &mut session).await.unwrap();
         }

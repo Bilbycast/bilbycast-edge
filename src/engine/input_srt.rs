@@ -29,7 +29,8 @@ use crate::stats::collector::FlowStatsAccumulator;
 use crate::util::rtp_parse::{is_likely_rtp, parse_rtp_sequence_number, parse_rtp_timestamp};
 use crate::util::time::now_us;
 
-use super::input_transcode::{publish_input_packet, InputTranscoder};
+use super::input_post_process::{InputPostProcess, InputPostProcessConfig};
+use super::input_transcode::{publish_input_packet_with_post, InputTranscoder};
 use super::packet::RtpPacket;
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -230,13 +231,27 @@ pub fn spawn_srt_input(
             config.audio_encode.as_ref(),
             config.video_encode.as_ref(),
         );
+        let mut post = InputPostProcess::from_config(&InputPostProcessConfig {
+            program_number: config.program_number,
+            pid_overrides: config.pid_overrides.as_ref(),
+            pid_map: config.pid_map.as_ref(),
+            has_transcode: config.audio_encode.is_some() || config.video_encode.is_some(),
+        });
+        if let Some(ref _p) = post {
+            tracing::info!(
+                "SRT input '{input_id}': ingress post-process active (program_filter={} pid_overrides={} pid_map={})",
+                config.program_number.is_some(),
+                config.pid_overrides.is_some(),
+                config.pid_map.is_some(),
+            );
+        }
 
         let result = if config.bonding.is_some() {
-            srt_input_bonded_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder).await
+            srt_input_bonded_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
         } else if config.redundancy.is_some() {
-            srt_input_redundant_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder).await
+            srt_input_redundant_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
         } else {
-            srt_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder).await
+            srt_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
         };
         if let Err(e) = result {
             tracing::error!("SRT input task exited with error: {e}");
@@ -257,10 +272,11 @@ async fn srt_input_loop(
     events: &EventSender,
     flow_id: &str,
     transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
     match config.mode {
-        SrtMode::Listener => srt_input_listener_loop(config, broadcast_tx, stats, cancel, events, flow_id, transcoder).await,
-        _ => srt_input_caller_loop(config, broadcast_tx, stats, cancel, events, flow_id, transcoder).await,
+        SrtMode::Listener => srt_input_listener_loop(config, broadcast_tx, stats, cancel, events, flow_id, transcoder, post).await,
+        _ => srt_input_caller_loop(config, broadcast_tx, stats, cancel, events, flow_id, transcoder, post).await,
     }
 }
 
@@ -274,6 +290,7 @@ async fn srt_input_listener_loop(
     events: &EventSender,
     flow_id: &str,
     transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
     let mut listener = match bind_srt_listener_for_input(&config).await {
         Ok(l) => l,
@@ -340,6 +357,7 @@ async fn srt_input_listener_loop(
             &socket, &broadcast_tx, &stats, &cancel,
             &mut format, &mut last_seq, &mut raw_ts_seq_counter, &mut raw_ts_timestamp,
             transcoder,
+            post,
         ).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
@@ -380,6 +398,7 @@ async fn srt_input_caller_loop(
     events: &EventSender,
     flow_id: &str,
     transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
     let mut format = SrtPayloadFormat::Unknown;
     let mut last_seq: Option<u16> = None;
@@ -432,6 +451,7 @@ async fn srt_input_caller_loop(
             &socket, &broadcast_tx, &stats, &cancel,
             &mut format, &mut last_seq, &mut raw_ts_seq_counter, &mut raw_ts_timestamp,
             transcoder,
+            post,
         ).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
@@ -477,6 +497,7 @@ async fn srt_input_recv_loop(
     raw_ts_seq_counter: &mut u16,
     raw_ts_timestamp: &mut u32,
     transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<bool> {
     loop {
         tokio::select! {
@@ -553,7 +574,7 @@ async fn srt_input_recv_loop(
                             upstream_leg_id: None,
                         };
 
-                        publish_input_packet(transcoder, broadcast_tx, packet);
+                        publish_input_packet_with_post(transcoder, post, broadcast_tx, packet);
                     }
                     Err(_) => {
                         tracing::warn!("SRT input connection lost, will reconnect");
@@ -587,6 +608,7 @@ async fn srt_input_redundant_loop(
     events: &EventSender,
     flow_id: &str,
     transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
     let redundancy = config
         .redundancy
@@ -828,6 +850,7 @@ async fn srt_input_redundant_loop(
                                 &stats,
                                 &broadcast_tx,
                                 transcoder,
+                                post,
                             );
                         }
                         Err(_) => {
@@ -861,6 +884,7 @@ async fn srt_input_redundant_loop(
                                 &stats,
                                 &broadcast_tx,
                                 transcoder,
+                                post,
                             );
                         }
                         Err(_) => {
@@ -1037,6 +1061,7 @@ fn process_redundant_packet(
     stats: &Arc<FlowStatsAccumulator>,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<InputPostProcess>,
 ) {
     let (seq, ts, is_raw, accepted_leg) = match format {
         SrtPayloadFormat::RtpTs => {
@@ -1099,7 +1124,7 @@ fn process_redundant_packet(
         upstream_leg_id: None,
     };
 
-    publish_input_packet(transcoder, broadcast_tx, packet);
+    publish_input_packet_with_post(transcoder, post, broadcast_tx, packet);
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,17 +1145,18 @@ async fn srt_input_bonded_loop(
     events: &EventSender,
     flow_id: &str,
     transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
     match config.mode {
         SrtMode::Listener => {
             srt_input_bonded_listener_loop(
-                config, broadcast_tx, stats, cancel, events, flow_id, transcoder,
+                config, broadcast_tx, stats, cancel, events, flow_id, transcoder, post,
             )
             .await
         }
         _ => {
             srt_input_bonded_caller_loop(
-                config, broadcast_tx, stats, cancel, events, flow_id, transcoder,
+                config, broadcast_tx, stats, cancel, events, flow_id, transcoder, post,
             )
             .await
         }
@@ -1145,6 +1171,7 @@ async fn srt_input_bonded_caller_loop(
     events: &EventSender,
     flow_id: &str,
     transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
     let bond = config.bonding.as_ref().expect("bonding must be set").clone();
     let mut format = SrtPayloadFormat::Unknown;
@@ -1212,6 +1239,7 @@ async fn srt_input_bonded_caller_loop(
             &mut raw_ts_seq_counter,
             &mut raw_ts_timestamp,
             transcoder,
+            post,
         )
         .await?;
         poller_cancel.cancel();
@@ -1245,6 +1273,7 @@ async fn srt_input_bonded_listener_loop(
     events: &EventSender,
     flow_id: &str,
     transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
     let bond = config.bonding.as_ref().expect("bonding must be set").clone();
     let mut listener = bind_srt_listener_for_bonded_input(&config).await?;
@@ -1312,6 +1341,7 @@ async fn srt_input_bonded_listener_loop(
             &mut raw_ts_seq_counter,
             &mut raw_ts_timestamp,
             transcoder,
+            post,
         )
         .await?;
         poller_cancel.cancel();
@@ -1353,6 +1383,7 @@ async fn srt_bonded_group_recv_loop(
     raw_ts_seq_counter: &mut u16,
     raw_ts_timestamp: &mut u32,
     transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<bool> {
     loop {
         tokio::select! {
@@ -1413,7 +1444,7 @@ async fn srt_bonded_group_recv_loop(
                             upstream_seq: None,
                             upstream_leg_id: None,
                         };
-                        publish_input_packet(transcoder, broadcast_tx, packet);
+                        publish_input_packet_with_post(transcoder, post, broadcast_tx, packet);
                     }
                     Err(_) => {
                         tracing::warn!("SRT bonded input connection lost, will reconnect");

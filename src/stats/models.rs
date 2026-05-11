@@ -1069,6 +1069,18 @@ pub struct EncodeStatsSnapshot {
     pub target_channels: u8,
     /// Resolved target bitrate in kbps.
     pub target_bitrate_kbps: u32,
+    /// Source audio PID the `TsAudioReplacer` is currently locked onto
+    /// (PMT-discovered or operator-pinned via
+    /// `audio_encode.source_audio_pid`). `0` means the PMT hasn't been
+    /// seen yet OR the output uses the subprocess `AudioEncoder` (no
+    /// `TsAudioReplacer` stats handle). Surfaces on the UI as
+    /// `(from PID 0x0101)` on the audio-transcode badge.
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub source_pid: u16,
+    /// Source audio stream_type byte (`0x0F` AAC, `0x03/0x04` MPEG-1/2,
+    /// `0x81` AC-3, `0x06` private). `0` = unknown.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub source_stream_type: u8,
 }
 
 /// Per-output video encode snapshot. Mirrors `engine::ts_video_replace::VideoEncodeStats`

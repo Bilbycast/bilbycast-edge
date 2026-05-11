@@ -19,7 +19,8 @@ use crate::config::models::{RtspInputConfig, RtspTransport};
 use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::FlowStatsAccumulator;
 
-use super::input_transcode::{publish_input_packet, InputTranscoder};
+use super::input_post_process::{InputPostProcess, InputPostProcessConfig};
+use super::input_transcode::{publish_input_packet_with_post, InputTranscoder};
 use super::packet::RtpPacket;
 use super::rtmp::ts_mux::TsMuxer;
 
@@ -69,7 +70,17 @@ pub fn spawn_rtsp_input(
             config.audio_encode.as_ref(),
             config.video_encode.as_ref(),
         );
-        rtsp_input_loop(config, broadcast_tx, stats, cancel, event_sender, flow_id, &mut transcoder).await;
+        // Synthetic-TS input — pid_overrides handled by TsMuxer.
+        let mut post = InputPostProcess::from_config(&InputPostProcessConfig {
+            program_number: config.program_number,
+            pid_overrides: None,
+            pid_map: config.pid_map.as_ref(),
+            has_transcode: true,
+        });
+        if let Some(ref _p) = post {
+            tracing::info!("RTSP input: ingress post-process active");
+        }
+        rtsp_input_loop(config, broadcast_tx, stats, cancel, event_sender, flow_id, &mut transcoder, &mut post).await;
     })
 }
 
@@ -81,6 +92,7 @@ async fn rtsp_input_loop(
     event_sender: EventSender,
     flow_id: String,
     transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<InputPostProcess>,
 ) {
     let reconnect_delay = std::time::Duration::from_secs(config.reconnect_delay_secs);
     // Track whether we need to emit a disconnect event. Set to true when
@@ -89,7 +101,7 @@ async fn rtsp_input_loop(
     let mut disconnect_event_pending = false;
 
     loop {
-        match run_rtsp_session(&config, &broadcast_tx, &stats, &cancel, &event_sender, &flow_id, &mut disconnect_event_pending, transcoder).await {
+        match run_rtsp_session(&config, &broadcast_tx, &stats, &cancel, &event_sender, &flow_id, &mut disconnect_event_pending, transcoder, post).await {
             Ok(()) => {
                 tracing::info!("RTSP input stopped (cancelled)");
                 break;
@@ -135,6 +147,7 @@ async fn run_rtsp_session(
     flow_id: &str,
     disconnect_event_pending: &mut bool,
     transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
     use retina::client::{PlayOptions, SessionGroup, SetupOptions};
     use retina::codec::{CodecItem, FrameFormat};
@@ -271,7 +284,7 @@ async fn run_rtsp_session(
                     stats.input_packets.fetch_add(1, Ordering::Relaxed);
                     stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
                     if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                        publish_input_packet(transcoder, broadcast_tx, pkt);
+                        publish_input_packet_with_post(transcoder, post, broadcast_tx, pkt);
                     } else {
                         stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                     }
@@ -311,7 +324,7 @@ async fn run_rtsp_session(
                     stats.input_packets.fetch_add(1, Ordering::Relaxed);
                     stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
                     if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                        publish_input_packet(transcoder, broadcast_tx, pkt);
+                        publish_input_packet_with_post(transcoder, post, broadcast_tx, pkt);
                     } else {
                         stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                     }

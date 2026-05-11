@@ -29,8 +29,28 @@
 //! single-digit milliseconds per frame and must not run inline on a
 //! single-threaded runtime.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use std::sync::Arc;
+
+/// Lock-free per-instance counters surfaced to the manager via the
+/// output stats snapshot path.
+///
+/// Mirrors the shape of `engine::ts_video_replace::VideoEncodeStats` so
+/// the manager UI can render an audio-side "transcoding from PID X"
+/// badge with the same plumbing as the video badge. Today it carries
+/// just the source PID + stream_type — the heavy encode-frame counters
+/// remain inside `engine::audio_encode::EncodeStats` on the subprocess
+/// path. Extend this struct when adding new audio-replacer telemetry.
+#[derive(Debug, Default)]
+pub struct TsAudioReplacerStats {
+    /// Source audio PID the replacer is currently locked onto
+    /// (PMT-discovered or operator-pinned via
+    /// `audio_encode.source_audio_pid`). `0` = PMT not yet observed.
+    pub source_pid: AtomicU16,
+    /// Source audio stream_type byte (`0x0F` AAC, `0x03/0x04` MPEG-1/2,
+    /// `0x81` AC-3, `0x06` private). `0` = unknown.
+    pub source_stream_type: AtomicU8,
+}
 
 use crate::config::models::{AudioEncodeConfig, TsPidOverridesMap};
 
@@ -104,6 +124,16 @@ pub struct TsAudioReplacer {
     /// multiple audio tracks). When unset, falls back to first-matching-
     /// codec discovery. Sourced from `audio_encode.source_audio_pid`.
     source_audio_pid_pin: Option<u16>,
+    /// De-duplication key for the `audio_source_pid_not_found` warning:
+    /// `Some((pinned_pid, actual_pid))` once we've warned about that
+    /// specific mismatch, so we don't spam logs every PMT version bump.
+    /// Cleared back to `None` once the pinned PID is found again.
+    last_pinned_warn: Option<(u16, u16)>,
+    /// Shared lock-free counters surfaced to the manager. The
+    /// `OutputStatsAccumulator` holds an `Arc` clone via
+    /// `set_audio_replacer_stats`, and the snapshot path reads
+    /// `source_pid` + `source_stream_type` from here every tick.
+    stats: Arc<TsAudioReplacerStats>,
     /// Source audio stream_type (0x0F = AAC-ADTS, etc.). Used to decide
     /// which decoder to instantiate.
     source_stream_type: u8,
@@ -252,6 +282,8 @@ impl TsAudioReplacer {
             audio_pid: None,
             out_audio_pid_override,
             source_audio_pid_pin: cfg.source_audio_pid,
+            last_pinned_warn: None,
+            stats: Arc::new(TsAudioReplacerStats::default()),
             source_stream_type: 0,
             target_stream_type,
             pes_buffer: Vec::with_capacity(16 * 1024),
@@ -290,6 +322,14 @@ impl TsAudioReplacer {
     #[allow(dead_code)]
     pub fn external_reset_handle(&self) -> Arc<AtomicBool> {
         self.external_reset.clone()
+    }
+
+    /// Shared handle to the source-PID stats counters. Output forward
+    /// loops register this with the per-output stats accumulator at
+    /// startup so the manager snapshot surfaces "transcoding from PID
+    /// 0x0101 (AAC)" on the audio_encode_stats badge.
+    pub fn stats_handle(&self) -> Arc<TsAudioReplacerStats> {
+        self.stats.clone()
     }
 
     /// Human-readable description of the active encoder target.
@@ -366,6 +406,30 @@ impl TsAudioReplacer {
             if let Some(pmt_pid) = self.pmt_pid {
                 if pid == pmt_pid && ts_pusi(pkt) {
                     if let Some((apid, ast)) = parse_pmt_audio(pkt, self.source_audio_pid_pin) {
+                        // Operator pinned a specific PID but the PMT
+                        // resolved to a different one — they got the
+                        // first-match fallback. Warn loudly once per
+                        // distinct (pinned, actual) pair so log review
+                        // surfaces the misconfiguration; the warning
+                        // recurs on PMT-version bumps where the pin is
+                        // still missing.
+                        if let Some(pin) = self.source_audio_pid_pin {
+                            if pin != apid && self.last_pinned_warn != Some((pin, apid)) {
+                                tracing::warn!(
+                                    error_code = "audio_source_pid_not_found",
+                                    pinned_pid = format!("0x{pin:04X}"),
+                                    actual_pid = format!("0x{apid:04X}"),
+                                    actual_stream_type = format!("0x{ast:02X}"),
+                                    "audio_encode.source_audio_pid pin not present in PMT — falling back to first-matching-codec audio (pinned 0x{pin:04X} → actual 0x{apid:04X})"
+                                );
+                                self.last_pinned_warn = Some((pin, apid));
+                            } else if pin == apid && self.last_pinned_warn.is_some() {
+                                // Pin re-found (e.g. after an upstream
+                                // PMT change) — clear the suppression
+                                // so a future drop-out warns again.
+                                self.last_pinned_warn = None;
+                            }
+                        }
                         let codec_changed =
                             self.source_stream_type != 0 && self.source_stream_type != ast;
                         let pid_changed =
@@ -378,6 +442,12 @@ impl TsAudioReplacer {
                         }
                         self.audio_pid = Some(apid);
                         self.source_stream_type = ast;
+                        // Surface for the manager UI's "(from PID 0x0101)"
+                        // badge. Updated on every PMT discovery so input
+                        // swaps and PMT-version bumps that change the
+                        // discovered audio PID are visible immediately.
+                        self.stats.source_pid.store(apid, Ordering::Relaxed);
+                        self.stats.source_stream_type.store(ast, Ordering::Relaxed);
                     }
                     // Rewrite the PMT stream_type whenever the source codec
                     // is one we can replace (AAC family via fdk-aac, or
