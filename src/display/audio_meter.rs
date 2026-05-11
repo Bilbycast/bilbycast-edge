@@ -32,7 +32,10 @@ use crate::engine::ts_parse::{
     TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
 
-use super::audio_bars::{new_shared_meter, prune_stale, update_levels, MeterPublisher, SharedMeter};
+use super::audio_bars::{
+    clear_all_pids, new_shared_meter, remove_pid, silence_stale, update_levels, MeterPublisher,
+    SharedMeter,
+};
 
 const PES_BUF_CAP: usize = 256 * 1024;
 const STALE_PID_AFTER: Duration = Duration::from_secs(5);
@@ -95,7 +98,12 @@ async fn run_meter(
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = prune_interval.tick() => {
-                prune_stale(&mut publisher, STALE_PID_AFTER);
+                // Silence rather than remove: stale PIDs keep their
+                // label + empty bar slots so brief audio decoder gaps
+                // don't blink the entire confidence strip off. Genuine
+                // PID removal happens below in `parse_pat` /
+                // `parse_pmt` when the PSI explicitly drops a PID.
+                silence_stale(&mut publisher, STALE_PID_AFTER);
             }
             result = rx.recv() => {
                 match result {
@@ -184,12 +192,12 @@ impl MeterState {
         let payload = &pkt[payload_offset..];
         if pid == PAT_PID {
             if pusi {
-                self.parse_pat(payload);
+                self.parse_pat(payload, publisher);
             }
             return;
         }
         if Some(pid) == self.selected_pmt_pid && pusi {
-            self.parse_pmt(payload);
+            self.parse_pmt(payload, publisher);
             return;
         }
         if let Some(pid_state) = self.audio_pids.get_mut(&pid) {
@@ -197,7 +205,7 @@ impl MeterState {
         }
     }
 
-    fn parse_pat(&mut self, payload: &[u8]) {
+    fn parse_pat(&mut self, payload: &[u8], publisher: &mut MeterPublisher) {
         if payload.is_empty() {
             return;
         }
@@ -235,13 +243,18 @@ impl MeterState {
         };
         if chosen != self.selected_pmt_pid {
             // Program changed (or first lock) — drop all per-PID state
-            // so the new PMT can repopulate cleanly.
+            // so the new PMT can repopulate cleanly. The published
+            // snapshot is cleared explicitly here (rather than waiting
+            // for silence_stale to coast the entries down) because a
+            // program change is a hard semantic boundary: the labels
+            // from the previous program are no longer meaningful.
             self.audio_pids.clear();
             self.selected_pmt_pid = chosen;
+            clear_all_pids(publisher);
         }
     }
 
-    fn parse_pmt(&mut self, payload: &[u8]) {
+    fn parse_pmt(&mut self, payload: &[u8], publisher: &mut MeterPublisher) {
         if payload.is_empty() {
             return;
         }
@@ -304,7 +317,20 @@ impl MeterState {
                 .entry(*pid)
                 .or_insert_with(|| MeterPidState::new(*pid, *stype));
         }
+        // Drop the PMT-removed PIDs from the published snapshot
+        // explicitly so the operator sees them disappear at the moment
+        // the PMT updated — silence_stale would otherwise leave the
+        // labels coasting at the dBFS floor until the next PMT cycle.
+        let removed: Vec<u16> = self
+            .audio_pids
+            .keys()
+            .copied()
+            .filter(|pid| !discovered.contains_key(pid))
+            .collect();
         self.audio_pids.retain(|pid, _| discovered.contains_key(pid));
+        for pid in removed {
+            remove_pid(publisher, pid);
+        }
     }
 }
 

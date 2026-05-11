@@ -340,19 +340,62 @@ pub fn update_levels(
     publisher.publish();
 }
 
-/// Drop PIDs whose decoder hasn't produced a block in `stale_after`.
-/// Called periodically by the meter task so the overlay reflects the
-/// current PMT (e.g. an audio PID that vanished from the program list).
-pub fn prune_stale(publisher: &mut MeterPublisher, stale_after: Duration) {
+/// Zero the levels of any PID whose decoder hasn't produced a block in
+/// `stale_after`, leaving the PID itself in the snapshot. The per-block
+/// label (`"0x100 AAC 2.0"`) and the empty bar slots stay visible so a
+/// brief audio decoder gap doesn't blink the entire confidence strip
+/// off and back on — operators see "PID still present, currently
+/// silent" instead of "PID vanished". Genuine PID removal is driven by
+/// [`remove_pid`] / [`clear_all_pids`] from the PMT/PAT parsers, not
+/// by elapsed time.
+pub fn silence_stale(publisher: &mut MeterPublisher, stale_after: Duration) {
     let now = Instant::now();
-    let before = publisher.local.per_pid.len();
-    publisher
-        .local
-        .per_pid
-        .retain(|p| now.duration_since(p.last_update) < stale_after);
-    if publisher.local.per_pid.len() != before {
+    let mut changed = false;
+    for pid in publisher.local.per_pid.iter_mut() {
+        if now.duration_since(pid.last_update) < stale_after {
+            continue;
+        }
+        for ch in pid.channels.iter_mut() {
+            if ch.rms_dbfs != DBFS_FLOOR
+                || ch.peak_dbfs != DBFS_FLOOR
+                || ch.peak_hold_dbfs != DBFS_FLOOR
+            {
+                ch.rms_dbfs = DBFS_FLOOR;
+                ch.peak_dbfs = DBFS_FLOOR;
+                ch.peak_hold_dbfs = DBFS_FLOOR;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        publisher.local.generation = publisher.local.generation.wrapping_add(1);
         publisher.publish();
     }
+}
+
+/// Remove a single PID from the published snapshot. Called by the meter
+/// task when a PMT update drops a PID from the program — i.e. the PID
+/// is genuinely gone from the stream, not merely audio-silent.
+pub fn remove_pid(publisher: &mut MeterPublisher, pid: u16) {
+    let before = publisher.local.per_pid.len();
+    publisher.local.per_pid.retain(|p| p.pid != pid);
+    if publisher.local.per_pid.len() != before {
+        publisher.local.generation = publisher.local.generation.wrapping_add(1);
+        publisher.publish();
+    }
+}
+
+/// Drop every PID from the published snapshot. Called by the meter task
+/// on a PAT-driven program change so the new program's PMT can
+/// repopulate cleanly without carrying stale entries from the previous
+/// program.
+pub fn clear_all_pids(publisher: &mut MeterPublisher) {
+    if publisher.local.per_pid.is_empty() {
+        return;
+    }
+    publisher.local.per_pid.clear();
+    publisher.local.generation = publisher.local.generation.wrapping_add(1);
+    publisher.publish();
 }
 
 /// Format the cached `"0xNNN CODEC X.Y"` label into `dst` without
@@ -1170,12 +1213,109 @@ mod tests {
     }
 
     #[test]
-    fn prune_stale_drops_old_pids() {
+    fn silence_stale_zeroes_levels_keeping_pid_visible() {
+        // Confidence-monitor convention: when the decoder briefly stops
+        // producing blocks (audio gap, decoder lag, lagged broadcast),
+        // the label stays visible and the bars sink to silence rather
+        // than the whole block vanishing.
+        let mut p = MeterPublisher::new(new_shared_meter());
+        update_levels(&full_scale_block(2, 64), 0x100, "AAC", &mut p);
+        // Confirm we have non-floor levels before going stale.
+        assert!(p.local.per_pid[0].channels[0].rms_dbfs > DBFS_FLOOR);
+        let baseline_label = p.local.per_pid[0].cached_label.clone();
+        let before_publishes = p.publish_count();
+
+        // Backdate so the PID is "stale" by silence_stale's reckoning.
+        p.local.per_pid[0].last_update = Instant::now() - Duration::from_secs(10);
+        silence_stale(&mut p, Duration::from_secs(5));
+
+        // PID still present.
+        assert_eq!(p.local.per_pid.len(), 1);
+        assert_eq!(p.local.per_pid[0].pid, 0x100);
+        assert_eq!(p.local.per_pid[0].cached_label, baseline_label);
+        // Levels zeroed to the dBFS floor on every channel.
+        for ch in &p.local.per_pid[0].channels {
+            assert_eq!(ch.rms_dbfs, DBFS_FLOOR);
+            assert_eq!(ch.peak_dbfs, DBFS_FLOOR);
+            assert_eq!(ch.peak_hold_dbfs, DBFS_FLOOR);
+        }
+        // Snapshot got republished exactly once for the transition.
+        assert_eq!(p.publish_count(), before_publishes + 1);
+
+        // A second call is idempotent — already-silent PIDs don't
+        // trigger spurious publishes that would churn the display
+        // task's ArcSwap reads for no visible change.
+        silence_stale(&mut p, Duration::from_secs(5));
+        assert_eq!(p.publish_count(), before_publishes + 1);
+    }
+
+    #[test]
+    fn silence_stale_skips_fresh_pids() {
+        // Recently-updated PIDs aren't touched — the bars stay at their
+        // live levels even while a sibling PID has gone silent.
+        let mut p = MeterPublisher::new(new_shared_meter());
+        update_levels(&full_scale_block(2, 64), 0x100, "AAC", &mut p);
+        let rms_before = p.local.per_pid[0].channels[0].rms_dbfs;
+        silence_stale(&mut p, Duration::from_secs(5));
+        assert_eq!(p.local.per_pid[0].channels[0].rms_dbfs, rms_before);
+    }
+
+    #[test]
+    fn remove_pid_drops_from_snapshot() {
         let mut p = MeterPublisher::new(new_shared_meter());
         update_levels(&silent_block(2, 64), 0x100, "AAC", &mut p);
-        p.local.per_pid[0].last_update = Instant::now() - Duration::from_secs(10);
-        prune_stale(&mut p, Duration::from_secs(5));
+        update_levels(&silent_block(2, 64), 0x101, "AC3", &mut p);
+        remove_pid(&mut p, 0x100);
+        assert_eq!(p.local.per_pid.len(), 1);
+        assert_eq!(p.local.per_pid[0].pid, 0x101);
+        // Removing a PID that's not in the snapshot is a no-op (no
+        // spurious publish).
+        let before = p.publish_count();
+        remove_pid(&mut p, 0x999);
+        assert_eq!(p.publish_count(), before);
+    }
+
+    #[test]
+    fn clear_all_pids_empties_snapshot() {
+        let mut p = MeterPublisher::new(new_shared_meter());
+        update_levels(&silent_block(2, 64), 0x100, "AAC", &mut p);
+        update_levels(&silent_block(2, 64), 0x101, "AC3", &mut p);
+        clear_all_pids(&mut p);
         assert!(p.local.per_pid.is_empty());
+        // Idempotent — clearing an empty snapshot doesn't republish.
+        let before = p.publish_count();
+        clear_all_pids(&mut p);
+        assert_eq!(p.publish_count(), before);
+    }
+
+    #[test]
+    fn silenced_pid_still_renders_label_and_empty_bars() {
+        // Verifies the user-visible payoff of silence_stale: with a
+        // single silent PID the overlay buffer still gets labels +
+        // empty bar slots drawn, not just background. Previously, a
+        // stale-pruned snapshot fell through to background-only.
+        let w: u32 = 1920;
+        let h: u32 = 140;
+        let pitch = (w as usize) * 4;
+        let mut buf = vec![0u8; pitch * (h as usize)];
+        let mut p = MeterPublisher::new(new_shared_meter());
+        update_levels(&full_scale_block(2, 64), 0x100, "AAC", &mut p);
+        p.local.per_pid[0].last_update = Instant::now() - Duration::from_secs(10);
+        silence_stale(&mut p, Duration::from_secs(5));
+        rasterise_overlay(&p.local, &mut buf, pitch, w, h);
+        // The label row should still carry fully-opaque text pixels
+        // somewhere in the centred block region — silence_stale kept
+        // the PID, so rasterise_overlay drew labels + slot frames.
+        let probe_y = (LABEL_TOP_PADDING_PX + 6) as usize;
+        let row_start = probe_y * pitch;
+        let row_end = row_start + (w as usize) * 4;
+        let any_fully_opaque = buf[row_start..row_end]
+            .chunks_exact(4)
+            .any(|px| px[3] == 0xFF);
+        assert!(
+            any_fully_opaque,
+            "silenced PID must still render label pixels, not background-only"
+        );
     }
 
     #[test]

@@ -1049,9 +1049,19 @@ fn extract_pcr_27mhz(pkt: &[u8; TS_PACKET]) -> Option<u64> {
 
 /// Rewrite a TS packet's continuity counter so the on-wire CC sequence
 /// stays continuous across loops and playlist transitions. Returns the
-/// CC value written, or `None` if the packet doesn't advance CC (per
-/// ISO/IEC 13818-1: only payload-bearing packets advance, and the
-/// null-PID 0x1FFF is exempt).
+/// CC value written, or `None` if the packet was skipped (null PID).
+///
+/// Per ISO/IEC 13818-1: payload-bearing packets advance CC by 1, AF-only
+/// packets (afc=10, no payload) keep CC == previous payload's CC, and
+/// the null PID 0x1FFF is fully exempt.
+///
+/// The earlier "skip AF-only packets" shortcut left the source's
+/// original CC in place on AF-only frames — but the source CC and the
+/// rewritten payload CC sequence drift apart over time. Receivers then
+/// see e.g. payload CC=3, AF-only CC=5 (from source), payload CC=4 and
+/// report "missing packets" on the video PID — visible as periodic
+/// pixelation on PID 0x0203 (Sky Witness HD). The fix below pins every
+/// AF-only packet's CC to the most-recent payload CC on the same PID.
 #[inline]
 pub(super) fn rewrite_cc(
     pkt: &mut [u8; TS_PACKET],
@@ -1067,6 +1077,14 @@ pub(super) fn rewrite_cc(
     let afc = (pkt[3] >> 4) & 0b11;
     let has_payload = afc == 0b01 || afc == 0b11;
     if !has_payload {
+        // AF-only packet: CC must equal the previous payload's CC on
+        // this PID. If we've never seen a payload on this PID yet,
+        // leave the source CC alone (cold-start fallback — the next
+        // payload-bearing packet will anchor the sequence).
+        if let Some(prev) = cont.last_cc.get(&pid).copied() {
+            pkt[3] = (pkt[3] & 0xF0) | prev;
+            return Some(prev);
+        }
         return None;
     }
     let next = match cont.last_cc.get(&pid).copied() {

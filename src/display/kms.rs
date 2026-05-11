@@ -1093,6 +1093,54 @@ impl KmsDisplay {
         })
     }
 
+    /// CPU-blit sibling of [`Self::present_prime`]. Flips the dumb-buffer
+    /// back FB onto the primary plane via atomic_commit so the bars
+    /// overlay plane gets re-armed in the same commit — without this,
+    /// a single VAAPI-fail frame that falls through to legacy
+    /// `page_flip` can implicitly detach non-primary planes on some
+    /// drivers, vanishing the bars overlay until the next prime frame
+    /// re-arms it. Falls back to legacy `present()` when atomic isn't
+    /// available (host lacks atomic, or atomic_commit hit
+    /// EOPNOTSUPP / EINVAL earlier in the session and `use_atomic`
+    /// got flipped off).
+    pub fn present_cpu_atomic(&mut self) -> Result<()> {
+        if !self.use_atomic || self.atomic.is_none() {
+            return self.present();
+        }
+        let back_idx = 1 - self.front_idx;
+        let new_fb = self.bufs[back_idx].fb;
+        let width = self.width;
+        let height = self.height;
+        match self.atomic_present(new_fb, width, height) {
+            Ok(()) => {
+                self.wait_page_flip()
+                    .context("display_page_flip_failed: receive_events")?;
+                // Same ping-pong promotion the prime path does — the
+                // bars overlay back buffer just submitted has been
+                // flipped to, so the rasteriser must land on the other
+                // half on the next iteration.
+                self.advance_bars_overlay_front();
+                self.front_idx = back_idx;
+                Ok(())
+            }
+            Err(AtomicCommitError::Unsupported(e)) => {
+                // Driver refused atomic for this commit shape. Don't
+                // permanently latch `use_atomic = false`: a subsequent
+                // prime frame may still atomic-commit successfully on
+                // some drivers. Fall back to legacy for this frame
+                // only — the bars overlay will re-arm on the next
+                // successful prime atomic commit.
+                tracing::debug!(
+                    "atomic_commit unsupported on CPU-blit flip; falling back to legacy page_flip: {e}"
+                );
+                self.present()
+            }
+            Err(AtomicCommitError::Other(e)) => Err(anyhow::anyhow!(
+                "display_page_flip_failed: atomic_commit: {e}"
+            )),
+        }
+    }
+
     /// Queue a vblank-synchronous page flip and block until the kernel
     /// posts `DRM_EVENT_FLIP_COMPLETE` for our CRTC. This is the proper
     /// per-frame primitive: the kernel atomically swaps the scanout source

@@ -3032,6 +3032,13 @@ fn blit_and_present(
         // refcount bump. The display loop never blocks the meter task
         // and never allocates on the hot path.
         let snap = snapshot.load();
+        // Bake bars into the dumb buffer as a defensive fallback —
+        // when the overlay plane is unavailable (no atomic, no
+        // suitable plane, driver detached the overlay), this is the
+        // only path the bars survive on for a CPU-blit frame. When
+        // the overlay plane IS available, the overlay buffer below
+        // composites on top (zpos > primary) so the visible result is
+        // unchanged; the dumb-buffer bars are then a hidden backstop.
         crate::display::audio_bars::rasterise(&snap, dst, pitch, dst_w, dst_h);
         crate::display::audio_bars::rasterise_header(
             &snap,
@@ -3044,7 +3051,44 @@ fn blit_and_present(
     }
 
     drop(map);
-    kms.present()?;
+
+    // Refresh the overlay-plane bars buffer so the next atomic commit
+    // (via `present_cpu_atomic` below) re-arms the plane with fresh
+    // content. Without this, a CPU-blit frame followed by legacy
+    // `page_flip` can leave the overlay plane detached on some
+    // drivers — bars + header vanish until the next VAAPI prime
+    // frame re-programs the plane via `present_prime`. The
+    // double-rasterise above (bake-into-dumb + paint-overlay) means
+    // the bars stay visible whichever plane the kernel ends up
+    // scanning out.
+    if let Some(snapshot) = meter {
+        if let (Some((dst_w_ov, dst_h_ov)), Some(mut ov_map)) =
+            (kms.bars_overlay_dims(), kms.bars_overlay_buffer())
+        {
+            let snap = snapshot.load();
+            let ov_pitch = ov_map.pitch() as usize;
+            crate::display::audio_bars::rasterise_overlay(
+                &snap,
+                ov_map.as_mut(),
+                ov_pitch,
+                dst_w_ov,
+                dst_h_ov,
+            );
+            crate::display::audio_bars::rasterise_header_overlay(
+                &snap,
+                &stream_header,
+                ov_map.as_mut(),
+                ov_pitch,
+                dst_w_ov,
+                dst_h_ov,
+            );
+        }
+    }
+
+    // Atomic commit when available — keeps the bars overlay plane
+    // programmed every frame. Falls back to legacy `page_flip`
+    // internally on hosts where atomic isn't usable.
+    kms.present_cpu_atomic()?;
     Ok(())
 }
 
