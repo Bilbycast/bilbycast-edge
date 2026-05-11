@@ -372,7 +372,34 @@ pub fn publish_input_packet_with_post(
     broadcast_tx: &tokio::sync::broadcast::Sender<super::packet::RtpPacket>,
     packet: super::packet::RtpPacket,
 ) -> bool {
+    match process_input_packet_with_post(transcoder, post, packet) {
+        Some(p) => broadcast_tx.send(p).is_ok(),
+        None => false,
+    }
+}
+
+/// Process a packet through optional transcode + post-process stages and
+/// return the resulting packet, without performing the final broadcast
+/// send. Splits [`publish_input_packet_with_post`] in two so a caller can
+/// take ownership of the egress timing — used by the media-player input
+/// to do the broadcast send from a dedicated SCHED_FIFO pacer thread
+/// where `tokio::task::block_in_place` is not available.
+///
+/// Returns `None` when the stages consumed the input without producing
+/// output (e.g. transcoder bootstrapping its PMT discovery, or the post-
+/// processor filtering this packet away). Returns `Some(pkt)` ready for
+/// broadcast.
+pub fn process_input_packet_with_post(
+    transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<super::input_post_process::InputPostProcess>,
+    packet: super::packet::RtpPacket,
+) -> Option<super::packet::RtpPacket> {
     use bytes::Bytes;
+
+    // Fast path: nothing to do, hand the packet back verbatim.
+    if transcoder.is_none() && post.is_none() {
+        return Some(packet);
+    }
 
     // Locate the TS bytes. For `is_raw_ts: true` (or SRT's `Unknown` fallback)
     // the whole payload is TS. For RTP-wrapped TS, strip the RTP header.
@@ -381,24 +408,14 @@ pub fn publish_input_packet_with_post(
     } else {
         match rtp_header_length(&packet.data) {
             Some(n) => n,
-            None => {
-                // Malformed header — publish unchanged, let the output side
-                // deal with it (or the next packet recovers).
-                return broadcast_tx.send(packet).is_ok();
-            }
+            // Malformed header — hand the packet back unchanged so the
+            // output side (or the next packet) can recover.
+            None => return Some(packet),
         }
     };
     let ts_in = &packet.data[ts_offset..];
 
-    // Run the transcoder (if present) then the post-processor (if
-    // present). When both are absent, fall back to broadcasting the
-    // packet verbatim — preserving today's zero-cost passthrough.
-    if transcoder.is_none() && post.is_none() {
-        return broadcast_tx.send(packet).is_ok();
-    }
-
     let out: Vec<u8> = tokio::task::block_in_place(|| {
-        // Stage 1: optional transcoder.
         let after_transcode_owned: Option<Vec<u8>> = transcoder.as_mut().map(|t| {
             t.process(ts_in).to_vec()
         });
@@ -409,20 +426,16 @@ pub fn publish_input_packet_with_post(
         if after_transcode.is_empty() {
             return Vec::new();
         }
-        // Stage 2: optional post-process (program_filter / pid_overrides
-        // / pid_map). Returns &[u8] borrowed from internal scratch — we
-        // copy out so the borrow ends at the closure boundary.
         match post.as_mut() {
             Some(p) => p.process(after_transcode).to_vec(),
             None => after_transcode.to_vec(),
         }
     });
     if out.is_empty() {
-        // Stage(s) buffered the input; nothing to emit this tick.
-        return false;
+        return None;
     }
 
-    let new_packet = super::packet::RtpPacket {
+    Some(super::packet::RtpPacket {
         data: Bytes::from(out),
         sequence_number: packet.sequence_number,
         rtp_timestamp: packet.rtp_timestamp,
@@ -432,8 +445,7 @@ pub fn publish_input_packet_with_post(
         is_raw_ts: true,
         upstream_seq: None,
         upstream_leg_id: None,
-    };
-    broadcast_tx.send(new_packet).is_ok()
+    })
 }
 
 #[cfg(test)]

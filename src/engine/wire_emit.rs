@@ -620,7 +620,7 @@ fn run_emitter(
 /// operator wires up ptp4l. Non-Linux falls back to a generic monotonic
 /// clock — production paths are Linux-only.
 #[cfg(target_os = "linux")]
-fn monotonic_now_ns() -> u64 {
+pub(super) fn monotonic_now_ns() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe {
         libc::clock_gettime(libc::CLOCK_TAI, &mut ts);
@@ -629,7 +629,7 @@ fn monotonic_now_ns() -> u64 {
 }
 
 #[cfg(target_os = "linux")]
-fn sleep_until_monotonic_ns(target_ns: u64) {
+pub(super) fn sleep_until_monotonic_ns(target_ns: u64) {
     let ts = libc::timespec {
         tv_sec: (target_ns / 1_000_000_000) as libc::time_t,
         tv_nsec: (target_ns % 1_000_000_000) as i64,
@@ -651,7 +651,7 @@ fn sleep_until_monotonic_ns(target_ns: u64) {
 }
 
 #[cfg(target_os = "linux")]
-fn apply_realtime_priority(id: &str) -> bool {
+pub(super) fn apply_realtime_priority(id: &str) -> bool {
     let mut sp: libc::sched_param = unsafe { std::mem::zeroed() };
     sp.sched_priority = 50;
     let rc = unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &sp) };
@@ -670,7 +670,7 @@ fn apply_realtime_priority(id: &str) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn monotonic_now_ns() -> u64 {
+pub(super) fn monotonic_now_ns() -> u64 {
     use std::time::Instant;
     static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let epoch = EPOCH.get_or_init(Instant::now);
@@ -678,7 +678,7 @@ fn monotonic_now_ns() -> u64 {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn sleep_until_monotonic_ns(target_ns: u64) {
+pub(super) fn sleep_until_monotonic_ns(target_ns: u64) {
     let now = monotonic_now_ns();
     if target_ns > now {
         std::thread::sleep(Duration::from_nanos(target_ns - now));
@@ -686,7 +686,7 @@ fn sleep_until_monotonic_ns(target_ns: u64) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn apply_realtime_priority(_id: &str) -> bool {
+pub(super) fn apply_realtime_priority(_id: &str) -> bool {
     // No realtime path on non-Linux. clock_nanosleep + SCHED_FIFO is
     // Linux-specific in this codebase.
     false

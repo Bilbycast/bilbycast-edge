@@ -37,7 +37,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, Instant};
+use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::{MediaPlayerInputConfig, MediaPlayerSource};
@@ -60,16 +60,40 @@ const SYNC_BYTE: u8 = 0x47;
 /// 204-byte DVB Reed-Solomon (16-byte parity suffix). 16 bytes covers all
 /// known broadcast variants.
 const MAX_TS_TRAILER: usize = 16;
-/// Probe window for [`detect_ts_packet_size_in_buf`]. 16 KiB is enough for
-/// `MIN_STRIDE_HITS = 5` consecutive sync bytes at the largest stride (204)
-/// with comfortable headroom for a leading non-TS prefix.
-const STRIDE_PROBE_BYTES: usize = 16 * 1024;
 /// Bundle 7 × 188 = 1316 bytes per `RtpPacket` — the standard MPEG-TS-over-RTP
 /// payload framing the rest of the engine already assumes.
 pub(super) const PACKETS_PER_BUNDLE: usize = 7;
 pub(super) const BUNDLE_SIZE: usize = TS_PACKET * PACKETS_PER_BUNDLE;
 /// Fallback when the file has no PCR and no `paced_bitrate_bps` override.
 const DEFAULT_FALLBACK_BITRATE_BPS: u64 = 4_000_000;
+
+/// Async-to-OS-thread queue depth for the TS-file pacer. Sized to absorb
+/// short scheduler stalls on the producer side without growing wire-side
+/// latency: 16 × 1316 B ≈ 21 KB ≈ 34 ms of buffer at 5 Mbps, ≈ 56 µs at
+/// 3 Gbps. Producer-side `try_send` is the failure path on overflow — the
+/// async loop yields back to tokio and retries so backpressure flows
+/// through the channel rather than dropping bundles upstream of the pacer.
+const PACER_QUEUE_CAP: usize = 16;
+
+/// Messages from the file-reading async task to the OS-thread pacer.
+///
+/// Each message carries a fully-prepared `RtpPacket` (transcoder + post-
+/// process already applied on the async side under `block_in_place`) plus
+/// the producer's latest cumulative-bitrate estimate. Embedding the rate
+/// in every bundle (rather than a separate `Bitrate` variant) sidesteps
+/// the producer's channel-full backpressure: when the queue is saturated
+/// — the steady state for a fast file reader and a 5 Mbps wire pace —
+/// an out-of-band rate update would be dropped by `try_send`, leaving
+/// the OS thread stuck on its initial rate. Carrying the rate on each
+/// bundle guarantees the OS thread sees the current estimate within
+/// one bundle period of any change.
+struct PacerMsg {
+    pkt: crate::engine::packet::RtpPacket,
+    /// Producer's current bitrate estimate (bps) for the file. The OS
+    /// thread re-anchors `iter_start_wall` whenever this differs from
+    /// its last-seen value.
+    bitrate_bps: u64,
+}
 
 /// Public entry point. Matches the signature shape of `input_test_pattern`
 /// and `input_bonded` so the flow runtime calls it through the same
@@ -548,17 +572,30 @@ async fn play_ts_file(
     // timestamp prefix per packet). 204 = DVB Reed-Solomon parity suffix
     // (broadcast captures from professional DVB tuners). Anything else
     // falls back to 188 + the existing resync loop.
-    let mut head = vec![0u8; STRIDE_PROBE_BYTES];
+    // Single 512 KB head probe used for both stride detection AND
+    // bitrate pre-scan. Sized to cover ~200 ms of source content even
+    // at 10 Mbps, which is comfortably above the worst-case 40-ms
+    // inter-PCR cadence — and on a multi-program MPTS the per-PID
+    // PCR cadence still fits because the file's first PCR sits within
+    // the first ~10 KB of any well-formed broadcast capture.
+    //
+    // Pre-scanning eliminates the per-loop slow-start that otherwise
+    // leaves the pacer below source rate for several seconds every
+    // time a media-player file restarts — the dominant source of
+    // PCR-vs-wallclock drift across loops on short files (Ten.ts loops
+    // every 63 s, so a 50-s slow-start covers most of the loop).
+    let mut head = vec![0u8; 512 * 1024];
     let head_len = file
         .read(&mut head)
         .await
         .with_context(|| format!("probe head of {}", path.display()))?;
     head.truncate(head_len);
     let stride = detect_ts_packet_size_in_buf(&head);
+    let head_bitrate = scan_head_bitrate(&head, stride);
     drop(head);
     file.seek(std::io::SeekFrom::Start(0))
         .await
-        .with_context(|| format!("rewind {} after stride probe", path.display()))?;
+        .with_context(|| format!("rewind {} after head probe", path.display()))?;
     let mut reader = BufReader::new(file);
 
     let trailer_len = stride - TS_PACKET;
@@ -567,26 +604,66 @@ async fn play_ts_file(
     let mut bundle = BytesMut::with_capacity(BUNDLE_SIZE);
     let mut packet = [0u8; TS_PACKET];
 
-    // ── Per-bundle wallclock pacer ─────────────────────────────────────
+    // ── OS-thread pacer (CLOCK_TAI + clock_nanosleep on SCHED_FIFO) ──
     //
-    // Earlier shape was per-PCR sleep: between PCR-bearing packets the
-    // loop ran at memory speed and `emit_bundle` flushed bundles onto
-    // `broadcast_tx` back-to-back, then slept until the next PCR. At
-    // 5 Mbps with PCRs every 40 ms that's ~19 bundles (~25 KB) bursting
-    // out in microseconds — the receiver saw PCR arrival jitter of tens
-    // of ms (47× over the DVB MGuard 5 ms limit), and pro decoders fired
-    // "input jitter" alarms.
+    // History: a per-bundle `tokio::time::sleep_until(target)` (~1.07 ms
+    // bundle period at 5 Mbps) was unreliable below ~1 ms — slip of 100s
+    // of µs per sleep accumulated through PCR re-anchors to -19 000 ppm
+    // drift over 4 min on Sky Witness 1080i25 (2026-05-11). A previous
+    // "skip short sleeps and burst" attempt overflowed wire_emit's UDP-
+    // side mpsc with 5-8 % drops and 1 s of latency.
     //
-    // New shape: pace every bundle by a running bitrate estimate
-    // anchored on the most recent PCR. Bitrate is updated by EMA from
-    // the (bytes emitted, PCR delta) pairs of consecutive PCRs, so the
-    // estimate converges to the source's actual rate within a few PCRs.
-    // Re-anchoring on every PCR bounds wallclock drift to one
-    // inter-PCR period (~30–40 ms) regardless of estimate accuracy.
-    let mut bitrate_bps: u64 = paced_bitrate_bps.unwrap_or(DEFAULT_FALLBACK_BITRATE_BPS);
-    let mut paced_anchor_wall: Option<Instant> = None;
-    let mut paced_anchor_bytes: u64 = 0;
-    let mut last_pcr_for_bitrate: Option<(u64, u64)> = None;
+    // The fix mirrors `engine::wire_emit`: a dedicated SCHED_FIFO std
+    // thread sleeps on absolute CLOCK_TAI deadlines via
+    // `clock_nanosleep(TIMER_ABSTIME)`. Absolute targets mean per-sleep
+    // slip does not accumulate — each bundle fires within ~50 µs of its
+    // computed deadline regardless of the previous bundle's actual fire
+    // time. Pacing math lives on the thread (single `iter_start` anchor
+    // for the file; bitrate refined from cumulative inter-PCR observations
+    // sent across a control channel), so the async producer never re-
+    // anchors against its own scheduler latency.
+    // Priority: operator-configured override > pre-scan head observation
+    // > default fallback. The pre-scan covers same-file loops at the
+    // correct rate from the first bundle; the operator override survives
+    // first as an escape hatch for known files.
+    let pacer_initial_bitrate = paced_bitrate_bps
+        .or(head_bitrate)
+        .unwrap_or(DEFAULT_FALLBACK_BITRATE_BPS);
+    let (pacer_tx, pacer_rx) =
+        std::sync::mpsc::sync_channel::<PacerMsg>(PACER_QUEUE_CAP);
+    let broadcast_for_pacer = session.per_input_tx.clone();
+    let cancel_for_pacer = session.cancel.clone();
+    let pacer_thread_name = format!(
+        "media-pacer-{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+    );
+    let pacer_thread = std::thread::Builder::new()
+        .name(pacer_thread_name.clone())
+        .spawn(move || {
+            run_paced_emitter(
+                pacer_thread_name,
+                pacer_rx,
+                broadcast_for_pacer,
+                pacer_initial_bitrate,
+                cancel_for_pacer,
+            );
+        })
+        .with_context(|| "spawn media-player pacer thread")?;
+
+    // Cumulative-rate observation. The async producer keeps a single
+    // (first_pcr, first_byte_pos) anchor for the whole file; each
+    // subsequent PCR provides a cumulative `bytes_delta / pcr_delta`
+    // rate. After ~1 s of observed PCR-content the cumulative measurement
+    // is precise to a few hundred ppm; after ~10 s it is single-digit
+    // ppm. The current estimate is carried on every `PacerMsg` so the
+    // OS thread tracks the producer's view of the file rate within one
+    // bundle period of any change, even when the channel is full (the
+    // steady state for a fast disk + a wire-paced output).
+    let mut first_pcr_27mhz: Option<u64> = None;
+    let mut first_pcr_byte_pos: u64 = 0;
+    let mut current_bitrate_bps: u64 = pacer_initial_bitrate;
     let mut bytes_emitted: u64 = 0;
     // Optional MPTS → SPTS down-select. Pre-allocated 188-byte scratch so
     // the per-packet path stays allocation-free (the filter writes 0 or
@@ -702,32 +779,46 @@ async fn play_ts_file(
         }
 
         if let Some(pcr) = raw_pcr {
-            // Update the running bitrate estimate from the window since
-            // the previous PCR. Filter out implausible inter-PCR gaps —
-            // PCR resets, file wraps, and seek-induced gaps would
-            // otherwise produce nonsense bitrates that take many windows
-            // to wash out of the EMA.
+            // Cumulative-rate bitrate estimation. Granularity = one TS
+            // packet (188 B) over the elapsed PCR window — so after ~10 s
+            // of observed material this is precise to a few ppm,
+            // strictly better than the per-inter-PCR EMA the prior shape
+            // used (which floors at ~0.4 % noise from the 188 B / 50 kB
+            // sample granularity). Discontinuities reset the anchor so a
+            // seek, file wrap, or PCR reset doesn't poison the rate.
             let pcr_byte_pos = bytes_emitted + bundle.len() as u64;
-            if let Some((prev_pcr, prev_bytes)) = last_pcr_for_bitrate {
-                let pcr_delta = pcr.wrapping_sub(prev_pcr);
-                let pcr_us = pcr_delta / 27;
-                if (1_000..=2_000_000).contains(&pcr_us) {
-                    let bytes_delta = pcr_byte_pos.saturating_sub(prev_bytes);
-                    if bytes_delta > 0 {
-                        let observed_bps = bytes_delta
-                            .saturating_mul(8 * 1_000_000)
-                            / pcr_us;
-                        // EMA: 1/4 toward observed → ~10 PCRs to 95 %.
-                        bitrate_bps = (observed_bps + 3 * bitrate_bps) / 4;
+            match first_pcr_27mhz {
+                None => {
+                    first_pcr_27mhz = Some(pcr);
+                    first_pcr_byte_pos = pcr_byte_pos;
+                }
+                Some(first_pcr) => {
+                    let pcr_delta = pcr.wrapping_sub(first_pcr);
+                    let bytes_delta = pcr_byte_pos.saturating_sub(first_pcr_byte_pos);
+                    // Reset on discontinuity (> 60 s of PCR-time would
+                    // mean a wrap or file change; < 1 s isn't enough to
+                    // beat the granularity floor — keep accumulating).
+                    if pcr_delta > 27_000_000 * 60 || bytes_delta == 0 {
+                        first_pcr_27mhz = Some(pcr);
+                        first_pcr_byte_pos = pcr_byte_pos;
+                    } else if pcr_delta >= 27_000_000 {
+                        let pcr_us = pcr_delta / 27;
+                        let observed_bps =
+                            bytes_delta.saturating_mul(8 * 1_000_000) / pcr_us;
+                        // Sanity-bound: refuse values below 100 kbps or
+                        // above 10 Gbps. Outside that the file is either
+                        // corrupt or we've miscounted bytes. Otherwise
+                        // adopt the new estimate — the per-bundle ride-
+                        // along to the OS thread carries it across,
+                        // converging the wire pace on the actual file
+                        // rate without needing a separate signalling
+                        // channel.
+                        if (100_000..=10_000_000_000).contains(&observed_bps) {
+                            current_bitrate_bps = observed_bps;
+                        }
                     }
                 }
             }
-            last_pcr_for_bitrate = Some((pcr, pcr_byte_pos));
-            // Re-anchor every PCR — bounds residual drift between our
-            // bitrate-paced wallclock and the source's PCR-paced clock
-            // to one inter-PCR period.
-            paced_anchor_wall = Some(Instant::now());
-            paced_anchor_bytes = pcr_byte_pos;
         }
 
         // ── PAT/PMT inspection (audio-PID discovery for splice anchor) ─
@@ -779,47 +870,24 @@ async fn play_ts_file(
 
         bundle.extend_from_slice(&packet);
         if bundle.len() >= BUNDLE_SIZE {
-            // Per-bundle wallclock sleep. Anchor lazily on first emit so
-            // the (rare) no-PCR-ever-seen path still paces — at the
-            // operator-supplied `paced_bitrate_bps` or default fallback.
-            // Lazy-init advances `paced_anchor_bytes` by `BUNDLE_SIZE`
-            // so the first bundle emits at the anchor (not delayed).
-            let anchor = match paced_anchor_wall {
-                Some(a) => a,
-                None => {
-                    let now = Instant::now();
-                    paced_anchor_wall = Some(now);
-                    paced_anchor_bytes = bytes_emitted + BUNDLE_SIZE as u64;
-                    now
-                }
-            };
-            // Increment FIRST so `bytes_since_anchor` reflects the byte
-            // position at the END of this bundle — matches the wall
-            // moment we want to be on the wire. Using `bytes_emitted`
-            // pre-increment causes a one-bundle-period burst right
-            // after every PCR re-anchor (anchor sits at PCR's mid-bundle
-            // byte position, pre-increment under-counts by `BUNDLE_SIZE`,
-            // saturating_sub clamps the gap to zero, target lands at
-            // `now`, the next bundle then emits ~600 µs later instead of
-            // ~2.1 ms — receiver sees per-PCR mini-bursts).
             bytes_emitted = bytes_emitted.saturating_add(BUNDLE_SIZE as u64);
-            let bytes_since_anchor = bytes_emitted.saturating_sub(paced_anchor_bytes);
-            let target_us = bytes_since_anchor
-                .saturating_mul(8 * 1_000_000)
-                / bitrate_bps.max(1);
-            let target = anchor + Duration::from_micros(target_us);
-            tokio::select! {
-                _ = session.cancel.cancelled() => break,
-                _ = tokio::time::sleep_until(target) => {}
+            if !emit_to_pacer(&mut bundle, session, &pacer_tx, current_bitrate_bps).await {
+                break;
             }
-            emit_bundle(&mut bundle, session, fake_rtp_ts(session));
         }
     }
 
     // Flush the trailing partial bundle so we don't lose the file's tail.
     if !bundle.is_empty() {
-        emit_bundle(&mut bundle, session, fake_rtp_ts(session));
+        let _ = emit_to_pacer(&mut bundle, session, &pacer_tx, current_bitrate_bps).await;
     }
+
+    // Tear down the OS-thread pacer: dropping the sender lets the thread's
+    // `recv_timeout` poll see `Disconnected` on its next iteration (within
+    // 50 ms). Join from a blocking-friendly context so this thread isn't
+    // pinned on a tokio worker while the pacer drains its remaining queue.
+    drop(pacer_tx);
+    let _ = tokio::task::spawn_blocking(move || pacer_thread.join()).await;
 
     // Hand off the splice anchor to `SpliceContinuity`. Prefer the
     // audio high-water mark — see `close_file` doc. Fall back to the
@@ -1004,6 +1072,67 @@ async fn resync_to_sync_byte<R: AsyncReadExt + Unpin>(
     Err(anyhow!(
         "TS file has no sync byte in 1 MiB of slop — file is not MPEG-TS or is severely corrupt"
     ))
+}
+
+/// Scan a file-head buffer for the first two PCR-bearing packets on the
+/// same PID and compute the file's source bitrate from `(bytes_between)
+/// × 8 / pcr_delta`. Returns `None` when the head doesn't carry two
+/// PCRs (e.g. extremely low-bitrate streams, or a buffer too small to
+/// reach the second PCR). Skips PCR pairs whose delta is implausible
+/// (< 1 ms or > 2 s — guards against multi-program PCRs interleaving
+/// or a malformed file).
+///
+/// Used to seed the OS-thread pacer's initial bitrate, eliminating the
+/// per-loop slow-start transient that would otherwise leave each file
+/// restart pacing below source rate for several seconds.
+fn scan_head_bitrate(buf: &[u8], stride: usize) -> Option<u64> {
+    if stride < TS_PACKET || buf.len() < stride {
+        return None;
+    }
+    let mut first: Option<(u16, u64, usize)> = None; // (pid, pcr_27mhz, byte_pos)
+    let mut pos = 0usize;
+    while pos + TS_PACKET <= buf.len() {
+        if buf[pos] != SYNC_BYTE {
+            // Try resyncing on the next byte; misaligned files are
+            // already handled by the main loop's `resync_to_sync_byte`,
+            // but for a head scan we just walk forward.
+            pos += 1;
+            continue;
+        }
+        let mut pkt = [0u8; TS_PACKET];
+        pkt.copy_from_slice(&buf[pos..pos + TS_PACKET]);
+        if let Some(pcr) = extract_pcr_27mhz(&pkt) {
+            let pid = ((pkt[1] as u16 & 0x1F) << 8) | pkt[2] as u16;
+            match first {
+                None => first = Some((pid, pcr, pos)),
+                Some((first_pid, first_pcr, first_pos)) if first_pid == pid => {
+                    let pcr_delta = pcr.wrapping_sub(first_pcr);
+                    let pcr_us = pcr_delta / 27;
+                    // Sanity bounds: inter-PCR between 1 ms and 2 s
+                    // covers every realistic broadcast cadence.
+                    if (1_000..=2_000_000).contains(&pcr_us) {
+                        let bytes_delta = (pos.saturating_sub(first_pos)) as u64;
+                        if bytes_delta > 0 {
+                            let observed_bps =
+                                bytes_delta.saturating_mul(8 * 1_000_000) / pcr_us;
+                            if (100_000..=10_000_000_000).contains(&observed_bps) {
+                                return Some(observed_bps);
+                            }
+                        }
+                    }
+                    // Implausible pair — restart anchor on this PCR.
+                    first = Some((pid, pcr, pos));
+                }
+                _ => {
+                    // Different PID — keep the original anchor (the
+                    // first PID's cadence is what `play_ts_file` will
+                    // ultimately pace from after the program filter).
+                }
+            }
+        }
+        pos += stride;
+    }
+    None
 }
 
 /// Parse the 27 MHz PCR out of the adaptation field, if this packet
@@ -1351,6 +1480,176 @@ pub(super) fn emit_bundle(
 fn fake_rtp_ts(_session: &PlayerSession<'_>) -> u32 {
     let now_us = crate::util::time::now_us();
     ((now_us / 1_000) * 90).rem_euclid(0x1_0000_0000) as u32
+}
+
+/// Drain `bundle` into an `RtpPacket`, run the optional input transcoder
+/// + post-processor under `block_in_place`, and push the result to the
+/// OS-thread pacer for absolute-deadline emission. Returns `true` on
+/// success and `false` if the OS thread has shut down (channel
+/// disconnected) — the async loop should bail when that happens.
+///
+/// Channel backpressure is exposed via `try_send`: when the pacer
+/// queue is full the producer yields back to tokio (so the worker can
+/// run other tasks) and retries. Producer-side blocking is forbidden by
+/// the data-path performance rules — no `block_in_place` around a
+/// `send()` that could stall a worker for tens of ms when a slow
+/// downstream broadcast subscriber back-pressures the OS thread.
+async fn emit_to_pacer(
+    bundle: &mut BytesMut,
+    session: &mut PlayerSession<'_>,
+    pacer_tx: &std::sync::mpsc::SyncSender<PacerMsg>,
+    bitrate_bps: u64,
+) -> bool {
+    if bundle.is_empty() {
+        return true;
+    }
+    let total_len = bundle.len();
+    let data: Bytes = std::mem::replace(bundle, BytesMut::with_capacity(BUNDLE_SIZE)).freeze();
+    // `recv_time_us` is filled in by the OS-thread pacer right before
+    // the broadcast send so the downstream `output_latency` metric
+    // measures only wire_emit's queue + pacer time, not the extra
+    // queueing introduced by the OS-thread channel. Matches the
+    // semantics of the previous in-task `emit_bundle` path.
+    let pkt = RtpPacket {
+        data,
+        sequence_number: *session.seq_num,
+        rtp_timestamp: fake_rtp_ts(session),
+        recv_time_us: 0,
+        is_raw_ts: true,
+        upstream_seq: None,
+        upstream_leg_id: None,
+    };
+    *session.seq_num = session.seq_num.wrapping_add(1);
+    session.stats.input_packets.fetch_add(1, Ordering::Relaxed);
+    session.stats.input_bytes.fetch_add(total_len as u64, Ordering::Relaxed);
+
+    // Run the optional transcoder + post-processor on the async side
+    // (they need a tokio runtime for `block_in_place`). `None` means
+    // the stage buffered without producing output — silently skip.
+    let processed = match crate::engine::input_transcode::process_input_packet_with_post(
+        session.transcoder,
+        session.post,
+        pkt,
+    ) {
+        Some(p) => p,
+        None => return true,
+    };
+
+    // Hand off to the OS-thread pacer. On `Full`, yield and retry — the
+    // pacer drains at file-bitrate (~2.1 ms per bundle at 5 Mbps), so
+    // the producer typically blocks for at most one bundle period.
+    let mut to_send = PacerMsg {
+        pkt: processed,
+        bitrate_bps,
+    };
+    loop {
+        if session.cancel.is_cancelled() {
+            return false;
+        }
+        match pacer_tx.try_send(to_send) {
+            Ok(()) => return true,
+            Err(std::sync::mpsc::TrySendError::Full(msg)) => {
+                to_send = msg;
+                tokio::task::yield_now().await;
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return false,
+        }
+    }
+}
+
+/// OS-thread pacer body. Sleeps on absolute CLOCK_TAI deadlines via
+/// `clock_nanosleep(TIMER_ABSTIME)` and emits each bundle onto
+/// `broadcast_tx`. Single anchor for the file's lifetime — drift is
+/// determined by `bitrate_bps` accuracy, not by per-sleep slip, because
+/// each target is computed independently from `iter_start_wall +
+/// bytes_emitted * 8 / bitrate_bps`. Bitrate updates re-anchor
+/// `iter_start_wall` against the current wallclock so the next bundle's
+/// target lands sensibly close to "now" rather than bursting forward or
+/// backward.
+fn run_paced_emitter(
+    thread_name: String,
+    rx: std::sync::mpsc::Receiver<PacerMsg>,
+    broadcast_tx: tokio::sync::broadcast::Sender<RtpPacket>,
+    initial_bitrate_bps: u64,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    let sched_fifo = crate::engine::wire_emit::apply_realtime_priority(&thread_name);
+    let mut bitrate_bps: u64 = initial_bitrate_bps.max(1);
+    let mut bytes_emitted: u64 = 0;
+    // Incremental target tracking — each bundle's target is the previous
+    // target plus `bundle_size * 8 / bitrate_bps`. No global `iter_start`
+    // anchor; bitrate changes affect *future* inter-bundle spacing
+    // without retroactively shifting the entire schedule. That avoids
+    // two failure modes a global-anchor design suffers from:
+    //   - re-anchoring on every PCR-noise step propagates `clock_gettime`
+    //     slip into each anchor → sustained -1700 ppm drift on SCHED_OTHER
+    //     (the user's 2026-05-11 testbed)
+    //   - re-anchoring only on > 5 % changes leaves smaller (1-4 %)
+    //     refinements to shift targets retroactively, producing a
+    //     mini-burst on every refinement as queued bundles' targets
+    //     land slightly in the past
+    let initial_now = crate::engine::wire_emit::monotonic_now_ns();
+    // Preroll 50 ms so the first bundle has a brief warm-up before
+    // emission — matches `wire_emit::PREROLL_NS`. Mostly cosmetic for
+    // a media-player flow but keeps the first-bundle wallclock in the
+    // future at startup so `clock_nanosleep` waits properly.
+    let mut next_target_wall: u64 = initial_now.saturating_add(50_000_000);
+    tracing::info!(
+        "media-pacer '{}': starting (bitrate_initial={} bps, sched_fifo={})",
+        thread_name,
+        bitrate_bps,
+        sched_fifo
+    );
+
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let msg = match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(m) => m,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        // Bitrate refinement piggybacks on every bundle so the OS thread
+        // tracks the producer's view of the file rate even when the
+        // bundle channel is steady-state full. Updates affect FUTURE
+        // inter-bundle spacing only; the next target is the previous
+        // target plus the new bundle period. No retroactive shift of
+        // queued targets, so a rate refinement never produces a burst.
+        if msg.bitrate_bps != 0 {
+            bitrate_bps = msg.bitrate_bps;
+        }
+        bytes_emitted = bytes_emitted.saturating_add(BUNDLE_SIZE as u64);
+        let bundle_period_ns =
+            (BUNDLE_SIZE as u64).saturating_mul(8_000_000_000) / bitrate_bps.max(1);
+        let target_ns = next_target_wall;
+        // Advance the running target for the next bundle. If the actual
+        // fire wallclock catches up to (or passes) `next_target_wall`
+        // — e.g. the channel has been silent for a while and the OS
+        // thread had nothing to send — anchor forward from "now" so the
+        // pacer doesn't burst through a backlog of past targets when a
+        // bundle eventually lands.
+        let now_check = crate::engine::wire_emit::monotonic_now_ns();
+        let advance_from = target_ns.max(now_check);
+        next_target_wall = advance_from.saturating_add(bundle_period_ns);
+        crate::engine::wire_emit::sleep_until_monotonic_ns(target_ns);
+        // `broadcast.send` is non-blocking — slow subscribers count
+        // against their own `packets_dropped`, never the producer.
+        // Failure means no subscribers; not fatal, continue draining
+        // the queue so backpressure stays released for the async
+        // producer.
+        //
+        // Stamp `recv_time_us` here (not in the async producer) so the
+        // downstream `output_latency_us` metric measures the wire_emit-
+        // side wait only — i.e. the same thing it measured before the
+        // OS-thread pacer landed. Without this, the OS-thread queue
+        // depth shows up as a ~20 ms latency increase even though
+        // wire-side timing is unchanged.
+        let mut out_pkt = msg.pkt;
+        out_pkt.recv_time_us = crate::util::time::now_us();
+        let _ = broadcast_tx.send(out_pkt);
+    }
+    tracing::info!("media-pacer '{}': exited", thread_name);
 }
 
 // ── Order-shuffle helper ────────────────────────────────────────────────
