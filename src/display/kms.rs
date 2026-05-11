@@ -303,11 +303,34 @@ struct ConnectorPropIds {
 struct BarsOverlay {
     plane: plane::Handle,
     plane_props: PlanePropIds,
-    /// ARGB8888 dumb buffer the display task rasterises bars into. The
-    /// audio-meter snapshot writes propagate to the panel at the next
-    /// atomic commit (so meter cadence ≤ video cadence; the bars never
-    /// pace the present loop).
-    dumb: DumbBuffer,
+    /// Ping-pong pair of ARGB8888 dumb buffers. The rasteriser always
+    /// writes to the **back** buffer (`dumbs[1 ^ front_idx]`); the next
+    /// atomic commit references it, and once the kernel posts
+    /// `DRM_EVENT_FLIP_COMPLETE` the caller advances `front_idx` so the
+    /// just-flipped buffer becomes "front" (currently scanning out) and
+    /// the previous front is safe to overwrite. Two reasons we ping-pong
+    /// instead of reusing a single buffer:
+    ///   1. **Write/scanout race.** A single buffer is being read by the
+    ///      scanout engine *while* the CPU rasterises the next frame.
+    ///      The kernel can read torn / partially-written content; on
+    ///      Intel i915 (Arrow Lake) this surfaces as the strip
+    ///      vanishing entirely most frames, with the bars + header
+    ///      "popping up" only when the CPU happens to finish writing
+    ///      between scanouts.
+    ///   2. **FB-id diff fast paths.** Some KMS plane-state diff paths
+    ///      treat back-to-back commits with an identical FB id as
+    ///      no-ops on the FB content. A fresh FB id every commit
+    ///      forces the kernel to re-fetch.
+    /// The pair mirrors the primary plane's existing
+    /// `KmsDisplay::bufs: [DumbBuffer; 2]` ping-pong (`front_idx`
+    /// advance after `wait_page_flip`).
+    dumbs: [DumbBuffer; 2],
+    /// Which `dumbs[]` entry is currently being scanned out. Toggles
+    /// (`^= 1`) after every successful atomic commit + flip-complete.
+    /// `bars_overlay_buffer()` returns the OTHER index for the next
+    /// rasterise. Reset to `0` whenever both buffers are reallocated
+    /// (panel mode change in `resync_bars_overlay_to_panel`).
+    front_idx: usize,
     /// Strip width / height in pixels. Width = panel width; height
     /// matches `audio_bars::compute_strip_height(panel_h)`.
     width: u32,
@@ -702,12 +725,12 @@ impl KmsDisplay {
         let (zpos, zpos_value, pixel_blend_mode, pixel_blend_coverage_value) =
             discover_bars_overlay_blend_props(&self.card, plane_h, primary_plane)
                 .context("bars-overlay zpos/blend property discovery")?;
-        let dumb = alloc_argb_dumb_buffer(&self.card, self.width, strip_h)
-            .context("bars-overlay ARGB8888 dumb buffer")?;
+        let dumbs = alloc_bars_dumb_pair(&self.card, self.width, strip_h)?;
         self.bars_overlay = Some(BarsOverlay {
             plane: plane_h,
             plane_props,
-            dumb,
+            dumbs,
+            front_idx: 0,
             width: self.width,
             height: strip_h,
             committed: false,
@@ -735,7 +758,7 @@ impl KmsDisplay {
         if bars.committed {
             // Detach the plane from our CRTC: a tiny atomic commit
             // with FB_ID = 0 + CRTC_ID = 0. Failure is non-fatal —
-            // destroying the FB drops the kernel-side reference.
+            // destroying the FBs drops the kernel-side reference.
             let mut req = AtomicModeReq::new();
             req.add_property(bars.plane, bars.plane_props.fb_id, property::Value::Framebuffer(None));
             req.add_property(bars.plane, bars.plane_props.crtc_id, property::Value::CRTC(None));
@@ -743,10 +766,13 @@ impl KmsDisplay {
                 .card
                 .atomic_commit(AtomicCommitFlags::empty(), req);
         }
-        let DumbBuffer { mapping, fb, handle } = bars.dumb;
-        drop(mapping);
-        let _ = self.card.destroy_framebuffer(fb);
-        let _ = self.card.destroy_dumb_buffer(handle);
+        let [d0, d1] = bars.dumbs;
+        for d in [d0, d1] {
+            let DumbBuffer { mapping, fb, handle } = d;
+            drop(mapping);
+            let _ = self.card.destroy_framebuffer(fb);
+            let _ = self.card.destroy_dumb_buffer(handle);
+        }
     }
 
     /// Reallocate the bars-overlay dumb buffer to match the panel's
@@ -779,23 +805,33 @@ impl KmsDisplay {
                 return Ok(());
             }
         };
-        let bars = self.bars_overlay.as_mut().expect("just checked Some");
-        if bars.width == self.width && bars.height == new_strip_h {
-            return Ok(());
+        {
+            let bars = self.bars_overlay.as_ref().expect("just checked Some");
+            if bars.width == self.width && bars.height == new_strip_h {
+                return Ok(());
+            }
         }
-        let new_dumb = alloc_argb_dumb_buffer(&self.card, self.width, new_strip_h)
+        let new_dumbs = alloc_bars_dumb_pair(&self.card, self.width, new_strip_h)
             .context("bars-overlay re-allocation after panel mode change")?;
-        let old_dumb = std::mem::replace(&mut bars.dumb, new_dumb);
-        let DumbBuffer { mapping, fb, handle } = old_dumb;
-        drop(mapping);
-        let _ = self.card.destroy_framebuffer(fb);
-        let _ = self.card.destroy_dumb_buffer(handle);
+        let bars = self.bars_overlay.as_mut().expect("just checked Some");
+        let old_dumbs = std::mem::replace(&mut bars.dumbs, new_dumbs);
         bars.width = self.width;
         bars.height = new_strip_h;
+        bars.front_idx = 0;
         // Force the next atomic commit to re-program every plane
         // property — the kernel's last-seen FB ID + SRC/CRTC rects
-        // referenced the destroyed dumb buffer.
+        // referenced the destroyed dumb buffers.
         bars.committed = false;
+        // End the `bars` borrow before touching `self.card` for the
+        // destroy syscalls.
+        let _ = bars;
+        let [old0, old1] = old_dumbs;
+        for d in [old0, old1] {
+            let DumbBuffer { mapping, fb, handle } = d;
+            drop(mapping);
+            let _ = self.card.destroy_framebuffer(fb);
+            let _ = self.card.destroy_dumb_buffer(handle);
+        }
         Ok(())
     }
 
@@ -804,15 +840,35 @@ impl KmsDisplay {
     /// ARGB8888 pixels via [`super::audio_bars::rasterise_overlay`];
     /// the next `present_prime` call composes the buffer onto the
     /// strip via atomic commit.
+    ///
+    /// Returns the **back** half of the ping-pong pair — the buffer
+    /// the kernel is *not* currently scanning out — so the rasteriser
+    /// never races the scanout engine. After `present_prime`'s atomic
+    /// commit lands and the flip-complete event fires,
+    /// `advance_bars_overlay_front` swaps front/back so the next call
+    /// here hands back the freshly-freed buffer.
     pub fn bars_overlay_buffer(&mut self) -> Option<DumbBufferMap<'_>> {
         let bars = self.bars_overlay.as_mut()?;
-        let pitch = bars.dumb.handle.pitch();
+        let back = bars.front_idx ^ 1;
+        let pitch = bars.dumbs[back].handle.pitch();
         Some(DumbBufferMap {
-            slice: bars.dumb.mapping.as_mut(),
+            slice: bars.dumbs[back].mapping.as_mut(),
             pitch,
             width: bars.width,
             height: bars.height,
         })
+    }
+
+    /// Advance the bars-overlay ping-pong: the back buffer that the
+    /// last atomic commit referenced has now been flipped to and is
+    /// the new "front" (currently scanning out); the buffer that *was*
+    /// front is safe to overwrite. Called from `present_prime` after
+    /// `wait_page_flip` confirms the flip event arrived. No-op when
+    /// the overlay isn't enabled.
+    fn advance_bars_overlay_front(&mut self) {
+        if let Some(bars) = self.bars_overlay.as_mut() {
+            bars.front_idx ^= 1;
+        }
     }
 
     /// `(width_px, strip_height_px)` of the audio-bars overlay buffer,
@@ -1712,6 +1768,27 @@ fn read_enum_value(
 /// which on most drivers means the strip would composite as fully
 /// opaque black instead of the 50 %-translucent dim the rasteriser
 /// writes.
+/// Allocate the two ARGB8888 dumb buffers backing the audio-bars overlay
+/// ping-pong. On second-alloc failure, tears down the first allocation
+/// before returning the error so the kernel doesn't leak the GEM /
+/// framebuffer until the DRM fd closes. Used by `enable_bars_overlay`
+/// at startup and `resync_bars_overlay_to_panel` after a panel mode
+/// change.
+fn alloc_bars_dumb_pair(card: &CardFile, w: u32, h: u32) -> Result<[DumbBuffer; 2]> {
+    let b0 = alloc_argb_dumb_buffer(card, w, h)
+        .context("bars-overlay ARGB8888 dumb buffer (front)")?;
+    match alloc_argb_dumb_buffer(card, w, h) {
+        Ok(b1) => Ok([b0, b1]),
+        Err(e) => {
+            let DumbBuffer { mapping, fb, handle } = b0;
+            drop(mapping);
+            let _ = card.destroy_framebuffer(fb);
+            let _ = card.destroy_dumb_buffer(handle);
+            Err(e.context("bars-overlay ARGB8888 dumb buffer (back)"))
+        }
+    }
+}
+
 fn alloc_argb_dumb_buffer(card: &CardFile, w: u32, h: u32) -> Result<DumbBuffer> {
     let mut handle = card
         .create_dumb_buffer((w, h), DrmFourcc::Argb8888, 32)
@@ -2045,6 +2122,11 @@ impl KmsDisplay {
                         let _ = self.card.destroy_framebuffer(new_fb);
                         return Err(e.context("display_prime_page_flip_failed: receive_events"));
                     }
+                    // The bars-overlay back buffer just submitted has
+                    // been flipped to — promote it to the new front so
+                    // the next rasterise lands on the OTHER half of the
+                    // pair (no scanout-vs-write race).
+                    self.advance_bars_overlay_front();
                 }
                 Err(AtomicCommitError::Unsupported(e)) => {
                     self.use_atomic = false;
@@ -2192,10 +2274,15 @@ impl KmsDisplay {
         // pixels down the panel.
         if let Some(bars) = self.bars_overlay.as_mut() {
             let bp = &bars.plane_props;
+            // Reference the BACK buffer — the one the rasteriser just
+            // wrote into and that the kernel hasn't been scanning out.
+            // `advance_bars_overlay_front` will promote it to front
+            // after the flip event arrives.
+            let back = bars.front_idx ^ 1;
             req.add_property(
                 bars.plane,
                 bp.fb_id,
-                property::Value::Framebuffer(Some(bars.dumb.fb)),
+                property::Value::Framebuffer(Some(bars.dumbs[back].fb)),
             );
             req.add_property(bars.plane, bp.crtc_id, property::Value::CRTC(Some(self.crtc)));
             req.add_property(bars.plane, bp.src_x, property::Value::UnsignedRange(0));
