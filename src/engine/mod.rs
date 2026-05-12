@@ -176,6 +176,12 @@ pub mod audio_transcode;
 /// HE-AAC and multichannel AAC are rejected with a clear error.
 pub mod audio_decode;
 
+/// Lock-free counters for the video-decode stage. Shared between
+/// [`ts_video_replace::TsVideoReplacer`] (paired with `VideoEncodeStats` for
+/// a true transcode) and [`output_display`] (decode-only). Surfaced on
+/// [`crate::stats::models::VideoDecodeStatsSnapshot`].
+pub mod video_decode_stats;
+
 /// ffmpeg-sidecar audio encoder. Wraps a long-running ffmpeg subprocess as a
 /// PCM → compressed-audio encoder for the RTMP, HLS, and WebRTC outputs.
 /// Pure Rust binary — ffmpeg is invoked at runtime via subprocess, never

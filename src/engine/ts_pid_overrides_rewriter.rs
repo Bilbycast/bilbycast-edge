@@ -56,7 +56,7 @@
 //! - PAT version bumps re-build the cached rewritten PAT so a
 //!   `program_map_PID` change in the source is picked up.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use bytes::Bytes;
 
@@ -79,7 +79,12 @@ struct ProgramState {
     /// Discovered source video PID (from first video stream entry in PMT).
     source_video_pid: Option<u16>,
     /// Discovered source audio PID (from first audio stream entry in PMT).
+    /// Retained for the back-compat `audio_pid` singular override path.
     source_audio_pid: Option<u16>,
+    /// Resolved per-source-PID audio remap for this program, built from
+    /// the `audio_pids` map (and seeded with `audio_pid` against the first
+    /// audio PID for back-compat). Keyed by source audio PID → target PID.
+    audio_remap: BTreeMap<u16, u16>,
     /// Discovered source PCR PID (from PMT header).
     source_pcr_pid: Option<u16>,
     /// Last PMT `version_number` we observed; skips dup parses.
@@ -105,6 +110,10 @@ pub struct TsPidOverridesRewriter {
 }
 
 const NO_REMAP: u16 = 0xFFFF;
+
+/// Empty audio remap sentinel — used by `rewrite_pmt` when per-program
+/// state hasn't been discovered yet so the &-borrow has a stable target.
+static EMPTY_AUDIO_REMAP: BTreeMap<u16, u16> = BTreeMap::new();
 
 impl TsPidOverridesRewriter {
     /// Build a passthrough rewriter from the operator's per-program
@@ -225,6 +234,7 @@ impl TsPidOverridesRewriter {
                     source_pmt_pid,
                     source_video_pid: None,
                     source_audio_pid: None,
+                    audio_remap: BTreeMap::new(),
                     source_pcr_pid: None,
                     last_pmt_version: None,
                 }
@@ -256,6 +266,7 @@ impl TsPidOverridesRewriter {
                 source_pmt_pid: 0,
                 source_video_pid: None,
                 source_audio_pid: None,
+                audio_remap: BTreeMap::new(),
                 source_pcr_pid: None,
                 last_pmt_version: None,
             }
@@ -265,29 +276,51 @@ impl TsPidOverridesRewriter {
         }
         state.last_pmt_version = version;
         state.source_pcr_pid = Some(source_pcr_pid);
-        // First-of-each-role wins (mirrors the existing replacer's
-        // single-program assumption — N video / N audio per program is
-        // unusual in broadcast contribution).
+        // First-of-each-role wins for the singular video / audio_pid
+        // overrides. Multi-audio programs walk the full audio list below.
         let mut first_video: Option<u16> = None;
         let mut first_audio: Option<u16> = None;
+        let mut all_audio_pids: Vec<u16> = Vec::new();
         for (es_pid, stream_type) in streams.iter() {
             if first_video.is_none() && is_video_stream_type(*stream_type) {
                 first_video = Some(*es_pid);
             }
-            if first_audio.is_none() && is_audio_stream_type(*stream_type) {
-                first_audio = Some(*es_pid);
+            if is_audio_stream_type(*stream_type) {
+                if first_audio.is_none() {
+                    first_audio = Some(*es_pid);
+                }
+                all_audio_pids.push(*es_pid);
             }
         }
         state.source_video_pid = first_video;
         state.source_audio_pid = first_audio;
+
+        // Build the resolved audio remap from `audio_pids` (per-source
+        // PID) and the singular `audio_pid` (first-audio back-compat).
+        // Per-source entries win on conflict.
+        let mut audio_remap: BTreeMap<u16, u16> = BTreeMap::new();
+        if let (Some(src), Some(target)) = (first_audio, o.audio_pid) {
+            audio_remap.insert(src, target);
+        }
+        if let Some(map) = o.audio_pids.as_ref() {
+            for (&src, &dst) in map.iter() {
+                // Only honour entries whose source PID actually exists as
+                // an audio stream in this PMT — silently ignore otherwise
+                // so a stale override doesn't shadow an unrelated PID.
+                if all_audio_pids.contains(&src) {
+                    audio_remap.insert(src, dst);
+                }
+            }
+        }
+        state.audio_remap = audio_remap;
 
         // Seed the per-PID remap table.
         if let (Some(src), Some(target)) = (first_video, o.video_pid) {
             self.pid_remap_table[(src & 0x1FFF) as usize] = target;
             self.has_any_remap = true;
         }
-        if let (Some(src), Some(target)) = (first_audio, o.audio_pid) {
-            self.pid_remap_table[(src & 0x1FFF) as usize] = target;
+        for (&src, &dst) in state.audio_remap.iter() {
+            self.pid_remap_table[(src & 0x1FFF) as usize] = dst;
             self.has_any_remap = true;
         }
         // PCR override: if the operator picked a PCR PID that aliases the
@@ -523,9 +556,9 @@ fn rewrite_pmt(
     let video_remap: Option<(u16, u16)> = state
         .and_then(|s| s.source_video_pid)
         .zip(o.video_pid);
-    let audio_remap: Option<(u16, u16)> = state
-        .and_then(|s| s.source_audio_pid)
-        .zip(o.audio_pid);
+    let audio_remap: &BTreeMap<u16, u16> = state
+        .map(|s| &s.audio_remap)
+        .unwrap_or(&EMPTY_AUDIO_REMAP);
 
     let mut changed = o.pmt_pid.is_some();
 
@@ -540,8 +573,8 @@ fn rewrite_pmt(
             if let Some((vsrc, vdst)) = video_remap {
                 if src == vsrc { return vdst; }
             }
-            if let Some((asrc, adst)) = audio_remap {
-                if src == asrc { return adst; }
+            if let Some(&adst) = audio_remap.get(&src) {
+                return adst;
             }
             src
         }).filter(|&new| state.and_then(|s| s.source_pcr_pid) != Some(new))
@@ -555,7 +588,8 @@ fn rewrite_pmt(
         changed = true;
     }
 
-    // ES PID rewrites — first matching video / first matching audio.
+    // ES PID rewrites — first matching video, plus every audio PID with
+    // a resolved remap (single-language → 1 entry; multi-language → N).
     let mut pos = data_start;
     while pos + 5 <= data_end {
         let es_pid = ((buf[pos + 1] as u16 & 0x1F) << 8) | buf[pos + 2] as u16;
@@ -567,12 +601,10 @@ fn rewrite_pmt(
                 changed = true;
             }
         }
-        if let Some((src, dst)) = audio_remap {
-            if es_pid == src {
-                buf[pos + 1] = (buf[pos + 1] & 0xE0) | (((dst >> 8) as u8) & 0x1F);
-                buf[pos + 2] = (dst & 0xFF) as u8;
-                changed = true;
-            }
+        if let Some(&dst) = audio_remap.get(&es_pid) {
+            buf[pos + 1] = (buf[pos + 1] & 0xE0) | (((dst >> 8) as u8) & 0x1F);
+            buf[pos + 2] = (dst & 0xFF) as u8;
+            changed = true;
         }
         pos += 5 + es_info_len;
     }
@@ -625,6 +657,161 @@ mod tests {
         let _r = TsPidOverridesRewriter::new(&m);
         // Behaviour verified by integration: an MPTS with programs 1+7
         // would re-PID program 1's audio while program 7 flows unchanged.
+    }
+
+    /// Build a synthetic PAT packet (lifted from ts_program_filter tests).
+    fn build_pat_packet(programs: &[(u16, u16)], version: u8) -> [u8; TS_PACKET_SIZE] {
+        let mut pkt = [0xFFu8; TS_PACKET_SIZE];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = 0x40;
+        pkt[2] = 0x00;
+        pkt[3] = 0x10;
+        pkt[4] = 0x00; // pointer_field
+        let section_length = 5 + 4 * programs.len() + 4;
+        pkt[5] = 0x00;
+        pkt[6] = 0xB0 | (((section_length >> 8) as u8) & 0x0F);
+        pkt[7] = (section_length & 0xFF) as u8;
+        pkt[8] = 0x00;
+        pkt[9] = 0x01;
+        pkt[10] = 0xC1 | ((version & 0x1F) << 1);
+        pkt[11] = 0x00;
+        pkt[12] = 0x00;
+        let mut pos = 13;
+        for (program_number, pmt_pid) in programs {
+            pkt[pos] = (program_number >> 8) as u8;
+            pkt[pos + 1] = (program_number & 0xFF) as u8;
+            pkt[pos + 2] = 0xE0 | (((pmt_pid >> 8) as u8) & 0x1F);
+            pkt[pos + 3] = (pmt_pid & 0xFF) as u8;
+            pos += 4;
+        }
+        let crc_section_end = 5 + 3 + section_length;
+        let crc = mpeg2_crc32(&pkt[5..crc_section_end - 4]);
+        pkt[crc_section_end - 4] = (crc >> 24) as u8;
+        pkt[crc_section_end - 3] = (crc >> 16) as u8;
+        pkt[crc_section_end - 2] = (crc >> 8) as u8;
+        pkt[crc_section_end - 1] = crc as u8;
+        pkt
+    }
+
+    /// Build a synthetic PMT packet. PCR_PID = first ES.
+    fn build_pmt_packet(pmt_pid: u16, streams: &[(u8, u16)], version: u8) -> [u8; TS_PACKET_SIZE] {
+        let mut pkt = [0xFFu8; TS_PACKET_SIZE];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = 0x40 | (((pmt_pid >> 8) as u8) & 0x1F);
+        pkt[2] = (pmt_pid & 0xFF) as u8;
+        pkt[3] = 0x10;
+        pkt[4] = 0x00;
+        let section_data_len = 9 + 5 * streams.len() + 4;
+        let section_length: u16 = section_data_len as u16;
+        let pcr_pid = streams.first().map(|(_, p)| *p).unwrap_or(0x1FFF);
+        pkt[5] = 0x02;
+        pkt[6] = 0xB0 | (((section_length >> 8) & 0x0F) as u8);
+        pkt[7] = (section_length & 0xFF) as u8;
+        pkt[8] = 0x00;
+        pkt[9] = 0x01;
+        pkt[10] = 0xC1 | ((version & 0x1F) << 1);
+        pkt[11] = 0x00;
+        pkt[12] = 0x00;
+        pkt[13] = 0xE0 | (((pcr_pid >> 8) as u8) & 0x1F);
+        pkt[14] = (pcr_pid & 0xFF) as u8;
+        pkt[15] = 0xF0;
+        pkt[16] = 0x00;
+        let mut pos = 17;
+        for (stream_type, es_pid) in streams {
+            pkt[pos] = *stream_type;
+            pkt[pos + 1] = 0xE0 | (((es_pid >> 8) as u8) & 0x1F);
+            pkt[pos + 2] = (es_pid & 0xFF) as u8;
+            pkt[pos + 3] = 0xF0;
+            pkt[pos + 4] = 0x00;
+            pos += 5;
+        }
+        let crc_section_end = 5 + 3 + section_length as usize;
+        let crc = mpeg2_crc32(&pkt[5..crc_section_end - 4]);
+        pkt[crc_section_end - 4] = (crc >> 24) as u8;
+        pkt[crc_section_end - 3] = (crc >> 16) as u8;
+        pkt[crc_section_end - 2] = (crc >> 8) as u8;
+        pkt[crc_section_end - 1] = crc as u8;
+        pkt
+    }
+
+    fn build_es_packet(pid: u16) -> [u8; TS_PACKET_SIZE] {
+        let mut pkt = [0xFFu8; TS_PACKET_SIZE];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = ((pid >> 8) as u8) & 0x1F;
+        pkt[2] = (pid & 0xFF) as u8;
+        pkt[3] = 0x10;
+        pkt
+    }
+
+    /// Three-audio program: EN/FR/ES tracks must each remap to distinct
+    /// output PIDs. The singular `audio_pid` field remains untouched —
+    /// `audio_pids` carries the per-source mappings.
+    #[test]
+    fn multi_audio_program_remaps_each_track() {
+        use std::collections::BTreeMap;
+
+        // Build PAT (program 1 → PMT 0x100) + PMT (video 0x101 + EN/FR/ES
+        // audio on 0x102/0x103/0x104) + one ES packet for each PID.
+        let pat = build_pat_packet(&[(1, 0x100)], 0);
+        let pmt = build_pmt_packet(
+            0x100,
+            &[
+                (0x1B, 0x101), // H.264 video
+                (0x0F, 0x102), // AAC ADTS — EN
+                (0x0F, 0x103), // AAC ADTS — FR
+                (0x0F, 0x104), // AAC ADTS — ES
+            ],
+            0,
+        );
+
+        // Override: leave EN on its source PID (no remap), shift FR to
+        // 0x202 and ES to 0x203. Singular `audio_pid` left None so the
+        // first-audio back-compat path is inactive.
+        let mut audio_map = BTreeMap::new();
+        audio_map.insert(0x103u16, 0x202u16); // FR → 0x202
+        audio_map.insert(0x104u16, 0x203u16); // ES → 0x203
+        let mut overrides = TsPidOverridesMap::new();
+        overrides.insert(
+            1,
+            TsPidOverridesEntry {
+                audio_pids: Some(audio_map),
+                ..Default::default()
+            },
+        );
+
+        let mut rew = TsPidOverridesRewriter::new(&overrides);
+        let mut out = Vec::new();
+        // Feed PAT + PMT to populate observation state.
+        rew.process(&pat, &mut out);
+        rew.process(&pmt, &mut out);
+        out.clear();
+
+        // Video PID — untouched.
+        rew.process(&build_es_packet(0x101), &mut out);
+        assert_eq!(ts_pid(&out[..TS_PACKET_SIZE]), 0x101);
+        out.clear();
+
+        // EN audio — untouched (no remap entry).
+        rew.process(&build_es_packet(0x102), &mut out);
+        assert_eq!(ts_pid(&out[..TS_PACKET_SIZE]), 0x102);
+        out.clear();
+
+        // FR audio — remapped to 0x202.
+        rew.process(&build_es_packet(0x103), &mut out);
+        assert_eq!(
+            ts_pid(&out[..TS_PACKET_SIZE]),
+            0x202,
+            "FR audio (source 0x103) must remap to 0x202"
+        );
+        out.clear();
+
+        // ES audio — remapped to 0x203.
+        rew.process(&build_es_packet(0x104), &mut out);
+        assert_eq!(
+            ts_pid(&out[..TS_PACKET_SIZE]),
+            0x203,
+            "ES audio (source 0x104) must remap to 0x203"
+        );
     }
 
     #[test]

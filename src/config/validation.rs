@@ -3094,6 +3094,12 @@ fn validate_pid_overrides_entry(
     if let Some(p) = entry.video_pid { check(p, "video_pid")?; }
     if let Some(p) = entry.audio_pid { check(p, "audio_pid")?; }
     if let Some(p) = entry.pcr_pid { check(p, "pcr_pid")?; }
+    if let Some(map) = entry.audio_pids.as_ref() {
+        for (&src, &dst) in map.iter() {
+            check(src, &format!("audio_pids[src=0x{src:04X}]"))?;
+            check(dst, &format!("audio_pids[src=0x{src:04X}] target"))?;
+        }
+    }
 
     // Collision check across the four slots. PCR is allowed to alias
     // video or audio (the standard pattern — PCR rides whichever ES the
@@ -3121,6 +3127,34 @@ fn validate_pid_overrides_entry(
             bail!("{context}: pcr_pid (0x{pcr:04X}) collides with pmt_pid; PCR must ride an ES PID, not the PMT PID");
         }
     }
+
+    // Multi-audio collision checks. Targets in `audio_pids` must be
+    // distinct from each other and from the singular video/pmt slots.
+    // Aliasing PCR is allowed (PCR may ride an audio ES); aliasing
+    // `audio_pid` is *redundant* (same source PID twice) — reject so the
+    // operator can't accidentally hide the duplicate in JSON.
+    if let Some(map) = entry.audio_pids.as_ref() {
+        use std::collections::HashSet;
+        let mut seen_targets: HashSet<u16> = HashSet::new();
+        for (&src, &dst) in map.iter() {
+            if Some(dst) == pmt {
+                bail!(
+                    "{context}: audio_pids[src=0x{src:04X}] target 0x{dst:04X} collides with pmt_pid"
+                );
+            }
+            if Some(dst) == video {
+                bail!(
+                    "{context}: audio_pids[src=0x{src:04X}] target 0x{dst:04X} collides with video_pid"
+                );
+            }
+            if !seen_targets.insert(dst) {
+                bail!(
+                    "{context}: audio_pids target 0x{dst:04X} is reused; each target audio PID must be unique within a program"
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -6048,6 +6082,7 @@ mod tests {
             video_pid: Some(0x0250),
             audio_pid: Some(0x0260),
             pcr_pid: Some(0x0250),
+            ..Default::default()
         });
         assert!(validate_pid_overrides(Some(&m), "test", false).is_ok());
     }
@@ -6078,6 +6113,7 @@ mod tests {
             video_pid: Some(0x0100),
             audio_pid: None,
             pcr_pid: None,
+            ..Default::default()
         });
         assert!(validate_pid_overrides(Some(&m), "ctx", false).is_err());
 
@@ -6086,6 +6122,7 @@ mod tests {
             video_pid: Some(0x0100),
             audio_pid: Some(0x0100),
             pcr_pid: None,
+            ..Default::default()
         });
         assert!(validate_pid_overrides(Some(&m), "ctx", false).is_err());
 
@@ -6095,6 +6132,7 @@ mod tests {
             video_pid: Some(0x0100),
             audio_pid: Some(0x0101),
             pcr_pid: Some(0x0100),
+            ..Default::default()
         });
         assert!(validate_pid_overrides(Some(&m), "ctx", false).is_ok());
 
@@ -6104,6 +6142,7 @@ mod tests {
             video_pid: Some(0x0100),
             audio_pid: None,
             pcr_pid: Some(0x1000),
+            ..Default::default()
         });
         assert!(validate_pid_overrides(Some(&m), "ctx", false).is_err());
     }
@@ -6147,6 +6186,174 @@ mod tests {
         m.insert(0, TsPidOverridesEntry { audio_pid: Some(0x101), ..Default::default() });
         assert!(validate_pid_overrides(Some(&m), "ctx", false).is_err());
         assert!(validate_pid_overrides(Some(&m), "ctx", true).is_err());
+    }
+
+    /// Pins the serde-tagged-enum round-trip bug fixed by
+    /// `crate::config::pid_overrides_serde`. Before the fix, deserialising
+    /// an `OutputConfig` (internally-tagged enum) carrying `pid_overrides`
+    /// failed with `invalid type: string "3928", expected u16` because
+    /// serde_json's tagged-enum `Content` intermediate keeps map keys as
+    /// strings. Top-level `TsPidOverridesMap` round-trips were fine, so
+    /// the bug only surfaced when the operator saved an input/output edit
+    /// from the manager UI.
+    #[test]
+    fn pid_overrides_round_trips_inside_tagged_enum() {
+        use crate::config::models::{InputConfig, OutputConfig};
+
+        let json_out = serde_json::json!({
+            "type": "udp",
+            "id": "test-out",
+            "name": "test-out",
+            "dest_addr": "239.0.0.1:5000",
+            "pid_overrides": {
+                "3928": { "pmt_pid": 1000, "video_pid": 100, "audio_pid": 101 }
+            }
+        });
+        let out: OutputConfig = serde_json::from_value(json_out.clone())
+            .expect("OutputConfig::Udp with pid_overrides must deserialise");
+        if let OutputConfig::Udp(cfg) = &out {
+            let map = cfg.pid_overrides.as_ref().expect("pid_overrides set");
+            let entry = map.get(&3928).expect("program 3928 key");
+            assert_eq!(entry.pmt_pid, Some(1000));
+            assert_eq!(entry.video_pid, Some(100));
+            assert_eq!(entry.audio_pid, Some(101));
+        } else {
+            panic!("expected Udp variant");
+        }
+        // Serialise back and re-deserialise to pin the symmetric path.
+        let round: OutputConfig =
+            serde_json::from_value(serde_json::to_value(&out).unwrap()).unwrap();
+        if let OutputConfig::Udp(cfg) = round {
+            assert!(cfg.pid_overrides.unwrap().contains_key(&3928));
+        } else {
+            panic!("round-trip variant lost");
+        }
+
+        // Same shape on the InputConfig side — the media_player variant
+        // carries pid_overrides and was the second user-reported path.
+        let json_in = serde_json::json!({
+            "type": "media_player",
+            "id": "test-in",
+            "name": "test-in",
+            "sources": [],
+            "pid_overrides": {
+                "1591": { "pmt_pid": 1000, "video_pid": 100, "audio_pid": 101 }
+            }
+        });
+        let inp: InputConfig = serde_json::from_value(json_in)
+            .expect("InputConfig::MediaPlayer with pid_overrides must deserialise");
+        if let InputConfig::MediaPlayer(cfg) = inp {
+            assert!(cfg.pid_overrides.unwrap().contains_key(&1591));
+        } else {
+            panic!("expected MediaPlayer variant");
+        }
+    }
+
+    /// Same regression but for the nested `audio_pids` map inside
+    /// `TsPidOverridesEntry`. The outer `pid_overrides` map already takes
+    /// the tagged-enum hit and its values flow through the `Content`
+    /// intermediate — without `crate::config::audio_pids_serde`, the
+    /// inner `BTreeMap<u16, u16>` would fail the same way the outer one
+    /// did before its helper landed.
+    #[test]
+    fn audio_pids_round_trips_inside_tagged_enum() {
+        use crate::config::models::OutputConfig;
+
+        let json_out = serde_json::json!({
+            "type": "udp",
+            "id": "test-out",
+            "name": "test-out",
+            "dest_addr": "239.0.0.1:5000",
+            "pid_overrides": {
+                "1": {
+                    "audio_pid": 0x101,
+                    "audio_pids": {
+                        "260": 0x201,
+                        "261": 0x202
+                    }
+                }
+            }
+        });
+        let out: OutputConfig = serde_json::from_value(json_out.clone())
+            .expect("OutputConfig::Udp with audio_pids must deserialise");
+        if let OutputConfig::Udp(cfg) = &out {
+            let map = cfg.pid_overrides.as_ref().expect("pid_overrides set");
+            let entry = map.get(&1).expect("program 1");
+            assert_eq!(entry.audio_pid, Some(0x101));
+            let audio = entry.audio_pids.as_ref().expect("audio_pids set");
+            assert_eq!(audio.get(&260), Some(&0x201));
+            assert_eq!(audio.get(&261), Some(&0x202));
+        } else {
+            panic!("expected Udp variant");
+        }
+        // Symmetric: serialise back and re-deserialise.
+        let round: OutputConfig =
+            serde_json::from_value(serde_json::to_value(&out).unwrap()).unwrap();
+        if let OutputConfig::Udp(cfg) = round {
+            let entry = cfg.pid_overrides.unwrap().remove(&1).unwrap();
+            assert_eq!(entry.audio_pids.unwrap().len(), 2);
+        } else {
+            panic!("round-trip variant lost");
+        }
+    }
+
+    /// Range check for `audio_pids` entries — both keys (source) and
+    /// values (target) must fall in 0x0010..=0x1FFE.
+    #[test]
+    fn audio_pids_rejects_reserved_pids() {
+        use std::collections::BTreeMap;
+        let mut audio = BTreeMap::new();
+        audio.insert(0x0001u16, 0x0202u16); // source in system-reserved
+        let m = one_prog(TsPidOverridesEntry {
+            audio_pids: Some(audio),
+            ..Default::default()
+        });
+        assert!(validate_pid_overrides(Some(&m), "ctx", false).is_err());
+
+        let mut audio = BTreeMap::new();
+        audio.insert(0x0260u16, 0x1FFFu16); // target on NULL PID
+        let m = one_prog(TsPidOverridesEntry {
+            audio_pids: Some(audio),
+            ..Default::default()
+        });
+        assert!(validate_pid_overrides(Some(&m), "ctx", false).is_err());
+    }
+
+    /// Duplicate target PIDs and target/pmt or target/video collisions
+    /// inside a single program's entry are rejected.
+    #[test]
+    fn audio_pids_rejects_target_collisions() {
+        use std::collections::BTreeMap;
+        // Two sources mapping to the same target — disallowed.
+        let mut audio = BTreeMap::new();
+        audio.insert(0x0260u16, 0x0301u16);
+        audio.insert(0x0261u16, 0x0301u16);
+        let m = one_prog(TsPidOverridesEntry {
+            audio_pids: Some(audio),
+            ..Default::default()
+        });
+        assert!(validate_pid_overrides(Some(&m), "ctx", false).is_err());
+
+        // Target collides with video_pid.
+        let mut audio = BTreeMap::new();
+        audio.insert(0x0260u16, 0x0100u16);
+        let m = one_prog(TsPidOverridesEntry {
+            video_pid: Some(0x0100),
+            audio_pids: Some(audio),
+            ..Default::default()
+        });
+        assert!(validate_pid_overrides(Some(&m), "ctx", false).is_err());
+
+        // Distinct targets — accepted.
+        let mut audio = BTreeMap::new();
+        audio.insert(0x0260u16, 0x0301u16);
+        audio.insert(0x0261u16, 0x0302u16);
+        let m = one_prog(TsPidOverridesEntry {
+            video_pid: Some(0x0100),
+            audio_pids: Some(audio),
+            ..Default::default()
+        });
+        assert!(validate_pid_overrides(Some(&m), "ctx", false).is_ok());
     }
 
     fn spts_assembly(input_id: &str) -> FlowAssembly {

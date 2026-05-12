@@ -23,6 +23,7 @@ use super::st2110_io::run_st2110_audio_input;
 
 pub fn spawn_st2110_31_input(
     config: St2110AudioInputConfig,
+    input_id: String,
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
@@ -32,6 +33,7 @@ pub fn spawn_st2110_31_input(
     tokio::spawn(async move {
         if let Err(e) = run_st2110_audio_input(
             config,
+            input_id,
             true,
             broadcast_tx,
             stats,

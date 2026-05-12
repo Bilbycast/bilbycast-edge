@@ -2181,7 +2181,7 @@ fn spawn_single_input(
             let mut c = c.clone();
             c.clock_domain = c.clock_domain.or(flow_clock_domain);
             super::input_st2110_30::spawn_st2110_30_input(
-                c, per_input_tx.clone(), flow_stats.clone(),
+                c, input_id.clone(), per_input_tx.clone(), flow_stats.clone(),
                 input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
             )
         }
@@ -2189,7 +2189,7 @@ fn spawn_single_input(
             let mut c = c.clone();
             c.clock_domain = c.clock_domain.or(flow_clock_domain);
             super::input_st2110_31::spawn_st2110_31_input(
-                c, per_input_tx.clone(), flow_stats.clone(),
+                c, input_id.clone(), per_input_tx.clone(), flow_stats.clone(),
                 input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
             )
         }
@@ -2202,7 +2202,7 @@ fn spawn_single_input(
             )
         }
         InputConfig::RtpAudio(c) => super::input_rtp_audio::spawn_rtp_audio_input(
-            c.clone(), per_input_tx.clone(), flow_stats.clone(),
+            c.clone(), input_id.clone(), per_input_tx.clone(), flow_stats.clone(),
             input_cancel.clone(), Some(event_sender.clone()),
             Some(flow_id.to_string()),
         ),

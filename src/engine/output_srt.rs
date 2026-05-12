@@ -584,18 +584,18 @@ fn build_pid_remapper(config: &SrtOutputConfig) -> Option<TsPidRemapper> {
 }
 
 /// Build a [`TsPidOverridesRewriter`] from `config.pid_overrides`.
-/// Returns `None` when the map is absent / empty OR when transcode is
-/// active (the replacers handle PID overrides internally on the
-/// transcoded path; chaining the standalone rewriter would double-rewrite).
+///
+/// Single owner of PID remapping on both passthrough and transcoded paths —
+/// the transcode replacers re-encode on the source audio / video PID and
+/// let this rewriter rename PIDs afterwards, so the same stage works for
+/// every program in `pid_overrides` regardless of whether
+/// `audio_encode` / `video_encode` is set.
 fn build_pid_overrides_rewriter(config: &SrtOutputConfig) -> Option<TsPidOverridesRewriter> {
-    if config.audio_encode.is_some() || config.video_encode.is_some() {
-        return None;
-    }
     let map = config.pid_overrides.as_ref()?;
     let r = TsPidOverridesRewriter::new(map);
     if r.is_active() {
         tracing::info!(
-            "SRT output '{}': pid_overrides passthrough rewriter active ({} programs)",
+            "SRT output '{}': pid_overrides rewriter active ({} programs)",
             config.id,
             map.len()
         );
@@ -635,10 +635,10 @@ fn spawn_replacer_switch_watcher(
 fn build_audio_replacer(
     config: &SrtOutputConfig,
     events: &EventSender,
-    stats: &OutputStatsAccumulator,
+    stats: &Arc<OutputStatsAccumulator>,
 ) -> Option<TsAudioReplacer> {
     let enc = config.audio_encode.as_ref()?;
-    match TsAudioReplacer::new(enc, config.transcode.clone(), config.pid_overrides.as_ref()) {
+    match TsAudioReplacer::new(enc, config.transcode.clone()) {
         Ok(r) => {
             tracing::info!(
                 "SRT output '{}': audio_encode active ({})",
@@ -653,6 +653,12 @@ fn build_audio_replacer(
                 serde_json::json!({ "codec": enc.codec }),
             );
             stats.set_audio_replacer_stats(r.stats_handle());
+            stats.set_decode_stats(
+                r.decode_stats_handle(),
+                "",
+                0, 0,
+            );
+            let r = r.with_output_stats(Arc::clone(&stats));
             Some(r)
         }
         Err(e) => {
@@ -684,7 +690,7 @@ fn build_video_replacer(
     av_sync_pacer: Option<&Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> Option<TsVideoReplacer> {
     let enc = config.video_encode.as_ref()?;
-    match TsVideoReplacer::new(enc, None, config.pid_overrides.as_ref()) {
+    match TsVideoReplacer::new(enc, None) {
         Ok(mut r) => {
             if let Some(p) = av_sync_pacer {
                 r.set_av_sync_pacer(p.clone());
@@ -711,6 +717,10 @@ fn build_video_replacer(
                 },
                 enc.bitrate_kbps.unwrap_or(0),
                 backend,
+            );
+            stats.set_video_decode_stats(
+                r.decode_stats_handle(),
+                "", 0, 0, 0.0,
             );
             tracing::info!(
                 "SRT output '{}': video_encode active ({})",

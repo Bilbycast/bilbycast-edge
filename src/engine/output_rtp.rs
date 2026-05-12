@@ -246,34 +246,30 @@ async fn rtp_output_loop(
     });
     let mut remap_scratch: Vec<u8> = Vec::new();
 
-    // Optional per-program role-keyed PID rewriter. Only engages on
-    // passthrough flows (no transcode) — the transcoded paths handle PID
-    // rewriting inside the replacers themselves.
-    let no_transcode_rtp = config.audio_encode.is_none() && config.video_encode.is_none();
-    let mut pid_overrides_rewriter = if no_transcode_rtp {
-        config.pid_overrides.as_ref().and_then(|m| {
-            let r = TsPidOverridesRewriter::new(m);
-            if r.is_active() {
-                tracing::info!(
-                    "RTP output '{}': pid_overrides passthrough rewriter active ({} programs)",
-                    config.id,
-                    m.len()
-                );
-                Some(r)
-            } else {
-                None
-            }
-        })
-    } else {
-        None
-    };
+    // Per-program role-keyed PID rewriter. Single owner of PID remapping
+    // on both passthrough and transcoded paths — the transcode replacers
+    // re-encode on the source audio / video PID and let this stage handle
+    // every PAT/PMT/ES PID rename, including for programs other than 1.
+    let mut pid_overrides_rewriter = config.pid_overrides.as_ref().and_then(|m| {
+        let r = TsPidOverridesRewriter::new(m);
+        if r.is_active() {
+            tracing::info!(
+                "RTP output '{}': pid_overrides rewriter active ({} programs)",
+                config.id,
+                m.len()
+            );
+            Some(r)
+        } else {
+            None
+        }
+    });
     let mut overrides_scratch: Vec<u8> = Vec::new();
 
     // Optional audio ES replacement. When set, all outgoing packets are
     // forced through the raw-TS path (the original RTP framing is
     // discarded and rebuilt) because the replacer rewrites payload bytes.
     let mut audio_replacer = match config.audio_encode.as_ref() {
-        Some(enc) => match TsAudioReplacer::new(enc, config.transcode.clone(), config.pid_overrides.as_ref()) {
+        Some(enc) => match TsAudioReplacer::new(enc, config.transcode.clone()) {
             Ok(r) => {
                 tracing::info!(
                     "RTP output '{}': audio_encode active ({})",
@@ -290,6 +286,16 @@ async fn rtp_output_loop(
                 // Surface source-PID + stream-type for the manager UI's
                 // audio-transcode `(from PID …)` badge.
                 stats.set_audio_replacer_stats(r.stats_handle());
+                // Register the internal AAC / MP2 / AC-3 / E-AC-3 decoder's
+                // counters so the egress pipeline emits `audio_decode`
+                // alongside `audio_encode` — the manager UI collapses the
+                // pair into a single "Audio Transcode" badge.
+                stats.set_decode_stats(
+                    r.decode_stats_handle(),
+                    "",   // codec label refreshed by the replacer on PMT discovery
+                    0, 0, // PCM shape refreshed when the decoder produces its first frame
+                );
+                let r = r.with_output_stats(Arc::clone(&stats));
                 Some(r)
             }
             Err(e) => {
@@ -313,7 +319,7 @@ async fn rtp_output_loop(
 
     // Optional video ES replacement.
     let mut video_replacer = match config.video_encode.as_ref() {
-        Some(enc) => match TsVideoReplacer::new(enc, None, config.pid_overrides.as_ref()) {
+        Some(enc) => match TsVideoReplacer::new(enc, None) {
             Ok(mut r) => {
                 let backend = match enc.codec.as_str() {
                     "x264" | "x265" => enc.codec.clone(),
@@ -337,6 +343,13 @@ async fn rtp_output_loop(
                     },
                     enc.bitrate_kbps.unwrap_or(0),
                     backend,
+                );
+                // Surface the internal decoder's counters so the egress
+                // pipeline emits `video_decode` + `video_encode` → the
+                // manager UI collapses them into a "Video Transcode" badge.
+                stats.set_video_decode_stats(
+                    r.decode_stats_handle(),
+                    "", 0, 0, 0.0,
                 );
                 if let Some(p) = av_sync_pacer.as_ref() {
                     r.set_av_sync_pacer(p.clone());

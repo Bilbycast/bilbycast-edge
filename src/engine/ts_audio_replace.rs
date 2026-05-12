@@ -52,7 +52,7 @@ pub struct TsAudioReplacerStats {
     pub source_stream_type: AtomicU8,
 }
 
-use crate::config::models::{AudioEncodeConfig, TsPidOverridesMap};
+use crate::config::models::AudioEncodeConfig;
 
 use super::audio_encode::AudioCodec;
 use super::audio_transcode::{PlanarAudioTranscoder, TranscodeJson};
@@ -107,18 +107,11 @@ pub struct TsAudioReplacer {
     /// Discovered PMT PID (the PAT's first program's PMT). `None` before
     /// the PAT has been seen.
     pmt_pid: Option<u16>,
-    /// Discovered audio PID. `None` before the PMT has been parsed. This
-    /// is the *source* PID where the original audio TS packets arrive —
-    /// the replacer drops packets on this PID and emits encoded packets
-    /// on `out_audio_pid_override.unwrap_or(audio_pid)`.
+    /// Discovered audio PID. `None` before the PMT has been parsed. The
+    /// replacer drops the original audio TS packets on this PID and
+    /// emits re-encoded packets on the same PID; any operator PID rename
+    /// is applied downstream by `TsPidOverridesRewriter`.
     audio_pid: Option<u16>,
-    /// Optional override for the output audio PID. When set, the encoded
-    /// audio TS packets are written on this PID instead of the source
-    /// `audio_pid`, and the rewritten PMT entry is updated to advertise
-    /// the override. Used by operators who need a fixed wire PID layout
-    /// across multiple inputs feeding a switcher (downstream decoders
-    /// stay locked on the same PID across input swaps).
-    out_audio_pid_override: Option<u16>,
     /// Optional operator-pinned source audio PID. When set, the replacer
     /// locks onto this PID specifically (useful on MPTS programs with
     /// multiple audio tracks). When unset, falls back to first-matching-
@@ -134,6 +127,23 @@ pub struct TsAudioReplacer {
     /// `set_audio_replacer_stats`, and the snapshot path reads
     /// `source_pid` + `source_stream_type` from here every tick.
     stats: Arc<TsAudioReplacerStats>,
+    /// Lock-free counters for the internal decode stage. Bumped per AAC /
+    /// MP2 / AC-3 / E-AC-3 access unit fed to the decoder and per
+    /// successfully decoded PCM frame. Surfaced to the manager via
+    /// [`crate::stats::collector::OutputStatsAccumulator::set_decode_stats`]
+    /// so the egress pipeline emits the `audio_decode` tag — the UI then
+    /// collapses `audio_decode + audio_encode` into a single
+    /// "Audio Transcode" badge, distinguishing this leg from an
+    /// encode-only ST 2110 ingress.
+    decode_stats: Arc<crate::engine::audio_decode::DecodeStats>,
+    /// Optional handle on the owning output's stats accumulator, used to
+    /// refresh the live `audio_decode_stats` source-codec / output PCM
+    /// shape whenever the source codec is rediscovered on a PMT update
+    /// (input switch, MPTS program change). `None` on outputs that do
+    /// not call [`Self::with_output_stats`] at spawn time — the
+    /// `audio_decode` tag still surfaces (the handle is registered up
+    /// front), the codec label just stays at its placeholder.
+    output_stats: Option<Arc<crate::stats::collector::OutputStatsAccumulator>>,
     /// Source audio stream_type (0x0F = AAC-ADTS, etc.). Used to decide
     /// which decoder to instantiate.
     source_stream_type: u8,
@@ -159,22 +169,37 @@ pub struct TsAudioReplacer {
     /// receivers' cached PMT pointing at the wrong codec.
     out_psi_version: u8,
 
-    /// Running output PTS in 90 kHz ticks. Anchored to the first decoded
-    /// PES PTS; advanced by encoded frame sample counts. Used as the
-    /// fallback when the source-PTS queue is exhausted (e.g. encoder
-    /// catch-up bursts).
+    /// Output PTS anchor in 90 kHz ticks — the PTS of the first output
+    /// sample emitted since the last anchor reset. Combined with
+    /// [`Self::samples_since_anchor`] and [`Self::resolved_sample_rate`]
+    /// it yields the exact output PES PTS without accumulating rounding.
+    ///
+    /// Replaces the previous per-PES FIFO queue, which broke down the
+    /// moment input and output frame sizes differed (every
+    /// frame-size-mismatched mapping — AC-3 1536 ↔ AAC-LC 1024 ↔
+    /// HE-AAC 2048 — used to drift linearly because PTSes were pushed
+    /// per source PES but popped per encoded output frame). The
+    /// sample-anchor model is codec / frame-size / sample-rate
+    /// agnostic: monotonic by construction, exact within ±1 tick
+    /// regardless of how the decoder and encoder buffer.
     out_pts_90k: u64,
-    /// True until the first decoded PES anchors `out_pts_90k`.
+    /// True after the first source PES anchored [`Self::out_pts_90k`].
+    /// Cleared on input switch / source codec change so the next PES
+    /// re-establishes the anchor.
     out_pts_anchored: bool,
-    /// Source PES PTSes pending output, one entry per source decoded
-    /// frame fed into the encoder. Drained in FIFO order on each
-    /// emitted output frame, so output PES PTS values track source's
-    /// monotonic clock instead of `out_pts_90k`'s sample-counted clock.
-    /// This is the path that keeps audio in lock with video when the
-    /// video encoder has its own pipeline delay — the audio replacer
-    /// anchors each output PES to the source PES's intrinsic PTS rather
-    /// than to wall-time accumulation.
-    src_pts_queue: std::collections::VecDeque<u64>,
+    /// Output samples emitted since the current anchor was set. Each
+    /// emitted PES advances this by `ef.num_samples` (output rate);
+    /// the per-PES PTS is recomputed from
+    /// `out_pts_90k + samples_since_anchor * 90000 / resolved_sample_rate`
+    /// so the division rounds once per PES rather than accumulating.
+    samples_since_anchor: u64,
+    /// Last observed source PES PTS (90 kHz) plus the source-rate
+    /// sample count from that PES, used to detect source-PTS
+    /// discontinuities > ~500 ms — looping media files, ad splices,
+    /// upstream encoder restarts — and re-anchor without waiting for
+    /// the operator to bounce the flow. `None` before the first PES
+    /// and after a reset.
+    expected_next_src_pts_90k: Option<u64>,
 
     /// Lazily constructed AAC-LC / ADTS decoder. Opened on the first PES
     /// flush once we know the source is AAC.
@@ -240,10 +265,14 @@ impl TsAudioReplacer {
     /// channel-shuffle / sample-rate stage before the target encoder. Unset
     /// fields inside the block fall back to the encoder's own overrides and
     /// then the source format, so an empty block is a no-op.
+    ///
+    /// PID rewriting (the operator's `pid_overrides` map) is handled by the
+    /// downstream `TsPidOverridesRewriter` stage — the replacer re-encodes
+    /// audio on the same source PID it learned from the PMT and lets that
+    /// stage rename the PID afterwards.
     pub fn new(
         cfg: &AudioEncodeConfig,
         transcode: Option<TranscodeJson>,
-        pid_overrides: Option<&TsPidOverridesMap>,
     ) -> Result<Self, TsAudioReplaceError> {
         let codec = AudioCodec::parse(&cfg.codec)
             .ok_or_else(|| TsAudioReplaceError::UnknownCodec(cfg.codec.clone()))?;
@@ -262,17 +291,6 @@ impl TsAudioReplacer {
 
         let bitrate_kbps = cfg.bitrate_kbps.unwrap_or_else(|| codec.default_bitrate_kbps());
 
-        // SPTS-only single-program scaffold today. Per-program N-program
-        // awareness lands in a follow-up step; for now we lock onto the
-        // first program in the PAT (legacy behaviour) and consume the
-        // override entry keyed `1` from the per-program map. When the
-        // map carries entries for other programs they're ignored on this
-        // path — Flow Assembly remains the answer for full multi-program
-        // rewriting until the replacer learns to walk all programs.
-        let out_audio_pid_override = pid_overrides
-            .and_then(|m| m.get(&1))
-            .and_then(|e| e.audio_pid);
-
         Ok(Self {
             codec,
             bitrate_kbps,
@@ -280,10 +298,11 @@ impl TsAudioReplacer {
             channels_override: cfg.channels,
             pmt_pid: None,
             audio_pid: None,
-            out_audio_pid_override,
             source_audio_pid_pin: cfg.source_audio_pid,
             last_pinned_warn: None,
             stats: Arc::new(TsAudioReplacerStats::default()),
+            decode_stats: Arc::new(crate::engine::audio_decode::DecodeStats::new()),
+            output_stats: None,
             source_stream_type: 0,
             target_stream_type,
             pes_buffer: Vec::with_capacity(16 * 1024),
@@ -292,7 +311,8 @@ impl TsAudioReplacer {
             out_psi_version: 1,
             out_pts_90k: 0,
             out_pts_anchored: false,
-            src_pts_queue: std::collections::VecDeque::with_capacity(64),
+            samples_since_anchor: 0,
+            expected_next_src_pts_90k: None,
             #[cfg(feature = "fdk-aac")]
             aac_decoder: None,
             #[cfg(feature = "video-thumbnail")]
@@ -330,6 +350,54 @@ impl TsAudioReplacer {
     /// 0x0101 (AAC)" on the audio_encode_stats badge.
     pub fn stats_handle(&self) -> Arc<TsAudioReplacerStats> {
         self.stats.clone()
+    }
+
+    /// Shared handle to the internal AAC / MP2 / AC-3 / E-AC-3 decoder
+    /// counters. Outputs register this via
+    /// [`crate::stats::collector::OutputStatsAccumulator::set_decode_stats`]
+    /// at spawn time so the manager's pipeline summary emits the
+    /// `audio_decode` tag — paired with the encoder's `audio_encode`
+    /// the UI then renders a single "Audio Transcode" badge.
+    pub fn decode_stats_handle(&self) -> Arc<crate::engine::audio_decode::DecodeStats> {
+        self.decode_stats.clone()
+    }
+
+    /// Attach the owning output's stats accumulator so the replacer can
+    /// refresh the live `audio_decode_stats` source-codec / output PCM
+    /// shape whenever the source codec is rediscovered on a PMT update.
+    /// Optional: omitting it keeps the badge alive (counters tick) but
+    /// the source-codec label stays at its placeholder.
+    pub fn with_output_stats(
+        mut self,
+        stats: Arc<crate::stats::collector::OutputStatsAccumulator>,
+    ) -> Self {
+        self.output_stats = Some(stats);
+        self
+    }
+
+    /// Best-effort label refresh on the registered audio-decode handle.
+    /// Called whenever `self.source_stream_type` / `self.resolved_*`
+    /// change; no-op when no `output_stats` was attached.
+    fn refresh_decode_stats_label(&self) {
+        let Some(stats) = self.output_stats.as_ref() else {
+            return;
+        };
+        let Some(h) = stats.audio_decode_stats_handle() else {
+            return;
+        };
+        let codec_label: &'static str = match self.source_stream_type {
+            0x0F | 0x11 => "AAC",
+            0x03 | 0x04 => "MP2",
+            0x81 | 0x80 | 0xC1 => "AC-3",
+            0x87 | 0xC2 => "E-AC-3",
+            _ => "",
+        };
+        if !codec_label.is_empty() {
+            h.set_input_codec(codec_label);
+        }
+        if self.resolved_sample_rate != 0 && self.resolved_channels != 0 {
+            h.set_output_shape(self.resolved_sample_rate, self.resolved_channels);
+        }
     }
 
     /// Human-readable description of the active encoder target.
@@ -448,6 +516,7 @@ impl TsAudioReplacer {
                         // discovered audio PID are visible immediately.
                         self.stats.source_pid.store(apid, Ordering::Relaxed);
                         self.stats.source_stream_type.store(ast, Ordering::Relaxed);
+                        self.refresh_decode_stats_label();
                     }
                     // Rewrite the PMT stream_type whenever the source codec
                     // is one we can replace (AAC family via fdk-aac, or
@@ -472,7 +541,6 @@ impl TsAudioReplacer {
                             rewrite_pmt_audio_stream_type(
                                 &mut rewritten,
                                 apid,
-                                self.out_audio_pid_override,
                                 self.target_stream_type,
                                 aac_pal,
                             );
@@ -533,23 +601,39 @@ impl TsAudioReplacer {
             if let Some(ref mut enc) = self.av_encoder {
                 if let Ok(frames) = enc.flush() {
                     let pid = match self.audio_pid {
-                        Some(p) => self.out_audio_pid_override.unwrap_or(p),
+                        Some(p) => p,
                         None => return,
                     };
+                    let sr = enc.sample_rate();
                     for ef in frames {
-                        let pes = build_audio_pes(&ef.data, self.out_pts_90k);
+                        let pts = self.next_output_pts_90k(sr);
+                        let pes = build_audio_pes(&ef.data, pts);
                         let pkts = packetize_ts(pid, &pes, &mut self.out_audio_cc);
                         for pkt in &pkts {
                             output.extend_from_slice(pkt);
                         }
-                        if enc.sample_rate() > 0 {
-                            self.out_pts_90k +=
-                                (ef.num_samples as u64) * 90_000 / enc.sample_rate() as u64;
-                        }
+                        self.samples_since_anchor =
+                            self.samples_since_anchor.saturating_add(ef.num_samples as u64);
                     }
                 }
             }
         }
+    }
+
+    /// Compute the PTS for the next output PES from the running anchor
+    /// + samples-emitted counter. The division rounds once per call
+    /// rather than accumulating, so a long-running encoder at a non-
+    /// integer-tick sample rate (e.g. 44.1 kHz) doesn't drift relative
+    /// to the source clock. Returns the anchor verbatim when the
+    /// resolved output sample rate isn't known yet — the encoder won't
+    /// have produced any frames either, so this is the lazy-init path.
+    fn next_output_pts_90k(&self, sample_rate: u32) -> u64 {
+        if sample_rate == 0 {
+            return self.out_pts_90k;
+        }
+        let advance =
+            self.samples_since_anchor.saturating_mul(90_000) / sample_rate as u64;
+        self.out_pts_90k.wrapping_add(advance)
     }
 
     // ── Internal helpers ─────────────────────────────────────────────
@@ -596,7 +680,8 @@ impl TsAudioReplacer {
         }
         self.transcoder = None;
         self.accumulator.clear();
-        self.src_pts_queue.clear();
+        self.samples_since_anchor = 0;
+        self.expected_next_src_pts_90k = None;
         self.resolved_channels = 0;
         self.resolved_sample_rate = 0;
         self.codecs_ready = false;
@@ -644,9 +729,35 @@ impl TsAudioReplacer {
             None => return Err(()),
         };
 
+        // Anchor establishment + discontinuity guard. On the first PES
+        // we anchor the output PTS to the source's intrinsic PTS so the
+        // output stream tracks the source clock from sample 0. After
+        // that, every PES is compared against the expected next source
+        // PTS (last PTS + last-PES sample-duration); a deviation
+        // greater than ~500 ms means the upstream clock skipped or
+        // looped (media-player loop wrap, SRT/RIST source restart,
+        // SCTE-35 splice) and we re-anchor so audio doesn't accumulate
+        // tens of seconds of phantom drift against the regenerated
+        // output PCR.
+        const DISCONTINUITY_THRESHOLD_90K: u64 = 45_000; // 500 ms
         if !self.out_pts_anchored {
             self.out_pts_90k = pts;
+            self.samples_since_anchor = 0;
             self.out_pts_anchored = true;
+        } else if let Some(expected) = self.expected_next_src_pts_90k {
+            let delta = pts.wrapping_sub(expected) as i64;
+            // 90 kHz PTS is 33 bits in MPEG-TS; treat the signed delta
+            // as bounded — anything outside ±500 ms re-anchors.
+            let abs_delta = delta.unsigned_abs();
+            if abs_delta > DISCONTINUITY_THRESHOLD_90K {
+                tracing::info!(
+                    "ts_audio_replace: source PTS discontinuity \
+                     (expected={expected}, got={pts}, delta_90k={delta}); \
+                     re-anchoring audio output PTS"
+                );
+                self.out_pts_90k = pts;
+                self.samples_since_anchor = 0;
+            }
         }
 
         // ── Phase 1: decode every codec frame in this PES ──
@@ -694,15 +805,20 @@ impl TsAudioReplacer {
                 let adts = &es_data[pos..pos + frame_len];
                 pos += frame_len;
 
+                self.decode_stats.inc_input();
                 match decoder.decode_frame(adts) {
                     Ok(d) => {
+                        self.decode_stats.inc_output();
                         decoded_frames.push(Decoded {
                             planar: d.planar,
                             sample_rate: decoder.sample_rate().unwrap_or(48_000),
                             channels: decoder.channels().unwrap_or(2),
                         });
                     }
-                    Err(_) => continue,
+                    Err(_) => {
+                        self.decode_stats.inc_error();
+                        continue;
+                    }
                 }
             }
         }
@@ -720,10 +836,13 @@ impl TsAudioReplacer {
             for au in
                 crate::engine::audio_decode::split_audio_codec_frames(&es_data, ff_codec)
             {
+                self.decode_stats.inc_input();
                 if decoder.send_packet(au, pts as i64).is_err() {
+                    self.decode_stats.inc_error();
                     continue;
                 }
                 while let Ok(frame) = decoder.receive_frame() {
+                    self.decode_stats.inc_output();
                     decoded_frames.push(Decoded {
                         planar: frame.planar,
                         sample_rate: frame.sample_rate,
@@ -742,9 +861,26 @@ impl TsAudioReplacer {
             return Err(());
         }
 
+        // Source-rate sample accounting for the discontinuity guard.
+        // The first decoded frame in this PES carries the canonical
+        // source sample rate; we sum `d.planar[0].len()` across every
+        // frame so that the "expected next source PTS" we stamp at end
+        // of PES reflects the actual audio time-span covered, even when
+        // libavcodec splits one syncframe into multiple decoded frames
+        // or when the source PES holds back-to-back AUs.
+        let source_sample_rate_hint: u32 = decoded_frames
+            .first()
+            .map(|d| d.sample_rate)
+            .unwrap_or(0);
+        let mut source_samples_in_pes: u64 = 0;
+
         // ── Phase 2: feed PCM into encoder ──
         {
             for d in decoded_frames {
+                source_samples_in_pes =
+                    source_samples_in_pes.saturating_add(
+                        d.planar.first().map(|c| c.len() as u64).unwrap_or(0),
+                    );
                 if !self.codecs_ready {
                     // Resolve the encoder target. When a transcode block is
                     // present it wins: build the planar transcoder first and
@@ -785,6 +921,7 @@ impl TsAudioReplacer {
                         vec![Vec::new(); self.resolved_channels as usize];
                     self.init_encoder()?;
                     self.codecs_ready = true;
+                    self.refresh_decode_stats_label();
                 }
                 // Apply transcode if present; otherwise forward source PCM
                 // directly. Both paths produce planar f32 at
@@ -815,23 +952,31 @@ impl TsAudioReplacer {
                         );
                     }
                 }
-                // Push the source PES PTS once per decoded frame so the
-                // emit path can pop it instead of guessing the PTS from
-                // a sample-count anchor. For 1:1 sample-count mappings
-                // (AC-3 → AC-3, AAC → AAC at the same sample rate) this
-                // collapses any offset between the audio replacer's
-                // internal clock and the source's own clock down to
-                // zero — the output PES carries source's intrinsic PTS
-                // verbatim. For mixed mappings (AAC → AC-3) the queue
-                // is still ahead of advancing-from-anchor: each output
-                // PES's PTS lands within ~1 source-frame-duration of
-                // the correct value (vs. up to encoder-buffer-depth
-                // worth of drift accumulated from a stale anchor).
-                self.src_pts_queue.push_back(pts);
+                // No per-PES PTS queue — output PTS is recomputed from
+                // the anchor + `samples_since_anchor` for every emitted
+                // frame, so encoder buffering and decoder priming can't
+                // produce duplicate or shifted PTSes the way the FIFO
+                // model used to.
                 self.drain_encoder(output)?;
             }
         }
 
+        // Stamp the expected next source PTS so the next PES can detect
+        // a > 500 ms discontinuity. Skip when we don't yet have a
+        // source rate (decode failed) — the next anchor establishment
+        // will set everything fresh.
+        if source_sample_rate_hint > 0 && source_samples_in_pes > 0 {
+            let span_90k =
+                source_samples_in_pes.saturating_mul(90_000)
+                    / source_sample_rate_hint as u64;
+            self.expected_next_src_pts_90k =
+                Some(pts.wrapping_add(span_90k));
+        } else if !self.out_pts_anchored {
+            // First PES failed to decode — leave anchor unset so the
+            // next PES re-anchors instead of treating its PTS as a
+            // jump from a stale anchor.
+            self.expected_next_src_pts_90k = None;
+        }
         let _ = pts;
         Ok(())
     }
@@ -902,9 +1047,11 @@ impl TsAudioReplacer {
     /// current PCM accumulator, re-packetize them as TS, and emit.
     fn drain_encoder(&mut self, output: &mut Vec<u8>) -> Result<(), ()> {
         let audio_pid = match self.audio_pid {
-            // Operator-pinned override wins; otherwise the encoded
-            // packets ride the source PID (the historical behaviour).
-            Some(p) => self.out_audio_pid_override.unwrap_or(p),
+            // Encoded packets always ride the source PID. Any operator
+            // PID rename lands on the downstream `TsPidOverridesRewriter`
+            // stage; the replacer's PMT rewrite advertises the source PID
+            // so the rewriter can match and rename consistently.
+            Some(p) => p,
             None => return Err(()),
         };
 
@@ -927,28 +1074,23 @@ impl TsAudioReplacer {
                         .collect();
                     match enc.encode_frame(&frame) {
                         Ok(encoded) => {
-                            // Prefer source PES PTS from the queue when
-                            // available; fall back to the sample-counted
-                            // anchor when the queue is exhausted (encoder
-                            // catch-up burst).
-                            let pts_for_pes = self
-                                .src_pts_queue
-                                .pop_front()
-                                .unwrap_or(self.out_pts_90k);
+                            let sr = self.resolved_sample_rate;
+                            let pts_for_pes = if sr == 0 {
+                                self.out_pts_90k
+                            } else {
+                                self.out_pts_90k.wrapping_add(
+                                    self.samples_since_anchor.saturating_mul(90_000)
+                                        / sr as u64,
+                                )
+                            };
                             let pes = build_audio_pes(&encoded.bytes, pts_for_pes);
                             let pkts = packetize_ts(audio_pid, &pes, &mut self.out_audio_cc);
                             for p in &pkts {
                                 output.extend_from_slice(p);
                             }
-                            let sr = self.resolved_sample_rate as u64;
-                            if sr > 0 {
-                                // Keep the fallback clock in sync from the
-                                // last source PTS we popped, so a later
-                                // queue-exhausted emit can still produce a
-                                // monotonic value.
-                                self.out_pts_90k = pts_for_pes
-                                    .wrapping_add((encoded.num_samples as u64) * 90_000 / sr);
-                            }
+                            self.samples_since_anchor = self
+                                .samples_since_anchor
+                                .saturating_add(encoded.num_samples as u64);
                         }
                         Err(_) => {
                             // Drop this frame on error and continue.
@@ -978,23 +1120,25 @@ impl TsAudioReplacer {
                         .collect();
                     match enc.encode_frame(&frame) {
                         Ok(frames) => {
+                            let sr = enc.sample_rate();
                             for ef in frames {
-                                let pts_for_pes = self
-                                    .src_pts_queue
-                                    .pop_front()
-                                    .unwrap_or(self.out_pts_90k);
+                                let pts_for_pes = if sr == 0 {
+                                    self.out_pts_90k
+                                } else {
+                                    self.out_pts_90k.wrapping_add(
+                                        self.samples_since_anchor.saturating_mul(90_000)
+                                            / sr as u64,
+                                    )
+                                };
                                 let pes = build_audio_pes(&ef.data, pts_for_pes);
                                 let pkts =
                                     packetize_ts(audio_pid, &pes, &mut self.out_audio_cc);
                                 for p in &pkts {
                                     output.extend_from_slice(p);
                                 }
-                                if enc.sample_rate() > 0 {
-                                    self.out_pts_90k = pts_for_pes.wrapping_add(
-                                        (ef.num_samples as u64) * 90_000
-                                            / enc.sample_rate() as u64,
-                                    );
-                                }
+                                self.samples_since_anchor = self
+                                    .samples_since_anchor
+                                    .saturating_add(ef.num_samples as u64);
                             }
                         }
                         Err(_) => {}
@@ -1011,14 +1155,70 @@ impl TsAudioReplacer {
 // ────────────────────────── TS / PES helpers ──────────────────────────
 
 /// True when the source `stream_type` is one we know how to decode and
-/// re-encode: AAC ADTS (0x0F) via fdk-aac, or MP2 / AC-3 / E-AC-3 via
-/// the FFmpeg-backed audio decoder. Anything else falls through to
-/// passthrough (no PMT rewrite, audio bytes preserved).
+/// re-encode: AAC ADTS (0x0F) via fdk-aac, AAC LATM (0x11) /
+/// MP2 / AC-3 / E-AC-3 via the FFmpeg-backed audio decoder.
+///
+/// DVB-style audio with `stream_type = 0x06` (`private_data`) is
+/// resolved via [`resolve_private_audio_stream_type`] in
+/// [`parse_pmt_audio`] *before* this gate fires, so e.g. a DVB AC-3
+/// stream (0x06 + descriptor 0x6A) arrives here as the synthesised
+/// 0x81 and lights up exactly like its ATSC sibling.
+///
+/// Anything else falls through to passthrough (no PMT rewrite, audio
+/// bytes preserved).
 fn source_replaceable(stream_type: u8) -> bool {
     matches!(
         stream_type,
-        0x0F | 0x03 | 0x04 | 0x80 | 0x81 | 0x87 | 0xC1 | 0xC2,
+        0x0F | 0x11 | 0x03 | 0x04 | 0x80 | 0x81 | 0x87 | 0xC1 | 0xC2,
     )
+}
+
+/// Walk the ES-info descriptor loop after a `stream_type = 0x06`
+/// (private_data) entry and synthesise the ATSC-style codec stream_type
+/// that the rest of the replacer already handles. Recognised:
+///
+/// - DVB AC-3 descriptor (tag `0x6A`, ETSI TS 101 154 § 5.3) → `0x81`
+/// - DVB Enhanced AC-3 descriptor (tag `0x7A`) → `0x87`
+/// - DVB AAC descriptor (tag `0x7C`) → `0x11` (LATM/LOAS — the
+///   broadcast carriage form; ATSC ADTS-via-private is vanishingly
+///   rare so we default to LATM and let `split_audio_codec_frames`
+///   dispatch through the LOAS path)
+/// - `registration_descriptor` (tag `0x05`) with `format_identifier`:
+///   - `"AC-3"` → `0x81`
+///   - `"EAC3"` → `0x87`
+///
+/// Returns `None` for any other private stream (Opus, AC-4, DTS, …) —
+/// the caller keeps the raw `0x06` and downstream paths handle it
+/// (Opus has its own arm in [`crate::engine::audio_decode::ff_codec_for_stream_type`];
+/// AC-4 / DTS fall through to passthrough). DVB AC-3 carriage and the
+/// ATSC equivalent thus collapse onto one code path — operators see
+/// the same transcoding behaviour whether the source comes from
+/// Europe / Australia (DVB) or North America (ATSC).
+fn resolve_private_audio_stream_type(descriptors: &[u8]) -> Option<u8> {
+    let mut pos = 0;
+    while pos + 2 <= descriptors.len() {
+        let tag = descriptors[pos];
+        let len = descriptors[pos + 1] as usize;
+        if pos + 2 + len > descriptors.len() {
+            return None;
+        }
+        match tag {
+            0x6A => return Some(0x81),
+            0x7A => return Some(0x87),
+            0x7C => return Some(0x11),
+            0x05 if len >= 4 => {
+                let fmt = &descriptors[pos + 2..pos + 6];
+                match fmt {
+                    b"AC-3" => return Some(0x81),
+                    b"EAC3" => return Some(0x87),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        pos += 2 + len;
+    }
+    None
 }
 
 /// Parse the PMT for an audio stream. Returns `(audio_pid, stream_type)`.
@@ -1058,17 +1258,49 @@ fn parse_pmt_audio(pkt: &[u8], pinned_pid: Option<u16>) -> Option<(u16, u8)> {
         .min(TS_PACKET_SIZE)
         .saturating_sub(4);
 
+    // Walk one ES entry. Returns `(es_pid, Option<resolved_stream_type>,
+    // next_pos)` — `Some` when the entry is one we can decode (with
+    // DVB-style `0x06` resolved via [`resolve_private_audio_stream_type`]
+    // to the canonical AC-3 / E-AC-3 / AAC stream_type the rest of the
+    // replacer already handles), `None` for entries we should walk past
+    // (video, subtitles, unrecognised private streams). Returns the
+    // outer `None` when the table is malformed or we ran past the end.
+    let classify_entry = |pos: usize| -> Option<(u16, Option<u8>, usize)> {
+        if pos + 5 > data_end {
+            return None;
+        }
+        let st = pkt[pos];
+        let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
+        let es_info_len =
+            (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
+        let next = pos + 5 + es_info_len;
+        if next > data_end {
+            return None;
+        }
+        let resolved_st = match st {
+            0x06 => resolve_private_audio_stream_type(
+                &pkt[pos + 5..pos + 5 + es_info_len],
+            ),
+            0x0F | 0x11 | 0x03 | 0x04 | 0x80 | 0x81 | 0x87 | 0xC1 | 0xC2 => Some(st),
+            _ => None,
+        };
+        Some((es_pid, resolved_st, next))
+    };
+
     // First pass: when a PID is pinned, look for that exact PID.
     if let Some(target) = pinned_pid {
         let mut pos = data_start;
-        while pos + 5 <= data_end {
-            let st = pkt[pos];
-            let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
-            let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
-            if es_pid == target && matches!(st, 0x0F | 0x03 | 0x04 | 0x81 | 0x06) {
-                return Some((es_pid, st));
+        while let Some((es_pid, resolved_st, next)) = classify_entry(pos) {
+            if es_pid == target {
+                if let Some(st) = resolved_st {
+                    return Some((es_pid, st));
+                }
+                // Pinned PID matched but its codec isn't one we can
+                // decode — drop out and let the first-match fallback
+                // pick a different audio PID.
+                break;
             }
-            pos += 5 + es_info_len;
+            pos = next;
         }
         // Pinned PID missing or wrong codec — fall through to first-match
         // for graceful degradation. Caller emits the warning event.
@@ -1076,14 +1308,11 @@ fn parse_pmt_audio(pkt: &[u8], pinned_pid: Option<u16>) -> Option<(u16, u8)> {
 
     // Default: first audio ES with a recognised stream_type.
     let mut pos = data_start;
-    while pos + 5 <= data_end {
-        let st = pkt[pos];
-        let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
-        let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
-        if matches!(st, 0x0F | 0x03 | 0x04 | 0x81 | 0x06) {
+    while let Some((es_pid, resolved_st, next)) = classify_entry(pos) {
+        if let Some(st) = resolved_st {
             return Some((es_pid, st));
         }
-        pos += 5 + es_info_len;
+        pos = next;
     }
     None
 }
@@ -1103,7 +1332,6 @@ fn parse_pmt_audio(pkt: &[u8], pinned_pid: Option<u16>) -> Option<(u16, u8)> {
 fn rewrite_pmt_audio_stream_type(
     pkt: &mut [u8],
     audio_pid: u16,
-    out_audio_pid: Option<u16>,
     new_stream_type: u8,
     new_aac_profile_and_level: Option<u8>,
 ) {
@@ -1138,13 +1366,6 @@ fn rewrite_pmt_audio_stream_type(
         let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
         if es_pid == audio_pid {
             pkt[pos] = new_stream_type;
-            // Rewrite the ES PID itself when the operator pinned an
-            // override. Top 3 bits of byte+1 are reserved (set to 1)
-            // followed by the high 5 bits of the 13-bit PID.
-            if let Some(new_pid) = out_audio_pid {
-                pkt[pos + 1] = (pkt[pos + 1] & 0xE0) | (((new_pid >> 8) as u8) & 0x1F);
-                pkt[pos + 2] = (new_pid & 0xFF) as u8;
-            }
             if let Some(pal) = new_aac_profile_and_level {
                 let desc_start = pos + 5;
                 let desc_end = (desc_start + es_info_len).min(data_end);
@@ -1325,7 +1546,7 @@ mod tests {
     #[test]
     fn rejects_opus_because_no_ts_mapping() {
         assert!(matches!(
-            TsAudioReplacer::new(&enc("opus"), None, None),
+            TsAudioReplacer::new(&enc("opus"), None),
             Err(TsAudioReplaceError::UnsupportedCodec(_))
         ));
     }
@@ -1333,21 +1554,21 @@ mod tests {
     #[test]
     fn rejects_unknown_codec() {
         assert!(matches!(
-            TsAudioReplacer::new(&enc("flac"), None, None),
+            TsAudioReplacer::new(&enc("flac"), None),
             Err(TsAudioReplaceError::UnknownCodec(_))
         ));
     }
 
     #[test]
     fn accepts_aac_lc_and_mp2_and_ac3() {
-        assert!(TsAudioReplacer::new(&enc("aac_lc"), None, None).is_ok());
-        assert!(TsAudioReplacer::new(&enc("mp2"), None, None).is_ok());
-        assert!(TsAudioReplacer::new(&enc("ac3"), None, None).is_ok());
+        assert!(TsAudioReplacer::new(&enc("aac_lc"), None).is_ok());
+        assert!(TsAudioReplacer::new(&enc("mp2"), None).is_ok());
+        assert!(TsAudioReplacer::new(&enc("ac3"), None).is_ok());
     }
 
     #[test]
     fn process_empty_input_is_noop() {
-        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None, None).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
         let mut out = Vec::new();
         r.process(&[], &mut out);
         assert!(out.is_empty());
@@ -1355,7 +1576,7 @@ mod tests {
 
     #[test]
     fn process_misaligned_input_is_passthrough() {
-        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None, None).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
         let mut out = Vec::new();
         let input = vec![0x00u8; 100]; // not 188-aligned
         r.process(&input, &mut out);
@@ -1364,7 +1585,7 @@ mod tests {
 
     #[test]
     fn process_unknown_pid_passes_through_verbatim() {
-        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None, None).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
         let mut pkt = [0xFFu8; 188];
         pkt[0] = TS_SYNC_BYTE;
         // PID 0x1FFF (null) — not the PAT, not a PMT, not audio.
@@ -1470,13 +1691,169 @@ mod tests {
         assert_eq!(parse_pmt_audio(&pkt, None), Some((0x0101, 0x81)));
     }
 
+    // ── DVB private-stream (0x06) descriptor resolution ──
+    //
+    // ffmpeg's `mpegts` muxer and every real DVB-T/T2/S/S2/C broadcast
+    // ships AC-3 / E-AC-3 / AAC as `stream_type = 0x06` with a codec
+    // descriptor (0x6A / 0x7A / 0x7C) in the ES_info loop. ATSC ships
+    // direct stream_types (0x81 / 0x87 / 0x0F). Without descriptor
+    // resolution the audio replacer hits the `source_replaceable` gate
+    // on 0x06, gives up, and emits source audio passthrough — the
+    // operator sees an "OK" transcoded flow that didn't actually
+    // transcode. These tests lock in that DVB-style PMTs route to the
+    // same codec path as their ATSC equivalents.
+
+    /// Build a PMT TS packet with one audio ES at stream_type 0x06 plus
+    /// a single descriptor (caller-supplied body bytes already include
+    /// tag + length octets). `desc_bytes` is appended verbatim into the
+    /// ES_info loop.
+    fn synth_pmt_private_audio(
+        pmt_pid: u16,
+        audio_pid: u16,
+        desc_bytes: &[u8],
+    ) -> [u8; 188] {
+        assert!(desc_bytes.len() <= 0x0F_FF, "descriptor loop too large for the synth helper");
+        let mut pkt = [0xFFu8; 188];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = 0x40 | ((pmt_pid >> 8) as u8 & 0x1F);
+        pkt[2] = pmt_pid as u8;
+        pkt[3] = 0x10;
+        pkt[4] = 0x00;
+        let s = 5;
+        pkt[s] = 0x02; // table_id = PMT
+        // 9 (PMT header after section_length) + 5 (ES fixed) + desc_len + 4 (CRC)
+        let section_length: u16 = 9 + 5 + desc_bytes.len() as u16 + 4;
+        pkt[s + 1] = 0xB0 | ((section_length >> 8) as u8 & 0x0F);
+        pkt[s + 2] = section_length as u8;
+        pkt[s + 3] = 0x00;
+        pkt[s + 4] = 0x01;
+        pkt[s + 5] = 0xC1;
+        pkt[s + 6] = 0x00;
+        pkt[s + 7] = 0x00;
+        pkt[s + 8] = 0xE0 | ((audio_pid >> 8) as u8 & 0x1F);
+        pkt[s + 9] = audio_pid as u8;
+        pkt[s + 10] = 0xF0;
+        pkt[s + 11] = 0x00; // program_info_length = 0
+        // ES entry
+        pkt[s + 12] = 0x06; // stream_type = private data
+        pkt[s + 13] = 0xE0 | ((audio_pid >> 8) as u8 & 0x1F);
+        pkt[s + 14] = audio_pid as u8;
+        pkt[s + 15] = 0xF0 | ((desc_bytes.len() >> 8) as u8 & 0x0F);
+        pkt[s + 16] = desc_bytes.len() as u8;
+        pkt[s + 17..s + 17 + desc_bytes.len()].copy_from_slice(desc_bytes);
+        let crc_in_end = s + 17 + desc_bytes.len();
+        let crc = mpeg2_crc32(&pkt[s..crc_in_end]);
+        pkt[crc_in_end] = (crc >> 24) as u8;
+        pkt[crc_in_end + 1] = (crc >> 16) as u8;
+        pkt[crc_in_end + 2] = (crc >> 8) as u8;
+        pkt[crc_in_end + 3] = crc as u8;
+        pkt
+    }
+
+    /// DVB AC-3 descriptor (tag 0x6A) on a private-data stream
+    /// resolves to ATSC AC-3 (0x81) and feeds into the AC-3 decode
+    /// path. This is the Australian / European / Latin American
+    /// broadcast contribution case.
+    #[test]
+    fn dvb_ac3_descriptor_resolves_to_0x81() {
+        // 0x6A descriptor with empty body (component_type bits all 0).
+        let desc = [0x6A, 0x00];
+        let pkt = synth_pmt_private_audio(0x1000, 0x0289, &desc);
+        assert_eq!(parse_pmt_audio(&pkt, None), Some((0x0289, 0x81)));
+    }
+
+    /// DVB Enhanced AC-3 descriptor (tag 0x7A) on a private-data
+    /// stream resolves to ATSC E-AC-3 (0x87). The original
+    /// motivating case for this fix — ffmpeg-muxed E-AC-3 sources
+    /// were silently passing through instead of transcoding.
+    #[test]
+    fn dvb_eac3_descriptor_resolves_to_0x87() {
+        let desc = [0x7A, 0x00];
+        let pkt = synth_pmt_private_audio(0x1000, 0x0289, &desc);
+        assert_eq!(parse_pmt_audio(&pkt, None), Some((0x0289, 0x87)));
+    }
+
+    /// DVB AAC descriptor (tag 0x7C) on a private-data stream
+    /// resolves to AAC LATM (0x11) — the broadcast carriage form
+    /// (ETSI TS 101 154). The LATM splitter + libavcodec `aac_latm`
+    /// decoder handle it downstream.
+    #[test]
+    fn dvb_aac_descriptor_resolves_to_0x11() {
+        // 0x7C descriptor body: 1 byte profile_and_level (AAC-LC L4)
+        let desc = [0x7C, 0x01, 0x28];
+        let pkt = synth_pmt_private_audio(0x1000, 0x0289, &desc);
+        assert_eq!(parse_pmt_audio(&pkt, None), Some((0x0289, 0x11)));
+    }
+
+    /// MPEG-2 registration_descriptor (tag 0x05) with `format_identifier
+    /// = "AC-3"` is the ATSC-via-Cablelabs carriage form for AC-3 on
+    /// `stream_type = 0x06`. Resolves to ATSC AC-3 (0x81).
+    #[test]
+    fn registration_descriptor_ac3_resolves_to_0x81() {
+        let desc = [0x05, 0x04, b'A', b'C', b'-', b'3'];
+        let pkt = synth_pmt_private_audio(0x1000, 0x0289, &desc);
+        assert_eq!(parse_pmt_audio(&pkt, None), Some((0x0289, 0x81)));
+    }
+
+    /// Same flavour for E-AC-3 (`"EAC3"`).
+    #[test]
+    fn registration_descriptor_eac3_resolves_to_0x87() {
+        let desc = [0x05, 0x04, b'E', b'A', b'C', b'3'];
+        let pkt = synth_pmt_private_audio(0x1000, 0x0289, &desc);
+        assert_eq!(parse_pmt_audio(&pkt, None), Some((0x0289, 0x87)));
+    }
+
+    /// Private-data streams that aren't audio (Opus, AC-4, DTS, …) or
+    /// that carry no recognised descriptor must NOT be picked up as
+    /// audio. The replacer would otherwise try to decode raw Opus
+    /// frames with the libavcodec AC-3 decoder. Note: Opus is the one
+    /// codec whose downstream path *does* accept stream_type 0x06, but
+    /// only when routed there explicitly — `parse_pmt_audio` is the
+    /// re-encode gate and Opus isn't a re-encodable target on this
+    /// MPEG-TS surface.
+    #[test]
+    fn unrecognised_private_descriptor_is_skipped() {
+        // 0xAB is a placeholder descriptor tag we don't recognise.
+        let desc = [0xAB, 0x02, 0x00, 0x00];
+        let pkt = synth_pmt_private_audio(0x1000, 0x0289, &desc);
+        assert_eq!(parse_pmt_audio(&pkt, None), None);
+
+        // Opus registration: also skipped by the re-encode gate.
+        let desc = [0x05, 0x04, b'O', b'p', b'u', b's'];
+        let pkt = synth_pmt_private_audio(0x1000, 0x0289, &desc);
+        assert_eq!(parse_pmt_audio(&pkt, None), None);
+    }
+
+    /// `resolve_private_audio_stream_type` survives a descriptor loop
+    /// whose declared length runs past the buffer (malformed PMT) by
+    /// returning `None` rather than reading out of bounds.
+    #[test]
+    fn descriptor_resolver_rejects_truncated_loop() {
+        // tag 0x6A claims len=10 but only 2 bytes follow.
+        let desc = [0x6A, 0x0A, 0xAA, 0xBB];
+        assert_eq!(resolve_private_audio_stream_type(&desc), None);
+    }
+
+    /// Multiple descriptors in the same ES loop: the resolver finds
+    /// the codec descriptor wherever it sits. DVB PMTs commonly have
+    /// an ISO-639 language descriptor BEFORE the codec descriptor.
+    #[test]
+    fn descriptor_resolver_walks_past_language_descriptor() {
+        // 0x0A ISO-639 language (4 bytes "eng" + audio_type), then 0x6A AC-3.
+        let desc = [
+            0x0A, 0x04, b'e', b'n', b'g', 0x00, // language
+            0x6A, 0x00,                          // AC-3
+        ];
+        assert_eq!(resolve_private_audio_stream_type(&desc), Some(0x81));
+    }
+
     /// Seamless input switching between inputs with different audio
     /// codecs (AAC → AC-3) must reset the decoder / encoder /
     /// transcoder so the new source's PCM isn't fed into an
     /// encoder initialised for the old format.
     #[test]
     fn codec_change_on_pmt_update_resets_source_state() {
-        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None, None).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
         let mut out = Vec::new();
 
         r.process(&synth_pat(0x1000), &mut out);
@@ -1517,7 +1894,7 @@ mod tests {
     /// accumulator belong to a different elementary stream.
     #[test]
     fn audio_pid_change_on_pmt_update_resets_source_state() {
-        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None, None).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
         let mut out = Vec::new();
 
         r.process(&synth_pat(0x1000), &mut out);
@@ -1538,7 +1915,7 @@ mod tests {
     /// the cost of closing and reopening the decoder + encoder.
     #[test]
     fn repeated_unchanged_pmt_does_not_reset_source_state() {
-        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None, None).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
         let mut out = Vec::new();
 
         r.process(&synth_pat(0x1000), &mut out);
@@ -1561,7 +1938,7 @@ mod tests {
     /// discontinuity the video replacer handles).
     #[test]
     fn pmt_pid_change_on_pat_update_resets_source_state() {
-        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None, None).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
         let mut out = Vec::new();
 
         r.process(&synth_pat(0x1000), &mut out);
@@ -1660,7 +2037,7 @@ mod tests {
     /// but we emit AAC-LC.
     #[test]
     fn pmt_aac_descriptor_neutralised_for_aac_target() {
-        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None, None).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
         let mut out = Vec::new();
         r.process(&synth_pat(0x1000), &mut out);
         out.clear();
@@ -1698,7 +2075,7 @@ mod tests {
     /// stream_type but we still preserve the source bytes verbatim.
     #[test]
     fn pmt_aac_descriptor_left_alone_for_non_aac_target() {
-        let mut r = TsAudioReplacer::new(&enc("ac3"), None, None).unwrap();
+        let mut r = TsAudioReplacer::new(&enc("ac3"), None).unwrap();
         let mut out = Vec::new();
         r.process(&synth_pat(0x1000), &mut out);
         out.clear();
@@ -1706,5 +2083,114 @@ mod tests {
         r.process(&pmt, &mut out);
         assert_eq!(out.len(), 188);
         assert_eq!(out[5 + 25], 0x51, "non-AAC target leaves descriptor body intact");
+    }
+
+    // ── PTS sample-anchor regression tests ──
+    //
+    // These tests pin the replacement of the legacy FIFO PTS queue
+    // with the anchor + samples-emitted model. The motivating bug:
+    // for any mapping where source AU count ≠ encoder output frame
+    // count (false-syncword splitter hit, frame-size mismatch like
+    // AC-3 → HE-AAC v1, decoder priming) the FIFO emitted duplicate
+    // and skipped PTS values — receivers heard sync-jump glitches and
+    // eventually muted the audio entirely. The anchor model is
+    // monotonic and exact within ±1 tick regardless of how the
+    // decoder and encoder buffer.
+
+    /// Anchor returned verbatim when no output samples have been
+    /// emitted yet (start of stream / immediately after re-anchor).
+    #[test]
+    fn next_output_pts_anchor_only_returns_anchor() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        r.out_pts_90k = 0xAA_BBCC_DDEE;
+        r.samples_since_anchor = 0;
+        r.resolved_sample_rate = 48_000;
+        assert_eq!(r.next_output_pts_90k(48_000), 0xAA_BBCC_DDEE);
+    }
+
+    /// At 48 kHz the advance is exact for any frame size we emit
+    /// (1024 / 1152 / 1536 / 2048 samples each map to integer
+    /// 90 kHz tick counts). 1000 frames at AAC-LC frame size = 1024:
+    /// expected advance = 1000 * 1024 * 90000 / 48000 = 1_920_000.
+    #[test]
+    fn next_output_pts_advances_exactly_at_48k() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        r.out_pts_90k = 1_000_000;
+        r.resolved_sample_rate = 48_000;
+        r.samples_since_anchor = 1024 * 1000; // 1000 AAC-LC frames worth
+        assert_eq!(r.next_output_pts_90k(48_000), 1_000_000 + 1_920_000);
+    }
+
+    /// 44.1 kHz exercises the "rounds once per PES" property. The
+    /// legacy code that added (samples * 90000 / sr) per emit would
+    /// accumulate (90000 mod 44100) per frame; anchor + sample-count
+    /// math rounds exactly once, so the worst-case error is ≤1 tick
+    /// no matter how many frames have been emitted.
+    #[test]
+    fn next_output_pts_advances_without_accumulating_at_44k() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        r.out_pts_90k = 0;
+        r.resolved_sample_rate = 44_100;
+        // 1000 AAC-LC frames at 44.1 kHz:
+        //   advance = 1024 * 1000 * 90000 / 44100 = 2_089_795.918...
+        // The single-shot integer division floors to 2_089_795.
+        r.samples_since_anchor = 1024 * 1000;
+        let pts = r.next_output_pts_90k(44_100);
+        assert_eq!(pts, 2_089_795);
+        // Compare against the legacy accumulate-each-frame model: if
+        // we'd added (1024 * 90000 / 44100) = 2089 ticks per frame
+        // for 1000 frames, the running counter would have reached
+        // 2_089_000 — 795 ticks shy of the true elapsed time. The
+        // anchor model recovers that 795-tick drift on every frame.
+        let legacy_per_frame = (1024u64 * 90_000) / 44_100;
+        let legacy_accumulated = legacy_per_frame * 1000;
+        assert!(
+            pts > legacy_accumulated,
+            "anchor model must NOT under-count vs. legacy per-frame accumulation"
+        );
+        assert!(pts - legacy_accumulated <= 1000,
+            "drift between anchor model and legacy accumulator stays \
+             within sub-frame ticks — single-shot rounding is bounded"
+        );
+    }
+
+    /// Unset / unknown sample rate must short-circuit to the anchor
+    /// rather than divide by zero. Hit when the first PES failed to
+    /// decode and the encoder still gets called on a flush.
+    #[test]
+    fn next_output_pts_handles_unresolved_sample_rate() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        r.out_pts_90k = 12_345;
+        r.samples_since_anchor = 99_999;
+        assert_eq!(r.next_output_pts_90k(0), 12_345);
+    }
+
+    /// `reset_source_state` must zero the sample counter and clear
+    /// the expected-next source PTS — otherwise an input switch would
+    /// keep advancing PTS from the OLD input's accumulated samples
+    /// against the NEW input's anchor.
+    #[test]
+    fn reset_source_state_clears_pts_arithmetic_state() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        r.process(&synth_pmt_audio(0x1000, 0x0101, 0x0F), &mut out);
+
+        // Simulate a fully running pipeline.
+        r.out_pts_anchored = true;
+        r.out_pts_90k = 1_000_000;
+        r.samples_since_anchor = 48_000 * 30;
+        r.expected_next_src_pts_90k = Some(1_000_000 + 90_000 * 30);
+
+        // Codec swap forces a reset.
+        r.process(&synth_pmt_audio(0x1000, 0x0101, 0x81), &mut out);
+
+        assert!(!r.out_pts_anchored, "anchor flag cleared on reset");
+        assert_eq!(r.samples_since_anchor, 0, "sample counter zeroed");
+        assert!(
+            r.expected_next_src_pts_90k.is_none(),
+            "expected-next must be cleared so the new input doesn't \
+             trip the discontinuity guard against a stale value"
+        );
     }
 }

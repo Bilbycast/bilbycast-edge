@@ -182,7 +182,6 @@ async fn run(
         config.transcode.as_ref(),
         config.video_encode.as_ref(),
         None,
-        config.pid_overrides.as_ref(),
     ) {
         Ok(t) => {
             if let Some(ref t) = t {
@@ -211,13 +210,12 @@ async fn run(
     // up program_filter / pid_overrides_rewriter / pid_map. Synthetic-TS
     // file types (image / mp4 → TsMuxer) get pid_overrides handled by
     // the muxer; for TS-passthrough files, the post-process rewriter
-    // can re-PID them. The `has_transcode` flag controls override skip.
+    // re-PIDs them.
     let mut post = crate::engine::input_post_process::InputPostProcess::from_config(
         &crate::engine::input_post_process::InputPostProcessConfig {
             program_number: config.program_number,
             pid_overrides: config.pid_overrides.as_ref(),
             pid_map: config.pid_map.as_ref(),
-            has_transcode: config.audio_encode.is_some() || config.video_encode.is_some(),
         },
     );
     if let Some(ref _p) = post {

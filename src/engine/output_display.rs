@@ -55,8 +55,10 @@ use crate::config::models::{DisplayOutputConfig, DisplayScalingMode};
 use crate::display::audio_bars::{new_shared_meter, SharedMeter, StreamHeader};
 use crate::display::audio_meter::spawn_audio_meter;
 use crate::display::{audio::AudioBackend, clock::AudioClock, kms::KmsDisplay};
+use crate::engine::audio_decode::DecodeStats;
 use crate::engine::packet::RtpPacket;
 use crate::engine::ts_demux::{DemuxedFrame, TsDemuxer};
+use crate::engine::video_decode_stats::VideoDecodeStats;
 use crate::manager::events::{EventSender, EventSeverity};
 use crate::stats::collector::{DisplayStatsCounters, OutputStatsAccumulator};
 
@@ -439,6 +441,37 @@ async fn run_display_output(
         )
     });
 
+    // Display is a terminal consumer — it decodes the flow's broadcast
+    // channel and renders to KMS + ALSA. No encoder runs, so register a
+    // passthrough-true egress descriptor: `build_pipeline_summary` will
+    // therefore suppress the `audio_encode` / `video_encode` tags. The
+    // `audio_decode` and `video_decode` handles below cause those tags
+    // to surface so the manager UI labels the leg as "Audio Decode" /
+    // "Video Decode" — never "Transcode".
+    output_stats.set_egress_static(crate::stats::collector::EgressMediaSummaryStatic {
+        transport_mode: None,
+        video_passthrough: true,
+        audio_passthrough: true,
+        audio_only: false,
+        ..Default::default()
+    });
+    let audio_decode_counters = Arc::new(DecodeStats::new());
+    let video_decode_counters = Arc::new(VideoDecodeStats::new());
+    // Register the decode handles up-front so the very first stats
+    // snapshot already carries the badge — even before the first frame
+    // is decoded. The handles are kept in sync with the live codec /
+    // geometry by the demux loop on every successful decode.
+    output_stats.set_decode_stats(
+        Arc::clone(&audio_decode_counters),
+        "",   // codec label lands when the first audio frame is decoded
+        0, 0, // sample rate / channels fill in on first decode
+    );
+    output_stats.set_video_decode_stats(
+        Arc::clone(&video_decode_counters),
+        "",   // codec label lands on first decoded video frame
+        0, 0, 0.0,
+    );
+
     // Demux + decode child — owns the broadcast subscriber.
     let demux_cancel = cancel.child_token();
     let demux_counters = Arc::clone(&counters);
@@ -472,6 +505,9 @@ async fn run_display_output(
     // zero-copy prime frames + let the display task program
     // `HDR_OUTPUT_METADATA` on the connector (panel does HDR).
     let demux_panel_hdr_capable = kms.panel_hdr_capable();
+    let demux_output_stats = Arc::clone(&output_stats);
+    let demux_audio_decode_counters = Arc::clone(&audio_decode_counters);
+    let demux_video_decode_counters = Arc::clone(&video_decode_counters);
     let demux_handle = tokio::task::spawn_blocking(move || {
         demux_decode_loop(
             &mut demux_rx,
@@ -489,6 +525,9 @@ async fn run_display_output(
             demux_hw_already_unavailable,
             demux_frame_gen,
             demux_panel_hdr_capable,
+            demux_output_stats,
+            demux_audio_decode_counters,
+            demux_video_decode_counters,
         );
     });
 
@@ -742,7 +781,16 @@ fn demux_decode_loop(
     hw_already_unavailable: bool,
     frame_gen: Arc<AtomicU64>,
     panel_hdr_capable: bool,
+    output_stats: Arc<OutputStatsAccumulator>,
+    audio_decode_counters: Arc<DecodeStats>,
+    video_decode_counters: Arc<VideoDecodeStats>,
 ) {
+    // Track the codec last reported on the audio-decode handle so we
+    // only touch the Mutex<String> when the source codec actually
+    // changes (cheap, but no point taking the lock on every frame).
+    // Video codec / dimensions are updated inside `drain_video_frames`
+    // off the decoded frame's own descriptors.
+    let mut last_audio_codec_label: Option<&'static str> = None;
     let mut demuxer = TsDemuxer::with_audio_track(program_number, audio_track_index);
     let mut video_decoder: Option<VideoDecoder> = None;
     let mut current_video_codec: Option<VideoCodec> = None;
@@ -891,6 +939,8 @@ fn demux_decode_loop(
                         &frame_gen,
                         panel_hdr_capable,
                         stream_ids,
+                        &video_decode_counters,
+                        &output_stats,
                     );
                 }
                 DemuxedFrame::H265 { nalus, pts, .. } => {
@@ -918,6 +968,8 @@ fn demux_decode_loop(
                         &frame_gen,
                         panel_hdr_capable,
                         stream_ids,
+                        &video_decode_counters,
+                        &output_stats,
                     );
                 }
                 DemuxedFrame::Mpeg2 { es, pts, .. } => {
@@ -954,12 +1006,20 @@ fn demux_decode_loop(
                         &frame_gen,
                         panel_hdr_capable,
                         stream_ids,
+                        &video_decode_counters,
+                        &output_stats,
                     );
                 }
                 DemuxedFrame::Aac { data, pts } => {
                     counters.set_audio_codec_label(
                         crate::stats::collector::DisplayCodecLabel::Aac,
                     );
+                    if last_audio_codec_label != Some("AAC-LC") {
+                        if let Some(h) = output_stats.audio_decode_stats_handle() {
+                            h.set_input_codec("AAC-LC");
+                        }
+                        last_audio_codec_label = Some("AAC-LC");
+                    }
                     if let Some(asc) = demuxer.cached_aac_config() {
                         if aac_decoder.is_none() {
                             if let Ok(d) = aac_decoder_from_adts_config(asc) {
@@ -967,29 +1027,49 @@ fn demux_decode_loop(
                             }
                         }
                         if let Some(decoder) = aac_decoder.as_mut() {
-                            if let Ok(decoded) = decoder.decode_frame(&data) {
-                                let sr = decoder.sample_rate().unwrap_or(48_000);
-                                let ch = decoder.channels().unwrap_or(2);
-                                if atx.try_send(AudioBlock {
-                                    planar: decoded.planar,
-                                    pts_90k: pts,
-                                    sample_rate: sr,
-                                    channels: ch,
-                                    frame_gen: frame_gen.load(Ordering::Relaxed),
-                                }).is_err()
-                                {
-                                    counters
-                                        .audio_dropped_mpsc_full
-                                        .fetch_add(1, Ordering::Relaxed);
+                            audio_decode_counters.inc_input();
+                            match decoder.decode_frame(&data) {
+                                Ok(decoded) => {
+                                    audio_decode_counters.inc_output();
+                                    let sr = decoder.sample_rate().unwrap_or(48_000);
+                                    let ch = decoder.channels().unwrap_or(2);
+                                    if let Some(h) = output_stats.audio_decode_stats_handle() {
+                                        h.set_output_shape(sr, ch as u8);
+                                    }
+                                    if atx.try_send(AudioBlock {
+                                        planar: decoded.planar,
+                                        pts_90k: pts,
+                                        sample_rate: sr,
+                                        channels: ch,
+                                        frame_gen: frame_gen.load(Ordering::Relaxed),
+                                    }).is_err()
+                                    {
+                                        counters
+                                            .audio_dropped_mpsc_full
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                                Err(_) => {
+                                    audio_decode_counters.inc_error();
                                 }
                             }
+                        } else {
+                            audio_decode_counters.inc_dropped_uninit();
                         }
+                    } else {
+                        audio_decode_counters.inc_dropped_uninit();
                     }
                 }
                 DemuxedFrame::Opus { data, pts } => {
                     counters.set_audio_codec_label(
                         crate::stats::collector::DisplayCodecLabel::Opus,
                     );
+                    if last_audio_codec_label != Some("Opus") {
+                        if let Some(h) = output_stats.audio_decode_stats_handle() {
+                            h.set_input_codec("Opus");
+                        }
+                        last_audio_codec_label = Some("Opus");
+                    }
                     // Opus rides on `stream_type = 0x06` (private_data) +
                     // an Opus registration descriptor. The PES payload is
                     // a sequence of Opus access units, each prefixed by
@@ -1006,8 +1086,16 @@ fn demux_decode_loop(
                         for frame_bytes in
                             crate::engine::audio_decode::split_opus_frames(&data)
                         {
+                            audio_decode_counters.inc_input();
                             if decoder.send_packet(frame_bytes, pts as i64).is_ok() {
                                 while let Ok(decoded) = decoder.receive_frame() {
+                                    audio_decode_counters.inc_output();
+                                    if let Some(h) = output_stats.audio_decode_stats_handle() {
+                                        h.set_output_shape(
+                                            decoded.sample_rate,
+                                            decoded.channels as u8,
+                                        );
+                                    }
                                     if atx.try_send(AudioBlock {
                                         planar: decoded.planar,
                                         pts_90k: pts,
@@ -1021,8 +1109,12 @@ fn demux_decode_loop(
                                             .fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
+                            } else {
+                                audio_decode_counters.inc_error();
                             }
                         }
+                    } else {
+                        audio_decode_counters.inc_dropped_uninit();
                     }
                 }
                 DemuxedFrame::Discontinuity => {
@@ -1102,6 +1194,19 @@ fn demux_decode_loop(
                         AudioDecoderCodec::Opus => crate::stats::collector::DisplayCodecLabel::Opus,
                         AudioDecoderCodec::AacLatm => crate::stats::collector::DisplayCodecLabel::Aac,
                     });
+                    let codec_label: &'static str = match codec {
+                        AudioDecoderCodec::Mp2 => "MP2",
+                        AudioDecoderCodec::Ac3 => "AC-3",
+                        AudioDecoderCodec::Eac3 => "E-AC-3",
+                        AudioDecoderCodec::Opus => "Opus",
+                        AudioDecoderCodec::AacLatm => "AAC-LATM",
+                    };
+                    if last_audio_codec_label != Some(codec_label) {
+                        if let Some(h) = output_stats.audio_decode_stats_handle() {
+                            h.set_input_codec(codec_label);
+                        }
+                        last_audio_codec_label = Some(codec_label);
+                    }
                     if current_ff_codec != Some(codec) {
                         ff_audio_decoder = FfAudioDecoder::open(codec).ok();
                         current_ff_codec = Some(codec);
@@ -1110,8 +1215,16 @@ fn demux_decode_loop(
                         for frame_bytes in
                             crate::engine::audio_decode::split_audio_codec_frames(&data, codec)
                         {
+                            audio_decode_counters.inc_input();
                             if decoder.send_packet(frame_bytes, pts as i64).is_ok() {
                                 while let Ok(decoded) = decoder.receive_frame() {
+                                    audio_decode_counters.inc_output();
+                                    if let Some(h) = output_stats.audio_decode_stats_handle() {
+                                        h.set_output_shape(
+                                            decoded.sample_rate,
+                                            decoded.channels as u8,
+                                        );
+                                    }
                                     if atx.try_send(AudioBlock {
                                         planar: decoded.planar,
                                         pts_90k: pts,
@@ -1125,8 +1238,12 @@ fn demux_decode_loop(
                                             .fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
+                            } else {
+                                audio_decode_counters.inc_error();
                             }
                         }
+                    } else {
+                        audio_decode_counters.inc_dropped_uninit();
                     }
                 }
             }
@@ -1515,7 +1632,13 @@ fn handle_video_au(
     frame_gen: &AtomicU64,
     panel_hdr_capable: bool,
     stream_ids: StreamIds,
+    video_decode_counters: &VideoDecodeStats,
+    output_stats: &OutputStatsAccumulator,
 ) {
+    // Count the access unit as a decode-stage input frame the moment we
+    // resolve a decoder for it. Output frames are bumped per
+    // `receive_frame` success inside `drain_video_frames`.
+    video_decode_counters.inc_input();
     if pts_jump(*last_video_pts, pts) {
         // Section 5: count + log every PTS jump so the operator can
         // tell whether the Reolink "degraded picture" is the
@@ -1591,6 +1714,8 @@ fn handle_video_au(
         codec,
         panel_hdr_capable,
         stream_ids,
+        video_decode_counters,
+        output_stats,
     );
     let decode_us = decode_start.elapsed().as_micros() as u64;
     counters.decode_count.fetch_add(1, Ordering::Relaxed);
@@ -1762,6 +1887,7 @@ fn feed_video_decoder(
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn drain_video_frames(
     decoder: &mut VideoDecoder,
     fallback_pts_90k: u64,
@@ -1777,8 +1903,29 @@ fn drain_video_frames(
     codec: VideoCodec,
     panel_hdr_capable: bool,
     stream_ids: StreamIds,
+    video_decode_counters: &VideoDecodeStats,
+    output_stats: &OutputStatsAccumulator,
 ) {
     while let Ok(frame) = decoder.receive_frame() {
+        video_decode_counters.inc_output();
+        // Refresh the registered handle's codec / geometry whenever the
+        // resolution changes. Cheap: at most one Mutex<String> lock per
+        // resolution change (typically just once per flow run).
+        if let Some(h) = output_stats.video_decode_stats_handle() {
+            let codec_label: &'static str = match codec {
+                VideoCodec::H264 => "h264",
+                VideoCodec::Hevc => "hevc",
+                VideoCodec::Mpeg2 => "mpeg2",
+            };
+            h.set_input_codec(codec_label);
+            let w = frame.width() as u32;
+            let hght = frame.height() as u32;
+            if h.output_width.load(Ordering::Relaxed) != w
+                || h.output_height.load(Ordering::Relaxed) != hght
+            {
+                h.set_geometry(w, hght, 0.0);
+            }
+        }
         // A successful frame proves the decode path is live — reset
         // the per-error window so the runtime fallback only triggers
         // on *sustained* failure, not the legit packet errors a

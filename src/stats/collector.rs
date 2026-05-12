@@ -78,6 +78,13 @@ pub struct OutputStatsAccumulator {
     /// startup by outputs that build an
     /// `engine::ts_video_replace::TsVideoReplacer`.
     video_encode_stats: OnceLock<VideoEncodeStatsHandle>,
+    /// Optional handle to the per-output video decode counters plus the
+    /// resolved source codec / geometry descriptors. Set once at output
+    /// startup by outputs that drive a `video_engine::VideoDecoder` —
+    /// either inside `engine::ts_video_replace::TsVideoReplacer` (true
+    /// transcode, paired with [`Self::video_encode_stats`]) or as the
+    /// terminal decoder in `engine::output_display` (decode-only).
+    video_decode_stats: OnceLock<VideoDecodeStatsHandle>,
     /// Optional handle to the per-output local-display task's counters +
     /// chosen-mode descriptors. Set once at output startup by
     /// `engine::output_display`. Read by the snapshot path to populate
@@ -119,12 +126,50 @@ pub struct OutputStatsAccumulator {
 
 /// Registered handle to a per-output decode stage's counters plus the
 /// steady-state descriptors the snapshot path needs to build a
-/// [`crate::stats::models::DecodeStatsSnapshot`].
+/// [`crate::stats::models::DecodeStatsSnapshot`]. `input_codec` is wrapped
+/// in `Mutex` so display outputs can update the label as the source codec
+/// changes mid-flow (an input switch can flip AAC → MP2 → AC-3) without
+/// re-registering the handle.
 pub struct AudioDecodeStatsHandle {
     pub stats: Arc<crate::engine::audio_decode::DecodeStats>,
-    pub input_codec: String,
-    pub output_sample_rate_hz: u32,
-    pub output_channels: u8,
+    pub input_codec: std::sync::Mutex<String>,
+    pub output_sample_rate_hz: std::sync::atomic::AtomicU32,
+    pub output_channels: std::sync::atomic::AtomicU8,
+}
+
+impl AudioDecodeStatsHandle {
+    pub fn new(
+        stats: Arc<crate::engine::audio_decode::DecodeStats>,
+        input_codec: impl Into<String>,
+        output_sample_rate_hz: u32,
+        output_channels: u8,
+    ) -> Self {
+        Self {
+            stats,
+            input_codec: std::sync::Mutex::new(input_codec.into()),
+            output_sample_rate_hz: std::sync::atomic::AtomicU32::new(output_sample_rate_hz),
+            output_channels: std::sync::atomic::AtomicU8::new(output_channels),
+        }
+    }
+
+    pub fn set_input_codec(&self, codec: impl Into<String>) {
+        if let Ok(mut g) = self.input_codec.lock() {
+            *g = codec.into();
+        }
+    }
+
+    pub fn set_output_shape(&self, sample_rate_hz: u32, channels: u8) {
+        use std::sync::atomic::Ordering;
+        self.output_sample_rate_hz.store(sample_rate_hz, Ordering::Relaxed);
+        self.output_channels.store(channels, Ordering::Relaxed);
+    }
+
+    fn snapshot_input_codec(&self) -> String {
+        self.input_codec
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// Registered handle to a per-output encode stage's counters plus the
@@ -150,6 +195,68 @@ pub struct VideoEncodeStatsHandle {
     pub output_fps: f32,
     pub output_bitrate_kbps: u32,
     pub encoder_backend: String,
+}
+
+/// Registered handle to a per-input/output video decode stage's counters
+/// plus the source codec + decoded geometry descriptors. The atomic
+/// counters live in [`crate::engine::video_decode_stats::VideoDecodeStats`];
+/// the descriptors are wrapped in `Mutex<...>` so the registering task can
+/// update them when the source codec / resolution / frame rate changes
+/// mid-flow (e.g. an input switch on a Display output).
+pub struct VideoDecodeStatsHandle {
+    pub stats: Arc<crate::engine::video_decode_stats::VideoDecodeStats>,
+    pub input_codec: std::sync::Mutex<String>,
+    pub output_width: std::sync::atomic::AtomicU32,
+    pub output_height: std::sync::atomic::AtomicU32,
+    /// Frame rate stored as IEEE-754 bits via [`AtomicU32`] — same trick
+    /// used by `engine::ts_video_replace::VideoEncodeStats` for atomic
+    /// reads of a float.
+    pub output_fps_bits: std::sync::atomic::AtomicU32,
+}
+
+impl VideoDecodeStatsHandle {
+    pub fn new(stats: Arc<crate::engine::video_decode_stats::VideoDecodeStats>) -> Self {
+        use std::sync::atomic::AtomicU32;
+        Self {
+            stats,
+            input_codec: std::sync::Mutex::new(String::new()),
+            output_width: AtomicU32::new(0),
+            output_height: AtomicU32::new(0),
+            output_fps_bits: AtomicU32::new(0),
+        }
+    }
+
+    pub fn set_input_codec(&self, codec: impl Into<String>) {
+        if let Ok(mut g) = self.input_codec.lock() {
+            *g = codec.into();
+        }
+    }
+
+    pub fn set_geometry(&self, width: u32, height: u32, fps: f32) {
+        use std::sync::atomic::Ordering;
+        self.output_width.store(width, Ordering::Relaxed);
+        self.output_height.store(height, Ordering::Relaxed);
+        self.output_fps_bits.store(fps.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> crate::stats::models::VideoDecodeStatsSnapshot {
+        use std::sync::atomic::Ordering;
+        let input_codec = self
+            .input_codec
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        crate::stats::models::VideoDecodeStatsSnapshot {
+            input_frames: self.stats.input_frames.load(Ordering::Relaxed),
+            output_frames: self.stats.output_frames.load(Ordering::Relaxed),
+            decode_errors: self.stats.decode_errors.load(Ordering::Relaxed),
+            dropped_uninit: self.stats.dropped_uninit.load(Ordering::Relaxed),
+            input_codec,
+            output_width: self.output_width.load(Ordering::Relaxed),
+            output_height: self.output_height.load(Ordering::Relaxed),
+            output_fps: f32::from_bits(self.output_fps_bits.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 /// Discriminant table for the lock-free `video_codec_label` /
@@ -535,6 +642,7 @@ impl OutputStatsAccumulator {
             audio_encode_stats: OnceLock::new(),
             audio_replacer_stats: OnceLock::new(),
             video_encode_stats: OnceLock::new(),
+            video_decode_stats: OnceLock::new(),
             display_stats: OnceLock::new(),
             egress_static: OnceLock::new(),
             latency_min_us: AtomicU64::new(u64::MAX),
@@ -611,13 +719,27 @@ impl OutputStatsAccumulator {
         input_codec: impl Into<String>,
         output_sample_rate_hz: u32,
         output_channels: u8,
-    ) {
-        let _ = self.audio_decode_stats.set(AudioDecodeStatsHandle {
-            stats,
-            input_codec: input_codec.into(),
-            output_sample_rate_hz,
-            output_channels,
+    ) -> &AudioDecodeStatsHandle {
+        let handle = self.audio_decode_stats.get_or_init(|| {
+            AudioDecodeStatsHandle::new(
+                stats,
+                input_codec.into(),
+                output_sample_rate_hz,
+                output_channels,
+            )
         });
+        // If the handle was already registered (e.g. a display output
+        // re-registering on a codec switch), keep the live counters but
+        // refresh the descriptors so the manager UI tracks reality.
+        handle.set_output_shape(output_sample_rate_hz, output_channels);
+        handle
+    }
+
+    /// Borrow the registered audio-decode handle, if any. Used by
+    /// long-lived tasks (Display output) that need to update the source
+    /// codec / output PCM shape whenever the upstream changes mid-flow.
+    pub fn audio_decode_stats_handle(&self) -> Option<&AudioDecodeStatsHandle> {
+        self.audio_decode_stats.get()
     }
 
     /// Register the per-output audio encode stats handle. Called once at
@@ -677,6 +799,35 @@ impl OutputStatsAccumulator {
             output_bitrate_kbps,
             encoder_backend: encoder_backend.into(),
         });
+    }
+
+    /// Register the per-output video decode stats handle. Called once at
+    /// output startup by outputs that drive a `video_engine::VideoDecoder` —
+    /// either `engine::ts_video_replace::TsVideoReplacer` (true transcode)
+    /// or `engine::output_display` (decode-only). Subsequent calls return
+    /// the existing handle so the caller can keep updating the source-codec
+    /// label and geometry on input switches without re-registering.
+    pub fn set_video_decode_stats(
+        &self,
+        stats: Arc<crate::engine::video_decode_stats::VideoDecodeStats>,
+        input_codec: impl Into<String>,
+        output_width: u32,
+        output_height: u32,
+        output_fps: f32,
+    ) -> &VideoDecodeStatsHandle {
+        let handle = self
+            .video_decode_stats
+            .get_or_init(|| VideoDecodeStatsHandle::new(stats));
+        handle.set_input_codec(input_codec);
+        handle.set_geometry(output_width, output_height, output_fps);
+        handle
+    }
+
+    /// Borrow the registered video decode handle, if any. Used by long-lived
+    /// tasks (Display output) that need to update the source-codec / geometry
+    /// fields whenever the upstream stream changes mid-flow.
+    pub fn video_decode_stats_handle(&self) -> Option<&VideoDecodeStatsHandle> {
+        self.video_decode_stats.get()
     }
 
     /// Register the per-output local-display counters + mode descriptors.
@@ -785,9 +936,9 @@ impl OutputStatsAccumulator {
                 output_blocks: h.stats.output_blocks.load(Ordering::Relaxed),
                 decode_errors: h.stats.decode_errors.load(Ordering::Relaxed),
                 dropped_uninit: h.stats.dropped_uninit.load(Ordering::Relaxed),
-                input_codec: h.input_codec.clone(),
-                output_sample_rate_hz: h.output_sample_rate_hz,
-                output_channels: h.output_channels,
+                input_codec: h.snapshot_input_codec(),
+                output_sample_rate_hz: h.output_sample_rate_hz.load(Ordering::Relaxed),
+                output_channels: h.output_channels.load(Ordering::Relaxed),
             }
         });
         let audio_encode_stats = self.audio_encode_stats.get().map(|h| {
@@ -814,6 +965,7 @@ impl OutputStatsAccumulator {
                 source_stream_type: src_stream_type,
             }
         });
+        let video_decode_stats = self.video_decode_stats.get().map(|h| h.snapshot());
         let video_encode_stats = self.video_encode_stats.get().map(|h| {
             // Prefer the actually-opened backend (after Auto-chain
             // demote) over the requested-codec label captured at
@@ -963,6 +1115,7 @@ impl OutputStatsAccumulator {
             audio_decode_stats,
             audio_encode_stats,
             video_encode_stats,
+            video_decode_stats,
             latency,
             // Filled in by `FlowStatsAccumulator::snapshot()` so it can merge
             // the flow's input MediaAnalysis with this output's per-stage
@@ -2057,6 +2210,10 @@ pub struct FlowStatsAccumulator {
     /// descriptors. Populated by ST 2110-20/-23 inputs or by Group A inputs
     /// that configured a `video_encode` block (via the `InputTranscoder`).
     input_video_encode_stats: DashMap<String, VideoEncodeStatsHandle>,
+    /// Per-input-id map of video decode stage handles. Populated by Group A
+    /// inputs whose `InputTranscoder` composer decodes the source video
+    /// before re-encoding it on the ingest leg.
+    input_video_decode_stats: DashMap<String, Arc<VideoDecodeStatsHandle>>,
     /// Per-input-id map of static ingress-summary descriptors. The dynamic
     /// codec/format fields are merged in at `FlowStatsAccumulator::snapshot()`.
     ingress_static: DashMap<String, EgressMediaSummaryStatic>,
@@ -2210,6 +2367,7 @@ impl FlowStatsAccumulator {
             input_audio_decode_stats: DashMap::new(),
             input_audio_encode_stats: DashMap::new(),
             input_video_encode_stats: DashMap::new(),
+            input_video_decode_stats: DashMap::new(),
             ingress_static: DashMap::new(),
             per_es_stats: DashMap::new(),
             pid_routing: std::sync::RwLock::new(std::collections::HashMap::new()),
@@ -2309,12 +2467,12 @@ impl FlowStatsAccumulator {
     ) {
         self.input_audio_decode_stats.insert(
             input_id.to_string(),
-            AudioDecodeStatsHandle {
+            AudioDecodeStatsHandle::new(
                 stats,
-                input_codec: input_codec.into(),
+                input_codec,
                 output_sample_rate_hz,
                 output_channels,
-            },
+            ),
         );
     }
 
@@ -2339,6 +2497,29 @@ impl FlowStatsAccumulator {
                 target_bitrate_kbps,
             },
         );
+    }
+
+    /// Register an input-side video decode stats handle. Called at flow start
+    /// by Group A inputs whose `InputTranscoder` composer decodes the source
+    /// before re-encoding it. The handle is shared so the registering task
+    /// can keep updating `input_codec` / `output_*` whenever the upstream
+    /// changes mid-flow.
+    #[allow(dead_code)]
+    pub fn set_input_video_decode_stats(
+        &self,
+        input_id: &str,
+        stats: Arc<crate::engine::video_decode_stats::VideoDecodeStats>,
+        input_codec: impl Into<String>,
+        output_width: u32,
+        output_height: u32,
+        output_fps: f32,
+    ) -> Arc<VideoDecodeStatsHandle> {
+        let handle = Arc::new(VideoDecodeStatsHandle::new(stats));
+        handle.set_input_codec(input_codec);
+        handle.set_geometry(output_width, output_height, output_fps);
+        self.input_video_decode_stats
+            .insert(input_id.to_string(), handle.clone());
+        handle
     }
 
     /// Register an input-side video encode stats handle for a specific input.
@@ -2541,6 +2722,7 @@ impl FlowStatsAccumulator {
                 out.audio_decode_stats.as_ref(),
                 out.audio_encode_stats.as_ref(),
                 out.video_encode_stats.as_ref(),
+                out.video_decode_stats.as_ref(),
             );
         }
 
@@ -2725,9 +2907,9 @@ impl FlowStatsAccumulator {
                             output_blocks: h.stats.output_blocks.load(Ordering::Relaxed),
                             decode_errors: h.stats.decode_errors.load(Ordering::Relaxed),
                             dropped_uninit: h.stats.dropped_uninit.load(Ordering::Relaxed),
-                            input_codec: h.input_codec.clone(),
-                            output_sample_rate_hz: h.output_sample_rate_hz,
-                            output_channels: h.output_channels,
+                            input_codec: h.snapshot_input_codec(),
+                            output_sample_rate_hz: h.output_sample_rate_hz.load(Ordering::Relaxed),
+                            output_channels: h.output_channels.load(Ordering::Relaxed),
                         }
                     });
                 let in_audio_encode =
@@ -2750,6 +2932,10 @@ impl FlowStatsAccumulator {
                             source_stream_type: 0,
                         }
                     });
+                let in_video_decode = self
+                    .input_video_decode_stats
+                    .get(active_key)
+                    .map(|h| h.value().snapshot());
                 let in_video_encode =
                     self.input_video_encode_stats.get(active_key).map(|h| {
                         // Prefer the actually-opened backend (after
@@ -2790,6 +2976,7 @@ impl FlowStatsAccumulator {
                     in_audio_decode.as_ref(),
                     in_audio_encode.as_ref(),
                     in_video_encode.as_ref(),
+                    in_video_decode.as_ref(),
                 );
 
                 let total_input_packets = self.input_packets.load(Ordering::Relaxed);
@@ -2828,6 +3015,7 @@ impl FlowStatsAccumulator {
                     audio_decode_stats: in_audio_decode,
                     audio_encode_stats: in_audio_encode,
                     video_encode_stats: in_video_encode,
+                    video_decode_stats: in_video_decode,
                     ingress_summary,
                 }
             },
@@ -3099,6 +3287,7 @@ fn red_blue_to_stats(
 /// encode/decode/transcode stats and the cached input `MediaAnalysisStats`.
 /// Returns `None` when no static descriptor was registered — callers then
 /// degrade to their previous behaviour.
+#[allow(clippy::too_many_arguments)]
 fn build_pipeline_summary(
     stat_desc: Option<&EgressMediaSummaryStatic>,
     program_number: Option<u16>,
@@ -3107,6 +3296,7 @@ fn build_pipeline_summary(
     audio_decode: Option<&crate::stats::models::DecodeStatsSnapshot>,
     audio_encode: Option<&crate::stats::models::EncodeStatsSnapshot>,
     video_encode: Option<&crate::stats::models::VideoEncodeStatsSnapshot>,
+    video_decode: Option<&crate::stats::models::VideoDecodeStatsSnapshot>,
 ) -> Option<crate::stats::models::EgressMediaSummary> {
     let stat_desc = stat_desc?;
 
@@ -3154,6 +3344,9 @@ fn build_pipeline_summary(
     }
     if audio_encode.is_some() || (!stat_desc.audio_passthrough && !stat_desc.audio_only) {
         summary.pipeline.push("audio_encode".to_string());
+    }
+    if video_decode.is_some() {
+        summary.pipeline.push("video_decode".to_string());
     }
     if video_encode.is_some() || (!stat_desc.video_passthrough && !stat_desc.audio_only) {
         summary.pipeline.push("video_encode".to_string());

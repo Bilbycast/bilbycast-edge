@@ -105,7 +105,6 @@ pub fn spawn_rtmp_input(
             config.transcode.as_ref(),
             config.video_encode.as_ref(),
             Some(force_idr.clone()),
-            config.pid_overrides.as_ref(),
         ) {
             Ok(t) => {
                 if let Some(ref t) = t {
@@ -138,7 +137,6 @@ pub fn spawn_rtmp_input(
             program_number: config.program_number,
             pid_overrides: None,
             pid_map: config.pid_map.as_ref(),
-            has_transcode: true, // double-belt: pid_overrides handled by TsMuxer
         });
         if let Some(ref _p) = post {
             tracing::info!(

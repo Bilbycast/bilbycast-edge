@@ -40,7 +40,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::config::models::{TsPidOverridesMap, VideoEncodeConfig};
+use crate::config::models::VideoEncodeConfig;
 
 use super::ts_parse::{
     mpeg2_crc32, parse_pat_programs, ts_has_adaptation, ts_has_payload, ts_payload_offset, ts_pid,
@@ -150,6 +150,12 @@ pub struct TsVideoReplacer {
     /// Shared atomic counters surfaced via [`Self::stats_handle`] so the
     /// per-output stats accumulator can register them at startup.
     stats: Arc<VideoEncodeStats>,
+    /// Internal-decoder counters surfaced via
+    /// [`Self::decode_stats_handle`]. Pairs with the encode counters so
+    /// the manager pipeline emits `video_decode` + `video_encode` →
+    /// "Video Transcode" badge (vs encode-only ST 2110-20 ingress, which
+    /// emits only `video_encode` → "Video Encode" badge).
+    decode_stats: Arc<crate::engine::video_decode_stats::VideoDecodeStats>,
     /// One-shot IDR request for the next encoded frame. External callers
     /// (e.g. the input forwarder on a flow switch) flip this to `true`;
     /// the replacer consumes and clears it before the next encode call.
@@ -199,27 +205,27 @@ impl TsVideoReplacer {
     /// the encoder to emit an IDR on its next frame. When `None`, the
     /// replacer allocates its own handle — useful for output-side callers
     /// that don't need external keyframe control.
+    ///
+    /// PID rewriting (the operator's `pid_overrides` map) is handled by the
+    /// downstream `TsPidOverridesRewriter` stage — the replacer re-encodes
+    /// video on the same source PID it learned from the PMT and lets that
+    /// stage rename the PID afterwards.
     #[cfg(feature = "video-thumbnail")]
     pub fn new(
         cfg: &VideoEncodeConfig,
         force_idr: Option<Arc<AtomicBool>>,
-        pid_overrides: Option<&TsPidOverridesMap>,
     ) -> Result<Self, TsVideoReplaceError> {
         let stats = Arc::new(VideoEncodeStats::default());
+        let decode_stats =
+            Arc::new(crate::engine::video_decode_stats::VideoDecodeStats::new());
         let force_idr = force_idr.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let external_reset = Arc::new(AtomicBool::new(false));
-        // SPTS-only single-program scaffold today (mirrors TsAudioReplacer).
-        // Per-program N-program awareness lands in a follow-up; for now
-        // consume the entry keyed `1`.
-        let out_video_pid_override = pid_overrides
-            .and_then(|m| m.get(&1))
-            .and_then(|e| e.video_pid);
         let inner = inner::Inner::from_config(
             cfg,
             stats.clone(),
+            decode_stats.clone(),
             force_idr.clone(),
             external_reset.clone(),
-            out_video_pid_override,
             cfg.source_video_pid,
         )?;
         let description = inner.target_description();
@@ -227,6 +233,7 @@ impl TsVideoReplacer {
             inner,
             description,
             stats,
+            decode_stats,
             force_idr_on_next_frame: force_idr,
             external_reset_on_switch: external_reset,
         })
@@ -238,7 +245,6 @@ impl TsVideoReplacer {
     pub fn new(
         _cfg: &VideoEncodeConfig,
         _force_idr: Option<Arc<AtomicBool>>,
-        _pid_overrides: Option<&TsPidOverridesMap>,
     ) -> Result<Self, TsVideoReplaceError> {
         Err(TsVideoReplaceError::VideoEngineMissing)
     }
@@ -253,6 +259,16 @@ impl TsVideoReplacer {
     /// at output startup.
     pub fn stats_handle(&self) -> Arc<VideoEncodeStats> {
         self.stats.clone()
+    }
+
+    /// Shared handle to the internal-decoder counters. Outputs register
+    /// this via [`crate::stats::collector::OutputStatsAccumulator::set_video_decode_stats`]
+    /// at spawn time so the egress pipeline emits `video_decode` — paired
+    /// with `video_encode` the UI renders a single "Video Transcode" badge.
+    pub fn decode_stats_handle(
+        &self,
+    ) -> Arc<crate::engine::video_decode_stats::VideoDecodeStats> {
+        self.decode_stats.clone()
     }
 
     /// Shared handle to the one-shot IDR request flag. Setting this to
@@ -371,13 +387,6 @@ mod inner {
 
         pmt_pid: Option<u16>,
         video_pid: Option<u16>,
-        /// Optional override for the output video PID. When set, the
-        /// encoded video TS packets are written on this PID instead of
-        /// the source `video_pid`, and the rewritten PMT entry advertises
-        /// the override. Pinning every transcoded input to the same
-        /// out-PID lets a downstream decoder stay locked across switcher
-        /// hops between transcoded inputs.
-        out_video_pid_override: Option<u16>,
         /// Operator-pinned source video PID (`video_encode.source_video_pid`).
         /// When `Some`, PMT discovery looks for this PID specifically; when
         /// `None`, the legacy first-matching-codec rule applies.
@@ -441,6 +450,7 @@ mod inner {
 
         description: String,
         stats: Arc<VideoEncodeStats>,
+        decode_stats: Arc<crate::engine::video_decode_stats::VideoDecodeStats>,
         force_idr: Arc<AtomicBool>,
         /// Shared with the outer `TsVideoReplacer::external_reset_on_switch`.
         /// Checked once per `process()` entry; on `true` we run
@@ -491,9 +501,9 @@ mod inner {
         pub fn from_config(
             cfg: &VideoEncodeConfig,
             stats: Arc<VideoEncodeStats>,
+            decode_stats: Arc<crate::engine::video_decode_stats::VideoDecodeStats>,
             force_idr: Arc<AtomicBool>,
             external_reset: Arc<AtomicBool>,
-            out_video_pid_override: Option<u16>,
             source_video_pid_pin: Option<u16>,
         ) -> Result<Self, TsVideoReplaceError> {
             // Resolve `*_auto` strings AND validate explicit backends
@@ -569,7 +579,6 @@ mod inner {
                 fps_den: cfg.fps_den,
                 pmt_pid: None,
                 video_pid: None,
-                out_video_pid_override,
                 source_video_pid_pin,
                 last_pinned_warn: None,
                 source_stream_type: 0,
@@ -590,6 +599,7 @@ mod inner {
                 unlocked_pes_count: 0,
                 description,
                 stats,
+                decode_stats,
                 force_idr,
                 external_reset,
                 last_emitted_pts_90k: None,
@@ -750,7 +760,6 @@ mod inner {
                             rewrite_pmt_video_stream_type(
                                 &mut rewritten,
                                 self.video_pid.unwrap(),
-                                self.out_video_pid_override,
                                 self.target_stream_type,
                             );
                             // Stamp the per-replacer monotonic version so
@@ -789,7 +798,7 @@ mod inner {
             if self.pipeline.is_open() {
                 if let Ok(frames) = self.pipeline.flush() {
                     let vpid = match self.video_pid {
-                        Some(p) => self.out_video_pid_override.unwrap_or(p),
+                        Some(p) => p,
                         None => return,
                     };
                     for ef in frames {
@@ -968,8 +977,10 @@ mod inner {
                 // queue tag every output PES with the matching source
                 // PTS instead of the sample-counted anchor — see the
                 // src_pts_queue field for the rationale.
+                self.decode_stats.inc_input();
                 if let Err(e) = dec.send_packet_with_pts(&es_data, pts as i64) {
                     // Partial/invalid packet — keep going.
+                    self.decode_stats.inc_error();
                     tracing::debug!("ts_video_replace: send_packet: {e:?}");
                 }
             }
@@ -1010,7 +1021,9 @@ mod inner {
                     self.source_fps_locked = true;
                 } else {
                     if let Some(dec) = self.decoder.as_mut() {
-                        while dec.receive_frame().is_ok() {}
+                        while dec.receive_frame().is_ok() {
+                            self.decode_stats.inc_output();
+                        }
                     }
                     return Ok(());
                 }
@@ -1022,6 +1035,7 @@ mod inner {
                     Ok(f) => f,
                     Err(_) => break,
                 };
+                self.decode_stats.inc_output();
 
                 // Push the source PTS into the FIFO queue so the emit
                 // path can pop it for each output PES. The decoder
@@ -1074,11 +1088,12 @@ mod inner {
                 };
                 self.out_frame_count += 1;
 
-                // Operator-pinned override wins; otherwise emit on the
-                // source video PID (the historical behaviour).
-                let vpid = self
-                    .out_video_pid_override
-                    .unwrap_or_else(|| self.video_pid.unwrap());
+                // Encoded packets always ride the source video PID. Any
+                // operator PID rename lands on the downstream
+                // `TsPidOverridesRewriter` stage; the PMT rewrite above
+                // advertises the source PID so the rewriter can match
+                // and rename consistently.
+                let vpid = self.video_pid.unwrap();
                 for ef in encoded {
                     // Prefer source PTS from the queue; fall back to the
                     // sample-counted anchor when the queue is exhausted
@@ -1242,10 +1257,8 @@ fn parse_pmt_video(pkt: &[u8], pinned_pid: Option<u16>) -> Option<(u16, u8)> {
 fn rewrite_pmt_video_stream_type(
     pkt: &mut [u8],
     video_pid: u16,
-    out_video_pid: Option<u16>,
     new_stream_type: u8,
 ) {
-    let effective_video_pid = out_video_pid.unwrap_or(video_pid);
     let mut offset = 4;
     if ts_has_adaptation(pkt) {
         let af_len = pkt[4] as usize;
@@ -1264,13 +1277,15 @@ fn rewrite_pmt_video_stream_type(
     let section_start = offset;
     let section_length =
         (((pkt[offset + 1] & 0x0F) as usize) << 8) | (pkt[offset + 2] as usize);
-    // Force PCR_PID to point at the PID we're actually emitting PCR on.
-    // With an override set, that's the override PID; otherwise the
-    // source video PID. Top 3 bits remain reserved (set to 1 per
-    // ISO 13818-1).
+    // Force PCR_PID to point at the source video PID — that's where this
+    // module actually emits PCR. Top 3 bits remain reserved (set to 1
+    // per ISO 13818-1). A downstream `TsPidOverridesRewriter` walks the
+    // PCR_PID field again whenever the operator renamed the video PID
+    // (see `rewrite_pmt`), so the on-wire PMT ends up consistent with
+    // the rewriter's final PID layout.
     pkt[section_start + 8] =
-        (pkt[section_start + 8] & 0xE0) | (((effective_video_pid >> 8) as u8) & 0x1F);
-    pkt[section_start + 9] = (effective_video_pid & 0xFF) as u8;
+        (pkt[section_start + 8] & 0xE0) | (((video_pid >> 8) as u8) & 0x1F);
+    pkt[section_start + 9] = (video_pid & 0xFF) as u8;
     let program_info_length =
         (((pkt[offset + 10] & 0x0F) as usize) << 8) | (pkt[offset + 11] as usize);
     let data_start = offset + 12 + program_info_length;
@@ -1284,11 +1299,6 @@ fn rewrite_pmt_video_stream_type(
         let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
         if es_pid == video_pid {
             pkt[pos] = new_stream_type;
-            // Rewrite the ES PID itself when an override is supplied.
-            if let Some(new_pid) = out_video_pid {
-                pkt[pos + 1] = (pkt[pos + 1] & 0xE0) | (((new_pid >> 8) as u8) & 0x1F);
-                pkt[pos + 2] = (new_pid & 0xFF) as u8;
-            }
         }
         pos += 5 + es_info_len;
     }
@@ -1587,20 +1597,20 @@ mod tests {
 
     #[test]
     fn rejects_unknown_codec() {
-        assert!(TsVideoReplacer::new(&cfg("vp9"), None, None).is_err());
+        assert!(TsVideoReplacer::new(&cfg("vp9"), None).is_err());
     }
 
     #[test]
     fn accepts_x264_and_x265_and_nvenc() {
-        assert!(TsVideoReplacer::new(&cfg("x264"), None, None).is_ok());
-        assert!(TsVideoReplacer::new(&cfg("x265"), None, None).is_ok());
-        assert!(TsVideoReplacer::new(&cfg("h264_nvenc"), None, None).is_ok());
-        assert!(TsVideoReplacer::new(&cfg("hevc_nvenc"), None, None).is_ok());
+        assert!(TsVideoReplacer::new(&cfg("x264"), None).is_ok());
+        assert!(TsVideoReplacer::new(&cfg("x265"), None).is_ok());
+        assert!(TsVideoReplacer::new(&cfg("h264_nvenc"), None).is_ok());
+        assert!(TsVideoReplacer::new(&cfg("hevc_nvenc"), None).is_ok());
     }
 
     #[test]
     fn process_empty_input_is_noop() {
-        let mut r = TsVideoReplacer::new(&cfg("x264"), None, None).unwrap();
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
         let mut out = Vec::new();
         r.process(&[], &mut out);
         assert!(out.is_empty());
@@ -1608,7 +1618,7 @@ mod tests {
 
     #[test]
     fn process_misaligned_input_is_passthrough() {
-        let mut r = TsVideoReplacer::new(&cfg("x264"), None, None).unwrap();
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
         let mut out = Vec::new();
         let input = vec![0u8; 100];
         r.process(&input, &mut out);
@@ -1617,7 +1627,7 @@ mod tests {
 
     #[test]
     fn process_unknown_pid_passes_through_verbatim() {
-        let mut r = TsVideoReplacer::new(&cfg("x264"), None, None).unwrap();
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
         let mut pkt = [0xFFu8; 188];
         pkt[0] = TS_SYNC_BYTE;
         pkt[1] = 0x1F;
@@ -1730,7 +1740,7 @@ mod tests {
     /// post-switch frame.
     #[test]
     fn codec_change_on_pmt_update_raises_force_idr() {
-        let mut r = TsVideoReplacer::new(&cfg("x264"), None, None).unwrap();
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
         let force_idr = r.force_idr_handle();
 
         // Initial program: H.264 (stream_type 0x1B).
@@ -1757,7 +1767,7 @@ mod tests {
     /// everything downstream.
     #[test]
     fn pmt_pid_change_on_pat_update_raises_force_idr() {
-        let mut r = TsVideoReplacer::new(&cfg("x264"), None, None).unwrap();
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
         let force_idr = r.force_idr_handle();
 
         let mut out = Vec::new();
@@ -1778,7 +1788,7 @@ mod tests {
     /// and turn every frame into an IDR.
     #[test]
     fn repeated_unchanged_pmt_does_not_raise_force_idr() {
-        let mut r = TsVideoReplacer::new(&cfg("x264"), None, None).unwrap();
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
         let force_idr = r.force_idr_handle();
 
         let mut out = Vec::new();
@@ -1966,8 +1976,8 @@ mod tests {
         assert_eq!(pcr_pid_before, 0x1234);
 
         // Run the rewrite. Target stream_type matches source (0x1B) so
-        // only the PCR_PID change drives the edit. No PID override.
-        rewrite_pmt_video_stream_type(&mut pkt, 0x0100, None, 0x1B);
+        // only the PCR_PID change drives the edit.
+        rewrite_pmt_video_stream_type(&mut pkt, 0x0100, 0x1B);
 
         let pcr_pid_after = ((pkt[5 + 8] as u16 & 0x1F) << 8) | pkt[5 + 9] as u16;
         assert_eq!(pcr_pid_after, 0x0100, "PCR_PID must be re-pointed at video PID");

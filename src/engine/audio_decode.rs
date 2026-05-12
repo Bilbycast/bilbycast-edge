@@ -508,30 +508,136 @@ pub fn split_opus_frames(buf: &[u8]) -> Vec<&[u8]> {
     out
 }
 
-/// AC-3 / E-AC-3 syncword splitter. The decoder tolerates the trailing-
-/// bytes ambiguity at the end of the buffer because each AU has its own
-/// embedded `frmsiz`; we just need to align the start of each
-/// `send_packet` call on a `0x0B 0x77` boundary.
+/// AC-3 / E-AC-3 header-aware splitter.
+///
+/// A naive `0x0B 0x77` scan trips on the ~1–3 % of AC-3 frames whose
+/// payload happens to contain that two-byte pattern, producing phantom
+/// AUs that the decoder either drops or decodes into corrupt PCM —
+/// either way the downstream PTS bookkeeping in
+/// [`crate::engine::ts_audio_replace`] sees an extra decoded frame and
+/// the output audio stream emits duplicate / glitched PTS values.
+///
+/// This walker validates each candidate sync by parsing the syncinfo
+/// header to compute the real frame size (AC-3 via `frmsizecod` lookup,
+/// E-AC-3 via the 11-bit `frmsiz` field), discriminating between the
+/// two by `bsid` (AC-3: 0..=10, E-AC-3: 11..=16). Last-frame truncation
+/// is dropped — the next PES will re-resync — matching
+/// [`split_mp2_frames`]'s contract.
 #[cfg(feature = "video-thumbnail")]
 fn split_ac3_frames(buf: &[u8]) -> Vec<&[u8]> {
-    let mut starts: Vec<usize> = Vec::with_capacity(8);
+    let mut out: Vec<&[u8]> = Vec::with_capacity(8);
     let mut i = 0;
-    while i + 1 < buf.len() {
-        if buf[i] == 0x0B && buf[i + 1] == 0x77 {
-            starts.push(i);
-            i += 2;
-        } else {
+    while i + AC3_MIN_HEADER_BYTES <= buf.len() {
+        if buf[i] != 0x0B || buf[i + 1] != 0x77 {
             i += 1;
+            continue;
         }
-    }
-    let mut out = Vec::with_capacity(starts.len());
-    for w in starts.windows(2) {
-        out.push(&buf[w[0]..w[1]]);
-    }
-    if let Some(&last) = starts.last() {
-        out.push(&buf[last..]);
+        let frame_bytes = match ac3_frame_size(&buf[i..]) {
+            Some(n) => n,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        if frame_bytes < AC3_MIN_HEADER_BYTES || i + frame_bytes > buf.len() {
+            // Truncated tail — leave it for the next PES to resync on.
+            break;
+        }
+        out.push(&buf[i..i + frame_bytes]);
+        i += frame_bytes;
     }
     out
+}
+
+/// Smallest syncinfo we can parse: 16 bits syncword + bsi bytes through
+/// the `bsid` field (byte 5). Anything shorter is treated as a sync
+/// candidate that we can't validate yet — caller falls through.
+const AC3_MIN_HEADER_BYTES: usize = 6;
+
+/// AC-3 frame size table from ATSC A/52 § 5.4.1.4 Table 5.18 — entries
+/// are in 16-bit words; the caller multiplies by 2 to get bytes. Indexed
+/// by `frmsizecod` (0..=37); inner index is the sample-rate code
+/// (0 = 48 kHz, 1 = 44.1 kHz, 2 = 32 kHz). `fscod = 0b11` is reserved
+/// and bails out before this table is consulted.
+#[cfg(feature = "video-thumbnail")]
+const AC3_FRMSIZ_WORDS: [[u16; 3]; 38] = [
+    [64, 69, 96],     // 32 kbps
+    [64, 70, 96],
+    [80, 87, 120],    // 40 kbps
+    [80, 88, 120],
+    [96, 104, 144],   // 48 kbps
+    [96, 105, 144],
+    [112, 121, 168],  // 56 kbps
+    [112, 122, 168],
+    [128, 139, 192],  // 64 kbps
+    [128, 140, 192],
+    [160, 174, 240],  // 80 kbps
+    [160, 175, 240],
+    [192, 208, 288],  // 96 kbps
+    [192, 209, 288],
+    [224, 243, 336],  // 112 kbps
+    [224, 244, 336],
+    [256, 278, 384],  // 128 kbps
+    [256, 279, 384],
+    [320, 348, 480],  // 160 kbps
+    [320, 349, 480],
+    [384, 417, 576],  // 192 kbps
+    [384, 418, 576],
+    [448, 487, 672],  // 224 kbps
+    [448, 488, 672],
+    [512, 557, 768],  // 256 kbps
+    [512, 558, 768],
+    [640, 696, 960],  // 320 kbps
+    [640, 697, 960],
+    [768, 835, 1152], // 384 kbps
+    [768, 836, 1152],
+    [896, 975, 1344], // 448 kbps
+    [896, 976, 1344],
+    [1024, 1114, 1536], // 512 kbps
+    [1024, 1115, 1536],
+    [1152, 1253, 1728], // 576 kbps
+    [1152, 1254, 1728],
+    [1280, 1393, 1920], // 640 kbps
+    [1280, 1394, 1920],
+];
+
+/// Parse the AC-3 / E-AC-3 syncinfo at the start of `buf` and return the
+/// total frame length in bytes. Returns `None` if the header is invalid
+/// (reserved `fscod`, out-of-range `frmsizecod`, or reserved `bsid`),
+/// which signals the caller to step one byte and resync.
+#[cfg(feature = "video-thumbnail")]
+fn ac3_frame_size(buf: &[u8]) -> Option<usize> {
+    if buf.len() < AC3_MIN_HEADER_BYTES {
+        return None;
+    }
+    if buf[0] != 0x0B || buf[1] != 0x77 {
+        return None;
+    }
+    // `bsid` lives at the same bit position (40..=44) in both AC-3 and
+    // E-AC-3 — the two formats differ in what precedes it but the
+    // BSID byte is byte 5 regardless.
+    let bsid = buf[5] >> 3;
+    if bsid <= 10 {
+        // AC-3: byte 4 = fscod(2) || frmsizecod(6).
+        let byte4 = buf[4];
+        let fscod = (byte4 >> 6) & 0x03;
+        let frmsizecod = (byte4 & 0x3F) as usize;
+        if fscod == 0b11 || frmsizecod >= AC3_FRMSIZ_WORDS.len() {
+            return None;
+        }
+        let words = AC3_FRMSIZ_WORDS[frmsizecod][fscod as usize] as usize;
+        Some(words * 2)
+    } else if bsid <= 16 {
+        // E-AC-3: byte 2 = strmtyp(2) || substreamid(3) || frmsiz_hi(3),
+        // byte 3 = frmsiz_lo(8). frame_bytes = (frmsiz + 1) * 2.
+        let frmsiz_hi = (buf[2] & 0x07) as usize;
+        let frmsiz_lo = buf[3] as usize;
+        let frmsiz = (frmsiz_hi << 8) | frmsiz_lo;
+        Some((frmsiz + 1) * 2)
+    } else {
+        // Reserved bsid — treat as garbage.
+        None
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1208,16 +1314,188 @@ mod tests {
         assert_eq!(frames[0].len(), a.len());
     }
 
-    /// AC-3 syncword splitter still aligns on `0x0B 0x77` boundaries.
+    // ── AC-3 / E-AC-3 splitter regression tests ──
+    //
+    // These tests document the contract that broadcast audio
+    // transcoding (AC-3 → AAC / MP2 / AC-3 etc.) relies on: each AU
+    // emitted by the splitter is one real syncframe — no phantom AUs
+    // from `0x0B 0x77` bytes that happen to live inside the payload.
+    // A phantom AU pushes an extra source PTS into the audio
+    // replacer's accumulator and the receiver hears duplicate-PTS
+    // PES frames; this is the broadcast-grade contract we're locking
+    // in.
+
+    /// Build a minimum-viable AC-3 syncframe of the requested byte
+    /// length. The header carries a 48 kHz `fscod` and a real
+    /// `frmsizecod` for the chosen size; the rest is zero filler.
+    #[cfg(feature = "video-thumbnail")]
+    fn make_ac3_frame_48k(frame_bytes: usize) -> Vec<u8> {
+        // Look up a frmsizecod that maps to `frame_bytes / 2` 16-bit
+        // words at 48 kHz (column 0 of AC3_FRMSIZ_WORDS).
+        let target_words = (frame_bytes / 2) as u16;
+        let frmsizecod = (0..AC3_FRMSIZ_WORDS.len())
+            .find(|&i| AC3_FRMSIZ_WORDS[i][0] == target_words)
+            .expect("frame_bytes must map to a valid AC-3 frmsizecod") as u8;
+        let mut buf = vec![0u8; frame_bytes];
+        buf[0] = 0x0B;
+        buf[1] = 0x77;
+        // byte 2-3: crc1 — opaque to the splitter.
+        // byte 4: fscod(2) | frmsizecod(6); fscod = 00 (48 kHz).
+        buf[4] = frmsizecod & 0x3F;
+        // byte 5: bsid(5) | bsmod(3); bsid = 8 picks AC-3 (≤10).
+        buf[5] = 8 << 3;
+        buf
+    }
+
+    /// Build a minimum-viable E-AC-3 syncframe of the requested byte
+    /// length. `frame_bytes` must be even and >= 6.
+    #[cfg(feature = "video-thumbnail")]
+    fn make_eac3_frame(frame_bytes: usize) -> Vec<u8> {
+        assert!(frame_bytes >= 6 && frame_bytes % 2 == 0);
+        let frmsiz: u16 = (frame_bytes as u16 / 2) - 1;
+        let mut buf = vec![0u8; frame_bytes];
+        buf[0] = 0x0B;
+        buf[1] = 0x77;
+        // byte 2: strmtyp(2)=0 | substreamid(3)=0 | frmsiz_hi(3)
+        buf[2] = ((frmsiz >> 8) & 0x07) as u8;
+        // byte 3: frmsiz_lo(8)
+        buf[3] = (frmsiz & 0xFF) as u8;
+        // byte 4: fscod(2) | numblkscod(2) | acmod(3) | lfeon(1)
+        buf[4] = 0x00;
+        // byte 5: bsid(5) = 16 (E-AC-3) | dialnorm hi bits
+        buf[5] = 16 << 3;
+        buf
+    }
+
+    /// Two valid AC-3 frames back-to-back land as two AUs.
     #[cfg(feature = "video-thumbnail")]
     #[test]
-    fn ac3_splitter_aligns_on_syncword() {
+    fn ac3_splitter_walks_real_frame_size() {
         use video_codec::AudioDecoderCodec;
-        let buf = vec![0x0B, 0x77, 0x01, 0x02, 0x03, 0x0B, 0x77, 0x04, 0x05];
-        let frames = split_audio_codec_frames(&buf, AudioDecoderCodec::Ac3);
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0], &[0x0B, 0x77, 0x01, 0x02, 0x03]);
-        assert_eq!(frames[1], &[0x0B, 0x77, 0x04, 0x05]);
+        // 384 kbps stereo 48 kHz frame = 1536 bytes (the 7HD Melbourne
+        // case where the field bug originally surfaced).
+        let a = make_ac3_frame_48k(1536);
+        let b = make_ac3_frame_48k(1536);
+        let mut concat = a.clone();
+        concat.extend_from_slice(&b);
+        let frames = split_audio_codec_frames(&concat, AudioDecoderCodec::Ac3);
+        assert_eq!(frames.len(), 2, "expected exactly two AC-3 frames");
+        assert_eq!(frames[0].len(), 1536);
+        assert_eq!(frames[1].len(), 1536);
+    }
+
+    /// `0x0B 0x77` inside an AC-3 payload must NOT trigger a split.
+    /// This is the regression for the duplicate-PTS audio bug — the
+    /// naive byte scan splitter would have emitted three slices here
+    /// (real start, phantom inside frame A, real start of frame B).
+    #[cfg(feature = "video-thumbnail")]
+    #[test]
+    fn ac3_splitter_ignores_payload_syncword_pattern() {
+        use video_codec::AudioDecoderCodec;
+        let mut a = make_ac3_frame_48k(1536);
+        // Plant the syncword pattern deep inside the AC-3 payload —
+        // outside the header bytes the splitter validates.
+        a[200] = 0x0B;
+        a[201] = 0x77;
+        a[900] = 0x0B;
+        a[901] = 0x77;
+        let b = make_ac3_frame_48k(1536);
+        let mut concat = a.clone();
+        concat.extend_from_slice(&b);
+        let frames = split_audio_codec_frames(&concat, AudioDecoderCodec::Ac3);
+        assert_eq!(
+            frames.len(),
+            2,
+            "expected 2 AC-3 frames; payload 0x0B 0x77 bytes must not split"
+        );
+        assert_eq!(frames[0].len(), 1536);
+        assert_eq!(frames[1].len(), 1536);
+    }
+
+    /// E-AC-3 walker honours the 11-bit `frmsiz` field. Same payload-
+    /// pattern guard as AC-3 — the byte sequence isn't a frame boundary.
+    #[cfg(feature = "video-thumbnail")]
+    #[test]
+    fn eac3_splitter_uses_frmsiz_field() {
+        use video_codec::AudioDecoderCodec;
+        let mut a = make_eac3_frame(768);
+        a[100] = 0x0B;
+        a[101] = 0x77;
+        let b = make_eac3_frame(896);
+        let mut concat = a.clone();
+        concat.extend_from_slice(&b);
+        let frames = split_audio_codec_frames(&concat, AudioDecoderCodec::Eac3);
+        assert_eq!(frames.len(), 2, "expected 2 E-AC-3 frames");
+        assert_eq!(frames[0].len(), 768);
+        assert_eq!(frames[1].len(), 896);
+    }
+
+    /// A truncated trailing AC-3 frame is dropped — the next PES will
+    /// resync on its own header. Matches `split_mp2_frames`'s contract.
+    #[cfg(feature = "video-thumbnail")]
+    #[test]
+    fn ac3_splitter_drops_truncated_trailing_frame() {
+        use video_codec::AudioDecoderCodec;
+        let a = make_ac3_frame_48k(768);
+        let mut b = make_ac3_frame_48k(768);
+        b.truncate(40); // header + body cut short
+        let mut concat = a.clone();
+        concat.extend_from_slice(&b);
+        let frames = split_audio_codec_frames(&concat, AudioDecoderCodec::Ac3);
+        assert_eq!(frames.len(), 1, "truncated frame must not be emitted");
+        assert_eq!(frames[0].len(), 768);
+    }
+
+    /// Reserved `fscod = 0b11` is rejected — the splitter resyncs to
+    /// the next real sync. Guards against treating a syncword pattern
+    /// embedded in payload as a real header.
+    #[cfg(feature = "video-thumbnail")]
+    #[test]
+    fn ac3_splitter_skips_reserved_fscod() {
+        use video_codec::AudioDecoderCodec;
+        let real = make_ac3_frame_48k(768);
+        // Garbage header at offset 0: syncword + fscod=11 + frmsizecod=0
+        // — invalid, splitter should drop it and resync to `real`.
+        let mut bad: Vec<u8> = vec![0x0B, 0x77, 0x00, 0x00, 0xC0, 8 << 3];
+        bad.extend_from_slice(&real);
+        let frames = split_audio_codec_frames(&bad, AudioDecoderCodec::Ac3);
+        assert_eq!(frames.len(), 1, "reserved fscod must not yield a frame");
+        assert_eq!(frames[0].len(), 768);
+    }
+
+    /// `AC3_FRMSIZ_WORDS` — spot-check the entries the broadcast
+    /// transcode path will actually hit. The whole table is copied
+    /// verbatim from ATSC A/52 § 5.4.1.4 Table 5.18 and a typo there
+    /// would silently drop audio frames; lock in the most common
+    /// 48 kHz bitrates.
+    #[test]
+    fn ac3_frmsiz_table_known_48k_bitrates() {
+        // [bitrate_kbps, frmsiz_words, frame_bytes]
+        let cases: &[(usize, u16, usize)] = &[
+            // 128 kbps stereo
+            (16, 256, 512),
+            // 192 kbps (typical TS broadcast AC-3 stereo)
+            (20, 384, 768),
+            // 256 kbps
+            (24, 512, 1024),
+            // 384 kbps (7HD Melbourne case)
+            (28, 768, 1536),
+            // 448 kbps (5.1 high-rate)
+            (30, 896, 1792),
+            // 640 kbps (max)
+            (36, 1280, 2560),
+        ];
+        for &(frmsizecod, words, frame_bytes) in cases {
+            assert_eq!(
+                AC3_FRMSIZ_WORDS[frmsizecod][0], words,
+                "AC-3 48 kHz frmsizecod={frmsizecod} entry off"
+            );
+            assert_eq!(
+                words as usize * 2,
+                frame_bytes,
+                "frame_bytes derivation off for frmsizecod={frmsizecod}"
+            );
+        }
     }
 
     /// Opus-in-MPEG-TS access unit: control_header_prefix `0xFFE0` (top

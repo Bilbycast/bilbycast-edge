@@ -46,7 +46,6 @@ pub fn spawn_udp_input(
             config.transcode.as_ref(),
             config.video_encode.as_ref(),
             Some(force_idr.clone()),
-            config.pid_overrides.as_ref(),
         ) {
             Ok(t) => {
                 if let Some(ref t) = t {
@@ -73,7 +72,6 @@ pub fn spawn_udp_input(
             program_number: config.program_number,
             pid_overrides: config.pid_overrides.as_ref(),
             pid_map: config.pid_map.as_ref(),
-            has_transcode: config.audio_encode.is_some() || config.video_encode.is_some(),
         });
         if let Some(_) = post.as_ref() {
             tracing::info!(

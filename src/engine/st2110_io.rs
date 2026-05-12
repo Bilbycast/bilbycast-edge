@@ -137,6 +137,7 @@ fn maybe_spawn_ptp_reporter(
 /// wire framing is identical; only the depacketizer's logging label differs.
 pub async fn run_st2110_audio_input(
     config: St2110AudioInputConfig,
+    input_id: String,
     is_aes3: bool,
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
@@ -236,6 +237,26 @@ pub async fn run_st2110_audio_input(
                 None
             }
         };
+
+    // Register the static portion of the ingress media summary. When the
+    // input has an `audio_encode` block configured the per-input AAC
+    // encoder runs (PCM → TS); the manager UI then renders an
+    // **Audio Encode** badge rather than the historic **Audio Transcode**
+    // — there is no decode stage on a raw-PCM ingress, so it is not a
+    // transcode. Audio-only (`audio_only: true`) suppresses the video
+    // encode tag entirely.
+    let ingress_static = crate::stats::collector::EgressMediaSummaryStatic {
+        transport_mode: if config.audio_encode.is_some() {
+            Some("ts".to_string())
+        } else {
+            None
+        },
+        video_passthrough: true,
+        audio_passthrough: config.audio_encode.is_none(),
+        audio_only: true,
+        ..Default::default()
+    };
+    stats.set_ingress_static(&input_id, ingress_static);
 
     // The recv loop in RedBluePair owns the sockets, so we cannot easily reach
     // out for source-IP filtering at this layer (it ignores src). Apply source
@@ -1239,7 +1260,7 @@ mod tests {
             let stats = flow_stats.clone();
             let cfg = input_config.clone();
             async move {
-                let _ = run_st2110_audio_input(cfg, false, tx, stats, in_cancel, None, None).await;
+                let _ = run_st2110_audio_input(cfg, "test-input".to_string(), false, tx, stats, in_cancel, None, None).await;
             }
         });
 
@@ -1358,7 +1379,7 @@ mod tests {
             let cfg = input_config.clone();
             let c = cancel.child_token();
             async move {
-                let _ = run_st2110_audio_input(cfg, false, tx, stats, c, None, None).await;
+                let _ = run_st2110_audio_input(cfg, "test-input".to_string(), false, tx, stats, c, None, None).await;
             }
         });
 
@@ -1618,7 +1639,7 @@ mod tests {
         let stats_clone = flow_stats.clone();
         let cancel_inner = cancel.child_token();
         let handle = tokio::spawn(async move {
-            let _ = run_st2110_audio_input(cfg, false, tx, stats_clone, cancel_inner, None, None).await;
+            let _ = run_st2110_audio_input(cfg, "test-input".to_string(), false, tx, stats_clone, cancel_inner, None, None).await;
         });
 
         // Give the spawn helper time to bind sockets and publish handles.

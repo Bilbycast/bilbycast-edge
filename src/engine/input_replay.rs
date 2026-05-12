@@ -93,7 +93,6 @@ async fn run(
         config.transcode.as_ref(),
         config.video_encode.as_ref(),
         None,
-            config.pid_overrides.as_ref(),
     ) {
         Ok(t) => {
             if let Some(ref t) = t {
@@ -127,7 +126,6 @@ async fn run(
             program_number: config.program_number,
             pid_overrides: config.pid_overrides.as_ref(),
             pid_map: config.pid_map.as_ref(),
-            has_transcode: config.audio_encode.is_some() || config.video_encode.is_some(),
         },
     );
     if let Some(ref _p) = post {

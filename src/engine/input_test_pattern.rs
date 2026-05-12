@@ -112,7 +112,6 @@ async fn run_inner(
         config.transcode.as_ref(),
         config.video_encode.as_ref(),
         None,
-            config.pid_overrides.as_ref(),
     ) {
         Ok(t) => {
             if let Some(ref t) = t {
@@ -143,7 +142,6 @@ async fn run_inner(
             program_number: config.program_number,
             pid_overrides: None,
             pid_map: config.pid_map.as_ref(),
-            has_transcode: true,
         },
     );
     if let Some(ref _p) = post {

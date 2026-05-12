@@ -1263,7 +1263,11 @@ pub struct ReplayInputConfig {
     /// program filter, before any role-keyed override or transcode).
     /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
     /// present pass through. Symmetric with the output-side `pid_map`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_map_serde"
+    )]
     pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
     /// Optional MPEG-TS PID overrides for the transcoded output. When set,
     /// the encoded ES is emitted on the override PID and the rewritten PMT
@@ -1271,7 +1275,11 @@ pub struct ReplayInputConfig {
     /// the same wire layout lets a downstream decoder stay locked across
     /// switcher hops between transcoded inputs/outputs. See
     /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
 }
 
@@ -1336,7 +1344,11 @@ pub struct TestPatternInputConfig {
     /// program filter, before any role-keyed override or transcode).
     /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
     /// present pass through. Symmetric with the output-side `pid_map`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_map_serde"
+    )]
     pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
     /// Optional MPEG-TS PID overrides for the transcoded output. When set,
     /// the encoded ES is emitted on the override PID and the rewritten PMT
@@ -1344,7 +1356,11 @@ pub struct TestPatternInputConfig {
     /// the same wire layout lets a downstream decoder stay locked across
     /// switcher hops between transcoded inputs/outputs. See
     /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
 }
 
@@ -1469,7 +1485,11 @@ pub struct MediaPlayerInputConfig {
     /// program filter, before any role-keyed override or transcode).
     /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
     /// present pass through. Symmetric with the output-side `pid_map`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_map_serde"
+    )]
     pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
     /// Optional MPEG-TS PID overrides for the transcoded output. When set,
     /// the encoded ES is emitted on the override PID and the rewritten PMT
@@ -1477,7 +1497,11 @@ pub struct MediaPlayerInputConfig {
     /// the same wire layout lets a downstream decoder stay locked across
     /// switcher hops between transcoded inputs/outputs. See
     /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
 }
 
@@ -1644,7 +1668,11 @@ pub struct RtpInputConfig {
     /// program filter, before any role-keyed override or transcode).
     /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
     /// present pass through. Symmetric with the output-side `pid_map`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_map_serde"
+    )]
     pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
     /// Optional MPEG-TS PID overrides for the transcoded output. When set,
     /// the encoded ES is emitted on the override PID and the rewritten PMT
@@ -1652,7 +1680,11 @@ pub struct RtpInputConfig {
     /// the same wire layout lets a downstream decoder stay locked across
     /// switcher hops between transcoded inputs/outputs. See
     /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin this leg to a physical NIC (loose source-IP bind by default,
     /// strict `SO_BINDTODEVICE` when `strict: true`). See
@@ -1704,7 +1736,11 @@ pub struct UdpInputConfig {
     /// program filter, before any role-keyed override or transcode).
     /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
     /// present pass through. Symmetric with the output-side `pid_map`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_map_serde"
+    )]
     pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
     /// Optional MPEG-TS PID overrides for the transcoded output. When set,
     /// the encoded ES is emitted on the override PID and the rewritten PMT
@@ -1712,7 +1748,11 @@ pub struct UdpInputConfig {
     /// the same wire layout lets a downstream decoder stay locked across
     /// switcher hops between transcoded inputs/outputs. See
     /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin this input to a physical NIC. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1880,7 +1920,11 @@ pub struct SrtInputConfig {
     /// program filter, before any role-keyed override or transcode).
     /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
     /// present pass through. Symmetric with the output-side `pid_map`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_map_serde"
+    )]
     pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
     /// Optional MPEG-TS PID overrides for the transcoded output. When set,
     /// the encoded ES is emitted on the override PID and the rewritten PMT
@@ -1888,7 +1932,11 @@ pub struct SrtInputConfig {
     /// the same wire layout lets a downstream decoder stay locked across
     /// switcher hops between transcoded inputs/outputs. See
     /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin this SRT input to a physical NIC. Phase 1: loose only — strict
     /// mode is rejected (libsrt SRTO_BINDTODEVICE plumbing deferred). When
@@ -1958,7 +2006,11 @@ pub struct RtmpInputConfig {
     /// program filter, before any role-keyed override or transcode).
     /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
     /// present pass through. Symmetric with the output-side `pid_map`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_map_serde"
+    )]
     pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
     /// Optional MPEG-TS PID overrides for the transcoded output. When set,
     /// the encoded ES is emitted on the override PID and the rewritten PMT
@@ -1966,7 +2018,11 @@ pub struct RtmpInputConfig {
     /// the same wire layout lets a downstream decoder stay locked across
     /// switcher hops between transcoded inputs/outputs. See
     /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
 }
 
@@ -2037,7 +2093,11 @@ pub struct RtspInputConfig {
     /// program filter, before any role-keyed override or transcode).
     /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
     /// present pass through. Symmetric with the output-side `pid_map`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_map_serde"
+    )]
     pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
     /// Optional MPEG-TS PID overrides for the transcoded output. When set,
     /// the encoded ES is emitted on the override PID and the rewritten PMT
@@ -2045,7 +2105,11 @@ pub struct RtspInputConfig {
     /// the same wire layout lets a downstream decoder stay locked across
     /// switcher hops between transcoded inputs/outputs. See
     /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
 }
 
@@ -2107,7 +2171,11 @@ pub struct WebrtcInputConfig {
     /// program filter, before any role-keyed override or transcode).
     /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
     /// present pass through. Symmetric with the output-side `pid_map`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_map_serde"
+    )]
     pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
     /// Optional MPEG-TS PID overrides for the transcoded output. When set,
     /// the encoded ES is emitted on the override PID and the rewritten PMT
@@ -2115,7 +2183,11 @@ pub struct WebrtcInputConfig {
     /// the same wire layout lets a downstream decoder stay locked across
     /// switcher hops between transcoded inputs/outputs. See
     /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
 }
 
@@ -2171,7 +2243,11 @@ pub struct WhepInputConfig {
     /// program filter, before any role-keyed override or transcode).
     /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
     /// present pass through. Symmetric with the output-side `pid_map`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_map_serde"
+    )]
     pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
     /// Optional MPEG-TS PID overrides for the transcoded output. When set,
     /// the encoded ES is emitted on the override PID and the rewritten PMT
@@ -2179,7 +2255,11 @@ pub struct WhepInputConfig {
     /// the same wire layout lets a downstream decoder stay locked across
     /// switcher hops between transcoded inputs/outputs. See
     /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
 }
 
@@ -2485,7 +2565,11 @@ pub struct RtpOutputConfig {
     /// the same wire layout lets a downstream decoder stay locked across
     /// switcher hops between transcoded inputs/outputs. See
     /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
     /// Optional CBR padding to a target wire bitrate (kbps). See
     /// [`UdpOutputConfig::cbr_pad_to_kbps`] for semantics.
@@ -2620,7 +2704,11 @@ pub struct UdpOutputConfig {
     /// the same wire layout lets a downstream decoder stay locked across
     /// switcher hops between transcoded inputs/outputs. See
     /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
     /// Optional CBR padding to a target wire bitrate (kbps). When set,
     /// `engine::ts_null_padder` injects PID 0x1FFF NULL packets between
@@ -2811,7 +2899,11 @@ pub struct SrtOutputConfig {
     /// the same wire layout lets a downstream decoder stay locked across
     /// switcher hops between transcoded inputs/outputs. See
     /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
     /// Optional CBR padding to a target wire bitrate (kbps). See
     /// [`UdpOutputConfig::cbr_pad_to_kbps`] for semantics. SRT carries
@@ -3128,7 +3220,11 @@ pub struct RistInputConfig {
     /// program filter, before any role-keyed override or transcode).
     /// Keys + values must sit in `0x0010..=0x1FFE`; source PIDs not
     /// present pass through. Symmetric with the output-side `pid_map`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_map_serde"
+    )]
     pub pid_map: Option<std::collections::BTreeMap<u16, u16>>,
     /// Optional MPEG-TS PID overrides for the transcoded output. When set,
     /// the encoded ES is emitted on the override PID and the rewritten PMT
@@ -3136,7 +3232,11 @@ pub struct RistInputConfig {
     /// the same wire layout lets a downstream decoder stay locked across
     /// switcher hops between transcoded inputs/outputs. See
     /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin this RIST input to a physical NIC (Phase 1: loose only —
     /// strict deferred pending librist plumbing). See [`InterfaceBinding`].
@@ -3214,7 +3314,11 @@ pub struct RistOutputConfig {
     /// the same wire layout lets a downstream decoder stay locked across
     /// switcher hops between transcoded inputs/outputs. See
     /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin this RIST output to a physical NIC (Phase 1: loose only —
     /// strict deferred pending librist plumbing). See [`InterfaceBinding`].
@@ -3513,7 +3617,11 @@ pub struct RtmpOutputConfig {
     /// the same wire layout lets a downstream decoder stay locked across
     /// switcher hops between transcoded inputs/outputs. See
     /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
 }
 
@@ -3703,7 +3811,11 @@ pub struct CmafOutputConfig {
     /// the same wire layout lets a downstream decoder stay locked across
     /// switcher hops between transcoded inputs/outputs. See
     /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
     /// MPTS program filter. If the source is an MPTS, filter down to this
     /// single program before segmenting. Must be `> 0` (program 0 is the
@@ -3868,7 +3980,11 @@ pub struct WebrtcOutputConfig {
     /// the same wire layout lets a downstream decoder stay locked across
     /// switcher hops between transcoded inputs/outputs. See
     /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for the per-field semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
 }
 
@@ -4145,8 +4261,33 @@ pub struct TsPidOverridesEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_pid: Option<u16>,
     /// Override the audio PES PID for this program.
+    ///
+    /// Singular form — used by the synthetic-TS path (test pattern,
+    /// media player, replay, image slate, PCM encode), which always
+    /// emits exactly one audio elementary stream. On the TS-passthrough
+    /// path with a multi-audio program (e.g. EN / FR / ES tracks), this
+    /// field still remaps the *first* audio PID for back-compat; use
+    /// [`Self::audio_pids`] to remap additional tracks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_pid: Option<u16>,
+    /// Per-source-PID audio remap for multi-language / multi-track programs.
+    ///
+    /// Keyed by **source audio PID** → **target audio PID**. Honoured by
+    /// the passthrough rewriter ([`crate::engine::ts_pid_overrides_rewriter`])
+    /// and ignored by the synthetic-TS path (where there's never more than
+    /// one audio ES). When both [`Self::audio_pid`] and an entry in this
+    /// map would target the same source PID, the explicit entry in this
+    /// map wins.
+    ///
+    /// Source PIDs are matched against the live PMT; entries for source
+    /// PIDs that don't exist in the current PMT are inert (the manager UI
+    /// surfaces this against the PSI catalogue).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::audio_pids_serde"
+    )]
+    pub audio_pids: Option<std::collections::BTreeMap<u16, u16>>,
     /// Override the PCR PID for this program. When unset, PCR rides the
     /// video PID (or audio if no video). The override must point at an ES
     /// PID that actually exists in the PMT — the muxer will not synthesise
@@ -4284,7 +4425,11 @@ pub struct St2110AudioInputConfig {
     /// PCM-encode stage emits (only consulted when `audio_encode` is
     /// set; ignored when the PCM input feeds the broadcast channel as
     /// raw PCM-RTP). See [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`] for per-field semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin this ST 2110 audio input to a physical NIC. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4418,7 +4563,11 @@ pub struct RtpAudioInputConfig {
     /// Optional MPEG-TS PID overrides for the synthesised TS that the
     /// PCM-encode stage emits (only consulted when `audio_encode` is
     /// set). See [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin this RTP audio input to a physical NIC. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4474,7 +4623,11 @@ pub struct RtpAudioOutputConfig {
     /// Optional MPEG-TS PID overrides for the synthesised TS that the
     /// `audio_302m` transport mode emits (ignored in plain RTP mode). See
     /// [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin this RTP audio output to a physical NIC. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4636,7 +4789,11 @@ pub struct St2110VideoInputConfig {
     pub video_encode: VideoEncodeConfig,
     /// Optional MPEG-TS PID overrides for the synthesised TS that the
     /// 2110-20 encode stage emits. See [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin this ST 2110-20 video input to a physical NIC. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4737,7 +4894,11 @@ pub struct St2110_23InputConfig {
     pub video_encode: VideoEncodeConfig,
     /// Optional MPEG-TS PID overrides for the synthesised TS that the
     /// 2110-23 encode stage emits. See [`TsPidOverridesEntry`] (per program) and [`TsPidOverridesMap`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
     pub pid_overrides: Option<TsPidOverridesMap>,
     /// Pin every ST 2110-23 sub-stream input to a physical NIC. Each
     /// sub-stream's `St2110_23SubStreamBind` already has its own

@@ -35,6 +35,7 @@ use super::st2110_io::run_st2110_audio_input;
 /// validation applies unchanged.
 pub fn spawn_rtp_audio_input(
     config: RtpAudioInputConfig,
+    input_id: String,
     broadcast_tx: broadcast::Sender<RtpPacket>,
     flow_stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
@@ -64,6 +65,7 @@ pub fn spawn_rtp_audio_input(
     tokio::spawn(async move {
         if let Err(e) = run_st2110_audio_input(
             synthesized,
+            input_id,
             false,
             broadcast_tx,
             flow_stats,

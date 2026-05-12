@@ -660,6 +660,12 @@ pub struct InputStats {
     /// composer on Group A inputs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode_stats: Option<VideoEncodeStatsSnapshot>,
+    /// Per-input video decode stage statistics. Present when an input runs a
+    /// `video_engine::VideoDecoder` (Group A composer paths that decode
+    /// before re-encoding). Absent on raw-uncompressed inputs (ST 2110-20/-23)
+    /// and on passthrough ingress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_decode_stats: Option<VideoDecodeStatsSnapshot>,
     /// Compact, snapshot-time description of the media arriving on this input:
     /// pipeline stages traversed, resolved codecs, and high-level format.
     /// Mirrors the per-output [`EgressMediaSummary`] so the manager UI can
@@ -761,6 +767,13 @@ pub struct OutputStats {
     /// config has a `video_encode` block). Absent on pass-through video outputs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode_stats: Option<VideoEncodeStatsSnapshot>,
+    /// Per-output video decode stage statistics. Present when the output runs
+    /// a `video_engine::VideoDecoder` — either inside
+    /// `engine::ts_video_replace::TsVideoReplacer` (true transcode, paired
+    /// with `video_encode_stats`) or as the terminal decoder feeding
+    /// `engine::output_display` (decode-only, no encode counterpart).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_decode_stats: Option<VideoDecodeStatsSnapshot>,
     /// End-to-end latency from input receive to output send.
     /// Present only when the output has actively sent packets in the last
     /// reporting window (1 second). Backward-compatible addition — old manager
@@ -1125,6 +1138,31 @@ pub struct VideoEncodeStatsSnapshot {
     /// `0` means unknown.
     #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub source_stream_type: u8,
+}
+
+/// Per-input or per-output video decode snapshot. Mirrors
+/// `engine::ts_video_replace::VideoDecodeStats` (and the analogous counter
+/// inside `engine::output_display`) so the manager UI can tell true
+/// transcoding (`video_decode` + `video_encode` on the same leg) apart
+/// from encode-only (ST 2110-20 ingress) and decode-only (Display output).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct VideoDecodeStatsSnapshot {
+    /// Compressed video frames fed into the decoder.
+    pub input_frames: u64,
+    /// Raw video frames successfully emitted.
+    pub output_frames: u64,
+    /// Frames that failed to decode.
+    pub decode_errors: u64,
+    /// Frames dropped because the decoder had not yet seen its init config.
+    pub dropped_uninit: u64,
+    /// Wire identifier of the source codec (e.g. `"h264"`, `"hevc"`).
+    pub input_codec: String,
+    /// Decoded frame width in pixels (0 if not yet known).
+    pub output_width: u32,
+    /// Decoded frame height in pixels.
+    pub output_height: u32,
+    /// Decoded frame rate (0.0 if not yet known).
+    pub output_fps: f32,
 }
 
 #[allow(dead_code)]

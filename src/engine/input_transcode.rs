@@ -92,23 +92,26 @@ impl InputTranscoder {
     /// Returns `Ok(None)` when all three are `None` — the caller should skip
     /// the stage entirely in that case (zero cost, no scratch buffers
     /// allocated, no codec state opened).
+    ///
+    /// PID rewriting (the operator's `pid_overrides` map) is handled by the
+    /// `InputPostProcess` stage that runs after this transcoder in every
+    /// input task — see `input_post_process.rs`.
     pub fn new(
         audio_encode: Option<&AudioEncodeConfig>,
         transcode: Option<&TranscodeJson>,
         video_encode: Option<&VideoEncodeConfig>,
         force_idr: Option<Arc<std::sync::atomic::AtomicBool>>,
-        pid_overrides: Option<&crate::config::models::TsPidOverridesMap>,
     ) -> Result<Option<Self>, InputTranscoderError> {
         if audio_encode.is_none() && transcode.is_none() && video_encode.is_none() {
             return Ok(None);
         }
 
         let audio = match audio_encode {
-            Some(ae) => Some(TsAudioReplacer::new(ae, transcode.cloned(), pid_overrides)?),
+            Some(ae) => Some(TsAudioReplacer::new(ae, transcode.cloned())?),
             None => None,
         };
         let video = match video_encode {
-            Some(ve) => Some(TsVideoReplacer::new(ve, force_idr, pid_overrides)?),
+            Some(ve) => Some(TsVideoReplacer::new(ve, force_idr)?),
             None => None,
         };
 
@@ -454,7 +457,7 @@ mod tests {
 
     #[test]
     fn empty_config_returns_none() {
-        let t = InputTranscoder::new(None, None, None, None, None).expect("construct");
+        let t = InputTranscoder::new(None, None, None, None).expect("construct");
         assert!(t.is_none(), "all-None config must be idle (no stage)");
     }
 
@@ -467,7 +470,7 @@ mod tests {
             sample_rate: Some(48_000),
             ..Default::default()
         };
-        let t = InputTranscoder::new(None, Some(&tj), None, None, None).expect("construct");
+        let t = InputTranscoder::new(None, Some(&tj), None, None).expect("construct");
         assert!(t.is_none());
     }
 
@@ -485,12 +488,211 @@ mod tests {
             opus_frame_duration_ms: None,
              source_audio_pid: None,
         };
-        let mut t = InputTranscoder::new(Some(&ae), None, None, None, None)
+        let mut t = InputTranscoder::new(Some(&ae), None, None, None)
             .expect("construct")
             .expect("stage");
         // Non-aligned input is passed through verbatim by TsAudioReplacer.
         let input = b"not a ts packet";
         let out = t.process(input);
         assert_eq!(out, input);
+    }
+
+    /// End-to-end: `audio_encode: mp2` + `pid_overrides` keyed on a
+    /// non-1 program number. The transcoder runs first (the audio
+    /// replacer rewrites the PMT's audio stream_type from 0x0F AAC →
+    /// 0x03 MP2), then the input post-process rewriter renames the PMT
+    /// PID + audio PID. The final PMT must carry **both** changes: the
+    /// MP2 stream_type from the replacer AND the target PIDs from the
+    /// rewriter.
+    ///
+    /// This is the contract the bug-fix relies on — the two stages
+    /// work on disjoint PMT bytes (replacer touches stream_type, rewriter
+    /// touches the PID slots), so they compose without overwriting each
+    /// other.
+    #[test]
+    fn audio_encode_plus_pid_overrides_preserves_both_codec_and_pid() {
+        use crate::config::models::{TsPidOverridesEntry, TsPidOverridesMap};
+        use crate::engine::input_post_process::{
+            InputPostProcess, InputPostProcessConfig,
+        };
+        use crate::engine::ts_parse::{
+            mpeg2_crc32, ts_pid, TS_PACKET_SIZE, TS_SYNC_BYTE,
+        };
+
+        // Same shape as testbed/configs/edge1/config.json media-player
+        // "Ten.ts" entry: audio_encode = mp2, pid_overrides keyed on
+        // program 1591 → pmt_pid 4096, video_pid 256, audio_pid 257.
+        let ae = AudioEncodeConfig {
+            codec: "mp2".to_string(),
+            bitrate_kbps: Some(192),
+            sample_rate: None,
+            channels: None,
+            silent_fallback: false,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
+            source_audio_pid: None,
+        };
+        let mut overrides = TsPidOverridesMap::new();
+        overrides.insert(
+            1591,
+            TsPidOverridesEntry {
+                pmt_pid: Some(4096),
+                video_pid: Some(256),
+                audio_pid: Some(257),
+                audio_pids: None,
+                pcr_pid: None,
+            },
+        );
+
+        let mut transcoder = InputTranscoder::new(Some(&ae), None, None, None)
+            .expect("transcoder construct")
+            .expect("audio stage active");
+        let mut post = InputPostProcess::from_config(&InputPostProcessConfig {
+            program_number: None,
+            pid_overrides: Some(&overrides),
+            pid_map: None,
+        })
+        .expect("rewriter active");
+
+        // Build PAT(program 1591 → PMT pid 0x100) + PMT(video 0x101
+        // H.264, audio 0x102 AAC). The audio replacer's PMT rewrite
+        // walks this packet, finds the audio entry by source PID, and
+        // changes its stream_type byte from 0x0F → 0x03. The rewriter
+        // then walks the same PMT and renames the PMT TS-header PID +
+        // body's video / audio PID slots.
+
+        // PAT.
+        let mut pat = [0xFFu8; TS_PACKET_SIZE];
+        pat[0] = TS_SYNC_BYTE;
+        pat[1] = 0x40; // PUSI=1, PID=0
+        pat[2] = 0x00;
+        pat[3] = 0x10;
+        pat[4] = 0x00; // pointer_field
+        let section_length = 5 + 4 + 4; // 13
+        pat[5] = 0x00;
+        pat[6] = 0xB0 | (((section_length >> 8) as u8) & 0x0F);
+        pat[7] = (section_length & 0xFF) as u8;
+        pat[8] = 0x00;
+        pat[9] = 0x01;
+        pat[10] = 0xC1;
+        pat[11] = 0x00;
+        pat[12] = 0x00;
+        // Program entry: program_number=1591, pmt_pid=0x100.
+        pat[13] = (1591u16 >> 8) as u8;
+        pat[14] = (1591u16 & 0xFF) as u8;
+        pat[15] = 0xE0 | (((0x100u16 >> 8) as u8) & 0x1F);
+        pat[16] = 0x00;
+        let crc = mpeg2_crc32(&pat[5..17]);
+        pat[17] = (crc >> 24) as u8;
+        pat[18] = (crc >> 16) as u8;
+        pat[19] = (crc >> 8) as u8;
+        pat[20] = crc as u8;
+
+        // PMT (on PID 0x100), with H.264 video at 0x101 + AAC audio at 0x102.
+        let mut pmt = [0xFFu8; TS_PACKET_SIZE];
+        pmt[0] = TS_SYNC_BYTE;
+        pmt[1] = 0x40 | (((0x100u16 >> 8) as u8) & 0x1F);
+        pmt[2] = 0x00;
+        pmt[3] = 0x10;
+        pmt[4] = 0x00;
+        // table_id PMT + section header (9 bytes header + 2*5 ES + 4 CRC) = 23
+        let pmt_section_length: u16 = 9 + 5 + 5 + 4;
+        pmt[5] = 0x02;
+        pmt[6] = 0xB0 | (((pmt_section_length >> 8) & 0x0F) as u8);
+        pmt[7] = (pmt_section_length & 0xFF) as u8;
+        pmt[8] = 0x00;
+        pmt[9] = 0x01;
+        pmt[10] = 0xC1;
+        pmt[11] = 0x00;
+        pmt[12] = 0x00;
+        // PCR_PID = 0x101 (video PID).
+        pmt[13] = 0xE0 | (((0x101u16 >> 8) as u8) & 0x1F);
+        pmt[14] = 0x01;
+        pmt[15] = 0xF0;
+        pmt[16] = 0x00;
+        // Video ES: stream_type=0x1B (H.264), es_pid=0x101.
+        pmt[17] = 0x1B;
+        pmt[18] = 0xE0 | (((0x101u16 >> 8) as u8) & 0x1F);
+        pmt[19] = 0x01;
+        pmt[20] = 0xF0;
+        pmt[21] = 0x00;
+        // Audio ES: stream_type=0x0F (AAC ADTS), es_pid=0x102.
+        pmt[22] = 0x0F;
+        pmt[23] = 0xE0 | (((0x102u16 >> 8) as u8) & 0x1F);
+        pmt[24] = 0x02;
+        pmt[25] = 0xF0;
+        pmt[26] = 0x00;
+        let pmt_crc = mpeg2_crc32(&pmt[5..(5 + 3 + pmt_section_length as usize - 4)]);
+        let crc_off = 5 + 3 + pmt_section_length as usize - 4;
+        pmt[crc_off] = (pmt_crc >> 24) as u8;
+        pmt[crc_off + 1] = (pmt_crc >> 16) as u8;
+        pmt[crc_off + 2] = (pmt_crc >> 8) as u8;
+        pmt[crc_off + 3] = pmt_crc as u8;
+
+        // Run PAT → transcoder → post.
+        let after_transcoder_pat = transcoder.process(&pat).to_vec();
+        // The audio replacer is a passthrough for PAT (it doesn't touch
+        // the PAT). The post rewriter rewrites it.
+        let rewritten_pat = post.process(&after_transcoder_pat).to_vec();
+        assert_eq!(
+            rewritten_pat.len(),
+            TS_PACKET_SIZE,
+            "PAT must be one packet"
+        );
+        // Program 1591's pmt_pid in the rewritten PAT must be 4096 (the
+        // override target).
+        let pat_entry_pmt_pid =
+            (((rewritten_pat[15] & 0x1F) as u16) << 8) | (rewritten_pat[16] as u16);
+        assert_eq!(
+            pat_entry_pmt_pid, 4096,
+            "rewritten PAT must advertise program 1591 → PMT PID 4096"
+        );
+
+        // Run PMT → transcoder → post.
+        let after_transcoder_pmt = transcoder.process(&pmt).to_vec();
+        // The audio replacer must have rewritten the audio entry's
+        // stream_type from 0x0F (AAC) → 0x03 (MP2). The byte sits at
+        // ES_info offset 22 in the original packet — but the post-
+        // process hasn't run yet, so the audio entry's PID is still
+        // the source 0x102.
+        let mid_audio_stream_type = after_transcoder_pmt[22];
+        assert_eq!(
+            mid_audio_stream_type, 0x03,
+            "audio replacer must rewrite PMT audio stream_type AAC (0x0F) → MP2 (0x03), got 0x{mid_audio_stream_type:02X}"
+        );
+
+        let rewritten_pmt = post.process(&after_transcoder_pmt).to_vec();
+        assert_eq!(
+            rewritten_pmt.len(),
+            TS_PACKET_SIZE,
+            "PMT must be one packet"
+        );
+        // PMT TS-header PID must be 4096 (override).
+        assert_eq!(
+            ts_pid(&rewritten_pmt[..TS_PACKET_SIZE]),
+            4096,
+            "rewritten PMT TS-header PID must be 4096"
+        );
+        // Audio entry: stream_type still 0x03 (MP2) — preserved
+        // through the rewriter — AND es_pid 257 (override target).
+        let out_audio_st = rewritten_pmt[22];
+        let out_audio_pid =
+            (((rewritten_pmt[23] & 0x1F) as u16) << 8) | (rewritten_pmt[24] as u16);
+        assert_eq!(
+            out_audio_st, 0x03,
+            "audio stream_type must still be MP2 (0x03) after rewriter; got 0x{out_audio_st:02X} — the rewriter overwrote the replacer's codec change"
+        );
+        assert_eq!(
+            out_audio_pid, 257,
+            "rewritten PMT audio entry must carry target PID 257 (got 0x{out_audio_pid:04X})"
+        );
+        // Video entry: stream_type still 0x1B (H.264 passthrough), pid 256.
+        let out_video_st = rewritten_pmt[17];
+        let out_video_pid =
+            (((rewritten_pmt[18] & 0x1F) as u16) << 8) | (rewritten_pmt[19] as u16);
+        assert_eq!(out_video_st, 0x1B, "video stream_type must passthrough");
+        assert_eq!(out_video_pid, 256, "video PID must be renamed to 256");
     }
 }
