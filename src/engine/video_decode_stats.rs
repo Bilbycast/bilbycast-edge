@@ -21,9 +21,6 @@ pub struct VideoDecodeStats {
     pub output_frames: AtomicU64,
     /// Frames that failed to decode (corrupt input, codec error).
     pub decode_errors: AtomicU64,
-    /// Frames dropped because the decoder had not yet seen its init config
-    /// (e.g. SPS/PPS for H.264 or VPS/SPS/PPS for HEVC).
-    pub dropped_uninit: AtomicU64,
 }
 
 impl VideoDecodeStats {
@@ -44,10 +41,5 @@ impl VideoDecodeStats {
     #[inline]
     pub fn inc_error(&self) {
         self.decode_errors.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn inc_dropped_uninit(&self) {
-        self.dropped_uninit.fetch_add(1, Ordering::Relaxed);
     }
 }

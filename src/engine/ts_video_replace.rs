@@ -271,6 +271,32 @@ impl TsVideoReplacer {
         self.decode_stats.clone()
     }
 
+    /// Attach the input-side `VideoDecodeStatsHandle` the replacer should
+    /// keep refreshing as the PMT learns the source codec. Mirrors the
+    /// audio-side `TsAudioReplacer::with_input_decode_handle` so ingress
+    /// callers (see `engine::input_transcode::register_ingress_stats`)
+    /// can flip the manager UI from `Video Encode` to `Video Transcode`
+    /// once both decode + encode stats are present.
+    #[cfg(feature = "media-codecs")]
+    pub fn with_input_decode_handle(
+        &mut self,
+        handle: Arc<crate::stats::collector::VideoDecodeStatsHandle>,
+    ) {
+        self.inner.input_decode_handle = Some(handle);
+        // Push whatever we know right now (placeholder until the PMT is
+        // observed) so the UI doesn't lag a tick.
+        self.inner.refresh_input_decode_label();
+    }
+
+    /// Stub variant when `media-codecs` is compiled out — the replacer
+    /// never opens in that build, so there's no decoder to refresh.
+    #[cfg(not(feature = "media-codecs"))]
+    pub fn with_input_decode_handle(
+        &mut self,
+        _handle: Arc<crate::stats::collector::VideoDecodeStatsHandle>,
+    ) {
+    }
+
     /// Shared handle to the one-shot IDR request flag. Setting this to
     /// `true` causes the replacer's next encoded frame to be an IDR. The
     /// flag is consumed (cleared) by the replacer once honoured, so rapid
@@ -483,6 +509,15 @@ mod inner {
         /// preserved. Phase 4 of the sync-mux work.
         pub av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 
+        /// Optional input-side `video_decode_stats` handle the replacer
+        /// keeps refreshing as the PMT learns the source codec / geometry.
+        /// Set by ingress-side callers via
+        /// [`super::TsVideoReplacer::with_input_decode_handle`]; `None` on
+        /// output-side replacers (output-side decode-stats refresh runs
+        /// through the per-output `OutputStatsAccumulator` already).
+        pub input_decode_handle:
+            Option<Arc<crate::stats::collector::VideoDecodeStatsHandle>>,
+
         /// Monotonic 5-bit PMT version counter for the rewritten PMT.
         /// Initialized at 1; bumped (mod 32) every time we run
         /// `reset_source_state()` (codec change, PID change, or external
@@ -605,8 +640,28 @@ mod inner {
                 last_emitted_pts_90k: None,
                 hw_decode_pref: cfg.hw_decode.unwrap_or_default(),
                 av_sync_pacer: None,
+                input_decode_handle: None,
                 out_psi_version: 1,
             })
+        }
+
+        /// Best-effort refresh of the registered input-side
+        /// `video_decode_stats` handle. Called whenever
+        /// `self.source_stream_type` changes; no-op when no handle was
+        /// attached (output-side replacers).
+        pub(super) fn refresh_input_decode_label(&self) {
+            let Some(h) = self.input_decode_handle.as_ref() else {
+                return;
+            };
+            let codec_label: &'static str = match self.source_stream_type {
+                0x1B => "H.264",
+                0x24 => "HEVC",
+                0x02 => "MPEG-2",
+                _ => "",
+            };
+            if !codec_label.is_empty() {
+                h.set_input_codec(codec_label);
+            }
         }
 
         pub fn target_description(&self) -> String {
@@ -743,6 +798,12 @@ mod inner {
                             // immediately on the next snapshot.
                             self.stats.source_pid.store(vpid, Ordering::Relaxed);
                             self.stats.source_stream_type.store(vst, Ordering::Relaxed);
+                            // Refresh the input-side video_decode_stats
+                            // handle's codec label so the manager's
+                            // inputs-live snapshot flips from the empty
+                            // placeholder to e.g. "H.264" / "HEVC". No-op
+                            // on output-side replacers (no handle).
+                            self.refresh_input_decode_label();
                         }
                         // Always run the PMT rewrite once we know the video
                         // PID — the rewrite enforces both the target

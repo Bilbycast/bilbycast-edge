@@ -719,13 +719,34 @@ impl KmsDisplay {
             ),
         };
 
-        let (plane_h, plane_props) =
+        let (plane_h, plane_props, plane_type_name) =
             discover_bars_overlay_plane(&self.card, self.crtc, primary_plane)
                 .context("bars-overlay plane discovery")?;
         let (zpos, zpos_value, pixel_blend_mode, pixel_blend_coverage_value) =
             discover_bars_overlay_blend_props(&self.card, plane_h, primary_plane)
                 .context("bars-overlay zpos/blend property discovery")?;
         let dumbs = alloc_bars_dumb_pair(&self.card, self.width, strip_h)?;
+        // One-shot diagnostic so operators debugging "bars don't show on
+        // the panel" can tell whether the failure is in plane selection
+        // (wrong type, missing zpos, missing pixel-blend-mode) versus
+        // composition. Logged at info to make it visible in default
+        // production logging without bumping a noisy debug filter.
+        let primary_zpos_raw = read_property_u64(&self.card, primary_plane, "zpos");
+        tracing::info!(
+            plane_type = plane_type_name,
+            bars_plane = format!("{:?}", plane_h),
+            primary_plane = format!("{:?}", primary_plane),
+            primary_zpos = ?primary_zpos_raw,
+            bars_zpos_exposed = zpos.is_some(),
+            bars_zpos_value = zpos_value,
+            blend_mode_exposed = pixel_blend_mode.is_some(),
+            blend_coverage_value = pixel_blend_coverage_value,
+            strip_w = self.width,
+            strip_h,
+            panel_w = self.width,
+            panel_h = self.height,
+            "audio-bars overlay enabled — plane discovery + property state"
+        );
         self.bars_overlay = Some(BarsOverlay {
             plane: plane_h,
             plane_props,
@@ -1663,7 +1684,7 @@ fn discover_bars_overlay_plane(
     card: &CardFile,
     crtc: drm::control::crtc::Handle,
     exclude: plane::Handle,
-) -> Result<(plane::Handle, PlanePropIds)> {
+) -> Result<(plane::Handle, PlanePropIds, &'static str)> {
     let res = card
         .resource_handles()
         .context("resource_handles for bars overlay discovery")?;
@@ -1699,9 +1720,13 @@ fn discover_bars_overlay_plane(
             _ => {}
         }
     }
-    let plane_h = overlay.or(cursor).context(
-        "no Overlay or Cursor plane drivable from this CRTC supports ARGB8888 — host driver lacks multi-plane composition",
-    )?;
+    let (plane_h, plane_type_name) = match (overlay, cursor) {
+        (Some(p), _) => (p, "Overlay"),
+        (None, Some(p)) => (p, "Cursor"),
+        (None, None) => anyhow::bail!(
+            "no Overlay or Cursor plane drivable from this CRTC supports ARGB8888 — host driver lacks multi-plane composition"
+        ),
+    };
     let names = [
         "FB_ID", "CRTC_ID", "SRC_X", "SRC_Y", "SRC_W", "SRC_H", "CRTC_X", "CRTC_Y", "CRTC_W",
         "CRTC_H",
@@ -1719,7 +1744,7 @@ fn discover_bars_overlay_plane(
         crtc_w: p[8],
         crtc_h: p[9],
     };
-    Ok((plane_h, plane_props))
+    Ok((plane_h, plane_props, plane_type_name))
 }
 
 /// Discover the optional `zpos` / `pixel blend mode` properties on the
@@ -2440,6 +2465,26 @@ impl KmsDisplay {
                 self.atomic_modeset_done = true;
                 self.hdr_dirty = false;
                 if let Some(bars) = self.bars_overlay.as_mut() {
+                    // First successful commit that programmed the bars
+                    // plane: log so an operator debugging "bars don't show
+                    // on the panel" can confirm the atomic_commit path
+                    // accepted the property set (vs being rejected
+                    // silently — in practice the kernel surfaces EINVAL
+                    // here, but a silent driver-side clip is the next
+                    // failure mode if zpos / pixel-blend-mode discovery
+                    // came up wrong).
+                    if !bars.committed {
+                        tracing::info!(
+                            bars_plane = format!("{:?}", bars.plane),
+                            strip_w = bars.width,
+                            strip_h = bars.height,
+                            strip_top_y = self.height.saturating_sub(bars.height),
+                            zpos_set = bars.zpos.is_some(),
+                            zpos_value = bars.zpos_value,
+                            blend_mode_set = bars.pixel_blend_mode.is_some(),
+                            "audio-bars overlay first atomic_commit OK"
+                        );
+                    }
                     bars.committed = true;
                 }
                 Ok(())
@@ -2454,6 +2499,22 @@ impl KmsDisplay {
                     // our property set. The plain set_crtc path may
                     // still work (different ioctl).
                     || (!self.atomic_modeset_done && raw == Some(libc_einval()));
+                // Surface every bars-bearing commit failure on its first
+                // occurrence so an operator debugging "bars don't show"
+                // can see whether the bars plane property set caused the
+                // rejection. `bars.committed` flips true on the first
+                // success; while still false, we haven't yet seen the
+                // bars plane land on the panel.
+                if let Some(bars) = self.bars_overlay.as_ref() {
+                    if !bars.committed {
+                        tracing::warn!(
+                            bars_plane = format!("{:?}", bars.plane),
+                            errno = ?raw,
+                            unsupported,
+                            "audio-bars overlay first atomic_commit FAILED — bars plane property set may be wrong for this driver"
+                        );
+                    }
+                }
                 if unsupported {
                     Err(AtomicCommitError::Unsupported(e))
                 } else {

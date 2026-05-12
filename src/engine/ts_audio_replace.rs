@@ -136,6 +136,14 @@ pub struct TsAudioReplacer {
     /// "Audio Transcode" badge, distinguishing this leg from an
     /// encode-only ST 2110 ingress.
     decode_stats: Arc<crate::engine::audio_decode::DecodeStats>,
+    /// Lock-free counters for the internal encode stage. Bumped per PCM
+    /// frame submitted to the encoder and per encoded frame produced.
+    /// Surfaced to the flow-stats accumulator via
+    /// [`crate::stats::collector::FlowStatsAccumulator::set_input_encode_stats`]
+    /// so the manager UI's input-side processing block can render
+    /// `Audio Transcode` (paired with `decode_stats`) instead of
+    /// `Audio Encode` for compressed-source TS ingest.
+    encode_stats: Arc<crate::engine::audio_encode::EncodeStats>,
     /// Optional handle on the owning output's stats accumulator, used to
     /// refresh the live `audio_decode_stats` source-codec / output PCM
     /// shape whenever the source codec is rediscovered on a PMT update
@@ -144,6 +152,13 @@ pub struct TsAudioReplacer {
     /// `audio_decode` tag still surfaces (the handle is registered up
     /// front), the codec label just stays at its placeholder.
     output_stats: Option<Arc<crate::stats::collector::OutputStatsAccumulator>>,
+    /// Optional handle on the input-side `audio_decode_stats` entry the
+    /// replacer should refresh whenever the source codec is rediscovered
+    /// on a PMT update. Set by ingress-side callers via
+    /// [`Self::with_input_decode_handle`] after registering the handle
+    /// with the flow stats accumulator. `None` on output-side replacers,
+    /// which refresh via `output_stats` instead.
+    input_decode_handle: Option<Arc<crate::stats::collector::AudioDecodeStatsHandle>>,
     /// Source audio stream_type (0x0F = AAC-ADTS, etc.). Used to decide
     /// which decoder to instantiate.
     source_stream_type: u8,
@@ -302,7 +317,9 @@ impl TsAudioReplacer {
             last_pinned_warn: None,
             stats: Arc::new(TsAudioReplacerStats::default()),
             decode_stats: Arc::new(crate::engine::audio_decode::DecodeStats::new()),
+            encode_stats: Arc::new(crate::engine::audio_encode::EncodeStats::new()),
             output_stats: None,
+            input_decode_handle: None,
             source_stream_type: 0,
             target_stream_type,
             pes_buffer: Vec::with_capacity(16 * 1024),
@@ -362,6 +379,18 @@ impl TsAudioReplacer {
         self.decode_stats.clone()
     }
 
+    /// Shared handle to the internal encode-stage counters
+    /// (`pcm_frames_submitted` / `encoded_frames_out` / etc.). Ingress
+    /// callers register this via
+    /// [`crate::stats::collector::FlowStatsAccumulator::set_input_encode_stats`]
+    /// at spawn time so the manager's inputs-live snapshot carries the
+    /// encode side of the transcode — paired with `decode_stats_handle()`
+    /// the UI renders an `Audio Transcode` badge instead of the
+    /// encode-only fallback.
+    pub fn encode_stats_handle(&self) -> Arc<crate::engine::audio_encode::EncodeStats> {
+        self.encode_stats.clone()
+    }
+
     /// Attach the owning output's stats accumulator so the replacer can
     /// refresh the live `audio_decode_stats` source-codec / output PCM
     /// shape whenever the source codec is rediscovered on a PMT update.
@@ -375,16 +404,27 @@ impl TsAudioReplacer {
         self
     }
 
+    /// Attach the input-side `AudioDecodeStatsHandle` the replacer should
+    /// keep refreshing as the PMT learns the source codec. Mirrors
+    /// [`Self::with_output_stats`] for ingress-side flows registered via
+    /// [`crate::engine::input_transcode::register_ingress_stats`].
+    pub fn with_input_decode_handle(
+        &mut self,
+        handle: Arc<crate::stats::collector::AudioDecodeStatsHandle>,
+    ) {
+        self.input_decode_handle = Some(handle);
+        // Push whatever we know right now (placeholder until the PMT is
+        // observed) so the UI doesn't lag a tick.
+        self.refresh_decode_stats_label();
+    }
+
     /// Best-effort label refresh on the registered audio-decode handle.
     /// Called whenever `self.source_stream_type` / `self.resolved_*`
-    /// change; no-op when no `output_stats` was attached.
+    /// change. Refreshes both the output-side handle (when
+    /// [`Self::with_output_stats`] was attached) and the input-side
+    /// handle (when [`Self::with_input_decode_handle`] was attached).
+    /// Either or both may be `None`.
     fn refresh_decode_stats_label(&self) {
-        let Some(stats) = self.output_stats.as_ref() else {
-            return;
-        };
-        let Some(h) = stats.audio_decode_stats_handle() else {
-            return;
-        };
         let codec_label: &'static str = match self.source_stream_type {
             0x0F | 0x11 => "AAC",
             0x03 | 0x04 => "MP2",
@@ -392,11 +432,30 @@ impl TsAudioReplacer {
             0x87 | 0xC2 => "E-AC-3",
             _ => "",
         };
-        if !codec_label.is_empty() {
-            h.set_input_codec(codec_label);
+        // Output-side path: look the handle up through the per-output
+        // accumulator. Same lookup as before — kept for backward compat
+        // with output-side TS replacers.
+        if let Some(stats) = self.output_stats.as_ref() {
+            if let Some(h) = stats.audio_decode_stats_handle() {
+                if !codec_label.is_empty() {
+                    h.set_input_codec(codec_label);
+                }
+                if self.resolved_sample_rate != 0 && self.resolved_channels != 0 {
+                    h.set_output_shape(self.resolved_sample_rate, self.resolved_channels);
+                }
+            }
         }
-        if self.resolved_sample_rate != 0 && self.resolved_channels != 0 {
-            h.set_output_shape(self.resolved_sample_rate, self.resolved_channels);
+        // Input-side path: handle held directly. Skips the
+        // accumulator-level indirection because ingress-side handles are
+        // keyed by `input_id` and the replacer never sees the flow-stats
+        // accumulator.
+        if let Some(h) = self.input_decode_handle.as_ref() {
+            if !codec_label.is_empty() {
+                h.set_input_codec(codec_label);
+            }
+            if self.resolved_sample_rate != 0 && self.resolved_channels != 0 {
+                h.set_output_shape(self.resolved_sample_rate, self.resolved_channels);
+            }
         }
     }
 
@@ -1072,6 +1131,7 @@ impl TsAudioReplacer {
                         .iter_mut()
                         .map(|ch| ch.drain(..frame_size).collect())
                         .collect();
+                    self.encode_stats.inc_submitted();
                     match enc.encode_frame(&frame) {
                         Ok(encoded) => {
                             let sr = self.resolved_sample_rate;
@@ -1088,12 +1148,13 @@ impl TsAudioReplacer {
                             for p in &pkts {
                                 output.extend_from_slice(p);
                             }
+                            self.encode_stats.inc_out(1);
                             self.samples_since_anchor = self
                                 .samples_since_anchor
                                 .saturating_add(encoded.num_samples as u64);
                         }
                         Err(_) => {
-                            // Drop this frame on error and continue.
+                            self.encode_stats.inc_dropped();
                         }
                     }
                 }
@@ -1118,6 +1179,7 @@ impl TsAudioReplacer {
                         .iter_mut()
                         .map(|ch| ch.drain(..frame_size).collect())
                         .collect();
+                    self.encode_stats.inc_submitted();
                     match enc.encode_frame(&frame) {
                         Ok(frames) => {
                             let sr = enc.sample_rate();
@@ -1136,12 +1198,15 @@ impl TsAudioReplacer {
                                 for p in &pkts {
                                     output.extend_from_slice(p);
                                 }
+                                self.encode_stats.inc_out(1);
                                 self.samples_since_anchor = self
                                     .samples_since_anchor
                                     .saturating_add(ef.num_samples as u64);
                             }
                         }
-                        Err(_) => {}
+                        Err(_) => {
+                            self.encode_stats.inc_dropped();
+                        }
                     }
                 }
                 return Ok(());

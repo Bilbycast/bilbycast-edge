@@ -250,7 +250,6 @@ impl VideoDecodeStatsHandle {
             input_frames: self.stats.input_frames.load(Ordering::Relaxed),
             output_frames: self.stats.output_frames.load(Ordering::Relaxed),
             decode_errors: self.stats.decode_errors.load(Ordering::Relaxed),
-            dropped_uninit: self.stats.dropped_uninit.load(Ordering::Relaxed),
             input_codec,
             output_width: self.output_width.load(Ordering::Relaxed),
             output_height: self.output_height.load(Ordering::Relaxed),
@@ -2202,10 +2201,14 @@ pub struct FlowStatsAccumulator {
     /// handles don't leak into the reported ingress pipeline after a switch.
     input_transcode_stats:
         DashMap<String, Arc<crate::engine::audio_transcode::TranscodeStats>>,
-    /// Per-input-id map of AAC decode stage handles + descriptors.
-    input_audio_decode_stats: DashMap<String, AudioDecodeStatsHandle>,
+    /// Per-input-id map of AAC decode stage handles + descriptors. Wrapped
+    /// in `Arc` so the owning ingress replacer can keep a clone and refresh
+    /// the source-codec label whenever the PMT learns a new stream_type
+    /// (input switch, MPTS program change) without going through the
+    /// flow accumulator.
+    input_audio_decode_stats: DashMap<String, Arc<AudioDecodeStatsHandle>>,
     /// Per-input-id map of audio encode stage handles + target codec descriptors.
-    input_audio_encode_stats: DashMap<String, AudioEncodeStatsHandle>,
+    input_audio_encode_stats: DashMap<String, Arc<AudioEncodeStatsHandle>>,
     /// Per-input-id map of video encode stage handles + target codec / geometry
     /// descriptors. Populated by ST 2110-20/-23 inputs or by Group A inputs
     /// that configured a `video_encode` block (via the `InputTranscoder`).
@@ -2455,8 +2458,10 @@ impl FlowStatsAccumulator {
         self.input_transcode_stats.insert(input_id.to_string(), stats);
     }
 
-    /// Register an input-side audio decode stats handle.
-    #[allow(dead_code)]
+    /// Register an input-side audio decode stats handle. Returns the
+    /// `Arc<AudioDecodeStatsHandle>` so the registering ingress replacer
+    /// can refresh `input_codec` / output PCM shape whenever the PMT
+    /// re-learns the source codec (input switch, MPTS program change).
     pub fn set_input_decode_stats(
         &self,
         input_id: &str,
@@ -2464,20 +2469,22 @@ impl FlowStatsAccumulator {
         input_codec: impl Into<String>,
         output_sample_rate_hz: u32,
         output_channels: u8,
-    ) {
-        self.input_audio_decode_stats.insert(
-            input_id.to_string(),
-            AudioDecodeStatsHandle::new(
-                stats,
-                input_codec,
-                output_sample_rate_hz,
-                output_channels,
-            ),
-        );
+    ) -> Arc<AudioDecodeStatsHandle> {
+        let handle = Arc::new(AudioDecodeStatsHandle::new(
+            stats,
+            input_codec,
+            output_sample_rate_hz,
+            output_channels,
+        ));
+        self.input_audio_decode_stats
+            .insert(input_id.to_string(), handle.clone());
+        handle
     }
 
-    /// Register an input-side audio encode stats handle.
-    #[allow(dead_code)]
+    /// Register an input-side audio encode stats handle. Returns the
+    /// `Arc<AudioEncodeStatsHandle>` for symmetry with the decode setter
+    /// (callers ignore the return today; the handle is fully described at
+    /// registration time).
     pub fn set_input_encode_stats(
         &self,
         input_id: &str,
@@ -2486,17 +2493,17 @@ impl FlowStatsAccumulator {
         target_sample_rate_hz: u32,
         target_channels: u8,
         target_bitrate_kbps: u32,
-    ) {
-        self.input_audio_encode_stats.insert(
-            input_id.to_string(),
-            AudioEncodeStatsHandle {
-                stats,
-                output_codec: output_codec.into(),
-                target_sample_rate_hz,
-                target_channels,
-                target_bitrate_kbps,
-            },
-        );
+    ) -> Arc<AudioEncodeStatsHandle> {
+        let handle = Arc::new(AudioEncodeStatsHandle {
+            stats,
+            output_codec: output_codec.into(),
+            target_sample_rate_hz,
+            target_channels,
+            target_bitrate_kbps,
+        });
+        self.input_audio_encode_stats
+            .insert(input_id.to_string(), handle.clone());
+        handle
     }
 
     /// Register an input-side video decode stats handle. Called at flow start

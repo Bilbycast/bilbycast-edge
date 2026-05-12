@@ -1153,8 +1153,6 @@ pub struct VideoDecodeStatsSnapshot {
     pub output_frames: u64,
     /// Frames that failed to decode.
     pub decode_errors: u64,
-    /// Frames dropped because the decoder had not yet seen its init config.
-    pub dropped_uninit: u64,
     /// Wire identifier of the source codec (e.g. `"h264"`, `"hevc"`).
     pub input_codec: String,
     /// Decoded frame width in pixels (0 if not yet known).

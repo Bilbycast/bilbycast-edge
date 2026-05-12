@@ -128,7 +128,7 @@ pub fn spawn_rist_input(
         super::input_transcode::register_ingress_stats(
             stats.as_ref(),
             &input_id,
-            transcoder.as_ref(),
+            transcoder.as_mut(),
             config.audio_encode.as_ref(),
             config.video_encode.as_ref(),
         );

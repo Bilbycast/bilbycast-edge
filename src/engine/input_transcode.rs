@@ -208,6 +208,60 @@ impl InputTranscoder {
         self.video.as_ref().map(|v| v.stats_handle())
     }
 
+    /// Shared handle to the audio replacer's internal decode counters, if
+    /// the audio stage is active. Registered via
+    /// [`crate::stats::collector::FlowStatsAccumulator::set_input_decode_stats`]
+    /// so the input-side `audio_decode` tag pairs with `audio_encode` in the
+    /// inputs-live snapshot and the UI renders `Audio Transcode` instead of
+    /// the encode-only fallback.
+    pub fn audio_decode_stats(
+        &self,
+    ) -> Option<Arc<crate::engine::audio_decode::DecodeStats>> {
+        self.audio.as_ref().map(|a| a.decode_stats_handle())
+    }
+
+    /// Shared handle to the audio replacer's internal encode counters, if
+    /// the audio stage is active.
+    pub fn audio_encode_stats(
+        &self,
+    ) -> Option<Arc<crate::engine::audio_encode::EncodeStats>> {
+        self.audio.as_ref().map(|a| a.encode_stats_handle())
+    }
+
+    /// Shared handle to the video replacer's internal decode counters, if
+    /// the video stage is active.
+    pub fn video_decode_stats(
+        &self,
+    ) -> Option<Arc<crate::engine::video_decode_stats::VideoDecodeStats>> {
+        self.video.as_ref().map(|v| v.decode_stats_handle())
+    }
+
+    /// Attach the registered input-side `AudioDecodeStatsHandle` to the
+    /// audio replacer so it can refresh the source-codec label whenever
+    /// the PMT learns a new stream_type. No-op when no audio stage is
+    /// active.
+    pub fn attach_input_audio_decode_handle(
+        &mut self,
+        handle: Arc<crate::stats::collector::AudioDecodeStatsHandle>,
+    ) {
+        if let Some(a) = self.audio.as_mut() {
+            a.with_input_decode_handle(handle);
+        }
+    }
+
+    /// Attach the registered input-side `VideoDecodeStatsHandle` to the
+    /// video replacer so it can refresh the source-codec label whenever
+    /// the PMT learns a new stream_type. No-op when no video stage is
+    /// active.
+    pub fn attach_input_video_decode_handle(
+        &mut self,
+        handle: Arc<crate::stats::collector::VideoDecodeStatsHandle>,
+    ) {
+        if let Some(v) = self.video.as_mut() {
+            v.with_input_decode_handle(handle);
+        }
+    }
+
     /// One-shot IDR request handle for the ingress video transcoder, if a
     /// video stage is active. The input forwarder normally passes its
     /// external flag into [`Self::new`] instead; this accessor is for
@@ -260,52 +314,106 @@ impl InputTranscoder {
 pub fn register_ingress_stats(
     flow_stats: &crate::stats::collector::FlowStatsAccumulator,
     input_id: &str,
-    transcoder: Option<&InputTranscoder>,
+    transcoder: Option<&mut InputTranscoder>,
     audio_encode: Option<&AudioEncodeConfig>,
     video_encode: Option<&VideoEncodeConfig>,
 ) {
     use crate::stats::collector::EgressMediaSummaryStatic;
 
-    // Wire the live video encode counters if a video stage is active.
+    // Track which stages we registered so the static descriptor below can
+    // be set from a single moved-out `transcoder` reference.
+    let has_audio_stage_via_transcoder;
+    let has_video_stage_via_transcoder;
+
     if let Some(t) = transcoder {
-        if let Some(vs) = t.video_stats() {
-            if let Some(enc) = video_encode {
-                let backend = match enc.codec.as_str() {
-                    "x264" | "x265" => enc.codec.clone(),
-                    "h264_nvenc" | "hevc_nvenc" => "nvenc".to_string(),
-                    other => other.to_string(),
-                };
-                let target_codec = match enc.codec.as_str() {
-                    "x264" | "h264_nvenc" => "h264",
-                    "x265" | "hevc_nvenc" => "hevc",
-                    other => other,
-                };
-                flow_stats.set_input_video_encode_stats(
+        has_audio_stage_via_transcoder = t.has_audio();
+        has_video_stage_via_transcoder = t.has_video();
+
+        // ── Audio: register decode + encode handles when an audio stage
+        // is active so the manager UI's inputs-live snapshot carries both
+        // halves of the transcode and renders `Audio Transcode` instead of
+        // the encode-only fallback. The decode-side codec label starts
+        // empty and is refreshed by the replacer on the first PMT scan.
+        if let (Some(ae), Some(decode_handle_stats), Some(encode_handle_stats)) = (
+            audio_encode,
+            t.audio_decode_stats(),
+            t.audio_encode_stats(),
+        ) {
+            let target_codec = ae.codec.as_str();
+            let target_sr = ae.sample_rate.unwrap_or(0);
+            let target_ch = ae.channels.unwrap_or(0);
+            let target_br = ae.bitrate_kbps.unwrap_or(0);
+            let audio_handle = flow_stats.set_input_decode_stats(
+                input_id,
+                decode_handle_stats,
+                "",
+                0,
+                0,
+            );
+            t.attach_input_audio_decode_handle(audio_handle);
+            let _ = flow_stats.set_input_encode_stats(
+                input_id,
+                encode_handle_stats,
+                target_codec.to_string(),
+                target_sr,
+                target_ch,
+                target_br,
+            );
+        }
+
+        // ── Video: register decode + encode handles when a video stage
+        // is active. Encode side has been wired since this function was
+        // first written; decode side is the bit that flips the label
+        // from `Video Encode` to `Video Transcode`.
+        if let (Some(enc), Some(vs)) = (video_encode, t.video_stats()) {
+            let backend = match enc.codec.as_str() {
+                "x264" | "x265" => enc.codec.clone(),
+                "h264_nvenc" | "hevc_nvenc" => "nvenc".to_string(),
+                other => other.to_string(),
+            };
+            let target_codec = match enc.codec.as_str() {
+                "x264" | "h264_nvenc" => "h264",
+                "x265" | "hevc_nvenc" => "hevc",
+                other => other,
+            };
+            flow_stats.set_input_video_encode_stats(
+                input_id,
+                vs,
+                String::new(),
+                target_codec.to_string(),
+                enc.width.unwrap_or(0),
+                enc.height.unwrap_or(0),
+                match (enc.fps_num, enc.fps_den) {
+                    (Some(n), Some(d)) if d > 0 => n as f32 / d as f32,
+                    _ => 0.0,
+                },
+                enc.bitrate_kbps.unwrap_or(0),
+                backend,
+            );
+
+            if let Some(vd_stats) = t.video_decode_stats() {
+                let video_handle = flow_stats.set_input_video_decode_stats(
                     input_id,
-                    vs,
-                    String::new(),
-                    target_codec.to_string(),
-                    enc.width.unwrap_or(0),
-                    enc.height.unwrap_or(0),
-                    match (enc.fps_num, enc.fps_den) {
-                        (Some(n), Some(d)) if d > 0 => n as f32 / d as f32,
-                        _ => 0.0,
-                    },
-                    enc.bitrate_kbps.unwrap_or(0),
-                    backend,
+                    vd_stats,
+                    "",
+                    0,
+                    0,
+                    0.0,
                 );
+                t.attach_input_video_decode_handle(video_handle);
             }
         }
+    } else {
+        has_audio_stage_via_transcoder = false;
+        has_video_stage_via_transcoder = false;
     }
 
     // Static summary descriptor. Every ingress pipeline ends in raw TS on
     // the flow broadcast channel, hence `transport_mode = "ts"`. Passthrough
     // flags mirror the output-side convention: `true` means the stage leaves
     // that essence untouched.
-    let has_audio_stage = audio_encode.is_some()
-        || transcoder.map(|t| t.has_audio()).unwrap_or(false);
-    let has_video_stage = video_encode.is_some()
-        || transcoder.map(|t| t.has_video()).unwrap_or(false);
+    let has_audio_stage = audio_encode.is_some() || has_audio_stage_via_transcoder;
+    let has_video_stage = video_encode.is_some() || has_video_stage_via_transcoder;
     flow_stats.set_ingress_static(
         input_id,
         EgressMediaSummaryStatic {
