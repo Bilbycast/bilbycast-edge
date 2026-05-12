@@ -1384,7 +1384,7 @@ fn default_tp_tone_dbfs() -> f32 { -20.0 }
 /// * `image` — single still image (JPEG / PNG). Decoded once, fed to the
 ///   in-process H.264 encoder at low frame-rate, optionally paired with
 ///   silence — the standard "slate" pattern. Requires the same
-///   `video-thumbnail` + `fdk-aac` features that [`TestPatternInputConfig`]
+///   `media-codecs` + `fdk-aac` features that [`TestPatternInputConfig`]
 ///   needs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -2315,7 +2315,7 @@ pub enum OutputConfig {
     /// Send SMPTE ST 2110-20 uncompressed video over RTP (RFC 4175).
     /// The output decodes the flow's source H.264/HEVC TS, scales/converts
     /// into planar 4:2:2 at the configured bit depth, then RFC 4175
-    /// packetizes onto the wire. Requires the `video-thumbnail` feature
+    /// packetizes onto the wire. Requires the `media-codecs` feature
     /// for in-process decoding (default on).
     #[serde(rename = "st2110_20")]
     St2110_20(St2110VideoOutputConfig),
@@ -4130,10 +4130,11 @@ pub struct VideoEncodeConfig {
     /// forces software libavcodec decode. `Nvdec` / `Qsv` / `Vaapi`
     /// force a specific HW backend; the edge falls back to CPU and
     /// emits `video_decoder_unavailable` when the host can't satisfy
-    /// the choice. The HW decoders share the compile gates of the
-    /// display path (`display-nvdec` / `display-qsv` /
-    /// `display-vaapi`), so an edge built for HW display playout also
-    /// gets HW transcode decode "for free".
+    /// the choice. The HW decoders are gated on the
+    /// `video-decoder-nvdec` / `video-decoder-qsv` /
+    /// `video-decoder-vaapi` Cargo features and shared between
+    /// transcode and the local-display output, so an edge built for
+    /// HW display playout also gets HW transcode decode "for free".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hw_decode: Option<HwDecodePreference>,
 }

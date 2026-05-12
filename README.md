@@ -18,7 +18,7 @@ Supports NMOS IS-04 (Discovery & Registration), IS-05 (Connection Management), I
 | UDP      | Yes   | Yes    | Raw MPEG-TS over UDP; unicast and multicast; DSCP QoS marking; optional `audio_encode` / `video_encode` / `transcode`. **`transport_mode: "audio_302m"`** for SMPTE 302M LPCM-in-MPEG-TS |
 | RTMP     | Yes   | Yes    | H.264/AAC + HEVC via Enhanced RTMP v2 (`hvc1`); accepts publish from OBS/ffmpeg; supports RTMPS (TLS); optional `audio_encode` (AAC-LC / HE-AAC v1/v2) and `video_encode` (H.264 / HEVC via libx264 / libx265 / NVENC) |
 | RTSP     | Yes   | No     | Pull H.264/H.265 from IP cameras/media servers; TCP/UDP transport; auto-reconnect |
-| HLS      | No    | Yes    | Segment-based egress; supports HEVC/HDR; in-process TS audio remuxing (default `video-thumbnail` feature); optional `audio_encode` per-segment re-encode (AAC family / MP2 / AC-3) |
+| HLS      | No    | Yes    | Segment-based egress; supports HEVC/HDR; in-process TS audio remuxing (default `media-codecs` feature); optional `audio_encode` per-segment re-encode (AAC family / MP2 / AC-3) |
 | WebRTC   | Yes   | Yes    | WHIP/WHEP (both client and server modes) via pure-Rust `str0m`; H.264 video + Opus audio (enabled by default); optional `audio_encode` (AAC → Opus in-process) and `video_encode` (H.264-only target — HEVC source auto-decoded and re-encoded to H.264 so browsers can play it) |
 | **SMPTE ST 2110-30** | Yes | Yes | RFC 3551 PCM audio (L16/L24); 2022-7 Red/Blue dual-network; PTP slave via external `ptp4l`. Optional per-output `transcode` block (sample-rate / bit-depth / channel routing) |
 | **SMPTE ST 2110-31** | Yes | Yes | AES3 transparent audio (24-bit), preserves Dolby E and AES3 sub-frame bits |
@@ -39,7 +39,7 @@ other PIDs pass through untouched. Every output that accepts
 `audio_encode` also accepts an optional companion `transcode` block
 (channel shuffle / sample-rate / bit-depth conversion) — `transcode`
 wins on conflicting fields.
-**Default (`fdk-aac` + `video-thumbnail` features):** decode and AAC
+**Default (`fdk-aac` + `media-codecs` features):** decode and AAC
 encode use Fraunhofer FDK AAC in-process (via `bilbycast-fdk-aac-rs`) —
 AAC-LC, HE-AAC v1/v2, multichannel up to 7.1. Opus / MP2 / AC-3 use
 in-process libavcodec (via `bilbycast-ffmpeg-video-rs`). **No external

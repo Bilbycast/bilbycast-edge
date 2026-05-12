@@ -440,7 +440,7 @@ enum EncoderBackend {
     },
     /// In-process audio encoder via FFmpeg libavcodec (Opus, MP2, AC-3).
     /// Synchronous — encode happens inline in `submit_planar`.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     InProcessLibav {
         encoder: video_engine::AudioEncoder,
         accumulator: Vec<Vec<f32>>,
@@ -464,7 +464,7 @@ impl std::fmt::Debug for AudioEncoder {
             EncoderBackend::Ffmpeg { .. } => "ffmpeg",
             #[cfg(feature = "fdk-aac")]
             EncoderBackend::InProcess { .. } => "fdk-aac",
-            #[cfg(feature = "video-thumbnail")]
+            #[cfg(feature = "media-codecs")]
             EncoderBackend::InProcessLibav { .. } => "libavcodec",
         };
         f.debug_struct("AudioEncoder")
@@ -508,7 +508,7 @@ impl AudioEncoder {
         }
 
         // Try in-process libavcodec for Opus/MP2/AC-3
-        #[cfg(feature = "video-thumbnail")]
+        #[cfg(feature = "media-codecs")]
         if matches!(params.codec, AudioCodec::Opus | AudioCodec::Mp2 | AudioCodec::Ac3) {
             return Self::spawn_in_process_libav(params, cancel, &flow_id, &output_id);
         }
@@ -638,7 +638,7 @@ impl AudioEncoder {
     /// source → 48 kHz Opus), a `rubato` async resampler is created to convert
     /// the PCM before encoding. This mirrors the `-ar` flag in the ffmpeg
     /// subprocess path.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     fn spawn_in_process_libav(
         params: EncoderParams,
         cancel: CancellationToken,
@@ -868,7 +868,7 @@ impl AudioEncoder {
 
                 true
             }
-            #[cfg(feature = "video-thumbnail")]
+            #[cfg(feature = "media-codecs")]
             EncoderBackend::InProcessLibav {
                 encoder,
                 accumulator,
@@ -980,7 +980,7 @@ impl AudioEncoder {
             EncoderBackend::Ffmpeg { encoded_rx, .. } => encoded_rx.try_recv().ok(),
             #[cfg(feature = "fdk-aac")]
             EncoderBackend::InProcess { output_queue, .. } => output_queue.pop_front(),
-            #[cfg(feature = "video-thumbnail")]
+            #[cfg(feature = "media-codecs")]
             EncoderBackend::InProcessLibav { output_queue, .. } => output_queue.pop_front(),
         };
         if frame.is_some() {
@@ -1003,7 +1003,7 @@ impl AudioEncoder {
             EncoderBackend::InProcess { output_queue, .. } => {
                 output_queue.drain(..).collect()
             }
-            #[cfg(feature = "video-thumbnail")]
+            #[cfg(feature = "media-codecs")]
             EncoderBackend::InProcessLibav { output_queue, .. } => {
                 output_queue.drain(..).collect()
             }
@@ -1021,7 +1021,7 @@ impl AudioEncoder {
             EncoderBackend::Ffmpeg { cancel, .. } => cancel.cancel(),
             #[cfg(feature = "fdk-aac")]
             EncoderBackend::InProcess { cancel, .. } => cancel.cancel(),
-            #[cfg(feature = "video-thumbnail")]
+            #[cfg(feature = "media-codecs")]
             EncoderBackend::InProcessLibav { cancel, .. } => cancel.cancel(),
         }
     }

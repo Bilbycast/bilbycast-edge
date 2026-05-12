@@ -19,7 +19,7 @@ applicable / by design.
 | **RTP**    | ✅              | ✅ (requires `audio_encode`) | ✅ | Strips source RTP framing, rewraps with fresh RFC 2250 headers. |
 | **RIST**   | ✅              | ✅ (requires `audio_encode`) | ✅ | TS-carrying; same plumbing as SRT/UDP/RTP. |
 | **RTMP**   | ✅              | ✅ (requires `audio_encode`) | ✅ | H.264 target rides classic FLV; HEVC target rides [Enhanced RTMP v2](https://veovera.org/docs/enhanced/enhanced-rtmp-v2) with FourCC `hvc1`. Transcode disables the same-codec AAC passthrough fast-path. HEVC passthrough (no `video_encode` set) also emits E-RTMP tags. |
-| **HLS**    | ✅              | ✅ (in-process remux only) | ⏳ | `video-thumbnail` feature required for transcode; subprocess fallback ignores it with a warning. |
+| **HLS**    | ✅              | ✅ (in-process remux only) | ⏳ | `media-codecs` feature required for transcode; subprocess fallback ignores it with a warning. |
 | **WebRTC** | ✅              | ✅ (`transcode.channels` overrides Opus channel count; unset keeps source) | ✅ | H.264 target only (browsers do not decode HEVC); SPS/PPS emitted in-band on every IDR via `global_header = false`. HEVC sources are decoded and re-encoded to H.264 automatically. No scaling / no force-IDR on PLI yet (encoder GOP cadence drives keyframes). |
 | **ST 2110-30 / `rtp_audio`** | ✅ (auto via compressed-audio bridge) | ✅ (native PCM transcode, bit-depth + SRC + shuffle) | ❌ | Uncompressed PCM outputs; transcode is first-class here. |
 | **ST 2110-31** | ✅ | ❌ (AES3 opaque — channel labels inside SMPTE 337M payload, not addressable from the pipeline) | ❌ | |
@@ -156,7 +156,7 @@ HE-AAC ADTS (MPEG-TS `stream_type` 0x0F), MP2 / MPEG-1 / MPEG-2 audio
 (0x03 / 0x04), AC-3 (0x80 / 0x81 / 0xC1), and E-AC-3 / Dolby Digital
 Plus (0x87 / 0xC2). AAC decodes via the in-process FDK-AAC bridge
 (`fdk-aac` feature, default on); MP2 / AC-3 / E-AC-3 decode via the
-in-process FFmpeg bridge (`video-thumbnail` feature, default on). Both
+in-process FFmpeg bridge (`media-codecs` feature, default on). Both
 share the same downstream PCM → encoder pipeline, so every target
 codec listed in the matrix below works regardless of source codec.
 
@@ -769,7 +769,7 @@ options the current binary cannot satisfy.
 
 A follow-up will add an `st2110-video` capability flag so the manager
 UI can offer the ST 2110-20 / -23 pixel-format / partition-mode
-pickers only when the edge's decoder (`video-thumbnail` feature) and
+pickers only when the edge's decoder (`media-codecs` feature) and
 at least one encoder (`video-encoder-*` feature) are both compiled in.
 
 A manager UI that wants to offer `video_encode` should check

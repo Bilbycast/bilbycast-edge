@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::collections::VecDeque;
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 use std::time::Duration;
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -22,7 +22,7 @@ use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::OutputStatsAccumulator;
 
 use super::audio_encode::AudioCodec;
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 use super::audio_encode::check_ffmpeg_available;
 use super::packet::RtpPacket;
 use super::ts_pid_remapper::TsPidRemapper;
@@ -30,7 +30,7 @@ use super::ts_program_filter::TsProgramFilter;
 
 /// Maximum time we'll wait for ffmpeg to re-mux a single segment.
 /// Segments are typically 2-6 seconds, so 30 s is a generous safety bound.
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 const HLS_REMUX_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Minimum RTP header size (no CSRC or extensions).
@@ -475,11 +475,11 @@ struct ResolvedAudioEncode {
     channels: Option<u8>,
     /// Optional planar PCM shuffle / resample block, applied between the
     /// AAC decoder and the target encoder. Only honoured on the in-process
-    /// remux path (`video-thumbnail` feature); the subprocess fallback
+    /// remux path (`media-codecs` feature); the subprocess fallback
     /// logs a warning and ignores it.
     transcode: Option<super::audio_transcode::TranscodeJson>,
     /// Pre-built ffmpeg args (only used for subprocess fallback).
-    #[cfg(not(feature = "video-thumbnail"))]
+    #[cfg(not(feature = "media-codecs"))]
     ffmpeg_args: Vec<String>,
 }
 
@@ -500,7 +500,7 @@ fn resolve_audio_encode(
 
     let bitrate_kbps = enc.bitrate_kbps.unwrap_or_else(|| codec.default_bitrate_kbps());
 
-    #[cfg(not(feature = "video-thumbnail"))]
+    #[cfg(not(feature = "media-codecs"))]
     {
         // Subprocess fallback: need ffmpeg in PATH
         if !check_ffmpeg_available() {
@@ -511,7 +511,7 @@ fn resolve_audio_encode(
         if transcode.is_some() {
             tracing::warn!(
                 "HLS output '{output_id}': transcode block ignored in ffmpeg subprocess fallback — \
-                 enable the `video-thumbnail` feature for in-process channel shuffle / SRC"
+                 enable the `media-codecs` feature for in-process channel shuffle / SRC"
             );
         }
         let ffmpeg_args = build_remux_args(enc)?;
@@ -525,7 +525,7 @@ fn resolve_audio_encode(
         })
     }
 
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     {
         // Validate HE-AAC variants have fdk-aac available
         #[cfg(feature = "fdk-aac")]
@@ -550,12 +550,12 @@ fn resolve_audio_encode(
 }
 
 /// Remux a TS segment with audio re-encoding. Dispatches to in-process
-/// or subprocess based on the video-thumbnail feature.
+/// or subprocess based on the media-codecs feature.
 async fn remux_segment_audio(
     segment: &[u8],
     enc: &ResolvedAudioEncode,
 ) -> Result<Vec<u8>, String> {
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     {
         // Run in-process on a blocking thread (C codec calls are synchronous)
         let segment_owned = segment.to_vec();
@@ -579,17 +579,17 @@ async fn remux_segment_audio(
         .map_err(|e| format!("remux task panicked: {e}"))?
     }
 
-    #[cfg(not(feature = "video-thumbnail"))]
+    #[cfg(not(feature = "media-codecs"))]
     {
         remux_segment_via_ffmpeg(segment, &enc.ffmpeg_args).await
     }
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// In-process TS audio remuxer (video-thumbnail feature)
+// In-process TS audio remuxer (media-codecs feature)
 // ════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn remux_ts_audio_inprocess(
     segment: &[u8],
     codec: AudioCodec,
@@ -785,7 +785,7 @@ fn remux_ts_audio_inprocess(
 
 /// Parse PMT to find both video and audio PIDs.
 /// Returns (video_pid, audio_pid, audio_stream_type).
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn parse_pmt_av_pids(pkt: &[u8]) -> Option<(u16, u16, u8)> {
     use super::ts_parse::ts_has_adaptation;
     const TS_PACKET_SIZE: usize = 188;
@@ -833,7 +833,7 @@ fn parse_pmt_av_pids(pkt: &[u8]) -> Option<(u16, u16, u8)> {
 }
 
 /// Extract elementary stream data and PTS from a PES packet.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn extract_pes_audio(pes: &[u8]) -> Option<(Vec<u8>, u64)> {
     if pes.len() < 9 || pes[0] != 0x00 || pes[1] != 0x00 || pes[2] != 0x01 {
         return None;
@@ -853,7 +853,7 @@ fn extract_pes_audio(pes: &[u8]) -> Option<(Vec<u8>, u64)> {
 }
 
 /// Parse PTS from 5 bytes of PES header.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn parse_pts(data: &[u8]) -> u64 {
     let b0 = data[0] as u64;
     let b1 = data[1] as u64;
@@ -868,7 +868,7 @@ fn parse_pts(data: &[u8]) -> u64 {
 }
 
 /// Decoded PCM audio frame.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 struct PcmFrame {
     planar: Vec<Vec<f32>>,
     pts: u64,
@@ -877,7 +877,7 @@ struct PcmFrame {
 }
 
 /// Encoded audio frame ready for TS muxing.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 struct RemuxEncodedFrame {
     data: Vec<u8>,
     pts: u64,
@@ -886,7 +886,7 @@ struct RemuxEncodedFrame {
 /// Decode audio PES list to PCM frames. Handles AAC (stream_type 0x0F)
 /// via fdk-aac and MP2 / AC-3 / E-AC-3 (0x03/0x04, 0x80/0x81/0xC1,
 /// 0x87/0xC2) via the FFmpeg-backed audio decoder.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn decode_audio_pes(
     pes_list: &[(Vec<u8>, u64)],
     audio_stream_type: u8,
@@ -904,7 +904,7 @@ fn decode_audio_pes(
     ))
 }
 
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 fn decode_audio_pes_aac(pes_list: &[(Vec<u8>, u64)]) -> Result<Vec<PcmFrame>, String> {
     let mut decoder = aac_audio::AacDecoder::open_adts()
         .map_err(|e| format!("AAC decoder init failed: {e}"))?;
@@ -963,12 +963,12 @@ fn decode_audio_pes_aac(pes_list: &[(Vec<u8>, u64)]) -> Result<Vec<PcmFrame>, St
     Ok(pcm_frames)
 }
 
-#[cfg(all(feature = "video-thumbnail", not(feature = "fdk-aac")))]
+#[cfg(all(feature = "media-codecs", not(feature = "fdk-aac")))]
 fn decode_audio_pes_aac(_pes_list: &[(Vec<u8>, u64)]) -> Result<Vec<PcmFrame>, String> {
     Err("AAC decoding requires the fdk-aac feature".into())
 }
 
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn decode_audio_pes_ffmpeg(
     pes_list: &[(Vec<u8>, u64)],
     codec: video_codec::AudioDecoderCodec,
@@ -1004,7 +1004,7 @@ fn decode_audio_pes_ffmpeg(
 }
 
 /// Re-encode PCM frames to the target codec.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn encode_audio_pcm(
     pcm_frames: &[PcmFrame],
     codec: AudioCodec,
@@ -1151,7 +1151,7 @@ fn encode_audio_pcm(
 }
 
 /// Re-encode PCM to AAC using fdk-aac.
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 fn encode_audio_pcm_aac(
     pcm_frames: &[PcmFrame],
     codec: AudioCodec,
@@ -1236,7 +1236,7 @@ fn encode_audio_pcm_aac(
 }
 
 /// Build a PES packet wrapping an audio frame.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn build_audio_pes(audio_data: &[u8], pts: u64) -> Vec<u8> {
     // PES header: 0x000001 + stream_id(0xC0) + length + flags + PTS
     let pes_header_len = 14; // 3 + 1 + 2 + 2 + 1 + 5
@@ -1274,7 +1274,7 @@ fn build_audio_pes(audio_data: &[u8], pts: u64) -> Vec<u8> {
 }
 
 /// Packetize a PES payload into 188-byte TS packets.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn packetize_ts(pid: u16, pes: &[u8], cc: &mut u8) -> Vec<[u8; 188]> {
     const TS_PACKET_SIZE: usize = 188;
     let mut packets = Vec::new();
@@ -1332,7 +1332,7 @@ fn packetize_ts(pid: u16, pes: &[u8], cc: &mut u8) -> Vec<[u8; 188]> {
 }
 
 /// Rewrite the audio stream_type in a PMT TS packet and recalculate CRC.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn rewrite_pmt_audio_stream_type(pkt: &mut [u8], audio_pid: u16, new_stream_type: u8) {
     use super::ts_parse::{ts_has_adaptation, mpeg2_crc32};
     const TS_PACKET_SIZE: usize = 188;
@@ -1380,10 +1380,10 @@ fn rewrite_pmt_audio_stream_type(pkt: &mut [u8], audio_pid: u16, new_stream_type
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// ffmpeg subprocess fallback (when video-thumbnail feature is disabled)
+// ffmpeg subprocess fallback (when media-codecs feature is disabled)
 // ════════════════════════════════════════════════════════════════════════
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 fn build_remux_args(enc: &AudioEncodeConfig) -> Result<Vec<String>, String> {
     let codec = AudioCodec::parse(&enc.codec)
         .ok_or_else(|| format!("unknown codec '{}'", enc.codec))?;
@@ -1443,7 +1443,7 @@ fn build_remux_args(enc: &AudioEncodeConfig) -> Result<Vec<String>, String> {
 }
 
 /// Run ffmpeg as a one-shot remuxer over a single HLS segment.
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 async fn remux_segment_via_ffmpeg(
     segment: &[u8],
     args: &[String],
@@ -1483,7 +1483,7 @@ async fn remux_segment_via_ffmpeg(
 }
 
 #[cfg(test)]
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 mod tests {
     use super::*;
 

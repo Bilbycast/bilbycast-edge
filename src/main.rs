@@ -236,14 +236,14 @@ async fn main() -> anyhow::Result<()> {
     // Detect thumbnail generation capability
     let ffmpeg_available = engine::thumbnail::check_thumbnail_available();
     if ffmpeg_available {
-        #[cfg(feature = "video-thumbnail")]
-        tracing::info!("video-thumbnail: in-process (libavcodec) — flow thumbnail generation available");
-        #[cfg(not(feature = "video-thumbnail"))]
-        tracing::info!("video-thumbnail: ffmpeg subprocess — flow thumbnail generation available");
+        #[cfg(feature = "media-codecs")]
+        tracing::info!("media-codecs: in-process (libavcodec) — flow thumbnail generation available");
+        #[cfg(not(feature = "media-codecs"))]
+        tracing::info!("media-codecs: ffmpeg subprocess — flow thumbnail generation available");
     } else {
-        #[cfg(not(feature = "video-thumbnail"))]
-        tracing::info!("ffmpeg not found — flow thumbnail generation disabled (install ffmpeg or enable the video-thumbnail feature)");
-        #[cfg(feature = "video-thumbnail")]
+        #[cfg(not(feature = "media-codecs"))]
+        tracing::info!("ffmpeg not found — flow thumbnail generation disabled (install ffmpeg or enable the media-codecs feature)");
+        #[cfg(feature = "media-codecs")]
         tracing::info!("thumbnail generation unavailable");
     }
 

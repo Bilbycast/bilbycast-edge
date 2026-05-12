@@ -23,7 +23,7 @@ use super::audio_decode::{AacDecoder, DecodeStats, sample_rate_from_index};
 use super::audio_encode::{AudioCodec, AudioEncoder, AudioEncoderError, EncoderParams};
 #[cfg(feature = "webrtc")]
 use super::audio_silence::SilenceGenerator;
-#[cfg(all(feature = "webrtc", feature = "video-thumbnail"))]
+#[cfg(all(feature = "webrtc", feature = "media-codecs"))]
 use super::ts_video_replace::VideoEncodeStats;
 #[cfg(feature = "webrtc")]
 use crate::config::models::VideoEncodeConfig;
@@ -84,17 +84,17 @@ enum WebrtcVideoEncoderState {
     Disabled,
     /// `video_encode` set; decoder+encoder will be built on the first
     /// source access unit.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     Lazy { cfg: VideoEncodeConfig },
     /// Decode → re-encode pipeline is live.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     Active(Box<WebrtcVideoActive>),
     /// Decoder or encoder construction failed once. Drop video for the
     /// rest of the session's lifetime.
     Failed,
 }
 
-#[cfg(all(feature = "webrtc", feature = "video-thumbnail"))]
+#[cfg(all(feature = "webrtc", feature = "media-codecs"))]
 struct WebrtcVideoActive {
     decoder: video_engine::VideoDecoder,
     /// Shared encoder pipeline — wraps `VideoEncoder` + optional
@@ -115,7 +115,7 @@ struct WebrtcVideoActive {
 /// WebRTC. Only H.264 backends are allowed; validation rejects HEVC at
 /// config-load, but guard against it at runtime too. Honours `h264_auto`
 /// → resolver-picked H.264 backend on the host.
-#[cfg(all(feature = "webrtc", feature = "video-thumbnail"))]
+#[cfg(all(feature = "webrtc", feature = "media-codecs"))]
 fn resolve_webrtc_video_backend(
     cfg: &VideoEncodeConfig,
     output_id: &str,
@@ -207,9 +207,9 @@ fn init_webrtc_video_encoder_state(
 ) -> WebrtcVideoEncoderState {
     match video_encode {
         None => WebrtcVideoEncoderState::Disabled,
-        #[cfg(feature = "video-thumbnail")]
+        #[cfg(feature = "media-codecs")]
         Some(cfg) => WebrtcVideoEncoderState::Lazy { cfg: cfg.clone() },
-        #[cfg(not(feature = "video-thumbnail"))]
+        #[cfg(not(feature = "media-codecs"))]
         Some(_) => WebrtcVideoEncoderState::Failed,
     }
 }
@@ -217,7 +217,7 @@ fn init_webrtc_video_encoder_state(
 /// Open the decoder+stats for a WebRTC video_encode pipeline and flip
 /// the state into `Active`. Mirrors RTMP's `open_video_active` but
 /// specialised to WebRTC's H.264-only output constraint.
-#[cfg(all(feature = "webrtc", feature = "video-thumbnail"))]
+#[cfg(all(feature = "webrtc", feature = "media-codecs"))]
 fn open_webrtc_video_active(
     cfg: &VideoEncodeConfig,
     source_is_h264: bool,
@@ -309,7 +309,7 @@ fn open_webrtc_video_active(
 
 /// Concatenate source NAL units (no start codes) back into an Annex-B
 /// byte stream suitable for `VideoDecoder::send_packet`.
-#[cfg(all(feature = "webrtc", feature = "video-thumbnail"))]
+#[cfg(all(feature = "webrtc", feature = "media-codecs"))]
 fn nalus_to_annex_b_webrtc(nalus: &[Vec<u8>]) -> Vec<u8> {
     let total: usize = nalus.iter().map(|n| 4 + n.len()).sum();
     let mut out = Vec::with_capacity(total);
@@ -324,7 +324,7 @@ fn nalus_to_annex_b_webrtc(nalus: &[Vec<u8>]) -> Vec<u8> {
 /// the encoder's Annex-B output (with any emitted SPS/PPS inline on
 /// IDRs). Flips `video_state` to `Failed` on a terminal error; returns
 /// an empty vec while the encoder opens (same convention as RTMP).
-#[cfg(all(feature = "webrtc", feature = "video-thumbnail"))]
+#[cfg(all(feature = "webrtc", feature = "media-codecs"))]
 fn encode_one_video_frame_webrtc(
     video_state: &mut WebrtcVideoEncoderState,
     nalus: &[Vec<u8>],
@@ -404,9 +404,9 @@ async fn handle_webrtc_video_frame(
     video_pt: str0m::media::Pt,
     stats: &Arc<OutputStatsAccumulator>,
     output_id: &str,
-    #[cfg_attr(not(feature = "video-thumbnail"), allow(unused_variables))]
+    #[cfg_attr(not(feature = "media-codecs"), allow(unused_variables))]
     flow_id: &str,
-    #[cfg_attr(not(feature = "video-thumbnail"), allow(unused_variables))]
+    #[cfg_attr(not(feature = "media-codecs"), allow(unused_variables))]
     events: &EventSender,
 ) {
     use super::webrtc::rtp_h264::H264Packetizer;
@@ -424,7 +424,7 @@ async fn handle_webrtc_video_frame(
 
     // Lazy-open the decoder + encoder scaffolding on the first video
     // access unit. Falls through to the encode path on the same frame.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     if matches!(video_state, WebrtcVideoEncoderState::Lazy { .. }) {
         let cfg = match video_state {
             WebrtcVideoEncoderState::Lazy { cfg } => cfg.clone(),
@@ -448,7 +448,7 @@ async fn handle_webrtc_video_frame(
     let owned: Vec<Vec<u8>>;
     let send_nalus: &[Vec<u8>];
 
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     {
         if matches!(video_state, WebrtcVideoEncoderState::Active(_)) {
             let encoded = encode_one_video_frame_webrtc(video_state, nalus, output_id);
@@ -476,7 +476,7 @@ async fn handle_webrtc_video_frame(
         }
     }
 
-    #[cfg(not(feature = "video-thumbnail"))]
+    #[cfg(not(feature = "media-codecs"))]
     {
         send_nalus = nalus;
         owned = Vec::new();
@@ -830,9 +830,9 @@ async fn whep_viewer_loop(
     // Lazy FFmpeg-backed decoder for non-AAC sources (MP2 / AC-3 /
     // E-AC-3). Mirrors `decoder` inside `WebrtcEncoderState::Active`
     // for the AAC path.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     let mut ff_audio_decoder: Option<video_engine::AudioDecoder> = None;
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     let mut ff_audio_codec: Option<video_codec::AudioDecoderCodec> = None;
     let mut video_encoder_state: WebrtcVideoEncoderState =
         init_webrtc_video_encoder_state(video_encode.as_ref());
@@ -1019,7 +1019,7 @@ async fn whep_viewer_loop(
                                         }
                                     }
                                 }
-                                #[cfg(feature = "video-thumbnail")]
+                                #[cfg(feature = "media-codecs")]
                                 super::webrtc::ts_demux::DemuxedFrame::OtherAudio {
                                     stream_type, data, pts,
                                 } => {
@@ -1098,7 +1098,7 @@ async fn whep_viewer_loop(
                                         stats.record_latency(recv_time_us);
                                     }
                                 }
-                                #[cfg(not(feature = "video-thumbnail"))]
+                                #[cfg(not(feature = "media-codecs"))]
                                 super::webrtc::ts_demux::DemuxedFrame::OtherAudio { .. } => {}
                                 // MPEG-2 video on a WebRTC output requires a
                                 // transcode hop we don't have today (WebRTC is
@@ -1302,9 +1302,9 @@ async fn whip_client_loop(
         };
         // Lazy FFmpeg-backed decoder for non-AAC sources on the WHIP
         // path. Sibling to `decoder` inside `WebrtcEncoderState::Active`.
-        #[cfg(feature = "video-thumbnail")]
+        #[cfg(feature = "media-codecs")]
         let mut ff_audio_decoder: Option<video_engine::AudioDecoder> = None;
-        #[cfg(feature = "video-thumbnail")]
+        #[cfg(feature = "media-codecs")]
         let mut ff_audio_codec: Option<video_codec::AudioDecoderCodec> = None;
         let mut silence_interval: Option<tokio::time::Interval> =
             if let WebrtcEncoderState::Active { silence: Some(sg), .. } = &encoder_state {
@@ -1485,7 +1485,7 @@ async fn whip_client_loop(
                                             }
                                         }
                                     }
-                                    #[cfg(feature = "video-thumbnail")]
+                                    #[cfg(feature = "media-codecs")]
                                     super::webrtc::ts_demux::DemuxedFrame::OtherAudio {
                                         stream_type, data, pts,
                                     } => {
@@ -1563,7 +1563,7 @@ async fn whip_client_loop(
                                             stats.record_latency(recv_time_us);
                                         }
                                     }
-                                    #[cfg(not(feature = "video-thumbnail"))]
+                                    #[cfg(not(feature = "media-codecs"))]
                                     super::webrtc::ts_demux::DemuxedFrame::OtherAudio { .. } => {}
                                     // MPEG-2 video on a WebRTC output requires
                                     // a transcode hop we don't have today

@@ -130,11 +130,11 @@ jobs:
         working-directory: bilbycast-edge
         run: |
           # No `display` (Linux-only KMS / ALSA), no GPL encoders. The
-          # `video-thumbnail` feature gives us libavcodec + libopus +
+          # `media-codecs` feature gives us libavcodec + libopus +
           # MP2 / AC-3 / E-AC-3 + VideoToolbox probe, which is enough
           # to confirm the codebase compiles on Apple Silicon.
           cargo check --no-default-features \
-            --features tls,fdk-aac,video-thumbnail,replay,webrtc \
+            --features tls,fdk-aac,media-codecs,replay,webrtc \
             --target aarch64-apple-darwin
 
   build:
@@ -184,7 +184,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact_suffix: aarch64-linux-full
             variant: full
-            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-nvenc video-encoder-vaapi display-nvdec display-vaapi display"
+            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-nvenc video-encoder-vaapi video-decoder-nvdec video-decoder-vaapi display"
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout bilbycast-libsrt-rs (path dependency)

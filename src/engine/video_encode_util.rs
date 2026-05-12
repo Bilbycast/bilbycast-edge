@@ -201,7 +201,7 @@ pub fn resolve_rate_control(s: Option<&str>) -> VideoRateControl {
 /// source resolution" when that happens — cropping is still wrong, but
 /// any behaviour change would be gated on extending
 /// `bilbycast-ffmpeg-video-rs` first.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 pub fn select_scaler_dst_format(
     chroma: VideoChroma,
     bit_depth: u8,
@@ -236,7 +236,7 @@ pub fn select_scaler_dst_format(
 /// ST 2110 ingest reaches the encoder through a different shape (raw
 /// RFC 4175 planes, no upstream decoder), so it uses
 /// [`ScaledVideoEncoder::encode_raw_planes`] instead.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 pub struct ScaledVideoEncoder {
     encode_cfg: VideoEncodeConfig,
     /// Backend chain: try in order on `avcodec_open2` failure. Single
@@ -269,7 +269,7 @@ pub struct ScaledVideoEncoder {
     resolved_backend_sink: Option<std::sync::Arc<ResolvedBackendCell>>,
 }
 
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 impl ScaledVideoEncoder {
     /// Create a new pipeline pinned to a single backend. No Auto
     /// fall-through. Callers that already invoked the resolver and
@@ -676,7 +676,7 @@ impl ScaledVideoEncoder {
 /// takes the raw integer as exposed by [`video_engine::DecodedFrame::pixel_format`]
 /// so the lazy-open path can decide whether to insert a scaler before
 /// the first frame is in hand.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn is_planar_yuv_av_pix_fmt(av_pix_fmt: i32) -> bool {
     // Hand off to a `DecodedFrame::is_planar_yuv` companion through a
     // thin shim — the constants live in `libffmpeg-video-sys` which

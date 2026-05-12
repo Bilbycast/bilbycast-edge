@@ -18,7 +18,7 @@
 //! - Idle fill — an unmistakable "this channel is reachable, but the
 //!   production feed isn't live" marker.
 //!
-//! Requires compile-time features `video-thumbnail` (for the
+//! Requires compile-time features `media-codecs` (for the
 //! `video-engine` encoder wrapper) and `fdk-aac` (for the AAC encoder).
 //! At runtime a video encoder backend must be compiled in
 //! (`video-encoder-x264` or `-x265` or `-nvenc`) — without one the
@@ -64,7 +64,7 @@ async fn run(
     flow_id: String,
     input_id: String,
 ) {
-    #[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
     {
         if let Err(e) = run_inner(&config, &per_input_tx, &stats, &cancel, &events, &flow_id, &input_id).await {
             events.emit_flow(
@@ -77,13 +77,13 @@ async fn run(
             cancel.cancelled().await;
         }
     }
-    #[cfg(not(all(feature = "video-thumbnail", feature = "fdk-aac")))]
+    #[cfg(not(all(feature = "media-codecs", feature = "fdk-aac")))]
     {
         events.emit_flow(
             EventSeverity::Critical,
             category::FLOW,
             format!(
-                "Test-pattern input '{input_id}' requires the 'video-thumbnail' and 'fdk-aac' features — rebuild the edge with those enabled"
+                "Test-pattern input '{input_id}' requires the 'media-codecs' and 'fdk-aac' features — rebuild the edge with those enabled"
             ),
             &flow_id,
         );
@@ -91,7 +91,7 @@ async fn run(
     }
 }
 
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 async fn run_inner(
     config: &TestPatternInputConfig,
     per_input_tx: &broadcast::Sender<RtpPacket>,
@@ -305,7 +305,7 @@ async fn run_inner(
     }
 }
 
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 fn publish_chunks(
     ts_chunks: Vec<Bytes>,
     seq_num: &mut u16,
@@ -348,7 +348,7 @@ fn publish_chunks(
     crate::engine::input_transcode::publish_input_packet_with_post(transcoder, post, per_input_tx, pkt);
 }
 
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 #[allow(unused_imports, unreachable_code)]
 fn select_video_backend() -> Option<video_codec::VideoEncoderCodec> {
     use video_codec::VideoEncoderCodec;
@@ -375,7 +375,7 @@ fn select_video_backend() -> Option<video_codec::VideoEncoderCodec> {
     None
 }
 
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 fn backend_codec_string(codec: video_codec::VideoEncoderCodec) -> &'static str {
     use video_codec::VideoEncoderCodec;
     // Exhaustive matches for feature-gated variants trigger unused-import
@@ -396,7 +396,7 @@ fn backend_codec_string(codec: video_codec::VideoEncoderCodec) -> &'static str {
 ///
 /// Returns `(y_plane, u_plane, v_plane, y_stride, u_stride, v_stride)`.
 /// Chroma planes are width/2 × height/2 per YUV420P.
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 fn build_smpte_bars_yuv420p(width: u32, height: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>, usize, usize, usize) {
     // SMPTE 75% bars, BT.601 TV-range YUV. 8 vertical bars left→right:
     // white (75%), yellow, cyan, green, magenta, red, blue, black.
@@ -446,7 +446,7 @@ fn build_smpte_bars_yuv420p(width: u32, height: u32) -> (Vec<u8>, Vec<u8>, Vec<u
 
 /// 5×7 bitmap font for digits 0–9 and `:`. Each row encodes 5 columns in
 /// the low 5 bits, MSB = leftmost pixel. Used for the timecode overlay.
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 const TC_FONT: [[u8; 7]; 11] = [
     [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110], // 0
     [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110], // 1
@@ -461,7 +461,7 @@ const TC_FONT: [[u8; 7]; 11] = [
     [0b00000, 0b00110, 0b00110, 0b00000, 0b00110, 0b00110, 0b00000], // :
 ];
 
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 fn tc_glyph_index(ch: char) -> Option<usize> {
     match ch {
         '0'..='9' => Some((ch as u8 - b'0') as usize),
@@ -470,7 +470,7 @@ fn tc_glyph_index(ch: char) -> Option<usize> {
     }
 }
 
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 fn fill_rect_y(y: &mut [u8], stride: usize, height: usize, x0: usize, y0: usize, w: usize, h: usize, luma: u8) {
     let x1 = (x0 + w).min(stride);
     let y1 = (y0 + h).min(height);
@@ -482,7 +482,7 @@ fn fill_rect_y(y: &mut [u8], stride: usize, height: usize, x0: usize, y0: usize,
     }
 }
 
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 fn draw_glyph(y: &mut [u8], stride: usize, height: usize, ch: char, x0: usize, y0: usize, scale: usize, luma: u8) {
     let Some(idx) = tc_glyph_index(ch) else { return; };
     let glyph = &TC_FONT[idx];
@@ -498,7 +498,7 @@ fn draw_glyph(y: &mut [u8], stride: usize, height: usize, ch: char, x0: usize, y
 /// Draw `HH:MM:SS:FF` centred near the bottom of the frame. Y plane only
 /// — chroma underneath tints the digits, which is fine: the count is
 /// still readable and motion proves liveness.
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 fn draw_timecode(y: &mut [u8], width: usize, height: usize, frame_idx: u64, fps: u32) {
     let fps_u = fps.max(1) as u64;
     let ff = (frame_idx % fps_u) as u32;
@@ -534,7 +534,7 @@ fn draw_timecode(y: &mut [u8], width: usize, height: usize, frame_idx: u64, fps:
 /// Solid white box that ping-pongs diagonally. Triangle wave in X and Y
 /// with coprime-ish speeds so the trajectory covers the frame rather
 /// than cycling on a short orbit.
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 fn draw_bouncing_box(y: &mut [u8], width: usize, height: usize, frame_idx: u64) {
     let box_size = (height / 10).max(20);
     if box_size >= width || box_size >= height { return; }
@@ -553,7 +553,7 @@ fn draw_bouncing_box(y: &mut [u8], width: usize, height: usize, frame_idx: u64) 
     fill_rect_y(y, width, height, pos_x, pos_y, box_size, box_size, 235);
 }
 
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 struct AudioContext {
     encoder: aac_audio::AacEncoder,
     sample_rate: usize,
@@ -567,7 +567,7 @@ struct AudioContext {
     pts_90k: u64,
 }
 
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 impl AudioContext {
     fn accumulate(&mut self, planar: Vec<Vec<f32>>) {
         let mut added_per_channel = 0;
@@ -609,7 +609,7 @@ impl AudioContext {
     }
 }
 
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 fn build_audio_encoder(tone_hz: f32, tone_dbfs: f32) -> Result<AudioContext, String> {
     let sample_rate = 48_000usize;
     let channels = 2usize;

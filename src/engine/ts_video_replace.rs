@@ -110,7 +110,7 @@ pub enum TsVideoReplaceError {
     /// This bilbycast build was compiled without the matching video
     /// encoder feature flag (`video-encoder-x264`, etc.).
     EncoderDisabled(&'static str),
-    /// The dependent `video-thumbnail` feature is disabled, which means
+    /// The dependent `media-codecs` feature is disabled, which means
     /// `video-engine` is not compiled in.
     VideoEngineMissing,
     /// `resolve_video_encoder` rejected the (codec, chroma, bit_depth)
@@ -130,7 +130,7 @@ impl std::fmt::Display for TsVideoReplaceError {
             }
             Self::VideoEngineMissing => write!(
                 f,
-                "video-engine is not compiled in (enable the video-thumbnail feature)"
+                "video-engine is not compiled in (enable the media-codecs feature)"
             ),
             Self::EncoderUnavailable(_reason, msg) => write!(f, "{msg}"),
         }
@@ -143,7 +143,7 @@ impl std::error::Error for TsVideoReplaceError {}
 ///
 /// See module-level docs for the algorithm. Not `Sync`.
 pub struct TsVideoReplacer {
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     inner: inner::Inner,
     /// Human-readable description for logging ("x264 @ 4000 kbps").
     description: String,
@@ -185,11 +185,11 @@ impl TsVideoReplacer {
         &mut self,
         pacer: Arc<crate::engine::av_sync_mux::AvSyncPacer>,
     ) {
-        #[cfg(feature = "video-thumbnail")]
+        #[cfg(feature = "media-codecs")]
         {
             self.inner.av_sync_pacer = Some(pacer);
         }
-        #[cfg(not(feature = "video-thumbnail"))]
+        #[cfg(not(feature = "media-codecs"))]
         {
             let _ = pacer;
         }
@@ -210,7 +210,7 @@ impl TsVideoReplacer {
     /// downstream `TsPidOverridesRewriter` stage — the replacer re-encodes
     /// video on the same source PID it learned from the PMT and lets that
     /// stage rename the PID afterwards.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     pub fn new(
         cfg: &VideoEncodeConfig,
         force_idr: Option<Arc<AtomicBool>>,
@@ -239,9 +239,9 @@ impl TsVideoReplacer {
         })
     }
 
-    /// Stub constructor when `video-thumbnail` is compiled out — returns
+    /// Stub constructor when `media-codecs` is compiled out — returns
     /// `VideoEngineMissing` so callers fail cleanly at output startup.
-    #[cfg(not(feature = "video-thumbnail"))]
+    #[cfg(not(feature = "media-codecs"))]
     pub fn new(
         _cfg: &VideoEncodeConfig,
         _force_idr: Option<Arc<AtomicBool>>,
@@ -302,11 +302,11 @@ impl TsVideoReplacer {
     /// verbatim (best-effort for boundary recovery in the caller).
     #[allow(unused_variables)]
     pub fn process(&mut self, input_ts: &[u8], output: &mut Vec<u8>) {
-        #[cfg(feature = "video-thumbnail")]
+        #[cfg(feature = "media-codecs")]
         {
             self.inner.process(input_ts, output);
         }
-        #[cfg(not(feature = "video-thumbnail"))]
+        #[cfg(not(feature = "media-codecs"))]
         {
             output.extend_from_slice(input_ts);
         }
@@ -315,7 +315,7 @@ impl TsVideoReplacer {
     /// Drain buffered PES / encoder state. Call on graceful shutdown.
     #[allow(dead_code, unused_variables)]
     pub fn flush(&mut self, output: &mut Vec<u8>) {
-        #[cfg(feature = "video-thumbnail")]
+        #[cfg(feature = "media-codecs")]
         {
             self.inner.flush(output);
         }
@@ -324,7 +324,7 @@ impl TsVideoReplacer {
 
 // ─────────────────────────── Implementation ───────────────────────────
 
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 mod inner {
     use super::*;
     use crate::engine::video_encode_util::ScaledVideoEncoder;
@@ -1190,7 +1190,7 @@ mod inner {
 ///
 /// `None`: legacy first-match — first ES with stream_type in
 /// `{0x01 MPEG-1, 0x02 MPEG-2, 0x1B H.264, 0x24 H.265}`.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn parse_pmt_video(pkt: &[u8], pinned_pid: Option<u16>) -> Option<(u16, u8)> {
     let mut offset = 4;
     if ts_has_adaptation(pkt) {
@@ -1253,7 +1253,7 @@ fn parse_pmt_video(pkt: &[u8], pinned_pid: Option<u16>) -> Option<(u16, u8)> {
 /// PCR_PID at a separate dedicated PCR PID would leave us emitting PCR
 /// on the video PID while the PMT advertises PCR somewhere else — a
 /// mismatch professional decoders treat as a TR 101 290 P1.6 violation.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn rewrite_pmt_video_stream_type(
     pkt: &mut [u8],
     video_pid: u16,
@@ -1314,7 +1314,7 @@ fn rewrite_pmt_video_stream_type(
 }
 
 /// Extract the ES payload and PTS from a complete PES packet.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn extract_pes_video(pes: &[u8]) -> Option<(Vec<u8>, u64, Option<u64>)> {
     if pes.len() < 9 || pes[0] != 0x00 || pes[1] != 0x00 || pes[2] != 0x01 {
         return None;
@@ -1348,7 +1348,7 @@ fn extract_pes_video(pes: &[u8]) -> Option<(Vec<u8>, u64, Option<u64>)> {
 /// (bits 21-15), byte 3 (bits 14-7), byte 4 bits 7-1 (bits 6-0). Each
 /// of bytes 0, 2, 4 reserves bit 0 as a marker bit set to '1' on the
 /// wire — this parser ignores those marker bits and shifts past them.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn parse_pts(data: &[u8]) -> u64 {
     let b0 = data[0] as u64;
     let b1 = data[1] as u64;
@@ -1375,7 +1375,7 @@ fn parse_pts(data: &[u8]) -> u64 {
 /// VLC, ffmpeg) decoded the resulting PES with garbled high-order bits
 /// once `value_33bit` exceeded 32 768 ticks (~ 364 ms at 90 kHz), which
 /// caused decoders to lose PTS lock after the first few frames.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn write_pes_timestamp(pes: &mut Vec<u8>, marker_top_nibble: u8, value_33bit: u64) {
     let v = value_33bit & 0x1_FFFF_FFFF;
     // Byte 0: marker_top_nibble << 4 already includes bits 7-4. We
@@ -1401,7 +1401,7 @@ fn write_pes_timestamp(pes: &mut Vec<u8>, marker_top_nibble: u8, value_33bit: u6
 /// 0` (the current default for the in-process encoder pipeline) DTS ==
 /// PTS; once B-frame encoding is wired in, the caller should pass the
 /// encoder's `EncodedVideoFrame::dts` here scaled to 90 kHz.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn build_video_pes(video_data: &[u8], pts: u64) -> Vec<u8> {
     build_video_pes_with_dts(video_data, pts, pts)
 }
@@ -1409,7 +1409,7 @@ fn build_video_pes(video_data: &[u8], pts: u64) -> Vec<u8> {
 /// Same as [`build_video_pes`] but lets the caller pass an explicit DTS
 /// distinct from the PTS. Kept separate so the no-B-frame default path
 /// stays a one-argument call.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn build_video_pes_with_dts(video_data: &[u8], pts: u64, dts: u64) -> Vec<u8> {
     let mut pes = Vec::with_capacity(19 + video_data.len());
     pes.extend_from_slice(&[0x00, 0x00, 0x01]);
@@ -1562,7 +1562,7 @@ fn packetize_ts(
 
 // ─────────────────────────── tests ───────────────────────────
 
-#[cfg(all(test, feature = "video-thumbnail"))]
+#[cfg(all(test, feature = "media-codecs"))]
 mod tests {
     use super::*;
 

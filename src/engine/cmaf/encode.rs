@@ -332,7 +332,7 @@ impl AudioReencoder {
 //  Video re-encoder
 // ────────────────────────────────────────────────────────────────────────
 
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 pub struct VideoReencoder {
     decoder: Option<video_engine::VideoDecoder>,
     /// Shared encoder pipeline — wraps `VideoEncoder` + optional
@@ -352,7 +352,7 @@ pub struct VideoReencoder {
     source_codec: Option<CmafVideoCodec>,
 }
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 pub struct VideoReencoder {
     _phantom: (),
     output_id: String,
@@ -363,7 +363,7 @@ pub struct VideoOutFrame {
     pub is_keyframe: bool,
 }
 
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 impl VideoReencoder {
     pub fn new(cfg: &VideoEncodeConfig, output_id: &str) -> Result<Self> {
         let target_codec = match cfg.codec.as_str() {
@@ -488,10 +488,10 @@ impl VideoReencoder {
     }
 }
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 impl VideoReencoder {
     pub fn new(_cfg: &VideoEncodeConfig, output_id: &str) -> Result<Self> {
-        bail!("video_encode requires the `video-thumbnail` feature (and a `video-encoder-*` backend) at build time")
+        bail!("video_encode requires the `media-codecs` feature (and a `video-encoder-*` backend) at build time")
     }
 
     pub fn encode_frame(
@@ -508,7 +508,7 @@ impl VideoReencoder {
 /// Split an Annex-B byte stream into NALU vectors with the start
 /// codes stripped. Handles both 3-byte (0x000001) and 4-byte
 /// (0x00000001) start codes.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn split_annex_b_to_nalus(data: &[u8], out: &mut Vec<Vec<u8>>) {
     let mut starts: Vec<usize> = Vec::new();
     let mut i = 0;
@@ -579,7 +579,7 @@ mod reencoder_tests {
 
     #[test]
     #[cfg_attr(
-        not(any(feature = "fdk-aac", feature = "video-thumbnail")),
+        not(any(feature = "fdk-aac", feature = "media-codecs")),
         ignore = "audio_encode requires an in-process encoder backend or ffmpeg in PATH"
     )]
     fn silent_fallback_on_builds_eager_encoder() {
@@ -610,7 +610,7 @@ mod reencoder_tests {
 }
 
 #[cfg(test)]
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 mod tests {
     use super::*;
 

@@ -60,7 +60,7 @@ const FRAME_HEIGHT: u32 = 90;
 /// JPEG quality (1=highest, 31=lowest, libavcodec scale). 5 matches
 /// `engine::thumbnail` — well within "look like the live picture" range
 /// without exploding bytes-per-frame.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 const FRAME_QUALITY: u32 = 5;
 
 /// TS ring buffer cap. Same budget as the live thumbnail generator — sized
@@ -278,7 +278,7 @@ async fn try_capture_frame(ts_data: &Bytes) -> Result<Option<(u64, Vec<u8>)>, St
     };
     let pts_90khz = pts_27mhz / 300;
 
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     {
         let bytes = ts_data.to_vec();
         let jpeg = tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>, String> {
@@ -311,7 +311,7 @@ async fn try_capture_frame(ts_data: &Bytes) -> Result<Option<(u64, Vec<u8>)>, St
             None => Ok(None),
         }
     }
-    #[cfg(not(feature = "video-thumbnail"))]
+    #[cfg(not(feature = "media-codecs"))]
     {
         // Subprocess fallback isn't worth carrying for the filmstrip —
         // operators on `--no-default-features` builds simply won't get
@@ -320,7 +320,7 @@ async fn try_capture_frame(ts_data: &Bytes) -> Result<Option<(u64, Vec<u8>)>, St
         // rather than spawning a parallel ffmpeg per cadence tick.
         let _ = ts_data;
         let _ = pts_90khz;
-        Err("filmstrip requires the `video-thumbnail` feature".to_string())
+        Err("filmstrip requires the `media-codecs` feature".to_string())
     }
 }
 

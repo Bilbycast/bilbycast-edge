@@ -298,7 +298,7 @@ fn round(v: f32, dp: u32) -> f32 {
 
 // ── Decode + metrics ──────────────────────────────────────────────────────
 
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn decode_and_metrics(
     ts: &[u8],
     prev_y: Option<&YPlane>,
@@ -358,7 +358,7 @@ fn decode_and_metrics(
     (Some(metrics), Some(new_y))
 }
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 fn decode_and_metrics(
     _ts: &[u8],
     _prev_y: Option<&YPlane>,
@@ -373,7 +373,7 @@ fn decode_and_metrics(
 /// its established "feed everything, let libavcodec catch up" decode
 /// pattern (the live thumbnail loop uses a per-AU pattern via TsDemuxer
 /// for open-GOP broadcast streams; both paths are independent).
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn extract_video(ts: &[u8]) -> Option<(Vec<u8>, video_codec::VideoCodec)> {
     use crate::engine::ts_parse::{
         parse_pat_programs, ts_has_payload, ts_payload_offset, ts_pid, ts_pusi, PAT_PID,
@@ -463,7 +463,7 @@ fn extract_video(ts: &[u8]) -> Option<(Vec<u8>, video_codec::VideoCodec)> {
     Some((es, codec))
 }
 
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn parse_pmt_first_video(payload: &[u8]) -> Option<(u16, u8)> {
     if payload.is_empty() {
         return None;

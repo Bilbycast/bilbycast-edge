@@ -224,7 +224,7 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
   - Async HTTP upload, non-blocking to other outputs
   - **MPTS passthrough** (default) or optional MPTS→SPTS program filter via `program_number` — filtered segments carry a rewritten single-program TS
   - **Optional `audio_encode` block (Phase B):** each segment is piped through `ffmpeg -i pipe:0 -c:v copy -c:a {codec} -f mpegts pipe:1` before HTTP PUT. Allowed codecs: `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`. Per-segment fork rather than a long-lived encoder because HLS segments are 2-6 s and ffmpeg startup is small relative to that — also lets MP2/AC-3 work without a new TS muxer. Requires ffmpeg in PATH; the output refuses to start if ffmpeg is missing and emits a Critical `audio_encode` event.
-  - **Optional companion `transcode` block:** channel shuffle / sample-rate conversion applied to the decoded PCM before re-encoding. Honoured only on the in-process remux path (`video-thumbnail` feature, default); the subprocess fallback ignores it with a warning. See [transcoding.md](transcoding.md#transcode--channel-shuffle--sample-rate-conversion).
+  - **Optional companion `transcode` block:** channel shuffle / sample-rate conversion applied to the decoded PCM before re-encoding. Honoured only on the in-process remux path (`media-codecs` feature, default); the subprocess fallback ignores it with a warning. See [transcoding.md](transcoding.md#transcode--channel-shuffle--sample-rate-conversion).
 - **Limitations:**
   - Output only. Segment-based transport inherently adds 1-4 seconds of latency.
   - Uses a minimal built-in HTTP client (not a full HTTP/2 client).
@@ -307,7 +307,7 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
   software video encoders, so it will deserialize the config but the
   encode worker logs an error and drops frames. The `*-linux-full`
   release binary includes all three encoders. ST 2110-20 **outputs**
-  only need the `video-thumbnail` feature (default on).
+  only need the `media-codecs` feature (default on).
 - **NMOS:** advertised as `urn:x-nmos:format:video` in IS-04 with
   BCP-004 receiver caps declaring `video/raw`,
   `color_sampling=YCbCr-4:2:2`, `component_depth` ∈ {8, 10},

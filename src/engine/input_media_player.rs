@@ -20,7 +20,7 @@
 //! |------|--------|--------|--------------------|
 //! | `ts`    | embedded PCR (or `paced_bitrate_bps`) | passthrough — anything inside the TS | none |
 //! | `mp4`   | sample PTS              | H.264 / HEVC video, AAC audio | none (pure-Rust mp4 demux + TsMuxer) |
-//! | `image` | encoder frame rate      | re-encode to H.264 + silent AAC | `video-thumbnail` + `fdk-aac` |
+//! | `image` | encoder frame rate      | re-encode to H.264 + silent AAC | `media-codecs` + `fdk-aac` |
 //!
 //! The TS path is the lowest-CPU, lowest-latency option — recommended for
 //! pre-baked broadcast slates. MP4 and image paths exist for operator
@@ -45,9 +45,9 @@ use crate::engine::packet::RtpPacket;
 use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::FlowStatsAccumulator;
 
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 mod image_slate;
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 mod mp4_demux;
 
 /// 188-byte MPEG-TS packet size.
@@ -488,7 +488,7 @@ pub(super) fn classify_playback_error(err: &anyhow::Error) -> &'static str {
     {
         return "media_player_source_unsupported";
     }
-    if msg_lc.contains("requires the 'video-thumbnail'") {
+    if msg_lc.contains("requires the 'media-codecs'") {
         return "media_player_source_codec_unsupported";
     }
     "media_player_source_failed"
@@ -1391,19 +1391,19 @@ pub(super) fn try_set_discontinuity_indicator(pkt: &mut [u8; TS_PACKET]) -> bool
 
 // ── MP4 + Image dispatch (Phase 3 / 4) ──────────────────────────────────
 
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 async fn play_mp4(path: &Path, session: &mut PlayerSession<'_>) -> Result<()> {
     mp4_demux::play_mp4_file(path, session).await
 }
 
-#[cfg(not(all(feature = "video-thumbnail", feature = "fdk-aac")))]
+#[cfg(not(all(feature = "media-codecs", feature = "fdk-aac")))]
 async fn play_mp4(_path: &Path, _session: &mut PlayerSession<'_>) -> Result<()> {
     Err(anyhow!(
-        "media-player MP4 source requires the 'video-thumbnail' and 'fdk-aac' features — rebuild the edge with those enabled, or use a pre-encoded .ts file instead"
+        "media-player MP4 source requires the 'media-codecs' and 'fdk-aac' features — rebuild the edge with those enabled, or use a pre-encoded .ts file instead"
     ))
 }
 
-#[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 async fn play_image(
     path: &Path,
     fps: u8,
@@ -1414,7 +1414,7 @@ async fn play_image(
     image_slate::play_image_file(path, fps, bitrate_kbps, audio_silence, session).await
 }
 
-#[cfg(not(all(feature = "video-thumbnail", feature = "fdk-aac")))]
+#[cfg(not(all(feature = "media-codecs", feature = "fdk-aac")))]
 async fn play_image(
     _path: &Path,
     _fps: u8,
@@ -1423,7 +1423,7 @@ async fn play_image(
     _session: &mut PlayerSession<'_>,
 ) -> Result<()> {
     Err(anyhow!(
-        "media-player image source requires the 'video-thumbnail' and 'fdk-aac' features — rebuild the edge with those enabled, or upload the slate as a pre-encoded .ts file"
+        "media-player image source requires the 'media-codecs' and 'fdk-aac' features — rebuild the edge with those enabled, or upload the slate as a pre-encoded .ts file"
     ))
 }
 
@@ -1744,7 +1744,7 @@ mod tests {
     #[test]
     fn classify_feature_gate_is_codec_unsupported() {
         let err = anyhow!(
-            "media-player MP4 source requires the 'video-thumbnail' and 'fdk-aac' features — rebuild the edge with those enabled, or use a pre-encoded .ts file instead"
+            "media-player MP4 source requires the 'media-codecs' and 'fdk-aac' features — rebuild the edge with those enabled, or use a pre-encoded .ts file instead"
         );
         assert_eq!(
             classify_playback_error(&err),

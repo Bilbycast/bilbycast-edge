@@ -126,7 +126,7 @@ tooltip.
 | `display-vaapi` (legacy) | `display-vaapi` | Same for VAAPI |
 | `display` | `display` + ≥ 1 KMS connector enumerated | Local-display output usable |
 | `fdk-aac` | `fdk-aac` | In-process AAC family |
-| `video-thumbnail` | `video-thumbnail` (default on) | libavcodec for video decode + Opus / MP2 / AC-3 audio decode |
+| `media-codecs` | `media-codecs` (default on) | libavcodec for video decode + Opus / MP2 / AC-3 audio decode |
 | `webrtc` | `webrtc` (default on) | WHIP / WHEP supported |
 | `tls` | `tls` (default on) | HTTPS + RTMPS |
 | `replay` | `replay` (default on) | Recording + clip playback |

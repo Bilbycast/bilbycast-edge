@@ -2521,7 +2521,7 @@ fn display_loop(
                     format!(
                         "display output '{output_id}': dropping {}x{} CPU-decoded \
                          frames (over {SW_BLIT_MAX_W}x{SW_BLIT_MAX_H} CPU-blit ceiling); \
-                         display will resume automatically when display-vaapi \
+                         display will resume automatically when video-decoder-vaapi \
                          zero-copy frames arrive again",
                         next.width, next.height,
                     ),

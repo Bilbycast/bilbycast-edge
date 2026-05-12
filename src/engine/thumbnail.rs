@@ -11,7 +11,7 @@
 //!
 //! ## Backend selection
 //!
-//! When the `video-thumbnail` feature is enabled (default), thumbnails are
+//! When the `media-codecs` feature is enabled (default), thumbnails are
 //! generated **in-process** via `video-engine` (FFmpeg libavcodec/libswscale).
 //! A long-lived [`TsDemuxer`] owned by the loop turns the inbound
 //! MPEG-TS stream into demuxed access units (one per PES), each tagged with
@@ -61,7 +61,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 use bytes::BytesMut;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -71,7 +71,7 @@ use crate::stats::collector::ThumbnailAccumulator;
 
 use super::packet::RtpPacket;
 use super::ts_parse::strip_rtp_header;
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 use super::ts_demux::{DemuxedFrame, TsDemuxer};
 
 /// How often to generate a thumbnail (seconds).
@@ -94,7 +94,7 @@ const FREEZE_MIN_GAP: Duration = Duration::from_millis(4_500);
 /// pre-encoded MP4 sources with 10 s GOPs are still covered: at 21 Mbps,
 /// 8 MB is ~3 s; at 2 Mbps it's ~32 s. The byte budget is a *retention*
 /// cap, not a per-tick decode budget — see [`MAX_DECODE_FRAMES`].
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 const MAX_AU_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 /// Maximum number of access units to feed the decoder per tick. Bounds
@@ -113,13 +113,13 @@ const MAX_AU_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 /// SBS-style open-GOP stream (SPS/I-slice every ~2.5 s) to lock on
 /// reliably, and small enough that 6 concurrent thumbnail loops decoding
 /// at ~15 ms / frame stay under ~25 % CPU steady-state.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 const MAX_DECODE_FRAMES: usize = 50;
 
 /// Subprocess-fallback raw TS budget. Larger than the AU budget because
 /// the legacy ffmpeg-pipe path needs PAT/PMT + a keyframe in the same
 /// chunk it streams to ffmpeg's mpegts demuxer.
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 const MAX_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 
 /// Thumbnail output dimensions.
@@ -142,14 +142,14 @@ const BLACK_LUMINANCE_THRESHOLD: f64 = 16.0;
 /// raise the wrong alarm.
 const NO_SIGNAL_TIMEOUT: Duration = Duration::from_secs(10);
 
-// ── Subprocess fallback constants (used when video-thumbnail is disabled) ──
+// ── Subprocess fallback constants (used when media-codecs is disabled) ──
 
 /// ffmpeg subprocess timeout.
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Timeout for the lightweight black-detection ffmpeg invocation.
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 const BLACK_DETECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 // ── Public API ───────────────────────────────────────────────────────────
@@ -173,14 +173,14 @@ pub fn spawn_thumbnail_generator(
 
 /// Check whether thumbnail generation is available on this system.
 ///
-/// With `video-thumbnail` feature: always `true` (compiled in).
+/// With `media-codecs` feature: always `true` (compiled in).
 /// Without: checks for external ffmpeg binary.
 pub fn check_thumbnail_available() -> bool {
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     {
         true
     }
-    #[cfg(not(feature = "video-thumbnail"))]
+    #[cfg(not(feature = "media-codecs"))]
     {
         check_ffmpeg_subprocess_available()
     }
@@ -200,7 +200,7 @@ async fn thumbnail_loop(
     cancel: CancellationToken,
     program_number: Option<u16>,
 ) {
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     {
         video_engine::silence_ffmpeg_logs();
     }
@@ -227,9 +227,9 @@ async fn thumbnail_loop(
     // Buffer state. The in-process path keeps a ring of demuxed access
     // units; the subprocess fallback keeps a ring of raw TS chunks because
     // it pipes them straight into ffmpeg's mpegts demuxer.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     let mut state = LiveState::new(program_number);
-    #[cfg(not(feature = "video-thumbnail"))]
+    #[cfg(not(feature = "media-codecs"))]
     let mut state = SubprocessState::new();
 
     // Wall-clock of the most recent *useful* broadcast packet — i.e. one
@@ -416,7 +416,7 @@ struct InternalThumbnailResult {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// In-process thumbnail backend (video-thumbnail feature)
+// In-process thumbnail backend (media-codecs feature)
 // ════════════════════════════════════════════════════════════════════════
 
 /// Anchor classification for a buffered access unit.
@@ -428,7 +428,7 @@ struct InternalThumbnailResult {
 /// produces green / pixelated output until enough P-frames have flowed.
 /// `snapshot_for_decode` therefore prefers `Idr` over `ParamSet` over
 /// `None`, falling through only when the stronger marker is absent.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnchorKind {
     /// Codec-defined random-access point — H.264 IDR (NAL 5), HEVC
@@ -445,7 +445,7 @@ enum AnchorKind {
     None,
 }
 
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 struct ThumbnailFrame {
     /// Concatenated Annex B NALs (one access unit) ready to feed the decoder.
     annex_b: Vec<u8>,
@@ -460,7 +460,7 @@ struct ThumbnailFrame {
 /// Owns its own `TsDemuxer` so thumbnail generation stays independent of
 /// any other subscriber on the broadcast channel — toggling `content_analysis`
 /// (or any future broadcast-tap feature) cannot affect this path.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 struct LiveState {
     demuxer: TsDemuxer,
     /// Demuxed access units in arrival order (oldest at front).
@@ -471,7 +471,7 @@ struct LiveState {
     codec: Option<video_codec::VideoCodec>,
 }
 
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 impl LiveState {
     fn new(program_number: Option<u16>) -> Self {
         Self {
@@ -665,7 +665,7 @@ impl LiveState {
 
 /// H.264 NAL unit type from the 1-byte header. Returns 0xFF for empty
 /// NALUs so caller checks (e.g. `== 7`) never accidentally match.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 #[inline]
 fn h264_nal_type(nalu: &[u8]) -> u8 {
     if nalu.is_empty() {
@@ -676,7 +676,7 @@ fn h264_nal_type(nalu: &[u8]) -> u8 {
 }
 
 /// HEVC NAL unit type from the 1-byte header. Returns 0xFF on empty.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 #[inline]
 fn h265_nal_type(nalu: &[u8]) -> u8 {
     if nalu.is_empty() {
@@ -690,7 +690,7 @@ fn h265_nal_type(nalu: &[u8]) -> u8 {
 /// (`0x000001B3`). MPEG-2 broadcasts emit the sequence header at every
 /// GoP boundary so any AU carrying one is a safe random-access anchor
 /// even before we look for the I-picture.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 #[inline]
 fn mpeg2_starts_with_sequence_header(es: &[u8]) -> bool {
     let mut i = 0;
@@ -711,7 +711,7 @@ fn mpeg2_starts_with_sequence_header(es: &[u8]) -> bool {
 
 /// Concatenate split NAL units (no start codes) into Annex B form by
 /// prepending a 4-byte `00 00 00 01` start code in front of each NAL.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn build_annex_b(nalus: &[Vec<u8>]) -> Vec<u8> {
     let total: usize = nalus.iter().map(|n| n.len() + 4).sum();
     let mut out = Vec::with_capacity(total);
@@ -729,7 +729,7 @@ fn build_annex_b(nalus: &[Vec<u8>]) -> Vec<u8> {
 /// For H.264: SPS+PPS in Annex B; for HEVC: VPS+SPS+PPS. Returns an empty
 /// Vec when the demuxer hasn't seen the corresponding NALUs yet — the
 /// decoder will pick them up off the first AU that carries them inline.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn build_headers(demuxer: &TsDemuxer, codec: video_codec::VideoCodec) -> Vec<u8> {
     let mut out = Vec::with_capacity(128);
     let push = |out: &mut Vec<u8>, nalu: Option<&[u8]>| {
@@ -764,7 +764,7 @@ fn build_headers(demuxer: &TsDemuxer, codec: video_codec::VideoCodec) -> Vec<u8>
 /// buffer, and returns a snapshot suitable for `decode_thumbnail_packets`
 /// — same primitive as the live thumbnail loop, just without the long-
 /// lived ring.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 pub(crate) fn demux_snapshot_for_decode(
     ts_data: &[u8],
     program_number: Option<u16>,
@@ -775,16 +775,16 @@ pub(crate) fn demux_snapshot_for_decode(
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// ffmpeg subprocess fallback (when video-thumbnail feature is disabled)
+// ffmpeg subprocess fallback (when media-codecs feature is disabled)
 // ════════════════════════════════════════════════════════════════════════
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 struct SubprocessState {
     buffer: VecDeque<Bytes>,
     buffer_bytes: usize,
 }
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 impl SubprocessState {
     fn new() -> Self {
         Self {
@@ -821,7 +821,7 @@ impl SubprocessState {
     }
 }
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 fn check_ffmpeg_subprocess_available() -> bool {
     std::process::Command::new("ffmpeg")
         .arg("-version")
@@ -832,7 +832,7 @@ fn check_ffmpeg_subprocess_available() -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 async fn generate_thumbnail_subprocess(ts_data: &[u8]) -> Result<InternalThumbnailResult, String> {
     use tokio::io::AsyncWriteExt;
 
@@ -887,7 +887,7 @@ async fn generate_thumbnail_subprocess(ts_data: &[u8]) -> Result<InternalThumbna
 }
 
 /// Detect average luminance via a lightweight ffmpeg invocation (subprocess fallback).
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 async fn detect_black_luminance_subprocess(jpeg: &[u8]) -> f64 {
     use tokio::io::AsyncWriteExt;
 
@@ -952,7 +952,7 @@ fn hash_jpeg(data: &[u8]) -> u64 {
     hasher.finish()
 }
 
-#[cfg(all(test, feature = "video-thumbnail"))]
+#[cfg(all(test, feature = "media-codecs"))]
 mod tests {
     use super::*;
 

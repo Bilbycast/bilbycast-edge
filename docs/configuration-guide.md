@@ -1028,7 +1028,7 @@ exercising downstream gear without a real source.
 | `tone_hz` | f32 | `1000.0` | Audio tone frequency. Range `[50, 8000]`. |
 | `tone_dbfs` | f32 | `-20.0` | Audio level in dBFS. `-20 dBFS` is the broadcast reference level. |
 
-Requires the edge build to include the `video-thumbnail` and
+Requires the edge build to include the `media-codecs` and
 `fdk-aac` features (both on by default). Software-encoded — counts
 against the resource budget like any other transcoding flow.
 
@@ -1328,7 +1328,7 @@ When `encryption` is set, the edge:
 
 - Output only. Standard-mode segment-based transport adds 1-4 s latency; LL-CMAF with 500 ms chunks targets <3 s glass-to-glass.
 - Source must emit an IDR at least every `segment_duration_secs` unless `video_encode` is set.
-- `video_encode` requires the `video-thumbnail` feature plus a matching `video-encoder-x264` / `-x265` / `-nvenc` / `-qsv` backend compiled in.
+- `video_encode` requires the `media-codecs` feature plus a matching `video-encoder-x264` / `-x265` / `-nvenc` / `-qsv` backend compiled in.
 - Whip-style signaling is not needed — CMAF is stateless HTTP push.
 
 See [`docs/cmaf.md`](cmaf.md) for the full reference, ingest compatibility notes, and performance tuning.
@@ -2472,7 +2472,7 @@ uncompressed-video subsets of SMPTE ST 2110:
     the flow's source TS and RFC 4175-packetize onto the wire. Pixel
     formats: **YCbCr-4:2:2 at 8-bit and 10-bit** (other formats are
     rejected by validation). Requires a `video-encoder-*` feature at
-    build time for inputs; the `video-thumbnail` feature (default on)
+    build time for inputs; the `media-codecs` feature (default on)
     is enough for outputs.
   - **ST 2110-23** — a single uncompressed video essence split across
     N ST 2110-20 sub-streams. Partition modes: `two_sample_interleave`
@@ -2957,7 +2957,7 @@ independent tiers:
   snapshot's top-level `ingress` field reports `"ts"` / `"pcm"` /
   `"aes3"` so the manager UI can label the ingest mode. MP2 / AC-3 /
   E-AC-3 PIDs inside MPEG-TS now decode in-process via the FFmpeg
-  audio bridge (`video-thumbnail` feature, default on) and run the
+  audio bridge (`media-codecs` feature, default on) and run the
   full R128 / true-peak / mute / clip pipeline alongside AAC; their
   snapshot reports `codec_decoded: true`.
 - **Video Full** — YUV pixel-domain metrics on decoded frames

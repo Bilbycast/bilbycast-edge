@@ -142,7 +142,7 @@ pub mod wire_emit;
 /// "Phase 2" section. Linux-only — public surface compiles on other
 /// platforms but every operation returns `Unsupported`.
 pub mod wire_emit_txtime;
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 pub mod video_encode_util;
 
 /// Ingress-side audio + video transcoding composer for TS-carrying inputs.

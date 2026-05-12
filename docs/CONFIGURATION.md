@@ -642,7 +642,7 @@ Segment-based HTTP ingest. Supports HEVC/HDR content.
 | `max_segments`         | `usize`   | `5`     | Maximum segments in rolling playlist             |
 | `program_number`       | `u16?`    | `null`  | MPTS → SPTS program filter. `null` = each segment carries the full MPTS; `Some(N)` = each segment carries only program N as a rewritten single-program TS. Must be `> 0`. |
 | `audio_encode`         | `AudioEncodeConfig?` | `null` | Optional per-segment ffmpeg remuxer. Allowed `codec`: `aac_lc` (default), `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`. Each segment is piped through `ffmpeg -i pipe:0 -c:v copy -c:a {codec} -f mpegts pipe:1`. Requires ffmpeg in PATH; the output refuses to start if ffmpeg is missing and emits a Critical `audio_encode` event. |
-| `transcode`            | `TranscodeJson?`     | `null` | Optional channel shuffle / sample-rate conversion applied to decoded PCM **before** `audio_encode` re-encodes. Honoured only on the in-process remux path (`video-thumbnail` feature, default); the subprocess fallback logs a warning and ignores it. Ignored when `audio_encode` is unset. See [`transcoding.md`](transcoding.md#transcode--channel-shuffle--sample-rate-conversion). |
+| `transcode`            | `TranscodeJson?`     | `null` | Optional channel shuffle / sample-rate conversion applied to decoded PCM **before** `audio_encode` re-encodes. Honoured only on the in-process remux path (`media-codecs` feature, default); the subprocess fallback logs a warning and ignores it. Ignored when `audio_encode` is unset. See [`transcoding.md`](transcoding.md#transcode--channel-shuffle--sample-rate-conversion). |
 
 ### WebRTC Output (`"type": "webrtc"`)
 

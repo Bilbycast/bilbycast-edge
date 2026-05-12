@@ -1105,8 +1105,8 @@ fn edge_capabilities() -> Vec<&'static str> {
     if cfg!(feature = "fdk-aac") {
         caps.push("fdk-aac");
     }
-    if cfg!(feature = "video-thumbnail") {
-        caps.push("video-thumbnail");
+    if cfg!(feature = "media-codecs") {
+        caps.push("media-codecs");
     }
     if cfg!(feature = "webrtc") {
         caps.push("webrtc");
@@ -1123,38 +1123,12 @@ fn edge_capabilities() -> Vec<&'static str> {
         if !crate::display::cached_displays().is_empty() {
             caps.push("display");
 
-            // Per-backend HW-decode capabilities. Advertised only when
-            // (a) the matching `display-nvdec` / `display-qsv` Cargo
-            // feature is on AND (b) the runtime probe found at least
-            // one decoder in that family usable. The manager UI keys
-            // the per-output "Video Decoder" dropdown options off
-            // these strings so older edges, edges built without the
-            // feature, and edges with the feature but no working
-            // hardware all hide the option cleanly.
-            #[cfg(feature = "display-nvdec")]
-            {
-                if let Some(c) = crate::engine::hardware_probe::static_capabilities() {
-                    if c.hw_decoders.h264_nvenc || c.hw_decoders.hevc_nvenc {
-                        caps.push("display-nvdec");
-                    }
-                }
-            }
-            #[cfg(feature = "display-qsv")]
-            {
-                if let Some(c) = crate::engine::hardware_probe::static_capabilities() {
-                    if c.hw_decoders.h264_qsv || c.hw_decoders.hevc_qsv {
-                        caps.push("display-qsv");
-                    }
-                }
-            }
-            #[cfg(feature = "display-vaapi")]
-            {
-                if let Some(c) = crate::engine::hardware_probe::static_capabilities() {
-                    if c.hw_decoders.h264_vaapi || c.hw_decoders.hevc_vaapi {
-                        caps.push("display-vaapi");
-                    }
-                }
-            }
+            // Per-backend HW-decode capabilities for the display output
+            // are advertised via the `video-decoder-{nvdec,qsv,vaapi}`
+            // strings pushed earlier — those decoders are shared
+            // between transcode and the display output, so the manager
+            // UI keys the display "Video Decoder" dropdown off the
+            // same capability strings as the transcode resolver.
         }
     }
     // Kernel-paced wire emission via SO_TXTIME — gates the per-output

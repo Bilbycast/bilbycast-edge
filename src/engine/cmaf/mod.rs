@@ -204,7 +204,7 @@ struct CmafState {
     cenc: Option<CencRuntime>,
     /// Lazy FFmpeg-backed audio decoder for non-AAC sources
     /// (MP2 / AC-3 / E-AC-3). Opened on first `OtherAudio`.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     ff_audio_decoder: Option<video_engine::AudioDecoder>,
 }
 
@@ -244,7 +244,7 @@ impl CmafState {
             video_reencoder: None,
             ll_current: None,
             cenc: None,
-            #[cfg(feature = "video-thumbnail")]
+            #[cfg(feature = "media-codecs")]
             ff_audio_decoder: None,
         }
     }
@@ -603,7 +603,7 @@ async fn handle_frame(
 /// and feed the resulting PCM to the AAC re-encoder, replicating the
 /// back half of [`handle_audio_frame`]. CMAF egress requires AAC, so
 /// without an `audio_encode` block we drop the frame.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn handle_other_audio_frame(
     state: &mut CmafState,
     config: &CmafOutputConfig,
@@ -713,7 +713,7 @@ fn handle_other_audio_frame(
     }
 }
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 fn handle_other_audio_frame(
     _state: &mut CmafState,
     _config: &CmafOutputConfig,

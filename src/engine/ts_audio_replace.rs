@@ -210,17 +210,17 @@ pub struct TsAudioReplacer {
     /// (MP2 / AC-3 / E-AC-3). Opened on the first PES flush once we
     /// know the source codec from the PMT. Mirrors the AAC slot above —
     /// only one is populated at a time per replacer instance.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     ff_decoder: Option<video_engine::AudioDecoder>,
 
     /// Lazily constructed AAC encoder (for AAC-family targets). Opened on
     /// the first encode call, once we know the input sample-rate/channels
     /// after the first successful decode.
-    #[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
     aac_encoder: Option<aac_audio::AacEncoder>,
 
     /// Lazily constructed libavcodec encoder for MP2 / AC-3 targets.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     av_encoder: Option<video_engine::AudioEncoder>,
 
     /// Per-channel PCM accumulator (f32, planar). Grown by successful
@@ -315,11 +315,11 @@ impl TsAudioReplacer {
             expected_next_src_pts_90k: None,
             #[cfg(feature = "fdk-aac")]
             aac_decoder: None,
-            #[cfg(feature = "video-thumbnail")]
+            #[cfg(feature = "media-codecs")]
             ff_decoder: None,
-            #[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+            #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
             aac_encoder: None,
-            #[cfg(feature = "video-thumbnail")]
+            #[cfg(feature = "media-codecs")]
             av_encoder: None,
             accumulator: Vec::new(),
             resolved_channels: 0,
@@ -586,7 +586,7 @@ impl TsAudioReplacer {
         }
 
         // Flush the encoder (last encoded frames live here).
-        #[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+        #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
         {
             if let Some(ref mut enc) = self.aac_encoder {
                 // fdk-aac encoder drains by calling encode_frame with empty
@@ -596,7 +596,7 @@ impl TsAudioReplacer {
             }
         }
 
-        #[cfg(feature = "video-thumbnail")]
+        #[cfg(feature = "media-codecs")]
         {
             if let Some(ref mut enc) = self.av_encoder {
                 if let Ok(frames) = enc.flush() {
@@ -662,7 +662,7 @@ impl TsAudioReplacer {
         {
             self.aac_decoder = None;
         }
-        #[cfg(feature = "video-thumbnail")]
+        #[cfg(feature = "media-codecs")]
         {
             self.ff_decoder = None;
         }
@@ -670,11 +670,11 @@ impl TsAudioReplacer {
         // rate / channels (resolved from the first decode). The new
         // input may have a different format, so tear them down and
         // let `init_encoder` / transcoder lazy-open rebuild them.
-        #[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+        #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
         {
             self.aac_encoder = None;
         }
-        #[cfg(feature = "video-thumbnail")]
+        #[cfg(feature = "media-codecs")]
         {
             self.av_encoder = None;
         }
@@ -823,7 +823,7 @@ impl TsAudioReplacer {
             }
         }
 
-        #[cfg(feature = "video-thumbnail")]
+        #[cfg(feature = "media-codecs")]
         if let Some(ff_codec) = crate::engine::audio_decode::ff_codec_for_stream_type(
             self.source_stream_type,
         ) {
@@ -989,7 +989,7 @@ impl TsAudioReplacer {
 
         match self.codec {
             AudioCodec::AacLc | AudioCodec::HeAacV1 | AudioCodec::HeAacV2 => {
-                #[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+                #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
                 {
                     let profile = match self.codec {
                         AudioCodec::AacLc => aac_codec::AacProfile::AacLc,
@@ -1011,13 +1011,13 @@ impl TsAudioReplacer {
                     );
                     return Ok(());
                 }
-                #[cfg(not(all(feature = "video-thumbnail", feature = "fdk-aac")))]
+                #[cfg(not(all(feature = "media-codecs", feature = "fdk-aac")))]
                 {
                     return Err(());
                 }
             }
             AudioCodec::Mp2 | AudioCodec::Ac3 => {
-                #[cfg(feature = "video-thumbnail")]
+                #[cfg(feature = "media-codecs")]
                 {
                     let codec_type = match self.codec {
                         AudioCodec::Mp2 => video_codec::AudioCodecType::Mp2,
@@ -1034,7 +1034,7 @@ impl TsAudioReplacer {
                         Some(video_engine::AudioEncoder::open(&cfg).map_err(|_| ())?);
                     return Ok(());
                 }
-                #[cfg(not(feature = "video-thumbnail"))]
+                #[cfg(not(feature = "media-codecs"))]
                 {
                     return Err(());
                 }
@@ -1056,7 +1056,7 @@ impl TsAudioReplacer {
         };
 
         // AAC branch — fdk-aac encoder.
-        #[cfg(all(feature = "video-thumbnail", feature = "fdk-aac"))]
+        #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
         {
             if let Some(ref mut enc) = self.aac_encoder {
                 let frame_size = enc.frame_size() as usize;
@@ -1102,7 +1102,7 @@ impl TsAudioReplacer {
         }
 
         // MP2 / AC-3 branch — libavcodec via video-engine.
-        #[cfg(feature = "video-thumbnail")]
+        #[cfg(feature = "media-codecs")]
         {
             if let Some(ref mut enc) = self.av_encoder {
                 let frame_size = enc.frame_size();
@@ -1329,6 +1329,14 @@ fn parse_pmt_audio(pkt: &[u8], pinned_pid: Option<u16>) -> Option<(u16, u8)> {
 /// broadcast decoders refuse the audio output. Callers pass `0xFE`
 /// ("no audio profile and level defined") to neutralise the descriptor;
 /// decoders then fall back to the ADTS sync header inside the ES.
+///
+/// ALSO: when transitioning to a new codec family, any inherited
+/// `registration_descriptor` (tag `0x05`) with a `format_identifier`
+/// that doesn't match the new stream_type is neutralised by zeroing
+/// the format_identifier bytes. Without this, strict decoders trust
+/// the registration descriptor (e.g. `"AC-3"`) over the rewritten
+/// stream_type byte and try to feed AAC bytes into the AC-3 decoder,
+/// producing `invalid bitstream id` errors and audible breakage.
 fn rewrite_pmt_audio_stream_type(
     pkt: &mut [u8],
     audio_pid: u16,
@@ -1360,27 +1368,55 @@ fn rewrite_pmt_audio_stream_type(
         .min(TS_PACKET_SIZE)
         .saturating_sub(4);
 
+    // The format_identifier expected for the rewritten stream_type.
+    // AC-3 = "AC-3", E-AC-3 = "EAC3"; AAC family + MP2 have no
+    // canonical registration_descriptor ident, so any inherited one is
+    // a mismatch and gets neutralised.
+    let expected_ident: Option<&[u8]> = match new_stream_type {
+        0x81 | 0x80 | 0xC1 => Some(b"AC-3"),
+        0x87 | 0xC2 => Some(b"EAC3"),
+        _ => None,
+    };
+
     let mut pos = data_start;
     while pos + 5 <= data_end {
         let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
         let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
         if es_pid == audio_pid {
             pkt[pos] = new_stream_type;
-            if let Some(pal) = new_aac_profile_and_level {
-                let desc_start = pos + 5;
-                let desc_end = (desc_start + es_info_len).min(data_end);
-                let mut dpos = desc_start;
-                while dpos + 2 <= desc_end {
-                    let tag = pkt[dpos];
-                    let dlen = pkt[dpos + 1] as usize;
-                    if dpos + 2 + dlen > desc_end {
-                        break;
-                    }
-                    if tag == 0x7C && dlen >= 1 {
+            let desc_start = pos + 5;
+            let desc_end = (desc_start + es_info_len).min(data_end);
+            let mut dpos = desc_start;
+            while dpos + 2 <= desc_end {
+                let tag = pkt[dpos];
+                let dlen = pkt[dpos + 1] as usize;
+                if dpos + 2 + dlen > desc_end {
+                    break;
+                }
+                // AAC profile_and_level rewrite (tag 0x7C, AAC family
+                // descriptor — ETSI TS 101 154 Annex G).
+                if tag == 0x7C && dlen >= 1 {
+                    if let Some(pal) = new_aac_profile_and_level {
                         pkt[dpos + 2] = pal;
                     }
-                    dpos += 2 + dlen;
                 }
+                // registration_descriptor (tag 0x05) — neutralise
+                // when the inherited format_identifier doesn't match
+                // the rewritten stream_type. Zeroing the body keeps
+                // section_length / CRC offsets stable while making
+                // the descriptor effectively a no-op.
+                if tag == 0x05 && dlen >= 4 {
+                    let ident_matches = match expected_ident {
+                        Some(want) => &pkt[dpos + 2..dpos + 6] == want,
+                        None => false,
+                    };
+                    if !ident_matches {
+                        for b in dpos + 2..dpos + 2 + dlen {
+                            pkt[b] = 0;
+                        }
+                    }
+                }
+                dpos += 2 + dlen;
             }
         }
         pos += 5 + es_info_len;

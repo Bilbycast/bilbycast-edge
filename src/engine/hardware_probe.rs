@@ -499,7 +499,7 @@ pub fn probe_static_capabilities() -> StaticCapabilities {
 /// Skipped per-codec when the baseline 4:2:0 8-bit probe didn't even
 /// return true — there's no point asking "can it do 4:2:2?" if it
 /// can't open at all.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn probe_encoder_chroma_capability(hw: &HwCodecCapability) -> HwEncoderChromaCapability {
     let mut out = HwEncoderChromaCapability::default();
 
@@ -550,13 +550,13 @@ fn probe_encoder_chroma_capability(hw: &HwCodecCapability) -> HwEncoderChromaCap
     out
 }
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 fn probe_encoder_chroma_capability(_: &HwCodecCapability) -> HwEncoderChromaCapability {
     HwEncoderChromaCapability::default()
 }
 
 /// Single-shot chroma/bit-depth probe with consistent logging.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn probe_chroma(name: &str, chroma: video_engine::ProbeChroma) -> bool {
     match video_engine::probe_open_encoder_chroma(name, chroma) {
         Ok(()) => {
@@ -587,7 +587,7 @@ fn probe_chroma(name: &str, chroma: video_engine::ProbeChroma) -> bool {
 /// generic encoder probe) returns false for every VAAPI cell because
 /// VAAPI encoders require an `AVHWDeviceContext` set on the codec
 /// context before `avcodec_open2`.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn probe_vaapi_chroma(name: &str, chroma: video_engine::ProbeChroma) -> bool {
     match video_engine::probe_open_vaapi_encoder_chroma(name, chroma) {
         Ok(()) => {
@@ -664,7 +664,7 @@ const FOUR_K_UPPER_BOUND: u32 = 8;
 /// Returns `None` for families where no codec was available at
 /// runtime, or where the 1080p baseline returned 0 (no point probing
 /// 4K when the engine can't open at HD).
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn probe_encoder_session_limits(hw: &HwCodecCapability) -> HwSessionLimits {
     let mut out = HwSessionLimits::default();
     let probe_4k = probe_4k_enabled();
@@ -775,7 +775,7 @@ fn probe_encoder_session_limits(hw: &HwCodecCapability) -> HwSessionLimits {
     out
 }
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 fn probe_encoder_session_limits(_: &HwCodecCapability) -> HwSessionLimits {
     HwSessionLimits::default()
 }
@@ -786,7 +786,7 @@ fn probe_encoder_session_limits(_: &HwCodecCapability) -> HwSessionLimits {
 /// 4K tier shape as the encoder twin; HW decoders that pre-allocate
 /// session resources at `avcodec_open2` time when given a coded-
 /// dimensions hint reflect the realistic workload class.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn probe_decoder_session_limits(hw: &HwCodecCapability) -> HwDecoderSessionLimits {
     let mut out = HwDecoderSessionLimits::default();
     let probe_4k = probe_4k_enabled();
@@ -872,7 +872,7 @@ fn probe_decoder_session_limits(hw: &HwCodecCapability) -> HwDecoderSessionLimit
     out
 }
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 fn probe_decoder_session_limits(_: &HwCodecCapability) -> HwDecoderSessionLimits {
     HwDecoderSessionLimits::default()
 }
@@ -933,7 +933,7 @@ fn probe_hw_decoders() -> HwCodecCapability {
 /// nouveau) are wired up and the running user has permission on
 /// `/dev/dri/renderD128`. Cheap (~10 ms) and idempotent; called once
 /// per startup-probe pass.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn probe_runtime_vaapi_device() -> bool {
     match video_engine::VaapiDevice::open(None) {
         Ok(_) => {
@@ -947,7 +947,7 @@ fn probe_runtime_vaapi_device() -> bool {
     }
 }
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 fn probe_runtime_vaapi_device() -> bool {
     false
 }
@@ -958,7 +958,7 @@ fn probe_runtime_vaapi_device() -> bool {
 /// 4:2:0 — meaningful answer for "can this host encode H.264 / HEVC
 /// via VAAPI right now?". Build prerequisite: `video-encoder-vaapi`
 /// feature on the `video-engine` crate.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn probe_runtime_vaapi_encoder(name: &str) -> bool {
     match video_engine::probe_open_vaapi_encoder(name) {
         Ok(()) => {
@@ -976,7 +976,7 @@ fn probe_runtime_vaapi_encoder(name: &str) -> bool {
     }
 }
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 fn probe_runtime_vaapi_encoder(_: &str) -> bool {
     false
 }
@@ -985,7 +985,7 @@ fn probe_runtime_vaapi_encoder(_: &str) -> bool {
 /// result. Used directly for AMF (no special retry / diagnostic
 /// behaviour); NVENC and QSV wrap this with backend-specific
 /// pre/post-conditions.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn probe_runtime_encoder(name: &str) -> bool {
     match video_engine::probe_open_encoder(name) {
         Ok(()) => {
@@ -1003,14 +1003,14 @@ fn probe_runtime_encoder(name: &str) -> bool {
     }
 }
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 fn probe_runtime_encoder(_: &str) -> bool {
     // No FFmpeg binding compiled in — every probe answers "no".
     false
 }
 
 /// Generic runtime decoder probe.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn probe_runtime_decoder(name: &str) -> bool {
     match video_engine::probe_open_decoder(name) {
         Ok(()) => {
@@ -1028,7 +1028,7 @@ fn probe_runtime_decoder(name: &str) -> bool {
     }
 }
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 fn probe_runtime_decoder(_: &str) -> bool {
     false
 }
@@ -1040,7 +1040,7 @@ fn probe_runtime_decoder(_: &str) -> bool {
 /// consumer card). Treating the latter as "unavailable" would lock out
 /// the host every time we restart while another tool is briefly using
 /// the GPU. So: on EAGAIN, sleep 100 ms and retry once.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn probe_nvenc_encoder(name: &str) -> bool {
     match video_engine::probe_open_encoder(name) {
         Ok(()) => {
@@ -1072,7 +1072,7 @@ fn probe_nvenc_encoder(name: &str) -> bool {
     }
 }
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 fn probe_nvenc_encoder(_: &str) -> bool {
     false
 }
@@ -1083,7 +1083,7 @@ fn probe_nvenc_encoder(_: &str) -> bool {
 /// `render` groups), the open fails with `EACCES`. That's a fixable
 /// permissions issue, distinct from "no Intel iGPU" — surface it loudly
 /// so operators don't waste time chasing GPU driver problems.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn probe_qsv_encoder(name: &str) -> bool {
     match video_engine::probe_open_encoder(name) {
         Ok(()) => {
@@ -1109,7 +1109,7 @@ fn probe_qsv_encoder(name: &str) -> bool {
     }
 }
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 fn probe_qsv_encoder(_: &str) -> bool {
     false
 }
@@ -1120,7 +1120,7 @@ fn probe_qsv_encoder(_: &str) -> bool {
 /// that competing apps are using, for no extra information. On non-Mac
 /// hosts the codec isn't in the build at all and the probe returns
 /// false via the registry pre-filter.
-#[cfg(all(feature = "video-thumbnail", target_os = "macos"))]
+#[cfg(all(feature = "media-codecs", target_os = "macos"))]
 fn probe_videotoolbox_encoder(name: &str) -> bool {
     let present = video_engine::is_encoder_available(name);
     if present {
@@ -1129,7 +1129,7 @@ fn probe_videotoolbox_encoder(name: &str) -> bool {
     present
 }
 
-#[cfg(all(feature = "video-thumbnail", target_os = "macos"))]
+#[cfg(all(feature = "media-codecs", target_os = "macos"))]
 fn probe_videotoolbox_decoder(name: &str) -> bool {
     let present = video_engine::is_decoder_available(name);
     if present {
@@ -1138,12 +1138,12 @@ fn probe_videotoolbox_decoder(name: &str) -> bool {
     present
 }
 
-#[cfg(not(all(feature = "video-thumbnail", target_os = "macos")))]
+#[cfg(not(all(feature = "media-codecs", target_os = "macos")))]
 fn probe_videotoolbox_encoder(_: &str) -> bool {
     false
 }
 
-#[cfg(not(all(feature = "video-thumbnail", target_os = "macos")))]
+#[cfg(not(all(feature = "media-codecs", target_os = "macos")))]
 fn probe_videotoolbox_decoder(_: &str) -> bool {
     false
 }
@@ -1700,7 +1700,7 @@ pub enum DecoderResolutionError {
 
 /// Resolved family choice from `resolve_display_decoder` — the
 /// HW-aware variant. Decoupled from `video_engine::DecoderBackend`
-/// (which only exists when `video-thumbnail` is on) so cost-plan code
+/// (which only exists when `media-codecs` is on) so cost-plan code
 /// can call into the resolver from non-display builds too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedDisplayDecoder {
@@ -1729,8 +1729,8 @@ impl ResolvedDisplayDecoder {
     }
 
     /// Translate to the video-engine backend handle. Only callable
-    /// when `video-thumbnail` is on (display path always has it).
-    #[cfg(feature = "video-thumbnail")]
+    /// when `media-codecs` is on (display path always has it).
+    #[cfg(feature = "media-codecs")]
     pub fn as_backend(&self) -> video_engine::DecoderBackend {
         match self {
             ResolvedDisplayDecoder::Cpu => video_engine::DecoderBackend::Cpu,
@@ -1755,9 +1755,9 @@ pub fn resolve_display_decoder(
 ) -> Result<ResolvedDisplayDecoder, DecoderResolutionError> {
     use crate::config::models::HwDecodePreference;
 
-    let nvdec_compiled = cfg!(feature = "display-nvdec");
-    let qsv_compiled = cfg!(feature = "display-qsv");
-    let vaapi_compiled = cfg!(feature = "display-vaapi");
+    let nvdec_compiled = cfg!(feature = "video-decoder-nvdec");
+    let qsv_compiled = cfg!(feature = "video-decoder-qsv");
+    let vaapi_compiled = cfg!(feature = "video-decoder-vaapi");
     let nvdec_ok = nvdec_compiled
         && caps.is_some_and(|c| c.hw_decoders.h264_nvenc || c.hw_decoders.hevc_nvenc);
     let qsv_ok = qsv_compiled
@@ -1922,7 +1922,7 @@ pub fn resolve_transcode_decoder(
 
 // ── Video-encoder resolution (Auto + explicit) ─────────────────────
 //
-// Only meaningful when `video-thumbnail` is on (no video encoder exists
+// Only meaningful when `media-codecs` is on (no video encoder exists
 // without it). Wrapping the whole resolver in the feature gate keeps the
 // `video_codec::VideoChroma` reference inside its compile-time scope.
 
@@ -1937,7 +1937,7 @@ pub enum EncoderFamily {
 
 /// Resolved encoder backend choice. Symmetric to [`ResolvedDisplayDecoder`]
 /// but on the encode side. Drops back into a `video_codec::VideoEncoderCodec`
-/// at call time when the `video-thumbnail` feature is on.
+/// at call time when the `media-codecs` feature is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedVideoEncoder {
     X264,
@@ -2009,9 +2009,9 @@ impl ResolvedVideoEncoder {
 
     /// Translate to the `video_codec::VideoEncoderCodec` handle used by
     /// `VideoEncoder::open`. Only callable on a build with the
-    /// `video-thumbnail` feature (every encoder spawn path is gated on
+    /// `media-codecs` feature (every encoder spawn path is gated on
     /// it anyway).
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     pub fn as_video_encoder_codec(self) -> video_codec::VideoEncoderCodec {
         use video_codec::VideoEncoderCodec;
         match self {
@@ -2030,7 +2030,7 @@ impl ResolvedVideoEncoder {
 /// Convenience wrapper that pulls the static capabilities snapshot and
 /// runs [`resolve_video_encoder`] against it. Each output's encoder spawn
 /// path uses this so they all see the same Auto resolution behaviour.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 pub fn resolve_for_video_encode_config(
     cfg: &crate::config::models::VideoEncodeConfig,
 ) -> Result<ResolvedVideoEncoder, EncoderResolutionError> {
@@ -2063,7 +2063,7 @@ pub fn resolve_for_video_encode_config(
 /// when VAAPI / libx264 would have worked. Returning the chain lets
 /// `ScaledVideoEncoder::lazy_open` retry the next backend instead of
 /// dropping the operator off a cliff. See codec-matrix bug C3.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 pub fn resolve_video_encoder_chain(
     codec_string: &str,
     chroma: Option<&str>,
@@ -2101,7 +2101,7 @@ pub fn resolve_video_encoder_chain(
 /// Edge-side companion to [`resolve_for_video_encode_config`] returning
 /// the full Auto fall-through chain. See
 /// [`resolve_video_encoder_chain`] for semantics.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 pub fn resolve_chain_for_video_encode_config(
     cfg: &crate::config::models::VideoEncodeConfig,
 ) -> Result<Vec<ResolvedVideoEncoder>, EncoderResolutionError> {
@@ -2197,7 +2197,7 @@ impl EncoderResolutionError {
 /// `chroma`-string parser used by both [`resolve_video_encoder`] and the
 /// chroma matrix lookup. Returns `Yuv420` for `None` and unrecognised
 /// values, matching the existing `VideoEncodeConfig` default.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn parse_chroma_str(s: Option<&str>) -> video_codec::VideoChroma {
     use video_codec::VideoChroma;
     match s {
@@ -2225,7 +2225,7 @@ fn parse_auto_family(codec: &str) -> Option<EncoderFamily> {
 /// `true` when the host can actually do the requested combination,
 /// considering compile-time features AND runtime probe results AND
 /// the per-(codec, chroma, bit-depth) chroma matrix.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn host_supports_encoder(
     encoder: ResolvedVideoEncoder,
     chroma: video_codec::VideoChroma,
@@ -2340,7 +2340,7 @@ fn host_supports_encoder(
 /// Auto-resolution priority chain per `(family, chroma, bit_depth)`.
 /// Heads of each list are the cheapest hosts that handle the request;
 /// tails are the safe SW fallback.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn auto_priority_chain(
     family: EncoderFamily,
     chroma: video_codec::VideoChroma,
@@ -2413,7 +2413,7 @@ fn auto_priority_chain(
 /// flow start path uses the resolved `ffmpeg_name()` to drive the existing
 /// `parse_codec` / `resolve_backend` helpers in `ts_video_replace.rs` /
 /// `output_rtmp.rs`.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 pub fn resolve_video_encoder(
     codec_string: &str,
     chroma: Option<&str>,
@@ -2576,15 +2576,16 @@ mod tests {
     fn resolve_display_decoder_rejects_forced_when_feature_off() {
         use crate::config::models::HwDecodePreference;
         // The bilbycast-edge build under `cargo test` here does not
-        // enable `display-nvdec` or `display-qsv` by default — the
-        // feature gates short-circuit before we even look at caps.
-        if !cfg!(feature = "display-nvdec") {
+        // enable `video-decoder-nvdec` or `video-decoder-qsv` by
+        // default — the feature gates short-circuit before we even
+        // look at caps.
+        if !cfg!(feature = "video-decoder-nvdec") {
             assert_eq!(
                 resolve_display_decoder(&HwDecodePreference::Nvdec, None),
                 Err(DecoderResolutionError::FeatureDisabled),
             );
         }
-        if !cfg!(feature = "display-qsv") {
+        if !cfg!(feature = "video-decoder-qsv") {
             assert_eq!(
                 resolve_display_decoder(&HwDecodePreference::Qsv, None),
                 Err(DecoderResolutionError::FeatureDisabled),
@@ -2872,7 +2873,7 @@ mod tests {
 
     // ── Video-encoder resolution tests ─────────────────────────────
 
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     fn make_caps(hw_encoders: HwCodecCapability) -> StaticCapabilities {
         StaticCapabilities {
             hw_encoders,
@@ -2904,7 +2905,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     #[test]
     fn auto_h264_4_2_0_8bit_picks_nvenc_when_available() {
         // NVIDIA host + h264_auto + 4:2:0 8-bit → h264_nvenc (top of chain).
@@ -2929,7 +2930,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     #[test]
     fn auto_hevc_4_2_2_10bit_skips_nvenc_qsv_picks_vaapi_or_x265() {
         // Intel iHD host + hevc_auto + 4:2:2 10-bit → hevc_vaapi (the
@@ -2956,7 +2957,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     #[test]
     fn auto_falls_through_to_software_when_no_hw() {
         // Software-only host. Auto should land on libx264 / libx265.
@@ -2974,7 +2975,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     #[test]
     fn explicit_h264_nvenc_with_4_2_2_returns_chroma_unsupported() {
         let caps = make_caps(HwCodecCapability {
@@ -2998,7 +2999,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     #[test]
     fn explicit_unknown_codec_returns_unknown_codec_error() {
         let result =
@@ -3011,14 +3012,14 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     #[test]
     fn auto_without_caps_returns_probe_unavailable() {
         let result = resolve_video_encoder("h264_auto", None, None, None);
         assert_eq!(result, Err(EncoderResolutionError::ProbeUnavailable));
     }
 
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     #[test]
     fn resolved_video_encoder_metadata() {
         assert_eq!(ResolvedVideoEncoder::X264.ffmpeg_name(), "x264");
@@ -3035,7 +3036,7 @@ mod tests {
         assert_eq!(ResolvedVideoEncoder::X264.hw_family(), None);
     }
 
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     #[test]
     fn encoder_resolution_error_reasons_are_stable() {
         assert_eq!(

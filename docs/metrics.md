@@ -322,10 +322,10 @@ the manager UI doesn't need separate renderers.
 
 **MP2 / AC-3 / E-AC-3** (stream_types `0x03`, `0x04`, `0x80` /
 `0x81` / `0xC1`, `0x87` / `0xC2`): decode in-process via the FFmpeg
-audio bridge (`video-thumbnail` feature, default on) and run the
+audio bridge (`media-codecs` feature, default on) and run the
 full R128 / true-peak / mute / clip pipeline. `codec_decoded: true`
 on the snapshot, `decode_note: null`. The silence-proxy fallback
-remains as a backstop on builds without the `video-thumbnail`
+remains as a backstop on builds without the `media-codecs`
 feature.
 
 ### Video Full tier (`content_analysis.video_full`, default **off**)
@@ -371,7 +371,7 @@ Decode runs in `tokio::task::block_in_place` so the tokio reactor is
 never held during FFmpeg work. One decode per sample tick bounds CPU
 proportionally to `sample_hz`. Only H.264 and H.265 are supported;
 other codecs publish no decoded metrics (`samples_decoded` stays at
-`0`). The tier requires the `video-thumbnail` Cargo feature (on by
+`0`). The tier requires the `media-codecs` Cargo feature (on by
 default) — with it disabled the task still runs but never decodes.
 
 ### Analyser lag

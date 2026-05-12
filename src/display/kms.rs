@@ -12,8 +12,8 @@
 // All KMS work is sw-only today (dumb buffer + libswscale-driven
 // YUV→BGRA scale into the mapped framebuffer). The hardware-decode
 // path (DMA-BUF-zerocopy via VAAPI/NVDEC) lands as an additive backend
-// behind the `display-vaapi` / `display-nvdec` Cargo features
-// documented in `Cargo.toml`.
+// behind the `video-decoder-vaapi` / `video-decoder-nvdec` Cargo
+// features documented in `Cargo.toml`.
 
 use std::path::PathBuf;
 use std::sync::Arc;

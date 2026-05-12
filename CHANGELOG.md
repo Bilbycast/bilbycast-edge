@@ -80,5 +80,5 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Frame-accurate scrubbing (currently snaps to the nearest IDR ≤ target).
 - Index rebuild on corruption (`replay_index_corrupt` is a Warning today;
   the writer keeps appending).
-- Per-clip thumbnail at the in-point IDR (the existing `video-thumbnail`
+- Per-clip thumbnail at the in-point IDR (the existing `media-codecs`
   JPEG path is the natural place to wire this).

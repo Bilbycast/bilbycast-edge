@@ -78,12 +78,14 @@ aac-audio = { path = "../bilbycast-fdk-aac-rs/aac-audio", optional = true }
 aac-codec = { path = "../bilbycast-fdk-aac-rs/aac-codec", optional = true }
 symphonia = { version = "0.5.5", features = ["aac"], default-features = false }
 
-# ── Video thumbnail backend ────────────────────────────────────────────
-# Default: in-process video decode + JPEG encode via FFmpeg C libraries.
-# Replaces the ffmpeg subprocess for thumbnail generation.
-# Fallback: ffmpeg subprocess (when video-thumbnail feature is disabled).
+# ── FFmpeg / libav base codec layer (the `media-codecs` feature) ──────
+# In-process video decode, JPEG thumbnail encode, audio decode/encode
+# for Opus/MP2/AC-3/E-AC-3, and HW probe scaffolding — all via FFmpeg
+# C libraries vendored through bilbycast-ffmpeg-video-rs. Replaces the
+# ffmpeg subprocess.
 #
 # To disable: cargo build --no-default-features --features tls,webrtc,fdk-aac
+# (off-build loses non-AAC audio + CPU video decode + thumbnails)
 # ────────────────────────────────────────────────────────────────────────
 video-engine = { path = "../bilbycast-ffmpeg-video-rs/video-engine", optional = true }
 video-codec = { path = "../bilbycast-ffmpeg-video-rs/video-codec", optional = true }
@@ -208,7 +210,7 @@ x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 # feature stays dormant — `enumerate_displays()` returns empty, the
 # `"display"` capability isn't advertised, and the manager UI hides the
 # option per-node.
-default = ["tls", "webrtc", "fdk-aac", "video-thumbnail", "replay", "display"]
+default = ["tls", "webrtc", "fdk-aac", "media-codecs", "replay", "display"]
 # Replay server: continuous flow recording to disk + playback as a fresh
 # input. Adds the `recording` flow attribute and the `replay` input type.
 # Pure-Rust, no new C deps. See `src/replay/` and `docs/replay.md`.
@@ -216,29 +218,45 @@ replay = []
 # Enable in-process AAC decode/encode via Fraunhofer FDK AAC (C library).
 # Replaces symphonia (decode) and ffmpeg subprocess (AAC encode).
 fdk-aac = ["dep:aac-audio", "dep:aac-codec"]
-# Enable in-process video decode + JPEG thumbnail via FFmpeg libavcodec/libswscale.
-# Replaces the ffmpeg subprocess for thumbnail generation.
-video-thumbnail = ["dep:video-engine", "dep:video-codec"]
+# FFmpeg / libav base codec layer. Bundles:
+#   - Universal CPU video decode (H.264 / HEVC / MPEG-2) via libavcodec —
+#     used by transcode input decode, content analysis (video_full),
+#     display output fallback, ST 2110-20/-23 input mux, replay filmstrip.
+#   - Audio decode for Opus / MP2 / AC-3 / E-AC-3 via libavcodec — used
+#     by transcode, content analysis (audio_full), display output.
+#   - Audio encode for Opus / MP2 / AC-3 via libavcodec + libopus —
+#     used by every TS-bearing output's `audio_encode`.
+#   - JPEG thumbnail encode via libswscale.
+#   - HW probe scaffolding (the runtime `avcodec_open2` checks in
+#     `engine::hardware_probe` for NVENC / QSV / VAAPI).
+# All five of the above ride on the same vendored FFmpeg build in
+# `bilbycast-ffmpeg-video-rs` (single all-or-nothing crate today), so
+# splitting them into sub-features is staged for when an upstream
+# Cargo-feature split lands there. AAC is independent — see `fdk-aac`.
+# Default on; off-builds compile cleanly and fall back to no-thumbnail,
+# AAC-only audio, and SRT/RIST/RTP/UDP/RTMP/HLS/CMAF/WebRTC protocol
+# passthrough.
+media-codecs = ["dep:video-engine", "dep:video-codec"]
 # Enable libx264 H.264 video encoding inside the vendored FFmpeg build.
 # **LICENSING:** libx264 is GPL v2+. Binaries built with this feature
 # are an AGPL-3.0-or-later combined work (see NOTICE.full). Requires
 # libx264-dev (or equivalent) installed on the host. Off by default;
 # enabled by the `video-encoders-full` composite in the `*-full`
 # release artefact.
-video-encoder-x264 = ["video-thumbnail", "video-engine/video-encoder-x264"]
+video-encoder-x264 = ["media-codecs", "video-engine/video-encoder-x264"]
 # Enable libx265 HEVC video encoding. Same licensing implications as
 # `video-encoder-x264` (GPL v2+). Off by default.
-video-encoder-x265 = ["video-thumbnail", "video-engine/video-encoder-x265"]
+video-encoder-x265 = ["media-codecs", "video-engine/video-encoder-x265"]
 # Enable NVENC hardware H.264/HEVC encoding. Royalty-free at the API
 # layer; requires an NVIDIA driver at runtime and nv-codec-headers at
 # build time. Off by default.
-video-encoder-nvenc = ["video-thumbnail", "video-engine/video-encoder-nvenc"]
+video-encoder-nvenc = ["media-codecs", "video-engine/video-encoder-nvenc"]
 # Enable Intel QuickSync hardware H.264/HEVC encoding via Intel oneVPL.
 # Royalty-free at the API layer (libvpl headers + dispatcher are
 # MIT/Apache); x86_64 only in practice. Requires `libvpl-dev` at build
 # time and the Intel media driver + libvpl runtime on the host. Off by
 # default.
-video-encoder-qsv = ["video-thumbnail", "video-engine/video-encoder-qsv"]
+video-encoder-qsv = ["media-codecs", "video-engine/video-encoder-qsv"]
 # Enable VAAPI hardware H.264/HEVC encoding (Linux). Royalty-free at
 # every layer (libva is MIT, FFmpeg's VAAPI wrapper is LGPL). Primary
 # motivation: AMD-on-Linux encode (the only royalty-clean path on AMD).
@@ -248,7 +266,7 @@ video-encoder-qsv = ["video-thumbnail", "video-engine/video-encoder-qsv"]
 # `av_hwframe_transfer_data`); 10-bit P010 + 4:2:2 / 4:4:4 are valid
 # VAAPI surface layouts but each demands a distinct upload packer that
 # is staged for a follow-up.
-video-encoder-vaapi = ["video-thumbnail", "video-engine/video-encoder-vaapi"]
+video-encoder-vaapi = ["media-codecs", "video-engine/video-encoder-vaapi"]
 # Bundle every video codec backend the edge knows about — encoders
 # (x264 + x265 + NVENC + QSV + VAAPI) AND HW decoders for the display
 # output (NVDEC + QSV-decode + VAAPI-decode). Used by the GitHub
@@ -274,15 +292,12 @@ video-encoders-full = [
     "video-encoder-nvenc",
     "video-encoder-qsv",
     "video-encoder-vaapi",
-    # HW decoders — used by both the display output and the transcode
-    # input-decode path.
+    # HW decoders — used by both the display output (when the `display`
+    # feature is also on, which it is in the default set) and the
+    # transcode input-decode path.
     "video-decoder-nvdec",
     "video-decoder-qsv",
     "video-decoder-vaapi",
-    # Display feature pulls in KMS/ALSA on top of the decoders.
-    "display-nvdec",
-    "display-qsv",
-    "display-vaapi",
 ]
 # Local-display output — decode the flow's video + audio and render to a
 # Linux KMS connector (HDMI / DisplayPort) plus an ALSA audio device.
@@ -291,13 +306,13 @@ video-encoders-full = [
 # `alsa` links libasound2, so `apt install libasound2-dev` (Debian /
 # Ubuntu) or the equivalent RPM is required for the build. Off by
 # default so generic builds stay portable. Audio decode of MP2 / AC-3 /
-# E-AC-3 / Opus rides through the `video-thumbnail` `AudioDecoder`
+# E-AC-3 / Opus rides through the `media-codecs` `AudioDecoder`
 # (libavcodec). See `docs/configuration-guide.md` "Display output
 # (HDMI / DisplayPort)".
 display = [
     "dep:drm",
     "dep:alsa",
-    "video-thumbnail",
+    "media-codecs",
     "fdk-aac",
 ]
 # Hardware-decoded video, used on both the display output AND the
@@ -307,25 +322,18 @@ display = [
 # transcode resolver picks it for the input decode side of a flow's
 # `video_encode` block, and the manager UI surfaces the matching
 # backend in the display output's "Video Decoder" dropdown. The edge
-# advertises the corresponding string on `HealthPayload.capabilities`
-# (`video-decoder-nvdec` / `video-decoder-qsv` / `video-decoder-vaapi`,
-# plus the legacy `display-nvdec` / `display-qsv` / `display-vaapi`
-# strings for older managers).
+# advertises `video-decoder-nvdec` / `video-decoder-qsv` /
+# `video-decoder-vaapi` on `HealthPayload.capabilities`. Operators
+# who want HW transcode decode + the display output simply enable the
+# `video-decoder-*` feature with the default-on `display` feature; no
+# separate `display-*` composite exists.
 video-decoder-nvdec = ["video-engine/video-decoder-nvdec"]
 video-decoder-qsv = ["video-engine/video-decoder-qsv"]
+# VAAPI HW decode (Linux). The decoder is fully wired with VAAPI
+# device + frames-context plumbing in `video-engine` and surfaces
+# frames either as zero-copy DRM PRIME DMA-BUFs (KMS scanout via the
+# `display` feature) or system-memory NV12/P010 (HDR tonemap path).
 video-decoder-vaapi = ["video-engine/video-decoder-vaapi"]
-# Display features layer the connector / KMS / ALSA plumbing on top of
-# the corresponding `video-decoder-*` feature. Operators who want HW
-# transcode decode but no display output enable the bare
-# `video-decoder-*` feature; operators who want both enable
-# `display-*` (which pulls in both halves).
-display-nvdec = ["display", "video-decoder-nvdec"]
-display-qsv = ["display", "video-decoder-qsv"]
-# VAAPI display-output decode (Linux). The decoder itself is fully
-# wired with VAAPI device + frames-context plumbing in `video-engine`
-# and surfaces frames either as zero-copy DRM PRIME DMA-BUFs (KMS
-# scanout) or system-memory NV12/P010 (HDR tonemap path).
-display-vaapi = ["display", "video-decoder-vaapi"]
 # Enable TLS (HTTPS on API + RTMPS) support via rustls/tokio-rustls/axum-server.
 tls = ["dep:tokio-rustls", "dep:axum-server"]
 # Enable WebRTC WHIP/WHEP input and output via str0m (pure Rust, sans-I/O).

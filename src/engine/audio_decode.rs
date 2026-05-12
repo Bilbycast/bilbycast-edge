@@ -240,7 +240,7 @@ pub fn input_can_carry_ts_audio(input: &crate::config::models::InputConfig) -> b
 /// so the `0x06` arm here only fires on the Opus path — AC-3 carried on
 /// `0x06 + 0x6A descriptor` is synthesised as `0x81` upstream so it
 /// matches the AC-3 arm below.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 pub fn ff_codec_for_stream_type(stream_type: u8) -> Option<video_codec::AudioDecoderCodec> {
     use video_codec::AudioDecoderCodec;
     match stream_type {
@@ -280,7 +280,7 @@ pub fn ff_codec_for_stream_type(stream_type: u8) -> Option<video_codec::AudioDec
 /// with `audio_encode` set on an Opus-in-TS source path can decode →
 /// re-encode end-to-end (previously this returned `Vec::new()` and the
 /// audio silently disappeared).
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 pub fn split_audio_codec_frames(
     buf: &[u8],
     codec: video_codec::AudioDecoderCodec,
@@ -312,7 +312,7 @@ pub fn split_audio_codec_frames(
 /// LOAS frame followed by the LATM payload) — that's the byte
 /// sequence libavcodec's `AAC_LATM` decoder consumes. Malformed
 /// frames trigger a single-byte resync to the next valid `0x2B7` sync.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 pub fn split_loas_frames(buf: &[u8]) -> Vec<&[u8]> {
     let mut out: Vec<&[u8]> = Vec::with_capacity(8);
     let mut i = 0;
@@ -343,7 +343,7 @@ pub fn split_loas_frames(buf: &[u8]) -> Vec<&[u8]> {
 /// computed from the header instead of scanning for the next sync — the
 /// scanning approach trips on `0xFF` bytes inside the audio payload and
 /// produces misaligned slices.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn split_mp2_frames(buf: &[u8]) -> Vec<&[u8]> {
     /// MPEG-1 layer II bitrate index (kbps) — ISO/IEC 11172-3 § 2.4.2.3,
     /// table B.211. Index 0 = "free format", index 15 = "bad". We treat
@@ -431,7 +431,7 @@ fn split_mp2_frames(buf: &[u8]) -> Vec<&[u8]> {
 ///
 /// Best-effort — malformed AUs cause a resync on the next valid prefix
 /// rather than aborting the PES.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 pub fn split_opus_frames(buf: &[u8]) -> Vec<&[u8]> {
     let mut out: Vec<&[u8]> = Vec::with_capacity(2);
     let mut i = 0;
@@ -523,7 +523,7 @@ pub fn split_opus_frames(buf: &[u8]) -> Vec<&[u8]> {
 /// two by `bsid` (AC-3: 0..=10, E-AC-3: 11..=16). Last-frame truncation
 /// is dropped — the next PES will re-resync — matching
 /// [`split_mp2_frames`]'s contract.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn split_ac3_frames(buf: &[u8]) -> Vec<&[u8]> {
     let mut out: Vec<&[u8]> = Vec::with_capacity(8);
     let mut i = 0;
@@ -559,7 +559,7 @@ const AC3_MIN_HEADER_BYTES: usize = 6;
 /// by `frmsizecod` (0..=37); inner index is the sample-rate code
 /// (0 = 48 kHz, 1 = 44.1 kHz, 2 = 32 kHz). `fscod = 0b11` is reserved
 /// and bails out before this table is consulted.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 const AC3_FRMSIZ_WORDS: [[u16; 3]; 38] = [
     [64, 69, 96],     // 32 kbps
     [64, 70, 96],
@@ -605,7 +605,7 @@ const AC3_FRMSIZ_WORDS: [[u16; 3]; 38] = [
 /// total frame length in bytes. Returns `None` if the header is invalid
 /// (reserved `fscod`, out-of-range `frmsizecod`, or reserved `bsid`),
 /// which signals the caller to step one byte and resync.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn ac3_frame_size(buf: &[u8]) -> Option<usize> {
     if buf.len() < AC3_MIN_HEADER_BYTES {
         return None;
@@ -1240,7 +1240,7 @@ mod tests {
     /// and sample rate. Returns the full frame bytes (header + zero
     /// payload). The header table here is the audio path's source of
     /// truth — picks the indices straight out of ISO/IEC 11172-3 § 2.4.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     fn make_mp2_frame(bitrate_kbps: u32, sample_rate_hz: u32, padding: bool) -> Vec<u8> {
         let bitrate_idx = match bitrate_kbps {
             32 => 1, 48 => 2, 56 => 3, 64 => 4, 80 => 5, 96 => 6,
@@ -1272,7 +1272,7 @@ mod tests {
     /// table-derived frame_size, even when the audio payload contains
     /// `0xFF` bytes that look like a sync prefix to the legacy
     /// scan-to-next-sync splitter.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     #[test]
     fn mp2_splitter_honours_frame_size_and_skips_payload_0xff() {
         use video_codec::AudioDecoderCodec;
@@ -1300,7 +1300,7 @@ mod tests {
     /// A truncated trailing MP2 frame is left behind for the next PES to
     /// resync on. The legacy splitter yielded the truncated bytes as a
     /// final slice and libavcodec rejected them with `Header missing`.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     #[test]
     fn mp2_splitter_drops_truncated_trailing_frame() {
         use video_codec::AudioDecoderCodec;
@@ -1328,7 +1328,7 @@ mod tests {
     /// Build a minimum-viable AC-3 syncframe of the requested byte
     /// length. The header carries a 48 kHz `fscod` and a real
     /// `frmsizecod` for the chosen size; the rest is zero filler.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     fn make_ac3_frame_48k(frame_bytes: usize) -> Vec<u8> {
         // Look up a frmsizecod that maps to `frame_bytes / 2` 16-bit
         // words at 48 kHz (column 0 of AC3_FRMSIZ_WORDS).
@@ -1349,7 +1349,7 @@ mod tests {
 
     /// Build a minimum-viable E-AC-3 syncframe of the requested byte
     /// length. `frame_bytes` must be even and >= 6.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     fn make_eac3_frame(frame_bytes: usize) -> Vec<u8> {
         assert!(frame_bytes >= 6 && frame_bytes % 2 == 0);
         let frmsiz: u16 = (frame_bytes as u16 / 2) - 1;
@@ -1368,7 +1368,7 @@ mod tests {
     }
 
     /// Two valid AC-3 frames back-to-back land as two AUs.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     #[test]
     fn ac3_splitter_walks_real_frame_size() {
         use video_codec::AudioDecoderCodec;
@@ -1388,7 +1388,7 @@ mod tests {
     /// This is the regression for the duplicate-PTS audio bug — the
     /// naive byte scan splitter would have emitted three slices here
     /// (real start, phantom inside frame A, real start of frame B).
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     #[test]
     fn ac3_splitter_ignores_payload_syncword_pattern() {
         use video_codec::AudioDecoderCodec;
@@ -1414,7 +1414,7 @@ mod tests {
 
     /// E-AC-3 walker honours the 11-bit `frmsiz` field. Same payload-
     /// pattern guard as AC-3 — the byte sequence isn't a frame boundary.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     #[test]
     fn eac3_splitter_uses_frmsiz_field() {
         use video_codec::AudioDecoderCodec;
@@ -1432,7 +1432,7 @@ mod tests {
 
     /// A truncated trailing AC-3 frame is dropped — the next PES will
     /// resync on its own header. Matches `split_mp2_frames`'s contract.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     #[test]
     fn ac3_splitter_drops_truncated_trailing_frame() {
         use video_codec::AudioDecoderCodec;
@@ -1449,7 +1449,7 @@ mod tests {
     /// Reserved `fscod = 0b11` is rejected — the splitter resyncs to
     /// the next real sync. Guards against treating a syncword pattern
     /// embedded in payload as a real header.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     #[test]
     fn ac3_splitter_skips_reserved_fscod() {
         use video_codec::AudioDecoderCodec;
@@ -1502,7 +1502,7 @@ mod tests {
     /// 11 bits all 1), no flags, au_size = 7, then 7 bytes of Opus
     /// payload. The splitter must skip the 3-byte header and emit the
     /// 7-byte Opus packet.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     #[test]
     fn opus_splitter_strips_control_header() {
         let mut buf = vec![0xFF, 0xE0, 0x07];
@@ -1514,7 +1514,7 @@ mod tests {
 
     /// `au_size` is variable-length: each `0xFF` byte adds 255 and
     /// continues. A 260-byte AU encodes as `[0xFF, 0x05]`.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     #[test]
     fn opus_splitter_decodes_variable_length_au_size() {
         let mut buf = vec![0xFF, 0xE0, 0xFF, 0x05];

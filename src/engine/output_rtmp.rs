@@ -83,17 +83,17 @@ enum VideoEncoderState {
     /// via classic FLV, HEVC via Enhanced RTMP).
     Disabled,
     /// `video_encode` is set; we haven't built the decoder + encoder yet.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     Lazy { cfg: VideoEncodeConfig },
     /// `video_encode` pipeline is live.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     Active(Box<VideoActive>),
     /// Decoder or encoder construction failed; drop video for the rest
     /// of the output's lifetime. The failure event was already emitted.
     Failed,
 }
 
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 struct VideoActive {
     decoder: video_engine::VideoDecoder,
     /// Shared encoder pipeline — wraps `VideoEncoder` + optional
@@ -258,9 +258,9 @@ async fn publish_loop(
     // (MP2 / AC-3 / E-AC-3). Opened on the first `OtherAudio` frame.
     // Mirrors the AAC decoder slot inside `EncoderState::Active` —
     // only one decoder is in flight per publish loop at a time.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     let mut ff_audio_decoder: Option<video_engine::AudioDecoder> = None;
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     let mut ff_audio_codec: Option<video_codec::AudioDecoderCodec> = None;
     // Lazy encoder: built on first AAC frame so we can read the demuxer's
     // cached AAC config and decide between Transparent / Active / Failed.
@@ -559,7 +559,7 @@ async fn publish_loop(
                 DemuxedFrame::Opus { .. } => {
                     // RTMP doesn't support Opus — skip
                 }
-                #[cfg(feature = "video-thumbnail")]
+                #[cfg(feature = "media-codecs")]
                 DemuxedFrame::OtherAudio { stream_type, data, pts } => {
                     let ts_ms = pts_to_ms(pts, &mut base_pts);
 
@@ -640,9 +640,9 @@ async fn publish_loop(
                         stats.record_latency(recv_time_us);
                     }
                 }
-                #[cfg(not(feature = "video-thumbnail"))]
+                #[cfg(not(feature = "media-codecs"))]
                 DemuxedFrame::OtherAudio { .. } => {
-                    // Build without `video-thumbnail` lacks the libavcodec
+                    // Build without `media-codecs` lacks the libavcodec
                     // bridge needed to decode MP2 / AC-3 / E-AC-3 — drop.
                 }
                 // RTMP carries H.264 / HEVC + AAC — MPEG-2 video would
@@ -916,7 +916,7 @@ pub(crate) fn annex_b_to_avcc(data: &[u8]) -> Vec<u8> {
 
 /// Concatenate a list of NAL units (as returned by the TS demuxer) back into
 /// an Annex-B byte stream suitable for `VideoDecoder::send_packet`.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn nalus_to_annex_b(nalus: &[Vec<u8>]) -> Vec<u8> {
     let total = nalus.iter().map(|n| 4 + n.len()).sum();
     let mut out = Vec::with_capacity(total);
@@ -954,7 +954,7 @@ impl<'a> VideoFrameSource<'a> {
 ///
 /// If `video_encode` is unset, returns `Disabled` and video is passed
 /// through untouched. Otherwise returns `Lazy` (or `Failed` when the
-/// build has no `video-thumbnail` support at all).
+/// build has no `media-codecs` support at all).
 fn init_video_encoder_state(
     config: &RtmpOutputConfig,
     stats: &Arc<OutputStatsAccumulator>,
@@ -965,15 +965,15 @@ fn init_video_encoder_state(
         return VideoEncoderState::Disabled;
     };
     let _ = (stats, flow_id, event_sender);
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     {
         VideoEncoderState::Lazy { cfg: enc_cfg.clone() }
     }
-    #[cfg(not(feature = "video-thumbnail"))]
+    #[cfg(not(feature = "media-codecs"))]
     {
         let msg = format!(
             "RTMP output '{}': video_encode requested but this build lacks \
-             the `video-thumbnail` feature (no in-process video codec library)",
+             the `media-codecs` feature (no in-process video codec library)",
             config.id
         );
         tracing::error!("{msg}");
@@ -988,7 +988,7 @@ fn init_video_encoder_state(
     }
 }
 
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn resolve_backend(
     codec: &str,
     output_id: &str,
@@ -1030,7 +1030,7 @@ fn resolve_backend(
 /// fall-throughs) for `*_auto`. Falls back to a single-element chain
 /// drawn from the legacy string parser when no probed-caps snapshot is
 /// installed (in-process tests + early-startup paths).
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn resolve_backend_chain_for_config(
     cfg: &VideoEncodeConfig,
     output_id: &str,
@@ -1113,7 +1113,7 @@ async fn process_video_frame(
             // so the output keeps running audio.
             Ok(true)
         }
-        #[cfg(feature = "video-thumbnail")]
+        #[cfg(feature = "media-codecs")]
         VideoEncoderState::Lazy { cfg } => {
             let cfg = cfg.clone();
             *video_state = open_video_active(
@@ -1129,7 +1129,7 @@ async fn process_video_frame(
             // Fall through to Active on the very same frame.
             encode_one_frame(&src, pts_90k, ts_ms, recv_time_us, sent_video_header, video_state, client, config, stats, flow_id, event_sender).await
         }
-        #[cfg(feature = "video-thumbnail")]
+        #[cfg(feature = "media-codecs")]
         VideoEncoderState::Active(_) => {
             encode_one_frame(&src, pts_90k, ts_ms, recv_time_us, sent_video_header, video_state, client, config, stats, flow_id, event_sender).await
         }
@@ -1315,7 +1315,7 @@ fn annex_b_to_avcc_filtered_h265(nalus: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn open_video_active(
     cfg: &VideoEncodeConfig,
     source_is_h264: bool,
@@ -1437,7 +1437,7 @@ fn open_video_active(
 
 /// Push one source access unit through the decoder, drain decoded frames
 /// through the encoder, and emit FLV tags per encoded frame.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 #[allow(clippy::too_many_arguments)]
 async fn encode_one_frame(
     src: &VideoFrameSource<'_>,

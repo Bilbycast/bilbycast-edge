@@ -185,7 +185,7 @@ struct AudioPidState {
     /// FFmpeg-backed decoder for MP2 / AC-3 / E-AC-3 PIDs, lazily
     /// constructed on the first PES flush. Mutually exclusive with
     /// `aac_decoder`.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     ff_decoder: Option<video_engine::AudioDecoder>,
     /// PES reassembly buffer keyed by PUSI. Sized for 1 s of 320 kbps —
     /// comfortably larger than the largest realistic audio PES.
@@ -248,7 +248,7 @@ impl AudioPidState {
             window_bytes: 0,
             last_bitrate_bps: 0.0,
             aac_decoder: None,
-            #[cfg(feature = "video-thumbnail")]
+            #[cfg(feature = "media-codecs")]
             ff_decoder: None,
             pes_buf: Vec::with_capacity(16_384),
             capturing_pes: false,
@@ -325,7 +325,7 @@ impl AudioPidState {
     /// running R128 + mute / clip / silence on every emitted PCM block.
     /// Lazy-builds the decoder + ebur128 state from the first frame's
     /// reported sample rate / channels.
-    #[cfg(feature = "video-thumbnail")]
+    #[cfg(feature = "media-codecs")]
     fn drain_ff_frames(&mut self) {
         let Some(codec) = ff_codec_for_stream_type_local(self.stream_type) else {
             self.pes_buf.clear();
@@ -377,7 +377,7 @@ impl AudioPidState {
         self.pes_buf.clear();
     }
 
-    #[cfg(not(feature = "video-thumbnail"))]
+    #[cfg(not(feature = "media-codecs"))]
     fn drain_ff_frames(&mut self) {
         // No libavcodec in this build → drop the buffered bytes.
         self.pes_buf.clear();
@@ -1172,12 +1172,12 @@ fn pes_payload_offset(payload: &[u8]) -> usize {
 
 /// Local indirection over the public `ff_codec_for_stream_type` helper
 /// so the rest of this file can call it on every build, returning
-/// `None` when the `video-thumbnail` feature is off.
-#[cfg(feature = "video-thumbnail")]
+/// `None` when the `media-codecs` feature is off.
+#[cfg(feature = "media-codecs")]
 fn ff_codec_for_stream_type_local(st: u8) -> Option<video_codec::AudioDecoderCodec> {
     crate::engine::audio_decode::ff_codec_for_stream_type(st)
 }
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 fn ff_codec_for_stream_type_local(_st: u8) -> Option<()> {
     None
 }

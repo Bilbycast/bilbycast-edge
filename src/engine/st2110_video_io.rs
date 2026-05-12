@@ -190,7 +190,7 @@ fn partition_mode_for(m: St2110_23PartitionModeConfig) -> St2110_23PartitionMode
 /// knobs (chroma / bit_depth / rate_control / CRF / bframes / refs / level
 /// / tune / colour metadata) propagate through to the ST 2110-20/-23
 /// ingest encoder in lock-step with RTMP / WebRTC / TS video replacer.
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn build_encoder_config(
     enc: &VideoEncodeConfig,
     width: u32,
@@ -348,7 +348,7 @@ pub async fn run_st2110_20_input(
     Ok(())
 }
 
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn encode_worker(
     enc: VideoEncodeConfig,
     width: u32,
@@ -622,7 +622,7 @@ fn encode_worker(
     }
 }
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 fn encode_worker(
     _enc: VideoEncodeConfig,
     _width: u32,
@@ -638,8 +638,8 @@ fn encode_worker(
     _pid_overrides: Option<crate::config::models::TsPidOverridesMap>,
 ) {
     tracing::error!(
-        "ST 2110-20 input requires the video-thumbnail and a video-encoder-* feature \
-         to be compiled in; this build has video-thumbnail disabled"
+        "ST 2110-20 input requires the media-codecs and a video-encoder-* feature \
+         to be compiled in; this build has media-codecs disabled"
     );
 }
 
@@ -818,7 +818,7 @@ pub async fn run_st2110_20_output(
     Ok(())
 }
 
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn decode_worker(
     width: u32,
     height: u32,
@@ -943,7 +943,7 @@ fn decode_worker(
     }
 }
 
-#[cfg(not(feature = "video-thumbnail"))]
+#[cfg(not(feature = "media-codecs"))]
 fn decode_worker(
     _width: u32,
     _height: u32,
@@ -953,12 +953,12 @@ fn decode_worker(
     _cancel: CancellationToken,
 ) {
     tracing::error!(
-        "ST 2110-20 output requires the video-thumbnail feature to be compiled in; \
-         this build has video-thumbnail disabled"
+        "ST 2110-20 output requires the media-codecs feature to be compiled in; \
+         this build has media-codecs disabled"
     );
 }
 
-#[cfg(feature = "video-thumbnail")]
+#[cfg(feature = "media-codecs")]
 fn bytes_le_to_u16(buf: &[u8], stride: usize, width: usize, height: usize) -> Vec<u16> {
     let mut out = vec![0u16; width * height];
     for row in 0..height {

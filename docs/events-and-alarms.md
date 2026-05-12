@@ -347,7 +347,7 @@ in the library picker without parsing the free-form message:
 |---|---|
 | `media_player_source_missing` | File not found on disk (`io::Error::NotFound`) or unreadable (`PermissionDenied`). |
 | `media_player_source_unsupported` | Container parse failed — no MPEG-TS sync byte in the first 1 MiB, or `io::Error::InvalidData` from a downstream demuxer. |
-| `media_player_source_codec_unsupported` | The active feature set cannot decode this source kind — e.g. an MP4 / image source in a build that lacks `video-thumbnail` + `fdk-aac`. |
+| `media_player_source_codec_unsupported` | The active feature set cannot decode this source kind — e.g. an MP4 / image source in a build that lacks `media-codecs` + `fdk-aac`. |
 | `media_player_source_render_failed` | Read or render error after the source opened — transient I/O, decoder crash, or other runtime fault. |
 | `media_player_source_failed` | Generic fallback when no specific cause was identified. |
 
