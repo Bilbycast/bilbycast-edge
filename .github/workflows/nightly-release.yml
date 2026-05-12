@@ -588,8 +588,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release list --repo "${{ github.repository }}" --limit 100 --json tagName,createdAt \
-            --jq 'sort_by(.createdAt) | reverse | .[3:] | .[].tagName' \
+          # Sort by publishedAt (release publication timestamp), not
+          # createdAt (the underlying tag-commit date) — the latter is
+          # unstable when multiple releases share the same target
+          # commit, which can happen on cross-repo publishes. publishedAt
+          # is monotonic per `gh release create` call.
+          gh release list --repo "${{ github.repository }}" --limit 100 --json tagName,publishedAt \
+            --jq 'sort_by(.publishedAt) | reverse | .[3:] | .[].tagName' \
             | while read -r OLD_TAG; do
                 [ -z "$OLD_TAG" ] && continue
                 echo "Deleting old release ${OLD_TAG}"
