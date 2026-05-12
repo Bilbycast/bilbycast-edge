@@ -273,7 +273,7 @@ async fn run_display_output(
     //    the in-process queue. A successful open after retries emits
     //    `display_output_acquired`. Cancellation cleanly exits without
     //    a `display_started`/`display_stopped` pair.
-    let kms = {
+    let mut kms = {
         let mut attempt: u32 = 0;
         let mut emitted_waiting = false;
         loop {
@@ -441,6 +441,51 @@ async fn run_display_output(
         )
     });
 
+    // Pre-allocate the audio-bars overlay plane up-front — before the
+    // demux task spawns — so we can plumb the result into the demux
+    // loop's VAAPI download decision. On hosts that lack a usable
+    // multi-plane KMS configuration (no atomic, no Overlay / Cursor
+    // plane drivable from the CRTC in ARGB8888, etc.) `enable_bars_overlay`
+    // returns an error. Previously an operator who set both
+    // `show_audio_bars: true` and `hw_decode: vaapi` saw no bars at
+    // all on those hosts — the VAAPI zero-copy path produces
+    // `VideoFrame { prime: Some(..) }` frames which the display loop
+    // scans straight out via `present_prime`, with no dumb buffer to
+    // bake bars into and no second plane to compose them onto.
+    //
+    // The fallback path: force the demux loop to download every VAAPI
+    // surface to sysmem (`av_hwframe_transfer_data`) when bars are
+    // requested but the overlay plane is unavailable. That makes
+    // `frame.is_vaapi()` flip to false, the demux loop builds a
+    // planar / semi-planar `VideoFrame`, and the display loop's
+    // CPU-blit path bakes the bars into the primary dumb buffer
+    // alongside the video. Same cost the HDR-on-SDR path already
+    // pays (one PCIe transfer per frame on Intel iHD; pointer-alias
+    // on AMD radeonsi) — small price for a useful confidence
+    // display when the host can't compose multiple planes.
+    let bars_overlay_active = if meter_snapshot.is_some() {
+        match kms.enable_bars_overlay() {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::info!(
+                    flow_id = %flow_id,
+                    output_id = %config.id,
+                    "audio-bars overlay plane unavailable — VAAPI frames will demote to CPU-blit so bars stay visible: {e:#}"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+    counters
+        .bars_overlay_enabled
+        .store(bars_overlay_active, Ordering::Relaxed);
+    // When bars are configured but the overlay plane can't be programmed,
+    // the demux loop forces VAAPI surfaces through the CPU-blit path so
+    // the display loop can bake bars into the primary dumb buffer.
+    let force_cpu_blit_for_bars = meter_snapshot.is_some() && !bars_overlay_active;
+
     // Display is a terminal consumer — it decodes the flow's broadcast
     // channel and renders to KMS + ALSA. No encoder runs, so register a
     // passthrough-true egress descriptor: `build_pipeline_summary` will
@@ -505,6 +550,7 @@ async fn run_display_output(
     // zero-copy prime frames + let the display task program
     // `HDR_OUTPUT_METADATA` on the connector (panel does HDR).
     let demux_panel_hdr_capable = kms.panel_hdr_capable();
+    let demux_force_cpu_blit_for_bars = force_cpu_blit_for_bars;
     let demux_output_stats = Arc::clone(&output_stats);
     let demux_audio_decode_counters = Arc::clone(&audio_decode_counters);
     let demux_video_decode_counters = Arc::clone(&video_decode_counters);
@@ -525,6 +571,7 @@ async fn run_display_output(
             demux_hw_already_unavailable,
             demux_frame_gen,
             demux_panel_hdr_capable,
+            demux_force_cpu_blit_for_bars,
             demux_output_stats,
             demux_audio_decode_counters,
             demux_video_decode_counters,
@@ -781,6 +828,7 @@ fn demux_decode_loop(
     hw_already_unavailable: bool,
     frame_gen: Arc<AtomicU64>,
     panel_hdr_capable: bool,
+    force_cpu_blit_for_bars: bool,
     output_stats: Arc<OutputStatsAccumulator>,
     audio_decode_counters: Arc<DecodeStats>,
     video_decode_counters: Arc<VideoDecodeStats>,
@@ -938,6 +986,7 @@ fn demux_decode_loop(
                         &output_id,
                         &frame_gen,
                         panel_hdr_capable,
+                        force_cpu_blit_for_bars,
                         stream_ids,
                         &video_decode_counters,
                         &output_stats,
@@ -967,6 +1016,7 @@ fn demux_decode_loop(
                         &output_id,
                         &frame_gen,
                         panel_hdr_capable,
+                        force_cpu_blit_for_bars,
                         stream_ids,
                         &video_decode_counters,
                         &output_stats,
@@ -1005,6 +1055,7 @@ fn demux_decode_loop(
                         &output_id,
                         &frame_gen,
                         panel_hdr_capable,
+                        force_cpu_blit_for_bars,
                         stream_ids,
                         &video_decode_counters,
                         &output_stats,
@@ -1631,6 +1682,7 @@ fn handle_video_au(
     output_id: &str,
     frame_gen: &AtomicU64,
     panel_hdr_capable: bool,
+    force_cpu_blit_for_bars: bool,
     stream_ids: StreamIds,
     video_decode_counters: &VideoDecodeStats,
     output_stats: &OutputStatsAccumulator,
@@ -1713,6 +1765,7 @@ fn handle_video_au(
         frame_gen,
         codec,
         panel_hdr_capable,
+        force_cpu_blit_for_bars,
         stream_ids,
         video_decode_counters,
         output_stats,
@@ -1902,6 +1955,7 @@ fn drain_video_frames(
     frame_gen: &AtomicU64,
     codec: VideoCodec,
     panel_hdr_capable: bool,
+    force_cpu_blit_for_bars: bool,
     stream_ids: StreamIds,
     video_decode_counters: &VideoDecodeStats,
     output_stats: &OutputStatsAccumulator,
@@ -2020,22 +2074,36 @@ fn drain_video_frames(
             state.hdr_on_sdr_event_emitted = true;
         }
 
+        // Download VAAPI surfaces to sysmem when:
+        //   1. HDR source + SDR panel — the display task needs CPU
+        //      pixels for the PQ/HLG → SDR tonemap LUT.
+        //   2. Bars are configured but the overlay plane couldn't be
+        //      programmed (`force_cpu_blit_for_bars`) — the display
+        //      task's CPU-blit path is the only way bars reach the
+        //      panel; the VAAPI zero-copy scanout owns the primary
+        //      plane and there's no dumb buffer to bake into.
+        // Either way: download flips `is_vaapi()` to false, the planar
+        // / semi-planar codepath below builds a sysmem `VideoFrame`,
+        // and the display task's CPU-blit path takes over.
+        let need_sysmem = frame.is_vaapi()
+            && ((source_is_hdr && !panel_hdr_capable) || force_cpu_blit_for_bars);
         let frame =
-            if frame.is_vaapi() && source_is_hdr && !panel_hdr_capable {
+            if need_sysmem {
                 match frame.download_to_sysmem() {
                     Ok(sysmem) => sysmem,
                     Err(e) => {
                         // Download failed (rare — driver / format
                         // mismatch). Pass the VAAPI frame through
-                        // and let the prime path run untonemapped —
-                        // the panel will see HDR transfer in the
-                        // pixel data without metadata. Sustained
-                        // failures trip the existing zero-copy
-                        // watchdog.
+                        // and let the prime path run — the operator
+                        // either sees un-tonemapped HDR (HDR-on-SDR
+                        // case) or no bars (bars-without-overlay
+                        // case). Sustained failures trip the existing
+                        // zero-copy watchdog.
                         tracing::warn!(
                             output_id = %output_id,
                             color_transfer,
-                            "HDR VAAPI → sysmem download failed ({e:?}) — primary plane will receive un-tonemapped HDR"
+                            force_cpu_blit_for_bars,
+                            "VAAPI → sysmem download failed ({e:?}) — falling back to zero-copy prime path"
                         );
                         frame
                     }
@@ -2412,31 +2480,15 @@ fn display_loop(
     // glitch (xrun, codec stall) still drops within ~quarter-second.
     const LATE_HYSTERESIS_FRAMES: u32 = 6;
 
-    // Pre-allocate the audio-bars overlay plane once at task startup
-    // (when bars are enabled). Failure isn't fatal: the dumb-buffer
-    // rasterise inside the CPU-blit path remains as the fallback. We
-    // emit a single info event so operators see why hardware bars
-    // didn't engage on hosts whose driver lacks a suitable overlay
-    // plane (or atomic). On a healthy modern Linux box this succeeds.
-    if meter.is_some() {
-        match kms.enable_bars_overlay() {
-            Ok(()) => {
-                counters
-                    .bars_overlay_enabled
-                    .store(true, Ordering::Relaxed);
-            }
-            Err(e) => {
-                tracing::info!(
-                    flow_id = %flow_id,
-                    output_id = %output_id,
-                    "audio-bars overlay plane unavailable — falling back to CPU-blit rasterise: {e:#}"
-                );
-                counters
-                    .bars_overlay_enabled
-                    .store(false, Ordering::Relaxed);
-            }
-        }
-    }
+    // The audio-bars overlay plane is pre-allocated up-front in
+    // `run_display_output` (before the demux task spawns) so the demux
+    // loop can plumb the result into its VAAPI-download decision.
+    // `kms.bars_overlay_dims()` returning Some on the hot path is the
+    // signal that the overlay plane is live and the rasterise should
+    // paint into it; returning None means run_display_output found no
+    // suitable plane and the demux loop is downloading VAAPI surfaces
+    // so the CPU-blit path below bakes bars into the primary dumb
+    // buffer instead.
 
     while !cancel.is_cancelled() {
         let next = match vrx.blocking_recv() {
