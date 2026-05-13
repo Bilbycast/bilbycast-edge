@@ -268,6 +268,9 @@ mv -Tf "${INSTALL_ROOT}/current.tmp" "${INSTALL_ROOT}/current"
 # ── Create system user + group ─────────────────────────────────────────
 if ! id -u bilbycast > /dev/null 2>&1; then
     if command -v systemd-sysusers > /dev/null 2>&1; then
+        # /etc/sysusers.d/ doesn't exist on minimal Ubuntu / Debian images
+        # by default, even when systemd-sysusers is present. Pre-create it.
+        mkdir -p /etc/sysusers.d
         cat > /etc/sysusers.d/bilbycast.conf <<'EOF'
 u bilbycast - "bilbycast-edge service account" /var/lib/bilbycast/edge /usr/sbin/nologin
 m bilbycast video
