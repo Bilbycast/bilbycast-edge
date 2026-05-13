@@ -1831,6 +1831,7 @@ pub fn resolve_display_decoder(
     }
 }
 
+#[cfg(any(test, all(feature = "display", target_os = "linux")))]
 impl DecoderResolutionError {
     /// Short tag for the `details.error_code` companion field. The
     /// outer `error_code` stays `display_hw_decode_unavailable` so

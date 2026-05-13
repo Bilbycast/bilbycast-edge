@@ -58,9 +58,18 @@ struct Cli {
     #[arg(short, long)]
     port: Option<u16>,
 
-    /// Override API listen address (overrides config file)
+    /// Override API listen address (legacy single-address override).
+    /// Use `--bind-addrs` for dual-stack / multi-listener overrides.
     #[arg(short = 'b', long)]
     bind: Option<String>,
+
+    /// Override API dual-stack listener addresses (comma-separated, e.g.
+    /// `0.0.0.0,[::]`). When set, takes precedence over `--bind` and the
+    /// config file's `server.listen_addr` / `server.listen_addrs`. v6
+    /// entries get `IPV6_V6ONLY=1` so they coexist with v4 listeners on
+    /// the same port.
+    #[arg(long)]
+    bind_addrs: Option<String>,
 
     /// Override monitor dashboard port (overrides config file)
     #[arg(long)]
@@ -189,6 +198,16 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(ref bind) = cli.bind {
         app_config.server.listen_addr = bind.clone();
+    }
+    if let Some(ref bind_addrs) = cli.bind_addrs {
+        // Comma-separated override; takes precedence over --bind and the
+        // config file. Validated by the same parser the config layer uses.
+        let entries: Vec<String> = bind_addrs
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        app_config.server.listen_addrs = Some(entries);
     }
     if let Some(mp) = cli.monitor_port {
         if let Some(ref mut mon) = app_config.monitor {
@@ -643,6 +662,19 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Resolve effective bind list. `server.listen_addrs` (when set) takes
+    // precedence over the legacy single-address `server.listen_addr`.
+    // Default is dual-stack (`0.0.0.0,[::]`); v6 listeners get
+    // IPV6_V6ONLY=1 so they coexist with the v4 listener on the same port.
+    let bind_entries = app_config.server.effective_listen_addrs();
+    let bind_ips = config::validation::parse_listen_addrs(&bind_entries, "server")
+        .map_err(|e| anyhow::anyhow!("server bind addresses: {e}"))?;
+    let listen_port = app_config.server.listen_port;
+    let bind_addrs: Vec<std::net::SocketAddr> = bind_ips
+        .iter()
+        .map(|ip| std::net::SocketAddr::new(*ip, listen_port))
+        .collect();
+
     // Start API server (with or without TLS)
     #[cfg(feature = "tls")]
     {
@@ -653,7 +685,6 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("Failed to load TLS cert/key: {e}"))?;
             tracing::info!("API server TLS enabled (cert={}, key={})", tls_config.cert_path, tls_config.key_path);
 
-            let addr: std::net::SocketAddr = listen_addr.parse()?;
             let handle = axum_server::Handle::new();
             let shutdown_handle = handle.clone();
             tokio::spawn(async move {
@@ -661,22 +692,46 @@ async fn main() -> anyhow::Result<()> {
                 shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
             });
 
-            axum_server::bind_rustls(addr, rustls_config)
-                .handle(handle)
-                .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .await
-                .map_err(|e| anyhow::anyhow!(
-                    "Edge API server failed to start on {listen_addr}: {e}"
-                ))?;
+            let mut serve_set: tokio::task::JoinSet<anyhow::Result<()>> =
+                tokio::task::JoinSet::new();
+            for bind_addr in &bind_addrs {
+                let std_listener = build_std_tcp_listener(*bind_addr).map_err(|e| {
+                    crate::util::port_error::annotate_bind_error(
+                        e,
+                        &bind_addr.to_string(),
+                        "Edge API server (HTTPS)",
+                    )
+                })?;
+                let router_clone = router.clone();
+                let rustls = rustls_config.clone();
+                let handle_clone = handle.clone();
+                let bind_label = bind_addr.to_string();
+                tracing::info!("Edge API server listening on {bind_label} (HTTPS)");
+                serve_set.spawn(async move {
+                    let server = axum_server::from_tcp_rustls(std_listener, rustls)
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "Edge API server failed to wrap listener {bind_label}: {e}"
+                            )
+                        })?;
+                    server
+                        .handle(handle_clone)
+                        .serve(router_clone.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "Edge API server failed to start on {bind_label}: {e}"
+                            )
+                        })
+                });
+            }
+            // First listener to exit (success or error) tears down the
+            // whole serve; dropping the JoinSet aborts the rest.
+            if let Some(res) = serve_set.join_next().await {
+                res??;
+            }
         } else {
-            let listener = TcpListener::bind(&listen_addr).await.map_err(|e| {
-                crate::util::port_error::annotate_bind_error(e, &listen_addr, "Edge API server")
-            })?;
-            axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .with_graceful_shutdown(async move {
-                    shutdown_token.cancelled().await;
-                })
-                .await?;
+            run_multi_listener_plain(bind_addrs.as_slice(), router, shutdown_token).await?;
         }
     }
 
@@ -685,14 +740,7 @@ async fn main() -> anyhow::Result<()> {
         if app_config.server.tls.is_some() {
             tracing::warn!("TLS is configured but the 'tls' feature is not enabled. Build with --features tls to enable HTTPS.");
         }
-        let listener = TcpListener::bind(&listen_addr).await.map_err(|e| {
-            crate::util::port_error::annotate_bind_error(e, &listen_addr, "Edge API server")
-        })?;
-        axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .with_graceful_shutdown(async move {
-                shutdown_token.cancelled().await;
-            })
-            .await?;
+        run_multi_listener_plain(bind_addrs.as_slice(), router, shutdown_token).await?;
     }
 
     // Graceful shutdown: stop all flows and tunnels
@@ -792,5 +840,72 @@ fn resolve_local_ip() -> String {
         }
     }
     "127.0.0.1".to_string()
+}
+
+/// Build a `std::net::TcpListener` with the dual-stack contract applied:
+/// v6 sockets get `IPV6_V6ONLY=1` so they don't claim the v4 address
+/// space, both families get `SO_REUSEADDR`, and the listener is set to
+/// non-blocking for tokio / axum_server adapters.
+fn build_std_tcp_listener(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = match addr.ip() {
+        std::net::IpAddr::V4(_) => Domain::IPV4,
+        std::net::IpAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    if matches!(addr.ip(), std::net::IpAddr::V6(_)) {
+        socket.set_only_v6(true)?;
+    }
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    Ok(socket.into())
+}
+
+/// Build a tokio `TcpListener` with the same dual-stack socket options as
+/// [`build_std_tcp_listener`].
+fn build_tokio_tcp_listener(addr: std::net::SocketAddr) -> std::io::Result<TcpListener> {
+    let std_listener = build_std_tcp_listener(addr)?;
+    TcpListener::from_std(std_listener)
+}
+
+/// Fan out `axum::serve` across every bind address, sharing one router
+/// and one shutdown token. First listener to exit terminates the whole
+/// serve; dropping the JoinSet aborts the rest.
+async fn run_multi_listener_plain(
+    bind_addrs: &[std::net::SocketAddr],
+    router: axum::Router,
+    shutdown_token: CancellationToken,
+) -> anyhow::Result<()> {
+    let mut serve_set: tokio::task::JoinSet<anyhow::Result<()>> = tokio::task::JoinSet::new();
+    for bind_addr in bind_addrs {
+        let listener = build_tokio_tcp_listener(*bind_addr).map_err(|e| {
+            crate::util::port_error::annotate_bind_error(
+                e,
+                &bind_addr.to_string(),
+                "Edge API server",
+            )
+        })?;
+        let router_clone = router.clone();
+        let shutdown_clone = shutdown_token.clone();
+        let bind_label = bind_addr.to_string();
+        tracing::info!("Edge API server listening on {bind_label}");
+        serve_set.spawn(async move {
+            axum::serve(
+                listener,
+                router_clone.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                shutdown_clone.cancelled().await;
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Edge API server on {bind_label}: {e}"))
+        });
+    }
+    if let Some(res) = serve_set.join_next().await {
+        res??;
+    }
+    Ok(())
 }
 

@@ -825,6 +825,7 @@ impl OutputStatsAccumulator {
     /// Borrow the registered video decode handle, if any. Used by long-lived
     /// tasks (Display output) that need to update the source-codec / geometry
     /// fields whenever the upstream stream changes mid-flow.
+    #[cfg(all(feature = "display", target_os = "linux"))]
     pub fn video_decode_stats_handle(&self) -> Option<&VideoDecodeStatsHandle> {
         self.video_decode_stats.get()
     }

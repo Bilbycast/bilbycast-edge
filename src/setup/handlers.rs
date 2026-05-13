@@ -71,8 +71,12 @@ pub async fn setup_status(State(state): State<AppState>) -> Json<SetupStatus> {
         Some(m) => (m.urls.clone(), m.accept_self_signed_cert),
         None => (Vec::new(), false),
     };
+    // Surface the effective bind list as a comma-separated string so the
+    // wizard can round-trip dual-stack edits. Falls back to the single
+    // legacy `listen_addr` when `listen_addrs` is unset.
+    let listen_addr_display = config.server.effective_listen_addrs().join(",");
     Json(SetupStatus {
-        listen_addr: config.server.listen_addr.clone(),
+        listen_addr: listen_addr_display,
         listen_port: config.server.listen_port,
         manager_urls,
         accept_self_signed_cert: accept_self_signed,
@@ -239,7 +243,24 @@ pub async fn apply_setup(
     let mut config = state.config.write().await;
 
     if let Some(ref addr) = payload.listen_addr {
-        config.server.listen_addr = addr.trim().to_string();
+        let trimmed = addr.trim();
+        if trimmed.contains(',') {
+            // Comma-separated form → populate dual-stack listen_addrs.
+            // listen_addr is left set to the first entry for backward-compat
+            // with any consumer that still reads it directly.
+            let entries: Vec<String> = trimmed
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if let Some(first) = entries.first() {
+                config.server.listen_addr = first.clone();
+            }
+            config.server.listen_addrs = Some(entries);
+        } else {
+            config.server.listen_addr = trimmed.to_string();
+            config.server.listen_addrs = None;
+        }
     }
     if let Some(port) = payload.listen_port {
         config.server.listen_port = port;

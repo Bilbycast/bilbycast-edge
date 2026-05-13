@@ -301,10 +301,19 @@ impl AppConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
-    /// API listen address, e.g. "0.0.0.0"
+    /// API listen address, e.g. "0.0.0.0". Legacy single-address field.
+    /// When [`listen_addrs`] is set, this is ignored on bind. Kept for
+    /// backward compatibility with pre-dual-stack configs.
     pub listen_addr: String,
     /// API listen port, default 8080
     pub listen_port: u16,
+    /// Dual-stack listener addresses. When set, the API server binds one
+    /// listener per entry (e.g. `["0.0.0.0", "[::]"]` for dual-stack).
+    /// IPv6 entries get `IPV6_V6ONLY=1` so they coexist with v4 listeners
+    /// on the same port without overlap. Unset = fall back to
+    /// `[listen_addr]` (legacy behaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_addrs: Option<Vec<String>>,
     /// Optional TLS configuration for HTTPS on the API server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
@@ -312,6 +321,17 @@ pub struct ServerConfig {
     /// When absent or `enabled: false`, all endpoints are unauthenticated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<crate::api::auth::AuthConfig>,
+}
+
+impl ServerConfig {
+    /// Resolve the effective list of bind addresses. Falls back to
+    /// `[listen_addr]` when [`listen_addrs`] is unset or empty.
+    pub fn effective_listen_addrs(&self) -> Vec<String> {
+        match &self.listen_addrs {
+            Some(addrs) if !addrs.is_empty() => addrs.clone(),
+            _ => vec![self.listen_addr.clone()],
+        }
+    }
 }
 
 /// TLS configuration for HTTPS serving.
@@ -327,6 +347,9 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen_addr: "0.0.0.0".to_string(),
+            // Dual-stack by default for new installs. Existing configs
+            // without this field keep `listen_addr`-only behaviour.
+            listen_addrs: Some(vec!["0.0.0.0".to_string(), "[::]".to_string()]),
             listen_port: 8080,
             tls: None,
             auth: None,
@@ -340,10 +363,26 @@ impl Default for ServerConfig {
 /// serving a self-contained HTML dashboard for browser-based status monitoring.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitorConfig {
-    /// Dashboard listen address, e.g. "0.0.0.0"
+    /// Dashboard listen address, e.g. "0.0.0.0". Legacy single-address field.
+    /// Ignored when [`listen_addrs`] is set.
     pub listen_addr: String,
+    /// Dual-stack listener addresses for the dashboard. Same semantics as
+    /// [`ServerConfig::listen_addrs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_addrs: Option<Vec<String>>,
     /// Dashboard listen port, e.g. 9090
     pub listen_port: u16,
+}
+
+impl MonitorConfig {
+    /// Resolve the effective list of bind addresses. Falls back to
+    /// `[listen_addr]` when [`listen_addrs`] is unset or empty.
+    pub fn effective_listen_addrs(&self) -> Vec<String> {
+        match &self.listen_addrs {
+            Some(addrs) if !addrs.is_empty() => addrs.clone(),
+            _ => vec![self.listen_addr.clone()],
+        }
+    }
 }
 
 /// Structured-JSON log shipper configuration.

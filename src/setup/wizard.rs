@@ -63,9 +63,16 @@ button:disabled{background:#21262d;color:#484f58;cursor:not-allowed}
       <div class="section-title">API Server</div>
       <div class="row">
         <div class="col">
-          <label for="listen_addr">Listen Address</label>
-          <div class="hint">Bind address for the API server</div>
-          <input type="text" id="listen_addr" value="0.0.0.0" required>
+          <label for="listen_addr">Listen Addresses</label>
+          <div class="hint">
+            One or more bind addresses, comma-separated.
+            Default <code>0.0.0.0,[::]</code> is dual-stack
+            (IPv4 + IPv6). Use a single value (e.g.
+            <code>0.0.0.0</code> or <code>[::]</code>) to
+            restrict to one family, or a specific IP to
+            bind a particular interface.
+          </div>
+          <input type="text" id="listen_addr" value="0.0.0.0,[::]" required>
         </div>
         <div class="col">
           <label for="listen_port">Port</label>

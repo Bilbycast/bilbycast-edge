@@ -43,10 +43,18 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
         );
     }
 
+    // Validate optional dual-stack listener list for the API server.
+    if let Some(ref addrs) = config.server.listen_addrs {
+        parse_listen_addrs(addrs, "server.listen_addrs")?;
+    }
+
     // Validate monitor config if present
     if let Some(ref monitor) = config.monitor {
         let monitor_addr = format!("{}:{}", monitor.listen_addr, monitor.listen_port);
         validate_socket_addr(&monitor_addr, "monitor listen address")?;
+        if let Some(ref addrs) = monitor.listen_addrs {
+            parse_listen_addrs(addrs, "monitor.listen_addrs")?;
+        }
         if monitor.listen_addr == config.server.listen_addr
             && monitor.listen_port == config.server.listen_port
         {
@@ -5417,6 +5425,35 @@ fn validate_socket_addr(addr: &str, context: &str) -> Result<()> {
     addr.parse::<SocketAddr>()
         .map_err(|e| anyhow::anyhow!("{context}: invalid socket address '{addr}': {e}"))?;
     Ok(())
+}
+
+/// Parse and validate a list of bind-address strings (e.g. `["0.0.0.0", "[::]"]`)
+/// into [`std::net::IpAddr`] values. Strips surrounding `[...]` brackets on v6
+/// entries so URL-style spelling is accepted. Rejects empty lists, duplicate
+/// entries, and malformed addresses.
+pub fn parse_listen_addrs(entries: &[String], context: &str) -> Result<Vec<std::net::IpAddr>> {
+    let mut out = Vec::new();
+    for raw in entries {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let stripped = trimmed
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(trimmed);
+        let addr: std::net::IpAddr = stripped
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{context}: invalid bind address '{trimmed}': {e}"))?;
+        if out.contains(&addr) {
+            anyhow::bail!("{context}: duplicate bind address '{trimmed}'");
+        }
+        out.push(addr);
+    }
+    if out.is_empty() {
+        anyhow::bail!("{context}: bind address list must not be empty");
+    }
+    Ok(out)
 }
 
 /// Validate an `InterfaceBinding`.

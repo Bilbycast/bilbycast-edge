@@ -113,8 +113,10 @@ pub enum DemuxedFrame {
         /// PES payload bytes (post-PES-header). The ETSI / ISO opus-in-TS
         /// control headers ride in front of each Opus frame inside this
         /// buffer.
+        #[cfg(all(feature = "display", target_os = "linux"))]
         data: Vec<u8>,
         /// Presentation timestamp in 90 kHz clock ticks.
+        #[cfg(all(feature = "display", target_os = "linux"))]
         pts: u64,
     },
     /// AAC audio frame (raw, ADTS header stripped).
@@ -831,7 +833,9 @@ impl TsDemuxer {
             }
             STREAM_TYPE_PRIVATE if Some(pid) == self.audio_pid => {
                 vec![DemuxedFrame::Opus {
+                    #[cfg(all(feature = "display", target_os = "linux"))]
                     data: es_data.to_vec(),
+                    #[cfg(all(feature = "display", target_os = "linux"))]
                     pts: pts.unwrap_or(0),
                 }]
             }

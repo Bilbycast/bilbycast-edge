@@ -23,6 +23,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Native dual-stack (IPv4 + IPv6) listeners** — the API server
+  (REST + NMOS IS-04/05/08 + setup wizard + Prometheus) and the
+  optional monitor dashboard now bind v4 and v6 simultaneously by
+  default. New optional config fields `ServerConfig.listen_addrs` and
+  `MonitorConfig.listen_addrs` (both `Option<Vec<String>>`) carry the
+  dual-stack list; default is `["0.0.0.0", "[::]"]` for fresh installs.
+  Existing configs without the field keep the legacy single-address
+  `listen_addr` behaviour — no migration required. v6 entries get
+  `IPV6_V6ONLY=1` so they coexist with v4 listeners on the same port
+  without `EADDRINUSE`. CLI override `--bind-addrs <comma-separated>`
+  is the multi-addr companion to legacy `--bind`. Setup wizard accepts
+  comma-separated input in the Listen Address field. Effective list
+  resolvers: `ServerConfig::effective_listen_addrs` /
+  `MonitorConfig::effective_listen_addrs`. Listener construction
+  (`main.rs::build_std_tcp_listener` / `build_tokio_tcp_listener`,
+  `monitor::server::build_monitor_listener`) uses `socket2` for the v6
+  socket option. Per-flow media listeners (SRT / RIST / RTP / UDP /
+  RTMP / WebRTC / ST 2110) were already family-agnostic via the
+  per-input `bind_addr` field; no change there.
 - **Replay server (Phase 1)** — pure-Rust continuous flow recording to disk
   + clip playback as a fresh input. Gated by the `replay` Cargo feature,
   on by default; pure-Rust, no new C deps.

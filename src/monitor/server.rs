@@ -189,11 +189,18 @@ pub async fn start_monitor_server(
     live_gpu: Arc<LiveUtilizationState>,
     shutdown_token: CancellationToken,
 ) -> anyhow::Result<JoinHandle<()>> {
-    let addr = format!("{}:{}", config.listen_addr, config.listen_port);
-    let listener = TcpListener::bind(&addr).await.map_err(|e| {
-        crate::util::port_error::annotate_bind_error(e, &addr, "Monitor dashboard server")
-    })?;
-    tracing::info!("Monitor dashboard listening on {addr}");
+    // Resolve effective dual-stack bind list. `listen_addrs` takes
+    // precedence over `listen_addr`; v6 entries get IPV6_V6ONLY=1 so
+    // they coexist with v4 listeners on the same port.
+    let bind_entries = config.effective_listen_addrs();
+    let bind_ips =
+        crate::config::validation::parse_listen_addrs(&bind_entries, "monitor")
+            .map_err(|e| anyhow::anyhow!("Monitor bind addresses: {e}"))?;
+    let listen_port = config.listen_port;
+    let bind_addrs: Vec<std::net::SocketAddr> = bind_ips
+        .iter()
+        .map(|ip| std::net::SocketAddr::new(*ip, listen_port))
+        .collect();
 
     let monitor_state = MonitorState {
         app: state,
@@ -202,16 +209,59 @@ pub async fn start_monitor_server(
     };
     let router = build_monitor_router(monitor_state);
 
+    let mut listeners: Vec<(std::net::SocketAddr, TcpListener)> = Vec::new();
+    for bind_addr in &bind_addrs {
+        let listener = build_monitor_listener(*bind_addr).map_err(|e| {
+            crate::util::port_error::annotate_bind_error(
+                e,
+                &bind_addr.to_string(),
+                "Monitor dashboard server",
+            )
+        })?;
+        tracing::info!("Monitor dashboard listening on {bind_addr}");
+        listeners.push((*bind_addr, listener));
+    }
+
     let handle = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                shutdown_token.cancelled().await;
-            })
-            .await
-        {
-            tracing::error!("Monitor server error: {e}");
+        let mut set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        for (bind_addr, listener) in listeners {
+            let router_clone = router.clone();
+            let shutdown_clone = shutdown_token.clone();
+            set.spawn(async move {
+                if let Err(e) = axum::serve(listener, router_clone)
+                    .with_graceful_shutdown(async move {
+                        shutdown_clone.cancelled().await;
+                    })
+                    .await
+                {
+                    tracing::error!("Monitor server on {bind_addr} error: {e}");
+                }
+            });
         }
+        // Wait for the first listener to exit; dropping the set aborts the rest.
+        let _ = set.join_next().await;
     });
 
     Ok(handle)
+}
+
+/// Build a tokio `TcpListener` for the monitor dashboard with
+/// `IPV6_V6ONLY=1` on v6 sockets and `SO_REUSEADDR` on both families.
+/// Matches the contract used by the edge API server's bind path.
+fn build_monitor_listener(addr: std::net::SocketAddr) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = match addr.ip() {
+        std::net::IpAddr::V4(_) => Domain::IPV4,
+        std::net::IpAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    if matches!(addr.ip(), std::net::IpAddr::V6(_)) {
+        socket.set_only_v6(true)?;
+    }
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    TcpListener::from_std(std_listener)
 }

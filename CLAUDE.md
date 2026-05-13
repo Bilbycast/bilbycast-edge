@@ -21,9 +21,12 @@ cargo test <test_name>         # Run a single test
 ```bash
 ./target/release/bilbycast-edge --config config.json
 ./target/release/bilbycast-edge --config config.json --port 8080 --log-level debug
+./target/release/bilbycast-edge --config config.json --bind-addrs '0.0.0.0,[::]'   # dual-stack override
 ```
 
 Example configs in `config_examples/`. Interop testing uses `test-edge1.json` through `test-edge4.json` (see `docs/INTEROP_TEST.md`).
+
+**Listener bind addresses.** `ServerConfig.listen_addrs` and `MonitorConfig.listen_addrs` (each `Option<Vec<String>>`, parsed by `config::validation::parse_listen_addrs`) carry the dual-stack list — when set, take precedence over the legacy single-address `listen_addr`. New installs default to `["0.0.0.0", "[::]"]` (dual-stack). v6 entries get `IPV6_V6ONLY=1` so they coexist with v4 listeners on the same port. CLI override: `--bind-addrs <comma-separated>` (companion to legacy `--bind`). Listener construction with the v6-only socket option lives in `main.rs::build_std_tcp_listener` / `build_tokio_tcp_listener` and `monitor::server::build_monitor_listener` (uses `socket2`). Effective list resolver: `ServerConfig::effective_listen_addrs` / `MonitorConfig::effective_listen_addrs`. Per-flow media listeners (SRT / RIST / RTP / UDP / RTMP / WebRTC / ST 2110) are already address-family-agnostic via the per-input `bind_addr` config field — no change needed there.
 
 ## External Crate Dependencies
 

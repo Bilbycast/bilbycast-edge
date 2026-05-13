@@ -19,6 +19,7 @@
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::IpAddr;
+#[cfg(target_os = "linux")]
 use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,9 +61,11 @@ pub struct NetworkInterfaceInfo {
 /// once per health tick — never on the data path.
 #[derive(Default)]
 pub struct NetworkSampler {
+    #[cfg(target_os = "linux")]
     last_samples: HashMap<String, LastSample>,
 }
 
+#[cfg(target_os = "linux")]
 struct LastSample {
     rx_bytes: u64,
     tx_bytes: u64,
@@ -80,6 +83,7 @@ impl NetworkSampler {
     /// because there's no prior counter to diff against — the second
     /// tick onwards has valid rates.
     pub fn sample(&mut self) -> Vec<NetworkInterfaceInfo> {
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut out = enumerate();
         #[cfg(target_os = "linux")]
         {
