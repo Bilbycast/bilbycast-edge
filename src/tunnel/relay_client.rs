@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use quinn::Connection;
+use tokio::net::lookup_host;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -73,9 +74,13 @@ impl std::fmt::Display for RelayTunnelState {
 /// the index of the currently-active relay on `active_idx_tx`.
 pub struct RelayTunnelParams {
     pub tunnel_id: Uuid,
-    /// Ordered list of relay addresses. Must contain at least one entry.
-    /// A second entry enables automatic primary↔backup failover.
-    pub relay_addrs: Vec<SocketAddr>,
+    /// Ordered list of relay addresses (`host:port` strings — IP literals
+    /// or DNS names). Must contain at least one entry. A second entry
+    /// enables automatic primary↔backup failover. DNS resolution happens
+    /// at connect time via `tokio::net::lookup_host`, so an IP change
+    /// behind a hostname is picked up on the next connect attempt
+    /// without a tunnel reconfig.
+    pub relay_addrs: Vec<String>,
     pub direction: TunnelDirection,
     pub protocol: TunnelProtocol,
     /// Optional manager node_id to identify this edge to the relay.
@@ -98,9 +103,16 @@ pub struct RelayTunnelParams {
 /// failure.
 ///
 /// Returns the QUIC connection ready for data forwarding once state becomes `Ready`.
+///
+/// `relay_addr` is a `host:port` string. It is resolved via
+/// `tokio::net::lookup_host` inside the [`CONNECT_TIMEOUT`] window so DNS
+/// changes are picked up on every retry without a config reload. The
+/// first returned `SocketAddr` is used — multi-record round-robin is not
+/// implemented at this layer (operators wanting that can list multiple
+/// addresses in `relay_addrs`).
 pub async fn connect_and_bind(
     params: &RelayTunnelParams,
-    relay_addr: SocketAddr,
+    relay_addr: &str,
     state_tx: &watch::Sender<RelayTunnelState>,
     cancel: CancellationToken,
     event_sender: EventSender,
@@ -109,11 +121,23 @@ pub async fn connect_and_bind(
     state_tx.send_replace(RelayTunnelState::Connecting);
     let endpoint = quic::make_client_endpoint(ALPN_RELAY)?;
 
-    let conn = tokio::select! {
-        result = tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            quic::connect(&endpoint, relay_addr, "relay"),
-        ) => result
+    // Resolve host:port → SocketAddr (DNS lookup if hostname; instant if
+    // already a literal). Bounded by CONNECT_TIMEOUT alongside the QUIC
+    // handshake so a slow / unresponsive resolver doesn't park the
+    // failover loop.
+    let connect_work = async {
+        let mut iter = lookup_host(relay_addr).await.map_err(|e| {
+            anyhow::anyhow!("resolve relay '{relay_addr}': {e}")
+        })?;
+        let resolved = iter
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("relay '{relay_addr}' resolved to no addresses"))?;
+        let conn = quic::connect(&endpoint, resolved, "relay").await?;
+        Ok::<(SocketAddr, Connection), anyhow::Error>((resolved, conn))
+    };
+
+    let (resolved_addr, conn) = tokio::select! {
+        result = tokio::time::timeout(CONNECT_TIMEOUT, connect_work) => result
             .map_err(|_| anyhow::anyhow!("connect to relay {relay_addr} timed out after {CONNECT_TIMEOUT:?}"))??,
         _ = cancel.cancelled() => anyhow::bail!("cancelled during connect"),
     };
@@ -121,6 +145,7 @@ pub async fn connect_and_bind(
     tracing::info!(
         tunnel_id = %params.tunnel_id,
         relay = %relay_addr,
+        resolved = %resolved_addr,
         "Connected to relay"
     );
 
@@ -398,14 +423,14 @@ pub async fn connect_with_retry(
     let max_backoff = Duration::from_secs(60);
 
     loop {
-        let relay_addr = params.relay_addrs[*active_idx];
+        let relay_addr: &str = &params.relay_addrs[*active_idx];
         match connect_and_bind(params, relay_addr, state_tx, cancel.clone(), event_sender.clone())
             .await
         {
             Ok(conn) => {
                 active_idx_tx.send_replace(*active_idx);
                 if *active_idx != initial_idx {
-                    let from = params.relay_addrs[initial_idx];
+                    let from: &str = &params.relay_addrs[initial_idx];
                     tracing::warn!(
                         tunnel_id = %params.tunnel_id,
                         "Tunnel failed over from {from} to {relay_addr} (idx {initial_idx} → {})",
@@ -417,8 +442,8 @@ pub async fn connect_with_retry(
                         format!("Tunnel failed over to backup relay {relay_addr}"),
                         &params.tunnel_id.to_string(),
                         serde_json::json!({
-                            "from_relay_addr": from.to_string(),
-                            "to_relay_addr": relay_addr.to_string(),
+                            "from_relay_addr": from,
+                            "to_relay_addr": relay_addr,
                             "from_idx": initial_idx,
                             "to_idx": *active_idx,
                         }),
@@ -491,17 +516,27 @@ pub async fn connect_with_retry(
 /// Measure the smoothed QUIC RTT to `relay_addr` by opening a short-lived
 /// probe connection and performing the Hello / HelloAck handshake.
 ///
+/// `relay_addr` is a `host:port` string (IP literal or DNS name). Resolution
+/// happens on every probe so an IP change behind a hostname is observed
+/// without restarting the failback task.
+///
 /// Used by the failback probe to decide whether the primary relay is healthy
 /// enough (RTT-wise) to resume traffic on. The connection is dropped at the
 /// end of the call.
 pub async fn measure_relay_rtt(
-    relay_addr: SocketAddr,
+    relay_addr: &str,
     cancel: CancellationToken,
 ) -> Result<Duration> {
+    let target = relay_addr.to_string();
     let work = async move {
         let endpoint = quic::make_client_endpoint(ALPN_RELAY)?;
+        let resolved = lookup_host(target.as_str())
+            .await
+            .map_err(|e| anyhow::anyhow!("resolve relay '{target}': {e}"))?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("relay '{target}' resolved to no addresses"))?;
         let conn = tokio::select! {
-            result = quic::connect(&endpoint, relay_addr, "relay") => result?,
+            result = quic::connect(&endpoint, resolved, "relay") => result?,
             _ = cancel.cancelled() => anyhow::bail!("cancelled during probe connect"),
         };
         let (mut send, mut recv) = conn.open_bi().await?;

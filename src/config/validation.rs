@@ -5427,6 +5427,68 @@ fn validate_socket_addr(addr: &str, context: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate a dial endpoint shaped as `host:port`. Accepts either:
+///   - IPv4 / IPv6 literal `host:port` (e.g. `54.1.2.3:4433`, `[2001:db8::1]:4433`)
+///   - DNS-name `host:port` (e.g. `relay.example.com:4433`)
+///
+/// Rejects: empty input, length >256, unspecified IP literals
+/// (`0.0.0.0:N`, `[::]:N`), port 0, malformed hostnames. DNS resolution
+/// is NOT performed here — that happens at dial time via
+/// `tokio::net::lookup_host` so IP changes are picked up without a
+/// tunnel reconfig.
+///
+/// Returned `Ok(())` only guarantees syntactic validity. A name that
+/// fails to resolve later surfaces as a connect error, not a config
+/// rejection.
+pub(crate) fn validate_dialable_host_port(raw: &str, context: &str) -> Result<()> {
+    let s = raw.trim();
+    if s.is_empty() {
+        bail!("{context}: must not be empty");
+    }
+    if s.len() > 256 {
+        bail!("{context}: too long (max 256 chars)");
+    }
+    if let Ok(sa) = s.parse::<SocketAddr>() {
+        if sa.ip().is_unspecified() {
+            bail!(
+                "{context}: '{s}' is an unspecified (listen-only) address; \
+                 use the address remote peers actually dial"
+            );
+        }
+        if sa.port() == 0 {
+            bail!("{context}: port must be non-zero");
+        }
+        return Ok(());
+    }
+    let (host, port_str) = s
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("{context}: '{s}' must be host:port"))?;
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{context}: invalid port '{port_str}'"))?;
+    if port == 0 {
+        bail!("{context}: port must be non-zero");
+    }
+    if host.is_empty() || host.len() > 253 {
+        bail!("{context}: host '{host}' length must be 1..=253");
+    }
+    let label_ok = |label: &str| -> bool {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    if !host.split('.').all(label_ok) {
+        bail!(
+            "{context}: host '{host}' is not a valid IPv4/IPv6 literal or DNS name"
+        );
+    }
+    Ok(())
+}
+
 /// Parse and validate a list of bind-address strings (e.g. `["0.0.0.0", "[::]"]`)
 /// into [`std::net::IpAddr`] values. Strips surrounding `[...]` brackets on v6
 /// entries so URL-style spelling is accepted. Rejects empty lists, duplicate
@@ -5574,25 +5636,17 @@ pub fn validate_tunnel(tunnel: &crate::tunnel::TunnelConfig) -> Result<()> {
                     relays.len()
                 );
             }
-            let mut seen: std::collections::HashSet<std::net::SocketAddr> =
+            // Dedup on the normalised string form. Two different DNS
+            // names can resolve to the same IP — that's not a config
+            // duplicate. DNS is case-insensitive so lowercase before
+            // comparing.
+            let mut seen: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             for (idx, addr) in relays.iter().enumerate() {
-                if addr.is_empty() || addr.len() > 256 {
-                    bail!(
-                        "Tunnel '{}': relay_addrs[{}] must be 1-256 characters",
-                        tunnel.id,
-                        idx
-                    );
-                }
-                let parsed: std::net::SocketAddr = addr.parse().map_err(|e| {
-                    anyhow::anyhow!(
-                        "Tunnel '{}': relay_addrs[{}] is not a valid socket address: {}",
-                        tunnel.id,
-                        idx,
-                        e
-                    )
-                })?;
-                if !seen.insert(parsed) {
+                let ctx = format!("Tunnel '{}': relay_addrs[{}]", tunnel.id, idx);
+                validate_dialable_host_port(addr, &ctx)?;
+                let key = addr.trim().to_ascii_lowercase();
+                if !seen.insert(key) {
                     bail!(
                         "Tunnel '{}': relay_addrs contains duplicate address '{}'",
                         tunnel.id,
@@ -8945,10 +8999,53 @@ mod tests {
     }
 
     #[test]
-    fn dual_relay_rejects_invalid_socket_addr() {
+    fn dual_relay_rejects_invalid_port() {
         let t = make_dual_relay_tunnel(vec!["127.0.0.1:4433", "not-a-host:port"]);
         let err = validate_tunnel(&t).unwrap_err().to_string();
-        assert!(err.contains("not a valid socket address"), "got: {err}");
+        assert!(err.contains("invalid port"), "got: {err}");
+    }
+
+    #[test]
+    fn dual_relay_accepts_dns_name() {
+        // Hostnames are accepted at config-load time. DNS resolution
+        // happens at connect time inside the tunnel layer.
+        let t = make_dual_relay_tunnel(vec!["relay.example.com:4433", "backup.example.com:4433"]);
+        validate_tunnel(&t).unwrap();
+    }
+
+    #[test]
+    fn dual_relay_accepts_ipv6_literal() {
+        let t = make_dual_relay_tunnel(vec!["[2001:db8::1]:4433", "[2001:db8::2]:4433"]);
+        validate_tunnel(&t).unwrap();
+    }
+
+    #[test]
+    fn dual_relay_rejects_unspecified_ipv4() {
+        let t = make_dual_relay_tunnel(vec!["0.0.0.0:4433", "127.0.0.1:4434"]);
+        let err = validate_tunnel(&t).unwrap_err().to_string();
+        assert!(err.contains("unspecified"), "got: {err}");
+    }
+
+    #[test]
+    fn dual_relay_rejects_unspecified_ipv6() {
+        let t = make_dual_relay_tunnel(vec!["[::]:4433", "127.0.0.1:4434"]);
+        let err = validate_tunnel(&t).unwrap_err().to_string();
+        assert!(err.contains("unspecified"), "got: {err}");
+    }
+
+    #[test]
+    fn dual_relay_rejects_zero_port() {
+        let t = make_dual_relay_tunnel(vec!["relay.example.com:0", "127.0.0.1:4434"]);
+        let err = validate_tunnel(&t).unwrap_err().to_string();
+        assert!(err.contains("port must be non-zero"), "got: {err}");
+    }
+
+    #[test]
+    fn dual_relay_dedup_case_insensitive_for_dns() {
+        // Two spellings of the same DNS name → duplicate.
+        let t = make_dual_relay_tunnel(vec!["Relay.Example.com:4433", "relay.example.com:4433"]);
+        let err = validate_tunnel(&t).unwrap_err().to_string();
+        assert!(err.contains("duplicate address"), "got: {err}");
     }
 
     #[test]

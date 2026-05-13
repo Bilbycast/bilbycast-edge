@@ -197,15 +197,15 @@ impl TunnelManager {
         tcp_stats: Option<Arc<TcpForwarderStats>>,
     ) -> anyhow::Result<watch::Receiver<usize>> {
         // Resolve ordered relay list (primary + optional backup). Validation has
-        // already enforced length, format, and uniqueness.
-        let relay_addrs: Vec<SocketAddr> = config
+        // already enforced length, format, and uniqueness. We keep these as
+        // strings — DNS names resolve at connect time inside
+        // `connect_and_bind` / `measure_relay_rtt`, so an IP change behind
+        // a hostname is observed on the next retry without a config edit.
+        let relay_addrs: Vec<String> = config
             .effective_relays()
             .into_iter()
-            .map(|s| {
-                s.parse::<SocketAddr>()
-                    .map_err(|e| anyhow::anyhow!("Invalid relay address '{s}': {e}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(str::to_string)
+            .collect();
         if relay_addrs.is_empty() {
             anyhow::bail!("at least one relay address required for relay mode");
         }
@@ -557,7 +557,7 @@ async fn run_relay_tunnel(
         // relay_addrs[0] and triggers a failback when its RTT is within the
         // configured gate relative to the active connection.
         let probe_handle = if has_backup && idx_local != 0 {
-            let probe_relay = params.relay_addrs[0];
+            let probe_relay = params.relay_addrs[0].clone();
             let probe_gate_ms = params.failback_rtt_gate_ms;
             let probe_active_idx = Arc::clone(&active_idx);
             let probe_conn = conn.clone();
@@ -669,7 +669,7 @@ async fn run_relay_tunnel(
 async fn run_failback_probe(
     tunnel_id: Uuid,
     tunnel_id_str: String,
-    primary_relay: SocketAddr,
+    primary_relay: String,
     rtt_gate_ms: u32,
     active_conn: quinn::Connection,
     active_idx: Arc<AtomicUsize>,
@@ -690,7 +690,7 @@ async fn run_failback_probe(
             return;
         }
 
-        let probe_result = relay_client::measure_relay_rtt(primary_relay, parent_cancel.clone()).await;
+        let probe_result = relay_client::measure_relay_rtt(&primary_relay, parent_cancel.clone()).await;
         let primary_rtt = match probe_result {
             Ok(rtt) => rtt,
             Err(e) => {
@@ -720,7 +720,7 @@ async fn run_failback_probe(
                 format!("Tunnel failing back to primary relay {primary_relay}"),
                 &tunnel_id_str,
                 serde_json::json!({
-                    "primary_relay_addr": primary_relay.to_string(),
+                    "primary_relay_addr": &primary_relay,
                     "primary_rtt_ms": primary_rtt.as_millis(),
                     "active_rtt_ms": active_rtt.as_millis(),
                     "gate_ms": rtt_gate_ms,
