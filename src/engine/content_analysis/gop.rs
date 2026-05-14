@@ -118,21 +118,32 @@ impl GopTracker {
         // buffer at scan-end is safe.
         let bytes = std::mem::take(&mut self.pes_peek);
         let mut i = 0;
+        // Outer condition needs `i + 4 <= bytes.len()` so we can read up to
+        // bytes[i+3] for the 4-byte start-code prefix check. Reading the
+        // NAL header byte after a match requires one more byte — bytes[i+3]
+        // for the 3-byte start code, bytes[i+4] for the 4-byte one — and
+        // both are guarded explicitly below so the trailing start-code-at-
+        // end-of-buffer case (which crashed on MPTS H.264 sources where a
+        // PES peek slice happened to terminate exactly on a start code)
+        // doesn't panic.
         while i + 4 <= bytes.len() {
             // Start code: 0x000001 (3 bytes) or 0x00000001 (4 bytes)
             let is_sc3 = bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 1;
-            let is_sc4 = i + 4 <= bytes.len()
-                && bytes[i] == 0
+            let is_sc4 = bytes[i] == 0
                 && bytes[i + 1] == 0
                 && bytes[i + 2] == 0
                 && bytes[i + 3] == 1;
             if is_sc4 {
+                if i + 5 > bytes.len() {
+                    break;  // start code at end of buffer; next NAL byte not yet in peek
+                }
                 let nal = bytes[i + 4];
                 self.classify_nal(nal);
                 i += 5;
                 continue;
             }
             if is_sc3 {
+                // Outer loop already guarantees i + 4 <= len, so bytes[i+3] is safe.
                 let nal = bytes[i + 3];
                 self.classify_nal(nal);
                 i += 4;

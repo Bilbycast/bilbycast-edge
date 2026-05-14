@@ -285,6 +285,13 @@ fn try_enable_so_txtime(socket: &UdpSocket, clockid: i32) -> bool {
 /// inter-PCR rate; no declared/configured rate parameter.
 #[derive(Default)]
 struct TargetState {
+    /// PID of the first PCR-bearing packet observed. Locks subsequent PCR
+    /// extraction to this single PID — critical for MPTS streams where
+    /// every program has its own independent 27 MHz clock and naive
+    /// "first PCR in datagram" returns values from unrelated clocks. See
+    /// `engine::ts_parse::first_pcr_in_ts_buffer_pid` for the rationale.
+    /// `None` until the first PCR is seen on this stream.
+    anchor_pid: Option<u16>,
     /// Most recent PCR sample (27 MHz ticks). `None` until first PCR.
     pcr_anchor: Option<u64>,
     /// Wallclock instant at which the most recent anchor datagram emits
@@ -538,10 +545,26 @@ fn run_emitter(
         };
 
         let now_ns = monotonic_now_ns();
-        let pcr_27mhz = match anchor {
-            AnchorSource::Pcr => crate::engine::ts_parse::first_pcr_in_ts_buffer(&dg.bytes),
+        let pcr_with_pid = match anchor {
+            AnchorSource::Pcr => crate::engine::ts_parse::first_pcr_in_ts_buffer_pid(
+                &dg.bytes,
+                state.anchor_pid,
+            ),
             AnchorSource::St2110Raster => None,
         };
+        // Lock onto the first PCR-bearing PID we ever see. From this point
+        // on, the ts_parse helper filters to this PID — PCRs from other
+        // programs in an MPTS are ignored (each program has its own 27 MHz
+        // clock; mixing them produces wild apparent discontinuities that
+        // collapse the closed-loop pacer). One PID anchored, every other
+        // datagram looks like "between PCRs" → emit ASAP. PCR_AC for the
+        // anchored program tracks the same as an SPTS would.
+        if let Some((_, pid)) = pcr_with_pid {
+            if state.anchor_pid.is_none() {
+                state.anchor_pid = Some(pid);
+            }
+        }
+        let pcr_27mhz = pcr_with_pid.map(|(pcr, _)| pcr);
 
         let target_ns = match anchor {
             AnchorSource::Pcr => state.derive_target(now_ns, pcr_27mhz, dg.bytes.len()),

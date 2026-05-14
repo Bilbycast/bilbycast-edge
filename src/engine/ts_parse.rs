@@ -101,12 +101,36 @@ pub fn set_discontinuity_indicator(pkt: &mut [u8]) -> bool {
 /// first; cheap because every caller already distinguishes raw-TS vs
 /// RTP-wrapped paths via `RtpPacket.is_raw_ts`.
 pub fn first_pcr_in_ts_buffer(data: &[u8]) -> Option<u64> {
+    first_pcr_in_ts_buffer_pid(data, None).map(|(pcr, _)| pcr)
+}
+
+/// Scan a raw TS buffer for the first PCR-bearing packet whose PID matches
+/// `filter_pid` (or any PID when `filter_pid` is `None`). Returns
+/// `Some((pcr_27mhz, pid))` on the first match.
+///
+/// **Why the PID filter matters.** In an MPTS, every program has its own
+/// PCR PID and its own 27 MHz clock — there's no shared timebase across
+/// programs. A naive PCR scan would report PCRs from whichever program
+/// happens to carry one in the current datagram, producing a sequence of
+/// values from independent clocks. Anything that derives wire-pacing
+/// targets from this sequence (e.g. `engine::wire_emit::TargetState`) then
+/// sees apparent "discontinuities" or random advances at every cross-
+/// program transition, even when each individual program is internally
+/// continuous. The fix is to lock onto a single PID's PCR cadence — the
+/// caller passes the PID it observed first as `filter_pid` on subsequent
+/// calls. Returns `None` if no packet in the buffer matches the filter
+/// (the caller treats this as "between PCRs"), which is exactly the
+/// right behaviour for between-program datagrams in an MPTS multiplex.
+pub fn first_pcr_in_ts_buffer_pid(data: &[u8], filter_pid: Option<u16>) -> Option<(u64, u16)> {
     let mut i = 0;
     while i + TS_PACKET_SIZE <= data.len() {
         let pkt = &data[i..i + TS_PACKET_SIZE];
         if pkt[0] == TS_SYNC_BYTE {
             if let Some(pcr) = extract_pcr(pkt) {
-                return Some(pcr);
+                let pid = ts_pid(pkt);
+                if filter_pid.is_none_or(|f| f == pid) {
+                    return Some((pcr, pid));
+                }
             }
         }
         i += TS_PACKET_SIZE;
