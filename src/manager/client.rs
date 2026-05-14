@@ -989,6 +989,17 @@ fn edge_capabilities() -> Vec<&'static str> {
         // Pick Tracks + Advanced editor on this capability so older
         // edges hide the source type.
         "pid_bus_switch_slot",
+        // PES Switch redesign Phase 3: the elementary-stream bus is
+        // node-wide (Phase 1) and accepts cross-flow assembly slot
+        // references (Phase 2.1+); foreign-input Essence slots resolve
+        // against the owning flow's PSI catalogue (Phase 2.2b). Manager
+        // UI gates the Node Bus matrix view + the bus_route switcher
+        // preset action + the master-clock badge in the input picker
+        // on this capability — older edges keep the per-flow assembly
+        // editor only, with no matrix surface. Future Phase 4 (PES-
+        // aligned splice across non-identical sources) advertises a
+        // separate `pes_splice` capability.
+        "node_bus",
         // Remote binary upgrade: edge accepts `upgrade_binary` WS
         // commands and stages a Sigstore-verified release tarball,
         // atomically swaps the `current` symlink, then drains and exits
