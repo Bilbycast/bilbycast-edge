@@ -393,8 +393,9 @@ async fn run_assembler(
 ) {
     use crate::engine::pes_splice::{
         AacAudioParams, AudioSpliceState, FromPacketAction, SpliceOutcome,
-        DEFAULT_AUDIO_SPLICE_BUDGET_MS, extract_aac_params_from_pes,
-        is_supported_audio_stream_type,
+        VideoSpliceState, DEFAULT_AUDIO_SPLICE_BUDGET_MS,
+        DEFAULT_VIDEO_SPLICE_BUDGET_MS, extract_aac_params_from_pes,
+        is_supported_audio_stream_type, is_supported_video_stream_type,
     };
     use std::time::Duration;
     // PES Switch Phase 4 — per-switch-slot splice state, keyed by
@@ -414,6 +415,15 @@ async fn run_assembler(
     // arm time. Only populated for AAC ADTS (stream_type 0x0F) slots;
     // every other audio codec leaves this `None`.
     let mut last_a_aac_params: std::collections::HashMap<(usize, u16), AacAudioParams> =
+        std::collections::HashMap::new();
+    // PES Switch Phase 4 (edge 0.66.0) — per-switch-slot video splice
+    // state, keyed by `(program_idx, out_pid)`. Disjoint from
+    // `splice_state` by construction: each slot's `stream_type` is
+    // either an audio codec (audio state map) or a supported video
+    // codec (this map), never both. SPS/PPS/VPS codec-param sentinel
+    // is a Session B follow-up — for now the video state machine
+    // commits on any IDR PES past threshold.
+    let mut video_splice_state: std::collections::HashMap<(usize, u16), VideoSpliceState> =
         std::collections::HashMap::new();
     // Fan-in: one task per flat slot drains the bus broadcast receiver
     // and forwards into a single mpsc. Channel capacity is deliberately
@@ -598,16 +608,18 @@ async fn run_assembler(
 
                                 // Decide splice path. PesAligned needs:
                                 //  (1) splice_mode == PesAligned,
-                                //  (2) slot is a known audio codec,
+                                //  (2) slot is a known audio OR video codec,
                                 //  (3) we've seen at least one PUSI=1 PTS
                                 //      on the active leg (otherwise we
                                 //      have no threshold to align B to).
                                 use crate::config::models::SpliceMode;
-                                let want_pes_aligned = matches!(
-                                    slot.splice_mode,
-                                    SpliceMode::PesAligned
-                                ) && is_supported_audio_stream_type(slot.stream_type);
-                                if want_pes_aligned {
+                                let pes_aligned =
+                                    matches!(slot.splice_mode, SpliceMode::PesAligned);
+                                let want_audio = pes_aligned
+                                    && is_supported_audio_stream_type(slot.stream_type);
+                                let want_video = pes_aligned
+                                    && is_supported_video_stream_type(slot.stream_type);
+                                if want_audio {
                                     if let Some(&last_pts) = last_a_pts.get(&key) {
                                         let budget_ms = slot
                                             .splice_budget_ms
@@ -648,6 +660,34 @@ async fn run_assembler(
                                     // through to PmtBump silently
                                     // (first switch on a freshly-armed
                                     // flow).
+                                } else if want_video {
+                                    if let Some(&last_pts) = last_a_pts.get(&key) {
+                                        let budget_ms = slot
+                                            .splice_budget_ms
+                                            .unwrap_or(DEFAULT_VIDEO_SPLICE_BUDGET_MS);
+                                        let state = video_splice_state
+                                            .entry(key)
+                                            .or_insert_with(VideoSpliceState::new);
+                                        if state.arm(
+                                            new_input_id.clone(),
+                                            slot.stream_type,
+                                            last_pts,
+                                            std::time::Instant::now(),
+                                            Duration::from_millis(budget_ms.into()),
+                                        ) {
+                                            // Splice armed — defer the
+                                            // flip. The fanin handler
+                                            // commits on B's first
+                                            // IDR PES at/past
+                                            // threshold, or flush_tick
+                                            // falls back to PmtBump
+                                            // on budget exhaustion.
+                                            continue;
+                                        }
+                                        // arm() returned false → fall through.
+                                    }
+                                    // No prior PTS observed → fall
+                                    // through to PmtBump silently.
                                 }
 
                                 // PmtBump path (today's behaviour).
@@ -715,17 +755,28 @@ async fn run_assembler(
                         .map(|active| active == &slot.source.0)
                         .unwrap_or(true); // missing entry = treat as active (no switch_legs yet)
 
-                    // Pull the splice state out into a local for clean
-                    // borrow handling. We re-write back if we change it.
-                    let splice_pending = splice_state
+                    // Two disjoint splice state maps — audio + video.
+                    // A slot's `stream_type` chooses at most one; both
+                    // cannot be pending simultaneously for the same
+                    // `(program_idx, out_pid)`. The boolean OR below
+                    // drives the "are we mid-splice?" gate; the two
+                    // observe_a / observe_b call sites dispatch on
+                    // which state machine is actually pending.
+                    let audio_splice_pending = splice_state
+                        .get(&key)
+                        .map(|s| s.is_pending())
+                        .unwrap_or(false);
+                    let video_splice_pending = video_splice_state
                         .get(&key)
                         .map(|s| s.is_pending())
                         .unwrap_or(false);
 
                     if is_active {
                         // Track active-leg PUSI=1 PTSes so the next
-                        // splice has a valid `last_a_pts` threshold.
-                        // For AAC ADTS slots also snapshot the
+                        // splice has a valid `last_a_pts` threshold —
+                        // shared by both audio and video state
+                        // machines because both arm off the same map.
+                        // For AAC ADTS slots additionally snapshot the
                         // AudioSpecificConfig so the codec sentinel
                         // has a baseline to compare against B with.
                         if crate::engine::ts_parse::ts_pusi(&es.payload) {
@@ -742,12 +793,13 @@ async fn run_assembler(
                                 }
                             }
                         }
-                        if splice_pending {
-                            // Pending splice: keep A's params snapshot
-                            // fresh inside the state machine (matters
-                            // when A produces another PUSI between arm
-                            // and AU-completion). Then decide forward
-                            // vs drop based on AU completion state.
+                        if audio_splice_pending {
+                            // Pending audio splice: keep A's AAC params
+                            // snapshot fresh inside the state machine
+                            // (matters when A produces another PUSI
+                            // between arm and AU-completion). Then
+                            // decide forward vs drop based on AU
+                            // completion state.
                             if slot.stream_type == 0x0F
                                 && crate::engine::ts_parse::ts_pusi(&es.payload)
                             {
@@ -762,12 +814,115 @@ async fn run_assembler(
                             if matches!(action, FromPacketAction::Drop) {
                                 continue;
                             }
+                        } else if video_splice_pending {
+                            // Pending video splice — no codec-param
+                            // sentinel today (Session B follow-up).
+                            // Drop A bytes once A's next PUSI=1 fires
+                            // so the receiver gets a clean AU boundary
+                            // on A's last fully-emitted PES.
+                            let action = video_splice_state
+                                .get_mut(&key)
+                                .map(|s| s.observe_a_packet(&es.payload))
+                                .unwrap_or(FromPacketAction::Forward);
+                            if matches!(action, FromPacketAction::Drop) {
+                                continue;
+                            }
                         }
                         // Active + (no splice OR splice still forwarding A)
                         // → fall through to rewrite + emit.
-                    } else if splice_pending {
-                        // Non-active leg with a pending splice. Is
-                        // this leg the splice's to-leg?
+                    } else if video_splice_pending {
+                        // Non-active leg with a pending VIDEO splice.
+                        // Is this leg the splice's to-leg?
+                        let is_splice_to = video_splice_state
+                            .get(&key)
+                            .and_then(|s| s.pending_to_input_id())
+                            .map(|to| to == slot.source.0.as_str())
+                            .unwrap_or(false);
+                        if !is_splice_to {
+                            continue; // some other leg, drop as today
+                        }
+                        // To-leg packet during pending video splice.
+                        // observe_b_packet returns Committed only when
+                        // PUSI=1 AND pts ≥ threshold AND the PES
+                        // carries an IDR NAL. Non-IDR keyframe-less
+                        // PES → None → drop; the next IDR PES from B
+                        // will commit (or the budget will expire and
+                        // flush_tick falls back to PmtBump).
+                        let outcome = video_splice_state
+                            .get_mut(&key)
+                            .and_then(|s| s.observe_b_packet(&es.payload));
+                        match outcome {
+                            Some(SpliceOutcome::Committed { first_b_pts }) => {
+                                // Atomic flip: active_leg → to_input_id,
+                                // PMT v+1 mod 32, DI=1 on next PCR.
+                                active_leg_input
+                                    .insert(key, slot.source.0.clone());
+                                if let Some(v) = pmt_versions.get_mut(key.0) {
+                                    *v = v.wrapping_add(1) & 0x1F;
+                                }
+                                pending_di_for_out_pid.insert(slot.out_pid, true);
+                                push_psi(
+                                    &mut buf,
+                                    &plan,
+                                    &pcr_out_pid_by_program,
+                                    pat_version,
+                                    &pmt_versions,
+                                    &mut pat_cc,
+                                    &mut pmt_cc,
+                                    &broadcast_tx,
+                                    &mut bundle_seq,
+                                );
+                                if let Some(es_) = &event_sender {
+                                    es_.emit_flow_with_details(
+                                        crate::manager::events::EventSeverity::Info,
+                                        crate::manager::events::category::FLOW,
+                                        format!(
+                                            "Flow '{flow_id}': PES-aligned video splice committed on \
+                                             program {} out_pid 0x{:04X} → '{}' (IDR @ first_b_pts={first_b_pts})",
+                                            plan.programs[key.0].program_number,
+                                            key.1,
+                                            slot.source.0,
+                                        ),
+                                        &flow_id,
+                                        serde_json::json!({
+                                            "error_code": "pes_splice_completed",
+                                            "kind": "video",
+                                            "program_number": plan.programs[key.0].program_number,
+                                            "out_pid": key.1,
+                                            "to_input_id": slot.source.0,
+                                            "first_b_pts": first_b_pts,
+                                        }),
+                                    );
+                                }
+                                // Seed last_a_pts with B's first PTS so the
+                                // next splice arm has a clean threshold.
+                                last_a_pts.insert(key, first_b_pts);
+                                // Fall through to rewrite + emit this
+                                // packet — it's now the first byte of
+                                // the new active leg and starts on an
+                                // IDR so the receiver decodes cleanly.
+                            }
+                            Some(SpliceOutcome::CodecParamMismatch { .. }) => {
+                                // Video state machine doesn't produce
+                                // CodecParamMismatch today (Session B
+                                // adds SPS/PPS/VPS sentinel). Unreachable
+                                // but no-op rather than panic on the
+                                // data path.
+                                continue;
+                            }
+                            Some(SpliceOutcome::Timeout { .. }) => {
+                                // observe_b_packet never returns Timeout —
+                                // that path is owned by check_timeout in
+                                // flush_tick. Unreachable but safe.
+                                continue;
+                            }
+                            None => {
+                                continue; // not aligned yet (mid-PES, sub-threshold, or non-IDR), drop
+                            }
+                        }
+                    } else if audio_splice_pending {
+                        // Non-active leg with a pending AUDIO splice.
+                        // Is this leg the splice's to-leg?
                         let is_splice_to = splice_state
                             .get(&key)
                             .and_then(|s| s.pending_to_input_id())
@@ -985,17 +1140,29 @@ async fn run_assembler(
                 // budget. Collected-and-applied in two passes so we
                 // don't mutate the splice_state map while iterating.
                 let now = std::time::Instant::now();
-                let mut timeouts: Vec<((usize, u16), String)> = Vec::new();
+                // (key, to_input_id, kind) tuples. `kind` is folded
+                // into the emitted event so the manager UI can tell
+                // audio splice timeouts apart from video splice
+                // timeouts (different operator action — video timeouts
+                // usually mean the encoder's GoP exceeds the budget).
+                let mut timeouts: Vec<((usize, u16), String, &'static str)> = Vec::new();
                 for (key, state) in splice_state.iter_mut() {
                     if let Some(SpliceOutcome::Timeout { to_input_id }) =
                         state.check_timeout(now)
                     {
-                        timeouts.push((*key, to_input_id));
+                        timeouts.push((*key, to_input_id, "audio"));
+                    }
+                }
+                for (key, state) in video_splice_state.iter_mut() {
+                    if let Some(SpliceOutcome::Timeout { to_input_id }) =
+                        state.check_timeout(now)
+                    {
+                        timeouts.push((*key, to_input_id, "video"));
                     }
                 }
                 if !timeouts.is_empty() {
                     let mut any_flipped = false;
-                    for (key, to_input_id) in &timeouts {
+                    for (key, to_input_id, kind) in &timeouts {
                         let (pidx, out_pid) = *key;
                         active_leg_input.insert(*key, to_input_id.clone());
                         if let Some(v) = pmt_versions.get_mut(pidx) {
@@ -1008,7 +1175,7 @@ async fn run_assembler(
                                 crate::manager::events::EventSeverity::Warning,
                                 crate::manager::events::category::FLOW,
                                 format!(
-                                    "Flow '{flow_id}': PES-aligned splice timed out on program \
+                                    "Flow '{flow_id}': PES-aligned {kind} splice timed out on program \
                                      {} out_pid 0x{:04X} → '{to_input_id}'; falling back to PMT-bump",
                                     plan.programs[pidx].program_number,
                                     out_pid,
@@ -1016,6 +1183,7 @@ async fn run_assembler(
                                 &flow_id,
                                 serde_json::json!({
                                     "error_code": "pes_splice_timeout",
+                                    "kind": kind,
                                     "program_number": plan.programs[pidx].program_number,
                                     "out_pid": out_pid,
                                     "to_input_id": to_input_id,

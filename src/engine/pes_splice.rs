@@ -26,6 +26,18 @@
 //! commit on PTS alone (the sentinel falls through). See
 //! [`AacAudioParams`] + [`parse_aac_adts_params`].
 //!
+//! Video splice MVP (edge 0.66.0): [`VideoSpliceState`] is the sibling
+//! state machine for H.264 (stream_type `0x1B`) and HEVC (`0x24`) slots.
+//! The arm path follows the same shape as audio. The boundary detector
+//! is IDR-aware: B's first PUSI=1 PES at PTS ≥ threshold must additionally
+//! carry an IDR NAL — H.264 `nal_unit_type == 5`, HEVC `nal_unit_type` in
+//! 16..=21 (IRAP family: BLA / IDR / CRA). Without an IDR the receiver
+//! cannot decode the post-splice bitstream and would freeze on the next
+//! anchor frame, so a non-IDR PES from B is held the same as a PES below
+//! the PTS threshold. SPS/PPS/VPS codec-param sentinel is a Session B
+//! follow-up; today's behaviour: commit on the first IDR PES past
+//! threshold regardless of parameter set, fail-safe on missing data.
+//!
 //! The state machine is **pure** — it doesn't own a clock or a channel;
 //! the caller (`ts_assembler`) drives transitions via `now` / per-packet
 //! `observe_b_packet`. Keeps the hot path free of any sleeps.
@@ -484,6 +496,310 @@ pub enum SpliceOutcome {
         a_params: AacAudioParams,
         b_params: AacAudioParams,
     },
+}
+
+// ── Video splice — IDR-aware boundary detector + state machine ───────────
+
+/// Default splice budget for video in milliseconds. Sized to cover one
+/// typical broadcast GoP (closed GoP of 0.5–2 s on every common codec
+/// profile) plus a small encoder buffer. Operators can override via
+/// `splice_budget_ms`; the validator still bounds the value to
+/// [`SPLICE_BUDGET_MS_RANGE`].
+pub const DEFAULT_VIDEO_SPLICE_BUDGET_MS: u32 = 2000;
+
+/// Conservative one-frame interval in 90 kHz PTS ticks used by the video
+/// splice machine to derive `threshold_pts = last_a_pts + this`. 3600
+/// ticks (= 40 ms) is exactly one frame at 25 fps and a *little* longer
+/// than a frame at 29.97 / 50 / 59.94 / 60 fps — so for the high-rate
+/// cases the state machine waits one extra frame in the worst case, the
+/// same fail-safe over-estimate the audio path uses (see
+/// [`audio_frame_duration_90k`]). 24-fps content (3750 ticks/frame) is
+/// the *one* case where 3600 under-estimates one frame; in practice 24p
+/// is only used in cinema-on-air contribution where the GoP is still
+/// closed at 12–24 frames and the IDR PTS easily clears the threshold.
+pub const VIDEO_FRAME_DURATION_90K: u64 = 3600;
+
+/// `true` iff the slot's MPEG-TS `stream_type` is one of the video
+/// codecs the splice state machine knows how to align. H.264 (`0x1B`)
+/// and HEVC (`0x24`) are supported; MPEG-2 video (`0x02`) is *not* —
+/// receiver-side GoP recovery is uglier and a real splice would
+/// re-acquire anyway, so today's [`SpliceMode::PmtBump`] fallback is
+/// the right call for legacy content.
+///
+/// [`SpliceMode::PmtBump`]: crate::config::models::SpliceMode::PmtBump
+pub fn is_supported_video_stream_type(stream_type: u8) -> bool {
+    matches!(stream_type, 0x1B | 0x24)
+}
+
+/// `true` iff the raw NAL header byte is the start of an IDR-equivalent
+/// AU for `stream_type`.
+///
+/// - H.264 (`0x1B`): NAL header is `forbidden_zero(1) | nal_ref_idc(2) |
+///   nal_unit_type(5)`. IDR = `nal_unit_type == 5`.
+/// - HEVC (`0x24`): NAL header byte 0 is `forbidden_zero(1) |
+///   nal_unit_type(6) | layer_id[5](1)`. IRAP family = `nal_unit_type
+///   ∈ {16..=21}` (BLA_W_LP, BLA_W_RADL, BLA_N_LP, IDR_W_RADL, IDR_N_LP,
+///   CRA_NUT). All of these are valid splice points for a receiver.
+/// - Other stream types return `false` — caller already gates the
+///   walker on [`is_supported_video_stream_type`].
+fn nal_is_idr(nal: u8, stream_type: u8) -> bool {
+    match stream_type {
+        0x1B => (nal & 0x1F) == 5,
+        0x24 => {
+            let nut = (nal >> 1) & 0x3F;
+            (16..=21).contains(&nut)
+        }
+        _ => false,
+    }
+}
+
+/// Walk the PES payload inside a TS packet looking for an Annex-B
+/// start code followed by an IDR NAL header. Returns `true` on the
+/// first hit.
+///
+/// `stream_type` is the slot's MPEG-TS stream type — `0x1B` (H.264) or
+/// `0x24` (HEVC). Other values short-circuit to `false`. The walker
+/// recognises both 3-byte (`00 00 01`) and 4-byte (`00 00 00 01`) start
+/// codes, mirroring [`crate::engine::content_analysis::gop`]'s NAL
+/// detector. Allocation-free, bounded by the TS packet size (~ 180 B
+/// of PES payload after the header) so it's safe to run on the
+/// per-packet hot path of an armed video splice.
+///
+/// Caller responsibilities:
+/// - Pre-filter on PUSI=1 (the start of a PES is where IDR NALs live).
+///   Mid-PES packets won't carry the slice header in their first bytes
+///   and would mis-fire — the splice state machine gates on
+///   [`crate::engine::ts_parse::ts_pusi`] before reaching this helper.
+/// - Gate on [`is_supported_video_stream_type`] — non-video PES is
+///   never IDR-bearing.
+///
+/// Edge case: the typical NAL order for an H.264 IDR PES is AUD →
+/// (SPS) → (PPS) → SEI → slice (NAL type 5). On most encoders this all
+/// fits in the first TS packet of the PES (~170 B usable after the PES
+/// header). If an encoder pushes the IDR slice past the first TS packet
+/// (rare, only with very large SEI), this helper misses; the splice
+/// then waits for the next IDR PES, which is exactly the safe
+/// behaviour — `pes_splice_timeout` fires after the budget if no IDR
+/// arrives.
+pub fn pes_contains_idr(pkt: &[u8], stream_type: u8) -> bool {
+    if !is_supported_video_stream_type(stream_type) {
+        return false;
+    }
+    let Some(es_start) = pes_payload_offset(pkt) else {
+        return false;
+    };
+    let bytes = &pkt[es_start..];
+    let mut i = 0usize;
+    while i + 4 <= bytes.len() {
+        let is_sc3 = bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 1;
+        let is_sc4 = bytes[i] == 0
+            && bytes[i + 1] == 0
+            && bytes[i + 2] == 0
+            && bytes[i + 3] == 1;
+        if is_sc4 {
+            if i + 5 > bytes.len() {
+                break;
+            }
+            if nal_is_idr(bytes[i + 4], stream_type) {
+                return true;
+            }
+            i += 5;
+            continue;
+        }
+        if is_sc3 {
+            if nal_is_idr(bytes[i + 3], stream_type) {
+                return true;
+            }
+            i += 4;
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// State of a single switch slot's PES-aligned video splice.
+///
+/// Sibling to [`AudioSpliceState`] — same shape, same lifecycle, same
+/// commit semantics on `pts ≥ threshold_pts`. The one difference is
+/// that B's first PUSI=1 PES past the threshold must *additionally*
+/// carry an IDR NAL ([`pes_contains_idr`]); a non-IDR PES is held the
+/// same as a PES below threshold. Without this, a downstream decoder
+/// would receive bytes that depend on AUs it never decoded (the
+/// preceding GoP from A), and freeze on the next anchor frame
+/// regardless of PMT-version bumps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VideoSpliceState {
+    /// No splice in flight; the slot follows today's behaviour.
+    Idle,
+    /// Splice armed — outbound is held until either:
+    /// (a) the to-leg produces a PUSI=1 PES with `pts ≥ threshold_pts`
+    ///     and an IDR NAL in the same packet, or
+    /// (b) `Instant::now() ≥ deadline` (caller falls back to PmtBump).
+    Pending {
+        /// Input id of the to-leg the operator is switching to.
+        to_input_id: String,
+        /// Last PTS observed on the from-leg before `arm` was called.
+        last_a_pts: u64,
+        /// `last_a_pts + VIDEO_FRAME_DURATION_90K` (mod 2^33). The
+        /// first accepted PES must have `pts ≥ threshold_pts`.
+        threshold_pts: u64,
+        /// Wallclock budget — `Instant::now() + splice_budget`. On
+        /// expiry the assembler falls back to PmtBump and emits
+        /// `pes_splice_timeout`.
+        deadline: Instant,
+        /// `true` once we've observed A's *next* PUSI=1 after arming.
+        /// That's the marker that A's current AU (whose PTS the
+        /// threshold is built off) has finished emitting and we
+        /// should stop forwarding A's bytes — otherwise we'd emit a
+        /// fragment of A's next AU into the receiver's pipeline and
+        /// trigger a decoder error.
+        a_au_completed: bool,
+        /// MPEG-TS stream_type of the slot (`0x1B` or `0x24`). Used by
+        /// [`pes_contains_idr`] to pick the per-codec IDR rule.
+        stream_type: u8,
+    },
+}
+
+impl VideoSpliceState {
+    /// Construct an Idle state.
+    pub fn new() -> Self {
+        VideoSpliceState::Idle
+    }
+
+    /// Arm the splice. Returns `false` and stays `Idle` when the slot's
+    /// `stream_type` isn't one of the supported video codecs — caller
+    /// falls back to PmtBump silently.
+    pub fn arm(
+        &mut self,
+        to_input_id: String,
+        stream_type: u8,
+        last_a_pts: u64,
+        now: Instant,
+        budget: Duration,
+    ) -> bool {
+        if !is_supported_video_stream_type(stream_type) {
+            return false;
+        }
+        let threshold_pts =
+            last_a_pts.wrapping_add(VIDEO_FRAME_DURATION_90K) & 0x1_FFFF_FFFF;
+        *self = VideoSpliceState::Pending {
+            to_input_id,
+            last_a_pts,
+            threshold_pts,
+            deadline: now + budget,
+            a_au_completed: false,
+            stream_type,
+        };
+        true
+    }
+
+    /// Decide whether to forward or drop a packet from the **from-leg**
+    /// during a pending splice. Identical semantics to
+    /// [`AudioSpliceState::observe_a_packet`]: forwards until A's first
+    /// PUSI=1 after `arm` flips `a_au_completed`; thereafter returns
+    /// [`FromPacketAction::Drop`]. Outside of `Pending` always returns
+    /// `Forward` so the assembler can call unconditionally.
+    pub fn observe_a_packet(&mut self, pkt: &[u8]) -> FromPacketAction {
+        let VideoSpliceState::Pending { a_au_completed, .. } = self else {
+            return FromPacketAction::Forward;
+        };
+        if *a_au_completed {
+            return FromPacketAction::Drop;
+        }
+        if ts_pusi(pkt) {
+            // A's next AU is starting — the AU whose PTS we captured at
+            // arm-time is finished emitting. Drop this PES-start byte
+            // (it's the next AU we won't emit) and stop forwarding A
+            // entirely.
+            *a_au_completed = true;
+            return FromPacketAction::Drop;
+        }
+        FromPacketAction::Forward
+    }
+
+    /// Process one fan-in packet from the **to-leg**. Returns
+    /// `Some(SpliceOutcome::Committed)` when the packet is a PUSI=1
+    /// PES with PTS ≥ threshold *and* an IDR NAL in its payload —
+    /// that's the commit signal. Returns `None` when the packet is
+    /// mid-PES, below-threshold, or non-IDR (the next IDR PES will
+    /// commit; budget exhaustion is the fallback).
+    pub fn observe_b_packet(&mut self, pkt: &[u8]) -> Option<SpliceOutcome> {
+        let VideoSpliceState::Pending {
+            threshold_pts,
+            stream_type,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if !ts_pusi(pkt) {
+            return None;
+        }
+        let pts = extract_pes_pts(pkt)?;
+        let threshold = *threshold_pts;
+        // 33-bit PTS comparison with wrap tolerance: anything within
+        // 2^31 ticks (≈ 6.6 h) ahead of `threshold_pts` counts as
+        // "≥ threshold". A "behind" PTS is the wrap-back case → wait.
+        let ahead = pts.wrapping_sub(threshold) & 0x1_FFFF_FFFF;
+        if ahead > 1 << 31 {
+            return None;
+        }
+        // PTS at/past threshold — now require an IDR NAL in the same
+        // packet. Non-IDR PES (P/B frames) cannot be a splice point
+        // for the receiver. The check runs only here, not per-packet
+        // on the from-leg, so the per-packet hot-path cost is unchanged
+        // when the splice is *not* armed.
+        let st = *stream_type;
+        if !pes_contains_idr(pkt, st) {
+            return None;
+        }
+        let outcome = SpliceOutcome::Committed { first_b_pts: pts };
+        *self = VideoSpliceState::Idle;
+        Some(outcome)
+    }
+
+    /// Check whether the splice budget has expired. Returns
+    /// `Some(SpliceOutcome::Timeout { to_input_id })` exactly once on
+    /// the first call past the deadline; transitions back to Idle
+    /// afterwards. The caller falls back to PmtBump on the to-leg.
+    pub fn check_timeout(&mut self, now: Instant) -> Option<SpliceOutcome> {
+        let VideoSpliceState::Pending {
+            deadline,
+            to_input_id,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if now >= *deadline {
+            let to = std::mem::take(to_input_id);
+            *self = VideoSpliceState::Idle;
+            Some(SpliceOutcome::Timeout { to_input_id: to })
+        } else {
+            None
+        }
+    }
+
+    /// `true` iff the splice is currently armed.
+    pub fn is_pending(&self) -> bool {
+        matches!(self, VideoSpliceState::Pending { .. })
+    }
+
+    /// Returns the to-leg's input_id when armed.
+    pub fn pending_to_input_id(&self) -> Option<&str> {
+        if let VideoSpliceState::Pending { to_input_id, .. } = self {
+            Some(to_input_id)
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for VideoSpliceState {
+    fn default() -> Self {
+        VideoSpliceState::Idle
+    }
 }
 
 #[cfg(test)]
@@ -1004,5 +1320,382 @@ mod tests {
             s.observe_b_packet(&b_pkt),
             Some(SpliceOutcome::Committed { .. })
         ));
+    }
+
+    // ── Video splice — IDR-aware boundary detector + state machine ──
+
+    /// Build a PUSI=1 TS packet carrying a video PES (stream_id `0xE0`)
+    /// with PTS-only header followed by a NAL stream. `nals` is a list
+    /// of `(start_code_size, nal_header_byte)` describing Annex-B
+    /// boundaries to lay into the packet. Returns the synthesised TS
+    /// packet padded to 188 B with zeros.
+    fn pkt_with_video_pes(pts: u64, pusi: bool, nals: &[(u8, u8)]) -> [u8; 188] {
+        let mut p = [0u8; 188];
+        p[0] = 0x47;
+        p[1] = if pusi { 0x40 } else { 0x00 };
+        p[2] = 0x11; // PID lo (0x11 — arbitrary video PID, different from audio fixture)
+        p[3] = 0x10; // afc=0b01 payload-only, CC=0
+        // PES header at byte 4: start code + stream_id 0xE0 (video).
+        p[4] = 0x00;
+        p[5] = 0x00;
+        p[6] = 0x01;
+        p[7] = 0xE0;
+        p[8] = 0; // PES_packet_length hi
+        p[9] = 0; // PES_packet_length lo
+        p[10] = 0x80;
+        p[11] = 0x80; // flags2 → PTS only
+        p[12] = 5; // PES_header_data_length
+        let m: u64 = pts & 0x1_FFFF_FFFF;
+        p[13] = 0x20 | (((m >> 30) as u8) & 0x07) << 1 | 1;
+        p[14] = ((m >> 22) as u8) & 0xFF;
+        p[15] = ((((m >> 15) as u8) & 0x7F) << 1) | 1;
+        p[16] = ((m >> 7) as u8) & 0xFF;
+        p[17] = (((m as u8) & 0x7F) << 1) | 1;
+        // Append NALs starting at byte 18.
+        let mut cursor = 18usize;
+        for &(sc_size, nal) in nals {
+            if cursor >= p.len() {
+                break;
+            }
+            if sc_size == 3 {
+                if cursor + 4 > p.len() {
+                    break;
+                }
+                p[cursor] = 0x00;
+                p[cursor + 1] = 0x00;
+                p[cursor + 2] = 0x01;
+                p[cursor + 3] = nal;
+                cursor += 4;
+            } else {
+                if cursor + 5 > p.len() {
+                    break;
+                }
+                p[cursor] = 0x00;
+                p[cursor + 1] = 0x00;
+                p[cursor + 2] = 0x00;
+                p[cursor + 3] = 0x01;
+                p[cursor + 4] = nal;
+                cursor += 5;
+            }
+        }
+        p
+    }
+
+    /// H.264 NAL header byte for `nal_unit_type` (low 5 bits).
+    fn avc_nal(nut: u8) -> u8 {
+        // forbidden_zero(1) = 0, nal_ref_idc(2) = 11 (highest), nal_unit_type(5)
+        0x60 | (nut & 0x1F)
+    }
+
+    /// HEVC NAL header byte 0 for `nal_unit_type` (6 bits packed into bits 1..6).
+    fn hevc_nal(nut: u8) -> u8 {
+        // forbidden_zero(1)=0, nal_unit_type(6), top bit of layer_id(1)=0
+        (nut & 0x3F) << 1
+    }
+
+    #[test]
+    fn video_supported_stream_types() {
+        assert!(is_supported_video_stream_type(0x1B));
+        assert!(is_supported_video_stream_type(0x24));
+        assert!(!is_supported_video_stream_type(0x02)); // MPEG-2 video — out of scope today
+        assert!(!is_supported_video_stream_type(0x0F)); // AAC — audio
+    }
+
+    #[test]
+    fn pes_contains_idr_avc_type_5() {
+        // AUD (type 9) → SEI (type 6) → IDR slice (type 5). Mixed 3-/4-byte SCs.
+        let nals = [
+            (4, avc_nal(9)),
+            (3, avc_nal(6)),
+            (3, avc_nal(5)),
+        ];
+        let pkt = pkt_with_video_pes(1_000_000, true, &nals);
+        assert!(pes_contains_idr(&pkt, 0x1B));
+    }
+
+    #[test]
+    fn pes_contains_idr_avc_no_idr() {
+        // P-slice only — NAL type 1.
+        let nals = [
+            (4, avc_nal(9)),
+            (3, avc_nal(1)),
+        ];
+        let pkt = pkt_with_video_pes(1_000_000, true, &nals);
+        assert!(!pes_contains_idr(&pkt, 0x1B));
+    }
+
+    #[test]
+    fn pes_contains_idr_hevc_irap_family() {
+        // IDR_W_RADL = 19, IDR_N_LP = 20, CRA_NUT = 21 — every value in
+        // 16..=21 must qualify as an IRAP RAP.
+        for nut in 16u8..=21 {
+            let nals = [(3, hevc_nal(nut))];
+            let pkt = pkt_with_video_pes(1_000_000, true, &nals);
+            assert!(
+                pes_contains_idr(&pkt, 0x24),
+                "HEVC NUT {nut} should be IDR-equivalent"
+            );
+        }
+        // Trailing P/B slice (TRAIL_N = 0) is not a RAP.
+        let nals = [(3, hevc_nal(0))];
+        let pkt = pkt_with_video_pes(1_000_000, true, &nals);
+        assert!(!pes_contains_idr(&pkt, 0x24));
+    }
+
+    #[test]
+    fn pes_contains_idr_rejects_non_video_stream_types() {
+        // Even if the bytes look like an IDR start code, the helper
+        // short-circuits on stream_type — the AUDIO splice path uses
+        // its own AAC sentinel, not this walker.
+        let nals = [(4, avc_nal(5))];
+        let pkt = pkt_with_video_pes(1_000_000, true, &nals);
+        assert!(!pes_contains_idr(&pkt, 0x0F));
+        assert!(!pes_contains_idr(&pkt, 0x02));
+    }
+
+    #[test]
+    fn pes_contains_idr_handles_missing_pes_header() {
+        // No PES start code → pes_payload_offset returns None →
+        // walker returns false rather than scanning AF bytes.
+        let mut p = [0u8; 188];
+        p[0] = 0x47;
+        p[1] = 0x40;
+        p[2] = 0x11;
+        p[3] = 0x10;
+        // Garbage payload — no 0x000001 start code.
+        for byte in &mut p[4..] {
+            *byte = 0xAA;
+        }
+        assert!(!pes_contains_idr(&p, 0x1B));
+    }
+
+    #[test]
+    fn video_arm_rejects_non_video_stream_type() {
+        let mut s = VideoSpliceState::new();
+        let now = Instant::now();
+        // AAC stream type — not a video codec; arm must refuse.
+        assert!(!s.arm(
+            "to".into(),
+            0x0F,
+            1_000_000,
+            now,
+            Duration::from_millis(DEFAULT_VIDEO_SPLICE_BUDGET_MS.into()),
+        ));
+        assert_eq!(s, VideoSpliceState::Idle);
+    }
+
+    #[test]
+    fn video_commit_on_first_idr_pes_at_threshold() {
+        let mut s = VideoSpliceState::new();
+        let now = Instant::now();
+        // last_a = 90_000, threshold = 93_600 (+ VIDEO_FRAME_DURATION_90K).
+        assert!(s.arm(
+            "to".into(),
+            0x1B,
+            90_000,
+            now,
+            Duration::from_millis(2000),
+        ));
+        // B's first PUSI=1 PES at exactly threshold, carrying IDR.
+        let nals = [(4, avc_nal(9)), (3, avc_nal(5))];
+        let pkt = pkt_with_video_pes(93_600, true, &nals);
+        match s.observe_b_packet(&pkt) {
+            Some(SpliceOutcome::Committed { first_b_pts }) => {
+                assert_eq!(first_b_pts, 93_600);
+            }
+            other => panic!("expected Committed, got {other:?}"),
+        }
+        assert_eq!(s, VideoSpliceState::Idle);
+    }
+
+    #[test]
+    fn video_skips_non_idr_pes_past_threshold() {
+        // B's first PUSI=1 PES is past the threshold but is a P-slice.
+        // The state machine must keep waiting — committing on a
+        // non-RAP would freeze the receiver's decoder on the next
+        // anchor frame.
+        let mut s = VideoSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to".into(),
+            0x1B,
+            90_000,
+            now,
+            Duration::from_millis(2000),
+        ));
+        let p_slice = pkt_with_video_pes(99_000, true, &[(4, avc_nal(1))]);
+        assert!(s.observe_b_packet(&p_slice).is_none());
+        assert!(s.is_pending());
+        // Next PES carries IDR → commits.
+        let idr = pkt_with_video_pes(99_500, true, &[(4, avc_nal(5))]);
+        assert!(matches!(
+            s.observe_b_packet(&idr),
+            Some(SpliceOutcome::Committed { first_b_pts: 99_500 })
+        ));
+    }
+
+    #[test]
+    fn video_skips_idr_below_threshold() {
+        // B's first IDR PES is below threshold (B's encoder is behind
+        // A's wallclock) — wait, even though the PES would otherwise
+        // qualify as a clean RAP.
+        let mut s = VideoSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to".into(),
+            0x1B,
+            90_000,
+            now,
+            Duration::from_millis(2000),
+        ));
+        let early = pkt_with_video_pes(90_000, true, &[(4, avc_nal(5))]);
+        assert!(s.observe_b_packet(&early).is_none());
+        assert!(s.is_pending());
+    }
+
+    #[test]
+    fn video_skips_non_pusi() {
+        let mut s = VideoSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to".into(),
+            0x1B,
+            90_000,
+            now,
+            Duration::from_millis(2000),
+        ));
+        let mid_pes = pkt_with_video_pes(99_999, /* pusi */ false, &[(4, avc_nal(5))]);
+        assert!(s.observe_b_packet(&mid_pes).is_none());
+        assert!(s.is_pending());
+    }
+
+    #[test]
+    fn video_hevc_commits_on_idr_w_radl() {
+        let mut s = VideoSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to".into(),
+            0x24,
+            90_000,
+            now,
+            Duration::from_millis(2000),
+        ));
+        // HEVC IDR_W_RADL = 19.
+        let idr = pkt_with_video_pes(93_600, true, &[(3, hevc_nal(19))]);
+        assert!(matches!(
+            s.observe_b_packet(&idr),
+            Some(SpliceOutcome::Committed { first_b_pts: 93_600 })
+        ));
+    }
+
+    #[test]
+    fn video_timeout_emits_once() {
+        let mut s = VideoSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to-leg".into(),
+            0x1B,
+            90_000,
+            now,
+            Duration::from_millis(10),
+        ));
+        let later = now + Duration::from_millis(11);
+        match s.check_timeout(later) {
+            Some(SpliceOutcome::Timeout { to_input_id }) => {
+                assert_eq!(to_input_id, "to-leg");
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+        assert!(s.check_timeout(later + Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn video_no_timeout_before_deadline() {
+        let mut s = VideoSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to".into(),
+            0x1B,
+            90_000,
+            now,
+            Duration::from_millis(2000),
+        ));
+        assert!(s.check_timeout(now + Duration::from_millis(500)).is_none());
+        assert!(s.is_pending());
+    }
+
+    #[test]
+    fn video_pts_wrap_around_threshold_commits() {
+        // last_a near the top of the 33-bit space; threshold wraps
+        // past 2^33. A B PES with a small PTS counts as wrapped-ahead.
+        let mut s = VideoSpliceState::new();
+        let now = Instant::now();
+        let near_top: u64 = (1u64 << 33) - 1000;
+        assert!(s.arm(
+            "to".into(),
+            0x1B,
+            near_top,
+            now,
+            Duration::from_millis(2000),
+        ));
+        // Threshold wraps to ~2600 (= 3600 - 1000). PTS = 3000 is past.
+        let pkt = pkt_with_video_pes(3000, true, &[(4, avc_nal(5))]);
+        assert!(matches!(
+            s.observe_b_packet(&pkt),
+            Some(SpliceOutcome::Committed { .. })
+        ));
+    }
+
+    #[test]
+    fn video_observe_does_nothing_when_idle() {
+        let mut s = VideoSpliceState::new();
+        let pkt = pkt_with_video_pes(1_000_000, true, &[(4, avc_nal(5))]);
+        assert!(s.observe_b_packet(&pkt).is_none());
+        assert!(s.check_timeout(Instant::now()).is_none());
+        assert_eq!(s.observe_a_packet(&pkt), FromPacketAction::Forward);
+    }
+
+    #[test]
+    fn video_from_leg_forwarded_then_dropped_at_next_pusi() {
+        let mut s = VideoSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to".into(),
+            0x1B,
+            90_000,
+            now,
+            Duration::from_millis(2000),
+        ));
+        // Continuation packet from A — forward (PUSI=0).
+        let cont = pkt_with_video_pes(0, false, &[]);
+        assert_eq!(s.observe_a_packet(&cont), FromPacketAction::Forward);
+        // A's next PUSI=1 marks A's current AU's end. Packet dropped.
+        let next_au = pkt_with_video_pes(93_600, true, &[(4, avc_nal(1))]);
+        assert_eq!(s.observe_a_packet(&next_au), FromPacketAction::Drop);
+        // Subsequent packets stay dropped.
+        assert_eq!(s.observe_a_packet(&cont), FromPacketAction::Drop);
+        assert!(s.is_pending());
+    }
+
+    #[test]
+    fn video_commit_resets_to_idle() {
+        let mut s = VideoSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to".into(),
+            0x1B,
+            90_000,
+            now,
+            Duration::from_millis(2000),
+        ));
+        let idr = pkt_with_video_pes(93_600, true, &[(4, avc_nal(5))]);
+        assert!(matches!(
+            s.observe_b_packet(&idr),
+            Some(SpliceOutcome::Committed { .. })
+        ));
+        // observe_a_packet returning Forward when Idle is the safe
+        // default for the new active leg (B is now A for next splice).
+        let later = pkt_with_video_pes(100_000, true, &[(4, avc_nal(1))]);
+        assert_eq!(s.observe_a_packet(&later), FromPacketAction::Forward);
     }
 }
