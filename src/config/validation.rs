@@ -2883,10 +2883,13 @@ where
             splice_budget_ms,
         } => {
             if let Some(ms) = splice_budget_ms {
-                if !(20..=5000).contains(ms) {
+                if !crate::engine::pes_splice::SPLICE_BUDGET_MS_RANGE.contains(ms) {
+                    let range = &crate::engine::pes_splice::SPLICE_BUDGET_MS_RANGE;
                     bail!(
-                        "{context}: switch splice_budget_ms must be in 20..=5000 (got {ms}) \
-                         (pid_bus_switch_splice_budget_out_of_range)"
+                        "{context}: switch splice_budget_ms must be in {}..={} (got {ms}) \
+                         (pid_bus_switch_splice_budget_out_of_range)",
+                        range.start(),
+                        range.end()
                     );
                 }
             }

@@ -72,6 +72,24 @@ commentary-processed feed). Three modes: `fixed` (constant ms delay),
 `target_ms` (target end-to-end latency, self-adjusting), `target_frames`
 (target latency in video frames using auto-detected frame rate).
 
+**PES Switch (node-wide ES bus + access-unit-aligned splice):** the
+PID bus is **node-wide** — any flow's assembly can pull elementary
+streams from inputs owned by sibling flows on the same edge, with a
+master-clock-identity preflight that refuses cross-PTP-domain /
+cross-PCR-PLL combinations before the WS round-trip. One edge becomes
+a full distribution matrix — fan one input's program out to N flows
+without dropping any other flow. `SlotSource::Switch` slots accept
+`splice_mode = "pes_aligned"` (default `pmt_bump`): audio splices wait
+for the next PUSI=1 PES with monotonically-past PTS, video splices
+additionally require an H.264 / HEVC IDR. AAC ADTS, AAC LATM, H.264
+SPS, and HEVC SPS sentinels refuse the splice on codec-parameter
+mismatch and fall back to PmtBump with a structured Warning event.
+Per-switch `splice_mode_override` on `ActivateInput` (REST or WS)
+overrides each slot's config-time mode for a single Take. Manager-side
+authoring is the [Node Bus Matrix](https://docs.bilbycast.com/manager/node-bus/) —
+a three-pane crosspoint UI with click-to-wire + drag-and-drop and
+salvo export to a Switcher preset.
+
 ## Quick Start
 
 ### Option 1: Standalone (no monitoring)

@@ -731,18 +731,6 @@ pub enum VideoCodec {
     Hevc,
 }
 
-impl VideoCodec {
-    /// Map from MPEG-TS stream_type to codec; returns `None` for any
-    /// stream_type the sentinel doesn't speak.
-    pub fn from_stream_type(stream_type: u8) -> Option<Self> {
-        match stream_type {
-            0x1B => Some(VideoCodec::Avc),
-            0x24 => Some(VideoCodec::Hevc),
-            _ => None,
-        }
-    }
-}
-
 /// SPS-derived codec parameters compared by the video splice sentinel.
 ///
 /// The fields chosen are exactly the ones a hardware video decoder
