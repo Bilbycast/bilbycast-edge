@@ -1933,6 +1933,9 @@ impl ThumbnailAccumulator {
 /// one is switched live. Incremented from the shared per-input forwarder
 /// in `engine::flow::spawn_input_forwarder` on every packet that arrives
 /// on the input's dedicated broadcast channel — active or passive.
+///
+/// Registered via
+/// [`FlowStatsAccumulator::register_input_counters_with_psi_catalog`].
 pub struct PerInputCounters {
     pub input_type: String,
     pub bytes: AtomicU64,
@@ -1959,13 +1962,34 @@ pub struct PerInputCounters {
 
 impl PerInputCounters {
     pub fn new(input_type: String, meta: InputConfigMeta) -> Self {
+        Self::with_psi_catalog(
+            input_type,
+            meta,
+            Arc::new(crate::engine::ts_psi_catalog::PsiCatalogStore::new()),
+        )
+    }
+
+    /// Build a [`PerInputCounters`] backed by an externally-supplied
+    /// catalogue store. Used by `FlowRuntime::start` so the per-input
+    /// PSI catalogue lives on the node-wide [`crate::engine::manager::FlowManager`]
+    /// publisher entry — and is therefore reachable by sibling flows'
+    /// Essence-slot resolvers via
+    /// [`crate::engine::manager::FlowManager::psi_catalog_for_input`]
+    /// (PES Switch Phase 2.2b). The owning flow's PSI observer task
+    /// still writes to the same `Arc`; both the snapshot path and any
+    /// foreign resolver read identical contents.
+    pub fn with_psi_catalog(
+        input_type: String,
+        meta: InputConfigMeta,
+        psi_catalog: Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>,
+    ) -> Self {
         Self {
             input_type,
             bytes: AtomicU64::new(0),
             packets: AtomicU64::new(0),
             throughput: ThroughputEstimator::new(),
             meta,
-            psi_catalog: Arc::new(crate::engine::ts_psi_catalog::PsiCatalogStore::new()),
+            psi_catalog,
             psi_catalog_cache: std::sync::Mutex::new((0, None)),
         }
     }
@@ -2140,9 +2164,10 @@ pub struct FlowStatsAccumulator {
     pub per_input_thumbnails: DashMap<String, Arc<ThumbnailAccumulator>>,
     /// Per-input byte/packet/throughput counters. One entry per input in the
     /// flow, keyed by input ID. Populated at flow start by
-    /// `register_input_counters` and incremented by the shared per-input
-    /// forwarder — so every input's liveness (bitrate, packets_received) is
-    /// tracked regardless of whether the input is currently switched active.
+    /// `register_input_counters_with_psi_catalog` and incremented by the
+    /// shared per-input forwarder — so every input's liveness (bitrate,
+    /// packets_received) is tracked regardless of whether the input is
+    /// currently switched active.
     /// The snapshot path reads this into `FlowStats.inputs_live` so the
     /// manager UI can render a NO SIGNAL / feed-present state per input.
     pub per_input_counters: DashMap<String, Arc<PerInputCounters>>,
@@ -2617,13 +2642,24 @@ impl FlowStatsAccumulator {
     /// reference. Called once per input at flow start so the per-input
     /// forwarder can increment bytes/packets for every packet flowing on that
     /// input's dedicated broadcast channel, regardless of active/passive.
-    pub fn register_input_counters(
+    /// Register per-input liveness counters for a flow. The PSI
+    /// catalogue store is supplied by the caller — the owning flow
+    /// passes the same `Arc` it just got from
+    /// [`crate::engine::manager::FlowManager::register_input_publisher`]
+    /// so the catalogue is reachable cross-flow for foreign Essence
+    /// resolvers (PES Switch Phase 2.2b).
+    pub fn register_input_counters_with_psi_catalog(
         &self,
         input_id: &str,
         input_type: &str,
         meta: InputConfigMeta,
+        psi_catalog: Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>,
     ) -> Arc<PerInputCounters> {
-        let c = Arc::new(PerInputCounters::new(input_type.to_string(), meta));
+        let c = Arc::new(PerInputCounters::with_psi_catalog(
+            input_type.to_string(),
+            meta,
+            psi_catalog,
+        ));
         self.per_input_counters.insert(input_id.to_string(), c.clone());
         c
     }

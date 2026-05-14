@@ -551,7 +551,17 @@ impl FlowRuntime {
             // — the FlowManager just holds a clone for cross-flow
             // consumers. The local subscribers (forwarder, demuxer)
             // keep using the same `Sender` so no path doubles up.
-            flow_manager.register_input_publisher(&input_id, per_input_tx.clone());
+            //
+            // PES Switch Phase 2.2b: register also returns the per-
+            // input PSI catalogue store. We pass the same `Arc` to
+            // `register_input_counters_with_psi_catalog` (so the
+            // snapshot path keeps reading from the catalogue the
+            // observer task writes to) AND keep it node-reachable via
+            // `FlowManager::psi_catalog_for_input`. Foreign-flow
+            // Essence resolvers can now look up this catalogue
+            // without going through `flow_stats.per_input_counters`.
+            let psi_catalog =
+                flow_manager.register_input_publisher(&input_id, per_input_tx.clone());
             registered_input_ids.push(input_id.clone());
             let force_idr = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -562,10 +572,11 @@ impl FlowRuntime {
             // here is what the snapshot path lifts into `PerInputLive` so
             // the manager topology view can draw upstream links for every
             // input of an assembled flow — not only the single active one.
-            let per_input_counters = flow_stats.register_input_counters(
+            let per_input_counters = flow_stats.register_input_counters_with_psi_catalog(
                 &input_id,
                 input_type_str(&input_def.config),
                 build_input_config_meta(&input_def.config),
+                Arc::clone(&psi_catalog),
             );
 
             let (input_handle, this_whip_info) = spawn_single_input(
@@ -842,6 +853,7 @@ impl FlowRuntime {
                         &event_sender,
                         &config.config.id,
                         &input_clocks,
+                        &flow_manager,
                     )
                     .await?,
                 ),
@@ -1364,15 +1376,30 @@ impl FlowRuntime {
 
         // Essence resolution against the flow's live PSI catalogues.
         // 3-second window matches start-up.
+        // PES Switch Phase 2.2b: foreign-input refs (cross-flow
+        // assembly slots) fall through to the node-wide FlowManager
+        // catalogue registry — same lookup pattern as
+        // `finalize_spts_assembler`.
         if !build.pending_essence.is_empty() {
+            let flow_manager = self.flow_manager_weak.upgrade();
             let mut catalogues: std::collections::HashMap<
                 String,
                 Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>,
             > = std::collections::HashMap::new();
             for p in &build.pending_essence {
                 if !catalogues.contains_key(&p.input_id) {
-                    if let Some(c) = self.stats.per_input_counters.get(&p.input_id) {
-                        catalogues.insert(p.input_id.clone(), c.psi_catalog.clone());
+                    let store = self
+                        .stats
+                        .per_input_counters
+                        .get(&p.input_id)
+                        .map(|c| c.psi_catalog.clone())
+                        .or_else(|| {
+                            flow_manager
+                                .as_ref()
+                                .and_then(|fm| fm.psi_catalog_for_input(&p.input_id))
+                        });
+                    if let Some(c) = store {
+                        catalogues.insert(p.input_id.clone(), c);
                     }
                 }
             }
@@ -3202,6 +3229,7 @@ async fn finalize_spts_assembler(
     event_sender: &EventSender,
     flow_id: &str,
     input_clocks: &HashMap<String, crate::engine::master_clock::ClockIdentity>,
+    flow_manager: &Arc<crate::engine::manager::FlowManager>,
 ) -> Result<crate::engine::ts_assembler::AssemblerHandle> {
     // 1. Essence resolution.
     if !build.pending_essence.is_empty() {
@@ -3211,8 +3239,19 @@ async fn finalize_spts_assembler(
         > = std::collections::HashMap::new();
         for p in &build.pending_essence {
             if !catalogues.contains_key(&p.input_id) {
-                if let Some(c) = flow_stats.per_input_counters.get(&p.input_id) {
-                    catalogues.insert(p.input_id.clone(), c.psi_catalog.clone());
+                // Own-flow inputs reach the catalogue via the per-flow
+                // counters map (cheap, no FlowManager hop). Foreign-flow
+                // inputs (cross-flow assembly references — PES Switch
+                // Phase 2.1c+) fall through to the node-wide
+                // `FlowManager` registry, which holds the same `Arc`
+                // the owning flow's PSI observer writes to (Phase 2.2b).
+                let store = flow_stats
+                    .per_input_counters
+                    .get(&p.input_id)
+                    .map(|c| c.psi_catalog.clone())
+                    .or_else(|| flow_manager.psi_catalog_for_input(&p.input_id));
+                if let Some(c) = store {
+                    catalogues.insert(p.input_id.clone(), c);
                 }
             }
         }

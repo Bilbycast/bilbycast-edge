@@ -15,6 +15,7 @@ use super::flow::FlowRuntime;
 use super::packet::RtpPacket;
 use super::resource_monitor::SystemResourceState;
 use super::ts_es_bus::NodeEsBus;
+use super::ts_psi_catalog::PsiCatalogStore;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -106,6 +107,15 @@ pub struct NodeInputPublisher {
     /// fresh `broadcast::Receiver`. Cloned freely; the underlying
     /// channel is bounded so a slow consumer drops, never blocks.
     pub sender: broadcast::Sender<RtpPacket>,
+    /// Per-input PSI (PAT/PMT) catalogue store. Created here so the
+    /// catalogue can be reached node-wide via [`FlowManager::psi_catalog_for_input`]
+    /// for cross-flow Essence-slot resolution (PES Switch Phase 2.2b).
+    /// The owning flow's PSI observer task writes to this store; both
+    /// the owning flow's [`crate::stats::collector::PerInputCounters`]
+    /// and any foreign flow's assembler resolver hold an `Arc` clone
+    /// and read the same snapshot. Non-TS inputs spawn no observer
+    /// (gated on `InputConfig::is_ts_carrier`); the store stays empty.
+    pub psi_catalog: Arc<PsiCatalogStore>,
 }
 
 /// One node-wide refcounted `TsEsDemuxer` task. The owning
@@ -209,19 +219,45 @@ impl FlowManager {
     /// start running on this node. Called by `FlowRuntime::start` once
     /// it has created the input's per-input broadcast channel; gives
     /// node-wide consumers (cross-flow assembly slots, the shared
-    /// `TsEsDemuxer` registry) a way to attach without re-creating
-    /// the channel.
+    /// `TsEsDemuxer` registry, foreign-flow Essence resolvers) a way
+    /// to attach without re-creating the channel.
     ///
-    /// Idempotent: re-registering an `input_id` replaces the previous
-    /// publisher entry. Cross-flow consumers are unaffected because
-    /// their `broadcast::Receiver` is bound to the previous sender,
-    /// which will close as the previous owner stops.
+    /// Returns the per-input [`PsiCatalogStore`] so the caller can pass
+    /// the same `Arc` to its `PerInputCounters` (so the per-flow
+    /// snapshot path keeps using the catalogue) and to its PSI observer
+    /// task. Reusing an existing entry's catalogue lets the input
+    /// publisher be re-registered without losing PSI history; in
+    /// today's single-owner reality this path is taken only after a
+    /// flow restart on the same input.
+    ///
+    /// Idempotent on the publisher slot: re-registering an `input_id`
+    /// replaces the previous broadcast `Sender` so cross-flow
+    /// consumers attaching afterwards see the new owner's bytes.
     #[allow(dead_code)]
-    pub fn register_input_publisher(&self, input_id: &str, sender: broadcast::Sender<RtpPacket>) {
-        self.input_publishers.insert(
-            input_id.to_string(),
-            Arc::new(NodeInputPublisher { sender }),
-        );
+    pub fn register_input_publisher(
+        &self,
+        input_id: &str,
+        sender: broadcast::Sender<RtpPacket>,
+    ) -> Arc<PsiCatalogStore> {
+        // `entry` keeps it atomic against concurrent register calls for
+        // the same input id (e.g. a flow stop+restart racing).
+        let entry = self
+            .input_publishers
+            .entry(input_id.to_string())
+            .and_modify(|existing| {
+                let psi = Arc::clone(&existing.psi_catalog);
+                *existing = Arc::new(NodeInputPublisher {
+                    sender: sender.clone(),
+                    psi_catalog: psi,
+                });
+            })
+            .or_insert_with(|| {
+                Arc::new(NodeInputPublisher {
+                    sender: sender.clone(),
+                    psi_catalog: Arc::new(PsiCatalogStore::new()),
+                })
+            });
+        Arc::clone(&entry.value().psi_catalog)
     }
 
     /// Unregister an input's publisher when the owning flow stops.
@@ -238,6 +274,20 @@ impl FlowManager {
     #[allow(dead_code)]
     pub fn subscribe_input(&self, input_id: &str) -> Option<broadcast::Receiver<RtpPacket>> {
         self.input_publishers.get(input_id).map(|e| e.value().sender.subscribe())
+    }
+
+    /// Look up the per-input PSI catalogue for cross-flow Essence-slot
+    /// resolution (PES Switch Phase 2.2b). Returns the same `Arc` the
+    /// owning flow holds via its `PerInputCounters`. Returns `None`
+    /// when the input isn't running on this node — caller treats that
+    /// as the same "no catalogue" state as a TS-bearing input that
+    /// hasn't yet emitted a PAT/PMT (resolver bails with
+    /// `pid_bus_essence_no_catalogue`).
+    #[allow(dead_code)]
+    pub fn psi_catalog_for_input(&self, input_id: &str) -> Option<Arc<PsiCatalogStore>> {
+        self.input_publishers
+            .get(input_id)
+            .map(|e| Arc::clone(&e.value().psi_catalog))
     }
 
     /// Acquire a refcounted handle to the node-wide `TsEsDemuxer` for
@@ -1019,5 +1069,61 @@ mod tests {
             panic!("spawn_fn must not be called when no publisher exists");
         });
         assert!(result.is_none());
+    }
+
+    /// PES Switch Phase 2.2b: registering an input publisher returns a
+    /// catalogue Arc the owning flow can pass through to its
+    /// `PerInputCounters`. The same catalogue is reachable
+    /// node-wide via `psi_catalog_for_input` so foreign-flow Essence
+    /// resolvers can read it.
+    #[tokio::test]
+    async fn psi_catalog_shared_via_register_input_publisher() {
+        let fm = make_fm();
+        let (tx, _rx_drop) = broadcast::channel::<RtpPacket>(8);
+        let cat_owner = fm.register_input_publisher("in-a", tx);
+        // Foreign-side lookup returns the SAME Arc.
+        let cat_foreign = fm.psi_catalog_for_input("in-a").expect("registered");
+        assert!(
+            Arc::ptr_eq(&cat_owner, &cat_foreign),
+            "owner + foreign lookup must share the same PsiCatalogStore Arc"
+        );
+        // Unknown input id returns None.
+        assert!(fm.psi_catalog_for_input("ghost").is_none());
+    }
+
+    /// PES Switch Phase 2.2b: re-registering the same input id (e.g.
+    /// after a flow restart on the same input) preserves the catalogue
+    /// Arc so any foreign reader holding it continues to see updates
+    /// from the new publisher's observer task. The broadcast `Sender`
+    /// is replaced; the catalogue is not.
+    #[tokio::test]
+    async fn psi_catalog_preserved_across_re_register() {
+        let fm = make_fm();
+        let (tx1, _rx1_drop) = broadcast::channel::<RtpPacket>(8);
+        let cat1 = fm.register_input_publisher("in-a", tx1);
+        let (tx2, _rx2_drop) = broadcast::channel::<RtpPacket>(8);
+        let cat2 = fm.register_input_publisher("in-a", tx2);
+        assert!(
+            Arc::ptr_eq(&cat1, &cat2),
+            "re-registering an input id must keep the same PsiCatalogStore"
+        );
+    }
+
+    /// PES Switch Phase 2.2b: unregistering drops the catalogue entry
+    /// from the registry, so a subsequent lookup returns None and a
+    /// fresh registration creates a new store.
+    #[tokio::test]
+    async fn psi_catalog_dropped_on_unregister() {
+        let fm = make_fm();
+        let (tx1, _rx1_drop) = broadcast::channel::<RtpPacket>(8);
+        let cat1 = fm.register_input_publisher("in-a", tx1);
+        fm.unregister_input_publisher("in-a");
+        assert!(fm.psi_catalog_for_input("in-a").is_none());
+        let (tx2, _rx2_drop) = broadcast::channel::<RtpPacket>(8);
+        let cat2 = fm.register_input_publisher("in-a", tx2);
+        assert!(
+            !Arc::ptr_eq(&cat1, &cat2),
+            "fresh registration after unregister must allocate a new store"
+        );
     }
 }
