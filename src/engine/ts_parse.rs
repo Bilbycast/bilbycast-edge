@@ -138,6 +138,55 @@ pub fn first_pcr_in_ts_buffer_pid(data: &[u8], filter_pid: Option<u16>) -> Optio
     None
 }
 
+/// Extract a 33-bit PTS from a PUSI-marked TS packet that begins a PES
+/// payload. Returns `None` when the packet is not a PES, the
+/// `PTS_DTS_flags` bits don't indicate PTS present, or the packet is too
+/// short to carry the 5-byte PTS field.
+///
+/// Caller is responsible for ensuring `pkt.len() == 188` and PUSI=1 — the
+/// function does the minimal work to return a clean `None` for malformed
+/// packets so it can sit on the hot path.
+///
+/// Used by:
+/// - [`crate::engine::tr101290`] — TS-quality PTS continuity sampling.
+/// - [`crate::engine::pes_splice`] — PES Switch Phase 4 audio-aligned splice.
+pub fn extract_pes_pts(pkt: &[u8]) -> Option<u64> {
+    if pkt.len() < TS_PACKET_SIZE {
+        return None;
+    }
+    // adaptation_field_control: 0b01 = payload only, 0b10 = af only,
+    // 0b11 = af + payload, 0b00 = reserved.
+    let afc = (pkt[3] >> 4) & 0x03;
+    let payload_offset: usize = match afc {
+        0b01 => 4,
+        0b11 => {
+            let af_len = pkt.get(4).copied()? as usize;
+            5 + af_len
+        }
+        _ => return None,
+    };
+    if pkt.len() < payload_offset + 14 {
+        return None;
+    }
+    let payload = &pkt[payload_offset..];
+    // PES start code = 0x000001
+    if payload[0] != 0x00 || payload[1] != 0x00 || payload[2] != 0x01 {
+        return None;
+    }
+    let pts_dts_flags = (payload[7] >> 6) & 0x03;
+    // 0b10 = PTS only, 0b11 = PTS + DTS. Both have PTS at bytes 9-13.
+    if pts_dts_flags != 0b10 && pts_dts_flags != 0b11 {
+        return None;
+    }
+    let p = &payload[9..14];
+    let pts: u64 = (((p[0] >> 1) & 0x07) as u64) << 30
+        | (p[1] as u64) << 22
+        | (((p[2] >> 1) & 0x7F) as u64) << 15
+        | (p[3] as u64) << 7
+        | ((p[4] >> 1) as u64);
+    Some(pts)
+}
+
 /// Extract the 42-bit PCR base and 9-bit extension from the adaptation field,
 /// returning the full PCR value in 27 MHz ticks.
 pub fn extract_pcr(pkt: &[u8]) -> Option<u64> {

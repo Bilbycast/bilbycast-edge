@@ -2879,7 +2879,17 @@ where
         SlotSource::Switch {
             legs,
             initial_input_id,
+            splice_mode: _,
+            splice_budget_ms,
         } => {
+            if let Some(ms) = splice_budget_ms {
+                if !(20..=5000).contains(ms) {
+                    bail!(
+                        "{context}: switch splice_budget_ms must be in 20..=5000 (got {ms}) \
+                         (pid_bus_switch_splice_budget_out_of_range)"
+                    );
+                }
+            }
             if inside_hitless {
                 bail!(
                     "{context}: switch slot source cannot nest inside hitless \
@@ -6650,6 +6660,8 @@ mod tests {
                 SwitchLeg::Pid { input_id: "in-b".into(), source_pid: 0x100 },
             ],
             initial_input_id: "in-a".into(),
+            splice_mode: Default::default(),
+            splice_budget_ms: None,
         };
         validate_flow_assembly(&a, &["in-a".into(), "in-b".into()], "test")
             .expect("two Pid legs with valid initial must pass");
@@ -6665,6 +6677,8 @@ mod tests {
                 SwitchLeg::Pid { input_id: "in-b".into(), source_pid: 0x100 },
             ],
             initial_input_id: "in-c".into(),
+            splice_mode: Default::default(),
+            splice_budget_ms: None,
         };
         let err = validate_flow_assembly(&a, &["in-a".into(), "in-b".into()], "test")
             .expect_err("initial_input_id not in legs must be rejected");
@@ -6677,6 +6691,8 @@ mod tests {
         a.programs[0].streams[0].source = SlotSource::Switch {
             legs: vec![],
             initial_input_id: "in-a".into(),
+            splice_mode: Default::default(),
+            splice_budget_ms: None,
         };
         let err = validate_flow_assembly(&a, &["in-a".into()], "test")
             .expect_err("empty legs must be rejected");
@@ -6693,6 +6709,8 @@ mod tests {
                 SwitchLeg::Pid { input_id: "in-a".into(), source_pid: 0x100 },
             ],
             initial_input_id: "in-a".into(),
+            splice_mode: Default::default(),
+            splice_budget_ms: None,
         };
         let err = validate_flow_assembly(&a, &["in-a".into()], "test")
             .expect_err("duplicate (input_id, pid) leg must be rejected");
@@ -6709,6 +6727,8 @@ mod tests {
                 SwitchLeg::Essence { input_id: "in-b".into(), kind: EssenceKind::Audio },
             ],
             initial_input_id: "in-a".into(),
+            splice_mode: Default::default(),
+            splice_budget_ms: None,
         };
         let err = validate_flow_assembly(&a, &["in-a".into(), "in-b".into()], "test")
             .expect_err("mixed essence kinds must be rejected");
@@ -6729,6 +6749,8 @@ mod tests {
         a.programs[0].streams[0].source = SlotSource::Switch {
             legs,
             initial_input_id: "in-0".into(),
+            splice_mode: Default::default(),
+            splice_budget_ms: None,
         };
         let inputs: Vec<String> = (0..65).map(|i| format!("in-{i}")).collect();
         let err = validate_flow_assembly(&a, &inputs, "test")
@@ -6751,6 +6773,8 @@ mod tests {
                 SwitchLeg::Pid { input_id: "in-b".into(), source_pid: 0x100 },
             ],
             initial_input_id: "in-a".into(),
+            splice_mode: Default::default(),
+            splice_budget_ms: None,
         };
         a.pcr_source = Some(PcrSource {
             input_id: "in-b".into(),

@@ -114,6 +114,21 @@ pub struct AssemblySlot {
     /// without re-tuning. `None` for non-switch slots.
     #[allow(dead_code)] // read by build_assembly_plan / SwitchActiveInput handler
     pub switch_legs: Option<Vec<(String, u16)>>,
+    /// PES Switch Phase 4. For Switch slots, controls the splice
+    /// behaviour at `SwitchActiveInput` time:
+    /// - [`SpliceMode::PmtBump`] (default): today's PMT-version-bump
+    ///   + DI=1 path.
+    /// - [`SpliceMode::PesAligned`]: assembler buffers the slot's
+    ///   outbound bytes at the last PES boundary on the from-leg,
+    ///   then concatenates the to-leg's next PES with
+    ///   `PTS ≥ last_a_pts + audio_frame_duration`. Audio-only on
+    ///   first land; non-audio slots fall through to `PmtBump`
+    ///   silently. Ignored for non-switch slots.
+    pub splice_mode: crate::config::models::SpliceMode,
+    /// PES Switch Phase 4. Splice-budget override in ms for
+    /// `PesAligned` mode. `None` falls back to the default
+    /// (200 ms for audio). Ignored when `splice_mode = PmtBump`.
+    pub splice_budget_ms: Option<u32>,
 }
 
 /// Runtime commands the assembler accepts via its `mpsc` channel.
@@ -134,13 +149,36 @@ pub enum PlanCommand {
     /// `engine::manager::FlowManager::switch_active_input` when an
     /// `ActivateInput` arrives for a flow running in assembly mode.
     /// The assembler walks every switch slot whose leg list contains
-    /// `new_input_id`, atomically flips that slot's active-leg pointer,
-    /// bumps the owning program's PMT version (mod 32, monotonic), and
-    /// arms DI=1 on the next PCR for the slot's `out_pid`. Slots whose
-    /// leg list does not include `new_input_id` are left untouched —
-    /// per design, `ActivateInput` is silent for slots that don't
-    /// speak that source.
-    SwitchActiveInput { new_input_id: String },
+    /// `new_input_id` and, per slot's `splice_mode`:
+    ///
+    /// - [`SpliceMode::PmtBump`] (default): atomically flips that
+    ///   slot's active-leg pointer, bumps the owning program's PMT
+    ///   version (mod 32, monotonic), and arms DI=1 on the next PCR
+    ///   for the slot's `out_pid`.
+    /// - [`SpliceMode::PesAligned`]: arms the per-slot audio splice
+    ///   state machine ([`crate::engine::pes_splice::AudioSpliceState`])
+    ///   if the slot's `stream_type` is a supported audio codec. The
+    ///   active-leg flip is deferred until either B produces a PUSI=1
+    ///   PES with `pts ≥ last_a_pts + audio_frame_duration` (commit,
+    ///   emits `pes_splice_completed`) or the splice budget expires
+    ///   (fall back to PmtBump, emits `pes_splice_timeout`). Non-audio
+    ///   slots fall through to the PmtBump path silently — video
+    ///   splice is a separate Phase 4 follow-up.
+    ///
+    /// Slots whose leg list does not include `new_input_id` are left
+    /// untouched — per design, `ActivateInput` is silent for slots
+    /// that don't speak that source.
+    SwitchActiveInput {
+        new_input_id: String,
+        /// PES Switch Phase 4. `None` is treated as
+        /// [`SpliceMode::PmtBump`] for backward compatibility with
+        /// callers that haven't been updated. When `Some`, the
+        /// command overrides each slot's config-time `splice_mode`
+        /// for this one switch — useful for ad-hoc operator overrides
+        /// without reconfiguring the flow.
+        #[allow(dead_code)] // wired through SwitchActiveInput handler in a follow-up
+        splice_mode_override: Option<crate::config::models::SpliceMode>,
+    },
 }
 
 /// Structured description of an assembly plan whose slots in one
@@ -297,18 +335,25 @@ pub struct AssemblerHandle {
 /// publishes synthesised `RtpPacket` bundles onto it exactly where the
 /// input forwarder would in passthrough mode, so every existing output
 /// subscriber (UDP, tr101290, thumbnailer) works unchanged.
+// `event_sender` carries `pes_splice_completed` / `pes_splice_timeout`
+// to the manager (PES Switch Phase 4). Tests pass `None`; the production
+// site in `flow.rs::finalize_spts_assembler` wires the flow's real
+// `EventSender`. `flow_id` is stamped on every emitted event
+// (empty in tests).
 pub fn spawn_spts_assembler(
     plan: AssemblyPlan,
     bus: Arc<NodeEsBus>,
     broadcast_tx: broadcast::Sender<RtpPacket>,
     cancel: CancellationToken,
+    event_sender: Option<crate::manager::events::EventSender>,
+    flow_id: String,
 ) -> AssemblerHandle {
     // Channel depth 16: plan updates are rare (operator-triggered), so a
     // small bounded buffer is plenty and keeps back-pressure observable
     // if a pathological caller floods.
     let (plan_tx, plan_rx) = mpsc::channel::<PlanCommand>(16);
     let join = tokio::spawn(async move {
-        run_assembler(plan, bus, broadcast_tx, cancel, plan_rx).await;
+        run_assembler(plan, bus, broadcast_tx, cancel, plan_rx, event_sender, flow_id).await;
     });
     AssemblerHandle { join, plan_tx }
 }
@@ -338,7 +383,26 @@ async fn run_assembler(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     cancel: CancellationToken,
     mut plan_rx: mpsc::Receiver<PlanCommand>,
+    event_sender: Option<crate::manager::events::EventSender>,
+    flow_id: String,
 ) {
+    use crate::engine::pes_splice::{
+        AudioSpliceState, FromPacketAction, SpliceOutcome,
+        DEFAULT_AUDIO_SPLICE_BUDGET_MS, is_supported_audio_stream_type,
+    };
+    use std::time::Duration;
+    // PES Switch Phase 4 — per-switch-slot splice state, keyed by
+    // `(program_idx, out_pid)` to match the `active_leg_input` map.
+    // Default `Idle`; flipped to `Pending` on `SwitchActiveInput` with
+    // splice_mode = PesAligned, reset to `Idle` on commit or timeout.
+    let mut splice_state: std::collections::HashMap<(usize, u16), AudioSpliceState> =
+        std::collections::HashMap::new();
+    // Last PUSI=1 PTS observed on each (program_idx, out_pid) — needed
+    // to arm the splice machine at SwitchActiveInput time. Updated on
+    // every active-leg PUSI=1 packet; cheap (one HashMap insert per AU,
+    // hot path stays clean).
+    let mut last_a_pts: std::collections::HashMap<(usize, u16), u64> =
+        std::collections::HashMap::new();
     // Fan-in: one task per flat slot drains the bus broadcast receiver
     // and forwards into a single mpsc. Channel capacity is deliberately
     // small — if the assembler lags, broadcasts `Lagged` earlier and
@@ -483,17 +547,28 @@ async fn run_assembler(
                             &mut bundle_seq,
                         );
                     }
-                    PlanCommand::SwitchActiveInput { new_input_id } => {
+                    PlanCommand::SwitchActiveInput {
+                        new_input_id,
+                        splice_mode_override: _,
+                    } => {
                         // Walk every switch slot. If its leg list
-                        // contains `new_input_id`, flip the active-leg
-                        // pointer, bump that program's PMT version
-                        // (mod 32, monotonic — same discipline as
-                        // ReplacePlan, avoids A→B→A version-stamp
-                        // collisions), and arm DI=1 on the next PCR
-                        // for that slot's out_pid. Slots without a
-                        // matching leg are silently skipped — that's
-                        // the design: ActivateInput is silent for
-                        // slots that don't speak that source.
+                        // contains `new_input_id`, route by the slot's
+                        // config-time `splice_mode`:
+                        //
+                        // - PmtBump (default): immediate flip + PMT
+                        //   v+1 mod 32 + DI=1 on next PCR. Identical
+                        //   to pre-Phase-4 behaviour.
+                        // - PesAligned (audio only): arm the per-slot
+                        //   audio splice state machine. The active-leg
+                        //   flip is deferred until B aligns (commit in
+                        //   fanin handler) or budget expires (PmtBump
+                        //   fallback on flush_tick). Non-audio slots
+                        //   fall through to PmtBump silently — video
+                        //   splice is a Phase 4 follow-up.
+                        //
+                        // Slots without a matching leg are silently
+                        // skipped — `ActivateInput` is silent for slots
+                        // that don't speak that source by design.
                         let mut any_flipped = false;
                         for (pidx, prog) in plan.programs.iter().enumerate() {
                             for slot in &prog.slots {
@@ -508,6 +583,52 @@ async fn run_assembler(
                                 if prev.as_deref() == Some(new_input_id.as_str()) {
                                     continue; // already active
                                 }
+
+                                // Decide splice path. PesAligned needs:
+                                //  (1) splice_mode == PesAligned,
+                                //  (2) slot is a known audio codec,
+                                //  (3) we've seen at least one PUSI=1 PTS
+                                //      on the active leg (otherwise we
+                                //      have no threshold to align B to).
+                                use crate::config::models::SpliceMode;
+                                let want_pes_aligned = matches!(
+                                    slot.splice_mode,
+                                    SpliceMode::PesAligned
+                                ) && is_supported_audio_stream_type(slot.stream_type);
+                                if want_pes_aligned {
+                                    if let Some(&last_pts) = last_a_pts.get(&key) {
+                                        let budget_ms = slot
+                                            .splice_budget_ms
+                                            .unwrap_or(DEFAULT_AUDIO_SPLICE_BUDGET_MS);
+                                        let state = splice_state
+                                            .entry(key)
+                                            .or_insert_with(AudioSpliceState::new);
+                                        if state.arm(
+                                            new_input_id.clone(),
+                                            slot.stream_type,
+                                            last_pts,
+                                            std::time::Instant::now(),
+                                            Duration::from_millis(budget_ms.into()),
+                                        ) {
+                                            // Splice armed — defer the
+                                            // flip. The fanin handler
+                                            // commits on B's first
+                                            // aligned PES, or
+                                            // flush_tick falls back to
+                                            // PmtBump on timeout.
+                                            continue;
+                                        }
+                                        // arm() returned false →
+                                        // stream_type isn't supported.
+                                        // Fall through to PmtBump.
+                                    }
+                                    // No prior PTS observed → fall
+                                    // through to PmtBump silently
+                                    // (first switch on a freshly-armed
+                                    // flow).
+                                }
+
+                                // PmtBump path (today's behaviour).
                                 active_leg_input.insert(key, new_input_id.clone());
                                 if let Some(v) = pmt_versions.get_mut(pidx) {
                                     *v = v.wrapping_add(1) & 0x1F;
@@ -519,7 +640,9 @@ async fn run_assembler(
                         if any_flipped {
                             // Push fresh PSI so receivers see new PMT
                             // versions before the first post-switch ES
-                            // byte from the new active leg lands.
+                            // byte from the new active leg lands. For
+                            // PesAligned splices, PSI is pushed at
+                            // commit time inside the fanin handler.
                             push_psi(
                                 &mut buf,
                                 &plan,
@@ -540,21 +663,140 @@ async fn run_assembler(
                     Some(s) => s,
                     None => continue,
                 };
+                if es.payload.len() != TS_PACKET_SIZE {
+                    continue;
+                }
                 // Switch-slot leg gating: drop packets from non-active
                 // legs at the main-loop edge — cheap compare, no rewrite,
                 // no CC advance (CC stays monotonic on out_pid because
                 // only the active leg ever wraps cc_table[out_pid]).
+                //
+                // PES Switch Phase 4: when a splice is pending, the
+                // gating becomes splice-aware:
+                //  - from-leg packets pass through `observe_a_packet`
+                //    which forwards them until A's next PUSI=1 (AU
+                //    completion), then drops them so the receiver sees
+                //    a clean AU boundary on A's last fully-emitted PES.
+                //  - to-leg packets pass through `observe_b_packet`
+                //    which commits the splice on B's first PUSI=1 PES
+                //    with `pts ≥ threshold_pts`. On commit we
+                //    atomically flip active_leg_input, bump PMT,
+                //    arm DI=1, push PSI, emit `pes_splice_completed`,
+                //    and let this very packet be forwarded as the
+                //    first byte of the new active leg.
+                //  - other-leg packets (neither active nor splice-to)
+                //    drop as today.
                 if slot.is_switch_leg {
                     let key = (slot.program_idx, slot.out_pid);
-                    if let Some(active) = active_leg_input.get(&key) {
-                        if active != &slot.source.0 {
-                            continue;
+                    let is_active = active_leg_input
+                        .get(&key)
+                        .map(|active| active == &slot.source.0)
+                        .unwrap_or(true); // missing entry = treat as active (no switch_legs yet)
+
+                    // Pull the splice state out into a local for clean
+                    // borrow handling. We re-write back if we change it.
+                    let splice_pending = splice_state
+                        .get(&key)
+                        .map(|s| s.is_pending())
+                        .unwrap_or(false);
+
+                    if is_active {
+                        // Track active-leg PUSI=1 PTSes so the next
+                        // splice has a valid `last_a_pts` threshold.
+                        if crate::engine::ts_parse::ts_pusi(&es.payload) {
+                            if let Some(pts) = crate::engine::ts_parse::extract_pes_pts(
+                                &es.payload,
+                            ) {
+                                last_a_pts.insert(key, pts);
+                            }
                         }
+                        if splice_pending {
+                            // Pending splice: keep forwarding A until A
+                            // finishes its current AU (next PUSI=1),
+                            // then drop A.
+                            let action = splice_state
+                                .get_mut(&key)
+                                .map(|s| s.observe_a_packet(&es.payload))
+                                .unwrap_or(FromPacketAction::Forward);
+                            if matches!(action, FromPacketAction::Drop) {
+                                continue;
+                            }
+                        }
+                        // Active + (no splice OR splice still forwarding A)
+                        // → fall through to rewrite + emit.
+                    } else if splice_pending {
+                        // Non-active leg with a pending splice. Is
+                        // this leg the splice's to-leg?
+                        let is_splice_to = splice_state
+                            .get(&key)
+                            .and_then(|s| s.pending_to_input_id())
+                            .map(|to| to == slot.source.0.as_str())
+                            .unwrap_or(false);
+                        if !is_splice_to {
+                            continue; // some other leg, drop as today
+                        }
+                        // To-leg packet during pending splice. Test
+                        // for alignment.
+                        let outcome = splice_state
+                            .get_mut(&key)
+                            .and_then(|s| s.observe_b_packet(&es.payload));
+                        if let Some(SpliceOutcome::Committed { first_b_pts }) = outcome {
+                            // Atomic flip: active_leg → to_input_id,
+                            // PMT v+1 mod 32, DI=1 on next PCR.
+                            active_leg_input
+                                .insert(key, slot.source.0.clone());
+                            if let Some(v) = pmt_versions.get_mut(key.0) {
+                                *v = v.wrapping_add(1) & 0x1F;
+                            }
+                            pending_di_for_out_pid.insert(slot.out_pid, true);
+                            push_psi(
+                                &mut buf,
+                                &plan,
+                                &pcr_out_pid_by_program,
+                                pat_version,
+                                &pmt_versions,
+                                &mut pat_cc,
+                                &mut pmt_cc,
+                                &broadcast_tx,
+                                &mut bundle_seq,
+                            );
+                            if let Some(es_) = &event_sender {
+                                es_.emit_flow_with_details(
+                                    crate::manager::events::EventSeverity::Info,
+                                    crate::manager::events::category::FLOW,
+                                    format!(
+                                        "Flow '{flow_id}': PES-aligned splice committed on program \
+                                         {} out_pid 0x{:04X} → '{}' (first_b_pts={first_b_pts})",
+                                        plan.programs[key.0].program_number,
+                                        key.1,
+                                        slot.source.0,
+                                    ),
+                                    &flow_id,
+                                    serde_json::json!({
+                                        "error_code": "pes_splice_completed",
+                                        "program_number": plan.programs[key.0].program_number,
+                                        "out_pid": key.1,
+                                        "to_input_id": slot.source.0,
+                                        "first_b_pts": first_b_pts,
+                                    }),
+                                );
+                            }
+                            // Seed last_a_pts with B's first PTS so the
+                            // next splice arm has a clean threshold.
+                            last_a_pts.insert(key, first_b_pts);
+                            // Fall through to rewrite + emit this packet
+                            // — it's now the first byte of the new
+                            // active leg.
+                        } else {
+                            continue; // not aligned yet, drop
+                        }
+                    } else {
+                        // Non-active leg, no pending splice → drop.
+                        continue;
                     }
                 }
-                if es.payload.len() != TS_PACKET_SIZE {
-                    continue;
-                }
+                // From here on: forward the packet (was active leg with
+                // splice forwarding A, or B's first committed PES).
                 let mut rewritten = rewrite_es_packet(&es.payload, slot.out_pid, &mut cc);
                 // After a plan swap or switch-slot flip, the first
                 // PCR-bearing TS packet on the affected out_pid carries
@@ -592,6 +834,65 @@ async fn run_assembler(
             }
             _ = flush_tick.tick() => {
                 flush(&mut buf, &broadcast_tx, &mut bundle_seq);
+                // PES Switch Phase 4 — splice budget deadlines. Walk
+                // every pending splice; on timeout, fall back to the
+                // legacy PmtBump path and emit `pes_splice_timeout`
+                // so the operator sees that B never aligned within
+                // budget. Collected-and-applied in two passes so we
+                // don't mutate the splice_state map while iterating.
+                let now = std::time::Instant::now();
+                let mut timeouts: Vec<((usize, u16), String)> = Vec::new();
+                for (key, state) in splice_state.iter_mut() {
+                    if let Some(SpliceOutcome::Timeout { to_input_id }) =
+                        state.check_timeout(now)
+                    {
+                        timeouts.push((*key, to_input_id));
+                    }
+                }
+                if !timeouts.is_empty() {
+                    let mut any_flipped = false;
+                    for (key, to_input_id) in &timeouts {
+                        let (pidx, out_pid) = *key;
+                        active_leg_input.insert(*key, to_input_id.clone());
+                        if let Some(v) = pmt_versions.get_mut(pidx) {
+                            *v = v.wrapping_add(1) & 0x1F;
+                        }
+                        pending_di_for_out_pid.insert(out_pid, true);
+                        any_flipped = true;
+                        if let Some(es_) = &event_sender {
+                            es_.emit_flow_with_details(
+                                crate::manager::events::EventSeverity::Warning,
+                                crate::manager::events::category::FLOW,
+                                format!(
+                                    "Flow '{flow_id}': PES-aligned splice timed out on program \
+                                     {} out_pid 0x{:04X} → '{to_input_id}'; falling back to PMT-bump",
+                                    plan.programs[pidx].program_number,
+                                    out_pid,
+                                ),
+                                &flow_id,
+                                serde_json::json!({
+                                    "error_code": "pes_splice_timeout",
+                                    "program_number": plan.programs[pidx].program_number,
+                                    "out_pid": out_pid,
+                                    "to_input_id": to_input_id,
+                                }),
+                            );
+                        }
+                    }
+                    if any_flipped {
+                        push_psi(
+                            &mut buf,
+                            &plan,
+                            &pcr_out_pid_by_program,
+                            pat_version,
+                            &pmt_versions,
+                            &mut pat_cc,
+                            &mut pmt_cc,
+                            &broadcast_tx,
+                            &mut bundle_seq,
+                        );
+                    }
+                }
             }
         }
     }
@@ -1361,6 +1662,8 @@ mod tests {
             out_pid,
             stream_type,
             switch_legs: None,
+            splice_mode: Default::default(),
+            splice_budget_ms: None,
         }
     }
 
@@ -1527,7 +1830,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(16);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone()).join;
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new()).join;
 
         // Drain one bundle — startup path emits PAT + PMT immediately.
         let bundle = tokio::time::timeout(Duration::from_millis(500), rx.recv())
@@ -1549,7 +1852,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone()).join;
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new()).join;
 
         // Wait for startup PSI, then publish enough ES packets on each
         // slot to fill a full bundle.
@@ -1619,7 +1922,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_mpts_plan(), bus.clone(), tx.clone(), cancel.clone()).join;
+        let handle = spawn_spts_assembler(make_mpts_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new()).join;
 
         // Collect bundles for ~250 ms — long enough to see the startup
         // PSI emission plus at least one tick of the 100 ms PSI cadence.
@@ -1662,7 +1965,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, _rx) = broadcast::channel::<RtpPacket>(4);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone()).join;
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new()).join;
         tokio::time::sleep(Duration::from_millis(30)).await;
         cancel.cancel();
         tokio::time::timeout(Duration::from_millis(500), handle)
@@ -1685,7 +1988,7 @@ mod tests {
 
         // Initial plan: in-a → out 0x200, in-b → out 0x201.
         let initial = make_plan();
-        let handle = spawn_spts_assembler(initial, bus.clone(), tx.clone(), cancel.clone());
+        let handle = spawn_spts_assembler(initial, bus.clone(), tx.clone(), cancel.clone(), None, String::new());
 
         // Capture startup PMT version (should be 0).
         let mut v0: Option<u8> = None;
@@ -1791,7 +2094,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone());
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new());
 
         // Drain startup PMT.
         let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
@@ -2167,6 +2470,8 @@ mod tests {
                 ("in-a".to_string(), 0x200),
                 ("in-c".to_string(), 0x200),
             ]),
+            splice_mode: Default::default(),
+            splice_budget_ms: None,
         };
         let map = clocks(&[
             ("in-a", ClockIdentity::SourcePcr { input_id: "in-a".into() }),

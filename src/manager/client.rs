@@ -996,10 +996,18 @@ fn edge_capabilities() -> Vec<&'static str> {
         // UI gates the Node Bus matrix view + the bus_route switcher
         // preset action + the master-clock badge in the input picker
         // on this capability — older edges keep the per-flow assembly
-        // editor only, with no matrix surface. Future Phase 4 (PES-
-        // aligned splice across non-identical sources) advertises a
-        // separate `pes_splice` capability.
+        // editor only, with no matrix surface.
         "node_bus",
+        // PES Switch redesign Phase 4 (audio-aligned splice MVP): the
+        // `SwitchActiveInput` handler honours `splice_mode = pes_aligned`
+        // on audio switch slots — buffers the slot's outbound bytes at
+        // the from-leg's last fully-emitted PES boundary and concatenates
+        // the to-leg's next aligned PES; on budget exhaust falls back to
+        // PmtBump and emits `pes_splice_timeout`. Non-audio slots fall
+        // through to PmtBump silently (video splice is a follow-up).
+        // Manager UI gates the splice_mode dropdown in the assembly
+        // editor on this capability so older edges hide it cleanly.
+        "pes_splice",
         // Remote binary upgrade: edge accepts `upgrade_binary` WS
         // commands and stages a Sigstore-verified release tarball,
         // atomically swaps the `current` symlink, then drains and exits

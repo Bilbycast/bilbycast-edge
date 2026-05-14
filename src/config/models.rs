@@ -947,7 +947,55 @@ pub enum SlotSource {
         /// equal one of `legs[i].input_id`. At runtime, supersedes
         /// per `flow.active_input_id`.
         initial_input_id: String,
+        /// PES Switch Phase 4. Controls what happens to outbound bytes
+        /// during a `SwitchActiveInput`:
+        /// - [`SpliceMode::PmtBump`] (default): receiver-friendly but
+        ///   not access-unit-aligned. Today's behaviour — PMT version
+        ///   bumps mod 32 and DI=1 is armed on the next PCR.
+        /// - [`SpliceMode::PesAligned`]: hold the outbound stream at
+        ///   the from-leg's last fully-emitted PES boundary, wait up
+        ///   to [`splice_budget_ms`] for the to-leg to produce a PES
+        ///   whose PTS is monotonically past the last emitted PTS,
+        ///   then concatenate. On budget exhaustion the path falls
+        ///   back to `PmtBump` and emits `pes_splice_timeout`.
+        /// Audio splice is the first surface to land — video splice
+        /// follows in a separate session. Only switches whose active
+        /// PES kind is audio honour `PesAligned` today; everything
+        /// else falls through to `PmtBump` silently.
+        #[serde(default, skip_serializing_if = "SpliceMode::is_default")]
+        splice_mode: SpliceMode,
+        /// Splice budget in milliseconds (PES-aligned mode only).
+        /// Default 200 ms for audio (enough for ≥8 audio frames at
+        /// every common AAC / MP2 / AC-3 framerate). Range 20..=5000.
+        /// Ignored when `splice_mode = PmtBump`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        splice_budget_ms: Option<u32>,
     },
+}
+
+/// PES Switch Phase 4. Splice strategy for `SlotSource::Switch` slots
+/// when the operator drives `ActivateInput`. See [`SlotSource::Switch`]
+/// for runtime semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SpliceMode {
+    /// PMT version bump + DI=1 on next PCR. Receiver-friendly but
+    /// not access-unit-aligned — decoders re-acquire if the two
+    /// sources are independent encoders of the same content.
+    /// Backwards-compatible default.
+    #[default]
+    PmtBump,
+    /// Hold the outbound stream at the from-leg's last fully-emitted
+    /// PES boundary, then concatenate the to-leg's first PES whose
+    /// PTS is monotonically past the last emitted PTS. Glitchless on
+    /// real receivers (gate 7) when both sources are coherent content.
+    PesAligned,
+}
+
+impl SpliceMode {
+    pub fn is_default(&self) -> bool {
+        matches!(self, SpliceMode::PmtBump)
+    }
 }
 
 /// One leg of a [`SlotSource::Switch`]. Flat (not `Box<SlotSource>`)

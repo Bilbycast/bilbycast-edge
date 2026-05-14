@@ -744,6 +744,11 @@ impl FlowManager {
             let _ = handle.plan_tx.try_send(
                 crate::engine::ts_assembler::PlanCommand::SwitchActiveInput {
                     new_input_id: new_input_id.to_string(),
+                    // No per-switch override today; the assembler reads
+                    // each switch slot's config-time `splice_mode` for
+                    // its routing decision. Wire this through when the
+                    // ad-hoc operator-override path lands.
+                    splice_mode_override: None,
                 },
             );
         }

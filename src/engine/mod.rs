@@ -124,6 +124,10 @@ pub mod ts_es_hitless;
 /// broadcast channel. Consumed by the FlowRuntime when a flow's
 /// `assembly.kind = spts`.
 pub mod ts_assembler;
+/// PES Switch Phase 4 — audio-aligned splice state machine driven by
+/// `SwitchActiveInput { splice_mode: PesAligned }`. Non-audio slots fall
+/// through to today's PmtBump path silently.
+pub mod pes_splice;
 pub mod ts_audio_replace;
 pub mod ts_null_padder;
 pub mod ts_video_replace;

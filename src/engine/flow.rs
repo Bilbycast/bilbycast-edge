@@ -3435,6 +3435,8 @@ async fn finalize_spts_assembler(
         bus.clone(),
         broadcast_tx.clone(),
         cancel_token.child_token(),
+        Some(event_sender.clone()),
+        flow_id.to_string(),
     ))
 }
 
@@ -3694,13 +3696,15 @@ fn build_assembly_plan(
         let restart_active_id: Option<String> =
             flow.active_input().map(|d| d.id.clone());
         for stream in &program.streams {
-            let (input_id, source_pid, switch_legs): (
+            let (input_id, source_pid, switch_legs, splice_mode, splice_budget_ms): (
                 String,
                 u16,
                 Option<Vec<(String, u16)>>,
+                crate::config::models::SpliceMode,
+                Option<u32>,
             ) = match &stream.source {
                 SlotSource::Pid { input_id, source_pid } => {
-                    (input_id.clone(), *source_pid, None)
+                    (input_id.clone(), *source_pid, None, Default::default(), None)
                 }
                 SlotSource::Essence { input_id, kind } => {
                     let slot_idx = slots.len();
@@ -3711,11 +3715,14 @@ fn build_assembly_plan(
                         kind: es_kind_from_config(*kind),
                         leg_idx: None,
                     });
-                    (input_id.clone(), 0_u16, None) // sentinel, patched after resolution
+                    // sentinel, patched after resolution
+                    (input_id.clone(), 0_u16, None, Default::default(), None)
                 }
                 SlotSource::Switch {
                     legs,
                     initial_input_id,
+                    splice_mode,
+                    splice_budget_ms,
                 } => {
                     use crate::config::models::SwitchLeg;
                     let slot_idx = slots.len();
@@ -3752,7 +3759,7 @@ fn build_assembly_plan(
                         .find(|(iid, _)| iid == &active_id)
                         .cloned()
                         .unwrap_or_else(|| leg_pairs[0].clone());
-                    (active_pair.0, active_pair.1, Some(leg_pairs))
+                    (active_pair.0, active_pair.1, Some(leg_pairs), *splice_mode, *splice_budget_ms)
                 }
                 SlotSource::Hitless {
                     primary,
@@ -3835,7 +3842,7 @@ fn build_assembly_plan(
                     // output. The pre-bus merger task is responsible
                     // for keeping that key supplied.
                     let (iid, pid) = crate::engine::ts_es_hitless::hitless_bus_key(&uid);
-                    (iid, pid, None)
+                    (iid, pid, None, Default::default(), None)
                 }
             };
             // Phase 6.5 cross-check: when the slot's input is a PCM /
@@ -3889,6 +3896,8 @@ fn build_assembly_plan(
                 out_pid: stream.out_pid,
                 stream_type: stream.stream_type,
                 switch_legs,
+                splice_mode,
+                splice_budget_ms,
             });
         }
 
