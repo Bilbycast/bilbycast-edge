@@ -125,6 +125,21 @@ impl EventSender {
     /// in-process recent-event tracker so command handlers can poll for the
     /// outcome of a freshly spawned input/output.
     pub fn send(&self, event: Event) {
+        // Phase 4 verification: mirror every event onto tracing so the
+        // testbed can observe pes_splice_* without a manager connected.
+        // Guarded by env var so production stays quiet.
+        if std::env::var("BILBYCAST_TESTBED_TRACE_EVENTS").as_deref() == Ok("1") {
+            let ec = event
+                .details
+                .as_ref()
+                .and_then(|d| d.get("error_code").and_then(|v| v.as_str()))
+                .unwrap_or("(no_error_code)");
+            tracing::info!(
+                target: "bilbycast_edge::testbed_events",
+                "EVENT severity={:?} category={} error_code={} flow_id={:?} msg={:?} details={:?}",
+                event.severity, event.category, ec, event.flow_id, event.message, event.details
+            );
+        }
         // Stash flow-scoped Critical events so the WS command handler can
         // poll for a runtime bind failure that happened just after spawn.
         // We only track the flow scope today — the input/output scope would

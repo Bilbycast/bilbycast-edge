@@ -568,6 +568,16 @@ pub fn clock_identity_for_input(
     input: &crate::config::models::InputDefinition,
 ) -> ClockIdentity {
     use crate::config::models::InputConfig;
+    // Testbed-only escape hatch for Phase 4 PES-splice verification:
+    // when `BILBYCAST_TESTBED_SHARED_WALLCLOCK=1`, treat every input as
+    // co-clocked on the host wallclock. NEVER set this in production —
+    // it removes the silent A/V-drift guard for cross-flow ES routing.
+    if matches!(
+        std::env::var("BILBYCAST_TESTBED_SHARED_WALLCLOCK").as_deref(),
+        Ok("1") | Ok("true")
+    ) {
+        return ClockIdentity::Wallclock;
+    }
     match &input.config {
         // Source-PCR family — identity pinned to this input's id.
         InputConfig::Srt(_)
