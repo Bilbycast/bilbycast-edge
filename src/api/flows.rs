@@ -29,6 +29,15 @@ pub struct AddOutputRequest {
 pub struct ActivateInputRequest {
     /// ID of the input to activate. Must be one of the flow's `input_ids`.
     pub input_id: String,
+    /// PES Switch Phase 4 — optional per-switch splice mode override.
+    /// `None` falls back to each switch slot's config-time `splice_mode`
+    /// in the flow's assembly (the normal path). `Some(_)` overrides
+    /// that mode for this one switch only; the persisted config is
+    /// untouched. Useful for ad-hoc operator overrides
+    /// (`pes_aligned` for a deliberately glitchless take, `pmt_bump`
+    /// to force the legacy fast-cut behaviour without reconfiguring).
+    #[serde(default)]
+    pub splice_mode_override: Option<crate::config::models::SpliceMode>,
 }
 
 /// Request body for `POST /api/v1/outputs/{output_id}/active` — toggles an
@@ -762,7 +771,7 @@ pub async fn activate_input(
     if state.flow_manager.is_running(&flow_id) {
         state
             .flow_manager
-            .switch_active_input(&flow_id, &req.input_id)
+            .switch_active_input(&flow_id, &req.input_id, req.splice_mode_override)
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
     }

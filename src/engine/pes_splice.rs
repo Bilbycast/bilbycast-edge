@@ -44,6 +44,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::engine::content_analysis::bitreader::{unescape_rbsp, BitReader};
 use crate::engine::ts_parse::{extract_pes_pts, pes_payload_offset, ts_pusi};
 
 /// Default splice budget for audio in milliseconds. ≥8 audio frames at
@@ -173,18 +174,98 @@ pub fn parse_aac_adts_params(payload: &[u8]) -> Option<AacAudioParams> {
     })
 }
 
+/// Parse the AAC `AudioSpecificConfig` fields out of an LATM
+/// `AudioMuxElement` at the start of a PES payload. Returns `None`
+/// when the payload is too short, when the encoder reused the previous
+/// `StreamMuxConfig` (`useSameStreamMux=1`, we don't have it), when
+/// `audioMuxVersion=1` (extended config, not supported by today's
+/// broadcast use case), or when `numProgram>0` / `numLayer>0` (multi-
+/// program / SBR-as-separate-layer setups). Mainstream broadcast AAC-LC
+/// over LATM falls into the supported subset; failure modes are
+/// fail-safe (caller commits on PTS alone, no behavioural change vs
+/// the audio MVP).
+///
+/// Output is normalised to the same `AacAudioParams` shape used by the
+/// ADTS sentinel:
+/// - `profile` carries `AudioObjectType − 1`, clamped to `0..=3` to
+///   match the 2-bit ADTS profile field (AAC-LC → 1, the broadcast
+///   default). HE-AAC v1/v2 signalled at the ASC layer as
+///   AOT=5/29 still maps to profile=3 — receivers re-init the decoder
+///   on any SBR/PS toggle anyway.
+/// - `sample_rate_idx` carries the 4-bit `samplingFrequencyIndex`; the
+///   spec's `15` escape (24-bit explicit frequency) preserves that
+///   sentinel value so a mismatch against any non-15 index still
+///   triggers the codec-param-mismatch refusal.
+/// - `channel_config` carries the 4-bit `channelConfiguration`.
+///
+/// Reference: ISO/IEC 14496-3 § 1.7.3 (StreamMuxConfig) + § 1.6.2.1
+/// (AudioSpecificConfig).
+pub fn parse_aac_latm_params(payload: &[u8]) -> Option<AacAudioParams> {
+    let mut br = BitReader::new(payload);
+    let use_same_stream_mux = br.read_bit()?;
+    if use_same_stream_mux != 0 {
+        return None;
+    }
+    let audio_mux_version = br.read_bit()?;
+    if audio_mux_version != 0 {
+        return None;
+    }
+    br.read_bit()?; // allStreamsSameTimeFraming
+    br.read_bits(6)?; // numSubFrames
+    let num_program = br.read_bits(4)?;
+    if num_program != 0 {
+        return None;
+    }
+    let num_layer = br.read_bits(3)?;
+    if num_layer != 0 {
+        return None;
+    }
+    // prog=0 lay=0 → useSameConfig is implicit 0, ASC follows.
+    let aot_5 = br.read_bits(5)? as u8;
+    let audio_object_type = if aot_5 == 31 {
+        let ext = br.read_bits(6)? as u16;
+        (32 + ext).min(255) as u8
+    } else {
+        aot_5
+    };
+    let sfi_4 = br.read_bits(4)? as u8;
+    let sample_rate_idx = if sfi_4 == 15 {
+        br.read_bits(24)?; // consume the 24-bit explicit frequency
+        15
+    } else {
+        sfi_4
+    };
+    let channel_config = br.read_bits(4)? as u8;
+    let profile = audio_object_type.saturating_sub(1).min(3);
+    Some(AacAudioParams {
+        profile,
+        sample_rate_idx,
+        channel_config,
+    })
+}
+
 /// Extract `AacAudioParams` from a PUSI=1 TS packet carrying an AAC
-/// ADTS frame at the start of its PES payload. Returns `None` when the
-/// packet isn't a PUSI=1 PES, the PES payload offset can't be located,
-/// or the ADTS sync header isn't present (e.g. LATM, or the ADTS frame
-/// straddles two TS packets — the rare case where the codec-param
-/// sentinel falls through to today's commit-on-PTS behaviour).
-pub fn extract_aac_params_from_pes(pkt: &[u8]) -> Option<AacAudioParams> {
+/// frame at the start of its PES payload. Dispatches on `stream_type`:
+/// - `0x0F` → ADTS sync header parser ([`parse_aac_adts_params`]).
+/// - `0x11` → LATM `AudioMuxElement` parser ([`parse_aac_latm_params`]),
+///   added edge 0.66.0 (PES Switch Phase 4 LATM sentinel).
+/// - Any other stream_type → `None` (caller already gates on this).
+///
+/// Returns `None` when the packet isn't a PUSI=1 PES, the PES payload
+/// offset can't be located, or the parser bails (mid-PES bytes,
+/// reused-config LATM frame, unsupported extension, fragmented frame).
+/// `None` is fail-safe — the splice falls through to today's
+/// commit-on-PTS behaviour.
+pub fn extract_aac_params_from_pes(pkt: &[u8], stream_type: u8) -> Option<AacAudioParams> {
     if !ts_pusi(pkt) {
         return None;
     }
     let es_start = pes_payload_offset(pkt)?;
-    parse_aac_adts_params(&pkt[es_start..])
+    match stream_type {
+        0x0F => parse_aac_adts_params(&pkt[es_start..]),
+        0x11 => parse_aac_latm_params(&pkt[es_start..]),
+        _ => None,
+    }
 }
 
 /// State of a single switch slot's PES-aligned audio splice.
@@ -328,13 +409,14 @@ impl AudioSpliceState {
         if *a_au_completed {
             return;
         }
-        // Only AAC ADTS today. AAC-LATM and every non-AAC codec skip
-        // the sentinel (extract returns None in those cases anyway, but
-        // a leading stream_type check keeps the no-op path cheap).
-        if *stream_type != 0x0F {
+        // AAC ADTS (0x0F) + LATM (0x11). Every other codec skips the
+        // sentinel — `extract_aac_params_from_pes` returns `None` for
+        // them anyway, but a leading stream_type check keeps the no-op
+        // path cheap on the per-packet hot loop.
+        if *stream_type != 0x0F && *stream_type != 0x11 {
             return;
         }
-        if let Some(params) = extract_aac_params_from_pes(pkt) {
+        if let Some(params) = extract_aac_params_from_pes(pkt, *stream_type) {
             *expected_aac_params = Some(params);
         }
     }
@@ -398,14 +480,15 @@ impl AudioSpliceState {
             return None;
         }
         // PTS at or past threshold — now the codec-param sentinel.
-        // Only fires when (a) the slot is AAC ADTS, (b) we captured a
-        // baseline from A, and (c) B's PES yields a parseable ADTS
+        // Only fires when (a) the slot is AAC ADTS or AAC-LATM, (b) we
+        // captured a baseline from A, and (c) B's PES yields a parseable
         // header. Any miss in (a)/(b)/(c) means we don't have enough
         // information to refuse — fall through to today's commit.
         let stream_type = *stream_type;
         let a_params = *expected_aac_params;
-        let b_params = if stream_type == 0x0F && a_params.is_some() {
-            extract_aac_params_from_pes(pkt)
+        let is_aac = matches!(stream_type, 0x0F | 0x11);
+        let b_params = if is_aac && a_params.is_some() {
+            extract_aac_params_from_pes(pkt, stream_type)
         } else {
             None
         };
@@ -495,6 +578,23 @@ pub enum SpliceOutcome {
         to_input_id: String,
         a_params: AacAudioParams,
         b_params: AacAudioParams,
+    },
+    /// Video sibling to [`SpliceOutcome::CodecParamMismatch`]: B's
+    /// first IDR PES past threshold parsed cleanly but its SPS-derived
+    /// codec parameters differ from A's last snapshot. A mid-stream
+    /// PES splice with changed parameters would require the receiver
+    /// to re-initialise its decoder mid-AU (different bit depth,
+    /// chroma format, resolution, profile/level), which most decoders
+    /// cannot do without a clean PMT bump. The assembler falls back
+    /// to `PmtBump` and emits `pes_splice_codec_param_mismatch` with
+    /// `kind: "video"` carrying the full SPS-field diff so operators
+    /// can see which field changed (the AAC sentinel only ever flags
+    /// three fields; the video sentinel flags seven, so the diff
+    /// is genuinely useful for triage).
+    VideoCodecParamMismatch {
+        to_input_id: String,
+        a_params: VideoCodecParams,
+        b_params: VideoCodecParams,
     },
 }
 
@@ -618,6 +718,333 @@ pub fn pes_contains_idr(pkt: &[u8], stream_type: u8) -> bool {
     false
 }
 
+/// Compressed-video codec family tracked by the video splice sentinel.
+/// Mirrors the MPEG-TS stream_type discriminator used elsewhere — keeps
+/// the [`VideoCodecParams`] comparison codec-aware (mismatched codec
+/// families always count as a mismatch, even when individual field
+/// values happen to coincide).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoCodec {
+    /// H.264 / AVC. MPEG-TS stream_type `0x1B`.
+    Avc,
+    /// H.265 / HEVC. MPEG-TS stream_type `0x24`.
+    Hevc,
+}
+
+impl VideoCodec {
+    /// Map from MPEG-TS stream_type to codec; returns `None` for any
+    /// stream_type the sentinel doesn't speak.
+    pub fn from_stream_type(stream_type: u8) -> Option<Self> {
+        match stream_type {
+            0x1B => Some(VideoCodec::Avc),
+            0x24 => Some(VideoCodec::Hevc),
+            _ => None,
+        }
+    }
+}
+
+/// SPS-derived codec parameters compared by the video splice sentinel.
+///
+/// The fields chosen are exactly the ones a hardware video decoder
+/// (Appear X10, Cobalt 9202, Cisco D9824 — the gate-7 receivers) has to
+/// re-initialise on if they change mid-PES:
+///
+/// - `profile_idc` — receiver picks a different profile-specific
+///   decode pipeline (Baseline / Main / High / High10 / High 4:2:2 /
+///   Main10 / Main 4:2:2 10). Mismatch = decoder restart required.
+/// - `level_idc` — buffer sizes / pipeline depth change. Mismatch =
+///   decoder may need to re-allocate VPP / CABAC / DPB pools.
+/// - `chroma_format_idc` — 4:2:0 / 4:2:2 / 4:4:4. Mismatch =
+///   different subsampling, fundamentally different colour pipeline.
+/// - `bit_depth_luma` / `bit_depth_chroma` — 8-bit vs 10-bit vs
+///   12-bit. Mismatch = decoder output bit depth flips, downstream
+///   colour processing pipeline reshapes.
+/// - `width` / `height` — coded luma dimensions. Mismatch = output
+///   surface allocation changes; on most receivers this is a hard
+///   re-acquire.
+///
+/// `frame_mbs_only_flag` (H.264) is folded into `height` via the
+/// `(2 − flag)` field-height multiplier per § 7.4.2.1.1; interlaced
+/// vs progressive flips show up as a 2× height change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoCodecParams {
+    pub codec: VideoCodec,
+    pub profile_idc: u8,
+    pub level_idc: u8,
+    pub chroma_format_idc: u8,
+    pub bit_depth_luma: u8,
+    pub bit_depth_chroma: u8,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Walk Annex-B NALs in a PUSI=1 TS packet's PES payload looking for
+/// an SPS NAL (H.264 `nal_unit_type == 7`, HEVC `nal_unit_type == 33`),
+/// then return its **unescaped RBSP** byte slice ready for SPS parsing.
+///
+/// Returns `None` when the packet isn't a PUSI, the PES payload offset
+/// can't be located, the stream_type isn't supported, or no SPS NAL
+/// appears before either the end of the TS packet or the next NAL
+/// start code. The walker bounds itself to the ~180 B of PES payload
+/// inside a single TS packet, so it's safe to call on the splice-arm
+/// path + B's first-IDR test (both fire well off the per-packet hot
+/// loop).
+///
+/// The RBSP unescape pass (`0x00 0x00 0x03` → `0x00 0x00`) allocates
+/// once per call — at most a few times per second per active video
+/// splice. Allocation cost is in the snapshot-refresh path, not the
+/// every-packet path.
+fn extract_sps_rbsp(pkt: &[u8], stream_type: u8) -> Option<Vec<u8>> {
+    if !ts_pusi(pkt) {
+        return None;
+    }
+    let target_nut: u8 = match stream_type {
+        0x1B => 7,
+        0x24 => 33,
+        _ => return None,
+    };
+    let es_start = pes_payload_offset(pkt)?;
+    let bytes = &pkt[es_start..];
+    let mut i = 0usize;
+    while i + 4 <= bytes.len() {
+        let is_sc3 = bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 1;
+        let is_sc4 = bytes[i] == 0
+            && bytes[i + 1] == 0
+            && bytes[i + 2] == 0
+            && bytes[i + 3] == 1;
+        let (sc_size, nal_off) = if is_sc4 {
+            (4usize, i + 4)
+        } else if is_sc3 {
+            (3usize, i + 3)
+        } else {
+            i += 1;
+            continue;
+        };
+        if nal_off >= bytes.len() {
+            return None;
+        }
+        let nut = match stream_type {
+            0x1B => bytes[nal_off] & 0x1F,
+            0x24 => (bytes[nal_off] >> 1) & 0x3F,
+            _ => return None,
+        };
+        if nut == target_nut {
+            // NAL header size: 1 byte for H.264, 2 bytes for HEVC.
+            let payload_start = nal_off
+                + match stream_type {
+                    0x1B => 1,
+                    0x24 => 2,
+                    _ => return None,
+                };
+            // Scan forward for the next start code or buffer end.
+            let mut end = payload_start;
+            while end + 3 <= bytes.len() {
+                if bytes[end] == 0
+                    && bytes[end + 1] == 0
+                    && (bytes[end + 2] == 0 || bytes[end + 2] == 1)
+                {
+                    break;
+                }
+                end += 1;
+            }
+            if end < bytes.len() && bytes.len() - end < 3 {
+                end = bytes.len();
+            }
+            if payload_start >= end {
+                return None;
+            }
+            return Some(unescape_rbsp(&bytes[payload_start..end]));
+        }
+        i = nal_off + sc_size.min(1); // advance past this NAL header byte
+    }
+    None
+}
+
+/// Parse an H.264 SPS RBSP into [`VideoCodecParams`]. Bails (returns
+/// `None`) on any failure mode the bit reader hits — out-of-buffer,
+/// malformed Exp-Golomb, scaling-list flag set (would require parsing
+/// large variable-length scaling lists; the sentinel doesn't need that
+/// data and the splice falls through to a PTS-only commit). The
+/// `expected_profile` byte at `rbsp[0]` is taken at face value; the
+/// `level_idc` byte is at `rbsp[2]`.
+pub fn parse_avc_sps_params(rbsp: &[u8]) -> Option<VideoCodecParams> {
+    if rbsp.len() < 4 {
+        return None;
+    }
+    let profile_idc = rbsp[0];
+    // rbsp[1] = constraint_set flags + reserved (not needed for the sentinel).
+    let level_idc = rbsp[2];
+    let mut br = BitReader::new(&rbsp[3..]);
+    br.read_ue()?; // seq_parameter_set_id
+
+    let extended_profile = matches!(
+        profile_idc,
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+    );
+    let (chroma_format_idc, bit_depth_luma, bit_depth_chroma);
+    if extended_profile {
+        let cf = br.read_ue()? as u8;
+        chroma_format_idc = cf;
+        if cf == 3 {
+            br.read_bit()?; // separate_colour_plane_flag
+        }
+        bit_depth_luma = 8 + (br.read_ue()? as u8);
+        bit_depth_chroma = 8 + (br.read_ue()? as u8);
+        br.read_bit()?; // qpprime_y_zero_transform_bypass_flag
+        let seq_scaling = br.read_bit()?;
+        if seq_scaling == 1 {
+            // Scaling-list parsing is non-trivial and not needed for the
+            // sentinel; surface a partial snapshot so the caller can
+            // still compare the three fields parsed so far (chroma,
+            // bit-depth). width/height are returned as 0 — comparison
+            // against another partial snapshot still flags a mismatch
+            // when the partial fields differ.
+            return Some(VideoCodecParams {
+                codec: VideoCodec::Avc,
+                profile_idc,
+                level_idc,
+                chroma_format_idc,
+                bit_depth_luma,
+                bit_depth_chroma,
+                width: 0,
+                height: 0,
+            });
+        }
+    } else {
+        // Baseline / Main / Extended → 4:2:0 8-bit by spec.
+        chroma_format_idc = 1;
+        bit_depth_luma = 8;
+        bit_depth_chroma = 8;
+    }
+    br.read_ue()?; // log2_max_frame_num_minus4
+    let pic_order_cnt_type = br.read_ue()?;
+    if pic_order_cnt_type == 0 {
+        br.read_ue()?; // log2_max_pic_order_cnt_lsb_minus4
+    } else if pic_order_cnt_type == 1 {
+        br.read_bit()?; // delta_pic_order_always_zero_flag
+        br.read_se()?; // offset_for_non_ref_pic
+        br.read_se()?; // offset_for_top_to_bottom_field
+        let n = br.read_ue()?;
+        for _ in 0..n.min(256) {
+            br.read_se()?;
+        }
+    }
+    br.read_ue()?; // max_num_ref_frames
+    br.read_bit()?; // gaps_in_frame_num_value_allowed_flag
+    let pic_width_in_mbs_minus1 = br.read_ue()?;
+    let pic_height_in_map_units_minus1 = br.read_ue()?;
+    let frame_mbs_only_flag = br.read_bit()?;
+
+    let width = (pic_width_in_mbs_minus1 + 1) * 16;
+    let height = (2 - frame_mbs_only_flag as u32) * (pic_height_in_map_units_minus1 + 1) * 16;
+
+    Some(VideoCodecParams {
+        codec: VideoCodec::Avc,
+        profile_idc,
+        level_idc,
+        chroma_format_idc,
+        bit_depth_luma,
+        bit_depth_chroma,
+        width,
+        height,
+    })
+}
+
+/// Parse an HEVC SPS RBSP into [`VideoCodecParams`]. Same shape /
+/// fail-safe semantics as [`parse_avc_sps_params`]. The
+/// `profile_tier_level` walk mirrors the production parser in
+/// `engine::content_analysis::signalling::skip_profile_tier_level` —
+/// 112 bits per sub_layer profile rather than the spec's 88, because
+/// the spec-correct chunking reads `pic_width` / `pic_height` as 0 on
+/// some live 4K HEVC encoders (encoder quirk; see comment on
+/// `skip_profile_tier_level`).
+pub fn parse_hevc_sps_params(rbsp: &[u8]) -> Option<VideoCodecParams> {
+    let mut br = BitReader::new(rbsp);
+    br.read_bits(4)?; // sps_video_parameter_set_id
+    let max_sub_layers_minus1 = br.read_bits(3)? as u8;
+    br.read_bit()?; // sps_temporal_id_nesting_flag
+
+    // profile_tier_level — inline rather than reusing
+    // signalling::skip_profile_tier_level because we want the
+    // general_profile_idc + general_level_idc returned, not skipped.
+    br.read_bits(2)?; // general_profile_space
+    br.read_bit()?; // general_tier_flag
+    let general_profile_idc = br.read_bits(5)? as u8;
+    br.read_bits(32)?; // general_profile_compatibility_flag[32]
+    // general_progressive(1) interlaced(1) non_packed(1) frame_only(1) + 44 reserved
+    // → 16 + 32 = 48 bits.
+    br.read_bits(16)?;
+    br.read_bits(32)?;
+    let general_level_idc = br.read_bits(8)? as u8;
+    let mut sub_layer_profile_present = [0u8; 8];
+    let mut sub_layer_level_present = [0u8; 8];
+    for i in 0..max_sub_layers_minus1 as usize {
+        sub_layer_profile_present[i] = br.read_bit()?;
+        sub_layer_level_present[i] = br.read_bit()?;
+    }
+    if max_sub_layers_minus1 > 0 {
+        for _ in max_sub_layers_minus1..8 {
+            br.read_bits(2)?; // reserved_zero_2bits
+        }
+    }
+    for i in 0..max_sub_layers_minus1 as usize {
+        if sub_layer_profile_present[i] == 1 {
+            // 112 bits — matches signalling.rs production-tested chunking.
+            br.read_bits(32)?;
+            br.read_bits(32)?;
+            br.read_bits(16)?;
+            br.read_bits(32)?;
+        }
+        if sub_layer_level_present[i] == 1 {
+            br.read_bits(8)?;
+        }
+    }
+
+    br.read_ue()?; // sps_seq_parameter_set_id
+    let chroma_format_idc = br.read_ue()? as u8;
+    if chroma_format_idc == 3 {
+        br.read_bit()?;
+    }
+    let pic_width = br.read_ue()?;
+    let pic_height = br.read_ue()?;
+    let conformance_window_flag = br.read_bit()?;
+    if conformance_window_flag == 1 {
+        br.read_ue()?;
+        br.read_ue()?;
+        br.read_ue()?;
+        br.read_ue()?;
+    }
+    let bit_depth_luma = 8 + (br.read_ue()? as u8);
+    let bit_depth_chroma = 8 + (br.read_ue()? as u8);
+
+    Some(VideoCodecParams {
+        codec: VideoCodec::Hevc,
+        profile_idc: general_profile_idc,
+        level_idc: general_level_idc,
+        chroma_format_idc,
+        bit_depth_luma,
+        bit_depth_chroma,
+        width: pic_width,
+        height: pic_height,
+    })
+}
+
+/// Extract [`VideoCodecParams`] from a PUSI=1 TS packet carrying an
+/// SPS NAL at the start of its PES payload (typically the first NAL
+/// after AUD on an H.264 IDR PES, or `SPS_NUT` on an HEVC IRAP PES).
+/// Returns `None` when the packet isn't a PUSI=1 video PES, no SPS is
+/// in the payload, or the parser fails — caller treats `None` as
+/// "fall through to PTS-only commit" the same way the AAC sentinel
+/// treats `None` from `extract_aac_params_from_pes`.
+pub fn extract_video_params_from_pes(pkt: &[u8], stream_type: u8) -> Option<VideoCodecParams> {
+    let rbsp = extract_sps_rbsp(pkt, stream_type)?;
+    match stream_type {
+        0x1B => parse_avc_sps_params(&rbsp),
+        0x24 => parse_hevc_sps_params(&rbsp),
+        _ => None,
+    }
+}
+
 /// State of a single switch slot's PES-aligned video splice.
 ///
 /// Sibling to [`AudioSpliceState`] — same shape, same lifecycle, same
@@ -632,10 +1059,14 @@ pub fn pes_contains_idr(pkt: &[u8], stream_type: u8) -> bool {
 pub enum VideoSpliceState {
     /// No splice in flight; the slot follows today's behaviour.
     Idle,
-    /// Splice armed — outbound is held until either:
+    /// Splice armed — outbound is held until one of:
     /// (a) the to-leg produces a PUSI=1 PES with `pts ≥ threshold_pts`
-    ///     and an IDR NAL in the same packet, or
-    /// (b) `Instant::now() ≥ deadline` (caller falls back to PmtBump).
+    ///     and an IDR NAL in the same packet AND its SPS parameters
+    ///     match A's snapshot (or either snapshot is unparseable —
+    ///     fail-safe to commit),
+    /// (b) the to-leg's first aligned IDR PES has SPS parameters that
+    ///     differ from A's (refuse → `VideoCodecParamMismatch`), or
+    /// (c) `Instant::now() ≥ deadline` (caller falls back to PmtBump).
     Pending {
         /// Input id of the to-leg the operator is switching to.
         to_input_id: String,
@@ -658,6 +1089,14 @@ pub enum VideoSpliceState {
         /// MPEG-TS stream_type of the slot (`0x1B` or `0x24`). Used by
         /// [`pes_contains_idr`] to pick the per-codec IDR rule.
         stream_type: u8,
+        /// SPS-derived parameter snapshot from A's last PUSI=1 IDR PES
+        /// at arm time (refreshed via [`VideoSpliceState::record_a_video_params`]
+        /// until A's AU completes). `None` when A's payload didn't
+        /// carry a parseable SPS (mid-PES at arm, or A's encoder
+        /// suppresses SPS between IDRs) — sentinel falls through to a
+        /// PTS+IDR-only commit so we don't refuse a perfectly
+        /// compatible splice on noise.
+        expected_params: Option<VideoCodecParams>,
     },
 }
 
@@ -677,6 +1116,7 @@ impl VideoSpliceState {
         last_a_pts: u64,
         now: Instant,
         budget: Duration,
+        expected_params: Option<VideoCodecParams>,
     ) -> bool {
         if !is_supported_video_stream_type(stream_type) {
             return false;
@@ -690,8 +1130,35 @@ impl VideoSpliceState {
             deadline: now + budget,
             a_au_completed: false,
             stream_type,
+            expected_params,
         };
         true
+    }
+
+    /// Refresh A's SPS parameter snapshot from a PUSI=1 IDR PES on the
+    /// active leg. Caller invokes this on every A-leg PUSI=1 while the
+    /// splice is `Pending` and `a_au_completed` is still false — that's
+    /// the window where A's last frame fully emits and the snapshot
+    /// stays receiver-meaningful. No-op when `Idle`, when A's AU has
+    /// already completed, or when the payload doesn't carry a parseable
+    /// SPS (most non-IDR PES, or encoders that suppress SPS between
+    /// IRAPs).
+    pub fn record_a_video_params(&mut self, pkt: &[u8]) {
+        let VideoSpliceState::Pending {
+            a_au_completed,
+            stream_type,
+            expected_params,
+            ..
+        } = self
+        else {
+            return;
+        };
+        if *a_au_completed {
+            return;
+        }
+        if let Some(params) = extract_video_params_from_pes(pkt, *stream_type) {
+            *expected_params = Some(params);
+        }
     }
 
     /// Decide whether to forward or drop a packet from the **from-leg**
@@ -718,16 +1185,23 @@ impl VideoSpliceState {
         FromPacketAction::Forward
     }
 
-    /// Process one fan-in packet from the **to-leg**. Returns
-    /// `Some(SpliceOutcome::Committed)` when the packet is a PUSI=1
-    /// PES with PTS ≥ threshold *and* an IDR NAL in its payload —
-    /// that's the commit signal. Returns `None` when the packet is
-    /// mid-PES, below-threshold, or non-IDR (the next IDR PES will
-    /// commit; budget exhaustion is the fallback).
+    /// Process one fan-in packet from the **to-leg**. Returns:
+    /// - `Some(SpliceOutcome::Committed)` when the packet is a PUSI=1
+    ///   PES with PTS ≥ threshold, an IDR NAL in its payload, and
+    ///   either no codec-param baseline exists (fail-safe commit) or
+    ///   B's SPS matches A's.
+    /// - `Some(SpliceOutcome::VideoCodecParamMismatch)` when an IDR PES
+    ///   arrived at the right PTS but B's SPS parameters differ from
+    ///   A's — caller falls back to PmtBump.
+    /// - `None` when the packet is mid-PES, below-threshold, or
+    ///   non-IDR (the next IDR PES will commit; budget exhaustion is
+    ///   the fallback).
     pub fn observe_b_packet(&mut self, pkt: &[u8]) -> Option<SpliceOutcome> {
         let VideoSpliceState::Pending {
             threshold_pts,
             stream_type,
+            expected_params,
+            to_input_id,
             ..
         } = self
         else {
@@ -753,6 +1227,27 @@ impl VideoSpliceState {
         let st = *stream_type;
         if !pes_contains_idr(pkt, st) {
             return None;
+        }
+        // IDR + PTS aligned — now the codec-param sentinel. Only fires
+        // when (a) we captured a baseline from A and (b) B's IDR PES
+        // yields a parseable SPS. Any miss in (a)/(b) means we don't
+        // have enough information to refuse — fall through to commit.
+        let a_params = *expected_params;
+        let b_params = if a_params.is_some() {
+            extract_video_params_from_pes(pkt, st)
+        } else {
+            None
+        };
+        if let (Some(a), Some(b)) = (a_params, b_params) {
+            if a != b {
+                let outcome = SpliceOutcome::VideoCodecParamMismatch {
+                    to_input_id: std::mem::take(to_input_id),
+                    a_params: a,
+                    b_params: b,
+                };
+                *self = VideoSpliceState::Idle;
+                return Some(outcome);
+            }
         }
         let outcome = SpliceOutcome::Committed { first_b_pts: pts };
         *self = VideoSpliceState::Idle;
@@ -1071,7 +1566,7 @@ mod tests {
         assert_eq!(parsed.sample_rate_hz(), 48000);
         // 5.1 from 48 kHz LC.
         let pkt = pkt_with_pts_and_adts(1_000_000, true, 1, 3, 6);
-        let params = extract_aac_params_from_pes(&pkt).unwrap();
+        let params = extract_aac_params_from_pes(&pkt, 0x0F).unwrap();
         assert_eq!(params.channel_config, 6);
     }
 
@@ -1085,7 +1580,7 @@ mod tests {
     #[test]
     fn extract_aac_params_skips_non_pusi() {
         let pkt = pkt_with_pts_and_adts(1_000_000, /* pusi */ false, 1, 3, 2);
-        assert!(extract_aac_params_from_pes(&pkt).is_none());
+        assert!(extract_aac_params_from_pes(&pkt, 0x0F).is_none());
     }
 
     #[test]
@@ -1300,6 +1795,159 @@ mod tests {
         ));
     }
 
+    /// Build an LATM AudioMuxElement bit stream for the simple case
+    /// (`useSameStreamMux=0`, `audioMuxVersion=0`,
+    /// `allStreamsSameTimeFraming=1`, `numSubFrames=0`, `numProgram=0`,
+    /// `numLayer=0`) followed by a minimal AudioSpecificConfig
+    /// (`audioObjectType`, `samplingFrequencyIndex`, `channelConfiguration`).
+    /// Returns the packed bytes ready to be planted as a PES payload.
+    fn build_latm_payload(aot: u8, sfi: u8, channel_config: u8) -> Vec<u8> {
+        let mut bits: Vec<u8> = vec![];
+        bits.push(0); // useSameStreamMux = 0
+        bits.push(0); // audioMuxVersion = 0
+        bits.push(1); // allStreamsSameTimeFraming = 1
+        for _ in 0..6 {
+            bits.push(0); // numSubFrames = 0
+        }
+        for _ in 0..4 {
+            bits.push(0); // numProgram = 0
+        }
+        for _ in 0..3 {
+            bits.push(0); // numLayer = 0
+        }
+        // AudioSpecificConfig: AOT (5 bits — assume ≤30, no escape), SFI (4), channel_config (4)
+        for i in (0..5).rev() {
+            bits.push((aot >> i) & 1);
+        }
+        for i in (0..4).rev() {
+            bits.push((sfi >> i) & 1);
+        }
+        for i in (0..4).rev() {
+            bits.push((channel_config >> i) & 1);
+        }
+        pack_bits(&bits)
+    }
+
+    /// Build a PUSI=1 stream_type-0x11 PES TS packet with a LATM
+    /// payload immediately after the PES header.
+    fn pkt_with_pts_and_latm(
+        pts: u64,
+        pusi: bool,
+        aot: u8,
+        sfi: u8,
+        channel_config: u8,
+    ) -> [u8; 188] {
+        let mut p = pkt_with_pts(pts, pusi);
+        let latm = build_latm_payload(aot, sfi, channel_config);
+        let cap = (p.len() - 18).min(latm.len());
+        p[18..18 + cap].copy_from_slice(&latm[..cap]);
+        p
+    }
+
+    #[test]
+    fn parse_latm_round_trip_aac_lc_stereo_48k() {
+        // AOT=2 (AAC-LC), SFI=3 (48 kHz), channel_config=2 (stereo).
+        let payload = build_latm_payload(2, 3, 2);
+        let parsed = parse_aac_latm_params(&payload).expect("parse latm");
+        // LATM → AacAudioParams normalisation: profile = AOT - 1
+        // (AAC-LC AOT=2 → profile=1, matching ADTS convention).
+        assert_eq!(parsed.profile, 1);
+        assert_eq!(parsed.sample_rate_idx, 3);
+        assert_eq!(parsed.channel_config, 2);
+        assert_eq!(parsed.sample_rate_hz(), 48000);
+    }
+
+    #[test]
+    fn parse_latm_rejects_use_same_stream_mux() {
+        // useSameStreamMux=1 means "reuse prior StreamMuxConfig". The
+        // parser doesn't have it; fail-safe to None.
+        let mut bits: Vec<u8> = vec![];
+        bits.push(1);
+        let payload = pack_bits(&bits);
+        assert!(parse_aac_latm_params(&payload).is_none());
+    }
+
+    #[test]
+    fn parse_latm_rejects_audio_mux_version_1() {
+        let mut bits: Vec<u8> = vec![];
+        bits.push(0); // useSameStreamMux=0
+        bits.push(1); // audioMuxVersion=1 (extended; not supported)
+        let payload = pack_bits(&bits);
+        assert!(parse_aac_latm_params(&payload).is_none());
+    }
+
+    #[test]
+    fn extract_latm_params_via_dispatch() {
+        // The same extract path used in the assembler — dispatch on
+        // stream_type 0x11 → LATM parser.
+        let pkt = pkt_with_pts_and_latm(1_000_000, true, 2, 3, 6);
+        let params = extract_aac_params_from_pes(&pkt, 0x11).expect("extract latm");
+        assert_eq!(params.profile, 1); // AAC-LC normalised
+        assert_eq!(params.sample_rate_idx, 3);
+        assert_eq!(params.channel_config, 6);
+    }
+
+    #[test]
+    fn extract_latm_dispatch_returns_none_for_wrong_stream_type() {
+        // LATM payload but stream_type set to 0x0F (ADTS) — dispatch
+        // calls the ADTS parser, which fails on the missing sync word.
+        let pkt = pkt_with_pts_and_latm(1_000_000, true, 2, 3, 2);
+        assert!(extract_aac_params_from_pes(&pkt, 0x0F).is_none());
+    }
+
+    #[test]
+    fn sentinel_rejects_latm_channel_count_change() {
+        // A is LATM AAC-LC stereo 48 kHz; B is LATM AAC-LC 5.1 48 kHz.
+        let mut s = AudioSpliceState::new();
+        let now = Instant::now();
+        let a_params = AacAudioParams {
+            profile: 1,
+            sample_rate_idx: 3,
+            channel_config: 2,
+        };
+        assert!(s.arm(
+            "to-leg".into(),
+            0x11, // LATM
+            90_000,
+            now,
+            Duration::from_millis(200),
+            Some(a_params),
+        ));
+        let b_pkt = pkt_with_pts_and_latm(91_920, true, 2, 3, 6);
+        match s.observe_b_packet(&b_pkt) {
+            Some(SpliceOutcome::CodecParamMismatch {
+                to_input_id,
+                a_params: a,
+                b_params: b,
+            }) => {
+                assert_eq!(to_input_id, "to-leg");
+                assert_eq!(a, a_params);
+                assert_eq!(b.channel_config, 6);
+            }
+            other => panic!("expected CodecParamMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sentinel_commits_latm_match() {
+        let mut s = AudioSpliceState::new();
+        let now = Instant::now();
+        let a = AacAudioParams { profile: 1, sample_rate_idx: 3, channel_config: 2 };
+        assert!(s.arm(
+            "to".into(),
+            0x11,
+            90_000,
+            now,
+            Duration::from_millis(200),
+            Some(a),
+        ));
+        let b_pkt = pkt_with_pts_and_latm(91_920, true, 2, 3, 2);
+        assert!(matches!(
+            s.observe_b_packet(&b_pkt),
+            Some(SpliceOutcome::Committed { first_b_pts: 91_920 })
+        ));
+    }
+
     #[test]
     fn sentinel_skipped_for_non_aac_stream_type() {
         // MP2 audio: frame-duration table supports the splice, but the
@@ -1469,13 +2117,28 @@ mod tests {
         assert!(!pes_contains_idr(&p, 0x1B));
     }
 
+    /// Helper: arm a video splice without a codec-param baseline
+    /// (matches today's MVP path for tests that only exercise PTS+IDR
+    /// alignment).
+    fn video_arm_no_sentinel(
+        s: &mut VideoSpliceState,
+        to: &str,
+        stream_type: u8,
+        last_a_pts: u64,
+        now: Instant,
+        budget: Duration,
+    ) -> bool {
+        s.arm(to.to_string(), stream_type, last_a_pts, now, budget, None)
+    }
+
     #[test]
     fn video_arm_rejects_non_video_stream_type() {
         let mut s = VideoSpliceState::new();
         let now = Instant::now();
         // AAC stream type — not a video codec; arm must refuse.
-        assert!(!s.arm(
-            "to".into(),
+        assert!(!video_arm_no_sentinel(
+            &mut s,
+            "to",
             0x0F,
             1_000_000,
             now,
@@ -1489,8 +2152,9 @@ mod tests {
         let mut s = VideoSpliceState::new();
         let now = Instant::now();
         // last_a = 90_000, threshold = 93_600 (+ VIDEO_FRAME_DURATION_90K).
-        assert!(s.arm(
-            "to".into(),
+        assert!(video_arm_no_sentinel(
+            &mut s,
+            "to",
             0x1B,
             90_000,
             now,
@@ -1516,8 +2180,9 @@ mod tests {
         // anchor frame.
         let mut s = VideoSpliceState::new();
         let now = Instant::now();
-        assert!(s.arm(
-            "to".into(),
+        assert!(video_arm_no_sentinel(
+            &mut s,
+            "to",
             0x1B,
             90_000,
             now,
@@ -1541,8 +2206,9 @@ mod tests {
         // qualify as a clean RAP.
         let mut s = VideoSpliceState::new();
         let now = Instant::now();
-        assert!(s.arm(
-            "to".into(),
+        assert!(video_arm_no_sentinel(
+            &mut s,
+            "to",
             0x1B,
             90_000,
             now,
@@ -1557,8 +2223,9 @@ mod tests {
     fn video_skips_non_pusi() {
         let mut s = VideoSpliceState::new();
         let now = Instant::now();
-        assert!(s.arm(
-            "to".into(),
+        assert!(video_arm_no_sentinel(
+            &mut s,
+            "to",
             0x1B,
             90_000,
             now,
@@ -1573,8 +2240,9 @@ mod tests {
     fn video_hevc_commits_on_idr_w_radl() {
         let mut s = VideoSpliceState::new();
         let now = Instant::now();
-        assert!(s.arm(
-            "to".into(),
+        assert!(video_arm_no_sentinel(
+            &mut s,
+            "to",
             0x24,
             90_000,
             now,
@@ -1592,8 +2260,9 @@ mod tests {
     fn video_timeout_emits_once() {
         let mut s = VideoSpliceState::new();
         let now = Instant::now();
-        assert!(s.arm(
-            "to-leg".into(),
+        assert!(video_arm_no_sentinel(
+            &mut s,
+            "to-leg",
             0x1B,
             90_000,
             now,
@@ -1613,8 +2282,9 @@ mod tests {
     fn video_no_timeout_before_deadline() {
         let mut s = VideoSpliceState::new();
         let now = Instant::now();
-        assert!(s.arm(
-            "to".into(),
+        assert!(video_arm_no_sentinel(
+            &mut s,
+            "to",
             0x1B,
             90_000,
             now,
@@ -1631,8 +2301,9 @@ mod tests {
         let mut s = VideoSpliceState::new();
         let now = Instant::now();
         let near_top: u64 = (1u64 << 33) - 1000;
-        assert!(s.arm(
-            "to".into(),
+        assert!(video_arm_no_sentinel(
+            &mut s,
+            "to",
             0x1B,
             near_top,
             now,
@@ -1659,8 +2330,9 @@ mod tests {
     fn video_from_leg_forwarded_then_dropped_at_next_pusi() {
         let mut s = VideoSpliceState::new();
         let now = Instant::now();
-        assert!(s.arm(
-            "to".into(),
+        assert!(video_arm_no_sentinel(
+            &mut s,
+            "to",
             0x1B,
             90_000,
             now,
@@ -1677,12 +2349,416 @@ mod tests {
         assert!(s.is_pending());
     }
 
+    // ── Video codec-param sentinel ───────────────────────────────
+
+    /// Encode an Exp-Golomb unsigned `ue(v)` into a bit vector.
+    fn push_ue(bits: &mut Vec<u8>, k: u32) {
+        if k == 0 {
+            bits.push(1);
+            return;
+        }
+        let v = k + 1;
+        let n_bits = 32 - v.leading_zeros();
+        for _ in 0..(n_bits - 1) {
+            bits.push(0);
+        }
+        bits.push(1);
+        for i in (0..(n_bits - 1)).rev() {
+            bits.push(((v >> i) & 1) as u8);
+        }
+    }
+
+    /// Pack a bit vector (MSB-first per byte) into a byte stream,
+    /// zero-padding any trailing partial byte.
+    fn pack_bits(bits: &[u8]) -> Vec<u8> {
+        let mut out = vec![];
+        let mut cur = 0u8;
+        let mut nb = 0u32;
+        for &b in bits {
+            cur = (cur << 1) | (b & 1);
+            nb += 1;
+            if nb == 8 {
+                out.push(cur);
+                cur = 0;
+                nb = 0;
+            }
+        }
+        if nb > 0 {
+            cur <<= 8 - nb;
+            out.push(cur);
+        }
+        out
+    }
+
+    /// Build a minimal H.264 SPS RBSP for the test parser. Generates
+    /// the fixed pre-amble + Exp-Golomb-encoded body covering exactly
+    /// the fields [`parse_avc_sps_params`] reads. Returns the RBSP
+    /// (post-NAL-header) bytes. For `extended_profile` values
+    /// (100, 110, …) the optional chroma + bit-depth fields are
+    /// included; for baseline/main/extended profiles (66/77/88) those
+    /// fields are skipped and the parser defaults to 4:2:0 8-bit.
+    fn build_avc_sps_rbsp(
+        profile_idc: u8,
+        level_idc: u8,
+        chroma_format_idc: u8,
+        bit_depth_luma_minus8: u8,
+        bit_depth_chroma_minus8: u8,
+        w_mbs_minus1: u32,
+        h_map_units_minus1: u32,
+        frame_mbs_only_flag: u8,
+    ) -> Vec<u8> {
+        let mut bits: Vec<u8> = vec![];
+        push_ue(&mut bits, 0); // seq_parameter_set_id
+        let is_extended = matches!(
+            profile_idc,
+            100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+        );
+        if is_extended {
+            push_ue(&mut bits, chroma_format_idc as u32);
+            if chroma_format_idc == 3 {
+                bits.push(0); // separate_colour_plane_flag
+            }
+            push_ue(&mut bits, bit_depth_luma_minus8 as u32);
+            push_ue(&mut bits, bit_depth_chroma_minus8 as u32);
+            bits.push(0); // qpprime_y_zero_transform_bypass_flag
+            bits.push(0); // seq_scaling_matrix_present_flag = 0
+        }
+        push_ue(&mut bits, 0); // log2_max_frame_num_minus4
+        push_ue(&mut bits, 0); // pic_order_cnt_type
+        push_ue(&mut bits, 0); // log2_max_pic_order_cnt_lsb_minus4
+        push_ue(&mut bits, 1); // max_num_ref_frames
+        bits.push(0); // gaps_in_frame_num_value_allowed_flag
+        push_ue(&mut bits, w_mbs_minus1);
+        push_ue(&mut bits, h_map_units_minus1);
+        bits.push(frame_mbs_only_flag & 1);
+
+        let mut out: Vec<u8> = vec![profile_idc, 0x00, level_idc];
+        out.extend(pack_bits(&bits));
+        out
+    }
+
+    /// Build a PUSI=1 video PES TS packet carrying AUD + SPS + IDR
+    /// slice NAL units. Used by the codec-param sentinel tests to
+    /// drive `extract_video_params_from_pes` + `observe_b_packet`
+    /// together. SPS RBSP is the byte sequence produced by
+    /// [`build_avc_sps_rbsp`].
+    fn pkt_with_avc_idr_pes(pts: u64, sps_rbsp: &[u8]) -> [u8; 188] {
+        let mut payload: Vec<u8> = vec![];
+        // AUD: start code + NAL header (type 9, nal_ref_idc=0) + primary_pic_type
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x09, 0x10]);
+        // SPS: start code + NAL header (type 7, nal_ref_idc=3) + rbsp
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x67]);
+        payload.extend_from_slice(sps_rbsp);
+        // IDR slice: start code + NAL header (type 5, nal_ref_idc=3)
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x65]);
+
+        let mut p = [0u8; 188];
+        p[0] = 0x47;
+        p[1] = 0x40; // PUSI=1
+        p[2] = 0x11;
+        p[3] = 0x10;
+        p[4] = 0x00;
+        p[5] = 0x00;
+        p[6] = 0x01;
+        p[7] = 0xE0;
+        p[8] = 0;
+        p[9] = 0;
+        p[10] = 0x80;
+        p[11] = 0x80;
+        p[12] = 5;
+        let m: u64 = pts & 0x1_FFFF_FFFF;
+        p[13] = 0x20 | (((m >> 30) as u8) & 0x07) << 1 | 1;
+        p[14] = ((m >> 22) as u8) & 0xFF;
+        p[15] = ((((m >> 15) as u8) & 0x7F) << 1) | 1;
+        p[16] = ((m >> 7) as u8) & 0xFF;
+        p[17] = (((m as u8) & 0x7F) << 1) | 1;
+        let cap = p.len() - 18;
+        let n = payload.len().min(cap);
+        p[18..18 + n].copy_from_slice(&payload[..n]);
+        p
+    }
+
+    fn avc_baseline_320x240() -> VideoCodecParams {
+        VideoCodecParams {
+            codec: VideoCodec::Avc,
+            profile_idc: 66,
+            level_idc: 30,
+            chroma_format_idc: 1,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            width: 320,
+            height: 240,
+        }
+    }
+
     #[test]
-    fn video_commit_resets_to_idle() {
+    fn parse_avc_sps_baseline_round_trip() {
+        // 320×240 baseline (profile 66, level 3.0). Verifies the parser
+        // walks ue() encoded values correctly and computes width/height
+        // from pic_*_in_mbs values.
+        let rbsp = build_avc_sps_rbsp(66, 30, 1, 0, 0, 19, 14, 1);
+        let params = parse_avc_sps_params(&rbsp).expect("parse");
+        assert_eq!(params, avc_baseline_320x240());
+    }
+
+    #[test]
+    fn parse_avc_sps_high_profile_10bit() {
+        // High10 profile (110), Main 5.0 level (50), 4:2:0 chroma,
+        // 10-bit luma + chroma, 1920×1088 coded (1080 displayed but
+        // SPS rounds to nearest 16-mb boundary).
+        let rbsp = build_avc_sps_rbsp(110, 50, 1, 2, 2, 119, 67, 1);
+        let params = parse_avc_sps_params(&rbsp).expect("parse");
+        assert_eq!(params.codec, VideoCodec::Avc);
+        assert_eq!(params.profile_idc, 110);
+        assert_eq!(params.level_idc, 50);
+        assert_eq!(params.bit_depth_luma, 10);
+        assert_eq!(params.bit_depth_chroma, 10);
+        assert_eq!(params.width, 1920);
+        assert_eq!(params.height, 1088);
+    }
+
+    #[test]
+    fn parse_avc_sps_too_short() {
+        assert!(parse_avc_sps_params(&[0x42, 0x00]).is_none());
+    }
+
+    #[test]
+    fn extract_video_params_from_avc_idr_pes() {
+        let rbsp = build_avc_sps_rbsp(66, 30, 1, 0, 0, 19, 14, 1);
+        let pkt = pkt_with_avc_idr_pes(1_000_000, &rbsp);
+        let params = extract_video_params_from_pes(&pkt, 0x1B).expect("extract");
+        assert_eq!(params, avc_baseline_320x240());
+    }
+
+    #[test]
+    fn extract_video_params_skips_non_pusi() {
+        // Even a packet carrying a perfect SPS shouldn't yield params
+        // when PUSI=0 (mid-PES bytes — the SPS is part of an earlier
+        // PES and was already snapshotted from its own PUSI packet).
+        let rbsp = build_avc_sps_rbsp(66, 30, 1, 0, 0, 19, 14, 1);
+        let mut pkt = pkt_with_avc_idr_pes(1_000_000, &rbsp);
+        pkt[1] = 0x00; // clear PUSI
+        assert!(extract_video_params_from_pes(&pkt, 0x1B).is_none());
+    }
+
+    #[test]
+    fn extract_video_params_no_sps_in_payload() {
+        // P-slice only PES: no SPS NAL → parser returns None and the
+        // sentinel falls through to PTS-only commit.
+        let nals = [(4, avc_nal(9)), (3, avc_nal(1))];
+        let pkt = pkt_with_video_pes(1_000_000, true, &nals);
+        assert!(extract_video_params_from_pes(&pkt, 0x1B).is_none());
+    }
+
+    #[test]
+    fn record_a_video_params_captures_sps() {
+        let mut s = VideoSpliceState::new();
+        let now = Instant::now();
+        assert!(video_arm_no_sentinel(
+            &mut s,
+            "to",
+            0x1B,
+            90_000,
+            now,
+            Duration::from_millis(2000),
+        ));
+        let rbsp = build_avc_sps_rbsp(66, 30, 1, 0, 0, 19, 14, 1);
+        let a_pkt = pkt_with_avc_idr_pes(89_000, &rbsp);
+        s.record_a_video_params(&a_pkt);
+        match &s {
+            VideoSpliceState::Pending { expected_params, .. } => {
+                assert_eq!(*expected_params, Some(avc_baseline_320x240()));
+            }
+            _ => panic!("expected Pending"),
+        }
+    }
+
+    #[test]
+    fn record_a_video_params_noop_after_au_completed() {
+        let mut s = VideoSpliceState::new();
+        let now = Instant::now();
+        assert!(video_arm_no_sentinel(
+            &mut s,
+            "to",
+            0x1B,
+            90_000,
+            now,
+            Duration::from_millis(2000),
+        ));
+        // Drive A's next PUSI=1 → AU completed.
+        let pusi = pkt_with_video_pes(91_000, true, &[(4, avc_nal(1))]);
+        assert_eq!(s.observe_a_packet(&pusi), FromPacketAction::Drop);
+        // Subsequent record attempts are no-ops.
+        let rbsp = build_avc_sps_rbsp(66, 30, 1, 0, 0, 19, 14, 1);
+        let later = pkt_with_avc_idr_pes(93_000, &rbsp);
+        s.record_a_video_params(&later);
+        match &s {
+            VideoSpliceState::Pending { expected_params, .. } => {
+                assert_eq!(*expected_params, None);
+            }
+            _ => panic!("expected Pending"),
+        }
+    }
+
+    #[test]
+    fn video_sentinel_commits_when_params_match() {
         let mut s = VideoSpliceState::new();
         let now = Instant::now();
         assert!(s.arm(
             "to".into(),
+            0x1B,
+            90_000,
+            now,
+            Duration::from_millis(2000),
+            Some(avc_baseline_320x240()),
+        ));
+        let rbsp = build_avc_sps_rbsp(66, 30, 1, 0, 0, 19, 14, 1);
+        let b_pkt = pkt_with_avc_idr_pes(93_600, &rbsp);
+        assert!(matches!(
+            s.observe_b_packet(&b_pkt),
+            Some(SpliceOutcome::Committed { first_b_pts: 93_600 })
+        ));
+        assert!(!s.is_pending());
+    }
+
+    #[test]
+    fn video_sentinel_rejects_on_resolution_change() {
+        let mut s = VideoSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to-leg".into(),
+            0x1B,
+            90_000,
+            now,
+            Duration::from_millis(2000),
+            Some(avc_baseline_320x240()),
+        ));
+        // B is 640×480: pic_width_in_mbs_minus1 = 39, h_map_units_minus1 = 29.
+        let rbsp = build_avc_sps_rbsp(66, 30, 1, 0, 0, 39, 29, 1);
+        let b_pkt = pkt_with_avc_idr_pes(93_600, &rbsp);
+        match s.observe_b_packet(&b_pkt) {
+            Some(SpliceOutcome::VideoCodecParamMismatch {
+                to_input_id,
+                a_params,
+                b_params,
+            }) => {
+                assert_eq!(to_input_id, "to-leg");
+                assert_eq!(a_params.width, 320);
+                assert_eq!(b_params.width, 640);
+                assert_eq!(b_params.height, 480);
+            }
+            other => panic!("expected VideoCodecParamMismatch, got {other:?}"),
+        }
+        assert!(!s.is_pending());
+    }
+
+    #[test]
+    fn video_sentinel_rejects_on_profile_change() {
+        let mut s = VideoSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to".into(),
+            0x1B,
+            90_000,
+            now,
+            Duration::from_millis(2000),
+            Some(avc_baseline_320x240()),
+        ));
+        // B is Main profile (77) instead of Baseline (66).
+        let rbsp = build_avc_sps_rbsp(77, 30, 1, 0, 0, 19, 14, 1);
+        let b_pkt = pkt_with_avc_idr_pes(93_600, &rbsp);
+        assert!(matches!(
+            s.observe_b_packet(&b_pkt),
+            Some(SpliceOutcome::VideoCodecParamMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn video_sentinel_rejects_on_bit_depth_change() {
+        // A is High10 10-bit; B is High10 8-bit. Bit-depth mismatch
+        // forces a decoder re-init.
+        let mut s = VideoSpliceState::new();
+        let now = Instant::now();
+        let a = VideoCodecParams {
+            codec: VideoCodec::Avc,
+            profile_idc: 110,
+            level_idc: 50,
+            chroma_format_idc: 1,
+            bit_depth_luma: 10,
+            bit_depth_chroma: 10,
+            width: 1920,
+            height: 1088,
+        };
+        assert!(s.arm(
+            "to".into(),
+            0x1B,
+            90_000,
+            now,
+            Duration::from_millis(2000),
+            Some(a),
+        ));
+        // B at 8-bit.
+        let rbsp = build_avc_sps_rbsp(110, 50, 1, 0, 0, 119, 67, 1);
+        let b_pkt = pkt_with_avc_idr_pes(93_600, &rbsp);
+        assert!(matches!(
+            s.observe_b_packet(&b_pkt),
+            Some(SpliceOutcome::VideoCodecParamMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn video_sentinel_falls_through_when_a_params_unknown() {
+        // No A baseline → sentinel can't refuse → commit on IDR/PTS alone.
+        let mut s = VideoSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to".into(),
+            0x1B,
+            90_000,
+            now,
+            Duration::from_millis(2000),
+            None,
+        ));
+        // B has a different profile, but sentinel doesn't care because A is unknown.
+        let rbsp = build_avc_sps_rbsp(77, 40, 1, 0, 0, 39, 29, 1);
+        let b_pkt = pkt_with_avc_idr_pes(93_600, &rbsp);
+        assert!(matches!(
+            s.observe_b_packet(&b_pkt),
+            Some(SpliceOutcome::Committed { first_b_pts: 93_600 })
+        ));
+    }
+
+    #[test]
+    fn video_sentinel_falls_through_when_b_params_unparseable() {
+        // A snapshot present; B's PES doesn't carry an SPS (e.g. some
+        // encoders don't emit SPS on every IDR). Sentinel must
+        // fail-safe to commit on IDR+PTS alone — refusing on missing
+        // data would refuse perfectly compatible splices.
+        let mut s = VideoSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to".into(),
+            0x1B,
+            90_000,
+            now,
+            Duration::from_millis(2000),
+            Some(avc_baseline_320x240()),
+        ));
+        // IDR slice only — no SPS.
+        let b_pkt = pkt_with_video_pes(93_600, true, &[(4, avc_nal(5))]);
+        assert!(matches!(
+            s.observe_b_packet(&b_pkt),
+            Some(SpliceOutcome::Committed { first_b_pts: 93_600 })
+        ));
+    }
+
+    #[test]
+    fn video_commit_resets_to_idle() {
+        let mut s = VideoSpliceState::new();
+        let now = Instant::now();
+        assert!(video_arm_no_sentinel(
+            &mut s,
+            "to",
             0x1B,
             90_000,
             now,

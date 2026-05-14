@@ -725,7 +725,12 @@ impl FlowManager {
     ///
     /// Returns an error if the flow is not running or `new_input_id` is not
     /// a member of the flow.
-    pub async fn switch_active_input(&self, flow_id: &str, new_input_id: &str) -> Result<()> {
+    pub async fn switch_active_input(
+        &self,
+        flow_id: &str,
+        new_input_id: &str,
+        splice_mode_override: Option<crate::config::models::SpliceMode>,
+    ) -> Result<()> {
         let runtime = self
             .flows
             .get(flow_id)
@@ -738,17 +743,20 @@ impl FlowManager {
         // flips that slot's active-leg pointer, bumps the owning program's
         // PMT version, and arms DI=1 on the next PCR for the slot's
         // out_pid. Slots without a matching leg are silently skipped.
+        //
+        // `splice_mode_override` lets the caller bypass the slot's
+        // config-time `splice_mode` for *this one switch* — useful for
+        // ad-hoc operator overrides without reconfiguring the flow.
+        // The assembler honours the override on a per-call basis; the
+        // config-time value remains the slot's default.
+        //
         // Channel try_send is fine here — channel depth 16 is plenty for
         // operator-paced switches; if full, the operator can re-Take.
         if let Some(handle) = runtime.pid_bus_assembler_handle.as_ref() {
             let _ = handle.plan_tx.try_send(
                 crate::engine::ts_assembler::PlanCommand::SwitchActiveInput {
                     new_input_id: new_input_id.to_string(),
-                    // No per-switch override today; the assembler reads
-                    // each switch slot's config-time `splice_mode` for
-                    // its routing decision. Wire this through when the
-                    // ad-hoc operator-override path lands.
-                    splice_mode_override: None,
+                    splice_mode_override,
                 },
             );
         }

@@ -393,9 +393,10 @@ async fn run_assembler(
 ) {
     use crate::engine::pes_splice::{
         AacAudioParams, AudioSpliceState, FromPacketAction, SpliceOutcome,
-        VideoSpliceState, DEFAULT_AUDIO_SPLICE_BUDGET_MS,
+        VideoCodecParams, VideoSpliceState, DEFAULT_AUDIO_SPLICE_BUDGET_MS,
         DEFAULT_VIDEO_SPLICE_BUDGET_MS, extract_aac_params_from_pes,
-        is_supported_audio_stream_type, is_supported_video_stream_type,
+        extract_video_params_from_pes, is_supported_audio_stream_type,
+        is_supported_video_stream_type,
     };
     use std::time::Duration;
     // PES Switch Phase 4 — per-switch-slot splice state, keyed by
@@ -420,10 +421,16 @@ async fn run_assembler(
     // state, keyed by `(program_idx, out_pid)`. Disjoint from
     // `splice_state` by construction: each slot's `stream_type` is
     // either an audio codec (audio state map) or a supported video
-    // codec (this map), never both. SPS/PPS/VPS codec-param sentinel
-    // is a Session B follow-up — for now the video state machine
-    // commits on any IDR PES past threshold.
+    // codec (this map), never both.
     let mut video_splice_state: std::collections::HashMap<(usize, u16), VideoSpliceState> =
+        std::collections::HashMap::new();
+    // PES Switch Phase 4 Session B — most recent SPS-derived parameter
+    // snapshot observed on the active leg of each `(program_idx,
+    // out_pid)` for video slots. Refreshed on every active-leg PUSI=1
+    // IDR PES that carries a parseable SPS. Feeds the codec-param
+    // sentinel at splice arm time so the state machine can compare
+    // A's snapshot against B's first IDR.
+    let mut last_a_video_params: std::collections::HashMap<(usize, u16), VideoCodecParams> =
         std::collections::HashMap::new();
     // Fan-in: one task per flat slot drains the bus broadcast receiver
     // and forwards into a single mpsc. Channel capacity is deliberately
@@ -571,7 +578,7 @@ async fn run_assembler(
                     }
                     PlanCommand::SwitchActiveInput {
                         new_input_id,
-                        splice_mode_override: _,
+                        splice_mode_override,
                     } => {
                         // Walk every switch slot. If its leg list
                         // contains `new_input_id`, route by the slot's
@@ -607,14 +614,20 @@ async fn run_assembler(
                                 }
 
                                 // Decide splice path. PesAligned needs:
-                                //  (1) splice_mode == PesAligned,
+                                //  (1) effective splice_mode == PesAligned,
                                 //  (2) slot is a known audio OR video codec,
                                 //  (3) we've seen at least one PUSI=1 PTS
                                 //      on the active leg (otherwise we
                                 //      have no threshold to align B to).
+                                //
+                                // The override beats the slot's config-time
+                                // `splice_mode` for this one switch only —
+                                // None falls back to today's behaviour.
                                 use crate::config::models::SpliceMode;
+                                let effective_mode = splice_mode_override
+                                    .unwrap_or(slot.splice_mode);
                                 let pes_aligned =
-                                    matches!(slot.splice_mode, SpliceMode::PesAligned);
+                                    matches!(effective_mode, SpliceMode::PesAligned);
                                 let want_audio = pes_aligned
                                     && is_supported_audio_stream_type(slot.stream_type);
                                 let want_video = pes_aligned
@@ -668,12 +681,23 @@ async fn run_assembler(
                                         let state = video_splice_state
                                             .entry(key)
                                             .or_insert_with(VideoSpliceState::new);
+                                        // Snapshot A's last SPS-derived
+                                        // codec params for the sentinel.
+                                        // `None` when A's encoder hasn't
+                                        // emitted a parseable SPS in the
+                                        // current GoP — the state machine
+                                        // falls through to IDR+PTS-only
+                                        // commit in that case.
+                                        let a_params = last_a_video_params
+                                            .get(&key)
+                                            .copied();
                                         if state.arm(
                                             new_input_id.clone(),
                                             slot.stream_type,
                                             last_pts,
                                             std::time::Instant::now(),
                                             Duration::from_millis(budget_ms.into()),
+                                            a_params,
                                         ) {
                                             // Splice armed — defer the
                                             // flip. The fanin handler
@@ -785,11 +809,31 @@ async fn run_assembler(
                             ) {
                                 last_a_pts.insert(key, pts);
                             }
-                            if slot.stream_type == 0x0F {
+                            if matches!(slot.stream_type, 0x0F | 0x11) {
                                 if let Some(p) = extract_aac_params_from_pes(
                                     &es.payload,
+                                    slot.stream_type,
                                 ) {
                                     last_a_aac_params.insert(key, p);
+                                }
+                            }
+                            // Snapshot SPS-derived params for video slots
+                            // on every active-leg PUSI=1 that carries a
+                            // parseable SPS. Most encoders emit SPS on
+                            // every IDR; some emit it once per GoP. The
+                            // last-seen value is what the sentinel
+                            // compares against B at arm time. Cost:
+                            // bounded ~180 B Annex-B walk + RBSP unescape
+                            // + Exp-Golomb parse per PUSI=1 of an active
+                            // video splice slot. Well off the per-packet
+                            // hot path (PUSI=1 is once per frame, not per
+                            // 188 B).
+                            if is_supported_video_stream_type(slot.stream_type) {
+                                if let Some(p) = extract_video_params_from_pes(
+                                    &es.payload,
+                                    slot.stream_type,
+                                ) {
+                                    last_a_video_params.insert(key, p);
                                 }
                             }
                         }
@@ -800,7 +844,7 @@ async fn run_assembler(
                             // between arm and AU-completion). Then
                             // decide forward vs drop based on AU
                             // completion state.
-                            if slot.stream_type == 0x0F
+                            if matches!(slot.stream_type, 0x0F | 0x11)
                                 && crate::engine::ts_parse::ts_pusi(&es.payload)
                             {
                                 if let Some(s) = splice_state.get_mut(&key) {
@@ -815,11 +859,17 @@ async fn run_assembler(
                                 continue;
                             }
                         } else if video_splice_pending {
-                            // Pending video splice — no codec-param
-                            // sentinel today (Session B follow-up).
-                            // Drop A bytes once A's next PUSI=1 fires
-                            // so the receiver gets a clean AU boundary
-                            // on A's last fully-emitted PES.
+                            // Pending video splice: keep A's SPS-derived
+                            // params snapshot fresh inside the state
+                            // machine on every PUSI=1 before AU
+                            // completion (matters when A emits another
+                            // IDR between arm and AU end). Then decide
+                            // forward vs drop based on AU completion.
+                            if crate::engine::ts_parse::ts_pusi(&es.payload) {
+                                if let Some(s) = video_splice_state.get_mut(&key) {
+                                    s.record_a_video_params(&es.payload);
+                                }
+                            }
                             let action = video_splice_state
                                 .get_mut(&key)
                                 .map(|s| s.observe_a_packet(&es.payload))
@@ -902,12 +952,108 @@ async fn run_assembler(
                                 // the new active leg and starts on an
                                 // IDR so the receiver decodes cleanly.
                             }
+                            Some(SpliceOutcome::VideoCodecParamMismatch {
+                                to_input_id,
+                                a_params,
+                                b_params,
+                            }) => {
+                                // Refuse the mid-PES splice — receiver
+                                // would need to re-init its decoder
+                                // (different profile / resolution /
+                                // bit-depth / chroma). Fall back to
+                                // PmtBump (flip + PMT v+1 + DI=1) so
+                                // the receiver re-init's cleanly on the
+                                // new params via the PMT bump, and emit
+                                // `pes_splice_codec_param_mismatch
+                                // { kind: "video", ... }` with the full
+                                // SPS-field diff for operator triage.
+                                active_leg_input.insert(key, to_input_id.clone());
+                                if let Some(v) = pmt_versions.get_mut(key.0) {
+                                    *v = v.wrapping_add(1) & 0x1F;
+                                }
+                                pending_di_for_out_pid.insert(slot.out_pid, true);
+                                push_psi(
+                                    &mut buf,
+                                    &plan,
+                                    &pcr_out_pid_by_program,
+                                    pat_version,
+                                    &pmt_versions,
+                                    &mut pat_cc,
+                                    &mut pmt_cc,
+                                    &broadcast_tx,
+                                    &mut bundle_seq,
+                                );
+                                if let Some(es_) = &event_sender {
+                                    es_.emit_flow_with_details(
+                                        crate::manager::events::EventSeverity::Warning,
+                                        crate::manager::events::category::FLOW,
+                                        format!(
+                                            "Flow '{flow_id}': PES-aligned video splice refused on \
+                                             program {} out_pid 0x{:04X} → '{to_input_id}': SPS \
+                                             params changed (profile {}→{}, level {}→{}, \
+                                             {}×{}→{}×{}, bit-depth {}→{}); falling back to PMT-bump",
+                                            plan.programs[key.0].program_number,
+                                            key.1,
+                                            a_params.profile_idc,
+                                            b_params.profile_idc,
+                                            a_params.level_idc,
+                                            b_params.level_idc,
+                                            a_params.width,
+                                            a_params.height,
+                                            b_params.width,
+                                            b_params.height,
+                                            a_params.bit_depth_luma,
+                                            b_params.bit_depth_luma,
+                                        ),
+                                        &flow_id,
+                                        serde_json::json!({
+                                            "error_code": "pes_splice_codec_param_mismatch",
+                                            "kind": "video",
+                                            "program_number": plan.programs[key.0].program_number,
+                                            "out_pid": key.1,
+                                            "to_input_id": to_input_id,
+                                            "a_video_params": {
+                                                "profile_idc": a_params.profile_idc,
+                                                "level_idc": a_params.level_idc,
+                                                "chroma_format_idc": a_params.chroma_format_idc,
+                                                "bit_depth_luma": a_params.bit_depth_luma,
+                                                "bit_depth_chroma": a_params.bit_depth_chroma,
+                                                "width": a_params.width,
+                                                "height": a_params.height,
+                                            },
+                                            "b_video_params": {
+                                                "profile_idc": b_params.profile_idc,
+                                                "level_idc": b_params.level_idc,
+                                                "chroma_format_idc": b_params.chroma_format_idc,
+                                                "bit_depth_luma": b_params.bit_depth_luma,
+                                                "bit_depth_chroma": b_params.bit_depth_chroma,
+                                                "width": b_params.width,
+                                                "height": b_params.height,
+                                            },
+                                        }),
+                                    );
+                                }
+                                // Seed last_a_pts + video-params snapshot
+                                // off B's first IDR so a subsequent
+                                // splice back to A has a clean baseline.
+                                if let Some(pts) = crate::engine::ts_parse::extract_pes_pts(
+                                    &es.payload,
+                                ) {
+                                    last_a_pts.insert(key, pts);
+                                }
+                                last_a_video_params.insert(key, b_params);
+                                // Fall through to rewrite + emit this
+                                // packet as the first byte of the new
+                                // active leg. Receiver sees: fresh PSI
+                                // w/ bumped PMT version → DI=1 PCR → B's
+                                // first IDR PES, so the decoder re-init's
+                                // on the new params cleanly.
+                            }
                             Some(SpliceOutcome::CodecParamMismatch { .. }) => {
-                                // Video state machine doesn't produce
-                                // CodecParamMismatch today (Session B
-                                // adds SPS/PPS/VPS sentinel). Unreachable
-                                // but no-op rather than panic on the
-                                // data path.
+                                // CodecParamMismatch is the audio variant.
+                                // The video state machine never emits it
+                                // — VideoCodecParamMismatch is the video
+                                // variant handled above. Unreachable.
                                 continue;
                             }
                             Some(SpliceOutcome::Timeout { .. }) => {
@@ -983,9 +1129,10 @@ async fn run_assembler(
                                 last_a_pts.insert(key, first_b_pts);
                                 // Refresh A's AAC snapshot to B's params
                                 // (B is the new A for the next splice).
-                                if slot.stream_type == 0x0F {
+                                if matches!(slot.stream_type, 0x0F | 0x11) {
                                     if let Some(p) = extract_aac_params_from_pes(
                                         &es.payload,
+                                        slot.stream_type,
                                     ) {
                                         last_a_aac_params.insert(key, p);
                                     }
@@ -1083,6 +1230,13 @@ async fn run_assembler(
                                 // check_timeout in flush_tick. Treat
                                 // as unreachable but safely no-op
                                 // rather than panic on the data path.
+                                continue;
+                            }
+                            Some(SpliceOutcome::VideoCodecParamMismatch { .. }) => {
+                                // VideoCodecParamMismatch is the video
+                                // variant — the audio state machine
+                                // never emits it. Unreachable on the
+                                // audio observe_b path; treat as no-op.
                                 continue;
                             }
                             None => {

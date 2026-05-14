@@ -1907,7 +1907,26 @@ async fn execute_command(
         "activate_input" => {
             let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?.to_string();
             let input_id = action["input_id"].as_str().ok_or("Missing input_id")?.to_string();
-            tracing::info!("Manager command: activate_input '{input_id}' on flow '{flow_id}'");
+            // PES Switch Phase 4 — optional per-switch override.
+            // Beats the slot's config-time `splice_mode` for this one
+            // switch only; the persisted config is untouched. Manager
+            // UI surfaces (Switcher preset, Assembly editor Take) emit
+            // this when the operator wants to force a specific splice
+            // path. Unknown/invalid values fall through to None so old
+            // edges still accept the command.
+            let splice_mode_override: Option<crate::config::models::SpliceMode> =
+                action.get("splice_mode_override").and_then(|v| match v {
+                    serde_json::Value::String(s) => match s.as_str() {
+                        "pmt_bump" => Some(crate::config::models::SpliceMode::PmtBump),
+                        "pes_aligned" => Some(crate::config::models::SpliceMode::PesAligned),
+                        _ => None,
+                    },
+                    _ => None,
+                });
+            tracing::info!(
+                "Manager command: activate_input '{input_id}' on flow '{flow_id}' splice_mode_override={:?}",
+                splice_mode_override,
+            );
             let mut cfg = app_config.write().await;
             let flow_idx = cfg
                 .flows
@@ -1926,7 +1945,10 @@ async fn execute_command(
                 }
             }
             if flow_manager.is_running(&flow_id) {
-                if let Err(e) = flow_manager.switch_active_input(&flow_id, &input_id).await {
+                if let Err(e) = flow_manager
+                    .switch_active_input(&flow_id, &input_id, splice_mode_override)
+                    .await
+                {
                     tracing::warn!("switch_active_input failed for '{flow_id}': {e}");
                 }
             }
