@@ -375,6 +375,11 @@ struct FlatSlot {
     /// `active_leg_input.get(&(program_idx, out_pid))`. Non-switch slots
     /// have this `false` and forward unconditionally.
     is_switch_leg: bool,
+    /// MPEG-TS `stream_type` of the parent [`AssemblySlot`]. Carried on
+    /// the flattened view so the PES Switch Phase 4 codec-param
+    /// sentinel can short-circuit the AAC ADTS-only path without a
+    /// PSI lookup on every fan-in packet.
+    stream_type: u8,
 }
 
 async fn run_assembler(
@@ -387,8 +392,9 @@ async fn run_assembler(
     flow_id: String,
 ) {
     use crate::engine::pes_splice::{
-        AudioSpliceState, FromPacketAction, SpliceOutcome,
-        DEFAULT_AUDIO_SPLICE_BUDGET_MS, is_supported_audio_stream_type,
+        AacAudioParams, AudioSpliceState, FromPacketAction, SpliceOutcome,
+        DEFAULT_AUDIO_SPLICE_BUDGET_MS, extract_aac_params_from_pes,
+        is_supported_audio_stream_type,
     };
     use std::time::Duration;
     // PES Switch Phase 4 — per-switch-slot splice state, keyed by
@@ -402,6 +408,12 @@ async fn run_assembler(
     // every active-leg PUSI=1 packet; cheap (one HashMap insert per AU,
     // hot path stays clean).
     let mut last_a_pts: std::collections::HashMap<(usize, u16), u64> =
+        std::collections::HashMap::new();
+    // Most recent AAC AudioSpecificConfig observed on the active leg of
+    // each (program_idx, out_pid) — feeds the codec-param sentinel at
+    // arm time. Only populated for AAC ADTS (stream_type 0x0F) slots;
+    // every other audio codec leaves this `None`.
+    let mut last_a_aac_params: std::collections::HashMap<(usize, u16), AacAudioParams> =
         std::collections::HashMap::new();
     // Fan-in: one task per flat slot drains the bus broadcast receiver
     // and forwards into a single mpsc. Channel capacity is deliberately
@@ -603,12 +615,22 @@ async fn run_assembler(
                                         let state = splice_state
                                             .entry(key)
                                             .or_insert_with(AudioSpliceState::new);
+                                        // Snapshot A's last AAC params for
+                                        // the codec sentinel. `None` for
+                                        // non-AAC or when ADTS hasn't
+                                        // been parseable yet — the state
+                                        // machine falls through to PTS-
+                                        // only commit in that case.
+                                        let a_params = last_a_aac_params
+                                            .get(&key)
+                                            .copied();
                                         if state.arm(
                                             new_input_id.clone(),
                                             slot.stream_type,
                                             last_pts,
                                             std::time::Instant::now(),
                                             Duration::from_millis(budget_ms.into()),
+                                            a_params,
                                         ) {
                                             // Splice armed — defer the
                                             // flip. The fanin handler
@@ -703,17 +725,36 @@ async fn run_assembler(
                     if is_active {
                         // Track active-leg PUSI=1 PTSes so the next
                         // splice has a valid `last_a_pts` threshold.
+                        // For AAC ADTS slots also snapshot the
+                        // AudioSpecificConfig so the codec sentinel
+                        // has a baseline to compare against B with.
                         if crate::engine::ts_parse::ts_pusi(&es.payload) {
                             if let Some(pts) = crate::engine::ts_parse::extract_pes_pts(
                                 &es.payload,
                             ) {
                                 last_a_pts.insert(key, pts);
                             }
+                            if slot.stream_type == 0x0F {
+                                if let Some(p) = extract_aac_params_from_pes(
+                                    &es.payload,
+                                ) {
+                                    last_a_aac_params.insert(key, p);
+                                }
+                            }
                         }
                         if splice_pending {
-                            // Pending splice: keep forwarding A until A
-                            // finishes its current AU (next PUSI=1),
-                            // then drop A.
+                            // Pending splice: keep A's params snapshot
+                            // fresh inside the state machine (matters
+                            // when A produces another PUSI between arm
+                            // and AU-completion). Then decide forward
+                            // vs drop based on AU completion state.
+                            if slot.stream_type == 0x0F
+                                && crate::engine::ts_parse::ts_pusi(&es.payload)
+                            {
+                                if let Some(s) = splice_state.get_mut(&key) {
+                                    s.record_a_audio_params(&es.payload);
+                                }
+                            }
                             let action = splice_state
                                 .get_mut(&key)
                                 .map(|s| s.observe_a_packet(&es.payload))
@@ -740,55 +781,158 @@ async fn run_assembler(
                         let outcome = splice_state
                             .get_mut(&key)
                             .and_then(|s| s.observe_b_packet(&es.payload));
-                        if let Some(SpliceOutcome::Committed { first_b_pts }) = outcome {
-                            // Atomic flip: active_leg → to_input_id,
-                            // PMT v+1 mod 32, DI=1 on next PCR.
-                            active_leg_input
-                                .insert(key, slot.source.0.clone());
-                            if let Some(v) = pmt_versions.get_mut(key.0) {
-                                *v = v.wrapping_add(1) & 0x1F;
-                            }
-                            pending_di_for_out_pid.insert(slot.out_pid, true);
-                            push_psi(
-                                &mut buf,
-                                &plan,
-                                &pcr_out_pid_by_program,
-                                pat_version,
-                                &pmt_versions,
-                                &mut pat_cc,
-                                &mut pmt_cc,
-                                &broadcast_tx,
-                                &mut bundle_seq,
-                            );
-                            if let Some(es_) = &event_sender {
-                                es_.emit_flow_with_details(
-                                    crate::manager::events::EventSeverity::Info,
-                                    crate::manager::events::category::FLOW,
-                                    format!(
-                                        "Flow '{flow_id}': PES-aligned splice committed on program \
-                                         {} out_pid 0x{:04X} → '{}' (first_b_pts={first_b_pts})",
-                                        plan.programs[key.0].program_number,
-                                        key.1,
-                                        slot.source.0,
-                                    ),
-                                    &flow_id,
-                                    serde_json::json!({
-                                        "error_code": "pes_splice_completed",
-                                        "program_number": plan.programs[key.0].program_number,
-                                        "out_pid": key.1,
-                                        "to_input_id": slot.source.0,
-                                        "first_b_pts": first_b_pts,
-                                    }),
+                        match outcome {
+                            Some(SpliceOutcome::Committed { first_b_pts }) => {
+                                // Atomic flip: active_leg → to_input_id,
+                                // PMT v+1 mod 32, DI=1 on next PCR.
+                                active_leg_input
+                                    .insert(key, slot.source.0.clone());
+                                if let Some(v) = pmt_versions.get_mut(key.0) {
+                                    *v = v.wrapping_add(1) & 0x1F;
+                                }
+                                pending_di_for_out_pid.insert(slot.out_pid, true);
+                                push_psi(
+                                    &mut buf,
+                                    &plan,
+                                    &pcr_out_pid_by_program,
+                                    pat_version,
+                                    &pmt_versions,
+                                    &mut pat_cc,
+                                    &mut pmt_cc,
+                                    &broadcast_tx,
+                                    &mut bundle_seq,
                                 );
+                                if let Some(es_) = &event_sender {
+                                    es_.emit_flow_with_details(
+                                        crate::manager::events::EventSeverity::Info,
+                                        crate::manager::events::category::FLOW,
+                                        format!(
+                                            "Flow '{flow_id}': PES-aligned splice committed on program \
+                                             {} out_pid 0x{:04X} → '{}' (first_b_pts={first_b_pts})",
+                                            plan.programs[key.0].program_number,
+                                            key.1,
+                                            slot.source.0,
+                                        ),
+                                        &flow_id,
+                                        serde_json::json!({
+                                            "error_code": "pes_splice_completed",
+                                            "program_number": plan.programs[key.0].program_number,
+                                            "out_pid": key.1,
+                                            "to_input_id": slot.source.0,
+                                            "first_b_pts": first_b_pts,
+                                        }),
+                                    );
+                                }
+                                // Seed last_a_pts with B's first PTS so the
+                                // next splice arm has a clean threshold.
+                                last_a_pts.insert(key, first_b_pts);
+                                // Refresh A's AAC snapshot to B's params
+                                // (B is the new A for the next splice).
+                                if slot.stream_type == 0x0F {
+                                    if let Some(p) = extract_aac_params_from_pes(
+                                        &es.payload,
+                                    ) {
+                                        last_a_aac_params.insert(key, p);
+                                    }
+                                }
+                                // Fall through to rewrite + emit this packet
+                                // — it's now the first byte of the new
+                                // active leg.
                             }
-                            // Seed last_a_pts with B's first PTS so the
-                            // next splice arm has a clean threshold.
-                            last_a_pts.insert(key, first_b_pts);
-                            // Fall through to rewrite + emit this packet
-                            // — it's now the first byte of the new
-                            // active leg.
-                        } else {
-                            continue; // not aligned yet, drop
+                            Some(SpliceOutcome::CodecParamMismatch {
+                                to_input_id,
+                                a_params,
+                                b_params,
+                            }) => {
+                                // Refuse the mid-PES splice — params
+                                // would click. Fall back to PmtBump
+                                // (flip + PMT v+1 + DI=1) so the
+                                // receiver re-init's its AAC decoder
+                                // on the new params cleanly. Emit
+                                // `pes_splice_codec_param_mismatch`
+                                // for operator visibility.
+                                active_leg_input.insert(key, to_input_id.clone());
+                                if let Some(v) = pmt_versions.get_mut(key.0) {
+                                    *v = v.wrapping_add(1) & 0x1F;
+                                }
+                                pending_di_for_out_pid.insert(slot.out_pid, true);
+                                push_psi(
+                                    &mut buf,
+                                    &plan,
+                                    &pcr_out_pid_by_program,
+                                    pat_version,
+                                    &pmt_versions,
+                                    &mut pat_cc,
+                                    &mut pmt_cc,
+                                    &broadcast_tx,
+                                    &mut bundle_seq,
+                                );
+                                if let Some(es_) = &event_sender {
+                                    es_.emit_flow_with_details(
+                                        crate::manager::events::EventSeverity::Warning,
+                                        crate::manager::events::category::FLOW,
+                                        format!(
+                                            "Flow '{flow_id}': PES-aligned splice refused on program \
+                                             {} out_pid 0x{:04X} → '{to_input_id}': AAC params \
+                                             changed (profile {}→{}, sample_rate idx {}→{}, ch {}→{}); \
+                                             falling back to PMT-bump",
+                                            plan.programs[key.0].program_number,
+                                            key.1,
+                                            a_params.profile,
+                                            b_params.profile,
+                                            a_params.sample_rate_idx,
+                                            b_params.sample_rate_idx,
+                                            a_params.channel_config,
+                                            b_params.channel_config,
+                                        ),
+                                        &flow_id,
+                                        serde_json::json!({
+                                            "error_code": "pes_splice_codec_param_mismatch",
+                                            "program_number": plan.programs[key.0].program_number,
+                                            "out_pid": key.1,
+                                            "to_input_id": to_input_id,
+                                            "a_aac_params": {
+                                                "profile": a_params.profile,
+                                                "sample_rate_idx": a_params.sample_rate_idx,
+                                                "sample_rate_hz": a_params.sample_rate_hz(),
+                                                "channel_config": a_params.channel_config,
+                                            },
+                                            "b_aac_params": {
+                                                "profile": b_params.profile,
+                                                "sample_rate_idx": b_params.sample_rate_idx,
+                                                "sample_rate_hz": b_params.sample_rate_hz(),
+                                                "channel_config": b_params.channel_config,
+                                            },
+                                        }),
+                                    );
+                                }
+                                // Seed last_a_pts + AAC snapshot off
+                                // B's first PES so a subsequent splice
+                                // back to A has a clean baseline.
+                                if let Some(pts) = crate::engine::ts_parse::extract_pes_pts(
+                                    &es.payload,
+                                ) {
+                                    last_a_pts.insert(key, pts);
+                                }
+                                last_a_aac_params.insert(key, b_params);
+                                // Fall through to rewrite + emit this
+                                // packet as the first byte of the new
+                                // active leg — receiver sees: fresh
+                                // PSI w/ bumped PMT version → DI=1
+                                // PCR → B's first PES. AAC decoder
+                                // re-init's on the bumped PMT.
+                            }
+                            Some(SpliceOutcome::Timeout { .. }) => {
+                                // observe_b_packet never returns
+                                // Timeout — that path is owned by
+                                // check_timeout in flush_tick. Treat
+                                // as unreachable but safely no-op
+                                // rather than panic on the data path.
+                                continue;
+                            }
+                            None => {
+                                continue; // not aligned yet, drop
+                            }
                         }
                     } else {
                         // Non-active leg, no pending splice → drop.
@@ -940,6 +1084,7 @@ fn install_plan(
                     source: src.clone(),
                     out_pid: s.out_pid,
                     is_switch_leg: is_switch,
+                    stream_type: s.stream_type,
                 };
                 let idx = flat.len();
                 flat.push(slot.clone());
@@ -1101,6 +1246,7 @@ fn apply_plan_replacement(
                         flat[i].out_pid = s.out_pid;
                         flat[i].program_idx = pidx;
                         flat[i].is_switch_leg = is_switch;
+                        flat[i].stream_type = s.stream_type;
                     }
                     None => {
                         let slot = FlatSlot {
@@ -1108,6 +1254,7 @@ fn apply_plan_replacement(
                             source: src.clone(),
                             out_pid: s.out_pid,
                             is_switch_leg: is_switch,
+                            stream_type: s.stream_type,
                         };
                         let idx = flat.len();
                         flat.push(slot.clone());

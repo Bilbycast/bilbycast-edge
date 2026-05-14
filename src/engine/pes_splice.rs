@@ -12,9 +12,19 @@
 //! behaviour.
 //!
 //! This first land is **audio-only** — video splice (PES Switch Phase 4
-//! follow-up) needs an IDR-aware boundary detector + codec-param sentinel
-//! that's out of scope here. Non-audio slots fall through to `PmtBump`
-//! silently so the assembler stays uniform.
+//! follow-up) needs an IDR-aware boundary detector + SPS/PPS/VPS
+//! sentinel that's out of scope here. Non-audio slots fall through to
+//! `PmtBump` silently so the assembler stays uniform.
+//!
+//! AAC AudioSpecificConfig sentinel (edge 0.65.0): the splice arm path
+//! optionally snapshots A's most recent AAC params (profile, sample
+//! rate index, channel configuration) from the active leg's ADTS sync
+//! header; on B's first PUSI=1 PES at PTS ≥ threshold the same params
+//! are parsed and compared. Mismatch → refuse the splice with
+//! `CodecParamMismatch`; the assembler falls back to PmtBump and emits
+//! `pes_splice_codec_param_mismatch`. AAC-LATM and non-AAC audio
+//! commit on PTS alone (the sentinel falls through). See
+//! [`AacAudioParams`] + [`parse_aac_adts_params`].
 //!
 //! The state machine is **pure** — it doesn't own a clock or a channel;
 //! the caller (`ts_assembler`) drives transitions via `now` / per-packet
@@ -22,7 +32,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::engine::ts_parse::{extract_pes_pts, ts_pusi};
+use crate::engine::ts_parse::{extract_pes_pts, pes_payload_offset, ts_pusi};
 
 /// Default splice budget for audio in milliseconds. ≥8 audio frames at
 /// every common codec rate (AAC-LC 21.3 ms, MP2 24 ms, AC-3 32 ms), so
@@ -61,6 +71,110 @@ pub fn is_supported_audio_stream_type(stream_type: u8) -> bool {
     audio_frame_duration_90k(stream_type).is_some()
 }
 
+/// AAC AudioSpecificConfig snapshot parsed from an ADTS sync header.
+///
+/// ADTS carries the AudioSpecificConfig fields inline at the start of
+/// every frame, so the codec-param sentinel can sample it in O(1) on the
+/// splice arm path + B's first PUSI=1 PES — no PMT-descriptor lookup is
+/// needed. AAC-LATM (stream_type `0x11`) embeds its
+/// `AudioSpecificConfig` inside StreamMuxConfig and is not parsed here;
+/// the sentinel returns `None` for LATM payloads which causes the
+/// splice to commit without the additional check (same as today's
+/// audio MVP).
+///
+/// All three fields are the raw on-the-wire codes from MPEG-4 ADTS:
+/// - `profile`: `MPEG-4 AOT − 1` (0=Main, 1=LC, 2=SSR, 3=LTP). Today's
+///   broadcast AAC is almost always LC (=1).
+/// - `sample_rate_idx`: MPEG-4 sampling_frequency_index (0..15). 0=96k,
+///   3=48k, 4=44.1k, ... 15 means "next 24 bits carry the explicit
+///   frequency", never used in ADTS in practice.
+/// - `channel_config`: MPEG-4 channel configuration (0..7). 0=defined
+///   by the program, 1=mono, 2=stereo, 6=5.1.
+///
+/// Comparing all three covers every receiver-visible AAC parameter
+/// change that produces an audible click on a mid-PES splice: profile
+/// switches the decoder mode, sample_rate forces a resampler restart,
+/// and channel_config changes the multi-channel layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AacAudioParams {
+    pub profile: u8,
+    pub sample_rate_idx: u8,
+    pub channel_config: u8,
+}
+
+impl AacAudioParams {
+    /// Human label for the sample rate (`"48000"`, `"44100"`, ...).
+    /// Falls back to the raw index in `Reserved-N` form for never-seen
+    /// codes (index 13/14 are reserved in the ADTS spec).
+    pub fn sample_rate_hz(&self) -> u32 {
+        match self.sample_rate_idx {
+            0 => 96000,
+            1 => 88200,
+            2 => 64000,
+            3 => 48000,
+            4 => 44100,
+            5 => 32000,
+            6 => 24000,
+            7 => 22050,
+            8 => 16000,
+            9 => 12000,
+            10 => 11025,
+            11 => 8000,
+            12 => 7350,
+            _ => 0,
+        }
+    }
+}
+
+/// Parse the AAC `AudioSpecificConfig` fields out of an ADTS sync header
+/// at the start of a PES payload. Returns `None` when the payload is
+/// shorter than the 7-byte ADTS header or the sync word doesn't match
+/// (e.g. AAC-LATM, mid-PES bytes, malformed frame).
+///
+/// The 7-byte ADTS header layout (reference: ISO/IEC 13818-7 §6):
+/// ```text
+/// byte 0       1                 2                 3
+/// FFFFFFFF  | FFFF VLLP        | PPSS SSCC      | CCFA HHHH ...
+///             ^^^^             | ^^   ^         | ^^
+///             sync (12 bits)   | profile (2b)   |
+///                              | sample_rate (4b)
+///                              |                | channel_config (3b, split)
+/// ```
+///
+/// Pure-bitwise, O(1), allocation-free. Designed for the splice arm
+/// path and B's first PES test — both fire well outside the per-packet
+/// hot path so this can sit on `block_in_place` callers happily.
+pub fn parse_aac_adts_params(payload: &[u8]) -> Option<AacAudioParams> {
+    if payload.len() < 7 {
+        return None;
+    }
+    if payload[0] != 0xFF || (payload[1] & 0xF0) != 0xF0 {
+        return None;
+    }
+    let profile = (payload[2] >> 6) & 0x03;
+    let sample_rate_idx = (payload[2] >> 2) & 0x0F;
+    let channel_config = ((payload[2] & 0x01) << 2) | ((payload[3] >> 6) & 0x03);
+    Some(AacAudioParams {
+        profile,
+        sample_rate_idx,
+        channel_config,
+    })
+}
+
+/// Extract `AacAudioParams` from a PUSI=1 TS packet carrying an AAC
+/// ADTS frame at the start of its PES payload. Returns `None` when the
+/// packet isn't a PUSI=1 PES, the PES payload offset can't be located,
+/// or the ADTS sync header isn't present (e.g. LATM, or the ADTS frame
+/// straddles two TS packets — the rare case where the codec-param
+/// sentinel falls through to today's commit-on-PTS behaviour).
+pub fn extract_aac_params_from_pes(pkt: &[u8]) -> Option<AacAudioParams> {
+    if !ts_pusi(pkt) {
+        return None;
+    }
+    let es_start = pes_payload_offset(pkt)?;
+    parse_aac_adts_params(&pkt[es_start..])
+}
+
 /// State of a single switch slot's PES-aligned audio splice.
 ///
 /// Driven by the assembler's main loop:
@@ -88,8 +202,12 @@ pub enum AudioSpliceState {
     /// No splice in flight; the slot follows today's behaviour.
     Idle,
     /// Splice armed — outbound is held until either:
-    /// (a) the to-leg produces a PUSI=1 PES with `pts ≥ threshold_pts`, or
-    /// (b) `Instant::now() ≥ deadline` (caller falls back to PmtBump).
+    /// (a) the to-leg produces a PUSI=1 PES with `pts ≥ threshold_pts`
+    ///     and codec params matching A (or A's params are unparseable
+    ///     so the sentinel falls through), or
+    /// (b) the to-leg's first aligned PES has codec params that differ
+    ///     from A's last params (refuse → `CodecParamMismatch`), or
+    /// (c) `Instant::now() ≥ deadline` (caller falls back to PmtBump).
     Pending {
         /// Input id of the to-leg the operator is switching to.
         to_input_id: String,
@@ -111,6 +229,18 @@ pub enum AudioSpliceState {
         /// to `true`. From then on A's packets are dropped at the
         /// assembler edge.
         a_au_completed: bool,
+        /// MPEG-TS stream_type of the slot. Used by the codec-param
+        /// sentinel to decide whether to look for an ADTS header on
+        /// B's first PES (only `0x0F` AAC ADTS today; `0x11` LATM and
+        /// every non-AAC codec skip the sentinel).
+        stream_type: u8,
+        /// `AudioSpecificConfig` snapshot from A's last PUSI=1 PES at
+        /// arm time (refreshed via `record_a_audio_params` until A's
+        /// AU completes). `None` when A's payload couldn't be parsed
+        /// (LATM, mid-PES at arm, malformed frame) — the sentinel then
+        /// falls through to today's PTS-only commit so we don't refuse
+        /// a perfectly compatible splice on noise.
+        expected_aac_params: Option<AacAudioParams>,
     },
 }
 
@@ -147,6 +277,7 @@ impl AudioSpliceState {
         last_a_pts: u64,
         now: Instant,
         budget: Duration,
+        expected_aac_params: Option<AacAudioParams>,
     ) -> bool {
         let Some(frame_dur) = audio_frame_duration_90k(stream_type) else {
             return false;
@@ -158,8 +289,42 @@ impl AudioSpliceState {
             threshold_pts,
             deadline: now + budget,
             a_au_completed: false,
+            stream_type,
+            expected_aac_params,
         };
         true
+    }
+
+    /// Refresh A's `AudioSpecificConfig` snapshot from a fresh PUSI=1
+    /// packet on the active leg. Caller invokes this on every A-leg
+    /// PUSI=1 while the splice is `Pending` and `a_au_completed` is
+    /// still false — that's the window where A's last frame fully
+    /// emits and the snapshot stays receiver-meaningful. No-op when
+    /// `Idle`, when A's AU has already completed, when the slot's
+    /// stream_type isn't AAC ADTS, or when the payload doesn't parse
+    /// as ADTS (LATM, fragmented frame).
+    pub fn record_a_audio_params(&mut self, pkt: &[u8]) {
+        let AudioSpliceState::Pending {
+            a_au_completed,
+            stream_type,
+            expected_aac_params,
+            ..
+        } = self
+        else {
+            return;
+        };
+        if *a_au_completed {
+            return;
+        }
+        // Only AAC ADTS today. AAC-LATM and every non-AAC codec skip
+        // the sentinel (extract returns None in those cases anyway, but
+        // a leading stream_type check keeps the no-op path cheap).
+        if *stream_type != 0x0F {
+            return;
+        }
+        if let Some(params) = extract_aac_params_from_pes(pkt) {
+            *expected_aac_params = Some(params);
+        }
     }
 
     /// Decide whether to forward or drop a packet from the **from-leg**
@@ -198,7 +363,11 @@ impl AudioSpliceState {
     /// calling; from-leg packets are dropped at the main loop edge.
     pub fn observe_b_packet(&mut self, pkt: &[u8]) -> Option<SpliceOutcome> {
         let AudioSpliceState::Pending {
-            threshold_pts, ..
+            threshold_pts,
+            stream_type,
+            expected_aac_params,
+            to_input_id,
+            ..
         } = self
         else {
             return None;
@@ -213,14 +382,35 @@ impl AudioSpliceState {
         // it as still waiting.
         let threshold = *threshold_pts;
         let ahead = pts.wrapping_sub(threshold) & 0x1_FFFF_FFFF;
-        if ahead <= 1 << 31 {
-            // PTS is at or past the threshold → commit.
-            let outcome = SpliceOutcome::Committed { first_b_pts: pts };
-            *self = AudioSpliceState::Idle;
-            Some(outcome)
+        if ahead > 1 << 31 {
+            return None;
+        }
+        // PTS at or past threshold — now the codec-param sentinel.
+        // Only fires when (a) the slot is AAC ADTS, (b) we captured a
+        // baseline from A, and (c) B's PES yields a parseable ADTS
+        // header. Any miss in (a)/(b)/(c) means we don't have enough
+        // information to refuse — fall through to today's commit.
+        let stream_type = *stream_type;
+        let a_params = *expected_aac_params;
+        let b_params = if stream_type == 0x0F && a_params.is_some() {
+            extract_aac_params_from_pes(pkt)
         } else {
             None
+        };
+        if let (Some(a), Some(b)) = (a_params, b_params) {
+            if a != b {
+                let outcome = SpliceOutcome::CodecParamMismatch {
+                    to_input_id: std::mem::take(to_input_id),
+                    a_params: a,
+                    b_params: b,
+                };
+                *self = AudioSpliceState::Idle;
+                return Some(outcome);
+            }
         }
+        let outcome = SpliceOutcome::Committed { first_b_pts: pts };
+        *self = AudioSpliceState::Idle;
+        Some(outcome)
     }
 
     /// Check whether the splice budget has expired. Returns
@@ -282,6 +472,18 @@ pub enum SpliceOutcome {
     Timeout {
         to_input_id: String,
     },
+    /// To-leg's first PUSI=1 PES arrived in time and at the right PTS,
+    /// but its AAC `AudioSpecificConfig` differs from A's (channel
+    /// count, sample rate, or profile). A mid-PES splice would click;
+    /// caller falls back to PmtBump (flip active + bump PMT v+1 +
+    /// DI=1) so receivers re-init the decoder cleanly on the new
+    /// codec params, and emits `pes_splice_codec_param_mismatch` for
+    /// operator visibility.
+    CodecParamMismatch {
+        to_input_id: String,
+        a_params: AacAudioParams,
+        b_params: AacAudioParams,
+    },
 }
 
 #[cfg(test)]
@@ -329,12 +531,26 @@ mod tests {
         assert_eq!(audio_frame_duration_90k(0x02), None); // MPEG-2 video
     }
 
+    /// Helper: arm with no codec-param sentinel (matches today's MVP
+    /// path for tests that only exercise PTS alignment).
+    fn arm_no_sentinel(
+        s: &mut AudioSpliceState,
+        to: &str,
+        stream_type: u8,
+        last_a_pts: u64,
+        now: Instant,
+        budget: Duration,
+    ) -> bool {
+        s.arm(to.to_string(), stream_type, last_a_pts, now, budget, None)
+    }
+
     #[test]
     fn arm_rejects_non_audio_stream_type() {
         let mut s = AudioSpliceState::new();
         let now = Instant::now();
-        let armed = s.arm(
-            "to".into(),
+        let armed = arm_no_sentinel(
+            &mut s,
+            "to",
             0x1B, // H.264 — not supported here
             1_000_000,
             now,
@@ -349,7 +565,7 @@ mod tests {
         let mut s = AudioSpliceState::new();
         let now = Instant::now();
         // AAC-LC: frame = 1920 ticks. last_a = 90_000, threshold = 91_920.
-        assert!(s.arm("to".into(), 0x0F, 90_000, now, Duration::from_millis(200)));
+        assert!(arm_no_sentinel(&mut s, "to", 0x0F, 90_000, now, Duration::from_millis(200)));
         // B emits at exactly the threshold → commit.
         let pkt = pkt_with_pts(91_920, /* pusi */ true);
         match s.observe_b_packet(&pkt) {
@@ -365,7 +581,7 @@ mod tests {
     fn commit_on_first_b_pes_past_threshold() {
         let mut s = AudioSpliceState::new();
         let now = Instant::now();
-        assert!(s.arm("to".into(), 0x0F, 90_000, now, Duration::from_millis(200)));
+        assert!(arm_no_sentinel(&mut s, "to", 0x0F, 90_000, now, Duration::from_millis(200)));
         // 200 ticks past threshold.
         let pkt = pkt_with_pts(92_120, true);
         assert!(matches!(
@@ -378,7 +594,7 @@ mod tests {
     fn skip_pes_below_threshold() {
         let mut s = AudioSpliceState::new();
         let now = Instant::now();
-        assert!(s.arm("to".into(), 0x0F, 90_000, now, Duration::from_millis(200)));
+        assert!(arm_no_sentinel(&mut s, "to", 0x0F, 90_000, now, Duration::from_millis(200)));
         // B's first PES is exactly the same as last A — alias, must wait.
         let pkt = pkt_with_pts(90_000, true);
         assert!(s.observe_b_packet(&pkt).is_none());
@@ -389,7 +605,7 @@ mod tests {
     fn skip_non_pusi() {
         let mut s = AudioSpliceState::new();
         let now = Instant::now();
-        assert!(s.arm("to".into(), 0x0F, 90_000, now, Duration::from_millis(200)));
+        assert!(arm_no_sentinel(&mut s, "to", 0x0F, 90_000, now, Duration::from_millis(200)));
         let pkt = pkt_with_pts(99_999, /* pusi */ false);
         assert!(s.observe_b_packet(&pkt).is_none());
         assert!(s.is_pending());
@@ -399,8 +615,9 @@ mod tests {
     fn timeout_emits_once() {
         let mut s = AudioSpliceState::new();
         let now = Instant::now();
-        assert!(s.arm(
-            "to-leg".into(),
+        assert!(arm_no_sentinel(
+            &mut s,
+            "to-leg",
             0x0F,
             90_000,
             now,
@@ -421,7 +638,7 @@ mod tests {
     fn no_timeout_before_deadline() {
         let mut s = AudioSpliceState::new();
         let now = Instant::now();
-        assert!(s.arm("to".into(), 0x0F, 90_000, now, Duration::from_millis(200)));
+        assert!(arm_no_sentinel(&mut s, "to", 0x0F, 90_000, now, Duration::from_millis(200)));
         assert!(s.check_timeout(now + Duration::from_millis(50)).is_none());
         assert!(s.is_pending());
     }
@@ -435,7 +652,7 @@ mod tests {
         let now = Instant::now();
         let near_top: u64 = (1u64 << 33) - 1000;
         // AAC frame 1920 → threshold wraps past 2^33 to (1920 - 1000) = 920.
-        assert!(s.arm("to".into(), 0x0F, near_top, now, Duration::from_millis(200)));
+        assert!(arm_no_sentinel(&mut s, "to", 0x0F, near_top, now, Duration::from_millis(200)));
         let pkt = pkt_with_pts(2000, true); // 2000 > 920, wrapped-ahead
         assert!(matches!(
             s.observe_b_packet(&pkt),
@@ -459,7 +676,7 @@ mod tests {
     fn from_leg_forwarded_then_dropped_at_next_pusi() {
         let mut s = AudioSpliceState::new();
         let now = Instant::now();
-        assert!(s.arm("to".into(), 0x0F, 90_000, now, Duration::from_millis(200)));
+        assert!(arm_no_sentinel(&mut s, "to", 0x0F, 90_000, now, Duration::from_millis(200)));
         // First, a non-PUSI continuation packet from A: forward.
         let cont = pkt_with_pts(0, false);
         assert_eq!(s.observe_a_packet(&cont), FromPacketAction::Forward);
@@ -478,7 +695,7 @@ mod tests {
     fn commit_resets_to_idle_so_subsequent_a_forwards() {
         let mut s = AudioSpliceState::new();
         let now = Instant::now();
-        assert!(s.arm("to".into(), 0x0F, 90_000, now, Duration::from_millis(200)));
+        assert!(arm_no_sentinel(&mut s, "to", 0x0F, 90_000, now, Duration::from_millis(200)));
         let pusi_b = pkt_with_pts(91_920, true);
         assert!(matches!(
             s.observe_b_packet(&pusi_b),
@@ -491,5 +708,301 @@ mod tests {
         // leg (B), which now becomes the "A" of any future splice.
         let new_a_pkt = pkt_with_pts(95_000, true);
         assert_eq!(s.observe_a_packet(&new_a_pkt), FromPacketAction::Forward);
+    }
+
+    // ── Codec-param sentinel ──────────────────────────────────────
+
+    /// Build a PUSI=1 PES TS packet with PTS-only header plus an
+    /// ADTS-framed AAC payload immediately after the PES header. The
+    /// PES_header_data_length is 5 (PTS only) so the ES (= ADTS frame)
+    /// starts at byte 18 of the TS packet.
+    fn pkt_with_pts_and_adts(
+        pts: u64,
+        pusi: bool,
+        profile: u8,
+        sample_rate_idx: u8,
+        channel_config: u8,
+    ) -> [u8; 188] {
+        let mut p = pkt_with_pts(pts, pusi);
+        // ADTS at byte 18: sync 0xFFF, layer=00, protection_absent=1.
+        p[18] = 0xFF;
+        p[19] = 0xF1; // 11110001 — MPEG-4, layer 0, protection_absent
+        p[20] = ((profile & 0x03) << 6)
+            | ((sample_rate_idx & 0x0F) << 2)
+            | ((channel_config & 0x04) >> 2); // top bit of channel_config
+        p[21] = ((channel_config & 0x03) << 6) | 0x00; // low two bits of channel_config, no frame_length bits
+        // bytes 22..24 = frame_length lower bits / buffer fullness — irrelevant for the sentinel
+        p[22] = 0x00;
+        p[23] = 0x80;
+        p[24] = 0x00;
+        p
+    }
+
+    fn aac_lc_stereo_48k() -> AacAudioParams {
+        AacAudioParams {
+            profile: 1,
+            sample_rate_idx: 3,
+            channel_config: 2,
+        }
+    }
+
+    #[test]
+    fn parse_adts_round_trip() {
+        let pkt = pkt_with_pts_and_adts(1_000_000, true, 1, 3, 2);
+        let es_start = pes_payload_offset(&pkt).expect("pes payload offset");
+        let parsed = parse_aac_adts_params(&pkt[es_start..]).expect("parse adts");
+        assert_eq!(parsed, aac_lc_stereo_48k());
+        assert_eq!(parsed.sample_rate_hz(), 48000);
+        // 5.1 from 48 kHz LC.
+        let pkt = pkt_with_pts_and_adts(1_000_000, true, 1, 3, 6);
+        let params = extract_aac_params_from_pes(&pkt).unwrap();
+        assert_eq!(params.channel_config, 6);
+    }
+
+    #[test]
+    fn parse_adts_rejects_non_sync() {
+        assert!(parse_aac_adts_params(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).is_none());
+        // Too short:
+        assert!(parse_aac_adts_params(&[0xFF, 0xF1]).is_none());
+    }
+
+    #[test]
+    fn extract_aac_params_skips_non_pusi() {
+        let pkt = pkt_with_pts_and_adts(1_000_000, /* pusi */ false, 1, 3, 2);
+        assert!(extract_aac_params_from_pes(&pkt).is_none());
+    }
+
+    #[test]
+    fn record_a_audio_params_captures_aac() {
+        let mut s = AudioSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to".into(),
+            0x0F,
+            90_000,
+            now,
+            Duration::from_millis(200),
+            None, // A's params not captured at arm
+        ));
+        let a_pkt = pkt_with_pts_and_adts(89_000, true, 1, 3, 2); // pre-arm PUSI from A
+        s.record_a_audio_params(&a_pkt);
+        match &s {
+            AudioSpliceState::Pending { expected_aac_params, .. } => {
+                assert_eq!(*expected_aac_params, Some(aac_lc_stereo_48k()));
+            }
+            _ => panic!("expected Pending"),
+        }
+    }
+
+    #[test]
+    fn record_a_audio_params_noop_for_non_aac_stream_type() {
+        let mut s = AudioSpliceState::new();
+        let now = Instant::now();
+        // MP2 audio — frame duration table accepts it, but the codec
+        // sentinel is ADTS-only today.
+        assert!(s.arm(
+            "to".into(),
+            0x04,
+            90_000,
+            now,
+            Duration::from_millis(200),
+            None,
+        ));
+        let a_pkt = pkt_with_pts_and_adts(89_000, true, 1, 3, 2);
+        s.record_a_audio_params(&a_pkt);
+        match &s {
+            AudioSpliceState::Pending { expected_aac_params, .. } => {
+                assert_eq!(*expected_aac_params, None);
+            }
+            _ => panic!("expected Pending"),
+        }
+    }
+
+    #[test]
+    fn record_a_audio_params_noop_after_au_completed() {
+        let mut s = AudioSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to".into(),
+            0x0F,
+            90_000,
+            now,
+            Duration::from_millis(200),
+            None,
+        ));
+        // Drive A's next PUSI=1 to mark AU completed.
+        let a_first = pkt_with_pts_and_adts(91_920, true, 1, 3, 2);
+        assert_eq!(s.observe_a_packet(&a_first), FromPacketAction::Drop);
+        // Any subsequent record attempt is a no-op (we don't want A's
+        // post-AU-completion params overwriting the snapshot since
+        // those bytes won't be emitted to the receiver anyway).
+        let later = pkt_with_pts_and_adts(93_840, true, 1, 3, 6);
+        s.record_a_audio_params(&later);
+        match &s {
+            AudioSpliceState::Pending { expected_aac_params, .. } => {
+                assert_eq!(*expected_aac_params, None);
+            }
+            _ => panic!("expected Pending"),
+        }
+    }
+
+    #[test]
+    fn sentinel_commits_when_aac_params_match() {
+        let mut s = AudioSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to".into(),
+            0x0F,
+            90_000,
+            now,
+            Duration::from_millis(200),
+            Some(aac_lc_stereo_48k()),
+        ));
+        // B's first PES at threshold with matching params → commit.
+        let b_pkt = pkt_with_pts_and_adts(91_920, true, 1, 3, 2);
+        assert!(matches!(
+            s.observe_b_packet(&b_pkt),
+            Some(SpliceOutcome::Committed { first_b_pts: 91_920 })
+        ));
+        assert!(!s.is_pending());
+    }
+
+    #[test]
+    fn sentinel_rejects_on_channel_count_change() {
+        let mut s = AudioSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to-leg".into(),
+            0x0F,
+            90_000,
+            now,
+            Duration::from_millis(200),
+            Some(aac_lc_stereo_48k()),
+        ));
+        // B is 5.1 — channel_config changed from 2 to 6.
+        let b_pkt = pkt_with_pts_and_adts(91_920, true, 1, 3, 6);
+        match s.observe_b_packet(&b_pkt) {
+            Some(SpliceOutcome::CodecParamMismatch {
+                to_input_id,
+                a_params,
+                b_params,
+            }) => {
+                assert_eq!(to_input_id, "to-leg");
+                assert_eq!(a_params, aac_lc_stereo_48k());
+                assert_eq!(b_params.channel_config, 6);
+                assert_eq!(b_params.sample_rate_idx, 3);
+            }
+            other => panic!("expected CodecParamMismatch, got {other:?}"),
+        }
+        assert!(!s.is_pending());
+    }
+
+    #[test]
+    fn sentinel_rejects_on_sample_rate_change() {
+        let mut s = AudioSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to".into(),
+            0x0F,
+            90_000,
+            now,
+            Duration::from_millis(200),
+            Some(aac_lc_stereo_48k()),
+        ));
+        // B is 44.1 kHz (idx 4) — sample_rate changed.
+        let b_pkt = pkt_with_pts_and_adts(91_920, true, 1, 4, 2);
+        assert!(matches!(
+            s.observe_b_packet(&b_pkt),
+            Some(SpliceOutcome::CodecParamMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn sentinel_rejects_on_profile_change() {
+        let mut s = AudioSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to".into(),
+            0x0F,
+            90_000,
+            now,
+            Duration::from_millis(200),
+            Some(aac_lc_stereo_48k()),
+        ));
+        // B is Main profile (0) instead of LC (1).
+        let b_pkt = pkt_with_pts_and_adts(91_920, true, 0, 3, 2);
+        assert!(matches!(
+            s.observe_b_packet(&b_pkt),
+            Some(SpliceOutcome::CodecParamMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn sentinel_falls_through_when_a_params_unknown() {
+        // We armed without an A baseline — sentinel can't refuse, so
+        // we commit on PTS alignment alone. This is the audio-MVP
+        // fallback path: AAC-LATM A leg, or arm happened before any
+        // ADTS-parseable PUSI was seen.
+        let mut s = AudioSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to".into(),
+            0x0F,
+            90_000,
+            now,
+            Duration::from_millis(200),
+            None,
+        ));
+        let b_pkt = pkt_with_pts_and_adts(91_920, true, 1, 4, 6); // would have mismatched
+        assert!(matches!(
+            s.observe_b_packet(&b_pkt),
+            Some(SpliceOutcome::Committed { first_b_pts: 91_920 })
+        ));
+    }
+
+    #[test]
+    fn sentinel_falls_through_when_b_params_unknown() {
+        // A snapshot present, but B's PES isn't ADTS-parseable (e.g.
+        // LATM source, or ADTS frame straddles two TS packets). We
+        // can't refuse on missing data — commit on PTS alone.
+        let mut s = AudioSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to".into(),
+            0x0F,
+            90_000,
+            now,
+            Duration::from_millis(200),
+            Some(aac_lc_stereo_48k()),
+        ));
+        // pkt_with_pts only carries PES header + PTS, no ADTS payload
+        // → parser returns None → sentinel falls through → commit.
+        let b_pkt = pkt_with_pts(91_920, true);
+        assert!(matches!(
+            s.observe_b_packet(&b_pkt),
+            Some(SpliceOutcome::Committed { first_b_pts: 91_920 })
+        ));
+    }
+
+    #[test]
+    fn sentinel_skipped_for_non_aac_stream_type() {
+        // MP2 audio: frame-duration table supports the splice, but the
+        // codec sentinel is ADTS-only today. Even if expected_aac_params
+        // is somehow populated, an MP2 slot must commit on PTS alone.
+        let mut s = AudioSpliceState::new();
+        let now = Instant::now();
+        assert!(s.arm(
+            "to".into(),
+            0x04, // MP2
+            90_000,
+            now,
+            Duration::from_millis(200),
+            Some(aac_lc_stereo_48k()), // would mismatch any B
+        ));
+        let b_pkt = pkt_with_pts_and_adts(92_160, true, 0, 4, 6);
+        assert!(matches!(
+            s.observe_b_packet(&b_pkt),
+            Some(SpliceOutcome::Committed { .. })
+        ));
     }
 }

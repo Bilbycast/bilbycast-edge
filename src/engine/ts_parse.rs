@@ -187,6 +187,48 @@ pub fn extract_pes_pts(pkt: &[u8]) -> Option<u64> {
     Some(pts)
 }
 
+/// Locate the PES payload start (= ES bytes, e.g. ADTS frame, NAL unit)
+/// inside a PUSI-marked TS packet. Returns `None` when the packet is not
+/// a PES start, doesn't carry payload, or the declared PES header runs
+/// off the packet boundary.
+///
+/// The returned offset is the byte index inside `pkt` where the ES data
+/// (i.e. what would follow the PES header in a fresh PES) begins.
+///
+/// Used by [`crate::engine::pes_splice`] to peek at the leading ADTS
+/// sync header for the codec-param sentinel.
+pub fn pes_payload_offset(pkt: &[u8]) -> Option<usize> {
+    if pkt.len() < TS_PACKET_SIZE {
+        return None;
+    }
+    let afc = (pkt[3] >> 4) & 0x03;
+    let payload_offset: usize = match afc {
+        0b01 => 4,
+        0b11 => {
+            let af_len = pkt.get(4).copied()? as usize;
+            5 + af_len
+        }
+        _ => return None,
+    };
+    // PES header (post-start-code) is at least 9 bytes: 4 (start code +
+    // stream_id) + 2 (PES_packet_length) + 1 (flags1) + 1 (flags2) + 1
+    // (PES_header_data_length). Plus PES_header_data_length bytes of
+    // optional fields (PTS / DTS / ESCR / etc.).
+    if payload_offset + 9 > TS_PACKET_SIZE {
+        return None;
+    }
+    let payload = &pkt[payload_offset..];
+    if payload[0] != 0x00 || payload[1] != 0x00 || payload[2] != 0x01 {
+        return None;
+    }
+    let pes_header_data_length = payload[8] as usize;
+    let es_start = payload_offset + 9 + pes_header_data_length;
+    if es_start >= TS_PACKET_SIZE {
+        return None;
+    }
+    Some(es_start)
+}
+
 /// Extract the 42-bit PCR base and 9-bit extension from the adaptation field,
 /// returning the full PCR value in 27 MHz ticks.
 pub fn extract_pcr(pkt: &[u8]) -> Option<u64> {
