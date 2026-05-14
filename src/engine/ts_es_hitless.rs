@@ -3,7 +3,7 @@
 
 //! Pre-bus Hitless merger for PID-bus `SlotSource::Hitless`.
 //!
-//! The merger sits between the [`FlowEsBus`] and the assembler: it
+//! The merger sits between the [`NodeEsBus`] and the assembler: it
 //! subscribes to two source bus keys (a `primary` and a `backup`) and
 //! republishes onto a third synthetic key that the assembler's slot
 //! points at. The assembler itself stays PID-level — zero changes to
@@ -40,7 +40,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, Instant};
 use tokio_util::sync::CancellationToken;
 
-use super::ts_es_bus::FlowEsBus;
+use super::ts_es_bus::NodeEsBus;
 
 /// Default stall timer: if no primary packet arrives within this
 /// window the merger flips to backup. Tight enough that standby cuts
@@ -73,7 +73,7 @@ pub fn spawn_hitless_es_merger_full(
     uid: String,
     primary: (String, u16),
     backup: (String, u16),
-    bus: Arc<FlowEsBus>,
+    bus: Arc<NodeEsBus>,
     stall: Duration,
     seq_aware: bool,
     path_differential_ms: Option<u32>,
@@ -327,7 +327,7 @@ mod tests {
 
     #[tokio::test]
     async fn primary_preference_when_primary_live() {
-        let bus = Arc::new(FlowEsBus::new());
+        let bus = Arc::new(NodeEsBus::new());
         let cancel = CancellationToken::new();
         let _handle = spawn_hitless_es_merger_full(
             "slot_0_0".to_string(),
@@ -365,7 +365,7 @@ mod tests {
 
     #[tokio::test]
     async fn failover_to_backup_on_stall() {
-        let bus = Arc::new(FlowEsBus::new());
+        let bus = Arc::new(NodeEsBus::new());
         let cancel = CancellationToken::new();
         let _handle = spawn_hitless_es_merger_full(
             "slot_0_0".to_string(),
@@ -401,7 +401,7 @@ mod tests {
 
     #[tokio::test]
     async fn switches_back_to_primary_on_resume() {
-        let bus = Arc::new(FlowEsBus::new());
+        let bus = Arc::new(NodeEsBus::new());
         let cancel = CancellationToken::new();
         let _handle = spawn_hitless_es_merger_full(
             "slot_0_0".to_string(),

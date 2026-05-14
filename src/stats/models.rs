@@ -361,7 +361,7 @@ pub struct MdiStats {
 }
 
 /// Per-elementary-stream counters collected on the PID bus. One entry per
-/// `(input_id, source_pid)` channel the flow's `FlowEsBus` currently
+/// `(input_id, source_pid)` channel the flow's `NodeEsBus` currently
 /// tracks. The assembler annotates entries it is actively forwarding with
 /// `out_pid`; unreferenced bus keys (e.g. PIDs present on an input but not
 /// used by the current plan) show up with `out_pid = None` so operators

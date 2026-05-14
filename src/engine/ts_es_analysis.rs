@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! PID-bus Phase 8: per-elementary-stream analyzer. One lightweight task
-//! per `(input_id, source_pid)` channel on the flow's [`FlowEsBus`].
+//! per `(input_id, source_pid)` channel on the flow's [`NodeEsBus`].
 //!
 //! Each task subscribes to its own broadcast channel on the bus and
 //! updates a dedicated [`PerEsAccumulator`] — packets, bytes, CC errors,
@@ -39,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::stats::collector::{FlowStatsAccumulator, PerEsAccumulator};
 
-use super::ts_es_bus::{EsPacket, FlowEsBus};
+use super::ts_es_bus::{EsPacket, NodeEsBus};
 
 /// Spawn one analyzer task for a given `(input_id, source_pid)` pair.
 ///
@@ -48,7 +48,7 @@ use super::ts_es_bus::{EsPacket, FlowEsBus};
 pub fn spawn_per_es_analyzer(
     input_id: impl Into<String>,
     source_pid: u16,
-    bus: Arc<FlowEsBus>,
+    bus: Arc<NodeEsBus>,
     flow_stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {

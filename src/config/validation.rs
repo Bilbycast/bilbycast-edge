@@ -250,7 +250,7 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
         // bytes reach `broadcast_tx` at any moment. PID-bus assembly
         // flows (`kind = spts` / `mpts`) break that model deliberately:
         // every input's `TsEsDemuxer` publishes onto the shared
-        // [`FlowEsBus`] concurrently, and the assembler pulls ES from
+        // [`NodeEsBus`] concurrently, and the assembler pulls ES from
         // whichever slots are configured. The `active` flag is unused
         // on the assembly path, so skip the count check there.
         let assembly_mode = flow

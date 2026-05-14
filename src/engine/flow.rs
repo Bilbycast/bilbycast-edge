@@ -84,7 +84,7 @@ use super::ts_assembler::{
     resolve_essence_slots, spawn_spts_assembler, AssemblyPlan, AssemblySlot, EsKind,
     EssenceResolveError, PendingEssenceSlot, ProgramPlan, SptsBuildResult,
 };
-use super::ts_es_bus::{FlowEsBus, TsEsDemuxer};
+use super::ts_es_bus::{NodeEsBus, TsEsDemuxer};
 use crate::stats::collector::{MediaAnalysisAccumulator, ThumbnailAccumulator, Tr101290Accumulator};
 
 /// Runtime state for a single media flow (one or more inputs, N outputs).
@@ -205,7 +205,7 @@ pub struct FlowRuntime {
     /// running. Kept on the runtime so `replace_assembly` (Phase 7) can
     /// spawn fresh Hitless mergers when the new plan adds Hitless slots.
     #[allow(dead_code)]
-    pub es_bus: Option<Arc<FlowEsBus>>,
+    pub es_bus: Option<Arc<NodeEsBus>>,
     /// Live mutable copy of the flow's `assembly` block. Used by
     /// `replace_assembly` to diff old → new and decide whether to
     /// hot-swap or fall back to a full restart. Persisted form lives
@@ -272,6 +272,33 @@ pub struct FlowRuntime {
     /// `engine::master_clock` module for the trait, kind enum, and
     /// selection policy.
     pub master_clock: crate::engine::master_clock::MasterClockHandle,
+    /// Weak handle to the owning [`crate::engine::manager::FlowManager`]
+    /// (PES Switch Phase 2.1c Stage 2). `Weak` rather than `Arc` so the
+    /// FlowManager → FlowRuntime ownership stays acyclic; flow code that
+    /// needs the manager (input publisher register / unregister, shared
+    /// demuxer acquire) upgrades on the path. Set at `start` time;
+    /// `None` should never be observed in production because the manager
+    /// outlives every flow it owns.
+    pub flow_manager_weak: std::sync::Weak<crate::engine::manager::FlowManager>,
+    /// `input_id`s for which this flow registered a node-wide publisher
+    /// via [`crate::engine::manager::FlowManager::register_input_publisher`]
+    /// at start time. The list is used by `stop()` / `Drop` to
+    /// symmetrically unregister so cross-flow subscribers see a clean
+    /// `RecvError::Closed`. Tracked separately from `input_handles`
+    /// because the unregister has to happen synchronously, before the
+    /// per-input cancel tokens fire and the broadcast::Senders drop.
+    pub registered_input_ids: std::sync::Mutex<Vec<String>>,
+    /// PES Switch Phase 2.1c Stage 3: shim tasks that hold
+    /// [`crate::engine::manager::DemuxerHandle`]s for inputs this
+    /// flow's assembly references but does NOT own in `flow.input_ids`
+    /// (cross-flow ES routing). One shim per foreign input — each
+    /// task simply waits on the flow's cancel token, then drops its
+    /// `DemuxerHandle` so the FlowManager's refcounted demuxer
+    /// registry decrements. When the LAST flow referencing a foreign
+    /// input drops its handle, the shared demuxer task is cancelled.
+    /// Empty for non-assembled flows and for flows whose assembly
+    /// only references their own inputs.
+    pub foreign_demuxer_shims: tokio::sync::Mutex<Vec<JoinHandle<()>>>,
 }
 
 /// Runtime state for a single input within a flow.
@@ -356,6 +383,8 @@ impl FlowRuntime {
         event_sender: EventSender,
         #[cfg(all(feature = "display", target_os = "linux"))]
         display_claim_registry: Arc<crate::display::claim_registry::DisplayClaimRegistry>,
+        node_es_bus: Arc<NodeEsBus>,
+        flow_manager: Arc<crate::engine::manager::FlowManager>,
     ) -> Result<Self> {
         // PID-bus assembly is accepted at config-validation time. Phases
         // 5 + 6 together lift the runtime for `kind = spts`; `kind =
@@ -377,13 +406,22 @@ impl FlowRuntime {
             Some(a) if matches!(a.kind, AssemblyKind::Passthrough) => None,
             Some(a) => Some(build_assembly_plan(a, &config, &event_sender)?),
         };
-        // Shared ES bus for the SPTS runtime. Constructed only when a
-        // plan is present; non-assembly flows pay zero cost (no Arc, no
-        // DashMap). The bus lives as long as the flow, shared by every
-        // per-input TS demuxer and the single assembler task.
-        let es_bus: Option<Arc<FlowEsBus>> = spts_build
+        // Node-wide ES bus reference. The bus instance is owned by
+        // `FlowManager` and shared across every assembled flow on the
+        // edge — non-assembly flows hold a clone of the Arc but never
+        // touch it (no map lookups, no allocations). Channels are keyed
+        // by `(input_id, source_pid)` which is globally unique on the
+        // node, so cross-flow channel collisions are impossible.
+        //
+        // Phase 1 of the PES Switch redesign: this is the only piece of
+        // structural sharing in P1. Demuxer dedup (one demuxer per
+        // input regardless of how many flows reference it) is a P2
+        // change that lands together with dropping assignment-
+        // uniqueness; before P2 each flow still owns its own demuxers
+        // because inputs are still flow-scoped.
+        let es_bus: Option<Arc<NodeEsBus>> = spts_build
             .as_ref()
-            .map(|_| Arc::new(FlowEsBus::new()));
+            .map(|_| Arc::clone(&node_es_bus));
         let cancel_token = CancellationToken::new();
         // The broadcast channel is bounded to BROADCAST_CHANNEL_CAPACITY slots.
         // When a slow output (receiver) cannot keep up, it will *not* block the
@@ -495,10 +533,26 @@ impl FlowRuntime {
         // dispatcher reads it to route mark/cue/play/scrub commands.
         #[cfg(feature = "replay")]
         let replay_command_txs: dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::replay::ReplayCommand>> = dashmap::DashMap::new();
+        // PES Switch Phase 2.1c Stage 2: track which `input_id`s we
+        // register with the node-wide `FlowManager` so `stop()` can
+        // symmetrically unregister. Built incrementally as the input
+        // loop spawns each input task.
+        let mut registered_input_ids: Vec<String> = Vec::with_capacity(config.inputs.len());
         for input_def in &config.inputs {
             let input_id = input_def.id.clone();
             let input_cancel = cancel_token.child_token();
             let (per_input_tx, _) = broadcast::channel::<RtpPacket>(BROADCAST_CHANNEL_CAPACITY);
+            // Register this input's broadcast publisher node-wide so
+            // sibling flows' assembly slots (once the membership rule
+            // is dropped) can subscribe to it via
+            // `FlowManager::subscribe_input`. Idempotent on the
+            // manager side; replaces the previous entry if any. The
+            // owning input task still publishes onto `per_input_tx`
+            // — the FlowManager just holds a clone for cross-flow
+            // consumers. The local subscribers (forwarder, demuxer)
+            // keep using the same `Sender` so no path doubles up.
+            flow_manager.register_input_publisher(&input_id, per_input_tx.clone());
+            registered_input_ids.push(input_id.clone());
             let force_idr = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             // Register per-input liveness counters. The forwarder increments
@@ -548,19 +602,53 @@ impl FlowRuntime {
 
             // In SPTS assembly mode, the per-input forwarder is replaced
             // by a TS-ES demuxer consumer that publishes elementary
-            // streams onto the shared [`FlowEsBus`]. The assembler (one
+            // streams onto the shared [`NodeEsBus`]. The assembler (one
             // per flow, spawned below) pulls ES from the bus, rewrites
             // PIDs, synthesises PAT/PMT, and is the sole publisher onto
             // `broadcast_tx`. The active-input watch is unused in this
             // mode — every input contributes ES simultaneously.
+            //
+            // PES Switch Phase 2.1c Stage 2: the demuxer task is now
+            // refcounted on `FlowManager` via `acquire_demuxer`. For
+            // single-flow-per-input (today's reality with assignment
+            // uniqueness in place), this is functionally identical to
+            // the previous flow-local spawn — one demuxer per
+            // `(input_id)`. When uniqueness is lifted in P2.1 main,
+            // sibling flows that reference the same input share the
+            // single demuxer task, eliminating duplicate-publish bugs
+            // onto the `(input_id, source_pid)` bus channels. The
+            // `DemuxerHandle` returned by `acquire_demuxer` is held
+            // by the shim task below; dropping it on `input_cancel`
+            // decrements the refcount, and the last drop cancels the
+            // shared task.
             let forwarder_handle = if let Some(ref bus) = es_bus {
-                spawn_ts_es_demuxer_consumer(
-                    input_id.clone(),
-                    per_input_tx.subscribe(),
-                    bus.clone(),
-                    input_cancel.clone(),
-                    per_input_counters,
-                )
+                let bus_clone = bus.clone();
+                let pic = per_input_counters.clone();
+                let input_id_for_demuxer = input_id.clone();
+                let demuxer_handle = flow_manager.acquire_demuxer(
+                    &input_id,
+                    move |rx, cancel| {
+                        Some(spawn_ts_es_demuxer_consumer(
+                            input_id_for_demuxer,
+                            rx,
+                            bus_clone,
+                            cancel,
+                            pic,
+                        ))
+                    },
+                );
+                // Shim task: holds the `DemuxerHandle` for this flow's
+                // duration; when this flow's `input_cancel` fires the
+                // task exits, the handle drops, and the refcount
+                // decrements. If the demuxer couldn't be acquired
+                // (input publisher not registered — shouldn't happen
+                // because we registered it above), the shim still
+                // honours cancel so the input lifecycle stays clean.
+                let input_cancel = input_cancel.clone();
+                tokio::spawn(async move {
+                    let _demuxer_handle = demuxer_handle; // moved in for RAII
+                    input_cancel.cancelled().await;
+                })
             } else {
                 spawn_input_forwarder(
                     input_id.clone(),
@@ -627,6 +715,121 @@ impl FlowRuntime {
         // TS-producing input's per-input broadcast channel, so PAT/PMT
         // arriving even a few hundred ms after input spawn lands before
         // the resolver's 3 s deadline.
+        // Build the per-input clock-identity map used by the cross-
+        // clock compatibility check inside `finalize_spts_assembler`.
+        // Populated unconditionally for assembled flows; the check
+        // itself is a no-op today (membership rule prevents cross-
+        // clock combinations) but the map is cheap (one entry per
+        // input — typical < 10) and Phase 2.1 will need it ready.
+        let input_clocks: HashMap<String, crate::engine::master_clock::ClockIdentity> = config
+            .inputs
+            .iter()
+            .map(|i| (i.id.clone(), crate::engine::master_clock::clock_identity_for_input(i)))
+            .collect();
+        // PES Switch Phase 2.1c Stage 3: enable cross-flow ES routing.
+        // The assembly plan may reference inputs that are NOT in
+        // `flow.input_ids` — owned by sibling flows on the node.
+        // For each such foreign input, acquire a refcounted handle on
+        // the shared `TsEsDemuxer` so the demuxer stays alive while
+        // this flow holds the reference; spawn a shim task that
+        // releases the handle on flow cancel. Pid slots subscribe to
+        // the resulting `(input_id, source_pid)` bus channels just like
+        // own-flow slots. Essence resolution for foreign inputs still
+        // requires the foreign flow's PSI catalogue, which today's
+        // catalogue lookup (flow-scoped `per_input_counters`) doesn't
+        // surface — foreign-input Essence slots therefore fail with
+        // `pid_bus_essence_no_catalogue`. Operators should use
+        // explicit Pid slots for cross-flow refs until catalogue
+        // sharing lands as a follow-up.
+        let mut foreign_demuxer_shims: Vec<JoinHandle<()>> = Vec::new();
+        if let Some(build) = spts_build.as_ref() {
+            let own_input_ids: std::collections::HashSet<String> = config
+                .inputs
+                .iter()
+                .map(|d| d.id.clone())
+                .collect();
+            let mut foreign_seen: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for program in &build.plan.programs {
+                for slot in &program.slots {
+                    let candidates: Vec<&str> = match &slot.switch_legs {
+                        Some(legs) => legs.iter().map(|(iid, _)| iid.as_str()).collect(),
+                        None => vec![slot.source.0.as_str()],
+                    };
+                    for iid in candidates {
+                        if own_input_ids.contains(iid) || foreign_seen.contains(iid) {
+                            continue;
+                        }
+                        foreign_seen.insert(iid.to_string());
+                        // Acquire a refcounted demuxer handle. The
+                        // `spawn_fn` only fires on first reference
+                        // node-wide; subsequent calls reuse the
+                        // running task. If the foreign input isn't
+                        // running on this node (publisher absent), the
+                        // acquire returns `None` and the shim is a
+                        // no-op — the slot will have no upstream data
+                        // until the owning flow comes online.
+                        let bus_for_demuxer = es_bus.as_ref().map(Arc::clone).unwrap_or_else(|| {
+                            // Unreachable: spts_build => es_bus is Some.
+                            // Defensive Arc clone so the closure stays
+                            // self-contained.
+                            Arc::clone(&node_es_bus)
+                        });
+                        // Foreign demuxer publishes onto the same node
+                        // bus; the slot's bus subscriber sees its
+                        // packets identically to own-input slots.
+                        // Per-input counters for cross-flow demuxer
+                        // are attributed to a synthetic node-level
+                        // accumulator since this flow doesn't own
+                        // PerInputCounters for foreign inputs. The
+                        // owning flow's demuxer still updates its
+                        // counters (because the demuxer was first
+                        // spawned by that flow); subsequent acquire
+                        // calls reuse the running task, so the
+                        // spawn_fn closure here is normally never
+                        // invoked — it's only the first-acquire path.
+                        // For the rare edge case where THIS flow is
+                        // the first to reference the foreign input
+                        // (e.g. owner flow hasn't yet completed
+                        // start), we provide a stub counters arc so
+                        // the demuxer can start without panicking.
+                        let foreign_id = iid.to_string();
+                        let stub_counters = std::sync::Arc::new(
+                            crate::stats::collector::PerInputCounters::new(
+                                "foreign".to_string(),
+                                crate::stats::collector::InputConfigMeta {
+                                    mode: None,
+                                    local_addr: None,
+                                    remote_addr: None,
+                                    listen_addr: None,
+                                    bind_addr: None,
+                                    rtsp_url: None,
+                                    whep_url: None,
+                                },
+                            ),
+                        );
+                        let demuxer_handle = flow_manager.acquire_demuxer(
+                            iid,
+                            move |rx, cancel| {
+                                Some(spawn_ts_es_demuxer_consumer(
+                                    foreign_id,
+                                    rx,
+                                    bus_for_demuxer,
+                                    cancel,
+                                    stub_counters,
+                                ))
+                            },
+                        );
+                        let cancel = cancel_token.child_token();
+                        foreign_demuxer_shims.push(tokio::spawn(async move {
+                            let _demuxer_handle = demuxer_handle;
+                            cancel.cancelled().await;
+                        }));
+                    }
+                }
+            }
+        }
+
         let pid_bus_assembler_handle: Option<crate::engine::ts_assembler::AssemblerHandle> =
             match (spts_build, &es_bus) {
                 (Some(build), Some(bus)) => Some(
@@ -638,6 +841,7 @@ impl FlowRuntime {
                         &cancel_token,
                         &event_sender,
                         &config.config.id,
+                        &input_clocks,
                     )
                     .await?,
                 ),
@@ -1074,6 +1278,9 @@ impl FlowRuntime {
             #[cfg(all(feature = "display", target_os = "linux"))]
             display_claim_registry,
             master_clock,
+            flow_manager_weak: Arc::downgrade(&flow_manager),
+            registered_input_ids: std::sync::Mutex::new(registered_input_ids),
+            foreign_demuxer_shims: tokio::sync::Mutex::new(foreign_demuxer_shims),
         })
     }
 
@@ -1144,7 +1351,7 @@ impl FlowRuntime {
             .es_bus
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!(
-                "flow '{}' assembler is running but has no FlowEsBus — internal invariant violated",
+                "flow '{}' assembler is running but has no NodeEsBus — internal invariant violated",
                 flow_id
             ))?
             .clone();
@@ -1252,6 +1459,49 @@ impl FlowRuntime {
                 );
                 bail!(msg);
             }
+        }
+
+        // Cross-clock compatibility check on the new plan. Mirrors the
+        // step 2.5 in `finalize_spts_assembler` so a hot-swap into an
+        // incompatible plan is rejected with the same error code +
+        // structured details as an initial start. See that call site
+        // for the full rationale.
+        let input_clocks: HashMap<String, crate::engine::master_clock::ClockIdentity> = self
+            .config
+            .inputs
+            .iter()
+            .map(|i| (i.id.clone(), crate::engine::master_clock::clock_identity_for_input(i)))
+            .collect();
+        if let Err(mismatch) = crate::engine::ts_assembler::check_assembly_clock_compatibility(
+            &build.plan,
+            &input_clocks,
+        ) {
+            let msg = format!(
+                "flow '{}': replace_assembly rejected — program {} slot 0x{:04X} input '{}' has master clock {} but the program already references input '{}' on clock {}",
+                flow_id,
+                mismatch.program_number,
+                mismatch.slot_out_pid,
+                mismatch.slot_input_id,
+                mismatch.slot_clock,
+                mismatch.reference_input_id,
+                mismatch.reference_clock,
+            );
+            self.event_sender.emit_flow_with_details(
+                EventSeverity::Critical,
+                category::FLOW,
+                msg.clone(),
+                flow_id,
+                serde_json::json!({
+                    "error_code": "pid_bus_master_clock_mismatch",
+                    "program_number": mismatch.program_number,
+                    "slot_out_pid": mismatch.slot_out_pid,
+                    "slot_input_id": mismatch.slot_input_id,
+                    "slot_clock": mismatch.slot_clock,
+                    "reference_input_id": mismatch.reference_input_id,
+                    "reference_clock": mismatch.reference_clock,
+                }),
+            );
+            bail!(msg);
         }
 
         // Spawn any Hitless mergers the new plan introduced. The
@@ -2049,6 +2299,22 @@ impl FlowRuntime {
     /// thread join) happens asynchronously inside each task's select loop.
     pub async fn stop(&self) {
         tracing::info!("Stopping flow '{}' ({})", self.config.config.id, self.config.config.name);
+        // PES Switch Phase 2.1c Stage 2: synchronously unregister
+        // every node-wide input publisher this flow owned, BEFORE
+        // tearing down the per-input cancel tokens. Cross-flow
+        // subscribers see a clean `RecvError::Closed` and stop;
+        // the manager's registry no longer holds a pointer to a
+        // soon-to-drop `broadcast::Sender`. Done synchronously
+        // because the manager is held via `Weak` — upgrading is
+        // best-effort; if the manager is already dropped (during
+        // shutdown) the entry was already torn down with it.
+        if let Some(fm) = self.flow_manager_weak.upgrade() {
+            if let Ok(ids) = self.registered_input_ids.lock() {
+                for id in ids.iter() {
+                    fm.unregister_input_publisher(id);
+                }
+            }
+        }
         self.cancel_token.cancel();
         // Await all output task handles so sockets (especially SRT listeners)
         // are fully closed and ports released before the flow is considered stopped.
@@ -2070,6 +2336,17 @@ impl FlowRuntime {
         for (ih, fh) in input_tasks {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), ih).await;
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fh).await;
+        }
+        // PES Switch Phase 2.1c Stage 3: drain any cross-flow demuxer
+        // shim tasks. Each holds a `DemuxerHandle` whose `Drop` impl
+        // decrements the FlowManager's refcounted demuxer slot; the
+        // task itself exits as soon as the parent cancel fires.
+        let foreign_shims: Vec<JoinHandle<()>> = {
+            let mut guard = self.foreign_demuxer_shims.lock().await;
+            std::mem::take(&mut *guard)
+        };
+        for shim in foreign_shims {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), shim).await;
         }
     }
 }
@@ -2918,12 +3195,13 @@ fn essence_error_to_event(flow_id: &str, err: &EssenceResolveError) -> (&'static
 #[allow(clippy::too_many_arguments)]
 async fn finalize_spts_assembler(
     mut build: SptsBuildResult,
-    bus: &Arc<FlowEsBus>,
+    bus: &Arc<NodeEsBus>,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     flow_stats: &Arc<FlowStatsAccumulator>,
     cancel_token: &CancellationToken,
     event_sender: &EventSender,
     flow_id: &str,
+    input_clocks: &HashMap<String, crate::engine::master_clock::ClockIdentity>,
 ) -> Result<crate::engine::ts_assembler::AssemblerHandle> {
     // 1. Essence resolution.
     if !build.pending_essence.is_empty() {
@@ -3016,6 +3294,53 @@ async fn finalize_spts_assembler(
             );
             bail!(msg);
         }
+    }
+
+    // 2.5. Cross-clock compatibility check.
+    //
+    // Phase 2 of the PES Switch redesign drops the manager-side
+    // membership check that today forces every assembly slot to
+    // reference an input already in the flow. Once that's lifted,
+    // operators can wire video and audio from different inputs.
+    // This guard rejects any program whose slots come from
+    // master-clock-incompatible inputs (two SourcePcr inputs from
+    // separate encoders, cross-PTP-domain ST 2110 inputs, etc.) so
+    // we never silently emit a stream that will drift apart.
+    //
+    // Today (membership check still in place + assignment-uniqueness
+    // still enforced) the call is a no-op because every slot's input
+    // lives in the same flow and therefore reports the same identity.
+    // Phase 2.1 makes it load-bearing.
+    if let Err(mismatch) = crate::engine::ts_assembler::check_assembly_clock_compatibility(
+        &build.plan,
+        input_clocks,
+    ) {
+        let msg = format!(
+            "flow '{}': program {} slot 0x{:04X} input '{}' has master clock {} but the program already references input '{}' on clock {} — combining incompatible clocks would silently drift",
+            flow_id,
+            mismatch.program_number,
+            mismatch.slot_out_pid,
+            mismatch.slot_input_id,
+            mismatch.slot_clock,
+            mismatch.reference_input_id,
+            mismatch.reference_clock,
+        );
+        event_sender.emit_flow_with_details(
+            EventSeverity::Critical,
+            category::FLOW,
+            msg.clone(),
+            flow_id,
+            serde_json::json!({
+                "error_code": "pid_bus_master_clock_mismatch",
+                "program_number": mismatch.program_number,
+                "slot_out_pid": mismatch.slot_out_pid,
+                "slot_input_id": mismatch.slot_input_id,
+                "slot_clock": mismatch.slot_clock,
+                "reference_input_id": mismatch.reference_input_id,
+                "reference_clock": mismatch.reference_clock,
+            }),
+        );
+        bail!(msg);
     }
 
     // 3. Pre-bus Hitless mergers.
@@ -3567,7 +3892,7 @@ fn build_assembly_plan(
 
 /// Drain a per-input `broadcast::Receiver<RtpPacket>` into a
 /// [`TsEsDemuxer`], publishing elementary-stream packets onto the flow's
-/// shared [`FlowEsBus`]. Replaces [`spawn_input_forwarder`] for flows
+/// shared [`NodeEsBus`]. Replaces [`spawn_input_forwarder`] for flows
 /// running under the SPTS assembler — there's no active-input gate and
 /// no continuity fixer in this path because the assembler synthesises
 /// its own CC + PSI downstream.
@@ -3578,7 +3903,7 @@ fn build_assembly_plan(
 fn spawn_ts_es_demuxer_consumer(
     input_id: String,
     mut rx: broadcast::Receiver<RtpPacket>,
-    bus: Arc<FlowEsBus>,
+    bus: Arc<NodeEsBus>,
     cancel: CancellationToken,
     per_input_counters: Arc<crate::stats::collector::PerInputCounters>,
 ) -> JoinHandle<()> {

@@ -3,7 +3,7 @@
 
 //! TS assembler for the PID-bus runtime (Phases 5 + 6 + MPTS).
 //!
-//! Subscribes to a set of elementary-stream channels on [`FlowEsBus`],
+//! Subscribes to a set of elementary-stream channels on [`NodeEsBus`],
 //! rewrites each `EsPacket`'s TS header PID → the configured `out_pid`,
 //! stamps a per-out-PID monotonic continuity counter, and emits bundles
 //! of 7 TS packets (1316 bytes, MTU-safe) as synthesised `RtpPacket`s
@@ -35,6 +35,7 @@
 //!   swapped in after each flush) — bundles ship at ~(video packet rate
 //!   / 7), not per-TS-packet.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,8 +45,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
+use super::master_clock::ClockIdentity;
 use super::packet::RtpPacket;
-use super::ts_es_bus::{EsPacket, FlowEsBus};
+use super::ts_es_bus::{EsPacket, NodeEsBus};
 use super::ts_parse::{
     extract_pcr, mpeg2_crc32, set_discontinuity_indicator, NULL_PID, PAT_PID, TS_PACKET_SIZE,
     TS_SYNC_BYTE,
@@ -141,6 +143,137 @@ pub enum PlanCommand {
     SwitchActiveInput { new_input_id: String },
 }
 
+/// Structured description of an assembly plan whose slots in one
+/// program reference inputs with incompatible master clocks.
+///
+/// Built by [`check_assembly_clock_compatibility`]; consumed by
+/// `flow.rs`'s `finalize_spts_assembler` to populate the structured
+/// `details` block on the `pid_bus_master_clock_mismatch` event so
+/// the manager UI can highlight the offending slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MasterClockMismatch {
+    /// MPEG-TS program number containing the conflict (matches `ProgramPlan.program_number`).
+    pub program_number: u16,
+    /// `out_pid` of the slot that breaks the program's clock identity.
+    pub slot_out_pid: u16,
+    /// `input_id` referenced by the offending slot.
+    pub slot_input_id: String,
+    /// Human-readable label of the offending slot's clock
+    /// (e.g. `"source_pcr:input=in-srt-a"`, `"ptp:domain=127"`).
+    pub slot_clock: String,
+    /// `input_id` of the slot whose clock the program adopted (the
+    /// first slot walked in the program, used as the reference).
+    pub reference_input_id: String,
+    /// Human-readable label of the reference slot's clock.
+    pub reference_clock: String,
+}
+
+/// Reject assembly plans that combine elementary streams from
+/// inputs whose master clocks are not coherent.
+///
+/// **Why this exists.** When Phase 2 of the PES Switch redesign drops
+/// the manager-side membership check (`assembly.input_ids ⊆
+/// flow.input_ids`), assembly slots can pull from any input on the
+/// node. Without this guard, an operator could route video from one
+/// SRT encoder and audio from a *different* SRT encoder onto the
+/// same output program. The two encoders run independent 27 MHz
+/// oscillators — their PCRs drift apart at hundreds of ppm and the
+/// downstream receiver loses lipsync within minutes. Mute beats
+/// wrong-sync (per `feedback_no_pcr_restamp.md` + the master-clock
+/// invariants in the PES Switch plan).
+///
+/// **What we check.** Each [`ProgramPlan`] in the resolved plan:
+/// - The first slot's source `input_id` defines the program's
+///   reference clock identity (looked up in `input_clocks`).
+/// - Every subsequent slot's source — and **every leg** of a switch
+///   slot's `switch_legs` — must report the same `ClockIdentity` from
+///   the map. Mismatch → `Err(MasterClockMismatch { … })` describing
+///   the first conflict found.
+/// - Slots whose `input_id` is absent from `input_clocks` are
+///   skipped (defensive). The caller should populate the map
+///   eagerly from `ResolvedFlow::inputs`; missing entries indicate
+///   a bug upstream in the resolve pipeline, not an operator error.
+///
+/// Cross-program clock differences are **allowed** — MPEG-TS
+/// receivers re-acquire per program anyway, so an MPTS may carry
+/// programs from different sources side-by-side.
+///
+/// This function is pure / does not allocate beyond the error path.
+/// Today (with the membership check still in place) the check is a
+/// no-op because every slot's input is in the flow's `input_ids`
+/// and the single-flow runtime has a single master clock by
+/// construction. Phase 2.1 makes it load-bearing.
+pub fn check_assembly_clock_compatibility(
+    plan: &AssemblyPlan,
+    input_clocks: &HashMap<String, ClockIdentity>,
+) -> Result<(), MasterClockMismatch> {
+    for program in &plan.programs {
+        // Collect (input_id, out_pid) for every source the program
+        // references — the primary slot source plus every switch leg.
+        // The walk preserves config order so the first slot's clock
+        // becomes the program reference. This matches operator intent
+        // because the first slot is conventionally the video PID, and
+        // a video clock mismatch is the most user-visible failure
+        // mode (audio drifts before video does, but video locks
+        // first).
+        let mut reference: Option<(String, ClockIdentity)> = None;
+        for slot in &program.slots {
+            // Direct source.
+            check_one_source(
+                program.program_number,
+                slot.out_pid,
+                &slot.source.0,
+                input_clocks,
+                &mut reference,
+            )?;
+            // Every switch leg.
+            if let Some(legs) = &slot.switch_legs {
+                for leg in legs {
+                    check_one_source(
+                        program.program_number,
+                        slot.out_pid,
+                        &leg.0,
+                        input_clocks,
+                        &mut reference,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_one_source(
+    program_number: u16,
+    slot_out_pid: u16,
+    input_id: &str,
+    input_clocks: &HashMap<String, ClockIdentity>,
+    reference: &mut Option<(String, ClockIdentity)>,
+) -> Result<(), MasterClockMismatch> {
+    let Some(clock) = input_clocks.get(input_id) else {
+        // Defensive: missing entries indicate the caller didn't
+        // populate the map for this input. Treat as "unknown but
+        // not provably incompatible" and skip — the upstream essence
+        // resolver will have already failed on a truly unknown input.
+        return Ok(());
+    };
+    match reference.as_ref() {
+        None => {
+            *reference = Some((input_id.to_string(), clock.clone()));
+            Ok(())
+        }
+        Some((_ref_input, ref_clock)) if ref_clock == clock => Ok(()),
+        Some((ref_input, ref_clock)) => Err(MasterClockMismatch {
+            program_number,
+            slot_out_pid,
+            slot_input_id: input_id.to_string(),
+            slot_clock: clock.label(),
+            reference_input_id: ref_input.clone(),
+            reference_clock: ref_clock.label(),
+        }),
+    }
+}
+
 /// Handle returned to the flow runtime after spawning the assembler.
 /// Carries the task JoinHandle plus the mpsc sender for runtime mutation.
 /// Dropping the sender does *not* stop the assembler — the assembler
@@ -166,7 +299,7 @@ pub struct AssemblerHandle {
 /// subscriber (UDP, tr101290, thumbnailer) works unchanged.
 pub fn spawn_spts_assembler(
     plan: AssemblyPlan,
-    bus: Arc<FlowEsBus>,
+    bus: Arc<NodeEsBus>,
     broadcast_tx: broadcast::Sender<RtpPacket>,
     cancel: CancellationToken,
 ) -> AssemblerHandle {
@@ -201,7 +334,7 @@ struct FlatSlot {
 
 async fn run_assembler(
     mut plan: AssemblyPlan,
-    bus: Arc<FlowEsBus>,
+    bus: Arc<NodeEsBus>,
     broadcast_tx: broadcast::Sender<RtpPacket>,
     cancel: CancellationToken,
     mut plan_rx: mpsc::Receiver<PlanCommand>,
@@ -479,7 +612,7 @@ async fn run_assembler(
 #[allow(clippy::too_many_arguments)]
 fn install_plan(
     plan: &AssemblyPlan,
-    bus: &Arc<FlowEsBus>,
+    bus: &Arc<NodeEsBus>,
     fanin_tx: &mpsc::Sender<(usize, EsPacket)>,
     cancel: &CancellationToken,
     flat: &mut Vec<FlatSlot>,
@@ -562,7 +695,7 @@ fn install_plan(
 fn apply_plan_replacement(
     plan: &mut AssemblyPlan,
     new_plan: AssemblyPlan,
-    bus: &Arc<FlowEsBus>,
+    bus: &Arc<NodeEsBus>,
     fanin_tx: &mpsc::Sender<(usize, EsPacket)>,
     cancel: &CancellationToken,
     flat: &mut Vec<FlatSlot>,
@@ -1391,7 +1524,7 @@ mod tests {
 
     #[tokio::test]
     async fn assembler_emits_psi_on_startup_before_any_es() {
-        let bus = Arc::new(FlowEsBus::new());
+        let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(16);
         let cancel = CancellationToken::new();
         let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone()).join;
@@ -1413,7 +1546,7 @@ mod tests {
 
     #[tokio::test]
     async fn assembler_rewrites_es_pids_end_to_end() {
-        let bus = Arc::new(FlowEsBus::new());
+        let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
         let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone()).join;
@@ -1483,7 +1616,7 @@ mod tests {
 
     #[tokio::test]
     async fn assembler_mpts_emits_pat_with_two_programs_and_two_pmts() {
-        let bus = Arc::new(FlowEsBus::new());
+        let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
         let handle = spawn_spts_assembler(make_mpts_plan(), bus.clone(), tx.clone(), cancel.clone()).join;
@@ -1526,7 +1659,7 @@ mod tests {
 
     #[tokio::test]
     async fn assembler_shutsdown_cleanly_with_no_es_traffic() {
-        let bus = Arc::new(FlowEsBus::new());
+        let bus = Arc::new(NodeEsBus::new());
         let (tx, _rx) = broadcast::channel::<RtpPacket>(4);
         let cancel = CancellationToken::new();
         let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone()).join;
@@ -1546,7 +1679,7 @@ mod tests {
 
     #[tokio::test]
     async fn replace_plan_swaps_slot_and_bumps_pmt_version() {
-        let bus = Arc::new(FlowEsBus::new());
+        let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(64);
         let cancel = CancellationToken::new();
 
@@ -1655,7 +1788,7 @@ mod tests {
 
     #[tokio::test]
     async fn replace_plan_no_change_does_not_bump_version() {
-        let bus = Arc::new(FlowEsBus::new());
+        let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
         let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone());
@@ -1926,5 +2059,134 @@ mod tests {
             .await
             .expect("must pick up late catalogue within timeout");
         assert_eq!(r, vec![((0, 0, None), 0x100)]);
+    }
+
+    // ─── Cross-clock compatibility check ──────────────────────────────
+
+    fn clocks(entries: &[(&str, ClockIdentity)]) -> HashMap<String, ClockIdentity> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn clock_compat_accepts_same_source_pcr_within_program() {
+        let plan = make_plan();
+        // Same input on both slots: trivially compatible.
+        let map = clocks(&[
+            ("in-a", ClockIdentity::SourcePcr { input_id: "in-a".into() }),
+            ("in-b", ClockIdentity::SourcePcr { input_id: "in-a".into() }),
+        ]);
+        check_assembly_clock_compatibility(&plan, &map).expect("two slots, same clock → OK");
+    }
+
+    #[test]
+    fn clock_compat_rejects_two_source_pcrs_in_one_program() {
+        // The realistic Phase 2 failure mode: video from encoder A,
+        // audio from encoder B. Each has its own SourcePcr identity.
+        let plan = make_plan();
+        let map = clocks(&[
+            ("in-a", ClockIdentity::SourcePcr { input_id: "in-a".into() }),
+            ("in-b", ClockIdentity::SourcePcr { input_id: "in-b".into() }),
+        ]);
+        let err = check_assembly_clock_compatibility(&plan, &map)
+            .expect_err("must reject cross-encoder PCR mix");
+        assert_eq!(err.program_number, 1);
+        assert_eq!(err.slot_out_pid, 0x201);
+        assert_eq!(err.slot_input_id, "in-b");
+        assert_eq!(err.reference_input_id, "in-a");
+        assert!(err.slot_clock.contains("in-b"));
+        assert!(err.reference_clock.contains("in-a"));
+    }
+
+    #[test]
+    fn clock_compat_accepts_coherent_ptp_inputs() {
+        // Two ST 2110 inputs on the same PTP domain: co-clocked.
+        let plan = make_plan();
+        let map = clocks(&[
+            ("in-a", ClockIdentity::Ptp { domain: 127 }),
+            ("in-b", ClockIdentity::Ptp { domain: 127 }),
+        ]);
+        check_assembly_clock_compatibility(&plan, &map)
+            .expect("same PTP domain → OK");
+    }
+
+    #[test]
+    fn clock_compat_rejects_cross_ptp_domain() {
+        let plan = make_plan();
+        let map = clocks(&[
+            ("in-a", ClockIdentity::Ptp { domain: 0 }),
+            ("in-b", ClockIdentity::Ptp { domain: 127 }),
+        ]);
+        let err = check_assembly_clock_compatibility(&plan, &map)
+            .expect_err("cross-domain PTP must be rejected");
+        assert!(err.slot_clock.contains("domain=127"));
+        assert!(err.reference_clock.contains("domain=0"));
+    }
+
+    #[test]
+    fn clock_compat_rejects_kind_mix() {
+        let plan = make_plan();
+        let map = clocks(&[
+            ("in-a", ClockIdentity::Ptp { domain: 0 }),
+            ("in-b", ClockIdentity::SourcePcr { input_id: "in-b".into() }),
+        ]);
+        let err = check_assembly_clock_compatibility(&plan, &map)
+            .expect_err("PTP + SourcePcr is never coherent");
+        assert_eq!(err.slot_input_id, "in-b");
+    }
+
+    #[test]
+    fn clock_compat_allows_cross_program_difference_in_mpts() {
+        // MPTS receivers re-acquire per program, so an MPTS with
+        // program 1 from input A and program 2 from input B is fine
+        // even when A and B have different clocks.
+        let plan = make_mpts_plan();
+        let map = clocks(&[
+            ("in-a", ClockIdentity::SourcePcr { input_id: "in-a".into() }),
+            ("in-b", ClockIdentity::SourcePcr { input_id: "in-b".into() }),
+        ]);
+        check_assembly_clock_compatibility(&plan, &map)
+            .expect("two programs from different sources is allowed");
+    }
+
+    #[test]
+    fn clock_compat_walks_switch_legs() {
+        // A Switch slot whose legs span multiple inputs must have
+        // every leg on the same clock as the program's reference.
+        let mut plan = make_plan();
+        // Replace slot 1 with a switch slot whose backup leg lives on
+        // a different SourcePcr — that's a sneaky failure mode the
+        // resolver could miss because the active leg looks fine.
+        plan.programs[0].slots[1] = AssemblySlot {
+            source: ("in-a".to_string(), 0x200),
+            out_pid: 0x201,
+            stream_type: 0x0F,
+            switch_legs: Some(vec![
+                ("in-a".to_string(), 0x200),
+                ("in-c".to_string(), 0x200),
+            ]),
+        };
+        let map = clocks(&[
+            ("in-a", ClockIdentity::SourcePcr { input_id: "in-a".into() }),
+            ("in-c", ClockIdentity::SourcePcr { input_id: "in-c".into() }),
+        ]);
+        let err = check_assembly_clock_compatibility(&plan, &map)
+            .expect_err("switch leg on a different clock must fail");
+        assert_eq!(err.slot_input_id, "in-c");
+    }
+
+    #[test]
+    fn clock_compat_skips_missing_inputs_defensively() {
+        // If the caller didn't populate the map for an input, the
+        // check skips it rather than failing — the upstream essence
+        // resolver is the authority on "input not found".
+        let plan = make_plan();
+        let map = clocks(&[("in-a", ClockIdentity::Wallclock)]);
+        // in-b is absent from the map; the check should accept the
+        // plan rather than spuriously rejecting.
+        check_assembly_clock_compatibility(&plan, &map)
+            .expect("missing-map-entry must not cause spurious rejection");
     }
 }

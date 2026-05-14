@@ -2224,9 +2224,9 @@ pub struct FlowStatsAccumulator {
     /// PID-bus Phase 8: per-elementary-stream counters keyed by
     /// `(input_id, source_pid)`. Populated incrementally by the
     /// per-ES analyzer task (see `engine::ts_es_analysis`) that
-    /// subscribes to each `FlowEsBus` channel. Surfaced via
+    /// subscribes to each `NodeEsBus` channel. Surfaced via
     /// `FlowStats.per_es` on assembled flows; absent on passthrough
-    /// flows (which have no `FlowEsBus` to read from).
+    /// flows (which have no `NodeEsBus` to read from).
     pub per_es_stats: DashMap<(String, u16), Arc<PerEsAccumulator>>,
     /// Snapshot of the running assembler's `(input_id, source_pid) → out_pid`
     /// routing. Updated by `FlowRuntime::replace_assembly` after every
@@ -2243,7 +2243,7 @@ pub struct FlowStatsAccumulator {
 }
 
 /// Per-elementary-stream accumulator. One instance per `(input_id, source_pid)`
-/// channel on the flow's `FlowEsBus`. Atomic counters — updated inline by
+/// channel on the flow's `NodeEsBus`. Atomic counters — updated inline by
 /// the per-ES analyzer subscriber, read at 1 Hz by the snapshot path.
 pub struct PerEsAccumulator {
     pub input_id: String,

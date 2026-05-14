@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Result, bail};
 use dashmap::DashMap;
@@ -12,7 +12,12 @@ use crate::manager::events::{Event, EventSender, EventSeverity, category};
 use crate::stats::collector::StatsCollector;
 
 use super::flow::FlowRuntime;
+use super::packet::RtpPacket;
 use super::resource_monitor::SystemResourceState;
+use super::ts_es_bus::NodeEsBus;
+use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 /// Central coordinator for the lifecycle of all media flows in the system.
 ///
@@ -59,7 +64,103 @@ pub struct FlowManager {
     /// feature is enabled (Linux + the `display` Cargo feature).
     #[cfg(all(feature = "display", target_os = "linux"))]
     display_claim_registry: Arc<crate::display::claim_registry::DisplayClaimRegistry>,
+    /// Node-wide elementary-stream bus. Shared `Arc` across every
+    /// assembled flow on the edge — passthrough flows never touch it.
+    /// Channels are keyed by `(input_id, source_pid)`; input IDs are
+    /// globally unique on the node so the key shape already covers the
+    /// node-wide scope. Owned here so that — once assignment uniqueness
+    /// is lifted in Phase 2 of the PES Switch redesign — multiple flows
+    /// can subscribe to the same input's ES channels without spawning
+    /// duplicate demuxers.
+    node_es_bus: Arc<NodeEsBus>,
+    /// Per-input node-wide broadcast publishers (PES Switch Phase 2.1).
+    /// One entry per running input on the node, keyed by `input_id`
+    /// (globally unique). The owning flow's input task publishes onto
+    /// the [`NodeInputPublisher::sender`]; any consumer on the node —
+    /// the flow's own forwarder, a sibling flow's assembly slot, or a
+    /// shared `TsEsDemuxer` — subscribes via [`Self::subscribe_input`].
+    ///
+    /// Lifecycle: registered by `FlowRuntime::start` for every input
+    /// it owns; unregistered on flow stop. Cross-flow references go
+    /// inactive when the owning flow stops (subscribers see
+    /// `RecvError::Closed` on the next `recv()`) — graceful degrade
+    /// that mirrors the operator-facing "this input is offline"
+    /// state, not a panic.
+    input_publishers: DashMap<String, Arc<NodeInputPublisher>>,
+    /// Refcounted per-input `TsEsDemuxer` registry (PES Switch
+    /// Phase 2.1). When a flow's assembly references `input_id`, it
+    /// calls [`Self::acquire_demuxer`] which returns a
+    /// [`DemuxerHandle`]: spawns the demuxer task on first reference,
+    /// increments refcount on subsequent references. Drop on
+    /// `DemuxerHandle` decrements; the task exits when the count
+    /// reaches zero. This is the single point that prevents the
+    /// duplicate-demuxer / duplicate-bus-publish bug when two flows
+    /// both reference the same input on the node.
+    demuxers: DashMap<String, Arc<DemuxerSlot>>,
 }
+
+/// One node-wide publisher entry for a running input. Held by every
+/// consumer that wants this input's bytes via [`FlowManager::subscribe_input`].
+pub struct NodeInputPublisher {
+    /// Stable per-input handle so consumers can `.subscribe()` for a
+    /// fresh `broadcast::Receiver`. Cloned freely; the underlying
+    /// channel is bounded so a slow consumer drops, never blocks.
+    pub sender: broadcast::Sender<RtpPacket>,
+}
+
+/// One node-wide refcounted `TsEsDemuxer` task. The owning
+/// [`FlowManager`] keeps an `Arc<DemuxerSlot>` in [`FlowManager::demuxers`];
+/// each [`DemuxerHandle`] handed to a flow holds its own clone of the
+/// `Arc`, and `Drop::drop` on the handle decrements `refcount`. When
+/// the count hits zero the slot's `cancel` token is fired and the
+/// demuxer task wakes up + exits.
+pub struct DemuxerSlot {
+    /// Demuxer task handle. Kept for completeness; in production the
+    /// task watches `cancel` rather than being explicitly joined.
+    #[allow(dead_code)]
+    join: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    /// Cancellation token. Fired when `refcount` reaches zero so the
+    /// demuxer task exits cleanly without leaking subscribers.
+    cancel: CancellationToken,
+    /// Live subscriber count. Atomically incremented when a
+    /// [`DemuxerHandle`] is created; decremented in `Drop::drop`.
+    /// When this transitions from `1` to `0`, the slot fires
+    /// `cancel` to terminate the underlying task. Tracked
+    /// independently of `Arc::strong_count` because the slot itself
+    /// is kept alive in the `FlowManager::demuxers` map while any
+    /// consumer holds a handle.
+    refcount: AtomicUsize,
+    /// Input ID this demuxer is fed by. Persisted on the slot for
+    /// the cleanup path on `release_demuxer`.
+    input_id: String,
+}
+
+/// RAII handle returned by [`FlowManager::acquire_demuxer`]. Dropping
+/// it decrements the slot's refcount; when the last handle drops, the
+/// underlying demuxer task is cancelled and removed from
+/// [`FlowManager::demuxers`].
+pub struct DemuxerHandle {
+    slot: Arc<DemuxerSlot>,
+    manager: std::sync::Weak<FlowManager>,
+}
+
+impl Drop for DemuxerHandle {
+    fn drop(&mut self) {
+        // `fetch_sub` returns the previous value — `1` means we just
+        // decremented to zero and own the cleanup.
+        let prev = self.slot.refcount.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            self.slot.cancel.cancel();
+            if let Some(manager) = self.manager.upgrade() {
+                // Remove the slot from the map so a subsequent
+                // `acquire_demuxer` for the same input spawns a fresh
+                // demuxer rather than reusing a cancelled one.
+                manager.demuxers.remove(&self.slot.input_id);
+            }
+        }
+    }
+}
+
 
 impl FlowManager {
     /// Create a new `FlowManager` with no active flows.
@@ -87,7 +188,103 @@ impl FlowManager {
             static_caps,
             #[cfg(all(feature = "display", target_os = "linux"))]
             display_claim_registry,
+            node_es_bus: Arc::new(NodeEsBus::new()),
+            input_publishers: DashMap::new(),
+            demuxers: DashMap::new(),
         }
+    }
+
+    /// Get a clone of the node-wide elementary-stream bus handle. Used
+    /// by `FlowRuntime::start` so assembled flows share one bus across
+    /// the node; passthrough flows never call this. Phase 2 of the PES
+    /// Switch redesign will use this accessor from non-create_flow
+    /// paths (e.g. cross-flow assembly editor + node-wide demuxer
+    /// registry); today only `create_flow` references the field.
+    #[allow(dead_code)]
+    pub fn node_es_bus(&self) -> Arc<NodeEsBus> {
+        Arc::clone(&self.node_es_bus)
+    }
+
+    /// Register the broadcast publisher for an input that's about to
+    /// start running on this node. Called by `FlowRuntime::start` once
+    /// it has created the input's per-input broadcast channel; gives
+    /// node-wide consumers (cross-flow assembly slots, the shared
+    /// `TsEsDemuxer` registry) a way to attach without re-creating
+    /// the channel.
+    ///
+    /// Idempotent: re-registering an `input_id` replaces the previous
+    /// publisher entry. Cross-flow consumers are unaffected because
+    /// their `broadcast::Receiver` is bound to the previous sender,
+    /// which will close as the previous owner stops.
+    #[allow(dead_code)]
+    pub fn register_input_publisher(&self, input_id: &str, sender: broadcast::Sender<RtpPacket>) {
+        self.input_publishers.insert(
+            input_id.to_string(),
+            Arc::new(NodeInputPublisher { sender }),
+        );
+    }
+
+    /// Unregister an input's publisher when the owning flow stops.
+    /// Subscribers see `RecvError::Closed` on the next `recv()` and
+    /// reconnect (or exit, depending on their drop policy). Idempotent.
+    #[allow(dead_code)]
+    pub fn unregister_input_publisher(&self, input_id: &str) {
+        self.input_publishers.remove(input_id);
+    }
+
+    /// Subscribe to a node-wide input's broadcast channel. Returns
+    /// `None` when the input isn't running on this node — caller
+    /// should treat that as "input offline" rather than a fatal error.
+    #[allow(dead_code)]
+    pub fn subscribe_input(&self, input_id: &str) -> Option<broadcast::Receiver<RtpPacket>> {
+        self.input_publishers.get(input_id).map(|e| e.value().sender.subscribe())
+    }
+
+    /// Acquire a refcounted handle to the node-wide `TsEsDemuxer` for
+    /// `input_id`. The first caller spawns the demuxer task via
+    /// `spawn_fn`; subsequent callers reuse it. The handle's `Drop`
+    /// decrements the refcount; when the last handle drops, the
+    /// demuxer task is cancelled and removed from the registry.
+    ///
+    /// Returns `None` when the demuxer can't be spawned — typically
+    /// because the input isn't running (`spawn_fn` returns `None`).
+    ///
+    /// `spawn_fn` receives the slot's cancel token + the input's
+    /// publisher subscriber so the demuxer task can hook up its
+    /// upstream + cancellation in one shot. Today's caller is
+    /// `flow.rs::finalize_spts_assembler` — the function lives here
+    /// so the refcounting + lifecycle stay opaque to flow code.
+    #[allow(dead_code)]
+    pub fn acquire_demuxer<F>(self: &Arc<Self>, input_id: &str, spawn_fn: F) -> Option<DemuxerHandle>
+    where
+        F: FnOnce(broadcast::Receiver<RtpPacket>, CancellationToken) -> Option<JoinHandle<()>>,
+    {
+        // Fast path: existing slot. Use `entry` API to avoid a
+        // get-then-insert race when two flows acquire simultaneously.
+        let slot = self
+            .demuxers
+            .entry(input_id.to_string())
+            .or_try_insert_with(|| -> Result<Arc<DemuxerSlot>, ()> {
+                let rx = self.subscribe_input(input_id).ok_or(())?;
+                let cancel = CancellationToken::new();
+                let join = spawn_fn(rx, cancel.clone()).ok_or(())?;
+                Ok(Arc::new(DemuxerSlot {
+                    join: tokio::sync::Mutex::new(Some(join)),
+                    cancel,
+                    refcount: AtomicUsize::new(0),
+                    input_id: input_id.to_string(),
+                }))
+            })
+            .ok()?
+            .value()
+            .clone();
+        // Bump the refcount BEFORE returning the handle so concurrent
+        // Drop of a sibling handle never falsely cancels the task.
+        slot.refcount.fetch_add(1, Ordering::AcqRel);
+        Some(DemuxerHandle {
+            slot,
+            manager: Arc::downgrade(self),
+        })
     }
 
     /// Get a clone of the event sender for passing to sub-components.
@@ -206,7 +403,7 @@ impl FlowManager {
     /// Returns an error if a flow with the same `config.id` is already running
     /// or if the underlying input/output tasks fail to initialize (e.g., socket
     /// bind failure, SRT connection error).
-    pub async fn create_flow(&self, config: ResolvedFlow) -> Result<Arc<FlowRuntime>> {
+    pub async fn create_flow(self: &Arc<Self>, config: ResolvedFlow) -> Result<Arc<FlowRuntime>> {
         // Gate flow creation when system resources are critical
         if self.resource_state.resources_critical.load(Ordering::Relaxed) {
             if matches!(self.resource_action, Some(ResourceLimitAction::GateFlows)) {
@@ -236,6 +433,8 @@ impl FlowManager {
             self.event_sender.clone(),
             #[cfg(all(feature = "display", target_os = "linux"))]
             Arc::clone(&self.display_claim_registry),
+            Arc::clone(&self.node_es_bus),
+            Arc::clone(self),
         ).await {
             Ok(runtime) => {
                 let runtime = Arc::new(runtime);
@@ -563,7 +762,7 @@ impl FlowManager {
     /// stricter time-aligned start (using a `tokio::sync::Barrier` to gate
     /// the input task spawn until all members are bound) is a follow-up.
     pub async fn start_flow_group(
-        &self,
+        self: &Arc<Self>,
         group_id: &str,
         members: Vec<ResolvedFlow>,
     ) -> Result<()> {
@@ -592,7 +791,10 @@ impl FlowManager {
             members
                 .iter()
                 .cloned()
-                .map(|cfg| async move { (cfg.config.id.clone(), self.create_flow(cfg).await) }),
+                .map(|cfg| {
+                    let this = Arc::clone(self);
+                    async move { (cfg.config.id.clone(), this.create_flow(cfg).await) }
+                }),
         )
         .await;
 
@@ -696,5 +898,126 @@ impl FlowManager {
     /// `FlowRuntime` instances.
     pub fn stats(&self) -> &Arc<StatsCollector> {
         &self.stats
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! PES Switch Phase 2.1c tests: NodeInputPublisher + refcounted
+    //! DemuxerSlot infrastructure. These tests verify the lifecycle
+    //! semantics in isolation — the wiring into FlowRuntime lands in
+    //! Stage 2 with its own integration tests.
+
+    use super::*;
+    use crate::stats::collector::StatsCollector;
+    use std::sync::atomic::Ordering;
+
+    fn make_fm() -> Arc<FlowManager> {
+        let stats = Arc::new(StatsCollector::new());
+        let (event_sender, _rx) = crate::manager::events::event_channel();
+        let resource_state = Arc::new(crate::engine::resource_monitor::SystemResourceState::new());
+        Arc::new(FlowManager::new(
+            stats,
+            false,
+            event_sender,
+            resource_state,
+            None,
+            None,
+            #[cfg(all(feature = "display", target_os = "linux"))]
+            crate::display::claim_registry::DisplayClaimRegistry::new(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn input_publisher_round_trip() {
+        let fm = make_fm();
+        let (tx, _rx_drop) = broadcast::channel::<RtpPacket>(8);
+        fm.register_input_publisher("in-a", tx.clone());
+        let mut rx = fm.subscribe_input("in-a").expect("publisher registered");
+        // Publish via the cloned sender; subscriber should see it.
+        let pkt = RtpPacket {
+            data: bytes::Bytes::from_static(&[0u8; 8]),
+            sequence_number: 0,
+            rtp_timestamp: 0,
+            recv_time_us: 0,
+            upstream_seq: None,
+            upstream_leg_id: None,
+            is_raw_ts: true,
+        };
+        tx.send(pkt).expect("send ok");
+        let got = rx.recv().await.expect("recv ok");
+        assert_eq!(got.data.len(), 8);
+        // Unregister, subscribe should return None now.
+        fm.unregister_input_publisher("in-a");
+        assert!(fm.subscribe_input("in-a").is_none());
+    }
+
+    #[tokio::test]
+    async fn subscribe_input_returns_none_when_absent() {
+        let fm = make_fm();
+        assert!(fm.subscribe_input("ghost").is_none());
+    }
+
+    #[tokio::test]
+    async fn acquire_demuxer_refcount_lifecycle() {
+        let fm = make_fm();
+        let (tx, _) = broadcast::channel::<RtpPacket>(8);
+        fm.register_input_publisher("in-a", tx);
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let cancel_seen = Arc::new(AtomicUsize::new(0));
+        let spawn_fn = |spawn_count: Arc<AtomicUsize>, cancel_seen: Arc<AtomicUsize>| {
+            move |_rx: broadcast::Receiver<RtpPacket>, cancel: CancellationToken| -> Option<JoinHandle<()>> {
+                spawn_count.fetch_add(1, Ordering::Relaxed);
+                let seen = cancel_seen.clone();
+                Some(tokio::spawn(async move {
+                    cancel.cancelled().await;
+                    seen.fetch_add(1, Ordering::Relaxed);
+                }))
+            }
+        };
+        // First acquire spawns; refcount = 1.
+        let h1 = fm
+            .acquire_demuxer("in-a", spawn_fn(spawn_count.clone(), cancel_seen.clone()))
+            .expect("first acquire");
+        assert_eq!(spawn_count.load(Ordering::Relaxed), 1);
+        // Second acquire reuses; refcount = 2.
+        let h2 = fm
+            .acquire_demuxer("in-a", spawn_fn(spawn_count.clone(), cancel_seen.clone()))
+            .expect("second acquire reuses");
+        assert_eq!(
+            spawn_count.load(Ordering::Relaxed),
+            1,
+            "demuxer must be spawned exactly once"
+        );
+        // Drop one handle; task must still be running (refcount 2 → 1).
+        drop(h1);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert_eq!(cancel_seen.load(Ordering::Relaxed), 0, "task lives while refcount > 0");
+        // Drop the last handle; cancel should fire.
+        drop(h2);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            cancel_seen.load(Ordering::Relaxed),
+            1,
+            "task must be cancelled when last handle drops"
+        );
+        // Re-acquire after cleanup → spawns a fresh demuxer.
+        let _h3 = fm
+            .acquire_demuxer("in-a", spawn_fn(spawn_count.clone(), cancel_seen.clone()))
+            .expect("re-acquire spawns afresh");
+        assert_eq!(
+            spawn_count.load(Ordering::Relaxed),
+            2,
+            "after cleanup, next acquire spawns a new demuxer"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_demuxer_returns_none_when_no_publisher() {
+        let fm = make_fm();
+        let result = fm.acquire_demuxer("ghost", |_rx, _cancel| {
+            panic!("spawn_fn must not be called when no publisher exists");
+        });
+        assert!(result.is_none());
     }
 }

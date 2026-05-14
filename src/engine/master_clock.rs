@@ -496,6 +496,104 @@ impl std::fmt::Debug for MasterClockHandle {
     }
 }
 
+/// Fine-grained per-input clock identity used by the PID-bus
+/// cross-clock-compatibility check.
+///
+/// `MasterClockKind` answers "what kind of clock recovers this input's
+/// time domain?" but does not answer "are two inputs co-clocked?".
+/// Two `MasterClockKind::SourcePcrPll` inputs from independent SRT
+/// senders are NOT co-clocked (each upstream encoder has its own
+/// 27 MHz oscillator); two `MasterClockKind::Ptp` inputs are co-clocked
+/// iff they share a PTP domain.
+///
+/// This enum is the identity the PID-bus assembler uses to validate
+/// that every slot in a single output program comes from inputs that
+/// are *actually* coherent — preventing the silent A/V-drift class
+/// of bugs that arises when an operator wires "video from encoder A"
+/// + "audio from encoder B" through Phase 2's cross-flow ES routing.
+///
+/// Equality semantics:
+/// - `Ptp { domain: N }` == `Ptp { domain: N }` (same grandmaster).
+/// - `Ptp { domain: N }` != `Ptp { domain: M }` for N≠M.
+/// - `SourcePcr { input_id: A }` == `SourcePcr { input_id: A }` (same input).
+/// - `SourcePcr { input_id: A }` != `SourcePcr { input_id: B }` for A≠B
+///   (each input owns its own PLL).
+/// - `Wallclock` == `Wallclock` (the host's monotonic clock is shared).
+/// - Cross-kind comparisons (`Ptp` vs `SourcePcr` etc.) are always !=.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ClockIdentity {
+    /// PTP grandmaster on a specific IEEE 1588 domain.
+    Ptp { domain: u8 },
+    /// Source-PCR PLL pinned to the named input. Each upstream encoder
+    /// has its own oscillator, so the `input_id` is part of the identity.
+    SourcePcr { input_id: String },
+    /// Host wallclock — degraded, but all wallclock-only inputs on the
+    /// same node share the same clock instance so they're nominally
+    /// equal. The degraded-clock warning still fires via the existing
+    /// telemetry path.
+    Wallclock,
+}
+
+impl ClockIdentity {
+    /// Short human-readable tag, useful in error messages and the
+    /// structured details of `pid_bus_master_clock_mismatch` events.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Ptp { domain } => format!("ptp:domain={domain}"),
+            Self::SourcePcr { input_id } => format!("source_pcr:input={input_id}"),
+            Self::Wallclock => "wallclock".to_string(),
+        }
+    }
+}
+
+/// Derive the [`ClockIdentity`] for a node's input from its definition.
+///
+/// Used by the PID-bus assembly compatibility check: every slot in
+/// one output program must report the same identity from this
+/// function, otherwise the resolve-time check rejects the plan with
+/// `pid_bus_master_clock_mismatch`.
+///
+/// The mapping mirrors [`select_master_kind_for_input`] but additionally
+/// pins each clock to its concrete coherence-defining property:
+/// PTP-domain for the `Ptp` family, the input's globally-unique id for
+/// the `SourcePcr` family. Two inputs with separate ids — even if both
+/// are SRT listeners on the same port number across reboots — are not
+/// co-clocked, because each ingest task drives its own
+/// [`SourcePcrPllMaster`] PLL instance.
+///
+/// `clock_domain` falls back to 0 (the IEEE 1588 default profile
+/// domain) when the input config doesn't specify one — matches
+/// `ptp4l`'s default.
+pub fn clock_identity_for_input(
+    input: &crate::config::models::InputDefinition,
+) -> ClockIdentity {
+    use crate::config::models::InputConfig;
+    match &input.config {
+        // Source-PCR family — identity pinned to this input's id.
+        InputConfig::Srt(_)
+        | InputConfig::Rtp(_)
+        | InputConfig::Udp(_)
+        | InputConfig::Rist(_)
+        | InputConfig::Rtmp(_)
+        | InputConfig::Rtsp(_)
+        | InputConfig::MediaPlayer(_)
+        | InputConfig::TestPattern(_)
+        | InputConfig::Replay(_)
+        | InputConfig::RtpAudio(_)
+        | InputConfig::Bonded(_) => ClockIdentity::SourcePcr {
+            input_id: input.id.clone(),
+        },
+        // PTP family — identity is the configured grandmaster domain.
+        InputConfig::St2110_20(c) => ClockIdentity::Ptp { domain: c.clock_domain.unwrap_or(0) },
+        InputConfig::St2110_23(c) => ClockIdentity::Ptp { domain: c.clock_domain.unwrap_or(0) },
+        InputConfig::St2110_30(c) => ClockIdentity::Ptp { domain: c.clock_domain.unwrap_or(0) },
+        InputConfig::St2110_31(c) => ClockIdentity::Ptp { domain: c.clock_domain.unwrap_or(0) },
+        InputConfig::St2110_40(c) => ClockIdentity::Ptp { domain: c.clock_domain.unwrap_or(0) },
+        // Wallclock-only inputs share the host clock.
+        InputConfig::Webrtc(_) | InputConfig::Whep(_) => ClockIdentity::Wallclock,
+    }
+}
+
 /// Selection-policy entry point. Returns the auto-default for a flow
 /// based on its active input config. Per-flow `master_clock` overrides
 /// are applied by the caller in `flow.rs`.
@@ -635,5 +733,58 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let b = WallclockMaster::new();
         assert_ne!(a.offset_27mhz, b.offset_27mhz);
+    }
+
+    // ─── ClockIdentity ────────────────────────────────────────────────
+    //
+    // The enum's equality + label behaviour is what the cross-clock
+    // compat check depends on. Per-input-config mapping is exercised
+    // via the assembler's `clock_compat_*` test suite where the full
+    // realistic plan + map shape is built — keeping these tests tight
+    // here so the suite doesn't depend on every InputConfig variant's
+    // unstable field set.
+
+    #[test]
+    fn clock_identity_source_pcr_keyed_by_input_id() {
+        let a = ClockIdentity::SourcePcr { input_id: "in-a".into() };
+        let b = ClockIdentity::SourcePcr { input_id: "in-b".into() };
+        let a2 = ClockIdentity::SourcePcr { input_id: "in-a".into() };
+        assert_eq!(a, a2, "same input_id → equal");
+        assert_ne!(a, b, "different input_ids → never co-clocked");
+    }
+
+    #[test]
+    fn clock_identity_ptp_keyed_by_domain() {
+        let d0 = ClockIdentity::Ptp { domain: 0 };
+        let d0_again = ClockIdentity::Ptp { domain: 0 };
+        let d127 = ClockIdentity::Ptp { domain: 127 };
+        assert_eq!(d0, d0_again, "same PTP domain → co-clocked");
+        assert_ne!(d0, d127, "different domains → not co-clocked");
+    }
+
+    #[test]
+    fn clock_identity_cross_kind_never_equal() {
+        // PTP vs SourcePcr vs Wallclock are categorically distinct;
+        // assembler must reject any program mixing them.
+        let p = ClockIdentity::Ptp { domain: 0 };
+        let s = ClockIdentity::SourcePcr { input_id: "x".into() };
+        let w = ClockIdentity::Wallclock;
+        assert_ne!(p, s);
+        assert_ne!(p, w);
+        assert_ne!(s, w);
+    }
+
+    #[test]
+    fn clock_identity_label_distinguishes_each_variant() {
+        let a = ClockIdentity::SourcePcr { input_id: "in-srt-a".into() };
+        let b = ClockIdentity::Ptp { domain: 127 };
+        let c = ClockIdentity::Wallclock;
+        assert!(a.label().contains("in-srt-a"));
+        assert!(b.label().contains("127"));
+        assert_eq!(c.label(), "wallclock");
+        let labels = std::collections::HashSet::<String>::from_iter(
+            [a.label(), b.label(), c.label()]
+        );
+        assert_eq!(labels.len(), 3, "labels must distinguish each variant");
     }
 }

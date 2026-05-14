@@ -4,11 +4,21 @@
 //! Elementary-stream bus primitives for the PID-bus runtime.
 //!
 //! This module provides the *plumbing* that the Phase 5 assembler will
-//! consume: a [`FlowEsBus`] registry keyed by `(input_id, source_pid)`,
+//! consume: a [`NodeEsBus`] registry keyed by `(input_id, source_pid)`,
 //! a lightweight [`EsPacket`] carrying exactly one 188-byte TS packet
 //! plus enough metadata for downstream assembly, and a per-input
 //! [`TsEsDemuxer`] task that reads the input's raw-TS broadcast and
 //! dispatches packets onto the right per-PID channels.
+//!
+//! Scope evolution: this bus was originally per-flow. As of the node-bus
+//! refactor (PES Switch plan, Phase 1), one [`NodeEsBus`] is owned by
+//! [`crate::engine::manager::FlowManager`] and shared across every
+//! assembled flow on the edge. Channels are still keyed by
+//! `(input_id, source_pid)` — input IDs are globally unique on a node,
+//! so the key shape already covers the new scope. The assignment-
+//! uniqueness rule (one input → one flow) is still enforced today, so
+//! channel keys still serialise to one publisher / consumer pair in
+//! practice; Phase 2 lifts that and the bus picks up real fan-out.
 //!
 //! Phase 4 ships these primitives with unit tests and zero integration
 //! into [`crate::engine::flow::FlowRuntime`]. Phase 5 owns the
@@ -89,18 +99,23 @@ pub struct EsPacket {
     pub upstream_seq: Option<u16>,
 }
 
-/// Per-flow elementary-stream bus. Read-shared across every consumer
-/// (PSI generator, assembler, analysis) via `Arc`.
+/// Node-wide elementary-stream bus. Read-shared across every consumer
+/// (PSI generator, assembler, analysis) on the edge via `Arc`.
 ///
-/// Keyed by `(input_id, source_pid)` so a flow with N inputs registers
-/// one logical namespace per input; the same PID on two different
-/// inputs does not collide. Channels are created lazily on first
-/// observation of a new PID and kept for the life of the flow.
-pub struct FlowEsBus {
+/// Keyed by `(input_id, source_pid)`. Input IDs are globally unique on
+/// the node (top-level config entities), so the key shape already
+/// scopes correctly without further qualification. Channels are
+/// created lazily on first observation of a new PID and kept for the
+/// life of the node.
+///
+/// Owned by [`crate::engine::manager::FlowManager`]; cloned into every
+/// assembled flow's runtime via `Arc`. Passthrough flows never touch
+/// the bus and pay zero cost (no map lookups, no allocations).
+pub struct NodeEsBus {
     channels: DashMap<(String, u16), broadcast::Sender<EsPacket>>,
 }
 
-impl FlowEsBus {
+impl NodeEsBus {
     pub fn new() -> Self {
         Self {
             channels: DashMap::new(),
@@ -137,7 +152,7 @@ impl FlowEsBus {
     }
 }
 
-impl Default for FlowEsBus {
+impl Default for NodeEsBus {
     fn default() -> Self {
         Self::new()
     }
@@ -152,10 +167,11 @@ impl Default for FlowEsBus {
 /// with `stream_type = 0` and the assembler can fall back to the
 /// configured plan.
 pub struct TsEsDemuxer {
-    /// Flow-local input ID — used as the bus key together with the PID.
+    /// Node-globally-unique input ID — used as the bus key together with the PID.
     input_id: String,
-    /// Shared bus. Cloned from the flow's `FlowEsBus`.
-    bus: Arc<FlowEsBus>,
+    /// Shared node-wide bus. Cloned from the [`NodeEsBus`] owned by the
+    /// `FlowManager`.
+    bus: Arc<NodeEsBus>,
     /// Known PMT PIDs, learned from PAT.
     pmt_pids: std::collections::HashSet<u16>,
     /// Learned `stream_type` per source PID, keyed from PMT entries.
@@ -167,7 +183,7 @@ pub struct TsEsDemuxer {
 }
 
 impl TsEsDemuxer {
-    pub fn new(input_id: impl Into<String>, bus: Arc<FlowEsBus>) -> Self {
+    pub fn new(input_id: impl Into<String>, bus: Arc<NodeEsBus>) -> Self {
         Self {
             input_id: input_id.into(),
             bus,
@@ -399,7 +415,7 @@ mod tests {
 
     #[test]
     fn demuxer_publishes_es_packets_with_stream_types() {
-        let bus = Arc::new(FlowEsBus::new());
+        let bus = Arc::new(NodeEsBus::new());
         let mut demux = TsEsDemuxer::new("in-a", bus.clone());
         let mut rx_video = bus.subscribe("in-a", 0x101);
         let mut rx_audio = bus.subscribe("in-a", 0x102);
@@ -425,7 +441,7 @@ mod tests {
 
     #[test]
     fn demuxer_keeps_two_inputs_isolated() {
-        let bus = Arc::new(FlowEsBus::new());
+        let bus = Arc::new(NodeEsBus::new());
         let mut demux_a = TsEsDemuxer::new("in-a", bus.clone());
         let mut demux_b = TsEsDemuxer::new("in-b", bus.clone());
         let mut rx_a = bus.subscribe("in-a", 0x100);
@@ -453,7 +469,7 @@ mod tests {
 
     #[test]
     fn demuxer_marks_pusi_and_pcr() {
-        let bus = Arc::new(FlowEsBus::new());
+        let bus = Arc::new(NodeEsBus::new());
         let mut demux = TsEsDemuxer::new("in-a", bus.clone());
         let mut rx = bus.subscribe("in-a", 0x101);
 
@@ -492,7 +508,7 @@ mod tests {
 
     #[test]
     fn demuxer_ignores_rtp_header_when_not_raw_ts() {
-        let bus = Arc::new(FlowEsBus::new());
+        let bus = Arc::new(NodeEsBus::new());
         let mut demux = TsEsDemuxer::new("in-a", bus.clone());
         let mut rx = bus.subscribe("in-a", 0x101);
 
@@ -522,7 +538,7 @@ mod tests {
 
     #[test]
     fn bus_sender_and_subscribe_lazy_create_channel() {
-        let bus = FlowEsBus::new();
+        let bus = NodeEsBus::new();
         // Subscribe-first pattern — the Phase 5 assembler wires up before
         // the demuxer publishes, so channels must exist at subscribe time.
         let mut rx = bus.subscribe("in-a", 0x100);
