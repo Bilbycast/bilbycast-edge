@@ -1400,6 +1400,16 @@ pub struct TestPatternInputConfig {
     /// Audio level in dBFS (negative). Default -20 dBFS (broadcast reference).
     #[serde(default = "default_tp_tone_dbfs")]
     pub tone_dbfs: f32,
+    /// A/V sync test mode (a.k.a. "beep and flash"). When true, the tone is
+    /// gated into a short burst on the first ~80 ms of every wallclock
+    /// second (silence in between) and the video draws a luma flash patch
+    /// next to the timecode on the same frames. A reviewer or scope sees
+    /// the offset between the audible pip and the visible flash directly —
+    /// the standard EBU R 49 / SMPTE 2-pop style sync test. Pairs with
+    /// gate 3 (A/V sync drift, EBU R37 ±40 ms) in the broadcast-quality
+    /// gates. Requires `audio_enabled = true`.
+    #[serde(default)]
+    pub av_sync_marker: bool,
     /// Optional ingress audio re-encode applied to the synthesised tone
     /// before the bytes reach the flow broadcast channel. Useful when a
     /// downstream consumer needs a different codec / sample-rate than

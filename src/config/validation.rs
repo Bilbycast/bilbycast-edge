@@ -219,7 +219,11 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
 
         // Validate input_ids references. A flow may have multiple inputs;
         // cross-flow input assignment uniqueness is still enforced (an input
-        // can only belong to one flow at a time).
+        // can only belong to one running flow at a time). Disabled flows
+        // don't actually spawn input tasks, so their `input_ids` are
+        // skipped here — operators stage alternative wiring on disabled
+        // flows and toggle `enabled` to switch between them without
+        // rewriting `input_ids`.
         let mut flow_input_ids = HashSet::new();
         let mut active_input_count = 0usize;
         for iid in &flow.input_ids {
@@ -232,7 +236,7 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
                     flow.id, iid
                 );
             }
-            if !assigned_inputs.insert(iid.clone()) {
+            if flow.enabled && !assigned_inputs.insert(iid.clone()) {
                 bail!(
                     "Flow '{}': input '{}' is already assigned to another flow",
                     flow.id, iid
@@ -245,22 +249,30 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
                 }
             }
         }
-        // The "at most one active input" invariant belongs to the
-        // passthrough active-input switching model — only one input's
-        // bytes reach `broadcast_tx` at any moment. PID-bus assembly
-        // flows (`kind = spts` / `mpts`) break that model deliberately:
-        // every input's `TsEsDemuxer` publishes onto the shared
-        // [`NodeEsBus`] concurrently, and the assembler pulls ES from
-        // whichever slots are configured. The `active` flag is unused
-        // on the assembly path, so skip the count check there.
+        // For passthrough flows only one input's bytes reach
+        // `broadcast_tx` at any moment, but with the PES Switch / Node
+        // Bus Matrix model the operator picks the live leg at runtime
+        // via `bus_route` / `switch_active_input`; the per-input
+        // `active` flag is now just an initial-state hint. The engine
+        // already picks the first `active: true` input as the initial
+        // active leg and runs the rest as warm-passive (no bytes on
+        // `broadcast_tx` until the operator routes to them), so
+        // multiple `active: true` flags are harmless. Log a warning
+        // (so misconfig is visible) but don't reject the config.
+        //
+        // PID-bus assembly flows (`kind = spts` / `mpts`) deliberately
+        // run every input concurrently — the `active` flag is unused
+        // on that path — so the warning is suppressed there.
         let assembly_mode = flow
             .assembly
             .as_ref()
             .is_some_and(|a| !matches!(a.kind, crate::config::models::AssemblyKind::Passthrough));
         if !assembly_mode && active_input_count > 1 {
-            bail!(
-                "Flow '{}': at most one input may be active at a time, found {}",
-                flow.id, active_input_count
+            tracing::warn!(
+                flow_id = %flow.id,
+                active_input_count,
+                "Flow has {} inputs marked active in a passthrough flow; the engine will pick the first as the initial active leg — the rest stay warm-passive until routed via bus_route / switch_active_input",
+                active_input_count
             );
         }
 
@@ -276,7 +288,7 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
                     flow.id, oid
                 );
             }
-            if !assigned_outputs.insert(oid.clone()) {
+            if flow.enabled && !assigned_outputs.insert(oid.clone()) {
                 bail!(
                     "Flow '{}': output '{}' is already assigned to another flow",
                     flow.id, oid
@@ -338,6 +350,39 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
                         flow.id, oid
                     );
                 }
+            }
+        }
+    }
+
+    // ── Top-level existence check for assembly references ────────────
+    // With cross-flow ES routing (PES Switch Phase 2.1c Stage 3), an
+    // assembled flow's slot may reference an input owned by a sibling
+    // flow on the same node — so `validate_flow_assembly` no longer
+    // requires the ref to be in this flow's own `input_ids`. We still
+    // catch typos: every assembly ref must name an input that exists
+    // somewhere in the top-level `inputs` array.
+    let node_input_ids: HashSet<&str> =
+        config.inputs.iter().map(|d| d.id.as_str()).collect();
+    for flow in &config.flows {
+        let Some(assembly) = flow.assembly.as_ref() else { continue };
+        let mut refs: Vec<&str> = Vec::new();
+        if let Some(pcr) = &assembly.pcr_source {
+            refs.push(pcr.input_id.as_str());
+        }
+        for prog in &assembly.programs {
+            if let Some(pcr) = &prog.pcr_source {
+                refs.push(pcr.input_id.as_str());
+            }
+            for stream in &prog.streams {
+                collect_slot_input_refs(&stream.source, &mut refs);
+            }
+        }
+        for iid in refs {
+            if !node_input_ids.contains(iid) {
+                bail!(
+                    "Flow '{}': assembly references input_id '{}' which is not defined in the top-level inputs array",
+                    flow.id, iid
+                );
             }
         }
     }
@@ -1361,6 +1406,11 @@ fn validate_test_pattern_input(c: &crate::config::models::TestPatternInputConfig
                 "test-pattern: tone_dbfs must be in -60..=0 (got {})", c.tone_dbfs
             ));
         }
+    }
+    if c.av_sync_marker && !c.audio_enabled {
+        return Err(anyhow::anyhow!(
+            "test-pattern: av_sync_marker requires audio_enabled = true (a silent flash has no audio reference to align against)"
+        ));
     }
     validate_input_transcode_group_a(
         c.audio_encode.as_ref(),
@@ -2592,17 +2642,18 @@ fn validate_flow_assembly(
 ) -> Result<()> {
     use crate::config::models::AssemblyKind;
 
-    let input_ids: std::collections::HashSet<&str> =
-        flow_input_ids.iter().map(|s| s.as_str()).collect();
+    // PES Switch Phase 2.1c Stage 3 ships cross-flow ES routing — an
+    // assembled flow's slot may reference an input owned by a sibling
+    // flow on the same node, looked up through
+    // `FlowManager::acquire_demuxer` against the node-wide
+    // `input_publishers` registry. So the assembly-level membership
+    // check is no longer "input must be on this flow" — that was the
+    // Phase 1 restriction, lifted here. Cross-config existence is
+    // validated at the `validate_config` level, which sees every
+    // top-level input on the node.
+    let _ = flow_input_ids; // kept for shape compatibility / future per-flow checks
 
-    let check_input = |iid: &str| -> Result<()> {
-        if !input_ids.contains(iid) {
-            bail!(
-                "{context}: assembly references input_id '{iid}' not present in flow.input_ids"
-            );
-        }
-        Ok(())
-    };
+    let check_input = |_iid: &str| -> Result<()> { Ok(()) };
 
     let check_pid = |pid: u16, what: &str| -> Result<()> {
         if !(0x0010..=0x1FFE).contains(&pid) {
@@ -2784,6 +2835,34 @@ fn validate_flow_assembly(
     }
 
     Ok(())
+}
+
+/// Walk a `SlotSource` tree and push every referenced `input_id` (Pid,
+/// Essence, both legs of Hitless, all Switch legs) into `out`. Used by
+/// `validate_config` to confirm every assembly ref names a real
+/// top-level input on the node (cross-flow refs allowed; typos
+/// rejected).
+fn collect_slot_input_refs<'a>(
+    src: &'a crate::config::models::SlotSource,
+    out: &mut Vec<&'a str>,
+) {
+    use crate::config::models::{SlotSource, SwitchLeg};
+    match src {
+        SlotSource::Pid { input_id, .. } => out.push(input_id.as_str()),
+        SlotSource::Essence { input_id, .. } => out.push(input_id.as_str()),
+        SlotSource::Hitless { primary, backup, .. } => {
+            collect_slot_input_refs(primary, out);
+            collect_slot_input_refs(backup, out);
+        }
+        SlotSource::Switch { legs, .. } => {
+            for leg in legs {
+                match leg {
+                    SwitchLeg::Pid { input_id, .. } => out.push(input_id.as_str()),
+                    SwitchLeg::Essence { input_id, .. } => out.push(input_id.as_str()),
+                }
+            }
+        }
+    }
 }
 
 fn collect_slot_ref<'a>(

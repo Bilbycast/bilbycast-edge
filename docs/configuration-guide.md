@@ -1013,7 +1013,8 @@ exercising downstream gear without a real source.
   "video_bitrate_kbps": 2000,
   "audio_enabled": true,
   "tone_hz": 1000.0,
-  "tone_dbfs": -20.0
+  "tone_dbfs": -20.0,
+  "av_sync_marker": false
 }
 ```
 
@@ -1027,6 +1028,7 @@ exercising downstream gear without a real source.
 | `audio_enabled` | bool | `true` | When `false`, emits a video-only TS. |
 | `tone_hz` | f32 | `1000.0` | Audio tone frequency. Range `[50, 8000]`. |
 | `tone_dbfs` | f32 | `-20.0` | Audio level in dBFS. `-20 dBFS` is the broadcast reference level. |
+| `av_sync_marker` | bool | `false` | A/V-sync test mode (EBU R 49 / SMPTE 2-pop style). When `true`, the tone gates into a ~80 ms burst on the timecode second boundary and a luma flash patch appears next to the timecode on the same frames. Offset between audible pip and visible flash reads off directly as A/V skew. Requires `audio_enabled = true`. |
 
 Requires the edge build to include the `media-codecs` and
 `fdk-aac` features (both on by default). Software-encoded — counts

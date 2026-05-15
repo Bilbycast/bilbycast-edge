@@ -241,6 +241,12 @@ async fn run_inner(
     // Audio state: sine phase, pts running counter in 90kHz.
     let mut audio_state = audio_ctx;
 
+    // A/V sync marker geometry. Burst length ≈ 80 ms (1 video frame on
+    // 12 fps and floor; the .max(3) keeps it visible at low rates and
+    // gives the AAC encoder enough samples to land at least one frame
+    // boundary inside the burst regardless of phase).
+    let burst_frames: u64 = ((fps as u64 * 80) / 1000).max(3);
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -250,12 +256,17 @@ async fn run_inner(
         }
 
         let pts_90khz = frame_idx.saturating_mul(90_000) / fps as u64;
+        let frame_in_second = frame_idx % fps as u64;
+        let burst_active = config.av_sync_marker && frame_in_second < burst_frames;
 
         // Refresh Y plane from the static bars and overlay motion so
         // downstream viewers can tell the feed is live, not frozen.
         y_plane.copy_from_slice(&y_base);
         draw_bouncing_box(&mut y_plane, width as usize, height as usize, frame_idx);
         draw_timecode(&mut y_plane, width as usize, height as usize, frame_idx, fps);
+        if config.av_sync_marker {
+            draw_av_sync_marker(&mut y_plane, width as usize, height as usize, burst_active);
+        }
 
         // ── Video ── encode one frame of bars.
         let encoded_frames = tokio::task::block_in_place(|| {
@@ -282,9 +293,32 @@ async fn run_inner(
         // ── Audio ── generate + encode ~1 frame-duration's worth of tone.
         if let Some(ref mut ctx) = audio_state {
             let samples_needed = ctx.sample_rate / fps as usize;
+            // Burst envelope: when av_sync_marker is on, gate the sine
+            // into the same window the flash uses, with a raised-cosine
+            // ramp at each edge so the burst doesn't add broadband click
+            // energy (which would taint LUFS / true-peak measurements
+            // downstream).
+            let total_burst_samples = (burst_frames as usize) * samples_needed;
+            let ramp_samples = (ctx.sample_rate * 2 / 1000).min(total_burst_samples / 4).max(1);
+            let pos_base = (frame_in_second as usize) * samples_needed;
             let mut planar: Vec<Vec<f32>> = vec![Vec::with_capacity(samples_needed); ctx.channels];
-            for _ in 0..samples_needed {
-                let v = (ctx.phase.sin() as f32) * ctx.amplitude;
+            for i in 0..samples_needed {
+                let env: f32 = if !config.av_sync_marker {
+                    1.0
+                } else if !burst_active {
+                    0.0
+                } else {
+                    let pos = pos_base + i;
+                    if pos < ramp_samples {
+                        0.5 * (1.0 - (std::f32::consts::PI * pos as f32 / ramp_samples as f32).cos())
+                    } else if pos + ramp_samples >= total_burst_samples {
+                        let tail = total_burst_samples - pos;
+                        0.5 * (1.0 - (std::f32::consts::PI * tail as f32 / ramp_samples as f32).cos())
+                    } else {
+                        1.0
+                    }
+                };
+                let v = (ctx.phase.sin() as f32) * ctx.amplitude * env;
                 for ch in planar.iter_mut() {
                     ch.push(v);
                 }
@@ -529,6 +563,25 @@ fn draw_timecode(y: &mut [u8], width: usize, height: usize, frame_idx: u64, fps:
         draw_glyph(y, width, height, ch, cx, y0, scale, 235);
         cx += glyph_w + gap;
     }
+}
+
+/// A/V-sync marker patch. Always paints a black "well" in the upper-
+/// right corner so the eye / scope knows where to look; on burst frames
+/// the inner square goes bright. Paired with the audio tone burst, the
+/// offset between the audible pip and the visible flash reads off
+/// directly as A/V skew.
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+fn draw_av_sync_marker(y: &mut [u8], width: usize, height: usize, flash_on: bool) {
+    let size = (height / 8).max(48);
+    if size >= width || size >= height { return; }
+    let pad = (height / 100).max(4);
+    let x0 = width.saturating_sub(size + pad);
+    let y0 = pad;
+    fill_rect_y(y, width, height, x0, y0, size, size, 16);
+    let border = (size / 12).max(2);
+    let inner_size = size.saturating_sub(2 * border);
+    let inner_luma = if flash_on { 235 } else { 16 };
+    fill_rect_y(y, width, height, x0 + border, y0 + border, inner_size, inner_size, inner_luma);
 }
 
 /// Solid white box that ping-pongs diagonally. Triangle wave in X and Y
