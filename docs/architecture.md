@@ -581,6 +581,28 @@ Fixed-size rotating reservoir (4096 samples) on every TS-bearing output's send p
 
 **Production-safety invariant.** Flows without an `assembly` block — or with `assembly.kind = passthrough` — run exactly as before. Assembled flows fail loudly with a Critical `pid_bus_*` event on any unresolvable state; no silent misbehaviour.
 
+### Input-host flows
+
+A flow with `output_ids: []` and `input_ids: [...]` is an **input-host flow** — it owns the input lifecycle, runs media analysis / thumbnail / recording on it, and exposes its elementary streams to sibling flows via the Node Bus Matrix. The engine has no special code path for it: `engine::flow.rs` validates `output_ids` for format / uniqueness only (no non-empty check), and `for out in &flow.outputs` is a tolerant iteration over `vec![]`. Sibling flows reference the host's input through their own `assembly` slots; `FlowManager::acquire_demuxer` refcounts demuxer subscriptions per `(input_id, source_pid)` so no duplicate demuxer is spawned. The PSI catalogue is shared via `FlowManager::psi_catalog_for_input` (Phase 2.2b).
+
+The pattern is the operator-friendly answer to "share one input across multiple flows" without lifting input lifecycle out of `FlowRuntime` (Phase 2.2a, deferred). Trade-offs:
+
+| Aspect | Standard flow | Input-host flow |
+|---|---|---|
+| `output_ids` | ≥ 1 | `[]` |
+| `input_ids` | ≥ 1 | ≥ 1 |
+| Owns input lifecycle | Yes | Yes |
+| Runs analysis / thumbnail / recording | Yes | Yes |
+| Exposes ES to siblings via Node Bus | Yes (concurrent OK) | Primary purpose |
+| Stopping the flow drops siblings? | Only siblings referencing its inputs | Same — but more likely to have many |
+| UI badge | (none) | `INPUT HOST` (purple) on flow card + master flows page + Node Bus Sources pane chip |
+
+**Lifecycle dependency.** When the host flow is stopped, the input task is cancelled and its `broadcast::Sender<EsPacket>` drops. Sibling flows referencing the host's input via assembly slots see `RecvError::Closed` on the `(input_id, source_pid)` channel and the slot's fan-in task exits. `engine::ts_assembler::slot_fanin` distinguishes legitimate teardown (the parent assembler's `cancel.cancelled()` arm wins on flow stop / hot-swap / edge shutdown) from the unexpected upstream-close case — the latter emits a Warning `pid_bus_slot_source_closed` event with structured `details = { error_code, program_number, out_pid, source_input_id, source_pid }` so the operator sees why output went silent. The bus channel re-arms automatically when the host restarts and the next packet wakes the assembler — no operator-driven recovery step is needed.
+
+**One owner per input.** Validation enforces that an input ID is in at most one **enabled** flow's `input_ids` (`config/validation.rs`). Disabled flows are exempt — operators can stage alternative wiring on a disabled flow and toggle `enabled` to switch. Cross-flow input *references* happen via `assembly`, never via duplicating the ID into a second flow's `input_ids`.
+
+**No schema field.** The "input-host" status is purely UI-derived from `output_ids.length === 0` (with `input_ids.length > 0` as a sanity gate). There is no `flow_kind` field on the wire; `WS_PROTOCOL_VERSION` is unchanged. Round-trip safe — adding outputs to a host flow flips it back to standard automatically.
+
 ## MPTS → SPTS program filtering
 
 When an input carries an MPTS (Multi-Program Transport Stream) and an output wants only a single program, a per-output **program filter** runs between the broadcast receiver and the output's send path. Two implementations share the heavy lifting:

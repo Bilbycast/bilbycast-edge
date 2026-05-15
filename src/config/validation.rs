@@ -6604,10 +6604,21 @@ mod tests {
     }
 
     #[test]
-    fn assembly_rejects_unknown_input_id() {
-        let a = spts_assembly("in-unknown");
-        let err = validate_flow_assembly(&a, &["in-a".into()], "test").unwrap_err();
-        assert!(err.to_string().contains("in-unknown"));
+    fn assembly_accepts_foreign_input_id() {
+        // PES Switch Phase 2.1c Stage 3 (May 2026) dropped the
+        // `assembly.input_ids ⊆ flow.input_ids` membership check —
+        // cross-flow assembly references are now legal so an operator
+        // can route ES from one flow's input into another flow's
+        // assembly via the Node Bus Matrix. The cross-clock guard
+        // (`check_assembly_clock_compatibility`) at resolve time is the
+        // real correctness gate; runtime closes surface as the
+        // `pid_bus_slot_source_closed` Warning when the foreign input's
+        // owning flow stops. Foreign refs to inputs that never resolve
+        // degrade gracefully (the slot just stays silent) — they are no
+        // longer rejected at validation time.
+        let a = spts_assembly("in-foreign");
+        validate_flow_assembly(&a, &["in-a".into()], "test")
+            .expect("foreign input_id is accepted post-PES-Switch");
     }
 
     #[test]

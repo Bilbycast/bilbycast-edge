@@ -502,6 +502,8 @@ async fn run_assembler(
         &mut slot_tasks,
         &mut pcr_out_pid_by_program,
         &mut active_leg_input,
+        &event_sender,
+        &flow_id,
     );
 
     let mut psi_tick = interval(PSI_INTERVAL);
@@ -546,6 +548,8 @@ async fn run_assembler(
                             &mut pat_version,
                             &mut pmt_versions,
                             &mut active_leg_input,
+                            &event_sender,
+                            &flow_id,
                         );
                         // Arm DI on every out_pid — the next PCR-bearing
                         // TS packet on each will carry
@@ -1387,6 +1391,8 @@ fn install_plan(
     slot_tasks: &mut Vec<JoinHandle<()>>,
     pcr_out_pid_by_program: &mut Vec<u16>,
     active_leg_input: &mut std::collections::HashMap<(usize, u16), String>,
+    event_sender: &Option<crate::manager::events::EventSender>,
+    flow_id: &str,
 ) {
     for (pidx, prog) in plan.programs.iter().enumerate() {
         for s in prog.slots.iter() {
@@ -1414,7 +1420,21 @@ fn install_plan(
                 let rx = bus.subscribe(&slot.source.0, slot.source.1);
                 let tx = fanin_tx.clone();
                 slot_cancels.push(slot_cancel.clone());
-                slot_tasks.push(tokio::spawn(slot_fanin(idx, rx, tx, slot_cancel)));
+                let identity = SlotIdentity {
+                    program_number: prog.program_number,
+                    out_pid: slot.out_pid,
+                    source_input_id: slot.source.0.clone(),
+                    source_pid: slot.source.1,
+                };
+                slot_tasks.push(tokio::spawn(slot_fanin(
+                    idx,
+                    rx,
+                    tx,
+                    slot_cancel,
+                    identity,
+                    event_sender.clone(),
+                    flow_id.to_string(),
+                )));
             }
             if is_switch {
                 // Initial active leg = AssemblySlot.source — populated
@@ -1460,6 +1480,7 @@ fn install_plan(
 /// Monotonic mod 32 — same discipline as `TsContinuityFixer` so A→B→A
 /// never lands on a receiver-locked phantom version.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn apply_plan_replacement(
     plan: &mut AssemblyPlan,
     new_plan: AssemblyPlan,
@@ -1473,6 +1494,8 @@ fn apply_plan_replacement(
     pat_version: &mut u8,
     pmt_versions: &mut Vec<u8>,
     active_leg_input: &mut std::collections::HashMap<(usize, u16), String>,
+    event_sender: &Option<crate::manager::events::EventSender>,
+    flow_id: &str,
 ) {
     // Program set: (program_number, pmt_pid) pairs, order-preserving.
     let old_pat: Vec<(u16, u16)> = plan
@@ -1585,7 +1608,21 @@ fn apply_plan_replacement(
                         let rx = bus.subscribe(&slot.source.0, slot.source.1);
                         let tx = fanin_tx.clone();
                         slot_cancels.push(slot_cancel.clone());
-                        slot_tasks.push(tokio::spawn(slot_fanin(idx, rx, tx, slot_cancel)));
+                        let identity = SlotIdentity {
+                            program_number: prog.program_number,
+                            out_pid: slot.out_pid,
+                            source_input_id: slot.source.0.clone(),
+                            source_pid: slot.source.1,
+                        };
+                        slot_tasks.push(tokio::spawn(slot_fanin(
+                            idx,
+                            rx,
+                            tx,
+                            slot_cancel,
+                            identity,
+                            event_sender.clone(),
+                            flow_id.to_string(),
+                        )));
                     }
                 }
             }
@@ -1644,11 +1681,26 @@ fn apply_plan_replacement(
     let _ = (&mut new_flat, &mut carry_tasks, &mut carry_cancels);
 }
 
+/// Identity carried into [`slot_fanin`] so it can emit a structured
+/// `pid_bus_slot_source_closed` event when the upstream ES bus channel
+/// closes while the parent assembler is still running. Cheap to clone
+/// (one String + four scalars).
+#[derive(Debug, Clone)]
+struct SlotIdentity {
+    program_number: u16,
+    out_pid: u16,
+    source_input_id: String,
+    source_pid: u16,
+}
+
 async fn slot_fanin(
     slot_idx: usize,
     mut rx: broadcast::Receiver<EsPacket>,
     tx: mpsc::Sender<(usize, EsPacket)>,
     cancel: CancellationToken,
+    identity: SlotIdentity,
+    event_sender: Option<crate::manager::events::EventSender>,
+    flow_id: String,
 ) {
     loop {
         tokio::select! {
@@ -1668,7 +1720,43 @@ async fn slot_fanin(
                     // without cross-packet correlation within a slot.
                     continue;
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Closed) => {
+                    // Upstream publisher dropped — the input task that
+                    // owns this `(input_id, source_pid)` channel exited.
+                    // Most commonly the owning flow was stopped while
+                    // sibling flows still reference its inputs via
+                    // assembly slots (the "input-host flow" pattern). The
+                    // bus channel re-arms automatically on owner restart,
+                    // but the operator needs to see why output went
+                    // silent. The `cancel.cancelled()` arm above wins
+                    // when the assembler is being torn down (parent flow
+                    // stop / hot-swap / edge shutdown), so this emit only
+                    // fires on truly unexpected closes.
+                    if let Some(es) = &event_sender {
+                        es.emit_flow_with_details(
+                            crate::manager::events::EventSeverity::Warning,
+                            crate::manager::events::category::FLOW,
+                            format!(
+                                "Flow '{flow_id}': assembly slot source disappeared — \
+                                 input '{}' source_pid 0x{:04X} (program {} out_pid 0x{:04X}). \
+                                 Most likely the owning flow stopped; restart it to recover.",
+                                identity.source_input_id,
+                                identity.source_pid,
+                                identity.program_number,
+                                identity.out_pid,
+                            ),
+                            &flow_id,
+                            serde_json::json!({
+                                "error_code": "pid_bus_slot_source_closed",
+                                "program_number": identity.program_number,
+                                "out_pid": identity.out_pid,
+                                "source_input_id": identity.source_input_id,
+                                "source_pid": identity.source_pid,
+                            }),
+                        );
+                    }
+                    break;
+                }
             }
         }
     }
