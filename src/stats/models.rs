@@ -666,6 +666,16 @@ pub struct InputStats {
     pub srt_bonding_stats: Option<SrtBondingStats>,
     /// Number of times the active input leg switched between leg 1 and leg 2.
     pub redundancy_switches: u64,
+    /// Cumulative count of source-side timing-field discontinuities
+    /// observed in the ingress stream (PCR / PTS / DTS jumps > 500 ms,
+    /// rolled up). Drives the manager UI's "Source discontinuities"
+    /// chip on the flow card so the operator sees a chronic upstream
+    /// `-stream_loop`-style sender at a glance, before the events
+    /// page surfaces the underlying `source_pcr_discontinuity` /
+    /// `source_pts_discontinuity` / `source_dts_discontinuity` event
+    /// trail. Additive — older managers ignore it.
+    #[serde(default)]
+    pub source_discontinuities: u64,
     /// True SMPTE 2022-7 buffered-merger stats. Present only when the
     /// input was started with `path_differential_ms` set on the
     /// redundancy config (industry-standard buffered mode). Absent on

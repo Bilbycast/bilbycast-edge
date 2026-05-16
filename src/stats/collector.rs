@@ -2152,6 +2152,17 @@ pub struct FlowStatsAccumulator {
     pub input_filtered: AtomicU64,
     pub fec_recovered: AtomicU64,
     pub redundancy_switches: AtomicU64,
+    /// Cumulative source-side timing-field discontinuities observed
+    /// in the ingress stream — file-loop boundaries on upstream
+    /// senders (e.g. ffmpeg `-stream_loop -1 -c copy`), encoder
+    /// restarts, decoder reseats. Aggregated across PCR + PTS + DTS
+    /// jumps > 500 ms; individual per-code events still ride the
+    /// events feed (`source_pcr_discontinuity` /
+    /// `source_pts_discontinuity` / `source_dts_discontinuity`) for
+    /// the operator. The counter is the running total so the manager
+    /// UI's flow card can show "12 source discontinuities since
+    /// start" alongside the recent-events panel.
+    pub source_discontinuities: AtomicU64,
     /// Latest snapshot of the buffered SMPTE 2022-7 merger, when the
     /// input runs in industry-standard buffered mode. The redundant
     /// RTP listener publishes to this from the data-path task at the
@@ -2391,6 +2402,7 @@ impl FlowStatsAccumulator {
             input_filtered: AtomicU64::new(0),
             fec_recovered: AtomicU64::new(0),
             redundancy_switches: AtomicU64::new(0),
+            source_discontinuities: AtomicU64::new(0),
             buffered_hitless_snapshot: std::sync::RwLock::new(None),
             output_stats: DashMap::new(),
             input_throughput: ThroughputEstimator::new(),
@@ -3080,6 +3092,9 @@ impl FlowStatsAccumulator {
                         .get()
                         .map(bond_handle_to_leg_stats),
                     redundancy_switches: self.redundancy_switches.load(Ordering::Relaxed),
+                    source_discontinuities: self
+                        .source_discontinuities
+                        .load(Ordering::Relaxed),
                     buffered_hitless: self
                         .buffered_hitless_snapshot
                         .read()

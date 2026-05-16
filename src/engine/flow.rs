@@ -1118,9 +1118,28 @@ impl FlowRuntime {
                 config.config.id.clone(),
                 active_input_tx.subscribe(),
                 event_sender.clone(),
+                flow_stats.clone(),
                 sampler_cancel,
             );
         }
+        // Source-side discontinuity watcher. Runs on every flow regardless
+        // of `master_clock.kind` because the PCR/PTS/DTS-backward-jump
+        // alarm is relevant to Passthrough flows too (the operator wants
+        // to see when an upstream `-stream_loop` sender's file boundary
+        // glitches the receiver), not just SourcePcrPll-class flows.
+        // Subscribes to the flow broadcast — for assembled flows that
+        // means it sees the assembled output, which doesn't have inner
+        // source PCRs, so the alarm only fires for passthrough /
+        // transcoded flows in practice. For PID-bus flows the equivalent
+        // alarm comes from each input's per-input ES bus stats (Phase 4).
+        let _ = crate::engine::pcr_ingress_sampler::spawn_source_discontinuity_watch(
+            &broadcast_tx,
+            config.config.id.clone(),
+            active_input_tx.subscribe(),
+            event_sender.clone(),
+            flow_stats.clone(),
+            cancel_token.child_token(),
+        );
         {
             let mc = master_clock.clone();
             let acc = flow_stats.clone();

@@ -25,9 +25,12 @@ use tokio_util::sync::CancellationToken;
 use crate::engine::master_clock::SourcePcrPllMaster;
 use crate::engine::packet::RtpPacket;
 use crate::engine::ts_parse::{
-    extract_pcr, TS_PACKET_SIZE, TS_SYNC_BYTE,
+    extract_pcr, extract_pes_dts, extract_pes_pts, ts_pid, ts_pusi,
+    TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
 use crate::manager::events::{category, EventSender, EventSeverity};
+
+use std::collections::HashMap;
 
 /// Mirrors [`crate::engine::pcr_pll::PcrPll`]'s discontinuity gate: a
 /// jump > 500 ms in either direction is treated as a source-clock step
@@ -36,11 +39,18 @@ use crate::manager::events::{category, EventSender, EventSeverity};
 /// with the PLL's internal anchor reset.
 const DISCONTINUITY_THRESHOLD_27MHZ: u64 = 500 * 27_000; // 500 ms
 
+/// PTS / DTS discontinuity threshold in 90 kHz ticks (500 ms). Same
+/// semantic threshold as PCR; the 90 kHz scale matches the PES
+/// header's native timescale (PCR is 27 MHz, PTS/DTS are 90 kHz —
+/// related by ×300).
+const DISCONTINUITY_THRESHOLD_90KHZ: u64 = 500 * 90; // 500 ms
+
 /// Minimum interval between operator-visible discontinuity events for
 /// a given input. A chronically-broken source might emit a backward
 /// PCR every few seconds; without rate-limiting that would drown the
 /// events feed. The first event fires immediately; subsequent ones
-/// are debounced.
+/// are debounced. Tracked per-error-code so a noisy PTS doesn't
+/// suppress an independent PCR discontinuity.
 const DISCONTINUITY_EVENT_MIN_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(30);
 
@@ -63,6 +73,7 @@ pub fn spawn_pcr_ingress_sampler(
     flow_id: String,
     active_input_rx: tokio::sync::watch::Receiver<String>,
     events: EventSender,
+    flow_stats: Arc<crate::stats::collector::FlowStatsAccumulator>,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     spawn_pcr_ingress_sampler_with_rx(
@@ -71,6 +82,7 @@ pub fn spawn_pcr_ingress_sampler(
         flow_id,
         active_input_rx,
         events,
+        flow_stats,
         cancel,
     )
 }
@@ -88,69 +100,27 @@ pub fn spawn_pcr_ingress_sampler_with_rx(
     flow_id: String,
     active_input_rx: tokio::sync::watch::Receiver<String>,
     events: EventSender,
+    flow_stats: Arc<crate::stats::collector::FlowStatsAccumulator>,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
+    let _ = events; // PLL sampler no longer emits events directly; the
+                    // `spawn_source_discontinuity_watch` task owns
+                    // operator-visible alarms now.
+    let _ = active_input_rx;
+    let _ = flow_stats;
+    let _ = flow_id;
     let thread_handle = crate::engine::dedicated_runtime::spawn_dedicated(
         crate::engine::dedicated_runtime::DedicatedRuntimeConfig::new(
             "pcr-pll",
             "BILBYCAST_PLL_CPUS",
         ),
         async move {
-            // Per-sampler discontinuity-detector state. Tracked in the
-            // dedicated thread so the hot-path `sample_packet` stays a
-            // pure function. `last_pcr_27mhz` is the previous accepted
-            // PCR value; `last_event_at` debounces operator events
-            // (see `DISCONTINUITY_EVENT_MIN_INTERVAL`).
-            let mut last_pcr_27mhz: Option<u64> = None;
-            let mut last_event_at: Option<Instant> = None;
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     msg = rx.recv() => {
                         match msg {
-                            Ok(pkt) => {
-                                let new_pcr = sample_packet(&master, &pkt);
-                                if let Some(pcr) = new_pcr {
-                                    if let Some(prev) = last_pcr_27mhz {
-                                        let gap = pcr_gap_27mhz(prev, pcr);
-                                        if gap.unsigned_abs() > DISCONTINUITY_THRESHOLD_27MHZ {
-                                            // Operator-visible event. Rate-
-                                            // limited so a chronically-broken
-                                            // source can't drown the feed.
-                                            let should_emit = match last_event_at {
-                                                None => true,
-                                                Some(t) => t.elapsed()
-                                                    >= DISCONTINUITY_EVENT_MIN_INTERVAL,
-                                            };
-                                            if should_emit {
-                                                last_event_at = Some(Instant::now());
-                                                let input_id =
-                                                    active_input_rx.borrow().clone();
-                                                events.emit_flow_with_details(
-                                                    EventSeverity::Warning,
-                                                    category::FLOW,
-                                                    format!(
-                                                        "source PCR discontinuity on flow '{}' \
-                                                         (input '{}'): {:.3} ms jump",
-                                                        flow_id,
-                                                        input_id,
-                                                        gap as f64 / 27_000.0,
-                                                    ),
-                                                    &flow_id,
-                                                    serde_json::json!({
-                                                        "error_code": "source_pcr_discontinuity",
-                                                        "input_id": input_id,
-                                                        "prev_pcr_27mhz": prev,
-                                                        "new_pcr_27mhz": pcr,
-                                                        "gap_ms": gap as f64 / 27_000.0,
-                                                    }),
-                                                );
-                                            }
-                                        }
-                                    }
-                                    last_pcr_27mhz = Some(pcr);
-                                }
-                            }
+                            Ok(pkt) => { let _ = sample_packet(&master, &pkt); }
                             Err(broadcast::error::RecvError::Lagged(_)) => continue,
                             Err(broadcast::error::RecvError::Closed) => break,
                         }
@@ -166,6 +136,268 @@ pub fn spawn_pcr_ingress_sampler_with_rx(
             let _ = thread_handle.join();
         }).await;
     })
+}
+
+/// Spawn the source-side discontinuity watcher — operator-visible
+/// alarm for PCR / PTS / DTS backward jumps > 500 ms in the ingress
+/// stream. Runs on **every** flow regardless of `master_clock.kind`
+/// (the PLL sampler is gated on SourcePcrPll-class flows, but the
+/// alarm should fire whenever the source loops a file or restarts
+/// its encoder — that's relevant to Passthrough flows too).
+///
+/// Emits three event families, rate-limited to 1 / 30 s per code:
+/// - `source_pcr_discontinuity` — PCR jump > 500 ms in either direction
+/// - `source_pts_discontinuity` — per-PID PES PTS backward jump
+/// - `source_dts_discontinuity` — per-PID PES DTS backward jump (video
+///   with B-frames)
+///
+/// Increments `FlowStats.source_discontinuities` on every detected
+/// event regardless of rate-limit suppression, so the manager UI's
+/// cumulative chip reflects the true rate.
+pub fn spawn_source_discontinuity_watch(
+    broadcast_tx: &broadcast::Sender<RtpPacket>,
+    flow_id: String,
+    active_input_rx: tokio::sync::watch::Receiver<String>,
+    events: EventSender,
+    flow_stats: Arc<crate::stats::collector::FlowStatsAccumulator>,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let mut rx = broadcast_tx.subscribe();
+    tokio::spawn(async move {
+        let mut last_pcr_27mhz: Option<u64> = None;
+        let mut last_pts_per_pid: HashMap<u16, u64> = HashMap::new();
+        let mut last_dts_per_pid: HashMap<u16, u64> = HashMap::new();
+        let mut last_event_pcr: Option<Instant> = None;
+        let mut last_event_pts: Option<Instant> = None;
+        let mut last_event_dts: Option<Instant> = None;
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                msg = rx.recv() => {
+                    match msg {
+                        Ok(pkt) => {
+                            // ── PCR jump detection ──
+                            for pcr in scan_all_pcr_values(&pkt) {
+                                if let Some(prev) = last_pcr_27mhz {
+                                    let gap = pcr_gap_27mhz(prev, pcr);
+                                    if gap.unsigned_abs() > DISCONTINUITY_THRESHOLD_27MHZ {
+                                        flow_stats.source_discontinuities
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        let should_emit = match last_event_pcr {
+                                            None => true,
+                                            Some(t) => t.elapsed() >= DISCONTINUITY_EVENT_MIN_INTERVAL,
+                                        };
+                                        if should_emit {
+                                            last_event_pcr = Some(Instant::now());
+                                            let input_id = active_input_rx.borrow().clone();
+                                            events.emit_flow_with_details(
+                                                EventSeverity::Warning,
+                                                category::FLOW,
+                                                format!(
+                                                    "source PCR discontinuity on flow '{}' \
+                                                     (input '{}'): {:.3} ms jump",
+                                                    flow_id, input_id, gap as f64 / 27_000.0,
+                                                ),
+                                                &flow_id,
+                                                serde_json::json!({
+                                                    "error_code": "source_pcr_discontinuity",
+                                                    "input_id": input_id,
+                                                    "prev_pcr_27mhz": prev,
+                                                    "new_pcr_27mhz": pcr,
+                                                    "gap_ms": gap as f64 / 27_000.0,
+                                                }),
+                                            );
+                                        }
+                                    }
+                                }
+                                last_pcr_27mhz = Some(pcr);
+                            }
+
+                            // ── PTS / DTS jump detection (per-PID) ──
+                            for obs in scan_pes_observations(&pkt) {
+                                if let Some(pts) = obs.pts_90khz {
+                                    if let Some(prev) = last_pts_per_pid.get(&obs.pid).copied() {
+                                        let gap = pts_gap_90khz(prev, pts);
+                                        if gap.unsigned_abs() > DISCONTINUITY_THRESHOLD_90KHZ {
+                                            flow_stats.source_discontinuities
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            let should_emit = match last_event_pts {
+                                                None => true,
+                                                Some(t) => t.elapsed() >= DISCONTINUITY_EVENT_MIN_INTERVAL,
+                                            };
+                                            if should_emit {
+                                                last_event_pts = Some(Instant::now());
+                                                let input_id = active_input_rx.borrow().clone();
+                                                events.emit_flow_with_details(
+                                                    EventSeverity::Warning,
+                                                    category::FLOW,
+                                                    format!(
+                                                        "source PTS discontinuity on flow '{}' \
+                                                         (input '{}', PID 0x{:04X}): {:.3} ms jump",
+                                                        flow_id, input_id, obs.pid, gap as f64 / 90.0,
+                                                    ),
+                                                    &flow_id,
+                                                    serde_json::json!({
+                                                        "error_code": "source_pts_discontinuity",
+                                                        "input_id": input_id,
+                                                        "pid": obs.pid,
+                                                        "prev_pts_90khz": prev,
+                                                        "new_pts_90khz": pts,
+                                                        "gap_ms": gap as f64 / 90.0,
+                                                    }),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    last_pts_per_pid.insert(obs.pid, pts);
+                                }
+                                if let Some(dts) = obs.dts_90khz {
+                                    if let Some(prev) = last_dts_per_pid.get(&obs.pid).copied() {
+                                        let gap = pts_gap_90khz(prev, dts);
+                                        if gap.unsigned_abs() > DISCONTINUITY_THRESHOLD_90KHZ {
+                                            flow_stats.source_discontinuities
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            let should_emit = match last_event_dts {
+                                                None => true,
+                                                Some(t) => t.elapsed() >= DISCONTINUITY_EVENT_MIN_INTERVAL,
+                                            };
+                                            if should_emit {
+                                                last_event_dts = Some(Instant::now());
+                                                let input_id = active_input_rx.borrow().clone();
+                                                events.emit_flow_with_details(
+                                                    EventSeverity::Warning,
+                                                    category::FLOW,
+                                                    format!(
+                                                        "source DTS discontinuity on flow '{}' \
+                                                         (input '{}', PID 0x{:04X}): {:.3} ms jump",
+                                                        flow_id, input_id, obs.pid, gap as f64 / 90.0,
+                                                    ),
+                                                    &flow_id,
+                                                    serde_json::json!({
+                                                        "error_code": "source_dts_discontinuity",
+                                                        "input_id": input_id,
+                                                        "pid": obs.pid,
+                                                        "prev_dts_90khz": prev,
+                                                        "new_dts_90khz": dts,
+                                                        "gap_ms": gap as f64 / 90.0,
+                                                    }),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    last_dts_per_pid.insert(obs.pid, dts);
+                                }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Pure scanner — returns every PCR value found in the datagram, in
+/// order. Used by [`spawn_source_discontinuity_watch`] which doesn't
+/// have an `SourcePcrPllMaster` to push samples into. Mirrors the
+/// `sample_packet` walk minus the PLL feed.
+fn scan_all_pcr_values(pkt: &RtpPacket) -> Vec<u64> {
+    let bytes = pkt.data.as_ref();
+    let payload = if pkt.is_raw_ts { bytes } else { skip_rtp_header(bytes) };
+    let mut out = Vec::new();
+    let mut i = match payload.iter().position(|&b| b == TS_SYNC_BYTE) {
+        Some(p) => p,
+        None => return out,
+    };
+    while i + TS_PACKET_SIZE <= payload.len() {
+        let ts_pkt = &payload[i..i + TS_PACKET_SIZE];
+        if ts_pkt[0] == TS_SYNC_BYTE {
+            if let Some(pcr) = extract_pcr(ts_pkt) {
+                out.push(pcr);
+            }
+            i += TS_PACKET_SIZE;
+        } else {
+            match payload[i + 1..].iter().position(|&b| b == TS_SYNC_BYTE) {
+                Some(p) => i = i + 1 + p,
+                None => return out,
+            }
+        }
+    }
+    out
+}
+
+/// One per-PID PES timestamp observation from a single datagram. Both
+/// fields are `Option` because most PESes set only PTS (`PTS_DTS_flags
+/// == 0b10`); only video with reordered B-frames sets both PTS and
+/// DTS (`0b11`).
+#[derive(Debug, Clone, Copy)]
+struct PesObservation {
+    pid: u16,
+    pts_90khz: Option<u64>,
+    dts_90khz: Option<u64>,
+}
+
+/// Scan a datagram for every PES start (PUSI=1 TS packet that begins
+/// with the 0x000001 PES start code) and return the (PID, PTS, DTS)
+/// triple for each. Used by the discontinuity watcher to alarm on
+/// per-PID backward jumps at upstream-sender file-loop boundaries.
+///
+/// Cheap on the hot path — one pass over the bytes, no allocations
+/// in the common case (small Vec — typically 0-2 entries per 1316-
+/// byte SRT datagram, since PES starts only land on the few packets
+/// per second that begin a new media frame).
+fn scan_pes_observations(pkt: &RtpPacket) -> Vec<PesObservation> {
+    let bytes = pkt.data.as_ref();
+    let payload = if pkt.is_raw_ts {
+        bytes
+    } else {
+        skip_rtp_header(bytes)
+    };
+    let mut out = Vec::new();
+    let mut i = match payload.iter().position(|&b| b == TS_SYNC_BYTE) {
+        Some(p) => p,
+        None => return out,
+    };
+    while i + TS_PACKET_SIZE <= payload.len() {
+        let ts_pkt = &payload[i..i + TS_PACKET_SIZE];
+        if ts_pkt[0] == TS_SYNC_BYTE {
+            if ts_pusi(ts_pkt) {
+                let pid = ts_pid(ts_pkt);
+                // PAT/PMT/NIT are PSI tables, not PES — skip them so
+                // their pointer-field + table-id bytes don't trip the
+                // PES start-code check inside `extract_pes_pts`.
+                if pid > 0x001F {
+                    let pts = extract_pes_pts(ts_pkt);
+                    let dts = extract_pes_dts(ts_pkt);
+                    if pts.is_some() || dts.is_some() {
+                        out.push(PesObservation { pid, pts_90khz: pts, dts_90khz: dts });
+                    }
+                }
+            }
+            i += TS_PACKET_SIZE;
+        } else {
+            match payload[i + 1..].iter().position(|&b| b == TS_SYNC_BYTE) {
+                Some(p) => i = i + 1 + p,
+                None => return out,
+            }
+        }
+    }
+    out
+}
+
+/// Modular Δ between two 90 kHz PTS/DTS values, signed. Handles the
+/// 33-bit field wrap (≈26.5 hour period). Same shape as
+/// [`pcr_gap_27mhz`] but at 90 kHz scale.
+fn pts_gap_90khz(prev: u64, cur: u64) -> i64 {
+    const PTS_MODULUS: u64 = 1u64 << 33;
+    const HALF_MODULUS: u64 = PTS_MODULUS / 2;
+    let forward = cur.wrapping_sub(prev) % PTS_MODULUS;
+    if forward <= HALF_MODULUS {
+        forward as i64
+    } else {
+        -((PTS_MODULUS - forward) as i64)
+    }
 }
 
 /// Modular Δ between two 27 MHz PCR values, signed (positive = `cur`

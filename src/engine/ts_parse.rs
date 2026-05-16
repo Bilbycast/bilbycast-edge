@@ -187,6 +187,51 @@ pub fn extract_pes_pts(pkt: &[u8]) -> Option<u64> {
     Some(pts)
 }
 
+/// Extract a 33-bit DTS from a PUSI-marked TS packet that begins a PES
+/// payload. Returns `None` when the PES doesn't carry DTS (most audio
+/// PESes only set PTS, only video with reordered B-frames sets both).
+///
+/// Layout per H.222.0 §2.4.3.6: when `PTS_DTS_flags == 0b11`, PTS is at
+/// payload bytes 9-13 and DTS is at 14-18. Same 5-byte 33-bit field
+/// shape as PTS.
+///
+/// Used by [`crate::engine::pcr_ingress_sampler::watch_source_discontinuities`]
+/// to alarm on source-side DTS backward jumps (file-loop boundaries on
+/// upstream senders).
+pub fn extract_pes_dts(pkt: &[u8]) -> Option<u64> {
+    if pkt.len() < TS_PACKET_SIZE {
+        return None;
+    }
+    let afc = (pkt[3] >> 4) & 0x03;
+    let payload_offset: usize = match afc {
+        0b01 => 4,
+        0b11 => {
+            let af_len = pkt.get(4).copied()? as usize;
+            5 + af_len
+        }
+        _ => return None,
+    };
+    if pkt.len() < payload_offset + 19 {
+        return None;
+    }
+    let payload = &pkt[payload_offset..];
+    if payload[0] != 0x00 || payload[1] != 0x00 || payload[2] != 0x01 {
+        return None;
+    }
+    let pts_dts_flags = (payload[7] >> 6) & 0x03;
+    // DTS only present when both PTS and DTS are set (0b11).
+    if pts_dts_flags != 0b11 {
+        return None;
+    }
+    let d = &payload[14..19];
+    let dts: u64 = (((d[0] >> 1) & 0x07) as u64) << 30
+        | (d[1] as u64) << 22
+        | (((d[2] >> 1) & 0x7F) as u64) << 15
+        | (d[3] as u64) << 7
+        | ((d[4] >> 1) as u64);
+    Some(dts)
+}
+
 /// Locate the PES payload start (= ES bytes, e.g. ADTS frame, NAL unit)
 /// inside a PUSI-marked TS packet. Returns `None` when the packet is not
 /// a PES start, doesn't carry payload, or the declared PES header runs
