@@ -130,6 +130,28 @@ pub const LOCK_JITTER_THRESHOLD_US: u64 = 100;
 /// a single noisy sample doesn't toggle the state.
 pub const UNLOCK_JITTER_THRESHOLD_US: u64 = 500;
 
+/// Number of *consecutive* samples whose post-sample p99 must exceed
+/// [`UNLOCK_JITTER_THRESHOLD_US`] before the PLL flips `locked` back to
+/// `false`. At a typical 20–25 Hz PCR cadence this is ~0.7–1 s of
+/// sustained out-of-band jitter, which absorbs:
+///
+/// - Single burst arrivals (one SRT latency-buffer release that
+///   delivered N packets back-to-back) without unlocking
+/// - Single network reorderings + retransmits that briefly shift
+///   recv timestamps
+/// - One-off scheduling slop on the sampler thread (Tokio worker
+///   contention; uncommon since the sampler runs on a dedicated
+///   thread, but bounded)
+///
+/// What it does *not* absorb: a real persistent rate problem (encoder
+/// stalled, source clock drifted past the recovered-rate clamp). Those
+/// trip the count quickly and unlock as the failure persists, which is
+/// the correct behaviour.
+///
+/// Setting this to 1 reverts to the pre-hysteresis behaviour (any
+/// single sample over the unlock threshold drops lock immediately).
+pub const UNLOCK_SUSTAINED_SAMPLES: u64 = 16;
+
 /// Number of recent residuals retained for jitter percentile.
 pub const JITTER_WINDOW: usize = 64;
 
@@ -150,6 +172,17 @@ pub struct PcrPllConfig {
     pub kp: f64,
     /// Integral gain. Default [`DEFAULT_KI`].
     pub ki: f64,
+    /// p99 jitter threshold (µs) at which the PLL flips
+    /// `locked = false → true`. Default [`LOCK_JITTER_THRESHOLD_US`].
+    /// Configurable per-flow via `master_clock.pll_lock_jitter_us`
+    /// (see `config::models::MasterClockConfig`).
+    pub lock_jitter_us: u64,
+    /// p99 jitter threshold (µs) at which the PLL flips back to
+    /// `locked = false` after `UNLOCK_SUSTAINED_SAMPLES` consecutive
+    /// violations. Defaults to 5× `lock_jitter_us` so the relative
+    /// hysteresis margin is preserved when an operator widens the
+    /// lock threshold for internet contribution.
+    pub unlock_jitter_us: u64,
 }
 
 impl Default for PcrPllConfig {
@@ -157,6 +190,8 @@ impl Default for PcrPllConfig {
         Self {
             kp: DEFAULT_KP,
             ki: DEFAULT_KI,
+            lock_jitter_us: LOCK_JITTER_THRESHOLD_US,
+            unlock_jitter_us: UNLOCK_JITTER_THRESHOLD_US,
         }
     }
 }
@@ -209,6 +244,13 @@ struct PllState {
     cumulative_samples: u64,
     /// Sticky lock flag — see module docs.
     locked: bool,
+    /// Consecutive samples whose post-sample p99 exceeded
+    /// [`UNLOCK_JITTER_THRESHOLD_US`]. Driven by
+    /// [`UNLOCK_SUSTAINED_SAMPLES`]: only when this counter reaches the
+    /// constant does `locked` flip back to false. Reset to 0 whenever
+    /// a sample comes in under the unlock threshold, so transient
+    /// spikes don't accumulate towards a future unlock either.
+    unlock_violation_count: u64,
 }
 
 impl PllState {
@@ -223,6 +265,7 @@ impl PllState {
             jitter_samples: VecDeque::with_capacity(JITTER_WINDOW),
             cumulative_samples: 0,
             locked: false,
+            unlock_violation_count: 0,
         }
     }
 }
@@ -392,15 +435,42 @@ impl PcrPll {
         s.jitter_samples.push_back(residual_us);
         s.cumulative_samples = s.cumulative_samples.saturating_add(1);
 
-        // Lock-state hysteresis.
+        // Lock-state machine. Two-tier hysteresis:
+        //   1. Threshold hysteresis — `LOCK_JITTER_THRESHOLD_US` (lock
+        //      entry) << `UNLOCK_JITTER_THRESHOLD_US` (unlock entry).
+        //      Inherited; tight on lock, loose on unlock so a single
+        //      borderline sample doesn't toggle.
+        //   2. Sustained-violation hysteresis — even past the unlock
+        //      threshold, we require `UNLOCK_SUSTAINED_SAMPLES` in a
+        //      row before flipping. This absorbs single bursts (one
+        //      SRT latency-buffer release, one network re-order, one
+        //      Tokio scheduling slop), which real-world contribution
+        //      hits multiple times per minute. Without this, the PLL
+        //      oscillates between locked / unlocked on healthy
+        //      internet sources.
         let p99 = jitter_p99(&s.jitter_samples);
+        let lock_us = self.config.lock_jitter_us;
+        let unlock_us = self.config.unlock_jitter_us;
         if !s.locked
             && s.cumulative_samples >= MIN_SAMPLES_FOR_LOCK
-            && p99 <= LOCK_JITTER_THRESHOLD_US
+            && p99 <= lock_us
         {
             s.locked = true;
-        } else if s.locked && p99 > UNLOCK_JITTER_THRESHOLD_US {
-            s.locked = false;
+            s.unlock_violation_count = 0;
+        } else if s.locked {
+            if p99 > unlock_us {
+                s.unlock_violation_count = s.unlock_violation_count.saturating_add(1);
+                if s.unlock_violation_count >= UNLOCK_SUSTAINED_SAMPLES {
+                    s.locked = false;
+                    s.unlock_violation_count = 0;
+                }
+            } else if p99 <= lock_us {
+                // Back inside the lock band — reset the unlock counter
+                // so the next spike has to start counting from zero.
+                s.unlock_violation_count = 0;
+            }
+            // Between lock-threshold and unlock-threshold: hold
+            // counter (no progress toward unlock, no reset either).
         }
     }
 
@@ -471,6 +541,7 @@ impl PcrPll {
         s.jitter_samples.clear();
         s.cumulative_samples = 0;
         s.locked = false;
+        s.unlock_violation_count = 0;
     }
 
     pub fn telemetry(&self) -> PcrPllTelemetry {

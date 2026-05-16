@@ -78,6 +78,60 @@ fn detect_format(data: &[u8]) -> SrtPayloadFormat {
     SrtPayloadFormat::Unknown
 }
 
+/// Scan a raw-TS or RTP-payload datagram for the first PCR-bearing TS
+/// packet and return its 27 MHz PCR value. Used to synthesise the outer
+/// RTP timestamp at 90 kHz from the inner media clock (RFC 2250 §3.5)
+/// for raw-TS-in-SRT inputs that don't carry an RTP layer of their own.
+///
+/// Skips a leading RTP header if present (`is_likely_rtp` heuristic) so
+/// the same helper works for both `RtpTs` and `RawTs` payloads. Returns
+/// `None` when no PCR-bearing packet is found in this datagram — the
+/// caller falls back to the previous timestamp value (most TS packets
+/// don't carry PCR; PCR cadence is typically 25–40 ms in broadcast).
+pub(crate) fn scan_first_pcr_in_datagram(data: &[u8]) -> Option<u64> {
+    let payload = if is_likely_rtp(data) {
+        // Best-effort RTP header skip: minimum 12 bytes; CSRC count +
+        // extension may extend it. If the resulting offset doesn't land
+        // on a TS sync byte we still try the scan from the start of the
+        // datagram, since some non-spec wrappers vary.
+        let cc = (data[0] & 0x0F) as usize;
+        let ext_bit = data[0] & 0x10 != 0;
+        let mut hdr = 12 + 4 * cc;
+        if ext_bit && hdr + 4 <= data.len() {
+            let ext_len_words =
+                ((data[hdr + 2] as usize) << 8) | data[hdr + 3] as usize;
+            hdr += 4 + 4 * ext_len_words;
+        }
+        if hdr <= data.len() {
+            &data[hdr..]
+        } else {
+            data
+        }
+    } else {
+        data
+    };
+    // Walk in 188-byte strides, looking for a PCR-bearing adaptation
+    // field. Stop at the first match — the caller only needs one
+    // anchor per datagram to keep the 90 kHz output monotonic.
+    let mut i = 0;
+    while i + TS_PACKET_SIZE <= payload.len() {
+        let pkt = &payload[i..i + TS_PACKET_SIZE];
+        if pkt[0] == TS_SYNC_BYTE {
+            if let Some(pcr) = crate::engine::ts_parse::extract_pcr(pkt) {
+                return Some(pcr);
+            }
+            i += TS_PACKET_SIZE;
+        } else {
+            // Resync — scan forward for the next sync byte.
+            match payload[i + 1..].iter().position(|&b| b == TS_SYNC_BYTE) {
+                Some(p) => i = i + 1 + p,
+                None => return None,
+            }
+        }
+    }
+    None
+}
+
 // ── Public Entry Point ─────────────────────────────────────────────────────
 
 /// Spawn a task that receives packets from an SRT connection and publishes
@@ -553,8 +607,24 @@ async fn srt_input_recv_loop(
                             SrtPayloadFormat::RawTs | SrtPayloadFormat::Unknown => {
                                 let seq = *raw_ts_seq_counter;
                                 *raw_ts_seq_counter = raw_ts_seq_counter.wrapping_add(1);
-                                let ts_pkts = (data.len() / TS_PACKET_SIZE) as u32;
-                                *raw_ts_timestamp = raw_ts_timestamp.wrapping_add(ts_pkts * 188 * 8);
+                                // RFC 2250 §3.5: the RTP timestamp for MP2T
+                                // payload is a 90 kHz media clock anchored to
+                                // PCR. Scan this datagram for the first PCR-
+                                // bearing TS packet and use `pcr_27mhz / 300`
+                                // as the 90 kHz timestamp. Falls through to
+                                // the last-seen value when no PCR is in this
+                                // datagram (most TS packets don't carry PCR;
+                                // PCR cadence is typically 25–40 ms in
+                                // broadcast). Replaces the old `bits_so_far`
+                                // counter (which advanced ~278× too fast for
+                                // a 90 kHz clock at 25 Mbps and tripped
+                                // receivers that consult the RTP timestamp
+                                // for de-jitter sizing).
+                                if let Some(pcr_27mhz) =
+                                    scan_first_pcr_in_datagram(&data)
+                                {
+                                    *raw_ts_timestamp = (pcr_27mhz / 300) as u32;
+                                }
                                 (seq, *raw_ts_timestamp, true)
                             }
                         };
@@ -1100,8 +1170,12 @@ fn process_redundant_packet(
             // bookkeeping. It is no longer used for dedup.
             let seq = *raw_ts_seq;
             *raw_ts_seq = raw_ts_seq.wrapping_add(1);
-            let ts_pkts = (data.len() / TS_PACKET_SIZE) as u32;
-            *raw_ts_timestamp = raw_ts_timestamp.wrapping_add(ts_pkts * 188 * 8);
+            // RFC 2250 §3.5 — 90 kHz media-clock RTP timestamp from
+            // PCR; falls back to last-seen value when this datagram
+            // doesn't carry a PCR-bearing TS packet.
+            if let Some(pcr_27mhz) = scan_first_pcr_in_datagram(&data) {
+                *raw_ts_timestamp = (pcr_27mhz / 300) as u32;
+            }
             (seq, *raw_ts_timestamp, true, leg)
         }
     };
@@ -1425,9 +1499,15 @@ async fn srt_bonded_group_recv_loop(
                             SrtPayloadFormat::RawTs | SrtPayloadFormat::Unknown => {
                                 let seq = *raw_ts_seq_counter;
                                 *raw_ts_seq_counter = raw_ts_seq_counter.wrapping_add(1);
-                                let ts_pkts = (data.len() / TS_PACKET_SIZE) as u32;
-                                *raw_ts_timestamp =
-                                    raw_ts_timestamp.wrapping_add(ts_pkts * 188 * 8);
+                                // RFC 2250 §3.5 — 90 kHz media-clock RTP
+                                // timestamp from PCR; falls back to
+                                // last-seen value when this datagram
+                                // doesn't carry a PCR-bearing TS packet.
+                                if let Some(pcr_27mhz) =
+                                    scan_first_pcr_in_datagram(&data)
+                                {
+                                    *raw_ts_timestamp = (pcr_27mhz / 300) as u32;
+                                }
                                 (seq, *raw_ts_timestamp, true)
                             }
                         };

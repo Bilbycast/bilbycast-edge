@@ -20,6 +20,7 @@ use super::input_transcode::InputTranscoder;
 use super::packet::{MAX_RTP_PACKET_SIZE, RtpPacket};
 
 /// TS packet size used for synthetic timestamp calculation.
+#[allow(dead_code)]
 const TS_PACKET_SIZE: usize = 188;
 
 /// Spawn a task that receives raw UDP datagrams and publishes them
@@ -160,9 +161,19 @@ async fn udp_input_loop(
                         let seq = seq_counter;
                         seq_counter = seq_counter.wrapping_add(1);
 
-                        // Approximate timestamp: assume 90kHz clock
-                        let ts_pkts = (len / TS_PACKET_SIZE) as u32;
-                        ts_counter = ts_counter.wrapping_add(ts_pkts.max(1) * 188 * 8);
+                        // RFC 2250 §3.5: RTP timestamp for MP2T payload is a
+                        // 90 kHz media clock anchored to PCR. Scan for the
+                        // first PCR-bearing TS packet in this datagram; fall
+                        // back to the last-seen value when this datagram
+                        // carries no PCR (most datagrams don't — PCR cadence
+                        // is 25–40 ms typical).
+                        if let Some(pcr_27mhz) =
+                            crate::engine::input_srt::scan_first_pcr_in_datagram(
+                                &data[..len],
+                            )
+                        {
+                            ts_counter = (pcr_27mhz / 300) as u32;
+                        }
 
                         stats.input_packets.fetch_add(1, Ordering::Relaxed);
                         stats.input_bytes.fetch_add(len as u64, Ordering::Relaxed);

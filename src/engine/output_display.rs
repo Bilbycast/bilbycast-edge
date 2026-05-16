@@ -3430,6 +3430,36 @@ fn audio_loop(
         return;
     }
     let mut backend = AudioBackend::new(device);
+    // Graceful-degradation state for repeated open failures (Bonus-K).
+    //
+    // Without this guard, a permanently misconfigured `audio_device`
+    // (e.g. `hw:1,3` on a host with only card 0, or a host where the
+    // running user isn't in the `audio` group so /dev/snd/* opens
+    // EACCES) puts the loop into a tight retry: every blocking_recv
+    // returns immediately because the upstream mpsc is full, every
+    // backend.write() fails on snd_pcm_open, the 200 ms sleep makes
+    // each iteration cost ~200 ms wall, and every iteration emits a
+    // Critical event. On the edge1 testbed this was observed to fire
+    // ~5 Critical events per second indefinitely and drop ~87 % of
+    // decoded audio frames upstream from mpsc-full pressure.
+    //
+    // The fix: after `AUDIO_DEGRADE_THRESHOLD` consecutive same-code
+    // failures, flip to silent-drain — emit ONE Critical "audio
+    // disabled for output X" event, then keep consuming AudioBlocks
+    // from the channel without calling backend.write(). The upstream
+    // decode pipeline stops dropping (channel drains at full rate)
+    // and the operator gets one actionable event instead of a flood.
+    // The watchdog also stops dragging the loop to 5 Hz so the
+    // demux task on the other side of the mpsc doesn't see
+    // back-pressure-induced frame loss.
+    //
+    // Counter resets on the first successful write, so a transient
+    // ALSA error (xrun + recover, USB-audio reseat) doesn't latch
+    // the loop into silent mode.
+    const AUDIO_DEGRADE_THRESHOLD: u32 = 10;
+    let mut consecutive_failures: u32 = 0;
+    let mut last_error_code: &'static str = "";
+    let mut degraded: bool = false;
     while !cancel.is_cancelled() {
         let block = match arx.blocking_recv() {
             Some(b) => b,
@@ -3448,6 +3478,12 @@ fn audio_loop(
         if block.frame_gen < frame_gen.load(Ordering::Relaxed) {
             continue;
         }
+        // Degraded state: drain silently. No writes to backend (which
+        // would just fail again), no events, no sleep. Upstream decode
+        // pipeline drains the mpsc at full rate.
+        if degraded {
+            continue;
+        }
         match backend.write(
             &block.planar,
             block.pts_90k,
@@ -3457,29 +3493,63 @@ fn audio_loop(
             program_start,
             channel_pair,
         ) {
-            Ok(_) => {}
+            Ok(_) => {
+                // Successful write — reset the failure counter so a
+                // future xrun doesn't latch us into degraded mode.
+                consecutive_failures = 0;
+                last_error_code = "";
+            }
             Err(e) => {
                 let msg = e.to_string();
-                let code = if msg.contains("display_audio_open_failed")
-                    || msg.contains("snd_pcm_open")
-                {
-                    "display_audio_device_invalid"
+                let code: &'static str =
+                    if msg.contains("display_audio_open_failed")
+                        || msg.contains("snd_pcm_open")
+                    {
+                        "display_audio_device_invalid"
+                    } else {
+                        counters.audio_underruns.fetch_add(1, Ordering::Relaxed);
+                        "display_audio_open_failed"
+                    };
+                if code == last_error_code {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
                 } else {
-                    counters.audio_underruns.fetch_add(1, Ordering::Relaxed);
-                    "display_audio_open_failed"
-                };
-                emit_event(
-                    &event_sender,
-                    EventSeverity::Critical,
-                    code,
-                    &flow_id,
-                    &output_id,
-                    &format!("display audio write failed: {msg}"),
-                );
-                // Reset and back off briefly — don't kill the whole
-                // output; video continues.
-                backend.reset();
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                    consecutive_failures = 1;
+                    last_error_code = code;
+                }
+                if consecutive_failures >= AUDIO_DEGRADE_THRESHOLD {
+                    // Latch into degraded mode. Emit the final
+                    // Critical that names the persistent error so the
+                    // operator can fix the underlying problem.
+                    degraded = true;
+                    emit_event(
+                        &event_sender,
+                        EventSeverity::Critical,
+                        "display_audio_disabled_persistent_failure",
+                        &flow_id,
+                        &output_id,
+                        &format!(
+                            "display audio disabled — {consecutive_failures} consecutive \
+                             '{code}' failures: {msg}. Channel drains silently; \
+                             video continues. Fix the audio_device or user-group \
+                             permission and restart the flow."
+                        ),
+                    );
+                } else {
+                    emit_event(
+                        &event_sender,
+                        EventSeverity::Critical,
+                        code,
+                        &flow_id,
+                        &output_id,
+                        &format!("display audio write failed: {msg}"),
+                    );
+                    // Reset and back off briefly — don't kill the whole
+                    // output; video continues. (Retry budget still
+                    // counts down; once it hits the threshold, we flip
+                    // to silent-drain above.)
+                    backend.reset();
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
             }
         }
     }

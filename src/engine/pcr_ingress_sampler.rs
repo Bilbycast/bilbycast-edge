@@ -17,6 +17,7 @@
 //! PCR accuracy at every output's send path).
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -26,6 +27,22 @@ use crate::engine::packet::RtpPacket;
 use crate::engine::ts_parse::{
     extract_pcr, TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
+use crate::manager::events::{category, EventSender, EventSeverity};
+
+/// Mirrors [`crate::engine::pcr_pll::PcrPll`]'s discontinuity gate: a
+/// jump > 500 ms in either direction is treated as a source-clock step
+/// (file loop, encoder restart, decoder reseat) rather than legitimate
+/// jitter. Same threshold so the operator-visible event aligns 1:1
+/// with the PLL's internal anchor reset.
+const DISCONTINUITY_THRESHOLD_27MHZ: u64 = 500 * 27_000; // 500 ms
+
+/// Minimum interval between operator-visible discontinuity events for
+/// a given input. A chronically-broken source might emit a backward
+/// PCR every few seconds; without rate-limiting that would drown the
+/// events feed. The first event fires immediately; subsequent ones
+/// are debounced.
+const DISCONTINUITY_EVENT_MIN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 /// Spawn the ingress PCR sampler. Returns the join handle so the
 /// FlowRuntime can hold ownership for the flow's lifetime; shutdown is
@@ -39,24 +56,101 @@ use crate::engine::ts_parse::{
 /// `sample_packet` call delays PLL catch-up, and under heavy main-
 /// runtime contention the PI loop spends longer than the locked p99
 /// jitter target. CPU pinning honoured via `BILBYCAST_PLL_CPUS`.
+#[allow(dead_code)]
 pub fn spawn_pcr_ingress_sampler(
     master: Arc<SourcePcrPllMaster>,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
+    flow_id: String,
+    active_input_rx: tokio::sync::watch::Receiver<String>,
+    events: EventSender,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
-    let mut rx = broadcast_tx.subscribe();
+    spawn_pcr_ingress_sampler_with_rx(
+        master,
+        broadcast_tx.subscribe(),
+        flow_id,
+        active_input_rx,
+        events,
+        cancel,
+    )
+}
+
+/// Variant that accepts an already-subscribed `broadcast::Receiver`,
+/// letting the caller choose between the flow broadcast (default,
+/// passthrough flows where output is byte-identical to the active
+/// input's stream) and a specific input's per-input broadcast (PID-bus
+/// assembled flows where the assembler's output PCR is the master
+/// clock itself — sampling that would form a self-referential loop).
+/// See [`flow::FlowRuntime::start`] for the caller-side resolution.
+pub fn spawn_pcr_ingress_sampler_with_rx(
+    master: Arc<SourcePcrPllMaster>,
+    mut rx: broadcast::Receiver<RtpPacket>,
+    flow_id: String,
+    active_input_rx: tokio::sync::watch::Receiver<String>,
+    events: EventSender,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     let thread_handle = crate::engine::dedicated_runtime::spawn_dedicated(
         crate::engine::dedicated_runtime::DedicatedRuntimeConfig::new(
             "pcr-pll",
             "BILBYCAST_PLL_CPUS",
         ),
         async move {
+            // Per-sampler discontinuity-detector state. Tracked in the
+            // dedicated thread so the hot-path `sample_packet` stays a
+            // pure function. `last_pcr_27mhz` is the previous accepted
+            // PCR value; `last_event_at` debounces operator events
+            // (see `DISCONTINUITY_EVENT_MIN_INTERVAL`).
+            let mut last_pcr_27mhz: Option<u64> = None;
+            let mut last_event_at: Option<Instant> = None;
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     msg = rx.recv() => {
                         match msg {
-                            Ok(pkt) => sample_packet(&master, &pkt),
+                            Ok(pkt) => {
+                                let new_pcr = sample_packet(&master, &pkt);
+                                if let Some(pcr) = new_pcr {
+                                    if let Some(prev) = last_pcr_27mhz {
+                                        let gap = pcr_gap_27mhz(prev, pcr);
+                                        if gap.unsigned_abs() > DISCONTINUITY_THRESHOLD_27MHZ {
+                                            // Operator-visible event. Rate-
+                                            // limited so a chronically-broken
+                                            // source can't drown the feed.
+                                            let should_emit = match last_event_at {
+                                                None => true,
+                                                Some(t) => t.elapsed()
+                                                    >= DISCONTINUITY_EVENT_MIN_INTERVAL,
+                                            };
+                                            if should_emit {
+                                                last_event_at = Some(Instant::now());
+                                                let input_id =
+                                                    active_input_rx.borrow().clone();
+                                                events.emit_flow_with_details(
+                                                    EventSeverity::Warning,
+                                                    category::FLOW,
+                                                    format!(
+                                                        "source PCR discontinuity on flow '{}' \
+                                                         (input '{}'): {:.3} ms jump",
+                                                        flow_id,
+                                                        input_id,
+                                                        gap as f64 / 27_000.0,
+                                                    ),
+                                                    &flow_id,
+                                                    serde_json::json!({
+                                                        "error_code": "source_pcr_discontinuity",
+                                                        "input_id": input_id,
+                                                        "prev_pcr_27mhz": prev,
+                                                        "new_pcr_27mhz": pcr,
+                                                        "gap_ms": gap as f64 / 27_000.0,
+                                                    }),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    last_pcr_27mhz = Some(pcr);
+                                }
+                            }
                             Err(broadcast::error::RecvError::Lagged(_)) => continue,
                             Err(broadcast::error::RecvError::Closed) => break,
                         }
@@ -74,6 +168,21 @@ pub fn spawn_pcr_ingress_sampler(
     })
 }
 
+/// Modular Δ between two 27 MHz PCR values, signed (positive = `cur`
+/// ahead of `prev`, negative = backward). Handles wrap at
+/// `PCR_MODULUS_27MHZ`. Used by the discontinuity gate to recognise
+/// either direction of jump.
+fn pcr_gap_27mhz(prev: u64, cur: u64) -> i64 {
+    const HALF_MODULUS: u64 =
+        crate::engine::pcr_pll::PCR_MODULUS_27MHZ / 2;
+    let forward = cur.wrapping_sub(prev) % crate::engine::pcr_pll::PCR_MODULUS_27MHZ;
+    if forward <= HALF_MODULUS {
+        forward as i64
+    } else {
+        -((crate::engine::pcr_pll::PCR_MODULUS_27MHZ - forward) as i64)
+    }
+}
+
 /// Scan a single `RtpPacket` for PCR samples, feeding the master's PLL
 /// for each one. Pure function — no I/O, no allocations on the hot path.
 ///
@@ -83,7 +192,7 @@ pub fn spawn_pcr_ingress_sampler(
 /// internal `epoch.elapsed()` here would bake broadcast-subscriber
 /// scheduling jitter into `Δwall_ns` and prevent lock against
 /// otherwise-clean sources.
-fn sample_packet(master: &SourcePcrPllMaster, pkt: &RtpPacket) {
+fn sample_packet(master: &SourcePcrPllMaster, pkt: &RtpPacket) -> Option<u64> {
     let recv_time_us = pkt.recv_time_us;
     let bytes = pkt.data.as_ref();
     let payload = if pkt.is_raw_ts {
@@ -98,23 +207,26 @@ fn sample_packet(master: &SourcePcrPllMaster, pkt: &RtpPacket) {
     // Find the first TS sync byte and walk in 188-byte strides.
     let mut i = match payload.iter().position(|&b| b == TS_SYNC_BYTE) {
         Some(p) => p,
-        None => return,
+        None => return None,
     };
+    let mut latest_pcr: Option<u64> = None;
     while i + TS_PACKET_SIZE <= payload.len() {
         let ts_pkt = &payload[i..i + TS_PACKET_SIZE];
         if ts_pkt[0] == TS_SYNC_BYTE {
             if let Some(pcr_27mhz) = extract_pcr(ts_pkt) {
                 master.record_sample_at(pcr_27mhz, recv_time_us);
+                latest_pcr = Some(pcr_27mhz);
             }
             i += TS_PACKET_SIZE;
         } else {
             // Resync — scan forward for the next sync byte.
             match payload[i + 1..].iter().position(|&b| b == TS_SYNC_BYTE) {
                 Some(p) => i = i + 1 + p,
-                None => return,
+                None => return latest_pcr,
             }
         }
     }
+    latest_pcr
 }
 
 /// Best-effort RTP header skip. Returns the slice after the header, or

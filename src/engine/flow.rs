@@ -507,9 +507,31 @@ impl FlowRuntime {
         // the same per-flow master-clock pacer the egress replacers use,
         // so that PCR generated inside the encoder pipeline references
         // the same clock as PCR re-stamped at wire-emit time.
+        // Resolve the clock-source input for PID-bus assembled flows.
+        // For assembled flows the master clock should track the
+        // operator-designated `assembly.pcr_source` input rather than
+        // whichever input happens to be the broadcast publisher (the
+        // assembler's output is the broadcast publisher — sampling
+        // its bytes would be a self-referential loop). For non-
+        // assembled flows this is `None` and the active input drives
+        // the master clock as before.
+        let clock_source_input_cfg: Option<&crate::config::models::InputConfig> =
+            crate::engine::master_clock::resolve_pcr_source_input_id(
+                &config.config,
+            )
+            .and_then(|id| {
+                config
+                    .inputs
+                    .iter()
+                    .find(|d| d.id == id)
+                    .map(|d| &d.config)
+            });
+        // Master clock takes the resolved clock-source input when
+        // present, otherwise falls back to the active input.
+        let mc_source_input_cfg = clock_source_input_cfg.or(active_input_cfg);
         let (master_clock, pll_master) = build_master_clock(
             &config.config,
-            active_input_cfg,
+            mc_source_input_cfg,
             active_input_tx.subscribe(),
             &event_sender,
             &cancel_token,
@@ -1052,9 +1074,50 @@ impl FlowRuntime {
         // depend on broadcast_tx + flow_stats already being wired.
         if let Some(pll_master) = pll_master {
             let sampler_cancel = cancel_token.child_token();
-            let _ = crate::engine::pcr_ingress_sampler::spawn_pcr_ingress_sampler(
+            // For assembled flows, subscribe the sampler to the
+            // designated `assembly.pcr_source.input_id`'s per-input
+            // broadcast (via `FlowManager::subscribe_input`) so the
+            // PLL tracks the *source* clock, not the assembler's
+            // *output* clock (which is the master clock itself,
+            // forming a circular feedback loop). For non-assembled
+            // flows fall through to the legacy flow-broadcast
+            // subscription — output is byte-for-byte the active
+            // input's stream, so the sampler sees the source clock
+            // either way.
+            let sampler_rx = if let Some(input_id) =
+                crate::engine::master_clock::resolve_pcr_source_input_id(
+                    &config.config,
+                )
+            {
+                match flow_manager.subscribe_input(input_id) {
+                    Some(rx) => {
+                        tracing::info!(
+                            flow_id = %config.config.id,
+                            pcr_source_input = %input_id,
+                            "PCR sampler subscribing to designated clock-source input"
+                        );
+                        rx
+                    }
+                    None => {
+                        tracing::warn!(
+                            flow_id = %config.config.id,
+                            pcr_source_input = %input_id,
+                            "PCR sampler: clock-source input not yet registered on the node; \
+                             falling back to flow broadcast (may form a self-referential loop \
+                             on assembled flows)"
+                        );
+                        broadcast_tx.subscribe()
+                    }
+                }
+            } else {
+                broadcast_tx.subscribe()
+            };
+            let _ = crate::engine::pcr_ingress_sampler::spawn_pcr_ingress_sampler_with_rx(
                 pll_master,
-                &broadcast_tx,
+                sampler_rx,
+                config.config.id.clone(),
+                active_input_tx.subscribe(),
+                event_sender.clone(),
                 sampler_cancel,
             );
         }
@@ -4803,13 +4866,63 @@ fn build_master_clock(
         Some(MasterClockKindConfig::SourcePcrPll) => MasterClockKind::SourcePcrPll,
         Some(MasterClockKindConfig::Ptp) => MasterClockKind::Ptp,
         Some(MasterClockKindConfig::AudioMaster) => MasterClockKind::AudioMaster,
+        Some(MasterClockKindConfig::Passthrough) => MasterClockKind::Passthrough,
+        Some(MasterClockKindConfig::SenderTimestamp) => {
+            // Framework wired but the libsrt `srctime` extraction in
+            // `bilbycast-libsrt-rs::epoll_bridge` (and equivalent in
+            // `bilbycast-srt`, `bilbycast-rist`) isn't surfaced on
+            // the recv API yet. Run as SourcePcrPll until that lands;
+            // emit a one-shot Warning so the operator sees we honoured
+            // the kind tag but degraded the rate source.
+            event_sender.emit_flow_with_details(
+                crate::manager::events::EventSeverity::Warning,
+                crate::manager::events::category::MASTER_CLOCK,
+                format!(
+                    "flow '{}': master_clock.kind=sender_timestamp selected, but the \
+                     SRT/RIST srctime feed isn't yet wired through the recv API. \
+                     Running as source_pcr_pll for this session — the lock criterion \
+                     is the same; only the rate reference differs",
+                    cfg.id
+                ),
+                &cfg.id,
+                serde_json::json!({
+                    "error_code": "master_clock_sender_timestamp_pending",
+                }),
+            );
+            MasterClockKind::SourcePcrPll
+        }
         Some(MasterClockKindConfig::Wallclock) => MasterClockKind::Wallclock,
-        None => crate::engine::master_clock::select_master_kind_for_input(active_input),
+        None => crate::engine::master_clock::select_master_kind_for_input(active_input, cfg),
     };
 
     let (handle, pll_master) = match kind {
         MasterClockKind::SourcePcrPll => {
-            let pll_inner = Arc::new(SourcePcrPllMaster::new(format!("source_pcr:{}", cfg.id)));
+            // Operator override for the PLL lock-jitter threshold. Defaults
+            // to broadcast-tier 100 µs; customers with internet contribution
+            // can widen to 500-2000 µs via `master_clock.pll_lock_jitter_us`.
+            // Clamped to [50, 5000] to keep the PLL physically meaningful
+            // (below 50 µs is harder than CPU-clock-derived deltas can
+            // sustain; above 5 ms the PLL output is no longer broadcast-
+            // grade and an explicit Wallclock/Passthrough kind is more
+            // honest about what's going on).
+            let pll_config = {
+                let mut c = crate::engine::pcr_pll::PcrPllConfig::default();
+                if let Some(lock_us) = cfg
+                    .master_clock
+                    .as_ref()
+                    .and_then(|m| m.pll_lock_jitter_us)
+                {
+                    let clamped = lock_us.clamp(50, 5000) as u64;
+                    c.lock_jitter_us = clamped;
+                    // Preserve the 5× threshold-level hysteresis margin.
+                    c.unlock_jitter_us = clamped * 5;
+                }
+                c
+            };
+            let pll_inner = Arc::new(SourcePcrPllMaster::new_with_config(
+                format!("source_pcr:{}", cfg.id),
+                pll_config,
+            ));
             // Wrap in PcrPllWithFallback so the watcher task can flip to
             // wallclock if the PLL never locks. The wrapper owns both
             // clocks behind a single `MasterClock` impl; `now_27mhz()`

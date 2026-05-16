@@ -646,6 +646,19 @@ pub struct MasterClockConfig {
     /// on unlockable sources). Range when set: 5..=300.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pll_lock_timeout_s: Option<u32>,
+    /// p99 residual-jitter threshold (µs) at which the PLL transitions
+    /// to `locked = true`. `None` → broadcast-tier default of 100 µs,
+    /// calibrated for hardware-paced contribution sources (Appear X,
+    /// Cobalt, Cisco encoders). Customers with prosumer encoders or
+    /// internet contribution paths over high-jitter networks routinely
+    /// see source PCR-vs-wallclock jitter in the 500 µs – 5 ms range
+    /// even on healthy streams, which never crosses the broadcast
+    /// threshold. Raising this to 500–2000 lets the PLL lock on those
+    /// sources at the cost of a less tight clock recovery. Range when
+    /// set: 50..=5000. The matching unlock threshold scales as 5× the
+    /// lock value, preserving the threshold-level hysteresis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pll_lock_jitter_us: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -654,6 +667,23 @@ pub enum MasterClockKindConfig {
     SourcePcrPll,
     Ptp,
     AudioMaster,
+    /// "This flow doesn't need a recovered source clock." Output PCR
+    /// comes from source bytes (passthrough) or source PTS
+    /// (transcoded) so the master clock is informational only. Backing
+    /// runtime is `wallclock` but no PLL spawns, no fallback alarm.
+    /// Default for most contribution-to-distribution flows when the
+    /// operator hasn't pinned `source_pcr_pll` explicitly.
+    Passthrough,
+    /// Recover rate from the SRT/RIST sender's per-packet timestamp
+    /// instead of MPEG-TS PCR sampled from the bytes. Useful for
+    /// internet-contribution paths where SRT's latency buffer makes
+    /// PCR-from-bytes look jittery to the PLL but the underlying
+    /// libsrt `srctime` reflects the sender's clock cleanly. See
+    /// [`engine::master_clock::MasterClockKind::SenderTimestamp`] —
+    /// framework only today; the srctime extraction is wired through
+    /// in a follow-up. Selecting this kind on a non-SRT / non-RIST
+    /// input is rejected by config validation.
+    SenderTimestamp,
     Wallclock,
 }
 

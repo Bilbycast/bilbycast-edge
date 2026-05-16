@@ -106,7 +106,40 @@ pub enum MasterClockKind {
     Ptp,
     /// ALSA audio master from the local-display output.
     AudioMaster,
+    /// **By-design** wallclock: this flow doesn't need a recovered
+    /// source clock because output PCR comes from the source bytes
+    /// directly (passthrough) or from source PTS (transcoded paths
+    /// via [`crate::engine::av_sync_mux::pcr_for_emit`]). The runtime
+    /// backing is identical to [`Self::Wallclock`] — what's different
+    /// is that no PLL is spawned, no fallback watcher runs, and no
+    /// "fallback" alarm ever fires. Telemetry reports `kind:
+    /// "passthrough"` so the operator sees an intentional state, not
+    /// a degraded one. Auto-selected by [`select_master_kind_for_input`]
+    /// for typical contribution-to-distribution flows.
+    Passthrough,
+    /// Sender-timestamp recovery for SRT / RIST inputs. Uses the
+    /// transport's per-packet sender timestamp (libsrt's
+    /// `SRT_MsgCtrl::srctime`, RIST's RTP-extension timestamp) as the
+    /// rate reference, instead of MPEG-TS PCR sampled from the bytes.
+    /// Cleaner under wide-area network jitter because the timestamp
+    /// is set at the sender's `sendmsg()` — pre-network-jitter — and
+    /// is not subject to the bursty arrival cadence that PCR-from-
+    /// bytes sees behind a 200 ms SRT latency buffer.
+    ///
+    /// **Status**: framework wired through `MasterClockKindConfig` and
+    /// the auto-policy gate; the underlying srctime extraction in
+    /// `bilbycast-libsrt-rs::srt-transport::epoll_bridge` (and
+    /// equivalent in `bilbycast-srt`, `bilbycast-rist`) is **not yet
+    /// surfaced** on the recv API. Selecting this kind today logs a
+    /// Warning event explaining the deferred wiring and falls through
+    /// to [`Self::SourcePcrPll`] semantics at runtime. Track in
+    /// `project_sender_timestamp_clock_recovery.md` (TBD).
+    SenderTimestamp,
     /// Last-resort monotonic wall clock. Loud telemetry warning.
+    /// Distinct from [`Self::Passthrough`] semantically: this is the
+    /// PLL's fallback path (we *wanted* a source clock and didn't get
+    /// one), while `Passthrough` is the auto-selected "this flow
+    /// doesn't need a master clock" choice.
     Wallclock,
 }
 
@@ -116,6 +149,8 @@ impl MasterClockKind {
             Self::SourcePcrPll => "source_pcr_pll",
             Self::Ptp => "ptp",
             Self::AudioMaster => "audio_master",
+            Self::Passthrough => "passthrough",
+            Self::SenderTimestamp => "sender_timestamp",
             Self::Wallclock => "wallclock",
         }
     }
@@ -193,8 +228,20 @@ pub struct SourcePcrPllMaster {
 
 impl SourcePcrPllMaster {
     pub fn new(source_id: impl Into<String>) -> Self {
+        Self::new_with_config(source_id, crate::engine::pcr_pll::PcrPllConfig::default())
+    }
+
+    /// Build a master with custom PLL parameters. Used by
+    /// `flow.rs::build_master_clock` to thread the per-flow
+    /// `master_clock.pll_lock_jitter_us` operator override into the
+    /// PI-controller's lock criterion. All other parameters take their
+    /// defaults (see [`crate::engine::pcr_pll::PcrPllConfig::default`]).
+    pub fn new_with_config(
+        source_id: impl Into<String>,
+        config: crate::engine::pcr_pll::PcrPllConfig,
+    ) -> Self {
         Self {
-            pll: Arc::new(crate::engine::pcr_pll::PcrPll::default()),
+            pll: Arc::new(crate::engine::pcr_pll::PcrPll::new(config)),
             epoch: Instant::now(),
             source_id: source_id.into(),
         }
@@ -819,6 +866,16 @@ impl MasterClockHandle {
         Self::new(Arc::new(WallclockMaster::new()), MasterClockKind::Wallclock)
     }
 
+    /// Build a Passthrough handle. Runtime is the same as [`Self::wallclock`]
+    /// but the kind label is `Passthrough` so telemetry distinguishes the
+    /// auto-selected "no master clock needed" choice from a degraded
+    /// fallback. No PLL spawn, no fallback watcher — pure source-driven
+    /// timing semantics for flows whose output PCR comes from source bytes
+    /// (passthrough) or source PTS (transcoded).
+    pub fn passthrough() -> Self {
+        Self::new(Arc::new(WallclockMaster::new()), MasterClockKind::Passthrough)
+    }
+
     pub fn now_27mhz(&self) -> u64 {
         self.inner.now_27mhz()
     }
@@ -997,19 +1054,110 @@ pub fn clock_identity_for_input(
 }
 
 /// Selection-policy entry point. Returns the auto-default for a flow
-/// based on its active input config. Per-flow `master_clock` overrides
-/// are applied by the caller in `flow.rs`.
+/// based on its active input config + flow shape. Per-flow
+/// `master_clock` overrides are applied by the caller in `flow.rs`.
 ///
-/// Inputs that don't carry MPEG-TS but produce media (WebRTC) get
-/// `Wallclock` with a degraded-clock warning. Pure-data inputs land on
-/// `SourcePcrPll` because their TS muxer mints PCR.
+/// **Selection priority:**
+///
+/// 1. **PTP for ST 2110 inputs** — these carry essence on PTP-disciplined
+///    transports; the PTP master is the only correct one.
+/// 2. **Wallclock for WebRTC-like inputs** — WebRTC ingress is wallclock-
+///    paced by the str0m session. A degraded-clock warning fires (see
+///    `flow.rs::build_master_clock`).
+/// 3. **SourcePcrPll for assembled / synthesized flows** — when the flow
+///    has [`FlowConfig::assembly`] set (PID-bus SPTS/MPTS), output PCR
+///    is generated by the assembler from `master.now_27mhz()` and
+///    therefore needs a real clock. The PLL recovers source PCR so the
+///    assembled stream's clock tracks the contribution source.
+/// 4. **Passthrough for everything else** — most contribution-to-
+///    distribution flows. Output PCR comes from the source bytes
+///    directly (passthrough outputs) or from source PTS (transcoded
+///    outputs via `av_sync_mux::pcr_for_emit`). The master clock is
+///    informational; running the PLL would only generate misleading
+///    fallback alarms on legitimate sources that have ms-scale PCR
+///    arrival jitter (typical for internet contribution over SRT/RIST).
+///    Operators who want PLL behaviour explicitly pin
+///    `master_clock.kind: "source_pcr_pll"` per-flow.
+///
+/// This split is the answer to a real customer pain: before it, every
+/// SRT/RIST/RTP input flow ran the PLL by default, and the fallback
+/// timer fired any time the source's PCR-vs-wallclock jitter exceeded
+/// 100 µs — which is essentially every internet-delivered stream.
+/// Customers saw a stream of "PLL fallback" alarms on flows whose
+/// output A/V sync was unaffected by the alarm.
+/// Resolve the input ID that should drive the master clock for a
+/// given flow. For PID-bus assembled flows, this is the operator-
+/// designated `pcr_source.input_id` (flow-level for SPTS, or the
+/// first program's pcr_source for MPTS, with the flow-level setting
+/// as a fallback). For non-assembled flows, returns `None` and the
+/// caller falls back to the "active input" semantic.
+///
+/// The runtime then uses this to:
+///   1. Pick the master-clock kind based on this input's type (not
+///      the active input's), via [`select_master_kind_for_input`].
+///   2. Subscribe the PCR ingress sampler to this input's per-input
+///      broadcast (via `FlowManager::subscribe_input`), rather than
+///      the flow's broadcast — which, for assembled flows, carries
+///      the assembler's *output* PCR (the very value the master clock
+///      generated) and would form a self-referential loop.
+///
+/// Returns `None` when:
+/// - The flow has no assembly (`flow.assembly` is `None` or
+///   `assembly.kind == Passthrough`), and
+/// - No flow-level or per-program `pcr_source` is set.
+pub fn resolve_pcr_source_input_id(
+    flow: &crate::config::models::FlowConfig,
+) -> Option<&str> {
+    use crate::config::models::AssemblyKind;
+    let asm = flow.assembly.as_ref()?;
+    if matches!(asm.kind, AssemblyKind::Passthrough) {
+        return None;
+    }
+    if let Some(src) = asm.pcr_source.as_ref() {
+        return Some(&src.input_id);
+    }
+    // No flow-level pcr_source. Look at the first program's pcr_source
+    // (MPTS scenarios where each program designates its own).
+    asm.programs
+        .first()
+        .and_then(|p| p.pcr_source.as_ref())
+        .map(|src| src.input_id.as_str())
+}
+
 pub fn select_master_kind_for_input(
     input: Option<&crate::config::models::InputConfig>,
+    flow: &crate::config::models::FlowConfig,
 ) -> MasterClockKind {
     use crate::config::models::InputConfig;
     let Some(input) = input else {
-        return MasterClockKind::Wallclock;
+        return MasterClockKind::Passthrough;
     };
+    // ST 2110 always wants PTP — they're PTP-disciplined transports.
+    if matches!(
+        input,
+        InputConfig::St2110_20(_)
+            | InputConfig::St2110_23(_)
+            | InputConfig::St2110_30(_)
+            | InputConfig::St2110_31(_)
+            | InputConfig::St2110_40(_)
+    ) {
+        return MasterClockKind::Ptp;
+    }
+    // WebRTC ingress is wallclock-paced — the str0m session sets its own
+    // PTS rate.
+    if matches!(input, InputConfig::Webrtc(_) | InputConfig::Whep(_)) {
+        return MasterClockKind::Wallclock;
+    }
+    // PID-bus assembled flows synthesize output PCR from the master
+    // clock — they NEED a recovered source clock to keep that PCR
+    // coherent with the source. Default to SourcePcrPll so the
+    // assembler tracks the contribution's clock.
+    if flow.assembly.is_some() {
+        return MasterClockKind::SourcePcrPll;
+    }
+    // Everything else (passthrough / transcoded / single-input flows
+    // without assembly): Passthrough. Output PCR comes from source
+    // bytes or source PTS — no PLL needed.
     match input {
         InputConfig::Srt(_)
         | InputConfig::Rtp(_)
@@ -1018,16 +1166,18 @@ pub fn select_master_kind_for_input(
         | InputConfig::Rtmp(_)
         | InputConfig::Rtsp(_)
         | InputConfig::MediaPlayer(_)
-        | InputConfig::TestPattern(_) => MasterClockKind::SourcePcrPll,
-        InputConfig::Replay(_) => MasterClockKind::SourcePcrPll,
+        | InputConfig::TestPattern(_) => MasterClockKind::Passthrough,
+        InputConfig::Replay(_) => MasterClockKind::Passthrough,
+        // ST 2110 + WebRTC handled above; arms here are for completeness
+        // of the match (won't be reached).
         InputConfig::Webrtc(_) | InputConfig::Whep(_) => MasterClockKind::Wallclock,
         InputConfig::St2110_20(_)
         | InputConfig::St2110_23(_)
         | InputConfig::St2110_30(_)
         | InputConfig::St2110_31(_)
         | InputConfig::St2110_40(_) => MasterClockKind::Ptp,
-        InputConfig::RtpAudio(_) => MasterClockKind::SourcePcrPll,
-        InputConfig::Bonded(_) => MasterClockKind::SourcePcrPll,
+        InputConfig::RtpAudio(_) => MasterClockKind::Passthrough,
+        InputConfig::Bonded(_) => MasterClockKind::Passthrough,
     }
 }
 

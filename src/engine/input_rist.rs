@@ -40,6 +40,7 @@ use super::input_post_process::{InputPostProcess, InputPostProcessConfig};
 use super::input_transcode::{publish_input_packet_with_post, InputTranscoder};
 use super::packet::RtpPacket;
 
+#[allow(dead_code)]
 const TS_PACKET_SIZE: usize = 188;
 
 /// Spawn a RIST input task. Produces `RtpPacket { is_raw_ts: true, .. }`.
@@ -261,8 +262,14 @@ fn publish(
 ) {
     let seq = *seq_counter;
     *seq_counter = seq_counter.wrapping_add(1);
-    let ts_pkts = (data.len() / TS_PACKET_SIZE) as u32;
-    *ts_counter = ts_counter.wrapping_add(ts_pkts.max(1) * 188 * 8);
+    // RFC 2250 §3.5 — 90 kHz media-clock RTP timestamp from PCR;
+    // falls back to last-seen value when this datagram doesn't carry a
+    // PCR-bearing TS packet.
+    if let Some(pcr_27mhz) =
+        crate::engine::input_srt::scan_first_pcr_in_datagram(&data)
+    {
+        *ts_counter = (pcr_27mhz / 300) as u32;
+    }
 
     stats.input_packets.fetch_add(1, Ordering::Relaxed);
     stats.input_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -413,8 +420,13 @@ fn handle_redundant_leg(
         return;
     }
 
-    let ts_pkts = (data.len() / TS_PACKET_SIZE) as u32;
-    *ts_counter = ts_counter.wrapping_add(ts_pkts.max(1) * 188 * 8);
+    // RFC 2250 §3.5 — 90 kHz media-clock RTP timestamp from PCR;
+    // falls back to last-seen value on datagrams without PCR.
+    if let Some(pcr_27mhz) =
+        crate::engine::input_srt::scan_first_pcr_in_datagram(&data)
+    {
+        *ts_counter = (pcr_27mhz / 300) as u32;
+    }
 
     let packet = RtpPacket {
         data: data.clone(),
