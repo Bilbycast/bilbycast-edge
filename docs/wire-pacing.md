@@ -138,6 +138,17 @@ getcap target/release/bilbycast-edge
 # expected: target/release/bilbycast-edge cap_net_admin=ep
 ```
 
+### Testbed quick toggle (`testbed/start-infrastructure.sh`)
+
+The testbed start script makes the SO_TXTIME tier opt-in so plain-NIC runs and full ETF + PTP runs are both reachable from the same script with no manual `setcap` step:
+
+| Invocation | Wire pacer | Caps applied | NIC / kernel needs |
+|---|---|---|---|
+| `./testbed/start-infrastructure.sh` *(default)* | userspace `clock_nanosleep(CLOCK_TAI)` | none — script also exports `BILBYCAST_FORCE_NANOSLEEP=1` so any caps left over from a previous run are bypassed | nothing — works on any NIC, no qdisc, no PTP |
+| `BILBYCAST_ENABLE_TXTIME=1 ./testbed/start-infrastructure.sh` | SO_TXTIME(CLOCK_TAI) when ETF is present, else falls back to `clock_nanosleep` | `cap_net_admin,cap_sys_nice+ep` on both edge binaries via one sudo prompt (one-time per rebuild — caps persist in xattrs) | for tier-1 PCR_AC: `setup-etf-qdisc.sh` on the egress NIC + `ptp4l`/`phc2sys` (see above). Without ETF the SO_TXTIME path silently degrades. |
+
+Both modes log the active tier on each output start (`wire-emit '<id>': starting (anchor=…, tier=…)`) and surface it on `OutputStats.wire_pacing_tier`.
+
 Then on edge start, the log line:
 
 ```
