@@ -140,10 +140,12 @@ pub fn spawn_pcr_ingress_sampler_with_rx(
 
 /// Spawn the source-side discontinuity watcher — operator-visible
 /// alarm for PCR / PTS / DTS backward jumps > 500 ms in the ingress
-/// stream. Runs on **every** flow regardless of `master_clock.kind`
-/// (the PLL sampler is gated on SourcePcrPll-class flows, but the
-/// alarm should fire whenever the source loops a file or restarts
-/// its encoder — that's relevant to Passthrough flows too).
+/// stream, plus an automatic DI=1 injection so receivers handle the
+/// jump cleanly. Runs on **every** flow regardless of
+/// `master_clock.kind` (the PLL sampler is gated on SourcePcrPll-
+/// class flows, but the alarm + auto-fix should fire whenever the
+/// source loops a file or restarts its encoder — that's relevant to
+/// Passthrough flows too).
 ///
 /// Emits three event families, rate-limited to 1 / 30 s per code:
 /// - `source_pcr_discontinuity` — PCR jump > 500 ms in either direction
@@ -154,12 +156,26 @@ pub fn spawn_pcr_ingress_sampler_with_rx(
 /// Increments `FlowStats.source_discontinuities` on every detected
 /// event regardless of rate-limit suppression, so the manager UI's
 /// cumulative chip reflects the true rate.
-pub fn spawn_source_discontinuity_watch(
+///
+/// **Auto-fix**: when `fixer_tx` is provided, each detected
+/// discontinuity sends a one-shot
+/// `FixerCommand::SignalSourceDiscontinuity` to the per-flow
+/// `TsContinuityFixer`, which OR's the bit into its existing
+/// `pending_di_on_pcr` flag and stamps the MPEG-TS adaptation-field
+/// `discontinuity_indicator` on the next PCR-bearing packet. Same
+/// one-shot mechanism the operator-input-switch path uses; receivers
+/// see DI=1 and flush STC. This is the receiver-side fix for the
+/// upstream-file-loop case (ffmpeg `-stream_loop -1 -c copy`) — the
+/// edge can't undo the jump in the bytes, but it can tell the
+/// receiver "fresh anchor, forget your old STC tracking" so
+/// downstream A/V re-aligns cleanly instead of sliding.
+pub(crate) fn spawn_source_discontinuity_watch(
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     flow_id: String,
     active_input_rx: tokio::sync::watch::Receiver<String>,
     events: EventSender,
     flow_stats: Arc<crate::stats::collector::FlowStatsAccumulator>,
+    fixer_tx: Option<tokio::sync::mpsc::Sender<crate::engine::flow::FixerCommand>>,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
@@ -183,6 +199,20 @@ pub fn spawn_source_discontinuity_watch(
                                     if gap.unsigned_abs() > DISCONTINUITY_THRESHOLD_27MHZ {
                                         flow_stats.source_discontinuities
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        // Auto-fix: tell the fixer to set
+                                        // DI=1 on the next PCR-bearing
+                                        // packet (one-shot). Sent on
+                                        // every detected jump regardless
+                                        // of the per-code event rate-
+                                        // limit so receivers get the
+                                        // signal on every loop boundary,
+                                        // not just the first one in a
+                                        // 30 s window.
+                                        if let Some(tx) = fixer_tx.as_ref() {
+                                            let _ = tx.try_send(
+                                                crate::engine::flow::FixerCommand::SignalSourceDiscontinuity,
+                                            );
+                                        }
                                         let should_emit = match last_event_pcr {
                                             None => true,
                                             Some(t) => t.elapsed() >= DISCONTINUITY_EVENT_MIN_INTERVAL,
@@ -221,6 +251,11 @@ pub fn spawn_source_discontinuity_watch(
                                         if gap.unsigned_abs() > DISCONTINUITY_THRESHOLD_90KHZ {
                                             flow_stats.source_discontinuities
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            if let Some(tx) = fixer_tx.as_ref() {
+                                                let _ = tx.try_send(
+                                                    crate::engine::flow::FixerCommand::SignalSourceDiscontinuity,
+                                                );
+                                            }
                                             let should_emit = match last_event_pts {
                                                 None => true,
                                                 Some(t) => t.elapsed() >= DISCONTINUITY_EVENT_MIN_INTERVAL,
@@ -257,6 +292,11 @@ pub fn spawn_source_discontinuity_watch(
                                         if gap.unsigned_abs() > DISCONTINUITY_THRESHOLD_90KHZ {
                                             flow_stats.source_discontinuities
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            if let Some(tx) = fixer_tx.as_ref() {
+                                                let _ = tx.try_send(
+                                                    crate::engine::flow::FixerCommand::SignalSourceDiscontinuity,
+                                                );
+                                            }
                                             let should_emit = match last_event_dts {
                                                 None => true,
                                                 Some(t) => t.elapsed() >= DISCONTINUITY_EVENT_MIN_INTERVAL,

@@ -1138,6 +1138,7 @@ impl FlowRuntime {
             active_input_tx.subscribe(),
             event_sender.clone(),
             flow_stats.clone(),
+            Some(fixer_tx.clone()),
             cancel_token.child_token(),
         );
         {
@@ -3095,7 +3096,7 @@ fn null_ts_packet() -> RtpPacket {
 ///
 /// Forwarders never touch the `TsContinuityFixer` directly — they enqueue
 /// one of these variants and let the fixer task own the state uncontended.
-enum FixerCommand {
+pub(crate) enum FixerCommand {
     /// The active input just produced a media packet. The fixer must apply
     /// CC rewriting and forward it to the flow's broadcast channel.
     ActivePacket { input_id: String, pkt: RtpPacket },
@@ -3108,6 +3109,18 @@ enum FixerCommand {
     /// Emit a keepalive NULL datagram to keep downstream sockets alive
     /// during a silent active input.
     Keepalive,
+    /// The source-discontinuity watcher detected an upstream PCR / PTS / DTS
+    /// backward jump on the active input's stream (e.g. an ffmpeg
+    /// `-stream_loop -1 -c copy` file-loop boundary, an encoder restart, a
+    /// decoder reseat). Signal the fixer to set the MPEG-TS
+    /// `discontinuity_indicator` bit on the **next** PCR-bearing packet it
+    /// forwards — same one-shot mechanism the operator-input-switch path
+    /// uses. Receivers see DI=1 and flush their STC cleanly instead of
+    /// silently sliding A/V over the jump.
+    ///
+    /// One-shot: the fixer ORs the flag with its existing
+    /// `pending_di_on_pcr`; consumed on the next PCR.
+    SignalSourceDiscontinuity,
 }
 
 /// Dedicated fixer task that owns the [`TsContinuityFixer`] for one flow.
@@ -3170,6 +3183,14 @@ async fn ts_fixer_task(
                     if out_tx.send(null_ts_packet()).is_err() {
                         FIXER_OUT_NO_RECEIVERS.fetch_add(1, Ordering::Relaxed);
                     }
+                }
+                Some(FixerCommand::SignalSourceDiscontinuity) => {
+                    // The watcher saw an upstream backward PCR/PTS/DTS
+                    // jump. Set the DI flag so the next PCR-bearing
+                    // packet that flows through the fixer gets
+                    // `discontinuity_indicator` set. One-shot;
+                    // consumed inside `process_packet`.
+                    fixer.signal_source_discontinuity();
                 }
                 None => return,
             }

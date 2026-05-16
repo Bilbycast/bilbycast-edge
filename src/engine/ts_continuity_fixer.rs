@@ -170,6 +170,28 @@ impl TsContinuityFixer {
         }
     }
 
+    /// Signal an upstream-source-side discontinuity (PCR / PTS / DTS
+    /// backward jump observed by `pcr_ingress_sampler::spawn_source_
+    /// discontinuity_watch`). Sets the one-shot `discontinuity_indicator`
+    /// flag so the next PCR-bearing packet the fixer forwards carries
+    /// DI=1 — telling receivers "the next PCR is a fresh STC anchor,
+    /// flush old timestamp tracking". Without this, professional and
+    /// prosumer decoders treat the backward jump as a clock fault and
+    /// either silently slide A/V or stall.
+    ///
+    /// Same mechanism the operator-input-switch path uses; OR'd in so
+    /// a switch happening concurrently with a source discontinuity
+    /// doesn't lose either signal.
+    ///
+    /// Also flips `ever_switched` so the post-switch processing path
+    /// (which is what applies DI to packets) takes over even when
+    /// the operator never manually switched — a chronic source-loop
+    /// without any operator action still gets DI=1 on every jump.
+    pub fn signal_source_discontinuity(&mut self) {
+        self.pending_di_on_pcr = true;
+        self.ever_switched = true;
+    }
+
     /// Return cached PAT + PMT packets suitable for a keepalive tick when
     /// the active input has no live data flowing. Preference order:
     ///
