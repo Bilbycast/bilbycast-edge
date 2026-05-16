@@ -263,6 +263,7 @@ mod tests {
                                 pid_map: None,
                                 pid_overrides: None,
                                 interface_binding: None,
+                                ingress_smoothing_ms: None,
                 }),
             }],
             outputs: Vec::new(),

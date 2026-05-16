@@ -23,11 +23,10 @@ use super::audio_302m::S302mOutputPipeline;
 use super::audio_transcode::InputFormat;
 use super::delay_buffer::resolve_output_delay;
 use super::packet::RtpPacket;
-use super::ts_audio_replace::TsAudioReplacer;
+use super::transcode_chain;
 use super::ts_pid_overrides_rewriter::TsPidOverridesRewriter;
 use super::ts_pid_remapper::TsPidRemapper;
 use super::ts_program_filter::TsProgramFilter;
-use super::ts_video_replace::TsVideoReplacer;
 
 /// TS sync byte.
 const TS_SYNC_BYTE: u8 = 0x47;
@@ -190,6 +189,7 @@ async fn udp_output_loop_302m(
                                 bytes: Bytes::from(datagram),
                                 recv_time_us: packet.recv_time_us,
                                 target_tx_time_ns: None,
+                                ts_offset: 0,
                             };
                             if wire_tx.try_send(dg).is_err() {
                                 stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
@@ -296,116 +296,75 @@ async fn udp_output_loop(
     });
     let mut overrides_scratch: Vec<u8> = Vec::new();
 
-    // Optional audio ES replacement (decode + re-encode audio in the TS).
-    let mut audio_replacer = match config.audio_encode.as_ref() {
-        Some(enc) => match TsAudioReplacer::new(enc, config.transcode.clone()) {
-            Ok(r) => {
+    // Transcoding chain (audio_encode + video_encode replacers running
+    // on a dedicated SCHED_FIFO codec thread, off the Tokio runtime).
+    // Stage 1 of the data-plane redesign: replaces the prior inline
+    // `tokio::task::block_in_place` pattern that caused work-stealing
+    // churn whenever a frame's encode took > a few hundred µs.
+    // See `engine::transcode_chain` + `docs/production-tuning.md`.
+    let mut transcode_chain = match transcode_chain::build_for_output(
+        &config.id,
+        config.audio_encode.as_ref(),
+        config.video_encode.as_ref(),
+        config.transcode.clone(),
+        &stats,
+        av_sync_pacer.as_ref(),
+    ) {
+        Ok(chain) => {
+            if let Some(ref c) = chain {
                 tracing::info!(
-                    "UDP output '{}': audio_encode active ({})",
+                    "UDP output '{}': transcode chain active ({})",
                     config.id,
-                    r.target_description()
+                    c.target_description()
                 );
-                events.emit_output_with_details(
-                    EventSeverity::Info,
-                    category::AUDIO_ENCODE,
-                    format!("TS audio encoder started: output '{}'", config.id),
-                    &config.id,
-                    serde_json::json!({ "codec": enc.codec }),
-                );
-                stats.set_audio_replacer_stats(r.stats_handle());
-                stats.set_decode_stats(
-                    r.decode_stats_handle(),
-                    "",
-                    0, 0,
-                );
-                let r = r.with_output_stats(Arc::clone(&stats));
-                Some(r)
-            }
-            Err(e) => {
-                tracing::error!(
-                    "UDP output '{}': audio_encode rejected: {e}; audio will be left untouched",
-                    config.id
-                );
-                events.emit_output_with_details(
-                    EventSeverity::Critical,
-                    category::AUDIO_ENCODE,
-                    format!("TS audio encoder failed: output '{}': {e}", config.id),
-                    &config.id,
-                    serde_json::json!({ "error": e.to_string() }),
-                );
-                None
-            }
-        },
-        None => None,
-    };
-    let mut replace_scratch: Vec<u8> = Vec::new();
-
-    // Optional video ES replacement (decode + re-encode video in the TS).
-    let mut video_replacer = match config.video_encode.as_ref() {
-        Some(enc) => match TsVideoReplacer::new(enc, None) {
-            Ok(mut r) => {
-                let backend = match enc.codec.as_str() {
-                    "x264" | "x265" => enc.codec.clone(),
-                    "h264_nvenc" | "hevc_nvenc" => "nvenc".to_string(),
-                    other => other.to_string(),
-                };
-                let target_codec = match enc.codec.as_str() {
-                    "x264" | "h264_nvenc" => "h264",
-                    "x265" | "hevc_nvenc" => "hevc",
-                    other => other,
-                };
-                stats.set_video_encode_stats(
-                    r.stats_handle(),
-                    String::new(),
-                    target_codec.to_string(),
-                    enc.width.unwrap_or(0),
-                    enc.height.unwrap_or(0),
-                    match (enc.fps_num, enc.fps_den) {
-                        (Some(n), Some(d)) if d > 0 => n as f32 / d as f32,
-                        _ => 0.0,
-                    },
-                    enc.bitrate_kbps.unwrap_or(0),
-                    backend,
-                );
-                stats.set_video_decode_stats(
-                    r.decode_stats_handle(),
-                    "", 0, 0, 0.0,
-                );
-                if let Some(p) = av_sync_pacer.as_ref() {
-                    r.set_av_sync_pacer(p.clone());
+                if config.audio_encode.is_some() {
+                    events.emit_output_with_details(
+                        EventSeverity::Info,
+                        category::AUDIO_ENCODE,
+                        format!("TS audio encoder started: output '{}'", config.id),
+                        &config.id,
+                        serde_json::json!({
+                            "codec": config.audio_encode.as_ref().map(|e| &e.codec)
+                        }),
+                    );
                 }
-                tracing::info!(
-                    "UDP output '{}': video_encode active ({})",
-                    config.id,
-                    r.target_description()
-                );
-                events.emit_output_with_details(
-                    EventSeverity::Info,
-                    category::VIDEO_ENCODE,
-                    format!("Video encoder started: output '{}'", config.id),
-                    &config.id,
-                    serde_json::json!({ "codec": enc.codec }),
-                );
-                Some(r)
+                if config.video_encode.is_some() {
+                    events.emit_output_with_details(
+                        EventSeverity::Info,
+                        category::VIDEO_ENCODE,
+                        format!("Video encoder started: output '{}'", config.id),
+                        &config.id,
+                        serde_json::json!({
+                            "codec": config.video_encode.as_ref().map(|e| &e.codec)
+                        }),
+                    );
+                }
             }
-            Err(e) => {
-                tracing::error!(
-                    "UDP output '{}': video_encode rejected: {e}; video will be left untouched",
-                    config.id
-                );
-                events.emit_output_with_details(
-                    EventSeverity::Critical,
-                    category::VIDEO_ENCODE,
-                    format!("Video encoder failed: output '{}': {e}", config.id),
-                    &config.id,
-                    serde_json::json!({ "error": e.to_string() }),
-                );
-                None
-            }
-        },
-        None => None,
+            chain
+        }
+        Err(e) => {
+            tracing::error!(
+                "UDP output '{}': transcode chain rejected: {e}; transcoding disabled",
+                config.id
+            );
+            let (cat, label) = match e {
+                transcode_chain::TranscodeChainError::Audio(_) => {
+                    (category::AUDIO_ENCODE, "TS audio encoder")
+                }
+                transcode_chain::TranscodeChainError::Video(_) => {
+                    (category::VIDEO_ENCODE, "Video encoder")
+                }
+            };
+            events.emit_output_with_details(
+                EventSeverity::Critical,
+                cat,
+                format!("{label} failed: output '{}': {e}", config.id),
+                &config.id,
+                serde_json::json!({ "error": e.to_string() }),
+            );
+            None
+        }
     };
-    let mut video_replace_scratch: Vec<u8> = Vec::new();
 
     // Optional CBR null padder: inflates the natural transcoded rate
     // up to a target wire bitrate by injecting PID 0x1FFF NULL packets.
@@ -424,11 +383,13 @@ async fn udp_output_loop(
     // receiving decoder gets stuck on PTS values that no longer line
     // up with the master-clock-paced output PCR.
     let mut switch_handles: Vec<Arc<std::sync::atomic::AtomicBool>> = Vec::new();
-    if let Some(r) = audio_replacer.as_ref() {
-        switch_handles.push(r.external_reset_handle());
-    }
-    if let Some(r) = video_replacer.as_ref() {
-        switch_handles.push(r.external_reset_handle());
+    if let Some(ref chain) = transcode_chain {
+        if let Some(h) = chain.audio_external_reset_handle() {
+            switch_handles.push(h);
+        }
+        if let Some(h) = chain.video_external_reset_handle() {
+            switch_handles.push(h);
+        }
     }
     crate::engine::input_switch_watcher::spawn(
         config.id.clone(),
@@ -505,98 +466,48 @@ async fn udp_output_loop(
             }
         }
 
-        for packet in &packets_to_send {
-            // Extract raw TS payload: strip RTP header if present
-            let ts_data = if packet.is_raw_ts {
-                &packet.data[..]
-            } else if packet.data.len() > RTP_HEADER_MIN_SIZE {
-                &packet.data[RTP_HEADER_MIN_SIZE..]
-            } else {
-                continue;
-            };
-
-            // Apply program filter (MPTS → SPTS) if configured, producing
-            // `filtered_bytes` (borrow or scratch).
-            let filtered_bytes: &[u8] = if let Some(ref mut filter) = program_filter {
-                filter_scratch.clear();
-                filter.filter_into(ts_data, &mut filter_scratch);
-                if filter_scratch.is_empty() {
-                    continue;
-                }
-                &filter_scratch
-            } else {
-                ts_data
-            };
-
-            // Apply audio ES replacement if configured. The replacer owns
-            // its own TS state — it rewrites the PMT, decodes+re-encodes
-            // audio PES, and leaves video / other PIDs untouched.
-            let after_audio: &[u8] = if let Some(ref mut replacer) = audio_replacer {
-                replace_scratch.clear();
-                crate::timed_block_in_place!(
-                    "output_udp.audio_replacer",
-                    crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
-                    {
-                        replacer.process(filtered_bytes, &mut replace_scratch);
-                    }
-                );
-                &replace_scratch
-            } else {
-                filtered_bytes
-            };
-
-            // Apply video ES replacement if configured. Runs after audio
-            // so both transforms stack cleanly on the same TS stream.
-            let after_video: &[u8] = if let Some(ref mut vreplacer) = video_replacer {
-                video_replace_scratch.clear();
-                crate::timed_block_in_place!(
-                    "output_udp.video_replacer",
-                    crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
-                    {
-                        vreplacer.process(after_audio, &mut video_replace_scratch);
-                    }
-                );
-                &video_replace_scratch
-            } else {
-                after_audio
-            };
-
-            // Apply CBR padding before PID remap so the remapper sees
-            // the inflated stream and keeps NULL-PID continuity through.
-            let after_pad: &[u8] = if let Some(ref mut padder) = null_padder {
+        // Per-iteration handler for transcoded output bytes flushed from
+        // the codec thread. Re-injected into the same downstream
+        // pipeline (padder → pid_overrides → pid_remapper → ts_buf →
+        // wire_tx) as the no-transcode path, just with bytes-after-
+        // transcode rather than bytes-before-filter. The closure captures
+        // all the per-iteration mutable scratch buffers + the long-lived
+        // wire_tx so call sites stay terse.
+        let forward_downstream = |downstream_input: &[u8],
+                                  recv_time_us: u64,
+                                  null_padder: &mut Option<crate::engine::ts_null_padder::TsNullPadder>,
+                                  pad_scratch: &mut Vec<u8>,
+                                  pid_overrides_rewriter: &mut Option<TsPidOverridesRewriter>,
+                                  overrides_scratch: &mut Vec<u8>,
+                                  pid_remapper: &mut Option<TsPidRemapper>,
+                                  remap_scratch: &mut Vec<u8>,
+                                  ts_buf: &mut BytesMut,
+                                  ts_sync_found: &mut bool,
+                                  config_id: &str,
+                                  stats: &OutputStatsAccumulator,
+                                  wire_tx: &std::sync::mpsc::SyncSender<WireDatagram>| {
+            let after_pad: &[u8] = if let Some(padder) = null_padder.as_mut() {
                 pad_scratch.clear();
-                padder.process(after_video, &mut pad_scratch);
-                &pad_scratch
+                padder.process(downstream_input, pad_scratch);
+                pad_scratch
             } else {
-                after_video
+                downstream_input
             };
-
-            // Per-program role-keyed PID rewrite for passthrough flows
-            // (gated on no_transcode at construction). Sits before the
-            // mechanical pid_map so the operator can layer both: roles
-            // first (PMT/video/audio/PCR), then any leftover mechanical
-            // remap on top.
-            let after_overrides: &[u8] = if let Some(ref mut rw) = pid_overrides_rewriter {
+            let after_overrides: &[u8] = if let Some(rw) = pid_overrides_rewriter.as_mut() {
                 overrides_scratch.clear();
-                rw.process(after_pad, &mut overrides_scratch);
-                &overrides_scratch
+                rw.process(after_pad, overrides_scratch);
+                overrides_scratch
             } else {
                 after_pad
             };
-
-            // Apply PID remapping last, so audio/video replacers see original
-            // PIDs in the PMT (they identify streams by stream_type, but this
-            // keeps debugging + stats consistent with the source stream).
-            if let Some(ref mut remapper) = pid_remapper {
+            if let Some(remapper) = pid_remapper.as_mut() {
                 remap_scratch.clear();
-                remapper.process(after_overrides, &mut remap_scratch);
-                ts_buf.extend_from_slice(&remap_scratch);
+                remapper.process(after_overrides, remap_scratch);
+                ts_buf.extend_from_slice(remap_scratch);
             } else {
                 ts_buf.extend_from_slice(after_overrides);
             }
-
-            // Find TS sync boundary on first data
-            if !ts_sync_found {
+            if !*ts_sync_found {
                 let min_bytes = TS_SYNC_CONFIRM_COUNT * TS_PACKET_SIZE;
                 if ts_buf.len() >= min_bytes {
                     let mut found_offset = None;
@@ -610,47 +521,113 @@ async fn udp_output_loop(
                             break;
                         }
                     }
-
                     if let Some(offset) = found_offset {
                         if offset > 0 {
                             tracing::info!(
                                 "UDP output '{}': TS sync found at offset {}, discarding {} leading bytes",
-                                config.id, offset, offset
+                                config_id, offset, offset
                             );
                             let _ = ts_buf.split_to(offset);
                         } else {
-                            tracing::info!(
-                                "UDP output '{}': TS sync found (already aligned)",
-                                config.id
-                            );
+                            tracing::info!("UDP output '{}': TS sync found (already aligned)", config_id);
                         }
-                        ts_sync_found = true;
+                        *ts_sync_found = true;
                     } else {
                         tracing::warn!(
                             "UDP output '{}': no TS sync found in {} bytes, discarding",
-                            config.id, ts_buf.len()
+                            config_id, ts_buf.len()
                         );
                         ts_buf.clear();
                     }
                 }
             }
-
-            // Hand complete TS-aligned datagrams to the wire-emit
-            // thread. `try_send` is non-blocking: if the wire thread
-            // is behind (sync_channel full), drop the datagram and
-            // count it.
-            if ts_sync_found {
+            if *ts_sync_found {
                 while ts_buf.len() >= ts_datagram_size {
                     let datagram = ts_buf.split_to(ts_datagram_size);
                     let dg = WireDatagram {
                         bytes: datagram.freeze(),
-                        recv_time_us: packet.recv_time_us,
+                        recv_time_us,
                         target_tx_time_ns: None,
+                        ts_offset: 0,
                     };
                     if wire_tx.try_send(dg).is_err() {
                         stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+            }
+        };
+
+        for packet in &packets_to_send {
+            // Extract raw TS payload: strip RTP header if present
+            let ts_data = if packet.is_raw_ts {
+                &packet.data[..]
+            } else if packet.data.len() > RTP_HEADER_MIN_SIZE {
+                &packet.data[RTP_HEADER_MIN_SIZE..]
+            } else {
+                continue;
+            };
+
+            // Apply program filter (MPTS → SPTS) if configured.
+            let filtered_bytes: &[u8] = if let Some(ref mut filter) = program_filter {
+                filter_scratch.clear();
+                filter.filter_into(ts_data, &mut filter_scratch);
+                if filter_scratch.is_empty() {
+                    continue;
+                }
+                &filter_scratch
+            } else {
+                ts_data
+            };
+
+            // If a transcode chain is active, hand the filtered bytes
+            // to the codec thread (non-blocking — drop-on-full). The
+            // transcoded output arrives asynchronously on the
+            // `chain.recv()` branch of the outer select! below.
+            if let Some(ref chain) = transcode_chain {
+                if let Err(_) = chain.try_submit(Bytes::copy_from_slice(filtered_bytes)) {
+                    stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                forward_downstream(
+                    filtered_bytes,
+                    packet.recv_time_us,
+                    &mut null_padder,
+                    &mut pad_scratch,
+                    &mut pid_overrides_rewriter,
+                    &mut overrides_scratch,
+                    &mut pid_remapper,
+                    &mut remap_scratch,
+                    &mut ts_buf,
+                    &mut ts_sync_found,
+                    &config.id,
+                    &stats,
+                    &wire_tx,
+                );
+            }
+        }
+
+        // Drain any transcoded chunks that the codec thread has produced
+        // since the last poll. Non-blocking — the outer select! also has
+        // a `chain.recv()` branch that wakes us when new chunks arrive
+        // without busy-waiting; this drain catches anything that came in
+        // alongside the broadcast.recv path.
+        if let Some(ref mut chain) = transcode_chain {
+            while let Some(transcoded) = chain.try_recv() {
+                forward_downstream(
+                    &transcoded,
+                    now_us(),
+                    &mut null_padder,
+                    &mut pad_scratch,
+                    &mut pid_overrides_rewriter,
+                    &mut overrides_scratch,
+                    &mut pid_remapper,
+                    &mut remap_scratch,
+                    &mut ts_buf,
+                    &mut ts_sync_found,
+                    &config.id,
+                    &stats,
+                    &wire_tx,
+                );
             }
         }
     }

@@ -344,6 +344,21 @@ if [[ ! -f "${ENV_FILE}" ]]; then
 RUST_LOG=info
 # BILBYCAST_REPLAY_DIR=/var/lib/bilbycast/edge/replay
 # BILBYCAST_MEDIA_DIR=/var/lib/bilbycast/edge/media
+
+# Lock all current + future memory pages into RAM at startup via
+# `mlockall(MCL_CURRENT | MCL_FUTURE)`. Eliminates major-page-fault
+# stalls on the data-plane hot path (encoder buffers, wire-emit
+# threads, broadcast channel slots). Paired with LimitMEMLOCK=infinity
+# in the systemd unit so the call always succeeds on this install.
+# Recommended on production deployments; safe to leave on.
+BILBYCAST_MLOCKALL=1
+
+# CPU pinning for wire-emit threads. Each output socket spawns its
+# own wire-emit thread; with pinning, multiple threads round-robin
+# across the listed CPUs. Recommended pairing: `isolcpus=N-M` on the
+# kernel command line + this set referencing the same isolated cores.
+# Example for a 4-core box with cores 2 + 3 isolated:
+# BILBYCAST_WIRE_EMIT_CPUS=2,3
 EOF
     chmod 0640 "${ENV_FILE}"
 fi

@@ -34,11 +34,9 @@ use crate::util::time::now_us;
 
 use super::delay_buffer::resolve_output_delay;
 use super::packet::RtpPacket;
-use super::ts_audio_replace::TsAudioReplacer;
 use super::ts_pid_overrides_rewriter::TsPidOverridesRewriter;
 use super::ts_pid_remapper::TsPidRemapper;
 use super::ts_program_filter::TsProgramFilter;
-use super::ts_video_replace::TsVideoReplacer;
 
 const TS_SYNC_BYTE: u8 = 0x47;
 const TS_PACKET_SIZE: usize = 188;
@@ -303,123 +301,81 @@ async fn rist_output_loop(
     });
     let mut overrides_scratch: Vec<u8> = Vec::new();
 
-    let mut audio_replacer = match config.audio_encode.as_ref() {
-        Some(enc) => match TsAudioReplacer::new(enc, config.transcode.clone()) {
-            Ok(r) => {
+    // Transcoding chain on a dedicated codec thread. See output_udp.rs
+    // for full rationale.
+    let mut transcode_chain = match crate::engine::transcode_chain::build_for_output(
+        &config.id,
+        config.audio_encode.as_ref(),
+        config.video_encode.as_ref(),
+        config.transcode.clone(),
+        &stats,
+        av_sync_pacer.as_ref(),
+    ) {
+        Ok(chain) => {
+            if let Some(ref c) = chain {
                 tracing::info!(
-                    "RIST output '{}': audio_encode active ({})",
+                    "RIST output '{}': transcode chain active ({})",
                     config.id,
-                    r.target_description()
+                    c.target_description()
                 );
-                events.emit_output_with_details(
-                    EventSeverity::Info,
-                    category::AUDIO_ENCODE,
-                    format!("TS audio encoder started: output '{}'", config.id),
-                    &config.id,
-                    serde_json::json!({ "codec": enc.codec }),
-                );
-                stats.set_audio_replacer_stats(r.stats_handle());
-                stats.set_decode_stats(
-                    r.decode_stats_handle(),
-                    "",
-                    0, 0,
-                );
-                let r = r.with_output_stats(Arc::clone(&stats));
-                Some(r)
-            }
-            Err(e) => {
-                tracing::error!(
-                    "RIST output '{}': audio_encode rejected: {e}; audio will be left untouched",
-                    config.id
-                );
-                events.emit_output_with_details(
-                    EventSeverity::Critical,
-                    category::AUDIO_ENCODE,
-                    format!("TS audio encoder failed: output '{}': {e}", config.id),
-                    &config.id,
-                    serde_json::json!({ "error": e.to_string() }),
-                );
-                None
-            }
-        },
-        None => None,
-    };
-    let mut replace_scratch: Vec<u8> = Vec::new();
-
-    let mut video_replacer = match config.video_encode.as_ref() {
-        Some(enc) => match TsVideoReplacer::new(enc, None) {
-            Ok(mut r) => {
-                if let Some(p) = av_sync_pacer.as_ref() {
-                    r.set_av_sync_pacer(p.clone());
+                if config.audio_encode.is_some() {
+                    events.emit_output_with_details(
+                        EventSeverity::Info,
+                        category::AUDIO_ENCODE,
+                        format!("TS audio encoder started: output '{}'", config.id),
+                        &config.id,
+                        serde_json::json!({
+                            "codec": config.audio_encode.as_ref().map(|e| &e.codec)
+                        }),
+                    );
                 }
-                let backend = match enc.codec.as_str() {
-                    "x264" | "x265" => enc.codec.clone(),
-                    "h264_nvenc" | "hevc_nvenc" => "nvenc".to_string(),
-                    other => other.to_string(),
-                };
-                let target_codec = match enc.codec.as_str() {
-                    "x264" | "h264_nvenc" => "h264",
-                    "x265" | "hevc_nvenc" => "hevc",
-                    other => other,
-                };
-                stats.set_video_encode_stats(
-                    r.stats_handle(),
-                    String::new(),
-                    target_codec.to_string(),
-                    enc.width.unwrap_or(0),
-                    enc.height.unwrap_or(0),
-                    match (enc.fps_num, enc.fps_den) {
-                        (Some(n), Some(d)) if d > 0 => n as f32 / d as f32,
-                        _ => 0.0,
-                    },
-                    enc.bitrate_kbps.unwrap_or(0),
-                    backend,
-                );
-                stats.set_video_decode_stats(
-                    r.decode_stats_handle(),
-                    "", 0, 0, 0.0,
-                );
-                tracing::info!(
-                    "RIST output '{}': video_encode active ({})",
-                    config.id,
-                    r.target_description()
-                );
-                events.emit_output_with_details(
-                    EventSeverity::Info,
-                    category::VIDEO_ENCODE,
-                    format!("Video encoder started: output '{}'", config.id),
-                    &config.id,
-                    serde_json::json!({ "codec": enc.codec }),
-                );
-                Some(r)
+                if config.video_encode.is_some() {
+                    events.emit_output_with_details(
+                        EventSeverity::Info,
+                        category::VIDEO_ENCODE,
+                        format!("Video encoder started: output '{}'", config.id),
+                        &config.id,
+                        serde_json::json!({
+                            "codec": config.video_encode.as_ref().map(|e| &e.codec)
+                        }),
+                    );
+                }
             }
-            Err(e) => {
-                tracing::error!(
-                    "RIST output '{}': video_encode rejected: {e}; video will be left untouched",
-                    config.id
-                );
-                events.emit_output_with_details(
-                    EventSeverity::Critical,
-                    category::VIDEO_ENCODE,
-                    format!("Video encoder failed: output '{}': {e}", config.id),
-                    &config.id,
-                    serde_json::json!({ "error": e.to_string() }),
-                );
-                None
-            }
-        },
-        None => None,
+            chain
+        }
+        Err(e) => {
+            tracing::error!(
+                "RIST output '{}': transcode chain rejected: {e}; transcoding disabled",
+                config.id
+            );
+            let (cat, label) = match e {
+                crate::engine::transcode_chain::TranscodeChainError::Audio(_) => {
+                    (category::AUDIO_ENCODE, "TS audio encoder")
+                }
+                crate::engine::transcode_chain::TranscodeChainError::Video(_) => {
+                    (category::VIDEO_ENCODE, "Video encoder")
+                }
+            };
+            events.emit_output_with_details(
+                EventSeverity::Critical,
+                cat,
+                format!("{label} failed: output '{}': {e}", config.id),
+                &config.id,
+                serde_json::json!({ "error": e.to_string() }),
+            );
+            None
+        }
     };
-    let mut video_replace_scratch: Vec<u8> = Vec::new();
 
-    // Per-output input-switch watcher. See output_udp.rs for the
-    // detailed rationale.
+    // Per-output input-switch watcher.
     let mut switch_handles: Vec<Arc<std::sync::atomic::AtomicBool>> = Vec::new();
-    if let Some(r) = audio_replacer.as_ref() {
-        switch_handles.push(r.external_reset_handle());
-    }
-    if let Some(r) = video_replacer.as_ref() {
-        switch_handles.push(r.external_reset_handle());
+    if let Some(ref chain) = transcode_chain {
+        if let Some(h) = chain.audio_external_reset_handle() {
+            switch_handles.push(h);
+        }
+        if let Some(h) = chain.video_external_reset_handle() {
+            switch_handles.push(h);
+        }
     }
     crate::engine::input_switch_watcher::spawn(
         config.id.clone(),
@@ -511,42 +467,39 @@ async fn rist_output_loop(
                 ts_data
             };
 
-            let after_audio: &[u8] = if let Some(ref mut replacer) = audio_replacer {
-                replace_scratch.clear();
-                crate::timed_block_in_place!(
-                    "output_rist.audio_replacer",
-                    crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
-                    {
-                        replacer.process(filtered_bytes, &mut replace_scratch);
+            // If transcode chain is active, submit + drain transcoded
+            // bytes for downstream pipeline. Otherwise filtered_bytes
+            // flows directly to the downstream pipeline.
+            let transcoded_holder: Option<Bytes>;
+            let downstream_input: &[u8] = if let Some(ref chain) = transcode_chain {
+                if chain.try_submit(Bytes::copy_from_slice(filtered_bytes)).is_err() {
+                    stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                // Drain any transcoded chunks emitted by the codec
+                // thread since last poll. If at least one chunk is
+                // ready we splice it through; otherwise this iteration
+                // contributes nothing (the encoder's still pipelining).
+                match transcode_chain.as_mut().and_then(|c| c.try_recv()) {
+                    Some(t) => {
+                        transcoded_holder = Some(t);
+                        transcoded_holder.as_ref().unwrap()
                     }
-                );
-                &replace_scratch
+                    None => continue,
+                }
             } else {
+                transcoded_holder = None;
                 filtered_bytes
-            };
-
-            let after_video: &[u8] = if let Some(ref mut vreplacer) = video_replacer {
-                video_replace_scratch.clear();
-                crate::timed_block_in_place!(
-                    "output_rist.video_replacer",
-                    crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
-                    {
-                        vreplacer.process(after_audio, &mut video_replace_scratch);
-                    }
-                );
-                &video_replace_scratch
-            } else {
-                after_audio
             };
 
             // Per-program role-keyed PID rewrite for passthrough flows.
             let after_overrides: &[u8] = if let Some(ref mut rw) = pid_overrides_rewriter {
                 overrides_scratch.clear();
-                rw.process(after_video, &mut overrides_scratch);
+                rw.process(downstream_input, &mut overrides_scratch);
                 &overrides_scratch
             } else {
-                after_video
+                downstream_input
             };
+            let _ = transcoded_holder; // keep transcoded bytes alive through use
 
             if let Some(ref mut remapper) = pid_remapper {
                 remap_scratch.clear();

@@ -3955,37 +3955,55 @@ fn spawn_ts_es_demuxer_consumer(
     cancel: CancellationToken,
     per_input_counters: Arc<crate::stats::collector::PerInputCounters>,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut demuxer = TsEsDemuxer::new(input_id.clone(), bus);
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return,
-                r = rx.recv() => match r {
-                    Ok(pkt) => {
-                        per_input_counters
-                            .bytes
-                            .fetch_add(pkt.data.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                        per_input_counters
-                            .packets
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        demuxer.process(&pkt);
+    // Stage 2 of the data-plane redesign: run the demuxer on a
+    // dedicated SCHED_FIFO OS thread with its own
+    // tokio::current_thread runtime, lifting it off the main worker
+    // pool. CPU pinning honoured via `BILBYCAST_PID_BUS_CPUS`. The
+    // demuxer is the upstream half of the PID-bus assembler (which
+    // also moved to a dedicated runtime); keeping them on the same
+    // CPU set lets the kernel keep their shared cache hot.
+    let input_id_for_demuxer = input_id.clone();
+    let thread_handle = crate::engine::dedicated_runtime::spawn_dedicated(
+        crate::engine::dedicated_runtime::DedicatedRuntimeConfig::new(
+            format!("demuxer-{input_id_for_demuxer}"),
+            "BILBYCAST_PID_BUS_CPUS",
+        ),
+        async move {
+            let mut demuxer = TsEsDemuxer::new(input_id_for_demuxer.clone(), bus);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    r = rx.recv() => match r {
+                        Ok(pkt) => {
+                            per_input_counters
+                                .bytes
+                                .fetch_add(pkt.data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                            per_input_counters
+                                .packets
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            demuxer.process(&pkt);
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::debug!(
+                                "ts_es_demuxer_consumer '{}': lagged {} packets",
+                                input_id_for_demuxer, n
+                            );
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // Slow consumer — drop on the floor. PID-bus
-                        // subscribers are independent per-PID channels
-                        // with their own Lagged handling; no correlation
-                        // state to reset at the demuxer level.
-                        tracing::debug!(
-                            "ts_es_demuxer_consumer '{}': lagged {} packets",
-                            input_id, n
-                        );
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
-        }
+        },
+    );
+    // Bridge to the existing `JoinHandle<()>` shape via a tokio
+    // spawn_blocking that joins the OS thread. Same pattern as the
+    // assembler's join bridge — see ts_assembler::spawn_spts_assembler.
+    tokio::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = thread_handle.join();
+        }).await;
     })
 }
 
@@ -4771,9 +4789,40 @@ fn build_master_clock(
 
     let (handle, pll_master) = match kind {
         MasterClockKind::SourcePcrPll => {
-            let inner = Arc::new(SourcePcrPllMaster::new(format!("source_pcr:{}", cfg.id)));
-            let h = MasterClockHandle::new(inner.clone(), MasterClockKind::SourcePcrPll);
-            (h, Some(inner))
+            let pll_inner = Arc::new(SourcePcrPllMaster::new(format!("source_pcr:{}", cfg.id)));
+            // Wrap in PcrPllWithFallback so the watcher task can flip to
+            // wallclock if the PLL never locks. The wrapper owns both
+            // clocks behind a single `MasterClock` impl; `now_27mhz()`
+            // dispatches based on an internal atomic flag.
+            let wrapper = Arc::new(
+                crate::engine::master_clock::PcrPllWithFallback::new(pll_inner.clone()),
+            );
+            // Spawn the fallback watcher unless the operator opted out
+            // by setting `pll_lock_timeout_s: 0`. Default 30 s.
+            let timeout_s = cfg
+                .master_clock
+                .as_ref()
+                .and_then(|m| m.pll_lock_timeout_s)
+                .unwrap_or(30);
+            // FlowConfig carries `input_ids` (references), not resolved
+            // input definitions — pick the first as the event's
+            // `input_id`. Empty input_ids → placeholder so the event
+            // payload stays well-formed.
+            let active_input_id = cfg
+                .input_ids
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "<no-input>".to_string());
+            crate::engine::master_clock::spawn_pll_fallback_watcher(
+                wrapper.clone(),
+                cfg.id.clone(),
+                active_input_id,
+                timeout_s,
+                event_sender.clone(),
+                cancel_token.child_token(),
+            );
+            let h = MasterClockHandle::new(wrapper, MasterClockKind::SourcePcrPll);
+            (h, Some(pll_inner))
         }
         MasterClockKind::Ptp => {
             // Phase 6: spawn a PTP reporter for this flow's clock_domain

@@ -30,28 +30,47 @@ use crate::engine::ts_parse::{
 /// Spawn the ingress PCR sampler. Returns the join handle so the
 /// FlowRuntime can hold ownership for the flow's lifetime; shutdown is
 /// driven by `cancel`.
+///
+/// Stage 3 of the data-plane redesign: runs on a dedicated SCHED_FIFO
+/// OS thread with its own `tokio::current_thread` runtime, lifting it
+/// off the main worker pool. PLL accuracy depends on the wall-time
+/// deltas between consecutive PCR samples being measured precisely;
+/// any Tokio scheduling latency between `broadcast::recv` and the
+/// `sample_packet` call delays PLL catch-up, and under heavy main-
+/// runtime contention the PI loop spends longer than the locked p99
+/// jitter target. CPU pinning honoured via `BILBYCAST_PLL_CPUS`.
 pub fn spawn_pcr_ingress_sampler(
     master: Arc<SourcePcrPllMaster>,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                msg = rx.recv() => {
-                    match msg {
-                        Ok(pkt) => sample_packet(&master, &pkt),
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            // Passive observer: resync silently.
-                            continue;
+    let thread_handle = crate::engine::dedicated_runtime::spawn_dedicated(
+        crate::engine::dedicated_runtime::DedicatedRuntimeConfig::new(
+            "pcr-pll",
+            "BILBYCAST_PLL_CPUS",
+        ),
+        async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    msg = rx.recv() => {
+                        match msg {
+                            Ok(pkt) => sample_packet(&master, &pkt),
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
                         }
-                        Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
             }
-        }
+        },
+    );
+    // Bridge to JoinHandle<()> shape via spawn_blocking-on-join, same
+    // pattern as the assembler + demuxer in Stage 2.
+    tokio::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = thread_handle.join();
+        }).await;
     })
 }
 

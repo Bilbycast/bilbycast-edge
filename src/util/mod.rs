@@ -14,6 +14,7 @@
 pub mod network_interfaces;
 pub mod port_error;
 pub mod rtp_parse;
+pub mod runtime_diag;
 pub mod socket;
 pub mod time;
 pub mod tls;

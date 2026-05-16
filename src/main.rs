@@ -172,6 +172,54 @@ async fn main() -> anyhow::Result<()> {
         env!("CARGO_PKG_VERSION")
     );
 
+    // Capture RLIMIT_RTPRIO so HealthPayload.scheduling_status can show
+    // the effective ceiling. Determines whether SCHED_FIFO at priority
+    // 50 (wire-emit) will be granted by the kernel without CAP_SYS_NICE.
+    let rtprio_max = util::runtime_diag::capture_rlimit_rtprio();
+    tracing::debug!("RLIMIT_RTPRIO max = {rtprio_max} (SCHED_FIFO priority ceiling)");
+
+    // Optional: lock all current + future pages into RAM via mlockall(2)
+    // to eliminate major-page-fault stalls on the data-plane hot path.
+    // Opt-in via BILBYCAST_MLOCKALL=1 — off by default because hosts
+    // without LimitMEMLOCK=infinity (development / testbed / manual
+    // installs) would see mlockall fail noisily. The systemd unit at
+    // packaging/bilbycast-edge.service ships with LimitMEMLOCK=infinity,
+    // so production deployments via the installer get the safe default.
+    // Outcome is recorded for HealthPayload.scheduling_status.
+    if std::env::var("BILBYCAST_MLOCKALL").as_deref() == Ok("1") {
+        let status = util::runtime_diag::try_mlockall_at_startup();
+        match status {
+            util::runtime_diag::MlockallStatus::Locked => {
+                tracing::info!(
+                    "mlockall(MCL_CURRENT | MCL_FUTURE): success — all current + future \
+                     pages locked; hot path is now immune to major page faults"
+                );
+            }
+            util::runtime_diag::MlockallStatus::Failed { errno } => {
+                let hint = match errno {
+                    libc::EPERM => " (process lacks CAP_IPC_LOCK and RLIMIT_MEMLOCK is too low; \
+                                    set LimitMEMLOCK=infinity in the systemd unit or grant \
+                                    CAP_IPC_LOCK)",
+                    libc::ENOMEM => " (the calling process's RLIMIT_MEMLOCK is exceeded; raise \
+                                     LimitMEMLOCK)",
+                    _ => "",
+                };
+                tracing::warn!(
+                    "mlockall(MCL_CURRENT | MCL_FUTURE) failed: errno={errno}{hint} — \
+                     hot path remains vulnerable to major page faults; broadcast quality \
+                     may degrade under memory pressure"
+                );
+            }
+            util::runtime_diag::MlockallStatus::Disabled => {}
+        }
+    } else {
+        util::runtime_diag::note_mlockall_disabled();
+        tracing::debug!(
+            "mlockall not requested (set BILBYCAST_MLOCKALL=1 to enable; recommended for \
+             production deployments)"
+        );
+    }
+
     // Derive secrets file path (same directory as config, named "secrets.json")
     let secrets_path = cli.config.with_file_name("secrets.json");
 

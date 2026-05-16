@@ -54,9 +54,17 @@ use tokio::sync::broadcast;
 use super::packet::RtpPacket;
 use super::ts_parse::*;
 
-/// Bus capacity per PID. Matches the flow-level broadcast default so a
-/// well-paced consumer stays well within budget; a lagging one drops.
-pub const BUS_CHANNEL_CAPACITY: usize = 2048;
+/// Bus capacity per PID. Sized to match `BROADCAST_CHANNEL_CAPACITY`
+/// (8192) so the per-PID bus offers the same per-subscriber buffer
+/// envelope as the flow-level fan-out. At a few hundred Mbps total
+/// compressed input (the typical edge workload), a single video PID
+/// carrying ~90 % of the bitrate runs at ~40 kpps; 8192 slots ≈ 200 ms
+/// of buffer — enough for input switches, PMT updates, and 2022-7
+/// dual-leg merge transients without lagging consumers losing data.
+/// Memory cost: ~60 B per slot × 8192 ≈ 480 KB per PID, ~8 MB across
+/// a 16-PID input bus. A well-paced consumer stays well within
+/// budget; a lagging one drops via `RecvError::Lagged`.
+pub const BUS_CHANNEL_CAPACITY: usize = 8192;
 
 /// A single elementary-stream packet on the bus.
 ///

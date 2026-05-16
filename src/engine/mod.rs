@@ -146,6 +146,39 @@ pub mod wire_emit;
 /// "Phase 2" section. Linux-only — public surface compiles on other
 /// platforms but every operation returns `Unsupported`.
 pub mod wire_emit_txtime;
+
+/// Dedicated OS-thread runtime for codec work (video / audio encoders,
+/// decoders, transcoders). Moves heavy CPU work off Tokio's worker
+/// pool — eliminates `tokio::task::block_in_place` work-stealing churn
+/// that would otherwise leak scheduling jitter into the PCR PLL,
+/// master-clock sampler, and wire-tx producer paths. SCHED_FIFO 40 +
+/// optional CPU pinning via `BILBYCAST_CODEC_CPUS`. See
+/// [`docs/production-tuning.md`](../../docs/production-tuning.md).
+pub mod codec_thread;
+
+/// Channel-based wrapper that drives the transcoding chain
+/// (`TsAudioReplacer` + `TsVideoReplacer`) on a dedicated
+/// `codec_thread`. Replaces the inline `tokio::task::block_in_place`
+/// pattern at every transcoded output (output_udp / output_rtp /
+/// output_srt / output_rist). See module docs for the rationale.
+pub mod transcode_chain;
+
+/// Per-task dedicated `tokio::current_thread` runtime on an OS thread
+/// with `SCHED_FIFO` + optional CPU pinning. Stages 2 and 3 use this
+/// to lift the PID-bus demuxer + assembler (Stage 2) and the PCR PLL
+/// sampler (Stage 3) off the main Tokio worker pool without rewriting
+/// either as raw synchronous OS-thread code.
+pub mod dedicated_runtime;
+
+/// Per-input ingress smoothing buffer — opt-in, off by default.
+/// Holds packets in a FIFO and releases at `recv_time_us +
+/// smoothing_ms` so all downstream consumers (content analysis,
+/// thumbnails, replay, PID bus, PCR PLL, outputs) see a
+/// jitter-smoothed stream regardless of network arrival variance.
+/// Most valuable on raw UDP/RTP inputs that lack protocol-level
+/// jitter handling.
+pub mod ingress_smoothing;
+
 #[cfg(feature = "media-codecs")]
 pub mod video_encode_util;
 

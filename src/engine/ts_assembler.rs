@@ -352,8 +352,37 @@ pub fn spawn_spts_assembler(
     // small bounded buffer is plenty and keeps back-pressure observable
     // if a pathological caller floods.
     let (plan_tx, plan_rx) = mpsc::channel::<PlanCommand>(16);
+    // Spawn on a dedicated SCHED_FIFO OS thread with its own
+    // tokio::current_thread runtime. Lifts the assembler off the main
+    // runtime's worker pool, so Tokio scheduling latency in other
+    // tasks doesn't leak into PAT/PMT version cadence, slot fan-in,
+    // or PCR-bearing-packet emission timing. CPU pinning honoured via
+    // `BILBYCAST_PID_BUS_CPUS`.
+    let who = if flow_id.is_empty() {
+        "assembler".to_string()
+    } else {
+        format!("assembler-{flow_id}")
+    };
+    let thread_handle = crate::engine::dedicated_runtime::spawn_dedicated(
+        crate::engine::dedicated_runtime::DedicatedRuntimeConfig::new(who, "BILBYCAST_PID_BUS_CPUS"),
+        async move {
+            run_assembler(plan, bus, broadcast_tx, cancel, plan_rx, event_sender, flow_id).await;
+        },
+    );
+    // The original `AssemblerHandle.join` is a `tokio::task::JoinHandle<()>`.
+    // Tests + lifecycle callers `.await` it. We need to preserve that
+    // shape, so wrap the OS-thread JoinHandle in a small bridge: a
+    // tokio task that blocks-in-place on the OS thread join. This
+    // bridge task runs on the main runtime (cheap — just a join wait),
+    // but the actual assembler work happens on the dedicated thread.
     let join = tokio::spawn(async move {
-        run_assembler(plan, bus, broadcast_tx, cancel, plan_rx, event_sender, flow_id).await;
+        // `tokio::task::spawn_blocking` is the right primitive here:
+        // `JoinHandle::join` is a blocking syscall (`pthread_join`).
+        // We don't await the spawn_blocking handle's result because
+        // the underlying future returned () already.
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = thread_handle.join();
+        }).await;
     });
     AssemblerHandle { join, plan_tx }
 }

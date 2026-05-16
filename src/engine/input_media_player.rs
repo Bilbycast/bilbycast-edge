@@ -1571,7 +1571,7 @@ fn run_paced_emitter(
     initial_bitrate_bps: u64,
     cancel: tokio_util::sync::CancellationToken,
 ) {
-    let sched_fifo = crate::engine::wire_emit::apply_realtime_priority(&thread_name);
+    let sched_fifo = crate::util::runtime_diag::apply_sched_fifo(&thread_name, 50);
     let mut bitrate_bps: u64 = initial_bitrate_bps.max(1);
     let mut bytes_emitted: u64 = 0;
     // Incremental target tracking — each bundle's target is the previous

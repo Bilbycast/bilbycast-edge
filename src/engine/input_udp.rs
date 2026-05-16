@@ -16,7 +16,7 @@ use crate::util::socket::bind_udp_input;
 use crate::util::time::now_us;
 
 use super::input_post_process::{InputPostProcess, InputPostProcessConfig};
-use super::input_transcode::{publish_input_packet_with_post, InputTranscoder};
+use super::input_transcode::InputTranscoder;
 use super::packet::{MAX_RTP_PACKET_SIZE, RtpPacket};
 
 /// TS packet size used for synthetic timestamp calculation.
@@ -81,7 +81,18 @@ pub fn spawn_udp_input(
                 config.pid_map.is_some(),
             );
         }
-        if let Err(e) = udp_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await {
+        // Per-input ingress smoothing publisher. When
+        // `ingress_smoothing_ms` is unset / 0, the publisher is a
+        // zero-overhead pass-through to broadcast_tx. Otherwise it
+        // spawns a drainer task that releases packets at
+        // recv_time_us + smoothing_ms.
+        let publisher = crate::engine::ingress_smoothing::IngressPublisher::new(
+            config.ingress_smoothing_ms,
+            broadcast_tx,
+            &input_id,
+            cancel.clone(),
+        );
+        if let Err(e) = udp_input_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await {
             tracing::error!("UDP input task exited with error: {e}");
             event_sender.emit_flow(EventSeverity::Critical, category::FLOW, format!("Flow input lost: {e}"), &flow_id);
         }
@@ -90,7 +101,7 @@ pub fn spawn_udp_input(
 
 async fn udp_input_loop(
     config: UdpInputConfig,
-    broadcast_tx: broadcast::Sender<RtpPacket>,
+    publisher: crate::engine::ingress_smoothing::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
@@ -172,7 +183,9 @@ async fn udp_input_loop(
                             upstream_leg_id: None,
                         };
 
-                        publish_input_packet_with_post(transcoder, post, &broadcast_tx, packet);
+                        crate::engine::input_transcode::publish_input_packet_smoothed(
+                            transcoder, post, &publisher, packet,
+                        );
                     }
                     Err(e) => {
                         tracing::warn!("UDP input recv error: {e}");

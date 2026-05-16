@@ -97,28 +97,65 @@ For PCR-anchored datagrams:
 
 ## Operator-side ETF qdisc
 
-For tier-1 PCR_AC (broadcast-grade, T-STD ≤ 500 ns), install ETF qdisc on the egress NIC. The edge does not install qdiscs (qdisc setup needs `CAP_NET_ADMIN`, deliberately operator-side):
+For tier-1 PCR_AC (broadcast-grade, T-STD ≤ 500 ns), install ETF qdisc on the egress NIC. The edge does not install qdiscs (qdisc setup needs `CAP_NET_ADMIN` at install time, deliberately operator-side):
 
 ```bash
 sudo bash packaging/setup-etf-qdisc.sh enp1s0    # name your egress NIC
 ```
 
-PTP prerequisite for tier-1: `ptp4l + phc2sys` running, system TAI clock disciplined to a grandmaster. Without PTP the system TAI is just wall + leap, which is fine for compressed-TS pacing (CLOCK_MONOTONIC anchor) but not for ST 2110-21 narrow-profile receiver compliance.
+The script installs `mqprio` + `etf` with `clockid CLOCK_TAI`, `offload`, and `skip_sock_check` set. The `skip_sock_check` flag is non-negotiable on this priomap (`0 0 0 0 1 1 1 1 …`): socket-priority 0 — the kernel default for ARP, DHCP, ssh, ping, and every UDP socket the edge opens — routes to the ETF-bearing class 100:1. Without `skip_sock_check`, ETF refuses any packet whose socket lacks SO_TXTIME and drops it at the qdisc, so ARP can't resolve the next-hop MAC and every `sendmsg` to that interface returns ENETUNREACH. With `skip_sock_check`, non-SO_TXTIME packets fall through to FIFO release (they leave the box but without a hardware-scheduled launch instant); SO_TXTIME packets still get scheduled.
+
+PTP prerequisite for tier-1: `ptp4l + phc2sys` running, system TAI clock disciplined to a grandmaster. **The NIC PHC must be in TAI domain**, not UTC — i.e. `phc2sys` should run with `-O 37` (current TAI–UTC offset, January 2026) or, equivalently, sync FROM the system's `CLOCK_TAI` rather than `CLOCK_REALTIME`. If `phc2sys -O 0` is used (PHC tracks UTC), kernel `CLOCK_TAI` ends up 37 s ahead of the PHC, every offload-mode launch time lands outside the NIC's launch horizon (1–4 s on Intel i225/i226, similar on others), and the NIC silently rejects every packet. Symptom: `tc -s qdisc show dev <NIC>` reports 100 % drops on the etf class with zero packets sent, identical to the missing-`skip_sock_check` symptom; distinguish the two by `getcap` on the edge binary + by reading `phc2sys -O` from the running process line.
 
 Without ETF qdisc the SO_TXTIME path silently degrades to no-op pacing (same observable behaviour as today's unpaced path). The edge does NOT probe ETF presence (querying qdiscs needs CAP_NET_ADMIN); operators verify with:
 
 ```bash
-tc -s qdisc show dev enp1s0    # look for "etf" in the output
+tc -s qdisc show dev enp1s0    # look for "etf" in the output, and zero drops once traffic flows
 ```
+
+## CAP_NET_ADMIN grant (kernel ≥ 6.x)
+
+Mainline kernel ≥ 6.x — and every recent Ubuntu / RHEL / Debian backport — requires **`CAP_NET_ADMIN`** for `setsockopt(SO_TXTIME)` with any non-`CLOCK_MONOTONIC` clockid. Wire pacing uses `CLOCK_TAI` (the only clockid the ETF qdisc on Intel ice / igc / igb and Mellanox mlx5 will accept, and the natural choice when ptp4l + phc2sys are running). Without the cap, the setsockopt returns `EPERM`, `engine::wire_emit` falls back to the `clock_nanosleep` tier — and on any host that also runs the ETF qdisc above, fallback-tier packets get dropped at the qdisc because they're not SO_TXTIME-bearing (see the `skip_sock_check` note above).
+
+Production via the systemd unit `packaging/bilbycast-edge.service` ships with:
+
+```
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+```
+
+Dev / testbed via `cargo run` or a direct release-binary invocation:
+
+```bash
+sudo setcap cap_net_admin+ep target/release/bilbycast-edge      # or target-full/
+# or run as root
+```
+
+Verify:
+
+```bash
+getcap target/release/bilbycast-edge
+# expected: target/release/bilbycast-edge cap_net_admin=ep
+```
+
+Then on edge start, the log line:
+
+```
+wire-emit '<id>': starting (anchor=Pcr, tier=so_txtime)
+```
+
+`tier=so_txtime` confirms the SO_TXTIME path. `tier=clock_nanosleep` means setsockopt failed — a `wire-emit: SO_TXTIME(clockid=11) setsockopt failed: Operation not permitted (kernel requires CAP_NET_ADMIN for non-CLOCK_MONOTONIC SO_TXTIME on this kernel; grant via systemd 'AmbientCapabilities=CAP_NET_ADMIN' or 'setcap cap_net_admin+ep <binary>') — falling back to clock_nanosleep tier` warning is emitted at the same time.
 
 ## SCHED_FIFO grant
 
-The wire-emit thread requests `SCHED_FIFO` priority 50 best-effort. Production via the systemd unit `packaging/bilbycast-edge.service` (`LimitRTPRIO=50`, `RestrictRealtime=false`) — no capability grant required, kernel allows unprivileged `SCHED_FIFO` whenever `RTPRIO` is non-zero. Dev via `cargo run` needs:
+The wire-emit thread requests `SCHED_FIFO` priority 50 best-effort. Production via the systemd unit `packaging/bilbycast-edge.service` (`LimitRTPRIO=50`, `RestrictRealtime=false`) — no separate capability grant required for this, kernel allows unprivileged `SCHED_FIFO` whenever `RTPRIO` is non-zero. Dev via `cargo run` needs:
 
 ```bash
-sudo setcap cap_sys_nice+ep target/debug/bilbycast-edge
+sudo setcap cap_sys_nice,cap_net_admin+ep target/debug/bilbycast-edge
 # or run as root
 ```
+
+(Combine with the `CAP_NET_ADMIN` grant above — `setcap` overwrites the capability set on each call, so list both in one invocation.)
 
 Verify:
 

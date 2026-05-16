@@ -584,6 +584,8 @@ pub mod category {
     pub const RTP: &str = "rtp";
     /// UDP input bind and lifecycle events.
     pub const UDP: &str = "udp";
+    /// Master clock lifecycle (PLL fallback, PTP lock, ALSA master ready).
+    pub const MASTER_CLOCK: &str = "master_clock";
     /// Video transcoding lifecycle (TsVideoReplacer start / fail).
     pub const VIDEO_ENCODE: &str = "video_encode";
     /// Media-aware bonding lifecycle (bond socket bind, path failover,

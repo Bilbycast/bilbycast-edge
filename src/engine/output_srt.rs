@@ -28,11 +28,9 @@ use super::audio_302m::{S302mOutputPipeline, SRT_TS_DATAGRAM_BYTES};
 use super::audio_transcode::InputFormat;
 use super::delay_buffer::resolve_output_delay;
 use super::packet::RtpPacket;
-use super::ts_audio_replace::TsAudioReplacer;
 use super::ts_pid_overrides_rewriter::TsPidOverridesRewriter;
 use super::ts_pid_remapper::TsPidRemapper;
 use super::ts_program_filter::TsProgramFilter;
-use super::ts_video_replace::TsVideoReplacer;
 
 /// Maximum SRT live-mode payload bytes per `srt_sendmsg` call.
 ///
@@ -293,15 +291,14 @@ async fn srt_output_listener_loop(
     });
     let mut pid_remapper = build_pid_remapper(config);
     let mut pid_overrides_rewriter = build_pid_overrides_rewriter(config);
-    let mut audio_replacer = build_audio_replacer(config, events, &stats);
-    let mut video_replacer = build_video_replacer(config, &stats, events, av_sync_pacer.as_ref());
+    let mut transcode_chain =
+        build_transcode_chain_for_srt(config, events, &stats, av_sync_pacer.as_ref());
     let mut null_padder = config
         .cbr_pad_to_kbps
         .map(crate::engine::ts_null_padder::TsNullPadder::new);
     spawn_replacer_switch_watcher(
         &config.id,
-        audio_replacer.as_ref(),
-        video_replacer.as_ref(),
+        transcode_chain.as_ref(),
         active_input_rx,
         cancel.clone(),
     );
@@ -409,7 +406,7 @@ async fn srt_output_listener_loop(
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
 
         let sink = SrtSendSink::Socket(socket.clone());
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut audio_replacer, &mut video_replacer, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut transcode_chain, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -464,15 +461,14 @@ async fn srt_output_caller_loop(
     });
     let mut pid_remapper = build_pid_remapper(config);
     let mut pid_overrides_rewriter = build_pid_overrides_rewriter(config);
-    let mut audio_replacer = build_audio_replacer(config, events, &stats);
-    let mut video_replacer = build_video_replacer(config, &stats, events, av_sync_pacer.as_ref());
+    let mut transcode_chain =
+        build_transcode_chain_for_srt(config, events, &stats, av_sync_pacer.as_ref());
     let mut null_padder = config
         .cbr_pad_to_kbps
         .map(crate::engine::ts_null_padder::TsNullPadder::new);
     spawn_replacer_switch_watcher(
         &config.id,
-        audio_replacer.as_ref(),
-        video_replacer.as_ref(),
+        transcode_chain.as_ref(),
         active_input_rx,
         cancel.clone(),
     );
@@ -526,7 +522,7 @@ async fn srt_output_caller_loop(
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
 
         let sink = SrtSendSink::Socket(socket.clone());
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut audio_replacer, &mut video_replacer, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut transcode_chain, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -605,22 +601,23 @@ fn build_pid_overrides_rewriter(config: &SrtOutputConfig) -> Option<TsPidOverrid
     }
 }
 
-/// Spawn the input-switch watcher for this SRT output's replacers. See
-/// `engine::input_switch_watcher` for the rationale. Skips spawning
-/// when neither replacer is present (passthrough output).
+/// Spawn the input-switch watcher for this SRT output's transcode
+/// chain. See `engine::input_switch_watcher` for the rationale.
+/// Skips spawning when there is no chain (passthrough output).
 fn spawn_replacer_switch_watcher(
     output_id: &str,
-    audio_replacer: Option<&TsAudioReplacer>,
-    video_replacer: Option<&TsVideoReplacer>,
+    chain: Option<&crate::engine::transcode_chain::TranscodeChain>,
     active_input_rx: tokio::sync::watch::Receiver<String>,
     cancel: CancellationToken,
 ) {
     let mut handles: Vec<Arc<std::sync::atomic::AtomicBool>> = Vec::new();
-    if let Some(r) = audio_replacer {
-        handles.push(r.external_reset_handle());
-    }
-    if let Some(r) = video_replacer {
-        handles.push(r.external_reset_handle());
+    if let Some(c) = chain {
+        if let Some(h) = c.audio_external_reset_handle() {
+            handles.push(h);
+        }
+        if let Some(h) = c.video_external_reset_handle() {
+            handles.push(h);
+        }
     }
     crate::engine::input_switch_watcher::spawn(
         output_id.to_string(),
@@ -630,121 +627,74 @@ fn spawn_replacer_switch_watcher(
     );
 }
 
-/// Resolve an `audio_encode` config into a [`TsAudioReplacer`]. Logs and
-/// returns `None` when the codec isn't supported by this build.
-fn build_audio_replacer(
+/// Resolve `audio_encode` + `video_encode` configs into a
+/// [`crate::engine::transcode_chain::TranscodeChain`]. Returns `None`
+/// when neither is configured. Logs + emits manager events on partial
+/// failure (one replacer rejected) so the SRT output behaviour matches
+/// the pre-Stage-1 build_audio_replacer / build_video_replacer pair.
+fn build_transcode_chain_for_srt(
     config: &SrtOutputConfig,
     events: &EventSender,
     stats: &Arc<OutputStatsAccumulator>,
-) -> Option<TsAudioReplacer> {
-    let enc = config.audio_encode.as_ref()?;
-    match TsAudioReplacer::new(enc, config.transcode.clone()) {
-        Ok(r) => {
-            tracing::info!(
-                "SRT output '{}': audio_encode active ({})",
-                config.id,
-                r.target_description()
-            );
-            events.emit_output_with_details(
-                EventSeverity::Info,
-                category::AUDIO_ENCODE,
-                format!("TS audio encoder started: output '{}'", config.id),
-                &config.id,
-                serde_json::json!({ "codec": enc.codec }),
-            );
-            stats.set_audio_replacer_stats(r.stats_handle());
-            stats.set_decode_stats(
-                r.decode_stats_handle(),
-                "",
-                0, 0,
-            );
-            let r = r.with_output_stats(Arc::clone(&stats));
-            Some(r)
-        }
-        Err(e) => {
-            tracing::error!(
-                "SRT output '{}': audio_encode rejected: {e}; audio will be left untouched",
-                config.id
-            );
-            events.emit_output_with_details(
-                EventSeverity::Critical,
-                category::AUDIO_ENCODE,
-                format!("TS audio encoder failed: output '{}': {e}", config.id),
-                &config.id,
-                serde_json::json!({ "error": e.to_string() }),
-            );
-            None
-        }
-    }
-}
-
-/// Resolve the `video_encode` config into a [`TsVideoReplacer`] and register
-/// its atomic stats handle on the output's accumulator. The descriptors
-/// (codec / width / height / fps / bitrate) come from the config — the actual
-/// runtime values may differ on first-frame discovery (see
-/// [`TsVideoReplacer`] MVP scope).
-fn build_video_replacer(
-    config: &SrtOutputConfig,
-    stats: &OutputStatsAccumulator,
-    events: &EventSender,
     av_sync_pacer: Option<&Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
-) -> Option<TsVideoReplacer> {
-    let enc = config.video_encode.as_ref()?;
-    match TsVideoReplacer::new(enc, None) {
-        Ok(mut r) => {
-            if let Some(p) = av_sync_pacer {
-                r.set_av_sync_pacer(p.clone());
+) -> Option<crate::engine::transcode_chain::TranscodeChain> {
+    match crate::engine::transcode_chain::build_for_output(
+        &config.id,
+        config.audio_encode.as_ref(),
+        config.video_encode.as_ref(),
+        config.transcode.clone(),
+        stats,
+        av_sync_pacer,
+    ) {
+        Ok(chain) => {
+            if let Some(ref c) = chain {
+                tracing::info!(
+                    "SRT output '{}': transcode chain active ({})",
+                    config.id,
+                    c.target_description()
+                );
+                if config.audio_encode.is_some() {
+                    events.emit_output_with_details(
+                        EventSeverity::Info,
+                        category::AUDIO_ENCODE,
+                        format!("TS audio encoder started: output '{}'", config.id),
+                        &config.id,
+                        serde_json::json!({
+                            "codec": config.audio_encode.as_ref().map(|e| &e.codec)
+                        }),
+                    );
+                }
+                if config.video_encode.is_some() {
+                    events.emit_output_with_details(
+                        EventSeverity::Info,
+                        category::VIDEO_ENCODE,
+                        format!("Video encoder started: output '{}'", config.id),
+                        &config.id,
+                        serde_json::json!({
+                            "codec": config.video_encode.as_ref().map(|e| &e.codec)
+                        }),
+                    );
+                }
             }
-            let backend = match enc.codec.as_str() {
-                "x264" | "x265" => enc.codec.clone(),
-                "h264_nvenc" | "hevc_nvenc" => "nvenc".to_string(),
-                other => other.to_string(),
-            };
-            let target_codec = match enc.codec.as_str() {
-                "x264" | "h264_nvenc" => "h264",
-                "x265" | "hevc_nvenc" => "hevc",
-                other => other,
-            };
-            stats.set_video_encode_stats(
-                r.stats_handle(),
-                String::new(),
-                target_codec.to_string(),
-                enc.width.unwrap_or(0),
-                enc.height.unwrap_or(0),
-                match (enc.fps_num, enc.fps_den) {
-                    (Some(n), Some(d)) if d > 0 => n as f32 / d as f32,
-                    _ => 0.0,
-                },
-                enc.bitrate_kbps.unwrap_or(0),
-                backend,
-            );
-            stats.set_video_decode_stats(
-                r.decode_stats_handle(),
-                "", 0, 0, 0.0,
-            );
-            tracing::info!(
-                "SRT output '{}': video_encode active ({})",
-                config.id,
-                r.target_description()
-            );
-            events.emit_output_with_details(
-                EventSeverity::Info,
-                category::VIDEO_ENCODE,
-                format!("Video encoder started: output '{}'", config.id),
-                &config.id,
-                serde_json::json!({ "codec": enc.codec }),
-            );
-            Some(r)
+            chain
         }
         Err(e) => {
             tracing::error!(
-                "SRT output '{}': video_encode rejected: {e}; video will be left untouched",
+                "SRT output '{}': transcode chain rejected: {e}; transcoding disabled",
                 config.id
             );
+            let (cat, label) = match e {
+                crate::engine::transcode_chain::TranscodeChainError::Audio(_) => {
+                    (category::AUDIO_ENCODE, "TS audio encoder")
+                }
+                crate::engine::transcode_chain::TranscodeChainError::Video(_) => {
+                    (category::VIDEO_ENCODE, "Video encoder")
+                }
+            };
             events.emit_output_with_details(
                 EventSeverity::Critical,
-                category::VIDEO_ENCODE,
-                format!("Video encoder failed: output '{}': {e}", config.id),
+                cat,
+                format!("{label} failed: output '{}': {e}", config.id),
                 &config.id,
                 serde_json::json!({ "error": e.to_string() }),
             );
@@ -763,8 +713,7 @@ async fn srt_output_forward_loop(
     program_filter: &mut Option<TsProgramFilter>,
     pid_remapper: &mut Option<TsPidRemapper>,
     pid_overrides_rewriter: &mut Option<TsPidOverridesRewriter>,
-    audio_replacer: &mut Option<TsAudioReplacer>,
-    video_replacer: &mut Option<TsVideoReplacer>,
+    transcode_chain: &mut Option<crate::engine::transcode_chain::TranscodeChain>,
     null_padder: &mut Option<crate::engine::ts_null_padder::TsNullPadder>,
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
@@ -1009,13 +958,16 @@ async fn srt_output_forward_loop(
                             packet.data
                         };
 
-                        // Apply audio ES replacement + video ES replacement
-                        // if configured. Each replacer owns its own TS state
-                        // and only touches its own elementary stream, so
-                        // stacking them is safe. Validation guarantees these
-                        // are not combined with redundancy, FEC, or 302M.
-                        let need_strip = audio_replacer.is_some() || video_replacer.is_some();
-                        let payload = if need_strip {
+                        // Hand to the transcode chain (codec thread) if
+                        // configured, otherwise pass through to the
+                        // downstream pipeline (CBR padder, PID rewrites,
+                        // sink). The chain runs encoders off the Tokio
+                        // runtime so heavy encode bursts don't leak
+                        // scheduling jitter to other tasks; output
+                        // arrives asynchronously and we drain it inline
+                        // here.
+                        let need_strip = transcode_chain.is_some();
+                        let payload = if let Some(chain) = transcode_chain.as_ref() {
                             const RTP_HEADER_MIN: usize = 12;
                             let ts_in: &[u8] = if packet.is_raw_ts {
                                 &payload[..]
@@ -1024,47 +976,28 @@ async fn srt_output_forward_loop(
                             } else {
                                 continue;
                             };
-
-                            let mut a_out: Vec<u8> = Vec::new();
-                            let after_audio: &[u8] =
-                                if let Some(replacer) = audio_replacer.as_mut() {
-                                    crate::timed_block_in_place!(
-                                        "output_srt.audio_replacer",
-                                        crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
-                                        {
-                                            replacer.process(ts_in, &mut a_out);
-                                        }
-                                    );
-                                    &a_out
-                                } else {
-                                    ts_in
-                                };
-
-                            let mut v_out: Vec<u8> = Vec::new();
-                            let after_video: &[u8] =
-                                if let Some(vreplacer) = video_replacer.as_mut() {
-                                    crate::timed_block_in_place!(
-                                        "output_srt.video_replacer",
-                                        crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
-                                        {
-                                            vreplacer.process(after_audio, &mut v_out);
-                                        }
-                                    );
-                                    &v_out
-                                } else {
-                                    after_audio
-                                };
-
-                            // Apply CBR null padding if configured.
+                            if chain.try_submit(Bytes::copy_from_slice(ts_in)).is_err() {
+                                stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            // Drain whatever the codec thread has produced
+                            // since last poll. If nothing's ready yet,
+                            // skip this iteration — encoded output will
+                            // come on a later iteration.
+                            let Some(transcoded) =
+                                transcode_chain.as_mut().and_then(|c| c.try_recv())
+                            else {
+                                continue;
+                            };
+                            // Apply CBR null padding to the transcoded
+                            // bytes, then forward.
                             let mut pad_out: Vec<u8> = Vec::new();
                             let final_bytes: &[u8] =
                                 if let Some(padder) = null_padder.as_mut() {
-                                    padder.process(after_video, &mut pad_out);
+                                    padder.process(&transcoded, &mut pad_out);
                                     &pad_out
                                 } else {
-                                    after_video
+                                    &transcoded
                                 };
-
                             if final_bytes.is_empty() {
                                 continue;
                             }
@@ -1820,15 +1753,14 @@ async fn srt_output_bonded_loop(
     });
     let mut pid_remapper = build_pid_remapper(config);
     let mut pid_overrides_rewriter = build_pid_overrides_rewriter(config);
-    let mut audio_replacer = build_audio_replacer(config, events, &stats);
-    let mut video_replacer = build_video_replacer(config, &stats, events, av_sync_pacer.as_ref());
+    let mut transcode_chain =
+        build_transcode_chain_for_srt(config, events, &stats, av_sync_pacer.as_ref());
     let mut null_padder = config
         .cbr_pad_to_kbps
         .map(crate::engine::ts_null_padder::TsNullPadder::new);
     spawn_replacer_switch_watcher(
         &config.id,
-        audio_replacer.as_ref(),
-        video_replacer.as_ref(),
+        transcode_chain.as_ref(),
         active_input_rx,
         cancel.clone(),
     );
@@ -1883,7 +1815,7 @@ async fn srt_output_bonded_loop(
                 let disconnected = srt_output_forward_loop(
                     config, &mut rx, &stats, &cancel, &sink,
                     &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter,
-                    &mut audio_replacer, &mut video_replacer,
+                    &mut transcode_chain,
                     &mut null_padder,
                     input_format, compressed_audio_input, frame_rate_rx.clone(),
                 )
@@ -1958,7 +1890,7 @@ async fn srt_output_bonded_loop(
                 let disconnected = srt_output_forward_loop(
                     config, &mut rx, &stats, &cancel, &sink,
                     &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter,
-                    &mut audio_replacer, &mut video_replacer,
+                    &mut transcode_chain,
                     &mut null_padder,
                     input_format, compressed_audio_input, frame_rate_rx.clone(),
                 )

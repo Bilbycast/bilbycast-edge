@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -122,6 +122,13 @@ pub struct OutputStatsAccumulator {
     /// the datagram because its target tx time landed in the past.
     /// Incremented from the wire thread on each errqueue drain.
     pub wire_pacing_late: AtomicU64,
+    /// CPU index the wire-emit thread is pinned to via
+    /// `pthread_setaffinity_np` (operator-configured via
+    /// `BILBYCAST_WIRE_EMIT_CPUS`). `-1` means not pinned (the kernel
+    /// scheduler may move it across cores). Surfaced on
+    /// `OutputStatsSnapshot` so the manager UI can show one row per
+    /// pacing thread with its core assignment.
+    pub wire_pacing_pinned_cpu: AtomicI32,
 }
 
 /// Registered handle to a per-output decode stage's counters plus the
@@ -651,6 +658,7 @@ impl OutputStatsAccumulator {
             pcr_trust: crate::stats::pcr_trust::PcrTrustSampler::new(),
             wire_pacing_tier: OnceLock::new(),
             wire_pacing_late: AtomicU64::new(0),
+            wire_pacing_pinned_cpu: AtomicI32::new(-1),
         }
     }
 
@@ -659,6 +667,20 @@ impl OutputStatsAccumulator {
     /// are no-ops (first wins).
     pub fn set_wire_pacing_tier(&self, tier: &'static str) {
         let _ = self.wire_pacing_tier.set(tier.to_string());
+    }
+
+    /// Record the CPU index the wire-emit thread was pinned to (or
+    /// `None` if the operator did not configure pinning, or pinning
+    /// failed). Called once at thread spawn by `engine::wire_emit`.
+    pub fn set_wire_pacing_pinned_cpu(&self, cpu: Option<u32>) {
+        // i32::MAX is unreachable as a real CPU index; use -1 sentinel
+        // for "not pinned" so snapshot consumers can distinguish from
+        // a real pinning to CPU 0.
+        let v = match cpu {
+            Some(c) => c as i32,
+            None => -1,
+        };
+        self.wire_pacing_pinned_cpu.store(v, Ordering::Relaxed);
     }
 
     /// Record one PCR observation at egress. Called inline by the output's
@@ -1126,6 +1148,10 @@ impl OutputStatsAccumulator {
             display_stats,
             wire_pacing_tier: self.wire_pacing_tier.get().cloned(),
             wire_pacing_late: self.wire_pacing_late.load(Ordering::Relaxed),
+            wire_pacing_pinned_cpu: {
+                let v = self.wire_pacing_pinned_cpu.load(Ordering::Relaxed);
+                if v < 0 { None } else { Some(v as u32) }
+            },
         }
     }
 }
@@ -2419,6 +2445,9 @@ impl FlowStatsAccumulator {
             rate_offset_ppm: telemetry.rate_offset_ppm,
             jitter_us: telemetry.jitter_us,
             lipsync_offset_90k: lipsync,
+            configured_kind: telemetry.configured_kind,
+            fallback_active: telemetry.fallback_active,
+            fallback_reason: telemetry.fallback_reason,
         };
         if let Ok(mut g) = self.master_clock_state.write() {
             *g = Some(stats);

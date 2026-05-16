@@ -489,6 +489,29 @@ pub fn publish_input_packet_with_post(
     }
 }
 
+/// Same as [`publish_input_packet_with_post`] but publishes through an
+/// [`super::ingress_smoothing::IngressPublisher`] instead of a raw
+/// `broadcast::Sender`. When the publisher is configured with
+/// `ingress_smoothing_ms > 0`, packets are queued in a per-input
+/// FIFO and released at their scheduled time; otherwise the publisher
+/// forwards immediately (zero-overhead pass-through).
+///
+/// Returns `true` when the packet reached the publisher (either
+/// directly or via the smoother's mpsc); `false` when the
+/// transcode+post pipeline filtered it out or the smoother's queue
+/// was full.
+pub fn publish_input_packet_smoothed(
+    transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<super::input_post_process::InputPostProcess>,
+    publisher: &super::ingress_smoothing::IngressPublisher,
+    packet: super::packet::RtpPacket,
+) -> bool {
+    match process_input_packet_with_post(transcoder, post, packet) {
+        Some(p) => publisher.send(p),
+        None => false,
+    }
+}
+
 /// Process a packet through optional transcode + post-process stages and
 /// return the resulting packet, without performing the final broadcast
 /// send. Splits [`publish_input_packet_with_post`] in two so a caller can

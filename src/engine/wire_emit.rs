@@ -132,12 +132,27 @@ const RECV_POLL: Duration = Duration::from_millis(50);
 /// non-blocking `recvmsg` call returning EAGAIN when empty).
 const SO_TXTIME_ERRQUEUE_DRAIN_EVERY: u64 = 1024;
 
-/// Channel capacity. 1024 datagrams ≈ 1.7 s of in-flight bytes at
-/// 6 Mbps. With closed-loop rate the channel should rarely fill — it
-/// was the symptom of the open-loop drift bug, not the root cause.
-/// At ST 2110 rates with SO_TXTIME the kernel takes packets at line
-/// rate, so userspace queue depth is irrelevant.
-pub const WIRE_CHANNEL_CAP: usize = 1024;
+/// Channel capacity. Bumped from 1024 → 8192 to absorb startup
+/// bursts that previously caused drop-on-full at the `wire_tx`
+/// boundary:
+///   - SRT input jitter-buffer dumps 1+ s of buffered media on
+///     connect (at 50 Mbps, ~4800 packets in one burst);
+///   - PCR PLL pre-lock, first-emit preroll, and 2022-7 dual-leg
+///     merge transients all push more than 1024 datagrams through
+///     before the wire pacer stabilises;
+///   - ST 2110-20 narrow-profile frame bursts approach ~5700
+///     packets per frame at 1080p50 (one frame in <1 ms followed
+///     by ~20 ms of pacing), and the higher cap covers a full
+///     frame plus the next being prepared.
+///
+/// 8192 datagrams ≈ 14 s in-flight at 6 Mbps TS / ~3.5 s at 25 Mbps
+/// / 30 ms at 3 Gbps ST 2110. Memory cost is ~400 KB of slot space
+/// per output socket (8192 × ~48 B); the heap behind each
+/// `Bytes::clone` is refcounted and only held while a slot is
+/// occupied. At ST 2110 rates with SO_TXTIME, the kernel takes
+/// packets at line rate so the queue stays nearly empty in steady
+/// state regardless — depth only matters during transients.
+pub const WIRE_CHANNEL_CAP: usize = 8192;
 
 // `MIN_BITRATE_BPS` was a clamp on the natural-paced
 // `wall + bytes/observed_rate` interpolation. Removed alongside the
@@ -175,6 +190,14 @@ pub struct WireDatagram {
     /// `St2110Raster` anchor. Ignored under `Pcr` anchor. `None` is
     /// "emit ASAP" under either anchor.
     pub target_tx_time_ns: Option<u64>,
+    /// Byte offset within `bytes` where the MPEG-TS payload starts.
+    /// Set to 0 for raw-TS callers (UDP); set to 12 for RTP-wrapped
+    /// callers so the `Pcr` anchor's PCR scan finds the `0x47` sync
+    /// bytes at correct strides. Without this offset, RTP datagrams
+    /// look like "between PCRs" forever and the wire pacer collapses
+    /// to producer cadence (no PCR-anchored re-pacing). For non-`Pcr`
+    /// anchors (`St2110Raster`) the field is ignored.
+    pub ts_offset: usize,
 }
 
 /// Internal: which release path the spawned thread will use.
@@ -235,16 +258,39 @@ pub fn spawn_wire_emitter(
     // upstream `St2110_21Pacer` work unchanged.
     let clockid = crate::engine::wire_emit_txtime::CLOCK_TAI;
 
-    // Operator escape hatch: when `BILBYCAST_FORCE_NANOSLEEP=1` is set, skip
-    // the SO_TXTIME probe entirely and fall back to the clock_nanosleep tier.
-    // Useful for diagnosing SO_TXTIME / ETF qdisc reordering during input
-    // switches (see /home/ms02/.claude/plans/bright-skipping-whisper.md
-    // step 1) and as a workaround on kernels where ETF behaves badly under
-    // PCR-discontinuity load.
-    let force_nanosleep = std::env::var("BILBYCAST_FORCE_NANOSLEEP")
+    // Releaser selection policy. **Default = clock_nanosleep**, *not* SO_TXTIME.
+    //
+    // Rationale (operator directive `feedback_no_etf_qdisc.md`): on every host
+    // that doesn't ship with an ETF qdisc + PTP grandmaster + HW-PTP NIC —
+    // i.e. essentially every production deployment today — the kernel
+    // accepts `SO_TXTIME(setsockopt)` but silently emits each packet *as
+    // soon as `sendmsg` is called* because there's no etf qdisc to honour
+    // the `SCM_TXTIME` cmsg. The wire-emit thread then runs in a tight
+    // producer-paced loop, propagating any burstiness from upstream
+    // (media-pacer, encoder, broadcast subscriber lag) straight through to
+    // the wire. Result: PCR_AC degrades to the source's burst envelope,
+    // even though `OutputStats.wire_pacing_tier` reports `so_txtime` and
+    // gives operators a false sense of broadcast-grade pacing.
+    //
+    // The `clock_nanosleep(CLOCK_TAI, TIMER_ABSTIME)` path actually paces in
+    // userspace using the closed-loop observed inter-PCR rate. On modern
+    // CPUs at SCHED_FIFO it consistently delivers ~50–500 µs p99 jitter,
+    // which sits comfortably in the broadcast tier-2 envelope and is
+    // sufficient for every real-world receiver short of T-STD-strict
+    // contribution decoders.
+    //
+    // SO_TXTIME stays available as an opt-in for the small minority of hosts
+    // that *do* have a properly-configured ETF qdisc (see
+    // `packaging/setup-etf-qdisc.sh`) plus PTP discipline. Set
+    // `BILBYCAST_ENABLE_SO_TXTIME=1` to take that path on those hosts.
+    //
+    // `BILBYCAST_FORCE_NANOSLEEP=1` is kept as a no-op alias for backwards
+    // compatibility (since clock_nanosleep is now the default it cannot
+    // "force" anything beyond the default behaviour).
+    let enable_so_txtime = std::env::var("BILBYCAST_ENABLE_SO_TXTIME")
         .map(|v| v == "1")
         .unwrap_or(false);
-    let releaser = if !force_nanosleep && try_enable_so_txtime(&socket, clockid) {
+    let releaser = if enable_so_txtime && try_enable_so_txtime(&socket, clockid) {
         Releaser::SoTxtime
     } else {
         Releaser::ClockNanosleep
@@ -253,17 +299,25 @@ pub fn spawn_wire_emitter(
     let (tx, rx) = sync_channel::<WireDatagram>(WIRE_CHANNEL_CAP);
     let thread_id = id.clone();
     let stats_for_thread = stats.clone();
+    // CPU pin index — round-robin across the operator-configured set so
+    // multiple wire-emit threads on the same edge spread across the
+    // dedicated cores instead of stacking onto one.
+    let cpu_index = next_wire_emit_cpu_index();
     std::thread::Builder::new()
         .name(format!("wire-emit-{}", id))
         .spawn(move || {
-            let sched_fifo = apply_realtime_priority(&thread_id);
-            let tier = tier_label(releaser, sched_fifo);
-            stats_for_thread.set_wire_pacing_tier(tier);
+            let who = format!("wire-emit '{}'", thread_id);
+            let sched_fifo = crate::util::runtime_diag::apply_sched_fifo(&who, 50);
+            let pinned_to = crate::util::runtime_diag::apply_cpu_pinning(&who, cpu_index);
+            stats_for_thread.set_wire_pacing_tier(tier_label(releaser, sched_fifo));
+            stats_for_thread.set_wire_pacing_pinned_cpu(pinned_to);
             tracing::info!(
-                "wire-emit '{}': starting (anchor={:?}, tier={})",
+                "wire-emit '{}': starting (anchor={:?}, tier={}, sched_fifo={}, pinned_cpu={:?})",
                 thread_id,
                 anchor,
-                tier
+                tier_label(releaser, sched_fifo),
+                sched_fifo,
+                pinned_to,
             );
             run_emitter(thread_id, socket, dest, anchor, releaser, stats_for_thread, cancel, rx);
         })
@@ -271,12 +325,65 @@ pub fn spawn_wire_emitter(
     tx
 }
 
+/// Round-robin next CPU from `BILBYCAST_WIRE_EMIT_CPUS`. Returns `None`
+/// when the env var is unset or empty, which leaves the wire-emit
+/// thread on the kernel's default placement.
+fn next_wire_emit_cpu_index() -> Option<usize> {
+    use std::sync::OnceLock;
+    use std::sync::atomic::AtomicUsize;
+    static SET: OnceLock<Vec<usize>> = OnceLock::new();
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let set =
+        SET.get_or_init(|| crate::util::runtime_diag::parse_cpu_set_env("BILBYCAST_WIRE_EMIT_CPUS"));
+    if set.is_empty() {
+        return None;
+    }
+    let i = COUNTER.fetch_add(1, Ordering::Relaxed) % set.len();
+    Some(set[i])
+}
+
 /// Best-effort SO_TXTIME enablement. Returns `true` only when the
 /// setsockopt actually succeeded — matches the existing
 /// `wire_emit_txtime::probe()` semantics but operates on the
 /// already-opened output socket.
+///
+/// Logs the EXACT errno on failure. The kernel ≥ 6.x in mainline (and
+/// every recent Ubuntu kernel that backports the same patch) rejects
+/// `SO_TXTIME` with non-`CLOCK_MONOTONIC` clockids unless the calling
+/// process has `CAP_NET_ADMIN` — `setsockopt` returns `EPERM` and the
+/// emitter silently falls back to the `clock_nanosleep` tier. Without
+/// this log line the only externally-visible symptom is the tier
+/// label on `OutputStats.wire_pacing_tier`; with it, the operator
+/// sees the cause and the remediation (grant the cap via systemd
+/// `AmbientCapabilities=CAP_NET_ADMIN`, `setcap cap_net_admin+ep`, or
+/// run as root) the moment the edge starts.
 fn try_enable_so_txtime(socket: &UdpSocket, clockid: i32) -> bool {
-    crate::engine::wire_emit_txtime::enable_so_txtime(socket, clockid).is_ok()
+    match crate::engine::wire_emit_txtime::enable_so_txtime(socket, clockid) {
+        Ok(()) => true,
+        Err(e) => {
+            // Distinguish "no permission" from "kernel doesn't know
+            // this clockid / option" — both surface as setsockopt
+            // failures but call for different operator action.
+            let hint = match e.raw_os_error() {
+                Some(libc::EPERM) => {
+                    " (kernel requires CAP_NET_ADMIN for non-CLOCK_MONOTONIC SO_TXTIME on this kernel; \
+                     grant via systemd `AmbientCapabilities=CAP_NET_ADMIN` or `setcap cap_net_admin+ep <binary>`)"
+                }
+                Some(libc::EINVAL) => {
+                    " (unknown clockid or invalid flags — check kernel ≥ 4.19 and iproute2)"
+                }
+                Some(libc::ENOPROTOOPT) => " (kernel built without SO_TXTIME — needs CONFIG_NET_SCH_ETF=y/m)",
+                _ => "",
+            };
+            tracing::warn!(
+                "wire-emit: SO_TXTIME(clockid={}) setsockopt failed: {}{} — falling back to clock_nanosleep tier",
+                clockid,
+                e,
+                hint
+            );
+            false
+        }
+    }
 }
 
 // ── Target derivation state ─────────────────────────────────────────────
@@ -546,10 +653,18 @@ fn run_emitter(
 
         let now_ns = monotonic_now_ns();
         let pcr_with_pid = match anchor {
-            AnchorSource::Pcr => crate::engine::ts_parse::first_pcr_in_ts_buffer_pid(
-                &dg.bytes,
-                state.anchor_pid,
-            ),
+            AnchorSource::Pcr => {
+                // RTP-wrapped callers prepend a 12-byte RTP header; raw-TS
+                // callers set `ts_offset = 0`. Without skipping the header,
+                // the 188-byte-stride sync scan never lands on `0x47` and
+                // the pacer treats every datagram as "between PCRs",
+                // collapsing to producer cadence on RTP outputs.
+                let off = dg.ts_offset.min(dg.bytes.len());
+                crate::engine::ts_parse::first_pcr_in_ts_buffer_pid(
+                    &dg.bytes[off..],
+                    state.anchor_pid,
+                )
+            }
             AnchorSource::St2110Raster => None,
         };
         // Lock onto the first PCR-bearing PID we ever see. From this point
@@ -673,25 +788,6 @@ pub(super) fn sleep_until_monotonic_ns(target_ns: u64) {
     }
 }
 
-#[cfg(target_os = "linux")]
-pub(super) fn apply_realtime_priority(id: &str) -> bool {
-    let mut sp: libc::sched_param = unsafe { std::mem::zeroed() };
-    sp.sched_priority = 50;
-    let rc = unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &sp) };
-    if rc == 0 {
-        tracing::debug!("wire-emit '{}': SCHED_FIFO priority 50 acquired", id);
-        true
-    } else {
-        tracing::debug!(
-            "wire-emit '{}': SCHED_FIFO unavailable (rc={}); running at default priority. \
-             Grant CAP_SYS_NICE for lower jitter.",
-            id,
-            rc
-        );
-        false
-    }
-}
-
 #[cfg(not(target_os = "linux"))]
 pub(super) fn monotonic_now_ns() -> u64 {
     use std::time::Instant;
@@ -706,13 +802,6 @@ pub(super) fn sleep_until_monotonic_ns(target_ns: u64) {
     if target_ns > now {
         std::thread::sleep(Duration::from_nanos(target_ns - now));
     }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(super) fn apply_realtime_priority(_id: &str) -> bool {
-    // No realtime path on non-Linux. clock_nanosleep + SCHED_FIFO is
-    // Linux-specific in this codebase.
-    false
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -971,6 +1060,7 @@ mod tests {
                 bytes: Bytes::from(bytes.clone()),
                 recv_time_us: 0,
                 target_tx_time_ns: None,
+                ts_offset: 0,
             })
             .unwrap();
         }
@@ -1015,6 +1105,7 @@ mod tests {
                 bytes: Bytes::from_static(b"st2110-raster-test"),
                 recv_time_us: 0,
                 target_tx_time_ns: Some(now + i * 100_000),
+                ts_offset: 0,
             })
             .unwrap();
         }
@@ -1024,5 +1115,80 @@ mod tests {
         cancel.cancel();
         let sent = stats.packets_sent.load(Ordering::Relaxed);
         assert_eq!(sent, 3);
+    }
+
+    /// Regression — RTP outputs prepend a 12-byte header before the TS
+    /// stream. Before the `ts_offset` field landed, `wire_emit`'s PCR
+    /// scan walked the buffer from byte 0 and never found a `0x47`
+    /// sync at any 188-byte boundary; PCR-pacing therefore never fired
+    /// and RTP outputs collapsed to producer cadence. This test pins
+    /// the contract: scanning at `ts_offset` recovers the same PCR an
+    /// equivalent raw-TS datagram would have produced.
+    #[test]
+    fn pcr_extracted_from_rtp_wrapped_datagram() {
+        let pcr_27mhz: u64 = 1_234_567 * 300; // arbitrary 27 MHz value
+        let mut ts = vec![0u8; 188];
+        ts[0] = 0x47;
+        ts[1] = 0x01; // PID upper 5 bits = 0, then 0x100
+        ts[2] = 0x00;
+        ts[3] = 0x20; // adaptation-field only
+        ts[4] = 7;    // af_len
+        ts[5] = 0x10; // PCR flag set
+        let base = pcr_27mhz / 300;
+        let ext = pcr_27mhz % 300;
+        ts[6]  = ((base >> 25) & 0xFF) as u8;
+        ts[7]  = ((base >> 17) & 0xFF) as u8;
+        ts[8]  = ((base >> 9) & 0xFF) as u8;
+        ts[9]  = ((base >> 1) & 0xFF) as u8;
+        ts[10] = (((base & 0x01) << 7) as u8) | 0x7E | (((ext >> 8) & 0x01) as u8);
+        ts[11] = (ext & 0xFF) as u8;
+        // Sanity: extract_pcr on the raw 188 should round-trip.
+        assert_eq!(
+            crate::engine::ts_parse::extract_pcr(&ts),
+            Some(pcr_27mhz),
+            "fixture extract_pcr round-trip failed"
+        );
+
+        // Build the exact buffer shape output_rtp.rs hands to wire_emit.
+        let mut buf = vec![0u8; 12]; // RTP header bytes (content irrelevant)
+        buf[0] = 0x80; // RTP V=2, P=0, X=0, CC=0
+        buf[1] = 33;   // PT = MP2T
+        buf.extend_from_slice(&ts);
+
+        let dg = WireDatagram {
+            bytes: Bytes::from(buf),
+            recv_time_us: 0,
+            target_tx_time_ns: None,
+            ts_offset: 12,
+        };
+
+        // Mirror the exact slice expression used by run_emitter.
+        let off = dg.ts_offset.min(dg.bytes.len());
+        let found = crate::engine::ts_parse::first_pcr_in_ts_buffer_pid(
+            &dg.bytes[off..],
+            None,
+        );
+        assert_eq!(
+            found.map(|(p, _pid)| p),
+            Some(pcr_27mhz),
+            "PCR scan must recover the source PCR through the RTP-header offset; \
+             the previous code scanned from byte 0 and silently returned None, \
+             collapsing every RTP output to producer cadence"
+        );
+
+        // And confirm the broken pre-fix path: scanning the whole buffer
+        // (offset 0) misses the PCR — that's the regression we just
+        // fixed. Document it here so a future change that restores
+        // offset-0 scanning is caught immediately.
+        let broken = crate::engine::ts_parse::first_pcr_in_ts_buffer_pid(
+            &dg.bytes[..],
+            None,
+        );
+        assert!(
+            broken.is_none(),
+            "control: scanning the RTP-wrapped buffer from byte 0 must \
+             miss the PCR (this is what justified the ts_offset field); \
+             if this assertion ever fails the fixture has changed"
+        );
     }
 }

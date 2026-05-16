@@ -37,7 +37,7 @@ use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::FlowStatsAccumulator;
 
 use super::input_post_process::{InputPostProcess, InputPostProcessConfig};
-use super::input_transcode::{publish_input_packet_with_post, InputTranscoder};
+use super::input_transcode::InputTranscoder;
 use super::packet::RtpPacket;
 use super::rtmp::server::{RtmpMediaMessage, RtmpServerConfig, run_rtmp_server};
 use super::rtmp::ts_mux::TsMuxer;
@@ -145,14 +145,21 @@ pub fn spawn_rtmp_input(
                 config.pid_map.is_some(),
             );
         }
-        process_media(media_rx, broadcast_tx, stats, cancel, event_sender, flow_id, &mut transcoder, &mut post, pid_overrides_for_mux).await;
+        // Per-input ingress smoothing publisher.
+        let publisher = crate::engine::ingress_smoothing::IngressPublisher::new(
+            config.ingress_smoothing_ms,
+            broadcast_tx,
+            &input_id,
+            cancel.clone(),
+        );
+        process_media(media_rx, publisher, stats, cancel, event_sender, flow_id, &mut transcoder, &mut post, pid_overrides_for_mux).await;
     })
 }
 
 /// Process media messages from the RTMP server, mux into TS, and push to broadcast.
 async fn process_media(
     mut media_rx: mpsc::Receiver<RtmpMediaMessage>,
-    broadcast_tx: broadcast::Sender<RtpPacket>,
+    publisher: crate::engine::ingress_smoothing::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     event_sender: EventSender,
@@ -279,7 +286,7 @@ async fn process_media(
                                     stats.input_packets.fetch_add(1, Ordering::Relaxed);
                                     stats.input_bytes.fetch_add(total_len as u64, Ordering::Relaxed);
                                     if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                                        publish_input_packet_with_post(transcoder, post, &broadcast_tx, packet);
+                                        crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, &publisher, packet);
                                     } else {
                                         stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                                     }
@@ -355,7 +362,7 @@ async fn process_media(
                                     stats.input_packets.fetch_add(1, Ordering::Relaxed);
                                     stats.input_bytes.fetch_add(total_len as u64, Ordering::Relaxed);
                                     if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                                        publish_input_packet_with_post(transcoder, post, &broadcast_tx, packet);
+                                        crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, &publisher, packet);
                                     } else {
                                         stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                                     }

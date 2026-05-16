@@ -45,7 +45,7 @@
 //!   gate on [`is_locked`](MasterClock::is_locked); outputs that can run
 //!   open-loop (passthrough) ignore it.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -86,6 +86,9 @@ pub trait MasterClock: Send + Sync + 'static {
             locked: self.is_locked(),
             rate_offset_ppm: 0.0,
             jitter_us: 0,
+            configured_kind: None,
+            fallback_active: false,
+            fallback_reason: None,
         }
     }
 }
@@ -121,6 +124,9 @@ impl MasterClockKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MasterClockTelemetry {
     /// Tagged kind ("wallclock", "source_pcr_pll", "ptp", "audio_master").
+    /// When PLL fallback has fired, this reports the **actual** kind
+    /// currently driving (e.g. "wallclock") while `configured_kind`
+    /// preserves what the operator requested.
     pub kind: String,
     /// True when the clock is converged enough for broadcast-grade emit.
     pub locked: bool,
@@ -129,7 +135,25 @@ pub struct MasterClockTelemetry {
     pub rate_offset_ppm: f64,
     /// Recent jitter in microseconds (p99 over last 1 s window).
     pub jitter_us: u64,
+    /// What the operator (or auto-policy) configured, regardless of
+    /// whether a fallback has since fired. `None` when the field is
+    /// not relevant (e.g. on bare wallclock flows that never had a
+    /// PLL configured). Additive — older managers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_kind: Option<String>,
+    /// `true` when the PLL→Wallclock fallback has fired on this
+    /// master. UI can render a "running degraded" chip.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fallback_active: bool,
+    /// Human-readable reason the fallback fired
+    /// ("insufficient_samples" / "jitter_too_high" / "no_pcr_observed").
+    /// Set only when `fallback_active`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
 }
+
+#[inline]
+fn is_false(b: &bool) -> bool { !*b }
 
 impl Default for MasterClockTelemetry {
     fn default() -> Self {
@@ -138,6 +162,9 @@ impl Default for MasterClockTelemetry {
             locked: true,
             rate_offset_ppm: 0.0,
             jitter_us: 0,
+            configured_kind: None,
+            fallback_active: false,
+            fallback_reason: None,
         }
     }
 }
@@ -234,6 +261,9 @@ impl MasterClock for SourcePcrPllMaster {
             locked: t.locked,
             rate_offset_ppm: t.rate_offset_ppm,
             jitter_us: t.jitter_us,
+            configured_kind: None,
+            fallback_active: false,
+            fallback_reason: None,
         }
     }
 }
@@ -305,6 +335,9 @@ impl MasterClock for PtpMasterClock {
                 .offset_ns
                 .map(|o| (o.unsigned_abs() / 1000) as u64)
                 .unwrap_or(0),
+            configured_kind: None,
+            fallback_active: false,
+            fallback_reason: None,
         }
     }
 }
@@ -384,8 +417,218 @@ impl MasterClock for WallclockMaster {
             locked: true,
             rate_offset_ppm: 0.0,
             jitter_us: 0,
+            configured_kind: None,
+            fallback_active: false,
+            fallback_reason: None,
         }
     }
+}
+
+/// PLL-with-wallclock-fallback wrapper.
+///
+/// Wraps a [`SourcePcrPllMaster`] and a [`WallclockMaster`] behind a
+/// single dyn-`MasterClock` façade. A watcher task spawned at flow
+/// start monitors the PLL's lock state; if the PLL fails to lock
+/// within the configured timeout (or sees zero PCR samples after a
+/// shorter grace window), the watcher flips `fallback_active` and
+/// `now_27mhz()` switches to driving the output from the wallclock
+/// master instead. The transition is one-shot — once fallen back,
+/// the master stays on wallclock for the flow's lifetime (no
+/// oscillation).
+///
+/// The configured kind is preserved on telemetry so the manager UI
+/// can render "PCR PLL → Wallclock (fallback)" rather than silently
+/// re-labelling the flow's clock as wallclock.
+pub struct PcrPllWithFallback {
+    pll_master: Arc<SourcePcrPllMaster>,
+    wallclock: WallclockMaster,
+    fallback_active: AtomicBool,
+    /// Set once when the fallback fires. Read by `telemetry()`.
+    fallback_reason: OnceLock<String>,
+    source_id: String,
+}
+
+impl PcrPllWithFallback {
+    pub fn new(pll_master: Arc<SourcePcrPllMaster>) -> Self {
+        let source_id = pll_master.source_id().to_string();
+        Self {
+            pll_master,
+            wallclock: WallclockMaster::new(),
+            fallback_active: AtomicBool::new(false),
+            fallback_reason: OnceLock::new(),
+            source_id,
+        }
+    }
+
+    pub fn pll_master(&self) -> Arc<SourcePcrPllMaster> {
+        self.pll_master.clone()
+    }
+
+    /// Flip the master onto wallclock and record the reason. Idempotent —
+    /// subsequent calls are no-ops.
+    pub fn activate_fallback(&self, reason: impl Into<String>) {
+        // Set reason first so any reader that observes `fallback_active`
+        // sees a populated reason.
+        let _ = self.fallback_reason.set(reason.into());
+        self.fallback_active.store(true, Ordering::Release);
+    }
+
+    pub fn is_fallback_active(&self) -> bool {
+        self.fallback_active.load(Ordering::Acquire)
+    }
+}
+
+impl MasterClock for PcrPllWithFallback {
+    fn now_27mhz(&self) -> u64 {
+        if self.fallback_active.load(Ordering::Acquire) {
+            self.wallclock.now_27mhz()
+        } else {
+            self.pll_master.now_27mhz()
+        }
+    }
+
+    fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    fn is_locked(&self) -> bool {
+        if self.fallback_active.load(Ordering::Acquire) {
+            // Wallclock fallback is always "locked" — operator sees the
+            // fallback chip on the UI but consumers see a usable clock.
+            true
+        } else {
+            self.pll_master.is_locked()
+        }
+    }
+
+    fn telemetry(&self) -> MasterClockTelemetry {
+        if self.fallback_active.load(Ordering::Acquire) {
+            // Inherit the wallclock telemetry but stamp the configured
+            // kind + fallback details so UI keeps the operator informed.
+            let mut t = self.wallclock.telemetry();
+            t.kind = MasterClockKind::Wallclock.as_str().to_string();
+            t.configured_kind = Some(MasterClockKind::SourcePcrPll.as_str().to_string());
+            t.fallback_active = true;
+            t.fallback_reason = self.fallback_reason.get().cloned();
+            t
+        } else {
+            self.pll_master.telemetry()
+        }
+    }
+
+    fn lipsync_offset_90k(&self) -> i64 {
+        self.pll_master.lipsync_offset_90k()
+    }
+}
+
+/// Spawn the PLL→Wallclock fallback watcher.
+///
+/// Polls the PLL's [`PcrPll::telemetry`] periodically. Fires fallback
+/// (via [`PcrPllWithFallback::activate_fallback`]) when:
+///
+/// - **No samples after 5 s** → `no_pcr_observed`. The fast path is
+///   important for sources that never emit PCR at all (constant-
+///   bitrate raw TS, some legacy contribution feeds): waiting the
+///   full timeout for one of those would silently delay output
+///   start by `timeout_s` seconds.
+/// - **Not locked at timeout** with samples > 0 → either
+///   `insufficient_samples` (still under the 100-sample minimum) or
+///   `jitter_too_high` (samples present but p99 over the lock
+///   threshold).
+///
+/// `timeout_s == 0` disables the watcher entirely (strict-PLL mode).
+pub fn spawn_pll_fallback_watcher(
+    wrapper: Arc<PcrPllWithFallback>,
+    flow_id: String,
+    input_id: String,
+    timeout_s: u32,
+    events: crate::manager::events::EventSender,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if timeout_s == 0 {
+            // Strict-PLL mode — operator opted out of fallback.
+            return;
+        }
+        // Single timeout. Waiting the full `pll_lock_timeout_s` before
+        // judging lock keeps the watcher from racing the broadcast
+        // pipeline's warm-up (file open, codec init, first PES, input
+        // forwarder pickup — collectively a few hundred ms to a few
+        // seconds depending on input type). A `samples == 0` outcome
+        // at the deadline is then a real "the source never emitted
+        // PCR" signal, not a startup artefact. The earlier 5 s
+        // fast-path was tempting but proved noisy: high-bitrate media
+        // player inputs took up to 5 s to start publishing under heavy
+        // CPU + Tokio startup load and the watcher fired before any
+        // PCR sample landed at the PLL, even though packets were
+        // streaming healthily within seconds.
+        let deadline = std::time::Duration::from_secs(timeout_s as u64);
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(deadline) => {}
+        }
+        if wrapper.is_fallback_active() {
+            return;
+        }
+        let t = wrapper.pll_master.pll().telemetry();
+        if t.locked {
+            return; // PLL converged within budget — done, no fallback.
+        }
+        let reason = if t.samples == 0 {
+            "no_pcr_observed"
+        } else if t.samples < 100 {
+            "insufficient_samples"
+        } else {
+            "jitter_too_high"
+        };
+        fire_fallback(
+            &wrapper,
+            &flow_id,
+            &input_id,
+            reason,
+            t.samples,
+            t.jitter_us,
+            deadline,
+            &events,
+        );
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fire_fallback(
+    wrapper: &Arc<PcrPllWithFallback>,
+    flow_id: &str,
+    input_id: &str,
+    reason: &str,
+    samples_received: u64,
+    p99_jitter_us: u64,
+    waited: std::time::Duration,
+    events: &crate::manager::events::EventSender,
+) {
+    wrapper.activate_fallback(reason);
+    let msg = format!(
+        "PCR PLL did not lock within {:.0}s on flow '{}' (reason: {}); falling back to wallclock",
+        waited.as_secs_f32(),
+        flow_id,
+        reason,
+    );
+    tracing::warn!("{msg}");
+    events.emit_flow_with_details(
+        crate::manager::events::EventSeverity::Warning,
+        crate::manager::events::category::MASTER_CLOCK,
+        msg,
+        flow_id,
+        serde_json::json!({
+            "error_code": "master_clock_pll_fallback",
+            "input_id": input_id,
+            "samples_received": samples_received,
+            "samples_needed": 100u64,
+            "p99_jitter_us": p99_jitter_us,
+            "lock_threshold_us": 100u64,
+            "fallback_reason": reason,
+            "waited_s": waited.as_secs(),
+        }),
+    );
 }
 
 /// Per-flow handle carrying the dyn master + its kind tag.
@@ -471,10 +714,23 @@ impl MasterClockHandle {
     }
 
     pub fn telemetry(&self) -> MasterClockTelemetry {
-        // Carry the kind tag from the handle (the inner Wallclock backing
-        // a SourcePcrPll handle would otherwise label itself "wallclock").
         let mut t = self.inner.telemetry();
-        t.kind = self.kind.as_str().to_string();
+        // If the inner is a fallback-aware wrapper (e.g.
+        // `PcrPllWithFallback`), it has already populated `kind` with
+        // the *actual* driving clock (wallclock when fallback fired,
+        // source_pcr_pll otherwise) and set `configured_kind` to the
+        // operator's request. Trust those values.
+        //
+        // Otherwise — the inner is a vanilla clock backing a typed
+        // handle (e.g. a bare `WallclockMaster` returned via
+        // `MasterClockHandle::wallclock()`) — overwrite `kind` with
+        // the handle's stored tag so the manager UI reports the
+        // operator-requested kind, not the implementation detail
+        // (a SourcePcrPll handle backed by a WallclockMaster during
+        // a Phase-3 stub would otherwise label itself "wallclock").
+        if t.configured_kind.is_none() {
+            t.kind = self.kind.as_str().to_string();
+        }
         t
     }
 

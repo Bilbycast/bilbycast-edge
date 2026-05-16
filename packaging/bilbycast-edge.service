@@ -48,11 +48,26 @@ DeviceAllow=/dev/dri/renderD128 rwm
 DeviceAllow=/dev/dri/renderD129 rwm
 DeviceAllow=/dev/snd/* rwm
 SupplementaryGroups=video render audio
-# Capability set: the edge needs no privileged ops itself (port < 1024
-# binding is handled via socket-activation or by configuring the manager
-# in front of a load balancer), so we drop all caps.
-CapabilityBoundingSet=
-AmbientCapabilities=
+# Capability set. We need exactly one capability:
+#
+#   CAP_NET_ADMIN — required by mainline kernel ≥ 6.x (and every recent
+#   Ubuntu / RHEL backport) for `setsockopt(SO_TXTIME)` with any non-
+#   `CLOCK_MONOTONIC` clockid. The wire-pacing path uses `CLOCK_TAI`
+#   (the only clockid the kernel ETF qdisc on Intel ice/igc/igb and
+#   Mellanox mlx5 will accept, and the natural choice when ptp4l +
+#   phc2sys are running). Without this cap, `enable_so_txtime` returns
+#   EPERM and `engine::wire_emit` silently falls back to the
+#   `clock_nanosleep` tier — degraded pacing precision (≈ 50–500 µs
+#   jitter vs sub-µs with NIC offload), and on any host where the ETF
+#   qdisc has `skip_sock_check off`, EVERY non-SO_TXTIME packet is
+#   also dropped at the qdisc — so the fallback path silently fails
+#   completely.
+#
+# CAP_NET_ADMIN does NOT let the edge install qdiscs (we still want
+# that to be operator-side at provision time via `setup-etf-qdisc.sh`)
+# — it only unlocks the per-socket setsockopt path.
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
 RestrictNamespaces=true
 # `wire_emit` uses SCHED_FIFO best-effort on its egress thread for
 # sub-100 µs `clock_nanosleep` precision (the alternative is the
@@ -71,14 +86,26 @@ SystemCallArchitectures=native
 # Resource limits — generous defaults; operators can tune via drop-in
 # /etc/systemd/system/bilbycast-edge.service.d/override.conf
 LimitNOFILE=65536
+# `LimitMEMLOCK=infinity` together with `BILBYCAST_MLOCKALL=1` in the
+# environment file below makes the edge pin every current + future
+# page into RAM at startup via `mlockall(MCL_CURRENT | MCL_FUTURE)`.
+# Eliminates major-page-fault stalls on the data-plane hot path —
+# without this, a single page fault on a wire-emit thread can stall
+# pacing for 10–100 ms and drop packets at the receiver.
 LimitMEMLOCK=infinity
-# Allows wire_emit's egress thread to acquire SCHED_FIFO priority 50
-# without `CAP_SYS_NICE`. Default RLIMIT_RTPRIO is 0 on most distros,
-# which would force a silent fallback to default scheduler.
-LimitRTPRIO=50
+# RT-priority ceiling. Wire-emit requests SCHED_FIFO priority 50.
+# Headroom up to 99 lets future hot-path threads (codec pool at 40,
+# PID-bus assembler at 30, PCR PLL sampler at 35 — see
+# docs/production-tuning.md) acquire SCHED_FIFO without
+# `CAP_SYS_NICE`. Default RLIMIT_RTPRIO is 0 on most distros, which
+# would force a silent fallback to SCHED_OTHER (1–5 ms p99 pacing
+# jitter — too coarse for broadcast PCR_AC).
+LimitRTPRIO=99
 
 # Environment file lets operators set RUST_LOG, BILBYCAST_REPLAY_DIR,
-# etc. without editing the unit. Created blank by install-edge.sh.
+# BILBYCAST_MLOCKALL=1, BILBYCAST_WIRE_EMIT_CPUS=<set>, etc. without
+# editing the unit. Created (with `BILBYCAST_MLOCKALL=1` seeded) by
+# install-edge.sh.
 EnvironmentFile=-/etc/bilbycast/edge.env
 
 [Install]

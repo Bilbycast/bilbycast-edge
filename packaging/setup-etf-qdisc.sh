@@ -98,20 +98,64 @@ tc qdisc replace dev "$IF" root handle 100: mqprio \
 #    ETF qdisc wakes 200 µs before the target tx time to prep the
 #    packet. `offload` enables HW-offload on supported NICs;
 #    silently degrades to software ETF on unsupported NICs.
-echo "$0: installing etf qdisc on $IF class 100:1 (clockid CLOCK_TAI, offload)"
-tc qdisc replace dev "$IF" parent 100:1 etf \
-    clockid CLOCK_TAI \
-    delta 200000 \
-    offload || {
-        echo "$0: ETF install with offload failed; retrying without offload" >&2
-        tc qdisc replace dev "$IF" parent 100:1 etf \
-            clockid CLOCK_TAI \
-            delta 200000 \
-            || {
-                echo "$0: ETF qdisc install failed entirely; check kernel version (≥ 4.19) and iproute2 version" >&2
-                exit 1
-            }
-    }
+#
+#    `skip_sock_check` is REQUIRED on the priomap above: the default
+#    mqprio map routes socket-priority 0 (the kernel default for
+#    everything from ARP to ssh) into class 100:1. Without
+#    `skip_sock_check`, ETF refuses any packet whose socket lacks
+#    SO_TXTIME and drops it at the qdisc — including kernel-issued
+#    ARP solicitations. Symptoms: `ip neigh show` reports
+#    `INCOMPLETE`, sendmsg returns ENETUNREACH (errno 101), and
+#    `tc -s qdisc show` reports 100 % drops on the ETF class with
+#    zero packets sent. With `skip_sock_check`, non-SO_TXTIME packets
+#    fall through to FIFO release (no scheduled launch time, but they
+#    *do* leave the box); SO_TXTIME packets still get hardware-
+#    scheduled. This is the right safety net whenever the etf-bearing
+#    TC also carries control-plane traffic (which it does under the
+#    default priomap).
+# NIC-offload mode programs the NIC's hardware launch register in PHC
+# time. The kernel translates the per-packet CLOCK_TAI tx-time into PHC
+# time using its known TAI↔PHC offset, which is only correct when
+# phc2sys is actively keeping PHC ≈ CLOCK_TAI (ptp4l locked to a GM, or
+# phc2sys in standalone mode bridging CLOCK_REALTIME→PHC). When PHC
+# freewheels (no PTP daemon yet, or daemon stuck waiting for a GM
+# announce), the launch register sees timestamps tens of seconds
+# outside its ~1 s horizon and the NIC silently rejects every packet.
+#
+# Operators without external PTP set `BILBYCAST_ETF_OFFLOAD=0` to skip
+# the offload flag — software ETF on CLOCK_TAI still gives ~1–10 µs
+# jitter (broadcast-quality), no PHC dependency. Tier-1 sub-µs PCR_AC
+# needs PHC sync; until that's set up, software ETF is the right
+# default.
+USE_OFFLOAD="${BILBYCAST_ETF_OFFLOAD:-1}"
+if [[ "$USE_OFFLOAD" == "1" ]]; then
+    echo "$0: installing etf qdisc on $IF class 100:1 (clockid CLOCK_TAI, offload, skip_sock_check)"
+    tc qdisc replace dev "$IF" parent 100:1 etf \
+        clockid CLOCK_TAI \
+        delta 200000 \
+        offload \
+        skip_sock_check || {
+            echo "$0: ETF install with offload failed; retrying without offload" >&2
+            tc qdisc replace dev "$IF" parent 100:1 etf \
+                clockid CLOCK_TAI \
+                delta 200000 \
+                skip_sock_check \
+                || {
+                    echo "$0: ETF qdisc install failed entirely; check kernel version (≥ 4.19) and iproute2 version" >&2
+                    exit 1
+                }
+        }
+else
+    echo "$0: installing etf qdisc on $IF class 100:1 (clockid CLOCK_TAI, software ETF, skip_sock_check)"
+    echo "$0:   BILBYCAST_ETF_OFFLOAD=0 — skipping NIC HW offload (safe without PTP grandmaster)"
+    tc qdisc replace dev "$IF" parent 100:1 etf \
+        clockid CLOCK_TAI \
+        delta 200000 \
+        skip_sock_check || {
+            echo "$0: ETF qdisc install failed; check kernel version (≥ 4.19) and iproute2 version" >&2
+            exit 1
+        }
+fi
 
 echo
 echo "$0: ETF qdisc installed on $IF. Current state:"

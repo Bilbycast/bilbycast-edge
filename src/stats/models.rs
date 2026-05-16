@@ -118,6 +118,9 @@ pub struct FlowStats {
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct MasterClockStats {
     /// Tagged kind: "source_pcr_pll" / "ptp" / "audio_master" / "wallclock".
+    /// When `fallback_active`, this reflects the **actual** driving
+    /// clock (e.g. "wallclock"); `configured_kind` carries what the
+    /// operator originally requested.
     pub kind: String,
     /// True when the clock is converged enough for broadcast-grade emit.
     pub locked: bool,
@@ -128,7 +131,25 @@ pub struct MasterClockStats {
     pub jitter_us: u64,
     /// Operator-set lipsync trim in 90 kHz ticks. Bounded ±18 000.
     pub lipsync_offset_90k: i64,
+    /// What the operator (or auto-policy) configured. Set when a
+    /// fallback has fired so the UI can render "PCR PLL → Wallclock
+    /// (fallback)". `None` for normal operation. Additive on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_kind: Option<String>,
+    /// `true` when a fallback has activated. Driven by the PLL
+    /// fallback watcher in `engine::master_clock`. Additive — older
+    /// managers ignore it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fallback_active: bool,
+    /// Human-readable reason the fallback fired
+    /// ("no_pcr_observed" / "insufficient_samples" / "jitter_too_high").
+    /// Set only when `fallback_active`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
 }
+
+#[inline]
+fn is_false(b: &bool) -> bool { !*b }
 
 /// Live atomic-counter snapshot of a flow's recording writer.
 #[derive(Debug, Clone, Serialize, Default)]
@@ -811,6 +832,14 @@ pub struct OutputStats {
     /// field — old managers ignore it.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub wire_pacing_late: u64,
+    /// CPU index the wire-emit thread was pinned to at spawn (via
+    /// `pthread_setaffinity_np`, configured per-process by
+    /// `BILBYCAST_WIRE_EMIT_CPUS`). `None` means not pinned — the
+    /// kernel scheduler floats the thread, which can cause contention
+    /// with Tokio workers under load. Backward-compatible additive
+    /// field — old managers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_pacing_pinned_cpu: Option<u32>,
 }
 
 #[inline]

@@ -206,7 +206,13 @@ impl VideoFullState {
 
         // Decode + metrics run on the current thread via block_in_place so
         // the tokio reactor isn't blocked. Keep the critical section small:
-        // we only produce `FrameMetrics` + an updated `YPlane`.
+        // we only produce `FrameMetrics` + an updated `YPlane`. This is a
+        // 1 Hz sampler (default; capped at 30 Hz via `video_full_hz`),
+        // and `sample()` is a synchronous method called from a Tokio
+        // task — staying on `block_in_place` here keeps the call-site
+        // surface unchanged. Migrating to spawn_blocking would
+        // cascade an async refactor through the analyser's caller; not
+        // worth it for a 1 Hz path.
         let (metrics, new_y) = tokio::task::block_in_place(|| {
             decode_and_metrics(&ts_snapshot, prev_y.as_ref())
         });

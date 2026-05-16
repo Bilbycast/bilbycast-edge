@@ -611,6 +611,11 @@ pub async fn run_st2110_audio_output(
                                 bytes: buf.clone(),
                                 recv_time_us: packet.recv_time_us,
                                 target_tx_time_ns: None,
+                                // ST 2110 paths run under the
+                                // St2110Raster anchor, which ignores
+                                // ts_offset; setting 0 is consistent
+                                // with raw-packet semantics.
+                                ts_offset: 0,
                             };
                             if wire_red.try_send(dg_red).is_err() {
                                 stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
@@ -620,6 +625,7 @@ pub async fn run_st2110_audio_output(
                                     bytes: buf.clone(),
                                     recv_time_us: packet.recv_time_us,
                                     target_tx_time_ns: None,
+                                    ts_offset: 0,
                                 };
                                 let _ = blue.try_send(dg_blue);
                             }
@@ -946,6 +952,7 @@ pub async fn run_st2110_anc_output(
                             bytes: packet.data.clone(),
                             recv_time_us: packet.recv_time_us,
                             target_tx_time_ns: None,
+                            ts_offset: 0,
                         };
                         if wire_red.try_send(dg_red).is_err() {
                             stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
@@ -955,6 +962,7 @@ pub async fn run_st2110_anc_output(
                                 bytes: packet.data.clone(),
                                 recv_time_us: packet.recv_time_us,
                                 target_tx_time_ns: None,
+                                ts_offset: 0,
                             };
                             let _ = blue.try_send(dg_blue);
                         }

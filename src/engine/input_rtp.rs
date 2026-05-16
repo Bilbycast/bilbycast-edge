@@ -90,7 +90,7 @@ use crate::util::socket::bind_udp_input;
 use crate::util::time::now_us;
 
 use super::input_post_process::{InputPostProcess, InputPostProcessConfig};
-use super::input_transcode::{publish_input_packet_with_post, InputTranscoder};
+use super::input_transcode::InputTranscoder;
 use super::packet::{MAX_RTP_PACKET_SIZE, RtpPacket};
 
 /// Spawn a task that receives RTP packets from a UDP socket and
@@ -150,10 +150,21 @@ pub fn spawn_rtp_input(
             );
             let _ = p;
         }
+        // Per-input ingress smoothing publisher — covers both single-
+        // leg and 2022-7 dual-leg paths. When the operator sets
+        // `ingress_smoothing_ms` on a -7 RTP input, both legs go
+        // through the same publisher so the hitless merger sees the
+        // legs with reduced inter-arrival jitter.
+        let publisher = crate::engine::ingress_smoothing::IngressPublisher::new(
+            config.ingress_smoothing_ms,
+            broadcast_tx,
+            &input_id,
+            cancel.clone(),
+        );
         let result = if config.redundancy.is_some() {
-            rtp_input_redundant_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
+            rtp_input_redundant_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
         } else {
-            rtp_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
+            rtp_input_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
         };
         if let Err(e) = result {
             tracing::error!("RTP input task exited with error: {e}");
@@ -226,7 +237,7 @@ impl TokenBucket {
 /// The loop exits when the cancellation token fires.
 async fn rtp_input_loop(
     config: RtpInputConfig,
-    broadcast_tx: broadcast::Sender<RtpPacket>,
+    publisher: crate::engine::ingress_smoothing::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
@@ -331,7 +342,7 @@ async fn rtp_input_loop(
                                 let recovered = decoder.process_fec(data);
                                 for pkt in recovered {
                                     stats.fec_recovered.fetch_add(1, Ordering::Relaxed);
-                                    publish_input_packet_with_post(transcoder, post, &broadcast_tx, pkt);
+                                    crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, &publisher, pkt);
                                 }
                             }
                             continue;
@@ -388,7 +399,7 @@ async fn rtp_input_loop(
                         if let Some(ref mut decoder) = fec_decoder {
                             let packets = decoder.process_media(seq, ts, &bytes_data);
                             for pkt in packets {
-                                publish_input_packet_with_post(transcoder, post, &broadcast_tx, pkt);
+                                crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, &publisher, pkt);
                             }
                         } else {
                             let packet = RtpPacket {
@@ -405,7 +416,7 @@ async fn rtp_input_loop(
                                 upstream_seq: Some(seq),
                                 upstream_leg_id: None,
                             };
-                            publish_input_packet_with_post(transcoder, post, &broadcast_tx, packet);
+                            crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, &publisher, packet);
                         }
                     }
                     Err(e) => {
@@ -434,7 +445,7 @@ async fn rtp_input_loop(
 /// sequence number present in every packet header.
 async fn rtp_input_redundant_loop(
     config: RtpInputConfig,
-    broadcast_tx: broadcast::Sender<RtpPacket>,
+    publisher: crate::engine::ingress_smoothing::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
@@ -600,7 +611,7 @@ async fn rtp_input_redundant_loop(
                 let now = std::time::Instant::now();
                 for (chosen, pkt) in merger.drain_expired(now) {
                     publish_emitted_redundant_packet(
-                        chosen, pkt, &broadcast_tx, &stats, transcoder, post,
+                        chosen, pkt, &publisher, &stats, transcoder, post,
                     );
                 }
                 refresh_buffered_hitless_snapshot(&merger, &stats);
@@ -648,7 +659,7 @@ async fn rtp_input_redundant_loop(
                         &buf1[..len], src.ip(), ActiveLeg::Leg1,
                         &source_filter, &pt_filter, &mut rate_limiter,
                         &mut fec_decoder_leg1, &mut merger,
-                        &broadcast_tx, &stats, transcoder, post,
+                        &publisher, &stats, transcoder, post,
                     );
                 }
             }
@@ -658,7 +669,7 @@ async fn rtp_input_redundant_loop(
                         &buf2[..len], src.ip(), ActiveLeg::Leg2,
                         &source_filter, &pt_filter, &mut rate_limiter,
                         &mut fec_decoder_leg2, &mut merger,
-                        &broadcast_tx, &stats, transcoder, post,
+                        &publisher, &stats, transcoder, post,
                     );
                 }
             }
@@ -744,7 +755,7 @@ fn refresh_buffered_hitless_snapshot(
 fn publish_emitted_redundant_packet(
     chosen_leg: ActiveLeg,
     mut packet: RtpPacket,
-    broadcast_tx: &broadcast::Sender<RtpPacket>,
+    publisher: &crate::engine::ingress_smoothing::IngressPublisher,
     stats: &FlowStatsAccumulator,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
@@ -766,7 +777,9 @@ fn publish_emitted_redundant_packet(
     }
     stats.input_packets.fetch_add(1, Ordering::Relaxed);
     stats.input_bytes.fetch_add(packet.data.len() as u64, Ordering::Relaxed);
-    publish_input_packet_with_post(transcoder, post, broadcast_tx, packet);
+    crate::engine::input_transcode::publish_input_packet_smoothed(
+        transcoder, post, publisher, packet,
+    );
 }
 
 /// Process a single packet from one leg of a 2022-7 redundant RTP input.
@@ -781,7 +794,7 @@ fn process_redundant_rtp_packet(
     rate_limiter: &mut Option<TokenBucket>,
     fec_decoder: &mut Option<FecDecoder>,
     merger: &mut RedundantMerger,
-    broadcast_tx: &broadcast::Sender<RtpPacket>,
+    publisher: &crate::engine::ingress_smoothing::IngressPublisher,
     stats: &FlowStatsAccumulator,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
@@ -803,7 +816,7 @@ fn process_redundant_rtp_packet(
             for pkt in recovered {
                 stats.fec_recovered.fetch_add(1, Ordering::Relaxed);
                 for (chosen, p) in merger.ingest(pkt, leg, now, stats) {
-                    publish_emitted_redundant_packet(chosen, p, broadcast_tx, stats, transcoder, post);
+                    publish_emitted_redundant_packet(chosen, p, publisher, stats, transcoder, post);
                 }
             }
         }
@@ -848,7 +861,7 @@ fn process_redundant_rtp_packet(
         let packets = decoder.process_media(seq, ts, &bytes_data);
         for pkt in packets {
             for (chosen, p) in merger.ingest(pkt, leg, now, stats) {
-                publish_emitted_redundant_packet(chosen, p, broadcast_tx, stats, transcoder, post);
+                publish_emitted_redundant_packet(chosen, p, publisher, stats, transcoder, post);
             }
         }
     } else {
@@ -862,7 +875,7 @@ fn process_redundant_rtp_packet(
             upstream_leg_id: None, // filled in by publish_emitted_*
         };
         for (chosen, p) in merger.ingest(packet, leg, now, stats) {
-            publish_emitted_redundant_packet(chosen, p, broadcast_tx, stats, transcoder, post);
+            publish_emitted_redundant_packet(chosen, p, publisher, stats, transcoder, post);
         }
     }
 }

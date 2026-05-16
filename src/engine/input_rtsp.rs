@@ -20,7 +20,7 @@ use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::FlowStatsAccumulator;
 
 use super::input_post_process::{InputPostProcess, InputPostProcessConfig};
-use super::input_transcode::{publish_input_packet_with_post, InputTranscoder};
+use super::input_transcode::InputTranscoder;
 use super::packet::RtpPacket;
 use super::rtmp::ts_mux::TsMuxer;
 
@@ -78,13 +78,20 @@ pub fn spawn_rtsp_input(
         if let Some(ref _p) = post {
             tracing::info!("RTSP input: ingress post-process active");
         }
-        rtsp_input_loop(config, broadcast_tx, stats, cancel, event_sender, flow_id, &mut transcoder, &mut post).await;
+        // Per-input ingress smoothing publisher.
+        let publisher = crate::engine::ingress_smoothing::IngressPublisher::new(
+            config.ingress_smoothing_ms,
+            broadcast_tx,
+            &input_id,
+            cancel.clone(),
+        );
+        rtsp_input_loop(config, publisher, stats, cancel, event_sender, flow_id, &mut transcoder, &mut post).await;
     })
 }
 
 async fn rtsp_input_loop(
     config: RtspInputConfig,
-    broadcast_tx: broadcast::Sender<RtpPacket>,
+    publisher: crate::engine::ingress_smoothing::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     event_sender: EventSender,
@@ -99,7 +106,7 @@ async fn rtsp_input_loop(
     let mut disconnect_event_pending = false;
 
     loop {
-        match run_rtsp_session(&config, &broadcast_tx, &stats, &cancel, &event_sender, &flow_id, &mut disconnect_event_pending, transcoder, post).await {
+        match run_rtsp_session(&config, &publisher, &stats, &cancel, &event_sender, &flow_id, &mut disconnect_event_pending, transcoder, post).await {
             Ok(()) => {
                 tracing::info!("RTSP input stopped (cancelled)");
                 break;
@@ -138,7 +145,7 @@ async fn rtsp_input_loop(
 
 async fn run_rtsp_session(
     config: &RtspInputConfig,
-    broadcast_tx: &broadcast::Sender<RtpPacket>,
+    publisher: &crate::engine::ingress_smoothing::IngressPublisher,
     stats: &Arc<FlowStatsAccumulator>,
     cancel: &CancellationToken,
     event_sender: &EventSender,
@@ -282,7 +289,7 @@ async fn run_rtsp_session(
                     stats.input_packets.fetch_add(1, Ordering::Relaxed);
                     stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
                     if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                        publish_input_packet_with_post(transcoder, post, broadcast_tx, pkt);
+                        crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, publisher, pkt);
                     } else {
                         stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                     }
@@ -322,7 +329,7 @@ async fn run_rtsp_session(
                     stats.input_packets.fetch_add(1, Ordering::Relaxed);
                     stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
                     if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                        publish_input_packet_with_post(transcoder, post, broadcast_tx, pkt);
+                        crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, publisher, pkt);
                     } else {
                         stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                     }

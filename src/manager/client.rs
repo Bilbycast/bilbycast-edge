@@ -832,6 +832,13 @@ pub(crate) fn build_health_payload(
         // `"resources"` capability string to render the Resources card
         // and the per-flow Resource-impact widget.
         "resource_budget": build_resource_budget_payload(flow_manager, static_caps, live_gpu),
+        // Hot-path scheduling status — surfaces whether the operator's
+        // production tuning (mlockall, SCHED_FIFO, RLIMIT_RTPRIO) has
+        // actually landed. The manager UI can flag a degraded state
+        // ("running at SCHED_OTHER — expect 1–5 ms PCR_AC jitter")
+        // without the operator chasing the value through logs.
+        // Backward-compatible additive field — old managers ignore it.
+        "scheduling_status": build_scheduling_status_payload(),
     });
     // Per-interface enumeration. Empty Vec → omit (defensive: if_addrs
     // can fail in some containerised environments). Manager UI hides
@@ -875,6 +882,26 @@ fn build_system_resources_payload(state: &SystemResourceState) -> serde_json::Va
         "ram_percent": state.ram_percent_f64(),
         "ram_used_mb": state.ram_used_mb.load(std::sync::atomic::Ordering::Relaxed),
         "ram_total_mb": state.ram_total_mb.load(std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+/// Aggregate hot-path scheduling state captured at startup + accrued
+/// per wire-emit thread.
+///
+/// The manager UI uses `sched_fifo_granted` + `sched_fifo_failed` to
+/// flag a "running degraded" warning on the per-node Resources card —
+/// silent fallback to SCHED_OTHER is the single most common cause of
+/// elevated PCR_AC jitter in field deployments. `mlockall_status`
+/// surfaces whether the operator enabled the page-fault stall guard.
+fn build_scheduling_status_payload() -> serde_json::Value {
+    use crate::util::runtime_diag::{
+        mlockall_status, rlimit_rtprio_max, sched_fifo_failed_any, sched_fifo_granted_any,
+    };
+    serde_json::json!({
+        "mlockall": mlockall_status(),
+        "sched_fifo_granted": sched_fifo_granted_any(),
+        "sched_fifo_failed": sched_fifo_failed_any(),
+        "rlimit_rtprio_max": rlimit_rtprio_max(),
     })
 }
 
@@ -933,6 +960,18 @@ fn build_resource_budget_payload(
                 .map(|o| o.insert("vaapi".into(), v));
         }
     }
+    // Live thread inventory — counts of hot-path OS threads currently
+    // running. Surfaces the Stage 1 codec-thread fleet, Stage 2 PID-bus
+    // threads (when wired), and Stage 3 PCR PLL sampler threads (when
+    // wired). The wire-emit count comes from active outputs (one
+    // wire-emit thread per UDP-socket-owning output). Additive on the
+    // wire — older managers ignore the field.
+    let threads_payload = serde_json::json!({
+        "codec_pool_count": crate::util::runtime_diag::codec_thread_count(),
+    });
+    payload
+        .as_object_mut()
+        .map(|o| o.insert("threads".into(), threads_payload));
     payload
 }
 

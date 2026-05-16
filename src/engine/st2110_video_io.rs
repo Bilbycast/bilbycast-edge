@@ -150,6 +150,9 @@ fn run_paced_sender(
                 bytes: pkt.clone(),
                 recv_time_us: recv_us,
                 target_tx_time_ns: Some(target_ns),
+                // ST 2110-20/-23 paths run under the St2110Raster
+                // anchor, which ignores ts_offset.
+                ts_offset: 0,
             };
             if wire_red.try_send(dg_red).is_err() {
                 stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
@@ -159,6 +162,7 @@ fn run_paced_sender(
                     bytes: pkt.clone(),
                     recv_time_us: recv_us,
                     target_tx_time_ns: Some(target_ns),
+                    ts_offset: 0,
                 };
                 let _ = blue.try_send(dg_blue);
             }
@@ -1233,6 +1237,7 @@ pub async fn run_st2110_23_output(
                         bytes: pkt.clone(),
                         recv_time_us: recv_us,
                         target_tx_time_ns: Some(target_ns),
+                        ts_offset: 0,
                     };
                     if sinks[i].wire_red.try_send(dg_red).is_err() {
                         sender_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
@@ -1242,6 +1247,7 @@ pub async fn run_st2110_23_output(
                             bytes: pkt.clone(),
                             recv_time_us: recv_us,
                             target_tx_time_ns: Some(target_ns),
+                            ts_offset: 0,
                         };
                         let _ = blue.try_send(dg_blue);
                     }

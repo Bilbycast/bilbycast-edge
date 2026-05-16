@@ -562,6 +562,24 @@ pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
         }
     }
 
+    // Per-flow master-clock config sanity (timeout range; the kind enum
+    // self-validates via serde). `pll_lock_timeout_s == 0` opts out of
+    // the PLL→Wallclock fallback (strict-PLL mode) — allowed. Otherwise
+    // accept 5..=300 s: shorter than 5 s gives legitimate sources no
+    // chance to converge; longer than 300 s defeats the point of a
+    // fallback timeout.
+    if let Some(ref mc) = flow.master_clock {
+        if let Some(t) = mc.pll_lock_timeout_s {
+            if t != 0 && (t < 5 || t > 300) {
+                bail!(
+                    "Flow '{}': master_clock.pll_lock_timeout_s = {} out of range \
+                     (allowed: 0 to opt out, or 5..=300)",
+                    flow.id, t
+                );
+            }
+        }
+    }
+
     // Note: input/output validation is done at the top level in validate_config()
     // since inputs and outputs are now independent top-level definitions referenced
     // by flows via input_id / output_ids.
@@ -623,6 +641,29 @@ pub fn validate_input_definition(def: &InputDefinition) -> Result<()> {
     }
     validate_input(&def.config)?;
     validate_input_interface_bindings(&def.id, &def.config)?;
+    validate_ingress_smoothing(&def.id, &def.config)?;
+    Ok(())
+}
+
+/// Reject `ingress_smoothing_ms` values outside the supported 0..=1000
+/// envelope. Per-input field, only meaningful on the input variants that
+/// expose it (UDP, RTP, SRT, RTMP, RTSP).
+fn validate_ingress_smoothing(input_id: &str, cfg: &InputConfig) -> Result<()> {
+    let ms = match cfg {
+        InputConfig::Rtp(c) => c.ingress_smoothing_ms,
+        InputConfig::Udp(c) => c.ingress_smoothing_ms,
+        InputConfig::Srt(c) => c.ingress_smoothing_ms,
+        InputConfig::Rtmp(c) => c.ingress_smoothing_ms,
+        InputConfig::Rtsp(c) => c.ingress_smoothing_ms,
+        _ => None,
+    };
+    if let Some(v) = ms {
+        if v > 1000 {
+            bail!(
+                "Input '{input_id}': ingress_smoothing_ms = {v} out of range (0..=1000)"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -6907,6 +6948,7 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
+                        ingress_smoothing_ms: None,
             }),
         });
         config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
@@ -7006,6 +7048,7 @@ mod tests {
                 pid_map: None,
                 pid_overrides: None,
                 interface_binding: None,
+                ingress_smoothing_ms: None,
         }));
         assert!(validate_config(&config).is_err());
     }
@@ -7043,6 +7086,7 @@ mod tests {
                 pid_map: None,
                 pid_overrides: None,
                 interface_binding: None,
+                ingress_smoothing_ms: None,
         }));
         assert!(validate_config(&config).is_err());
     }
@@ -7083,6 +7127,7 @@ mod tests {
                 pid_map: None,
                 pid_overrides: None,
                 interface_binding: None,
+                ingress_smoothing_ms: None,
         }));
         let err = validate_config(&config).expect_err("rendezvous+FEC must be rejected");
         let msg = format!("{err:#}");
@@ -7118,6 +7163,7 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
+                        ingress_smoothing_ms: None,
             }),
         });
         config.inputs.push(InputDefinition {
@@ -7143,6 +7189,7 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
+                        ingress_smoothing_ms: None,
             }),
         });
         config.flows.push(FlowConfig {
@@ -7215,6 +7262,7 @@ mod tests {
                 pid_map: None,
                 pid_overrides: None,
                 interface_binding: None,
+                ingress_smoothing_ms: None,
         }));
         assert!(validate_config(&config).is_err());
     }
@@ -7253,6 +7301,7 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
+                        ingress_smoothing_ms: None,
             }),
         });
         config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
@@ -7322,6 +7371,7 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
+                        ingress_smoothing_ms: None,
             }),
         });
         config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
@@ -7387,6 +7437,7 @@ mod tests {
                 pid_map: None,
                 pid_overrides: None,
                 interface_binding: None,
+                ingress_smoothing_ms: None,
         }));
         assert!(validate_config(&config).is_err());
     }
@@ -7417,6 +7468,7 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
+                        ingress_smoothing_ms: None,
             }),
         });
         config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
@@ -7486,6 +7538,7 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
+                        ingress_smoothing_ms: None,
             }),
         });
         config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
@@ -7555,6 +7608,7 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
+                        ingress_smoothing_ms: None,
             }),
         });
         config.outputs.push(OutputConfig::Rtp(RtpOutputConfig {
@@ -8853,6 +8907,7 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
+                        ingress_smoothing_ms: None,
             }),
         };
         // Add a UDP tunnel egress on the same port
@@ -8906,6 +8961,7 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
+                        ingress_smoothing_ms: None,
             }),
         });
         config.inputs.push(InputDefinition {
@@ -8931,6 +8987,7 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
+                        ingress_smoothing_ms: None,
             }),
         });
         assert!(validate_config(&config).is_ok());

@@ -636,6 +636,16 @@ pub struct MasterClockConfig {
     /// Default 0.
     #[serde(default)]
     pub lipsync_offset_90k: i64,
+    /// PLL-lock timeout in seconds. When the `kind` is
+    /// `source_pcr_pll` (or `auto` selects it for the active input)
+    /// and the PLL hasn't locked within this many seconds, the master
+    /// clock falls back to a free-running wallclock master and emits
+    /// a Warning event with the lock failure reason. `None` (or
+    /// unset) → default 30 s. Set to `0` to disable the fallback
+    /// entirely (PLL strict-mode — flow stays unlocked indefinitely
+    /// on unlockable sources). Range when set: 5..=300.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pll_lock_timeout_s: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1789,6 +1799,18 @@ pub struct RtpInputConfig {
     /// when both are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
+    /// Ingress smoothing buffer (0..=1000 ms). When set, packets are
+    /// held in a per-input FIFO and released to the broadcast channel
+    /// at `recv_time_us + ingress_smoothing_ms` so downstream consumers
+    /// (content analysis, thumbnail, PID bus, replay, outputs) see a
+    /// jitter-smoothed stream regardless of network arrival variance.
+    /// Adds end-to-end latency equal to the configured value. `None` or
+    /// `0` disables. Useful primarily for raw UDP / raw RTP inputs that
+    /// lack protocol-level jitter handling; on RTMP / RTSP it's still
+    /// effective but the transports usually deliver smoothly anyway.
+    /// See [`docs/configuration-guide.md`](configuration-guide.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_smoothing_ms: Option<u16>,
 }
 
 /// Raw UDP input — receives datagrams without requiring RTP headers.
@@ -1854,6 +1876,9 @@ pub struct UdpInputConfig {
     /// Pin this input to a physical NIC. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
+    /// Ingress smoothing buffer (0..=1000 ms). See [`RtpInputConfig::ingress_smoothing_ms`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_smoothing_ms: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2042,6 +2067,12 @@ pub struct SrtInputConfig {
     /// See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
+    /// Ingress smoothing buffer (0..=1000 ms). Layered on top of SRT's
+    /// own `latency` jitter buffer — usually redundant; logs a warning
+    /// at startup when both are set. See
+    /// [`RtpInputConfig::ingress_smoothing_ms`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_smoothing_ms: Option<u16>,
 }
 
 /// RTMP input configuration — runs an RTMP server that accepts publish connections.
@@ -2121,6 +2152,10 @@ pub struct RtmpInputConfig {
         with = "crate::config::pid_overrides_serde"
     )]
     pub pid_overrides: Option<TsPidOverridesMap>,
+    /// Ingress smoothing buffer (0..=1000 ms). See
+    /// [`RtpInputConfig::ingress_smoothing_ms`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_smoothing_ms: Option<u16>,
 }
 
 fn default_rtmp_app() -> String {
@@ -2208,6 +2243,10 @@ pub struct RtspInputConfig {
         with = "crate::config::pid_overrides_serde"
     )]
     pub pid_overrides: Option<TsPidOverridesMap>,
+    /// Ingress smoothing buffer (0..=1000 ms). See
+    /// [`RtpInputConfig::ingress_smoothing_ms`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_smoothing_ms: Option<u16>,
 }
 
 fn default_rtsp_timeout() -> u64 {
@@ -5566,6 +5605,7 @@ mod tests {
                                 pid_map: None,
                                 pid_overrides: None,
                                 interface_binding: None,
+                                ingress_smoothing_ms: None,
                 }),
             }],
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
@@ -5637,6 +5677,7 @@ mod tests {
                                 pid_map: None,
                                 pid_overrides: None,
                                 interface_binding: None,
+                                ingress_smoothing_ms: None,
                 }),
             }],
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {

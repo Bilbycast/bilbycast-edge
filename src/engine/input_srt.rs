@@ -30,7 +30,7 @@ use crate::util::rtp_parse::{is_likely_rtp, parse_rtp_sequence_number, parse_rtp
 use crate::util::time::now_us;
 
 use super::input_post_process::{InputPostProcess, InputPostProcessConfig};
-use super::input_transcode::{publish_input_packet_with_post, InputTranscoder};
+use super::input_transcode::InputTranscoder;
 use super::packet::RtpPacket;
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -244,12 +244,30 @@ pub fn spawn_srt_input(
             );
         }
 
+        // Per-input ingress smoothing publisher. Warn when layered on
+        // top of SRT's native `latency` jitter buffer (usually
+        // redundant; operator either set both deliberately or by
+        // mistake — surface either way).
+        crate::engine::ingress_smoothing::warn_if_double_buffer_srt(
+            &input_id,
+            &flow_id,
+            config.ingress_smoothing_ms,
+            config.recv_latency_ms.map(|v| v as u32),
+            &event_sender,
+        );
+        let publisher = crate::engine::ingress_smoothing::IngressPublisher::new(
+            config.ingress_smoothing_ms,
+            broadcast_tx,
+            &input_id,
+            cancel.clone(),
+        );
+
         let result = if config.bonding.is_some() {
-            srt_input_bonded_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
+            srt_input_bonded_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
         } else if config.redundancy.is_some() {
-            srt_input_redundant_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
+            srt_input_redundant_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
         } else {
-            srt_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
+            srt_input_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
         };
         if let Err(e) = result {
             tracing::error!("SRT input task exited with error: {e}");
@@ -264,7 +282,7 @@ pub fn spawn_srt_input(
 
 async fn srt_input_loop(
     config: SrtInputConfig,
-    broadcast_tx: broadcast::Sender<RtpPacket>,
+    publisher: crate::engine::ingress_smoothing::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
@@ -273,8 +291,8 @@ async fn srt_input_loop(
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
     match config.mode {
-        SrtMode::Listener => srt_input_listener_loop(config, broadcast_tx, stats, cancel, events, flow_id, transcoder, post).await,
-        _ => srt_input_caller_loop(config, broadcast_tx, stats, cancel, events, flow_id, transcoder, post).await,
+        SrtMode::Listener => srt_input_listener_loop(config, publisher, stats, cancel, events, flow_id, transcoder, post).await,
+        _ => srt_input_caller_loop(config, publisher, stats, cancel, events, flow_id, transcoder, post).await,
     }
 }
 
@@ -282,7 +300,7 @@ async fn srt_input_loop(
 /// on disconnect.
 async fn srt_input_listener_loop(
     config: SrtInputConfig,
-    broadcast_tx: broadcast::Sender<RtpPacket>,
+    publisher: crate::engine::ingress_smoothing::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
@@ -352,7 +370,7 @@ async fn srt_input_listener_loop(
         spawn_srt_stats_poller(socket.clone(), stats.input_srt_stats_cache.clone(), poller_cancel.clone());
 
         let disconnected = srt_input_recv_loop(
-            &socket, &broadcast_tx, &stats, &cancel,
+            &socket, &publisher, &stats, &cancel,
             &mut format, &mut last_seq, &mut raw_ts_seq_counter, &mut raw_ts_timestamp,
             transcoder,
             post,
@@ -390,7 +408,7 @@ async fn srt_input_listener_loop(
 /// Caller-mode input: reconnects with exponential back-off on disconnect.
 async fn srt_input_caller_loop(
     config: SrtInputConfig,
-    broadcast_tx: broadcast::Sender<RtpPacket>,
+    publisher: crate::engine::ingress_smoothing::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
@@ -446,7 +464,7 @@ async fn srt_input_caller_loop(
         spawn_srt_stats_poller(socket.clone(), stats.input_srt_stats_cache.clone(), poller_cancel.clone());
 
         let disconnected = srt_input_recv_loop(
-            &socket, &broadcast_tx, &stats, &cancel,
+            &socket, &publisher, &stats, &cancel,
             &mut format, &mut last_seq, &mut raw_ts_seq_counter, &mut raw_ts_timestamp,
             transcoder,
             post,
@@ -487,7 +505,7 @@ async fn srt_input_caller_loop(
 /// `Ok(false)` if cancelled (flow is shutting down).
 async fn srt_input_recv_loop(
     socket: &Arc<srt_transport::SrtSocket>,
-    broadcast_tx: &broadcast::Sender<RtpPacket>,
+    publisher: &crate::engine::ingress_smoothing::IngressPublisher,
     stats: &Arc<FlowStatsAccumulator>,
     cancel: &CancellationToken,
     format: &mut SrtPayloadFormat,
@@ -572,7 +590,7 @@ async fn srt_input_recv_loop(
                             upstream_leg_id: None,
                         };
 
-                        publish_input_packet_with_post(transcoder, post, broadcast_tx, packet);
+                        crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, publisher, packet);
                     }
                     Err(_) => {
                         tracing::warn!("SRT input connection lost, will reconnect");
@@ -600,7 +618,7 @@ async fn srt_input_recv_loop(
 /// reconnect with exponential back-off.
 async fn srt_input_redundant_loop(
     config: SrtInputConfig,
-    broadcast_tx: broadcast::Sender<RtpPacket>,
+    publisher: crate::engine::ingress_smoothing::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
@@ -846,7 +864,7 @@ async fn srt_input_redundant_loop(
                                 &mut failover,
                                 &mut prev_active_leg,
                                 &stats,
-                                &broadcast_tx,
+                                &publisher,
                                 transcoder,
                                 post,
                             );
@@ -880,7 +898,7 @@ async fn srt_input_redundant_loop(
                                 &mut failover,
                                 &mut prev_active_leg,
                                 &stats,
-                                &broadcast_tx,
+                                &publisher,
                                 transcoder,
                                 post,
                             );
@@ -1057,7 +1075,7 @@ fn process_redundant_packet(
     failover: &mut RawTsFailover,
     prev_active_leg: &mut ActiveLeg,
     stats: &Arc<FlowStatsAccumulator>,
-    broadcast_tx: &broadcast::Sender<RtpPacket>,
+    publisher: &crate::engine::ingress_smoothing::IngressPublisher,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) {
@@ -1122,7 +1140,7 @@ fn process_redundant_packet(
         upstream_leg_id: None,
     };
 
-    publish_input_packet_with_post(transcoder, post, broadcast_tx, packet);
+    crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, publisher, packet);
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,7 +1155,7 @@ fn process_redundant_packet(
 /// bonded callers).
 async fn srt_input_bonded_loop(
     config: SrtInputConfig,
-    broadcast_tx: broadcast::Sender<RtpPacket>,
+    publisher: crate::engine::ingress_smoothing::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
@@ -1148,13 +1166,13 @@ async fn srt_input_bonded_loop(
     match config.mode {
         SrtMode::Listener => {
             srt_input_bonded_listener_loop(
-                config, broadcast_tx, stats, cancel, events, flow_id, transcoder, post,
+                config, publisher, stats, cancel, events, flow_id, transcoder, post,
             )
             .await
         }
         _ => {
             srt_input_bonded_caller_loop(
-                config, broadcast_tx, stats, cancel, events, flow_id, transcoder, post,
+                config, publisher, stats, cancel, events, flow_id, transcoder, post,
             )
             .await
         }
@@ -1163,7 +1181,7 @@ async fn srt_input_bonded_loop(
 
 async fn srt_input_bonded_caller_loop(
     config: SrtInputConfig,
-    broadcast_tx: broadcast::Sender<RtpPacket>,
+    publisher: crate::engine::ingress_smoothing::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
@@ -1229,7 +1247,7 @@ async fn srt_input_bonded_caller_loop(
 
         let disconnected = srt_bonded_group_recv_loop(
             &group,
-            &broadcast_tx,
+            &publisher,
             &stats,
             &cancel,
             &mut format,
@@ -1265,7 +1283,7 @@ async fn srt_input_bonded_caller_loop(
 
 async fn srt_input_bonded_listener_loop(
     config: SrtInputConfig,
-    broadcast_tx: broadcast::Sender<RtpPacket>,
+    publisher: crate::engine::ingress_smoothing::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
@@ -1331,7 +1349,7 @@ async fn srt_input_bonded_listener_loop(
 
         let disconnected = srt_input_recv_loop(
             &socket,
-            &broadcast_tx,
+            &publisher,
             &stats,
             &cancel,
             &mut format,
@@ -1373,7 +1391,7 @@ async fn srt_input_bonded_listener_loop(
 #[allow(clippy::too_many_arguments)]
 async fn srt_bonded_group_recv_loop(
     group: &Arc<srt_transport::SrtGroup>,
-    broadcast_tx: &broadcast::Sender<RtpPacket>,
+    publisher: &crate::engine::ingress_smoothing::IngressPublisher,
     stats: &Arc<FlowStatsAccumulator>,
     cancel: &CancellationToken,
     format: &mut SrtPayloadFormat,
@@ -1442,7 +1460,7 @@ async fn srt_bonded_group_recv_loop(
                             upstream_seq: None,
                             upstream_leg_id: None,
                         };
-                        publish_input_packet_with_post(transcoder, post, broadcast_tx, packet);
+                        crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, publisher, packet);
                     }
                     Err(_) => {
                         tracing::warn!("SRT bonded input connection lost, will reconnect");
