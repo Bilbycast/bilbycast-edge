@@ -194,6 +194,21 @@ fn pcr_gap_27mhz(prev: u64, cur: u64) -> i64 {
 /// otherwise-clean sources.
 fn sample_packet(master: &SourcePcrPllMaster, pkt: &RtpPacket) -> Option<u64> {
     let recv_time_us = pkt.recv_time_us;
+    // Sender-timestamp path: when the SRT/RIST input surfaced a
+    // sender-set timestamp (libsrt's `SRT_MsgCtrl::srctime`), prefer
+    // it over MPEG-TS PCR-from-bytes. srctime is set at the sender's
+    // `sendmsg()` — pre-network-jitter, pre-TSBPD-buffering — so the
+    // PLL's `Δsrctime / Δrecv_wall` measurement reflects the true
+    // sender clock rate rather than the bursty arrival cadence at
+    // the receiver. One sample per packet is plenty (vs. the
+    // 25–40 ms PCR cadence), so the PLL converges faster too.
+    //
+    // We still scan the bytes for PCR below so the discontinuity
+    // event surfaces correctly. The PLL itself only gets one of the
+    // two feeds — telemetry's `rate_source` reflects which.
+    if let Some(srctime_us) = pkt.sender_timestamp_us {
+        master.record_sender_timestamp(srctime_us, recv_time_us);
+    }
     let bytes = pkt.data.as_ref();
     let payload = if pkt.is_raw_ts {
         bytes
@@ -214,7 +229,12 @@ fn sample_packet(master: &SourcePcrPllMaster, pkt: &RtpPacket) -> Option<u64> {
         let ts_pkt = &payload[i..i + TS_PACKET_SIZE];
         if ts_pkt[0] == TS_SYNC_BYTE {
             if let Some(pcr_27mhz) = extract_pcr(ts_pkt) {
-                master.record_sample_at(pcr_27mhz, recv_time_us);
+                // Only feed PCR to the PLL when srctime wasn't
+                // available — otherwise we'd mix two rate references
+                // in the jitter window and the PLL would never lock.
+                if pkt.sender_timestamp_us.is_none() {
+                    master.record_sample_at(pcr_27mhz, recv_time_us);
+                }
                 latest_pcr = Some(pcr_27mhz);
             }
             i += TS_PACKET_SIZE;
@@ -291,6 +311,7 @@ mod tests {
             is_raw_ts: true,
             upstream_seq: None,
             upstream_leg_id: None,
+            sender_timestamp_us: None,
         };
         sample_packet(&master, &pkt);
         // First sample primes the PLL (no cumulative count yet).
@@ -328,6 +349,7 @@ mod tests {
             is_raw_ts: false,
             upstream_seq: None,
             upstream_leg_id: None,
+            sender_timestamp_us: None,
         };
         sample_packet(&master, &pkt);
 
@@ -356,6 +378,7 @@ mod tests {
             is_raw_ts: true,
             upstream_seq: None,
             upstream_leg_id: None,
+            sender_timestamp_us: None,
         };
         sample_packet(&master, &pkt);
         let t = master.pll().telemetry();

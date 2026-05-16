@@ -90,6 +90,7 @@ pub trait MasterClock: Send + Sync + 'static {
             fallback_active: false,
             fallback_reason: None,
             active_input_id: None,
+            rate_source: None,
         }
     }
 }
@@ -119,21 +120,19 @@ pub enum MasterClockKind {
     Passthrough,
     /// Sender-timestamp recovery for SRT / RIST inputs. Uses the
     /// transport's per-packet sender timestamp (libsrt's
-    /// `SRT_MsgCtrl::srctime`, RIST's RTP-extension timestamp) as the
-    /// rate reference, instead of MPEG-TS PCR sampled from the bytes.
-    /// Cleaner under wide-area network jitter because the timestamp
-    /// is set at the sender's `sendmsg()` — pre-network-jitter — and
-    /// is not subject to the bursty arrival cadence that PCR-from-
-    /// bytes sees behind a 200 ms SRT latency buffer.
+    /// `SRT_MsgCtrl::srctime` — surfaced on `RtpPacket.sender_timestamp_us`
+    /// by `input_srt`) as the rate reference, with MPEG-TS PCR from the
+    /// bytes as a per-packet fallback when the sender didn't propagate
+    /// srctime. Cleaner under wide-area network jitter because the
+    /// timestamp is set at the sender's `sendmsg()` — pre-network-
+    /// jitter — and is not subject to the bursty arrival cadence that
+    /// PCR-from-bytes sees behind the TSBPD latency buffer.
     ///
-    /// **Status**: framework wired through `MasterClockKindConfig` and
-    /// the auto-policy gate; the underlying srctime extraction in
-    /// `bilbycast-libsrt-rs::srt-transport::epoll_bridge` (and
-    /// equivalent in `bilbycast-srt`, `bilbycast-rist`) is **not yet
-    /// surfaced** on the recv API. Selecting this kind today logs a
-    /// Warning event explaining the deferred wiring and falls through
-    /// to [`Self::SourcePcrPll`] semantics at runtime. Track in
-    /// `project_sender_timestamp_clock_recovery.md` (TBD).
+    /// Runtime is identical to [`Self::SourcePcrPll`] (same `PcrPll`
+    /// recovers rate from any monotonic-clock sample stream); what
+    /// differs is the sampler's per-packet decision rule (prefer
+    /// srctime, fall back to PCR). Telemetry exposes which source
+    /// actually fed the most recent sample via `rate_source`.
     SenderTimestamp,
     /// Last-resort monotonic wall clock. Loud telemetry warning.
     /// Distinct from [`Self::Passthrough`] semantically: this is the
@@ -194,6 +193,14 @@ pub struct MasterClockTelemetry {
     /// (`ptp`, bare `wallclock`). Additive — older managers ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_input_id: Option<String>,
+    /// Which rate-sample source last fed the PLL. `"sender_timestamp"`
+    /// for SRT/RIST inputs delivering libsrt's `SRT_MsgCtrl::srctime`,
+    /// `"pcr"` for MPEG-TS PCR sampled from the adaptation field,
+    /// `"none"` before the first sample lands. Additive — older
+    /// managers ignore it; only meaningful for `source_pcr_pll`-class
+    /// clocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_source: Option<String>,
 }
 
 #[inline]
@@ -210,6 +217,32 @@ impl Default for MasterClockTelemetry {
             fallback_active: false,
             fallback_reason: None,
             active_input_id: None,
+            rate_source: None,
+        }
+    }
+}
+
+/// Rate-sample source feeding the PLL. Surfaced on telemetry so
+/// operators can tell whether the master clock is recovering from
+/// SRT/RIST sender timestamps (cleaner — set at sendmsg() time, pre-
+/// network-jitter) or MPEG-TS PCR sampled from the bytes (subject to
+/// the bursty arrival cadence behind a 200 ms+ latency buffer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateSampleSource {
+    /// No samples have reached the PLL yet (startup state).
+    None,
+    /// Most recent sample was from `pkt.sender_timestamp_us`.
+    SenderTimestamp,
+    /// Most recent sample was from an MPEG-TS adaptation-field PCR.
+    Pcr,
+}
+
+impl RateSampleSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::SenderTimestamp => "sender_timestamp",
+            Self::Pcr => "pcr",
         }
     }
 }
@@ -224,6 +257,10 @@ pub struct SourcePcrPllMaster {
     /// `wall_ns` values land on the same clock.
     epoch: Instant,
     source_id: String,
+    /// Latest sample source — lock-free atomic so `telemetry()` can
+    /// read without coordinating with the sampler thread. Stored as
+    /// `u8` to fit in an atomic; `RateSampleSource::as_str` decodes.
+    rate_source: std::sync::atomic::AtomicU8,
 }
 
 impl SourcePcrPllMaster {
@@ -244,6 +281,7 @@ impl SourcePcrPllMaster {
             pll: Arc::new(crate::engine::pcr_pll::PcrPll::new(config)),
             epoch: Instant::now(),
             source_id: source_id.into(),
+            rate_source: std::sync::atomic::AtomicU8::new(RateSampleSource::None as u8),
         }
     }
 
@@ -256,7 +294,47 @@ impl SourcePcrPllMaster {
             pll,
             epoch,
             source_id: source_id.into(),
+            rate_source: std::sync::atomic::AtomicU8::new(RateSampleSource::None as u8),
         }
+    }
+
+    /// Lock-free read of the latest rate-sample source. Exposed on
+    /// `MasterClockTelemetry.rate_source`.
+    pub fn rate_source(&self) -> RateSampleSource {
+        match self.rate_source.load(std::sync::atomic::Ordering::Relaxed) {
+            x if x == RateSampleSource::SenderTimestamp as u8 => {
+                RateSampleSource::SenderTimestamp
+            }
+            x if x == RateSampleSource::Pcr as u8 => RateSampleSource::Pcr,
+            _ => RateSampleSource::None,
+        }
+    }
+
+    /// Feed a sample taken from the SRT/RIST sender's `srctime`
+    /// (microseconds since Unix epoch on the sender's wallclock).
+    /// Bypasses the PCR-from-bytes path. Cleaner under wide-area
+    /// network jitter — the timestamp is set at the sender's
+    /// `sendmsg()`, pre-TSBPD-buffering.
+    ///
+    /// **Caveat**: this recovers the sender's *wallclock* rate, not
+    /// the source's media-clock rate. For production encoders these
+    /// are typically the same crystal (encoder reads one clock for
+    /// both PTS generation and `sendmsg` pacing). For ffmpeg `-re`
+    /// reading a file, sender wallclock and media clock diverge by
+    /// whatever the host's CPU clock vs the file's encoded PCR rate
+    /// is — typically a few ppm, harmless in practice.
+    pub fn record_sender_timestamp(&self, srctime_us: i64, recv_time_us: u64) {
+        // Convert µs → 27 MHz tick equivalent (×27). This makes the
+        // PLL's recovered_rate dimensionally identical to the PCR-from-
+        // bytes path and lets the rest of the data plane consume
+        // `now_27mhz()` without caring which source fed the PLL.
+        let pseudo_27mhz = (srctime_us as i128 * 27) as u64;
+        let wall_ns = (recv_time_us as u128) * 1000;
+        self.pll.record_sample(pseudo_27mhz, wall_ns);
+        self.rate_source.store(
+            RateSampleSource::SenderTimestamp as u8,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     pub fn pll(&self) -> Arc<crate::engine::pcr_pll::PcrPll> {
@@ -294,6 +372,10 @@ impl SourcePcrPllMaster {
     pub fn record_sample_at(&self, pcr_27mhz: u64, recv_time_us: u64) {
         let wall_ns = (recv_time_us as u128) * 1000;
         self.pll.record_sample(pcr_27mhz, wall_ns);
+        self.rate_source.store(
+            RateSampleSource::Pcr as u8,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Reset the underlying PLL's anchor + lock state. Called on
@@ -329,6 +411,7 @@ impl MasterClock for SourcePcrPllMaster {
             fallback_active: false,
             fallback_reason: None,
             active_input_id: None,
+            rate_source: Some(self.rate_source().as_str().to_string()),
         }
     }
 }
@@ -404,6 +487,7 @@ impl MasterClock for PtpMasterClock {
             fallback_active: false,
             fallback_reason: None,
             active_input_id: None,
+            rate_source: None,
         }
     }
 }
@@ -487,6 +571,7 @@ impl MasterClock for WallclockMaster {
             fallback_active: false,
             fallback_reason: None,
             active_input_id: None,
+            rate_source: None,
         }
     }
 }

@@ -371,6 +371,7 @@ fn publish_chunks(
         is_raw_ts: true,
         upstream_seq: None,
         upstream_leg_id: None,
+        sender_timestamp_us: None,
     };
     *seq_num = seq_num.wrapping_add(1);
     stats.input_packets.fetch_add(1, Ordering::Relaxed);

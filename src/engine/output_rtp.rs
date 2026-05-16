@@ -426,6 +426,7 @@ async fn rtp_output_loop(
                                     is_raw_ts: packet.is_raw_ts,
                                     upstream_seq: None,
                                     upstream_leg_id: None,
+                                    sender_timestamp_us: None,
                                 },
                                 None => continue,
                             }
@@ -444,6 +445,7 @@ async fn rtp_output_loop(
                                     is_raw_ts: packet.is_raw_ts,
                                     upstream_seq: None,
                                     upstream_leg_id: None,
+                                    sender_timestamp_us: None,
                                 },
                                 None => continue,
                             }
@@ -461,6 +463,7 @@ async fn rtp_output_loop(
                                     is_raw_ts: packet.is_raw_ts,
                                     upstream_seq: None,
                                     upstream_leg_id: None,
+                                    sender_timestamp_us: None,
                                 },
                                 None => continue,
                             }
@@ -884,6 +887,7 @@ async fn rtp_output_redundant_loop(
                                     is_raw_ts: packet.is_raw_ts,
                                     upstream_seq: None,
                                     upstream_leg_id: None,
+                                    sender_timestamp_us: None,
                                 },
                                 None => continue,
                             }
@@ -901,6 +905,7 @@ async fn rtp_output_redundant_loop(
                                     is_raw_ts: packet.is_raw_ts,
                                     upstream_seq: None,
                                     upstream_leg_id: None,
+                                    sender_timestamp_us: None,
                                 },
                                 None => continue,
                             }

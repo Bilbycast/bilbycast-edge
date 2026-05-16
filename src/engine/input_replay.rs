@@ -501,6 +501,7 @@ async fn pump_one_bundle(
                 is_raw_ts: true,
                 upstream_seq: None,
                 upstream_leg_id: None,
+                sender_timestamp_us: None,
             };
             crate::engine::input_transcode::publish_input_packet_with_post(transcoder, post, per_input_tx, pkt);
             flow_stats.input_bytes.fetch_add(bundle_len as u64, Ordering::Relaxed);
@@ -568,6 +569,7 @@ async fn pump_one_bundle(
         is_raw_ts: true,
         upstream_seq: None,
         upstream_leg_id: None,
+        sender_timestamp_us: None,
     };
     crate::engine::input_transcode::publish_input_packet_with_post(transcoder, post, per_input_tx, pkt);
     flow_stats.input_bytes.fetch_add(bundle_len as u64, Ordering::Relaxed);

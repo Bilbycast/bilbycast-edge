@@ -169,6 +169,7 @@ impl FecDecoder {
             is_raw_ts: false,
             upstream_seq: None,
             upstream_leg_id: None,
+            sender_timestamp_us: None,
         });
 
         self.attempt_recovery(&mut result);
@@ -401,6 +402,7 @@ impl FecDecoder {
             is_raw_ts: false,
             upstream_seq: None,
             upstream_leg_id: None,
+            sender_timestamp_us: None,
         }
     }
 

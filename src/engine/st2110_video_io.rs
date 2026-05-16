@@ -617,6 +617,7 @@ fn encode_worker(
                     is_raw_ts: true,
                     upstream_seq: None,
                     upstream_leg_id: None,
+                    sender_timestamp_us: None,
                 };
                 stats.input_packets.fetch_add(1, Ordering::Relaxed);
                 stats.input_bytes.fetch_add(ts_len, Ordering::Relaxed);

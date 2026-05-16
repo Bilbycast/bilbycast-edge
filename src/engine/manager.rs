@@ -1005,6 +1005,7 @@ mod tests {
             recv_time_us: 0,
             upstream_seq: None,
             upstream_leg_id: None,
+            sender_timestamp_us: None,
             is_raw_ts: true,
         };
         tx.send(pkt).expect("send ok");

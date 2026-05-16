@@ -3068,6 +3068,7 @@ fn null_ts_packet() -> RtpPacket {
         is_raw_ts: true,
         upstream_seq: None,
         upstream_leg_id: None,
+        sender_timestamp_us: None,
     }
 }
 
@@ -3119,6 +3120,7 @@ async fn ts_fixer_task(
                                 is_raw_ts: pkt.is_raw_ts,
                                 upstream_seq: None,
                                 upstream_leg_id: None,
+                                sender_timestamp_us: None,
                             }).is_err() {
                                 FIXER_OUT_NO_RECEIVERS.fetch_add(1, Ordering::Relaxed);
                             }
@@ -4868,27 +4870,19 @@ fn build_master_clock(
         Some(MasterClockKindConfig::AudioMaster) => MasterClockKind::AudioMaster,
         Some(MasterClockKindConfig::Passthrough) => MasterClockKind::Passthrough,
         Some(MasterClockKindConfig::SenderTimestamp) => {
-            // Framework wired but the libsrt `srctime` extraction in
-            // `bilbycast-libsrt-rs::epoll_bridge` (and equivalent in
-            // `bilbycast-srt`, `bilbycast-rist`) isn't surfaced on
-            // the recv API yet. Run as SourcePcrPll until that lands;
-            // emit a one-shot Warning so the operator sees we honoured
-            // the kind tag but degraded the rate source.
-            event_sender.emit_flow_with_details(
-                crate::manager::events::EventSeverity::Warning,
-                crate::manager::events::category::MASTER_CLOCK,
-                format!(
-                    "flow '{}': master_clock.kind=sender_timestamp selected, but the \
-                     SRT/RIST srctime feed isn't yet wired through the recv API. \
-                     Running as source_pcr_pll for this session — the lock criterion \
-                     is the same; only the rate reference differs",
-                    cfg.id
-                ),
-                &cfg.id,
-                serde_json::json!({
-                    "error_code": "master_clock_sender_timestamp_pending",
-                }),
-            );
+            // Sender-timestamp recovery is wired through the PLL via
+            // `pcr_ingress_sampler::sample_packet`'s per-packet
+            // preference rule: when the packet carries
+            // `RtpPacket.sender_timestamp_us` (libsrt's
+            // `SRT_MsgCtrl::srctime` surfaced by `input_srt`), the
+            // sampler feeds the PLL via
+            // `SourcePcrPllMaster::record_sender_timestamp`; otherwise
+            // it falls back to MPEG-TS PCR sampled from the bytes.
+            //
+            // Runtime kind stays `SourcePcrPll` (same PLL math). The
+            // operator's `SenderTimestamp` choice is preserved on
+            // `MasterClockTelemetry.configured_kind` for the UI label,
+            // and the per-sample source is exposed on `rate_source`.
             MasterClockKind::SourcePcrPll
         }
         Some(MasterClockKindConfig::Wallclock) => MasterClockKind::Wallclock,

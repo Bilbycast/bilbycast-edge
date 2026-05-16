@@ -417,6 +417,7 @@ mod tests {
             recv_time_us: 12345,
             upstream_seq: None,
             upstream_leg_id: None,
+            sender_timestamp_us: None,
             is_raw_ts: true,
         }
     }
@@ -536,6 +537,7 @@ mod tests {
             recv_time_us: 1,
             upstream_seq: None,
             upstream_leg_id: None,
+            sender_timestamp_us: None,
             is_raw_ts: false,
         };
         demux.process(&pkt);

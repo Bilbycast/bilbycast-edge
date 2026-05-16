@@ -577,7 +577,15 @@ async fn srt_input_recv_loop(
             }
             result = socket.recv() => {
                 match result {
-                    Ok(data) => {
+                    Ok(pkt) => {
+                        // Destructure the libsrt-surfaced packet: `data` is the
+                        // payload, `srctime_us` is the sender-set µs timestamp
+                        // (None when the sender's srt_sendmsg2 msgctrl was NULL
+                        // or carried srctime=0). The latter feeds
+                        // SenderTimestampMaster downstream; we attach it to the
+                        // emitted RtpPacket below.
+                        let srctime_us = pkt.sender_timestamp_us;
+                        let data = pkt.data;
                         // Auto-detect format on first packet
                         if *format == SrtPayloadFormat::Unknown {
                             *format = detect_format(&data);
@@ -658,6 +666,7 @@ async fn srt_input_recv_loop(
                             is_raw_ts: is_raw,
                             upstream_seq: None,
                             upstream_leg_id: None,
+                            sender_timestamp_us: srctime_us,
                         };
 
                         crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, publisher, packet);
@@ -919,13 +928,16 @@ async fn srt_input_redundant_loop(
                 }
                 result = socket_leg1.recv(), if leg1_alive => {
                     match result {
-                        Ok(data) => {
+                        Ok(pkt) => {
+                            let srctime_us = pkt.sender_timestamp_us;
+                            let data = pkt.data;
                             if format == SrtPayloadFormat::Unknown {
                                 format = detect_format(&data);
                                 log_detected_format_redundant(format, &events, flow_id);
                             }
                             process_redundant_packet(
                                 data,
+                                srctime_us,
                                 ActiveLeg::Leg1,
                                 format,
                                 &mut raw_ts_seq_leg1,
@@ -953,13 +965,16 @@ async fn srt_input_redundant_loop(
                 }
                 result = leg2_recv, if leg2_alive => {
                     match result {
-                        Ok(data) => {
+                        Ok(pkt) => {
+                            let srctime_us = pkt.sender_timestamp_us;
+                            let data = pkt.data;
                             if format == SrtPayloadFormat::Unknown {
                                 format = detect_format(&data);
                                 log_detected_format_redundant(format, &events, flow_id);
                             }
                             process_redundant_packet(
                                 data,
+                                srctime_us,
                                 ActiveLeg::Leg2,
                                 format,
                                 &mut raw_ts_seq_leg2,
@@ -1137,6 +1152,7 @@ impl RawTsFailover {
 ///   shared seq across legs.
 fn process_redundant_packet(
     data: Bytes,
+    srctime_us: Option<i64>,
     leg: ActiveLeg,
     format: SrtPayloadFormat,
     raw_ts_seq: &mut u16,
@@ -1212,6 +1228,7 @@ fn process_redundant_packet(
         is_raw_ts: is_raw,
         upstream_seq: None,
         upstream_leg_id: None,
+        sender_timestamp_us: srctime_us,
     };
 
     crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, publisher, packet);
@@ -1480,7 +1497,9 @@ async fn srt_bonded_group_recv_loop(
             _ = cancel.cancelled() => return Ok(false),
             result = group.recv() => {
                 match result {
-                    Ok(data) => {
+                    Ok(pkt) => {
+                        let srctime_us = pkt.sender_timestamp_us;
+                        let data = pkt.data;
                         if *format == SrtPayloadFormat::Unknown {
                             *format = detect_format(&data);
                             if *format == SrtPayloadFormat::Unknown {
@@ -1539,6 +1558,7 @@ async fn srt_bonded_group_recv_loop(
                             is_raw_ts: is_raw,
                             upstream_seq: None,
                             upstream_leg_id: None,
+                            sender_timestamp_us: srctime_us,
                         };
                         crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, publisher, packet);
                     }

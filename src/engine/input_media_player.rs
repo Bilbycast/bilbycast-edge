@@ -1452,6 +1452,7 @@ pub(super) fn emit_bundle(
         is_raw_ts: true,
         upstream_seq: None,
         upstream_leg_id: None,
+        sender_timestamp_us: None,
     };
     *session.seq_num = session.seq_num.wrapping_add(1);
     session
@@ -1516,6 +1517,7 @@ async fn emit_to_pacer(
         is_raw_ts: true,
         upstream_seq: None,
         upstream_leg_id: None,
+        sender_timestamp_us: None,
     };
     *session.seq_num = session.seq_num.wrapping_add(1);
     session.stats.input_packets.fetch_add(1, Ordering::Relaxed);

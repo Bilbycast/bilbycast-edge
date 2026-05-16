@@ -287,6 +287,7 @@ fn publish(
         is_raw_ts: true,
         upstream_seq: None,
         upstream_leg_id: None,
+        sender_timestamp_us: None,
     };
 
     publish_input_packet_with_post(transcoder, post, broadcast_tx, packet);
@@ -436,6 +437,7 @@ fn handle_redundant_leg(
         is_raw_ts: true,
         upstream_seq: None,
         upstream_leg_id: None,
+        sender_timestamp_us: None,
     };
 
     publish_input_packet_with_post(transcoder, post, broadcast_tx, packet);

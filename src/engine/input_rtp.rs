@@ -415,6 +415,7 @@ async fn rtp_input_loop(
                                 // the seq-aware path.
                                 upstream_seq: Some(seq),
                                 upstream_leg_id: None,
+                                sender_timestamp_us: None,
                             };
                             crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, &publisher, packet);
                         }
@@ -873,6 +874,7 @@ fn process_redundant_rtp_packet(
             is_raw_ts: false,
             upstream_seq: Some(seq),
             upstream_leg_id: None, // filled in by publish_emitted_*
+            sender_timestamp_us: None,
         };
         for (chosen, p) in merger.ingest(packet, leg, now, stats) {
             publish_emitted_redundant_packet(chosen, p, publisher, stats, transcoder, post);

@@ -1913,6 +1913,7 @@ fn flush(
         is_raw_ts: true,
         upstream_seq: None,
         upstream_leg_id: None,
+        sender_timestamp_us: None,
     };
     // `send` returns Err when there are no subscribers (e.g. flow still
     // warming). That's fine — we don't buffer, by design.

@@ -193,6 +193,7 @@ fn publish(
         is_raw_ts: true,
         upstream_seq: None,
         upstream_leg_id: None,
+        sender_timestamp_us: None,
     };
     let _ = broadcast_tx.send(packet);
 }

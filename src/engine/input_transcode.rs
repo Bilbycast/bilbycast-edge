@@ -579,6 +579,7 @@ pub fn process_input_packet_with_post(
         is_raw_ts: true,
         upstream_seq: None,
         upstream_leg_id: None,
+        sender_timestamp_us: None,
     })
 }
 

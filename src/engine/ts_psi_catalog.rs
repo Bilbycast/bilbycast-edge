@@ -468,6 +468,7 @@ mod tests {
             is_raw_ts: true,
             upstream_seq: None,
             upstream_leg_id: None,
+            sender_timestamp_us: None,
         };
         observe_packet(&pkt, state, store);
     }

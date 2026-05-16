@@ -208,6 +208,7 @@ impl TsContinuityFixer {
                 is_raw_ts: true,
                 upstream_seq: None,
                 upstream_leg_id: None,
+                sender_timestamp_us: None,
             });
         }
         for mut pmt in cache.cached_pmts.values().copied() {
@@ -220,6 +221,7 @@ impl TsContinuityFixer {
                 is_raw_ts: true,
                 upstream_seq: None,
                 upstream_leg_id: None,
+                sender_timestamp_us: None,
             });
         }
         out
@@ -339,6 +341,7 @@ impl TsContinuityFixer {
                 is_raw_ts: true,
                 upstream_seq: None,
                 upstream_leg_id: None,
+                sender_timestamp_us: None,
             });
         }
 
@@ -353,6 +356,7 @@ impl TsContinuityFixer {
                 is_raw_ts: true,
                 upstream_seq: None,
                 upstream_leg_id: None,
+                sender_timestamp_us: None,
             });
         }
 
@@ -620,6 +624,7 @@ mod tests {
             is_raw_ts: true,
             upstream_seq: None,
             upstream_leg_id: None,
+            sender_timestamp_us: None,
         }
     }
 
@@ -872,6 +877,7 @@ mod tests {
             is_raw_ts: false,
             upstream_seq: None,
             upstream_leg_id: None,
+            sender_timestamp_us: None,
         };
 
         assert!(matches!(fixer.process_packet("a", &pkt), ProcessResult::Unchanged));
@@ -893,6 +899,7 @@ mod tests {
             is_raw_ts: false,
             upstream_seq: None,
             upstream_leg_id: None,
+            sender_timestamp_us: None,
         };
 
         let result = fixer.process_packet("b", &pkt2).unwrap_rewritten();

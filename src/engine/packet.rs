@@ -52,4 +52,15 @@ pub struct RtpPacket {
     /// single-leg inputs. Used by the seq-aware merger to attribute
     /// failover events.
     pub upstream_leg_id: Option<u8>,
+    /// Sender-set per-packet timestamp in microseconds since the Unix
+    /// epoch, when the transport surfaces it. Today: libsrt's
+    /// `SRT_MsgCtrl::srctime` reaches us as `Some(_)` on raw-TS-over-
+    /// SRT inputs; everywhere else this is `None`. Consumed by
+    /// `engine::master_clock::SenderTimestampMaster` for PLL rate
+    /// recovery on internet-contribution paths where MPEG-TS PCR
+    /// sampled from the bytes after a 200 ms+ latency-buffer release
+    /// is too bursty for the PLL to lock cleanly. Sender timestamps
+    /// are set at `sendmsg()` time — pre-network-jitter — so they
+    /// are not affected by TSBPD release cadence at the receiver.
+    pub sender_timestamp_us: Option<i64>,
 }
