@@ -2448,6 +2448,7 @@ impl FlowStatsAccumulator {
             configured_kind: telemetry.configured_kind,
             fallback_active: telemetry.fallback_active,
             fallback_reason: telemetry.fallback_reason,
+            active_input_id: telemetry.active_input_id,
         };
         if let Ok(mut g) = self.master_clock_state.write() {
             *g = Some(stats);

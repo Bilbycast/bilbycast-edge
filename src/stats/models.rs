@@ -146,6 +146,16 @@ pub struct MasterClockStats {
     /// Set only when `fallback_active`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
+    /// ID of the input currently feeding the clock. For
+    /// `source_pcr_pll` this is the active input whose PCR samples the
+    /// PLL is tracking; the field refreshes on operator-driven input
+    /// switches without re-creating the master. `None` for clock kinds
+    /// that don't take their rate from a single ingress stream (`ptp`,
+    /// bare `wallclock`). Lets the manager UI render "PLL locked on
+    /// <input_id>" / "wallclock fallback after failing on <input_id>".
+    /// Additive — older managers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_input_id: Option<String>,
 }
 
 #[inline]

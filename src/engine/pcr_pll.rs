@@ -450,6 +450,29 @@ impl PcrPll {
             .unwrap_or(false)
     }
 
+    /// Drop all anchor + jitter state so the next [`record_sample`] call
+    /// re-anchors as if it were the first sample. Used on operator-driven
+    /// active-input switches: the new input's PCR base is unrelated to
+    /// the previous input's, and the in-loop discontinuity gate would
+    /// reject the new anchor for one extra sample before recovering. A
+    /// hard reset gets us re-locked faster. Lock-state is also cleared
+    /// — the new stream has to re-acquire lock on its own samples.
+    pub fn reset_anchor(&self) {
+        let mut s = match self.state.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        s.last_pcr_27mhz = None;
+        s.last_wall_ns = None;
+        s.anchor_pcr_27mhz = None;
+        s.anchor_wall_ns = None;
+        s.rate = EXPECTED_RATE_TICKS_PER_NS;
+        s.integral = 0.0;
+        s.jitter_samples.clear();
+        s.cumulative_samples = 0;
+        s.locked = false;
+    }
+
     pub fn telemetry(&self) -> PcrPllTelemetry {
         let s = match self.state.lock() {
             Ok(g) => g,

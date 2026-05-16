@@ -45,7 +45,7 @@
 //!   gate on [`is_locked`](MasterClock::is_locked); outputs that can run
 //!   open-loop (passthrough) ignore it.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -89,6 +89,7 @@ pub trait MasterClock: Send + Sync + 'static {
             configured_kind: None,
             fallback_active: false,
             fallback_reason: None,
+            active_input_id: None,
         }
     }
 }
@@ -150,6 +151,14 @@ pub struct MasterClockTelemetry {
     /// Set only when `fallback_active`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
+    /// ID of the input currently feeding the clock. For
+    /// `source_pcr_pll` this is the active input whose PCR samples the
+    /// PLL is tracking (refreshes on operator-driven input switches
+    /// without re-creating the master). `None` for clock kinds that
+    /// don't take their rate from a single ingress stream
+    /// (`ptp`, bare `wallclock`). Additive — older managers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_input_id: Option<String>,
 }
 
 #[inline]
@@ -165,6 +174,7 @@ impl Default for MasterClockTelemetry {
             configured_kind: None,
             fallback_active: false,
             fallback_reason: None,
+            active_input_id: None,
         }
     }
 }
@@ -238,6 +248,13 @@ impl SourcePcrPllMaster {
         let wall_ns = (recv_time_us as u128) * 1000;
         self.pll.record_sample(pcr_27mhz, wall_ns);
     }
+
+    /// Reset the underlying PLL's anchor + lock state. Called on
+    /// active-input switches so the new stream's PCR base re-anchors
+    /// cleanly rather than tripping the inner discontinuity filter.
+    pub fn reset_anchor(&self) {
+        self.pll.reset_anchor();
+    }
 }
 
 impl MasterClock for SourcePcrPllMaster {
@@ -264,6 +281,7 @@ impl MasterClock for SourcePcrPllMaster {
             configured_kind: None,
             fallback_active: false,
             fallback_reason: None,
+            active_input_id: None,
         }
     }
 }
@@ -338,6 +356,7 @@ impl MasterClock for PtpMasterClock {
             configured_kind: None,
             fallback_active: false,
             fallback_reason: None,
+            active_input_id: None,
         }
     }
 }
@@ -420,6 +439,7 @@ impl MasterClock for WallclockMaster {
             configured_kind: None,
             fallback_active: false,
             fallback_reason: None,
+            active_input_id: None,
         }
     }
 }
@@ -443,8 +463,10 @@ pub struct PcrPllWithFallback {
     pll_master: Arc<SourcePcrPllMaster>,
     wallclock: WallclockMaster,
     fallback_active: AtomicBool,
-    /// Set once when the fallback fires. Read by `telemetry()`.
-    fallback_reason: OnceLock<String>,
+    /// Reason the most recent fallback fired. Cleared on
+    /// `deactivate_fallback`. Read by `telemetry()` when the active
+    /// flag is set.
+    fallback_reason: std::sync::RwLock<Option<String>>,
     source_id: String,
 }
 
@@ -455,7 +477,7 @@ impl PcrPllWithFallback {
             pll_master,
             wallclock: WallclockMaster::new(),
             fallback_active: AtomicBool::new(false),
-            fallback_reason: OnceLock::new(),
+            fallback_reason: std::sync::RwLock::new(None),
             source_id,
         }
     }
@@ -464,23 +486,68 @@ impl PcrPllWithFallback {
         self.pll_master.clone()
     }
 
-    /// Flip the master onto wallclock and record the reason. Idempotent —
-    /// subsequent calls are no-ops.
+    /// Flip the master onto wallclock and record the reason. Re-fireable —
+    /// `deactivate_fallback` clears the state so subsequent activate
+    /// calls record fresh reasons.
     pub fn activate_fallback(&self, reason: impl Into<String>) {
-        // Set reason first so any reader that observes `fallback_active`
-        // sees a populated reason.
-        let _ = self.fallback_reason.set(reason.into());
+        // Record reason first so any reader observing `fallback_active`
+        // sees a populated reason. `expect` is safe — write lock
+        // poisoning would mean a panic already shredded the engine; we
+        // run with `RUST_BACKTRACE=full` to surface it.
+        if let Ok(mut w) = self.fallback_reason.write() {
+            *w = Some(reason.into());
+        }
         self.fallback_active.store(true, Ordering::Release);
+    }
+
+    /// Flip the master back onto the PLL and clear the recorded reason.
+    /// Idempotent. Called by:
+    ///  - the watcher when the PLL re-locks (after fallback fired and
+    ///    the operator either fixed the source or switched to a healthy
+    ///    input)
+    ///  - `on_input_switch` so the new input gets a fresh `pll_lock_timeout_s`
+    ///    grace window before re-falling back
+    pub fn deactivate_fallback(&self) {
+        if self
+            .fallback_active
+            .swap(false, Ordering::AcqRel)
+        {
+            if let Ok(mut w) = self.fallback_reason.write() {
+                *w = None;
+            }
+            tracing::info!(
+                source_id = %self.source_id,
+                "master clock: PLL fallback deactivated (PLL re-locked or input switched)"
+            );
+        }
     }
 
     pub fn is_fallback_active(&self) -> bool {
         self.fallback_active.load(Ordering::Acquire)
+    }
+
+    /// Active-input-switch hook. Reset the PLL anchor + clear any
+    /// existing fallback so the new input has a clean `pll_lock_timeout_s`
+    /// window to acquire lock. The watcher restarts its grace window
+    /// from the moment `active_input_tx` publishes the new ID — this
+    /// method only handles the master-clock state.
+    pub fn on_input_switch(&self) {
+        self.pll_master.reset_anchor();
+        self.deactivate_fallback();
     }
 }
 
 impl MasterClock for PcrPllWithFallback {
     fn now_27mhz(&self) -> u64 {
         if self.fallback_active.load(Ordering::Acquire) {
+            // Self-heal: if the PLL has acquired lock while in fallback
+            // (operator fixed the source / input switched to a healthy
+            // one / late lock after the watcher fired), leave fallback
+            // immediately rather than wait for the watcher's next poll.
+            if self.pll_master.is_locked() {
+                self.deactivate_fallback();
+                return self.pll_master.now_27mhz();
+            }
             self.wallclock.now_27mhz()
         } else {
             self.pll_master.now_27mhz()
@@ -493,6 +560,10 @@ impl MasterClock for PcrPllWithFallback {
 
     fn is_locked(&self) -> bool {
         if self.fallback_active.load(Ordering::Acquire) {
+            if self.pll_master.is_locked() {
+                self.deactivate_fallback();
+                return true;
+            }
             // Wallclock fallback is always "locked" — operator sees the
             // fallback chip on the UI but consumers see a usable clock.
             true
@@ -503,13 +574,23 @@ impl MasterClock for PcrPllWithFallback {
 
     fn telemetry(&self) -> MasterClockTelemetry {
         if self.fallback_active.load(Ordering::Acquire) {
-            // Inherit the wallclock telemetry but stamp the configured
-            // kind + fallback details so UI keeps the operator informed.
+            // Self-heal here too so the 1 Hz telemetry tick guarantees
+            // the manager UI clears the fallback chip the moment the
+            // PLL has re-locked — without waiting for the next emit-path
+            // `now_27mhz` to trigger it.
+            if self.pll_master.is_locked() {
+                self.deactivate_fallback();
+                return self.pll_master.telemetry();
+            }
             let mut t = self.wallclock.telemetry();
             t.kind = MasterClockKind::Wallclock.as_str().to_string();
             t.configured_kind = Some(MasterClockKind::SourcePcrPll.as_str().to_string());
             t.fallback_active = true;
-            t.fallback_reason = self.fallback_reason.get().cloned();
+            t.fallback_reason = self
+                .fallback_reason
+                .read()
+                .ok()
+                .and_then(|g| g.clone());
             t
         } else {
             self.pll_master.telemetry()
@@ -521,26 +602,31 @@ impl MasterClock for PcrPllWithFallback {
     }
 }
 
-/// Spawn the PLL→Wallclock fallback watcher.
+/// Spawn the continuous PLL ↔ Wallclock fallback monitor.
 ///
-/// Polls the PLL's [`PcrPll::telemetry`] periodically. Fires fallback
-/// (via [`PcrPllWithFallback::activate_fallback`]) when:
+/// Runs as a long-lived poller that handles three transitions:
 ///
-/// - **No samples after 5 s** → `no_pcr_observed`. The fast path is
-///   important for sources that never emit PCR at all (constant-
-///   bitrate raw TS, some legacy contribution feeds): waiting the
-///   full timeout for one of those would silently delay output
-///   start by `timeout_s` seconds.
-/// - **Not locked at timeout** with samples > 0 → either
-///   `insufficient_samples` (still under the 100-sample minimum) or
-///   `jitter_too_high` (samples present but p99 over the lock
-///   threshold).
+/// 1. **Initial grace window**: after spawn, gives the PLL
+///    `timeout_s` seconds to acquire lock. If lock doesn't land,
+///    activates fallback with `no_pcr_observed` / `insufficient_samples`
+///    / `jitter_too_high` reason.
+/// 2. **Recovery**: if the PLL acquires lock while in fallback (operator
+///    fixed the source / input switched to a healthy stream), the
+///    monitor deactivates fallback so output PCR follows the source
+///    again. Self-heal also fires from `now_27mhz` / `telemetry`, this
+///    branch is the belt-and-braces backstop and emits the recovery
+///    event.
+/// 3. **Input switch**: when `active_input_rx` publishes a new ID, the
+///    grace window restarts so the new input has a fresh
+///    `timeout_s` to acquire lock before re-falling-back. The monitor
+///    also calls `PcrPllWithFallback::on_input_switch` to reset the
+///    PLL anchor + clear stale fallback state.
 ///
-/// `timeout_s == 0` disables the watcher entirely (strict-PLL mode).
+/// `timeout_s == 0` disables the monitor entirely (strict-PLL mode).
 pub fn spawn_pll_fallback_watcher(
     wrapper: Arc<PcrPllWithFallback>,
     flow_id: String,
-    input_id: String,
+    mut active_input_rx: tokio::sync::watch::Receiver<String>,
     timeout_s: u32,
     events: crate::manager::events::EventSender,
     cancel: tokio_util::sync::CancellationToken,
@@ -550,47 +636,97 @@ pub fn spawn_pll_fallback_watcher(
             // Strict-PLL mode — operator opted out of fallback.
             return;
         }
-        // Single timeout. Waiting the full `pll_lock_timeout_s` before
-        // judging lock keeps the watcher from racing the broadcast
-        // pipeline's warm-up (file open, codec init, first PES, input
-        // forwarder pickup — collectively a few hundred ms to a few
-        // seconds depending on input type). A `samples == 0` outcome
-        // at the deadline is then a real "the source never emitted
-        // PCR" signal, not a startup artefact. The earlier 5 s
-        // fast-path was tempting but proved noisy: high-bitrate media
-        // player inputs took up to 5 s to start publishing under heavy
-        // CPU + Tokio startup load and the watcher fired before any
-        // PCR sample landed at the PLL, even though packets were
-        // streaming healthily within seconds.
         let deadline = std::time::Duration::from_secs(timeout_s as u64);
-        tokio::select! {
-            _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(deadline) => {}
+        let poll_interval = std::time::Duration::from_millis(500);
+        // Grace-window anchor. Reset on every input switch so the new
+        // input gets a fresh `timeout_s` before re-falling-back. Seeded
+        // at spawn so the first input also gets the grace window.
+        let mut window_start = std::time::Instant::now();
+        let mut current_input = active_input_rx.borrow().clone();
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(poll_interval) => {}
+                res = active_input_rx.changed() => {
+                    if res.is_err() {
+                        // sender dropped → flow shutting down
+                        return;
+                    }
+                    let new_input = active_input_rx.borrow().clone();
+                    if new_input != current_input {
+                        tracing::info!(
+                            flow_id = %flow_id,
+                            previous = %current_input,
+                            new = %new_input,
+                            "master clock: active input changed — resetting PLL anchor + fallback grace window"
+                        );
+                        current_input = new_input;
+                        window_start = std::time::Instant::now();
+                        wrapper.on_input_switch();
+                    }
+                    continue;
+                }
+            }
+            // ── Periodic poll body ────────────────────────────────────
+            // Recovery: PLL re-locked while we were in fallback. Emit
+            // the recovery event (UI clears the fallback chip via the
+            // separate self-heal in `telemetry`).
+            if wrapper.is_fallback_active() && wrapper.pll_master.pll().is_locked() {
+                wrapper.deactivate_fallback();
+                let t = wrapper.pll_master.pll().telemetry();
+                events.emit_flow_with_details(
+                    crate::manager::events::EventSeverity::Info,
+                    crate::manager::events::category::MASTER_CLOCK,
+                    format!(
+                        "PCR PLL re-acquired lock on flow '{}' (input '{}'); leaving wallclock fallback",
+                        flow_id, current_input,
+                    ),
+                    &flow_id,
+                    serde_json::json!({
+                        "error_code": "master_clock_pll_recovered",
+                        "input_id": current_input,
+                        "samples_received": t.samples,
+                        "p99_jitter_us": t.jitter_us,
+                    }),
+                );
+                // Recovery resets the grace window — if we de-lock again
+                // we want the same grace before re-falling-back.
+                window_start = std::time::Instant::now();
+                continue;
+            }
+            // No-op if already in fallback (re-fire is gated by the
+            // recovery branch above; otherwise we'd loop-fire the
+            // event).
+            if wrapper.is_fallback_active() {
+                continue;
+            }
+            // Not in fallback — has the grace window expired without
+            // lock?
+            if window_start.elapsed() < deadline {
+                continue;
+            }
+            let t = wrapper.pll_master.pll().telemetry();
+            if t.locked {
+                continue;
+            }
+            let reason = if t.samples == 0 {
+                "no_pcr_observed"
+            } else if t.samples < 100 {
+                "insufficient_samples"
+            } else {
+                "jitter_too_high"
+            };
+            fire_fallback(
+                &wrapper,
+                &flow_id,
+                &current_input,
+                reason,
+                t.samples,
+                t.jitter_us,
+                deadline,
+                &events,
+            );
         }
-        if wrapper.is_fallback_active() {
-            return;
-        }
-        let t = wrapper.pll_master.pll().telemetry();
-        if t.locked {
-            return; // PLL converged within budget — done, no fallback.
-        }
-        let reason = if t.samples == 0 {
-            "no_pcr_observed"
-        } else if t.samples < 100 {
-            "insufficient_samples"
-        } else {
-            "jitter_too_high"
-        };
-        fire_fallback(
-            &wrapper,
-            &flow_id,
-            &input_id,
-            reason,
-            t.samples,
-            t.jitter_us,
-            deadline,
-            &events,
-        );
     })
 }
 

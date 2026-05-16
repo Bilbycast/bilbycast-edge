@@ -507,8 +507,13 @@ impl FlowRuntime {
         // the same per-flow master-clock pacer the egress replacers use,
         // so that PCR generated inside the encoder pipeline references
         // the same clock as PCR re-stamped at wire-emit time.
-        let (master_clock, pll_master) =
-            build_master_clock(&config.config, active_input_cfg, &event_sender, &cancel_token);
+        let (master_clock, pll_master) = build_master_clock(
+            &config.config,
+            active_input_cfg,
+            active_input_tx.subscribe(),
+            &event_sender,
+            &cancel_token,
+        );
         flow_stats.set_master_clock_telemetry(master_clock.telemetry());
         flow_stats.set_master_clock_lipsync(master_clock.lipsync_offset_90k());
         let av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>> =
@@ -1067,7 +1072,21 @@ impl FlowRuntime {
                     tokio::select! {
                         _ = cancel.cancelled() => break,
                         _ = interval.tick() => {
-                            acc.set_master_clock_telemetry(mc.telemetry());
+                            let mut t = mc.telemetry();
+                            // Stamp the currently-active input ID so
+                            // the manager UI can render "PLL locked on
+                            // <input_id>" / "wallclock fallback after
+                            // failing on <input_id>". `acc` holds the
+                            // canonical active-input under an RwLock —
+                            // empty string maps to None.
+                            if t.active_input_id.is_none() {
+                                if let Ok(g) = acc.active_input_id.read() {
+                                    if !g.is_empty() {
+                                        t.active_input_id = Some(g.clone());
+                                    }
+                                }
+                            }
+                            acc.set_master_clock_telemetry(t);
                             acc.set_master_clock_lipsync(mc.lipsync_offset_90k());
                         }
                     }
@@ -4768,6 +4787,7 @@ fn input_encode_blocks(
 fn build_master_clock(
     cfg: &crate::config::models::FlowConfig,
     active_input: Option<&crate::config::models::InputConfig>,
+    active_input_rx: tokio::sync::watch::Receiver<String>,
     event_sender: &EventSender,
     cancel_token: &CancellationToken,
 ) -> (
@@ -4804,19 +4824,14 @@ fn build_master_clock(
                 .as_ref()
                 .and_then(|m| m.pll_lock_timeout_s)
                 .unwrap_or(30);
-            // FlowConfig carries `input_ids` (references), not resolved
-            // input definitions — pick the first as the event's
-            // `input_id`. Empty input_ids → placeholder so the event
-            // payload stays well-formed.
-            let active_input_id = cfg
-                .input_ids
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "<no-input>".to_string());
+            // The watcher tracks the active input via the shared
+            // `active_input_rx` watch — it sees switches as they happen
+            // and restarts the grace window so the new input gets a
+            // fresh `timeout_s` to acquire lock.
             crate::engine::master_clock::spawn_pll_fallback_watcher(
                 wrapper.clone(),
                 cfg.id.clone(),
-                active_input_id,
+                active_input_rx,
                 timeout_s,
                 event_sender.clone(),
                 cancel_token.child_token(),

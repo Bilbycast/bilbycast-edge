@@ -2362,6 +2362,53 @@ fn drain_video_frames(
 
 // ── Display child ─────────────────────────────────────────────────
 
+// Absolute-time monotonic-clock sleep used by the per-frame pacing
+// branch of `display_loop`. Replaces `std::thread::sleep(Duration::from_millis)`
+// — that primitive runs on SCHED_OTHER with typical ±1–2 ms wake-up
+// slop, which at 60 Hz (16.7 ms vblank) can push the kernel page-flip
+// a full vblank late on frames whose drift target sits near a vblank
+// boundary, tipping the smoothed drift toward the late-frame hysteresis.
+//
+// `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)` is the same syscall
+// the data-plane wire pacer uses (`engine::wire_emit::sleep_until_monotonic_ns`,
+// just on CLOCK_TAI there to keep the kernel etf qdisc happy). Display
+// has no ETF / PTP requirement, so CLOCK_MONOTONIC is the natural
+// choice — leap-second / system-clock adjustments don't perturb it.
+//
+// Inlined here rather than reusing the `wire_emit` helper to keep the
+// optional, feature-gated display module decoupled from the always-on
+// data-plane hot path. If a third caller ever appears, lift both into
+// `util/time.rs`.
+fn display_monotonic_now_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
+    (ts.tv_sec as u64).saturating_mul(1_000_000_000) + (ts.tv_nsec as u64)
+}
+
+fn display_sleep_until_monotonic_ns(target_ns: u64) {
+    let ts = libc::timespec {
+        tv_sec: (target_ns / 1_000_000_000) as libc::time_t,
+        tv_nsec: (target_ns % 1_000_000_000) as i64,
+    };
+    // EINTR re-arms with the same absolute deadline so signals can't
+    // shorten the sleep below its target.
+    loop {
+        let rc = unsafe {
+            libc::clock_nanosleep(
+                libc::CLOCK_MONOTONIC,
+                libc::TIMER_ABSTIME,
+                &ts,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != libc::EINTR {
+            break;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn display_loop(
     mut kms: KmsDisplay,
@@ -2853,7 +2900,17 @@ fn display_loop(
             if drift_ms > PRESENT_MARGIN_MS {
                 let cap_ms = drop_threshold_ms;
                 let sleep_ms = (drift_ms - PRESENT_MARGIN_MS).min(cap_ms) as u64;
-                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+                // Absolute CLOCK_MONOTONIC sleep — eliminates the
+                // ±1–2 ms slop of `std::thread::sleep` on SCHED_OTHER,
+                // which at 60 Hz can push the next page-flip a full
+                // vblank late on frames whose drift target sits near
+                // a vblank boundary. `clock_nanosleep` with
+                // TIMER_ABSTIME wakes within ~50–500 µs on a stock
+                // kernel — well inside the PRESENT_MARGIN_MS budget
+                // that gates this branch.
+                let target_ns = display_monotonic_now_ns()
+                    .saturating_add(sleep_ms.saturating_mul(1_000_000));
+                display_sleep_until_monotonic_ns(target_ns);
             }
         }
 
