@@ -575,17 +575,18 @@ encoder backend (CPU x264/x265, NVENC, QSV, VAAPI).
 
 The receiver-side PCR_AC envelope you should expect:
 
-| Tier | Expected PCR_AC (p99) | Receiver compliance |
-|---|---|---|
-| 1 (SO_TXTIME + ETF + NIC HW) | < 1 µs | Tier-1 broadcast, T-STD ≤ 500 ns met |
-| 2 (SO_TXTIME + software ETF) | < 50 µs | Most professional decoders happy |
-| 3 (SO_TXTIME, no ETF) | Same as no pacing | Status quo for unpaced loopback |
-| 4 (`clock_nanosleep` SCHED_FIFO) | < 1 ms | Decoder-acceptable for ≤ 6 Mbps TS |
-| 5 (no SCHED_FIFO grant) | < 5 ms | Worst-case fallback; visual decode usually still clean |
+| Tier | Expected PCR_AC (p99) | Receiver compliance | When |
+|---|---|---|---|
+| 1 (SO_TXTIME + ETF + NIC HW) | < 1 µs | Tier-1 broadcast, T-STD ≤ 500 ns met | Opt-in via `BILBYCAST_ENABLE_TXTIME=1` + full PTP / ETF / HW-PTP stack |
+| 2 (SO_TXTIME + software ETF) | < 50 µs | Most professional decoders happy | Opt-in via `BILBYCAST_ENABLE_TXTIME=1` + ETF qdisc (no HW-PTP NIC needed) |
+| 4 ⭐ (`clock_nanosleep` SCHED_FIFO) | < 3 ms typical, ms-tail under load | Broadcast tier-2 envelope (≤ 30 ms p99); compressed TS through 2 Gbps; VLC / ffplay / OBS / cloud receivers / most professional decoders in standard tolerance mode | **Default** — no setup required |
+| 5 (no SCHED_FIFO grant) | < 5 ms | Worst-case fallback; visual decode usually still clean | Non-Linux or Linux without `LimitRTPRIO` |
 
-See [`wire-pacing.md`](wire-pacing.md) for the full architecture and
-[`installation.md`](installation.md#wire-pacing) for the operator-side
-ETF qdisc setup.
+See [`wire-pacing.md`](wire-pacing.md) for the full architecture, the
+decision matrix for when ETF earns its keep, and the per-symptom
+diagnostic table. [`installation.md`](installation.md#wire-pacing)
+covers the four-step opt-in procedure (qdisc → boot-time systemd unit
+→ PTP → env var).
 
 ---
 

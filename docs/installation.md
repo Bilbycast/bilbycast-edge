@@ -345,43 +345,60 @@ those libraries are statically linked into the `*-full` binary.
 
 ## Wire pacing
 
-PCR-anchored / PTP-raster-anchored kernel-paced wire emission runs on
-every output that owns a UDP socket directly: UDP, RTP (single-leg,
-FEC, 2022-7 dual-leg), 302M, ST 2110-20/-23/-30/-31/-40. SRT, RIST,
-RTMP, HLS, CMAF, and WebRTC are unchanged — they have their own
-protocol-layer pacing.
+PCR-anchored / PTP-raster-anchored wire emission runs on every output
+that owns a UDP socket directly: UDP, RTP (single-leg, FEC, 2022-7
+dual-leg), 302M, ST 2110-20/-23/-30/-31/-40. SRT, RIST, RTMP, HLS,
+CMAF, and WebRTC are unchanged — they have their own protocol-layer
+pacing.
 
-Pacing is **automatic**. The edge picks the highest tier the host can
-deliver at output startup:
+**The default release tier is `clock_nanosleep` on a SCHED_FIFO thread
+(tier 4 below) — no qdisc, no PTP, no HW-PTP NIC, no env var required.**
+That path handles compressed TS through at least 2 Gbps with sub-3 ms
+PCR_AC max on commodity Linux. The kernel-paced **`SO_TXTIME` + ETF
+qdisc** path (tiers 1–2) is opt-in via `BILBYCAST_ENABLE_TXTIME=1` and
+only worth enabling for ST 2110-21 narrow profile, T-STD-strict
+contribution receivers (Appear X10 / Cobalt 9202 / Cisco D9824 with
+`PCR_AC` alarms enabled), or sustained CPU contention pushing tier-4
+p99 above ~30 ms.
 
 | Tier | Mechanism | Inter-packet jitter | Requires |
 |---|---|---|---|
-| 1 | SO_TXTIME + ETF qdisc + NIC HW offload | Sub-µs | Linux ≥ 4.19, ETF qdisc, PTP-disciplined NIC |
-| 2 | SO_TXTIME + software ETF qdisc | ~1–10 µs | Linux ≥ 4.19, ETF qdisc |
-| 3 | SO_TXTIME accepted, no ETF qdisc | Same as no pacing | Linux ≥ 4.19 |
-| 4 | `clock_nanosleep` on SCHED_FIFO | ~50–500 µs | systemd unit (LimitRTPRIO=50) |
-| 5 | `clock_nanosleep` on SCHED_OTHER | ~1–5 ms | None |
+| 1 | SO_TXTIME + ETF qdisc + NIC HW offload | Sub-µs | Linux ≥ 4.19, ETF qdisc, PTP-disciplined HW-PTP NIC, `CAP_NET_ADMIN`, `BILBYCAST_ENABLE_TXTIME=1` |
+| 2 | SO_TXTIME + software ETF qdisc | ~1–10 µs | Linux ≥ 4.19, ETF qdisc, `CAP_NET_ADMIN`, `BILBYCAST_ENABLE_TXTIME=1` |
+| 4 ⭐ | `clock_nanosleep` on SCHED_FIFO | ~50–500 µs typical, ms-tail under load | systemd unit (`LimitRTPRIO=99`). **Default — no setup required.** |
+| 5 | `clock_nanosleep` on SCHED_OTHER | ~1–5 ms | None — non-Linux, or Linux without the SCHED_FIFO grant |
 
 Tier is logged on every output startup
 (`wire-emit '<id>': starting (anchor=..., tier=...)`)
 and surfaced on `OutputStats.wire_pacing_tier`.
 
-For tier-1 broadcast PCR_AC compliance (T-STD ≤ 500 ns), install the
-ETF qdisc on the egress NIC.
+The pre-2026-05-16 default of "try SO_TXTIME first, fall back to
+clock_nanosleep" was reverted. On a host without ETF qdisc the kernel
+accepts the `SO_TXTIME` setsockopt and the `SCM_TXTIME` cmsg silently
+but emits each packet immediately on `sendmsg`, so the wire-emit thread
+degenerated into a producer-paced loop while telemetry still reported
+tier `so_txtime`. The inverted default removes that silent-degradation
+trap.
 
-### Step 1 (optional, recommended for tier-1): install the ETF qdisc
+### Enabling the SO_TXTIME tier (opt-in, four steps)
+
+Only do this if you have one of the cases above. Enabling SO_TXTIME
+without the full prerequisite stack produces *silent degradation*
+worse than the default.
+
+**Step 1: install the ETF qdisc on the egress NIC**
 
 ```bash
 sudo bash packaging/setup-etf-qdisc.sh enp1s0   # name your egress NIC
 ```
 
 The script installs `mqprio` at root + `etf clockid CLOCK_TAI delta
-200000 offload` on the prioritized class. `offload` enables NIC HW
-pacing on supported NICs (Mellanox CX-6/CX-7, Intel E810, Intel
-i210); falls back to software ETF (~1–10 µs jitter) on unsupported
-ones. Boot-time persistence: wrap the same `tc` calls in your own
-systemd unit, NetworkManager dispatch hook, or ifupdown post-up
-snippet — qdiscs revert to default on link bounce.
+200000 offload skip_sock_check on` on the prioritized class. `offload`
+enables NIC HW pacing on supported NICs (Mellanox CX-6/CX-7, Intel
+E810, Intel i210); falls back to software ETF (~1–10 µs jitter) on
+unsupported ones. `skip_sock_check on` is non-negotiable — without it
+ARP / DHCP / ssh / every default UDP socket on the host gets dropped
+at the qdisc.
 
 Verify:
 
@@ -389,33 +406,63 @@ Verify:
 tc -s qdisc show dev enp1s0    # look for "etf" in the output
 ```
 
-Removal: `sudo tc qdisc del dev enp1s0 root`.
+**Step 2: persist the qdisc across reboots via the shipped systemd
+unit**
 
-Without ETF qdisc, the kernel accepts the `SCM_TXTIME` CMSG but
-ignores it and emits immediately — same observable behaviour as
-today's unpaced path, no regression.
-
-### Step 2 (PTP for tier-1 ST 2110-21 compliance): `ptp4l + phc2sys`
-
-ST 2110-21 narrow profile is meaningless without PTP discipline on
-the host. Compressed-TS pacing (UDP/RTP) does NOT need PTP — it
-anchors on `CLOCK_MONOTONIC`. PTP only matters for ST 2110-20/-23
-where the frame raster is anchored to the grandmaster clock.
+The one-shot `tc` call doesn't survive a reboot. Install the templated
+`bilbycast-etf-qdisc@.service` so the qdisc lands at boot before the
+edge starts:
 
 ```bash
-# Ubuntu / Debian
+sudo install -m 0644 packaging/bilbycast-etf-qdisc@.service \
+    /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now bilbycast-etf-qdisc@enp1s0
+```
+
+Removal: `sudo systemctl disable --now bilbycast-etf-qdisc@enp1s0`.
+
+**Step 3: PTP for tier-1 (ST 2110-21 + multi-edge coherence)**
+
+Tier 1 requires `ptp4l` + `phc2sys` against a PTP grandmaster on a
+HW-PTP NIC. Tier 2 (software ETF, no HW-PTP NIC, no PTP) caps out
+around 1–10 µs jitter and works without this step.
+
+```bash
 sudo apt install linuxptp
 sudo systemctl enable --now ptp4l@<your-iface>
 sudo systemctl enable --now phc2sys@<your-iface>
 ```
 
-### Step 3: SCHED_FIFO grant
+Use `phc2sys -w` (not `-O 0`). See [`wire-pacing.md`](wire-pacing.md)
+for the full PTP setup recipe and the `ptp4l.conf` for the SMPTE
+2110-10 PM/AM profile.
+
+**Step 4: opt the edge in to SO_TXTIME**
+
+Set `BILBYCAST_ENABLE_TXTIME=1` in the edge's environment. Production
+via the env file consumed by the systemd unit:
+
+```bash
+# /etc/bilbycast/edge.env
+BILBYCAST_ENABLE_TXTIME=1
+```
+
+Then `sudo systemctl restart bilbycast-edge`. The startup log should
+now show `wire-emit '<id>': starting (anchor=Pcr, tier=so_txtime)`.
+If it shows `tier=clock_nanosleep` instead, the setsockopt probe
+failed — typically because `CAP_NET_ADMIN` isn't granted. The shipped
+`packaging/bilbycast-edge.service` already includes the cap; standalone
+runs need `sudo setcap cap_net_admin,cap_sys_nice+ep <binary>`.
+
+### SCHED_FIFO grant (tier 4 default)
 
 The shipped `packaging/bilbycast-edge.service` already includes
-`RestrictRealtime=false` + `LimitRTPRIO=50`. The kernel allows
-unprivileged `SCHED_FIFO` whenever `RTPRIO` is non-zero, so no
-capability grant is required when running under systemd. For
-`cargo run` / dev binary:
+`RestrictRealtime=false` + `LimitRTPRIO=99`. The kernel allows
+unprivileged `SCHED_FIFO` whenever the requested priority is at or
+below `RLIMIT_RTPRIO`, so no capability grant is required when
+running under systemd — this is what gives the default tier its
+~50–500 µs jitter envelope. For `cargo run` / dev binary:
 
 ```bash
 sudo setcap cap_sys_nice+ep target/debug/bilbycast-edge
@@ -429,14 +476,15 @@ ps -eLo pid,tid,class,rtprio,comm | grep bilbycast-edge
 # wire-emit-* threads should show class=FF, rtprio=50
 ```
 
-Without the grant, threads run at `SCHED_OTHER` (tier 5 in the table
-above) and a debug-level log line shows the failure. Pacing still
-works at coarser jitter — acceptable for ≤ 6 Mbps TS, degraded at
-100s of Mbps and unworkable at ST 2110 rates.
+Without the grant, threads run at `SCHED_OTHER` (tier 5) and a
+debug-level log line shows the failure. Pacing still works at coarser
+jitter (~1–5 ms typical), still inside the broadcast tier-2 envelope
+on a lightly-loaded box.
 
 For the full reference — anchor strategies, per-codec PCR_AC
-expectations, FEC + 2022-7 dual-leg integration — see
-[`wire-pacing.md`](wire-pacing.md).
+expectations, FEC + 2022-7 dual-leg integration, the decision matrix
+for when ETF actually earns its keep, and the per-symptom diagnostic
+table — see [`wire-pacing.md`](wire-pacing.md).
 
 ---
 

@@ -1,0 +1,34 @@
+[Unit]
+Description=bilbycast ETF qdisc on %I (boot-time install for SO_TXTIME wire pacing)
+Documentation=https://docs.bilbycast.com/edge/wire-pacing/
+# Run after the named network interface (%I) is up so `tc` can find it,
+# but before bilbycast-edge starts so the qdisc is in place by the time
+# the edge tries to use SO_TXTIME.
+After=network-online.target sys-subsystem-net-devices-%i.device
+Wants=network-online.target sys-subsystem-net-devices-%i.device
+Before=bilbycast-edge.service
+
+# Don't bring up at all on hosts that don't need it. This unit is
+# **opt-in**: operators enable it explicitly via `systemctl enable
+# bilbycast-etf-qdisc@<NIC>.service` only when they need the SO_TXTIME
+# pacing tier (tier 1 ≤ 500 ns PCR_AC). Most deployments stay on the
+# default `clock_nanosleep` tier which needs no qdisc.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/bilbycast/edge/current/packaging/setup-etf-qdisc.sh %i
+ExecStop=/usr/sbin/tc qdisc del dev %i root
+# `tc qdisc del` returns 2 ("No such file or directory") if the qdisc
+# was already torn down or never installed; treat that as success.
+SuccessExitStatus=2
+# `tc` needs CAP_NET_ADMIN; this oneshot runs as root briefly.
+User=root
+# Don't restart automatically — qdisc install failure usually means a
+# misconfiguration (wrong NIC name, missing iproute2, no `etf` module),
+# and silently retrying masks the underlying problem. Operator sees the
+# failure via `systemctl status` and fixes the config.
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

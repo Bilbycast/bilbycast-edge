@@ -334,6 +334,18 @@ else
         "https://github.com/${RELEASE_REPO}/releases/latest/download/bilbycast-edge.service"
 fi
 
+# ── Install opt-in ETF qdisc systemd unit (template, not enabled) ────
+# The bilbycast-etf-qdisc@.service template installs the ETF qdisc on
+# a named NIC at boot, before bilbycast-edge starts. Most deployments
+# stay on the default `clock_nanosleep` wire-pacing tier and never
+# need this unit — it's only enabled by operators who have explicitly
+# opted in to SO_TXTIME (tier 1 / 2) via BILBYCAST_ENABLE_TXTIME=1.
+# Lay the file down so it's discoverable; do not enable any instance.
+ETF_UNIT_DEST="${SYSTEMD_UNIT_DIR}/bilbycast-etf-qdisc@.service"
+if [[ -f "${VERSION_DIR}/packaging/bilbycast-etf-qdisc@.service" ]]; then
+    install -m 0644 "${VERSION_DIR}/packaging/bilbycast-etf-qdisc@.service" "${ETF_UNIT_DEST}"
+fi
+
 # Default env file (RUST_LOG etc.). Only seed it if missing — operators
 # may have customised it.
 ENV_FILE="${CONFIG_DIR}/edge.env"
@@ -359,6 +371,17 @@ BILBYCAST_MLOCKALL=1
 # kernel command line + this set referencing the same isolated cores.
 # Example for a 4-core box with cores 2 + 3 isolated:
 # BILBYCAST_WIRE_EMIT_CPUS=2,3
+
+# Opt in to the SO_TXTIME wire-pacing release tier (kernel-paced via
+# the ETF qdisc; tier 1 / 2 in OutputStats.wire_pacing_tier). Default
+# off — the edge uses userspace clock_nanosleep on SCHED_FIFO, which
+# handles compressed TS through 2 Gbps with sub-3 ms PCR_AC max on a
+# commodity NIC. Enabling SO_TXTIME requires the ETF qdisc on the
+# egress NIC (install via packaging/setup-etf-qdisc.sh, persist via
+# `systemctl enable --now bilbycast-etf-qdisc@<NIC>`) and, for
+# sub-µs jitter (tier 1), a HW-PTP NIC with ptp4l + phc2sys disciplined
+# to a PTP grandmaster. Full setup: docs.bilbycast.com/edge/wire-pacing/
+# BILBYCAST_ENABLE_TXTIME=1
 EOF
     chmod 0640 "${ENV_FILE}"
 fi
@@ -377,6 +400,19 @@ echo "Optional — strict per-interface binding (kernel-enforced NIC pinning):"
 echo "  sudo install -m 0644 ${VERSION_DIR}/packaging/strict-binding.conf \\"
 echo "      /etc/systemd/system/bilbycast-edge.service.d/strict-binding.conf"
 echo "  sudo systemctl daemon-reload && sudo systemctl restart bilbycast-edge"
+
+# ── Optional: SO_TXTIME wire-pacing tier (ETF qdisc + ptp4l) ──────────
+# Default install uses the userspace clock_nanosleep tier — fine for
+# 99 % of deployments. The SO_TXTIME tier is opt-in for sub-µs PCR_AC
+# (ST 2110-21 narrow profile, T-STD-strict contribution receivers).
+echo
+echo "Optional — kernel-paced wire emission (SO_TXTIME, sub-µs PCR_AC):"
+echo "  sudo bash ${VERSION_DIR}/packaging/setup-etf-qdisc.sh <NIC>"
+echo "  sudo systemctl enable --now bilbycast-etf-qdisc@<NIC>"
+echo "  # uncomment BILBYCAST_ENABLE_TXTIME=1 in ${ENV_FILE}, then:"
+echo "  sudo systemctl restart bilbycast-edge"
+echo "  # Full setup (requires PTP grandmaster + HW-PTP NIC for tier 1):"
+echo "  #   https://docs.bilbycast.com/edge/wire-pacing/"
 
 # ── Wait for first manager registration ────────────────────────────────
 echo

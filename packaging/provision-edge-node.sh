@@ -340,7 +340,7 @@ if [[ "${PTP_ONLY:-0}" != "1" && "${SKIP_SETCAP:-0}" != "1" ]]; then
         echo "      - or set SKIP_SETCAP=1 if you rely on the systemd unit's AmbientCapabilities" >&2
     else
         # cap_net_admin: SO_TXTIME(CLOCK_TAI). cap_sys_nice: SCHED_FIFO
-        # priority change (LimitRTPRIO=50 covers it under systemd; setcap
+        # priority change (LimitRTPRIO=99 covers it under systemd; setcap
         # covers it for ad-hoc invocations).
         setcap cap_net_admin,cap_sys_nice+ep "$BILBYCAST_BIN"
         echo "  ✓ setcap cap_net_admin,cap_sys_nice+ep $BILBYCAST_BIN"

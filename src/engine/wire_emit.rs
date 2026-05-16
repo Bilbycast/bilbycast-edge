@@ -281,15 +281,23 @@ pub fn spawn_wire_emitter(
     //
     // SO_TXTIME stays available as an opt-in for the small minority of hosts
     // that *do* have a properly-configured ETF qdisc (see
-    // `packaging/setup-etf-qdisc.sh`) plus PTP discipline. Set
-    // `BILBYCAST_ENABLE_SO_TXTIME=1` to take that path on those hosts.
+    // `packaging/setup-etf-qdisc.sh` and the boot-time systemd template
+    // `packaging/bilbycast-etf-qdisc@.service`) **and** a PTP discipline
+    // stack (`ptp4l` + `phc2sys`) running. Set `BILBYCAST_ENABLE_TXTIME=1`
+    // (or the more verbose alias `BILBYCAST_ENABLE_SO_TXTIME=1`, both
+    // accepted) to take that path on those hosts. The testbed start
+    // script `testbed/start-infrastructure.sh` already uses the short
+    // form when invoked as `BILBYCAST_ENABLE_TXTIME=1 ./start-…`.
     //
     // `BILBYCAST_FORCE_NANOSLEEP=1` is kept as a no-op alias for backwards
     // compatibility (since clock_nanosleep is now the default it cannot
     // "force" anything beyond the default behaviour).
-    let enable_so_txtime = std::env::var("BILBYCAST_ENABLE_SO_TXTIME")
+    let enable_so_txtime = std::env::var("BILBYCAST_ENABLE_TXTIME")
         .map(|v| v == "1")
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || std::env::var("BILBYCAST_ENABLE_SO_TXTIME")
+            .map(|v| v == "1")
+            .unwrap_or(false);
     let releaser = if enable_so_txtime && try_enable_so_txtime(&socket, clockid) {
         Releaser::SoTxtime
     } else {

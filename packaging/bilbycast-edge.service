@@ -73,11 +73,12 @@ RestrictNamespaces=true
 # sub-100 µs `clock_nanosleep` precision (the alternative is the
 # tokio timer wheel's ~1–5 ms ceiling, which is too coarse for
 # PCR-anchored pacing). RestrictRealtime=true would block this. Pair
-# with `LimitRTPRIO=50` below — the kernel allows unprivileged
-# `sched_setscheduler(SCHED_FIFO)` whenever RTPRIO is non-zero, so
-# we don't need to grant `CAP_SYS_NICE`. Wire_emit logs at debug and
-# falls back to default scheduler if the priority change is denied,
-# so there is no hard failure path.
+# with `LimitRTPRIO=99` below — the kernel allows unprivileged
+# `sched_setscheduler(SCHED_FIFO)` whenever the requested priority
+# is at or below RLIMIT_RTPRIO, so we don't need to grant
+# `CAP_SYS_NICE`. Wire_emit logs at debug and falls back to default
+# scheduler if the priority change is denied, so there is no hard
+# failure path.
 RestrictRealtime=false
 LockPersonality=true
 MemoryDenyWriteExecute=false  # JIT crates exist (rustls, ring) — leave on default
