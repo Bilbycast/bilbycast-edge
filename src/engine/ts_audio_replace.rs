@@ -1021,9 +1021,26 @@ impl TsAudioReplacer {
         }
 
         // Stamp the expected next source PTS so the next PES can detect
-        // a > 500 ms discontinuity. Skip when we don't yet have a
-        // source rate (decode failed) — the next anchor establishment
-        // will set everything fresh.
+        // a > 500 ms discontinuity. Three cases:
+        //
+        // 1. Decode succeeded — advance by the audio time actually carried
+        //    in this PES.
+        // 2. First PES failed to decode — leave anchor unset so the next
+        //    PES re-anchors instead of treating its PTS as a jump from a
+        //    stale value.
+        // 3. **Already-anchored PES failed to decode** — advance to *this*
+        //    PES's pts so subsequent PESes are measured against the most
+        //    recent observed timestamp, not the pre-failure projection.
+        //    Without case 3, consecutive decode failures (e.g., when the
+        //    ffmpeg `-stream_loop` wrap emits a few malformed AC-3 bytes
+        //    that don't pass `split_ac3_frames`) leave `expected_next`
+        //    frozen far in the past; the next successful PES then sees a
+        //    huge synthetic forward delta and fires a phantom
+        //    discontinuity, re-anchoring `out_pts_90k` forward by hundreds
+        //    of milliseconds. Stack a few of those across one loop wrap
+        //    and the output audio PTS races ahead of the passthrough
+        //    video PTS lineage — the AV-drift-after-loop symptom on
+        //    `srt-plain-9000` + `-stream_loop -1 -c copy` sources.
         if source_sample_rate_hint > 0 && source_samples_in_pes > 0 {
             let span_90k =
                 source_samples_in_pes.saturating_mul(90_000)
@@ -1031,10 +1048,9 @@ impl TsAudioReplacer {
             self.expected_next_src_pts_90k =
                 Some(pts.wrapping_add(span_90k));
         } else if !self.out_pts_anchored {
-            // First PES failed to decode — leave anchor unset so the
-            // next PES re-anchors instead of treating its PTS as a
-            // jump from a stale anchor.
             self.expected_next_src_pts_90k = None;
+        } else {
+            self.expected_next_src_pts_90k = Some(pts);
         }
         let _ = pts;
         Ok(())
@@ -2292,6 +2308,46 @@ mod tests {
             r.expected_next_src_pts_90k.is_none(),
             "expected-next must be cleared so the new input doesn't \
              trip the discontinuity guard against a stale value"
+        );
+    }
+
+    /// A PES that fails to decode (no syncframes found) must still
+    /// advance `expected_next_src_pts_90k` to its own pts. The previous
+    /// code left it stale, so a run of failed PESes — e.g. the malformed
+    /// AC-3 bytes ffmpeg's mpegts muxer emits at a `-stream_loop` wrap
+    /// boundary — would let the projection fall hundreds of milliseconds
+    /// behind. The next successful PES then saw a synthetic forward
+    /// delta against the stale projection and fired a phantom
+    /// discontinuity, re-anchoring `out_pts_90k` forward. Stack a few of
+    /// those across one loop wrap and the output audio PTS races ahead
+    /// of the passthrough video PTS lineage.
+    #[test]
+    fn decode_failure_when_anchored_advances_expected_next_to_current_pts() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        // Wire just enough state for consume_pes to walk to the end:
+        // anchored, audio_pid known, source codec set, sample-rate stale
+        // from a previous (hypothetical) decode.
+        r.out_pts_anchored = true;
+        r.out_pts_90k = 1_000_000;
+        r.samples_since_anchor = 0;
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F; // AAC ADTS
+        // Stale projection from an earlier successful PES.
+        r.expected_next_src_pts_90k = Some(1_000_000 + 2_880);
+
+        // Build a PES with a valid PTS but ES bytes that don't pass any
+        // ADTS / AC-3 / MP2 / LATM splitter — so `decoded_frames` stays
+        // empty and `source_samples_in_pes` stays 0.
+        let pes = build_audio_pes(&[0u8; 32], 1_100_000);
+        let mut out = Vec::new();
+        let _ = r.consume_pes(&pes, &mut out);
+
+        assert_eq!(
+            r.expected_next_src_pts_90k,
+            Some(1_100_000),
+            "decode failure on an anchored PES must roll expected-next to \
+             the current pts so successive failures don't accumulate a \
+             stale projection and fire phantom forward-jump discontinuities"
         );
     }
 }
