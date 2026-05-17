@@ -290,6 +290,22 @@ pub mod output_st2110_23;
 /// `bilbycast-mxl-rs/CLAUDE.md` for the build prereq footprint.
 #[cfg(feature = "mxl")]
 pub mod mxl;
+#[cfg(feature = "mxl")]
+pub mod mxl_io;
+#[cfg(feature = "mxl")]
+pub mod mxl_video_io;
+#[cfg(feature = "mxl")]
+pub mod input_mxl_video;
+#[cfg(feature = "mxl")]
+pub mod input_mxl_audio;
+#[cfg(feature = "mxl")]
+pub mod input_mxl_anc;
+#[cfg(feature = "mxl")]
+pub mod output_mxl_video;
+#[cfg(feature = "mxl")]
+pub mod output_mxl_audio;
+#[cfg(feature = "mxl")]
+pub mod output_mxl_anc;
 
 /// Generic RFC 3551 PCM-over-RTP audio input. Wire-identical to ST 2110-30
 /// but with no PTP / RFC 7273 / NMOS clock_domain. Drives the same shared

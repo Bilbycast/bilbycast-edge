@@ -425,6 +425,8 @@ async fn main() -> anyhow::Result<()> {
                 mgr.so_path().display(),
                 if shm_tmpfs { "OK" } else { "MISS (libmxl perf will degrade)" }
             );
+            // Install for engine spawn arms to look up.
+            engine::mxl::domain::install_global(std::sync::Arc::clone(mgr));
         }
         None => tracing::info!(
             "mxl: probe found no libmxl.so — mxl-* capabilities will not be advertised"

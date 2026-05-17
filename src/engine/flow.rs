@@ -2230,39 +2230,87 @@ impl FlowRuntime {
                     )
                 }
             }
-            // MXL outputs — the engine spawn modules land in M2 (audio +
-            // ANC) and M3 (video). Compile-clean scaffold today: stats
-            // registration + a clear startup error so the flow doesn't
-            // silently no-op when an operator configures an MXL output
-            // on a binary that hasn't yet shipped the engine wiring.
+            #[cfg(feature = "mxl")]
             OutputConfig::MxlVideo(c) => {
-                let _ = (broadcast_tx, frame_rate_rx, av_sync_pacer, active_input_rx,
-                         output_cancel, event_sender, flow_id, flow_stats);
-                anyhow::bail!(
-                    "MXL video output '{}' is not yet wired in this build \
-                     (M3 engine module engine::mxl_video_io::run_mxl_video_output lands the spawn) \
-                     (error_code: mxl_output_not_wired)",
-                    c.id
-                )
+                let _ = (frame_rate_rx, av_sync_pacer, active_input_rx);
+                let domain_mgr = super::mxl::domain::global().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "MXL video output '{}' refused: libmxl probe failed at boot \
+                         (error_code: mxl_domain_unavailable)",
+                        c.id
+                    )
+                })?;
+                let output_stats = flow_stats.register_output(
+                    c.id.clone(), c.name.clone(), "mxl_video".to_string(),
+                );
+                let handle = super::output_mxl_video::spawn_mxl_video_output(
+                    c.clone(),
+                    broadcast_tx,
+                    output_stats.clone(),
+                    output_cancel.clone(),
+                    event_sender.clone(),
+                    flow_id.to_string(),
+                    domain_mgr,
+                );
+                Ok(OutputRuntime { handle, cancel_token: output_cancel, stats: output_stats })
             }
+            #[cfg(feature = "mxl")]
             OutputConfig::MxlAudio(c) => {
+                let _ = (frame_rate_rx, av_sync_pacer, active_input_rx, input_audio_format);
+                let domain_mgr = super::mxl::domain::global().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "MXL audio output '{}' refused: libmxl probe failed at boot \
+                         (error_code: mxl_domain_unavailable)",
+                        c.id
+                    )
+                })?;
+                let output_stats = flow_stats.register_output(
+                    c.id.clone(), c.name.clone(), "mxl_audio".to_string(),
+                );
+                let handle = super::output_mxl_audio::spawn_mxl_audio_output(
+                    c.clone(),
+                    broadcast_tx,
+                    output_stats.clone(),
+                    output_cancel.clone(),
+                    event_sender.clone(),
+                    flow_id.to_string(),
+                    domain_mgr,
+                );
+                Ok(OutputRuntime { handle, cancel_token: output_cancel, stats: output_stats })
+            }
+            #[cfg(feature = "mxl")]
+            OutputConfig::MxlAnc(c) => {
+                let _ = (frame_rate_rx, av_sync_pacer, active_input_rx);
+                let domain_mgr = super::mxl::domain::global().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "MXL ANC output '{}' refused: libmxl probe failed at boot \
+                         (error_code: mxl_domain_unavailable)",
+                        c.id
+                    )
+                })?;
+                let output_stats = flow_stats.register_output(
+                    c.id.clone(), c.name.clone(), "mxl_anc".to_string(),
+                );
+                let handle = super::output_mxl_anc::spawn_mxl_anc_output(
+                    c.clone(),
+                    broadcast_tx,
+                    output_stats.clone(),
+                    output_cancel.clone(),
+                    event_sender.clone(),
+                    flow_id.to_string(),
+                    domain_mgr,
+                );
+                Ok(OutputRuntime { handle, cancel_token: output_cancel, stats: output_stats })
+            }
+            #[cfg(not(feature = "mxl"))]
+            OutputConfig::MxlVideo(_)
+            | OutputConfig::MxlAudio(_)
+            | OutputConfig::MxlAnc(_) => {
                 let _ = (broadcast_tx, frame_rate_rx, av_sync_pacer, active_input_rx,
                          input_audio_format, output_cancel, event_sender, flow_id, flow_stats);
                 anyhow::bail!(
-                    "MXL audio output '{}' is not yet wired in this build \
-                     (M2 engine module engine::mxl_io::run_mxl_audio_output lands the spawn) \
-                     (error_code: mxl_output_not_wired)",
-                    c.id
-                )
-            }
-            OutputConfig::MxlAnc(c) => {
-                let _ = (broadcast_tx, frame_rate_rx, av_sync_pacer, active_input_rx,
-                         output_cancel, event_sender, flow_id, flow_stats);
-                anyhow::bail!(
-                    "MXL ANC output '{}' is not yet wired in this build \
-                     (M2 engine module engine::mxl_io::run_mxl_anc_output lands the spawn) \
-                     (error_code: mxl_output_not_wired)",
-                    c.id
+                    "MXL output requires the `mxl` Cargo feature, which was not compiled in \
+                     (error_code: mxl_feature_disabled)"
                 )
             }
         }
@@ -2962,6 +3010,30 @@ type WhipSessionInfo = ();
 /// the per-input setup as a single `spawn_single_input` call rather than a
 /// 200-line match arm. Returns the input task handle plus, for WHIP inputs,
 /// the session channel + bearer token the HTTP signaling layer needs.
+/// Common "MXL probe failed at boot" fallback used by the MXL input
+/// spawn arms when [`super::mxl::domain::global`] returns `None`. Emits
+/// a Critical event so the operator sees the cause, then parks on the
+/// input's cancellation token (preserves flow shutdown semantics).
+#[cfg(feature = "mxl")]
+fn spawn_mxl_unavailable(
+    kind: &'static str,
+    input_id: String,
+    cancel: CancellationToken,
+    event_sender: EventSender,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        event_sender.emit(
+            crate::manager::events::EventSeverity::Critical,
+            crate::manager::events::category::FLOW,
+            format!(
+                "MXL {kind} input '{input_id}' refused: libmxl probe failed at boot \
+                 (error_code: mxl_domain_unavailable)"
+            ),
+        );
+        cancel.cancelled().await;
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_single_input(
     input_def: &InputDefinition,
@@ -3133,30 +3205,58 @@ fn spawn_single_input(
                 cancel.cancelled().await;
             })
         }
-        // MXL inputs — engine modules land in M2 (audio + ANC, via
-        // `engine::mxl_io::run_mxl_audio_input` / `run_mxl_anc_input`) and
-        // M3 (video, via `engine::mxl_video_io::run_mxl_video_input`).
-        // M2 scaffold today: emit a Critical event so the operator sees
-        // the input failed to start and park on cancellation so the
-        // flow shutdown path stays clean.
+        // MXL inputs — spawn arms call into engine::input_mxl_* shims
+        // which dispatch to engine::mxl_io or engine::mxl_video_io. The
+        // domain manager is looked up from the global OnceLock installed
+        // at boot in main.rs; missing manager means libmxl probe failed.
+        #[cfg(feature = "mxl")]
+        InputConfig::MxlVideo(c) => {
+            let mut c = c.clone();
+            c.clock_domain = c.clock_domain.or(flow_clock_domain);
+            match super::mxl::domain::global() {
+                Some(mgr) => super::input_mxl_video::spawn_mxl_video_input(
+                    c, input_id.clone(), per_input_tx.clone(), flow_stats.clone(),
+                    input_cancel.clone(), event_sender.clone(), flow_id.to_string(), mgr,
+                ),
+                None => spawn_mxl_unavailable("video", input_id.clone(), input_cancel.clone(), event_sender.clone()),
+            }
+        }
+        #[cfg(feature = "mxl")]
+        InputConfig::MxlAudio(c) => {
+            let mut c = c.clone();
+            c.clock_domain = c.clock_domain.or(flow_clock_domain);
+            match super::mxl::domain::global() {
+                Some(mgr) => super::input_mxl_audio::spawn_mxl_audio_input(
+                    c, input_id.clone(), per_input_tx.clone(), flow_stats.clone(),
+                    input_cancel.clone(), event_sender.clone(), flow_id.to_string(), mgr,
+                ),
+                None => spawn_mxl_unavailable("audio", input_id.clone(), input_cancel.clone(), event_sender.clone()),
+            }
+        }
+        #[cfg(feature = "mxl")]
+        InputConfig::MxlAnc(c) => {
+            let mut c = c.clone();
+            c.clock_domain = c.clock_domain.or(flow_clock_domain);
+            match super::mxl::domain::global() {
+                Some(mgr) => super::input_mxl_anc::spawn_mxl_anc_input(
+                    c, input_id.clone(), per_input_tx.clone(), flow_stats.clone(),
+                    input_cancel.clone(), event_sender.clone(), flow_id.to_string(), mgr,
+                ),
+                None => spawn_mxl_unavailable("ANC", input_id.clone(), input_cancel.clone(), event_sender.clone()),
+            }
+        }
+        #[cfg(not(feature = "mxl"))]
         InputConfig::MxlVideo(_) | InputConfig::MxlAudio(_) | InputConfig::MxlAnc(_) => {
-            let _ = flow_clock_domain;
             let cancel = input_cancel.clone();
             let event_sender = event_sender.clone();
             let input_id_msg = input_id.clone();
-            let kind = match &input_def.config {
-                InputConfig::MxlVideo(_) => "video",
-                InputConfig::MxlAudio(_) => "audio",
-                InputConfig::MxlAnc(_) => "ANC",
-                _ => "unknown",
-            };
             tokio::spawn(async move {
                 event_sender.emit(
                     crate::manager::events::EventSeverity::Critical,
                     crate::manager::events::category::FLOW,
                     format!(
-                        "MXL {kind} input '{input_id_msg}' is not yet wired in this build \
-                         (M2/M3 engine modules pending). error_code: mxl_input_not_wired"
+                        "MXL input '{input_id_msg}' requires the `mxl` Cargo feature \
+                         (error_code: mxl_feature_disabled)"
                     ),
                 );
                 cancel.cancelled().await;
