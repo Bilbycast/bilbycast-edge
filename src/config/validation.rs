@@ -781,6 +781,12 @@ fn input_pid_overrides(input: &InputConfig) -> Option<&crate::config::models::Ts
         // verbatim — TS layout (and PIDs) follow the source. No synthetic
         // mux to override.
         InputConfig::Bonded(_) => None,
+        // MXL video synthesises TS via in-process encode; MXL audio
+        // synthesises TS only when audio_encode is set. Both surface
+        // pid_overrides on the config struct. MXL ANC carries no TS.
+        InputConfig::MxlVideo(c) => c.pid_overrides.as_ref(),
+        InputConfig::MxlAudio(c) => c.pid_overrides.as_ref(),
+        InputConfig::MxlAnc(_) => None,
     }
 }
 
@@ -805,7 +811,13 @@ fn input_program_number(input: &InputConfig) -> Option<u16> {
         | InputConfig::St2110_20(_)
         | InputConfig::St2110_23(_)
         | InputConfig::St2110_40(_)
-        | InputConfig::Bonded(_) => None,
+        | InputConfig::Bonded(_)
+        // MXL doesn't ingest external MPEG-TS — no program_number filter
+        // is meaningful. The synthesised TS (when MxlAudio has
+        // audio_encode set) always emits program 1.
+        | InputConfig::MxlVideo(_)
+        | InputConfig::MxlAudio(_)
+        | InputConfig::MxlAnc(_) => None,
     }
 }
 
@@ -830,7 +842,10 @@ fn input_pid_map(input: &InputConfig) -> Option<&std::collections::BTreeMap<u16,
         | InputConfig::St2110_20(_)
         | InputConfig::St2110_23(_)
         | InputConfig::St2110_40(_)
-        | InputConfig::Bonded(_) => None,
+        | InputConfig::Bonded(_)
+        | InputConfig::MxlVideo(_)
+        | InputConfig::MxlAudio(_)
+        | InputConfig::MxlAnc(_) => None,
     }
 }
 
@@ -850,10 +865,13 @@ fn input_audio_encode(input: &InputConfig) -> Option<&crate::config::models::Aud
         InputConfig::Replay(c) => c.audio_encode.as_ref(),
         InputConfig::St2110_30(c) | InputConfig::St2110_31(c) => c.audio_encode.as_ref(),
         InputConfig::RtpAudio(c) => c.audio_encode.as_ref(),
+        InputConfig::MxlAudio(c) => c.audio_encode.as_ref(),
         InputConfig::St2110_20(_)
         | InputConfig::St2110_23(_)
         | InputConfig::St2110_40(_)
-        | InputConfig::Bonded(_) => None,
+        | InputConfig::Bonded(_)
+        | InputConfig::MxlVideo(_)
+        | InputConfig::MxlAnc(_) => None,
     }
 }
 
@@ -873,11 +891,14 @@ fn input_video_encode(input: &InputConfig) -> Option<&crate::config::models::Vid
         InputConfig::Replay(c) => c.video_encode.as_ref(),
         InputConfig::St2110_20(c) => Some(&c.video_encode),
         InputConfig::St2110_23(c) => Some(&c.video_encode),
+        InputConfig::MxlVideo(c) => Some(&c.video_encode),
         InputConfig::St2110_30(_)
         | InputConfig::St2110_31(_)
         | InputConfig::RtpAudio(_)
         | InputConfig::St2110_40(_)
-        | InputConfig::Bonded(_) => None,
+        | InputConfig::Bonded(_)
+        | InputConfig::MxlAudio(_)
+        | InputConfig::MxlAnc(_) => None,
     }
 }
 
@@ -899,7 +920,10 @@ fn output_audio_encode(output: &OutputConfig) -> Option<&crate::config::models::
         | OutputConfig::St2110_23(_)
         | OutputConfig::RtpAudio(_)
         | OutputConfig::Bonded(_)
-        | OutputConfig::Display(_) => None,
+        | OutputConfig::Display(_)
+        | OutputConfig::MxlVideo(_)
+        | OutputConfig::MxlAudio(_)
+        | OutputConfig::MxlAnc(_) => None,
     }
 }
 
@@ -921,7 +945,10 @@ fn output_video_encode(output: &OutputConfig) -> Option<&crate::config::models::
         | OutputConfig::St2110_23(_)
         | OutputConfig::RtpAudio(_)
         | OutputConfig::Bonded(_)
-        | OutputConfig::Display(_) => None,
+        | OutputConfig::Display(_)
+        | OutputConfig::MxlVideo(_)
+        | OutputConfig::MxlAudio(_)
+        | OutputConfig::MxlAnc(_) => None,
     }
 }
 
@@ -979,11 +1006,14 @@ fn input_is_synthetic_ts(input: &InputConfig) -> bool {
         | InputConfig::Whep(_)
         | InputConfig::TestPattern(_)
         | InputConfig::St2110_20(_)
-        | InputConfig::St2110_23(_) => true,
+        | InputConfig::St2110_23(_)
+        // MXL video always synthesises TS (video_encode mandatory).
+        | InputConfig::MxlVideo(_) => true,
         // PCM inputs become synthetic-TS only when audio_encode is set
         // (turning them into TS carriers via input_pcm_encode + TsMuxer).
         InputConfig::St2110_30(c) | InputConfig::St2110_31(c) => c.audio_encode.is_some(),
         InputConfig::RtpAudio(c) => c.audio_encode.is_some(),
+        InputConfig::MxlAudio(c) => c.audio_encode.is_some(),
         // External-TS sources may carry MPTS.
         InputConfig::Rtp(_)
         | InputConfig::Udp(_)
@@ -994,6 +1024,7 @@ fn input_is_synthetic_ts(input: &InputConfig) -> bool {
         | InputConfig::Bonded(_) => false,
         // ANC, no MPEG-TS layer at all.
         InputConfig::St2110_40(_) => false,
+        InputConfig::MxlAnc(_) => false,
     }
 }
 
@@ -1022,6 +1053,11 @@ fn output_pid_overrides(output: &OutputConfig) -> Option<&crate::config::models:
         // Local-display playout decodes audio + video into KMS / ALSA —
         // no MPEG-TS leaves the box, so PID overrides do not apply.
         OutputConfig::Display(_) => None,
+        // MXL outputs publish raw essence onto a shared-memory bus —
+        // there is no MPEG-TS layer, so PID overrides are not applicable.
+        OutputConfig::MxlVideo(_)
+        | OutputConfig::MxlAudio(_)
+        | OutputConfig::MxlAnc(_) => None,
     }
 }
 
@@ -1321,6 +1357,9 @@ fn validate_input(input: &InputConfig) -> Result<()> {
         InputConfig::TestPattern(c) => validate_test_pattern_input(c)?,
         InputConfig::MediaPlayer(c) => validate_media_player_input(c)?,
         InputConfig::Replay(c) => validate_replay_input(c)?,
+        InputConfig::MxlVideo(c) => validate_mxl_video_input(c)?,
+        InputConfig::MxlAudio(c) => validate_mxl_audio_input(c)?,
+        InputConfig::MxlAnc(c)   => validate_mxl_anc_input(c)?,
     }
     Ok(())
 }
@@ -4662,6 +4701,9 @@ pub fn validate_output_with_input(
         OutputConfig::RtpAudio(c) => validate_rtp_audio_output(c, upstream_audio)?,
         OutputConfig::Bonded(c) => validate_bonded_output(c)?,
         OutputConfig::Display(c) => validate_display_output(c)?,
+        OutputConfig::MxlVideo(c) => validate_mxl_video_output(c)?,
+        OutputConfig::MxlAudio(c) => validate_mxl_audio_output(c)?,
+        OutputConfig::MxlAnc(c)   => validate_mxl_anc_output(c)?,
     }
     Ok(())
 }
@@ -4820,6 +4862,141 @@ fn validate_display_output(c: &crate::config::models::DisplayOutputConfig) -> Re
         ));
     }
 
+    Ok(())
+}
+
+// ── MXL (Media eXchange Layer) validators ──────────────────────────────
+//
+// Common rules at v1.0 (enforced across all three essences):
+//   - `domain_path` must be a non-empty absolute path; the runtime
+//     additionally checks `is_tmpfs()` and warns on a miss (see
+//     `engine::mxl::domain`).
+//   - `flow_name` 1..=256 chars, only `[A-Za-z0-9_-]`.
+//   - `clock_domain` (when set) 0..=127.
+//   - `sample_rate` (audio) fixed at 48000 Hz; channels in {1,2,4,8,16}.
+//   - Pixel format / bit depth implicit: V210 only at v1.0.
+
+fn validate_mxl_domain(mxl: &crate::config::models::MxlDomainRef, ctx: &str) -> Result<()> {
+    if mxl.domain_path.is_empty() || mxl.domain_path.len() > 4096 {
+        bail!("{ctx}: domain_path length must be in [1, 4096]");
+    }
+    if !mxl.domain_path.starts_with('/') {
+        bail!("{ctx}: domain_path must be absolute (got {:?})", mxl.domain_path);
+    }
+    if mxl.flow_name.is_empty() || mxl.flow_name.len() > 256 {
+        bail!("{ctx}: flow_name length must be in [1, 256]");
+    }
+    if !mxl
+        .flow_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        bail!(
+            "{ctx}: flow_name must contain only [A-Za-z0-9_-] (got {:?})",
+            mxl.flow_name
+        );
+    }
+    Ok(())
+}
+
+fn validate_mxl_clock_domain(clock: Option<u8>, ctx: &str) -> Result<()> {
+    if let Some(d) = clock {
+        if d > 127 {
+            bail!("{ctx}: clock_domain must be 0..=127, got {d}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_mxl_channels(channels: u8, ctx: &str) -> Result<()> {
+    if !matches!(channels, 1 | 2 | 4 | 8 | 16) {
+        bail!(
+            "{ctx}: channels must be 1, 2, 4, 8, or 16 (got {channels})"
+        );
+    }
+    Ok(())
+}
+
+fn validate_mxl_packet_time_us(packet_time_us: u32, ctx: &str) -> Result<()> {
+    // Same compatible packet-time set as ST 2110-30 PM/AM (RFC 8331-friendly).
+    if !matches!(packet_time_us, 125 | 250 | 333 | 500 | 1000 | 4000) {
+        bail!(
+            "{ctx}: packet_time_us must be one of 125, 250, 333, 500, 1000, 4000 (got {packet_time_us})"
+        );
+    }
+    Ok(())
+}
+
+fn validate_mxl_frame_rate(num: u32, den: u32, ctx: &str) -> Result<()> {
+    if num == 0 || den == 0 {
+        bail!("{ctx}: frame_rate_num/den must be > 0 (got {num}/{den})");
+    }
+    Ok(())
+}
+
+fn validate_mxl_video_input(c: &crate::config::models::MxlVideoInputConfig) -> Result<()> {
+    let ctx = format!("MXL video input domain={:?} flow={:?}", c.mxl.domain_path, c.mxl.flow_name);
+    validate_mxl_domain(&c.mxl, &ctx)?;
+    validate_mxl_clock_domain(c.clock_domain, &ctx)?;
+    validate_mxl_frame_rate(c.frame_rate_num, c.frame_rate_den, &ctx)?;
+    if c.width == 0 || c.height == 0 {
+        bail!("{ctx}: width/height must be > 0");
+    }
+    if c.width > 8192 || c.height > 8192 {
+        bail!("{ctx}: width/height must be <= 8192 (got {}x{})", c.width, c.height);
+    }
+    // video_encode is mandatory for MXL video input at v1.0 — same
+    // pattern as ST 2110-20.
+    validate_video_encode(&c.video_encode, &ctx)?;
+    Ok(())
+}
+
+fn validate_mxl_video_output(c: &crate::config::models::MxlVideoOutputConfig) -> Result<()> {
+    let ctx = format!("MXL video output '{}'", c.id);
+    validate_id(&c.id, "MXL video output")?;
+    validate_name(&c.name, "MXL video output")?;
+    validate_mxl_domain(&c.mxl, &ctx)?;
+    validate_mxl_clock_domain(c.clock_domain, &ctx)?;
+    validate_mxl_frame_rate(c.frame_rate_num, c.frame_rate_den, &ctx)?;
+    if c.width == 0 || c.height == 0 || c.width > 8192 || c.height > 8192 {
+        bail!("{ctx}: width/height must be in (0, 8192] (got {}x{})", c.width, c.height);
+    }
+    Ok(())
+}
+
+fn validate_mxl_audio_input(c: &crate::config::models::MxlAudioInputConfig) -> Result<()> {
+    let ctx = format!("MXL audio input domain={:?} flow={:?}", c.mxl.domain_path, c.mxl.flow_name);
+    validate_mxl_domain(&c.mxl, &ctx)?;
+    validate_mxl_clock_domain(c.clock_domain, &ctx)?;
+    validate_mxl_channels(c.channels, &ctx)?;
+    validate_mxl_packet_time_us(c.packet_time_us, &ctx)?;
+    Ok(())
+}
+
+fn validate_mxl_audio_output(c: &crate::config::models::MxlAudioOutputConfig) -> Result<()> {
+    let ctx = format!("MXL audio output '{}'", c.id);
+    validate_id(&c.id, "MXL audio output")?;
+    validate_name(&c.name, "MXL audio output")?;
+    validate_mxl_domain(&c.mxl, &ctx)?;
+    validate_mxl_clock_domain(c.clock_domain, &ctx)?;
+    validate_mxl_channels(c.channels, &ctx)?;
+    validate_mxl_packet_time_us(c.packet_time_us, &ctx)?;
+    Ok(())
+}
+
+fn validate_mxl_anc_input(c: &crate::config::models::MxlAncInputConfig) -> Result<()> {
+    let ctx = format!("MXL ANC input domain={:?} flow={:?}", c.mxl.domain_path, c.mxl.flow_name);
+    validate_mxl_domain(&c.mxl, &ctx)?;
+    validate_mxl_clock_domain(c.clock_domain, &ctx)?;
+    Ok(())
+}
+
+fn validate_mxl_anc_output(c: &crate::config::models::MxlAncOutputConfig) -> Result<()> {
+    let ctx = format!("MXL ANC output '{}'", c.id);
+    validate_id(&c.id, "MXL ANC output")?;
+    validate_name(&c.name, "MXL ANC output")?;
+    validate_mxl_domain(&c.mxl, &ctx)?;
+    validate_mxl_clock_domain(c.clock_domain, &ctx)?;
     Ok(())
 }
 
@@ -6143,6 +6320,8 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
             InputConfig::MediaPlayer(_) => {}
             // Replay reads from the local replay store — no socket bind.
             InputConfig::Replay(_) => {}
+            // MXL inputs attach to a shared-memory domain — no socket bind.
+            InputConfig::MxlVideo(_) | InputConfig::MxlAudio(_) | InputConfig::MxlAnc(_) => {}
         }
     }
 
@@ -6274,6 +6453,10 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
             | OutputConfig::Cmaf(_)
             | OutputConfig::Webrtc(_)
             | OutputConfig::Display(_) => {}
+            // MXL outputs publish onto a shared-memory bus — no socket bind.
+            OutputConfig::MxlVideo(_)
+            | OutputConfig::MxlAudio(_)
+            | OutputConfig::MxlAnc(_) => {}
         }
     }
 

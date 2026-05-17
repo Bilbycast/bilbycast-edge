@@ -369,6 +369,9 @@ impl SecretsConfig {
             // Replay reads previously-recorded TS off the local replay
             // store; recording / clip IDs aren't secrets.
             InputConfig::Replay(_) => {}
+            // MXL inputs reference a shared-memory domain path + flow
+            // name. Neither is a secret — the manager UI shows both.
+            InputConfig::MxlVideo(_) | InputConfig::MxlAudio(_) | InputConfig::MxlAnc(_) => {}
         }
     }
 
@@ -422,6 +425,9 @@ impl SecretsConfig {
             // Display outputs render to local hardware; no infrastructure
             // or content secrets travel with the config.
             OutputConfig::Display(_) => {}
+            // MXL outputs reference a shared-memory domain + flow name;
+            // neither is a secret.
+            OutputConfig::MxlVideo(_) | OutputConfig::MxlAudio(_) | OutputConfig::MxlAnc(_) => {}
         }
     }
 }

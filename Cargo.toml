@@ -90,6 +90,19 @@ symphonia = { version = "0.5.5", features = ["aac"], default-features = false }
 video-engine = { path = "../bilbycast-ffmpeg-video-rs/video-engine", optional = true }
 video-codec = { path = "../bilbycast-ffmpeg-video-rs/video-codec", optional = true }
 
+# ── MXL (Media eXchange Layer, the `mxl` feature) ─────────────────────
+# EBU / Linux Foundation cloud-native broadcast composition layer
+# (Apache-2.0). Wraps the `dmf-mxl/mxl` upstream Rust crate pinned to
+# v1.0.1 via the sibling `bilbycast-mxl-rs` workspace, which carries
+# the upstream as a git submodule + libmxl C++ source builds via
+# CMake/Ninja/Clang + vcpkg.
+#
+# Heavy build prereq footprint — see `bilbycast-mxl-rs/CLAUDE.md`.
+# Default OFF; the small set of contribution-grade installs that need
+# uncompressed on-host composition opt in explicitly.
+# ────────────────────────────────────────────────────────────────────────
+mxl-rs = { path = "../bilbycast-mxl-rs/mxl-rs", optional = true }
+
 # System resource monitoring (CPU, RAM)
 sysinfo = "0.39.1"
 
@@ -315,6 +328,16 @@ display = [
     "media-codecs",
     "fdk-aac",
 ]
+# MXL (Media eXchange Layer) input + output. Three essence variants
+# each side — `mxl_video` (V210 4:2:2 10-bit), `mxl_audio` (Float32 PCM @
+# 48 kHz), `mxl_anc` (RFC 8331 ANC) — mirroring the ST 2110-20/-30/-40
+# pattern. PTP-enforced at validation. Same-host shared-memory only at
+# v1.0 (no cross-host Fabric API). See
+# `bilbycast-edge/docs/mxl-integration-plan.md` for the architectural
+# rationale and `bilbycast-mxl-rs/CLAUDE.md` for the build prereq
+# footprint (clang + cmake + ninja + bison + flex + lld + GStreamer dev
+# + vcpkg + `CC=clang CXX=clang++`). Default OFF.
+mxl = ["dep:mxl-rs"]
 # Hardware-decoded video, used on both the display output AND the
 # transcode (TS → TS) decode path. Each feature pulls in the matching
 # `video-engine/video-decoder-*` family. When the feature is on AND

@@ -1133,6 +1133,10 @@ pub fn clock_identity_for_input(
         InputConfig::St2110_30(c) => ClockIdentity::Ptp { domain: c.clock_domain.unwrap_or(0) },
         InputConfig::St2110_31(c) => ClockIdentity::Ptp { domain: c.clock_domain.unwrap_or(0) },
         InputConfig::St2110_40(c) => ClockIdentity::Ptp { domain: c.clock_domain.unwrap_or(0) },
+        // MXL is PTP-anchored at v1.0 — same identity rule as ST 2110.
+        InputConfig::MxlVideo(c) => ClockIdentity::Ptp { domain: c.clock_domain.unwrap_or(0) },
+        InputConfig::MxlAudio(c) => ClockIdentity::Ptp { domain: c.clock_domain.unwrap_or(0) },
+        InputConfig::MxlAnc(c)   => ClockIdentity::Ptp { domain: c.clock_domain.unwrap_or(0) },
         // Wallclock-only inputs share the host clock.
         InputConfig::Webrtc(_) | InputConfig::Whep(_) => ClockIdentity::Wallclock,
     }
@@ -1263,6 +1267,11 @@ pub fn select_master_kind_for_input(
         | InputConfig::St2110_40(_) => MasterClockKind::Ptp,
         InputConfig::RtpAudio(_) => MasterClockKind::Passthrough,
         InputConfig::Bonded(_) => MasterClockKind::Passthrough,
+        // MXL — same selection rule as ST 2110: PTP-disciplined,
+        // validation rejects `master_clock=wallclock` on MXL flows.
+        InputConfig::MxlVideo(_)
+        | InputConfig::MxlAudio(_)
+        | InputConfig::MxlAnc(_) => MasterClockKind::Ptp,
     }
 }
 

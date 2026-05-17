@@ -149,6 +149,24 @@ pub async fn test_input(config: &InputConfig) -> TestResult {
                 };
                 TestResult::ok("configured", label, start.elapsed())
             }
+            // MXL inputs attach to a shared-memory domain; connectivity
+            // test is just a path/permissions sanity check (real attach
+            // happens at flow start).
+            InputConfig::MxlVideo(c) => TestResult::ok(
+                "configured",
+                format!("MXL video input domain={} flow={}", c.mxl.domain_path, c.mxl.flow_name),
+                start.elapsed(),
+            ),
+            InputConfig::MxlAudio(c) => TestResult::ok(
+                "configured",
+                format!("MXL audio input domain={} flow={}", c.mxl.domain_path, c.mxl.flow_name),
+                start.elapsed(),
+            ),
+            InputConfig::MxlAnc(c) => TestResult::ok(
+                "configured",
+                format!("MXL ANC input domain={} flow={}", c.mxl.domain_path, c.mxl.flow_name),
+                start.elapsed(),
+            ),
         }
     })
     .await;
@@ -230,6 +248,24 @@ pub async fn test_output(config: &OutputConfig) -> TestResult {
                     start.elapsed(),
                 )
             }
+            // MXL outputs publish onto a shared-memory bus. No network
+            // connectivity test applies — the manager confirms attach
+            // at flow start.
+            OutputConfig::MxlVideo(c) => TestResult::ok(
+                "configured",
+                format!("MXL video output domain={} flow={}", c.mxl.domain_path, c.mxl.flow_name),
+                start.elapsed(),
+            ),
+            OutputConfig::MxlAudio(c) => TestResult::ok(
+                "configured",
+                format!("MXL audio output domain={} flow={}", c.mxl.domain_path, c.mxl.flow_name),
+                start.elapsed(),
+            ),
+            OutputConfig::MxlAnc(c) => TestResult::ok(
+                "configured",
+                format!("MXL ANC output domain={} flow={}", c.mxl.domain_path, c.mxl.flow_name),
+                start.elapsed(),
+            ),
         }
     })
     .await;

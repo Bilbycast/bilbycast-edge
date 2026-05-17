@@ -207,6 +207,9 @@ fn is_passive_listener(config: &InputConfig) -> bool {
         InputConfig::MediaPlayer(_) => false,
         // Replay reads from the local replay store — no socket.
         InputConfig::Replay(_) => false,
+        // MXL inputs read from a shared-memory domain, not a network
+        // socket — standby-listener monitoring isn't applicable.
+        InputConfig::MxlVideo(_) | InputConfig::MxlAudio(_) | InputConfig::MxlAnc(_) => false,
     }
 }
 

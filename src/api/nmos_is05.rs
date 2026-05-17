@@ -868,6 +868,10 @@ fn active_receiver_params(
         InputConfig::MediaPlayer(_) => TransportParamSet::default(),
         // Replay reads from the local replay store — no network transport.
         InputConfig::Replay(_) => TransportParamSet::default(),
+        // MXL is shared-memory only — no network transport params.
+        InputConfig::MxlVideo(_)
+        | InputConfig::MxlAudio(_)
+        | InputConfig::MxlAnc(_) => TransportParamSet::default(),
     };
     Ok(TransportParams {
         transport_params: vec![param_set],

@@ -282,6 +282,15 @@ pub mod output_st2110_40;
 pub mod output_st2110_20;
 pub mod output_st2110_23;
 
+/// MXL (Media eXchange Layer) — same-host cloud-native broadcast composition.
+/// Wraps `dmf-mxl/mxl` v1.0.1 via the sibling `bilbycast-mxl-rs` crate. Boot
+/// probe lives in `engine::mxl::domain::MxlDomainManager::probe`. Off by
+/// default — gated by the `mxl` Cargo feature. See
+/// `docs/mxl-integration-plan.md` for the rationale and
+/// `bilbycast-mxl-rs/CLAUDE.md` for the build prereq footprint.
+#[cfg(feature = "mxl")]
+pub mod mxl;
+
 /// Generic RFC 3551 PCM-over-RTP audio input. Wire-identical to ST 2110-30
 /// but with no PTP / RFC 7273 / NMOS clock_domain. Drives the same shared
 /// runtime as the ST 2110 audio modules.

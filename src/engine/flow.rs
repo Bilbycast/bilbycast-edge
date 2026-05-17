@@ -2230,6 +2230,41 @@ impl FlowRuntime {
                     )
                 }
             }
+            // MXL outputs — the engine spawn modules land in M2 (audio +
+            // ANC) and M3 (video). Compile-clean scaffold today: stats
+            // registration + a clear startup error so the flow doesn't
+            // silently no-op when an operator configures an MXL output
+            // on a binary that hasn't yet shipped the engine wiring.
+            OutputConfig::MxlVideo(c) => {
+                let _ = (broadcast_tx, frame_rate_rx, av_sync_pacer, active_input_rx,
+                         output_cancel, event_sender, flow_id, flow_stats);
+                anyhow::bail!(
+                    "MXL video output '{}' is not yet wired in this build \
+                     (M3 engine module engine::mxl_video_io::run_mxl_video_output lands the spawn) \
+                     (error_code: mxl_output_not_wired)",
+                    c.id
+                )
+            }
+            OutputConfig::MxlAudio(c) => {
+                let _ = (broadcast_tx, frame_rate_rx, av_sync_pacer, active_input_rx,
+                         input_audio_format, output_cancel, event_sender, flow_id, flow_stats);
+                anyhow::bail!(
+                    "MXL audio output '{}' is not yet wired in this build \
+                     (M2 engine module engine::mxl_io::run_mxl_audio_output lands the spawn) \
+                     (error_code: mxl_output_not_wired)",
+                    c.id
+                )
+            }
+            OutputConfig::MxlAnc(c) => {
+                let _ = (broadcast_tx, frame_rate_rx, av_sync_pacer, active_input_rx,
+                         output_cancel, event_sender, flow_id, flow_stats);
+                anyhow::bail!(
+                    "MXL ANC output '{}' is not yet wired in this build \
+                     (M2 engine module engine::mxl_io::run_mxl_anc_output lands the spawn) \
+                     (error_code: mxl_output_not_wired)",
+                    c.id
+                )
+            }
         }
     }
 
@@ -3098,6 +3133,35 @@ fn spawn_single_input(
                 cancel.cancelled().await;
             })
         }
+        // MXL inputs — engine modules land in M2 (audio + ANC, via
+        // `engine::mxl_io::run_mxl_audio_input` / `run_mxl_anc_input`) and
+        // M3 (video, via `engine::mxl_video_io::run_mxl_video_input`).
+        // M2 scaffold today: emit a Critical event so the operator sees
+        // the input failed to start and park on cancellation so the
+        // flow shutdown path stays clean.
+        InputConfig::MxlVideo(_) | InputConfig::MxlAudio(_) | InputConfig::MxlAnc(_) => {
+            let _ = flow_clock_domain;
+            let cancel = input_cancel.clone();
+            let event_sender = event_sender.clone();
+            let input_id_msg = input_id.clone();
+            let kind = match &input_def.config {
+                InputConfig::MxlVideo(_) => "video",
+                InputConfig::MxlAudio(_) => "audio",
+                InputConfig::MxlAnc(_) => "ANC",
+                _ => "unknown",
+            };
+            tokio::spawn(async move {
+                event_sender.emit(
+                    crate::manager::events::EventSeverity::Critical,
+                    crate::manager::events::category::FLOW,
+                    format!(
+                        "MXL {kind} input '{input_id_msg}' is not yet wired in this build \
+                         (M2/M3 engine modules pending). error_code: mxl_input_not_wired"
+                    ),
+                );
+                cancel.cancelled().await;
+            })
+        }
     };
 
     (handle, whip_info)
@@ -3426,6 +3490,22 @@ fn media_analysis_metadata(input: &InputConfig) -> MediaAnalysisMeta {
             fec_enabled: false, fec_type: None,
             redundancy_enabled: false, redundancy_type: None,
         },
+        InputConfig::MxlVideo(_) => MediaAnalysisMeta {
+            protocol: "mxl_video".into(), payload_format: "h264_hevc_ts".into(),
+            fec_enabled: false, fec_type: None,
+            redundancy_enabled: false, redundancy_type: None,
+        },
+        InputConfig::MxlAudio(c) => MediaAnalysisMeta {
+            protocol: "mxl_audio".into(),
+            payload_format: if c.audio_encode.is_some() { "audio_ts".into() } else { "pcm_f32".into() },
+            fec_enabled: false, fec_type: None,
+            redundancy_enabled: false, redundancy_type: None,
+        },
+        InputConfig::MxlAnc(_) => MediaAnalysisMeta {
+            protocol: "mxl_anc".into(), payload_format: "anc".into(),
+            fec_enabled: false, fec_type: None,
+            redundancy_enabled: false, redundancy_type: None,
+        },
     }
 }
 
@@ -3455,6 +3535,9 @@ fn input_type_str(input: &InputConfig) -> &'static str {
         InputConfig::TestPattern(_) => "test_pattern",
         InputConfig::MediaPlayer(_) => "media_player",
         InputConfig::Replay(_) => "replay",
+        InputConfig::MxlVideo(_) => "mxl_video",
+        InputConfig::MxlAudio(_) => "mxl_audio",
+        InputConfig::MxlAnc(_) => "mxl_anc",
     }
 }
 
@@ -3618,6 +3701,24 @@ fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::Inpu
             bind_addr: None,
             rtsp_url: None,
             whep_url: None,
+        },
+        InputConfig::MxlVideo(c) => InputConfigMeta {
+            mode: Some(format!("mxl_video {}x{} domain={} flow={}", c.width, c.height, c.mxl.domain_path, c.mxl.flow_name)),
+            local_addr: None, remote_addr: None,
+            listen_addr: None, bind_addr: None,
+            rtsp_url: None, whep_url: None,
+        },
+        InputConfig::MxlAudio(c) => InputConfigMeta {
+            mode: Some(format!("mxl_audio {}ch domain={} flow={}", c.channels, c.mxl.domain_path, c.mxl.flow_name)),
+            local_addr: None, remote_addr: None,
+            listen_addr: None, bind_addr: None,
+            rtsp_url: None, whep_url: None,
+        },
+        InputConfig::MxlAnc(c) => InputConfigMeta {
+            mode: Some(format!("mxl_anc domain={} flow={}", c.mxl.domain_path, c.mxl.flow_name)),
+            local_addr: None, remote_addr: None,
+            listen_addr: None, bind_addr: None,
+            rtsp_url: None, whep_url: None,
         },
     }
 }
@@ -4857,6 +4958,27 @@ fn build_output_config_meta(config: &OutputConfig) -> OutputConfigMeta {
             whip_url: None,
             program_number: c.program_number,
         },
+        OutputConfig::MxlVideo(c) => OutputConfigMeta {
+            mode: Some(format!("mxl_video {}x{} domain={} flow={}", c.width, c.height, c.mxl.domain_path, c.mxl.flow_name)),
+            remote_addr: None, local_addr: None,
+            dest_addr: Some(format!("{}#{}", c.mxl.domain_path, c.mxl.flow_name)),
+            dest_url: None, ingest_url: None, whip_url: None,
+            program_number: None,
+        },
+        OutputConfig::MxlAudio(c) => OutputConfigMeta {
+            mode: Some(format!("mxl_audio {}ch domain={} flow={}", c.channels, c.mxl.domain_path, c.mxl.flow_name)),
+            remote_addr: None, local_addr: None,
+            dest_addr: Some(format!("{}#{}", c.mxl.domain_path, c.mxl.flow_name)),
+            dest_url: None, ingest_url: None, whip_url: None,
+            program_number: None,
+        },
+        OutputConfig::MxlAnc(c) => OutputConfigMeta {
+            mode: Some(format!("mxl_anc domain={} flow={}", c.mxl.domain_path, c.mxl.flow_name)),
+            remote_addr: None, local_addr: None,
+            dest_addr: Some(format!("{}#{}", c.mxl.domain_path, c.mxl.flow_name)),
+            dest_url: None, ingest_url: None, whip_url: None,
+            program_number: None,
+        },
     }
 }
 
@@ -4987,11 +5109,14 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
             InputConfig::TestPattern(c) => c.video_encode.as_ref(),
             InputConfig::St2110_20(c) => Some(&c.video_encode),
             InputConfig::St2110_23(c) => Some(&c.video_encode),
+            InputConfig::MxlVideo(c) => Some(&c.video_encode),
             InputConfig::St2110_30(_)
             | InputConfig::St2110_31(_)
             | InputConfig::St2110_40(_)
             | InputConfig::RtpAudio(_)
-            | InputConfig::Bonded(_) => None,
+            | InputConfig::Bonded(_)
+            | InputConfig::MxlAudio(_)
+            | InputConfig::MxlAnc(_) => None,
         }
     }
 
@@ -5488,6 +5613,12 @@ fn input_encode_blocks(
         RtpAudio(c) => (c.audio_encode.as_ref(), None),
         // No encode blocks on these.
         St2110_40(_) | Bonded(_) => (None, None),
+        // MXL video has mandatory `video_encode` (ingress decode → re-encode).
+        MxlVideo(c) => (None, Some(c.video_encode.codec.as_str())),
+        // MXL audio: optional `audio_encode` like ST 2110-30.
+        MxlAudio(c) => (c.audio_encode.as_ref(), None),
+        // MXL ANC carries no encode blocks.
+        MxlAnc(_) => (None, None),
     }
 }
 

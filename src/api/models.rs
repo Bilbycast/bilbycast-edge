@@ -104,6 +104,11 @@ impl FlowSummary {
             Some(InputConfig::TestPattern(_)) => ("test_pattern", false),
             Some(InputConfig::MediaPlayer(_)) => ("media_player", false),
             Some(InputConfig::Replay(_)) => ("replay", false),
+            // MXL is same-host shared memory — no transport-level
+            // redundancy (no Red/Blue legs at v1.0).
+            Some(InputConfig::MxlVideo(_)) => ("mxl_video", false),
+            Some(InputConfig::MxlAudio(_)) => ("mxl_audio", false),
+            Some(InputConfig::MxlAnc(_)) => ("mxl_anc", false),
             None => ("none", false),
         };
 

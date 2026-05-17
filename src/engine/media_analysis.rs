@@ -159,6 +159,24 @@ fn populate_transport_info(input: &InputConfig, state: &mut MediaAnalysisState) 
             state.protocol = "replay".to_string();
             state.payload_format = "raw_ts".to_string();
         }
+        InputConfig::MxlVideo(_) => {
+            state.protocol = "mxl_video".to_string();
+            // After ingress decode + re-encode, the broadcast channel
+            // carries H.264 or HEVC MPEG-TS.
+            state.payload_format = "h264_hevc_ts".to_string();
+        }
+        InputConfig::MxlAudio(c) => {
+            state.protocol = "mxl_audio".to_string();
+            state.payload_format = if c.audio_encode.is_some() {
+                "audio_ts".to_string()
+            } else {
+                "pcm_f32".to_string()
+            };
+        }
+        InputConfig::MxlAnc(_) => {
+            state.protocol = "mxl_anc".to_string();
+            state.payload_format = "anc".to_string();
+        }
     }
 }
 

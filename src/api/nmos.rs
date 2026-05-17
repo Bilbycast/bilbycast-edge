@@ -142,6 +142,12 @@ fn input_transport(input: &InputConfig) -> &'static str {
         // Replay pumps recorded MPEG-TS back onto the broadcast channel;
         // advertise as generic RTP for NMOS surface compatibility.
         InputConfig::Replay(_) => "urn:x-nmos:transport:rtp",
+        // MXL is same-host shared memory; NMOS has no native URN, so we
+        // advertise as generic RTP for NMOS surface compatibility (same
+        // approach as display outputs / bonded / test_pattern).
+        InputConfig::MxlVideo(_)
+        | InputConfig::MxlAudio(_)
+        | InputConfig::MxlAnc(_) => "urn:x-nmos:transport:rtp",
     }
 }
 
@@ -166,6 +172,9 @@ fn output_transport(output: &OutputConfig) -> &'static str {
         // NMOS has no native concept for this; the placeholder transport
         // keeps `output_transport` exhaustive without crashing.
         OutputConfig::Display(_) => "urn:x-nmos:transport:rtp",
+        OutputConfig::MxlVideo(_)
+        | OutputConfig::MxlAudio(_)
+        | OutputConfig::MxlAnc(_) => "urn:x-nmos:transport:rtp",
     }
 }
 
@@ -311,6 +320,9 @@ fn input_type_str(input: &InputConfig) -> &'static str {
         InputConfig::TestPattern(_) => "test_pattern",
         InputConfig::MediaPlayer(_) => "media_player",
         InputConfig::Replay(_) => "replay",
+        InputConfig::MxlVideo(_) => "mxl_video",
+        InputConfig::MxlAudio(_) => "mxl_audio",
+        InputConfig::MxlAnc(_) => "mxl_anc",
     }
 }
 
@@ -332,6 +344,9 @@ fn output_id(output: &OutputConfig) -> &str {
         OutputConfig::RtpAudio(c) => &c.id,
         OutputConfig::Bonded(c) => &c.id,
         OutputConfig::Display(c) => &c.id,
+        OutputConfig::MxlVideo(c) => &c.id,
+        OutputConfig::MxlAudio(c) => &c.id,
+        OutputConfig::MxlAnc(c) => &c.id,
     }
 }
 
@@ -353,6 +368,9 @@ fn output_name(output: &OutputConfig) -> &str {
         OutputConfig::RtpAudio(c) => &c.name,
         OutputConfig::Bonded(c) => &c.name,
         OutputConfig::Display(c) => &c.name,
+        OutputConfig::MxlVideo(c) => &c.name,
+        OutputConfig::MxlAudio(c) => &c.name,
+        OutputConfig::MxlAnc(c) => &c.name,
     }
 }
 

@@ -483,6 +483,24 @@ Surface for the `upgrade_binary` lifecycle. Manager UI gates the per-node "Upgra
 
 **Source**: `src/upgrade/mod.rs::error_codes`, emitted by `src/upgrade/{mod,watchdog,verify,download,apply}.rs`. The full operator-facing trust model and runbook live in [`docs/upgrade.md`](upgrade.md).
 
+### MXL (Media eXchange Layer) (`flow`)
+
+Lifecycle + format events for MXL inputs / outputs. Gated by the `mxl` Cargo feature (default off). The manager UI surfaces these events only when an edge advertises one of `mxl-video` / `mxl-audio` / `mxl-anc` on `HealthPayload.capabilities`. See [`docs/mxl-integration-plan.md`](mxl-integration-plan.md) for the integration plan and [`bilbycast-mxl-rs/CLAUDE.md`](../../bilbycast-mxl-rs/CLAUDE.md) for the build prereq footprint.
+
+| Severity | Error code | Trigger |
+|----------|------------|---------|
+| critical | `mxl_domain_unavailable` | Boot-time `MxlDomainManager::probe()` failed to locate or dlopen libmxl.so. Capability bits are not advertised; existing MXL flow configs refuse to start. |
+| critical | `mxl_ptp_required` | Flow validation: `master_clock = wallclock` was configured on a flow that references any MXL input or output. MXL is PTP-anchored at v1.0; wallclock would silently drift relative to upstream / downstream MXL pods. |
+| critical | `mxl_input_not_wired` | M2-pending stub fires when a flow with an MXL input starts on a build whose engine modules haven't been wired yet. Will be removed when M2 engine modules land. |
+| critical | `mxl_output_not_wired` | Same as `mxl_input_not_wired` but on the output side. M2/M3 engine modules land per essence. |
+| warning | `mxl_domain_not_tmpfs` | The configured `domain_path` is not on `tmpfs` or `ramfs` per `statfs(2)`. libmxl's perf model degrades sharply off tmpfs; recommend operator mount the path on tmpfs (the default for `/dev/shm`). |
+| warning | `mxl_format_unsupported` | Operator config specifies a format not yet supported by upstream MXL v1.0 (non-V210 video, non-Float32 audio, non-48 kHz sample rate). |
+| warning | `mxl_grain_drop` | An MXL output dropped grains because the broadcast subscriber lagged. Increments `OutputStats.packets_dropped`. |
+
+**Details**: `{ error_code, domain_path, flow_name, kind ("video" | "audio" | "anc"), … }`.
+
+**Source**: M1 wired `mxl_domain_unavailable` from the boot probe path (`src/main.rs`); the per-flow events land alongside the M2/M3 engine modules in `src/engine/mxl_io.rs` and `src/engine/mxl_video_io.rs`. Until then, `mxl_input_not_wired` / `mxl_output_not_wired` are emitted from the flow dispatch stub in `src/engine/flow.rs::spawn_single_input` / `start_output`.
+
 ---
 
 ## Manager-Generated Events

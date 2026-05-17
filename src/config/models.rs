@@ -1332,6 +1332,24 @@ pub enum InputConfig {
     /// behaviour. Field schema in [`ReplayInputConfig`].
     #[serde(rename = "replay")]
     Replay(ReplayInputConfig),
+    /// Consume a MXL (Media eXchange Layer) **video** flow — V210 4:2:2
+    /// 10-bit grains from the shared-memory bus, encoded to H.264/HEVC
+    /// and published as MPEG-TS onto the flow's broadcast channel.
+    /// PTP-required. Gated by the `mxl` Cargo feature. See
+    /// `docs/mxl-integration-plan.md`.
+    #[serde(rename = "mxl_video")]
+    MxlVideo(MxlVideoInputConfig),
+    /// Consume a MXL **audio** flow — Float32 PCM @ 48 kHz samples from
+    /// the shared-memory bus. Optional `audio_encode` synthesises an
+    /// audio-only MPEG-TS for TS-bearing outputs (same shape as ST
+    /// 2110-30). PTP-required. Gated by the `mxl` Cargo feature.
+    #[serde(rename = "mxl_audio")]
+    MxlAudio(MxlAudioInputConfig),
+    /// Consume a MXL **ancillary** flow — RFC 8331 ANC grains from the
+    /// shared-memory bus. SCTE-104, SMPTE 12M timecode, CEA-608/708
+    /// captions. PTP-required. Gated by the `mxl` Cargo feature.
+    #[serde(rename = "mxl_anc")]
+    MxlAnc(MxlAncInputConfig),
 }
 
 /// File-backed replay input. Reads MPEG-TS segments from a local
@@ -1667,6 +1685,9 @@ impl InputConfig {
             InputConfig::TestPattern(_) => "test_pattern",
             InputConfig::MediaPlayer(_) => "media_player",
             InputConfig::Replay(_) => "replay",
+            InputConfig::MxlVideo(_) => "mxl_video",
+            InputConfig::MxlAudio(_) => "mxl_audio",
+            InputConfig::MxlAnc(_) => "mxl_anc",
         }
     }
 
@@ -1716,6 +1737,13 @@ impl InputConfig {
             InputConfig::RtpAudio(c) => c.audio_encode.is_some(),
             InputConfig::St2110_31(c) => c.audio_encode.is_some(),
             InputConfig::St2110_40(_) => false,
+            // MXL video always encodes to TS at v1.0 (video_encode is required).
+            InputConfig::MxlVideo(_) => true,
+            // MXL audio becomes a TS carrier only when audio_encode is set
+            // — mirrors the ST 2110-30 pattern.
+            InputConfig::MxlAudio(c) => c.audio_encode.is_some(),
+            // MXL ANC is RFC 8331 data, never TS.
+            InputConfig::MxlAnc(_) => false,
         }
     }
 
@@ -2506,6 +2534,21 @@ pub enum OutputConfig {
     /// is always present so configs round-trip cleanly across platforms.
     #[serde(rename = "display")]
     Display(DisplayOutputConfig),
+    /// Produce a MXL **video** flow — decode the flow's H.264/HEVC TS,
+    /// scale + convert to V210 4:2:2 10-bit planar, publish as grains
+    /// onto the shared-memory bus. PTP-required. Gated by the `mxl`
+    /// Cargo feature.
+    #[serde(rename = "mxl_video")]
+    MxlVideo(MxlVideoOutputConfig),
+    /// Produce a MXL **audio** flow — Float32 PCM @ 48 kHz samples onto
+    /// the shared-memory bus. PTP-required. Gated by the `mxl` Cargo
+    /// feature.
+    #[serde(rename = "mxl_audio")]
+    MxlAudio(MxlAudioOutputConfig),
+    /// Produce a MXL **ancillary** flow — RFC 8331 ANC grains onto the
+    /// shared-memory bus. PTP-required. Gated by the `mxl` Cargo feature.
+    #[serde(rename = "mxl_anc")]
+    MxlAnc(MxlAncOutputConfig),
 }
 
 impl OutputConfig {
@@ -2528,6 +2571,9 @@ impl OutputConfig {
             OutputConfig::RtpAudio(c) => &c.id,
             OutputConfig::Bonded(c) => &c.id,
             OutputConfig::Display(c) => &c.id,
+            OutputConfig::MxlVideo(c) => &c.id,
+            OutputConfig::MxlAudio(c) => &c.id,
+            OutputConfig::MxlAnc(c) => &c.id,
         }
     }
 
@@ -2550,6 +2596,9 @@ impl OutputConfig {
             OutputConfig::RtpAudio(c) => &c.name,
             OutputConfig::Bonded(c) => &c.name,
             OutputConfig::Display(c) => &c.name,
+            OutputConfig::MxlVideo(c) => &c.name,
+            OutputConfig::MxlAudio(c) => &c.name,
+            OutputConfig::MxlAnc(c) => &c.name,
         }
     }
 
@@ -2572,6 +2621,9 @@ impl OutputConfig {
             OutputConfig::RtpAudio(_) => "rtp_audio",
             OutputConfig::Bonded(_) => "bonded",
             OutputConfig::Display(_) => "display",
+            OutputConfig::MxlVideo(_) => "mxl_video",
+            OutputConfig::MxlAudio(_) => "mxl_audio",
+            OutputConfig::MxlAnc(_) => "mxl_anc",
         }
     }
 
@@ -2595,6 +2647,9 @@ impl OutputConfig {
             OutputConfig::RtpAudio(c) => c.active,
             OutputConfig::Bonded(c) => c.active,
             OutputConfig::Display(c) => c.active,
+            OutputConfig::MxlVideo(c) => c.active,
+            OutputConfig::MxlAudio(c) => c.active,
+            OutputConfig::MxlAnc(c) => c.active,
         }
     }
 
@@ -2619,6 +2674,9 @@ impl OutputConfig {
             OutputConfig::RtpAudio(c) => c.active = active,
             OutputConfig::Bonded(c) => c.active = active,
             OutputConfig::Display(c) => c.active = active,
+            OutputConfig::MxlVideo(c) => c.active = active,
+            OutputConfig::MxlAudio(c) => c.active = active,
+            OutputConfig::MxlAnc(c) => c.active = active,
         }
     }
 
@@ -2641,6 +2699,9 @@ impl OutputConfig {
             OutputConfig::RtpAudio(c) => c.group.as_deref(),
             OutputConfig::Bonded(c) => c.group.as_deref(),
             OutputConfig::Display(c) => c.group.as_deref(),
+            OutputConfig::MxlVideo(c) => c.group.as_deref(),
+            OutputConfig::MxlAudio(c) => c.group.as_deref(),
+            OutputConfig::MxlAnc(c) => c.group.as_deref(),
         }
     }
 }
@@ -5355,6 +5416,196 @@ pub enum DisplayScalingMode {
     #[default]
     MatchSource,
     MonitorNative,
+}
+
+// ── MXL (Media eXchange Layer) configuration ────────────────────────────
+//
+// Gated by the `mxl` Cargo feature (default off). MXL v1.0 carries three
+// essence types over same-host shared memory: V210 4:2:2 10-bit video,
+// Float32 PCM @ 48 kHz audio, and RFC 8331 ancillary data. PTP is
+// mandatory — validation rejects `master_clock=wallclock` on any flow
+// referencing an MXL input or output. See
+// `docs/mxl-integration-plan.md` for the architectural rationale and
+// `bilbycast-mxl-rs/CLAUDE.md` for the build prereq footprint.
+
+/// Shared identifier for a MXL flow on a domain. Both producer (output)
+/// and consumer (input) must agree on `(domain_path, flow_name)` for
+/// libmxl to route grains between them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MxlDomainRef {
+    /// Path to the MXL domain directory — typically `/dev/shm/<name>`.
+    /// Must live on tmpfs or ramfs for libmxl's shared-memory perf model;
+    /// the edge emits a `mxl_domain_not_tmpfs` Warning event otherwise.
+    pub domain_path: String,
+    /// MXL flow name (libmxl identifies flows by this string).
+    pub flow_name: String,
+}
+
+/// MXL **video** input. Consumes V210 grains from the bus, decodes V210
+/// into planar 4:2:2 10-bit YUV, encodes via the configured backend, and
+/// publishes MPEG-TS onto the flow's broadcast channel.
+///
+/// `video_encode` is currently required at v1.0 — bilbycast's flows are
+/// downstream-MPEG-TS-centric, so an MXL-in flow that wants to feed any
+/// network output needs the encode step. (When M3 grows an MXL→MXL
+/// passthrough output, the requirement relaxes.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MxlVideoInputConfig {
+    /// Shared-memory domain + flow identifier.
+    #[serde(flatten)]
+    pub mxl: MxlDomainRef,
+    /// Video width in pixels.
+    pub width: u32,
+    /// Video height in pixels.
+    pub height: u32,
+    /// Frame rate numerator (e.g. 30000 for 29.97).
+    pub frame_rate_num: u32,
+    /// Frame rate denominator (e.g. 1001 for 29.97).
+    pub frame_rate_den: u32,
+    /// PTP clock domain (0..=127). Inherits from the parent flow when
+    /// omitted. Required for MXL — validation rejects
+    /// `master_clock=wallclock` on any MXL flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_domain: Option<u8>,
+    /// Mandatory ingress video encode. Mirrors `St2110VideoInputConfig`.
+    /// A feature-flagged backend (`video-encoder-x264` / `-x265` /
+    /// `-nvenc` / `-qsv` / `-vaapi`) must be compiled in.
+    pub video_encode: VideoEncodeConfig,
+    /// MPEG-TS PID overrides for the synthesised TS.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
+    pub pid_overrides: Option<TsPidOverridesMap>,
+}
+
+/// MXL **video** output. Decodes the flow's H.264/HEVC TS, scales to
+/// 4:2:2 10-bit planar, packs into V210, publishes grains onto the bus.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MxlVideoOutputConfig {
+    /// Unique output ID within this flow.
+    pub id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Whether this output is currently active.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Optional free-form group tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Shared-memory domain + flow identifier we publish onto.
+    #[serde(flatten)]
+    pub mxl: MxlDomainRef,
+    /// Output frame dimensions.
+    pub width: u32,
+    pub height: u32,
+    pub frame_rate_num: u32,
+    pub frame_rate_den: u32,
+    /// PTP clock domain (0..=127).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_domain: Option<u8>,
+}
+
+/// MXL **audio** input — consumes a Float32 PCM samples flow from the bus.
+///
+/// MXL v1.0 fixes audio at 48 kHz Float32. Channel count and packet time
+/// are operator-configurable. Optional `audio_encode` synthesises an
+/// audio-only MPEG-TS for TS-bearing outputs on the same flow (same
+/// shape as `St2110AudioInputConfig::audio_encode`); when set, the
+/// broadcast channel switches from raw PCM to TS.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MxlAudioInputConfig {
+    /// Shared-memory domain + flow identifier.
+    #[serde(flatten)]
+    pub mxl: MxlDomainRef,
+    /// Channel count (1, 2, 4, 8, 16).
+    #[serde(default = "default_st2110_channels")]
+    pub channels: u8,
+    /// Packet time in microseconds. libmxl bundles samples per grain to
+    /// match. Default 1000 (1ms, ST 2110-30 PM-compatible).
+    #[serde(default = "default_st2110_packet_time_us")]
+    pub packet_time_us: u32,
+    /// PTP clock domain (0..=127). Required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_domain: Option<u8>,
+    /// Optional planar PCM transcode — see
+    /// `St2110AudioInputConfig::transcode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// Optional ingress audio re-encode — see
+    /// `St2110AudioInputConfig::audio_encode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
+    /// MPEG-TS PID overrides when `audio_encode` is set.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
+    pub pid_overrides: Option<TsPidOverridesMap>,
+}
+
+/// MXL **audio** output — publishes Float32 PCM samples onto the bus.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MxlAudioOutputConfig {
+    /// Unique output ID within this flow.
+    pub id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Whether this output is currently active.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Optional free-form group tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Shared-memory domain + flow identifier we publish onto.
+    #[serde(flatten)]
+    pub mxl: MxlDomainRef,
+    /// Channel count.
+    #[serde(default = "default_st2110_channels")]
+    pub channels: u8,
+    /// Packet time in microseconds.
+    #[serde(default = "default_st2110_packet_time_us")]
+    pub packet_time_us: u32,
+    /// PTP clock domain (0..=127).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_domain: Option<u8>,
+    /// Optional planar PCM transcode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+}
+
+/// MXL **ancillary** input — consumes RFC 8331 ANC grains from the bus.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MxlAncInputConfig {
+    /// Shared-memory domain + flow identifier.
+    #[serde(flatten)]
+    pub mxl: MxlDomainRef,
+    /// PTP clock domain (0..=127).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_domain: Option<u8>,
+}
+
+/// MXL **ancillary** output — publishes RFC 8331 ANC grains onto the bus.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MxlAncOutputConfig {
+    /// Unique output ID within this flow.
+    pub id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Whether this output is currently active.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Optional free-form group tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Shared-memory domain + flow identifier we publish onto.
+    #[serde(flatten)]
+    pub mxl: MxlDomainRef,
+    /// PTP clock domain (0..=127).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_domain: Option<u8>,
 }
 
 #[cfg(test)]

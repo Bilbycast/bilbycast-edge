@@ -404,6 +404,32 @@ async fn main() -> anyhow::Result<()> {
         let displays = display::init_displays();
         tracing::info!("display: enumerated {} connector(s)", displays.len());
     }
+    // MXL (Media eXchange Layer) probe — try to dlopen libmxl.so at boot.
+    // Returns Some on success and gates the `mxl-*` capability bits;
+    // returns None gracefully on hosts without libmxl installed so the
+    // boot path stays alive. M4 wires the resulting handle into capability
+    // advertisement + flow spawn dispatch.
+    #[cfg(feature = "mxl")]
+    let mxl_domain_manager: Option<std::sync::Arc<engine::mxl::domain::MxlDomainManager>> = {
+        engine::mxl::domain::MxlDomainManager::probe().map(std::sync::Arc::new)
+    };
+    #[cfg(feature = "mxl")]
+    match mxl_domain_manager.as_ref() {
+        Some(mgr) => {
+            // Boot-time perf preflight: confirm /dev/shm is tmpfs (the default
+            // MXL domain root). M2 will repeat this per-flow against the
+            // operator-configured domain path before attach.
+            let shm_tmpfs = engine::mxl::domain::is_tmpfs(std::path::Path::new("/dev/shm"));
+            tracing::info!(
+                "mxl: probe succeeded — libmxl loaded from {}; /dev/shm tmpfs check = {}",
+                mgr.so_path().display(),
+                if shm_tmpfs { "OK" } else { "MISS (libmxl perf will degrade)" }
+            );
+        }
+        None => tracing::info!(
+            "mxl: probe found no libmxl.so — mxl-* capabilities will not be advertised"
+        ),
+    }
     tracing::info!(
         "hardware probe: cpu={} ({}/{} cores, avx={:?}); hw_encoders any={}; sw x264/x265={}/{}",
         static_capabilities.cpu.brand,

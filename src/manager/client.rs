@@ -1200,6 +1200,19 @@ fn edge_capabilities() -> Vec<&'static str> {
             caps.push("wire_pacing_txtime");
         }
     }
+    // MXL (Media eXchange Layer) — advertised per-essence only when the
+    // `mxl` Cargo feature is on AND the boot probe successfully dlopen'd
+    // libmxl.so. Manager UI keys MXL option dropdowns off these bits.
+    // Three per-essence bits parallel the ST 2110-20/-30/-40 pattern so
+    // future per-essence build slicing stays clean.
+    #[cfg(feature = "mxl")]
+    {
+        if crate::engine::mxl::domain::probe_succeeded() {
+            caps.push("mxl-video");
+            caps.push("mxl-audio");
+            caps.push("mxl-anc");
+        }
+    }
     caps
 }
 
