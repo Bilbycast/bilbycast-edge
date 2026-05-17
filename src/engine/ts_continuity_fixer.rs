@@ -192,6 +192,19 @@ impl TsContinuityFixer {
         self.ever_switched = true;
     }
 
+    /// Forget the per-input PSI cache for `input_id`.
+    ///
+    /// Called when an input is hot-removed from a flow so that a later
+    /// hot-add of an input under the same id doesn't carry stale PAT/PMT
+    /// from a different source. The output-side `pid_state` map is NOT
+    /// touched — those continuity counters are output-PID-keyed and
+    /// shared across all inputs.
+    ///
+    /// Idempotent: dropping an unknown input id is a no-op.
+    pub fn forget_input(&mut self, input_id: &str) {
+        self.input_psi.remove(input_id);
+    }
+
     /// Return cached PAT + PMT packets suitable for a keepalive tick when
     /// the active input has no live data flowing. Preference order:
     ///

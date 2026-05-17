@@ -421,6 +421,14 @@ async fn main() -> anyhow::Result<()> {
     let resource_action = app_config.resource_limits.as_ref().map(|rl| rl.critical_action.clone());
     #[cfg(all(feature = "display", target_os = "linux"))]
     let display_claim_registry = display::claim_registry::DisplayClaimRegistry::new();
+    // Construct the WebRTC session registry before FlowManager so the
+    // manager can hold a clone for flow-lifecycle cleanup (unregister on
+    // flow stop, granular unregister on hot-remove of WHIP-server inputs).
+    // The same Arc is also surfaced on `AppState.webrtc_sessions` below for
+    // the HTTP signalling layer.
+    #[cfg(feature = "webrtc")]
+    let webrtc_sessions: Arc<api::webrtc::registry::WebrtcSessionRegistry> =
+        Arc::new(api::webrtc::registry::WebrtcSessionRegistry::new());
     let flow_manager = Arc::new(FlowManager::new(
         global_stats.clone(),
         ffmpeg_available,
@@ -430,6 +438,8 @@ async fn main() -> anyhow::Result<()> {
         Some(static_capabilities.clone()),
         #[cfg(all(feature = "display", target_os = "linux"))]
         Arc::clone(&display_claim_registry),
+        #[cfg(feature = "webrtc")]
+        Some(Arc::clone(&webrtc_sessions)),
     ));
     let tunnel_manager = Arc::new(TunnelManager::new(event_sender.clone()));
     let standby_listeners = Arc::new(
@@ -489,7 +499,7 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|| std::path::PathBuf::from("nmos_channel_map.json")),
         ),
         #[cfg(feature = "webrtc")]
-        webrtc_sessions: Some(Arc::new(api::webrtc::registry::WebrtcSessionRegistry::new())),
+        webrtc_sessions: Some(Arc::clone(&webrtc_sessions)),
         event_sender: Some(event_sender.clone()),
         resource_state: resource_state.clone(),
         standby_listeners: Some(standby_listeners.clone()),

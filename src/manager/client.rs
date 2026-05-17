@@ -1624,11 +1624,31 @@ async fn execute_command(
                         );
                     }
 
-                    if input_changed || restart_required {
-                        // Input, rate-limit, or content-analysis tier
-                        // toggles changed — must restart entire flow.
+                    // Phase 2 hot-swap upgrade: an input-set change that
+                    // touches a Hitless slot's leg list must fall back to
+                    // a full restart because the hitless ES merger is not
+                    // designed to grow / shrink legs in flight. For every
+                    // other input-set delta the surgical add_input /
+                    // remove_input paths apply without dropping outputs.
+                    let input_touches_hitless = if input_changed {
+                        input_delta_touches_hitless(
+                            flow_manager,
+                            flow_id,
+                            &old_flow.input_ids,
+                            &new_flow.input_ids,
+                        )
+                        .await
+                    } else {
+                        false
+                    };
+                    let force_restart = input_touches_hitless || restart_required;
+
+                    if force_restart {
+                        // Input change that touches a hitless leg, rate-limit
+                        // change, or content-analysis / recording tier toggle
+                        // — must restart entire flow.
                         tracing::info!(
-                            "Update flow '{flow_id}': restarting (input changed={input_changed}, bandwidth_limit/content_analysis/recording changed={restart_required}, content_analysis_changed={content_analysis_changed}, recording_changed={recording_changed})"
+                            "Update flow '{flow_id}': restarting (input_touches_hitless={input_touches_hitless}, bandwidth_limit/content_analysis/recording changed={restart_required}, content_analysis_changed={content_analysis_changed}, recording_changed={recording_changed})"
                         );
                         let _ = flow_manager.destroy_flow(flow_id).await;
                         let resolved = {
@@ -1648,6 +1668,29 @@ async fn execute_command(
                             let _ = flow_manager.destroy_flow(flow_id).await;
                             return Err(err);
                         }
+                    } else if input_changed {
+                        // Surgical input + output reconcile — outputs keep
+                        // running across the edit. Reconcile inputs first
+                        // so an added input is publishing before outputs
+                        // are added, and removed inputs are gone before
+                        // outputs that depended on them get dropped.
+                        tracing::info!(
+                            "Update flow '{flow_id}': surgical input + output reconcile (inputs old→new: {} → {}, outputs old→new: {} → {})",
+                            old_flow.input_ids.len(),
+                            new_flow.input_ids.len(),
+                            old_flow.output_ids.len(),
+                            new_flow.output_ids.len(),
+                        );
+                        let cfg = app_config.read().await;
+                        diff_inputs(
+                            flow_manager,
+                            flow_id,
+                            &new_flow.input_ids,
+                            &cfg.inputs,
+                            _webrtc_sessions,
+                        )
+                        .await;
+                        diff_outputs(flow_manager, flow_id, &new_flow.output_ids, &cfg).await;
                     } else {
                         // Only outputs changed — diff surgically against the runtime.
                         // `old_flow.output_ids` is intentionally unused here; see
@@ -1886,6 +1929,120 @@ async fn execute_command(
             let still_referenced = cfg.flows.iter().any(|f| f.output_ids.iter().any(|id| id == output_id));
             if !still_referenced {
                 cfg.outputs.retain(|o| o.id() != output_id);
+            }
+            persist_config(&cfg, config_path, secrets_path).await;
+            Ok(None)
+        }
+        "add_input" => {
+            let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?.to_string();
+            let input: InputDefinition =
+                serde_json::from_value(action["input"].clone())
+                    .map_err(|e| format!("Invalid input config: {e}"))?;
+            validate_input_definition(&input)
+                .map_err(|e| CommandError::from_validation("Invalid input config", e))?;
+            let input_id = input.id.clone();
+            tracing::info!(
+                "Manager command: add input '{input_id}' to flow '{flow_id}' (hot-add)"
+            );
+
+            let spawn_started_at = std::time::Instant::now();
+            let hot_added = match flow_manager.add_input(&flow_id, input.clone()).await {
+                Ok(info) => info,
+                Err(e) => {
+                    // Recover structured InputMembershipError code if present.
+                    if let Some(membership_err) =
+                        e.downcast_ref::<crate::engine::flow::InputMembershipError>()
+                    {
+                        return Err(CommandError::with_code(
+                            membership_err.message.clone(),
+                            membership_err.code,
+                        ));
+                    }
+                    return Err(CommandError::new(e.to_string()));
+                }
+            };
+
+            // Listener inputs (SRT-listener, RIST, RTSP, WHIP server) bind
+            // asynchronously. Watch the event channel briefly for a bind
+            // failure scoped to this flow; if one fires, roll back via
+            // `remove_input` and surface a structured `port_conflict` /
+            // `bind_failed` on the ack so the manager UI can highlight the
+            // offending field.
+            if let Some(err) = wait_for_first_bind_failure(
+                flow_manager.event_sender(),
+                &flow_id,
+                spawn_started_at,
+            )
+            .await
+            {
+                let _ = flow_manager.remove_input(&flow_id, &input_id).await;
+                return Err(err);
+            }
+
+            // Register the WHIP-server session channel with the WebrtcSessionRegistry
+            // so browsers can pair against the hot-added input without restarting
+            // the flow. Pre-Phase-1 behaviour was to spawn the input task but skip
+            // registry registration (operators had to restart). Surfacing
+            // `whip_info` from `add_input` closes that gap.
+            #[cfg(feature = "webrtc")]
+            if let Some((tx, bearer_token)) = hot_added.whip_info {
+                if let Some(registry) = _webrtc_sessions {
+                    registry.register_whip_input(&flow_id, tx, bearer_token);
+                    tracing::info!(
+                        "Registered hot-added WHIP input '{input_id}' for flow '{flow_id}'"
+                    );
+                }
+            }
+            // Suppress unused-variable warnings when webrtc feature is off.
+            #[cfg(not(feature = "webrtc"))]
+            let _ = hot_added;
+
+            // Persist: ensure the input definition exists in cfg.inputs and
+            // the flow's input_ids carries the id.
+            let mut cfg = app_config.write().await;
+            if !cfg.inputs.iter().any(|i| i.id == input_id) {
+                cfg.inputs.push(input);
+            }
+            if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
+                if !flow.input_ids.contains(&input_id) {
+                    flow.input_ids.push(input_id.clone());
+                }
+            }
+            persist_config(&cfg, config_path, secrets_path).await;
+            Ok(None)
+        }
+        "remove_input" => {
+            let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?.to_string();
+            let input_id = action["input_id"].as_str().ok_or("Missing input_id")?.to_string();
+            tracing::info!(
+                "Manager command: remove input '{input_id}' from flow '{flow_id}' (hot-remove)"
+            );
+
+            if let Err(e) = flow_manager.remove_input(&flow_id, &input_id).await {
+                if let Some(membership_err) =
+                    e.downcast_ref::<crate::engine::flow::InputMembershipError>()
+                {
+                    return Err(CommandError::with_code(
+                        membership_err.message.clone(),
+                        membership_err.code,
+                    ));
+                }
+                return Err(CommandError::new(e.to_string()));
+            }
+
+            // Persist: drop the id from the flow's input_ids, then garbage-
+            // collect the top-level inputs entry if no other flow still
+            // references it. Mirrors the symmetric `add_input` persist.
+            let mut cfg = app_config.write().await;
+            if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
+                flow.input_ids.retain(|id| id != &input_id);
+            }
+            let still_referenced = cfg
+                .flows
+                .iter()
+                .any(|f| f.input_ids.iter().any(|id| id == &input_id));
+            if !still_referenced {
+                cfg.inputs.retain(|i| i.id != input_id);
             }
             persist_config(&cfg, config_path, secrets_path).await;
             Ok(None)
@@ -2235,9 +2392,28 @@ async fn execute_command(
                                 );
                             }
 
-                            if input_changed || restart_required {
-                                // Input or rate-limit changed → must restart entire flow
-                                tracing::info!("Config diff: restarting flow '{id}' (input changed={input_changed}, bandwidth_limit changed={restart_required})");
+                            // Phase 2 hot-swap upgrade: an input-set change
+                            // that touches a Hitless slot's leg list must
+                            // fall back to a full restart; every other
+                            // input-set change uses the surgical add/remove
+                            // path so outputs keep running.
+                            let input_touches_hitless = if input_changed {
+                                input_delta_touches_hitless(
+                                    flow_manager,
+                                    id,
+                                    &old_flow.input_ids,
+                                    &new_flow.input_ids,
+                                )
+                                .await
+                            } else {
+                                false
+                            };
+                            let force_restart = input_touches_hitless || restart_required;
+
+                            if force_restart {
+                                tracing::info!(
+                                    "Config diff: restarting flow '{id}' (input_touches_hitless={input_touches_hitless}, bandwidth_limit changed={restart_required})"
+                                );
                                 let _ = flow_manager.destroy_flow(id).await;
                                 match new_config.resolve_flow(new_flow) {
                                     Ok(resolved) => match flow_manager.create_flow(resolved).await {
@@ -2251,6 +2427,30 @@ async fn execute_command(
                                     }
                                     Err(e) => tracing::warn!("Failed to resolve flow '{id}': {e}"),
                                 }
+                            } else if input_changed {
+                                tracing::info!(
+                                    "Config diff: flow '{id}' surgical input + output reconcile (inputs: {} → {}, outputs: {} → {})",
+                                    old_flow.input_ids.len(),
+                                    new_flow.input_ids.len(),
+                                    old_flow.output_ids.len(),
+                                    new_flow.output_ids.len(),
+                                );
+                                diff_inputs(
+                                    flow_manager,
+                                    id,
+                                    &new_flow.input_ids,
+                                    &new_config.inputs,
+                                    _webrtc_sessions,
+                                )
+                                .await;
+                                diff_outputs_with_configs(
+                                    flow_manager,
+                                    id,
+                                    &new_flow.output_ids,
+                                    &old_config,
+                                    &new_config,
+                                )
+                                .await;
                             } else {
                                 // Input unchanged — reconcile outputs against the runtime
                                 tracing::info!(
@@ -3747,6 +3947,143 @@ async fn diff_outputs(
     new_config: &AppConfig,
 ) {
     diff_outputs_inner(flow_manager, flow_id, new_output_ids, new_config, new_config).await;
+}
+
+/// Surgically reconcile a running flow's input set against `new_input_ids`,
+/// dispatching `add_input` / `remove_input` per delta. The output side is
+/// not touched — call [`diff_outputs`] afterwards if outputs also changed.
+///
+/// `input_defs` provides the canonical [`InputDefinition`] lookup for the
+/// added side. For `update_flow` this is the manager's current `cfg.inputs`;
+/// for `update_config` it's `new_config.inputs`.
+///
+/// **Hitless-leg constraint**: the caller must have already checked that no
+/// added or removed id appears in `FlowManager::flow_hitless_inputs(flow_id)`
+/// and routed to a full restart in that case. This helper assumes the
+/// hitless-safe path.
+///
+/// Bind failures on hot-added listener inputs (SRT-listener / RIST / RTSP /
+/// WHIP server) are detected via [`wait_for_first_bind_failure`]; on
+/// failure the just-added input is rolled back via `remove_input`. The
+/// helper continues processing the remaining deltas rather than aborting
+/// the whole reconcile — a `port_conflict` on one input shouldn't block
+/// applying changes to another.
+async fn diff_inputs(
+    flow_manager: &Arc<FlowManager>,
+    flow_id: &str,
+    new_input_ids: &[String],
+    input_defs: &[InputDefinition],
+    webrtc_sessions: &WebrtcRegistry,
+) {
+    use std::collections::HashSet;
+
+    let running: Vec<String> = flow_manager
+        .running_input_ids(flow_id)
+        .await
+        .unwrap_or_default();
+    let running_set: HashSet<&str> = running.iter().map(|s| s.as_str()).collect();
+    let new_set: HashSet<&str> = new_input_ids.iter().map(|s| s.as_str()).collect();
+
+    tracing::info!(
+        "Flow '{flow_id}' input reconcile: running={:?} -> new={:?}",
+        running,
+        new_input_ids,
+    );
+
+    // Remove inputs no longer referenced.
+    for id in running_set.iter().copied() {
+        if !new_set.contains(id) {
+            tracing::info!(
+                "Config diff: removing input '{id}' from flow '{flow_id}' (running, not in new config)"
+            );
+            if let Err(e) = flow_manager.remove_input(flow_id, id).await {
+                tracing::warn!("Failed to remove input '{id}' from flow '{flow_id}': {e}");
+            }
+        }
+    }
+
+    // Add newly referenced inputs.
+    for &id in &new_set {
+        if running_set.contains(id) {
+            continue;
+        }
+        let Some(input_def) = input_defs.iter().find(|d| d.id == id) else {
+            tracing::warn!(
+                "Config diff: input '{id}' referenced by flow '{flow_id}' but not found in top-level inputs"
+            );
+            continue;
+        };
+        tracing::info!("Config diff: adding input '{id}' to flow '{flow_id}'");
+        let spawn_started_at = std::time::Instant::now();
+        let hot_added = match flow_manager.add_input(flow_id, input_def.clone()).await {
+            Ok(info) => info,
+            Err(e) => {
+                tracing::warn!("Failed to add input '{id}' to flow '{flow_id}': {e}");
+                continue;
+            }
+        };
+        if let Some(err) = wait_for_first_bind_failure(
+            flow_manager.event_sender(),
+            flow_id,
+            spawn_started_at,
+        )
+        .await
+        {
+            tracing::warn!(
+                "Input '{id}' bind failure on flow '{flow_id}': {} — rolling back",
+                err.message,
+            );
+            let _ = flow_manager.remove_input(flow_id, id).await;
+            continue;
+        }
+        // Register WHIP session channel if this hot-added input is a
+        // WHIP server, so browsers can pair without a flow restart.
+        #[cfg(feature = "webrtc")]
+        if let Some((tx, bearer_token)) = hot_added.whip_info {
+            if let Some(registry) = webrtc_sessions {
+                registry.register_whip_input(flow_id, tx, bearer_token);
+                tracing::info!(
+                    "Registered hot-added WHIP input '{id}' for flow '{flow_id}' (diff path)"
+                );
+            }
+        }
+        #[cfg(not(feature = "webrtc"))]
+        let _ = hot_added;
+    }
+    #[cfg(not(feature = "webrtc"))]
+    let _ = webrtc_sessions;
+}
+
+/// Detect whether the delta between `old_ids` and `new_ids` would touch the
+/// hitless leg list of a running flow. Used to gate the surgical input diff
+/// — when any added/removed id appears in the current hitless inputs the
+/// caller must fall back to a full flow restart instead.
+async fn input_delta_touches_hitless(
+    flow_manager: &FlowManager,
+    flow_id: &str,
+    old_ids: &[String],
+    new_ids: &[String],
+) -> bool {
+    use std::collections::HashSet;
+    let old_set: HashSet<&str> = old_ids.iter().map(|s| s.as_str()).collect();
+    let new_set: HashSet<&str> = new_ids.iter().map(|s| s.as_str()).collect();
+    if old_set == new_set {
+        return false;
+    }
+    let Some(hitless) = flow_manager.flow_hitless_inputs(flow_id).await else {
+        return false;
+    };
+    if hitless.is_empty() {
+        return false;
+    }
+    // Any id in the symmetric difference that's also in the hitless set
+    // would change the merger's leg list.
+    for id in old_set.symmetric_difference(&new_set) {
+        if hitless.contains(*id) {
+            return true;
+        }
+    }
+    false
 }
 
 async fn diff_outputs_with_configs(

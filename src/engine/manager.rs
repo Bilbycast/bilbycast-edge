@@ -65,6 +65,16 @@ pub struct FlowManager {
     /// feature is enabled (Linux + the `display` Cargo feature).
     #[cfg(all(feature = "display", target_os = "linux"))]
     display_claim_registry: Arc<crate::display::claim_registry::DisplayClaimRegistry>,
+    /// WebRTC session registry. Held so flow lifecycle (destroy + WHIP
+    /// hot-remove) can clean up the per-flow signalling channels +
+    /// session sessions. `None` on builds without the `webrtc` feature.
+    /// Optional even with the feature on because the registry is
+    /// constructed at the HTTP server layer; not all entry points wire
+    /// it through (e.g. `tests` and `examples` that exercise the engine
+    /// in isolation).
+    #[cfg(feature = "webrtc")]
+    webrtc_sessions:
+        Option<Arc<crate::api::webrtc::registry::WebrtcSessionRegistry>>,
     /// Node-wide elementary-stream bus. Shared `Arc` across every
     /// assembled flow on the edge — passthrough flows never touch it.
     /// Channels are keyed by `(input_id, source_pid)`; input IDs are
@@ -187,6 +197,10 @@ impl FlowManager {
         static_caps: Option<Arc<crate::engine::hardware_probe::StaticCapabilities>>,
         #[cfg(all(feature = "display", target_os = "linux"))]
         display_claim_registry: Arc<crate::display::claim_registry::DisplayClaimRegistry>,
+        #[cfg(feature = "webrtc")]
+        webrtc_sessions: Option<
+            Arc<crate::api::webrtc::registry::WebrtcSessionRegistry>,
+        >,
     ) -> Self {
         Self {
             flows: DashMap::new(),
@@ -198,10 +212,22 @@ impl FlowManager {
             static_caps,
             #[cfg(all(feature = "display", target_os = "linux"))]
             display_claim_registry,
+            #[cfg(feature = "webrtc")]
+            webrtc_sessions,
             node_es_bus: Arc::new(NodeEsBus::new()),
             input_publishers: DashMap::new(),
             demuxers: DashMap::new(),
         }
+    }
+
+    /// Accessor for the WebRTC session registry (if wired). Used by
+    /// `FlowRuntime::remove_input` to unregister WHIP-server inputs
+    /// without going through the WS-layer plumbing.
+    #[cfg(feature = "webrtc")]
+    pub fn webrtc_sessions(
+        &self,
+    ) -> Option<&Arc<crate::api::webrtc::registry::WebrtcSessionRegistry>> {
+        self.webrtc_sessions.as_ref()
     }
 
     /// Get a clone of the node-wide elementary-stream bus handle. Used
@@ -478,7 +504,7 @@ impl FlowManager {
         let flow_id = config.config.id.clone();
         match FlowRuntime::start(
             config.clone(),
-            &self.stats,
+            Arc::clone(&self.stats),
             self.ffmpeg_available,
             self.event_sender.clone(),
             #[cfg(all(feature = "display", target_os = "linux"))]
@@ -618,6 +644,15 @@ impl FlowManager {
         if let Some((_, runtime)) = self.flows.remove(flow_id) {
             runtime.stop().await;
             self.stats.unregister_flow(flow_id);
+            // Clear the flow's WebRTC session entries (WHIP input channel,
+            // WHEP output channel, bearer tokens, in-flight sessions). Long-
+            // standing TODO in `webrtc.rs::unregister_flow` — without this,
+            // a browser pairing against the now-dead flow id hits a closed
+            // `mpsc::Sender` instead of a clean "no WHIP for this flow".
+            #[cfg(feature = "webrtc")]
+            if let Some(reg) = self.webrtc_sessions.as_ref() {
+                reg.unregister_flow(flow_id);
+            }
             self.event_sender.emit_flow(
                 EventSeverity::Info,
                 category::FLOW,
@@ -690,6 +725,147 @@ impl FlowManager {
         let runtime = self.flows.get(flow_id)?;
         let handles = runtime.output_handles.read().await;
         Some(handles.keys().cloned().collect())
+    }
+
+    /// Return the IDs of every input currently attached to a running flow,
+    /// or `None` if the flow itself is not running.
+    ///
+    /// Reads from `FlowRuntime.input_handles` — this reflects **live runtime
+    /// state**, not the config. The future `update_flow` / `update_config`
+    /// input-set diff uses this as the authoritative "what's currently
+    /// attached" set so a hot-add / hot-remove dispatch correctly identifies
+    /// the deltas against the running flow.
+    #[allow(dead_code)] // Phase 1 wires callers via the update_flow / update_config diff.
+    pub async fn running_input_ids(&self, flow_id: &str) -> Option<Vec<String>> {
+        let runtime = self.flows.get(flow_id)?;
+        let handles = runtime.input_handles.read().await;
+        Some(handles.keys().cloned().collect())
+    }
+
+    /// Return the set of input ids that appear inside any `Hitless` slot
+    /// (primary or backup) of the flow's current assembly plan, or
+    /// `None` if the flow is not running.
+    ///
+    /// Used by the Phase 2 `update_flow` / `update_config` diff to decide
+    /// whether an input-set change would alter a running hitless ES
+    /// merger's leg list. The merger isn't designed to grow/shrink legs
+    /// mid-flight, so such edits trigger a full flow restart instead of
+    /// going through the surgical `add_input` / `remove_input` paths.
+    pub async fn flow_hitless_inputs(
+        &self,
+        flow_id: &str,
+    ) -> Option<std::collections::HashSet<String>> {
+        let runtime = self.flows.get(flow_id)?;
+        Some(runtime.assembly_hitless_inputs().await)
+    }
+
+    /// Add a single input to a running flow without disturbing other
+    /// inputs or any outputs (hot-add).
+    ///
+    /// Thin wrapper over [`FlowRuntime::add_input`]. Looks up the running
+    /// flow, delegates the spawn, emits an Info event on success, and
+    /// propagates the structured `error_code` on failure via the
+    /// `InputMembershipError` payload attached to the returned
+    /// `anyhow::Error` — WS handlers downcast to recover the code.
+    ///
+    /// # Errors
+    ///
+    /// - `Flow '...' is not running` if the flow id is unknown.
+    /// - The runtime's `InputMembershipError` variants
+    ///   (`input_already_member`, `hitless_leg_change_requires_restart`)
+    ///   propagated verbatim.
+    /// - Asynchronous bind failures (`port_conflict`, `bind_failed`) do
+    ///   NOT surface here; the WS handler uses
+    ///   `wait_for_first_bind_failure` to detect them within
+    ///   `FIRST_BIND_WAIT` and call [`Self::remove_input`] for rollback.
+    pub async fn add_input(
+        self: &Arc<Self>,
+        flow_id: &str,
+        input_def: crate::config::models::InputDefinition,
+    ) -> Result<crate::engine::flow::HotAddedInputInfo> {
+        let input_id = input_def.id.clone();
+        // Resource-critical gate — mirrors `create_flow`. Refuses with a
+        // structured `input_resource_critical` `error_code` so the manager
+        // UI shows the same banner it uses for the create path. Other
+        // resource modes (alarm-only) fall through.
+        if self.resource_state.resources_critical.load(Ordering::Relaxed)
+            && matches!(self.resource_action, Some(ResourceLimitAction::GateFlows))
+        {
+            self.event_sender.emit_flow_with_details(
+                EventSeverity::Warning,
+                category::SYSTEM_RESOURCES,
+                format!(
+                    "Hot-add of input '{input_id}' to flow '{flow_id}' blocked: \
+                     system resources critical"
+                ),
+                flow_id,
+                serde_json::json!({
+                    "error_code": "input_resource_critical",
+                    "flow_id": flow_id,
+                    "input_id": input_id,
+                }),
+            );
+            return Err(anyhow::Error::new(
+                crate::engine::flow::InputMembershipError::resource_critical(
+                    flow_id, &input_id,
+                ),
+            ));
+        }
+        let runtime = self
+            .flows
+            .get(flow_id)
+            .ok_or_else(|| anyhow::anyhow!("Flow '{}' is not running", flow_id))?;
+        match runtime.add_input(input_def, self).await {
+            Ok(info) => {
+                self.event_sender.emit_flow(
+                    EventSeverity::Info,
+                    category::FLOW,
+                    format!("Input '{input_id}' added to flow '{flow_id}'"),
+                    flow_id,
+                );
+                Ok(info)
+            }
+            Err(e) => {
+                self.event_sender.emit_flow(
+                    EventSeverity::Warning,
+                    category::FLOW,
+                    format!("Input '{input_id}' failed to add to flow '{flow_id}': {e}"),
+                    flow_id,
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Remove a single input from a running flow without disturbing other
+    /// inputs or outputs (hot-remove).
+    ///
+    /// Thin wrapper over [`FlowRuntime::remove_input`]. Cancels the
+    /// input's child cancellation token, awaits its task handles, drops
+    /// the entry from the runtime's live state. The fixer's per-input
+    /// PSI cache is evicted via a `FixerCommand::DropInputPsi` message
+    /// so a later re-add under the same id doesn't carry stale PAT/PMT.
+    ///
+    /// # Errors
+    ///
+    /// - `Flow '...' is not running` if the flow id is unknown.
+    /// - The runtime's `InputMembershipError` variants
+    ///   (`input_not_member`, `active_input_in_use`,
+    ///   `pid_bus_input_in_use`, `hitless_leg_change_requires_restart`)
+    ///   propagated verbatim.
+    pub async fn remove_input(&self, flow_id: &str, input_id: &str) -> Result<()> {
+        let runtime = self
+            .flows
+            .get(flow_id)
+            .ok_or_else(|| anyhow::anyhow!("Flow '{}' is not running", flow_id))?;
+        runtime.remove_input(input_id).await?;
+        self.event_sender.emit_flow(
+            EventSeverity::Info,
+            category::FLOW,
+            format!("Input '{input_id}' removed from flow '{flow_id}'"),
+            flow_id,
+        );
+        Ok(())
     }
 
     /// Remove a single output from a running flow without affecting other outputs.
@@ -988,6 +1164,8 @@ mod tests {
             None,
             #[cfg(all(feature = "display", target_os = "linux"))]
             crate::display::claim_registry::DisplayClaimRegistry::new(),
+            #[cfg(feature = "webrtc")]
+            None,
         ))
     }
 

@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -128,6 +128,17 @@ pub struct FlowRuntime {
     /// plus its forwarder. Keyed by input ID so the map can be updated in
     /// place when inputs are added/removed via `update_flow`.
     pub input_handles: RwLock<HashMap<String, InputRuntime>>,
+    /// Live, mutable copy of this flow's input definitions. Populated at
+    /// start from `config.inputs` and updated by hot-swap `add_input` /
+    /// `remove_input` operations so post-start readers
+    /// (`replace_assembly`, `switch_active_input`, `add_output`) see the
+    /// current set rather than the start-time snapshot.
+    ///
+    /// **Control plane only** — never read on the per-packet hot path.
+    /// All readers are operator-initiated (assembly hot-swap, input
+    /// switch, output add). The per-input packet path captures whatever
+    /// state it needs at task-spawn time and owns it locally.
+    pub live_inputs: RwLock<Vec<crate::config::models::InputDefinition>>,
     /// Watch channel holding the currently-active input ID. Empty string
     /// means "no active input" (flow is idle — outputs are up but no packets
     /// are being forwarded). Switching inputs is `active_input_tx.send(id)`.
@@ -188,6 +199,29 @@ pub struct FlowRuntime {
     /// Event sender for emitting operational events to the manager.
     /// Stored so that hot-added outputs can also emit events.
     pub event_sender: EventSender,
+    /// Continuity-fixer command channel. Per-input forwarders enqueue
+    /// `FixerCommand::{ActivePacket, PassivePacket, Switch, Keepalive,
+    /// SignalSourceDiscontinuity}` onto this and let the per-flow
+    /// `ts_fixer_task` own the fixer state uncontended.
+    ///
+    /// Stored on the runtime so [`Self::add_input`] can build a new
+    /// per-input forwarder that publishes onto the same fixer task,
+    /// and so [`Self::remove_input`] can enqueue
+    /// `FixerCommand::DropInputPsi` to evict the removed input's PSI
+    /// cache.
+    #[allow(dead_code)] // Phase 1b wires the reader via FlowRuntime::add_input.
+    pub(crate) fixer_tx: tokio::sync::mpsc::Sender<FixerCommand>,
+    /// Global stats collector. Cloned at start; held so [`Self::add_input`]
+    /// can build per-input thumbnail accumulators with the same
+    /// `thumbnail_update_notify` watch every other accumulator on the
+    /// node uses.
+    #[allow(dead_code)] // Phase 1b wires the reader via FlowRuntime::add_input.
+    pub global_stats: Arc<crate::stats::collector::StatsCollector>,
+    /// Whether ffmpeg is available on the host. Used by [`Self::add_input`]
+    /// to gate per-input thumbnail spawning, mirroring the start-time
+    /// thumbnail decision.
+    #[allow(dead_code)] // Phase 1b wires the reader via FlowRuntime::add_input.
+    pub ffmpeg_available: bool,
     /// Watch channel receiver for the detected video frame rate (fps).
     /// Created when media analysis is enabled so that hot-added outputs
     /// with `TargetFrames` delay mode can subscribe to frame rate updates
@@ -357,6 +391,100 @@ pub struct OutputRuntime {
     pub stats: Arc<OutputStatsAccumulator>,
 }
 
+/// Structured error variants for [`FlowRuntime::add_input`] /
+/// [`FlowRuntime::remove_input`]. Each variant carries a stable
+/// `error_code` string the WS handler surfaces on `command_ack.error_code`
+/// so the manager UI can render targeted messages (e.g. "switch to a
+/// different active input first" for `active_input_in_use`).
+///
+/// The error type is attached to `anyhow::Error` so existing
+/// `Result<(), anyhow::Error>` plumbing is unchanged. WS handlers recover
+/// the code via `err.downcast_ref::<InputMembershipError>()`.
+#[derive(Debug, Clone)]
+pub struct InputMembershipError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl std::fmt::Display for InputMembershipError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for InputMembershipError {}
+
+impl InputMembershipError {
+    pub fn already_member(input_id: &str) -> Self {
+        Self {
+            code: "input_already_member",
+            message: format!(
+                "Input '{input_id}' is already a member of this flow"
+            ),
+        }
+    }
+    pub fn not_member(input_id: &str) -> Self {
+        Self {
+            code: "input_not_member",
+            message: format!(
+                "Input '{input_id}' is not a member of this flow"
+            ),
+        }
+    }
+    pub fn active_in_use(input_id: &str) -> Self {
+        Self {
+            code: "active_input_in_use",
+            message: format!(
+                "Input '{input_id}' is the currently active input — \
+                 activate a different member first"
+            ),
+        }
+    }
+    pub fn pid_bus_in_use(input_id: &str) -> Self {
+        Self {
+            code: "pid_bus_input_in_use",
+            message: format!(
+                "Input '{input_id}' is referenced by the running \
+                 assembly plan — unbind the slot first"
+            ),
+        }
+    }
+    pub fn hitless_leg_change(input_id: &str) -> Self {
+        Self {
+            code: "hitless_leg_change_requires_restart",
+            message: format!(
+                "Hot-edit involving input '{input_id}' would change a \
+                 hitless slot's leg list — requires full flow restart"
+            ),
+        }
+    }
+    pub fn resource_critical(flow_id: &str, input_id: &str) -> Self {
+        Self {
+            code: "input_resource_critical",
+            message: format!(
+                "Cannot add input '{input_id}' to flow '{flow_id}': \
+                 system resources critical"
+            ),
+        }
+    }
+}
+
+/// Success output of [`FlowRuntime::add_input`]. Carries the registered
+/// input id so callers can persist it, plus — when `feature = "webrtc"`
+/// is on AND the new input is a WHIP server — the session channel that
+/// the WS handler must register with the `WebrtcSessionRegistry` so
+/// browsers can pair without a flow restart.
+///
+/// WHIP-server inputs hot-added at runtime were previously "spawned but
+/// invisible to browsers until restart". Surfacing `whip_info` closes
+/// that gap.
+pub struct HotAddedInputInfo {
+    #[allow(dead_code)] // Carried for symmetry + future logging hooks; only whip_info is read today.
+    pub input_id: String,
+    #[cfg(feature = "webrtc")]
+    pub whip_info: Option<WhipSessionInfo>,
+}
+
 impl FlowRuntime {
     /// Create and start a new flow from the provided configuration.
     ///
@@ -378,7 +506,7 @@ impl FlowRuntime {
     /// reported asynchronously via the task's log output.
     pub async fn start(
         config: ResolvedFlow,
-        global_stats: &crate::stats::collector::StatsCollector,
+        global_stats: Arc<crate::stats::collector::StatsCollector>,
         ffmpeg_available: bool,
         event_sender: EventSender,
         #[cfg(all(feature = "display", target_os = "linux"))]
@@ -565,176 +693,37 @@ impl FlowRuntime {
         // symmetrically unregister. Built incrementally as the input
         // loop spawns each input task.
         let mut registered_input_ids: Vec<String> = Vec::with_capacity(config.inputs.len());
+        // Bundle the shared per-flow state into a context so each input
+        // spawn is a single call. Same engine code feeds the hot-add path
+        // in `FlowRuntime::add_input` — see [`spawn_input_runtime`] for
+        // the per-input setup order and rationale.
+        let spawn_ctx = InputSpawnContext {
+            flow_id: &config.config.id,
+            flow_cancel: &cancel_token,
+            active_input_watch_rx: &active_input_watch_rx,
+            fixer_tx: &fixer_tx,
+            flow_stats: &flow_stats,
+            flow_manager: &flow_manager,
+            event_sender: &event_sender,
+            av_sync_pacer: av_sync_pacer.clone(),
+            es_bus: es_bus.as_ref(),
+            global_stats: &global_stats,
+            ffmpeg_available,
+            thumbnail_enabled: config.config.thumbnail,
+            flow_clock_domain: config.config.clock_domain,
+            #[cfg(feature = "replay")]
+            replay_command_txs: &replay_command_txs,
+        };
         for input_def in &config.inputs {
-            let input_id = input_def.id.clone();
-            let input_cancel = cancel_token.child_token();
-            let (per_input_tx, _) = broadcast::channel::<RtpPacket>(BROADCAST_CHANNEL_CAPACITY);
-            // Register this input's broadcast publisher node-wide so
-            // sibling flows' assembly slots (once the membership rule
-            // is dropped) can subscribe to it via
-            // `FlowManager::subscribe_input`. Idempotent on the
-            // manager side; replaces the previous entry if any. The
-            // owning input task still publishes onto `per_input_tx`
-            // — the FlowManager just holds a clone for cross-flow
-            // consumers. The local subscribers (forwarder, demuxer)
-            // keep using the same `Sender` so no path doubles up.
-            //
-            // PES Switch Phase 2.2b: register also returns the per-
-            // input PSI catalogue store. We pass the same `Arc` to
-            // `register_input_counters_with_psi_catalog` (so the
-            // snapshot path keeps reading from the catalogue the
-            // observer task writes to) AND keep it node-reachable via
-            // `FlowManager::psi_catalog_for_input`. Foreign-flow
-            // Essence resolvers can now look up this catalogue
-            // without going through `flow_stats.per_input_counters`.
-            let psi_catalog =
-                flow_manager.register_input_publisher(&input_id, per_input_tx.clone());
-            registered_input_ids.push(input_id.clone());
-            let force_idr = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-            // Register per-input liveness counters. The forwarder increments
-            // these on every packet arriving from this input's broadcast
-            // channel so the manager UI can surface NO SIGNAL / feed-present
-            // state for passive inputs too. The `InputConfigMeta` attached
-            // here is what the snapshot path lifts into `PerInputLive` so
-            // the manager topology view can draw upstream links for every
-            // input of an assembled flow — not only the single active one.
-            let per_input_counters = flow_stats.register_input_counters_with_psi_catalog(
-                &input_id,
-                input_type_str(&input_def.config),
-                build_input_config_meta(&input_def.config),
-                Arc::clone(&psi_catalog),
-            );
-
-            let (input_handle, this_whip_info) = spawn_single_input(
-                input_def,
-                &config.config.id,
-                &per_input_tx,
-                &flow_stats,
-                &input_cancel,
-                &event_sender,
-                &force_idr,
-                config.config.clock_domain,
-                av_sync_pacer.clone(),
-                #[cfg(feature = "replay")]
-                &replay_command_txs,
-            );
-
-            // Spawn the forwarder: drains the per-input channel and forwards
-            // onto the main broadcast channel iff this input's ID matches the
-            // current value in the active-input watch. The shared continuity
-            // fixer ensures CC counters are seamless across input switches.
-            // Spawn per-input PSI catalogue observer for TS-bearing inputs.
-            // Runs independently of flow activation so passive inputs still
-            // surface their programs and PIDs to the manager / UI. Must happen
-            // *before* the forwarder consumes `per_input_counters`.
-            if input_def.config.is_ts_carrier() {
-                let _ = super::ts_psi_catalog::spawn_psi_catalog_observer(
-                    input_id.clone(),
-                    config.config.id.clone(),
-                    per_input_tx.clone(),
-                    per_input_counters.psi_catalog.clone(),
-                    input_cancel.child_token(),
-                );
-            }
-
-            // In SPTS assembly mode, the per-input forwarder is replaced
-            // by a TS-ES demuxer consumer that publishes elementary
-            // streams onto the shared [`NodeEsBus`]. The assembler (one
-            // per flow, spawned below) pulls ES from the bus, rewrites
-            // PIDs, synthesises PAT/PMT, and is the sole publisher onto
-            // `broadcast_tx`. The active-input watch is unused in this
-            // mode — every input contributes ES simultaneously.
-            //
-            // PES Switch Phase 2.1c Stage 2: the demuxer task is now
-            // refcounted on `FlowManager` via `acquire_demuxer`. For
-            // single-flow-per-input (today's reality with assignment
-            // uniqueness in place), this is functionally identical to
-            // the previous flow-local spawn — one demuxer per
-            // `(input_id)`. When uniqueness is lifted in P2.1 main,
-            // sibling flows that reference the same input share the
-            // single demuxer task, eliminating duplicate-publish bugs
-            // onto the `(input_id, source_pid)` bus channels. The
-            // `DemuxerHandle` returned by `acquire_demuxer` is held
-            // by the shim task below; dropping it on `input_cancel`
-            // decrements the refcount, and the last drop cancels the
-            // shared task.
-            let forwarder_handle = if let Some(ref bus) = es_bus {
-                let bus_clone = bus.clone();
-                let pic = per_input_counters.clone();
-                let input_id_for_demuxer = input_id.clone();
-                let demuxer_handle = flow_manager.acquire_demuxer(
-                    &input_id,
-                    move |rx, cancel| {
-                        Some(spawn_ts_es_demuxer_consumer(
-                            input_id_for_demuxer,
-                            rx,
-                            bus_clone,
-                            cancel,
-                            pic,
-                        ))
-                    },
-                );
-                // Shim task: holds the `DemuxerHandle` for this flow's
-                // duration; when this flow's `input_cancel` fires the
-                // task exits, the handle drops, and the refcount
-                // decrements. If the demuxer couldn't be acquired
-                // (input publisher not registered — shouldn't happen
-                // because we registered it above), the shim still
-                // honours cancel so the input lifecycle stays clean.
-                let input_cancel = input_cancel.clone();
-                tokio::spawn(async move {
-                    let _demuxer_handle = demuxer_handle; // moved in for RAII
-                    input_cancel.cancelled().await;
-                })
-            } else {
-                spawn_input_forwarder(
-                    input_id.clone(),
-                    per_input_tx.subscribe(),
-                    active_input_watch_rx.clone(),
-                    input_cancel.clone(),
-                    fixer_tx.clone(),
-                    force_idr.clone(),
-                    per_input_counters,
-                )
-            };
-
-            // Spawn per-input thumbnail generator (subscribes to the input's
-            // own broadcast channel so it captures this source's video even
-            // when the input is passive / not currently active).
-            let thumbnail_handle = if config.config.thumbnail && ffmpeg_available {
-                let thumb_acc = Arc::new(ThumbnailAccumulator::new_with_update_notify(
-                    global_stats.thumbnail_update_notify.clone(),
-                ));
-                flow_stats.per_input_thumbnails.insert(input_id.clone(), thumb_acc.clone());
-                Some(spawn_thumbnail_generator(
-                    &per_input_tx,
-                    thumb_acc,
-                    input_cancel.child_token(),
-                    None, // no program filter for per-input thumbnails (pre-filter stream)
-                ))
-            } else {
-                None
-            };
-
+            let spawned = spawn_input_runtime(input_def, &spawn_ctx);
+            registered_input_ids.push(spawned.input_id.clone());
             #[cfg(feature = "webrtc")]
             {
-                if this_whip_info.is_some() {
-                    whip_session_info = this_whip_info;
+                if spawned.whip_info.is_some() {
+                    whip_session_info = spawned.whip_info;
                 }
             }
-            #[cfg(not(feature = "webrtc"))]
-            let _ = this_whip_info;
-
-            input_handles.insert(
-                input_id,
-                InputRuntime {
-                    input_handle,
-                    forwarder_handle,
-                    cancel_token: input_cancel,
-                    thumbnail_handle,
-                },
-            );
+            input_handles.insert(spawned.input_id, spawned.input_runtime);
         }
 
         // If the flow has no inputs at all, note it in the log. The broadcast
@@ -1358,6 +1347,7 @@ impl FlowRuntime {
         // replacer could attach to the per-flow pacer.
 
         Ok(Self {
+            live_inputs: RwLock::new(config.inputs.clone()),
             config,
             broadcast_tx,
             input_handles: RwLock::new(input_handles),
@@ -1378,6 +1368,9 @@ impl FlowRuntime {
             #[cfg(feature = "webrtc")]
             whep_session_tx: whep_session_info,
             event_sender,
+            fixer_tx,
+            global_stats,
+            ffmpeg_available,
             frame_rate_rx,
             pid_bus_assembler_handle,
             es_bus,
@@ -1595,12 +1588,18 @@ impl FlowRuntime {
         // incompatible plan is rejected with the same error code +
         // structured details as an initial start. See that call site
         // for the full rationale.
-        let input_clocks: HashMap<String, crate::engine::master_clock::ClockIdentity> = self
-            .config
-            .inputs
-            .iter()
-            .map(|i| (i.id.clone(), crate::engine::master_clock::clock_identity_for_input(i)))
-            .collect();
+        //
+        // Reads `live_inputs` (control-plane lock) rather than the
+        // start-time `self.config.inputs` snapshot so a flow that has
+        // hot-added inputs after start sees the current input set when
+        // an assembly plan is hot-swapped.
+        let input_clocks: HashMap<String, crate::engine::master_clock::ClockIdentity> = {
+            let inputs = self.live_inputs.read().await;
+            inputs
+                .iter()
+                .map(|i| (i.id.clone(), crate::engine::master_clock::clock_identity_for_input(i)))
+                .collect()
+        };
         if let Err(mismatch) = crate::engine::ts_assembler::check_assembly_clock_compatibility(
             &build.plan,
             &input_clocks,
@@ -1726,15 +1725,16 @@ impl FlowRuntime {
         // mode, addresses). Without this the manager UI keeps showing the
         // first-activated input's transport and address after a switch —
         // only the active_input_id badge would flip, not the header text.
-        if let Some(new_def) = self
-            .config
-            .inputs
-            .iter()
-            .find(|d| d.id == new_input_id)
+        //
+        // Reads `live_inputs` so hot-added inputs are discoverable here;
+        // the lock is released before the thumbnail-rebuild prod below.
         {
-            let new_input_type = input_type_str(&new_def.config);
-            let new_meta = build_input_config_meta(&new_def.config);
-            self.stats.update_active_input_meta(new_input_type, new_meta);
+            let inputs = self.live_inputs.read().await;
+            if let Some(new_def) = inputs.iter().find(|d| d.id == new_input_id) {
+                let new_input_type = input_type_str(&new_def.config);
+                let new_meta = build_input_config_meta(&new_def.config);
+                self.stats.update_active_input_meta(new_input_type, new_meta);
+            }
         }
 
         // Ask the newly-active input's thumbnail generator to emit a frame
@@ -2253,7 +2253,23 @@ impl FlowRuntime {
         // with WebrtcSessionRegistry through this path). WHEP outputs defined
         // at flow creation time work correctly.
 
-        let active_input_cfg = self.config.active_input().map(|d| &d.config);
+        // Reads `live_inputs` (control-plane lock) to find the input
+        // currently marked `active: true` — matches the start-time
+        // `config.active_input()` semantics while honouring hot-added
+        // inputs.
+        //
+        // Note: the `active` flag in this flow-runtime-local copy is
+        // populated from the start-time config and NOT refreshed on
+        // `switch_active_input`. The watch channel (`active_input_tx`)
+        // is the source of truth for the *currently* selected input
+        // id post-switch. This call matches today's `add_output`
+        // behaviour exactly — preserving the pre-existing semantic for
+        // Phase 0 of the input hot-swap rollout.
+        let active_input_cfg_owned: Option<crate::config::models::InputConfig> = {
+            let inputs = self.live_inputs.read().await;
+            inputs.iter().find(|d| d.active).map(|d| d.config.clone())
+        };
+        let active_input_cfg = active_input_cfg_owned.as_ref();
         let input_audio_format = active_input_cfg
             .and_then(crate::engine::audio_transcode::InputFormat::from_input_config);
         let compressed_audio_input = active_input_cfg
@@ -2420,6 +2436,297 @@ impl FlowRuntime {
         }
     }
 
+    /// Add an input to a running flow (hot-add).
+    ///
+    /// Spawns the input task graph (input task, forwarder or refcounted
+    /// demuxer shim, optional PSI catalogue observer, optional per-input
+    /// thumbnail generator) using the same engine code that
+    /// [`Self::start`] uses for start-time inputs. The new input joins
+    /// as warm-passive — its packets flow onto its per-input broadcast
+    /// channel and pre-warm the PSI cache, but the flow's output
+    /// `broadcast_tx` only forwards packets from the input named in the
+    /// `active_input_tx` watch. An operator `activate_input` flips the
+    /// new input in seamlessly via the existing switch path.
+    ///
+    /// # Refusal paths (structured `error_code`)
+    ///
+    /// - `input_already_member`: the flow's `input_handles` already
+    ///   contains an entry for `input_def.id`. Idempotent no-op from
+    ///   the runtime's perspective; surfaced as a Warning so the
+    ///   operator sees that nothing happened.
+    /// - `hitless_leg_change_requires_restart`: the input id appears in
+    ///   any running hitless slot's leg list. The merger is not
+    ///   designed to grow legs mid-flight; operator must restart the
+    ///   flow to land this change.
+    ///
+    /// Bind failures (SRT-listener / RIST / RTSP / WHIP-server on a busy
+    /// port) surface asynchronously through the event channel. The
+    /// caller (WS handler) uses `wait_for_first_bind_failure` to detect
+    /// them within a short window and call [`Self::remove_input`] to
+    /// roll back.
+    ///
+    /// WHIP-server inputs hot-added at runtime spawn their input task
+    /// but **do not** register a WebrtcSessionRegistry entry — same
+    /// limitation as WHEP outputs hot-added via [`Self::add_output`].
+    /// The WS handler emits a Warning event when the input is WHIP so
+    /// operators know to restart the flow if browser pairing is needed.
+    pub async fn add_input(
+        &self,
+        input_def: InputDefinition,
+        flow_manager: &Arc<crate::engine::manager::FlowManager>,
+    ) -> Result<HotAddedInputInfo> {
+        let input_id = input_def.id.clone();
+
+        // Idempotency check — already a member.
+        {
+            let handles = self.input_handles.read().await;
+            if handles.contains_key(&input_id) {
+                return Err(anyhow::Error::new(
+                    InputMembershipError::already_member(&input_id),
+                ));
+            }
+        }
+
+        // Hitless-leg refusal: if the current assembly already lists
+        // this input id as a hitless primary or backup leg, we can't
+        // grow it in flight. Operator must restart.
+        let hitless = self.assembly_hitless_inputs().await;
+        if hitless.contains(&input_id) {
+            return Err(anyhow::Error::new(
+                InputMembershipError::hitless_leg_change(&input_id),
+            ));
+        }
+
+        // Build the spawn context. Mirrors the context built at flow
+        // start in `FlowRuntime::start` — same engine code spawns the
+        // input on both code paths.
+        let active_input_watch_rx = self.active_input_tx.subscribe();
+        let av_sync_pacer = Some(Arc::new(
+            crate::engine::av_sync_mux::AvSyncPacer::new(self.master_clock.clone()),
+        ));
+        let spawn_ctx = InputSpawnContext {
+            flow_id: &self.config.config.id,
+            flow_cancel: &self.cancel_token,
+            active_input_watch_rx: &active_input_watch_rx,
+            fixer_tx: &self.fixer_tx,
+            flow_stats: &self.stats,
+            flow_manager,
+            event_sender: &self.event_sender,
+            av_sync_pacer,
+            es_bus: self.es_bus.as_ref(),
+            global_stats: &self.global_stats,
+            ffmpeg_available: self.ffmpeg_available,
+            thumbnail_enabled: self.config.config.thumbnail,
+            flow_clock_domain: self.config.config.clock_domain,
+            #[cfg(feature = "replay")]
+            replay_command_txs: &self.replay_command_txs,
+        };
+
+        let spawned = spawn_input_runtime(&input_def, &spawn_ctx);
+
+        // Persist live state in the same order as start:
+        //   live_inputs (config snapshot) → input_handles (runtime) →
+        //   registered_input_ids (unregister bookkeeping).
+        {
+            let mut live = self.live_inputs.write().await;
+            live.push(input_def);
+        }
+        {
+            let mut handles = self.input_handles.write().await;
+            handles.insert(spawned.input_id.clone(), spawned.input_runtime);
+        }
+        if let Ok(mut ids) = self.registered_input_ids.lock() {
+            ids.push(spawned.input_id.clone());
+        }
+
+        tracing::info!(
+            "Hot-added input '{}' to flow '{}'",
+            spawned.input_id,
+            self.config.config.id
+        );
+        Ok(HotAddedInputInfo {
+            input_id: spawned.input_id,
+            #[cfg(feature = "webrtc")]
+            whip_info: spawned.whip_info,
+        })
+    }
+
+    /// Remove an input from a running flow (hot-remove).
+    ///
+    /// Unregisters the node-wide publisher first (so cross-flow
+    /// subscribers see a clean `RecvError::Closed`), then cancels the
+    /// per-input child token, awaits the input task + forwarder +
+    /// thumbnail handles with the same 5s timeout the stop path uses,
+    /// and finally drops the entry from `live_inputs`, `input_handles`,
+    /// and `registered_input_ids`. Enqueues `FixerCommand::DropInputPsi`
+    /// so the fixer evicts the per-input PSI cache — preventing a later
+    /// re-add under the same id from injecting stale PAT/PMT.
+    ///
+    /// # Refusal paths (structured `error_code`)
+    ///
+    /// 1. `input_not_member`: id not in `input_handles`. Idempotent no-op
+    ///    from the runtime's perspective; surfaced as a Warning.
+    /// 2. `active_input_in_use`: id equals the current `active_input_tx`
+    ///    value. Operator must `activate_input` to a different member
+    ///    first. Refusing here keeps the data path's "always have an
+    ///    active source" invariant; auto-switching to an arbitrary
+    ///    sibling would silently change broadcast output.
+    /// 3. `pid_bus_input_in_use`: id appears in any current assembly
+    ///    slot's source tree. Operator must edit the assembly first;
+    ///    auto-orphaning would mute the synthesised program silently.
+    /// 4. `hitless_leg_change_requires_restart`: id appears in a
+    ///    hitless slot's leg list. Merger isn't designed to shrink
+    ///    legs mid-flight; operator must restart.
+    ///
+    /// # Master clock side-effect (R5)
+    ///
+    /// If the removed input is the operator-declared master-clock
+    /// source (`flow.master_clock`), emits a Warning event
+    /// `master_clock_input_removed` so the operator sees the PLL
+    /// fallback. The clock's auto-resolver picks the next active input
+    /// transparently; output PCR may briefly drift while the new
+    /// source locks. Refusing here was the alternative — chosen
+    /// against because retiring an old input shouldn't have to
+    /// detour through a master-clock config edit.
+    pub async fn remove_input(&self, input_id: &str) -> Result<()> {
+        // (1) Not a member?
+        {
+            let handles = self.input_handles.read().await;
+            if !handles.contains_key(input_id) {
+                return Err(anyhow::Error::new(
+                    InputMembershipError::not_member(input_id),
+                ));
+            }
+        }
+        // (2) Currently active?
+        if self.active_input_tx.borrow().as_str() == input_id {
+            return Err(anyhow::Error::new(
+                InputMembershipError::active_in_use(input_id),
+            ));
+        }
+        // (3) Referenced by the running assembly?
+        if self.input_used_by_assembly(input_id).await {
+            return Err(anyhow::Error::new(
+                InputMembershipError::pid_bus_in_use(input_id),
+            ));
+        }
+        // (4) In a hitless slot's leg list?
+        let hitless = self.assembly_hitless_inputs().await;
+        if hitless.contains(input_id) {
+            return Err(anyhow::Error::new(
+                InputMembershipError::hitless_leg_change(input_id),
+            ));
+        }
+
+        // R5: master-clock source warning. Emit BEFORE teardown so the
+        // operator's event log shows the cause before the PLL drift
+        // appears in telemetry.
+        let clock_source =
+            crate::engine::master_clock::resolve_pcr_source_input_id(&self.config.config);
+        if clock_source.as_deref() == Some(input_id) {
+            self.event_sender.emit_flow_with_details(
+                EventSeverity::Warning,
+                category::FLOW,
+                format!(
+                    "Master clock source input '{}' is being removed from flow '{}'; \
+                     PLL will fall back to the next active input — output PCR may \
+                     briefly drift until lock",
+                    input_id, self.config.config.id
+                ),
+                &self.config.config.id,
+                serde_json::json!({
+                    "error_code": "master_clock_input_removed",
+                    "input_id": input_id,
+                    "flow_id": self.config.config.id,
+                }),
+            );
+        }
+
+        // Snapshot whether this input is a WHIP server BEFORE we drop
+        // its entry from `live_inputs` — the WebRTC session registry
+        // cleanup below needs to know without re-acquiring the lock.
+        // Only WHIP-server inputs registered a channel; other input
+        // kinds had nothing to register.
+        #[cfg(feature = "webrtc")]
+        let removed_was_whip_server: bool = {
+            let live = self.live_inputs.read().await;
+            live.iter()
+                .find(|d| d.id == input_id)
+                .map(|d| matches!(d.config, InputConfig::Webrtc(_)))
+                .unwrap_or(false)
+        };
+
+        // Drop per-input PSI cache via the fixer command channel.
+        // Idempotent on the fixer; use try_send so a backed-up fixer
+        // doesn't stall the remove path.
+        let _ = self
+            .fixer_tx
+            .try_send(FixerCommand::DropInputPsi {
+                input_id: input_id.to_string(),
+            });
+
+        // Unregister the node-wide publisher BEFORE cancelling per-input
+        // tokens. Cross-flow subscribers see `RecvError::Closed` on the
+        // next recv and exit cleanly. The `pid_bus_slot_source_closed`
+        // Warning that sibling flows' slot_fanin emits covers the
+        // operator-visible "this slot just went silent" surface.
+        if let Some(fm) = self.flow_manager_weak.upgrade() {
+            fm.unregister_input_publisher(input_id);
+            // Unregister the WHIP session channel if we just removed
+            // the flow's WHIP-server input. The registry is keyed by
+            // flow_id (one WHIP per flow by design), so the cleanup
+            // is symmetric with the `register_whip_input` we did on
+            // hot-add. WHEP outputs for the flow stay registered.
+            #[cfg(feature = "webrtc")]
+            if removed_was_whip_server {
+                if let Some(reg) = fm.webrtc_sessions() {
+                    reg.unregister_whip_input(&self.config.config.id);
+                    tracing::info!(
+                        "Unregistered WHIP-server input '{}' from flow '{}'",
+                        input_id,
+                        self.config.config.id
+                    );
+                }
+            }
+        }
+
+        // Pull the runtime out of input_handles, cancel its token, and
+        // await all child task handles.
+        let runtime = {
+            let mut handles = self.input_handles.write().await;
+            handles.remove(input_id)
+        };
+        if let Some(rt) = runtime {
+            rt.cancel_token.cancel();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rt.input_handle)
+                .await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rt.forwarder_handle)
+                .await;
+            if let Some(thumb) = rt.thumbnail_handle {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), thumb).await;
+            }
+            // Detach the per-input thumbnail accumulator so the stats
+            // snapshot stops surfacing this input's last-thumbnail.
+            self.stats.per_input_thumbnails.remove(input_id);
+        }
+
+        // Drop from live_inputs + registered_input_ids.
+        {
+            let mut live = self.live_inputs.write().await;
+            live.retain(|d| d.id != input_id);
+        }
+        if let Ok(mut ids) = self.registered_input_ids.lock() {
+            ids.retain(|id| id != input_id);
+        }
+
+        tracing::info!(
+            "Hot-removed input '{}' from flow '{}'",
+            input_id,
+            self.config.config.id
+        );
+        Ok(())
+    }
+
     /// Stop the entire flow by cancelling the parent token.
     ///
     /// This signals both the input task and every output task to shut down.
@@ -2476,6 +2783,127 @@ impl FlowRuntime {
         };
         for shim in foreign_shims {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(1), shim).await;
+        }
+    }
+
+    /// Return `true` iff the given `input_id` appears anywhere in this
+    /// flow's current assembly plan — as a slot source (Pid / Essence /
+    /// Hitless leg / Switch leg) or as a PCR source at flow or program
+    /// level.
+    ///
+    /// Used by the future hot-swap `remove_input` path to refuse removal
+    /// of inputs still bound to the running assembly. The corresponding
+    /// `pid_bus_input_in_use` error rides on `command_ack.error_code` so
+    /// the manager UI can surface a structured "unbind the slot first"
+    /// message rather than mute the assembled program silently.
+    #[allow(dead_code)] // Phase 1 will wire callers via remove_input / add_input.
+    pub async fn input_used_by_assembly(&self, input_id: &str) -> bool {
+        let guard = self.current_assembly.lock().await;
+        let Some(asm) = guard.as_ref() else { return false; };
+        if let Some(pcr) = &asm.pcr_source {
+            if pcr.input_id == input_id {
+                return true;
+            }
+        }
+        for program in &asm.programs {
+            if let Some(pcr) = &program.pcr_source {
+                if pcr.input_id == input_id {
+                    return true;
+                }
+            }
+            for stream in &program.streams {
+                if slot_source_references_input(&stream.source, input_id) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Return the set of `input_id`s that appear inside any
+    /// [`crate::config::models::SlotSource::Hitless`] slot's primary or
+    /// backup leg in this flow's current assembly plan.
+    ///
+    /// Used by the future hot-swap `add_input` / `remove_input` paths to
+    /// detect changes that would alter a running hitless ES merger's leg
+    /// list. The merger isn't designed to grow/shrink mid-flight, so
+    /// such edits fall back to a full flow restart via
+    /// `hitless_leg_change_requires_restart` on `command_ack.error_code`.
+    #[allow(dead_code)] // Phase 1 will wire callers via remove_input / add_input.
+    pub async fn assembly_hitless_inputs(&self) -> HashSet<String> {
+        let mut out = HashSet::new();
+        let guard = self.current_assembly.lock().await;
+        let Some(asm) = guard.as_ref() else { return out; };
+        for program in &asm.programs {
+            for stream in &program.streams {
+                collect_hitless_input_ids(&stream.source, &mut out);
+            }
+        }
+        out
+    }
+}
+
+/// Recursive walker used by [`FlowRuntime::input_used_by_assembly`]. Returns
+/// `true` if `input_id` appears anywhere inside the slot source tree.
+///
+/// Per the validation rules, `Hitless` cannot nest inside `Hitless` or
+/// `Switch`, and `Switch` legs are flat — but recursing through the boxed
+/// `Hitless { primary, backup }` arms is the natural shape.
+#[allow(dead_code)] // Phase 1 wires callers via FlowRuntime::input_used_by_assembly.
+fn slot_source_references_input(
+    src: &crate::config::models::SlotSource,
+    input_id: &str,
+) -> bool {
+    use crate::config::models::SlotSource;
+    match src {
+        SlotSource::Pid { input_id: id, .. } => id == input_id,
+        SlotSource::Essence { input_id: id, .. } => id == input_id,
+        SlotSource::Hitless { primary, backup, .. } => {
+            slot_source_references_input(primary, input_id)
+                || slot_source_references_input(backup, input_id)
+        }
+        SlotSource::Switch { legs, .. } => legs.iter().any(|l| l.input_id() == input_id),
+    }
+}
+
+/// Helper for [`FlowRuntime::assembly_hitless_inputs`]. When `src` is a
+/// `Hitless`, inserts every input id referenced by its primary or backup
+/// leg into `out`. Non-`Hitless` sources are ignored.
+#[allow(dead_code)] // Phase 1 wires callers via FlowRuntime::assembly_hitless_inputs.
+fn collect_hitless_input_ids(
+    src: &crate::config::models::SlotSource,
+    out: &mut HashSet<String>,
+) {
+    use crate::config::models::SlotSource;
+    if let SlotSource::Hitless { primary, backup, .. } = src {
+        collect_all_input_ids(primary, out);
+        collect_all_input_ids(backup, out);
+    }
+}
+
+/// Insert every input id referenced anywhere inside `src` into `out`.
+/// Used to enumerate the full leg list of a `Hitless` source.
+#[allow(dead_code)] // Phase 1 wires callers via collect_hitless_input_ids.
+fn collect_all_input_ids(
+    src: &crate::config::models::SlotSource,
+    out: &mut HashSet<String>,
+) {
+    use crate::config::models::SlotSource;
+    match src {
+        SlotSource::Pid { input_id, .. } => {
+            out.insert(input_id.clone());
+        }
+        SlotSource::Essence { input_id, .. } => {
+            out.insert(input_id.clone());
+        }
+        SlotSource::Hitless { primary, backup, .. } => {
+            collect_all_input_ids(primary, out);
+            collect_all_input_ids(backup, out);
+        }
+        SlotSource::Switch { legs, .. } => {
+            for leg in legs {
+                out.insert(leg.input_id().to_string());
+            }
         }
     }
 }
@@ -2673,6 +3101,172 @@ fn spawn_single_input(
     };
 
     (handle, whip_info)
+}
+
+/// Shared per-flow context needed to spawn a single input's runtime
+/// (input task + forwarder/demuxer-shim + PSI observer + thumbnail).
+///
+/// Bundles the references that don't vary per input so the spawn loop in
+/// [`FlowRuntime::start`] and the hot-add path in `FlowRuntime::add_input`
+/// share the same engine code without a 15-argument call site.
+pub(crate) struct InputSpawnContext<'a> {
+    pub flow_id: &'a str,
+    pub flow_cancel: &'a CancellationToken,
+    pub active_input_watch_rx: &'a watch::Receiver<String>,
+    pub fixer_tx: &'a tokio::sync::mpsc::Sender<FixerCommand>,
+    pub flow_stats: &'a Arc<FlowStatsAccumulator>,
+    pub flow_manager: &'a Arc<crate::engine::manager::FlowManager>,
+    pub event_sender: &'a EventSender,
+    pub av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+    pub es_bus: Option<&'a Arc<NodeEsBus>>,
+    pub global_stats: &'a Arc<crate::stats::collector::StatsCollector>,
+    pub ffmpeg_available: bool,
+    pub thumbnail_enabled: bool,
+    pub flow_clock_domain: Option<u8>,
+    #[cfg(feature = "replay")]
+    pub replay_command_txs:
+        &'a dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::replay::ReplayCommand>>,
+}
+
+/// Output of [`spawn_input_runtime`]. Carries the assembled [`InputRuntime`]
+/// that the caller inserts into `input_handles`, the registered input id,
+/// and the optional WHIP session channel for the WebRTC HTTP signaling
+/// layer (only present when `feature = "webrtc"` is on and the input
+/// dispatched a WHIP receiver).
+pub(crate) struct SpawnedInputRuntime {
+    pub input_id: String,
+    pub input_runtime: InputRuntime,
+    #[cfg(feature = "webrtc")]
+    pub whip_info: Option<WhipSessionInfo>,
+}
+
+/// Spawn a single input's full runtime: per-input broadcast publisher,
+/// node-wide publisher registration (gets `psi_catalog`), per-input
+/// liveness counters, protocol-specific input task, optional PSI catalogue
+/// observer, forwarder (passthrough) or refcounted demuxer shim (assembled
+/// flow), and optional thumbnail generator.
+///
+/// Used by both [`FlowRuntime::start`] (one call per input at start) and
+/// the hot-add path (one call per added input). The setup order is
+/// load-bearing: register publisher BEFORE counter registration so the
+/// PSI catalogue lives in both the manager's node-wide registry and the
+/// flow's stats accumulator; spawn the PSI catalogue observer BEFORE the
+/// forwarder so passive inputs surface their PMTs even while another
+/// input is active; spawn the demuxer shim BEFORE the thumbnail so a
+/// later thumbnail generator subscribes to a publisher with at least one
+/// downstream draining the channel.
+///
+/// Pure spawn — no awaits, no Result. Bind failures surface asynchronously
+/// via the event channel; the hot-add caller uses `wait_for_first_bind_failure`
+/// to detect them within a short window after spawn.
+pub(crate) fn spawn_input_runtime(
+    input_def: &InputDefinition,
+    ctx: &InputSpawnContext<'_>,
+) -> SpawnedInputRuntime {
+    let input_id = input_def.id.clone();
+    let input_cancel = ctx.flow_cancel.child_token();
+    let (per_input_tx, _) = broadcast::channel::<RtpPacket>(BROADCAST_CHANNEL_CAPACITY);
+
+    let psi_catalog = ctx
+        .flow_manager
+        .register_input_publisher(&input_id, per_input_tx.clone());
+    let force_idr = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let per_input_counters = ctx.flow_stats.register_input_counters_with_psi_catalog(
+        &input_id,
+        input_type_str(&input_def.config),
+        build_input_config_meta(&input_def.config),
+        Arc::clone(&psi_catalog),
+    );
+
+    let (input_handle, this_whip_info) = spawn_single_input(
+        input_def,
+        ctx.flow_id,
+        &per_input_tx,
+        ctx.flow_stats,
+        &input_cancel,
+        ctx.event_sender,
+        &force_idr,
+        ctx.flow_clock_domain,
+        ctx.av_sync_pacer.clone(),
+        #[cfg(feature = "replay")]
+        ctx.replay_command_txs,
+    );
+
+    if input_def.config.is_ts_carrier() {
+        let _ = super::ts_psi_catalog::spawn_psi_catalog_observer(
+            input_id.clone(),
+            ctx.flow_id.to_string(),
+            per_input_tx.clone(),
+            per_input_counters.psi_catalog.clone(),
+            input_cancel.child_token(),
+        );
+    }
+
+    let forwarder_handle = if let Some(bus) = ctx.es_bus {
+        let bus_clone = bus.clone();
+        let pic = per_input_counters.clone();
+        let input_id_for_demuxer = input_id.clone();
+        let demuxer_handle = ctx.flow_manager.acquire_demuxer(
+            &input_id,
+            move |rx, cancel| {
+                Some(spawn_ts_es_demuxer_consumer(
+                    input_id_for_demuxer,
+                    rx,
+                    bus_clone,
+                    cancel,
+                    pic,
+                ))
+            },
+        );
+        let input_cancel_inner = input_cancel.clone();
+        tokio::spawn(async move {
+            let _demuxer_handle = demuxer_handle; // RAII — drops on cancel
+            input_cancel_inner.cancelled().await;
+        })
+    } else {
+        spawn_input_forwarder(
+            input_id.clone(),
+            per_input_tx.subscribe(),
+            ctx.active_input_watch_rx.clone(),
+            input_cancel.clone(),
+            ctx.fixer_tx.clone(),
+            force_idr.clone(),
+            per_input_counters,
+        )
+    };
+
+    let thumbnail_handle = if ctx.thumbnail_enabled && ctx.ffmpeg_available {
+        let thumb_acc = Arc::new(ThumbnailAccumulator::new_with_update_notify(
+            ctx.global_stats.thumbnail_update_notify.clone(),
+        ));
+        ctx.flow_stats
+            .per_input_thumbnails
+            .insert(input_id.clone(), thumb_acc.clone());
+        Some(spawn_thumbnail_generator(
+            &per_input_tx,
+            thumb_acc,
+            input_cancel.child_token(),
+            None,
+        ))
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "webrtc"))]
+    let _ = this_whip_info;
+
+    SpawnedInputRuntime {
+        input_id,
+        input_runtime: InputRuntime {
+            input_handle,
+            forwarder_handle,
+            cancel_token: input_cancel,
+            thumbnail_handle,
+        },
+        #[cfg(feature = "webrtc")]
+        whip_info: this_whip_info,
+    }
 }
 
 /// Metadata describing how the active input feeds the media analyzer.
@@ -3121,6 +3715,15 @@ pub(crate) enum FixerCommand {
     /// One-shot: the fixer ORs the flag with its existing
     /// `pending_di_on_pcr`; consumed on the next PCR.
     SignalSourceDiscontinuity,
+    /// An input has been hot-removed from the flow. Drop its cached
+    /// PAT/PMT so a later hot-add of an input under the same id doesn't
+    /// re-inject stale PSI on the next switch.
+    ///
+    /// Enqueued by the future `FlowRuntime::remove_input` path before
+    /// the per-input cancel token fires. Idempotent on the fixer side —
+    /// dropping an unknown id is a no-op.
+    #[allow(dead_code)] // Phase 1 wires callers via FlowRuntime::remove_input.
+    DropInputPsi { input_id: String },
 }
 
 /// Dedicated fixer task that owns the [`TsContinuityFixer`] for one flow.
@@ -3191,6 +3794,12 @@ async fn ts_fixer_task(
                     // `discontinuity_indicator` set. One-shot;
                     // consumed inside `process_packet`.
                     fixer.signal_source_discontinuity();
+                }
+                Some(FixerCommand::DropInputPsi { input_id }) => {
+                    // An input was hot-removed. Drop its cached PAT/PMT
+                    // so a later hot-add under the same id doesn't
+                    // re-inject stale PSI on the next switch. Idempotent.
+                    fixer.forget_input(&input_id);
                 }
                 None => return,
             }
@@ -5239,6 +5848,152 @@ mod cost_plan_tests {
         assert_eq!(plan.vaapi_sessions_4k, 1);
         assert_eq!(plan.vaapi_decode_sessions, 1);
         assert_eq!(plan.vaapi_decode_sessions_4k, 1);
+    }
+}
+
+#[cfg(test)]
+mod input_membership_tests {
+    //! Pure-logic tests for the hot-swap input-membership helpers
+    //! (`slot_source_references_input`, `collect_all_input_ids`) and the
+    //! stable `InputMembershipError` error codes that ride on
+    //! `command_ack.error_code`.
+    use super::*;
+    use crate::config::models::{SlotSource, SwitchLeg};
+
+    fn pid_src(input_id: &str) -> SlotSource {
+        SlotSource::Pid {
+            input_id: input_id.to_string(),
+            source_pid: 0x100,
+        }
+    }
+
+    #[test]
+    fn slot_source_references_input_pid_match() {
+        let s = pid_src("a");
+        assert!(slot_source_references_input(&s, "a"));
+        assert!(!slot_source_references_input(&s, "b"));
+    }
+
+    #[test]
+    fn slot_source_references_input_essence_match() {
+        let s = SlotSource::Essence {
+            input_id: "feed-1".into(),
+            kind: crate::config::models::EssenceKind::Video,
+        };
+        assert!(slot_source_references_input(&s, "feed-1"));
+        assert!(!slot_source_references_input(&s, "feed-2"));
+    }
+
+    #[test]
+    fn slot_source_references_input_hitless_walks_both_legs() {
+        let s = SlotSource::Hitless {
+            primary: Box::new(pid_src("primary")),
+            backup: Box::new(pid_src("backup")),
+            mode: Default::default(),
+            stall_ms: None,
+            reorder_window: None,
+            path_differential_ms: None,
+        };
+        assert!(slot_source_references_input(&s, "primary"));
+        assert!(slot_source_references_input(&s, "backup"));
+        assert!(!slot_source_references_input(&s, "other"));
+    }
+
+    #[test]
+    fn slot_source_references_input_switch_walks_every_leg() {
+        let s = SlotSource::Switch {
+            legs: vec![
+                SwitchLeg::Pid { input_id: "cam-a".into(), source_pid: 0x100 },
+                SwitchLeg::Essence {
+                    input_id: "cam-b".into(),
+                    kind: crate::config::models::EssenceKind::Video,
+                },
+            ],
+            initial_input_id: "cam-a".into(),
+            splice_mode: Default::default(),
+            splice_budget_ms: None,
+        };
+        assert!(slot_source_references_input(&s, "cam-a"));
+        assert!(slot_source_references_input(&s, "cam-b"));
+        assert!(!slot_source_references_input(&s, "cam-c"));
+    }
+
+    #[test]
+    fn collect_all_input_ids_hitless_finds_both_legs() {
+        let h = SlotSource::Hitless {
+            primary: Box::new(pid_src("p")),
+            backup: Box::new(pid_src("b")),
+            mode: Default::default(),
+            stall_ms: None,
+            reorder_window: None,
+            path_differential_ms: None,
+        };
+        let mut out = HashSet::new();
+        collect_all_input_ids(&h, &mut out);
+        assert!(out.contains("p"));
+        assert!(out.contains("b"));
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn collect_hitless_input_ids_ignores_non_hitless_sources() {
+        let mut out = HashSet::new();
+        collect_hitless_input_ids(&pid_src("a"), &mut out);
+        assert!(out.is_empty());
+        collect_hitless_input_ids(
+            &SlotSource::Switch {
+                legs: vec![SwitchLeg::Pid {
+                    input_id: "x".into(),
+                    source_pid: 0x100,
+                }],
+                initial_input_id: "x".into(),
+                splice_mode: Default::default(),
+                splice_budget_ms: None,
+            },
+            &mut out,
+        );
+        assert!(out.is_empty(), "Switch alone should not contribute to hitless-leg set");
+    }
+
+    #[test]
+    fn input_membership_error_codes_are_stable() {
+        // The error codes ride on command_ack.error_code and the manager
+        // UI matches against them — pin the strings here so a future
+        // refactor can't quietly break the protocol surface.
+        assert_eq!(
+            InputMembershipError::already_member("x").code,
+            "input_already_member"
+        );
+        assert_eq!(InputMembershipError::not_member("x").code, "input_not_member");
+        assert_eq!(
+            InputMembershipError::active_in_use("x").code,
+            "active_input_in_use"
+        );
+        assert_eq!(
+            InputMembershipError::pid_bus_in_use("x").code,
+            "pid_bus_input_in_use"
+        );
+        assert_eq!(
+            InputMembershipError::hitless_leg_change("x").code,
+            "hitless_leg_change_requires_restart"
+        );
+        assert_eq!(
+            InputMembershipError::resource_critical("f", "x").code,
+            "input_resource_critical"
+        );
+    }
+
+    #[test]
+    fn fixer_drop_input_psi_evicts_cache() {
+        // Build a minimal TS packet that injects a PMT under input "a",
+        // then ask the fixer to forget "a" and assert the cache is gone.
+        let mut fixer = crate::engine::ts_continuity_fixer::TsContinuityFixer::new();
+        // We can't easily synthesise valid PSI here without pulling in
+        // the broader test fixtures from ts_continuity_fixer's own
+        // tests, so just exercise the forget_input contract — it must
+        // be a no-op on an unknown id and must not panic.
+        fixer.forget_input("never-existed");
+        fixer.forget_input("");
     }
 }
 

@@ -235,9 +235,14 @@ pub mod registry {
             }
         }
 
-        /// Unregister channels for a flow (called on flow stop).
-        /// Retained for flow lifecycle cleanup when session management is wired up.
-        #[allow(dead_code)]
+        /// Unregister all channels + sessions for a flow.
+        ///
+        /// Called on flow stop / destroy (via `FlowManager::destroy_flow`)
+        /// so the registry doesn't hold dead `mpsc::Sender`s for flows
+        /// that no longer exist. Without this, a browser pairing against
+        /// the stale flow id would race on a closed channel — clean
+        /// removal returns a 404-style "no WHIP input registered for
+        /// flow" instead.
         pub fn unregister_flow(&self, flow_id: &str) {
             self.whip_input_channels.remove(flow_id);
             self.whep_output_channels.remove(flow_id);
@@ -246,6 +251,15 @@ pub mod registry {
             // Remove all sessions for this flow
             let prefix = format!("{}/", flow_id);
             self.sessions.retain(|k, _| !k.starts_with(&prefix));
+        }
+
+        /// Unregister only the WHIP-input entry for a flow. Used by
+        /// `FlowRuntime::remove_input` when the input being hot-removed
+        /// is the flow's WHIP-server input — leaves the flow's WHEP
+        /// outputs (and their tokens) untouched.
+        pub fn unregister_whip_input(&self, flow_id: &str) {
+            self.whip_input_channels.remove(flow_id);
+            self.whip_tokens.remove(flow_id);
         }
 
         /// Get the expected Bearer token for WHIP on a flow.
