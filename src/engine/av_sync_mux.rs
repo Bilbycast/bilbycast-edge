@@ -76,33 +76,6 @@ pub const PCR_PREROLL_27MHZ: u64 = 2_160_000;
 pub struct AvSyncPacer {
     master: MasterClockHandle,
     assembler_owned: Arc<std::sync::atomic::AtomicBool>,
-    /// **Cumulative** sum of source-PCR forward-jump magnitudes
-    /// (27 MHz ticks) signalled by
-    /// [`crate::engine::ts_pts_rewriter::TsPtsRewriter`]. Monotonically
-    /// non-decreasing across the flow's lifetime — never reset, never
-    /// drained at the source. Each consumer (audio replacer) tracks
-    /// its own `last_observed_pcr_cumulative_27mhz` and computes the
-    /// delta on every PES, supporting **multiple replacers sharing
-    /// the same flow pacer** (input-level audio transcode + N
-    /// output-level audio transcodes) without losing the signal.
-    ///
-    /// `ts_pts_rewriter` passes forward PCR jumps through to preserve
-    /// PCR_FO accuracy, but for sources where the audio PES PTS does
-    /// NOT follow the PCR jump (notably `ffmpeg -stream_loop` — its
-    /// mpegts muxer offsets audio by `audio_duration` and video by
-    /// `video_duration` independently at each loop wrap), output
-    /// audio drifts ~1.3 s behind PCR per loop without compensation.
-    ///
-    /// On each PES the audio replacer reads this cumulative, subtracts
-    /// its `last_observed`, and pads its accumulator with `diff × sr /
-    /// 27_000_000` zero PCM samples — the receiver hears silence
-    /// covering the source-side gap, A-V stays synced.
-    ///
-    /// Backward PCR jumps are bridged inside the rewriter (anchor
-    /// updates) and don't reach here. Audio replacer's own
-    /// `expected_next_src_pts_90k` threshold (500 ms) handles audio-
-    /// side discontinuities orthogonally.
-    pcr_cumulative_forward_jump_27mhz: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl AvSyncPacer {
@@ -110,7 +83,6 @@ impl AvSyncPacer {
         Self {
             master,
             assembler_owned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            pcr_cumulative_forward_jump_27mhz: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }
     }
 
@@ -178,36 +150,6 @@ impl AvSyncPacer {
     #[allow(dead_code)]
     pub fn lipsync_offset_90k(&self) -> i64 {
         self.master.lipsync_offset_90k()
-    }
-
-    /// Signal a forward source-PCR jump that the rewriter has decided
-    /// to pass through (PCR_FO preservation policy). The magnitude is
-    /// **added** to the cumulative counter — never reset. Multiple
-    /// consumers (input-level + per-output audio replacers) each
-    /// track their own `last_observed` and apply the delta independently.
-    ///
-    /// Called from `ts_pts_rewriter::rewrite_pcr_value` only when the
-    /// source-PCR delta exceeds the discontinuity threshold (500 ms).
-    /// Smaller jumps fall within the normal source-rate envelope and
-    /// do not need silence-padding.
-    pub fn signal_pcr_forward_jump_27mhz(&self, delta_27mhz: u64) {
-        // Saturate against i64::MAX to avoid wraparound on a
-        // pathologically large delta (shouldn't happen — sources jump
-        // by seconds, not hours).
-        let signed = delta_27mhz.min(i64::MAX as u64) as i64;
-        self.pcr_cumulative_forward_jump_27mhz
-            .fetch_add(signed, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Read the **cumulative** forward-jump total in 27 MHz ticks
-    /// since the flow started. Never reset, monotonically non-
-    /// decreasing — each consumer (audio replacer) holds its own
-    /// `last_observed_pcr_cumulative_27mhz` and computes the delta
-    /// against this value on every PES to decide how much silence to
-    /// pad. Safe with N concurrent consumers (no drain, no race).
-    pub fn pcr_cumulative_forward_jump_27mhz(&self) -> i64 {
-        self.pcr_cumulative_forward_jump_27mhz
-            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -337,86 +279,5 @@ mod tests {
         const PCR_MODULUS: u64 = (1u64 << 33) * 300;
         let pcr = pcr_for_emit(None, 0);
         assert_eq!(pcr, PCR_MODULUS - PCR_PREROLL_27MHZ);
-    }
-
-    #[test]
-    fn pcr_forward_jump_signal_accumulates_monotonically() {
-        let p = wallclock_pacer();
-
-        // Zero at start.
-        assert_eq!(p.pcr_cumulative_forward_jump_27mhz(), 0);
-
-        // Signals accumulate, never reset. The cumulative model
-        // supports N independent consumers — each tracks its own
-        // last_observed without draining the shared atomic.
-        p.signal_pcr_forward_jump_27mhz(27_000_000); // 1 s
-        assert_eq!(p.pcr_cumulative_forward_jump_27mhz(), 27_000_000);
-        // Reading does NOT reset.
-        assert_eq!(p.pcr_cumulative_forward_jump_27mhz(), 27_000_000);
-
-        // More signals add on top.
-        p.signal_pcr_forward_jump_27mhz(27_000_000 / 2); // 500 ms
-        assert_eq!(
-            p.pcr_cumulative_forward_jump_27mhz(),
-            27_000_000 + 27_000_000 / 2,
-        );
-    }
-
-    #[test]
-    fn pcr_forward_jump_signal_is_clone_shared() {
-        // AvSyncPacer is cloned across the rewriter + every audio
-        // replacer the flow runs — the cumulative counter must
-        // surface across all Arc clones identically.
-        let p1 = wallclock_pacer();
-        let p2 = p1.clone();
-        let p3 = p1.clone();
-        p1.signal_pcr_forward_jump_27mhz(1_000_000);
-        assert_eq!(p2.pcr_cumulative_forward_jump_27mhz(), 1_000_000);
-        assert_eq!(p3.pcr_cumulative_forward_jump_27mhz(), 1_000_000);
-        // Signals via any clone reflect everywhere.
-        p2.signal_pcr_forward_jump_27mhz(500_000);
-        assert_eq!(p1.pcr_cumulative_forward_jump_27mhz(), 1_500_000);
-        assert_eq!(p3.pcr_cumulative_forward_jump_27mhz(), 1_500_000);
-    }
-
-    #[test]
-    fn pcr_forward_jump_supports_multiple_independent_consumers() {
-        // Two replacers sharing the same flow pacer (e.g. an input-
-        // level audio_encode + an output-level audio_encode on the
-        // same flow) each silence-pad independently — neither drains
-        // the signal.
-        let p = wallclock_pacer();
-        let mut consumer_a_last: i64 = 0;
-        let mut consumer_b_last: i64 = 0;
-
-        // Pacer signals 1.333 s jump (one ffmpeg loop wrap).
-        p.signal_pcr_forward_jump_27mhz(35_991_000);
-
-        // Consumer A reads + applies.
-        let cur = p.pcr_cumulative_forward_jump_27mhz();
-        let diff_a = cur - consumer_a_last;
-        consumer_a_last = cur;
-        assert_eq!(diff_a, 35_991_000);
-
-        // Consumer B reads + applies independently — also sees the
-        // full delta. With the old swap-to-zero design, B would see 0.
-        let cur = p.pcr_cumulative_forward_jump_27mhz();
-        let diff_b = cur - consumer_b_last;
-        consumer_b_last = cur;
-        assert_eq!(diff_b, 35_991_000);
-
-        // After a second loop wrap, both consumers pick up the new
-        // delta and only the new delta (their last_observed advanced).
-        p.signal_pcr_forward_jump_27mhz(35_991_000);
-        let cur = p.pcr_cumulative_forward_jump_27mhz();
-        let diff_a2 = cur - consumer_a_last;
-        consumer_a_last = cur;
-        let diff_b2 = cur - consumer_b_last;
-        consumer_b_last = cur;
-        assert_eq!(diff_a2, 35_991_000);
-        assert_eq!(diff_b2, 35_991_000);
-        // Both consumers are now caught up to the same cumulative.
-        assert_eq!(consumer_a_last, consumer_b_last);
-        assert_eq!(consumer_a_last, 71_982_000);
     }
 }
