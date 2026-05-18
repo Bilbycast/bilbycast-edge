@@ -555,10 +555,25 @@ impl TsPtsRewriter {
             );
         } else if delta_src > DISCONTINUITY_THRESHOLD_27MHZ as i64 {
             set_di = true;
+            // Signal the audio replacer to silence-pad the gap. Forward
+            // PCR jumps pass through (PCR_FO preservation), but on
+            // sources where audio PTS does NOT follow the PCR jump
+            // (notably `ffmpeg -stream_loop` — its mpegts muxer
+            // advances audio by `audio_duration` and video by
+            // `video_duration` independently), output audio drifts
+            // ~1.3 s behind PCR per loop without this. The replacer
+            // pads its PCM accumulator with `delta × sr / 27_000_000`
+            // zero samples so output audio PTS catches up; receiver
+            // hears the source-side gap as silence and A-V stays
+            // synced. Backward jumps go through the bridge path above
+            // (anchor update) so the audio doesn't need padding.
+            self.pacer
+                .signal_pcr_forward_jump_27mhz(delta_src as u64);
             tracing::info!(
                 src_pcr_27mhz,
                 delta_src_27mhz = delta_src,
-                "ts_pts_rewriter: forward PCR discontinuity passed through (DI=1)"
+                "ts_pts_rewriter: forward PCR discontinuity passed through (DI=1); \
+                 signalling audio silence-pad to maintain A-V sync"
             );
         }
 
