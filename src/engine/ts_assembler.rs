@@ -347,6 +347,7 @@ pub fn spawn_spts_assembler(
     cancel: CancellationToken,
     event_sender: Option<crate::manager::events::EventSender>,
     flow_id: String,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> AssemblerHandle {
     // Channel depth 16: plan updates are rare (operator-triggered), so a
     // small bounded buffer is plenty and keeps back-pressure observable
@@ -366,7 +367,7 @@ pub fn spawn_spts_assembler(
     let thread_handle = crate::engine::dedicated_runtime::spawn_dedicated(
         crate::engine::dedicated_runtime::DedicatedRuntimeConfig::new(who, "BILBYCAST_PID_BUS_CPUS"),
         async move {
-            run_assembler(plan, bus, broadcast_tx, cancel, plan_rx, event_sender, flow_id).await;
+            run_assembler(plan, bus, broadcast_tx, cancel, plan_rx, event_sender, flow_id, av_sync_pacer).await;
         },
     );
     // The original `AssemblerHandle.join` is a `tokio::task::JoinHandle<()>`.
@@ -419,7 +420,17 @@ async fn run_assembler(
     mut plan_rx: mpsc::Receiver<PlanCommand>,
     event_sender: Option<crate::manager::events::EventSender>,
     flow_id: String,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) {
+    // Muxer-mode rewriter on the assembled output. Single shared
+    // anchor across every input contributing to the program — fixes
+    // the per-input-anchor problem the input-side rewriter has on
+    // PID-bus / Node-Bus flows. Industry-standard remux behaviour:
+    // master-clock PCR + PES PTS, PCR_RR + PSI_RR + DI=1 + SCTE-35
+    // compliance applied to the *assembled* output. `None` when the
+    // flow doesn't have a pacer (legacy + test paths).
+    let mut pts_rewriter: Option<crate::engine::ts_pts_rewriter::TsPtsRewriter> =
+        av_sync_pacer.map(crate::engine::ts_pts_rewriter::TsPtsRewriter::new);
     use crate::engine::pes_splice::{
         AacAudioParams, AudioSpliceState, FromPacketAction, SpliceOutcome,
         VideoCodecParams, VideoSpliceState, DEFAULT_AUDIO_SPLICE_BUDGET_MS,
@@ -552,13 +563,15 @@ async fn run_assembler(
         &mut pmt_cc,
         &broadcast_tx,
         &mut bundle_seq,
+
+        pts_rewriter.as_mut(),
     );
 
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                flush(&mut buf, &broadcast_tx, &mut bundle_seq);
+                flush(&mut buf, &broadcast_tx, &mut bundle_seq, pts_rewriter.as_mut());
                 break;
             }
             Some(cmd) = plan_rx.recv() => {
@@ -607,6 +620,8 @@ async fn run_assembler(
                             &mut pmt_cc,
                             &broadcast_tx,
                             &mut bundle_seq,
+
+                            pts_rewriter.as_mut(),
                         );
                     }
                     PlanCommand::SwitchActiveInput {
@@ -772,6 +787,8 @@ async fn run_assembler(
                                 &mut pmt_cc,
                                 &broadcast_tx,
                                 &mut bundle_seq,
+
+                                pts_rewriter.as_mut(),
                             );
                         }
                     }
@@ -954,6 +971,8 @@ async fn run_assembler(
                                     &mut pmt_cc,
                                     &broadcast_tx,
                                     &mut bundle_seq,
+
+                                    pts_rewriter.as_mut(),
                                 );
                                 if let Some(es_) = &event_sender {
                                     es_.emit_flow_with_details(
@@ -1015,6 +1034,8 @@ async fn run_assembler(
                                     &mut pmt_cc,
                                     &broadcast_tx,
                                     &mut bundle_seq,
+
+                                    pts_rewriter.as_mut(),
                                 );
                                 if let Some(es_) = &event_sender {
                                     es_.emit_flow_with_details(
@@ -1135,6 +1156,8 @@ async fn run_assembler(
                                     &mut pmt_cc,
                                     &broadcast_tx,
                                     &mut bundle_seq,
+
+                                    pts_rewriter.as_mut(),
                                 );
                                 if let Some(es_) = &event_sender {
                                     es_.emit_flow_with_details(
@@ -1201,6 +1224,8 @@ async fn run_assembler(
                                     &mut pmt_cc,
                                     &broadcast_tx,
                                     &mut bundle_seq,
+
+                                    pts_rewriter.as_mut(),
                                 );
                                 if let Some(es_) = &event_sender {
                                     es_.emit_flow_with_details(
@@ -1302,7 +1327,7 @@ async fn run_assembler(
                 }
                 buf.extend_from_slice(&rewritten);
                 if buf.len() >= BUNDLE_BYTES {
-                    flush(&mut buf, &broadcast_tx, &mut bundle_seq);
+                    flush(&mut buf, &broadcast_tx, &mut bundle_seq, pts_rewriter.as_mut());
                 }
             }
             _ = psi_tick.tick() => {
@@ -1316,10 +1341,12 @@ async fn run_assembler(
                     &mut pmt_cc,
                     &broadcast_tx,
                     &mut bundle_seq,
+
+                    pts_rewriter.as_mut(),
                 );
             }
             _ = flush_tick.tick() => {
-                flush(&mut buf, &broadcast_tx, &mut bundle_seq);
+                flush(&mut buf, &broadcast_tx, &mut bundle_seq, pts_rewriter.as_mut());
                 // PES Switch Phase 4 — splice budget deadlines. Walk
                 // every pending splice; on timeout, fall back to the
                 // legacy PmtBump path and emit `pes_splice_timeout`
@@ -1389,6 +1416,8 @@ async fn run_assembler(
                             &mut pmt_cc,
                             &broadcast_tx,
                             &mut bundle_seq,
+
+                            pts_rewriter.as_mut(),
                         );
                     }
                 }
@@ -1838,6 +1867,7 @@ fn push_psi(
     pmt_cc: &mut std::collections::HashMap<u16, u8>,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     bundle_seq: &mut u16,
+    rewriter: Option<&mut crate::engine::ts_pts_rewriter::TsPtsRewriter>,
 ) {
     // PAT: one entry per program. PAT lives on PID 0x0000 with its own
     // continuity counter across the whole flow (there's only one PAT).
@@ -1848,7 +1878,12 @@ fn push_psi(
         .collect();
     let pat = build_pat(&entries, pat_version, *pat_cc);
     *pat_cc = pat_cc.wrapping_add(1) & 0x0F;
-    append_ts(buf, &pat, broadcast_tx, bundle_seq);
+    // Reborrow rewriter so we can use it across multiple append_ts calls
+    // (each consumes the borrow; we hand out fresh borrows from the
+    // Option). `as_deref_mut` produces `Option<&mut TsPtsRewriter>` from
+    // `Option<&mut TsPtsRewriter>` shape-equivalent.
+    let mut rewriter = rewriter;
+    append_ts(buf, &pat, broadcast_tx, bundle_seq, rewriter.as_deref_mut());
 
     // One PMT per program on its own `pmt_pid` with its own CC counter.
     for (pidx, prog) in plan.programs.iter().enumerate() {
@@ -1867,7 +1902,7 @@ fn push_psi(
             *cc_entry,
         );
         *cc_entry = cc_entry.wrapping_add(1) & 0x0F;
-        append_ts(buf, &pmt, broadcast_tx, bundle_seq);
+        append_ts(buf, &pmt, broadcast_tx, bundle_seq, rewriter.as_deref_mut());
     }
 }
 
@@ -1878,28 +1913,50 @@ fn append_ts(
     pkt: &[u8; TS_PACKET_SIZE],
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     bundle_seq: &mut u16,
+    rewriter: Option<&mut crate::engine::ts_pts_rewriter::TsPtsRewriter>,
 ) {
     buf.extend_from_slice(pkt);
     if buf.len() >= BUNDLE_BYTES {
-        flush(buf, broadcast_tx, bundle_seq);
+        flush(buf, broadcast_tx, bundle_seq, rewriter);
     }
 }
 
 /// Emit whatever is in `buf` as one `RtpPacket` (raw TS) onto the
-/// broadcast channel and reset the buffer. Stamps a monotonic u16
-/// sequence number and derives a 90 kHz RTP timestamp from the current
-/// wall clock so downstream RTP / SRT / FEC outputs can treat the
-/// assembler as a first-class RTP source. No-op when `buf` is empty.
+/// broadcast channel and reset the buffer.
+///
+/// **Muxer-mode rewrite**: when `rewriter` is `Some`, the assembled
+/// bundle bytes pass through `TsPtsRewriter::process` before being
+/// wrapped in the `RtpPacket`. This is the industry-standard mux
+/// behaviour for PID-bus / Node-Bus flows — one shared anchor across
+/// every input contributing to the output, master-clock-derived PCR
+/// + PES PTS, PCR_RR + PSI_RR + DI=1 + SCTE-35 compliance applied to
+/// the *assembled* output (not per-input, which would produce
+/// mismatched anchors). When `None`, source PCR + PES PTS flow
+/// through unchanged (legacy behaviour, used by tests that don't
+/// build a flow context).
+///
+/// Stamps a monotonic u16 sequence number and derives a 90 kHz RTP
+/// timestamp from the current wall clock so downstream RTP / SRT /
+/// FEC outputs can treat the assembler as a first-class RTP source.
+/// No-op when `buf` is empty.
 fn flush(
     buf: &mut BytesMut,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     bundle_seq: &mut u16,
+    rewriter: Option<&mut crate::engine::ts_pts_rewriter::TsPtsRewriter>,
 ) {
     if buf.is_empty() {
         return;
     }
     let replaced = std::mem::replace(buf, BytesMut::with_capacity(BUNDLE_BYTES));
-    let bundle: Bytes = replaced.freeze();
+    let source: Bytes = replaced.freeze();
+    let bundle = if let Some(rw) = rewriter {
+        let mut rewritten = Vec::with_capacity(source.len());
+        rw.process(&source, &mut rewritten);
+        Bytes::from(rewritten)
+    } else {
+        source
+    };
     let recv_time_us = crate::util::time::now_us();
     // Scale µs → 90 kHz ticks and truncate to u32 (standard RTP math).
     let rtp_ts = ((recv_time_us.wrapping_mul(9)).wrapping_div(100)) as u32;
@@ -2417,7 +2474,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(16);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new()).join;
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None).join;
 
         // Drain one bundle — startup path emits PAT + PMT immediately.
         let bundle = tokio::time::timeout(Duration::from_millis(500), rx.recv())
@@ -2439,7 +2496,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new()).join;
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None).join;
 
         // Wait for startup PSI, then publish enough ES packets on each
         // slot to fill a full bundle.
@@ -2509,7 +2566,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_mpts_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new()).join;
+        let handle = spawn_spts_assembler(make_mpts_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None).join;
 
         // Collect bundles for ~250 ms — long enough to see the startup
         // PSI emission plus at least one tick of the 100 ms PSI cadence.
@@ -2552,7 +2609,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, _rx) = broadcast::channel::<RtpPacket>(4);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new()).join;
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None).join;
         tokio::time::sleep(Duration::from_millis(30)).await;
         cancel.cancel();
         tokio::time::timeout(Duration::from_millis(500), handle)
@@ -2575,7 +2632,7 @@ mod tests {
 
         // Initial plan: in-a → out 0x200, in-b → out 0x201.
         let initial = make_plan();
-        let handle = spawn_spts_assembler(initial, bus.clone(), tx.clone(), cancel.clone(), None, String::new());
+        let handle = spawn_spts_assembler(initial, bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None);
 
         // Capture startup PMT version (should be 0).
         let mut v0: Option<u8> = None;
@@ -2681,7 +2738,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new());
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None);
 
         // Drain startup PMT.
         let deadline = tokio::time::Instant::now() + Duration::from_millis(200);

@@ -879,6 +879,7 @@ impl FlowRuntime {
                         &config.config.id,
                         &input_clocks,
                         &flow_manager,
+                        av_sync_pacer.clone(),
                     )
                     .await?,
                 ),
@@ -4181,6 +4182,7 @@ async fn finalize_spts_assembler(
     flow_id: &str,
     input_clocks: &HashMap<String, crate::engine::master_clock::ClockIdentity>,
     flow_manager: &Arc<crate::engine::manager::FlowManager>,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> Result<crate::engine::ts_assembler::AssemblerHandle> {
     // 1. Essence resolution.
     if !build.pending_essence.is_empty() {
@@ -4381,6 +4383,9 @@ async fn finalize_spts_assembler(
     flow_stats.set_pid_routing(routing);
 
     // 5. The assembler itself — single publisher onto broadcast_tx.
+    //    Pass the per-flow A/V sync pacer so the assembler can run
+    //    its own muxer-mode rewriter on the assembled output (single
+    //    shared anchor, master-clock PCR/PTS, TR 101 290 compliance).
     Ok(spawn_spts_assembler(
         build.plan,
         bus.clone(),
@@ -4388,6 +4393,7 @@ async fn finalize_spts_assembler(
         cancel_token.child_token(),
         Some(event_sender.clone()),
         flow_id.to_string(),
+        av_sync_pacer.clone(),
     ))
 }
 
