@@ -303,22 +303,34 @@ impl TsPtsRewriter {
                         if set_di {
                             // TR 101 290 §PCR_DR: flag receivers that the
                             // next PCR is a fresh STC anchor so they don't
-                            // alarm on the clock jump. Required on every
-                            // PCR discontinuity (backward bridge OR
-                            // passed-through forward jump).
+                            // alarm on the clock jump.
                             set_discontinuity_indicator(&mut buf);
                         }
 
-                        // TR 101 290 §PCR_RR: ensure inter-PCR gap stays
-                        // ≤ 40 ms. When the gap to last_emitted exceeds
-                        // 40 ms (sparse source PCR), inject synthetic
-                        // AF-only PCR padding packets BEFORE the source
-                        // packet so receivers see compliant cadence.
-                        // CC is taken from the last source packet on
-                        // this PCR_PID (synthetic AF-only packets MUST
-                        // NOT advance CC per H.222.0 §2.4.3.3).
-                        let cc = (pkt[3] & 0x0F);
-                        self.maybe_inject_pcr_rr_padding(pid, cc, new_pcr, out);
+                        // TR 101 290 §PCR_RR injection ONLY on steady-
+                        // state sparse-PCR sources. Skip on
+                        // discontinuities (set_di=true): filling a
+                        // forward jump with synthetics would emit dozens
+                        // of phantom PCRs at the boundary, confusing
+                        // receivers — the DI=1 + native source PCR is
+                        // the correct discontinuity signal.
+                        //
+                        // Synthetic AF-only packets use the PREVIOUS
+                        // source CC (CC MUST NOT advance on AF-only per
+                        // H.222.0 §2.4.3.3). Using the current source
+                        // CC would cause CC errors at the receiver (the
+                        // current source CC is already +1 from previous,
+                        // so synthetics with current-CC would duplicate
+                        // the upcoming source CC value).
+                        let cc = pkt[3] & 0x0F;
+                        if !set_di {
+                            let prev_cc = self
+                                .last_cc_on_pcr_pid
+                                .get(&pid)
+                                .copied()
+                                .unwrap_or(cc.wrapping_sub(1) & 0x0F);
+                            self.maybe_inject_pcr_rr_padding(pid, prev_cc, new_pcr, out);
+                        }
                         self.last_emitted_out_pcr_27mhz = Some(new_pcr);
                         self.last_cc_on_pcr_pid.insert(pid, cc);
                     }
@@ -1241,10 +1253,11 @@ mod tests {
         );
     }
 
-    /// Forward PCR jump > 500 ms passes through (rate preserved) but
-    /// gets DI=1 so receivers re-anchor cleanly. With PCR_RR injection
-    /// active, the forward jump also gets filled in by synthetic
-    /// padding packets to keep inter-PCR ≤ 40 ms.
+    /// Forward PCR jump > 500 ms passes through with DI=1 and NO
+    /// synthetic padding. PCR_RR injection is intentionally skipped on
+    /// discontinuities — injecting dozens of phantom PCRs at a loop
+    /// boundary would confuse receivers and corrupt CC. The DI=1 flag
+    /// + native source PCR value is the correct discontinuity signal.
     #[test]
     fn forward_pcr_jump_passes_through_with_di() {
         use crate::engine::ts_parse::ts_discontinuity_indicator;
@@ -1262,23 +1275,20 @@ mod tests {
         let mut out2 = Vec::new();
         r.process(&build_pcr_packet(0x100, src_pcr_2), &mut out2);
 
-        // Output should include PCR_RR padding (19 synthetics) + 1
-        // source packet. Validate the LAST packet is the source.
+        // Output: exactly 1 packet (source, with DI=1). No PCR_RR
+        // synthetics on a discontinuity.
         let n_pkts = out2.len() / TS_PACKET_SIZE;
-        assert_eq!(n_pkts, 20, "800ms forward gap → 19 synth + 1 source = 20 packets");
-        let source_offset = (n_pkts - 1) * TS_PACKET_SIZE;
-        let source_pkt = &out2[source_offset..source_offset + TS_PACKET_SIZE];
+        assert_eq!(n_pkts, 1, "forward discontinuity: source only, no synthetic padding");
+        let source_pkt = &out2[0..TS_PACKET_SIZE];
         let new_pcr_2 = extract_pcr(source_pkt).unwrap();
 
-        // Source packet PCR should advance by ~800 ms (rate preserved)
         let forward = (new_pcr_2 as i64).wrapping_sub(new_pcr_1 as i64);
         assert_eq!(
             forward,
             800 * 27_000,
-            "source PCR (last packet) must preserve forward 800ms jump"
+            "source PCR must preserve forward 800ms jump"
         );
 
-        // DI=1 must be set on the SOURCE packet (forward discontinuity)
         assert!(
             ts_discontinuity_indicator(source_pkt),
             "forward PCR discontinuity MUST set DI=1 on source packet"
