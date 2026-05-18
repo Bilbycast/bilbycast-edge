@@ -290,9 +290,20 @@ pub fn build_for_output(
 ) -> Result<Option<TranscodeChain>, TranscodeChainError> {
     let audio = match audio_encode {
         Some(enc) => {
-            let r = TsAudioReplacer::new(enc, transcode)?;
+            let mut r = TsAudioReplacer::new(enc, transcode)?;
             stats.set_audio_replacer_stats(r.stats_handle());
             stats.set_decode_stats(r.decode_stats_handle(), "", 0, 0);
+            // Attach the per-flow A/V sync pacer so the audio anchor on
+            // first PES + every >500 ms source-PTS discontinuity re-anchor
+            // pulls from the master clock instead of the raw source PTS.
+            // Mirrors the video wiring below; the 10 s safety check
+            // inside `TsAudioReplacer::anchor_target` keeps the existing
+            // anchor-to-source behaviour intact when master and source
+            // clocks are wildly uncorrelated (Wallclock master vs
+            // encoder-relative source PTS, PLL pre-lock garbage).
+            if let Some(p) = av_sync_pacer {
+                r.set_av_sync_pacer(p.clone());
+            }
             // Hook the audio replacer's "output stats accumulator"
             // reference so it can refresh source-codec labels on PMT
             // updates — identical to today's inline construction.

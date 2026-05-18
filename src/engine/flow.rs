@@ -3177,6 +3177,7 @@ fn spawn_single_input(
             c.clone(), per_input_tx.clone(), flow_stats.clone(),
             input_cancel.clone(), event_sender.clone(),
             flow_id.to_string(), input_id.clone(),
+            av_sync_pacer.clone(),
         ),
         #[cfg(feature = "replay")]
         InputConfig::Replay(c) => {
@@ -5766,8 +5767,39 @@ fn build_master_clock(
             MasterClockKind::SourcePcrPll
         }
         Some(MasterClockKindConfig::Wallclock) => MasterClockKind::Wallclock,
+        Some(MasterClockKindConfig::Contribution) => {
+            // Same runtime backend as `SourcePcrPll` — operator's
+            // `Contribution` choice flags intent (clean contribution
+            // feed, opt-in to source-PCR PLL pacing) rather than a
+            // distinct runtime path. Telemetry surfaces the operator
+            // label via `configured_kind` so the manager UI can render
+            // "PLL (contribution)" distinct from a legacy explicit
+            // `source_pcr_pll` pin. Required when the auto-policy's
+            // new Wallclock default is too coarse — e.g. PTP-disciplined
+            // contribution feeds where cross-edge clock coherence is
+            // important.
+            MasterClockKind::SourcePcrPll
+        }
         None => crate::engine::master_clock::select_master_kind_for_input(active_input, cfg),
     };
+
+    // Operator-visible note on which master-clock backend the flow
+    // ended up on. WARN so it shows at the default tracing level —
+    // master-clock selection drives PCR sequencing on every output,
+    // surfacing the active kind is operator-relevant context, not
+    // debug noise.
+    tracing::warn!(
+        flow_id = %cfg.id,
+        master_clock_kind = ?kind,
+        configured_kind = ?cfg.master_clock.as_ref().map(|m| m.kind),
+        "master clock selected for flow {}: {} (configured: {})",
+        cfg.id,
+        kind.as_str(),
+        cfg.master_clock
+            .as_ref()
+            .map(|m| format!("{:?}", m.kind))
+            .unwrap_or_else(|| "<auto>".to_string()),
+    );
 
     let (handle, pll_master) = match kind {
         MasterClockKind::SourcePcrPll => {

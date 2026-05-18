@@ -266,6 +266,15 @@ pub struct TsAudioReplacer {
     /// receiver hears wrong-epoch PTS audio frames against a master-
     /// clock-paced PCR.
     external_reset: Arc<AtomicBool>,
+
+    /// Optional per-flow A/V sync pacer. When set, the anchor target on
+    /// first PES and on every discontinuity re-anchor is derived from
+    /// `master.now_27mhz()/300 + PCR_PREROLL + lipsync` instead of the
+    /// raw source PES PTS. A 10 s safety check falls back to source PTS
+    /// when master and source clocks are wildly different (Wallclock
+    /// master vs uncorrelated source, or PLL pre-lock garbage) — the
+    /// re-anchor only kicks in when the two agree to within 10 s.
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 }
 
 impl TsAudioReplacer {
@@ -345,7 +354,23 @@ impl TsAudioReplacer {
             transcode_cfg: transcode,
             transcoder: None,
             external_reset: Arc::new(AtomicBool::new(false)),
+            av_sync_pacer: None,
         })
+    }
+
+    /// Attach a per-flow A/V sync pacer. When set, the anchor target on
+    /// first PES and on each `>500 ms` source-PTS discontinuity is
+    /// derived from `master.now_27mhz()/300 + PCR_PREROLL + lipsync`
+    /// instead of the source PES PTS — the same model as
+    /// [`crate::engine::ts_pts_rewriter::TsPtsRewriter`] uses on the
+    /// passthrough path. Safe to call zero or one time before
+    /// `process()` runs; calling twice silently overwrites. Mirrors
+    /// [`crate::engine::ts_video_replace::TsVideoReplacer::set_av_sync_pacer`].
+    pub fn set_av_sync_pacer(
+        &mut self,
+        pacer: Arc<crate::engine::av_sync_mux::AvSyncPacer>,
+    ) {
+        self.av_sync_pacer = Some(pacer);
     }
 
     /// Shared handle to the one-shot "input was switched" request flag.
@@ -800,7 +825,7 @@ impl TsAudioReplacer {
         // output PCR.
         const DISCONTINUITY_THRESHOLD_90K: u64 = 45_000; // 500 ms
         if !self.out_pts_anchored {
-            self.out_pts_90k = pts;
+            self.out_pts_90k = anchor_target(self.av_sync_pacer.as_ref(), pts);
             self.samples_since_anchor = 0;
             self.out_pts_anchored = true;
         } else if let Some(expected) = self.expected_next_src_pts_90k {
@@ -814,7 +839,7 @@ impl TsAudioReplacer {
                      (expected={expected}, got={pts}, delta_90k={delta}); \
                      re-anchoring audio output PTS"
                 );
-                self.out_pts_90k = pts;
+                self.out_pts_90k = anchor_target(self.av_sync_pacer.as_ref(), pts);
                 self.samples_since_anchor = 0;
             }
         }
@@ -1511,6 +1536,44 @@ fn rewrite_pmt_audio_stream_type(
         pkt[crc_offset + 2] = (crc >> 8) as u8;
         pkt[crc_offset + 3] = crc as u8;
     }
+}
+
+/// 80 ms in 90 kHz ticks. Mirrors
+/// `av_sync_mux::PCR_PREROLL_27MHZ / 300` and
+/// `ts_pts_rewriter::PCR_PREROLL_27MHZ` so the audio anchor sits the
+/// same distance ahead of the master-clock-derived PCR sequence as
+/// the passthrough rewriter.
+const PCR_PREROLL_90K: i64 = 7_200;
+
+/// Master-clock anchor target for the audio PTS, applied on first
+/// PES and on every >500 ms source-PTS discontinuity. Industry-
+/// standard muxer-mode behaviour:
+///
+/// - Without a pacer attached, falls through to source PTS
+///   (preserves the pre-master-clock behaviour).
+/// - With a pacer, anchors to `master_now/300 + PCR_PREROLL + lipsync`.
+///
+/// The earlier 10 s safety check was removed — it made the rewriter
+/// a no-op on the most common case (Wallclock master + encoder-relative
+/// source PTS) which defeats the purpose. The output PTS values use
+/// master clock for the *anchor* only; the per-PES advance still
+/// tracks the source rate via `samples_since_anchor`, so source-rate
+/// fidelity is preserved regardless of how master and source absolute
+/// values compare. The receiver sees a clean monotonic PTS sequence
+/// at source content rate, locally generated.
+fn anchor_target(
+    pacer: Option<&Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+    src_pts: u64,
+) -> u64 {
+    let Some(p) = pacer else {
+        return src_pts;
+    };
+    let master_now_90k = p.now_27mhz() / 300;
+    let lipsync = p.lipsync_offset_90k();
+    let candidate = (master_now_90k as i64)
+        .wrapping_add(PCR_PREROLL_90K)
+        .wrapping_add(lipsync) as u64;
+    candidate & 0x1_FFFF_FFFF
 }
 
 /// Extract the elementary-stream payload and PTS (90 kHz) from a complete
@@ -2348,6 +2411,150 @@ mod tests {
             "decode failure on an anchored PES must roll expected-next to \
              the current pts so successive failures don't accumulate a \
              stale projection and fire phantom forward-jump discontinuities"
+        );
+    }
+
+    // ─── Master-clock anchor (Phase B, step 2) ────────────────────
+
+    /// Without a pacer attached, `anchor_target` returns the source PTS
+    /// — preserving today's anchor-to-source behaviour for callers
+    /// that haven't opted into master-clock anchoring.
+    #[test]
+    fn anchor_target_with_no_pacer_returns_src_pts() {
+        let v = anchor_target(None, 1_234_567);
+        assert_eq!(v, 1_234_567);
+    }
+
+    /// With a pacer attached, anchor_target ALWAYS uses the master
+    /// clock candidate — the 10 s safety check was removed (it was
+    /// over-conservative; the per-sample advance via
+    /// `samples_since_anchor` preserves source rate regardless of how
+    /// master/source absolute values compare).
+    #[test]
+    fn anchor_target_uses_master_candidate_even_when_clocks_diverge() {
+        use crate::engine::av_sync_mux::AvSyncPacer;
+        use crate::engine::master_clock::{
+            MasterClockHandle, MasterClockKind, WallclockMaster,
+        };
+        let handle = MasterClockHandle::new(
+            std::sync::Arc::new(WallclockMaster::new()),
+            MasterClockKind::Wallclock,
+        );
+        let pacer = std::sync::Arc::new(AvSyncPacer::new(handle));
+        // ffmpeg-typical source PTS (~1.4 s) vs wallclock master at
+        // unix-epoch 90 kHz ticks — divergence is huge but the
+        // muxer-mode rewriter uses the master candidate regardless.
+        let v = anchor_target(Some(&pacer), 126_000);
+        assert_ne!(
+            v, 126_000,
+            "muxer mode: anchor must use master candidate, NOT fall \
+             back to src_pts (safety check intentionally removed)"
+        );
+    }
+
+    /// When the master-clock candidate is within 10 s of the source PTS
+    /// (PTP-disciplined or locked PLL scenario), the anchor target is
+    /// the master-derived candidate, not the source PTS.
+    #[test]
+    fn anchor_target_uses_master_candidate_when_clocks_agree() {
+        use crate::engine::av_sync_mux::AvSyncPacer;
+        use crate::engine::master_clock::{
+            MasterClockHandle, MasterClockKind, WallclockMaster,
+        };
+        let handle = MasterClockHandle::new(
+            std::sync::Arc::new(WallclockMaster::new()),
+            MasterClockKind::Wallclock,
+        );
+        let pacer = std::sync::Arc::new(AvSyncPacer::new(handle));
+        // Pick src_pts ≈ master_now so the safety check passes.
+        let src_pts = pacer.now_27mhz() / 300;
+        let v = anchor_target(Some(&pacer), src_pts);
+        // Candidate = master_now + PCR_PREROLL (7200) + lipsync (0).
+        // Allow a small tolerance for elapsed ticks between the two
+        // `now_27mhz()` reads.
+        let expected_min = src_pts.wrapping_add(7_000); // 7200 - some slack
+        let expected_max = src_pts.wrapping_add(20_000); // 7200 + plenty
+        assert!(
+            v >= expected_min && v <= expected_max,
+            "anchor target should track master+preroll; got {v}, \
+             expected in [{expected_min}, {expected_max}]"
+        );
+    }
+
+    /// First PES anchors via the master-clock candidate when a pacer
+    /// is set, the candidate is within 10 s of src_pts, AND there is
+    /// no decode failure that would short-circuit the path.
+    #[test]
+    fn first_pes_anchor_uses_master_clock_when_pacer_set_and_clocks_agree() {
+        use crate::engine::av_sync_mux::AvSyncPacer;
+        use crate::engine::master_clock::{
+            MasterClockHandle, MasterClockKind, WallclockMaster,
+        };
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let handle = MasterClockHandle::new(
+            std::sync::Arc::new(WallclockMaster::new()),
+            MasterClockKind::Wallclock,
+        );
+        let pacer = std::sync::Arc::new(AvSyncPacer::new(handle));
+        r.set_av_sync_pacer(pacer.clone());
+
+        // Set up enough state for consume_pes to walk past the decode
+        // path without doing real work — we only care about the anchor
+        // assignment in the `!self.out_pts_anchored` branch.
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F;
+
+        let src_pts = pacer.now_27mhz() / 300;
+        let pes = build_audio_pes(&[0u8; 32], src_pts);
+        let mut out = Vec::new();
+        let _ = r.consume_pes(&pes, &mut out);
+
+        // Decode-empty + anchored: out_pts_90k should hold the
+        // master-clock candidate, NOT src_pts. Tolerance accounts for
+        // wallclock advancing between reads.
+        assert!(
+            r.out_pts_anchored,
+            "first PES with valid PTS must anchor even when decode produces no frames"
+        );
+        let diff = r.out_pts_90k.wrapping_sub(src_pts) & 0x1_FFFF_FFFF;
+        assert!(
+            diff >= 7_000 && diff <= 20_000,
+            "anchor must be src_pts + PCR_PREROLL (~7200) + small elapsed, \
+             got diff={diff}"
+        );
+    }
+
+    /// Muxer-mode: even when source and master clocks diverge, the
+    /// anchor uses the master candidate. Per-sample advance via
+    /// `samples_since_anchor` preserves source rate independently.
+    #[test]
+    fn first_pes_anchor_uses_master_even_when_clocks_diverge() {
+        use crate::engine::av_sync_mux::AvSyncPacer;
+        use crate::engine::master_clock::{
+            MasterClockHandle, MasterClockKind, WallclockMaster,
+        };
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let handle = MasterClockHandle::new(
+            std::sync::Arc::new(WallclockMaster::new()),
+            MasterClockKind::Wallclock,
+        );
+        let pacer = std::sync::Arc::new(AvSyncPacer::new(handle));
+        r.set_av_sync_pacer(pacer);
+
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F;
+
+        // Tiny src_pts vs wallclock master at unix-epoch ticks.
+        let src_pts = 126_000u64;
+        let pes = build_audio_pes(&[0u8; 32], src_pts);
+        let mut out = Vec::new();
+        let _ = r.consume_pes(&pes, &mut out);
+
+        assert!(r.out_pts_anchored);
+        assert_ne!(
+            r.out_pts_90k, src_pts,
+            "muxer mode: anchor must come from master clock, NOT fall \
+             back to src_pts"
         );
     }
 }

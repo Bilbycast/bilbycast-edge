@@ -1245,8 +1245,22 @@ pub fn select_master_kind_for_input(
         return MasterClockKind::SourcePcrPll;
     }
     // Everything else (passthrough / transcoded / single-input flows
-    // without assembly): Passthrough. Output PCR comes from source
-    // bytes or source PTS — no PLL needed.
+    // without assembly): default to `Wallclock`.
+    //
+    // The previous default was `Passthrough` — a wallclock-equivalent
+    // backend with a different tag. The new explicit Wallclock default
+    // pairs with the encoder-style PTS regeneration work
+    // (`engine::ts_pts_rewriter` + `TsAudioReplacer::set_av_sync_pacer`):
+    // those callers anchor against `master.now_27mhz()` and need a
+    // monotonic, always-locked master. Wallclock satisfies both,
+    // without a PLL that fails to lock on loop-every-30s contribution
+    // sources (the failure mode that motivated this work — see
+    // `.claude-memory/monorepo/project_audio_transcode_stale_expected.md`).
+    //
+    // Operators who run on PTP-disciplined or clean-PCR sources and
+    // want source-PCR-PLL pacing opt-in explicitly via
+    // `master_clock.kind = "contribution"` (preferred, surfaces intent
+    // in telemetry) or the legacy `master_clock.kind = "source_pcr_pll"`.
     match input {
         InputConfig::Srt(_)
         | InputConfig::Rtp(_)
@@ -1255,8 +1269,10 @@ pub fn select_master_kind_for_input(
         | InputConfig::Rtmp(_)
         | InputConfig::Rtsp(_)
         | InputConfig::MediaPlayer(_)
-        | InputConfig::TestPattern(_) => MasterClockKind::Passthrough,
-        InputConfig::Replay(_) => MasterClockKind::Passthrough,
+        | InputConfig::TestPattern(_)
+        | InputConfig::Replay(_)
+        | InputConfig::RtpAudio(_)
+        | InputConfig::Bonded(_) => MasterClockKind::Wallclock,
         // ST 2110 + WebRTC handled above; arms here are for completeness
         // of the match (won't be reached).
         InputConfig::Webrtc(_) | InputConfig::Whep(_) => MasterClockKind::Wallclock,
@@ -1265,8 +1281,6 @@ pub fn select_master_kind_for_input(
         | InputConfig::St2110_30(_)
         | InputConfig::St2110_31(_)
         | InputConfig::St2110_40(_) => MasterClockKind::Ptp,
-        InputConfig::RtpAudio(_) => MasterClockKind::Passthrough,
-        InputConfig::Bonded(_) => MasterClockKind::Passthrough,
         // MXL — same selection rule as ST 2110: PTP-disciplined,
         // validation rejects `master_clock=wallclock` on MXL flows.
         InputConfig::MxlVideo(_)

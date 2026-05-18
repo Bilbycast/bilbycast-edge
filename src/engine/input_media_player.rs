@@ -106,6 +106,7 @@ pub fn spawn_media_player_input(
     events: EventSender,
     flow_id: String,
     input_id: String,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         run(
@@ -116,6 +117,7 @@ pub fn spawn_media_player_input(
             events,
             flow_id,
             input_id,
+            av_sync_pacer,
         )
         .await;
     })
@@ -162,6 +164,7 @@ async fn run(
     events: EventSender,
     flow_id: String,
     input_id: String,
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) {
     events.emit_flow(
         EventSeverity::Info,
@@ -211,15 +214,20 @@ async fn run(
     // file types (image / mp4 → TsMuxer) get pid_overrides handled by
     // the muxer; for TS-passthrough files, the post-process rewriter
     // re-PIDs them.
+    let passthrough_clock = config.passthrough_clock.unwrap_or(false);
     let mut post = crate::engine::input_post_process::InputPostProcess::from_config(
         &crate::engine::input_post_process::InputPostProcessConfig {
             program_number: config.program_number,
             pid_overrides: config.pid_overrides.as_ref(),
             pid_map: config.pid_map.as_ref(),
+            passthrough_clock,
+            av_sync_pacer: av_sync_pacer.as_ref(),
         },
     );
     if let Some(ref _p) = post {
-        tracing::info!("Media-player input '{input_id}': ingress post-process active");
+        tracing::info!(
+            "Media-player input '{input_id}': ingress post-process active (passthrough_clock={passthrough_clock})"
+        );
     }
 
     let mut seq_num: u16 = 0;

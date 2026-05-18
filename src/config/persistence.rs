@@ -264,6 +264,7 @@ mod tests {
                                 pid_overrides: None,
                                 interface_binding: None,
                                 ingress_smoothing_ms: None,
+                                passthrough_clock: None,
                 }),
             }],
             outputs: Vec::new(),

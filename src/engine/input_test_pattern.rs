@@ -136,12 +136,16 @@ async fn run_inner(
         config.audio_encode.as_ref(),
         config.video_encode.as_ref(),
     );
-    // Synthetic-TS — TsMuxer handles pid_overrides.
+    // Synthetic-TS — TsMuxer handles pid_overrides. No `passthrough_clock`
+    // on TestPatternInputConfig: the pattern generator already controls
+    // every PTS it emits, so there's no source clock to re-anchor against.
     let mut post = crate::engine::input_post_process::InputPostProcess::from_config(
         &crate::engine::input_post_process::InputPostProcessConfig {
             program_number: config.program_number,
             pid_overrides: None,
             pid_map: config.pid_map.as_ref(),
+            passthrough_clock: false,
+            av_sync_pacer: None,
         },
     );
     if let Some(ref _p) = post {

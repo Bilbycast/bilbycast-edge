@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Composite ingress post-processor: program filter → role-keyed PID
-//! overrides → mechanical PID remap.
+//! overrides → mechanical PID remap → PES PTS/DTS regeneration.
 //!
-//! Wraps the three input-side TS rewriting stages so each TS-carrying
+//! Wraps the four input-side TS rewriting stages so each TS-carrying
 //! input task can pull in symmetric `program_number` / `pid_overrides` /
-//! `pid_map` semantics with one helper. The chain ordering mirrors the
-//! output-side equivalent in the per-output forward loops:
+//! `pid_map` / `passthrough_clock` semantics with one helper. The chain
+//! ordering mirrors the output-side equivalent in the per-output forward
+//! loops:
 //!
 //! 1. **`TsProgramFilter`** narrows MPTS → SPTS at ingress when
 //!    `program_number` is set. Drops every program except the named one
@@ -20,26 +21,48 @@
 //!    `pid_overrides` entries for programs other than 1 work the same
 //!    way they do for passthrough.
 //! 3. **`TsPidRemapper`** mechanical `source_pid → target_pid` lookup.
-//!    Runs last so the operator can layer "rewrite roles, then bulk-remap
-//!    leftover PIDs".
+//!    Runs after the role-keyed override so the operator can layer
+//!    "rewrite roles, then bulk-remap leftover PIDs".
+//! 4. **`TsPtsRewriter`** byte-level PES PTS/DTS regeneration driven by
+//!    the per-flow master clock. Runs last so the rewriter learns the
+//!    *final* PID layout (post-rename) directly from the rewritten PMT.
+//!    Gated by `passthrough_clock: true` + an attached `AvSyncPacer`; with
+//!    either unset this stage is `None` and the byte stream passes
+//!    through with zero cost. See [`super::ts_pts_rewriter`].
 //!
 //! The processor is byte-stream oriented: callers feed 188-byte-aligned
-//! TS bytes, get rewritten 188-byte-aligned TS bytes back. Two scratch
-//! buffers are reused across calls (no steady-state allocations).
+//! TS bytes, get rewritten 188-byte-aligned TS bytes back. One scratch
+//! buffer per active stage so the borrow checker stays happy with
+//! simultaneous immutable / mutable references to different stages'
+//! outputs.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::config::models::TsPidOverridesMap;
 
+use super::av_sync_mux::AvSyncPacer;
 use super::ts_pid_overrides_rewriter::TsPidOverridesRewriter;
 use super::ts_pid_remapper::TsPidRemapper;
 use super::ts_program_filter::TsProgramFilter;
+use super::ts_pts_rewriter::TsPtsRewriter;
 
 /// Construction options assembled from one input config.
 pub struct InputPostProcessConfig<'a> {
     pub program_number: Option<u16>,
     pub pid_overrides: Option<&'a TsPidOverridesMap>,
     pub pid_map: Option<&'a BTreeMap<u16, u16>>,
+    /// Per-input opt-OUT of muxer-mode PCR + PES PTS regeneration.
+    /// Default `false` → muxer mode active when an `av_sync_pacer` is
+    /// attached. Set to `true` to forward source PCR/PTS bytes
+    /// unchanged (relay / transparent-forwarder mode — preserves
+    /// source bit patterns at the cost of inheriting source clock
+    /// jitter and discontinuities).
+    pub passthrough_clock: bool,
+    /// Per-flow A/V sync pacer (master-clock handle). Required for
+    /// the muxer-mode rewriter; `None` disables it regardless of
+    /// `passthrough_clock`.
+    pub av_sync_pacer: Option<&'a Arc<AvSyncPacer>>,
 }
 
 /// Composite TS post-processor for inputs.
@@ -50,14 +73,16 @@ pub struct InputPostProcessConfig<'a> {
 ///
 /// One scratch buffer per stage so the borrow checker is happy with
 /// simultaneous immutable / mutable references to different stages'
-/// outputs. ~96 KB total when all three stages are active.
+/// outputs. ~128 KB total when all four stages are active.
 pub struct InputPostProcess {
     program_filter: Option<TsProgramFilter>,
     pid_overrides_rewriter: Option<TsPidOverridesRewriter>,
     pid_remapper: Option<TsPidRemapper>,
+    pts_rewriter: Option<TsPtsRewriter>,
     scratch_filter: Vec<u8>,
     scratch_overrides: Vec<u8>,
     scratch_remap: Vec<u8>,
+    scratch_pts: Vec<u8>,
 }
 
 impl InputPostProcess {
@@ -76,9 +101,20 @@ impl InputPostProcess {
             if r.is_active() { Some(r) } else { None }
         });
 
+        // Muxer-mode rewriter: ON when an A/V sync pacer is available
+        // AND the operator hasn't opted out via passthrough_clock.
+        // Industry-standard default (Sencore RMX / Cobalt 9970-MX /
+        // Cisco D9036 mux mode). See [`super::ts_pts_rewriter`].
+        let pts_rewriter = if cfg.passthrough_clock {
+            None
+        } else {
+            cfg.av_sync_pacer.map(|p| TsPtsRewriter::new(p.clone()))
+        };
+
         if program_filter.is_none()
             && pid_overrides_rewriter.is_none()
             && pid_remapper.is_none()
+            && pts_rewriter.is_none()
         {
             return None;
         }
@@ -87,9 +123,11 @@ impl InputPostProcess {
             program_filter,
             pid_overrides_rewriter,
             pid_remapper,
+            pts_rewriter,
             scratch_filter: Vec::with_capacity(32 * 1024),
             scratch_overrides: Vec::with_capacity(32 * 1024),
             scratch_remap: Vec::with_capacity(32 * 1024),
+            scratch_pts: Vec::with_capacity(32 * 1024),
         })
     }
 
@@ -105,13 +143,16 @@ impl InputPostProcess {
             program_filter,
             pid_overrides_rewriter,
             pid_remapper,
+            pts_rewriter,
             scratch_filter,
             scratch_overrides,
             scratch_remap,
+            scratch_pts,
         } = self;
         scratch_filter.clear();
         scratch_overrides.clear();
         scratch_remap.clear();
+        scratch_pts.clear();
 
         let after_filter: &[u8] = if let Some(f) = program_filter.as_mut() {
             f.filter_into(ts_in, scratch_filter);
@@ -127,11 +168,18 @@ impl InputPostProcess {
             after_filter
         };
 
-        if let Some(rm) = pid_remapper.as_mut() {
+        let after_remap: &[u8] = if let Some(rm) = pid_remapper.as_mut() {
             rm.process(after_overrides, scratch_remap);
             scratch_remap
         } else {
             after_overrides
+        };
+
+        if let Some(rw) = pts_rewriter.as_mut() {
+            rw.process(after_remap, scratch_pts);
+            scratch_pts
+        } else {
+            after_remap
         }
     }
 }
@@ -275,6 +323,8 @@ mod tests {
             program_number: None,
             pid_overrides: Some(&overrides),
             pid_map: None,
+            passthrough_clock: false,
+            av_sync_pacer: None,
         })
         .expect("rewriter must be built when pid_overrides is non-empty");
 

@@ -131,18 +131,30 @@ impl InputTranscoder {
         }))
     }
 
-    /// Attach the per-flow A/V sync pacer onto the inner video replacer
-    /// (no-op when the transcoder has no video stage). Master-clocked
-    /// PCR generation is the same Phase-4 path as the output-side
-    /// replacers — once attached, ingress-emitted bytes carry the
-    /// flow's master-clock PCR sequence instead of `pts × 300 −
-    /// preroll`. Outputs that consume the broadcast channel (HLS,
-    /// CMAF, RTMP, WebRTC, plus passthrough TS-native outputs) inherit
-    /// the master-clocked PCR cadence.
+    /// Attach the per-flow A/V sync pacer onto the inner audio and
+    /// video replacers (no-op for whichever stage is absent).
+    /// Master-clocked PCR + PTS generation is the same path as the
+    /// output-side replacers — once attached, ingress-emitted bytes
+    /// carry the flow's master-clock PCR + PES PTS sequence instead of
+    /// the source-derived values. Outputs that consume the broadcast
+    /// channel (HLS, CMAF, RTMP, WebRTC, plus passthrough TS-native
+    /// outputs) inherit the master-clocked cadence.
+    ///
+    /// The audio wire is symmetric with the video wire: the audio
+    /// replacer's first-PES anchor + every discontinuity re-anchor
+    /// targets `master.now_27mhz()/300 + PCR_PREROLL + lipsync`.
+    /// Industry-standard muxer-mode behaviour — uses master clock for
+    /// the anchor only; per-sample advance still tracks source rate
+    /// via `samples_since_anchor`, so source-rate fidelity is
+    /// preserved regardless of how master and source absolute values
+    /// compare.
     pub fn set_av_sync_pacer(
         &mut self,
         pacer: Arc<crate::engine::av_sync_mux::AvSyncPacer>,
     ) {
+        if let Some(a) = self.audio.as_mut() {
+            a.set_av_sync_pacer(pacer.clone());
+        }
         if let Some(v) = self.video.as_mut() {
             v.set_av_sync_pacer(pacer);
         }
@@ -685,6 +697,8 @@ mod tests {
             program_number: None,
             pid_overrides: Some(&overrides),
             pid_map: None,
+            passthrough_clock: false,
+            av_sync_pacer: None,
         })
         .expect("rewriter active");
 

@@ -121,15 +121,20 @@ async fn run(
         config.video_encode.as_ref(),
     );
     // Replay reads stored TS files (possibly MPTS) — full post-process chain.
+    let passthrough_clock = config.passthrough_clock.unwrap_or(false);
     let mut post = crate::engine::input_post_process::InputPostProcess::from_config(
         &crate::engine::input_post_process::InputPostProcessConfig {
             program_number: config.program_number,
             pid_overrides: config.pid_overrides.as_ref(),
             pid_map: config.pid_map.as_ref(),
+            passthrough_clock,
+            av_sync_pacer: av_sync_pacer.as_ref(),
         },
     );
     if let Some(ref _p) = post {
-        tracing::info!("Replay input '{input_id}': ingress post-process active");
+        tracing::info!(
+            "Replay input '{input_id}': ingress post-process active (passthrough_clock={passthrough_clock})"
+        );
     }
     if playing {
         emit_play_started(&events, &flow_id, &input_id, &reader);

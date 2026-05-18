@@ -284,17 +284,21 @@ pub fn spawn_srt_input(
             config.audio_encode.as_ref(),
             config.video_encode.as_ref(),
         );
+        let passthrough_clock = config.passthrough_clock.unwrap_or(false);
         let mut post = InputPostProcess::from_config(&InputPostProcessConfig {
             program_number: config.program_number,
             pid_overrides: config.pid_overrides.as_ref(),
             pid_map: config.pid_map.as_ref(),
+            passthrough_clock,
+            av_sync_pacer: av_sync_pacer.as_ref(),
         });
         if let Some(ref _p) = post {
             tracing::info!(
-                "SRT input '{input_id}': ingress post-process active (program_filter={} pid_overrides={} pid_map={})",
+                "SRT input '{input_id}': ingress post-process active (program_filter={} pid_overrides={} pid_map={} passthrough_clock={})",
                 config.program_number.is_some(),
                 config.pid_overrides.is_some(),
                 config.pid_map.is_some(),
+                passthrough_clock,
             );
         }
 

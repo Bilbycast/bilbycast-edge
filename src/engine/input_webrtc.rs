@@ -82,11 +82,15 @@ pub fn spawn_whip_input(
             config.video_encode.as_ref(),
         );
         // Synthetic-TS input — TsMuxer handles pid_overrides; the post-
-        // process only does program_filter (no-op) + pid_map.
+        // process only does program_filter (no-op) + pid_map. No
+        // `passthrough_clock` on WebrtcInputConfig — TsMuxer already
+        // controls PTS.
         let mut post = InputPostProcess::from_config(&InputPostProcessConfig {
             program_number: config.program_number,
             pid_overrides: None,
             pid_map: config.pid_map.as_ref(),
+            passthrough_clock: false,
+            av_sync_pacer: None,
         });
         if let Some(ref _p) = post {
             tracing::info!("WHIP input: ingress post-process active");
@@ -344,6 +348,8 @@ pub fn spawn_whep_input(
             program_number: config.program_number,
             pid_overrides: None,
             pid_map: config.pid_map.as_ref(),
+            passthrough_clock: false,
+            av_sync_pacer: None,
         });
         if let Some(ref _p) = post {
             tracing::info!("WHEP input: ingress post-process active");

@@ -685,6 +685,21 @@ pub enum MasterClockKindConfig {
     /// input is rejected by config validation.
     SenderTimestamp,
     Wallclock,
+    /// Contribution-mode PLL: same runtime backend as `source_pcr_pll`
+    /// (PI-controller PLL recovering source's 27 MHz from incoming PCR
+    /// samples) but flags the operator's *intent* — "this is a clean
+    /// contribution feed and I want the output PCR to track the source
+    /// clock". The auto-policy maps SRT/RTP/UDP/RIST/RTMP/RTSP to
+    /// `wallclock` by default (always-locked, monotonic, no
+    /// discontinuity sensitivity) because most contribution sources
+    /// have transient PCR discontinuities that prevent the PLL from
+    /// locking. Operators who run on PTP-disciplined or clean-PCR
+    /// sources opt into this mode to get cross-edge clock coherence.
+    /// Telemetry preserves the `Contribution` label on
+    /// `MasterClockTelemetry.configured_kind` so the manager UI can
+    /// render "PLL (contribution)" distinct from a legacy
+    /// `source_pcr_pll` explicit pin.
+    Contribution,
 }
 
 /// Per-flow continuous-recording attributes. When attached to a
@@ -1426,6 +1441,10 @@ pub struct ReplayInputConfig {
         with = "crate::config::pid_overrides_serde"
     )]
     pub pid_overrides: Option<TsPidOverridesMap>,
+    /// Muxer-mode PCR + PES PTS regeneration opt-out. See
+    /// [`RtpInputConfig::passthrough_clock`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough_clock: Option<bool>,
 }
 
 /// Configuration for an in-process synthetic test-pattern input.
@@ -1658,6 +1677,10 @@ pub struct MediaPlayerInputConfig {
         with = "crate::config::pid_overrides_serde"
     )]
     pub pid_overrides: Option<TsPidOverridesMap>,
+    /// Muxer-mode PCR + PES PTS regeneration opt-out. See
+    /// [`RtpInputConfig::passthrough_clock`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough_clock: Option<bool>,
 }
 
 fn default_image_fps() -> u8 { 5 }
@@ -1869,6 +1892,16 @@ pub struct RtpInputConfig {
     /// See [`docs/configuration-guide.md`](configuration-guide.md).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress_smoothing_ms: Option<u16>,
+    /// Opt OUT of muxer-mode PCR + PES PTS regeneration. Default
+    /// `false` (muxer mode ON) — bilbycast-edge regenerates PCR and
+    /// PES PTS/DTS values from the per-flow master clock per the
+    /// industry-standard remux model (Sencore RMX / Cobalt 9970-MX /
+    /// Cisco D9036 mux mode). Set `true` to emit source PCR/PTS
+    /// bytes unchanged (relay / transparent-forwarder mode — inherits
+    /// source clock jitter and discontinuities at the receiver). See
+    /// [`crate::engine::ts_pts_rewriter`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough_clock: Option<bool>,
 }
 
 /// Raw UDP input — receives datagrams without requiring RTP headers.
@@ -1937,6 +1970,10 @@ pub struct UdpInputConfig {
     /// Ingress smoothing buffer (0..=1000 ms). See [`RtpInputConfig::ingress_smoothing_ms`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress_smoothing_ms: Option<u16>,
+    /// Muxer-mode PCR + PES PTS regeneration opt-out. See
+    /// [`RtpInputConfig::passthrough_clock`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough_clock: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2131,6 +2168,10 @@ pub struct SrtInputConfig {
     /// [`RtpInputConfig::ingress_smoothing_ms`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress_smoothing_ms: Option<u16>,
+    /// Muxer-mode PCR + PES PTS regeneration opt-out. See
+    /// [`RtpInputConfig::passthrough_clock`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough_clock: Option<bool>,
 }
 
 /// RTMP input configuration — runs an RTMP server that accepts publish connections.
@@ -2214,6 +2255,10 @@ pub struct RtmpInputConfig {
     /// [`RtpInputConfig::ingress_smoothing_ms`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress_smoothing_ms: Option<u16>,
+    /// Muxer-mode PCR + PES PTS regeneration opt-out. See
+    /// [`RtpInputConfig::passthrough_clock`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough_clock: Option<bool>,
 }
 
 fn default_rtmp_app() -> String {
@@ -2305,6 +2350,10 @@ pub struct RtspInputConfig {
     /// [`RtpInputConfig::ingress_smoothing_ms`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress_smoothing_ms: Option<u16>,
+    /// Muxer-mode PCR + PES PTS regeneration opt-out. See
+    /// [`RtpInputConfig::passthrough_clock`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough_clock: Option<bool>,
 }
 
 fn default_rtsp_timeout() -> u64 {
@@ -3469,6 +3518,10 @@ pub struct RistInputConfig {
     /// strict deferred pending librist plumbing). See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
+    /// Muxer-mode PCR + PES PTS regeneration opt-out. See
+    /// [`RtpInputConfig::passthrough_clock`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough_clock: Option<bool>,
 }
 
 /// RIST Simple Profile (TR-06-1:2020) output. Binds a local dual-port UDP
@@ -5887,6 +5940,7 @@ mod tests {
                                 pid_overrides: None,
                                 interface_binding: None,
                                 ingress_smoothing_ms: None,
+                                passthrough_clock: None,
                 }),
             }],
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
@@ -5959,6 +6013,7 @@ mod tests {
                                 pid_overrides: None,
                                 interface_binding: None,
                                 ingress_smoothing_ms: None,
+                                passthrough_clock: None,
                 }),
             }],
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {

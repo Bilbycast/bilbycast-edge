@@ -133,16 +133,20 @@ pub fn spawn_rtmp_input(
         // rewriter doesn't double-rewrite. program_filter is a no-op
         // (TsMuxer always emits program 1) but harmless; pid_map can
         // still mechanically remap on top.
+        let passthrough_clock = config.passthrough_clock.unwrap_or(false);
         let mut post = InputPostProcess::from_config(&InputPostProcessConfig {
             program_number: config.program_number,
             pid_overrides: None,
             pid_map: config.pid_map.as_ref(),
+            passthrough_clock,
+            av_sync_pacer: av_sync_pacer.as_ref(),
         });
         if let Some(ref _p) = post {
             tracing::info!(
-                "RTMP input: ingress post-process active (program_filter={} pid_map={})",
+                "RTMP input: ingress post-process active (program_filter={} pid_map={} passthrough_clock={})",
                 config.program_number.is_some(),
                 config.pid_map.is_some(),
+                passthrough_clock,
             );
         }
         // Per-input ingress smoothing publisher.

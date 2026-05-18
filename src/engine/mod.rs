@@ -131,6 +131,10 @@ pub mod pes_splice;
 pub mod ts_audio_replace;
 pub mod ts_null_padder;
 pub mod ts_video_replace;
+/// Encoder-style PES PTS/DTS rewriter — byte-level, no decode. Gated
+/// per-input by [`crate::config::models::RtpInputConfig::passthrough_clock`].
+/// Plugs in as the fourth optional stage of [`input_post_process`].
+pub mod ts_pts_rewriter;
 /// Per-output wire emission engine. Dedicated `std::thread` (Linux:
 /// `SCHED_FIFO`) that paces TS datagrams onto the wire via PCR-anchored
 /// `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, ...)`. Decouples wire
