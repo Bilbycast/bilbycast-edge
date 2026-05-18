@@ -160,6 +160,21 @@ impl InputTranscoder {
         }
     }
 
+    /// Wire the **per-input** PCR forward-jump signal channel onto
+    /// the audio replacer (the video replacer doesn't silence-pad —
+    /// video PES values follow the source PCR jump). The
+    /// `TsPtsRewriter` in this SAME input's pipeline must share the
+    /// same `Arc<AtomicI64>` — typically constructed alongside this
+    /// transcoder and passed to both via the input's spawn function.
+    pub fn set_pcr_jump_signal(
+        &mut self,
+        signal: Arc<std::sync::atomic::AtomicI64>,
+    ) {
+        if let Some(a) = self.audio.as_mut() {
+            a.set_pcr_jump_signal(signal);
+        }
+    }
+
     /// Pass one chunk of raw 188-byte-aligned TS through the audio stage, then
     /// the video stage. Returns the transformed output as a borrowed slice of
     /// the internal scratch buffer. The slice is valid until the next call to
@@ -699,6 +714,7 @@ mod tests {
             pid_map: None,
             passthrough_clock: false,
             av_sync_pacer: None,
+            pcr_jump_signal: None,
         })
         .expect("rewriter active");
 

@@ -91,6 +91,7 @@ pub fn spawn_whip_input(
             pid_map: config.pid_map.as_ref(),
             passthrough_clock: false,
             av_sync_pacer: None,
+            pcr_jump_signal: None,
         });
         if let Some(ref _p) = post {
             tracing::info!("WHIP input: ingress post-process active");
@@ -350,6 +351,7 @@ pub fn spawn_whep_input(
             pid_map: config.pid_map.as_ref(),
             passthrough_clock: false,
             av_sync_pacer: None,
+            pcr_jump_signal: None,
         });
         if let Some(ref _p) = post {
             tracing::info!("WHEP input: ingress post-process active");

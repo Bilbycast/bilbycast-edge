@@ -129,6 +129,7 @@ async fn run(
             pid_map: config.pid_map.as_ref(),
             passthrough_clock,
             av_sync_pacer: av_sync_pacer.as_ref(),
+            pcr_jump_signal: None,
         },
     );
     if let Some(ref _p) = post {

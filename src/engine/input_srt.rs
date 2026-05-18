@@ -277,6 +277,18 @@ pub fn spawn_srt_input(
         if let (Some(t), Some(p)) = (transcoder.as_mut(), av_sync_pacer.as_ref()) {
             t.set_av_sync_pacer(p.clone());
         }
+        // **Per-input** PCR forward-jump signal channel. Built once
+        // here in the input pipeline and shared with the input's
+        // audio replacer (via `InputTranscoder::set_pcr_jump_signal`)
+        // and its `TsPtsRewriter` (via `InputPostProcessConfig.
+        // pcr_jump_signal`). Each input owns its own counter so
+        // cross-input loop wraps can't pollute the active input's
+        // audio (the bug that motivated this design).
+        let pcr_jump_signal: Arc<std::sync::atomic::AtomicI64> =
+            Arc::new(std::sync::atomic::AtomicI64::new(0));
+        if let Some(t) = transcoder.as_mut() {
+            t.set_pcr_jump_signal(pcr_jump_signal.clone());
+        }
         super::input_transcode::register_ingress_stats(
             stats.as_ref(),
             &input_id,
@@ -291,6 +303,7 @@ pub fn spawn_srt_input(
             pid_map: config.pid_map.as_ref(),
             passthrough_clock,
             av_sync_pacer: av_sync_pacer.as_ref(),
+            pcr_jump_signal: Some(&pcr_jump_signal),
         });
         if let Some(ref _p) = post {
             tracing::info!(

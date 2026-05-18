@@ -216,6 +216,25 @@ pub struct TsAudioReplacer {
     /// and after a reset.
     expected_next_src_pts_90k: Option<u64>,
 
+    /// **Per-input** signal from the `TsPtsRewriter` on this same
+    /// input's pipeline. The rewriter `fetch_add`s a forward PCR jump
+    /// magnitude (27 MHz ticks) on every loop wrap; this replacer
+    /// reads + zeros it on each PES and applies a coordinated
+    /// PTS-leap + zero-PCM silence-pad so output audio PTS catches
+    /// up with the (jumped) PCR. Per-input (vs per-flow) by design:
+    /// passive inputs run their own pipelines with their own signal
+    /// counters; nothing is shared across inputs so cross-input loop
+    /// wraps can't pollute the active input's silence pad. `None`
+    /// disables the mechanism (audio passthrough or test setup).
+    pcr_jump_signal: Option<Arc<std::sync::atomic::AtomicI64>>,
+
+    /// Pending silence-pad duration (27 MHz ticks) drained from
+    /// `pcr_jump_signal` on each `consume_pes` and applied inside the
+    /// per-decoded-frame loop once `codecs_ready` is true. Survives
+    /// the first-PES + decode-failure window where `codecs_ready` is
+    /// still false. Capped at 5 s per consume in the apply logic.
+    pending_silence_27mhz: i64,
+
     /// Lazily constructed AAC-LC / ADTS decoder. Opened on the first PES
     /// flush once we know the source is AAC.
     #[cfg(feature = "fdk-aac")]
@@ -339,6 +358,8 @@ impl TsAudioReplacer {
             out_pts_anchored: false,
             samples_since_anchor: 0,
             expected_next_src_pts_90k: None,
+            pcr_jump_signal: None,
+            pending_silence_27mhz: 0,
             #[cfg(feature = "fdk-aac")]
             aac_decoder: None,
             #[cfg(feature = "media-codecs")]
@@ -371,6 +392,23 @@ impl TsAudioReplacer {
         pacer: Arc<crate::engine::av_sync_mux::AvSyncPacer>,
     ) {
         self.av_sync_pacer = Some(pacer);
+    }
+
+    /// Attach a per-input PCR forward-jump signal `Arc<AtomicI64>`,
+    /// shared with the `TsPtsRewriter` on this SAME input's
+    /// pipeline. The rewriter writes the magnitude of every forward
+    /// PCR jump > 500 ms; this replacer reads + zeros it on each PES
+    /// and applies a coordinated PTS-leap + zero-PCM silence-pad so
+    /// output audio PTS catches up with the new PCR. Per-input by
+    /// design (vs per-flow) so passive inputs' loop wraps cannot
+    /// pollute the active input's audio. See
+    /// [`TsAudioReplacer::pcr_jump_signal`] for the full rationale.
+    /// Idempotent; calling twice overwrites.
+    pub fn set_pcr_jump_signal(
+        &mut self,
+        signal: Arc<std::sync::atomic::AtomicI64>,
+    ) {
+        self.pcr_jump_signal = Some(signal);
     }
 
     /// Shared handle to the one-shot "input was switched" request flag.
@@ -766,6 +804,15 @@ impl TsAudioReplacer {
         self.accumulator.clear();
         self.samples_since_anchor = 0;
         self.expected_next_src_pts_90k = None;
+        // Drop any unapplied silence-pad and drain the shared signal
+        // counter — on input switch / codec change the audio path
+        // starts fresh and stale loop-wrap signals are no longer
+        // meaningful. `swap(0)` is atomic so we don't race with the
+        // rewriter on the same input.
+        self.pending_silence_27mhz = 0;
+        if let Some(s) = self.pcr_jump_signal.as_ref() {
+            s.swap(0, std::sync::atomic::Ordering::AcqRel);
+        }
         self.resolved_channels = 0;
         self.resolved_sample_rate = 0;
         self.codecs_ready = false;
@@ -813,6 +860,22 @@ impl TsAudioReplacer {
             None => return Err(()),
         };
 
+        // Drain the per-input PCR forward-jump signal from the paired
+        // `TsPtsRewriter`. `swap(0)` is atomic so this is race-free
+        // even though the rewriter writes from a different task on
+        // the same input pipeline. The drained delta accumulates onto
+        // `pending_silence_27mhz` and is applied below inside the
+        // per-decoded-frame loop once `codecs_ready` is true — that
+        // way the silence-pad survives the first-PES + decode-failure
+        // window where the encoder isn't initialised yet.
+        if let Some(s) = self.pcr_jump_signal.as_ref() {
+            let drained = s.swap(0, std::sync::atomic::Ordering::AcqRel);
+            if drained > 0 {
+                self.pending_silence_27mhz =
+                    self.pending_silence_27mhz.saturating_add(drained);
+            }
+        }
+
         // Anchor establishment + discontinuity guard. On the first PES
         // we anchor the output PTS to the source's intrinsic PTS so the
         // output stream tracks the source clock from sample 0. After
@@ -834,13 +897,53 @@ impl TsAudioReplacer {
             // as bounded — anything outside ±500 ms re-anchors.
             let abs_delta = delta.unsigned_abs();
             if abs_delta > DISCONTINUITY_THRESHOLD_90K {
-                tracing::info!(
-                    "ts_audio_replace: source PTS discontinuity \
-                     (expected={expected}, got={pts}, delta_90k={delta}); \
-                     re-anchoring audio output PTS"
-                );
-                self.out_pts_90k = anchor_target(self.av_sync_pacer.as_ref(), pts);
-                self.samples_since_anchor = 0;
+                // **Monotonicity guard.** Compute where the output
+                // is currently sitting (out_pts_90k advanced by
+                // samples_since_anchor). If the new anchor candidate
+                // (= `pts` per 0.81) would push output PTS *backward*,
+                // do NOT re-anchor — leave the existing trajectory
+                // alone so output PTS stays monotonically forward.
+                // This is the ffmpeg-loop case: the mpegts muxer
+                // resets audio PTS at every `-stream_loop` wrap to a
+                // value smaller than the last emitted output PTS. The
+                // pre-guard behaviour was to slam out_pts_90k backward
+                // and start over — receivers saw audio rewind ~3 s
+                // per loop and dropped frames. Genuine forward jumps
+                // (real source restart, splice insertion) still
+                // re-anchor.
+                let current_effective_out_pts_90k = if self.resolved_sample_rate > 0 {
+                    self.out_pts_90k.wrapping_add(
+                        self.samples_since_anchor.saturating_mul(90_000)
+                            / self.resolved_sample_rate as u64,
+                    )
+                } else {
+                    self.out_pts_90k
+                };
+                let candidate = anchor_target(self.av_sync_pacer.as_ref(), pts);
+                let forward_delta =
+                    (candidate as i64).wrapping_sub(current_effective_out_pts_90k as i64);
+                if forward_delta < 0 {
+                    tracing::info!(
+                        candidate,
+                        current_effective_out_pts_90k,
+                        backward_delta_90k = forward_delta,
+                        delta_90k = delta,
+                        "ts_audio_replace: source PTS discontinuity would push output backward; \
+                         suppressing re-anchor to preserve output PTS monotonicity"
+                    );
+                    // Update expected pointer so subsequent same-
+                    // direction PESes don't keep re-triggering the
+                    // branch — DON'T touch out_pts_90k / samples.
+                    self.expected_next_src_pts_90k = Some(pts);
+                } else {
+                    tracing::info!(
+                        "ts_audio_replace: source PTS discontinuity \
+                         (expected={expected}, got={pts}, delta_90k={delta}); \
+                         re-anchoring audio output PTS"
+                    );
+                    self.out_pts_90k = candidate;
+                    self.samples_since_anchor = 0;
+                }
             }
         }
 
@@ -1025,6 +1128,78 @@ impl TsAudioReplacer {
                     } else {
                         d.planar
                     };
+                // Silence-pad in lockstep with the next source samples
+                // so the gap appears at the right PTS in the output
+                // stream. `pending_silence_27mhz` was drained from
+                // the per-input `pcr_jump_signal` at the top of
+                // consume_pes — this is the apply point now that
+                // `codecs_ready` is true and `resolved_sample_rate` is
+                // known. Two coordinated effects:
+                //
+                // 1. **PTS leap**: advance `out_pts_90k` by
+                //    `jump_90k − frame_step_90k`. The frame_step
+                //    subtraction compensates for the natural +1
+                //    encoder-frame-step that `drain_encoder` would
+                //    otherwise add to the very next PES's PTS
+                //    (over-correction = ~24 ms at MP2/48 kHz).
+                //    Encoder `frame_size()` queried at runtime so the
+                //    compensation is codec-correct.
+                //
+                // 2. **Silence content**: extend the PCM accumulator
+                //    with zero samples covering the jump duration so
+                //    the encoder produces real MP2 silence frames
+                //    occupying the new PTS range. Without (2) the
+                //    encoder would resume with pre-jump source
+                //    content stamped with post-jump PTS — receiver
+                //    would hear stale content in the new time slot.
+                //
+                // Cap at 5 s per consume to bound worst-case
+                // pathological inputs.
+                if self.codecs_ready
+                    && self.pending_silence_27mhz > 0
+                    && self.resolved_sample_rate > 0
+                {
+                    let capped_27mhz = self
+                        .pending_silence_27mhz
+                        .min(5 * 27_000_000) as u64;
+                    let sr = self.resolved_sample_rate as u64;
+                    let silence_samples = capped_27mhz
+                        .saturating_mul(sr)
+                        / 27_000_000;
+                    if silence_samples > 0 {
+                        let silence_ms = capped_27mhz / 27_000;
+                        let frame_step_90k = if let Some(enc) =
+                            self.av_encoder.as_ref()
+                        {
+                            (enc.frame_size() as u64)
+                                .saturating_mul(90_000)
+                                / sr.max(1)
+                        } else {
+                            // MP2 default: 1152 samples / sr.
+                            1152 * 90_000 / sr.max(1)
+                        };
+                        let jump_90k = (capped_27mhz / 300)
+                            .saturating_sub(frame_step_90k);
+                        tracing::info!(
+                            silence_samples,
+                            silence_ms,
+                            jump_90k_adjusted = jump_90k,
+                            frame_step_90k,
+                            sample_rate = self.resolved_sample_rate,
+                            "ts_audio_replace: applying silence-pad for PCR forward jump \
+                             (per-input signal; advancing out_pts_90k + adding silence content)"
+                        );
+                        self.out_pts_90k =
+                            self.out_pts_90k.wrapping_add(jump_90k);
+                        for ch in self.accumulator.iter_mut() {
+                            ch.extend(
+                                std::iter::repeat(0.0f32)
+                                    .take(silence_samples as usize),
+                            );
+                        }
+                    }
+                    self.pending_silence_27mhz = 0;
+                }
                 for ch in 0..self.resolved_channels as usize {
                     if ch < shuffled_planar.len() {
                         self.accumulator[ch]
@@ -2465,6 +2640,100 @@ mod tests {
             "out_pts_90k must equal src_pts so downstream rewriter \
              (ts_pts_rewriter / assembler rewriter) sees source-relative \
              PTS and is the single owner of master-clock anchoring"
+        );
+    }
+
+    // ─── Per-input PCR forward-jump signal (silence-pad redesign) ──
+
+    /// **The bug catcher.** Two replacers configured with INDEPENDENT
+    /// per-input signal Arcs must NOT see each other's PCR jumps.
+    /// This is the architectural change vs the per-flow shared
+    /// pacer signal that caused the "constant silence" regression in
+    /// the first 0.84.0 attempt — every passive input's loop-wrap
+    /// signal accumulated into the shared counter, the active
+    /// replacer padded silence for the sum, audio drowned.
+    #[test]
+    fn pcr_jump_signal_is_per_input_not_shared() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let sig_a = std::sync::Arc::new(AtomicI64::new(0));
+        let sig_b = std::sync::Arc::new(AtomicI64::new(0));
+
+        let mut r_a = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        r_a.set_pcr_jump_signal(sig_a.clone());
+        r_a.audio_pid = Some(0x0101);
+        r_a.source_stream_type = 0x0F;
+
+        let mut r_b = TsAudioReplacer::new(&enc("mp2"), None).unwrap();
+        r_b.set_pcr_jump_signal(sig_b.clone());
+        r_b.audio_pid = Some(0x0102);
+        r_b.source_stream_type = 0x0F;
+
+        // Input A's rewriter signals 1.333 s forward jump on input A's
+        // counter ONLY. Input B's counter stays at zero.
+        sig_a.fetch_add(35_991_000, Ordering::Release);
+
+        // Replacer A consumes its signal → pending_silence non-zero.
+        let _ = r_a.consume_pes(&build_audio_pes(&[0u8; 32], 1), &mut Vec::new());
+        assert_eq!(r_a.pending_silence_27mhz, 35_991_000);
+
+        // Replacer B consumes its independent signal → pending stays 0.
+        let _ = r_b.consume_pes(&build_audio_pes(&[0u8; 32], 2), &mut Vec::new());
+        assert_eq!(
+            r_b.pending_silence_27mhz, 0,
+            "passive input B must NOT receive input A's loop-wrap signal — \
+             per-input Arc isolation is the architectural fix for the \
+             cross-input silence pollution that caused 0.84.0's audio drop"
+        );
+
+        // After consume A drained its counter via swap(0); both are
+        // now back at zero. A new jump on B fires only B's counter.
+        assert_eq!(sig_a.load(Ordering::Acquire), 0);
+        assert_eq!(sig_b.load(Ordering::Acquire), 0);
+        sig_b.fetch_add(21_384_000, Ordering::Release);
+        let _ = r_a.consume_pes(&build_audio_pes(&[0u8; 32], 3), &mut Vec::new());
+        let _ = r_b.consume_pes(&build_audio_pes(&[0u8; 32], 4), &mut Vec::new());
+        assert_eq!(
+            r_a.pending_silence_27mhz, 35_991_000,
+            "no double-charge on A — B's signal must NOT reach A"
+        );
+        assert_eq!(r_b.pending_silence_27mhz, 21_384_000);
+    }
+
+    /// Signal Arc shared by setter is reflected by the replacer's
+    /// next consume_pes — covers the basic flow on one input.
+    #[test]
+    fn pcr_jump_signal_drains_into_pending_silence() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let sig = std::sync::Arc::new(AtomicI64::new(0));
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        r.set_pcr_jump_signal(sig.clone());
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F;
+
+        sig.fetch_add(35_991_000, Ordering::Release);
+        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 100), &mut Vec::new());
+        assert_eq!(r.pending_silence_27mhz, 35_991_000);
+        // Signal drained — `swap(0)` semantics.
+        assert_eq!(sig.load(Ordering::Acquire), 0);
+    }
+
+    /// `reset_source_state` (input switch / codec change) clears both
+    /// `pending_silence_27mhz` AND drains the shared signal so the
+    /// new source doesn't inherit stale loop-wrap pads.
+    #[test]
+    fn reset_source_state_drains_pcr_jump_signal() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let sig = std::sync::Arc::new(AtomicI64::new(99_999_999));
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        r.set_pcr_jump_signal(sig.clone());
+        r.pending_silence_27mhz = 12_345_678;
+
+        r.reset_source_state("test");
+        assert_eq!(r.pending_silence_27mhz, 0);
+        assert_eq!(
+            sig.load(Ordering::Acquire), 0,
+            "reset must drain the shared signal so the new pipeline \
+             doesn't pick up stale loop-wrap pads"
         );
     }
 }

@@ -225,6 +225,29 @@ pub struct TsPtsRewriter {
     /// be rewritten under muxer mode so splice events fire at the
     /// correct moment downstream relative to the regenerated PCR.
     scte35_pids: HashSet<u16>,
+    /// **Per-input** signal channel for PCR forward-jump events.
+    /// Shared `Arc<AtomicI64>` with the `TsAudioReplacer` on this
+    /// SAME input's pipeline. On a forward PCR jump > 500 ms, this
+    /// rewriter `fetch_add`s the magnitude (in 27 MHz ticks) so the
+    /// audio replacer can silence-pad its accumulator to keep
+    /// output audio PTS aligned with the (jumped) PCR.
+    ///
+    /// **Why per-input, not per-flow.** A flow may have N inputs all
+    /// running their full rewriter pipelines (passive inputs run
+    /// pipelines to keep PSI cache + clock-anchor state warm for
+    /// input switches). If the signal channel were shared per-flow,
+    /// every passive input's ffmpeg-loop wrap would pollute the
+    /// active input's audio replacer with phantom silence-pad
+    /// requests — output audio would be drowned in silence. Each
+    /// input owning its own counter solves this by construction:
+    /// only the active input's rewriter + audio replacer pair
+    /// communicate, passive inputs' state is local to their own
+    /// pipeline. Wired by each input's spawn function.
+    ///
+    /// `None` disables the signal — used in tests and on inputs
+    /// whose audio is passthrough (no replacer in the pipeline to
+    /// receive the signal).
+    pcr_jump_signal: Option<Arc<std::sync::atomic::AtomicI64>>,
 }
 
 impl TsPtsRewriter {
@@ -243,7 +266,22 @@ impl TsPtsRewriter {
             cached_pmts: HashMap::new(),
             last_psi_emit_master_27mhz: None,
             scte35_pids: HashSet::new(),
+            pcr_jump_signal: None,
         }
+    }
+
+    /// Attach a per-input PCR forward-jump signal `Arc<AtomicI64>`.
+    /// The `TsAudioReplacer` on this SAME input's pipeline must share
+    /// the same `Arc`. On every forward PCR jump > 500 ms, this
+    /// rewriter `fetch_add`s the magnitude so the audio replacer can
+    /// silence-pad its accumulator to keep output audio PTS aligned
+    /// with the (jumped) PCR. See the field's doc-comment for the
+    /// per-input rationale. Idempotent; calling twice overwrites.
+    pub fn set_pcr_jump_signal(
+        &mut self,
+        signal: Arc<std::sync::atomic::AtomicI64>,
+    ) {
+        self.pcr_jump_signal = Some(signal);
     }
 
     /// Process a chunk of 188-byte-aligned TS bytes. Appends rewritten
@@ -555,9 +593,34 @@ impl TsPtsRewriter {
             );
         } else if delta_src > DISCONTINUITY_THRESHOLD_27MHZ as i64 {
             set_di = true;
+            // Signal the audio replacer on this SAME input's pipeline
+            // to silence-pad the gap. Forward PCR jumps pass through
+            // (PCR_FO preservation), but on sources where audio PES
+            // PTS does NOT follow the PCR jump (notably
+            // `ffmpeg -stream_loop` — its mpegts muxer offsets audio
+            // by `audio_duration` and video by `video_duration`
+            // independently at each loop wrap), the output audio
+            // drifts ~1.3 s behind PCR per loop without padding.
+            //
+            // **Per-input signal**: this Arc is shared with ONE audio
+            // replacer (the one in this input's pipeline). Passive
+            // inputs have their own separate Arc — no cross-input
+            // pollution. See the field's doc-comment for rationale.
+            // `None` = no replacer paired (audio passthrough or test
+            // setup); the signal is silently dropped.
+            let signalled = if let Some(s) = self.pcr_jump_signal.as_ref() {
+                s.fetch_add(
+                    delta_src,
+                    std::sync::atomic::Ordering::Release,
+                );
+                true
+            } else {
+                false
+            };
             tracing::info!(
                 src_pcr_27mhz,
                 delta_src_27mhz = delta_src,
+                signalled,
                 "ts_pts_rewriter: forward PCR discontinuity passed through (DI=1)"
             );
         }
