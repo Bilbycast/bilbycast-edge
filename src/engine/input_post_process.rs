@@ -102,13 +102,25 @@ impl InputPostProcess {
         });
 
         // Muxer-mode rewriter: ON when an A/V sync pacer is available
-        // AND the operator hasn't opted out via passthrough_clock.
-        // Industry-standard default (Sencore RMX / Cobalt 9970-MX /
-        // Cisco D9036 mux mode). See [`super::ts_pts_rewriter`].
+        // AND the operator hasn't opted out via passthrough_clock AND
+        // the pacer hasn't been claimed by an assembler (PID-bus /
+        // Node-Bus flow). When `is_assembler_owned`, the assembler
+        // runs its own single-anchor rewriter on the assembled output,
+        // so per-input rewriting would double-stamp + use per-input
+        // anchors that don't align across inputs (breaks cross-input
+        // PES splice arithmetic). Industry-standard default (Sencore
+        // RMX / Cobalt 9970-MX / Cisco D9036 mux mode). See
+        // [`super::ts_pts_rewriter`].
         let pts_rewriter = if cfg.passthrough_clock {
             None
         } else {
-            cfg.av_sync_pacer.map(|p| TsPtsRewriter::new(p.clone()))
+            cfg.av_sync_pacer.and_then(|p| {
+                if p.is_assembler_owned() {
+                    None
+                } else {
+                    Some(TsPtsRewriter::new(p.clone()))
+                }
+            })
         };
 
         if program_filter.is_none()
@@ -413,6 +425,50 @@ mod tests {
             ts_pid(&audio_out[..TS_PACKET_SIZE]),
             0x3EA,
             "ES packets on source audio PID 0x102 must ride target audio PID 0x3EA"
+        );
+    }
+
+    /// When the per-flow pacer has been claimed by an assembler
+    /// (`mark_assembler_owned`), the per-input rewriter must NOT
+    /// build — the assembler is responsible for the single-anchor
+    /// muxer-mode rewrite on the assembled output.
+    #[test]
+    fn assembler_owned_pacer_disables_per_input_rewriter() {
+        use crate::engine::av_sync_mux::AvSyncPacer;
+        use crate::engine::master_clock::MasterClockHandle;
+        let pacer = Arc::new(AvSyncPacer::new(MasterClockHandle::wallclock()));
+        pacer.mark_assembler_owned();
+        let post = InputPostProcess::from_config(&InputPostProcessConfig {
+            program_number: None,
+            pid_overrides: None,
+            pid_map: None,
+            passthrough_clock: false,
+            av_sync_pacer: Some(&pacer),
+        });
+        assert!(
+            post.is_none(),
+            "assembler-owned pacer + no other stages → no post-processor"
+        );
+    }
+
+    /// Non-assembler pacer (default) DOES build the per-input rewriter
+    /// when other stages are absent.
+    #[test]
+    fn non_assembler_pacer_builds_rewriter() {
+        use crate::engine::av_sync_mux::AvSyncPacer;
+        use crate::engine::master_clock::MasterClockHandle;
+        let pacer = Arc::new(AvSyncPacer::new(MasterClockHandle::wallclock()));
+        // not marked
+        let post = InputPostProcess::from_config(&InputPostProcessConfig {
+            program_number: None,
+            pid_overrides: None,
+            pid_map: None,
+            passthrough_clock: false,
+            av_sync_pacer: Some(&pacer),
+        });
+        assert!(
+            post.is_some(),
+            "non-claimed pacer + muxer mode → rewriter built"
         );
     }
 }

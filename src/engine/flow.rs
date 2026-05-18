@@ -670,6 +670,15 @@ impl FlowRuntime {
             Some(Arc::new(crate::engine::av_sync_mux::AvSyncPacer::new(
                 master_clock.clone(),
             )));
+        // For assembled flows (PID-bus / Node-Bus), claim the pacer so
+        // per-input rewriters skip — the assembler runs its own
+        // shared-anchor rewriter on the assembled output. Avoids per-
+        // input anchors clashing with cross-input PES splice math.
+        if config.config.assembly.is_some() {
+            if let Some(p) = av_sync_pacer.as_ref() {
+                p.mark_assembler_owned();
+            }
+        }
 
         // Spawn every input task (warm passive). Each input publishes to its
         // own per-input broadcast channel; a forwarder task drains it and
@@ -2587,6 +2596,13 @@ impl FlowRuntime {
         let av_sync_pacer = Some(Arc::new(
             crate::engine::av_sync_mux::AvSyncPacer::new(self.master_clock.clone()),
         ));
+        // Mirror the start-time `mark_assembler_owned` so hot-added
+        // inputs on an assembled flow also skip their per-input rewriter.
+        if self.config.config.assembly.is_some() {
+            if let Some(p) = av_sync_pacer.as_ref() {
+                p.mark_assembler_owned();
+            }
+        }
         let spawn_ctx = InputSpawnContext {
             flow_id: &self.config.config.id,
             flow_cancel: &self.cancel_token,

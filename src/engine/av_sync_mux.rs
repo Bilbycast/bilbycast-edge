@@ -66,14 +66,41 @@ pub const PCR_PREROLL_27MHZ: u64 = 2_160_000;
 /// `TsAudioReplacer` / output emit code via a setter that defaults to
 /// `None` so existing tests + non-mastered code paths keep working
 /// without changes.
+///
+/// `assembler_owned` is a flow-level signal: when set, the per-input
+/// `ts_pts_rewriter` skips itself because the assembler will run its
+/// own single-anchor muxer-mode rewriter on the assembled output.
+/// Avoids per-input anchors interfering with cross-input PES splice
+/// arithmetic in PID-bus / Node-Bus flows.
 #[derive(Clone)]
 pub struct AvSyncPacer {
     master: MasterClockHandle,
+    assembler_owned: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AvSyncPacer {
     pub fn new(master: MasterClockHandle) -> Self {
-        Self { master }
+        Self {
+            master,
+            assembler_owned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Mark this pacer as owned by an assembled-flow assembler. Per-input
+    /// rewriters check this and skip themselves so the assembler can run
+    /// a single shared-anchor rewriter on the assembled output. Idempotent.
+    pub fn mark_assembler_owned(&self) {
+        self.assembler_owned
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether an assembler has claimed this pacer's anchor responsibility.
+    /// `ts_pts_rewriter::TsPtsRewriter` checks this in `InputPostProcess::
+    /// from_config` to skip per-input rewriting on inputs that feed an
+    /// assembled flow.
+    pub fn is_assembler_owned(&self) -> bool {
+        self.assembler_owned
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Master clock's tagged kind ("source_pcr_pll" / "ptp" / etc.).
