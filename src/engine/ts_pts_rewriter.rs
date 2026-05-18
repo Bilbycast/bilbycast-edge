@@ -215,6 +215,16 @@ pub struct TsPtsRewriter {
     cached_pat: Option<[u8; TS_PACKET_SIZE]>,
     /// Cached most-recent PMT packets keyed by PMT PID.
     cached_pmts: HashMap<u16, [u8; TS_PACKET_SIZE]>,
+    /// Per-PID continuity counter the rewriter has emitted on PSI PIDs
+    /// (PAT + every learned PMT PID). The rewriter takes ownership of
+    /// CC on these PIDs so PSI_RR injection of cached PAT/PMT bytes
+    /// can advance the sequence cleanly — without this, every cached
+    /// emission re-uses the CC stamped at observe time, producing
+    /// duplicate-CC errors at the receiver whenever injection fires
+    /// between natural source PSI packets. First emit on a PID is
+    /// seeded from `ts_cc(pkt)` so the rewriter's sequence aligns
+    /// with upstream's `rewrite_cc` value on cold start.
+    psi_emit_cc: HashMap<u16, u8>,
     /// Last master-clock time any PSI (PAT or PMT) was emitted on
     /// this rewriter's output. Used to enforce TR 101 290 §PAT_error
     /// / §PMT_error 500 ms repetition cap.
@@ -264,6 +274,7 @@ impl TsPtsRewriter {
             last_cc_on_pcr_pid: HashMap::new(),
             cached_pat: None,
             cached_pmts: HashMap::new(),
+            psi_emit_cc: HashMap::new(),
             last_psi_emit_master_27mhz: None,
             scte35_pids: HashSet::new(),
             pcr_jump_signal: None,
@@ -370,7 +381,18 @@ impl TsPtsRewriter {
                             self.maybe_inject_pcr_rr_padding(pid, prev_cc, new_pcr, out);
                         }
                         self.last_emitted_out_pcr_27mhz = Some(new_pcr);
-                        self.last_cc_on_pcr_pid.insert(pid, cc);
+                        // CC tracker update is consolidated at the
+                        // bottom of the loop so non-PCR payload
+                        // packets on this PID (PES continuation when
+                        // PCR_PID == video_PID — the typical broadcast
+                        // configuration) also advance the tracker.
+                        // Updating only here would leave
+                        // `last_cc_on_pcr_pid` pointing at the previous
+                        // *PCR-bearing* packet's CC, many ticks behind
+                        // the actual last-payload CC the receiver saw
+                        // — causing AF-only synthetics to emit at the
+                        // wrong CC and trip H.222.0 §2.4.3.3 at the
+                        // decoder.
                     }
                 }
             }
@@ -418,6 +440,39 @@ impl TsPtsRewriter {
                 }
             }
 
+            // Stamp the rewriter's monotonic CC onto every natural PSI
+            // emit. Required so PSI_RR cached injections (which also
+            // stamp via this counter in `maybe_inject_psi_padding`) can
+            // advance the sequence past the natural packets without
+            // duplicate-CC errors at the receiver. Suppress the
+            // last-emit timer reset's effect: this stamp is part of the
+            // same natural emit so `note_psi_emitted()` above remains
+            // the authoritative timer write.
+            if is_psi {
+                if !rewritten {
+                    buf.copy_from_slice(pkt);
+                }
+                self.stamp_psi_cc(pid, &mut buf);
+                rewritten = true;
+            }
+
+            // Track the most-recent **payload** CC on each PCR_PID so
+            // PCR_RR's AF-only synthetic injections can stamp the
+            // correct previous-payload CC (H.222.0 §2.4.3.3: AF-only
+            // packets shall carry the same CC as the previous
+            // payload-bearing packet on the PID, NOT the previous
+            // *PCR*-bearing packet — those are typically separated by
+            // many PES-continuation packets when PCR_PID == video_PID).
+            // Uses the *emitted* CC (post any rewrite) so the tracker
+            // matches what the receiver sees.
+            let afc = (pkt[3] >> 4) & 0b11;
+            let has_payload = afc == 0b01 || afc == 0b11;
+            let on_pcr_pid = self.pcr_pids.is_empty() || self.pcr_pids.contains(&pid);
+            if has_payload && on_pcr_pid {
+                let emitted_cc = if rewritten { buf[3] & 0x0F } else { pkt[3] & 0x0F };
+                self.last_cc_on_pcr_pid.insert(pid, emitted_cc);
+            }
+
             if rewritten {
                 out.extend_from_slice(&buf);
             } else {
@@ -446,6 +501,25 @@ impl TsPtsRewriter {
         self.last_psi_emit_master_27mhz = Some(self.pacer.now_27mhz());
     }
 
+    /// Stamp the rewriter's per-PID monotonic continuity counter onto
+    /// `buf[3]` and update the tracker. Called for every emitted PSI
+    /// packet (natural emit + PSI_RR cached injection) so the on-wire
+    /// CC sequence stays monotonic across the rewriter's lifetime
+    /// regardless of how many cached injections fire between source
+    /// PSI packets.
+    ///
+    /// First emit on a PID seeds the tracker from `buf[3]`'s low
+    /// nibble — preserves continuity with upstream's `rewrite_cc`
+    /// value so cold start doesn't introduce a one-tick jump.
+    fn stamp_psi_cc(&mut self, pid: u16, buf: &mut [u8; TS_PACKET_SIZE]) {
+        let next_cc = match self.psi_emit_cc.get(&pid).copied() {
+            Some(prev) => (prev + 1) & 0x0F,
+            None => buf[3] & 0x0F,
+        };
+        buf[3] = (buf[3] & 0xF0) | next_cc;
+        self.psi_emit_cc.insert(pid, next_cc);
+    }
+
     /// PSI_RR guard: when no PSI has flowed in the configured window
     /// (TR 101 290 §PAT_error / §PMT_error: 500 ms max), inject cached
     /// PAT + all cached PMT packets ahead of the current source
@@ -471,16 +545,26 @@ impl TsPtsRewriter {
         if gap < PSI_RR_MAX_27MHZ || gap >= PCR_MODULUS_27MHZ / 2 {
             return;
         }
-        if let Some(pat) = self.cached_pat.as_ref() {
-            out.extend_from_slice(pat);
+        // Rewrite CC on every cached PSI packet before emitting so the
+        // receiver sees a monotonic CC sequence on PID 0 (and each PMT
+        // PID) across natural emits + injections. Cached bytes carry
+        // the CC stamped at observe time, which would collide with
+        // subsequent natural source PSI if emitted verbatim. See
+        // [`Self::stamp_psi_cc`].
+        if let Some(pat) = self.cached_pat {
+            let mut buf = pat;
+            self.stamp_psi_cc(PAT_PID, &mut buf);
+            out.extend_from_slice(&buf);
         }
         // Iterate deterministically — sort by PID so reading the
         // output is predictable in tests.
         let mut pmt_pids: Vec<u16> = self.cached_pmts.keys().copied().collect();
         pmt_pids.sort_unstable();
         for pid in pmt_pids {
-            if let Some(pmt) = self.cached_pmts.get(&pid) {
-                out.extend_from_slice(pmt);
+            if let Some(pmt) = self.cached_pmts.get(&pid).copied() {
+                let mut buf = pmt;
+                self.stamp_psi_cc(pid, &mut buf);
+                out.extend_from_slice(&buf);
             }
         }
         self.last_psi_emit_master_27mhz = Some(master_now);
@@ -1407,6 +1491,89 @@ mod tests {
         }
     }
 
+    /// PCR_RR synthetic AF-only packets must carry the **previous
+    /// payload** CC on the PCR_PID — not the previous *PCR-bearing*
+    /// packet's CC. When PCR_PID == video_PID (the typical broadcast
+    /// configuration), several PES-continuation payload packets land
+    /// between PCRs; each advances the receiver-side CC. The synthetic
+    /// must equal the most-recent of those continuation CCs per
+    /// H.222.0 §2.4.3.3, otherwise every injection emits a duplicate
+    /// or out-of-order CC that the decoder reports as a discontinuity.
+    ///
+    /// Regression cover for the bug that produced ~20 CC errors / s
+    /// on PID 256 over 120 s of media-player capture (2 492 unexpected
+    /// discontinuities in `tsanalyze --error`).
+    #[test]
+    fn pcr_rr_synthetic_cc_follows_last_payload_not_last_pcr() {
+        fn build_payload_packet(pid: u16, cc: u8) -> [u8; TS_PACKET_SIZE] {
+            let mut pkt = [0xFFu8; TS_PACKET_SIZE];
+            pkt[0] = TS_SYNC_BYTE;
+            pkt[1] = ((pid >> 8) as u8) & 0x1F; // PUSI=0
+            pkt[2] = (pid & 0xFF) as u8;
+            pkt[3] = 0x10 | (cc & 0x0F); // AFC=01 (payload only)
+            pkt
+        }
+
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut buf = Vec::new();
+        // Learn PMT → PCR_PID = 0x100.
+        r.process(&build_psi(0x100, 0x101), &mut buf);
+
+        // First PCR establishes the anchor; CC=0 (build_pcr_packet's
+        // default). No injection yet because we have no prior emitted
+        // PCR to compare gap against.
+        let src_1: u64 = 1_000_000_000;
+        let mut out1 = Vec::new();
+        r.process(&build_pcr_packet(0x100, src_1), &mut out1);
+        assert_eq!(out1.len(), TS_PACKET_SIZE, "first PCR: no injection");
+        assert_eq!(out1[3] & 0x0F, 0, "first PCR's CC unchanged");
+
+        // 7 payload-bearing PES-continuation packets on the same PID,
+        // CCs 1..=7 — the typical pattern between consecutive PCRs in
+        // a video stream where PCR_PID == video_PID.
+        for cc in 1u8..=7 {
+            let mut out = Vec::new();
+            r.process(&build_payload_packet(0x100, cc), &mut out);
+        }
+
+        // Second PCR with a gap of 200 ms (5× PCR_RR_MAX) — should
+        // inject 4 synthetics. Patch in CC=8 so the natural source
+        // continues monotonically after the continuation packets.
+        let mut pcr2 = build_pcr_packet(0x100, src_1 + 200 * 27_000);
+        pcr2[3] = 0x30 | 0x08; // AF+payload, CC=8
+        let mut out2 = Vec::new();
+        r.process(&pcr2, &mut out2);
+
+        let n_pkts = out2.len() / TS_PACKET_SIZE;
+        assert_eq!(
+            n_pkts, 5,
+            "200 ms gap should produce 4 synthetic + 1 source = 5 packets"
+        );
+
+        // Every synthetic AF-only packet must carry CC=7 (the last
+        // payload-bearing packet's CC on PID 0x100), NOT CC=0 (the
+        // previous PCR-bearing packet's CC, which is what the pre-fix
+        // implementation emitted).
+        for i in 0..4 {
+            let p = &out2[i * TS_PACKET_SIZE..(i + 1) * TS_PACKET_SIZE];
+            assert_eq!(ts_pid(p), 0x100, "synthetic {i}: PID");
+            assert_eq!((p[3] >> 4) & 0x03, 0b10, "synthetic {i}: AF-only AFC");
+            assert_eq!(
+                p[3] & 0x0F,
+                7,
+                "synthetic {i}: CC must equal last payload CC (=7), \
+                 not last PCR CC (=0)"
+            );
+        }
+        // And the source PCR packet's CC sails through unchanged (=8).
+        let source = &out2[4 * TS_PACKET_SIZE..5 * TS_PACKET_SIZE];
+        assert_eq!(
+            source[3] & 0x0F,
+            8,
+            "source PCR2 emitted with its natural CC"
+        );
+    }
+
     /// PSI_RR injection: when no PSI flows for > 500 ms, the rewriter
     /// emits cached PAT + PMT(s) ahead of the next non-PSI packet so
     /// the receiver never alarms on missing PAT/PMT (TR 101 290
@@ -1444,6 +1611,122 @@ mod tests {
         assert!(
             now.wrapping_sub(last) < 1_000_000,
             "PSI_RR timer should reset after injection"
+        );
+    }
+
+    /// PSI_RR injection rewrites cached PAT/PMT CC monotonically so the
+    /// receiver sees a continuous CC sequence on every PSI PID across
+    /// repeated injections — regression cover for the bug where
+    /// `maybe_inject_psi_padding` emitted cached bytes verbatim,
+    /// re-using the CC stamped at observe time and producing
+    /// duplicate-CC errors at the decoder.
+    #[test]
+    fn psi_rr_injection_advances_cc_monotonically() {
+        let pacer = make_wallclock_pacer();
+        let mut r = TsPtsRewriter::new(pacer.clone());
+        let mut warmup = Vec::new();
+        // Prime: one natural PSI emit. Both PAT and PMT come in with
+        // source CC=0 (build_psi convention) and are stamped at the
+        // first-seen seed (CC=0). Tracker afterwards: PAT=0, PMT=0.
+        r.process(&build_psi(0x100, 0x101), &mut warmup);
+        let pcr_pkt = build_pcr_packet(0x100, 50_000_000);
+
+        // Trigger 5 successive injections; expect CC=1..=5 on each
+        // injected PAT and PMT.
+        for expected_cc in 1u8..=5 {
+            let master_now = pacer.now_27mhz();
+            r.last_psi_emit_master_27mhz =
+                Some(master_now.wrapping_sub(600 * 27_000));
+            let mut out = Vec::new();
+            r.process(&pcr_pkt, &mut out);
+            let pat = &out[..TS_PACKET_SIZE];
+            let pmt = &out[TS_PACKET_SIZE..2 * TS_PACKET_SIZE];
+            assert_eq!(
+                pat[3] & 0x0F, expected_cc & 0x0F,
+                "injection #{expected_cc}: PAT CC must advance monotonically"
+            );
+            assert_eq!(
+                pmt[3] & 0x0F, expected_cc & 0x0F,
+                "injection #{expected_cc}: PMT CC must advance monotonically"
+            );
+        }
+    }
+
+    /// Natural PSI emit interleaved with PSI_RR injection — the
+    /// rewriter's CC counter must advance past the injected packets so
+    /// subsequent natural emits don't collide with them (which is the
+    /// receiver-visible failure mode pre-fix: cached injection at CC=N,
+    /// then upstream's `rewrite_cc` produces natural CC=N → duplicate).
+    #[test]
+    fn psi_rr_natural_emit_advances_past_injections() {
+        let pacer = make_wallclock_pacer();
+        let mut r = TsPtsRewriter::new(pacer.clone());
+        let pcr_pkt = build_pcr_packet(0x100, 50_000_000);
+
+        // 1) First natural PSI emit: CC preserved from source (=0).
+        let mut out1 = Vec::new();
+        r.process(&build_psi(0x100, 0x101), &mut out1);
+        assert_eq!(out1[3] & 0x0F, 0, "first natural PAT preserves source CC");
+        assert_eq!(
+            out1[TS_PACKET_SIZE + 3] & 0x0F,
+            0,
+            "first natural PMT preserves source CC"
+        );
+
+        // 2) Force an injection — PAT/PMT bumped to CC=1.
+        let master_now = pacer.now_27mhz();
+        r.last_psi_emit_master_27mhz =
+            Some(master_now.wrapping_sub(600 * 27_000));
+        let mut out2 = Vec::new();
+        r.process(&pcr_pkt, &mut out2);
+        assert_eq!(out2[3] & 0x0F, 1, "injected PAT CC bumps to 1");
+        assert_eq!(
+            out2[TS_PACKET_SIZE + 3] & 0x0F,
+            1,
+            "injected PMT CC bumps to 1"
+        );
+
+        // 3) Next natural PSI: source CC still 0, but the rewriter
+        //    overrides to CC=2 so the on-wire sequence stays monotonic.
+        let mut out3 = Vec::new();
+        r.process(&build_psi(0x100, 0x101), &mut out3);
+        assert_eq!(
+            out3[3] & 0x0F,
+            2,
+            "next natural PAT continues at CC=2 post-injection"
+        );
+        assert_eq!(
+            out3[TS_PACKET_SIZE + 3] & 0x0F,
+            2,
+            "next natural PMT continues at CC=2 post-injection"
+        );
+    }
+
+    /// First-emit CC seeding — the rewriter's first emit on a PSI PID
+    /// preserves the source CC so cold start aligns with upstream's
+    /// `rewrite_cc` value (no synthetic CC jump on the very first
+    /// packet of the stream).
+    #[test]
+    fn psi_first_emit_preserves_source_cc() {
+        let pacer = make_wallclock_pacer();
+        let mut r = TsPtsRewriter::new(pacer);
+        let mut psi = build_psi(0x100, 0x101);
+        // Patch source CCs to non-zero values so the seed is visible.
+        psi[3] = (psi[3] & 0xF0) | 0x07;
+        psi[TS_PACKET_SIZE + 3] = (psi[TS_PACKET_SIZE + 3] & 0xF0) | 0x0B;
+
+        let mut out = Vec::new();
+        r.process(&psi, &mut out);
+
+        assert_eq!(
+            out[3] & 0x0F,
+            7,
+            "first PAT emit must preserve the source CC (cold-start seed)"
+        );
+        assert_eq!(
+            out[TS_PACKET_SIZE + 3] & 0x0F,
+            11,
+            "first PMT emit must preserve the source CC (cold-start seed)"
         );
     }
 
