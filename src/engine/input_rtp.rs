@@ -129,6 +129,15 @@ pub fn spawn_rtp_input(
         if let (Some(t), Some(p)) = (transcoder.as_mut(), av_sync_pacer.as_ref()) {
             t.set_av_sync_pacer(p.clone());
         }
+        // **Per-input** PCR forward-jump signal — same shape as input_srt.
+        // Required so source-side discontinuities (reconnect, re-anchor,
+        // upstream encoder restart) silence-pad input-side audio_encode
+        // and keep output A/V aligned.
+        let pcr_jump_signal: std::sync::Arc<std::sync::atomic::AtomicI64> =
+            std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        if let Some(t) = transcoder.as_mut() {
+            t.set_pcr_jump_signal(pcr_jump_signal.clone());
+        }
         super::input_transcode::register_ingress_stats(
             stats.as_ref(),
             &input_id,
@@ -143,7 +152,7 @@ pub fn spawn_rtp_input(
             pid_map: config.pid_map.as_ref(),
             passthrough_clock,
             av_sync_pacer: av_sync_pacer.as_ref(),
-            pcr_jump_signal: None,
+            pcr_jump_signal: Some(&pcr_jump_signal),
         });
         if let Some(ref p) = post {
             tracing::info!(

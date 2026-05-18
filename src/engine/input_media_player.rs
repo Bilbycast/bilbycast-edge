@@ -202,6 +202,26 @@ async fn run(
             None
         }
     };
+    // **Per-input** PCR forward-jump signal channel. Built once here in
+    // the input pipeline and shared with the input's audio replacer
+    // (via `InputTranscoder::set_pcr_jump_signal`) and its
+    // `TsPtsRewriter` (via `InputPostProcessConfig.pcr_jump_signal`).
+    // Each input owns its own counter so cross-input loop wraps can't
+    // pollute the active input's audio (the bug that motivated this
+    // design — see `bilbycast-edge` commit 48ea5dc 0.84.0 v2).
+    //
+    // Critical for media_player: every loop boundary in a multi-source
+    // playlist (or single-source loop) emits a forward PCR jump as the
+    // splice re-anchors. Without this signal, an input-side audio
+    // re-encoder runs through the jump verbatim — its `samples_since_
+    // anchor` keeps advancing while the wire-time clock leaps ahead,
+    // and output audio falls progressively behind video by the
+    // cumulative loop-wrap distance.
+    let pcr_jump_signal: Arc<std::sync::atomic::AtomicI64> =
+        Arc::new(std::sync::atomic::AtomicI64::new(0));
+    if let Some(t) = transcoder.as_mut() {
+        t.set_pcr_jump_signal(pcr_jump_signal.clone());
+    }
     crate::engine::input_transcode::register_ingress_stats(
         stats.as_ref(),
         &input_id,
@@ -222,7 +242,7 @@ async fn run(
             pid_map: config.pid_map.as_ref(),
             passthrough_clock,
             av_sync_pacer: av_sync_pacer.as_ref(),
-            pcr_jump_signal: None,
+            pcr_jump_signal: Some(&pcr_jump_signal),
         },
     );
     if let Some(ref _p) = post {
@@ -703,6 +723,16 @@ async fn play_ts_file(
     let mut splice_offset_27m: Option<i64> = None;
     let mut max_emitted_pts_90k: u64 = target_pts_90k;
     let mut max_emitted_audio_pts_90k: Option<u64> = None;
+    // Track the highest emitted PCR (in 90 kHz units) on this file so
+    // `close_file` can anchor the next loop's target ≥ the previous loop's
+    // last PCR. Without this, real broadcast captures (whose video PES PTS
+    // ~1 s past the last AUDIO PES PTS at EOF, due to mux look-ahead) put
+    // the next loop's first PCR ~60 ms BEFORE the previous loop's last
+    // PCR — a backward PCR jump that's below the rewriter's 500 ms
+    // discontinuity threshold so it slips through and the wire pacer
+    // cumulatively falls behind wallclock at ~1000 ppm. See the audio-
+    // anchor reasoning in `SpliceContinuity::close_file` below.
+    let mut max_emitted_pcr_90k: u64 = target_pts_90k;
 
     // Audio PIDs discovered by parsing the program's PMT during playback.
     // The PMT lives at `pmt_pid` (extracted from the PAT on its first
@@ -850,6 +880,18 @@ async fn play_ts_file(
         rewrite_cc(&mut packet, session.cont);
         if let Some(off_27m) = splice_offset_27m {
             rewrite_pcr_in_place(&mut packet, off_27m);
+            // After in-place rewrite, the packet carries the output PCR
+            // value. Re-extract and track the high-water-mark — the
+            // close_file anchor needs `max(last_pcr, audio_max)` so the
+            // next loop's first PCR is ≥ this file's last PCR (otherwise
+            // a backward PCR jump <500 ms slips below the rewriter's
+            // discontinuity threshold and the wire pacer drifts).
+            if let Some(out_pcr_27m) = extract_pcr_27mhz(&packet) {
+                let out_pcr_90k = (out_pcr_27m / 300) & 0x1_FFFF_FFFF;
+                if out_pcr_90k > max_emitted_pcr_90k {
+                    max_emitted_pcr_90k = out_pcr_90k;
+                }
+            }
             let off_90k = off_27m / 300;
             // Track the high-water-mark emitted PTS overall *and* on
             // audio PIDs separately. `close_file` prefers the audio
@@ -896,12 +938,33 @@ async fn play_ts_file(
     drop(pacer_tx);
     let _ = tokio::task::spawn_blocking(move || pacer_thread.join()).await;
 
-    // Hand off the splice anchor to `SpliceContinuity`. Prefer the
-    // audio high-water mark — see `close_file` doc. Fall back to the
-    // overall max when no audio PID has been observed (very rare —
-    // requires either a video-only stream or a file too short to carry
-    // a PMT, neither of which is realistic for broadcast captures).
-    let anchor_pts = max_emitted_audio_pts_90k.unwrap_or(max_emitted_pts_90k);
+    // Hand off the splice anchor to `SpliceContinuity`.
+    //
+    // The anchor must satisfy two properties:
+    //
+    // 1. The next loop's first audio PES PTS should be tightly adjacent
+    //    to this loop's last audio PTS — anchoring on
+    //    `max_emitted_audio_pts_90k` keeps the audio gap to ~200 ms
+    //    instead of ~1 s on real broadcast captures.
+    // 2. The next loop's first PCR must be ≥ this loop's last PCR.
+    //    Otherwise the output PCR sequence has a small backward jump at
+    //    every loop boundary — typically ~60 ms on captures where video
+    //    PES PTS ~1 s past audio PES PTS (mux look-ahead). That jump is
+    //    below the rewriter's 500 ms discontinuity threshold so it
+    //    slips through, and the wire pacer cumulatively falls behind
+    //    wallclock at ~1000 ppm.
+    //
+    // We satisfy both by taking `max(audio_max, pcr_max)` (each falling
+    // back as needed). On real broadcast captures with the video-mux-
+    // ahead-of-audio shape `pcr_max > audio_max` so `pcr_max` wins,
+    // costing an extra ~90 ms of audio gap per loop in exchange for
+    // eliminating the 60 ms PCR drift. On synthetic / ffmpeg-generated
+    // tracks where audio and video end together `audio_max ≈ pcr_max`
+    // so behaviour is unchanged.
+    let anchor_pts = match max_emitted_audio_pts_90k {
+        Some(a) => a.max(max_emitted_pcr_90k),
+        None => max_emitted_pts_90k.max(max_emitted_pcr_90k),
+    };
     session.cont.close_file(anchor_pts);
     Ok(())
 }
@@ -1096,7 +1159,18 @@ fn scan_head_bitrate(buf: &[u8], stride: usize) -> Option<u64> {
     if stride < TS_PACKET || buf.len() < stride {
         return None;
     }
-    let mut first: Option<(u16, u64, usize)> = None; // (pid, pcr_27mhz, byte_pos)
+    // Walk the buffer and record FIRST + LAST PCR on the first PCR-bearing
+    // PID we see. Using first-to-last (rather than first-to-second-PCR)
+    // averages over the entire head window so initial-mux idiosyncrasies
+    // (PSI bursts, occasional NULL padding bursts, encoder warmup
+    // jitter) don't bias the estimate by 10-15 %. Previous behaviour:
+    // returned on the very first valid PCR pair. For a 512 KB head on
+    // a 4 Mbps file (~ 1 s of source content), that meant a 35 ms sample
+    // window — one bad inter-PCR delta could shift the estimate ±15 %
+    // and the OS pacer would carry the wrong initial rate for the first
+    // second of every file loop (= cumulative drift on short loops).
+    let mut first: Option<(u16, u64, usize)> = None;
+    let mut last_same_pid: Option<(u64, usize)> = None;
     let mut pos = 0usize;
     while pos + TS_PACKET <= buf.len() {
         if buf[pos] != SYNC_BYTE {
@@ -1112,23 +1186,8 @@ fn scan_head_bitrate(buf: &[u8], stride: usize) -> Option<u64> {
             let pid = ((pkt[1] as u16 & 0x1F) << 8) | pkt[2] as u16;
             match first {
                 None => first = Some((pid, pcr, pos)),
-                Some((first_pid, first_pcr, first_pos)) if first_pid == pid => {
-                    let pcr_delta = pcr.wrapping_sub(first_pcr);
-                    let pcr_us = pcr_delta / 27;
-                    // Sanity bounds: inter-PCR between 1 ms and 2 s
-                    // covers every realistic broadcast cadence.
-                    if (1_000..=2_000_000).contains(&pcr_us) {
-                        let bytes_delta = (pos.saturating_sub(first_pos)) as u64;
-                        if bytes_delta > 0 {
-                            let observed_bps =
-                                bytes_delta.saturating_mul(8 * 1_000_000) / pcr_us;
-                            if (100_000..=10_000_000_000).contains(&observed_bps) {
-                                return Some(observed_bps);
-                            }
-                        }
-                    }
-                    // Implausible pair — restart anchor on this PCR.
-                    first = Some((pid, pcr, pos));
+                Some((first_pid, _, _)) if first_pid == pid => {
+                    last_same_pid = Some((pcr, pos));
                 }
                 _ => {
                     // Different PID — keep the original anchor (the
@@ -1139,7 +1198,25 @@ fn scan_head_bitrate(buf: &[u8], stride: usize) -> Option<u64> {
         }
         pos += stride;
     }
-    None
+    let (_pid, first_pcr, first_pos) = first?;
+    let (last_pcr, last_pos) = last_same_pid?;
+    let pcr_delta = last_pcr.wrapping_sub(first_pcr);
+    let pcr_us = pcr_delta / 27;
+    // Sanity: total head span must be ≥ 100 ms; covers > 3 inter-PCR
+    // periods at a typical 40 ms cadence so the average is meaningful.
+    if !(100_000..=10_000_000).contains(&pcr_us) {
+        return None;
+    }
+    let bytes_delta = (last_pos.saturating_sub(first_pos)) as u64;
+    if bytes_delta == 0 {
+        return None;
+    }
+    let observed_bps = bytes_delta.saturating_mul(8 * 1_000_000) / pcr_us;
+    if (100_000..=10_000_000_000).contains(&observed_bps) {
+        Some(observed_bps)
+    } else {
+        None
+    }
 }
 
 /// Parse the 27 MHz PCR out of the adaptation field, if this packet

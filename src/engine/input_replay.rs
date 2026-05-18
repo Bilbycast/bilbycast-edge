@@ -113,6 +113,14 @@ async fn run(
     if let (Some(t), Some(p)) = (transcoder.as_mut(), av_sync_pacer.as_ref()) {
         t.set_av_sync_pacer(p.clone());
     }
+    // **Per-input** PCR forward-jump signal — same shape as input_srt.
+    // Replay scrubs jump source PCR; without this signal an input-side
+    // audio re-encoder runs through verbatim and drifts.
+    let pcr_jump_signal: std::sync::Arc<std::sync::atomic::AtomicI64> =
+        std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    if let Some(t) = transcoder.as_mut() {
+        t.set_pcr_jump_signal(pcr_jump_signal.clone());
+    }
     crate::engine::input_transcode::register_ingress_stats(
         flow_stats.as_ref(),
         &input_id,
@@ -129,7 +137,7 @@ async fn run(
             pid_map: config.pid_map.as_ref(),
             passthrough_clock,
             av_sync_pacer: av_sync_pacer.as_ref(),
-            pcr_jump_signal: None,
+            pcr_jump_signal: Some(&pcr_jump_signal),
         },
     );
     if let Some(ref _p) = post {
