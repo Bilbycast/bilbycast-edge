@@ -77,21 +77,27 @@ use crate::engine::ts_audio_replace::{
 };
 use crate::engine::ts_video_replace::{TsVideoReplaceError, TsVideoReplacer};
 
-/// Bounded depth of the input channel. Sized to match
-/// `BROADCAST_CHANNEL_CAPACITY` (8192) so the chain offers the same
-/// startup-burst headroom as the flow-level fan-out feeding it.
+/// Bounded depth of the input channel. Matches the Standard tier of
+/// [`crate::config::models::BandwidthProfile`] (16 384 slots) so the
+/// chain offers the same startup-burst headroom as the flow-level
+/// fan-out feeding it at typical TS-contribution bitrates.
 /// At a few hundred Mbps total compressed input — the typical edge
-/// workload — that's ~170 ms of in-flight TS bundles at 500 Mbps,
-/// or ~340 ms at 250 Mbps. Memory cost is ~128 KB per chain (8192 ×
+/// workload — that's ~344 ms of in-flight TS bundles at 500 Mbps,
+/// or ~680 ms at 250 Mbps. Memory cost is ~256 KB per chain (16 384 ×
 /// the 16-byte `Bytes` struct; payload heap is refcounted and only
 /// held while a slot is occupied). Beyond this depth, dropping the
 /// newest input is the right call for live broadcast — buffering
 /// past the encoder's pacing budget produces nothing useful.
-const TRANSCODE_CHAIN_INPUT_DEPTH: usize = 8192;
+///
+/// This is per-output and does not scale with the flow's bandwidth
+/// profile today: transcoded outputs are by definition the compressed-
+/// egress path (ST 2110 etc. are passthrough on the egress side), so
+/// Standard-tier sizing is the right floor here.
+const TRANSCODE_CHAIN_INPUT_DEPTH: usize = 16_384;
 /// Bounded depth of the output channel. Symmetric with the input
 /// depth so a transient at either side doesn't pin the codec thread
 /// against a smaller mismatched buffer.
-const TRANSCODE_CHAIN_OUTPUT_DEPTH: usize = 8192;
+const TRANSCODE_CHAIN_OUTPUT_DEPTH: usize = 16_384;
 
 /// Errors raised when building a [`TranscodeChain`]. Forwarded from
 /// the underlying replacer constructors.

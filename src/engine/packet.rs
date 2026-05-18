@@ -6,14 +6,24 @@ use bytes::Bytes;
 /// Maximum RTP packet size for SMPTE 2022-2 (7 x 188 byte TS packets + 12 byte RTP header)
 pub const MAX_RTP_PACKET_SIZE: usize = 1500;
 
-/// Broadcast channel capacity for fan-out.
+/// Broadcast channel capacity for fan-out — the `Standard` tier of
+/// [`crate::config::models::BandwidthProfile`].
 ///
-/// Sized for 4K/UHD at high bitrate with multiple outputs. At 1316 bytes
-/// per RTP packet (7×188 TS + 12 RTP header), 8192 slots ≈ 10 MB buffer
-/// providing ~3.4 seconds at 1080p50 or ~0.8 seconds at 100 Mbps 4K.
-/// Slow subscribers receive `RecvError::Lagged` and drop — the input is
-/// never blocked.
-pub const BROADCAST_CHANNEL_CAPACITY: usize = 8192;
+/// Sized for TS-class contribution / distribution flows (up to ~500 Mbps
+/// compressed video). At 1316 bytes per RTP packet (7×188 TS + 12 RTP
+/// header), 16 384 slots ≈ 21 MB buffer providing ~3.4 seconds at
+/// 50 Mbps, ~344 ms at 500 Mbps, or ~56 ms at 3 Gbps. Slow subscribers
+/// receive `RecvError::Lagged` and drop — the input is never blocked.
+///
+/// **Per-flow override**: when [`crate::config::models::FlowConfig::bandwidth_profile`]
+/// is set (or auto-derived to `HighBitrate` / `Uncompressed`) the
+/// runtime uses [`crate::config::models::BandwidthProfile::broadcast_capacity`]
+/// instead of this constant — see
+/// [`crate::engine::bandwidth_profile::resolve_for_flow`]. This constant
+/// remains the fallback for code paths that don't have a flow context
+/// (tests, isolated channel construction).
+#[allow(dead_code)]
+pub const BROADCAST_CHANNEL_CAPACITY: usize = 16_384;
 
 /// The packet that flows through broadcast channels.
 ///

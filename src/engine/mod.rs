@@ -20,6 +20,7 @@
 //! - **Redundancy duplicate** on SRT output (SMPTE 2022-7 dual-leg send)
 
 pub mod bandwidth_monitor;
+pub mod bandwidth_profile;
 pub mod degradation_monitor;
 pub mod input_test_pattern;
 /// File-backed media-player input — TS / MP4 / image fallback source.

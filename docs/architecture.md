@@ -640,7 +640,7 @@ FEC (2022-1) and hitless redundancy (2022-7) run **after** the filter, so the re
 ## Backpressure & QoS
 
 ```
-  Input ──▶ broadcast::channel(2048) ──▶ Output subscribers
+  Input ──▶ broadcast::channel(per-flow-capacity) ──▶ Output subscribers
 
   Slow output?
   ├─ recv() returns RecvError::Lagged(n)
@@ -656,3 +656,53 @@ FEC (2022-1) and hitless redundancy (2022-7) run **after** the filter, so the re
   RTP output:
   └─ Direct send from broadcast receiver (no intermediate buffer)
 ```
+
+### Channel sizing (`BandwidthProfile`)
+
+The flow-level broadcast channel capacity is per-flow and scales with
+the essence bitrate class via [`crate::config::models::BandwidthProfile`]:
+
+| Profile | Slots | Memory / channel | Headroom @ 50 Mbps | @ 500 Mbps | @ 3 Gbps | @ 12 Gbps |
+|---|---:|---:|---:|---:|---:|---:|
+| `Standard` (default) | 16 384 | 21 MB | 3.4 s | 344 ms | 56 ms | 14 ms |
+| `HighBitrate` | 32 768 | 43 MB | 6.9 s | 690 ms | 115 ms | 28 ms |
+| `Uncompressed` | 65 536 | 86 MB | 13.8 s | 1.38 s | 230 ms | 57 ms |
+
+Each slot holds one `RtpPacket` (≈1316 B for 7×188 TS in RTP).
+`engine::bandwidth_profile::resolve_for_flow` picks the tier:
+
+- **ST 2110-20**, **ST 2110-23**, **MXL video** → `Uncompressed`
+- Everything else → `Standard`
+- Flow takes the widest class across its inputs (Hitless dual-leg with
+  one ST 2110-20 leg promotes the whole flow's channels)
+- Operator override on `FlowConfig.bandwidth_profile` wins
+  unconditionally — set explicitly for the rare HEVC 4K compressed
+  contribution case where Standard's 56 ms @ 3 Gbps is tight
+
+The resolved capacity is applied to **every broadcast-class channel on
+the flow**: the main fan-out, each per-input pre-broadcast, and the
+fixer command channel. Transcode chain in/out queues stay at the
+Standard tier (`16 384` slots) since they're per-output and downstream
+of the encoder's pacing budget — buffering past that produces nothing
+useful.
+
+### PID-bus channel sizing (per-PID, by stream type)
+
+`NodeEsBus` creates one `broadcast::Sender<EsPacket>` per
+`(input_id, source_pid)` pair. Capacity is now stream-type aware —
+audio and data PIDs run at 1/8 to 1/16 the video size since their
+bitrates are 1000× lower:
+
+| Stream class | Capacity | Memory |
+|---|---:|---:|
+| Video (H.264, HEVC, MPEG-2, JPEG 2000, etc.) | 8 192 slots | ~480 KB / PID |
+| Audio (MP2, AAC, AC-3, E-AC-3, DTS, etc.) | 1 024 slots | ~60 KB / PID |
+| Data, private, DSM-CC | 1 024 slots | ~60 KB / PID |
+| SCTE-35 (`0x86`) | 512 slots | ~30 KB / PID |
+| Unknown / pre-PMT | 8 192 slots | ~480 KB / PID (safe video fallback) |
+
+A typical SCTE-35 broadcast feed (1 video + 4 audio + 4 captions + 1
+SCTE-35) drops from ~4.9 MB to ~570 KB of bus-channel memory — ~88 %
+saved with no functional change. See
+[`bus_capacity_for_stream_type`](../src/engine/ts_es_bus.rs) for the
+exact stream-type → capacity table.

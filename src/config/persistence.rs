@@ -286,6 +286,7 @@ mod tests {
                 content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
             }],
         };
 

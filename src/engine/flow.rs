@@ -73,7 +73,7 @@ use super::output_rtp::spawn_rtp_output;
 use super::output_srt::spawn_srt_output;
 use super::output_udp::spawn_udp_output;
 use super::output_webrtc::spawn_webrtc_output;
-use super::packet::{BROADCAST_CHANNEL_CAPACITY, RtpPacket};
+use super::packet::RtpPacket;
 use super::ts_continuity_fixer::{ProcessResult, TsContinuityFixer};
 use super::bandwidth_monitor::spawn_bandwidth_monitor;
 use super::degradation_monitor::spawn_degradation_monitor;
@@ -100,9 +100,12 @@ use crate::stats::collector::{MediaAnalysisAccumulator, ThumbnailAccumulator, Tr
 ///   re-publishes the packet onto `broadcast_tx`.
 /// - **Main broadcast channel** (`broadcast_tx`): a Tokio `broadcast::Sender`
 ///   that fans out every incoming packet to all subscribed outputs. The
-///   channel is bounded to [`BROADCAST_CHANNEL_CAPACITY`] slots; slow
-///   receivers that fall behind will receive a `Lagged` error and lose
-///   packets rather than blocking the input.
+///   channel is bounded — capacity is set by the flow's
+///   [`crate::config::models::BandwidthProfile`] (see
+///   [`crate::engine::bandwidth_profile::resolve_for_flow`]) and ranges
+///   from 16 384 slots (Standard) up to 65 536 slots (Uncompressed).
+///   Slow receivers that fall behind will receive a `Lagged` error and
+///   lose packets rather than blocking the input.
 /// - **Active-input watch** (`active_input_tx`): a `tokio::sync::watch`
 ///   channel carrying the ID of the currently active input. Switching inputs
 ///   is a single `send(new_id)` — no task restart, no broadcast-channel
@@ -222,6 +225,12 @@ pub struct FlowRuntime {
     /// thumbnail decision.
     #[allow(dead_code)] // Phase 1b wires the reader via FlowRuntime::add_input.
     pub ffmpeg_available: bool,
+    /// Per-flow broadcast-class channel capacity (slots). Derived from
+    /// the resolved [`crate::config::models::BandwidthProfile`] at flow
+    /// start and reused by [`Self::add_input`] so hot-added inputs
+    /// build their per-input broadcast channel at the same size as
+    /// the start-time inputs.
+    pub broadcast_capacity: usize,
     /// Watch channel receiver for the detected video frame rate (fps).
     /// Created when media analysis is enabled so that hot-added outputs
     /// with `TargetFrames` delay mode can subscribe to frame rate updates
@@ -551,14 +560,36 @@ impl FlowRuntime {
             .as_ref()
             .map(|_| Arc::clone(&node_es_bus));
         let cancel_token = CancellationToken::new();
-        // The broadcast channel is bounded to BROADCAST_CHANNEL_CAPACITY slots.
+
+        // Resolve the bandwidth profile for this flow. Operator override
+        // on `FlowConfig::bandwidth_profile` wins; otherwise auto-derive
+        // from the input set (ST 2110-20/-23 / MXL video → Uncompressed,
+        // everything else → Standard). The resolved capacity drives
+        // every broadcast-class channel on the flow: main fan-out,
+        // per-input pre-broadcast, fixer command channel.
+        let input_refs: Vec<&InputDefinition> = config.inputs.iter().collect();
+        let bandwidth_profile =
+            crate::engine::bandwidth_profile::resolve_for_flow(
+                &config.config,
+                &input_refs,
+            );
+        let broadcast_capacity = bandwidth_profile.broadcast_capacity();
+        tracing::info!(
+            "flow {}: bandwidth profile {:?} → broadcast capacity {} slots",
+            config.config.id,
+            bandwidth_profile,
+            broadcast_capacity,
+        );
+
+        // The broadcast channel is bounded to `broadcast_capacity` slots
+        // (set by the flow's bandwidth profile).
         // When a slow output (receiver) cannot keep up, it will *not* block the
         // input or other outputs. Instead, the lagging receiver's next `recv()`
         // returns `RecvError::Lagged(n)`, telling it how many messages it missed.
         // Each output handles this by incrementing its `packets_dropped` stat.
         // The underscore `_` receiver is created and immediately dropped; it is
         // only needed to satisfy the channel constructor signature.
-        let (broadcast_tx, _) = broadcast::channel::<RtpPacket>(BROADCAST_CHANNEL_CAPACITY);
+        let (broadcast_tx, _) = broadcast::channel::<RtpPacket>(broadcast_capacity);
 
         // Pick the active input (if any) up front — used for stats registration,
         // media analysis setup, and the initial value of the active-input watch.
@@ -611,11 +642,11 @@ impl FlowRuntime {
         // The fixer is owned by a single dedicated task (`ts_fixer_task`)
         // so the per-input forwarders can hand off work via a bounded mpsc
         // without ever locking shared state on the packet hot path.
-        // Channel capacity matches the per-flow `BROADCAST_CHANNEL_CAPACITY`
-        // so drop-on-full semantics line up with the upstream broadcast
-        // drop-on-lag behaviour.
+        // Channel capacity matches the per-flow bandwidth-profile
+        // broadcast capacity so drop-on-full semantics line up with the
+        // upstream broadcast drop-on-lag behaviour.
         let (fixer_tx, fixer_rx) = tokio::sync::mpsc::channel::<FixerCommand>(
-            BROADCAST_CHANNEL_CAPACITY,
+            broadcast_capacity,
         );
         let fixer_task_cancel = cancel_token.child_token();
         // Handle is intentionally dropped — the task lives for the flow's
@@ -720,6 +751,7 @@ impl FlowRuntime {
             ffmpeg_available,
             thumbnail_enabled: config.config.thumbnail,
             flow_clock_domain: config.config.clock_domain,
+            broadcast_capacity,
             #[cfg(feature = "replay")]
             replay_command_txs: &replay_command_txs,
         };
@@ -1381,6 +1413,7 @@ impl FlowRuntime {
             fixer_tx,
             global_stats,
             ffmpeg_available,
+            broadcast_capacity,
             frame_rate_rx,
             pid_bus_assembler_handle,
             es_bus,
@@ -2618,6 +2651,7 @@ impl FlowRuntime {
             ffmpeg_available: self.ffmpeg_available,
             thumbnail_enabled: self.config.config.thumbnail,
             flow_clock_domain: self.config.config.clock_domain,
+            broadcast_capacity: self.broadcast_capacity,
             #[cfg(feature = "replay")]
             replay_command_txs: &self.replay_command_txs,
         };
@@ -3305,6 +3339,12 @@ pub(crate) struct InputSpawnContext<'a> {
     pub ffmpeg_available: bool,
     pub thumbnail_enabled: bool,
     pub flow_clock_domain: Option<u8>,
+    /// Per-flow per-input broadcast capacity (slots). Derived from the
+    /// flow's [`crate::config::models::BandwidthProfile`] in
+    /// [`FlowRuntime::start`]; passed through here so the hot-add path
+    /// builds its `per_input_tx` at the same size as the start-time
+    /// inputs. Matches the flow's main broadcast channel capacity.
+    pub broadcast_capacity: usize,
     #[cfg(feature = "replay")]
     pub replay_command_txs:
         &'a dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::replay::ReplayCommand>>,
@@ -3347,7 +3387,7 @@ pub(crate) fn spawn_input_runtime(
 ) -> SpawnedInputRuntime {
     let input_id = input_def.id.clone();
     let input_cancel = ctx.flow_cancel.child_token();
-    let (per_input_tx, _) = broadcast::channel::<RtpPacket>(BROADCAST_CHANNEL_CAPACITY);
+    let (per_input_tx, _) = broadcast::channel::<RtpPacket>(ctx.broadcast_capacity);
 
     let psi_catalog = ctx
         .flow_manager

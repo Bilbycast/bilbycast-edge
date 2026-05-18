@@ -82,7 +82,11 @@ pub fn spawn_hitless_es_merger_full(
     let mut primary_rx = bus.subscribe(&primary.0, primary.1);
     let mut backup_rx = bus.subscribe(&backup.0, backup.1);
     let (out_input, out_pid) = hitless_bus_key(&uid);
-    let out_tx = bus.sender_for(&out_input, out_pid);
+    // `stream_type = 0` (unknown) → bus channel sizes at the video-class
+    // default (8192). Hitless mergers don't know the essence type up
+    // front and we'd rather over-allocate by a few KB than truncate a
+    // real video leg.
+    let out_tx = bus.sender_for(&out_input, out_pid, 0);
 
     tokio::spawn(async move {
         match (seq_aware, path_differential_ms) {
@@ -341,8 +345,8 @@ mod tests {
         );
 
         let mut out_rx = bus.subscribe(&format!("{HITLESS_INPUT_PREFIX}slot_0_0"), 0);
-        let pri = bus.sender_for("in-a", 0x100);
-        let bak = bus.sender_for("in-b", 0x200);
+        let pri = bus.sender_for("in-a", 0x100, 0x1B);
+        let bak = bus.sender_for("in-b", 0x200, 0x03);
 
         // Give the merger time to subscribe.
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -379,8 +383,8 @@ mod tests {
         );
 
         let mut out_rx = bus.subscribe(&format!("{HITLESS_INPUT_PREFIX}slot_0_0"), 0);
-        let pri = bus.sender_for("in-a", 0x100);
-        let bak = bus.sender_for("in-b", 0x200);
+        let pri = bus.sender_for("in-a", 0x100, 0x1B);
+        let bak = bus.sender_for("in-b", 0x200, 0x03);
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         // Prime primary so the merger anchors.
@@ -415,8 +419,8 @@ mod tests {
         );
 
         let mut out_rx = bus.subscribe(&format!("{HITLESS_INPUT_PREFIX}slot_0_0"), 0);
-        let pri = bus.sender_for("in-a", 0x100);
-        let bak = bus.sender_for("in-b", 0x200);
+        let pri = bus.sender_for("in-a", 0x100, 0x1B);
+        let bak = bus.sender_for("in-b", 0x200, 0x03);
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         pri.send(es(0x100, 0xAA)).unwrap();

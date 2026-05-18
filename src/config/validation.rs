@@ -7172,6 +7172,7 @@ mod tests {
             content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
         });
         config
     }
@@ -7202,6 +7203,7 @@ mod tests {
             content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
         });
         config
     }
@@ -7397,6 +7399,7 @@ mod tests {
             content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
         });
         config.flows.push(FlowConfig {
             id: "same-id".to_string(),
@@ -7414,6 +7417,7 @@ mod tests {
             content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -7532,6 +7536,7 @@ mod tests {
             content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
         });
         assert!(validate_config(&config).is_ok());
     }
@@ -7603,6 +7608,7 @@ mod tests {
             content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
         });
         assert!(validate_config(&config).is_ok());
     }
@@ -7702,6 +7708,7 @@ mod tests {
             content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -7773,6 +7780,7 @@ mod tests {
             content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -7844,6 +7852,7 @@ mod tests {
             content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -8059,6 +8068,7 @@ mod tests {
             content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
         });
         config.flow_groups.push(FlowGroupConfig {
             id: "group-1".to_string(),
@@ -8115,6 +8125,7 @@ mod tests {
             content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
         });
         config.flow_groups.push(FlowGroupConfig {
             id: "group-1".to_string(),
@@ -8138,6 +8149,7 @@ mod tests {
             content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
         });
         assert!(validate_config(&config).is_err());
     }
@@ -8168,6 +8180,7 @@ mod tests {
             content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
         });
         config.flow_groups.push(FlowGroupConfig {
             id: "group-1".to_string(),

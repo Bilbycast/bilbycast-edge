@@ -657,6 +657,7 @@ mod tests {
                 content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
             }],
             tunnels: vec![TunnelConfig {
                 id: "tunnel-1".to_string(),
@@ -780,6 +781,7 @@ mod tests {
                 content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
             }],
             ..Default::default()
         };
@@ -848,6 +850,7 @@ mod tests {
                 content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
             }],
             ..Default::default()
         };
@@ -901,6 +904,7 @@ mod tests {
                 content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
             }],
             ..Default::default()
         };

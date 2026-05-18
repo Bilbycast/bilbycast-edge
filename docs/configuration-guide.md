@@ -573,6 +573,7 @@ At startup (or on create/update), `AppConfig::resolve_flow()` dereferences the I
 | `input_ids` | array of strings | No | `[]` | IDs of inputs from the top-level `inputs` array. Each referenced input must exist and must not already be assigned to another flow. At most one input may be active at a time. Can be empty (output-only flow). |
 | `output_ids` | array of strings | No | `[]` | IDs of outputs from the top-level `outputs` array. Each referenced output must exist and must not already be assigned to another flow. Can be empty (input-only flow). |
 | `assembly` | object | No | `null` | Optional PID-bus assembly block. `null` (or `"kind": "passthrough"`) = legacy passthrough. Set `"kind": "spts"` / `"mpts"` to build a fresh TS from elementary streams pulled off any of the flow's inputs. See [Flow Assembly (PID bus)](#flow-assembly-pid-bus--spts--mpts-from-n-inputs). |
+| `bandwidth_profile` | string | No | auto | Per-flow broadcast-channel capacity tier. `"standard"` (16 384 slots / ~21 MB) handles TS-contribution up to ~500 Mbps; `"high_bitrate"` (32 768 / ~43 MB) for 500 Mbps – 3 Gbps compressed; `"uncompressed"` (65 536 / ~86 MB) for ST 2110-20/-23 + MXL video. Omit to auto-derive from inputs (ST 2110-20/-23 / MXL video → uncompressed, everything else → standard). Operators override only when auto picks too low a tier for an unusually-high-bitrate compressed source. |
 
 ### Multi-Input Flows and Seamless Switching
 

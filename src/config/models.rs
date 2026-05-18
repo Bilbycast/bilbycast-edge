@@ -622,6 +622,70 @@ pub struct FlowConfig {
     /// disagrees.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub master_clock: Option<MasterClockConfig>,
+    /// Optional per-flow bandwidth profile. Sizes the flow's broadcast
+    /// channels (fan-out + per-input pre-broadcast + transcode chain
+    /// hand-off) to give enough headroom for the active essence's
+    /// bitrate class. `None` (default) → auto-derive from the flow's
+    /// inputs (uncompressed ST 2110 / MXL video → `Uncompressed`,
+    /// everything else → `Standard`). Operators override here for the
+    /// rare case of >500 Mbps compressed video where Standard's
+    /// jitter headroom is tight. See
+    /// `engine::bandwidth_profile::resolve_for_flow`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bandwidth_profile: Option<BandwidthProfile>,
+}
+
+/// Channel-capacity tier for a flow's broadcast-class channels.
+///
+/// Each broadcast slot holds one [`crate::engine::packet::RtpPacket`]
+/// (1316 bytes typical for 7×188 TS bundled into RTP). The tier sets
+/// the slot count, which translates to a wallclock jitter budget at
+/// the flow's bitrate:
+///
+/// | Tier            | Slots   | At 50 Mbps | At 500 Mbps | At 3 Gbps | At 12 Gbps |
+/// |-----------------|--------:|-----------:|------------:|----------:|-----------:|
+/// | `Standard`      | 16 384  | 3.4 s      | 344 ms      | 56 ms     | 14 ms      |
+/// | `HighBitrate`   | 32 768  | 6.9 s      | 690 ms      | 115 ms    | 28 ms      |
+/// | `Uncompressed`  | 65 536  | 13.8 s     | 1.38 s      | 230 ms    | 57 ms      |
+///
+/// Memory cost per broadcast channel: ~21 MB / 43 MB / 86 MB. Per
+/// flow the cost multiplies by the number of broadcast-class channels
+/// (the flow's main fan-out + one per-input pre-broadcast + the
+/// fixer command channel — typically 3 to 10 channels depending on
+/// the number of inputs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BandwidthProfile {
+    /// 16 384 slots. The default for TS-carrying flows up to ~500 Mbps
+    /// compressed video. Generous jitter budget on every typical
+    /// contribution / distribution flow.
+    Standard,
+    /// 32 768 slots. For compressed video flows in the 500 Mbps –
+    /// 3 Gbps range — UHD HEVC contribution, JPEG XS (ST 2110-22 when
+    /// it lands), or a hitless dual-leg at the top of the compressed
+    /// envelope.
+    HighBitrate,
+    /// 65 536 slots. For uncompressed essence — ST 2110-20 / -23 video,
+    /// MXL video. Auto-selected when the flow's inputs include any
+    /// uncompressed-essence type.
+    Uncompressed,
+}
+
+impl BandwidthProfile {
+    /// Broadcast channel capacity (slots) for this profile.
+    pub const fn broadcast_capacity(self) -> usize {
+        match self {
+            Self::Standard => 16_384,
+            Self::HighBitrate => 32_768,
+            Self::Uncompressed => 65_536,
+        }
+    }
+}
+
+impl Default for BandwidthProfile {
+    fn default() -> Self {
+        Self::Standard
+    }
 }
 
 /// Per-flow master-clock override. Mirrors the
@@ -5980,6 +6044,7 @@ mod tests {
                 content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
             }],
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
@@ -6053,6 +6118,7 @@ mod tests {
                 content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
             }],
             ..Default::default()
         };
@@ -6083,6 +6149,7 @@ mod tests {
                 content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
             }],
             ..Default::default()
         };
@@ -6161,6 +6228,7 @@ mod tests {
                 content_analysis: None,
                 recording: None,
                 master_clock: None,
+                bandwidth_profile: None,
             }],
             ..Default::default()
         };

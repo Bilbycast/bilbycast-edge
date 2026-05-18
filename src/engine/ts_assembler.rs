@@ -2502,8 +2502,8 @@ mod tests {
         // slot to fill a full bundle.
         let _ = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
 
-        let video_tx = bus.sender_for("in-a", 0x100);
-        let audio_tx = bus.sender_for("in-b", 0x200);
+        let video_tx = bus.sender_for("in-a", 0x100, 0x1B);
+        let audio_tx = bus.sender_for("in-b", 0x200, 0x03);
         // 7 packets total → exactly one full bundle.
         for i in 0..5 {
             video_tx
@@ -2699,7 +2699,7 @@ mod tests {
         // new out_pid (still 0x200). Fan-in reuse means `in-c:0x100` got
         // a fresh fan-in task but the original one for `in-a:0x100` was
         // cancelled.
-        let video_tx = bus.sender_for("in-c", 0x100);
+        let video_tx = bus.sender_for("in-c", 0x100, 0x1B);
         video_tx
             .send(EsPacket {
                 source_pid: 0x100,

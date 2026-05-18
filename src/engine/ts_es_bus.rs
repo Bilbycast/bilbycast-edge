@@ -54,17 +54,70 @@ use tokio::sync::broadcast;
 use super::packet::RtpPacket;
 use super::ts_parse::*;
 
-/// Bus capacity per PID. Sized to match `BROADCAST_CHANNEL_CAPACITY`
-/// (8192) so the per-PID bus offers the same per-subscriber buffer
-/// envelope as the flow-level fan-out. At a few hundred Mbps total
-/// compressed input (the typical edge workload), a single video PID
-/// carrying ~90 % of the bitrate runs at ~40 kpps; 8192 slots ≈ 200 ms
-/// of buffer — enough for input switches, PMT updates, and 2022-7
-/// dual-leg merge transients without lagging consumers losing data.
-/// Memory cost: ~60 B per slot × 8192 ≈ 480 KB per PID, ~8 MB across
-/// a 16-PID input bus. A well-paced consumer stays well within
-/// budget; a lagging one drops via `RecvError::Lagged`.
+/// Bus capacity per PID — fallback when stream-type-aware sizing isn't
+/// possible (subscriber arrives before the publisher has learned the
+/// PMT, so we don't yet know whether the PID carries video, audio, or
+/// data). Sized for the worst case (video) to avoid over-truncating
+/// during the brief pre-PMT window. Kept as a public constant for
+/// downstream callers / tests that want the video-class baseline.
+///
+/// **Right-sized values per stream class** — see
+/// [`bus_capacity_for_stream_type`]. A single video PID carrying ~90 %
+/// of a flow's compressed bitrate at a few hundred Mbps runs at
+/// ~40 kpps; 8192 slots ≈ 200 ms of buffer at that rate — enough for
+/// input switches, PMT updates, and 2022-7 dual-leg merge transients
+/// without lagging consumers losing data. Memory cost: ~60 B per slot
+/// × 8192 ≈ 480 KB per video PID. Audio and data PIDs use far smaller
+/// channels (see the helper) since their bitrates are 1000× lower.
+#[allow(dead_code)]
 pub const BUS_CHANNEL_CAPACITY: usize = 8192;
+
+/// Bus channel capacity (slots) appropriate for a PMT-declared
+/// `stream_type`.
+///
+/// Audio and data PIDs at typical bitrates (~200 kbps audio, < 1 kbps
+/// SCTE-35) consume two to four orders of magnitude less bandwidth
+/// than video, so the bus channel for them can be much smaller and
+/// still hold seconds of buffer. Right-sizing matters when an
+/// assembled flow plan references many audio + data PIDs (typical
+/// SCTE-35 broadcast feed: 1 video + 4 audio + 4 captions + 1 SCTE-35
+/// = 10 PIDs) — the saving is ~75 % of the bus memory budget vs the
+/// uniform-8192 model.
+///
+/// `0` (unknown stream_type) returns the video capacity to stay safe
+/// — we'd rather over-allocate during the brief pre-PMT learning
+/// window than risk truncating a video PID.
+///
+/// Reference: ISO/IEC 13818-1 Table 2-34, ATSC A/53, DVB EN 300 468,
+/// SCTE 35.
+pub const fn bus_capacity_for_stream_type(stream_type: u8) -> usize {
+    match stream_type {
+        // Video — MPEG-1/2 (0x01, 0x02), MPEG-4 (0x10), H.264 (0x1B),
+        // SVC/MVC variants (0x20, 0x21, 0x24), JPEG 2000 (0x42),
+        // H.265 / HEVC (0x52, 0xD1).
+        0x01 | 0x02 | 0x10 | 0x1B | 0x20 | 0x21 | 0x24 | 0x42 | 0x52 | 0xD1 => 8192,
+        // Audio — MPEG-1 (0x03), MPEG-2 (0x04), AAC ADTS (0x0F),
+        // AAC LATM (0x11), MPEG-4 audio (0x1C), AC-3 (0x80/0x81),
+        // DTS (0x82), DTS-HD (0x83, 0x86), E-AC-3 (0x87), and the
+        // ATSC private-audio range (0x84, 0x85, 0x88, 0xC1, 0xC2).
+        // At 96–384 kbps typical bitrate, 1024 slots × ~60 B = 61 KB
+        // per audio PID and still ≥ 10 s of buffer at 200 kbps.
+        0x03 | 0x04 | 0x0F | 0x11 | 0x1C | 0x80 | 0x81 | 0x82 | 0x83 | 0x84 | 0x85
+        | 0x87 | 0x88 | 0xC1 | 0xC2 => 1024,
+        // SCTE-35 splice info (0x86) — splice messages are tens of
+        // bytes apart from sparse insertions; even 512 is generous.
+        0x86 => 512,
+        // Private data (0x05, 0x06), DSM-CC (0x0B/0x0C), AC-3 in the
+        // private namespace, ANC, captions, teletext. Sparse-to-modest
+        // bitrate; 1024 covers both teletext-class and ANC-class with
+        // headroom.
+        0x05 | 0x06 | 0x0B | 0x0C => 1024,
+        // Unknown — pre-PMT window, or a stream_type the standards have
+        // added since this table was last updated. Fall back to the
+        // video-class default to avoid truncating a real video PID.
+        _ => 8192,
+    }
+}
 
 /// A single elementary-stream packet on the bus.
 ///
@@ -132,11 +185,25 @@ impl NodeEsBus {
 
     /// Resolve (or create) the broadcast sender for a given
     /// `(input_id, source_pid)` key. Subsequent publishes go through it.
-    pub fn sender_for(&self, input_id: &str, source_pid: u16) -> broadcast::Sender<EsPacket> {
+    ///
+    /// `stream_type` is the PMT-declared codec class — used to size the
+    /// channel appropriately on first creation (see
+    /// [`bus_capacity_for_stream_type`]). Subsequent calls with the same
+    /// key ignore the hint (channel capacity is fixed at construction).
+    /// Pass `0` when the stream type is not yet known (subscribe-before-
+    /// PMT path) — the channel falls back to the video-class default,
+    /// which over-allocates briefly but never under-truncates.
+    pub fn sender_for(
+        &self,
+        input_id: &str,
+        source_pid: u16,
+        stream_type: u8,
+    ) -> broadcast::Sender<EsPacket> {
         if let Some(tx) = self.channels.get(&(input_id.to_string(), source_pid)) {
             return tx.value().clone();
         }
-        let (tx, _) = broadcast::channel(BUS_CHANNEL_CAPACITY);
+        let cap = bus_capacity_for_stream_type(stream_type);
+        let (tx, _) = broadcast::channel(cap);
         self.channels
             .entry((input_id.to_string(), source_pid))
             .or_insert(tx)
@@ -148,8 +215,13 @@ impl NodeEsBus {
     /// if no publisher has touched it yet — that way the Phase 5
     /// assembler can wire up its consumers before the input task has
     /// seen any packets.
+    ///
+    /// Subscribe-before-publish creates the channel at the video-class
+    /// default (8192) because the stream type isn't known yet; once the
+    /// publisher arrives with a real `stream_type`, the channel already
+    /// exists and is reused (capacity is fixed at construction).
     pub fn subscribe(&self, input_id: &str, source_pid: u16) -> broadcast::Receiver<EsPacket> {
-        self.sender_for(input_id, source_pid).subscribe()
+        self.sender_for(input_id, source_pid, 0).subscribe()
     }
 
     /// Snapshot the currently-registered `(input_id, source_pid)` keys.
@@ -255,7 +327,7 @@ impl TsEsDemuxer {
                 recv_time_us: pkt.recv_time_us,
                 upstream_seq: pkt.upstream_seq,
             };
-            let tx = self.bus.sender_for(&self.input_id, pid);
+            let tx = self.bus.sender_for(&self.input_id, pid, stream_type);
             // `send` returns `Err` only when there are no active
             // subscribers — that's fine, we don't hold packets for the
             // future. Count attempts, not actual receivers.
@@ -552,7 +624,7 @@ mod tests {
         // Subscribe-first pattern — the Phase 5 assembler wires up before
         // the demuxer publishes, so channels must exist at subscribe time.
         let mut rx = bus.subscribe("in-a", 0x100);
-        let tx = bus.sender_for("in-a", 0x100);
+        let tx = bus.sender_for("in-a", 0x100, 0x1B);
         let dummy = EsPacket {
             source_pid: 0x100,
             stream_type: 0x1B,
