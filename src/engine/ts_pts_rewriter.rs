@@ -258,6 +258,42 @@ pub struct TsPtsRewriter {
     /// whose audio is passthrough (no replacer in the pipeline to
     /// receive the signal).
     pcr_jump_signal: Option<Arc<std::sync::atomic::AtomicI64>>,
+    /// **MPTS guard latch.** Set on the first PAT observation that
+    /// shows > 1 program. When set, every subsequent `process()` call
+    /// becomes a verbatim passthrough: no PCR rewriting, no PES PTS
+    /// rewriting, no PSI_RR injection, no SCTE-35 pts_adjustment.
+    ///
+    /// **Why.** The shared `ClockAnchor` model in this rewriter
+    /// assumes a single 27 MHz source clock — true of every SPTS but
+    /// false of every MPTS (each program has its own independent
+    /// PCR_PID and clock domain, often originating from different
+    /// upstream encoders with multi-second offsets between their clocks).
+    /// Running `rewrite_pcr_value` on PCRs from multiple PIDs against
+    /// one anchor produces a stream of fake `> 500 ms` jumps (every
+    /// PCR appears as a discontinuity vs the previous-PID's PCR),
+    /// triggers the "backward bridge"/"forward DI=1" paths
+    /// continuously, and corrupts every output PCR by the inter-PID
+    /// clock skew (commonly multi-second). PES PTS rewriting is
+    /// similarly broken: `out_pts = anchor.out + (src_pts -
+    /// anchor.src)` returns values offset by the inter-program clock
+    /// skew on every non-anchor program.
+    ///
+    /// The safe fallback is verbatim passthrough — the source clocks
+    /// are already broadcast-grade for any contribution-class MPTS,
+    /// and the per-PID PCR_AC at the receiver is preserved if the
+    /// wallclock pacing at egress (`engine::wire_emit`) holds the
+    /// source byte cadence. Operators who need muxer-mode
+    /// regeneration on MPTS today should down-select to a single
+    /// program via the upstream input's `program_number` filter
+    /// (drops every non-target program before this rewriter sees
+    /// anything; the SPTS path then runs end-to-end).
+    ///
+    /// One-way latch: clears only on `TsPtsRewriter` reconstruction
+    /// (one per input lifetime). PMT-version churn on the source
+    /// (typical broadcast captures bump versions every loop) can't
+    /// flip the rewriter back into SPTS muxer mode mid-stream, which
+    /// would produce a one-time anchor reset glitch.
+    mpts_passthrough_latch: bool,
 }
 
 impl TsPtsRewriter {
@@ -278,6 +314,7 @@ impl TsPtsRewriter {
             last_psi_emit_master_27mhz: None,
             scte35_pids: HashSet::new(),
             pcr_jump_signal: None,
+            mpts_passthrough_latch: false,
         }
     }
 
@@ -300,6 +337,18 @@ impl TsPtsRewriter {
     /// Output length may exceed input length when synthetic packets are
     /// injected for PCR_RR (40 ms) or PSI_RR (500 ms) compliance.
     pub fn process(&mut self, ts_in: &[u8], out: &mut Vec<u8>) {
+        // MPTS guard: latched on the first PAT showing > 1 program.
+        // Verbatim passthrough — the shared `ClockAnchor` model is
+        // SPTS-only, see `mpts_passthrough_latch` doc-comment. Still
+        // peek-observe PAT/PMT below so the latch keeps tracking
+        // post-PMT-version-bump program-count changes (any time we
+        // see > 1 program, we stay latched — never unlatch).
+        //
+        // We still call observe_pat() inline below so the latch
+        // evaluation runs on every PAT packet. Without it, the
+        // latch would never fire on streams whose first packet
+        // isn't a PAT (e.g. mid-stream join after the first PAT
+        // version flowed past the rewriter's startup).
         let mut offset = 0;
         while offset + TS_PACKET_SIZE <= ts_in.len() {
             let pkt = &ts_in[offset..offset + TS_PACKET_SIZE];
@@ -313,6 +362,18 @@ impl TsPtsRewriter {
             }
 
             let pid = ts_pid(pkt);
+
+            // In MPTS-passthrough mode every packet is forwarded
+            // verbatim, but we still must inspect each PAT to keep
+            // the latch evaluation current (PAT version churn can
+            // show > 1 program after a single-program startup).
+            if self.mpts_passthrough_latch {
+                if pid == PAT_PID && ts_pusi(pkt) {
+                    self.observe_pat(pkt);
+                }
+                out.extend_from_slice(pkt);
+                continue;
+            }
 
             // PSI_RR guard (TR 101 290 §PAT_error / §PMT_error ≤ 500 ms):
             // if no PSI has flowed in 500 ms, inject cached PAT + PMTs
@@ -777,6 +838,21 @@ impl TsPtsRewriter {
         self.last_pat_version = Some(version);
 
         let programs = parse_pat_programs(pkt);
+        // MPTS guard: any PAT showing > 1 program latches the rewriter
+        // into verbatim-passthrough mode permanently. See
+        // `mpts_passthrough_latch` doc-comment for the SPTS-only
+        // `ClockAnchor` rationale. The check runs before the PMT-PID
+        // diff math below so the latch reflects the program count
+        // implied by THIS PAT, not the cumulative cache of previous
+        // PMT-PIDs (which can be stale after PMT removal).
+        if !self.mpts_passthrough_latch && programs.len() > 1 {
+            self.mpts_passthrough_latch = true;
+            tracing::info!(
+                program_count = programs.len(),
+                "ts_pts_rewriter: MPTS detected — latching into verbatim passthrough \
+                 (use upstream `program_number` filter to down-select to SPTS for muxer-mode)"
+            );
+        }
         let new_pmt_pids: HashSet<u16> = programs.into_iter().map(|(_, p)| p).collect();
         let lost: Vec<u16> = self.pmt_pids.difference(&new_pmt_pids).copied().collect();
         for pid in lost {
@@ -1916,5 +1992,156 @@ mod tests {
             }
             last_out = Some(pcr);
         }
+    }
+
+    /// Build a minimal MPTS PAT (one TS packet) listing N programs, each
+    /// pointing at PMT PID `0x100 + i`. Helper for the MPTS-passthrough
+    /// regression below.
+    fn build_mpts_pat(program_count: usize) -> [u8; TS_PACKET_SIZE] {
+        use crate::engine::ts_parse::mpeg2_crc32;
+        assert!(program_count >= 1 && program_count <= 16);
+        let mut pat = [0xFFu8; TS_PACKET_SIZE];
+        pat[0] = TS_SYNC_BYTE;
+        pat[1] = 0x40;
+        pat[2] = 0x00;
+        pat[3] = 0x10;
+        pat[4] = 0x00;
+        // Section payload: 5 fixed bytes + 4×N + 4 CRC.
+        let section_length: usize = 5 + 4 * program_count + 4;
+        pat[5] = 0x00;
+        pat[6] = 0xB0 | (((section_length >> 8) as u8) & 0x0F);
+        pat[7] = (section_length & 0xFF) as u8;
+        pat[8] = 0x00;
+        pat[9] = 0x01;
+        pat[10] = 0xC1;
+        pat[11] = 0x00;
+        pat[12] = 0x00;
+        for i in 0..program_count {
+            let off = 13 + i * 4;
+            let prog_no = (i as u16) + 1;
+            let pmt_pid = 0x100u16 + i as u16;
+            pat[off] = ((prog_no >> 8) & 0xFF) as u8;
+            pat[off + 1] = (prog_no & 0xFF) as u8;
+            pat[off + 2] = 0xE0 | (((pmt_pid >> 8) as u8) & 0x1F);
+            pat[off + 3] = (pmt_pid & 0xFF) as u8;
+        }
+        let crc_end = 5 + 3 + section_length;
+        let crc = mpeg2_crc32(&pat[5..crc_end - 4]);
+        pat[crc_end - 4] = (crc >> 24) as u8;
+        pat[crc_end - 3] = (crc >> 16) as u8;
+        pat[crc_end - 2] = (crc >> 8) as u8;
+        pat[crc_end - 1] = crc as u8;
+        pat
+    }
+
+    /// MPTS guard: a PAT showing > 1 program latches the rewriter into
+    /// verbatim passthrough mode. Subsequent PCR + PES packets emit
+    /// byte-for-byte unchanged, regardless of how far apart the per-PID
+    /// source PCR values are. Without this latch, the shared
+    /// `ClockAnchor` model treats every PID's PCR as a discontinuity
+    /// against the previous-PID's PCR, fires DI=1 on every PCR, and
+    /// corrupts output PCR values by the inter-PID clock skew
+    /// (commonly multi-second on real-world MPTS captures).
+    #[test]
+    fn mpts_pat_latches_into_verbatim_passthrough() {
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut buf = Vec::new();
+        // 10-program PAT — typical of a broadcast MPTS capture (matches
+        // `broadcast-mpts-hevc-1080p-hd-russia-dttv.ts` shape that
+        // exposed the original bug).
+        let pat = build_mpts_pat(10);
+        r.process(&pat, &mut buf);
+        assert!(r.mpts_passthrough_latch, "PAT with 10 programs MUST latch the MPTS guard");
+        assert_eq!(buf.len(), TS_PACKET_SIZE);
+        assert_eq!(&buf[..], &pat[..], "PAT itself passes verbatim");
+
+        // PCRs from two different "program" clock domains, 13 seconds
+        // apart in the source 27 MHz space — mirrors the real-world
+        // multi-program MPTS pattern where each program has its own
+        // independent encoder clock. Without the latch, the second PCR
+        // would trip the backward-discontinuity bridge and emit a
+        // bridged (not source) PCR value.
+        let src_pcr_a: u64 = 1_000_000_000;
+        let src_pcr_b: u64 = src_pcr_a - 13 * 27_000_000; // 13 s "earlier"
+
+        let pkt_a = build_pcr_packet(0x200, src_pcr_a);
+        let pkt_b = build_pcr_packet(0x300, src_pcr_b);
+
+        let mut out_a = Vec::new();
+        r.process(&pkt_a, &mut out_a);
+        assert_eq!(out_a.len(), TS_PACKET_SIZE);
+        assert_eq!(&out_a[..], &pkt_a[..], "PCR-A passes verbatim under MPTS latch");
+        assert_eq!(extract_pcr(&out_a).unwrap(), src_pcr_a, "PCR-A value unchanged");
+
+        let mut out_b = Vec::new();
+        r.process(&pkt_b, &mut out_b);
+        assert_eq!(out_b.len(), TS_PACKET_SIZE);
+        assert_eq!(&out_b[..], &pkt_b[..], "PCR-B passes verbatim under MPTS latch");
+        assert_eq!(
+            extract_pcr(&out_b).unwrap(),
+            src_pcr_b,
+            "PCR-B value preserved exactly — no anchor bridge, no DI=1 flag, \
+             source clocks pass through untouched"
+        );
+
+        // DI=1 must NOT be set (the source didn't have it; the latch
+        // prevented us from spuriously adding it).
+        use crate::engine::ts_parse::ts_discontinuity_indicator;
+        assert!(
+            !ts_discontinuity_indicator(&out_b),
+            "MPTS latch must NOT flag DI=1 on cross-PID PCRs"
+        );
+    }
+
+    /// Counter-regression: an SPTS PAT (single program) must NOT latch.
+    /// The muxer-mode rewriter must continue to regenerate PCR + PES PTS
+    /// on SPTS streams — that's the primary use case.
+    #[test]
+    fn spts_pat_does_not_latch() {
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut buf = Vec::new();
+        let pat = build_mpts_pat(1);
+        r.process(&pat, &mut buf);
+        assert!(
+            !r.mpts_passthrough_latch,
+            "single-program PAT must leave the rewriter in muxer mode"
+        );
+    }
+
+    /// One-way latch: once SPTS-rewriter mode is left behind, a later
+    /// MPTS PAT version must keep the latch ON. PMT-version churn on
+    /// real broadcast captures bumps the PAT once per loop wrap — if
+    /// the latch unlatched on a single-program PAT, the rewriter would
+    /// flip back into muxer mode (with the discontinuity bridge firing
+    /// on the next cross-PID PCR) and produce a one-time anchor reset
+    /// glitch every time the PAT churn happens to drop a program.
+    #[test]
+    fn mpts_latch_is_one_way() {
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut buf = Vec::new();
+        // First PAT: 5 programs → latches.
+        r.process(&build_mpts_pat(5), &mut buf);
+        assert!(r.mpts_passthrough_latch);
+        // Bump the PAT version and report only 1 program. The latch
+        // must STAY set — there's no path to unlatch.
+        let mut spts_pat = build_mpts_pat(1);
+        // Bump version (bits 1..5 of the version_number byte at
+        // sec_off + 5 = byte 10).
+        spts_pat[10] = (spts_pat[10] & 0xC1) | (0x01 << 1);
+        // Recompute CRC since we tampered with the section body.
+        use crate::engine::ts_parse::mpeg2_crc32;
+        let section_length = (((spts_pat[6] & 0x0F) as usize) << 8) | (spts_pat[7] as usize);
+        let crc_end = 5 + 3 + section_length;
+        let crc = mpeg2_crc32(&spts_pat[5..crc_end - 4]);
+        spts_pat[crc_end - 4] = (crc >> 24) as u8;
+        spts_pat[crc_end - 3] = (crc >> 16) as u8;
+        spts_pat[crc_end - 2] = (crc >> 8) as u8;
+        spts_pat[crc_end - 1] = crc as u8;
+        let mut out = Vec::new();
+        r.process(&spts_pat, &mut out);
+        assert!(
+            r.mpts_passthrough_latch,
+            "subsequent SPTS PAT must NOT unlatch — latch is one-way"
+        );
     }
 }

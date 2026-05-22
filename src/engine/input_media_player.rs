@@ -692,6 +692,20 @@ async fn play_ts_file(
     let mut first_pcr_byte_pos: u64 = 0;
     let mut current_bitrate_bps: u64 = pacer_initial_bitrate;
     let mut bytes_emitted: u64 = 0;
+    // MPTS guard: lock onto the first PCR-bearing PID for every
+    // pacing/anchoring computation. An MPTS file has one independent
+    // 27 MHz clock per program; mixing PCRs from multiple PIDs into a
+    // single anchor produces apparent multi-second discontinuities at
+    // every PID switch and collapses the bitrate estimator (observed
+    // values from PIDs whose clocks are offset by seconds blow well past
+    // the 100 kbps–10 Gbps sanity bounds or oscillate the estimate
+    // catastrophically). Mirrors `engine::wire_emit`'s `anchor_pid`
+    // behaviour at the egress. `None` until the first PCR is seen;
+    // every PCR-carrying packet on any other PID is then transparent
+    // to the bitrate / splice-offset / max-PCR trackers (its PCR bytes
+    // still pass through `rewrite_pcr_in_place` since `splice_offset_27m`
+    // is a flat shift applied uniformly).
+    let mut anchor_pcr_pid: Option<u16> = None;
     // Optional MPTS → SPTS down-select. Pre-allocated 188-byte scratch so
     // the per-packet path stays allocation-free (the filter writes 0 or
     // 188 bytes per input packet).
@@ -801,7 +815,22 @@ async fn play_ts_file(
         }
 
         // Read the raw PCR (pre-rewrite) for pacing and offset anchoring.
-        let raw_pcr = extract_pcr_27mhz(&packet);
+        // Filter to the anchor PCR PID so MPTS files (multiple independent
+        // 27 MHz clocks, one per program) anchor consistently — the first
+        // PCR-bearing packet's PID becomes the anchor and PCRs from other
+        // PIDs are ignored for pacing/anchoring. (Their bytes still pass
+        // through `rewrite_pcr_in_place` with the constant splice offset
+        // because that's a flat shift applied uniformly to every PCR.)
+        let raw_pcr_any = extract_pcr_27mhz(&packet);
+        let pcr_pid_early = ((packet[1] as u16 & 0x1F) << 8) | packet[2] as u16;
+        if raw_pcr_any.is_some() && anchor_pcr_pid.is_none() {
+            anchor_pcr_pid = Some(pcr_pid_early);
+        }
+        let raw_pcr = if anchor_pcr_pid == Some(pcr_pid_early) {
+            raw_pcr_any
+        } else {
+            None
+        };
 
         // Anchor the splice offset on the very first PCR we see in this
         // file. Until we have an offset, packets stream through with CC
@@ -886,10 +915,19 @@ async fn play_ts_file(
             // next loop's first PCR is ≥ this file's last PCR (otherwise
             // a backward PCR jump <500 ms slips below the rewriter's
             // discontinuity threshold and the wire pacer drifts).
-            if let Some(out_pcr_27m) = extract_pcr_27mhz(&packet) {
-                let out_pcr_90k = (out_pcr_27m / 300) & 0x1_FFFF_FFFF;
-                if out_pcr_90k > max_emitted_pcr_90k {
-                    max_emitted_pcr_90k = out_pcr_90k;
+            //
+            // MPTS guard: only track PCR high-water-mark on the anchor
+            // PCR PID — other PIDs in an MPTS have independent clocks
+            // whose absolute values are not comparable. Tracking the
+            // cross-PID max would push the next loop's target forward
+            // by the inter-PID clock skew (often seconds), corrupting
+            // smooth-splice arithmetic.
+            if anchor_pcr_pid == Some(pcr_pid_early) {
+                if let Some(out_pcr_27m) = extract_pcr_27mhz(&packet) {
+                    let out_pcr_90k = (out_pcr_27m / 300) & 0x1_FFFF_FFFF;
+                    if out_pcr_90k > max_emitted_pcr_90k {
+                        max_emitted_pcr_90k = out_pcr_90k;
+                    }
                 }
             }
             let off_90k = off_27m / 300;

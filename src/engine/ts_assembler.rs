@@ -1825,10 +1825,22 @@ async fn slot_fanin(
 ///
 /// Byte 1 upper 3 bits (TEI, PUSI, transport_priority) are preserved.
 /// Byte 3 upper 4 bits (transport_scrambling_control +
-/// adaptation_field_control) are preserved. CC advances only when the
-/// packet carries a payload; null-payload adaptation-only packets
-/// would not advance CC per H.222.0 — our PAT/PMT/ES emission never
-/// produces one so this is defensive rather than load-bearing.
+/// adaptation_field_control) are preserved.
+///
+/// CC handling follows H.222.0 §2.4.3.3 exactly:
+/// - **Payload-bearing packet** (AFC = `0b01` payload-only, or `0b11`
+///   AF+payload): stamp the next CC value from `cc_table`, then advance
+///   `cc_table` by one.
+/// - **AF-only packet** (AFC = `0b10`): stamp the previously-issued
+///   payload CC value, do NOT advance `cc_table`. Receivers expect the
+///   AF-only packet to carry the SAME CC as the prior payload packet
+///   on the same PID — advancing the counter on AF-only would produce
+///   a phantom CC_error on every PCR-only adaptation packet in the
+///   source, manifesting as 159-of-394 296 unexpected discontinuities
+///   in a 180 s sync-test SPTS run (one per source AF-only packet,
+///   spread across the whole capture, NOT clustered at splice
+///   boundaries). Previously the code unconditionally advanced
+///   `cc_table` and stamped the advanced value, breaking the contract.
 fn rewrite_es_packet(src: &[u8], out_pid: u16, cc_table: &mut std::collections::HashMap<u16, u8>) -> [u8; TS_PACKET_SIZE] {
     debug_assert_eq!(src.len(), TS_PACKET_SIZE);
     let mut pkt = [0u8; TS_PACKET_SIZE];
@@ -1837,14 +1849,26 @@ fn rewrite_es_packet(src: &[u8], out_pid: u16, cc_table: &mut std::collections::
     pkt[1] = (pkt[1] & 0xE0) | (((out_pid >> 8) as u8) & 0x1F);
     // Byte 2: new PID low byte.
     pkt[2] = (out_pid & 0xFF) as u8;
-    // Byte 3: mask out existing CC (low 4 bits), OR in fresh CC if this
-    // packet has a payload.
-    let afc = (pkt[3] >> 4) & 0x0F; // preserve scrambling + adaptation_field_control
-    let has_payload = (afc & 0x01) != 0; // bit0 of afc = payload_present
-    let _ = has_payload;
-    let cc = cc_table.entry(out_pid).or_insert(0);
-    let new_cc = *cc & 0x0F;
-    *cc = cc.wrapping_add(1) & 0x0F;
+    // Byte 3: preserve scrambling + adaptation_field_control nibble,
+    // rebuild CC nibble per H.222.0 §2.4.3.3.
+    let afc = (pkt[3] >> 4) & 0x0F;
+    let has_payload = (afc & 0x01) != 0; // low bit of AFC = payload_present
+    let cc_entry = cc_table.entry(out_pid).or_insert(0);
+    let new_cc = if has_payload {
+        let stamped = *cc_entry & 0x0F;
+        *cc_entry = cc_entry.wrapping_add(1) & 0x0F;
+        stamped
+    } else {
+        // AF-only: keep the prior payload's CC (= cc_entry - 1 mod 16,
+        // since cc_entry holds the next-to-issue value and has already
+        // advanced past the last issued payload). On cold start
+        // (cc_entry still 0), wrapping_sub yields 0xF — this is a
+        // harmless cold-start stamp because the receiver hasn't seen
+        // a baseline on this PID yet; the next payload packet will
+        // stamp CC=0 which the receiver accepts as a clean +1 from
+        // the 0xF baseline.
+        cc_entry.wrapping_sub(1) & 0x0F
+    };
     pkt[3] = (afc << 4) | new_cc;
     pkt
 }
@@ -2455,6 +2479,87 @@ mod tests {
         assert_eq!(ts_cc(&a0), 0);
         assert_eq!(ts_cc(&b0), 0, "new out_pid starts its own counter");
         assert_eq!(ts_cc(&a1), 1, "old out_pid advances independently");
+    }
+
+    /// Build an AF-only source packet (PCR-bearing, no PES payload).
+    /// AFC = `0b10`. Used to exercise the H.222.0 §2.4.3.3 rule that
+    /// AF-only packets MUST NOT advance the continuity counter — they
+    /// carry the previously-issued payload's CC value verbatim.
+    fn ts_af_only(src_pid: u16) -> Bytes {
+        let mut pkt = [0u8; TS_PACKET_SIZE];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = (((src_pid >> 8) as u8) & 0x1F);
+        pkt[2] = (src_pid & 0xFF) as u8;
+        pkt[3] = 0x20; // AFC = 0b10 (AF only, no payload), CC = 0
+        pkt[4] = 183; // AF length = 183 (fills remaining 188-5)
+        pkt[5] = 0x10; // PCR flag set
+        // PCR bytes 6..12 zeroed — content not checked by rewrite_es_packet.
+        Bytes::copy_from_slice(&pkt)
+    }
+
+    /// AF-only source packets MUST NOT advance the CC counter. The
+    /// previous behaviour unconditionally advanced cc_table, stamping
+    /// the AF-only packet with the next-payload CC value — receivers
+    /// then saw a `+1` jump between the prior payload and the AF-only
+    /// packet, counting one unexpected CC discontinuity per source
+    /// AF-only packet (~1 per video PCR_RR period, accumulating to
+    /// hundreds-per-minute on assembled SPTS outputs). Regression
+    /// reference: Cell 8 / Finding #2 in
+    /// `testbed/full_test_2026-05-21/v2/REPORT_v2.md`.
+    #[test]
+    fn rewrite_es_packet_af_only_does_not_advance_cc() {
+        let mut cc_table = std::collections::HashMap::new();
+        // Payload 1 → CC=0, cc_table advances to 1.
+        let p1 = rewrite_es_packet(&ts_es(0x100, true, 5, 0xAB), 0x200, &mut cc_table);
+        assert_eq!(ts_cc(&p1), 0, "first payload starts the CC sequence at 0");
+        assert_eq!(*cc_table.get(&0x200).unwrap(), 1, "cc_table advances to 1 after payload");
+
+        // AF-only between two payloads must stamp the prior payload's CC
+        // (= 0, the last issued), NOT advance the counter.
+        let af = rewrite_es_packet(&ts_af_only(0x100), 0x200, &mut cc_table);
+        assert_eq!(
+            ts_cc(&af),
+            0,
+            "AF-only must stamp the LAST PAYLOAD's CC (0), not the next-to-issue (1)"
+        );
+        assert_eq!(
+            *cc_table.get(&0x200).unwrap(),
+            1,
+            "cc_table MUST NOT advance on AF-only — receivers expect AF-only's CC to equal the prior payload's"
+        );
+
+        // Next payload picks up CC=1 — a clean +1 from the prior payload.
+        // Pre-fix code would have stamped CC=2 here, causing the receiver
+        // to count an unexpected discontinuity at every AF-only packet.
+        let p2 = rewrite_es_packet(&ts_es(0x100, false, 9, 0xCD), 0x200, &mut cc_table);
+        assert_eq!(ts_cc(&p2), 1, "second payload is +1 from first (NOT +2 across the AF-only)");
+        assert_eq!(*cc_table.get(&0x200).unwrap(), 2);
+    }
+
+    /// CC wrap is correctly preserved across AF-only packets. After
+    /// emitting payloads 0..=15, cc_table wraps from 15→0; the next
+    /// AF-only must stamp 15 (the prior payload's value, NOT
+    /// `cc_table - 1 = 0xF` mishandled as cold-start).
+    #[test]
+    fn af_only_after_cc_wrap_stamps_prior_payload_value() {
+        let mut cc_table = std::collections::HashMap::new();
+        // Burn through CC values 0..=15 with payload packets.
+        for _ in 0..16 {
+            let _ = rewrite_es_packet(&ts_es(0x100, false, 0, 0), 0x200, &mut cc_table);
+        }
+        assert_eq!(*cc_table.get(&0x200).unwrap(), 0, "cc_table wrapped to 0 after 16 payloads");
+        // AF-only after the wrap: stamp 15 (the last issued payload's
+        // CC), NOT 0xF re-interpreted from cold start. wrapping_sub(1)
+        // on 0 gives 0xFF, masked to 0x0F = 15 ✓ — happens to be the
+        // same byte value as cold-start 0xF, but the meaning differs:
+        // here it's a valid "last payload CC" rather than a cold-start
+        // sentinel.
+        let af = rewrite_es_packet(&ts_af_only(0x100), 0x200, &mut cc_table);
+        assert_eq!(ts_cc(&af), 0x0F, "AF-only after wrap must stamp prior payload CC (15)");
+        assert_eq!(*cc_table.get(&0x200).unwrap(), 0, "cc_table unchanged on AF-only");
+        // Next payload picks up CC=0 — clean +1 wrap from 15.
+        let next = rewrite_es_packet(&ts_es(0x100, false, 0, 0), 0x200, &mut cc_table);
+        assert_eq!(ts_cc(&next), 0);
     }
 
     #[test]
