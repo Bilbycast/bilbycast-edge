@@ -235,6 +235,26 @@ pub struct TsAudioReplacer {
     /// still false. Capped at 5 s per consume in the apply logic.
     pending_silence_27mhz: i64,
 
+    /// Master clock value (27 MHz) at the first PES anchor — used by
+    /// the wallclock-aware catch-up to compute how much master-clock
+    /// time has elapsed since this encoder started. `None` until the
+    /// first PES; cleared on `reset_source_state` (input switch /
+    /// codec change) so the next PES re-anchors. Sampled from
+    /// `av_sync_pacer.now_27mhz()`, which abstracts the per-flow
+    /// master clock: wallclock (host time, the default), PTP
+    /// (grandmaster-synced), or source_pcr_pll (PLL-recovered source
+    /// clock). The catch-up below works correctly for all three —
+    /// see the docstring on the catch-up site in `consume_pes`.
+    first_pes_master_27mhz: Option<u64>,
+
+    /// Source PES PTS (90 kHz) at the first PES anchor. Paired with
+    /// `first_pes_master_27mhz` so the catch-up can compute
+    /// `effective_out_pts_elapsed = effective_out_pts -
+    /// first_pes_src_pts_90k` and compare it against
+    /// `master.now_27mhz() - first_pes_master_27mhz`. `None` until
+    /// the first PES; cleared on `reset_source_state`.
+    first_pes_src_pts_90k: Option<u64>,
+
     /// Lazily constructed AAC-LC / ADTS decoder. Opened on the first PES
     /// flush once we know the source is AAC.
     #[cfg(feature = "fdk-aac")]
@@ -360,6 +380,8 @@ impl TsAudioReplacer {
             expected_next_src_pts_90k: None,
             pcr_jump_signal: None,
             pending_silence_27mhz: 0,
+            first_pes_master_27mhz: None,
+            first_pes_src_pts_90k: None,
             #[cfg(feature = "fdk-aac")]
             aac_decoder: None,
             #[cfg(feature = "media-codecs")]
@@ -758,6 +780,69 @@ impl TsAudioReplacer {
         self.out_pts_90k.wrapping_add(advance)
     }
 
+    /// Drain `pending_silence_27mhz` into the PCM accumulator as
+    /// zero samples — the encoder will produce K silence frames as
+    /// it drains, each one advancing `samples_since_anchor` by
+    /// `frame_size`. Long-term `effective_out_pts = out_pts_90k +
+    /// samples_since_anchor * 90000 / sr` advances by exactly
+    /// `silence_samples * 90000 / sr ≈ jump_27mhz / 300` — the
+    /// desired catch-up amount, independent of K.
+    ///
+    /// **`out_pts_90k` is intentionally untouched.** The pre-0.87
+    /// implementation also did `out_pts_90k += jump_90k -
+    /// frame_step` thinking it was correcting a "natural +1
+    /// encoder-frame-step" overshoot. That logic was only correct
+    /// when exactly one silence frame was emitted (K=1): for K>1
+    /// the formula double-counted, over-advancing effective PTS by
+    /// `(K-1) * frame_step` per jump (≈ 235 ms over on a typical
+    /// 268 ms loop-splice). Removing the `out_pts_90k += …` line
+    /// restores the correct long-term catch-up so audio PTS tracks
+    /// source PTS exactly even when the jump spans many frames.
+    ///
+    /// Cap at 5 s per consume to bound worst-case pathological
+    /// inputs (the cap protects against a stuck signal at startup
+    /// — operator gets a single fixed-size burst of silence, not
+    /// hours of zeroes).
+    ///
+    /// No-op when `pending_silence_27mhz == 0`, when
+    /// `codecs_ready == false` (encoder pipeline not yet open —
+    /// the queue persists across decode failures and the first
+    /// PES), or when `resolved_sample_rate == 0` (cannot convert
+    /// 27 MHz ticks to sample counts).
+    fn apply_pending_silence_pad(&mut self) {
+        if !self.codecs_ready
+            || self.pending_silence_27mhz <= 0
+            || self.resolved_sample_rate == 0
+        {
+            return;
+        }
+        let capped_27mhz = self
+            .pending_silence_27mhz
+            .min(5 * 27_000_000) as u64;
+        let sr = self.resolved_sample_rate as u64;
+        let silence_samples = capped_27mhz
+            .saturating_mul(sr)
+            / 27_000_000;
+        if silence_samples > 0 {
+            let silence_ms = capped_27mhz / 27_000;
+            tracing::info!(
+                silence_samples,
+                silence_ms,
+                sample_rate = self.resolved_sample_rate,
+                "ts_audio_replace: applying silence-pad for source-PTS forward jump \
+                 (silence-content-only; out_pts_90k unchanged so encoder frame stamping \
+                 advances effective PTS by silence_samples * 90000 / sample_rate)"
+            );
+            for ch in self.accumulator.iter_mut() {
+                ch.extend(
+                    std::iter::repeat(0.0f32)
+                        .take(silence_samples as usize),
+                );
+            }
+        }
+        self.pending_silence_27mhz = 0;
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────
 
     /// Drop every pipeline stage that depends on the current source
@@ -810,6 +895,10 @@ impl TsAudioReplacer {
         // meaningful. `swap(0)` is atomic so we don't race with the
         // rewriter on the same input.
         self.pending_silence_27mhz = 0;
+        // Reset the wallclock-aware catch-up anchors. Next first PES
+        // re-records both (master clock now + that PES's source PTS).
+        self.first_pes_master_27mhz = None;
+        self.first_pes_src_pts_90k = None;
         if let Some(s) = self.pcr_jump_signal.as_ref() {
             s.swap(0, std::sync::atomic::Ordering::AcqRel);
         }
@@ -880,17 +969,47 @@ impl TsAudioReplacer {
         // we anchor the output PTS to the source's intrinsic PTS so the
         // output stream tracks the source clock from sample 0. After
         // that, every PES is compared against the expected next source
-        // PTS (last PTS + last-PES sample-duration); a deviation
-        // greater than ~500 ms means the upstream clock skipped or
-        // looped (media-player loop wrap, SRT/RIST source restart,
-        // SCTE-35 splice) and we re-anchor so audio doesn't accumulate
-        // tens of seconds of phantom drift against the regenerated
-        // output PCR.
+        // PTS (last PTS + last-PES sample-duration). Two outcomes:
+        //
+        // 1. Forward delta in `(SUB_DISCONTINUITY_THRESHOLD_90K,
+        //    DISCONTINUITY_THRESHOLD_90K]` — likely a media_player loop
+        //    splice (or any source whose splice gap is `max(audio_max,
+        //    pcr_max) + SPLICE_GUARD`, which on real broadcast
+        //    captures lands at audio_max + ~268 ms because
+        //    pcr_max - audio_max ≈ ~238 ms). Without catch-up, output
+        //    audio PES PTS keeps advancing at steady encoder rate
+        //    (samples / sr) while video PES PTS (passthrough) carries
+        //    the source's per-loop forward jump verbatim, drifting
+        //    audio behind video by the loop-jump amount per loop. Route
+        //    the forward delta through `pending_silence_27mhz` so the
+        //    encoder produces silence frames that consume samples at
+        //    the right rate (the silence content alone advances
+        //    samples_since_anchor by the right amount; no out_pts_90k
+        //    nudge needed). Pre-fix on a Sky Witness 1080i25 looped
+        //    capture (30 min × 10 loops): -27 ms/min linear A/V drift
+        //    (cell 4 of testbed/full_test_2026-05-21/v2).
+        //
+        // 2. Absolute delta > DISCONTINUITY_THRESHOLD_90K — catastrophic
+        //    jump (upstream restart, SCTE-35 splice across a > 500 ms
+        //    boundary). Re-anchor `out_pts_90k` and reset
+        //    `samples_since_anchor` so audio doesn't accumulate tens of
+        //    seconds of phantom drift against the regenerated output
+        //    PCR. Backward jumps in this range hit the monotonicity
+        //    guard and are suppressed (see below).
         const DISCONTINUITY_THRESHOLD_90K: u64 = 45_000; // 500 ms
+        const SUB_DISCONTINUITY_THRESHOLD_90K: i64 = 7_200; // 80 ms
         if !self.out_pts_anchored {
             self.out_pts_90k = anchor_target(self.av_sync_pacer.as_ref(), pts);
             self.samples_since_anchor = 0;
             self.out_pts_anchored = true;
+            // Record the master-clock + source-PTS anchors for the
+            // wallclock-aware catch-up below. Sampled here (and only
+            // here) so the catch-up's `master_elapsed` and
+            // `output_pts_elapsed` reference the same starting point.
+            if let Some(pacer) = self.av_sync_pacer.as_ref() {
+                self.first_pes_master_27mhz = Some(pacer.now_27mhz());
+                self.first_pes_src_pts_90k = Some(pts);
+            }
         } else if let Some(expected) = self.expected_next_src_pts_90k {
             let delta = pts.wrapping_sub(expected) as i64;
             // 90 kHz PTS is 33 bits in MPEG-TS; treat the signed delta
@@ -943,6 +1062,188 @@ impl TsAudioReplacer {
                     );
                     self.out_pts_90k = candidate;
                     self.samples_since_anchor = 0;
+                    // Re-anchor the wallclock catch-up too: drop the
+                    // accumulated drift from before the discontinuity
+                    // so the next lag measurement starts from this
+                    // PES. Stale anchors would make the catch-up fire
+                    // immediately with a huge lag value derived from
+                    // pre-discontinuity history.
+                    if let Some(pacer) = self.av_sync_pacer.as_ref() {
+                        self.first_pes_master_27mhz = Some(pacer.now_27mhz());
+                        self.first_pes_src_pts_90k = Some(pts);
+                    }
+                }
+            } else if delta > SUB_DISCONTINUITY_THRESHOLD_90K {
+                // Sub-500 ms FORWARD jump — typical media_player loop
+                // splice (~268 ms). Queue the forward delta as silence
+                // padding so the encoder produces silence frames that
+                // pull `samples_since_anchor` forward by the right
+                // amount. PTS catches up in steady state without
+                // touching `out_pts_90k`; receivers see continuous
+                // output PES at the steady 1920-tick cadence with the
+                // gap rendered as silence frames.
+                let delta_27mhz = delta.saturating_mul(300);
+                self.pending_silence_27mhz = self
+                    .pending_silence_27mhz
+                    .saturating_add(delta_27mhz);
+                tracing::debug!(
+                    expected,
+                    got = pts,
+                    delta_90k = delta,
+                    queued_silence_27mhz = delta_27mhz,
+                    total_pending_silence_27mhz = self.pending_silence_27mhz,
+                    "ts_audio_replace: sub-500ms forward source-PTS jump queued for silence-pad"
+                );
+            }
+        }
+
+        // ── Master-clock-aware audio catch-up ─────────────────────────
+        //
+        // Some sources (notably `media_player` loops on real broadcast
+        // captures) stamp audio PES PTSes continuously across loop
+        // boundaries while video PES PTSes carry a per-loop forward
+        // jump (because the file-side splice anchor lands at
+        // `max(audio_max, pcr_max) + GUARD` and `pcr_max > audio_max`
+        // by ~200 ms — audio_max happens to land near the splice
+        // anchor while video_max lands further short, leaving a
+        // ~268 ms video gap and only ~4.5 ms audio gap per loop). The
+        // forward-jump detector above doesn't fire because the audio
+        // PES PTS delta stays small; the encoder stamps output PESes
+        // at sample-rate cadence; output audio PTS rate ends up
+        // slightly below the source/wallclock rate that drives output
+        // video PTS. On Sky Witness 170-sec loops the result is
+        // ~-27 ms/min audio drift behind passthrough video.
+        //
+        // The catch-up below compares effective output PTS elapsed
+        // since the first PES against master-clock time elapsed
+        // since the first PES. When audio falls behind by more than
+        // CATCH_UP_THRESHOLD_27M (200 ms), queue the deficit through
+        // `pending_silence_27mhz`. The existing silence-pad apply
+        // path drains it: silence samples added to the accumulator
+        // produce K silence frames at the encoder, each advancing
+        // `samples_since_anchor` by `frame_size` — effective PTS
+        // climbs back up to wallclock-paced position, lag returns
+        // toward zero, the next PES check sees a smaller residual
+        // (below threshold) and doesn't re-queue.
+        //
+        // **Master-clock semantics.** `av_sync_pacer.now_27mhz()`
+        // abstracts the per-flow master clock kind:
+        // - **wallclock** (default for SRT/RTP/UDP/RIST/RTMP/RTSP/
+        //   `media_player`/`replay`): host CLOCK_TAI. The most
+        //   common case where this catch-up matters — corrects
+        //   per-loop drift caused by source-side splice asymmetry.
+        // - **source_pcr_pll** (opt-in via `master_clock.kind =
+        //   "contribution"` / `"source_pcr_pll"`): tracks the PLL-
+        //   recovered source PCR rate. Source audio samples arrive
+        //   at source rate, so `output_pts_elapsed` ≈
+        //   `master_elapsed`. Lag stays ~0 and the catch-up is
+        //   inert — exactly what we want for PLL-locked
+        //   contribution feeds.
+        // - **ptp** (auto-selected for ST 2110 + MXL): tracks
+        //   `ptp4l` grandmaster. ST 2110 audio is PTP-paced at
+        //   source; `output_pts_elapsed` ≈ `master_elapsed`. Lag
+        //   stays ~0, inert.
+        //
+        // Threshold 100 ms — engineering compromise between strict
+        // production lip-sync (EBU R37 ±40 ms, ATSC IS-191 -45 ms /
+        // +15 ms) and practical silence-pad cost. The catch-up always
+        // keeps audio LAGGING (queues silence to advance toward
+        // master, never the reverse), so steady-state offset is
+        // `[-(threshold + per-loop-step), 0]` — the forgiving side
+        // per ATSC IS-191 which permits audio lag up to -45 ms.
+        //
+        // Why not 40 ms (= strict EBU R37). Each catch-up firing
+        // queues silence equal to current lag; the encoder drains in
+        // `frame_size`-sample chunks (1024 for AAC-LC, 1152 for MP2),
+        // so the IMMEDIATE PTS advance per firing is bounded by one
+        // frame (~21 ms at 48 kHz AAC). For the cell 4 case where
+        // drift comes in ~30 ms steps at each ~170 sec loop boundary,
+        // a 40 ms threshold fires every loop with silence values
+        // 42-70 ms, but the encoder catches up ~21 ms per drain
+        // round — so the MAX instantaneous drift is bounded by
+        // `(threshold + loop_step) ≈ 70 ms` regardless. Tighter
+        // threshold (down to ~10 ms) would fire on every PES
+        // without improving the practical bound, just multiplying
+        // silence-pad artifacts. For strict ±40 ms compliance the
+        // architecture needs sub-frame catch-up granularity OR an
+        // upstream fix in play_ts_file.
+        //
+        // Why not 200 ms. Max drift ~230 ms, exceeding common
+        // broadcast tolerances (HLS / RTMP / DVB IRD ±100 ms).
+        //
+        // 100 ms = max drift ~130 ms, firings every ~4 min on Sky
+        // Witness, meets HLS/RTMP/DVB tolerances. Production paths
+        // using PTP or source_pcr_pll masters don't fire this at
+        // all — audio + master + video already track together.
+        const CATCH_UP_THRESHOLD_27M: i64 = 2_700_000; // 100 ms
+        // Sanity ceiling: a lag > 2 seconds means something is wrong
+        // with the master clock or our anchors — the source-PCR PLL
+        // may not have locked, the PTP servo may be in transient, or
+        // a 33-bit PTS wrap interacted badly with our anchor. Skip
+        // catch-up in that case: queueing multi-second silence based
+        // on garbage anchor values would mute the output for seconds
+        // every PES (which is exactly what an early version of this
+        // patch did on cell 6 with source_pcr_pll — observed lag values
+        // ran into multi-hour territory during PLL warmup). Once the
+        // clocks settle, the next legitimate small-lag catch-up will
+        // fire normally.
+        const SANITY_CEILING_27M: i64 = 54_000_000; // 2 seconds
+        // Gate on `pacer.is_locked()` so the source-PCR PLL has a
+        // chance to converge before we trust its `now_27mhz()` values.
+        // Wallclock returns `true` immediately; PTP after the servo
+        // hits tolerance; source-PCR PLL after lock.
+        if let (Some(pacer), Some(first_master_27m), Some(first_src_pts_90k)) = (
+            self.av_sync_pacer.as_ref(),
+            self.first_pes_master_27mhz,
+            self.first_pes_src_pts_90k,
+        ) {
+            if self.resolved_sample_rate > 0 && pacer.is_locked() {
+                let master_now_27m = pacer.now_27mhz();
+                let master_elapsed_27m =
+                    master_now_27m.wrapping_sub(first_master_27m) as i64;
+                let effective_out_pts_90k = self.out_pts_90k.wrapping_add(
+                    self.samples_since_anchor.saturating_mul(90_000)
+                        / self.resolved_sample_rate as u64,
+                );
+                // 33-bit PTS subtraction with wrap.
+                let output_pts_elapsed_90k = ((effective_out_pts_90k as i128
+                    - first_src_pts_90k as i128)
+                    .rem_euclid(1i128 << 33))
+                    as u64;
+                let output_pts_elapsed_27m = output_pts_elapsed_90k
+                    .saturating_mul(300) as i64;
+                let lag_27m = master_elapsed_27m
+                    .saturating_sub(output_pts_elapsed_27m);
+                if lag_27m > CATCH_UP_THRESHOLD_27M
+                    && lag_27m < SANITY_CEILING_27M
+                {
+                    self.pending_silence_27mhz = self
+                        .pending_silence_27mhz
+                        .saturating_add(lag_27m);
+                    tracing::info!(
+                        lag_27m,
+                        lag_ms = lag_27m / 27_000,
+                        master_elapsed_27m,
+                        output_pts_elapsed_27m,
+                        threshold_27m = CATCH_UP_THRESHOLD_27M,
+                        "ts_audio_replace: master-clock catch-up — output audio PTS has fallen \
+                         behind master clock; queueing silence-pad to realign"
+                    );
+                } else if lag_27m >= SANITY_CEILING_27M {
+                    // Log once at debug level — production-quality
+                    // installations should never hit this (would
+                    // indicate a clock-source pathology); useful for
+                    // diagnosing master-clock transients on the
+                    // testbed.
+                    tracing::debug!(
+                        lag_27m,
+                        lag_ms = lag_27m / 27_000,
+                        master_elapsed_27m,
+                        output_pts_elapsed_27m,
+                        sanity_ceiling_27m = SANITY_CEILING_27M,
+                        "ts_audio_replace: master-clock catch-up suppressed — lag exceeds \
+                         sanity ceiling (PLL warmup, PTP servo transient, or PTS wrap)"
+                    );
                 }
             }
         }
@@ -1130,76 +1431,11 @@ impl TsAudioReplacer {
                     };
                 // Silence-pad in lockstep with the next source samples
                 // so the gap appears at the right PTS in the output
-                // stream. `pending_silence_27mhz` was drained from
-                // the per-input `pcr_jump_signal` at the top of
-                // consume_pes — this is the apply point now that
-                // `codecs_ready` is true and `resolved_sample_rate` is
-                // known. Two coordinated effects:
-                //
-                // 1. **PTS leap**: advance `out_pts_90k` by
-                //    `jump_90k − frame_step_90k`. The frame_step
-                //    subtraction compensates for the natural +1
-                //    encoder-frame-step that `drain_encoder` would
-                //    otherwise add to the very next PES's PTS
-                //    (over-correction = ~24 ms at MP2/48 kHz).
-                //    Encoder `frame_size()` queried at runtime so the
-                //    compensation is codec-correct.
-                //
-                // 2. **Silence content**: extend the PCM accumulator
-                //    with zero samples covering the jump duration so
-                //    the encoder produces real MP2 silence frames
-                //    occupying the new PTS range. Without (2) the
-                //    encoder would resume with pre-jump source
-                //    content stamped with post-jump PTS — receiver
-                //    would hear stale content in the new time slot.
-                //
-                // Cap at 5 s per consume to bound worst-case
-                // pathological inputs.
-                if self.codecs_ready
-                    && self.pending_silence_27mhz > 0
-                    && self.resolved_sample_rate > 0
-                {
-                    let capped_27mhz = self
-                        .pending_silence_27mhz
-                        .min(5 * 27_000_000) as u64;
-                    let sr = self.resolved_sample_rate as u64;
-                    let silence_samples = capped_27mhz
-                        .saturating_mul(sr)
-                        / 27_000_000;
-                    if silence_samples > 0 {
-                        let silence_ms = capped_27mhz / 27_000;
-                        let frame_step_90k = if let Some(enc) =
-                            self.av_encoder.as_ref()
-                        {
-                            (enc.frame_size() as u64)
-                                .saturating_mul(90_000)
-                                / sr.max(1)
-                        } else {
-                            // MP2 default: 1152 samples / sr.
-                            1152 * 90_000 / sr.max(1)
-                        };
-                        let jump_90k = (capped_27mhz / 300)
-                            .saturating_sub(frame_step_90k);
-                        tracing::info!(
-                            silence_samples,
-                            silence_ms,
-                            jump_90k_adjusted = jump_90k,
-                            frame_step_90k,
-                            sample_rate = self.resolved_sample_rate,
-                            "ts_audio_replace: applying silence-pad for PCR forward jump \
-                             (per-input signal; advancing out_pts_90k + adding silence content)"
-                        );
-                        self.out_pts_90k =
-                            self.out_pts_90k.wrapping_add(jump_90k);
-                        for ch in self.accumulator.iter_mut() {
-                            ch.extend(
-                                std::iter::repeat(0.0f32)
-                                    .take(silence_samples as usize),
-                            );
-                        }
-                    }
-                    self.pending_silence_27mhz = 0;
-                }
+                // stream. See `apply_pending_silence_pad` for the
+                // full rationale — silence-content-only, no
+                // `out_pts_90k` nudge. Cap at 5 s per consume to
+                // bound worst-case pathological inputs.
+                self.apply_pending_silence_pad();
                 for ch in 0..self.resolved_channels as usize {
                     if ch < shuffled_planar.len() {
                         self.accumulator[ch]
@@ -2734,6 +2970,490 @@ mod tests {
             sig.load(Ordering::Acquire), 0,
             "reset must drain the shared signal so the new pipeline \
              doesn't pick up stale loop-wrap pads"
+        );
+    }
+
+    // ─── Sub-500ms forward source-PTS jump detector (0.87.0 fix) ──
+    //
+    // Bug: per-loop media_player splices set the next loop's first PES
+    // to `max(audio_max, pcr_max) + SPLICE_GUARD_TICKS_90K`. On real
+    // broadcast captures `pcr_max - audio_max ≈ 238 ms`, so audio PES
+    // PTS jumps forward by ~268 ms per loop. That's under the 500 ms
+    // discontinuity threshold, so the pre-fix discontinuity guard did
+    // not catch it. Output audio PES PTSes kept advancing at the
+    // steady (samples_since_anchor / sample_rate) rate while video
+    // passthrough PESes advanced with the source's per-loop forward
+    // jump verbatim — audio drifted behind video by the jump amount
+    // per loop (-27 ms/min over 30 min × 10 loops on the Sky Witness
+    // 1080i25 capture, cell 4 of testbed/full_test_2026-05-21/v2).
+    //
+    // Fix: route sub-500ms forward source-PTS jumps through the
+    // existing `pending_silence_27mhz` queue. Threshold 80 ms — well
+    // above MP2/AAC/AC-3 per-PES jitter, well below 500 ms.
+
+    /// Forward source-PTS jump in `(80 ms, 500 ms]` queues silence
+    /// for the per-loop loop-splice catch-up.
+    #[test]
+    fn sub_500ms_forward_source_jump_queues_silence_pad() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F;
+        // Prime the anchor + expected_next_src_pts via a first PES.
+        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 90_000), &mut Vec::new());
+        assert!(r.out_pts_anchored);
+        let expected_after_first = r
+            .expected_next_src_pts_90k
+            .expect("first PES must stamp expected_next");
+        // Source skips forward by 268 ms (24 120 ticks @ 90 kHz) —
+        // the typical Sky Witness loop-splice forward jump.
+        let jump_90k: u64 = 24_120;
+        let next_pts = expected_after_first.wrapping_add(jump_90k);
+        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], next_pts), &mut Vec::new());
+        // Delta = jump_90k > 7200 (80 ms) → queued for silence-pad.
+        let expected_27mhz = (jump_90k as i64).saturating_mul(300);
+        assert_eq!(
+            r.pending_silence_27mhz, expected_27mhz,
+            "268 ms forward source-PTS jump must queue 268 ms of silence-pad in 27 MHz units"
+        );
+    }
+
+    /// Forward source-PTS jump of exactly 80 ms (threshold boundary)
+    /// does NOT queue silence — the threshold is strict `>`, so 80 ms
+    /// jitter stays inert (covers MP2/AC-3 every-other-frame timing
+    /// noise without false positives).
+    #[test]
+    fn forward_jump_at_threshold_boundary_does_not_queue_silence() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F;
+        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 100_000), &mut Vec::new());
+        let expected = r.expected_next_src_pts_90k.unwrap();
+        // 80 ms = 7200 ticks — exactly the threshold.
+        let next_pts = expected.wrapping_add(7_200);
+        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], next_pts), &mut Vec::new());
+        assert_eq!(
+            r.pending_silence_27mhz, 0,
+            "exactly-80ms forward jump must NOT queue silence — threshold is strict `>`"
+        );
+    }
+
+    /// Sub-500ms BACKWARD source-PTS jump must NOT queue silence
+    /// (silence would push output ahead, not catch up). Backward
+    /// small jumps are absorbed silently as PTS noise.
+    #[test]
+    fn sub_500ms_backward_source_jump_does_not_queue_silence() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F;
+        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 200_000), &mut Vec::new());
+        let expected = r.expected_next_src_pts_90k.unwrap();
+        // 200 ms backward.
+        let next_pts = expected.wrapping_sub(18_000);
+        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], next_pts), &mut Vec::new());
+        assert_eq!(
+            r.pending_silence_27mhz, 0,
+            "backward source-PTS jump must NOT queue silence — silence only catches up forward drift"
+        );
+    }
+
+    /// Catastrophic forward jump (> 500 ms) still hits the
+    /// discontinuity-guard re-anchor branch (sets `out_pts_90k =
+    /// candidate`, resets `samples_since_anchor` to 0) — NOT the
+    /// silence-pad branch. The two paths are mutually exclusive:
+    /// > 500 ms uses re-anchor; (80 ms, 500 ms] uses silence-pad;
+    /// ≤ 80 ms is inert.
+    #[test]
+    fn forward_jump_over_500ms_still_uses_reanchor_not_silence() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F;
+        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 300_000), &mut Vec::new());
+        let expected = r.expected_next_src_pts_90k.unwrap();
+        // 600 ms = 54 000 ticks — past the 500 ms threshold.
+        let next_pts = expected.wrapping_add(54_000);
+        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], next_pts), &mut Vec::new());
+        assert_eq!(
+            r.pending_silence_27mhz, 0,
+            "> 500ms jump must use the catastrophic re-anchor branch, not silence-pad"
+        );
+    }
+
+    // ─── Silence-pad apply: out_pts_90k must NOT advance (0.87.0 fix) ──
+    //
+    // Bug: pre-0.87 silence-pad apply did `out_pts_90k += jump_90k −
+    // frame_step` AND added silence_samples to the accumulator. That
+    // was only correct when exactly one silence frame was emitted
+    // (K = 1). For K > 1 the effective_out_pts = `out_pts_90k +
+    // samples_since_anchor * 90000 / sr` over-advanced by
+    // `(K − 1) * frame_step` per jump — e.g. 268 ms loop splice =>
+    // K = 12 AAC-LC frames => 21 120 ticks (235 ms) over.
+    //
+    // Fix: silence content only. Each silence frame the encoder
+    // produces advances `samples_since_anchor` by frame_size, so
+    // long-term effective_out_pts advances by exactly
+    // `silence_samples * 90000 / sr` — the correct catch-up amount,
+    // independent of K.
+
+    /// Apply path with pending silence: `out_pts_90k` must NOT
+    /// change, and the accumulator must receive exactly
+    /// `silence_samples = jump_27mhz * sr / 27_000_000` zero samples
+    /// per channel. The encoder side will advance the effective PTS
+    /// via `samples_since_anchor` over multiple frame emits as it
+    /// drains the accumulator — covered in the next test.
+    #[test]
+    fn silence_pad_apply_does_not_advance_out_pts_90k() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        // Hand-bring the replacer into the apply-ready state — bypass
+        // the full PES path so the test doesn't depend on a real ADTS
+        // frame round-tripping through fdk-aac.
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F;
+        r.out_pts_90k = 1_000_000_000;
+        r.samples_since_anchor = 4_096;
+        r.codecs_ready = true;
+        r.resolved_sample_rate = 48_000;
+        r.resolved_channels = 2;
+        r.accumulator = vec![Vec::new(); 2];
+        let out_pts_before = r.out_pts_90k;
+        let samples_before = r.samples_since_anchor;
+        // 268 ms forward source-PTS jump = 24 120 90 kHz ticks =
+        // 7 236 000 27 MHz ticks — the Sky Witness loop-splice case
+        // that motivated this fix.
+        r.pending_silence_27mhz = 7_236_000;
+        r.apply_pending_silence_pad();
+        assert_eq!(r.pending_silence_27mhz, 0, "silence queue must drain");
+        // **The core invariant.** `out_pts_90k` is the anchor base;
+        // silence-pad must not nudge it. The pre-0.87 code did
+        // `out_pts_90k += jump_90k - frame_step`, which double-counted
+        // with the silence content's contribution to effective PTS.
+        assert_eq!(
+            r.out_pts_90k, out_pts_before,
+            "silence-pad must NOT advance out_pts_90k — silence frames carry the PTS advance"
+        );
+        assert_eq!(
+            r.samples_since_anchor, samples_before,
+            "silence-pad must NOT touch samples_since_anchor — drain_encoder advances it as silence frames emit"
+        );
+        // 7_236_000 * 48_000 / 27_000_000 = 12_864 silence samples
+        // per channel.
+        let expected_silence_samples: usize = 12_864;
+        for (ch, acc) in r.accumulator.iter().enumerate() {
+            assert_eq!(
+                acc.len(), expected_silence_samples,
+                "channel {ch}: silence samples added (got {}, want {})",
+                acc.len(), expected_silence_samples
+            );
+            assert!(
+                acc.iter().all(|&s| s == 0.0f32),
+                "channel {ch}: padded samples must be exact zeros (digital silence)"
+            );
+        }
+    }
+
+    // ─── Master-clock-aware catch-up (0.86.2 follow-up) ──────────────
+    //
+    // Source-side splice asymmetries (e.g. media_player loops where
+    // pcr_max - audio_max ≈ 200 ms produces a 268 ms video PES gap but
+    // only ~4.5 ms audio PES gap per loop) leave the encoder stamping
+    // output PESes at sample-rate cadence, drifting behind passthrough
+    // video by ~27 ms/min on Sky Witness. The forward-jump detector
+    // above doesn't catch this because the audio PES PTS sequence
+    // stays continuous. The catch-up below uses the per-flow master
+    // clock as the wallclock-truth reference, queueing silence when
+    // effective output PTS falls behind master by > 200 ms.
+    //
+    // Master clock kind is abstracted by `av_sync_pacer.now_27mhz()`:
+    // wallclock (default, host CLOCK_TAI), ptp (grandmaster), or
+    // source_pcr_pll (PLL-recovered). Catch-up logic is clock-agnostic
+    // — same code, three different clocks.
+
+    /// First PES with `av_sync_pacer` set records both anchors so
+    /// the catch-up has a starting point to measure elapsed time
+    /// against.
+    #[test]
+    fn first_pes_records_master_clock_and_src_pts_anchors() {
+        use crate::engine::av_sync_mux::AvSyncPacer;
+        use crate::engine::master_clock::{
+            MasterClockHandle, MasterClockKind, WallclockMaster,
+        };
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let handle = MasterClockHandle::new(
+            std::sync::Arc::new(WallclockMaster::new()),
+            MasterClockKind::Wallclock,
+        );
+        let pacer = std::sync::Arc::new(AvSyncPacer::new(handle));
+        r.set_av_sync_pacer(pacer);
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F;
+        assert!(r.first_pes_master_27mhz.is_none());
+        assert!(r.first_pes_src_pts_90k.is_none());
+        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 1_234_567), &mut Vec::new());
+        assert!(r.first_pes_master_27mhz.is_some(), "master anchor must be recorded on first PES");
+        assert_eq!(
+            r.first_pes_src_pts_90k,
+            Some(1_234_567),
+            "src-PTS anchor must equal the first PES's source PTS"
+        );
+    }
+
+    /// First PES without `av_sync_pacer` leaves anchors at `None` —
+    /// the catch-up below is a no-op without a master clock to
+    /// reference. Preserves zero-cost behaviour on output paths that
+    /// don't wire the pacer.
+    #[test]
+    fn first_pes_without_pacer_leaves_catchup_anchors_none() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F;
+        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 1_234_567), &mut Vec::new());
+        assert!(r.first_pes_master_27mhz.is_none());
+        assert!(r.first_pes_src_pts_90k.is_none());
+    }
+
+    /// Catastrophic > 500 ms re-anchor branch must also re-anchor the
+    /// catch-up state — otherwise the next lag measurement would
+    /// reference pre-discontinuity history and fire immediately with a
+    /// huge stale lag value.
+    #[test]
+    fn over_500ms_reanchor_also_resets_catchup_anchors() {
+        use crate::engine::av_sync_mux::AvSyncPacer;
+        use crate::engine::master_clock::{
+            MasterClockHandle, MasterClockKind, WallclockMaster,
+        };
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let handle = MasterClockHandle::new(
+            std::sync::Arc::new(WallclockMaster::new()),
+            MasterClockKind::Wallclock,
+        );
+        let pacer = std::sync::Arc::new(AvSyncPacer::new(handle));
+        r.set_av_sync_pacer(pacer);
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F;
+        // First PES seeds the catch-up anchors.
+        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 100_000), &mut Vec::new());
+        let original_master = r.first_pes_master_27mhz;
+        let original_src_pts = r.first_pes_src_pts_90k;
+        // Force the output to be sitting somewhere — the > 500 ms
+        // forward branch needs current_effective_out_pts_90k to make
+        // candidate (= pts) forward of where output is.
+        r.resolved_sample_rate = 48_000;
+        r.samples_since_anchor = 0;
+        r.out_pts_90k = 100_000;
+        // Trigger > 500 ms forward jump (1 sec). Expected_next was
+        // updated at the end of the first PES to ~100_000 + small_span;
+        // a +90_000 jump from there crosses the 45_000 threshold.
+        // Sleep a tiny bit so master clock advances and we can verify
+        // it's been refreshed.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 100_000 + 90_000), &mut Vec::new());
+        // Both catch-up anchors must have been refreshed (master moved
+        // forward by at least 2 ms = 54 000 27 MHz ticks).
+        assert_ne!(
+            r.first_pes_master_27mhz, original_master,
+            "> 500 ms re-anchor must refresh first_pes_master_27mhz"
+        );
+        assert_ne!(
+            r.first_pes_src_pts_90k, original_src_pts,
+            "> 500 ms re-anchor must refresh first_pes_src_pts_90k"
+        );
+    }
+
+    /// `reset_source_state` (input switch / codec change) clears the
+    /// catch-up anchors alongside the other source-relative state.
+    #[test]
+    fn reset_source_state_clears_catchup_anchors() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        r.first_pes_master_27mhz = Some(123_456_789);
+        r.first_pes_src_pts_90k = Some(42_000);
+        r.reset_source_state("test");
+        assert!(r.first_pes_master_27mhz.is_none());
+        assert!(r.first_pes_src_pts_90k.is_none());
+    }
+
+    /// **Catch-up fires when effective PTS lags master by > 200 ms.**
+    /// Hand-rig the state so the lag computation evaluates to a known
+    /// large value, then call consume_pes and verify
+    /// `pending_silence_27mhz` got the deficit.
+    #[test]
+    fn catchup_queues_silence_when_lag_exceeds_threshold() {
+        use crate::engine::av_sync_mux::AvSyncPacer;
+        use crate::engine::master_clock::{
+            MasterClockHandle, MasterClockKind, WallclockMaster,
+        };
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let handle = MasterClockHandle::new(
+            std::sync::Arc::new(WallclockMaster::new()),
+            MasterClockKind::Wallclock,
+        );
+        let pacer = std::sync::Arc::new(AvSyncPacer::new(handle));
+        r.set_av_sync_pacer(pacer.clone());
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F;
+        // Anchor at a master_now from 500 ms in the past so when
+        // consume_pes runs, the lag computation sees ~500 ms elapsed.
+        let now = pacer.now_27mhz();
+        r.first_pes_master_27mhz = Some(now.saturating_sub(13_500_000)); // 500 ms ago
+        r.first_pes_src_pts_90k = Some(0);
+        r.out_pts_anchored = true;
+        r.out_pts_90k = 0;
+        r.samples_since_anchor = 0; // effective_out_pts_elapsed = 0
+        r.resolved_sample_rate = 48_000;
+        // expected_next_src_pts_90k arbitrary — only the catch-up
+        // branch matters here; we want a tiny same-PES delta so the
+        // discontinuity branches don't fire.
+        r.expected_next_src_pts_90k = Some(2_160);
+        // Process a PES with pts close to expected — discontinuity
+        // guard inert, but catch-up sees ~500 ms master_elapsed and
+        // 0 output_elapsed → lag ≈ 500 ms, > 200 ms threshold.
+        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 2_160), &mut Vec::new());
+        assert!(
+            r.pending_silence_27mhz > 13_500_000 / 2,
+            "catch-up must queue ~500 ms (= 13_500_000 27 MHz ticks); got {}",
+            r.pending_silence_27mhz
+        );
+    }
+
+    /// Catch-up suppresses absurd lag values (> 2 sec sanity ceiling).
+    /// PLL warmup, PTP servo transients, and 33-bit PTS-wrap interactions
+    /// can produce multi-second / multi-hour apparent lag values; the
+    /// ceiling prevents us from queueing seconds-or-more of silence
+    /// based on garbage anchor values. Observed on cell 6 (sync-test
+    /// source_pcr_pll, 17-hour lag during PLL warmup) before the
+    /// ceiling was added — catch-up fired 543 times in 3 min, each
+    /// queueing 5 sec of silence.
+    #[test]
+    fn catchup_suppresses_lag_above_sanity_ceiling() {
+        use crate::engine::av_sync_mux::AvSyncPacer;
+        use crate::engine::master_clock::{
+            MasterClockHandle, MasterClockKind, WallclockMaster,
+        };
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let handle = MasterClockHandle::new(
+            std::sync::Arc::new(WallclockMaster::new()),
+            MasterClockKind::Wallclock,
+        );
+        let pacer = std::sync::Arc::new(AvSyncPacer::new(handle));
+        r.set_av_sync_pacer(pacer.clone());
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F;
+        // Anchor master ~10 sec in the past — well above the 2 sec
+        // sanity ceiling.
+        let now = pacer.now_27mhz();
+        r.first_pes_master_27mhz = Some(now.saturating_sub(270_000_000)); // 10 s ago
+        r.first_pes_src_pts_90k = Some(0);
+        r.out_pts_anchored = true;
+        r.out_pts_90k = 0;
+        r.samples_since_anchor = 0;
+        r.resolved_sample_rate = 48_000;
+        r.expected_next_src_pts_90k = Some(2_160);
+        let pending_before = r.pending_silence_27mhz;
+        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 2_160), &mut Vec::new());
+        assert_eq!(
+            r.pending_silence_27mhz, pending_before,
+            "lag > sanity ceiling must NOT queue silence — caller's master clock or anchors are pathological"
+        );
+    }
+
+    /// Catch-up stays inert when output PTS tracks master clock.
+    /// Hand-rig state so `output_pts_elapsed` matches
+    /// `master_elapsed` within the 200 ms threshold; verify no
+    /// silence is queued. This is the source_pcr_pll / PTP case
+    /// where audio + master + video all track the same rate.
+    #[test]
+    fn catchup_does_not_fire_when_output_tracks_master() {
+        use crate::engine::av_sync_mux::AvSyncPacer;
+        use crate::engine::master_clock::{
+            MasterClockHandle, MasterClockKind, WallclockMaster,
+        };
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let handle = MasterClockHandle::new(
+            std::sync::Arc::new(WallclockMaster::new()),
+            MasterClockKind::Wallclock,
+        );
+        let pacer = std::sync::Arc::new(AvSyncPacer::new(handle));
+        r.set_av_sync_pacer(pacer.clone());
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F;
+        // Anchor master ~50 ms in the past; arrange effective PTS to
+        // also be ~50 ms ahead of the anchor (samples_since_anchor *
+        // 90000 / 48000 = 50 ms → 2400 samples = ~4500 90k ticks).
+        let now = pacer.now_27mhz();
+        r.first_pes_master_27mhz = Some(now.saturating_sub(1_350_000)); // 50 ms ago
+        r.first_pes_src_pts_90k = Some(0);
+        r.out_pts_anchored = true;
+        r.out_pts_90k = 0;
+        r.samples_since_anchor = 2_400; // 50 ms of audio at 48 kHz
+        r.resolved_sample_rate = 48_000;
+        r.expected_next_src_pts_90k = Some(2_160);
+        let pending_before = r.pending_silence_27mhz;
+        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 2_160), &mut Vec::new());
+        assert_eq!(
+            r.pending_silence_27mhz, pending_before,
+            "lag ≈ 0 (within 200 ms threshold) must NOT queue silence — \
+             catch-up is inert when source/output track master"
+        );
+    }
+
+    /// **Long-form effective-PTS catch-up invariant.** After K silence
+    /// frames have been encoded out of the silence-padded accumulator,
+    /// `effective_out_pts = out_pts_90k + samples_since_anchor *
+    /// 90000 / sr` must advance by exactly `silence_samples *
+    /// 90000 / sr` from its pre-pad value — i.e. the silence
+    /// content alone carries the jump catch-up, with no out_pts_90k
+    /// contribution. Simulates `drain_encoder` consuming the silence
+    /// in 1024-sample AAC-LC chunks. Demonstrates that the pre-0.87
+    /// `out_pts_90k += jump_90k - frame_step` was overshoot for K>1.
+    #[test]
+    fn silence_pad_effective_pts_advance_matches_jump_amount_long_term() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F;
+        r.out_pts_90k = 1_000_000_000;
+        r.samples_since_anchor = 0;
+        r.codecs_ready = true;
+        r.resolved_sample_rate = 48_000;
+        r.resolved_channels = 2;
+        r.accumulator = vec![Vec::new(); 2];
+
+        let pre_effective = r.next_output_pts_90k(48_000);
+        // 268 ms jump.
+        r.pending_silence_27mhz = 7_236_000;
+        let expected_advance_90k: u64 = 7_236_000 / 300; // 24 120 ticks
+        r.apply_pending_silence_pad();
+
+        // Simulate drain_encoder: while accumulator has ≥ 1024
+        // samples in channel 0, pull a frame and bump
+        // samples_since_anchor by 1024.
+        const FRAME: usize = 1024;
+        while r.accumulator[0].len() >= FRAME {
+            for ch in r.accumulator.iter_mut() {
+                ch.drain(..FRAME);
+            }
+            r.samples_since_anchor =
+                r.samples_since_anchor.saturating_add(FRAME as u64);
+        }
+        // To complete the catch-up the leftover (0 to 1023 samples)
+        // would be merged with the next real PES's samples and drained
+        // as part of a normal frame — the long-term cumulative advance
+        // matches `expected_advance_90k` once those leftover samples
+        // are encoded. Verify both: (a) the immediate effective PTS
+        // is close to expected (within one frame_step), and (b) the
+        // leftover sample count is < FRAME so the round-up completes
+        // on the next real PES.
+        let post_effective = r.next_output_pts_90k(48_000);
+        let actual_advance_90k = post_effective.wrapping_sub(pre_effective);
+        let frame_step_90k: u64 = (FRAME as u64) * 90_000 / 48_000;
+        assert!(
+            actual_advance_90k <= expected_advance_90k
+                && actual_advance_90k + frame_step_90k > expected_advance_90k,
+            "after silence drain the effective PTS must have advanced by at most \
+             expected_advance_90k ({expected_advance_90k}) and the leftover < 1 frame_step \
+             ({frame_step_90k}); got advance = {actual_advance_90k}"
+        );
+        // The leftover < FRAME completes the catch-up on the next encoder call.
+        assert!(
+            r.accumulator[0].len() < FRAME,
+            "leftover silence samples in accumulator (< 1024) finishes catch-up on next PES"
         );
     }
 }
