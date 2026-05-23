@@ -302,6 +302,26 @@ async fn udp_output_loop(
     // `tokio::task::block_in_place` pattern that caused work-stealing
     // churn whenever a frame's encode took > a few hundred µs.
     // See `engine::transcode_chain` + `docs/production-tuning.md`.
+    // Codec → wire pacer backpressure: codec thread pauses one frame
+    // interval before each encode when wire_tx is > 75 % full. Source
+    // frame interval is derived from the operator-supplied fps_num/den;
+    // defaults to ~33 ms (30 fps) when unset. Without this, transient
+    // VBR encoder overshoots fill wire_tx and drop fresh content (see
+    // cell24 x264 case study in `engine::transcode_chain::WireBackpressure`).
+    let backpressure = config.video_encode.as_ref().map(|ve| {
+        let (n, d) = (ve.fps_num.unwrap_or(30) as u64, ve.fps_den.unwrap_or(1) as u64);
+        let frame_interval = if n > 0 {
+            std::time::Duration::from_nanos((d * 1_000_000_000) / n)
+        } else {
+            std::time::Duration::from_millis(33)
+        };
+        transcode_chain::WireBackpressure {
+            depth: wire_tx.depth_handle(),
+            threshold: super::wire_emit::WIRE_CHANNEL_BACKPRESSURE_THRESHOLD,
+            frame_interval,
+        }
+    });
+
     let mut transcode_chain = match transcode_chain::build_for_output(
         &config.id,
         config.audio_encode.as_ref(),
@@ -309,6 +329,7 @@ async fn udp_output_loop(
         config.transcode.clone(),
         &stats,
         av_sync_pacer.as_ref(),
+        backpressure,
     ) {
         Ok(chain) => {
             if let Some(ref c) = chain {
@@ -485,7 +506,7 @@ async fn udp_output_loop(
                                   ts_sync_found: &mut bool,
                                   config_id: &str,
                                   stats: &OutputStatsAccumulator,
-                                  wire_tx: &std::sync::mpsc::SyncSender<WireDatagram>| {
+                                  wire_tx: &super::wire_emit::WireTxHandle| {
             let after_pad: &[u8] = if let Some(padder) = null_padder.as_mut() {
                 pad_scratch.clear();
                 padder.process(downstream_input, pad_scratch);

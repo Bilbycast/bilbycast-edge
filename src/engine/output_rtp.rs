@@ -272,6 +272,7 @@ async fn rtp_output_loop(
         config.transcode.clone(),
         &stats,
         av_sync_pacer.as_ref(),
+        None, // RTP backpressure not yet wired
     ) {
         Ok(chain) => {
             if let Some(ref c) = chain {

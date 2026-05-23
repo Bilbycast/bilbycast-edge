@@ -160,6 +160,97 @@ pub const WIRE_CHANNEL_CAP: usize = 8192;
 // targets come from the source's PCR clock difference (no rate divisor
 // involved). See `derive_target_raw` for the rationale.
 
+// ── Wire-tx depth tracking for codec backpressure ──────────────────────
+//
+// The codec thread upstream (engine::transcode_chain::run_chain) needs
+// to know how deep the wire pacer's queue is so it can pause before
+// over-producing during transient encoder bursts. Without this, a VBR
+// encoder that briefly overshoots its target rate during a complex
+// scene fills the wire_tx channel, hits the cap, and drops. cell24 x264
+// surfaces this on every long run at t=270 s when the source content
+// drives the encoder into a sustained overshoot window.
+//
+// The depth is shared via a single `Arc<AtomicUsize>` updated on every
+// successful `try_send` (incr) and `recv_timeout` (decr). The codec
+// thread polls it once per frame; if it's above
+// `BACKPRESSURE_THRESHOLD` (75% of cap) the codec sleeps one frame
+// interval before encoding more. This naturally rate-matches the
+// encoder to the wire pacer's drain rate without any explicit rate
+// limit — once the queue drains below the threshold the codec resumes
+// at full speed.
+
+/// Codec backpressure kicks in at 75% of WIRE_CHANNEL_CAP. Below this
+/// the codec runs at full speed; above, it sleeps one frame interval
+/// before each encode to let the wire pacer drain.
+pub const WIRE_CHANNEL_BACKPRESSURE_THRESHOLD: usize = (WIRE_CHANNEL_CAP * 3) / 4;
+
+/// Wraps a `SyncSender<WireDatagram>` with a shared depth counter so
+/// upstream codec threads can apply backpressure when the wire pacer
+/// falls behind. Cloneable; all clones share the same depth.
+#[derive(Clone)]
+pub struct WireTxHandle {
+    tx: SyncSender<WireDatagram>,
+    depth: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl WireTxHandle {
+    /// Try to send a datagram. Returns `Ok(())` on success (depth
+    /// incremented), `Err(WireDatagram)` if the channel was full (depth
+    /// unchanged, caller decides whether to count the drop).
+    pub fn try_send(&self, dg: WireDatagram) -> Result<(), WireDatagram> {
+        match self.tx.try_send(dg) {
+            Ok(()) => {
+                self.depth.fetch_add(1, Ordering::Release);
+                Ok(())
+            }
+            Err(std::sync::mpsc::TrySendError::Full(dg)) => Err(dg),
+            Err(std::sync::mpsc::TrySendError::Disconnected(dg)) => Err(dg),
+        }
+    }
+
+    /// Current depth (datagrams queued for the wire emit thread).
+    /// Read by codec threads to gate backpressure sleeps.
+    pub fn depth(&self) -> usize {
+        self.depth.load(Ordering::Acquire)
+    }
+
+    /// Snapshot of the depth Arc, for passing into upstream codec
+    /// threads that need to poll it independently of the sender.
+    pub fn depth_handle(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.depth)
+    }
+}
+
+/// Wraps a `Receiver<WireDatagram>` so the depth counter decrements on
+/// every successful recv. The wire-emit thread owns this; no other
+/// code path should construct or hold a `WireTxReceiver`.
+struct WireTxReceiver {
+    rx: Receiver<WireDatagram>,
+    depth: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl WireTxReceiver {
+    fn recv_timeout(&self, timeout: Duration) -> Result<WireDatagram, RecvTimeoutError> {
+        let r = self.rx.recv_timeout(timeout)?;
+        // Saturate-on-underflow guard: depth is incremented on send and
+        // decremented here. Under normal flow they balance, but on
+        // shutdown the receiver may drain after the sender has been
+        // dropped — keep the count non-negative.
+        self.depth.fetch_update(Ordering::Release, Ordering::Acquire, |d| {
+            Some(d.saturating_sub(1))
+        }).ok();
+        Ok(r)
+    }
+
+    fn try_recv(&self) -> Result<WireDatagram, TryRecvError> {
+        let r = self.rx.try_recv()?;
+        self.depth.fetch_update(Ordering::Release, Ordering::Acquire, |d| {
+            Some(d.saturating_sub(1))
+        }).ok();
+        Ok(r)
+    }
+}
+
 /// Anchor strategy chosen at spawn time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnchorSource {
@@ -182,7 +273,7 @@ pub enum AnchorSource {
 /// can `.freeze()` (zero-copy) instead of `.to_vec()` (per-datagram
 /// heap copy on the data path). For 2022-7 dual-leg, `Bytes::clone()`
 /// is a refcount bump — no copy.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WireDatagram {
     pub bytes: Bytes,
     pub recv_time_us: u64,
@@ -243,7 +334,7 @@ pub fn spawn_wire_emitter(
     anchor: AnchorSource,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
-) -> SyncSender<WireDatagram> {
+) -> WireTxHandle {
     // Always use CLOCK_TAI for SO_TXTIME's clockid. The kernel etf
     // qdisc on Intel ice / igc drivers (and most others) only accepts
     // CLOCK_TAI; setsockopt with CLOCK_MONOTONIC silently degrades to
@@ -304,7 +395,16 @@ pub fn spawn_wire_emitter(
         Releaser::ClockNanosleep
     };
 
-    let (tx, rx) = sync_channel::<WireDatagram>(WIRE_CHANNEL_CAP);
+    let (tx_raw, rx_raw) = sync_channel::<WireDatagram>(WIRE_CHANNEL_CAP);
+    let depth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let tx = WireTxHandle {
+        tx: tx_raw,
+        depth: Arc::clone(&depth),
+    };
+    let rx = WireTxReceiver {
+        rx: rx_raw,
+        depth: Arc::clone(&depth),
+    };
     let thread_id = id.clone();
     let stats_for_thread = stats.clone();
     // CPU pin index — round-robin across the operator-configured set so
@@ -680,7 +780,7 @@ fn run_emitter(
     releaser: Releaser,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
-    rx: Receiver<WireDatagram>,
+    rx: WireTxReceiver,
 ) {
     let mut state = TargetState::default();
     let mut packets_since_drain: u64 = 0;

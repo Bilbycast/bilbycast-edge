@@ -65,8 +65,9 @@
 //! plumbing.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -98,6 +99,67 @@ const TRANSCODE_CHAIN_INPUT_DEPTH: usize = 16_384;
 /// depth so a transient at either side doesn't pin the codec thread
 /// against a smaller mismatched buffer.
 const TRANSCODE_CHAIN_OUTPUT_DEPTH: usize = 16_384;
+
+/// Backpressure handle from the wire pacer back into the codec thread.
+/// The codec polls `depth` before each encode; if it's above
+/// `threshold` the codec sleeps `frame_interval` to let the wire pacer
+/// drain. Without this, a VBR encoder that briefly overshoots its
+/// target rate during a complex scene fills the wire_tx channel, hits
+/// the cap, and drops fresh broadcast content. With it, the codec
+/// rate-matches the wire pacer's drain rate naturally — no explicit
+/// rate limit, no PCR_AC violation, channel stays drained.
+///
+/// cell24 x264 (MPEG-2 NTSC → 1080p H.264 at 5 Mbps with `loop_playback`)
+/// surfaced the underlying issue: the source's t=240–360 s content
+/// window pushes x264 into a sustained ~6.5 Mbps egress rate while the
+/// wire pacer drains at PCR cadence (≈ 6.3 Mbps); the differential
+/// fills the 8192-dgm wire_tx channel within ~30 s of that window
+/// starting and produces 14 k drops. Backpressure stops the codec
+/// before the channel overflows.
+#[derive(Clone)]
+pub struct WireBackpressure {
+    /// Shared atomic depth counter — wire_emit increments on send,
+    /// decrements on receive. The codec polls this Acquire-ordered.
+    pub depth: Arc<AtomicUsize>,
+    /// Codec pauses (sleeps `frame_interval`) before the next encode
+    /// when depth exceeds this. Sized to leave enough headroom for an
+    /// in-flight I-frame burst — typically 75 % of `WIRE_CHANNEL_CAP`.
+    pub threshold: usize,
+    /// How long to sleep between depth re-checks when above threshold.
+    /// One source frame interval is the natural choice — it's the
+    /// granularity at which the codec produces output anyway.
+    pub frame_interval: Duration,
+}
+
+impl WireBackpressure {
+    /// Block the codec thread until `depth ≤ threshold` (or the cancel
+    /// signal would have us exit anyway — checked via `input_rx.try_recv`
+    /// for a `None` so a shutdown doesn't hang forever in this loop).
+    ///
+    /// Returns `true` if we slept at all (for diagnostic / telemetry).
+    pub fn wait_until_drained(&self) -> bool {
+        let mut slept_any = false;
+        // Hard ceiling on cumulative wait — broadcast can't tolerate
+        // unbounded codec stalls. 2 s matches the wire pacer's
+        // worst-case 8192-dgm × 1316 B / 5 Mbps ≈ 17 s in-flight,
+        // capped at the duration we'd accept anyway before declaring
+        // the downstream genuinely stuck.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while self.depth.load(Ordering::Acquire) > self.threshold {
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "transcode-chain backpressure: depth still > {} after 2 s — \
+                     wire pacer stuck, releasing codec to avoid deadlock",
+                    self.threshold
+                );
+                break;
+            }
+            std::thread::sleep(self.frame_interval);
+            slept_any = true;
+        }
+        slept_any
+    }
+}
 
 /// Errors raised when building a [`TranscodeChain`]. Forwarded from
 /// the underlying replacer constructors.
@@ -170,6 +232,7 @@ impl TranscodeChain {
         who: impl Into<String>,
         audio: Option<TsAudioReplacer>,
         video: Option<TsVideoReplacer>,
+        backpressure: Option<WireBackpressure>,
     ) -> Self {
         debug_assert!(
             audio.is_some() || video.is_some(),
@@ -208,7 +271,7 @@ impl TranscodeChain {
         // transfer.
         let thread = spawn_codec_thread(
             CodecThreadConfig::realtime(format!("transcode-{}", who.clone())),
-            move || run_chain(input_rx, output_tx, audio, video),
+            move || run_chain(input_rx, output_tx, audio, video, backpressure),
         );
 
         tracing::info!(
@@ -293,6 +356,7 @@ pub fn build_for_output(
     transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
     stats: &Arc<crate::stats::collector::OutputStatsAccumulator>,
     av_sync_pacer: Option<&Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+    backpressure: Option<WireBackpressure>,
 ) -> Result<Option<TranscodeChain>, TranscodeChainError> {
     let audio = match audio_encode {
         Some(enc) => {
@@ -357,7 +421,7 @@ pub fn build_for_output(
     if audio.is_none() && video.is_none() {
         return Ok(None);
     }
-    Ok(Some(TranscodeChain::new(output_id, audio, video)))
+    Ok(Some(TranscodeChain::new(output_id, audio, video, backpressure)))
 }
 
 impl Drop for TranscodeChain {
@@ -384,6 +448,7 @@ fn run_chain(
     output_tx: mpsc::Sender<Bytes>,
     mut audio: Option<TsAudioReplacer>,
     mut video: Option<TsVideoReplacer>,
+    backpressure: Option<WireBackpressure>,
 ) {
     // Scratch buffers persist across iterations so we don't reallocate
     // per input chunk. 64 KB initial — typical input is ~1316 B (RTP
@@ -393,6 +458,20 @@ fn run_chain(
     let mut after_video_scratch: Vec<u8> = Vec::with_capacity(64 * 1024);
 
     loop {
+        // Codec → wire_emit backpressure. When the wire_tx queue is
+        // > 75 % full the wire pacer hasn't drained the previous burst
+        // yet; sleeping one frame interval here gives it time without
+        // blocking the data path or violating PCR_AC. Once depth drops
+        // below threshold the codec resumes at full speed.
+        //
+        // Without this, transient encoder overshoots (VBR I-frames,
+        // sustained complex scenes) fill wire_tx, hit the cap, and drop
+        // fresh broadcast content. See `WireBackpressure` doc for the
+        // cell24 x264 case study.
+        if let Some(ref bp) = backpressure {
+            bp.wait_until_drained();
+        }
+
         let input = match input_rx.blocking_recv() {
             Some(b) => b,
             None => {
@@ -496,7 +575,7 @@ mod tests {
             opus_frame_duration_ms: None,
         };
         let audio = TsAudioReplacer::new(&cfg, None).expect("audio replacer build");
-        TranscodeChain::new("test-audio-only", Some(audio), None)
+        TranscodeChain::new("test-audio-only", Some(audio), None, None)
     }
 
     /// Construct + immediately drop. Verifies the codec thread sees

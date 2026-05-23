@@ -124,8 +124,8 @@ fn run_paced_sender(
     packetizer: &mut Rfc4175Packetizer,
     mut frame_rx: mpsc::Receiver<RawVideoFrame>,
     cancel: CancellationToken,
-    wire_red: std::sync::mpsc::SyncSender<WireDatagram>,
-    wire_blue: Option<std::sync::mpsc::SyncSender<WireDatagram>>,
+    wire_red: crate::engine::wire_emit::WireTxHandle,
+    wire_blue: Option<crate::engine::wire_emit::WireTxHandle>,
     stats: Arc<OutputStatsAccumulator>,
 ) {
     let _ = id;
@@ -1135,8 +1135,8 @@ pub async fn run_st2110_23_output(
 
     // Build per-sub-stream packetizers + wire-emit pairs.
     struct SubSink {
-        wire_red: std::sync::mpsc::SyncSender<WireDatagram>,
-        wire_blue: Option<std::sync::mpsc::SyncSender<WireDatagram>>,
+        wire_red: crate::engine::wire_emit::WireTxHandle,
+        wire_blue: Option<crate::engine::wire_emit::WireTxHandle>,
         pkt: Rfc4175Packetizer,
     }
     let mut sinks: Vec<SubSink> = Vec::with_capacity(n as usize);
