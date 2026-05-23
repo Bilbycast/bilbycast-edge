@@ -1008,10 +1008,10 @@ exercising downstream gear without a real source.
   "type": "test_pattern",
   "id": "in-test",
   "name": "Test pattern",
-  "width": 1280,
-  "height": 720,
-  "fps": 25,
-  "video_bitrate_kbps": 2000,
+  "width": 1920,
+  "height": 1080,
+  "fps": 50,
+  "video_bitrate_kbps": 8000,
   "audio_enabled": true,
   "tone_hz": 1000.0,
   "tone_dbfs": -20.0,
@@ -1019,11 +1019,15 @@ exercising downstream gear without a real source.
 }
 ```
 
+The defaults reflect tier-1 broadcast — 1080p50 with an 8 Mbps target
+matches a 3G-SDI contribution feed. Drop `fps` to `25`/`29.97` for
+legacy interlace stand-ins; `2160`/`3840` widths work too for UHD.
+
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `type` | string | — | Always `"test_pattern"`. |
-| `width` | u16 | `1280` | Video width in pixels. Must be divisible by 2. |
-| `height` | u16 | `720` | Video height in pixels. Must be divisible by 2. |
+| `width` | u16 | `1920` | Video width in pixels. Must be divisible by 2. |
+| `height` | u16 | `1080` | Video height in pixels. Must be divisible by 2. |
 | `fps` | u16 | `25` | Frame rate. Range `[1, 60]`. |
 | `video_bitrate_kbps` | u32 | `2000` | Target video bitrate. |
 | `audio_enabled` | bool | `true` | When `false`, emits a video-only TS. |

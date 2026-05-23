@@ -466,17 +466,15 @@ fn poll_once(config: &PtpReporterConfig) -> Result<PtpState, PtpPollError> {
         return Err(PtpPollError::SocketMissing);
     }
 
-    // Bind a temporary client socket. linuxptp accepts abstract or filesystem
-    // UDS clients; on Linux we use an abstract address (\0bilbycast-ptp-<pid>)
-    // so we don't pollute the filesystem and so multiple bilbycast instances
-    // never collide. socket2 / std::os::unix::net::UnixDatagram does support
-    // abstract sockets via the `from_abstract_*` API since Rust 1.70 on Linux,
-    // but for portability we use a filesystem-based tempfile here.
-    let tmp = tempfile_socket_path()?;
-    let sock = UnixDatagram::bind(&tmp).map_err(PtpPollError::Io)?;
-    // Best-effort cleanup on drop. We hold this guard until the function
-    // returns so the temp file is unlinked even on error paths.
-    let _cleanup = TempPathGuard(tmp);
+    // Bind a temporary client socket. On Linux we use the abstract Unix
+    // namespace (a `\0`-prefixed sun_path with no filesystem presence) —
+    // this avoids `/tmp` write permissions, avoids AppArmor profiles
+    // that mediate access by filesystem path (Ubuntu's stock
+    // `/usr/sbin/ptp4l` profile denies `sendmsg` to `/tmp/...`),
+    // and never leaves stale files on crash. Filesystem fallback is
+    // used on non-Linux Unix platforms (macOS doesn't have abstract
+    // sockets).
+    let (sock, _cleanup) = bind_client_socket()?;
 
     sock.set_read_timeout(Some(config.uds_timeout)).map_err(PtpPollError::Io)?;
     sock.set_write_timeout(Some(config.uds_timeout)).map_err(PtpPollError::Io)?;
@@ -535,26 +533,59 @@ fn classify_lock(offset_ns: i64, tolerance_ns: i64) -> PtpLockState {
     }
 }
 
-/// Generate a temporary filesystem path for a client UDS endpoint.
+/// Bind the per-poll client UDS endpoint.
 ///
-/// Uses the process ID and a monotonic counter so concurrent polls within the
-/// same process never collide. Lives under `/tmp` since `/var/run` is usually
-/// not writable by the bilbycast user.
-fn tempfile_socket_path() -> Result<PathBuf, PtpPollError> {
+/// Linux: uses the abstract namespace (`\0bilbycast-ptp-<pid>-<counter>`).
+/// Abstract sockets have no filesystem path, vanish on close, and bypass
+/// path-based LSM mediation (AppArmor / SELinux file rules). This is the
+/// preferred shape on every Linux distribution we support, and it is what
+/// `pmc -u` itself does when invoked under systemd.
+///
+/// Non-Linux Unix: falls back to a filesystem path under the temp dir,
+/// cleaned up on drop. macOS lacks abstract sockets entirely.
+fn bind_client_socket() -> Result<(UnixDatagram, ClientSocketCleanup), PtpPollError> {
+    next_client_socket()
+}
+
+#[cfg(target_os = "linux")]
+fn next_client_socket() -> Result<(UnixDatagram, ClientSocketCleanup), PtpPollError> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::SocketAddr;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let name = format!("bilbycast-ptp-{pid}-{n}");
+    let addr = SocketAddr::from_abstract_name(name.as_bytes()).map_err(PtpPollError::Io)?;
+    let sock = UnixDatagram::bind_addr(&addr).map_err(PtpPollError::Io)?;
+    Ok((sock, ClientSocketCleanup::Abstract))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn next_client_socket() -> Result<(UnixDatagram, ClientSocketCleanup), PtpPollError> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let path = std::env::temp_dir().join(format!("bilbycast-ptp-{pid}-{n}.sock"));
-    // Best-effort: remove any leftover from a previous crash.
     let _ = std::fs::remove_file(&path);
-    Ok(path)
+    let sock = UnixDatagram::bind(&path).map_err(PtpPollError::Io)?;
+    Ok((sock, ClientSocketCleanup::Path(path)))
 }
 
-struct TempPathGuard(PathBuf);
-impl Drop for TempPathGuard {
+enum ClientSocketCleanup {
+    /// Abstract Linux UDS — vanishes on socket close, no cleanup needed.
+    Abstract,
+    /// Filesystem-based UDS — unlink on drop.
+    #[allow(dead_code)]
+    Path(PathBuf),
+}
+
+impl Drop for ClientSocketCleanup {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        if let ClientSocketCleanup::Path(p) = self {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
@@ -947,8 +978,12 @@ mod tests {
                 } else {
                     build_response_parent_data_set_gm(0, [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17])
                 };
-                let peer_path = peer.as_pathname().unwrap().to_path_buf();
-                let _ = server.send_to(&response, &peer_path);
+                // Client may have bound an abstract or filesystem path. On
+                // Linux post-fix the client uses abstract addresses, so we
+                // must use `send_to_addr` (stable since 1.70) with the
+                // returned `SocketAddr` instead of round-tripping through a
+                // filesystem path.
+                let _ = server.send_to_addr(&response, &peer);
             }
         });
 

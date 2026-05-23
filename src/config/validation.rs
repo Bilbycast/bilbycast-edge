@@ -332,21 +332,29 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
             }
         }
 
-        // If the flow broadcasts TS (either natively or because a PCM input has
-        // `audio_encode` set), PCM-only outputs cannot attach: they depacketize
-        // RTP PCM and would silently produce noise if fed encoded TS.
+        // If the flow broadcasts TS (either natively or because a PCM input
+        // has `audio_encode` set), outputs that have no TS-decode bridge
+        // cannot attach. ST 2110-30 / -31 and `rtp_audio` ARE compatible
+        // — `engine::st2110_io::run_st2110_audio_output` runs a
+        // `compressed_audio_input` bridge (TsDemuxer + AacDecoder +
+        // TranscodeStage) when the active input carries TS audio, so the
+        // wire still emits clean PCM-RTP / AES3 / 302M. Only ST 2110-40
+        // (RFC 8331 ANC) lacks a TS bridge — ANC essence has no
+        // equivalent in MPEG-TS today, so a TS upstream cannot feed it.
         let flow_produces_ts = flow_inputs.first().map(|c| c.produces_ts()).unwrap_or(false);
         if flow_produces_ts {
             for oid in &flow.output_ids {
                 let Some(output) = config.outputs.iter().find(|o| o.id() == oid) else {
                     continue;
                 };
-                if output_is_pcm_only(output) {
+                if output_lacks_ts_bridge(output) {
                     bail!(
-                        "Flow '{}': output '{}' expects raw PCM-RTP on the broadcast \
-                         channel, but this flow's inputs produce MPEG-TS (either natively \
-                         or via `audio_encode` on a PCM input). Remove the PCM-only output \
-                         from this flow, or remove `audio_encode` from the PCM input(s).",
+                        "Flow '{}': output '{}' has no MPEG-TS → essence bridge \
+                         (ST 2110-40 ANC carries RFC 8331 payload that has no \
+                         TS counterpart), but this flow's inputs produce MPEG-TS \
+                         (either natively or via `audio_encode` on a PCM input). \
+                         Remove this output from the flow, or split it onto a \
+                         separate flow whose input is native ANC.",
                         flow.id, oid
                     );
                 }
@@ -587,17 +595,16 @@ pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
     Ok(())
 }
 
-/// Returns true when this output expects raw PCM-RTP on the flow's broadcast
-/// channel. Used by the flow-level shape-compatibility check: these outputs
-/// cannot attach to a flow whose inputs produce MPEG-TS.
-fn output_is_pcm_only(output: &OutputConfig) -> bool {
-    matches!(
-        output,
-        OutputConfig::St2110_30(_)
-            | OutputConfig::St2110_31(_)
-            | OutputConfig::St2110_40(_)
-            | OutputConfig::RtpAudio(_)
-    )
+/// Returns true when this output has no MPEG-TS → wire-essence bridge in the
+/// engine and therefore cannot attach to a TS-shape flow. Currently only
+/// ST 2110-40 (RFC 8331 ancillary data) — ANC essence has no TS counterpart
+/// today, so a TS input cannot feed it. ST 2110-30/-31 and `rtp_audio` HAVE
+/// a TS bridge (`compressed_audio_input` path in
+/// `engine::st2110_io::run_st2110_audio_output` runs TS demux + AAC/MP2/AC-3
+/// decode + planar transcode + PCM repacketize) so they are allowed on
+/// TS-shape flows.
+fn output_lacks_ts_bridge(output: &OutputConfig) -> bool {
+    matches!(output, OutputConfig::St2110_40(_))
 }
 
 /// If `input` is itself an uncompressed audio source, return its

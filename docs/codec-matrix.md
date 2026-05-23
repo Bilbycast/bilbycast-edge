@@ -157,13 +157,20 @@ overflowing the running total.
 
 | Profile | Approx units (cost helper) |
 |---|---|
-| 720p30 H.264 4:2:0 8-bit on NVENC | ≈ 50 (clamped to 100 baseline) |
-| 1080p30 H.264 4:2:0 8-bit on NVENC | 100 |
-| 1080p30 HEVC 4:2:0 10-bit on NVENC | 150 |
+| 1080p25 H.264 4:2:0 8-bit on NVENC | ~83 (clamped to 100 baseline) |
+| 1080p50 H.264 4:2:0 8-bit on NVENC (3G-SDI tier-1 baseline) | 167 |
+| 1080p59.94 H.264 4:2:0 8-bit on NVENC | 200 |
+| 1080p50 HEVC 4:2:2 10-bit on NVENC (broadcast contribution) | 313 |
 | 4K30 H.264 4:2:0 8-bit on NVENC | 400 |
-| 4K60 HEVC 4:2:2 10-bit on libx265 (broadcast contribution) | ~7 980 |
-| 1080p30 H.264 4:2:0 8-bit on libx264 | 500 |
-| 4K60 HEVC 4:2:0 8-bit on libx265 | 4000 |
+| 4K50 HEVC 4:2:2 10-bit on libx265 (broadcast contribution) | ~6 650 |
+| 4K59.94 HEVC 4:2:2 10-bit on libx265 (broadcast contribution) | ~7 980 |
+| 1080p50 H.264 4:2:0 8-bit on libx264 | 833 |
+| 4K59.94 HEVC 4:2:0 8-bit on libx265 | 4 800 |
+
+Tier-1 production reference rates: **1080p50 ≈ 2.07 Gbps RFC 4175
+YUV422 10-bit**, **1080p59.94 ≈ 2.48 Gbps**, **2160p50 ≈ 8.28 Gbps**.
+720p was tier-2 in the legacy SDI era and is not exercised in the
+broadcast-grade test matrix today.
 
 The total per-host budget is `1000 + 200 × physical_cores`, so a 4-core
 edge gets 1800 units (one 4K30 NVENC flow + headroom), a 32-core EPYC
@@ -207,9 +214,9 @@ End-to-end sanity check on each host class:
    `category: display, error_code: display_hdr_tonemap_active`
    warning exactly once per flow start.
 
-6. **Resource impact tile reflects pixel rate.** Start one 720p30 H.264
-   4:2:0 8-bit on NVENC and one 4K60 HEVC 4:2:2 10-bit on libx265 on
-   the same host. The Resources card should show roughly a 100 : 8000
+6. **Resource impact tile reflects pixel rate.** Start one 1080p50 H.264
+   4:2:0 8-bit on NVENC and one 4K59.94 HEVC 4:2:2 10-bit on libx265 on
+   the same host. The Resources card should show roughly a 167 : 7980
    unit ratio between the two flows.
 
 7. **Cost-budget oversubscription warning fires** when the second

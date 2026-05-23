@@ -843,6 +843,10 @@ fn decode_worker(
     let mut current_codec: Option<VideoCodec> = None;
     let mut decoder: Option<VideoDecoder> = None;
     let mut scaler: Option<VideoScaler> = None;
+    // Monotonic fallback when the source omits PTS (very rare on TS
+    // ingress — `media-codecs` decoder always supplies one). Bumped
+    // per emitted frame so receivers never see a backwards step.
+    let mut synth_pts: i64 = 0;
 
     while !cancel.is_cancelled() {
         let frame = match nalu_rx.blocking_recv() {
@@ -867,13 +871,21 @@ fn decode_worker(
         }
         let dec = decoder.as_mut().unwrap();
 
-        // Feed NALUs as annex-B to decoder.
+        // Feed NALUs as annex-B to decoder. Attach the source PES PTS
+        // so the decoder propagates it (in presentation order, after
+        // B-frame reorder) onto each output frame's `pts()`. Without
+        // this, the RFC 4175 wire timestamp would inherit the
+        // most-recently-sent packet's decode-order PTS — non-monotonic
+        // on streams with B-frames, which RFC 4175 § 4.1 forbids.
         let mut nalu_bytes = Vec::new();
         for nalu in nalus {
             nalu_bytes.extend_from_slice(&[0, 0, 0, 1]);
             nalu_bytes.extend_from_slice(&nalu);
         }
-        if let Err(e) = dec.send_packet(&nalu_bytes) {
+        // `DemuxedFrame::H264::pts` is u64 (TS PES PTS in 90 kHz, 33-bit).
+        // libavcodec wants i64; the high bit is always 0 for a 33-bit
+        // value, so a plain cast is safe.
+        if let Err(e) = dec.send_packet_with_pts(&nalu_bytes, pts as i64) {
             tracing::debug!(error = %e, "ST 2110-20 output decoder send_packet error");
             continue;
         }
@@ -886,6 +898,16 @@ fn decode_worker(
             let src_w = dec_frame.width();
             let src_h = dec_frame.height();
             let src_pix_fmt = dec_frame.pixel_format();
+            // Pull the PRESENTATION-order PTS that libavcodec attached
+            // after the decoder's B-frame reorder. Falls back to a
+            // monotonic synthetic anchor only if the source genuinely
+            // omitted PTS (very rare — `media-codecs` always supplies
+            // it in our pipeline). The fallback uses a per-decoder
+            // counter so receivers still see monotonic timestamps.
+            let frame_pts = dec_frame.pts().unwrap_or_else(|| {
+                synth_pts += 1;
+                synth_pts
+            });
             if scaler.is_none() {
                 scaler = Some(
                     match VideoScaler::new_with_dst_format(
@@ -940,7 +962,7 @@ fn decode_worker(
                 width,
                 height,
                 format: fmt,
-                pts_90k: pts as u32,
+                pts_90k: frame_pts as u32,
                 field: VideoField::Progressive,
             };
             let _ = frame_tx.try_send(raw);
