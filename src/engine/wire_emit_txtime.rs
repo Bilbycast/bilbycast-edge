@@ -285,6 +285,88 @@ pub fn send_batch_with_txtime(
     ))
 }
 
+/// Send a batch of datagrams to the same destination in a single
+/// `sendmmsg(2)` syscall — no `SCM_TXTIME` cmsg, no kernel-side pacing.
+/// Used by the `ClockNanosleep` releaser tier in `engine::wire_emit` to
+/// amortize per-packet send overhead when the channel has multiple
+/// "send NOW" datagrams queued (typically the burst of non-PCR datagrams
+/// between two PCR-bearing packets on a TS output).
+///
+/// Per-packet `socket.send_to(...)` carries ~30 µs of syscall overhead
+/// on SCHED_OTHER, and at 20 datagrams per PCR cycle (33 ms at 30 fps
+/// over 6 Mbps TS) that's 600 µs / cycle — significant fraction of the
+/// pacing budget, enough to drift the wire egress rate behind the
+/// encoder producer rate and grow the `wire_tx` channel into the cap on
+/// long runs. A single `sendmmsg` for the same 20 datagrams amortizes
+/// the syscall to one ~30 µs call, restoring the pacing margin.
+///
+/// Returns the number of datagrams the kernel actually accepted (may be
+/// less than the batch size on a transient send error).
+///
+/// On non-Linux this falls back to a loop of `send_to` calls.
+#[cfg(target_os = "linux")]
+pub fn send_batch_simple(
+    socket: &std::net::UdpSocket,
+    dest: SocketAddr,
+    batch: &[&[u8]],
+) -> io::Result<usize> {
+    use std::os::unix::io::AsRawFd;
+
+    if batch.is_empty() {
+        return Ok(0);
+    }
+
+    let (sa_ptr, sa_len) = sockaddr_for(&dest);
+
+    let mut iovs: Vec<libc::iovec> = Vec::with_capacity(batch.len());
+    let mut mmsgs: Vec<libc::mmsghdr> = Vec::with_capacity(batch.len());
+
+    for bytes in batch {
+        iovs.push(libc::iovec {
+            iov_base: bytes.as_ptr() as *mut libc::c_void,
+            iov_len: bytes.len(),
+        });
+    }
+
+    for i in 0..batch.len() {
+        let mut mh: libc::mmsghdr = unsafe { std::mem::zeroed() };
+        mh.msg_hdr.msg_name = sa_ptr;
+        mh.msg_hdr.msg_namelen = sa_len;
+        mh.msg_hdr.msg_iov = (&mut iovs[i]) as *mut libc::iovec;
+        mh.msg_hdr.msg_iovlen = 1;
+        mh.msg_hdr.msg_control = std::ptr::null_mut();
+        mh.msg_hdr.msg_controllen = 0;
+        mmsgs.push(mh);
+    }
+
+    let rc = unsafe {
+        libc::sendmmsg(
+            socket.as_raw_fd(),
+            mmsgs.as_mut_ptr(),
+            mmsgs.len() as libc::c_uint,
+            0,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(rc as usize)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn send_batch_simple(
+    socket: &std::net::UdpSocket,
+    dest: SocketAddr,
+    batch: &[&[u8]],
+) -> io::Result<usize> {
+    let mut n = 0;
+    for bytes in batch {
+        socket.send_to(bytes, dest)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// Drain the socket's error queue and count datagrams the kernel
 /// rejected as late (target tx time landed in the past, returning
 /// `EOVERFLOW`). Should be called periodically — e.g. once per ST 2110

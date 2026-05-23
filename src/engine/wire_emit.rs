@@ -89,7 +89,7 @@
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -636,6 +636,42 @@ impl TargetState {
 
 // ── Emitter main loop ───────────────────────────────────────────────────
 
+/// Greedy collect cap for the `ClockNanosleep`-tier batch send. The
+/// batch naturally bounds at the next PCR-bearing datagram with a
+/// future target (one full inter-PCR window of bytes), so this cap is
+/// only the absolute safety ceiling. Sized to absorb a worst-case
+/// uncompressed-class I-frame burst — 2 MB raw video per 33 ms PCR
+/// cycle (≈ 480 Mbps peak) is ~1600 datagrams. The cycle's `try_recv`
+/// + `derive_target` overhead at 2 048 datagrams is ~3 ms (1.5 µs ×
+/// 2 048) plus one `sendmmsg` syscall (~50 µs at 1 500 dgms on a
+/// loopback socket) — well under the 33 ms cycle budget.
+///
+/// Shipping the full inter-PCR window in **one** `sendmmsg(2)` call is
+/// what keeps the wire_tx channel from accumulating during I-frame
+/// bursts: a 200 KB I-frame on a 5 Mbps stream is 152 datagrams within
+/// a single 33 ms PCR cadence; capping the batch at e.g. 64 would
+/// spread that single I-frame across 3 PCR cycles (99 ms wallclock vs
+/// the 33 ms of content it represents), accumulating 66 ms of latency
+/// per I-frame and ultimately filling the channel on long runs.
+const NANOSLEEP_BATCH_MAX: usize = 2048;
+
+/// One entry in the `ClockNanosleep`-tier batch: the datagram + the
+/// PCR sample we parsed out of it (for `record_pcr_egress`).
+struct BatchEntry {
+    dg: WireDatagram,
+    pcr_27mhz: Option<u64>,
+}
+
+/// A datagram whose `derive_target` was already evaluated in a prior
+/// iteration's batch-collection step. Carries the resolved target so
+/// the next iteration's main path skips a second `derive_target` call
+/// (which would double-advance `state`).
+struct PendingDatagram {
+    dg: WireDatagram,
+    target_ns: u64,
+    pcr_27mhz: Option<u64>,
+}
+
 fn run_emitter(
     id: String,
     socket: UdpSocket,
@@ -648,51 +684,78 @@ fn run_emitter(
 ) {
     let mut state = TargetState::default();
     let mut packets_since_drain: u64 = 0;
+    let mut pending: Option<PendingDatagram> = None;
+    // Initial capacity covers a typical TS inter-PCR window (~20 dgms)
+    // plus comfortable headroom for I-frame bursts. The Vec grows on
+    // demand up to NANOSLEEP_BATCH_MAX; the initial size just avoids
+    // reallocation on the first few cycles.
+    let mut batch: Vec<BatchEntry> = Vec::with_capacity(256);
+    // Diagnostic — log average batch size every 5 seconds so operators
+    // can confirm the batching path is firing on bursty TS outputs.
+    let mut batch_count: u64 = 0;
+    let mut batch_dgms_total: u64 = 0;
+    let mut batch_log_next_ns: u64 = monotonic_now_ns().saturating_add(5_000_000_000);
 
     loop {
         if cancel.is_cancelled() {
             return;
         }
-        let dg = match rx.recv_timeout(RECV_POLL) {
-            Ok(d) => d,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => return,
-        };
+        // The "anchor" datagram for this iteration is either the one we
+        // deferred from the previous iteration (its target was in the
+        // future so we couldn't batch it — but `derive_target` already
+        // ran for it, so we MUST NOT re-derive here) or a fresh blocking
+        // recv.
+        let (dg, target_ns, pcr_27mhz) = match pending.take() {
+            Some(p) => (p.dg, p.target_ns, p.pcr_27mhz),
+            None => {
+                let dg = match rx.recv_timeout(RECV_POLL) {
+                    Ok(d) => d,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => return,
+                };
 
+                let now_ns = monotonic_now_ns();
+                let pcr_with_pid = match anchor {
+                    AnchorSource::Pcr => {
+                        // RTP-wrapped callers prepend a 12-byte RTP header;
+                        // raw-TS callers set `ts_offset = 0`. Without
+                        // skipping the header, the 188-byte-stride sync
+                        // scan never lands on `0x47` and the pacer treats
+                        // every datagram as "between PCRs", collapsing to
+                        // producer cadence on RTP outputs.
+                        let off = dg.ts_offset.min(dg.bytes.len());
+                        crate::engine::ts_parse::first_pcr_in_ts_buffer_pid(
+                            &dg.bytes[off..],
+                            state.anchor_pid,
+                        )
+                    }
+                    AnchorSource::St2110Raster => None,
+                };
+                // Lock onto the first PCR-bearing PID we ever see. From
+                // this point on, the ts_parse helper filters to this PID —
+                // PCRs from other programs in an MPTS are ignored (each
+                // program has its own 27 MHz clock; mixing them produces
+                // wild apparent discontinuities that collapse the closed-
+                // loop pacer). One PID anchored, every other datagram
+                // looks like "between PCRs" → emit ASAP. PCR_AC for the
+                // anchored program tracks the same as an SPTS would.
+                if let Some((_, pid)) = pcr_with_pid {
+                    if state.anchor_pid.is_none() {
+                        state.anchor_pid = Some(pid);
+                    }
+                }
+                let pcr_27mhz = pcr_with_pid.map(|(pcr, _)| pcr);
+
+                let target_ns = match anchor {
+                    AnchorSource::Pcr => {
+                        state.derive_target(now_ns, pcr_27mhz, dg.bytes.len())
+                    }
+                    AnchorSource::St2110Raster => dg.target_tx_time_ns.unwrap_or(now_ns),
+                };
+                (dg, target_ns, pcr_27mhz)
+            }
+        };
         let now_ns = monotonic_now_ns();
-        let pcr_with_pid = match anchor {
-            AnchorSource::Pcr => {
-                // RTP-wrapped callers prepend a 12-byte RTP header; raw-TS
-                // callers set `ts_offset = 0`. Without skipping the header,
-                // the 188-byte-stride sync scan never lands on `0x47` and
-                // the pacer treats every datagram as "between PCRs",
-                // collapsing to producer cadence on RTP outputs.
-                let off = dg.ts_offset.min(dg.bytes.len());
-                crate::engine::ts_parse::first_pcr_in_ts_buffer_pid(
-                    &dg.bytes[off..],
-                    state.anchor_pid,
-                )
-            }
-            AnchorSource::St2110Raster => None,
-        };
-        // Lock onto the first PCR-bearing PID we ever see. From this point
-        // on, the ts_parse helper filters to this PID — PCRs from other
-        // programs in an MPTS are ignored (each program has its own 27 MHz
-        // clock; mixing them produces wild apparent discontinuities that
-        // collapse the closed-loop pacer). One PID anchored, every other
-        // datagram looks like "between PCRs" → emit ASAP. PCR_AC for the
-        // anchored program tracks the same as an SPTS would.
-        if let Some((_, pid)) = pcr_with_pid {
-            if state.anchor_pid.is_none() {
-                state.anchor_pid = Some(pid);
-            }
-        }
-        let pcr_27mhz = pcr_with_pid.map(|(pcr, _)| pcr);
-
-        let target_ns = match anchor {
-            AnchorSource::Pcr => state.derive_target(now_ns, pcr_27mhz, dg.bytes.len()),
-            AnchorSource::St2110Raster => dg.target_tx_time_ns.unwrap_or(now_ns),
-        };
 
         // PCR is left exactly as packetized. An earlier attempt to
         // re-stamp PCR to `target_ns - preroll` here was reverted —
@@ -705,37 +768,174 @@ fn run_emitter(
         // or `clock_nanosleep` (~100 µs); we trust the kernel to
         // place the packet on the wire at the right instant rather
         // than rewriting the PCR field.
-        let send_result = match releaser {
-            Releaser::ClockNanosleep => {
-                if target_ns > now_ns {
-                    sleep_until_monotonic_ns(target_ns);
-                }
-                socket.send_to(&dg.bytes, dest)
+        if let Releaser::ClockNanosleep = releaser {
+            if target_ns > now_ns {
+                sleep_until_monotonic_ns(target_ns);
             }
-            Releaser::SoTxtime => {
-                // Kernel handles the wallclock target via ETF qdisc.
-                // No userspace sleep — the thread loops at producer
-                // rate with bounded recvmsg + sendmsg cost.
-                crate::engine::wire_emit_txtime::send_with_txtime(
-                    &socket,
-                    dest,
-                    &dg.bytes,
-                    target_ns,
-                )
-            }
-        };
+        }
 
-        match send_result {
-            Ok(sent) => {
-                stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                stats.record_latency(dg.recv_time_us);
-                if let Some(pcr) = pcr_27mhz {
-                    stats.record_pcr_egress(pcr, crate::util::time::now_us());
+        // ── ClockNanosleep tier: batch send via sendmmsg ────────────
+        //
+        // Per-packet `socket.send_to` is the bottleneck under SCHED_OTHER:
+        // ~30 µs syscall cost × 20 datagrams between two PCR-bearing
+        // datagrams = 600 µs out of the 33 ms pacing budget for a 30 fps
+        // 6 Mbps TS. That margin lost per cycle accumulates into the
+        // `wire_tx` channel; a long run grows the channel to the cap →
+        // drop-on-full. The fix: after sleeping for the anchor's target,
+        // greedily drain the channel for follow-on datagrams that are
+        // also ready NOW, and ship them all in one `sendmmsg`.
+        //
+        // Only meaningful for `Pcr` + `ClockNanosleep`. ST 2110 raster
+        // anchor has per-packet target tx times and the existing v1
+        // per-packet `send_with_txtime` path is fine at the rates we
+        // currently drive it. SO_TXTIME path leaves kernel pacing in
+        // place; batching would need `send_batch_with_txtime` (already
+        // implemented but separate wire-up).
+        let use_batch =
+            matches!(releaser, Releaser::ClockNanosleep) && matches!(anchor, AnchorSource::Pcr);
+        if use_batch {
+            batch.clear();
+            batch.push(BatchEntry { dg, pcr_27mhz });
+            // Greedily pull more datagrams that are already ready to
+            // send (target ≤ now). Stop when:
+            //   - channel is empty (most common — burst already drained)
+            //   - next datagram has a future target (defer to next loop)
+            //   - we hit NANOSLEEP_BATCH_MAX (cap collection latency)
+            //   - channel disconnected (return)
+            // Track Disconnected separately — we must still ship the
+            // accumulated batch before exiting, otherwise teardown drops
+            // up to NANOSLEEP_BATCH_MAX in-flight datagrams on the floor.
+            let mut channel_disconnected = false;
+            while batch.len() < NANOSLEEP_BATCH_MAX {
+                match rx.try_recv() {
+                    Ok(next_dg) => {
+                        let now_ns = monotonic_now_ns();
+                        let off = next_dg.ts_offset.min(next_dg.bytes.len());
+                        let next_pcr_with_pid =
+                            crate::engine::ts_parse::first_pcr_in_ts_buffer_pid(
+                                &next_dg.bytes[off..],
+                                state.anchor_pid,
+                            );
+                        if let Some((_, pid)) = next_pcr_with_pid {
+                            if state.anchor_pid.is_none() {
+                                state.anchor_pid = Some(pid);
+                            }
+                        }
+                        let next_pcr_27mhz = next_pcr_with_pid.map(|(pcr, _)| pcr);
+                        let next_target = state.derive_target(
+                            now_ns,
+                            next_pcr_27mhz,
+                            next_dg.bytes.len(),
+                        );
+                        if next_target <= now_ns {
+                            batch.push(BatchEntry {
+                                dg: next_dg,
+                                pcr_27mhz: next_pcr_27mhz,
+                            });
+                        } else {
+                            // Future target — defer to next iteration.
+                            // We've already advanced `state` via
+                            // `derive_target`, so the next iteration MUST
+                            // skip the derive call. Stash the resolved
+                            // target_ns and pcr_27mhz alongside the dg so
+                            // the next loop's main path picks them up via
+                            // the `pending.take()` arm and skips the
+                            // re-derive that would double-advance state.
+                            pending = Some(PendingDatagram {
+                                dg: next_dg,
+                                target_ns: next_target,
+                                pcr_27mhz: next_pcr_27mhz,
+                            });
+                            break;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        channel_disconnected = true;
+                        break;
+                    }
                 }
             }
-            Err(e) => {
-                tracing::warn!("wire-emit '{}' send error: {}", id, e);
+
+            // Send the batch in a single sendmmsg syscall (or per-packet
+            // on non-Linux, or if the batch is size 1).
+            let bufs: Vec<&[u8]> = batch.iter().map(|e| e.dg.bytes.as_ref()).collect();
+            let send_result =
+                crate::engine::wire_emit_txtime::send_batch_simple(&socket, dest, &bufs);
+            let now_us = crate::util::time::now_us();
+            match send_result {
+                Ok(n_sent) => {
+                    let mut bytes_total: u64 = 0;
+                    for entry in batch.iter().take(n_sent) {
+                        bytes_total =
+                            bytes_total.saturating_add(entry.dg.bytes.len() as u64);
+                        stats.record_latency(entry.dg.recv_time_us);
+                        if let Some(pcr) = entry.pcr_27mhz {
+                            stats.record_pcr_egress(pcr, now_us);
+                        }
+                    }
+                    stats
+                        .packets_sent
+                        .fetch_add(n_sent as u64, Ordering::Relaxed);
+                    stats.bytes_sent.fetch_add(bytes_total, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "wire-emit '{}' batch send error ({} dgms): {}",
+                        id,
+                        batch.len(),
+                        e
+                    );
+                }
+            }
+            // Diagnostic accounting — running average batch size over a
+            // 5 s window, emitted at DEBUG level so operators can confirm
+            // the sendmmsg optimisation is firing on bursty TS outputs
+            // (`RUST_LOG=bilbycast_edge::engine::wire_emit=debug`). Silent
+            // at default log level.
+            batch_count = batch_count.saturating_add(1);
+            batch_dgms_total = batch_dgms_total.saturating_add(batch.len() as u64);
+            let now = monotonic_now_ns();
+            if now >= batch_log_next_ns && batch_count > 0 {
+                let avg = batch_dgms_total as f64 / batch_count as f64;
+                tracing::debug!(
+                    "wire-emit '{}' batches={}  avg_dgms_per_batch={:.2}  (5s window)",
+                    id, batch_count, avg
+                );
+                batch_count = 0;
+                batch_dgms_total = 0;
+                batch_log_next_ns = now.saturating_add(5_000_000_000);
+            }
+            // Honor a Disconnect that happened during batch collection
+            // — exit AFTER shipping the batch above.
+            if channel_disconnected {
+                return;
+            }
+        } else {
+            // Non-batched path: ST 2110 raster anchor or SO_TXTIME releaser.
+            let send_result = match releaser {
+                Releaser::ClockNanosleep => socket.send_to(&dg.bytes, dest),
+                Releaser::SoTxtime => {
+                    // Kernel handles the wallclock target via ETF qdisc.
+                    // No userspace sleep — the thread loops at producer
+                    // rate with bounded recvmsg + sendmsg cost.
+                    crate::engine::wire_emit_txtime::send_with_txtime(
+                        &socket, dest, &dg.bytes, target_ns,
+                    )
+                }
+            };
+            match send_result {
+                Ok(sent) => {
+                    stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                    stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                    stats.record_latency(dg.recv_time_us);
+                    if let Some(pcr) = pcr_27mhz {
+                        stats.record_pcr_egress(pcr, crate::util::time::now_us());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("wire-emit '{}' send error: {}", id, e);
+                }
             }
         }
 

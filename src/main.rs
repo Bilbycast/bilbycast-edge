@@ -178,6 +178,33 @@ async fn main() -> anyhow::Result<()> {
     let rtprio_max = util::runtime_diag::capture_rlimit_rtprio();
     tracing::debug!("RLIMIT_RTPRIO max = {rtprio_max} (SCHED_FIFO priority ceiling)");
 
+    // ── Broadcast-grade scheduling preflight ────────────────────────────
+    //
+    // Real-time priority (`SCHED_FIFO`) on the wire-emit thread is THE
+    // single biggest determinant of PCR_AC accuracy on a Linux host —
+    // without it, the kernel can delay our `clock_nanosleep` wake by
+    // 0.5–5 ms under load, the wire pacer accumulates lag into its
+    // queue, and on long runs the queue overflows → packet drops.
+    //
+    // Production systemd unit (`packaging/bilbycast-edge.service`)
+    // already ships `LimitRTPRIO=99` + `AmbientCapabilities=CAP_SYS_NICE`
+    // so this preflight passes silently for installs done via
+    // `packaging/install-edge.sh`. The CRITICAL log here surfaces the
+    // misconfiguration immediately for manual installs / containers /
+    // unprivileged testbed runs.
+    if rtprio_max == 0 && !crate::util::runtime_diag::sched_fifo_self_test_can_acquire() {
+        tracing::error!(
+            "SCHEDULING-CRITICAL: RLIMIT_RTPRIO=0 and CAP_SYS_NICE not granted — \
+             wire-emit threads will run at SCHED_OTHER and degrade PCR_AC by \
+             0.5–5 ms (p99). Long-run TS outputs may accumulate latency in the \
+             wire_tx queue and drop packets under sustained bitrate excursions. \
+             Broadcast-grade fix: install via packaging/install-edge.sh (the \
+             shipped systemd unit sets LimitRTPRIO=99 + AmbientCapabilities=\
+             CAP_SYS_NICE), or grant cap_sys_nice manually: \
+             `sudo setcap cap_sys_nice=eip ./bilbycast-edge`."
+        );
+    }
+
     // Optional: lock all current + future pages into RAM via mlockall(2)
     // to eliminate major-page-fault stalls on the data-plane hot path.
     // Opt-in via BILBYCAST_MLOCKALL=1 — off by default because hosts

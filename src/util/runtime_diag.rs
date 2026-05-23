@@ -139,6 +139,57 @@ pub fn rlimit_rtprio_max() -> u32 {
     RLIMIT_RTPRIO_MAX.load(Ordering::Relaxed)
 }
 
+/// Probe whether the current process can ACTUALLY acquire `SCHED_FIFO`
+/// at our wire-emit priority (50), regardless of `RLIMIT_RTPRIO`. The
+/// `CAP_SYS_NICE` capability lets a process call
+/// `sched_setscheduler(SCHED_FIFO)` even when `RLIMIT_RTPRIO==0` (e.g.
+/// `setcap cap_sys_nice=eip ./bilbycast-edge`), so a self-test on a
+/// transient thread is the only reliable indicator. Restores
+/// `SCHED_OTHER` before returning so the test thread leaves no
+/// scheduler imprint.
+///
+/// Cheap — one `pthread_create` + 2 syscalls + join. Used by the
+/// `main.rs` preflight to decide whether to emit the CRITICAL
+/// scheduling warning.
+#[cfg(target_os = "linux")]
+pub fn sched_fifo_self_test_can_acquire() -> bool {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel();
+    let h = std::thread::Builder::new()
+        .name("sched-fifo-probe".to_string())
+        .spawn(move || {
+            let mut sp: libc::sched_param = unsafe { std::mem::zeroed() };
+            sp.sched_priority = 50;
+            let rc = unsafe {
+                libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &sp)
+            };
+            // Best-effort restore; ignore errors (thread exits anyway).
+            let mut sp_otherw: libc::sched_param = unsafe { std::mem::zeroed() };
+            sp_otherw.sched_priority = 0;
+            unsafe {
+                let _ = libc::pthread_setschedparam(
+                    libc::pthread_self(),
+                    libc::SCHED_OTHER,
+                    &sp_otherw,
+                );
+            }
+            let _ = tx.send(rc == 0);
+        });
+    match h {
+        Ok(handle) => {
+            let result = rx.recv().unwrap_or(false);
+            let _ = handle.join();
+            result
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn sched_fifo_self_test_can_acquire() -> bool {
+    false
+}
+
 /// Apply `SCHED_FIFO` at `priority` (1..=99) to the calling thread.
 /// Returns `true` on success, `false` on any failure (logged warn-level
 /// so operators see it). On failure the thread continues at
