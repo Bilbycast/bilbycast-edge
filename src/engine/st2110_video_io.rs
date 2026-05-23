@@ -189,11 +189,28 @@ fn partition_mode_for(m: St2110_23PartitionModeConfig) -> St2110_23PartitionMode
 // ── INGRESS ────────────────────────────────────────────────────────────────
 
 /// Convert a configured `VideoEncodeConfig` to the codec crate's
-/// `VideoEncoderConfig`. Delegates to
-/// [`crate::engine::video_encode_util::build_encoder_config`] so advanced
-/// knobs (chroma / bit_depth / rate_control / CRF / bframes / refs / level
-/// / tune / colour metadata) propagate through to the ST 2110-20/-23
-/// ingest encoder in lock-step with RTMP / WebRTC / TS video replacer.
+/// `VideoEncoderConfig`. The codec field passes through the runtime
+/// host-capability resolver so:
+///
+/// - `*_auto` strings (`h264_auto` / `hevc_auto`) resolve to the best
+///   backend the host actually supports for the requested
+///   `(chroma, bit_depth)`. Matches RTMP / WebRTC / TS replacer behaviour.
+/// - Operator-pinned HW backends that the host probe finds incompatible
+///   with the requested `(chroma, bit_depth)` (e.g. `hevc_vaapi` +
+///   4:2:2 10-bit on an Intel iGPU whose iHD driver lacks
+///   `VAProfileHEVCMain422_10`) fall back to the matching SW backend
+///   (`x265` for HEVC, `x264` for H.264) and log a single
+///   operator-facing `error_code = "encoder_chroma_not_supported"`
+///   message. Previously this surfaced as an opaque FFmpeg `-22` at
+///   first frame; now the operator gets the precise reason and the
+///   flow keeps running on the SW path.
+/// - Operator-pinned SW backends and HW backends that ARE supported
+///   pass straight through, no behaviour change.
+///
+/// Advanced knobs (chroma / bit_depth / rate_control / CRF / bframes /
+/// refs / level / tune / colour metadata) propagate through to the
+/// ST 2110-20/-23 ingest encoder in lock-step with RTMP / WebRTC /
+/// TS video replacer.
 #[cfg(feature = "media-codecs")]
 fn build_encoder_config(
     enc: &VideoEncodeConfig,
@@ -202,17 +219,57 @@ fn build_encoder_config(
     fps_num: u32,
     fps_den: u32,
 ) -> Result<video_codec::VideoEncoderConfig> {
+    use crate::engine::hardware_probe::{
+        resolve_for_video_encode_config, EncoderResolutionError, ResolvedVideoEncoder,
+    };
     use video_codec::VideoEncoderCodec;
-    let codec = match enc.codec.as_str() {
-        "x264" => VideoEncoderCodec::X264,
-        "x265" => VideoEncoderCodec::X265,
-        "h264_nvenc" => VideoEncoderCodec::H264Nvenc,
-        "hevc_nvenc" => VideoEncoderCodec::HevcNvenc,
-        "h264_qsv" => VideoEncoderCodec::H264Qsv,
-        "hevc_qsv" => VideoEncoderCodec::HevcQsv,
-        "h264_vaapi" => VideoEncoderCodec::H264Vaapi,
-        "hevc_vaapi" => VideoEncoderCodec::HevcVaapi,
-        other => return Err(anyhow!("unknown encoder codec '{other}'")),
+    let resolved_to_codec = |r: ResolvedVideoEncoder| match r {
+        ResolvedVideoEncoder::X264 => VideoEncoderCodec::X264,
+        ResolvedVideoEncoder::X265 => VideoEncoderCodec::X265,
+        ResolvedVideoEncoder::H264Nvenc => VideoEncoderCodec::H264Nvenc,
+        ResolvedVideoEncoder::HevcNvenc => VideoEncoderCodec::HevcNvenc,
+        ResolvedVideoEncoder::H264Qsv => VideoEncoderCodec::H264Qsv,
+        ResolvedVideoEncoder::HevcQsv => VideoEncoderCodec::HevcQsv,
+        ResolvedVideoEncoder::H264Vaapi => VideoEncoderCodec::H264Vaapi,
+        ResolvedVideoEncoder::HevcVaapi => VideoEncoderCodec::HevcVaapi,
+    };
+    // Try the host-capability resolver first. This unwraps `*_auto`
+    // strings AND validates fixed backends against the runtime
+    // (chroma, bit-depth) chroma matrix.
+    let codec = match resolve_for_video_encode_config(enc) {
+        Ok(resolved) => resolved_to_codec(resolved),
+        Err(EncoderResolutionError::ChromaUnsupported {
+            backend, chroma, bit_depth,
+        }) => {
+            // Fall back to the matching SW backend. SW is always
+            // compiled into the bilbycast `video-encoders-full`
+            // release artefact and accepts the broadcast contribution
+            // matrix (4:2:0 / 4:2:2 / 4:4:4 × 8 / 10) on every host.
+            // Pick the family from the original requested backend so
+            // an HEVC ask doesn't silently demote to H.264.
+            let fallback = match enc.codec.as_str() {
+                "h264_vaapi" | "h264_qsv" | "h264_nvenc" => VideoEncoderCodec::X264,
+                "hevc_vaapi" | "hevc_qsv" | "hevc_nvenc" => VideoEncoderCodec::X265,
+                "h264_auto" => VideoEncoderCodec::X264,
+                "hevc_auto" => VideoEncoderCodec::X265,
+                _ => VideoEncoderCodec::X265,
+            };
+            tracing::warn!(
+                error_code = "encoder_chroma_not_supported",
+                requested = %enc.codec,
+                backend = %backend,
+                chroma = %chroma,
+                bit_depth = bit_depth,
+                fallback = ?fallback,
+                "ST 2110-20 input: host's {backend} doesn't support \
+                 ({chroma}, {bit_depth}-bit) — falling back to {fallback:?}. \
+                 Configure `video_encode.codec` explicitly to suppress \
+                 this warning, or use `hevc_auto`/`h264_auto` to let the \
+                 resolver pick the cheapest supported backend per host."
+            );
+            fallback
+        }
+        Err(e) => return Err(anyhow!("ST 2110-20 input: {}", e.message())),
     };
     Ok(crate::engine::video_encode_util::build_encoder_config(
         enc, codec, width, height, fps_num, fps_den, false,

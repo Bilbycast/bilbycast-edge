@@ -468,6 +468,13 @@ mod inner {
         /// True once we've measured the source fps and pushed it into
         /// the encoder pipeline (a no-op once the encoder has opened).
         source_fps_locked: bool,
+        /// One-shot guard against log spam when the measured source
+        /// rate disagrees with the operator-pinned
+        /// `video_encode.fps_num` / `fps_den`. The mismatch is
+        /// load-bearing — A/V sync drift on cellPTP24 (ESPN.ts NTSC
+        /// 29.97 fps + pinned 25/1) traced to this. Emitted at most
+        /// once per encoder run.
+        fps_mismatch_warned: bool,
         /// PES frames consumed without yet locking the source rate.
         /// After a hard cap we accept the placeholder rate so a
         /// pathological source (no DTS, all-zero PTS) can't stall the
@@ -631,6 +638,7 @@ mod inner {
                 src_pts_queue: std::collections::VecDeque::with_capacity(64),
                 last_input_dts: None,
                 source_fps_locked: cfg.fps_num.is_some() && cfg.fps_den.is_some(),
+                fps_mismatch_warned: false,
                 unlocked_pes_count: 0,
                 description,
                 stats,
@@ -973,6 +981,46 @@ mod inner {
                                 if locked { "ACQUIRED" } else { "MISSED (encoder already opened)" },
                             );
                             self.source_fps_locked = true;
+                        } else if let (Some(n), Some(d)) = (self.fps_num, self.fps_den) {
+                            // Operator pinned `video_encode.fps_num` /
+                            // `fps_den` — but the measured source rate
+                            // (DTS delta) disagrees. The encoder runs at
+                            // the operator's time_base; the wire PES PTS
+                            // values come from `src_pts_queue` (= source
+                            // rate). When they disagree, A/V sync drifts
+                            // by the rate ratio bias — observed on
+                            // ESPN.ts NTSC 29.97 fps with operator-pinned
+                            // 25 fps (cellPTP24 / v3 report). One-shot
+                            // log per encoder run when the mismatch is
+                            // outside 0.1 % to avoid log spam on
+                            // VFR sources with steady-state jitter.
+                            let measured_fps = 90_000.0_f64 / delta as f64;
+                            let pinned_fps = n as f64 / d.max(1) as f64;
+                            let ratio = measured_fps / pinned_fps;
+                            let off_pct = (ratio - 1.0).abs() * 100.0;
+                            if off_pct > 0.1 && !self.fps_mismatch_warned {
+                                tracing::warn!(
+                                    error_code = "video_encode_fps_mismatch",
+                                    measured_fps = format!("{:.3}", measured_fps),
+                                    pinned_fps_num = n,
+                                    pinned_fps_den = d,
+                                    pinned_fps = format!("{:.3}", pinned_fps),
+                                    drift_pct = format!("{:.2}", off_pct),
+                                    "ts_video_replace: source fps ({:.3}) disagrees \
+                                     with `video_encode.fps_num`/`fps_den` \
+                                     ({}/{} = {:.3}); A/V sync will drift by ~{:.1}% \
+                                     of elapsed time. Remove the pinned fps to let \
+                                     the encoder auto-lock to the source rate, or \
+                                     set it to match the source (e.g. 30000/1001 \
+                                     for NTSC 29.97).",
+                                    measured_fps,
+                                    n,
+                                    d,
+                                    pinned_fps,
+                                    off_pct,
+                                );
+                                self.fps_mismatch_warned = true;
+                            }
                         }
                     }
                 }

@@ -212,11 +212,29 @@ pub fn input_can_carry_ts_audio(input: &crate::config::models::InputConfig) -> b
     use crate::config::models::InputConfig;
     matches!(
         input,
+        // Contribution / distribution transports that carry MPEG-TS
+        // verbatim on the wire.
         InputConfig::Rtp(_)
             | InputConfig::Udp(_)
             | InputConfig::Srt(_)
             | InputConfig::Rtmp(_)
             | InputConfig::Rtsp(_)
+            // Synthetic / file-backed sources that publish fresh
+            // MPEG-TS onto the broadcast channel. test_pattern always
+            // includes AAC when `audio_enabled = true` (default);
+            // media_player's source file may carry AAC / MP2 / AC-3 /
+            // E-AC-3; replay reads back recorded TS verbatim. All
+            // three feed the `compressed_audio_input` path in
+            // `engine::st2110_io::run_st2110_audio_output` so a PCM-
+            // only audio output (ST 2110-30/-31/rtp_audio) attached
+            // to the same flow gets the de-embedded audio decoded to
+            // PCM. Previously these were absent from the predicate
+            // so ST 2110-30 outputs on test_pattern / media_player /
+            // replay sources only emitted the 250 ms NULL-PID
+            // heartbeat — surfaced as ~107 pps on cellPTP11.
+            | InputConfig::TestPattern(_)
+            | InputConfig::MediaPlayer(_)
+            | InputConfig::Replay(_)
     )
 }
 
