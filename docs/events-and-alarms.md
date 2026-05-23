@@ -294,6 +294,20 @@ Emitted at `TsVideoReplacer::new()` call sites in each output module.
 **Source**: `src/engine/output_srt.rs`, `src/engine/output_rist.rs`,
 `src/engine/output_rtp.rs`, `src/engine/output_udp.rs`.
 
+### Encoder runtime diagnostics
+
+Surfaced as structured `tracing::warn!` lines (not WS events) — they ride
+the edge log and the manager picks them up via the standard log-stream
+ingest. Each carries `error_code` so dashboards / alerting rules can match
+without parsing the human-readable message.
+
+| `error_code` | Severity | Trigger | Fields | What it tells the operator |
+|---|---|---|---|---|
+| `encoder_chroma_not_supported` | warn | ST 2110-20 ingress encoder open path detects that the operator-pinned HW backend (`hevc_vaapi`, `hevc_qsv`, `hevc_nvenc`, `h264_vaapi`, `h264_qsv`, `h264_nvenc`) doesn't support the requested `(chroma, bit_depth)` on this host's probe matrix. The flow keeps running on a SW fallback (`x265` for HEVC, `x264` for H.264). | `requested`, `backend`, `chroma`, `bit_depth`, `fallback` | This host's iGPU/driver lacks the matching VAAPI/QSV/NVENC entrypoint (e.g. Arrow Lake iHD has no `VAProfileHEVCMain422_10`). Use `hevc_auto` / `h264_auto` to let the resolver pick the cheapest supported backend, or pin to the SW backend explicitly to suppress the warn. Same error code is used by the manager-side preflight in `device-edge/src/validation.rs`. |
+| `video_encode_fps_mismatch` | warn | `engine::ts_video_replace::TsVideoReplacer` measures the source frame rate from DTS deltas and finds it disagrees with `video_encode.fps_num` / `fps_den` by more than 0.1 % (one-shot per encoder run). | `measured_fps`, `pinned_fps_num`, `pinned_fps_den`, `pinned_fps`, `drift_pct` | The encoder is running at the operator's pinned time_base, but receiving frames at the source rate — A/V sync will drift by the rate-ratio bias. Common case: NTSC source (29.97 fps = 30000/1001) into a `25/1` pinned encoder. Either remove the pin (the encoder auto-locks to the source rate when unpinned) or set it to the source rate explicitly. |
+
+**Source**: `src/engine/st2110_video_io.rs` (chroma resolver), `src/engine/ts_video_replace.rs` (fps mismatch).
+
 ---
 
 ### RTP Input (`rtp`)
