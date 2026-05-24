@@ -244,6 +244,56 @@ pass with the master-clock work in.
   delta further, a follow-up could add a PCR-rewrite stage to the
   rewriter.
 
+## Local PTP grandmaster for testing
+
+ST 2110 and MXL flows refuse to start without a working `ptp4l` —
+`PtpStateReporter` reads `/var/run/ptp4l` and the master clock fails to
+lock if no grandmaster is present. For development on a workstation
+with no broadcast PTP fabric on the wire, the `ptp-gm/` directory at
+the monorepo root contains a small helper that runs `ptp4l` (and
+`phc2sys` on HW-PTP NICs) as a free-running grandmaster:
+
+```
+ptp-gm/
+├── bilbycast-ptp-gm.conf   # ptp4l GM config (SMPTE ST 2059-2 timings, domain 127)
+├── bilbycast-ptp-gm.sh     # start | stop | status | restart | logs | help
+└── README.md               # how-to + tier comparison + troubleshooting
+```
+
+It exists so that:
+
+- ST 2110 + MXL bring-up tests work without a hardware PTP grandmaster
+  on a separate machine.
+- TS flows on the default `master_clock.kind = "wallclock"` get
+  NIC-disciplined CLOCK_REALTIME for free when the script is in HW
+  mode — `phc2sys -a -r -r` keeps the system clock locked to the NIC
+  PHC, so `engine::wire_emit`'s CLOCK_TAI pacing and PCR generation
+  inherit that stability.
+- Cross-host PCR_AC and 2022-7 hitless measurements have a deterministic
+  shared time source even when neither host has GPS.
+
+Tiers (auto-picked from the NIC):
+
+| Tier | Use when | Floor | bilbycast lock |
+|---|---|---|---|
+| A (software) | proving the master-clock / ST 2110 / MXL code works | ~tens of µs | yes — `PtpStateReporter` reads `/var/run/ptp4l` regardless of timestamping mode |
+| B (HW PHC)   | publishing sub-µs claims, narrow VRX, tier-1 PCR_AC | < 1 µs | yes — and `phc2sys` extends the discipline to CLOCK_REALTIME/CLOCK_TAI so TS-wallclock flows benefit too |
+| C (GPS)      | compliance demos, UTC traceability | < 1 µs UTC | same — only changes `clockClass` advertised |
+
+Quick start (the script lives outside `bilbycast-edge/`; this doc just
+points at it):
+
+```bash
+sudo /path/to/monorepo/ptp-gm/bilbycast-ptp-gm.sh start
+/path/to/monorepo/ptp-gm/bilbycast-ptp-gm.sh status
+```
+
+The full how-to, NIC auto-pick rules, chrony coexistence notes, and
+cross-host setup are in `ptp-gm/README.md`. The helper is **for
+testing only** — production deployments run `ptp4l` + `phc2sys` from a
+distribution package or vendor-supplied unit, locked to a real
+grandmaster (Meinberg, ESI, FsPro, or similar).
+
 ## See also
 
 - [`wire-pacing.md`](wire-pacing.md) — PCR-anchored / PTP-raster-anchored
@@ -251,3 +301,10 @@ pass with the master-clock work in.
   inside the bitstream; wire pacing ensures those PCR-bearing packets
   hit the wire at the matching wallclock instant. Both are required
   for tier-1 PCR_AC at the receiver.
+- [`../../ptp-gm/README.md`](../../ptp-gm/README.md) — local PTP
+  grandmaster helper used during development and testbed runs.
+- [`../packaging/setup-etf-qdisc.sh`](../packaging/setup-etf-qdisc.sh)
+  and [`../packaging/bilbycast-etf-qdisc@.service`](../packaging/bilbycast-etf-qdisc@.service) —
+  egress-side ETF qdisc setup for SO_TXTIME wire pacing. Independent of
+  the GM helper; production-only, and the userspace
+  `clock_nanosleep(CLOCK_TAI)` tier is the default elsewhere.

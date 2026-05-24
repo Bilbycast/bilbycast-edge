@@ -1,0 +1,20 @@
+# /etc/apparmor.d/local/usr.sbin.ptp4l — bilbycast PTP support
+#
+# Loaded by Ubuntu's stock /usr/sbin/ptp4l profile via:
+#     include if exists <local/usr.sbin.ptp4l>
+#
+# Two paths bilbycast needs ptp4l to be able to write replies to:
+#
+# /tmp/bilbycast-ptp-* — legacy filesystem-path UDS client used by
+#   bilbycast-edge pre-0.89.0. Edge 0.89.0+ switched to abstract
+#   Unix sockets on Linux (`engine::st2110::ptp::next_client_socket`),
+#   which AppArmor path-based rules cannot deny. This entry remains
+#   belt-and-braces for the pre-0.89 fallback and for any sibling
+#   tooling that still uses the filesystem path.
+#
+# /tmp/pmc.* — operator-side `pmc -u` invocations for PTP debugging.
+#   pmc's default client socket lives at `/tmp/pmc.<pid>`; without
+#   this entry pmc queries silently fail under the stock Ubuntu
+#   profile.
+/tmp/bilbycast-ptp-* rw,
+/tmp/pmc.* rw,

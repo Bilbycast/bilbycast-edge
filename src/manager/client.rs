@@ -3805,6 +3805,85 @@ async fn execute_command(
                 "arch": staged.arch,
             })))
         }
+        "get_ptp_mode" => {
+            // Reads /var/lib/bilbycast/ptp.conf and returns the current
+            // operator-facing settings + a list of NICs the helper would
+            // pick from. Manager UI uses this to populate the Time page.
+            let settings = crate::util::ptp_config::load();
+            let ifaces: Vec<String> = crate::util::network_interfaces::enumerate()
+                .into_iter()
+                .filter(|n| !n.is_loopback && n.mac.is_some() && n.is_up.unwrap_or(true))
+                .map(|n| n.name)
+                .collect();
+            Ok(Some(serde_json::json!({
+                "mode": settings.mode.as_str(),
+                "iface": settings.iface,
+                "domain": settings.domain,
+                "priority1": settings.priority1,
+                "scan_timeout": settings.scan_timeout,
+                "config_path": crate::util::ptp_config::config_path().display().to_string(),
+                "available_ifaces": ifaces,
+            })))
+        }
+        "set_ptp_mode" => {
+            // Writes /var/lib/bilbycast/ptp.conf with the operator's
+            // selection; `bilbycast-ptp-helper` picks it up via its
+            // 1 Hz mtime watch and restarts ptp4l + phc2sys with the
+            // new role. No sudo path needed at runtime — the helper's
+            // systemd unit owns the ambient caps. Same dispatch is
+            // mirrored at PUT /api/v1/ptp for direct REST clients.
+            use crate::util::ptp_config::{PtpMode, PtpSettings};
+            let mode_str = action["mode"].as_str().ok_or_else(|| {
+                CommandError::with_code("set_ptp_mode: missing 'mode'", "missing_field")
+            })?;
+            let mode = match mode_str.to_ascii_lowercase().as_str() {
+                "auto" => PtpMode::Auto,
+                "grandmaster" | "gm" | "master" => PtpMode::Grandmaster,
+                "slave-only" | "slave" => PtpMode::SlaveOnly,
+                "off" | "disabled" | "none" => PtpMode::Off,
+                _ => {
+                    return Err(CommandError::with_code(
+                        format!(
+                            "set_ptp_mode: unknown mode '{mode_str}' \
+                             (expected auto, grandmaster, slave-only, off)"
+                        ),
+                        "invalid_value",
+                    ));
+                }
+            };
+            let iface = action["iface"].as_str().unwrap_or("").to_string();
+            let domain = action["domain"].as_u64().and_then(|d| u8::try_from(d).ok());
+            let priority1 = action["priority1"].as_u64().and_then(|p| u8::try_from(p).ok());
+            let scan_timeout = action["scan_timeout"]
+                .as_u64()
+                .and_then(|s| u8::try_from(s).ok());
+            let settings = PtpSettings {
+                mode,
+                iface,
+                domain,
+                priority1,
+                scan_timeout,
+            }
+            .normalised();
+            if let Err(e) = crate::util::ptp_config::save(&settings) {
+                return Err(CommandError::with_code(
+                    format!("set_ptp_mode: cannot persist config: {e}"),
+                    "ptp_config_write_failed",
+                ));
+            }
+            // bilbycast-ptp-helper picks it up via 1 Hz mtime poll;
+            // we don't have to do anything else here. Return the
+            // applied settings echo so the operator UI confirms the
+            // value the edge actually wrote (after normalisation).
+            Ok(Some(serde_json::json!({
+                "mode": settings.mode.as_str(),
+                "iface": settings.iface,
+                "domain": settings.domain,
+                "priority1": settings.priority1,
+                "scan_timeout": settings.scan_timeout,
+                "config_path": crate::util::ptp_config::config_path().display().to_string(),
+            })))
+        }
         "set_master_clock_lipsync" => {
             let flow_id = action["flow_id"].as_str().ok_or_else(|| {
                 CommandError::with_code(

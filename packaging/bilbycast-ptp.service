@@ -1,0 +1,73 @@
+[Unit]
+Description=bilbycast PTP supervisor — manages ptp4l + phc2sys per /var/lib/bilbycast/ptp.conf
+Documentation=https://bilbycast.com/docs/ptp
+After=network-online.target
+Wants=network-online.target
+# bilbycast-edge consumes /var/run/ptp4l on startup; ordering the
+# units this way keeps the edge from racing the daemon.
+Before=bilbycast-edge.service
+
+[Service]
+Type=simple
+User=bilbycast
+Group=bilbycast
+
+# Daemon mode: watch /var/lib/bilbycast/ptp.conf at 1 Hz, re-apply
+# on mtime change. The shipped config has mode=off out of the box —
+# the helper sits idle until the operator changes the mode via the
+# manager UI (which writes to the config file the bilbycast user
+# owns).
+ExecStart=/opt/bilbycast/edge/current/bilbycast-ptp-helper run --config /var/lib/bilbycast/ptp.conf
+
+Restart=on-failure
+RestartSec=3
+StartLimitInterval=300
+StartLimitBurst=10
+
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# ── Privileges ──
+# Ambient caps inherit to child ptp4l + phc2sys execs so they don't
+# need their own file caps. The bilbycast user runs the whole stack
+# with just the three caps the daemons need.
+#
+#   CAP_NET_RAW    — ptp4l binds raw IP sockets (UDP/IP port 320
+#                    and the multicast joins for Sync/Announce).
+#   CAP_NET_ADMIN  — ptp4l configures PHC + HW timestamping;
+#                    helper invokes `ip link set <iface> up` when
+#                    the operator-chosen NIC is admin-down.
+#   CAP_SYS_TIME   — phc2sys disciplines CLOCK_REALTIME from the
+#                    NIC PHC. Skipped when no HW PTP NIC is in use.
+#
+# NoNewPrivileges MUST be false for the AmbientCapabilities to
+# propagate through `execve` into ptp4l + phc2sys.
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_TIME
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_TIME
+NoNewPrivileges=false
+
+# ── Hardening ──
+ProtectSystem=strict
+# /var/lib/bilbycast — config file + role marker + state
+# /var/run/bilbycast-ptp — PID files
+# /var/log/bilbycast-ptp — script log files
+# /var/run/ptp4l, /var/run/ptp4lro — UDS sockets ptp4l creates;
+#                                    bilbycast-edge reads them
+# /etc/linuxptp — staged ptp4l config the script generates
+# /run — ip-link writes here for runtime state
+ReadWritePaths=/var/lib/bilbycast /var/run/bilbycast-ptp /var/log/bilbycast-ptp /var/run/ptp4l /var/run/ptp4lro /etc/linuxptp /run
+ProtectHome=true
+PrivateTmp=true
+# Don't restrict address families — ptp4l needs AF_INET + AF_PACKET.
+# RestrictAddressFamilies=AF_INET AF_UNIX AF_NETLINK AF_PACKET
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Log routing — `tag=bilbycast-ptp` so a journalctl filter is easy.
+SyslogIdentifier=bilbycast-ptp
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

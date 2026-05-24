@@ -21,7 +21,7 @@ use crate::tunnel::manager::TunnelManager;
 use super::auth::{self, AuthState};
 use super::nmos_is05::Is05State;
 use super::nmos_is08::Is08State;
-use super::{flows, inputs, nmos, nmos_is05, nmos_is08, outputs, stats, tunnels, ws};
+use super::{flows, inputs, nmos, nmos_is05, nmos_is08, outputs, ptp, stats, tunnels, ws};
 
 /// Shared application state accessible from all Axum handlers via [`axum::extract::State`].
 #[derive(Clone)]
@@ -108,6 +108,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/stats", get(stats::all_stats))
         .route("/api/v1/stats/{flow_id}", get(stats::flow_stats))
         .route("/api/v1/config", get(flows::get_config))
+        .route("/api/v1/ptp", get(ptp::get_ptp))
         .route("/api/v1/ws/stats", get(ws::ws_stats_handler))
         .route("/api/v1/tunnels", get(tunnels::list_tunnels))
         .route("/api/v1/tunnels/{id}", get(tunnels::get_tunnel));
@@ -159,6 +160,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/v1/config", put(flows::replace_config))
         .route("/api/v1/config/reload", post(flows::reload_config))
+        .route("/api/v1/ptp", put(ptp::put_ptp))
         .route("/api/v1/tunnels", post(tunnels::create_tunnel))
         .route("/api/v1/tunnels/{id}", delete(tunnels::delete_tunnel));
 

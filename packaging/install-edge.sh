@@ -153,6 +153,27 @@ need_pkg curl
 need_pkg jq
 need_pkg sha256sum
 
+# linuxptp ships ptp4l + phc2sys + pmc — required by the
+# bilbycast-ptp.service unit when an operator enables PTP via the
+# manager UI. Install via apt rather than need_pkg so a missing
+# linuxptp on a fresh node doesn't block install of bilbycast-edge
+# itself (the operator may choose `mode = off` and never need
+# linuxptp). The bilbycast-ptp.service will refuse to start with a
+# clear error if the binaries are missing later — and apt will be
+# tried again automatically here on next install/upgrade.
+if ! command -v ptp4l > /dev/null 2>&1; then
+    if command -v apt-get > /dev/null 2>&1; then
+        echo "Installing linuxptp (provides ptp4l, phc2sys, pmc)…"
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linuxptp || true
+    else
+        echo "WARNING: ptp4l not found and apt-get unavailable. The"
+        echo "         bilbycast-ptp.service unit will fail until linuxptp"
+        echo "         is installed manually. ST 2110 / MXL flows that"
+        echo "         require PTP will not start."
+    fi
+fi
+
 ensure_cosign() {
     if command -v cosign > /dev/null 2>&1; then
         echo "Using existing cosign: $(command -v cosign)"
@@ -345,6 +366,93 @@ ETF_UNIT_DEST="${SYSTEMD_UNIT_DIR}/bilbycast-etf-qdisc@.service"
 if [[ -f "${VERSION_DIR}/packaging/bilbycast-etf-qdisc@.service" ]]; then
     install -m 0644 "${VERSION_DIR}/packaging/bilbycast-etf-qdisc@.service" "${ETF_UNIT_DEST}"
 fi
+
+# ── Install bilbycast PTP supervisor unit + helper + script ──────────
+# The helper (`bilbycast-ptp-helper`) ships alongside `bilbycast-edge`
+# in the release tarball. It runs under `bilbycast-ptp.service` with
+# ambient capabilities (CAP_NET_RAW, CAP_NET_ADMIN, CAP_SYS_TIME) so
+# the operator can change PTP modes via the manager UI without sudo
+# at runtime — the UI writes `/var/lib/bilbycast/ptp.conf` (writable
+# by the bilbycast user) and the helper's 1 Hz mtime poll picks it up.
+#
+# Default install ships `mode = off` so a freshly-imaged node sits
+# idle until the operator opts in via the manager. ST 2110 / MXL
+# flows refuse to start until the operator picks a non-off mode.
+PTP_SCRIPT_SRC="${VERSION_DIR}/packaging/bilbycast-ptp-gm.sh"
+PTP_SCRIPT_DEST="/opt/bilbycast/bin/bilbycast-ptp-gm.sh"
+PTP_HELPER_SRC="${VERSION_DIR}/bilbycast-ptp-helper"
+PTP_HELPER_DEST="${VERSION_DIR}/bilbycast-ptp-helper"   # already in place
+PTP_UNIT_SRC="${VERSION_DIR}/packaging/bilbycast-ptp.service"
+PTP_UNIT_DEST="${SYSTEMD_UNIT_DIR}/bilbycast-ptp.service"
+PTP_CONF_FILE="/var/lib/bilbycast/ptp.conf"
+PTP_CONF_DEFAULT_SRC="${VERSION_DIR}/packaging/bilbycast-ptp.default"
+
+mkdir -p /opt/bilbycast/bin
+if [[ -f "${PTP_SCRIPT_SRC}" ]]; then
+    install -m 0755 "${PTP_SCRIPT_SRC}" "${PTP_SCRIPT_DEST}"
+    # The script reads its config template from the same dir by
+    # default; ship the template alongside.
+    if [[ -f "${VERSION_DIR}/packaging/bilbycast-ptp-gm.conf" ]]; then
+        install -m 0644 "${VERSION_DIR}/packaging/bilbycast-ptp-gm.conf" \
+            /opt/bilbycast/bin/bilbycast-ptp-gm.conf
+    fi
+fi
+
+if [[ -f "${PTP_UNIT_SRC}" ]]; then
+    install -m 0644 "${PTP_UNIT_SRC}" "${PTP_UNIT_DEST}"
+fi
+
+# Seed the default config — `mode = off` until operator opts in.
+mkdir -p /var/lib/bilbycast
+if [[ ! -f "${PTP_CONF_FILE}" ]]; then
+    if [[ -f "${PTP_CONF_DEFAULT_SRC}" ]]; then
+        install -m 0644 "${PTP_CONF_DEFAULT_SRC}" "${PTP_CONF_FILE}"
+    else
+        cat > "${PTP_CONF_FILE}" <<'EOF'
+# bilbycast-ptp-helper config — manager UI rewrites this file when
+# the operator changes PTP mode. mode = off keeps PTP disabled.
+mode = off
+iface =
+domain = 127
+priority1 =
+scan_timeout = 5
+EOF
+    fi
+    chown bilbycast:bilbycast "${PTP_CONF_FILE}"
+    chmod 0664 "${PTP_CONF_FILE}"
+fi
+
+# Runtime dirs the helper + script write to. Owned by bilbycast so
+# the service unit (running as `bilbycast` user) can manage PID
+# files + logs without escalating.
+install -d -o bilbycast -g bilbycast -m 0755 /var/run/bilbycast-ptp
+install -d -o bilbycast -g bilbycast -m 0755 /var/log/bilbycast-ptp
+# /etc/linuxptp holds the staged ptp4l config the script generates.
+# Stock AppArmor profile on /usr/sbin/ptp4l allows reads from
+# @{etc_ro}/linuxptp/** so the staged path lives there.
+install -d -m 0755 /etc/linuxptp
+
+# AppArmor local override — lets ptp4l reply to bilbycast / pmc
+# client sockets under /tmp/. Belt-and-braces alongside the F4
+# abstract-socket fix in edge 0.89.0+.
+APPARMOR_LOCAL_SRC="${VERSION_DIR}/packaging/apparmor-local-ptp4l"
+APPARMOR_LOCAL_DEST="/etc/apparmor.d/local/usr.sbin.ptp4l"
+if [[ -d /etc/apparmor.d/local && -f "${APPARMOR_LOCAL_SRC}" ]]; then
+    if [[ ! -f "${APPARMOR_LOCAL_DEST}" ]] \
+       || ! cmp -s "${APPARMOR_LOCAL_SRC}" "${APPARMOR_LOCAL_DEST}"; then
+        install -m 0644 "${APPARMOR_LOCAL_SRC}" "${APPARMOR_LOCAL_DEST}"
+        if command -v apparmor_parser > /dev/null 2>&1; then
+            apparmor_parser -r /etc/apparmor.d/usr.sbin.ptp4l 2>/dev/null || true
+        fi
+    fi
+fi
+
+# Enable the PTP unit. The default `mode = off` config means the
+# helper starts, idles, and never spawns ptp4l until the operator
+# changes the config. This is intentional — the service is always
+# running so a manager-UI write to ptp.conf is immediately picked
+# up via the 1 Hz mtime poll (no systemctl restart needed).
+systemctl enable --now bilbycast-ptp.service 2>/dev/null || true
 
 # Default env file (RUST_LOG etc.). Only seed it if missing — operators
 # may have customised it.

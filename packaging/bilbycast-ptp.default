@@ -1,0 +1,26 @@
+# /var/lib/bilbycast/ptp.conf — bilbycast-ptp-helper config
+#
+# Edit this file to change the PTP role on this node. The
+# bilbycast-ptp.service unit polls it at 1 Hz and re-applies the
+# underlying ptp4l + phc2sys on every mtime change. The manager UI
+# Time page writes this file — operators don't normally edit it by
+# hand.
+#
+# mode  = auto | grandmaster | slave-only | off  (required)
+#   auto         — listen for PTP Announce for scan_timeout seconds;
+#                  slave if a peer is heard, GM if not.
+#   grandmaster  — this node is the time source (priority1=128).
+#   slave-only   — must slave to an external GM (priority1=255,
+#                  slaveOnly=1). Refuses to become GM under BMCA.
+#   off          — no PTP at all. ST 2110 / MXL flows refuse to start.
+#
+# iface       — NIC name (eno4 etc). Blank → auto-pick HW-PTP + carrier-up.
+# domain      — PTP domain. Blank → 127 (SMPTE ST 2059-2). 0 for generic IEEE 1588.
+# priority1   — BMCA priority. Blank → 128 for GM, 255 for slave-only.
+# scan_timeout — seconds the `auto` listener waits for Announce. Blank → 5.
+
+mode = off
+iface =
+domain = 127
+priority1 =
+scan_timeout = 5
