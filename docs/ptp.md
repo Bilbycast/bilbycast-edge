@@ -152,6 +152,96 @@ with `offset_ns: 0` (the node is its own reference).
 - The customer says "we provide PTP, you slave"? → **Slave only**.
 - Not using ST 2110 / MXL at this site? → **Off** (the install default).
 
+## Security analysis
+
+The PTP UX moves a previously root-only workflow (`sudo systemctl
+restart ptp4l@…`) into a daemon driven by manager-UI input. The
+threat model + mitigations:
+
+### Trust boundaries
+
+| Step | Who acts | Privilege held | What it can do |
+|---|---|---|---|
+| Operator → Manager | Authenticated user with `Operate` role on this node | Group-scoped session JWT + CSRF | Submit a `SetPtpModePayload` JSON to `PUT /api/v1/nodes/{id}/ptp/mode` |
+| Manager → Edge | Manager process | Authenticated WS to the edge | Send the `set_ptp_mode` command — already gated by the existing manager-WS auth |
+| Edge → Disk | `bilbycast-edge` user | File write to `/var/lib/bilbycast/ptp.conf` (mode 0644, owned by `bilbycast`) | Persist the operator's mode + iface + domain |
+| Helper → Script | `bilbycast-ptp-helper` (separate process, `bilbycast` user) | `CAP_NET_RAW`, `CAP_NET_ADMIN`, `CAP_SYS_TIME` ambient caps | exec `/opt/bilbycast/bin/bilbycast-ptp-gm.sh` with up to ~6 argv entries |
+| Script → ptp4l/phc2sys | The script | Inherits the helper's caps | `systemctl restart ptp4l@<iface>.service` + `phc2sys` equivalents |
+
+### Defended attack vectors
+
+**1. Config-file forging via `iface`.** A malicious operator with
+`Operate` could try to defeat the KEY=VALUE on-disk format by sending
+`iface = "eno4\nmode = grandmaster"` so that the file's last `mode`
+line wins, overriding the chosen mode. Mitigation: `PtpSettings::validate`
+rejects any `iface` containing characters outside `[A-Za-z0-9._-]` or
+longer than 15 bytes (Linux `IFNAMSIZ`). Same rule is enforced both
+on the manager (front-stops with HTTP 400) and on the edge (defence
+in depth, returns `invalid_value`). Unit-tested by
+`util::ptp_config::tests::validate_rejects_*` (5 cases).
+
+**2. Shell injection via `iface` to the privileged script.** The
+helper builds argv with `Command::args(OsString)`, which doesn't
+shell-split — but the script then passes `$iface` to `systemctl
+restart "ptp4l@$iface"`. Same iface validator from (1) blocks any
+metachar (`;`, `$`, `` ` ``, `&`, etc.) that could be relevant if a
+future code path ever does invoke a shell.
+
+**3. Path traversal via `BILBYCAST_PTP_SCRIPT` env override.** The
+helper supports the env override for tests. In production the systemd
+unit (`bilbycast-ptp.service`) sets a clean environment without that
+variable, so the compiled-in default `/opt/bilbycast/bin/bilbycast-ptp-gm.sh`
+is what gets exec'd. The script + helper binary are both root-owned
+mode 0755 (installed by `install-edge.sh`); an unprivileged attacker
+on the box cannot replace either. The `bilbycast` user cannot write
+to `/opt/bilbycast/bin/`.
+
+**4. Torn writes / TOCTOU between edge and helper.** Edge uses
+atomic `write(.tmp)` + `rename(2)`, so the helper's `read_to_string`
+can never see a half-written file. The helper's 1 Hz mtime poll
+re-reads on every observed change; subsequent edits within the same
+1 s window collapse to one re-apply.
+
+**5. Privilege escalation by replacing the script with a symlink.**
+`/opt/bilbycast/bin/` is owned by root mode 0755; the `bilbycast`
+user (which owns the helper process and the edge process) cannot
+modify it. The helper does NOT follow symlinks before exec — but
+even if it did, the directory isn't writable to the unprivileged
+account, so a swap requires root already.
+
+### Residual capabilities held by the helper
+
+The helper holds three ambient capabilities even when idle:
+`CAP_NET_RAW` (raw sockets), `CAP_NET_ADMIN` (NIC config), and
+`CAP_SYS_TIME` (clock skew). These are exactly what `ptp4l` and
+`phc2sys` need to run; they are not granted to the main edge
+process. If the helper itself were compromised, an attacker would
+inherit only those three caps — `CAP_SETUID`, `CAP_SYS_ADMIN`,
+and root file write are NOT in the set. The systemd unit also sets
+`ProtectSystem=strict` + `ReadWritePaths=` to the four paths
+ptp4l/phc2sys actually need.
+
+### Not yet defended (operator awareness)
+
+- **Operator with `Operate` role can take the time source offline.**
+  Flipping to `Off` stops `ptp4l` / `phc2sys`. This is by design — the
+  same operator can already do worse (stop flows, force `master_clock
+  = wallclock` on an ST 2110 flow, etc.) — but worth knowing for
+  group permission design.
+- **Per-tenant scoping of PTP changes.** Today the WS command treats
+  the PTP file as node-wide. In a multi-tenant deployment where
+  one node is shared, Group A's operator can change the PTP role,
+  affecting Group B's flows. Tracked as a follow-up — the file
+  doesn't know about tenants and the helper is a single process.
+
+### Audit trail
+
+Every successful `set_ptp_mode` is logged on the manager (audit:
+`node.command`, action `set_ptp_mode`, args carry the requested
+mode + iface) and on the edge's structured log
+(`tracing::info!("set_ptp_mode applied: …")`). Failed validation is
+logged at `warn` on both sides with the rejecting rule.
+
 ## See also
 
 - [`clocking.md`](clocking.md) — flow-level master clock + PTP-disciplined wallclock

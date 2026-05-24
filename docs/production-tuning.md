@@ -115,10 +115,12 @@ Prerequisites:
 ```bash
 sudo apt install linuxptp ethtool iproute2
 
-# Start ptp4l in slave mode + phc2sys to discipline CLOCK_TAI.
-# Replace ${IFACE} with your egress NIC.
-sudo systemctl enable --now ptp4l@${IFACE}.service
-sudo systemctl enable --now phc2sys@${IFACE}.service
+# Don't start ptp4l / phc2sys by hand. The bilbycast-ptp-helper
+# daemon (installed by install-edge.sh, runs under
+# bilbycast-ptp.service with CAP_NET_RAW + CAP_NET_ADMIN +
+# CAP_SYS_TIME ambient caps) starts the right services for you
+# when you pick a PTP role from the manager UI's per-node Time
+# (PTP) page. Operator runbook: docs/ptp.md.
 
 # Install the ETF qdisc on the egress NIC.
 # bilbycast ships a setup script that handles the priomap +

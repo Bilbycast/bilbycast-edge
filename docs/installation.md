@@ -428,15 +428,25 @@ Tier 1 requires `ptp4l` + `phc2sys` against a PTP grandmaster on a
 HW-PTP NIC. Tier 2 (software ETF, no HW-PTP NIC, no PTP) caps out
 around 1–10 µs jitter and works without this step.
 
+**No `sudo systemctl ptp4l@…` commands needed in normal operation.**
+`install-edge.sh` provisions a `bilbycast-ptp-helper` daemon with the
+right capabilities; operators flip the node between PTP roles (Auto /
+Grandmaster / Slave-only / Off) from the manager UI's per-node
+**Time** page (`/nodes/{id}/time`) or by hand-editing
+`/var/lib/bilbycast/ptp.conf`. Full operator runbook + security
+analysis: [`ptp.md`](ptp.md).
+
+The only thing the manual `apt` install gets you here is the
+`linuxptp` packages the helper execs:
+
 ```bash
 sudo apt install linuxptp
-sudo systemctl enable --now ptp4l@<your-iface>
-sudo systemctl enable --now phc2sys@<your-iface>
 ```
 
-Use `phc2sys -w` (not `-O 0`). See [`wire-pacing.md`](wire-pacing.md)
-for the full PTP setup recipe and the `ptp4l.conf` for the SMPTE
-2110-10 PM/AM profile.
+Then pick **Slave only** on the Time page and point it at your
+grandmaster's interface. The helper applies the config within ~1 s
+of the file mtime advancing. Use `phc2sys -w` (the helper's default)
+not `-O 0`.
 
 **Step 4: opt the edge in to SO_TXTIME**
 

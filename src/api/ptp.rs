@@ -78,6 +78,9 @@ pub async fn put_ptp(
         scan_timeout: req.scan_timeout,
     }
     .normalised();
+    settings
+        .validate()
+        .map_err(ApiError::BadRequest)?;
     ptp_config::save(&settings)
         .map_err(|e| ApiError::Internal(format!("Cannot persist PTP config: {e}")))?;
     Ok(Json(ApiResponse::ok(PtpStatusPayload::from(settings))))

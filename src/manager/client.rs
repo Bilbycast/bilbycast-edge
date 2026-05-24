@@ -3865,6 +3865,15 @@ async fn execute_command(
                 scan_timeout,
             }
             .normalised();
+            // Defense-in-depth — iface goes via a file the privileged
+            // helper reads; reject newline/length/shell-metachar attacks
+            // before the bytes ever hit disk.
+            if let Err(e) = settings.validate() {
+                return Err(CommandError::with_code(
+                    format!("set_ptp_mode: invalid settings: {e}"),
+                    "invalid_value",
+                ));
+            }
             if let Err(e) = crate::util::ptp_config::save(&settings) {
                 return Err(CommandError::with_code(
                     format!("set_ptp_mode: cannot persist config: {e}"),

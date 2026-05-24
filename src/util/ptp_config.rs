@@ -155,6 +155,66 @@ impl PtpSettings {
         }
         self
     }
+
+    /// Strict validation — call before persisting. Rejects an `iface`
+    /// that could (a) defeat the on-disk KEY=VALUE format by embedding
+    /// a newline + a second `mode = …` line, (b) overflow Linux
+    /// `IFNAMSIZ` (15 bytes + NUL), or (c) carry shell / control
+    /// metacharacters that the downstream `bilbycast-ptp-gm.sh` script
+    /// would pass to `systemctl` / `ip` / `ethtool`.
+    ///
+    /// Iface naming follows the kernel rule: 1..=15 bytes, alphanumeric
+    /// plus `._-`. This matches the existing edge-wide
+    /// `validate_interface_binding` helper.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.iface.is_empty() {
+            validate_iface_name(&self.iface)?;
+        }
+        if let Some(d) = self.domain {
+            // IEEE 1588 domains run 0..=127. The struct already pins us
+            // to u8, so the upper-bound check is the only one with
+            // teeth — surface a clean error instead of letting ptp4l
+            // refuse to start.
+            if d > 127 {
+                return Err(format!(
+                    "domain {d} out of range (PTP domains are 0..=127)"
+                ));
+            }
+        }
+        if let Some(t) = self.scan_timeout {
+            if !(1..=60).contains(&t) {
+                return Err(format!(
+                    "scan_timeout {t}s out of range (1..=60)"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Linux IFNAMSIZ-safe interface name validator. Same rules as
+/// `crate::config::validation::validate_interface_binding`; duplicated
+/// here so this module stays standalone (no validation::* dep).
+fn validate_iface_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("iface name must not be empty".to_string());
+    }
+    if name.len() > 15 {
+        return Err(format!(
+            "iface name '{name}' is {} bytes — Linux IFNAMSIZ caps at 15",
+            name.len()
+        ));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+    {
+        return Err(format!(
+            "iface name '{name}' contains invalid characters \
+             (allowed: alphanumeric, '.', '_', '-')"
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve the config file path. Honours `BILBYCAST_PTP_CONF_PATH`
@@ -263,6 +323,68 @@ mod tests {
         assert_eq!(parsed.scan_timeout, Some(1));
         let parsed = PtpSettings::parse("mode = auto\nscan_timeout = 120\n").normalised();
         assert_eq!(parsed.scan_timeout, Some(60));
+    }
+
+    #[test]
+    fn validate_rejects_iface_with_newline() {
+        let bad = PtpSettings {
+            mode: PtpMode::Auto,
+            iface: "eno4\nmode = grandmaster".to_string(),
+            domain: None,
+            priority1: None,
+            scan_timeout: None,
+        };
+        assert!(bad.validate().is_err(), "newline in iface must be rejected");
+    }
+
+    #[test]
+    fn validate_rejects_iface_too_long() {
+        let bad = PtpSettings {
+            mode: PtpMode::Auto,
+            iface: "a".repeat(16),
+            domain: None,
+            priority1: None,
+            scan_timeout: None,
+        };
+        assert!(bad.validate().is_err(), "iface >15 bytes must be rejected");
+    }
+
+    #[test]
+    fn validate_rejects_shell_metachars() {
+        for bad_iface in ["eno4;rm -rf /", "eno4 --bogus", "eno4$IFS", "eno4`id`"] {
+            let bad = PtpSettings {
+                mode: PtpMode::Auto,
+                iface: bad_iface.to_string(),
+                domain: None,
+                priority1: None,
+                scan_timeout: None,
+            };
+            assert!(
+                bad.validate().is_err(),
+                "shell metachars in iface must be rejected: {bad_iface}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_real_iface_names() {
+        for good in ["eno4", "enp1s0f0", "eth0.100", "br-lan", "vlan10"] {
+            let s = PtpSettings {
+                mode: PtpMode::Auto,
+                iface: good.to_string(),
+                domain: Some(127),
+                priority1: None,
+                scan_timeout: Some(5),
+            };
+            assert!(s.validate().is_ok(), "should accept: {good}");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_blank_iface() {
+        // Empty iface is fine — script auto-picks one.
+        let s = PtpSettings::default();
+        assert!(s.validate().is_ok());
     }
 
     #[test]
