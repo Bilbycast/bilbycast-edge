@@ -2089,7 +2089,10 @@ fn drain_video_frames(
         // Either way: download flips `is_vaapi()` to false, the planar
         // / semi-planar codepath below builds a sysmem `VideoFrame`,
         // and the display task's CPU-blit path takes over.
+        let over_sw_ceiling =
+            frame.width() > 1920 || frame.height() > 1080;
         let need_sysmem = frame.is_vaapi()
+            && !over_sw_ceiling
             && ((source_is_hdr && !panel_hdr_capable)
                 || force_cpu_blit_for_bars.load(Ordering::Relaxed));
         let frame =
