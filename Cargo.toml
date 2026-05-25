@@ -338,6 +338,14 @@ display = [
 # footprint (clang + cmake + ninja + bison + flex + lld + GStreamer dev
 # + vcpkg + `CC=clang CXX=clang++`). Default OFF.
 mxl = ["dep:mxl-rs"]
+# Skip the upstream libmxl C++ cmake build inside mxl-sys. bindgen still
+# generates dlopen-based FFI bindings from the vendored headers; the
+# resulting binary loads libmxl.so at runtime via `libloading`. Used by
+# the CI release workflow so the heavy build chain (cmake + ninja + vcpkg
+# + GStreamer-dev + bison + flex + lld) is not required on the runner.
+# Operators deploy libmxl.so on the host; the boot probe gates MXL
+# capabilities on its presence.
+mxl-not-built = ["mxl-rs/mxl-not-built"]
 # Hardware-decoded video, used on both the display output AND the
 # transcode (TS → TS) decode path. Each feature pulls in the matching
 # `video-engine/video-decoder-*` family. When the feature is on AND

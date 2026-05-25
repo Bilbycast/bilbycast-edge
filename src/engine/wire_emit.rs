@@ -208,12 +208,6 @@ impl WireTxHandle {
         }
     }
 
-    /// Current depth (datagrams queued for the wire emit thread).
-    /// Read by codec threads to gate backpressure sleeps.
-    pub fn depth(&self) -> usize {
-        self.depth.load(Ordering::Acquire)
-    }
-
     /// Snapshot of the depth Arc, for passing into upstream codec
     /// threads that need to poll it independently of the sender.
     pub fn depth_handle(&self) -> Arc<std::sync::atomic::AtomicUsize> {

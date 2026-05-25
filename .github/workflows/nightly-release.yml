@@ -106,6 +106,12 @@ jobs:
         with:
           repository: Bilbycast/bilbycast-bonding
           path: bilbycast-bonding
+      - name: Checkout bilbycast-mxl-rs (path dependency)
+        uses: actions/checkout@v5
+        with:
+          repository: Bilbycast/bilbycast-mxl-rs
+          path: bilbycast-mxl-rs
+          submodules: recursive
       - name: Checkout bilbycast-edge
         uses: actions/checkout@v5
         with:
@@ -131,10 +137,11 @@ jobs:
         run: |
           # No `display` (Linux-only KMS / ALSA), no GPL encoders. The
           # `media-codecs` feature gives us libavcodec + libopus +
-          # MP2 / AC-3 / E-AC-3 + VideoToolbox probe, which is enough
-          # to confirm the codebase compiles on Apple Silicon.
+          # MP2 / AC-3 / E-AC-3 + VideoToolbox probe. `mxl` with
+          # `mxl-not-built` skips the C++ cmake build and relies on
+          # libmxl.so at runtime via dlopen.
           cargo check --no-default-features \
-            --features tls,fdk-aac,media-codecs,replay,webrtc \
+            --features tls,fdk-aac,media-codecs,replay,webrtc,mxl,mxl-not-built \
             --target aarch64-apple-darwin
 
   build:
@@ -160,12 +167,12 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_suffix: x86_64-linux
             variant: default
-            cargo_features: "display"
+            cargo_features: "display mxl mxl-not-built"
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_suffix: aarch64-linux
             variant: default
-            cargo_features: "display"
+            cargo_features: "display mxl mxl-not-built"
           # ─── full variant: every video codec backend (AGPL + GPL bundle) ───
           # libx264 + libx265 + NVENC + NVDEC + VAAPI encoders/decoders —
           # plus QSV (encode + decode) on x86_64. aarch64 drops QSV
@@ -179,12 +186,12 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_suffix: x86_64-linux-full
             variant: full
-            cargo_features: "video-encoders-full display"
+            cargo_features: "video-encoders-full display mxl mxl-not-built"
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_suffix: aarch64-linux-full
             variant: full
-            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-nvenc video-encoder-vaapi video-decoder-nvdec video-decoder-vaapi display"
+            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-nvenc video-encoder-vaapi video-decoder-nvdec video-decoder-vaapi display mxl mxl-not-built"
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout bilbycast-libsrt-rs (path dependency)
@@ -221,6 +228,13 @@ jobs:
         with:
           repository: Bilbycast/bilbycast-bonding
           path: bilbycast-bonding
+
+      - name: Checkout bilbycast-mxl-rs (path dependency)
+        uses: actions/checkout@v5
+        with:
+          repository: Bilbycast/bilbycast-mxl-rs
+          path: bilbycast-mxl-rs
+          submodules: recursive
 
       - name: Checkout bilbycast-edge
         uses: actions/checkout@v5
@@ -367,6 +381,11 @@ jobs:
             exit 1
           fi
           echo "OK: display feature linked (libasound)"
+          # MXL uses dlopen (libloading) at runtime — no link-time dep.
+          # The `mxl-not-built` feature skips the cmake C++ build; the
+          # boot probe discovers libmxl.so on the host and gates the
+          # mxl-* capability bits accordingly. No ldd check needed.
+          echo "=== MXL: runtime-only (dlopen), no link-time check ==="
 
       - name: Package tarball
         run: |
@@ -534,6 +553,8 @@ jobs:
           Two variants per architecture — pick one based on your transcoding needs:
 
           Asset filenames are versionless so \`https://github.com/Bilbycast/bilbycast-edge/releases/latest/download/<asset>\` always resolves to this release. The unpacked directory keeps the version (\`bilbycast-edge-${VERSION}-<arch>-linux[-full]/\`).
+
+          Both variants include **MXL** (Media eXchange Layer) support. MXL uses runtime discovery (\`dlopen\`) — install \`libmxl.so\` on the host to activate MXL capabilities; without it the edge runs normally with MXL features hidden.
 
           ### \`*-linux\` (default variant)
           No H.264 / H.265 software encoders bundled. AGPL-3.0-or-later binary.

@@ -95,8 +95,14 @@ impl Default for PtpLockState {
 ///
 /// Stored in the byte order ptp4l reports it (network order). The
 /// [`std::fmt::Display`] impl renders it as `xx:xx:xx:xx:xx:xx:xx:xx`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 pub struct GrandmasterId([u8; 8]);
+
+impl serde::Serialize for GrandmasterId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
 
 impl GrandmasterId {
     /// Construct from raw bytes (network order).
@@ -456,6 +462,23 @@ impl std::fmt::Display for PtpPollError {
     }
 }
 
+/// One-shot PTP state query using the current `ptp_config` settings.
+/// Returns `Unavailable` when ptp4l is not running or the socket is
+/// missing — never errors. Suitable for inclusion in the health payload
+/// without requiring a long-lived reporter task.
+pub fn poll_once_from_config() -> PtpState {
+    let settings = crate::util::ptp_config::load();
+    let domain = settings.domain.unwrap_or(127);
+    let config = PtpReporterConfig {
+        domain,
+        ..PtpReporterConfig::default()
+    };
+    match poll_once(&config) {
+        Ok(state) => state,
+        Err(_) => PtpState::unavailable(domain),
+    }
+}
+
 /// Poll the ptp4l UDS once. Synchronous because the linuxptp UDS protocol is
 /// strictly request/response and the round-trip is sub-millisecond.
 ///
@@ -503,7 +526,25 @@ fn poll_once(config: &PtpReporterConfig) -> Result<PtpState, PtpPollError> {
         Err(_) => None,
     };
 
-    let lock_state = classify_lock(offset_ns, config.lock_tolerance_ns);
+    // Query PORT_DATA_SET to detect whether this node is master.
+    // Layout (IEEE 1588-2008 §15.5.3.7):
+    //   portIdentity   10 bytes (clockIdentity 8 + portNumber 2)
+    //   portState       1 byte  (6 = MASTER, 9 = SLAVE, ...)
+    let port_state_master = {
+        let req_port = build_management_get(MANAGEMENT_ID_PORT_DATA_SET, config.domain);
+        let _ = sock.send(&req_port);
+        let mut buf3 = [0u8; 1500];
+        recv_management_response(&sock, &mut buf3, MANAGEMENT_ID_PORT_DATA_SET)
+            .ok()
+            .map(|(_, data)| data.len() > 10 && data[10] == 6)
+            .unwrap_or(false)
+    };
+
+    let lock_state = if port_state_master {
+        PtpLockState::Master
+    } else {
+        classify_lock(offset_ns, config.lock_tolerance_ns)
+    };
     let last_update_unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -598,6 +639,7 @@ impl Drop for ClientSocketCleanup {
 
 const MANAGEMENT_ID_CURRENT_DATA_SET: u16 = 0x2001;
 const MANAGEMENT_ID_PARENT_DATA_SET: u16 = 0x2002;
+const MANAGEMENT_ID_PORT_DATA_SET: u16 = 0x2004;
 
 const PTP_VERSION: u8 = 2;
 const PTP_MSG_TYPE_MANAGEMENT: u8 = 0x0D;

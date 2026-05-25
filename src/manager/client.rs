@@ -840,6 +840,20 @@ pub(crate) fn build_health_payload(
         // Backward-compatible additive field — old managers ignore it.
         "scheduling_status": build_scheduling_status_payload(),
     });
+    // Node-level PTP state — one-shot poll so the manager's Time page
+    // shows lock status without requiring a running ST 2110 flow.
+    {
+        let ptp = crate::engine::st2110::ptp::poll_once_from_config();
+        let ptp_settings = crate::util::ptp_config::load();
+        if let Ok(v) = serde_json::to_value(&ptp) {
+            let obj = payload.as_object_mut().unwrap();
+            obj.insert("ptp_state".into(), v);
+            obj.insert(
+                "ptp_mode".into(),
+                serde_json::Value::String(ptp_settings.mode.as_str().to_string()),
+            );
+        }
+    }
     // Per-interface enumeration. Empty Vec → omit (defensive: if_addrs
     // can fail in some containerised environments). Manager UI hides
     // the card unless the `"network-info"` capability is also present.
@@ -3874,9 +3888,15 @@ async fn execute_command(
                     "invalid_value",
                 ));
             }
+            let conf_path = crate::util::ptp_config::config_path();
             if let Err(e) = crate::util::ptp_config::save(&settings) {
                 return Err(CommandError::with_code(
-                    format!("set_ptp_mode: cannot persist config: {e}"),
+                    format!(
+                        "Cannot write PTP config to {}: {e}. \
+                         Set BILBYCAST_PTP_CONF_PATH to override, \
+                         or create the directory with write access.",
+                        conf_path.display()
+                    ),
                     "ptp_config_write_failed",
                 ));
             }

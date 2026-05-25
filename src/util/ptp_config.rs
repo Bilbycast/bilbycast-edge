@@ -217,12 +217,45 @@ fn validate_iface_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Resolve the config file path. Honours `BILBYCAST_PTP_CONF_PATH`
-/// for tests.
+/// Resolve the config file path.
+///
+/// Priority:
+/// 1. `BILBYCAST_PTP_CONF_PATH` env var (explicit override)
+/// 2. `/var/lib/bilbycast/ptp.conf` if writable (production install)
+/// 3. `$XDG_DATA_HOME/bilbycast/ptp.conf`
+/// 4. `$HOME/.bilbycast/ptp.conf`
+///
+/// The fallback chain mirrors the media/replay pattern so dev
+/// environments work without root. The PTP helper must be pointed
+/// at the same path via `--config`.
 pub fn config_path() -> PathBuf {
-    std::env::var("BILBYCAST_PTP_CONF_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_CONF_PATH))
+    if let Ok(p) = std::env::var("BILBYCAST_PTP_CONF_PATH") {
+        return PathBuf::from(p);
+    }
+    let default = PathBuf::from(DEFAULT_CONF_PATH);
+    if let Some(parent) = default.parent() {
+        if parent.exists() && is_dir_writable(parent) {
+            return default;
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        return PathBuf::from(xdg).join("bilbycast/ptp.conf");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".bilbycast/ptp.conf");
+    }
+    default
+}
+
+fn is_dir_writable(dir: &Path) -> bool {
+    let probe = dir.join(".bilbycast_write_probe");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Read the current settings from disk. Returns `Off` defaults on

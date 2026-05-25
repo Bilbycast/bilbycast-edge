@@ -269,6 +269,11 @@ async fn run(
                 return;
             }
             let source = &config.sources[idx];
+            let gap_signal = if transcoder.is_some() {
+                Some(&pcr_jump_signal)
+            } else {
+                None
+            };
             let mut session = PlayerSession {
                 seq_num: &mut seq_num,
                 per_input_tx: &per_input_tx,
@@ -278,6 +283,7 @@ async fn run(
                 transcoder: &mut transcoder,
                 pid_overrides: config.pid_overrides.as_ref(),
                 post: &mut post,
+                splice_gap_signal: gap_signal,
             };
             let result = play_source(source, &config, &mut session).await;
             if let Err(e) = result {
@@ -344,6 +350,12 @@ pub(super) struct PlayerSession<'a> {
     /// pid_map) applied to every emitted TS chunk before publishing onto
     /// the broadcast channel. None ⇒ no post-processing (zero cost).
     pub(super) post: &'a mut Option<crate::engine::input_post_process::InputPostProcess>,
+    /// Per-input PCR-jump signal shared with the `TsAudioReplacer` on
+    /// this input's pipeline. `play_ts_file` writes the splice-boundary
+    /// video-audio gap here so the audio replacer can silence-pad its
+    /// output PTS to match the video timeline at the loop boundary.
+    /// `None` in tests or when no transcoder is active.
+    pub(super) splice_gap_signal: Option<&'a std::sync::Arc<std::sync::atomic::AtomicI64>>,
 }
 
 /// 30 ms gap inserted between the previous file's last emitted PTS and the
@@ -1003,6 +1015,34 @@ async fn play_ts_file(
         Some(a) => a.max(max_emitted_pcr_90k),
         None => max_emitted_pts_90k.max(max_emitted_pcr_90k),
     };
+
+    // Signal the splice-boundary video-audio gap to the TsAudioReplacer
+    // so it can silence-pad output audio PTS to match the video timeline.
+    //
+    // On real broadcast captures (Sky Witness, Seven, etc.) the file ends
+    // with `pcr_max > audio_max` by ~200 ms (video mux look-ahead). The
+    // splice anchor is `max(audio_max, pcr_max) + GUARD`, so the next
+    // loop's first audio PES starts ~(pcr_max − audio_max + GUARD) past
+    // this loop's last audio PES — but the TsAudioReplacer's encoder
+    // stamps output at steady sample-rate cadence and only sees a ~4.5 ms
+    // audio-PES gap. Without this signal, audio PTS falls behind video
+    // PTS by ~(pcr_max − audio_max) per loop (~-7 ms/min on Sky Witness).
+    //
+    // The signal rides on the same `pcr_jump_signal` channel that
+    // `TsPtsRewriter` uses for > 500 ms PCR jumps. `TsAudioReplacer`
+    // drains it via `swap(0)` on the next `consume_pes` and routes the
+    // value through `pending_silence_27mhz` → silence frames → encoder
+    // sample advance → output PTS catches up. No changes needed in
+    // `ts_audio_replace.rs`.
+    if let Some(signal) = session.splice_gap_signal.as_ref() {
+        let audio_max = max_emitted_audio_pts_90k.unwrap_or(max_emitted_pts_90k);
+        if max_emitted_pcr_90k > audio_max {
+            let gap_90k = max_emitted_pcr_90k - audio_max;
+            let gap_27m = (gap_90k as i64).saturating_mul(300);
+            signal.fetch_add(gap_27m, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     session.cont.close_file(anchor_pts);
     Ok(())
 }
@@ -2204,6 +2244,7 @@ mod tests {
                 transcoder: &mut transcoder,
                 pid_overrides: None,
                 post: &mut None,
+                splice_gap_signal: None,
             };
             play_ts_file(&path, None, None, &mut session).await.unwrap();
         }
@@ -2392,6 +2433,7 @@ mod tests {
                 transcoder: &mut transcoder,
                 pid_overrides: None,
                 post: &mut None,
+                splice_gap_signal: None,
             };
             play_ts_file(&path, None, None, &mut session).await.unwrap();
         }
@@ -2408,6 +2450,7 @@ mod tests {
                 transcoder: &mut transcoder,
                 pid_overrides: None,
                 post: &mut None,
+                splice_gap_signal: None,
             };
             play_ts_file(&path, None, None, &mut session).await.unwrap();
         }
