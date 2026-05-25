@@ -34,7 +34,7 @@
 
 #![cfg(all(feature = "display", target_os = "linux"))]
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -484,7 +484,9 @@ async fn run_display_output(
     // When bars are configured but the overlay plane can't be programmed,
     // the demux loop forces VAAPI surfaces through the CPU-blit path so
     // the display loop can bake bars into the primary dumb buffer.
-    let force_cpu_blit_for_bars = meter_snapshot.is_some() && !bars_overlay_active;
+    let force_cpu_blit_for_bars = Arc::new(AtomicBool::new(
+        meter_snapshot.is_some() && !bars_overlay_active,
+    ));
 
     // Display is a terminal consumer — it decodes the flow's broadcast
     // channel and renders to KMS + ALSA. No encoder runs, so register a
@@ -550,7 +552,7 @@ async fn run_display_output(
     // zero-copy prime frames + let the display task program
     // `HDR_OUTPUT_METADATA` on the connector (panel does HDR).
     let demux_panel_hdr_capable = kms.panel_hdr_capable();
-    let demux_force_cpu_blit_for_bars = force_cpu_blit_for_bars;
+    let demux_force_cpu_blit_for_bars = Arc::clone(&force_cpu_blit_for_bars);
     let demux_output_stats = Arc::clone(&output_stats);
     let demux_audio_decode_counters = Arc::clone(&audio_decode_counters);
     let demux_video_decode_counters = Arc::clone(&video_decode_counters);
@@ -619,6 +621,7 @@ async fn run_display_output(
         }
     };
     let display_frame_gen = Arc::clone(&frame_gen);
+    let display_force_cpu_blit = Arc::clone(&force_cpu_blit_for_bars);
     let display_handle = tokio::task::spawn_blocking(move || {
         display_loop(
             kms,
@@ -634,6 +637,7 @@ async fn run_display_output(
             display_meter,
             display_scaling_mode,
             display_frame_gen,
+            display_force_cpu_blit,
         );
     });
 
@@ -828,7 +832,7 @@ fn demux_decode_loop(
     hw_already_unavailable: bool,
     frame_gen: Arc<AtomicU64>,
     panel_hdr_capable: bool,
-    force_cpu_blit_for_bars: bool,
+    force_cpu_blit_for_bars: Arc<AtomicBool>,
     output_stats: Arc<OutputStatsAccumulator>,
     audio_decode_counters: Arc<DecodeStats>,
     video_decode_counters: Arc<VideoDecodeStats>,
@@ -986,7 +990,7 @@ fn demux_decode_loop(
                         &output_id,
                         &frame_gen,
                         panel_hdr_capable,
-                        force_cpu_blit_for_bars,
+                        &force_cpu_blit_for_bars,
                         stream_ids,
                         &video_decode_counters,
                         &output_stats,
@@ -1016,7 +1020,7 @@ fn demux_decode_loop(
                         &output_id,
                         &frame_gen,
                         panel_hdr_capable,
-                        force_cpu_blit_for_bars,
+                        &force_cpu_blit_for_bars,
                         stream_ids,
                         &video_decode_counters,
                         &output_stats,
@@ -1055,7 +1059,7 @@ fn demux_decode_loop(
                         &output_id,
                         &frame_gen,
                         panel_hdr_capable,
-                        force_cpu_blit_for_bars,
+                        &force_cpu_blit_for_bars,
                         stream_ids,
                         &video_decode_counters,
                         &output_stats,
@@ -1682,7 +1686,7 @@ fn handle_video_au(
     output_id: &str,
     frame_gen: &AtomicU64,
     panel_hdr_capable: bool,
-    force_cpu_blit_for_bars: bool,
+    force_cpu_blit_for_bars: &AtomicBool,
     stream_ids: StreamIds,
     video_decode_counters: &VideoDecodeStats,
     output_stats: &OutputStatsAccumulator,
@@ -1955,7 +1959,7 @@ fn drain_video_frames(
     frame_gen: &AtomicU64,
     codec: VideoCodec,
     panel_hdr_capable: bool,
-    force_cpu_blit_for_bars: bool,
+    force_cpu_blit_for_bars: &AtomicBool,
     stream_ids: StreamIds,
     video_decode_counters: &VideoDecodeStats,
     output_stats: &OutputStatsAccumulator,
@@ -2086,7 +2090,8 @@ fn drain_video_frames(
         // / semi-planar codepath below builds a sysmem `VideoFrame`,
         // and the display task's CPU-blit path takes over.
         let need_sysmem = frame.is_vaapi()
-            && ((source_is_hdr && !panel_hdr_capable) || force_cpu_blit_for_bars);
+            && ((source_is_hdr && !panel_hdr_capable)
+                || force_cpu_blit_for_bars.load(Ordering::Relaxed));
         let frame =
             if need_sysmem {
                 match frame.download_to_sysmem() {
@@ -2102,7 +2107,7 @@ fn drain_video_frames(
                         tracing::warn!(
                             output_id = %output_id,
                             color_transfer,
-                            force_cpu_blit_for_bars,
+                            force_cpu_blit_for_bars = force_cpu_blit_for_bars.load(Ordering::Relaxed),
                             "VAAPI → sysmem download failed ({e:?}) — falling back to zero-copy prime path"
                         );
                         frame
@@ -2424,11 +2429,12 @@ fn display_loop(
     meter: Option<SharedMeter>,
     scaling_mode: DisplayScalingMode,
     frame_gen: Arc<AtomicU64>,
+    force_cpu_blit_signal: Arc<AtomicBool>,
 ) {
     // Frame period derived from the observed PTS deltas — used to size
     // the late-drop threshold. 33 ms (30 fps) until we've seen enough
     // frames to estimate.
-    let mut frame_period_ms: i64 = 33;
+    let mut frame_period_ms: f64 = 33.0;
     let mut last_pts: Option<u64> = None;
     let mut scaler: Option<CachedScaler> = None;
     // Reusable scratch buffer for the per-frame stream-info header
@@ -2463,6 +2469,7 @@ fn display_loop(
     // that's an integer multiple of the source. Stays `true` from then
     // on until the resolution / input switch path resets it.
     let mut fps_locked: bool = false;
+    let mut frames_since_period_reset: u32 = 0;
 
     // Wall-clock pacer used when audio is muted (no `AudioClock` to
     // pace against). Anchors on the first frame's PTS + the wall-clock
@@ -2649,6 +2656,7 @@ fn display_loop(
                 consecutive_late_frames = 0;
                 consecutive_early_frames = 0;
                 fps_locked = false;
+                frames_since_period_reset = 0;
             }
         }
         // Re-fire the auto-match exactly once after the source fps has
@@ -2657,7 +2665,7 @@ fn display_loop(
         // on the 60 Hz mode KMS picked at first-frame time (when our
         // `frame_period_ms` was still the 33 ms default), and the
         // operator sees 2:3 pulldown judder for the rest of the run.
-        if matched_dims.is_some() && !fps_locked && frame_period_ms != 33 {
+        if matched_dims.is_some() && !fps_locked && frames_since_period_reset >= 40 {
             matched_dims = None;
         }
 
@@ -2684,8 +2692,8 @@ fn display_loop(
             // 30/60 fps). Pass `None` while the period is still at the
             // default so the picker falls back to highest-refresh and
             // the auto-match re-fires once the period has stabilised.
-            let src_fps_hint = if frame_period_ms > 0 && frame_period_ms != 33 {
-                Some(1000.0_f32 / frame_period_ms as f32)
+            let src_fps_hint = if frames_since_period_reset >= 40 {
+                Some(1000.0 / frame_period_ms as f32)
             } else {
                 None
             };
@@ -2761,16 +2769,17 @@ fn display_loop(
             let backward = (prev.wrapping_sub(next.pts_90k)) as i64;
             let dms = forward / 90;
             if forward.unsigned_abs() > 90_000 && backward.unsigned_abs() > 90_000 {
-                frame_period_ms = 33;
+                frame_period_ms = 33.0;
                 matched_dims = None;
                 wall_anchor = None;
                 av_offset_pts_smoothed = None;
                 consecutive_late_frames = 0;
                 consecutive_early_frames = 0;
+                fps_locked = false;
+                frames_since_period_reset = 0;
             } else if (10..=200).contains(&dms) {
-                // Light EMA so a one-off long frame doesn't move the
-                // window. α = 1/8 is plenty for ≤ 60 fps content.
-                frame_period_ms = (frame_period_ms * 7 + dms) / 8;
+                frame_period_ms = frame_period_ms * 0.875 + dms as f64 * 0.125;
+                frames_since_period_reset = frames_since_period_reset.saturating_add(1);
             }
         }
         last_pts = Some(next.pts_90k);
@@ -2804,7 +2813,7 @@ fn display_loop(
         // Drop only frames so far behind the audio clock that catching
         // up by re-pacing isn't realistic. 4× source period (160 ms at
         // 25 fps, 100 ms at 60 fps).
-        let drop_threshold_ms: i64 = (frame_period_ms * 4).max(160);
+        let drop_threshold_ms: i64 = ((frame_period_ms as i64) * 4).max(160);
         // Compute raw drift (V-A in ms). Returned `None` while the
         // wall-clock fallback is still seeding (≤ 1 frame).
         let raw_drift_ms_opt: Option<i64> = if let Some(audio_pts) =
@@ -2831,7 +2840,13 @@ fn display_loop(
             // re-set the baseline.
             let new_smoothed = match av_offset_pts_smoothed {
                 None => raw_drift_ms,
-                Some(prev) => (prev * 63 + raw_drift_ms) / 64,
+                Some(prev) => {
+                    let ema = (prev * 63 + raw_drift_ms) / 64;
+                    ema.clamp(
+                        raw_drift_ms - drop_threshold_ms,
+                        raw_drift_ms + drop_threshold_ms,
+                    )
+                }
             };
             av_offset_pts_smoothed = Some(new_smoothed);
             let drift_ms = raw_drift_ms - new_smoothed;
@@ -2897,7 +2912,7 @@ fn display_loop(
             // by even a millisecond pushes the actual scan-out a full
             // frame late at 60 Hz.
             const PRESENT_MARGIN_MS: i64 = 2;
-            if drift_ms > PRESENT_MARGIN_MS {
+            if drift_ms > PRESENT_MARGIN_MS && raw_drift_ms > 0 {
                 let cap_ms = drop_threshold_ms;
                 let sleep_ms = (drift_ms - PRESENT_MARGIN_MS).min(cap_ms) as u64;
                 // Absolute CLOCK_MONOTONIC sleep — eliminates the
@@ -2932,6 +2947,14 @@ fn display_loop(
             &header_buf,
         )
         .is_ok();
+        if meter.is_some() && kms.bars_overlay_dims().is_none()
+            && !force_cpu_blit_signal.load(Ordering::Relaxed)
+        {
+            force_cpu_blit_signal.store(true, Ordering::Relaxed);
+            counters
+                .bars_overlay_enabled
+                .store(false, Ordering::Relaxed);
+        }
         let blit_us = blit_start.elapsed().as_micros() as u64;
         counters.blit_count.fetch_add(1, Ordering::Relaxed);
         counters.blit_us_total.fetch_add(blit_us, Ordering::Relaxed);
@@ -3362,7 +3385,7 @@ fn blit_and_present(
 /// fps still on the 30 fps default before PTS deltas stabilise) so a
 /// freshly-armed flow shows what it knows without `0x0` / `0p`
 /// placeholders.
-fn compose_stream_header(buf: &mut String, frame: &VideoFrame, frame_period_ms: i64) {
+fn compose_stream_header(buf: &mut String, frame: &VideoFrame, frame_period_ms: f64) {
     use std::fmt::Write;
     buf.clear();
     let codec_name = match frame.codec {
@@ -3374,7 +3397,7 @@ fn compose_stream_header(buf: &mut String, frame: &VideoFrame, frame_period_ms: 
     // fps from the running frame-period EMA. The 33 ms initial value
     // is the same default the mode picker uses; suppress it so we
     // don't show "30p" before the source frame rate has stabilised.
-    if frame_period_ms > 0 && frame_period_ms != 33 {
+    if frame_period_ms > 0.0 && (frame_period_ms - 33.0).abs() > 1.0 {
         let fps = (1000.0_f32 / frame_period_ms as f32).round() as u32;
         let _ = write!(buf, " {fps}p");
     }

@@ -1328,7 +1328,7 @@ fn pick_mode_for_source_dims_only(
         }
         let ratio = refresh_hz as f32 / fps;
         let rounded = ratio.round();
-        if rounded >= 1.0 && (ratio - rounded).abs() < 0.05 {
+        if rounded >= 1.0 && (ratio - rounded).abs() < 0.12 {
             0
         } else {
             1
@@ -2020,6 +2020,7 @@ const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 /// the caller propagates as a normal display-path failure (the FB is
 /// torn down, the keepalive is held briefly, and the next frame
 /// retries the same atomic path).
+#[derive(Debug)]
 enum AtomicCommitError {
     Unsupported(std::io::Error),
     Other(String),
@@ -2211,10 +2212,36 @@ impl KmsDisplay {
                     }
                 }
                 Err(AtomicCommitError::Other(e)) => {
-                    let _ = self.card.destroy_framebuffer(new_fb);
-                    return Err(anyhow::anyhow!(
-                        "display_prime_page_flip_failed: atomic_commit: {e}"
-                    ));
+                    if self.bars_overlay.is_some() {
+                        tracing::warn!(
+                            "atomic_commit failed with bars overlay active ({e}) — \
+                             disabling overlay and retrying without bars"
+                        );
+                        self.disable_bars_overlay();
+                        self.invalidate_atomic_modeset();
+                        match self.atomic_present(new_fb, descriptor.width, descriptor.height) {
+                            Ok(()) => {
+                                if let Err(e2) = self.wait_page_flip() {
+                                    let _ = self.card.destroy_framebuffer(new_fb);
+                                    return Err(e2.context(
+                                        "display_prime_page_flip_failed: receive_events (bars-retry)",
+                                    ));
+                                }
+                            }
+                            Err(retry_err) => {
+                                let _ = self.card.destroy_framebuffer(new_fb);
+                                return Err(anyhow::anyhow!(
+                                    "display_prime_page_flip_failed: atomic_commit \
+                                     (also failed without bars): {retry_err:?}"
+                                ));
+                            }
+                        }
+                    } else {
+                        let _ = self.card.destroy_framebuffer(new_fb);
+                        return Err(anyhow::anyhow!(
+                            "display_prime_page_flip_failed: atomic_commit: {e}"
+                        ));
+                    }
                 }
             }
         } else {
@@ -2345,6 +2372,12 @@ impl KmsDisplay {
         // SRC rectangle covers the full overlay buffer (= panel width
         // × strip_h); CRTC rectangle places it `panel_h - strip_h`
         // pixels down the panel.
+        //
+        // Skip the bars plane on the very first commit (the modeset):
+        // Intel i915 on Arrow Lake rejects a first ALLOW_MODESET commit
+        // that simultaneously binds a new overlay plane. Adding the bars
+        // on the second commit (after the modeset has landed) works.
+        if self.atomic_modeset_done {
         if let Some(bars) = self.bars_overlay.as_mut() {
             let bp = &bars.plane_props;
             // Reference the BACK buffer — the one the rasteriser just
@@ -2424,6 +2457,7 @@ impl KmsDisplay {
                 );
             }
         }
+        } // bars skip on first modeset commit
 
         if !self.atomic_modeset_done {
             // First commit (or first after a legacy modeset): re-arm
