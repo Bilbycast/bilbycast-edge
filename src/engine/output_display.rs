@@ -2845,9 +2845,10 @@ fn display_loop(
                 None => raw_drift_ms,
                 Some(prev) => {
                     let ema = (prev * 63 + raw_drift_ms) / 64;
+                    let clamp_ms = frame_period_ms as i64;
                     ema.clamp(
-                        raw_drift_ms - drop_threshold_ms,
-                        raw_drift_ms + drop_threshold_ms,
+                        raw_drift_ms - clamp_ms,
+                        raw_drift_ms + clamp_ms,
                     )
                 }
             };
@@ -2915,9 +2916,7 @@ fn display_loop(
             // by even a millisecond pushes the actual scan-out a full
             // frame late at 60 Hz.
             const PRESENT_MARGIN_MS: i64 = 2;
-            if drift_ms > PRESENT_MARGIN_MS
-                && raw_drift_ms > -(frame_period_ms as i64)
-            {
+            if drift_ms > PRESENT_MARGIN_MS {
                 let cap_ms = drop_threshold_ms;
                 let sleep_ms = (drift_ms - PRESENT_MARGIN_MS).min(cap_ms) as u64;
                 // Absolute CLOCK_MONOTONIC sleep — eliminates the
