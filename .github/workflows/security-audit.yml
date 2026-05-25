@@ -92,6 +92,7 @@ jobs:
         with:
           repository: Bilbycast/bilbycast-mxl-rs
           path: bilbycast-mxl-rs
+          submodules: recursive
 
       - name: Checkout bilbycast-edge
         uses: actions/checkout@v5
