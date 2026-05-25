@@ -61,10 +61,9 @@ for sha_file in "${ARTIFACT_DIR}"/*.tar.gz.sha256; do
 
     # Parse arch + variant out of the tarball name.
     # Example tarballs:
-    #   bilbycast-edge-x86_64-linux.tar.gz             → arch=x86_64-linux, variant=default
     #   bilbycast-edge-x86_64-linux-full.tar.gz        → arch=x86_64-linux, variant=full
-    #   bilbycast-edge-aarch64-linux.tar.gz            → arch=aarch64-linux, variant=default
     #   bilbycast-edge-aarch64-linux-full.tar.gz       → arch=aarch64-linux, variant=full
+    #   bilbycast-edge-x86_64-linux.tar.gz             → arch=x86_64-linux, variant=default (legacy)
     bare="${tarball_name#bilbycast-edge-}"
     bare="${bare%.tar.gz}"
     case "${bare}" in
