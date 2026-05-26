@@ -465,16 +465,13 @@ impl MasterClock for PtpMasterClock {
         use crate::engine::st2110::ptp::PtpLockState;
         matches!(
             self.state.snapshot().lock_state,
-            PtpLockState::Locked
+            PtpLockState::Locked | PtpLockState::Master
         )
     }
 
     fn telemetry(&self) -> MasterClockTelemetry {
         let snap = self.state.snapshot();
-        let locked = matches!(
-            snap.lock_state,
-            crate::engine::st2110::ptp::PtpLockState::Locked
-        );
+        let locked = snap.lock_state.is_healthy();
         MasterClockTelemetry {
             kind: MasterClockKind::Ptp.as_str().to_string(),
             locked,

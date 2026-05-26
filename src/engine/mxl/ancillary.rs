@@ -19,7 +19,7 @@ pub fn build_anc_flow_def(
     let json = format!(
         r#"{{
             "description": "bilbycast-edge MXL ANC flow {flow_name}",
-            "tags": {{}},
+            "tags": {{ "urn:x-nmos:tag:grouphint/v1.0": ["{flow_name}:Ancillary Data"] }},
             "format": "urn:x-nmos:format:data",
             "label": "{flow_name}",
             "version": "0:0",

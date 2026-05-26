@@ -212,7 +212,7 @@ fn partition_mode_for(m: St2110_23PartitionModeConfig) -> St2110_23PartitionMode
 /// ST 2110-20/-23 ingest encoder in lock-step with RTMP / WebRTC /
 /// TS video replacer.
 #[cfg(feature = "media-codecs")]
-fn build_encoder_config(
+pub(crate) fn build_encoder_config(
     enc: &VideoEncodeConfig,
     width: u32,
     height: u32,

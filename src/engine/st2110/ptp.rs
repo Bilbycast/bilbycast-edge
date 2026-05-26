@@ -79,9 +79,12 @@ pub enum PtpLockState {
 }
 
 impl PtpLockState {
-    /// True when the PTP slave is healthy enough for ST 2110 flows.
+    /// True when the PTP clock is healthy enough for ST 2110 flows.
+    /// Both `Locked` (slave locked to a GM) and `Master` (this node IS
+    /// the GM) are healthy — the grandmaster is definitionally locked to
+    /// its own reference.
     pub fn is_healthy(self) -> bool {
-        matches!(self, PtpLockState::Locked)
+        matches!(self, PtpLockState::Locked | PtpLockState::Master)
     }
 }
 

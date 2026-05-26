@@ -688,13 +688,16 @@ impl FlowRuntime {
         // Master clock takes the resolved clock-source input when
         // present, otherwise falls back to the active input.
         let mc_source_input_cfg = clock_source_input_cfg.or(active_input_cfg);
-        let (master_clock, pll_master) = build_master_clock(
+        let (master_clock, pll_master, ptp_handle) = build_master_clock(
             &config.config,
             mc_source_input_cfg,
             active_input_tx.subscribe(),
             &event_sender,
             &cancel_token,
         );
+        if let Some(h) = ptp_handle {
+            let _ = flow_stats.ptp_state.set(h);
+        }
         flow_stats.set_master_clock_telemetry(master_clock.telemetry());
         flow_stats.set_master_clock_lipsync(master_clock.lipsync_offset_90k());
         let av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>> =
@@ -5801,6 +5804,7 @@ fn build_master_clock(
 ) -> (
     crate::engine::master_clock::MasterClockHandle,
     Option<Arc<crate::engine::master_clock::SourcePcrPllMaster>>,
+    Option<crate::engine::st2110::ptp::PtpStateHandle>,
 ) {
     use crate::config::models::MasterClockKindConfig;
     use crate::engine::master_clock::{
@@ -5863,7 +5867,7 @@ fn build_master_clock(
             .unwrap_or_else(|| "<auto>".to_string()),
     );
 
-    let (handle, pll_master) = match kind {
+    let (handle, pll_master, ptp_handle) = match kind {
         MasterClockKind::SourcePcrPll => {
             // Operator override for the PLL lock-jitter threshold. Defaults
             // to broadcast-tier 100 µs; customers with internet contribution
@@ -5918,16 +5922,9 @@ fn build_master_clock(
                 cancel_token.child_token(),
             );
             let h = MasterClockHandle::new(wrapper, MasterClockKind::SourcePcrPll);
-            (h, Some(pll_inner))
+            (h, Some(pll_inner), None)
         }
         MasterClockKind::Ptp => {
-            // Phase 6: spawn a PTP reporter for this flow's clock_domain
-            // (or domain 0 when unset) and wrap its handle as a
-            // PtpMasterClock. The reporter is best-effort — when ptp4l
-            // is missing the wrapper reports `is_locked = false` and
-            // PCR generation falls through to the wallclock-style
-            // SystemTime path. This matches the PTP-as-degraded-source
-            // behaviour today's ST 2110 path already has.
             let domain = cfg.clock_domain.unwrap_or(0);
             let state = Arc::new(
                 crate::engine::st2110::ptp::PtpStateReporter::spawn(
@@ -5938,15 +5935,17 @@ fn build_master_clock(
                     cancel_token.child_token(),
                 ),
             );
+            let ptp_handle = (*state).clone();
             let inner = Arc::new(crate::engine::master_clock::PtpMasterClock::new(state));
             let h = MasterClockHandle::new(inner, MasterClockKind::Ptp);
-            (h, None)
+            (h, None, Some(ptp_handle))
         }
         // AudioMaster falls through to Wallclock until a future phase
         // wires the local-display ALSA master clock. The kind tag is
         // preserved so manager UI surfaces the intended source.
         other => (
             MasterClockHandle::new(Arc::new(WallclockMaster::new()), other),
+            None,
             None,
         ),
     };
@@ -5972,7 +5971,7 @@ fn build_master_clock(
         );
     }
 
-    (handle, pll_master)
+    (handle, pll_master, ptp_handle)
 }
 
 fn is_webrtc_like_input(input: &crate::config::models::InputConfig) -> bool {

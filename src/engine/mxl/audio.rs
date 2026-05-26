@@ -36,7 +36,7 @@ pub fn build_audio_flow_def(flow_name: &str, channels: u8) -> (String, uuid::Uui
         r#"{{
             "description": "bilbycast-edge MXL audio flow {flow_name}",
             "format": "urn:x-nmos:format:audio",
-            "tags": {{}},
+            "tags": {{ "urn:x-nmos:tag:grouphint/v1.0": ["{flow_name}:Audio"] }},
             "label": "{flow_name}",
             "version": "0:0",
             "id": "{flow_id}",
