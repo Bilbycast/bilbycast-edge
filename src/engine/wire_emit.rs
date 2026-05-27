@@ -789,6 +789,11 @@ fn run_emitter(
     let mut batch_count: u64 = 0;
     let mut batch_dgms_total: u64 = 0;
     let mut batch_log_next_ns: u64 = monotonic_now_ns().saturating_add(5_000_000_000);
+    // Diagnostic: per-5s throughput + PCR event counters
+    let mut diag_dgms: u64 = 0;
+    let mut diag_pcr_events: u64 = 0;
+    let mut diag_sleep_ns: u64 = 0;
+    let mut diag_last_ns: u64 = monotonic_now_ns();
 
     loop {
         if cancel.is_cancelled() {
@@ -864,9 +869,12 @@ fn run_emitter(
         // than rewriting the PCR field.
         if let Releaser::ClockNanosleep = releaser {
             if target_ns > now_ns {
+                let before = monotonic_now_ns();
                 sleep_until_monotonic_ns(target_ns);
+                diag_sleep_ns = diag_sleep_ns.saturating_add(monotonic_now_ns().saturating_sub(before));
             }
         }
+        if pcr_27mhz.is_some() { diag_pcr_events += 1; }
 
         // ── ClockNanosleep tier: batch send via sendmmsg ────────────
         //
@@ -967,6 +975,14 @@ fn run_emitter(
                         if let Some(pcr) = entry.pcr_27mhz {
                             stats.record_pcr_egress(pcr, now_us);
                         }
+                        // A/V sync drift: feed every TS packet.
+                        let ts_start = entry.dg.ts_offset.min(entry.dg.bytes.len());
+                        let ts_data = &entry.dg.bytes[ts_start..];
+                        let mut off = 0;
+                        while off + 188 <= ts_data.len() {
+                            stats.observe_av_sync_packet(&ts_data[off..off + 188]);
+                            off += 188;
+                        }
                     }
                     stats
                         .packets_sent
@@ -987,17 +1003,27 @@ fn run_emitter(
             // the sendmmsg optimisation is firing on bursty TS outputs
             // (`RUST_LOG=bilbycast_edge::engine::wire_emit=debug`). Silent
             // at default log level.
+            diag_dgms = diag_dgms.saturating_add(batch.len() as u64);
             batch_count = batch_count.saturating_add(1);
             batch_dgms_total = batch_dgms_total.saturating_add(batch.len() as u64);
             let now = monotonic_now_ns();
             if now >= batch_log_next_ns && batch_count > 0 {
                 let avg = batch_dgms_total as f64 / batch_count as f64;
-                tracing::debug!(
-                    "wire-emit '{}' batches={}  avg_dgms_per_batch={:.2}  (5s window)",
-                    id, batch_count, avg
+                let dt_s = (now.saturating_sub(diag_last_ns)) as f64 / 1e9;
+                let dgms_per_s = diag_dgms as f64 / dt_s.max(0.001);
+                let mbps = dgms_per_s * 1316.0 * 8.0 / 1e6;
+                let sleep_pct = diag_sleep_ns as f64 / (now.saturating_sub(diag_last_ns)) as f64 * 100.0;
+                let depth = rx.depth.load(std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    "wire-emit '{}' diag: {:.0} dgm/s ({:.2} Mbps)  pcr={}/5s  sleep={:.1}%  batch_avg={:.1}  depth={}",
+                    id, dgms_per_s, mbps, diag_pcr_events, sleep_pct, avg, depth
                 );
                 batch_count = 0;
                 batch_dgms_total = 0;
+                diag_dgms = 0;
+                diag_pcr_events = 0;
+                diag_sleep_ns = 0;
+                diag_last_ns = now;
                 batch_log_next_ns = now.saturating_add(5_000_000_000);
             }
             // Honor a Disconnect that happened during batch collection
@@ -1025,6 +1051,14 @@ fn run_emitter(
                     stats.record_latency(dg.recv_time_us);
                     if let Some(pcr) = pcr_27mhz {
                         stats.record_pcr_egress(pcr, crate::util::time::now_us());
+                    }
+                    // A/V sync drift: feed every TS packet.
+                    let ts_start = dg.ts_offset.min(dg.bytes.len());
+                    let ts_data = &dg.bytes[ts_start..];
+                    let mut off = 0;
+                    while off + 188 <= ts_data.len() {
+                        stats.observe_av_sync_packet(&ts_data[off..off + 188]);
+                        off += 188;
                     }
                 }
                 Err(e) => {

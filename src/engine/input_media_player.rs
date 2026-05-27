@@ -418,6 +418,13 @@ pub(super) struct SpliceContinuity {
     /// [`Self::pending_discontinuity`] — the cold-start file has no
     /// preceding stream to be discontinuous from.
     has_played_at_least_one_file: bool,
+
+    /// Converged cumulative bitrate from the previous `play_ts_file` call.
+    /// Carried across loops so the OS-thread pacer starts at the known-good
+    /// rate instead of the head-scan estimate (which overshoots by 10-20%
+    /// on the first second of every loop, accumulating wire_tx excess that
+    /// never drains).
+    pub(super) last_converged_bitrate_bps: Option<u64>,
 }
 
 impl SpliceContinuity {
@@ -623,14 +630,60 @@ async fn play_ts_file(
     // time a media-player file restarts — the dominant source of
     // PCR-vs-wallclock drift across loops on short files (Ten.ts loops
     // every 63 s, so a 50-s slow-start covers most of the loop).
-    let mut head = vec![0u8; 512 * 1024];
+    // When a program filter is active, the filter needs PAT + PMT
+    // discovery before it starts producing output. On a typical DVB-T
+    // MPTS the PAT appears within the first ~100 KB, and the PMT
+    // shortly after. With a 512 KB head, only ~50 KB of filtered
+    // content survives — too little for scan_head_bitrate's 100 ms
+    // minimum PCR span. 2 MB gives ~500 KB of filtered content on a
+    // 4-program MPTS (660 ms at 5.5 Mbps), comfortably above the
+    // threshold. Still fast on SSD (<5 ms).
+    let head_size = if program_number.is_some() { 2 * 1024 * 1024 } else { 512 * 1024 };
+    let mut head = vec![0u8; head_size];
     let head_len = file
         .read(&mut head)
         .await
         .with_context(|| format!("probe head of {}", path.display()))?;
     head.truncate(head_len);
     let stride = detect_ts_packet_size_in_buf(&head);
-    let head_bitrate = scan_head_bitrate(&head, stride);
+    let head_bitrate_raw = scan_head_bitrate(&head, stride);
+    let head_bitrate = if let Some(pn) = program_number {
+        // MPTS: scan_head_bitrate on the raw file measures the total mux
+        // rate across all programs, not the target program's rate. That
+        // overestimate causes the OS-thread pacer to emit 2-3× too fast
+        // during the first second of every file loop, flooding the wire_tx
+        // channel with excess packets that never drain (input rate equals
+        // output rate after the cumulative estimator converges, so the
+        // per-loop surplus accumulates indefinitely). Fix: filter the head
+        // to the target program before scanning so the bitrate matches the
+        // post-filter byte rate the wire emitter will actually pace.
+        let mut filter = super::ts_program_filter::TsProgramFilter::new(pn);
+        let mut filtered = Vec::with_capacity(head.len());
+        let mut scratch = Vec::with_capacity(TS_PACKET);
+        let mut pos = 0usize;
+        while pos + TS_PACKET <= head.len() {
+            if head[pos] == SYNC_BYTE {
+                scratch.clear();
+                filter.filter_into(&head[pos..pos + TS_PACKET], &mut scratch);
+                filtered.extend_from_slice(&scratch);
+                pos += stride;
+            } else {
+                pos += 1;
+            }
+        }
+        let filtered_br = scan_head_bitrate(&filtered, TS_PACKET);
+        tracing::info!(
+            "media-player head bitrate: raw={} bps, filtered(prog {})={} bps, filtered_bytes={}/{}",
+            head_bitrate_raw.unwrap_or(0),
+            pn,
+            filtered_br.unwrap_or(0),
+            filtered.len(),
+            head.len(),
+        );
+        filtered_br
+    } else {
+        head_bitrate_raw
+    };
     drop(head);
     file.seek(std::io::SeekFrom::Start(0))
         .await
@@ -661,13 +714,19 @@ async fn play_ts_file(
     // for the file; bitrate refined from cumulative inter-PCR observations
     // sent across a control channel), so the async producer never re-
     // anchors against its own scheduler latency.
-    // Priority: operator-configured override > pre-scan head observation
-    // > default fallback. The pre-scan covers same-file loops at the
-    // correct rate from the first bundle; the operator override survives
-    // first as an escape hatch for known files.
+    // Priority: operator override > previous loop's converged rate >
+    // head scan > default fallback. The carried rate eliminates the
+    // 50-second convergence transient that otherwise overshoots on every
+    // loop restart and accumulates wire_tx excess.
+    let carried = session.cont.last_converged_bitrate_bps;
     let pacer_initial_bitrate = paced_bitrate_bps
+        .or(carried)
         .or(head_bitrate)
         .unwrap_or(DEFAULT_FALLBACK_BITRATE_BPS);
+    tracing::info!(
+        "media-player pacer rate selection: carried={:?}, head={:?}, chosen={} bps",
+        carried, head_bitrate, pacer_initial_bitrate,
+    );
     let (pacer_tx, pacer_rx) =
         std::sync::mpsc::sync_channel::<PacerMsg>(PACER_QUEUE_CAP);
     let broadcast_for_pacer = session.per_input_tx.clone();
@@ -691,17 +750,14 @@ async fn play_ts_file(
         })
         .with_context(|| "spawn media-player pacer thread")?;
 
-    // Cumulative-rate observation. The async producer keeps a single
-    // (first_pcr, first_byte_pos) anchor for the whole file; each
-    // subsequent PCR provides a cumulative `bytes_delta / pcr_delta`
-    // rate. After ~1 s of observed PCR-content the cumulative measurement
-    // is precise to a few hundred ppm; after ~10 s it is single-digit
-    // ppm. The current estimate is carried on every `PacerMsg` so the
-    // OS thread tracks the producer's view of the file rate within one
-    // bundle period of any change, even when the channel is full (the
-    // steady state for a fast disk + a wire-paced output).
-    let mut first_pcr_27mhz: Option<u64> = None;
-    let mut first_pcr_byte_pos: u64 = 0;
+    // Windowed bitrate observation. A 2-second sliding window tracks
+    // the instantaneous PCR-implied rate, re-anchoring every 2 seconds
+    // so VBR content doesn't bias the estimate (the old cumulative
+    // estimator measured from file-start, producing a running average
+    // that overshot the instantaneous rate during the low-bitrate second
+    // half of VBR files and caused the wire_tx channel to fill).
+    let mut window_pcr_27mhz: Option<u64> = None;
+    let mut window_byte_pos: u64 = 0;
     let mut current_bitrate_bps: u64 = pacer_initial_bitrate;
     let mut bytes_emitted: u64 = 0;
     // MPTS guard: lock onto the first PCR-bearing PID for every
@@ -857,42 +913,47 @@ async fn play_ts_file(
         }
 
         if let Some(pcr) = raw_pcr {
-            // Cumulative-rate bitrate estimation. Granularity = one TS
-            // packet (188 B) over the elapsed PCR window — so after ~10 s
-            // of observed material this is precise to a few ppm,
-            // strictly better than the per-inter-PCR EMA the prior shape
-            // used (which floors at ~0.4 % noise from the 188 B / 50 kB
-            // sample granularity). Discontinuities reset the anchor so a
-            // seek, file wrap, or PCR reset doesn't poison the rate.
+            // Windowed bitrate estimation. The window re-anchors every
+            // 5 seconds of PCR-time so the estimate tracks VBR rate
+            // changes within the file instead of biasing toward the
+            // front-loaded I-frame data. The wire emitter paces at the
+            // instantaneous PCR rate — the pacer must match it, not the
+            // file-long average. Window of 2 s is long enough to smooth
+            // per-PCR-pair noise (~0.4 % at 188 B / 50 KB granularity)
+            // while short enough to track a 25 fps GOP structure (1-2
+            // seconds per I-frame cycle).
+            const WINDOW_27MHZ: u64 = 27_000_000 * 2; // 2 seconds
+            const MIN_SPAN_27MHZ: u64 = 27_000_000;   // 1 second
             let pcr_byte_pos = bytes_emitted + bundle.len() as u64;
-            match first_pcr_27mhz {
+            match window_pcr_27mhz {
                 None => {
-                    first_pcr_27mhz = Some(pcr);
-                    first_pcr_byte_pos = pcr_byte_pos;
+                    window_pcr_27mhz = Some(pcr);
+                    window_byte_pos = pcr_byte_pos;
                 }
-                Some(first_pcr) => {
-                    let pcr_delta = pcr.wrapping_sub(first_pcr);
-                    let bytes_delta = pcr_byte_pos.saturating_sub(first_pcr_byte_pos);
-                    // Reset on discontinuity (> 60 s of PCR-time would
-                    // mean a wrap or file change; < 1 s isn't enough to
-                    // beat the granularity floor — keep accumulating).
-                    if pcr_delta > 27_000_000 * 60 || bytes_delta == 0 {
-                        first_pcr_27mhz = Some(pcr);
-                        first_pcr_byte_pos = pcr_byte_pos;
-                    } else if pcr_delta >= 27_000_000 {
+                Some(anchor_pcr) => {
+                    let pcr_delta = pcr.wrapping_sub(anchor_pcr);
+                    let bytes_delta = pcr_byte_pos.saturating_sub(window_byte_pos);
+                    // Discontinuity (backward or > 60 s forward): reset.
+                    if pcr_delta > 27_000_000 * 60 || (pcr_delta as i64) < 0 || bytes_delta == 0 {
+                        window_pcr_27mhz = Some(pcr);
+                        window_byte_pos = pcr_byte_pos;
+                    } else if pcr_delta >= MIN_SPAN_27MHZ {
                         let pcr_us = pcr_delta / 27;
                         let observed_bps =
                             bytes_delta.saturating_mul(8 * 1_000_000) / pcr_us;
-                        // Sanity-bound: refuse values below 100 kbps or
-                        // above 10 Gbps. Outside that the file is either
-                        // corrupt or we've miscounted bytes. Otherwise
-                        // adopt the new estimate — the per-bundle ride-
-                        // along to the OS thread carries it across,
-                        // converging the wire pace on the actual file
-                        // rate without needing a separate signalling
-                        // channel.
                         if (100_000..=10_000_000_000).contains(&observed_bps) {
+                            let prev = current_bitrate_bps;
                             current_bitrate_bps = observed_bps;
+                            tracing::debug!(
+                                "media-player windowed bitrate: {} -> {} bps (span={} ms, bytes={})",
+                                prev, observed_bps, pcr_us / 1000, bytes_delta,
+                            );
+                        }
+                        // Re-anchor when the window exceeds 5 seconds
+                        // so the next estimate reflects recent content.
+                        if pcr_delta >= WINDOW_27MHZ {
+                            window_pcr_27mhz = Some(pcr);
+                            window_byte_pos = pcr_byte_pos;
                         }
                     }
                 }
@@ -980,6 +1041,10 @@ async fn play_ts_file(
     if !bundle.is_empty() {
         let _ = emit_to_pacer(&mut bundle, session, &pacer_tx, current_bitrate_bps).await;
     }
+
+    // Carry the converged cumulative rate to the next loop so the pacer
+    // starts at the known-good rate instead of the head-scan estimate.
+    session.cont.last_converged_bitrate_bps = Some(current_bitrate_bps);
 
     // Tear down the OS-thread pacer: dropping the sender lets the thread's
     // `recv_timeout` poll see `Disconnected` on its next iteration (within
