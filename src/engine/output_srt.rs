@@ -740,6 +740,12 @@ async fn srt_output_forward_loop(
                     send_stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                     send_stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
                     send_stats.record_latency(recv_time_us);
+                    // A/V sync drift: feed every TS packet.
+                    let mut off = 0;
+                    while off + 188 <= data.len() {
+                        send_stats.observe_av_sync_packet(&data[off..off + 188]);
+                        off += 188;
+                    }
                 }
                 Err(e) if is_transient_backpressure(&e) => {
                     // Rust-side send-channel was briefly full. Drop this
@@ -854,6 +860,23 @@ async fn srt_output_forward_loop(
 
     let delay_sleep = tokio::time::sleep(Duration::from_secs(86400));
     tokio::pin!(delay_sleep);
+
+    // Per-output A/V alignment buffer.
+    let mut av_align_buf = if config.av_align {
+        let window_ms = config.av_align_window_ms.unwrap_or(100);
+        Some(crate::engine::ts_av_align::TsAvAlignBuffer::new(
+            crate::engine::ts_av_align::AlignConfig {
+                alignment_window_ms: window_ms,
+                tolerance_ms: 5,
+                max_hold_ms: window_ms * 2,
+                stream_presence_timeout_ms: 500,
+                capacity_packets: crate::engine::ts_av_align::TsAvAlignBuffer::initial_capacity(window_ms),
+            },
+        ))
+    } else {
+        None
+    };
+    let mut align_scratch: Vec<u8> = Vec::with_capacity(8192);
 
     let connection_lost = loop {
         if let Some(ref db) = delay_buf {
@@ -1049,9 +1072,20 @@ async fn srt_output_forward_loop(
                             payload
                         };
 
+                        // A/V alignment: process the final TS payload
+                        // through the alignment buffer before queueing.
+                        let payload = if let Some(ref mut al) = av_align_buf {
+                            align_scratch.clear();
+                            al.process(&payload, &mut align_scratch);
+                            if align_scratch.is_empty() {
+                                continue;
+                            }
+                            Bytes::copy_from_slice(&align_scratch)
+                        } else {
+                            payload
+                        };
+
                         if let Some(ref mut db) = delay_buf {
-                            // Re-wrap as RtpPacket for the delay buffer (using
-                            // the filtered payload but preserving timing metadata).
                             db.push(RtpPacket {
                                 data: payload,
                                 sequence_number: packet.sequence_number,

@@ -85,6 +85,11 @@ pub struct FlowStats {
     /// no output has yet collected enough samples. PID-bus Phase 8.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pcr_trust_flow: Option<PcrTrustStats>,
+    /// Flow-wide A/V sync drift rollup — worst-case (max absolute) p95
+    /// across all outputs. Absent when no output has collected enough
+    /// samples. Backward-compatible additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub av_sync_flow: Option<AvSyncStats>,
     /// In-depth content-analysis snapshot. Populated when the flow has
     /// `content_analysis.lite | audio_full | video_full` enabled. Each
     /// sub-field is independently optional so a partial selection (e.g.
@@ -834,11 +839,21 @@ pub struct OutputStats {
     /// PID-bus Phase 8 addition; old managers ignore unknown fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pcr_trust: Option<PcrTrustStats>,
+    /// Per-output A/V sync drift metric. Present only when the output has
+    /// forwarded both video and audio PES PTS values. Absent on audio-only,
+    /// video-only, non-TS, and freshly-started outputs. Backward-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub av_sync: Option<AvSyncStats>,
     /// Per-output local-display stats. Populated only when the output
     /// type is `display`; absent on every network-egress output.
     /// Backward-compatible additive field — old managers ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_stats: Option<DisplayStats>,
+    /// Per-output A/V alignment buffer statistics. Present only when the
+    /// output has `av_align: true` (default) and has received both video
+    /// and audio elementary streams. Backward-compatible additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub av_align: Option<AvAlignStats>,
     /// The active wire-pacing release tier for this output, set once at
     /// output startup. One of `so_txtime`, `clock_nanosleep_fifo`,
     /// `clock_nanosleep`, `unpaced`. Absent on outputs that don't own
@@ -865,6 +880,28 @@ pub struct OutputStats {
 #[inline]
 fn is_zero_u64(n: &u64) -> bool {
     *n == 0
+}
+
+/// Per-output A/V alignment buffer statistics. Populated by
+/// `engine::ts_av_align::TsAvAlignBuffer` when `av_align: true` on
+/// a TS-carrying output. Backward-compatible additive field.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AvAlignStats {
+    /// Current measured V−A PTS offset at the buffer output (ms).
+    /// Positive = video late relative to audio.
+    pub alignment_offset_ms: i64,
+    /// Current buffer depth in bytes across all PID queues.
+    pub buffer_depth_bytes: u64,
+    /// Total PES units released since output start.
+    pub pes_released: u64,
+    /// Total TS packets dropped due to buffer overflow.
+    pub packets_dropped_overflow: u64,
+    /// PES units that were held (delayed) for alignment.
+    pub alignment_holds: u64,
+    /// Number of PSI-driven resets (PMT change, input switch).
+    pub resets: u64,
+    /// Current operating mode.
+    pub mode: String,
 }
 
 /// Per-output statistics for the local-display (`display`) output type.
@@ -1040,6 +1077,29 @@ pub struct PcrTrustStats {
     /// against `p95_us` to see whether recent behaviour diverges from
     /// the longer-window baseline.
     pub window_p95_us: u64,
+}
+
+/// Egress A/V sync drift metric — signed offset between the most recent
+/// video PES PTS and audio PES PTS observed at egress. Positive = video
+/// late relative to audio. Units are milliseconds.
+///
+/// EBU R37 thresholds: |p95| > 20 ms = warning, |p95| > 40 ms = error.
+/// Measured per-output on TS-bearing network outputs (UDP, RTP, SRT,
+/// RIST). Percentiles are computed on absolute values; the signed average
+/// preserves trend direction.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AvSyncStats {
+    pub samples: u64,
+    pub cumulative_samples: u64,
+    pub avg_ms: i64,
+    pub p50_abs_ms: i64,
+    pub p95_abs_ms: i64,
+    pub p99_abs_ms: i64,
+    pub max_abs_ms: i64,
+    pub window_samples: u64,
+    pub window_p95_abs_ms: i64,
+    pub video_pid: u16,
+    pub audio_pid: u16,
 }
 
 /// Per-output end-to-end latency statistics for the last reporting window.

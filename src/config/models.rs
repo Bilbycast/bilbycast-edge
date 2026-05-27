@@ -2872,6 +2872,18 @@ pub struct RtpOutputConfig {
     /// See [`OutputDelay`] for the available modes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay: Option<OutputDelay>,
+    /// Enable per-output A/V alignment buffer. Buffers video and audio
+    /// elementary streams at PES boundaries and releases them temporally
+    /// aligned. Corrects baked-in source A/V offset and transcode-induced
+    /// drift. Default: true.
+    #[serde(default = "default_true")]
+    pub av_align: bool,
+    /// A/V alignment window in milliseconds. The buffer holds streams for
+    /// up to this duration to absorb offset. Larger values handle bigger
+    /// offsets but add latency. Range: 20..=500, default 100. Ignored when
+    /// `av_align` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub av_align_window_ms: Option<u32>,
     /// Optional audio encode block. When set, the output runs its incoming
     /// MPEG-TS through a streaming audio-ES replacer: the source AAC-LC
     /// audio is decoded, re-encoded into the configured codec, and muxed
@@ -3022,6 +3034,14 @@ pub struct UdpOutputConfig {
     /// Incompatible with `transport_mode: "audio_302m"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay: Option<OutputDelay>,
+    /// Enable per-output A/V alignment buffer. See
+    /// [`RtpOutputConfig::av_align`] for semantics. Default: true.
+    #[serde(default = "default_true")]
+    pub av_align: bool,
+    /// A/V alignment window in milliseconds. See
+    /// [`RtpOutputConfig::av_align_window_ms`] for semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub av_align_window_ms: Option<u32>,
     /// Optional audio encode block. See [`RtpOutputConfig::audio_encode`]
     /// for the semantics. Incompatible with `transport_mode = "audio_302m"`
     /// (the 302M path already owns the TS stream and carries no video).
@@ -3217,6 +3237,14 @@ pub struct SrtOutputConfig {
     /// Incompatible with `transport_mode: "audio_302m"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay: Option<OutputDelay>,
+    /// Enable per-output A/V alignment buffer. See
+    /// [`RtpOutputConfig::av_align`] for semantics. Default: true.
+    #[serde(default = "default_true")]
+    pub av_align: bool,
+    /// A/V alignment window in milliseconds. See
+    /// [`RtpOutputConfig::av_align_window_ms`] for semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub av_align_window_ms: Option<u32>,
     /// Optional audio encode block. See [`RtpOutputConfig::audio_encode`]
     /// for the semantics. Incompatible with `transport_mode = "audio_302m"`
     /// (the 302M path already owns the TS stream and carries no video).
@@ -3638,6 +3666,14 @@ pub struct RistOutputConfig {
     /// Optional output delay for stream synchronization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay: Option<OutputDelay>,
+    /// Enable per-output A/V alignment buffer. See
+    /// [`RtpOutputConfig::av_align`] for semantics. Default: true.
+    #[serde(default = "default_true")]
+    pub av_align: bool,
+    /// A/V alignment window in milliseconds. See
+    /// [`RtpOutputConfig::av_align_window_ms`] for semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub av_align_window_ms: Option<u32>,
     /// Optional audio encode block (AAC-LC / HE-AAC / MP2 / AC-3). See
     /// [`RtpOutputConfig::audio_encode`] for semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6021,6 +6057,8 @@ mod tests {
                 program_number: None,
                 pid_map: None,
                 delay: None,
+                av_align: true,
+                av_align_window_ms: None,
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
@@ -6095,6 +6133,8 @@ mod tests {
                 program_number: None,
                 pid_map: None,
                 delay: None,
+                av_align: true,
+                av_align_window_ms: None,
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,

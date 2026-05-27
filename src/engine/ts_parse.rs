@@ -14,6 +14,7 @@ pub const TS_SYNC_BYTE: u8 = 0x47;
 pub const RTP_HEADER_MIN_SIZE: usize = 12;
 pub const PAT_PID: u16 = 0x0000;
 pub const NULL_PID: u16 = 0x1FFF;
+pub const PTS_MODULUS_90KHZ: u64 = 1u64 << 33;
 
 // ── TS Packet Field Accessors ────────────────────────────────────────────
 
@@ -296,6 +297,23 @@ pub fn extract_pcr(pkt: &[u8]) -> Option<u64> {
         | ((pkt[10] as u64) >> 7);
     let ext = (((pkt[10] & 0x01) as u64) << 8) | (pkt[11] as u64);
     Some(base * 300 + ext)
+}
+
+// ── PTS Arithmetic ──────────────────────────────────────────────────────
+
+/// Signed PTS delta in milliseconds: `(pts_a − pts_b)` in modular 33-bit
+/// PTS space. Positive = `a` is later than `b`, negative = `a` is earlier.
+#[inline]
+pub fn pts_delta_ms(pts_a: u64, pts_b: u64) -> i64 {
+    let a = pts_a & (PTS_MODULUS_90KHZ - 1);
+    let b = pts_b & (PTS_MODULUS_90KHZ - 1);
+    let raw = a.wrapping_sub(b) & (PTS_MODULUS_90KHZ - 1);
+    let signed = if raw > PTS_MODULUS_90KHZ / 2 {
+        raw as i64 - PTS_MODULUS_90KHZ as i64
+    } else {
+        raw as i64
+    };
+    signed / 90
 }
 
 // ── PAT Parsing ──────────────────────────────────────────────────────────

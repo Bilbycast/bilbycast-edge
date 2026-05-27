@@ -136,6 +136,7 @@ pub mod ts_video_replace;
 /// per-input by [`crate::config::models::RtpInputConfig::passthrough_clock`].
 /// Plugs in as the fourth optional stage of [`input_post_process`].
 pub mod ts_pts_rewriter;
+pub mod ts_av_align;
 /// Per-output wire emission engine. Dedicated `std::thread` (Linux:
 /// `SCHED_FIFO`) that paces TS datagrams onto the wire via PCR-anchored
 /// `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, ...)`. Decouples wire

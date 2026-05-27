@@ -402,6 +402,23 @@ async fn rist_output_loop(
     let delay_sleep = tokio::time::sleep(Duration::from_secs(86400));
     tokio::pin!(delay_sleep);
 
+    // Per-output A/V alignment buffer.
+    let mut av_align_buf = if config.av_align {
+        let window_ms = config.av_align_window_ms.unwrap_or(100);
+        Some(crate::engine::ts_av_align::TsAvAlignBuffer::new(
+            crate::engine::ts_av_align::AlignConfig {
+                alignment_window_ms: window_ms,
+                tolerance_ms: 5,
+                max_hold_ms: window_ms * 2,
+                stream_presence_timeout_ms: 500,
+                capacity_packets: crate::engine::ts_av_align::TsAvAlignBuffer::initial_capacity(window_ms),
+            },
+        ))
+    } else {
+        None
+    };
+    let mut align_scratch: Vec<u8> = Vec::with_capacity(8192);
+
     loop {
         if let Some(ref db) = delay_buf {
             if let Some(release_us) = db.next_release_time() {
@@ -502,12 +519,19 @@ async fn rist_output_loop(
             };
             let _ = transcoded_holder; // keep transcoded bytes alive through use
 
-            if let Some(ref mut remapper) = pid_remapper {
+            let after_remap: &[u8] = if let Some(ref mut remapper) = pid_remapper {
                 remap_scratch.clear();
                 remapper.process(after_overrides, &mut remap_scratch);
-                ts_buf.extend_from_slice(&remap_scratch);
+                &remap_scratch
             } else {
-                ts_buf.extend_from_slice(after_overrides);
+                after_overrides
+            };
+            if let Some(ref mut al) = av_align_buf {
+                align_scratch.clear();
+                al.process(after_remap, &mut align_scratch);
+                ts_buf.extend_from_slice(&align_scratch);
+            } else {
+                ts_buf.extend_from_slice(after_remap);
             }
 
             if !ts_sync_found {
@@ -546,6 +570,12 @@ async fn rist_output_loop(
                             .bytes_sent
                             .fetch_add(datagram.len() as u64, Ordering::Relaxed);
                         stats.record_latency(packet.recv_time_us);
+                        // A/V sync drift: feed every TS packet.
+                        let mut off = 0;
+                        while off + 188 <= datagram.len() {
+                            stats.observe_av_sync_packet(&datagram[off..off + 188]);
+                            off += 188;
+                        }
                     }
                     if let Some(ref s2) = socket_leg2 {
                         if let Err(e) = s2.send(datagram).await {

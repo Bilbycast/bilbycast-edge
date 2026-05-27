@@ -438,6 +438,23 @@ async fn udp_output_loop(
     let delay_sleep = tokio::time::sleep(Duration::from_secs(86400));
     tokio::pin!(delay_sleep);
 
+    // Per-output A/V alignment buffer.
+    let mut av_align_buf = if config.av_align {
+        let window_ms = config.av_align_window_ms.unwrap_or(100);
+        Some(crate::engine::ts_av_align::TsAvAlignBuffer::new(
+            crate::engine::ts_av_align::AlignConfig {
+                alignment_window_ms: window_ms,
+                tolerance_ms: 5,
+                max_hold_ms: window_ms * 2,
+                stream_presence_timeout_ms: 500,
+                capacity_packets: crate::engine::ts_av_align::TsAvAlignBuffer::initial_capacity(window_ms),
+            },
+        ))
+    } else {
+        None
+    };
+    let mut align_scratch: Vec<u8> = Vec::with_capacity(8192);
+
     // Reused per-iteration send scratch. Hoisted out of the select loop so
     // the per-packet hot path does not allocate a fresh Vec on every branch
     // — at 50 Mbps that would be ~3k allocs/sec per output.
@@ -502,6 +519,8 @@ async fn udp_output_loop(
                                   overrides_scratch: &mut Vec<u8>,
                                   pid_remapper: &mut Option<TsPidRemapper>,
                                   remap_scratch: &mut Vec<u8>,
+                                  av_aligner: &mut Option<crate::engine::ts_av_align::TsAvAlignBuffer>,
+                                  av_align_scratch: &mut Vec<u8>,
                                   ts_buf: &mut BytesMut,
                                   ts_sync_found: &mut bool,
                                   config_id: &str,
@@ -521,12 +540,19 @@ async fn udp_output_loop(
             } else {
                 after_pad
             };
-            if let Some(remapper) = pid_remapper.as_mut() {
+            let after_remap: &[u8] = if let Some(remapper) = pid_remapper.as_mut() {
                 remap_scratch.clear();
                 remapper.process(after_overrides, remap_scratch);
-                ts_buf.extend_from_slice(remap_scratch);
+                remap_scratch
             } else {
-                ts_buf.extend_from_slice(after_overrides);
+                after_overrides
+            };
+            if let Some(ref mut al) = *av_aligner {
+                av_align_scratch.clear();
+                al.process(after_remap, av_align_scratch);
+                ts_buf.extend_from_slice(av_align_scratch);
+            } else {
+                ts_buf.extend_from_slice(after_remap);
             }
             if !*ts_sync_found {
                 let min_bytes = TS_SYNC_CONFIRM_COUNT * TS_PACKET_SIZE;
@@ -618,6 +644,8 @@ async fn udp_output_loop(
                     &mut overrides_scratch,
                     &mut pid_remapper,
                     &mut remap_scratch,
+                    &mut av_align_buf,
+                    &mut align_scratch,
                     &mut ts_buf,
                     &mut ts_sync_found,
                     &config.id,
@@ -643,6 +671,8 @@ async fn udp_output_loop(
                     &mut overrides_scratch,
                     &mut pid_remapper,
                     &mut remap_scratch,
+                    &mut av_align_buf,
+                    &mut align_scratch,
                     &mut ts_buf,
                     &mut ts_sync_found,
                     &config.id,

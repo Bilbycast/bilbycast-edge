@@ -376,6 +376,26 @@ async fn rtp_output_loop(
     let delay_sleep = tokio::time::sleep(Duration::from_secs(86400));
     tokio::pin!(delay_sleep);
 
+    // Per-output A/V alignment buffer. Sits after all TS modifications
+    // (transcode, null pad, PID remap) and before the realign buffer /
+    // wire emission. Holds video and audio PES groups and releases them
+    // temporally aligned.
+    let mut av_align_buf = if config.av_align {
+        let window_ms = config.av_align_window_ms.unwrap_or(100);
+        Some(crate::engine::ts_av_align::TsAvAlignBuffer::new(
+            crate::engine::ts_av_align::AlignConfig {
+                alignment_window_ms: window_ms,
+                tolerance_ms: 5,
+                max_hold_ms: window_ms * 2,
+                stream_presence_timeout_ms: 500,
+                capacity_packets: crate::engine::ts_av_align::TsAvAlignBuffer::initial_capacity(window_ms),
+            },
+        ))
+    } else {
+        None
+    };
+    let mut align_scratch: Vec<u8> = Vec::with_capacity(8192);
+
     // Reused per-iteration send scratch. Hoisted out of the loop so the
     // per-packet hot path does not allocate a fresh Vec on every select
     // branch (at 50 Mbps that would be ~3k allocs/sec per output).
@@ -539,6 +559,22 @@ async fn rtp_output_loop(
                 // padder. The transcoded output may arrive across one
                 // or more iterations; this loop continues to consume
                 // from ts_realign_buf normally.
+                // Helper: feed processed TS bytes into the A/V
+                // alignment buffer (if active), then into the realign
+                // accumulator.
+                let feed_realign = |data: &[u8],
+                                        aligner: &mut Option<crate::engine::ts_av_align::TsAvAlignBuffer>,
+                                        scratch: &mut Vec<u8>,
+                                        realign: &mut BytesMut| {
+                    if let Some(ref mut al) = *aligner {
+                        scratch.clear();
+                        al.process(data, scratch);
+                        realign.extend_from_slice(scratch);
+                    } else {
+                        realign.extend_from_slice(data);
+                    }
+                };
+
                 if let Some(ref chain) = transcode_chain {
                     if chain.try_submit(Bytes::copy_from_slice(ts_input)).is_err() {
                         stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
@@ -548,9 +584,9 @@ async fn rtp_output_loop(
                         if let Some(ref mut padder) = null_padder {
                             pad_scratch.clear();
                             padder.process(&transcoded, &mut pad_scratch);
-                            ts_realign_buf.extend_from_slice(&pad_scratch);
+                            feed_realign(&pad_scratch, &mut av_align_buf, &mut align_scratch, &mut ts_realign_buf);
                         } else {
-                            ts_realign_buf.extend_from_slice(&transcoded);
+                            feed_realign(&transcoded, &mut av_align_buf, &mut align_scratch, &mut ts_realign_buf);
                         }
                     }
                 } else {
@@ -559,9 +595,9 @@ async fn rtp_output_loop(
                     if let Some(ref mut padder) = null_padder {
                         pad_scratch.clear();
                         padder.process(ts_input, &mut pad_scratch);
-                        ts_realign_buf.extend_from_slice(&pad_scratch);
+                        feed_realign(&pad_scratch, &mut av_align_buf, &mut align_scratch, &mut ts_realign_buf);
                     } else {
-                        ts_realign_buf.extend_from_slice(ts_input);
+                        feed_realign(ts_input, &mut av_align_buf, &mut align_scratch, &mut ts_realign_buf);
                     }
                 }
 

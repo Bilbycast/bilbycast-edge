@@ -110,6 +110,13 @@ pub struct OutputStatsAccumulator {
     // rotating reservoir (last 4096 samples).
     pcr_trust: crate::stats::pcr_trust::PcrTrustSampler,
 
+    // ── Per-output egress A/V sync drift metric ─────────────────────
+    // Fed inline by the output's send task for every 188-byte TS packet.
+    // Self-bootstrapping: tracks PAT/PMT inline to discover video/audio
+    // PIDs, then measures V−A PTS offset. Same reservoir pattern as
+    // pcr_trust but signed ms values.
+    av_sync: crate::stats::av_sync::AvSyncDriftSampler,
+
     // ── Wire pacing: tier + late-drop counter ────────────────────────
     // The active release-path tier for this output. Set once at output
     // startup by `engine::wire_emit::spawn_wire_emitter`. One of:
@@ -656,6 +663,7 @@ impl OutputStatsAccumulator {
             latency_sum_us: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
             pcr_trust: crate::stats::pcr_trust::PcrTrustSampler::new(),
+            av_sync: crate::stats::av_sync::AvSyncDriftSampler::new(),
             wire_pacing_tier: OnceLock::new(),
             wire_pacing_late: AtomicU64::new(0),
             wire_pacing_pinned_cpu: AtomicI32::new(-1),
@@ -701,6 +709,20 @@ impl OutputStatsAccumulator {
     /// all outputs.
     pub fn pcr_trust_sampler(&self) -> &crate::stats::pcr_trust::PcrTrustSampler {
         &self.pcr_trust
+    }
+
+    /// Feed one 188-byte TS packet at egress for A/V sync drift
+    /// measurement. The sampler internally tracks PAT/PMT to discover
+    /// video/audio PIDs, then measures V−A PTS offset. Call once per
+    /// TS packet in the output's send loop.
+    #[inline]
+    pub fn observe_av_sync_packet(&self, pkt: &[u8]) {
+        self.av_sync.observe_packet(pkt);
+    }
+
+    /// Borrow the A/V sync sampler for flow-level rollup.
+    pub fn av_sync_sampler(&self) -> &crate::stats::av_sync::AvSyncDriftSampler {
+        &self.av_sync
     }
 
     /// Register the per-output transcoder stats handle. Called once at
@@ -1145,6 +1167,8 @@ impl OutputStatsAccumulator {
             // self-contained.
             egress_summary: None,
             pcr_trust: self.pcr_trust.snapshot(),
+            av_sync: self.av_sync.snapshot(),
+            av_align: None,
             display_stats,
             wire_pacing_tier: self.wire_pacing_tier.get().cloned(),
             wire_pacing_late: self.wire_pacing_late.load(Ordering::Relaxed),
@@ -1557,6 +1581,51 @@ impl Tr101290Accumulator {
             tr07_compliant: jpeg_xs_detected,
             jpeg_xs_pid,
         }
+    }
+
+    pub fn reset_counters(&self) {
+        self.ts_packets_analyzed.store(0, Ordering::Relaxed);
+        self.pat_count.store(0, Ordering::Relaxed);
+        self.pmt_count.store(0, Ordering::Relaxed);
+        self.sync_loss_count.store(0, Ordering::Relaxed);
+        self.sync_byte_errors.store(0, Ordering::Relaxed);
+        self.cc_errors.store(0, Ordering::Relaxed);
+        self.pat_errors.store(0, Ordering::Relaxed);
+        self.pmt_errors.store(0, Ordering::Relaxed);
+        self.pid_errors.store(0, Ordering::Relaxed);
+        self.tei_errors.store(0, Ordering::Relaxed);
+        self.crc_errors.store(0, Ordering::Relaxed);
+        self.pcr_discontinuity_errors.store(0, Ordering::Relaxed);
+        self.pcr_accuracy_errors.store(0, Ordering::Relaxed);
+        self.pts_errors.store(0, Ordering::Relaxed);
+        self.cat_errors.store(0, Ordering::Relaxed);
+        self.pcr_repetition_errors.store(0, Ordering::Relaxed);
+        self.nit_errors.store(0, Ordering::Relaxed);
+        self.si_repetition_errors.store(0, Ordering::Relaxed);
+        self.unreferenced_pid_errors.store(0, Ordering::Relaxed);
+        self.sdt_errors.store(0, Ordering::Relaxed);
+        self.eit_errors.store(0, Ordering::Relaxed);
+        self.rst_errors.store(0, Ordering::Relaxed);
+        self.tdt_errors.store(0, Ordering::Relaxed);
+        self.window_cc_errors.store(0, Ordering::Relaxed);
+        self.window_pat_errors.store(0, Ordering::Relaxed);
+        self.window_pmt_errors.store(0, Ordering::Relaxed);
+        self.window_pid_errors.store(0, Ordering::Relaxed);
+        self.window_tei_errors.store(0, Ordering::Relaxed);
+        self.window_crc_errors.store(0, Ordering::Relaxed);
+        self.window_pcr_discontinuity_errors.store(0, Ordering::Relaxed);
+        self.window_pcr_accuracy_errors.store(0, Ordering::Relaxed);
+        self.window_pts_errors.store(0, Ordering::Relaxed);
+        self.window_cat_errors.store(0, Ordering::Relaxed);
+        self.window_pcr_repetition_errors.store(0, Ordering::Relaxed);
+        self.window_nit_errors.store(0, Ordering::Relaxed);
+        self.window_si_repetition_errors.store(0, Ordering::Relaxed);
+        self.window_unreferenced_pid_errors.store(0, Ordering::Relaxed);
+        self.window_sdt_errors.store(0, Ordering::Relaxed);
+        self.window_eit_errors.store(0, Ordering::Relaxed);
+        self.window_rst_errors.store(0, Ordering::Relaxed);
+        self.window_tdt_errors.store(0, Ordering::Relaxed);
+        *self.state.lock().unwrap() = Tr101290State::default();
     }
 }
 
@@ -2079,6 +2148,10 @@ pub struct ContentAnalysisAccumulator {
     pub audio_full: Mutex<Option<serde_json::Value>>,
     /// Phase 3 placeholder.
     pub video_full: Mutex<Option<serde_json::Value>>,
+    /// Operator-initiated reset. Analyser tasks poll this at the top of
+    /// each sample interval; when true, they reinitialise internal state
+    /// and flip it back to false.
+    pub reset_requested: AtomicBool,
 }
 
 impl ContentAnalysisAccumulator {
@@ -2090,6 +2163,7 @@ impl ContentAnalysisAccumulator {
             lite: Mutex::new(None),
             audio_full: Mutex::new(None),
             video_full: Mutex::new(None),
+            reset_requested: AtomicBool::new(false),
         }
     }
 
@@ -2119,6 +2193,16 @@ impl ContentAnalysisAccumulator {
         snap: crate::stats::models::ContentAnalysisLiteStats,
     ) {
         *self.lite.lock().unwrap() = Some(snap);
+    }
+
+    pub fn reset_counters(&self) {
+        self.lite_drops.store(0, Ordering::Relaxed);
+        self.audio_full_drops.store(0, Ordering::Relaxed);
+        self.video_full_drops.store(0, Ordering::Relaxed);
+        *self.lite.lock().unwrap() = None;
+        *self.audio_full.lock().unwrap() = None;
+        *self.video_full.lock().unwrap() = None;
+        self.reset_requested.store(true, Ordering::Relaxed);
     }
 }
 
@@ -2475,6 +2559,29 @@ impl FlowStatsAccumulator {
         if let Ok(mut g) = self.master_clock_state.write() {
             if let Some(s) = g.as_mut() {
                 s.lipsync_offset_90k = lipsync_offset_90k;
+            }
+        }
+    }
+
+    pub fn reset_counters(&self, scope: &str) {
+        match scope {
+            "tr101290" => {
+                if let Some(tr) = self.tr101290.get() {
+                    tr.reset_counters();
+                }
+            }
+            "content_analysis" => {
+                if let Some(ca) = self.content_analysis.get() {
+                    ca.reset_counters();
+                }
+            }
+            _ => {
+                if let Some(tr) = self.tr101290.get() {
+                    tr.reset_counters();
+                }
+                if let Some(ca) = self.content_analysis.get() {
+                    ca.reset_counters();
+                }
             }
         }
     }
@@ -2957,6 +3064,23 @@ impl FlowStatsAccumulator {
             acc
         };
 
+        // Flow-level A/V sync drift rollup. Pick the output with the
+        // worst |p95| — gives operators "the most problematic output".
+        let av_sync_flow = {
+            let mut worst: Option<crate::stats::models::AvSyncStats> = None;
+            for out_entry in self.output_stats.iter() {
+                if let Some(snap) = out_entry.value().av_sync_sampler().snapshot() {
+                    let dominated = worst
+                        .as_ref()
+                        .is_none_or(|w| snap.p95_abs_ms.abs() > w.p95_abs_ms.abs());
+                    if dominated {
+                        worst = Some(snap);
+                    }
+                }
+            }
+            worst
+        };
+
         FlowStats {
             flow_id: self.flow_id.clone(),
             flow_name: self.flow_name.clone(),
@@ -3132,6 +3256,7 @@ impl FlowStatsAccumulator {
             inputs_live,
             per_es,
             pcr_trust_flow,
+            av_sync_flow,
             content_analysis: self.content_analysis.get().map(|acc| acc.snapshot()),
             #[cfg(feature = "replay")]
             recording: self.recording_stats.get().map(|s| {
