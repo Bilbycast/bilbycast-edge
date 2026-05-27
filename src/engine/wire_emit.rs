@@ -124,6 +124,12 @@ const MAX_FUTURE_LOOKAHEAD_NS: u64 = 200_000_000;
 /// 500 ms in 27 MHz ticks. PCR jumps beyond this trigger an anchor reset.
 const PCR_DISCONTINUITY_27MHZ: i64 = 13_500_000;
 
+/// If no PCR is seen on anchor_pid for this long, reset the anchor so
+/// the emitter can re-lock on a different PID (input switch). 200 ms
+/// covers 5× the typical 40 ms PCR cadence — long enough to ride out
+/// a single lost PCR packet, short enough to re-lock within one GOP.
+const PCR_ANCHOR_STALE_NS: u64 = 200_000_000;
+
 /// `recv_timeout` polling cadence. Bounds cancel latency.
 const RECV_POLL: Duration = Duration::from_millis(50);
 
@@ -515,6 +521,13 @@ struct TargetState {
     observed_rate_bps: u64,
     /// Set after the very first datagram so we don't preroll again.
     initialised: bool,
+    /// Wallclock (ns) of the last datagram where we found a PCR on
+    /// `anchor_pid`. When this exceeds `PCR_ANCHOR_STALE_NS` without
+    /// a new PCR, `anchor_pid` is reset to `None` so the emitter can
+    /// re-lock on a different PID after an input switch. Without this,
+    /// `anchor_pid` stays pinned to the old input's PCR PID forever
+    /// and the emitter runs unpaced (pcr=0) on every subsequent input.
+    last_pcr_seen_ns: u64,
     /// Last `tx-time` value returned by `derive_target` — used to
     /// guarantee the kernel ETF qdisc never sees a tx-time that goes
     /// backwards. Without this, an input switch (PCR discontinuity →
@@ -842,6 +855,24 @@ fn run_emitter(
                     if state.anchor_pid.is_none() {
                         state.anchor_pid = Some(pid);
                     }
+                    state.last_pcr_seen_ns = now_ns;
+                } else if state.anchor_pid.is_some()
+                    && state.last_pcr_seen_ns > 0
+                    && now_ns.saturating_sub(state.last_pcr_seen_ns) > PCR_ANCHOR_STALE_NS
+                {
+                    // No PCR on anchor_pid for > 200 ms — the active
+                    // input likely switched to a stream with a different
+                    // PCR PID. Reset so the next PCR-bearing datagram
+                    // re-locks the anchor.
+                    tracing::debug!(
+                        "wire-emit '{}': anchor_pid {:?} stale ({}ms), resetting",
+                        id,
+                        state.anchor_pid,
+                        now_ns.saturating_sub(state.last_pcr_seen_ns) / 1_000_000,
+                    );
+                    state.anchor_pid = None;
+                    state.pcr_anchor = None;
+                    state.initialised = false;
                 }
                 let pcr_27mhz = pcr_with_pid.map(|(pcr, _)| pcr);
 
