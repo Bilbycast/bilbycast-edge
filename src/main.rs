@@ -648,6 +648,78 @@ async fn main() -> anyhow::Result<()> {
     // Shared shutdown token for coordinated graceful shutdown
     let shutdown_token = CancellationToken::new();
 
+    // ── Dev-mode PTP helper auto-start ────────────────────────────────
+    // In production the systemd bilbycast-ptp.service unit runs the
+    // helper. In dev there is no systemd, so spawn the helper as a
+    // child process when the binary exists next to the edge binary.
+    // The child inherits our UID (needs root / ambient caps for ptp4l).
+    // Killed automatically when the edge exits (SIGCHLD reap).
+    let _ptp_helper_child: Option<std::process::Child> = (|| {
+        let our_exe = std::env::current_exe().ok()?;
+        let helper = our_exe.with_file_name("bilbycast-ptp-helper");
+        if !helper.exists() {
+            return None;
+        }
+        // Don't spawn if the systemd unit is already running.
+        let systemd_active = std::process::Command::new("systemctl")
+            .args(["is-active", "--quiet", "bilbycast-ptp.service"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if systemd_active {
+            tracing::debug!("bilbycast-ptp.service already active; skipping dev helper spawn");
+            return None;
+        }
+        let conf = util::ptp_config::config_path();
+        if let Some(parent) = conf.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Seed a default config if the file doesn't exist yet so the
+        // helper has something to read (mode=off, same as the install
+        // default — operator sets the real mode via the manager UI).
+        if !conf.exists() {
+            let _ = std::fs::write(
+                &conf,
+                "mode = off\niface =\ndomain = 127\npriority1 =\nscan_timeout = 5\n",
+            );
+        }
+        // Locate the shell script relative to the source tree.
+        let script = our_exe
+            .ancestors()
+            .find_map(|dir| {
+                let candidate = dir.join("packaging/bilbycast-ptp-gm.sh");
+                candidate.exists().then_some(candidate)
+            })
+            .or_else(|| {
+                let packaging = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("packaging/bilbycast-ptp-gm.sh");
+                packaging.exists().then_some(packaging)
+            });
+        let child = std::process::Command::new(&helper)
+            .args(["run", "--config"])
+            .arg(&conf)
+            .envs(script.map(|s| ("BILBYCAST_PTP_SCRIPT", s.into_os_string())))
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn();
+        match child {
+            Ok(c) => {
+                tracing::info!(
+                    "dev PTP helper started (pid {}, config {})",
+                    c.id(),
+                    conf.display()
+                );
+                Some(c)
+            }
+            Err(e) => {
+                tracing::warn!("failed to spawn PTP helper: {e}");
+                None
+            }
+        }
+    })();
+
     // Spawn system resource monitor (CPU, RAM, optional NVIDIA GPU util)
     let _resource_monitor_handle = engine::resource_monitor::spawn_resource_monitor(
         app_config.resource_limits.clone(),
@@ -859,6 +931,11 @@ async fn main() -> anyhow::Result<()> {
     // Graceful shutdown: stop all flows and tunnels
     flow_manager.stop_all().await;
     tunnel_manager.stop_all().await;
+
+    if let Some(mut child) = _ptp_helper_child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     tracing::info!("bilbycast-edge shutting down");
     Ok(())
