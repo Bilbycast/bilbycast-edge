@@ -1217,11 +1217,38 @@ impl TsAudioReplacer {
                 if lag_27m > CATCH_UP_THRESHOLD_27M
                     && lag_27m < SANITY_CEILING_27M
                 {
+                    // Per-fire cap = exactly one AC-3 frame duration
+                    // (32 ms at 48 kHz, 1536 samples). Larger caps
+                    // (e.g. 50 ms) overshoot because the encoder
+                    // consumes accumulator in `frame_size` chunks
+                    // and will emit 2 frames if silence + real
+                    // exceeds 2 × frame_size, advancing
+                    // `samples_since_anchor` by 64 ms per fire. By
+                    // matching the cap to one frame's worth of
+                    // samples, exactly one extra silence frame is
+                    // emitted per fire — `samples_since_anchor`
+                    // advances by exactly 32 ms above the per-PES
+                    // baseline (per fire), which means in
+                    // equilibrium with drift rate D ms/sec:
+                    //   fire_rate ≈ D / 32 fires/sec
+                    //   silence_rate = 32 × fire_rate = D ms/sec
+                    // — exactly compensating the drift, so audio
+                    // tracks PCR within ±~5 ms after the
+                    // `CATCH_UP_THRESHOLD` (100 ms) settling band.
+                    // Note: 32 ms is AC-3-specific; for codecs with
+                    // different frame_size (Opus 20 ms, MP2 24 ms,
+                    // AAC 21.3 ms) a slightly different value would
+                    // be optimal, but 32 ms is close enough for the
+                    // smaller codecs to still keep audio within
+                    // strict broadcast tolerance.
+                    const SANITY_CAP_PER_FIRE_27M: i64 = 32 * 27_000;
+                    let silence_to_add = lag_27m.min(SANITY_CAP_PER_FIRE_27M);
                     self.pending_silence_27mhz = self
                         .pending_silence_27mhz
-                        .saturating_add(lag_27m);
+                        .saturating_add(silence_to_add);
                     tracing::info!(
                         lag_27m,
+                        silence_added_27m = silence_to_add,
                         lag_ms = lag_27m / 27_000,
                         master_elapsed_27m,
                         output_pts_elapsed_27m,
