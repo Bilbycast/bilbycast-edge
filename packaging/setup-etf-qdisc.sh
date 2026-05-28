@@ -25,19 +25,19 @@
 #
 #   - Linux kernel ≥ 4.19
 #   - `iproute2` ≥ 4.20 (for `etf` qdisc support; check `tc -V`)
-#   - PTP discipline running on the system clock — either
-#     `ptp4l` + `phc2sys`, or a similar GM-aligned setup. The ETF qdisc
-#     pulls its reference from `clockid` (`CLOCK_TAI` here); without
-#     PTP the system TAI clock is just wall time + leap-second offset
-#     and the receiver-side ST 2110-21 narrow profile bounds will fail.
-#   - For HW offload (`offload` flag below): a NIC with PTP-disciplined
-#     hardware tx timestamping. Tested NIC families:
+#
+# PTP is NOT required for the default software ETF mode. Without PTP,
+# the system TAI clock is wall time + leap-second offset — good enough
+# for software-ETF pacing (~1–10 µs jitter). PTP is only needed for:
+#   - HW offload (`BILBYCAST_ETF_OFFLOAD=1`) — sub-µs jitter
+#   - ST 2110-21 narrow profile receiver-side VRX bound compliance
+#
+# For HW offload (`BILBYCAST_ETF_OFFLOAD=1`): requires a PTP-disciplined
+# NIC with `ptp4l` + `phc2sys` running in TAI domain. Without PHC sync,
+# HW offload silently drops every packet. Tested NIC families:
 #       * Mellanox CX-6, CX-7 (mlx5_core)
 #       * Intel E810 (ice driver)
 #       * Intel i210 (igb driver)
-#     Other NICs may work but the kernel falls back to software ETF if
-#     HW offload isn't available — still ~1–10 µs jitter, an order of
-#     magnitude better than no pacing.
 #
 # Usage:
 #
@@ -122,12 +122,15 @@ tc qdisc replace dev "$IF" root handle 100: mqprio \
 # announce), the launch register sees timestamps tens of seconds
 # outside its ~1 s horizon and the NIC silently rejects every packet.
 #
-# Operators without external PTP set `BILBYCAST_ETF_OFFLOAD=0` to skip
-# the offload flag — software ETF on CLOCK_TAI still gives ~1–10 µs
-# jitter (broadcast-quality), no PHC dependency. Tier-1 sub-µs PCR_AC
-# needs PHC sync; until that's set up, software ETF is the right
-# default.
-USE_OFFLOAD="${BILBYCAST_ETF_OFFLOAD:-1}"
+# Default: software ETF (`BILBYCAST_ETF_OFFLOAD=0`). Safe everywhere —
+# no PTP, no PHC sync, no silent packet drops. Gives ~1–10 µs jitter
+# (broadcast-quality for compressed TS and ST 2110 wide profile).
+#
+# Operators with a PTP grandmaster + HW-PTP NIC + confirmed PHC sync
+# (`phc2sys` in TAI domain) set `BILBYCAST_ETF_OFFLOAD=1` for sub-µs
+# jitter (tier 1). Without PHC sync, HW offload silently drops every
+# packet — the NIC rejects launch timestamps outside its ~1 s horizon.
+USE_OFFLOAD="${BILBYCAST_ETF_OFFLOAD:-0}"
 if [[ "$USE_OFFLOAD" == "1" ]]; then
     echo "$0: installing etf qdisc on $IF class 100:1 (clockid CLOCK_TAI, offload, skip_sock_check)"
     tc qdisc replace dev "$IF" parent 100:1 etf \

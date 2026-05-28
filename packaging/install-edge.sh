@@ -50,6 +50,7 @@ VARIANT=""    # auto-detect from arch unless overridden
 MANAGER_URL=""
 REGISTRATION_TOKEN=""
 UPGRADE_INSTALLER=0
+OUTPUT_NICS=""  # comma-separated NIC list for ETF qdisc + SO_TXTIME
 
 # ── Argument parsing ──────────────────────────────────────────────────
 usage() {
@@ -61,6 +62,11 @@ Options:
   --registration-token <tok>   One-shot registration token from manager UI
   --channel <name>             Release channel (stable | nightly | beta), default stable
   --variant <name>             Binary variant (default | full), defaults to "full" on Linux
+  --output-nics <nic1,nic2>    Comma-separated NIC names for ETF qdisc + SO_TXTIME
+                               wire pacing. Each NIC gets a boot-persistent systemd
+                               unit and BILBYCAST_ENABLE_TXTIME=1 is set in the env
+                               file. Requires ≥ 3 HW tx queues per NIC (validated).
+                               Omit to stay on the default clock_nanosleep tier.
   --upgrade-installer          Refresh service unit + install script,
                                leave config and versions/ untouched
   -h, --help                   Show this message
@@ -73,6 +79,7 @@ while [[ $# -gt 0 ]]; do
         --registration-token) REGISTRATION_TOKEN="$2"; shift 2;;
         --channel) CHANNEL="$2"; shift 2;;
         --variant) VARIANT="$2"; shift 2;;
+        --output-nics) OUTPUT_NICS="$2"; shift 2;;
         --upgrade-installer) UPGRADE_INSTALLER=1; shift;;
         -h|--help) usage; exit 0;;
         *) echo "Unknown argument: $1" >&2; usage; exit 1;;
@@ -355,16 +362,42 @@ else
         "https://github.com/${RELEASE_REPO}/releases/latest/download/bilbycast-edge.service"
 fi
 
-# ── Install opt-in ETF qdisc systemd unit (template, not enabled) ────
+# ── Install ETF qdisc systemd unit template ──────────────────────────
 # The bilbycast-etf-qdisc@.service template installs the ETF qdisc on
-# a named NIC at boot, before bilbycast-edge starts. Most deployments
-# stay on the default `clock_nanosleep` wire-pacing tier and never
-# need this unit — it's only enabled by operators who have explicitly
-# opted in to SO_TXTIME (tier 1 / 2) via BILBYCAST_ENABLE_TXTIME=1.
-# Lay the file down so it's discoverable; do not enable any instance.
+# a named NIC at boot, before bilbycast-edge starts. Always laid down
+# so it's discoverable; instances are enabled only when the operator
+# passes --output-nics at install time.
 ETF_UNIT_DEST="${SYSTEMD_UNIT_DIR}/bilbycast-etf-qdisc@.service"
 if [[ -f "${VERSION_DIR}/packaging/bilbycast-etf-qdisc@.service" ]]; then
     install -m 0644 "${VERSION_DIR}/packaging/bilbycast-etf-qdisc@.service" "${ETF_UNIT_DEST}"
+fi
+
+# ── Enable ETF qdisc per NIC (when --output-nics is provided) ────────
+ETF_ENABLED_COUNT=0
+if [[ -n "${OUTPUT_NICS}" ]]; then
+    IFS=',' read -ra NICS <<< "${OUTPUT_NICS}"
+    for nic in "${NICS[@]}"; do
+        nic="$(echo "$nic" | xargs)"  # trim whitespace
+        if ! ip link show "$nic" &>/dev/null; then
+            echo "WARNING: NIC '$nic' not found — skipping ETF setup" >&2
+            continue
+        fi
+        tx_queues="$(ls -d /sys/class/net/"$nic"/queues/tx-* 2>/dev/null | wc -l)"
+        if [[ "$tx_queues" -lt 3 ]]; then
+            echo "WARNING: NIC '$nic' has $tx_queues tx queue(s) (need ≥ 3 for mqprio) — skipping ETF setup" >&2
+            continue
+        fi
+        echo "  Enabling ETF qdisc boot service on $nic ($tx_queues tx queues)"
+        systemctl enable "bilbycast-etf-qdisc@${nic}.service" 2>/dev/null || {
+            echo "WARNING: failed to enable bilbycast-etf-qdisc@${nic}.service" >&2
+            continue
+        }
+        systemctl start "bilbycast-etf-qdisc@${nic}.service" 2>/dev/null || {
+            echo "WARNING: ETF qdisc install failed on $nic — the boot service is enabled"
+            echo "         and will retry on next reboot. Check: systemctl status bilbycast-etf-qdisc@${nic}" >&2
+        }
+        ((ETF_ENABLED_COUNT++)) || true
+    done
 fi
 
 # ── Install bilbycast PTP supervisor unit + helper + script ──────────
@@ -458,7 +491,12 @@ systemctl enable --now bilbycast-ptp.service 2>/dev/null || true
 # may have customised it.
 ENV_FILE="${CONFIG_DIR}/edge.env"
 if [[ ! -f "${ENV_FILE}" ]]; then
-    cat > "${ENV_FILE}" <<'EOF'
+    if [[ "${ETF_ENABLED_COUNT}" -gt 0 ]]; then
+        TXTIME_LINE="BILBYCAST_ENABLE_TXTIME=1"
+    else
+        TXTIME_LINE="# BILBYCAST_ENABLE_TXTIME=1"
+    fi
+    cat > "${ENV_FILE}" <<EOF
 # bilbycast-edge runtime environment.
 # Tunable via systemctl restart bilbycast-edge (no daemon-reload needed).
 RUST_LOG=info
@@ -466,7 +504,7 @@ RUST_LOG=info
 # BILBYCAST_MEDIA_DIR=/var/lib/bilbycast/edge/media
 
 # Lock all current + future memory pages into RAM at startup via
-# `mlockall(MCL_CURRENT | MCL_FUTURE)`. Eliminates major-page-fault
+# \`mlockall(MCL_CURRENT | MCL_FUTURE)\`. Eliminates major-page-fault
 # stalls on the data-plane hot path (encoder buffers, wire-emit
 # threads, broadcast channel slots). Paired with LimitMEMLOCK=infinity
 # in the systemd unit so the call always succeeds on this install.
@@ -475,23 +513,28 @@ BILBYCAST_MLOCKALL=1
 
 # CPU pinning for wire-emit threads. Each output socket spawns its
 # own wire-emit thread; with pinning, multiple threads round-robin
-# across the listed CPUs. Recommended pairing: `isolcpus=N-M` on the
+# across the listed CPUs. Recommended pairing: \`isolcpus=N-M\` on the
 # kernel command line + this set referencing the same isolated cores.
 # Example for a 4-core box with cores 2 + 3 isolated:
 # BILBYCAST_WIRE_EMIT_CPUS=2,3
 
-# Opt in to the SO_TXTIME wire-pacing release tier (kernel-paced via
-# the ETF qdisc; tier 1 / 2 in OutputStats.wire_pacing_tier). Default
-# off — the edge uses userspace clock_nanosleep on SCHED_FIFO, which
-# handles compressed TS through 2 Gbps with sub-3 ms PCR_AC max on a
-# commodity NIC. Enabling SO_TXTIME requires the ETF qdisc on the
-# egress NIC (install via packaging/setup-etf-qdisc.sh, persist via
-# `systemctl enable --now bilbycast-etf-qdisc@<NIC>`) and, for
-# sub-µs jitter (tier 1), a HW-PTP NIC with ptp4l + phc2sys disciplined
-# to a PTP grandmaster. Full setup: docs.bilbycast.com/edge/wire-pacing/
-# BILBYCAST_ENABLE_TXTIME=1
+# SO_TXTIME wire-pacing release tier (kernel-paced via the ETF qdisc;
+# tier 1 / 2 in OutputStats.wire_pacing_tier). Requires the ETF qdisc
+# on each egress NIC — installed at boot by the per-NIC
+# bilbycast-etf-qdisc@<NIC>.service units. For sub-us jitter (tier 1),
+# also needs a HW-PTP NIC with ptp4l + phc2sys disciplined to a PTP
+# grandmaster. Full setup: docs.bilbycast.com/edge/wire-pacing/
+${TXTIME_LINE}
 EOF
     chmod 0640 "${ENV_FILE}"
+elif [[ "${ETF_ENABLED_COUNT}" -gt 0 ]]; then
+    if grep -q '^# *BILBYCAST_ENABLE_TXTIME=' "${ENV_FILE}"; then
+        sed -i 's/^# *BILBYCAST_ENABLE_TXTIME=.*/BILBYCAST_ENABLE_TXTIME=1/' "${ENV_FILE}"
+        echo "  Enabled BILBYCAST_ENABLE_TXTIME=1 in ${ENV_FILE}"
+    elif ! grep -q '^BILBYCAST_ENABLE_TXTIME=' "${ENV_FILE}"; then
+        echo "BILBYCAST_ENABLE_TXTIME=1" >> "${ENV_FILE}"
+        echo "  Added BILBYCAST_ENABLE_TXTIME=1 to ${ENV_FILE}"
+    fi
 fi
 
 systemctl daemon-reload
@@ -509,18 +552,23 @@ echo "  sudo install -m 0644 ${VERSION_DIR}/packaging/strict-binding.conf \\"
 echo "      /etc/systemd/system/bilbycast-edge.service.d/strict-binding.conf"
 echo "  sudo systemctl daemon-reload && sudo systemctl restart bilbycast-edge"
 
-# ── Optional: SO_TXTIME wire-pacing tier (ETF qdisc + ptp4l) ──────────
-# Default install uses the userspace clock_nanosleep tier — fine for
-# 99 % of deployments. The SO_TXTIME tier is opt-in for sub-µs PCR_AC
-# (ST 2110-21 narrow profile, T-STD-strict contribution receivers).
-echo
-echo "Optional — kernel-paced wire emission (SO_TXTIME, sub-µs PCR_AC):"
-echo "  sudo bash ${VERSION_DIR}/packaging/setup-etf-qdisc.sh <NIC>"
-echo "  sudo systemctl enable --now bilbycast-etf-qdisc@<NIC>"
-echo "  # uncomment BILBYCAST_ENABLE_TXTIME=1 in ${ENV_FILE}, then:"
-echo "  sudo systemctl restart bilbycast-edge"
-echo "  # Full setup (requires PTP grandmaster + HW-PTP NIC for tier 1):"
-echo "  #   https://docs.bilbycast.com/edge/wire-pacing/"
+# ── SO_TXTIME wire-pacing status ──────────────────────────────────────
+if [[ "${ETF_ENABLED_COUNT}" -gt 0 ]]; then
+    echo
+    echo "Wire pacing: SO_TXTIME enabled on ${ETF_ENABLED_COUNT} NIC(s) via ETF qdisc."
+    echo "  Verify: tc -s qdisc show dev <NIC>"
+    echo "  Disable per-NIC: sudo systemctl disable --now bilbycast-etf-qdisc@<NIC>"
+    echo "  For sub-us jitter (tier 1), also configure PTP:"
+    echo "    https://docs.bilbycast.com/edge/wire-pacing/"
+else
+    echo
+    echo "Optional — kernel-paced wire emission (SO_TXTIME, sub-µs PCR_AC):"
+    echo "  Rerun this installer with --output-nics <nic1,nic2,...> to enable, or manually:"
+    echo "  sudo bash ${VERSION_DIR}/packaging/setup-etf-qdisc.sh <NIC>"
+    echo "  sudo systemctl enable --now bilbycast-etf-qdisc@<NIC>"
+    echo "  # then uncomment BILBYCAST_ENABLE_TXTIME=1 in ${ENV_FILE} and restart:"
+    echo "  sudo systemctl restart bilbycast-edge"
+fi
 
 # ── Wait for first manager registration ────────────────────────────────
 echo
