@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -209,12 +209,13 @@ pub fn start_manager_client(
     static_caps: Arc<crate::engine::hardware_probe::StaticCapabilities>,
     live_gpu: Arc<crate::engine::hardware_probe::LiveUtilizationState>,
     standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
+    start_time: Instant,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         manager_client_loop(
             config, flow_manager, tunnel_manager, ws_stats_rx, app_config, config_path,
             secrets_path, api_addr, monitor_addr, webrtc_sessions, event_rx, resource_state,
-            static_caps, live_gpu, standby_listeners,
+            static_caps, live_gpu, standby_listeners, start_time,
         ).await;
     })
 }
@@ -235,6 +236,7 @@ async fn manager_client_loop(
     static_caps: Arc<crate::engine::hardware_probe::StaticCapabilities>,
     live_gpu: Arc<crate::engine::hardware_probe::LiveUtilizationState>,
     standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
+    start_time: Instant,
 ) {
     // If we already have a node_id from config, set it on the tunnel manager
     // so relay tunnels can identify this edge before the first manager connection.
@@ -279,6 +281,7 @@ async fn manager_client_loop(
             &static_caps,
             &live_gpu,
             &standby_listeners,
+            start_time,
         )
         .await
         {
@@ -344,6 +347,7 @@ async fn try_connect(
     static_caps: &Arc<crate::engine::hardware_probe::StaticCapabilities>,
     live_gpu: &Arc<crate::engine::hardware_probe::LiveUtilizationState>,
     standby_listeners: &Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
+    start_time: Instant,
 ) -> Result<ConnectResult, String> {
     // Enforce TLS — only wss:// connections are allowed
     if !current_url.starts_with("wss://") {
@@ -529,6 +533,7 @@ async fn try_connect(
         static_caps,
         live_gpu,
         Some(&mut network_sampler),
+        start_time,
     );
     if let Ok(json) = serde_json::to_string(&health) {
         let _ = ws_write.send(Message::Text(json.into())).await;
@@ -586,7 +591,7 @@ async fn try_connect(
                         let mut payload = serde_json::json!({
                             "flows": flows_value,
                             "tunnels": tunnel_statuses,
-                            "uptime_secs": 0,
+                            "uptime_secs": start_time.elapsed().as_secs(),
                             "active_flows": flow_manager.active_flow_count(),
                             "total_flows": total_flows,
                             "system_resources": build_system_resources_payload(resource_state)
@@ -630,7 +635,7 @@ async fn try_connect(
                 let mut payload = serde_json::json!({
                     "flows": [],
                     "tunnels": tunnel_statuses,
-                    "uptime_secs": 0,
+                    "uptime_secs": start_time.elapsed().as_secs(),
                     "active_flows": flow_manager.active_flow_count(),
                     "total_flows": flow_manager.active_flow_count(),
                     "system_resources": build_system_resources_payload(resource_state)
@@ -705,6 +710,7 @@ async fn try_connect(
                         static_caps,
                         live_gpu,
                         Some(&mut network_sampler),
+                        start_time,
                     )
                 });
                 if let Ok(json) = serde_json::to_string(&pong) {
@@ -794,11 +800,12 @@ fn build_health_message(
     static_caps: &crate::engine::hardware_probe::StaticCapabilities,
     live_gpu: &crate::engine::hardware_probe::LiveUtilizationState,
     network_sampler: Option<&mut crate::util::network_interfaces::NetworkSampler>,
+    start_time: Instant,
 ) -> serde_json::Value {
     serde_json::json!({
         "type": "health",
         "timestamp": chrono::Utc::now().to_rfc3339(),
-        "payload": build_health_payload(flow_manager, api_addr, monitor_addr, resource_state, static_caps, live_gpu, network_sampler)
+        "payload": build_health_payload(flow_manager, api_addr, monitor_addr, resource_state, static_caps, live_gpu, network_sampler, start_time)
     })
 }
 
@@ -810,12 +817,13 @@ pub(crate) fn build_health_payload(
     static_caps: &crate::engine::hardware_probe::StaticCapabilities,
     live_gpu: &crate::engine::hardware_probe::LiveUtilizationState,
     network_sampler: Option<&mut crate::util::network_interfaces::NetworkSampler>,
+    start_time: Instant,
 ) -> serde_json::Value {
     #[allow(unused_mut)]
     let mut payload = serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
-        "uptime_secs": 0,
+        "uptime_secs": start_time.elapsed().as_secs(),
         "active_flows": flow_manager.active_flow_count(),
         "total_flows": flow_manager.active_flow_count(),
         "api_addr": api_addr,
@@ -1639,9 +1647,11 @@ async fn execute_command(
                     // Restart the flow on any recording-config change so the
                     // edit takes effect immediately.
                     let recording_changed = old_flow.recording != new_flow.recording;
+                    let master_clock_changed = old_flow.master_clock != new_flow.master_clock;
                     let restart_required = old_flow.bandwidth_limit != new_flow.bandwidth_limit
                         || content_analysis_changed
-                        || recording_changed;
+                        || recording_changed
+                        || master_clock_changed;
                     let persist_only_meta_changed = old_flow.name != new_flow.name
                         || old_flow.media_analysis != new_flow.media_analysis
                         || old_flow.thumbnail != new_flow.thumbnail;
@@ -1675,7 +1685,7 @@ async fn execute_command(
                         // change, or content-analysis / recording tier toggle
                         // — must restart entire flow.
                         tracing::info!(
-                            "Update flow '{flow_id}': restarting (input_touches_hitless={input_touches_hitless}, bandwidth_limit/content_analysis/recording changed={restart_required}, content_analysis_changed={content_analysis_changed}, recording_changed={recording_changed})"
+                            "Update flow '{flow_id}': restarting (input_touches_hitless={input_touches_hitless}, bandwidth_limit/content_analysis/recording/master_clock changed={restart_required}, content_analysis_changed={content_analysis_changed}, recording_changed={recording_changed}, master_clock_changed={master_clock_changed})"
                         );
                         let _ = flow_manager.destroy_flow(flow_id).await;
                         let resolved = {
@@ -2334,6 +2344,28 @@ async fn execute_command(
             let old_config = app_config.read().await.clone();
             let existing_secrets = SecretsConfig::extract_from(&old_config);
             existing_secrets.merge_into(&mut new_config);
+
+            // The manager doesn't manage these local-only fields. Preserve the
+            // node's existing values so an update_config push doesn't wipe
+            // operator-configured local settings.
+            if new_config.upgrades.is_none() {
+                new_config.upgrades = old_config.upgrades.clone();
+            }
+            if new_config.monitor.is_none() {
+                new_config.monitor = old_config.monitor.clone();
+            }
+            if new_config.resource_limits.is_none() {
+                new_config.resource_limits = old_config.resource_limits.clone();
+            }
+            if new_config.logging.is_none() {
+                new_config.logging = old_config.logging.clone();
+            }
+            if new_config.nmos_registration.is_none() {
+                new_config.nmos_registration = old_config.nmos_registration.clone();
+            }
+            if new_config.device_name.is_none() {
+                new_config.device_name = old_config.device_name.clone();
+            }
 
             validate_config(&new_config).map_err(|e| CommandError::from_validation("Invalid config", e))?;
             tracing::info!("Manager command: update_config (diff-based)");
@@ -3941,6 +3973,24 @@ async fn execute_command(
             runtime.stats.set_master_clock_lipsync(clamped);
             Ok(Some(serde_json::json!({
                 "lipsync_offset_90k": clamped,
+            })))
+        }
+        "reset_counters" => {
+            let flow_id = action["flow_id"].as_str().ok_or_else(|| {
+                CommandError::with_code("reset_counters: missing 'flow_id'", "missing_field")
+            })?;
+            let scope = action["scope"].as_str().unwrap_or("all");
+            let runtime = flow_manager.get_runtime(flow_id).ok_or_else(|| {
+                CommandError::with_code(
+                    format!("reset_counters: unknown flow '{flow_id}'"),
+                    "unknown_flow",
+                )
+            })?;
+            runtime.stats.reset_counters(scope);
+            tracing::info!(flow_id, scope, "operator reset counters");
+            Ok(Some(serde_json::json!({
+                "flow_id": flow_id,
+                "scope": scope,
             })))
         }
         _ => Err(CommandError::with_code(format!("Unknown command: {action_type}"), "unknown_action")),

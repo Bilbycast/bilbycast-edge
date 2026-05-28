@@ -67,7 +67,7 @@ async fn monitor_health(State(state): State<MonitorState>) -> Json<serde_json::V
                 .map(|m| format!("{}:{}", m.listen_addr, m.listen_port)),
         )
     };
-    let mut payload = crate::manager::client::build_health_payload(
+    let payload = crate::manager::client::build_health_payload(
         &state.app.flow_manager,
         &api_addr,
         monitor_addr.as_deref(),
@@ -75,17 +75,8 @@ async fn monitor_health(State(state): State<MonitorState>) -> Json<serde_json::V
         &state.static_caps,
         &state.live_gpu,
         None,
+        state.app.start_time,
     );
-    // Stamp uptime from the application's start_time so the SPA can
-    // render the system bar without a separate /api/v1/stats call.
-    if let Some(obj) = payload.as_object_mut() {
-        let uptime = state.app.start_time.elapsed().as_secs();
-        obj.insert("uptime_secs".into(), serde_json::json!(uptime));
-        obj.insert(
-            "active_flows".into(),
-            serde_json::json!(state.app.flow_manager.active_flow_count()),
-        );
-    }
     Json(payload)
 }
 

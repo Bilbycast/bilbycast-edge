@@ -861,23 +861,6 @@ async fn srt_output_forward_loop(
     let delay_sleep = tokio::time::sleep(Duration::from_secs(86400));
     tokio::pin!(delay_sleep);
 
-    // Per-output A/V alignment buffer.
-    let mut av_align_buf = if config.av_align {
-        let window_ms = config.av_align_window_ms.unwrap_or(100);
-        Some(crate::engine::ts_av_align::TsAvAlignBuffer::new(
-            crate::engine::ts_av_align::AlignConfig {
-                alignment_window_ms: window_ms,
-                tolerance_ms: 5,
-                max_hold_ms: window_ms * 2,
-                stream_presence_timeout_ms: 500,
-                capacity_packets: crate::engine::ts_av_align::TsAvAlignBuffer::initial_capacity(window_ms),
-            },
-        ))
-    } else {
-        None
-    };
-    let mut align_scratch: Vec<u8> = Vec::with_capacity(8192);
-
     let connection_lost = loop {
         if let Some(ref db) = delay_buf {
             if let Some(release_us) = db.next_release_time() {
@@ -1068,19 +1051,6 @@ async fn srt_output_forward_loop(
                                 Some(b) => b,
                                 None => continue,
                             }
-                        } else {
-                            payload
-                        };
-
-                        // A/V alignment: process the final TS payload
-                        // through the alignment buffer before queueing.
-                        let payload = if let Some(ref mut al) = av_align_buf {
-                            align_scratch.clear();
-                            al.process(&payload, &mut align_scratch);
-                            if align_scratch.is_empty() {
-                                continue;
-                            }
-                            Bytes::copy_from_slice(&align_scratch)
                         } else {
                             payload
                         };

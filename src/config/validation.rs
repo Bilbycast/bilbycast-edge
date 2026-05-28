@@ -3170,17 +3170,6 @@ fn validate_program_number(prog: Option<u16>, context: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_av_align_window(window: Option<u32>, output_id: &str) -> Result<()> {
-    if let Some(w) = window {
-        if !(20..=500).contains(&w) {
-            bail!(
-                "output '{}': av_align_window_ms must be 20..=500, got {}",
-                output_id, w
-            );
-        }
-    }
-    Ok(())
-}
 
 /// Validate an optional MPEG-TS PID remap table. Keys and values must be
 /// real user-range PIDs (0x0010–0x1FFE — reserved slots 0x0000..=0x000F,
@@ -4073,7 +4062,6 @@ pub fn validate_output_with_input(
                     bail!("RTP output '{}' redundancy: leg 1 ({}) and leg 2 ({}) must use the same address family", rtp.id, rtp.dest_addr, red.dest_addr);
                 }
             }
-            validate_av_align_window(rtp.av_align_window_ms, &rtp.id)?;
             if let Some(ref enc) = rtp.audio_encode {
                 if rtp.redundancy.is_some() {
                     bail!(
@@ -4163,7 +4151,6 @@ pub fn validate_output_with_input(
                     );
                 }
             }
-            validate_av_align_window(udp.av_align_window_ms, &udp.id)?;
             if let Some(ref enc) = udp.audio_encode {
                 if udp.transport_mode.as_deref() == Some("audio_302m") {
                     bail!(
@@ -4289,7 +4276,6 @@ pub fn validate_output_with_input(
                     }
                 }
             }
-            validate_av_align_window(srt.av_align_window_ms, &srt.id)?;
             if let Some(ref enc) = srt.audio_encode {
                 if srt.transport_mode.as_deref() == Some("audio_302m") {
                     bail!(
@@ -5481,7 +5467,6 @@ fn validate_rist_output(rist: &RistOutputConfig) -> Result<()> {
             );
         }
     }
-    validate_av_align_window(rist.av_align_window_ms, &rist.id)?;
     if let Some(ref enc) = rist.audio_encode {
         if rist.redundancy.is_some() {
             bail!(
@@ -7172,8 +7157,6 @@ mod tests {
             program_number: None,
             pid_map: None,
             delay: None,
-            av_align: true,
-            av_align_window_ms: None,
             audio_encode: None,
             transcode: None,
             video_encode: None,
@@ -7538,8 +7521,6 @@ mod tests {
             program_number: None,
             pid_map: None,
             delay: None,
-            av_align: true,
-            av_align_window_ms: None,
             audio_encode: None,
             transcode: None,
             video_encode: None,
@@ -7612,8 +7593,6 @@ mod tests {
             program_number: None,
             pid_map: None,
             delay: None,
-            av_align: true,
-            av_align_window_ms: None,
             audio_encode: None,
             transcode: None,
             video_encode: None,
@@ -7714,8 +7693,6 @@ mod tests {
             program_number: None,
             pid_map: None,
             delay: None,
-            av_align: true,
-            av_align_window_ms: None,
             audio_encode: None,
             transcode: None,
             video_encode: None,
@@ -7788,8 +7765,6 @@ mod tests {
             program_number: None,
             pid_map: None,
             delay: None,
-            av_align: true,
-            av_align_window_ms: None,
             audio_encode: None,
             transcode: None,
             video_encode: None,
@@ -7862,8 +7837,6 @@ mod tests {
             program_number: None,
             pid_map: None,
             delay: None,
-            av_align: true,
-            av_align_window_ms: None,
             audio_encode: None,
             transcode: None,
             video_encode: None,
@@ -9312,8 +9285,6 @@ mod tests {
             pid_map: None,
             transport_mode: None,
             delay: None,
-            av_align: true,
-            av_align_window_ms: None,
             audio_encode: None,
             transcode: None,
             video_encode: None,
@@ -9334,8 +9305,6 @@ mod tests {
             pid_map: None,
             transport_mode: None,
             delay: None,
-            av_align: true,
-            av_align_window_ms: None,
             audio_encode: None,
             transcode: None,
             video_encode: None,

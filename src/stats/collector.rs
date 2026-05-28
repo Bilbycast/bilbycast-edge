@@ -1168,7 +1168,6 @@ impl OutputStatsAccumulator {
             egress_summary: None,
             pcr_trust: self.pcr_trust.snapshot(),
             av_sync: self.av_sync.snapshot(),
-            av_align: None,
             display_stats,
             wire_pacing_tier: self.wire_pacing_tier.get().cloned(),
             wire_pacing_late: self.wire_pacing_late.load(Ordering::Relaxed),

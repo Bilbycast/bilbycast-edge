@@ -122,6 +122,14 @@ async fn lite_loop(
             }
 
             _ = publish_interval.tick() => {
+                if stats.reset_requested.compare_exchange(
+                    true, false,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                ).is_ok() {
+                    state = LiteState::new();
+                    tracing::info!(flow_id = %flow_id, "content-analysis Lite state reset by operator");
+                }
                 // Refresh the SMPTE timecode validator's fps from the
                 // MediaAnalyzer watch channel. 250 ms cadence is plenty
                 // fresh — fps changes once per encoder restart at most.

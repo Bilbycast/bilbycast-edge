@@ -729,6 +729,7 @@ async fn main() -> anyhow::Result<()> {
                 static_capabilities.clone(),
                 live_gpu_state.clone(),
                 Some(standby_listeners.clone()),
+                state.start_time,
             );
         }
     }

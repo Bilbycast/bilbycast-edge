@@ -30,58 +30,20 @@ KillSignal=SIGTERM
 TimeoutStopSec=20
 
 # ── Hardening ──
-ProtectSystem=strict
-# Writable paths: the install root (versions/, current symlink,
-# state.json), the data dir (replay segments, media library, etc.),
-# and the runtime tmp dir. Everything else is read-only.
-ReadWritePaths=/opt/bilbycast/edge /var/lib/bilbycast/edge /run/bilbycast
-ProtectHome=true
-PrivateTmp=true
 NoNewPrivileges=true
 # Allow opening DRI render nodes (VAAPI, KMS scanout for `display`)
-# and ALSA devices when those features are compiled in. Operators
-# who don't need the display output can drop these without affecting
-# the rest of the edge.
+# and ALSA devices when those features are compiled in.
 DeviceAllow=/dev/dri/card0 rwm
 DeviceAllow=/dev/dri/card1 rwm
 DeviceAllow=/dev/dri/renderD128 rwm
 DeviceAllow=/dev/dri/renderD129 rwm
 DeviceAllow=/dev/snd/* rwm
 SupplementaryGroups=video render audio
-# Capability set. We need exactly one capability:
-#
-#   CAP_NET_ADMIN — required by mainline kernel ≥ 6.x (and every recent
-#   Ubuntu / RHEL backport) for `setsockopt(SO_TXTIME)` with any non-
-#   `CLOCK_MONOTONIC` clockid. The wire-pacing path uses `CLOCK_TAI`
-#   (the only clockid the kernel ETF qdisc on Intel ice/igc/igb and
-#   Mellanox mlx5 will accept, and the natural choice when ptp4l +
-#   phc2sys are running). Without this cap, `enable_so_txtime` returns
-#   EPERM and `engine::wire_emit` silently falls back to the
-#   `clock_nanosleep` tier — degraded pacing precision (≈ 50–500 µs
-#   jitter vs sub-µs with NIC offload), and on any host where the ETF
-#   qdisc has `skip_sock_check off`, EVERY non-SO_TXTIME packet is
-#   also dropped at the qdisc — so the fallback path silently fails
-#   completely.
-#
-# CAP_NET_ADMIN does NOT let the edge install qdiscs (we still want
-# that to be operator-side at provision time via `setup-etf-qdisc.sh`)
-# — it only unlocks the per-socket setsockopt path.
+# CAP_NET_ADMIN — required by kernel ≥ 6.x for setsockopt(SO_TXTIME)
+# with CLOCK_TAI. Without it, wire-emit falls back to clock_nanosleep.
 CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN
-RestrictNamespaces=true
-# `wire_emit` uses SCHED_FIFO best-effort on its egress thread for
-# sub-100 µs `clock_nanosleep` precision (the alternative is the
-# tokio timer wheel's ~1–5 ms ceiling, which is too coarse for
-# PCR-anchored pacing). RestrictRealtime=true would block this. Pair
-# with `LimitRTPRIO=99` below — the kernel allows unprivileged
-# `sched_setscheduler(SCHED_FIFO)` whenever the requested priority
-# is at or below RLIMIT_RTPRIO, so we don't need to grant
-# `CAP_SYS_NICE`. Wire_emit logs at debug and falls back to default
-# scheduler if the priority change is denied, so there is no hard
-# failure path.
 RestrictRealtime=false
-LockPersonality=true
-MemoryDenyWriteExecute=false  # JIT crates exist (rustls, ring) — leave on default
 SystemCallArchitectures=native
 
 # Resource limits — generous defaults; operators can tune via drop-in
