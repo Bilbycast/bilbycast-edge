@@ -557,11 +557,6 @@ const DEFAULT_MAX_BUFFER_PACKETS: usize = 12_000;
 /// health to Down. Below this, missing packets only count as Degraded.
 const LEG_DOWN_THRESHOLD: Duration = Duration::from_millis(1000);
 
-/// Re-anchor when |virtual_seq - anchor_virtual| exceeds this. Prevents
-/// the i64 from drifting toward overflow over very long-running flows
-/// with sustained traffic.
-const REANCHOR_THRESHOLD: i64 = 1_000_000;
-
 impl<T: Clone> BufferedHitlessMerger<T> {
     pub fn new(max_path_diff: Duration) -> Self {
         let bounded = if max_path_diff > MAX_PATH_DIFF_BOUND {
@@ -584,9 +579,18 @@ impl<T: Clone> BufferedHitlessMerger<T> {
     }
 
     /// Project a `u16` wire seq onto a monotonically-increasing `i64`
-    /// virtual seq. Wraparound is preserved by sign-extending the
-    /// difference from the current anchor. Re-anchors lazily when the
-    /// differential exceeds [`REANCHOR_THRESHOLD`].
+    /// virtual seq. Wraparound is preserved by sign-extending the wrapping
+    /// `u16` distance from the current anchor.
+    ///
+    /// The anchor slides forward continuously: whenever a seq is at or
+    /// ahead of the anchor (`diff > 0`) it becomes the new anchor. This
+    /// keeps `|diff|` bounded by the realistic reorder window on every
+    /// call. The previous lazy re-anchor (only past a 1_000_000 threshold)
+    /// could never fire because `diff` was first truncated through `as i16`
+    /// to `[-32768, 32767]`, so after 32_768 packets the cast wrapped
+    /// negative and the virtual seq sawtoothed — the drain cursor then
+    /// dropped every later packet as a late gap-fill and emission froze at
+    /// exactly 0x8000 (cell16, 2026-05-21).
     fn project(&mut self, seq: u16) -> i64 {
         if !self.anchor_set {
             self.anchor_real = seq;
@@ -596,7 +600,7 @@ impl<T: Clone> BufferedHitlessMerger<T> {
         }
         let diff = seq.wrapping_sub(self.anchor_real) as i16 as i64;
         let virt = self.anchor_virtual + diff;
-        if diff.abs() > REANCHOR_THRESHOLD {
+        if diff > 0 {
             self.anchor_real = seq;
             self.anchor_virtual = virt;
         }
@@ -1074,6 +1078,49 @@ mod buffered_tests {
             m.stats.late_dropped.load(Ordering::Relaxed),
             dropped_before + 1,
             "the rejected gap-fill should bump late_dropped"
+        );
+    }
+
+    /// Regression for the 2026-05-21 cell16 stall: a long-running flow with
+    /// a small path differential must keep emitting past the 32 768-packet
+    /// (`i16` half-range) mark. The broken `project()` cast the wrapping
+    /// `u16` distance through `as i16`, so after 32 768 packets the virtual
+    /// seq sawtoothed negative; the drain cursor then dropped every
+    /// subsequent packet as a "late gap-fill" and `packets_emitted` froze at
+    /// exactly 0x8000. With the continuous re-anchor the virtual seq stays
+    /// monotonic and emission never stalls.
+    #[test]
+    fn long_run_does_not_stall_at_i16_halfrange() {
+        // path_diff 0 → each ingest drains immediately (one packet in, one
+        // out). Start at an arbitrary ISN so we cross both the u16 wrap and
+        // the old 32 768 boundary.
+        let mut m = BufferedHitlessMerger::<u16>::new(Duration::from_millis(0));
+        let t0 = Instant::now();
+        let isn: u16 = 0xF000;
+        let total: usize = 40_000;
+        let mut emitted = 0u64;
+        for i in 0..total {
+            let seq = isn.wrapping_add(i as u16);
+            let out = m.ingest(seq, ActiveLeg::Leg1, pkt(seq), t0);
+            emitted += out.len() as u64;
+        }
+        // Flush anything still held (path_diff 0 means nothing should be).
+        let out = m.drain_expired(t0 + Duration::from_secs(1));
+        emitted += out.len() as u64;
+        assert_eq!(
+            emitted, total as u64,
+            "merger stalled — emitted {emitted} of {total} (froze at the \
+             i16 half-range; see cell16 2026-05-21)"
+        );
+        assert_eq!(
+            m.stats.packets_emitted.load(Ordering::Relaxed),
+            total as u64
+        );
+        assert_eq!(
+            m.stats.late_dropped.load(Ordering::Relaxed),
+            0,
+            "no packet should be dropped as a late gap-fill on a clean \
+             sequential stream"
         );
     }
 
