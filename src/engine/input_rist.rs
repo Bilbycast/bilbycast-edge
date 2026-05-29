@@ -21,14 +21,13 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use rist_transport::{RistSocket, RistSocketConfig};
+use rist_transport::{RistDelivered, RistSocket, RistSocketConfig};
 
 use crate::config::models::RistInputConfig;
 use crate::manager::events::{EventSender, EventSeverity, category};
@@ -228,7 +227,6 @@ async fn rist_input_loop(
         flow_id,
     );
 
-    let mut seq_counter: u16 = 0;
     let mut ts_counter: u32 = 0;
 
     loop {
@@ -238,14 +236,13 @@ async fn rist_input_loop(
                 socket.close();
                 return Ok(());
             }
-            recv = socket.recv() => {
+            recv = socket.recv_delivered() => {
                 match recv {
-                    Some(data) => {
+                    Some(delivered) => {
                         publish(
-                            &data,
+                            &delivered,
                             &broadcast_tx,
                             &stats,
-                            &mut seq_counter,
                             &mut ts_counter,
                             transcoder,
                             post,
@@ -263,21 +260,23 @@ async fn rist_input_loop(
 }
 
 fn publish(
-    data: &Bytes,
+    delivered: &RistDelivered,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     stats: &Arc<FlowStatsAccumulator>,
-    seq_counter: &mut u16,
     ts_counter: &mut u32,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) {
-    let seq = *seq_counter;
-    *seq_counter = seq_counter.wrapping_add(1);
+    let data = &delivered.data;
+    // Use the wire RTP sequence number (RIST delivers in seq order) so a
+    // downstream Hitless slot pairing this input with a peer can run the
+    // seq-aware 2022-7 path.
+    let seq = delivered.rtp_seq;
     // RFC 2250 §3.5 — 90 kHz media-clock RTP timestamp from PCR;
     // falls back to last-seen value when this datagram doesn't carry a
     // PCR-bearing TS packet.
     if let Some(pcr_27mhz) =
-        crate::engine::input_srt::scan_first_pcr_in_datagram(&data)
+        crate::engine::input_srt::scan_first_pcr_in_datagram(data)
     {
         *ts_counter = (pcr_27mhz / 300) as u32;
     }
@@ -294,14 +293,31 @@ fn publish(
         data: data.clone(),
         sequence_number: seq,
         rtp_timestamp: *ts_counter,
-        recv_time_us: now_us(),
+        // True UDP arrival in the edge's now_us() epoch, reconstructed from
+        // the pre-reorder-hold arrival the delivery thread surfaced. This is
+        // the cadence the source-PCR PLL must see to lock — stamping
+        // now_us() here (post-1s-hold delivery) instead bakes in the hold +
+        // drain jitter and prevents lock. Keeps now_us()-relative latency
+        // calcs (audio_transcode, wire_emit) honest too.
+        recv_time_us: recv_time_from_arrival(delivered.arrival),
         is_raw_ts: true,
-        upstream_seq: None,
+        upstream_seq: Some(seq),
         upstream_leg_id: None,
         sender_timestamp_us: None,
     };
 
     publish_input_packet_with_post(transcoder, post, broadcast_tx, packet);
+}
+
+/// Reconstruct a packet's true UDP-arrival time in the edge's `now_us()`
+/// epoch from the pre-reorder-hold `arrival` Instant the RIST delivery
+/// thread surfaced: `now_us() - (now - arrival)`.
+#[inline]
+fn recv_time_from_arrival(arrival: Instant) -> u64 {
+    let age_us = Instant::now()
+        .saturating_duration_since(arrival)
+        .as_micros() as u64;
+    now_us().saturating_sub(age_us)
 }
 
 async fn rist_input_redundant_loop(
@@ -368,8 +384,6 @@ async fn rist_input_redundant_loop(
     );
 
     let mut merger = HitlessMerger::new();
-    let mut seq_counter_leg1: u16 = 0;
-    let mut seq_counter_leg2: u16 = 0;
     let mut ts_counter: u32 = 0;
 
     loop {
@@ -380,10 +394,10 @@ async fn rist_input_redundant_loop(
                 socket_leg2.close();
                 return Ok(());
             }
-            recv = socket_leg1.recv() => match recv {
-                Some(data) => handle_redundant_leg(
-                    &data, ActiveLeg::Leg1, &mut merger,
-                    &mut seq_counter_leg1, &mut ts_counter,
+            recv = socket_leg1.recv_delivered() => match recv {
+                Some(delivered) => handle_redundant_leg(
+                    &delivered, ActiveLeg::Leg1, &mut merger,
+                    &mut ts_counter,
                     &broadcast_tx, &stats, transcoder, post,
                 ),
                 None => {
@@ -391,10 +405,10 @@ async fn rist_input_redundant_loop(
                     return Ok(());
                 }
             },
-            recv = socket_leg2.recv() => match recv {
-                Some(data) => handle_redundant_leg(
-                    &data, ActiveLeg::Leg2, &mut merger,
-                    &mut seq_counter_leg2, &mut ts_counter,
+            recv = socket_leg2.recv_delivered() => match recv {
+                Some(delivered) => handle_redundant_leg(
+                    &delivered, ActiveLeg::Leg2, &mut merger,
+                    &mut ts_counter,
                     &broadcast_tx, &stats, transcoder, post,
                 ),
                 None => {
@@ -407,18 +421,23 @@ async fn rist_input_redundant_loop(
 }
 
 fn handle_redundant_leg(
-    data: &Bytes,
+    delivered: &RistDelivered,
     leg: ActiveLeg,
     merger: &mut HitlessMerger,
-    leg_seq: &mut u16,
     ts_counter: &mut u32,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     stats: &Arc<FlowStatsAccumulator>,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) {
-    let seq = *leg_seq;
-    *leg_seq = leg_seq.wrapping_add(1);
+    let data = &delivered.data;
+    // Use the REAL wire RTP sequence number. SMPTE 2022-7 mandates both
+    // legs carry the same seq for the same packet, which is exactly what
+    // HitlessMerger needs for cross-leg dedup + gap-fill. (The old
+    // synthetic per-leg counters made leg1's "seq N" and leg2's "seq N"
+    // different packets, so the merger could never recognise duplicates or
+    // fill a cross-leg gap — it degenerated to whichever leg ran ahead.)
+    let seq = delivered.rtp_seq;
 
     stats.input_packets.fetch_add(1, Ordering::Relaxed);
     stats.input_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -435,19 +454,24 @@ fn handle_redundant_leg(
     // RFC 2250 §3.5 — 90 kHz media-clock RTP timestamp from PCR;
     // falls back to last-seen value on datagrams without PCR.
     if let Some(pcr_27mhz) =
-        crate::engine::input_srt::scan_first_pcr_in_datagram(&data)
+        crate::engine::input_srt::scan_first_pcr_in_datagram(data)
     {
         *ts_counter = (pcr_27mhz / 300) as u32;
     }
 
+    let upstream_leg_id = match leg {
+        ActiveLeg::Leg1 => Some(0u8),
+        ActiveLeg::Leg2 => Some(1u8),
+        ActiveLeg::None => None,
+    };
     let packet = RtpPacket {
         data: data.clone(),
         sequence_number: seq,
         rtp_timestamp: *ts_counter,
-        recv_time_us: now_us(),
+        recv_time_us: recv_time_from_arrival(delivered.arrival),
         is_raw_ts: true,
-        upstream_seq: None,
-        upstream_leg_id: None,
+        upstream_seq: Some(seq),
+        upstream_leg_id,
         sender_timestamp_us: None,
     };
 
