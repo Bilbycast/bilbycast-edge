@@ -109,7 +109,18 @@ ensure_dirs() {
 }
 
 iface_has_hw_ptp() {
-    ethtool -T "$1" 2>/dev/null | grep -qE "PTP Hardware Clock: [0-9]+"
+    # Detect a usable PTP hardware clock across ethtool output formats:
+    #   ethtool < 6.x:  "PTP Hardware Clock: 1"                ("none" when absent)
+    #   ethtool >= 6.x: "Hardware timestamp provider index: 1" ("-1"  when absent)
+    # Older releases only printed the first form; ethtool 6.x renamed it.
+    # Matching just the legacy string silently demotes modern E810/CX NICs to
+    # software timestamping, whose TX-timestamp path faults ("timed out while
+    # polling for tx timestamp") and flaps the grandmaster MASTER<->FAULTY.
+    local out
+    out="$(ethtool -T "$1" 2>/dev/null)" || return 1
+    printf '%s\n' "$out" | grep -qE 'PTP Hardware Clock: [0-9]+' && return 0
+    printf '%s\n' "$out" | grep -qE 'Hardware timestamp provider index: [0-9]+' && return 0
+    return 1
 }
 
 iface_link_up() {
