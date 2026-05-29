@@ -93,6 +93,24 @@ struct PacerMsg {
     /// thread re-anchors `iter_start_wall` whenever this differs from
     /// its last-seen value.
     bitrate_bps: u64,
+    /// Number of **source** TS bytes this message represents — i.e. how
+    /// much file-content was consumed to produce `pkt`, *including* bytes
+    /// from any preceding source bundles the transcoder buffered without
+    /// emitting (decode reorder + encoder latency). The pacer derives this
+    /// message's wall-clock duration as `content_src_bytes * 8 / bitrate_bps`.
+    ///
+    /// **Why not pace by a fixed `BUNDLE_SIZE`?** In passthrough every
+    /// emitted message is exactly one `BUNDLE_SIZE` source bundle, so a
+    /// fixed slice was accidentally correct. With an input-level transcoder
+    /// the emitted-message count diverges from the source-bundle count
+    /// (the transcoder buffers, then flushes several frames in one call),
+    /// so a fixed-`BUNDLE_SIZE` slice under-times the merged messages and
+    /// the file plays ~2 % fast (measured: Sky-Witness 1080i25 looped in
+    /// ~167.5 s instead of 171.5 s; wire PCR ran +20 000 ppm vs wallclock,
+    /// breaking receiver clock recovery -> audio dropout). Crediting each
+    /// message with the actual source bytes it carries conserves content
+    /// time exactly, independent of how the transcoder chunks its output.
+    content_src_bytes: u64,
 }
 
 /// Public entry point. Matches the signature shape of `input_test_pattern`
@@ -776,6 +794,10 @@ async fn play_ts_file(
     let mut window_byte_pos: u64 = 0;
     let mut current_bitrate_bps: u64 = pacer_initial_bitrate;
     let mut bytes_emitted: u64 = 0;
+    // Source bytes the transcoder buffered without emitting yet. Credited to
+    // the next emitted message so the pacer's content clock stays conserved
+    // even though the transcoder emits fewer messages than source bundles.
+    let mut pending_src_bytes: u64 = 0;
     // MPTS guard: lock onto the first PCR-bearing PID for every
     // pacing/anchoring computation. An MPTS file has one independent
     // 27 MHz clock per program; mixing PCRs from multiple PIDs into a
@@ -1047,7 +1069,15 @@ async fn play_ts_file(
         bundle.extend_from_slice(&packet);
         if bundle.len() >= BUNDLE_SIZE {
             bytes_emitted = bytes_emitted.saturating_add(BUNDLE_SIZE as u64);
-            if !emit_to_pacer(&mut bundle, session, &pacer_tx, current_bitrate_bps).await {
+            if !emit_to_pacer(
+                &mut bundle,
+                session,
+                &pacer_tx,
+                current_bitrate_bps,
+                &mut pending_src_bytes,
+            )
+            .await
+            {
                 break;
             }
         }
@@ -1055,7 +1085,14 @@ async fn play_ts_file(
 
     // Flush the trailing partial bundle so we don't lose the file's tail.
     if !bundle.is_empty() {
-        let _ = emit_to_pacer(&mut bundle, session, &pacer_tx, current_bitrate_bps).await;
+        let _ = emit_to_pacer(
+            &mut bundle,
+            session,
+            &pacer_tx,
+            current_bitrate_bps,
+            &mut pending_src_bytes,
+        )
+        .await;
     }
 
     // Carry the converged cumulative rate to the next loop so the pacer
@@ -1755,6 +1792,10 @@ async fn emit_to_pacer(
     session: &mut PlayerSession<'_>,
     pacer_tx: &std::sync::mpsc::SyncSender<PacerMsg>,
     bitrate_bps: u64,
+    // Source bytes consumed by transcoder calls that buffered (returned
+    // nothing). Carried across calls so the next message that DOES emit is
+    // credited with the full source-content it represents — see `PacerMsg`.
+    pending_src_bytes: &mut u64,
 ) -> bool {
     if bundle.is_empty() {
         return true;
@@ -1789,8 +1830,19 @@ async fn emit_to_pacer(
         pkt,
     ) {
         Some(p) => p,
-        None => return true,
+        None => {
+            // Transcoder buffered this bundle without emitting. Remember its
+            // source bytes so the next emitted message is paced for the full
+            // content it carries; emitting nothing now keeps the pacer's
+            // content clock conserved rather than dropping this slice's time.
+            *pending_src_bytes = pending_src_bytes.saturating_add(total_len as u64);
+            return true;
+        }
     };
+
+    // This message carries its own source bundle plus any buffered ones.
+    let content_src_bytes = pending_src_bytes.saturating_add(total_len as u64);
+    *pending_src_bytes = 0;
 
     // Hand off to the OS-thread pacer. On `Full`, yield and retry — the
     // pacer drains at file-bitrate (~2.1 ms per bundle at 5 Mbps), so
@@ -1798,6 +1850,7 @@ async fn emit_to_pacer(
     let mut to_send = PacerMsg {
         pkt: processed,
         bitrate_bps,
+        content_src_bytes,
     };
     loop {
         if session.cancel.is_cancelled() {
@@ -1876,9 +1929,20 @@ fn run_paced_emitter(
         if msg.bitrate_bps != 0 {
             bitrate_bps = msg.bitrate_bps;
         }
-        bytes_emitted = bytes_emitted.saturating_add(BUNDLE_SIZE as u64);
+        // Pace by the SOURCE content this message represents, not a fixed
+        // `BUNDLE_SIZE`. In passthrough `content_src_bytes == BUNDLE_SIZE`
+        // (1 message per source bundle) so behaviour is unchanged; with an
+        // input transcoder the count carries any buffered-then-merged source
+        // bundles, so the file plays at true 1.0x instead of ~2 % fast.
+        // Fall back to BUNDLE_SIZE if a producer ever sends 0 (defensive).
+        let content_bytes = if msg.content_src_bytes != 0 {
+            msg.content_src_bytes
+        } else {
+            BUNDLE_SIZE as u64
+        };
+        bytes_emitted = bytes_emitted.saturating_add(content_bytes);
         let bundle_period_ns =
-            (BUNDLE_SIZE as u64).saturating_mul(8_000_000_000) / bitrate_bps.max(1);
+            content_bytes.saturating_mul(8_000_000_000) / bitrate_bps.max(1);
         let target_ns = next_target_wall;
         // Advance the running target for the next bundle. If the actual
         // fire wallclock catches up to (or passes) `next_target_wall`
