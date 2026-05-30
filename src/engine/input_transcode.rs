@@ -130,14 +130,21 @@ impl InputTranscoder {
             return Ok(None);
         }
 
-        // Realign audio→video only when video is transcoded (that's the path
-        // with the deep encode pipeline). Audio-only transcode leaves video as
-        // passthrough — no added video latency to compensate for.
-        let realign = if video.is_some() {
-            Some(crate::engine::ts_av_realign::TsAvRealigner::new())
-        } else {
-            None
-        };
+        // A/V emission realigner — DISABLED pending a redesign.
+        //
+        // The intent was to hold audio and release it gated on video PTS so it
+        // stops running ~0.5 s ahead of its (deep-HW-pipeline-delayed) video.
+        // The broadcast-readiness codec matrix (2026-05-30) showed the
+        // byte-stream batch-release approach is too source-dependent: it helped
+        // some sources (sky-witness: audio_pts−PCR 598→208 ms) but OVER-HELD on
+        // others (sync-test 1080p25→hevc_qsv: −133 ms ⇒ audio LATE, dropped by a
+        // strict T-STD decoder). Neither per-frame draining nor a PCR floor
+        // fixed sync-test — the interleaving fundamentally fights the bursty,
+        // pipelined transcode output. An audio-EARLY stream is benign (PTS are
+        // correct; receivers buffer it; never late), so we keep that safe state
+        // rather than risk audio drops. The module + tests are retained for a
+        // future PTS-ordered-merge implementation. See ts_av_realign.rs.
+        let realign: Option<crate::engine::ts_av_realign::TsAvRealigner> = None;
 
         Ok(Some(Self {
             audio,

@@ -43,6 +43,12 @@ const SYNC_BYTE: u8 = 0x47;
 /// instead of the ~0.5 s *early* the raw transcode produces. 150 ms.
 const LEAD_90K: i64 = 150 * 90;
 
+/// Hard floor: audio is force-released once its PTS is within this of the
+/// current PCR, so it always leaves at least ~this far ahead of PCR and can
+/// never arrive late (a strict T-STD receiver drops late audio). Catches any
+/// source where the video gate over-holds. 120 ms.
+const LATE_FLOOR_MS: i64 = 120;
+
 /// Hard cap on held audio packets before force-release (safety net so a
 /// stalled / absent video PID can never grow the queue unbounded). ~6 s of
 /// 192 kbps MP2-in-TS.
@@ -70,6 +76,11 @@ pub struct TsAvRealigner {
     audio_pids: HashSet<u16>,
     latest_video_pts: u64,
     have_video_pts: bool,
+    /// Latest PCR seen (90 kHz), from the PCR-bearing (video) PID. The drain
+    /// floor uses it to guarantee audio is NEVER held past the point where it
+    /// would arrive late (audio_pts < PCR ⇒ a strict receiver drops it).
+    latest_pcr_90k: u64,
+    have_pcr: bool,
     /// Newest audio PES PTS seen — drives the stall safety bound.
     latest_audio_pts: u64,
     have_audio_pts: bool,
@@ -95,6 +106,8 @@ impl TsAvRealigner {
             audio_pids: HashSet::with_capacity(4),
             latest_video_pts: 0,
             have_video_pts: false,
+            latest_pcr_90k: 0,
+            have_pcr: false,
             latest_audio_pts: 0,
             have_audio_pts: false,
             cur_pes_pts: std::collections::HashMap::with_capacity(4),
@@ -136,8 +149,10 @@ impl TsAvRealigner {
                 }
             }
             // The PCR PID is the video PID (transcoder forces PCR→video).
-            if extract_pcr(pkt).is_some() {
+            if let Some(pcr_27) = extract_pcr(pkt) {
                 self.video_pid = Some(pid);
+                self.latest_pcr_90k = pcr_27 / 300;
+                self.have_pcr = true;
             }
 
             let is_video = Some(pid) == self.video_pid;
@@ -190,10 +205,17 @@ impl TsAvRealigner {
         while let Some(front) = self.pending.front() {
             let reached = self.have_video_pts
                 && pts_delta_ms(self.latest_video_pts, front.pts_90k) >= -(LEAD_90K / 90);
+            // PCR floor — the hard safety: never hold audio past the point
+            // where it would arrive late. Release once the audio PES PTS is
+            // within LATE_FLOOR_MS of the current PCR, so audio always leaves
+            // at least ~LATE_FLOOR_MS ahead of PCR regardless of why the video
+            // gate may have over-held (source-dependent pipeline behaviour).
+            let near_late = self.have_pcr
+                && pts_delta_ms(front.pts_90k, self.latest_pcr_90k) <= LATE_FLOOR_MS;
             let stalled_too_long = self.have_audio_pts
                 && pts_delta_ms(self.latest_audio_pts, front.pts_90k) > MAX_HOLD_MS;
             let too_many = self.pending.len() > MAX_HELD_PKTS;
-            if flush_all || reached || stalled_too_long || too_many {
+            if flush_all || reached || near_late || stalled_too_long || too_many {
                 let p = self.pending.pop_front().unwrap();
                 output.extend_from_slice(&p.bytes);
             } else {
