@@ -314,6 +314,13 @@ pub struct TsAudioReplacer {
     /// master vs uncorrelated source, or PLL pre-lock garbage) — the
     /// re-anchor only kicks in when the two agree to within 10 s.
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+
+    /// Shared latest-emitted-audio-output-PTS (90 kHz), read by the co-running
+    /// `TsVideoReplacer` to floor the regenerated PCR on min(video, audio) so
+    /// the audio is never stamped behind PCR (T-STD late ⇒ dropped). Written
+    /// here on every emitted audio PES. `None` ⇒ no PCR flooring (audio-only
+    /// transcode / video passthrough needs none).
+    audio_pts_out: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl TsAudioReplacer {
@@ -398,6 +405,7 @@ impl TsAudioReplacer {
             transcoder: None,
             external_reset: Arc::new(AtomicBool::new(false)),
             av_sync_pacer: None,
+            audio_pts_out: None,
         })
     }
 
@@ -414,6 +422,16 @@ impl TsAudioReplacer {
         pacer: Arc<crate::engine::av_sync_mux::AvSyncPacer>,
     ) {
         self.av_sync_pacer = Some(pacer);
+    }
+
+    /// Wire the shared latest-emitted-audio-PTS handle the co-running
+    /// `TsVideoReplacer` reads to floor its regenerated PCR on
+    /// min(video, audio). Both replacers get the same `Arc`.
+    pub fn set_audio_pts_floor(
+        &mut self,
+        floor: Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        self.audio_pts_out = Some(floor);
     }
 
     /// Attach a per-input PCR forward-jump signal `Arc<AtomicI64>`,
@@ -1622,6 +1640,10 @@ impl TsAudioReplacer {
                                         / sr as u64,
                                 )
                             };
+                            // Publish for the video replacer's PCR floor.
+                            if let Some(h) = self.audio_pts_out.as_ref() {
+                                h.store(pts_for_pes, std::sync::atomic::Ordering::Relaxed);
+                            }
                             let pes = build_audio_pes(&encoded.bytes, pts_for_pes);
                             let pkts = packetize_ts(audio_pid, &pes, &mut self.out_audio_cc);
                             for p in &pkts {
@@ -1671,6 +1693,10 @@ impl TsAudioReplacer {
                                             / sr as u64,
                                     )
                                 };
+                                // Publish for the video replacer's PCR floor.
+                                if let Some(h) = self.audio_pts_out.as_ref() {
+                                    h.store(pts_for_pes, std::sync::atomic::Ordering::Relaxed);
+                                }
                                 let pes = build_audio_pes(&ef.data, pts_for_pes);
                                 let pkts =
                                     packetize_ts(audio_pid, &pes, &mut self.out_audio_cc);

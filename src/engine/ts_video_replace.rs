@@ -194,6 +194,23 @@ impl TsVideoReplacer {
             let _ = pacer;
         }
     }
+
+    /// Wire the shared latest-emitted-audio-PTS handle so the regenerated PCR
+    /// can be floored on `min(video_pts, audio_pts)` (see the field doc). The
+    /// co-running `TsAudioReplacer` writes the same `Arc`.
+    pub fn set_audio_pts_floor(
+        &mut self,
+        floor: Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        #[cfg(feature = "media-codecs")]
+        {
+            self.inner.audio_pts_floor = Some(floor);
+        }
+        #[cfg(not(feature = "media-codecs"))]
+        {
+            let _ = floor;
+        }
+    }
 }
 
 impl TsVideoReplacer {
@@ -516,6 +533,23 @@ mod inner {
         /// preserved. Phase 4 of the sync-mux work.
         pub av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 
+        /// Shared latest-emitted-audio-output-PTS (90 kHz), written by the
+        /// co-running `TsAudioReplacer`. Used to FLOOR the regenerated PCR on
+        /// `min(video_pts, audio_pts)`: when the source muxes audio behind its
+        /// video by more than the 80 ms pre-roll, a video-only PCR
+        /// (`video_pts − preroll`) overtakes the audio (`audio_pts < PCR`) and
+        /// a strict T-STD decoder drops it. Flooring keeps `audio_pts ≥ PCR`
+        /// without moving any PES PTS, so lipsync is untouched. `None` (or a
+        /// stored 0 = unset) ⇒ PCR is byte-identical to the video-only path.
+        pub audio_pts_floor: Option<Arc<std::sync::atomic::AtomicU64>>,
+
+        /// Smoothed audio-behind-video lag (90 kHz) used to lower the PCR
+        /// without coupling it to the jittery per-frame audio PTS. Jumps UP
+        /// immediately to the current lag (so PCR never overtakes the audio)
+        /// and decays SLOWLY (so the PCR rate stays smooth → PCR_AC stays
+        /// tier-2). PCR = video_pts − this; equals video_pts when audio leads.
+        pub pcr_audio_lag_90k: u64,
+
         /// Optional input-side `video_decode_stats` handle the replacer
         /// keeps refreshing as the PMT learns the source codec / geometry.
         /// Set by ingress-side callers via
@@ -648,6 +682,8 @@ mod inner {
                 last_emitted_pts_90k: None,
                 hw_decode_pref: cfg.hw_decode.unwrap_or_default(),
                 av_sync_pacer: None,
+                audio_pts_floor: None,
+                pcr_audio_lag_90k: 0,
                 input_decode_handle: None,
                 out_psi_version: 1,
             })
@@ -1221,9 +1257,44 @@ mod inner {
                     // identical PCR sequence regardless of internal
                     // pipeline depth, and multi-edge plants on the same
                     // PTP/source PCR stay coherent.
+                    // Floor the PCR on min(video_pts, latest_audio_pts) so it
+                    // never overtakes the audio. When the source muxes audio
+                    // behind video by more than the 80 ms pre-roll, a
+                    // video-only PCR makes audio_pts < PCR ⇒ the audio is
+                    // dropped by a strict T-STD decoder. Flooring moves only
+                    // the PCR (receiver STC reference), not any PES PTS, so
+                    // lipsync is unchanged; on the common audio-leads case
+                    // min == video_pts and the PCR is byte-identical to before.
+                    // Signed-delta compare is 33-bit-wrap-safe.
+                    let pcr_pts = match self.audio_pts_floor.as_ref() {
+                        Some(h) => {
+                            let a = h.load(std::sync::atomic::Ordering::Relaxed);
+                            if a != 0 {
+                                // How far is the audio behind THIS video frame
+                                // (≥ 0; 0 when audio leads). Signed-delta is
+                                // 33-bit-wrap-safe.
+                                let cur_lag = (pts_for_pes as i64)
+                                    .wrapping_sub(a as i64)
+                                    .max(0) as u64;
+                                // Jump up to cur_lag immediately (PCR never
+                                // overtakes audio); decay slowly so the PCR
+                                // rate stays smooth (PCR_AC tier-2). ~1/32
+                                // frame per frame.
+                                let decay = (self.pts_step_90k / 32).max(1);
+                                self.pcr_audio_lag_90k = self
+                                    .pcr_audio_lag_90k
+                                    .saturating_sub(decay)
+                                    .max(cur_lag);
+                                pts_for_pes.wrapping_sub(self.pcr_audio_lag_90k)
+                            } else {
+                                pts_for_pes
+                            }
+                        }
+                        None => pts_for_pes,
+                    };
                     let pcr_27mhz = crate::engine::av_sync_mux::pcr_for_emit(
                         self.av_sync_pacer.as_ref(),
-                        pts_for_pes,
+                        pcr_pts,
                     );
                     // Inter-PCR cadence here is whatever the encoder's
                     // PUSI cadence gives us — at typical broadcast frame

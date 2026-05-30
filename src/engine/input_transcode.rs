@@ -113,14 +113,29 @@ impl InputTranscoder {
             return Ok(None);
         }
 
-        let audio = match audio_encode {
+        let mut audio = match audio_encode {
             Some(ae) => Some(TsAudioReplacer::new(ae, transcode.cloned())?),
             None => None,
         };
-        let video = match video_encode {
+        let mut video = match video_encode {
             Some(ve) => Some(TsVideoReplacer::new(ve, force_idr)?),
             None => None,
         };
+
+        // Floor the regenerated PCR on min(video_pts, audio_pts) so the audio
+        // is never stamped behind PCR (a strict T-STD decoder drops late
+        // audio). This only matters when BOTH stages transcode: the video
+        // stage regenerates the PCR (video_pts − preroll), and when the source
+        // muxes audio behind its video by more than the 80 ms pre-roll the PCR
+        // overtakes the audio. The shared handle lets the audio stage publish
+        // its emitted PTS so the video stage can floor on it. Moves only the
+        // PCR, not any PES PTS — lipsync unchanged; byte-identical when audio
+        // leads. (Root-caused via the broadcast-readiness codec matrix.)
+        if let (Some(a), Some(v)) = (audio.as_mut(), video.as_mut()) {
+            let floor = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            a.set_audio_pts_floor(floor.clone());
+            v.set_audio_pts_floor(floor);
+        }
 
         // If `transcode` is set but `audio_encode` is not, the transcode block
         // has no encoder to feed — ignore silently to match the output-side
