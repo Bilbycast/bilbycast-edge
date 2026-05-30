@@ -8827,20 +8827,23 @@ mod tests {
             hw_decode: None,
              source_video_pid: None,
         };
-        let err = validate_video_encode(&make(Some(1281), Some(720)), "ctx")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("must be even"), "expected even-width error, got: {err}");
-        let err = validate_video_encode(&make(Some(1280), Some(721)), "ctx")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("must be even"), "expected even-height error, got: {err}");
+        // Odd dimensions must be rejected in EVERY build. With x264 compiled
+        // the parity check is reached and surfaces the specific "must be even"
+        // message; on a default build (no x264) the earlier backend-feature
+        // gate rejects first — still an error, which is all the config layer
+        // needs. Mirrors the feature-gating pattern in
+        // validate_video_encode_rejects_source_video_pid_out_of_range.
+        for (w, h) in [(Some(1281u32), Some(720u32)), (Some(1280), Some(721)), (None, Some(721))] {
+            let res = validate_video_encode(&make(w, h), "ctx");
+            assert!(res.is_err(), "odd dimension {w:?}x{h:?} must be rejected");
+            #[cfg(feature = "video-encoder-x264")]
+            assert!(
+                res.unwrap_err().to_string().contains("must be even"),
+                "expected even-dimension error for {w:?}x{h:?}"
+            );
+        }
         #[cfg(feature = "video-encoder-x264")]
         assert!(validate_video_encode(&make(Some(1280), Some(720)), "ctx").is_ok());
-        let err = validate_video_encode(&make(None, Some(721)), "ctx")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("must be even"));
     }
 
     #[test]
