@@ -79,10 +79,17 @@ pub struct InputTranscoder {
     /// Scratch buffer that holds the audio-replacer output. Reused across
     /// ticks to avoid steady-state allocations.
     scratch_a: Vec<u8>,
-    /// Scratch buffer that holds the final output (after the video replacer,
-    /// or after the audio replacer when video is absent). Borrowed out via
-    /// `process`.
+    /// Scratch buffer that holds the video-replacer output (input to the
+    /// A/V realign stage, or the final output when no realigner is active).
     scratch_b: Vec<u8>,
+    /// Scratch buffer that holds the final output after A/V realignment.
+    scratch_c: Vec<u8>,
+    /// A/V emission realigner. `Some` only when the **video** ES is
+    /// transcoded — the deep video encode pipeline is what pushes audio
+    /// ahead of video, so there's nothing to realign on an audio-only
+    /// transcode (video passthrough isn't delayed). Holds audio gated on
+    /// video PTS so the two leave together. See `ts_av_realign`.
+    realign: Option<crate::engine::ts_av_realign::TsAvRealigner>,
 }
 
 impl InputTranscoder {
@@ -123,11 +130,22 @@ impl InputTranscoder {
             return Ok(None);
         }
 
+        // Realign audio→video only when video is transcoded (that's the path
+        // with the deep encode pipeline). Audio-only transcode leaves video as
+        // passthrough — no added video latency to compensate for.
+        let realign = if video.is_some() {
+            Some(crate::engine::ts_av_realign::TsAvRealigner::new())
+        } else {
+            None
+        };
+
         Ok(Some(Self {
             audio,
             video,
             scratch_a: Vec::with_capacity(32 * 1024),
             scratch_b: Vec::with_capacity(32 * 1024),
+            scratch_c: Vec::with_capacity(32 * 1024),
+            realign,
         }))
     }
 
@@ -188,6 +206,7 @@ impl InputTranscoder {
         // Reset scratch buffers without giving up capacity.
         self.scratch_a.clear();
         self.scratch_b.clear();
+        self.scratch_c.clear();
 
         // Stage 1: audio. When absent, pass the input through unchanged.
         let after_audio: &[u8] = match self.audio.as_mut() {
@@ -198,13 +217,24 @@ impl InputTranscoder {
             None => input_ts,
         };
 
-        // Stage 2: video. When absent, return the audio-stage output directly.
-        match self.video.as_mut() {
+        // Stage 2: video. When absent, the audio-stage output is final.
+        let after_video: &[u8] = match self.video.as_mut() {
             Some(v) => {
                 v.process(after_audio, &mut self.scratch_b);
                 &self.scratch_b
             }
             None => after_audio,
+        };
+
+        // Stage 3: A/V emission realign (only present when video is
+        // transcoded). Holds audio until the video PID's PTS catches up so
+        // they leave together; PTS/CC untouched. Absent ⇒ return stage-2 out.
+        match self.realign.as_mut() {
+            Some(r) => {
+                r.process(after_video, &mut self.scratch_c);
+                &self.scratch_c
+            }
+            None => after_video,
         }
     }
 
@@ -224,6 +254,12 @@ impl InputTranscoder {
         }
         if let Some(v) = self.video.as_mut() {
             v.flush(output);
+        }
+        // Emit any audio the realigner is still holding so shutdown loses
+        // no samples (ordering relative to the just-flushed tail is moot at
+        // teardown — the stream is ending).
+        if let Some(r) = self.realign.as_mut() {
+            r.flush(output);
         }
     }
 

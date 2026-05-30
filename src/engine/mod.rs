@@ -130,6 +130,7 @@ pub mod ts_assembler;
 /// through to today's PmtBump path silently.
 pub mod pes_splice;
 pub mod ts_audio_replace;
+pub mod ts_av_realign;
 pub mod ts_null_padder;
 pub mod ts_video_replace;
 /// Encoder-style PES PTS/DTS rewriter — byte-level, no decode. Gated

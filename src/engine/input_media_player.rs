@@ -1189,7 +1189,7 @@ async fn play_ts_file(
 /// `out` is cleared and repopulated each call so PMT-version bumps that
 /// add or remove audio tracks are tracked. No allocations on the steady
 /// state — `HashSet::clear` keeps the existing capacity.
-fn refresh_audio_pids_from_pmt(pkt: &[u8; TS_PACKET], out: &mut HashSet<u16>) {
+pub(crate) fn refresh_audio_pids_from_pmt(pkt: &[u8; TS_PACKET], out: &mut HashSet<u16>) {
     let mut offset = 4usize;
     if (pkt[3] >> 4) & 0b11 == 0b11 {
         // adaptation_field present — skip it
