@@ -386,6 +386,16 @@ mod inner {
     /// hiccups are sub-100 ms.
     const PTS_JUMP_THRESHOLD_90K: u64 = 90_000;
 
+    /// Upper bound on how far the PCR may be floored behind the video PTS to
+    /// keep ahead of audio (5 s @ 90 kHz). A well-muxed contribution feed sits
+    /// audio a few ms–few-hundred-ms behind video; anything beyond a few
+    /// seconds is a pathological source or a stale/epoch-jumped audio
+    /// reference. Clamping here means neither a 33-bit PTS wrap nor an
+    /// input-switch epoch jump can drive the PCR backward by more than a
+    /// bounded, recoverable amount (a 5 s step the receiver re-buffers past)
+    /// instead of the ~26.5 h corruption a raw signed delta would produce.
+    const MAX_AUDIO_LAG_90K: u64 = 5 * 90_000;
+
     /// Two-way modular distance between two 33-bit PTS values, in 90 kHz
     /// ticks. Returns the smaller of the forward and backward distances
     /// across the modulus, so a legitimate PTS wrap (which only happens
@@ -397,6 +407,26 @@ mod inner {
         let fwd = (am + PTS_MODULUS_90K - bm) % PTS_MODULUS_90K;
         let bwd = (bm + PTS_MODULUS_90K - am) % PTS_MODULUS_90K;
         fwd.min(bwd)
+    }
+
+    /// How far the audio PTS sits BEHIND this video PTS, in 90 kHz ticks,
+    /// for the PCR floor — wrap-safe and clamped. Masks both operands into
+    /// 33-bit PTS space and takes the modular FORWARD distance audio→video;
+    /// when that exceeds half the modulus the audio actually LEADS the video
+    /// (or the two straddle a ~26.5 h wrap such that "behind" is ambiguous),
+    /// so the lag is 0 — no floor needed. The result is clamped to
+    /// `max_90k`. A raw `(video as i64).wrapping_sub(audio as i64)` is NOT
+    /// wrap-safe: across a wrap it balloons to ~2^33 and, once latched into
+    /// the smoothed lag, floors the PCR backward by hours.
+    pub(super) fn audio_lag_90k(video_pts: u64, audio_pts: u64, max_90k: u64) -> u64 {
+        let vm = video_pts & PTS_MASK_33B;
+        let am = audio_pts & PTS_MASK_33B;
+        let fwd = (vm + PTS_MODULUS_90K - am) % PTS_MODULUS_90K;
+        if fwd <= PTS_MODULUS_90K / 2 {
+            fwd.min(max_90k)
+        } else {
+            0
+        }
     }
 
     /// Compute the `discontinuity_indicator` flag for the next emitted
@@ -1309,16 +1339,22 @@ mod inner {
                     };
                     let pcr_pts = if a != 0 {
                         // How far is the audio behind THIS video frame (≥ 0;
-                        // 0 when audio leads). Signed-delta is 33-bit-wrap-safe.
-                        let cur_lag =
-                            (pts_for_pes as i64).wrapping_sub(a as i64).max(0) as u64;
+                        // 0 when audio leads). Wrap-safe + clamped — see
+                        // `audio_lag_90k` (a raw signed wrapping_sub is NOT
+                        // wrap-safe and would floor the PCR back by ~26.5 h
+                        // across a PTS wrap).
+                        let cur_lag = audio_lag_90k(pts_for_pes, a, MAX_AUDIO_LAG_90K);
                         // Jump up to cur_lag immediately (PCR never overtakes
                         // audio); decay slowly so the PCR rate stays smooth
                         // (PCR_AC tier-2). ~1/32 frame per frame.
                         let decay = (self.pts_step_90k / 32).max(1);
                         self.pcr_audio_lag_90k =
                             self.pcr_audio_lag_90k.saturating_sub(decay).max(cur_lag);
-                        pts_for_pes.wrapping_sub(self.pcr_audio_lag_90k)
+                        // Mask back into 33-bit PTS space: the subtraction can
+                        // underflow when video is just past a wrap, and
+                        // pcr_for_emit expects a 33-bit PTS (it wrapping_mul's
+                        // by 300).
+                        pts_for_pes.wrapping_sub(self.pcr_audio_lag_90k) & PTS_MASK_33B
                     } else {
                         pts_for_pes
                     };
@@ -2157,6 +2193,41 @@ mod tests {
         // 1 s + 1 tick: just over → DI.
         let mut over_last: Option<u64> = Some(0);
         assert!(compute_discontinuity_flag(&mut over_last, 90_001));
+    }
+
+    /// `audio_lag_90k` is the wrap-safe PCR-floor lag (replaces a raw signed
+    /// `wrapping_sub` that floored the PCR back by ~26.5 h across a PTS wrap).
+    #[test]
+    fn audio_lag_is_wrap_safe_and_clamped() {
+        use super::inner::audio_lag_90k;
+        const MOD: u64 = 1u64 << 33;
+        const MASK: u64 = MOD - 1;
+        const MAX: u64 = 5 * 90_000; // 5 s clamp (MAX_AUDIO_LAG_90K)
+
+        // Normal: audio 100 ms behind video → lag = 9000.
+        assert_eq!(audio_lag_90k(1_000_000, 1_000_000 - 9_000, MAX), 9_000);
+
+        // Audio LEADS video (audio_pts > video_pts) → no floor.
+        assert_eq!(audio_lag_90k(1_000_000, 1_009_000, MAX), 0);
+
+        // Pathological 10 s behind → clamped to the 5 s ceiling, NOT 10 s.
+        assert_eq!(audio_lag_90k(10_000_000, 10_000_000 - 900_000, MAX), MAX);
+
+        // THE BUG THIS GUARDS: video ~50 ms before the 33-bit wrap, audio
+        // ~50 ms after it (audio leads across the wrap). A raw signed
+        // wrapping_sub would return ~2^33 here and floor the PCR back by
+        // hours; the modular forward distance is the long way (> MOD/2) so
+        // the lag is correctly 0.
+        assert_eq!(audio_lag_90k(MASK - 4_500, 4_500, MAX), 0);
+
+        // Audio genuinely ~100 ms behind, straddling the wrap (video just
+        // after, audio just before) → lag ≈ 9000, bounded — not a huge value.
+        assert_eq!(audio_lag_90k(4_500, MASK - 4_500 + 1, MAX), 9_000);
+
+        // Unmasked inputs (> 33-bit, e.g. an accumulated fallback PTS) are
+        // masked before the compare, so an out-of-range operand can't escape
+        // the modular logic.
+        assert_eq!(audio_lag_90k(MOD + 1_000_000, MOD + 1_000_000 - 9_000, MAX), 9_000);
     }
 
     /// PMT rewrite must force PCR_PID to the rebuilt video PID — even
