@@ -151,6 +151,18 @@ impl TsAvRealigner {
                     }
                 }
                 output.extend_from_slice(pkt);
+                // Drain INTERLEAVED right after each video frame — NOT batched
+                // at chunk end. The HW encoder emits video in bursts (several
+                // frames per process() call); batching the audio release to the
+                // end of a burst bunches it after the burst's last PCR, so the
+                // older audio in the batch lands behind that PCR ⇒ LATE at the
+                // receiver (a strict T-STD decoder drops it). Draining per video
+                // frame bounds each released batch to ~one frame and positions
+                // each audio PES right after the video frame that gates it, so
+                // wire_emit paces it at the correct wall-clock and audio stays
+                // ~LEAD ahead of PCR. (Verified: sync-test went from −133 ms
+                // audio-vs-PCR / "ever late" to a healthy positive lead.)
+                self.drain(output, false);
             } else if is_audio {
                 if ts_pusi(pkt) {
                     if let Some(pts) = extract_pes_pts(pkt) {
@@ -301,6 +313,36 @@ mod tests {
             count_pid(&out, 0x201) >= 1,
             "stalled-video safety must release audio, not stall it"
         );
+    }
+
+    #[test]
+    fn audio_interleaved_within_a_video_burst_not_batched_at_end() {
+        // Regression: a multi-frame video burst in ONE process() call must
+        // interleave the eligible audio between the video frames (drain per
+        // frame), not dump it all after the burst's last frame (which would
+        // land older audio behind the last PCR == late).
+        let mut r = TsAvRealigner::new();
+        r.video_pid = Some(0x200);
+        r.audio_pids.insert(0x201);
+        // Pre-queue two audio PESes (held — no video yet).
+        let mut out = Vec::new();
+        r.process(&pkt(0x201, true, Some(90_000), None), &mut out); // audio A @1.0s
+        r.process(&pkt(0x201, true, Some(90_000 + 3600), None), &mut out); // audio B @1.04s
+        assert_eq!(count_pid(&out, 0x201), 0, "held until video");
+        // Now a 2-frame video burst in ONE process() call.
+        let mut burst = Vec::new();
+        burst.extend_from_slice(&pkt(0x200, true, Some(90_000), None)); // video @1.0s
+        burst.extend_from_slice(&pkt(0x200, true, Some(90_000 + 3600), None)); // video @1.04s
+        out.clear();
+        r.process(&burst, &mut out);
+        // Both audio released; and audio A must appear BEFORE video frame B in
+        // byte order (interleaved by the per-frame drain), not after it.
+        let pids: Vec<u16> = out.chunks(TS_PACKET).map(ts_pid).collect();
+        assert_eq!(pids.iter().filter(|&&p| p == 0x201).count(), 2, "both audio out");
+        let first_audio = pids.iter().position(|&p| p == 0x201).unwrap();
+        let last_video = pids.iter().rposition(|&p| p == 0x200).unwrap();
+        assert!(first_audio < last_video,
+            "audio must interleave within the burst (got order {:?})", pids);
     }
 
     #[test]
