@@ -43,8 +43,8 @@ use std::sync::Arc;
 use crate::config::models::VideoEncodeConfig;
 
 use super::ts_parse::{
-    mpeg2_crc32, parse_pat_programs, ts_has_adaptation, ts_has_payload, ts_payload_offset, ts_pid,
-    ts_pusi, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
+    extract_pes_pts, mpeg2_crc32, parse_pat_programs, ts_has_adaptation, ts_has_payload,
+    ts_payload_offset, ts_pid, ts_pusi, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
 
 /// PCR pre-roll behind PTS in 27 MHz ticks (80 ms × 27 000 000 / 1000).
@@ -550,6 +550,15 @@ mod inner {
         /// tier-2). PCR = video_pts − this; equals video_pts when audio leads.
         pub pcr_audio_lag_90k: u64,
 
+        /// Audio PIDs learned from the PMT — used to floor the PCR on
+        /// PASSTHROUGH audio (video-only transcode, where no `TsAudioReplacer`
+        /// publishes via `audio_pts_floor`). For both-transcode the shared
+        /// atomic is authoritative and this is ignored.
+        pub audio_pids: std::collections::HashSet<u16>,
+        /// Latest passthrough audio PES PTS (90 kHz) on an `audio_pids` PID;
+        /// feeds the PCR floor when `audio_pts_floor` is unset.
+        pub passthrough_audio_pts: u64,
+
         /// Optional input-side `video_decode_stats` handle the replacer
         /// keeps refreshing as the PMT learns the source codec / geometry.
         /// Set by ingress-side callers via
@@ -684,6 +693,8 @@ mod inner {
                 av_sync_pacer: None,
                 audio_pts_floor: None,
                 pcr_audio_lag_90k: 0,
+                audio_pids: std::collections::HashSet::new(),
+                passthrough_audio_pts: 0,
                 input_decode_handle: None,
                 out_psi_version: 1,
             })
@@ -725,6 +736,11 @@ mod inner {
             self.pes_started = false;
             self.pending_pts = None;
             self.decoder = None;
+            // The new source re-advertises its audio PIDs via PMT; drop the
+            // old set + PCR-floor state so a switch can't floor on stale audio.
+            self.audio_pids.clear();
+            self.passthrough_audio_pts = 0;
+            self.pcr_audio_lag_90k = 0;
             // NOTE: `last_emitted_pts_90k` is intentionally NOT reset.
             // Output PCR derives from source PTS, so on a switch the new
             // input's first emit will land in a different epoch — the
@@ -805,6 +821,14 @@ mod inner {
 
                 if let Some(pmt_pid) = self.pmt_pid {
                     if pid == pmt_pid && ts_pusi(pkt) {
+                        // Learn the audio PIDs so the PCR can be floored on
+                        // PASSTHROUGH audio when this is a video-only transcode.
+                        if let Ok(arr) = <&[u8; TS_PACKET_SIZE]>::try_from(pkt) {
+                            crate::engine::input_media_player::refresh_audio_pids_from_pmt(
+                                arr,
+                                &mut self.audio_pids,
+                            );
+                        }
                         if let Some((vpid, vst)) = parse_pmt_video(pkt, self.source_video_pid_pin) {
                             // Operator-pinned PID not in PMT — warn
                             // once per distinct (pinned, actual) pair.
@@ -890,6 +914,14 @@ mod inner {
                     continue;
                 }
 
+                // Passthrough. Track passthrough audio PES PTS so the PCR can
+                // be floored on it (video-only transcode, where no audio
+                // replacer publishes via `audio_pts_floor`).
+                if ts_pusi(pkt) && self.audio_pids.contains(&pid) {
+                    if let Some(apts) = extract_pes_pts(pkt) {
+                        self.passthrough_audio_pts = apts;
+                    }
+                }
                 output.extend_from_slice(pkt);
             }
         }
@@ -1266,31 +1298,29 @@ mod inner {
                     // lipsync is unchanged; on the common audio-leads case
                     // min == video_pts and the PCR is byte-identical to before.
                     // Signed-delta compare is 33-bit-wrap-safe.
-                    let pcr_pts = match self.audio_pts_floor.as_ref() {
-                        Some(h) => {
-                            let a = h.load(std::sync::atomic::Ordering::Relaxed);
-                            if a != 0 {
-                                // How far is the audio behind THIS video frame
-                                // (≥ 0; 0 when audio leads). Signed-delta is
-                                // 33-bit-wrap-safe.
-                                let cur_lag = (pts_for_pes as i64)
-                                    .wrapping_sub(a as i64)
-                                    .max(0) as u64;
-                                // Jump up to cur_lag immediately (PCR never
-                                // overtakes audio); decay slowly so the PCR
-                                // rate stays smooth (PCR_AC tier-2). ~1/32
-                                // frame per frame.
-                                let decay = (self.pts_step_90k / 32).max(1);
-                                self.pcr_audio_lag_90k = self
-                                    .pcr_audio_lag_90k
-                                    .saturating_sub(decay)
-                                    .max(cur_lag);
-                                pts_for_pes.wrapping_sub(self.pcr_audio_lag_90k)
-                            } else {
-                                pts_for_pes
-                            }
-                        }
-                        None => pts_for_pes,
+                    // Audio reference for the PCR floor: the shared atomic
+                    // (authoritative for both-transcode — the audio replacer
+                    // publishes its emitted PTS there) when wired, otherwise
+                    // the passthrough audio PTS we track from the PMT-learned
+                    // audio PIDs (video-only transcode).
+                    let a = match self.audio_pts_floor.as_ref() {
+                        Some(h) => h.load(std::sync::atomic::Ordering::Relaxed),
+                        None => self.passthrough_audio_pts,
+                    };
+                    let pcr_pts = if a != 0 {
+                        // How far is the audio behind THIS video frame (≥ 0;
+                        // 0 when audio leads). Signed-delta is 33-bit-wrap-safe.
+                        let cur_lag =
+                            (pts_for_pes as i64).wrapping_sub(a as i64).max(0) as u64;
+                        // Jump up to cur_lag immediately (PCR never overtakes
+                        // audio); decay slowly so the PCR rate stays smooth
+                        // (PCR_AC tier-2). ~1/32 frame per frame.
+                        let decay = (self.pts_step_90k / 32).max(1);
+                        self.pcr_audio_lag_90k =
+                            self.pcr_audio_lag_90k.saturating_sub(decay).max(cur_lag);
+                        pts_for_pes.wrapping_sub(self.pcr_audio_lag_90k)
+                    } else {
+                        pts_for_pes
                     };
                     let pcr_27mhz = crate::engine::av_sync_mux::pcr_for_emit(
                         self.av_sync_pacer.as_ref(),

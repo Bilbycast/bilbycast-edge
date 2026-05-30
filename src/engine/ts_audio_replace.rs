@@ -3359,9 +3359,21 @@ mod tests {
         // guard inert, but catch-up sees ~500 ms master_elapsed and
         // 0 output_elapsed → lag ≈ 500 ms, > 200 ms threshold.
         let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 2_160), &mut Vec::new());
+        // Catch-up FIRES (master lag ~500 ms > the 200 ms threshold) but the
+        // queued silence is CAPPED at one frame per fire (commit 0944ab1:
+        // "cap catch-up silence per fire to one AC-3 frame") so a large lag is
+        // bled off over multiple PESes as whole-frame steps rather than one big
+        // jump — see memory project_master_clock_catchup_wallclock_fallback.
+        // So it queues the per-fire cap (~32 ms = 864_000 ticks), NOT the full
+        // ~500 ms lag.
         assert!(
-            r.pending_silence_27mhz > 13_500_000 / 2,
-            "catch-up must queue ~500 ms (= 13_500_000 27 MHz ticks); got {}",
+            r.pending_silence_27mhz > 0,
+            "catch-up must fire (queue some silence) when master lag exceeds the threshold; got {}",
+            r.pending_silence_27mhz
+        );
+        assert!(
+            r.pending_silence_27mhz <= 13_500_000 / 2,
+            "per-fire catch-up silence must be capped (not the full ~500 ms lag); got {}",
             r.pending_silence_27mhz
         );
     }
