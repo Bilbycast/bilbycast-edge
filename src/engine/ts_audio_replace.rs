@@ -1016,6 +1016,12 @@ impl TsAudioReplacer {
         //    guard and are suppressed (see below).
         const DISCONTINUITY_THRESHOLD_90K: u64 = 45_000; // 500 ms
         const SUB_DISCONTINUITY_THRESHOLD_90K: i64 = 7_200; // 80 ms
+        // Deadband for the media_player anchor-relabel tracker below: only
+        // forward source-PTS steps larger than this are tracked, so normal
+        // sub-frame PES-PTS rounding/jitter never accumulates into the
+        // anchor. File sources are content-continuous (delta == 0 within a
+        // loop), so this only fires on the per-loop splice step.
+        const MP_FORWARD_TRACK_DEADBAND_90K: i64 = 450; // 5 ms
         if !self.out_pts_anchored {
             self.out_pts_90k = anchor_target(self.av_sync_pacer.as_ref(), pts);
             self.samples_since_anchor = 0;
@@ -1091,15 +1097,53 @@ impl TsAudioReplacer {
                         self.first_pes_src_pts_90k = Some(pts);
                     }
                 }
+            } else if self.av_sync_pacer.is_none()
+                && delta > MP_FORWARD_TRACK_DEADBAND_90K
+            {
+                // ── media_player source-PTS forward-step tracking ──
+                //
+                // The ONLY `audio_encode` path that leaves `av_sync_pacer`
+                // unwired is the media_player input transcode (see
+                // `input_media_player.rs` — every catch-up config there
+                // drifted, so the pacer is intentionally not handed to the
+                // transcoder). Its output PTS is therefore a free-running
+                // encoder-sample clock that counts only decoded *content*
+                // samples. On a looping file whose audio/video content
+                // durations differ, the file-side splice advances source
+                // PTS by a per-loop step to keep the looped stream
+                // PCR-continuous. Passthrough audio carries that step
+                // verbatim and stays A/V-locked with the (passthrough or
+                // re-encoded) video; the re-encoder's sample clock silently
+                // *loses* it, drifting audio against video without bound
+                // (measured −26.8 ms/min ≈ −76 ms/loop on the Sky Witness
+                // 1080i25 loop; full passthrough of the same file is flat).
+                //
+                // `delta` here is `pts − (prev_pts + prev_PES_content)`, i.e.
+                // the source forward step BEYOND continuous progression —
+                // buffer-depth-independent. Track it by advancing the anchor
+                // (a pure PTS relabel). We do NOT queue silence: inserting
+                // silence would put a >20 ms gap into the decoded PCM
+                // (gate 6 violation) and change content; the relabel leaves
+                // audio bit-identical and simply reproduces the drift-free
+                // passthrough timeline. Forward-only and bounded above by the
+                // 500 ms re-anchor branch, so it cannot run away.
+                self.out_pts_90k =
+                    self.out_pts_90k.wrapping_add(delta as u64) & 0x1_FFFF_FFFF;
+                tracing::debug!(
+                    expected,
+                    got = pts,
+                    delta_90k = delta,
+                    out_pts_90k = self.out_pts_90k,
+                    "ts_audio_replace: media_player source-PTS forward step tracked (anchor relabel)"
+                );
             } else if delta > SUB_DISCONTINUITY_THRESHOLD_90K {
-                // Sub-500 ms FORWARD jump — typical media_player loop
-                // splice (~268 ms). Queue the forward delta as silence
-                // padding so the encoder produces silence frames that
-                // pull `samples_since_anchor` forward by the right
-                // amount. PTS catches up in steady state without
-                // touching `out_pts_90k`; receivers see continuous
-                // output PES at the steady 1920-tick cadence with the
-                // gap rendered as silence frames.
+                // Sub-500 ms FORWARD jump on a master-clock-paced path
+                // (live SRT/RTP/output transcode). Queue the forward delta
+                // as silence padding so the encoder produces silence frames
+                // that pull `samples_since_anchor` forward by the right
+                // amount. PTS catches up in steady state without touching
+                // `out_pts_90k`; receivers see continuous output PES at the
+                // steady cadence with the gap rendered as silence frames.
                 let delta_27mhz = delta.saturating_mul(300);
                 self.pending_silence_27mhz = self
                     .pending_silence_27mhz
@@ -3032,28 +3076,35 @@ mod tests {
     // to `max(audio_max, pcr_max) + SPLICE_GUARD_TICKS_90K`. On real
     // broadcast captures `pcr_max - audio_max ≈ 238 ms`, so audio PES
     // PTS jumps forward by ~268 ms per loop. That's under the 500 ms
-    // discontinuity threshold, so the pre-fix discontinuity guard did
-    // not catch it. Output audio PES PTSes kept advancing at the
+    // discontinuity threshold, so the discontinuity-guard re-anchor did
+    // not catch it. The free-running output clock kept advancing at the
     // steady (samples_since_anchor / sample_rate) rate while video
     // passthrough PESes advanced with the source's per-loop forward
-    // jump verbatim — audio drifted behind video by the jump amount
-    // per loop (-27 ms/min over 30 min × 10 loops on the Sky Witness
+    // jump verbatim — audio drifted against video by the jump amount
+    // per loop (-26.8 ms/min over 30 min × 10 loops on the Sky Witness
     // 1080i25 capture, cell 4 of testbed/full_test_2026-05-21/v2).
     //
-    // Fix: route sub-500ms forward source-PTS jumps through the
-    // existing `pending_silence_27mhz` queue. Threshold 80 ms — well
-    // above MP2/AAC/AC-3 per-PES jitter, well below 500 ms.
+    // Fix: on the media_player path (no `av_sync_pacer`), TRACK the
+    // forward source-PTS step by advancing the anchor `out_pts_90k` (a
+    // pure relabel — reproduces the drift-free passthrough timeline, no
+    // silence inserted so decoded PCM stays gap-free per gate 6). The
+    // master-clock-paced paths (live SRT / output transcode) keep the
+    // older silence-pad behaviour. Deadband 5 ms — well above MP2 / AAC /
+    // AC-3 per-PES jitter, well below 500 ms.
 
-    /// Forward source-PTS jump in `(80 ms, 500 ms]` queues silence
-    /// for the per-loop loop-splice catch-up.
+    /// Forward source-PTS jump in `(5 ms, 500 ms]` on the media_player
+    /// path relabels the anchor (tracks the source) instead of queuing
+    /// silence — the per-loop loop-splice catch-up that fixes the drift.
     #[test]
-    fn sub_500ms_forward_source_jump_queues_silence_pad() {
+    fn sub_500ms_forward_source_jump_relabels_anchor_on_media_player_path() {
         let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        assert!(r.av_sync_pacer.is_none(), "media_player path has no pacer");
         r.audio_pid = Some(0x0101);
         r.source_stream_type = 0x0F;
         // Prime the anchor + expected_next_src_pts via a first PES.
         let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 90_000), &mut Vec::new());
         assert!(r.out_pts_anchored);
+        let out_after_first = r.out_pts_90k;
         let expected_after_first = r
             .expected_next_src_pts_90k
             .expect("first PES must stamp expected_next");
@@ -3062,11 +3113,16 @@ mod tests {
         let jump_90k: u64 = 24_120;
         let next_pts = expected_after_first.wrapping_add(jump_90k);
         let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], next_pts), &mut Vec::new());
-        // Delta = jump_90k > 7200 (80 ms) → queued for silence-pad.
-        let expected_27mhz = (jump_90k as i64).saturating_mul(300);
+        // Delta = jump_90k > 5 ms deadband → tracked via anchor relabel,
+        // NOT silence.
         assert_eq!(
-            r.pending_silence_27mhz, expected_27mhz,
-            "268 ms forward source-PTS jump must queue 268 ms of silence-pad in 27 MHz units"
+            r.pending_silence_27mhz, 0,
+            "media_player forward jump must NOT queue silence (gate 6) — it relabels the anchor"
+        );
+        assert_eq!(
+            r.out_pts_90k,
+            out_after_first.wrapping_add(jump_90k),
+            "media_player forward jump must advance out_pts_90k by the source delta"
         );
     }
 
@@ -3128,6 +3184,86 @@ mod tests {
         assert_eq!(
             r.pending_silence_27mhz, 0,
             "> 500ms jump must use the catastrophic re-anchor branch, not silence-pad"
+        );
+    }
+
+    /// **media_player source-PTS forward-step tracking.** With no
+    /// `av_sync_pacer` wired (the media_player input-transcode path), a
+    /// forward source-PTS step below the 500 ms re-anchor threshold must be
+    /// TRACKED by advancing `out_pts_90k` (a pure PTS relabel that
+    /// reproduces the drift-free passthrough timeline) and must NOT queue
+    /// silence (a >20 ms silence gap in decoded PCM would violate gate 6).
+    /// This is the fix for the Sky Witness 1080i25 loop −26.8 ms/min A/V
+    /// drift: the free-running sample clock loses the file-side per-loop
+    /// splice step, which passthrough audio carries verbatim.
+    #[test]
+    fn media_player_forward_step_relabels_anchor_without_silence() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        assert!(r.av_sync_pacer.is_none(), "media_player path has no pacer");
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F;
+        r.out_pts_anchored = true;
+        r.out_pts_90k = 1_000_000;
+        r.samples_since_anchor = 0;
+        r.resolved_sample_rate = 48_000;
+        r.expected_next_src_pts_90k = Some(1_000_000);
+        let out_before = r.out_pts_90k;
+        let step_90k: u64 = 4_500; // 50 ms forward splice step
+        let _ = r.consume_pes(
+            &build_audio_pes(&[0u8; 32], 1_000_000 + step_90k),
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            r.pending_silence_27mhz, 0,
+            "media_player forward step must NOT queue silence (gate 6) — it relabels the anchor"
+        );
+        assert_eq!(
+            r.out_pts_90k,
+            out_before.wrapping_add(step_90k),
+            "media_player forward step must advance out_pts_90k by the source delta (track source PTS)"
+        );
+    }
+
+    /// No-regression guard for the master-clock-paced (live SRT / RTP /
+    /// output transcode) path: with an `av_sync_pacer` set, a > 80 ms
+    /// forward source step still uses the silence-pad branch (queues
+    /// silence, leaves `out_pts_90k` untouched) — the media_player relabel
+    /// branch is scoped to the no-pacer path and must NOT engage here.
+    #[test]
+    fn paced_path_forward_jump_uses_silence_not_relabel() {
+        use crate::engine::av_sync_mux::AvSyncPacer;
+        use crate::engine::master_clock::{
+            MasterClockHandle, MasterClockKind, WallclockMaster,
+        };
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let handle = MasterClockHandle::new(
+            std::sync::Arc::new(WallclockMaster::new()),
+            MasterClockKind::Wallclock,
+        );
+        r.set_av_sync_pacer(std::sync::Arc::new(AvSyncPacer::new(handle)));
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F;
+        r.out_pts_anchored = true;
+        r.out_pts_90k = 1_000_000;
+        r.resolved_sample_rate = 48_000;
+        // Leave the catch-up anchors unset so the master-clock catch-up
+        // stays inert; we are exercising the forward-jump silence branch.
+        r.first_pes_master_27mhz = None;
+        r.first_pes_src_pts_90k = None;
+        r.expected_next_src_pts_90k = Some(1_000_000);
+        let out_before = r.out_pts_90k;
+        // 100 ms forward (> 80 ms threshold).
+        let _ = r.consume_pes(
+            &build_audio_pes(&[0u8; 32], 1_000_000 + 9_000),
+            &mut Vec::new(),
+        );
+        assert!(
+            r.pending_silence_27mhz > 0,
+            "paced path must queue silence on a >80ms forward jump"
+        );
+        assert_eq!(
+            r.out_pts_90k, out_before,
+            "paced path must NOT relabel out_pts_90k (relabel is media_player-only)"
         );
     }
 
