@@ -1648,10 +1648,26 @@ async fn execute_command(
                     // edit takes effect immediately.
                     let recording_changed = old_flow.recording != new_flow.recording;
                     let master_clock_changed = old_flow.master_clock != new_flow.master_clock;
+                    // Crossing the passthrough↔assembled boundary — or any
+                    // assembly-plan change that arrives via `update_flow`
+                    // rather than the `update_flow_assembly` hot-swap — must
+                    // rebuild the task graph. `FlowRuntime::start` keys
+                    // passthrough vs assembled off `assembly`, and the live
+                    // SPTS/MPTS assembler task is owned for the flow's
+                    // lifetime; the surgical output-only diff below never
+                    // tears it down. Without this the assembly-less config
+                    // would persist while the assembler keeps emitting, so
+                    // config and runtime silently diverge until the next
+                    // manual restart. (Same-boundary assembly edits still
+                    // hot-swap via `update_flow_assembly`, so this only forces
+                    // a restart on genuine plan changes routed through here —
+                    // notably the manager's "Convert to passthrough" button.)
+                    let assembly_changed = old_flow.assembly != new_flow.assembly;
                     let restart_required = old_flow.bandwidth_limit != new_flow.bandwidth_limit
                         || content_analysis_changed
                         || recording_changed
-                        || master_clock_changed;
+                        || master_clock_changed
+                        || assembly_changed;
                     let persist_only_meta_changed = old_flow.name != new_flow.name
                         || old_flow.media_analysis != new_flow.media_analysis
                         || old_flow.thumbnail != new_flow.thumbnail;
@@ -1685,7 +1701,7 @@ async fn execute_command(
                         // change, or content-analysis / recording tier toggle
                         // — must restart entire flow.
                         tracing::info!(
-                            "Update flow '{flow_id}': restarting (input_touches_hitless={input_touches_hitless}, bandwidth_limit/content_analysis/recording/master_clock changed={restart_required}, content_analysis_changed={content_analysis_changed}, recording_changed={recording_changed}, master_clock_changed={master_clock_changed})"
+                            "Update flow '{flow_id}': restarting (input_touches_hitless={input_touches_hitless}, bandwidth_limit/content_analysis/recording/master_clock/assembly changed={restart_required}, content_analysis_changed={content_analysis_changed}, recording_changed={recording_changed}, master_clock_changed={master_clock_changed}, assembly_changed={assembly_changed})"
                         );
                         let _ = flow_manager.destroy_flow(flow_id).await;
                         let resolved = {
