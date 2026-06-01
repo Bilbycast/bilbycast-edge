@@ -895,6 +895,19 @@ pub(crate) fn build_health_payload(
             }
         }
     }
+    // System-clock discipline (adjtimex read). Inserted only when probe()
+    // returns Some — non-Linux hosts and seccomp-blocked adjtimex omit the
+    // field, so older managers and clock-less hosts stay wire-compatible.
+    // Manager UI hides the card unless the `"clock-sync"` capability is also
+    // present. Reflects the wallclock master's underlying CLOCK_MONOTONIC
+    // discipline (chrony / ntpd / phc2sys vs free-running).
+    if let Some(status) = crate::util::clock_sync::probe() {
+        if let Ok(v) = serde_json::to_value(&status) {
+            payload
+                .as_object_mut()
+                .map(|o| o.insert("clock_sync".into(), v));
+        }
+    }
     payload
 }
 
@@ -1221,6 +1234,14 @@ fn edge_capabilities() -> Vec<&'static str> {
         if c.wire_pacing_txtime {
             caps.push("wire_pacing_txtime");
         }
+    }
+    // System-clock discipline indicator. Advertised only when the adjtimex
+    // read succeeds (Linux + syscall permitted). Manager UI gates the "Clock
+    // Sync" card on this so non-Linux / seccomp-blocked / older edges hide
+    // the surface cleanly. Reflects whether the wallclock master's
+    // underlying CLOCK_MONOTONIC is disciplined or free-running.
+    if crate::util::clock_sync::probe().is_some() {
+        caps.push("clock-sync");
     }
     // MXL (Media eXchange Layer) — advertised per-essence only when the
     // `mxl` Cargo feature is on AND the boot probe successfully dlopen'd
