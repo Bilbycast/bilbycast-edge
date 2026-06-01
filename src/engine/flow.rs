@@ -5913,14 +5913,16 @@ fn build_master_clock(
         MasterClockHandle, MasterClockKind, SourcePcrPllMaster, WallclockMaster,
     };
 
-    // `auto` is PER-INPUT. ST 2110 / MXL essence is PTP-domain, so it
-    // resolves straight to PTP (no PLL-first). Contribution + assembly get
-    // the PLL → PTP → Wallclock cascade. `select_master_kind_for_input`
-    // returns `Ptp` only for the PTP-native (ST 2110 / MXL) inputs, so it's
-    // the authoritative "is this input PTP-domain?" check.
+    // `auto` is PER-INPUT and is the DEFAULT — a flow with no explicit
+    // `master_clock` (None) behaves identically to `auto`. ST 2110 / MXL
+    // essence is PTP-domain, so it resolves straight to PTP (no PLL-first);
+    // contribution + assembly get the PLL → PTP → Wallclock cascade.
+    // `select_master_kind_for_input` returns `Ptp` only for the PTP-native
+    // (ST 2110 / MXL) inputs, so it's the authoritative "is this input
+    // PTP-domain?" check.
     let is_auto = matches!(
         cfg.master_clock.as_ref().map(|m| m.kind),
-        Some(MasterClockKindConfig::Auto)
+        Some(MasterClockKindConfig::Auto) | None
     );
     if is_auto
         && !matches!(
@@ -5967,13 +5969,13 @@ fn build_master_clock(
             // important.
             MasterClockKind::SourcePcrPll
         }
-        Some(MasterClockKindConfig::Auto) => {
-            // Auto on a PTP-native input (ST 2110 / MXL) → PTP-primary.
-            // Contribution / assembly Auto returned to build_auto_cascade
-            // above, so only the PTP-native case reaches here.
+        Some(MasterClockKindConfig::Auto) | None => {
+            // Auto (and the no-override default, which now means Auto) on a
+            // PTP-native input (ST 2110 / MXL) → PTP-primary. Contribution /
+            // assembly returned to build_auto_cascade above, so only the
+            // PTP-native case reaches here.
             MasterClockKind::Ptp
         }
-        None => crate::engine::master_clock::select_master_kind_for_input(active_input, cfg),
     };
 
     // Operator-visible note on which master-clock backend the flow

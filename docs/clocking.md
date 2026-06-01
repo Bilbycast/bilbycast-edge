@@ -24,24 +24,25 @@ A single per-flow clock fixes this:
   source PCR or same PTP grandmaster. 2022-7 hitless redundancy at the
   receiver works without an external genlock.
 
-| Master kind        | When auto-selected                                 | Lock criterion                             |
-|--------------------|----------------------------------------------------|--------------------------------------------|
-| `Wallclock`        | **Default** for SRT / RTP / UDP / RIST / RTMP / RTSP / `media_player` / `replay` / `test_pattern` / `rtp_audio` / `bonded` inputs; WebRTC ingress; no active input | Always locked — no convergence concept     |
-| `SourcePcrPll`     | PID-bus assembled flows (assembler needs the source's recovered clock to keep cross-program PCR coherent) | PI loop converges, p99 jitter < 100 µs over 64-sample window after ≥ 100 samples |
-| `Ptp`              | ST 2110-20/-23/-30/-31/-40 + MXL inputs            | `ptp4l` reports `port_state == SLAVE` and offset within tolerance |
-| `AudioMaster`      | (Reserved for future ALSA-master local-display path) | (Not yet implemented; falls through to Wallclock) |
+**The default policy is now `auto` (per-input).** A flow with no explicit
+`master_clock` resolves identically to `master_clock.kind = "auto"`:
 
-**Why Wallclock is the default for contribution-class TS sources.**
-The earlier auto-policy auto-selected `SourcePcrPll` for SRT / RTP /
-UDP / RIST / RTMP / RTSP. In practice the PLL never locks on
-contribution sources that carry per-source-restart PCR
-discontinuities — e.g. `ffmpeg -re -stream_loop -1 -c copy` on a
-30-second file, every kind of looping playout, SCTE-35 splice
-insertions, source encoder restarts. With `Wallclock` as the default
-the master is always locked, always monotonic, and the encoder-style
-PES PTS regenerators (`engine::ts_pts_rewriter` and
-`TsAudioReplacer::set_av_sync_pacer`) can anchor against a clean
-timeline immediately.
+| Input class | `auto` resolves to | Notes |
+|-------------|--------------------|-------|
+| ST 2110-20/-23/-30/-31/-40, MXL | `Ptp` | PTP-domain essence; `ptp4l` `port_state == SLAVE`/`MASTER`, offset within tolerance |
+| Contribution: SRT / RTP / UDP / RIST / RTMP / RTSP / `media_player` / `replay` / `test_pattern` / `rtp_audio` / `bonded`; WebRTC | cascade **`SourcePcrPll` → `Ptp` → `Wallclock`** | PLL lock criterion: PI loop converges, p99 jitter < 100 µs over 64 samples after ≥ 100 samples; on failure → PTP-if-configured-&-healthy, else wallclock |
+| PID-bus assembled flows | cascade (same as contribution) | the PLL recovers the designated `pcr_source` |
+| `AudioMaster` | (reserved) | not yet implemented; falls through to Wallclock |
+
+**Why the cascade tries the PLL first then PTP, not wallclock.** The
+PLL often won't lock on contribution sources that carry per-source-restart
+PCR discontinuities — `ffmpeg -re -stream_loop -1 -c copy` on a 30-second
+file, looping playout, SCTE-35 splices, encoder restarts. Once the PLL
+has failed, source-tracking is already lost, so the fallback prefers the
+node's PTP clock (clean, cross-edge-coherent) over bare wallclock, with
+`Wallclock` only as the always-locked floor. The encoder-style PES PTS
+regenerators (`engine::ts_pts_rewriter`, `TsAudioReplacer::set_av_sync_pacer`)
+anchor against whichever rung is active.
 
 Operators who run on PTP-disciplined or clean-PCR contribution
 sources and want cross-edge coherence opt in to the PLL via the new
