@@ -471,7 +471,31 @@ fn next_wire_emit_cpu_index() -> Option<usize> {
 /// run as root) the moment the edge starts.
 fn try_enable_so_txtime(socket: &UdpSocket, clockid: i32) -> bool {
     match crate::engine::wire_emit_txtime::enable_so_txtime(socket, clockid) {
-        Ok(()) => true,
+        Ok(()) => {
+            // The ETF qdisc lives on one mqprio traffic class (TC0 under the
+            // standard `0 0 0 0 1 1 1 1 …` prio_tc_map). A DSCP marking on the
+            // output socket derives a non-zero sk_priority that routes the
+            // packet OFF that class, so SO_TXTIME is silently ignored and the
+            // wire runs unpaced. Pin the priority back onto the ETF class so
+            // SO_TXTIME actually takes effect. Default 0 (TC0 under the
+            // standard map); override via BILBYCAST_ETF_SO_PRIORITY for
+            // non-default qdisc layouts.
+            let etf_prio = std::env::var("BILBYCAST_ETF_SO_PRIORITY")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0);
+            match crate::engine::wire_emit_txtime::set_so_priority(socket, etf_prio) {
+                Ok(()) => tracing::info!(
+                    "wire-emit: SO_PRIORITY set to {} so SO_TXTIME packets land on the ETF traffic class (overrides DSCP-derived priority)",
+                    etf_prio
+                ),
+                Err(e) => tracing::warn!(
+                    "wire-emit: failed to set SO_PRIORITY={} ({}); a DSCP marking may route packets off the ETF class and silently disable SO_TXTIME pacing",
+                    etf_prio, e
+                ),
+            }
+            true
+        }
         Err(e) => {
             // Distinguish "no permission" from "kernel doesn't know
             // this clockid / option" — both surface as setsockopt
@@ -714,20 +738,31 @@ impl TargetState {
             return self.wall_anchor_ns.max(now_ns);
         }
 
-        // Between PCRs: emit ASAP. PCR-bearing packets are the only
-        // pacing-critical events (they set wall_anchor at the correct
-        // wallclock instant via the closed-loop). Non-PCR datagrams
-        // target max(wall_anchor, now) so they queue behind the last
-        // PCR-paced emit and burst out in one sendmmsg batch.
+        // Between PCRs: linearly interpolate each non-PCR datagram's target
+        // across the interval implied by the most recently completed PCR
+        // window, so datagrams spread evenly instead of all clumping at
+        // `wall_anchor` and bursting out in one sendmmsg per PCR interval.
+        // The clumping showed up at the receiver as PCR-spacing-equivalent
+        // jitter (40–60 ms at 50 fps) — fine for a pro T-STD jitter buffer,
+        // but it breaks consumer receivers (VLC) and, when the kernel ETF
+        // qdisc is bypassed, hits the wire as a burst.
         //
-        // This creates bursty delivery (one batch per PCR interval).
-        // Consumer receivers (VLC, ffplay) may need a larger UDP receive
-        // buffer — `sysctl net.core.rmem_default=8388608` on the
-        // receiving host, or VLC `--network-caching=3000`.
-        // Professional receivers (Appear X, Cobalt, Cisco) handle the
-        // burst natively via their T-STD jitter buffers.
+        // `target = wall_anchor + (bytes_since_anchor / prev_interval_bytes)
+        //           × prev_interval_ns`, capped at one interval so a longer
+        // current (VBR) window can't push a datagram past where the next PCR
+        // re-anchors (the next PCR corrects the baseline regardless). Cold
+        // start (no completed interval yet) falls back to emit-at-anchor.
         self.bytes_since_anchor = self.bytes_since_anchor.saturating_add(datagram_bytes as u64);
-        self.wall_anchor_ns.max(now_ns)
+        if self.prev_interval_bytes > 0 && self.prev_interval_ns > 0 {
+            let frac_ns = (self
+                .bytes_since_anchor
+                .saturating_mul(self.prev_interval_ns)
+                / self.prev_interval_bytes)
+                .min(self.prev_interval_ns);
+            self.wall_anchor_ns.saturating_add(frac_ns).max(now_ns)
+        } else {
+            self.wall_anchor_ns.max(now_ns)
+        }
     }
 }
 
@@ -1200,27 +1235,37 @@ mod tests {
     }
 
     #[test]
-    fn between_pcrs_emit_asap_after_anchor() {
+    fn between_pcrs_interpolate_across_interval() {
         let mut s = TargetState::default();
         // First datagram, PCR=0. wall_anchor = preroll into the future.
         let _ = s.derive_target(0, Some(0), 1316);
-        // Seed observed rate via a second PCR 40 ms later carrying
-        // 50 000 bytes accumulated in between (the test fakes this by
-        // setting bytes_since_anchor directly so the observed-rate
-        // EMA fires).
+        // Second PCR 40 ms later with 50 000 bytes accumulated in between
+        // → completes one interval, so prev_interval_{bytes,ns} are seeded.
         s.bytes_since_anchor = 50_000;
         let _ = s.derive_target(0, Some(40 * TICK_PER_MS), 1316);
         assert_eq!(s.observed_rate_bps, 10_000_000); // 50 KB / 40 ms = 10 Mbps (telemetry only)
+        assert_eq!(s.prev_interval_bytes, 50_000);
+        assert_eq!(s.prev_interval_ns, 40 * 1_000_000);
         let anchor = s.wall_anchor_ns;
 
-        // Non-PCR datagram between PCRs: target = max(wall_anchor, now).
-        let target = s.derive_target(anchor + 1, None, 1316);
-        assert_eq!(target, anchor + 1);
+        // Non-PCR datagrams now LINEARLY INTERPOLATE across the completed
+        // interval instead of all clumping at `wall_anchor` and bursting out
+        // together. target = wall_anchor + bytes_since_anchor/prev_interval_bytes × prev_interval_ns.
+        // First (1316 bytes): 1316/50000 × 40 ms = 1.0528 ms past the anchor.
+        let t1 = s.derive_target(anchor + 1, None, 1316);
         assert_eq!(s.bytes_since_anchor, 1316);
+        assert_eq!(t1, anchor + 1316 * 40_000_000 / 50_000);
 
-        let target2 = s.derive_target(anchor + 100_000, None, 1316);
-        assert_eq!(target2, anchor + 100_000);
+        // Second (cumulative 2632 bytes): 2632/50000 × 40 ms = 2.1056 ms.
+        let t2 = s.derive_target(anchor + 100_000, None, 1316);
         assert_eq!(s.bytes_since_anchor, 2632);
+        assert_eq!(t2, anchor + 2632 * 40_000_000 / 50_000);
+
+        // The whole point of the fix: consecutive non-PCR datagrams get
+        // strictly-increasing, spread-out targets — NOT the same clumped
+        // `wall_anchor` value they had before.
+        assert!(t2 > t1, "between-PCR datagrams must spread across the interval, not clump");
+        assert!(t1 > anchor, "first non-PCR datagram must be paced past the anchor, not emitted at it");
     }
 
     #[test]
@@ -1333,9 +1378,12 @@ mod tests {
         s.bytes_since_anchor = 50_000;
         let _ = s.derive_target(now, Some(40 * TICK_PER_MS), 1316);
         assert!(s.observed_rate_bps > 0);
-        // Non-PCR datagrams emit ASAP: target = max(wall_anchor, now).
+        // Now an interval is complete, so non-PCR datagrams interpolate
+        // across it (spread) instead of clumping at wall_anchor:
+        // wall_anchor + 1316/50000 × 40 ms.
+        let wa = s.wall_anchor_ns;
         let post = s.derive_target(now + 1, None, 1316);
-        assert_eq!(post, s.wall_anchor_ns.max(now + 1));
+        assert_eq!(post, wa + 1316 * 40_000_000 / 50_000);
     }
 
     #[test]

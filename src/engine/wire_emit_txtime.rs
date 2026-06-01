@@ -117,6 +117,45 @@ pub fn enable_so_txtime(_socket: &std::net::UdpSocket, _clockid: i32) -> io::Res
     ))
 }
 
+/// Set `SO_PRIORITY` on a socket so its packets land on the mqprio traffic
+/// class that carries the ETF qdisc.
+///
+/// The kernel derives `sk_priority` from the DSCP/IP_TOS byte via
+/// `rt_tos2priority()` UNLESS `SO_PRIORITY` is set explicitly. A DSCP such as
+/// EF (46) yields a non-zero priority that the default mqprio `prio_tc_map`
+/// (`0 0 0 0 1 1 1 1 …`) routes to TC1 — OFF the ETF class on TC0 — so the
+/// `SCM_TXTIME` cmsg is silently ignored and every datagram emits immediately
+/// (no kernel pacing). Calling this AFTER `set_tos` pins the priority back
+/// onto the ETF class. DSCP stays in the IP header (downstream wire QoS
+/// intact); only the *local* qdisc class selection changes. `SO_PRIORITY` set
+/// via setsockopt overrides the TOS-derived value.
+#[cfg(target_os = "linux")]
+pub fn set_so_priority(socket: &std::net::UdpSocket, priority: u32) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let p = priority as libc::c_int;
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PRIORITY,
+            (&p as *const libc::c_int) as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_so_priority(_socket: &std::net::UdpSocket, _priority: u32) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "SO_PRIORITY is Linux-only",
+    ))
+}
+
 /// Send one datagram with a target tx time. The socket must already
 /// have `SO_TXTIME` enabled — otherwise the CMSG is silently dropped
 /// and the packet emits immediately.
