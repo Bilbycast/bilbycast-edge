@@ -151,7 +151,18 @@ const SO_TXTIME_ERRQUEUE_DRAIN_EVERY: u64 = 1024;
 /// pass through untouched; because both the derived target and the floor are
 /// monotonically non-decreasing, the floored stream stays ordered (no etf
 /// reorder of HEVC reference frames).
-const ETF_LATE_FLOOR_NS: u64 = 1_000_000;
+///
+/// Sized at 15 ms (not the etf `delta` + a hair): the floor must also cover
+/// the gap between stamping `now` here and the etf qdisc's hrtimer actually
+/// dequeuing the packet. On a contended box where the SCHED_FIFO wire-emit
+/// thread shares cores with the input/media-pacer threads, that gap was
+/// observed to exceed 1 ms for ~13 % of packets — etf then dropped them as
+/// late (data loss). 15 ms is comfortably past worst-case scheduling slop yet
+/// well inside the receiver's T-STD jitter buffer (output PCR carries 80 ms
+/// preroll), so a floored (late) packet is delivered intact, just slightly
+/// late, instead of dropped. CPU-isolating the wire-emit thread
+/// (`BILBYCAST_WIRE_EMIT_CPUS`) is the complementary deployment-side fix.
+const ETF_LATE_FLOOR_NS: u64 = 15_000_000;
 
 /// Channel capacity. Bumped from 1024 → 8192 to absorb startup
 /// bursts that previously caused drop-on-full at the `wire_tx`
