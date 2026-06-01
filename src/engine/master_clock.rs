@@ -16,17 +16,30 @@
 //!
 //! ## Selection policy
 //!
-//! [`select_master_for_flow`] picks the right [`MasterClockKind`] for a
-//! given flow at start-up:
+//! [`select_master_kind_for_input`] picks the [`MasterClockKind`] for a
+//! flow at start-up, from the type of the input that *drives* the master
+//! clock — the active input for a passthrough flow, or the designated
+//! `pcr_source` input ([`resolve_pcr_source_input_id`]) for a PID-bus
+//! assembled flow. Rows are evaluated in priority order:
 //!
-//! | Active input                            | Master                        |
-//! |-----------------------------------------|-------------------------------|
-//! | SRT / RTP / UDP / RIST carrying TS      | `SourcePcrPll`                |
-//! | RTMP / RTSP carrying TS via input mux   | `SourcePcrPll`                |
-//! | media_player / test_pattern / replay    | `SourcePcrPll` (synth feed)   |
-//! | ST 2110-20/-23/-30/-31/-40              | `Ptp` (Phase 6)               |
-//! | WebRTC ingress                          | `Wallclock` + warn event      |
-//! | None active                             | `Wallclock`                   |
+//! | Driving input / flow shape                       | Master                     |
+//! |--------------------------------------------------|----------------------------|
+//! | ST 2110-20/-23/-30/-31/-40, MXL                  | `Ptp`                      |
+//! | WebRTC / WHEP ingress                            | `Wallclock` + warn event   |
+//! | Flow has `assembly` set (PID-bus SPTS/MPTS)      | `SourcePcrPll`             |
+//! | SRT / RTP / UDP / RIST / RTMP / RTSP carrying TS | `Wallclock` (PLL opt-in)   |
+//! | media_player / test_pattern / replay / rtp_audio | `Wallclock`                |
+//! | bonded / none active                             | `Wallclock`                |
+//!
+//! Assembled flows default to `SourcePcrPll` because the assembler
+//! generates fresh output PCR from [`MasterClock::now_27mhz`] and needs a
+//! recovered source clock to keep it coherent. Plain contribution flows
+//! default to `Wallclock` and only run the source-PCR PLL when an operator
+//! opts in per-flow via `master_clock.kind = "contribution"` (preferred,
+//! surfaces intent on telemetry) or the legacy `"source_pcr_pll"`. The
+//! former PLL-everywhere default was dropped because internet contribution's
+//! ms-scale PCR-arrival jitter tripped spurious fallback alarms on flows
+//! whose output A/V sync was unaffected.
 //!
 //! Operators can pin a master per-flow via
 //! [`crate::config::models::FlowConfig::master_clock`]; that override beats
