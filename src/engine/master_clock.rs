@@ -604,11 +604,27 @@ impl MasterClock for WallclockMaster {
 pub struct PcrPllWithFallback {
     pll_master: Arc<SourcePcrPllMaster>,
     wallclock: WallclockMaster,
+    /// Optional middle fallback rung for the `auto` cascade
+    /// (PLL → PTP → Wallclock). When `Some` and locked at fallback-fire
+    /// time, the master falls to PTP instead of straight to wallclock; if
+    /// PTP later loses lock it demotes one-way to wallclock (never
+    /// re-promotes — avoids emitting PCR off an unlocked CLOCK_REALTIME
+    /// and avoids epoch oscillation if PTP flaps). `None` = classic
+    /// PLL → Wallclock wrapper, behaviourally unchanged.
+    ptp_fallback: Option<Arc<dyn MasterClock>>,
     fallback_active: AtomicBool,
+    /// When in fallback: true = currently driving from the PTP rung,
+    /// false = wallclock. Latched at fallback-fire from PTP health;
+    /// demoted to false (one-way) by `now_27mhz` if PTP loses lock.
+    fallback_uses_ptp: AtomicBool,
     /// Reason the most recent fallback fired. Cleared on
     /// `deactivate_fallback`. Read by `telemetry()` when the active
     /// flag is set.
     fallback_reason: std::sync::RwLock<Option<String>>,
+    /// Operator's configured label for telemetry — `Some("auto")` for the
+    /// cascade so the UI renders "Auto → PTP/Wallclock"; `None` for the
+    /// classic wrapper (which reports `source_pcr_pll`).
+    configured_kind: Option<&'static str>,
     source_id: String,
 }
 
@@ -618,8 +634,33 @@ impl PcrPllWithFallback {
         Self {
             pll_master,
             wallclock: WallclockMaster::new(),
+            ptp_fallback: None,
             fallback_active: AtomicBool::new(false),
+            fallback_uses_ptp: AtomicBool::new(false),
             fallback_reason: std::sync::RwLock::new(None),
+            configured_kind: None,
+            source_id,
+        }
+    }
+
+    /// Cascade constructor for `master_clock.kind = "auto"`: PLL primary,
+    /// optional PTP middle rung (`None` when the node has no PTP role
+    /// configured → classic PLL → Wallclock), wallclock floor. `label` is
+    /// the operator-configured kind surfaced on telemetry (e.g. `"auto"`).
+    pub fn new_cascade(
+        pll_master: Arc<SourcePcrPllMaster>,
+        ptp_fallback: Option<Arc<dyn MasterClock>>,
+        label: &'static str,
+    ) -> Self {
+        let source_id = pll_master.source_id().to_string();
+        Self {
+            pll_master,
+            wallclock: WallclockMaster::new(),
+            ptp_fallback,
+            fallback_active: AtomicBool::new(false),
+            fallback_uses_ptp: AtomicBool::new(false),
+            fallback_reason: std::sync::RwLock::new(None),
+            configured_kind: Some(label),
             source_id,
         }
     }
@@ -632,6 +673,17 @@ impl PcrPllWithFallback {
     /// `deactivate_fallback` clears the state so subsequent activate
     /// calls record fresh reasons.
     pub fn activate_fallback(&self, reason: impl Into<String>) {
+        // Cascade target decision, latched here so the data path doesn't
+        // flap: prefer the PTP rung when present AND locked at this moment;
+        // else wallclock. `now_27mhz` only ever demotes PTP → wallclock
+        // one-way if PTP later loses lock. For the classic wrapper
+        // (`ptp_fallback == None`) this is always false → wallclock, exactly
+        // as before.
+        let use_ptp = self
+            .ptp_fallback
+            .as_ref()
+            .map_or(false, |p| p.is_locked());
+        self.fallback_uses_ptp.store(use_ptp, Ordering::Release);
         // Record reason first so any reader observing `fallback_active`
         // sees a populated reason. `expect` is safe — write lock
         // poisoning would mean a panic already shredded the engine; we
@@ -690,6 +742,17 @@ impl MasterClock for PcrPllWithFallback {
                 self.deactivate_fallback();
                 return self.pll_master.now_27mhz();
             }
+            // Cascade middle rung: drive from PTP while it stays locked.
+            // The first time it loses lock, demote one-way to wallclock so
+            // we never emit PCR off an unlocked, undisciplined PTP clock.
+            if self.fallback_uses_ptp.load(Ordering::Acquire) {
+                if let Some(ptp) = &self.ptp_fallback {
+                    if ptp.is_locked() {
+                        return ptp.now_27mhz();
+                    }
+                }
+                self.fallback_uses_ptp.store(false, Ordering::Release);
+            }
             self.wallclock.now_27mhz()
         } else {
             self.pll_master.now_27mhz()
@@ -724,15 +787,40 @@ impl MasterClock for PcrPllWithFallback {
                 self.deactivate_fallback();
                 return self.pll_master.telemetry();
             }
+            // Cascade PTP rung active → report its real servo telemetry,
+            // labelled `auto`. PTP is a legitimate resolved rung, not an
+            // alarm, so `fallback_active` stays false (the "Auto → PTP"
+            // label tells the story).
+            let on_ptp = self.fallback_uses_ptp.load(Ordering::Acquire)
+                && self
+                    .ptp_fallback
+                    .as_ref()
+                    .map_or(false, |p| p.is_locked());
+            if on_ptp {
+                let mut t = self.ptp_fallback.as_ref().unwrap().telemetry();
+                t.configured_kind =
+                    Some(self.configured_kind.unwrap_or("auto").to_string());
+                t.fallback_active = false;
+                return t;
+            }
+            // Wallclock rung. The classic wrapper surfaces the alarm chip +
+            // reason ("Wallclock (fallback from source_pcr_pll)"); the
+            // cascade treats wallclock as its expected floor (the
+            // "Auto → Wallclock" label communicates it) and does not alarm.
+            let is_cascade = self.configured_kind.is_some();
             let mut t = self.wallclock.telemetry();
             t.kind = MasterClockKind::Wallclock.as_str().to_string();
-            t.configured_kind = Some(MasterClockKind::SourcePcrPll.as_str().to_string());
-            t.fallback_active = true;
-            t.fallback_reason = self
-                .fallback_reason
-                .read()
-                .ok()
-                .and_then(|g| g.clone());
+            t.configured_kind = Some(
+                self.configured_kind
+                    .unwrap_or(MasterClockKind::SourcePcrPll.as_str())
+                    .to_string(),
+            );
+            t.fallback_active = !is_cascade;
+            t.fallback_reason = if is_cascade {
+                None
+            } else {
+                self.fallback_reason.read().ok().and_then(|g| g.clone())
+            };
             t
         } else {
             self.pll_master.telemetry()
@@ -924,6 +1012,12 @@ pub struct MasterClockHandle {
     /// we don't spam the operator. Mirrors the `WallclockMaster` fall-
     /// back path.
     degraded_warned: Arc<AtomicBool>,
+    /// Operator's *configured* kind label when it differs from the
+    /// resolved runtime `kind` (e.g. `auto` resolving to `ptp` /
+    /// `wallclock`). Surfaced on `MasterClockTelemetry.configured_kind`.
+    /// `Copy`, set once at construction before any clone — all clones
+    /// inherit it without an atomic.
+    configured_kind: Option<&'static str>,
 }
 
 impl MasterClockHandle {
@@ -952,7 +1046,18 @@ impl MasterClockHandle {
             kind,
             lipsync_offset_90k: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             degraded_warned: Arc::new(AtomicBool::new(false)),
+            configured_kind: None,
         }
+    }
+
+    /// Tag the handle with the operator's *configured* kind label when it
+    /// differs from the resolved runtime kind (e.g. `auto` resolving to
+    /// `ptp` or `wallclock`). Surfaced on
+    /// `MasterClockTelemetry.configured_kind` for the manager UI. Call
+    /// before any clone — the tag is `Copy` and inherited by clones.
+    pub fn with_configured_kind(mut self, configured: &'static str) -> Self {
+        self.configured_kind = Some(configured);
+        self
     }
 
     /// Build a Wallclock handle. Convenience wrapper for fall-back paths
@@ -1018,6 +1123,12 @@ impl MasterClockHandle {
         // a Phase-3 stub would otherwise label itself "wallclock").
         if t.configured_kind.is_none() {
             t.kind = self.kind.as_str().to_string();
+            // Surface the operator's configured label (e.g. `auto`) when
+            // it differs from the resolved runtime kind, so the UI can
+            // render "Auto → PTP" rather than just "PTP".
+            if let Some(ck) = self.configured_kind {
+                t.configured_kind = Some(ck.to_string());
+            }
         }
         t
     }
@@ -1309,6 +1420,62 @@ mod tests {
         assert!(h.is_locked());
         assert_eq!(h.kind(), MasterClockKind::Wallclock);
         assert_eq!(h.source_id(), "wallclock");
+    }
+
+    #[test]
+    fn with_configured_kind_surfaces_label_but_keeps_resolved_kind() {
+        // `auto` resolving to a wallclock backend must report
+        // kind = "wallclock" (what is actually running) AND
+        // configured_kind = "auto" (what the operator asked for).
+        let h = MasterClockHandle::wallclock().with_configured_kind("auto");
+        let t = h.telemetry();
+        assert_eq!(t.kind, "wallclock");
+        assert_eq!(t.configured_kind.as_deref(), Some("auto"));
+        // Untagged handle leaves configured_kind absent.
+        assert_eq!(MasterClockHandle::wallclock().telemetry().configured_kind, None);
+    }
+
+    #[test]
+    fn master_clock_kind_config_auto_serde() {
+        use crate::config::models::MasterClockKindConfig;
+        let parsed: MasterClockKindConfig =
+            serde_json::from_str("\"auto\"").expect("\"auto\" should deserialize");
+        assert_eq!(parsed, MasterClockKindConfig::Auto);
+        assert_eq!(
+            serde_json::to_string(&MasterClockKindConfig::Auto).unwrap(),
+            "\"auto\""
+        );
+    }
+
+    #[test]
+    fn cascade_without_ptp_rung_falls_to_wallclock_labelled_auto() {
+        // No PTP role configured → cascade degrades to PLL → Wallclock, but
+        // labelled `auto` and WITHOUT the alarm chip (the "Auto → Wallclock"
+        // label communicates the degraded floor).
+        let pll = Arc::new(SourcePcrPllMaster::new("test-auto"));
+        let w = PcrPllWithFallback::new_cascade(pll, None, "auto");
+        assert!(!w.is_fallback_active());
+        w.activate_fallback("jitter_too_high");
+        assert!(w.is_fallback_active());
+        let t = w.telemetry();
+        assert_eq!(t.kind, "wallclock");
+        assert_eq!(t.configured_kind.as_deref(), Some("auto"));
+        assert!(!t.fallback_active, "cascade must not raise the alarm chip");
+        assert!(w.now_27mhz() > 0);
+    }
+
+    #[test]
+    fn classic_fallback_still_alarms_with_source_pcr_pll_label() {
+        // The classic PLL → Wallclock wrapper is unchanged: alarm chip +
+        // source_pcr_pll label + reason.
+        let pll = Arc::new(SourcePcrPllMaster::new("test-classic"));
+        let w = PcrPllWithFallback::new(pll);
+        w.activate_fallback("jitter_too_high");
+        let t = w.telemetry();
+        assert_eq!(t.kind, "wallclock");
+        assert_eq!(t.configured_kind.as_deref(), Some("source_pcr_pll"));
+        assert!(t.fallback_active, "classic wrapper still alarms");
+        assert_eq!(t.fallback_reason.as_deref(), Some("jitter_too_high"));
     }
 
     #[test]

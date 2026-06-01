@@ -5795,6 +5795,108 @@ fn input_encode_blocks(
 // through to the Wallclock impl until Phase 6 lands real backends.
 // Returns the handle and an optional `SourcePcrPllMaster` so the flow
 // runtime can spawn the ingress PCR sampler against the same instance.
+/// Build the `master_clock.kind = "auto"` cascade: **PLL → PTP → Wallclock**.
+///
+/// Try the source PCR PLL first (best — output tracks the source clock, zero
+/// source-relative drift). If it can't lock within the grace window, fall to
+/// the node's PTP clock *when PTP is healthy* (a clean, cross-edge-coherent
+/// reference); else fall to wallclock (the always-available floor). The PTP
+/// rung is present only when the node has a PTP role configured (`ptp.conf`
+/// mode != off) — otherwise the cascade degrades to the classic
+/// PLL → Wallclock. The PTP-vs-wallclock choice is latched at fallback-fire
+/// and only ever demotes (PTP → wallclock) if PTP later loses lock, so the
+/// output never rides an unlocked CLOCK_REALTIME and never oscillates epochs.
+fn build_auto_cascade(
+    cfg: &crate::config::models::FlowConfig,
+    active_input_rx: tokio::sync::watch::Receiver<String>,
+    event_sender: &EventSender,
+    cancel_token: &CancellationToken,
+) -> (
+    crate::engine::master_clock::MasterClockHandle,
+    Option<Arc<crate::engine::master_clock::SourcePcrPllMaster>>,
+    Option<crate::engine::st2110::ptp::PtpStateHandle>,
+) {
+    use crate::engine::master_clock::{
+        MasterClock, MasterClockHandle, MasterClockKind, PcrPllWithFallback, SourcePcrPllMaster,
+    };
+
+    // ── PLL primary — same construction + lock-jitter override as an
+    //    explicit `source_pcr_pll` pin ──
+    let pll_config = {
+        let mut c = crate::engine::pcr_pll::PcrPllConfig::default();
+        if let Some(lock_us) = cfg.master_clock.as_ref().and_then(|m| m.pll_lock_jitter_us) {
+            let clamped = lock_us.clamp(50, 5000) as u64;
+            c.lock_jitter_us = clamped;
+            c.unlock_jitter_us = clamped * 5;
+        }
+        c
+    };
+    let pll_inner = Arc::new(SourcePcrPllMaster::new_with_config(
+        format!("source_pcr:{}", cfg.id),
+        pll_config,
+    ));
+
+    // ── PTP middle rung — built only when the node has a PTP role
+    //    configured. Polls the node's `ptp.conf` domain (matches the
+    //    health probe), not the flow's SDP `clock_domain` (unset on a
+    //    contribution flow). ──
+    let ptp_settings = crate::util::ptp_config::load();
+    let (ptp_fallback, ptp_handle): (
+        Option<Arc<dyn MasterClock>>,
+        Option<crate::engine::st2110::ptp::PtpStateHandle>,
+    ) = if ptp_settings.mode != crate::util::ptp_config::PtpMode::Off {
+        let domain = ptp_settings.domain.unwrap_or(127);
+        let state = Arc::new(crate::engine::st2110::ptp::PtpStateReporter::spawn(
+            crate::engine::st2110::ptp::PtpReporterConfig {
+                domain,
+                ..Default::default()
+            },
+            cancel_token.child_token(),
+        ));
+        let handle = (*state).clone();
+        let ptp_clock: Arc<dyn MasterClock> =
+            Arc::new(crate::engine::master_clock::PtpMasterClock::new(state));
+        (Some(ptp_clock), Some(handle))
+    } else {
+        (None, None)
+    };
+    let has_ptp_rung = ptp_handle.is_some();
+
+    let wrapper = Arc::new(PcrPllWithFallback::new_cascade(
+        pll_inner.clone(),
+        ptp_fallback,
+        "auto",
+    ));
+    // Same fallback watcher as the PLL path — it drives the PLL→fallback
+    // decision; `activate_fallback` picks PTP-vs-wallclock internally.
+    let timeout_s = cfg
+        .master_clock
+        .as_ref()
+        .and_then(|m| m.pll_lock_timeout_s)
+        .unwrap_or(30);
+    crate::engine::master_clock::spawn_pll_fallback_watcher(
+        wrapper.clone(),
+        cfg.id.clone(),
+        active_input_rx,
+        timeout_s,
+        event_sender.clone(),
+        cancel_token.child_token(),
+    );
+
+    let handle = MasterClockHandle::new(wrapper, MasterClockKind::SourcePcrPll)
+        .with_configured_kind("auto");
+    if let Some(mc_cfg) = cfg.master_clock.as_ref() {
+        handle.set_lipsync_offset_90k(mc_cfg.lipsync_offset_90k);
+    }
+    tracing::warn!(
+        flow_id = %cfg.id,
+        ptp_rung = has_ptp_rung,
+        "master clock: auto cascade (PLL → {} → Wallclock)",
+        if has_ptp_rung { "PTP" } else { "(no PTP role)" },
+    );
+    (handle, Some(pll_inner), ptp_handle)
+}
+
 fn build_master_clock(
     cfg: &crate::config::models::FlowConfig,
     active_input: Option<&crate::config::models::InputConfig>,
@@ -5810,6 +5912,25 @@ fn build_master_clock(
     use crate::engine::master_clock::{
         MasterClockHandle, MasterClockKind, SourcePcrPllMaster, WallclockMaster,
     };
+
+    // `auto` is PER-INPUT. ST 2110 / MXL essence is PTP-domain, so it
+    // resolves straight to PTP (no PLL-first). Contribution + assembly get
+    // the PLL → PTP → Wallclock cascade. `select_master_kind_for_input`
+    // returns `Ptp` only for the PTP-native (ST 2110 / MXL) inputs, so it's
+    // the authoritative "is this input PTP-domain?" check.
+    let is_auto = matches!(
+        cfg.master_clock.as_ref().map(|m| m.kind),
+        Some(MasterClockKindConfig::Auto)
+    );
+    if is_auto
+        && !matches!(
+            crate::engine::master_clock::select_master_kind_for_input(active_input, cfg),
+            MasterClockKind::Ptp
+        )
+    {
+        // Contribution / assembly → cascade.
+        return build_auto_cascade(cfg, active_input_rx, event_sender, cancel_token);
+    }
 
     let kind = match cfg.master_clock.as_ref().map(|m| m.kind) {
         Some(MasterClockKindConfig::SourcePcrPll) => MasterClockKind::SourcePcrPll,
@@ -5845,6 +5966,12 @@ fn build_master_clock(
             // contribution feeds where cross-edge clock coherence is
             // important.
             MasterClockKind::SourcePcrPll
+        }
+        Some(MasterClockKindConfig::Auto) => {
+            // Auto on a PTP-native input (ST 2110 / MXL) → PTP-primary.
+            // Contribution / assembly Auto returned to build_auto_cascade
+            // above, so only the PTP-native case reaches here.
+            MasterClockKind::Ptp
         }
         None => crate::engine::master_clock::select_master_kind_for_input(active_input, cfg),
     };
@@ -5948,6 +6075,15 @@ fn build_master_clock(
             None,
             None,
         ),
+    };
+
+    // Auto on a PTP-native input resolved to PTP above — tag it so the UI
+    // shows "Auto → PTP" (the contribution/assembly cascade tags itself in
+    // build_auto_cascade).
+    let handle = if is_auto {
+        handle.with_configured_kind("auto")
+    } else {
+        handle
     };
 
     if let Some(mc_cfg) = cfg.master_clock.as_ref() {

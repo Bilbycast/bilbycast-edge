@@ -54,6 +54,37 @@ flow config (overrides the auto-policy). Useful when a plant has PTP
 everywhere and the operator wants every flow paced against the
 grandmaster regardless of input type.
 
+**Per-input auto: `master_clock.kind = "auto"`.** A config-level policy
+rather than a runtime kind of its own — it picks the right reference for
+the input type. **ST 2110 / MXL** inputs are PTP-domain essence, so they
+resolve straight to **PTP** (no PLL-first). **Contribution + assembly**
+inputs get the cascade **source PCR PLL → PTP → Wallclock**. The cascade
+first runs the source-PCR PLL against the selected
+input (best — output tracks the source clock, zero source-relative
+drift). If the PLL can't lock within `pll_lock_timeout_s` (default 30 s),
+the fallback watcher drops to the **PTP** rung when the node has a PTP
+role configured (`ptp.conf` mode != off) **and** PTP is healthy (slave
+`Locked`, or this node is the grandmaster) — a clean, cross-edge-coherent
+reference (genlock-free 2022-7). Otherwise it drops to **wallclock**, the
+always-available floor.
+
+The PTP-vs-wallclock choice is **latched** when the PLL gives up, and the
+data path only ever **demotes one-way** (PTP → wallclock) if PTP later
+loses lock — so the output never paces PCR off an unlocked, undisciplined
+`CLOCK_REALTIME`, and never oscillates epochs. The PTP rung polls the
+node's `ptp.conf` domain, not the flow's SDP `clock_domain`. If the PLL
+re-locks at any point, the master self-heals back to the PLL (best rung).
+
+Telemetry reports `configured_kind = "auto"` with `kind` = the active
+rung, so the manager UI renders "Auto → Source PCR PLL" / "Auto → PTP" /
+"Auto → Wallclock". This order suits **contribution** workflows: prefer
+to track the source, use PTP as a clean catch when the source clock is
+unrecoverable, wallclock only as the last resort. Caveats: mid-run PTP
+loss demotes to wallclock (a PCR discontinuity, but safe); and the PTP
+rung buys cross-edge / absolute coherence, **not** drift versus an
+un-genlocked source — for true source-rate tracking the PLL must lock, or
+the source must be genlocked.
+
 ## Encoder-style PES PTS regeneration
 
 Every TS-carrying ingress can opt in to byte-level PES PTS/DTS

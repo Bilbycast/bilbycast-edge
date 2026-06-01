@@ -764,6 +764,25 @@ pub enum MasterClockKindConfig {
     /// render "PLL (contribution)" distinct from a legacy
     /// `source_pcr_pll` explicit pin.
     Contribution,
+    /// Per-input auto policy. **ST 2110 / MXL** inputs are PTP-domain
+    /// essence, so they resolve straight to **PTP** (no PLL-first).
+    /// **Contribution + assembly** inputs (SRT/RIST/RTP/UDP/RTMP/RTSP/…)
+    /// get the cascade: **source PCR PLL → PTP → Wallclock**. The cascade
+    /// first tries to lock the selected input's PCR via the source-PCR PLL
+    /// (best — output tracks the source clock with zero source-relative
+    /// drift). If the PLL can't lock within the grace window, it falls to
+    /// the node's PTP clock when a PTP role is configured (`ptp.conf` !=
+    /// off) AND PTP is healthy (slave `Locked`, or this node is the
+    /// grandmaster) — a clean, cross-edge-coherent reference (genlock-free
+    /// 2022-7). Otherwise it falls to wallclock, the always-available floor.
+    ///
+    /// The PTP-vs-wallclock choice is latched when the PLL gives up, and
+    /// only ever demotes one-way (PTP → wallclock) if PTP later loses
+    /// lock — so the output never rides an unlocked `CLOCK_REALTIME` and
+    /// never oscillates epochs. Telemetry reports `configured_kind =
+    /// "auto"` with `kind` = the active rung, so the manager UI renders
+    /// "Auto → Source PCR PLL" / "Auto → PTP" / "Auto → Wallclock".
+    Auto,
 }
 
 /// Per-flow continuous-recording attributes. When attached to a
