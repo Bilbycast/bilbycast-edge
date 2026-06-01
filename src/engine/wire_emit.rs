@@ -138,6 +138,21 @@ const RECV_POLL: Duration = Duration::from_millis(50);
 /// non-blocking `recvmsg` call returning EAGAIN when empty).
 const SO_TXTIME_ERRQUEUE_DRAIN_EVERY: u64 = 1024;
 
+/// Minimum lead time (ns) stamped into a SO_TXTIME launch timestamp on the
+/// ETF path. The `etf` qdisc DROPS any packet whose launch time is at or
+/// behind "now" when it reaches the qdisc (its `delta` lookahead is 200 µs);
+/// the generator legitimately emits "now" targets (late-rebase, PCR
+/// discontinuities, input-switch resets, catch-up on bursty/contribution
+/// sources), and on a bursty source that dropped ~14 % of packets at the
+/// qdisc. Flooring the launch time to `now + ETF_LATE_FLOOR_NS` turns a late
+/// packet into "emit ~1 ms from now" instead of a drop. 1 ms is comfortably
+/// above the 200 µs etf `delta` + sendmsg→qdisc latency, and trivial added
+/// latency. On-time targets (the common case) already exceed the floor and
+/// pass through untouched; because both the derived target and the floor are
+/// monotonically non-decreasing, the floored stream stays ordered (no etf
+/// reorder of HEVC reference frames).
+const ETF_LATE_FLOOR_NS: u64 = 1_000_000;
+
 /// Channel capacity. Bumped from 1024 → 8192 to absorb startup
 /// bursts that previously caused drop-on-full at the `wire_tx`
 /// boundary:
@@ -1095,8 +1110,16 @@ fn run_emitter(
                     // Kernel handles the wallclock target via ETF qdisc.
                     // No userspace sleep — the thread loops at producer
                     // rate with bounded recvmsg + sendmsg cost.
+                    //
+                    // Floor the launch time to `now + ETF_LATE_FLOOR_NS` so a
+                    // target that has fallen at/behind real time (late-rebase,
+                    // discontinuity, bursty catch-up) is emitted ~1 ms out
+                    // rather than DROPPED by the etf qdisc as "too late". The
+                    // floor is monotonic with the derived target, so ordering
+                    // is preserved; on-time targets are unaffected.
+                    let floor = monotonic_now_ns().saturating_add(ETF_LATE_FLOOR_NS);
                     crate::engine::wire_emit_txtime::send_with_txtime(
-                        &socket, dest, &dg.bytes, target_ns,
+                        &socket, dest, &dg.bytes, target_ns.max(floor),
                     )
                 }
             };
