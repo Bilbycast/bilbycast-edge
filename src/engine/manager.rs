@@ -935,6 +935,34 @@ impl FlowManager {
                     splice_mode_override,
                 },
             );
+        } else if let Some(mode) = splice_mode_override {
+            // Passthrough flow: there is no assembler to honour a
+            // PES-aligned / forced-PMT-bump splice. The TsContinuityFixer
+            // does a plain seamless cut. Surface a Warning so the operator
+            // knows the per-switch override had no effect rather than
+            // swallowing it silently — PES Switch is an assembled-flow
+            // (SPTS / MPTS / PID-bus) feature only.
+            let mode_str = match mode {
+                crate::config::models::SpliceMode::PmtBump => "pmt_bump",
+                crate::config::models::SpliceMode::PesAligned => "pes_aligned",
+            };
+            self.event_sender.send(Event {
+                severity: EventSeverity::Warning,
+                category: category::FLOW.to_string(),
+                message: format!(
+                    "Flow '{flow_id}': splice override '{mode_str}' ignored — flow is passthrough \
+                     (no PID-bus assembler); used the default seamless cut"
+                ),
+                details: Some(serde_json::json!({
+                    "error_code": "splice_override_ignored",
+                    "requested_mode": mode_str,
+                    "reason": "flow_not_assembled",
+                    "new_input_id": new_input_id,
+                })),
+                flow_id: Some(flow_id.to_string()),
+                input_id: Some(new_input_id.to_string()),
+                output_id: None,
+            });
         }
         self.event_sender.send(Event {
             severity: EventSeverity::Info,

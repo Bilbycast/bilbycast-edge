@@ -121,9 +121,11 @@ pub struct AssemblySlot {
     /// - [`SpliceMode::PesAligned`]: assembler buffers the slot's
     ///   outbound bytes at the last PES boundary on the from-leg,
     ///   then concatenates the to-leg's next PES with
-    ///   `PTS ≥ last_a_pts + audio_frame_duration`. Audio-only on
-    ///   first land; non-audio slots fall through to `PmtBump`
-    ///   silently. Ignored for non-switch slots.
+    ///   `PTS ≥ threshold`. Honoured for both audio (PES-boundary
+    ///   aligned) and video (H.264 / HEVC, IDR-aligned). Slots whose
+    ///   codec supports neither fall through to `PmtBump` and the
+    ///   assembler emits `pes_splice_degraded`. Ignored for non-switch
+    ///   slots.
     pub splice_mode: crate::config::models::SpliceMode,
     /// PES Switch Phase 4. Splice-budget override in ms for
     /// `PesAligned` mode. `None` falls back to the default
@@ -155,28 +157,32 @@ pub enum PlanCommand {
     ///   slot's active-leg pointer, bumps the owning program's PMT
     ///   version (mod 32, monotonic), and arms DI=1 on the next PCR
     ///   for the slot's `out_pid`.
-    /// - [`SpliceMode::PesAligned`]: arms the per-slot audio splice
-    ///   state machine ([`crate::engine::pes_splice::AudioSpliceState`])
-    ///   if the slot's `stream_type` is a supported audio codec. The
-    ///   active-leg flip is deferred until either B produces a PUSI=1
-    ///   PES with `pts ≥ last_a_pts + audio_frame_duration` (commit,
-    ///   emits `pes_splice_completed`) or the splice budget expires
-    ///   (fall back to PmtBump, emits `pes_splice_timeout`). Non-audio
-    ///   slots fall through to the PmtBump path silently — video
-    ///   splice is a separate Phase 4 follow-up.
+    /// - [`SpliceMode::PesAligned`]: arms the per-slot splice state
+    ///   machine — [`crate::engine::pes_splice::AudioSpliceState`] for
+    ///   supported audio codecs, or
+    ///   [`crate::engine::pes_splice::VideoSpliceState`] for H.264
+    ///   (`0x1B`) / HEVC (`0x24`). The active-leg flip is deferred
+    ///   until either B produces an aligned PES (audio: PUSI=1 at
+    ///   `pts ≥ threshold`; video: the same plus an IDR access unit)
+    ///   — commit — or the splice budget expires (fall back to
+    ///   PmtBump, emits `pes_splice_timeout`). Slots whose codec
+    ///   supports neither fall through to the PmtBump path and emit
+    ///   `pes_splice_degraded`.
     ///
     /// Slots whose leg list does not include `new_input_id` are left
     /// untouched — per design, `ActivateInput` is silent for slots
     /// that don't speak that source.
     SwitchActiveInput {
         new_input_id: String,
-        /// PES Switch Phase 4. `None` is treated as
-        /// [`SpliceMode::PmtBump`] for backward compatibility with
-        /// callers that haven't been updated. When `Some`, the
-        /// command overrides each slot's config-time `splice_mode`
-        /// for this one switch — useful for ad-hoc operator overrides
-        /// without reconfiguring the flow.
-        #[allow(dead_code)] // wired through SwitchActiveInput handler in a follow-up
+        /// PES Switch Phase 4. `None` means "honour each slot's
+        /// config-time `splice_mode`" (which itself defaults to
+        /// [`SpliceMode::PmtBump`]) — the back-compatible behaviour for
+        /// callers that don't set it. When `Some`, the command
+        /// overrides each slot's config-time `splice_mode` for this one
+        /// switch — useful for ad-hoc operator overrides without
+        /// reconfiguring the flow. Resolved as
+        /// `splice_mode_override.unwrap_or(slot.splice_mode)` in the
+        /// handler.
         splice_mode_override: Option<crate::config::models::SpliceMode>,
     },
 }
@@ -760,6 +766,49 @@ async fn run_assembler(
                                     }
                                     // No prior PTS observed → fall
                                     // through to PmtBump silently.
+                                }
+
+                                // PES-aligned was requested (override or
+                                // slot config) but we reached the PmtBump
+                                // fall-through — emit a degrade Warning so
+                                // the operator isn't left thinking the cut
+                                // was glitchless. Reasons: the slot's codec
+                                // is not a supported PES-splice type, or no
+                                // active-leg PTS reference has been observed
+                                // yet (first switch on a freshly-armed flow).
+                                // Budget-exhaustion degrades emit
+                                // `pes_splice_timeout` separately on the
+                                // flush tick.
+                                if pes_aligned {
+                                    if let Some(es_) = &event_sender {
+                                        let reason = if want_audio || want_video {
+                                            "no_aligned_pes_reference"
+                                        } else {
+                                            "unsupported_codec"
+                                        };
+                                        es_.emit_flow_with_details(
+                                            crate::manager::events::EventSeverity::Warning,
+                                            crate::manager::events::category::FLOW,
+                                            format!(
+                                                "Flow '{flow_id}': PES-aligned splice on program {} \
+                                                 out_pid 0x{:04X} → '{new_input_id}' degraded to \
+                                                 PMT-bump ({reason}, stream_type 0x{:02X})",
+                                                prog.program_number,
+                                                slot.out_pid,
+                                                slot.stream_type,
+                                            ),
+                                            &flow_id,
+                                            serde_json::json!({
+                                                "error_code": "pes_splice_degraded",
+                                                "reason": reason,
+                                                "forced": splice_mode_override.is_some(),
+                                                "stream_type": slot.stream_type,
+                                                "program_number": prog.program_number,
+                                                "out_pid": slot.out_pid,
+                                                "to_input_id": new_input_id,
+                                            }),
+                                        );
+                                    }
                                 }
 
                                 // PmtBump path (today's behaviour).

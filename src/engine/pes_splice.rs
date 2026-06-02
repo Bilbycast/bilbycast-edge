@@ -11,10 +11,12 @@
 //! on success so operators can correlate switch events to receiver-side
 //! behaviour.
 //!
-//! This first land is **audio-only** — video splice (PES Switch Phase 4
-//! follow-up) needs an IDR-aware boundary detector + SPS/PPS/VPS
-//! sentinel that's out of scope here. Non-audio slots fall through to
-//! `PmtBump` silently so the assembler stays uniform.
+//! Both audio and video splice have landed. Audio aligns on the next
+//! PES boundary at/after the splice PTS (optionally guarded by an
+//! AAC-ADTS parameter check); video ([`VideoSpliceState`], below) adds
+//! an IDR-aware boundary detector plus an SPS codec-param sentinel.
+//! Slots whose codec supports neither fall through to `PmtBump` and the
+//! assembler emits `pes_splice_degraded`, so the assembler stays uniform.
 //!
 //! AAC AudioSpecificConfig sentinel (edge 0.65.0): the splice arm path
 //! optionally snapshots A's most recent AAC params (profile, sample
@@ -34,9 +36,11 @@
 //! 16..=21 (IRAP family: BLA / IDR / CRA). Without an IDR the receiver
 //! cannot decode the post-splice bitstream and would freeze on the next
 //! anchor frame, so a non-IDR PES from B is held the same as a PES below
-//! the PTS threshold. SPS/PPS/VPS codec-param sentinel is a Session B
-//! follow-up; today's behaviour: commit on the first IDR PES past
-//! threshold regardless of parameter set, fail-safe on missing data.
+//! the PTS threshold. A codec-param sentinel then compares B's SPS
+//! against A's and refuses the splice on a parameter-set change
+//! (`VideoCodecParamMismatch` → PmtBump). It is fail-open: when either
+//! side's SPS isn't parseable the splice commits on the first IDR PES
+//! past threshold.
 //!
 //! The state machine is **pure** — it doesn't own a clock or a channel;
 //! the caller (`ts_assembler`) drives transitions via `now` / per-packet

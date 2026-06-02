@@ -1096,10 +1096,13 @@ pub enum SlotSource {
         ///   whose PTS is monotonically past the last emitted PTS,
         ///   then concatenate. On budget exhaustion the path falls
         ///   back to `PmtBump` and emits `pes_splice_timeout`.
-        /// Audio splice is the first surface to land — video splice
-        /// follows in a separate session. Only switches whose active
-        /// PES kind is audio honour `PesAligned` today; everything
-        /// else falls through to `PmtBump` silently.
+        /// `PesAligned` is honoured for both audio (AAC / MP2 / AC-3 /
+        /// E-AC-3, aligned on the next PES boundary, with an optional
+        /// AAC-ADTS parameter check) and video (H.264 `0x1B` / HEVC
+        /// `0x24`, IDR-aligned with an SPS codec-param check). Slots
+        /// whose `stream_type` is neither a supported audio nor video
+        /// codec (e.g. MPEG-2 video `0x02`) fall through to `PmtBump`
+        /// and the assembler emits `pes_splice_degraded`.
         #[serde(default, skip_serializing_if = "SpliceMode::is_default")]
         splice_mode: SpliceMode,
         /// Splice budget in milliseconds (PES-aligned mode only).
