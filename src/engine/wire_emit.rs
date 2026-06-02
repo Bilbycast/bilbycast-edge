@@ -554,48 +554,54 @@ pub fn spawn_wire_emitter(
     let force_nanosleep = std::env::var("BILBYCAST_FORCE_NANOSLEEP")
         .map(|v| v == "1")
         .unwrap_or(false);
-    // QoS-class gate: only ST 2110 essence rides the etf / SO_TXTIME
-    // hard-drop path. Compressed MPEG-TS (WirePacingClass::Lossless) must
-    // never be dropped by etf as "late" — the receiver re-times it from
-    // PCR + its jitter buffer (and SRT/RIST TSBPD downstream) — so it stays
-    // on clock_nanosleep + a non-etf traffic class even when the operator
-    // has enabled SO_TXTIME for ST 2110 on the same NIC.
-    let etf_eligible = matches!(pacing, WirePacingClass::EtfEligible);
+    // Egress pacing: BOTH ST 2110 (EtfEligible) AND compressed MPEG-TS
+    // (Lossless) ride the kernel etf qdisc via SO_TXTIME — the industry-standard
+    // hardware-timestamped egress pacer. De-jitter belongs at INGRESS (SRT
+    // TSBPD / RIST / ingress_dejitter_ms), NOT egress; egress only paces. The
+    // earlier split that routed Lossless onto a userspace clock_nanosleep +
+    // release-rate servo shed ~50 % of a normal compressed feed (servo
+    // residence-cap firing) — reverted. The etf "late-drop" that originally
+    // motivated the split is prevented by the ETF_LATE_FLOOR_NS (15 ms) launch
+    // floor on the SO_TXTIME path: targets are stamped >= now+15 ms, so on a
+    // SCHED_FIFO wire-emit thread the kernel never sees a past launch time.
+    // Falls back to clock_nanosleep automatically when no etf qdisc is present
+    // (try_enable_so_txtime fails).
+    let etf_eligible = matches!(
+        pacing,
+        WirePacingClass::EtfEligible | WirePacingClass::Lossless
+    );
     let releaser = if !force_nanosleep
         && enable_so_txtime
         && etf_eligible
         && try_enable_so_txtime(&socket, clockid)
     {
-        Releaser::SoTxtime
-    } else {
-        // When an etf qdisc is present (operator enabled SO_TXTIME for ST
-        // 2110 on this NIC), a Lossless output must be steered OFF the etf
-        // class. The kernel derives sk_priority from the DSCP byte (DSCP 46
-        // -> prio 4 -> TC1/fq_codel on the standard map), but a Lossless
-        // output with NO DSCP would default to priority 0 -> TC0/etf and get
-        // hard-dropped. Pin it explicitly to a non-etf priority so it always
-        // lands on a lossless class regardless of DSCP. Override via
-        // BILBYCAST_NONETF_SO_PRIORITY for non-default qdisc layouts. No-op
-        // (debug-logged) on hosts without an etf qdisc.
-        if enable_so_txtime && !etf_eligible {
-            let non_etf_prio = std::env::var("BILBYCAST_NONETF_SO_PRIORITY")
+        // A compressed (Lossless) output usually carries a DSCP byte (e.g. 46),
+        // which the kernel maps to a non-TC0 priority -> off the etf class. Pin
+        // SO_PRIORITY explicitly (default 0 -> TC0/etf) so it lands on the etf
+        // class regardless of DSCP. The DSCP byte on the wire is set separately
+        // via IP_TOS and is unaffected (QoS marking preserved). ST 2110 has no
+        // DSCP -> already prio 0 -> TC0, so this is a harmless no-op there.
+        if matches!(pacing, WirePacingClass::Lossless) {
+            let etf_prio = std::env::var("BILBYCAST_ETF_SO_PRIORITY")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(4);
-            match crate::engine::wire_emit_txtime::set_so_priority(&socket, non_etf_prio) {
+                .unwrap_or(0);
+            match crate::engine::wire_emit_txtime::set_so_priority(&socket, etf_prio) {
                 Ok(()) => tracing::info!(
-                    "wire-emit '{}': lossless (compressed) output pinned to SO_PRIORITY={} (non-etf fq_codel class)",
+                    "wire-emit '{}': compressed output pinned to SO_PRIORITY={} (etf TC0, hardware-paced)",
                     id,
-                    non_etf_prio
+                    etf_prio
                 ),
                 Err(e) => tracing::debug!(
-                    "wire-emit '{}': set_so_priority({}) for lossless class failed: {} (no mqprio/etf qdisc — harmless)",
+                    "wire-emit '{}': set_so_priority({}) failed: {} (no mqprio/etf qdisc — clock_nanosleep fallback)",
                     id,
-                    non_etf_prio,
+                    etf_prio,
                     e
                 ),
             }
         }
+        Releaser::SoTxtime
+    } else {
         Releaser::ClockNanosleep
     };
 
@@ -618,13 +624,18 @@ pub fn spawn_wire_emitter(
     // multiple wire-emit threads on the same edge spread across the
     // dedicated cores instead of stacking onto one.
     let cpu_index = next_wire_emit_cpu_index();
-    // Egress de-jitter policy: compressed (Lossless) gets the release-rate
-    // servo + bounded residence cap so a source-rate-vs-wallclock mismatch or
-    // burst can't run the output buffer away; ST 2110 (EtfEligible) keeps
-    // strict pacing untouched (its raster + SO_TXTIME is the clock). The
-    // per-output `egress_buffer_ms` (manager UI knob) tunes the servo
-    // setpoint; `None` falls back to env / 60 ms default.
-    let dejitter = if matches!(pacing, WirePacingClass::Lossless) {
+    // Egress de-jitter is OFF by default. De-jitter belongs at INGRESS (SRT
+    // TSBPD / RIST reorder / ingress_dejitter_ms), and egress should only PACE
+    // (etf / clock_nanosleep). The release-rate servo + residence-cap shed are
+    // architecturally misplaced at egress and shed ~50 % of a normal compressed
+    // feed — so they are retained ONLY as an explicit per-output opt-in
+    // (`egress_buffer_ms`, or the BILBYCAST_EGRESS_BUFFER_MS env) for hosts
+    // with no etf qdisc that still want a bounded-latency egress buffer. Unset
+    // (the default) = pure pacing, no shed, no added latency. ST 2110
+    // (EtfEligible) never takes the servo regardless.
+    let want_egress_servo = matches!(pacing, WirePacingClass::Lossless)
+        && (egress_buffer_ms.is_some() || std::env::var("BILBYCAST_EGRESS_BUFFER_MS").is_ok());
+    let dejitter = if want_egress_servo {
         DejitterConfig::servo_with(egress_buffer_ms)
     } else {
         DejitterConfig::disabled()
