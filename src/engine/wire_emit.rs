@@ -1016,9 +1016,14 @@ impl TargetState {
     ) -> u64 {
         // 1. Recover the nominal source rate from inter-PCR observations
         //    (same EMA as the raw path). On a source discontinuity (input
-        //    switch / loop seam) re-anchor the measurement and emit ASAP,
-        //    but KEEP `observed_rate_bps` so the leaky bucket never stalls.
-        let mut force_asap = false;
+        //    switch / loop seam) re-anchor the rate MEASUREMENT but KEEP
+        //    `observed_rate_bps` AND the wallclock release cursor — the leaky
+        //    bucket is paced by wallclock, not by source PCR, so a source-PCR
+        //    jump must NOT collapse the cushion (the receiver re-clocks from
+        //    the new PCR across the discontinuity exactly as before). Earlier
+        //    this set `force_asap` → reset the cursor to `now`, which dumped
+        //    the de-jitter cushion at every loop seam (~every 64 s) and left
+        //    the steady state tracking the bursty arrival.
         if let Some(pcr) = datagram_pcr {
             match self.pcr_anchor {
                 Some(prev) => {
@@ -1036,9 +1041,9 @@ impl TargetState {
                                 (3 * self.observed_rate_bps + observed_bps) / 4
                             };
                         }
-                    } else {
-                        force_asap = true;
                     }
+                    // else: discontinuity — skip the rate EMA (don't measure
+                    // a rate across the jump) but keep the cursor + rate.
                     self.pcr_anchor = Some(pcr);
                     self.bytes_since_anchor = 0;
                 }
@@ -1051,15 +1056,31 @@ impl TargetState {
 
         let nominal = self.observed_rate_bps;
 
-        // 2. Cold start, source discontinuity, or no rate recovered yet →
-        //    emit ASAP and seed the leaky-bucket cursor at now.
-        if force_asap || !self.initialised || nominal == 0 {
+        // 2. Cold start → BUILD the de-jitter cushion. Seed the release cursor
+        //    `setpoint_ms` into the future so the first datagram is held that
+        //    long, establishing the buffer that absorbs arrival jitter. This
+        //    is the piece that was missing: the old code seeded the cursor at
+        //    `now`, so a ~realtime source never accumulated a cushion, the
+        //    ±authority trim (±5 %) could not build one, and the output simply
+        //    tracked the bursty arrival. The kernel ETF qdisc builds this same
+        //    cushion via its PREROLL wall-anchor; this is the userspace twin.
+        let cushion_ns = (cfg.setpoint_ms.max(1) as u64).saturating_mul(1_000_000);
+        if !self.initialised {
             self.initialised = true;
-            self.last_returned_ns = now_ns;
-            return now_ns;
+            self.last_returned_ns = now_ns.saturating_add(cushion_ns);
+            return self.last_returned_ns;
         }
 
-        // 3. Buffer-level trim (the feedback the open-loop pacer lacked).
+        // 3. No rate recovered yet (between the first and second PCR): queue
+        //    against the existing cursor so the cushion is preserved (do NOT
+        //    collapse to `now`). `.max(now_ns)` guards a genuine underrun.
+        if nominal == 0 {
+            let target = self.last_returned_ns.max(now_ns);
+            self.last_returned_ns = target;
+            return target;
+        }
+
+        // 4. Buffer-level trim (the feedback the open-loop pacer lacked).
         //    Time domain so it auto-adapts to datagram size + bitrate:
         //    fill_ms = how many ms of content sit in the queue behind this
         //    datagram. err is ‰ of setpoint, clamped ±1000 (±1.0).
@@ -1075,7 +1096,7 @@ impl TargetState {
         let factor_permille = 1000 + (cfg.authority_permille as i64 * err_permille) / 1000;
         let release_bps = nominal.saturating_mul(factor_permille.max(1) as u64) / 1000;
 
-        // 4. Leaky bucket: schedule this datagram `interval` after the last,
+        // 5. Leaky bucket: schedule this datagram `interval` after the last,
         //    where interval = wire-time of these bytes at the trimmed rate.
         let interval_ns = (datagram_bytes as u64).saturating_mul(8_000_000_000)
             / release_bps.max(1);
@@ -2180,15 +2201,21 @@ mod tests {
     }
 
     #[test]
-    fn servo_cold_start_and_drain_emit_asap() {
-        let cfg = DejitterConfig::servo();
-        // Cold start (no rate recovered) → emit ASAP, seed cursor.
+    fn servo_cold_start_seeds_cushion_and_drain_floors() {
+        let cfg = DejitterConfig::servo(); // setpoint 60 ms
+        let cushion_ns = 60_000_000u64;
+        // Cold start → BUILD the cushion: hold the first datagram one setpoint
+        // into the future so a bursty source's arrival jitter is absorbed.
+        // (The old code seeded at `now`, so no cushion ever formed and the
+        // output tracked the bursty arrival — the de-jitter gap.)
         let mut cold = TargetState::default();
         let t0 = cold.derive_target_servo(5_000, Some(1000), 1316, 0, &cfg);
-        assert_eq!(t0, 5_000);
+        assert_eq!(t0, 5_000 + cushion_ns, "first datagram held one cushion");
+        assert_eq!(cold.last_returned_ns, 5_000 + cushion_ns);
         assert!(cold.initialised);
         assert_eq!(cold.pcr_anchor, Some(1000));
-        // Drained buffer: we fell behind wallclock → floor to now, never past.
+        // Genuine underrun (fell a full 4 s behind the cursor) → floor to now,
+        // never the past.
         let mut behind = warmed_servo_state(6_000_000, 1_000_000_000);
         let t1 = behind.derive_target_servo(5_000_000_000, None, 1316, 0, &cfg);
         assert_eq!(t1, 5_000_000_000, "target floored to now, not the past");
@@ -2196,16 +2223,51 @@ mod tests {
     }
 
     #[test]
-    fn servo_discontinuity_emits_asap_and_keeps_rate() {
-        // Input switch / loop seam: source PCR jumps. Emit ASAP and re-anchor
-        // the rate measurement, but KEEP the recovered rate so the leaky
-        // bucket never stalls to zero.
+    fn servo_discontinuity_preserves_cushion_and_rate() {
+        // Input switch / loop seam: source PCR jumps. The wallclock leaky
+        // bucket must KEEP its cushion (cursor stays ahead of now) — it must
+        // NOT collapse to `now`, which dumped the de-jitter buffer at every
+        // loop seam in the old code (the steady-state jitter the user saw).
+        // The rate is preserved; only the rate MEASUREMENT re-anchors.
         let cfg = DejitterConfig::servo();
-        let mut s = warmed_servo_state(6_000_000, 1_000_000_000);
-        let t = s.derive_target_servo(2_000_000_000, Some(500_000), 1316, 50, &cfg);
-        assert_eq!(t, 2_000_000_000, "discontinuity → emit ASAP");
+        let now = 2_000_000_000u64;
+        // Steady state: cursor held one cushion (60 ms) ahead of now.
+        let mut s = warmed_servo_state(6_000_000, now + 60_000_000);
+        let t = s.derive_target_servo(now, Some(500_000), 1316, 60, &cfg);
+        assert!(t > now, "cushion preserved across the seam (not collapsed to now)");
+        assert!(t >= now + 60_000_000, "target still ~one cushion ahead");
         assert_eq!(s.observed_rate_bps, 6_000_000, "rate preserved across seam");
         assert_eq!(s.pcr_anchor, Some(500_000), "rate measurement re-anchored");
+    }
+
+    #[test]
+    fn servo_holds_cushion_across_a_burst() {
+        // The crux property the old emit-on-arrival servo lacked: a bursty
+        // arrival (many datagrams handed at the same `now`) must be metered
+        // out into the future cushion paced to the recovered rate, NOT dumped
+        // at `now`. That is what turns ~130 ms input jitter into a smooth
+        // output.
+        let cfg = DejitterConfig::servo();
+        let bytes = 1316usize;
+        let now = 1_000_000_000u64;
+        let mut s = TargetState::default();
+        s.derive_target_servo(now, Some(0), bytes, 0, &cfg); // cold → seed cushion
+        // Second PCR 40 ms later recovers a rate.
+        s.derive_target_servo(now, Some(40 * 27_000), bytes, 0, &cfg);
+        assert!(s.observed_rate_bps > 0, "rate recovered from the 40 ms PCR gap");
+        // Hand 20 datagrams in an instantaneous burst (same `now`).
+        let mut prev = 0u64;
+        let mut all_future = true;
+        for _ in 0..20 {
+            let t = s.derive_target_servo(now, None, bytes, 10, &cfg);
+            if t <= now {
+                all_future = false;
+            }
+            assert!(t >= prev, "targets monotonic");
+            prev = t;
+        }
+        assert!(all_future, "burst metered into the future cushion, not dumped at now");
+        assert!(prev > now, "cursor stays ahead of now (cushion held)");
     }
 
     #[test]
