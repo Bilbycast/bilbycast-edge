@@ -349,6 +349,15 @@ pub struct DejitterConfig {
     /// offset, small enough that the induced PCR_OJ stays inside the
     /// receiver T-STD. Default 50.
     pub authority_permille: u64,
+    /// De-jitter buffer mode (OPT-IN): build + hold a `setpoint_ms` cushion so
+    /// a bursty/jittery contribution is metered out smoothly. Engaged ONLY when
+    /// the operator explicitly sets a per-output `egress_buffer_ms` (or the env
+    /// override). When `false` (the default — `egress_buffer_ms` unset) the
+    /// servo keeps its legacy emit-on-arrival behaviour byte-for-byte, so the
+    /// default deploy carries zero regression risk and adds no latency. Set an
+    /// `egress_buffer_ms` to turn the output into a real de-jitter buffer that
+    /// absorbs `~setpoint_ms` of arrival jitter (at the cost of that latency).
+    pub seed_cushion: bool,
 }
 
 impl DejitterConfig {
@@ -367,13 +376,16 @@ impl DejitterConfig {
     /// ms (overridable via `BILBYCAST_EGRESS_RESIDENCE_MS`) so a bigger
     /// buffer gets proportionally more burst headroom before the hard shed.
     pub fn servo_with(egress_buffer_ms: Option<u32>) -> Self {
+        // De-jitter (cushion) is OPT-IN: only when the operator explicitly set
+        // a per-output egress_buffer_ms or the env override. Unset → legacy
+        // emit-on-arrival servo (no cushion, no added latency, no regression).
+        let env_buf = std::env::var("BILBYCAST_EGRESS_BUFFER_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+        let seed_cushion = egress_buffer_ms.is_some() || env_buf.is_some();
         let setpoint_ms = egress_buffer_ms
             .map(|m| m as u64)
-            .or_else(|| {
-                std::env::var("BILBYCAST_EGRESS_BUFFER_MS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-            })
+            .or(env_buf)
             .unwrap_or(60)
             .clamp(20, 2000);
         let cap_ms = std::env::var("BILBYCAST_EGRESS_RESIDENCE_MS")
@@ -387,6 +399,7 @@ impl DejitterConfig {
             drain_floor_dgms: 32,
             setpoint_ms,
             authority_permille: 50,
+            seed_cushion,
         }
     }
     /// No de-jitter (ST 2110 strict pacing / SO_TXTIME owns timing).
@@ -397,6 +410,7 @@ impl DejitterConfig {
             drain_floor_dgms: 0,
             setpoint_ms: 0,
             authority_permille: 0,
+            seed_cushion: false,
         }
     }
     /// Residence cap in microseconds (for comparison with `recv_time_us`).
@@ -1024,6 +1038,7 @@ impl TargetState {
         //    this set `force_asap` → reset the cursor to `now`, which dumped
         //    the de-jitter cushion at every loop seam (~every 64 s) and left
         //    the steady state tracking the bursty arrival.
+        let mut discontinuity = false;
         if let Some(pcr) = datagram_pcr {
             match self.pcr_anchor {
                 Some(prev) => {
@@ -1041,9 +1056,11 @@ impl TargetState {
                                 (3 * self.observed_rate_bps + observed_bps) / 4
                             };
                         }
+                    } else {
+                        // Source discontinuity (loop seam / input switch): skip
+                        // the rate EMA (don't measure a rate across the jump).
+                        discontinuity = true;
                     }
-                    // else: discontinuity — skip the rate EMA (don't measure
-                    // a rate across the jump) but keep the cursor + rate.
                     self.pcr_anchor = Some(pcr);
                     self.bytes_since_anchor = 0;
                 }
@@ -1055,29 +1072,44 @@ impl TargetState {
         self.bytes_since_anchor = self.bytes_since_anchor.saturating_add(datagram_bytes as u64);
 
         let nominal = self.observed_rate_bps;
-
-        // 2. Cold start → BUILD the de-jitter cushion. Seed the release cursor
-        //    `setpoint_ms` into the future so the first datagram is held that
-        //    long, establishing the buffer that absorbs arrival jitter. This
-        //    is the piece that was missing: the old code seeded the cursor at
-        //    `now`, so a ~realtime source never accumulated a cushion, the
-        //    ±authority trim (±5 %) could not build one, and the output simply
-        //    tracked the bursty arrival. The kernel ETF qdisc builds this same
-        //    cushion via its PREROLL wall-anchor; this is the userspace twin.
         let cushion_ns = (cfg.setpoint_ms.max(1) as u64).saturating_mul(1_000_000);
-        if !self.initialised {
-            self.initialised = true;
-            self.last_returned_ns = now_ns.saturating_add(cushion_ns);
-            return self.last_returned_ns;
-        }
 
-        // 3. No rate recovered yet (between the first and second PCR): queue
-        //    against the existing cursor so the cushion is preserved (do NOT
-        //    collapse to `now`). `.max(now_ns)` guards a genuine underrun.
-        if nominal == 0 {
-            let target = self.last_returned_ns.max(now_ns);
-            self.last_returned_ns = target;
-            return target;
+        if cfg.seed_cushion {
+            // ── De-jitter mode (OPT-IN via egress_buffer_ms) ──────────────
+            // 2a. Cold start → BUILD the cushion: hold the first datagram one
+            //     setpoint into the future so arrival jitter is absorbed. The
+            //     legacy path (below) seeds at `now`, so no cushion forms and
+            //     the output tracks the bursty arrival — the de-jitter gap.
+            //     The kernel ETF qdisc builds this same cushion via its PREROLL
+            //     wall-anchor; this is the userspace twin.
+            if !self.initialised {
+                self.initialised = true;
+                self.last_returned_ns = now_ns.saturating_add(cushion_ns);
+                return self.last_returned_ns;
+            }
+            // 2b. No rate yet, OR a source-PCR discontinuity: PRESERVE the
+            //     cursor (do NOT collapse to `now`, which dumped the cushion at
+            //     every loop seam). The wallclock leaky bucket is immune to a
+            //     source-PCR jump; the receiver re-clocks from the new PCR.
+            //     `.max(now_ns)` guards a genuine underrun. A discontinuity with
+            //     a known rate falls through to the leaky bucket from the
+            //     preserved cursor.
+            if nominal == 0 {
+                let target = self.last_returned_ns.max(now_ns);
+                self.last_returned_ns = target;
+                return target;
+            }
+        } else {
+            // ── Legacy mode (DEFAULT, egress_buffer_ms unset): UNCHANGED ──
+            // Emit ASAP on cold start, source discontinuity, or before a rate
+            // is recovered, seeding the cursor at `now`. No cushion, no added
+            // latency — byte-for-byte the pre-fix behaviour, so the default
+            // deploy carries zero regression risk.
+            if discontinuity || !self.initialised || nominal == 0 {
+                self.initialised = true;
+                self.last_returned_ns = now_ns;
+                return now_ns;
+            }
         }
 
         // 4. Buffer-level trim (the feedback the open-loop pacer lacked).
@@ -2202,7 +2234,7 @@ mod tests {
 
     #[test]
     fn servo_cold_start_seeds_cushion_and_drain_floors() {
-        let cfg = DejitterConfig::servo(); // setpoint 60 ms
+        let cfg = DejitterConfig::servo_with(Some(60)); // de-jitter mode, 60 ms
         let cushion_ns = 60_000_000u64;
         // Cold start → BUILD the cushion: hold the first datagram one setpoint
         // into the future so a bursty source's arrival jitter is absorbed.
@@ -2229,7 +2261,7 @@ mod tests {
         // NOT collapse to `now`, which dumped the de-jitter buffer at every
         // loop seam in the old code (the steady-state jitter the user saw).
         // The rate is preserved; only the rate MEASUREMENT re-anchors.
-        let cfg = DejitterConfig::servo();
+        let cfg = DejitterConfig::servo_with(Some(60));
         let now = 2_000_000_000u64;
         // Steady state: cursor held one cushion (60 ms) ahead of now.
         let mut s = warmed_servo_state(6_000_000, now + 60_000_000);
@@ -2247,7 +2279,7 @@ mod tests {
         // out into the future cushion paced to the recovered rate, NOT dumped
         // at `now`. That is what turns ~130 ms input jitter into a smooth
         // output.
-        let cfg = DejitterConfig::servo();
+        let cfg = DejitterConfig::servo_with(Some(60));
         let bytes = 1316usize;
         let now = 1_000_000_000u64;
         let mut s = TargetState::default();
@@ -2268,6 +2300,32 @@ mod tests {
         }
         assert!(all_future, "burst metered into the future cushion, not dumped at now");
         assert!(prev > now, "cursor stays ahead of now (cushion held)");
+    }
+
+    #[test]
+    fn servo_default_no_egress_buffer_is_legacy_emit_asap() {
+        // ZERO-REGRESSION GUARANTEE: with egress_buffer_ms UNSET (plain servo()),
+        // seed_cushion is false → cold start AND discontinuity emit ASAP at
+        // `now`, byte-for-byte the pre-fix behaviour. The de-jitter cushion is
+        // strictly opt-in via egress_buffer_ms — a default deploy adds no
+        // latency and changes nothing.
+        let cfg = DejitterConfig::servo();
+        assert!(!cfg.seed_cushion, "default servo must NOT seed a cushion");
+        let mut cold = TargetState::default();
+        assert_eq!(
+            cold.derive_target_servo(5_000, Some(1000), 1316, 0, &cfg),
+            5_000,
+            "default cold start emits ASAP (no cushion)"
+        );
+        let mut s = warmed_servo_state(6_000_000, 1_000_000_000);
+        assert_eq!(
+            s.derive_target_servo(2_000_000_000, Some(500_000), 1316, 50, &cfg),
+            2_000_000_000,
+            "default discontinuity emits ASAP at now"
+        );
+        assert_eq!(s.observed_rate_bps, 6_000_000, "rate preserved across seam");
+        // Opt-in path flips the flag.
+        assert!(DejitterConfig::servo_with(Some(120)).seed_cushion);
     }
 
     #[test]
