@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use super::wire_emit::{AnchorSource, WireDatagram, spawn_wire_emitter};
+use super::wire_emit::{AnchorSource, WireDatagram, WirePacingClass, spawn_wire_emitter};
 
 use crate::config::models::RtpOutputConfig;
 use crate::fec::encoder::FecEncoder;
@@ -178,6 +178,7 @@ async fn rtp_output_loop(
         std_socket,
         dest,
         AnchorSource::Pcr,
+        WirePacingClass::Lossless,
         stats.clone(),
         cancel.clone(),
     );
@@ -774,6 +775,7 @@ async fn rtp_output_redundant_loop(
         std_socket1,
         dest1,
         AnchorSource::Pcr,
+        WirePacingClass::Lossless,
         stats.clone(),
         cancel.clone(),
     );
@@ -782,6 +784,7 @@ async fn rtp_output_redundant_loop(
         std_socket2,
         dest2,
         AnchorSource::Pcr,
+        WirePacingClass::Lossless,
         leg2_stats,
         cancel.clone(),
     );

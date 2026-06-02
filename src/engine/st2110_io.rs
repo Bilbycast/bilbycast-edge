@@ -46,7 +46,7 @@ use bytes::Bytes;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::engine::wire_emit::{AnchorSource, WireDatagram, spawn_wire_emitter};
+use crate::engine::wire_emit::{AnchorSource, WireDatagram, WirePacingClass, spawn_wire_emitter};
 
 use crate::config::models::{
     St2110AncillaryInputConfig, St2110AncillaryOutputConfig, St2110AudioInputConfig,
@@ -461,6 +461,7 @@ pub async fn run_st2110_audio_output(
         red_std,
         red_dest,
         AnchorSource::Pcr,
+        WirePacingClass::EtfEligible,
         stats.clone(),
         cancel.clone(),
     );
@@ -486,6 +487,7 @@ pub async fn run_st2110_audio_output(
             blue_std,
             dest,
             AnchorSource::Pcr,
+            WirePacingClass::EtfEligible,
             leg2_stats,
             cancel.clone(),
         ))
@@ -907,6 +909,7 @@ pub async fn run_st2110_anc_output(
         red_std,
         red_dest,
         AnchorSource::Pcr,
+        WirePacingClass::EtfEligible,
         stats.clone(),
         cancel.clone(),
     );
@@ -929,6 +932,7 @@ pub async fn run_st2110_anc_output(
             blue_std,
             dest,
             AnchorSource::Pcr,
+            WirePacingClass::EtfEligible,
             leg2_stats,
             cancel.clone(),
         ))

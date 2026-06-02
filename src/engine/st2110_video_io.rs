@@ -60,7 +60,7 @@ use crate::engine::st2110::video::{
     Rfc4175Depacketizer, Rfc4175MultiStreamReassembler, Rfc4175Packetizer,
     St2110_23PartitionMode, VideoField,
 };
-use crate::engine::wire_emit::{AnchorSource, WireDatagram, spawn_wire_emitter};
+use crate::engine::wire_emit::{AnchorSource, WireDatagram, WirePacingClass, spawn_wire_emitter};
 use crate::engine::ts_demux::{DemuxedFrame, TsDemuxer};
 use crate::stats::collector::{FlowStatsAccumulator, OutputStatsAccumulator};
 use crate::util::socket::{create_udp_output};
@@ -803,6 +803,7 @@ pub async fn run_st2110_20_output(
         red_std,
         dest_red,
         AnchorSource::St2110Raster,
+        WirePacingClass::EtfEligible,
         stats.clone(),
         cancel.clone(),
     );
@@ -824,6 +825,7 @@ pub async fn run_st2110_20_output(
                 blue_std,
                 addr,
                 AnchorSource::St2110Raster,
+                WirePacingClass::EtfEligible,
                 leg2_stats,
                 cancel.clone(),
             ))
@@ -1237,6 +1239,7 @@ pub async fn run_st2110_23_output(
             red_std,
             red_addr,
             AnchorSource::St2110Raster,
+            WirePacingClass::EtfEligible,
             stats.clone(),
             cancel.clone(),
         );
@@ -1265,6 +1268,7 @@ pub async fn run_st2110_23_output(
                     blue_std,
                     blue_addr,
                     AnchorSource::St2110Raster,
+                    WirePacingClass::EtfEligible,
                     leg2_stats,
                     cancel.clone(),
                 ))

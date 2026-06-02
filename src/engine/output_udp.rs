@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use super::wire_emit::{AnchorSource, WireDatagram, spawn_wire_emitter};
+use super::wire_emit::{AnchorSource, WireDatagram, WirePacingClass, spawn_wire_emitter};
 
 use crate::config::models::UdpOutputConfig;
 use crate::manager::events::{EventSender, EventSeverity, category};
@@ -170,6 +170,7 @@ async fn udp_output_loop_302m(
         std_socket,
         dest,
         AnchorSource::Pcr,
+        WirePacingClass::Lossless,
         stats.clone(),
         cancel.clone(),
     );
@@ -246,6 +247,7 @@ async fn udp_output_loop(
         std_socket,
         dest,
         AnchorSource::Pcr,
+        WirePacingClass::Lossless,
         stats.clone(),
         cancel.clone(),
     );

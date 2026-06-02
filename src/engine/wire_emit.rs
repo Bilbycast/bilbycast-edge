@@ -292,6 +292,33 @@ pub enum AnchorSource {
     St2110Raster,
 }
 
+/// Wire-pacing QoS class — selects whether an output may ride the kernel
+/// ETF / SO_TXTIME hard-drop path. Orthogonal to [`AnchorSource`] (which
+/// only decides how the send target is *derived*); this decides which
+/// traffic class the packets land on.
+///
+/// The ETF qdisc DROPS any packet whose launch time has already passed
+/// when it reaches the qdisc. That is correct for ST 2110 uncompressed
+/// essence (no receiver re-timing buffer — wire precision is the only
+/// timing source) but WRONG for compressed MPEG-TS, where the receiver
+/// reconstructs timing from PCR + its jitter buffer (and from SRT/RIST
+/// TSBPD when carried over those). A compressed feed forced onto the etf
+/// class loses packets as "late" on a contended box — unrecoverable on
+/// RTP/UDP (no ARQ). So compressed outputs stay LOSSLESS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WirePacingClass {
+    /// Compressed MPEG-TS (UDP / RTP / SMPTE 302M). Lossless delivery is
+    /// mandatory: never SO_TXTIME, never the etf hard-drop class. Paced
+    /// in userspace (clock_nanosleep) and pinned to a non-etf fq_codel
+    /// class. The receiver re-times via PCR + jitter buffer.
+    Lossless,
+    /// ST 2110 essence (-20/-23 video, -30/-31 audio, -40 ANC). No
+    /// receiver re-timing buffer, so wire precision matters: eligible for
+    /// SO_TXTIME + the ETF qdisc class when the operator enabled it
+    /// (`BILBYCAST_ENABLE_TXTIME=1`) and the setsockopt probe succeeds.
+    EtfEligible,
+}
+
 /// One datagram on its way to the wire. `bytes` is on-the-wire-final
 /// (caller has already wrapped RTP / FEC / RFC 4175 / etc.).
 ///
@@ -358,6 +385,7 @@ pub fn spawn_wire_emitter(
     socket: UdpSocket,
     dest: SocketAddr,
     anchor: AnchorSource,
+    pacing: WirePacingClass,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
 ) -> WireTxHandle {
@@ -419,9 +447,48 @@ pub fn spawn_wire_emitter(
     let force_nanosleep = std::env::var("BILBYCAST_FORCE_NANOSLEEP")
         .map(|v| v == "1")
         .unwrap_or(false);
-    let releaser = if !force_nanosleep && enable_so_txtime && try_enable_so_txtime(&socket, clockid) {
+    // QoS-class gate: only ST 2110 essence rides the etf / SO_TXTIME
+    // hard-drop path. Compressed MPEG-TS (WirePacingClass::Lossless) must
+    // never be dropped by etf as "late" — the receiver re-times it from
+    // PCR + its jitter buffer (and SRT/RIST TSBPD downstream) — so it stays
+    // on clock_nanosleep + a non-etf traffic class even when the operator
+    // has enabled SO_TXTIME for ST 2110 on the same NIC.
+    let etf_eligible = matches!(pacing, WirePacingClass::EtfEligible);
+    let releaser = if !force_nanosleep
+        && enable_so_txtime
+        && etf_eligible
+        && try_enable_so_txtime(&socket, clockid)
+    {
         Releaser::SoTxtime
     } else {
+        // When an etf qdisc is present (operator enabled SO_TXTIME for ST
+        // 2110 on this NIC), a Lossless output must be steered OFF the etf
+        // class. The kernel derives sk_priority from the DSCP byte (DSCP 46
+        // -> prio 4 -> TC1/fq_codel on the standard map), but a Lossless
+        // output with NO DSCP would default to priority 0 -> TC0/etf and get
+        // hard-dropped. Pin it explicitly to a non-etf priority so it always
+        // lands on a lossless class regardless of DSCP. Override via
+        // BILBYCAST_NONETF_SO_PRIORITY for non-default qdisc layouts. No-op
+        // (debug-logged) on hosts without an etf qdisc.
+        if enable_so_txtime && !etf_eligible {
+            let non_etf_prio = std::env::var("BILBYCAST_NONETF_SO_PRIORITY")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(4);
+            match crate::engine::wire_emit_txtime::set_so_priority(&socket, non_etf_prio) {
+                Ok(()) => tracing::info!(
+                    "wire-emit '{}': lossless (compressed) output pinned to SO_PRIORITY={} (non-etf fq_codel class)",
+                    id,
+                    non_etf_prio
+                ),
+                Err(e) => tracing::debug!(
+                    "wire-emit '{}': set_so_priority({}) for lossless class failed: {} (no mqprio/etf qdisc — harmless)",
+                    id,
+                    non_etf_prio,
+                    e
+                ),
+            }
+        }
         Releaser::ClockNanosleep
     };
 
@@ -1473,6 +1540,7 @@ mod tests {
             send,
             dest,
             AnchorSource::Pcr,
+            WirePacingClass::Lossless,
             stats.clone(),
             cancel.clone(),
         );
@@ -1524,6 +1592,7 @@ mod tests {
             send,
             dest,
             AnchorSource::St2110Raster,
+            WirePacingClass::EtfEligible,
             stats.clone(),
             cancel.clone(),
         );
