@@ -687,6 +687,18 @@ pub struct InputStats {
     /// the legacy stateless dedup path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buffered_hitless: Option<BufferedHitlessSnapshot>,
+    /// Ingress de-jitter: cumulative packets shed by this input's
+    /// release-rate servo residence cap (raw UDP / RTP only). Non-zero
+    /// means a burst / source-rate offset exceeded the ±5 % servo
+    /// authority and the buffer was trimmed to bound input latency; the
+    /// receiver re-clocks from PCR. Backward-compatible additive field.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub ingress_dejitter_shed: u64,
+    /// Ingress de-jitter: current de-jitter buffer occupancy (packets).
+    /// The servo holds this near the configured `ingress_dejitter_ms` of
+    /// content. Absent on inputs without a de-jitter buffer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_buffer_depth: Option<u64>,
     /// Per-input PCM transcode stage statistics. Present only when the input
     /// runs an `engine::audio_transcode::TranscodeStage` (i.e. the input config
     /// has a `transcode` block). Absent on passthrough inputs.
@@ -870,6 +882,24 @@ pub struct OutputStats {
     /// field — old managers ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_pacing_pinned_cpu: Option<u32>,
+    /// Egress de-jitter: datagrams shed by the residence cap (compressed /
+    /// `Lossless` outputs). The bounded-latency safety net — non-zero means
+    /// the release-rate servo hit its ±authority ceiling (a burst or rate
+    /// offset bigger than the servo can absorb) and the buffer was trimmed to
+    /// stay inside the receiver T-STD; the receiver re-clocked from PCR. The
+    /// companion residence is on `latency.{avg,max}_us`. Always 0 on ST 2110
+    /// and protocol-paced outputs (SRT/RIST/RTMP/HLS/CMAF/WebRTC).
+    /// Backward-compatible additive field — old managers ignore it.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub egress_shed: u64,
+    /// Egress de-jitter: current wire-emit queue depth (datagrams in flight
+    /// between the broadcast subscriber and the wire). The servo holds this
+    /// near its setpoint (~the configured `egress_buffer_ms` of content); a
+    /// sustained climb is the early signature of the latency runaway the
+    /// servo + shed exist to prevent. Absent on outputs without a dedicated
+    /// wire emitter. Backward-compatible additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_emit_depth: Option<u64>,
 }
 
 #[inline]

@@ -1102,6 +1102,27 @@ fn edge_capabilities() -> Vec<&'static str> {
         // wired/virtual interface — operators no longer have to SSH
         // in to find which IP is on which port.
         "network-info",
+        // Egress de-jitter: compressed UDP/RTP outputs run a closed-loop
+        // release-rate servo + bounded residence-cap shed in `wire_emit`,
+        // so a source-rate-vs-wallclock offset or network burst is absorbed
+        // (rate-matched) or shed instead of integrating into output latency
+        // (the diagnosed latency runaway). Per-output `egress_buffer_ms`
+        // tunes the servo setpoint; `OutputStats.egress_shed` +
+        // `wire_emit_depth` report it. Manager UI gates the egress-buffer
+        // knob + the de-jitter telemetry card on this so older edges hide
+        // the surface. ST 2110 keeps strict raster/SO_TXTIME pacing.
+        "egress_dejitter",
+        // Ingress de-jitter: raw UDP / RTP inputs run the ingress
+        // counterpart to the egress servo — recover the source rate from
+        // inter-PCR observations and release packets paced at that rate
+        // (leaky bucket + fill servo + residence-cap shed), so every
+        // downstream consumer (analysers, PCR PLL, PID bus, SRT/RIST
+        // outputs) sees a smooth cadence regardless of network PDV.
+        // Per-input `ingress_dejitter_ms` tunes the setpoint;
+        // `InputStats.ingress_dejitter_shed` + `ingress_buffer_depth`
+        // report it. Cooperates with SMPTE 2022-7 (runs after the merger).
+        // Manager UI gates the per-input de-jitter knob on this.
+        "ingress_dejitter",
         // Per-input/per-output `interface_binding` field is honoured
         // (loose source-IP binding via NIC name lookup, plus per-leg
         // binding inside 2022-7 redundancy and per-endpoint binding

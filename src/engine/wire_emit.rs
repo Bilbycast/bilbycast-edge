@@ -319,6 +319,98 @@ pub enum WirePacingClass {
     EtfEligible,
 }
 
+/// Egress de-jitter / smoothing-buffer policy for the wire emitter.
+///
+/// Compressed MPEG-TS (`WirePacingClass::Lossless`) must never let a
+/// source-rate-vs-wallclock mismatch or burst grow the internal queue
+/// unbounded (the diagnosed 47 s latency runaway). When `enabled`, the
+/// `clock_nanosleep` drain enforces a hard RESIDENCE CAP: a datagram that
+/// has waited longer than `shed_residence_ns` (and the stale backlog behind
+/// it) is shed and the pacing anchor re-set to "now", bounding output
+/// latency by construction — the downstream receiver re-clocks from the
+/// (untouched) PCR via its own T-STD buffer. ST 2110
+/// (`WirePacingClass::EtfEligible`) sets `enabled = false`: its strict
+/// raster / SO_TXTIME pacing owns timing and has no receiver re-clock.
+/// Full rationale + IRD references: `docs/egress-dejitter-design.md`.
+#[derive(Clone, Copy, Debug)]
+pub struct DejitterConfig {
+    pub enabled: bool,
+    /// Hard end-to-end residence cap (ns); older datagrams are shed.
+    pub shed_residence_ns: u64,
+    /// After a shed, drain the wire channel down to this many datagrams
+    /// (the de-jitter buffer setpoint floor, ~56 ms @ 6 Mbps for 32).
+    pub drain_floor_dgms: usize,
+    /// Release-rate servo setpoint: the buffer fill (in ms of content) the
+    /// servo holds the queue centred on. The ±authority rate trim pulls the
+    /// fill back toward this. 0 disables the servo (shed-only). Default 60 ms.
+    pub setpoint_ms: u64,
+    /// Servo rate authority in permille (‰) of the recovered source rate.
+    /// 50 = ±5 %: enough to absorb any realistic source-vs-wallclock ppm
+    /// offset, small enough that the induced PCR_OJ stays inside the
+    /// receiver T-STD. Default 50.
+    pub authority_permille: u64,
+}
+
+impl DejitterConfig {
+    /// Default policy for compressed outputs: release-rate servo holding a
+    /// 60 ms buffer with ±5 % authority, backed by a 250 ms residence cap
+    /// (drain back to ~32 datagrams). Inside the receiver T-STD envelope
+    /// (≤ ~0.7 s) and SRT/RIST receive-latency headroom.
+    pub fn servo() -> Self {
+        Self::servo_with(None)
+    }
+
+    /// As [`Self::servo`] but with an operator-supplied setpoint. Precedence
+    /// for the buffer setpoint: explicit per-output `egress_buffer_ms` config
+    /// > `BILBYCAST_EGRESS_BUFFER_MS` env > 60 ms default (all clamped to
+    /// [20, 2000] ms). The residence cap defaults to `max(4×setpoint, 250)`
+    /// ms (overridable via `BILBYCAST_EGRESS_RESIDENCE_MS`) so a bigger
+    /// buffer gets proportionally more burst headroom before the hard shed.
+    pub fn servo_with(egress_buffer_ms: Option<u32>) -> Self {
+        let setpoint_ms = egress_buffer_ms
+            .map(|m| m as u64)
+            .or_else(|| {
+                std::env::var("BILBYCAST_EGRESS_BUFFER_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+            })
+            .unwrap_or(60)
+            .clamp(20, 2000);
+        let cap_ms = std::env::var("BILBYCAST_EGRESS_RESIDENCE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or_else(|| (setpoint_ms.saturating_mul(4)).max(250))
+            .clamp(setpoint_ms.saturating_add(40), 5_000);
+        Self {
+            enabled: true,
+            shed_residence_ns: cap_ms.saturating_mul(1_000_000),
+            drain_floor_dgms: 32,
+            setpoint_ms,
+            authority_permille: 50,
+        }
+    }
+    /// No de-jitter (ST 2110 strict pacing / SO_TXTIME owns timing).
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            shed_residence_ns: 0,
+            drain_floor_dgms: 0,
+            setpoint_ms: 0,
+            authority_permille: 0,
+        }
+    }
+    /// Residence cap in microseconds (for comparison with `recv_time_us`).
+    fn shed_residence_us(&self) -> u64 {
+        self.shed_residence_ns / 1_000
+    }
+}
+
+impl Default for DejitterConfig {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
 /// One datagram on its way to the wire. `bytes` is on-the-wire-final
 /// (caller has already wrapped RTP / FEC / RFC 4175 / etc.).
 ///
@@ -386,6 +478,7 @@ pub fn spawn_wire_emitter(
     dest: SocketAddr,
     anchor: AnchorSource,
     pacing: WirePacingClass,
+    egress_buffer_ms: Option<u32>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
 ) -> WireTxHandle {
@@ -502,12 +595,26 @@ pub fn spawn_wire_emitter(
         rx: rx_raw,
         depth: Arc::clone(&depth),
     };
+    // Surface live queue depth on the output stats so the manager UI can
+    // show the egress buffer occupancy (and catch a runaway early).
+    stats.set_wire_emit_depth_handle(Arc::clone(&depth));
     let thread_id = id.clone();
     let stats_for_thread = stats.clone();
     // CPU pin index — round-robin across the operator-configured set so
     // multiple wire-emit threads on the same edge spread across the
     // dedicated cores instead of stacking onto one.
     let cpu_index = next_wire_emit_cpu_index();
+    // Egress de-jitter policy: compressed (Lossless) gets the release-rate
+    // servo + bounded residence cap so a source-rate-vs-wallclock mismatch or
+    // burst can't run the output buffer away; ST 2110 (EtfEligible) keeps
+    // strict pacing untouched (its raster + SO_TXTIME is the clock). The
+    // per-output `egress_buffer_ms` (manager UI knob) tunes the servo
+    // setpoint; `None` falls back to env / 60 ms default.
+    let dejitter = if matches!(pacing, WirePacingClass::Lossless) {
+        DejitterConfig::servo_with(egress_buffer_ms)
+    } else {
+        DejitterConfig::disabled()
+    };
     std::thread::Builder::new()
         .name(format!("wire-emit-{}", id))
         .spawn(move || {
@@ -524,7 +631,7 @@ pub fn spawn_wire_emitter(
                 sched_fifo,
                 pinned_to,
             );
-            run_emitter(thread_id, socket, dest, anchor, releaser, stats_for_thread, cancel, rx);
+            run_emitter(thread_id, socket, dest, anchor, releaser, dejitter, stats_for_thread, cancel, rx);
         })
         .expect("wire-emit thread spawn");
     tx
@@ -857,6 +964,128 @@ impl TargetState {
             self.wall_anchor_ns.max(now_ns)
         }
     }
+
+    /// Pacing dispatch. Compressed/`Lossless` outputs (`cfg.enabled`) use
+    /// the closed-loop [`Self::derive_target_servo`]; ST 2110 / everything
+    /// else keeps the open-loop PCR-delta [`Self::derive_target`] **byte for
+    /// byte unchanged** (its strict raster + SO_TXTIME pacing is the clock).
+    fn derive_target_paced(
+        &mut self,
+        now_ns: u64,
+        datagram_pcr: Option<u64>,
+        datagram_bytes: usize,
+        depth: usize,
+        cfg: &DejitterConfig,
+    ) -> u64 {
+        if cfg.enabled {
+            self.derive_target_servo(now_ns, datagram_pcr, datagram_bytes, depth, cfg)
+        } else {
+            self.derive_target(now_ns, datagram_pcr, datagram_bytes)
+        }
+    }
+
+    /// Closed-loop release-rate servo for compressed (`Lossless`) outputs.
+    ///
+    /// The open-loop [`Self::derive_target_raw`] paces by **source-PCR
+    /// deltas** against a startup wall anchor, with no term comparing the
+    /// internal buffer fill or the wallclock drain rate — so any steady
+    /// source-rate-vs-`CLOCK_TAI` offset (or burst) integrates into the wire
+    /// queue with nothing correcting it (the 47 s latency runaway). This
+    /// servo replaces that integration with a **leaky-bucket release** whose
+    /// rate is the recovered source rate (`observed_rate_bps`) trimmed
+    /// ±`authority` by the buffer-fill error. Holding the buffer at
+    /// `setpoint_ms` absorbs a steady offset as a steady rate trim with **no
+    /// accumulation and no loss** — there is no integrator for the runaway.
+    /// The hard residence-cap shed (in `run_emitter`) stays as the safety net
+    /// for bursts beyond the servo's ±authority.
+    ///
+    /// PCR is used here ONLY to *measure* the nominal rate; pacing is by
+    /// byte/rate, not by PCR delta. The PCR field in the bytes is never
+    /// rewritten — the receiver re-clocks from it exactly as before.
+    ///
+    /// Runs ONLY under the ClockNanosleep tier (Lossless never takes the
+    /// SO_TXTIME / etf path), so a backward target on a drained buffer is
+    /// harmless (no etf reorder) and the outer monotonic guard is moot.
+    fn derive_target_servo(
+        &mut self,
+        now_ns: u64,
+        datagram_pcr: Option<u64>,
+        datagram_bytes: usize,
+        depth: usize,
+        cfg: &DejitterConfig,
+    ) -> u64 {
+        // 1. Recover the nominal source rate from inter-PCR observations
+        //    (same EMA as the raw path). On a source discontinuity (input
+        //    switch / loop seam) re-anchor the measurement and emit ASAP,
+        //    but KEEP `observed_rate_bps` so the leaky bucket never stalls.
+        let mut force_asap = false;
+        if let Some(pcr) = datagram_pcr {
+            match self.pcr_anchor {
+                Some(prev) => {
+                    let delta_27 = pcr.wrapping_sub(prev) as i64;
+                    if (0..=PCR_DISCONTINUITY_27MHZ).contains(&delta_27) {
+                        let delta_ns = (delta_27 as u64) * 1000 / 27;
+                        if delta_ns >= 1_000_000 && self.bytes_since_anchor > 0 {
+                            let observed_bps = self
+                                .bytes_since_anchor
+                                .saturating_mul(8 * 1_000_000_000)
+                                / delta_ns;
+                            self.observed_rate_bps = if self.observed_rate_bps == 0 {
+                                observed_bps
+                            } else {
+                                (3 * self.observed_rate_bps + observed_bps) / 4
+                            };
+                        }
+                    } else {
+                        force_asap = true;
+                    }
+                    self.pcr_anchor = Some(pcr);
+                    self.bytes_since_anchor = 0;
+                }
+                None => {
+                    self.pcr_anchor = Some(pcr);
+                }
+            }
+        }
+        self.bytes_since_anchor = self.bytes_since_anchor.saturating_add(datagram_bytes as u64);
+
+        let nominal = self.observed_rate_bps;
+
+        // 2. Cold start, source discontinuity, or no rate recovered yet →
+        //    emit ASAP and seed the leaky-bucket cursor at now.
+        if force_asap || !self.initialised || nominal == 0 {
+            self.initialised = true;
+            self.last_returned_ns = now_ns;
+            return now_ns;
+        }
+
+        // 3. Buffer-level trim (the feedback the open-loop pacer lacked).
+        //    Time domain so it auto-adapts to datagram size + bitrate:
+        //    fill_ms = how many ms of content sit in the queue behind this
+        //    datagram. err is ‰ of setpoint, clamped ±1000 (±1.0).
+        let fill_ms = (depth as u64)
+            .saturating_mul(datagram_bytes as u64)
+            .saturating_mul(8_000)
+            / nominal.max(1);
+        let setpoint_ms = cfg.setpoint_ms.max(1);
+        let err_permille = (((fill_ms as i64 - setpoint_ms as i64) * 1000)
+            / setpoint_ms as i64)
+            .clamp(-1000, 1000);
+        // release = nominal · (1 + authority·err). authority_permille=50 → ±5%.
+        let factor_permille = 1000 + (cfg.authority_permille as i64 * err_permille) / 1000;
+        let release_bps = nominal.saturating_mul(factor_permille.max(1) as u64) / 1000;
+
+        // 4. Leaky bucket: schedule this datagram `interval` after the last,
+        //    where interval = wire-time of these bytes at the trimmed rate.
+        let interval_ns = (datagram_bytes as u64).saturating_mul(8_000_000_000)
+            / release_bps.max(1);
+        let target = self
+            .last_returned_ns
+            .saturating_add(interval_ns)
+            .max(now_ns); // drained buffer (target in the past) → emit ASAP
+        self.last_returned_ns = target;
+        target
+    }
 }
 
 // ── Emitter main loop ───────────────────────────────────────────────────
@@ -897,12 +1126,51 @@ struct PendingDatagram {
     pcr_27mhz: Option<u64>,
 }
 
+/// Shed the stale wire-queue backlog after the residence cap was exceeded.
+///
+/// The caller has already pulled the over-residence anchor datagram (counted
+/// as the first shed) and decided to drop it. This drains the channel down to
+/// `floor` datagrams — dropping the stale backlog that has piled up behind the
+/// anchor — and re-anchors the pacing state so the next datagram restarts ASAP
+/// rather than chasing the stale future target.
+///
+/// Terminates: every `try_recv` decrements `rx.depth` (saturating), so the
+/// loop exits when depth reaches `floor` or the channel empties (`Err`).
+/// Returns the total number of datagrams shed (≥ 1, the anchor included).
+///
+/// Re-anchor semantics mirror the PCR-discontinuity reset in
+/// `derive_target_raw`: clearing `initialised` routes the next datagram through
+/// the cold-start path, and resetting `last_returned_ns` stops the outer
+/// monotonic guard from dragging that fresh anchor back to the stale future
+/// target. `anchor_pid` (same stream) and `observed_rate_bps` (the recovered
+/// rate the Phase-2 servo reuses) are intentionally preserved.
+fn shed_stale_backlog(
+    state: &mut TargetState,
+    rx: &WireTxReceiver,
+    floor: usize,
+    now_ns: u64,
+) -> u64 {
+    let mut shed: u64 = 1; // the anchor datagram the caller already pulled
+    while rx.depth.load(Ordering::Relaxed) > floor {
+        match rx.try_recv() {
+            Ok(_) => shed += 1,
+            Err(_) => break,
+        }
+    }
+    state.initialised = false;
+    state.pcr_anchor = None;
+    state.bytes_since_anchor = 0;
+    state.last_returned_ns = now_ns;
+    shed
+}
+
 fn run_emitter(
     id: String,
     socket: UdpSocket,
     dest: SocketAddr,
     anchor: AnchorSource,
     releaser: Releaser,
+    dejitter: DejitterConfig,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
     rx: WireTxReceiver,
@@ -995,15 +1263,62 @@ fn run_emitter(
                 let pcr_27mhz = pcr_with_pid.map(|(pcr, _)| pcr);
 
                 let target_ns = match anchor {
-                    AnchorSource::Pcr => {
-                        state.derive_target(now_ns, pcr_27mhz, dg.bytes.len())
-                    }
+                    AnchorSource::Pcr => state.derive_target_paced(
+                        now_ns,
+                        pcr_27mhz,
+                        dg.bytes.len(),
+                        rx.depth.load(Ordering::Relaxed),
+                        &dejitter,
+                    ),
                     AnchorSource::St2110Raster => dg.target_tx_time_ns.unwrap_or(now_ns),
                 };
                 (dg, target_ns, pcr_27mhz)
             }
         };
         let now_ns = monotonic_now_ns();
+
+        // ── Egress de-jitter: hard residence cap (compressed only) ───────
+        //
+        // The pacer (`derive_target_raw`) is open-loop on source-PCR deltas
+        // against a startup wall anchor — it has NO term comparing the
+        // internal wire queue's fill or the wallclock drain rate. So a
+        // sub-% source-rate-vs-CLOCK_TAI offset, or a burst, integrates into
+        // this thread's input channel with nothing correcting it: the
+        // diagnosed 47 s output-latency runaway. (etf masked it as late-drop
+        // stutter before the WirePacingClass fix; clock_nanosleep buffers it
+        // unbounded.)
+        //
+        // The safety net: if the anchor datagram has waited longer than the
+        // residence cap, the queue has backed up past what any receiver
+        // buffer can use — shed this datagram and drain the stale backlog
+        // behind it down to the de-jitter floor, then re-anchor pacing at
+        // "now". Bounds end-to-end latency by construction (the runaway
+        // becomes physically impossible). The PCR field is never touched, so
+        // the downstream IRD / SRT-TSBPD / RIST receiver re-clocks across the
+        // discontinuity from its own T-STD buffer exactly as it would across
+        // any upstream packet loss. Lossless-only (`dejitter.enabled`); ST
+        // 2110 keeps strict pacing untouched. The richer release-rate servo
+        // (Phase 2) holds occupancy far below this cap so it rarely fires;
+        // this is the floor that makes the failure mode bounded regardless.
+        // Residence uses the SAME clock on both ends (`util::time::now_us`,
+        // the Instant epoch that stamped `recv_time_us`) — NOT the CLOCK_TAI
+        // `now_ns` above, which is a different time base.
+        if dejitter.enabled && dg.recv_time_us > 0 {
+            let residence_us = crate::util::time::now_us().saturating_sub(dg.recv_time_us);
+            if residence_us > dejitter.shed_residence_us() {
+                let shed =
+                    shed_stale_backlog(&mut state, &rx, dejitter.drain_floor_dgms, now_ns);
+                stats.egress_shed.fetch_add(shed, Ordering::Relaxed);
+                tracing::warn!(
+                    "wire-emit '{}': egress residence {}ms exceeded {}ms cap — shed {} stale datagram(s) and re-anchored; receiver re-clocks from PCR",
+                    id,
+                    residence_us / 1000,
+                    dejitter.shed_residence_us() / 1000,
+                    shed,
+                );
+                continue;
+            }
+        }
 
         // PCR is left exactly as packetized. An earlier attempt to
         // re-stamp PCR to `target_ns - preroll` here was reverted —
@@ -1073,10 +1388,12 @@ fn run_emitter(
                             }
                         }
                         let next_pcr_27mhz = next_pcr_with_pid.map(|(pcr, _)| pcr);
-                        let next_target = state.derive_target(
+                        let next_target = state.derive_target_paced(
                             now_ns,
                             next_pcr_27mhz,
                             next_dg.bytes.len(),
+                            rx.depth.load(Ordering::Relaxed),
+                            &dejitter,
                         );
                         if next_target <= now_ns {
                             batch.push(BatchEntry {
@@ -1541,6 +1858,7 @@ mod tests {
             dest,
             AnchorSource::Pcr,
             WirePacingClass::Lossless,
+            None,
             stats.clone(),
             cancel.clone(),
         );
@@ -1593,6 +1911,7 @@ mod tests {
             dest,
             AnchorSource::St2110Raster,
             WirePacingClass::EtfEligible,
+            None,
             stats.clone(),
             cancel.clone(),
         );
@@ -1688,5 +2007,221 @@ mod tests {
              miss the PCR (this is what justified the ts_offset field); \
              if this assertion ever fails the fixture has changed"
         );
+    }
+
+    // ── Egress de-jitter: residence-cap shed (Phase 1) ──────────────────
+
+    /// Build a connected wire channel pre-filled with `n` datagrams so the
+    /// shared depth counter reads `n` — mirrors the real spawn-time wiring.
+    fn filled_wire_channel(n: usize) -> (WireTxHandle, WireTxReceiver) {
+        let (tx_raw, rx_raw) = sync_channel::<WireDatagram>(WIRE_CHANNEL_CAP);
+        let depth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tx = WireTxHandle {
+            tx: tx_raw,
+            depth: Arc::clone(&depth),
+        };
+        let rx = WireTxReceiver {
+            rx: rx_raw,
+            depth,
+        };
+        for _ in 0..n {
+            tx.try_send(WireDatagram {
+                bytes: Bytes::from_static(&[0u8; 188]),
+                recv_time_us: 0,
+                target_tx_time_ns: None,
+                ts_offset: 0,
+            })
+            .expect("channel has capacity for the test fill");
+        }
+        assert_eq!(tx.depth.load(Ordering::Relaxed), n);
+        (tx, rx)
+    }
+
+    #[test]
+    fn shed_drains_backlog_down_to_floor_and_reanchors() {
+        // 100 datagrams queued, drain floor 32: the caller already pulled the
+        // anchor (counts as 1), then we drop 100 → 32 = 68 more = 69 total,
+        // leaving exactly `floor` in the channel.
+        let (tx, rx) = filled_wire_channel(100);
+        let mut state = TargetState::default();
+        // Simulate a runaway: pacing anchored far in the future.
+        state.initialised = true;
+        state.pcr_anchor = Some(123_456);
+        state.bytes_since_anchor = 9_999;
+        state.last_returned_ns = 50_000_000_000;
+        let now_ns = 1_000_000_000;
+
+        let shed = shed_stale_backlog(&mut state, &rx, 32, now_ns);
+
+        assert_eq!(shed, 69, "1 anchor + (100-32) drained");
+        assert_eq!(
+            tx.depth.load(Ordering::Relaxed),
+            32,
+            "channel drained to the floor, not emptied"
+        );
+        // Re-anchored exactly like a PCR discontinuity reset.
+        assert!(!state.initialised, "next datagram takes the cold-start path");
+        assert_eq!(state.pcr_anchor, None);
+        assert_eq!(state.bytes_since_anchor, 0);
+        assert_eq!(
+            state.last_returned_ns, now_ns,
+            "last_returned reset so the monotonic guard can't drag the fresh \
+             anchor back to the stale future target"
+        );
+    }
+
+    #[test]
+    fn shed_with_floor_zero_empties_channel() {
+        let (tx, rx) = filled_wire_channel(50);
+        let mut state = TargetState::default();
+        let shed = shed_stale_backlog(&mut state, &rx, 0, 7);
+        assert_eq!(shed, 51, "1 anchor + all 50 drained");
+        assert_eq!(tx.depth.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn shed_below_floor_only_drops_the_anchor() {
+        // Depth already at/under the floor: nothing to drain, only the anchor
+        // datagram (already pulled by the caller) is shed; the buffer the
+        // receiver still needs is left intact.
+        let (tx, rx) = filled_wire_channel(10);
+        let mut state = TargetState::default();
+        let shed = shed_stale_backlog(&mut state, &rx, 32, 7);
+        assert_eq!(shed, 1, "floor not reached → only the anchor is shed");
+        assert_eq!(tx.depth.load(Ordering::Relaxed), 10, "backlog untouched");
+        assert!(!state.initialised, "still re-anchors even with no drain");
+    }
+
+    #[test]
+    fn dejitter_policy_matches_pacing_class() {
+        // The spawn-time derivation: compressed gets the cap, ST 2110 doesn't.
+        assert!(DejitterConfig::servo().enabled);
+        assert!(!DejitterConfig::disabled().enabled);
+        assert!(!DejitterConfig::default().enabled);
+        assert_eq!(DejitterConfig::servo().shed_residence_us(), 250_000);
+    }
+
+    // ── Egress de-jitter: release-rate servo (Phase 2) ──────────────────
+
+    /// A warmed servo state: rate already recovered, leaky-bucket cursor at
+    /// `last_returned_ns`. Mirrors steady-state after a few inter-PCR pairs.
+    fn warmed_servo_state(rate_bps: u64, last_returned_ns: u64) -> TargetState {
+        let mut s = TargetState::default();
+        s.observed_rate_bps = rate_bps;
+        s.initialised = true;
+        s.pcr_anchor = Some(1_000_000);
+        s.last_returned_ns = last_returned_ns;
+        s
+    }
+
+    #[test]
+    fn servo_pacing_responds_to_buffer_fill() {
+        // Over setpoint → release faster (shorter interval); under setpoint →
+        // slower. This IS the feedback the open-loop pacer lacked.
+        let cfg = DejitterConfig::servo();
+        let bytes = 1316;
+        let now = 1_000_000_000;
+        let mut mid = warmed_servo_state(6_000_000, now);
+        let int_mid = mid.derive_target_servo(now, None, bytes, 34, &cfg) - now;
+        let mut hi = warmed_servo_state(6_000_000, now);
+        let int_hi = hi.derive_target_servo(now, None, bytes, 340, &cfg) - now;
+        let mut lo = warmed_servo_state(6_000_000, now);
+        let int_lo = lo.derive_target_servo(now, None, bytes, 5, &cfg) - now;
+        assert!(int_hi < int_mid, "buffer over setpoint must drain faster");
+        assert!(int_lo > int_mid, "buffer under setpoint must slow down");
+    }
+
+    #[test]
+    fn servo_rate_authority_is_bounded() {
+        // No matter how full or empty, the trim stays within ±authority
+        // (default ±5 %) — the induced PCR_OJ must stay inside the receiver
+        // T-STD. A bounded trim is what makes the runaway impossible:
+        // sustained overflow can't push release past +5 %, so a burst beyond
+        // that is handled by the residence-cap shed, not by unbounded speedup.
+        let cfg = DejitterConfig::servo();
+        let bytes = 1316;
+        // Pathologically full → release capped at nominal · 1.05.
+        let mut full = warmed_servo_state(6_000_000, 0);
+        let t_full = full.derive_target_servo(0, None, bytes, 1_000_000, &cfg);
+        let min_interval = bytes as u64 * 8_000_000_000 / (6_000_000 * 1050 / 1000);
+        assert_eq!(t_full, min_interval, "+authority bound (fastest release)");
+        // Empty → release floored at nominal · 0.95.
+        let mut empty = warmed_servo_state(6_000_000, 2_000_000_000);
+        let t_empty = empty.derive_target_servo(2_000_000_000, None, bytes, 0, &cfg);
+        let max_interval = bytes as u64 * 8_000_000_000 / (6_000_000 * 950 / 1000);
+        assert_eq!(
+            t_empty - 2_000_000_000,
+            max_interval,
+            "-authority bound (slowest release)"
+        );
+    }
+
+    #[test]
+    fn servo_holds_nominal_rate_at_setpoint_no_drift() {
+        // The crux: with the buffer held at setpoint, the servo paces at the
+        // recovered nominal rate with NO accumulating drift — a steady source
+        // offset is absorbed by the trim, not integrated into latency. 100
+        // datagrams at depth≈setpoint must land within 1 % of the ideal span.
+        let cfg = DejitterConfig::servo();
+        let bytes = 1316u64;
+        let nominal = 6_000_000u64;
+        let mut s = warmed_servo_state(nominal, 0);
+        let mut last = 0u64;
+        for _ in 0..100 {
+            // now=0 so the underflow floor never clamps (targets grow freely).
+            last = s.derive_target_servo(0, None, bytes as usize, 34, &cfg);
+        }
+        let ideal = 100 * bytes * 8_000_000_000 / nominal;
+        let diff = (last as i64 - ideal as i64).abs();
+        assert!(
+            diff < ideal as i64 / 100,
+            "paced span {last} drifted from ideal {ideal} by {diff} (> 1%)"
+        );
+    }
+
+    #[test]
+    fn servo_cold_start_and_drain_emit_asap() {
+        let cfg = DejitterConfig::servo();
+        // Cold start (no rate recovered) → emit ASAP, seed cursor.
+        let mut cold = TargetState::default();
+        let t0 = cold.derive_target_servo(5_000, Some(1000), 1316, 0, &cfg);
+        assert_eq!(t0, 5_000);
+        assert!(cold.initialised);
+        assert_eq!(cold.pcr_anchor, Some(1000));
+        // Drained buffer: we fell behind wallclock → floor to now, never past.
+        let mut behind = warmed_servo_state(6_000_000, 1_000_000_000);
+        let t1 = behind.derive_target_servo(5_000_000_000, None, 1316, 0, &cfg);
+        assert_eq!(t1, 5_000_000_000, "target floored to now, not the past");
+        assert_eq!(behind.last_returned_ns, 5_000_000_000);
+    }
+
+    #[test]
+    fn servo_discontinuity_emits_asap_and_keeps_rate() {
+        // Input switch / loop seam: source PCR jumps. Emit ASAP and re-anchor
+        // the rate measurement, but KEEP the recovered rate so the leaky
+        // bucket never stalls to zero.
+        let cfg = DejitterConfig::servo();
+        let mut s = warmed_servo_state(6_000_000, 1_000_000_000);
+        let t = s.derive_target_servo(2_000_000_000, Some(500_000), 1316, 50, &cfg);
+        assert_eq!(t, 2_000_000_000, "discontinuity → emit ASAP");
+        assert_eq!(s.observed_rate_bps, 6_000_000, "rate preserved across seam");
+        assert_eq!(s.pcr_anchor, Some(500_000), "rate measurement re-anchored");
+    }
+
+    #[test]
+    fn paced_dispatch_routes_by_enabled_flag() {
+        // disabled → byte-identical to the open-loop derive_target (ST 2110
+        // path untouched). enabled → the servo (different value).
+        let now = 1_000_000_000;
+        let mut a = TargetState::default();
+        let mut b = TargetState::default();
+        let raw = a.derive_target(now, Some(900_000), 1316);
+        let disabled =
+            b.derive_target_paced(now, Some(900_000), 1316, 0, &DejitterConfig::disabled());
+        assert_eq!(raw, disabled, "disabled dispatch must equal derive_target");
+        // Both fresh states warmed identically, servo path diverges from raw.
+        let mut c = warmed_servo_state(6_000_000, now);
+        let servo = c.derive_target_paced(now, None, 1316, 200, &DejitterConfig::servo());
+        assert!(servo >= now, "servo target is sane");
     }
 }

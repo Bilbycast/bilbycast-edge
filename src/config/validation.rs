@@ -648,26 +648,48 @@ pub fn validate_input_definition(def: &InputDefinition) -> Result<()> {
     }
     validate_input(&def.config)?;
     validate_input_interface_bindings(&def.id, &def.config)?;
-    validate_ingress_smoothing(&def.id, &def.config)?;
+    validate_ingress_delay(&def.id, &def.config)?;
+    validate_ingress_dejitter(&def.id, &def.config)?;
     Ok(())
 }
 
-/// Reject `ingress_smoothing_ms` values outside the supported 0..=1000
+/// Reject `ingress_delay_ms` values outside the supported 0..=1000
 /// envelope. Per-input field, only meaningful on the input variants that
 /// expose it (UDP, RTP, SRT, RTMP, RTSP).
-fn validate_ingress_smoothing(input_id: &str, cfg: &InputConfig) -> Result<()> {
+fn validate_ingress_delay(input_id: &str, cfg: &InputConfig) -> Result<()> {
     let ms = match cfg {
-        InputConfig::Rtp(c) => c.ingress_smoothing_ms,
-        InputConfig::Udp(c) => c.ingress_smoothing_ms,
-        InputConfig::Srt(c) => c.ingress_smoothing_ms,
-        InputConfig::Rtmp(c) => c.ingress_smoothing_ms,
-        InputConfig::Rtsp(c) => c.ingress_smoothing_ms,
+        InputConfig::Rtp(c) => c.ingress_delay_ms,
+        InputConfig::Udp(c) => c.ingress_delay_ms,
+        InputConfig::Srt(c) => c.ingress_delay_ms,
+        InputConfig::Rtmp(c) => c.ingress_delay_ms,
+        InputConfig::Rtsp(c) => c.ingress_delay_ms,
         _ => None,
     };
     if let Some(v) = ms {
         if v > 1000 {
             bail!(
-                "Input '{input_id}': ingress_smoothing_ms = {v} out of range (0..=1000)"
+                "Input '{input_id}': ingress_delay_ms = {v} out of range (0..=1000)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reject `ingress_dejitter_ms` values outside the supported 20..=2000
+/// envelope. Per-input field, only exposed on the raw UDP / RTP input
+/// variants (the only TS-carrying inputs without transport-level
+/// de-jitter). Bound mirrors the per-output `egress_buffer_ms` servo so
+/// the two de-jitter stages share one operator mental model.
+fn validate_ingress_dejitter(input_id: &str, cfg: &InputConfig) -> Result<()> {
+    let ms = match cfg {
+        InputConfig::Rtp(c) => c.ingress_dejitter_ms,
+        InputConfig::Udp(c) => c.ingress_dejitter_ms,
+        _ => None,
+    };
+    if let Some(v) = ms {
+        if !(20..=2000).contains(&v) {
+            bail!(
+                "Input '{input_id}': ingress_dejitter_ms = {v} out of range (20..=2000 ms)"
             );
         }
     }
@@ -3904,6 +3926,7 @@ fn validate_input_transcode_group_a(
 pub fn validate_output(output: &OutputConfig) -> Result<()> {
     validate_output_with_input(output, None)?;
     validate_output_interface_bindings(output)?;
+    validate_output_egress_buffer(output)?;
     validate_pid_overrides(
         output_pid_overrides(output),
         "output pid_overrides",
@@ -3991,6 +4014,26 @@ fn validate_output_interface_bindings(output: &OutputConfig) -> Result<()> {
         }
         // RTMP / HLS / CMAF / WebRTC / Display are out of Phase 1 scope.
         _ => {}
+    }
+    Ok(())
+}
+
+/// Validate the optional `egress_buffer_ms` de-jitter setpoint on the
+/// compressed UDP/RTP outputs. Bounded 20–2000 ms (the wire-emit servo
+/// clamps to the same range; rejecting out-of-range here gives the operator
+/// an explicit error instead of a silent clamp). All other output types
+/// ignore the field (the wire emitter only runs on UDP/RTP). Walked once per
+/// output, mirroring [`validate_output_interface_bindings`].
+fn validate_output_egress_buffer(output: &OutputConfig) -> Result<()> {
+    let (val, label) = match output {
+        OutputConfig::Rtp(c) => (c.egress_buffer_ms, format!("output '{}' (RTP)", c.id)),
+        OutputConfig::Udp(c) => (c.egress_buffer_ms, format!("output '{}' (UDP)", c.id)),
+        _ => return Ok(()),
+    };
+    if let Some(ms) = val {
+        if !(20..=2000).contains(&ms) {
+            bail!("{label}: egress_buffer_ms must be 20-2000 ms, got {ms}");
+        }
     }
     Ok(())
 }
@@ -7139,7 +7182,8 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
-                        ingress_smoothing_ms: None,
+                        ingress_delay_ms: None,
+                        ingress_dejitter_ms: None,
                         passthrough_clock: None,
             }),
         });
@@ -7163,6 +7207,7 @@ mod tests {
                 cbr_pad_to_kbps: None,
                 pid_overrides: None,
                 interface_binding: None,
+            egress_buffer_ms: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -7216,6 +7261,56 @@ mod tests {
         config
     }
 
+    fn rtp_input_with_dejitter(ms: Option<u32>) -> InputConfig {
+        InputConfig::Rtp(RtpInputConfig {
+            bind_addr: "0.0.0.0:5000".to_string(),
+            external_address: None,
+            interface_addr: None,
+            source_addr: None,
+            fec_decode: None,
+            allowed_sources: None,
+            allowed_payload_types: None,
+            max_bitrate_mbps: None,
+            tr07_mode: None,
+            redundancy: None,
+            audio_encode: None,
+            transcode: None,
+            video_encode: None,
+            program_number: None,
+            pid_map: None,
+            pid_overrides: None,
+            interface_binding: None,
+            ingress_delay_ms: None,
+            ingress_dejitter_ms: ms,
+            passthrough_clock: None,
+        })
+    }
+
+    #[test]
+    fn validate_ingress_dejitter_accepts_in_range() {
+        for ms in [20u32, 60, 250, 2000] {
+            let config = make_config_input_only(rtp_input_with_dejitter(Some(ms)));
+            assert!(
+                validate_config(&config).is_ok(),
+                "ingress_dejitter_ms={ms} should be accepted"
+            );
+        }
+        // None (disabled) is always fine.
+        let config = make_config_input_only(rtp_input_with_dejitter(None));
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn validate_ingress_dejitter_rejects_out_of_range() {
+        for ms in [0u32, 10, 19, 2001, 100_000] {
+            let config = make_config_input_only(rtp_input_with_dejitter(Some(ms)));
+            assert!(
+                validate_config(&config).is_err(),
+                "ingress_dejitter_ms={ms} should be rejected (bound 20..=2000)"
+            );
+        }
+    }
+
     #[test]
     fn test_valid_rtp_flow() {
         let config = make_config_with_rtp("0.0.0.0:5000", "127.0.0.1:5004");
@@ -7242,7 +7337,8 @@ mod tests {
                 pid_map: None,
                 pid_overrides: None,
                 interface_binding: None,
-                ingress_smoothing_ms: None,
+                ingress_delay_ms: None,
+                ingress_dejitter_ms: None,
                 passthrough_clock: None,
         }));
         assert!(validate_config(&config).is_err());
@@ -7281,7 +7377,7 @@ mod tests {
                 pid_map: None,
                 pid_overrides: None,
                 interface_binding: None,
-                ingress_smoothing_ms: None,
+                ingress_delay_ms: None,
                 passthrough_clock: None,
         }));
         assert!(validate_config(&config).is_err());
@@ -7323,7 +7419,7 @@ mod tests {
                 pid_map: None,
                 pid_overrides: None,
                 interface_binding: None,
-                ingress_smoothing_ms: None,
+                ingress_delay_ms: None,
                 passthrough_clock: None,
         }));
         let err = validate_config(&config).expect_err("rendezvous+FEC must be rejected");
@@ -7360,7 +7456,8 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
-                        ingress_smoothing_ms: None,
+                        ingress_delay_ms: None,
+                        ingress_dejitter_ms: None,
                         passthrough_clock: None,
             }),
         });
@@ -7387,7 +7484,8 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
-                        ingress_smoothing_ms: None,
+                        ingress_delay_ms: None,
+                        ingress_dejitter_ms: None,
                         passthrough_clock: None,
             }),
         });
@@ -7463,7 +7561,7 @@ mod tests {
                 pid_map: None,
                 pid_overrides: None,
                 interface_binding: None,
-                ingress_smoothing_ms: None,
+                ingress_delay_ms: None,
                 passthrough_clock: None,
         }));
         assert!(validate_config(&config).is_err());
@@ -7503,7 +7601,8 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
-                        ingress_smoothing_ms: None,
+                        ingress_delay_ms: None,
+                        ingress_dejitter_ms: None,
                         passthrough_clock: None,
             }),
         });
@@ -7527,6 +7626,7 @@ mod tests {
                 cbr_pad_to_kbps: None,
                 pid_overrides: None,
                 interface_binding: None,
+            egress_buffer_ms: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -7575,7 +7675,8 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
-                        ingress_smoothing_ms: None,
+                        ingress_delay_ms: None,
+                        ingress_dejitter_ms: None,
                         passthrough_clock: None,
             }),
         });
@@ -7599,6 +7700,7 @@ mod tests {
                 cbr_pad_to_kbps: None,
                 pid_overrides: None,
                 interface_binding: None,
+            egress_buffer_ms: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -7643,7 +7745,8 @@ mod tests {
                 pid_map: None,
                 pid_overrides: None,
                 interface_binding: None,
-                ingress_smoothing_ms: None,
+                ingress_delay_ms: None,
+                ingress_dejitter_ms: None,
                 passthrough_clock: None,
         }));
         assert!(validate_config(&config).is_err());
@@ -7675,7 +7778,8 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
-                        ingress_smoothing_ms: None,
+                        ingress_delay_ms: None,
+                        ingress_dejitter_ms: None,
                         passthrough_clock: None,
             }),
         });
@@ -7699,6 +7803,7 @@ mod tests {
                 cbr_pad_to_kbps: None,
                 pid_overrides: None,
                 interface_binding: None,
+            egress_buffer_ms: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -7747,7 +7852,8 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
-                        ingress_smoothing_ms: None,
+                        ingress_delay_ms: None,
+                        ingress_dejitter_ms: None,
                         passthrough_clock: None,
             }),
         });
@@ -7771,6 +7877,7 @@ mod tests {
                 cbr_pad_to_kbps: None,
                 pid_overrides: None,
                 interface_binding: None,
+            egress_buffer_ms: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -7819,7 +7926,8 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
-                        ingress_smoothing_ms: None,
+                        ingress_delay_ms: None,
+                        ingress_dejitter_ms: None,
                         passthrough_clock: None,
             }),
         });
@@ -7843,6 +7951,7 @@ mod tests {
                 cbr_pad_to_kbps: None,
                 pid_overrides: None,
                 interface_binding: None,
+            egress_buffer_ms: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -9127,7 +9236,7 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
-                        ingress_smoothing_ms: None,
+                        ingress_delay_ms: None,
                         passthrough_clock: None,
             }),
         };
@@ -9182,7 +9291,8 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
-                        ingress_smoothing_ms: None,
+                        ingress_delay_ms: None,
+                        ingress_dejitter_ms: None,
                         passthrough_clock: None,
             }),
         });
@@ -9209,7 +9319,8 @@ mod tests {
                         pid_map: None,
                         pid_overrides: None,
                         interface_binding: None,
-                        ingress_smoothing_ms: None,
+                        ingress_delay_ms: None,
+                        ingress_dejitter_ms: None,
                         passthrough_clock: None,
             }),
         });
@@ -9294,6 +9405,7 @@ mod tests {
                 cbr_pad_to_kbps: None,
                 pid_overrides: None,
                 interface_binding: None,
+            egress_buffer_ms: None,
         }));
         config.outputs.push(OutputConfig::Udp(UdpOutputConfig {
             id: "out-udp-b".into(),
@@ -9314,6 +9426,7 @@ mod tests {
                 cbr_pad_to_kbps: None,
                 pid_overrides: None,
                 interface_binding: None,
+            egress_buffer_ms: None,
         }));
         let err = validate_config(&config).unwrap_err().to_string();
         assert!(err.contains("Port conflict"), "got: {err}");

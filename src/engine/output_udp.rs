@@ -171,6 +171,7 @@ async fn udp_output_loop_302m(
         dest,
         AnchorSource::Pcr,
         WirePacingClass::Lossless,
+        config.egress_buffer_ms,
         stats.clone(),
         cancel.clone(),
     );
@@ -248,6 +249,7 @@ async fn udp_output_loop(
         dest,
         AnchorSource::Pcr,
         WirePacingClass::Lossless,
+        config.egress_buffer_ms,
         stats.clone(),
         cancel.clone(),
     );

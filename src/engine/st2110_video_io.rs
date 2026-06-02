@@ -804,6 +804,7 @@ pub async fn run_st2110_20_output(
         dest_red,
         AnchorSource::St2110Raster,
         WirePacingClass::EtfEligible,
+        None,
         stats.clone(),
         cancel.clone(),
     );
@@ -826,6 +827,7 @@ pub async fn run_st2110_20_output(
                 addr,
                 AnchorSource::St2110Raster,
                 WirePacingClass::EtfEligible,
+                None,
                 leg2_stats,
                 cancel.clone(),
             ))
@@ -1240,6 +1242,7 @@ pub async fn run_st2110_23_output(
             red_addr,
             AnchorSource::St2110Raster,
             WirePacingClass::EtfEligible,
+            None,
             stats.clone(),
             cancel.clone(),
         );
@@ -1269,6 +1272,7 @@ pub async fn run_st2110_23_output(
                     blue_addr,
                     AnchorSource::St2110Raster,
                     WirePacingClass::EtfEligible,
+                    None,
                     leg2_stats,
                     cancel.clone(),
                 ))

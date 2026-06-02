@@ -315,22 +315,26 @@ pub fn spawn_srt_input(
             );
         }
 
-        // Per-input ingress smoothing publisher. Warn when layered on
+        // Per-input ingress publisher (fixed-delay + de-jitter modes). Warn when layered on
         // top of SRT's native `latency` jitter buffer (usually
         // redundant; operator either set both deliberately or by
         // mistake — surface either way).
-        crate::engine::ingress_smoothing::warn_if_double_buffer_srt(
+        crate::engine::ingress_publisher::warn_if_double_buffer_srt(
             &input_id,
             &flow_id,
-            config.ingress_smoothing_ms,
+            config.ingress_delay_ms,
             config.recv_latency_ms.map(|v| v as u32),
             &event_sender,
         );
-        let publisher = crate::engine::ingress_smoothing::IngressPublisher::new(
-            config.ingress_smoothing_ms,
+        let publisher = crate::engine::ingress_publisher::IngressPublisher::new(
+            config.ingress_delay_ms,
+            // SRT has libsrt TSBPD as its transport de-jitter — no
+            // media-rate ingress de-jitter (would double-buffer).
+            None,
             broadcast_tx,
             &input_id,
             cancel.clone(),
+            stats.clone(),
         );
 
         let result = if config.bonding.is_some() {
@@ -353,7 +357,7 @@ pub fn spawn_srt_input(
 
 async fn srt_input_loop(
     config: SrtInputConfig,
-    publisher: crate::engine::ingress_smoothing::IngressPublisher,
+    publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
@@ -371,7 +375,7 @@ async fn srt_input_loop(
 /// on disconnect.
 async fn srt_input_listener_loop(
     config: SrtInputConfig,
-    publisher: crate::engine::ingress_smoothing::IngressPublisher,
+    publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
@@ -479,7 +483,7 @@ async fn srt_input_listener_loop(
 /// Caller-mode input: reconnects with exponential back-off on disconnect.
 async fn srt_input_caller_loop(
     config: SrtInputConfig,
-    publisher: crate::engine::ingress_smoothing::IngressPublisher,
+    publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
@@ -576,7 +580,7 @@ async fn srt_input_caller_loop(
 /// `Ok(false)` if cancelled (flow is shutting down).
 async fn srt_input_recv_loop(
     socket: &Arc<srt_transport::SrtSocket>,
-    publisher: &crate::engine::ingress_smoothing::IngressPublisher,
+    publisher: &crate::engine::ingress_publisher::IngressPublisher,
     stats: &Arc<FlowStatsAccumulator>,
     cancel: &CancellationToken,
     format: &mut SrtPayloadFormat,
@@ -714,7 +718,7 @@ async fn srt_input_recv_loop(
 /// reconnect with exponential back-off.
 async fn srt_input_redundant_loop(
     config: SrtInputConfig,
-    publisher: crate::engine::ingress_smoothing::IngressPublisher,
+    publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
@@ -1178,7 +1182,7 @@ fn process_redundant_packet(
     failover: &mut RawTsFailover,
     prev_active_leg: &mut ActiveLeg,
     stats: &Arc<FlowStatsAccumulator>,
-    publisher: &crate::engine::ingress_smoothing::IngressPublisher,
+    publisher: &crate::engine::ingress_publisher::IngressPublisher,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) {
@@ -1263,7 +1267,7 @@ fn process_redundant_packet(
 /// bonded callers).
 async fn srt_input_bonded_loop(
     config: SrtInputConfig,
-    publisher: crate::engine::ingress_smoothing::IngressPublisher,
+    publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
@@ -1289,7 +1293,7 @@ async fn srt_input_bonded_loop(
 
 async fn srt_input_bonded_caller_loop(
     config: SrtInputConfig,
-    publisher: crate::engine::ingress_smoothing::IngressPublisher,
+    publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
@@ -1391,7 +1395,7 @@ async fn srt_input_bonded_caller_loop(
 
 async fn srt_input_bonded_listener_loop(
     config: SrtInputConfig,
-    publisher: crate::engine::ingress_smoothing::IngressPublisher,
+    publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
@@ -1499,7 +1503,7 @@ async fn srt_input_bonded_listener_loop(
 #[allow(clippy::too_many_arguments)]
 async fn srt_bonded_group_recv_loop(
     group: &Arc<srt_transport::SrtGroup>,
-    publisher: &crate::engine::ingress_smoothing::IngressPublisher,
+    publisher: &crate::engine::ingress_publisher::IngressPublisher,
     stats: &Arc<FlowStatsAccumulator>,
     cancel: &CancellationToken,
     format: &mut SrtPayloadFormat,

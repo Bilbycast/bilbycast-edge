@@ -515,7 +515,7 @@ pub fn register_ingress_stats(
 /// header. Returns `None` if the input is too short or malformed. Does not
 /// validate the packet is RTP — callers must check that separately (e.g. via
 /// [`crate::util::rtp_parse::is_likely_rtp`]).
-fn rtp_header_length(data: &[u8]) -> Option<usize> {
+pub(crate) fn rtp_header_length(data: &[u8]) -> Option<usize> {
     if data.len() < 12 {
         return None;
     }
@@ -575,9 +575,9 @@ pub fn publish_input_packet_with_post(
 }
 
 /// Same as [`publish_input_packet_with_post`] but publishes through an
-/// [`super::ingress_smoothing::IngressPublisher`] instead of a raw
+/// [`super::ingress_publisher::IngressPublisher`] instead of a raw
 /// `broadcast::Sender`. When the publisher is configured with
-/// `ingress_smoothing_ms > 0`, packets are queued in a per-input
+/// `ingress_delay_ms > 0`, packets are queued in a per-input
 /// FIFO and released at their scheduled time; otherwise the publisher
 /// forwards immediately (zero-overhead pass-through).
 ///
@@ -588,7 +588,7 @@ pub fn publish_input_packet_with_post(
 pub fn publish_input_packet_smoothed(
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<super::input_post_process::InputPostProcess>,
-    publisher: &super::ingress_smoothing::IngressPublisher,
+    publisher: &super::ingress_publisher::IngressPublisher,
     packet: super::packet::RtpPacket,
 ) -> bool {
     match process_input_packet_with_post(transcoder, post, packet) {

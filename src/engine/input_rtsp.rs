@@ -90,12 +90,16 @@ pub fn spawn_rtsp_input(
                 "RTSP input: ingress post-process active (passthrough_clock={passthrough_clock})"
             );
         }
-        // Per-input ingress smoothing publisher.
-        let publisher = crate::engine::ingress_smoothing::IngressPublisher::new(
-            config.ingress_smoothing_ms,
+        // Per-input ingress publisher (fixed-delay + de-jitter modes).
+        let publisher = crate::engine::ingress_publisher::IngressPublisher::new(
+            config.ingress_delay_ms,
+            // RTSP (retina, RTP/TCP) is a locally-synthesised TS clock — no
+            // media-rate ingress de-jitter.
+            None,
             broadcast_tx,
             &input_id,
             cancel.clone(),
+            stats.clone(),
         );
         rtsp_input_loop(config, publisher, stats, cancel, event_sender, flow_id, &mut transcoder, &mut post).await;
     })
@@ -103,7 +107,7 @@ pub fn spawn_rtsp_input(
 
 async fn rtsp_input_loop(
     config: RtspInputConfig,
-    publisher: crate::engine::ingress_smoothing::IngressPublisher,
+    publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     event_sender: EventSender,
@@ -157,7 +161,7 @@ async fn rtsp_input_loop(
 
 async fn run_rtsp_session(
     config: &RtspInputConfig,
-    publisher: &crate::engine::ingress_smoothing::IngressPublisher,
+    publisher: &crate::engine::ingress_publisher::IngressPublisher,
     stats: &Arc<FlowStatsAccumulator>,
     cancel: &CancellationToken,
     event_sender: &EventSender,

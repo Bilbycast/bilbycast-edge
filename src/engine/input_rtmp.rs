@@ -156,12 +156,16 @@ pub fn spawn_rtmp_input(
                 passthrough_clock,
             );
         }
-        // Per-input ingress smoothing publisher.
-        let publisher = crate::engine::ingress_smoothing::IngressPublisher::new(
-            config.ingress_smoothing_ms,
+        // Per-input ingress publisher (fixed-delay + de-jitter modes).
+        let publisher = crate::engine::ingress_publisher::IngressPublisher::new(
+            config.ingress_delay_ms,
+            // RTMP is TCP + a locally-synthesised TS clock — no media-rate
+            // ingress de-jitter.
+            None,
             broadcast_tx,
             &input_id,
             cancel.clone(),
+            stats.clone(),
         );
         process_media(media_rx, publisher, stats, cancel, event_sender, flow_id, &mut transcoder, &mut post, pid_overrides_for_mux).await;
     })
@@ -170,7 +174,7 @@ pub fn spawn_rtmp_input(
 /// Process media messages from the RTMP server, mux into TS, and push to broadcast.
 async fn process_media(
     mut media_rx: mpsc::Receiver<RtmpMediaMessage>,
-    publisher: crate::engine::ingress_smoothing::IngressPublisher,
+    publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     event_sender: EventSender,

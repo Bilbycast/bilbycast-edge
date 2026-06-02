@@ -136,6 +136,23 @@ pub struct OutputStatsAccumulator {
     /// `OutputStatsSnapshot` so the manager UI can show one row per
     /// pacing thread with its core assignment.
     pub wire_pacing_pinned_cpu: AtomicI32,
+    /// Egress de-jitter: count of datagrams **shed** by the residence cap
+    /// (compressed / `WirePacingClass::Lossless` outputs only). When the
+    /// internal wire queue's oldest datagram has waited longer than the
+    /// de-jitter residence cap (default 250 ms — a source-rate-vs-wallclock
+    /// mismatch or burst backing the queue up), the emitter drops the stale
+    /// backlog and re-anchors, bounding end-to-end latency by construction.
+    /// Distinct from `packets_dropped` (broadcast-channel lag) and
+    /// `wire_pacing_late` (SO_TXTIME kernel EOVERFLOW). The companion
+    /// residence value is already surfaced via the `latency.{avg,max}_us`
+    /// metric (`record_latency` = `now − recv_time`). See
+    /// `engine::wire_emit::DejitterConfig` + `docs/egress-dejitter-design.md`.
+    pub egress_shed: AtomicU64,
+    /// Handle to the wire-emit thread's live queue-depth gauge (shared
+    /// `Arc<AtomicUsize>` with the `WireTxHandle`/`WireTxReceiver`).
+    /// Registered once at output startup by `wire_emit::spawn_wire_emitter`.
+    /// Read (single atomic load) on snapshot to surface `wire_emit_depth`.
+    wire_emit_depth: OnceLock<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 /// Registered handle to a per-output decode stage's counters plus the
@@ -667,6 +684,8 @@ impl OutputStatsAccumulator {
             wire_pacing_tier: OnceLock::new(),
             wire_pacing_late: AtomicU64::new(0),
             wire_pacing_pinned_cpu: AtomicI32::new(-1),
+            egress_shed: AtomicU64::new(0),
+            wire_emit_depth: OnceLock::new(),
         }
     }
 
@@ -675,6 +694,13 @@ impl OutputStatsAccumulator {
     /// are no-ops (first wins).
     pub fn set_wire_pacing_tier(&self, tier: &'static str) {
         let _ = self.wire_pacing_tier.set(tier.to_string());
+    }
+
+    /// Register the wire-emit queue-depth gauge so the snapshot path can
+    /// surface live egress buffer occupancy (`wire_emit_depth`). Called
+    /// once at output startup by `engine::wire_emit::spawn_wire_emitter`.
+    pub fn set_wire_emit_depth_handle(&self, depth: Arc<std::sync::atomic::AtomicUsize>) {
+        let _ = self.wire_emit_depth.set(depth);
     }
 
     /// Record the CPU index the wire-emit thread was pinned to (or
@@ -1175,6 +1201,11 @@ impl OutputStatsAccumulator {
                 let v = self.wire_pacing_pinned_cpu.load(Ordering::Relaxed);
                 if v < 0 { None } else { Some(v as u32) }
             },
+            egress_shed: self.egress_shed.load(Ordering::Relaxed),
+            wire_emit_depth: self
+                .wire_emit_depth
+                .get()
+                .map(|d| d.load(Ordering::Relaxed) as u64),
         }
     }
 }
@@ -2252,6 +2283,16 @@ pub struct FlowStatsAccumulator {
     /// natural drain cadence; the snapshot path just clones it.
     pub buffered_hitless_snapshot:
         std::sync::RwLock<Option<crate::stats::models::BufferedHitlessSnapshot>>,
+    /// Ingress de-jitter telemetry, keyed by `input_id` (one entry per
+    /// de-jittered raw UDP / RTP input). The snapshot surfaces the **active**
+    /// input's `shed` + `depth` on its `InputStats` via an `active_key`
+    /// lookup — same per-input model as `input_video_decode_stats` et al.
+    /// Keeping it per-input (not a single flow-shared counter) avoids
+    /// conflating sheds and mis-reporting the buffer depth across multiple
+    /// de-jittered inputs in one flow. Registered by
+    /// [`crate::engine::ingress_dejitter::start`].
+    pub ingress_dejitter_stats:
+        DashMap<String, Arc<crate::engine::ingress_dejitter::IngressDejitterStats>>,
     // Per-output stats
     pub output_stats: DashMap<String, Arc<OutputStatsAccumulator>>,
     pub input_throughput: ThroughputEstimator,
@@ -2487,6 +2528,7 @@ impl FlowStatsAccumulator {
             redundancy_switches: AtomicU64::new(0),
             source_discontinuities: AtomicU64::new(0),
             buffered_hitless_snapshot: std::sync::RwLock::new(None),
+            ingress_dejitter_stats: DashMap::new(),
             output_stats: DashMap::new(),
             input_throughput: ThroughputEstimator::new(),
             tr101290: OnceLock::new(),
@@ -2770,6 +2812,19 @@ impl FlowStatsAccumulator {
     /// once after `BondSocket::receiver` is built.
     pub fn set_input_bond_stats(&self, handle: BondStatsHandle) {
         let _ = self.input_bond_stats_handle.set(handle);
+    }
+
+    /// Register a per-input ingress de-jitter telemetry handle (keyed by
+    /// `input_id`) so the snapshot can surface the active input's shed +
+    /// buffer depth. Called once per de-jittered input at startup by
+    /// [`crate::engine::ingress_dejitter::start`]. Idempotent on re-register
+    /// (e.g. hot re-add) — the latest handle wins.
+    pub fn set_ingress_dejitter_stats(
+        &self,
+        input_id: &str,
+        stats: Arc<crate::engine::ingress_dejitter::IngressDejitterStats>,
+    ) {
+        self.ingress_dejitter_stats.insert(input_id.to_string(), stats);
     }
 
     /// Replace the header fields (`input_type` + `InputConfigMeta`) that the
@@ -3223,6 +3278,15 @@ impl FlowStatsAccumulator {
                         .read()
                         .ok()
                         .and_then(|g| g.clone()),
+                    ingress_dejitter_shed: self
+                        .ingress_dejitter_stats
+                        .get(active_key)
+                        .map(|h| h.shed.load(Ordering::Relaxed))
+                        .unwrap_or(0),
+                    ingress_buffer_depth: self
+                        .ingress_dejitter_stats
+                        .get(active_key)
+                        .map(|h| h.depth.load(Ordering::Relaxed) as u64),
                     transcode_stats: in_transcode,
                     audio_decode_stats: in_audio_decode,
                     audio_encode_stats: in_audio_encode,

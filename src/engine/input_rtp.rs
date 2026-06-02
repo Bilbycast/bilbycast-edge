@@ -164,16 +164,18 @@ pub fn spawn_rtp_input(
             );
             let _ = p;
         }
-        // Per-input ingress smoothing publisher — covers both single-
+        // Per-input ingress publisher (fixed-delay + de-jitter modes) — covers both single-
         // leg and 2022-7 dual-leg paths. When the operator sets
-        // `ingress_smoothing_ms` on a -7 RTP input, both legs go
+        // `ingress_delay_ms` on a -7 RTP input, both legs go
         // through the same publisher so the hitless merger sees the
         // legs with reduced inter-arrival jitter.
-        let publisher = crate::engine::ingress_smoothing::IngressPublisher::new(
-            config.ingress_smoothing_ms,
+        let publisher = crate::engine::ingress_publisher::IngressPublisher::new(
+            config.ingress_delay_ms,
+            config.ingress_dejitter_ms,
             broadcast_tx,
             &input_id,
             cancel.clone(),
+            stats.clone(),
         );
         let result = if config.redundancy.is_some() {
             rtp_input_redundant_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
@@ -251,7 +253,7 @@ impl TokenBucket {
 /// The loop exits when the cancellation token fires.
 async fn rtp_input_loop(
     config: RtpInputConfig,
-    publisher: crate::engine::ingress_smoothing::IngressPublisher,
+    publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
@@ -460,7 +462,7 @@ async fn rtp_input_loop(
 /// sequence number present in every packet header.
 async fn rtp_input_redundant_loop(
     config: RtpInputConfig,
-    publisher: crate::engine::ingress_smoothing::IngressPublisher,
+    publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
@@ -770,7 +772,7 @@ fn refresh_buffered_hitless_snapshot(
 fn publish_emitted_redundant_packet(
     chosen_leg: ActiveLeg,
     mut packet: RtpPacket,
-    publisher: &crate::engine::ingress_smoothing::IngressPublisher,
+    publisher: &crate::engine::ingress_publisher::IngressPublisher,
     stats: &FlowStatsAccumulator,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
@@ -809,7 +811,7 @@ fn process_redundant_rtp_packet(
     rate_limiter: &mut Option<TokenBucket>,
     fec_decoder: &mut Option<FecDecoder>,
     merger: &mut RedundantMerger,
-    publisher: &crate::engine::ingress_smoothing::IngressPublisher,
+    publisher: &crate::engine::ingress_publisher::IngressPublisher,
     stats: &FlowStatsAccumulator,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,

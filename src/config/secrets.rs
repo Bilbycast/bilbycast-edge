@@ -609,7 +609,7 @@ mod tests {
             pid_map: None,
             pid_overrides: None,
             interface_binding: None,
-            ingress_smoothing_ms: None,
+            ingress_delay_ms: None,
             passthrough_clock: None,
         }
     }
@@ -815,7 +815,8 @@ mod tests {
                                 pid_map: None,
                                 pid_overrides: None,
                                 interface_binding: None,
-                                ingress_smoothing_ms: None,
+                                ingress_delay_ms: None,
+                                ingress_dejitter_ms: None,
                                 passthrough_clock: None,
                 }),
             }],

@@ -178,14 +178,23 @@ pub mod transcode_chain;
 /// either as raw synchronous OS-thread code.
 pub mod dedicated_runtime;
 
-/// Per-input ingress smoothing buffer — opt-in, off by default.
-/// Holds packets in a FIFO and releases at `recv_time_us +
-/// smoothing_ms` so all downstream consumers (content analysis,
-/// thumbnails, replay, PID bus, PCR PLL, outputs) see a
-/// jitter-smoothed stream regardless of network arrival variance.
-/// Most valuable on raw UDP/RTP inputs that lack protocol-level
-/// jitter handling.
-pub mod ingress_smoothing;
+/// Per-input ingress publisher — the buffering front-end between an input
+/// task and the flow broadcast channel. Picks one of three modes:
+/// `Direct` (passthrough), `Delayed` (per-input `ingress_delay_ms` — a
+/// FIXED delay line for alignment / cross-device sync; does NOT remove
+/// jitter), or `Dejitter` (delegates to [`ingress_dejitter`]). Opt-in, off
+/// by default. See the module docs for the delay-vs-de-jitter distinction.
+pub mod ingress_publisher;
+
+/// Per-input de-jitter buffer — opt-in, off by default. The ingress
+/// counterpart to the egress release-rate servo in [`wire_emit`]:
+/// recovers the source rate from inter-PCR observations and releases
+/// packets paced at that rate (leaky bucket + fill servo + residence-cap
+/// shed), so downstream consumers see a smooth cadence regardless of
+/// network PDV. Unlike the `ingress_delay_ms` fixed delay (a pure delay
+/// line) it actually removes jitter. Wired on raw UDP/RTP only; cooperates
+/// with the SMPTE 2022-7 merger by sitting after it.
+pub mod ingress_dejitter;
 
 #[cfg(feature = "media-codecs")]
 pub mod video_encode_util;

@@ -179,6 +179,7 @@ async fn rtp_output_loop(
         dest,
         AnchorSource::Pcr,
         WirePacingClass::Lossless,
+        config.egress_buffer_ms,
         stats.clone(),
         cancel.clone(),
     );
@@ -776,6 +777,7 @@ async fn rtp_output_redundant_loop(
         dest1,
         AnchorSource::Pcr,
         WirePacingClass::Lossless,
+        config.egress_buffer_ms,
         stats.clone(),
         cancel.clone(),
     );
@@ -785,6 +787,7 @@ async fn rtp_output_redundant_loop(
         dest2,
         AnchorSource::Pcr,
         WirePacingClass::Lossless,
+        config.egress_buffer_ms,
         leg2_stats,
         cancel.clone(),
     );

@@ -1966,18 +1966,39 @@ pub struct RtpInputConfig {
     /// when both are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
-    /// Ingress smoothing buffer (0..=1000 ms). When set, packets are
-    /// held in a per-input FIFO and released to the broadcast channel
-    /// at `recv_time_us + ingress_smoothing_ms` so downstream consumers
-    /// (content analysis, thumbnail, PID bus, replay, outputs) see a
-    /// jitter-smoothed stream regardless of network arrival variance.
-    /// Adds end-to-end latency equal to the configured value. `None` or
-    /// `0` disables. Useful primarily for raw UDP / raw RTP inputs that
-    /// lack protocol-level jitter handling; on RTMP / RTSP it's still
-    /// effective but the transports usually deliver smoothly anyway.
-    /// See [`docs/configuration-guide.md`](configuration-guide.md).
+    /// Fixed ingress **delay** (0..=1000 ms). When set, packets are held in
+    /// a per-input FIFO and released to the broadcast channel at exactly
+    /// `recv_time_us + ingress_delay_ms`, so every downstream consumer
+    /// (content analysis, thumbnail, PID bus, replay, outputs) sees the same
+    /// constant-shifted timeline. This is a **pure delay line** — it shifts
+    /// the timeline by a fixed amount but reproduces the inter-arrival
+    /// spacing exactly, so it does **NOT** remove network jitter. Its purpose
+    /// is deterministic alignment / cross-device sync (the input-side
+    /// counterpart to the per-output `OutputDelay::Fixed`), applied before
+    /// fan-out so all consumers share it. **To absorb network packet-delay
+    /// variation, use [`Self::ingress_dejitter_ms`] instead** (a rate-paced
+    /// servo that actually de-jitters; de-jitter supersedes this delay if
+    /// both are set). `None` or `0` disables. Renamed from the former
+    /// `ingress_smoothing_ms` (accepted as a serde alias for
+    /// back-compat). See [`docs/configuration-guide.md`](configuration-guide.md).
+    #[serde(default, alias = "ingress_smoothing_ms", skip_serializing_if = "Option::is_none")]
+    pub ingress_delay_ms: Option<u16>,
+    /// Ingress **de-jitter** buffer setpoint, in ms of content. The
+    /// ingress counterpart to the per-output `egress_buffer_ms` servo:
+    /// when set, packets are buffered and released to the broadcast
+    /// channel paced at the **recovered source rate** (a leaky bucket
+    /// trimmed ±5 % by the buffer-fill error, with a hard residence-cap
+    /// shed), so every downstream consumer sees a smooth cadence
+    /// regardless of network packet-delay-variation. Unlike
+    /// `ingress_delay_ms` (a pure delay line that *preserves* jitter)
+    /// this actually removes it — it's the real broadcast-grade input
+    /// de-jitter. `None` → env (`BILBYCAST_INGRESS_BUFFER_MS`) / 60 ms
+    /// default; bounded 20–2000 ms. De-jitter supersedes smoothing if both
+    /// are set. On a SMPTE 2022-7 dual-leg RTP input it runs *after* the
+    /// hitless merger (re-pacing the merger's bursty seq-ordered drain).
+    /// See [`crate::engine::ingress_dejitter`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ingress_smoothing_ms: Option<u16>,
+    pub ingress_dejitter_ms: Option<u32>,
     /// Opt OUT of muxer-mode PCR + PES PTS regeneration. Default
     /// `false` (muxer mode ON) — bilbycast-edge regenerates PCR and
     /// PES PTS/DTS values from the per-flow master clock per the
@@ -2053,9 +2074,14 @@ pub struct UdpInputConfig {
     /// Pin this input to a physical NIC. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
-    /// Ingress smoothing buffer (0..=1000 ms). See [`RtpInputConfig::ingress_smoothing_ms`].
+    /// Fixed ingress delay (0..=1000 ms) — a pure delay line, NOT a jitter
+    /// buffer (use `ingress_dejitter_ms` to de-jitter). See [`RtpInputConfig::ingress_delay_ms`].
+    #[serde(default, alias = "ingress_smoothing_ms", skip_serializing_if = "Option::is_none")]
+    pub ingress_delay_ms: Option<u16>,
+    /// Ingress de-jitter buffer setpoint (20–2000 ms of content). See
+    /// [`RtpInputConfig::ingress_dejitter_ms`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ingress_smoothing_ms: Option<u16>,
+    pub ingress_dejitter_ms: Option<u32>,
     /// Muxer-mode PCR + PES PTS regeneration opt-out. See
     /// [`RtpInputConfig::passthrough_clock`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2248,12 +2274,13 @@ pub struct SrtInputConfig {
     /// See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
-    /// Ingress smoothing buffer (0..=1000 ms). Layered on top of SRT's
-    /// own `latency` jitter buffer — usually redundant; logs a warning
+    /// Fixed ingress delay (0..=1000 ms) — a pure delay line for alignment,
+    /// NOT a jitter buffer. Layered on top of SRT's own `latency` jitter
+    /// buffer it is usually pointless (SRT already re-times); logs a warning
     /// at startup when both are set. See
-    /// [`RtpInputConfig::ingress_smoothing_ms`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ingress_smoothing_ms: Option<u16>,
+    /// [`RtpInputConfig::ingress_delay_ms`].
+    #[serde(default, alias = "ingress_smoothing_ms", skip_serializing_if = "Option::is_none")]
+    pub ingress_delay_ms: Option<u16>,
     /// Muxer-mode PCR + PES PTS regeneration opt-out. See
     /// [`RtpInputConfig::passthrough_clock`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2337,10 +2364,11 @@ pub struct RtmpInputConfig {
         with = "crate::config::pid_overrides_serde"
     )]
     pub pid_overrides: Option<TsPidOverridesMap>,
-    /// Ingress smoothing buffer (0..=1000 ms). See
-    /// [`RtpInputConfig::ingress_smoothing_ms`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ingress_smoothing_ms: Option<u16>,
+    /// Fixed ingress delay (0..=1000 ms) — a pure delay line, NOT a jitter
+    /// buffer (use `ingress_dejitter_ms` to de-jitter). See
+    /// [`RtpInputConfig::ingress_delay_ms`].
+    #[serde(default, alias = "ingress_smoothing_ms", skip_serializing_if = "Option::is_none")]
+    pub ingress_delay_ms: Option<u16>,
     /// Muxer-mode PCR + PES PTS regeneration opt-out. See
     /// [`RtpInputConfig::passthrough_clock`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2432,10 +2460,11 @@ pub struct RtspInputConfig {
         with = "crate::config::pid_overrides_serde"
     )]
     pub pid_overrides: Option<TsPidOverridesMap>,
-    /// Ingress smoothing buffer (0..=1000 ms). See
-    /// [`RtpInputConfig::ingress_smoothing_ms`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ingress_smoothing_ms: Option<u16>,
+    /// Fixed ingress delay (0..=1000 ms) — a pure delay line, NOT a jitter
+    /// buffer (use `ingress_dejitter_ms` to de-jitter). See
+    /// [`RtpInputConfig::ingress_delay_ms`].
+    #[serde(default, alias = "ingress_smoothing_ms", skip_serializing_if = "Option::is_none")]
+    pub ingress_delay_ms: Option<u16>,
     /// Muxer-mode PCR + PES PTS regeneration opt-out. See
     /// [`RtpInputConfig::passthrough_clock`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2941,6 +2970,12 @@ pub struct RtpOutputConfig {
     /// Pin this output to a physical NIC. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
+    /// Egress de-jitter buffer setpoint (ms of content). See
+    /// [`UdpOutputConfig::egress_buffer_ms`] for full semantics. Tunes the
+    /// wire-emit release-rate servo + residence cap for this compressed RTP
+    /// output. `None` → env / 60 ms default; bounded 20–2000 ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_buffer_ms: Option<u32>,
 }
 
 /// Configurable output delay for stream synchronization.
@@ -3087,6 +3122,17 @@ pub struct UdpOutputConfig {
     /// Pin this UDP output to a physical NIC. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
+    /// Egress de-jitter buffer setpoint, in milliseconds of content. Tunes
+    /// the wire-emit release-rate servo for this compressed output: the servo
+    /// holds the internal queue centred on this fill, absorbing a source-rate-
+    /// vs-wallclock offset (or burst) as a ±5 % rate trim instead of letting
+    /// it integrate into latency, and a hard residence cap (≈4× this, min
+    /// 250 ms) sheds the backlog if a burst exceeds the servo's authority.
+    /// `None` → env (`BILBYCAST_EGRESS_BUFFER_MS`) / 60 ms default. Bounded
+    /// 20–2000 ms. Has no effect on protocol-paced outputs (the wire emitter
+    /// only runs on UDP/RTP). See `docs/egress-dejitter-design.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_buffer_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6026,7 +6072,8 @@ mod tests {
                                 pid_map: None,
                                 pid_overrides: None,
                                 interface_binding: None,
-                                ingress_smoothing_ms: None,
+                                ingress_delay_ms: None,
+                                ingress_dejitter_ms: None,
                                 passthrough_clock: None,
                 }),
             }],
@@ -6050,6 +6097,7 @@ mod tests {
                         cbr_pad_to_kbps: None,
                         pid_overrides: None,
                         interface_binding: None,
+                egress_buffer_ms: None,
             })],
             flows: vec![FlowConfig {
                 id: "test-flow".to_string(),
@@ -6100,7 +6148,8 @@ mod tests {
                                 pid_map: None,
                                 pid_overrides: None,
                                 interface_binding: None,
-                                ingress_smoothing_ms: None,
+                                ingress_delay_ms: None,
+                                ingress_dejitter_ms: None,
                                 passthrough_clock: None,
                 }),
             }],
@@ -6124,6 +6173,7 @@ mod tests {
                         cbr_pad_to_kbps: None,
                         pid_overrides: None,
                         interface_binding: None,
+                egress_buffer_ms: None,
             })],
             flows: vec![FlowConfig {
                 id: "flow-1".to_string(),

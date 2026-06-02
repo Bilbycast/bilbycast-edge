@@ -93,16 +93,18 @@ pub fn spawn_udp_input(
                 passthrough_clock,
             );
         }
-        // Per-input ingress smoothing publisher. When
-        // `ingress_smoothing_ms` is unset / 0, the publisher is a
+        // Per-input ingress publisher (fixed-delay + de-jitter modes). When
+        // `ingress_delay_ms` is unset / 0, the publisher is a
         // zero-overhead pass-through to broadcast_tx. Otherwise it
         // spawns a drainer task that releases packets at
-        // recv_time_us + smoothing_ms.
-        let publisher = crate::engine::ingress_smoothing::IngressPublisher::new(
-            config.ingress_smoothing_ms,
+        // recv_time_us + delay_ms (fixed delay; NOT a jitter buffer).
+        let publisher = crate::engine::ingress_publisher::IngressPublisher::new(
+            config.ingress_delay_ms,
+            config.ingress_dejitter_ms,
             broadcast_tx,
             &input_id,
             cancel.clone(),
+            stats.clone(),
         );
         if let Err(e) = udp_input_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await {
             tracing::error!("UDP input task exited with error: {e}");
@@ -113,7 +115,7 @@ pub fn spawn_udp_input(
 
 async fn udp_input_loop(
     config: UdpInputConfig,
-    publisher: crate::engine::ingress_smoothing::IngressPublisher,
+    publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
     events: &EventSender,
