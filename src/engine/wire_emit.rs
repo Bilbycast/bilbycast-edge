@@ -307,10 +307,15 @@ pub enum AnchorSource {
 /// RTP/UDP (no ARQ). So compressed outputs stay LOSSLESS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WirePacingClass {
-    /// Compressed MPEG-TS (UDP / RTP / SMPTE 302M). Lossless delivery is
-    /// mandatory: never SO_TXTIME, never the etf hard-drop class. Paced
-    /// in userspace (clock_nanosleep) and pinned to a non-etf fq_codel
-    /// class. The receiver re-times via PCR + jitter buffer.
+    /// Compressed MPEG-TS (UDP / RTP / SMPTE 302M). Paced onto the wire by the
+    /// kernel etf qdisc via SO_TXTIME when the operator enabled it
+    /// (`BILBYCAST_ENABLE_TXTIME=1`) and an etf qdisc is present — the late-drop
+    /// that compressed feeds suffer on etf is prevented by the
+    /// `ETF_LATE_FLOOR_NS` (15 ms) launch floor (so a late packet emits ~15 ms
+    /// out instead of being dropped). A Lossless output carrying DSCP is pinned
+    /// `SO_PRIORITY=0` so it lands on the etf TC0 class (the DSCP wire byte is
+    /// unaffected). Falls back to userspace `clock_nanosleep` when no etf qdisc
+    /// is present. The receiver still re-times via PCR + jitter buffer.
     Lossless,
     /// ST 2110 essence (-20/-23 video, -30/-31 audio, -40 ANC). No
     /// receiver re-timing buffer, so wire precision matters: eligible for
@@ -1028,9 +1033,12 @@ impl TargetState {
     /// byte/rate, not by PCR delta. The PCR field in the bytes is never
     /// rewritten — the receiver re-clocks from it exactly as before.
     ///
-    /// Runs ONLY under the ClockNanosleep tier (Lossless never takes the
-    /// SO_TXTIME / etf path), so a backward target on a drained buffer is
-    /// harmless (no etf reorder) and the outer monotonic guard is moot.
+    /// OPT-IN only (egress_buffer_ms set). NOTE: a Lossless output CAN take the
+    /// SO_TXTIME / etf path now, and the servo + SO_TXTIME can co-run — so this
+    /// path applies its OWN `MAX_FUTURE_LOOKAHEAD_NS` cap on the computed target
+    /// (mirroring `derive_target`) to bound the launch time handed to the etf
+    /// qdisc; without it a source overrun would walk the kernel launch time
+    /// arbitrarily far into the future.
     fn derive_target_servo(
         &mut self,
         now_ns: u64,
@@ -1146,7 +1154,14 @@ impl TargetState {
         let target = self
             .last_returned_ns
             .saturating_add(interval_ns)
-            .max(now_ns); // drained buffer (target in the past) → emit ASAP
+            .max(now_ns) // drained buffer (target in the past) → emit ASAP
+            // Bound the lookahead like `derive_target` does: the servo can
+            // co-run with SO_TXTIME, so an unbounded target would walk the etf
+            // qdisc launch time arbitrarily far into the future on a source
+            // overrun. The residence-cap shed is keyed to arrival time and
+            // would NOT catch a future-targeted datagram — this is the cap that
+            // does. Caps servo latency to the same 200 ms as the legacy path.
+            .min(now_ns.saturating_add(MAX_FUTURE_LOOKAHEAD_NS));
         self.last_returned_ns = target;
         target
     }
@@ -2337,6 +2352,24 @@ mod tests {
         assert_eq!(s.observed_rate_bps, 6_000_000, "rate preserved across seam");
         // Opt-in path flips the flag.
         assert!(DejitterConfig::servo_with(Some(120)).seed_cushion);
+    }
+
+    #[test]
+    fn servo_target_is_capped_at_max_future_lookahead() {
+        // The servo can co-run with SO_TXTIME (Lossless is etf-eligible now),
+        // so its target must be bounded like derive_target — else a source
+        // overrun walks the kernel launch time arbitrarily far ahead. Cursor
+        // parked 10 s in the future → next target must clamp to now+lookahead.
+        let cfg = DejitterConfig::servo_with(Some(60));
+        let now = 1_000_000_000u64;
+        let mut s = warmed_servo_state(6_000_000, now + 10_000_000_000);
+        let t = s.derive_target_servo(now, None, 1316, 34, &cfg);
+        assert_eq!(
+            t,
+            now + MAX_FUTURE_LOOKAHEAD_NS,
+            "servo target must clamp to now + MAX_FUTURE_LOOKAHEAD_NS"
+        );
+        assert_eq!(s.last_returned_ns, t, "cursor stored at the capped value");
     }
 
     #[test]
