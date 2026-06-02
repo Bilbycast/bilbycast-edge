@@ -1065,13 +1065,28 @@ impl TsAudioReplacer {
                 let candidate = anchor_target(self.av_sync_pacer.as_ref(), pts);
                 let forward_delta =
                     (candidate as i64).wrapping_sub(current_effective_out_pts_90k as i64);
-                if forward_delta < 0 {
+                // Suppress ONLY a BACKWARD source jump (`delta < 0`): the
+                // ffmpeg `-stream_loop -c copy` muxer resets audio PTS to a
+                // smaller value each loop, and re-anchoring there would rewind
+                // output PTS by seconds. A FORWARD source jump (`delta > 0` —
+                // media_player loop splice / SCTE-35) MUST re-anchor even when
+                // the re-encoder has run output slightly ahead of the new
+                // source PTS (`forward_delta < 0`): that "ahead" is the
+                // silence-pad's per-loop frame-quantization overshoot, and
+                // gating the suppress on `forward_delta` (the pre-2026-06-02
+                // behaviour) let it accumulate into unbounded A/V drift
+                // (~+96 ms/loop measured on a looped AC-3 re-encode; audio
+                // crept behind video without bound). Re-anchoring realigns
+                // output audio PTS to the source timeline exactly as
+                // passthrough does, at the cost of a one-frame backward output
+                // step per loop — bounded, vs. the unbounded drift it cures.
+                if delta < 0 {
                     tracing::info!(
                         candidate,
                         current_effective_out_pts_90k,
                         backward_delta_90k = forward_delta,
                         delta_90k = delta,
-                        "ts_audio_replace: source PTS discontinuity would push output backward; \
+                        "ts_audio_replace: BACKWARD source PTS reset; \
                          suppressing re-anchor to preserve output PTS monotonicity"
                     );
                     // Update expected pointer so subsequent same-
@@ -1086,6 +1101,12 @@ impl TsAudioReplacer {
                     );
                     self.out_pts_90k = candidate;
                     self.samples_since_anchor = 0;
+                    // Drop any silence-pad pending for this seam. The
+                    // re-anchor already realigns output PTS to the source
+                    // timeline; also draining the per-loop gap as silence
+                    // frames would double-count it and re-introduce the
+                    // overshoot this re-anchor exists to cure.
+                    self.pending_silence_27mhz = 0;
                     // Re-anchor the wallclock catch-up too: drop the
                     // accumulated drift from before the discontinuity
                     // so the next lag measurement starts from this
@@ -3184,6 +3205,62 @@ mod tests {
         assert_eq!(
             r.pending_silence_27mhz, 0,
             "> 500ms jump must use the catastrophic re-anchor branch, not silence-pad"
+        );
+    }
+
+    /// **Loop-drift fix (2026-06-02).** A FORWARD source-PTS discontinuity
+    /// (> 500 ms — media_player loop splice) must RE-ANCHOR even when the
+    /// re-encoder has run effective output PTS slightly AHEAD of the new
+    /// source PTS (the per-loop silence-pad frame-quantization overshoot).
+    /// Gating the suppress on `forward_delta < 0` (the pre-fix behaviour) let
+    /// that overshoot accumulate as unbounded A/V drift on looped AC-3/MP2/AAC
+    /// re-encodes; the gate is now the SOURCE `delta` sign.
+    #[test]
+    fn forward_discontinuity_reanchors_even_when_output_ran_ahead() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F;
+        r.resolved_sample_rate = 48_000;
+        r.out_pts_anchored = true;
+        r.out_pts_90k = 1_000_000;
+        // effective = 1_000_000 + 36_640 * 90000/48000 = 1_068_700.
+        r.samples_since_anchor = 36_640;
+        r.expected_next_src_pts_90k = Some(1_000_000);
+        // Forward jump +60 000 ticks (> 500 ms): candidate = 1_060_000, which
+        // is BEHIND current effective (1_068_700) so forward_delta < 0. The
+        // pre-fix guard suppressed here; the fix re-anchors on the positive
+        // source delta.
+        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 1_060_000), &mut Vec::new());
+        assert_eq!(
+            r.out_pts_90k, 1_060_000,
+            "forward source discontinuity must re-anchor out_pts_90k to the source PTS \
+             even when effective output ran ahead (else per-loop overshoot drifts unbounded)"
+        );
+        assert_eq!(
+            r.samples_since_anchor, 0,
+            "re-anchor must reset samples_since_anchor"
+        );
+    }
+
+    /// A BACKWARD source-PTS reset (ffmpeg `-stream_loop -c copy` wrap, which
+    /// resets audio PTS to a small value every loop) must still be SUPPRESSED:
+    /// re-anchoring would rewind output PTS by seconds and make receivers drop
+    /// frames. Only the FORWARD direction was changed by the loop-drift fix.
+    #[test]
+    fn backward_discontinuity_still_suppressed() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        r.audio_pid = Some(0x0101);
+        r.source_stream_type = 0x0F;
+        r.resolved_sample_rate = 48_000;
+        r.out_pts_anchored = true;
+        r.out_pts_90k = 2_000_000;
+        r.samples_since_anchor = 0;
+        r.expected_next_src_pts_90k = Some(1_060_000);
+        // Backward jump: source PTS resets to 1_000_000 (delta = -60 000).
+        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 1_000_000), &mut Vec::new());
+        assert_eq!(
+            r.out_pts_90k, 2_000_000,
+            "backward source reset must NOT re-anchor (suppress to keep output PTS monotonic)"
         );
     }
 
