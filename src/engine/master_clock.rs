@@ -755,7 +755,23 @@ impl MasterClock for PcrPllWithFallback {
             }
             self.wallclock.now_27mhz()
         } else {
-            self.pll_master.now_27mhz()
+            // Lock-then-promote (tier-1): never drive output from an UNLOCKED
+            // PLL. While acquiring, the PLL rails its rate correction (measured
+            // +500 ppm / 24 ms jitter on a jittery/looping contribution source)
+            // — emitting output PCR off that for the whole lock-acquire window
+            // (~30 s on every start AND every input switch) is not broadcast-
+            // grade and visibly stutters a switcher's cuts. Hold phase-
+            // continuous wallclock until the PLL achieves lock, then promote to
+            // it (the SAME wallclock→PLL transition the fallback self-heal above
+            // already performs, so no new jump risk). On a source discontinuity
+            // the PLL unlocks → we auto-demote to wallclock until it re-locks.
+            // A clean/PTP-disciplined source locks within a second or two and
+            // then runs fully transparent (genlocked, zero slip).
+            if self.pll_master.is_locked() {
+                self.pll_master.now_27mhz()
+            } else {
+                self.wallclock.now_27mhz()
+            }
         }
     }
 

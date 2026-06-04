@@ -5913,25 +5913,79 @@ fn build_master_clock(
         MasterClockHandle, MasterClockKind, SourcePcrPllMaster, WallclockMaster,
     };
 
-    // `auto` is PER-INPUT and is the DEFAULT — a flow with no explicit
-    // `master_clock` (None) behaves identically to `auto`. ST 2110 / MXL
-    // essence is PTP-domain, so it resolves straight to PTP (no PLL-first);
-    // contribution + assembly get the PLL → PTP → Wallclock cascade.
-    // `select_master_kind_for_input` returns `Ptp` only for the PTP-native
-    // (ST 2110 / MXL) inputs, so it's the authoritative "is this input
-    // PTP-domain?" check.
+    // `auto` is the DEFAULT (a flow with no explicit `master_clock` behaves
+    // identically). It resolves by FLOW ROLE + active input — NOT a blanket
+    // PLL cascade (the old behaviour, which railed an unlocked PLL onto the
+    // output for ~30 s on every start/cut). Industry-standard tier-1 mapping:
+    //
+    //   • ST 2110 / MXL essence  → PTP (PTP-disciplined transport).
+    //   • PID-bus assembled flow → PLL cascade — the assembler synthesises
+    //                              output PCR from the master, so it needs the
+    //                              recovered source clock to stay coherent.
+    //   • SINGLE-source live      → PLL cascade (lock-then-promote): genlock to
+    //     contribution              the source so passthrough/transcode is
+    //     (SRT/RTP/UDP/RIST/        bit-rate transparent (zero clock slip). The
+    //      RTMP/RTSP)               wrapper holds wallclock until the PLL locks,
+    //                              so a jittery/looping source never rails the
+    //                              output — it just stays on wallclock.
+    //   • SWITCHER (multi-input) → Wallclock. Each source has its own 27 MHz
+    //                              clock; genlocking to the active one would
+    //                              step the output clock on every cut and
+    //                              re-acquire lock for seconds. A stable
+    //                              wallclock keeps cuts seamless (sources are
+    //                              re-clocked to it).
+    //   • File / replay / WebRTC → Wallclock (no live source clock to recover;
+    //     / test-pattern / etc.     the file plays at wallclock rate).
+    //
+    // Operators override any of this with an explicit `master_clock.kind`
+    // (e.g. `contribution` to force source-PCR genlock on a clean feed).
     let is_auto = matches!(
         cfg.master_clock.as_ref().map(|m| m.kind),
         Some(MasterClockKindConfig::Auto) | None
     );
-    if is_auto
-        && !matches!(
-            crate::engine::master_clock::select_master_kind_for_input(active_input, cfg),
-            MasterClockKind::Ptp
-        )
-    {
-        // Contribution / assembly → cascade.
-        return build_auto_cascade(cfg, active_input_rx, event_sender, cancel_token);
+    if is_auto {
+        use crate::config::models::InputConfig;
+        let sel = crate::engine::master_clock::select_master_kind_for_input(active_input, cfg);
+        if !matches!(sel, MasterClockKind::Ptp) {
+            let is_switcher = cfg.input_ids.len() > 1;
+            let single_live_contribution = !is_switcher
+                && matches!(
+                    active_input,
+                    Some(
+                        InputConfig::Srt(_)
+                            | InputConfig::Rtp(_)
+                            | InputConfig::Udp(_)
+                            | InputConfig::Rist(_)
+                            | InputConfig::Rtmp(_)
+                            | InputConfig::Rtsp(_)
+                    )
+                );
+            if cfg.assembly.is_some() || single_live_contribution {
+                return build_auto_cascade(cfg, active_input_rx, event_sender, cancel_token);
+            }
+            // Switcher / file / replay / WebRTC / test-pattern / bonded /
+            // rtp_audio → stable wallclock.
+            let handle = MasterClockHandle::new(
+                Arc::new(WallclockMaster::new()),
+                MasterClockKind::Wallclock,
+            )
+            .with_configured_kind("auto");
+            if let Some(mc_cfg) = cfg.master_clock.as_ref() {
+                handle.set_lipsync_offset_90k(mc_cfg.lipsync_offset_90k);
+            }
+            tracing::warn!(
+                flow_id = %cfg.id,
+                inputs = cfg.input_ids.len(),
+                "master clock: auto → Wallclock ({})",
+                if is_switcher {
+                    "multi-input switcher — stable clock across cuts"
+                } else {
+                    "no live source clock to recover"
+                },
+            );
+            return (handle, None, None);
+        }
+        // sel == Ptp → fall through; the kind match below resolves auto → Ptp.
     }
 
     let kind = match cfg.master_clock.as_ref().map(|m| m.kind) {
