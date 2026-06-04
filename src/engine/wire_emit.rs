@@ -370,11 +370,12 @@ impl DejitterConfig {
     /// 60 ms buffer with ±5 % authority, backed by a 250 ms residence cap
     /// (drain back to ~32 datagrams). Inside the receiver T-STD envelope
     /// (≤ ~0.7 s) and SRT/RIST receive-latency headroom.
+    #[cfg(test)] // test-only convenience wrapper; production paths call servo_with
     pub fn servo() -> Self {
         Self::servo_with(None)
     }
 
-    /// As [`Self::servo`] but with an operator-supplied setpoint. Precedence
+    /// As `servo` (the no-arg wrapper) but with an operator-supplied setpoint. Precedence
     /// for the buffer setpoint: explicit per-output `egress_buffer_ms` config
     /// > `BILBYCAST_EGRESS_BUFFER_MS` env > 60 ms default (all clamped to
     /// [20, 2000] ms). The residence cap defaults to `max(4×setpoint, 250)`
