@@ -629,17 +629,32 @@ pub fn spawn_wire_emitter(
     // multiple wire-emit threads on the same edge spread across the
     // dedicated cores instead of stacking onto one.
     let cpu_index = next_wire_emit_cpu_index();
-    // Egress de-jitter is OFF by default. De-jitter belongs at INGRESS (SRT
-    // TSBPD / RIST reorder / ingress_dejitter_ms), and egress should only PACE
-    // (etf / clock_nanosleep). The release-rate servo + residence-cap shed are
-    // architecturally misplaced at egress and shed ~50 % of a normal compressed
-    // feed — so they are retained ONLY as an explicit per-output opt-in
-    // (`egress_buffer_ms`, or the BILBYCAST_EGRESS_BUFFER_MS env) for hosts
-    // with no etf qdisc that still want a bounded-latency egress buffer. Unset
-    // (the default) = pure pacing, no shed, no added latency. ST 2110
-    // (EtfEligible) never takes the servo regardless.
-    let want_egress_servo = matches!(pacing, WirePacingClass::Lossless)
-        && (egress_buffer_ms.is_some() || std::env::var("BILBYCAST_EGRESS_BUFFER_MS").is_ok());
+    // Compressed (Lossless) egress runs a CLOSED-LOOP bounded pacer by default.
+    //
+    // Open-loop PCR-delta pacing (the prior default) has NO term comparing the
+    // internal wire-queue fill or the wallclock drain rate, so any sub-% source-
+    // rate-vs-CLOCK_TAI offset, `ffmpeg -re` overrun, SRT jitter-buffer dump,
+    // file-loop PCR-handoff drift, or encoder burst integrates into this thread's
+    // input channel with nothing correcting it — a MEASURED output-latency
+    // runaway to 1–2 s+ on BOTH file (media_player) and live (SRT) inputs
+    // (2026-06-04). The receiver's T-STD/VBX buffer then over/underflows →
+    // pixelation + pausing on consumer players (VLC) and lighter STBs.
+    //
+    // The release-rate servo replaces that open-loop integration with a leaky-
+    // bucket release trimmed ±authority by the buffer-fill error, holding
+    // residence near `setpoint_ms` (~60 ms) — a steady source offset is absorbed
+    // as a steady, tiny rate trim with NO accumulation and NO loss. With
+    // `egress_buffer_ms` UNSET (the default) `seed_cushion=false`: cold-start
+    // emits ASAP (no added startup latency) and there is no hold-release gap —
+    // only the gentle rate trim, ~0 at steady state. Setting `egress_buffer_ms`
+    // (or BILBYCAST_EGRESS_BUFFER_MS) additionally seeds a jitter-absorption
+    // cushion for genuinely bursty INGRESS, at the cost of that latency.
+    //
+    // ST 2110 / MXL (`EtfEligible`, `St2110Raster` anchor) keep strict
+    // isochronous raster + SO_TXTIME pacing — that IS their clock — and NEVER
+    // take the servo, by construction (this gate is Lossless-only and the raster
+    // anchor bypasses `derive_target` entirely).
+    let want_egress_servo = matches!(pacing, WirePacingClass::Lossless);
     let dejitter = if want_egress_servo {
         DejitterConfig::servo_with(egress_buffer_ms)
     } else {
@@ -1007,6 +1022,15 @@ impl TargetState {
         depth: usize,
         cfg: &DejitterConfig,
     ) -> u64 {
+        // Compressed (`Lossless`) outputs run the closed-loop release servo: a
+        // smooth UNIFORM-RATE leaky bucket holding buffer residence near
+        // `setpoint_ms`, bounding egress latency. Uniform-rate draining avoids
+        // the batch CLUMPING that a PCR-delta-baseline drain trim induces —
+        // clumping clusters PCR-bearing datagrams into one sendmmsg, spiking
+        // PCR_OJ to tens of ms and breaking consumer receivers (see the
+        // `derive_target_raw` between-PCR interpolation note). ST 2110 /
+        // `disabled` keeps open-loop PCR-delta pacing — the raster anchor owns
+        // its clock and never reaches the servo.
         if cfg.enabled {
             self.derive_target_servo(now_ns, datagram_pcr, datagram_bytes, depth, cfg)
         } else {
