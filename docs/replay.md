@@ -1,9 +1,17 @@
-# Replay Server (Phase 1)
+# Replay Server
 
 The replay server captures a flow's broadcast channel to disk and replays
 named clips back onto a flow's broadcast channel. It is implemented
 purely in Rust, with no new C dependencies, and is enabled by default
 via the `replay` Cargo feature.
+
+Several v2 surfaces have shipped on top of the original Phase 1 recorder
+— the edge advertises `replay`, `replay-v2`, `replay-filmstrip`, and
+`replay_export_mp4` capabilities (pre-buffer recording, filmstrip
+thumbnails, clip tags + `update_clip` trim, and TS→MP4 export). The
+manager UI gates each surface on the matching capability bit, so the
+"Phase 1 / Phase 2" labels below track which release a feature landed
+in rather than what is or isn't implemented.
 
 The configuration schema (storage root, `RecordingConfig`,
 `ReplayInputConfig`) lives in
@@ -25,7 +33,9 @@ operator-action matrix.
   fresh input on a different flow, paced by PCR.
 
 It is **not** a video editing surface. There is no reverse playback,
-slow-motion, multi-track timeline, or render-to-file export.
+slow-motion, or multi-track timeline. (Clip / recording **export** does
+ship — TS download plus the TS→MP4 remuxer, see the Recordings library
+section.)
 
 ## Architecture
 
@@ -100,15 +110,25 @@ unset). Resolution order for the root:
 
 ### `index.bin` entry format
 
-Each entry is exactly 24 bytes, packed `u64 + u32 + u64 + u32`
+Each entry is exactly 24 bytes, packed `u64 + u32 + u32 + u32 + u32`
 (little-endian):
 
 | Bytes | Field | Notes |
 |---|---|---|
 | 0..8 | `pts_90khz` | Recorded PCR-derived PTS at the IDR boundary |
-| 8..12 | `segment_id` | The `NNNNNN` of the file the IDR lives in |
-| 12..20 | `byte_offset` | Offset within the segment file |
-| 20..24 | `flags` | Reserved; currently always `0` |
+| 8..12 | `smpte_tc` | Packed SMPTE timecode at the IDR (`0xFFFFFFFF` if unknown) |
+| 12..16 | `segment_id` | The `NNNNNN` of the file the IDR lives in |
+| 16..20 | `byte_offset` | Offset within the segment file |
+| 20..24 | `flags` | Bit flags (see below) |
+
+`flags` is a bitfield (`src/replay/index.rs::flag`); three bits are
+defined and set by the writer:
+
+| Bit | Constant | Meaning |
+|---|---|---|
+| `1 << 0` | `IS_IDR` | Entry marks an IDR / GOP boundary (set on every entry) |
+| `1 << 1` | `PCR_DISCONTINUITY` | Set on the first IDR after a > 5 min PCR step (stream-source change); the reader skips wallclock-pacing across it |
+| `1 << 2` | `SMPTE_TC_VALID` | `smpte_tc` holds a decoded SMPTE timecode for this IDR |
 
 Entries are append-only; rebuild on corruption is a Phase 2 item — the
 current behaviour emits a `replay_index_corrupt` Warning and continues
@@ -331,13 +351,15 @@ auto-routes to `rename_clip` when only `name` / `description` are
 present, and to `update_clip` when any tag / PTS field is set, so old
 edges keep accepting the legacy shape.
 
-## Current limitations (Phase 1 + 1.5)
+## Current limitations
 
-- **Forward 1.0× playback only.** No reverse, slow-motion, or
-  variable-speed yet — the `paced_replayer` reverse-scrub mode and
-  the audio-on-scrub toggle are Phase 2 follow-ups.
+- **Forward playback only, 0.1×–1.0×.** Variable-speed / slow-motion
+  forward playback has shipped (the `play_clip` / `set_speed` `speed`
+  param rewrites PCR + PES PTS/DTS in `input_replay.rs`, Phase 2.4).
+  **No reverse playback** — the reverse-scrub mode and the
+  audio-on-scrub toggle remain follow-ups.
 - **Seeks snap to the nearest IDR ≤ target.** Frame-accurate
-  scrubbing is a Phase 2 item.
+  scrubbing is still a follow-up.
 - **No index rebuild on corruption.** `replay_index_corrupt` is a
   Warning today; the writer keeps appending. Phase 2 will rebuild
   from segments at open time.
@@ -422,7 +444,7 @@ aligned, so no per-session bookkeeping is needed.
 {
   "type": "export_clip",
   "clip_id": "clp_…",
-  "format": "ts",            // optional; "ts" only in Phase 1
+  "format": "ts",            // optional; "ts" (default) or "mp4"
   "byte_offset": 0,          // optional; default 0
   "chunk_bytes": 1048576     // optional; default 1 MiB, hard cap 3 MiB
 }
@@ -449,8 +471,18 @@ capped at 4 GiB total — over-cap requests fail with
 The exported bytes are **packet-aligned MPEG-TS** — the manager can
 concatenate chunks in order and serve the result as
 `Content-Type: application/mp2t` without resyncing the first byte.
-MP4 packaging is a follow-up; Phase 1 advertises `format: "ts"`
-only and rejects other values with `replay_export_format_unsupported`.
+
+**MP4 export has shipped.** Passing `format: "mp4"` runs the
+`src/replay/export_mp4.rs` TS→fragmented-MP4 remuxer (reuses the CMAF
+fMP4 box writer): video H.264 (`avc1`) / HEVC (`hvc1`), audio AAC
+(`mp4a`) / AC-3 / E-AC-3 / MP2. The remuxer assumes PTS == DTS (DTS
+recovery via PES parsing is a follow-up), builds the file one-shot into
+a 5-minute-TTL in-memory cache, and caps exports at 256 MiB —
+over-cap clips fail with `replay_export_too_large` (download TS
+instead). Unsupported essence (MPEG-2 video, Opus audio) surfaces
+`replay_export_format_unsupported`. The edge advertises the
+`replay_export_mp4` capability so the manager UI lights up the ⬇ MP4
+button alongside ⬇ TS.
 
 ## Cross-references
 

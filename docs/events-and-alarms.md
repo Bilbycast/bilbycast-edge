@@ -78,6 +78,30 @@ Events are queued in an unbounded in-memory channel. When the edge is not connec
 
 **Source**: `src/engine/manager.rs`, `src/manager/client.rs`. Hot-swap engine paths: `FlowRuntime::{add_input, remove_input}` (`src/engine/flow.rs`).
 
+> Note: the R5 `master_clock_input_removed` event above rides the **`flow`**
+> category. The PLL fallback / recovery events below use a separate
+> **`master_clock`** category.
+
+---
+
+### Master Clock (`master_clock`)
+
+PLL lock-state transitions for flows whose master clock runs the source-PCR
+PLL (`master_clock.kind = source_pcr_pll` / `contribution`, or the `auto`
+cascade's PLL rung). Emitted by the per-flow fallback watcher in
+`src/engine/master_clock.rs`.
+
+| Severity | Message | Trigger | Details |
+|----------|---------|---------|---------|
+| warning | PCR PLL did not lock within {n}s on flow '{id}' (reason: {reason}); falling back to wallclock | The PLL failed to lock within the grace window (`pll_lock_timeout_s`, default 30 s). The master clock drops to the wallclock rung; output PCR is bounded but no longer tracks the source. | `{ error_code: "master_clock_pll_fallback", input_id, samples_received, samples_needed: 100, p99_jitter_us, lock_threshold_us: 100, fallback_reason, waited_s }`. `fallback_reason` is `"no_pcr_observed"` (no PCR samples), `"insufficient_samples"` (< 100 samples), or `"jitter_too_high"` (samples seen but p99 jitter above the lock threshold). |
+| info | PCR PLL re-acquired lock on flow '{id}' (input '{id}'); leaving wallclock fallback | The PLL converged again after a prior fallback. The master clock self-heals back to the PLL rung; the grace window is reset. | `{ error_code: "master_clock_pll_recovered", input_id, samples_received, p99_jitter_us }`. |
+
+**Source**: `src/engine/master_clock.rs` (`fire_fallback`, the recovery branch). Telemetry counterpart on `FlowStats.master_clock` (`fallback_active` / `fallback_reason`) — see [`metrics.md`](metrics.md#master-clock-telemetry-flowstatsmaster_clock) and [`clocking.md`](clocking.md#telemetry).
+
+> The egress / ingress de-jitter residence-cap shed surfaces as **stats**
+> (`OutputStats.egress_shed`, `InputStats.ingress_dejitter_shed`), **not** as
+> dedicated events — see [`metrics.md`](metrics.md#wire-pacing-and-egress-de-jitter-telemetry-outputstats).
+
 ---
 
 ### Bandwidth (`bandwidth`)
@@ -548,6 +572,7 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `tunnel` | 9 | Tunnel connection state (now with structured details) |
 | `manager` | 3 | Manager WebSocket connection |
 | `config` | 2 | Configuration changes |
+| `master_clock` | 2 | Source-PCR PLL lock-state transitions (fallback to wallclock, recovery) |
 | `system_resources` | 7 | CPU/RAM threshold monitoring + flow creation gating |
 | `rtp` | 2 | RTP input bind and lifecycle |
 | `udp` | 2 | UDP input bind and lifecycle |
@@ -558,7 +583,7 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `nmos` | — | NMOS IS-04 / IS-05 / IS-08 controller activity (Phase 1) |
 | `nmos_registry` | 4 | IS-04 registration client lifecycle (registered, heartbeat lost, registration failed, registry unreachable) |
 | `scte104` | — | SCTE-104 splice events parsed from ST 2110-40 ANC (Phase 1) |
-| **Total** | **87** | |
+| **Total** | **89** | |
 
 ### Phase 1 ST 2110 categories
 
@@ -581,8 +606,8 @@ mapping:
 | Severity | Count | Description |
 |----------|-------|-------------|
 | critical | 23 | Service-impacting: flow/tunnel failures, auth rejection, both legs lost, bandwidth block, audio/video encoder failures, bind failures (RTP/UDP/RIST), media-player source failed |
-| warning | 22 | Degradation: disconnects, stale connections, upload failures, reconnects, bandwidth exceeded, audio_encode restart, resource gating, tunnel retry |
-| info | 42 | State changes: connections established, flows started, config updated, bandwidth recovery, encoder started, input/output CRUD, bind success (RTP/UDP), media-player started/playlist-exhausted |
+| warning | 23 | Degradation: disconnects, stale connections, upload failures, reconnects, bandwidth exceeded, audio_encode restart, resource gating, tunnel retry, master-clock PLL fallback |
+| info | 43 | State changes: connections established, flows started, config updated, bandwidth recovery, encoder started, input/output CRUD, bind success (RTP/UDP), media-player started/playlist-exhausted, master-clock PLL recovery |
 
 ## Unified bind-failure events (`port_conflict` / `bind_failed`)
 

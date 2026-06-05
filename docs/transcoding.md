@@ -325,8 +325,12 @@ channel count; if unset, the Opus encoder follows the source.
 
 ## `video_encode` — H.264 / HEVC re-encoding
 
-**Status:** Phase 4 MVP. Active on SRT / UDP / RTP outputs in the TS
-pipeline. Everything else is deferred (see below).
+**Status:** Shipped. Active on SRT / UDP / RTP / RIST outputs (TS
+pipeline via `TsVideoReplacer`), RTMP (`output_rtmp::VideoEncoderState`),
+WebRTC (H.264 only, `output_webrtc::WebrtcVideoEncoderState`), CMAF /
+CMAF-LL (segmenter forces GoP alignment), and ST 2110-20 / -23
+(mandatory on those inputs). **HLS is the only remaining output
+without `video_encode`** (deferred — see below).
 
 Decodes the source video ES (H.264 or HEVC) in-process via
 `video-engine::VideoDecoder`, re-encodes via a feature-gated backend,
@@ -339,7 +343,8 @@ leave the PMT untouched.
 
 ```jsonc
 "video_encode": {
-  "codec":       "x264" | "x265" | "h264_nvenc" | "hevc_nvenc" | "h264_qsv" | "hevc_qsv",
+  "codec":       "x264" | "x265" | "h264_nvenc" | "hevc_nvenc" | "h264_qsv" | "hevc_qsv"
+  //             | "h264_vaapi" | "hevc_vaapi" | "h264_auto" | "hevc_auto" | "auto",
   "width":       1920,       // optional — see "Limitations"
   "height":      1080,       // optional — see "Limitations"
   "fps_num":     30,         // recommended — operator-supplied, no auto-detect yet
@@ -435,13 +440,15 @@ contribution shops on AMD-on-Linux land on libx265.
 Default release build has no software video encoders (AGPL-only
 binary). The composite `video-encoders-full` feature bundles every
 video codec backend the edge knows about — encoders (x264 + x265 +
-NVENC + QSV) **and** HW decoders for the local-display output
-(NVDEC + QSV-decode) — and is used by the GitHub Actions release
-workflow to produce the `*-linux-full` variant. See
+NVENC + QSV + VAAPI) **and** HW decoders for the local-display +
+transcode-input paths (NVDEC + QSV-decode + VAAPI-decode) — and is
+used by the GitHub Actions release workflow to produce the
+`*-linux-full` variant. See
 [`docs/installation.md`](installation.md) for the two-channel
 release model. The `*-aarch64-linux-full` artefact intentionally
 drops QSV (encode + decode; Intel iGPU is x86_64-only) and lists
-the remaining features explicitly: x264 + x265 + NVENC + NVDEC.
+the remaining features explicitly: x264 + x265 + NVENC + NVDEC +
+VAAPI encode/decode.
 Runtime error `video encoder disabled: rebuild with …` surfaces
 when a config targets a codec whose feature flag was not enabled at
 build; the display output's `hw_decode: "nvdec" / "qsv"` choice
@@ -464,16 +471,16 @@ bundled `NOTICE.full` for the full scope statement.
 # Linux — default build (no video encoders, matches *-linux release):
 cargo build --release
 
-# Linux x86_64 — full build (bundles x264 + x265 + NVENC + QSV
-# encoders, plus NVDEC + QSV-decode for the display output; matches
-# *-x86_64-linux-full release):
-sudo apt install libx264-dev libx265-dev nv-codec-headers libvpl-dev
+# Linux x86_64 — full build (bundles x264 + x265 + NVENC + QSV + VAAPI
+# encoders, plus NVDEC + QSV-decode + VAAPI-decode for the display +
+# transcode-input paths; matches *-x86_64-linux-full release):
+sudo apt install libx264-dev libx265-dev nv-codec-headers libvpl-dev libva-dev
 cargo build --release --features video-encoders-full
 
 # Linux aarch64 — full build minus QSV encode + decode (Intel iGPU is
 # x86_64-only):
-sudo apt install libx264-dev libx265-dev nv-codec-headers
-cargo build --release --features "video-encoder-x264 video-encoder-x265 video-encoder-nvenc display-nvdec"
+sudo apt install libx264-dev libx265-dev nv-codec-headers libva-dev
+cargo build --release --features "video-encoder-x264 video-encoder-x265 video-encoder-nvenc video-encoder-vaapi video-decoder-nvdec video-decoder-vaapi"
 
 # Linux — individual opt-ins (à la carte):
 cargo build --release --features video-encoder-x264
@@ -762,11 +769,12 @@ options the current binary cannot satisfy.
 | Flag                        | Emitted when                                                   |
 |-----------------------------|----------------------------------------------------------------|
 | `audio-encode`              | Always (the AAC/Opus/MP2/AC-3 encoders are unconditional).     |
-| `video-encode`              | Any of the three `video-encoder-*` features is enabled.        |
+| `video-encode`              | Any `video-encoder-*` feature (x264 / x265 / nvenc / qsv / vaapi) is enabled. |
 | `video-encoder-x264`        | Built with `--features video-encoder-x264`.                    |
 | `video-encoder-x265`        | Built with `--features video-encoder-x265`.                    |
 | `video-encoder-nvenc`       | Built with `--features video-encoder-nvenc`.                   |
 | `video-encoder-qsv`         | Built with `--features video-encoder-qsv` (x86_64 only).       |
+| `video-encoder-vaapi`       | Built with `--features video-encoder-vaapi` (Linux).          |
 
 A follow-up will add an `st2110-video` capability flag so the manager
 UI can offer the ST 2110-20 / -23 pixel-format / partition-mode
@@ -778,7 +786,11 @@ A manager UI that wants to offer `video_encode` should check
 and then enable only the codec options whose backend flag is also
 present. `h264_nvenc` and `hevc_nvenc` both gate on
 `video-encoder-nvenc`; `h264_qsv` and `hevc_qsv` both gate on
-`video-encoder-qsv`.
+`video-encoder-qsv`; `h264_vaapi` and `hevc_vaapi` both gate on
+`video-encoder-vaapi`. The `h264_auto` / `hevc_auto` / `auto` strings
+are accepted whenever at least one encoder backend is compiled in and
+resolve to a concrete backend per-host at flow start (see
+[`docs/codec-matrix.md`](codec-matrix.md)).
 
 See `bilbycast-edge/src/manager/client.rs::edge_capabilities` for the
 source of truth.

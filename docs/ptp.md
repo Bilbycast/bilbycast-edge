@@ -46,9 +46,8 @@ curl -X PUT https://edge:8443/api/v1/ptp \
 
 ### Hand-editing the config file
 
-`/var/lib/bilbycast/ptp.conf` is a plain KEY=VALUE file. Edit it with
-your favourite editor and the helper picks the change up within 1
-second:
+The PTP config is a plain KEY=VALUE file. Edit it with your favourite
+editor and the helper picks the change up within 1 second:
 
 ```ini
 mode         = auto
@@ -60,6 +59,25 @@ scan_timeout = 5
 
 Unknown keys are tolerated — safe for forward-compat with future
 fields. Comments (`#`) and blank lines are skipped.
+
+#### Where the file lives (resolution chain)
+
+`util::ptp_config::config_path()` resolves the file path in this order
+(first match wins), so non-root and dev installs work without
+`/var/lib`:
+
+1. `$BILBYCAST_PTP_CONF_PATH` — explicit env override.
+2. `/var/lib/bilbycast/ptp.conf` — the production install path, used
+   **only if its parent directory is writable** by the running user.
+3. `$XDG_DATA_HOME/bilbycast/ptp.conf`.
+4. `$HOME/.bilbycast/ptp.conf`.
+
+The fallback chain mirrors the media / replay directory pattern. A
+production install runs as the `bilbycast` user with `/var/lib/bilbycast`
+writable, so it lands on path 2; a developer running from a checkout
+typically lands on path 3 or 4. **The PTP helper must be pointed at the
+same resolved path via its `--config` argument** — the two processes
+don't auto-negotiate the location.
 
 ## How it works under the hood
 
@@ -119,7 +137,7 @@ it watches one file and execs one script.
 
 | Path | Role |
 |---|---|
-| `/var/lib/bilbycast/ptp.conf` | Operator-managed mode + iface + domain config. Watched at 1 Hz by the helper. |
+| `/var/lib/bilbycast/ptp.conf` | Operator-managed mode + iface + domain config. Watched at 1 Hz by the helper. Production install path; non-root / dev installs resolve to an XDG / `$HOME` fallback — see [Where the file lives](#where-the-file-lives-resolution-chain). |
 | `/opt/bilbycast/bin/bilbycast-ptp-helper` | Tiny Rust binary: `scan`, `apply`, `run` subcommands. Runs under systemd unit `bilbycast-ptp.service`. |
 | `/opt/bilbycast/bin/bilbycast-ptp-gm.sh` | The script the helper execs. Handles `start` / `stop` / `restart` / `scan` and the per-mode `ptp4l` config rendering. |
 | `/etc/systemd/system/bilbycast-ptp.service` | systemd unit for the helper. `User=bilbycast`, ambient caps, `Before=bilbycast-edge.service`. |

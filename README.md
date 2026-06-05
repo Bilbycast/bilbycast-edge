@@ -289,8 +289,8 @@ Options:
 
 ## Documentation
 
-- [Configuration Reference](docs/CONFIGURATION.md) — full config file documentation with all fields and examples
-- [Configuration Guide](docs/configuration-guide.md) — annotated examples for every input and output type
+- [Configuration Guide](docs/configuration-guide.md) — **authoritative** config reference: annotated examples for every input and output type, kept current with the shipping code
+- [Configuration Reference](docs/CONFIGURATION.md) — legacy/superseded field reference; consult the Configuration Guide above first
 - [Supported Protocols](docs/supported-protocols.md) — protocol matrix with feature lists
 - **[Audio Gateway Guide](docs/audio-gateway.md)** — bridging PCM audio between studios, transcoding, talkback, radio contribution, and SMPTE 302M LPCM-in-MPEG-TS over SRT/UDP/RTP. Read this if you're using Bilbycast for any audio that isn't strict byte-identical ST 2110-30 passthrough.
 - [SMPTE ST 2110](docs/st2110.md) — ST 2110-30/-31/-40 architecture, validation rules, PTP integration

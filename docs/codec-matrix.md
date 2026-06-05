@@ -81,7 +81,7 @@ benefits from offloading decode to dedicated silicon.
 | **AAC-LC** | FDK-AAC in-process (`fdk-aac`) | FDK-AAC | 8 k–48 k | 1–8 (mono–7.1) | Production AAC; lowest latency |
 | **HE-AAC v1** | FDK-AAC in-process | FDK-AAC | 8 k–48 k | 1–2 | SBR adds chroma-bandwidth dependency |
 | **HE-AAC v2** | FDK-AAC in-process | FDK-AAC | 8 k–48 k | 2 (stereo only) | Parametric Stereo — manager UI hard-filters mono |
-| **Opus** | libopus via libavcodec | libopus via libavcodec | 48 k | 1–2 | Decode wired (transcode-from-Opus-on-TS works) |
+| **Opus** | libopus via libavcodec in-process (`media-codecs`); ffmpeg-subprocess `-c:a libopus` fallback when `media-codecs` off | libopus via libavcodec | 48 k | 1–2 | Encode surface is WebRTC only (MPEG-TS has no standard Opus mapping). Decode wired (transcode-from-Opus-on-TS works) |
 | **MP2** | libavcodec | libavcodec | 32 k / 48 k | 1–2 | DVB-T / SD broadcast |
 | **AC-3** | libavcodec | libavcodec | 32 k / 44.1 k / 48 k | 1–6 (5.1) | ATSC / Blu-ray |
 | **E-AC-3** | (passthrough only) | libavcodec | — | 1–7.1 | UHD ATSC 3.0 |
@@ -121,9 +121,6 @@ tooltip.
 | `video-decoder-nvdec` | `video-decoder-nvdec` + runtime probe | NVDEC decode available (transcode + display) |
 | `video-decoder-qsv` | `video-decoder-qsv` + runtime probe | QSV decode available |
 | `video-decoder-vaapi` | `video-decoder-vaapi` + runtime probe | VAAPI decode available |
-| `display-nvdec` (legacy) | `display-nvdec` | Older managers fall back on this for the display dropdown |
-| `display-qsv` (legacy) | `display-qsv` | Same for QSV |
-| `display-vaapi` (legacy) | `display-vaapi` | Same for VAAPI |
 | `display` | `display` + ≥ 1 KMS connector enumerated | Local-display output usable |
 | `fdk-aac` | `fdk-aac` | In-process AAC family |
 | `media-codecs` | `media-codecs` (default on) | libavcodec for video decode + Opus / MP2 / AC-3 audio decode |

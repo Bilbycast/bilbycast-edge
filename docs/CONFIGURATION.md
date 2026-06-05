@@ -1,5 +1,7 @@
 # Configuration Reference
 
+> ⚠️ **SUPERSEDED — legacy version-1 model.** This document describes the legacy **version-1 inline-flow** config model, where each flow embedded its `input` and `outputs` directly. The current schema is **version 2**, which makes inputs and outputs top-level, first-class entities that flows reference by ID (`input_ids` / `output_ids`). The authoritative, up-to-date reference is **[docs/configuration-guide.md](configuration-guide.md)** — use it for all new work. The persistence, secrets-split, and manager-update concepts below remain accurate, but the inline-flow JSON examples do not reflect the current shape.
+
 bilbycast-edge is configured via two JSON files:
 
 - **`config.json`** (default: `./config.json`) — Operational configuration: server addresses, flow definitions (including user-configured parameters like SRT passphrases, RTSP credentials, RTMP keys, bearer tokens), tunnel routing, monitor settings. When the manager requests the node's config (`GetConfig`), this file's content is returned with infrastructure secrets stripped.
@@ -66,7 +68,7 @@ On startup, the edge loads its config from both `config.json` and `secrets.json`
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "node_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "device_name": "Studio-A Encoder",
   "setup_enabled": true,
@@ -78,10 +80,14 @@ On startup, the edge loads its config from both `config.json` and `secrets.json`
   },
   "monitor": null,
   "manager": null,
+  "inputs": [],
+  "outputs": [],
   "flows": [],
   "tunnels": []
 }
 ```
+
+> In version 2 (current), `inputs` and `outputs` are top-level arrays of independent definitions; each `flows[]` entry references them by ID via `input_ids` / `output_ids` rather than embedding `input` / `outputs` inline. See [docs/configuration-guide.md](configuration-guide.md) for the full version-2 schema and examples.
 
 ## Node Identity & Setup
 

@@ -88,7 +88,7 @@ with its current status and a brief description of the implementation.
 | N1 | Private IP ranges on inter-entity links | n/a | Network design concern, not enforced by software. |
 | N2 | UDP ports > 1024 | n/a | Config accepts any port; operators should follow this guideline. |
 | N3 | NAT for address isolation | missing | No NAT capability in the system. |
-| N4 | SSM (Source-Specific Multicast) | partial | Multicast joins are (*,G) style. SSM (S,G) filtering is not yet supported. The `allowed_sources` filter provides equivalent protection at the application layer. |
+| N4 | SSM (Source-Specific Multicast) | met | SSM (S,G) filtering is supported: set `source_addr` on a multicast RTP/UDP input and the kernel joins the source-specific group, dropping traffic from any other source before it reaches userspace (RFC 3678). Validated by `validate_ssm_source` (bind must be multicast, source must be a same-family unicast address). The `allowed_sources` filter remains available as a complementary application-layer allow-list. |
 | N5 | Point-to-point over routed L3 | n/a | Network design concern. |
 | N6 | Dual links for redundancy only | n/a | Network design concern. SMPTE 2022-7 support ensures redundant paths are used for protection, not load-sharing. |
 

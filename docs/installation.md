@@ -39,9 +39,12 @@ matches your transcoding needs:
 | Variant         | H.264 / H.265 transcoding | Licence of binary            |
 |-----------------|---------------------------|------------------------------|
 | **`*-linux`**   | No (pass-through only)    | AGPL-3.0-or-later            |
-| **`*-linux-full`** | Yes (libx264 + libx265 + NVENC) | AGPL-3.0-or-later combined work (bundles GPL-2.0+ libx264 / libx265) |
+| **`*-linux-full`** | Yes (libx264 + libx265 + NVENC + VAAPI; QSV on x86_64 only — Intel iGPU is x86_64-only) | AGPL-3.0-or-later combined work (bundles GPL-2.0+ libx264 / libx265) |
 
-Both ship for Linux x86_64 (amd64) and Linux ARM64 (aarch64). See
+Both ship for Linux x86_64 (amd64) and Linux ARM64 (aarch64). The
+`install-edge.sh` script defaults to `--variant full` on Linux (full is
+what most operators want); pass `--variant default` explicitly for the
+AGPL-only pass-through binary. See
 [README.md](../README.md#choosing-a-release-binary) for the full
 picture.
 

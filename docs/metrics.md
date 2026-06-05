@@ -170,6 +170,68 @@ Reported in microseconds. Exposed per-output on `OutputStats.pcr_trust` (MPTS UD
 
 **Source:** `src/stats/pcr_trust.rs`, wired into `OutputStatsAccumulator.pcr_trust`. Recorded from `src/engine/output_udp.rs` (MPTS path) and `src/engine/output_rtp.rs` (raw-TS-over-RTP + RTP-wrapped TS passthrough path).
 
+## Master-clock telemetry (`FlowStats.master_clock`)
+
+> **Not exposed through Prometheus.** Master-clock state is a structured
+> per-flow object on the WS `stats` snapshot (`FlowStats.master_clock`,
+> `src/stats/models.rs::MasterClockStats`) consumed by the manager UI's
+> per-flow telemetry card. It does **not** appear under `/metrics`.
+
+Present on every running flow (every flow has a master clock; `wallclock`
+is the last-resort default). Absent only on older edges. Fields:
+
+| Field | Meaning |
+|---|---|
+| `kind` | The **actual** driving clock: `"source_pcr_pll"` / `"ptp"` / `"audio_master"` / `"wallclock"`. When `fallback_active`, this reflects the rung the data path is really on (e.g. `"wallclock"`). |
+| `locked` | `true` when the clock is converged enough for broadcast-grade emit. |
+| `rate_offset_ppm` | Recovered rate vs. local CPU clock. Meaningful for PLL masters; `0.0` for `wallclock` / `ptp`. |
+| `jitter_us` | Recent p99 jitter over the last 1 s window (µs). |
+| `lipsync_offset_90k` | Operator-set lipsync trim (90 kHz ticks, bounded ±18 000). |
+| `configured_kind` | What the operator / auto-policy configured (e.g. `"auto"`, `"source_pcr_pll"`). Set when a fallback has fired so the UI can render "PCR PLL → Wallclock (fallback)". `None` in normal operation. |
+| `fallback_active` | `true` when the PLL fallback watcher has activated a degraded rung. |
+| `fallback_reason` | `"no_pcr_observed"` / `"insufficient_samples"` / `"jitter_too_high"`. Set only when `fallback_active`. |
+
+The fallback transitions also surface as discrete `master_clock` events —
+see [`events-and-alarms.md`](events-and-alarms.md#master-clock-master_clock).
+
+**Source:** `src/engine/master_clock.rs` (telemetry snapshot), mirrored into `src/stats/models.rs::MasterClockStats`. Full model: [`clocking.md`](clocking.md#telemetry).
+
+## Wire-pacing and egress de-jitter telemetry (`OutputStats`)
+
+> **Not exposed through Prometheus.** These are additive fields on the
+> per-output WS `stats` snapshot (`src/stats/models.rs::OutputStats`),
+> rendered by the manager UI's egress card. They do **not** appear under
+> `/metrics`.
+
+Present on outputs that own a UDP socket directly (UDP / RTP / 302M / ST
+2110); absent on SRT / RIST / RTMP / HLS / CMAF / WebRTC. Older managers
+ignore unknown fields.
+
+| Field | Meaning |
+|---|---|
+| `wire_pacing_tier` | Active release tier, set once at output start: `"so_txtime"` / `"clock_nanosleep_fifo"` / `"clock_nanosleep"` / `"unpaced"`. |
+| `wire_pacing_late` | Datagrams the kernel rejected as late on the SO_TXTIME path. Always 0 on the userspace-sleep paths. |
+| `wire_pacing_pinned_cpu` | CPU index the wire-emit thread was pinned to (`BILBYCAST_WIRE_EMIT_CPUS`); `None` when not pinned. |
+| `egress_shed` | Datagrams shed by the egress residence cap (compressed / `Lossless` outputs). Non-zero means the release-rate servo hit its ±authority ceiling and the buffer was trimmed to stay inside the receiver T-STD; the receiver re-clocked from PCR. Always 0 on ST 2110 / protocol-paced outputs. |
+| `wire_emit_depth` | Current wire-emit queue depth (datagrams in flight between the broadcast subscriber and the wire). The servo holds this near its setpoint; a sustained climb is the early signature of the latency runaway the servo + shed prevent. |
+
+**Source:** `src/engine/wire_emit.rs`, `src/stats/models.rs::OutputStats`. Background: [`wire-pacing.md`](wire-pacing.md), [`egress-dejitter-design.md`](egress-dejitter-design.md).
+
+## Ingress de-jitter telemetry (`InputStats`)
+
+> **Not exposed through Prometheus.** Additive fields on the per-input WS
+> `stats` snapshot (`src/stats/models.rs::InputStats`). Not under `/metrics`.
+
+Present on raw UDP / RTP inputs running the ingress de-jitter buffer
+(`ingress_dejitter_ms` set); absent otherwise.
+
+| Field | Meaning |
+|---|---|
+| `ingress_dejitter_shed` | Cumulative packets shed by the input's release-rate servo residence cap. Non-zero means a burst / source-rate offset exceeded the ±5 % servo authority and the buffer was trimmed to bound input latency; the receiver re-clocks from PCR. |
+| `ingress_buffer_depth` | Current de-jitter buffer occupancy (packets). The servo holds this near the configured `ingress_dejitter_ms` of content. `None` on inputs without a de-jitter buffer. |
+
+**Source:** `src/engine/ingress_dejitter.rs` (wired via `input_udp.rs` / `input_rtp.rs`), `src/stats/models.rs::InputStats`. Background: [`ingress-dejitter-design.md`](ingress-dejitter-design.md).
+
 ## Tunnel metrics
 
 Emitted for every active QUIC tunnel.

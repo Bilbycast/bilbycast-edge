@@ -18,7 +18,7 @@ Without pacing of *any* kind, encoder bursts arrive at the wire as bursts. PCR j
 
 ## Capability tiers
 
-`engine::wire_emit::spawn_wire_emitter` selects the release path based on the `BILBYCAST_ENABLE_TXTIME` env var. The chosen tier is logged at info level on output start and surfaced on `OutputStats.wire_pacing_tier`.
+`engine::wire_emit::spawn_wire_emitter` only takes the SO_TXTIME path when **all three** of the following hold: `BILBYCAST_ENABLE_TXTIME=1` (alias `BILBYCAST_ENABLE_SO_TXTIME=1`) is set and `BILBYCAST_FORCE_NANOSLEEP` is not, the output is **etf-eligible** (`WirePacingClass::EtfEligible` — ST 2110 uncompressed essence), **and** the `try_enable_so_txtime(&socket, clockid)` probe succeeds on the socket. If any of the three fails — including a compressed (`Lossless`) output even with the env var set — it falls back to the `clock_nanosleep` releaser. The chosen tier is logged at info level on output start and surfaced on `OutputStats.wire_pacing_tier`.
 
 | Tier | Mechanism | Inter-packet jitter | Requires | When |
 |---|---|---|---|---|

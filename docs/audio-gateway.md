@@ -845,12 +845,15 @@ through that stage — leave it empty and the pipeline is the plain
 decode → encode chain described above. Full reference:
 [`transcoding.md`](transcoding.md#transcode--channel-shuffle--sample-rate-conversion).
 
-**Default (`fdk-aac` feature, on by default):** AAC codecs (AAC-LC,
-HE-AAC v1, HE-AAC v2) are encoded in-process via Fraunhofer FDK AAC —
-no subprocess, no ffmpeg dependency for AAC. Non-AAC codecs (Opus, MP2,
-AC-3) use an ffmpeg subprocess. **Fallback (no `fdk-aac` feature):** all
-codecs use an ffmpeg subprocess. Outputs without `audio_encode` set keep
-working without ffmpeg installed at all.
+**Default (`fdk-aac` + `media-codecs` features, both on by default):**
+AAC codecs (AAC-LC, HE-AAC v1, HE-AAC v2) are encoded in-process via
+Fraunhofer FDK AAC, and **MP2 / AC-3 on the TS and HLS outputs are also
+encoded in-process** via the libavcodec layer (`media-codecs`) — no
+subprocess, no ffmpeg dependency. The only codec that uses an ffmpeg
+subprocess by default is **Opus** (WebRTC), which has no in-process
+encoder. **Fallback (no `media-codecs` / no `fdk-aac` feature):** the
+affected codecs fall back to an ffmpeg subprocess. Outputs without
+`audio_encode` set keep working without ffmpeg installed at all.
 
 ```jsonc
 {
@@ -917,12 +920,14 @@ always AAC, the sink is always Opus, so passthrough is impossible.
 The encoder is opt-in and fails fast with a clear `audio_encode`
 category event to the manager (Critical severity) when:
 
-- **ffmpeg is missing in `PATH`** (non-AAC codecs, or AAC without
-  `fdk-aac` feature): outputs with `audio_encode` set refuse to start
-  (HLS) or drop audio for the rest of the output's lifetime after
-  logging once (RTMP / WebRTC). AAC codecs with the `fdk-aac` feature
-  (default) do not require ffmpeg. Outputs without `audio_encode` keep
-  working without ffmpeg installed.
+- **ffmpeg is missing in `PATH`** (only relevant to codecs that fall
+  back to the subprocess — Opus always, and any codec when its
+  in-process backend is compiled out): outputs with `audio_encode` set
+  refuse to start (HLS) or drop audio for the rest of the output's
+  lifetime after logging once (RTMP / WebRTC). With the default features
+  (`fdk-aac` + `media-codecs`), AAC and MP2 / AC-3 are encoded in-process
+  and do **not** require ffmpeg; only Opus (WebRTC) does. Outputs without
+  `audio_encode` keep working without ffmpeg installed.
 - **Input audio is unsupported**: with the default `fdk-aac` feature,
   the decoder supports AAC-LC, HE-AAC v1/v2, and multichannel up to
   7.1. Without `fdk-aac`, the pure-Rust fallback supports AAC-LC
@@ -980,19 +985,23 @@ browser viewer step.
 
 ### Performance
 
+By default (`fdk-aac` + `media-codecs`) the encode work runs in-process
+on a blocking thread (AAC via FDK AAC, MP2 / AC-3 via libavcodec) — no
+subprocess on the TS / HLS / RTMP paths. The notes below describe the
+**subprocess fallback** (Opus on WebRTC always, or any codec when its
+in-process backend is compiled out):
+
 - **One persistent ffmpeg per encoded RTMP / WebRTC output.** Each
   long-lived subprocess has three concurrent driver tasks: stdin
   writer (PCM in via a bounded(64) channel, drop-on-full so a slow
   encoder never cascades backpressure into the input), stdout reader
   + per-codec framer, stderr drainer (must always run or ffmpeg
   deadlocks on a full pipe).
-- **HLS forks ffmpeg per segment** instead. The plan considered using
-  the per-codec encoder + a Rust TS muxer but the existing
-  `engine/rtmp/ts_mux.rs` only knows AAC, and adding MP2 / AC-3 PES
-  framing was disproportionate work for v1. Per-segment fork is
-  acceptable because HLS segments are typically 2-6 s and ffmpeg
-  startup is small relative to that.
-- **Drop-on-full** is by design. Slow ffmpeg → `OutputStatsAccumulator.
+- **HLS forks ffmpeg per segment** instead (subprocess fallback only;
+  the in-process path remuxes each segment on a `spawn_blocking`
+  thread). The per-segment fork is acceptable because HLS segments are
+  typically 2-6 s and ffmpeg startup is small relative to that.
+- **Drop-on-full** is by design. Slow encoder → `OutputStatsAccumulator.
   packets_dropped` increments. The data path is never blocked.
 
 ---

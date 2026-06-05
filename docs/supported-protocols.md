@@ -2,7 +2,7 @@
 
 ## Overview
 
-bilbycast-edge is a pure-Rust media gateway supporting multiple transport protocols for professional broadcast and streaming workflows. All protocol implementations are native Rust with no C library dependencies.
+bilbycast-edge is a media gateway supporting multiple transport protocols for professional broadcast and streaming workflows. The transport/protocol logic is Rust throughout, but the **default build is not C-free**: it links libsrt (via `bilbycast-libsrt-rs`, the default SRT backend selected in `Cargo.toml`'s `── SRT backend ──` block), Fraunhofer FDK AAC (the default `fdk-aac` feature), and FFmpeg/libavcodec (the default `media-codecs` feature). A fully pure-Rust binary is only achievable by switching the SRT backend to `bilbycast-srt` **and** disabling the default codec features (`--no-default-features --features tls,webrtc,replay`); RIST and the tunnel/relay stack are pure Rust regardless.
 
 ## Input Protocols
 
@@ -185,7 +185,7 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
   - Reconnection with configurable delay and max attempts
   - Non-blocking: uses mpsc bridge pattern, never blocks other outputs
   - **MPTS-aware:** on an MPTS input, selects program by `program_number` or (default) locks onto the lowest-numbered program in the PAT
-  - **Optional `audio_encode` block (Phase B):** runs the input AAC through the ffmpeg-sidecar encoder so the operator can normalise bitrate / sample rate / channel count or upgrade to HE-AAC v1/v2 (`aac_lc`, `he_aac_v1`, `he_aac_v2`). Same-codec passthrough fast path skips both decoder and encoder when the source is already AAC-LC and no overrides are set (disabled when `transcode` is set). Requires ffmpeg in PATH at runtime; outputs without `audio_encode` keep working without ffmpeg installed. See [audio-gateway.md](audio-gateway.md#the-audio_encode-block--compressed-audio-egress-rtmp--hls--webrtc).
+  - **Optional `audio_encode` block (Phase B):** re-encodes the input AAC so the operator can normalise bitrate / sample rate / channel count or upgrade to HE-AAC v1/v2 (`aac_lc`, `he_aac_v1`, `he_aac_v2`). With the default `fdk-aac` feature these AAC profiles encode **in-process** via Fraunhofer FDK AAC — no ffmpeg dependency. (ffmpeg is only needed as a subprocess fallback when `fdk-aac` is off.) Same-codec passthrough fast path skips both decoder and encoder when the source is already AAC-LC and no overrides are set (disabled when `transcode` is set). Outputs without `audio_encode` need no codec libraries at all. See [audio-gateway.md](audio-gateway.md#the-audio_encode-block--compressed-audio-egress-rtmp--hls--webrtc).
   - **Optional companion `transcode` block:** channel shuffle / sample-rate conversion applied to the decoded PCM before re-encoding. See [transcoding.md](transcoding.md#transcode--channel-shuffle--sample-rate-conversion).
 - **Limitations:**
   - Only H.264 video and AAC audio. HEVC/VP9 not supported via RTMP.
@@ -223,7 +223,7 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
   - Optional Bearer token authentication
   - Async HTTP upload, non-blocking to other outputs
   - **MPTS passthrough** (default) or optional MPTS→SPTS program filter via `program_number` — filtered segments carry a rewritten single-program TS
-  - **Optional `audio_encode` block (Phase B):** each segment is piped through `ffmpeg -i pipe:0 -c:v copy -c:a {codec} -f mpegts pipe:1` before HTTP PUT. Allowed codecs: `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`. Per-segment fork rather than a long-lived encoder because HLS segments are 2-6 s and ffmpeg startup is small relative to that — also lets MP2/AC-3 work without a new TS muxer. Requires ffmpeg in PATH; the output refuses to start if ffmpeg is missing and emits a Critical `audio_encode` event.
+  - **Optional `audio_encode` block (Phase B):** re-encodes the segment audio before HTTP PUT. Allowed codecs: `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`. With the default `media-codecs` (+ `fdk-aac`) features this runs **in-process** — AAC via Fraunhofer FDK AAC, MP2/AC-3 via libavcodec — with no ffmpeg dependency. Only when `media-codecs` is off does the output fall back to a per-segment `ffmpeg` subprocess remux; in that fallback mode the output refuses to start if ffmpeg is missing and emits a Critical `audio_encode` event.
   - **Optional companion `transcode` block:** channel shuffle / sample-rate conversion applied to the decoded PCM before re-encoding. Honoured only on the in-process remux path (`media-codecs` feature, default); the subprocess fallback ignores it with a warning. See [transcoding.md](transcoding.md#transcode--channel-shuffle--sample-rate-conversion).
 - **Limitations:**
   - Output only. Segment-based transport inherently adds 1-4 seconds of latency.
@@ -346,6 +346,13 @@ bilbycast-edge is a pure-Rust media gateway supporting multiple transport protoc
 - **Security:** Bearer token authentication on WHIP/WHEP endpoints, DTLS/SRTP encryption, ICE-lite for server modes.
 - **NAT traversal:** Configurable `public_ip` and optional `stun_server` for ICE candidate advertisement.
 
+### MXL (Media eXchange Layer) — behind the `mxl` feature
+
+- **Direction:** Input and Output
+- **Status:** Gated by the `mxl` Cargo feature, which is **OFF by default** (heavy build prerequisites — see [`mxl-integration-plan.md`](mxl-integration-plan.md) and `bilbycast-mxl-rs/CLAUDE.md`).
+- **Variants:** three input variants and three output variants — `mxl_video` (V210 4:2:2 10-bit), `mxl_audio` (Float32 PCM @ 48 kHz), `mxl_anc` (RFC 8331 ANC) — mirroring the ST 2110-20/-30/-40 pattern over the EBU / Linux Foundation same-host shared-memory bus.
+- **PTP:** mandatory at validation time (`master_clock = wallclock` is rejected on MXL flows). The boot probe dlopens `libmxl.so` and only advertises the `mxl-video` / `mxl-audio` / `mxl-anc` capability bits when it loads successfully.
+
 ## MPEG-TS Program Handling
 
 ### MPTS / SPTS Support
@@ -390,12 +397,22 @@ A flow can optionally carry an `assembly` block (`kind = spts | mpts | passthrou
 
 ## Cargo Features
 
-| Feature | Description | Default |
-|---------|-------------|---------|
-| `tls` | Enable RTMPS (RTMP over TLS) via `rustls`/`tokio-rustls` | **Yes** |
-| `webrtc` | Enable WebRTC WHIP/WHEP input and output via `str0m` | **Yes** |
+The canonical feature table — every flag, its default, build prerequisites, and licensing implications — lives in the monorepo root [`CLAUDE.md`](../../CLAUDE.md) ("Feature Flags"). It is **not** the case that "all features are enabled by default." The real default set (per `Cargo.toml`) is:
 
-All features are enabled by default. A plain `cargo build --release` includes everything.
+```
+default = ["tls", "webrtc", "fdk-aac", "media-codecs", "replay", "display"]
+```
+
+| Feature | Description |
+|---------|-------------|
+| `tls` | RTMPS (RTMP over TLS) + HTTPS via `rustls`/`tokio-rustls` |
+| `webrtc` | WebRTC WHIP/WHEP input and output via `str0m` |
+| `fdk-aac` | In-process AAC decode/encode (Fraunhofer FDK AAC) |
+| `media-codecs` | FFmpeg/libavcodec base layer: CPU video decode, Opus/MP2/AC-3 audio, JPEG thumbnails, HW probe scaffolding |
+| `replay` | Continuous flow recording to disk + clip playback as a fresh input |
+| `display` | Local-display output (HDMI / DisplayPort + ALSA), Linux-only |
+
+The software video encoders (`video-encoder-x264` / `-x265` / `-nvenc` / `-qsv` / `-vaapi`), their HW-decoder counterparts, and `mxl` are **off** by default. The `*-linux-full` release variant bundles the encoder set via `video-encoders-full`. See root `CLAUDE.md` for the full matrix.
 
 ## Configuration Examples
 

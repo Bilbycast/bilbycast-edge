@@ -194,6 +194,15 @@ bilbycast-edge supports two roles:
 | `/api/v1/flows/{id}/whep` | POST | Yes | **No (403)** | Yes |
 | `/api/v1/flows/{id}/whep/{sid}` | DELETE | Yes | **No (403)** | Yes |
 
+**Note:** This table is illustrative, not exhaustive. The same role rule
+applies uniformly to every route: `GET /api/v1/*` is read-only (any role),
+and every mutating `POST`/`PUT`/`DELETE` under `/api/v1/*` requires `admin`.
+Newer routes not listed above follow this rule too — e.g. the top-level
+inputs/outputs CRUD (`/api/v1/inputs`, `/api/v1/outputs` and their `{id}`
+variants), flow assembly (`PUT /api/v1/flows/{id}/assembly`), per-output
+active-flow management (`/api/v1/outputs/{id}/active`), and the PTP status
+endpoint (`/api/v1/ptp`).
+
 **Note:** WHIP/WHEP endpoints additionally validate per-flow Bearer tokens configured in the flow's WebRTC input/output config. This is separate from the API auth — even with API auth disabled, the per-flow bearer_token protects WebRTC signaling.
 
 **How RBAC works internally:**
@@ -351,7 +360,7 @@ Edit your `config.json`:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "server": {
     "listen_addr": "0.0.0.0",
     "listen_port": 8080,
@@ -570,7 +579,7 @@ Note: Query parameter authentication is less secure than headers because tokens 
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "server": {
     "listen_addr": "0.0.0.0",
     "listen_port": 8080
@@ -583,7 +592,7 @@ Note: Query parameter authentication is less secure than headers because tokens 
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "server": {
     "listen_addr": "0.0.0.0",
     "listen_port": 8443,
@@ -610,7 +619,7 @@ Note: Query parameter authentication is less secure than headers because tokens 
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "server": {
     "listen_addr": "0.0.0.0",
     "listen_port": 8443,

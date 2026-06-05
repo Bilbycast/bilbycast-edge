@@ -1,5 +1,18 @@
 # MXL implementation handoff — next session
 
+> **Historical handoff doc (2026-05-18).** This was the next-session
+> prompt written at the end of the MXL scaffolding session. MXL has
+> since **shipped behind the `mxl` feature (default OFF)**. The **video
+> bridges are implemented** (`src/engine/mxl_video_io.rs` — input
+> encode via `ScaledVideoEncoder`, output decode-to-grain via
+> `TsDemuxer` + `VideoDecoder`/`VideoScaler`). The **audio bridges
+> remain stubbed** (`src/engine/mxl_io.rs` — audio input emits the
+> `mxl_audio_no_encode_set` Warning with a TODO; audio output drains
+> the broadcast channel via `drain_until_cancel` and emits
+> `mxl_audio_decode_pending`). The **audio codec bridge is the
+> remaining gap** — the audio-in / audio-out steps in Part 2 below are
+> the live work; the V210 / video steps are done. Kept for reference.
+
 Self-contained operator setup + next-session prompt for finishing the MXL
 (Media eXchange Layer) integration. Generated 2026-05-18 at the end of
 the scaffolding session; current state is documented in

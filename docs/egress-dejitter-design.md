@@ -1,5 +1,32 @@
 # Egress de-jitter / re-clock — design (2026-06-02)
 
+> ⚠️ **SUPERSEDED DESIGN SNAPSHOT (2026-06-02).** This is the original
+> design note, kept for rationale + research citations. The **shipped code
+> diverged** in the 2026-06-04 rework — read it for the *why*, not the *what
+> ships*. Specifically (verify against `src/engine/wire_emit.rs`):
+>
+> - **The cushion is now OPT-IN.** With `egress_buffer_ms` (per-output) /
+>   `BILBYCAST_EGRESS_BUFFER_MS` unset, `seed_cushion = false`: the servo
+>   emits byte-for-byte on arrival with only a gentle rate trim and **no 60 ms
+>   startup cushion** — zero added latency, zero regression. The 60 ms
+>   setpoint cushion is seeded **only** when an operator sets one of those
+>   knobs. (Design §"The fix" / §"Defaults" assumed the cushion was always on.)
+> - **The Lossless→`clock_nanosleep` / ST 2110→SO_TXTIME class split was
+>   reverted.** When SO_TXTIME is enabled, **both** `Lossless` and
+>   `EtfEligible` ride etf / SO_TXTIME; late etf packets are handled by the
+>   `ETF_LATE_FLOOR_NS` floor (15 ms), not a class split. The **default**
+>   release path is `clock_nanosleep` (SO_TXTIME is opt-in via
+>   `BILBYCAST_ENABLE_TXTIME`). See [`wire-pacing.md`](wire-pacing.md).
+> - **The residence-cap shed fires on `dejitter.enabled` regardless of
+>   releaser**, and `dejitter.enabled` is **Lossless-only** (`want_egress_servo
+>   = matches!(pacing, WirePacingClass::Lossless)`).
+>
+> The **numeric defaults below still match** the shipped code: 60 ms setpoint,
+> ±5 % authority (`authority_permille = 50`), 32-datagram drain floor,
+> residence cap `max(4×setpoint, 250)` ms. For the shipped ingress
+> counterpart, [`ingress-dejitter-design.md`](ingress-dejitter-design.md) is
+> accurate and current.
+
 ## Problem
 The edge's egress pacer (`engine::wire_emit::TargetState::derive_target_raw`) advances its
 output cadence purely by **source-PCR deltas** against a **wall anchor frozen at startup**, with
@@ -38,11 +65,15 @@ Replace the open-loop PCR integration with a **leaky-bucket release servo + hard
    anchor, no source-PCR integration → a steady ppm offset has no integrator to accumulate).
 4. **Underflow floor** `target.max(now)` (ASAP when drained).
 5. **Hard residence cap** (controlled overflow, IRD-style): when residence (`now − oldest
-   recv_time`, = `last_latency_us`) exceeds **250 ms**, **shed oldest** datagrams (count them) and
+   recv_time`, = `last_latency_us`) exceeds the cap, **shed oldest** datagrams (count them) and
    snap forward — bounds latency by construction. The receiver re-clocks from the untouched PCR.
+   *(Shipped: the cap is `max(4×setpoint, 250)` ms — 250 ms only at the 60 ms default setpoint —
+   and the shed fires on `dejitter.enabled` regardless of releaser, not just on the
+   `clock_nanosleep` path.)*
 
 ST 2110 (`EtfEligible`) keeps `derive_target_raw` + SO_TXTIME/etf **unchanged** (wire precision IS
-its clock); it gets the residence-cap only as a graceful-degradation safety net.
+its clock). *(Shipped: the residence-cap shed is **Lossless-only** — `dejitter.enabled` is gated by
+`want_egress_servo = matches!(pacing, WirePacingClass::Lossless)`, so ST 2110 does **not** get it.)*
 
 ## Defaults (justified)
 | Knob | Default | Basis |
@@ -73,9 +104,11 @@ below it. Codec backpressure (75 %) and SRT/RIST input buffers are unchanged + c
   `WS_PROTOCOL_VERSION`, per the protocol-change rule.
 
 ## Phasing
-- **Phase 1 (safety net, stops the runaway today):** residence-cap shed in the `clock_nanosleep`
-  drain loop only (additive, Lossless-only by construction, no config/signature change). Caps
-  latency at 250 ms → the 47 s becomes impossible. Strict subset of the full design (no throwaway).
+- **Phase 1 (safety net, stops the runaway today):** residence-cap shed in the drain loop,
+  Lossless-only by construction (additive, no config/signature change). Caps latency → the 47 s
+  becomes impossible. Strict subset of the full design (no throwaway). *(Shipped: the shed is gated
+  on `dejitter.enabled`, which is Lossless-only via `want_egress_servo`, and fires regardless of
+  the active releaser — not scoped to the `clock_nanosleep` path as written here.)*
 - **Phase 2 (elegant servo):** the release-rate servo (§ fix) so the shed never fires under normal
   jitter; reuse `observed_rate_bps` + `depth`.
 - **Phase 3 (UI/protocol):** config knob + telemetry card on edge + manager.

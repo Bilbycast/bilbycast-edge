@@ -6,6 +6,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.33.0] - unreleased
 
+> **Note:** This changelog trails the shipped behaviour. Release tags are
+> well ahead of the latest version recorded here, and several major
+> subsystems shipped without changelog entries. Treat the per-project
+> `CLAUDE.md` and the `docs/` set as the source of truth until the
+> changelog is reconciled. Notable shipped-but-unlogged subsystems include:
+> RIST Simple Profile input/output; the per-flow master clock + A/V sync
+> (`master_clock`, encoder-style PES PTS regeneration); in-depth content
+> analysis (`content_analysis` lite / audio_full / video_full tiers); the
+> PID bus / Flow Assembly + PES Switch (SPTS/MPTS synthesis, PES-aligned
+> splice); egress and ingress de-jitter buffers; and wallclock-egress wire
+> pacing (`engine::wire_emit`, SO_TXTIME / ETF + `clock_nanosleep` tiers).
+
 ### Changed
 
 - **Release workflow triggers** — `push.tags: v*` and `workflow_dispatch`

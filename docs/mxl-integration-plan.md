@@ -1,6 +1,8 @@
 # MXL (Media eXchange Layer) — integration plan
 
-> **Status (2026-05-13):** design analysis only — implementation deferred. Pick this back up when ready to greenlight. Upstream MXL state verified directly from `dmf-mxl/mxl` on this date; re-check before implementation if more than ~2 weeks have passed.
+> **Status (updated):** **implemented feature-gated (the `mxl` feature, default off).** The **video path works** — input encode and output decode-to-grain bridges are live in `src/engine/mxl_video_io.rs`; ANC pass-through is wired. The **audio codec bridge is the remaining gap** — `src/engine/mxl_io.rs` consumes/produces Float32 PCM but does not yet bridge it through `audio_encode` / `audio_decode` (input emits `mxl_audio_no_encode_set`, output emits `mxl_audio_decode_pending`). The original status line below ("design analysis only — implementation deferred") and the "no grep hits / clean slate" note in [Where bilbycast stands today](#where-bilbycast-stands-today) are **historical** — the design-analysis body that follows still holds and is preserved for rationale.
+>
+> **Original status (2026-05-13):** design analysis only — implementation deferred. Pick this back up when ready to greenlight. Upstream MXL state verified directly from `dmf-mxl/mxl` on this date; re-check before implementation if more than ~2 weeks have passed.
 
 ## Context
 
@@ -33,7 +35,7 @@ bilbycast-edge already has the exact abstraction MXL needs:
 - **ST 2110-20/-23/-30/-31/-40 — the closest analog to MXL in concept** (uncompressed essence, PTP-anchored, RFC-formatted) — are already plumbed in. They live in `bilbycast-edge/src/engine/st2110/` and are dispatched from `flow.rs::spawn_single_input()`.
 - The Flow architecture has **two parallel pipelines**: passthrough (no reassembly) and assembly (PID bus → SPTS/MPTS synthesis). The PID bus is **MPEG-TS only**. Uncompressed essence that doesn't encode-to-TS already bypasses it (see ST 2110-30 with no `audio_encode`, ST 2110-40 always). MXL would fit the same model.
 - **C-library FFI wrappers are an established pattern**: `bilbycast-libsrt-rs`, `bilbycast-fdk-aac-rs`, `bilbycast-ffmpeg-video-rs`. A `bilbycast-mxl-rs` wrapping libmxl would slot in alongside them as a sibling crate — but only as a fallback (see Design sketch).
-- No grep hits for `mxl` / "Media eXchange Layer" in the codebase today — clean slate.
+- ~~No grep hits for `mxl` / "Media eXchange Layer" in the codebase today — clean slate.~~ **(Historical — superseded.)** MXL is now implemented behind the `mxl` feature: `src/engine/mxl_video_io.rs` + `src/engine/mxl_io.rs`, config variants in `src/config/models.rs`, capability gating in `src/manager/client.rs`. Video + ANC bridges work; the audio codec bridge is the remaining gap.
 
 ## Recommendation
 

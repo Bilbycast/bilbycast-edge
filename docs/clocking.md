@@ -24,15 +24,39 @@ A single per-flow clock fixes this:
   source PCR or same PTP grandmaster. 2022-7 hitless redundancy at the
   receiver works without an external genlock.
 
-**The default policy is now `auto` (per-input).** A flow with no explicit
-`master_clock` resolves identically to `master_clock.kind = "auto"`:
+**The default policy is now `auto` (by flow role).** A flow with no explicit
+`master_clock` resolves identically to `master_clock.kind = "auto"`. The
+resolution is keyed on **flow role** (in `build_master_clock`), which
+overrides the per-input default table:
 
-| Input class | `auto` resolves to | Notes |
-|-------------|--------------------|-------|
+| Flow role | `auto` resolves to | Notes |
+|-----------|--------------------|-------|
 | ST 2110-20/-23/-30/-31/-40, MXL | `Ptp` | PTP-domain essence; `ptp4l` `port_state == SLAVE`/`MASTER`, offset within tolerance |
-| Contribution: SRT / RTP / UDP / RIST / RTMP / RTSP / `media_player` / `replay` / `test_pattern` / `rtp_audio` / `bonded`; WebRTC | cascade **`SourcePcrPll` → `Ptp` → `Wallclock`** | PLL lock criterion: PI loop converges, p99 jitter < 100 µs over 64 samples after ≥ 100 samples; on failure → PTP-if-configured-&-healthy, else wallclock |
-| PID-bus assembled flows | cascade (same as contribution) | the PLL recovers the designated `pcr_source` |
+| Single-source **live contribution**: SRT / RTP / UDP / RIST / RTMP / RTSP | cascade **`SourcePcrPll` → `Ptp` → `Wallclock`** | PLL lock criterion: PI loop converges, p99 jitter < 100 µs over 64 samples after ≥ 100 samples; on failure → PTP-if-configured-&-healthy, else wallclock |
+| PID-bus assembled flows | cascade (same as live contribution) | the PLL recovers the designated `pcr_source` |
+| **Multi-input switcher** (more than one `input_id`) | `Wallclock` | stable clock keeps cuts seamless; genlocking to the active source would step the clock on every cut and re-acquire lock for seconds |
+| File / `media_player` / `replay` / WebRTC / `test_pattern` / `rtp_audio` / `bonded` | `Wallclock` | no live source clock to recover; the source plays at wallclock rate |
 | `AudioMaster` | (reserved) | not yet implemented; falls through to Wallclock |
+
+**The explicit `master_clock.kind` values** an operator can pin (snake_case
+on the wire, `MasterClockKindConfig` in `src/config/models.rs`):
+`source_pcr_pll`, `contribution`, `ptp`, `audio_master`, `wallclock`,
+`auto`, plus two more:
+
+- **`passthrough`** — "this flow doesn't need a recovered source clock".
+  Output PCR comes from source bytes (passthrough) or source PTS
+  (transcoded); the runtime backend is `wallclock` but no PLL spawns and no
+  fallback alarm fires. The implicit default for most
+  contribution-to-distribution flows when the operator hasn't pinned
+  `source_pcr_pll` / `contribution` explicitly.
+- **`sender_timestamp`** (SRT / RIST inputs only) — recover rate from the
+  SRT/RIST sender's per-packet timestamp instead of the MPEG-TS PCR sampled
+  from the bytes. Useful for internet-contribution paths where SRT's
+  latency buffer makes PCR-from-bytes look jittery to the PLL but the
+  underlying libsrt `srctime` reflects the sender's clock cleanly.
+  **Framework only today** — the srctime extraction is wired through in a
+  follow-up. Config validation rejects this kind on a non-SRT / non-RIST
+  input.
 
 **Why the cascade tries the PLL first then PTP, not wallclock.** The
 PLL often won't lock on contribution sources that carry per-source-restart
@@ -55,11 +79,15 @@ flow config (overrides the auto-policy). Useful when a plant has PTP
 everywhere and the operator wants every flow paced against the
 grandmaster regardless of input type.
 
-**Per-input auto: `master_clock.kind = "auto"`.** A config-level policy
+**Auto by flow role: `master_clock.kind = "auto"`.** A config-level policy
 rather than a runtime kind of its own — it picks the right reference for
-the input type. **ST 2110 / MXL** inputs are PTP-domain essence, so they
-resolve straight to **PTP** (no PLL-first). **Contribution + assembly**
-inputs get the cascade **source PCR PLL → PTP → Wallclock**. The cascade
+the flow's role. **ST 2110 / MXL** inputs are PTP-domain essence, so they
+resolve straight to **PTP** (no PLL-first). A **single-source live
+contribution** flow (SRT/RTP/UDP/RIST/RTMP/RTSP) and a **PID-bus
+assembled** flow get the cascade **source PCR PLL → PTP → Wallclock**; a
+**multi-input switcher** and **file / replay / WebRTC / test-pattern**
+flows resolve straight to **Wallclock** (no genlock to step on cuts / no
+live source clock to recover). The cascade
 first runs the source-PCR PLL against the selected
 input (best — output tracks the source clock, zero source-relative
 drift). If the PLL can't lock within `pll_lock_timeout_s` (default 30 s),
@@ -88,9 +116,10 @@ the source must be genlocked.
 
 ## Encoder-style PES PTS regeneration
 
-Every TS-carrying ingress can opt in to byte-level PES PTS/DTS
-regeneration via the per-input `regenerate_pts: bool` config field
-(default `false`). When set, the new
+Every TS-carrying ingress runs byte-level PES PTS/DTS regeneration in
+muxer mode **by default**; the per-input `passthrough_clock: Option<bool>`
+config field set to `true` opts OUT (emits source PCR/PTS bytes
+unchanged — relay / transparent-forwarder mode). In muxer mode the
 [`engine::ts_pts_rewriter`](../src/engine/ts_pts_rewriter.rs) stage
 inside `engine::input_post_process::InputPostProcess` rewrites each
 PES header's PTS (and DTS when present) so emitted timestamps come
@@ -134,10 +163,11 @@ replacer anchors via the same `anchor_target` helper with the same
 (audio + video together).
 
 **When does the rewriter actually rewrite?** Only when the
-`anchor_target` 10 s safety lets it. On a flow with `Wallclock`
-master (the new default) and a typical encoder-relative source PTS,
-the safety triggers and the anchor falls back to source PTS —
-effectively a no-op (output PTS == source PTS). To actually see
+`anchor_target` 10 s safety lets it. On a flow with a `Wallclock`
+master (switcher / file / replay / WebRTC / test-pattern) and a
+typical encoder-relative source PTS, the safety triggers and the
+anchor falls back to source PTS — effectively a no-op (output
+PTS == source PTS). To actually see
 master-clock-derived PTS output, the flow needs either:
 
 - `master_clock.kind = "ptp"` with PTP-disciplined sources, OR
@@ -156,7 +186,7 @@ clock-coherent configurations where it improves output quality.
 | `engine/pcr_pll.rs` | Software PI-controller PLL recovering source's 27 MHz from incoming PCR samples. PI loop on `(Δpcr_ticks, Δwall_ns)` with re-anchor on every accepted sample. Discontinuity filter mirrors `pcr_trust.rs` (gaps > 500 ms reset the anchor). Sticky lock-state hysteresis (enter at p99 < 100 µs, exit at > 500 µs). `now_27mhz(wall_ns)` projects forward from the anchor at the recovered rate so PCR generation never quantises to the ingress PCR cadence. |
 | `engine/pcr_ingress_sampler.rs` | Per-flow ingress PCR sampler. Sibling broadcast subscriber (drop-on-Lagged) that scans every `RtpPacket` for adaptation-field PCRs and feeds the master's PLL. Handles both raw TS and RTP-wrapped TS via best-effort RTP header skip. Passive observer — never blocks the data path. |
 | `engine/av_sync_mux.rs` | `AvSyncPacer` — thin wrapper around `MasterClockHandle` that exposes `pcr_27mhz_for_emit()` (master_now − PCR_PREROLL_27MHZ, modular-aware), `is_locked()`, and the lipsync trim. Plus `pcr_for_emit(pacer, pts)` helper that prefers the pacer when set, falls back to legacy `pts × 300 − preroll` otherwise. |
-| `engine/ts_pts_rewriter.rs` | Encoder-style byte-level PES PTS/DTS rewriter, per-PID anchor + source-delta model. Plugs into `input_post_process::InputPostProcess` as a fourth optional stage; gated by per-input `regenerate_pts` config + an attached `AvSyncPacer`. See the "Encoder-style PES PTS regeneration" section above for the model. |
+| `engine/ts_pts_rewriter.rs` | Encoder-style byte-level PES PTS/DTS rewriter, per-PID anchor + source-delta model. Plugs into `input_post_process::InputPostProcess` as a fourth optional stage; on by default (muxer mode) unless per-input `passthrough_clock: true` opts out, plus an attached `AvSyncPacer`. See the "Encoder-style PES PTS regeneration" section above for the model. |
 | `stats/pcr_trust.rs` | Per-output egress PCR accuracy sampler (4096-sample rotating reservoir, exact percentiles). Sibling consumer of the same PCR sample stream as the ingress PLL, but on the egress side. |
 | `engine/wire_emit.rs` | Per-output PCR-anchored wire emission engine. Dedicated `std::thread` (Linux: `SCHED_FIFO` best-effort priority 50) pops TS datagrams off a `std::sync::mpsc::sync_channel(1024)` fed by the encoder task. Two release tiers: (1) **`clock_nanosleep(CLOCK_TAI, TIMER_ABSTIME)`** on SCHED_FIFO — the **default**; ~50–500 µs typical jitter, no kernel / NIC / PTP prerequisites. (2) **SO_TXTIME** — kernel-paced via the `etf` qdisc on `CLOCK_TAI`; sub-µs jitter when paired with HW-PTP, ~1–10 µs with software ETF. **Opt-in** via `BILBYCAST_ENABLE_TXTIME=1`; the probe is not attempted by default because on a host without the ETF qdisc the kernel accepts `setsockopt(SO_TXTIME)` and the `SCM_TXTIME` cmsg silently but emits each packet immediately, producing silent degradation. Closed-loop on observed inter-PCR rate (no declared-bitrate parameter — open-loop drifts when the encoder runs above/below its configured target). Discontinuity > 500 ms or any backwards step resets the anchor; a per-emitter monotonic-target guard prevents kernel ETF reorder on PCR discontinuities. **Wired into UDP, RTP (single-leg + FEC + 2022-7 dual-leg), 302M, ST 2110-20/-23/-30/-31/-40.** SRT, RIST, RTMP, HLS, CMAF, WebRTC keep their protocol-layer pacing. The legacy `BILBYCAST_FORCE_NANOSLEEP=1` env var is kept as a no-op alias for back-compat (the default is already nanosleep). Full doc: [`wire-pacing.md`](wire-pacing.md). |
 
