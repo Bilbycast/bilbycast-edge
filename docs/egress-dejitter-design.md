@@ -23,9 +23,22 @@
 >
 > The **numeric defaults below still match** the shipped code: 60 ms setpoint,
 > ±5 % authority (`authority_permille = 50`), 32-datagram drain floor,
-> residence cap `max(4×setpoint, 250)` ms. For the shipped ingress
+> residence cap `max(4×setpoint, 1000)` ms. For the shipped ingress
 > counterpart, [`ingress-dejitter-design.md`](ingress-dejitter-design.md) is
 > accurate and current.
+>
+> **2026-06-05 update — pacing model + config surface.** The shipped default
+> for compressed UDP/RTP is now **forward-cadence** (emit at input cadence,
+> no re-pacing; the residence cap stays armed as the runaway backstop) —
+> re-pacing held I-frame bursts → GOP-cadence latency swing → receiver
+> underrun on a clean SRT feed. The servo described in this note and the
+> open-loop PCR-delta pacer survive as **per-output opt-ins** via the
+> manager-configurable `egress_pacing: "forward" | "pcr" | "servo"` config
+> field; `egress_buffer_ms` (the cushion) is only valid with `"servo"`.
+> The `BILBYCAST_EGRESS_PACING` / `BILBYCAST_EGRESS_BUFFER_MS` /
+> `BILBYCAST_EGRESS_RESIDENCE_MS` env vars are **gone** — behavior knobs
+> live in config, not the environment. Capability `egress_pacing` gates the
+> manager UI dropdown.
 
 ## Problem
 The edge's egress pacer (`engine::wire_emit::TargetState::derive_target_raw`) advances its

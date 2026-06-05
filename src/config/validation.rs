@@ -4018,19 +4018,38 @@ fn validate_output_interface_bindings(output: &OutputConfig) -> Result<()> {
     Ok(())
 }
 
-/// Validate the optional `egress_buffer_ms` de-jitter setpoint on the
-/// compressed UDP/RTP outputs. Bounded 20–2000 ms (the wire-emit servo
-/// clamps to the same range; rejecting out-of-range here gives the operator
-/// an explicit error instead of a silent clamp). All other output types
-/// ignore the field (the wire emitter only runs on UDP/RTP). Walked once per
-/// output, mirroring [`validate_output_interface_bindings`].
+/// Validate the egress pacing knobs (`egress_pacing` + `egress_buffer_ms`)
+/// on the compressed UDP/RTP outputs. The buffer setpoint is bounded
+/// 20–2000 ms (the wire-emit servo clamps to the same range; rejecting
+/// out-of-range here gives the operator an explicit error instead of a
+/// silent clamp) and is only meaningful in `servo` mode — the cushion is
+/// seeded by the servo's leaky bucket, so accepting it under `forward` /
+/// `pcr` would be a silent no-op (exactly the trap this validation exists
+/// to prevent). All other output types ignore both fields (the wire emitter
+/// only runs on UDP/RTP). Walked once per output, mirroring
+/// [`validate_output_interface_bindings`].
 fn validate_output_egress_buffer(output: &OutputConfig) -> Result<()> {
-    let (val, label) = match output {
-        OutputConfig::Rtp(c) => (c.egress_buffer_ms, format!("output '{}' (RTP)", c.id)),
-        OutputConfig::Udp(c) => (c.egress_buffer_ms, format!("output '{}' (UDP)", c.id)),
+    let (pacing, val, label) = match output {
+        OutputConfig::Rtp(c) => (
+            c.egress_pacing,
+            c.egress_buffer_ms,
+            format!("output '{}' (RTP)", c.id),
+        ),
+        OutputConfig::Udp(c) => (
+            c.egress_pacing,
+            c.egress_buffer_ms,
+            format!("output '{}' (UDP)", c.id),
+        ),
         _ => return Ok(()),
     };
     if let Some(ms) = val {
+        if pacing != Some(EgressPacingMode::Servo) {
+            bail!(
+                "{label}: egress_buffer_ms requires egress_pacing = \"servo\" \
+                 (the de-jitter cushion only exists in servo mode; under \
+                 forward/pcr pacing it would be a silent no-op)"
+            );
+        }
         if !(20..=2000).contains(&ms) {
             bail!("{label}: egress_buffer_ms must be 20-2000 ms, got {ms}");
         }
@@ -6565,6 +6584,62 @@ mod tests {
     }
 
     #[test]
+    fn egress_buffer_requires_servo_pacing() {
+        // The de-jitter cushion only exists in servo mode — accepting
+        // `egress_buffer_ms` under forward/pcr would be a silent no-op
+        // (the trap this rule exists to prevent).
+        fn rtp(pacing: Option<EgressPacingMode>, buf: Option<u32>) -> OutputConfig {
+            OutputConfig::Rtp(RtpOutputConfig {
+                active: true,
+                group: None,
+                id: "out-eb".to_string(),
+                name: "Out EB".to_string(),
+                dest_addr: "127.0.0.1:6000".to_string(),
+                bind_addr: None,
+                interface_addr: None,
+                fec_encode: None,
+                dscp: 46,
+                redundancy: None,
+                program_number: None,
+                pid_map: None,
+                delay: None,
+                audio_encode: None,
+                transcode: None,
+                video_encode: None,
+                cbr_pad_to_kbps: None,
+                pid_overrides: None,
+                interface_binding: None,
+                egress_pacing: pacing,
+                egress_buffer_ms: buf,
+            })
+        }
+        // No knobs / pacing alone (any mode, no buffer) → ok.
+        assert!(validate_output_egress_buffer(&rtp(None, None)).is_ok());
+        for mode in [EgressPacingMode::Forward, EgressPacingMode::Pcr, EgressPacingMode::Servo] {
+            assert!(validate_output_egress_buffer(&rtp(Some(mode), None)).is_ok());
+        }
+        // Buffer without servo → rejected.
+        assert!(validate_output_egress_buffer(&rtp(None, Some(60))).is_err());
+        assert!(
+            validate_output_egress_buffer(&rtp(Some(EgressPacingMode::Forward), Some(60))).is_err()
+        );
+        assert!(
+            validate_output_egress_buffer(&rtp(Some(EgressPacingMode::Pcr), Some(60))).is_err()
+        );
+        // Buffer with servo → ok; bounds still enforced.
+        assert!(
+            validate_output_egress_buffer(&rtp(Some(EgressPacingMode::Servo), Some(60))).is_ok()
+        );
+        assert!(
+            validate_output_egress_buffer(&rtp(Some(EgressPacingMode::Servo), Some(5))).is_err()
+        );
+        assert!(
+            validate_output_egress_buffer(&rtp(Some(EgressPacingMode::Servo), Some(3000)))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn pid_overrides_rejects_pmt_video_audio_collisions() {
         let m = one_prog(TsPidOverridesEntry {
             pmt_pid: Some(0x0100),
@@ -7207,6 +7282,7 @@ mod tests {
                 cbr_pad_to_kbps: None,
                 pid_overrides: None,
                 interface_binding: None,
+            egress_pacing: None,
             egress_buffer_ms: None,
         }));
         config.flows.push(FlowConfig {
@@ -7626,6 +7702,7 @@ mod tests {
                 cbr_pad_to_kbps: None,
                 pid_overrides: None,
                 interface_binding: None,
+            egress_pacing: None,
             egress_buffer_ms: None,
         }));
         config.flows.push(FlowConfig {
@@ -7700,6 +7777,7 @@ mod tests {
                 cbr_pad_to_kbps: None,
                 pid_overrides: None,
                 interface_binding: None,
+            egress_pacing: None,
             egress_buffer_ms: None,
         }));
         config.flows.push(FlowConfig {
@@ -7803,6 +7881,7 @@ mod tests {
                 cbr_pad_to_kbps: None,
                 pid_overrides: None,
                 interface_binding: None,
+            egress_pacing: None,
             egress_buffer_ms: None,
         }));
         config.flows.push(FlowConfig {
@@ -7877,6 +7956,7 @@ mod tests {
                 cbr_pad_to_kbps: None,
                 pid_overrides: None,
                 interface_binding: None,
+            egress_pacing: None,
             egress_buffer_ms: None,
         }));
         config.flows.push(FlowConfig {
@@ -7951,6 +8031,7 @@ mod tests {
                 cbr_pad_to_kbps: None,
                 pid_overrides: None,
                 interface_binding: None,
+            egress_pacing: None,
             egress_buffer_ms: None,
         }));
         config.flows.push(FlowConfig {
@@ -9405,6 +9486,7 @@ mod tests {
                 cbr_pad_to_kbps: None,
                 pid_overrides: None,
                 interface_binding: None,
+            egress_pacing: None,
             egress_buffer_ms: None,
         }));
         config.outputs.push(OutputConfig::Udp(UdpOutputConfig {
@@ -9426,6 +9508,7 @@ mod tests {
                 cbr_pad_to_kbps: None,
                 pid_overrides: None,
                 interface_binding: None,
+            egress_pacing: None,
             egress_buffer_ms: None,
         }));
         let err = validate_config(&config).unwrap_err().to_string();

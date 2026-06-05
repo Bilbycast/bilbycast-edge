@@ -1112,6 +1112,14 @@ fn edge_capabilities() -> Vec<&'static str> {
         // knob + the de-jitter telemetry card on this so older edges hide
         // the surface. ST 2110 keeps strict raster/SO_TXTIME pacing.
         "egress_dejitter",
+        // Per-output egress pacing model: compressed UDP/RTP outputs accept
+        // `egress_pacing: forward | pcr | servo` (+ `egress_buffer_ms`
+        // cushion, servo-only) as plain config — fully manager-configurable,
+        // no env vars. Edges WITHOUT this bit silently ignore the field on
+        // config push (serde unknown-field tolerance), so the manager UI
+        // MUST gate the pacing dropdown on this capability to avoid the
+        // silent-no-op trap.
+        "egress_pacing",
         // Ingress de-jitter: raw UDP / RTP inputs run the ingress
         // counterpart to the egress servo — recover the source rate from
         // inter-PCR observations and release packets paced at that rate

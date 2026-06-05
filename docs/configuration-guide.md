@@ -1102,6 +1102,8 @@ Sends RTP-wrapped MPEG-TS packets to a unicast or multicast destination. Support
 | `dscp` | integer | No | `46` | DSCP value for QoS marking (RP 2129 C10). Range 0-63. Default 46 = Expedited Forwarding (RFC 4594). |
 | `program_number` | integer | No | `null` | MPTS → SPTS program filter. `null` = full MPTS passthrough; `Some(N)` = forward only program N as a rewritten single-program TS. Applied before FEC, so the receiver's FEC protects the filtered SPTS. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 | `delay` | object | No | `null` | Output delay for stream synchronization. Modes: `{"mode":"fixed","ms":N}` adds constant delay; `{"mode":"target_ms","ms":N}` targets end-to-end latency (self-adjusting); `{"mode":"target_frames","frames":N,"fallback_ms":M}` targets latency in video frames (auto-detected fps). |
+| `egress_pacing` | string | No | `"forward"` | Egress pacing model for the wire emitter: `"forward"` (default — emit at input cadence, no re-pacing; lowest latency, recommended), `"pcr"` (open-loop re-pacing at PCR-implied instants, for SMPTE 2022-7 dual-leg coherence / strict-T-STD receivers), `"servo"` (closed-loop release-rate servo for a genuinely bursty unpaced ingress). A bounded residence cap guards against latency runaway in every mode. Manager-configurable; UI gated on the `egress_pacing` capability. |
+| `egress_buffer_ms` | integer | No | `null` | Servo de-jitter cushion (ms of content). **Only valid with `egress_pacing: "servo"`** — rejected otherwise. Seeds and holds ~this much content in the egress queue, absorbing arrival jitter at the cost of that latency. Range 20-2000. `null` = no cushion (servo rate-trims only). |
 
 **Validation rules:**
 - `id` cannot be empty.
@@ -1109,6 +1111,7 @@ Sends RTP-wrapped MPEG-TS packets to a unicast or multicast destination. Support
 - `dscp` must be 0-63.
 - `program_number` must be `> 0` if set (program_number 0 is reserved for the NIT).
 - `delay`: `fixed` ms 0-10000; `target_ms` ms 1-10000; `target_frames` frames 0.01-300, fallback_ms 0-10000.
+- `egress_buffer_ms` requires `egress_pacing: "servo"` and must be 20-2000 ms.
 
 ### UDP Output
 
@@ -1135,6 +1138,8 @@ Sends raw MPEG-TS over UDP without RTP headers. Datagrams are TS-aligned (7×188
 | `dscp` | integer | No | `46` | DSCP value for QoS marking. Range 0-63. |
 | `program_number` | integer | No | `null` | MPTS → SPTS program filter. `null` = full MPTS passthrough; `Some(N)` = forward only program N as a rewritten single-program TS. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 | `delay` | object | No | `null` | Output delay for stream synchronization (same modes as RTP output). Incompatible with `transport_mode: "audio_302m"`. |
+| `egress_pacing` | string | No | `"forward"` | Egress pacing model for the wire emitter: `"forward"` (default — emit at input cadence, no re-pacing; lowest latency, recommended), `"pcr"` (open-loop re-pacing at PCR-implied instants, for SMPTE 2022-7 dual-leg coherence / strict-T-STD receivers), `"servo"` (closed-loop release-rate servo for a genuinely bursty unpaced ingress). A bounded residence cap guards against latency runaway in every mode. Manager-configurable; UI gated on the `egress_pacing` capability. |
+| `egress_buffer_ms` | integer | No | `null` | Servo de-jitter cushion (ms of content). **Only valid with `egress_pacing: "servo"`** — rejected otherwise. Seeds and holds ~this much content in the egress queue, absorbing arrival jitter at the cost of that latency. Range 20-2000. `null` = no cushion (servo rate-trims only). |
 
 **Validation rules:**
 - `id` cannot be empty.
@@ -1142,6 +1147,7 @@ Sends raw MPEG-TS over UDP without RTP headers. Datagrams are TS-aligned (7×188
 - `dscp` must be 0-63.
 - `program_number` must be `> 0` if set.
 - `delay`: same validation as RTP output. Incompatible with `transport_mode: "audio_302m"`.
+- `egress_buffer_ms` requires `egress_pacing: "servo"` and must be 20-2000 ms.
 
 ### SRT Output
 

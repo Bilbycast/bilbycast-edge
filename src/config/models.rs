@@ -2970,12 +2970,52 @@ pub struct RtpOutputConfig {
     /// Pin this output to a physical NIC. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
+    /// Egress pacing model for this compressed RTP output. See
+    /// [`EgressPacingMode`]. `None` → `forward` (emit at input cadence,
+    /// no re-pacing — the default every output should keep unless it has
+    /// a genuinely bursty unpaced ingress or a strict-T-STD receiver).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_pacing: Option<EgressPacingMode>,
     /// Egress de-jitter buffer setpoint (ms of content). See
-    /// [`UdpOutputConfig::egress_buffer_ms`] for full semantics. Tunes the
-    /// wire-emit release-rate servo + residence cap for this compressed RTP
-    /// output. `None` → env / 60 ms default; bounded 20–2000 ms.
+    /// [`UdpOutputConfig::egress_buffer_ms`] for full semantics. Only valid
+    /// with `egress_pacing: "servo"` (validation rejects it otherwise);
+    /// `None` → no cushion. Bounded 20–2000 ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_buffer_ms: Option<u32>,
+}
+
+/// Egress pacing model for compressed (MPEG-TS) UDP/RTP outputs — how
+/// `engine::wire_emit` times each datagram's release onto the wire.
+///
+/// - **`forward`** (default): emit at the input's own cadence — no edge
+///   re-pacing. The upstream (SRT/RIST TSBPD, `media_player` pacer, a clean
+///   encoder) has already paced the stream and the receiver re-clocks from
+///   PCR, so re-metering only adds latency and holds I-frame bursts
+///   (measured: receiver-buffer underrun → periodic freezing on a clean
+///   feed). Lowest latency; output PCR accuracy ≈ input PDV.
+/// - **`pcr`**: open-loop PCR-delta re-pacing — emit each packet at its
+///   PCR-implied wall instant. For 2022-7 dual-leg coherence or a
+///   strict-T-STD receiver that can't ride input burst cadence.
+/// - **`servo`**: closed-loop release-rate servo (leaky bucket at the
+///   recovered source rate, ±5 % authority). For a genuinely bursty raw-UDP
+///   ingress that nothing upstream has smoothed. Pair with
+///   `egress_buffer_ms` to seed a real de-jitter cushion (adds that much
+///   latency); without it the servo only rate-trims.
+///
+/// Protocol-paced outputs (SRT / RIST / RTMP / HLS / WebRTC) and ST 2110
+/// raster pacing are unaffected — this knob exists only where the wire
+/// emitter owns release timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressPacingMode {
+    /// Emit at input cadence (no re-pacing). The default.
+    #[default]
+    Forward,
+    /// Open-loop PCR-delta re-pacing.
+    Pcr,
+    /// Closed-loop release-rate servo (optionally cushioned via
+    /// `egress_buffer_ms`).
+    Servo,
 }
 
 /// Configurable output delay for stream synchronization.
@@ -3122,15 +3162,22 @@ pub struct UdpOutputConfig {
     /// Pin this UDP output to a physical NIC. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
-    /// Egress de-jitter buffer setpoint, in milliseconds of content. Tunes
-    /// the wire-emit release-rate servo for this compressed output: the servo
-    /// holds the internal queue centred on this fill, absorbing a source-rate-
-    /// vs-wallclock offset (or burst) as a ±5 % rate trim instead of letting
-    /// it integrate into latency, and a hard residence cap (≈4× this, min
-    /// 250 ms) sheds the backlog if a burst exceeds the servo's authority.
-    /// `None` → env (`BILBYCAST_EGRESS_BUFFER_MS`) / 60 ms default. Bounded
-    /// 20–2000 ms. Has no effect on protocol-paced outputs (the wire emitter
-    /// only runs on UDP/RTP). See `docs/egress-dejitter-design.md`.
+    /// Egress pacing model for this compressed UDP output. See
+    /// [`EgressPacingMode`]. `None` → `forward` (emit at input cadence,
+    /// no re-pacing — the default every output should keep unless it has
+    /// a genuinely bursty unpaced ingress or a strict-T-STD receiver).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_pacing: Option<EgressPacingMode>,
+    /// Egress de-jitter buffer setpoint, in milliseconds of content. Seeds
+    /// the wire-emit release-rate servo's cushion for this compressed output:
+    /// the servo holds the internal queue centred on this fill, absorbing a
+    /// source-rate-vs-wallclock offset (or burst) as a ±5 % rate trim instead
+    /// of letting it integrate into latency, and a hard residence cap (≈4×
+    /// this, min 1000 ms) sheds the backlog if a burst exceeds the servo's
+    /// authority. Only valid with `egress_pacing: "servo"` (validation
+    /// rejects it otherwise); `None` → no cushion. Bounded 20–2000 ms. Has
+    /// no effect on protocol-paced outputs (the wire emitter only runs on
+    /// UDP/RTP). See `docs/egress-dejitter-design.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_buffer_ms: Option<u32>,
 }
@@ -6097,6 +6144,7 @@ mod tests {
                         cbr_pad_to_kbps: None,
                         pid_overrides: None,
                         interface_binding: None,
+                egress_pacing: None,
                 egress_buffer_ms: None,
             })],
             flows: vec![FlowConfig {
@@ -6173,6 +6221,7 @@ mod tests {
                         cbr_pad_to_kbps: None,
                         pid_overrides: None,
                         interface_binding: None,
+                egress_pacing: None,
                 egress_buffer_ms: None,
             })],
             flows: vec![FlowConfig {

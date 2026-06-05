@@ -95,6 +95,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
+use crate::config::models::EgressPacingMode;
 use crate::stats::collector::OutputStatsAccumulator;
 
 /// 50 ms preroll on the first emit. Avoids the immediate send-cliff
@@ -361,10 +362,11 @@ pub struct DejitterConfig {
     pub authority_permille: u64,
     /// De-jitter buffer mode (OPT-IN): build + hold a `setpoint_ms` cushion so
     /// a bursty/jittery contribution is metered out smoothly. Engaged ONLY when
-    /// the operator explicitly sets a per-output `egress_buffer_ms` (or the env
-    /// override). When `false` (the default — `egress_buffer_ms` unset) the
-    /// servo keeps its legacy emit-on-arrival behaviour byte-for-byte, so the
-    /// default deploy carries zero regression risk and adds no latency. Set an
+    /// the operator explicitly sets a per-output `egress_buffer_ms` (manager-
+    /// configurable; validation requires `egress_pacing: "servo"`). When
+    /// `false` (the default — `egress_buffer_ms` unset) the servo keeps its
+    /// legacy emit-on-arrival behaviour byte-for-byte, so the default deploy
+    /// carries zero regression risk and adds no latency. Set an
     /// `egress_buffer_ms` to turn the output into a real de-jitter buffer that
     /// absorbs `~setpoint_ms` of arrival jitter (at the cost of that latency).
     pub seed_cushion: bool,
@@ -379,8 +381,9 @@ pub struct DejitterConfig {
     /// the (always-on) residence cap is the sole runaway bound. Open-loop is the
     /// tier-1 choice for PCR-disciplined / `ffmpeg -re`-class sources; the servo
     /// suits sources with a sustained source-vs-wallclock rate offset where the
-    /// cap would otherwise sawtooth-shed. Selected at construction from
-    /// `BILBYCAST_EGRESS_PACING=servo`. Ignored when `forward_cadence` is set.
+    /// cap would otherwise sawtooth-shed. Selected at construction from the
+    /// per-output `egress_pacing` config field (`"servo"`). Ignored when
+    /// `forward_cadence` is set.
     pub use_servo: bool,
     /// Forward at the INPUT's own cadence — emit each datagram as it arrives, no
     /// edge re-pacing (the residence cap still applies as a runaway backstop).
@@ -392,48 +395,36 @@ pub struct DejitterConfig {
     /// cadence → receiver-buffer under/overrun (the "freezes/pixelates every few
     /// seconds on a clean SRT feed" symptom). Forwarding preserves the source's
     /// own low-jitter timing (output PCR_AC ≈ input PDV) at the lowest latency.
-    /// `BILBYCAST_EGRESS_PACING=pcr` re-enables open-loop PCR-delta pacing (for
-    /// 2022-7 hitless coherence / strict T-STD), `=servo` the rate servo (for a
-    /// genuinely bursty raw-UDP ingress that nothing upstream has smoothed).
+    /// Per-output `egress_pacing: "pcr"` re-enables open-loop PCR-delta pacing
+    /// (for 2022-7 hitless coherence / strict T-STD), `"servo"` the rate servo
+    /// (for a genuinely bursty raw-UDP ingress that nothing upstream has
+    /// smoothed). Both are manager-configurable per output — no env vars.
     pub forward_cadence: bool,
 }
 
 impl DejitterConfig {
-    /// Default policy for compressed outputs: open-loop PCR-delta pacing with a
-    /// 1000 ms residence cap (drain back to ~32 datagrams) as the runaway bound.
-    /// Inside the receiver T-STD envelope and SRT/RIST receive-latency headroom.
-    /// `BILBYCAST_EGRESS_SERVO=1` swaps the pacer for the rate servo (60 ms
-    /// buffer, ±5 % authority) for sustained-drift sources.
-    #[cfg(test)] // test-only convenience wrapper; production paths call servo_with
+    /// Test-only convenience: the rate servo with no cushion (60 ms setpoint,
+    /// ±5 % authority, 1000 ms residence cap) — what production builds via
+    /// `lossless(EgressPacingMode::Servo, None)`.
+    #[cfg(test)] // test-only convenience wrapper; production paths call lossless
     pub fn servo() -> Self {
-        // Force the servo pacer on for the servo-specific tests, independent of
-        // the BILBYCAST_EGRESS_PACING env default (which production reads).
-        Self {
-            use_servo: true,
-            forward_cadence: false,
-            ..Self::servo_with(None)
-        }
+        Self::lossless(EgressPacingMode::Servo, None)
     }
 
-    /// As `servo` (the no-arg wrapper) but with an operator-supplied setpoint. Precedence
-    /// for the buffer setpoint: explicit per-output `egress_buffer_ms` config
-    /// > `BILBYCAST_EGRESS_BUFFER_MS` env > 60 ms default (all clamped to
-    /// [20, 2000] ms). The residence cap defaults to `max(4×setpoint, 1000)`
-    /// ms (overridable via `BILBYCAST_EGRESS_RESIDENCE_MS`) so a bigger
-    /// buffer gets proportionally more burst headroom before the hard shed.
-    pub fn servo_with(egress_buffer_ms: Option<u32>) -> Self {
+    /// Policy for compressed (`Lossless`) outputs, built from the per-output
+    /// manager-configurable config: `egress_pacing` selects the pacing model
+    /// (forward / pcr / servo — see [`EgressPacingMode`]) and
+    /// `egress_buffer_ms` seeds the servo's de-jitter cushion (validation
+    /// guarantees it is only set in servo mode; clamped to [20, 2000] ms,
+    /// 60 ms servo setpoint when unset). The residence cap is
+    /// `max(4×setpoint, 1000)` ms so a bigger buffer gets proportionally
+    /// more burst headroom before the hard shed.
+    pub fn lossless(mode: EgressPacingMode, egress_buffer_ms: Option<u32>) -> Self {
         // De-jitter (cushion) is OPT-IN: only when the operator explicitly set
-        // a per-output egress_buffer_ms or the env override. Unset → legacy
-        // emit-on-arrival servo (no cushion, no added latency, no regression).
-        let env_buf = std::env::var("BILBYCAST_EGRESS_BUFFER_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok());
-        let seed_cushion = egress_buffer_ms.is_some() || env_buf.is_some();
-        let setpoint_ms = egress_buffer_ms
-            .map(|m| m as u64)
-            .or(env_buf)
-            .unwrap_or(60)
-            .clamp(20, 2000);
+        // a per-output egress_buffer_ms. Unset → legacy emit-on-arrival servo
+        // (no cushion, no added latency, no regression).
+        let seed_cushion = egress_buffer_ms.is_some();
+        let setpoint_ms = egress_buffer_ms.map(|m| m as u64).unwrap_or(60).clamp(20, 2000);
         // The residence cap is the LAST-RESORT runaway bound, NOT a normal-
         // operation shedder. It must clear (a) the servo's own
         // MAX_FUTURE_LOOKAHEAD_NS (200 ms) hold and (b) the realistic
@@ -447,23 +438,17 @@ impl DejitterConfig {
         // window. Pacing rate-/PCR-tracking (not this cap) prevents the 47 s
         // runaway, so a generous cap costs nothing at steady state (residence
         // stays near 0) and only bounds a genuine sustained drift.
-        let cap_ms = std::env::var("BILBYCAST_EGRESS_RESIDENCE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or_else(|| (setpoint_ms.saturating_mul(4)).max(1_000))
-            .clamp(setpoint_ms.saturating_add(40), 5_000);
-        // Pacing model — `BILBYCAST_EGRESS_PACING`:
-        //   unset / "forward" (DEFAULT) → forward at input cadence (no re-pace);
-        //   "pcr"   → open-loop PCR-delta (tier-1 PCR_AC; for 2022-7 / strict);
-        //   "servo" → rate leaky-bucket (for a bursty raw-UDP ingress).
+        let cap_ms =
+            (setpoint_ms.saturating_mul(4)).max(1_000).clamp(setpoint_ms.saturating_add(40), 5_000);
+        // Pacing model — per-output `egress_pacing` (manager-configurable):
+        //   forward (DEFAULT) → forward at input cadence (no re-pace);
+        //   pcr   → open-loop PCR-delta (tier-1 PCR_AC; for 2022-7 / strict);
+        //   servo → rate leaky-bucket (for a bursty raw-UDP ingress).
         // The residence cap above is active in ALL modes (gated on `enabled`).
-        let pacing = std::env::var("BILBYCAST_EGRESS_PACING")
-            .map(|v| v.to_ascii_lowercase())
-            .unwrap_or_default();
-        let (forward_cadence, use_servo) = match pacing.as_str() {
-            "pcr" | "openloop" | "open-loop" => (false, false),
-            "servo" | "rate" => (false, true),
-            _ => (true, false), // "forward" / unset / unknown → forward cadence
+        let (forward_cadence, use_servo) = match mode {
+            EgressPacingMode::Forward => (true, false),
+            EgressPacingMode::Pcr => (false, false),
+            EgressPacingMode::Servo => (false, true),
         };
         Self {
             enabled: true,
@@ -568,6 +553,7 @@ pub fn spawn_wire_emitter(
     dest: SocketAddr,
     anchor: AnchorSource,
     pacing: WirePacingClass,
+    egress_pacing: EgressPacingMode,
     egress_buffer_ms: Option<u32>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
@@ -714,34 +700,38 @@ pub fn spawn_wire_emitter(
     // multiple wire-emit threads on the same edge spread across the
     // dedicated cores instead of stacking onto one.
     let cpu_index = next_wire_emit_cpu_index();
-    // Compressed (Lossless) egress runs a CLOSED-LOOP bounded pacer by default.
+    // Compressed (Lossless) egress pacing — per-output, manager-configurable
+    // via `egress_pacing` (+ `egress_buffer_ms` cushion in servo mode):
     //
-    // Open-loop PCR-delta pacing (the prior default) has NO term comparing the
-    // internal wire-queue fill or the wallclock drain rate, so any sub-% source-
-    // rate-vs-CLOCK_TAI offset, `ffmpeg -re` overrun, SRT jitter-buffer dump,
-    // file-loop PCR-handoff drift, or encoder burst integrates into this thread's
-    // input channel with nothing correcting it — a MEASURED output-latency
-    // runaway to 1–2 s+ on BOTH file (media_player) and live (SRT) inputs
-    // (2026-06-04). The receiver's T-STD/VBX buffer then over/underflows →
-    // pixelation + pausing on consumer players (VLC) and lighter STBs.
-    //
-    // The release-rate servo replaces that open-loop integration with a leaky-
-    // bucket release trimmed ±authority by the buffer-fill error, holding
-    // residence near `setpoint_ms` (~60 ms) — a steady source offset is absorbed
-    // as a steady, tiny rate trim with NO accumulation and NO loss. With
-    // `egress_buffer_ms` UNSET (the default) `seed_cushion=false`: cold-start
-    // emits ASAP (no added startup latency) and there is no hold-release gap —
-    // only the gentle rate trim, ~0 at steady state. Setting `egress_buffer_ms`
-    // (or BILBYCAST_EGRESS_BUFFER_MS) additionally seeds a jitter-absorption
-    // cushion for genuinely bursty INGRESS, at the cost of that latency.
+    //   forward (DEFAULT) → emit at input cadence, no re-pacing. The upstream
+    //     already paced the stream and the receiver re-clocks from PCR;
+    //     re-metering holds I-frame bursts → GOP-cadence latency swing →
+    //     receiver underrun (the diagnosed "freezes every few seconds on a
+    //     clean SRT feed", 2026-06-05).
+    //   pcr → open-loop PCR-delta. Emits at PCR-implied wall instants, but has
+    //     NO term comparing the internal wire-queue fill or the wallclock
+    //     drain rate, so any sub-% source-rate-vs-CLOCK_TAI offset, `ffmpeg
+    //     -re` overrun, SRT jitter-buffer dump, file-loop PCR-handoff drift,
+    //     or encoder burst would integrate into this thread's input channel —
+    //     a MEASURED output-latency runaway to 1–2 s+ on BOTH file
+    //     (media_player) and live (SRT) inputs (2026-06-04) → receiver T-STD
+    //     over/underflow → pixelation + pausing on consumer players (VLC).
+    //     The (always-on) residence cap is the runaway bound here.
+    //   servo → leaky-bucket release trimmed ±authority by the buffer-fill
+    //     error, holding residence near `setpoint_ms` — a steady source
+    //     offset is absorbed as a steady, tiny rate trim with NO accumulation
+    //     and NO loss. With `egress_buffer_ms` UNSET `seed_cushion=false`:
+    //     cold-start emits ASAP and there is no hold-release gap — only the
+    //     gentle rate trim. Setting `egress_buffer_ms` additionally seeds a
+    //     jitter-absorption cushion for genuinely bursty INGRESS, at the cost
+    //     of that latency.
     //
     // ST 2110 / MXL (`EtfEligible`, `St2110Raster` anchor) keep strict
     // isochronous raster + SO_TXTIME pacing — that IS their clock — and NEVER
-    // take the servo, by construction (this gate is Lossless-only and the raster
-    // anchor bypasses `derive_target` entirely).
-    let want_egress_servo = matches!(pacing, WirePacingClass::Lossless);
-    let dejitter = if want_egress_servo {
-        DejitterConfig::servo_with(egress_buffer_ms)
+    // take any of these models, by construction (this gate is Lossless-only
+    // and the raster anchor bypasses `derive_target` entirely).
+    let dejitter = if matches!(pacing, WirePacingClass::Lossless) {
+        DejitterConfig::lossless(egress_pacing, egress_buffer_ms)
     } else {
         DejitterConfig::disabled()
     };
@@ -1109,7 +1099,7 @@ impl TargetState {
     ) -> u64 {
         // Pacing model (the residence cap in `run_emitter` is active whenever
         // `cfg.enabled`, independent of this choice):
-        //   • `use_servo` (opt-in, BILBYCAST_EGRESS_SERVO=1) → the closed-loop
+        //   • `use_servo` (opt-in, per-output `egress_pacing: "servo"`) → the closed-loop
         //     rate leaky bucket: smooth UNIFORM-RATE release holding residence
         //     near `setpoint_ms`. Bounds latency on a sustained source-vs-
         //     wallclock offset with NO drift-shed, but smooths *rate* not *PCR
@@ -2058,6 +2048,7 @@ mod tests {
             dest,
             AnchorSource::Pcr,
             WirePacingClass::Lossless,
+            EgressPacingMode::Forward,
             None,
             stats.clone(),
             cancel.clone(),
@@ -2111,6 +2102,7 @@ mod tests {
             dest,
             AnchorSource::St2110Raster,
             WirePacingClass::EtfEligible,
+            EgressPacingMode::Forward,
             None,
             stats.clone(),
             cancel.clone(),
@@ -2303,19 +2295,18 @@ mod tests {
         // bound, not a normal-operation shedder).
         assert_eq!(DejitterConfig::servo().shed_residence_us(), 1_000_000);
         // Default pacer is FORWARD-cadence (no re-pacing; receiver re-clocks);
-        // open-loop PCR-delta and the rate servo are both opt-in via
-        // BILBYCAST_EGRESS_PACING.
-        let def = DejitterConfig::servo_with(None);
+        // open-loop PCR-delta and the rate servo are both opt-in via the
+        // per-output `egress_pacing` config field.
+        let def = DejitterConfig::lossless(EgressPacingMode::default(), None);
         assert!(def.forward_cadence, "compressed default = forward cadence");
         assert!(!def.use_servo);
+        let pcr = DejitterConfig::lossless(EgressPacingMode::Pcr, None);
+        assert!(!pcr.forward_cadence && !pcr.use_servo, "pcr = open-loop");
         assert!(DejitterConfig::servo().use_servo, "test helper forces servo on");
         assert!(!DejitterConfig::servo().forward_cadence, "servo helper not forward");
         // Forward mode dispatches to emit-now (no re-pace), regardless of PCR.
         let mut s = warmed_servo_state(6_000_000, 1_000_000_000);
-        let fwd = DejitterConfig {
-            forward_cadence: true,
-            ..DejitterConfig::servo_with(None)
-        };
+        let fwd = DejitterConfig::lossless(EgressPacingMode::Forward, None);
         assert_eq!(
             s.derive_target_paced(2_000_000_000, Some(900_000), 1316, 50, &fwd),
             2_000_000_000,
@@ -2403,7 +2394,7 @@ mod tests {
 
     #[test]
     fn servo_cold_start_seeds_cushion_and_drain_floors() {
-        let cfg = DejitterConfig::servo_with(Some(60)); // de-jitter mode, 60 ms
+        let cfg = DejitterConfig::lossless(EgressPacingMode::Servo, Some(60)); // de-jitter mode, 60 ms
         let cushion_ns = 60_000_000u64;
         // Cold start → BUILD the cushion: hold the first datagram one setpoint
         // into the future so a bursty source's arrival jitter is absorbed.
@@ -2430,7 +2421,7 @@ mod tests {
         // NOT collapse to `now`, which dumped the de-jitter buffer at every
         // loop seam in the old code (the steady-state jitter the user saw).
         // The rate is preserved; only the rate MEASUREMENT re-anchors.
-        let cfg = DejitterConfig::servo_with(Some(60));
+        let cfg = DejitterConfig::lossless(EgressPacingMode::Servo, Some(60));
         let now = 2_000_000_000u64;
         // Steady state: cursor held one cushion (60 ms) ahead of now.
         let mut s = warmed_servo_state(6_000_000, now + 60_000_000);
@@ -2448,7 +2439,7 @@ mod tests {
         // out into the future cushion paced to the recovered rate, NOT dumped
         // at `now`. That is what turns ~130 ms input jitter into a smooth
         // output.
-        let cfg = DejitterConfig::servo_with(Some(60));
+        let cfg = DejitterConfig::lossless(EgressPacingMode::Servo, Some(60));
         let bytes = 1316usize;
         let now = 1_000_000_000u64;
         let mut s = TargetState::default();
@@ -2494,7 +2485,7 @@ mod tests {
         );
         assert_eq!(s.observed_rate_bps, 6_000_000, "rate preserved across seam");
         // Opt-in path flips the flag.
-        assert!(DejitterConfig::servo_with(Some(120)).seed_cushion);
+        assert!(DejitterConfig::lossless(EgressPacingMode::Servo, Some(120)).seed_cushion);
     }
 
     #[test]
@@ -2503,7 +2494,7 @@ mod tests {
         // sustained source overrun walks the clock_nanosleep wake time
         // arbitrarily far ahead, parking datagrams in the queue. Cursor
         // parked 10 s in the future → next target must clamp to now+lookahead.
-        let cfg = DejitterConfig::servo_with(Some(60));
+        let cfg = DejitterConfig::lossless(EgressPacingMode::Servo, Some(60));
         let now = 1_000_000_000u64;
         let mut s = warmed_servo_state(6_000_000, now + 10_000_000_000);
         let t = s.derive_target_servo(now, None, 1316, 34, &cfg);

@@ -46,9 +46,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::{
-    St2110VideoInputConfig, St2110VideoOutputConfig, St2110VideoPixelFormat, St2110_21ProfileConfig,
-    St2110_23InputConfig, St2110_23OutputConfig, St2110_23PartitionModeConfig, VideoEncodeConfig,
-    WirePacingConfig,
+    EgressPacingMode, St2110VideoInputConfig, St2110VideoOutputConfig, St2110VideoPixelFormat,
+    St2110_21ProfileConfig, St2110_23InputConfig, St2110_23OutputConfig,
+    St2110_23PartitionModeConfig, VideoEncodeConfig, WirePacingConfig,
 };
 use crate::engine::packet::RtpPacket;
 use crate::engine::rtmp::ts_mux::TsMuxer;
@@ -804,6 +804,7 @@ pub async fn run_st2110_20_output(
         dest_red,
         AnchorSource::St2110Raster,
         WirePacingClass::EtfEligible,
+        EgressPacingMode::Forward,
         None,
         stats.clone(),
         cancel.clone(),
@@ -827,6 +828,7 @@ pub async fn run_st2110_20_output(
                 addr,
                 AnchorSource::St2110Raster,
                 WirePacingClass::EtfEligible,
+                EgressPacingMode::Forward,
                 None,
                 leg2_stats,
                 cancel.clone(),
@@ -1242,6 +1244,7 @@ pub async fn run_st2110_23_output(
             red_addr,
             AnchorSource::St2110Raster,
             WirePacingClass::EtfEligible,
+            EgressPacingMode::Forward,
             None,
             stats.clone(),
             cancel.clone(),
@@ -1272,6 +1275,7 @@ pub async fn run_st2110_23_output(
                     blue_addr,
                     AnchorSource::St2110Raster,
                     WirePacingClass::EtfEligible,
+                    EgressPacingMode::Forward,
                     None,
                     leg2_stats,
                     cancel.clone(),
