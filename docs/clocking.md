@@ -178,6 +178,25 @@ This matches the existing pre-rewriter behaviour for the safe path,
 and unlocks the master-clock anchor path for the genuinely
 clock-coherent configurations where it improves output quality.
 
+**Which PIDs are rewritten.** Every PES-bearing ES learned from the
+PMT — audio, video, AND other PES carriers (DVB teletext, DVB
+subtitles, KLV metadata, ST 2038 ANC, DSM-CC PES). Once the PCR has
+been re-anchored to the master clock, *any* PES timestamp left in the
+source timebase is dead on arrival downstream, so partial coverage is
+not an option. Roles are resolved from the PMT `stream_type` **plus
+the ES-info descriptor loop** (`ts_parse::descriptor_audio_kind`):
+DVB-style audio carried as `stream_type 0x06` + AC-3 (0x6A) /
+E-AC-3 (0x7A) / AAC (0x7C) / DTS (0x7B) / registration descriptor is
+classified **audio** and receives the lipsync trim, exactly like its
+ATSC (0x81/0x87) siblings; a 0x06 ES without an audio descriptor
+(teletext, subtitles, KLV) is re-anchored without lipsync.
+Section-carrying stream types (0x05 private sections, 0x0A–0x0D
+DSM-CC, 0x86 SCTE-35) are never PES-rewritten — SCTE-35 timing is
+handled by the dedicated `pts_adjustment` rewrite. Before 2026-06-05
+only bare-`stream_type` audio/video was rewritten, which left
+DVB-0x06 AC-3 PES at source PTS hours away from the regenerated PCR —
+silent audio on every compliant receiver (the "Network TEN" bug).
+
 ## Module map
 
 | Module | What it does |

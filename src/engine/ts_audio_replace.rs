@@ -1818,42 +1818,38 @@ fn source_replaceable(stream_type: u8) -> bool {
 ///   broadcast carriage form; ATSC ADTS-via-private is vanishingly
 ///   rare so we default to LATM and let `split_audio_codec_frames`
 ///   dispatch through the LOAS path)
-/// - `registration_descriptor` (tag `0x05`) with `format_identifier`:
-///   - `"AC-3"` → `0x81`
-///   - `"EAC3"` → `0x87`
+/// - `registration_descriptor` (tag `0x05`) with `format_identifier`
+///   `"AC-3"` / `"EAC3"`
 ///
-/// Returns `None` for any other private stream (Opus, AC-4, DTS, …) —
-/// the caller keeps the raw `0x06` and downstream paths handle it
-/// (Opus has its own arm in [`crate::engine::audio_decode::ff_codec_for_stream_type`];
-/// AC-4 / DTS fall through to passthrough). DVB AC-3 carriage and the
-/// ATSC equivalent thus collapse onto one code path — operators see
-/// the same transcoding behaviour whether the source comes from
-/// Europe / Australia (DVB) or North America (ATSC).
+/// Returns `None` for any other private stream (Opus, AC-4, DTS,
+/// SMPTE 302M, …) — the caller keeps the raw `0x06` and downstream
+/// paths handle it (Opus has its own arm in
+/// [`crate::engine::audio_decode::ff_codec_for_stream_type`]; AC-4 /
+/// DTS fall through to passthrough). The replacer must only be handed
+/// codecs it can actually decode, which is why the broader kinds the
+/// shared classifier recognises are deliberately collapsed to `None`
+/// here. DVB AC-3 carriage and the ATSC equivalent thus collapse onto
+/// one code path — operators see the same transcoding behaviour
+/// whether the source comes from Europe / Australia (DVB) or North
+/// America (ATSC).
+///
+/// Descriptor walking itself is the shared
+/// [`crate::engine::ts_parse::descriptor_audio_kind`] — the same logic
+/// that drives muxer-mode PES re-anchoring (`ts_pts_rewriter`), the
+/// singular `audio_pid` override binding, and the A/V drift metric, so
+/// all four surfaces agree on what counts as DVB private audio.
 fn resolve_private_audio_stream_type(descriptors: &[u8]) -> Option<u8> {
-    let mut pos = 0;
-    while pos + 2 <= descriptors.len() {
-        let tag = descriptors[pos];
-        let len = descriptors[pos + 1] as usize;
-        if pos + 2 + len > descriptors.len() {
-            return None;
-        }
-        match tag {
-            0x6A => return Some(0x81),
-            0x7A => return Some(0x87),
-            0x7C => return Some(0x11),
-            0x05 if len >= 4 => {
-                let fmt = &descriptors[pos + 2..pos + 6];
-                match fmt {
-                    b"AC-3" => return Some(0x81),
-                    b"EAC3" => return Some(0x87),
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-        pos += 2 + len;
+    use crate::engine::ts_parse::{descriptor_audio_kind, PrivateEsAudioKind};
+    match descriptor_audio_kind(descriptors)? {
+        PrivateEsAudioKind::Ac3 => Some(0x81),
+        PrivateEsAudioKind::Eac3 => Some(0x87),
+        PrivateEsAudioKind::AacLatm => Some(0x11),
+        // Not decodable by the replacer — keep raw 0x06 / passthrough.
+        PrivateEsAudioKind::Dts
+        | PrivateEsAudioKind::Opus
+        | PrivateEsAudioKind::Smpte302m
+        | PrivateEsAudioKind::Ac4 => None,
     }
-    None
 }
 
 /// Parse the PMT for an audio stream. Returns `(audio_pid, stream_type)`.

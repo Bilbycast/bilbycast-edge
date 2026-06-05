@@ -64,8 +64,8 @@ use crate::config::models::{TsPidOverridesEntry, TsPidOverridesMap};
 
 use super::packet::RtpPacket;
 use super::ts_parse::{
-    mpeg2_crc32, parse_pat_programs, ts_has_adaptation, ts_pid, ts_pusi, PAT_PID, TS_PACKET_SIZE,
-    TS_SYNC_BYTE,
+    descriptor_audio_kind, descriptors_indicate_text_service, mpeg2_crc32, parse_pat_programs,
+    ts_has_adaptation, ts_pid, ts_pusi, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
 
 /// RTP fixed-header minimum size (no CSRCs, no extension). Mirrors the
@@ -280,9 +280,11 @@ impl TsPidOverridesRewriter {
         // overrides. Multi-audio programs walk the full audio list below.
         let mut first_video: Option<u16> = None;
         let mut first_audio: Option<u16> = None; // first UNAMBIGUOUS audio
-        let mut first_audio_fallback: Option<u16> = None; // first ambiguous (0x06)
+        // 0x06 (PES-private) fallbacks, descriptor-discriminated:
+        let mut first_descriptor_audio: Option<u16> = None; // 0x06 + audio descriptor
+        let mut first_bare_private: Option<u16> = None; // 0x06, no audio/text markers
         let mut all_audio_pids: Vec<u16> = Vec::new();
-        for (es_pid, stream_type) in streams.iter() {
+        for (es_pid, stream_type, es_info) in streams.iter() {
             if first_video.is_none() && is_video_stream_type(*stream_type) {
                 first_video = Some(*es_pid);
             }
@@ -292,19 +294,37 @@ impl TsPidOverridesRewriter {
                     if first_audio.is_none() {
                         first_audio = Some(*es_pid);
                     }
-                } else if first_audio_fallback.is_none() {
-                    first_audio_fallback = Some(*es_pid);
+                } else if descriptor_audio_kind(es_info).is_some() {
+                    // DVB-style audio: 0x06 + AC-3 (0x6A) / E-AC-3 (0x7A) /
+                    // AAC (0x7C) / DTS (0x7B) / registration descriptor.
+                    if first_descriptor_audio.is_none() {
+                        first_descriptor_audio = Some(*es_pid);
+                    }
+                } else if !descriptors_indicate_text_service(es_info)
+                    && first_bare_private.is_none()
+                {
+                    // Bare 0x06 with neither audio nor teletext/VBI/
+                    // subtitling descriptors — last-resort candidate.
+                    first_bare_private = Some(*es_pid);
                 }
             }
         }
-        // The singular `audio_pid` back-compat binds the FIRST audio PID. Prefer
-        // the first UNAMBIGUOUS audio (a real codec) over an ambiguous 0x06
-        // PES-private PID (usually DVB teletext that `is_audio_stream_type`
-        // conservatively accepts): on a teletext-before-audio program (e.g. SBS,
-        // PMT = 0x06 teletext, then MP2, then AAC) the singular would otherwise
-        // latch the teletext PID and the real audio would never be remapped. Fall
-        // back to a 0x06 PID only when there is no unambiguous audio at all.
-        let first_audio = first_audio.or(first_audio_fallback);
+        // The singular `audio_pid` back-compat binds the FIRST audio PID, in
+        // strict preference order:
+        //   1. first UNAMBIGUOUS audio stream_type (a real codec);
+        //   2. first 0x06 ES whose descriptor loop proves it is audio
+        //      (DVB AC-3 / E-AC-3 / AAC-LATM / DTS — e.g. the Network TEN
+        //      shape: 0x06+AC-3-descriptor audio next to a 0x06 teletext ES,
+        //      where PMT order alone cannot be trusted to land on the audio);
+        //   3. first bare 0x06 carrying no descriptors at all (legacy mux
+        //      that tags nothing — better to bind than to leave the operator
+        //      with no audio remap).
+        // A 0x06 ES whose descriptors mark teletext / VBI / DVB subtitling is
+        // NEVER bound — latching a teletext PID as "the audio" leaves the
+        // real audio un-remapped (silent on PID-pinned receivers).
+        let first_audio = first_audio
+            .or(first_descriptor_audio)
+            .or(first_bare_private);
         state.source_video_pid = first_video;
         state.source_audio_pid = first_audio;
 
@@ -411,8 +431,12 @@ impl TsPidOverridesRewriter {
 
 // ────────────────────────────── helpers ──────────────────────────────
 
-/// Walk PMT entries; returns (pcr_pid, [(es_pid, stream_type), ...]).
-fn parse_pmt_body(pkt: &[u8]) -> Option<(u16, Vec<(u16, u8)>)> {
+/// Walk PMT entries; returns `(pcr_pid, [(es_pid, stream_type,
+/// es_info_descriptors), ...])`. The descriptor bytes are copied out so
+/// the singular-`audio_pid` selection can discriminate DVB 0x06 audio
+/// (AC-3 / E-AC-3 / AAC-LATM by descriptor) from teletext / subtitling
+/// on the same stream_type. Cold path — runs only on PMT version bumps.
+fn parse_pmt_body(pkt: &[u8]) -> Option<(u16, Vec<(u16, u8, Vec<u8>)>)> {
     let mut offset = 4;
     if ts_has_adaptation(pkt) {
         let af_len = pkt[4] as usize;
@@ -442,7 +466,9 @@ fn parse_pmt_body(pkt: &[u8]) -> Option<(u16, Vec<(u16, u8)>)> {
         let st = pkt[pos];
         let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
         let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
-        streams.push((es_pid, st));
+        let es_info_end = (pos + 5 + es_info_len).min(data_end);
+        let es_info = pkt[pos + 5..es_info_end].to_vec();
+        streams.push((es_pid, st, es_info));
         pos += 5 + es_info_len;
     }
     Some((pcr_pid, streams))
@@ -951,6 +977,128 @@ mod tests {
             ts_pid(&out[..TS_PACKET_SIZE]),
             0x12E,
             "0x06 teletext must NOT be treated as the audio"
+        );
+    }
+
+    /// Like [`build_pmt_packet`] but with per-ES descriptor loops, so
+    /// tests can express DVB-style 0x06 programs (AC-3-by-descriptor
+    /// next to teletext-by-descriptor on the same stream_type).
+    fn build_pmt_packet_with_descs(
+        pmt_pid: u16,
+        streams: &[(u8, u16, &[u8])],
+        version: u8,
+    ) -> [u8; TS_PACKET_SIZE] {
+        let mut pkt = [0xFFu8; TS_PACKET_SIZE];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = 0x40 | (((pmt_pid >> 8) as u8) & 0x1F);
+        pkt[2] = (pmt_pid & 0xFF) as u8;
+        pkt[3] = 0x10;
+        pkt[4] = 0x00;
+        let es_bytes: usize = streams.iter().map(|(_, _, d)| 5 + d.len()).sum();
+        let section_length: u16 = (9 + es_bytes + 4) as u16;
+        let pcr_pid = streams.first().map(|(_, p, _)| *p).unwrap_or(0x1FFF);
+        pkt[5] = 0x02;
+        pkt[6] = 0xB0 | (((section_length >> 8) & 0x0F) as u8);
+        pkt[7] = (section_length & 0xFF) as u8;
+        pkt[8] = 0x00;
+        pkt[9] = 0x01;
+        pkt[10] = 0xC1 | ((version & 0x1F) << 1);
+        pkt[11] = 0x00;
+        pkt[12] = 0x00;
+        pkt[13] = 0xE0 | (((pcr_pid >> 8) as u8) & 0x1F);
+        pkt[14] = (pcr_pid & 0xFF) as u8;
+        pkt[15] = 0xF0;
+        pkt[16] = 0x00;
+        let mut pos = 17;
+        for (stream_type, es_pid, descs) in streams {
+            pkt[pos] = *stream_type;
+            pkt[pos + 1] = 0xE0 | (((es_pid >> 8) as u8) & 0x1F);
+            pkt[pos + 2] = (es_pid & 0xFF) as u8;
+            pkt[pos + 3] = 0xF0 | (((descs.len() >> 8) as u8) & 0x0F);
+            pkt[pos + 4] = (descs.len() & 0xFF) as u8;
+            pkt[pos + 5..pos + 5 + descs.len()].copy_from_slice(descs);
+            pos += 5 + descs.len();
+        }
+        let crc_section_end = 5 + 3 + section_length as usize;
+        let crc = mpeg2_crc32(&pkt[5..crc_section_end - 4]);
+        pkt[crc_section_end - 4] = (crc >> 24) as u8;
+        pkt[crc_section_end - 3] = (crc >> 16) as u8;
+        pkt[crc_section_end - 2] = (crc >> 8) as u8;
+        pkt[crc_section_end - 1] = crc as u8;
+        pkt
+    }
+
+    #[test]
+    fn singular_audio_pid_prefers_descriptor_audio_among_0x06() {
+        // Worst-case DVB shape: the program's ONLY audio is 0x06 +
+        // AC-3 descriptor, and a 0x06 teletext ES is listed FIRST in
+        // the PMT. PMT order alone would latch the teletext; the
+        // descriptor loop must override order and bind the AC-3.
+        let ttxt_descs: &[u8] = &[0x56, 0x05, b'e', b'n', b'g', 0x10, 0x01];
+        let ac3_descs: &[u8] = &[0x0A, 0x04, b'e', b'n', b'g', 0x00, 0x6A, 0x01, 0x44];
+        let pat = build_pat_packet(&[(1, 0x100)], 0);
+        let pmt = build_pmt_packet_with_descs(
+            0x100,
+            &[
+                (0x1B, 0x101, &[]),       // H.264 video
+                (0x06, 0x12E, ttxt_descs), // teletext — listed FIRST
+                (0x06, 0x289, ac3_descs),  // DVB AC-3 — the real audio
+            ],
+            0,
+        );
+        let mut overrides = TsPidOverridesMap::new();
+        overrides.insert(
+            1,
+            TsPidOverridesEntry { audio_pid: Some(0x201), ..Default::default() },
+        );
+        let mut rew = TsPidOverridesRewriter::new(&overrides);
+        let mut out = Vec::new();
+        rew.process(&pat, &mut out);
+        rew.process(&pmt, &mut out);
+        out.clear();
+        rew.process(&build_es_packet(0x289), &mut out);
+        assert_eq!(
+            ts_pid(&out[..TS_PACKET_SIZE]),
+            0x201,
+            "descriptor-confirmed AC-3-in-0x06 must bind the singular audio_pid"
+        );
+        out.clear();
+        rew.process(&build_es_packet(0x12E), &mut out);
+        assert_eq!(
+            ts_pid(&out[..TS_PACKET_SIZE]),
+            0x12E,
+            "teletext-marked 0x06 must NOT bind even though it precedes the audio"
+        );
+    }
+
+    #[test]
+    fn singular_audio_pid_never_binds_text_marked_0x06() {
+        // Program with video + teletext only (no audio at all). The
+        // singular audio_pid must bind NOTHING — a teletext PID
+        // masquerading as audio leaves PID-pinned receivers silent
+        // AND mislabels the PMT.
+        let ttxt_descs: &[u8] = &[0x56, 0x05, b'e', b'n', b'g', 0x10, 0x01];
+        let pat = build_pat_packet(&[(1, 0x100)], 0);
+        let pmt = build_pmt_packet_with_descs(
+            0x100,
+            &[(0x1B, 0x101, &[]), (0x06, 0x12E, ttxt_descs)],
+            0,
+        );
+        let mut overrides = TsPidOverridesMap::new();
+        overrides.insert(
+            1,
+            TsPidOverridesEntry { audio_pid: Some(0x201), ..Default::default() },
+        );
+        let mut rew = TsPidOverridesRewriter::new(&overrides);
+        let mut out = Vec::new();
+        rew.process(&pat, &mut out);
+        rew.process(&pmt, &mut out);
+        out.clear();
+        rew.process(&build_es_packet(0x12E), &mut out);
+        assert_eq!(
+            ts_pid(&out[..TS_PACKET_SIZE]),
+            0x12E,
+            "text-marked 0x06 must never be bound as the audio"
         );
     }
 

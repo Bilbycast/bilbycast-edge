@@ -110,9 +110,9 @@ use std::sync::Arc;
 
 use super::av_sync_mux::AvSyncPacer;
 use super::ts_parse::{
-    extract_pcr, extract_pes_dts, extract_pes_pts, mpeg2_crc32, parse_pat_programs,
-    set_discontinuity_indicator, ts_has_adaptation, ts_pid, ts_pusi, PAT_PID, TS_PACKET_SIZE,
-    TS_SYNC_BYTE,
+    descriptor_audio_kind, extract_pcr, extract_pes_dts, extract_pes_pts, mpeg2_crc32,
+    parse_pat_programs, set_discontinuity_indicator, ts_has_adaptation, ts_pid, ts_pusi, PAT_PID,
+    TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
 
 /// PCR pre-roll in 27 MHz ticks. Matches `av_sync_mux::PCR_PREROLL_27MHZ`.
@@ -145,25 +145,61 @@ const PSI_RR_MAX_27MHZ: u64 = 500 * 27_000;
 enum PidRole {
     Audio,
     Video,
-    Other,
+    /// PES-bearing ES that is neither audio nor video: teletext, DVB
+    /// subtitles, KLV metadata, ST 2038 ANC, DSM-CC PES, unresolved
+    /// private streams. PES PTS/DTS are re-anchored exactly like
+    /// audio/video — a PES timestamp left in the source timebase is
+    /// dead on arrival once PCR has been regenerated — but no lipsync
+    /// trim applies.
+    OtherPes,
+    /// Section-carrying ES (AIT / private sections, DSM-CC carousels,
+    /// SCTE-35 splice_info). Sections have no PES header, so a PES
+    /// rewrite is never attempted. SCTE-35 PTS references are handled
+    /// by the dedicated `pts_adjustment` path keyed off
+    /// `scte35_pids`.
+    Sections,
 }
 
-/// Classify an MPEG-TS `stream_type` into audio/video/other for the
-/// purpose of routing lipsync trim (audio PIDs only).
+/// Classify a PMT ES entry into a [`PidRole`] from its `stream_type`
+/// plus its ES-info descriptor loop.
 ///
 /// Per ISO/IEC 13818-1 Table 2-34, ATSC A/53, DVB EN 300 468, and
-/// SCTE 35. `0x06` (private/PES — often AC-3 with DVB descriptor
-/// 0x6A / E-AC-3 with 0x7A) falls through as `Other` because we don't
-/// parse ES descriptors here; the audio path handles this via the
-/// PMT-side `registration_descriptor` logic in `ts_audio_replace`.
-fn classify_stream_type(stream_type: u8) -> PidRole {
+/// SCTE 35. `stream_type = 0x06` (PES private data) is the DVB
+/// carriage convention for BOTH descriptor-tagged audio (AC-3 0x6A /
+/// E-AC-3 0x7A / AAC-LATM 0x7C / DTS 0x7B / registration ids) AND
+/// teletext / VBI / subtitling — the shared
+/// [`descriptor_audio_kind`] helper is the discriminator. A 0x06 ES
+/// with no recognised audio descriptor stays `OtherPes`: its PES
+/// timestamps are still re-anchored (teletext/subtitle PTS must follow
+/// the regenerated PCR) but it never receives the audio lipsync trim.
+///
+/// Every receiver-visible consequence of a wrong guess is bounded: an
+/// `OtherPes` PID that turns out to carry sections is protected by the
+/// PES start-code + PTS-flag guard in `extract_pes_pts` (a section
+/// payload never matches `00 00 01`), so the rewrite is a no-op.
+fn classify_es(stream_type: u8, es_info: &[u8]) -> PidRole {
     match stream_type {
         // Video
         0x01 | 0x02 | 0x10 | 0x1B | 0x20 | 0x21 | 0x24 | 0x42 | 0x52 | 0xD1 => PidRole::Video,
-        // Audio
-        0x03 | 0x04 | 0x0F | 0x11 | 0x1C | 0x80 | 0x81 | 0x82 | 0x83 | 0x84 | 0x85 | 0x86
-        | 0x87 | 0x88 | 0xC1 | 0xC2 => PidRole::Audio,
-        _ => PidRole::Other,
+        // Unambiguous audio. NOTE: 0x86 is deliberately NOT here — it
+        // is SCTE-35 splice_info (sections), not audio, despite living
+        // in the ATSC/SCTE private range.
+        0x03 | 0x04 | 0x0F | 0x11 | 0x1C | 0x80 | 0x81 | 0x82 | 0x83 | 0x84 | 0x85 | 0x87
+        | 0x88 | 0xC1 | 0xC2 => PidRole::Audio,
+        // PES private data — descriptor loop decides audio vs other.
+        0x06 => {
+            if descriptor_audio_kind(es_info).is_some() {
+                PidRole::Audio
+            } else {
+                PidRole::OtherPes
+            }
+        }
+        // Section-carrying types: 0x05 private sections (AIT, …),
+        // 0x0A–0x0D DSM-CC, 0x86 SCTE-35 splice_info.
+        0x05 | 0x0A..=0x0D | 0x86 => PidRole::Sections,
+        // Everything else: assume PES-bearing and re-anchor. The PES
+        // start-code guard makes this safe for exotic section streams.
+        _ => PidRole::OtherPes,
     }
 }
 
@@ -473,11 +509,22 @@ impl TsPtsRewriter {
                 }
             }
 
-            // Rewrite PES PTS/DTS on PUSI packets (only on classified
-            // audio/video PIDs after PMT is learned).
+            // Rewrite PES PTS/DTS on PUSI packets of every PES-bearing
+            // ES learned from the PMT — audio, video, AND other PES
+            // (teletext, DVB subtitles, KLV, …). Once PCR has been
+            // re-anchored to the master clock, ANY PES timestamp left
+            // in the source timebase is dead on arrival downstream;
+            // DVB-style AC-3-in-0x06 audio used to be skipped here
+            // (classified by bare stream_type), leaving output audio
+            // PTS hours away from the regenerated PCR == silent audio
+            // on every compliant receiver. Section-carrying PIDs
+            // (`Sections`) are excluded; unlearned PIDs pass through.
             if ts_pusi(pkt) {
-                let role = self.pid_role.get(&pid).copied().unwrap_or(PidRole::Other);
-                if matches!(role, PidRole::Audio | PidRole::Video) {
+                let role = self.pid_role.get(&pid).copied();
+                if matches!(
+                    role,
+                    Some(PidRole::Audio | PidRole::Video | PidRole::OtherPes)
+                ) {
                     if let Some(src_pts) = extract_pes_pts(pkt) {
                         if !rewritten {
                             buf.copy_from_slice(pkt);
@@ -486,7 +533,7 @@ impl TsPtsRewriter {
                         let (new_pts, new_dts) = self.rewrite_pes_values(
                             src_pts,
                             src_dts,
-                            matches!(role, PidRole::Audio),
+                            matches!(role, Some(PidRole::Audio)),
                         );
                         if write_pes_timestamps(&mut buf, new_pts, new_dts).is_some() {
                             rewritten = true;
@@ -910,8 +957,14 @@ impl TsPtsRewriter {
             let es_pid = (((pkt[pos + 1] & 0x1F) as u16) << 8) | (pkt[pos + 2] as u16);
             let es_info_length =
                 (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
+            // ES-info descriptor loop (clamped to the section bounds) —
+            // discriminates DVB 0x06 audio (AC-3/E-AC-3/AAC-LATM/DTS by
+            // descriptor) from teletext / subtitling on the same
+            // stream_type.
+            let es_info_end = (pos + 5 + es_info_length).min(data_end);
+            let es_info = &pkt[pos + 5..es_info_end];
             self.pid_role
-                .insert(es_pid, classify_stream_type(stream_type));
+                .insert(es_pid, classify_es(stream_type, es_info));
             // SCTE-35 splice-info PID: stream_type 0x86 (per SCTE 35 §6).
             // Track separately so the rewriter can adjust pts_adjustment
             // under muxer mode (otherwise splice events fire at the wrong
@@ -2142,6 +2195,218 @@ mod tests {
         assert!(
             r.mpts_passthrough_latch,
             "subsequent SPTS PAT must NOT unlatch — latch is one-way"
+        );
+    }
+
+    // ── DVB 0x06 private-ES classification (descriptor-aware) ─────────
+
+    /// PAT (program 1 → PMT 0x20) + PMT on PID 0x20 with PCR_PID 0x100
+    /// and an arbitrary ES list of `(stream_type, pid, descriptors)`.
+    fn build_psi_with_es(entries: &[(u8, u16, &[u8])]) -> Vec<u8> {
+        use crate::engine::ts_parse::mpeg2_crc32;
+        let pmt_pid: u16 = 0x20;
+
+        let mut pat = [0xFFu8; TS_PACKET_SIZE];
+        pat[0] = TS_SYNC_BYTE;
+        pat[1] = 0x40;
+        pat[2] = 0x00;
+        pat[3] = 0x10;
+        pat[4] = 0x00;
+        let section_length: usize = 5 + 4 + 4;
+        pat[5] = 0x00;
+        pat[6] = 0xB0 | (((section_length >> 8) as u8) & 0x0F);
+        pat[7] = (section_length & 0xFF) as u8;
+        pat[8] = 0x00;
+        pat[9] = 0x01;
+        pat[10] = 0xC1;
+        pat[11] = 0x00;
+        pat[12] = 0x00;
+        pat[13] = 0x00;
+        pat[14] = 0x01;
+        pat[15] = 0xE0 | (((pmt_pid >> 8) as u8) & 0x1F);
+        pat[16] = (pmt_pid & 0xFF) as u8;
+        let crc_end = 5 + 3 + section_length;
+        let crc = mpeg2_crc32(&pat[5..crc_end - 4]);
+        pat[crc_end - 4] = (crc >> 24) as u8;
+        pat[crc_end - 3] = (crc >> 16) as u8;
+        pat[crc_end - 2] = (crc >> 8) as u8;
+        pat[crc_end - 1] = crc as u8;
+
+        let es_bytes: usize = entries.iter().map(|(_, _, d)| 5 + d.len()).sum();
+        let body_len: usize = 9 + es_bytes + 4;
+        let mut pmt = [0xFFu8; TS_PACKET_SIZE];
+        pmt[0] = TS_SYNC_BYTE;
+        pmt[1] = 0x40 | (((pmt_pid >> 8) as u8) & 0x1F);
+        pmt[2] = (pmt_pid & 0xFF) as u8;
+        pmt[3] = 0x10;
+        pmt[4] = 0x00;
+        pmt[5] = 0x02;
+        pmt[6] = 0xB0 | (((body_len >> 8) as u8) & 0x0F);
+        pmt[7] = (body_len & 0xFF) as u8;
+        pmt[8] = 0x00;
+        pmt[9] = 0x01;
+        pmt[10] = 0xC1;
+        pmt[11] = 0x00;
+        pmt[12] = 0x00;
+        // PCR_PID = 0x100
+        pmt[13] = 0xE0 | (((0x100u16 >> 8) as u8) & 0x1F);
+        pmt[14] = 0x00;
+        pmt[15] = 0xF0;
+        pmt[16] = 0x00; // program_info_length = 0
+        let mut pos = 17;
+        for (st, pid, descs) in entries {
+            pmt[pos] = *st;
+            pmt[pos + 1] = 0xE0 | (((pid >> 8) as u8) & 0x1F);
+            pmt[pos + 2] = (pid & 0xFF) as u8;
+            pmt[pos + 3] = 0xF0 | (((descs.len() >> 8) as u8) & 0x0F);
+            pmt[pos + 4] = (descs.len() & 0xFF) as u8;
+            pmt[pos + 5..pos + 5 + descs.len()].copy_from_slice(descs);
+            pos += 5 + descs.len();
+        }
+        let pmt_crc_end = 5 + 3 + body_len;
+        let pmt_crc = mpeg2_crc32(&pmt[5..pmt_crc_end - 4]);
+        pmt[pmt_crc_end - 4] = (pmt_crc >> 24) as u8;
+        pmt[pmt_crc_end - 3] = (pmt_crc >> 16) as u8;
+        pmt[pmt_crc_end - 2] = (pmt_crc >> 8) as u8;
+        pmt[pmt_crc_end - 1] = pmt_crc as u8;
+
+        let mut out = Vec::with_capacity(2 * TS_PACKET_SIZE);
+        out.extend_from_slice(&pat);
+        out.extend_from_slice(&pmt);
+        out
+    }
+
+    /// The Network-TEN shape that produced silent audio in production:
+    /// H.264 video (0x1B) + AC-3 carried as DVB 0x06 + AC-3 descriptor
+    /// (0x6A) + teletext as a second 0x06 ES. ALL three PES streams
+    /// must be re-anchored coherently with the regenerated PCR, the
+    /// AC-3 PID must be classified Audio (lipsync trim applies), and
+    /// teletext must be re-anchored WITHOUT lipsync.
+    #[test]
+    fn dvb_ac3_in_0x06_and_teletext_pes_are_reanchored() {
+        const VIDEO_PID: u16 = 0x100;
+        const AC3_PID: u16 = 0x101;
+        const TTXT_PID: u16 = 0x102;
+        const LIPSYNC_90K: i64 = 9_000; // +100 ms trim to prove routing
+
+        let handle = MasterClockHandle::new(
+            Arc::new(WallclockMaster::new()),
+            MasterClockKind::Wallclock,
+        );
+        handle.set_lipsync_offset_90k(LIPSYNC_90K);
+        let mut r = TsPtsRewriter::new(Arc::new(AvSyncPacer::new(handle)));
+
+        let ac3_descs: &[u8] = &[0x0A, 0x04, b'e', b'n', b'g', 0x00, 0x6A, 0x01, 0x44];
+        let ttxt_descs: &[u8] = &[0x56, 0x05, b'e', b'n', b'g', 0x10, 0x01];
+        let psi = build_psi_with_es(&[
+            (0x1B, VIDEO_PID, &[]),
+            (0x06, AC3_PID, ac3_descs),
+            (0x06, TTXT_PID, ttxt_descs),
+        ]);
+        let mut buf = Vec::new();
+        r.process(&psi, &mut buf);
+
+        // Establish the anchor with a PCR on the PCR PID.
+        let src_pcr: u64 = 27_000_000; // 1 s in 27 MHz
+        let mut pcr_out = Vec::new();
+        r.process(&build_pcr_packet(VIDEO_PID, src_pcr), &mut pcr_out);
+        let out_pcr = extract_pcr(&pcr_out[..TS_PACKET_SIZE]).unwrap();
+
+        // One PES on each ES PID, all at the same source PTS.
+        let src_pts: u64 = src_pcr / 300 + 7_200; // PCR + 80 ms pre-roll
+        let mut outs = Vec::new();
+        for pid in [VIDEO_PID, AC3_PID, TTXT_PID] {
+            let mut out = Vec::new();
+            r.process(&build_pes_packet_pts_only(pid, src_pts), &mut out);
+            outs.push(extract_pes_pts(&out[..TS_PACKET_SIZE]).expect("PES PTS present"));
+        }
+        let (video_pts, ac3_pts, ttxt_pts) = (outs[0], outs[1], outs[2]);
+
+        // All three must be re-anchored: source value never survives
+        // (the wallclock anchor is far from the 1 s source timeline).
+        for (label, v) in [("video", video_pts), ("ac3", ac3_pts), ("ttxt", ttxt_pts)] {
+            assert_ne!(v, src_pts, "{label} PES PTS must be rewritten");
+        }
+
+        // Video + teletext re-anchor with PCR coherence: out_pts −
+        // out_pcr == src_pts − src_pcr (±1 tick of 90 kHz flooring).
+        let expected_no_lipsync =
+            (out_pcr / 300 + (src_pts - src_pcr / 300)) as i64;
+        for (label, v) in [("video", video_pts), ("ttxt", ttxt_pts)] {
+            let err = (v as i64 - expected_no_lipsync).abs();
+            assert!(
+                err <= 1,
+                "{label} PES PTS must track the regenerated PCR \
+                 (got {v}, expected ≈{expected_no_lipsync})"
+            );
+        }
+
+        // The AC-3-in-0x06 PID is AUDIO: same anchor plus lipsync trim.
+        let err = (ac3_pts as i64 - (expected_no_lipsync + LIPSYNC_90K)).abs();
+        assert!(
+            err <= 1,
+            "AC-3-in-0x06 must be classified audio and receive the \
+             lipsync trim (got {ac3_pts}, expected ≈{})",
+            expected_no_lipsync + LIPSYNC_90K
+        );
+    }
+
+    /// A bare 0x06 ES with no recognisable descriptors (KLV metadata,
+    /// proprietary data) is still PES — its PTS must be re-anchored
+    /// (no lipsync), never left in the source timebase.
+    #[test]
+    fn bare_0x06_pes_is_reanchored_without_lipsync() {
+        const VIDEO_PID: u16 = 0x100;
+        const KLV_PID: u16 = 0x103;
+
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let psi = build_psi_with_es(&[(0x1B, VIDEO_PID, &[]), (0x06, KLV_PID, &[])]);
+        let mut buf = Vec::new();
+        r.process(&psi, &mut buf);
+
+        let src_pcr: u64 = 27_000_000;
+        let mut pcr_out = Vec::new();
+        r.process(&build_pcr_packet(VIDEO_PID, src_pcr), &mut pcr_out);
+        let out_pcr = extract_pcr(&pcr_out[..TS_PACKET_SIZE]).unwrap();
+
+        let src_pts: u64 = src_pcr / 300 + 7_200;
+        let mut out = Vec::new();
+        r.process(&build_pes_packet_pts_only(KLV_PID, src_pts), &mut out);
+        let klv_pts = extract_pes_pts(&out[..TS_PACKET_SIZE]).expect("PES PTS present");
+
+        assert_ne!(klv_pts, src_pts, "bare 0x06 PES PTS must be rewritten");
+        let expected = (out_pcr / 300 + (src_pts - src_pcr / 300)) as i64;
+        assert!(
+            (klv_pts as i64 - expected).abs() <= 1,
+            "bare 0x06 PES must track the regenerated PCR"
+        );
+    }
+
+    /// Section-carrying stream types (0x05 private sections / AIT) are
+    /// never PES-rewritten even if a packet on that PID happens to
+    /// parse as PES — the role gate excludes them entirely.
+    #[test]
+    fn section_stream_types_never_pes_rewritten() {
+        const VIDEO_PID: u16 = 0x100;
+        const AIT_PID: u16 = 0x104;
+
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let psi = build_psi_with_es(&[(0x1B, VIDEO_PID, &[]), (0x05, AIT_PID, &[])]);
+        let mut buf = Vec::new();
+        r.process(&psi, &mut buf);
+
+        let mut pcr_out = Vec::new();
+        r.process(&build_pcr_packet(VIDEO_PID, 27_000_000), &mut pcr_out);
+
+        // Contrived: a PES-shaped packet on the sections PID. The role
+        // gate (Sections) must pass it through byte-identical.
+        let pes = build_pes_packet_pts_only(AIT_PID, 123_456);
+        let mut out = Vec::new();
+        r.process(&pes, &mut out);
+        assert_eq!(
+            &out[..TS_PACKET_SIZE],
+            &pes[..],
+            "sections PID must pass through unchanged"
         );
     }
 }

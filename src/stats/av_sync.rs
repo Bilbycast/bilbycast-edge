@@ -124,16 +124,32 @@ impl AvSyncDriftSampler {
                 if let Some(streams) = parse_pmt_streams(pkt) {
                     let mut new_video: Option<u16> = None;
                     let mut new_audio: Option<u16> = None;
-                    let mut fallback_audio: Option<u16> = None;
-                    for (es_pid, stream_type) in streams {
+                    // 0x06 fallbacks, descriptor-discriminated: prefer a
+                    // descriptor-confirmed audio ES (DVB AC-3 0x6A /
+                    // E-AC-3 0x7A / AAC 0x7C / DTS 0x7B / registration),
+                    // then a bare undescribed 0x06; NEVER a teletext /
+                    // VBI / subtitling-marked ES (locking onto teletext
+                    // as "audio" means the drift metric never sees a
+                    // real audio PTS).
+                    let mut descriptor_audio: Option<u16> = None;
+                    let mut bare_private: Option<u16> = None;
+                    for (es_pid, stream_type, es_info) in streams {
                         if new_video.is_none() && is_video_stream_type(stream_type) {
                             new_video = Some(es_pid);
                         }
                         if new_audio.is_none() {
                             if is_unambiguous_audio_stream_type(stream_type) {
                                 new_audio = Some(es_pid);
-                            } else if fallback_audio.is_none() && stream_type == 0x06 {
-                                fallback_audio = Some(es_pid);
+                            } else if stream_type == 0x06 {
+                                if ts_parse::descriptor_audio_kind(&es_info).is_some() {
+                                    if descriptor_audio.is_none() {
+                                        descriptor_audio = Some(es_pid);
+                                    }
+                                } else if bare_private.is_none()
+                                    && !ts_parse::descriptors_indicate_text_service(&es_info)
+                                {
+                                    bare_private = Some(es_pid);
+                                }
                             }
                         }
                         if new_video.is_some() && new_audio.is_some() {
@@ -141,7 +157,7 @@ impl AvSyncDriftSampler {
                         }
                     }
                     if new_audio.is_none() {
-                        new_audio = fallback_audio;
+                        new_audio = descriptor_audio.or(bare_private);
                     }
                     if state.video_pid != new_video {
                         state.video_pid = new_video;
@@ -308,7 +324,11 @@ fn psi_version(pkt: &[u8]) -> Option<u8> {
 }
 
 /// Walk a PMT section to extract `(es_pid, stream_type)` pairs.
-fn parse_pmt_streams(pkt: &[u8]) -> Option<Vec<(u16, u8)>> {
+/// Walk PMT ES entries; returns `(es_pid, stream_type, es_info)` with
+/// the descriptor bytes copied out so the audio-PID pick can
+/// discriminate DVB 0x06 audio from teletext / subtitling. Cold path —
+/// runs only on PMT version bumps.
+fn parse_pmt_streams(pkt: &[u8]) -> Option<Vec<(u16, u8, Vec<u8>)>> {
     let mut offset = 4usize;
     if ts_parse::ts_has_adaptation(pkt) {
         let af_len = pkt[4] as usize;
@@ -338,7 +358,9 @@ fn parse_pmt_streams(pkt: &[u8]) -> Option<Vec<(u16, u8)>> {
         let st = pkt[pos];
         let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
         let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
-        streams.push((es_pid, st));
+        let es_info_end = (pos + 5 + es_info_len).min(data_end);
+        let es_info = pkt[pos + 5..es_info_end].to_vec();
+        streams.push((es_pid, st, es_info));
         pos += 5 + es_info_len;
     }
     Some(streams)
@@ -655,6 +677,84 @@ mod tests {
         let snap = s.snapshot().unwrap();
         assert_eq!(snap.audio_pid, audio_pid);
         assert_eq!(snap.avg_ms, 10);
+    }
+
+    /// PMT with explicit ES-info descriptor loops: video (0x1B) +
+    /// teletext-marked 0x06 (descriptor 0x56) + AC-3-marked 0x06
+    /// (descriptor 0x6A). The Network-TEN shape.
+    fn build_pmt_dvb_ac3_with_ttxt(
+        pmt_pid: u16,
+        version: u8,
+        ttx_pid: u16,
+        video_pid: u16,
+        ac3_pid: u16,
+    ) -> [u8; TS] {
+        let ttx_descs: [u8; 7] = [0x56, 0x05, b'e', b'n', b'g', 0x10, 0x01];
+        let ac3_descs: [u8; 3] = [0x6A, 0x01, 0x44];
+        let mut pkt = [0xFFu8; TS];
+        pkt[0] = 0x47;
+        pkt[1] = 0x40 | ((pmt_pid >> 8) as u8 & 0x1F);
+        pkt[2] = (pmt_pid & 0xFF) as u8;
+        pkt[3] = 0x10;
+        pkt[4] = 0x00;
+        pkt[5] = 0x02;
+        pkt[6] = 0xB0;
+        // section_length: 5 + 4 + (5+0) + (5+7) + (5+3) + 4 = 38
+        pkt[7] = 38;
+        pkt[8] = 0x00;
+        pkt[9] = 0x01;
+        pkt[10] = (version << 1) | 0x01;
+        pkt[11] = 0x00;
+        pkt[12] = 0x00;
+        pkt[13] = 0xE0 | ((video_pid >> 8) as u8 & 0x1F);
+        pkt[14] = (video_pid & 0xFF) as u8;
+        pkt[15] = 0xF0;
+        pkt[16] = 0x00;
+        // ES 1: video, no descriptors
+        pkt[17] = 0x1B;
+        pkt[18] = 0xE0 | ((video_pid >> 8) as u8 & 0x1F);
+        pkt[19] = (video_pid & 0xFF) as u8;
+        pkt[20] = 0xF0;
+        pkt[21] = 0x00;
+        // ES 2: teletext-marked 0x06 — listed BEFORE the audio
+        pkt[22] = 0x06;
+        pkt[23] = 0xE0 | ((ttx_pid >> 8) as u8 & 0x1F);
+        pkt[24] = (ttx_pid & 0xFF) as u8;
+        pkt[25] = 0xF0;
+        pkt[26] = ttx_descs.len() as u8;
+        pkt[27..27 + ttx_descs.len()].copy_from_slice(&ttx_descs);
+        // ES 3: AC-3-marked 0x06 — the real audio
+        let p = 27 + ttx_descs.len();
+        pkt[p] = 0x06;
+        pkt[p + 1] = 0xE0 | ((ac3_pid >> 8) as u8 & 0x1F);
+        pkt[p + 2] = (ac3_pid & 0xFF) as u8;
+        pkt[p + 3] = 0xF0;
+        pkt[p + 4] = ac3_descs.len() as u8;
+        pkt[p + 5..p + 5 + ac3_descs.len()].copy_from_slice(&ac3_descs);
+        pkt
+    }
+
+    #[test]
+    fn descriptor_confirmed_ac3_0x06_wins_over_preceding_teletext() {
+        let s = AvSyncDriftSampler::new();
+        let ttx_pid = 0x23F;
+        let video_pid = 0x1FF;
+        let ac3_pid = 0x289;
+        let pmt_pid = 0x101;
+
+        s.observe_packet(&build_pat(pmt_pid, 0));
+        s.observe_packet(&build_pmt_dvb_ac3_with_ttxt(
+            pmt_pid, 0, ttx_pid, video_pid, ac3_pid,
+        ));
+        s.observe_packet(&build_pes_with_pts(video_pid, 90_000 + 1800));
+        s.observe_packet(&build_pes_with_pts(ac3_pid, 90_000));
+
+        let snap = s.snapshot().unwrap();
+        assert_eq!(
+            snap.audio_pid, ac3_pid,
+            "descriptor-confirmed AC-3-in-0x06 must win over the teletext that precedes it"
+        );
+        assert_eq!(snap.avg_ms, 20);
     }
 
     #[test]

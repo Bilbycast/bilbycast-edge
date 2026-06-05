@@ -380,6 +380,112 @@ pub fn parse_pat_pmt_pids(pkt: &[u8]) -> Vec<u16> {
     parse_pat_programs(pkt).into_iter().map(|(_, pid)| pid).collect()
 }
 
+// ── PMT ES-info descriptor classification ───────────────────────────────
+//
+// `stream_type = 0x06` (ISO/IEC 13818-1 "PES private data") is the DVB
+// carriage convention for AC-3 / E-AC-3 / AAC-LATM / DTS audio AND for
+// teletext / VBI / DVB subtitling — the stream_type byte alone cannot
+// distinguish a 5.1 AC-3 service from a teletext page. The ES-info
+// descriptor loop is the discriminator (ETSI EN 300 468 §6). These
+// helpers are the single shared implementation used by every module
+// that must classify a private ES: `ts_pts_rewriter` (muxer-mode PES
+// re-anchoring + lipsync routing), `ts_pid_overrides_rewriter`
+// (singular `audio_pid` binding), `stats::av_sync` (A/V drift metric),
+// and `ts_audio_replace` (transcode source identification).
+
+/// Audio codec family resolved from a private-ES descriptor loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateEsAudioKind {
+    /// DVB AC-3 descriptor (0x6A) or registration "AC-3".
+    Ac3,
+    /// DVB Enhanced-AC-3 descriptor (0x7A) or registration "EAC3".
+    Eac3,
+    /// DVB AAC descriptor (0x7C) — LATM/LOAS carriage.
+    AacLatm,
+    /// DVB DTS descriptor (0x7B) or registration "DTS1"/"DTS2"/"DTS3".
+    Dts,
+    /// Registration "Opus" (Opus-in-TS convention).
+    Opus,
+    /// Registration "BSSD" — SMPTE 302M LPCM audio in MPEG-TS.
+    Smpte302m,
+    /// DVB extension descriptor (0x7F) with AC-4 extension tag (0x15).
+    Ac4,
+}
+
+/// Walk a PMT ES-info descriptor loop and resolve the audio codec family
+/// a private ES (typically `stream_type = 0x06`) carries, or `None` when
+/// no recognised audio descriptor is present.
+///
+/// Recognised (first match in loop order wins, mirroring receiver
+/// behaviour):
+/// - DVB AC-3 descriptor (tag 0x6A, ETSI EN 300 468 §6.2.1) → [`PrivateEsAudioKind::Ac3`]
+/// - DVB Enhanced-AC-3 descriptor (tag 0x7A) → [`PrivateEsAudioKind::Eac3`]
+/// - DVB DTS descriptor (tag 0x7B) → [`PrivateEsAudioKind::Dts`]
+/// - DVB AAC descriptor (tag 0x7C) → [`PrivateEsAudioKind::AacLatm`]
+/// - `registration_descriptor` (tag 0x05) with `format_identifier`
+///   "AC-3" / "EAC3" / "DTS1" / "DTS2" / "DTS3" / "Opus" / "BSSD"
+/// - DVB extension descriptor (tag 0x7F) with extension tag 0x15 (AC-4)
+pub fn descriptor_audio_kind(descriptors: &[u8]) -> Option<PrivateEsAudioKind> {
+    let mut pos = 0;
+    while pos + 2 <= descriptors.len() {
+        let tag = descriptors[pos];
+        let len = descriptors[pos + 1] as usize;
+        if pos + 2 + len > descriptors.len() {
+            return None;
+        }
+        match tag {
+            0x6A => return Some(PrivateEsAudioKind::Ac3),
+            0x7A => return Some(PrivateEsAudioKind::Eac3),
+            0x7B => return Some(PrivateEsAudioKind::Dts),
+            0x7C => return Some(PrivateEsAudioKind::AacLatm),
+            0x05 if len >= 4 => {
+                let fmt = &descriptors[pos + 2..pos + 6];
+                match fmt {
+                    b"AC-3" => return Some(PrivateEsAudioKind::Ac3),
+                    b"EAC3" => return Some(PrivateEsAudioKind::Eac3),
+                    b"DTS1" | b"DTS2" | b"DTS3" => return Some(PrivateEsAudioKind::Dts),
+                    b"Opus" => return Some(PrivateEsAudioKind::Opus),
+                    b"BSSD" => return Some(PrivateEsAudioKind::Smpte302m),
+                    _ => {}
+                }
+            }
+            0x7F if len >= 1 => {
+                // DVB extension descriptor: first body byte is the
+                // descriptor_tag_extension. 0x15 = AC-4 (EN 300 468).
+                if descriptors[pos + 2] == 0x15 {
+                    return Some(PrivateEsAudioKind::Ac4);
+                }
+            }
+            _ => {}
+        }
+        pos += 2 + len;
+    }
+    None
+}
+
+/// True when a PMT ES-info descriptor loop marks the ES as a text /
+/// data service that is definitively NOT audio: DVB teletext (0x56),
+/// VBI data (0x45), VBI teletext (0x46), or DVB subtitling (0x59).
+///
+/// Used to keep heuristic "first 0x06 PID is probably the audio"
+/// fallbacks from latching a teletext or subtitle PID when the real
+/// audio carries no recognisable descriptor.
+pub fn descriptors_indicate_text_service(descriptors: &[u8]) -> bool {
+    let mut pos = 0;
+    while pos + 2 <= descriptors.len() {
+        let tag = descriptors[pos];
+        let len = descriptors[pos + 1] as usize;
+        if pos + 2 + len > descriptors.len() {
+            return false;
+        }
+        if matches!(tag, 0x45 | 0x46 | 0x56 | 0x59) {
+            return true;
+        }
+        pos += 2 + len;
+    }
+    false
+}
+
 // ── MPEG-2 CRC-32 ───────────────────────────────────────────────────────
 
 /// MPEG-2 CRC-32 lookup table (polynomial 0x04C11DB7, no bit reversal).
@@ -657,5 +763,76 @@ mod tests {
         let before = pkt;
         set_psi_version(&mut pkt, 12);
         assert_eq!(pkt, before, "no PUSI → set_psi_version is no-op");
+    }
+
+    // ── descriptor_audio_kind / descriptors_indicate_text_service ──────
+
+    #[test]
+    fn descriptor_audio_kind_dvb_tags() {
+        // DVB AC-3 descriptor (0x6A) — the Network TEN / DVB-Australia
+        // shape: 0x06 ES with AC-3 descriptor + ISO-639 language.
+        let d = [0x0A, 0x04, b'e', b'n', b'g', 0x00, 0x6A, 0x01, 0x44];
+        assert_eq!(descriptor_audio_kind(&d), Some(PrivateEsAudioKind::Ac3));
+
+        let d = [0x7A, 0x01, 0x00];
+        assert_eq!(descriptor_audio_kind(&d), Some(PrivateEsAudioKind::Eac3));
+
+        let d = [0x7B, 0x05, 0, 0, 0, 0, 0];
+        assert_eq!(descriptor_audio_kind(&d), Some(PrivateEsAudioKind::Dts));
+
+        let d = [0x7C, 0x01, 0x00];
+        assert_eq!(descriptor_audio_kind(&d), Some(PrivateEsAudioKind::AacLatm));
+    }
+
+    #[test]
+    fn descriptor_audio_kind_registration_ids() {
+        for (fmt, kind) in [
+            (*b"AC-3", PrivateEsAudioKind::Ac3),
+            (*b"EAC3", PrivateEsAudioKind::Eac3),
+            (*b"DTS2", PrivateEsAudioKind::Dts),
+            (*b"Opus", PrivateEsAudioKind::Opus),
+            (*b"BSSD", PrivateEsAudioKind::Smpte302m),
+        ] {
+            let d = [0x05, 0x04, fmt[0], fmt[1], fmt[2], fmt[3]];
+            assert_eq!(descriptor_audio_kind(&d), Some(kind), "fmt {fmt:?}");
+        }
+        // Unrecognised registration → None.
+        let d = [0x05, 0x04, b'K', b'L', b'V', b'A'];
+        assert_eq!(descriptor_audio_kind(&d), None);
+    }
+
+    #[test]
+    fn descriptor_audio_kind_ac4_extension() {
+        let d = [0x7F, 0x02, 0x15, 0x00];
+        assert_eq!(descriptor_audio_kind(&d), Some(PrivateEsAudioKind::Ac4));
+        // Other extension tags are not audio.
+        let d = [0x7F, 0x02, 0x20, 0x00];
+        assert_eq!(descriptor_audio_kind(&d), None);
+    }
+
+    #[test]
+    fn descriptor_audio_kind_rejects_text_and_empty() {
+        // Teletext descriptor only → not audio.
+        let d = [0x56, 0x05, b'e', b'n', b'g', 0x10, 0x01];
+        assert_eq!(descriptor_audio_kind(&d), None);
+        assert!(descriptors_indicate_text_service(&d));
+        // DVB subtitling.
+        let d = [0x59, 0x08, b'e', b'n', b'g', 0x10, 0, 1, 0, 2];
+        assert_eq!(descriptor_audio_kind(&d), None);
+        assert!(descriptors_indicate_text_service(&d));
+        // VBI data / VBI teletext.
+        assert!(descriptors_indicate_text_service(&[0x45, 0x00]));
+        assert!(descriptors_indicate_text_service(&[0x46, 0x00]));
+        // Empty loop → neither audio nor text.
+        assert_eq!(descriptor_audio_kind(&[]), None);
+        assert!(!descriptors_indicate_text_service(&[]));
+    }
+
+    #[test]
+    fn descriptor_walk_handles_truncated_loop() {
+        // Length runs past the slice — must bail, not panic.
+        let d = [0x6A, 0x40, 0x00];
+        assert_eq!(descriptor_audio_kind(&d), None);
+        assert!(!descriptors_indicate_text_service(&[0x56, 0x40, 0x00]));
     }
 }
