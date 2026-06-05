@@ -295,13 +295,23 @@ impl TsPidOverridesRewriter {
         state.source_video_pid = first_video;
         state.source_audio_pid = first_audio;
 
-        // Build the resolved audio remap from `audio_pids` (per-source
-        // PID) and the singular `audio_pid` (first-audio back-compat).
-        // Per-source entries win on conflict.
+        // Build the resolved audio remap. The explicit per-source `audio_pids`
+        // map is AUTHORITATIVE; the singular `audio_pid` is back-compat that
+        // maps the FIRST audio PID to the target.
+        //
+        // CRITICAL (multi-audio MPTS, e.g. SBS program 790 = MP2 + AAC): if a
+        // program carries more than one audio stream and BOTH `audio_pid` and
+        // `audio_pids` are set, the singular maps `first_audio` (which may be a
+        // DIFFERENT stream than the one named in `audio_pids`) to the same
+        // target — putting TWO source audio PIDs onto ONE output PID. That
+        // interleaves two elementary streams on the wire (e.g. MP2 frames and
+        // AAC frames on PID 257), so the receiver's decoder gets ~half the
+        // frames plus a flood of sync errors == broken / dropped audio. Apply
+        // `audio_pids` first, then the singular `audio_pid` ONLY when it neither
+        // re-maps an already-mapped source nor reuses an already-claimed output
+        // PID — so the explicit map always wins and a collision is impossible.
         let mut audio_remap: BTreeMap<u16, u16> = BTreeMap::new();
-        if let (Some(src), Some(target)) = (first_audio, o.audio_pid) {
-            audio_remap.insert(src, target);
-        }
+        let mut claimed_targets: Vec<u16> = Vec::new();
         if let Some(map) = o.audio_pids.as_ref() {
             for (&src, &dst) in map.iter() {
                 // Only honour entries whose source PID actually exists as
@@ -309,7 +319,13 @@ impl TsPidOverridesRewriter {
                 // so a stale override doesn't shadow an unrelated PID.
                 if all_audio_pids.contains(&src) {
                     audio_remap.insert(src, dst);
+                    claimed_targets.push(dst);
                 }
+            }
+        }
+        if let (Some(src), Some(target)) = (first_audio, o.audio_pid) {
+            if !audio_remap.contains_key(&src) && !claimed_targets.contains(&target) {
+                audio_remap.insert(src, target);
             }
         }
         state.audio_remap = audio_remap;
@@ -811,6 +827,63 @@ mod tests {
             ts_pid(&out[..TS_PACKET_SIZE]),
             0x203,
             "ES audio (source 0x104) must remap to 0x203"
+        );
+    }
+
+    #[test]
+    fn multi_audio_singular_and_map_do_not_collide_on_one_target() {
+        use std::collections::BTreeMap;
+        // SBS-shaped regression: program 1 with TWO audio streams, AAC listed
+        // FIRST (so first_audio = the AAC) then MP2. Config sets BOTH the
+        // singular `audio_pid` (target 0x201) AND the explicit `audio_pids`
+        // map (MP2 0x156 -> 0x201). The buggy path remapped first_audio (the
+        // AAC) AND the MP2 both onto 0x201, interleaving two elementary streams
+        // on one PID (decoder gets ~half-frames + sync errors == broken audio).
+        // The fix makes `audio_pids` authoritative: only the MP2 maps to 0x201;
+        // the AAC is left on its own PID — no collision.
+        let pat = build_pat_packet(&[(1, 0x100)], 0);
+        let pmt = build_pmt_packet(
+            0x100,
+            &[
+                (0x1B, 0x101), // H.264 video
+                (0x0F, 0x158), // AAC — listed FIRST -> becomes first_audio
+                (0x04, 0x156), // MP2 — the stream we actually want
+            ],
+            0,
+        );
+        let mut audio_map = BTreeMap::new();
+        audio_map.insert(0x156u16, 0x201u16); // MP2 -> 0x201
+        let mut overrides = TsPidOverridesMap::new();
+        overrides.insert(
+            1,
+            TsPidOverridesEntry {
+                audio_pid: Some(0x201), // singular ALSO points at 0x201
+                audio_pids: Some(audio_map),
+                ..Default::default()
+            },
+        );
+        let mut rew = TsPidOverridesRewriter::new(&overrides);
+        let mut out = Vec::new();
+        rew.process(&pat, &mut out);
+        rew.process(&pmt, &mut out);
+        out.clear();
+
+        // MP2 (0x156) -> 0x201 (the intended audio).
+        rew.process(&build_es_packet(0x156), &mut out);
+        assert_eq!(
+            ts_pid(&out[..TS_PACKET_SIZE]),
+            0x201,
+            "MP2 (audio_pids source) must map to the audio target"
+        );
+        out.clear();
+
+        // AAC (0x158 = first_audio) must NOT also be remapped onto 0x201 —
+        // that collision interleaved two ES on one PID. It stays on its own PID.
+        rew.process(&build_es_packet(0x158), &mut out);
+        assert_eq!(
+            ts_pid(&out[..TS_PACKET_SIZE]),
+            0x158,
+            "AAC (first_audio) must NOT collide onto the audio target"
         );
     }
 
