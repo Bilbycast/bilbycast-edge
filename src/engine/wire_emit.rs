@@ -384,20 +384,17 @@ pub struct DejitterConfig {
     pub use_servo: bool,
     /// Forward at the INPUT's own cadence — emit each datagram as it arrives, no
     /// edge re-pacing (the residence cap still applies as a runaway backstop).
-    /// **Opt-in** (`BILBYCAST_EGRESS_PACING=forward`), NOT the default: it is only
-    /// correct when the upstream is already wallclock-smooth (a hardware encoder
-    /// on a clean LAN). For the common contribution case — `ffmpeg -re`, an
-    /// SRT/RIST TSBPD batch release, or any congested long-haul 3rd-party feed —
-    /// the input arrives in 100-300 ms bursts, and forwarding emits those bursts
-    /// verbatim onto the wire (output PCR_AC ≈ input PDV ≈ 100-300 ms), wrecking
-    /// the downstream receiver's PCR clock recovery (audio dropouts + video
-    /// breakup — the live symptom that prompted this audit). PCR-delta pacing (the
-    /// default) instead spreads each burst across its inter-PCR interval; an A/B
-    /// (2026-06-05, `ffmpeg -re` SBS HD + 4K HEVC VBR) measured it strictly
-    /// smoother (94→0 gaps>50 ms, PCR_AC 188 ms→0.5 ms) AND bounded on 4K VBR
-    /// (depth ~137 ms, no runaway, 0 shed) — so the "re-pacing HOLDS I-frames"
-    /// worry that once motivated forward-as-default did not hold up. Keep this
-    /// only for genuine low-latency LAN paths where the source is already paced.
+    /// This is the **default** for compressed: the upstream (SRT/RIST TSBPD,
+    /// `media_player` pacer, a clean encoder) has already paced the stream, and
+    /// the downstream receiver re-clocks from PCR + its own buffer. Re-metering a
+    /// variable-bitrate feed to a smooth rate (servo) or to PCR-delta targets
+    /// (open-loop) HOLDS each I-frame burst → egress latency swings on the GOP
+    /// cadence → receiver-buffer under/overrun (the "freezes/pixelates every few
+    /// seconds on a clean SRT feed" symptom). Forwarding preserves the source's
+    /// own low-jitter timing (output PCR_AC ≈ input PDV) at the lowest latency.
+    /// `BILBYCAST_EGRESS_PACING=pcr` re-enables open-loop PCR-delta pacing (for
+    /// 2022-7 hitless coherence / strict T-STD), `=servo` the rate servo (for a
+    /// genuinely bursty raw-UDP ingress that nothing upstream has smoothed).
     pub forward_cadence: bool,
 }
 
@@ -456,31 +453,17 @@ impl DejitterConfig {
             .unwrap_or_else(|| (setpoint_ms.saturating_mul(4)).max(1_000))
             .clamp(setpoint_ms.saturating_add(40), 5_000);
         // Pacing model — `BILBYCAST_EGRESS_PACING`:
-        //   unset / "pcr" (DEFAULT) → open-loop PCR-delta: emit each datagram at
-        //       its PCR-implied wall instant, de-jittering bursty contribution
-        //       ingress (ffmpeg -re, SRT/RIST TSBPD batch release, congested
-        //       3rd-party feeds — all routinely 100-300 ms bursty) into a smooth
-        //       wire output. A/B verified 2026-06-05: turns a 94-gaps>50ms /
-        //       PCR_AC-188ms forward output into 0-gaps>50ms / PCR_AC-0.5ms; on
-        //       4K HEVC VBR depth stabilises ~137 ms (bounded, no runaway, 0 shed)
-        //       — the I-frame-hold runaway it was once blamed for was the residence
-        //       cap being OFF, not this pacer. The cap (always-on here) is the bound.
-        //   "forward" → emit at the input's own arrival cadence, no re-pacing
-        //       (lowest latency, but output PCR_AC ≈ input PDV, so it ONLY holds
-        //       up when the upstream is already wallclock-smooth — most live
-        //       contribution feeds are NOT; this passes their burst straight to
-        //       the wire and breaks receiver clock recovery).
-        //   "servo"   → rate leaky-bucket (sustained source-vs-wallclock drift;
-        //       over-sheds bursty VBR — see the A/B — so it is opt-in only).
+        //   unset / "forward" (DEFAULT) → forward at input cadence (no re-pace);
+        //   "pcr"   → open-loop PCR-delta (tier-1 PCR_AC; for 2022-7 / strict);
+        //   "servo" → rate leaky-bucket (for a bursty raw-UDP ingress).
         // The residence cap above is active in ALL modes (gated on `enabled`).
         let pacing = std::env::var("BILBYCAST_EGRESS_PACING")
             .map(|v| v.to_ascii_lowercase())
             .unwrap_or_default();
         let (forward_cadence, use_servo) = match pacing.as_str() {
-            "forward" | "off" => (true, false),
+            "pcr" | "openloop" | "open-loop" => (false, false),
             "servo" | "rate" => (false, true),
-            // unset / "pcr" / "openloop" / unknown → PCR-delta pacing (DEFAULT)
-            _ => (false, false),
+            _ => (true, false), // "forward" / unset / unknown → forward cadence
         };
         Self {
             enabled: true,
@@ -2319,26 +2302,15 @@ mod tests {
         // lookahead + the contribution burst envelope so the cap is a runaway
         // bound, not a normal-operation shedder).
         assert_eq!(DejitterConfig::servo().shed_residence_us(), 1_000_000);
-        // Default pacer is PCR-delta (open-loop): re-paces each datagram to its
-        // PCR-implied wall instant, de-jittering bursty contribution ingress.
-        // Forward-cadence (no re-pace) and the rate servo are both opt-in via
-        // BILBYCAST_EGRESS_PACING. (Verified unset-env default 2026-06-05.)
+        // Default pacer is FORWARD-cadence (no re-pacing; receiver re-clocks);
+        // open-loop PCR-delta and the rate servo are both opt-in via
+        // BILBYCAST_EGRESS_PACING.
         let def = DejitterConfig::servo_with(None);
-        assert!(!def.forward_cadence, "compressed default = PCR-delta, not forward");
-        assert!(!def.use_servo, "compressed default = PCR-delta, not servo");
+        assert!(def.forward_cadence, "compressed default = forward cadence");
+        assert!(!def.use_servo);
         assert!(DejitterConfig::servo().use_servo, "test helper forces servo on");
         assert!(!DejitterConfig::servo().forward_cadence, "servo helper not forward");
-        // The DEFAULT (PCR-delta) re-paces: a future-PCR datagram targets a wall
-        // instant AHEAD of now, NOT now — this is what spreads a burst.
-        let mut sp = warmed_servo_state(6_000_000, 1_000_000_000);
-        let paced =
-            sp.derive_target_paced(2_000_000_000, Some(900_000), 1316, 50, &def);
-        assert!(
-            paced >= 2_000_000_000,
-            "PCR-delta default re-paces (target {} >= now), not emit-at-now",
-            paced
-        );
-        // Forward mode (opt-in) dispatches to emit-now (no re-pace), any PCR.
+        // Forward mode dispatches to emit-now (no re-pace), regardless of PCR.
         let mut s = warmed_servo_state(6_000_000, 1_000_000_000);
         let fwd = DejitterConfig {
             forward_cadence: true,
