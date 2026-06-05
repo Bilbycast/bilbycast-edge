@@ -279,19 +279,32 @@ impl TsPidOverridesRewriter {
         // First-of-each-role wins for the singular video / audio_pid
         // overrides. Multi-audio programs walk the full audio list below.
         let mut first_video: Option<u16> = None;
-        let mut first_audio: Option<u16> = None;
+        let mut first_audio: Option<u16> = None; // first UNAMBIGUOUS audio
+        let mut first_audio_fallback: Option<u16> = None; // first ambiguous (0x06)
         let mut all_audio_pids: Vec<u16> = Vec::new();
         for (es_pid, stream_type) in streams.iter() {
             if first_video.is_none() && is_video_stream_type(*stream_type) {
                 first_video = Some(*es_pid);
             }
             if is_audio_stream_type(*stream_type) {
-                if first_audio.is_none() {
-                    first_audio = Some(*es_pid);
-                }
                 all_audio_pids.push(*es_pid);
+                if is_unambiguous_audio_stream_type(*stream_type) {
+                    if first_audio.is_none() {
+                        first_audio = Some(*es_pid);
+                    }
+                } else if first_audio_fallback.is_none() {
+                    first_audio_fallback = Some(*es_pid);
+                }
             }
         }
+        // The singular `audio_pid` back-compat binds the FIRST audio PID. Prefer
+        // the first UNAMBIGUOUS audio (a real codec) over an ambiguous 0x06
+        // PES-private PID (usually DVB teletext that `is_audio_stream_type`
+        // conservatively accepts): on a teletext-before-audio program (e.g. SBS,
+        // PMT = 0x06 teletext, then MP2, then AAC) the singular would otherwise
+        // latch the teletext PID and the real audio would never be remapped. Fall
+        // back to a 0x06 PID only when there is no unambiguous audio at all.
+        let first_audio = first_audio.or(first_audio_fallback);
         state.source_video_pid = first_video;
         state.source_audio_pid = first_audio;
 
@@ -442,7 +455,20 @@ fn is_video_stream_type(st: u8) -> bool {
 
 /// True for audio stream_types we recognise (AAC, MPEG-1/2, AC-3, private).
 fn is_audio_stream_type(st: u8) -> bool {
-    matches!(st, 0x03 | 0x04 | 0x06 | 0x0F | 0x11 | 0x81)
+    // 0x03 MPEG-1, 0x04 MPEG-2, 0x0F AAC-ADTS, 0x11 AAC-LATM, 0x81 AC-3,
+    // 0x87 E-AC-3 (ATSC). 0x06 is PES-private-data — usually DVB teletext/
+    // subtitle, accepted only as a conservative fallback (see
+    // `is_unambiguous_audio_stream_type`).
+    matches!(st, 0x03 | 0x04 | 0x06 | 0x0F | 0x11 | 0x81 | 0x87)
+}
+
+/// Stream types that are UNambiguously a real audio codec. Excludes 0x06
+/// (PES-private-data — DVB teletext/subtitle far more often than audio). Used
+/// to pick the singular `audio_pid` back-compat target so it never latches a
+/// teletext PID that merely precedes the real audio in the PMT. Mirrors
+/// `stats::av_sync::is_unambiguous_audio_stream_type`.
+fn is_unambiguous_audio_stream_type(st: u8) -> bool {
+    matches!(st, 0x03 | 0x04 | 0x0F | 0x11 | 0x81 | 0x87)
 }
 
 /// Read PAT `version_number` (5 bits, 0..=31) when PUSI is set, or `None`.
@@ -884,6 +910,47 @@ mod tests {
             ts_pid(&out[..TS_PACKET_SIZE]),
             0x158,
             "AAC (first_audio) must NOT collide onto the audio target"
+        );
+    }
+
+    #[test]
+    fn singular_audio_pid_skips_0x06_teletext_and_binds_real_audio() {
+        // SBS-shaped: PMT lists a 0x06 DVB-teletext PID FIRST, then the real MP2
+        // audio. With ONLY the singular `audio_pid` (no audio_pids map), the
+        // back-compat path must bind the REAL audio (MP2), NOT the teletext PID
+        // that is_audio_stream_type conservatively accepts — so a
+        // teletext-before-audio feed self-heals without the audio_pids workaround.
+        let pat = build_pat_packet(&[(1, 0x100)], 0);
+        let pmt = build_pmt_packet(
+            0x100,
+            &[
+                (0x1B, 0x101), // H.264 video
+                (0x06, 0x12E), // DVB teletext (PES-private) — listed FIRST
+                (0x04, 0x156), // MP2 audio — the real audio
+            ],
+            0,
+        );
+        let mut overrides = TsPidOverridesMap::new();
+        overrides.insert(1, TsPidOverridesEntry { audio_pid: Some(0x201), ..Default::default() });
+        let mut rew = TsPidOverridesRewriter::new(&overrides);
+        let mut out = Vec::new();
+        rew.process(&pat, &mut out);
+        rew.process(&pmt, &mut out);
+        out.clear();
+        // MP2 (real audio) -> 0x201.
+        rew.process(&build_es_packet(0x156), &mut out);
+        assert_eq!(
+            ts_pid(&out[..TS_PACKET_SIZE]),
+            0x201,
+            "real audio (MP2) must bind the singular audio_pid, not the 0x06 teletext"
+        );
+        out.clear();
+        // teletext (0x06) must be left on its own PID, NOT bound to the audio target.
+        rew.process(&build_es_packet(0x12E), &mut out);
+        assert_eq!(
+            ts_pid(&out[..TS_PACKET_SIZE]),
+            0x12E,
+            "0x06 teletext must NOT be treated as the audio"
         );
     }
 
