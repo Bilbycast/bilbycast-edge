@@ -307,15 +307,20 @@ pub enum AnchorSource {
 /// RTP/UDP (no ARQ). So compressed outputs stay LOSSLESS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WirePacingClass {
-    /// Compressed MPEG-TS (UDP / RTP / SMPTE 302M). Paced onto the wire by the
-    /// kernel etf qdisc via SO_TXTIME when the operator enabled it
-    /// (`BILBYCAST_ENABLE_TXTIME=1`) and an etf qdisc is present — the late-drop
-    /// that compressed feeds suffer on etf is prevented by the
-    /// `ETF_LATE_FLOOR_NS` (15 ms) launch floor (so a late packet emits ~15 ms
-    /// out instead of being dropped). A Lossless output carrying DSCP is pinned
-    /// `SO_PRIORITY=0` so it lands on the etf TC0 class (the DSCP wire byte is
-    /// unaffected). Falls back to userspace `clock_nanosleep` when no etf qdisc
-    /// is present. The receiver still re-times via PCR + jitter buffer.
+    /// Compressed MPEG-TS (UDP / RTP / SMPTE 302M; every codec). **NEVER** paced
+    /// by the kernel etf qdisc: etf DROPS any packet whose launch time has
+    /// already passed when it reaches the qdisc — unrecoverable corruption on
+    /// bare UDP/RTP (no ARQ) that freezes video to the next IDR. The receiver
+    /// re-times from PCR + its own jitter buffer (and from SRT/RIST TSBPD when
+    /// carried onward), so a few-ms-late packet is harmless but a dropped one is
+    /// not. Paced in userspace by `clock_nanosleep` on a SCHED_FIFO thread
+    /// (~50–500 µs p99 — broadcast tier-2, ample for any PCR-re-clocking
+    /// receiver), with the closed-loop release servo bounding latency. When the
+    /// operator has installed the etf qdisc (its priomap routes skb-priority 0,
+    /// the kernel default, to the etf TC0 class), a Lossless output is pinned to
+    /// a NON-etf `SO_PRIORITY` so its plain sends are queued by fq_codel rather
+    /// than late-dropped by etf — the DSCP wire byte (set separately via IP_TOS)
+    /// is unaffected, so downstream QoS marking is preserved.
     Lossless,
     /// ST 2110 essence (-20/-23 video, -30/-31 audio, -40 ANC). No
     /// receiver re-timing buffer, so wire precision matters: eligible for
@@ -363,22 +368,57 @@ pub struct DejitterConfig {
     /// `egress_buffer_ms` to turn the output into a real de-jitter buffer that
     /// absorbs `~setpoint_ms` of arrival jitter (at the cost of that latency).
     pub seed_cushion: bool,
+    /// Pacing model for the released datagrams (independent of the residence
+    /// cap, which is always governed by `enabled`). `true` → the rate-leaky-
+    /// bucket **servo** (`derive_target_servo`): bounds latency by metering at
+    /// the recovered source rate, but smooths *rate* rather than aligning *PCR
+    /// instants*, so per-packet PCR_AC degrades to tens/hundreds of ms on a
+    /// contended box. `false` → **open-loop PCR-delta** pacing (`derive_target`):
+    /// emits each packet at its PCR-implied wall instant (PCR_AC ≈ the input's
+    /// own PDV — tier-2), self-draining any backlog via the `.max(now)` guard;
+    /// the (always-on) residence cap is the sole runaway bound. Open-loop is the
+    /// tier-1 choice for PCR-disciplined / `ffmpeg -re`-class sources; the servo
+    /// suits sources with a sustained source-vs-wallclock rate offset where the
+    /// cap would otherwise sawtooth-shed. Selected at construction from
+    /// `BILBYCAST_EGRESS_PACING=servo`. Ignored when `forward_cadence` is set.
+    pub use_servo: bool,
+    /// Forward at the INPUT's own cadence — emit each datagram as it arrives, no
+    /// edge re-pacing (the residence cap still applies as a runaway backstop).
+    /// This is the **default** for compressed: the upstream (SRT/RIST TSBPD,
+    /// `media_player` pacer, a clean encoder) has already paced the stream, and
+    /// the downstream receiver re-clocks from PCR + its own buffer. Re-metering a
+    /// variable-bitrate feed to a smooth rate (servo) or to PCR-delta targets
+    /// (open-loop) HOLDS each I-frame burst → egress latency swings on the GOP
+    /// cadence → receiver-buffer under/overrun (the "freezes/pixelates every few
+    /// seconds on a clean SRT feed" symptom). Forwarding preserves the source's
+    /// own low-jitter timing (output PCR_AC ≈ input PDV) at the lowest latency.
+    /// `BILBYCAST_EGRESS_PACING=pcr` re-enables open-loop PCR-delta pacing (for
+    /// 2022-7 hitless coherence / strict T-STD), `=servo` the rate servo (for a
+    /// genuinely bursty raw-UDP ingress that nothing upstream has smoothed).
+    pub forward_cadence: bool,
 }
 
 impl DejitterConfig {
-    /// Default policy for compressed outputs: release-rate servo holding a
-    /// 60 ms buffer with ±5 % authority, backed by a 250 ms residence cap
-    /// (drain back to ~32 datagrams). Inside the receiver T-STD envelope
-    /// (≤ ~0.7 s) and SRT/RIST receive-latency headroom.
+    /// Default policy for compressed outputs: open-loop PCR-delta pacing with a
+    /// 1000 ms residence cap (drain back to ~32 datagrams) as the runaway bound.
+    /// Inside the receiver T-STD envelope and SRT/RIST receive-latency headroom.
+    /// `BILBYCAST_EGRESS_SERVO=1` swaps the pacer for the rate servo (60 ms
+    /// buffer, ±5 % authority) for sustained-drift sources.
     #[cfg(test)] // test-only convenience wrapper; production paths call servo_with
     pub fn servo() -> Self {
-        Self::servo_with(None)
+        // Force the servo pacer on for the servo-specific tests, independent of
+        // the BILBYCAST_EGRESS_PACING env default (which production reads).
+        Self {
+            use_servo: true,
+            forward_cadence: false,
+            ..Self::servo_with(None)
+        }
     }
 
     /// As `servo` (the no-arg wrapper) but with an operator-supplied setpoint. Precedence
     /// for the buffer setpoint: explicit per-output `egress_buffer_ms` config
     /// > `BILBYCAST_EGRESS_BUFFER_MS` env > 60 ms default (all clamped to
-    /// [20, 2000] ms). The residence cap defaults to `max(4×setpoint, 250)`
+    /// [20, 2000] ms). The residence cap defaults to `max(4×setpoint, 1000)`
     /// ms (overridable via `BILBYCAST_EGRESS_RESIDENCE_MS`) so a bigger
     /// buffer gets proportionally more burst headroom before the hard shed.
     pub fn servo_with(egress_buffer_ms: Option<u32>) -> Self {
@@ -394,11 +434,37 @@ impl DejitterConfig {
             .or(env_buf)
             .unwrap_or(60)
             .clamp(20, 2000);
+        // The residence cap is the LAST-RESORT runaway bound, NOT a normal-
+        // operation shedder. It must clear (a) the servo's own
+        // MAX_FUTURE_LOOKAHEAD_NS (200 ms) hold and (b) the realistic
+        // contribution-ingress burst envelope (an SRT/RIST TSBPD release or an
+        // input-switch buffer dump is routinely 200–500 ms). The old 250 ms
+        // floor sat only 50 ms above the lookahead, so the cap shed datagrams
+        // the pacer was legitimately holding — on a compressed feed that is
+        // unrecoverable corruption (measured: ~50 % of a normal feed shed under
+        // burst → the VLC breakup). 1000 ms clears the lookahead + burst
+        // envelope and still sits inside the receiver T-STD / SRT-onward re-clock
+        // window. Pacing rate-/PCR-tracking (not this cap) prevents the 47 s
+        // runaway, so a generous cap costs nothing at steady state (residence
+        // stays near 0) and only bounds a genuine sustained drift.
         let cap_ms = std::env::var("BILBYCAST_EGRESS_RESIDENCE_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or_else(|| (setpoint_ms.saturating_mul(4)).max(250))
+            .unwrap_or_else(|| (setpoint_ms.saturating_mul(4)).max(1_000))
             .clamp(setpoint_ms.saturating_add(40), 5_000);
+        // Pacing model — `BILBYCAST_EGRESS_PACING`:
+        //   unset / "forward" (DEFAULT) → forward at input cadence (no re-pace);
+        //   "pcr"   → open-loop PCR-delta (tier-1 PCR_AC; for 2022-7 / strict);
+        //   "servo" → rate leaky-bucket (for a bursty raw-UDP ingress).
+        // The residence cap above is active in ALL modes (gated on `enabled`).
+        let pacing = std::env::var("BILBYCAST_EGRESS_PACING")
+            .map(|v| v.to_ascii_lowercase())
+            .unwrap_or_default();
+        let (forward_cadence, use_servo) = match pacing.as_str() {
+            "pcr" | "openloop" | "open-loop" => (false, false),
+            "servo" | "rate" => (false, true),
+            _ => (true, false), // "forward" / unset / unknown → forward cadence
+        };
         Self {
             enabled: true,
             shed_residence_ns: cap_ms.saturating_mul(1_000_000),
@@ -406,6 +472,8 @@ impl DejitterConfig {
             setpoint_ms,
             authority_permille: 50,
             seed_cushion,
+            use_servo,
+            forward_cadence,
         }
     }
     /// No de-jitter (ST 2110 strict pacing / SO_TXTIME owns timing).
@@ -417,6 +485,8 @@ impl DejitterConfig {
             setpoint_ms: 0,
             authority_permille: 0,
             seed_cushion: false,
+            use_servo: false,
+            forward_cadence: false,
         }
     }
     /// Residence cap in microseconds (for comparison with `recv_time_us`).
@@ -560,56 +630,70 @@ pub fn spawn_wire_emitter(
     let force_nanosleep = std::env::var("BILBYCAST_FORCE_NANOSLEEP")
         .map(|v| v == "1")
         .unwrap_or(false);
-    // Egress pacing: BOTH ST 2110 (EtfEligible) AND compressed MPEG-TS
-    // (Lossless) ride the kernel etf qdisc via SO_TXTIME — the industry-standard
-    // hardware-timestamped egress pacer. De-jitter belongs at INGRESS (SRT
-    // TSBPD / RIST / ingress_dejitter_ms), NOT egress; egress only paces. The
-    // earlier split that routed Lossless onto a userspace clock_nanosleep +
-    // release-rate servo shed ~50 % of a normal compressed feed (servo
-    // residence-cap firing) — reverted. The etf "late-drop" that originally
-    // motivated the split is prevented by the ETF_LATE_FLOOR_NS (15 ms) launch
-    // floor on the SO_TXTIME path: targets are stamped >= now+15 ms, so on a
-    // SCHED_FIFO wire-emit thread the kernel never sees a past launch time.
-    // Falls back to clock_nanosleep automatically when no etf qdisc is present
-    // (try_enable_so_txtime fails).
-    let etf_eligible = matches!(
-        pacing,
-        WirePacingClass::EtfEligible | WirePacingClass::Lossless
-    );
+    // ── Releaser + qdisc-class selection ─────────────────────────────────
+    //
+    // SO_TXTIME + the kernel etf qdisc are reserved for `EtfEligible` (ST 2110
+    // uncompressed essence). There is no receiver re-timing buffer for raw
+    // essence, so wire precision IS the clock and a late packet is useless —
+    // etf's drop-if-late policy is correct there.
+    //
+    // Compressed MPEG-TS (`Lossless` — every codec, UDP/RTP/302M) is the exact
+    // opposite and must NEVER touch etf. The receiver re-clocks from PCR + its
+    // jitter buffer (and SRT/RIST TSBPD downstream), so a packet a few ms late
+    // on the wire is fine, but a DROPPED packet is unrecoverable corruption (no
+    // ARQ on bare UDP/RTP) that freezes video until the next IDR. Forcing
+    // compressed onto etf measured 16k+ kernel late-drops and a 148 ms p99
+    // PCR_AC on a contended box (the `ETF_LATE_FLOOR_NS` 15 ms band-aid did NOT
+    // hold under real scheduling slop) — the diagnosed VLC freeze/stutter.
+    // Compressed therefore always paces in userspace (`clock_nanosleep` on a
+    // SCHED_FIFO thread, ~50–500 µs p99 — broadcast tier-2, ample for any
+    // PCR-re-clocking receiver), with the closed-loop servo bounding latency.
+    let etf_eligible = matches!(pacing, WirePacingClass::EtfEligible);
     let releaser = if !force_nanosleep
         && enable_so_txtime
         && etf_eligible
         && try_enable_so_txtime(&socket, clockid)
     {
-        // A compressed (Lossless) output usually carries a DSCP byte (e.g. 46),
-        // which the kernel maps to a non-TC0 priority -> off the etf class. Pin
-        // SO_PRIORITY explicitly (default 0 -> TC0/etf) so it lands on the etf
-        // class regardless of DSCP. The DSCP byte on the wire is set separately
-        // via IP_TOS and is unaffected (QoS marking preserved). ST 2110 has no
-        // DSCP -> already prio 0 -> TC0, so this is a harmless no-op there.
-        if matches!(pacing, WirePacingClass::Lossless) {
-            let etf_prio = std::env::var("BILBYCAST_ETF_SO_PRIORITY")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(0);
-            match crate::engine::wire_emit_txtime::set_so_priority(&socket, etf_prio) {
-                Ok(()) => tracing::info!(
-                    "wire-emit '{}': compressed output pinned to SO_PRIORITY={} (etf TC0, hardware-paced)",
-                    id,
-                    etf_prio
-                ),
-                Err(e) => tracing::debug!(
-                    "wire-emit '{}': set_so_priority({}) failed: {} (no mqprio/etf qdisc — clock_nanosleep fallback)",
-                    id,
-                    etf_prio,
-                    e
-                ),
-            }
-        }
         Releaser::SoTxtime
     } else {
         Releaser::ClockNanosleep
     };
+
+    // Keep compressed (`Lossless`) datagrams OFF the etf traffic class.
+    //
+    // Only relevant when the operator opted into the SO_TXTIME/etf world
+    // (`enable_so_txtime`) — i.e. an etf qdisc is installed for ST 2110 pacing.
+    // Its mqprio priomap (`0 0 0 0 1 1 1 1 2 2 2 2 …`) routes skb-priority 0 —
+    // the kernel default for every socket, and what a low/zero DSCP yields — to
+    // TC0 = etf. A compressed datagram sent there on the clock_nanosleep path
+    // carries no SCM_TXTIME, so its skb->tstamp is 0, which etf reads as "launch
+    // time already passed" and DROPS. This is the identical trap the setup
+    // script's PTP-bypass filter dodges by rewriting PTP to priority 4 (TC1,
+    // fq_codel); pin Lossless to that same non-etf class so its plain sends are
+    // queued, not dropped, regardless of the source's DSCP. The DSCP byte on the
+    // wire is set separately via IP_TOS and is unaffected (downstream QoS marking
+    // intact); only the local qdisc-class selection changes. Left untouched when
+    // `enable_so_txtime` is false (no etf qdisc present — the DSCP-derived
+    // priority is honoured exactly as before, zero change to the default deploy).
+    if matches!(pacing, WirePacingClass::Lossless) && enable_so_txtime {
+        let lossless_prio = std::env::var("BILBYCAST_LOSSLESS_SO_PRIORITY")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(4);
+        match crate::engine::wire_emit_txtime::set_so_priority(&socket, lossless_prio) {
+            Ok(()) => tracing::info!(
+                "wire-emit '{}': compressed output pinned to SO_PRIORITY={} (non-etf class — userspace-paced, never late-dropped)",
+                id,
+                lossless_prio
+            ),
+            Err(e) => tracing::debug!(
+                "wire-emit '{}': set_so_priority({}) failed: {} (no mqprio — ordinary qdisc, no etf trap)",
+                id,
+                lossless_prio,
+                e
+            ),
+        }
+    }
 
     let (tx_raw, rx_raw) = sync_channel::<WireDatagram>(WIRE_CHANNEL_CAP);
     let depth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1023,16 +1107,29 @@ impl TargetState {
         depth: usize,
         cfg: &DejitterConfig,
     ) -> u64 {
-        // Compressed (`Lossless`) outputs run the closed-loop release servo: a
-        // smooth UNIFORM-RATE leaky bucket holding buffer residence near
-        // `setpoint_ms`, bounding egress latency. Uniform-rate draining avoids
-        // the batch CLUMPING that a PCR-delta-baseline drain trim induces —
-        // clumping clusters PCR-bearing datagrams into one sendmmsg, spiking
-        // PCR_OJ to tens of ms and breaking consumer receivers (see the
-        // `derive_target_raw` between-PCR interpolation note). ST 2110 /
-        // `disabled` keeps open-loop PCR-delta pacing — the raster anchor owns
-        // its clock and never reaches the servo.
-        if cfg.enabled {
+        // Pacing model (the residence cap in `run_emitter` is active whenever
+        // `cfg.enabled`, independent of this choice):
+        //   • `use_servo` (opt-in, BILBYCAST_EGRESS_SERVO=1) → the closed-loop
+        //     rate leaky bucket: smooth UNIFORM-RATE release holding residence
+        //     near `setpoint_ms`. Bounds latency on a sustained source-vs-
+        //     wallclock offset with NO drift-shed, but smooths *rate* not *PCR
+        //     instants*, so per-packet PCR_AC degrades to tens/hundreds of ms.
+        //   • default (open-loop PCR-delta `derive_target`) → emits each packet
+        //     at its PCR-implied wall instant: PCR_AC ≈ the source's own PDV
+        //     (tier-2), and the `.max(now)` guard self-drains any backlog so
+        //     egress latency stays low. The residence cap is the sole runaway
+        //     bound. This is the tier-1 default for PCR-disciplined sources.
+        // ST 2110 / `disabled` (cfg.enabled == false) always uses open-loop —
+        // its raster anchor owns the clock and never reaches the servo.
+        if cfg.enabled && cfg.forward_cadence {
+            // Forward at input cadence: emit at the instant the datagram arrived,
+            // no re-pacing — preserving the source's own (already-paced) timing.
+            // No anchor bookkeeping: nothing here consumes `last_returned_ns` /
+            // `wall_anchor`, and the residence-cap shed re-anchors on its own if
+            // it ever fires (it won't at steady state — depth stays ~0). The
+            // receiver re-clocks from the untouched PCR.
+            now_ns
+        } else if cfg.enabled && cfg.use_servo {
             self.derive_target_servo(now_ns, datagram_pcr, datagram_bytes, depth, cfg)
         } else {
             self.derive_target(now_ns, datagram_pcr, datagram_bytes)
@@ -1058,12 +1155,11 @@ impl TargetState {
     /// byte/rate, not by PCR delta. The PCR field in the bytes is never
     /// rewritten — the receiver re-clocks from it exactly as before.
     ///
-    /// OPT-IN only (egress_buffer_ms set). NOTE: a Lossless output CAN take the
-    /// SO_TXTIME / etf path now, and the servo + SO_TXTIME can co-run — so this
-    /// path applies its OWN `MAX_FUTURE_LOOKAHEAD_NS` cap on the computed target
-    /// (mirroring `derive_target`) to bound the launch time handed to the etf
-    /// qdisc; without it a source overrun would walk the kernel launch time
-    /// arbitrarily far into the future.
+    /// OPT-IN only (egress_buffer_ms set). The computed target is bounded by its
+    /// OWN `MAX_FUTURE_LOOKAHEAD_NS` cap (mirroring `derive_target`): a sustained
+    /// source overrun would otherwise walk the `clock_nanosleep` wake target
+    /// arbitrarily far into the future, parking datagrams in the wire queue. The
+    /// cap keeps servo latency bounded to the same ceiling as the legacy path.
     fn derive_target_servo(
         &mut self,
         now_ns: u64,
@@ -1180,10 +1276,10 @@ impl TargetState {
             .last_returned_ns
             .saturating_add(interval_ns)
             .max(now_ns) // drained buffer (target in the past) → emit ASAP
-            // Bound the lookahead like `derive_target` does: the servo can
-            // co-run with SO_TXTIME, so an unbounded target would walk the etf
-            // qdisc launch time arbitrarily far into the future on a source
-            // overrun. The residence-cap shed is keyed to arrival time and
+            // Bound the lookahead like `derive_target` does: an unbounded target
+            // would walk the `clock_nanosleep` wake time arbitrarily far into
+            // the future on a sustained source overrun, parking datagrams in the
+            // wire queue. The residence-cap shed is keyed to arrival time and
             // would NOT catch a future-targeted datagram — this is the cap that
             // does. Caps servo latency to the same 200 ms as the legacy path.
             .min(now_ns.saturating_add(MAX_FUTURE_LOOKAHEAD_NS));
@@ -2202,7 +2298,29 @@ mod tests {
         assert!(DejitterConfig::servo().enabled);
         assert!(!DejitterConfig::disabled().enabled);
         assert!(!DejitterConfig::default().enabled);
-        assert_eq!(DejitterConfig::servo().shed_residence_us(), 250_000);
+        // Residence cap default raised to 1000 ms (must clear the 200 ms servo
+        // lookahead + the contribution burst envelope so the cap is a runaway
+        // bound, not a normal-operation shedder).
+        assert_eq!(DejitterConfig::servo().shed_residence_us(), 1_000_000);
+        // Default pacer is FORWARD-cadence (no re-pacing; receiver re-clocks);
+        // open-loop PCR-delta and the rate servo are both opt-in via
+        // BILBYCAST_EGRESS_PACING.
+        let def = DejitterConfig::servo_with(None);
+        assert!(def.forward_cadence, "compressed default = forward cadence");
+        assert!(!def.use_servo);
+        assert!(DejitterConfig::servo().use_servo, "test helper forces servo on");
+        assert!(!DejitterConfig::servo().forward_cadence, "servo helper not forward");
+        // Forward mode dispatches to emit-now (no re-pace), regardless of PCR.
+        let mut s = warmed_servo_state(6_000_000, 1_000_000_000);
+        let fwd = DejitterConfig {
+            forward_cadence: true,
+            ..DejitterConfig::servo_with(None)
+        };
+        assert_eq!(
+            s.derive_target_paced(2_000_000_000, Some(900_000), 1316, 50, &fwd),
+            2_000_000_000,
+            "forward cadence emits at now, not a re-paced target"
+        );
     }
 
     // ── Egress de-jitter: release-rate servo (Phase 2) ──────────────────
@@ -2381,9 +2499,9 @@ mod tests {
 
     #[test]
     fn servo_target_is_capped_at_max_future_lookahead() {
-        // The servo can co-run with SO_TXTIME (Lossless is etf-eligible now),
-        // so its target must be bounded like derive_target — else a source
-        // overrun walks the kernel launch time arbitrarily far ahead. Cursor
+        // The servo's target must be bounded like derive_target — else a
+        // sustained source overrun walks the clock_nanosleep wake time
+        // arbitrarily far ahead, parking datagrams in the queue. Cursor
         // parked 10 s in the future → next target must clamp to now+lookahead.
         let cfg = DejitterConfig::servo_with(Some(60));
         let now = 1_000_000_000u64;
