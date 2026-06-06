@@ -76,7 +76,12 @@ Events are queued in an unbounded in-memory channel. When the edge is not connec
 | warning | Input '{id}' failed to add to flow '{flow_id}': {error} | Hot-add refusal. Carries structured `error_code` on `command_ack`: `active_input_in_use`, `pid_bus_input_in_use`, `hitless_leg_change_requires_restart`, `input_already_member`, `input_not_member`, `input_resource_critical`, or `port_conflict` / `bind_failed` (caught by the 600 ms bind-failure window on listener inputs). |
 | warning | Master clock source input '{id}' is being removed from flow '{flow_id}' | **R5**. The input being removed is the operator-declared master-clock source (`flow.master_clock`). The PCR PLL coasts on its last-known frequency; the master clock's auto-resolver picks the next active input and re-locks. Output PCR may briefly drift until lock. Details: `{ error_code: "master_clock_input_removed", input_id, flow_id }`. |
 
-**Source**: `src/engine/manager.rs`, `src/manager/client.rs`. Hot-swap engine paths: `FlowRuntime::{add_input, remove_input}` (`src/engine/flow.rs`).
+| warning | Edge-added A/V skew {n} ms on flow '{id}' exceeds the EBU R37 ±40 ms limit … | The exact lip-sync error introduced by this edge's PTS-touching stages (`FlowStats.av_skew`) exceeded ±40 ms for two consecutive 5 s polls. Details: `{ error_code: "av_skew_exceeded", skew_ms, worst_abs_ms, lipsync_trim_ms, threshold_ms }`. The configured lipsync trim counts toward the skew (a ±100 ms deliberate trim WILL alarm — by design, the operator asked for an offset that large). |
+| info | Edge-added A/V skew on flow '{id}' recovered to {n} ms | Skew back under 30 ms (hysteresis). Details: `{ error_code: "av_skew_recovered", skew_ms }`. |
+| warning | A/V mux interleave p95 {n} ms on flow '{id}' — not a lip-sync fault, but receivers buffering less than this … | Windowed p95 of `OutputStats.av_interleave` exceeded 1200 ms for two consecutive polls. NOT a lip-sync defect — guidance that consumer players with ~1 s default caching (VLC) will starve their audio queue on this stream. Details: `{ error_code: "av_interleave_deep", window_p95_abs_ms, threshold_ms }`. |
+| info | A/V mux interleave on flow '{id}' recovered to p95 {n} ms | Windowed p95 back under 900 ms. Details: `{ error_code: "av_interleave_recovered", window_p95_abs_ms }`. |
+
+**Source**: `src/engine/manager.rs`, `src/manager/client.rs`. Hot-swap engine paths: `FlowRuntime::{add_input, remove_input}` (`src/engine/flow.rs`). A/V quality watcher: `src/engine/av_quality_watch.rs`.
 
 > Note: the R5 `master_clock_input_removed` event above rides the **`flow`**
 > category. The PLL fallback / recovery events below use a separate

@@ -547,10 +547,10 @@ async fn rist_output_loop(
                             .bytes_sent
                             .fetch_add(datagram.len() as u64, Ordering::Relaxed);
                         stats.record_latency(packet.recv_time_us);
-                        // A/V sync drift: feed every TS packet.
+                        // A/V interleave: feed every TS packet.
                         let mut off = 0;
                         while off + 188 <= datagram.len() {
-                            stats.observe_av_sync_packet(&datagram[off..off + 188]);
+                            stats.observe_av_interleave_packet(&datagram[off..off + 188]);
                             off += 188;
                         }
                     }

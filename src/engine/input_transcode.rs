@@ -200,6 +200,22 @@ impl InputTranscoder {
         }
     }
 
+    /// Wire the per-input edge-added A/V skew reporter onto both
+    /// replacer stages (`stats::av_skew`). Called by
+    /// `register_ingress_stats` so every input module gets it without
+    /// per-module wiring.
+    pub fn set_av_skew_reporter(
+        &mut self,
+        reporter: Arc<crate::stats::av_skew::AvSkewReporter>,
+    ) {
+        if let Some(a) = self.audio.as_mut() {
+            a.set_av_skew_reporter(reporter.clone());
+        }
+        if let Some(v) = self.video.as_mut() {
+            v.set_av_skew_reporter(reporter);
+        }
+    }
+
     /// Wire the **per-input** PCR forward-jump signal channel onto
     /// the audio replacer (the video replacer doesn't silence-pad —
     /// video PES values follow the source PCR jump). The
@@ -405,6 +421,12 @@ pub fn register_ingress_stats(
 ) {
     use crate::stats::collector::EgressMediaSummaryStatic;
 
+    // Edge-added A/V skew: get-or-create this input's reporter and hand
+    // it to the replacer stages. Idempotent (DashMap entry per input id),
+    // so the InputPostProcess construction in each input module can call
+    // `av_skew_reporter_for_input` again for the rewriter side.
+    let av_skew = flow_stats.av_skew_reporter_for_input(input_id);
+
     // Track which stages we registered so the static descriptor below can
     // be set from a single moved-out `transcoder` reference.
     let has_audio_stage_via_transcoder;
@@ -413,6 +435,7 @@ pub fn register_ingress_stats(
     if let Some(t) = transcoder {
         has_audio_stage_via_transcoder = t.has_audio();
         has_video_stage_via_transcoder = t.has_video();
+        t.set_av_skew_reporter(av_skew.clone());
 
         // ── Audio: register decode + encode handles when an audio stage
         // is active so the manager UI's inputs-live snapshot carries both
@@ -773,6 +796,7 @@ mod tests {
             passthrough_clock: false,
             av_sync_pacer: None,
             pcr_jump_signal: None,
+            av_skew: None,
         })
         .expect("rewriter active");
 

@@ -196,6 +196,66 @@ see [`events-and-alarms.md`](events-and-alarms.md#master-clock-master_clock).
 
 **Source:** `src/engine/master_clock.rs` (telemetry snapshot), mirrored into `src/stats/models.rs::MasterClockStats`. Full model: [`clocking.md`](clocking.md#telemetry).
 
+## Edge-added A/V skew (`FlowStats.av_skew`, `OutputStats.av_skew`)
+
+> **Not exposed through Prometheus.** Structured object on the WS `stats`
+> snapshot, consumed by the manager UI's "Lip-sync (edge-added)" strip.
+
+The **exact lip-sync error this edge introduces**, derived from the
+PTS-touching stages' own `(output − source)` PTS deltas — not estimated
+from the mux. At a TS tap true lip-sync is not observable (receivers pair
+A/V by PTS regardless of interleave); what IS exactly knowable is how much
+the edge shifted the audio↔video PTS relationship vs the source:
+
+| Field | Meaning |
+|---|---|
+| `skew_ms` | Signed edge-added skew. **> 0 ⇒ audio presented LATER than video** relative to the source's own alignment. EBU R37 applies to THIS number: warn > 20 ms, error > 40 ms. |
+| `worst_abs_ms` | Worst \|skew\| since flow start / input switch. |
+| `lipsync_trim_ms` | The operator-configured lipsync trim portion included in `skew_ms` (deliberate offset, not defect). |
+| `mode` | `"passthrough"` (no PTS-modifying stage active — source A/V preserved bit-exactly, skew 0 by construction) or `"measured"`. |
+
+Contributing stages: `engine::ts_pts_rewriter` (single shared anchor → only
+the lipsync trim), `engine::ts_audio_replace` (re-encode sample clock —
+where loop-seam drift historically lived), `engine::ts_video_replace`
+(source-PTS queue → 0 by design, reported for regression visibility).
+`FlowStats.av_skew` covers the ACTIVE input's path; `OutputStats.av_skew`
+appears additionally on outputs with their own `audio_encode` /
+`video_encode`. Capability bit: `av-skew`.
+
+**Source:** `src/stats/av_skew.rs`.
+
+## A/V mux interleave (`FlowStats.av_interleave_flow`, `OutputStats.av_interleave`)
+
+> Hard-renamed from `av_sync_flow` / `av_sync` 2026-06-06. **This is NOT
+> lip-sync** — the old name plus EBU coloring caused repeated false drift
+> alarms.
+
+Signed `video_PES_PTS − audio_PES_PTS` as last seen in the byte stream at
+egress = how far apart the two ES sit in MUX POSITION. Positive = video
+muxed ahead (normal broadcast T-STD geometry, legitimately 0.3–1.5 s).
+What it bounds is the **receiver buffering requirement**: a player must
+buffer at least this much to pair late-muxed audio with video — consumer
+players defaulting to ~1 s caching (VLC) starve their audio queue when
+sustained interleave exceeds it.
+
+| Field | Meaning |
+|---|---|
+| `ewma_ms` | Signed EWMA (~4–6 s time constant). Replaces the old lifetime average, whose slow post-switch convergence read as "drift". |
+| `p50/p95/p99_abs_ms`, `max_abs_ms` | Over the ~4096-sample rolling reservoir (≈1 min at PES cadence). |
+| `window_p95_abs_ms` | Short 256-sample window. |
+| `video_pid` / `audio_pid` | Self-discovered from PAT/PMT. |
+
+Also serialized: `samples` (reservoir occupancy) and
+`cumulative_samples`. Resets automatically on input switch (the collector
+hooks `set_active_input_id`). **Known limitation**: deltas beyond ±2 s are
+treated as discontinuities and discarded, so interleave that jumps past
+2 s stops producing samples — the percentiles go stale rather than
+reporting the (extreme) value, and `av_interleave_deep` will not fire for
+it.
+
+**Source:** `src/stats/av_interleave.rs`, fed per TS packet from
+`engine::wire_emit` (UDP/RTP), `engine::output_srt`, `engine::output_rist`.
+
 ## Wire-pacing and egress de-jitter telemetry (`OutputStats`)
 
 > **Not exposed through Prometheus.** These are additive fields on the

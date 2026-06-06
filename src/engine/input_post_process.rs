@@ -73,6 +73,13 @@ pub struct InputPostProcessConfig<'a> {
     /// passthrough or test setup).
     pub pcr_jump_signal:
         Option<&'a Arc<std::sync::atomic::AtomicI64>>,
+    /// **Per-input** edge-added A/V skew reporter (`stats::av_skew`).
+    /// The muxer-mode rewriter reports its lipsync-trim contribution
+    /// here. Obtain via
+    /// `FlowStatsAccumulator::av_skew_reporter_for_input` (idempotent
+    /// get-or-create, same Arc the replacer stages receive through
+    /// `register_ingress_stats`). `None` disables reporting (tests).
+    pub av_skew: Option<&'a Arc<crate::stats::av_skew::AvSkewReporter>>,
 }
 
 /// Composite TS post-processor for inputs.
@@ -138,6 +145,9 @@ impl InputPostProcess {
                     // active input's audio.
                     if let Some(s) = cfg.pcr_jump_signal {
                         r.set_pcr_jump_signal(s.clone());
+                    }
+                    if let Some(rep) = cfg.av_skew {
+                        r.set_av_skew_reporter(rep.clone());
                     }
                     Some(r)
                 }
@@ -359,6 +369,7 @@ mod tests {
             passthrough_clock: false,
             av_sync_pacer: None,
             pcr_jump_signal: None,
+            av_skew: None,
         })
         .expect("rewriter must be built when pid_overrides is non-empty");
 
@@ -467,6 +478,7 @@ mod tests {
             passthrough_clock: false,
             av_sync_pacer: Some(&pacer),
             pcr_jump_signal: None,
+            av_skew: None,
         });
         assert!(
             post.is_none(),
@@ -489,6 +501,7 @@ mod tests {
             passthrough_clock: false,
             av_sync_pacer: Some(&pacer),
             pcr_jump_signal: None,
+            av_skew: None,
         });
         assert!(
             post.is_some(),

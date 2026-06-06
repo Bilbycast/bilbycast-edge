@@ -933,6 +933,16 @@ impl FlowRuntime {
         // of input type; for non-TS flows it just stays at zero.
         let tr101290_acc = Arc::new(Tr101290Accumulator::new());
         flow_stats.tr101290.set(tr101290_acc.clone()).ok();
+
+        // A/V quality threshold watcher: edge-added skew (EBU R37) +
+        // mux-interleave depth (receiver-buffering guidance). Cheap 5 s
+        // poll over the flow's own accumulators; transition events only.
+        let _av_quality_handle = crate::engine::av_quality_watch::spawn_av_quality_watch(
+            config.config.id.clone(),
+            flow_stats.clone(),
+            event_sender.clone(),
+            cancel_token.child_token(),
+        );
         let analyzer_handle = if active_input_cfg.map_or(false, |i| i.is_ts_carrier()) {
             spawn_tr101290_analyzer(
                 &broadcast_tx,
@@ -2845,6 +2855,10 @@ impl FlowRuntime {
             // Detach the per-input thumbnail accumulator so the stats
             // snapshot stops surfacing this input's last-thumbnail.
             self.stats.per_input_thumbnails.remove(input_id);
+            // Drop the input's A/V skew reporter — a re-add of the same
+            // id must start with fresh stage state, not the removed
+            // incarnation's frozen deltas (adversarial review 2026-06-06).
+            self.stats.remove_av_skew_reporter(input_id);
         }
 
         // Drop from live_inputs + registered_input_ids.

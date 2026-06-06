@@ -85,6 +85,7 @@ pub fn spawn_whip_input(
         // process only does program_filter (no-op) + pid_map. No
         // `passthrough_clock` on WebrtcInputConfig — TsMuxer already
         // controls PTS.
+        let av_skew_for_post = stats.as_ref().av_skew_reporter_for_input(&input_id);
         let mut post = InputPostProcess::from_config(&InputPostProcessConfig {
             program_number: config.program_number,
             pid_overrides: None,
@@ -92,6 +93,7 @@ pub fn spawn_whip_input(
             passthrough_clock: false,
             av_sync_pacer: None,
             pcr_jump_signal: None,
+            av_skew: Some(&av_skew_for_post),
         });
         if let Some(ref _p) = post {
             tracing::info!("WHIP input: ingress post-process active");
@@ -345,6 +347,7 @@ pub fn spawn_whep_input(
             config.audio_encode.as_ref(),
             config.video_encode.as_ref(),
         );
+        let av_skew_for_post = stats.as_ref().av_skew_reporter_for_input(&input_id);
         let mut post = InputPostProcess::from_config(&InputPostProcessConfig {
             program_number: config.program_number,
             pid_overrides: None,
@@ -352,6 +355,7 @@ pub fn spawn_whep_input(
             passthrough_clock: false,
             av_sync_pacer: None,
             pcr_jump_signal: None,
+            av_skew: Some(&av_skew_for_post),
         });
         if let Some(ref _p) = post {
             tracing::info!("WHEP input: ingress post-process active");

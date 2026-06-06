@@ -1651,12 +1651,12 @@ fn run_emitter(
                         if let Some(pcr) = entry.pcr_27mhz {
                             stats.record_pcr_egress(pcr, now_us);
                         }
-                        // A/V sync drift: feed every TS packet.
+                        // A/V interleave: feed every TS packet.
                         let ts_start = entry.dg.ts_offset.min(entry.dg.bytes.len());
                         let ts_data = &entry.dg.bytes[ts_start..];
                         let mut off = 0;
                         while off + 188 <= ts_data.len() {
-                            stats.observe_av_sync_packet(&ts_data[off..off + 188]);
+                            stats.observe_av_interleave_packet(&ts_data[off..off + 188]);
                             off += 188;
                         }
                     }
@@ -1736,12 +1736,12 @@ fn run_emitter(
                     if let Some(pcr) = pcr_27mhz {
                         stats.record_pcr_egress(pcr, crate::util::time::now_us());
                     }
-                    // A/V sync drift: feed every TS packet.
+                    // A/V interleave: feed every TS packet.
                     let ts_start = dg.ts_offset.min(dg.bytes.len());
                     let ts_data = &dg.bytes[ts_start..];
                     let mut off = 0;
                     while off + 188 <= ts_data.len() {
-                        stats.observe_av_sync_packet(&ts_data[off..off + 188]);
+                        stats.observe_av_interleave_packet(&ts_data[off..off + 188]);
                         off += 188;
                     }
                 }

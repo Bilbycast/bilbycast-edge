@@ -139,6 +139,7 @@ async fn run_inner(
     // Synthetic-TS — TsMuxer handles pid_overrides. No `passthrough_clock`
     // on TestPatternInputConfig: the pattern generator already controls
     // every PTS it emits, so there's no source clock to re-anchor against.
+    let av_skew_for_post = stats.as_ref().av_skew_reporter_for_input(input_id);
     let mut post = crate::engine::input_post_process::InputPostProcess::from_config(
         &crate::engine::input_post_process::InputPostProcessConfig {
             program_number: config.program_number,
@@ -147,6 +148,7 @@ async fn run_inner(
             passthrough_clock: false,
             av_sync_pacer: None,
             pcr_jump_signal: None,
+            av_skew: Some(&av_skew_for_post),
         },
     );
     if let Some(ref _p) = post {

@@ -15,6 +15,7 @@
 
 pub mod collector;
 pub mod models;
-pub mod av_sync;
+pub mod av_interleave;
+pub mod av_skew;
 pub mod pcr_trust;
 pub mod throughput;

@@ -269,6 +269,7 @@ async fn run(
     // the muxer; for TS-passthrough files, the post-process rewriter
     // re-PIDs them.
     let passthrough_clock = config.passthrough_clock.unwrap_or(false);
+    let av_skew_for_post = stats.as_ref().av_skew_reporter_for_input(&input_id);
     let mut post = crate::engine::input_post_process::InputPostProcess::from_config(
         &crate::engine::input_post_process::InputPostProcessConfig {
             program_number: config.program_number,
@@ -277,6 +278,7 @@ async fn run(
             passthrough_clock,
             av_sync_pacer: av_sync_pacer.as_ref(),
             pcr_jump_signal: Some(&pcr_jump_signal),
+            av_skew: Some(&av_skew_for_post),
         },
     );
     if let Some(ref _p) = post {

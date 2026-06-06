@@ -740,10 +740,10 @@ async fn srt_output_forward_loop(
                     send_stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                     send_stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
                     send_stats.record_latency(recv_time_us);
-                    // A/V sync drift: feed every TS packet.
+                    // A/V interleave: feed every TS packet.
                     let mut off = 0;
                     while off + 188 <= data.len() {
-                        send_stats.observe_av_sync_packet(&data[off..off + 188]);
+                        send_stats.observe_av_interleave_packet(&data[off..off + 188]);
                         off += 188;
                     }
                 }

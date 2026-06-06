@@ -110,12 +110,18 @@ pub struct OutputStatsAccumulator {
     // rotating reservoir (last 4096 samples).
     pcr_trust: crate::stats::pcr_trust::PcrTrustSampler,
 
-    // ── Per-output egress A/V sync drift metric ─────────────────────
+    // ── Per-output egress A/V mux-interleave metric ─────────────────
     // Fed inline by the output's send task for every 188-byte TS packet.
     // Self-bootstrapping: tracks PAT/PMT inline to discover video/audio
-    // PIDs, then measures V−A PTS offset. Same reservoir pattern as
-    // pcr_trust but signed ms values.
-    av_sync: crate::stats::av_sync::AvSyncDriftSampler,
+    // PIDs, then measures V−A PTS mux offset. Same reservoir pattern as
+    // pcr_trust but signed ms values. NOT lip-sync — see stats::av_skew.
+    av_interleave: crate::stats::av_interleave::AvInterleaveSampler,
+
+    // ── Per-output edge-added A/V skew (output-local transcode) ─────
+    // Set once by transcode_chain::build_for_output when this output
+    // carries its own audio/video re-encode stages. Absent on plain
+    // passthrough outputs (flow-level av_skew covers those).
+    av_skew: std::sync::OnceLock<std::sync::Arc<crate::stats::av_skew::AvSkewReporter>>,
 
     // ── Wire pacing: tier + late-drop counter ────────────────────────
     // The active release-path tier for this output. Set once at output
@@ -680,7 +686,8 @@ impl OutputStatsAccumulator {
             latency_sum_us: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
             pcr_trust: crate::stats::pcr_trust::PcrTrustSampler::new(),
-            av_sync: crate::stats::av_sync::AvSyncDriftSampler::new(),
+            av_interleave: crate::stats::av_interleave::AvInterleaveSampler::new(),
+            av_skew: std::sync::OnceLock::new(),
             wire_pacing_tier: OnceLock::new(),
             wire_pacing_late: AtomicU64::new(0),
             wire_pacing_pinned_cpu: AtomicI32::new(-1),
@@ -737,18 +744,25 @@ impl OutputStatsAccumulator {
         &self.pcr_trust
     }
 
-    /// Feed one 188-byte TS packet at egress for A/V sync drift
+    /// Feed one 188-byte TS packet at egress for A/V mux-interleave
     /// measurement. The sampler internally tracks PAT/PMT to discover
-    /// video/audio PIDs, then measures V−A PTS offset. Call once per
+    /// video/audio PIDs, then measures V−A PTS mux offset. Call once per
     /// TS packet in the output's send loop.
     #[inline]
-    pub fn observe_av_sync_packet(&self, pkt: &[u8]) {
-        self.av_sync.observe_packet(pkt);
+    pub fn observe_av_interleave_packet(&self, pkt: &[u8]) {
+        self.av_interleave.observe_packet(pkt);
     }
 
-    /// Borrow the A/V sync sampler for flow-level rollup.
-    pub fn av_sync_sampler(&self) -> &crate::stats::av_sync::AvSyncDriftSampler {
-        &self.av_sync
+    /// Borrow the A/V interleave sampler for flow-level rollup / reset.
+    pub fn av_interleave_sampler(&self) -> &crate::stats::av_interleave::AvInterleaveSampler {
+        &self.av_interleave
+    }
+
+    /// Register the output-local edge-added A/V skew reporter (set by
+    /// `transcode_chain::build_for_output` when this output re-encodes
+    /// audio and/or video). First call wins.
+    pub fn set_av_skew_reporter(&self, r: std::sync::Arc<crate::stats::av_skew::AvSkewReporter>) {
+        let _ = self.av_skew.set(r);
     }
 
     /// Register the per-output transcoder stats handle. Called once at
@@ -1193,7 +1207,8 @@ impl OutputStatsAccumulator {
             // self-contained.
             egress_summary: None,
             pcr_trust: self.pcr_trust.snapshot(),
-            av_sync: self.av_sync.snapshot(),
+            av_interleave: self.av_interleave.snapshot(),
+            av_skew: self.av_skew.get().map(|r| r.snapshot()),
             display_stats,
             wire_pacing_tier: self.wire_pacing_tier.get().cloned(),
             wire_pacing_late: self.wire_pacing_late.load(Ordering::Relaxed),
@@ -2388,6 +2403,11 @@ pub struct FlowStatsAccumulator {
     /// handles don't leak into the reported ingress pipeline after a switch.
     input_transcode_stats:
         DashMap<String, Arc<crate::engine::audio_transcode::TranscodeStats>>,
+    /// Per-input-id edge-added A/V skew reporters (`stats::av_skew`).
+    /// Each input's PTS-touching stages (rewriter trim, audio/video
+    /// transcode) publish their (output − source) PTS deltas here; the
+    /// snapshot reads the entry keyed by `active_input_id`.
+    av_skew_reporters: DashMap<String, Arc<crate::stats::av_skew::AvSkewReporter>>,
     /// Per-input-id map of AAC decode stage handles + descriptors. Wrapped
     /// in `Arc` so the owning ingress replacer can keep a clone and refresh
     /// the source-codec label whenever the PMT learns a new stream_type
@@ -2555,6 +2575,7 @@ impl FlowStatsAccumulator {
             ptp_state: OnceLock::new(),
             red_blue_stats: OnceLock::new(),
             active_input_id: std::sync::RwLock::new(String::new()),
+            av_skew_reporters: DashMap::new(),
             input_transcode_stats: DashMap::new(),
             input_audio_decode_stats: DashMap::new(),
             input_audio_encode_stats: DashMap::new(),
@@ -2792,9 +2813,76 @@ impl FlowStatsAccumulator {
     /// during startup and on every input switch. The empty string means
     /// "no active input" (the flow is idle).
     pub fn set_active_input_id(&self, id: &str) {
+        let changed = self
+            .active_input_id
+            .read()
+            .map(|g| *g != id)
+            .unwrap_or(true);
         if let Ok(mut guard) = self.active_input_id.write() {
             *guard = id.to_string();
         }
+        if changed {
+            // Input switch: the old input's interleave geometry and skew
+            // history are meaningless for the new input — reset so the
+            // dashboard never averages across the switch (the old
+            // lifetime average converging post-switch read as "drift",
+            // 2026-06-06).
+            for out_entry in self.output_stats.iter() {
+                out_entry.value().av_interleave_sampler().reset();
+            }
+            if let Some(r) = self.av_skew_reporters.get(id) {
+                r.value().reset_worst();
+            }
+        }
+    }
+
+    /// Snapshot the ACTIVE input's edge-added A/V skew (for the
+    /// per-flow quality watcher — avoids building a full FlowStats).
+    pub fn active_av_skew_snapshot(&self) -> Option<crate::stats::models::AvSkewStats> {
+        let active = self
+            .active_input_id
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        self.av_skew_reporters
+            .get(&active)
+            .map(|r| r.value().snapshot())
+    }
+
+    /// Worst per-output A/V interleave windowed p95 across all outputs
+    /// (for the per-flow quality watcher).
+    pub fn worst_av_interleave_window_p95_ms(&self) -> Option<i64> {
+        let mut worst: Option<i64> = None;
+        for out_entry in self.output_stats.iter() {
+            if let Some(snap) = out_entry.value().av_interleave_sampler().snapshot() {
+                worst = Some(worst.map_or(snap.window_p95_abs_ms, |w: i64| {
+                    w.max(snap.window_p95_abs_ms)
+                }));
+            }
+        }
+        worst
+    }
+
+    /// Drop an input's edge-added A/V skew reporter. Called by
+    /// `FlowRuntime::remove_input` — without this, re-adding the same
+    /// input id with its transcode stage removed resurrects the old
+    /// incarnation's frozen `mode="measured"` skew forever (adversarial
+    /// review 2026-06-06).
+    pub fn remove_av_skew_reporter(&self, input_id: &str) {
+        self.av_skew_reporters.remove(input_id);
+    }
+
+    /// Get-or-create the edge-added A/V skew reporter for an input.
+    /// Called by each input task at startup; the same Arc is handed to
+    /// every PTS-touching stage on that input's chain.
+    pub fn av_skew_reporter_for_input(
+        &self,
+        input_id: &str,
+    ) -> Arc<crate::stats::av_skew::AvSkewReporter> {
+        self.av_skew_reporters
+            .entry(input_id.to_string())
+            .or_insert_with(|| Arc::new(crate::stats::av_skew::AvSkewReporter::new()))
+            .clone()
     }
 
     /// Register the primary RIST input's shared stats handle. Called once
@@ -3118,12 +3206,12 @@ impl FlowStatsAccumulator {
             acc
         };
 
-        // Flow-level A/V sync drift rollup. Pick the output with the
+        // Flow-level A/V mux-interleave rollup. Pick the output with the
         // worst |p95| — gives operators "the most problematic output".
-        let av_sync_flow = {
-            let mut worst: Option<crate::stats::models::AvSyncStats> = None;
+        let av_interleave_flow = {
+            let mut worst: Option<crate::stats::models::AvInterleaveStats> = None;
             for out_entry in self.output_stats.iter() {
-                if let Some(snap) = out_entry.value().av_sync_sampler().snapshot() {
+                if let Some(snap) = out_entry.value().av_interleave_sampler().snapshot() {
                     let dominated = worst
                         .as_ref()
                         .is_none_or(|w| snap.p95_abs_ms.abs() > w.p95_abs_ms.abs());
@@ -3133,6 +3221,20 @@ impl FlowStatsAccumulator {
                 }
             }
             worst
+        };
+
+        // Flow-level edge-added A/V skew: the ACTIVE input's reporter
+        // (each input owns its own PTS-stage chain; passive inputs keep
+        // processing and must not leak into the live number).
+        let av_skew = {
+            let active = self
+                .active_input_id
+                .read()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            self.av_skew_reporters
+                .get(&active)
+                .map(|r| r.value().snapshot())
         };
 
         FlowStats {
@@ -3319,7 +3421,8 @@ impl FlowStatsAccumulator {
             inputs_live,
             per_es,
             pcr_trust_flow,
-            av_sync_flow,
+            av_interleave_flow,
+            av_skew,
             content_analysis: self.content_analysis.get().map(|acc| acc.snapshot()),
             #[cfg(feature = "replay")]
             recording: self.recording_stats.get().map(|s| {

@@ -140,6 +140,7 @@ pub fn spawn_rtmp_input(
         // (TsMuxer always emits program 1) but harmless; pid_map can
         // still mechanically remap on top.
         let passthrough_clock = config.passthrough_clock.unwrap_or(false);
+        let av_skew_for_post = stats.as_ref().av_skew_reporter_for_input(&input_id);
         let mut post = InputPostProcess::from_config(&InputPostProcessConfig {
             program_number: config.program_number,
             pid_overrides: None,
@@ -147,6 +148,7 @@ pub fn spawn_rtmp_input(
             passthrough_clock,
             av_sync_pacer: av_sync_pacer.as_ref(),
             pcr_jump_signal: Some(&pcr_jump_signal),
+            av_skew: Some(&av_skew_for_post),
         });
         if let Some(ref _p) = post {
             tracing::info!(

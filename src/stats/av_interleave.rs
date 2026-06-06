@@ -1,12 +1,24 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-output egress A/V sync drift metric.
+//! Per-output egress A/V **mux-interleave** metric.
 //!
-//! Measures `video_PES_PTS − audio_PES_PTS` at the egress point for every
-//! TS-bearing output. Positive = video late relative to audio, negative =
-//! video early. Units are **milliseconds** (A/V sync is meaningful at ms,
-//! not µs). EBU R37 thresholds: |p95| > 20 ms = warning, > 40 ms = error.
+//! Measures `video_PES_PTS − audio_PES_PTS` as last seen in the byte
+//! stream at egress — i.e. how far apart the audio and video elementary
+//! streams sit in MUX POSITION. Positive = video PES carry larger PTS
+//! than the audio PES alongside them (video muxed ahead — the normal
+//! broadcast T-STD geometry).
+//!
+//! **This is NOT lip-sync.** A compliant receiver pairs A/V by PTS
+//! regardless of interleave; what this number bounds is the RECEIVER
+//! BUFFERING REQUIREMENT — a player must buffer at least this much to
+//! pair late-muxed audio with its video (VLC's default network caching
+//! is ~1 s; sustained interleave beyond that starves its audio queue).
+//! Broadcast muxes legitimately run 0.3–1.5 s here. Do NOT apply EBU
+//! R37 lip-sync thresholds to this metric — edge-added lip-sync error
+//! is the separate `stats::av_skew` metric (exact, from the PTS-rewrite
+//! stages). Renamed from `av_sync` 2026-06-06 after the metric's EBU
+//! framing caused two false drift alarms.
 //!
 //! Self-bootstrapping: the sampler watches for PAT → PMT inline and
 //! discovers the first video and first audio PID automatically. No
@@ -24,10 +36,10 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use crate::engine::ts_parse;
-use crate::stats::models::AvSyncStats;
+use crate::stats::models::AvInterleaveStats;
 
-pub const AV_SYNC_RESERVOIR_SIZE: usize = 4096;
-pub const AV_SYNC_WINDOW_SAMPLES: usize = 256;
+pub const AV_INTERLEAVE_RESERVOIR_SIZE: usize = 4096;
+pub const AV_INTERLEAVE_WINDOW_SAMPLES: usize = 256;
 
 /// Samples with |V−A offset| larger than this are treated as straddling
 /// a discontinuity (input switch, stream restart, PTS wrap) and discarded.
@@ -35,13 +47,13 @@ pub const AV_SYNC_WINDOW_SAMPLES: usize = 256;
 /// deltas of 1–2 seconds (video muxed ahead of audio by the T-STD buffer
 /// depth). 2000 ms accommodates deep-buffered broadcast muxes while still
 /// filtering genuine discontinuities.
-pub const AV_SYNC_MAX_DRIFT_MS: i64 = 2000;
+pub const AV_INTERLEAVE_MAX_MS: i64 = 2000;
 
-pub struct AvSyncDriftSampler {
-    state: Mutex<AvSyncState>,
+pub struct AvInterleaveSampler {
+    state: Mutex<AvInterleaveState>,
 }
 
-struct AvSyncState {
+struct AvInterleaveState {
     samples: VecDeque<i64>,
     // Inline PSI tracking
     pmt_pid: Option<u16>,
@@ -52,16 +64,19 @@ struct AvSyncState {
     // Last observed PTS per stream type
     last_video_pts_90k: Option<u64>,
     last_audio_pts_90k: Option<u64>,
-    // Cumulative counters (survive reservoir rollover)
-    cumulative_drift_sum_ms: i64,
+    // EWMA of the signed interleave (alpha 1/256 ≈ 2-5 s time constant
+    // at the 56-107 Hz combined A+V PES cadence). Replaces the old
+    // lifetime average, whose slow convergence after an input switch
+    // read as "drift" on dashboards (2026-06-06).
+    ewma_ms: Option<f64>,
     cumulative_samples: u64,
 }
 
-impl AvSyncDriftSampler {
+impl AvInterleaveSampler {
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(AvSyncState {
-                samples: VecDeque::with_capacity(AV_SYNC_RESERVOIR_SIZE),
+            state: Mutex::new(AvInterleaveState {
+                samples: VecDeque::with_capacity(AV_INTERLEAVE_RESERVOIR_SIZE),
                 pmt_pid: None,
                 video_pid: None,
                 audio_pid: None,
@@ -69,7 +84,7 @@ impl AvSyncDriftSampler {
                 last_pmt_version: None,
                 last_video_pts_90k: None,
                 last_audio_pts_90k: None,
-                cumulative_drift_sum_ms: 0,
+                ewma_ms: None,
                 cumulative_samples: 0,
             }),
         }
@@ -194,7 +209,7 @@ impl AvSyncDriftSampler {
         }
     }
 
-    pub fn snapshot(&self) -> Option<AvSyncStats> {
+    pub fn snapshot(&self) -> Option<AvInterleaveStats> {
         let state = match self.state.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -213,7 +228,7 @@ impl AvSyncDriftSampler {
         let max_abs_ms = *abs_sorted.last().unwrap_or(&0);
 
         // Short-window p95
-        let window_len = abs_sorted.len().min(AV_SYNC_WINDOW_SAMPLES);
+        let window_len = abs_sorted.len().min(AV_INTERLEAVE_WINDOW_SAMPLES);
         let window_p95_abs_ms = if window_len >= 2 {
             let mut window: Vec<i64> = state
                 .samples
@@ -228,16 +243,12 @@ impl AvSyncDriftSampler {
             p95_abs_ms
         };
 
-        let avg_ms = if state.cumulative_samples > 0 {
-            state.cumulative_drift_sum_ms / state.cumulative_samples as i64
-        } else {
-            0
-        };
+        let ewma_ms = state.ewma_ms.map(|e| e.round() as i64).unwrap_or(0);
 
-        Some(AvSyncStats {
+        Some(AvInterleaveStats {
             samples: state.samples.len() as u64,
             cumulative_samples: state.cumulative_samples,
-            avg_ms,
+            ewma_ms,
             p50_abs_ms,
             p95_abs_ms,
             p99_abs_ms,
@@ -248,9 +259,25 @@ impl AvSyncDriftSampler {
             audio_pid: state.audio_pid.unwrap_or(0),
         })
     }
+
+    /// Clear measurement state on input switch so the new input's
+    /// interleave geometry isn't averaged against the old one. PSI/PID
+    /// learning is kept — the continuity fixer re-injects versioned
+    /// PAT/PMT on switch, which relearns PIDs through the normal path.
+    pub fn reset(&self) {
+        let mut state = match self.state.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.samples.clear();
+        state.last_video_pts_90k = None;
+        state.last_audio_pts_90k = None;
+        state.ewma_ms = None;
+        state.cumulative_samples = 0;
+    }
 }
 
-impl Default for AvSyncDriftSampler {
+impl Default for AvInterleaveSampler {
     fn default() -> Self {
         Self::new()
     }
@@ -258,7 +285,7 @@ impl Default for AvSyncDriftSampler {
 
 /// Compute V−A drift in milliseconds and push into the reservoir if
 /// both video and audio PTS are known and the drift is within bounds.
-fn try_record_drift(state: &mut AvSyncState) {
+fn try_record_drift(state: &mut AvInterleaveState) {
     let (v, a) = match (state.last_video_pts_90k, state.last_audio_pts_90k) {
         (Some(v), Some(a)) => (v, a),
         _ => return,
@@ -266,18 +293,25 @@ fn try_record_drift(state: &mut AvSyncState) {
 
     let drift_ms = pts_delta_ms(v, a);
 
-    if drift_ms.abs() > AV_SYNC_MAX_DRIFT_MS {
+    if drift_ms.abs() > AV_INTERLEAVE_MAX_MS {
         // Discontinuity — reset both PTS trackers
         state.last_video_pts_90k = None;
         state.last_audio_pts_90k = None;
         return;
     }
 
-    if state.samples.len() >= AV_SYNC_RESERVOIR_SIZE {
+    if state.samples.len() >= AV_INTERLEAVE_RESERVOIR_SIZE {
         state.samples.pop_front();
     }
     state.samples.push_back(drift_ms);
-    state.cumulative_drift_sum_ms = state.cumulative_drift_sum_ms.saturating_add(drift_ms);
+    // EWMA, alpha = 1/256 — at the ~40-75 Hz combined A+V PES cadence this
+    // is a ~4-6 s time constant: responsive enough to track a real change,
+    // smooth enough not to flicker per-PES.
+    let x = drift_ms as f64;
+    state.ewma_ms = Some(match state.ewma_ms {
+        Some(e) => e + (x - e) / 256.0,
+        None => x,
+    });
     state.cumulative_samples = state.cumulative_samples.saturating_add(1);
 }
 
@@ -502,13 +536,13 @@ mod tests {
 
     #[test]
     fn empty_state_returns_none() {
-        let s = AvSyncDriftSampler::new();
+        let s = AvInterleaveSampler::new();
         assert!(s.snapshot().is_none());
     }
 
     #[test]
     fn no_snapshot_without_pmt_discovery() {
-        let s = AvSyncDriftSampler::new();
+        let s = AvInterleaveSampler::new();
         // Feed a random PES packet without prior PAT/PMT — should be ignored
         let pkt = build_pes_with_pts(0x100, 90_000);
         s.observe_packet(&pkt);
@@ -517,7 +551,7 @@ mod tests {
 
     #[test]
     fn zero_drift_when_pts_aligned() {
-        let s = AvSyncDriftSampler::new();
+        let s = AvInterleaveSampler::new();
         let video_pid = 0x100;
         let audio_pid = 0x101;
         let pmt_pid = 0x1000;
@@ -530,7 +564,7 @@ mod tests {
 
         let snap = s.snapshot().expect("should have a sample");
         assert_eq!(snap.samples, 1);
-        assert_eq!(snap.avg_ms, 0);
+        assert_eq!(snap.ewma_ms, 0);
         assert_eq!(snap.p50_abs_ms, 0);
         assert_eq!(snap.video_pid, video_pid);
         assert_eq!(snap.audio_pid, audio_pid);
@@ -538,7 +572,7 @@ mod tests {
 
     #[test]
     fn positive_drift_when_video_late() {
-        let s = AvSyncDriftSampler::new();
+        let s = AvInterleaveSampler::new();
         let video_pid = 0x100;
         let audio_pid = 0x101;
         let pmt_pid = 0x1000;
@@ -550,13 +584,13 @@ mod tests {
         s.observe_packet(&build_pes_with_pts(audio_pid, 90_000));
 
         let snap = s.snapshot().unwrap();
-        assert_eq!(snap.avg_ms, 30);
+        assert_eq!(snap.ewma_ms, 30);
         assert_eq!(snap.p50_abs_ms, 30);
     }
 
     #[test]
     fn negative_drift_when_video_early() {
-        let s = AvSyncDriftSampler::new();
+        let s = AvInterleaveSampler::new();
         let video_pid = 0x100;
         let audio_pid = 0x101;
         let pmt_pid = 0x1000;
@@ -568,20 +602,20 @@ mod tests {
         s.observe_packet(&build_pes_with_pts(audio_pid, 90_000 + 1800)); // +20ms
 
         let snap = s.snapshot().unwrap();
-        assert_eq!(snap.avg_ms, -20);
+        assert_eq!(snap.ewma_ms, -20);
         assert_eq!(snap.p50_abs_ms, 20);
     }
 
     #[test]
     fn discontinuity_guard_skips_large_drift() {
-        let s = AvSyncDriftSampler::new();
+        let s = AvInterleaveSampler::new();
         let video_pid = 0x100;
         let audio_pid = 0x101;
         let pmt_pid = 0x1000;
 
         s.observe_packet(&build_pat(pmt_pid, 0));
         s.observe_packet(&build_pmt(pmt_pid, 0, video_pid, 0x1B, audio_pid, 0x0F));
-        // 2500ms offset — exceeds AV_SYNC_MAX_DRIFT_MS (2000ms) guard
+        // 2500ms offset — exceeds AV_INTERLEAVE_MAX_MS (2000ms) guard
         s.observe_packet(&build_pes_with_pts(video_pid, 90_000 + 225_000));
         s.observe_packet(&build_pes_with_pts(audio_pid, 90_000));
 
@@ -642,7 +676,7 @@ mod tests {
 
     #[test]
     fn teletext_0x06_does_not_shadow_real_audio() {
-        let s = AvSyncDriftSampler::new();
+        let s = AvInterleaveSampler::new();
         let ttx_pid = 0x2B;
         let video_pid = 0x66;
         let audio_pid = 0x67;
@@ -658,12 +692,12 @@ mod tests {
         let snap = s.snapshot().unwrap();
         assert_eq!(snap.video_pid, video_pid);
         assert_eq!(snap.audio_pid, audio_pid);
-        assert_eq!(snap.avg_ms, 30);
+        assert_eq!(snap.ewma_ms, 30);
     }
 
     #[test]
     fn fallback_to_0x06_when_no_unambiguous_audio() {
-        let s = AvSyncDriftSampler::new();
+        let s = AvInterleaveSampler::new();
         let video_pid = 0x100;
         let audio_pid = 0x101;
         let pmt_pid = 0x1000;
@@ -676,7 +710,7 @@ mod tests {
 
         let snap = s.snapshot().unwrap();
         assert_eq!(snap.audio_pid, audio_pid);
-        assert_eq!(snap.avg_ms, 10);
+        assert_eq!(snap.ewma_ms, 10);
     }
 
     /// PMT with explicit ES-info descriptor loops: video (0x1B) +
@@ -736,7 +770,7 @@ mod tests {
 
     #[test]
     fn descriptor_confirmed_ac3_0x06_wins_over_preceding_teletext() {
-        let s = AvSyncDriftSampler::new();
+        let s = AvInterleaveSampler::new();
         let ttx_pid = 0x23F;
         let video_pid = 0x1FF;
         let ac3_pid = 0x289;
@@ -754,12 +788,12 @@ mod tests {
             snap.audio_pid, ac3_pid,
             "descriptor-confirmed AC-3-in-0x06 must win over the teletext that precedes it"
         );
-        assert_eq!(snap.avg_ms, 20);
+        assert_eq!(snap.ewma_ms, 20);
     }
 
     #[test]
     fn reservoir_caps_at_configured_size() {
-        let s = AvSyncDriftSampler::new();
+        let s = AvInterleaveSampler::new();
         let video_pid = 0x100;
         let audio_pid = 0x101;
         let pmt_pid = 0x1000;
@@ -767,7 +801,7 @@ mod tests {
         s.observe_packet(&build_pat(pmt_pid, 0));
         s.observe_packet(&build_pmt(pmt_pid, 0, video_pid, 0x1B, audio_pid, 0x0F));
 
-        for i in 0..(AV_SYNC_RESERVOIR_SIZE as u64 + 500) {
+        for i in 0..(AV_INTERLEAVE_RESERVOIR_SIZE as u64 + 500) {
             let base = i * 3600; // 40ms in 90kHz
             s.observe_packet(&build_pes_with_pts(video_pid, base + 90));
             s.observe_packet(&build_pes_with_pts(audio_pid, base));
@@ -775,12 +809,12 @@ mod tests {
 
         let snap = s.snapshot().unwrap();
         assert!(
-            snap.samples as usize <= AV_SYNC_RESERVOIR_SIZE,
+            snap.samples as usize <= AV_INTERLEAVE_RESERVOIR_SIZE,
             "reservoir grew past cap: {}",
             snap.samples
         );
         assert!(
-            snap.cumulative_samples > AV_SYNC_RESERVOIR_SIZE as u64,
+            snap.cumulative_samples > AV_INTERLEAVE_RESERVOIR_SIZE as u64,
             "cumulative should keep counting: {}",
             snap.cumulative_samples
         );
@@ -788,7 +822,7 @@ mod tests {
 
     #[test]
     fn percentiles_are_ordered() {
-        let s = AvSyncDriftSampler::new();
+        let s = AvInterleaveSampler::new();
         let video_pid = 0x100;
         let audio_pid = 0x101;
         let pmt_pid = 0x1000;
@@ -811,7 +845,7 @@ mod tests {
 
     #[test]
     fn pmt_version_update_resets_pids() {
-        let s = AvSyncDriftSampler::new();
+        let s = AvInterleaveSampler::new();
         let pmt_pid = 0x1000;
 
         s.observe_packet(&build_pat(pmt_pid, 0));

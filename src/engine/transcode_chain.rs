@@ -358,6 +358,15 @@ pub fn build_for_output(
     av_sync_pacer: Option<&Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     backpressure: Option<WireBackpressure>,
 ) -> Result<Option<TranscodeChain>, TranscodeChainError> {
+    // Output-local edge-added A/V skew reporter: this output's own
+    // re-encode stages shift PTS independently of the input path, so
+    // they report into a per-output reporter surfaced on
+    // `OutputStats.av_skew` (the flow-level `FlowStats.av_skew` covers
+    // the input path).
+    let av_skew = std::sync::Arc::new(crate::stats::av_skew::AvSkewReporter::new());
+    if audio_encode.is_some() || video_encode.is_some() {
+        stats.set_av_skew_reporter(av_skew.clone());
+    }
     let audio = match audio_encode {
         Some(enc) => {
             let mut r = TsAudioReplacer::new(enc, transcode)?;
@@ -374,6 +383,7 @@ pub fn build_for_output(
             if let Some(p) = av_sync_pacer {
                 r.set_av_sync_pacer(p.clone());
             }
+            r.set_av_skew_reporter(av_skew.clone());
             // Hook the audio replacer's "output stats accumulator"
             // reference so it can refresh source-codec labels on PMT
             // updates — identical to today's inline construction.
@@ -413,6 +423,7 @@ pub fn build_for_output(
             if let Some(p) = av_sync_pacer {
                 r.set_av_sync_pacer(p.clone());
             }
+            r.set_av_skew_reporter(av_skew.clone());
             Some(r)
         }
         None => None,

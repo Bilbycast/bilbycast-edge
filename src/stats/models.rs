@@ -85,11 +85,16 @@ pub struct FlowStats {
     /// no output has yet collected enough samples. PID-bus Phase 8.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pcr_trust_flow: Option<PcrTrustStats>,
-    /// Flow-wide A/V sync drift rollup — worst-case (max absolute) p95
-    /// across all outputs. Absent when no output has collected enough
-    /// samples. Backward-compatible additive field.
+    /// Flow-wide A/V mux-interleave rollup — worst-case (max absolute)
+    /// p95 across all outputs. Absent when no output has collected
+    /// enough samples. Hard-renamed from `av_sync_flow` 2026-06-06.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub av_sync_flow: Option<AvSyncStats>,
+    pub av_interleave_flow: Option<AvInterleaveStats>,
+    /// Edge-added A/V skew (exact lip-sync error introduced by this
+    /// edge's PTS-touching stages) for the ACTIVE input's path. See
+    /// [`AvSkewStats`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub av_skew: Option<AvSkewStats>,
     /// In-depth content-analysis snapshot. Populated when the flow has
     /// `content_analysis.lite | audio_full | video_full` enabled. Each
     /// sub-field is independently optional so a partial selection (e.g.
@@ -851,11 +856,18 @@ pub struct OutputStats {
     /// PID-bus Phase 8 addition; old managers ignore unknown fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pcr_trust: Option<PcrTrustStats>,
-    /// Per-output A/V sync drift metric. Present only when the output has
-    /// forwarded both video and audio PES PTS values. Absent on audio-only,
-    /// video-only, non-TS, and freshly-started outputs. Backward-compatible.
+    /// Per-output A/V mux-interleave metric. Present only when the output
+    /// has forwarded both video and audio PES PTS values. Absent on
+    /// audio-only, video-only, non-TS, and freshly-started outputs.
+    /// Hard-renamed from `av_sync` 2026-06-06.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub av_sync: Option<AvSyncStats>,
+    pub av_interleave: Option<AvInterleaveStats>,
+    /// Output-local edge-added A/V skew from output-level transcode
+    /// stages (`audio_encode` / `video_encode` on this output). Absent
+    /// when the output transcodes nothing — the flow-level
+    /// `FlowStats.av_skew` then covers the whole path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub av_skew: Option<AvSkewStats>,
     /// Per-output local-display stats. Populated only when the output
     /// type is `display`; absent on every network-egress output.
     /// Backward-compatible additive field — old managers ignore it.
@@ -1082,19 +1094,26 @@ pub struct PcrTrustStats {
     pub window_p95_us: u64,
 }
 
-/// Egress A/V sync drift metric — signed offset between the most recent
-/// video PES PTS and audio PES PTS observed at egress. Positive = video
-/// late relative to audio. Units are milliseconds.
+/// Egress A/V **mux-interleave** metric — signed offset between the most
+/// recent video PES PTS and audio PES PTS observed in the byte stream at
+/// egress. Positive = video muxed ahead of audio (the normal broadcast
+/// T-STD geometry). Units are milliseconds.
 ///
-/// EBU R37 thresholds: |p95| > 20 ms = warning, |p95| > 40 ms = error.
-/// Measured per-output on TS-bearing network outputs (UDP, RTP, SRT,
-/// RIST). Percentiles are computed on absolute values; the signed average
-/// preserves trend direction.
+/// **This is NOT lip-sync** — receivers pair A/V by PTS regardless of
+/// interleave. It bounds the RECEIVER BUFFERING REQUIREMENT: a player
+/// must buffer at least this much to pair late-muxed audio with video.
+/// Sustained values beyond a consumer player's caching (~1 s for VLC)
+/// starve its audio queue. Edge-added lip-sync error is the separate
+/// [`AvSkewStats`]. Percentiles are over the ~4096-sample rolling
+/// reservoir (≈1 min); `ewma_ms` replaces the old lifetime average whose
+/// post-switch convergence read as "drift". Hard-renamed from
+/// `AvSyncStats` / wire key `av_sync` 2026-06-06.
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct AvSyncStats {
+pub struct AvInterleaveStats {
     pub samples: u64,
     pub cumulative_samples: u64,
-    pub avg_ms: i64,
+    /// Signed EWMA (~4-6 s time constant) of video−audio PTS at egress.
+    pub ewma_ms: i64,
     pub p50_abs_ms: i64,
     pub p95_abs_ms: i64,
     pub p99_abs_ms: i64,
@@ -1103,6 +1122,31 @@ pub struct AvSyncStats {
     pub window_p95_abs_ms: i64,
     pub video_pid: u16,
     pub audio_pid: u16,
+}
+
+/// Edge-added A/V skew — the lip-sync error THIS EDGE introduces, exact,
+/// derived from the PTS-rewrite stages' own (output − source) PTS deltas
+/// rather than estimated from the mux. `skew_ms > 0` ⇒ audio is presented
+/// LATER than video relative to the source's own A/V alignment (audio
+/// lags). Includes the operator's deliberate lipsync trim, reported
+/// separately in `lipsync_trim_ms` so dashboards can distinguish
+/// configured offset from defect.
+///
+/// `mode == "passthrough"`: no PTS-modifying stage is active on the
+/// path — the source's A/V relationship is preserved bit-exactly and the
+/// skew is 0 by construction. `mode == "measured"`: at least one stage
+/// (PTS rewriter trim, audio/video transcode) is active and the value is
+/// computed from stage anchor state. EBU R37 thresholds apply to THIS
+/// metric: |skew| > 20 ms warning, > 40 ms error.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AvSkewStats {
+    pub skew_ms: i64,
+    /// Worst |skew_ms| observed since flow start / input switch.
+    pub worst_abs_ms: i64,
+    /// The operator-configured lipsync trim portion included in `skew_ms`.
+    pub lipsync_trim_ms: i64,
+    /// "passthrough" | "measured"
+    pub mode: String,
 }
 
 /// Per-output end-to-end latency statistics for the last reporting window.

@@ -195,6 +195,22 @@ impl TsVideoReplacer {
         }
     }
 
+    /// Attach the per-input edge-added A/V skew reporter. See the inner
+    /// `av_skew` field doc-comment.
+    pub fn set_av_skew_reporter(
+        &mut self,
+        reporter: Arc<crate::stats::av_skew::AvSkewReporter>,
+    ) {
+        #[cfg(feature = "media-codecs")]
+        {
+            self.inner.av_skew = Some(reporter);
+        }
+        #[cfg(not(feature = "media-codecs"))]
+        {
+            let _ = reporter;
+        }
+    }
+
     /// Wire the shared latest-emitted-audio-PTS handle so the regenerated PCR
     /// can be floored on `min(video_pts, audio_pts)` (see the field doc). The
     /// co-running `TsAudioReplacer` writes the same `Arc`.
@@ -562,6 +578,12 @@ mod inner {
         /// from `src_pts_queue`, so A/V offset versus source is
         /// preserved. Phase 4 of the sync-mux work.
         pub av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+        /// Edge-added A/V skew reporter (`stats::av_skew`). The video
+        /// replacer stamps emitted PES with PTS dequeued from
+        /// `src_pts_queue` (= source values), so its delta is 0 by
+        /// design — reported anyway so a future regression in this
+        /// invariant becomes visible on the dashboard immediately.
+        pub av_skew: Option<Arc<crate::stats::av_skew::AvSkewReporter>>,
 
         /// Shared latest-emitted-audio-output-PTS (90 kHz), written by the
         /// co-running `TsAudioReplacer`. Used to FLOOR the regenerated PCR on
@@ -721,6 +743,7 @@ mod inner {
                 last_emitted_pts_90k: None,
                 hw_decode_pref: cfg.hw_decode.unwrap_or_default(),
                 av_sync_pacer: None,
+                av_skew: None,
                 audio_pts_floor: None,
                 pcr_audio_lag_90k: 0,
                 audio_pids: std::collections::HashSet::new(),
@@ -969,10 +992,13 @@ mod inner {
                         None => return,
                     };
                     for ef in frames {
-                        let pts_for_pes = self
-                            .src_pts_queue
-                            .pop_front()
-                            .unwrap_or(self.pts_90k);
+                        let queued = self.src_pts_queue.pop_front();
+                        if queued.is_some() {
+                            if let Some(rep) = self.av_skew.as_ref() {
+                                rep.set_video_delta(0); // PTS == source value
+                            }
+                        }
+                        let pts_for_pes = queued.unwrap_or(self.pts_90k);
                         let pes = build_video_pes(&ef.data, pts_for_pes);
                         // PCR comes from the master clock when a flow-
                         // wide pacer is attached (broadcast-grade emit);
@@ -1306,10 +1332,13 @@ mod inner {
                     // sample-counted anchor when the queue is exhausted
                     // (encoder catch-up burst emitting more frames than
                     // we've pushed inputs for since the last drain).
-                    let pts_for_pes = self
-                        .src_pts_queue
-                        .pop_front()
-                        .unwrap_or(self.pts_90k);
+                    let queued = self.src_pts_queue.pop_front();
+                    if queued.is_some() {
+                        if let Some(rep) = self.av_skew.as_ref() {
+                            rep.set_video_delta(0); // PTS == source value
+                        }
+                    }
+                    let pts_for_pes = queued.unwrap_or(self.pts_90k);
                     let pes = build_video_pes(&ef.data, pts_for_pes);
                     // PCR sits PCR_PREROLL_27MHZ behind the master clock
                     // (or PTS-derived clock if no pacer is attached) so

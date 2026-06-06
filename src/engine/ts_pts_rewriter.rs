@@ -330,6 +330,17 @@ pub struct TsPtsRewriter {
     /// flip the rewriter back into SPTS muxer mode mid-stream, which
     /// would produce a one-time anchor reset glitch.
     mpts_passthrough_latch: bool,
+
+    /// Edge-added A/V skew reporter (`stats::av_skew`). The rewriter's
+    /// shared `ClockAnchor` preserves the source A/V relationship by
+    /// construction, so its only skew contribution is the deliberate
+    /// audio lipsync trim — reported here (with `active` reflecting
+    /// anchor establishment and the MPTS passthrough latch) so the
+    /// dashboard's lip-sync number includes the operator trim.
+    av_skew: Option<Arc<crate::stats::av_skew::AvSkewReporter>>,
+    /// Last (trim, active) pushed to `av_skew` — avoids two atomic
+    /// stores per process() call when nothing changed.
+    av_skew_last: Option<(i64, bool)>,
 }
 
 impl TsPtsRewriter {
@@ -351,6 +362,8 @@ impl TsPtsRewriter {
             scte35_pids: HashSet::new(),
             pcr_jump_signal: None,
             mpts_passthrough_latch: false,
+            av_skew: None,
+            av_skew_last: None,
         }
     }
 
@@ -368,11 +381,36 @@ impl TsPtsRewriter {
         self.pcr_jump_signal = Some(signal);
     }
 
+    /// Attach the per-input edge-added A/V skew reporter. The rewriter
+    /// reports its lipsync-trim contribution + active state; see the
+    /// `av_skew` field doc-comment.
+    pub fn set_av_skew_reporter(
+        &mut self,
+        reporter: Arc<crate::stats::av_skew::AvSkewReporter>,
+    ) {
+        self.av_skew = Some(reporter);
+        self.av_skew_last = None; // force re-publish
+    }
+
+    /// Publish (trim, active) to the skew reporter when changed.
+    fn publish_av_skew(&mut self) {
+        let Some(reporter) = self.av_skew.as_ref() else {
+            return;
+        };
+        let active = self.anchor.established && !self.mpts_passthrough_latch;
+        let trim = self.pacer.lipsync_offset_90k();
+        if self.av_skew_last != Some((trim, active)) {
+            reporter.set_rewriter(trim, active);
+            self.av_skew_last = Some((trim, active));
+        }
+    }
+
     /// Process a chunk of 188-byte-aligned TS bytes. Appends rewritten
     /// output to `out` (caller is responsible for any prior clear).
     /// Output length may exceed input length when synthetic packets are
     /// injected for PCR_RR (40 ms) or PSI_RR (500 ms) compliance.
     pub fn process(&mut self, ts_in: &[u8], out: &mut Vec<u8>) {
+        self.publish_av_skew();
         // MPTS guard: latched on the first PAT showing > 1 program.
         // Verbatim passthrough — the shared `ClockAnchor` model is
         // SPTS-only, see `mpts_passthrough_latch` doc-comment. Still

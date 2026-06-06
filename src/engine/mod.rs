@@ -90,6 +90,7 @@ pub mod pcr_ingress_sampler;
 /// [`av_sync_mux`] for the architectural rationale (operator chose
 /// "per-output replacer keeps current shape; mux only governs PCR /
 /// emission timing" over the heavier per-flow producer).
+pub mod av_quality_watch;
 pub mod av_sync_mux;
 pub mod perf;
 pub mod rtmp;

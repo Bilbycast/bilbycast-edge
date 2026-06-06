@@ -1095,6 +1095,15 @@ fn edge_capabilities() -> Vec<&'static str> {
         // `set_master_clock_lipsync` commands — older edges return
         // `unknown_action`.
         "master_clock",
+        // Edge-added A/V skew (exact lip-sync error from PTS-touching
+        // stages, stats::av_skew) + the renamed A/V mux-interleave
+        // metric (FlowStats.av_interleave_flow / OutputStats.
+        // av_interleave, formerly av_sync*). ADVISORY today: the
+        // manager UI gates the split strips on field presence (the
+        // master_clock precedent), not on this bit — advertised so
+        // future tooling / fleet dashboards can detect the metric
+        // generation without parsing stats shapes.
+        "av-skew",
         // Per-NIC enumeration on every health tick: name, IPv4/IPv6,
         // MAC, MTU, link speed (Linux), up/down (Linux). Manager UI
         // gates the "Network Interfaces" card on this so older edges

@@ -172,6 +172,32 @@ for TS-layer loss visibility.
 | Seq Gaps | `flow.input.packets_lost` | Mislabelled | Wireshark RTP gaps (RTP) or `tsanalyze` (TS) | See pre-flagged issue #3. |
 | BW Limit / Status | from input config | Matches | n/a | |
 
+## Per-flow card — Lip-sync (edge-added) and A/V interleave
+
+Two distinct numbers the old single "A/V sync" card conflated (split
+2026-06-06 after the conflation produced two false drift alarms):
+
+- **Edge-added A/V skew** ([`stats/av_skew.rs`](../src/stats/av_skew.rs))
+  — exact, from each PTS-touching stage's own `(output − source)` PTS
+  delta (rewriter trim, audio/video re-encode anchors). This is the
+  number EBU R37 thresholds apply to. `mode: "passthrough"` means no
+  stage touches PTS and the source A/V relationship is preserved
+  bit-exactly — skew 0 by construction, not by measurement.
+  *Honesty caveats*: the audio-replacer delta compensates the PCM
+  accumulator partial but remains approximate to within the encoder's
+  internal buffering (< 1 target frame); encoder PRIMING (content
+  emitted late by the codec's startup delay) is NOT visible to this PTS
+  bookkeeping — and the absolute source lip-sync (camera/upstream) is
+  not measurable inline. Verify end-to-end with the trusted flash/beep
+  source (`testbed/av-trusted-2026-06-05`); live cross-check 2026-06-06:
+  metric 0 ms vs decoded truth +8.6 ms on the AC-3 re-encode path.
+
+- **A/V mux interleave** ([`stats/av_interleave.rs`](../src/stats/av_interleave.rs))
+  — `video_PES_PTS − audio_PES_PTS` at mux position. NOT lip-sync; a
+  receiver-buffering requirement (broadcast muxes legitimately run
+  0.3–1.5 s). EWMA + rolling-reservoir percentiles; resets on input
+  switch.
+
 ## Per-flow card — PCR Trust (per-output and flow rollup)
 
 [`stats/pcr_trust.rs:126–230`](../src/stats/pcr_trust.rs) — fixed-size

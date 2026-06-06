@@ -208,6 +208,20 @@ pub struct TsAudioReplacer {
     /// `out_pts_90k + samples_since_anchor * 90000 / resolved_sample_rate`
     /// so the division rounds once per PES rather than accumulating.
     samples_since_anchor: u64,
+    /// Source-PES countdown before `av_skew` publication resumes after
+    /// any anchor (re)establishment. The first few PES after an anchor
+    /// land while the codec pipeline refills, producing transient deltas
+    /// of hundreds of ms that would latch a scary `worst_abs_ms` on a
+    /// healthy path (observed 832 ms at cold start 2026-06-06; steady
+    /// state 0 ms).
+    av_skew_holdoff: u8,
+    /// Edge-added A/V skew reporter (`stats::av_skew`). At each source
+    /// PES this replacer publishes `(output PTS its content will carry)
+    /// − (source PES PTS)` — the exact audio-path lip-sync shift this
+    /// re-encode introduces. This is the number that would have shown
+    /// the historical Sky-Witness −27 ms/min loop drift directly on the
+    /// dashboard.
+    av_skew: Option<Arc<crate::stats::av_skew::AvSkewReporter>>,
     /// Last observed source PES PTS (90 kHz) plus the source-rate
     /// sample count from that PES, used to detect source-PTS
     /// discontinuities > ~500 ms — looping media files, ad splices,
@@ -384,6 +398,8 @@ impl TsAudioReplacer {
             out_pts_90k: 0,
             out_pts_anchored: false,
             samples_since_anchor: 0,
+            av_skew_holdoff: 0,
+            av_skew: None,
             expected_next_src_pts_90k: None,
             pcr_jump_signal: None,
             pending_silence_27mhz: 0,
@@ -422,6 +438,15 @@ impl TsAudioReplacer {
         pacer: Arc<crate::engine::av_sync_mux::AvSyncPacer>,
     ) {
         self.av_sync_pacer = Some(pacer);
+    }
+
+    /// Attach the per-input edge-added A/V skew reporter. See the
+    /// `av_skew` field doc-comment.
+    pub fn set_av_skew_reporter(
+        &mut self,
+        reporter: Arc<crate::stats::av_skew::AvSkewReporter>,
+    ) {
+        self.av_skew = Some(reporter);
     }
 
     /// Wire the shared latest-emitted-audio-PTS handle the co-running
@@ -906,6 +931,7 @@ impl TsAudioReplacer {
         self.transcoder = None;
         self.accumulator.clear();
         self.samples_since_anchor = 0;
+        self.av_skew_holdoff = 32; // suppress transient deltas while the pipeline refills
         self.expected_next_src_pts_90k = None;
         // Drop any unapplied silence-pad and drain the shared signal
         // counter — on input switch / codec change the audio path
@@ -1025,6 +1051,7 @@ impl TsAudioReplacer {
         if !self.out_pts_anchored {
             self.out_pts_90k = anchor_target(self.av_sync_pacer.as_ref(), pts);
             self.samples_since_anchor = 0;
+            self.av_skew_holdoff = 32;
             self.out_pts_anchored = true;
             // Record the master-clock + source-PTS anchors for the
             // wallclock-aware catch-up below. Sampled here (and only
@@ -1101,6 +1128,7 @@ impl TsAudioReplacer {
                     );
                     self.out_pts_90k = candidate;
                     self.samples_since_anchor = 0;
+                    self.av_skew_holdoff = 32; // suppress transient deltas while the pipeline refills
                     // Drop any silence-pad pending for this seam. The
                     // re-anchor already realigns output PTS to the source
                     // timeline; also draining the per-loop gap as silence
@@ -1597,6 +1625,53 @@ impl TsAudioReplacer {
             self.expected_next_src_pts_90k = None;
         } else {
             self.expected_next_src_pts_90k = Some(pts);
+        }
+        // Publish the edge-added audio-path skew. This point is AFTER
+        // the PES's content was decoded + encoded + drained, so
+        // `samples_since_anchor` sits at the END of this PES's content —
+        // compare end-position to end-position: output side
+        // `out_pts + samples_since_anchor/rate` vs source side
+        // `pts + samples_in_pes/source_rate`. (Comparing against the
+        // PES START pts overstated the skew by one PES span — caught
+        // live 2026-06-06: reported +96 ms while the decoded flash/beep
+        // truth was +9 ms.) Residual bias = decode→encode in-flight +
+        // encoder priming, bounded by ~1 encoder frame. Wrap-aware
+        // 33-bit signed difference.
+        // Output side counts emitted samples PLUS the partial still in
+        // the PCM accumulator (without it, mixed source/target frame
+        // sizes sawtooth the delta by up to one target frame). PTS-less
+        // PES (legal; pts==0 sentinel) are skipped. The holdoff
+        // suppresses pipeline-refill transients after (re)anchors.
+        if let Some(reporter) = self.av_skew.as_ref() {
+            if self.av_skew_holdoff > 0 {
+                self.av_skew_holdoff -= 1;
+            } else if self.out_pts_anchored
+                && self.resolved_sample_rate > 0
+                && source_sample_rate_hint > 0
+                && pts != 0
+            {
+                let pending = self
+                    .accumulator
+                    .first()
+                    .map(|c| c.len() as u64)
+                    .unwrap_or(0);
+                let effective_out = self.out_pts_90k.wrapping_add(
+                    self.samples_since_anchor
+                        .saturating_add(pending)
+                        .saturating_mul(90_000)
+                        / self.resolved_sample_rate as u64,
+                ) & 0x1_FFFF_FFFF;
+                let src_end = pts.wrapping_add(
+                    source_samples_in_pes.saturating_mul(90_000)
+                        / source_sample_rate_hint as u64,
+                ) & 0x1_FFFF_FFFF;
+                let mut delta =
+                    (effective_out.wrapping_sub(src_end) & 0x1_FFFF_FFFF) as i64;
+                if delta >= (1 << 32) {
+                    delta -= 1 << 33;
+                }
+                reporter.set_audio_delta(delta);
+            }
         }
         let _ = pts;
         Ok(())
