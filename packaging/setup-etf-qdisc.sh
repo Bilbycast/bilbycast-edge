@@ -81,11 +81,32 @@ fi
 # 1. Multiqueue priority qdisc at root: 3 traffic classes mapped to 3
 #    HW queues (assumes the NIC has at least 3 tx queues — typical on
 #    modern multi-Gbps cards). Class 0 carries the paced ST 2110
-#    traffic, classes 1+2 are spare for non-paced bulk + control.
-echo "$0: installing mqprio root qdisc on $IF"
+#    traffic, classes 1+2 take everything else.
+#
+#    The priority map sends ONLY socket-priority 5 to the etf class
+#    (TC0). Priority 5 is unreachable via DSCP marking — the kernel's
+#    `ip_tos2prio` table only ever derives priorities 0/2/4/6 — so the
+#    etf class is hit exclusively by sockets that opt in with an
+#    explicit SO_PRIORITY=5 (the edge's SO_TXTIME outputs, via
+#    BILBYCAST_ETF_SO_PRIORITY=5). Default-priority traffic — ARP,
+#    ICMP, IGMP joins, TCP, mDNS, any unmarked socket — rides the
+#    fq_codel classes and the NIC behaves like a normal interface.
+#
+#    The previous map (`0 0 0 0 1 1 1 1 2 2 2 2 0 0 0 0`) routed
+#    priority 0 onto the etf class, which SILENTLY BLACKHOLED all
+#    unstamped egress on the NIC (measured 2026-06-06: ARP resolution
+#    FAILED, ping 100 % loss, IGMP membership reports eaten — the etf
+#    class showed `Sent 0` with a continuously climbing drop counter).
+#    See the skip_sock_check note below for why the old map's safety
+#    assumption did not hold.
+#
+#    REQUIRED COMPANION: run the edge with BILBYCAST_ETF_SO_PRIORITY=5
+#    when BILBYCAST_ENABLE_TXTIME=1, otherwise SO_TXTIME outputs land
+#    on fq_codel (priority 0 default) and lose etf launch-time pacing.
+echo "$0: installing mqprio root qdisc on $IF (etf class reachable only via SO_PRIORITY=5)"
 tc qdisc replace dev "$IF" root handle 100: mqprio \
     num_tc 3 \
-    map 0 0 0 0 1 1 1 1 2 2 2 2 0 0 0 0 \
+    map 1 1 1 1 1 0 1 1 2 2 2 2 1 1 1 1 \
     queues 1@0 1@1 1@2 \
     hw 0 || {
         echo "$0: mqprio install failed — NIC may not have ≥ 3 tx queues" >&2
@@ -99,20 +120,18 @@ tc qdisc replace dev "$IF" root handle 100: mqprio \
 #    packet. `offload` enables HW-offload on supported NICs;
 #    silently degrades to software ETF on unsupported NICs.
 #
-#    `skip_sock_check` is REQUIRED on the priomap above: the default
-#    mqprio map routes socket-priority 0 (the kernel default for
-#    everything from ARP to ssh) into class 100:1. Without
-#    `skip_sock_check`, ETF refuses any packet whose socket lacks
-#    SO_TXTIME and drops it at the qdisc — including kernel-issued
-#    ARP solicitations. Symptoms: `ip neigh show` reports
-#    `INCOMPLETE`, sendmsg returns ENETUNREACH (errno 101), and
-#    `tc -s qdisc show` reports 100 % drops on the ETF class with
-#    zero packets sent. With `skip_sock_check`, non-SO_TXTIME packets
-#    fall through to FIFO release (no scheduled launch time, but they
-#    *do* leave the box); SO_TXTIME packets still get hardware-
-#    scheduled. This is the right safety net whenever the etf-bearing
-#    TC also carries control-plane traffic (which it does under the
-#    default priomap).
+#    `skip_sock_check` only skips the per-SOCKET validation (the
+#    SOCK_TXTIME flag / clockid / deadline_mode match). It does NOT
+#    exempt a packet from the per-packet txtime validity check: a
+#    packet with no timestamp (skb->tstamp == 0 — ARP, ICMP, TCP,
+#    IGMP, any unmarked socket) has a "launch time" of 1970, which is
+#    in the past, and etf DROPS it on enqueue. The earlier belief that
+#    such packets "fall through to FIFO release and do leave the box"
+#    was measured FALSE on kernel 7.x (2026-06-06: etf class Sent 0,
+#    drop counter climbing; ARP FAILED; ping 100 % loss). That is why
+#    the priomap above keeps all default-priority traffic OFF the etf
+#    class entirely — `skip_sock_check` is retained only so legitimate
+#    SO_TXTIME senders with mismatched socket flags aren't rejected.
 # NIC-offload mode programs the NIC's hardware launch register in PHC
 # time. The kernel translates the per-packet CLOCK_TAI tx-time into PHC
 # time using its known TAI↔PHC offset, which is only correct when
