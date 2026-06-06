@@ -51,6 +51,15 @@ const RTP_PT_MP2T: u8 = 33;
 struct RtpWrapState {
     seq: u16,
     ssrc: u32,
+    /// Last non-zero RTP timestamp emitted. Edge-generated filler bundles
+    /// (dead-input NULL keepalives, partial-bundle flush padding, injected
+    /// PSI) carry `rtp_timestamp: 0` on their `RtpPacket` — stamping that
+    /// raw onto the wire reads as a ±300 s clock jump to receivers that
+    /// de-jitter on the RTP timestamp (observed live 2026-06-06: 30 ts=0
+    /// datagrams in 180 s flushed downstream jitter buffers). RFC 2250's
+    /// timestamp is "target transmission time", so carrying the previous
+    /// value forward for filler keeps the wire clock monotonic and honest.
+    last_ts: u32,
 }
 
 impl RtpWrapState {
@@ -58,6 +67,7 @@ impl RtpWrapState {
         Self {
             seq: rand::random::<u16>(),
             ssrc: rand::random::<u32>(),
+            last_ts: 0,
         }
     }
 
@@ -65,8 +75,12 @@ impl RtpWrapState {
     /// `rtp_ts` is the 32-bit RTP timestamp at the 90 kHz MPEG clock; pass
     /// the value derived from the upstream `RtpPacket::rtp_timestamp` so the
     /// wire timing reflects the source media clock rather than wall time.
-    /// Sequence number advances by 1 per call.
+    /// A zero `rtp_ts` (timestamp-less filler) reuses the previous packet's
+    /// timestamp instead — see `last_ts`. Sequence number advances by 1 per
+    /// call.
     fn build_header(&mut self, rtp_ts: u32) -> [u8; RTP_HEADER_SIZE] {
+        let rtp_ts = if rtp_ts == 0 { self.last_ts } else { rtp_ts };
+        self.last_ts = rtp_ts;
         let mut hdr = [0u8; RTP_HEADER_SIZE];
         hdr[0] = 0x80; // V=2, P=0, X=0, CC=0
         hdr[1] = RTP_PT_MP2T; // M=0, PT=33
@@ -619,6 +633,7 @@ async fn rtp_output_loop(
                         let dg = WireDatagram {
                             bytes: Bytes::from(buf),
                             recv_time_us: packet.recv_time_us,
+                            enqueue_us: 0,
                             target_tx_time_ns: None,
                             ts_offset: RTP_HEADER_SIZE,
                         };
@@ -644,6 +659,7 @@ async fn rtp_output_loop(
                 let dg = WireDatagram {
                     bytes: Bytes::from(buf),
                     recv_time_us: packet.recv_time_us,
+                    enqueue_us: 0,
                     target_tx_time_ns: None,
                     ts_offset: RTP_HEADER_SIZE,
                 };
@@ -670,6 +686,7 @@ async fn rtp_output_loop(
                     let dg = WireDatagram {
                         bytes: Bytes::from(fec_pkt),
                         recv_time_us: packet.recv_time_us,
+                        enqueue_us: 0,
                         target_tx_time_ns: None,
                         // FEC payload after the RTP header is XOR
                         // parity, not TS — PCR scan correctly returns
@@ -1002,12 +1019,14 @@ async fn rtp_output_redundant_loop(
                         let dg1 = WireDatagram {
                             bytes: bytes.clone(),
                             recv_time_us: packet.recv_time_us,
+                            enqueue_us: 0,
                             target_tx_time_ns: None,
                             ts_offset: RTP_HEADER_SIZE,
                         };
                         let dg2 = WireDatagram {
                             bytes,
                             recv_time_us: packet.recv_time_us,
+                            enqueue_us: 0,
                             target_tx_time_ns: None,
                             ts_offset: RTP_HEADER_SIZE,
                         };
@@ -1022,12 +1041,14 @@ async fn rtp_output_redundant_loop(
                 let dg1 = WireDatagram {
                     bytes: bytes.clone(),
                     recv_time_us: packet.recv_time_us,
+                    enqueue_us: 0,
                     target_tx_time_ns: None,
                     ts_offset: RTP_HEADER_SIZE,
                 };
                 let dg2 = WireDatagram {
                     bytes,
                     recv_time_us: packet.recv_time_us,
+                    enqueue_us: 0,
                     target_tx_time_ns: None,
                     ts_offset: RTP_HEADER_SIZE,
                 };
@@ -1053,12 +1074,14 @@ async fn rtp_output_redundant_loop(
                     let dg1 = WireDatagram {
                         bytes: bytes.clone(),
                         recv_time_us: packet.recv_time_us,
+                        enqueue_us: 0,
                         target_tx_time_ns: None,
                         ts_offset: RTP_HEADER_SIZE,
                     };
                     let dg2 = WireDatagram {
                         bytes,
                         recv_time_us: packet.recv_time_us,
+                        enqueue_us: 0,
                         target_tx_time_ns: None,
                         ts_offset: RTP_HEADER_SIZE,
                     };
@@ -1120,5 +1143,29 @@ mod tests {
         let h2 = s.build_header(0);
         assert_eq!(u16::from_be_bytes([h1[2], h1[3]]), 0xFFFF);
         assert_eq!(u16::from_be_bytes([h2[2], h2[3]]), 0x0000);
+    }
+
+    fn ts_of(h: &[u8; RTP_HEADER_SIZE]) -> u32 {
+        u32::from_be_bytes([h[4], h[5], h[6], h[7]])
+    }
+
+    /// Timestamp-less filler (`rtp_ts == 0` from NULL keepalives /
+    /// partial-bundle flush padding) must not stamp a raw 0 onto the wire
+    /// mid-stream — it reuses the previous packet's timestamp so the wire
+    /// clock stays monotonic (observed live 2026-06-06: ts=0 datagrams
+    /// read as ±300 s clock jumps to RFC 3550 jitter estimators).
+    #[test]
+    fn rtp_wrap_state_carries_timestamp_forward_for_filler() {
+        let mut s = RtpWrapState::new();
+        // Mid-stream filler inherits the previous timestamp.
+        assert_eq!(ts_of(&s.build_header(27_000_000)), 27_000_000);
+        assert_eq!(ts_of(&s.build_header(0)), 27_000_000);
+        assert_eq!(ts_of(&s.build_header(0)), 27_000_000);
+        // Real timestamps resume unchanged.
+        assert_eq!(ts_of(&s.build_header(27_003_600)), 27_003_600);
+        // Before any real timestamp has been seen, 0 still emits 0
+        // (cold start — nothing better to claim).
+        let mut cold = RtpWrapState::new();
+        assert_eq!(ts_of(&cold.build_header(0)), 0);
     }
 }

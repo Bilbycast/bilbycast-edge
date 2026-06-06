@@ -230,7 +230,10 @@ impl WireTxHandle {
     /// Try to send a datagram. Returns `Ok(())` on success (depth
     /// incremented), `Err(WireDatagram)` if the channel was full (depth
     /// unchanged, caller decides whether to count the drop).
-    pub fn try_send(&self, dg: WireDatagram) -> Result<(), WireDatagram> {
+    /// Stamps `enqueue_us` so the emitter's residence-cap shed measures
+    /// wire-queue dwell only (see `WireDatagram::enqueue_us`).
+    pub fn try_send(&self, mut dg: WireDatagram) -> Result<(), WireDatagram> {
+        dg.enqueue_us = crate::util::time::now_us();
         match self.tx.try_send(dg) {
             Ok(()) => {
                 self.depth.fetch_add(1, Ordering::Release);
@@ -497,6 +500,18 @@ impl Default for DejitterConfig {
 pub struct WireDatagram {
     pub bytes: Bytes,
     pub recv_time_us: u64,
+    /// Stamped by `WireTxHandle::try_send` when the datagram enters the
+    /// wire queue (`util::time::now_us` epoch). The residence-cap shed
+    /// measures queue dwell from THIS, not `recv_time_us`: anchoring the
+    /// shed at input arrival silently counted every configured upstream
+    /// hold (RIST ARQ `buffer_ms`, output-delay, hitless merger) against
+    /// the egress cap — a RIST input with `buffer_ms ≥ 1000` pre-aged
+    /// every datagram past the 1000 ms cap and the emitter shed 100 % of
+    /// traffic (observed live 2026-06-06: UDP/RTP outputs emitted only
+    /// keepalives while SRT/RIST outputs flowed). `recv_time_us` keeps
+    /// the end-to-end input→wire latency stat. 0 = unstamped (direct
+    /// channel pushes in tests): the shed check skips it.
+    pub enqueue_us: u64,
     /// Caller-supplied target wallclock (CLOCK_MONOTONIC ns) for the
     /// `St2110Raster` anchor. Ignored under `Pcr` anchor. `None` is
     /// "emit ASAP" under either anchor.
@@ -1491,10 +1506,15 @@ fn run_emitter(
         // (Phase 2) holds occupancy far below this cap so it rarely fires;
         // this is the floor that makes the failure mode bounded regardless.
         // Residence uses the SAME clock on both ends (`util::time::now_us`,
-        // the Instant epoch that stamped `recv_time_us`) — NOT the CLOCK_TAI
-        // `now_ns` above, which is a different time base.
-        if dejitter.enabled && dg.recv_time_us > 0 {
-            let residence_us = crate::util::time::now_us().saturating_sub(dg.recv_time_us);
+        // the Instant epoch that stamped `enqueue_us`) — NOT the CLOCK_TAI
+        // `now_ns` above, which is a different time base. Anchored at wire-
+        // queue ENTRY (`enqueue_us`), not input arrival (`recv_time_us`):
+        // configured upstream holds (RIST ARQ buffer_ms, output-delay,
+        // hitless merger) must not spend the egress runaway budget — with
+        // arrival anchoring, a RIST input at buffer_ms ≥ cap pre-aged every
+        // datagram and this shed dropped 100 % of traffic (2026-06-06).
+        if dejitter.enabled && dg.enqueue_us > 0 {
+            let residence_us = crate::util::time::now_us().saturating_sub(dg.enqueue_us);
             if residence_us > dejitter.shed_residence_us() {
                 let shed =
                     shed_stale_backlog(&mut state, &rx, dejitter.drain_floor_dgms, now_ns);
@@ -2065,6 +2085,7 @@ mod tests {
             tx.try_send(WireDatagram {
                 bytes: Bytes::from(bytes.clone()),
                 recv_time_us: 0,
+                enqueue_us: 0,
                 target_tx_time_ns: None,
                 ts_offset: 0,
             })
@@ -2113,6 +2134,7 @@ mod tests {
             tx.try_send(WireDatagram {
                 bytes: Bytes::from_static(b"st2110-raster-test"),
                 recv_time_us: 0,
+                enqueue_us: 0,
                 target_tx_time_ns: Some(now + i * 100_000),
                 ts_offset: 0,
             })
@@ -2167,6 +2189,7 @@ mod tests {
         let dg = WireDatagram {
             bytes: Bytes::from(buf),
             recv_time_us: 0,
+            enqueue_us: 0,
             target_tx_time_ns: None,
             ts_offset: 12,
         };
@@ -2220,6 +2243,7 @@ mod tests {
             tx.try_send(WireDatagram {
                 bytes: Bytes::from_static(&[0u8; 188]),
                 recv_time_us: 0,
+                enqueue_us: 0,
                 target_tx_time_ns: None,
                 ts_offset: 0,
             })

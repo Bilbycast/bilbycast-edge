@@ -191,6 +191,7 @@ async fn udp_output_loop_302m(
                             let dg = WireDatagram {
                                 bytes: Bytes::from(datagram),
                                 recv_time_us: packet.recv_time_us,
+                                enqueue_us: 0,
                                 target_tx_time_ns: None,
                                 ts_offset: 0,
                             };
@@ -575,6 +576,7 @@ async fn udp_output_loop(
                     let dg = WireDatagram {
                         bytes: datagram.freeze(),
                         recv_time_us,
+                        enqueue_us: 0,
                         target_tx_time_ns: None,
                         ts_offset: 0,
                     };

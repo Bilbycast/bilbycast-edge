@@ -149,6 +149,7 @@ fn run_paced_sender(
             let dg_red = WireDatagram {
                 bytes: pkt.clone(),
                 recv_time_us: recv_us,
+                enqueue_us: 0,
                 target_tx_time_ns: Some(target_ns),
                 // ST 2110-20/-23 paths run under the St2110Raster
                 // anchor, which ignores ts_offset.
@@ -161,6 +162,7 @@ fn run_paced_sender(
                 let dg_blue = WireDatagram {
                     bytes: pkt.clone(),
                     recv_time_us: recv_us,
+                    enqueue_us: 0,
                     target_tx_time_ns: Some(target_ns),
                     ts_offset: 0,
                 };
@@ -1328,6 +1330,7 @@ pub async fn run_st2110_23_output(
                     let dg_red = WireDatagram {
                         bytes: pkt.clone(),
                         recv_time_us: recv_us,
+                        enqueue_us: 0,
                         target_tx_time_ns: Some(target_ns),
                         ts_offset: 0,
                     };
@@ -1338,6 +1341,7 @@ pub async fn run_st2110_23_output(
                         let dg_blue = WireDatagram {
                             bytes: pkt.clone(),
                             recv_time_us: recv_us,
+                            enqueue_us: 0,
                             target_tx_time_ns: Some(target_ns),
                             ts_offset: 0,
                         };

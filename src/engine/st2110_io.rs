@@ -618,6 +618,7 @@ pub async fn run_st2110_audio_output(
                             let dg_red = WireDatagram {
                                 bytes: buf.clone(),
                                 recv_time_us: packet.recv_time_us,
+                                enqueue_us: 0,
                                 target_tx_time_ns: None,
                                 // ST 2110 paths run under the
                                 // St2110Raster anchor, which ignores
@@ -632,6 +633,7 @@ pub async fn run_st2110_audio_output(
                                 let dg_blue = WireDatagram {
                                     bytes: buf.clone(),
                                     recv_time_us: packet.recv_time_us,
+                                    enqueue_us: 0,
                                     target_tx_time_ns: None,
                                     ts_offset: 0,
                                 };
@@ -966,6 +968,7 @@ pub async fn run_st2110_anc_output(
                         let dg_red = WireDatagram {
                             bytes: packet.data.clone(),
                             recv_time_us: packet.recv_time_us,
+                            enqueue_us: 0,
                             target_tx_time_ns: None,
                             ts_offset: 0,
                         };
@@ -976,6 +979,7 @@ pub async fn run_st2110_anc_output(
                             let dg_blue = WireDatagram {
                                 bytes: packet.data.clone(),
                                 recv_time_us: packet.recv_time_us,
+                                enqueue_us: 0,
                                 target_tx_time_ns: None,
                                 ts_offset: 0,
                             };
