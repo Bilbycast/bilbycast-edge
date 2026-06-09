@@ -1,0 +1,43 @@
+{
+  "version": 2,
+  "node_id": "b2c3d4e5-9999-4aaa-bbbb-000000000099",
+  "server": { "listen_addr": "127.0.0.1", "listen_port": 18090 },
+  "monitor": { "listen_addr": "127.0.0.1", "listen_port": 18190 },
+  "device_name": "Bond gateway-mode smoke",
+  "setup_enabled": false,
+  "inputs": [
+    { "id": "udp-in", "name": "udp ingest", "type": "udp", "bind_addr": "127.0.0.1:5599" }
+  ],
+  "outputs": [
+    {
+      "type": "bonded",
+      "id": "bond-out",
+      "name": "bonded gateway-mode (dongle)",
+      "bond_flow_id": 999,
+      "scheduler": "round_robin",
+      "paths": [
+        {
+          "id": 0,
+          "name": "dongle-4g",
+          "weight_hint": 1,
+          "transport": {
+            "type": "udp",
+            "remote": "1.1.1.1:7000",
+            "interface": "enx0c5b8f279a64",
+            "gateway": "192.168.8.1",
+            "source": "192.168.8.100/24"
+          }
+        }
+      ]
+    }
+  ],
+  "flows": [
+    {
+      "id": "bond-gw-smoke",
+      "name": "udp -> bonded(gateway)",
+      "enabled": true,
+      "input_ids": ["udp-in"],
+      "output_ids": ["bond-out"]
+    }
+  ]
+}

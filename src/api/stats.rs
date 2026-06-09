@@ -607,6 +607,10 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
         output.push_str("# TYPE bilbycast_edge_bond_gaps_lost counter\n");
         output.push_str("# HELP bilbycast_edge_bond_packets_duplicated Bond packets duplicated across paths (sender side)\n");
         output.push_str("# TYPE bilbycast_edge_bond_packets_duplicated counter\n");
+        output.push_str("# HELP bilbycast_edge_bond_throughput_bps Aggregate bond bandwidth in bits/sec (sum of per-path)\n");
+        output.push_str("# TYPE bilbycast_edge_bond_throughput_bps gauge\n");
+        output.push_str("# HELP bilbycast_edge_bond_path_throughput_bps Per-path bond bandwidth in bits/sec\n");
+        output.push_str("# TYPE bilbycast_edge_bond_path_throughput_bps gauge\n");
         for fs in &flow_snapshots {
             let emit_bond = |out: &mut String, owner_labels: &str, bond: &crate::stats::models::BondLegStats| {
                 out.push_str(&format!(
@@ -621,6 +625,10 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
                     "bilbycast_edge_bond_packets_duplicated{{{}}} {}\n",
                     owner_labels, bond.packets_duplicated
                 ));
+                out.push_str(&format!(
+                    "bilbycast_edge_bond_throughput_bps{{{}}} {}\n",
+                    owner_labels, bond.throughput_bps
+                ));
                 for path in &bond.paths {
                     let path_labels = format!(
                         "{},path_id=\"{}\",path_name=\"{}\",transport=\"{}\"",
@@ -633,6 +641,10 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
                     out.push_str(&format!(
                         "bilbycast_edge_bond_loss_fraction{{{}}} {:.6}\n",
                         path_labels, path.loss_fraction
+                    ));
+                    out.push_str(&format!(
+                        "bilbycast_edge_bond_path_throughput_bps{{{}}} {}\n",
+                        path_labels, path.throughput_bps
                     ));
                     out.push_str(&format!(
                         "bilbycast_edge_bond_path_packets_sent{{{}}} {}\n",

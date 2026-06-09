@@ -764,14 +764,33 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Spawn shutdown signal handler
+    // Spawn shutdown signal handler. Handle BOTH SIGTERM (what systemd
+    // sends on `stop`) and SIGINT (Ctrl-C) so a managed stop runs the
+    // graceful shutdown path below — otherwise SIGTERM hits the default
+    // disposition and the process is killed before flows/routes are
+    // torn down cleanly.
     {
         let token = shutdown_token.clone();
         tokio::spawn(async move {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to install CTRL+C signal handler");
-            tracing::info!("Received shutdown signal");
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut sigterm =
+                    signal(SignalKind::terminate()).expect("install SIGTERM handler");
+                let mut sigint =
+                    signal(SignalKind::interrupt()).expect("install SIGINT handler");
+                tokio::select! {
+                    _ = sigterm.recv() => tracing::info!("Received SIGTERM, shutting down"),
+                    _ = sigint.recv() => tracing::info!("Received SIGINT, shutting down"),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("Failed to install CTRL+C signal handler");
+                tracing::info!("Received shutdown signal");
+            }
             token.cancel();
         });
     }
@@ -860,6 +879,14 @@ async fn main() -> anyhow::Result<()> {
     // Graceful shutdown: stop all flows and tunnels
     flow_manager.stop_all().await;
     tunnel_manager.stop_all().await;
+
+    // Remove any gateway-mode bond policy routes this process installed.
+    // The per-flow teardown already fires on flow stop; this is the
+    // process-exit backstop so a clean shutdown leaves no routes behind
+    // (the startup GC sweep covers the crash / SIGKILL case).
+    if let Some(mgr) = engine::bond_routing::BondRouteManager::try_global() {
+        mgr.teardown_all().await;
+    }
 
     tracing::info!("bilbycast-edge shutting down");
     Ok(())

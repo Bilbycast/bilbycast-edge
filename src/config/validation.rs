@@ -1655,6 +1655,41 @@ fn validate_bonded_input(c: &crate::config::models::BondedInputConfig) -> Result
     Ok(())
 }
 
+/// True when `a` and `b` share the same subnet at `prefix` length.
+fn same_subnet(a: std::net::IpAddr, b: std::net::IpAddr, prefix: u8) -> bool {
+    match (a, b) {
+        (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => {
+            if prefix == 0 {
+                return true;
+            }
+            if prefix > 32 {
+                return false;
+            }
+            let mask = if prefix == 32 {
+                u32::MAX
+            } else {
+                !(u32::MAX >> prefix)
+            };
+            (u32::from(a) & mask) == (u32::from(b) & mask)
+        }
+        (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => {
+            if prefix == 0 {
+                return true;
+            }
+            if prefix > 128 {
+                return false;
+            }
+            let mask = if prefix == 128 {
+                u128::MAX
+            } else {
+                !(u128::MAX >> prefix)
+            };
+            (u128::from(a) & mask) == (u128::from(b) & mask)
+        }
+        _ => false,
+    }
+}
+
 /// Shared path-transport validation for bonded input/output.
 fn validate_bond_path_transport(
     t: &crate::config::models::BondPathTransportConfig,
@@ -1667,22 +1702,11 @@ fn validate_bond_path_transport(
             bind,
             remote,
             interface,
+            gateway,
+            source,
         } => {
-            if let Some(b) = bind {
-                validate_socket_addr(b, "bonded UDP path bind")?;
-            }
             if let Some(r) = remote {
                 validate_socket_addr(r, "bonded UDP path remote")?;
-            }
-            if sender_mode && remote.is_none() && bind.is_none() {
-                return Err(anyhow::anyhow!(
-                    "bonded UDP path '{path_name}' (sender) requires at least remote or bind"
-                ));
-            }
-            if !sender_mode && bind.is_none() {
-                return Err(anyhow::anyhow!(
-                    "bonded UDP path '{path_name}' (receiver) requires bind"
-                ));
             }
             if let Some(iface) = interface {
                 // IFNAMSIZ is 16 on Linux (15 chars + NUL). Keep this
@@ -1696,6 +1720,66 @@ fn validate_bond_path_transport(
                 if iface.contains('\0') {
                     return Err(anyhow::anyhow!(
                         "bonded UDP path '{path_name}' interface must not contain NUL"
+                    ));
+                }
+            }
+
+            // ── Gateway mode (sender side only) ──────────────────────
+            if let Some(gw) = gateway {
+                if !sender_mode {
+                    return Err(anyhow::anyhow!(
+                        "bonded UDP path '{path_name}': `gateway` is only valid on a bonded \
+                         output (sender) — the receiver's return path uses the host default route"
+                    ));
+                }
+                let gw_ip: std::net::IpAddr = gw.parse().map_err(|_| {
+                    anyhow::anyhow!("bonded UDP path '{path_name}': invalid gateway IP '{gw}'")
+                })?;
+                let src = source.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "bonded UDP path '{path_name}': `gateway` mode requires `source` \
+                         (the box's address in the gateway's subnet, e.g. 192.168.10.2/24)"
+                    )
+                })?;
+                let src_net = crate::engine::bond_routing::SourceNet::parse(src)
+                    .map_err(|e| anyhow::anyhow!("bonded UDP path '{path_name}': {e}"))?;
+                if src_net.addr.is_ipv4() != gw_ip.is_ipv4() {
+                    return Err(anyhow::anyhow!(
+                        "bonded UDP path '{path_name}': gateway and source must be the same IP family"
+                    ));
+                }
+                if !same_subnet(src_net.addr, gw_ip, src_net.prefix) {
+                    return Err(anyhow::anyhow!(
+                        "bonded UDP path '{path_name}': gateway {gw} is not inside the source \
+                         subnet {src}/{} — it would be unreachable",
+                        src_net.prefix
+                    ));
+                }
+                if interface.is_none() {
+                    return Err(anyhow::anyhow!(
+                        "bonded UDP path '{path_name}': `gateway` mode requires `interface` \
+                         (the NIC the routers are reachable on)"
+                    ));
+                }
+                // `bind` is derived from `source` in gateway mode.
+            } else {
+                // ── Interface / plain mode ──────────────────────────
+                if source.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "bonded UDP path '{path_name}': `source` is only meaningful with `gateway`"
+                    ));
+                }
+                if let Some(b) = bind {
+                    validate_socket_addr(b, "bonded UDP path bind")?;
+                }
+                if sender_mode && remote.is_none() && bind.is_none() {
+                    return Err(anyhow::anyhow!(
+                        "bonded UDP path '{path_name}' (sender) requires at least remote or bind"
+                    ));
+                }
+                if !sender_mode && bind.is_none() {
+                    return Err(anyhow::anyhow!(
+                        "bonded UDP path '{path_name}' (receiver) requires bind"
                     ));
                 }
             }

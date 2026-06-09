@@ -134,6 +134,11 @@ webpki-roots = "1.0.7"
 futures-util = "0.3.32"
 url = "2.5.8"
 
+# Netlink (gateway-mode bonded-path policy routing — engine::bond_routing).
+# Pure Rust; uses the edge process's CAP_NET_ADMIN at runtime.
+rtnetlink = "0.21"
+netlink-packet-route = "0.30"
+
 # ── SRT backend ──────────────────────────────────────────────────────────
 # Uncomment ONE pair below. Both expose identical public APIs (SrtSocket,
 # SrtListener, SrtStats, etc.). No other code changes needed to switch.

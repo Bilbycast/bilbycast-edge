@@ -1765,6 +1765,13 @@ pub struct BondLegStats {
     /// `"round_robin"`, `"weighted_rtt"`, `"media_aware"`). Empty
     /// string on the receiver side.
     pub scheduler: String,
+    /// Aggregate bond bandwidth (bits/sec) — sum of the per-path
+    /// realized throughput in the bond's active direction (bytes_sent
+    /// for a sender, bytes_received for a receiver). Sampled at 1 Hz
+    /// off the byte counters; `0` until the first interval elapses.
+    /// Older edges omit this (serde default `0`).
+    #[serde(default)]
+    pub throughput_bps: u64,
 
     // ── Aggregate sender-side counters ──
     pub packets_sent: u64,
@@ -1815,6 +1822,13 @@ pub struct BondPathLegStats {
     pub retransmits_received: u64,
     pub keepalives_sent: u64,
     pub keepalives_received: u64,
+    /// How this leg's egress is pinned to its link:
+    /// `"gateway"` (edge-programmed policy route via a router),
+    /// `"so_bindtodevice"` (hard NIC bind, needs CAP_NET_RAW),
+    /// `"ip_unicast_if"` (unprivileged NIC egress hint),
+    /// `"ip_bound_if"` (Apple/BSD bind), or `"none"` (kernel default route).
+    #[serde(default)]
+    pub binding: String,
 }
 
 // ── Media Analysis ────────────────────────────────────────────────────────

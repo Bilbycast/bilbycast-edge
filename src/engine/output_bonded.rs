@@ -78,6 +78,99 @@ async fn bonded_output_loop(
     events: &EventSender,
     flow_id: &str,
 ) -> anyhow::Result<()> {
+    // Gateway-mode legs: program each leg's policy route (ensure
+    // source address + `from <source>` rule + `default via <gateway>`
+    // table) BEFORE the socket binds to that source. Teardown runs on
+    // every exit path so a stopped flow leaves no orphan routes.
+    let programmed = program_gateway_paths(config, flow_id, events).await?;
+    let result = bonded_output_run(config, rx, stats, cancel, events, flow_id).await;
+    if !programmed.is_empty() {
+        teardown_gateway_paths(flow_id, &programmed).await;
+    }
+    result
+}
+
+/// Program the policy route for every gateway-mode leg. Returns the
+/// list of path ids that were programmed (for teardown). Fails loudly
+/// — a gateway path that can't be routed must NOT silently fall
+/// through to the default route (that collapses every leg onto one
+/// router).
+async fn program_gateway_paths(
+    config: &BondedOutputConfig,
+    flow_id: &str,
+    events: &EventSender,
+) -> anyhow::Result<Vec<u8>> {
+    use crate::config::models::BondPathTransportConfig;
+    let mut programmed = Vec::new();
+    for p in &config.paths {
+        if let BondPathTransportConfig::Udp {
+            interface,
+            gateway: Some(gw),
+            source: Some(src),
+            ..
+        } = &p.transport
+        {
+            let gw_ip: std::net::IpAddr = match gw.parse() {
+                Ok(ip) => ip,
+                Err(_) => continue, // validation already rejected this
+            };
+            let src_net = super::bond_routing::SourceNet::parse(src)?;
+            let iface = interface.as_deref().unwrap_or_default();
+            let mgr = match super::bond_routing::BondRouteManager::global().await {
+                Ok(m) => m,
+                Err(e) => {
+                    // No netlink / no CAP_NET_ADMIN — refuse, don't collapse.
+                    teardown_gateway_paths(flow_id, &programmed).await;
+                    events.emit_flow(
+                        EventSeverity::Critical,
+                        category::MEDIA,
+                        format!(
+                            "bonded output '{}': gateway routing unavailable ({e}). \
+                             Needs CAP_NET_ADMIN; path '{}' not started.",
+                            config.id, p.name
+                        ),
+                        flow_id,
+                    );
+                    return Err(anyhow::anyhow!("bond gateway routing init: {e}"));
+                }
+            };
+            if let Err(e) = mgr.program(flow_id, p.id, iface, src_net, gw_ip).await {
+                teardown_gateway_paths(flow_id, &programmed).await;
+                events.emit_flow(
+                    EventSeverity::Critical,
+                    category::MEDIA,
+                    format!(
+                        "bonded output '{}': failed to program gateway route for path '{}' \
+                         (via {gw}): {e}",
+                        config.id, p.name
+                    ),
+                    flow_id,
+                );
+                return Err(anyhow::anyhow!("bond gateway route program: {e}"));
+            }
+            programmed.push(p.id);
+        }
+    }
+    Ok(programmed)
+}
+
+/// Best-effort teardown of all programmed gateway routes for a flow.
+async fn teardown_gateway_paths(flow_id: &str, path_ids: &[u8]) {
+    if let Ok(mgr) = super::bond_routing::BondRouteManager::global().await {
+        for id in path_ids {
+            mgr.teardown(flow_id, *id).await;
+        }
+    }
+}
+
+async fn bonded_output_run(
+    config: &BondedOutputConfig,
+    rx: &mut broadcast::Receiver<RtpPacket>,
+    stats: Arc<OutputStatsAccumulator>,
+    cancel: CancellationToken,
+    events: &EventSender,
+    flow_id: &str,
+) -> anyhow::Result<()> {
     let socket_cfg = build_sender_cfg(config)?;
     let path_ids: Vec<u8> = socket_cfg.paths.iter().map(|p| p.id).collect();
 
@@ -118,12 +211,19 @@ async fn bonded_output_loop(
         Vec::with_capacity(config.paths.len());
     for p in &config.paths {
         if let Some(ps) = socket.path_stats(p.id) {
-            path_handles.push(crate::stats::collector::BondPathStatsHandle {
-                id: p.id,
-                name: p.name.clone(),
-                transport: super::input_bonded::bond_transport_label(&p.transport),
-                stats: ps,
-            });
+            let gateway_mode = matches!(
+                &p.transport,
+                crate::config::models::BondPathTransportConfig::Udp { gateway: Some(_), .. }
+            );
+            path_handles.push(
+                crate::stats::collector::BondPathStatsHandle::new(
+                    p.id,
+                    p.name.clone(),
+                    super::input_bonded::bond_transport_label(&p.transport),
+                    ps,
+                )
+                .with_gateway_mode(gateway_mode),
+            );
         }
     }
     stats.set_bond_stats(crate::stats::collector::BondStatsHandle {
@@ -292,11 +392,32 @@ fn translate_transport_for_sender(
             bind,
             remote,
             interface,
-        } => BondPathTxTransport::Udp {
-            bind: bind.as_deref().map(parse_sockaddr).transpose()?,
-            remote: remote.as_deref().map(parse_sockaddr).transpose()?,
-            interface: interface.clone(),
-        },
+            gateway,
+            source,
+        } => {
+            if gateway.is_some() {
+                // Gateway mode: bind to the source IP so the policy
+                // rule (programmed by engine::bond_routing) matches
+                // and steers this leg via its router. No
+                // SO_BINDTODEVICE pin (that needs CAP_NET_RAW); the
+                // route does the steering.
+                let src = source.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("gateway-mode bonded path requires `source`")
+                })?;
+                let src_net = super::bond_routing::SourceNet::parse(src)?;
+                BondPathTxTransport::Udp {
+                    bind: Some(std::net::SocketAddr::new(src_net.addr, 0)),
+                    remote: remote.as_deref().map(parse_sockaddr).transpose()?,
+                    interface: None,
+                }
+            } else {
+                BondPathTxTransport::Udp {
+                    bind: bind.as_deref().map(parse_sockaddr).transpose()?,
+                    remote: remote.as_deref().map(parse_sockaddr).transpose()?,
+                    interface: interface.clone(),
+                }
+            }
+        }
         BondPathTransportConfig::Rist {
             role,
             remote,

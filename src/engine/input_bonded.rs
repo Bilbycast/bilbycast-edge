@@ -91,12 +91,12 @@ pub fn spawn_bonded_input(
             Vec::with_capacity(config.paths.len());
         for p in &config.paths {
             if let Some(ps) = socket.path_stats(p.id) {
-                path_handles.push(crate::stats::collector::BondPathStatsHandle {
-                    id: p.id,
-                    name: p.name.clone(),
-                    transport: bond_transport_label(&p.transport),
-                    stats: ps,
-                });
+                path_handles.push(crate::stats::collector::BondPathStatsHandle::new(
+                    p.id,
+                    p.name.clone(),
+                    bond_transport_label(&p.transport),
+                    ps,
+                ));
             }
         }
         stats.set_input_bond_stats(crate::stats::collector::BondStatsHandle {
@@ -237,6 +237,10 @@ fn translate_transport_for_receiver(
             bind,
             remote,
             interface,
+            // gateway/source are sender-side only (validation rejects
+            // them on a receiver); ignore on the receive path.
+            gateway: _,
+            source: _,
         } => BondPathTxTransport::Udp {
             bind: bind.as_deref().map(parse_sockaddr).transpose()?,
             remote: remote.as_deref().map(parse_sockaddr).transpose()?,

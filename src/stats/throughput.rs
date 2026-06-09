@@ -14,6 +14,7 @@ use std::time::Instant;
 /// All state is stored in atomics — no Mutex required. The `sample()` method
 /// takes `&self` and uses a CAS loop to update state, making it safe to call
 /// from multiple tasks without blocking the Tokio runtime.
+#[derive(Debug)]
 pub struct ThroughputEstimator {
     last_bytes: AtomicU64,
     /// Monotonic timestamp in microseconds (from `Instant` baseline).

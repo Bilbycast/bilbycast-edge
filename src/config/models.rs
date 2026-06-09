@@ -3927,8 +3927,26 @@ pub enum BondPathTransportConfig {
         /// routing table. Without this, multiple paths with the
         /// same destination will typically all use the default
         /// route. See `bilbycast-bonding/docs/nic-pinning.md`.
+        ///
+        /// This is **interface-mode** path selection. For the
+        /// dumb-switch / single-NIC topology use `gateway` instead.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         interface: Option<String>,
+        /// **Gateway-mode** path selection (sender side only). The
+        /// router / next-hop this leg egresses through. The edge
+        /// programs a dedicated policy route (`ip rule from <source>
+        /// → table → default via <gateway>`) via netlink, so several
+        /// legs on one NIC each go out their own router. Requires
+        /// `source`. Mutually exclusive with `interface`.
+        /// See `docs/bonding-gateway-routing.md`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gateway: Option<String>,
+        /// Source address (`ip/prefix`, e.g. `192.168.10.2/24`) this
+        /// leg binds to, inside the `gateway`'s subnet. The edge
+        /// ensures the address is present on the NIC and keys the
+        /// policy rule on it. Required when `gateway` is set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     /// RIST Simple Profile leg. Unidirectional at the bond layer; set
     /// `role` to match the bonded-input-or-output side of this path.

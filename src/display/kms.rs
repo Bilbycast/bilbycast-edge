@@ -15,7 +15,7 @@
 // behind the `video-decoder-vaapi` / `video-decoder-nvdec` Cargo
 // features documented in `Cargo.toml`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -183,42 +183,120 @@ fn connector_protocol_label(t: u32) -> &'static str {
     }
 }
 
-/// Best-effort sysfs walk to find the ALSA card+device pair that backs
-/// a given KMS connector. Implementation: enumerate
-/// `/sys/class/drm/card*-<connector>` to confirm presence, then scan
-/// `/sys/class/sound/cardN/eldM` for the matching ELD payload (the
-/// PCM index `M` is what `hw:N,M` references). Returns `None` on any
-/// failure — the operator can still pick `default` or supply a custom
-/// device name.
+/// Best-effort resolution of the ALSA `hw:<card>,<device>` string that
+/// carries a given KMS connector's HDMI / DisplayPort audio.
+///
+/// **The ALSA sound-card index is a different namespace from the
+/// DRM/KMS card index.** On many hosts the GPU enumerates as DRM
+/// `card1` (with `card0` empty / a non-display DRI node) while its HDMI
+/// audio is exposed on ALSA `card0` — the single HDA controller. The
+/// previous implementation derived the card digit from
+/// `/sys/class/drm/cardN-<connector>` and reused `N` directly as the
+/// ALSA card index, so a host whose HDMI audio actually lives on
+/// `hw:0,3` was advertised as `hw:1,3` — `snd_pcm_open` then failed
+/// with `ENODEV` and the display output was silently video-only.
+///
+/// We now resolve the ALSA card by locating the HDA card that actually
+/// exposes HDMI PCM playback devices (preferring one with a monitor
+/// currently plugged in), independent of DRM numbering. The PCM
+/// *device* index is still the positional `infer_alsa_pcm_for`
+/// heuristic — pinning a specific connector to a specific HDMI
+/// converter requires parsing the HDA codec topology
+/// (`/proc/asound/card*/codec#*`), which is deferred; operators
+/// override the full `hw:<card>,<device>` via the output's
+/// `audio_device` field when the heuristic misses. Returns `None` only
+/// when no HDMI-capable ALSA card is found at all (the operator can
+/// still pick `default` or a custom device name).
 fn best_alsa_device_for_connector(connector_name: &str) -> Option<String> {
-    let drm_dir = std::fs::read_dir("/sys/class/drm").ok()?;
-    let mut card_idx: Option<u32> = None;
-    for entry in drm_dir.flatten() {
+    let card_idx = alsa_hdmi_card_index()?;
+    Some(format!("hw:{},{}", card_idx, infer_alsa_pcm_for(connector_name)))
+}
+
+/// Locate the ALSA card index that backs HDMI / DisplayPort audio.
+/// Walks `/proc/asound/card*/` for cards that expose an HDMI PCM
+/// playback device; when several exist (e.g. an Intel PCH HDA plus a
+/// discrete-GPU HDA), prefers the lowest-indexed card that currently
+/// reports a plugged-in sink (`eld#* monitor_present 1`). Falls back to
+/// the lowest HDMI-capable card index. `None` when none is found.
+fn alsa_hdmi_card_index() -> Option<u32> {
+    let mut hdmi_cards: Vec<u32> = Vec::new();
+    let mut card_with_monitor: Option<u32> = None;
+
+    for entry in std::fs::read_dir("/proc/asound").ok()?.flatten() {
         let fname = entry.file_name();
         let name = fname.to_string_lossy();
-        if !name.contains(connector_name) {
+        // `card0`, `card1`, … — skip the `cards` summary file and any
+        // non-card entries.
+        let Some(idx_str) = name.strip_prefix("card") else {
+            continue;
+        };
+        let Ok(card_idx) = idx_str.parse::<u32>() else {
+            continue;
+        };
+        let card_dir = entry.path();
+        if !card_has_hdmi_pcm(&card_dir) {
             continue;
         }
-        // Walk back: `cardN-HDMI-A-1` → N
-        if let Some(prefix) = name.strip_prefix("card") {
-            if let Some((n_str, _rest)) = prefix.split_once('-') {
-                if let Ok(n) = n_str.parse::<u32>() {
-                    card_idx = Some(n);
-                    break;
-                }
+        hdmi_cards.push(card_idx);
+        if card_has_present_monitor(&card_dir) {
+            card_with_monitor = Some(card_with_monitor.map_or(card_idx, |c| c.min(card_idx)));
+        }
+    }
+
+    hdmi_cards.sort_unstable();
+    card_with_monitor.or_else(|| hdmi_cards.first().copied())
+}
+
+/// True when the ALSA card directory exposes at least one HDMI / DP PCM
+/// *playback* device — detected via `pcm<N>p/info` whose `id:` line
+/// names "HDMI" or "DP" (excludes the analog `ALC###` playback device).
+fn card_has_hdmi_pcm(card_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(card_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let n = entry.file_name();
+        let n = n.to_string_lossy();
+        // Playback PCM device dirs are `pcm3p`, `pcm7p`, … (trailing `p`);
+        // capture (`pcm0c`) and other nodes are skipped.
+        if !(n.starts_with("pcm") && n.ends_with('p')) {
+            continue;
+        }
+        let info = card_dir.join(&*n).join("info");
+        if let Ok(text) = std::fs::read_to_string(&info) {
+            if text.lines().any(|l| {
+                let l = l.trim();
+                l.starts_with("id:") && (l.contains("HDMI") || l.contains("DP"))
+            }) {
+                return true;
             }
         }
     }
-    let _ = card_idx?;
-    // Fallback: most modern hosts route HDMI audio through the GPU's
-    // own ALSA card with PCM index `3` for the first HDMI port. We
-    // could refine this by scanning `eld*` files, but for v1 the
-    // operator can override via `audio_device` on the output config.
-    Some(format!(
-        "hw:{},{}",
-        card_idx.unwrap_or(0),
-        infer_alsa_pcm_for(connector_name)
-    ))
+    false
+}
+
+/// True when any `eld#*` node under the card reports `monitor_present
+/// 1` — i.e. a sink is currently plugged into one of its HDMI/DP ports.
+fn card_has_present_monitor(card_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(card_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let n = entry.file_name();
+        if !n.to_string_lossy().starts_with("eld#") {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(entry.path()) {
+            // ELD lines are whitespace-separated: `monitor_present\t\t1`.
+            if text.lines().any(|l| {
+                let mut it = l.split_whitespace();
+                it.next() == Some("monitor_present") && it.next() == Some("1")
+            }) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn infer_alsa_pcm_for(connector_name: &str) -> u32 {
@@ -2618,6 +2696,29 @@ impl KmsDisplay {
             &[self.connector],
             Some(self.mode),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infer_alsa_pcm_positional_heuristic() {
+        // First HDMI/DP connector → PCM 3, second → 7, others → 8.
+        assert_eq!(infer_alsa_pcm_for("HDMI-A-1"), 3);
+        assert_eq!(infer_alsa_pcm_for("DP-1"), 3);
+        assert_eq!(infer_alsa_pcm_for("HDMI-A-2"), 7);
+        assert_eq!(infer_alsa_pcm_for("HDMI-A-3"), 8);
+        // No numeric suffix → default first HDMI PCM.
+        assert_eq!(infer_alsa_pcm_for("HDMI-A"), 3);
+    }
+
+    #[test]
+    fn alsa_hdmi_card_index_does_not_panic() {
+        // Environment-dependent (reads /proc/asound) — just assert it
+        // returns without panicking on whatever host runs the suite.
+        let _ = alsa_hdmi_card_index();
     }
 }
 

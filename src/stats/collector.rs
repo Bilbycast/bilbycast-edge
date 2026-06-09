@@ -3524,6 +3524,44 @@ pub struct BondPathStatsHandle {
     pub name: String,
     pub transport: String,
     pub stats: Arc<bonding_protocol::stats::PathStats>,
+    /// Per-path bitrate estimator, sampled once per snapshot (1 Hz)
+    /// off the path's directional byte counter. The bonding crate
+    /// declares `PathStats::throughput_bps` but never writes it, so
+    /// the edge derives the rate here — same delta/elapsed×8 model the
+    /// per-input/output bitrate uses.
+    pub bitrate_est: Arc<crate::stats::throughput::ThroughputEstimator>,
+    /// True when this leg uses gateway-mode path selection (the edge
+    /// programmed a policy route). Reported as `binding = "gateway"`;
+    /// otherwise the resolved NIC-pin mechanism from `PathStats` is
+    /// reported.
+    pub gateway_mode: bool,
+}
+
+impl BondPathStatsHandle {
+    /// Build a path handle, allocating its bitrate estimator. The
+    /// estimator lives behind an `Arc` so the handle stays `Clone` and
+    /// every snapshot of the same path shares one rate-sampling window.
+    pub fn new(
+        id: u8,
+        name: String,
+        transport: String,
+        stats: Arc<bonding_protocol::stats::PathStats>,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            transport,
+            stats,
+            bitrate_est: Arc::new(crate::stats::throughput::ThroughputEstimator::new()),
+            gateway_mode: false,
+        }
+    }
+
+    /// Mark this leg as gateway-mode (builder style).
+    pub fn with_gateway_mode(mut self, gateway: bool) -> Self {
+        self.gateway_mode = gateway;
+        self
+    }
 }
 
 /// Aggregate + per-path bond stats handle. One per bonded input or
@@ -3556,6 +3594,14 @@ pub fn bond_handle_to_leg_stats(h: &BondStatsHandle) -> BondLegStats {
         .iter()
         .map(|p| {
             let ps = p.stats.snapshot();
+            // Derive the per-path rate off the byte counter for this
+            // bond's active direction. Cached for 1 s inside the
+            // estimator, so multiple consumers (WS + Prometheus + API)
+            // within a tick reuse one computed value.
+            let throughput_bps = match h.role {
+                BondStatsRole::Sender => p.bitrate_est.sample(ps.bytes_sent),
+                BondStatsRole::Receiver => p.bitrate_est.sample(ps.bytes_received),
+            };
             BondPathLegStats {
                 id: p.id,
                 name: p.name.clone(),
@@ -3564,7 +3610,7 @@ pub fn bond_handle_to_leg_stats(h: &BondStatsHandle) -> BondLegStats {
                 rtt_ms: ps.rtt_ms(),
                 jitter_us: ps.jitter_us,
                 loss_fraction: ps.loss_fraction(),
-                throughput_bps: ps.throughput_bps,
+                throughput_bps,
                 queue_depth: ps.queue_depth,
                 packets_sent: ps.packets_sent,
                 bytes_sent: ps.bytes_sent,
@@ -3576,6 +3622,14 @@ pub fn bond_handle_to_leg_stats(h: &BondStatsHandle) -> BondLegStats {
                 retransmits_received: ps.retransmits_received,
                 keepalives_sent: ps.keepalives_sent,
                 keepalives_received: ps.keepalives_received,
+                // Gateway-mode legs report "gateway"; interface-mode
+                // legs report the kernel primitive that actually bound
+                // them (so_bindtodevice vs the unprivileged hint).
+                binding: if p.gateway_mode {
+                    "gateway".to_string()
+                } else {
+                    ps.pin_mechanism_label().to_string()
+                },
             }
         })
         .collect();
@@ -3596,11 +3650,21 @@ pub fn bond_handle_to_leg_stats(h: &BondStatsHandle) -> BondLegStats {
         "idle".to_string()
     };
 
+    // Aggregate bond bandwidth = sum of per-path realized throughput in
+    // the active direction. This is gross bytes on the wire across all
+    // legs, not the unique/delivered payload rate: on the sender a
+    // duplicated `Critical` IDR counts on each path it rides; on the
+    // receiver a Broadcast-group bond counts the same packet on every
+    // leg before reassembly dedup. Goodput is visible separately via the
+    // aggregate `packets_delivered` / `duplicates_received` counters.
+    let throughput_bps: u64 = paths.iter().map(|p| p.throughput_bps).sum();
+
     BondLegStats {
         state,
         flow_id: h.flow_id,
         role,
         scheduler: h.scheduler.clone(),
+        throughput_bps,
         packets_sent: snap.packets_sent,
         bytes_sent: snap.bytes_sent,
         packets_retransmitted: snap.packets_retransmitted,
@@ -3988,5 +4052,96 @@ impl StatsCollector {
     /// Snapshot a single flow by ID. Returns `None` if the flow is not registered.
     pub fn flow_snapshot(&self, flow_id: &str) -> Option<FlowStats> {
         self.flow_stats.get(flow_id).map(|entry| entry.snapshot())
+    }
+}
+
+#[cfg(test)]
+mod bond_throughput_tests {
+    use super::*;
+    use bonding_protocol::stats::{BondConnStats, PathStats};
+    use std::sync::atomic::Ordering;
+
+    /// `bond_handle_to_leg_stats` must derive a per-path rate from the
+    /// byte counter in the bond's active direction, sum it into the
+    /// aggregate, and ignore the opposite-direction counter. (The
+    /// bonding crate declares `throughput_bps` but never writes it, so
+    /// this rate has to come from the edge.)
+    #[test]
+    fn per_path_rate_is_derived_summed_and_direction_correct() {
+        let p0 = PathStats::new();
+        let p1 = PathStats::new();
+        // Sender direction reads bytes_sent. The large bytes_received
+        // value is a decoy a sender bond must NOT count.
+        p0.bytes_sent.fetch_add(250_000, Ordering::Relaxed); // ~2 Mbps / s
+        p0.bytes_received.fetch_add(50_000_000, Ordering::Relaxed); // decoy
+        p1.bytes_sent.fetch_add(125_000, Ordering::Relaxed); // ~1 Mbps / s
+
+        let handle = BondStatsHandle {
+            flow_id: 7,
+            role: BondStatsRole::Sender,
+            scheduler: "weighted_rtt".to_string(),
+            conn_stats: Arc::new(BondConnStats::default()),
+            paths: vec![
+                BondPathStatsHandle::new(0, "5G".to_string(), "udp".to_string(), p0.clone()),
+                BondPathStatsHandle::new(1, "starlink".to_string(), "udp".to_string(), p1.clone()),
+            ],
+        };
+
+        // The estimator caches for 1 s, so sample once, wait past the
+        // window, then sample again to get a real rate.
+        let _ = bond_handle_to_leg_stats(&handle);
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        let legs = bond_handle_to_leg_stats(&handle);
+
+        assert_eq!(legs.paths.len(), 2);
+        assert!(legs.paths[0].throughput_bps > 0, "p0 rate should be > 0");
+        assert!(legs.paths[1].throughput_bps > 0, "p1 rate should be > 0");
+        // Direction: rate tracks the 250 kB of bytes_sent, never the
+        // 50 MB bytes_received decoy (which would be ~400 Mbps).
+        assert!(
+            legs.paths[0].throughput_bps < 20_000_000,
+            "sender rate must track bytes_sent, not bytes_received (got {})",
+            legs.paths[0].throughput_bps
+        );
+        // p0 sent 2× p1, so it must carry the higher rate.
+        assert!(legs.paths[0].throughput_bps > legs.paths[1].throughput_bps);
+        // Aggregate is exactly the sum of the per-path rates.
+        assert_eq!(
+            legs.throughput_bps,
+            legs.paths[0].throughput_bps + legs.paths[1].throughput_bps
+        );
+    }
+
+    /// A receiver bond reads the bytes_received counter instead.
+    #[test]
+    fn receiver_direction_reads_bytes_received() {
+        let p0 = PathStats::new();
+        p0.bytes_received.fetch_add(250_000, Ordering::Relaxed);
+        p0.bytes_sent.fetch_add(50_000_000, Ordering::Relaxed); // decoy
+
+        let handle = BondStatsHandle {
+            flow_id: 9,
+            role: BondStatsRole::Receiver,
+            scheduler: String::new(),
+            conn_stats: Arc::new(BondConnStats::default()),
+            paths: vec![BondPathStatsHandle::new(
+                0,
+                "wired".to_string(),
+                "udp".to_string(),
+                p0.clone(),
+            )],
+        };
+
+        let _ = bond_handle_to_leg_stats(&handle);
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        let legs = bond_handle_to_leg_stats(&handle);
+
+        assert!(legs.paths[0].throughput_bps > 0);
+        assert!(
+            legs.paths[0].throughput_bps < 20_000_000,
+            "receiver rate must track bytes_received, not bytes_sent (got {})",
+            legs.paths[0].throughput_bps
+        );
+        assert_eq!(legs.throughput_bps, legs.paths[0].throughput_bps);
     }
 }
