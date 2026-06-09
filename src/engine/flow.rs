@@ -1271,6 +1271,7 @@ impl FlowRuntime {
                 &display_claim_registry,
                 av_sync_pacer.clone(),
                 active_input_tx.subscribe(),
+                &master_clock,
             ).await?;
             output_handles.insert(output_config.id().to_string(), output_rt);
         }
@@ -1904,6 +1905,9 @@ impl FlowRuntime {
         // between same-codec / same-PID inputs (where the replacers'
         // internal codec/PID-change reset path doesn't fire).
         active_input_rx: watch::Receiver<String>,
+        // Flow master clock — handed to the display output so a
+        // `sync_mode = "genlock"` panel can lock its audio to it.
+        master_clock: &crate::engine::master_clock::MasterClockHandle,
     ) -> Result<OutputRuntime> {
         let output_cancel = parent_cancel.child_token();
 
@@ -2268,6 +2272,7 @@ impl FlowRuntime {
                         event_sender.clone(),
                         flow_id.to_string(),
                         Arc::clone(display_claim_registry),
+                        master_clock.clone(),
                     );
                     Ok(OutputRuntime {
                         handle,
@@ -2432,6 +2437,7 @@ impl FlowRuntime {
             &self.display_claim_registry,
             av_sync_pacer,
             self.active_input_tx.subscribe(),
+            &self.master_clock,
         ).await?;
 
         // Update output config metadata so stats snapshots reflect the new address/port

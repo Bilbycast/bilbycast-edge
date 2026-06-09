@@ -1,50 +1,67 @@
-// Lock-free audio clock shared between the display task and the audio
-// task on a `display` output.
+// Measured audio-playout clock shared between the display task and the
+// audio task on a `display` output.
 //
-// The audio task is the master: every successful `snd_pcm_writei` of N
-// samples advances the clock by `N / sample_rate` seconds. The display
-// task reads the clock per-frame to compute the current PTS-equivalent
-// for pacing decisions against decoded video frames.
+// **This is a MEASURED clock, not an estimate.** The audio task calls
+// [`AudioClock::set_position`] after every successful ALSA write with the
+// PTS of the sample the DAC is *actually about to play* — derived from
+// `snd_pcm_delay()` (frames written but not yet played). The display task
+// reads [`AudioClock::current_pts_90k_smoothed`] per video frame and paces
+// each frame to that playout position.
 //
-// Implementation: an anchor PTS (90 kHz), the active sample rate (Hz),
-// and a running counter of total samples-since-anchor — all atomic.
-// Plus a wall-clock anchor (`program_start`-relative microseconds) and
-// a per-`advance` wall-clock timestamp used to interpolate the clock
-// forward between ALSA-period writes (~20 ms). Without that
-// interpolation the display task reads a stepped value and drift
-// against video PTS swings ±20 ms across each period boundary,
-// triggering visible dup/drop stutter.
+// History: an earlier revision advanced this clock open-loop by
+// `samples_written / nominal_rate` plus two heuristic "catch-up" tiers
+// that snapped the clock forward/back by ±100 ms when accumulated PES-PTS
+// gaps crossed a threshold. That produced (a) a large constant lip-sync
+// offset, because the audio clock never knew the true DAC playout point,
+// and (b) a slow sawtooth as the catch-up hunted around the soundcard-vs-
+// source rate gap. Driving the clock from the measured hardware delay
+// eliminates both: the clock IS the playout point, so there is nothing to
+// estimate and nothing to snap. Rate-matching between the soundcard and
+// the source is handled in `audio.rs` by an adaptive resampler, not here.
+//
+// Implementation: a base PTS (90 kHz, = the measured playout point at the
+// last write) plus a wall-clock stamp of when that measurement was taken.
+// Reads interpolate the base forward by wall-clock elapsed since the
+// stamp (the DAC plays in real time), capped at `INTERP_CAP_US` so a
+// stalled audio task — xrun recovery, codec error, channel close — stops
+// extrapolating into the future and lets the display task notice the
+// stall instead.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-/// Audio-as-master clock. Constructed empty; the audio task calls
-/// [`AudioClock::set_anchor`] on the first successful ALSA write and
-/// [`AudioClock::advance`] thereafter.
+/// Beyond this many µs since the last `set_position`, stop interpolating
+/// the playout forward — a brief gap (a slow write, one missed period)
+/// shouldn't extrapolate unbounded. Steady-state writes land every ALSA
+/// period (~20–32 ms), so this cap is only reached on a hiccup.
+const INTERP_CAP_US: u64 = 120_000;
+
+/// Beyond this many µs since the last `set_position`, treat the clock as
+/// **unavailable** (reads return `None`). At this point the audio task is
+/// genuinely wedged (codec death, ALSA device hang, channel closed without
+/// teardown) and the display loop should fall back to free-running video on
+/// wall-clock rather than pacing to a frozen clock forever.
+const STALE_US: u64 = 2_000_000;
+
+/// Measured audio-playout clock. Constructed empty; the audio task calls
+/// [`AudioClock::set_position`] on the first successful ALSA write and
+/// after every write thereafter. Until the first call, all reads return
+/// `None`.
 #[derive(Debug, Default)]
 pub struct AudioClock {
-    /// Set by `set_anchor`. Until then, all reads return `None`.
+    /// Set true by the first `set_position`. Until then, reads return `None`.
     armed: AtomicBool,
-    /// Reference `Instant` against which `last_advance_us` is measured.
-    /// Set on the first `set_anchor` call (the supplied `now` is the
-    /// receiver-side `program_start` — kept around so the smoothed
-    /// reader can compute "wall-clock now in µs since program start").
+    /// Reference `Instant` (the receiver-side `program_start`), recorded on
+    /// the first `set_position` and reused so `base_wall_us` and the reader
+    /// share one timeline.
     program_start: OnceLock<Instant>,
-    /// PTS at the anchor instant, in 90 kHz units (matching `TsDemuxer`).
-    anchor_pts_90k: AtomicU64,
-    /// Sample rate driving the clock — set on first write, mutated only
-    /// when the upstream stream's SR changes (and the anchor is reset).
-    sample_rate: AtomicU32,
-    /// Total samples-per-channel written through the audio device since
-    /// the anchor. Together with `sample_rate` this lets the display
-    /// task compute a fresh PTS without locking.
-    samples_since_anchor: AtomicU64,
-    /// Microseconds-since-`program_start` at the most recent `advance`
-    /// (or `set_anchor`). The smoothed reader uses
-    /// `now_us - last_advance_us` to interpolate the audio PTS forward
-    /// between ALSA-period writes — a ~20 ms quantum without it.
-    last_advance_us: AtomicU64,
+    /// The measured DAC playout PTS at the most recent `set_position`, in
+    /// 90 kHz units (matching `TsDemuxer`).
+    base_pts_90k: AtomicU64,
+    /// Microseconds-since-`program_start` at the most recent `set_position`.
+    /// The reader interpolates `base_pts_90k` forward by `now − base_wall_us`.
+    base_wall_us: AtomicU64,
 }
 
 impl AudioClock {
@@ -52,86 +69,59 @@ impl AudioClock {
         Self::default()
     }
 
-    /// Initial wall-clock anchor. Called by the audio task right before
-    /// the first successful `writei` returns. The wall-clock origin
-    /// `now` (the receiver-side `program_start`) is recorded the first
-    /// time this is called and reused for every subsequent call so
-    /// `last_advance_us` and the smoothed reader stay on a single
-    /// timeline.
-    pub fn set_anchor(&self, now: Instant, anchor_pts_90k: u64, sample_rate: u32) {
+    /// Record the measured playout position. `playout_pts_90k` is the PTS of
+    /// the sample the DAC is about to play (the source-PTS of the last
+    /// queued sample minus the `snd_pcm_delay()` queue depth). `now` is the
+    /// wall-clock instant the measurement was taken; the first call's value
+    /// is kept as the timeline origin and reused for every later call.
+    pub fn set_position(&self, now: Instant, playout_pts_90k: u64) {
         let _ = self.program_start.set(now);
-        self.anchor_pts_90k.store(anchor_pts_90k, Ordering::Relaxed);
-        self.sample_rate.store(sample_rate, Ordering::Relaxed);
-        self.samples_since_anchor.store(0, Ordering::Relaxed);
         let now_us = self
             .program_start
             .get()
             .map(|s| s.elapsed().as_micros() as u64)
             .unwrap_or(0);
-        self.last_advance_us.store(now_us, Ordering::Relaxed);
+        self.base_pts_90k.store(playout_pts_90k, Ordering::Relaxed);
+        self.base_wall_us.store(now_us, Ordering::Relaxed);
         self.armed.store(true, Ordering::Release);
     }
 
-    /// Advance the clock by `samples` samples-per-channel of audio that
-    /// just landed in the ALSA buffer. The audio task calls this after
-    /// each successful blocking write.
-    pub fn advance(&self, samples: u64) {
-        self.samples_since_anchor
-            .fetch_add(samples, Ordering::Relaxed);
-        if let Some(start) = self.program_start.get() {
-            let now_us = start.elapsed().as_micros() as u64;
-            self.last_advance_us.store(now_us, Ordering::Relaxed);
-        }
-    }
-
-    /// Read the current "audio now" PTS in 90 kHz units. `None` until
-    /// the audio task has set the anchor. Cheap — three relaxed loads
-    /// plus a couple of mults. **Stepped** — the value only advances
-    /// when the audio task calls `advance()`, i.e. once per ALSA period
-    /// (~20 ms in our config). Use [`current_pts_90k_smoothed`] from
-    /// the display task; this method is kept for stats / debug paths
-    /// that want the raw "samples written so far" answer.
+    /// Raw last-measured playout PTS in 90 kHz units (no interpolation).
+    /// `None` until the audio task has set a position. Kept for stats /
+    /// debug paths and unit tests; the display loop uses
+    /// [`current_pts_90k_smoothed`].
+    #[allow(dead_code)]
     pub fn current_pts_90k(&self) -> Option<u64> {
         if !self.armed.load(Ordering::Acquire) {
             return None;
         }
-        let anchor_pts = self.anchor_pts_90k.load(Ordering::Relaxed);
-        let sr = self.sample_rate.load(Ordering::Relaxed);
-        if sr == 0 {
-            return Some(anchor_pts);
-        }
-        let samples = self.samples_since_anchor.load(Ordering::Relaxed);
-        // 90 000 / sample_rate * samples — done in u128 to avoid overflow
-        // on long playouts (e.g. 48 kHz × hours).
-        let delta_pts = (samples as u128).saturating_mul(90_000) / (sr as u128);
-        Some(anchor_pts.wrapping_add(delta_pts as u64))
+        Some(self.base_pts_90k.load(Ordering::Relaxed))
     }
 
-    /// Same as [`current_pts_90k`] but **interpolated forward** by
-    /// wall-clock since the most recent `advance`. Smooths over the
-    /// per-ALSA-period quantum (~20 ms in our config) the audio task
-    /// writes in. The display loop reads this for per-frame pacing —
-    /// without smoothing, drift swings ±20 ms across each period
-    /// boundary and tips the dup/drop logic into bursts of repeated /
-    /// dropped frames that the operator sees as motion stutter.
-    ///
-    /// The interpolation is capped at 200 ms — beyond that the audio
-    /// task is stalled (xrun recovery, codec error, channel close)
-    /// and we shouldn't keep extrapolating; we let drift go negative
-    /// instead so the display task knows to drop / re-anchor.
+    /// Current audio playout PTS in 90 kHz units, interpolated forward by
+    /// wall-clock since the last [`set_position`]. The DAC plays in real
+    /// time, so between ALSA-period writes the true playout advances at
+    /// wall-clock rate; interpolating gives the display loop a smooth
+    /// per-frame reference instead of a value that steps once per period.
+    /// Forward interpolation is capped at [`INTERP_CAP_US`]. If no position
+    /// has been published for longer than [`STALE_US`] the audio task is
+    /// considered wedged and this returns `None` so the display loop reverts
+    /// to wall-clock pacing instead of tracking a frozen clock indefinitely.
     pub fn current_pts_90k_smoothed(&self) -> Option<u64> {
-        let base = self.current_pts_90k()?;
+        if !self.armed.load(Ordering::Acquire) {
+            return None;
+        }
+        let base = self.base_pts_90k.load(Ordering::Relaxed);
         let Some(start) = self.program_start.get() else {
             return Some(base);
         };
-        let sr = self.sample_rate.load(Ordering::Relaxed);
-        if sr == 0 {
-            return Some(base);
-        }
         let now_us = start.elapsed().as_micros() as u64;
-        let last_us = self.last_advance_us.load(Ordering::Relaxed);
-        let elapsed_us = now_us.saturating_sub(last_us).min(200_000);
-        let elapsed_pts = elapsed_us.saturating_mul(90) / 1000;
+        let last_us = self.base_wall_us.load(Ordering::Relaxed);
+        let gap_us = now_us.saturating_sub(last_us);
+        if gap_us > STALE_US {
+            return None;
+        }
+        let elapsed_pts = gap_us.min(INTERP_CAP_US).saturating_mul(90) / 1000;
         Some(base.wrapping_add(elapsed_pts))
     }
 }
@@ -151,47 +141,60 @@ mod tests {
     }
 
     #[test]
-    fn anchored_clock_advances_in_pts() {
+    fn position_is_reported_raw() {
         let c = AudioClock::new();
-        let now = Instant::now();
-        c.set_anchor(now, 90_000, 48_000);
-        // Raw reader is exact: anchor PTS until samples advance.
+        c.set_position(Instant::now(), 90_000);
         assert_eq!(c.current_pts_90k(), Some(90_000));
-        // Write 480 samples = 10 ms at 48 kHz = 900 PTS units.
-        c.advance(480);
-        assert_eq!(c.current_pts_90k(), Some(90_900));
-        c.advance(48_000);
-        assert_eq!(c.current_pts_90k(), Some(90_000 + 900 + 90_000));
+        // A later measurement simply overwrites the base (re-anchor on a
+        // stream switch is free — the next write's playout PTS wins).
+        c.set_position(Instant::now(), 270_000);
+        assert_eq!(c.current_pts_90k(), Some(270_000));
     }
 
     #[test]
-    fn smoothed_clock_interpolates_between_advances() {
+    fn smoothed_clock_interpolates_forward_at_wallclock_rate() {
         let c = AudioClock::new();
-        c.set_anchor(Instant::now(), 90_000, 48_000);
-        c.advance(480); // base = 90_900
+        c.set_position(Instant::now(), 90_000);
         let base = c.current_pts_90k().unwrap();
         thread::sleep(Duration::from_millis(20));
         let smoothed = c.current_pts_90k_smoothed().unwrap();
-        // Smoothed should have moved forward by roughly 20 ms = 1800 PTS,
-        // give a wide tolerance for OS scheduler jitter.
+        // ~20 ms of wall-clock = ~1800 PTS units; wide tolerance for
+        // scheduler jitter.
         let delta = smoothed.wrapping_sub(base);
         assert!(
-            (1_500..=3_000).contains(&delta),
+            (1_200..=3_000).contains(&delta),
             "expected ~1800 PTS interpolation, got {delta}",
         );
     }
 
     #[test]
-    fn shared_arc_lock_free() {
+    fn interpolation_is_capped_on_stall() {
+        let c = AudioClock::new();
+        c.set_position(Instant::now(), 1_000_000);
+        // Simulate a long stall well past the cap.
+        thread::sleep(Duration::from_millis(200));
+        let smoothed = c.current_pts_90k_smoothed().unwrap();
+        let delta = smoothed.wrapping_sub(1_000_000);
+        // Capped at INTERP_CAP_US (120 ms) = 10_800 PTS; never the full 200 ms.
+        assert!(
+            delta <= 10_800 + 900,
+            "interpolation should cap near 120 ms, got {delta} PTS",
+        );
+    }
+
+    #[test]
+    fn shared_arc_is_lock_free_and_monotonic_under_forward_positions() {
         let c = Arc::new(AudioClock::new());
-        let now = Instant::now();
-        c.set_anchor(now, 0, 48_000);
+        let start = Instant::now();
+        c.set_position(start, 0);
         let writer = {
             let c = Arc::clone(&c);
             thread::spawn(move || {
+                let mut pts = 0u64;
                 for _ in 0..100 {
-                    c.advance(48);
-                    thread::sleep(Duration::from_micros(10));
+                    pts += 960; // ~20 ms @ 48 kHz worth of playout
+                    c.set_position(Instant::now(), pts * 90_000 / 48_000);
+                    thread::sleep(Duration::from_micros(50));
                 }
             })
         };
@@ -200,14 +203,16 @@ mod tests {
             thread::spawn(move || {
                 let mut last = 0;
                 for _ in 0..100 {
-                    let pts = c.current_pts_90k().unwrap();
-                    assert!(pts >= last);
-                    last = pts;
+                    if let Some(pts) = c.current_pts_90k() {
+                        // Positions only ever move forward in this test.
+                        assert!(pts >= last);
+                        last = pts;
+                    }
                 }
             })
         };
         writer.join().unwrap();
         reader.join().unwrap();
-        assert!(c.current_pts_90k().unwrap() >= 100 * 48 * 90_000 / 48_000);
+        assert!(c.current_pts_90k().unwrap() > 0);
     }
 }

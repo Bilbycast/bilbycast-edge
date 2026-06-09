@@ -4923,10 +4923,15 @@ fn validate_display_output(c: &crate::config::models::DisplayOutputConfig) -> Re
         );
     }
 
-    if c.sync_mode != "vsync_to_display" {
+    // `vsync_to_display` (default) paces video to the measured ALSA audio
+    // playout (audio-master). `genlock` instead locks the display's audio to
+    // the flow master clock so the panel stays rate-coherent with the flow's
+    // wire outputs (and with other edges on the same grandmaster); video
+    // still follows the audio playout, so lip-sync is identical either way.
+    if c.sync_mode != "vsync_to_display" && c.sync_mode != "genlock" {
         return Err(anyhow::anyhow!(
-            "display output '{}': sync_mode '{}' is not supported in v1 \
-             (only 'vsync_to_display' is accepted)",
+            "display output '{}': sync_mode '{}' is not supported \
+             (accepted: 'vsync_to_display', 'genlock')",
             c.id,
             c.sync_mode
         ));

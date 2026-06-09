@@ -5575,9 +5575,16 @@ pub struct DisplayOutputConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_hz: Option<u32>,
 
-    /// A/V sync mode. v1 only accepts `"vsync_to_display"` — the renderer
-    /// paces to the monitor's vsync and dup/drops video to track the audio
-    /// clock. PTP-genlocked / PCR-master modes land in v2.
+    /// A/V sync mode.
+    /// - `"vsync_to_display"` (default): audio-master. Video is paced to the
+    ///   measured ALSA audio-playout clock (`snd_pcm_delay()`); an adaptive
+    ///   resampler holds the DAC buffer so the soundcard-vs-source rate gap
+    ///   never accumulates.
+    /// - `"genlock"`: the audio resampler instead locks the measured playout
+    ///   to the flow master clock, so the panel stays rate-coherent with the
+    ///   flow's wire outputs and with other edges on the same grandmaster.
+    ///   Video still follows the audio playout, so on-screen lip-sync is
+    ///   identical to audio-master; genlock only adds cross-output coherence.
     #[serde(default = "default_sync_mode")]
     pub sync_mode: String,
 

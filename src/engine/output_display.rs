@@ -89,6 +89,7 @@ pub fn spawn_display_output(
     event_sender: EventSender,
     flow_id: String,
     claim_registry: Arc<crate::display::claim_registry::DisplayClaimRegistry>,
+    master_clock: crate::engine::master_clock::MasterClockHandle,
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
     tokio::spawn(async move {
@@ -100,6 +101,7 @@ pub fn spawn_display_output(
             event_sender,
             flow_id,
             claim_registry,
+            master_clock,
         )
         .await
         {
@@ -118,6 +120,7 @@ async fn run_display_output(
     event_sender: EventSender,
     flow_id: String,
     claim_registry: Arc<crate::display::claim_registry::DisplayClaimRegistry>,
+    master_clock: crate::engine::master_clock::MasterClockHandle,
 ) -> Result<()> {
     use crate::display::claim_registry::{ClaimKey, ClaimOutcome};
 
@@ -410,9 +413,19 @@ async fn run_display_output(
         ),
     );
 
-    // 3. Wire up channels + audio clock + program-start anchor.
+    // 3. Wire up channels + audio clock.
     let clock = Arc::new(AudioClock::new());
-    let program_start = Instant::now();
+    // Clock reference for the audio resampler. Default (`vsync_to_display`)
+    // is audio-master: the resampler holds the DAC buffer and video paces to
+    // the measured playout. `genlock` instead locks the measured playout to
+    // the flow master clock so the panel stays rate-coherent with the flow's
+    // wire outputs; video still follows the playout, so lip-sync is the same.
+    let display_master_clock: Option<crate::engine::master_clock::MasterClockHandle> =
+        if config.sync_mode == "genlock" {
+            Some(master_clock)
+        } else {
+            None
+        };
     let (vtx, vrx) = mpsc::channel::<VideoFrame>(MPSC_VIDEO_DEPTH);
     let (atx, arx) = mpsc::channel::<AudioBlock>(MPSC_AUDIO_DEPTH);
     // Shared switch / Lagged / pts_jump generation. Demux is the sole
@@ -658,7 +671,9 @@ async fn run_display_output(
             audio_clock,
             audio_counters,
             audio_pair,
-            program_start,
+            // Stage 1 runs audio-master (None); Stage 2 passes the flow
+            // master clock here to switch the renderer into genlock.
+            display_master_clock,
             audio_cancel,
             audio_event_sender,
             audio_flow_id,
@@ -2486,56 +2501,20 @@ fn display_loop(
     // fresh.
     let mut wall_anchor: Option<(u64, Instant)> = None;
 
-    // Audio↔video PTS offset, EMA-smoothed across the run.
-    //
-    // The single-shot capture this used to do was fragile: the very
-    // first frame after `clock` arms could land mid-startup-burst (the
-    // audio task fills the 80 ms ALSA buffer in <5 ms wall, so smoothed
-    // audio_pts spikes forward), or mid-decoder-priming (libavcodec MP2 /
-    // MPEG-2 audio under-counts the first 1-2 frames' samples), or just
-    // happened to fall on a heavy B-frame's display PTS. Whatever
-    // value got captured became a permanent constant — and on the
-    // sources that captured a small offset but had a real long-term
-    // V-A drift in the source stream itself (PCR/PTS encoder jitter),
-    // every steady-state frame sat 100-300 ms past the drop threshold.
-    //
-    // EMA-smoothed offset (α = 1/64 ≈ 2.5 s @ 25 fps) tracks both the
-    // initial baseline and slow source drift. **Filtered drift** (raw
-    // drift − smoothed offset) gates dropping; real transient
-    // excursions still trip the threshold while the steady-state
-    // baseline is absorbed. The **raw drift** is what operators see on
-    // `DisplayStats.av_sync_offset_ms` so a mis-anchored stream is
-    // visible in the manager UI.
-    //
-    // Sustained-drop hysteresis: a single filtered-drift sample past
-    // `-drop_threshold_ms` is treated as transient noise (mpeg-2 audio
-    // streams produce these on per-frame PTS jitter); we only drop
-    // after `LATE_HYSTERESIS_FRAMES` consecutive samples agree the
-    // video is genuinely late.
-    //
-    // Reset on resolution change / PTS jump (input switch) so the EMA
-    // re-converges on the new stream.
-    let mut av_offset_pts_smoothed: Option<i64> = None;
-    let mut consecutive_late_frames: u32 = 0;
-    // Mirror of `consecutive_late_frames` — counts consecutive frames
-    // where `drift_ms > drop_threshold_ms` (video is sustained AHEAD
-    // of the audio clock by more than one drop window). Without this
-    // counter, sustained early drift (e.g. a source whose video PES
-    // PTS leads audio PES PTS by hundreds of ms — common on ISDB-T /
-    // DVB captures with pre-roll video buffer) leaves the display
-    // sleeping at the cap (`drop_threshold_ms`, 160 ms minimum) every
-    // frame forever, dropping the present rate to ~5-10 fps even when
-    // the source is 30 fps. The mirror snaps the EMA forward to the
-    // current raw drift after `LATE_HYSTERESIS_FRAMES * 2` consecutive
-    // sustained-early frames, the same way the late path snaps
-    // backward — recovers the display to source rate within ~12
-    // frames of an offset shift.
-    let mut consecutive_early_frames: u32 = 0;
-    // 6 frames ≈ 240 ms at 25 fps, 120 ms at 50 fps. Long enough to
-    // ride through one-off PES PTS jitter (DVB encoder side) and the
-    // slow-α EMA's catchup window; short enough that a real audio
-    // glitch (xrun, codec stall) still drops within ~quarter-second.
-    const LATE_HYSTERESIS_FRAMES: u32 = 6;
+    // Video is paced directly to the measured audio-playout position
+    // (`AudioClock`, now driven by `snd_pcm_delay()` in `audio.rs`). We
+    // present each frame when the audio the operator is *hearing* reaches
+    // that frame's PTS — i.e. we drive the raw V−A offset toward zero,
+    // rather than absorbing whatever baseline the stream happened to anchor
+    // with. That is the whole fix for the historical "+700 ms, video leads
+    // sound" offset: the old EMA folded the mux delivery interleave (~1 s of
+    // audio buffered ahead of the matching video) into "drift ≈ 0" and
+    // presented video immediately, so the picture ran a second ahead of the
+    // sound. With a measured clock the per-frame offset is smooth, so no EMA
+    // baseline, no consecutive-late/early snap, and no catch-up are needed —
+    // the loop self-aligns over the first ~second and then paces at source
+    // rate. `av_sync_offset_ms` reports this raw V−A offset and should now
+    // sit near zero.
 
     // The audio-bars overlay plane is pre-allocated up-front in
     // `run_display_output` (before the demux task spawns) so the demux
@@ -2655,9 +2634,6 @@ fn display_loop(
             if mw != next.width || mh != next.height {
                 matched_dims = None;
                 wall_anchor = None;
-                av_offset_pts_smoothed = None;
-                consecutive_late_frames = 0;
-                consecutive_early_frames = 0;
                 fps_locked = false;
                 frames_since_period_reset = 0;
             }
@@ -2775,9 +2751,6 @@ fn display_loop(
                 frame_period_ms = 33.0;
                 matched_dims = None;
                 wall_anchor = None;
-                av_offset_pts_smoothed = None;
-                consecutive_late_frames = 0;
-                consecutive_early_frames = 0;
                 fps_locked = false;
                 frames_since_period_reset = 0;
             } else if (10..=200).contains(&dms) {
@@ -2816,17 +2789,28 @@ fn display_loop(
         // Drop only frames so far behind the audio clock that catching
         // up by re-pacing isn't realistic. 4× source period (160 ms at
         // 25 fps, 100 ms at 60 fps).
+        // Drop frames more than this far behind the reference clock — a
+        // hopelessly-late frame (overloaded host, long Lagged burst) is
+        // better skipped than shown stale. Also the cap on the forward
+        // wait below. 4× source period (160 ms at 25 fps, 100 ms at 60 fps).
         let drop_threshold_ms: i64 = ((frame_period_ms as i64) * 4).max(160);
-        // Compute raw drift (V-A in ms). Returned `None` while the
-        // wall-clock fallback is still seeding (≤ 1 frame).
+        // Hand the buffer to KMS a hair before its target vblank — the
+        // page-flip blocks for up to one vblank inside `kms.present()`, so
+        // over-sleeping by even a millisecond pushes the scan-out a full
+        // frame late at 60 Hz.
+        const PRESENT_MARGIN_MS: i64 = 2;
+
+        // Raw video−audio offset in ms. With audio configured the reference
+        // is the *measured* audio-playout position (`AudioClock`, driven by
+        // `snd_pcm_delay()`); muted outputs fall back to a wall-clock seeded
+        // by the first frame's PTS.
         let raw_drift_ms_opt: Option<i64> = if let Some(audio_pts) =
             clock.current_pts_90k_smoothed()
         {
             wall_anchor = None;
             Some((next.pts_90k as i64 - audio_pts as i64) / 90)
         } else {
-            // Audio muted — pace on wall-clock seeded by the first
-            // post-anchor frame.
+            // Audio muted — pace on wall-clock seeded by the first frame.
             let now = Instant::now();
             let (anchor_pts, anchor_at) =
                 wall_anchor.get_or_insert_with(|| (next.pts_90k, now));
@@ -2836,97 +2820,39 @@ fn display_loop(
         };
 
         if let Some(raw_drift_ms) = raw_drift_ms_opt {
-            // EMA-smoothed offset of (V-A) in ms. α = 1/64 ≈ 2.5 s
-            // half-life at 25 fps — fast enough to track real source
-            // drift (DVB encoder PCR jitter typically evolves on a
-            // 5–30 s timescale), slow enough that one bad frame doesn't
-            // re-set the baseline.
-            let new_smoothed = match av_offset_pts_smoothed {
-                None => raw_drift_ms,
-                Some(prev) => {
-                    let ema = (prev * 63 + raw_drift_ms) / 64;
-                    let clamp_ms = frame_period_ms as i64;
-                    ema.clamp(
-                        raw_drift_ms - clamp_ms,
-                        raw_drift_ms + clamp_ms,
-                    )
-                }
-            };
-            av_offset_pts_smoothed = Some(new_smoothed);
-            let drift_ms = raw_drift_ms - new_smoothed;
-            // Surface the **raw** A-V offset to the operator so a
-            // mis-anchored stream is visible in the manager UI; the
-            // filtered drift is internal to the late-drop / sleep logic.
+            // Surface the raw V−A offset to the operator. We drive this
+            // toward zero by present-to-playout (below), so a sustained
+            // non-zero value is a real lip-sync problem — not an absorbed
+            // baseline as in the previous EMA design.
             counters.store_av_offset_ms(
                 raw_drift_ms.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
             );
-            if drift_ms < -drop_threshold_ms {
-                consecutive_late_frames = consecutive_late_frames.saturating_add(1);
-                consecutive_early_frames = 0;
-                if consecutive_late_frames >= LATE_HYSTERESIS_FRAMES {
-                    // After 2× hysteresis of consecutive late frames,
-                    // assume the source has shifted to a new sustained
-                    // baseline (audio decoder slowly racing wall —
-                    // mpeg-2-audio combos do this) and snap the EMA
-                    // forward to the current raw drift. Prevents a
-                    // permanent cascade of drops once the slow EMA
-                    // falls behind a real long-term drift.
-                    if consecutive_late_frames >= LATE_HYSTERESIS_FRAMES * 2 {
-                        av_offset_pts_smoothed = Some(raw_drift_ms);
-                        consecutive_late_frames = 0;
-                        // Don't drop this frame — we just re-anchored.
-                    } else {
-                        counters.frames_dropped_late.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                }
-                // Below threshold but not yet sustained — still present
-                // this frame; the EMA will catch up on the next sample.
-            } else if drift_ms > drop_threshold_ms {
-                // Mirror of the late-frame path: video is sustained
-                // AHEAD of audio by more than one drop window. The
-                // sleep below would block on the cap (`drop_threshold_ms`,
-                // 160 ms minimum) every frame, throttling the display
-                // to ~5-10 fps even when the source itself is 30 fps —
-                // and the EMA's α=1/64 convergence is too slow to dig
-                // out of a +sustained drift without help (a 200 ms
-                // baseline takes ~25 s to reach <10 ms residual).
-                // After `LATE_HYSTERESIS_FRAMES * 2` consecutive early
-                // frames, snap the EMA forward to the current raw
-                // drift so subsequent frames present at source rate
-                // again. The +baseline is preserved for the operator
-                // on `av_sync_offset_ms` (it's still real — the
-                // source has video PES leading audio PES); only the
-                // *filtered* drift the loop uses for sleep is reset.
-                consecutive_early_frames = consecutive_early_frames.saturating_add(1);
-                consecutive_late_frames = 0;
-                if consecutive_early_frames >= LATE_HYSTERESIS_FRAMES * 2 {
-                    av_offset_pts_smoothed = Some(raw_drift_ms);
-                    consecutive_early_frames = 0;
-                    // Fall through and present at full rate — the new
-                    // EMA absorbs the offset, drift_ms ≈ 0, sleep ≈ 0.
-                }
-            } else {
-                consecutive_late_frames = 0;
-                consecutive_early_frames = 0;
+            // Negative beyond the drop threshold → the frame is behind the
+            // audio the operator is hearing; drop it. EXCEPT when it's so far
+            // behind that this is a clock re-base, not a late frame: on an
+            // input switch the new stream's PTS epoch can sit seconds below
+            // the (still-old-stream) audio playout for the brief window before
+            // the audio task re-anchors. Dropping there would blank the whole
+            // new stream's video; instead present it and let the measured
+            // clock re-converge over the next few frames.
+            const REBASE_LIMIT_MS: i64 = 2_000;
+            if raw_drift_ms < -drop_threshold_ms && raw_drift_ms >= -REBASE_LIMIT_MS {
+                counters.frames_dropped_late.fetch_add(1, Ordering::Relaxed);
+                continue;
             }
-            // Subtract a small margin so we hand the buffer to KMS a hair
-            // before its target vblank — the page-flip itself blocks for
-            // up to one vblank inside `kms.present()`, so over-sleeping
-            // by even a millisecond pushes the actual scan-out a full
-            // frame late at 60 Hz.
-            const PRESENT_MARGIN_MS: i64 = 2;
-            if drift_ms > PRESENT_MARGIN_MS {
-                let cap_ms = drop_threshold_ms;
-                let sleep_ms = (drift_ms - PRESENT_MARGIN_MS).min(cap_ms) as u64;
-                // Absolute CLOCK_MONOTONIC sleep — eliminates the
-                // ±1–2 ms slop of `std::thread::sleep` on SCHED_OTHER,
-                // which at 60 Hz can push the next page-flip a full
-                // vblank late on frames whose drift target sits near
-                // a vblank boundary. `clock_nanosleep` with
-                // TIMER_ABSTIME wakes within ~50–500 µs on a stock
-                // kernel — well inside the PRESENT_MARGIN_MS budget
-                // that gates this branch.
+            // Positive → this frame is ahead of the audio playout; wait
+            // until the sound reaches it so the picture is shown exactly
+            // when its audio plays. Capped at `drop_threshold_ms` so a large
+            // startup mux interleave (audio buffered ~1 s ahead of the
+            // matching video) converges over ~a second of gentle slow-in
+            // rather than a single long freeze.
+            if raw_drift_ms > PRESENT_MARGIN_MS {
+                let sleep_ms =
+                    (raw_drift_ms - PRESENT_MARGIN_MS).min(drop_threshold_ms) as u64;
+                // Absolute CLOCK_MONOTONIC sleep — eliminates the ±1–2 ms
+                // slop of `std::thread::sleep` on SCHED_OTHER, which at
+                // 60 Hz can push the next page-flip a full vblank late on
+                // frames whose target sits near a vblank boundary.
                 let target_ns = display_monotonic_now_ns()
                     .saturating_add(sleep_ms.saturating_mul(1_000_000));
                 display_sleep_until_monotonic_ns(target_ns);
@@ -3439,7 +3365,7 @@ fn audio_loop(
     clock: Arc<AudioClock>,
     counters: Arc<DisplayStatsCounters>,
     channel_pair: [u8; 2],
-    program_start: Instant,
+    master_clock: Option<crate::engine::master_clock::MasterClockHandle>,
     cancel: CancellationToken,
     event_sender: EventSender,
     flow_id: String,
@@ -3457,6 +3383,12 @@ fn audio_loop(
         return;
     }
     let mut backend = AudioBackend::new(device);
+    // Genlock mode (Stage 2): attach the flow master clock so the resampler
+    // drives the measured audio playout toward `master.now_90khz()`. Absent
+    // (Stage 1 / muted) the backend runs audio-master and holds buffer fill.
+    if let Some(m) = master_clock {
+        backend.set_master_clock(m);
+    }
     // Graceful-degradation state for repeated open failures (Bonus-K).
     //
     // Without this guard, a permanently misconfigured `audio_device`
@@ -3517,7 +3449,6 @@ fn audio_loop(
             block.sample_rate,
             block.channels,
             &clock,
-            program_start,
             channel_pair,
         ) {
             Ok(_) => {
