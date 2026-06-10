@@ -1644,6 +1644,7 @@ fn validate_bonded_input(c: &crate::config::models::BondedInputConfig) -> Result
             ));
         }
         validate_bond_path_transport(&p.transport, /* sender_mode */ false, &p.name)?;
+        validate_bond_path_common(p, "bonded input")?;
     }
     if let Some(ms) = c.hold_ms {
         if !(10..=30_000).contains(&ms) {
@@ -1652,6 +1653,7 @@ fn validate_bonded_input(c: &crate::config::models::BondedInputConfig) -> Result
             ));
         }
     }
+    validate_bond_encryption_key(&c.encryption_key, "bonded input")?;
     Ok(())
 }
 
@@ -4888,6 +4890,7 @@ fn validate_bonded_output(c: &crate::config::models::BondedOutputConfig) -> Resu
             ));
         }
         validate_bond_path_transport(&p.transport, /* sender_mode */ true, &p.name)?;
+        validate_bond_path_common(p, &format!("bonded output '{}'", c.id))?;
     }
     if let Some(pn) = c.program_number {
         if pn == 0 {
@@ -4897,7 +4900,97 @@ fn validate_bonded_output(c: &crate::config::models::BondedOutputConfig) -> Resu
             ));
         }
     }
+    validate_bond_encryption_key(&c.encryption_key, &format!("bonded output '{}'", c.id))?;
+    validate_bond_congestion(&c.congestion, &format!("bonded output '{}'", c.id))?;
     validate_pid_map(c.pid_map.as_ref(), &format!("bonded output '{}'", c.id))?;
+    Ok(())
+}
+
+/// Validate the non-transport fields of a bond leg (shared by input and
+/// output): the optional per-link hard bandwidth ceiling.
+fn validate_bond_path_common(
+    p: &crate::config::models::BondPathConfig,
+    ctx: &str,
+) -> Result<()> {
+    if let Some(bps) = p.max_bitrate_bps {
+        // 100 kbps floor (below this a media leg is pointless) to 10 Gbps.
+        if !(100_000..=10_000_000_000).contains(&bps) {
+            return Err(anyhow::anyhow!(
+                "{ctx} path '{}': max_bitrate_bps must be in [100000, 10000000000], got {bps}",
+                p.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a 64-hex-char bond AEAD key, if present.
+fn validate_bond_encryption_key(key: &Option<String>, ctx: &str) -> Result<()> {
+    if let Some(k) = key {
+        let k = k.trim();
+        if k.len() != 64 {
+            return Err(anyhow::anyhow!(
+                "{ctx}: encryption_key must be 64 hex chars (32 bytes), got {}",
+                k.len()
+            ));
+        }
+        if !k.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(anyhow::anyhow!("{ctx}: encryption_key must be hexadecimal"));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the optional adaptive-scheduler congestion knobs.
+fn validate_bond_congestion(
+    c: &Option<crate::config::models::BondCongestionConfig>,
+    ctx: &str,
+) -> Result<()> {
+    let Some(c) = c else { return Ok(()) };
+    if let Some(v) = c.min_rate_kbps {
+        if !(50..=10_000_000).contains(&v) {
+            return Err(anyhow::anyhow!(
+                "{ctx}: congestion.min_rate_kbps must be in [50, 10000000]"
+            ));
+        }
+    }
+    if let Some(v) = c.start_rate_kbps {
+        if !(50..=10_000_000).contains(&v) {
+            return Err(anyhow::anyhow!(
+                "{ctx}: congestion.start_rate_kbps must be in [50, 10000000]"
+            ));
+        }
+    }
+    for (label, v) in [("loss_low_pct", c.loss_low_pct), ("loss_high_pct", c.loss_high_pct)] {
+        if let Some(v) = v {
+            if !(0.0..=100.0).contains(&v) || v.is_nan() {
+                return Err(anyhow::anyhow!(
+                    "{ctx}: congestion.{label} must be in [0, 100]"
+                ));
+            }
+        }
+    }
+    if let (Some(lo), Some(hi)) = (c.loss_low_pct, c.loss_high_pct) {
+        if lo > hi {
+            return Err(anyhow::anyhow!(
+                "{ctx}: congestion.loss_low_pct ({lo}) must not exceed loss_high_pct ({hi})"
+            ));
+        }
+    }
+    if let Some(v) = c.delay_inflation_ms {
+        if !(1..=10_000).contains(&v) {
+            return Err(anyhow::anyhow!(
+                "{ctx}: congestion.delay_inflation_ms must be in [1, 10000]"
+            ));
+        }
+    }
+    if let Some(v) = c.burst_ms {
+        if !(1..=5_000).contains(&v) {
+            return Err(anyhow::anyhow!(
+                "{ctx}: congestion.burst_ms must be in [1, 5000]"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -6629,6 +6722,24 @@ mod tests {
         AssembledProgram, AssembledStream, AssemblyKind, EssenceKind, FlowAssembly, PcrSource,
         SlotSource, TsPidOverridesEntry, TsPidOverridesMap,
     };
+
+    /// The customer-scenario adaptive-bond testbed configs (SRT in →
+    /// adaptive bonded over 4x LTE + 2x Starlink → SRT out) must parse
+    /// and validate — exercises `scheduler: adaptive`, per-path
+    /// `max_bitrate_bps`, and the bond `encryption_key` end to end.
+    #[test]
+    fn testbed_adaptive_contribution_configs_validate() {
+        for path in [
+            "../testbed/configs/bonded-adaptive-contribution-sender.json",
+            "../testbed/configs/bonded-adaptive-contribution-receiver.json",
+        ] {
+            let s =
+                std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let cfg: AppConfig =
+                serde_json::from_str(&s).unwrap_or_else(|e| panic!("parse {path}: {e}"));
+            validate_config(&cfg).unwrap_or_else(|e| panic!("validate {path}: {e}"));
+        }
+    }
 
     /// Helper: build a single-program map for tests.
     fn one_prog(entry: TsPidOverridesEntry) -> TsPidOverridesMap {

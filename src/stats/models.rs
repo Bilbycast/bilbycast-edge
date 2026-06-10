@@ -1810,7 +1810,17 @@ pub struct BondPathLegStats {
     pub rtt_ms: f64,
     pub jitter_us: u64,
     pub loss_fraction: f64,
+    /// Rate the sender **put on** this link (bits/sec, off the byte
+    /// counter for the bond's active direction).
     pub throughput_bps: u64,
+    /// Rate the receiver reports actually **arriving** on this link
+    /// (bits/sec, windowed, from the v2 keepalive byte feedback). The
+    /// gap between `throughput_bps` and this is loss / saturation. The
+    /// adaptive scheduler fills each link toward this discovered
+    /// capacity. Sender side only; 0 on the receiver side and on legacy
+    /// edges (serde default).
+    #[serde(default)]
+    pub delivered_bps: u64,
     pub queue_depth: u64,
     pub packets_sent: u64,
     pub bytes_sent: u64,

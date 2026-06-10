@@ -218,6 +218,9 @@ pub(crate) fn build_receiver_cfg(cfg: &BondedInputConfig) -> anyhow::Result<Bond
     if let Some(n) = cfg.max_nack_retries {
         out.max_nack_retries = n;
     }
+    if let Some(hex_key) = &cfg.encryption_key {
+        out.encryption_key = Some(decode_bond_key(hex_key)?);
+    }
     for p in &cfg.paths {
         out.paths.push(BondPathTxCfg {
             id: p.id,
@@ -310,6 +313,26 @@ pub(crate) fn translate_tls(tls: &BondQuicTls) -> anyhow::Result<BondQuicTlsTx> 
 pub(crate) fn parse_sockaddr(s: &str) -> anyhow::Result<SocketAddr> {
     s.parse::<SocketAddr>()
         .map_err(|e| anyhow::anyhow!("invalid socket address '{s}': {e}"))
+}
+
+/// Decode a 64-hex-char bond AEAD key into its 32 raw bytes. Shared by
+/// the bonded input (receiver) and output (sender) so both ends derive
+/// the same key bytes from the operator's hex string.
+pub(crate) fn decode_bond_key(hex: &str) -> anyhow::Result<Vec<u8>> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        anyhow::bail!(
+            "bond encryption_key must be 64 hex chars (32 bytes), got {}",
+            hex.len()
+        );
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&hex[i..i + 2], 16)
+                .map_err(|e| anyhow::anyhow!("invalid hex in bond encryption_key at {i}: {e}"))
+        })
+        .collect()
 }
 
 /// String label for the path transport, used in stats + Prometheus.

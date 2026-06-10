@@ -3611,6 +3611,10 @@ pub fn bond_handle_to_leg_stats(h: &BondStatsHandle) -> BondLegStats {
                 jitter_us: ps.jitter_us,
                 loss_fraction: ps.loss_fraction(),
                 throughput_bps,
+                // Receiver-fed delivered rate (sender side): the capacity
+                // controller's ground truth, now written by the bonding
+                // crate from the v2 keepalive byte feedback.
+                delivered_bps: ps.throughput_bps,
                 queue_depth: ps.queue_depth,
                 packets_sent: ps.packets_sent,
                 bytes_sent: ps.bytes_sent,

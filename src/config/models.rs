@@ -3846,6 +3846,11 @@ pub struct BondedInputConfig {
     /// Keepalive interval in milliseconds. Default 200 ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keepalive_ms: Option<u32>,
+    /// Optional 64-hex-char (32-byte) AEAD key — must match the bonded
+    /// output's key for the encrypted legs to open. See
+    /// [`BondedOutputConfig::encryption_key`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_key: Option<String>,
 }
 
 /// Bonded output — subscribes to the flow's broadcast channel, frames each
@@ -3871,6 +3876,16 @@ pub struct BondedOutputConfig {
     /// Scheduling policy.
     #[serde(default)]
     pub scheduler: BondSchedulerKind,
+    /// Optional congestion-control tuning for the `adaptive` scheduler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub congestion: Option<BondCongestionConfig>,
+    /// Optional 64-hex-char (32-byte) AEAD key. When set, every UDP/RIST
+    /// leg of this bond is ChaCha20-Poly1305 encrypted; the matching
+    /// bonded input must carry the same key. QUIC legs are already TLS.
+    /// Sensitive but operator-managed (mirrors SRT `passphrase`), so it
+    /// lives in `config.json` and is visible in the manager UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_key: Option<String>,
     /// Sender retransmit buffer capacity in packets. Default 8192.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retransmit_capacity: Option<usize>,
@@ -3899,14 +3914,51 @@ pub struct BondPathConfig {
     /// Operator-visible name (e.g. `"lte-0"`, `"starlink"`).
     pub name: String,
     /// Scheduler weight hint; higher = more traffic at steady state.
+    /// With the `adaptive` scheduler this seeds the path's initial
+    /// capacity estimate (a relative prior) so a known-fat link starts
+    /// carrying its share sooner.
     #[serde(default = "default_bond_weight")]
     pub weight_hint: u32,
+    /// Optional **hard upper bound** on this leg's send rate, bits/sec.
+    /// The adaptive scheduler never drives the link above this even if
+    /// it could carry more — use it to cap a metered cellular modem for
+    /// cost control. Unset = auto-discover with no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bitrate_bps: Option<u64>,
     /// Transport flavour.
     pub transport: BondPathTransportConfig,
 }
 
 fn default_bond_weight() -> u32 {
     1
+}
+
+/// Congestion-control tuning for the `adaptive` bonded-output scheduler.
+/// Every field is optional; unset falls back to the broadcast-tuned
+/// library default. Exposed so an operator can adapt the controller to
+/// an unusual link mix without an edge release.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct BondCongestionConfig {
+    /// Floor each link's capacity estimate never drops below, kbps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rate_kbps: Option<u32>,
+    /// Starting capacity estimate (before measurement) for a unit-weight
+    /// link, kbps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_rate_kbps: Option<u32>,
+    /// Loss percent below which a link is "clean" and probes up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_low_pct: Option<f32>,
+    /// Loss percent at/above which a link backs off hard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_high_pct: Option<f32>,
+    /// RTT inflation over a link's own minimum treated as queue-building
+    /// congestion (delay-based signal), milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_inflation_ms: Option<u32>,
+    /// Token-bucket burst depth, milliseconds of capacity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst_ms: Option<u32>,
 }
 
 /// Transport enum for a single bond leg.
@@ -4019,9 +4071,18 @@ pub enum BondSchedulerKind {
     /// (H.264 types 7, 8, 5; HEVC VPS/SPS/PPS/IDR_W_RADL/IDR_N_LP)
     /// as `Priority::Critical` so the scheduler duplicates them
     /// across the two best paths. Falls back to single-path for
-    /// non-IDR frames. **Default for broadcast flows.**
-    #[default]
+    /// non-IDR frames. Legacy — superseded by `adaptive`.
     MediaAware,
+    /// **Capacity-aware congestion-controlled** scheduler plus the same
+    /// NAL-type IDR detection as `media_aware`. Each leg discovers its
+    /// usable bandwidth from delivered-rate / loss / RTT-inflation
+    /// feedback and is filled to (but not past) that capacity; the split
+    /// is therefore proportional to *measured* capacity with smooth
+    /// quality deweighting, and a saturated link spills to one with
+    /// headroom. This is the right policy for a heterogeneous cellular +
+    /// satellite contribution bond. **Default.**
+    #[default]
+    Adaptive,
 }
 
 /// RTMP/RTMPS output configuration for publishing to streaming platforms.

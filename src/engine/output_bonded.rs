@@ -28,11 +28,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use bonding_transport::{
-    BondSocket, BondSocketConfig, PacketHints, PathConfig as BondPathTxCfg,
-    PathTransport as BondPathTxTransport, RoundRobinScheduler, WeightedRttScheduler,
+    BondSocket, BondSocketConfig, CapacityAwareScheduler, CongestionConfig, PacketHints,
+    PathConfig as BondPathTxCfg, PathPrior, PathTransport as BondPathTxTransport,
+    RoundRobinScheduler, WeightedRttScheduler,
 };
 
-use crate::config::models::{BondedOutputConfig, BondSchedulerKind};
+use crate::config::models::{BondCongestionConfig, BondedOutputConfig, BondSchedulerKind};
 use crate::manager::events::{
     BondEventScope, EventSender, EventSeverity, category, run_bond_event_forwarder,
 };
@@ -174,8 +175,8 @@ async fn bonded_output_run(
     let socket_cfg = build_sender_cfg(config)?;
     let path_ids: Vec<u8> = socket_cfg.paths.iter().map(|p| p.id).collect();
 
-    // Pick scheduler. MediaAware wraps WeightedRtt and adds NAL
-    // awareness on top; see engine::bonded_scheduler.
+    // Pick scheduler. MediaAware/Adaptive add NAL awareness on top of
+    // the inner path-selection policy; see engine::bonded_scheduler.
     let socket = match config.scheduler {
         BondSchedulerKind::RoundRobin => {
             BondSocket::sender(socket_cfg, RoundRobinScheduler::new(path_ids.clone()))
@@ -196,6 +197,28 @@ async fn bonded_output_run(
                 .await
                 .map_err(|e| anyhow::anyhow!("bonded sender setup: {e}"))?
         }
+        BondSchedulerKind::Adaptive => {
+            // Congestion-controlled, capacity-aware inner scheduler:
+            // each leg discovers its usable bandwidth and is filled to
+            // (not past) it, with smooth quality deweighting and spill.
+            let priors: Vec<PathPrior> = config
+                .paths
+                .iter()
+                .map(|p| PathPrior {
+                    id: p.id,
+                    weight_hint: p.weight_hint,
+                    ceiling_bps: p.max_bitrate_bps,
+                })
+                .collect();
+            let cong = config
+                .congestion
+                .as_ref()
+                .map(build_congestion)
+                .unwrap_or_default();
+            BondSocket::sender(socket_cfg, CapacityAwareScheduler::with_paths(priors, cong))
+                .await
+                .map_err(|e| anyhow::anyhow!("bonded sender setup: {e}"))?
+        }
     };
 
     // Register per-path + aggregate bond stats on the accumulator so
@@ -205,6 +228,7 @@ async fn bonded_output_run(
         BondSchedulerKind::RoundRobin => "round_robin",
         BondSchedulerKind::WeightedRtt => "weighted_rtt",
         BondSchedulerKind::MediaAware => "media_aware",
+        BondSchedulerKind::Adaptive => "adaptive",
     }
     .to_string();
     let mut path_handles: Vec<crate::stats::collector::BondPathStatsHandle> =
@@ -262,9 +286,10 @@ async fn bonded_output_run(
         cancel.clone(),
     ));
 
-    // Optional media-aware scheduler state.
+    // Optional media-aware NAL-priority tagging — used by both the
+    // legacy MediaAware policy and the new Adaptive policy.
     let mut media_sched = match config.scheduler {
-        BondSchedulerKind::MediaAware => {
+        BondSchedulerKind::MediaAware | BondSchedulerKind::Adaptive => {
             Some(super::bonded_scheduler::MediaAwareScheduler::new())
         }
         _ => None,
@@ -371,6 +396,12 @@ fn build_sender_cfg(cfg: &BondedOutputConfig) -> anyhow::Result<BondSocketConfig
     if let Some(cap) = cfg.retransmit_capacity {
         out.retransmit_capacity = cap;
     }
+    if let Some(hex_key) = &cfg.encryption_key {
+        out.encryption_key = Some(
+            super::input_bonded::decode_bond_key(hex_key)
+                .map_err(|e| anyhow::anyhow!("bonded output '{}': {e}", cfg.id))?,
+        );
+    }
     for p in &cfg.paths {
         out.paths.push(BondPathTxCfg {
             id: p.id,
@@ -380,6 +411,32 @@ fn build_sender_cfg(cfg: &BondedOutputConfig) -> anyhow::Result<BondSocketConfig
         });
     }
     Ok(out)
+}
+
+/// Translate the edge's operator-facing congestion knobs into the
+/// library `CongestionConfig`, leaving any unset field at its
+/// broadcast-tuned default.
+fn build_congestion(c: &BondCongestionConfig) -> CongestionConfig {
+    let mut cc = CongestionConfig::default();
+    if let Some(v) = c.min_rate_kbps {
+        cc.min_rate_bps = v as u64 * 1000;
+    }
+    if let Some(v) = c.start_rate_kbps {
+        cc.start_rate_bps = v as u64 * 1000;
+    }
+    if let Some(v) = c.loss_low_pct {
+        cc.loss_low = v / 100.0;
+    }
+    if let Some(v) = c.loss_high_pct {
+        cc.loss_high = v / 100.0;
+    }
+    if let Some(v) = c.delay_inflation_ms {
+        cc.delay_inflation = std::time::Duration::from_millis(v as u64);
+    }
+    if let Some(v) = c.burst_ms {
+        cc.burst_secs = v as f32 / 1000.0;
+    }
+    cc
 }
 
 fn translate_transport_for_sender(
